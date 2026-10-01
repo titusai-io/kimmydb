@@ -48,13 +48,32 @@ Each binary must be a `--release` build of `kimmyd`:
 Pass means, for each build: every trial exits 0 with a logged "shutdown
 complete" and no sign of a background task, an HTTP connection, a push
 driver or a write left running at the stop window's end, no restart that
-found something to repair, and the head build's worst stop time no worse
-than the baseline's worst plus STOP_TIME_EPSILON. `--seed` is random unless
-given, and always printed, so a failing run can be reproduced exactly.
+found something to repair, and the head build no slower to stop than the
+baseline on the paired trials, by three tests on the differences (head minus
+baseline) of the pairs that drew the same offset: their mean is within
+STOP_TIME_EPSILON; no single pair is worse by more than STOP_TIME_WORST_PAIR;
+and the pairs clearly worse by more than STOP_TIME_PAIR_NOISE do not outnumber
+the pairs clearly better by that much by as many as a fifth of the pairs (the
+excess count, which catches a regression that hits some stops by a few tenths
+of a second, where a mean and one worst pair both miss it). Each FAIL line
+says which test failed. **A FAIL from the excess count alone warrants a
+re-run**: it is the most sensitive of the three, and on a noisy host it fails a
+build that is no slower about 1 run in 20. `--seed` is random unless given, and
+always printed, so a failing run can be reproduced exactly.
+
+**The two builds' trials are interleaved**, one pair at a time, each pair on
+the same offset and in alternating order (baseline first, then head first).
+Running one build's whole group and then the other's put the second build
+under whatever the host was doing later: on a busy machine the second group
+was slower whichever build it was, and swapping the builds swapped the
+verdict. Four runs said so before the paired design replaced it. A stop that
+is slow because of the host is then as likely to land on either build, and
+the mean of the paired differences cancels it.
 """
 
 import argparse
 import json
+import math
 import os
 import random
 import re
@@ -73,10 +92,27 @@ ROOT_PASSWORD = "stop-matrix-root-password"
 JWT_SECRET = "stop-matrix-jwt-secret-at-least-32-bytes-long"
 CLUSTER_SECRET = "stop-matrix-cluster-secret"
 
-# How much worse the head build's worst stop may be than the baseline's,
-# before the matrix reports a regression rather than ordinary run-to-run
-# jitter on this machine.
+# How much slower the head build may be to stop than the baseline, on the mean
+# of the paired differences, before the matrix reports a regression rather than
+# ordinary run-to-run jitter on this machine.
 STOP_TIME_EPSILON_S = 0.25
+
+# How much worse one pair may be. Stop times on a busy host jump by up to a
+# second or so on either build (a single slow trial of 0.6-0.9 s was seen on
+# both), so one pair is judged against a wider bound than the mean: a stop that
+# regresses to the budget's seconds, or an exit 75, is far past it. A review
+# simulated 24 pairs with host noise of this shape: 1.25 s keeps the false FAIL
+# rate of the three tests together at 8% or less, and catches a regression of
+# +1.5 s on one stop in eight in 93% of runs, where 2 s caught about half.
+STOP_TIME_WORST_PAIR_S = 1.25
+
+# A pair differing by more than this either way is counted by the excess test:
+# beyond the 0.1-0.3 s a stop varies by on a quiet host, and below the
+# regressions worth stopping a release for.
+STOP_TIME_PAIR_NOISE_S = 0.3
+
+# The excess count never fails below this many pairs, whatever a fifth of them is.
+EXCESS_COUNT_MIN = 3
 
 # A clean stop is exit 0 with the marker logged -- nothing else. Python's
 # subprocess reports a process a supervisor had to kill as a *negative*
@@ -380,27 +416,33 @@ def run_trial(binary, target, index, offset_s, walk_row_ms, serve_walk_ms, seed_
     return result
 
 
-def run_matrix(binary, label, trials, walk_row_ms, serve_walk_ms, seed_batches, seed):
+def run_paired_matrix(builds, trials, walk_row_ms, serve_walk_ms, seed_batches, seed):
+    """`builds`: [(label, binary), (label, binary)], baseline first. One trial
+    per build for each (target, index), run back to back on the same offset,
+    the order alternating from one pair to the next, so the host's state at
+    the time falls on both builds alike. Returns {label: results}."""
     rng = random.Random(seed)
-    results = []
+    results = {label: [] for label, _ in builds}
     targets = ["requester", "server"]
     per_target = max(1, trials // len(targets))
     n = 0
     for target in targets:
         for i in range(per_target):
             offset = rng.uniform(2.0, 30.0)
+            order = builds if n % 2 == 0 else builds[::-1]
             n += 1
-            label_i = f"{label}/{target}/{i}"
-            print(f"  [{label_i}] offset={offset:.2f}s ...", file=sys.stderr, flush=True)
-            r = run_trial(binary, target, i, offset, walk_row_ms, serve_walk_ms, seed_batches, label_i)
-            results.append(r)
-            print(
-                f"    exit={r['exit_code']} stop_time={r['stop_time_s']}s "
-                f"clean={r['clean_marker']} reset_in_progress={r['reset_in_progress_at_signal']} "
-                f"aborted={r['task_aborted']}",
-                file=sys.stderr,
-                flush=True,
-            )
+            for label, binary in order:
+                label_i = f"{label}/{target}/{i}"
+                print(f"  [{label_i}] offset={offset:.2f}s ...", file=sys.stderr, flush=True)
+                r = run_trial(binary, target, i, offset, walk_row_ms, serve_walk_ms, seed_batches, label_i)
+                results[label].append(r)
+                print(
+                    f"    exit={r['exit_code']} stop_time={r['stop_time_s']}s "
+                    f"clean={r['clean_marker']} reset_in_progress={r['reset_in_progress_at_signal']} "
+                    f"aborted={r['task_aborted']}",
+                    file=sys.stderr,
+                    flush=True,
+                )
     return results
 
 
@@ -446,7 +488,7 @@ def pair_and_compare(baseline_results, head_results):
     build's run and not the other's cannot inflate or hide a group
     average's gap the way it could between two independently-averaged
     groups. Prints the worst and mean per-pair delta (head minus
-    baseline) and returns the worst."""
+    baseline) and returns the worst, the mean, and every delta."""
     by_key = {(r["target"], r["index"]): r for r in baseline_results}
     deltas = []
     for head in head_results:
@@ -457,7 +499,7 @@ def pair_and_compare(baseline_results, head_results):
         deltas.append((key, head["stop_time_s"] - base["stop_time_s"], base["stop_time_s"], head["stop_time_s"]))
     if not deltas:
         print("\n== paired comparison: no matching (target, index) pairs found ==")
-        return 0.0
+        return 0.0, 0.0, []
     deltas.sort(key=lambda d: d[1], reverse=True)
     worst_key, worst_delta, worst_base, worst_head = deltas[0]
     mean_delta = sum(d[1] for d in deltas) / len(deltas)
@@ -466,7 +508,50 @@ def pair_and_compare(baseline_results, head_results):
         f"worst delta {worst_delta:+.3f}s at {worst_key} (baseline {worst_base:.3f}s, "
         f"head {worst_head:.3f}s), mean delta {mean_delta:+.3f}s =="
     )
-    return worst_delta
+    return worst_delta, mean_delta, [d[1] for d in deltas]
+
+
+def excess_count(deltas, noise=STOP_TIME_PAIR_NOISE_S):
+    """Pairs where head was slower by more than `noise`, minus pairs where it was
+    faster by more than `noise`: what a mean and one worst pair can both miss,
+    when a regression is a few tenths of a second on some of the stops. The
+    deltas are rounded to the millisecond first, so a pair of exactly `noise`
+    does not count one way or the other by float error."""
+    rounded = [round(d, 3) for d in deltas]
+    return sum(1 for d in rounded if d > noise) - sum(1 for d in rounded if d < -noise)
+
+
+def excess_limit(pairs):
+    """The excess at which the count test fails: a fifth of the pairs, and never
+    fewer than 3, so that with few trials one noisy pair cannot fail a run."""
+    return max(EXCESS_COUNT_MIN, math.ceil(pairs / 5))
+
+
+def judge_pairs(worst_delta, mean_delta, deltas):
+    """The three tests on the paired differences. Returns (failures, notes):
+    each failure names its test, and no pair at all is a failure, never a pass:
+    a run that compared nothing has said nothing about the build."""
+    if not deltas:
+        return ["FAIL (no pairs): no (target, index) pair of trials matched between the builds, so nothing was compared"], []
+    failures, notes = [], []
+    excess = excess_count(deltas)
+    limit = excess_limit(len(deltas))
+    if len(deltas) < 10:
+        notes.append(f"the excess-count test is weak below about 10 pairs; this run has {len(deltas)}")
+    if mean_delta > STOP_TIME_EPSILON_S:
+        failures.append(
+            f"FAIL (mean test): the pairs' mean difference is {mean_delta:+.3f}s, past {STOP_TIME_EPSILON_S}s"
+        )
+    if worst_delta > STOP_TIME_WORST_PAIR_S:
+        failures.append(
+            f"FAIL (worst-pair test): the worst same-offset pair regressed by {worst_delta:.3f}s, "
+            f"past {STOP_TIME_WORST_PAIR_S}s"
+        )
+    if excess >= limit:
+        failures.append(f"FAIL (excess-count test): {excess:+d} pairs, limit {limit}")
+        if len(failures) == 1:
+            notes.append("the excess count failed alone: re-run before concluding, it is the most sensitive test")
+    return failures, notes
 
 
 def build_label(role, binary):
@@ -503,13 +588,15 @@ def main():
     head_label = build_label("head", args.head_bin)
     print(f"baseline: {baseline_label}\nhead: {head_label}", file=sys.stderr)
 
-    all_results = {}
-    for label, binary in [(baseline_label, args.baseline_bin), (head_label, args.head_bin)]:
-        print(f"\n### {label}: {args.trials} trials ###", file=sys.stderr)
-        results = run_matrix(
-            binary, label, args.trials, args.walk_row_ms, args.serve_walk_ms, args.seed_batches, args.seed
-        )
-        all_results[label] = results
+    print(f"\n### {args.trials} trials per build, interleaved ###", file=sys.stderr)
+    all_results = run_paired_matrix(
+        [(baseline_label, args.baseline_bin), (head_label, args.head_bin)],
+        args.trials,
+        args.walk_row_ms,
+        args.serve_walk_ms,
+        args.seed_batches,
+        args.seed,
+    )
 
     worsts = {}
     failed = False
@@ -526,15 +613,26 @@ def main():
         f"(epsilon {STOP_TIME_EPSILON_S}s) =="
     )
 
-    # The regression check itself is on the paired deltas, not the group
-    # worsts above: a handful of harder offsets landing in one build's run
-    # and not the other's can move a group's worst or its average without
-    # either build actually being slower to stop, and a shared seed makes
-    # comparing like-for-like free.
-    worst_pair_delta = pair_and_compare(all_results.get(baseline_label, []), all_results.get(head_label, []))
-    if worst_pair_delta > STOP_TIME_EPSILON_S:
-        print(f"FAIL: the worst same-offset pair regressed by {worst_pair_delta:.3f}s, past epsilon")
-        failed = True
+    # The regression check is on the paired deltas, not the group worsts
+    # above: a trial a busy host slowed moves a group's worst without either
+    # build being slower to stop. The builds' trials are interleaved on the same
+    # offsets, so the pairs' differences are what a slower stop looks like:
+    # their mean, one pair against a wider bound, and the excess of clearly
+    # slower pairs over clearly faster ones.
+    worst_pair_delta, mean_pair_delta, pair_deltas = pair_and_compare(
+        all_results.get(baseline_label, []), all_results.get(head_label, [])
+    )
+    print(
+        f"   excess count (pairs worse than +{STOP_TIME_PAIR_NOISE_S}s minus pairs better than "
+        f"-{STOP_TIME_PAIR_NOISE_S}s): {excess_count(pair_deltas):+d}, "
+        f"fails at {excess_limit(len(pair_deltas))}"
+    )
+    failures, notes = judge_pairs(worst_pair_delta, mean_pair_delta, pair_deltas)
+    for note in notes:
+        print(f"   note: {note}")
+    for failure in failures:
+        print(failure)
+    failed = failed or bool(failures)
 
     if args.json_out:
         with open(args.json_out, "w") as f:
