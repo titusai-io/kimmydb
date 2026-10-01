@@ -489,6 +489,12 @@ impl Confirmer {
         self.peers.lock().get(&addr).and_then(|q| q.backoff.as_ref()).is_some_and(|b| now < b.until)
     }
 
+    /// How many waiters `addr`'s queue holds that no push has taken yet.
+    #[cfg(test)]
+    fn waiters_queued(&self, addr: SocketAddr) -> usize {
+        self.peers.lock().get(&addr).map_or(0, |q| q.waiters.len())
+    }
+
     /// The step of `addr`'s back-off, paused or not.
     #[cfg(test)]
     fn backoff_step(&self, addr: SocketAddr) -> Option<Duration> {
@@ -1038,11 +1044,12 @@ mod tests {
 
     /// What a serving member's push hook saw: each window's schema changes
     /// applied and entries deferred, in order; and levers to hold its answer
-    /// or break it.
+    /// for a time, hold it until the test lets it go, or break it.
     #[derive(Default)]
     struct Served {
         windows: Mutex<Vec<(usize, usize)>>,
         hold: Mutex<Duration>,
+        gate: AtomicBool,
         break_next: AtomicUsize,
     }
 
@@ -1082,6 +1089,12 @@ mod tests {
                 let hold = *served.hold.lock();
                 if !hold.is_zero() {
                     std::thread::sleep(hold);
+                }
+                // Bounded, so a test that never opens it fails on its own
+                // assertions rather than hanging the suite.
+                let until = Instant::now() + Duration::from_secs(60);
+                while served.gate.load(Ordering::SeqCst) && Instant::now() < until {
+                    std::thread::sleep(Duration::from_millis(5));
                 }
                 if served.break_next.load(Ordering::SeqCst) > 0 {
                     served.break_next.fetch_sub(1, Ordering::SeqCst);
@@ -1247,24 +1260,44 @@ mod tests {
 
     /// A burst of 32 creates confirmed concurrently is applied once each on
     /// the member: the ~N²/2 of one push per change is gone (ADR-191).
+    ///
+    /// The burst is made while the first push is held at the member, so the
+    /// claim is about what the driver does, not about how fast the host mints:
+    /// the 31 changes queued behind a push in flight go in one next push.
+    /// Before, the member held each answer for 200 ms and the creates were
+    /// 3 ms apart, and a host that stalled the minting past a hold split the
+    /// burst over more pushes than the bound allowed.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn a_burst_of_32_creates_is_applied_once_each_on_a_member() {
         let b = member().await;
-        *b.served.hold.lock() = Duration::from_millis(200);
+        b.served.gate.store(true, Ordering::SeqCst);
         let a = pusher_for(&b, quick());
         let node = b.engine.node_id();
         let mut asked = tokio::task::JoinSet::new();
-        for i in 0..32 {
-            let entry = create(&a.engine, &format!("f{i}"));
+        let confirm = |entry: OplogEntry| {
             let confirmer = Arc::clone(&a.confirmer);
-            asked.spawn(async move { confirmer.confirm(b.addr, node, entry, DEADLINE).await });
-            tokio::time::sleep(Duration::from_millis(3)).await;
+            async move { confirmer.confirm(b.addr, node, entry, DEADLINE).await }
+        };
+        asked.spawn(confirm(create(&a.engine, "f0")));
+        // The first push is at the member, held there until the gate opens.
+        windows_reached(&b, 1).await;
+        for i in 1..32 {
+            asked.spawn(confirm(create(&a.engine, &format!("f{i}"))));
         }
+        eventually("the 31 confirmations queued behind the push in flight", || {
+            a.confirmer.waiters_queued(b.addr) == 31
+        })
+        .await;
+        b.served.gate.store(false, Ordering::SeqCst);
         while let Some(resolution) = asked.join_next().await {
             assert_eq!(resolution.unwrap(), Resolution::Confirmed);
         }
-        assert_eq!(b.served.ddl(), 32, "each create applied once: {:?}", b.served.windows());
-        assert!(a.pushes.load(Ordering::SeqCst) <= 4, "{:?}", b.served.windows());
+        assert_eq!(
+            b.served.windows(),
+            vec![(1, 0), (31, 0)],
+            "the first push carried f0, and the next all 31 queued behind it, each applied once"
+        );
+        assert_eq!(a.pushes.load(Ordering::SeqCst), 2, "{:?}", b.served.windows());
     }
 
     // --- T2 ---
