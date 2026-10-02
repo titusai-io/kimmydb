@@ -828,8 +828,11 @@ what a dot-product search means — so it is refused rather than redefined.
 
 ## What is not built
 
-**No `$vectorSearch` aggregation stage.** Search is its own endpoint; it does
-not yet compose inside a pipeline.
+Search also runs as the first stage of an [aggregation](aggregation.md#vectorsearch)
+pipeline, `$vectorSearch`, with this endpoint's fields (`query` or `vector`, `k`,
+`per_document`, `filter`), so the hits can be filtered further, joined and grouped
+inside the database. Each hit enters the pipeline as its source document with
+`_score` and `_chunk` added.
 
 Tracked in [Deviations](deviations.md). Two former entries here are built:
 graphs **persist across restarts** (M8 — loaded before any rebuild is paid,

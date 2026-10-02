@@ -23849,3 +23849,74 @@ strings. `update`: an `arrayFilters` entry naming `$$line` only inside an array
 selects its elements, and a field inside an array is refused there.
 `kimmy-api`: the worked example, a `find` with `$in` over an array of fields
 and with `$literal`, and the `arrayFilters` entry over HTTP.
+
+---
+
+## ADR-216 — `$vectorSearch` is the first aggregation stage, spelled as the vector search endpoint is
+
+**Status:** accepted, for the next `0.MINOR`. Builds on
+[ADR-098](#adr-098--query-paths-are-bounded-by-what-they-return-not-by-what-they-scan)
+for the ceiling and on
+[ADR-121](#adr-121--a-request-body-with-a-field-the-route-does-not-define-is-refused)
+for refusing a field the stage does not define.
+
+**The gap.** Vector search was only an endpoint, so a pipeline could not feed
+its hits into `$match`, `$lookup` or `$group`; a client moved the hits out of the
+database and did the rest itself. Another system exposes the same capability as
+a first stage, spelled `queryVector`, `numCandidates`, `limit`, `index` and
+`filter`.
+
+**Decision.**
+
+- **The stage takes the endpoint's own fields and no others:** `query` (text) or
+  `vector`, `k`, `per_document`, `filter`. The endpoint is the contract clients
+  already know, and one feature has one vocabulary.
+- **The other system's names are refused, not aliased.** `queryVector` is a `400`
+  saying to use `vector`; `limit` says to use `k`; `numCandidates` and `index`
+  say there is no such knob and that KimmyDB has one vector index per collection.
+  An alias would have accepted a field, `numCandidates`, that changes nothing
+  here, and a port costs one rename. Any other field is refused by name, and a
+  stage with neither `query` nor `vector` is refused at parse.
+- **First stage only.** The stage is the pipeline's source, in place of the
+  collection scan, so any other position and a `$lookup` sub-pipeline are a `400`
+  naming the rule.
+- **One code path.** The executor obtains hits through the step the endpoint and
+  the MCP tool use (authorization, the embedding provider's checks and messages,
+  the filter, the ranking, dropping a hit whose document is gone), so the three
+  cannot diverge. Each hit enters the pipeline as its source document with
+  `_score` and `_chunk` added, in rank order. A stored field of either name is
+  overwritten by the stage's value, kept on purpose: the stage's documented
+  shape is the source plus those two fields. With `per_document` above 1 a
+  source document enters once per matching chunk, each with its own `_chunk`.
+- **Ceiling.** `k` (default 10, clamped to 1,000 as on the endpoint) bounds what
+  enters; the hit count is also checked against the pipeline ceiling, naming
+  `$vectorSearch`.
+- **Authorization.** The stage needs `read`, which `aggregate` checks, and
+  `search`, which the shared hits step checks as the endpoint does. `read`
+  carries `search`, so `read` alone satisfies both. What differs from the
+  endpoint: a token granted only `search` is refused by `aggregate`, at its
+  `read` check, before the stage runs, where the endpoint answers it. What is
+  the same: every refusal is the uniform `403` with the body of
+  `ApiError::forbidden`, which names no action, so a token with neither action
+  gets the same status and the same body from the stage as from the endpoint,
+  and the `search`-only refusal is that same body. Which action was missing
+  cannot be read from the refusal on either route.
+- **`aggregate` is asynchronous in the executor,** because embedding a query is.
+  Nothing changes on the wire.
+
+**Alternative rejected.** Adopting the other system's spelling wholesale: two
+vocabularies for one feature, one of which has a candidate knob this index does
+not have.
+
+**Not done.** `aggregate` has no `explain`, so there is nothing to report the
+stage in; see Aggregation, "Performance".
+
+**Test.** `kimmy-query`: the fields parsed, first-stage-only (second place and
+inside a `$lookup`), each of the four refused names with the spelling it gives,
+unknown and malformed fields, and the supported-stages message. `kimmy-api`
+over HTTP: the products example answers `[{"_id": "acme", "n": 1}]` under `byo`
+with a `vector`; hits are source documents with `_score` and `_chunk` and `k`
+bounds them and are held to the ceiling, naming the stage; the `filter`; `query` under `byo` refused with the endpoint's
+message; a misplaced stage and a refused name as `400`s; a `read` grant searches
+and a `search`-only grant is answered by the endpoint and refused by aggregate,
+a token with neither getting the same `403` body from both.

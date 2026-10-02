@@ -50,6 +50,26 @@ numeric segment (`"p.0"`) it replaces that element by position.
 
 ---
 
+## 🟡 A `$vectorSearch` stage takes KimmyDB's field names and refuses Atlas's
+
+**Raised 2026-10-01, with ADR-216.** MongoDB Atlas spells the stage's fields
+`queryVector`, `numCandidates`, `limit` and `index`. KimmyDB's stage takes the
+spelling of its own `vector_search` endpoint, `query` or `vector`, `k`,
+`per_document` and `filter`, and a pipeline ported from Atlas that carries any
+of the four Atlas names is a `400` naming the KimmyDB spelling to use instead
+(`vector` for `queryVector`, `k` for `limit`) or saying there is no such knob
+(`numCandidates`, `index`: KimmyDB has one vector index per collection).
+
+**Why.** The endpoint is the contract clients already know; a stage with a
+second vocabulary for the same feature would have made every KimmyDB client
+learn two. Aliasing the Atlas names was considered and declined: refusing loudly
+costs a port one rename, and an alias would have accepted `numCandidates` while
+doing nothing with it.
+
+**What closes it.** Nothing needs to: rename the fields.
+
+---
+
 ## 🟡 A compound index over two array fields indexes nothing for that document, where MongoDB refuses the write
 
 **Raised 2026-09-06, with ADR-139.** MongoDB refuses a write that would put
@@ -2452,7 +2472,6 @@ here so that the absence of a decision is visible as a decision.
 | No certificate expiry metric | A failed reload is counted, but a certificate nobody ever tried to rotate reports nothing. `kimmy_tls_cert_expiry_seconds` needs `x509-parser` as a new runtime dependency (pure Rust — not a second crypto stack, so `check-native-deps.sh` would still pass) | not scheduled |
 | Rate limiting beyond login | Only `/v1/auth/login` is limited. Every other route is unbounded — see the entry below | M5 |
 | Per-session revocation | Revocation is per user — all of that user's tokens or none. Killing one session while leaving another needs a per-token deny-list, which fails open when an entry has not reached the node handling the request | not planned |
-| `$vectorSearch` as a pipeline stage | The pipeline is built, but vector search stays its own endpoint | M5 |
 | `$zip` and `$sortArray` | Refused at parse as unknown operators, so a ported pipeline using either fails loudly. Declined when the set operators, `$objectToArray` and `$arrayToObject` were built (2026-09-29, ADR-207): `$map` over a `$range` of indexes with `$arrayElemAt` reads arrays by position, and `$unwind`, `$sort` and `$group` with `$push` order an array's elements | not planned |
 | Multi-document atomicity | Uneven, on purpose. **Bulk insert is atomic** — one transaction, all or nothing ([ADR-048](decisions.md)). `update` and `delete` with `multi: true` are **atomic per chunk** of `storage.multi_chunk_docs` documents (default 1,000): each chunk is one transaction, the writer is released between chunks, and a failure in a later chunk leaves the earlier ones committed — so a `multi` can stop partway, at a chunk boundary, and a concurrent reader can see the state between two chunks ([ADR-086](decisions.md)). Nothing spans two requests. The full table is [What each operation guarantees](compatibility.md#what-each-operation-guarantees) | by design |
 | Benchmarks | The vector index, the write path, batched writes, concurrent writers and the planner are measured ([Benchmarks](benchmarks.md)), against a recorded baseline that is advisory rather than gating | M8 |

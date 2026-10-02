@@ -31,6 +31,7 @@ can answer it, which only a *leading* `$match` gets (see
 | `$group` | [Blocking](#the-memory-limit). **One row per distinct key**, so an empty input produces no rows at all. Accumulators below |
 | `$count` | `{$count: "name"}` — a document holding the count, **always**: over an empty input it is one document holding `0`, not no document. [Blocking](#the-memory-limit) |
 | `$lookup` | Join another collection, by one key or by a sub-pipeline. **Authorized separately** |
+| `$vectorSearch` | Semantic search as the pipeline's **source**: the hits, as documents, flow into the rest of the pipeline. **First stage only**. [Below](#vectorsearch) |
 
 **Stage operands with a fixed key set are closed; field-path maps stay
 open.** `$unwind`'s document form, `$lookup`'s both forms and `$replaceRoot`
@@ -789,6 +790,53 @@ inherent, not an omission.
 
 ---
 
+## `$vectorSearch`
+
+Search a collection by meaning and keep working on the hits. The stage takes the
+fields of the [`vector_search` endpoint](vectors.md) and no others: `query` (text,
+embedded by the collection's provider) or `vector` (required under `byo`), `k`,
+`per_document` and `filter`.
+
+```json
+POST /v1/db/shop/coll/products/aggregate
+{
+  "pipeline": [
+    { "$vectorSearch": { "query": "lightweight running footwear", "k": 10 } },
+    { "$match": { "price": { "$lt": 100 } } },
+    { "$group": { "_id": "$brand", "n": { "$sum": 1 } } }
+  ]
+}
+```
+
+```json
+{ "documents": [ { "_id": "acme", "n": 1 } ], "count": 1 }
+```
+
+- **It is the source, so it is first.** Anywhere else, and inside a `$lookup`
+  sub-pipeline, is a `400` that says so.
+- **What enters the pipeline.** Each hit is its source document with two fields
+  added, `_score` and `_chunk`, in rank order. If the stored document has a
+  field of either name, the stage's value replaces it. With `per_document` above
+  1 the same source document enters once per matching chunk, each time with its
+  own `_chunk`; the default is one chunk per document. `k` (default 10, at most 1,000, as
+  on the endpoint) bounds how many enter; the [pipeline limit](#the-memory-limit)
+  is checked against them too. A document deleted since it was ranked is dropped,
+  as on the endpoint.
+- **Authorization.** The stage needs `read` on the collection, which carries
+  `search`. A caller granted only `search` can use the endpoint but is refused
+  by `aggregate`, because a pipeline reads documents. Every refusal is the same
+  uniform `403`, naming no action.
+- **Embedding.** The same checks and messages as the endpoint: `query` needs a
+  server-side provider, and under `byo` the stage needs a `vector` of the
+  collection's width.
+- **The names of other systems are refused, not aliased.** `queryVector` should
+  be `vector` and `limit` should be `k`; `numCandidates` and `index` have no
+  equivalent, because KimmyDB has no candidate knob and one vector index per
+  collection. Each is a `400` saying so. See [ADR-216](decisions.md).
+- **No `explain`.** `aggregate` has none; see [Performance](#performance).
+
+---
+
 ## Performance
 
 **A leading `$match` is planned exactly as `find` is.** When the first stage is
@@ -868,7 +916,8 @@ documents holding large arrays can exceed the cap long before the stage ends.
 | A `Decimal128` literal — bare, under `$literal`, or inside a document or array written in an expression | The same reason from the other side: the canonical order ranks a Decimal128 equal to every other number, so a comparison against one would hold for every number and a value computed from one could be neither indexed nor grouped. Refused at parse — `a Decimal128 literal is not supported in an expression` — wherever an expression is parsed, `$expr` included. A `$sort` stage refuses a document holding one at a sort path the way `find`'s sort does ([Query language](query-language.md#sort-and-projection)); a *stored* Decimal128 read through a field path is not refused, and `$type` finds it, except by the set operators, which refuse one in their input rather than compare it ([ADR-207](decisions.md), [Sets](#sets)); where truth is read, a `Decimal128` zero is false like any zero ([What reads as false](#behaviours-worth-knowing)) |
 | `$toDecimal` | Never built as an operator at all, so it is refused at parse as an **unknown operator** — `unsupported operator "$toDecimal": not an expression operator` — rather than with the pointer `$convert` gives. The reason is the row above; the message does not say so |
 | `$facet`, `$bucket`, `$graphLookup`, `$merge`, `$out` | Not built. An unknown stage is refused with a message listing what is supported |
-| `$vectorSearch` as a stage | Vector search is its own endpoint — see [Vectors](vectors.md) |
+| `$vectorSearch` anywhere but first, or inside a `$lookup` sub-pipeline | `400`, naming the rule: it is the pipeline's source, in place of the collection scan |
+| `$vectorSearch` fields from other systems — `queryVector`, `numCandidates`, `limit`, `index` | Refused, each naming the KimmyDB spelling (`vector`, `k`) or saying there is no such knob: KimmyDB has one vector index per collection ([ADR-216](decisions.md)) |
 | Index use by a `$match` that is not first | Deliberate — see [Performance](#performance). Only the leading `$match` reads through the planner; a later one filters what reaches it |
 
 ---

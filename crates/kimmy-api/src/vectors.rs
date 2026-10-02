@@ -881,12 +881,64 @@ pub async fn run_vector_search(
     coll: &str,
     body: &SearchRequest,
 ) -> Result<Value, ApiError> {
+    let (_, hits) = search_hits(state, auth, db, coll, body).await?;
+    Ok(render(&hits))
+}
+
+/// The request-to-hits step of a vector search: authorize, resolve the query
+/// vector, apply the filter, rank, and keep the hits whose document is still
+/// there. Shared by the endpoint, the MCP tool and the `$vectorSearch`
+/// aggregation stage (ADR-216), so the three cannot diverge on authorization,
+/// provider checks or messages.
+async fn search_hits(
+    state: &SharedState,
+    auth: &Auth,
+    db: &str,
+    coll: &str,
+    body: &SearchRequest,
+) -> Result<(kimmy_storage::CollectionMeta, Vec<Hit>), ApiError> {
     let (source, shadow, config, options) = prepare(state, auth, db, coll, body)?;
     let query = resolve_query_vector(state, &config, body).await?;
     let allowed = allowed_ids(state, auth, db, coll, body.filter.as_ref())?;
 
     let hits = knn(state, &shadow, &config, &query, &options, allowed.as_ref())?;
-    Ok(render(&only_live(state, &source, hits)?))
+    let hits = only_live(state, &source, hits)?;
+    Ok((source, hits))
+}
+
+/// The documents a `$vectorSearch` stage feeds into the rest of a pipeline
+/// (ADR-216): each hit's source document with `_score` and `_chunk` added, in
+/// rank order. `k` bounds what enters; the pipeline ceiling is checked too.
+pub(crate) async fn stage_documents(
+    state: &SharedState,
+    auth: &Auth,
+    db: &str,
+    coll: &str,
+    spec: &kimmy_query::aggregate::VectorSearch,
+    limits: &kimmy_query::aggregate::Limits,
+) -> Result<Vec<bson::Document>, ApiError> {
+    let body = SearchRequest {
+        query: spec.query.clone(),
+        vector: spec.vector.clone(),
+        filter: spec
+            .filter
+            .as_ref()
+            .map(|f| crate::json::bson_to_json(&bson::Bson::Document(f.clone()))),
+        k: spec.k,
+        per_document: spec.per_document,
+        ..Default::default()
+    };
+    let (source, hits) = search_hits(state, auth, db, coll, &body).await?;
+    kimmy_query::aggregate::check_limit("$vectorSearch", hits.len(), limits)?;
+    let mut docs = Vec::with_capacity(hits.len());
+    for hit in hits {
+        // A document deleted since `only_live` looked is dropped, as there.
+        let Some(mut doc) = state.engine.get(&source, &hit.id)? else { continue };
+        doc.insert("_score", f64::from(hit.score));
+        doc.insert("_chunk", i64::from(hit.chunk));
+        docs.push(doc);
+    }
+    Ok(docs)
 }
 
 /// k-NN by whichever path the index cache selects, joined with the filter's

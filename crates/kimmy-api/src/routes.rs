@@ -1127,7 +1127,7 @@ async fn aggregate_docs(
     Path((db, coll)): Path<(String, String)>,
     JsonBody(body): JsonBody<AggregateRequest>,
 ) -> Result<Json<Value>, ApiError> {
-    Ok(Json(exec::aggregate(&state, &auth, &db, &coll, &body.pipeline)?))
+    Ok(Json(exec::aggregate(&state, &auth, &db, &coll, &body.pipeline).await?))
 }
 
 // ---------------------------------------------------------------------------

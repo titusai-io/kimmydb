@@ -993,7 +993,7 @@ than as an `$or` of one `$regex` each.
 
 | Feature | Status |
 |---|---|
-| `$vectorSearch` | 📋 Planned — vector search works, but as [its own endpoint](vectors.md), not an [aggregation](aggregation.md) stage |
+| `$vectorSearch` | ✅ Built as the first [aggregation](aggregation.md#vectorsearch) stage, with the fields of the [vector search endpoint](vectors.md); other systems' field names are refused |
 | `$bit` | 📋 Planned — the next tier of update-operator compatibility |
 | `$` positional update operator (`items.$.qty`) | ⛔ Not planned — the matcher does not report which element a filter matched, and `$[<identifier>]` with `arrayFilters` expresses the same thing without depending on the query; see [Positional updates](#positional-updates) |
 | `$where`, JavaScript execution | ⛔ Never — an obvious injection surface |
