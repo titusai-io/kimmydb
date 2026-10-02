@@ -139,6 +139,14 @@ It goes anywhere a filter clause goes: top level, inside `$and` / `$or` /
 > reach for `$expr` when the right-hand side is itself a field or a
 > computation.
 
+**An array inside the expression is read element by element.** `{"$expr":
+{"$in": ["$status", ["$primary", "$fallback"]]}}` matches when `status` equals
+either field's value, and `{"$in": ["$status", ["new", "paid"]]}` compares
+against the two constants. To compare against a string that begins with `$`,
+write the array as `{"$literal": ["$primary"]}`
+([Aggregation](aggregation.md#arrays-and-literal)). An `arrayFilters` entry's
+`$expr` reads arrays the same way, `$$<identifier>` inside one included.
+
 **Never indexed.** An expression names no field the planner can put bounds on,
 so a filter that is only `$expr` is a collection scan. An equality or range
 beside it — `{account: "acme", $expr: …}` — still uses the index on `account`,

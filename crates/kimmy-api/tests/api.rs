@@ -8727,6 +8727,74 @@ async fn a_stored_decimal128_zero_reads_as_false_in_every_expression() {
 }
 
 #[tokio::test]
+async fn an_array_written_in_an_expression_is_read_as_expressions() {
+    // ADR-215: a field path inside an array is the field's value, in a
+    // pipeline, a filter's `$expr` and an arrayFilters entry alike;
+    // `$literal` keeps the strings.
+    let server = Server::start().await;
+    let token = server.root().await;
+    server.post("/v1/db/shop/collections", Some(&token), json!({"name": "pairs"})).await;
+    let docs = "/v1/db/shop/coll/pairs/docs";
+    for doc in [
+        json!({"_id": 1, "a": 1, "b": 2, "tags": ["x"], "extra": "y", "x": 2,
+               "lines": [{"sku": "bolt", "alt": "gasket"}, {"sku": "nut", "alt": "washer"}]}),
+        json!({"_id": 2, "a": 1, "b": 2, "tags": [], "extra": "z", "x": "$a", "lines": []}),
+    ] {
+        let res = server.post(docs, Some(&token), doc).await;
+        assert_eq!(res.status, 200, "{:?}", res.body);
+    }
+
+    let res = server
+        .post(
+            "/v1/db/shop/coll/pairs/aggregate",
+            Some(&token),
+            json!({"pipeline": [
+                {"$match": {"_id": 1}},
+                {"$project": {
+                    "pair": ["$a", "$b"],
+                    "u": {"$setUnion": ["$tags", ["$extra"]]},
+                    "kept": {"$literal": ["$a", "$b"]},
+                }},
+            ]}),
+        )
+        .await;
+    assert_eq!(res.status, 200, "{:?}", res.body);
+    assert_eq!(
+        res.body["documents"][0],
+        json!({"_id": 1, "pair": [1, 2], "u": ["x", "y"], "kept": ["$a", "$b"]})
+    );
+
+    let ids = |body: &Value| -> Vec<i64> {
+        body["documents"].as_array().unwrap().iter().map(|d| d["_id"].as_i64().unwrap()).collect()
+    };
+    let find = |filter: Value| {
+        server.post("/v1/db/shop/coll/pairs/find", Some(&token), json!({"filter": filter}))
+    };
+    let res = find(json!({"$expr": {"$in": ["$x", ["$a", "$b"]]}})).await;
+    assert_eq!(res.status, 200, "{:?}", res.body);
+    assert_eq!(ids(&res.body), [1]);
+    let res = find(json!({"$expr": {"$in": ["$x", {"$literal": ["$a", "$b"]}]}})).await;
+    assert_eq!(ids(&res.body), [2]);
+
+    // The entry names `$$line` only inside the array, and is still read.
+    let res = server
+        .post(
+            "/v1/db/shop/coll/pairs/update",
+            Some(&token),
+            json!({
+                "filter": {"_id": 1},
+                "update": {"$set": {"lines.$[line].hit": true}},
+                "arrayFilters": [{"$expr": {"$in": ["gasket", ["$$line.sku", "$$line.alt"]]}}],
+            }),
+        )
+        .await;
+    assert_eq!(res.status, 200, "{:?}", res.body);
+    let doc = server.get("/v1/db/shop/coll/pairs/docs/1", Some(&token)).await.body;
+    assert_eq!(doc["lines"][0]["hit"], true, "{doc}");
+    assert!(doc["lines"][1].get("hit").is_none(), "{doc}");
+}
+
+#[tokio::test]
 async fn a_field_path_through_an_array_fans_out_in_every_expression_context() {
     // The same pipeline MongoDB runs: a path that crosses an array is the
     // array of what it found, in `$addFields`, in `$expr` and as a `$group`
