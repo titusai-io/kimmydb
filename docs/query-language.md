@@ -73,7 +73,7 @@ Top-level fields are implicitly `$and`-ed.
 
 | Operator | Meaning |
 |---|---|
-| `$exists` | Field is present (an explicit `null` counts as present) |
+| `$exists` | Field is present (an explicit `null` counts as present); a flag of `false`, `0` or a Decimal128 zero means absent |
 | `$type` | BSON type, by alias (`"string"`), numeric code (`2`), or an array of either — see [`$type`](#type) |
 | `$regex` / `$options` | Pattern match against string values |
 
@@ -107,7 +107,10 @@ at least one value, or leave the condition out. See
 Every operator above compares a field with a **constant**. `$expr` takes an
 expression from the [aggregation language](aggregation.md#expressions) instead,
 evaluates it against the whole document, and matches when the result is truthy
-— `false`, `null`, `0` and a missing field are false, everything else is true.
+— `false`, `null`, a zero of any numeric type (a stored `Decimal128` zero,
+whatever its sign or exponent, included) and a missing field are false,
+everything else is true
+([Aggregation](aggregation.md#behaviours-worth-knowing)).
 That makes it the one clause that can put two fields on either side of a
 comparison:
 

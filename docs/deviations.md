@@ -454,10 +454,11 @@ of a set result, which MongoDB leaves unspecified.
   element kept is that first appearance. A port that sorted the result keeps
   working; one that relied on whatever order MongoDB happened to give may see
   a different one.
-- **A `Decimal128` in a set input, or as an element of `$anyElementTrue` or
-  `$allElementsTrue`, is a `400`.** MongoDB compares it exactly. Here the
-  canonical order ranks one equal to every other number and truthiness has no
-  reading of one, so an answer would be wrong rather than merely different.
+- **A `Decimal128` in a set input is a `400`.** MongoDB compares it exactly.
+  Here the canonical order ranks one equal to every other number, so an
+  answer would be wrong rather than merely different. `$anyElementTrue` and
+  `$allElementsTrue` compare nothing and read a `Decimal128` element by its
+  value, a zero as false, as MongoDB does.
 
 `$arrayToObject` takes every string key but one holding a NUL, the empty,
 dotted and `$`-prefixed ones included, so it is not an entry here.
