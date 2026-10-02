@@ -209,7 +209,6 @@ pub(crate) mod test_support {
 #[cfg(test)]
 mod tests {
     use std::path::{Path, PathBuf};
-    use std::sync::{Arc, Mutex};
 
     use bson::doc;
     use kimmy_core::{Hlc, NodeId, OpKind, OplogEntry, Stamp, VersionVector};
@@ -220,30 +219,10 @@ mod tests {
     use super::*;
     use crate::codec;
     use crate::engine::{Engine, Position, WriterHolder};
+    use crate::log_capture::logs_of;
     use crate::meta::CollectionMeta;
 
     // --- helpers ---
-
-    /// What `body` logs on this thread.
-    fn logs_of(body: impl FnOnce()) -> String {
-        #[derive(Clone)]
-        struct Captured(Arc<Mutex<Vec<u8>>>);
-        impl std::io::Write for Captured {
-            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-                self.0.lock().unwrap().extend_from_slice(buf);
-                Ok(buf.len())
-            }
-            fn flush(&mut self) -> std::io::Result<()> {
-                Ok(())
-            }
-        }
-        let out = Captured(Arc::new(Mutex::new(Vec::new())));
-        let writer = out.clone();
-        let subscriber =
-            tracing_subscriber::fmt().with_writer(move || writer.clone()).with_ansi(false).finish();
-        tracing::subscriber::with_default(subscriber, body);
-        String::from_utf8(out.0.lock().unwrap().clone()).unwrap()
-    }
 
     /// Change the raw store under a closed engine.
     fn raw(path: &Path, f: impl FnOnce(&redb::WriteTransaction)) {

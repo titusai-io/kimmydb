@@ -7614,36 +7614,11 @@ mod tests {
 /// removed from `Engine::open`, every other test in the workspace passes.
 #[cfg(test)]
 mod converted_filters_line {
-    use std::sync::{Arc, Mutex};
-
     use bson::doc;
 
     use super::Engine;
+    use crate::log_capture::logs_of;
     use crate::meta::{Enforcement, IndexField};
-
-    #[derive(Clone)]
-    struct Captured(Arc<Mutex<Vec<u8>>>);
-
-    impl std::io::Write for Captured {
-        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-            self.0.lock().unwrap().extend_from_slice(buf);
-            Ok(buf.len())
-        }
-
-        fn flush(&mut self) -> std::io::Result<()> {
-            Ok(())
-        }
-    }
-
-    /// What `body` logs on this thread.
-    fn logs_of(body: impl FnOnce()) -> String {
-        let out = Captured(Arc::new(Mutex::new(Vec::new())));
-        let writer = out.clone();
-        let subscriber =
-            tracing_subscriber::fmt().with_writer(move || writer.clone()).with_ansi(false).finish();
-        tracing::subscriber::with_default(subscriber, body);
-        String::from_utf8(out.0.lock().unwrap().clone()).unwrap()
-    }
 
     #[test]
     fn every_open_names_each_partial_index_whose_filter_holds_an_array() {
@@ -7830,37 +7805,18 @@ mod clearing {
 #[cfg(test)]
 mod repairs_at_open {
     use std::path::{Path, PathBuf};
-    use std::sync::{Arc, Mutex};
 
     use super::{Engine, RepairsAtOpen};
+    use crate::log_capture::logged;
 
     const LATEST: &str = "latest-marker-9876543210-zyxwvutsrqponmlkjihgfedcba-end";
-
-    #[derive(Clone)]
-    struct Captured(Arc<Mutex<Vec<u8>>>);
-
-    impl std::io::Write for Captured {
-        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-            self.0.lock().unwrap().extend_from_slice(buf);
-            Ok(buf.len())
-        }
-
-        fn flush(&mut self) -> std::io::Result<()> {
-            Ok(())
-        }
-    }
 
     /// Open the store at `path`, and return what the open logged with the
     /// engine's repairs and whether document `b` survived.
     fn open_logged(path: &Path) -> (String, RepairsAtOpen, bool) {
-        let out = Captured(Arc::new(Mutex::new(Vec::new())));
-        let writer = out.clone();
-        let subscriber =
-            tracing_subscriber::fmt().with_writer(move || writer.clone()).with_ansi(false).finish();
-        let engine = tracing::subscriber::with_default(subscriber, || Engine::open(path).unwrap());
+        let (engine, logs) = logged(|| Engine::open(path).unwrap());
         let c = engine.get_collection("shop", "orders").unwrap();
         let b = engine.get(&c, &kimmy_core::DocId::String("b".into())).unwrap().is_some();
-        let logs = String::from_utf8(out.0.lock().unwrap().clone()).unwrap();
         (logs, engine.repairs_at_open(), b)
     }
 
