@@ -52,6 +52,9 @@ pub mod watch;
 #[cfg(test)]
 mod key_walk_tests;
 
+#[cfg(test)]
+mod log_capture;
+
 pub use divergence::{
     DivergenceTracker, Findings as DivergenceFindings, LocalState as DivergenceLocalState,
     PeerAnswer as DivergencePeerAnswer, compare as compare_divergence, next_probe,

@@ -1510,6 +1510,7 @@ mod tests {
     use kimmy_core::OpKind;
 
     use super::*;
+    use crate::log_capture::logs_of;
     use crate::meta::CollectionMeta;
 
     fn setup() -> (Engine, CollectionMeta, tempfile::TempDir) {
@@ -2980,27 +2981,6 @@ mod tests {
             ),
             "e2 was collected before the client was sent it"
         );
-    }
-
-    /// What `body` logs on this thread.
-    fn logs_of(body: impl FnOnce()) -> String {
-        #[derive(Clone)]
-        struct Captured(Arc<std::sync::Mutex<Vec<u8>>>);
-        impl std::io::Write for Captured {
-            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-                self.0.lock().unwrap().extend_from_slice(buf);
-                Ok(buf.len())
-            }
-            fn flush(&mut self) -> std::io::Result<()> {
-                Ok(())
-            }
-        }
-        let out = Captured(Arc::new(std::sync::Mutex::new(Vec::new())));
-        let writer = out.clone();
-        let subscriber =
-            tracing_subscriber::fmt().with_writer(move || writer.clone()).with_ansi(false).finish();
-        tracing::subscriber::with_default(subscriber, body);
-        String::from_utf8(out.0.lock().unwrap().clone()).unwrap()
     }
 
     /// A token another member issued, covering nothing: the resume that walks
