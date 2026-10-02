@@ -201,7 +201,7 @@ impl crate::Engine {
                     true,
                     None,
                     &|_| false,
-                    self.next_stamp(),
+                    || self.next_stamp(),
                 )),
                 Configured::FromEntry(stamp) => Some(self.create_collection_in_txn(
                     &txn,
@@ -210,7 +210,7 @@ impl crate::Engine {
                     false,
                     Some(stamp.hlc),
                     &|dropped| stamp < dropped,
-                    stamp,
+                    || stamp,
                 )),
                 Configured::FromSnapshot => None,
             };
