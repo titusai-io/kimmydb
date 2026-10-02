@@ -1216,8 +1216,18 @@ mod tests {
 
     const DEADLINE: Duration = Duration::from_secs(10);
 
+    /// How long a test waits on a condition it expects, before it fails with
+    /// what it was waiting for. A guard against a hang, not a claim about speed:
+    /// a loaded host can stretch the work behind a wait several times over.
+    const EVENTUALLY: Duration = Duration::from_secs(60);
+
+    /// How long a push held at the member, and the confirmations waiting on it,
+    /// may take. Above the longest hold a test makes (the member's gate lets go
+    /// after 60 s), so the hold, not the clock, is what ends a held push.
+    const HELD: Duration = Duration::from_secs(120);
+
     async fn eventually(what: &str, mut ok: impl FnMut() -> bool) {
-        let until = Instant::now() + Duration::from_secs(10);
+        let until = Instant::now() + EVENTUALLY;
         while !ok() {
             assert!(Instant::now() < until, "{what}");
             tokio::time::sleep(Duration::from_millis(20)).await;
@@ -1267,16 +1277,22 @@ mod tests {
     /// Before, the member held each answer for 200 ms and the creates were
     /// 3 ms apart, and a host that stalled the minting past a hold split the
     /// burst over more pushes than the bound allowed.
+    ///
+    /// The first push stays held for as long as the 31 creates take to mint,
+    /// each a committed write, which a loaded host stretches past the 10 s
+    /// request timeout and confirmation deadline the other tests use: the held
+    /// push then timed out, was sent again, and the queue the test waited to
+    /// see at 31 emptied into it. So this test's timeouts are [`HELD`].
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn a_burst_of_32_creates_is_applied_once_each_on_a_member() {
         let b = member().await;
         b.served.gate.store(true, Ordering::SeqCst);
-        let a = pusher_for(&b, quick());
+        let a = pusher_for(&b, ConfirmConfig { request_timeout: HELD, ..quick() });
         let node = b.engine.node_id();
         let mut asked = tokio::task::JoinSet::new();
         let confirm = |entry: OplogEntry| {
             let confirmer = Arc::clone(&a.confirmer);
-            async move { confirmer.confirm(b.addr, node, entry, DEADLINE).await }
+            async move { confirmer.confirm(b.addr, node, entry, HELD).await }
         };
         asked.spawn(confirm(create(&a.engine, "f0")));
         // The first push is at the member, held there until the gate opens.
