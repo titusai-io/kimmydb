@@ -6616,38 +6616,110 @@ async fn a_carried_peer_dropped_from_membership_is_not_dialled_by_the_reset_tick
 /// `FROZEN_CONTACTS` both advance in far less wall-clock time than either
 /// constant's own reasoning assumes; a chain deep enough to run several
 /// intervals, most of its ticks resets, is what tells the two apart.
+///
+/// The chain's length is fixed by the fixture, not measured off the machine:
+/// the peer is a fake that holds every pull for exactly `PULL_HOLD` and
+/// serves `PULLS` of them, each advancing and truncated. A pull can only
+/// take longer than its hold, never less, and a tick stops pulling once
+/// what is left of the interval is under its slowest pull, so a tick fits
+/// at most two pulls whatever the load -- the chain is at least
+/// `PULLS / 2` ticks, and a loaded machine only lengthens it. Pricing the
+/// interval off a few timed real pulls instead let a load change between
+/// the pricing and the run shrink the chain below the premise.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_reset_chain_opens_about_once_an_interval_not_once_a_tick() {
-    use kimmy_cluster::protocol::MAX_BATCH;
+    use kimmy_cluster::protocol::prove;
     use kimmy_cluster::{ReplicationConfig, RoundReport, SeedSource, replicate};
 
-    let d = node().await;
-    let a = node().await;
-    let coll = a.engine.create_collection("shop", "orders").unwrap();
-    seed(&a, &coll, MAX_BATCH * 200);
+    const PULL_HOLD: Duration = Duration::from_millis(180);
+    // Two holds fit under this with less than one hold to spare, so a tick
+    // stops after two pulls: about 72% of the interval, which is the slack
+    // an every-reset-tick open would not have.
+    const INTERVAL: Duration = Duration::from_millis(500);
+    const PULLS: usize = 48;
 
-    // Priced, not fixed, for the same reason `a_tick_at_the_pull_ceiling`
-    // prices its interval: a pull's cost belongs to the machine. A fixed
-    // interval close to one pull's own cost would let a loaded machine's
-    // slower pulls make every reset tick open, on the correct reasoning
-    // that each one genuinely took about an interval -- proving nothing
-    // about the gate. Six times the slowest of a few priced pulls (the
-    // same margin `a_tick_at_the_pull_ceiling` starts at) keeps several
-    // pulls inside one interval without draining the whole, deliberately
-    // deep backlog in only one or two ticks either.
-    const PRICED_PULLS: usize = 8;
-    let mut slowest = Duration::ZERO;
-    for _ in 0..PRICED_PULLS {
-        let priced = std::time::Instant::now();
-        let one = sync_once(&d.engine, a.addr, SECRET, None).await.expect("a pull to price");
-        slowest = slowest.max(priced.elapsed());
-        assert!(one.truncated, "the fixture must still be draining, or this prices nothing");
-    }
-    let interval = slowest * 6;
+    let d = node().await;
+    let coll = d.engine.create_collection("shop", "orders").unwrap();
+    let origin = kimmy_core::NodeId::generate();
+    let collection = coll.id;
+    let entry = move |n: u64| kimmy_core::OplogEntry {
+        stamp: kimmy_core::Stamp::new(Hlc::new(1_000 + n, 0), origin),
+        kind: kimmy_core::OpKind::Insert,
+        collection,
+        doc_id: Some(DocId::String(format!("d{n}"))),
+        body: Some(bson::serialize_to_vec(&doc! { "_id": format!("d{n}") }).unwrap()),
+    };
+    let mut theirs = kimmy_core::VersionVector::new();
+    theirs.insert(origin, Hlc::new(1_000_000, 0));
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let fake = listener.local_addr().unwrap();
+    let pulls = Arc::new(AtomicUsize::new(0));
+    tokio::spawn({
+        let pulls = Arc::clone(&pulls);
+        async move {
+            let tls = kimmy_cluster::tls::ClusterTls::new().unwrap();
+            while let Ok((tcp, _)) = listener.accept().await {
+                let acceptor = tls.acceptor();
+                let (theirs, pulls) = (theirs.clone(), Arc::clone(&pulls));
+                tokio::spawn(async move {
+                    let Ok(mut stream) = acceptor.accept(tcp).await else { return };
+                    let binding = kimmy_cluster::tls::binding(stream.get_ref().1).unwrap();
+                    let Ok(Message::Hello { nonce, .. }) = read_frame(&mut stream).await else {
+                        return;
+                    };
+                    let welcome = Message::Welcome {
+                        node: origin,
+                        nonce: vec![7; 32],
+                        proof: prove(SECRET, &nonce, &binding),
+                    };
+                    if write_frame(&mut stream, &welcome).await.is_err() {
+                        return;
+                    }
+                    let Ok(Message::Confirm { .. }) = read_frame(&mut stream).await else { return };
+                    while let Ok(message) = read_frame(&mut stream).await {
+                        let answer = match message {
+                            Message::AskVersions { .. } => Message::Vectors {
+                                servable: theirs.clone(),
+                                witnessed: theirs.clone(),
+                                facts: None,
+                            },
+                            Message::AskEntries { .. } => {
+                                tokio::time::sleep(PULL_HOLD).await;
+                                let n = pulls.fetch_add(1, Ordering::SeqCst);
+                                if n < PULLS {
+                                    let served = entry(n as u64);
+                                    let scanned_to = served.stamp.hlc;
+                                    Message::Entries {
+                                        entries: vec![served],
+                                        scanned_to,
+                                        exhausted: false,
+                                        passed_through: None,
+                                    }
+                                } else {
+                                    Message::Entries {
+                                        entries: Vec::new(),
+                                        scanned_to: Hlc::new(1_000_000, 0),
+                                        exhausted: true,
+                                        passed_through: None,
+                                    }
+                                }
+                            }
+                            _ => return,
+                        };
+                        if write_frame(&mut stream, &answer).await.is_err() {
+                            return;
+                        }
+                    }
+                });
+            }
+        }
+    });
+    let interval = INTERVAL;
 
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<RoundReport>();
     let mut config =
-        ReplicationConfig::new(vec![SeedSource::Static(vec![a.addr])], SECRET.into(), d.addr);
+        ReplicationConfig::new(vec![SeedSource::Static(vec![fake])], SECRET.into(), d.addr);
     config.fanout = 1;
     config.sync_interval = interval;
     config.discovery_interval = interval;
@@ -6657,13 +6729,9 @@ async fn a_reset_chain_opens_about_once_an_interval_not_once_a_tick() {
     let looping = tokio::spawn(replicate(Arc::clone(&d.engine), config));
 
     let start = tokio::time::Instant::now();
-    // Priced off the same `interval` the ticks themselves run at, not a
-    // fixed wall-clock constant: on a loaded machine a slower `slowest`
-    // pull prices a longer `interval`, and the whole chain -- dozens of
-    // ticks draining `MAX_BATCH * 200` entries -- scales with it. A fixed
-    // 30 s deadline here once failed on a shared CI runner after only 10
-    // ticks, far short of a real chain, while comfortably sufficient
-    // locally.
+    // Generous against the chain's fixed length, not a fixed wall-clock
+    // constant: a stalled host only stretches the holds, and the chain with
+    // them.
     let deadline = start + interval * 100 + Duration::from_secs(60);
     let (mut total_ticks, mut opened_ticks, mut reset_ticks) = (0usize, 0usize, 0usize);
     let chain_ended_at = loop {
@@ -6689,8 +6757,10 @@ async fn a_reset_chain_opens_about_once_an_interval_not_once_a_tick() {
     looping.abort();
     let elapsed = chain_ended_at.duration_since(start);
 
+    // At most two pulls fit in a tick whatever the load, so `PULLS` pulls
+    // are at least `PULLS / 2` ticks, all but the first and last resets.
     assert!(
-        reset_ticks >= 3,
+        reset_ticks >= PULLS / 2 - 2,
         "premise: this needs a real reset chain, several ticks long, not one or two: \
          {reset_ticks} reset ticks over {total_ticks} total"
     );
