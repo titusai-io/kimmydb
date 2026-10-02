@@ -3658,9 +3658,6 @@ impl Engine {
     pub fn create_database(&self, name: &str) -> Result<DatabaseMeta> {
         CoreError::validate_name(name)?;
         let txn = self.begin_write(WriterHolder::Ddl)?;
-        // Minted under the writer, as every stamp is (ADR-148).
-        let stamp = self.next_stamp();
-        let meta = DatabaseMeta { name: name.to_string(), created: stamp.hlc };
         {
             let mut dbs = txn.open_table(tables::DATABASES)?;
             if dbs.get(name)?.is_some() {
@@ -3673,10 +3670,16 @@ impl Engine {
                 txn.abort()?;
                 return Ok(parsed);
             }
+            // Minted under the writer (ADR-148), and only once the database is
+            // known to be new: a create that finds it there is not an event, so
+            // it does not tick the clock.
+            let stamp = self.next_stamp();
+            let meta = DatabaseMeta { name: name.to_string(), created: stamp.hlc };
             dbs.insert(name, serde_json::to_vec(&meta)?.as_slice())?;
+            drop(dbs);
+            txn.commit()?;
+            Ok(meta)
         }
-        txn.commit()?;
-        Ok(meta)
     }
 
     pub fn list_databases(&self) -> Result<Vec<DatabaseMeta>> {
@@ -3873,19 +3876,22 @@ impl Engine {
         // transaction, below: see `create_collection_in_txn` (ADR-189).
 
         let txn = self.begin_write(WriterHolder::Ddl)?;
-        // Minted *after* the writer is held, never before (ADR-148). A stamp
-        // minted while another transaction holds the writer sorts below the
-        // entries that transaction commits first, and a peer that reads this
-        // node's vector and window in that interval witnesses past the stamp
-        // without ever being served the entry it will belong to. Under the
-        // writer, stamp order is commit order: the oplog this node serves is
-        // contiguous for its own origin, which is what makes its advertised
-        // vector a promise a peer can trust. `create_collection_in_txn` takes
-        // the stamp from its caller for that reason: a caller that mints one
-        // mints it with the writer held, and a replicated shadow takes its
-        // configuration entry's stamp.
-        let stamp = self.next_stamp();
-        match self.create_collection_in_txn(&txn, db, name, log, origin, history, stamp) {
+        // The stamp is minted *after* the writer is held, never before
+        // (ADR-148), and after the checks that can end the creation without
+        // one: `create_collection_in_txn` calls the closure once the collection
+        // is certain to be made, so a creation that finds the collection there,
+        // or is history, does not tick the clock. A stamp minted while another
+        // transaction holds the writer sorts below the entries that transaction
+        // commits first, and a peer that reads this node's vector and window in
+        // that interval witnesses past the stamp without ever being served the
+        // entry it will belong to. Under the writer, stamp order is commit
+        // order: the oplog this node serves is contiguous for its own origin,
+        // which is what makes its advertised vector a promise a peer can
+        // trust. `create_collection_in_txn` takes the mint from its caller for
+        // that reason: a caller that mints one mints it with the writer held,
+        // and a replicated shadow takes its configuration entry's stamp.
+        let mint = || self.next_stamp();
+        match self.create_collection_in_txn(&txn, db, name, log, origin, history, mint) {
             Ok(InTxn::Created(meta, logged)) => {
                 txn.commit()?;
                 if let Some(entry) = logged {
@@ -3929,10 +3935,10 @@ impl Engine {
         log: bool,
         origin: Option<Hlc>,
         history: &dyn Fn(Stamp) -> bool,
-        stamp: Stamp,
+        mint: impl FnOnce() -> Stamp,
     ) -> Result<InTxn> {
         let id = CollectionId::derive(db, name);
-        let meta = {
+        let (meta, stamp) = {
             let mut collections = txn.open_table(tables::COLLECTIONS)?;
             if collections.get((db, name))?.is_some() {
                 return Ok(InTxn::Exists);
@@ -4022,6 +4028,10 @@ impl Engine {
                 });
             }
 
+            // Every check that ends the creation without a write is behind us:
+            // the stamp is minted here, once, for the write that follows.
+            let stamp = mint();
+
             // `created` is the stamp of the create that produced this
             // incarnation *at its origin* — for a replicated create, the
             // entry's stamp rather than this node's clock at apply time. A
@@ -4030,7 +4040,7 @@ impl Engine {
             let meta =
                 CollectionMeta::new(id, db, name, origin.unwrap_or(stamp.hlc), incarnation_floor);
             collections.insert((db, name), serde_json::to_vec(&meta)?.as_slice())?;
-            meta
+            (meta, stamp)
         };
 
         // Databases are created implicitly by their first collection.
@@ -5855,6 +5865,47 @@ mod tests {
             engine.create_collection("app", "orders"),
             Err(StorageError::Core(CoreError::CollectionExists { .. }))
         ));
+    }
+
+    /// A creation that finds the database or the collection there, or that is
+    /// history, makes nothing, so it does not tick the clock; the one that
+    /// does create ticks it.
+    #[test]
+    fn a_creation_that_finds_it_there_or_is_history_mints_nothing() {
+        let (engine, _dir) = engine();
+        let db = engine.create_database("app").unwrap();
+        engine.create_collection("app", "orders").unwrap();
+        engine.create_collection("app", "gone").unwrap();
+        assert!(engine.drop_collection("app", "gone").unwrap());
+        let (commits, oplog, clock) =
+            (engine.commits(), engine.oplog_entries().unwrap(), engine.clock_last());
+
+        // The database is there: answered with what it holds.
+        assert_eq!(engine.create_database("app").unwrap().created, db.created);
+        // The collection is there.
+        assert!(matches!(
+            engine.create_collection("app", "orders"),
+            Err(StorageError::Core(CoreError::CollectionExists { .. }))
+        ));
+        // A creation older than the collection's drop is history.
+        assert!(
+            engine
+                .create_collection_inner("app", "gone", false, None, &|_| true)
+                .unwrap()
+                .is_none()
+        );
+
+        assert_eq!(engine.clock_last(), clock, "no stamp minted");
+        assert_eq!(engine.oplog_entries().unwrap(), oplog, "nothing logged");
+        assert_eq!(engine.commits(), commits, "nothing committed");
+
+        // The creations that do make something still tick, once each.
+        engine.create_database("other").unwrap();
+        let after_database = engine.clock_last();
+        assert!(after_database > clock);
+        engine.create_collection("app", "fresh").unwrap();
+        assert!(engine.clock_last() > after_database);
+        assert_eq!(engine.oplog_entries().unwrap(), oplog + 1);
     }
 
     #[test]

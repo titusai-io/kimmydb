@@ -531,9 +531,8 @@ impl Engine {
 
         let key = doc_key(&id)?;
         let body = bson::serialize_to_vec(&doc)?;
-        let stamp = self.next_stamp();
 
-        {
+        let stamp = {
             let mut docs = txn.open_table(tables::DOCS)?;
             // A tombstone may still occupy the key; overwriting it is a
             // legitimate resurrection, but a live document is a conflict.
@@ -544,6 +543,10 @@ impl Engine {
             if occupied {
                 return Err(CoreError::DuplicateKey(id.to_string()).into());
             }
+            // Minted once the write is certain to be made, under the writer
+            // (ADR-148): a refused insert is not an event, so it does not tick
+            // the clock.
+            let stamp = self.next_stamp();
             let record = DocRecord::live(stamp, body.clone());
             crate::live_count::put_record(
                 txn,
@@ -552,7 +555,8 @@ impl Engine {
                 &key,
                 &codec::encode_doc_record(&record),
             )?;
-        }
+            stamp
+        };
 
         // Same transaction as the document write, so the index cannot describe
         // a state that never existed. A unique violation returns here and the
@@ -853,23 +857,26 @@ impl Engine {
         guard: impl Fn(Stamp, &Document) -> Result<bool>,
     ) -> Result<Option<OplogEntry>> {
         let key = doc_key(id)?;
-        let stamp = self.next_stamp();
 
-        let previous = {
+        let (previous, stamp) = {
             let mut docs = txn.open_table(tables::DOCS)?;
             let (current, previous) = match docs.get((coll.id.0, key.as_slice()))? {
                 Some(raw) => {
                     let record = codec::decode_doc_record(raw.value())?;
-                    (record.stamp, record.document()?)
+                    (Some(record.stamp), record.document()?)
                 }
-                None => (stamp, None),
+                None => (None, None),
             };
-            let Some(image) = previous.as_ref() else {
+            let (Some(current), Some(image)) = (current, previous.as_ref()) else {
                 return Ok(None);
             };
             if !guard(current, image)? {
                 return Ok(None);
             }
+            // Minted once the delete is certain to be made, under the writer
+            // (ADR-148): a delete that finds nothing, or that the guard
+            // declines, is not an event and does not tick the clock.
+            let stamp = self.next_stamp();
             crate::live_count::put_record(
                 txn,
                 &mut docs,
@@ -877,7 +884,7 @@ impl Engine {
                 &key,
                 &codec::encode_doc_record(&DocRecord::tombstone(stamp)),
             )?;
-            previous
+            (previous, stamp)
         };
 
         // A tombstoned document must leave no index entries behind, or a scan
@@ -2872,6 +2879,66 @@ mod tests {
         let docs = txn.open_table(tables::DOCS).unwrap();
         let key = doc_key(id).unwrap();
         docs.get((coll.id.0, key.as_slice())).unwrap().unwrap().value().to_vec()
+    }
+
+    /// A write that is refused or finds nothing to do is not an event, so it
+    /// does not tick the clock, log, commit or publish: a delete of a missing
+    /// document, of a tombstone, one a guard declines and one a stale stamp
+    /// refuses.
+    #[test]
+    fn a_delete_that_finds_nothing_or_is_declined_mints_nothing() {
+        let (engine, coll, _dir) = engine();
+        let (_, stamp) = engine.insert_stamped(&coll, doc! {"_id": 1_i64, "a": 1}).unwrap();
+        engine.insert(&coll, doc! {"_id": 2_i64}).unwrap();
+        assert!(engine.delete(&coll, &DocId::Int64(2)).unwrap());
+        let (commits, oplog, clock) =
+            (engine.commits(), engine.oplog_entries().unwrap(), engine.clock_last());
+        let mut rx = engine.subscribe();
+
+        // Missing, and a tombstone: nothing to remove.
+        assert!(!engine.delete(&coll, &DocId::Int64(99)).unwrap());
+        assert!(!engine.delete(&coll, &DocId::Int64(2)).unwrap());
+        assert_eq!(engine.delete_if(&coll, &DocId::Int64(99), None).unwrap(), None);
+        // A guard that declines, which is a refused expiry.
+        assert!(!engine.delete_guarded(&coll, &DocId::Int64(1), |_| false).unwrap());
+        // A stale stamp, and a stamp for a document that is not there.
+        let other = Stamp { hlc: stamp.hlc.successor(), node: stamp.node };
+        assert!(engine.delete_if(&coll, &DocId::Int64(1), Some(other)).is_err());
+        assert!(engine.delete_if(&coll, &DocId::Int64(99), Some(stamp)).is_err());
+
+        assert_eq!(engine.clock_last(), clock, "no stamp minted");
+        assert_eq!(engine.oplog_entries().unwrap(), oplog, "nothing logged");
+        assert_eq!(engine.commits(), commits, "nothing committed");
+        assert!(rx.try_recv().is_err(), "nothing published");
+
+        // And the delete that does remove one still mints, logs and publishes.
+        assert!(engine.delete(&coll, &DocId::Int64(1)).unwrap());
+        assert!(engine.clock_last() > clock);
+        assert_eq!(engine.oplog_entries().unwrap(), oplog + 1);
+        assert!(rx.try_recv().is_ok());
+    }
+
+    /// An insert refused for a stored id does not tick the clock either, alone
+    /// or as the first document of a batch.
+    #[test]
+    fn an_insert_refused_for_a_duplicate_mints_nothing() {
+        let (engine, coll, _dir) = engine();
+        engine.insert(&coll, doc! {"_id": 1_i64}).unwrap();
+        let (commits, oplog, clock) =
+            (engine.commits(), engine.oplog_entries().unwrap(), engine.clock_last());
+
+        assert!(engine.insert(&coll, doc! {"_id": 1_i64, "a": 2}).is_err());
+        assert!(engine.insert_many(&coll, vec![doc! {"_id": 1_i64}, doc! {"_id": 3_i64}]).is_err());
+
+        assert_eq!(engine.clock_last(), clock, "no stamp minted");
+        assert_eq!(engine.oplog_entries().unwrap(), oplog, "nothing logged");
+        assert_eq!(engine.commits(), commits, "nothing committed");
+
+        // A tombstone is not a conflict: the insert resurrects it and ticks.
+        assert!(engine.delete(&coll, &DocId::Int64(1)).unwrap());
+        let clock = engine.clock_last();
+        engine.insert(&coll, doc! {"_id": 1_i64, "back": true}).unwrap();
+        assert!(engine.clock_last() > clock);
     }
 
     #[test]

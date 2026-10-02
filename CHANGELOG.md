@@ -345,6 +345,19 @@ breaking changes and says so here; a `0.x.PATCH` bump never does.
   refuse one, since that refusal is about equality. See aggregation.md,
   "Behaviours worth knowing", and ADR-207's amendment.
 
+- **A write that finds nothing to do no longer advances the clock.** Each minted
+  its stamp before looking, so a delete of a missing document or a tombstone, a
+  delete a guard declined (a refused expiry) or a stale stamp refused, an insert
+  whose `_id` was already live, and a create of a database or collection that
+  was already there or was history, ticked the hybrid clock and consumed a stamp
+  for a write that was never made, though nothing was committed, logged or
+  published. The stamp is now minted once the write is certain, under the
+  writer, so these leave the clock, the oplog and the change streams exactly as
+  they were. Two leftovers keep their stamp: a batch insert whose later document
+  collides still ticks for the documents before it, whose stamps are minted
+  before the collision is found, and aborts as it did; and a write a unique
+  index refuses is found after its stamp is minted, and still ticks the clock.
+
 - **A start that fails after it opens the store no longer leaves it needing
   repair.** The cluster listener's port in use, or any other failure past the
   open, left redb's recovery-required flag set: a background task that held the
