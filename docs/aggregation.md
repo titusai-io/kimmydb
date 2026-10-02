@@ -261,7 +261,11 @@ field path.
 (see [Stages](#stages)): `$filter`, `$map`, `$reduce`, `$let`, `$convert`,
 `$switch` (and each of its branches) and `$dateToString` refuse a key they do
 not define — `{"input": "$items", "condition": …}` inside `$filter` is a
-`400` naming `condition`, not a silently unfiltered array.
+`400` naming `condition`, not a silently unfiltered array. **That holds for
+all of them, on purpose** ([ADR-217](decisions.md#adr-217--the-refusals-and-differences-ruled-to-stay-are-recorded-as-a-set)): a pipeline carrying an extra key
+is refused, and the message names the key to drop. A refused typo is better
+than an answer that is wrong without a sign. (See [Deviations](deviations.md)
+for a pipeline ported from elsewhere.)
 
 ### How a value is read
 
@@ -425,9 +429,24 @@ fail the pipeline, and errors when it is any other type, so `{$size: "$name"}`
 on a string is a 400 rather than a silent null. `$isArray` is the exception and
 answers `false` for anything that is not an array.
 
+**That is the rule on purpose** ([ADR-217](decisions.md#adr-217--the-refusals-and-differences-ruled-to-stay-are-recorded-as-a-set)). A null or missing argument to
+`$size`, `$in`, `$range`, `$slice`, `$arrayElemAt`, `$indexOfArray`, the set
+operators and `$anyElementTrue` / `$allElementsTrue` answers null, because a
+sparse collection is the norm here. `{$addFields: {n: {$size: "$tags"}}}` over a
+document with no `tags` gives `n: null`, not a failed request. A pipeline that needs to catch bad data tests for
+the bad value, for example `{$match: {$expr: {$eq:
+[{$isArray: "$tags"}, false]}}}`, which finds the documents whose `tags` is
+not an array, a missing one included. (See [Deviations](deviations.md).)
+
 **`$arrayElemAt` counts from the end when negative** (`-1` is the last element)
 and is null when the index is out of range on either side. **`$first`** and
 **`$last`** are `$arrayElemAt` at `0` and `-1`; on an empty array they are null.
+**Null here is the rule, on purpose**
+([ADR-217](decisions.md#adr-217--the-refusals-and-differences-ruled-to-stay-are-recorded-as-a-set)): an expression always yields a value, so `{$addFields: {head:
+{$first: "$lines"}}}` over `lines: []` writes `head: null` and the field is
+*present*. A later `$match` on `{head: {$exists:
+true}}` keeps the document here, and the same holds for an index out of range
+and for a field path that resolves to nothing.
 **A fractional index is refused**, not truncated.
 
 **`$slice` has two shapes.** `[array, n]` takes the first `n`, or the last
@@ -473,7 +492,9 @@ element (see [`$unwind`](#unwind) and [ADR-130](decisions.md)).
 **`$range`** produces at most 100,000 integers — the same ceiling as the
 pipeline, for the same reason: `{$range: [0, 1000000000]}` is a memory
 exhaustion written as an expression, and it is refused before anything is
-allocated. Its elements are 64-bit integers, as every integer result here is.
+allocated. Its elements are 64-bit integers, as every integer result here is
+, so `$type` of an element is `"long"`
+([ADR-217](decisions.md#adr-217--the-refusals-and-differences-ruled-to-stay-are-recorded-as-a-set)).
 
 ### Sets
 
@@ -613,13 +634,30 @@ What converts to what:
 |---|---|
 | `double` | any number; bool (`0`/`1`); date (epoch milliseconds); string, parsed strictly — `"1.5"`, `"-1e3"`; not `"1.5kg"` |
 | `int`, `long` | any number, **truncated toward zero** and refused when out of range — `$toInt` of 2^40 is an error, not a wrap; bool; string as a base-10 integer — `"42"`, not `"1.5"`; date to `long` only (epoch milliseconds never fit an int) |
-| `string` | number (a whole double prints as `"2"`, not `"2.0"`); bool; date as ISO 8601 with milliseconds, `"2026-08-12T13:45:07.250Z"`; ObjectId as 24 hex characters |
+| `string` | number (a whole double prints as `"2"`, not `"2.0"`, and a double never prints in exponent form); bool; date as ISO 8601 with milliseconds, `"2026-08-12T13:45:07.250Z"`; ObjectId as 24 hex characters |
 | `bool` | a number is `false` when zero, a stored `Decimal128` zero of any sign or exponent included; **everything else present is `true`** — including `""` and `"false"`, which is MongoDB's rule and a trap worth knowing |
 | `date` | a number as epoch milliseconds (a double is truncated); a string in RFC 3339 / ISO 8601 with an offset or `Z`, or the looser forms `"2026-08-12"`, `"2026-08-12 13:45:07"` and a missing zone, all read as UTC; an ObjectId's creation time |
 | `objectId` | a string of 24 hex characters |
 
 Everything not in the table — an array to a number, a document to a date — is
-an error. **`decimal` (`Decimal128`) is refused at parse**: it has no exact key
+an error.
+
+**Four rules of the table, on purpose**
+([ADR-217](decisions.md#adr-217--the-refusals-and-differences-ruled-to-stay-are-recorded-as-a-set), [Deviations](deviations.md)):
+
+- **An `int` converts to a `date`** (as epoch milliseconds, like a `long` or a
+  double): `{$toDate: 1500}` is `1970-01-01T00:00:01.500Z`.
+- **`to` is a constant**: a type name or a numeric code. A field path or
+  other expression there is a `400` at parse, before any document is read.
+- **A string converts to a date in these spellings and no others**: RFC 3339
+  with `Z` or a `±hh:mm` offset; a date alone (midnight UTC); a space for the
+  `T`; and a time with no zone, read as UTC. `+0500`, `13:45` with no seconds,
+  month names and `20260812` are errors.
+- **A double converts to a string in plain decimal digits, never exponent
+  form**: `1e21` is `"1000000000000000000000"` and `1e-7` is `"0.0000001"`.
+  The engine's JSON output prints doubles the same way.
+
+**`decimal` (`Decimal128`) is refused at parse**: it has no exact key
 encoding here ([ADR-005](decisions.md)), so a value converted to it could be
 neither indexed nor grouped, and producing one would only move the refusal
 somewhere less obvious. Convert to `double` or `long` instead.
@@ -744,8 +782,13 @@ document, the `let` names are the only way to reach the local one, and every
 stage takes them — `$project`, `$addFields`, `$group`, `$replaceRoot` and a
 nested `$lookup`'s own `let` included. `let` may be omitted for an uncorrelated
 join, and a `$lookup` may not carry both `localField`/`foreignField` and
-`pipeline`: join on the key, then reshape the attached array with `$filter` or
-`$map` in the following `$addFields`.
+`pipeline` (or `let`): that is a `400`, kept on purpose ([ADR-217](decisions.md#adr-217--the-refusals-and-differences-ruled-to-stay-are-recorded-as-a-set)). Join
+on the key, then reshape the attached array with `$filter` or `$map` in the
+following `$addFields`: `{"$addFields": {"unpaid": {"$filter": {"input":
+"$unpaid", "as": "i", "cond": {"$eq": ["$$i.paid", false]}}}}}` after an
+equality `$lookup` into `unpaid`. The equality join attaches every match
+before the filter drops any, so the ceiling below counts what the join
+attached. The refusal is revisited if a caller meets that ceiling.
 
 **This form is O(local × foreign).** The sub-pipeline may do anything at all
 with the variables, so there is no one key to index the foreign side by; it is
@@ -774,10 +817,13 @@ or not the `$lookup` has a `let`. The one exception is the subtree under
 `$expr`, which the expression parser owns and checks by its own rule. The
 scope is the sub-pipeline: a top-level `$match`, and a `find` filter, read
 `"$$oid"` as the literal string a stored document may hold. There is no
-literal escape inside a sub-pipeline `$match` — a stored string that begins
-with `$$` cannot be matched there — and the register records that as a
-deliberate difference from MongoDB. Correlate in a computed field and
-`$match` on that, as the example does. `$expr` in a filter
+plain-value escape inside a sub-pipeline `$match`, and the register records
+that as a deliberate difference from MongoDB ([ADR-217](decisions.md#adr-217--the-refusals-and-differences-ruled-to-stay-are-recorded-as-a-set)). **A stored string
+that begins with `$$` is matched there through `$expr` and `$literal`**, which
+the expression parser reads as a string and never as a reference:
+`{"$match": {"$expr": {"$eq": ["$code", {"$literal": "$$promo"}]}}}`. That
+comparison is `$expr`'s `$eq`, not the filter's. To correlate, compute a
+field and `$match` on that, as the example does. `$expr` in a filter
 — which is the natural place for a correlation,
 `{$match: {$expr: {$eq: ["$order", "$$oid"]}}}` — is a separate addition to
 the filter language and, once the two compose, will be the direct way to
@@ -911,10 +957,10 @@ documents holding large arrays can exceed the cap long before the stage ends.
 |---|---|
 | `$zip`, `$sortArray` | Not built, by decision: both are refused at parse as **unknown operators**. `$map` over a `$range` of indexes, with `$arrayElemAt`, reads several arrays by position, and an `$unwind`, `$sort` and `$group` with `$push` orders an array's elements |
 | System variables other than `$$ROOT` and `$$CURRENT` — `$$NOW`, `$$REMOVE`, `$$DESCEND`, `$$PRUNE`, `$$KEEP` | Not built. Refused with a message saying so, rather than as an unknown name |
-| `$lookup` with both `localField`/`foreignField` and `pipeline` | Refused. Join on the key, then `$filter`/`$map` the attached array in the next stage |
+| `$lookup` with both `localField`/`foreignField` and `pipeline` | Refused, by decision ([ADR-217](decisions.md#adr-217--the-refusals-and-differences-ruled-to-stay-are-recorded-as-a-set)). Join on the key, then `$filter`/`$map` the attached array in the next stage |
 | `$convert` to `decimal` (or code `19`) | `Decimal128` has no exact key encoding ([ADR-005](decisions.md)); refused at parse, naming `double` and `long` as the alternatives |
 | A `Decimal128` literal — bare, under `$literal`, or inside a document or array written in an expression | The same reason from the other side: the canonical order ranks a Decimal128 equal to every other number, so a comparison against one would hold for every number and a value computed from one could be neither indexed nor grouped. Refused at parse — `a Decimal128 literal is not supported in an expression` — wherever an expression is parsed, `$expr` included. A `$sort` stage refuses a document holding one at a sort path the way `find`'s sort does ([Query language](query-language.md#sort-and-projection)); a *stored* Decimal128 read through a field path is not refused, and `$type` finds it, except by the set operators, which refuse one in their input rather than compare it ([ADR-207](decisions.md), [Sets](#sets)); where truth is read, a `Decimal128` zero is false like any zero ([What reads as false](#behaviours-worth-knowing)) |
-| `$toDecimal` | Never built as an operator at all, so it is refused at parse as an **unknown operator** — `unsupported operator "$toDecimal": not an expression operator` — rather than with the pointer `$convert` gives. The reason is the row above; the message does not say so |
+| `$toDecimal` | Never built as an operator, and refused at parse with the reason `$convert` gives for `decimal`: `unsupported operator "$toDecimal": Decimal128 has no exact key encoding in this engine, so the result could be neither indexed nor grouped; convert to double or long instead`. A `400`, as before; only the explanation is new |
 | `$facet`, `$bucket`, `$graphLookup`, `$merge`, `$out` | Not built. An unknown stage is refused with a message listing what is supported |
 | `$vectorSearch` anywhere but first, or inside a `$lookup` sub-pipeline | `400`, naming the rule: it is the pipeline's source, in place of the collection scan |
 | `$vectorSearch` fields from other systems — `queryVector`, `numCandidates`, `limit`, `index` | Refused, each naming the KimmyDB spelling (`vector`, `k`) or saying there is no such knob: KimmyDB has one vector index per collection ([ADR-216](decisions.md)) |

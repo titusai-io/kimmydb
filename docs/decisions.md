@@ -24286,3 +24286,155 @@ Through the router, `/readyz`'s exact keys and values for each cause and the
 `503`'s `owed_members`, validated against the specification, and no owner work
 of any class while owed. Each guard was broken and its test failed (recorded in
 the pull request).
+
+---
+
+## ADR-217 — The refusals and differences ruled to stay are recorded as a set
+
+**Status:** accepted, decided 2026-09-29 and recorded for the next
+`0.MINOR`. Records ten rulings that leave behaviour as it is, with the one
+message change that came with them. Supplements
+[ADR-104](#adr-104--array-elements-are-addressed-by-filtered-identifiers-not-by-query-position),
+[ADR-105](#adr-105--expressions-evaluate-in-a-lexical-scope),
+[ADR-106](#adr-106--expr-joins-the-filter-language-by-delegating-to-the-expression-evaluator)
+and [ADR-129](#adr-129--an-aggregation-stage-operand-with-a-fixed-key-set-is-closed-a-field-path-map-stays-open),
+and rests on [ADR-005](#adr-005--exact-mantissaexponent-numeric-encoding),
+[ADR-121](#adr-121--a-request-body-with-a-field-the-route-does-not-define-is-refused)
+and
+[ADR-124](#adr-124--a-route-that-reads-no-query-string-refuses-every-query-string).
+
+**Why a record.** Each item below is a place where a request a caller might
+reasonably write is refused, or answers in a way the caller might not expect,
+and each was put to a decision: implement it, keep it and say so, or refuse it
+loudly. The register in `deviations.md` is where a caller porting a query from
+elsewhere finds the comparison. Nineteen items went through that pass. Nine of them were built, under
+ADRs of their own, and ten were kept, and a kept item that nobody wrote down is
+a question that comes back. This is the written answer, so that the next
+person to ask finds it, with the reason, instead of reopening it.
+
+**The rule they share.** A request that means two things, or that this
+database cannot answer exactly, is answered with a `400` that names the
+replacement, never with a `200` that is wrong in a way the caller cannot see
+([ADR-121](#adr-121--a-request-body-with-a-field-the-route-does-not-define-is-refused),
+[ADR-124](#adr-124--a-route-that-reads-no-query-string-refuses-every-query-string)).
+Where a difference leaves every request that is accepted meaning the same
+thing here as there, it is documented and kept.
+
+### Five refusals that stay
+
+Each of these is a `400` today, each names what to write instead, and nothing
+is written when it fires. None changes in this release.
+
+- **The `$` positional operator in an update path** (`items.$.shipped`). The
+  message points at `$[<identifier>]` with `arrayFilters`, or `$[]`. `$` means
+  the element the *filter* matched, and the matcher answers a boolean: giving
+  it a position would mean a second evaluation mode, a rule for which array
+  wins when a filter touches several, and a value carried from the match into
+  the write. `$[<identifier>]` says the same thing, selects every matching
+  element rather than the first, and needs none of it
+  ([ADR-104](#adr-104--array-elements-are-addressed-by-filtered-identifiers-not-by-query-position)).
+- **A `$push` document with a `$`-prefixed key beside others.** A document
+  argument with any key beginning with `$` is read as modifiers, so
+  `{"sku": "b", "$each": [1]}` is a `400` (`$push: unrecognized clause
+  "sku"`). Reading only the first key would push that document literally and
+  store a `$` key nobody meant to store. Nothing that starts with `$` is a
+  value a caller wants kept, so the stricter rule only turns a misfiling into
+  an error. `$addToSet` is the same.
+- **A key an expression operator or a stage does not define**, on nine
+  operands: `$filter`, `$map`, `$reduce` and `$let`, and, under ADR-129,
+  `$unwind`'s document form, `$lookup`, `$replaceRoot`, `$switch` and
+  `$dateToString`; `$convert` refuses the same way. `{"$filter": {"input":
+  "$items", "condition": …}}` is a `400` naming `condition`. Ignoring the
+  key would return the whole array, which is the one answer a typo should
+  never produce. A pipeline that carries a harmless extra key drops it.
+- **A `$lookup` that joins on a key and also runs a pipeline.** `localField`
+  and `foreignField` with `pipeline` or `let` is a `400` that says to join on
+  the key and `$filter` or `$map` the attached array in the next stage. That
+  form holds the whole join in memory before it filters, and the ceiling of
+  100,000 documents counts what is attached. It is revisited if a caller
+  meets that ceiling, and not before.
+- **A `$$` string in a `$lookup` sub-pipeline `$match`.** Any string value
+  beginning with `$$` there is a `400`, because inside a sub-pipeline it is
+  far more often a `let` name the author expected to be substituted than a
+  stored value, and read as a literal it produces an empty join with a `200`.
+  The escape that already exists is the expression language's:
+  `{"$match": {"$expr": {"$eq": ["$code", {"$literal": "$$promo"}]}}}`. The
+  `$expr` subtree is the expression parser's, which never reads a string a
+  `$literal` holds as a reference, so a stored value that begins with `$$`
+  can be matched from inside a sub-pipeline, with `$expr`'s own comparison
+  rules. No second escape is added to the filter language.
+
+### Four differences that stay, documented
+
+Each leaves every request that is accepted meaning one thing, stated in the
+reference docs; what differs is a spelling of a result, or a place a request
+is accepted that a caller might not expect.
+
+- **`$expr` is accepted inside a document-form `$elemMatch`.** It reads the
+  element as the document. It is an extension of the filter language ([ADR-106](#adr-106--expr-joins-the-filter-language-by-delegating-to-the-expression-evaluator)).
+- **Null in, null out, in the array operators.** `$size`, `$in`, `$range`,
+  `$slice`, `$arrayElemAt`, `$indexOfArray`, the set operators and the two
+  element-truth operators answer null for a null or missing array, number or
+  index, and a non-array or non-number is still a `400`
+  ([ADR-105](#adr-105--expressions-evaluate-in-a-lexical-scope)). A sparse
+  collection is the norm here, and failing a whole request because one
+  document lacks `tags` is the wrong trade. A caller who wants to catch bad
+  data tests for it with `$isArray` or `$type`.
+- **`$range` elements are 64-bit integers**, under the standing rule that an
+  integer result of the expression language is an `Int64`. `$type` over an
+  element says `"long"`.
+- **Missing is null in an expression.** `$arrayElemAt` out of range, `$first`
+  and `$last` on an empty array, and a field path that resolves to nothing
+  are null, so a field computed from one is present with `null` and not
+  absent from the output document. A missing field is already null everywhere
+  else in the expression language; making this one place different would make
+  the rule harder to state than the difference is worth.
+
+### `$convert` and `$toDecimal`
+
+The four differences in type conversion are kept and documented exactly
+(aggregation.md, "Type conversion"; the register entry):
+
+- an `int` converts to a `date`, as a number of epoch milliseconds;
+- `to` is a constant, a type name or a numeric code, and a field path or any
+  other expression there is a `400`;
+- a string converts to a date in RFC 3339 and in three looser spellings (a
+  date alone, a space for the `T`, and no zone, read as UTC), and in nothing
+  else;
+- a double converts to a string in plain decimal digits and never in exponent
+  form.
+
+`decimal` stays refused ([ADR-005](#adr-005--exact-mantissaexponent-numeric-encoding)).
+The one change is a message. `$toDecimal` was never built, so it was refused
+as an unknown operator and the message pointed at nothing, where `$convert`
+to `decimal` explained itself. `$toDecimal` is now refused with that
+explanation, in the `unsupported operator "$toDecimal": …` template, so a
+client that reads the operator out of the quotes still finds it there. It was
+a `400` before and is a `400` now: not a breaking change.
+
+**Rejected.**
+
+- *Build each of the ten differently.* Five would turn a loud refusal into
+  either a silent answer (a typo ignored, a `$$` name read as text, a
+  `$push` document stored with a `$` key) or a feature with no caller (the
+  positional `$`); the other five would change what a working request
+  returns, for the sake of a spelling.
+- *Refuse the four differences instead of documenting them.* Each refuses
+  something harmless, which is a rule nobody could predict.
+- *A per-request strictness flag* for the null rule or the unknown-key rule.
+  Two behaviours for one operator is worse than one.
+
+**Not changed.** No stored state, no wire format, no oplog entry and no
+replication behaviour is touched; the one code change is the text of a `400`.
+Nothing here is a rollback boundary.
+
+### Test
+
+`kimmy-query` `expr`: `$toDecimal` refused with `$convert`'s reason, for a
+field path, a one-element array and a constant, and as an operator named in
+the quotes; the operator-slot test uses a genuinely unknown operator for its
+unknown case. `aggregate`: a stored `$$` string is matched from a sub-pipeline
+through `$expr` and `$literal` and still refused bare. The refusals this ADR
+keeps are pinned where they were built: the `$` positional refusal and the
+`$push` unrecognized clause in `update`, the closed key sets in `expr` and
+`aggregate`, and the combined `$lookup` in `aggregate`.

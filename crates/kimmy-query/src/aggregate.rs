@@ -2937,6 +2937,36 @@ mod tests {
         assert!(err.contains("$$oid"), "{err}");
     }
 
+    /// The refusal has a way round, recorded in the Deviations register:
+    /// `$literal` under `$expr`. The `$expr` subtree is the expression
+    /// parser's, which reads a string a `$literal` holds as a string and
+    /// never as a reference, so a stored value that begins with `$$` can be
+    /// matched from inside a sub-pipeline without a `let` name being guessed.
+    #[test]
+    fn a_literal_under_expr_matches_a_stored_variable_string_in_a_sub_pipeline() {
+        let stages = parse(&[doc! {"$lookup": {
+            "from": "coupons", "let": {"oid": "$_id"},
+            "pipeline": [{"$match": {"$expr": {"$eq": ["$code", {"$literal": "$$promo"}]}}}],
+            "as": "c"
+        }}])
+        .unwrap();
+        let foreign = [
+            doc! {"_id": 1, "code": "$$promo", "pct": 10},
+            doc! {"_id": 2, "code": "SAVE5", "pct": 5},
+            doc! {"_id": 3, "code": "promo", "pct": 1},
+        ];
+        let out = join_in_memory(&stages[0], vec![doc! {"_id": 100}], &foreign);
+        assert_eq!(out[0].get_array("c").unwrap(), &vec![Bson::from(foreign[0].clone())]);
+        // The same string written bare, in the same stage, is still refused.
+        assert!(
+            parse(&[doc! {"$lookup": {
+                "from": "coupons", "let": {"oid": "$_id"},
+                "pipeline": [{"$match": {"code": "$$promo"}}], "as": "c"
+            }}])
+            .is_err()
+        );
+    }
+
     /// The refusal is scoped to sub-pipelines: at the top level there is no
     /// `let` a `$$` string could mean, and a stored document may hold one.
     #[test]

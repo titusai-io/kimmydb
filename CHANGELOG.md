@@ -378,6 +378,31 @@ breaking changes and says so here; a `0.x.PATCH` bump never does.
   the condition out ([Query language](docs/query-language.md#array),
   [Deviations](docs/deviations.md)).
 
+- **`$toDecimal` says why it is refused.** It was never an operator, so it was
+  refused as an unknown one with a message that pointed at nothing, where
+  `$convert` to `decimal` explained itself. It is now refused with the same
+  explanation, `unsupported operator "$toDecimal": Decimal128 has no exact key
+  encoding in this engine, so the result could be neither indexed nor grouped;
+  convert to double or long instead`, still in the `unsupported operator`
+  template and still a `400`. Not breaking: only the text changes. See
+  aggregation.md, "Type conversion", and ADR-217.
+
+### Documented
+
+- **The refusals and differences that were ruled to stay are recorded, each
+  with the way to write the request that works.** Nothing the server does
+  changes for these. Refused, on purpose: the `$` positional operator in an
+  update path; a `$push` document with a `$`-prefixed key beside others; an
+  unknown key on `$filter`, `$map`, `$reduce`, `$let` and the stage and
+  expression operands ADR-129 closed; a `$lookup` that joins on a key and also
+  runs a pipeline; and a string value beginning with two dollar signs in a
+  `$lookup` sub-pipeline `$match`, where a stored string that begins that way
+  is matched through `$expr` and `$literal`. Different, on purpose: `$expr` inside `$elemMatch`;
+  null in, null out in the array operators; `$range`'s 64-bit elements;
+  missing as null in an expression; and the four `$convert` differences, with
+  the accepted date spellings and the double-to-string rendering written out.
+  See Deviations and ADR-217.
+
 ### Fixed
 
 - **A stored `Decimal128` zero reads as false wherever truth is read.** The

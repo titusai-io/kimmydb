@@ -349,6 +349,11 @@ pub enum ConvertTo {
     Long,
 }
 
+/// Why `decimal` is not a conversion target, in the words `$convert` and
+/// `$toDecimal` both refuse with (ADR-005).
+const DECIMAL_TARGET_REASON: &str = "Decimal128 has no exact key encoding in this engine, so the \
+     result could be neither indexed nor grouped; convert to double or long instead";
+
 /// Refuse a `Decimal128` literal, wherever an expression would hold one.
 ///
 /// The reason `$convert` refuses `decimal` as a target, met from the other
@@ -405,12 +410,9 @@ impl ConvertTo {
             "int" => ConvertTo::Int,
             "long" => ConvertTo::Long,
             "decimal" => {
-                return Err(Error::InvalidQuery(
-                    "$convert to decimal is not supported: Decimal128 has no exact key encoding \
-                     in this engine, so the result could be neither indexed nor grouped; convert \
-                     to double or long instead"
-                        .into(),
-                ));
+                return Err(Error::InvalidQuery(format!(
+                    "$convert to decimal is not supported: {DECIMAL_TARGET_REASON}"
+                )));
             }
             other => {
                 return Err(Error::InvalidQuery(format!(
@@ -949,6 +951,12 @@ impl Expr {
             "$map" => Self::parse_map(raw, declared),
             "$reduce" => Self::parse_reduce(raw, declared),
             "$convert" => Self::parse_convert(raw, declared),
+            // The one `$toX` name that is not a shorthand: it has no target to
+            // convert to, so it is refused with the reason `$convert` gives.
+            "$toDecimal" => Err(Error::UnsupportedOperator {
+                operator: "$toDecimal".into(),
+                reason: Some(DECIMAL_TARGET_REASON.into()),
+            }),
             name if ConvertTo::from_shorthand(name).is_some() => {
                 Self::parse_convert_shorthand(name, raw, declared)
             }
@@ -4298,6 +4306,30 @@ mod tests {
         for result in [by_name, by_code] {
             let msg = result.expect_err("decimal must be refused").to_string();
             assert!(msg.contains("Decimal128"), "the refusal should say why: {msg}");
+        }
+    }
+
+    #[test]
+    fn to_decimal_is_refused_for_the_reason_convert_gives() {
+        // The shorthand was never an operator; it used to be refused as an
+        // unknown one, and the message pointed at nothing. It now says why,
+        // in the words `$convert` uses, and still names the operator in the
+        // quotes of the `unsupported operator` template.
+        let convert = Expr::parse(&doc! {"$convert": {"input": 1, "to": "decimal"}}.into())
+            .expect_err("decimal must be refused")
+            .to_string();
+        let reason =
+            convert.split_once("not supported: ").map(|(_, rest)| rest).expect("a reason follows");
+        for arg in [Bson::from("$n"), Bson::from(vec![Bson::from("$n")]), Bson::Int32(1)] {
+            let err = Expr::parse(&doc! {"$toDecimal": arg}.into()).expect_err("must be refused");
+            assert!(matches!(err, Error::UnsupportedOperator { .. }), "{err:?}");
+            assert_eq!(
+                err.to_string(),
+                "unsupported operator \"$toDecimal\": Decimal128 has no exact key encoding in \
+                 this engine, so the result could be neither indexed nor grouped; convert to \
+                 double or long instead"
+            );
+            assert!(err.to_string().ends_with(reason), "{err} vs {convert}");
         }
     }
 
