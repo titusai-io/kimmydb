@@ -62,7 +62,7 @@ has been incomplete before.
 | `POST` | `/v1/db/{db}/coll/{coll}/update` | `write` |
 | `POST` | `/v1/db/{db}/coll/{coll}/find_and_modify` | `write` |
 | `POST` | `/v1/db/{db}/coll/{coll}/delete` | `write` |
-| `POST` | `/v1/db/{db}/coll/{coll}/aggregate` | `read` — see [Aggregation](aggregation.md) |
+| `POST` | `/v1/db/{db}/coll/{coll}/aggregate` | `read` (and `search`, implied by it, for a `$vectorSearch` stage) — see [Aggregation](aggregation.md) |
 | `GET` | `/v1/db/{db}/coll/{coll}/describe` | `read` |
 | `POST` | `/v1/db/{db}/coll/{coll}/vector` | `ddl` — configure embedding ([Vectors](vectors.md)) |
 | `GET` `PUT` `DELETE` | `/v1/db/{db}/coll/{coll}/docs/{id}/vectors` | `read` / `write` / `write` |
@@ -1237,7 +1237,6 @@ the property above removes.
 
 | | |
 |---|---|
-| `$vectorSearch` as a pipeline stage | The pipeline itself is built ([Aggregation](aggregation.md)); vector search remains its own endpoint |
 | Database- and cluster-scoped watch routes | Implemented in storage, no route yet |
 | Client certificates (mTLS) | Not planned — the server proves itself, clients authenticate with a bearer token |
 

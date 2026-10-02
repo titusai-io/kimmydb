@@ -558,7 +558,9 @@ impl KimmyMcp {
                        reduce. Stages: $match (filter, put it first so later stages see \
                        less), $group (with $sum, $avg, $min, $max, $first, $last, $push, \
                        $addToSet), $unwind, $project, $sort, $skip, $limit, $count, and \
-                       $lookup (join; you need read access to the joined collection too). \
+                       $lookup (join; you need read access to the joined collection too), and \
+                       $vectorSearch (semantic search as the first stage, with query or \
+                       vector, k, per_document, filter; needs read access). \
                        Field references are written \"$field\"; computed expressions \
                        ($add, $concat, $cond, $size, $filter, $map and the rest) work \
                        anywhere a value is derived. A pipeline that would hold too many \
@@ -569,13 +571,10 @@ impl KimmyMcp {
         ctx: RequestContext<RoleServer>,
     ) -> Result<CallToolResult, ErrorData> {
         let auth = principal(&ctx)?;
-        render(exec::aggregate(
-            &self.state,
-            &auth,
-            &args.database,
-            &args.collection,
-            &args.pipeline,
-        ))
+        render(
+            exec::aggregate(&self.state, &auth, &args.database, &args.collection, &args.pipeline)
+                .await,
+        )
     }
 
     /// Semantic search.

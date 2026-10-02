@@ -119,6 +119,10 @@ pub enum Stage {
         fields: Vec<(String, Accumulator)>,
     },
     Count(String),
+    /// Vector search as the pipeline's source (ADR-216). Executed by the
+    /// caller, which owns the embedding provider and the index: the stage
+    /// replaces the collection scan, so it is only ever first.
+    VectorSearch(VectorSearch),
     /// Join against another collection. Executed by the caller — see the module
     /// documentation.
     Lookup {
@@ -126,6 +130,22 @@ pub enum Stage {
         as_field: String,
         join: Join,
     },
+}
+
+/// The fields of a `$vectorSearch` stage: the endpoint's own request fields
+/// and no others (ADR-216).
+#[derive(Clone, Debug, PartialEq)]
+pub struct VectorSearch {
+    /// Query text, embedded server-side.
+    pub query: Option<String>,
+    /// A pre-computed query vector; required under the `byo` provider.
+    pub vector: Option<Vec<f32>>,
+    /// Hits wanted; the endpoint's default and clamp apply when absent.
+    pub k: Option<usize>,
+    /// Chunks per document allowed into the hits.
+    pub per_document: Option<usize>,
+    /// Restrict hits to documents matching this filter.
+    pub filter: Option<Document>,
 }
 
 /// How a `$lookup` decides which foreign documents belong to an input document.
@@ -161,6 +181,7 @@ impl Stage {
             Stage::Group { .. } => "$group",
             Stage::Count(_) => "$count",
             Stage::Lookup { .. } => "$lookup",
+            Stage::VectorSearch(_) => "$vectorSearch",
         }
     }
 }
@@ -203,7 +224,7 @@ enum Placement {
 }
 
 fn parse_pipeline(pipeline: &[Document], vars: &[String], at: Placement) -> Result<Vec<Stage>> {
-    pipeline.iter().map(|stage| parse_stage(stage, vars, at)).collect()
+    pipeline.iter().enumerate().map(|(i, stage)| parse_stage(stage, vars, at, i)).collect()
 }
 
 /// The `$match` stages a pipeline *begins* with, merged into one filter, and
@@ -235,7 +256,7 @@ pub fn leading_match(stages: &[Stage]) -> Option<(Filter, usize)> {
     }
 }
 
-fn parse_stage(stage: &Document, vars: &[String], at: Placement) -> Result<Stage> {
+fn parse_stage(stage: &Document, vars: &[String], at: Placement, index: usize) -> Result<Stage> {
     if stage.len() != 1 {
         return Err(Error::InvalidQuery(format!(
             "a pipeline stage must have exactly one key naming the operator, found {}",
@@ -269,15 +290,120 @@ fn parse_stage(stage: &Document, vars: &[String], at: Placement) -> Result<Stage
         "$unwind" => parse_unwind(value),
         "$group" => parse_group(as_document(name, value)?, vars),
         "$lookup" => parse_lookup(as_document(name, value)?, vars),
+        "$vectorSearch" => {
+            // The stage is the pipeline's source, in place of the collection
+            // scan, so it can only be the first stage of the top-level
+            // pipeline; a `$lookup` sub-pipeline's source is the foreign
+            // collection scan.
+            if at == Placement::SubPipeline {
+                return Err(Error::InvalidQuery(
+                    "$vectorSearch must be the first stage of the top-level pipeline; it cannot \
+                     run inside a $lookup sub-pipeline"
+                        .into(),
+                ));
+            }
+            if index != 0 {
+                return Err(Error::InvalidQuery(format!(
+                    "$vectorSearch must be the first stage of the pipeline (it is the source), \
+                     but it is stage {}",
+                    index + 1
+                )));
+            }
+            parse_vector_search(as_document(name, value)?)
+        }
         // `UnsupportedOperator` renders its payload quoted — `unsupported
         // operator "x"` — so the guidance goes in an `InvalidQuery`, whose
         // format composes with a sentence. Both are a 400; this is about the
         // message a caller actually reads.
         other => Err(Error::InvalidQuery(format!(
             "{other} is not a pipeline stage; supported: $match, $project, $addFields, $set, \
-             $replaceRoot, $sort, $limit, $skip, $unwind, $group, $count, $lookup"
+             $replaceRoot, $sort, $limit, $skip, $unwind, $group, $count, $lookup, $vectorSearch"
         ))),
     }
+}
+
+/// Parse a `$vectorSearch` stage.
+///
+/// The spelling is the vector endpoint's own: `query` or `vector`, `k`,
+/// `per_document`, `filter`. The names another system uses for the same things
+/// are refused with the KimmyDB spelling, not aliased (ADR-216).
+fn parse_vector_search(spec: &Document) -> Result<Stage> {
+    let mut out =
+        VectorSearch { query: None, vector: None, k: None, per_document: None, filter: None };
+    for (key, value) in spec {
+        match key.as_str() {
+            "query" => match value {
+                Bson::String(text) => out.query = Some(text.clone()),
+                _ => {
+                    return Err(Error::InvalidQuery(format!(
+                        "$vectorSearch `query` must be a string, found {}",
+                        type_name(value)
+                    )));
+                }
+            },
+            "vector" => out.vector = Some(parse_query_vector(value)?),
+            "k" => out.k = Some(as_count("$vectorSearch `k`", value)?),
+            "per_document" => {
+                out.per_document = Some(as_count("$vectorSearch `per_document`", value)?)
+            }
+            "filter" => out.filter = Some(as_document("$vectorSearch `filter`", value)?.clone()),
+            "queryVector" => {
+                return Err(Error::InvalidQuery(
+                    "$vectorSearch does not take `queryVector`; use `vector`".into(),
+                ));
+            }
+            "limit" => {
+                return Err(Error::InvalidQuery(
+                    "$vectorSearch does not take `limit`; use `k` for the number of hits".into(),
+                ));
+            }
+            "numCandidates" => {
+                return Err(Error::InvalidQuery(
+                    "$vectorSearch does not take `numCandidates`: there is no such knob in \
+                     KimmyDB, which has one vector index per collection; `k` is the number of hits"
+                        .into(),
+                ));
+            }
+            "index" => {
+                return Err(Error::InvalidQuery(
+                    "$vectorSearch does not take `index`: there is nothing to name, KimmyDB has \
+                     one vector index per collection"
+                        .into(),
+                ));
+            }
+            other => {
+                return Err(Error::InvalidQuery(format!(
+                    "$vectorSearch does not take `{other}`; its fields are query, vector, k, \
+                     per_document and filter"
+                )));
+            }
+        }
+    }
+    if out.query.is_none() && out.vector.is_none() {
+        return Err(Error::InvalidQuery("$vectorSearch needs `query` text or a `vector`".into()));
+    }
+    Ok(Stage::VectorSearch(out))
+}
+
+fn parse_query_vector(value: &Bson) -> Result<Vec<f32>> {
+    let Bson::Array(items) = value else {
+        return Err(Error::InvalidQuery(format!(
+            "$vectorSearch `vector` must be an array of numbers, found {}",
+            type_name(value)
+        )));
+    };
+    items
+        .iter()
+        .map(|item| match item {
+            Bson::Double(d) => Ok(*d as f32),
+            Bson::Int32(n) => Ok(*n as f32),
+            Bson::Int64(n) => Ok(*n as f32),
+            other => Err(Error::InvalidQuery(format!(
+                "$vectorSearch `vector` must hold only numbers, found {}",
+                type_name(other)
+            ))),
+        })
+        .collect()
 }
 
 /// Refuse a `"$$name"` string value anywhere in a sub-pipeline `$match`.
@@ -795,6 +921,13 @@ pub fn apply_with_vars(
             unwind(input, p, *preserve_null_and_empty, include_array_index.as_deref(), limits)?
         }
         Stage::Group { id, fields } => group(input, id, fields, limits, vars)?,
+        Stage::VectorSearch(_) => {
+            return Err(Error::Unsupported(
+                "$vectorSearch is the pipeline's source and must be run by the executor that \
+                 holds the vector index, not by the pure pipeline"
+                    .into(),
+            ));
+        }
         Stage::Lookup { .. } => {
             // Not silently passed through: a join that returns its input
             // unchanged is a wrong answer wearing a right answer's shape.
@@ -2234,6 +2367,135 @@ mod tests {
             vec![doc! {"_id": 1, "qty": 5}],
         );
         assert!(err.is_err());
+    }
+
+    #[test]
+    fn vector_search_parses_with_the_endpoints_fields() {
+        let stages = parse(&[
+            doc! {"$vectorSearch": {"query": "shoes", "k": 5, "per_document": 2,
+            "filter": {"brand": "acme"}}},
+            doc! {"$match": {"price": {"$lt": 100}}},
+        ])
+        .unwrap();
+        let Stage::VectorSearch(v) = &stages[0] else { panic!("{:?}", stages[0]) };
+        assert_eq!(v.query.as_deref(), Some("shoes"));
+        assert_eq!((v.k, v.per_document), (Some(5), Some(2)));
+        assert_eq!(v.filter, Some(doc! {"brand": "acme"}));
+        let byo = parse(&[doc! {"$vectorSearch": {"vector": [1, 0.5, 0.0]}}]).unwrap();
+        let Stage::VectorSearch(v) = &byo[0] else { panic!() };
+        assert_eq!(v.vector.as_deref(), Some(&[1.0f32, 0.5, 0.0][..]));
+    }
+
+    #[test]
+    fn vector_search_must_be_the_first_stage() {
+        let err = parse(&[doc! {"$match": {}}, doc! {"$vectorSearch": {"query": "x"}}])
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("first stage"), "{err}");
+        assert!(err.contains("stage 2"), "{err}");
+        let err = parse(&[doc! {"$lookup": {
+            "from": "other", "let": {}, "pipeline": [{"$vectorSearch": {"query": "x"}}],
+            "as": "hits"
+        }}])
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("first stage of the top-level pipeline"), "{err}");
+    }
+
+    fn refusal(field: &str, value: Bson) -> String {
+        let spec = doc! {"query": "x", field: value};
+        parse(&[doc! {"$vectorSearch": spec}]).unwrap_err().to_string()
+    }
+
+    #[test]
+    fn vector_search_refuses_query_vector_and_says_use_vector() {
+        let err = refusal("queryVector", Bson::Array(vec![]));
+        assert!(err.contains("`queryVector`") && err.contains("use `vector`"), "{err}");
+    }
+
+    #[test]
+    fn vector_search_refuses_limit_and_says_use_k() {
+        let err = refusal("limit", Bson::Int32(5));
+        assert!(err.contains("`limit`") && err.contains("use `k`"), "{err}");
+    }
+
+    #[test]
+    fn vector_search_refuses_num_candidates_and_says_there_is_no_such_knob() {
+        let err = refusal("numCandidates", Bson::Int32(100));
+        assert!(err.contains("`numCandidates`") && err.contains("no such knob"), "{err}");
+        assert!(err.contains("one vector index per collection") && err.contains("`k`"), "{err}");
+    }
+
+    #[test]
+    fn vector_search_refuses_index_and_says_there_is_one_index() {
+        let err = refusal("index", Bson::String("idx".into()));
+        assert!(
+            err.contains("`index`") && err.contains("one vector index per collection"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn vector_search_refuses_unknown_and_malformed_fields() {
+        for spec in [
+            doc! {"query": "x", "bogus": 1},
+            doc! {},
+            doc! {"query": 3},
+            doc! {"vector": "abc"},
+            doc! {"vector": ["a"]},
+            doc! {"query": "x", "k": -1},
+            doc! {"query": "x", "filter": "no"},
+        ] {
+            assert!(parse(&[doc! {"$vectorSearch": spec.clone()}]).is_err(), "{spec:?}");
+        }
+        let err =
+            parse(&[doc! {"$vectorSearch": {"query": "x", "bogus": 1}}]).unwrap_err().to_string();
+        assert!(err.contains("bogus") && err.contains("per_document"), "{err}");
+    }
+
+    #[test]
+    fn no_vector_search_message_has_a_run_of_spaces() {
+        // A lost `\` continuation leaves the next line's indentation inside the
+        // message; substring tests do not see it.
+        let mut messages = Vec::new();
+        for field in ["queryVector", "limit", "numCandidates", "index", "bogus"] {
+            let spec = doc! {"query": "x", field: 1};
+            messages.push(parse(&[doc! {"$vectorSearch": spec}]).unwrap_err().to_string());
+        }
+        for spec in [
+            doc! {},
+            doc! {"query": 3},
+            doc! {"vector": "abc"},
+            doc! {"vector": ["a"]},
+            doc! {"query": "x", "k": -1},
+            doc! {"query": "x", "filter": "no"},
+        ] {
+            messages.push(parse(&[doc! {"$vectorSearch": spec}]).unwrap_err().to_string());
+        }
+        messages.push(
+            parse(&[doc! {"$match": {}}, doc! {"$vectorSearch": {"query": "x"}}])
+                .unwrap_err()
+                .to_string(),
+        );
+        messages.push(
+            parse(&[doc! {"$lookup": {
+                "from": "o", "let": {}, "pipeline": [{"$vectorSearch": {"query": "x"}}],
+                "as": "h"
+            }}])
+            .unwrap_err()
+            .to_string(),
+        );
+        messages.push(parse(&[doc! {"$bucket": {}}]).unwrap_err().to_string());
+        assert_eq!(messages.len(), 14);
+        for message in messages {
+            assert!(!message.contains("  "), "a run of spaces in {message:?}");
+        }
+    }
+
+    #[test]
+    fn the_unsupported_stage_message_lists_vector_search() {
+        let err = parse(&[doc! {"$bucket": {}}]).unwrap_err().to_string();
+        assert!(err.contains("$vectorSearch"), "{err}");
     }
 
     #[test]

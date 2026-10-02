@@ -6199,6 +6199,371 @@ async fn a_deleted_document_does_not_surface_from_search() {
     assert_eq!(ids, vec!["b"], "nor from hybrid search: {:?}", hybrid.body);
 }
 
+/// `shop.products` with a `byo` vector index and three products, nearest
+/// first to `[1, 0, 0]`: trail shoe (acme, 120), road shoe (acme, 90), rain
+/// coat (nimbus, 200). Returns a root token.
+async fn products_collection(server: &Server) -> String {
+    let token = server.root().await;
+    server.post("/v1/db/shop/collections", Some(&token), json!({ "name": "products" })).await;
+    let res = server
+        .post(
+            "/v1/db/shop/coll/products/vector",
+            Some(&token),
+            json!({ "fields": ["name"], "provider": { "kind": "byo" }, "dim": 3 }),
+        )
+        .await;
+    assert_eq!(res.status, 200, "{:?}", res.body);
+    for (id, name, brand, price, vector) in [
+        (1, "trail shoe", "acme", 120, [1.0, 0.0, 0.0]),
+        (2, "road shoe", "acme", 90, [0.9, 0.1, 0.0]),
+        (3, "rain coat", "nimbus", 200, [0.0, 1.0, 0.0]),
+    ] {
+        let res = server
+            .post(
+                "/v1/db/shop/coll/products/docs",
+                Some(&token),
+                json!({ "_id": id, "name": name, "brand": brand, "price": price }),
+            )
+            .await;
+        assert_eq!(res.status, 200, "{:?}", res.body);
+        let res = server
+            .put(
+                &format!("/v1/db/shop/coll/products/docs/{id}/vectors"),
+                Some(&token),
+                json!([{ "chunk": 0, "vector": vector, "text": name }]),
+            )
+            .await;
+        assert_eq!(res.status, 200, "{:?}", res.body);
+    }
+    token
+}
+
+/// ADR-216: the search feeds the rest of the pipeline. Under `byo` the query
+/// is a `vector`; the products under 100, counted by brand, are one acme.
+#[tokio::test]
+async fn a_vector_search_stage_feeds_the_rest_of_the_pipeline() {
+    let server = Server::start().await;
+    let token = products_collection(&server).await;
+    let res = server
+        .post(
+            "/v1/db/shop/coll/products/aggregate",
+            Some(&token),
+            json!({ "pipeline": [
+                { "$vectorSearch": { "vector": [1.0, 0.0, 0.0], "k": 10 } },
+                { "$match": { "price": { "$lt": 100 } } },
+                { "$group": { "_id": "$brand", "n": { "$sum": 1 } } },
+            ] }),
+        )
+        .await;
+    assert_eq!(res.status, 200, "{:?}", res.body);
+    assert_eq!(res.body["documents"], json!([{ "_id": "acme", "n": 1 }]), "{:?}", res.body);
+}
+
+/// Each hit enters as its source document plus `_score` and `_chunk`, in rank
+/// order, and `k` bounds how many enter.
+#[tokio::test]
+async fn vector_search_stage_hits_are_source_documents_with_score_and_chunk() {
+    let server = Server::start().await;
+    let token = products_collection(&server).await;
+    let run = |k: u64| {
+        let token = token.clone();
+        let server = &server;
+        async move {
+            server
+                .post(
+                    "/v1/db/shop/coll/products/aggregate",
+                    Some(&token),
+                    json!({ "pipeline": [
+                        { "$vectorSearch": { "vector": [1.0, 0.0, 0.0], "k": k } },
+                    ] }),
+                )
+                .await
+        }
+    };
+    let res = run(2).await;
+    assert_eq!(res.status, 200, "{:?}", res.body);
+    let docs = res.body["documents"].as_array().unwrap();
+    assert_eq!(docs.len(), 2, "k bounds what enters the pipeline: {docs:?}");
+    assert_eq!(docs[0]["_id"], 1);
+    assert_eq!(docs[0]["name"], "trail shoe");
+    assert_eq!(docs[0]["brand"], "acme");
+    assert_eq!(docs[0]["price"], 120);
+    assert_eq!(docs[0]["_chunk"], 0);
+    assert!(docs[0]["_score"].as_f64().unwrap() > docs[1]["_score"].as_f64().unwrap(), "{docs:?}");
+    assert_eq!(docs[1]["_id"], 2);
+
+    let res = run(1).await;
+    assert_eq!(res.body["documents"].as_array().unwrap().len(), 1, "{:?}", res.body);
+
+    // The endpoint answers the same ids and scores for the same request.
+    let endpoint = server
+        .post(
+            "/v1/db/shop/coll/products/vector_search",
+            Some(&token),
+            json!({ "vector": [1.0, 0.0, 0.0], "k": 2 }),
+        )
+        .await;
+    assert_eq!(endpoint.body["matches"][0]["_id"], 1);
+    assert_eq!(endpoint.body["matches"][0]["score"], docs[0]["_score"]);
+}
+
+/// A source document that stores its own `_score` and `_chunk` comes out with
+/// the stage's values: the stage's shape is the source plus those two fields,
+/// and they win (ADR-216).
+#[tokio::test]
+async fn vector_search_stage_overwrites_a_stored_score_and_chunk() {
+    let server = Server::start().await;
+    let token = products_collection(&server).await;
+    server
+        .post(
+            "/v1/db/shop/coll/products/docs",
+            Some(&token),
+            json!({ "_id": 4, "name": "odd", "_score": "mine", "_chunk": "mine" }),
+        )
+        .await;
+    let res = server
+        .put(
+            "/v1/db/shop/coll/products/docs/4/vectors",
+            Some(&token),
+            json!([{ "chunk": 0, "vector": [1.0, 0.0, 0.0], "text": "odd" }]),
+        )
+        .await;
+    assert_eq!(res.status, 200, "{:?}", res.body);
+    let res = server
+        .post(
+            "/v1/db/shop/coll/products/aggregate",
+            Some(&token),
+            json!({ "pipeline": [
+                { "$vectorSearch": { "vector": [1.0, 0.0, 0.0], "k": 10 } },
+                { "$match": { "_id": 4 } },
+            ] }),
+        )
+        .await;
+    assert_eq!(res.status, 200, "{:?}", res.body);
+    let doc = &res.body["documents"][0];
+    assert!(doc["_score"].is_number(), "the stage's score replaces the stored one: {doc}");
+    assert_eq!(doc["_chunk"], 0, "{doc}");
+    assert_eq!(doc["name"], "odd");
+}
+
+/// With `per_document` above 1 the same source document enters once per
+/// matching chunk, each with its own `_chunk`; without it, once.
+#[tokio::test]
+async fn vector_search_stage_per_document_repeats_a_document_per_chunk() {
+    let server = Server::start().await;
+    let token = products_collection(&server).await;
+    let res = server
+        .put(
+            "/v1/db/shop/coll/products/docs/1/vectors",
+            Some(&token),
+            json!([
+                { "chunk": 0, "vector": [1.0, 0.0, 0.0], "text": "trail shoe" },
+                { "chunk": 1, "vector": [0.8, 0.2, 0.0], "text": "trail shoe, wide" },
+            ]),
+        )
+        .await;
+    assert_eq!(res.status, 200, "{:?}", res.body);
+    let run = |per_document: Option<u64>| {
+        let token = token.clone();
+        let server = &server;
+        async move {
+            let mut spec = json!({ "vector": [1.0, 0.0, 0.0], "k": 10 });
+            if let Some(n) = per_document {
+                spec["per_document"] = json!(n);
+            }
+            let res = server
+                .post(
+                    "/v1/db/shop/coll/products/aggregate",
+                    Some(&token),
+                    json!({ "pipeline": [
+                        { "$vectorSearch": spec },
+                        { "$match": { "_id": 1 } },
+                    ] }),
+                )
+                .await;
+            assert_eq!(res.status, 200, "{:?}", res.body);
+            res.body["documents"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|d| d["_chunk"].as_i64().unwrap())
+                .collect::<Vec<_>>()
+        }
+    };
+    let mut chunks = run(Some(2)).await;
+    chunks.sort();
+    assert_eq!(chunks, vec![0, 1], "one entry per matching chunk, distinct `_chunk`");
+    assert_eq!(run(None).await.len(), 1, "the default is one chunk per document");
+}
+
+/// The stage's `filter` is the endpoint's: only matching documents are hit.
+#[tokio::test]
+async fn vector_search_stage_applies_its_filter() {
+    let server = Server::start().await;
+    let token = products_collection(&server).await;
+    let res = server
+        .post(
+            "/v1/db/shop/coll/products/aggregate",
+            Some(&token),
+            json!({ "pipeline": [
+                { "$vectorSearch": { "vector": [1.0, 0.0, 0.0], "k": 10,
+                                     "filter": { "brand": "nimbus" } } },
+            ] }),
+        )
+        .await;
+    assert_eq!(res.status, 200, "{:?}", res.body);
+    let ids: Vec<&Value> =
+        res.body["documents"].as_array().unwrap().iter().map(|d| &d["_id"]).collect();
+    assert_eq!(ids, vec![&json!(3)], "{:?}", res.body);
+}
+
+/// Under `byo` the server cannot embed text: the endpoint's refusal, verbatim.
+#[tokio::test]
+async fn vector_search_stage_needs_a_vector_under_byo() {
+    let server = Server::start().await;
+    let token = products_collection(&server).await;
+    let endpoint = server
+        .post(
+            "/v1/db/shop/coll/products/vector_search",
+            Some(&token),
+            json!({ "query": "running shoes" }),
+        )
+        .await;
+    assert_eq!(endpoint.status, 400, "{:?}", endpoint.body);
+    let res = server
+        .post(
+            "/v1/db/shop/coll/products/aggregate",
+            Some(&token),
+            json!({ "pipeline": [{ "$vectorSearch": { "query": "running shoes" } }] }),
+        )
+        .await;
+    assert_eq!(res.status, 400, "{:?}", res.body);
+    assert_eq!(res.body["message"], endpoint.body["message"]);
+    assert!(res.body["message"].as_str().unwrap().contains("send a `vector`"), "{:?}", res.body);
+}
+
+/// A misplaced stage and the foreign spellings are 400s that say what to do.
+#[tokio::test]
+async fn vector_search_stage_refusals_are_400_over_the_wire() {
+    let server = Server::start().await;
+    let token = products_collection(&server).await;
+    let run = |pipeline: Value| {
+        let token = token.clone();
+        let server = &server;
+        async move {
+            server
+                .post(
+                    "/v1/db/shop/coll/products/aggregate",
+                    Some(&token),
+                    json!({ "pipeline": pipeline }),
+                )
+                .await
+        }
+    };
+    let res = run(json!([{ "$match": {} }, { "$vectorSearch": { "vector": [1, 0, 0] } }])).await;
+    assert_eq!(res.status, 400, "{:?}", res.body);
+    assert!(res.body["message"].as_str().unwrap().contains("first stage"), "{:?}", res.body);
+    let res = run(json!([{ "$vectorSearch": { "queryVector": [1, 0, 0] } }])).await;
+    assert_eq!(res.status, 400, "{:?}", res.body);
+    assert!(res.body["message"].as_str().unwrap().contains("use `vector`"), "{:?}", res.body);
+}
+
+/// What the stage's authorization is, exactly. It needs `read`, which carries
+/// `search`, so: `read` works on both routes; a `search`-only token works on the
+/// endpoint and is refused by aggregate's own `read` check; a token with
+/// neither is refused by both. Every refusal is the uniform 403, which names no
+/// action, so the refusals are the same bytes whichever check made them.
+#[tokio::test]
+async fn vector_search_stage_is_authorized_like_the_endpoint() {
+    let server = Server::start().await;
+    let root = products_collection(&server).await;
+    for (user, actions) in [
+        ("reader", json!(["read"])),
+        ("searcher", json!(["search"])),
+        ("watcher", json!(["watch"])),
+    ] {
+        server
+            .post(
+                "/v1/users",
+                Some(&root),
+                json!({
+                    "user": user, "password": format!("{user}-password"),
+                    "grants": [{"db":"shop","collection":"products","actions": actions}]
+                }),
+            )
+            .await;
+    }
+    let pipeline = json!({ "pipeline": [
+        { "$vectorSearch": { "vector": [1.0, 0.0, 0.0], "k": 1 } },
+    ] });
+    let search = json!({ "vector": [1.0, 0.0, 0.0], "k": 1 });
+    let agg = "/v1/db/shop/coll/products/aggregate";
+    let endpoint = "/v1/db/shop/coll/products/vector_search";
+
+    let reader = server.login("reader", "reader-password").await;
+    let res = server.post(agg, Some(&reader), pipeline.clone()).await;
+    assert_eq!(res.status, 200, "{:?}", res.body);
+    assert_eq!(res.body["count"], 1);
+    assert_eq!(server.post(endpoint, Some(&reader), search.clone()).await.status, 200);
+
+    // A search grant alone opens the endpoint but not aggregate, which reads
+    // documents: the refusal comes from aggregate's `read` check.
+    let searcher = server.login("searcher", "searcher-password").await;
+    assert_eq!(server.post(endpoint, Some(&searcher), search.clone()).await.status, 200);
+    let refused = server.post(agg, Some(&searcher), pipeline.clone()).await;
+    assert_eq!(refused.status, 403, "{:?}", refused.body);
+
+    // Neither action: both routes refuse, with the same status and body.
+    let watcher = server.login("watcher", "watcher-password").await;
+    let by_endpoint = server.post(endpoint, Some(&watcher), search).await;
+    let by_stage = server.post(agg, Some(&watcher), pipeline.clone()).await;
+    assert_eq!((by_endpoint.status, by_stage.status), (403, 403));
+    assert_eq!(by_endpoint.body, by_stage.body, "the uniform refusal names no action");
+    assert_eq!(refused.body, by_stage.body);
+
+    // No token at all.
+    let res = server.post(agg, None, pipeline).await;
+    assert_eq!(res.status, 401, "{:?}", res.body);
+}
+
+/// The hit count is held to the pipeline ceiling, naming the stage; the same
+/// hits pass under a roomy one.
+#[tokio::test]
+async fn vector_search_stage_hits_are_held_to_the_pipeline_ceiling() {
+    let server = Server::start().await;
+    products_collection(&server).await;
+    let auth = kimmy_api::state::Auth(kimmy_auth::Principal::superuser("test"));
+    let pipeline = json!([{ "$vectorSearch": { "vector": [1.0, 0.0, 0.0], "k": 3 } }]);
+
+    let tight = kimmy_query::aggregate::Limits { max_documents: 2 };
+    let err = kimmy_api::exec::aggregate_with_limits(
+        &server.state,
+        &auth,
+        "shop",
+        "products",
+        &pipeline,
+        tight,
+    )
+    .await
+    .expect_err("three hits are over a ceiling of two");
+    let text = format!("{err:?}");
+    assert!(text.contains("$vectorSearch produced 3 documents"), "{text}");
+    assert!(text.contains("pipeline limit of 2"), "{text}");
+
+    let roomy = kimmy_query::aggregate::Limits { max_documents: 3 };
+    let out = kimmy_api::exec::aggregate_with_limits(
+        &server.state,
+        &auth,
+        "shop",
+        "products",
+        &pipeline,
+        roomy,
+    )
+    .await
+    .unwrap();
+    assert_eq!(out["count"], 3, "{out:?}");
+}
+
 /// Three documents that separate the two halves of a hybrid search for the
 /// query `"red blue"` with vector `[1, 0, 0]`:
 ///

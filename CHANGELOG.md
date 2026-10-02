@@ -14,6 +14,19 @@ breaking changes and says so here; a `0.x.PATCH` bump never does.
 
 ### Added
 
+- **`$vectorSearch`, an aggregation stage.** The first stage of a pipeline can
+  run a vector search and hand the hits to the rest of it, so a search can be
+  filtered further, joined and grouped inside the database. It takes the fields
+  of the `vector_search` endpoint (`query` or `vector`, `k`, `per_document`,
+  `filter`), checks the same things and answers the same errors, and each hit
+  enters the pipeline as its source document with `_score` and `_chunk` added.
+  It needs `read` on the collection, which carries `search`, so a token granted
+  only `search` is refused by aggregate's `read` check; `k` bounds what enters
+  the pipeline, `aggregate` still has no `explain`, and anywhere but first is a
+  `400`. The names other systems use, `queryVector`,
+  `numCandidates`, `limit` and `index`, are refused, each naming the spelling to
+  use or saying there is no such knob. See Aggregation, Vectors and ADR-216.
+
 - **An `arrayFilters` entry takes `$expr`.** `{"$expr": {"$lt": ["$$line.qty",
   "$$line.min"]}}` selects the elements whose quantity is below their own
   minimum, where an entry could only compare a field with a constant. The

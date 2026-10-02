@@ -121,7 +121,7 @@ is a comparison rather than a state machine, and re-embedding is idempotent.
 | Deletes | Tombstone in the graph, rebuild past a ratio threshold | ✅ Handled differently: the graph supplies candidates only, and a candidate whose record is gone is skipped. No tombstoning needed |
 | Search | `vector_search` + `hybrid_search` with RRF | ✅ Both, with filter composition against the query language |
 | Replication | Vectors ride the oplog as data | 📋 M4 — the records are stored like any document, so this needs no vector-specific work |
-| `$vectorSearch` stage | A pipeline stage | ⛔ Not built; search is its own endpoint |
+| `$vectorSearch` stage | A pipeline stage | ✅ The first stage of an aggregation pipeline, with the endpoint's own fields ([ADR-216](decisions.md)) |
 
 **Resolved open questions.** Filtered k-NN post-filters, widening the graph
 search 8× to compensate — a pre-filter would need the graph to know about
@@ -534,9 +534,9 @@ scalar-only majority both bounds back.
 
 ### Deliberately out of scope
 
-`$vectorSearch` as a pipeline stage stays unbuilt — it is an API-surface
-decision, not a planner gap, and belongs with the ergonomics theme. Rate
-limiting beyond login still waits on the benchmark work, as agreed in M5.
+`$vectorSearch` as a pipeline stage was left unbuilt here — it is an API-surface
+decision, not a planner gap — and has since been built ([ADR-216](decisions.md)).
+Rate limiting beyond login still waits on the benchmark work, as agreed in M5.
 
 ---
 
@@ -693,8 +693,8 @@ The first has since been decided; the second stands.
 Geospatial, full-text and `$where` stay in the not-planned table below.
 Multi-document transactions stay out for the reason they always have: they
 need coordination, which is what a leaderless design gives up. `$vectorSearch`
-as a pipeline stage becomes *easier* once expressions exist, but is still not
-scheduled — vector search remains its own endpoint.
+as a pipeline stage became *easier* once expressions existed, and was built
+later ([ADR-216](decisions.md)).
 
 ---
 

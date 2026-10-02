@@ -1955,14 +1955,14 @@ pub fn now_millis() -> i64 {
 /// pipeline began. In a leaderless store with no multi-document transactions
 /// there is no cross-collection snapshot to take — see ADR-006 — so this is
 /// inherent rather than an omission.
-pub fn aggregate(
+pub async fn aggregate(
     state: &SharedState,
     auth: &Auth,
     db: &str,
     coll: &str,
     pipeline: &Value,
 ) -> Result<Value, ApiError> {
-    aggregate_with_limits(state, auth, db, coll, pipeline, aggregate::Limits::default())
+    aggregate_with_limits(state, auth, db, coll, pipeline, aggregate::Limits::default()).await
 }
 
 /// [`aggregate`] under an explicit ceiling.
@@ -1970,7 +1970,7 @@ pub fn aggregate(
 /// Split out so the source ceiling can be exercised without inserting a
 /// hundred thousand documents; every caller outside a test goes through
 /// [`aggregate`] and the default.
-pub fn aggregate_with_limits(
+pub async fn aggregate_with_limits(
     state: &SharedState,
     auth: &Auth,
     db: &str,
@@ -1978,33 +1978,58 @@ pub fn aggregate_with_limits(
     pipeline: &Value,
     limits: aggregate::Limits,
 ) -> Result<Value, ApiError> {
-    let _span = op_span("aggregate", db, Some(coll)).entered();
+    use tracing::Instrument;
+    aggregate_run(state, auth, db, coll, pipeline, limits)
+        .instrument(op_span("aggregate", db, Some(coll)))
+        .await
+}
+
+/// The body of [`aggregate_with_limits`], run inside its span: an entered
+/// span guard is not `Send`, and this holds across the `$vectorSearch` await.
+async fn aggregate_run(
+    state: &SharedState,
+    auth: &Auth,
+    db: &str,
+    coll: &str,
+    pipeline: &Value,
+    limits: aggregate::Limits,
+) -> Result<Value, ApiError> {
     let meta = authorize(state, auth, Action::Read, db, coll)?;
 
     let stages = parse_pipeline(pipeline)?;
 
-    // The source. A pipeline that begins with `$match` is read the way `find`
-    // reads: the leading filter goes through `collect_matching`, so an indexed
-    // equality or range fetches its candidates rather than the whole
-    // collection, and the ceiling applies to what the filter *admits* rather
-    // than to what the collection holds. Only the leading run of `$match`
-    // stages is taken — `aggregate::leading_match` says why — and every later
-    // stage runs exactly as it did, on exactly the input it had. A pipeline
-    // with no leading `$match` is the collection, through the same scan.
-    let (filter, consumed, what) = match aggregate::leading_match(&stages) {
-        Some((filter, consumed)) => (filter, consumed, "the leading $match"),
-        None => (filter::Filter::AlwaysTrue, 0, "the source collection"),
+    // A `$vectorSearch` first stage is the source (ADR-216): the hits, as
+    // documents, take the collection scan's place. It needs `search` as well
+    // as the `read` above, and `k` bounds what enters the pipeline.
+    let (docs, consumed) = if let Some(aggregate::Stage::VectorSearch(spec)) = stages.first() {
+        let docs = crate::vectors::stage_documents(state, auth, db, coll, spec, &limits).await?;
+        (docs, 1)
+    } else {
+        // The source. A pipeline that begins with `$match` is read the way `find`
+        // reads: the leading filter goes through `collect_matching`, so an indexed
+        // equality or range fetches its candidates rather than the whole
+        // collection, and the ceiling applies to what the filter *admits* rather
+        // than to what the collection holds. Only the leading run of `$match`
+        // stages is taken — `aggregate::leading_match` says why — and every later
+        // stage runs exactly as it did, on exactly the input it had. A pipeline
+        // with no leading `$match` is the collection, through the same scan.
+        let (filter, consumed, what) = match aggregate::leading_match(&stages) {
+            Some((filter, consumed)) => (filter, consumed, "the leading $match"),
+            None => (filter::Filter::AlwaysTrue, 0, "the source collection"),
+        };
+        // One past the ceiling: the scan stops as soon as it is over, rather than
+        // materialising everything the filter admits in order to refuse it.
+        let (docs, _stats) =
+            collect_matching(state, &meta, &filter, Some(limits.max_documents + 1))?;
+        if docs.len() > limits.max_documents {
+            return Err(ApiError::bad_request(format!(
+                "{what} admits more than {} documents, the pipeline limit. Narrow it with a more \
+                 selective $match",
+                limits.max_documents
+            )));
+        }
+        (docs, consumed)
     };
-    // One past the ceiling: the scan stops as soon as it is over, rather than
-    // materialising everything the filter admits in order to refuse it.
-    let (docs, _stats) = collect_matching(state, &meta, &filter, Some(limits.max_documents + 1))?;
-    if docs.len() > limits.max_documents {
-        return Err(ApiError::bad_request(format!(
-            "{what} admits more than {} documents, the pipeline limit. Narrow it with a more \
-             selective $match",
-            limits.max_documents
-        )));
-    }
 
     let docs = run_stages(state, auth, db, &stages[consumed..], docs, &limits, &[])?;
 
@@ -2242,6 +2267,32 @@ fn join_keys(doc: &bson::Document, field: &str) -> Vec<Vec<u8>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `aggregate` is async because a `$vectorSearch` stage may embed its
+    /// query; these tests have no such stage and run it to completion here.
+    pub(super) fn agg(
+        state: &SharedState,
+        auth: &Auth,
+        db: &str,
+        coll: &str,
+        pipeline: &Value,
+    ) -> Result<Value, ApiError> {
+        agg_limits(state, auth, db, coll, pipeline, aggregate::Limits::default())
+    }
+
+    fn agg_limits(
+        state: &SharedState,
+        auth: &Auth,
+        db: &str,
+        coll: &str,
+        pipeline: &Value,
+        limits: aggregate::Limits,
+    ) -> Result<Value, ApiError> {
+        tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap()
+            .block_on(aggregate_with_limits(state, auth, db, coll, pipeline, limits))
+    }
 
     #[test]
     fn ids_are_parsed_by_shape() {
@@ -2636,18 +2687,18 @@ mod tests {
         let auth = superuser();
 
         let whole = json!([{ "$count": "c" }]);
-        let err = aggregate_with_limits(&state, &auth, "app", "docs", &whole, limits)
+        let err = agg_limits(&state, &auth, "app", "docs", &whole, limits)
             .expect_err("the whole collection is over the ceiling");
         assert!(format!("{err:?}").contains("source collection"), "{err:?}");
 
         let narrowed = json!([{ "$match": { "n": 3 } }, { "$count": "c" }]);
-        let out = aggregate_with_limits(&state, &auth, "app", "docs", &narrowed, limits).unwrap();
+        let out = agg_limits(&state, &auth, "app", "docs", &narrowed, limits).unwrap();
         assert_eq!(out["documents"][0]["c"], 6);
 
         // A leading `$match` that admits too many is refused too, and the
         // refusal names it rather than the collection.
         let wide = json!([{ "$match": { "n": { "$gte": 0 } } }, { "$count": "c" }]);
-        let err = aggregate_with_limits(&state, &auth, "app", "docs", &wide, limits)
+        let err = agg_limits(&state, &auth, "app", "docs", &wide, limits)
             .expect_err("the match admits thirty");
         assert!(format!("{err:?}").contains("leading $match"), "{err:?}");
     }
@@ -2704,14 +2755,9 @@ mod tests {
                 { "$sort": { "_id": 1 } },
             ])
         };
-        let out = aggregate(
-            &state,
-            &superuser(),
-            "app",
-            "orders",
-            &pipeline("items.sku", "products", "_id"),
-        )
-        .unwrap();
+        let out =
+            agg(&state, &superuser(), "app", "orders", &pipeline("items.sku", "products", "_id"))
+                .unwrap();
         // Scan order is the foreign collection's key order: ef-9 before gh-3,
         // whichever order the elements name them in.
         assert_eq!(
@@ -2734,7 +2780,7 @@ mod tests {
                 bson::doc! { "_id": "s2", "covers": [{"sku": "gh-3"}] },
             ],
         );
-        let out = aggregate(
+        let out = agg(
             &state,
             &superuser(),
             "app",
@@ -2771,9 +2817,8 @@ mod tests {
                 bson::doc! { "_id": "w", "tags": "q" },
             ],
         );
-        let out =
-            aggregate(&state, &superuser(), "app", "tagged", &pipeline("tags", "tag_sets", "tags"))
-                .unwrap();
+        let out = agg(&state, &superuser(), "app", "tagged", &pipeline("tags", "tag_sets", "tags"))
+            .unwrap();
         assert_eq!(
             joined_ids(&out, "p"),
             vec![
@@ -2801,14 +2846,9 @@ mod tests {
                 bson::doc! { "_id": 30, "name": "c" },
             ],
         );
-        let out = aggregate(
-            &state,
-            &superuser(),
-            "app",
-            "baskets",
-            &pipeline("productIds", "catalog", "_id"),
-        )
-        .unwrap();
+        let out =
+            agg(&state, &superuser(), "app", "baskets", &pipeline("productIds", "catalog", "_id"))
+                .unwrap();
         assert_eq!(joined_ids(&out, "p"), vec![vec![json!(10), json!(20)], vec![]]);
     }
 
@@ -2849,7 +2889,7 @@ mod tests {
             { "$lookup": { "from": "coded", "localField": "items.sku", "foreignField": "code", "as": "p" } },
             { "$sort": { "_id": 1 } },
         ]);
-        let out = aggregate(&state, &superuser(), "app", "carts", &join).unwrap();
+        let out = agg(&state, &superuser(), "app", "carts", &join).unwrap();
         assert_eq!(
             joined_ids(&out, "p"),
             vec![
@@ -2874,7 +2914,7 @@ mod tests {
         seed_docs(&state, "late", vec![bson::doc! { "_id": 1, "items": [{"sku": "z"}] }]);
         let join = json!([{ "$lookup": { "from": "covers", "localField": "items.sku",
                                         "foreignField": "covers.sku", "as": "p" } }]);
-        let out = aggregate(&state, &superuser(), "app", "late", &join).unwrap();
+        let out = agg(&state, &superuser(), "app", "late", &join).unwrap();
         assert_eq!(joined_ids(&out, "p"), vec![vec![json!("s1")]], "found through its second key");
     }
 
@@ -2915,12 +2955,11 @@ mod tests {
         let join = json!([{ "$lookup": { "from": "products", "localField": "items.sku",
                                         "foreignField": "_id", "as": "p" } }]);
         let tight = aggregate::Limits { max_documents: 3 };
-        let err = aggregate_with_limits(&state, &superuser(), "app", "orders", &join, tight)
+        let err = agg_limits(&state, &superuser(), "app", "orders", &join, tight)
             .expect_err("four products held under a ceiling of three");
         assert!(format!("{err:?}").contains("$lookup produced 4 documents"), "{err:?}");
         let roomy = aggregate::Limits { max_documents: 4 };
-        let out =
-            aggregate_with_limits(&state, &superuser(), "app", "orders", &join, roomy).unwrap();
+        let out = agg_limits(&state, &superuser(), "app", "orders", &join, roomy).unwrap();
         assert_eq!(out["documents"][0]["p"].as_array().unwrap().len(), 4);
 
         // One foreign document filed under all four keys is held once.
@@ -2934,7 +2973,7 @@ mod tests {
         let wide = json!([{ "$lookup": { "from": "wide", "localField": "items.sku",
                                         "foreignField": "covers.sku", "as": "p" } }]);
         let one = aggregate::Limits { max_documents: 1 };
-        let out = aggregate_with_limits(&state, &superuser(), "app", "orders", &wide, one).unwrap();
+        let out = agg_limits(&state, &superuser(), "app", "orders", &wide, one).unwrap();
         assert_eq!(out["documents"][0]["p"].as_array().unwrap().len(), 1);
     }
 
@@ -2956,11 +2995,10 @@ mod tests {
         let join = json!([{ "$lookup": { "from": "products", "localField": "items.sku",
                                         "foreignField": "_id", "as": "p" } }]);
         let nine = aggregate::Limits { max_documents: 9 };
-        let out =
-            aggregate_with_limits(&state, &superuser(), "app", "orders", &join, nine).unwrap();
+        let out = agg_limits(&state, &superuser(), "app", "orders", &join, nine).unwrap();
         assert_eq!(out["count"], 3);
         let eight = aggregate::Limits { max_documents: 8 };
-        let err = aggregate_with_limits(&state, &superuser(), "app", "orders", &join, eight)
+        let err = agg_limits(&state, &superuser(), "app", "orders", &join, eight)
             .expect_err("nine attached under a ceiling of eight, three held");
         assert!(format!("{err:?}").contains("$lookup would attach 9 documents in all"), "{err:?}");
     }
@@ -2980,7 +3018,7 @@ mod tests {
         );
         let join = json!([{ "$lookup": { "from": "nulls", "localField": "k", "foreignField": "k", "as": "p" } }]);
         let two = aggregate::Limits { max_documents: 2 };
-        let out = aggregate_with_limits(&state, &superuser(), "app", "orders", &join, two).unwrap();
+        let out = agg_limits(&state, &superuser(), "app", "orders", &join, two).unwrap();
         assert_eq!(out["documents"][0]["p"], json!([]));
     }
 
@@ -3005,7 +3043,7 @@ mod tests {
             { "$lookup": { "from": "targets", "localField": "k", "foreignField": "k", "as": "p" } },
             { "$sort": { "_id": 1 } },
         ]);
-        let out = aggregate(&state, &superuser(), "app", "orders", &join).unwrap();
+        let out = agg(&state, &superuser(), "app", "orders", &join).unwrap();
         assert_eq!(joined_ids(&out, "p"), vec![vec![], vec![json!("five")]]);
     }
 
@@ -3020,7 +3058,7 @@ mod tests {
         let limits = aggregate::Limits { max_documents: 10 };
 
         let pipeline = json!([{ "$project": { "n": 1 } }, { "$match": { "n": 3 } }]);
-        let err = aggregate_with_limits(&state, &superuser(), "app", "docs", &pipeline, limits)
+        let err = agg_limits(&state, &superuser(), "app", "docs", &pipeline, limits)
             .expect_err("the source is the whole collection");
         assert!(format!("{err:?}").contains("source collection"), "{err:?}");
 
@@ -3029,8 +3067,7 @@ mod tests {
         let roomy = aggregate::Limits::default();
         let on_projected_away = json!([{ "$project": { "n": 1 } }, { "$match": { "k": 3 } }]);
         let out =
-            aggregate_with_limits(&state, &superuser(), "app", "docs", &on_projected_away, roomy)
-                .unwrap();
+            agg_limits(&state, &superuser(), "app", "docs", &on_projected_away, roomy).unwrap();
         assert_eq!(out["count"], 0);
     }
 
@@ -3054,8 +3091,8 @@ mod tests {
                 { "$group": { "_id": Value::Null, "total": { "$sum": "$k" } } }
             ]),
         ] {
-            let indexed = aggregate(&state, &auth, "app", "indexed", &pipeline).unwrap();
-            let plain = aggregate(&state, &auth, "app", "plain", &pipeline).unwrap();
+            let indexed = agg(&state, &auth, "app", "indexed", &pipeline).unwrap();
+            let plain = agg(&state, &auth, "app", "plain", &pipeline).unwrap();
             assert_eq!(indexed, plain, "{pipeline}");
             assert!(indexed["count"].as_u64().unwrap() > 0, "the pipeline must find something");
         }
@@ -3427,7 +3464,7 @@ mod join_differential {
                 {"$sort": {"_id": 1}},
                 {"$project": {"_id": 1, "p": 1}},
             ]);
-            let out = aggregate(&state, &auth, "app", &local_name, &pipeline)
+            let out = crate::exec::tests::agg(&state, &auth, "app", &local_name, &pipeline)
                 .unwrap_or_else(|e| panic!("seed {seed}: {e:?}"));
             let got: Vec<Vec<i64>> = out["documents"]
                 .as_array()
