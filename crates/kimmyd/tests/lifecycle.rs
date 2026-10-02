@@ -633,6 +633,17 @@ async fn a_port_line_the_harness_cannot_read_fails_at_once() {
     {
         let dir = tempfile::tempdir().unwrap();
         let run = Run::spawn(dir.path(), "unreadable");
+        if says == "without a bind=ADDR" {
+            // A line the node does log, but only once its store is open. Asking
+            // before it is logged is the other case's question (a node
+            // listening with no such line), and how long the open takes is the
+            // machine's, not the harness's: wait for the line, then ask.
+            let deadline = Instant::now() + PATIENCE;
+            while !run.log().contains(line) {
+                assert!(Instant::now() < deadline, "never logged {line:?}; log: {}", run.log());
+                tokio::time::sleep(POLL).await;
+            }
+        }
         let started = Instant::now();
         let answer = run.try_ready(&client, line).await;
         let why = answer.expect_err("the port cannot be read, so the wait fails");

@@ -7499,7 +7499,17 @@ async fn a_floor_older_than_the_peers_oplog_still_reads_back_a_newer_loss() {
          round, against a retention of {retention:?}, which is how long the clamp reads back)",
         written.elapsed()
     );
-    assert_eq!(catch_up.reason(), Some(kimmy_cluster::CatchUpReason::Restored));
+    // The count alone does not say the replay did it: the restored member's own
+    // vector is below the loss here, so an ordinary pull serves the same rows.
+    // The mark is the replay's, and it is not set once the writes have aged out
+    // of the clamp, so a failure here carries the same elapsed time.
+    assert_eq!(
+        catch_up.reason(),
+        Some(kimmy_cluster::CatchUpReason::Restored),
+        "the replay marked the member ({:?} between the writes and the last round, against a \
+         retention of {retention:?})",
+        written.elapsed()
+    );
 }
 
 /// The behind peer first, then the one that holds the tail: with both live, the
