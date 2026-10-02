@@ -5606,6 +5606,19 @@ document, paid only when it is read whole. And the parse-time check means an
 expression is bound to the names it was parsed with: `parse_with_vars`
 followed by a plain `eval` is an error rather than a null, which is the point.
 
+> **Amended 2026-10-01.** The parser's declared names are a stack with a count of
+> the bindings of each name, so asking whether a name is bound is one hash probe
+> and not a walk of everything bound, and a frame of more than sixteen names (a
+> `$let`'s) is kept in name order and bisected when a variable is read. Both were
+> linear scans, quadratic over a `$let` of thousands of variables each read once:
+> 6.7 s to parse and 5.8 s to evaluate, on the request thread, for 95,000
+> variables. The "`Vec<String>` of declared names" in the Cost paragraph is now
+> that stack, its names shared with the count index and not copied into it. The
+> `$lookup` pipeline form's `let` frames are deliberately still scanned: they
+> layer an inner set over an outer one, shadowing by position, and a bisect
+> would need a design of its own. Scope, shadowing and the parse-time refusal of
+> an unbound name are as above.
+
 ---
 
 ## ADR-106 — `$expr` joins the filter language by delegating to the expression evaluator

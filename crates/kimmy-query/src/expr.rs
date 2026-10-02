@@ -518,14 +518,24 @@ pub type Binding<'a> = (&'a str, &'a Bson);
 pub struct Scope<'a> {
     root: &'a Document,
     bindings: &'a [Binding<'a>],
+    /// Whether `bindings` is in name order, so a lookup in it can bisect: a frame
+    /// of more than [`BISECT_FRAME`] names is built that way, and a smaller one
+    /// is scanned.
+    sorted: bool,
     parent: Option<&'a Scope<'a>>,
 }
+
+/// The size of a frame past which its names are kept in order and bisected, so
+/// that reading each of a `$let`'s thousands of variables is not a walk of them
+/// all. Below it a scan is cheaper than a sort, and every frame but a `$let`'s is
+/// one or two names.
+const BISECT_FRAME: usize = 16;
 
 impl<'a> Scope<'a> {
     /// A scope over a document with nothing bound beyond `$$ROOT` and
     /// `$$CURRENT` — what every stage outside a `$lookup` sub-pipeline wants.
     pub fn new(root: &'a Document) -> Self {
-        Self { root, bindings: &[], parent: None }
+        Self { root, bindings: &[], sorted: false, parent: None }
     }
 
     /// A scope over a document with variables already in place — what a
@@ -534,7 +544,7 @@ impl<'a> Scope<'a> {
     /// A later binding shadows an earlier one of the same name, so a caller
     /// layering an inner set over an outer one appends rather than prepends.
     pub fn with_bindings(root: &'a Document, bindings: &'a [Binding<'a>]) -> Self {
-        Self { root, bindings, parent: None }
+        Self { root, bindings, sorted: false, parent: None }
     }
 
     /// The document `$$ROOT` names.
@@ -543,16 +553,37 @@ impl<'a> Scope<'a> {
     }
 
     fn nested<'b>(&'b self, bindings: &'b [Binding<'b>]) -> Scope<'b> {
-        Scope { root: self.root, bindings, parent: Some(self) }
+        Scope { root: self.root, bindings, sorted: false, parent: Some(self) }
+    }
+
+    /// [`Self::nested`] over a frame already in name order, which a lookup in it
+    /// bisects. Names in a frame are distinct, so the order is a total one.
+    fn nested_sorted<'b>(&'b self, bindings: &'b [Binding<'b>]) -> Scope<'b> {
+        Scope { root: self.root, bindings, sorted: true, parent: Some(self) }
     }
 
     fn get(&self, name: &str) -> Option<&'a Bson> {
-        self.bindings
-            .iter()
-            .rev()
-            .find(|(bound, _)| *bound == name)
-            .map(|(_, value)| *value)
-            .or_else(|| self.parent.and_then(|parent| parent.get(name)))
+        let found = if self.sorted {
+            self.bindings
+                .binary_search_by(|(bound, _)| {
+                    #[cfg(test)]
+                    FRAME_COMPARISONS.with(|n| n.set(n.get() + 1));
+                    (*bound).cmp(name)
+                })
+                .ok()
+                .map(|at| self.bindings[at].1)
+        } else {
+            self.bindings
+                .iter()
+                .rev()
+                .find(|(bound, _)| {
+                    #[cfg(test)]
+                    FRAME_COMPARISONS.with(|n| n.set(n.get() + 1));
+                    *bound == name
+                })
+                .map(|(_, value)| *value)
+        };
+        found.or_else(|| self.parent.and_then(|parent| parent.get(name)))
     }
 }
 
@@ -586,6 +617,14 @@ thread_local! {
     /// search to one.
     #[cfg(test)]
     static PARSES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    /// Scope lookups made by [`Declared::binds`] on this thread, for the tests
+    /// that hold a parse to one probe per reference.
+    #[cfg(test)]
+    static LOOKUPS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    /// Names compared by [`Scope::get`] on this thread, for the tests that hold
+    /// reading a `$let`'s variables to a bisect and not a walk.
+    #[cfg(test)]
+    static FRAME_COMPARISONS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
 /// A scope, for the life of the guard, in which the parser on this thread
@@ -621,6 +660,70 @@ impl Drop for FreeVariables {
     }
 }
 
+/// The lexical environment of a parse: the names in scope, innermost last, and
+/// how many bindings of each are in scope, so that asking whether a name is
+/// bound is one hash lookup and not a walk of everything bound (ADR-105). A
+/// `$let` with thousands of variables, each read once, was quadratic here, on
+/// the request thread, where the request timeout cannot interrupt it.
+///
+/// A name bound again by an inner construct is counted twice, so leaving the
+/// inner one leaves the outer one bound, which is what shadowing is.
+struct Declared {
+    stack: Vec<std::rc::Rc<str>>,
+    bound: BoundNames,
+}
+
+/// How many enclosing bindings each name has; the one thing a lookup consults.
+#[derive(Default)]
+struct BoundNames(std::collections::HashMap<std::rc::Rc<str>, usize>);
+
+impl BoundNames {
+    /// One probe.
+    fn contains(&self, name: &str) -> bool {
+        #[cfg(test)]
+        LOOKUPS.with(|n| n.set(n.get() + 1));
+        self.0.contains_key(name)
+    }
+}
+
+impl Declared {
+    fn new(vars: &[String]) -> Self {
+        let mut declared = Declared { stack: Vec::new(), bound: BoundNames::default() };
+        for name in vars {
+            declared.push(name);
+        }
+        declared
+    }
+
+    fn depth(&self) -> usize {
+        self.stack.len()
+    }
+
+    fn push(&mut self, name: &str) {
+        let name: std::rc::Rc<str> = name.into();
+        self.stack.push(std::rc::Rc::clone(&name));
+        *self.bound.0.entry(name).or_insert(0) += 1;
+    }
+
+    /// Leave every binding made since the scope was `depth` deep.
+    fn truncate(&mut self, depth: usize) {
+        while self.stack.len() > depth {
+            let name = self.stack.pop().expect("longer than depth");
+            if let Some(count) = self.bound.0.get_mut(&*name) {
+                *count -= 1;
+                if *count == 0 {
+                    self.bound.0.remove(&name);
+                }
+            }
+        }
+    }
+
+    /// Whether `name` is bound by an enclosing construct. One probe.
+    fn binds(&self, name: &str) -> bool {
+        self.bound.contains(name)
+    }
+}
+
 impl Expr {
     /// Parse an expression from BSON.
     ///
@@ -635,7 +738,7 @@ impl Expr {
     pub fn parse_with_vars(value: &Bson, vars: &[String]) -> Result<Self> {
         #[cfg(test)]
         PARSES.with(|n| n.set(n.get() + 1));
-        let mut declared = vars.to_vec();
+        let mut declared = Declared::new(vars);
         Self::parse_in(value, &mut declared)
     }
 
@@ -699,14 +802,14 @@ impl Expr {
     /// construct. Names are validated here so both callers refuse the same
     /// things.
     pub fn parse_bindings(raw: &Document, vars: &[String]) -> Result<Vec<(String, Expr)>> {
-        let mut declared = vars.to_vec();
+        let mut declared = Declared::new(vars);
         Self::parse_bindings_in(raw, &mut declared)
     }
 
     /// `declared` is the lexical environment: every construct that binds a
     /// name pushes it before parsing its body and pops it after, so an unknown
     /// variable is caught where it is written.
-    fn parse_in(value: &Bson, declared: &mut Vec<String>) -> Result<Self> {
+    fn parse_in(value: &Bson, declared: &mut Declared) -> Result<Self> {
         match value {
             Bson::String(s) => Ok(match s.strip_prefix('$') {
                 Some(rest) if rest.starts_with('$') => Self::parse_variable(&rest[1..], declared)?,
@@ -730,7 +833,7 @@ impl Expr {
     /// called `$ROOT` — which is what a naive reading does — would silently
     /// yield null in every row, and a typo in `$$this` deserves the same
     /// refusal as a typo in an operator name.
-    fn parse_variable(spec: &str, declared: &[String]) -> Result<Self> {
+    fn parse_variable(spec: &str, declared: &Declared) -> Result<Self> {
         let (name, path) = match spec.split_once('.') {
             Some((name, path)) => (name, Some(path)),
             None => (spec, None),
@@ -741,7 +844,7 @@ impl Expr {
         if path.is_some_and(str::is_empty) {
             return Err(Error::InvalidQuery(format!("$${name}. needs a field path after the dot")));
         }
-        if !SYSTEM_VARIABLES.contains(&name) && !declared.iter().any(|d| d == name) {
+        if !SYSTEM_VARIABLES.contains(&name) && !declared.binds(name) {
             // Collecting free variables: a lowercase name nothing binds is the
             // answer, not an error. An uppercase one is a system variable this
             // build does not have, and is refused below as ever.
@@ -782,7 +885,7 @@ impl Expr {
     /// which evaluates to the same value without a walk per document. A
     /// document of literals is one already (see [`Self::parse_document`]), so
     /// an array of constants folds at any depth.
-    fn parse_array(items: &[Bson], declared: &mut Vec<String>) -> Result<Self> {
+    fn parse_array(items: &[Bson], declared: &mut Declared) -> Result<Self> {
         let elements =
             items.iter().map(|v| Self::parse_in(v, declared)).collect::<Result<Vec<_>>>()?;
         if elements.iter().all(|e| matches!(e, Expr::Literal(_))) {
@@ -798,7 +901,7 @@ impl Expr {
         Ok(Expr::Array(elements))
     }
 
-    fn parse_document(doc: &Document, declared: &mut Vec<String>) -> Result<Self> {
+    fn parse_document(doc: &Document, declared: &mut Declared) -> Result<Self> {
         let Some((first, _)) = doc.iter().next() else {
             // `{}` is an empty document, not an operator.
             return Ok(Expr::Literal(Bson::Document(Document::new())));
@@ -870,7 +973,7 @@ impl Expr {
     ///
     /// MongoDB allows `{$toUpper: "$name"}` as well as `{$toUpper: ["$name"]}`,
     /// and the shorthand is what people actually write.
-    fn parse_args(op: Op, raw: &Bson, declared: &mut Vec<String>) -> Result<Vec<Expr>> {
+    fn parse_args(op: Op, raw: &Bson, declared: &mut Declared) -> Result<Vec<Expr>> {
         let args = match raw {
             Bson::Array(items) => {
                 items.iter().map(|v| Self::parse_in(v, declared)).collect::<Result<Vec<_>>>()?
@@ -898,7 +1001,7 @@ impl Expr {
         Ok(args)
     }
 
-    fn parse_switch(raw: &Bson, declared: &mut Vec<String>) -> Result<Self> {
+    fn parse_switch(raw: &Bson, declared: &mut Declared) -> Result<Self> {
         let spec = Self::named_spec("$switch", raw, &["branches", "default"])?;
         let Some(Bson::Array(raw_branches)) = spec.get("branches") else {
             return Err(Error::InvalidQuery("$switch needs a `branches` array".into()));
@@ -925,7 +1028,7 @@ impl Expr {
         Ok(Expr::Switch { branches, default })
     }
 
-    fn parse_date_to_string(raw: &Bson, declared: &mut Vec<String>) -> Result<Self> {
+    fn parse_date_to_string(raw: &Bson, declared: &mut Declared) -> Result<Self> {
         let spec = Self::named_spec("$dateToString", raw, &["date", "format"])?;
         let Some(date) = spec.get("date") else {
             return Err(Error::InvalidQuery("$dateToString needs a `date`".into()));
@@ -992,19 +1095,18 @@ impl Expr {
     fn parse_scoped<'n>(
         body: &Bson,
         names: impl IntoIterator<Item = &'n str>,
-        declared: &mut Vec<String>,
+        declared: &mut Declared,
     ) -> Result<Self> {
-        let depth = declared.len();
-        declared.extend(names.into_iter().map(str::to_string));
+        let depth = declared.depth();
+        for name in names {
+            declared.push(name);
+        }
         let parsed = Self::parse_in(body, declared);
         declared.truncate(depth);
         parsed
     }
 
-    fn parse_bindings_in(
-        raw: &Document,
-        declared: &mut Vec<String>,
-    ) -> Result<Vec<(String, Expr)>> {
+    fn parse_bindings_in(raw: &Document, declared: &mut Declared) -> Result<Vec<(String, Expr)>> {
         raw.iter()
             .map(|(name, value)| {
                 validate_variable_name(name)?;
@@ -1013,7 +1115,7 @@ impl Expr {
             .collect()
     }
 
-    fn parse_let(raw: &Bson, declared: &mut Vec<String>) -> Result<Self> {
+    fn parse_let(raw: &Bson, declared: &mut Declared) -> Result<Self> {
         let spec = Self::named_spec("$let", raw, &["vars", "in"])?;
         let Bson::Document(raw_vars) = Self::required("$let", spec, "vars")? else {
             return Err(Error::InvalidQuery(
@@ -1028,7 +1130,7 @@ impl Expr {
         Ok(Expr::Let { vars, body: Box::new(body) })
     }
 
-    fn parse_filter(raw: &Bson, declared: &mut Vec<String>) -> Result<Self> {
+    fn parse_filter(raw: &Bson, declared: &mut Declared) -> Result<Self> {
         let spec = Self::named_spec("$filter", raw, &["input", "as", "cond", "limit"])?;
         let input = Self::parse_in(Self::required("$filter", spec, "input")?, declared)?;
         let limit = match spec.get("limit") {
@@ -1041,7 +1143,7 @@ impl Expr {
         Ok(Expr::Filter { input: Box::new(input), as_name, cond: Box::new(cond), limit })
     }
 
-    fn parse_map(raw: &Bson, declared: &mut Vec<String>) -> Result<Self> {
+    fn parse_map(raw: &Bson, declared: &mut Declared) -> Result<Self> {
         let spec = Self::named_spec("$map", raw, &["input", "as", "in"])?;
         let input = Self::parse_in(Self::required("$map", spec, "input")?, declared)?;
         let as_name = Self::as_name("$map", spec)?;
@@ -1050,7 +1152,7 @@ impl Expr {
         Ok(Expr::Map { input: Box::new(input), as_name, body: Box::new(body) })
     }
 
-    fn parse_reduce(raw: &Bson, declared: &mut Vec<String>) -> Result<Self> {
+    fn parse_reduce(raw: &Bson, declared: &mut Declared) -> Result<Self> {
         let spec = Self::named_spec("$reduce", raw, &["input", "initialValue", "in"])?;
         let input = Self::parse_in(Self::required("$reduce", spec, "input")?, declared)?;
         let initial = Self::parse_in(Self::required("$reduce", spec, "initialValue")?, declared)?;
@@ -1070,7 +1172,7 @@ impl Expr {
     /// unsupported `decimal` be refused before a document is read. A key this
     /// does not know is an error rather than being ignored: `onerror` for
     /// `onError` would otherwise silently mean "no fallback".
-    fn parse_convert(raw: &Bson, declared: &mut Vec<String>) -> Result<Self> {
+    fn parse_convert(raw: &Bson, declared: &mut Declared) -> Result<Self> {
         let Bson::Document(spec) = raw else {
             return Err(Error::InvalidQuery(format!(
                 "$convert takes a document, found {}",
@@ -1092,7 +1194,7 @@ impl Expr {
                 "$convert needs a `to`: a type name such as \"int\" or its numeric code".into(),
             ));
         };
-        let optional = |key: &str, declared: &mut Vec<String>| -> Result<Option<Box<Expr>>> {
+        let optional = |key: &str, declared: &mut Declared| -> Result<Option<Box<Expr>>> {
             spec.get(key).map(|v| Self::parse_in(v, declared).map(Box::new)).transpose()
         };
         Ok(Expr::Convert {
@@ -1106,7 +1208,7 @@ impl Expr {
     /// `{$toInt: <expr>}` and its siblings: a `$convert` with the target
     /// fixed and no fallbacks. Takes the single value or a one-element array,
     /// as every other one-argument operator does.
-    fn parse_convert_shorthand(name: &str, raw: &Bson, declared: &mut Vec<String>) -> Result<Self> {
+    fn parse_convert_shorthand(name: &str, raw: &Bson, declared: &mut Declared) -> Result<Self> {
         let to = ConvertTo::from_shorthand(name).expect("checked by the caller");
         let arg = match raw {
             Bson::Array(items) if items.len() == 1 => &items[0],
@@ -1200,8 +1302,12 @@ impl Expr {
                 // together: `{a: 1, b: "$$a"}` is an error at parse, not 1.
                 let values =
                     vars.iter().map(|(_, e)| e.eval_in(scope)).collect::<Result<Vec<_>>>()?;
-                let frame: Vec<Binding<'_>> =
+                let mut frame: Vec<Binding<'_>> =
                     vars.iter().zip(&values).map(|((name, _), v)| (name.as_str(), v)).collect();
+                if frame.len() > BISECT_FRAME {
+                    frame.sort_unstable_by(|a, b| a.0.cmp(b.0));
+                    return body.eval_in(&scope.nested_sorted(&frame));
+                }
                 body.eval_in(&scope.nested(&frame))
             }
             Expr::Filter { input, as_name, cond, limit } => {
@@ -2891,6 +2997,152 @@ mod tests {
         assert!(free(doc! { "$eq": ["$a", { "$literal": "$$nope" }] }.into()).is_empty());
         // An expression that does not parse is that error.
         assert!(Expr::free_variables(&doc! { "$nope": 1 }.into()).is_err());
+    }
+
+    /// Asking whether a name is bound is one probe, however many names are in
+    /// scope: a `$let` with fifty thousand variables, each read once, is fifty
+    /// thousand probes, where a walk of the scope for every reference was
+    /// quadratic and held a request worker for seconds. Counted, not timed.
+    #[test]
+    fn a_scope_lookup_is_one_probe_per_reference_however_many_names_are_bound() {
+        for k in [10usize, 50_000] {
+            let mut vars = Document::new();
+            for i in 0..k {
+                vars.insert(format!("v{i}"), 1);
+            }
+            let names: Vec<Bson> = (0..k).map(|i| Bson::String(format!("$$v{i}"))).collect();
+            let entry = Bson::Document(doc! { "$let": { "vars": vars, "in": { "$add": names } } });
+            let before = LOOKUPS.with(std::cell::Cell::get);
+            let parsed = Expr::parse(&entry).unwrap();
+            assert_eq!(
+                LOOKUPS.with(std::cell::Cell::get) - before,
+                k,
+                "{k} references, one probe each"
+            );
+            // And it still means what it said.
+            assert_eq!(parsed.eval(&doc! {}).unwrap(), Bson::Int64(k as i64));
+        }
+        // A name nothing binds is one probe too, and refused.
+        let before = LOOKUPS.with(std::cell::Cell::get);
+        assert!(Expr::parse(&Bson::String("$$nope".into())).is_err());
+        assert_eq!(LOOKUPS.with(std::cell::Cell::get) - before, 1);
+        // A system name is not looked up at all.
+        let before = LOOKUPS.with(std::cell::Cell::get);
+        Expr::parse(&Bson::String("$$ROOT".into())).unwrap();
+        assert_eq!(LOOKUPS.with(std::cell::Cell::get) - before, 0);
+    }
+
+    /// Reading a `$let`'s variables is a bisect past a handful of them, not a
+    /// walk: fifty thousand variables, each read once, compare names about
+    /// fifty thousand times seventeen, where a walk compared about a billion.
+    /// Counted, not timed, and the answers are the same as a small `$let`'s.
+    #[test]
+    fn reading_a_let_with_thousands_of_variables_bisects_its_frame() {
+        let k = 50_000usize;
+        let mut vars = Document::new();
+        for i in 0..k {
+            vars.insert(format!("v{i}"), i as i64);
+        }
+        let names: Vec<Bson> = (0..k).map(|i| Bson::String(format!("$$v{i}"))).collect();
+        let big = Expr::parse(&Bson::Document(
+            doc! { "$let": { "vars": vars, "in": { "$add": names } } },
+        ))
+        .unwrap();
+        let before = FRAME_COMPARISONS.with(std::cell::Cell::get);
+        let sum = big.eval(&doc! {}).unwrap();
+        let compared = FRAME_COMPARISONS.with(std::cell::Cell::get) - before;
+        assert_eq!(sum, Bson::Int64((k as i64) * (k as i64 - 1) / 2));
+        assert!(compared <= k * 20, "{compared} name comparisons to read {k} variables once each");
+        // The shadowing and the parent chain of a big frame are a small one's:
+        // the inner `$let` is small and rebinds a name the big one holds.
+        let mut vars = Document::new();
+        for i in 0..40 {
+            vars.insert(format!("v{i}"), i);
+        }
+        let shadow = Expr::parse(&Bson::Document(doc! { "$let": { "vars": vars, "in": {
+        "$add": [ "$$v7", { "$let": { "vars": { "v7": 100 }, "in": "$$v7" } }, "$$v39" ] } } }))
+        .unwrap();
+        assert_eq!(shadow.eval(&doc! {}).unwrap(), Bson::Int64(7 + 100 + 39));
+        // A name only an enclosing frame binds is found through a big one.
+        let mut vars = Document::new();
+        for i in 0..40 {
+            vars.insert(format!("w{i}"), i);
+        }
+        let through =
+            Expr::parse(&Bson::Document(doc! { "$let": { "vars": { "outer": 5 }, "in": {
+            "$let": { "vars": vars, "in": { "$add": ["$$outer", "$$w3"] } } } } }))
+            .unwrap();
+        assert_eq!(through.eval(&doc! {}).unwrap(), Bson::Int64(8));
+    }
+
+    /// The frame size at which a `$let`'s names stop being scanned and are
+    /// bisected, held at both edges: sixteen names are walked, so the first one
+    /// defined is the sixteenth compared, and seventeen are bisected. Counted,
+    /// and every variable is read so a wrong answer shows.
+    #[test]
+    fn a_frame_is_bisected_from_seventeen_names_and_not_before() {
+        let read_first = |n: usize| -> usize {
+            let mut vars = Document::new();
+            for i in 0..n {
+                vars.insert(format!("v{i}"), i as i64);
+            }
+            let names: Vec<Bson> = (0..n).map(|i| Bson::String(format!("$$v{i}"))).collect();
+            let all = Expr::parse(&Bson::Document(
+                doc! { "$let": { "vars": vars.clone(), "in": { "$add": names } } },
+            ))
+            .unwrap();
+            assert_eq!(all.eval(&doc! {}).unwrap(), Bson::Int64((n * (n - 1) / 2) as i64));
+            let first =
+                Expr::parse(&Bson::Document(doc! { "$let": { "vars": vars, "in": "$$v0" } }))
+                    .unwrap();
+            let before = FRAME_COMPARISONS.with(std::cell::Cell::get);
+            assert_eq!(first.eval(&doc! {}).unwrap(), Bson::Int64(0));
+            FRAME_COMPARISONS.with(std::cell::Cell::get) - before
+        };
+        assert_eq!(read_first(16), 16, "sixteen names are scanned");
+        let at_seventeen = read_first(17);
+        assert!((1..=8).contains(&at_seventeen), "{at_seventeen} comparisons at 17 names");
+    }
+
+    /// Shadowing and leaving a scope, which the index must keep the way the
+    /// walk did: an inner binding of a name leaves the outer one bound, and a
+    /// name is unbound once the last construct that bound it is left.
+    #[test]
+    fn a_scope_index_keeps_shadowing_and_leaving_a_scope() {
+        let mut declared = Declared::new(&["a".to_string(), "a".to_string()]);
+        assert!(declared.binds("a") && !declared.binds("b"));
+        let depth = declared.depth();
+        declared.push("b");
+        declared.push("a");
+        assert!(declared.binds("b"));
+        declared.truncate(depth);
+        assert!(declared.binds("a"), "the outer bindings of `a` are still in scope");
+        assert!(!declared.binds("b"), "`b` went with its scope");
+        declared.truncate(0);
+        assert!(!declared.binds("a"));
+
+        // Through the parser: an inner `$let` of `x` shadows and then restores,
+        // and a name is unbound after the construct that bound it.
+        let nested = doc! { "$let": { "vars": { "x": 1 }, "in": { "$add": [
+            { "$let": { "vars": { "x": 2 }, "in": "$$x" } },
+            "$$x",
+        ] } } };
+        assert_eq!(Expr::parse(&nested.into()).unwrap().eval(&doc! {}).unwrap(), Bson::Int64(3));
+        let leaked = doc! { "$add": [
+            { "$let": { "vars": { "x": 2 }, "in": "$$x" } },
+            "$$x",
+        ] };
+        assert!(Expr::parse(&leaked.into()).is_err(), "`x` is not bound outside its `$let`");
+        let mapped = doc! { "$map": { "input": [1, 2], "as": "n", "in": { "$add": ["$$n", 1] } } };
+        assert!(Expr::parse(&mapped.into()).is_ok());
+        assert!(
+            Expr::parse(
+                &doc! { "$add": [{ "$map": { "input": [1], "as": "n", "in": "$$n" } }, "$$n"] }
+                    .into()
+            )
+            .is_err(),
+            "`n` is not bound outside its `$map`"
+        );
     }
 
     /// Finding the free names is one parse, however many names the expression

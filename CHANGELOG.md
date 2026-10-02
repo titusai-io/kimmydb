@@ -358,6 +358,18 @@ breaking changes and says so here; a `0.x.PATCH` bump never does.
   before the collision is found, and aborts as it did; and a write a unique
   index refuses is found after its stamp is minted, and still ticks the clock.
 
+- **An expression that binds thousands of variables is parsed and evaluated in
+  linear time.** The parser asked whether each `$$name` was bound by scanning
+  every name in scope, and evaluation read a `$let`'s variables the same way, so
+  a `$let` of 95,000 variables (about 2.3 MB, inside the request body cap), each
+  read once, took 6.7 s to parse on a release build and a further 5.8 s to
+  evaluate, per document it is evaluated against, synchronously on the worker
+  that took the request, where the request timeout cannot interrupt it. The
+  parser now asks one hash probe (it takes 17 ms), and a `$let` of more than
+  sixteen variables keeps them in name order and bisects. Nothing about what an
+  expression means changes; shadowing and scope are as they were
+  ([ADR-105](docs/decisions.md)).
+
 - **A start that fails after it opens the store no longer leaves it needing
   repair.** The cluster listener's port in use, or any other failure past the
   open, left redb's recovery-required flag set: a background task that held the
