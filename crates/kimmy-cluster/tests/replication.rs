@@ -6798,74 +6798,92 @@ async fn an_advancing_contact_ending_at_the_ceiling_is_not_reset_or_carried() {
         }
     });
 
-    // Priced the same way `a_tick_at_the_pull_ceiling` is, and for the same
-    // reason: a pull's cost belongs to the machine, and the interval must
-    // never be what ends the contact -- only the ceiling may.
-    const PRICED_PULLS: usize = 8;
-    let mut slowest = Duration::ZERO;
-    for _ in 0..PRICED_PULLS {
-        let priced = std::time::Instant::now();
-        let one = sync_once(&b.engine, fake, SECRET, None).await.expect("a pull to price");
-        slowest = slowest.max(priced.elapsed());
-        assert!(one.truncated, "the fake must read as truncated, or this tests nothing: {one:?}");
-    }
-    let interval = slowest * (6 * MAX_PULLS_PER_CONTACT as u32);
-    let priced_pulls = pulls.load(Ordering::SeqCst);
-
+    // The interval is one hour, so the interval can never be what ends the
+    // first contact: only the ceiling can, whatever a pull costs on this
+    // machine (a pull's cost belongs to the machine, and 128 of them are
+    // seconds locally and tens of seconds on a loaded CI runner). The test
+    // used to price a fixed interval off a few timed pulls, six times the
+    // ceiling's worth of the slowest of them, and then wait out two such
+    // intervals for the second and third ticks; that was six minutes on CI.
+    // A tick that waits the full hour is never waited for: what is asserted
+    // is that nothing comes at once, which is what a reset or a carry would
+    // do (`reset_immediately`, a tick at the next scheduler turn).
+    const INTERVAL: Duration = Duration::from_secs(3600);
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<RoundReport>();
     let mut config =
         ReplicationConfig::new(vec![SeedSource::Static(vec![fake])], SECRET.into(), b.addr);
-    config.sync_interval = interval;
+    config.sync_interval = INTERVAL;
     config.discovery_interval = Duration::from_millis(10);
     config.on_round = Some(Arc::new(move |report| {
         let _ = tx.send(report);
     }));
     let looping = tokio::spawn(replicate(Arc::clone(&b.engine), config));
 
-    let deadline = tokio::time::Instant::now() + interval * 4 + Duration::from_secs(10);
-    // The first tick that actually reached the peer -- discovery and any
-    // earlier ticks before it get skipped, the same way the single-tick
-    // fixture does.
-    let (first_at, first_reset) = loop {
+    // The first tick that actually reached the peer: the seeds resolve beside
+    // the loop, so the first tick or two can find nobody and retry early.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(120);
+    let first = loop {
         let report = tokio::time::timeout_at(deadline, rx.recv())
             .await
             .unwrap_or_else(|_| panic!("no tick reached the peer"))
             .expect("the loop must keep reporting");
-        if pulls.load(Ordering::SeqCst) - priced_pulls > 0 {
-            break (tokio::time::Instant::now(), report.reset);
+        if pulls.load(Ordering::SeqCst) > 0 {
+            break report;
         }
     };
-    let ended_at_ceiling = pulls.load(Ordering::SeqCst) - priced_pulls >= MAX_PULLS_PER_CONTACT;
-    let second = tokio::time::timeout_at(deadline, rx.recv())
-        .await
-        .unwrap_or_else(|_| panic!("no second tick arrived"))
-        .expect("the loop must keep reporting");
-    let second_at = tokio::time::Instant::now();
-    let third = tokio::time::timeout_at(deadline, rx.recv())
-        .await
-        .unwrap_or_else(|_| panic!("no third tick arrived"))
-        .expect("the loop must keep reporting");
-    let third_at = tokio::time::Instant::now();
-    looping.abort();
-
-    assert!(
-        ended_at_ceiling,
-        "premise: the first tick must reach the ceiling, {} pulls short of it",
-        MAX_PULLS_PER_CONTACT as i64 - (pulls.load(Ordering::SeqCst) - priced_pulls) as i64
+    let contacts = first.pulls.contacts;
+    let pulled = pulls.load(Ordering::SeqCst);
+    assert_eq!(
+        pulled, MAX_PULLS_PER_CONTACT,
+        "premise: the first tick must pull exactly up to the ceiling, no more and no fewer"
     );
-    assert!(!first_reset, "premise: the first tick is not itself a reset's continuation");
-    assert!(!second.reset, "an advancing Ceiling end must not schedule a reset for the next tick");
-    assert!(!third.reset, "nor the one after it");
-    // A tick that overran its interval on a stalled host makes the ticker
-    // fire the next at once (`MissedTickBehavior::Delay`), so one short gap
-    // proves nothing; two in a row are a loop rescheduling without the flag.
-    let gaps = [second_at.duration_since(first_at), third_at.duration_since(second_at)];
-    let short = interval - interval / 4;
-    assert!(
-        gaps.iter().any(|gap| *gap >= short),
-        "the ticks after an advancing Ceiling end landed {gaps:?} after one another, both well \
-         under the {interval:?} interval -- it was reset and carried forward despite ending at \
-         the ceiling"
+    assert_eq!(
+        contacts[kimmy_cluster::ContactEnd::Ceiling.slot()],
+        1,
+        "premise: the first tick's one contact must end at the ceiling: {contacts:?}"
+    );
+    assert_eq!(
+        contacts[kimmy_cluster::ContactEnd::Budget.slot()],
+        0,
+        "premise: an hour-long interval leaves budget for every pull: {contacts:?}"
+    );
+    assert_eq!(
+        first.pulls.entries, MAX_PULLS_PER_CONTACT as u64,
+        "premise: every one of those pulls advanced, each applying its one new entry"
+    );
+    assert!(!first.reset, "premise: the first tick is not itself a reset's continuation");
+
+    // What a reset or a carry would do is start the next tick at once, so
+    // that is the window: three seconds in which this process actually ran
+    // (a sleep that overshoots its step is a stall of the host, not time the
+    // loop had), with no report from a second tick and no further pull
+    // from the peer. A bug here is a peer pulled 128 times more, and a
+    // report with `reset` set, within moments.
+    const STEP: Duration = Duration::from_millis(100);
+    const RAN_STEPS: usize = 30;
+    let mut ran = 0;
+    while ran < RAN_STEPS {
+        let slept = std::time::Instant::now();
+        match tokio::time::timeout(STEP, rx.recv()).await {
+            Err(_) => {}
+            Ok(Some(second)) => panic!(
+                "a second tick arrived at once after an advancing Ceiling end, with an \
+                 {INTERVAL:?} interval (reset: {}) -- it was reset and carried forward despite \
+                 ending at the ceiling",
+                second.reset
+            ),
+            Ok(None) => panic!("the loop must keep its report channel open"),
+        }
+        if slept.elapsed() < STEP * 5 {
+            ran += 1;
+        }
+    }
+    looping.abort();
+    assert_eq!(
+        pulls.load(Ordering::SeqCst),
+        pulled,
+        "the peer was pulled again at once after an advancing Ceiling end -- it was carried \
+         forward despite ending at the ceiling"
     );
 }
 
