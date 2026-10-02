@@ -23687,3 +23687,152 @@ holding none of the paths kept as `{}` outside an array; the shorter path not
 winning, in the tree and in each walk; fields put in specification order. The
 `kimmy-api` and `kimmy-mcp` tests fail on the code before this change, with
 the first element answered as a document.
+
+---
+
+## ADR-215 — An array written inside an expression is an array of expressions
+
+**Status:** accepted, for the next `0.MINOR`. Completes the reading rules of
+[ADR-105](#adr-105--expressions-evaluate-in-a-lexical-scope): a field path, a
+variable, an operator and an object expression were read wherever they stood,
+except inside an array. Applies to every caller of the expression parser,
+[ADR-206](#adr-206--a-filters-expr-that-cannot-be-evaluated-fails-the-request)'s
+filter `$expr` and
+[ADR-209](#adr-209--an-arrayfilters-entry-takes-expr-reading-the-element-as-identifier)'s
+`arrayFilters` entry included.
+
+**The defect.** `Expr::parse_in` read a string beginning with `$` as a field
+path or a variable and a document as an operator or an object expression, and
+turned **every other value, an array included, into a literal**. An operator's
+argument list was read element by element, so `{$setUnion: ["$tags",
+"$extra"]}` worked; an array nested as one argument, or written where a single
+expression goes, was kept as written. Over `{a: 1, b: 2, tags: ["x"], extra:
+"y"}`:
+
+```json
+{"$project": {"pair": ["$a", "$b"], "u": {"$setUnion": ["$tags", ["$extra"]]}}}
+```
+
+answered `pair: ["$a", "$b"]` and `u: ["x", "$extra"]`, with a `200`. The same
+held for a `$group` key or accumulator written as an array, an `$expr` such as
+`{$in: ["$x", ["$a", "$b"]]}` (compared against the two strings, on a `multi`
+update or delete too), a `$lookup` `let` value, and the arrays inside `$map`,
+`$filter` and `$reduce` bodies, where a `$$this` in an array was the string
+`"$$this"`. `aggregation.md` documents `"$field"` as a field reference and
+never said an array suspends that, and the deviations register had no entry:
+by this project's bar a wrong answer nothing documents is a defect.
+
+**Decision.**
+
+- **An array inside an expression is an array of expressions.** Each element is
+  parsed by `parse_in` in the scope the array sits in, so a variable bound by
+  `$let`, `$map`, `$filter`, `$reduce` or a `$lookup` `let` is readable in it,
+  and evaluates to the array of the elements' values, in order. Nesting is
+  recursive: an array in an array, a document in an array, an array in a
+  document. One parse function reads arrays for every caller, so `$project`,
+  `$addFields`, `$replaceRoot`, `$group` keys and accumulators, a filter's
+  `$expr`, an `arrayFilters` entry's `$expr`, a `$lookup` `let`, a vector
+  search's `filter` and the MCP tools read an array the same way.
+- **An operator's argument list is not an array value.** `{$size: ["$tags"]}`
+  is `$size` with one argument, as before; `{$size: [["$a", "$b"]]}` is `$size`
+  of a two-element array. `parse_args` reads the outer list and hands each
+  argument to `parse_in`, which is the only place an array value is read.
+- **`{$literal: [...]}` keeps an array as written**, `$`-strings and
+  operator-shaped documents included. It is the one spelling of a literal
+  array that holds such values, as it is already the one spelling of the
+  string `"$x"`.
+- **A missing field is `null` in its place.** The element is kept, so an
+  array's length and positions do not depend on which fields a document has:
+  `["$a", "$missing"]` is `[1, null]`, `{$concatArrays: [["$missing"], [1]]}`
+  is `[null, 1]` and `{$size: [["$missing"]]}` is `1`. This is how a missing
+  field reads everywhere else in the language, and an array holding a null is
+  an array, so the operators that answer null for a null argument do not.
+- **An element that cannot be evaluated fails the array**, with that element's
+  own error, the first in written order. It is a value error, so under
+  [ADR-211](#adr-211--an-expressions-and-and-or-fail-only-when-the-answer-depends-on-an-argument-that-cannot-be-evaluated)
+  an `$and` or `$or` holds it while another argument may decide:
+  `{$and: [[<bad>], false]}` is `false`.
+- **The names in an array are found.** `Expr::free_variables` collects in the
+  same parse, so an `arrayFilters` entry whose `$expr` names `$$line` only
+  inside an array, `{$in: ["gasket", ["$$line.sku", "$$line.alt"]]}`, has its
+  identifier, and `Expr::reads_document` looks inside arrays, so a field of the
+  document in one is still refused there.
+- **An array of constants is folded to one literal at parse.** When every
+  element parses to a literal the result is `Expr::Literal` of the array, so
+  `{$in: ["$x", ["a", "b"]]}` costs what it did. A document whose values are
+  all literals is a literal too (an object expression with nothing to read
+  answers the same document in every row, so it is built once), which makes an
+  array of constant documents, and an array in a document in an array, fold at
+  any depth: `[{"a": [1, {"b": 2}]}]` is one value. The answer is the same as
+  evaluating the elements one by one; a property test holds the two equal over
+  generated arrays and documents.
+- **A document written in an array is parsed as an expression.** One whose
+  first key starts with `$` is an operator, so `[{"$gt": 1}]` fails with
+  `$gt takes exactly 2 argument(s)` and `[{"a": 1, "$b": 2}]` is refused as
+  mixing an operator with a field. Both were kept as written before. This is
+  the same rule a document follows anywhere else in an expression, and
+  `{$literal: [...]}` is the way to keep one.
+- **A `Decimal128` element is refused as before**, now by the element's own
+  parse, with the same message.
+
+**Why not refuse.** Refusing a `$`-string inside an array would also refuse
+arrays of plain strings that happen to begin with `$`, which `$literal` already
+covers, and would leave `["$a", "$b"]` without a meaning when the docs' field
+path rule already gives it one. Evaluating is that rule applied without an
+exception. ADR-121 and ADR-124 ask for a refusal where the server cannot
+honour a request; here it can.
+
+**Caller-visible.** **Breaking:** any request that wrote a `$`-string, a
+`$$`-variable or an operator inside an array in an expression changes its
+answer: it reads the value where it used to keep the text. A pipeline that
+wanted the text writes `{$literal: [...]}`. A filter's `$expr` with such an
+array selects different documents, on a `multi` update or delete too, and an
+`arrayFilters` `$expr` that named its identifier only inside an array was
+refused as naming none and is now accepted. An array holding only constants
+answers as before, with one exception: one holding a document with a
+`$`-prefixed key is now parsed as an operator and can be refused, where it was
+kept as written; write it under `$literal`. During a roll, a member on the old version answers with the
+text and one on the new version with the value; nothing evaluated in the
+background or on replication reads an expression, so no stored state diverges.
+
+**Rejected.**
+
+- *Keep the literal reading and document it.* A rule with no reason a caller
+  could guess, and the wrong answer arrives with a `200`.
+- *Drop a missing element instead of writing null.* Positions would shift with
+  the data, so `{$arrayElemAt: [["$a", "$b"], 0]}` would read `b` on a
+  document without `a`.
+- *No folding.* Same answers, but every constant array, the common case in
+  `$in`, would be rebuilt per document.
+
+**Cost.** One more node, `Expr::Array`, built only for an array with an element
+to read; evaluating it is one allocation and one evaluation per element. The
+parse checks each element once. An array with one element to read is not
+folded as a whole, so a large array of constants with a single field path in it
+is walked per document: every constant element is cloned into the result, as
+the result must own them, so the cost is the size of the answer.
+
+### Test
+
+`kimmy-query` `expr::arrays`: field paths, an operator, a document and a
+variable as elements, the worked example, `$in` and `$concatArrays` over
+nested arrays; arrays in arrays and documents in arrays at depth; a missing
+field as null in `$concatArrays`, `$size`, `$arrayElemAt` and `$setUnion`;
+`$literal` keeping `$`-strings and operators; the variables of `$map`,
+`$filter`, `$reduce`, `$let` and a `$lookup` `let` read in an array, an unbound
+name refused at parse; `free_variables` inside arrays and not inside
+`$literal`; `reads_document` through arrays; the first failing element's error,
+and an `$and`/`$or` deciding past a failing array or reporting its error;
+folding, including constant documents and arrays nested in them, and a
+`Decimal128` element refused folded or not; an operator-shaped document in an
+array parsed and refused, and kept by `$literal`; the named operands of
+`$reduce`, `$switch`, `$convert`, `$map`, `$filter` and `$let` read as arrays; a property test
+over generated arrays of literals and plain documents in which the parsed
+array, the same elements built unfolded, and `$size` of it all answer the
+array. `aggregate`: `$project`, `$addFields`, `$replaceRoot`, a `$group` key and
+a `$push`, a `$match` `$expr`, and a `$lookup` `let` read by its sub-pipeline.
+`filter`: an `$expr` `$in` over an array of fields, and `$literal` keeping the
+strings. `update`: an `arrayFilters` entry naming `$$line` only inside an array
+selects its elements, and a field inside an array is refused there.
+`kimmy-api`: the worked example, a `find` with `$in` over an array of fields
+and with `$literal`, and the `arrayFilters` entry over HTTP.

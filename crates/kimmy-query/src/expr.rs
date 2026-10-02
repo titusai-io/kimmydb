@@ -26,6 +26,9 @@
 //! - any other document is an **object expression** — its values are
 //!   expressions and the result is a document. This is what makes a compound
 //!   `$group` key work;
+//! - an array is an **array expression** — each element is an expression,
+//!   parsed in the same scope, and the result is the array of their values
+//!   (ADR-215). `{$literal: [...]}` keeps an array as written;
 //! - anything else is a literal.
 //!
 //! That third rule is a **behaviour change**: `{_id: {a: "$x"}}` used to be a
@@ -489,6 +492,11 @@ pub enum Expr {
     Reduce { input: Box<Expr>, initial: Box<Expr>, body: Box<Expr> },
     /// A document whose values are expressions.
     Object(Vec<(String, Expr)>),
+    /// An array whose elements are expressions, evaluated in order to the
+    /// array of their values. An array whose elements are all constants, at
+    /// any depth, is folded to one [`Expr::Literal`] at parse, which answers
+    /// the same.
+    Array(Vec<Expr>),
 }
 
 // ---------------------------------------------------------------------------
@@ -680,6 +688,7 @@ impl Expr {
                 input.reads_document() || initial.reads_document() || body.reads_document()
             }
             Expr::Object(fields) => fields.iter().any(|(_, e)| e.reads_document()),
+            Expr::Array(items) => any(items),
         }
     }
 
@@ -707,6 +716,7 @@ impl Expr {
                 _ => Expr::Literal(value.clone()),
             }),
             Bson::Document(doc) => Self::parse_document(doc, declared),
+            Bson::Array(items) => Self::parse_array(items, declared),
             other => {
                 refuse_decimal_literal(other)?;
                 Ok(Expr::Literal(other.clone()))
@@ -760,10 +770,38 @@ impl Expr {
         Ok(Expr::Var { name: name.to_string(), path: path.map(str::to_string) })
     }
 
+    /// An array written inside an expression: each element is an expression,
+    /// parsed in the scope the array sits in, so a field path, a variable
+    /// and an operator in it are read rather than kept as written.
+    ///
+    /// The operand list of an operator is not this: `parse_args` reads that
+    /// list itself, and only an array nested as one operand, or written where
+    /// a single expression goes, arrives here. `{$literal: [...]}` never does.
+    ///
+    /// When every element is a literal the array is folded to one literal,
+    /// which evaluates to the same value without a walk per document. A
+    /// document of literals is one already (see [`Self::parse_document`]), so
+    /// an array of constants folds at any depth.
+    fn parse_array(items: &[Bson], declared: &mut Vec<String>) -> Result<Self> {
+        let elements =
+            items.iter().map(|v| Self::parse_in(v, declared)).collect::<Result<Vec<_>>>()?;
+        if elements.iter().all(|e| matches!(e, Expr::Literal(_))) {
+            let values = elements
+                .into_iter()
+                .map(|e| match e {
+                    Expr::Literal(v) => v,
+                    _ => unreachable!("every element was checked to be a literal"),
+                })
+                .collect();
+            return Ok(Expr::Literal(Bson::Array(values)));
+        }
+        Ok(Expr::Array(elements))
+    }
+
     fn parse_document(doc: &Document, declared: &mut Vec<String>) -> Result<Self> {
         let Some((first, _)) = doc.iter().next() else {
-            // `{}` is an empty object expression, not an operator.
-            return Ok(Expr::Object(Vec::new()));
+            // `{}` is an empty document, not an operator.
+            return Ok(Expr::Literal(Bson::Document(Document::new())));
         };
 
         if !first.starts_with('$') {
@@ -776,6 +814,18 @@ impl Expr {
                     )));
                 }
                 fields.push((key.clone(), Self::parse_in(value, declared)?));
+            }
+            // A document whose values are all literals is one literal: the
+            // same document in every row, built once.
+            if fields.iter().all(|(_, e)| matches!(e, Expr::Literal(_))) {
+                let folded = fields
+                    .into_iter()
+                    .map(|(key, e)| match e {
+                        Expr::Literal(v) => (key, v),
+                        _ => unreachable!("every value was checked to be a literal"),
+                    })
+                    .collect();
+                return Ok(Expr::Literal(Bson::Document(folded)));
             }
             return Ok(Expr::Object(fields));
         }
@@ -1097,6 +1147,13 @@ impl Expr {
                     out.insert(key.clone(), expr.eval_in(scope)?);
                 }
                 Ok(Bson::Document(out))
+            }
+            // A missing field is null in its place, as everywhere else: the
+            // element is kept, so positions do not shift. The first element
+            // that fails fails the array, with its own error, which is a
+            // value error like any other and may be held by `$and`/`$or`.
+            Expr::Array(items) => {
+                items.iter().map(|e| e.eval_in(scope)).collect::<Result<Vec<_>>>().map(Bson::Array)
             }
             Expr::Switch { branches, default } => {
                 for (case, then) in branches {
@@ -5398,6 +5455,313 @@ mod sets_and_pairs {
             expr.insert(name, doc! { "inputs": [[1]] });
             let msg = Expr::parse(&Bson::Document(expr)).unwrap_err().to_string();
             assert!(msg.contains(name) && msg.contains("not an expression operator"), "{msg}");
+        }
+    }
+}
+
+/// An array written inside an expression is an array of expressions, read in
+/// the scope it sits in (ADR-215).
+#[cfg(test)]
+mod arrays {
+    use super::*;
+    use bson::{bson, doc};
+    use proptest::prelude::*;
+
+    fn row() -> Document {
+        doc! {
+            "a": 1, "b": 2, "tags": ["x"], "extra": "y", "xs": [1, 2],
+            "s": "text", "n": 0,
+        }
+    }
+
+    fn ev(expr: Bson) -> Result<Bson> {
+        Expr::parse(&expr)?.eval(&row())
+    }
+
+    fn ok(expr: Bson) -> Bson {
+        ev(expr.clone()).unwrap_or_else(|e| panic!("{expr}: {e}"))
+    }
+
+    #[test]
+    fn a_field_path_in_an_array_is_read() {
+        assert_eq!(ok(bson!(["$a", "$b"])), bson!([1, 2]));
+        // The worked example: a nested operand is read too.
+        assert_eq!(ok(bson!({"$setUnion": ["$tags", ["$extra"]]})), bson!(["x", "y"]));
+        assert_eq!(ok(bson!({"$in": [2, ["$a", "$b"]]})), bson!(true));
+        assert_eq!(ok(bson!({"$in": ["$b", ["$a", 3]]})), bson!(false));
+        assert_eq!(
+            ok(bson!({"$concatArrays": ["$xs", ["$a", {"$add": ["$b", 1]}]]})),
+            bson!([1, 2, 1, 3_i64])
+        );
+        assert_eq!(ok(bson!({"$size": [["$a", "$b", "$s"]]})), bson!(3_i64));
+        // An operator, a document and a variable as elements.
+        assert_eq!(
+            ok(bson!([{"$add": ["$a", "$b"]}, {"k": "$s"}, "$$ROOT.a", "plain"])),
+            bson!([3_i64, {"k": "text"}, 1, "plain"])
+        );
+    }
+
+    #[test]
+    fn arrays_nest_and_documents_inside_them_are_read() {
+        assert_eq!(ok(bson!([["$a", ["$b"]], 3])), bson!([[1, [2]], 3]));
+        assert_eq!(ok(bson!([{"p": ["$a", {"q": ["$b"]}]}])), bson!([{"p": [1, {"q": [2]}]}]));
+        assert_eq!(ok(bson!({"o": [{"v": "$s"}]})), bson!({"o": [{"v": "text"}]}));
+    }
+
+    #[test]
+    fn a_missing_field_is_null_in_its_place() {
+        assert_eq!(ok(bson!(["$a", "$missing", "$b"])), bson!([1, null, 2]));
+        assert_eq!(ok(bson!({"$concatArrays": [["$missing"], [1]]})), bson!([null, 1]));
+        assert_eq!(ok(bson!({"$size": [["$missing", "$nope"]]})), bson!(2_i64));
+        assert_eq!(ok(bson!({"$arrayElemAt": [["$missing", "$b"], 1]})), bson!(2));
+        // An array holding a null is an array, not a null: the operators that
+        // propagate a null argument do not see one.
+        assert_eq!(ok(bson!({"$setUnion": [["$missing"], [1]]})), bson!([null, 1]));
+    }
+
+    #[test]
+    fn a_literal_keeps_an_array_as_written() {
+        assert_eq!(
+            ok(bson!({"$literal": ["$a", "$$x", {"$add": [1]}]})),
+            bson!(["$a", "$$x", {"$add": [1]}])
+        );
+        assert_eq!(ok(bson!({"$in": ["$a", {"$literal": ["$a"]}]})), bson!(false));
+        assert_eq!(ok(bson!({"$in": ["$a", {"$literal": [1]}]})), bson!(true));
+    }
+
+    #[test]
+    fn an_element_reads_the_variables_of_the_scope_it_sits_in() {
+        let mapped =
+            bson!({"$map": {"input": "$xs", "as": "x", "in": ["$$x", {"$multiply": ["$$x", 10]}]}});
+        assert_eq!(ok(mapped), bson!([[1, 10_i64], [2, 20_i64]]));
+        let filtered = bson!({"$filter": {"input": "$xs", "cond": {"$in": ["$$this", ["$a", 5]]}}});
+        assert_eq!(ok(filtered), bson!([1]));
+        let reduced = bson!({"$reduce": {
+            "input": "$xs", "initialValue": [], "in": {"$concatArrays": ["$$value", ["$$this"]]}
+        }});
+        assert_eq!(ok(reduced), bson!([1, 2]));
+        let bound = bson!({"$let": {"vars": {"v": "$b"}, "in": [["$$v"]]}});
+        assert_eq!(ok(bound), bson!([[2]]));
+        // A `$lookup` let name, bound by the caller.
+        let parsed = Expr::parse_with_vars(&bson!(["$$oid", "$a"]), &["oid".to_string()]).unwrap();
+        let oid = Bson::Int32(7);
+        let frame = [("oid", &oid)];
+        assert_eq!(parsed.eval_in(&Scope::with_bindings(&row(), &frame)).unwrap(), bson!([7, 1]));
+        // A name nothing binds is refused at parse, inside an array as anywhere.
+        let msg = Expr::parse(&bson!({"$in": [1, ["$$nope"]]})).unwrap_err().to_string();
+        assert!(msg.contains("unknown variable $$nope"), "{msg}");
+        // And one bound around the array but not in scope outside it is free.
+        let msg = Expr::parse(&bson!([{"$let": {"vars": {"v": 1}, "in": "$$v"}}, "$$v"]))
+            .unwrap_err()
+            .to_string();
+        assert!(msg.contains("unknown variable $$v"), "{msg}");
+    }
+
+    #[test]
+    fn free_variables_are_collected_inside_an_array() {
+        assert_eq!(
+            Expr::free_variables(&bson!({"$in": ["gasket", ["$$line.sku", "$$line.alt"]]}))
+                .unwrap(),
+            vec!["line".to_string()]
+        );
+        assert_eq!(
+            Expr::free_variables(&bson!([["$$a"], {"k": ["$$b"]}])).unwrap(),
+            vec!["a".to_string(), "b".to_string()]
+        );
+        // A `$literal` array names nothing.
+        assert!(Expr::free_variables(&bson!({"$literal": ["$$line"]})).unwrap().is_empty());
+    }
+
+    #[test]
+    fn an_array_reads_the_document_when_an_element_does() {
+        let reads =
+            |v: Bson| Expr::parse_with_vars(&v, &["line".to_string()]).unwrap().reads_document();
+        assert!(reads(bson!({"$in": ["$$line", ["$a"]]})));
+        assert!(reads(bson!([[{"k": "$$ROOT"}]])));
+        assert!(!reads(bson!({"$in": ["$$line", ["$$line.alt", 1]]})));
+        // One element that reads is enough, wherever it sits.
+        assert!(reads(bson!({"$in": ["$$line", [1, "$a"]]})));
+        assert!(reads(bson!([["$$line.alt", 1], ["$$line.alt", "$$ROOT"]])));
+        assert!(!reads(bson!([1, [2]])));
+    }
+
+    #[test]
+    fn an_element_that_fails_fails_the_array_with_its_own_error() {
+        let msg = ev(bson!(["$a", {"$add": ["$s", 1]}])).unwrap_err().to_string();
+        assert!(msg.contains("$add") && msg.contains("string"), "{msg}");
+        // The first failing element in order is the one reported.
+        let msg = ev(bson!([{"$divide": [1, "$n"]}, {"$add": ["$s", 1]}])).unwrap_err().to_string();
+        assert!(msg.contains("$divide"), "{msg}");
+    }
+
+    #[test]
+    fn a_failing_array_is_held_by_and_and_or_like_any_value_error() {
+        // ADR-211: a value error waits while another argument may decide.
+        let bad = bson!([{"$add": ["$s", 1]}]);
+        let sized = bson!({"$gt": [{"$size": [bad.clone()]}, 0]});
+        for (expr, want) in [
+            (bson!({"$and": [bad.clone(), false]}), false),
+            (bson!({"$and": [false, bad.clone()]}), false),
+            (bson!({"$or": [bad.clone(), true]}), true),
+            (bson!({"$or": [true, sized.clone()]}), true),
+            (bson!({"$and": [sized.clone(), "$missing"]}), false),
+        ] {
+            assert_eq!(ev(expr.clone()).unwrap(), Bson::Boolean(want), "{expr}");
+        }
+        // Undecided, the array's own error stands.
+        for expr in [bson!({"$and": [bad.clone(), true]}), bson!({"$or": [false, sized]})] {
+            let msg = ev(expr.clone()).unwrap_err().to_string();
+            assert!(msg.contains("$add"), "{expr}: {msg}");
+        }
+    }
+
+    #[test]
+    fn an_array_of_literals_is_folded_to_one_literal() {
+        assert_eq!(
+            Expr::parse(&bson!([1, ["two", null], true])).unwrap(),
+            Expr::Literal(bson!([1, ["two", null], true]))
+        );
+        assert_eq!(Expr::parse(&bson!([])).unwrap(), Expr::Literal(bson!([])));
+        // One element to read and the array is not folded, at any depth.
+        assert!(matches!(Expr::parse(&bson!([1, ["$a"]])).unwrap(), Expr::Array(_)));
+        assert!(matches!(Expr::parse(&bson!([1, {"k": "$a"}])).unwrap(), Expr::Array(_)));
+        assert!(matches!(Expr::parse(&bson!([[{"k": [1, "$a"]}]])).unwrap(), Expr::Array(_)));
+        // A Decimal128 element is refused, folded or not.
+        let d = Bson::Decimal128("1.5".parse().unwrap());
+        for array in [Bson::Array(vec![d.clone()]), Bson::Array(vec![Bson::from("$a"), d])] {
+            let msg = Expr::parse(&array).unwrap_err().to_string();
+            assert!(msg.contains("Decimal128 literal"), "{msg}");
+        }
+    }
+
+    /// An array of constants folds to one literal even when an element is a
+    /// document of constants, at any depth, so no walk is made per document.
+    #[test]
+    fn a_constant_nested_array_or_document_folds_to_one_literal() {
+        let folded = |v: Bson| Expr::parse(&v).unwrap();
+        for value in [
+            bson!([{"a": 1}]),
+            bson!([{"a": [1, {"b": [2, {}]}], "c": "text"}, [{"d": null}], {}]),
+            bson!([[[{"k": [[{"j": 1}]]}]]]),
+        ] {
+            assert_eq!(folded(value.clone()), Expr::Literal(value.clone()), "{value}");
+        }
+        // Inside an operand the whole nested array is one literal node.
+        let value = bson!([{"a": [1, {"b": 2}]}, [3]]);
+        assert_eq!(
+            folded(bson!({"$size": [value.clone()]})),
+            Expr::Op(Op::Size, vec![Expr::Literal(value)])
+        );
+        // One path anywhere keeps the array to walk, and only it: the
+        // constants around it are folded where they stand.
+        let Expr::Array(items) = folded(bson!([{"a": 1}, [2, {"b": 3}], {"c": "$a"}])) else {
+            panic!("an element reads the document");
+        };
+        assert_eq!(items[0], Expr::Literal(bson!({"a": 1})));
+        assert_eq!(items[1], Expr::Literal(bson!([2, {"b": 3}])));
+        assert!(matches!(items[2], Expr::Object(_)));
+        // The answer is the same either way.
+        assert_eq!(
+            ok(bson!([{"a": 1}, [2, {"b": 3}], {"c": "$a"}])),
+            bson!([{"a": 1}, [2, {"b": 3}], {"c": 1}])
+        );
+    }
+
+    /// A document written in an array is read as an expression, so one with a
+    /// `$`-prefixed key is an operator and can be refused. `$literal` keeps it.
+    #[test]
+    fn an_operator_shaped_document_in_an_array_is_parsed_and_literal_keeps_it() {
+        let msg = Expr::parse(&bson!([{"$gt": 1}])).unwrap_err().to_string();
+        assert!(msg.contains("$gt takes exactly 2 argument(s)"), "{msg}");
+        let msg = Expr::parse(&bson!({"$in": ["$a", [{"$gt": 1}]]})).unwrap_err().to_string();
+        assert!(msg.contains("$gt takes exactly 2 argument(s)"), "{msg}");
+        let msg = Expr::parse(&bson!([{"a": 1, "$b": 2}])).unwrap_err().to_string();
+        assert!(msg.contains("cannot mix operator"), "{msg}");
+        // Written under `$literal`, the same documents are values.
+        assert_eq!(ok(bson!({"$literal": [{"$gt": 1}]})), bson!([{"$gt": 1}]));
+        assert_eq!(ok(bson!({"$literal": [{"a": 1, "$b": 2}]})), bson!([{"a": 1, "$b": 2}]));
+        let kept = bson!({"$in": [{"$literal": {"$gt": 1}}, {"$literal": [{"$gt": 1}]}]});
+        assert_eq!(ok(kept), bson!(true));
+    }
+
+    /// The named operands of `$reduce`, `$switch`, `$convert`, `$map`,
+    /// `$filter` and `$let` are expressions like any other, so an array
+    /// written as one is read, not kept as text.
+    #[test]
+    fn an_array_written_as_a_named_operand_is_read() {
+        assert_eq!(
+            ok(bson!({"$reduce": {
+                "input": "$xs", "initialValue": ["$a"],
+                "in": {"$concatArrays": ["$$value", ["$$this"]]}
+            }})),
+            bson!([1, 1, 2])
+        );
+        assert_eq!(
+            ok(bson!({"$switch": {"branches": [{"case": true, "then": ["$a", "$b"]}]}})),
+            bson!([1, 2])
+        );
+        assert_eq!(
+            ok(bson!({"$switch": {
+                "branches": [{"case": false, "then": 0}], "default": ["$a", "$b"]
+            }})),
+            bson!([1, 2])
+        );
+        assert_eq!(
+            ok(bson!({"$convert": {"input": "$s", "to": "int", "onError": ["$a"]}})),
+            bson!([1])
+        );
+        assert_eq!(
+            ok(bson!({"$convert": {"input": "$missing", "to": "int", "onNull": ["$b"]}})),
+            bson!([2])
+        );
+        assert_eq!(
+            ok(bson!({"$map": {"input": ["$a", "$b"], "as": "x", "in": {"$add": ["$$x", 1]}}})),
+            bson!([2_i64, 3_i64])
+        );
+        assert_eq!(
+            ok(bson!({"$filter": {"input": ["$a", "$b"], "cond": {"$gt": ["$$this", 1]}}})),
+            bson!([2])
+        );
+        assert_eq!(ok(bson!({"$let": {"vars": {"v": ["$a", "$b"]}, "in": "$$v"}})), bson!([1, 2]));
+    }
+
+    /// A value an expression reads as itself: no `$`-prefixed string or key,
+    /// at any depth. Documents and nested arrays are included, so the folded
+    /// shape of each is held equal to the unfolded one below.
+    fn literal_value() -> impl Strategy<Value = Bson> {
+        let leaf = prop_oneof![
+            Just(Bson::Null),
+            any::<bool>().prop_map(Bson::Boolean),
+            any::<i32>().prop_map(Bson::Int32),
+            any::<i64>().prop_map(Bson::Int64),
+            (-1.0e6f64..1.0e6).prop_map(Bson::Double),
+            "[a-z ]{0,6}".prop_map(Bson::String),
+        ];
+        leaf.prop_recursive(4, 32, 6, |inner| {
+            prop_oneof![
+                prop::collection::vec(inner.clone(), 0..6).prop_map(Bson::Array),
+                prop::collection::vec(("[a-z]{1,4}", inner), 1..4)
+                    .prop_map(|fields| { Bson::Document(fields.into_iter().collect()) }),
+            ]
+        })
+    }
+
+    proptest! {
+        #[test]
+        fn an_array_of_literals_evaluates_to_itself(
+            items in prop::collection::vec(literal_value(), 0..8),
+        ) {
+            let array = Bson::Array(items.clone());
+            let parsed = Expr::parse(&array).unwrap();
+            prop_assert_eq!(parsed.eval(&row()).unwrap(), array.clone());
+            // Folded or not, the same answer: each element parsed alone and
+            // the array built from them.
+            let unfolded =
+                Expr::Array(items.iter().map(|v| Expr::parse(v).unwrap()).collect());
+            prop_assert_eq!(unfolded.eval(&row()).unwrap(), array.clone());
+            // And through an operator that takes it as one operand.
+            let sized = Expr::parse(&bson!({"$size": [array.clone()]})).unwrap();
+            prop_assert_eq!(sized.eval(&row()).unwrap(), Bson::Int64(items.len() as i64));
         }
     }
 }

@@ -2800,6 +2800,86 @@ mod tests {
         let read = Expr::parse_with_vars(&"$$outer".into(), &["outer".into()]).unwrap();
         assert_eq!(read.eval_in(&Scope::with_bindings(&d, &frame)).unwrap(), "rebound".into());
     }
+
+    /// An array written in a stage is an array of expressions in every place
+    /// an expression sits (ADR-215): `$project`, `$addFields`, `$replaceRoot`,
+    /// a `$group` key and an accumulator, `$match`'s `$expr` and a `$lookup`
+    /// `let`.
+    #[test]
+    fn an_array_in_any_stage_is_read_as_expressions() {
+        let input = || {
+            docs(vec![
+                doc! {"_id": 1, "a": 1, "b": 2, "tags": ["x"], "extra": "y"},
+                doc! {"_id": 2, "a": 1, "b": 3, "tags": [], "extra": "x"},
+            ])
+        };
+        let out = run(
+            vec![doc! {"$project": {
+                "pair": ["$a", "$b"],
+                "u": {"$setUnion": ["$tags", ["$extra"]]},
+                "kept": {"$literal": ["$a"]},
+            }}],
+            input(),
+        )
+        .unwrap();
+        assert_eq!(out[0], doc! {"_id": 1, "pair": [1, 2], "u": ["x", "y"], "kept": ["$a"]});
+
+        let out = run(vec![doc! {"$addFields": {"pair": [["$b"], "$missing"]}}], input()).unwrap();
+        assert_eq!(
+            out[1].get("pair"),
+            Some(&Bson::from(vec![Bson::from(vec![Bson::Int32(3)]), Bson::Null]))
+        );
+
+        let out = run(vec![doc! {"$replaceRoot": {"newRoot": {"v": ["$_id"]}}}], input()).unwrap();
+        assert_eq!(out, docs(vec![doc! {"v": [1]}, doc! {"v": [2]}]));
+
+        // A group key that is an array groups by the values, not by one
+        // constant: two buckets here, where the strings made one.
+        let mut out = run(
+            vec![doc! {"$group": {"_id": ["$a", "$b"], "pairs": {"$push": ["$_id", "$extra"]}}}],
+            input(),
+        )
+        .unwrap();
+        out.sort_by_key(|d| d.get_array("_id").unwrap()[1].as_i32());
+        assert_eq!(
+            out,
+            docs(vec![
+                doc! {"_id": [1, 2], "pairs": [[1, "y"]]},
+                doc! {"_id": [1, 3], "pairs": [[2, "x"]]},
+            ])
+        );
+
+        let out =
+            run(vec![doc! {"$match": {"$expr": {"$in": ["$extra", ["$tags", "x"]]}}}], input())
+                .unwrap();
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].get_i32("_id").unwrap(), 2);
+    }
+
+    #[test]
+    fn a_lookup_let_array_is_read_and_its_names_reach_the_sub_pipeline() {
+        let stages = parse(&[doc! {"$lookup": {
+            "from": "items",
+            "let": {"wanted": ["$first", "$second"]},
+            "pipeline": [
+                {"$addFields": {"hit": {"$in": ["$sku", "$$wanted"]}}},
+                {"$match": {"hit": true}},
+                {"$project": {"_id": 0, "sku": 1, "pair": ["$$wanted", "$sku"]}},
+            ],
+            "as": "lines",
+        }}])
+        .unwrap();
+        let orders = vec![doc! {"_id": 1, "first": "a", "second": "c"}];
+        let items = vec![doc! {"sku": "a"}, doc! {"sku": "b"}, doc! {"sku": "c"}];
+        let out = join_in_memory(&stages[0], orders, &items);
+        assert_eq!(
+            out[0].get_array("lines").unwrap(),
+            &vec![
+                Bson::Document(doc! {"sku": "a", "pair": [["a", "c"], "a"]}),
+                Bson::Document(doc! {"sku": "c", "pair": [["a", "c"], "c"]}),
+            ]
+        );
+    }
 }
 
 #[cfg(test)]

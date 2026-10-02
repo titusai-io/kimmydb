@@ -2141,6 +2141,19 @@ mod tests {
     }
 
     #[test]
+    fn expr_reads_the_field_paths_inside_an_array() {
+        // ADR-215: `["$a", "$b"]` is the two fields' values, not two strings.
+        let q = doc! { "$expr": { "$in": ["$x", ["$a", "$b"]] } };
+        assert!(hits(q.clone(), doc! { "x": 2, "a": 1, "b": 2 }));
+        assert!(!hits(q.clone(), doc! { "x": 3, "a": 1, "b": 2 }));
+        assert!(!hits(q, doc! { "x": "$a", "a": 1, "b": 2 }));
+        // `$literal` keeps the strings.
+        let q = doc! { "$expr": { "$in": ["$x", { "$literal": ["$a"] }] } };
+        assert!(hits(q.clone(), doc! { "x": "$a", "a": 1 }));
+        assert!(!hits(q, doc! { "x": 1, "a": 1 }));
+    }
+
+    #[test]
     fn expr_accepts_a_literal() {
         assert!(hits(doc! { "$expr": true }, doc! {}));
         assert!(!hits(doc! { "$expr": false }, doc! { "a": 1 }));

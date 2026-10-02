@@ -72,6 +72,32 @@ breaking changes and says so here; a `0.x.PATCH` bump never does.
 
 ### Changed
 
+- **Breaking: an array written inside an expression is evaluated, so a field
+  path in it is the field's value.** An array nested as one operand, or
+  written where a single expression goes, was kept as written: `{"$project":
+  {"pair": ["$a", "$b"]}}` answered the two strings, `{"$setUnion": ["$tags",
+  ["$extra"]]}` added the string `"$extra"`, and a filter's `{"$expr": {"$in":
+  ["$x", ["$a", "$b"]]}}` compared against `"$a"` and `"$b"`, on a `multi`
+  update or delete too, all with a `200`. Each element is now an expression,
+  read in the same scope (variables of `$map`, `$filter`, `$reduce`, `$let`
+  and a `$lookup` `let` included), and the array is the elements' values; a
+  missing field is `null` in its place, and an element that cannot be
+  evaluated fails the array, which an `$and` or `$or` with a deciding argument
+  still answers past. In `$project`, `$addFields`, `$replaceRoot`, `$group`
+  keys and accumulators, a filter's `$expr` (on `find`, `count`, `update`,
+  `delete`, `find_and_modify`, `$match` and a vector search's `filter`), an
+  `arrayFilters` entry's `$expr` and the MCP tools. An `arrayFilters` `$expr`
+  that names `$$<identifier>` only inside an array was refused as naming none
+  and is now accepted. An array holding only constants answers as before,
+  except one holding a document with a `$`-prefixed key: that is now parsed
+  as an operator and can be refused (`[{"$gt": 1}]` fails with `$gt takes
+  exactly 2 argument(s)`, and `[{"a": 1, "$b": 2}]` is refused as mixing an
+  operator with a field), where it was kept as written; write it under
+  `$literal`.
+  Check stored pipelines and filters before upgrading: one that relied on the
+  text now reads the value; write the array as `{"$literal": [...]}` to keep
+  the text. See aggregation.md, "Arrays and `$literal`", and ADR-215.
+
 - **Breaking: `modified` counts the documents an update changed, and a
   document it leaves as it was is not written.** An `update` (single or
   `multi`), a `find_and_modify` or a `PUT .../docs/{id}` whose new document is

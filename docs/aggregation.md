@@ -272,8 +272,53 @@ not define — `{"input": "$items", "condition": …}` inside `$filter` is a
   not carry any other key.
 - **Any other document is computed** — its values are expressions. This is what
   makes a compound `$group` key work.
+- **An array is computed** — its elements are expressions. See
+  [Arrays and `$literal`](#arrays-and-literal).
 - `{$literal: x}` yields `x` untouched, which is how you produce the *string*
-  `"$total"` or a document with a `$`-prefixed key.
+  `"$total"`, a document with a `$`-prefixed key, or an array that holds either.
+
+### Arrays and `$literal`
+
+An array written inside an expression is an **array of expressions**: each
+element is read as an expression, in the same scope, and the result is the
+array of their values
+([ADR-215](decisions.md#adr-215--an-array-written-inside-an-expression-is-an-array-of-expressions)).
+
+```javascript
+{ "$project": {
+    "pair":  ["$a", "$b"],                              // [1, 2]
+    "u":     { "$setUnion": ["$tags", ["$extra"]] },    // ["x", "y"]
+    "dims":  [{ "w": "$w", "h": "$h" }, { "$multiply": ["$w", "$h"] }],
+    "text":  { "$literal": ["$a", "$b"] } } }           // ["$a", "$b"]
+```
+
+over `{a: 1, b: 2, tags: ["x"], extra: "y", …}`. The rules:
+
+- **An operator's argument list is not an array value.** `{"$size": ["$tags"]}`
+  is `$size` of the field; `{"$size": [["$a", "$b"]]}` is `$size` of a
+  two-element array, `2`. An array nested as one argument, or written where a
+  single expression goes — a `$project` or `$addFields` value, a `$group` key or
+  accumulator, `$map`'s `in` — is read as above.
+- **Variables reach inside.** `{"$map": {"input": "$xs", "as": "x", "in":
+  ["$$x", {"$multiply": ["$$x", 10]}]}}` pairs each element with ten times it,
+  and a `$lookup` `let` name, `$$this` and `$$value` read the same way. Arrays
+  nest, and a document inside one is computed too.
+- **A missing field is `null` in its place.** `["$a", "$missing"]` is
+  `[1, null]`, so positions never shift: `{"$concatArrays": [["$missing"],
+  [1]]}` is `[null, 1]`, and `{"$size": [["$missing"]]}` is `1`. An array
+  holding a null is an array, so an operator that answers null for a null
+  argument does not here.
+- **An element that cannot be evaluated fails the array**, with its own error,
+  the first in written order. It is a value error like any other, so an
+  `$and` or `$or` with a deciding argument still answers.
+- **`{"$literal": [...]}` keeps an array as written** — the only way to get the
+  string `"$a"` or an operator-shaped document inside an array. An array whose
+  elements are all constants (`["new", "paid"]`, `[1, [2, 3]]`, `[{"a": 1}]`)
+  needs no `$literal`: it reads as itself.
+- **A document in an array is read like any other.** One whose first key starts
+  with `$` is an operator, so `[{"$gt": 1}]` is refused (`$gt` takes two
+  arguments) and `[{"a": 1, "$b": 2}]` is refused as mixing an operator with a
+  field; both were kept as written before. Write them under `$literal`.
 
 ### Behaviours worth knowing
 
@@ -820,7 +865,7 @@ documents holding large arrays can exceed the cap long before the stage ends.
 | System variables other than `$$ROOT` and `$$CURRENT` — `$$NOW`, `$$REMOVE`, `$$DESCEND`, `$$PRUNE`, `$$KEEP` | Not built. Refused with a message saying so, rather than as an unknown name |
 | `$lookup` with both `localField`/`foreignField` and `pipeline` | Refused. Join on the key, then `$filter`/`$map` the attached array in the next stage |
 | `$convert` to `decimal` (or code `19`) | `Decimal128` has no exact key encoding ([ADR-005](decisions.md)); refused at parse, naming `double` and `long` as the alternatives |
-| A `Decimal128` literal — bare, under `$literal`, or inside a document or array literal | The same reason from the other side: the canonical order ranks a Decimal128 equal to every other number, so a comparison against one would hold for every number and a value computed from one could be neither indexed nor grouped. Refused at parse — `a Decimal128 literal is not supported in an expression` — wherever an expression is parsed, `$expr` included. A `$sort` stage refuses a document holding one at a sort path the way `find`'s sort does ([Query language](query-language.md#sort-and-projection)); a *stored* Decimal128 read through a field path is not refused, and `$type` finds it, except by the set operators, which refuse one in their input rather than compare it ([ADR-207](decisions.md), [Sets](#sets)); where truth is read, a `Decimal128` zero is false like any zero ([What reads as false](#behaviours-worth-knowing)) |
+| A `Decimal128` literal — bare, under `$literal`, or inside a document or array written in an expression | The same reason from the other side: the canonical order ranks a Decimal128 equal to every other number, so a comparison against one would hold for every number and a value computed from one could be neither indexed nor grouped. Refused at parse — `a Decimal128 literal is not supported in an expression` — wherever an expression is parsed, `$expr` included. A `$sort` stage refuses a document holding one at a sort path the way `find`'s sort does ([Query language](query-language.md#sort-and-projection)); a *stored* Decimal128 read through a field path is not refused, and `$type` finds it, except by the set operators, which refuse one in their input rather than compare it ([ADR-207](decisions.md), [Sets](#sets)); where truth is read, a `Decimal128` zero is false like any zero ([What reads as false](#behaviours-worth-knowing)) |
 | `$toDecimal` | Never built as an operator at all, so it is refused at parse as an **unknown operator** — `unsupported operator "$toDecimal": not an expression operator` — rather than with the pointer `$convert` gives. The reason is the row above; the message does not say so |
 | `$facet`, `$bucket`, `$graphLookup`, `$merge`, `$out` | Not built. An unknown stage is refused with a message listing what is supported |
 | `$vectorSearch` as a stage | Vector search is its own endpoint — see [Vectors](vectors.md) |

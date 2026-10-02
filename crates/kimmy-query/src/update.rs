@@ -2084,6 +2084,35 @@ mod tests {
         );
     }
 
+    /// An array inside the expression is read (ADR-215), so an `$expr` that
+    /// names the element only inside one still names its identifier, and a
+    /// field of the document inside one is still refused.
+    #[test]
+    fn an_expr_naming_the_element_only_inside_an_array_finds_the_identifier() {
+        let either = doc! { "$expr": { "$in": ["gasket", ["$$line.sku", "$$line.alt"]] } };
+        assert_eq!(
+            applied_with(
+                doc! { "$set": { "lines.$[line].hit": true } },
+                vec![either],
+                doc! { "lines": [
+                    { "sku": "bolt", "alt": "gasket" },
+                    { "sku": "nut", "alt": "washer" },
+                    { "sku": "gasket" },
+                ] },
+            ),
+            doc! { "lines": [
+                { "sku": "bolt", "alt": "gasket", "hit": true },
+                { "sku": "nut", "alt": "washer" },
+                { "sku": "gasket", "hit": true },
+            ] }
+        );
+        let update = doc! { "$set": { "lines.$[line].hit": true } };
+        let entry = doc! { "$expr": { "$in": ["$$line.sku", ["$wanted"]] } };
+        let err =
+            parse_with_filters(&update, std::slice::from_ref(&entry)).unwrap_err().to_string();
+        assert!(err.contains("which it cannot read"), "{err}");
+    }
+
     /// One identifier per entry, as for field conditions: an `$expr` naming a
     /// second one, or a different one from the fields', is refused with both
     /// names, wherever each is written.
