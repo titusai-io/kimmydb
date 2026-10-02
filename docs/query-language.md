@@ -147,6 +147,15 @@ write the array as `{"$literal": ["$primary"]}`
 ([Aggregation](aggregation.md#arrays-and-literal)). An `arrayFilters` entry's
 `$expr` reads arrays the same way, `$$<identifier>` inside one included.
 
+**`$expr` inside `$elemMatch` reads the element.** In a document-form
+`$elemMatch`, the element is an ordinary document and the body is an ordinary
+filter over it, so `{"lines": {"$elemMatch": {"$expr": {"$gt": ["$qty",
+"$min"]}}}}` finds the orders where some line's own `qty` is above its own
+`min`, and `"$$ROOT"` and `"$$CURRENT"` there name the element. **This is a
+KimmyDB extension and stays supported**; a top-level `$expr` with `$map` and
+`$anyElementTrue` says the same thing. An evaluation error inside it fails the
+request like any other `$expr` ([Deviations](deviations.md), [ADR-217](decisions.md#adr-217--the-refusals-and-differences-ruled-to-stay-are-recorded-as-a-set)).
+
 **Never indexed.** An expression names no field the planner can put bounds on,
 so a filter that is only `$expr` is a collection scan. An equality or range
 beside it — `{account: "acme", $expr: …}` — still uses the index on `account`,
@@ -493,7 +502,12 @@ bounded, ordered list. They apply in a fixed order — **`$position`, then
 
 A modifier without `$each` is an error, as is a clause `$push` does not know —
 a document argument with any `$`-prefixed key is read as modifiers, never
-pushed as a value. `{"$each": []}` with `$sort` or `$slice` reshapes the array
+pushed as a value, so `{"sku": "b", "$each": [1]}` is a **`400`**
+(`$push: unrecognized clause "sku"`) and nothing is written. **That is kept on
+purpose**: a `$`-prefixed key is never a value anyone meant to store, and the
+refusal turns a misfiling into an error ([Deviations](deviations.md), [ADR-217](decisions.md#adr-217--the-refusals-and-differences-ruled-to-stay-are-recorded-as-a-set)). A document with no
+`$`-prefixed key is a value, pushed as written. `{"$each": []}` with `$sort`
+or `$slice` reshapes the array
 without adding to it. `$addToSet` takes `$each` and no other modifier: a set
 has no order to sort or position in.
 
@@ -640,14 +654,18 @@ The rules, which are MongoDB's:
   `null` in its position rather than closing the gap, so the other elements
   keep their indices — the same rule as `$unset` of `items.1`.
 
-**`$` — MongoDB's "the element the query matched" — is not implemented.** It
-depends on the filter reporting *which* element satisfied it, which the
-matcher does not track, and `$[<identifier>]` says the same thing without
+**`$` — MongoDB's "the element the query matched" — is not implemented, and
+that is deliberate.** An update path with a `$` segment is a **`400`**
+(`the $ positional operator is not supported (in path "items.$.shipped"); use
+$[<identifier>] with arrayFilters, or $[] for every element`) and nothing is
+written. It depends on the filter reporting *which* element satisfied it,
+which the matcher does not track, and `$[<identifier>]` says the same thing without
 depending on the query: `{"items.sku": "gasket"}` with `items.$.shipped` is
 `items.$[line].shipped` with `[{"line.sku": "gasket"}]` — and the second form
 reaches every gasket line rather than only the first. An update that uses `$`
 is refused with a message that says so. Recorded in
-[Deviations](deviations.md); the reasoning is ADR-104.
+[Deviations](deviations.md); the reasoning is ADR-104, and the ruling to keep
+it is [ADR-217](decisions.md#adr-217--the-refusals-and-differences-ruled-to-stay-are-recorded-as-a-set).
 
 ### Integers stay integral
 

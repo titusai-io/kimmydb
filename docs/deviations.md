@@ -283,7 +283,12 @@ on a write would be just as silent about the bug.
 **Raised 2026-08-30, with `$convert` and the `$toX` shorthands.** The
 conversion pairs follow MongoDB's table, and every pipeline MongoDB accepts
 means the same thing here. Four places are more lenient or differently
-spelled, and one target is missing:
+spelled, and one target is missing.
+
+**Ruled 2026-09-29, kept ([ADR-217](decisions.md#adr-217--the-refusals-and-differences-ruled-to-stay-are-recorded-as-a-set)).** The four differences stay,
+recorded exactly below and in [aggregation.md](aggregation.md#type-conversion);
+`decimal` stays refused; and `$toDecimal` is refused with the explanation
+`$convert` gives (changed in the same release, still a `400`).
 
 - **`int` → `date` is accepted.** MongoDB refuses it — its table admits
   `long`, `double` and `decimal` to `date` but not `int`, for no reason the
@@ -292,26 +297,41 @@ spelled, and one target is missing:
   not the other would be a rule nobody could predict.
 - **`to` is a constant.** MongoDB lets it be an expression, evaluated per
   document. Nothing here needs a per-row target type, and a constant is what
-  lets the unsupported `decimal` be refused before a document is read.
-- **A string to a date accepts RFC 3339 and three looser spellings** — a bare
-  date, a space between date and time, a missing zone read as UTC. MongoDB's
-  parser accepts those and more (month names, `%Y%m%d`, a `timezone` argument
-  applied to a zoneless string). A string neither accepts is an error in both.
-- **A double to a string is Rust's shortest round-trip rendering.** It agrees
-  with MongoDB on every ordinary value — `2` for `2.0`, `1.5`, `NaN`,
-  `Infinity` — and disagrees on magnitudes MongoDB prints in exponent form:
-  `1e21` is `"1000000000000000000000"` here and `"1e+21"` there. The engine's
-  own JSON edge prints doubles the same way, so a converted string and a
-  returned double read alike.
+  lets the unsupported `decimal` be refused before a document is read. A type
+  name or a numeric code is accepted; a field path, or any other expression,
+  is a `400` at parse (`$convert cannot target "$want"; supported: double,
+  string, objectId, bool, date, int, long`), so a pipeline that picks its
+  target from the document must be split into one `$convert` per target.
+- **A string to a date accepts RFC 3339 and three looser spellings.** The
+  accepted forms are exactly these: RFC 3339 with a `Z` or a `±hh:mm` offset
+  (`2026-08-12T13:45:07Z`, `2026-08-12T13:45:07.25-05:00`); a date alone
+  (`2026-08-12`, midnight UTC); a space for the `T`
+  (`2026-08-12 13:45:07`); and a time with no zone
+  (`2026-08-12T13:45:07`, read as UTC). Surrounding white space is ignored.
+  Everything else is a `400` that says to use RFC 3339: an offset without the
+  colon (`+0500`), a time without seconds (`13:45`), unpadded fields
+  (`2026-8-12`), month names (`07 Sep 2026 10:00:00 GMT`) and `20260812`.
+  MongoDB's parser accepts those and more, and a `timezone` argument applied
+  to a zoneless string. A string neither accepts is an error in both.
+- **A double to a string is Rust's shortest round-trip digits, in plain
+  decimal, never in exponent form.** It agrees with MongoDB on every ordinary
+  value — `2` for `2.0`, `1.5`, `NaN`, `Infinity` — and disagrees on
+  magnitudes MongoDB prints in exponent form: `1e21` is
+  `"1000000000000000000000"` here and `"1e+21"` there, and `1e-7` is
+  `"0.0000001"`. The engine's own JSON edge prints doubles the same way, so a
+  converted string and a returned double read alike. A string built from a
+  large or small double therefore compares unequal to the same string built
+  there.
 - **`decimal` is refused.** `Decimal128` has no exact key encoding
   ([ADR-005](decisions.md)); a value converted to it could be neither indexed
   nor grouped. `$convert` to `decimal` or `19` is a `400` naming `double` and
-  `long` as the alternatives. **`$toDecimal` is a `400` too, but not that
-  one**: the shorthand was never built as an operator, so it is refused as an
-  unknown expression operator and the message points at nothing. Both
-  refusals are right and only one of them explains itself; giving `$toDecimal`
-  its own arm of the refusal is the small change that would close it. A
-  `Decimal128` *input* is likewise unconvertible.
+  `long` as the alternatives. **`$toDecimal` is a `400` with the same
+  explanation**: `unsupported operator "$toDecimal": Decimal128 has no exact
+  key encoding in this engine, so the result could be neither indexed nor
+  grouped; convert to double or long instead`. It was never built as an
+  operator and used to be refused as an unknown one, with a message that
+  pointed at nothing; it is still refused for any argument. A `Decimal128`
+  *input* is likewise unconvertible.
 
 **`$mod` and `$pullAll` have no entry.** Both follow MongoDB — `$mod`
 truncates doubles toward zero, refuses a zero divisor, and refuses a `NaN` or
@@ -324,7 +344,10 @@ planned — is the one MongoDB's own optimizer follows.
 **Closing the first would mean refusing something harmless**, so it is
 recorded rather than scheduled. The third and fourth close by widening the
 date parser and adding an exponent threshold to the double renderer, if a
-ported pipeline ever needs either.
+ported pipeline ever needs either; the second by evaluating `to` per document,
+which a `decimal` target would then have to be refused at run time. None is
+planned: the four are kept on purpose, and `decimal` goes when the canonical
+order can place one ([ADR-005](decisions.md)).
 
 ---
 
@@ -335,6 +358,12 @@ elements in an update path: `$[<identifier>]` (the elements an `arrayFilters`
 entry selects), `$[]` (every element) and `$` (the first element the *query*
 matched). The first two are implemented; `$` is refused at parse time with a
 message that points at the first.
+
+**Ruled 2026-09-29, kept ([ADR-217](decisions.md#adr-217--the-refusals-and-differences-ruled-to-stay-are-recorded-as-a-set)).** The refusal is deliberate and
+stays: the `400` reads *the `$` positional operator is not supported (in path
+"items.$.shipped"); use `$[<identifier>]` with arrayFilters, or `$[]` for every
+element*, and nothing is written. A caller porting such an update rewrites it
+as the second form.
 
 **Why not `$`.** Its meaning depends on which element satisfied the filter,
 and the matcher answers a `bool`: `filter::matches` tests a path's values with
@@ -358,9 +387,10 @@ document. A positional update that selects no element leaves the document
 unchanged, so it is not written and does not count in `modified`
 ([ADR-208](decisions.md)).
 
-**Closing it** means a second evaluation mode for `Filter::Field` that
+**Closing it** would mean a second evaluation mode for `Filter::Field` that
 returns the matching element's index, plumbed from `ModifySpec::matches` into
-`update::apply`. Not scheduled: nothing `$` can express is out of reach.
+`update::apply`. Not planned, by the ruling above: nothing `$` can express is
+out of reach.
 
 ---
 
@@ -414,7 +444,13 @@ conformance test drives it.
 **Raised 2026-08-30, with the expression scope (ADR-105).** The array operators
 follow the expression layer's standing rule — *null propagates, a type violation
 refuses* — and in six places that is a strict superset of MongoDB, which
-errors instead:
+errors instead.
+
+**Ruled 2026-09-29, all five points in this entry kept ([ADR-217](decisions.md#adr-217--the-refusals-and-differences-ruled-to-stay-are-recorded-as-a-set)).**
+The null leniency, the missing-versus-null difference, `$range`'s `Int64`,
+the closed key sets and the refused combined `$lookup` each stay, and each is
+stated plainly in [aggregation.md](aggregation.md#arrays) and below. Nothing
+here is scheduled to change.
 
 | Operator | Here | MongoDB |
 |---|---|---|
@@ -430,7 +466,9 @@ there may succeed here with a null in the row. Chosen because a sparse
 collection is the norm in this database and `{$size: "$tags"}` on a document
 without `tags` failing the whole request is the wrong trade; recorded because
 someone porting a pipeline that *relies* on the error to catch bad data will
-not get it.
+not get it. A pipeline that wants the error tests for the bad value instead,
+for example `{"$match": {"$expr": {"$eq": [{"$isArray": "$tags"}, false]}}}`
+finds the documents whose `tags` is not an array, a missing one included.
 
 **Three smaller divergences, same entry.** `$arrayElemAt` out of range and
 `$first`/`$last` on an empty array are **null** rather than MongoDB's *missing*
@@ -440,8 +478,10 @@ MongoDB produces `Int32`, as every integer result of the expression layer does
 (see the module notes on numbers). And `$filter`, `$map`, `$reduce` and `$let`
 **refuse a key they do not know** (`condition` for `cond`), where MongoDB
 ignores it; that is stricter, and only turns a silently wrong pipeline into an
-error. `$unwind`'s document form, `$lookup`'s both forms, `$replaceRoot`,
-`$switch` (and each of its branches), and `$dateToString` refuse an unknown
+error (`{"$filter": {"input": "$items", "condition": …}}` is a `400` naming
+`condition`, where there it would return the whole array). `$unwind`'s
+document form, `$lookup`'s both forms, `$replaceRoot`, `$switch` (and each of
+its branches), and `$dateToString` refuse an unknown
 key the same way (ADR-129) — the same closure, not a new one. Whether MongoDB
 itself ignores or refuses an unknown key on each of *those* five is not
 verified here, so no claim is made about it either way; the "where MongoDB
@@ -454,6 +494,27 @@ the key with the equality form, then `$filter` or `$map` the attached array in
 the following stage, which keeps the single pass. Closing this would mean
 combining the indexed pass with the per-document loop; not planned until
 someone needs it.
+
+**`$range` and the other integer results.** A result of the expression
+language that is an integer is an `Int64`, `$range`'s elements included, so
+`{$type: {$arrayElemAt: [{$range: [0, 3]}, 0]}}` is `"long"` here and `"int"`
+there. The numbers are the same; what differs is `$type`, a `$switch` on it,
+and a typed client that reads the element into a 32-bit field. Kept, with the
+rule it follows.
+
+**Missing is null in an expression.** `{$addFields: {head: {$first:
+"$lines"}}}` over a document whose `lines` is `[]` writes `head: null`, where
+MongoDB leaves `head` out. A following `{$match: {head: {$exists: true}}}`
+keeps that document here and drops it there, and a `$project` that includes
+`head` emits a key MongoDB does not. A field path that resolves to nothing is
+the same. Kept: a missing field is null everywhere in the expression language,
+and this is the one rule it states without an exception.
+
+**`$lookup`'s combined form.** The refusal stays. The equivalent is the
+equality join followed by `{$addFields: {unpaid: {$filter: {input: "$unpaid",
+as: "i", cond: …}}}}`, which attaches every joined document before it drops
+any, so the 100,000-document ceiling counts what the join attached. Revisit
+only if a caller meets that ceiling.
 
 **Closing the null leniency** would mean a per-operator strictness flag in the
 evaluator for the sake of matching an error, at the cost of the one rule the
@@ -561,6 +622,13 @@ Two places where the filter's `$expr` is accepted and MongoDB's is not, both
 by design and both small. An evaluation error in either fails the request like
 any other (ADR-206).
 
+**Ruled 2026-09-29, both kept ([ADR-217](decisions.md#adr-217--the-refusals-and-differences-ruled-to-stay-are-recorded-as-a-set)).** Neither is withdrawn; both
+are documented extensions, the `$elemMatch` one in
+[query-language.md](query-language.md#expr--comparing-fields-of-the-same-document)
+and the `arrayFilters` one under
+[positional updates](query-language.md#positional-updates). A filter that uses
+either does not port.
+
 **`$expr` is accepted inside a document-form `$elemMatch`.** MongoDB refuses
 `{lines: {$elemMatch: {$expr: …}}}` outright. Here the element is a document
 and `$elemMatch`'s body is an ordinary filter over it, so the expression reads
@@ -614,22 +682,31 @@ a 400 naming the variable and the idiom that works: bind it in an
 `$expr` is exempt; the expression parser owns variables there and refuses an
 unbound one by its own rule.
 
+**Ruled 2026-09-29, the refusal kept ([ADR-217](decisions.md#adr-217--the-refusals-and-differences-ruled-to-stay-are-recorded-as-a-set)).** It stays a `400`, and
+the way to match a stored string that begins with `$$` from inside a
+sub-pipeline is the one the expression language already has, checked rather
+than assumed: `{$match: {$expr: {$eq: ["$code", {$literal: "$$promo"}]}}}`.
+The `$expr` subtree is exempt from the refusal and the expression parser reads
+a string a `$literal` holds as a string, never as a reference; a test pins both
+halves. The comparison is `$expr`'s `$eq`: the [canonical order, not the filter's
+array-element matching](query-language.md#expr--comparing-fields-of-the-same-document).
+
 **What that costs.** MongoDB does not substitute variables in a sub-pipeline
 `$match` either — `{_id: "$$oid"}` matches nothing there too — but it accepts
-the string as a literal, so a stored value that begins with `$$` *can* be
-matched from inside a sub-pipeline. Here it cannot: **there is no literal
-escape inside a sub-pipeline `$match`.** A top-level `$match` and a `find`
-filter keep the literal reading, so such a document is still reachable; it is
-only from within a `$lookup` pipeline that it is not.
+the string as a literal, so a stored value that begins with `$$` can be
+matched there with a plain value. Here the plain value is refused and the
+`$expr` and `$literal` form is the spelling. A top-level `$match` and a `find`
+filter keep the literal reading, so such a document is reachable by a plain
+value there.
 
 **Why the stricter side.** The two readings of `"$$oid"` inside a
 sub-pipeline are a `let` name the author expected substituted and a literal
 that happens to look like one, and the first is overwhelmingly the one
 written. Under the lenient reading the first produces an empty join with no
 error — a result indistinguishable from a correct one, which is the worse
-failure. Closing this would mean an escape syntax for a literal `$$` string
-in a sub-pipeline filter, which the filter language has nowhere else; not
-planned until someone stores such a value and needs to join on it.
+failure. Closing it would mean a second escape for a literal `$$` string in a
+sub-pipeline filter, one the filter language has nowhere else; not planned,
+since the `$expr` form says it.
 
 ---
 
@@ -671,7 +748,9 @@ compared by its value (`a.01` is `a.1`).
 
 **Raised 2026-08-30, with the `$push` modifiers**, and recorded with the
 conflicting-paths entry above until that closed. Neither is a debt; they are
-recorded so they are visible.
+recorded so they are visible. **Ruled 2026-09-29, kept ([ADR-217](decisions.md#adr-217--the-refusals-and-differences-ruled-to-stay-are-recorded-as-a-set)):** the
+second is a loud refusal that stays, and this entry is its own record now that
+the conflicting-paths entry has closed.
 
 - **`$push`'s `$sort` on elements that are not documents.** With a
   `{field: direction}` sort, an element that is not a document sorts as though
@@ -683,7 +762,12 @@ recorded so they are visible.
   `{"$each": [1], "x": 2}` and `{"x": 2, "$each": [1]}` are both refused as an
   unrecognized clause, where MongoDB would push the second literally. Nothing
   that starts with `$` is a value anyone meant to store, so the stricter
-  reading only ever turns a silent misfiling into an error.
+  reading only ever turns a silent misfiling into an error. The refusal is a
+  `400` naming the key: `{"$push": {"items": {"sku": "b", "$each": [1]}}}`
+  fails with `$push: unrecognized clause "sku"`, and nothing is written, where
+  MongoDB appends the document literally with its `$each` key. A document with
+  no `$`-prefixed key is a value, as before. `$addToSet` reads its argument the
+  same way. A document with a `$`-prefixed key cannot be pushed as a value.
 
 ---
 

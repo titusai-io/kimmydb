@@ -57,12 +57,13 @@ fn a_partial_filters_refusals_name_the_operator_and_say_why_after_it() {
 
 #[test]
 fn an_expressions_refusals_name_the_operator() {
-    let unknown = Expr::parse(&Bson::Document(doc! { "$toDecimal": "$a" })).unwrap_err();
-    assert_eq!(slot(&unknown), "$toDecimal");
-    assert_eq!(
-        unknown.to_string(),
-        "unsupported operator \"$toDecimal\": not an expression operator"
-    );
+    let unknown = Expr::parse(&Bson::Document(doc! { "$zip": "$a" })).unwrap_err();
+    assert_eq!(slot(&unknown), "$zip");
+    assert_eq!(unknown.to_string(), "unsupported operator \"$zip\": not an expression operator");
+    // `$toDecimal` is refused for a reason of its own, and the slot still
+    // holds the operator.
+    let decimal = Expr::parse(&Bson::Document(doc! { "$toDecimal": "$a" })).unwrap_err();
+    assert_eq!(slot(&decimal), "$toDecimal");
     let variable = Expr::parse(&Bson::String("$$NOW".into())).unwrap_err();
     assert_eq!(slot(&variable), "$$NOW");
 }
