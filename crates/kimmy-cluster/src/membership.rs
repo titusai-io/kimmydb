@@ -35,9 +35,12 @@ use std::time::{Duration, Instant};
 use foca::{Config, Foca, Identity, Notification, PostcardCodec, Timer};
 use kimmy_core::{CollectionId, NodeId};
 
-use crate::facts::{Facts, FactsSource, LocalFacts, OwnerClass, PeerFacts, PeerState, may_own};
+use crate::facts::{
+    Facts, FactsSource, LocalFacts, OwnerClass, PeerFacts, PeerState, last_decoded_seq, may_own,
+    next_decoded_seq,
+};
 use crate::protocol;
-use parking_lot::RwLock;
+use parking_lot::{Mutex, RwLock};
 use serde::{Deserialize, Serialize};
 use tokio::net::UdpSocket;
 use tokio::sync::mpsc;
@@ -146,6 +149,12 @@ impl Identity for Member {
 #[derive(Clone, Default)]
 pub struct Members(Arc<MembersInner>);
 
+impl std::fmt::Debug for Members {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Members").field("peers", &self.0.live.read().len()).finish()
+    }
+}
+
 #[derive(Default)]
 struct MembersInner {
     live: RwLock<BTreeMap<SocketAddr, NodeId>>,
@@ -156,13 +165,72 @@ struct MembersInner {
     next: std::sync::atomic::AtomicU64,
     /// This member's own block, once the daemon has given a source for it.
     local: std::sync::OnceLock<LocalFacts>,
-    /// The last block each peer sent (ADR-201).
-    peer_facts: RwLock<BTreeMap<NodeId, PeerFacts>>,
+    /// The last block each peer sent (ADR-201), and the floors that keep an
+    /// earlier-decoded block from coming back after a drop (ADR-213).
+    ///
+    /// **Every writer of this table or of the live set builds and stores the new
+    /// [`PeerView`] while holding this lock**, so the order views are published in
+    /// is the order the state changed in, and an older view is never stored last.
+    peer_facts: RwLock<PeerTable>,
+    /// The immutable view the evaluator reads: a load, never a lock.
+    view: arc_swap::ArcSwap<PeerView>,
+    view_version: std::sync::atomic::AtomicU64,
+    /// When the live set last changed: a yield becomes effective only after it has
+    /// held still for a lease (ADR-213, C9).
+    live_changed: Mutex<Option<Instant>>,
+    /// When each live peer came up, for the unheard-peer warning.
+    up_since: Mutex<BTreeMap<NodeId, Instant>>,
     /// The sync interval and the fanout the lease is derived from.
     lease_shape: RwLock<(Duration, usize)>,
     /// When each peer's undecodable block was last said, so it is said once per
     /// [`crate::health::WARN_INTERVAL`] and peer.
-    undecodable_said: parking_lot::Mutex<BTreeMap<NodeId, Instant>>,
+    undecodable_said: Mutex<BTreeMap<NodeId, Instant>>,
+    unheard_said: Mutex<BTreeMap<NodeId, Instant>>,
+}
+
+/// The blocks held, and where a block must have been decoded after to count.
+#[derive(Default)]
+struct PeerTable {
+    held: BTreeMap<NodeId, PeerFacts>,
+    /// The decode sequence at which a peer's slot was dropped (SWIM down, a
+    /// rename), and when: a record decoded before it is ignored. Pruned once the
+    /// slot holds a block decoded after it, and for a peer that is gone and has
+    /// been quiet for many leases, as `held` is.
+    dropped: BTreeMap<NodeId, (u64, Instant)>,
+    /// The decode sequence at this member's own `Defunct` or `Rejoin`.
+    floor: u64,
+}
+
+/// One held block, as the evaluator sees it.
+#[derive(Clone, Debug)]
+pub struct ViewBlock {
+    pub facts: Arc<Facts>,
+    /// The sender's generation of the block, `None` from a 0.43 sender.
+    pub generation: Option<u64>,
+    pub received: Instant,
+}
+
+/// The live set and every held block, immutable: what the yield evaluator reads
+/// without taking a lock any runtime task takes (ADR-213). `version` moves with
+/// every change.
+#[derive(Clone, Debug, Default)]
+pub struct PeerView {
+    pub version: u64,
+    /// The lease a block is fresh for, derived from the live count.
+    pub lease: Duration,
+    pub live: BTreeSet<NodeId>,
+    pub blocks: BTreeMap<NodeId, ViewBlock>,
+}
+
+impl PeerView {
+    /// The block held from `node`, if it is live, and whether it is within its lease.
+    pub fn live_block(&self, node: &NodeId, now: Instant) -> Option<(&ViewBlock, bool)> {
+        if !self.live.contains(node) {
+            return None;
+        }
+        let held = self.blocks.get(node)?;
+        Some((held, now.saturating_duration_since(held.received) <= self.lease))
+    }
 }
 
 impl Members {
@@ -201,23 +269,63 @@ impl Members {
         self.0.live.read().is_empty()
     }
 
+    /// The live set and every held block as of the last change: **one atomic
+    /// load, no lock** (ADR-213). The yield evaluator's only read of `Members`.
+    pub fn view(&self) -> Arc<PeerView> {
+        self.0.view.load_full()
+    }
+
+    /// Build and store the view. Called with `table` held for write, so the
+    /// order views are stored in is the order the state changed in.
+    fn publish(&self, table: &PeerTable) {
+        let blocks = table
+            .held
+            .iter()
+            .map(|(node, held)| {
+                (
+                    *node,
+                    ViewBlock {
+                        facts: Arc::clone(&held.facts),
+                        generation: held.generation,
+                        received: held.received,
+                    },
+                )
+            })
+            .collect();
+        let version = self.0.view_version.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+        let view = PeerView { version, lease: self.lease(), live: self.node_ids(), blocks };
+        self.0.view.store(Arc::new(view));
+    }
+
+    fn live_changed_now(&self) {
+        *self.0.live_changed.lock() = Some(Instant::now());
+    }
+
     fn insert(&self, addr: SocketAddr, node: NodeId) {
+        let table = self.0.peer_facts.write();
         let generation = self.0.next.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
         self.0.generations.write().insert(addr, generation);
         self.0.live.write().insert(addr, node);
+        self.live_changed_now();
+        self.0.up_since.lock().entry(node).or_insert_with(Instant::now);
+        self.publish(&table);
         // Nothing is dropped here: a block that arrived before SWIM's insert
         // (the contact can win the race) is the peer's, and a peer SWIM declared
         // down had its block dropped then, in `remove`.
     }
 
     fn remove(&self, addr: &SocketAddr) {
+        let mut table = self.0.peer_facts.write();
         let gone = self.0.live.write().remove(addr);
+        self.live_changed_now();
         // Declared down: what it last said, and what it last read of ours,
         // belong to an incarnation that may be gone. A block it sends after it
         // is back is a new one, and a stale bit stays only until then (ADR-201).
         if let Some(node) = gone {
-            self.forget_peer(node);
+            self.0.up_since.lock().remove(&node);
+            self.drop_peer(&mut table, node);
         }
+        self.publish(&table);
     }
 
     /// A block from `peer` did not decode and was treated as none. Says so, once
@@ -240,13 +348,78 @@ impl Members {
         due
     }
 
-    /// Drop what `node` last said and what it last read of this member's block:
-    /// it is a new incarnation, or SWIM declared it down (ADR-201).
-    fn forget_peer(&self, node: NodeId) {
-        self.0.peer_facts.write().remove(&node);
+    /// The live peers that have sent no block for more than a lease, since they
+    /// came up. Such a peer is not a candidate for webhooks or embeddings here, so
+    /// this member also owns that share (ADR-213).
+    pub fn unheard_beyond_lease(&self, now: Instant) -> Vec<NodeId> {
+        let lease = self.lease();
+        let table = self.0.peer_facts.read();
+        let up = self.0.up_since.lock();
+        self.node_ids()
+            .into_iter()
+            .filter(|node| {
+                !table.held.contains_key(node)
+                    && up
+                        .get(node)
+                        .is_some_and(|since| now.saturating_duration_since(*since) > lease)
+            })
+            .collect()
+    }
+
+    /// Say, once per interval per peer, that `peer` has been unheard for more than
+    /// a lease. Answers whether it said it now.
+    pub(crate) fn note_unheard(&self, peer: NodeId, now: Instant) -> bool {
+        let live = self.node_ids();
+        let mut said = self.0.unheard_said.lock();
+        // Kept for live peers and for those named within the interval, the same
+        // shape as the echoed map: a peer that left does not stay in it for ever.
+        said.retain(|node, at| {
+            live.contains(node) || now.saturating_duration_since(*at) < crate::health::WARN_INTERVAL
+        });
+        let due = said
+            .get(&peer)
+            .is_none_or(|at| now.saturating_duration_since(*at) >= crate::health::WARN_INTERVAL);
+        if due {
+            said.insert(peer, now);
+            warn!(
+                %peer,
+                "a live peer has sent no facts block for more than a lease: it is not a candidate \
+                 for webhooks or embeddings here, so this member also owns that peer's share until \
+                 it is heard"
+            );
+        }
+        due
+    }
+
+    /// Drop what `node` last said, and what it last echoed of ours: it is a new
+    /// incarnation, or SWIM declared it down (ADR-201). The slot remembers when it
+    /// was dropped, so a block decoded before cannot come back (ADR-213).
+    fn drop_peer(&self, table: &mut PeerTable, node: NodeId) {
+        table.held.remove(&node);
+        table.dropped.insert(node, (last_decoded_seq(), Instant::now()));
         if let Some(local) = self.0.local.get() {
             local.forget(node);
         }
+    }
+
+    fn forget_peer(&self, node: NodeId) {
+        let mut table = self.0.peer_facts.write();
+        self.drop_peer(&mut table, node);
+        self.publish(&table);
+    }
+
+    /// This member was declared down by the cluster, or rejoined (ADR-213): its
+    /// peers dropped its block, and it may have missed changes to theirs, so it
+    /// clears every echo and **drops every peer block**. It then owns everything
+    /// it is a candidate for until it hears blocks again: duplicates, never a gap.
+    pub(crate) fn clear_for_own_defunct(&self) {
+        let mut table = self.0.peer_facts.write();
+        table.held.clear();
+        table.floor = last_decoded_seq();
+        if let Some(local) = self.0.local.get() {
+            local.clear_echoes();
+        }
+        self.publish(&table);
     }
 
     /// Give this member's own block a source. Once: a second call is ignored.
@@ -256,7 +429,9 @@ impl Members {
 
     /// The sync interval and fanout the lease is derived from.
     pub fn configure_lease(&self, sync_interval: Duration, fanout: usize) {
+        let table = self.0.peer_facts.write();
         *self.0.lease_shape.write() = (sync_interval, fanout.max(1));
+        self.publish(&table);
     }
 
     /// How long a peer's block is fresh: **at least `ceil((N - 1) / fanout) + 2`
@@ -278,25 +453,114 @@ impl Members {
     /// This member's block to send, with its generation, or `None` with no
     /// source. Cached (`facts::LocalFacts`).
     pub fn local_facts(&self) -> Option<(std::sync::Arc<Facts>, u64)> {
-        self.0.local.get()?.current(Instant::now())
+        self.local_facts_at(Instant::now())
     }
 
-    /// `peer` was sent this member's block `generation`.
-    pub(crate) fn note_read_by(&self, peer: NodeId, generation: u64) {
+    pub(crate) fn local_facts_at(&self, now: Instant) -> Option<(std::sync::Arc<Facts>, u64)> {
+        self.0.local.get()?.current(now)
+    }
+
+    /// This member's own block with `yielding` masked to the **effective** bits
+    /// (ADR-213): what ownership consults for `me`. A class counts as yielded
+    /// only once every live peer has echoed the generation that set it and the
+    /// live set has held still for a lease; until then this member keeps owning
+    /// it. The advertised block, which peers read, is [`Self::local_facts`].
+    pub fn local_facts_effective(&self) -> Option<Arc<Facts>> {
+        self.local_facts_effective_at(Instant::now())
+    }
+
+    pub(crate) fn local_facts_effective_at(&self, now: Instant) -> Option<Arc<Facts>> {
+        let local = self.0.local.get()?;
+        local.effective(now, || (self.node_ids(), self.live_stable_at(now)))
+    }
+
+    /// Whether the live set has held still for a lease. A member that has seen
+    /// no change since it was created counts from the first time it is asked.
+    fn live_stable_at(&self, now: Instant) -> bool {
+        let lease = self.lease();
+        let mut changed = self.0.live_changed.lock();
+        let at = *changed.get_or_insert(now);
+        now.saturating_duration_since(at) >= lease
+    }
+
+    /// What this member holds of `peer`'s block, to echo on the next frame to it
+    /// (ADR-213). **Only what is recorded**: an empty boot and generation zero when
+    /// nothing is held, which says "echoing, and confirming nothing".
+    pub(crate) fn echo_for(&self, peer: NodeId) -> crate::protocol::Echo {
+        self.0
+            .peer_facts
+            .read()
+            .held
+            .get(&peer)
+            .map(|held| crate::protocol::Echo {
+                boot: held.facts.boot.clone(),
+                generation: held.generation.unwrap_or(0),
+            })
+            .unwrap_or_default()
+    }
+
+    /// A frame from `peer` carried `echo` (or none): the confirmation of this
+    /// member's yield (ADR-213).
+    pub(crate) fn note_echo(&self, peer: NodeId, echo: Option<&crate::protocol::Echo>) {
         if let Some(local) = self.0.local.get() {
-            local.note_read(peer, generation);
+            local.note_echo(peer, echo);
         }
     }
 
-    /// A block `node` sent. A new boot id replaces everything earlier, which is
-    /// what replacing the block does; nothing of the previous process is kept.
-    pub(crate) fn record_peer_facts(&self, node: NodeId, facts: Arc<Facts>, now: Instant) {
+    /// A block `node` sent, decoded at `decoded_seq` (ADR-213).
+    ///
+    /// **Blocks are ordered by when they were decoded, and across boots by the
+    /// sender's start time.** The held block is replaced only when one of these
+    /// holds, and a block that does not replace it does not refresh `received`:
+    /// - (a) same boot: decoded later **and** a generation at least the held one
+    ///   (a 0.43 sender has none, which skips that half);
+    /// - (b) a different boot: decoded later **and** `started_ms` at least the
+    ///   held one's (either missing skips that half);
+    /// - (c) a different boot, the held block past its lease, and this one decoded
+    ///   later: the escape for a sender whose clock stepped back across a restart.
+    ///   It is **never** for the same boot: within one process the generation does
+    ///   not go backwards, however old the held block is.
+    ///
+    /// A record decoded before the slot's drop, or before this member's own
+    /// `Defunct`, is ignored. Answers whether the block was taken.
+    pub(crate) fn record_peer_facts(
+        &self,
+        node: NodeId,
+        facts: Arc<Facts>,
+        generation: Option<u64>,
+        decoded_seq: u64,
+        now: Instant,
+    ) -> bool {
         let mut table = self.0.peer_facts.write();
-        // A new boot id is a new process: what the old one read of our block
-        // says nothing of it.
-        let restarted = table.get(&node).is_some_and(|held| held.facts.boot != facts.boot);
-        table.insert(node, PeerFacts { facts, received: now });
+        let floor = table.floor.max(table.dropped.get(&node).map_or(0, |(seq, _)| *seq));
+        if decoded_seq <= floor {
+            return false;
+        }
+        let lease = self.lease();
+        let mut restarted = false;
+        if let Some(held) = table.held.get(&node) {
+            let later = decoded_seq > held.decoded_seq;
+            let same_boot = held.facts.boot == facts.boot;
+            let ordered = if same_boot {
+                later && generation.is_none_or(|g| g >= held.generation.unwrap_or(0))
+            } else {
+                later
+                    && match (facts.started_ms, held.facts.started_ms) {
+                        (Some(new), Some(old)) => new >= old,
+                        _ => true,
+                    }
+            };
+            let escape =
+                !same_boot && later && now.saturating_duration_since(held.received) > lease;
+            if !(ordered || escape) {
+                return false;
+            }
+            restarted = !same_boot;
+        }
+        table.held.insert(node, PeerFacts { facts, received: now, generation, decoded_seq });
         if let Some(local) = self.0.local.get() {
+            // A new boot id is a new process: what the old one echoed of our
+            // block says nothing of it.
             if restarted {
                 local.forget(node);
             }
@@ -304,11 +568,21 @@ impl Members {
         }
         // A peer that is not live and has been quiet for many leases is
         // forgotten, so the table follows the cluster and does not grow.
-        let lease = self.lease();
         let live: BTreeSet<NodeId> = self.node_ids();
-        table.retain(|peer, held| {
+        table.held.retain(|peer, held| {
             live.contains(peer) || now.saturating_duration_since(held.received) < lease * 10
         });
+        // A drop floor is needed only until the slot holds a later block (which
+        // already refuses anything decoded earlier), and while its peer might
+        // still be heard from.
+        let PeerTable { held, dropped, floor } = &mut *table;
+        dropped.retain(|peer, (seq, at)| {
+            *seq > *floor
+                && !held.get(peer).is_some_and(|h| h.decoded_seq > *seq)
+                && (live.contains(peer) || now.saturating_duration_since(*at) < lease * 10)
+        });
+        self.publish(&table);
+        true
     }
 
     /// How this member sees each live peer.
@@ -322,7 +596,7 @@ impl Members {
         self.node_ids()
             .into_iter()
             .map(|node| {
-                let state = match table.get(&node) {
+                let state = match table.held.get(&node) {
                     None => PeerState::Unknown,
                     Some(held) if now.saturating_duration_since(held.received) > lease => {
                         PeerState::Stale
@@ -351,10 +625,16 @@ impl Members {
     /// tried again ignoring it, since an owner that is slow beats none. Empty
     /// after that means nobody may own it (ADR-201).
     ///
-    /// A peer that has never sent a block owns as it always did, except that TTL
-    /// needs positive knowledge that it holds the index, and **a TTL listing is
-    /// positive only while its block is within its lease**. A block past its
-    /// lease keeps saying `catching_up` and what it yields.
+    /// **A peer this member holds no block from is not a candidate** for any class,
+    /// in the fallback pass too (ADR-213): never heard, or forgotten on SWIM down,
+    /// a rename, a new boot or this member's own `Defunct`. Exclusion only ever
+    /// adds owners, so it costs duplicates, never a gap. TTL needs positive
+    /// knowledge that the peer holds the index, **and a TTL listing is positive
+    /// only while its block is within its lease**. A block past its lease keeps
+    /// saying `catching_up` and what it yields.
+    ///
+    /// `mine` is this member's block with the **effective** yield bits
+    /// ([`Self::local_facts_effective`]), not the advertised ones.
     pub fn candidates(
         &self,
         class: OwnerClass,
@@ -370,7 +650,7 @@ impl Members {
             let mut set: BTreeSet<NodeId> = peers
                 .iter()
                 .filter(|peer| {
-                    let held = table.get(*peer);
+                    let held = table.held.get(*peer);
                     let fresh = held
                         .is_some_and(|held| now.saturating_duration_since(held.received) <= lease);
                     let theirs = held.map(|held| &*held.facts);
@@ -395,7 +675,7 @@ impl Members {
     pub fn holder_catching_up(&self, collection: CollectionId) -> bool {
         let table = self.0.peer_facts.read();
         self.node_ids().iter().any(|peer| {
-            table.get(peer).is_some_and(|held| {
+            table.held.get(peer).is_some_and(|held| {
                 held.facts.catching_up
                     && !held.facts.ttl_disabled
                     && held.facts.holds_ttl(collection)
@@ -403,16 +683,17 @@ impl Members {
         })
     }
 
-    /// The live peers that have not read this member's current block while it
-    /// yields `class`: what a yielding member waits on before it stops owning
-    /// (ADR-201). Empty when the member does not yield the class.
+    /// The live peers that have not confirmed this member's yield of `class`:
+    /// those that do not echo (a 0.43 peer, or one whose echo did not decode) and
+    /// those whose echo is below the generation that set the bit. What a yielding
+    /// member waits on before it stops owning (ADR-201, ADR-213). Empty when the
+    /// member does not yield the class.
     pub fn unconfirmed_peers(&self, class: OwnerClass) -> Vec<NodeId> {
         let Some(local) = self.0.local.get() else { return Vec::new() };
-        let Some((block, _)) = local.current(Instant::now()) else { return Vec::new() };
-        if !block.yielding.of(class) {
+        if local.current(Instant::now()).is_none() {
             return Vec::new();
         }
-        local.unread_by(&self.node_ids())
+        local.unconfirmed(class, &self.node_ids())
     }
 
     /// Record a block a peer sent, as if a contact had carried it now. For
@@ -421,7 +702,20 @@ impl Members {
     /// `age` back-dates the block, so a test can make it stale.
     pub fn record_peer_facts_for_test(&self, node: NodeId, facts: Facts, age: Duration) {
         let received = Instant::now().checked_sub(age).unwrap_or_else(Instant::now);
-        self.record_peer_facts(node, Arc::new(facts), received);
+        self.record_peer_facts(node, Arc::new(facts), None, next_decoded_seq(), received);
+    }
+
+    /// Hold the table's write lock, as a stalled worker could: a test that the
+    /// yield evaluator never waits on it.
+    #[cfg(test)]
+    pub(crate) fn write_lock_for_test(&self) -> impl Drop + '_ {
+        self.0.peer_facts.write()
+    }
+
+    /// How many drop floors the table keeps.
+    #[cfg(test)]
+    pub(crate) fn drop_floors_for_test(&self) -> usize {
+        self.0.peer_facts.read().dropped.len()
     }
 
     /// Populate a member set without a running SWIM task.
@@ -493,9 +787,14 @@ impl foca::Runtime<Member> for Collector {
             }
             Notification::Defunct => {
                 warn!("this node was declared down by the cluster; rejoining");
+                // The cluster dropped this member's block, and this member may
+                // have missed changes to its peers': clear what it routes by
+                // and what it counted as confirmed (ADR-213).
+                self.members.clear_for_own_defunct();
             }
             Notification::Rejoin(identity) => {
                 info!(as_member = %identity.addr, "rejoined the cluster");
+                self.members.clear_for_own_defunct();
             }
             other => debug!(?other, "membership notification"),
         }
@@ -695,6 +994,9 @@ impl SeedFeed {
 }
 
 #[cfg(test)]
+mod yield_tests;
+
+#[cfg(test)]
 mod tests {
     use super::*;
 
@@ -714,19 +1016,20 @@ mod tests {
         use foca::Runtime;
         let members = Members::default();
         members.set_facts_source(std::sync::Arc::new(|| Facts {
+            boot: vec![9; 16],
             yielding: crate::facts::Yielding { ttl: true, ..Default::default() },
             ..Facts::default()
         }));
         let old = Member::identified(addr(7900), node(1));
         let new = old.renew().unwrap();
         members.insert_for_test(addr(7900), node(1));
-        members.record_peer_facts(
+        members.record_peer_facts_for_test(
             node(1),
-            Arc::new(Facts { catching_up: true, boot: vec![1; 16], ..Facts::default() }),
-            Instant::now(),
+            Facts { catching_up: true, boot: vec![1; 16], ..Facts::default() },
+            Duration::ZERO,
         );
         let (_, generation) = members.local_facts().unwrap();
-        members.note_read_by(node(1), generation);
+        members.note_echo(node(1), Some(&protocol::Echo { boot: vec![9; 16], generation }));
         assert_eq!(members.peer_states()[&node(1)], PeerState::IneligibleCatchingUp);
         assert!(members.unconfirmed_peers(OwnerClass::Ttl).is_empty());
 

@@ -28,17 +28,21 @@ pub mod peers;
 pub mod protocol;
 pub mod tls;
 pub mod transport;
+pub mod yielding;
+
+#[cfg(test)]
+mod codec_tests;
 
 pub use confirm::{
     ConfirmConfig, ConfirmHook, ConfirmOutcome, Confirmer, PushSentHook, Resolution,
 };
 pub use discovery::{DEFAULT_CLUSTER_PORT, ResolveError, SeedSource, names_another_member};
 pub use facts::{
-    CatchUpReason, Facts, FactsSource, MAX_TTL_COLLECTIONS, OwnerClass, PeerState, TtlHeld,
-    Yielding, facts_undecodable_total,
+    CatchUpReason, ClassState, Facts, FactsSource, MAX_TTL_COLLECTIONS, OwnerClass, PeerState,
+    PerClass, StallCause, TtlHeld, Yielding, facts_undecodable_total,
 };
 pub use health::{DEFAULT_FANOUT, MAX_BACKOFF, PeerHealth, WARN_INTERVAL};
-pub use membership::{Member, Members, SeedFeed};
+pub use membership::{Member, Members, PeerView, SeedFeed, ViewBlock};
 pub use peers::{
     ContactEnd, DEFAULT_DISCOVERY_INTERVAL, DEFAULT_SYNC_INTERVAL, ENTRY_WAIT_BUCKETS_US,
     Histogram, LagVectors, MAX_PULLS_PER_CONTACT, PULL_BUCKETS_US, PullReport, ReplicationConfig,

@@ -44,6 +44,7 @@ pub mod vectors;
 pub mod version;
 pub mod watch;
 pub mod webhooks;
+pub mod yielding;
 
 use std::sync::Arc;
 

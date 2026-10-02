@@ -648,6 +648,26 @@ const EARLY_RETRY_BASE: Duration = Duration::from_millis(250);
 /// 2 s, 3.75 s in all, after which the ticker's own interval is the cadence.
 const EARLY_RETRIES: u32 = 4;
 
+/// Apply what a contact's replies carried to `members`: each block the peer sent,
+/// ordered by when its frame decoded, and each echo of this member's own block
+/// (ADR-213). **Taken whether or not the round then succeeded**: the frames were
+/// read, and an apply at the contact's end can no longer replace a block decoded
+/// later. The confirmation is the echo, never the fact that a request was sent.
+pub(crate) fn apply_facts_read(members: &Members, stalls: &mut PeerStalls) {
+    for read in stalls.take_facts_read() {
+        members.record_peer_facts(
+            read.node,
+            read.facts,
+            read.generation,
+            read.decoded_seq,
+            Instant::now(),
+        );
+    }
+    for (node, echo) in stalls.take_echoes_read() {
+        members.note_echo(node, echo.as_ref());
+    }
+}
+
 /// When to retry a tick early, given how many ticks in a row found no peers
 /// (ADR-202's addendum): `None` for none, for more than [`EARLY_RETRIES`], and
 /// for a delay that would not be earlier than the interval itself.
@@ -878,7 +898,11 @@ pub async fn replicate(engine: Arc<Engine>, config: ReplicationConfig) {
                 // (ADR-201): the loop reads it once, from the cache, and a
                 // peer that answers has read it.
                 let sent_facts = config.members.as_ref().and_then(Members::local_facts);
-                stalls.set_local_facts(sent_facts.as_ref().map(|(facts, _)| facts.clone()));
+                stalls.set_local_facts(
+                    sent_facts.as_ref().map(|(facts, _)| facts.clone()),
+                    sent_facts.as_ref().map(|(_, generation)| *generation),
+                );
+                stalls.set_members(config.members.clone());
                 // A subset, not everyone: anti-entropy is transitive, so a
                 // write reaches the cluster through intermediate peers without
                 // every node contacting every other one every interval.
@@ -1053,14 +1077,9 @@ pub async fn replicate(engine: Arc<Engine>, config: ReplicationConfig) {
                             members.note_undecodable(peer, Instant::now());
                         }
                     }
-                    // What the peer said about itself, and that it read ours.
-                    for (node, facts) in stalls.take_facts_read() {
-                        if let Some(members) = &config.members {
-                            members.record_peer_facts(node, facts, Instant::now());
-                            if let Some((_, generation)) = &sent_facts {
-                                members.note_read_by(node, *generation);
-                            }
-                        }
+                    // What the peer said about itself, and what it holds of ours.
+                    if let Some(members) = &config.members {
+                        apply_facts_read(members, &mut stalls);
                     }
                     if let Some(members) = &config.members {
                         let mut waiting = Vec::new();
@@ -1076,14 +1095,20 @@ pub async fn replicate(engine: Arc<Engine>, config: ReplicationConfig) {
                                     warn!(
                                         class = class.label(),
                                         %peer,
-                                        "a peer has not read this member's block, which says it \
+                                        "a peer has not echoed this member's block, which says it \
                                          yields the class; this member keeps owning the class \
-                                         until every live peer has read it"
+                                         until every live peer has echoed it (an older version \
+                                         never does)"
                                     );
                                 }
                             }
                         }
                         unconfirmed_warned.retain(&waiting);
+                        // A live peer heard from not at all keeps this member
+                        // owning that peer's webhook and embedding share too.
+                        for peer in members.unheard_beyond_lease(Instant::now()) {
+                            members.note_unheard(peer, Instant::now());
+                        }
                     }
                     if let Some(pull) = stalls.take_pull() {
                         report.pulls.pulled(&pull);

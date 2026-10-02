@@ -13,6 +13,7 @@
 
 pub mod backup;
 pub mod check;
+pub mod class_step;
 pub mod codec;
 pub mod divergence;
 pub mod docs;

@@ -10135,6 +10135,9 @@ async fn the_metrics_body_exposes_exactly_these_series_in_exactly_this_order() {
         "kimmy_task_retries_total",
         "kimmy_task_retries_total",
         // One per progress writer (ADR-187): no startup has fixed a smaller set.
+        // Seven since ADR-213: the ttl pass and the yield evaluator's thread.
+        "kimmy_task_progress_age_seconds",
+        "kimmy_task_progress_age_seconds",
         "kimmy_task_progress_age_seconds",
         "kimmy_task_progress_age_seconds",
         "kimmy_task_progress_age_seconds",
@@ -10355,6 +10358,17 @@ async fn the_metrics_body_exposes_exactly_these_series_in_exactly_this_order() {
         "kimmy_yield_unconfirmed_peers",
         kimmy_cluster::OwnerClass::ALL.len(),
     ))
+    // The yield evaluator's series (ADR-213), in the order the page renders them:
+    // each class's three plain states and three causes of stalled, then the rest.
+    .chain(std::iter::repeat_n("kimmy_owner_class_state", 3 * (3 + 3)))
+    .chain(std::iter::repeat_n("kimmy_owner_class_owned", 3))
+    .chain(std::iter::repeat_n("kimmy_yielding", 3))
+    .chain(std::iter::repeat_n("kimmy_yield_transitions_total", 3 * 3))
+    .chain(std::iter::repeat_n("kimmy_yield_suppressed", 3 * 4))
+    .chain(std::iter::repeat_n("kimmy_yield_observations_total", 3 * 5))
+    .chain(["kimmy_yield_evaluator_ticks_total"])
+    .chain(std::iter::repeat_n("kimmy_yield_faults_total", 3 * 3))
+    .chain(["kimmy_runtime_responsive", "kimmy_ownership_yield_enabled", "kimmy_yield_probation"])
     .chain(["kimmy_ownership_facts_undecodable_total"])
     .chain(std::iter::repeat_n("kimmy_catching_up", kimmy_cluster::catchup::STATES.len()))
     .chain(std::iter::repeat_n("kimmy_ttl_collections", kimmy_api::ownership::TtlState::ALL.len()))

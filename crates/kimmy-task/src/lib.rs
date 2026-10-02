@@ -269,6 +269,10 @@ impl Shutdown {
     }
 
     /// Resolves once shutdown has begun, immediately if it already has.
+    pub async fn wait_begun(&self) {
+        self.reached().await
+    }
+
     async fn reached(&self) {
         let mut rx = self.announced.subscribe();
         // `borrow_and_update` first, so a shutdown that began before this call
@@ -372,6 +376,16 @@ pub const TASKS: &[&str] = &[
     "webhook_dispatcher",
 ];
 
+/// The supervised OS threads, by name: threads are not tasks, are not retried, and
+/// are started through [`supervise_thread`]. `kimmy_task_retries_total` does not
+/// carry them. A panic in one is a death, as in a task.
+///
+/// `every_supervised_name_is_in_the_task_list_and_every_entry_is_used` checks the
+/// tasks; the thread golden tests check that every entry here has a
+/// [`supervise_thread`] call site and that every progress writer is a task or a
+/// thread.
+pub const THREADS: &[&str] = &["yield_evaluator"];
+
 /// Every task in [`TASKS`] with the number of times its work has been retried.
 ///
 /// Reported as `kimmy_task_retries_total{task}`. **Every task appears, at 0 if it
@@ -404,9 +418,36 @@ pub enum Kill {
     /// Fail the work once, so a retrying task retries. Only a task with a retry
     /// loop reads this one.
     Error,
+    /// Stop making progress without ending: block at the task's own `Waiting`
+    /// point (its loop's wait, never the supervise wrapper) for the given time,
+    /// counted from the moment the stall begins, or until the stop's first signal.
+    /// `None` is until the stop. A task with a stall point reads this one; see
+    /// [`stall_point`].
+    Stall(Option<std::time::Duration>),
 }
 
-/// What `KIMMY_TEST_KILL_TASK` asks for, as `<task>:<panic|return|error>`.
+/// The tasks and threads that have a stall point: the places `stall` blocks.
+pub const STALLABLE: &[&str] =
+    &["ttl_expiry", "webhook_dispatcher", "embedding_worker", "yield_evaluator"];
+
+fn parse_mode(how: &str) -> Option<Kill> {
+    match how {
+        "panic" => Some(Kill::Panic),
+        "return" => Some(Kill::Return),
+        "error" => Some(Kill::Error),
+        "stall" => Some(Kill::Stall(None)),
+        _ => {
+            let secs = how.strip_prefix("stall:")?.parse::<u64>().ok()?;
+            Some(Kill::Stall(Some(std::time::Duration::from_secs(secs))))
+        }
+    }
+}
+
+/// Every entry `KIMMY_TEST_KILL_TASK` asks for, as `(task, mode)`.
+///
+/// **A comma-separated list** of `<task>:<mode>`, each entry split at its first
+/// `:`; the mode is `panic`, `return`, `error`, `stall` or `stall:<secs>`. An entry
+/// that does not parse is left out here and named by [`test_kill_requested`].
 ///
 /// **A test-only switch that is present in the shipped binary**, deliberately:
 /// the tests that matter here drive a real `kimmyd` and assert its exit code and
@@ -414,27 +455,77 @@ pub enum Kill {
 /// a binary nobody ships. It is named in the `KIMMY_TEST_*` family, is never read
 /// from the configuration file, is announced at `WARN` on every start where it is
 /// set, and does nothing until [`arm_test_kills`] is called — which the daemon
-/// does just before it installs its router, and the kill then waits a further
+/// does just before it installs its router, and a kill then waits a further
 /// [`TEST_KILL_GRACE`], so it lands after the node serves and cannot interfere
 /// with startup.
 ///
 /// The environment is not remotely settable, so the exposure is a switch
 /// available to whoever can already set the process's environment.
-fn requested_kill() -> Option<(String, Kill)> {
-    static PARSED: OnceLock<Option<(String, Kill)>> = OnceLock::new();
-    PARSED
-        .get_or_init(|| {
-            let raw = std::env::var("KIMMY_TEST_KILL_TASK").ok()?;
-            let (task, how) = raw.split_once(':')?;
-            let how = match how {
-                "panic" => Kill::Panic,
-                "return" => Kill::Return,
-                "error" => Kill::Error,
-                _ => return None,
-            };
-            Some((task.to_string(), how))
-        })
-        .clone()
+fn requested_kills() -> &'static [(String, Kill)] {
+    static PARSED: OnceLock<Vec<(String, Kill)>> = OnceLock::new();
+    PARSED.get_or_init(|| match std::env::var("KIMMY_TEST_KILL_TASK") {
+        Ok(raw) => parse_kills(&raw).0,
+        Err(_) => Vec::new(),
+    })
+}
+
+/// Parse a switch's value: the entries that read, and a complaint for each that
+/// does not.
+fn parse_kills(raw: &str) -> (Vec<(String, Kill)>, Vec<String>) {
+    let mut kills = Vec::new();
+    let mut complaints = Vec::new();
+    for entry in raw.split(',').map(str::trim).filter(|entry| !entry.is_empty()) {
+        let Some((task, how)) = entry.split_once(':') else {
+            complaints.push(format!(
+                "{entry} -- malformed, so nothing will happen; expected \
+                 <task>:<panic|return|error|stall[:secs]>"
+            ));
+            continue;
+        };
+        let Some(how) = parse_mode(how) else {
+            complaints.push(format!(
+                "{entry} -- malformed, so nothing will happen; expected \
+                 <task>:<panic|return|error|stall[:secs]>"
+            ));
+            continue;
+        };
+        if !TASKS.contains(&task) && !THREADS.contains(&task) {
+            complaints.push(format!(
+                "{entry} -- matches no task, so nothing will happen; the names are \
+                 kimmy_task::TASKS and THREADS"
+            ));
+            continue;
+        }
+        match how {
+            // `error` asks for a transient failure and a retry, which only a task
+            // with a retry loop can honour.
+            Kill::Error if !RETRYING.contains(&task) => {
+                complaints.push(format!(
+                    "{entry} -- error mode only acts on a retrying task, so nothing will \
+                     happen; the retrying tasks are kimmy_task::RETRYING"
+                ));
+                continue;
+            }
+            Kill::Stall(_) if !STALLABLE.contains(&task) => {
+                complaints.push(format!(
+                    "{entry} -- this task has no stall point, so nothing will happen; the \
+                     stallable ones are kimmy_task::STALLABLE"
+                ));
+                continue;
+            }
+            // A thread is not a task: it cannot be asked to return.
+            Kill::Return if THREADS.contains(&task) => {
+                complaints.push(format!(
+                    "{entry} -- a thread cannot be asked to return, so nothing will happen; \
+                     use panic or stall"
+                ));
+                continue;
+            }
+            _ => {}
+        }
+        kills.push((task.to_string(), how));
+    }
+    (kills, complaints)
 }
 
 /// Whether `KIMMY_TEST_KILL_TASK` is set, as it was set, for the startup
@@ -447,21 +538,8 @@ pub fn test_kill_requested() -> Option<String> {
     // node shut down normally and had to work out why. A switch that does
     // nothing has to say so.
     let raw = std::env::var("KIMMY_TEST_KILL_TASK").ok()?;
-    Some(match requested_kill() {
-        None => format!(
-            "{raw} -- malformed, so nothing will happen; expected <task>:<panic|return|error>"
-        ),
-        Some((task, _)) if !TASKS.contains(&task.as_str()) => format!(
-            "{raw} -- matches no task, so nothing will happen; the names are kimmy_task::TASKS"
-        ),
-        // `error` asks for a transient failure and a retry, which only a task
-        // with a retry loop can honour.
-        Some((task, Kill::Error)) if !RETRYING.contains(&task.as_str()) => format!(
-            "{raw} -- error mode only acts on a retrying task, so nothing will happen; the \
-             retrying tasks are kimmy_task::RETRYING"
-        ),
-        Some(_) => raw,
-    })
+    let (_, complaints) = parse_kills(&raw);
+    Some(if complaints.is_empty() { raw } else { format!("{raw} -- {}", complaints.join("; ")) })
 }
 
 /// How long after arming `KIMMY_TEST_KILL_TASK` waits, so the node is serving
@@ -480,26 +558,85 @@ pub fn arm_test_kills() {
     // task that never started here would otherwise wait for ever and look like a
     // switch that failed: a node with `vector.worker_enabled = false` starts no
     // embedding worker, and a single node starts none of the membership tasks.
-    if let Some((task, _)) = requested_kill()
-        && TASKS.contains(&task.as_str())
-        && !started().contains(&task.as_str())
-    {
-        warn!(
-            KIMMY_TEST_KILL_TASK = %task,
-            started = ?started(),
-            "the test switch names a task this node did not start, so nothing will happen; it is \
-             not configured on this node"
-        );
+    for (task, _) in requested_kills() {
+        if !started().contains(&task.as_str()) {
+            warn!(
+                KIMMY_TEST_KILL_TASK = %task,
+                started = ?started(),
+                "the test switch names a task this node did not start, so nothing will happen; it \
+                 is not configured on this node"
+            );
+        }
     }
 }
 
-/// What `KIMMY_TEST_KILL_TASK` asks of this task, once armed.
+/// What `KIMMY_TEST_KILL_TASK` asks of this task, once armed. When more than one
+/// entry names it, the first.
 pub fn kill_for(task: &str) -> Option<Kill> {
     if !ARMED.load(std::sync::atomic::Ordering::SeqCst) {
         return None;
     }
-    requested_kill().and_then(|(wanted, how)| (wanted == task).then_some(how))
+    requested_kills().iter().find(|(wanted, _)| wanted == task).map(|(_, how)| *how)
 }
+
+/// Where a task stops when `KIMMY_TEST_KILL_TASK` asks it to `stall`.
+///
+/// Called by a task **at its own `Waiting` point**, each turn of its loop, and
+/// never from the supervise wrapper: the stall is the task itself ceasing to make
+/// progress, with its supervisor none the wiser. For a task not asked to stall
+/// this returns at once. For one that is, the first call logs `test stall began`
+/// with the task and the seconds (or `until the stop`) for a grader, and blocks:
+/// for the seconds counted **from this point**, or until the stop's first signal.
+/// A stall that has ended does not begin again.
+pub async fn stall_point(task: &'static str, shutdown: &Shutdown) {
+    let Some(Kill::Stall(secs)) = kill_for(task) else { return };
+    let remaining = {
+        let mut stalls = STALLS.lock().expect("the stall states are never held across a panic");
+        let state = match stalls.iter_mut().find(|(name, _)| *name == task) {
+            Some((_, state)) => state,
+            None => {
+                stalls.push((task, StallState::default()));
+                &mut stalls.last_mut().expect("just pushed").1
+            }
+        };
+        if state.ended {
+            return;
+        }
+        let began = *state.began.get_or_insert_with(|| {
+            warn!(
+                task,
+                secs =
+                    secs.map_or_else(|| "until the stop".to_string(), |d| d.as_secs().to_string()),
+                "test stall began"
+            );
+            std::time::Instant::now()
+        });
+        secs.map(|d| d.saturating_sub(began.elapsed()))
+    };
+    match remaining {
+        Some(left) => {
+            tokio::select! {
+                () = tokio::time::sleep(left) => {}
+                () = shutdown.wait_begun() => {}
+            }
+        }
+        None => shutdown.wait_begun().await,
+    }
+    let mut stalls = STALLS.lock().expect("the stall states are never held across a panic");
+    if let Some((_, state)) = stalls.iter_mut().find(|(name, _)| *name == task) {
+        state.ended = true;
+    }
+    info!(task, "test stall ended");
+}
+
+#[derive(Default)]
+struct StallState {
+    began: Option<std::time::Instant>,
+    ended: bool,
+}
+
+static STALLS: std::sync::Mutex<Vec<(&'static str, StallState)>> =
+    std::sync::Mutex::new(Vec::new());
 
 /// Wait until this task is asked to end, if it ever is.
 ///
@@ -512,15 +649,13 @@ async fn awaiting_test_kill(task: &'static str) -> Kill {
     // every 50ms, for every supervised task, for the life of a node that was
     // not being tested at all -- fifteen timers, three hundred wakeups a
     // second, shipped.
-    let Some((wanted, how)) = requested_kill() else { return never().await };
-    if wanted != task {
+    let Some((_, how)) = requested_kills()
+        .iter()
+        .find(|(wanted, how)| wanted == task && matches!(how, Kill::Panic | Kill::Return))
+    else {
         return never().await;
-    }
-    // The retrying shape reads this one itself; ending the task here would test
-    // the wrong thing.
-    if how == Kill::Error {
-        return never().await;
-    }
+    };
+    let how = *how;
     // `ARMED` is the one thing that still has to be waited for: tasks start
     // before the node serves, and the switch must not fire during startup. A
     // poll here costs nothing, because only the named task reaches it.
@@ -542,8 +677,7 @@ async fn awaiting_test_kill(task: &'static str) -> Kill {
 /// the two end differently: that one ends the task, this one makes one attempt
 /// fail so the retry is the thing under test.
 async fn awaiting_test_error(task: &'static str) {
-    let Some((wanted, Kill::Error)) = requested_kill() else { return never().await };
-    if wanted != task {
+    if !requested_kills().iter().any(|(wanted, how)| wanted == task && *how == Kill::Error) {
         return never().await;
     }
     while !ARMED.load(std::sync::atomic::Ordering::SeqCst) {
@@ -980,4 +1114,114 @@ where
     let supervising = shutdown.supervising();
     // UNSUPERVISED: the supervisor task, as in `supervise`.
     tokio::spawn(supervised(name, shutdown, work, |()| Return::Expected, supervising))
+}
+
+/// Supervise a named OS thread: a panic in it is a death, exactly as in a task.
+///
+/// For work that must not run on the runtime, such as the yield evaluator, whose
+/// whole point is that a stalled runtime cannot stop it. A thread is not retried,
+/// and returning is not a death: a thread whose work is to end at the stop (the
+/// evaluator returns once frozen) ends by returning. A panic that lands after
+/// shutdown has begun is part of the stop and is only logged.
+///
+/// The thread is named `name` with its underscores as hyphens, `yield-evaluator`
+/// for `yield_evaluator`. `name` must be in [`THREADS`]; a golden test checks each
+/// entry there has a call site here.
+pub fn supervise_thread<F>(
+    name: &'static str,
+    shutdown: Shutdown,
+    work: F,
+) -> std::io::Result<std::thread::JoinHandle<()>>
+where
+    F: FnOnce() + Send + 'static,
+{
+    mark_started(name);
+    // The supervised thread itself: `catch_unwind` below is its supervision.
+    // UNSUPERVISED: the supervisor of a thread is the thread's own catch_unwind, which ends the process.
+    std::thread::Builder::new().name(name.replace('_', "-")).spawn(move || {
+        let ended = std::panic::catch_unwind(std::panic::AssertUnwindSafe(work));
+        if let Err(payload) = ended {
+            let detail = if let Some(s) = payload.downcast_ref::<&str>() {
+                (*s).to_string()
+            } else if let Some(s) = payload.downcast_ref::<String>() {
+                s.clone()
+            } else {
+                "a panic payload of a type this build cannot render".to_string()
+            };
+            if shutdown.has_begun() {
+                info!(thread = name, detail, "a supervised thread panicked as shutdown began");
+            } else {
+                exit_because(name, Death::Panicked, &detail);
+            }
+        }
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn kills(raw: &str) -> Vec<(String, Kill)> {
+        parse_kills(raw).0
+    }
+
+    /// A comma-separated list, each entry split at its first `:`, with `stall` and
+    /// `stall:<secs>` as modes of their own.
+    #[test]
+    fn the_switch_is_a_comma_list_of_task_and_mode() {
+        assert_eq!(
+            kills("ttl_expiry:stall:300, webhook_dispatcher:stall,yield_evaluator:panic"),
+            vec![
+                ("ttl_expiry".to_string(), Kill::Stall(Some(std::time::Duration::from_secs(300)))),
+                ("webhook_dispatcher".to_string(), Kill::Stall(None)),
+                ("yield_evaluator".to_string(), Kill::Panic),
+            ]
+        );
+        assert_eq!(
+            kills("stall_probe:panic,session_invalidator:return,embedding_worker:error"),
+            vec![
+                ("stall_probe".to_string(), Kill::Panic),
+                ("session_invalidator".to_string(), Kill::Return),
+                ("embedding_worker".to_string(), Kill::Error),
+            ]
+        );
+        // The mode is everything after the first colon: `stall:` with a bad count
+        // is not `stall`.
+        assert!(kills("ttl_expiry:stall:soon").is_empty());
+        assert!(kills("ttl_expiry:stall:").is_empty());
+        assert!(kills("").is_empty());
+    }
+
+    /// An entry that cannot act says so, by name, and the others still act.
+    #[test]
+    fn an_entry_that_cannot_act_is_named_and_the_rest_still_do() {
+        let (read, complaints) = parse_kills(
+            "nothing:panic,ttl_expiry,ttl_expiry:wobble,stall_probe:stall,\
+             stall_probe:error,yield_evaluator:return,ttl_expiry:panic",
+        );
+        assert_eq!(read, vec![("ttl_expiry".to_string(), Kill::Panic)]);
+        assert_eq!(complaints.len(), 6, "{complaints:?}");
+        let said = complaints.join("\n");
+        assert!(said.contains("nothing:panic -- matches no task"), "{said}");
+        assert!(said.contains("ttl_expiry -- malformed"), "{said}");
+        assert!(said.contains("ttl_expiry:wobble -- malformed"), "{said}");
+        assert!(said.contains("stall_probe:stall -- this task has no stall point"), "{said}");
+        assert!(
+            said.contains("stall_probe:error -- error mode only acts on a retrying task"),
+            "{said}"
+        );
+        assert!(
+            said.contains("yield_evaluator:return -- a thread cannot be asked to return"),
+            "{said}"
+        );
+    }
+
+    /// Every stallable name is a task or a thread this crate knows, so a switch
+    /// cannot name a stall point that nothing declares.
+    #[test]
+    fn every_stallable_name_is_a_task_or_a_thread() {
+        for name in STALLABLE {
+            assert!(TASKS.contains(name) || THREADS.contains(name), "{name}");
+        }
+    }
 }

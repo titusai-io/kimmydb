@@ -895,6 +895,112 @@ A member that creates its store in a cluster it has seeds for (a new pod, a volu
 
 **A limit: a rollback without `kimmyd restore` is protected only by the replay's proof.** A volume or disk-snapshot revert, or a copy of an old data directory, writes no marker. The member is marked `restored` only when a member that holds the lost writes answers the replay; while that member is reachable over SWIM and not over the cluster port, the rolled-back member serves and does owner work without them, with a `WARN` every ten minutes that its replay is still owed. **Restore with `kimmyd restore`, never by rolling back a volume.**
 
+### A member that yields a class of work
+
+Expiry, webhook delivery and embedding are each owned by one member at a time,
+chosen over the members SWIM lists live. SWIM says a member is reachable, not
+that it can do the work, so a member with a wedged dispatcher, an expiry task
+that fails every pass or a held runtime used to keep its share until someone
+restarted it. A member now judges its own heartbeats and **yields** a class it
+cannot do to a peer that can ([ADR-213](decisions.md)).
+
+**What it watches.** Each class (`ttl`, `webhooks`, `embeddings`) beats as it
+works, and a class is overdue when it has not moved for longer than its phase's
+bound: 30 s waiting or working for webhooks and embeddings, 75 s for one
+provider attempt, `storage.ttl_interval_secs` plus 60 s for expiry between
+passes. A dedicated thread, the evaluator, reads the beats and the runtime's
+250 ms stall probe every 5 s. A tick in which the evaluator itself ran late is
+**void** and counts as nothing, so a paused process, a debugger or a loaded
+host is never read as a fault. Only this member's own failures count: a provider
+that hangs or answers 5xx, a webhook endpoint that is down, a missing API key or
+a refused address do not make a member yield, and show in
+`kimmy_yield_faults_total{kind="remote"}` or `"config"`.
+
+**Reading a state.** `kimmy_owner_class_state{class}` is `ok` (working), `idle`
+(owns nothing), `suspect` (one bad item: the member is already not a target) or
+`stalled` (half of the last minute was bad; expiry: three passes of five), with
+the cause on the `stalled` series: `local`, `runtime` (the runtime stalled) or
+`probation` (see below). A `stalled` class yields when a **target** exists: a
+live peer with a fresh block that is not catching up, is `ok` or `idle` in that
+class, is `responsive` (`kimmy_runtime_responsive`), would own the work and does
+not itself yield it. A member running 0.43.0 is never a target. On a yield the
+member logs a `WARN` naming the class, the evidence and the targets, and
+`kimmy_yielding{class}` reads 1.
+
+**A yield takes effect when every live peer confirms it.** `kimmy_yielding` is
+what the member advertises. It keeps owning the class until every live peer has
+echoed the block back and its own live set has held still for a lease, so
+`kimmy_yield_unconfirmed_peers{class}` above 0 for longer than a lease means a
+peer is not confirming: an older version (it never does, so a mixed cluster
+keeps the member owning until none is live), a peer whose replication contacts
+fail while SWIM stays up, or a peer whose blocks do not decode. Both members own
+the class meanwhile, which is a duplicate and never a gap.
+
+**Why it does not yield.** A stalled class that is not yielding says why in
+`kimmy_yield_suppressed{class,reason}` and in a `WARN` once per class per five
+minutes, naming each live peer that is not a target and the reason:
+
+- `switched_off`: `KIMMY_OWNERSHIP_YIELD=off` (below).
+- `shared_fault`: **the latch.** Two or more members are `stalled` in the class
+  with a local cause, so the fault probably follows the data (a replicated bad
+  record, a defect on every member) and moving the work moves the fault. No
+  member yields it, and any that did withdraws and takes its share back. It
+  clears after fewer than two have been stalled for 30 minutes.
+- `no_target`: no peer qualifies. Common during a restart of the others, in a
+  cluster of one, and while every member is loaded.
+- `cap`: yielding would exceed `max(1, ⌊(n−1)/2⌋)` members for the class.
+
+**Taking the class back.** The member reclaims after 120 s of good (or idle)
+ticks with a responsive runtime, and owns the class again at once. A class
+that yields again within 30 minutes doubles the wait, up to 32 minutes, and the
+wait resets after 30 minutes without a yield; it is per process, so a restart
+resets it. A member that fails only while it does the work therefore holds the
+work for a shrinking share of each cycle. `kimmy_yield_transitions_total` counts
+`yield`, `reclaim` and `withdraw`.
+
+**Probation.** A start after `storage_failed` or `task_died` begins with every
+class `stalled` (cause `probation`) and yields from its first block, to any peer
+that qualifies. A start after `unclean` or `storage_not_closed` does so only
+when corroborated: the data directory's free space is below the smaller of 1 GiB
+and 5% of the filesystem, or the previous run was shorter than 10 minutes, or
+the previous start was itself not clean. The previous start's time and verdict
+come from `kimmy.last-start` in the data directory, written when a start reaches
+serving; it is advisory, a missing or unreadable file only removes the second
+and third corroborations, and 0.43.0 ignores it. An ordinary roll, a SIGKILL
+after a long run or a restart with space on the disk does not start probation.
+A whole cluster restarted after a power loss starts every member in probation and
+advertising a yield of every class. The latch counts only stalls with a local
+cause, and a probation stall is not one, so it does not hold the yields back:
+the cap does. It is `max(1, ⌊(n−1)/2⌋)`, which is one at three members, so once
+the members have heard each other the ones beyond the cap in node id order
+withdraw and the lowest node id keeps yielding.
+No member is a target (every one of them is stalled), so the one still
+advertising keeps owning, and nothing is left unowned. It takes the work back
+after about 24 quiet ticks, two minutes. `kimmy_yield_probation` reads 1 for a
+start that began in probation.
+
+**The off switch.** `KIMMY_OWNERSHIP_YIELD=off`, environment only, keeps this
+member from setting its own yield bits. It still judges, advertises its states,
+honours its peers' yields and can be a target, and a stalled class shows
+`suppressed{reason="switched_off"}`; `kimmy_ownership_yield_enabled` reads 0 and
+the start logs it at `INFO`. Unset, empty and `on` leave yielding on, the match ignores
+case, surrounding whitespace is ignored, and **any other value refuses the start**, naming the variable, so a typo
+cannot leave yielding on. There is no configuration key, so a config file
+written for this version still starts 0.43.0.
+
+**What it does not do.** A writer held for good delays every class and is not
+detected. In a build with the optional in-process embedding model, a first-use
+model download that takes more than 75 seconds reads as a local fault and can make
+the member yield embeddings; that is accepted, because the member cannot embed
+while it downloads. Independent faults on two members of one class look like one shared
+fault, so neither yields. A fault that shows only as runtime stalls does not set
+the latch, so for a record whose reads hold the workers of whichever member owns
+it, the work can move between members, at most one hand-off per back-off.
+`/v1/topology` shows, per node, `yielding` and `classState` as the answering
+member sees them, and `view` names that member; compare members after a lease,
+not a single scrape. The `KIMMY_TEST_` switches listed with the metrics exist
+for the tests of this behaviour and are never set in a deployment.
+
 ### Metrics
 
 Unauthenticated, like the health endpoints, and deliberately **counts only** —
@@ -907,7 +1013,7 @@ the series; every series the endpoint exposes has a row.
 | `kimmy_up` | Always 1; presence means the node is serving |
 | `kimmy_uptime_seconds` | Since this process started |
 | `kimmy_task_retries_total{task}` | Times a supervised background task retried its work in place after a transient failure (one instrument per task on the OTLP bridge, `kimmy.task.retries.<task>`). Every supervised task has a row from the first scrape, at 0. A **rising** count is the node recovering by itself and needs no action; a count that **keeps** rising while that task's work does not progress is a task retrying something permanent — alive, and doing nothing. That is the one case this series cannot tell you on its own. For the embedding worker, the only task that retries, read it beside `kimmy_task_progress_age_seconds{task="embedding_worker"}`, which rises through a retry that never succeeds ([ADR-184](decisions.md), [ADR-187](decisions.md)) |
-| `kimmy_task_progress_age_seconds{task}` | Seconds since a background writer last completed its work, computed when the page is read (one instrument per writer on the OTLP bridge, `kimmy.task.progress_age.<task>`). Five writers have one: `replication` (a round with a peer completed and measured the lag), `stall_probe` (the probe woke), `webhook_dispatcher` (a pass read the registry and set the backlog), `embedding_worker` (a flush committed, or an idle turn had nothing waiting) and `drop_purger` (a purge chunk committed, an owed check finished, or an idle turn had nothing queued or owed; held, not climbing, while it waits for the storage writer, [ADR-189](decisions.md)). **Before a writer's first completion it reads the time since the process started, never 0**, so a writer that has never run, one that has died, one that is stuck and one retrying something permanent all read the same way: old. **A writer this node does not run has no row**: `replication` with clustering off, `embedding_worker` with the worker disabled. The rows are fixed at startup, so the set does not change between scrapes. **Alert on this**, per writer, at the threshold in [the table below](#a-gauge-is-only-as-fresh-as-its-writer), which also says which gauges each age covers ([ADR-187](decisions.md)) |
+| `kimmy_task_progress_age_seconds{task}` | Seconds since a background writer last completed its work, computed when the page is read (one instrument per writer on the OTLP bridge, `kimmy.task.progress_age.<task>`). Seven writers have one: `ttl_expiry` (the TTL class beat: each index and each candidate a pass examines, and each turn of its loop; [ADR-213](decisions.md)), `yield_evaluator` (the yield evaluator ticked; a thread, not a task), `replication` (a round with a peer completed and measured the lag), `stall_probe` (the probe woke), `webhook_dispatcher` (a pass read the registry and set the backlog), `embedding_worker` (a flush committed, or an idle turn had nothing waiting) and `drop_purger` (a purge chunk committed, an owed check finished, or an idle turn had nothing queued or owed; held, not climbing, while it waits for the storage writer, [ADR-189](decisions.md)). **Before a writer's first completion it reads the time since the process started, never 0**, so a writer that has never run, one that has died, one that is stuck and one retrying something permanent all read the same way: old. **A writer this node does not run has no row**: `replication` with clustering off, `embedding_worker` with the worker disabled. The rows are fixed at startup, so the set does not change between scrapes. **Alert on this**, per writer, at the threshold in [the table below](#a-gauge-is-only-as-fresh-as-its-writer), which also says which gauges each age covers ([ADR-187](decisions.md)) |
 | `kimmy_runtime_stall_seconds` | Worst delay a 250 ms timer on the async runtime saw since the last scrape, then reset. Tens of milliseconds is normal jitter; whole seconds means a worker thread was blocked — the storage lock or an fsync — and peers may have marked this node down in the meantime. **Alert on this** at 1 s |
 | `kimmy_embed_provider_requests_total` | Embedding provider calls answered — documents embedded by the worker and search queries embedded for `vector_search`/`hybrid_search` alike. Compare with the provider's own request count. One call carries many documents ([ADR-095](decisions.md)), so `kimmy_embed_chunks_total` over this is the batch size the worker is achieving; there is no separate batch-size series |
 | `kimmy_embed_provider_tokens_total` | Input tokens the provider reported billing for (`usage.prompt_tokens` and equivalents). The number a metered provider's invoice is made of; zero for providers that report none |
@@ -1000,7 +1106,18 @@ the series; every series the endpoint exposes has a row.
 | `kimmy_violations_backfill_rows_total` | Oplog rows the completing pass has read since start; flat at 0 on a store whose table was ready at open. On the OTLP bridge, `kimmy.violations.backfill_rows` |
 | `kimmy_violations_walk_path_total{path}` | `GET …/violations` calls by how they were answered: `table`, or `oplog` (the walk, while the table is not ready). On the OTLP bridge, `kimmy.violations.walk_path.table` and `.oplog` |
 | `kimmy_ownership_peers{state}` | Live peers as **this member** sees them by the block each last sent on the replication contact ([ADR-201](decisions.md)): `eligible`, `ineligible_catching_up` (the catching-up marker is set; no class overrides it), `ineligible_yielding` (at least one class given up), `unknown` (no block yet: an older version, or not yet heard) and `stale` (a block past its lease, which keeps saying what it last said: not hearing from a member is not evidence that it recovered). Every state is always present. Views differ while blocks converge, so compare members after a lease, never a single scrape. The lease is `ceil(peers / cluster.fanout) + 2` sync intervals. On the OTLP bridge, `kimmy.ownership.peers.<state>` |
-| `kimmy_yield_unconfirmed_peers{class}` | Live peers that have not read this member's current block while it yields `class` (`ttl`, `webhooks`, `embeddings`). A member that yields a class keeps owning it until every live peer has read the block that says so, so a peer that never does keeps it owning; alert on a value that stays above 0. 0 while no class yields, which is always in this release. On the OTLP bridge, `kimmy.yield.unconfirmed_peers.<class>` |
+| `kimmy_yield_unconfirmed_peers{class}` | Live peers that have not confirmed this member's yield of `class` (`ttl`, `webhooks`, `embeddings`): those that do not echo the block back (an older version never does) and those whose echo is below the generation that set the bit. A member that yields a class keeps owning it until every live peer has echoed the block that says so and its live set has held still for a lease, so a peer that never does keeps it owning; alert on a value that stays above 0. 0 while no class yields. On the OTLP bridge, `kimmy.yield.unconfirmed_peers.<class>` |
+| `kimmy_owner_class_state{class,state,cause}` | How this member's own class of owned work stands, one-hot over `ok`, `idle`, `suspect` and `stalled`; only the `stalled` series carries a `cause` (`local`, `runtime`, `probation`). The state last decided, so read it beside `kimmy_task_progress_age_seconds{task="yield_evaluator"}`. On the OTLP bridge, `kimmy.owner.class_state.<class>.<state>` and `.stalled.<cause>` ([ADR-213](decisions.md)) |
+| `kimmy_owner_class_owned{class}` | Items the class owned at its last owner check. A negative test that nothing owned work proves nothing: read it beside the state. For embeddings the count is set by the worker's loop, so while a provider call is held (two attempts of 60 s at most) it lags until the call ends; the class is judged by its heartbeat meanwhile. On the OTLP bridge, `kimmy.owner.class_owned.<class>` |
+| `kimmy_yielding{class}` | 1 while this member **advertises** that it yields the class. Advertised, not effective: it keeps owning the class until every live peer has echoed the block. On the OTLP bridge, `kimmy.yielding.<class>` |
+| `kimmy_yield_transitions_total{class,direction}` | Times this member made a `yield`, a `reclaim` (took the class back after good ticks) or a `withdraw` (took it back while still stalled, for the shared-fault latch or the tie-break). A fault that follows the data costs one yield and one withdraw. On the OTLP bridge, `kimmy.yield.transitions.<class>.<direction>` |
+| `kimmy_yield_suppressed{class,reason}` | 1 while a stalled class is not yielding, by the first reason that applies: `switched_off`, `shared_fault`, `no_target`, `cap`. On the OTLP bridge, `kimmy.yield.suppressed.<class>.<reason>` |
+| `kimmy_yield_observations_total{class,verdict}` | What each evaluator tick counted the class as: `good`, `bad`, `idle`, `neutral`, `void`. A quiet cluster was really watched when `good`, `idle` or `neutral` rises beside the ticks. On the OTLP bridge, `kimmy.yield.observations.<class>.<verdict>` |
+| `kimmy_yield_evaluator_ticks_total` | Ticks the evaluator has made, one every five seconds. Stops rising when the thread is frozen for a stop or wedged. On the OTLP bridge, `kimmy.yield.evaluator.ticks` |
+| `kimmy_yield_faults_total{class,kind}` | Faults counted against the class by its own heartbeat: `local` (this member's storage, the registry: the only kind that counts towards yielding), `remote` (a delivery or provider call: an endpoint's) and `config` (a policy refusal, a missing key). On the OTLP bridge, `kimmy.yield.faults.<class>.<kind>` |
+| `kimmy_runtime_responsive` | 1 when this member's runtime has not stalled for the last six judged evaluator ticks: quick to 0, slow to 1. Only a responsive member is a target for a peer's yield. On the OTLP bridge, `kimmy.runtime.responsive` |
+| `kimmy_ownership_yield_enabled` | 1 unless `KIMMY_OWNERSHIP_YIELD=off` keeps this member from setting its own yield bits. Off, it still judges, advertises, honours its peers' bits and can be a target. On the OTLP bridge, `kimmy.ownership.yield.enabled` |
+| `kimmy_yield_probation` | 1 when this start began in probation: every class starts `stalled` and yields from the first block. Set at start. On the OTLP bridge, `kimmy.yield.probation` |
 | `kimmy_ownership_facts_undecodable_total` | Blocks a peer sent about itself that did not decode and were treated as none ([ADR-201](decisions.md)). A peer whose blocks never decode looks exactly like an older version that sends none (`unknown` in `kimmy_ownership_peers`), so a rising count, and the `WARN` that names the peer (once per five minutes each), are how they are told apart. Should stay 0. On the OTLP bridge, `kimmy.ownership.facts_undecodable` |
 | `kimmy_catching_up{reason}` | Gauge, one-hot over `none`, `seeded_empty`, `restored`, `snapshot` and `unknown`: every reason is always present and exactly one is `1` ([ADR-202](decisions.md)). Not `none` means this member's catching-up marker is set: it refuses requests (except `unknown`, which serves) and does no expiry, embedding or webhook work. `seeded_empty` is a member that created its store in a cluster it has seeds for; `restored` is a store put back by `kimmyd restore`, or a member a peer shows to have lost writes it made; `snapshot` is a member a peer can only serve with a whole-database snapshot (it fell behind that peer's retention horizon); `unknown` is a marker still set after `cluster.catch_up_wait_secs` with no peer reached that could say, or with a member the cluster lists live still owing the replay of this member's own origin past that wait (`/readyz`'s `unknown_because` says which, [ADR-212](decisions.md)). **Alert on `unknown`, and on any reason other than `none` that outlasts a catch-up.** On the OTLP bridge, `kimmy.catching_up.<reason>` |
 | `kimmy_ttl_collections{state}` | The collections this member holds a TTL index on, by how their expiry stands **from this member's view** ([ADR-201](decisions.md)), with or without clustering: `owned` (this member expires it), `owed_elsewhere` (another member does), `unowned_no_holder` (no member is known to hold the index and be able to expire it: every holder has expiry switched off, or none is known to hold it, which is an operator or index-definition problem and is logged as a `WARN` naming the collection, at most once per thirty minutes), and `unowned_catching_up` (every member known to hold it is catching up: a transient, and the expiry waits, since a stale expiry beats a refreshed copy under last-writer-wins). Every state is always present. **The unowned states are reported only by members that are not themselves candidates**: a member with expiry switched off (which checks once a minute for this and nothing else), or one that is catching up (its catching-up marker is set: see [A member that is catching up](#a-member-that-is-catching-up)). A member with expiry on that holds the index is a candidate, so it always sees an owner. A lone member with expiry off reports every TTL collection it holds as `unowned_no_holder`. Each member reports its own view, so **aggregate with `max` across members**, and alert on either `unowned_*` state staying above 0. **Summed across members, `owned` above one member's total of all four states means a collection has more than one owner**: a member whose sync contacts fail (it also shows `kimmy_ownership_peers{state="stale"}`), or more than 256 TTL collections, past which every holder owns each of the rest. On the OTLP bridge, `kimmy.ttl.collections.<state>` |
@@ -1010,6 +1127,31 @@ the series; every series the endpoint exposes has a row.
 
 Counters render at zero before their first event, so a dashboard shows "nothing
 has gone wrong yet" rather than "no data".
+
+**Test switches of the yield evaluator** are environment variables with a
+`KIMMY_TEST_` prefix, present in the shipped binary so that the tests exercise the
+binary that ships. Each is announced at `WARN` at start and none has a configuration
+key. All of them but `KIMMY_TEST_YIELD_SCALE`, which is applied when the evaluator
+is built, wait for the node to serve before they act. Never set one in a
+deployment.
+
+| Variable | What it does |
+|---|---|
+| `KIMMY_TEST_YIELD_SCALE=<k>` | Divides the evaluator's tick, the latch hold and the back-off window by `k` |
+| `KIMMY_TEST_KILL_TASK=<task>:<mode>[,...]` | `panic`, `return`, `error`, `stall` or `stall:<secs>` for a named task, with a stall held at the task's own wait |
+| `KIMMY_TEST_FAIL_STEP=<class>[:<after_secs>][,...]` | Fails a class's local step without calling the backend |
+| `KIMMY_TEST_STALL_RUNTIME=<ms>/<period_s>` | Blocks every runtime worker for `ms` (at most 3000) every `period_s` |
+| `KIMMY_TEST_REFUSE_SYNC=1` | The member completes no replication contact in either direction: its listener accepts and drops peers and it dials none. SWIM and the client API are untouched. Any other value refuses the start |
+
+**A bad value is not always the same answer.** A malformed or too large
+`KIMMY_TEST_STALL_RUNTIME` (more than 3000 ms, or a period under a second) and a
+`KIMMY_TEST_REFUSE_SYNC` that is not exactly `1` **refuse the start**, as does a
+`KIMMY_OWNERSHIP_YIELD` that is not `on` or `off`, so that a test never believes it
+has armed a switch it has not. A `KIMMY_TEST_YIELD_SCALE` that is not a whole number
+of at least 1, a `KIMMY_TEST_FAIL_STEP` entry that does not read, and a
+`KIMMY_TEST_KILL_TASK` entry that cannot act (an unknown task, an `error` on a task
+that does not retry, a stall on a task with no stall point, a thread asked to
+return) are named in the start's `WARN` and **ignored**; the other entries still act.
 
 The two absences ADR-043 recorded — latency histograms and oplog lag — are
 filled by `kimmy_request_duration_seconds` and `kimmy_replication_lag_seconds`,
@@ -1031,6 +1173,8 @@ completions, so an ordinary slow pass does not fire it.
 |---|---|---|
 | `replication` | `kimmy_replication_lag_seconds` and `kimmy_sync_divergent_collections`. Not `kimmy_sync_peers_backing_off`, which the loop writes on every tick, failed rounds included, so it stays live exactly when rounds are failing and this age is climbing. It freezes too if the loop itself is stuck, as every figure the loop writes does | 4 × `cluster.sync_interval_secs`: a round completes once a tick while any peer answers, and a tick that runs long delays the next by up to an interval |
 | `stall_probe` | `kimmy_runtime_stall_seconds` | 2 s or more. The probe wakes every 250 ms, but ages are whole seconds, so a healthy probe reads 0 or 1 |
+| `ttl_expiry` | none of its own: it bounds how long expired documents wait to be removed on this member | `2 × (ttl_interval_secs + 12 × 5 s)`: twice the `Waiting` bound the evaluator uses, which is 240 s at the default `storage.ttl_interval_secs` of 60 and grows with it, so a fixed 240 s alert false-fires on a larger interval |
+| `yield_evaluator` | every `kimmy_owner_class_*`, `kimmy_yield_*` and `kimmy_runtime_responsive` series, which report what it last decided | 10 s: two evaluator ticks. A member whose evaluator is older than that advertises every class as `unknown` and is no target |
 | `webhook_dispatcher` | `kimmy_webhook_backlog_seconds` | 24 s: 2 × (10 s, the longest one delivery may take, the lookup of its host included, + 2 s between passes). A pass delivers `webhooks.max_concurrent_deliveries` at a time, so each further round of that many deliveries in one pass adds 10 s to the gap |
 | `embedding_worker` | the `kimmy_embed_*` counters: flat is only "nothing to embed" while this is fresh | 150 s: 2 × (5 s between idle turns + 10 s, the lookup of the endpoint's host before the call, + 60 s, the provider call's timeout). A backfill after a vector configuration change resets it with each batch it stores, so a long one does not trip it |
 | `drop_purger` | none of its own: it bounds how long what a collection drop held stays on disk, and how long a creation of that name answers `503 collection_purging` | 15 s: 2 × (5 s between idle turns + 2.5 s for one chunk and one owed check). Its wait for the storage writer is held out of the age, so a purger queued behind an index build reads fresh; a writer that is never released shows on `kimmy_write_lock_wait_seconds` instead ([ADR-189](decisions.md)) |

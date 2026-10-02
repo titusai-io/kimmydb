@@ -116,6 +116,7 @@ fn a_collection_whose_every_holder_is_catching_up_is_on_the_gauge_and_in_the_log
             engine.node_id(),
             Some(members),
             Duration::from_millis(20),
+            kimmy_task::Shutdown::new(),
         ));
         tokio::time::sleep(Duration::from_millis(400)).await;
         looping.abort();

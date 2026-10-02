@@ -1085,7 +1085,7 @@ curl localhost:7878/v1/topology -H "$A"
       "version": "0.1.0", "status": "live", "self": true },
     { "node": "fa5b2a9e-…", "endpoint": "http://10.0.0.6:7878",
       "version": "0.1.0", "status": "unknown", "self": false } ],
-  "count": 2 }
+  "count": 2, "view": "c88b8984-…" }
 ```
 
 **Every node accepts writes**, so client-side selection is sticky plus retry
@@ -1114,6 +1114,21 @@ costs a round trip, and `retry: elsewhere` already covers the outcome.
 
 **The answering node is always listed, marked `self`, and first** — a client
 reading top-down should not be moved off the node already serving it.
+
+**What each node yields.** `view` is the id of the node that answered, and
+`yielding` and `classState` on each entry are what **that member sees** of the
+node ([ADR-213](decisions.md)). A member that cannot do a class of work (TTL
+expiry, webhook delivery, embedding) gives it to a peer that can, and says so in
+its block. `yielding` lists the classes the node yields (`ttl`, `webhooks`,
+`embeddings`); `classState` says how each class stands on it (`ok`, `idle`,
+`suspect`, `stalled`, or `unknown`). For the answering node these are what its own
+evaluator last decided; for a peer, what its last block said. They are present
+only when there is something to say: for a peer from an older build `yielding` is
+`[]` and `classState` is absent, and it is never a target for a yield. They are **advertised, not effective**: a member
+keeps owning a class it yields until every live peer has confirmed it, so read
+them as "where work is going", and compare members after a lease, never a single
+answer. A client choosing where to send a request should still prefer `live`
+nodes without `catchingUp`, and need not read these at all.
 
 A node appears with a null `endpoint` when it has not been told what to
 advertise. Set `server.advertise` to the URL clients should use; it cannot be

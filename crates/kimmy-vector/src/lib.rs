@@ -39,4 +39,4 @@ pub use search::{
     Hit, SearchOptions, keyword_search, reciprocal_rank_fusion, vector_search,
     weighted_reciprocal_rank_fusion,
 };
-pub use worker::{BatchSettings, EmbeddingWorker, Outcome, OwnerCheck, WorkerCounters};
+pub use worker::{BatchSettings, EmbeddingWorker, Fault, Outcome, OwnerCheck, WorkerCounters};

@@ -191,18 +191,36 @@ pub struct Owners {
     /// own `catching_up` bit does the same through the local block, but a node
     /// with clustering on and no membership has no block to carry it.
     gate: Option<std::sync::Arc<kimmy_cluster::catchup::CatchUp>>,
+    /// Test seam: called at the top of every ownership question, so a test can
+    /// change the catching-up marker in the middle of a pass.
+    #[cfg(test)]
+    ask_hook: Option<std::sync::Arc<dyn Fn() + Send + Sync>>,
 }
 
 impl Owners {
     /// With clustering (`Some`) or without (`None`, which owns everything).
     pub fn over(me: NodeId, members: Option<kimmy_cluster::Members>) -> Self {
-        Self { me, view: members.map_or(View::Alone, View::Members), expiry_off: false, gate: None }
+        Self {
+            me,
+            view: members.map_or(View::Alone, View::Members),
+            expiry_off: false,
+            gate: None,
+            #[cfg(test)]
+            ask_hook: None,
+        }
     }
 
     /// Over a fixed live set and nothing said by anyone, as ownership was before
     /// members said anything.
     pub fn over_set(me: NodeId, live: BTreeSet<NodeId>) -> Self {
-        Self { me, view: View::Set(live), expiry_off: false, gate: None }
+        Self {
+            me,
+            view: View::Set(live),
+            expiry_off: false,
+            gate: None,
+            #[cfg(test)]
+            ask_hook: None,
+        }
     }
 
     /// The same view, for a member whose expiry is switched off: it is never a
@@ -225,12 +243,26 @@ impl Owners {
         self
     }
 
-    fn gated(&self) -> bool {
+    /// Whether this member's catching-up marker is set, so that it owns nothing
+    /// because it knows nothing, not because the work belongs to others.
+    pub(crate) fn gated(&self) -> bool {
         self.gate.as_ref().is_some_and(|catch_up| catch_up.is_set())
     }
 
+    /// This member's own block **with the effective yield bits** (ADR-213): a
+    /// class it advertises as yielded still counts as owned by this member until
+    /// every live peer has echoed the generation that set the bit and the live set
+    /// has held still for a lease. The block peers read is `local_facts`; this is
+    /// what `me` is judged by.
     fn mine(&self, members: &kimmy_cluster::Members) -> std::sync::Arc<kimmy_cluster::Facts> {
-        members.local_facts().map(|(facts, _)| facts).unwrap_or_default()
+        members.local_facts_effective().unwrap_or_default()
+    }
+
+    /// Call `hook` at the top of every ownership question (tests only).
+    #[cfg(test)]
+    pub(crate) fn with_ask_hook(mut self, hook: impl Fn() + Send + Sync + 'static) -> Self {
+        self.ask_hook = Some(std::sync::Arc::new(hook));
+        self
     }
 
     fn owns(
@@ -240,6 +272,10 @@ impl Owners {
         collection: Option<kimmy_core::CollectionId>,
         holds_ttl: bool,
     ) -> bool {
+        #[cfg(test)]
+        if let Some(hook) = &self.ask_hook {
+            hook();
+        }
         if self.gated() {
             return false;
         }
@@ -571,20 +607,33 @@ mod tests {
         }
     }
 
-    /// Without clustering, or with a member set nobody has spoken in, ownership
-    /// is what it was.
+    /// Without clustering this node owns everything. With a member set nobody has
+    /// spoken in, **it owns everything too**: a peer this member holds no block from
+    /// is not a candidate (ADR-213), so until the peers have been heard this member
+    /// owns their share as well (duplicates, never a gap); once they have, ownership
+    /// is what the bare set says.
     #[test]
-    fn with_no_clustering_this_node_owns_everything_and_unheard_peers_count_as_before() {
+    fn with_no_clustering_this_node_owns_everything_and_unheard_peers_are_no_candidates() {
         let alone = Owners::over(node(1), None);
         assert!(alone.owns_subscription("wh_a") && alone.owns_embedding("db/c"));
-        // Peers that have said nothing (older builds): as the bare set did.
         let members_set = members(&[2, 3]);
         let unheard = Members::default();
         for n in [2u8, 3] {
             unheard.insert_for_test(addr(n), node(n));
         }
-        let with_facts = Owners::over(node(1), Some(unheard));
+        let with_facts = Owners::over(node(1), Some(unheard.clone()));
         let bare = Owners::over_set(node(1), members_set);
+        for i in 0..40 {
+            let id = format!("wh_{i}");
+            assert!(with_facts.owns_subscription(&id), "{id}: nobody else has been heard");
+            assert!(with_facts.owns_embedding(&format!("db/c{i}")));
+        }
+        // Heard, they are candidates again, and ownership is the bare set's.
+        for n in [2u8, 3] {
+            unheard.record_peer_facts_for_test(node(n), block(), std::time::Duration::ZERO);
+        }
+        let split = (0..40).filter(|i| !with_facts.owns_subscription(&format!("wh_{i}"))).count();
+        assert!(split > 0, "the peers took their share");
         for i in 0..40 {
             let id = format!("wh_{i}");
             assert_eq!(with_facts.owns_subscription(&id), bare.owns_subscription(&id), "{id}");

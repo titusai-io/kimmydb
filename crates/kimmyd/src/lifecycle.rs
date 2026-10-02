@@ -62,6 +62,12 @@ pub const LAST_EXIT_FILE: &str = "kimmy.last-exit";
 /// Where a start keeps the marker it read until it is serving.
 pub const PREVIOUS_FILE: &str = "kimmy.last-exit.previous";
 
+/// Filename of the record a start leaves when it reaches serving, beside
+/// [`LAST_EXIT_FILE`] (ADR-213). **Advisory**: a build that predates it never
+/// reads, rewrites or removes it, and a missing, torn or unparsable one makes
+/// probation's short-run and second-end conditions false, the safe direction.
+pub const LAST_START_FILE: &str = "kimmy.last-start";
+
 /// How a run ended, as it says of itself.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -244,6 +250,73 @@ pub fn settle(data_dir: &Path) {
         Ok(()) => {}
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
         Err(e) => warn!(error = %e, "could not remove the previous run's exit marker"),
+    }
+}
+
+/// What a start leaves when it reaches serving: the next start reads it to judge
+/// whether the run was short (`at_ms` to its own start) and whether this start
+/// itself followed a non-clean end (`inherited`) (ADR-213).
+///
+/// TOML, as the exit marker is. `written_by` is the build version, the same string
+/// as the store's format sidecar's `written_by`: a next start uses the record only
+/// when the two agree, because a build that predates the file never rewrites it,
+/// so after a rollback and a roll forward it describes a run two binaries ago.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LastStart {
+    /// This process's random boot id, as hex.
+    pub boot: String,
+    /// Milliseconds since the Unix epoch when serving began.
+    pub at_ms: u64,
+    pub version: String,
+    /// The verdict this run started with: an exit name, `unclean`, `unreadable` or
+    /// `first_start`.
+    pub inherited: String,
+    pub written_by: String,
+}
+
+/// Read the previous start's record, if it is there and parses.
+pub fn read_last_start(data_dir: &Path) -> Option<LastStart> {
+    let body = std::fs::read_to_string(data_dir.join(LAST_START_FILE)).ok()?;
+    toml::from_str(&body).ok()
+}
+
+/// Record that this start reached serving. Best effort, and said so: a record that
+/// cannot be written costs the next start two probation conditions, both on the
+/// side of not starting probation. Written to a temporary named for this process,
+/// synced, and renamed; the directory is not synced, since a lost file is the safe
+/// direction.
+pub fn record_start(data_dir: &Path, boot: &str, inherited: &str) {
+    use std::io::Write;
+    let at_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_millis() as u64);
+    let record = LastStart {
+        boot: boot.to_string(),
+        at_ms,
+        version: kimmy_core::build::VERSION.to_string(),
+        inherited: inherited.to_string(),
+        written_by: kimmy_core::build::VERSION.to_string(),
+    };
+    let body = match toml::to_string(&record) {
+        Ok(body) => body,
+        Err(e) => {
+            warn!(error = %e, "could not encode the start record");
+            return;
+        }
+    };
+    let temp = data_dir.join(format!("{LAST_START_FILE}.tmp.{}", std::process::id()));
+    let written = (|| {
+        let mut file = std::fs::File::create(&temp)?;
+        file.write_all(body.as_bytes())?;
+        file.sync_all()?;
+        std::fs::rename(&temp, data_dir.join(LAST_START_FILE))
+    })();
+    if let Err(e) = written {
+        let _ = std::fs::remove_file(&temp);
+        warn!(
+            error = %e,
+            "could not write the start record; the next start cannot measure this run's length"
+        );
     }
 }
 
@@ -476,11 +549,13 @@ fn sync(file: &std::io::Result<std::fs::File>) -> std::io::Result<()> {
 /// too, and it is kept: harmless, since nothing reads it and this run's own
 /// marker write truncates and renames that same file.
 fn remove_stale_temporaries(data_dir: &Path) {
-    let prefix = format!("{LAST_EXIT_FILE}.tmp.");
+    // The start record's temporaries go by the same rule (ADR-213).
+    let prefixes = [format!("{LAST_EXIT_FILE}.tmp."), format!("{LAST_START_FILE}.tmp.")];
     if let Ok(entries) = std::fs::read_dir(data_dir) {
         for entry in entries.flatten() {
             let file_name = entry.file_name();
-            let Some(pid) = file_name.to_string_lossy().strip_prefix(&prefix).map(str::to_owned)
+            let name = file_name.to_string_lossy();
+            let Some(pid) = prefixes.iter().find_map(|prefix| name.strip_prefix(prefix.as_str()))
             else {
                 continue;
             };
@@ -814,9 +889,18 @@ mod tests {
             .path()
             .join(format!("{LAST_EXIT_FILE}.tmp.{}", std::os::unix::process::parent_id()));
         std::fs::write(&live, "exit = \"shutdown\"\n").unwrap();
+        // The start record's temporaries go by the same rule (ADR-213).
+        let stale_start = dir.path().join(format!("{LAST_START_FILE}.tmp.{}", i32::MAX));
+        std::fs::write(&stale_start, "at_ms = 1\n").unwrap();
+        let live_start = dir
+            .path()
+            .join(format!("{LAST_START_FILE}.tmp.{}", std::os::unix::process::parent_id()));
+        std::fs::write(&live_start, "at_ms = 1\n").unwrap();
         assert!(matches!(previous_run(dir.path(), &db), PreviousRun::Unclean { .. }));
         assert!(!stale.exists());
         assert!(live.exists(), "a running writer's temporary is kept");
+        assert!(!stale_start.exists(), "a dead process's start-record temporary is removed");
+        assert!(live_start.exists(), "a running writer's start-record temporary is kept");
     }
 
     fn dir_with_database() -> (tempfile::TempDir, std::path::PathBuf) {

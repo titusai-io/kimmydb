@@ -683,13 +683,20 @@ paths:
             application/json:
               schema:
                 type: object
-                required: [nodes, count]
+                required: [nodes, count, view]
                 properties:
                   nodes:
                     type: array
                     items: { $ref: "#/components/schemas/Node" }
                   count:
                     type: integer
+                  view:
+                    type: string
+                    description: |
+                      The id of the node that answered, whose eyes `yielding`
+                      and `classState` are. Every member reports what **it**
+                      sees of each node, from the blocks it holds, and views
+                      differ while blocks converge (ADR-213).
         "400": { $ref: "#/components/responses/BadRequest" }
         "401": { $ref: "#/components/responses/Unauthorized" }
 
@@ -3414,6 +3421,41 @@ components:
             - type: string
               enum: [seeded_empty, restored, snapshot, unknown]
             - type: boolean
+        yielding:
+          type: array
+          items:
+            type: string
+            enum: [ttl, webhooks, embeddings]
+          description: |
+            The classes of owned work this node yields (ADR-213), as the
+            answering node (`view`) sees it: for the answering node's own entry,
+            what its evaluator last decided; for a peer, what its last block
+            said. Present only when the answering node has something to say,
+            which is its own entry once its evaluator runs, and a peer it holds
+            a block from. Advertised, not effective: a member keeps owning a
+            class it yields until every live peer has echoed the block that says
+            so. An older build's peer has no block fields, so this is `[]` for it.
+        classState:
+          type: object
+          description: |
+            How each class of owned work stands on this node, as the answering
+            node sees it (ADR-213). Present only with a block that carries it,
+            so absent for an older build's peer: that peer is not a target for a
+            yield. A class the block does not name reads `unknown`, never `idle`.
+          required: [ttl, webhooks, embeddings]
+          properties:
+            ttl: { $ref: "#/components/schemas/ClassState" }
+            webhooks: { $ref: "#/components/schemas/ClassState" }
+            embeddings: { $ref: "#/components/schemas/ClassState" }
+
+    ClassState:
+      type: string
+      enum: [ok, idle, suspect, stalled, unknown]
+      description: |
+        `ok`: owns work in the class and does it. `idle`: owns none, nothing
+        wrong. `suspect`: bad evidence now, not enough to yield: out of target
+        eligibility at once. `stalled`: enough bad evidence to yield the class.
+        `unknown`: said nothing usable, or an evaluator that stopped ticking.
 
     Token:
       type: object

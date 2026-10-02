@@ -33,6 +33,20 @@ finds nothing to repair.
 Usage:
     scripts/stop-matrix.py --baseline-bin PATH --head-bin PATH [--trials N]
 
+`--yield-half {target,peer}` (ADR-213) makes the head build's odd-indexed trials
+yield: one member's expiry task is wedged with `KIMMY_TEST_KILL_TASK=ttl_expiry:stall`
+at `KIMMY_TEST_YIELD_SCALE=5`, and the trial waits for that member's
+`kimmy_yielding{class="ttl"}` to read 1 **and** `kimmy_yield_unconfirmed_peers{class="ttl"}`
+to read 0 (every live peer has echoed the yield, so the member has stopped owning)
+before the load and the offset start, so the signal lands on a cluster where the
+yield is in force and not merely advertised. `target` wedges the member that
+is then signalled (its stop has to end a stalled task and an evaluator), `peer` the
+third member (the stopped member's pulls and pushes meet a yielded peer). Head only,
+because the baseline has no yielding to arm, and a yield that never takes effect
+within 120 s fails the run: it is not a stop result. The pairing, the offsets and the
+three paired tests are unchanged, so the head's yielded trials are compared with the
+baseline's un-yielded ones on the same offsets.
+
 Each binary must be a `--release` build of `kimmyd`:
 
     git worktree add /tmp/kimmydb-v0410-baseline v0.41.0
@@ -128,6 +142,12 @@ EXCESS_COUNT_MIN = 3
 # way, a reset was underway close enough to the signal to be relevant to
 # the stop this trial is timing.
 RESET_LOG_MARKER = "reset tick starting"
+# ADR-213: a yielded member, in the trials that ask for one. The head build only:
+# the baseline has no yielding to arm. `ttl_expiry:stall` wedges that member's
+# expiry task, and at scale 5 the evaluator judges it stalled in about 17 s and the
+# yield is effective, once every peer has echoed it, in about 15 s more.
+YIELD_ENV = {"KIMMY_TEST_YIELD_SCALE": "5", "KIMMY_TEST_KILL_TASK": "ttl_expiry:stall"}
+YIELD_WAIT_S = 120
 RESET_LOG_TARGET = "kimmy_cluster::peers=debug"
 
 
@@ -147,6 +167,22 @@ def http(method, url, body=None, token=None, timeout=5):
         req.add_header("Authorization", f"Bearer {token}")
     with urllib.request.urlopen(req, timeout=timeout) as r:
         return json.loads(r.read())
+
+
+def yield_effective(node):
+    """Whether `node`'s yield of its expiry is **in force**, not only advertised
+    (`/metrics` is open): the bit is set, and every live peer has echoed it, which
+    is what `kimmy_yield_unconfirmed_peers` counting 0 says. Until then the member
+    keeps owning the class."""
+    try:
+        with urllib.request.urlopen(node.url("/metrics"), timeout=2) as r:
+            body = r.read().decode()
+    except Exception:
+        return False
+    return (
+        'kimmy_yielding{class="ttl"} 1' in body
+        and 'kimmy_yield_unconfirmed_peers{class="ttl"} 0' in body
+    )
 
 
 class Node:
@@ -281,7 +317,7 @@ def background_writers(node, token, stop_event):
         time.sleep(0.05)
 
 
-def run_trial(binary, target, index, offset_s, walk_row_ms, serve_walk_ms, seed_batches, trial_label):
+def run_trial(binary, target, index, offset_s, walk_row_ms, serve_walk_ms, seed_batches, trial_label, yielded=None):
     """target: 'requester' (signals b) or 'server' (signals a). `index` is
     this trial's position within its (target, build) group -- with a
     shared seed, the same (target, index) pair draws the same offset on
@@ -299,6 +335,8 @@ def run_trial(binary, target, index, offset_s, walk_row_ms, serve_walk_ms, seed_
         "target": target,
         "index": index,
         "offset_s": round(offset_s, 3),
+        "yielded": yielded,
+        "yield_effective_s": None,
     }
     try:
         a_env = {
@@ -307,7 +345,13 @@ def run_trial(binary, target, index, offset_s, walk_row_ms, serve_walk_ms, seed_
         }
         for i in range(3):
             seeds = [cluster_ports[j] for j in range(3) if j != i]
-            extra = a_env if names[i] == "a" else None
+            extra = dict(a_env) if names[i] == "a" else {}
+            # The member that yields: the one about to be signalled, or the third.
+            if yielded == "target" and i == (1 if target == "requester" else 0):
+                extra.update(YIELD_ENV)
+            if yielded == "peer" and names[i] == "c":
+                extra.update(YIELD_ENV)
+            extra = extra or None
             n = Node(binary, names[i], http_ports[i], cluster_ports[i], seeds, sync_interval_secs=2, extra_env=extra)
             nodes.append(n)
         a, b, c = nodes
@@ -329,6 +373,22 @@ def run_trial(binary, target, index, offset_s, walk_row_ms, serve_walk_ms, seed_
         for batch in range(seed_batches):
             docs = [{"_id": f"seed-{batch}-{i}"} for i in range(50)]
             http("POST", a.url("/v1/db/shop/coll/orders/bulk"), docs, token)
+
+        # A trial that asks for a yield waits for it to be effective before any load
+        # or offset starts, so the signal lands on a cluster where the yield is
+        # already in force. A yield that never takes effect is a failed trial, not
+        # a stop result.
+        if yielded:
+            yielded_node = (
+                nodes[1 if target == "requester" else 0] if yielded == "target" else nodes[2]
+            )
+            waited_from = time.monotonic()
+            while time.monotonic() - waited_from < YIELD_WAIT_S and not yield_effective(yielded_node):
+                time.sleep(0.5)
+            if yield_effective(yielded_node):
+                result["yield_effective_s"] = round(time.monotonic() - waited_from, 1)
+            else:
+                result["yield_never_effective"] = True
 
         # Load on both the member about to be signalled and a third,
         # otherwise idle one: the target's own stop path is what this trial
@@ -416,7 +476,7 @@ def run_trial(binary, target, index, offset_s, walk_row_ms, serve_walk_ms, seed_
     return result
 
 
-def run_paired_matrix(builds, trials, walk_row_ms, serve_walk_ms, seed_batches, seed):
+def run_paired_matrix(builds, trials, walk_row_ms, serve_walk_ms, seed_batches, seed, yield_mode=None):
     """`builds`: [(label, binary), (label, binary)], baseline first. One trial
     per build for each (target, index), run back to back on the same offset,
     the order alternating from one pair to the next, so the host's state at
@@ -434,7 +494,11 @@ def run_paired_matrix(builds, trials, walk_row_ms, serve_walk_ms, seed_batches, 
             for label, binary in order:
                 label_i = f"{label}/{target}/{i}"
                 print(f"  [{label_i}] offset={offset:.2f}s ...", file=sys.stderr, flush=True)
-                r = run_trial(binary, target, i, offset, walk_row_ms, serve_walk_ms, seed_batches, label_i)
+                # Half the trials, the odd indexes, on the head build only.
+                yielded = yield_mode if yield_mode and i % 2 == 1 and label.startswith("head") else None
+                r = run_trial(
+                    binary, target, i, offset, walk_row_ms, serve_walk_ms, seed_batches, label_i, yielded
+                )
                 results[label].append(r)
                 print(
                     f"    exit={r['exit_code']} stop_time={r['stop_time_s']}s "
@@ -462,6 +526,13 @@ def summarize(label, results):
         or r["write_still_in_progress"]
     ]
     dirty_restarts = [r for r in results if r["restart_clean"] is False]
+    yielded = [r for r in results if r.get("yielded")]
+    unyielded = [r for r in yielded if r.get("yield_never_effective")]
+    if yielded:
+        print(f"\n   trials with a yielded member: {len(yielded)}, yield never took effect: {len(unyielded)}")
+        for r in unyielded:
+            print(f"     {r}")
+        bad_exits = bad_exits + unyielded
     worst = max((r["stop_time_s"] for r in results), default=0.0)
     resets = sum(1 for r in results if r["reset_in_progress_at_signal"])
     print(f"\n== {label}: {len(results)} trials, worst stop {worst:.3f}s ==")
@@ -578,6 +649,15 @@ def main():
     p.add_argument(
         "--seed", type=int, default=None, help="offsets' random seed; random and printed if omitted"
     )
+    p.add_argument(
+        "--yield-half",
+        choices=["target", "peer"],
+        default=None,
+        help="in the odd-indexed trials of the head build, wedge one member's expiry task so it "
+        "yields (ADR-213) and wait for the yield to be effective before the load starts: "
+        "`target` yields the member that is then signalled, `peer` the third member. Head "
+        "only, since the baseline has no yielding",
+    )
     p.add_argument("--json-out", help="write the raw per-trial results here as JSON")
     args = p.parse_args()
     if args.seed is None:
@@ -596,6 +676,7 @@ def main():
         args.serve_walk_ms,
         args.seed_batches,
         args.seed,
+        args.yield_half,
     )
 
     worsts = {}
@@ -605,6 +686,15 @@ def main():
         worsts[label] = worst
         if bad_exits or aborted or dirty_restarts:
             failed = True
+
+    # A run that was asked to yield a member and never did has measured nothing of
+    # the yielded half: with `--trials` below 4 the odd-indexed trials do not exist.
+    if args.yield_half and not any(r.get("yielded") for r in all_results.get(head_label, [])):
+        print(
+            "FAIL (no yielded trial): --yield-half was given but no head trial yielded a "
+            "member (the odd-indexed ones do; give --trials of at least 4)"
+        )
+        failed = True
 
     baseline_worst = worsts.get(baseline_label, 0.0)
     head_worst = worsts.get(head_label, 0.0)
@@ -633,6 +723,33 @@ def main():
     for failure in failures:
         print(failure)
     failed = failed or bool(failures)
+
+    # The two halves, each against the same bars as the whole: faster pairs in one
+    # half net against slower pairs in the other in the overall mean and excess count,
+    # so a regression that only the yielded trials (or only the others) show can hide.
+    if args.yield_half:
+        head_results = all_results.get(head_label, [])
+        for name, half in (
+            ("yielded", [r for r in head_results if r.get("yielded")]),
+            ("un-yielded", [r for r in head_results if not r.get("yielded")]),
+        ):
+            print(f"\n-- the {name} half of the head's trials, against the baseline's on the same offsets --")
+            if not half:
+                print(f"   no {name} trials; not judged")
+                continue
+            half_worst, half_mean, half_deltas = pair_and_compare(
+                all_results.get(baseline_label, []), half
+            )
+            print(
+                f"   excess count: {excess_count(half_deltas):+d}, "
+                f"fails at {excess_limit(len(half_deltas))}"
+            )
+            half_failures, half_notes = judge_pairs(half_worst, half_mean, half_deltas)
+            for note in half_notes:
+                print(f"   note: {note}")
+            for failure in half_failures:
+                print(f"{failure} [{name} half]")
+            failed = failed or bool(half_failures)
 
     if args.json_out:
         with open(args.json_out, "w") as f:

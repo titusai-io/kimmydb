@@ -16,8 +16,15 @@ readers.
 ```
 /var/lib/kimmy/
 ├── kimmy.redb        documents, oplog, users, node identity — everything
-└── kimmy.last-exit   how the last run ended; written on the way out, read and
-                      removed by the next start ([Operations](operations.md#what-a-shutdown-logs-and-what-a-start-says-about-the-last-one))
+├── kimmy.format      the schema, the redb version and file format, and the
+│                     version that wrote the store; read before each open
+│                     ([Operations](operations.md#rolling-back-and-kimmyformat))
+├── kimmy.last-exit   how the last run ended; written on the way out, read and
+│                     removed by the next start ([Operations](operations.md#what-a-shutdown-logs-and-what-a-start-says-about-the-last-one))
+└── kimmy.last-start  when the current run reached serving and what verdict it
+                      started from; advisory, read by the next start to judge
+                      probation ([Operations](operations.md#a-member-that-yields-a-class-of-work)),
+                      ignored by 0.43.0
 ```
 
 > Node identity lives **inside** the database file, not beside it. Copying or

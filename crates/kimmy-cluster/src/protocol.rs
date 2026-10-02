@@ -59,6 +59,40 @@ pub const MAX_FRAME: usize = 64 * 1024 * 1024;
 /// not on its own keep a batch inside [`MAX_FRAME`] — see [`Message::BatchTooLarge`].
 pub const MAX_BATCH: usize = 1024;
 
+/// What a member holds of the sender's block (ADR-213): the sender's boot id and
+/// the generation of the block recorded from that boot. **Confirmation is the
+/// reader's**: a member's yield counts as read by a peer only when a frame from
+/// the peer carries an echo naming the member's current boot and a generation at
+/// least the one that set the bit. A member that holds nothing sends an empty
+/// boot and generation zero, which is *echoing, and confirming nothing*; a build
+/// that predates the field sends no echo at all and never confirms.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Echo {
+    #[serde(default, with = "serde_bytes")]
+    pub boot: Vec<u8>,
+    /// A per-process counter: it encodes as BSON `Int64` and never nears
+    /// `i64::MAX`.
+    #[serde(default)]
+    pub generation: u64,
+}
+
+/// A generation on a frame, read leniently: anything but a non-negative integer
+/// is `None`, so a field of another shape costs the field and never the frame.
+fn lenient_generation<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<Option<u64>, D::Error> {
+    crate::facts::lenient_millis(deserializer)
+}
+
+/// An echo, read leniently: one that does not decode is none, which reads as a
+/// peer that does not echo.
+fn lenient_echo<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<Option<Echo>, D::Error> {
+    let raw = Option::<bson::Bson>::deserialize(deserializer)?;
+    Ok(raw.and_then(|raw| bson::deserialize_from_bson::<Echo>(raw).ok()))
+}
+
 /// What one side says to the other.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub enum Message {
@@ -99,6 +133,22 @@ pub enum Message {
             deserialize_with = "crate::facts::lenient"
         )]
         facts: Option<std::sync::Arc<crate::facts::Facts>>,
+        /// The generation of the requester's own block (ADR-213), so the server
+        /// can order blocks from one process. Optional and lenient.
+        #[serde(
+            default,
+            skip_serializing_if = "Option::is_none",
+            deserialize_with = "lenient_generation"
+        )]
+        facts_gen: Option<u64>,
+        /// The server's block as the requester **holds it now** (ADR-213): the
+        /// confirmation of the server's yield, on the serve path.
+        #[serde(
+            default,
+            skip_serializing_if = "Option::is_none",
+            deserialize_with = "lenient_echo"
+        )]
+        echo: Option<Echo>,
     },
     /// The answer: what the receiver can serve.
     Versions(VersionVector),
@@ -120,6 +170,22 @@ pub enum Message {
             deserialize_with = "crate::facts::lenient"
         )]
         facts: Option<std::sync::Arc<crate::facts::Facts>>,
+        /// The generation of the answerer's block in this reply (ADR-213).
+        #[serde(
+            default,
+            skip_serializing_if = "Option::is_none",
+            deserialize_with = "lenient_generation"
+        )]
+        facts_gen: Option<u64>,
+        /// The requester's block as the server **holds it after recording** the
+        /// request's (ADR-213): the confirmation of the requester's yield, on the
+        /// sync path. A reply's `facts_gen` confirms nothing.
+        #[serde(
+            default,
+            skip_serializing_if = "Option::is_none",
+            deserialize_with = "lenient_echo"
+        )]
+        echo: Option<Echo>,
     },
     /// "Send me everything at or after this point."
     ///
@@ -431,17 +497,20 @@ pub async fn read_frame<R: AsyncRead + Unpin>(reader: &mut R) -> Result<Message,
     decode(&read_body(reader).await?)
 }
 
-/// [`read_frame`], and whether this frame carried a `facts` block that did not
-/// decode (ADR-201). The flag is cleared and taken with **no await between**, right
-/// around the decode, so another task decoding on the same thread while this one
-/// waited for its bytes cannot set it: it names this frame's peer or none.
+/// [`read_frame`], whether this frame carried a `facts` block that did not
+/// decode (ADR-201), and the **decode sequence** taken as it decoded (ADR-213).
+/// The flag is cleared and taken with **no await between**, right around the
+/// decode, so another task decoding on the same thread while this one waited for
+/// its bytes cannot set it: it names this frame's peer or none. The sequence
+/// travels with the block to wherever it is recorded, however late.
 pub(crate) async fn read_frame_noting_facts<R: AsyncRead + Unpin>(
     reader: &mut R,
-) -> Result<(Message, bool), ProtocolError> {
+) -> Result<(Message, bool, u64), ProtocolError> {
     let body = read_body(reader).await?;
     crate::facts::take_undecodable();
     let message = decode(&body)?;
-    Ok((message, crate::facts::take_undecodable()))
+    let seq = crate::facts::next_decoded_seq();
+    Ok((message, crate::facts::take_undecodable(), seq))
 }
 
 fn decode(body: &[u8]) -> Result<Message, ProtocolError> {
@@ -701,8 +770,8 @@ mod tests {
     #[tokio::test]
     async fn frames_round_trip() {
         let messages = [
-            Message::AskVersions { witnessed: false, facts: None },
-            Message::AskVersions { witnessed: true, facts: None },
+            Message::AskVersions { witnessed: false, facts: None, facts_gen: None, echo: None },
+            Message::AskVersions { witnessed: true, facts: None, facts_gen: None, echo: None },
             Message::AskEntries {
                 from: Hlc::new(7, 1),
                 limit: 10,
@@ -733,6 +802,8 @@ mod tests {
                 servable: populated_vector(),
                 witnessed: populated_vector(),
                 facts: None,
+                facts_gen: None,
+                echo: None,
             },
             Message::Entries {
                 entries: Vec::new(),
@@ -816,9 +887,12 @@ mod tests {
         // The length prefix is what separates them; without it the second read
         // would consume the tail of the first message.
         let mut buffer = Vec::new();
-        write_frame(&mut buffer, &Message::AskVersions { witnessed: false, facts: None })
-            .await
-            .unwrap();
+        write_frame(
+            &mut buffer,
+            &Message::AskVersions { witnessed: false, facts: None, facts_gen: None, echo: None },
+        )
+        .await
+        .unwrap();
         write_frame(
             &mut buffer,
             &Message::AskEntries {
@@ -835,7 +909,7 @@ mod tests {
         let mut stream = buffer.as_slice();
         assert_eq!(
             read_frame(&mut stream).await.unwrap(),
-            Message::AskVersions { witnessed: false, facts: None }
+            Message::AskVersions { witnessed: false, facts: None, facts_gen: None, echo: None }
         );
         assert_eq!(
             read_frame(&mut stream).await.unwrap(),
@@ -1188,23 +1262,26 @@ mod tests {
         let old_request = frame(bson::doc! { "AskVersions": {} });
         assert_eq!(
             read_frame(&mut old_request.as_slice()).await.unwrap(),
-            Message::AskVersions { witnessed: false, facts: None },
+            Message::AskVersions { witnessed: false, facts: None, facts_gen: None, echo: None },
             "a request without the field must read as one that did not ask"
         );
 
         let future = frame(bson::doc! { "AskVersions": { "somethingNewer": true } });
         assert_eq!(
             read_frame(&mut future.as_slice()).await.unwrap(),
-            Message::AskVersions { witnessed: false, facts: None },
+            Message::AskVersions { witnessed: false, facts: None, facts_gen: None, echo: None },
             "a field this build does not know must not fail the frame"
         );
 
         // And the frame this build writes when it asks is exactly the shape
         // an old receiver is handed above: an unknown field on `AskVersions`.
         let mut asked = Vec::new();
-        write_frame(&mut asked, &Message::AskVersions { witnessed: true, facts: None })
-            .await
-            .unwrap();
+        write_frame(
+            &mut asked,
+            &Message::AskVersions { witnessed: true, facts: None, facts_gen: None, echo: None },
+        )
+        .await
+        .unwrap();
         let body = bson::deserialize_from_slice::<bson::Document>(&asked[4..]).unwrap();
         assert_eq!(body, bson::doc! { "AskVersions": { "witnessed": true } });
     }
@@ -1233,7 +1310,7 @@ mod tests {
         let (mut waiting_end, mut waiting_writer) = tokio::io::duplex(4096);
         // The first task reads and has nothing yet: it is parked on its bytes.
         let waiting = tokio::spawn(async move {
-            read_frame_noting_facts(&mut waiting_end).await.map(|(_, flagged)| flagged)
+            read_frame_noting_facts(&mut waiting_end).await.map(|(_, flagged, _)| flagged)
         });
         tokio::task::yield_now().await;
 
@@ -1288,11 +1365,15 @@ mod tests {
             Message::AskVersions {
                 witnessed: true,
                 facts: Some(std::sync::Arc::new(facts.clone())),
+                facts_gen: None,
+                echo: None,
             },
             Message::Vectors {
                 servable: populated_vector(),
                 witnessed: populated_vector(),
                 facts: Some(std::sync::Arc::new(facts.clone())),
+                facts_gen: None,
+                echo: None,
             },
         ] {
             let mut written = Vec::new();
@@ -1318,7 +1399,7 @@ mod tests {
         let old_ask = frame(bson::doc! { "AskVersions": { "witnessed": true } });
         assert_eq!(
             read_frame(&mut old_ask.as_slice()).await.unwrap(),
-            Message::AskVersions { witnessed: true, facts: None }
+            Message::AskVersions { witnessed: true, facts: None, facts_gen: None, echo: None }
         );
 
         // A block from a build with fewer fields, on the wire in a reply.
@@ -1364,6 +1445,8 @@ mod tests {
             servable: populated_vector(),
             witnessed: populated_vector(),
             facts: Some(std::sync::Arc::new(facts)),
+            facts_gen: None,
+            echo: None,
         };
         write_frame(&mut wire, &full).await.unwrap();
         assert_eq!(read_frame(&mut wire.as_slice()).await.unwrap(), full);
@@ -1374,6 +1457,8 @@ mod tests {
                 servable: populated_vector(),
                 witnessed: populated_vector(),
                 facts: None,
+                facts_gen: None,
+                echo: None,
             },
         )
         .await
@@ -1381,9 +1466,12 @@ mod tests {
         let body = bson::deserialize_from_slice::<bson::Document>(&bare[4..]).unwrap();
         assert!(!body.get_document("Vectors").unwrap().contains_key("facts"));
         let mut ask = Vec::new();
-        write_frame(&mut ask, &Message::AskVersions { witnessed: true, facts: None })
-            .await
-            .unwrap();
+        write_frame(
+            &mut ask,
+            &Message::AskVersions { witnessed: true, facts: None, facts_gen: None, echo: None },
+        )
+        .await
+        .unwrap();
         let body = bson::deserialize_from_slice::<bson::Document>(&ask[4..]).unwrap();
         assert!(!body.get_document("AskVersions").unwrap().contains_key("facts"));
     }

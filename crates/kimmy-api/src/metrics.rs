@@ -16,8 +16,8 @@
 //! replication lag is **pushed here by the replication loop**, which is the
 //! only place a peer's version vector exists.
 
-use std::sync::OnceLock;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, OnceLock};
 use std::time::Instant;
 
 /// Upper bounds of `kimmy_backup_duration_seconds`, in microseconds (ADR-170).
@@ -154,7 +154,7 @@ pub struct StorageReadings {
 pub struct OwnershipReading {
     /// Live peers by [`kimmy_cluster::PeerState`], in `PeerState::ALL` order.
     pub peers: [u64; kimmy_cluster::PeerState::ALL.len()],
-    /// Live peers that have not read this member's block, per class, while it
+    /// Live peers that have not echoed this member's block, per class, while it
     /// yields the class, in `OwnerClass::ALL` order.
     pub unconfirmed: [u64; kimmy_cluster::OwnerClass::ALL.len()],
     /// Blocks that arrived and did not decode, since start.
@@ -165,6 +165,43 @@ pub struct OwnershipReading {
     /// This member's catching-up state (ADR-202): an index into
     /// [`kimmy_cluster::catchup::STATES`]; 0 is `none`.
     pub catching_up: usize,
+    /// What the yield evaluator last decided (ADR-213).
+    pub evaluator: YieldReading,
+}
+
+/// The classes' states, in the order the series renders them; `unknown` is not a
+/// series (an evaluator that stopped ticking is told by its age).
+pub const YIELD_STATES: [&str; 4] = ["ok", "idle", "suspect", "stalled"];
+/// Why a class is `stalled`, in the order the series renders them.
+pub const YIELD_CAUSES: [&str; 3] = ["local", "runtime", "probation"];
+/// What a fault counted against a class was.
+pub const YIELD_FAULT_KINDS: [&str; 3] = ["local", "remote", "config"];
+
+/// What the yield evaluator last decided, and what the classes counted, read at
+/// the scrape (ADR-213). Indexed by class in `OwnerClass::ALL` order.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct YieldReading {
+    /// An index into [`YIELD_STATES`], or 4 for `unknown`.
+    pub state: [usize; 3],
+    /// 0 for none, else 1 + an index into [`YIELD_CAUSES`].
+    pub cause: [usize; 3],
+    /// The advertised yield bits.
+    pub yielding: [bool; 3],
+    pub owned: [u64; 3],
+    /// Per class, by [`YIELD_FAULT_KINDS`].
+    pub faults: [[u64; 3]; 3],
+    /// Per class, by direction: yield, reclaim, withdraw.
+    pub transitions: [[u64; 3]; 3],
+    /// Per class, by suppression reason: switched_off, shared_fault, no_target, cap.
+    pub suppressed: [[bool; 4]; 3],
+    /// Per class, by verdict: good, bad, idle, neutral, void.
+    pub observations: [[u64; 5]; 3],
+    pub ticks: u64,
+    pub responsive: bool,
+    /// `KIMMY_OWNERSHIP_YIELD` is not `off`.
+    pub enabled: bool,
+    /// This start began in probation.
+    pub probation: bool,
 }
 
 /// The background writers behind the page's measured gauges, each with a
@@ -175,10 +212,19 @@ pub struct OwnershipReading {
 /// is left here are values only a background pass can know: the replication
 /// loop's lag, backoff and divergence figures, the stall probe's lateness, the
 /// dispatcher's backlog, and the embedding worker's work. Every name is a
-/// `kimmy_task::TASKS` entry, which `every_progress_writer_is_a_supervised_task`
-/// holds.
-pub const PROGRESS_WRITERS: [&str; 5] =
-    ["drop_purger", "embedding_worker", "replication", "stall_probe", "webhook_dispatcher"];
+/// `kimmy_task::TASKS` entry or `THREADS` entry (`yield_evaluator` is a thread),
+/// which `every_progress_writer_is_a_supervised_task_or_thread` holds. The ttl pass is read
+/// from its class cell's last beat and the evaluator from its last tick, not from
+/// a mark a writer sets (ADR-213, amending ADR-187).
+pub const PROGRESS_WRITERS: [&str; 7] = [
+    "drop_purger",
+    "embedding_worker",
+    "replication",
+    "stall_probe",
+    "ttl_expiry",
+    "webhook_dispatcher",
+    "yield_evaluator",
+];
 
 /// Where `writer` sits in [`PROGRESS_WRITERS`], and so in every array ordered
 /// by it. Read by name, so that a writer added to the list cannot move a
@@ -562,6 +608,11 @@ pub struct Metrics {
     /// until then, so a render with no startup behind it — a test — has
     /// every row.
     progress_writers: OnceLock<Vec<&'static str>>,
+    /// The yield evaluator's marks of the runtime probe: its subject, atomics
+    /// only (ADR-213).
+    probe_marks: Arc<kimmy_cluster::yielding::ProbeMarks>,
+    /// The evaluator's read side, once the daemon has started it.
+    yield_handle: OnceLock<Arc<crate::yielding::YieldHandle>>,
     tls_reloads_ok: AtomicU64,
     tls_reloads_failed: AtomicU64,
     jwks_refresh_ok: AtomicU64,
@@ -634,6 +685,8 @@ impl Default for Metrics {
             dispatcher_progress: parking_lot::Mutex::new(None),
             replication_progress: parking_lot::Mutex::new(None),
             progress_writers: OnceLock::new(),
+            probe_marks: Arc::default(),
+            yield_handle: OnceLock::new(),
             tls_reloads_ok: AtomicU64::new(0),
             tls_reloads_failed: AtomicU64::new(0),
             jwks_refresh_ok: AtomicU64::new(0),
@@ -1049,6 +1102,14 @@ impl Metrics {
                 "replication" => *self.replication_progress.lock(),
                 "stall_probe" => *self.stall_probe_progress.lock(),
                 "webhook_dispatcher" => *self.dispatcher_progress.lock(),
+                // Read from the class cell and the evaluator's last tick, which
+                // the cell and the evaluator keep: no second mark to forget.
+                "ttl_expiry" => {
+                    self.yield_handle.get().and_then(|h| now.checked_sub(h.ttl_beat_age()))
+                }
+                "yield_evaluator" => {
+                    self.yield_handle.get().and_then(|h| now.checked_sub(h.evaluator_age()))
+                }
                 _ => unreachable!("every progress writer has a source"),
             };
             self.runs(writer).then(|| self.age_at(last, now))
@@ -1066,7 +1127,24 @@ impl Metrics {
         let us = u64::try_from(late.as_micros()).unwrap_or(u64::MAX);
         self.runtime_stall_us.fetch_max(us, Ordering::Relaxed);
         self.runtime_stall_otlp_us.fetch_max(us, Ordering::Relaxed);
+        // The evaluator's own mark: atomics, read without a lock (ADR-213).
+        self.probe_marks.record(late);
         *self.stall_probe_progress.lock() = Some(Instant::now());
+    }
+
+    /// The probe's marks the yield evaluator reads.
+    pub fn probe_marks(&self) -> Arc<kimmy_cluster::yielding::ProbeMarks> {
+        Arc::clone(&self.probe_marks)
+    }
+
+    /// Hand the metrics the yield evaluator's read side. Once.
+    pub fn set_yield_handle(&self, handle: Arc<crate::yielding::YieldHandle>) {
+        let _ = self.yield_handle.set(handle);
+    }
+
+    /// The yield evaluator's read side, once the daemon has started it.
+    pub fn yield_handle(&self) -> Option<&Arc<crate::yielding::YieldHandle>> {
+        self.yield_handle.get()
     }
 
     /// The worst runtime stall since the last call, in seconds.
@@ -2001,7 +2079,7 @@ fn render_ownership(out: &mut String, ownership: &OwnershipReading) {
 
     let _ = writeln!(
         out,
-        "# HELP kimmy_ownership_peers Live peers by how this member sees them: eligible to own work by the block they last sent (within its lease); ineligible_catching_up (the catching-up marker is set, which no class overrides); ineligible_yielding (at least one class given up); unknown (no block yet: an older version, or one not yet heard); stale (a block past its lease with no fresh one, which keeps saying what it last said). Each member reports its own view, and views differ while blocks converge.\n\
+        "# HELP kimmy_ownership_peers Live peers by how this member sees them: eligible to own work by the block they last sent (within its lease); ineligible_catching_up (the catching-up marker is set, which no class overrides); ineligible_yielding (at least one class given up); unknown (no block held from the peer's current process: an older version, one not yet heard, or one this member dropped on SWIM down or its own rejoin; an unknown peer is no longer a candidate for webhooks or embeddings); stale (a block past its lease with no fresh one, which keeps saying what it last said). Each member reports its own view, and views differ while blocks converge.\n\
          # TYPE kimmy_ownership_peers gauge"
     );
     for state in kimmy_cluster::PeerState::ALL {
@@ -2014,7 +2092,7 @@ fn render_ownership(out: &mut String, ownership: &OwnershipReading) {
     }
     let _ = writeln!(
         out,
-        "# HELP kimmy_yield_unconfirmed_peers Live peers that have not read this member's current block while it yields the class. A member that yields a class keeps owning it until every live peer has read the block that says so; a peer that never does keeps it owning, and is named in a WARN. Always 0 while no class yields.\n\
+        "# HELP kimmy_yield_unconfirmed_peers Live peers that have not confirmed this member's yield of the class: those that do not echo the block back (an older version never does) and those whose echo is below the generation that set the bit. A member that yields a class keeps owning it until every live peer has echoed the block that says so and the live set has held still for a lease; a peer that never does keeps it owning, and is named in a WARN. Always 0 while no class yields.\n\
          # TYPE kimmy_yield_unconfirmed_peers gauge"
     );
     for class in kimmy_cluster::OwnerClass::ALL {
@@ -2025,6 +2103,7 @@ fn render_ownership(out: &mut String, ownership: &OwnershipReading) {
             ownership.unconfirmed[class as usize]
         );
     }
+    render_yield(out, &ownership.evaluator);
     let _ = writeln!(
         out,
         "# HELP kimmy_ownership_facts_undecodable_total Blocks a peer sent about itself that did not decode and were treated as none. A peer whose blocks never decode looks exactly like an older version that sends none, so this and the WARN naming the peer are how they are told apart. Should stay 0.\n\
@@ -2113,6 +2192,148 @@ fn render_sync_serve(out: &mut String, serve: &kimmy_storage::ServeSnapshot) {
             );
         }
     }
+}
+
+/// The yield evaluator's series (ADR-213), every one always rendered.
+fn render_yield(out: &mut String, y: &YieldReading) {
+    use std::fmt::Write;
+    let classes = kimmy_cluster::OwnerClass::ALL;
+    let _ = writeln!(
+        out,
+        "# HELP kimmy_owner_class_state How this member's own class of owned work stands, one-hot over ok (owns work in the class and does it), idle (owns none, nothing wrong), suspect (bad evidence now, not yet enough to yield: out of target eligibility at once) and stalled (enough bad evidence to yield it, by its cause: local for an overdue class or failing cycles, runtime for the runtime's stalls, probation for a start after an unclean end). Only the stalled series carries a cause label. The state last decided, not read at the scrape: kimmy_task_progress_age_seconds{{task=\"yield_evaluator\"}} says how old that is.\n\
+         # TYPE kimmy_owner_class_state gauge"
+    );
+    for (i, class) in classes.into_iter().enumerate() {
+        for (slot, state) in YIELD_STATES.iter().enumerate().take(3) {
+            let _ = writeln!(
+                out,
+                "kimmy_owner_class_state{{class=\"{}\",state=\"{state}\"}} {}",
+                class.label(),
+                u8::from(y.state[i] == slot)
+            );
+        }
+        for (cause_slot, cause) in YIELD_CAUSES.iter().enumerate() {
+            let _ = writeln!(
+                out,
+                "kimmy_owner_class_state{{class=\"{}\",state=\"stalled\",cause=\"{cause}\"}} {}",
+                class.label(),
+                u8::from(y.state[i] == 3 && y.cause[i] == cause_slot + 1)
+            );
+        }
+    }
+    let _ = writeln!(
+        out,
+        "# HELP kimmy_owner_class_owned Items of the class this member owned at its last owner check: owned non-invalidated subscriptions, owned embedding collections, TTL collections it expires. 0 while the class is yielded or gated, and the last value it had while its task is stuck (a stalled class does not update it). Read it beside the state: a negative test that nothing owned work proves nothing. For embeddings the count is set by the worker's loop, so while a provider call is held it lags until the call ends; the class is judged by its heartbeat meanwhile.\n\
+         # TYPE kimmy_owner_class_owned gauge"
+    );
+    for (i, class) in classes.into_iter().enumerate() {
+        let _ =
+            writeln!(out, "kimmy_owner_class_owned{{class=\"{}\"}} {}", class.label(), y.owned[i]);
+    }
+    let _ = writeln!(
+        out,
+        "# HELP kimmy_yielding Whether this member advertises that it yields the class (0 or 1): the bit its peers read. Advertised, not effective: this member keeps owning the class until every live peer has echoed the block that says so, which kimmy_yield_unconfirmed_peers counts.\n\
+         # TYPE kimmy_yielding gauge"
+    );
+    for (i, class) in classes.into_iter().enumerate() {
+        let _ = writeln!(
+            out,
+            "kimmy_yielding{{class=\"{}\"}} {}",
+            class.label(),
+            u8::from(y.yielding[i])
+        );
+    }
+    let _ = writeln!(
+        out,
+        "# HELP kimmy_yield_transitions_total Times this member changed what it yields: yield (set the bit), reclaim (took the class back after good ticks) and withdraw (took it back while still stalled, for the shared-fault latch or the tie-break). A fault that follows the data costs one yield and one withdraw, then today's behaviour.\n\
+         # TYPE kimmy_yield_transitions_total counter"
+    );
+    for (i, class) in classes.into_iter().enumerate() {
+        for direction in kimmy_cluster::yielding::Direction::ALL {
+            let _ = writeln!(
+                out,
+                "kimmy_yield_transitions_total{{class=\"{}\",direction=\"{}\"}} {}",
+                class.label(),
+                direction.label(),
+                y.transitions[i][direction as usize]
+            );
+        }
+    }
+    let _ = writeln!(
+        out,
+        "# HELP kimmy_yield_suppressed Why a stalled class is not yielding (0 or 1 per reason): switched_off (KIMMY_OWNERSHIP_YIELD=off), shared_fault (two members are stalled locally in the class: the latch), no_target (no fresh, responsive peer is ok or idle in it) and cap (the class's yielders are at the cap). At most one is 1, the first that applies in that order.\n\
+         # TYPE kimmy_yield_suppressed gauge"
+    );
+    for (i, class) in classes.into_iter().enumerate() {
+        for reason in kimmy_cluster::yielding::Suppression::ALL {
+            let _ = writeln!(
+                out,
+                "kimmy_yield_suppressed{{class=\"{}\",reason=\"{}\"}} {}",
+                class.label(),
+                reason.label(),
+                u8::from(y.suppressed[i][reason.slot()])
+            );
+        }
+    }
+    let _ = writeln!(
+        out,
+        "# HELP kimmy_yield_observations_total What each evaluator tick counted a class as: good (owned work and made progress), bad (overdue, a failing cycle, or the runtime stalled), idle (owns nothing and nothing is wrong), neutral (gated, switched off, stopping, or nothing to say) and void (the tick judged nothing because a pause of the whole process delayed it). A rise in good, idle or neutral beside a rise in ticks is what says a quiet cluster was really watched.\n\
+         # TYPE kimmy_yield_observations_total counter"
+    );
+    for (i, class) in classes.into_iter().enumerate() {
+        for verdict in kimmy_cluster::yielding::Verdict::ALL {
+            let _ = writeln!(
+                out,
+                "kimmy_yield_observations_total{{class=\"{}\",verdict=\"{}\"}} {}",
+                class.label(),
+                verdict.label(),
+                y.observations[i][verdict.slot()]
+            );
+        }
+    }
+    let _ = writeln!(
+        out,
+        "# HELP kimmy_yield_evaluator_ticks_total Ticks the yield evaluator has made, one every five seconds. Never rises while it is frozen for a stop, and stops rising if the evaluator thread is wedged, which kimmy_task_progress_age_seconds{{task=\"yield_evaluator\"}} shows and which makes this member advertise every class as unknown.\n\
+         # TYPE kimmy_yield_evaluator_ticks_total counter\n\
+         kimmy_yield_evaluator_ticks_total {}",
+        y.ticks
+    );
+    let _ = writeln!(
+        out,
+        "# HELP kimmy_yield_faults_total Faults counted against a class by its own heartbeat, by kind: local (the storage engine, the registry, a list: this member's health, and the only kind that counts towards yielding), remote (a failed delivery or provider call: an endpoint's, never this member's) and config (a policy refusal, a missing key: this node's configuration). A local success in the same cycle masks local failures for yielding; they stay visible here.\n\
+         # TYPE kimmy_yield_faults_total counter"
+    );
+    for (i, class) in classes.into_iter().enumerate() {
+        for (k, kind) in YIELD_FAULT_KINDS.iter().enumerate() {
+            let _ = writeln!(
+                out,
+                "kimmy_yield_faults_total{{class=\"{}\",kind=\"{kind}\"}} {}",
+                class.label(),
+                y.faults[i][k]
+            );
+        }
+    }
+    let _ = writeln!(
+        out,
+        "# HELP kimmy_runtime_responsive Whether this member's async runtime has not stalled for the last six judged evaluator ticks (0 or 1): quick to 0, slow to 1. Only a responsive member is a target for a peer's yield.\n\
+         # TYPE kimmy_runtime_responsive gauge\n\
+         kimmy_runtime_responsive {}",
+        u8::from(y.responsive)
+    );
+    let _ = writeln!(
+        out,
+        "# HELP kimmy_ownership_yield_enabled Whether this member may set its own yield bits (1), or KIMMY_OWNERSHIP_YIELD=off is set (0). Off, it still judges, advertises its states, honours its peers' bits and can be a target.\n\
+         # TYPE kimmy_ownership_yield_enabled gauge\n\
+         kimmy_ownership_yield_enabled {}",
+        u8::from(y.enabled)
+    );
+    let _ = writeln!(
+        out,
+        "# HELP kimmy_yield_probation Whether this start began in probation (0 or 1), set at start: the previous run ended storage_failed or task_died, or unclean or storage_not_closed with low free space, a short run or a second non-clean end in a row. In probation every class starts stalled and yields from the first block, and leaves by the ordinary reclaim.\n\
+         # TYPE kimmy_yield_probation gauge\n\
+         kimmy_yield_probation {}",
+        u8::from(y.probation)
+    );
 }
 
 #[cfg(test)]
@@ -2328,6 +2549,41 @@ mod tests {
     /// one more in the top bucket, and one hold above every bound — so the
     /// cumulative sum, the `+Inf` overflow and the `holder` label are each
     /// visible in the golden text rather than inferred from it.
+    /// A yield reading with a different number in every cell, so a value rendered under
+    /// another label cannot match the golden (ADR-213). The states are one-hot, so those
+    /// are chosen by position instead: webhooks is stalled by cause `runtime`, ttl is
+    /// `suspect`, embeddings is `ok`.
+    fn distinct_yield() -> YieldReading {
+        let mut y = YieldReading {
+            state: [2, 3, 0],
+            cause: [0, 2, 0],
+            yielding: [false, true, false],
+            owned: [1_601, 1_602, 1_603],
+            ticks: 1_699,
+            responsive: true,
+            enabled: false,
+            probation: true,
+            ..YieldReading::default()
+        };
+        let mut n = 1_700u64;
+        for class in 0..3 {
+            for kind in 0..3 {
+                y.faults[class][kind] = n;
+                n += 1;
+            }
+            for direction in 0..3 {
+                y.transitions[class][direction] = n;
+                n += 1;
+            }
+            for verdict in 0..5 {
+                y.observations[class][verdict] = n;
+                n += 1;
+            }
+        }
+        y.suppressed = [[false; 4], [false, false, true, false], [false; 4]];
+        y
+    }
+
     fn distinct_hold() -> kimmy_storage::WriterHoldSnapshot {
         let top = kimmy_storage::WRITER_HOLD_BUCKETS_US.len() - 1;
         let mut hold = kimmy_storage::WriterHoldSnapshot::default();
@@ -2397,6 +2653,7 @@ mod tests {
                 ttl_collections: [1_521, 1_522, 1_523, 1_524],
                 // `restored`, so the golden shows one 1 among the zeros.
                 catching_up: 2,
+                evaluator: distinct_yield(),
             },
             // One holder per row, none of them equal, so a row rendered
             // under another holder's label cannot match the golden. The
@@ -2857,7 +3114,9 @@ kimmy_task_progress_age_seconds{task=\"drop_purger\"} 89
 kimmy_task_progress_age_seconds{task=\"embedding_worker\"} 87
 kimmy_task_progress_age_seconds{task=\"replication\"} 81
 kimmy_task_progress_age_seconds{task=\"stall_probe\"} 83
+kimmy_task_progress_age_seconds{task=\"ttl_expiry\"} 99
 kimmy_task_progress_age_seconds{task=\"webhook_dispatcher\"} 85
+kimmy_task_progress_age_seconds{task=\"yield_evaluator\"} 99
 # HELP kimmy_runtime_stall_seconds Worst delay a 250 ms timer on the async runtime saw since the last scrape. Above a few tens of milliseconds, something blocked a worker thread - the storage lock or an fsync - and peers may have marked this node down.
 # TYPE kimmy_runtime_stall_seconds gauge
 kimmy_runtime_stall_seconds 0
@@ -3215,18 +3474,113 @@ kimmy_violations_backfill_rows_total 1401
 # TYPE kimmy_violations_walk_path_total counter
 kimmy_violations_walk_path_total{path=\"table\"} 1402
 kimmy_violations_walk_path_total{path=\"oplog\"} 1403
-# HELP kimmy_ownership_peers Live peers by how this member sees them: eligible to own work by the block they last sent (within its lease); ineligible_catching_up (the catching-up marker is set, which no class overrides); ineligible_yielding (at least one class given up); unknown (no block yet: an older version, or one not yet heard); stale (a block past its lease with no fresh one, which keeps saying what it last said). Each member reports its own view, and views differ while blocks converge.
+# HELP kimmy_ownership_peers Live peers by how this member sees them: eligible to own work by the block they last sent (within its lease); ineligible_catching_up (the catching-up marker is set, which no class overrides); ineligible_yielding (at least one class given up); unknown (no block held from the peer's current process: an older version, one not yet heard, or one this member dropped on SWIM down or its own rejoin; an unknown peer is no longer a candidate for webhooks or embeddings); stale (a block past its lease with no fresh one, which keeps saying what it last said). Each member reports its own view, and views differ while blocks converge.
 # TYPE kimmy_ownership_peers gauge
 kimmy_ownership_peers{state=\"eligible\"} 1501
 kimmy_ownership_peers{state=\"ineligible_catching_up\"} 1502
 kimmy_ownership_peers{state=\"ineligible_yielding\"} 1503
 kimmy_ownership_peers{state=\"unknown\"} 1504
 kimmy_ownership_peers{state=\"stale\"} 1505
-# HELP kimmy_yield_unconfirmed_peers Live peers that have not read this member's current block while it yields the class. A member that yields a class keeps owning it until every live peer has read the block that says so; a peer that never does keeps it owning, and is named in a WARN. Always 0 while no class yields.
+# HELP kimmy_yield_unconfirmed_peers Live peers that have not confirmed this member's yield of the class: those that do not echo the block back (an older version never does) and those whose echo is below the generation that set the bit. A member that yields a class keeps owning it until every live peer has echoed the block that says so and the live set has held still for a lease; a peer that never does keeps it owning, and is named in a WARN. Always 0 while no class yields.
 # TYPE kimmy_yield_unconfirmed_peers gauge
 kimmy_yield_unconfirmed_peers{class=\"ttl\"} 1511
 kimmy_yield_unconfirmed_peers{class=\"webhooks\"} 1512
 kimmy_yield_unconfirmed_peers{class=\"embeddings\"} 1513
+# HELP kimmy_owner_class_state How this member's own class of owned work stands, one-hot over ok (owns work in the class and does it), idle (owns none, nothing wrong), suspect (bad evidence now, not yet enough to yield: out of target eligibility at once) and stalled (enough bad evidence to yield it, by its cause: local for an overdue class or failing cycles, runtime for the runtime's stalls, probation for a start after an unclean end). Only the stalled series carries a cause label. The state last decided, not read at the scrape: kimmy_task_progress_age_seconds{task=\"yield_evaluator\"} says how old that is.
+# TYPE kimmy_owner_class_state gauge
+kimmy_owner_class_state{class=\"ttl\",state=\"ok\"} 0
+kimmy_owner_class_state{class=\"ttl\",state=\"idle\"} 0
+kimmy_owner_class_state{class=\"ttl\",state=\"suspect\"} 1
+kimmy_owner_class_state{class=\"ttl\",state=\"stalled\",cause=\"local\"} 0
+kimmy_owner_class_state{class=\"ttl\",state=\"stalled\",cause=\"runtime\"} 0
+kimmy_owner_class_state{class=\"ttl\",state=\"stalled\",cause=\"probation\"} 0
+kimmy_owner_class_state{class=\"webhooks\",state=\"ok\"} 0
+kimmy_owner_class_state{class=\"webhooks\",state=\"idle\"} 0
+kimmy_owner_class_state{class=\"webhooks\",state=\"suspect\"} 0
+kimmy_owner_class_state{class=\"webhooks\",state=\"stalled\",cause=\"local\"} 0
+kimmy_owner_class_state{class=\"webhooks\",state=\"stalled\",cause=\"runtime\"} 1
+kimmy_owner_class_state{class=\"webhooks\",state=\"stalled\",cause=\"probation\"} 0
+kimmy_owner_class_state{class=\"embeddings\",state=\"ok\"} 1
+kimmy_owner_class_state{class=\"embeddings\",state=\"idle\"} 0
+kimmy_owner_class_state{class=\"embeddings\",state=\"suspect\"} 0
+kimmy_owner_class_state{class=\"embeddings\",state=\"stalled\",cause=\"local\"} 0
+kimmy_owner_class_state{class=\"embeddings\",state=\"stalled\",cause=\"runtime\"} 0
+kimmy_owner_class_state{class=\"embeddings\",state=\"stalled\",cause=\"probation\"} 0
+# HELP kimmy_owner_class_owned Items of the class this member owned at its last owner check: owned non-invalidated subscriptions, owned embedding collections, TTL collections it expires. 0 while the class is yielded or gated, and the last value it had while its task is stuck (a stalled class does not update it). Read it beside the state: a negative test that nothing owned work proves nothing. For embeddings the count is set by the worker's loop, so while a provider call is held it lags until the call ends; the class is judged by its heartbeat meanwhile.
+# TYPE kimmy_owner_class_owned gauge
+kimmy_owner_class_owned{class=\"ttl\"} 1601
+kimmy_owner_class_owned{class=\"webhooks\"} 1602
+kimmy_owner_class_owned{class=\"embeddings\"} 1603
+# HELP kimmy_yielding Whether this member advertises that it yields the class (0 or 1): the bit its peers read. Advertised, not effective: this member keeps owning the class until every live peer has echoed the block that says so, which kimmy_yield_unconfirmed_peers counts.
+# TYPE kimmy_yielding gauge
+kimmy_yielding{class=\"ttl\"} 0
+kimmy_yielding{class=\"webhooks\"} 1
+kimmy_yielding{class=\"embeddings\"} 0
+# HELP kimmy_yield_transitions_total Times this member changed what it yields: yield (set the bit), reclaim (took the class back after good ticks) and withdraw (took it back while still stalled, for the shared-fault latch or the tie-break). A fault that follows the data costs one yield and one withdraw, then today's behaviour.
+# TYPE kimmy_yield_transitions_total counter
+kimmy_yield_transitions_total{class=\"ttl\",direction=\"yield\"} 1703
+kimmy_yield_transitions_total{class=\"ttl\",direction=\"reclaim\"} 1704
+kimmy_yield_transitions_total{class=\"ttl\",direction=\"withdraw\"} 1705
+kimmy_yield_transitions_total{class=\"webhooks\",direction=\"yield\"} 1714
+kimmy_yield_transitions_total{class=\"webhooks\",direction=\"reclaim\"} 1715
+kimmy_yield_transitions_total{class=\"webhooks\",direction=\"withdraw\"} 1716
+kimmy_yield_transitions_total{class=\"embeddings\",direction=\"yield\"} 1725
+kimmy_yield_transitions_total{class=\"embeddings\",direction=\"reclaim\"} 1726
+kimmy_yield_transitions_total{class=\"embeddings\",direction=\"withdraw\"} 1727
+# HELP kimmy_yield_suppressed Why a stalled class is not yielding (0 or 1 per reason): switched_off (KIMMY_OWNERSHIP_YIELD=off), shared_fault (two members are stalled locally in the class: the latch), no_target (no fresh, responsive peer is ok or idle in it) and cap (the class's yielders are at the cap). At most one is 1, the first that applies in that order.
+# TYPE kimmy_yield_suppressed gauge
+kimmy_yield_suppressed{class=\"ttl\",reason=\"switched_off\"} 0
+kimmy_yield_suppressed{class=\"ttl\",reason=\"shared_fault\"} 0
+kimmy_yield_suppressed{class=\"ttl\",reason=\"no_target\"} 0
+kimmy_yield_suppressed{class=\"ttl\",reason=\"cap\"} 0
+kimmy_yield_suppressed{class=\"webhooks\",reason=\"switched_off\"} 0
+kimmy_yield_suppressed{class=\"webhooks\",reason=\"shared_fault\"} 0
+kimmy_yield_suppressed{class=\"webhooks\",reason=\"no_target\"} 1
+kimmy_yield_suppressed{class=\"webhooks\",reason=\"cap\"} 0
+kimmy_yield_suppressed{class=\"embeddings\",reason=\"switched_off\"} 0
+kimmy_yield_suppressed{class=\"embeddings\",reason=\"shared_fault\"} 0
+kimmy_yield_suppressed{class=\"embeddings\",reason=\"no_target\"} 0
+kimmy_yield_suppressed{class=\"embeddings\",reason=\"cap\"} 0
+# HELP kimmy_yield_observations_total What each evaluator tick counted a class as: good (owned work and made progress), bad (overdue, a failing cycle, or the runtime stalled), idle (owns nothing and nothing is wrong), neutral (gated, switched off, stopping, or nothing to say) and void (the tick judged nothing because a pause of the whole process delayed it). A rise in good, idle or neutral beside a rise in ticks is what says a quiet cluster was really watched.
+# TYPE kimmy_yield_observations_total counter
+kimmy_yield_observations_total{class=\"ttl\",verdict=\"good\"} 1706
+kimmy_yield_observations_total{class=\"ttl\",verdict=\"bad\"} 1707
+kimmy_yield_observations_total{class=\"ttl\",verdict=\"idle\"} 1708
+kimmy_yield_observations_total{class=\"ttl\",verdict=\"neutral\"} 1709
+kimmy_yield_observations_total{class=\"ttl\",verdict=\"void\"} 1710
+kimmy_yield_observations_total{class=\"webhooks\",verdict=\"good\"} 1717
+kimmy_yield_observations_total{class=\"webhooks\",verdict=\"bad\"} 1718
+kimmy_yield_observations_total{class=\"webhooks\",verdict=\"idle\"} 1719
+kimmy_yield_observations_total{class=\"webhooks\",verdict=\"neutral\"} 1720
+kimmy_yield_observations_total{class=\"webhooks\",verdict=\"void\"} 1721
+kimmy_yield_observations_total{class=\"embeddings\",verdict=\"good\"} 1728
+kimmy_yield_observations_total{class=\"embeddings\",verdict=\"bad\"} 1729
+kimmy_yield_observations_total{class=\"embeddings\",verdict=\"idle\"} 1730
+kimmy_yield_observations_total{class=\"embeddings\",verdict=\"neutral\"} 1731
+kimmy_yield_observations_total{class=\"embeddings\",verdict=\"void\"} 1732
+# HELP kimmy_yield_evaluator_ticks_total Ticks the yield evaluator has made, one every five seconds. Never rises while it is frozen for a stop, and stops rising if the evaluator thread is wedged, which kimmy_task_progress_age_seconds{task=\"yield_evaluator\"} shows and which makes this member advertise every class as unknown.
+# TYPE kimmy_yield_evaluator_ticks_total counter
+kimmy_yield_evaluator_ticks_total 1699
+# HELP kimmy_yield_faults_total Faults counted against a class by its own heartbeat, by kind: local (the storage engine, the registry, a list: this member's health, and the only kind that counts towards yielding), remote (a failed delivery or provider call: an endpoint's, never this member's) and config (a policy refusal, a missing key: this node's configuration). A local success in the same cycle masks local failures for yielding; they stay visible here.
+# TYPE kimmy_yield_faults_total counter
+kimmy_yield_faults_total{class=\"ttl\",kind=\"local\"} 1700
+kimmy_yield_faults_total{class=\"ttl\",kind=\"remote\"} 1701
+kimmy_yield_faults_total{class=\"ttl\",kind=\"config\"} 1702
+kimmy_yield_faults_total{class=\"webhooks\",kind=\"local\"} 1711
+kimmy_yield_faults_total{class=\"webhooks\",kind=\"remote\"} 1712
+kimmy_yield_faults_total{class=\"webhooks\",kind=\"config\"} 1713
+kimmy_yield_faults_total{class=\"embeddings\",kind=\"local\"} 1722
+kimmy_yield_faults_total{class=\"embeddings\",kind=\"remote\"} 1723
+kimmy_yield_faults_total{class=\"embeddings\",kind=\"config\"} 1724
+# HELP kimmy_runtime_responsive Whether this member's async runtime has not stalled for the last six judged evaluator ticks (0 or 1): quick to 0, slow to 1. Only a responsive member is a target for a peer's yield.
+# TYPE kimmy_runtime_responsive gauge
+kimmy_runtime_responsive 1
+# HELP kimmy_ownership_yield_enabled Whether this member may set its own yield bits (1), or KIMMY_OWNERSHIP_YIELD=off is set (0). Off, it still judges, advertises its states, honours its peers' bits and can be a target.
+# TYPE kimmy_ownership_yield_enabled gauge
+kimmy_ownership_yield_enabled 0
+# HELP kimmy_yield_probation Whether this start began in probation (0 or 1), set at start: the previous run ended storage_failed or task_died, or unclean or storage_not_closed with low free space, a short run or a second non-clean end in a row. In probation every class starts stalled and yields from the first block, and leaves by the ordinary reclaim.
+# TYPE kimmy_yield_probation gauge
+kimmy_yield_probation 1
 # HELP kimmy_ownership_facts_undecodable_total Blocks a peer sent about itself that did not decode and were treated as none. A peer whose blocks never decode looks exactly like an older version that sends none, so this and the WARN naming the peer are how they are told apart. Should stay 0.
 # TYPE kimmy_ownership_facts_undecodable_total counter
 kimmy_ownership_facts_undecodable_total 1531
@@ -3833,7 +4187,14 @@ kimmy_storage_cache_reads_total{result=\"miss\"} 9104
                 + crate::ownership::TtlState::ALL.len()
                 + 1
                 // One-hot over the catching-up marker's states (ADR-202).
-                + kimmy_cluster::catchup::STATES.len(),
+                + kimmy_cluster::catchup::STATES.len()
+                // The yield evaluator's series (ADR-213), for the three classes:
+                // the class state's three plain states and three causes of
+                // stalled, owned, yielding, three transitions, four suppression
+                // reasons, five verdicts and three fault kinds; then the ticks, the
+                // responsive flag, the off switch and probation.
+                + 3 * (3 + 3 + 1 + 1 + 3 + 4 + 5 + 3)
+                + 4,
             "expected one sample per series: {out}"
         );
     }
@@ -4138,7 +4499,7 @@ kimmy_storage_cache_reads_total{result=\"miss\"} 9104
         });
         assert_eq!(
             ages(&m).task_progress_age_secs,
-            [Some(90), Some(90), Some(4), Some(90), Some(90)],
+            [Some(90), Some(90), Some(4), Some(90), Some(90), Some(90), Some(90)],
             "only replication's, in {PROGRESS_WRITERS:?}"
         );
         // Stamped with the clock, which is 90 s short of `later`.
@@ -4205,9 +4566,12 @@ kimmy_storage_cache_reads_total{result=\"miss\"} 9104
     }
 
     #[test]
-    fn every_progress_writer_is_a_supervised_task() {
+    fn every_progress_writer_is_a_supervised_task_or_thread() {
         for writer in PROGRESS_WRITERS {
-            assert!(kimmy_task::TASKS.contains(&writer), "{writer} is supervised under no name");
+            assert!(
+                kimmy_task::TASKS.contains(&writer) || kimmy_task::THREADS.contains(&writer),
+                "{writer} is supervised under no name"
+            );
         }
     }
 

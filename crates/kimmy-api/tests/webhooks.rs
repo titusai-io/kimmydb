@@ -219,6 +219,7 @@ async fn the_dispatcher_loop_delivers_without_being_driven() {
         // startup failure, not a task that returns.
         dispatch::client(&EgressPolicy::new(WEBHOOKS, vec!["127.0.0.1".into()]))
             .expect("a delivery client for the test"),
+        kimmy_task::Shutdown::new(),
     ));
 
     // The first pass runs before the first sleep, so this resolves fast; the
@@ -263,6 +264,7 @@ async fn the_dispatcher_loop_delivers_nothing_while_the_catching_up_marker_is_se
         dispatch::Limits::default(),
         dispatch::client(&EgressPolicy::new(WEBHOOKS, vec!["127.0.0.1".into()]))
             .expect("a delivery client for the test"),
+        kimmy_task::Shutdown::new(),
     ));
 
     tokio::time::sleep(std::time::Duration::from_millis(1500)).await;
@@ -536,6 +538,7 @@ async fn the_dispatcher_loop_asks_the_members_that_may_own_webhooks() {
             Some(members(catching_up)),
             dispatch::Limits::default(),
             reqwest::Client::new(),
+            kimmy_task::Shutdown::new(),
         ));
         let until = tokio::time::Instant::now() + wait;
         while hits.load(Ordering::Relaxed) == 0 && tokio::time::Instant::now() < until {

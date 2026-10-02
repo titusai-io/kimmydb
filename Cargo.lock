@@ -2435,6 +2435,7 @@ dependencies = [
 name = "kimmy-cluster"
 version = "0.43.0"
 dependencies = [
+ "arc-swap",
  "bson",
  "foca",
  "hickory-resolver",
@@ -2539,6 +2540,7 @@ dependencies = [
 name = "kimmy-storage"
 version = "0.43.0"
 dependencies = [
+ "arc-swap",
  "bson",
  "criterion",
  "kimmy-core",
@@ -2580,9 +2582,11 @@ dependencies = [
  "criterion",
  "fastembed",
  "hnsw_rs",
+ "kimmy-cluster",
  "kimmy-core",
  "kimmy-egress",
  "kimmy-storage",
+ "kimmy-task",
  "parking_lot",
  "reqwest 0.12.28",
  "serde",
@@ -2598,6 +2602,7 @@ name = "kimmyd"
 version = "0.43.0"
 dependencies = [
  "anyhow",
+ "arc-swap",
  "axum",
  "axum-server",
  "bson",
@@ -2612,6 +2617,7 @@ dependencies = [
  "kimmy-storage",
  "kimmy-task",
  "kimmy-vector",
+ "libc",
  "mimalloc",
  "opentelemetry",
  "opentelemetry-otlp",

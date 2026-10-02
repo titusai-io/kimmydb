@@ -72,6 +72,12 @@ pub struct ExpiryOutcome {
     /// examined; a pass that reaches the end of the expired range ends the
     /// cycle, and the one after it starts again from the front.
     pub truncated: bool,
+    /// Indexes whose `expire_documents` call failed, other than a stop. Counted by
+    /// the pass that calls it, so a failure no caller could see before (the pass
+    /// swallowed it into a log line) reaches the class's heartbeat (ADR-213).
+    pub failed_indexes: u64,
+    /// Database or collection lists that failed.
+    pub failed_lists: u64,
 }
 
 impl Engine {
@@ -88,6 +94,9 @@ impl Engine {
         let (Some(secs), Some(field)) = (index.expire_after_secs, index.ttl_path()) else {
             return Ok(ExpiryOutcome::default());
         };
+        // A beat per index and, below, per candidate examined, declined or not: a
+        // pass over a big collection is long and must not read as stuck (ADR-213).
+        crate::class_step::beat();
 
         // Saturating: a policy longer than the time since the epoch expires
         // nothing, rather than wrapping into a cutoff in the far future and
@@ -144,6 +153,7 @@ impl Engine {
         // A document an index keys more than once is one candidate.
         let mut seen = HashSet::new();
         for (_, key) in candidates {
+            crate::class_step::beat();
             if !seen.insert(key.clone()) {
                 continue;
             }
@@ -284,6 +294,50 @@ mod tests {
             )
             .unwrap();
         (engine.get_collection("app", "sessions").unwrap(), index)
+    }
+
+    /// A clock whose every reading is counted, so a test can count the beats a cell
+    /// took without a wall clock.
+    struct Counting(std::sync::atomic::AtomicU64);
+
+    impl crate::class_step::StepClock for Counting {
+        fn now_ms(&self) -> u64 {
+            self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+        }
+    }
+
+    /// A pass beats the class once per index and once **per candidate it examines**
+    /// (ADR-213): a pass over a big collection is long and must not read as stuck.
+    /// Each delete's own commit is a local success and a beat too, and the writer
+    /// gate stamps the phase twice, so for `n` candidates the clock is read at least
+    /// `1 + 4n` times; one beat fewer is the mutation this guards.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_pass_beats_per_index_and_per_candidate_inside_the_blocking_call() {
+        let (engine, _, _dir) = engine();
+        let (coll, index) = with_ttl(&engine, 60);
+        const N: u64 = 5;
+        for id in 0..N {
+            engine.insert(&coll, doc! {"_id": id as i64, "seen": dt(0)}).unwrap();
+        }
+        let clock = std::sync::Arc::new(Counting(Default::default()));
+        let cell = crate::class_step::ClassCell::leak(
+            std::sync::Arc::clone(&clock) as std::sync::Arc<dyn crate::class_step::StepClock>
+        );
+        let before = clock.0.load(std::sync::atomic::Ordering::SeqCst);
+        let out = crate::class_step::scope(cell, async {
+            crate::blocking(|| engine.expire_documents(&coll, &index, 100_000).unwrap())
+        })
+        .await;
+        assert_eq!(out.deleted, N);
+        let reads = clock.0.load(std::sync::atomic::Ordering::SeqCst) - before;
+        // One for the index; for each candidate its own beat, the two phase stamps
+        // around the writer-gate wait (`WriterGate`, then back), and the commit's
+        // success. Dropping the index's or any candidate's beat is one reading fewer.
+        assert!(
+            reads > 4 * N,
+            "{reads} readings for {N} candidates: one for the index, and four for each candidate"
+        );
+        assert_eq!(cell.local_oks(), N, "each delete's commit is a local success");
     }
 
     #[test]
