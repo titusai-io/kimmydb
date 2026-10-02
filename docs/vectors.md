@@ -258,8 +258,8 @@ share a call, because the collection names the provider, the model and the
 prefix. A batch that fails *permanently* — a `400` for one input the model
 cannot take, which the provider does not name — is taken apart and each
 document sent alone, so the one at fault is skipped and named and the rest
-land; a *retryable* failure retries the whole batch, as one document retried
-before.
+land; a *retryable* failure holds the whole batch for its collection's next
+attempt ([When a provider keeps failing](#when-a-provider-keeps-failing)).
 
 `kimmy_embed_documents_total` and `kimmy_embed_chunks_total` still count
 documents and chunks. `kimmy_embed_provider_requests_total` counts calls, so
@@ -270,6 +270,46 @@ collection's, because they describe the round trip this node makes. One
 caveat: the `ollama` provider sends one request per input, because its
 embeddings endpoint takes one, so batching saves it nothing on the wire;
 every other provider takes the batch whole.
+
+### When a provider keeps failing
+
+A node has one embedding worker for all its collections, so a provider that
+fails must not hold the worker. When a call fails in a way a later attempt may
+fix (a provider that is down, a `5xx`, a `429`, a `408` or `425`, a connect or
+timeout failure, a host that does not resolve, or a node whose lookups are all
+busy), the worker **holds the batch for that collection and goes on with the
+others**. The collection's next attempt is made from the worker's own loop,
+after a delay that starts at 5 s and doubles with each failed attempt up to
+300 s, and starts over at 5 s after one call is answered. Each attempt is one
+provider call, bounded by the provider's own timeout; between attempts the
+worker holds nothing open, so a stop does not wait on a collection that is
+backing off.
+
+While a collection backs off, its other new batches are not sent and not kept:
+when its provider answers, the held batch goes first and a scan of the
+collection embeds what the skipped ones would have, finding it stale the way a
+rescan does. Other collections, including other tenants' on the same node,
+embed as usual.
+
+**What is held is in memory, so the debt is also written down.** A collection
+that holds a batch, or has skipped one, is **marked in the store** as owing a
+scan before the oplog position is recorded past the entries the work came from.
+The position then advances as it always does, and a restart reads the marks and
+scans the marked collections, finding what is stale and embedding it: the cost
+of a restart is a scan per marked collection, and does not depend on how long
+the provider has been down or how far back the oplog goes. The mark is cleared
+once the collection's scan has run, or when the collection is reconfigured (its
+own backfill covers it), dropped, or no longer owned by this member (its new
+owner's rescan covers it; a collection that comes back to this member is a
+gain and is rescanned). If a mark cannot be written the worker says so at `WARN`
+and holds the position back instead, which a restart answers by replaying the
+entries since; it goes on as soon as the mark is written.
+`kimmy_task_progress_age_seconds{task="embedding_worker"}` rises while a
+collection backs off and nothing else embeds, as it did for the old retry (see
+[Operations](operations.md#a-gauge-is-only-as-fresh-as-its-writer)); a flush
+that only held a failing collection's batch does not reset it.
+Documents are only held for a **retryable** failure: a failure that will not
+clear by itself is skipped and named, as below.
 
 ---
 
@@ -389,7 +429,8 @@ restart re-processes up to a second of the stream, which the idempotence
 above makes a handful of reads.
 
 A provider failure that could plausibly succeed on retry — a transport error, a
-rate limit, a `5xx`, a `408` or a `425` — retries the same entry after a delay rather than advancing past it.
+rate limit, a `5xx`, a `408` or a `425` — is retried after a delay rather than advanced past
+([When a provider keeps failing](#when-a-provider-keeps-failing)).
 A failure that will fail identically forever — a wrong dimension, a missing API
 key — does not, because retrying it would stall every document queued behind it.
 A document the provider refuses **as input** (`400`, `413` or `422`) also loses

@@ -599,6 +599,68 @@ impl crate::Engine {
         Ok(Some(u64::from_be_bytes(bytes)))
     }
 
+    /// Record that a collection owes a scan: its embedding provider failed
+    /// retryably, so a batch was held in memory, or its batches were skipped,
+    /// and the vectors those would have written are missing. `force` says the
+    /// scan must read a record with no configuration fingerprint as stale (a
+    /// configuration change's backfill) rather than trust its version.
+    ///
+    /// Written by the embedding worker **before** it records an oplog position
+    /// that passes the entries the held or skipped work came from, so a restart
+    /// finds the debt without replaying the oplog for it. Cleared by
+    /// [`Self::clear_vector_rescan`] when the scan has run.
+    pub fn put_vector_rescan(&self, collection: CollectionId, force: bool) -> Result<()> {
+        let txn = self.begin_write(WriterHolder::Embedding)?;
+        {
+            let mut meta = txn.open_table(crate::tables::META)?;
+            let value: &[u8] = if force { b"force" } else { b"check" };
+            meta.insert(rescan_key(collection).as_str(), value)?;
+        }
+        txn.commit()?;
+        Ok(())
+    }
+
+    /// Forget the debt [`Self::put_vector_rescan`] recorded. Commits only when
+    /// there was one.
+    pub fn clear_vector_rescan(&self, collection: CollectionId) -> Result<()> {
+        if !self.vector_rescans()?.iter().any(|(id, _)| *id == collection) {
+            return Ok(());
+        }
+        let txn = self.begin_write(WriterHolder::Embedding)?;
+        {
+            let mut meta = txn.open_table(crate::tables::META)?;
+            meta.remove(rescan_key(collection).as_str())?;
+        }
+        txn.commit()?;
+        Ok(())
+    }
+
+    /// Every collection that owes a scan, with whether it must be forced.
+    pub fn vector_rescans(&self) -> Result<Vec<(CollectionId, bool)>> {
+        let txn = self.db().begin_read()?;
+        let meta = txn.open_table(crate::tables::META)?;
+        let mut owed = Vec::new();
+        // `;` is the character after `:`, so this range is exactly the prefix.
+        for row in meta.range(RESCAN_PREFIX..RESCAN_END)? {
+            let (key, value) = row?;
+            let Some(id) = key.value().strip_prefix(RESCAN_PREFIX).and_then(|id| id.parse().ok())
+            else {
+                return Err(StorageError::Corrupt("vector rescan key is not an id".into()));
+            };
+            let force = match value.value() {
+                b"force" => true,
+                b"check" => false,
+                _ => {
+                    return Err(StorageError::Corrupt(
+                        "vector rescan is not check or force".into(),
+                    ));
+                }
+            };
+            owed.push((CollectionId(id), force));
+        }
+        Ok(owed)
+    }
+
     // -----------------------------------------------------------------------
     // Vector records
     // -----------------------------------------------------------------------
@@ -921,6 +983,13 @@ fn fingerprint_key(collection: CollectionId) -> String {
     format!("vector_config:{}", collection.0)
 }
 
+const RESCAN_PREFIX: &str = "vector_rescan:";
+const RESCAN_END: &str = "vector_rescan;";
+
+fn rescan_key(collection: CollectionId) -> String {
+    format!("{RESCAN_PREFIX}{}", collection.0)
+}
+
 fn decode_vector(doc: bson::Document) -> Result<VectorRecord> {
     bson::deserialize_from_document(doc)
         .map_err(|e| StorageError::Corrupt(format!("decoding vector record: {e}")))
@@ -938,6 +1007,21 @@ mod tests {
         let engine = Engine::open(&dir.path().join("kimmy.redb")).unwrap();
         engine.create_collection("app", "docs").unwrap();
         (engine, dir)
+    }
+
+    #[test]
+    fn a_recorded_rescan_reads_back_and_is_cleared() {
+        let (engine, _dir) = engine();
+        let (a, b) = (CollectionId(7), CollectionId(8));
+        assert!(engine.vector_rescans().unwrap().is_empty(), "nothing owed yet");
+        engine.put_vector_rescan(a, false).unwrap();
+        engine.put_vector_rescan(b, true).unwrap();
+        assert_eq!(engine.vector_rescans().unwrap(), vec![(a, false), (b, true)]);
+        engine.put_vector_rescan(a, true).unwrap();
+        engine.clear_vector_rescan(b).unwrap();
+        engine.clear_vector_rescan(b).unwrap();
+        assert_eq!(engine.vector_rescans().unwrap(), vec![(a, true)]);
+        assert_eq!(engine.vector_fingerprint(a).unwrap(), None, "no other key reads it");
     }
 
     #[test]
