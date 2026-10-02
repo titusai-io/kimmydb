@@ -3661,41 +3661,72 @@ mod tests {
     /// exits 75.
     #[test]
     fn the_clean_exit_marker_waits_for_the_write_in_progress_and_is_withheld_past_the_cap() {
-        let hold = |engine: &Arc<Engine>, for_: Duration| {
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        /// A writer held until `release` is sent (or a safety timeout, so a
+        /// product that waited on it fails the test instead of hanging it).
+        /// `holding` is true from the moment the writer is taken until just
+        /// before it is let go: the order of events is asserted through it,
+        /// never how long anything took.
+        struct Hold {
+            holding: Arc<AtomicBool>,
+            release: std::sync::mpsc::Sender<()>,
+            thread: std::thread::JoinHandle<()>,
+        }
+        let hold = |engine: &Arc<Engine>| {
             let (held, is_held) = std::sync::mpsc::channel();
-            let engine = Arc::clone(engine);
-            std::thread::spawn(move || {
+            let (release, released) = std::sync::mpsc::channel::<()>();
+            let holding = Arc::new(AtomicBool::new(true));
+            let (engine, flag) = (Arc::clone(engine), Arc::clone(&holding));
+            let thread = std::thread::spawn(move || {
                 let guard = engine.hold_writer(kimmy_storage::WriterHolder::Bulk);
                 held.send(()).unwrap();
-                std::thread::sleep(for_);
+                let _ = released.recv_timeout(Duration::from_secs(30));
+                flag.store(false, Ordering::SeqCst);
                 drop(guard);
             });
             is_held.recv().unwrap();
+            Hold { holding, release, thread }
         };
 
-        // Past the cap: storage_not_closed, promptly.
+        // Past the cap: storage_not_closed, and the conclusion did not wait
+        // for the write: it was still in progress when the run ended.
         let dir = tempfile::tempdir().unwrap();
         let engine = Arc::new(Engine::open(&dir.path().join(DATABASE_FILE)).unwrap());
-        hold(&engine, Duration::from_secs(5));
-        let started = std::time::Instant::now();
+        let write = hold(&engine);
         let outcome = conclude_now(ended(dir.path(), engine, Duration::from_millis(200)));
-        assert!(started.elapsed() < Duration::from_secs(2), "{:?}", started.elapsed());
+        assert!(write.holding.load(Ordering::SeqCst), "the end waited for the write to finish");
         assert!(not_closed(&outcome), "{outcome:?}");
         let last = marker(dir.path());
         assert_eq!(last.exit, lifecycle::Exit::StorageNotClosed);
         assert!(last.cause.unwrap().contains("a write was still in progress"));
+        write.release.send(()).unwrap();
+        write.thread.join().unwrap();
 
-        // Inside the cap: the marker waits for the write, and the close.
+        // Inside the cap: the marker waits for the write, and the close. The
+        // write is let go only once the close to writes has begun, so it is
+        // in progress while the close waits, however slowly this runs.
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join(DATABASE_FILE);
         let engine = Arc::new(Engine::open(&path).unwrap());
-        hold(&engine, Duration::from_millis(300));
-        let started = std::time::Instant::now();
-        let end = ended(dir.path(), engine, Duration::from_secs(5));
-        assert!(started.elapsed() >= Duration::from_millis(250), "the close did not wait");
+        let write = hold(&engine);
+        let releaser = {
+            let engine = Arc::clone(&engine);
+            let release = write.release.clone();
+            std::thread::spawn(move || {
+                while !engine.is_stopping() {
+                    std::thread::sleep(Duration::from_millis(1));
+                }
+                release.send(()).unwrap();
+            })
+        };
+        let end = ended(dir.path(), engine, Duration::from_secs(30));
+        assert!(!write.holding.load(Ordering::SeqCst), "the close did not wait");
         conclude_now(end).unwrap();
         assert_eq!(marker(dir.path()).exit, lifecycle::Exit::Shutdown);
         assert!(kimmy_storage::format::closed_cleanly(&path).unwrap());
+        releaser.join().unwrap();
+        write.thread.join().unwrap();
     }
 
     /// `exit = "shutdown"` is written only after redb closed: the engine is
