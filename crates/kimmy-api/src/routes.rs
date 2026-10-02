@@ -1140,7 +1140,7 @@ async fn register_webhook(
     Path((db, coll)): Path<(String, String)>,
     JsonBody(body): JsonBody<crate::webhooks::RegisterRequest>,
 ) -> Result<Json<Value>, ApiError> {
-    Ok(Json(crate::webhooks::register(&state, &auth, &db, &coll, &body, &state.egress)?))
+    Ok(Json(crate::webhooks::register(&state, &auth, &db, &coll, &body, &state.egress).await?))
 }
 
 async fn list_webhooks(

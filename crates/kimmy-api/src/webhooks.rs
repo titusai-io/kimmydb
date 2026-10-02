@@ -158,7 +158,7 @@ fn new_secret() -> String {
 }
 
 /// Register a webhook on a collection.
-pub fn register(
+pub async fn register(
     state: &SharedState,
     auth: &Auth,
     db: &str,
@@ -175,8 +175,10 @@ pub fn register(
 
     // Checked here so a bad URL fails while the person who typed it is
     // watching. It is checked again before every delivery, because a name that
-    // resolves publicly now can resolve inward later.
-    policy.check(&request.url).map_err(|e| ApiError::bad_request(e.to_string()))?;
+    // resolves publicly now can resolve inward later. The lookup runs on the
+    // blocking pool, so a resolver that does not answer holds this request,
+    // under the request's own deadline, and not the worker serving others.
+    policy.check_for_request(&request.url).await.map_err(ApiError::egress)?;
 
     let operations = match &request.operations {
         Some(names) => {
@@ -316,6 +318,89 @@ pub fn remove(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// **Registration resolves the host off the worker.** It used to check
+    /// the URL with a blocking lookup on the request's worker, which a
+    /// resolver that did not answer held for its own timeout, along with every
+    /// other request queued on it. On a runtime of one thread, a probe task
+    /// counts the turns it gets while an injected lookup is held: none, if the
+    /// lookup holds the thread. The answer, once it comes, is the `400` it was.
+    #[tokio::test]
+    async fn registration_waits_for_the_lookup_without_holding_the_worker() {
+        use std::sync::atomic::{AtomicUsize, Ordering::SeqCst};
+        let dir = tempfile::tempdir().unwrap();
+        let state = crate::state::tests::a_state(&dir);
+        state.engine.create_collection("shop", "orders").unwrap();
+        let hung = crate::dispatch::tests::HungLookup::new();
+        let policy =
+            EgressPolicy::new(crate::egress::WEBHOOKS, Vec::new()).with_lookup(hung.lookup());
+        let auth = Auth(kimmy_auth::Principal::new("root", vec![kimmy_auth::Grant::superuser()]));
+        let request = RegisterRequest { url: "http://hangs.example/hook".into(), operations: None };
+
+        let turns_while_held = std::sync::Arc::new(AtomicUsize::new(0));
+        let probe = tokio::spawn({
+            let (hung, turns) =
+                (std::sync::Arc::clone(&hung), std::sync::Arc::clone(&turns_while_held));
+            async move {
+                loop {
+                    if hung.held() {
+                        turns.fetch_add(1, SeqCst);
+                    }
+                    tokio::task::yield_now().await;
+                }
+            }
+        });
+        let (registered, ()) =
+            tokio::join!(register(&state, &auth, "shop", "orders", &request, &policy), async {
+                hung.until_entered().await;
+                for _ in 0..100 {
+                    tokio::task::yield_now().await;
+                }
+                assert!(turns_while_held.load(SeqCst) > 0, "the runtime ran nothing meanwhile");
+                assert!(hung.held(), "the lookup returned before the runtime ran anything else");
+                probe.abort();
+                hung.release();
+            });
+        let err = registered.unwrap_err();
+        assert_eq!(err.status, axum::http::StatusCode::BAD_REQUEST);
+        assert!(err.message.contains("cannot resolve \"hangs.example\""), "{}", err.message);
+    }
+
+    /// **Registration answers `503 resolver_busy` while the request path's
+    /// lookups are full**, with `Retry-After`: the host was not looked up,
+    /// which is this node's state and not the URL's, so not a `400`.
+    #[tokio::test]
+    async fn registration_answers_resolver_busy_while_the_requests_lookups_are_full() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = crate::state::tests::a_state(&dir);
+        state.engine.create_collection("shop", "orders").unwrap();
+        let hung = crate::dispatch::tests::HungLookup::new();
+        let policy =
+            EgressPolicy::new(crate::egress::WEBHOOKS, Vec::new()).with_lookup(hung.lookup());
+        let holders: Vec<_> = (0..crate::egress::MAX_REQUEST_LOOKUPS_IN_FLIGHT)
+            .map(|i| {
+                let policy = policy.clone();
+                tokio::spawn(async move {
+                    policy.check_for_request(&format!("http://held{i}.example/")).await
+                })
+            })
+            .collect();
+        for _ in 0..10 {
+            tokio::task::yield_now().await;
+        }
+        let auth = Auth(kimmy_auth::Principal::new("root", vec![kimmy_auth::Grant::superuser()]));
+        let request = RegisterRequest { url: "http://new.example/hook".into(), operations: None };
+        let err = register(&state, &auth, "shop", "orders", &request, &policy).await.unwrap_err();
+        assert_eq!(err.status, axum::http::StatusCode::SERVICE_UNAVAILABLE, "{}", err.message);
+        assert_eq!(err.code, crate::error::ErrorCode::ResolverBusy);
+        assert_eq!(err.retry(), crate::error::Retry::Wait);
+        let response = axum::response::IntoResponse::into_response(err);
+        assert_eq!(response.headers()["retry-after"], "5");
+        hung.release();
+        for holder in holders {
+            let _ = holder.await;
+        }
+    }
 
     #[test]
     fn a_stored_subscription_never_shows_its_secret() {

@@ -29,6 +29,10 @@
 //! `169.254.169.254` an hour later. Checking once would validate a promise DNS
 //! can withdraw.
 //!
+//! The check's lookup is under the delivery's own deadline and off the
+//! runtime's workers: a resolver that stops answering fails the delivery at
+//! the timeout, as an endpoint that stops answering does.
+//!
 //! # A pass plans serially, delivers concurrently, and applies serially
 //!
 //! Only the network call runs concurrently, under a semaphore of
@@ -929,21 +933,55 @@ pub async fn dispatch_once_owned(
                 outcome.delivered += plan.events;
                 debug!(subscription = %plan.job.id, events = plan.events, "delivered");
             }
-            Err(e) => {
-                backoff.failed(&plan.job.id);
+            Err(failure) => {
+                // A host not looked up because the node's lookups were all
+                // busy says nothing about this subscription's endpoint, and
+                // they can be filled by somebody else's names: it is retried
+                // at the next pass without counting against the backoff.
+                if !failure.lookups_busy {
+                    backoff.failed(&plan.job.id);
+                }
                 state.metrics.record_webhook_delivery(false, plan.events);
                 outcome.failed += 1;
-                warn!(
-                    subscription = %plan.job.id,
-                    url = %plan.job.url,
-                    error = %e,
-                    attempts = backoff.failure_count(&plan.job.id),
-                    "webhook delivery failed"
-                );
+                if failure.lookups_busy {
+                    // Takes no backoff, so every pass retries it: a WARN per
+                    // pass per subscription would be a log line a second for
+                    // as long as somebody else holds the lookups. Counted as a
+                    // failed delivery above all the same.
+                    debug!(
+                        subscription = %plan.job.id,
+                        error = %failure.message,
+                        "webhook delivery deferred; the node's lookups are busy"
+                    );
+                } else {
+                    warn!(
+                        subscription = %plan.job.id,
+                        url = %plan.job.url,
+                        error = %failure.message,
+                        attempts = backoff.failure_count(&plan.job.id),
+                        "webhook delivery failed"
+                    );
+                }
             }
         }
     }
     outcome
+}
+
+/// Why a delivery failed.
+#[derive(Debug)]
+struct Failure {
+    message: String,
+    /// The host was not looked up because the node's lookups were all busy
+    /// (`kimmy_egress::MAX_LOOKUPS_IN_FLIGHT`): not counted against the
+    /// subscription's backoff.
+    lookups_busy: bool,
+}
+
+impl From<String> for Failure {
+    fn from(message: String) -> Self {
+        Self { message, lookups_busy: false }
+    }
 }
 
 async fn deliver(
@@ -951,7 +989,7 @@ async fn deliver(
     policy: &EgressPolicy,
     job: &Job,
     delivery: &Delivery,
-) -> Result<(), String> {
+) -> Result<(), Failure> {
     // No URL and no subscription id on the span. A webhook URL is an operator's
     // endpoint and its path routinely carries a token; the subscription id is
     // already in the log line beside every outcome, where it is not being
@@ -963,9 +1001,28 @@ async fn deliver(
     );
     let _entered = span.enter();
 
+    // One deadline for the check and the send. The check resolves the host,
+    // and a resolver that does not answer is this delivery failing, retried
+    // under the subscription's backoff like an endpoint that does not answer:
+    // neither may hold the pass past the delivery timeout, and the lookup runs
+    // on the blocking pool, so it holds no runtime worker while it waits.
+    let deadline = tokio::time::Instant::now() + DELIVERY_TIMEOUT;
+
     // Re-checked here, not just at registration: a name that resolved publicly
-    // then can resolve inward now.
-    policy.check(&job.url).map_err(|e| e.to_string())?;
+    // then can resolve inward now. And kept beside the client's own resolver,
+    // because behind a proxy that resolver sees only the proxy's name: this is
+    // then the only check of the target's addresses.
+    match tokio::time::timeout_at(deadline, policy.check_async(&job.url)).await {
+        Ok(checked) => checked
+            .map_err(|e| Failure { message: e.to_string(), lookups_busy: e.is_lookups_busy() })?,
+        Err(_) => {
+            return Err(format!(
+                "the host did not resolve within the {} s delivery timeout",
+                DELIVERY_TIMEOUT.as_secs()
+            )
+            .into());
+        }
+    }
 
     // Signed at the moment of sending rather than when the batch was planned,
     // so the timestamp a receiver checks against replay is the send time.
@@ -980,7 +1037,6 @@ async fn deliver(
         .header("x-kimmy-event-id", first)
         .header("x-kimmy-timestamp", timestamp.to_string())
         .header("x-kimmy-signature", signature)
-        .timeout(DELIVERY_TIMEOUT)
         .body(delivery.body.clone());
 
     // Carry the trace across the boundary, so a receiver that also speaks W3C
@@ -1001,12 +1057,21 @@ async fn deliver(
         request = request.header(name, value);
     }
 
-    let response = request.send().await.map_err(|e| e.to_string())?;
+    let response = match tokio::time::timeout_at(deadline, request.send()).await {
+        Ok(sent) => sent.map_err(|e| Failure::from(e.to_string()))?,
+        Err(_) => {
+            return Err(format!(
+                "the endpoint did not answer within the {} s delivery timeout",
+                DELIVERY_TIMEOUT.as_secs()
+            )
+            .into());
+        }
+    };
 
     if response.status().is_success() {
         Ok(())
     } else {
-        Err(format!("endpoint returned {}", response.status()))
+        Err(format!("endpoint returned {}", response.status()).into())
     }
 }
 
@@ -1079,7 +1144,7 @@ pub async fn run(
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use kimmy_core::{DocId, NodeId, Stamp};
 
     use super::*;
@@ -1092,6 +1157,277 @@ mod tests {
         let mut document = bson::doc! { "_id": id };
         document.extend(record);
         state.engine.insert(&meta, document).unwrap();
+    }
+
+    /// A lookup that does not answer until it is released: it holds every
+    /// thread that calls it, as a resolver that does not answer holds
+    /// `getaddrinfo`'s caller. Each caller is released at the latest after
+    /// [`HUNG_FOR`], all at once, so that a test of broken code fails rather
+    /// than hangs.
+    pub(crate) struct HungLookup {
+        entered: std::sync::atomic::AtomicBool,
+        held: std::sync::atomic::AtomicBool,
+        released: std::sync::Mutex<bool>,
+        wake: std::sync::Condvar,
+    }
+
+    const HUNG_FOR: Duration = Duration::from_secs(20);
+
+    impl HungLookup {
+        pub(crate) fn new() -> Arc<Self> {
+            Arc::new(Self {
+                entered: Default::default(),
+                held: Default::default(),
+                released: std::sync::Mutex::new(false),
+                wake: std::sync::Condvar::new(),
+            })
+        }
+
+        pub(crate) fn lookup(self: &Arc<Self>) -> crate::egress::Lookup {
+            let hung = Arc::clone(self);
+            Arc::new(move |_host: &str| {
+                use std::sync::atomic::Ordering::SeqCst;
+                hung.held.store(true, SeqCst);
+                hung.entered.store(true, SeqCst);
+                let released = hung.released.lock().unwrap();
+                let _ = hung.wake.wait_timeout_while(released, HUNG_FOR, |r| !*r).unwrap();
+                hung.held.store(false, SeqCst);
+                Err(std::io::Error::other("the hung lookup was released"))
+            })
+        }
+
+        pub(crate) fn entered(&self) -> bool {
+            self.entered.load(std::sync::atomic::Ordering::SeqCst)
+        }
+
+        pub(crate) fn held(&self) -> bool {
+            self.held.load(std::sync::atomic::Ordering::SeqCst)
+        }
+
+        pub(crate) fn release(&self) {
+            *self.released.lock().unwrap() = true;
+            self.wake.notify_all();
+        }
+
+        /// Yield until the lookup has been called. The ceiling, in real time,
+        /// is for a lookup that is never called at all, so that such a test
+        /// fails rather than spins: it times nothing that passes.
+        pub(crate) async fn until_entered(&self) {
+            let started = std::time::Instant::now();
+            while !self.entered() {
+                assert!(started.elapsed() < HUNG_FOR, "the lookup was never called");
+                tokio::task::yield_now().await;
+            }
+        }
+    }
+
+    fn a_delivery(url: &str) -> (Job, Delivery) {
+        let job = Job {
+            id: "wh_test".into(),
+            url: url.into(),
+            secret: "s".into(),
+            database: "shop".into(),
+            collection: "orders".into(),
+            collection_id: 1,
+            operations: Vec::new(),
+            invalidated: false,
+        };
+        (job, Delivery { body: "{}".into(), stamps: Vec::new() })
+    }
+
+    /// **A resolver that does not answer fails the delivery at its deadline,
+    /// and holds no runtime worker meanwhile.** The egress check before a
+    /// delivery used to resolve the host with a blocking `getaddrinfo` on the
+    /// dispatcher's worker, outside the delivery timeout: a DNS outage held the
+    /// worker for the resolver's own timeout, once per delivery in turn.
+    ///
+    /// On a runtime of one thread, a probe task counts the turns it gets while
+    /// the lookup is held: none, if the lookup holds the thread. Time is
+    /// paused and moved by hand, so the deadline is the delivery's own and
+    /// nothing that passes is timed. The failure is the delivery's, in its own
+    /// words, and not a policy refusal.
+    #[tokio::test(start_paused = true)]
+    async fn a_lookup_that_never_answers_fails_the_delivery_at_its_deadline_off_the_worker() {
+        use std::sync::atomic::{AtomicUsize, Ordering::SeqCst};
+        let hung = HungLookup::new();
+        let policy =
+            EgressPolicy::new(crate::egress::WEBHOOKS, Vec::new()).with_lookup(hung.lookup());
+        let client = client(&policy).unwrap();
+        let (job, delivery) = a_delivery("http://hangs.example/hook");
+
+        let turns_while_held = Arc::new(AtomicUsize::new(0));
+        let probe = tokio::spawn({
+            let (hung, turns) = (Arc::clone(&hung), Arc::clone(&turns_while_held));
+            async move {
+                loop {
+                    if hung.held() {
+                        turns.fetch_add(1, SeqCst);
+                    }
+                    tokio::task::yield_now().await;
+                }
+            }
+        });
+        let delivering =
+            tokio::spawn(async move { deliver(&client, &policy, &job, &delivery).await });
+        hung.until_entered().await;
+        for _ in 0..100 {
+            tokio::task::yield_now().await;
+        }
+        assert!(
+            turns_while_held.load(SeqCst) > 0,
+            "the runtime ran nothing while the lookup was held"
+        );
+        assert!(hung.held(), "the lookup returned before the runtime ran anything else");
+        probe.abort();
+
+        tokio::time::advance(DELIVERY_TIMEOUT).await;
+        for _ in 0..100 {
+            if delivering.is_finished() {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        assert!(delivering.is_finished(), "the delivery outlived its deadline");
+        assert!(hung.held(), "premise: the lookup is still unanswered");
+        let err = delivering.await.unwrap().unwrap_err();
+        assert_eq!(err.message, "the host did not resolve within the 10 s delivery timeout");
+        assert!(!err.lookups_busy, "a lookup that ran out the deadline counts as a failure");
+        hung.release();
+    }
+
+    /// **A stop during a hung lookup does not wait for it.** The supervisor
+    /// stops the dispatcher by aborting it, which lands at its next yield; the
+    /// lookup holds a blocking-pool thread, not the task, so the delivery ends
+    /// at once and the lookup is left to finish with nobody waiting.
+    #[tokio::test(start_paused = true)]
+    async fn a_stop_during_a_hung_lookup_ends_the_delivery_without_waiting_for_the_lookup() {
+        let hung = HungLookup::new();
+        let policy =
+            EgressPolicy::new(crate::egress::WEBHOOKS, Vec::new()).with_lookup(hung.lookup());
+        let client = client(&policy).unwrap();
+        let (job, delivery) = a_delivery("http://hangs.example/hook");
+        let delivering =
+            tokio::spawn(async move { deliver(&client, &policy, &job, &delivery).await });
+        hung.until_entered().await;
+
+        delivering.abort();
+        let ended = delivering.await;
+        assert!(ended.as_ref().is_err_and(|e| e.is_cancelled()), "{ended:?}");
+        assert!(hung.held(), "the delivery ended while the lookup was still unanswered");
+        hung.release();
+    }
+
+    /// **A delivery whose host was not looked up, because the node's lookups
+    /// were all busy, does not count against its subscription's backoff.** The
+    /// lookups can be filled by somebody else's names; counting them would back
+    /// every subscription off for up to five minutes on another's doing. It is
+    /// failed, counted and logged, and tried again at the next pass. A host
+    /// that was looked up and did not resolve still counts.
+    #[tokio::test]
+    async fn a_delivery_refused_for_busy_lookups_is_retried_at_the_next_pass_without_backoff() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = crate::state::tests::a_state(&dir);
+        let coll = state.engine.create_collection("shop", "orders").unwrap();
+        subscribe(
+            &state,
+            "wh_a",
+            bson::doc! {
+                "url": "http://busy.example/hook", "secret": "s", "database": "shop",
+                "collection": "orders", "operations": ["insert"],
+            },
+        );
+        state.engine.insert(&coll, bson::doc! { "_id": 1 }).unwrap();
+
+        let hung = HungLookup::new();
+        let policy =
+            EgressPolicy::new(crate::egress::WEBHOOKS, Vec::new()).with_lookup(hung.lookup());
+        let holders: Vec<_> = (0..crate::egress::MAX_LOOKUPS_IN_FLIGHT)
+            .map(|i| {
+                let policy = policy.clone();
+                tokio::spawn(
+                    async move { policy.check_async(&format!("http://h{i}.example/")).await },
+                )
+            })
+            .collect();
+        for _ in 0..10 {
+            tokio::task::yield_now().await;
+        }
+
+        let client = client(&policy).unwrap();
+        let mut backoff = Backoff::default();
+        let (me, live) = (NodeId::generate(), BTreeSet::new());
+        for pass in 0..2 {
+            let outcome =
+                dispatch_once(&state, &client, &policy, me, &live, &mut backoff, Limits::default())
+                    .await;
+            assert_eq!(
+                (outcome.failed, outcome.skipped_backoff),
+                (1, 0),
+                "pass {pass}: {outcome:?}"
+            );
+            assert_eq!(backoff.failure_count("wh_a"), 0, "pass {pass}");
+        }
+
+        hung.release();
+        for holder in holders {
+            let _ = holder.await;
+        }
+        let outcome =
+            dispatch_once(&state, &client, &policy, me, &live, &mut backoff, Limits::default())
+                .await;
+        assert_eq!(outcome.failed, 1, "{outcome:?}");
+        assert_eq!(backoff.failure_count("wh_a"), 1, "a host that did not resolve counts");
+    }
+
+    /// **Behind a proxy, the check before the send is the only check of the
+    /// target.** A client that sends through a proxy, as one honouring
+    /// `HTTP_PROXY` does, dials the proxy, so its own checked resolver is asked
+    /// about the proxy and never about the target. A host that resolves inward
+    /// has to be refused by the check `deliver` makes first, and the request
+    /// must never reach the proxy.
+    #[tokio::test]
+    async fn behind_a_proxy_the_check_before_the_send_refuses_an_inward_host() {
+        use std::sync::atomic::{AtomicUsize, Ordering::SeqCst};
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        // A proxy that answers every request `200` and counts them.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let proxy = listener.local_addr().unwrap();
+        let requests = Arc::new(AtomicUsize::new(0));
+        let counted = Arc::clone(&requests);
+        tokio::spawn(async move {
+            loop {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                counted.fetch_add(1, SeqCst);
+                let mut buf = vec![0u8; 4096];
+                let _ = socket.read(&mut buf).await;
+                let _ = socket
+                    .write_all(b"HTTP/1.1 200 OK\r\ncontent-length: 0\r\nconnection: close\r\n\r\n")
+                    .await;
+            }
+        });
+
+        let inward: crate::egress::Lookup =
+            Arc::new(|_host: &str| Ok(vec!["10.0.0.5".parse().unwrap()]));
+        let policy = EgressPolicy::new(crate::egress::WEBHOOKS, Vec::new()).with_lookup(inward);
+        // The delivery client as `client` builds it, sending through the proxy.
+        let client = reqwest::Client::builder()
+            .redirect(reqwest::redirect::Policy::none())
+            .dns_resolver(Arc::new(crate::egress::CheckedResolver::new(policy.clone())))
+            .proxy(reqwest::Proxy::http(format!("http://{proxy}")).unwrap())
+            .build()
+            .unwrap();
+
+        // Premise: the client's own resolver never sees the target. Sent
+        // straight, the request goes through the proxy and is answered.
+        let straight = client.post("http://inward.example/hook").send().await.unwrap();
+        assert!(straight.status().is_success(), "{}", straight.status());
+        assert_eq!(requests.load(SeqCst), 1);
+
+        let (job, delivery) = a_delivery("http://inward.example/hook");
+        let err = deliver(&client, &policy, &job, &delivery).await.unwrap_err().message;
+        assert!(err.contains("10.0.0.5") && err.contains("not a public address"), "{err}");
+        assert_eq!(requests.load(SeqCst), 1, "the refused delivery reached the proxy");
     }
 
     /// The subscription counts are read from the registry at the scrape

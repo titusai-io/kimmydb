@@ -188,7 +188,7 @@ pub async fn configure_vectors(
 ) -> Result<Json<Value>, ApiError> {
     auth.require(Action::Ddl, &db, Some(&coll))?;
     let body: VectorConfig = body.into();
-    admit_provider(&state, &body.provider)?;
+    admit_provider(&state, &body.provider).await?;
     // A schema change, off the async worker: it creates the shadow
     // collection, and waits for the single writer to do it.
     let meta = kimmy_storage::blocking(|| state.engine.configure_vectors(&db, &coll, body))?;
@@ -214,11 +214,17 @@ pub async fn configure_vectors(
 /// provider is built — the second because a configuration also arrives by
 /// replication. A refusal is a `400` naming the variable or the host, never
 /// a value: the policy refuses the *name* before anything reads it (ADR-115).
-fn admit_provider(
+async fn admit_provider(
     state: &SharedState,
     provider: &kimmy_core::ProviderConfig,
 ) -> Result<(), ApiError> {
-    state.providers.check_configure(provider).map_err(|e| ApiError::bad_request(e.to_string()))
+    state.providers.check_configure(provider).await.map_err(|e| match &e {
+        // The node's lookups were busy: its state, not the configuration's.
+        kimmy_vector::PolicyError::Endpoint(refused) if refused.is_lookups_busy() => {
+            ApiError::resolver_busy(refused.to_string())
+        }
+        _ => ApiError::bad_request(e.to_string()),
+    })
 }
 
 pub async fn get_vector_config(
@@ -1292,6 +1298,9 @@ fn vector_error(e: kimmy_vector::VectorError) -> ApiError {
             ErrorCode::Misconfigured,
             e.to_string(),
         ),
+        // The node's own lookups were busy: not the provider's failure, and
+        // not a `502`.
+        V::ResolverBusy { .. } => ApiError::resolver_busy(e.to_string()),
         V::Transport { .. } | V::ProviderRejected { .. } | V::MalformedResponse { .. } => {
             ApiError::new(StatusCode::BAD_GATEWAY, ErrorCode::ProviderError, e.to_string())
         }
@@ -1347,8 +1356,8 @@ mod tests {
         }
     }
 
-    #[test]
-    fn configure_time_refuses_a_node_secret_and_a_private_endpoint_by_name() {
+    #[tokio::test]
+    async fn configure_time_refuses_a_node_secret_and_a_private_endpoint_by_name() {
         // The finding, at the door: a `400` that names the variable or the
         // host and the setting that governs it, so the person who typed the
         // configuration learns why while they are still watching.
@@ -1361,34 +1370,124 @@ mod tests {
             "KIMMY_ROOT_PASSWORD",
             "KIMMY_JWT_PREVIOUS_SECRET",
         ] {
-            let err =
-                admit_provider(&state, &openai(Some("https://93.184.216.34"), var)).expect_err(var);
+            let err = admit_provider(&state, &openai(Some("https://93.184.216.34"), var))
+                .await
+                .expect_err(var);
             assert_eq!(err.status, StatusCode::BAD_REQUEST);
             assert!(err.message.contains(var), "{var}: {}", err.message);
             assert!(err.message.contains("api_key_env"), "{}", err.message);
         }
 
-        let err = admit_provider(&state, &openai(None, "SOMEBODY_ELSES_KEY")).unwrap_err();
+        let err = admit_provider(&state, &openai(None, "SOMEBODY_ELSES_KEY")).await.unwrap_err();
         assert_eq!(err.status, StatusCode::BAD_REQUEST);
         assert!(err.message.contains("SOMEBODY_ELSES_KEY"), "{}", err.message);
         assert!(err.message.contains("vector.provider.allowed_key_env"), "{}", err.message);
 
         let lan =
             ProviderConfig::Ollama { model: "m".into(), endpoint: "http://10.0.0.5:11434".into() };
-        let err = admit_provider(&state, &lan).unwrap_err();
+        let err = admit_provider(&state, &lan).await.unwrap_err();
         assert_eq!(err.status, StatusCode::BAD_REQUEST);
         assert!(err.message.contains("10.0.0.5"), "{}", err.message);
         assert!(err.message.contains("vector.provider.allowed_hosts"), "{}", err.message);
 
         // The defaults, and the provider namespace, pass with nothing set.
-        admit_provider(&state, &openai(None, "OPENAI_API_KEY")).unwrap();
+        admit_provider(&state, &openai(None, "OPENAI_API_KEY")).await.unwrap();
         admit_provider(&state, &openai(Some("https://93.184.216.34"), "KIMMY_PROVIDER_ACME"))
+            .await
             .unwrap();
-        admit_provider(&state, &ProviderConfig::Byo {}).unwrap();
+        admit_provider(&state, &ProviderConfig::Byo {}).await.unwrap();
     }
 
-    #[test]
-    fn a_locked_node_accepts_only_profiles_byo_and_local() {
+    /// Spawn `n` checks that hold lookups of names that never answer, on the
+    /// request path's bound or the node's own.
+    fn hold_lookups(
+        egress: &crate::egress::EgressPolicy,
+        n: usize,
+        request: bool,
+    ) -> Vec<tokio::task::JoinHandle<Result<(), crate::egress::EgressError>>> {
+        (0..n)
+            .map(|i| {
+                let egress = egress.clone();
+                tokio::spawn(async move {
+                    let url = format!("http://held{i}.example/");
+                    if request {
+                        egress.check_for_request(&url).await
+                    } else {
+                        egress.check_async(&url).await
+                    }
+                })
+            })
+            .collect()
+    }
+
+    /// The `503 resolver_busy` a request gets when the host it must resolve
+    /// was not looked up, with its `Retry-After`.
+    fn assert_resolver_busy(err: ApiError) {
+        assert_eq!(err.status, StatusCode::SERVICE_UNAVAILABLE, "{}", err.message);
+        assert_eq!(err.code, ErrorCode::ResolverBusy, "{}", err.message);
+        assert_eq!(err.retry(), crate::error::Retry::Wait);
+        assert!(err.message.contains("lookups are already waiting"), "{}", err.message);
+        let response = axum::response::IntoResponse::into_response(err);
+        assert_eq!(response.headers()["retry-after"], "5");
+    }
+
+    /// **Configure time answers `503 resolver_busy` while the request path's
+    /// lookups are full.** The endpoint's host was not looked up, which is
+    /// this node's state and not the configuration's, so not a `400`.
+    #[tokio::test]
+    async fn configure_time_answers_resolver_busy_while_the_requests_lookups_are_full() {
+        let hung = crate::dispatch::tests::HungLookup::new();
+        let policy = kimmy_vector::ProviderPolicy::default().with_egress_lookup(hung.lookup());
+        let dir = tempfile::tempdir().unwrap();
+        let state = live_state_with(&dir, policy);
+        let holders = hold_lookups(
+            state.providers.egress(),
+            crate::egress::MAX_REQUEST_LOOKUPS_IN_FLIGHT,
+            true,
+        );
+        for _ in 0..10 {
+            tokio::task::yield_now().await;
+        }
+        let err = admit_provider(&state, &openai(Some("https://new.example"), "OPENAI_API_KEY"))
+            .await
+            .unwrap_err();
+        assert_resolver_busy(err);
+        hung.release();
+        for holder in holders {
+            let _ = holder.await;
+        }
+    }
+
+    /// **A search's query answers `503 resolver_busy`, not `502
+    /// provider_error`, while the node's lookups are full.** The provider was
+    /// never reached; the bound that refused it is this node's.
+    #[tokio::test]
+    async fn a_search_answers_resolver_busy_while_the_nodes_lookups_are_full() {
+        let hung = crate::dispatch::tests::HungLookup::new();
+        let policy = kimmy_vector::ProviderPolicy::default().with_egress_lookup(hung.lookup());
+        let dir = tempfile::tempdir().unwrap();
+        let state = live_state_with(&dir, policy);
+        let holders =
+            hold_lookups(state.providers.egress(), crate::egress::MAX_LOOKUPS_IN_FLIGHT, false);
+        for _ in 0..10 {
+            tokio::task::yield_now().await;
+        }
+        let mut c = config();
+        c.provider = ProviderConfig::CustomHttp {
+            endpoint: "http://new.example/embed".into(),
+            api_key_env: None,
+        };
+        let body = SearchRequest { query: Some("hello".into()), ..Default::default() };
+        let err = resolve_query_vector(&state, &c, &body).await.unwrap_err();
+        assert_resolver_busy(err);
+        hung.release();
+        for holder in holders {
+            let _ = holder.await;
+        }
+    }
+
+    #[tokio::test]
+    async fn a_locked_node_accepts_only_profiles_byo_and_local() {
         let mut profiles = std::collections::BTreeMap::new();
         profiles.insert(
             "corp".to_string(),
@@ -1404,14 +1503,15 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let state = live_state_with(&dir, policy);
 
-        let err = admit_provider(&state, &openai(None, "OPENAI_API_KEY")).unwrap_err();
+        let err = admit_provider(&state, &openai(None, "OPENAI_API_KEY")).await.unwrap_err();
         assert_eq!(err.status, StatusCode::BAD_REQUEST);
         assert!(err.message.contains("endpoints_locked"), "{}", err.message);
 
-        admit_provider(&state, &ProviderConfig::Profile { name: "corp".into() }).unwrap();
-        admit_provider(&state, &ProviderConfig::Byo {}).unwrap();
-        let err =
-            admit_provider(&state, &ProviderConfig::Profile { name: "nope".into() }).unwrap_err();
+        admit_provider(&state, &ProviderConfig::Profile { name: "corp".into() }).await.unwrap();
+        admit_provider(&state, &ProviderConfig::Byo {}).await.unwrap();
+        let err = admit_provider(&state, &ProviderConfig::Profile { name: "nope".into() })
+            .await
+            .unwrap_err();
         assert!(err.message.contains("vector.providers.nope"), "{}", err.message);
 
         // The accepted configuration stores the profile's *name* and reads

@@ -690,6 +690,7 @@ async fn a_new_subscription_does_not_replay_history() {
         &request,
         &EgressPolicy::new(WEBHOOKS, vec!["127.0.0.1".into()]),
     )
+    .await
     .expect("registration");
 
     assert_eq!(pass(&state).await.delivered, 0, "history must not be replayed");
@@ -904,6 +905,7 @@ async fn removing_a_subscription_stops_delivery_and_clears_its_progress() {
         },
         &EgressPolicy::new(WEBHOOKS, vec!["127.0.0.1".into()]),
     )
+    .await
     .expect("registration");
     let id = registered["id"].as_str().unwrap().to_string();
 

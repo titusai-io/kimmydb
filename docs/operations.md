@@ -60,7 +60,7 @@ fails fast on a bad volume mount.
 | `server.rate_limit.max_tracked_keys` | — | `100000` | Bounds the limiters' own memory; the key space is attacker-controlled |
 | `server.rate_limit.per_principal` | `KIMMY_RATE_LIMIT_PER_PRINCIPAL` | `0` | Requests per authenticated principal per window, on every route that takes a token. `0` disables — the default. See [Security](security.md#limits-on-authenticated-requests) |
 | `server.rate_limit.per_principal_window_secs` | `KIMMY_RATE_LIMIT_PER_PRINCIPAL_WINDOW_SECS` | `60` | |
-| `server.request_timeout_secs` | `KIMMY_REQUEST_TIMEOUT_SECS` | `30` | Deadline for a request still waiting for its body or for an embedding provider; `503 timeout` past it. Not a query timeout — storage work already running completes. Change streams, `/mcp` and `GET /v1/admin/backup` are exempt |
+| `server.request_timeout_secs` | `KIMMY_REQUEST_TIMEOUT_SECS` | `30` | Deadline for a request still waiting for its body, for an embedding provider, or for the lookup of a webhook's or provider's host; `503 timeout` past it. Not a query timeout — storage work already running completes. Change streams, `/mcp` and `GET /v1/admin/backup` are exempt |
 | `server.max_body_bytes` | `KIMMY_MAX_BODY_BYTES` | `2097152` | Largest request body; `413 payload_too_large` over it. The default is what every release has enforced |
 | `storage.cache_bytes` | — | `268435456` | Bound on redb's page cache — most of the node's resident memory. Filled by reads and never released on a timer, so RSS settles at the busiest period's level; raise it for a large, latency-sensitive database, lower it for a small footprint |
 | `vector.index_cache.max_bytes` | — | `536870912` | Bound on the HNSW graphs kept in memory across vector collections, least recently searched evicted first. About `dim × 4 + 5,000` bytes per chunk (6.5 KB at 384 dimensions, 11 KB at 1,536); size it so the routinely searched collections fit, or their searches pay a rebuild. A single graph over the whole bound is held anyway. `0` lifts the bound (ADR-103) |
@@ -104,8 +104,9 @@ fails fast on a bad volume mount.
 Three of the settings above bound what one authenticated caller can cost the
 node ([ADR-099](decisions.md)), and each defaults to what the server already
 did. `request_timeout_secs` is a deadline on *waiting*: a request whose body
-is still trickling in, or whose embedding-provider call has stalled, is
-abandoned with `503 timeout` at 30 s. It does not cut short storage work — a
+is still trickling in, or whose embedding-provider call or lookup of a
+webhook's or provider's host has stalled, is abandoned with `503 timeout` at
+30 s. It does not cut short storage work — a
 scan, a bulk commit or an index backfill runs to completion and is answered
 normally — so raising it is about slow clients and slow providers, never about
 slow queries. `max_body_bytes` is the ceiling axum always applied, now yours to
@@ -462,6 +463,24 @@ node's `resolv.conf`, so with a resolver that may not answer, set for example
 `options timeout:2 attempts:2`, or expect stops of up to 22 s. A stop between
 lookups does not wait, and `dns-srv:` seeds never hold a stop.
 
+**Webhook and embedding provider hosts are looked up the same way.** The egress
+check before each webhook delivery and each embedding provider call resolves the
+host with `getaddrinfo` on the blocking pool, never on a runtime worker. A lookup
+that has not answered fails the delivery at its 10 s timeout, or the provider
+call at its 10 s connect timeout, and is retried as an endpoint that does not
+answer is. The lookups are bounded for a resolver that has stopped answering:
+checks of one host share one lookup, a failed lookup is not repeated for that
+host for 5 s, and at most 16 run at once, process-wide, for deliveries and
+provider calls, past which a check fails at once with `cannot resolve "…" now:
+16 lookups are already waiting on the resolver`. A delivery refused that way is
+tried again at the next pass and does not count against its subscription's
+backoff. Checks made on a client's request (registering a webhook, configuring
+a provider) have **4 slots of their own**, so a client registering names that
+never answer cannot take the node's; past them the request is answered `503
+resolver_busy` with `Retry-After: 5`, as is a search whose query's provider
+lookup is refused for busy lookups. A stop waits for a lookup in flight as it
+does for a `dns:` lookup, and the same resolver options bound it.
+
 **`dns-srv:` is the one form where peers need not agree on a port**, because
 each record carries its own:
 
@@ -520,6 +539,7 @@ a provider this member cannot build is one only an operator can.
 | `misconfigured` | `ERROR` | This member cannot build the embedding provider a stored vector configuration names, while some other member could: an unset environment variable, an egress policy that refuses it, a profile it does not define. It is silent until somebody searches that collection *on this member*, so the first line is the whole warning you get. **Page** |
 | `snapshot` | `ERROR` | A vector index snapshot on this node's disk could not be written or read back. The cache is supposed to absorb this by discarding and rebuilding, so one reaching a response means that did not happen — a fault on top of whatever the disk did. **Page** |
 | `timeout` | `WARN` | The request was abandoned at `server.request_timeout_secs` while waiting for the rest of its body or for an embedding provider. One is usually a slow client; a *rise* is worth looking at, and the level does not distinguish the two causes because the deadline is enforced above the code that knows which one it was |
+| `resolver_busy` | `WARN` | A host the request had to resolve (a webhook's on registration, an embedding provider's on configuration or on a search's query) was not looked up, because the lookups this node allows at once were all waiting on the resolver ([Discovery formats](#discovery-formats)). Nothing was done; the client is told to wait, with `Retry-After`. One is a resolver slow for a moment or a client registering names that never answer; **a rise is a resolver that has stopped answering**, and that is yours |
 | `provider_error` | `WARN` | An upstream embedding provider failed. Nobody needs to act on one; a rise is a quota, a revoked key, or a provider that is down, and those are yours. Pair it with `kimmy_embed_provider_errors_total{kind}`, which says at which layer |
 | `not_implemented` | `INFO` | A caller asked for a capability that is reserved and does not exist yet. There is no operator action — no configuration turns it on — so it is recorded and nothing more. **One exception, which logs `ERROR`**: a node that cannot build *local embeddings* returns this same code, and that is a member provisioned unlike its cluster; every search of that collection landing here fails, and behind a load balancer the other members hide it |
 
@@ -880,8 +900,8 @@ the series; every series the endpoint exposes has a row.
 | `kimmy_embed_deferred_total` | Documents this member holds but does not own the embedding of, held for a later re-check rather than embedded on arrival — including a document written here, whose writer holds it until the owner embeds it |
 | `kimmy_embed_skipped_not_owned_total` | Documents this node dropped un-embedded because another node owns embedding for the collection ([Vectors](vectors.md#throughput-and-why-more-nodes-do-not-embed-one-collection-faster)). Each is a duplicate provider call not made: before ownership, every member embedded every document, and on a three-member cluster that was three calls for one |
 | `kimmy_embed_skipped_no_shadow_total` | Documents, rescans and backfills the embedding worker skipped because a collection is configured for vectors and its shadow collection, where its vectors are stored, is not on this node ([ADR-178](decisions.md)). **Should read 0.** A configuration can stand without its shadow when it was restored from a snapshot page that did not carry the shadow, or applied from an entry older than a drop of the shadow this node holds; the worker skips such a collection, warns once per scan, and goes on, where it used to stop for good. Configuring the collection again makes the shadow |
-| `kimmy_embed_failures_total` | Failed provider calls, counting each retry. Climbing while `kimmy_embed_documents_total` stays flat is a provider outage |
-| `kimmy_embed_provider_errors_total{kind}` | Provider calls that failed before any response, by what failed: `connect` (DNS, TCP, TLS), `timeout`, `reset` (the far side closed an open connection), `other`. Where `kimmy_embed_failures_total` says a call failed, this says at which layer |
+| `kimmy_embed_failures_total` | Failed provider calls, counting each retry. A call whose endpoint lookup failed counts too, though no request was made: the egress check before the call could not resolve the host, timed out, or was refused for busy lookups. Climbing while `kimmy_embed_documents_total` stays flat is a provider outage |
+| `kimmy_embed_provider_errors_total{kind}` | Provider calls that failed before any response, by what failed: `connect` (DNS, the egress check's lookup of the endpoint's host included, TCP, TLS), `timeout`, `reset` (the far side closed an open connection), `other`. Where `kimmy_embed_failures_total` says a call failed, this says at which layer |
 | `kimmy_databases`, `kimmy_collections` | Counts, not names |
 | `kimmy_storage_bytes` | Size of the database file |
 | `kimmy_store_repairs_total{rolled_back}` | Repairs redb made when this process opened the store, after an unclean stop: `rolled_back="false"` kept every commit, `rolled_back="true"` discarded the latest commit, which failed verification. At most one per process, so each reads 0 or 1; the start logs the same at `WARN` (`database repaired after an unclean stop`, with `rolled_back`). A rollback is the commit the stop interrupted, or damage to it; **after a clean shutdown it means the store is damaged**: stop the member and run [`kimmyd check-store`](#checking-a-store) ([ADR-204](decisions.md)) |
@@ -995,8 +1015,8 @@ completions, so an ordinary slow pass does not fire it.
 |---|---|---|
 | `replication` | `kimmy_replication_lag_seconds` and `kimmy_sync_divergent_collections`. Not `kimmy_sync_peers_backing_off`, which the loop writes on every tick, failed rounds included, so it stays live exactly when rounds are failing and this age is climbing. It freezes too if the loop itself is stuck, as every figure the loop writes does | 4 × `cluster.sync_interval_secs`: a round completes once a tick while any peer answers, and a tick that runs long delays the next by up to an interval |
 | `stall_probe` | `kimmy_runtime_stall_seconds` | 2 s or more. The probe wakes every 250 ms, but ages are whole seconds, so a healthy probe reads 0 or 1 |
-| `webhook_dispatcher` | `kimmy_webhook_backlog_seconds` | 24 s: 2 × (10 s, the longest one delivery may take, + 2 s between passes). A pass delivers `webhooks.max_concurrent_deliveries` at a time, so each further round of that many deliveries in one pass adds 10 s to the gap |
-| `embedding_worker` | the `kimmy_embed_*` counters: flat is only "nothing to embed" while this is fresh | 130 s: 2 × (5 s between idle turns + 60 s, the provider call's timeout). A backfill after a vector configuration change resets it with each batch it stores, so a long one does not trip it |
+| `webhook_dispatcher` | `kimmy_webhook_backlog_seconds` | 24 s: 2 × (10 s, the longest one delivery may take, the lookup of its host included, + 2 s between passes). A pass delivers `webhooks.max_concurrent_deliveries` at a time, so each further round of that many deliveries in one pass adds 10 s to the gap |
+| `embedding_worker` | the `kimmy_embed_*` counters: flat is only "nothing to embed" while this is fresh | 150 s: 2 × (5 s between idle turns + 10 s, the lookup of the endpoint's host before the call, + 60 s, the provider call's timeout). A backfill after a vector configuration change resets it with each batch it stores, so a long one does not trip it |
 | `drop_purger` | none of its own: it bounds how long what a collection drop held stays on disk, and how long a creation of that name answers `503 collection_purging` | 15 s: 2 × (5 s between idle turns + 2.5 s for one chunk and one owed check). Its wait for the storage writer is held out of the age, so a purger queued behind an index build reads fresh; a writer that is never released shows on `kimmy_write_lock_wait_seconds` instead ([ADR-189](decisions.md)) |
 
 For the embedding worker, **a provider outage holds this age up**. That shows

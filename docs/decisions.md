@@ -6377,6 +6377,9 @@ llama.cpp on `localhost` or a LAN address needs its host listed in
 clients no longer follow redirects, so a provider that answers `302` fails
 where it used to work. One more workspace crate. A configure-time and a
 build-time DNS resolution per provider, the same cost webhooks already pay.
+*(Amended 2026-10-01: a build no longer resolves the endpoint's host; its
+addresses are checked before each call instead, off the runtime's workers. See
+ADR-199's addendum of that date.)*
 What remains out of scope is narrower than before and stated in the threat
 model: a `ddl` holder on an unlocked node choosing a *public* endpoint under
 a listed key can send that collection's text — and that key — there. Binding
@@ -21630,6 +21633,114 @@ one-worker runtime over 200 expired documents, with each walked row slowed to
 5 ms. A spawned task measures how late a 10 ms timer fires while the pass runs.
 With the wrap, the worst was about 2.5 ms over a pass of about 2.5 s. With the
 wrap removed, the test failed at 1.23 s late.
+
+**Addendum, 2026-10-01: an egress check's lookup runs on the blocking pool, under
+the deadline of what it guards.** The same class of stall, from DNS rather than
+storage. `EgressPolicy::check` resolved a host with a blocking `getaddrinfo`, and
+three async paths called it on their worker: the webhook dispatcher before each
+delivery, outside `DELIVERY_TIMEOUT`; the embedding worker and a search that
+embeds its query, through `provider::build`; and, on the request's worker,
+webhook registration and a provider's configure-time check. A resolver that does
+not answer holds `getaddrinfo` for its own timeout, thirty seconds and more with
+search domains or `ndots:5`, and no timeout around the caller can cut it short.
+A pass's deliveries share one task, so they waited one after another, and an
+embedding provider whose host did not resolve was never cached, so every retry,
+5 s apart, built it and blocked again.
+
+- **`EgressPolicy::check_async`** asks what needs no resolver first (shape,
+  allowlist, literal address: `check_unresolved`), then hands the lookup to the
+  blocking pool and checks every address it answers. The blocking `check` stays,
+  for startup and `check-config`.
+- **A delivery's check and send share one deadline**, `DELIVERY_TIMEOUT` from
+  the start of the check. A lookup that runs it out is a failure of that
+  delivery, retried under the subscription's backoff, and not a policy refusal.
+- **A provider build resolves nothing.** `ProviderPolicy::check_provider` checks
+  the key variable and `check_unresolved`; `HttpProvider::embed` checks the
+  host's addresses before each call, under `CONNECT_TIMEOUT`. An unresolvable
+  host, or a lookup that runs the timeout out, is a retryable `connect`
+  failure, and the provider stays cached. A host that resolves to a refused
+  address is the permanent refusal ADR-115 describes: the worker remembers it,
+  says it once and drops the provider, and does not count it as a failed call.
+  **That refusal is permanent for the configuration on that member**, until the
+  collection is reconfigured or the node restarts: a host that resolves inward
+  even once (a split-horizon resolver, a record changed for a moment) stops
+  that collection's embedding there for good, even after it resolves publicly
+  again. It fails closed, and that is accepted: a destination that was private
+  once is not trusted again on the strength of a later answer. The `ERROR` line
+  names the host; the remedy is to list it in `vector.provider.allowed_hosts`
+  if it is meant, or fix the record, and then reconfigure or restart.
+- **Registration and configure time** await the same check, under the request's
+  deadline (ADR-099).
+- **The lookups are bounded, process-wide.** A deadline abandons the wait, not
+  the lookup, which holds its blocking thread until the resolver answers; during
+  an outage, retries would otherwise pile up threads. Checks of one host share
+  one lookup, and share its addresses, never a verdict: each policy judges them
+  against its own allowlist. Only a failure is kept, for 5 s. At most 16 run at
+  once for the node's own requests (deliveries, provider calls), and **4 more
+  for checks made on a client's request** (registration, configure time),
+  counted apart, so a client registering names that never answer fills only
+  its own 4. Past its bound a check fails at once with `Refusal::LookupsBusy`,
+  which, like `Unresolvable`, is transient (`EgressError::is_transient`). A
+  lookup leaves the count when its thread is done, whoever is still waiting,
+  and a lookup that panics leaves it too.
+- **What `LookupsBusy` becomes.** It is the node's state, not the URL's, so it
+  is answered apart from a host that does not resolve:
+  - at registration, configure time and a search's query, a new code,
+    **`503 resolver_busy`**, retry `wait`, with `Retry-After: 5`, the time a
+    failed lookup is kept, and logged at `WARN`. `wait` rather than
+    `elsewhere`: the slots are this node's, but what fills them is a resolver
+    that does not answer, which a cluster's members usually share. A host that
+    does not resolve stays a `400` there, and a `502 provider_error` on a
+    search;
+  - for a delivery, a failure that is **not counted against the
+    subscription's backoff**, and is tried again at the next pass: the slots
+    can be filled by another tenant's names, and counting them would back
+    every subscription off for up to five minutes on another's doing;
+  - for an embedding call, a retried `connect` failure (`VectorError::
+    ResolverBusy`), counted as one.
+
+  What remains is a delivery-path flood: names that resolve at registration
+  and then stop answering hold delivery slots, each subscription at most one
+  lookup per backoff period. The threat model states the bound.
+
+**The pre-check is not redundant with `CheckedResolver`.** Both clients leave
+`reqwest`'s system-proxy detection on, and behind `HTTP_PROXY` the client
+resolves only the proxy's name, so the check before the send is the only check
+of the target's addresses. It stays before every delivery and every provider
+call.
+
+**A stop.** The dispatcher and the embedding worker now await the lookup, so the
+supervisor's abort lands at once rather than when `getaddrinfo` returns. The
+lookup itself holds a blocking-pool thread, and the runtime's shutdown waits for
+it as it waits for a `dns:` seed's lookup (ADR-202's addendum): never past the
+stop budget. Measured on a two-worker runtime with a lookup that never answers:
+the aborted delivery ended in 0.3 ms, where the blocking check had not ended
+5 s after the abort; `shutdown_timeout(3 s)` took its full 3 s either way.
+
+**Alternatives.** *A detached thread per lookup*, which a shutdown would not
+wait for: not taken here, as the blocking pool is what `dns:` seeds use and the
+stop's wait for both is one question. *Resolving with the async resolver the SRV
+lookup uses*: it would make the lookup cancellable, and is the same change for
+seeds and egress; not part of this one.
+
+**Tests.** On a runtime of one thread with paused time, a probe task counts the
+turns it gets while an injected lookup is held: the delivery and the provider
+call each fail at their own deadline with the lookup still held, and with the
+blocking check restored the probe gets none. An aborted delivery ends with its
+lookup still held. Behind a proxy that answers every request, a host resolving
+to a private address is refused and the proxy sees nothing. A provider whose
+host does not resolve is built once, asks no resolver to build, and its call is
+a counted `connect` failure. In `kimmy-egress`: eight concurrent checks of one
+hung host start one lookup; a failed lookup is not repeated within 5 s and is
+after; sixteen abandoned lookups refuse a seventeenth host at once without a
+lookup, while a host already in flight is joined; a request's lookups and the
+node's are bounded apart; a successful answer is never reused; policies sharing
+lookups keep their own verdicts; and twice the bound of panicking lookups leave
+nothing in flight. With the request path's 4 slots held, registration and
+configure time answer `503 resolver_busy` with `Retry-After: 5`, and so does a
+search with the node's 16 held; a delivery refused for busy lookups fails two
+passes in a row with no backoff, and one whose host does not resolve then
+backs off.
 
 ## ADR-200 — `GET …/violations` reads a table of its own records, not the retained oplog
 

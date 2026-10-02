@@ -79,6 +79,14 @@ pub enum VectorError {
     #[error("could not reach the {provider} embedding provider ({kind}): {detail}")]
     Transport { provider: &'static str, kind: TransportKind, detail: String },
 
+    /// The endpoint's host was not looked up: the node's lookups were all
+    /// waiting on the resolver ([`kimmy_egress::MAX_LOOKUPS_IN_FLIGHT`]). A
+    /// condition of the moment, retried like a connect failure, and counted as
+    /// one; split from [`Self::Transport`] so a search can answer it as the
+    /// node's own state rather than the provider's.
+    #[error("could not reach the {provider} embedding provider (connect): {detail}")]
+    ResolverBusy { provider: &'static str, detail: String },
+
     #[error("the {provider} embedding provider returned {status}: {detail}")]
     ProviderRejected { provider: &'static str, status: u16, detail: String },
 

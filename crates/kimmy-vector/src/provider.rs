@@ -50,7 +50,7 @@ use crate::error::{Result, TransportKind, VectorError};
 use crate::policy::{PolicyError, ProviderPolicy};
 
 /// How long a connection attempt may take before it counts as failed.
-const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+pub(crate) const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 /// The whole request, connect included. A hung provider must not hold the
 /// worker's position forever; the worker's own retry takes it from here.
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(60);
@@ -72,9 +72,9 @@ const RETRY_PAUSE: Duration = Duration::from_millis(250);
 ///
 /// The client resolves names through the address policy and follows no
 /// redirect, for the reasons the webhook delivery client does the same
-/// (ADR-115): the endpoint was checked when the provider was built, but a
-/// name can resolve inward later, and a permitted host answering `302` to a
-/// private address would otherwise walk the request through the policy.
+/// (ADR-115): the endpoint is checked before each call, but a name can resolve
+/// inward between the check and the dial, and a permitted host answering `302`
+/// to a private address would otherwise walk the request through the policy.
 fn http_client(policy: &ProviderPolicy) -> reqwest::Client {
     reqwest::Client::builder()
         .connect_timeout(CONNECT_TIMEOUT)
@@ -88,6 +88,18 @@ fn http_client(policy: &ProviderPolicy) -> reqwest::Client {
         // The builder only fails when a TLS backend cannot initialise, which
         // is a broken build rather than a runtime condition.
         .expect("HTTP client")
+}
+
+/// What a provider reaches its endpoint with: the client, and the address
+/// policy its endpoint is checked against before each call
+/// ([`HttpProvider::check_destination`]).
+struct Outbound {
+    http: reqwest::Client,
+    egress: kimmy_egress::EgressPolicy,
+}
+
+fn outbound(policy: &ProviderPolicy) -> Outbound {
+    Outbound { http: http_client(policy), egress: policy.egress().clone() }
 }
 
 /// The URL an OpenAI-dialect endpoint setting resolves to.
@@ -154,6 +166,13 @@ pub trait EmbeddingProvider: Send + Sync {
 /// the endpoint are checked before the variable is read, so a refused name is
 /// never even looked up in the environment.
 ///
+/// The endpoint's check here is the half that needs no resolver: its shape,
+/// the allowlist and a literal address. Building a provider never waits on
+/// DNS, so it is cheap to keep cached and is not rebuilt while the endpoint's
+/// host does not resolve. The addresses the host resolves to are checked
+/// before every call instead, off the runtime's workers and under
+/// [`CONNECT_TIMEOUT`], in [`HttpProvider::embed`].
+///
 /// The `Byo` provider has no implementation here on purpose: it means the
 /// client supplies vectors and the server never embeds, so there is nothing to
 /// call. Callers check [`ProviderConfig::embeds_server_side`] first.
@@ -175,34 +194,34 @@ pub fn build(
                 api_key_env.clone(),
                 dim,
                 *dimensions,
-                http_client(policy),
+                outbound(policy),
             )?))
         }
         ProviderConfig::Ollama { model, endpoint } => Ok(Box::new(HttpProvider::ollama(
             endpoint.clone(),
             model.clone(),
             dim,
-            http_client(policy),
+            outbound(policy),
         ))),
         ProviderConfig::CustomHttp { endpoint, api_key_env } => Ok(Box::new(HttpProvider::custom(
             endpoint.clone(),
             api_key_env.clone(),
             dim,
-            http_client(policy),
+            outbound(policy),
         )?)),
         ProviderConfig::Cohere { model, api_key_env, .. } => Ok(Box::new(HttpProvider::cohere(
             endpoint.expect("cohere has an endpoint"),
             model.clone(),
             api_key_env.clone(),
             dim,
-            http_client(policy),
+            outbound(policy),
         )?)),
         ProviderConfig::Gemini { model, api_key_env, .. } => Ok(Box::new(HttpProvider::gemini(
             endpoint.expect("gemini has an endpoint"),
             model.clone(),
             api_key_env.clone(),
             dim,
-            http_client(policy),
+            outbound(policy),
         )?)),
 
         ProviderConfig::Local { model } => local_provider(model, dim),
@@ -221,6 +240,9 @@ pub fn build(
 fn refused(e: PolicyError, provider: &'static str) -> VectorError {
     match e {
         PolicyError::UnknownProfile { name } => VectorError::UnknownProfile { name },
+        PolicyError::Endpoint(e) if e.is_lookups_busy() => {
+            VectorError::ResolverBusy { provider, detail: e.to_string() }
+        }
         e if e.is_unresolvable() => {
             VectorError::Transport { provider, kind: TransportKind::Connect, detail: e.to_string() }
         }
@@ -303,8 +325,8 @@ pub struct HttpProvider {
     dialect: Dialect,
     auth: Auth,
     dim: usize,
-    /// Shared across every call this provider makes; see [`http_client`].
-    client: reqwest::Client,
+    /// Shared across every call this provider makes; see [`outbound`].
+    client: Outbound,
     /// The OpenAI `dimensions` request field, when the configuration asks
     /// for a width other than the model's native one.
     dimensions: Option<usize>,
@@ -317,7 +339,7 @@ impl HttpProvider {
         key_env: String,
         dim: usize,
         dimensions: Option<usize>,
-        client: reqwest::Client,
+        client: Outbound,
     ) -> Result<Self> {
         Ok(Self {
             endpoint: openai_url(&base),
@@ -330,7 +352,7 @@ impl HttpProvider {
         })
     }
 
-    fn ollama(endpoint: String, model: String, dim: usize, client: reqwest::Client) -> Self {
+    fn ollama(endpoint: String, model: String, dim: usize, client: Outbound) -> Self {
         Self {
             endpoint: format!("{}/api/embeddings", endpoint.trim_end_matches('/')),
             model,
@@ -346,7 +368,7 @@ impl HttpProvider {
         endpoint: String,
         key_env: Option<String>,
         dim: usize,
-        client: reqwest::Client,
+        client: Outbound,
     ) -> Result<Self> {
         let auth = match key_env {
             Some(var) => Auth::Bearer(read_key(&var)?),
@@ -368,7 +390,7 @@ impl HttpProvider {
         model: String,
         key_env: String,
         dim: usize,
-        client: reqwest::Client,
+        client: Outbound,
     ) -> Result<Self> {
         Ok(Self {
             endpoint: format!("{}/v2/embed", base.trim_end_matches('/')),
@@ -386,20 +408,14 @@ impl HttpProvider {
         model: String,
         key_env: String,
         dim: usize,
-        client: reqwest::Client,
+        client: Outbound,
     ) -> Result<Self> {
         Ok(Self::gemini_with_key(&base, &model, read_key(&key_env)?, dim, client))
     }
 
     /// The Gemini shape with the key already in hand. Split from [`Self::gemini`]
     /// so a test can build one without touching the environment.
-    fn gemini_with_key(
-        base: &str,
-        model: &str,
-        key: String,
-        dim: usize,
-        client: reqwest::Client,
-    ) -> Self {
+    fn gemini_with_key(base: &str, model: &str, key: String, dim: usize, client: Outbound) -> Self {
         // The model rides both the URL and the request body; the URL wants it
         // bare, the body wants a `models/` prefix. Stored bare.
         let bare = model.strip_prefix("models/").unwrap_or(model);
@@ -415,6 +431,33 @@ impl HttpProvider {
             dim,
             client,
             dimensions: None,
+        }
+    }
+
+    /// Check, before a call, every address the endpoint's host resolves to.
+    ///
+    /// Before each call rather than once when the provider was built, as a
+    /// webhook's host is before each delivery: a name that resolved publicly
+    /// then can resolve inward now. And kept beside the client's own resolver,
+    /// because behind a proxy that resolver sees only the proxy's name.
+    ///
+    /// The lookup runs on the blocking pool under [`CONNECT_TIMEOUT`]. A host
+    /// that does not resolve, or whose lookup does not answer in time, is a
+    /// connect failure, retried on the worker's clock like any other; an
+    /// address the policy refuses is the permanent refusal it always was.
+    async fn check_destination(&self) -> Result<()> {
+        match tokio::time::timeout(CONNECT_TIMEOUT, self.client.egress.check_async(&self.endpoint))
+            .await
+        {
+            Ok(checked) => checked.map_err(|e| refused(PolicyError::Endpoint(e), self.name())),
+            Err(_) => Err(VectorError::Transport {
+                provider: self.name(),
+                kind: TransportKind::Connect,
+                detail: format!(
+                    "the endpoint's host did not resolve within the {} s connect timeout",
+                    CONNECT_TIMEOUT.as_secs()
+                ),
+            }),
         }
     }
 
@@ -539,6 +582,8 @@ impl EmbeddingProvider for HttpProvider {
             return Ok(Vec::new());
         }
 
+        self.check_destination().await?;
+
         // Ollama takes one text per request; the others take the whole batch.
         let batches: Vec<&[String]> = match self.dialect {
             Dialect::Ollama => texts.iter().map(std::slice::from_ref).collect(),
@@ -557,7 +602,7 @@ impl EmbeddingProvider for HttpProvider {
             let mut attempt = 0;
             let response = loop {
                 attempt += 1;
-                let mut request = self.client.post(&self.endpoint).json(&body);
+                let mut request = self.client.http.post(&self.endpoint).json(&body);
                 request = match &self.auth {
                     Auth::None => request,
                     Auth::Bearer(key) => request.bearer_auth(key),
@@ -643,7 +688,7 @@ mod tests {
             dialect,
             auth: Auth::None,
             dim,
-            client: http_client(&ProviderPolicy::default()),
+            client: outbound(&ProviderPolicy::default()),
             dimensions: None,
         }
     }
@@ -687,7 +732,7 @@ mod tests {
             dialect: Dialect::Custom,
             auth: Auth::None,
             dim: 2,
-            client: http_client(&loopback_policy()),
+            client: outbound(&loopback_policy()),
             dimensions: None,
         };
         let out = p.embed(&["a".to_string()]).await.unwrap();
@@ -859,7 +904,7 @@ mod tests {
             "models/text-embedding-004",
             "k".into(),
             768,
-            http_client(&ProviderPolicy::default()),
+            outbound(&ProviderPolicy::default()),
         );
         assert!(matches!(p.auth, Auth::Header("x-goog-api-key", _)));
         // The `models/` prefix is stripped for the URL — bare there — and the
@@ -1011,7 +1056,7 @@ mod tests {
             "http://localhost:11434/".into(),
             "m".into(),
             8,
-            http_client(&ProviderPolicy::default()),
+            outbound(&ProviderPolicy::default()),
         );
         assert_eq!(p.endpoint, "http://localhost:11434/api/embeddings");
     }
