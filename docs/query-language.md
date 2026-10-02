@@ -656,11 +656,30 @@ is refused with a message that says so. Recorded in
                           //  →  9007199254740993, exactly
 ```
 
-Arithmetic stays in `i64` when both operands are integers. On overflow it
-**refuses** with an error rather than silently widening to `f64` — widening
-loses precision quietly, which is worse than failing.
+Arithmetic stays integral when both operands are integers, and keeps the
+narrowest type that holds the result:
+
+| Stored | Operand | Result |
+|---|---|---|
+| 32-bit integer | 32-bit integer | 32-bit integer, unless the result leaves the 32-bit range, then a 64-bit integer |
+| absent | 32-bit integer | 32-bit integer (an absent field starts as a 32-bit `0`) |
+| either a 64-bit integer | | 64-bit integer |
+| either a double | | double |
+
+On overflow of a 64-bit integer it **refuses** with an error rather than
+silently widening to `f64` — widening loses precision quietly, which is worse
+than failing. So `$inc` and `$mul` do not change a field's type behind the
+caller: `$type: "int"` keeps finding a counter that stays small.
 
 ### `_id` is immutable
+
+A replacement (`PUT`) stores `_id` as the document was keyed. An integer id in
+the path finds the document whatever integer type it was stored with, and the
+stored type is kept, so a `PUT` over a document inserted with a 32-bit `_id`
+leaves it a 32-bit integer. A `PUT` with `upsert` that creates the document
+keeps the body's own `_id` when it names the same id, as an insert does, and
+otherwise stores the narrowest integer type that holds the path id: a 32-bit
+integer when it fits, as a JSON insert of the same number does.
 
 `_id` is identity, not content. Neither operators nor replacements can move a
 document:
@@ -702,7 +721,7 @@ it had, so an `if_stamp` that named it still does ([ADR-208](decisions.md)).
 | `$unset`, `$rename` of a missing field; `$setOnInsert` on a match | | no |
 | `$addToSet` of a present value; `$pull` of an absent one; `$push` with an empty `$each` onto an array | | no |
 | `$inc: {n: 0}` | `n` a 64-bit integer or a double | no |
-| `$inc: {n: 0}` | `n` a 32-bit integer | **yes**: [integer arithmetic](#integers-stay-integral) answers a 64-bit integer |
+| `$inc: {n: 0}` | `n` a 32-bit integer | no: [integer arithmetic](#integers-stay-integral) keeps it a 32-bit integer |
 | `$currentDate` | an earlier time | **yes** |
 
 A replacement (`PUT`, or a whole document as the `update` of `/update` or
