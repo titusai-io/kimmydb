@@ -452,6 +452,28 @@ breaking changes and says so here; a `0.x.PATCH` bump never does.
   whose wait had run out, so it kept serving reads of the lost documents until a
   counting peer was next reached ([ADR-212](docs/decisions.md)), shipped in 0.43.0.
 
+- **One collection's failing embedding provider no longer stops embedding for
+  every other collection on the node.** The embedding worker is one task per
+  node, and it retried a failed batch in place, every 5 s with no limit, so a
+  collection whose provider was down, rate limited, hung or unresolvable halted
+  the documents of every other collection, other tenants' included, for as long
+  as the failure lasted. The failed batch is now held for its own collection,
+  which backs off alone: 5 s, doubling to 300 s, back to 5 s once its provider
+  answers. Meanwhile the collection's other batches are not sent, and a scan
+  after the held batch goes through embeds what they would have; the worker
+  goes on with the others, and a stop no longer waits on a retry delay. **A
+  collection that owes such a scan is marked in the store, before the oplog
+  position passes the entries it came from**, so the position advances as it
+  always does and a restart scans the marked collections, at a cost that grows
+  with how many are marked and not with the oplog window. A `WARN` per failed
+  attempt names the database and collection, how many documents, the attempt
+  number and the delay. A backfill after a configuration change stops at a
+  failing batch and finishes the same way. The re-check of a document another
+  member wrote no longer stops at its first failing document, so one failing
+  collection's deferred documents do not hold up another's, and the worker no
+  longer sleeps on a retryable error while preparing an entry. See Vectors,
+  "When a provider keeps failing", Operations, and ADR-095's amendment.
+
 - **A start that fails after it opens the store no longer leaves it needing
   repair.** The cluster listener's port in use, or any other failure past the
   open, left redb's recovery-required flag set: a background task that held the

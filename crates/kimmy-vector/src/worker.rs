@@ -50,6 +50,11 @@ pub const CONSUMER: &str = "embedding-worker";
 /// delays embedding but never silently loses it.
 const RETRY_DELAY: std::time::Duration = std::time::Duration::from_secs(5);
 
+/// The longest a collection whose provider keeps failing waits between two
+/// attempts: its delay starts at [`RETRY_DELAY`] and doubles per failed
+/// attempt up to this, the shape of a webhook subscription's backoff.
+const BACKOFF_CAP: Duration = Duration::from_secs(300);
+
 /// How long a non-owner waits before re-checking a document it did not embed.
 ///
 /// Every node runs a worker and every node sees every write, so before
@@ -286,6 +291,21 @@ impl Batch {
         Self { collection, shadow, config, jobs: Vec::new(), chunks: 0, tokens: 0 }
     }
 
+    /// A batch of exactly these jobs, which a batch put back together to be
+    /// held for a retry needs.
+    fn of(
+        collection: CollectionMeta,
+        shadow: CollectionMeta,
+        config: VectorConfig,
+        jobs: Vec<Job>,
+    ) -> Self {
+        let mut batch = Self::new(collection, shadow, config);
+        for job in jobs {
+            batch.push(job);
+        }
+        batch
+    }
+
     /// Whether a job fits under both bounds. An empty batch takes anything:
     /// a document too large for the bounds still has to be embedded, and it
     /// goes alone.
@@ -426,6 +446,11 @@ struct Checkpoint {
     /// The node's stop ended the work: nothing more is done, and nothing is
     /// recorded as done. The documents are embedded after the restart.
     stopped: Option<kimmy_storage::StopReason>,
+    /// The batch was not embedded because its collection's provider failed,
+    /// or is backing off from failing: it is held for a retry ([`Backoff`]).
+    /// A scan reads it to stop where its provider fails, and a flush to tell
+    /// a turn that only held work from one that embedded.
+    deferred: bool,
 }
 
 /// How one document sent alone ended.
@@ -437,8 +462,73 @@ enum Alone {
     /// ([`VectorError::refuses_the_input`]); the job comes back to be judged
     /// against its split ([`EmbeddingWorker::settle_refusals`]).
     RefusedAsInput(Job),
+    /// The provider failed in a way a later attempt may fix; the job comes
+    /// back, with the failure, to be held for one ([`Backoff`]).
+    Deferred(Job, VectorError),
     /// Anything else: skipped, left stale, or ended by the stop.
     Failed,
+}
+
+/// What one collection's failing provider has left undone, and when the worker
+/// next tries it.
+///
+/// **A collection whose provider fails waits alone.** The worker is one task
+/// per node, and it used to retry a failed batch in place, every five seconds
+/// for as long as the failure lasted, so one collection's provider being down
+/// stopped embedding for every other collection on the node. Now the failed
+/// batch is held here and the worker goes back to its loop; the collection's
+/// next attempt is made from that loop when `due` comes, and the worker's only
+/// waits are the loop's own, so nothing is held open between attempts and a
+/// stop does not wait on a held batch.
+///
+/// `due` starts at [`RETRY_DELAY`] after the first failure and doubles with each
+/// further one up to [`BACKOFF_CAP`]; one answered call resets it. Until `due`,
+/// the collection's other batches are not sent, and not kept either: a
+/// `rescan` is noted, and a scan of the collection embeds what they would have,
+/// once the held batch has gone through.
+///
+/// **The debt is durable.** What is held is in memory, so the collection is
+/// also *marked* in the store (`marked`, [`Engine::put_vector_rescan`]) before
+/// the oplog position is recorded past the entries it came from. A restart
+/// loads the marks and scans the marked collections, so the position advances
+/// as it always does and a restart costs a scan per marked collection, not a
+/// replay of the oplog. The mark is cleared when the entry is gone: recovered,
+/// reconfigured, no longer owned, or dropped.
+struct Backoff {
+    /// Failed attempts since the provider last answered.
+    failures: u32,
+    due: tokio::time::Instant,
+    /// The batch whose attempt failed, to try again at `due`.
+    held: Option<Batch>,
+    /// A scan to run once the provider answers, for what the batches skipped
+    /// meanwhile, or a scan this one cut short, would have embedded.
+    rescan: Option<Unscanned>,
+    /// What the store holds for this collection. Only ever raised until the
+    /// entry is removed, so a failed attempt cannot lower it.
+    marked: Option<Unscanned>,
+    /// A mark that could not be written. While there is one the position is
+    /// held back instead, as the last resort: nothing durable says what a
+    /// restart must scan.
+    unwritten: Option<Unscanned>,
+}
+
+impl Backoff {
+    fn new(now: tokio::time::Instant) -> Self {
+        Self { failures: 0, due: now, held: None, rescan: None, marked: None, unwritten: None }
+    }
+}
+
+/// The stronger of two scan kinds: `Force` stays over `Check`.
+fn stronger(a: Option<Unscanned>, b: Unscanned) -> Unscanned {
+    match (a, b) {
+        (Some(Unscanned::Force), _) | (_, Unscanned::Force) => Unscanned::Force,
+        _ => Unscanned::Check,
+    }
+}
+
+/// How long a collection waits after its `failures`th failed attempt.
+fn backoff_delay(failures: u32) -> Duration {
+    RETRY_DELAY.saturating_mul(1 << failures.saturating_sub(1).min(6)).min(BACKOFF_CAP)
 }
 
 /// The error the worker returns once the node's stop has ended its work.
@@ -478,6 +568,11 @@ pub struct EmbeddingWorker {
     /// worker is retrying, not idle (ADR-187). Documents merely waiting out
     /// another member's grace are not this: they are ordinary on a cluster.
     deferred_retrying: bool,
+    /// Collections whose provider is failing, by collection id ([`Backoff`]).
+    backoff: HashMap<u64, Backoff>,
+    /// A test's way to make every scan mark fail to write.
+    #[cfg(test)]
+    refuse_marks: bool,
     /// Whether *this* node owns embedding work for a collection, injected by
     /// the caller because [`crate`] sits below the cluster crates that know
     /// the member set. The closure receives a stable `"{db}/{collection}"`
@@ -678,6 +773,9 @@ impl EmbeddingWorker {
             refused: HashMap::new(),
             deferred: VecDeque::new(),
             deferred_retrying: false,
+            backoff: HashMap::new(),
+            #[cfg(test)]
+            refuse_marks: false,
             am_owner: None,
             ownership_checked: None,
             ownership_settled: HashMap::new(),
@@ -762,6 +860,10 @@ impl EmbeddingWorker {
     pub async fn run(&mut self) -> Result<()> {
         let mut resume = self.engine.consumer_position(CONSUMER)?;
         let mut recovering = false;
+        // What the last run left owed: its held and skipped batches were
+        // recorded as marks before the position passed them, so a start finds
+        // them here and scans those collections, rather than the oplog.
+        self.load_marks().await?;
         loop {
             let options = WatchOptions {
                 resume_after: resume.clone(),
@@ -823,6 +925,10 @@ impl EmbeddingWorker {
     async fn drive(&mut self, stream: &mut kimmy_storage::ChangeStream) -> Result<StreamEnd> {
         let mut pending = Pending::default();
         loop {
+            // The next collection whose provider failed and whose attempt has
+            // come due, before anything else, so a start sees the scans its
+            // marks owe at once and every other turn ends here.
+            self.retry_one_collection().await?;
             // A collection whose ownership moved to this member is rescanned
             // once the move has held (ADR-201). What was gathered goes first,
             // so the rescan does not sit behind a partial batch's wait.
@@ -857,6 +963,9 @@ impl EmbeddingWorker {
             let wait = pending
                 .deadline(self.batching.max_wait)
                 .map_or(tick, |due| due.saturating_duration_since(Instant::now()).min(tick));
+            // No separate wake-up for a collection's next attempt: the tick is
+            // never longer than the shortest delay, `RETRY_DELAY`, so an
+            // attempt is made at most one turn after it falls due.
             let event = match tokio::time::timeout(wait, stream.next(&self.engine)).await {
                 Ok(Some(event)) => event,
                 Ok(None) => {
@@ -976,22 +1085,37 @@ impl EmbeddingWorker {
         pending.opened = None;
         let count = batches.len();
         let mut checkpoint = Checkpoint::default();
+        let mut written = 0;
         for (i, batch) in batches.into_iter().enumerate() {
             // Only the last batch carries the position, and only while no
-            // store has failed: the position must not land in a commit
-            // that follows a batch whose vectors did not.
-            if i + 1 == count && !checkpoint.failed {
+            // store has failed and every held collection's mark is written:
+            // the position must not land in a commit that follows a batch whose
+            // vectors did not, nor ahead of the mark that says what is owed.
+            if i + 1 == count && !checkpoint.failed && !self.marks_unwritten() {
                 checkpoint.token = pending.token.take();
             }
-            self.embed_batch(batch, &mut checkpoint).await;
+            written += self.embed_batch(batch, &mut checkpoint).await;
             if checkpoint.stopped.is_some() {
                 break;
             }
         }
-        if checkpoint.failed {
+        // A held batch or a skipped one is recorded as a mark before the
+        // position moves (`Backoff`), so the position goes on as always. Only
+        // a mark that could not be written holds it, since then a restart
+        // would not know what it owes. Held for the next flush, not written.
+        let unwritten = self.marks_unwritten();
+        if checkpoint.failed || unwritten {
             pending.token = pending.token.take().or(checkpoint.token.take());
+            if unwritten && pending.token.is_some() {
+                // Looked at again in a position wait, not at once.
+                pending.held_since = Some(Instant::now());
+            }
             if let Some(reason) = checkpoint.stopped {
                 return Err(stopped(reason));
+            }
+            // The other collections are embedding: that is progress.
+            if !checkpoint.failed && written > 0 {
+                self.counters.progressed();
             }
             return Ok(());
         }
@@ -999,7 +1123,11 @@ impl EmbeddingWorker {
             self.engine.put_consumer_position(CONSUMER, token)?;
         }
         pending.held_since = None;
-        self.counters.progressed();
+        // A turn that only held a failing collection's batch is not progress:
+        // the age keeps climbing for a provider that stays down.
+        if !checkpoint.deferred || written > 0 {
+            self.counters.progressed();
+        }
         Ok(())
     }
 
@@ -1217,10 +1345,22 @@ impl EmbeddingWorker {
     pub async fn drain_deferred(&mut self, now: Instant) -> usize {
         let mut embedded = 0;
         let (mut processed, mut retrying) = (false, false);
+        // Collections whose provider has failed in this pass, and the
+        // documents passed over for them. A failing collection costs the pass
+        // one provider call, and the documents behind it are not tried, so
+        // they cannot hold up another collection's: they go back after the
+        // pass, due again after the delay a failed re-check waits.
+        let mut failing = std::collections::HashSet::new();
+        let mut passed_over = Vec::new();
 
         while self.deferred.front().is_some_and(|d| d.due <= now) {
             let Some(item) = self.deferred.pop_front() else { break };
             processed = true;
+            if failing.contains(&item.collection) || self.is_backing_off(item.collection.0) {
+                passed_over.push(Deferred { due: now + RETRY_DELAY, ..item });
+                retrying = true;
+                continue;
+            }
             match self.embed_deferred(&item).await {
                 Ok(Recheck::Embedded) => {
                     embedded += 1;
@@ -1250,9 +1390,9 @@ impl EmbeddingWorker {
                 // briefly down must not cost the document.
                 Err(e) if e.is_retryable() => {
                     warn!(error = %e, "deferred embedding failed; will retry");
-                    self.deferred.push_back(Deferred { due: now + RETRY_DELAY, ..item });
+                    failing.insert(item.collection);
+                    passed_over.push(Deferred { due: now + RETRY_DELAY, ..item });
                     retrying = true;
-                    break;
                 }
                 Err(e) if e.is_refused_by_policy() => {
                     debug!(
@@ -1271,6 +1411,7 @@ impl EmbeddingWorker {
                 }
             }
         }
+        self.deferred.extend(passed_over);
         // Only a drain that reached a due document can say anything new. One
         // with nothing due leaves the last answer standing, so the flag holds
         // through the delay before a retried document comes due again.
@@ -1347,46 +1488,42 @@ impl EmbeddingWorker {
         Ok(if embedded { Recheck::Embedded } else { Recheck::Current })
     }
 
-    /// Prepare one entry, retrying what is worth retrying and skipping, by
-    /// name, an entry that fails for good. The node's stop is neither: it is
-    /// returned, so the entry is processed after the restart, from a
-    /// position that has not passed it.
+    /// Prepare one entry, skipping, by name, an entry that fails for good. A
+    /// failure that may clear and the node's stop are returned, so the entry
+    /// is processed after the restart, from a position that has not passed it.
     async fn prepare_or_skip(&mut self, entry: &kimmy_core::OplogEntry) -> Result<Prepared> {
-        // Retry rather than advance: losing an entry means a document stays
-        // unembedded with nothing to notice it.
-        loop {
-            match self.prepare_entry(entry).await {
-                Ok(prepared) => return Ok(prepared),
-                // Not a failure of the entry: the node is stopping, and the
-                // entry is processed after the restart, from a position
-                // that has not passed it.
-                Err(e) if e.is_stopping() => return Err(e),
-                Err(e) if e.is_retryable() => {
-                    warn!(error = %e, "embedding failed; retrying");
-                    tokio::time::sleep(RETRY_DELAY).await;
+        match self.prepare_entry(entry).await {
+            Ok(prepared) => Ok(prepared),
+            // Not a failure of the entry: the node is stopping, and the
+            // entry is processed after the restart, from a position
+            // that has not passed it. Neither is a failure that may clear:
+            // losing the entry would leave a document unembedded with
+            // nothing to notice it. Nothing is retried in place here (a
+            // provider call's failures are held per collection, `Backoff`):
+            // the worker ends, and its supervisor starts it again with a
+            // backoff of its own.
+            Err(e) if e.is_stopping() || e.is_retryable() => Err(e),
+            Err(e) => {
+                // A permanent failure would retry forever. Record it
+                // and move on, so one poisoned entry cannot stall
+                // every other one. A policy refusal was reported when
+                // the provider failed to build, once; the documents
+                // behind it are noted at debug.
+                if e.is_refused_by_policy() {
+                    debug!(
+                        collection = ?entry.collection,
+                        doc = ?entry.doc_id,
+                        "skipping an entry of a collection whose provider is refused"
+                    );
+                } else {
+                    warn!(
+                        error = %e,
+                        collection = ?entry.collection,
+                        doc = ?entry.doc_id,
+                        "embedding permanently failed; skipping this entry"
+                    );
                 }
-                Err(e) => {
-                    // A permanent failure would retry forever. Record it
-                    // and move on, so one poisoned entry cannot stall
-                    // every other one. A policy refusal was reported when
-                    // the provider failed to build, once; the documents
-                    // behind it are noted at debug.
-                    if e.is_refused_by_policy() {
-                        debug!(
-                            collection = ?entry.collection,
-                            doc = ?entry.doc_id,
-                            "skipping an entry of a collection whose provider is refused"
-                        );
-                    } else {
-                        warn!(
-                            error = %e,
-                            collection = ?entry.collection,
-                            doc = ?entry.doc_id,
-                            "embedding permanently failed; skipping this entry"
-                        );
-                    }
-                    return Ok(Prepared::Done(Outcome::Skipped));
-                }
+                Ok(Prepared::Done(Outcome::Skipped))
             }
         }
     }
@@ -1697,6 +1834,9 @@ impl EmbeddingWorker {
         // wait for. Transient failures retry and a permanent one skips its
         // document, inside `embed_batch`, exactly as the streaming path.
         let mut batch = Batch::new(collection.clone(), shadow.clone(), config.clone());
+        // A batch the provider's failure held ends the scan: the collection
+        // is backing off, and the rest is scanned once it answers.
+        let mut cut_short = false;
         for source in ids {
             let Some(mut job) = self.scanned_job(collection, shadow, config, &source, judgement)?
             else {
@@ -1743,7 +1883,12 @@ impl EmbeddingWorker {
                     &mut batch,
                     Batch::new(collection.clone(), shadow.clone(), config.clone()),
                 );
-                embedded += self.embed_scanned(ready).await?;
+                let (landed, held) = self.embed_scanned(ready).await?;
+                embedded += landed;
+                if held {
+                    cut_short = true;
+                    break;
+                }
             }
             batch.push(job);
             if batch.full(&self.batching) {
@@ -1751,10 +1896,32 @@ impl EmbeddingWorker {
                     &mut batch,
                     Batch::new(collection.clone(), shadow.clone(), config.clone()),
                 );
-                embedded += self.embed_scanned(ready).await?;
+                let (landed, held) = self.embed_scanned(ready).await?;
+                embedded += landed;
+                if held {
+                    cut_short = true;
+                    break;
+                }
             }
         }
-        embedded += self.embed_scanned(batch).await?;
+        if !cut_short {
+            let (landed, held) = self.embed_scanned(batch).await?;
+            embedded += landed;
+            cut_short = held;
+        }
+
+        if cut_short {
+            self.note_rescan(collection.id.0, unscanned).await;
+            info!(
+                db = %collection.db,
+                collection = %collection.name,
+                embedded,
+                total,
+                reason,
+                "a scan stopped at a provider that is failing; the rest follows once it answers"
+            );
+            return Ok(Scanned { embedded, handed_over: judgement.handed_over });
+        }
 
         // The completed scan is what the fingerprint attests. Failing to
         // write it costs a redundant re-scan next time, never a gap. A scan
@@ -1941,7 +2108,15 @@ impl EmbeddingWorker {
         // delivered again after the restart.
         self.engine.check_walk(kimmy_storage::WalkScope::Background)?;
         match provider.embed(inputs).await {
-            Ok(vectors) => Ok(vectors),
+            Ok(vectors) => {
+                // The provider answered: the collection's failures are over,
+                // whatever it still holds is to go out at the next turn.
+                if let Some(held) = self.backoff.get_mut(&collection.id.0) {
+                    held.failures = 0;
+                    held.due = tokio::time::Instant::now();
+                }
+                Ok(vectors)
+            }
             // The endpoint's host resolved to an address the policy refuses,
             // found by the check before the call (a build checks no addresses).
             // The same permanent refusal a build makes, remembered and said
@@ -2069,11 +2244,15 @@ impl EmbeddingWorker {
         Ok(written.len())
     }
 
-    /// An idle turn is progress when nothing is left waiting and no deferred
-    /// re-check is retrying (ADR-187): a quiet node has no batch to complete,
+    /// An idle turn is progress when nothing is left waiting, no deferred
+    /// re-check is retrying and no collection is backing off (ADR-187): a quiet node has no batch to complete,
     /// and its age must not climb for want of writes.
     fn idle_turn(&self, pending: &Pending) {
-        if pending.batches.is_empty() && pending.token.is_none() && !self.deferred_retrying {
+        if pending.batches.is_empty()
+            && pending.token.is_none()
+            && !self.deferred_retrying
+            && self.backoff.is_empty()
+        {
             self.counters.progressed();
         }
     }
@@ -2084,23 +2263,32 @@ impl EmbeddingWorker {
     /// between them, and it is working: without this its age climbed for the
     /// whole scan. A store that fails is not progress, or a shadow collection
     /// that cannot be written would read fresh for the whole scan.
-    async fn embed_scanned(&mut self, batch: Batch) -> Result<usize> {
+    ///
+    /// The second answer is whether the batch was held for its provider's
+    /// failure: the scan ends there, and notes the rest for a rescan.
+    async fn embed_scanned(&mut self, batch: Batch) -> Result<(usize, bool)> {
         let mut checkpoint = Checkpoint::default();
         let embedded = self.embed_batch(batch, &mut checkpoint).await;
         if let Some(reason) = checkpoint.stopped {
             return Err(stopped(reason));
         }
-        if !checkpoint.failed {
+        if !checkpoint.failed && !checkpoint.deferred {
             self.counters.progressed();
         }
-        Ok(embedded)
+        Ok((embedded, checkpoint.deferred))
     }
 
     /// Embed one batch and return how many documents were written.
     ///
-    /// A retryable failure retries the whole batch, forever, exactly as one
-    /// document retried before: a provider that is briefly down must not
-    /// cost a document. A permanent failure on a batch of several documents
+    /// A retryable failure does not retry here: the batch is held for its
+    /// collection's next attempt ([`Backoff`]) and this returns, so the worker
+    /// goes on to the other collections' work and sleeps nowhere in this
+    /// function. A provider that is briefly down still costs no document: the
+    /// batch is held whole, and its collection is marked in the store as
+    /// owing a scan before any position past it is written. A
+    /// collection that is already backing off is not tried again before its
+    /// attempt is due, and a batch of it that arrives first is not kept, but
+    /// noted for a rescan. A permanent failure on a batch of several documents
     /// is almost never the batch's fault but one document's — a `400` for an
     /// input the model cannot take — and the provider does not say which. So
     /// the batch is taken apart and each document sent alone: the one at
@@ -2118,75 +2306,104 @@ impl EmbeddingWorker {
     /// writes it on its own afterwards — one extra commit on a path that
     /// had already failed.
     async fn embed_batch(&mut self, batch: Batch, checkpoint: &mut Checkpoint) -> usize {
-        let Batch { collection, shadow, config, jobs, .. } = batch;
-        if jobs.is_empty() {
+        if batch.jobs.is_empty() {
             return 0;
         }
+        if self.is_backing_off(batch.collection.id.0) {
+            debug!(
+                db = %batch.collection.db,
+                collection = %batch.collection.name,
+                documents = batch.jobs.len(),
+                "not sending a batch of a collection whose provider is backing off; it is \
+                 rescanned once the provider answers"
+            );
+            self.note_rescan(batch.collection.id.0, Unscanned::Check).await;
+            checkpoint.deferred = true;
+            return 0;
+        }
+        let Batch { collection, shadow, config, jobs, .. } = batch;
         if jobs.len() == 1 {
             let job = jobs.into_iter().next().expect("one job");
             // A batch of one proves nothing about a refusal: see below.
             return match self.embed_alone(&collection, &shadow, &config, job, checkpoint).await {
                 Alone::Stored(written) => written,
+                Alone::Deferred(job, e) => {
+                    let held = Batch::of(collection, shadow, config, vec![job]);
+                    self.hold_for_retry(held, &e).await;
+                    checkpoint.deferred = true;
+                    0
+                }
                 Alone::RefusedAsInput(_) | Alone::Failed => 0,
             };
         }
-        let vectors = loop {
-            match self.call_provider(&collection, &config, &jobs).await {
-                Ok(vectors) => break vectors,
-                // The node is stopping: none of the batch is embedded, and
-                // nothing is recorded as done.
-                Err(e) if e.is_stopping() => {
-                    checkpoint.failed = true;
-                    checkpoint.stopped = e.stop_reason();
-                    return 0;
-                }
-                Err(e) if e.is_retryable() => {
-                    warn!(error = %e, documents = jobs.len(), "embedding failed; retrying");
-                    tokio::time::sleep(RETRY_DELAY).await;
-                }
-                Err(e) => {
-                    // Splitting a refused batch would ask the policy once per
-                    // document and get the same answer; the batch is simply
-                    // skipped.
-                    if e.is_refused_by_policy() {
-                        debug!(
-                            db = %collection.db,
-                            collection = %collection.name,
-                            documents = jobs.len(),
-                            "skipping a batch of a collection whose provider is refused"
-                        );
-                        return 0;
-                    }
-                    warn!(
-                        error = %e,
+        let vectors = match self.call_provider(&collection, &config, &jobs).await {
+            Ok(vectors) => vectors,
+            // The node is stopping: none of the batch is embedded, and
+            // nothing is recorded as done.
+            Err(e) if e.is_stopping() => {
+                checkpoint.failed = true;
+                checkpoint.stopped = e.stop_reason();
+                return 0;
+            }
+            Err(e) if e.is_retryable() => {
+                self.hold_for_retry(Batch::of(collection, shadow, config, jobs), &e).await;
+                checkpoint.deferred = true;
+                return 0;
+            }
+            Err(e) => {
+                // Splitting a refused batch would ask the policy once per
+                // document and get the same answer; the batch is simply
+                // skipped.
+                if e.is_refused_by_policy() {
+                    debug!(
                         db = %collection.db,
                         collection = %collection.name,
                         documents = jobs.len(),
-                        "a batch permanently failed; embedding its documents one at a time"
+                        "skipping a batch of a collection whose provider is refused"
                     );
-                    let mut written = 0;
-                    let mut alone = Checkpoint::default();
-                    let mut stored_at = Vec::new();
-                    let mut refused = Vec::new();
-                    for (at, job) in jobs.into_iter().enumerate() {
-                        match self.embed_alone(&collection, &shadow, &config, job, &mut alone).await
-                        {
-                            Alone::Stored(stored) => {
-                                written += stored;
-                                stored_at.push(at);
-                            }
-                            Alone::RefusedAsInput(job) => refused.push((at, job)),
-                            Alone::Failed => {}
+                    return 0;
+                }
+                warn!(
+                    error = %e,
+                    db = %collection.db,
+                    collection = %collection.name,
+                    documents = jobs.len(),
+                    "a batch permanently failed; embedding its documents one at a time"
+                );
+                let mut written = 0;
+                let mut alone = Checkpoint::default();
+                let mut stored_at = Vec::new();
+                let mut refused = Vec::new();
+                let mut rest = jobs.into_iter().enumerate();
+                while let Some((at, job)) = rest.next() {
+                    match self.embed_alone(&collection, &shadow, &config, job, &mut alone).await {
+                        Alone::Stored(stored) => {
+                            written += stored;
+                            stored_at.push(at);
                         }
-                        if alone.stopped.is_some() {
+                        Alone::RefusedAsInput(job) => refused.push((at, job)),
+                        // The provider went from failing for good to failing
+                        // for now part-way through: this document and the
+                        // ones not yet sent are held for a retry.
+                        Alone::Deferred(job, e) => {
+                            let mut left = vec![job];
+                            left.extend(rest.by_ref().map(|(_, job)| job));
+                            let held =
+                                Batch::of(collection.clone(), shadow.clone(), config.clone(), left);
+                            self.hold_for_retry(held, &e).await;
+                            checkpoint.deferred = true;
                             break;
                         }
+                        Alone::Failed => {}
                     }
-                    checkpoint.failed |= alone.failed;
-                    checkpoint.stopped = checkpoint.stopped.or(alone.stopped);
-                    self.settle_refusals(&collection, &shadow, &config, &stored_at, refused);
-                    return written;
+                    if alone.stopped.is_some() {
+                        break;
+                    }
                 }
+                checkpoint.failed |= alone.failed;
+                checkpoint.stopped = checkpoint.stopped.or(alone.stopped);
+                self.settle_refusals(&collection, &shadow, &config, &stored_at, refused);
+                return written;
             }
         };
         match self.store(&collection, &shadow, &config, jobs, vectors, checkpoint) {
@@ -2204,8 +2421,229 @@ impl EmbeddingWorker {
         }
     }
 
-    /// Embed one document by itself, retrying what is worth retrying and
-    /// skipping — by name — what is not.
+    /// Whether the collection is backing off and its next attempt is not yet
+    /// due.
+    fn is_backing_off(&self, collection: u64) -> bool {
+        self.backoff.get(&collection).is_some_and(|b| b.due > tokio::time::Instant::now())
+    }
+
+    /// Whether any collection holds a batch or a scan for its provider.
+    fn holding_work(&self) -> bool {
+        self.backoff.values().any(|b| b.held.is_some() || b.rescan.is_some())
+    }
+
+    /// Whether a collection owes a scan that the store does not know of: its
+    /// mark could not be written. The position is held back meanwhile.
+    fn marks_unwritten(&self) -> bool {
+        self.backoff.values().any(|b| b.unwritten.is_some())
+    }
+
+    /// When the earliest collection attempt is due.
+    #[cfg(test)]
+    fn next_attempt(&self) -> Option<tokio::time::Instant> {
+        self.backoff.values().map(|b| b.due).min()
+    }
+
+    /// Make sure the store holds a mark for the collection at least as strong
+    /// as `how`, **before** anything is recorded as done past the work it
+    /// stands for. A write that fails is said at `WARN` and held in
+    /// `unwritten`, which holds the position back.
+    async fn mark(&mut self, collection: u64, how: Unscanned) {
+        let Some(entry) = self.backoff.get_mut(&collection) else { return };
+        let want = stronger(entry.marked, how);
+        if entry.marked == Some(want) {
+            return;
+        }
+        let engine = Arc::clone(&self.engine);
+        #[cfg(test)]
+        let refused = self.refuse_marks;
+        let written = kimmy_storage::blocking(move || {
+            #[cfg(test)]
+            if refused {
+                return Err(kimmy_storage::StorageError::Corrupt("a refused mark".into()));
+            }
+            engine.put_vector_rescan(kimmy_core::CollectionId(collection), want == Unscanned::Force)
+        });
+        let Some(entry) = self.backoff.get_mut(&collection) else { return };
+        match written {
+            Ok(()) => {
+                entry.marked = Some(want);
+                entry.unwritten = None;
+            }
+            Err(e) => {
+                warn!(
+                    error = %e,
+                    collection,
+                    "could not record that a collection owes a scan; the oplog position is held \
+                     back until it can be, so a restart processes its entries again"
+                );
+                entry.unwritten = Some(want);
+            }
+        }
+    }
+
+    /// Note that a collection needs a scan once its provider answers, and
+    /// record it. `Force` stays noted over `Check`.
+    async fn note_rescan(&mut self, collection: u64, how: Unscanned) {
+        let entry = self
+            .backoff
+            .entry(collection)
+            .or_insert_with(|| Backoff::new(tokio::time::Instant::now()));
+        entry.rescan = Some(stronger(entry.rescan, how));
+        self.mark(collection, how).await;
+    }
+
+    /// Load the marks a previous run left, as scans to run: the collections
+    /// whose batches were held, or skipped, when that run ended.
+    async fn load_marks(&mut self) -> Result<()> {
+        let engine = Arc::clone(&self.engine);
+        let owed = kimmy_storage::blocking(move || engine.vector_rescans())?;
+        let now = tokio::time::Instant::now();
+        for (collection, force) in owed {
+            let how = if force { Unscanned::Force } else { Unscanned::Check };
+            let entry = self.backoff.entry(collection.0).or_insert_with(|| Backoff::new(now));
+            entry.rescan = Some(stronger(entry.rescan, how));
+            entry.marked = Some(stronger(entry.marked, how));
+        }
+        Ok(())
+    }
+
+    /// A provider call for the batch failed in a way a later attempt may fix:
+    /// hold the batch, record that the collection owes a scan, and fix its
+    /// next attempt at the doubled delay. Said once per failed attempt, naming
+    /// the collection, at `WARN`.
+    ///
+    /// A collection that already holds a batch keeps that one: this is
+    /// another attempt's, and what it carried is noted for a rescan.
+    async fn hold_for_retry(&mut self, batch: Batch, error: &VectorError) {
+        let now = tokio::time::Instant::now();
+        let documents = batch.jobs.len();
+        let (db, name) = (batch.collection.db.clone(), batch.collection.name.clone());
+        let key = batch.collection.id.0;
+        let entry = self.backoff.entry(key).or_insert_with(|| Backoff::new(now));
+        entry.failures = entry.failures.saturating_add(1);
+        let delay = backoff_delay(entry.failures);
+        entry.due = now + delay;
+        let attempts = entry.failures;
+        if entry.held.is_none() {
+            entry.held = Some(batch);
+        } else {
+            entry.rescan.get_or_insert(Unscanned::Check);
+        }
+        self.mark(key, Unscanned::Check).await;
+        warn!(
+            error = %error,
+            db = %db,
+            collection = %name,
+            documents,
+            attempts,
+            retry_in_secs = delay.as_secs(),
+            "embedding failed for this collection; it is retried later, after a delay that \
+             grows, and other collections' embedding goes on"
+        );
+    }
+
+    /// Try the collection whose attempt is due soonest, if one is due, from
+    /// the worker's loop. Returns whether this left the worker holding
+    /// nothing.
+    ///
+    /// One collection per turn, so another's documents are not kept waiting
+    /// behind a run of attempts. A provider call here is bounded by its own
+    /// timeout, as everywhere.
+    async fn retry_one_collection(&mut self) -> Result<bool> {
+        let now = tokio::time::Instant::now();
+        let Some(key) = self
+            .backoff
+            .iter()
+            .filter(|(_, b)| b.due <= now)
+            .min_by_key(|(_, b)| b.due)
+            .map(|(key, _)| *key)
+        else {
+            return Ok(false);
+        };
+        let holding = self.holding_work();
+        let (held, rescan) = match self.backoff.get_mut(&key) {
+            Some(b) => (b.held.take(), b.rescan.take()),
+            None => return Ok(false),
+        };
+        // A mark that could not be written is tried again with every attempt.
+        if let Some(how) = self.backoff.get(&key).and_then(|b| b.unwritten) {
+            self.mark(key, how).await;
+        }
+        // The entry stays while the attempt runs, so a failure keeps its count
+        // and its mark.
+        self.retry_collection(key, held, rescan).await?;
+        if self.backoff.get(&key).is_some_and(|b| b.held.is_none() && b.rescan.is_none()) {
+            // Nothing is owed any more: recovered, reconfigured, no longer
+            // owned, or dropped.
+            self.backoff.remove(&key);
+            let engine = Arc::clone(&self.engine);
+            let cleared = kimmy_storage::blocking(move || {
+                engine.clear_vector_rescan(kimmy_core::CollectionId(key))
+            });
+            if let Err(e) = cleared {
+                // Costs one scan at the next start, which finds nothing to do.
+                warn!(error = %e, collection = key, "could not clear a collection's scan mark");
+            }
+        }
+        Ok(holding && !self.holding_work())
+    }
+
+    async fn retry_collection(
+        &mut self,
+        key: u64,
+        held: Option<Batch>,
+        rescan: Option<Unscanned>,
+    ) -> Result<()> {
+        // What the attempt was for may be gone or no longer this member's. A
+        // collection that moved to another member is its new owner's to
+        // finish, from its own rescan (ADR-201).
+        let Some(collection) = self.engine.collection_by_id(kimmy_core::CollectionId(key))? else {
+            return Ok(());
+        };
+        let Some(config) = collection.vector.clone().filter(|c| c.provider.embeds_server_side())
+        else {
+            return Ok(());
+        };
+        if !self.is_owner_of(&collection.db, &collection.name) {
+            // Unsettled, as a scan that handed the collection over leaves it
+            // (ADR-203): if this member owns it again at its next evaluation,
+            // however briefly it lost it, that is a gain, and the rescan that
+            // follows finishes what was owed here.
+            let owner_key = format!("{}/{}", collection.db, collection.name);
+            self.ownership_gaining.remove(&owner_key);
+            self.ownership_settled.insert(owner_key, false);
+            return Ok(());
+        }
+        let Some(shadow) = self.shadow_of(&collection.db, &collection.name, false)? else {
+            return Ok(());
+        };
+        // A reconfigured collection's own scan covers what a batch held under
+        // the old configuration would have embedded, and sending it would
+        // write the old model's vectors over the new one's.
+        if let Some(held) = held.filter(|h| h.config == config) {
+            let mut checkpoint = Checkpoint::default();
+            self.embed_batch(held, &mut checkpoint).await;
+            if let Some(reason) = checkpoint.stopped {
+                return Err(stopped(reason));
+            }
+            if checkpoint.deferred {
+                if let Some(how) = rescan {
+                    self.note_rescan(key, how).await;
+                }
+                return Ok(());
+            }
+        }
+        if let Some(how) = rescan {
+            self.scan_collection(&collection, &shadow, &config, "a provider that was failing", how)
+                .await?;
+        }
+        Ok(())
+    }
+
+    /// Embed one document by itself. A failure a later attempt may fix comes
+    /// back to the caller to be held, and a permanent one is named and
+    /// skipped.
     async fn embed_alone(
         &mut self,
         collection: &CollectionMeta,
@@ -2214,45 +2652,41 @@ impl EmbeddingWorker {
         job: Job,
         checkpoint: &mut Checkpoint,
     ) -> Alone {
-        let vectors = loop {
-            match self.call_provider(collection, config, std::slice::from_ref(&job)).await {
-                Ok(vectors) => break vectors,
-                Err(e) if e.is_stopping() => {
-                    checkpoint.failed = true;
-                    checkpoint.stopped = e.stop_reason();
-                    return Alone::Failed;
-                }
-                Err(e) if e.is_retryable() => {
-                    warn!(error = %e, "embedding failed; retrying");
-                    tokio::time::sleep(RETRY_DELAY).await;
-                }
-                Err(e) => {
-                    // A permanent failure (bad config, wrong dimension, an
-                    // input the model refuses) would retry forever. Name it
-                    // and move on, so one poisoned document cannot stall
-                    // every other one. A policy refusal was named once when
-                    // the provider failed to build.
-                    if e.is_refused_by_policy() {
-                        debug!(
-                            db = %collection.db,
-                            collection = %collection.name,
-                            doc = %job.source,
-                            "skipping a document of a collection whose provider is refused"
-                        );
-                    } else {
-                        warn!(
-                            error = %e,
-                            db = %collection.db,
-                            collection = %collection.name,
-                            doc = %job.source,
-                            "embedding permanently failed; skipping this document"
-                        );
-                        if e.refuses_the_input() {
-                            return Alone::RefusedAsInput(job);
-                        }
+        let vectors = match self.call_provider(collection, config, std::slice::from_ref(&job)).await
+        {
+            Ok(vectors) => vectors,
+            Err(e) if e.is_stopping() => {
+                checkpoint.failed = true;
+                checkpoint.stopped = e.stop_reason();
+                return Alone::Failed;
+            }
+            Err(e) if e.is_retryable() => return Alone::Deferred(job, e),
+            Err(e) => {
+                // A permanent failure (bad config, wrong dimension, an
+                // input the model refuses) would retry forever. Name it
+                // and move on, so one poisoned document cannot stall
+                // every other one. A policy refusal was named once when
+                // the provider failed to build.
+                if e.is_refused_by_policy() {
+                    debug!(
+                        db = %collection.db,
+                        collection = %collection.name,
+                        doc = %job.source,
+                        "skipping a document of a collection whose provider is refused"
+                    );
+                } else {
+                    warn!(
+                        error = %e,
+                        db = %collection.db,
+                        collection = %collection.name,
+                        doc = %job.source,
+                        "embedding permanently failed; skipping this document"
+                    );
+                    if e.refuses_the_input() {
+                        return Alone::RefusedAsInput(job);
                     }
-                    return Alone::Failed;
                 }
+                return Alone::Failed;
             }
         };
         // Stored only once `store` has accepted the answer: it is what checks
@@ -4218,8 +4652,7 @@ pub(crate) mod tests {
     }
 
     // Paused clock: the retry delay is five seconds of real time, and a test
-    // that waits it out is a test nobody runs. Virtual time still advances
-    // past the deadline if the loop never exits, so this keeps its teeth.
+    // that waits it out is a test nobody runs.
     #[tokio::test(start_paused = true)]
     async fn a_transient_failure_during_a_backfill_is_retried_rather_than_skipped() {
         // The other direction: a classification that called everything
@@ -4231,19 +4664,23 @@ pub(crate) mod tests {
         let coll = engine.get_collection("app", "docs").unwrap();
         worker.set_provider(coll.id.0, Arc::clone(&fake) as Arc<dyn EmbeddingProvider>);
 
-        let outcome = tokio::time::timeout(
-            std::time::Duration::from_secs(300),
-            worker.process(&last_entry(&engine)),
-        )
-        .await
-        .expect("retries are bounded by the documents, not unbounded")
-        .unwrap();
-
+        // The scan stops at the failing batch and holds it; the worker's loop
+        // makes the next attempts, which `retry_one_collection` is.
+        let outcome = worker.process(&last_entry(&engine)).await.unwrap();
+        assert_eq!(outcome, Outcome::Backfilled { embedded: 0 }, "cut short at the failure");
+        let mut turns = 0;
+        while worker.holding_work() {
+            turns += 1;
+            assert!(turns < 10, "the retries are bounded by the failures");
+            tokio::time::sleep_until(worker.next_attempt().expect("an attempt is due")).await;
+            worker.retry_one_collection().await.unwrap();
+        }
         assert_eq!(
-            outcome,
-            Outcome::Backfilled { embedded: 3 },
+            worker.counters().documents_embedded.load(Ordering::SeqCst),
+            3,
             "every document must land despite the transient failures"
         );
+        assert_eq!(turns, 2, "one retry failed again and one went through");
     }
 
     #[tokio::test]
@@ -4827,6 +5264,704 @@ pub(crate) mod tests {
         assert!(fake.calls() >= 3, "premise: it is retrying ({} calls)", fake.calls());
     }
 
+    // -----------------------------------------------------------------------
+    // A collection whose provider keeps failing waits alone
+    // -----------------------------------------------------------------------
+
+    /// Two embedded collections, `docs` (A) and `other` (B), each with its own
+    /// fake provider, and the position recorded at the tail.
+    async fn two_collections()
+    -> (Arc<Engine>, EmbeddingWorker, [(CollectionMeta, Arc<FakeProvider>); 2], tempfile::TempDir)
+    {
+        let (engine, a, mut worker, dir) = setup().await;
+        engine.create_collection("app", "other").unwrap();
+        engine.configure_vectors("app", "other", config(&["title"])).unwrap();
+        let b = engine.get_collection("app", "other").unwrap();
+        let (fa, fb) = (FakeProvider::new(4), FakeProvider::new(4));
+        worker.set_provider(a.id.0, Arc::clone(&fa) as Arc<dyn EmbeddingProvider>);
+        worker.set_provider(b.id.0, Arc::clone(&fb) as Arc<dyn EmbeddingProvider>);
+        position_at_latest(&engine);
+        (engine, worker, [(a, fa), (b, fb)], dir)
+    }
+
+    /// Write documents to a collection and gather their jobs, as the stream
+    /// would, and hold the position that covers everything written so far.
+    fn gathered(
+        engine: &Engine,
+        worker: &EmbeddingWorker,
+        pending: &mut Pending,
+        coll: &CollectionMeta,
+        ids: std::ops::Range<i64>,
+    ) -> Vec<kimmy_core::DocId> {
+        let shadow = engine.vector_collection(&coll.db, &coll.name).unwrap().unwrap();
+        let config = coll.vector.clone().unwrap();
+        let now = Instant::now();
+        let mut written = Vec::new();
+        for i in ids {
+            let id = engine.insert(coll, doc! { "_id": i, "title": format!("doc {i}") }).unwrap();
+            let judgement = Judgement {
+                fingerprint: config.fingerprint(),
+                unstamped: Unstamped::ByVersion,
+                handed_over: false,
+            };
+            let job = worker
+                .prepare_one(coll, &shadow, &config, &id, judgement)
+                .unwrap()
+                .expect("a fresh document has a job");
+            let item = Item {
+                collection: coll.clone(),
+                shadow: shadow.clone(),
+                config: config.clone(),
+                job,
+            };
+            pending.push(item, now, &worker.batching);
+            written.push(id);
+        }
+        let latest = last_entry(engine);
+        pending.hold(kimmy_core::ResumeToken::new(latest.stamp.hlc, latest.stamp.node), now);
+        written
+    }
+
+    fn embedded_ids(engine: &Engine, coll: &CollectionMeta, ids: &[kimmy_core::DocId]) -> usize {
+        let shadow = engine.vector_collection(&coll.db, &coll.name).unwrap().unwrap();
+        ids.iter().filter(|id| !engine.get_vectors(&shadow, id).unwrap().is_empty()).count()
+    }
+
+    /// A flush that must come back: a worker that retries a batch in place
+    /// never does, and on the paused clock its sleeps would run for ever.
+    async fn flushed(worker: &mut EmbeddingWorker, pending: &mut Pending) {
+        tokio::time::timeout(Duration::from_secs(60), worker.flush(pending))
+            .await
+            .expect("a flush returns while a provider is failing")
+            .unwrap();
+    }
+
+    /// The finding. One collection's provider failing retryably must not stop
+    /// another collection's embedding, whichever of the two the flush reaches
+    /// first. The failing collection is marked in the store, and the position
+    /// goes on as always, past what it holds.
+    #[tokio::test(start_paused = true)]
+    async fn a_collection_whose_provider_keeps_failing_does_not_stop_another_from_embedding() {
+        for failing_first in [true, false] {
+            let (engine, mut worker, [(a, fa), (b, fb)], _dir) = two_collections().await;
+            fa.fail_times.store(1_000_000, std::sync::atomic::Ordering::SeqCst);
+            let before = engine.consumer_position(CONSUMER).unwrap();
+            assert!(before.is_some(), "premise: a position is recorded");
+
+            let mut pending = Pending::default();
+            let (ids_a, ids_b);
+            if failing_first {
+                ids_a = gathered(&engine, &worker, &mut pending, &a, 0..3);
+                ids_b = gathered(&engine, &worker, &mut pending, &b, 0..3);
+            } else {
+                ids_b = gathered(&engine, &worker, &mut pending, &b, 0..3);
+                ids_a = gathered(&engine, &worker, &mut pending, &a, 0..3);
+            }
+            let newest = pending.token.clone();
+            flushed(&mut worker, &mut pending).await;
+
+            assert_eq!(embedded_ids(&engine, &b, &ids_b), 3, "B embeds while A fails");
+            assert_eq!(embedded_ids(&engine, &a, &ids_a), 0, "A has not been embedded");
+            assert_eq!(fa.calls(), 1, "A was tried once, not in a loop");
+            assert_eq!(
+                engine.consumer_position(CONSUMER).unwrap(),
+                newest,
+                "the position moves past what A holds (A first: {failing_first})"
+            );
+            assert_ne!(newest, before);
+            assert_eq!(
+                engine.vector_rescans().unwrap(),
+                vec![(a.id, false)],
+                "and A, only A, is marked as owing a scan"
+            );
+            assert_eq!(worker.backoff.len(), 1, "only A is backing off");
+            assert_eq!(worker.backoff[&a.id.0].failures, 1);
+
+            // B's later writes go on being embedded, and the position on.
+            let mut more = Pending::default();
+            let ids_b2 = gathered(&engine, &worker, &mut more, &b, 3..5);
+            let latest = more.token.clone();
+            flushed(&mut worker, &mut more).await;
+            assert_eq!(embedded_ids(&engine, &b, &ids_b2), 2);
+            assert_eq!(fb.calls(), 2);
+            assert_eq!(engine.consumer_position(CONSUMER).unwrap(), latest);
+        }
+    }
+
+    /// A collection's own batches that arrive while it backs off are not sent
+    /// and not piled up: a rescan is noted and picks them up with the held
+    /// batch once the provider answers, and then the mark is gone.
+    #[tokio::test(start_paused = true)]
+    async fn a_collection_that_recovers_embeds_what_it_held_and_what_it_skipped() {
+        let (engine, mut worker, [(a, fa), _], _dir) = two_collections().await;
+        fa.fail_times.store(1_000_000, std::sync::atomic::Ordering::SeqCst);
+        let mut pending = Pending::default();
+        let held_ids = gathered(&engine, &worker, &mut pending, &a, 0..3);
+        flushed(&mut worker, &mut pending).await;
+        assert_eq!(fa.calls(), 1);
+
+        // More of A's writes while it backs off: not sent, and not kept.
+        let skipped_ids = gathered(&engine, &worker, &mut pending, &a, 3..6);
+        let token = pending.token.clone().expect("a position is held");
+        flushed(&mut worker, &mut pending).await;
+        assert_eq!(fa.calls(), 1, "no attempt before the collection's attempt is due");
+        assert_eq!(worker.backoff[&a.id.0].failures, 1, "a skipped batch is not a failure");
+        assert!(worker.backoff[&a.id.0].rescan.is_some(), "the skipped batch is noted");
+        assert_eq!(
+            engine.consumer_position(CONSUMER).unwrap(),
+            Some(token.clone()),
+            "the position has passed both, their debt being in the store"
+        );
+        assert_eq!(engine.vector_rescans().unwrap(), vec![(a.id, false)]);
+
+        // Not yet due: nothing is tried.
+        tokio::time::sleep(RETRY_DELAY - Duration::from_secs(1)).await;
+        assert!(!worker.retry_one_collection().await.unwrap());
+        assert_eq!(fa.calls(), 1, "not tried before its delay has passed");
+        assert!(worker.backoff[&a.id.0].held.is_some(), "and the batch is still held");
+
+        // The provider recovers; the next attempt, when due, embeds all six.
+        fa.fail_times.store(0, std::sync::atomic::Ordering::SeqCst);
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        let unblocked = worker.retry_one_collection().await.unwrap();
+        assert!(unblocked, "nothing is held any more");
+        assert_eq!(embedded_ids(&engine, &a, &held_ids), 3, "the held batch");
+        assert_eq!(embedded_ids(&engine, &a, &skipped_ids), 3, "and what was skipped meanwhile");
+        assert!(worker.backoff.is_empty(), "the backoff is over, and so is its count");
+
+        assert!(engine.vector_rescans().unwrap().is_empty(), "the debt is paid and forgotten");
+        assert_eq!(engine.consumer_position(CONSUMER).unwrap(), Some(token));
+    }
+
+    /// A single document is held like a batch, and a recovered provider's next
+    /// failure starts the delay over rather than continuing the old one.
+    #[tokio::test(start_paused = true)]
+    async fn a_collections_delay_starts_over_after_its_provider_answers() {
+        let (engine, mut worker, [(a, fa), _], _dir) = two_collections().await;
+        fa.fail_times.store(1_000_000, std::sync::atomic::Ordering::SeqCst);
+        let mut pending = Pending::default();
+        gathered(&engine, &worker, &mut pending, &a, 0..1);
+        flushed(&mut worker, &mut pending).await;
+        for _ in 0..3 {
+            tokio::time::sleep_until(worker.next_attempt().unwrap()).await;
+            worker.retry_one_collection().await.unwrap();
+        }
+        assert_eq!(worker.backoff[&a.id.0].failures, 4, "premise: four failures in a row");
+
+        // One call is answered, and the next failure is the first again.
+        fa.fail_times.store(0, std::sync::atomic::Ordering::SeqCst);
+        tokio::time::sleep_until(worker.next_attempt().unwrap()).await;
+        assert!(worker.retry_one_collection().await.unwrap());
+        assert!(worker.backoff.is_empty());
+        fa.fail_times.store(1_000_000, std::sync::atomic::Ordering::SeqCst);
+        let mut again = Pending::default();
+        gathered(&engine, &worker, &mut again, &a, 1..2);
+        flushed(&mut worker, &mut again).await;
+        assert_eq!(worker.backoff[&a.id.0].failures, 1, "the count started over");
+        let wait = worker.next_attempt().unwrap() - tokio::time::Instant::now();
+        assert_eq!(wait.as_secs(), RETRY_DELAY.as_secs(), "and so did the delay");
+    }
+
+    /// A provider that answers only one call, the `answers`th, counting from
+    /// one, and fails retryably on every other.
+    struct AnswersOneCall {
+        inner: Arc<FakeProvider>,
+        answers: usize,
+        calls: std::sync::atomic::AtomicUsize,
+    }
+
+    #[async_trait]
+    impl EmbeddingProvider for AnswersOneCall {
+        async fn embed(&self, texts: &[String]) -> Result<Vec<Vec<f32>>> {
+            if self.calls.fetch_add(1, Ordering::SeqCst) + 1 == self.answers {
+                return self.inner.embed(texts).await;
+            }
+            Err(VectorError::Transport {
+                provider: "fake",
+                kind: TransportKind::Reset,
+                detail: "gone".into(),
+            })
+        }
+
+        fn dim(&self) -> usize {
+            self.inner.dim()
+        }
+
+        fn name(&self) -> &'static str {
+            "fake"
+        }
+    }
+
+    /// An answered call ends the failures even when the collection still has
+    /// work held: the held batch lands, the scan behind it meets the provider
+    /// failing again, and that is a first failure, with the first delay.
+    #[tokio::test(start_paused = true)]
+    async fn an_answered_call_resets_the_count_of_a_collection_that_still_holds_work() {
+        let (engine, mut worker, [(a, _), _], _dir) = two_collections().await;
+        let provider =
+            AnswersOneCall { inner: FakeProvider::new(4), answers: 3, calls: Default::default() };
+        worker.set_provider(a.id.0, Arc::new(provider));
+        let mut pending = Pending::default();
+        let held = gathered(&engine, &worker, &mut pending, &a, 0..2);
+        flushed(&mut worker, &mut pending).await;
+        // Written while the collection backs off, so a scan is owed.
+        let skipped = gathered(&engine, &worker, &mut pending, &a, 2..4);
+        flushed(&mut worker, &mut pending).await;
+
+        // Call 2 fails, call 3 lands the held batch, call 4 is the scan's.
+        for _ in 0..2 {
+            tokio::time::sleep_until(worker.next_attempt().unwrap()).await;
+            worker.retry_one_collection().await.unwrap();
+        }
+        assert_eq!(embedded_ids(&engine, &a, &held), 2, "the held batch landed");
+        assert_eq!(embedded_ids(&engine, &a, &skipped), 0, "the scan's batch did not");
+        assert_eq!(worker.backoff[&a.id.0].failures, 1, "a first failure, not a fourth");
+        let wait = worker.next_attempt().unwrap() - tokio::time::Instant::now();
+        assert_eq!(wait.as_secs(), RETRY_DELAY.as_secs());
+    }
+
+    /// The attempts follow the schedule: five seconds, doubling, to the cap.
+    /// Counted in provider calls over virtual time.
+    #[tokio::test(start_paused = true)]
+    async fn a_failing_collections_attempts_follow_the_backoff_schedule() {
+        let (engine, mut worker, [(a, fa), _], _dir) = two_collections().await;
+        fa.fail_times.store(1_000_000, std::sync::atomic::Ordering::SeqCst);
+        let mut pending = Pending::default();
+        gathered(&engine, &worker, &mut pending, &a, 0..2);
+        let start = tokio::time::Instant::now();
+        flushed(&mut worker, &mut pending).await;
+
+        let mut at = vec![0];
+        for _ in 0..9 {
+            tokio::time::sleep_until(worker.next_attempt().unwrap()).await;
+            let calls = fa.calls();
+            worker.retry_one_collection().await.unwrap();
+            assert_eq!(fa.calls(), calls + 1, "one provider call per attempt");
+            at.push((tokio::time::Instant::now() - start).as_secs());
+        }
+        assert_eq!(
+            at,
+            vec![0, 5, 15, 35, 75, 155, 315, 615, 915, 1215],
+            "5 s doubling to 300 s: attempts at these seconds"
+        );
+        assert_eq!(fa.calls(), 10);
+        assert_eq!(worker.backoff[&a.id.0].failures, 10);
+
+        // A node whose collection is backing off is not an idle one.
+        worker.idle_turn(&Pending::default());
+        assert_eq!(worker.counters().last_progress(), None, "an idle turn is not progress");
+    }
+
+    /// A provider that refuses a batch for good, takes the next call, and then
+    /// fails for now: a provider that goes from one failure to the other while
+    /// a batch is being taken apart.
+    struct RefusesThenGoesAway {
+        inner: Arc<FakeProvider>,
+        calls: std::sync::atomic::AtomicUsize,
+    }
+
+    #[async_trait]
+    impl EmbeddingProvider for RefusesThenGoesAway {
+        async fn embed(&self, texts: &[String]) -> Result<Vec<Vec<f32>>> {
+            match self.calls.fetch_add(1, Ordering::SeqCst) {
+                0 => Err(VectorError::ProviderRejected {
+                    provider: "fake",
+                    status: 400,
+                    detail: "refused".into(),
+                }),
+                1 => self.inner.embed(texts).await,
+                _ => Err(VectorError::Transport {
+                    provider: "fake",
+                    kind: TransportKind::Reset,
+                    detail: "gone".into(),
+                }),
+            }
+        }
+
+        fn dim(&self) -> usize {
+            self.inner.dim()
+        }
+
+        fn name(&self) -> &'static str {
+            "fake"
+        }
+    }
+
+    /// A batch taken apart after a permanent failure, whose provider then
+    /// fails for now part-way through, keeps the document that landed and
+    /// holds the one that failed and the ones not yet sent.
+    #[tokio::test(start_paused = true)]
+    async fn a_batch_taken_apart_holds_the_documents_a_failing_provider_did_not_reach() {
+        let (engine, mut worker, [(a, _), _], _dir) = two_collections().await;
+        let provider =
+            RefusesThenGoesAway { inner: FakeProvider::new(4), calls: Default::default() };
+        worker.set_provider(a.id.0, Arc::new(provider));
+        let mut pending = Pending::default();
+        let ids = gathered(&engine, &worker, &mut pending, &a, 0..4);
+        flushed(&mut worker, &mut pending).await;
+
+        assert_eq!(embedded_ids(&engine, &a, &ids), 1, "the one the provider took landed");
+        let held = worker.backoff[&a.id.0].held.as_ref().expect("the rest is held");
+        assert_eq!(held.jobs.len(), 3, "the failed document and the two not sent");
+    }
+
+    /// A batch held under a configuration the collection no longer has is
+    /// not sent: the reconfiguration's own scan embeds under the new one, and
+    /// sending the old batch would write the old model's vectors over it.
+    #[tokio::test(start_paused = true)]
+    async fn a_held_batch_is_dropped_when_its_collection_is_reconfigured() {
+        let (engine, mut worker, [(a, fa), _], _dir) = two_collections().await;
+        fa.fail_times.store(1_000_000, std::sync::atomic::Ordering::SeqCst);
+        let mut pending = Pending::default();
+        gathered(&engine, &worker, &mut pending, &a, 0..2);
+        flushed(&mut worker, &mut pending).await;
+        assert_eq!(fa.calls(), 1);
+
+        let changed =
+            VectorConfig { document_prefix: Some("passage: ".into()), ..config(&["title"]) };
+        engine.configure_vectors("app", "docs", changed).unwrap();
+        tokio::time::sleep_until(worker.next_attempt().unwrap()).await;
+        worker.retry_one_collection().await.unwrap();
+        assert_eq!(fa.calls(), 1, "the old configuration's batch is not sent");
+        assert!(worker.backoff.is_empty(), "and nothing is left to retry");
+    }
+
+    /// The worker's own loop makes the attempts, on a quiet stream, when they
+    /// fall due, and records the position the moment nothing is held. Paused
+    /// clock; each poll waits a real millisecond so the worker's storage work
+    /// gets its turn, then a virtual second, so the attempts fall due.
+    #[tokio::test(start_paused = true)]
+    async fn a_running_worker_retries_a_held_batch_when_due_and_then_records_the_position() {
+        let (engine, mut worker, [(a, fa), _], _dir) = two_collections().await;
+        fa.fail_times.store(2, std::sync::atomic::Ordering::SeqCst);
+        // The batch fills at three chunks and goes out from the entry arm: no
+        // deadline read from the std clock, which a paused clock does not move.
+        worker.set_batching(BatchSettings { max_chunks: 3, ..Default::default() });
+        let ids: Vec<_> = (0..3)
+            .map(|i| engine.insert(&a, doc! { "_id": i as i64, "title": "late" }).unwrap())
+            .collect();
+        let latest = last_entry(&engine);
+        let newest = kimmy_core::ResumeToken::new(latest.stamp.hlc, latest.stamp.node);
+        let running = tokio::spawn(async move { worker.run().await });
+
+        let landed = |engine: &Engine| {
+            embedded_ids(engine, &a, &ids) == 3
+                && engine.consumer_position(CONSUMER).unwrap().is_some_and(|p| p.hlc == newest.hlc)
+        };
+        for _ in 0..5_000 {
+            if landed(&engine) {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(1));
+            tokio::time::sleep(Duration::from_secs(1)).await;
+        }
+        assert_eq!(embedded_ids(&engine, &a, &ids), 3, "the held batch is retried when due");
+        assert_eq!(fa.calls(), 3, "two failed attempts, then the one that landed");
+        assert!(landed(&engine), "and the position moves once nothing is held");
+        running.abort();
+    }
+
+    /// The invariant the position depends on: the mark is in the store by the
+    /// time the call that held the work returns, which is before any flush can
+    /// record a position past the entries it came from.
+    #[tokio::test(start_paused = true)]
+    async fn a_held_batch_is_marked_before_the_call_that_held_it_returns() {
+        let (engine, mut worker, [(a, fa), _], _dir) = two_collections().await;
+        fa.fail_times.store(1_000_000, std::sync::atomic::Ordering::SeqCst);
+        let before = engine.consumer_position(CONSUMER).unwrap();
+        let mut pending = Pending::default();
+        gathered(&engine, &worker, &mut pending, &a, 0..3);
+        assert!(engine.vector_rescans().unwrap().is_empty());
+
+        let mut checkpoint = Checkpoint::default();
+        worker.embed_batch(pending.batches.remove(0), &mut checkpoint).await;
+        assert!(checkpoint.deferred);
+        assert_eq!(engine.vector_rescans().unwrap(), vec![(a.id, false)], "marked on return");
+        assert_eq!(engine.consumer_position(CONSUMER).unwrap(), before, "and no position yet");
+
+        // A batch skipped while it backs off is marked as well, and a scan
+        // that needs forcing raises the mark before it returns.
+        let mut more = Pending::default();
+        gathered(&engine, &worker, &mut more, &a, 3..5);
+        worker.note_rescan(a.id.0, Unscanned::Force).await;
+        assert_eq!(engine.vector_rescans().unwrap(), vec![(a.id, true)]);
+        // And a weaker one after it never lowers it: a crash between the two
+        // would otherwise lose the force.
+        worker.mark(a.id.0, Unscanned::Check).await;
+        assert_eq!(engine.vector_rescans().unwrap(), vec![(a.id, true)], "not lowered");
+    }
+
+    /// If a mark cannot be written nothing durable says what a restart owes,
+    /// so the position is held back instead, and goes out once the mark is
+    /// written.
+    #[tokio::test(start_paused = true)]
+    async fn a_mark_that_cannot_be_written_holds_the_position_until_it_can() {
+        let (engine, mut worker, [(a, fa), (b, _)], _dir) = two_collections().await;
+        fa.fail_times.store(1_000_000, std::sync::atomic::Ordering::SeqCst);
+        worker.refuse_marks = true;
+        let before = engine.consumer_position(CONSUMER).unwrap();
+        let mut pending = Pending::default();
+        gathered(&engine, &worker, &mut pending, &a, 0..3);
+        let token = pending.token.clone();
+        flushed(&mut worker, &mut pending).await;
+        assert!(engine.vector_rescans().unwrap().is_empty(), "premise: no mark was written");
+        assert_eq!(engine.consumer_position(CONSUMER).unwrap(), before, "the position is held");
+        assert_eq!(pending.token, token);
+
+        // Another collection's flush must not carry it out in its own commit.
+        let mut more = Pending::default();
+        let ids_b = gathered(&engine, &worker, &mut more, &b, 0..2);
+        let latest = more.token.clone();
+        flushed(&mut worker, &mut more).await;
+        assert_eq!(embedded_ids(&engine, &b, &ids_b), 2, "B goes on embedding");
+        assert_eq!(engine.consumer_position(CONSUMER).unwrap(), before, "still held");
+
+        worker.refuse_marks = false;
+        tokio::time::sleep_until(worker.next_attempt().unwrap()).await;
+        worker.retry_one_collection().await.unwrap();
+        assert_eq!(engine.vector_rescans().unwrap(), vec![(a.id, false)], "written at the retry");
+        flushed(&mut worker, &mut more).await;
+        assert_eq!(engine.consumer_position(CONSUMER).unwrap(), latest, "and the position goes");
+    }
+
+    /// A scan of several batches that fails at the first stops there, holds
+    /// the batch and marks the collection (forced, as a configuration
+    /// change's backfill is), and the rest is scanned when the provider
+    /// answers: every document lands.
+    #[tokio::test(start_paused = true)]
+    async fn a_scan_of_several_batches_that_fails_is_finished_when_the_provider_answers() {
+        let (engine, coll, mut worker, _dir) = setup_with_history(4).await;
+        let fake = FakeProvider::new(4);
+        fake.fail_times.store(2, std::sync::atomic::Ordering::SeqCst);
+        worker.set_provider(coll.id.0, Arc::clone(&fake) as Arc<dyn EmbeddingProvider>);
+        worker.set_batching(BatchSettings { max_chunks: 1, ..Default::default() });
+
+        let outcome = worker.process(&last_entry(&engine)).await.unwrap();
+        assert_eq!(outcome, Outcome::Backfilled { embedded: 0 }, "cut short at the first batch");
+        assert_eq!(worker.backoff[&coll.id.0].held.as_ref().unwrap().jobs.len(), 1);
+        assert_eq!(
+            engine.vector_rescans().unwrap(),
+            vec![(coll.id, true)],
+            "marked, and forced: it was a backfill"
+        );
+
+        // A retry that fails again keeps the mark, forced, where it was.
+        tokio::time::sleep_until(worker.next_attempt().unwrap()).await;
+        worker.retry_one_collection().await.unwrap();
+        assert!(worker.holding_work(), "premise: the second call failed too");
+        assert_eq!(engine.vector_rescans().unwrap(), vec![(coll.id, true)], "still forced");
+
+        let mut turns = 0;
+        while worker.holding_work() {
+            turns += 1;
+            assert!(turns < 10);
+            tokio::time::sleep_until(worker.next_attempt().unwrap()).await;
+            worker.retry_one_collection().await.unwrap();
+        }
+        assert_eq!(worker.counters().documents_embedded.load(Ordering::SeqCst), 4, "all four");
+        assert!(engine.vector_rescans().unwrap().is_empty(), "and the mark is gone");
+    }
+
+    /// The restart the held position used to stand for. A worker is stopped
+    /// without ceremony (a crash) while a collection's provider is failing and
+    /// more of its writes have arrived: the position went past all of them,
+    /// each held or skipped batch having been marked first, and the next worker
+    /// on the same store finds the mark, scans the collection and embeds every
+    /// document, with the provider answering, whatever the oplog says.
+    #[tokio::test]
+    async fn a_restart_finishes_what_a_failing_provider_left_from_its_marks_not_the_oplog() {
+        let (engine, mut worker, [(a, fa), _], _dir) = two_collections().await;
+        fa.fail_times.store(1_000_000, std::sync::atomic::Ordering::SeqCst);
+        worker.set_batching(BatchSettings { max_chunks: 3, ..Default::default() });
+        let before = engine.consumer_position(CONSUMER).unwrap();
+        let mut ids = Vec::new();
+        for i in 0..3 {
+            ids.push(engine.insert(&a, doc! { "_id": i as i64, "title": "first" }).unwrap());
+        }
+        let running = tokio::spawn(async move { worker.run().await });
+        let reached = |engine: &Engine, stamp: Hlc| {
+            engine.consumer_position(CONSUMER).unwrap().is_some_and(|p| p.hlc == stamp)
+        };
+        let first = last_entry(&engine).stamp.hlc;
+        for _ in 0..2_000 {
+            if reached(&engine, first) && !engine.vector_rescans().unwrap().is_empty() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        // More writes while A backs off, skipped, not sent.
+        for i in 3..5 {
+            ids.push(engine.insert(&a, doc! { "_id": i as i64, "title": "second" }).unwrap());
+        }
+        let newest = last_entry(&engine).stamp.hlc;
+        for _ in 0..2_000 {
+            if reached(&engine, newest) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        assert!(reached(&engine, newest), "the position passed all five entries");
+        assert_ne!(before, engine.consumer_position(CONSUMER).unwrap());
+        assert_eq!(embedded_ids(&engine, &a, &ids), 0, "premise: none of A is embedded");
+        assert_eq!(engine.vector_rescans().unwrap(), vec![(a.id, false)]);
+
+        // The crash.
+        running.abort();
+        assert!(running.await.unwrap_err().is_cancelled());
+
+        // A new worker on the same store, its provider healthy.
+        let mut restarted = EmbeddingWorker::new(Arc::clone(&engine));
+        let healthy = FakeProvider::new(4);
+        restarted.set_provider(a.id.0, Arc::clone(&healthy) as Arc<dyn EmbeddingProvider>);
+        let running = tokio::spawn(async move { restarted.run().await });
+        for _ in 0..2_000 {
+            if embedded_ids(&engine, &a, &ids) == 5 && engine.vector_rescans().unwrap().is_empty() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        assert_eq!(embedded_ids(&engine, &a, &ids), 5, "every document of A, from the mark");
+        assert!(engine.vector_rescans().unwrap().is_empty(), "and the mark is cleared");
+        assert!(reached(&engine, newest), "the position had not gone back");
+        running.abort();
+    }
+
+    /// A collection this member stops owning while it owes a scan is its new
+    /// owner's to finish, but it is left unsettled, so if the member owns it
+    /// again at a later evaluation, however briefly it lost it, that is a gain
+    /// and the rescan follows (ADR-203). Left settled, the flicker would lose
+    /// the debt.
+    #[tokio::test(start_paused = true)]
+    async fn a_collection_dropped_for_ownership_while_it_owes_a_scan_is_rescanned_if_it_returns() {
+        let (engine, mut worker, [(a, fa), _], _dir) = two_collections().await;
+        let owner = switchable_owner(&mut worker, true);
+        fa.fail_times.store(1_000_000, std::sync::atomic::Ordering::SeqCst);
+        worker.ownership_settled.insert("app/docs".into(), true);
+        let mut pending = Pending::default();
+        let ids = gathered(&engine, &worker, &mut pending, &a, 0..3);
+        flushed(&mut worker, &mut pending).await;
+
+        // Ownership moves away, and the attempt that finds out drops the debt.
+        owner.store(false, Ordering::SeqCst);
+        tokio::time::sleep_until(worker.next_attempt().unwrap()).await;
+        worker.retry_one_collection().await.unwrap();
+        assert!(worker.backoff.is_empty() && engine.vector_rescans().unwrap().is_empty());
+        assert_eq!(worker.ownership_settled.get("app/docs"), Some(&false), "unsettled");
+
+        // It comes back before anything else looked: a gain, rescanned once held.
+        owner.store(true, Ordering::SeqCst);
+        fa.fail_times.store(0, std::sync::atomic::Ordering::SeqCst);
+        let t0 = Instant::now();
+        worker.rescan_gained(t0).await.unwrap();
+        assert_eq!(embedded_ids(&engine, &a, &ids), 0, "not before the move has held");
+        worker.rescan_gained(t0 + OWNERSHIP_SETTLE + Duration::from_secs(1)).await.unwrap();
+        assert_eq!(embedded_ids(&engine, &a, &ids), 3, "the gain is rescanned");
+    }
+
+    /// A failing collection's deferred documents do not hold up another's. The
+    /// pass makes one call for the failing collection, passes over the rest of
+    /// its documents and goes on, where it broke at the first failure.
+    #[tokio::test]
+    async fn a_failing_collections_deferred_documents_do_not_hold_up_anothers() {
+        let (engine, mut worker, [(a, fa), (b, fb)], _dir) = two_collections().await;
+        let owner = switchable_owner(&mut worker, false);
+        fa.fail_times.store(1_000_000, std::sync::atomic::Ordering::SeqCst);
+        let mut ids_b = Vec::new();
+        for (coll, i) in [(&a, 0), (&a, 1), (&b, 0)] {
+            let id = engine.insert(coll, doc! { "_id": i as i64, "title": "held" }).unwrap();
+            let entry = as_if_written_elsewhere(last_entry(&engine));
+            assert_eq!(worker.process(&entry).await.unwrap(), Outcome::Deferred);
+            if coll.id == b.id {
+                ids_b.push(id);
+            }
+        }
+        owner.store(true, Ordering::SeqCst);
+
+        let embedded = worker.drain_deferred(Instant::now() + FOREIGN_GRACE).await;
+        assert_eq!(embedded, 1, "B's document was embedded in the same pass");
+        assert_eq!(embedded_ids(&engine, &b, &ids_b), 1);
+        assert_eq!(fa.calls(), 1, "A cost one call, not one per document");
+        assert_eq!(fb.calls(), 1);
+        assert_eq!(worker.deferred.len(), 2, "A's two documents are kept for another pass");
+    }
+
+    /// A collection backing off from a failed batch is not called by the
+    /// deferred re-check either.
+    #[tokio::test(start_paused = true)]
+    async fn a_deferred_document_of_a_backing_off_collection_is_passed_over() {
+        let (engine, mut worker, [(a, fa), (b, fb)], _dir) = two_collections().await;
+        let owner = switchable_owner(&mut worker, false);
+        fa.fail_times.store(1_000_000, std::sync::atomic::Ordering::SeqCst);
+        let mut ids_b = Vec::new();
+        for (coll, i) in [(&a, 0), (&b, 0)] {
+            let id = engine.insert(coll, doc! { "_id": i as i64, "title": "held" }).unwrap();
+            let entry = as_if_written_elsewhere(last_entry(&engine));
+            assert_eq!(worker.process(&entry).await.unwrap(), Outcome::Deferred);
+            if coll.id == b.id {
+                ids_b.push(id);
+            }
+        }
+        owner.store(true, Ordering::SeqCst);
+        // A's provider fails a batch of its own: A backs off.
+        let mut pending = Pending::default();
+        gathered(&engine, &worker, &mut pending, &a, 10..12);
+        flushed(&mut worker, &mut pending).await;
+        assert_eq!(fa.calls(), 1);
+
+        let embedded = worker.drain_deferred(Instant::now() + FOREIGN_GRACE).await;
+        assert_eq!(embedded, 1, "B's");
+        assert_eq!(fa.calls(), 1, "A was not called while it backs off");
+        assert_eq!(fb.calls(), 1);
+        assert_eq!(embedded_ids(&engine, &b, &ids_b), 1);
+    }
+
+    /// A batch held for its provider holds no task and no attempt: the worker
+    /// that is running makes B's progress while A waits, its position goes on,
+    /// and a stop during A's backoff starts no attempt and ends the worker.
+    /// Counted, not timed: the ceiling on the stop is only there so a worker
+    /// that never ends fails the test instead of hanging it.
+    #[tokio::test]
+    async fn a_running_worker_embeds_another_collection_and_stops_while_one_backs_off() {
+        let (engine, mut worker, [(a, fa), (b, fb)], _dir) = two_collections().await;
+        fa.fail_times.store(1_000_000, std::sync::atomic::Ordering::SeqCst);
+        let before = engine.consumer_position(CONSUMER).unwrap();
+        let counters = worker.counters();
+        let mut ids_b = Vec::new();
+        for i in 0..3 {
+            engine.insert(&a, doc! { "_id": i as i64, "title": "never lands" }).unwrap();
+            ids_b.push(engine.insert(&b, doc! { "_id": i as i64, "title": "lands" }).unwrap());
+        }
+        let latest = last_entry(&engine);
+        let newest = kimmy_core::ResumeToken::new(latest.stamp.hlc, latest.stamp.node);
+        let running = tokio::spawn(async move { worker.run().await });
+
+        let moved = |engine: &Engine| {
+            engine.consumer_position(CONSUMER).unwrap().is_some_and(|p| p.hlc == newest.hlc)
+        };
+        for _ in 0..2_000 {
+            if embedded_ids(&engine, &b, &ids_b) == 3 && moved(&engine) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        assert_eq!(embedded_ids(&engine, &b, &ids_b), 3, "B is embedded while A fails");
+        assert!(fb.calls() >= 1, "B was tried");
+        assert!(fa.calls() >= 1, "A was tried");
+        assert_ne!(before, engine.consumer_position(CONSUMER).unwrap());
+        assert!(moved(&engine), "the position went past A's entries, A being marked");
+        assert_eq!(engine.vector_rescans().unwrap(), vec![(a.id, false)]);
+        assert!(counters.last_progress().is_some(), "B's embedding is progress");
+
+        engine.stop_walks();
+        let calls = fa.calls();
+        let ended = tokio::time::timeout(Duration::from_secs(30), running)
+            .await
+            .expect("a stop ends the worker")
+            .unwrap();
+        assert!(ended.as_ref().is_err_and(VectorError::is_stopping), "{ended:?}");
+        assert_eq!(fa.calls(), calls, "a stop starts no attempt");
+    }
+
     /// A drain that puts a document back after a retryable provider error is
     /// not idle (ADR-187): the next idle turn records no progress, and the
     /// drain that gets it through lets the one after it count again.
@@ -5381,9 +6516,9 @@ pub(crate) mod tests {
     }
 
     /// A provider whose first `good` calls succeed and whose every later call
-    /// fails the way a provider that went away does, retryably, so the worker
-    /// waits and tries again for as long as it runs: an owner that is stopped
-    /// part-way through a scan once the test aborts it.
+    /// fails the way a provider that went away does, retryably, so a scan of
+    /// it is cut short at the failing batch: an owner that leaves a scan
+    /// part-way, as one that was stopped there does.
     struct GoesAway {
         inner: Arc<FakeProvider>,
         good: std::sync::atomic::AtomicUsize,
@@ -5464,8 +6599,11 @@ pub(crate) mod tests {
             assert!(Instant::now() < deadline, "the owner's first batch never landed");
             tokio::time::sleep(Duration::from_millis(5)).await;
         }
-        running.abort();
-        assert!(running.await.unwrap_err().is_cancelled(), "stopped part-way, not finished");
+        assert_eq!(
+            running.await.unwrap().unwrap(),
+            Outcome::Backfilled { embedded: 4 },
+            "cut short at the batch the provider failed, not finished"
+        );
         let under_b = ids.iter().filter(|id| made_under(engine, id) == Some(b.fingerprint()));
         assert_eq!(under_b.count(), 4, "one batch re-embedded under B");
         let under_a = ids.iter().filter(|id| made_under(engine, id) == Some(a.fingerprint()));

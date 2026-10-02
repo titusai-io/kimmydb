@@ -4792,6 +4792,42 @@ operators size deployments: a collection is embedded by exactly one owner
 node, so adding members does not raise one collection's throughput — it
 raises how many collections embed at once.
 
+**Amended 2026-10-02: a retryable failure holds the batch for its collection, and
+no longer retries it in place.** The line above, that a retryable failure
+retries the whole batch, was true to the letter: the worker, one task per node,
+retried that batch in place every 5 s with no bound, so one collection's provider
+being down, rate limited, hung or unresolvable stopped embedding for every other
+collection on the node, other tenants' included. The batch is now held with its
+collection (`Backoff`), the worker returns to its loop, and the collection's next
+attempt is made from there when due: 5 s after the first failure, doubling to 300 s,
+reset by one answered call. The collection's other batches are not sent while it
+backs off and are not piled up; a scan, noted when one is skipped, embeds what
+they would have once the held batch has gone through. A scan or a backfill that
+meets the failure stops there and is run again the same way. **What is held is in
+memory, so the debt is made durable first:** the collection is marked in the store
+(`vector_rescan:<collection id>` in the metadata table, `check` or `force`) when
+its entry is created, a scan is cut short or a batch is skipped, and before any
+oplog position past the entries it came from is written. The position is one
+position for every collection and advances as it always does; a restart loads
+the marks and scans the marked collections, so it costs a scan per marked
+collection, not a replay of the oplog window. The first version held the
+position while any collection held work, and a provider down for longer than
+`storage.oplog_retention_secs` then made every restart take the lost-position
+path and force-rescan every owned collection. The mark is cleared when the
+entry ends: recovered, reconfigured, dropped, or no longer owned, and in the
+last case the collection is marked unsettled, so a return is a gain (ADR-203). A
+mark that cannot be written holds the position back instead, with a `WARN`. The
+worker sleeps nowhere inside a batch, so a stop
+does not wait on a delay, and a held batch holds no attempt: each attempt is one
+provider call under its own timeout. A deferred re-check of a document another
+member wrote (the ownership path) still retries every 5 s, but a failing
+collection costs a pass one call and its other documents, and those of a
+collection that is backing off, are passed over, so one collection's failures do
+not hold up another's. ADR-203's note that a `408` or
+`425` that recurs "is retried for ever, every five seconds, holding the documents
+behind it" now reads: retried for ever at a delay that grows to five minutes,
+holding only its own collection's.
+
 ---
 
 ## ADR-096 — Federated tokens are refused above a maximum lifetime

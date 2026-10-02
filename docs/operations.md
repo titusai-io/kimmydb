@@ -1040,11 +1040,28 @@ as `kimmy_embed_failures_total` climbing beside an age that climbs too. Every
 path that calls the provider holds it:
 
 - a streamed batch, the one an outage reaches first, and the backfill after a
-  vector configuration change, both retry a retryable error in place, every
-  5 s, until it succeeds, and take no other turn meanwhile;
+  vector configuration change, both hold the batch for that collection when
+  the error is retryable, and the worker goes on with other collections
+  ([Vectors](vectors.md#when-a-provider-keeps-failing)). No idle turn counts
+  while any collection is held, so the age climbs, except that a flush which
+  embedded something for another collection resets it;
 - a re-check of a document another member wrote and did not embed is put back
   to try again, and no idle turn counts until a later re-check goes through.
   Documents merely waiting out that member's grace period do not hold it up.
+
+Each failed attempt of a held collection logs one `WARN`, `embedding failed for
+this collection; it is retried later, after a delay that grows, and other
+collections' embedding goes on`, with `db`, `collection`, `documents` (in the
+held batch), `attempts` (failed in a row), `retry_in_secs` (5, 10, 20 and so on
+to 300) and the `error`. It is said once per attempt, not once per document or
+per skipped batch, so a line every few minutes for one collection is a provider
+that is still down, and its collection's documents are waiting, not lost. The
+collection is marked in the store as owing a scan, so the oplog position goes
+on, and a restart scans the marked collections instead of replaying the oplog.
+A `WARN` that a collection's scan mark **could not be recorded** means the
+position is being held back instead, and a restart in that time replays the
+entries since; look at the store's health, since the write that failed is an
+ordinary one.
 
 A storage error the worker retries in place holds it up too, with
 `kimmy_task_retries_total{task="embedding_worker"}` rising.
