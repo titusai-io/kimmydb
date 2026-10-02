@@ -297,6 +297,10 @@ impl AppState {
                 // One-hot over the marker's state; `none` on a node with none.
                 reading.catching_up =
                     self.catch_up().map_or(0, |c| c.state_slot(std::time::Instant::now()));
+                // What the yield evaluator last decided (ADR-213).
+                if let Some(handle) = self.metrics.yield_handle() {
+                    reading.evaluator = handle.reading();
+                }
                 reading
             },
         })

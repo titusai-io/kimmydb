@@ -83,6 +83,43 @@ breaking changes and says so here; a `0.x.PATCH` bump never does.
   process. A rollback is the commit the stop interrupted, or damage to it;
   after a clean shutdown it means the store is damaged.
 
+- **A member that cannot do a class of work gives it to a peer that can.** Each
+  of expiry, webhook delivery and embedding now beats a heartbeat, and a
+  dedicated thread judges those heartbeats and the runtime's own stall probe
+  every five seconds. A class that has failed locally in 6 of the last 12 ticks
+  (expiry: three passes of five), or has not moved for longer than its own bound, is
+  advertised as yielded to a peer that is healthy, responsive and would own the
+  work, and the member goes on owning it until every live peer has confirmed.
+  It takes the class back after two quiet minutes, doubling that for a class
+  that yields again, up to 32 minutes. A provider that hangs or answers 5xx, a
+  webhook endpoint that is down and a missing key never make a member yield, a
+  paused process or a loaded host reads as nothing, at most one member yields a
+  class at a time at a few members, and when two members are stalled in the same
+  class none yields it (a fault that follows the data costs one hand-off). A
+  start after `storage_failed` or `task_died`, or after an unclean end that the
+  disk's free space, a short previous run or an earlier unclean end corroborates,
+  begins with every class yielded, so a node in a full-disk restart loop stops
+  holding its share. A stuck writer is not detected yet. A member that sends
+  nothing is treated as before, so a cluster with 0.43.0 members works, with the
+  yielder owning until none is live. New series, all in Operations:
+  `kimmy_owner_class_state`, `kimmy_owner_class_owned`, `kimmy_yielding`,
+  `kimmy_yield_transitions_total`, `kimmy_yield_suppressed`,
+  `kimmy_yield_observations_total`, `kimmy_yield_evaluator_ticks_total`,
+  `kimmy_yield_faults_total`, `kimmy_runtime_responsive`,
+  `kimmy_ownership_yield_enabled` and `kimmy_yield_probation`, and the progress
+  rows `ttl_expiry` and `yield_evaluator`. `/v1/topology` gives each node
+  `yielding` and `classState` as the answering member sees them, and the answer
+  `view`. A new advisory file, `kimmy.last-start`, sits beside `kimmy.last-exit`;
+  0.43.0 ignores it, as it ignores the new optional fields on the replication
+  frames, so a rollback needs no step. See Operations, "A member that yields a
+  class of work", the oplog and sync reference, and ADR-213.
+
+- **`KIMMY_OWNERSHIP_YIELD=off` keeps a member from yielding.** Environment
+  only, with no configuration key. Off, the member still judges, advertises its
+  states, honours its peers' yields and can be a target, and shows
+  `suppressed{reason="switched_off"}` while stalled. Unset and `on` leave it
+  on; any other value refuses the start, naming the variable.
+
 ### Changed
 
 - **Breaking: an array written inside an expression is evaluated, so a field
@@ -386,6 +423,21 @@ breaking changes and says so here; a `0.x.PATCH` bump never does.
   convert to double or long instead`, still in the `unsupported operator`
   template and still a `400`. Not breaking: only the text changes. See
   aggregation.md, "Type conversion", and ADR-217.
+
+- **A member no longer counts as a candidate for webhooks and embeddings until
+  it has heard from it, and a yield is confirmed by the peer that read it.**
+  Until a member has received a block from a live peer in its current process
+  (every start, a rejoin after its own `Defunct`, and a peer whose blocks never
+  decode), it also owns that peer's webhook subscriptions and embedding
+  collections, so each is delivered or embedded twice for at most one
+  contact; webhook receivers already deduplicate per event, and the provider
+  sees the repeated calls. Confirmation moved from the serving side writing a
+  frame to the reader echoing the block it holds, and a block no longer replaces
+  an older one from the same process. This fixes a member dropping out of its own
+  candidate set the moment it set the yield bit, and a yield undone by an
+  unrelated block change. A `WARN` names a live peer that has sent no block for
+  more than a lease. Nothing is refused that was accepted. See ADR-201's
+  amendment and ADR-213.
 
 ### Documented
 

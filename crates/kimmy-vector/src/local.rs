@@ -84,8 +84,15 @@ impl EmbeddingProvider for LocalProvider {
 
         // Inference is CPU-bound and would otherwise stall the async runtime's
         // worker thread for the whole batch.
-        let vectors = tokio::task::block_in_place(|| model.embed(owned, None)).map_err(|e| {
-            VectorError::ModelUnavailable { model: self.model_name.clone(), detail: e.to_string() }
+        //
+        // Held as `Remote` for the batch: the heartbeat has no point to beat at inside
+        // it, and a batch of many texts can outlast the 30 s local bound.
+        let vectors = crate::provider::held_as_remote(|| {
+            tokio::task::block_in_place(|| model.embed(owned, None))
+        })
+        .map_err(|e| VectorError::ModelUnavailable {
+            model: self.model_name.clone(),
+            detail: e.to_string(),
         })?;
 
         for row in &vectors {

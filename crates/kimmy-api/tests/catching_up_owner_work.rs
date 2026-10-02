@@ -217,6 +217,7 @@ async fn the_expiry_loop_reads_the_marker_from_the_state() {
         engine.node_id(),
         None,
         Duration::from_millis(50),
+        kimmy_task::Shutdown::new(),
     ));
 
     tokio::time::sleep(Duration::from_millis(600)).await;

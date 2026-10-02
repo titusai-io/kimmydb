@@ -12,6 +12,7 @@ description = "Embedding providers and vector indexing for KimmyDB"
 kimmy-core.workspace = true
 kimmy-storage.workspace = true
 kimmy-egress.workspace = true
+kimmy-task.workspace = true
 bson.workspace = true
 reqwest.workspace = true
 parking_lot.workspace = true
@@ -52,6 +53,9 @@ criterion.workspace = true
 kimmy-storage = { workspace = true, features = ["test-hooks"] }
 tempfile.workspace = true
 tokio = { workspace = true, features = ["full", "test-util"] }
+# The constants the yield evaluator's bounds are tied to (ADR-213): a test asserts
+# each one equals its twin there. Dev only: nothing in a build depends on it.
+kimmy-cluster.workspace = true
 
 [[bench]]
 name = "vector_index"

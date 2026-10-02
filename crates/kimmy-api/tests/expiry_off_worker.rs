@@ -75,6 +75,7 @@ fn a_timer_fires_on_time_while_the_ttl_pass_walks() {
             me,
             None,
             Duration::from_millis(50),
+            kimmy_task::Shutdown::new(),
         ));
 
         // A task that wants nothing but its timer: how late the timer fires

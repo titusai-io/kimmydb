@@ -7,7 +7,9 @@ mod front;
 mod lifecycle;
 mod logging;
 mod node;
+mod probation;
 mod supervision;
+mod yielding;
 
 use anyhow::{Context, Result};
 use clap::Parser;

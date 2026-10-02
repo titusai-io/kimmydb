@@ -880,6 +880,8 @@ impl WriteTxn<'_> {
                 });
             }
             engine.commits.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            // A commit by a class task is a local success and a beat (ADR-213).
+            crate::class_step::commit_ok();
             // The ticket is taken **before** the writer is let go: a flush
             // reads the tickets issued once it holds the writer, so a commit
             // that has landed is either counted by the flush that follows it
@@ -3371,9 +3373,14 @@ impl Engine {
         // Waiting for the writer is the other blocking step. The queue is
         // this engine's gate (ADR-151), which a caller can wait at for a
         // bounded time; redb's own lock behind it is then uncontended.
-        let gate = blocking(|| match budget {
-            Some(budget) => self.writer_gate.try_lock_for(budget),
-            None => Some(self.writer_gate.lock()),
+        // The class's phase is `WriterGate` for the wait, and its age is
+        // re-stamped after (ADR-213): a legitimate long hold elsewhere is not a
+        // stall of the class waiting behind it.
+        let gate = crate::class_step::around_gate(|| {
+            blocking(|| match budget {
+                Some(budget) => self.writer_gate.try_lock_for(budget),
+                None => Some(self.writer_gate.lock()),
+            })
         });
         let waited = waited_from.elapsed();
         self.record_writer_wait(waited);

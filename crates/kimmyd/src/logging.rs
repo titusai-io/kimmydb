@@ -545,7 +545,9 @@ impl TelemetryGuard {
         task_progress_age!("kimmy.task.progress_age.embedding_worker", 1, "embedding_worker");
         task_progress_age!("kimmy.task.progress_age.replication", 2, "replication");
         task_progress_age!("kimmy.task.progress_age.stall_probe", 3, "stall_probe");
-        task_progress_age!("kimmy.task.progress_age.webhook_dispatcher", 4, "webhook_dispatcher");
+        task_progress_age!("kimmy.task.progress_age.ttl_expiry", 4, "ttl_expiry");
+        task_progress_age!("kimmy.task.progress_age.webhook_dispatcher", 5, "webhook_dispatcher");
+        task_progress_age!("kimmy.task.progress_age.yield_evaluator", 6, "yield_evaluator");
 
         observe!(
             u64_observable_counter,
@@ -995,7 +997,7 @@ impl TelemetryGuard {
             u64_observable_gauge,
             "kimmy.ownership.peers.unknown",
             "{peer}",
-            "Live peers that have sent no block yet: an older version, or one not yet heard.",
+            "Live peers this member holds no block from: an older version, or one not yet heard. Not candidates for webhooks or embeddings.",
             |s| s.ownership.peers[kimmy_cluster::PeerState::Unknown.slot()]
         );
         observe!(
@@ -1009,22 +1011,175 @@ impl TelemetryGuard {
             u64_observable_gauge,
             "kimmy.yield.unconfirmed_peers.ttl",
             "{peer}",
-            "Live peers that have not read this member's block while it yields ttl.",
+            "Live peers that have not confirmed this member's yield of ttl by echoing its block.",
             |s| s.ownership.unconfirmed[0]
         );
         observe!(
             u64_observable_gauge,
             "kimmy.yield.unconfirmed_peers.webhooks",
             "{peer}",
-            "Live peers that have not read this member's block while it yields webhooks.",
+            "Live peers that have not confirmed this member's yield of webhooks by echoing its block.",
             |s| s.ownership.unconfirmed[1]
         );
         observe!(
             u64_observable_gauge,
             "kimmy.yield.unconfirmed_peers.embeddings",
             "{peer}",
-            "Live peers that have not read this member's block while it yields embeddings.",
+            "Live peers that have not confirmed this member's yield of embeddings by echoing its block.",
             |s| s.ownership.unconfirmed[2]
+        );
+        // The yield evaluator's series (ADR-213), one instrument per label
+        // combination as every labelled series on this bridge is carried. The
+        // names are built from the class and the label, and the guard that reads
+        // this file by stem sees each family under its own prefix.
+        for (ci, class) in ["ttl", "webhooks", "embeddings"].into_iter().enumerate() {
+            for (si, state) in kimmy_api::metrics::YIELD_STATES.into_iter().enumerate().take(3) {
+                let snapshot = snapshot.clone();
+                let _ = meter
+                    .u64_observable_gauge(format!("kimmy.owner.class_state.{class}.{state}"))
+                    .with_unit("1")
+                    .with_description(format!(
+                        "1 while the {class} class is {state} on this member, else 0."
+                    ))
+                    .with_callback(move |observer| {
+                        if let Some(s) = snapshot() {
+                            observer.observe(u64::from(s.ownership.evaluator.state[ci] == si), &[]);
+                        }
+                    })
+                    .build();
+            }
+            for (ki, cause) in kimmy_api::metrics::YIELD_CAUSES.into_iter().enumerate() {
+                let snapshot = snapshot.clone();
+                let _ = meter
+                    .u64_observable_gauge(format!("kimmy.owner.class_state.{class}.stalled.{cause}"))
+                    .with_unit("1")
+                    .with_description(format!(
+                        "1 while the {class} class is stalled on this member for the cause {cause}, else 0."
+                    ))
+                    .with_callback(move |observer| {
+                        if let Some(s) = snapshot() {
+                            let y = &s.ownership.evaluator;
+                            observer.observe(u64::from(y.state[ci] == 3 && y.cause[ci] == ki + 1), &[]);
+                        }
+                    })
+                    .build();
+            }
+            let gauge =
+                |name: String,
+                 unit: &'static str,
+                 description: String,
+                 read: fn(&kimmy_api::metrics::YieldReading, usize) -> u64| {
+                    let snapshot = snapshot.clone();
+                    let _ = meter
+                        .u64_observable_gauge(name)
+                        .with_unit(unit)
+                        .with_description(description)
+                        .with_callback(move |observer| {
+                            if let Some(s) = snapshot() {
+                                observer.observe(read(&s.ownership.evaluator, ci), &[]);
+                            }
+                        })
+                        .build();
+                };
+            gauge(
+                format!("kimmy.owner.class_owned.{class}"),
+                "{item}",
+                format!("Items of the {class} class this member owned at its last owner check."),
+                |y, i| y.owned[i],
+            );
+            gauge(
+                format!("kimmy.yielding.{class}"),
+                "1",
+                format!("1 while this member advertises that it yields {class}."),
+                |y, i| u64::from(y.yielding[i]),
+            );
+            for (ri, reason) in
+                ["switched_off", "shared_fault", "no_target", "cap"].into_iter().enumerate()
+            {
+                let snapshot = snapshot.clone();
+                let _ = meter
+                    .u64_observable_gauge(format!("kimmy.yield.suppressed.{class}.{reason}"))
+                    .with_unit("1")
+                    .with_description(format!(
+                        "1 while a stalled {class} class is not yielding because of {reason}."
+                    ))
+                    .with_callback(move |observer| {
+                        if let Some(s) = snapshot() {
+                            observer
+                                .observe(u64::from(s.ownership.evaluator.suppressed[ci][ri]), &[]);
+                        }
+                    })
+                    .build();
+            }
+            let counter = |name: String,
+                           description: String,
+                           read: Box<
+                dyn Fn(&kimmy_api::metrics::YieldReading) -> u64 + Send + Sync,
+            >| {
+                let snapshot = snapshot.clone();
+                let _ = meter
+                    .u64_observable_counter(name)
+                    .with_unit("{event}")
+                    .with_description(description)
+                    .with_callback(move |observer| {
+                        if let Some(s) = snapshot() {
+                            observer.observe(read(&s.ownership.evaluator), &[]);
+                        }
+                    })
+                    .build();
+            };
+            for (di, direction) in ["yield", "reclaim", "withdraw"].into_iter().enumerate() {
+                counter(
+                    format!("kimmy.yield.transitions.{class}.{direction}"),
+                    format!(
+                        "Times this member made the {direction} transition of the {class} class."
+                    ),
+                    Box::new(move |y| y.transitions[ci][di]),
+                );
+            }
+            for (vi, verdict) in ["good", "bad", "idle", "neutral", "void"].into_iter().enumerate()
+            {
+                counter(
+                    format!("kimmy.yield.observations.{class}.{verdict}"),
+                    format!("Evaluator ticks that counted the {class} class as {verdict}."),
+                    Box::new(move |y| y.observations[ci][vi]),
+                );
+            }
+            for (ki, kind) in kimmy_api::metrics::YIELD_FAULT_KINDS.into_iter().enumerate() {
+                counter(
+                    format!("kimmy.yield.faults.{class}.{kind}"),
+                    format!("{kind} faults counted against the {class} class by its heartbeat."),
+                    Box::new(move |y| y.faults[ci][ki]),
+                );
+            }
+        }
+        observe!(
+            u64_observable_counter,
+            "kimmy.yield.evaluator.ticks",
+            "{tick}",
+            "Ticks the yield evaluator has made.",
+            |s| s.ownership.evaluator.ticks
+        );
+        observe!(
+            u64_observable_gauge,
+            "kimmy.runtime.responsive",
+            "1",
+            "1 while this member's runtime has not stalled for the last six judged evaluator ticks.",
+            |s| u64::from(s.ownership.evaluator.responsive)
+        );
+        observe!(
+            u64_observable_gauge,
+            "kimmy.ownership.yield.enabled",
+            "1",
+            "1 unless KIMMY_OWNERSHIP_YIELD=off keeps this member from setting its own yield bits.",
+            |s| u64::from(s.ownership.evaluator.enabled)
+        );
+        observe!(
+            u64_observable_gauge,
+            "kimmy.yield.probation",
+            "1",
+            "1 when this start began in probation.",
+            |s| u64::from(s.ownership.evaluator.probation)
         );
         observe!(
             u64_observable_gauge,
