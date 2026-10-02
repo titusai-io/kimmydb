@@ -144,7 +144,23 @@ Redirects are refused for the same reason.
 The delivery check runs **inside the HTTP client's own resolver**, so the
 addresses it approves are, by construction, the addresses the connection uses.
 Checking on one resolution and dialling on another would leave a zero-TTL name
-a window between the two.
+a window between the two. The check before the send stays as well: behind
+`HTTP_PROXY` or `HTTPS_PROXY` the client resolves only the proxy's name, and
+that check is then the only one of the target's addresses.
+
+**A host that does not resolve is a failed delivery, not a stalled node.** The
+lookup runs off the node's async workers and inside the ten-second delivery
+timeout, so a resolver that has stopped answering fails that delivery at the
+timeout and the subscription backs off, exactly as for an endpoint that has
+stopped answering. Lookups are shared and bounded: deliveries to one host wait
+on one lookup, a failed lookup is reused for 5 s, and at most 16 run at once
+across the node ([Operations](operations.md#discovery-formats)). A delivery
+refused because all 16 were busy is tried again at the next pass and does not
+count against the subscription's backoff: what fills them need not be its own.
+Registration resolves the host the same way, under the request's deadline,
+from 4 slots of its own, so registrations cannot take the deliveries'; a
+registration refused because those are busy is answered `503 resolver_busy`
+with `Retry-After`, and a host that does not resolve is a `400`.
 
 ---
 

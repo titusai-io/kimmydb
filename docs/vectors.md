@@ -156,9 +156,24 @@ Keys for a provider are simplest under the `KIMMY_PROVIDER_` prefix — `KIMMY_P
 The policy is asked twice: when the configuration is accepted, and again when
 the provider is built — by the worker for documents and by a search that
 embeds a `query` — because a configuration also arrives by replication from
-another member. A stored configuration this node refuses is a permanent
-failure for that collection until it is reconfigured, logged once with the
-variable's name or the host; a search that needs it answers `500 misconfigured`.
+another member. Building a provider resolves nothing: the endpoint's host is
+resolved, and every address checked, before each call to it, off the node's
+async workers and within the 10 s connect timeout. A host that does not resolve
+is a `connect` failure of that call, retried, with the provider kept; one that
+resolves to a refused address is refused as below. A stored configuration this
+node refuses is a permanent failure for that collection until it is
+reconfigured, logged once with the variable's name or the host; a search that
+needs it answers `500 misconfigured`.
+
+**One answer inward is enough to stop embedding on that member.** The
+addresses are checked before each call, and a refusal is remembered for the
+configuration, so an endpoint whose name resolves to a private address even
+once (a split-horizon resolver, a record changed for a moment) stops the
+collection's embedding on that member until the collection is reconfigured or
+the node restarts, even if the name resolves publicly again. That fails
+closed, on purpose. The `ERROR` line names the host; if the address is meant,
+list the host in `vector.provider.allowed_hosts`, otherwise fix the record, and
+then reconfigure the collection or restart the member.
 Every configure and disable writes an audit record with the provider kind, the
 endpoint host or profile name, and the key variable's name.
 

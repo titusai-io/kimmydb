@@ -45,7 +45,7 @@
 use std::collections::BTreeMap;
 
 use kimmy_core::ProviderConfig;
-use kimmy_egress::{EgressError, EgressPolicy, Purpose, Refusal};
+use kimmy_egress::{EgressError, EgressPolicy, Purpose};
 
 /// How a refused provider destination reads.
 pub const PROVIDER_EGRESS: Purpose =
@@ -188,11 +188,11 @@ impl std::fmt::Display for PolicyError {
 impl std::error::Error for PolicyError {}
 
 impl PolicyError {
-    /// Whether the refusal is a host that could not be resolved — the one
+    /// Whether the refusal is a host that could not be resolved now — the one
     /// outcome that is a condition of the moment rather than of the
     /// configuration, and so worth retrying.
     pub fn is_unresolvable(&self) -> bool {
-        matches!(self, PolicyError::Endpoint(EgressError { refusal: Refusal::Unresolvable(_), .. }))
+        matches!(self, PolicyError::Endpoint(e) if e.is_transient())
     }
 }
 
@@ -272,11 +272,24 @@ impl ProviderPolicy {
     /// and every address checked, as a collection's own endpoint is at
     /// configure time. Run at startup and by `check-config`, so the two give
     /// the same answer.
+    ///
+    /// Blocking, on the system resolver: for startup and `check-config`, where
+    /// nothing else is waiting on the thread.
     pub fn validate_profiles(&self) -> Result<(), String> {
         for (name, config) in &self.profiles {
-            self.check_provider(config).map_err(|e| format!("vector.providers.{name}: {e}"))?;
+            let checked = self.check_provider(config).and_then(|()| match config.endpoint() {
+                Some(url) => self.check_endpoint(url),
+                None => Ok(()),
+            });
+            checked.map_err(|e| format!("vector.providers.{name}: {e}"))?;
         }
         Ok(())
+    }
+
+    /// The same policy, resolving endpoint hosts with `lookup` instead of the
+    /// system resolver: for a test. See [`kimmy_egress::Lookup`].
+    pub fn with_egress_lookup(self, lookup: kimmy_egress::Lookup) -> Self {
+        Self { egress: self.egress.with_lookup(lookup), ..self }
     }
 
     /// Where a provider may be sent.
@@ -311,18 +324,31 @@ impl ProviderPolicy {
 
     /// Whether a provider may be sent to this URL: shape, then every address
     /// the host resolves to.
+    ///
+    /// **Blocks** on the system resolver: never on a runtime worker. Async
+    /// code uses [`Self::check_endpoint_async`].
     pub fn check_endpoint(&self, url: &str) -> Result<(), PolicyError> {
         self.egress.check(url).map_err(PolicyError::Endpoint)
     }
 
+    /// [`Self::check_endpoint`], with the lookup on the runtime's blocking
+    /// pool, counted against the bound for checks made on a client's request
+    /// ([`kimmy_egress::MAX_REQUEST_LOOKUPS_IN_FLIGHT`]).
+    pub async fn check_endpoint_async(&self, url: &str) -> Result<(), PolicyError> {
+        self.egress.check_for_request(url).await.map_err(PolicyError::Endpoint)
+    }
+
     /// The key and endpoint checks on a concrete provider — everything but a
-    /// profile, which is resolved first by [`Self::resolve`].
+    /// profile, which is resolved first by [`Self::resolve`] — that need no
+    /// resolver: the key variable, and the endpoint's shape, allowlist and
+    /// literal address. What a provider build asks; the addresses a named
+    /// host resolves to are checked before each call to it.
     pub fn check_provider(&self, config: &ProviderConfig) -> Result<(), PolicyError> {
         if let Some(var) = config.api_key_env() {
             self.check_key_env(var)?;
         }
         if let Some(url) = config.endpoint() {
-            self.check_endpoint(url)?;
+            self.egress.check_unresolved(url).map_err(PolicyError::Endpoint)?;
         }
         Ok(())
     }
@@ -333,7 +359,10 @@ impl ProviderPolicy {
     /// under the lock, everything else is refused by kind. Otherwise the key
     /// variable and the endpoint — the default one, for a dialect whose
     /// endpoint was left out — are checked as they will be used.
-    pub fn check_configure(&self, config: &ProviderConfig) -> Result<(), PolicyError> {
+    ///
+    /// The endpoint's host is resolved, off the runtime's workers, so a
+    /// resolver that does not answer holds this request and not the others.
+    pub async fn check_configure(&self, config: &ProviderConfig) -> Result<(), PolicyError> {
         match config {
             ProviderConfig::Byo {} | ProviderConfig::Local { .. } => Ok(()),
             ProviderConfig::Profile { name } => self
@@ -341,7 +370,13 @@ impl ProviderPolicy {
                 .map(|_| ())
                 .or(Err(PolicyError::UnknownProfile { name: name.clone() })),
             other if self.locked => Err(PolicyError::Locked { kind: other.name() }),
-            other => self.check_provider(other),
+            other => {
+                self.check_provider(other)?;
+                match other.endpoint() {
+                    Some(url) => self.check_endpoint_async(url).await,
+                    None => Ok(()),
+                }
+            }
         }
     }
 
@@ -486,35 +521,92 @@ mod tests {
         assert!(allowed.check_endpoint("http://10.0.0.5/").is_err(), "only the listed host");
     }
 
-    #[test]
-    fn configure_time_checks_the_default_endpoint_and_the_key_together() {
-        let p = ProviderPolicy::default();
+    /// A lookup that answers a public address for every name but
+    /// `inward.example`, which resolves to a private one.
+    fn lookup_by_name() -> kimmy_egress::Lookup {
+        std::sync::Arc::new(|host: &str| {
+            let addr = if host == "inward.example" { "10.0.0.5" } else { "93.184.216.34" };
+            Ok(vec![addr.parse().unwrap()])
+        })
+    }
+
+    #[tokio::test]
+    async fn configure_time_checks_the_default_endpoint_and_the_key_together() {
+        let p = ProviderPolicy::default().with_egress_lookup(lookup_by_name());
         // The hosted defaults are public and pass with no configuration.
-        p.check_configure(&openai(None, "OPENAI_API_KEY")).unwrap();
+        p.check_configure(&openai(None, "OPENAI_API_KEY")).await.unwrap();
+        // A name is resolved at configure time, and every address checked.
+        let err = p
+            .check_configure(&openai(Some("https://inward.example"), "OPENAI_API_KEY"))
+            .await
+            .unwrap_err();
+        assert!(matches!(err, PolicyError::Endpoint(_)), "{err:?}");
+        assert!(err.to_string().contains("10.0.0.5"), "{err}");
         // The finding, end to end: a public attacker endpoint with the
         // node's secret named as the key.
         let err = p
             .check_configure(&openai(Some("https://attacker.example"), "KIMMY_JWT_SECRET"))
+            .await
             .unwrap_err();
         assert!(matches!(err, PolicyError::DeniedKeyEnv { .. }), "{err:?}");
         // And a listed key sent to a private address.
-        let err =
-            p.check_configure(&openai(Some("http://10.0.0.5"), "OPENAI_API_KEY")).unwrap_err();
+        let err = p
+            .check_configure(&openai(Some("http://10.0.0.5"), "OPENAI_API_KEY"))
+            .await
+            .unwrap_err();
         assert!(matches!(err, PolicyError::Endpoint(_)), "{err:?}");
         // byo and local reach nothing.
-        p.check_configure(&ProviderConfig::Byo {}).unwrap();
-        p.check_configure(&ProviderConfig::Local { model: "m".into() }).unwrap();
+        p.check_configure(&ProviderConfig::Byo {}).await.unwrap();
+        p.check_configure(&ProviderConfig::Local { model: "m".into() }).await.unwrap();
         // An unauthenticated custom endpoint has no variable to check, only
         // an address — a literal public one here, so no resolver is needed.
         p.check_configure(&ProviderConfig::CustomHttp {
             endpoint: "https://93.184.216.34/v1".into(),
             api_key_env: None,
         })
+        .await
         .unwrap();
     }
 
-    #[test]
-    fn the_lock_refuses_free_form_endpoints_and_accepts_a_profile() {
+    /// **Configure time resolves the endpoint's host off the worker.** It used
+    /// to resolve with a blocking lookup on the request's worker. On a runtime
+    /// of one thread, a probe task counts the turns it gets while an injected
+    /// lookup is held: none, if the lookup holds the thread.
+    #[tokio::test]
+    async fn configure_time_waits_for_the_lookup_without_holding_the_worker() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicUsize, Ordering::SeqCst};
+        let hung = crate::worker::tests::HungLookup::new();
+        let p = ProviderPolicy::default().with_egress_lookup(hung.lookup());
+        let turns_while_held = Arc::new(AtomicUsize::new(0));
+        let probe = tokio::spawn({
+            let (hung, turns) = (Arc::clone(&hung), Arc::clone(&turns_while_held));
+            async move {
+                loop {
+                    if hung.held() {
+                        turns.fetch_add(1, SeqCst);
+                    }
+                    tokio::task::yield_now().await;
+                }
+            }
+        });
+        let config = openai(Some("https://hangs.example"), "OPENAI_API_KEY");
+        let (checked, ()) = tokio::join!(p.check_configure(&config), async {
+            hung.until_entered().await;
+            for _ in 0..100 {
+                tokio::task::yield_now().await;
+            }
+            assert!(turns_while_held.load(SeqCst) > 0, "the runtime ran nothing meanwhile");
+            assert!(hung.held(), "the lookup returned before the runtime ran anything else");
+            probe.abort();
+            hung.release();
+        });
+        let err = checked.unwrap_err();
+        assert!(err.is_unresolvable(), "{err:?}");
+    }
+
+    #[tokio::test]
+    async fn the_lock_refuses_free_form_endpoints_and_accepts_a_profile() {
         let mut profiles = BTreeMap::new();
         profiles.insert(
             "corp".to_string(),
@@ -525,7 +617,7 @@ mod tests {
         assert!(locked.locked());
 
         // A configuration that would pass unlocked is refused by kind.
-        let err = locked.check_configure(&openai(None, "OPENAI_API_KEY")).unwrap_err();
+        let err = locked.check_configure(&openai(None, "OPENAI_API_KEY")).await.unwrap_err();
         assert!(matches!(err, PolicyError::Locked { kind: "openai" }), "{err:?}");
         assert!(err.to_string().contains("endpoints_locked"), "{err}");
         let err = locked
@@ -533,18 +625,21 @@ mod tests {
                 model: "m".into(),
                 endpoint: "https://x".into(),
             })
+            .await
             .unwrap_err();
         assert!(matches!(err, PolicyError::Locked { kind: "ollama" }), "{err:?}");
 
         // The three kinds that reach nothing the operator did not define.
-        locked.check_configure(&ProviderConfig::Profile { name: "corp".into() }).unwrap();
-        locked.check_configure(&ProviderConfig::Byo {}).unwrap();
-        locked.check_configure(&ProviderConfig::Local { model: "m".into() }).unwrap();
+        locked.check_configure(&ProviderConfig::Profile { name: "corp".into() }).await.unwrap();
+        locked.check_configure(&ProviderConfig::Byo {}).await.unwrap();
+        locked.check_configure(&ProviderConfig::Local { model: "m".into() }).await.unwrap();
 
         // A profile that does not exist is refused where there is someone to
         // tell, and the message names the setting that would define it.
-        let err =
-            locked.check_configure(&ProviderConfig::Profile { name: "nope".into() }).unwrap_err();
+        let err = locked
+            .check_configure(&ProviderConfig::Profile { name: "nope".into() })
+            .await
+            .unwrap_err();
         assert!(matches!(err, PolicyError::UnknownProfile { .. }), "{err:?}");
         assert!(err.to_string().contains("vector.providers.nope"), "{err}");
     }

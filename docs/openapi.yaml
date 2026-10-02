@@ -2366,11 +2366,14 @@ paths:
             with `drop_vectors=true`, and what the old shadow collection held
             is still being removed on this node, so a new one cannot stand
             over it yet. Nothing was written, and that removal was moved to
-            the front. `timeout` is the other `503` this can answer.
+            the front. `resolver_busy`: the endpoint's host was not looked
+            up, because the lookups this node allows at once were all waiting
+            on the resolver; nothing was written. `timeout` is the other `503`
+            this can answer.
           headers:
             Retry-After:
               schema: { type: integer }
-              description: Seconds to wait before retrying. Present on `collection_purging`.
+              description: Seconds to wait before retrying. Present on `collection_purging` and `resolver_busy`.
           content:
             application/json:
               schema: { $ref: "#/components/schemas/Error" }
@@ -2556,6 +2559,7 @@ paths:
           content:
             application/json:
               schema: { $ref: "#/components/schemas/Error" }
+        "503": { $ref: "#/components/responses/ResolverBusy" }
 
   /v1/db/{db}/coll/{coll}/hybrid_search:
     parameters:
@@ -2613,6 +2617,7 @@ paths:
           content:
             application/json:
               schema: { $ref: "#/components/schemas/Error" }
+        "503": { $ref: "#/components/responses/ResolverBusy" }
 
   /v1/db/{db}/coll/{coll}/webhooks:
     parameters:
@@ -2702,6 +2707,7 @@ paths:
         "401": { $ref: "#/components/responses/Unauthorized" }
         "403": { $ref: "#/components/responses/Forbidden" }
         "404": { $ref: "#/components/responses/NotFound" }
+        "503": { $ref: "#/components/responses/ResolverBusy" }
 
   /v1/db/{db}/coll/{coll}/webhooks/{id}:
     parameters:
@@ -2947,6 +2953,20 @@ components:
       content:
         application/json:
           schema: { $ref: "#/components/schemas/Error" }
+    ResolverBusy:
+      description: |
+        `resolver_busy`: a host this request had to resolve (a webhook's, or
+        an embedding provider's) was not looked up, because the lookups this
+        node allows at once were all waiting on a resolver that has not
+        answered. Nothing was done. `timeout` is the other `503` this can
+        answer.
+      headers:
+        Retry-After:
+          schema: { type: integer }
+          description: Seconds to wait before retrying; how long a failed lookup's answer is kept.
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/Error" }
     NoVectors:
       description: |
         The collection has a vector configuration but no stored vectors, so a
@@ -3099,6 +3119,7 @@ components:
         | `partially_applied` | 500 | verify | A request that commits in more than one transaction failed after its first commit. What landed stands and replicates; `applied` says how much and `cause` why the rest did not. Never resend it blindly |
         | `node_stopping` | 503 | elsewhere | This node is shutting down and did not complete the request: nothing was written. Send it to another member |
         | `starting` | 503 | elsewhere | This node has bound its port and is still starting, and answers only `/healthz` and `/readyz` until it is up: nothing was read or written. Send it to another member |
+        | `resolver_busy` | 503 | wait | A host the request had to resolve — a webhook's on registration, an embedding provider's on configuration or for a search's `query` — was not looked up, because the lookups this node allows at once were all waiting on a resolver that has not answered. Nothing was done. Carries `Retry-After`. A host that does not resolve is a `400` on registration and configuration, and a `502 provider_error` on a search |
         | `catching_up` | 503 | elsewhere | This member knows it is behind (it created its store in a cluster it has seeds for, was restored from a backup, or fell behind its peers' retention horizon, and its catching-up marker is set) and answers only `/healthz`, `/readyz`, `/metrics` and `/v1/topology` until it has caught up: nothing was read or written. Send it to another member |
       enum:
         - bad_request
@@ -3126,6 +3147,7 @@ components:
         - node_stopping
         - starting
         - catching_up
+        - resolver_busy
 
     Capability:
       type: string

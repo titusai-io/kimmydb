@@ -10,7 +10,7 @@ description = "Where the KimmyDB node may issue an outbound HTTP request: the ad
 
 [dependencies]
 reqwest.workspace = true
-tokio = { workspace = true, features = ["net"] }
+tokio = { workspace = true, features = ["net", "rt"] }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["full", "test-util"] }

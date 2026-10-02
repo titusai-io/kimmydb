@@ -339,6 +339,63 @@ breaking changes and says so here; a `0.x.PATCH` bump never does.
   and never past the 22 s stop budget, then exits 0, as before; between lookups,
   or with a `dns-srv:` seed, it does not wait.
 
+- **A webhook or embedding host that does not resolve no longer holds a runtime
+  worker.** The egress check before each webhook delivery, and the one when an
+  embedding provider was built, resolved the host with a blocking `getaddrinfo`
+  on the task's worker and outside any timeout. A resolver that stopped answering
+  held the worker for its own timeout (thirty seconds and more with search
+  domains), once per delivery in turn, since a pass's deliveries share one task;
+  an embedding provider whose host did not resolve was never kept, so every retry,
+  5 s apart, built it and waited on DNS again. Registering a webhook, configuring
+  an embedding provider and a search that embeds its query did the same on the
+  request's worker. The lookup now runs on the blocking pool:
+
+  - **a webhook's check and send share the 10 s delivery timeout.** A lookup that
+    runs it out fails that delivery, logged as `the host did not resolve within
+    the 10 s delivery timeout` and retried under the subscription's backoff, as
+    an endpoint that does not answer is. A host that resolves to a refused
+    address is refused as before.
+  - **building an embedding provider resolves nothing.** It checks the key
+    variable and the endpoint's shape, allowlist and literal address; the
+    addresses a named host resolves to are checked before each call, under the
+    10 s connect timeout. The provider is built once and kept while its host does
+    not resolve, and each failed lookup is a retried `connect` failure, now
+    counted by `kimmy_embed_failures_total` and
+    `kimmy_embed_provider_errors_total{kind="connect"}` as the connect failures
+    they are. A host that resolves to a refused address is the permanent refusal
+    a build made, logged once and not counted as a failed call.
+  - **registering a webhook and configuring a provider** wait on the lookup
+    under the request's own deadline, and hold no worker while they do.
+  - **the lookups are bounded.** A deadline abandons the wait for a lookup, not
+    the lookup, which keeps its blocking thread until the resolver answers. So
+    checks of one host share one lookup (its addresses, never a verdict), a
+    failed lookup's answer is reused for 5 s, and at most 16 lookups run at
+    once, process-wide, for deliveries and provider calls, with **4 more of
+    their own for registration and configure time**, so a client registering
+    names that never answer cannot take the node's. Past its bound a check
+    fails at once (`cannot resolve "…" now: 16 lookups are already waiting on
+    the resolver`). A delivery refused that way is retried at the next pass and
+    **not counted against its subscription's backoff**; an embedding call, as a
+    `connect` failure.
+  - **a new error code, `resolver_busy`: `503`, retry `wait`, with
+    `Retry-After: 5`, logged at `WARN`.** Registration, configure time and a
+    search's query answer it when the host was not looked up because the
+    lookups were busy. A host that does not resolve stays a `400` on
+    registration and configuration, and a `502 provider_error` on a search.
+    Client libraries keep their own code lists and read an unknown code's
+    `retry` class meanwhile.
+  - **a host that resolves inward even once stops a collection's embedding on
+    that member** until it is reconfigured or the node restarts, as a refusal
+    at build time did: the check is now before each call. List the host in
+    `vector.provider.allowed_hosts` if it is meant, or fix the record.
+
+  The check before the send stays: behind `HTTP_PROXY` or `HTTPS_PROXY` the
+  client resolves only the proxy's name, and this check is the only one of the
+  target's addresses. A stop no longer waits for the dispatcher or the embedding
+  worker to come out of a lookup, but still waits for a lookup in flight when it
+  begins, on the blocking pool, as for a `dns:` seed: never past the 22 s stop
+  budget.
+
 - **A stored member that returns behind every peer's horizon is marked within a
   fraction of a second, not after a whole sync interval.** It starts unmarked,
   by design, and is marked `snapshot` when its own first pull gets

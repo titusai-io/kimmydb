@@ -98,6 +98,11 @@ pub enum ErrorCode {
     /// horizon, and is catching up (ADR-202). Nothing was read or
     /// written, and another member serves.
     CatchingUp,
+    /// A host this request had to resolve was not looked up: the node's
+    /// lookups were all waiting on a resolver that has stopped answering
+    /// (`kimmy_egress::MAX_LOOKUPS_IN_FLIGHT` and
+    /// `MAX_REQUEST_LOOKUPS_IN_FLIGHT`). Nothing was done.
+    ResolverBusy,
 }
 
 /// What a client may do about a failure.
@@ -186,7 +191,7 @@ impl fmt::Display for LogLevel {
 
 impl ErrorCode {
     /// Every variant, for the tests that hold the specification to this set.
-    pub const ALL: [ErrorCode; 25] = [
+    pub const ALL: [ErrorCode; 26] = [
         Self::BadRequest,
         Self::PayloadTooLarge,
         Self::UnsupportedMediaType,
@@ -212,6 +217,7 @@ impl ErrorCode {
         Self::NodeStopping,
         Self::Starting,
         Self::CatchingUp,
+        Self::ResolverBusy,
     ];
 
     /// The string on the wire. Stable: clients branch on it.
@@ -242,6 +248,7 @@ impl ErrorCode {
             Self::NodeStopping => "node_stopping",
             Self::Starting => "starting",
             Self::CatchingUp => "catching_up",
+            Self::ResolverBusy => "resolver_busy",
         }
     }
 
@@ -294,6 +301,12 @@ impl ErrorCode {
             // succeeds here; another member may still be removing its own copy
             // of the same drop, so moving does not help.
             Self::CollectionPurging => Retry::Wait,
+            // `wait`, not `elsewhere`: the slots are this node's, but what
+            // fills them is a resolver that does not answer, and the members
+            // of a cluster usually share their resolver. A failed lookup is
+            // remembered for `Retry-After`'s 5 s, so a retry sooner gets the
+            // same answer.
+            Self::ResolverBusy => Retry::Wait,
             // It may already have happened, and replicates if it did: read
             // before resending, which neither waiting nor moving replaces.
             Self::OutcomeUnknown => Retry::Verify,
@@ -424,6 +437,10 @@ impl ErrorCode {
             Self::Starting => Some(LogLevel::Warn),
             // A member doing what it should while it catches up.
             Self::CatchingUp => Some(LogLevel::Warn),
+            // One is a resolver slow for a moment, or a client registering
+            // names that never answer; a rise is a resolver that has stopped
+            // answering, which is the operator's.
+            Self::ResolverBusy => Some(LogLevel::Warn),
 
             // An operator must set something. This node cannot build the
             // provider a replicated vector configuration names — an unset
@@ -572,6 +589,27 @@ impl ApiError {
                      created again once that finishes"
                 ),
             )
+        }
+    }
+
+    /// A host this request had to resolve was not looked up, because the
+    /// node's lookups were all waiting on the resolver. `Retry-After` is how
+    /// long a failed lookup's answer is kept.
+    pub fn resolver_busy(message: impl Into<String>) -> Self {
+        Self {
+            retry_after_secs: Some(crate::egress::FAILED_LOOKUP_KEPT.as_secs()),
+            ..Self::new(StatusCode::SERVICE_UNAVAILABLE, ErrorCode::ResolverBusy, message)
+        }
+    }
+
+    /// A URL the egress policy refused at a client's request: `400`, or `503
+    /// resolver_busy` when the host was not looked up at all because the
+    /// lookups were busy, which is the node's state and not the URL's.
+    pub fn egress(e: crate::egress::EgressError) -> Self {
+        if e.is_lookups_busy() {
+            Self::resolver_busy(e.to_string())
+        } else {
+            Self::bad_request(e.to_string())
         }
     }
 
@@ -1088,7 +1126,7 @@ mod tests {
         // Each level is a claim about what an alert on it would mean, and
         // ADR-136 argues them one at a time; this is that argument's fixture.
         use ErrorCode::*;
-        let expected: [(ErrorCode, Option<LogLevel>); 25] = [
+        let expected: [(ErrorCode, Option<LogLevel>); 26] = [
             // The caller's, every one, and answered in full by the response.
             (BadRequest, None),
             (PayloadTooLarge, None),
@@ -1110,6 +1148,7 @@ mod tests {
             // Somebody else's fault, or nobody's; a rise is the finding.
             (ProviderError, Some(LogLevel::Warn)),
             (Timeout, Some(LogLevel::Warn)),
+            (ResolverBusy, Some(LogLevel::Warn)),
             // This node's own state, and the operator's to fix.
             (Internal, Some(LogLevel::Error)),
             (OutcomeUnknown, Some(LogLevel::Error)),

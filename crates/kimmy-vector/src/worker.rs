@@ -603,8 +603,15 @@ impl WorkerCounters {
     /// Count a failed provider call, and its transport kind when it has one.
     fn failed(&self, error: &VectorError) {
         self.failures.fetch_add(1, Ordering::Relaxed);
-        if let VectorError::Transport { kind, .. } = error {
-            let i = TransportKind::ALL.iter().position(|k| k == kind).unwrap_or(3);
+        let kind = match error {
+            VectorError::Transport { kind, .. } => Some(*kind),
+            // A host not looked up because the lookups were all busy fails
+            // where DNS does, before any connection.
+            VectorError::ResolverBusy { .. } => Some(TransportKind::Connect),
+            _ => None,
+        };
+        if let Some(kind) = kind {
+            let i = TransportKind::ALL.iter().position(|k| *k == kind).unwrap_or(3);
             self.transport[i].fetch_add(1, Ordering::Relaxed);
         }
     }
@@ -1933,7 +1940,22 @@ impl EmbeddingWorker {
         // hold the engine past the stop. What it would have embedded is
         // delivered again after the restart.
         self.engine.check_walk(kimmy_storage::WalkScope::Background)?;
-        provider.embed(inputs).await.inspect_err(|e| self.counters.failed(e))
+        match provider.embed(inputs).await {
+            Ok(vectors) => Ok(vectors),
+            // The endpoint's host resolved to an address the policy refuses,
+            // found by the check before the call (a build checks no addresses).
+            // The same permanent refusal a build makes, remembered and said
+            // once in the same way, and not counted as a failed call: no call
+            // was made.
+            Err(e) if e.is_refused_by_policy() => {
+                self.remember_refusal(collection.id.0, config, &e);
+                Err(e)
+            }
+            Err(e) => {
+                self.counters.failed(&e);
+                Err(e)
+            }
+        }
     }
 
     /// Write each job's vectors, and the position the flush handed down, in
@@ -2353,20 +2375,7 @@ impl EmbeddingWorker {
             match provider::build(&config.provider, config.dim, &self.policy) {
                 Ok(built) => Arc::from(built),
                 Err(e) if e.is_refused_by_policy() => {
-                    // The one line an operator gets, so it carries what they
-                    // need: which collection, and the name or host refused.
-                    // Never a value — the policy refused the *name* before
-                    // anything read it.
-                    let message = e.to_string();
-                    error!(
-                        collection = collection,
-                        provider = config.provider.name(),
-                        error = %message,
-                        "this node's provider policy refuses the collection's embedding \
-                         configuration; its documents will not be embedded here until it is \
-                         reconfigured"
-                    );
-                    self.refused.insert(collection, (config.clone(), message));
+                    self.remember_refusal(collection, config, &e);
                     return Err(e);
                 }
                 Err(e) => return Err(e),
@@ -2374,6 +2383,30 @@ impl EmbeddingWorker {
         self.refused.remove(&collection);
         self.providers.insert(collection, (Some(config.clone()), Arc::clone(&built)));
         Ok(built)
+    }
+
+    /// Remember that the policy refuses a collection's configuration, and say
+    /// so once.
+    ///
+    /// A provider built from that configuration is dropped from the cache, so
+    /// the next call meets the remembered refusal rather than the provider. A
+    /// test-injected provider (`None` configuration) is kept, as it always is.
+    fn remember_refusal(&mut self, collection: u64, config: &VectorConfig, e: &VectorError) {
+        // The one line an operator gets, so it carries what they need: which
+        // collection, and the name or host refused. Never a value — the
+        // policy refused the *name* before anything read it.
+        let message = e.to_string();
+        error!(
+            collection = collection,
+            provider = config.provider.name(),
+            error = %message,
+            "this node's provider policy refuses the collection's embedding configuration; its \
+             documents will not be embedded here until it is reconfigured"
+        );
+        if self.providers.get(&collection).is_some_and(|(built_from, _)| built_from.is_some()) {
+            self.providers.remove(&collection);
+        }
+        self.refused.insert(collection, (config.clone(), message));
     }
 
     /// Replace the provider for a collection. Used by tests to inject a fake.
@@ -2443,7 +2476,7 @@ impl VectorError {
     /// would stall every document behind them.
     pub fn is_retryable(&self) -> bool {
         match self {
-            VectorError::Transport { .. } => true,
+            VectorError::Transport { .. } | VectorError::ResolverBusy { .. } => true,
             // 429, 408 (the provider timed the request out), 425 (too early)
             // and 5xx are worth another attempt; any other 4xx is a bad
             // request.
@@ -2490,7 +2523,7 @@ impl VectorError {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use async_trait::async_trait;
     use bson::doc;
     use kimmy_core::{ChunkConfig, Metric, ProviderConfig};
@@ -4363,6 +4396,252 @@ mod tests {
         worker.set_policy(loopback_policy());
         worker.provider_for(coll.id.0, &fixed).expect("an admitted configuration builds");
         assert!(!worker.refused.contains_key(&coll.id.0));
+    }
+
+    /// A lookup that does not answer until it is released: it holds every
+    /// thread that calls it, as a resolver that does not answer holds
+    /// `getaddrinfo`'s caller. Each caller is released at the latest after
+    /// [`HUNG_FOR`], all at once, so that a test of broken code fails rather
+    /// than hangs.
+    pub(crate) struct HungLookup {
+        entered: std::sync::atomic::AtomicBool,
+        held: std::sync::atomic::AtomicBool,
+        released: std::sync::Mutex<bool>,
+        wake: std::sync::Condvar,
+    }
+
+    const HUNG_FOR: Duration = Duration::from_secs(20);
+
+    impl HungLookup {
+        pub(crate) fn new() -> Arc<Self> {
+            Arc::new(Self {
+                entered: Default::default(),
+                held: Default::default(),
+                released: std::sync::Mutex::new(false),
+                wake: std::sync::Condvar::new(),
+            })
+        }
+
+        pub(crate) fn lookup(self: &Arc<Self>) -> kimmy_egress::Lookup {
+            let hung = Arc::clone(self);
+            Arc::new(move |_host: &str| {
+                use std::sync::atomic::Ordering::SeqCst;
+                hung.held.store(true, SeqCst);
+                hung.entered.store(true, SeqCst);
+                let released = hung.released.lock().unwrap();
+                let _ = hung.wake.wait_timeout_while(released, HUNG_FOR, |r| !*r).unwrap();
+                hung.held.store(false, SeqCst);
+                Err(std::io::Error::other("the hung lookup was released"))
+            })
+        }
+
+        pub(crate) fn entered(&self) -> bool {
+            self.entered.load(std::sync::atomic::Ordering::SeqCst)
+        }
+
+        pub(crate) fn held(&self) -> bool {
+            self.held.load(std::sync::atomic::Ordering::SeqCst)
+        }
+
+        pub(crate) fn release(&self) {
+            *self.released.lock().unwrap() = true;
+            self.wake.notify_all();
+        }
+
+        /// Yield until the lookup has been called. The ceiling, in real time,
+        /// is for a lookup that is never called at all, so that such a test
+        /// fails rather than spins: it times nothing that passes.
+        pub(crate) async fn until_entered(&self) {
+            let started = std::time::Instant::now();
+            while !self.entered() {
+                assert!(started.elapsed() < HUNG_FOR, "the lookup was never called");
+                tokio::task::yield_now().await;
+            }
+        }
+    }
+
+    /// A lookup answering `addr`, or failing when it is `None`, counting calls.
+    fn answering(
+        addr: Option<&str>,
+    ) -> (kimmy_egress::Lookup, Arc<std::sync::atomic::AtomicUsize>) {
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counted = Arc::clone(&calls);
+        let addr: Option<std::net::IpAddr> = addr.map(|a| a.parse().unwrap());
+        let lookup: kimmy_egress::Lookup = Arc::new(move |_host: &str| {
+            counted.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            addr.map(|a| vec![a]).ok_or_else(|| std::io::Error::other("no such host"))
+        });
+        (lookup, calls)
+    }
+
+    /// A collection's configuration naming an endpoint by host name.
+    fn named_endpoint(host: &str) -> VectorConfig {
+        let mut config = config(&["title"]);
+        config.provider = ProviderConfig::CustomHttp {
+            endpoint: format!("http://{host}/embed"),
+            api_key_env: None,
+        };
+        config
+    }
+
+    /// One job of one chunk.
+    fn a_job() -> Job {
+        Job {
+            source: kimmy_core::DocId::Int64(1),
+            hlc: Hlc::ZERO,
+            chunks: vec!["hello".into()],
+            inputs: vec!["hello".into()],
+            tokens: 2,
+            unstamped: Unstamped::ByVersion,
+        }
+    }
+
+    /// **Building a provider asks no resolver, so one whose host does not
+    /// resolve is built once and kept.** The build used to resolve the
+    /// endpoint's host with a blocking lookup on the worker, and a host that
+    /// did not resolve failed the build as a retryable connect failure: never
+    /// cached, so every retry built it again and waited on DNS again. The
+    /// lookup is now made before each call, and its failure is that call's,
+    /// counted as a connect failure, with the provider still cached.
+    #[tokio::test]
+    async fn a_provider_whose_host_does_not_resolve_is_built_once_and_its_calls_fail_to_connect() {
+        let (_engine, coll, mut worker, _dir) = setup().await;
+        let (lookup, calls) = answering(None);
+        worker.set_policy(ProviderPolicy::default().with_egress_lookup(lookup));
+        worker.providers.clear();
+        let config = named_endpoint("nowhere.example");
+
+        let first = worker.provider_for(coll.id.0, &config).expect("a build resolves nothing");
+        let again = worker.provider_for(coll.id.0, &config).unwrap();
+        assert!(Arc::ptr_eq(&first, &again), "the provider is cached");
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 0, "a build asks no resolver");
+
+        let err = worker.call_provider(&coll, &config, &[a_job()]).await.unwrap_err();
+        assert!(
+            matches!(err, VectorError::Transport { kind: TransportKind::Connect, .. }),
+            "{err:?}"
+        );
+        assert!(err.is_retryable(), "{err:?}");
+        assert!(err.to_string().contains("cannot resolve \"nowhere.example\""), "{err}");
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1, "the call asked");
+        assert_eq!(worker.counters.transport_failures(TransportKind::Connect), 1);
+        let after = worker.provider_for(coll.id.0, &config).unwrap();
+        assert!(Arc::ptr_eq(&first, &after), "a failed call does not cost the cached provider");
+    }
+
+    /// **A lookup that does not answer fails the call at the connect timeout,
+    /// and holds no runtime worker meanwhile.** On a runtime of one thread, a
+    /// probe task counts the turns it gets while the lookup is held: none, if
+    /// the lookup holds the thread. Time is paused and moved by hand.
+    #[tokio::test(start_paused = true)]
+    async fn a_lookup_that_never_answers_fails_the_call_at_the_connect_timeout_off_the_worker() {
+        use std::sync::atomic::{AtomicUsize, Ordering::SeqCst};
+        let (_engine, coll, mut worker, _dir) = setup().await;
+        let hung = HungLookup::new();
+        worker.set_policy(ProviderPolicy::default().with_egress_lookup(hung.lookup()));
+        worker.providers.clear();
+        let config = named_endpoint("hangs.example");
+
+        let turns_while_held = Arc::new(AtomicUsize::new(0));
+        let probe = tokio::spawn({
+            let (hung, turns) = (Arc::clone(&hung), Arc::clone(&turns_while_held));
+            async move {
+                loop {
+                    if hung.held() {
+                        turns.fetch_add(1, SeqCst);
+                    }
+                    tokio::task::yield_now().await;
+                }
+            }
+        });
+        let jobs = [a_job()];
+        let (result, finished_at_deadline) =
+            tokio::join!(worker.call_provider(&coll, &config, &jobs), async {
+                hung.until_entered().await;
+                for _ in 0..100 {
+                    tokio::task::yield_now().await;
+                }
+                assert!(turns_while_held.load(SeqCst) > 0, "the runtime ran nothing meanwhile");
+                assert!(hung.held(), "the lookup returned before the runtime ran anything else");
+                probe.abort();
+                tokio::time::advance(crate::provider::CONNECT_TIMEOUT).await;
+                hung.held()
+            });
+        assert!(finished_at_deadline, "premise: the lookup was still unanswered at the deadline");
+        let err = result.unwrap_err();
+        assert!(
+            matches!(err, VectorError::Transport { kind: TransportKind::Connect, .. }),
+            "{err:?}"
+        );
+        assert!(
+            err.to_string().contains("did not resolve within the 10 s connect timeout"),
+            "{err}"
+        );
+        assert!(worker.providers.contains_key(&coll.id.0), "the provider stays cached");
+        hung.release();
+    }
+
+    /// **A call whose host was not looked up, because the node's lookups were
+    /// all busy, is a retried connect failure.** Not the provider's answer and
+    /// not the policy's: the provider stays cached and nothing is remembered as
+    /// refused.
+    #[tokio::test]
+    async fn a_call_refused_for_busy_lookups_is_a_retried_connect_failure() {
+        let (_engine, coll, mut worker, _dir) = setup().await;
+        let hung = HungLookup::new();
+        worker.set_policy(ProviderPolicy::default().with_egress_lookup(hung.lookup()));
+        worker.providers.clear();
+        let holders: Vec<_> = (0..kimmy_egress::MAX_LOOKUPS_IN_FLIGHT)
+            .map(|i| {
+                let egress = worker.policy.egress().clone();
+                tokio::spawn(async move {
+                    egress.check_async(&format!("http://held{i}.example/")).await
+                })
+            })
+            .collect();
+        for _ in 0..10 {
+            tokio::task::yield_now().await;
+        }
+        let config = named_endpoint("new.example");
+        let err = worker.call_provider(&coll, &config, &[a_job()]).await.unwrap_err();
+        assert!(matches!(err, VectorError::ResolverBusy { .. }), "{err:?}");
+        assert!(err.is_retryable() && !err.is_refused_by_policy(), "{err:?}");
+        assert_eq!(worker.counters.transport_failures(TransportKind::Connect), 1);
+        assert!(worker.providers.contains_key(&coll.id.0), "the provider stays cached");
+        assert!(!worker.refused.contains_key(&coll.id.0));
+        hung.release();
+        for holder in holders {
+            let _ = holder.await;
+        }
+    }
+
+    /// **A host that resolves to a refused address is the permanent refusal a
+    /// build made.** Found by the check before the call, now that a build
+    /// checks no addresses: remembered and said once, the provider dropped, and
+    /// not counted as a failed provider call, since none was made.
+    #[tokio::test]
+    async fn a_host_that_resolves_inward_is_refused_once_and_remembered() {
+        let (_engine, coll, mut worker, _dir) = setup().await;
+        let (lookup, calls) = answering(Some("10.0.0.5"));
+        worker.set_policy(ProviderPolicy::default().with_egress_lookup(lookup));
+        worker.providers.clear();
+        let config = named_endpoint("inward.example");
+
+        worker.provider_for(coll.id.0, &config).expect("the build checks no address");
+        let err = worker.call_provider(&coll, &config, &[a_job()]).await.unwrap_err();
+        assert!(err.is_refused_by_policy() && !err.is_retryable(), "{err:?}");
+        let text = err.to_string();
+        assert!(
+            text.contains("10.0.0.5") && text.contains("vector.provider.allowed_hosts"),
+            "{text}"
+        );
+        assert!(worker.refused.contains_key(&coll.id.0), "remembered, so it is said once");
+        assert!(!worker.providers.contains_key(&coll.id.0), "the provider is dropped");
+        assert_eq!(worker.counters.failures.load(Ordering::Relaxed), 0, "no call was made");
+
+        let again = worker.provider_for(coll.id.0, &config).err().expect("still refused");
+        assert!(matches!(again, VectorError::PolicyRefused(_)), "{again:?}");
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1, "from memory");
     }
 
     #[tokio::test]

@@ -1602,7 +1602,7 @@ impl Metrics {
              # HELP kimmy_embed_skipped_no_shadow_total Documents and scans skipped because a collection is configured for vectors and its shadow collection is not on this node. Should read 0; rising means a configuration without the collection its vectors are stored in.\n\
              # TYPE kimmy_embed_skipped_no_shadow_total counter\n\
              kimmy_embed_skipped_no_shadow_total {embed_no_shadow}\n\
-             # HELP kimmy_embed_failures_total Failed provider calls, including each retry. Climbing while embed_documents stays flat is a provider outage.\n\
+             # HELP kimmy_embed_failures_total Failed provider calls, including each retry, and calls whose endpoint lookup failed before any request was made. Climbing while embed_documents stays flat is a provider outage.\n\
              # TYPE kimmy_embed_failures_total counter\n\
              kimmy_embed_failures_total {embed_failures}\n\
              # HELP kimmy_embed_provider_errors_total Provider calls that failed before a response, by what failed: connect (DNS, TCP, TLS), timeout, reset (the far side closed an open connection), other.\n\
@@ -3039,7 +3039,7 @@ kimmy_embed_skipped_not_owned_total 304
 # HELP kimmy_embed_skipped_no_shadow_total Documents and scans skipped because a collection is configured for vectors and its shadow collection is not on this node. Should read 0; rising means a configuration without the collection its vectors are stored in.
 # TYPE kimmy_embed_skipped_no_shadow_total counter
 kimmy_embed_skipped_no_shadow_total 305
-# HELP kimmy_embed_failures_total Failed provider calls, including each retry. Climbing while embed_documents stays flat is a provider outage.
+# HELP kimmy_embed_failures_total Failed provider calls, including each retry, and calls whose endpoint lookup failed before any request was made. Climbing while embed_documents stays flat is a provider outage.
 # TYPE kimmy_embed_failures_total counter
 kimmy_embed_failures_total 306
 # HELP kimmy_embed_provider_errors_total Provider calls that failed before a response, by what failed: connect (DNS, TCP, TLS), timeout, reset (the far side closed an open connection), other.
