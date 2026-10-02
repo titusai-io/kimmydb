@@ -277,6 +277,14 @@ not define — `{"input": "$items", "condition": …}` inside `$filter` is a
 
 ### Behaviours worth knowing
 
+**What reads as false.** Wherever an expression asks whether a value is true —
+`$cond`, `$switch`'s `case`, `$and`, `$or`, `$not`, `$filter`'s `cond`,
+`$anyElementTrue`, `$allElementsTrue`, `$toBool` and a filter's `$expr` — the
+false values are `false`, `null`, a missing field, and a zero of any numeric
+type: `0`, `0.0` and `-0.0`, and a stored `Decimal128` zero whatever its sign
+or exponent (`0`, `-0`, `0.000`, `0E-6176`). **Everything else is true**: `""`,
+`[]`, `{}`, a `NaN` and an infinity, of a double or a `Decimal128`, included.
+
 **`$cond` and `$ifNull` do not evaluate the branch they do not take.** A guard
 like `{$cond: [{$gt: ["$n", 0]}, {$divide: [100, "$n"]}, null]}` works, rather
 than failing on exactly the inputs it exists to protect.
@@ -475,8 +483,9 @@ compared, and the result is null.
 `$or` do: `false`, `null`, `0` and missing are false, and everything else is
 true, the empty array included, and an array element is not looked inside.
 An empty array is `false` for `$anyElementTrue` and `true` for
-`$allElementsTrue`. A `Decimal128` element is refused, whatever else the
-array holds, because a zero one would be read as true. The argument is one
+`$allElementsTrue`. A stored `Decimal128` element is read like any other
+number, false when it is a zero; unlike the set operators these compare
+nothing, so there is nothing to refuse. The argument is one
 array, so a literal is written inside the argument list:
 `{"$anyElementTrue": [[true, false]]}`, not `{"$anyElementTrue": [true,
 false]}`, which is two arguments and refused.
@@ -559,7 +568,7 @@ What converts to what:
 | `double` | any number; bool (`0`/`1`); date (epoch milliseconds); string, parsed strictly — `"1.5"`, `"-1e3"`; not `"1.5kg"` |
 | `int`, `long` | any number, **truncated toward zero** and refused when out of range — `$toInt` of 2^40 is an error, not a wrap; bool; string as a base-10 integer — `"42"`, not `"1.5"`; date to `long` only (epoch milliseconds never fit an int) |
 | `string` | number (a whole double prints as `"2"`, not `"2.0"`); bool; date as ISO 8601 with milliseconds, `"2026-08-12T13:45:07.250Z"`; ObjectId as 24 hex characters |
-| `bool` | a number is `false` when zero; **everything else present is `true`** — including `""` and `"false"`, which is MongoDB's rule and a trap worth knowing |
+| `bool` | a number is `false` when zero, a stored `Decimal128` zero of any sign or exponent included; **everything else present is `true`** — including `""` and `"false"`, which is MongoDB's rule and a trap worth knowing |
 | `date` | a number as epoch milliseconds (a double is truncated); a string in RFC 3339 / ISO 8601 with an offset or `Z`, or the looser forms `"2026-08-12"`, `"2026-08-12 13:45:07"` and a missing zone, all read as UTC; an ObjectId's creation time |
 | `objectId` | a string of 24 hex characters |
 
@@ -811,7 +820,7 @@ documents holding large arrays can exceed the cap long before the stage ends.
 | System variables other than `$$ROOT` and `$$CURRENT` — `$$NOW`, `$$REMOVE`, `$$DESCEND`, `$$PRUNE`, `$$KEEP` | Not built. Refused with a message saying so, rather than as an unknown name |
 | `$lookup` with both `localField`/`foreignField` and `pipeline` | Refused. Join on the key, then `$filter`/`$map` the attached array in the next stage |
 | `$convert` to `decimal` (or code `19`) | `Decimal128` has no exact key encoding ([ADR-005](decisions.md)); refused at parse, naming `double` and `long` as the alternatives |
-| A `Decimal128` literal — bare, under `$literal`, or inside a document or array literal | The same reason from the other side: the canonical order ranks a Decimal128 equal to every other number, so a comparison against one would hold for every number and a value computed from one could be neither indexed nor grouped. Refused at parse — `a Decimal128 literal is not supported in an expression` — wherever an expression is parsed, `$expr` included. A `$sort` stage refuses a document holding one at a sort path the way `find`'s sort does ([Query language](query-language.md#sort-and-projection)); a *stored* Decimal128 read through a field path is not refused, and `$type` finds it, except by the set operators and `$anyElementTrue`/`$allElementsTrue`, which refuse one in their input rather than compare or read it ([ADR-207](decisions.md), [Sets](#sets)) |
+| A `Decimal128` literal — bare, under `$literal`, or inside a document or array literal | The same reason from the other side: the canonical order ranks a Decimal128 equal to every other number, so a comparison against one would hold for every number and a value computed from one could be neither indexed nor grouped. Refused at parse — `a Decimal128 literal is not supported in an expression` — wherever an expression is parsed, `$expr` included. A `$sort` stage refuses a document holding one at a sort path the way `find`'s sort does ([Query language](query-language.md#sort-and-projection)); a *stored* Decimal128 read through a field path is not refused, and `$type` finds it, except by the set operators, which refuse one in their input rather than compare it ([ADR-207](decisions.md), [Sets](#sets)); where truth is read, a `Decimal128` zero is false like any zero ([What reads as false](#behaviours-worth-knowing)) |
 | `$toDecimal` | Never built as an operator at all, so it is refused at parse as an **unknown operator** — `unsupported operator "$toDecimal": not an expression operator` — rather than with the pointer `$convert` gives. The reason is the row above; the message does not say so |
 | `$facet`, `$bucket`, `$graphLookup`, `$merge`, `$out` | Not built. An unknown stage is refused with a message listing what is supported |
 | `$vectorSearch` as a stage | Vector search is its own endpoint — see [Vectors](vectors.md) |

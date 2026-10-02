@@ -36,14 +36,13 @@ breaking changes and says so here; a `0.x.PATCH` bump never does.
   `[{k, v}, ...]` in field order; `$arrayToObject` reads `[[k, v], ...]` or
   `[{k, v}, ...]`, and a repeated key keeps its first place and its last
   value. Null or missing in is null out; a non-array (or, for
-  `$objectToArray`, a non-document) is a `400`. A `Decimal128` in a set input,
-  or as an element of `$anyElementTrue` or `$allElementsTrue`, is a `400`
-  rather than compared, and `$arrayToObject` refuses a mixed form, a pair of
-  the wrong shape, a non-string key, and a key holding a NUL, each naming the
-  element; any other string is a key, empty, dotted and `$`-prefixed ones
-  included, so a document turned into pairs and back is the same document.
-  Every one of these names was an
-  unknown operator before, so nothing that used to be accepted is refused.
+  `$objectToArray`, a non-document) is a `400`. A `Decimal128` in a set input
+  is a `400` rather than compared, and `$arrayToObject` refuses a mixed form,
+  a pair of the wrong shape, a non-string key, and a key holding a NUL, each
+  naming the element; any other string is a key, empty, dotted and
+  `$`-prefixed ones included, so a document turned into pairs and back is the
+  same document. Every one of these names was an unknown operator before, so
+  nothing that used to be accepted is refused.
   `$zip` and `$sortArray` stay unknown operators. See aggregation.md, "Sets"
   and "Documents as pairs", and ADR-207.
 
@@ -304,6 +303,21 @@ breaking changes and says so here; a `0.x.PATCH` bump never does.
   [Deviations](docs/deviations.md)).
 
 ### Fixed
+
+- **A stored `Decimal128` zero reads as false wherever truth is read.** The
+  expression language had no reading of a `Decimal128` and took every one as
+  true, so over `{qty: Decimal128("0")}`, `{"$cond": ["$qty", "has stock",
+  "empty"]}` answered `"has stock"`, where `qty: 0` answers `"empty"`. A zero,
+  of either sign and any exponent (`0`, `-0`, `0.000`, `0E-6176`), is now false
+  in `$cond`, `$switch`, `$and`, `$or`, `$not`, `$filter`'s `cond`, `$toBool`
+  and `$convert` to `bool`, and a filter's `$expr`, and as the flag `$exists`
+  takes; every other `Decimal128`, `NaN` and the infinities included, is true,
+  as a double's are. A `find`, `count`, `update` or `delete` whose `$expr`
+  tests such a field's truth now leaves those documents out. With a reading
+  defined, `$anyElementTrue` and `$allElementsTrue`, new in this release, read
+  a `Decimal128` element instead of refusing it; the set operators still
+  refuse one, since that refusal is about equality. See aggregation.md,
+  "Behaviours worth knowing", and ADR-207's amendment.
 
 - **A start that fails after it opens the store no longer leaves it needing
   repair.** The cluster listener's port in use, or any other failure past the

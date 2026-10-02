@@ -2224,21 +2224,13 @@ fn set_is_subset(args: &[Bson]) -> Result<Bson> {
 /// [`truthy`], as `$and` and `$or` read their arguments. An empty array has
 /// no true element and no false one, so it is `false` and `true`.
 ///
-/// A `Decimal128` element is refused rather than read: [`truthy`] has no
-/// reading of one, and `Decimal128("0")` would be taken as true. Every element
-/// is looked at before the answer is given, so whether the refusal happens
-/// does not depend on where in the array the element is.
+/// A `Decimal128` element is read like any number: false when it is a zero.
+/// Unlike the set operators, nothing here compares two values, so the
+/// canonical order's trouble with a `Decimal128` does not arise.
 fn element_truth(op: Op, value: &Bson) -> Result<Bson> {
     let Some(items) = as_array(op, value)? else {
         return Ok(Bson::Null);
     };
-    if let Some(i) = items.iter().position(|item| matches!(item, Bson::Decimal128(_))) {
-        return Err(Error::InvalidQuery(format!(
-            "{} cannot read a Decimal128 as true or false (element {i}): this engine has no \
-             reading of one, so a zero would be taken as true; store a double or a long",
-            op.name()
-        )));
-    }
     Ok(Bson::Boolean(match op {
         Op::AnyElementTrue => items.iter().any(truthy),
         Op::AllElementsTrue => items.iter().all(truthy),
@@ -2534,15 +2526,11 @@ fn convert(value: &Bson, to: ConvertTo) -> Result<Bson> {
             Bson::ObjectId(oid) => oid.to_hex(),
             _ => return Err(unsupported()),
         })),
-        // Everything present is true except a zero, which is MongoDB's rule:
-        // `"false"` is a non-empty string and therefore true.
-        ConvertTo::Bool => Ok(Bson::Boolean(match value {
-            Bson::Boolean(b) => *b,
-            Bson::Int32(n) => *n != 0,
-            Bson::Int64(n) => *n != 0,
-            Bson::Double(d) => *d != 0.0,
-            _ => true,
-        })),
+        // Everything present is true except a zero, and `"false"` is a
+        // non-empty string and therefore true. The rule is `truthy`'s alone;
+        // a null or an undefined never reaches here, because `$convert`
+        // answers it with `onNull` first.
+        ConvertTo::Bool => Ok(Bson::Boolean(truthy(value))),
         ConvertTo::Date => Ok(Bson::DateTime(match value {
             Bson::DateTime(dt) => *dt,
             Bson::Int32(n) => bson::DateTime::from_millis(i64::from(*n)),
@@ -2658,14 +2646,43 @@ fn article(noun: &str) -> String {
 /// MongoDB's truthiness: `false`, `null`, missing and zero are false, and
 /// **everything else** — including the empty string and the empty array — is
 /// true.
+///
+/// Zero is zero of every numeric type: a stored `Decimal128` zero, of either
+/// sign and any exponent (`0`, `-0`, `0.000`, `0E-6176`), is false like `0`
+/// and `0.0`. A `NaN` or an infinity is not zero, so it is true, for a double
+/// and a `Decimal128` alike.
 pub fn truthy(value: &Bson) -> bool {
     match value {
         Bson::Boolean(b) => *b,
         Bson::Null | Bson::Undefined => false,
         Bson::Int32(0) | Bson::Int64(0) => false,
         Bson::Double(d) => *d != 0.0,
+        Bson::Decimal128(d) => !decimal128_is_zero(d),
         _ => true,
     }
+}
+
+/// Whether a `Decimal128` holds a zero, read from its IEEE 754-2008 BID
+/// encoding rather than its text.
+///
+/// The value is zero exactly when it is finite and its coefficient is zero;
+/// the sign and the exponent do not matter. A coefficient above
+/// `10^34 - 1` is non-canonical, and the standard reads it as zero, as the
+/// `bson` crate's own decoding does. That covers every encoding whose two
+/// bits after the sign are `11` and that is not a `NaN` or an infinity: its
+/// coefficient starts at `2^113`, which is already above the limit.
+pub(crate) fn decimal128_is_zero(d: &bson::Decimal128) -> bool {
+    const MAX_COEFFICIENT: u128 = 9_999_999_999_999_999_999_999_999_999_999_999;
+    // BSON stores the 128 bits little-endian; bit 127 is the sign.
+    let bits = u128::from_le_bytes(d.bytes());
+    if (bits >> 122) & 0b1_1110 == 0b1_1110 {
+        return false; // `11110` is an infinity, `11111` a NaN
+    }
+    if (bits >> 125) & 0b11 == 0b11 {
+        return true; // a non-canonical coefficient, read as zero
+    }
+    let coefficient = bits & ((1u128 << 113) - 1);
+    coefficient == 0 || coefficient > MAX_COEFFICIENT
 }
 
 pub(crate) fn type_name(value: &Bson) -> &'static str {
@@ -4739,6 +4756,128 @@ mod decimal128 {
         }
         assert!(Expr::parse(&Bson::Document(doc! { "$eq": ["$v", 1.5] })).is_ok());
     }
+
+    fn dec(text: &str) -> bson::Decimal128 {
+        text.parse().unwrap()
+    }
+
+    /// A `Decimal128` from its 128 bits, in the specification's bit order
+    /// (sign first); BSON stores them little-endian.
+    fn raw(bits: u128) -> bson::Decimal128 {
+        bson::Decimal128::from_bytes(bits.to_le_bytes())
+    }
+
+    /// Zeros of every sign and of exponents at both ends and between.
+    const ZEROS: [&str; 8] = ["0", "-0", "0.000", "-0.0", "0E-6176", "-0E-6176", "0E+6111", "0E+3"];
+
+    /// Not zero: the smallest and largest magnitudes, both signs, `NaN` and
+    /// the infinities.
+    const NON_ZEROS: [&str; 9] = [
+        "1",
+        "-1",
+        "0.001",
+        "1E-6176",
+        "-1E-6176",
+        "9.999999999999999999999999999999999E+6144",
+        "NaN",
+        "Infinity",
+        "-Infinity",
+    ];
+
+    #[test]
+    fn a_decimal128_zero_of_any_sign_or_exponent_is_false() {
+        for text in ZEROS {
+            assert!(!truthy(&Bson::Decimal128(dec(text))), "{text} should be false");
+        }
+        for text in NON_ZEROS {
+            assert!(truthy(&Bson::Decimal128(dec(text))), "{text} should be true");
+        }
+        // A signalling NaN (`0 11111 1…`) and a negative NaN (`1 11111 0…`)
+        // are NaNs, and true.
+        assert!(truthy(&Bson::Decimal128(raw(0x7e_u128 << 120))));
+        assert!(truthy(&Bson::Decimal128(raw(0xfc_u128 << 120))));
+    }
+
+    #[test]
+    fn a_non_canonical_decimal128_coefficient_reads_as_zero() {
+        // IEEE 754-2008 reads a coefficient above `10^34 - 1` as zero, and so
+        // does the `bson` crate's own text. Two ways to write one: the `11`
+        // form, whose coefficient starts at `2^113`, and the plain form with
+        // all 113 coefficient bits set.
+        let eleven_form = raw((0b0_11u128 << 125) | 1);
+        let too_big = raw((1u128 << 113) - 1);
+        for d in [eleven_form, too_big] {
+            assert!(decimal128_is_zero(&d), "{d}");
+            assert!(!truthy(&Bson::Decimal128(d)));
+            assert!(d.to_string().starts_with('0'), "the crate reads {d} as zero too");
+        }
+        // One below the limit is the largest canonical coefficient.
+        let largest = raw(9_999_999_999_999_999_999_999_999_999_999_999u128);
+        assert!(!decimal128_is_zero(&largest));
+    }
+
+    /// The crate's own reading of a `Decimal128`'s text: finite, and every
+    /// digit of its coefficient a zero.
+    fn zero_by_its_text(d: &bson::Decimal128) -> bool {
+        let text = d.to_string();
+        if text.contains("NaN") || text.contains("Infinity") {
+            return false;
+        }
+        let coefficient = text.split('E').next().unwrap();
+        coefficient.chars().filter(char::is_ascii_digit).all(|c| c == '0')
+    }
+
+    proptest::proptest! {
+        #[test]
+        fn the_bit_reading_of_zero_agrees_with_the_crates_text(
+            bits in proptest::prelude::any::<u128>(),
+            // Most random bit patterns are far from zero; this half lands
+            // on a zero coefficient, at a random sign and exponent.
+            zero_coefficient in proptest::prelude::any::<bool>(),
+        ) {
+            let bits = if zero_coefficient { bits & !((1u128 << 113) - 1) } else { bits };
+            let d = raw(bits);
+            proptest::prop_assert_eq!(decimal128_is_zero(&d), zero_by_its_text(&d), "{}", d);
+        }
+    }
+
+    fn on(expr: Document, d: Document) -> Result<Bson> {
+        Expr::parse(&Bson::Document(expr))?.eval(&d)
+    }
+
+    #[test]
+    fn a_stored_decimal128_zero_is_false_wherever_an_expression_reads_truth() {
+        for (text, truth) in
+            ZEROS.iter().map(|t| (*t, false)).chain(NON_ZEROS.iter().map(|t| (*t, true)))
+        {
+            let q = Bson::Decimal128(dec(text));
+            let d = doc! { "q": q.clone(), "items": [q.clone(), 1], "pair": [q, false] };
+            let cond = on(doc! { "$cond": ["$q", "yes", "no"] }, d.clone()).unwrap();
+            assert_eq!(cond, Bson::from(if truth { "yes" } else { "no" }), "{text} in $cond");
+            for (expr, want) in [
+                (doc! { "$and": ["$q", true] }, truth),
+                (doc! { "$or": ["$q", false] }, truth),
+                (doc! { "$not": ["$q"] }, !truth),
+                (doc! { "$toBool": "$q" }, truth),
+                (doc! { "$convert": { "input": "$q", "to": "bool" } }, truth),
+                (doc! { "$anyElementTrue": "$pair" }, truth),
+                (doc! { "$allElementsTrue": "$items" }, truth),
+                (
+                    doc! { "$switch": { "branches": [{ "case": "$q", "then": true }], "default": false } },
+                    truth,
+                ),
+            ] {
+                assert_eq!(
+                    on(expr.clone(), d.clone()).unwrap(),
+                    Bson::Boolean(want),
+                    "{text}: {expr}"
+                );
+            }
+            let kept = on(doc! { "$filter": { "input": "$items", "cond": "$$this" } }, d).unwrap();
+            let want = if truth { 2 } else { 1 };
+            assert_eq!(kept.as_array().unwrap().len(), want, "{text} in $filter: {kept}");
+        }
+    }
 }
 
 #[cfg(test)]
@@ -5045,22 +5184,27 @@ mod sets_and_pairs {
     }
 
     #[test]
-    fn any_and_all_refuse_a_decimal128_element_wherever_it_is() {
-        // `Decimal128("0")` would otherwise read as true. The refusal does not
-        // depend on whether the answer was already known before the element.
-        for items in
-            [vec![dec("0")], vec![Bson::Int32(1), dec("0")], vec![Bson::Int32(0), dec("1")]]
-        {
-            for op in ["$anyElementTrue", "$allElementsTrue"] {
-                let mut expr = Document::new();
-                expr.insert(op, "$v");
-                let msg = refused(expr, doc! { "v": items.clone() });
-                assert!(msg.contains(op) && msg.contains("Decimal128"), "{items:?}: {msg}");
-            }
+    fn any_and_all_read_a_decimal128_element_by_its_value() {
+        // A zero, of any sign or exponent, is false; any other value, `NaN`
+        // included, is true. Nothing is compared, so unlike the set
+        // operators there is nothing to refuse.
+        for (items, any, all) in [
+            (vec![dec("0")], false, false),
+            (vec![dec("-0.000")], false, false),
+            (vec![dec("0E-6176"), Bson::Int32(0)], false, false),
+            (vec![dec("1")], true, true),
+            (vec![dec("NaN"), dec("-Infinity")], true, true),
+            (vec![Bson::Int32(1), dec("0")], true, false),
+            (vec![dec("0"), Bson::Int32(1)], true, false),
+            (vec![Bson::Int32(0), dec("1")], true, false),
+        ] {
+            let d = doc! { "v": items.clone() };
+            assert_eq!(on(doc! { "$anyElementTrue": "$v" }, d.clone()), any.into(), "{items:?}");
+            assert_eq!(on(doc! { "$allElementsTrue": "$v" }, d), all.into(), "{items:?}");
         }
         // Nested inside an element, it is not read: the element is an array.
         assert_eq!(
-            on(doc! { "$anyElementTrue": "$v" }, doc! { "v": [[dec("0")]] }),
+            on(doc! { "$allElementsTrue": "$v" }, doc! { "v": [[dec("0")]] }),
             Bson::Boolean(true)
         );
     }

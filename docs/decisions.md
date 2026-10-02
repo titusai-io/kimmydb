@@ -22893,9 +22893,8 @@ left so: `$map` over a `$range` of indexes reads arrays by position, and
 - **`$anyElementTrue` and `$allElementsTrue` read elements by `truthy`**, as
   `$and` and `$or` read their arguments; an array element is true without
   being looked inside, and an empty array is `false` and `true`. A
-  `Decimal128` element is refused, since `truthy` has no reading of one and
-  would take `Decimal128("0")` as true, and every element is checked before
-  the answer is given, so the refusal does not depend on its position.
+  `Decimal128` element is read by `truthy` like any other number: a zero, of
+  either sign and any exponent, is false (see the amendment below).
 - **`$objectToArray`** gives `[{k, v}, ...]` in the document's field order,
   top level only. **`$arrayToObject`** reads `[[k, v], ...]` and
   `[{k, v}, ...]` (`k` and `v` in either order); the first element decides the
@@ -22925,6 +22924,21 @@ reading one such document would fail the whole aggregation. A repeated key's
 last value wins because that is what a caller building a document from pairs
 means by writing the key again; refusing it would make `$concatArrays` of an
 object's pairs with an override impossible.
+
+**Amended 2026-10-01 — a `Decimal128` element of `$anyElementTrue` or
+`$allElementsTrue` is read, not refused.** As first built, both refused one,
+`400`, wherever it stood in the array: `truthy` had no `Decimal128` arm, so it
+took every one as true, `Decimal128("0")` included, and an answer built on that
+would have been wrong. `truthy` now reads a `Decimal128` zero as false,
+whatever its sign or exponent, and every other one, `NaN` and the infinities
+included, as true, the way it reads a double; the same change fixed `$cond`,
+`$and`, `$or`, `$not`, `$switch`, `$filter`'s `cond`, `$toBool`, a filter's
+`$expr` and the flag a filter's `$exists` takes, which had answered with the
+wrong reading. With a reading defined there is
+nothing left to refuse, so the two operators take the element. **The set
+operators still refuse a `Decimal128`**: theirs is a refusal about equality,
+the canonical order ranking one equal to every number, and truthiness compares
+nothing. Neither operator has shipped, so no request that answered changes.
 
 ### Considered and rejected
 
@@ -22964,8 +22978,9 @@ seventeen-value corpus whose union is nine members, pairwise unequal under
 members `$addToSet` keeps and unchanged under every rotation; a `Decimal128`
 refused in either argument, nested in a document or an array, and passed over
 beside a null; `$anyElementTrue`/`$allElementsTrue` on falsy, truthy, mixed,
-nested and empty arrays and a `Decimal128` element first, after a true
-element and after a false one; `$objectToArray` order, nesting, empty,
+nested and empty arrays, and on `Decimal128` elements of each zero form, a
+non-zero, a `NaN` and an infinity, alone and before, after and beside true
+and false elements, read by value; `$objectToArray` order, nesting, empty,
 null and non-documents; the rename example in aggregation.md;
 `$arrayToObject` in both forms, a repeated key in both forms, eleven
 malformed pairs each with its message, a NUL key refused in both forms naming
@@ -22975,7 +22990,8 @@ unknown.
 `kimmy-api`: the worked example and the rest of the family through
 `$project`, a document turned into pairs and back with an override through
 `$addFields`, seven refusals as `400`s with their messages, and a stored
-`Decimal128` refused by `$setIsSubset`.
+`Decimal128` refused by `$setIsSubset`; a stored `Decimal128` zero false under
+`$allElementsTrue`, `$cond`, `$filter` and a filter's `$expr`.
 
 ---
 
@@ -23012,8 +23028,11 @@ and the MCP tools.
 **Decision.**
 
 - **Three-valued and order-free.** Each argument is true, false, or not known
-  (it cannot be evaluated). Truthiness is unchanged: `false`, `null`, `0` and a
-  missing field are false; everything else, `""` and `[]` included, is true.
+  (it cannot be evaluated). Truthiness is unchanged: `false`, `null`, `0` (a
+  Decimal128 zero too, of either sign and any exponent, per the amendment to
+  [ADR-207](#adr-207--a-set-operators-member-is-what-eq-calls-equal-its-result-is-first-seen-and-what-it-cannot-compare-it-refuses))
+  and a missing field are false; everything else, `""` and `[]` included, is
+  true.
 
   | `$and`, in any order | Result |
   |---|---|

@@ -290,7 +290,9 @@ fn parse_condition(path: &str, op: &str, arg: &Bson, sibling_options: &str) -> R
             path,
             without_elem_match(without_regex(op, array_arg(arg)?)?)?,
         )?),
-        "exists" => Condition::Exists(truthy(arg)),
+        // `$exists` reads its argument the way an expression reads a
+        // condition, so `Decimal128("0")` asks for absence as `0` does.
+        "exists" => Condition::Exists(expr::truthy(arg)),
         "size" => match arg {
             Bson::Int32(n) => Condition::Size(i64::from(*n)),
             Bson::Int64(n) => Condition::Size(*n),
@@ -463,17 +465,6 @@ fn comparable(what: &str, operand: &Bson) -> Result<()> {
         )));
     }
     Ok(())
-}
-
-fn truthy(value: &Bson) -> bool {
-    match value {
-        Bson::Boolean(b) => *b,
-        Bson::Int32(n) => *n != 0,
-        Bson::Int64(n) => *n != 0,
-        Bson::Double(n) => *n != 0.0,
-        Bson::Null | Bson::Undefined => false,
-        _ => true,
-    }
 }
 
 /// `{$mod: [divisor, remainder]}`, exactly two numbers.
@@ -2130,6 +2121,23 @@ mod tests {
         assert!(!hits(q.clone(), doc! { "active": 0.0 }));
         assert!(!hits(q.clone(), doc! { "active": Bson::Null }));
         assert!(!hits(q, doc! { "other": 1 }));
+    }
+
+    #[test]
+    fn a_stored_decimal128_zero_is_false_in_expr_and_as_an_exists_flag() {
+        let dec = |text: &str| Bson::Decimal128(text.parse().unwrap());
+        let q = doc! { "$expr": "$active" };
+        for zero in ["0", "-0", "0.000", "0E-6176"] {
+            assert!(!hits(q.clone(), doc! { "active": dec(zero) }), "{zero}");
+            // `$exists` reads its argument by the same rule: a zero asks for
+            // absence.
+            assert!(hits(doc! { "a": { "$exists": dec(zero) } }, doc! { "b": 1 }), "{zero}");
+            assert!(!hits(doc! { "a": { "$exists": dec(zero) } }, doc! { "a": 1 }), "{zero}");
+        }
+        for other in ["1", "-0.001", "NaN", "Infinity"] {
+            assert!(hits(q.clone(), doc! { "active": dec(other) }), "{other}");
+            assert!(hits(doc! { "a": { "$exists": dec(other) } }, doc! { "a": 1 }), "{other}");
+        }
     }
 
     #[test]

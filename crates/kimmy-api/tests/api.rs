@@ -8631,6 +8631,102 @@ async fn set_operators_and_pair_conversions_run_in_a_pipeline_over_http() {
 }
 
 #[tokio::test]
+async fn a_stored_decimal128_zero_reads_as_false_in_every_expression() {
+    // A Decimal128 zero, of any sign or exponent, is false where an
+    // expression reads truth, as `0` and `0.0` are; any other value, `NaN`
+    // included, is true.
+    let server = Server::start().await;
+    let token = server.root().await;
+    server.post("/v1/db/shop/collections", Some(&token), json!({"name": "stock"})).await;
+    for (id, qty) in [(1, "0"), (2, "-0.000"), (3, "0E-6176"), (4, "2.5"), (5, "NaN")] {
+        let res = server
+            .post(
+                "/v1/db/shop/coll/stock/docs",
+                Some(&token),
+                json!({"_id": id, "qty": {"$numberDecimal": qty}, "lots": [{"$numberDecimal": qty}, 1]}),
+            )
+            .await;
+        assert_eq!(res.status, 200, "{:?}", res.body);
+    }
+    let ids = |body: &Value| -> Vec<i64> {
+        body["documents"]
+            .as_array()
+            .unwrap_or_else(|| panic!("no documents in {body}"))
+            .iter()
+            .map(|d| d["_id"].as_i64().unwrap())
+            .collect()
+    };
+
+    // A filter's `$expr`, bare and under `$and`.
+    for filter in [json!({"$expr": "$qty"}), json!({"$expr": {"$and": ["$qty", true]}})] {
+        let res = server
+            .post(
+                "/v1/db/shop/coll/stock/find",
+                Some(&token),
+                json!({"filter": filter, "sort": {"_id": 1}}),
+            )
+            .await;
+        assert_eq!(res.status, 200, "{filter}: {:?}", res.body);
+        assert_eq!(ids(&res.body), [4, 5], "{filter}");
+    }
+
+    // `$exists` reads its flag by the same rule: a Decimal128 zero asks for
+    // absence, as a numeric `0` does, and any other value asks for presence.
+    for (flag, want_present) in [
+        (json!({"$numberDecimal": "0"}), false),
+        (json!({"$numberDecimal": "-0.000"}), false),
+        (json!(0), false),
+        (json!({"$numberDecimal": "2.5"}), true),
+        (json!(1), true),
+    ] {
+        for (field, present) in [("qty", true), ("nope", false)] {
+            let res = server
+                .post(
+                    "/v1/db/shop/coll/stock/find",
+                    Some(&token),
+                    json!({"filter": {field: {"$exists": flag}}, "sort": {"_id": 1}}),
+                )
+                .await;
+            assert_eq!(res.status, 200, "{field} {flag}: {:?}", res.body);
+            let want: &[i64] = if present == want_present { &[1, 2, 3, 4, 5] } else { &[] };
+            assert_eq!(ids(&res.body), want, "{field} $exists {flag}");
+        }
+    }
+
+    // `$cond`, `$filter`'s `cond` and `$allElementsTrue` in a pipeline.
+    let res = server
+        .post(
+            "/v1/db/shop/coll/stock/aggregate",
+            Some(&token),
+            json!({"pipeline": [
+                {"$sort": {"_id": 1}},
+                {"$project": {
+                    "label": {"$cond": ["$qty", "has stock", "empty"]},
+                    "kept": {"$size": {"$filter": {"input": "$lots", "cond": "$$this"}}},
+                    "all": {"$allElementsTrue": "$lots"},
+                }},
+            ]}),
+        )
+        .await;
+    assert_eq!(res.status, 200, "{:?}", res.body);
+    let rows: Vec<(String, i64, bool)> = res.body["documents"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|d| {
+            (
+                d["label"].as_str().unwrap().to_string(),
+                d["kept"].as_i64().unwrap(),
+                d["all"].as_bool().unwrap(),
+            )
+        })
+        .collect();
+    let empty = ("empty".to_string(), 1, false);
+    let stocked = ("has stock".to_string(), 2, true);
+    assert_eq!(rows, [empty.clone(), empty.clone(), empty, stocked.clone(), stocked]);
+}
+
+#[tokio::test]
 async fn a_field_path_through_an_array_fans_out_in_every_expression_context() {
     // The same pipeline MongoDB runs: a path that crosses an array is the
     // array of what it found, in `$addFields`, in `$expr` and as a `$group`
