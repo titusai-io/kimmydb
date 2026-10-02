@@ -946,6 +946,37 @@ async fn find_accepts_the_query_language() {
     assert_eq!(found["documents"][0]["_id"], "c");
 }
 
+/// The `find` and `aggregate` tools shape through the same projection as
+/// REST, so a path through an array keeps the array here too (ADR-214).
+#[tokio::test]
+async fn a_projection_through_an_array_keeps_the_array_through_the_tools() {
+    let server = Server::start().await;
+    let meta = server.engine.create_collection("sales", "carts").unwrap();
+    server
+        .engine
+        .insert(&meta, bson::doc! { "_id": "k", "p": [{ "_id": 1, "n": "a" }, 5, { "_id": 2 }] })
+        .unwrap();
+    let token = server.root();
+
+    let found = server
+        .call_ok(
+            &token,
+            "find",
+            json!({"database":"sales","collection":"carts","projection":{"p._id":1}}),
+        )
+        .await;
+    assert_eq!(found["documents"][0], json!({"_id": "k", "p": [{"_id": 1}, {"_id": 2}]}));
+
+    let piped = server
+        .call_ok(
+            &token,
+            "aggregate",
+            json!({"database":"sales","collection":"carts","pipeline":[{"$project":{"p.n":0}}]}),
+        )
+        .await;
+    assert_eq!(piped["documents"][0], json!({"_id": "k", "p": [{"_id": 1}, 5, {"_id": 2}]}));
+}
+
 #[tokio::test]
 async fn a_filter_the_server_cannot_honour_is_refused_here_as_it_is_over_rest() {
     let server = Server::start().await;

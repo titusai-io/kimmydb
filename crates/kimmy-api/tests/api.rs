@@ -1785,6 +1785,144 @@ async fn queries_filter_sort_and_project() {
     assert_eq!(res.body["documents"][1], json!({ "item": "widget" }));
 }
 
+/// A sort ranks the stored documents, not the projected ones: the projection
+/// here drops the sort key, so a ranking taken after it would see `qty`
+/// missing everywhere and fall back to `_id` order, which is chosen to
+/// disagree with `qty` order. Checked through `find`'s bounded window
+/// (a `limit` with a `sort`) in both directions, and `find_and_modify`.
+#[tokio::test]
+async fn a_sort_ranks_documents_before_the_projection_drops_the_key() {
+    let server = Server::start().await;
+    let token = server.root().await;
+    server.post("/v1/db/shop/collections", Some(&token), json!({"name":"orders"})).await;
+    for (id, item, qty) in [(1, "a", 30), (2, "b", 20), (3, "c", 10), (4, "d", 40)] {
+        let res = server
+            .post(
+                "/v1/db/shop/coll/orders/docs",
+                Some(&token),
+                json!({ "_id": id, "item": item, "qty": qty }),
+            )
+            .await;
+        assert_eq!(res.status, 200, "{:?}", res.body);
+    }
+
+    for (direction, want) in [(1, json!(["c", "b"])), (-1, json!(["d", "a"]))] {
+        let res = server
+            .post(
+                "/v1/db/shop/coll/orders/find",
+                Some(&token),
+                json!({"sort": {"qty": direction}, "limit": 2, "projection": {"item": 1}}),
+            )
+            .await;
+        assert_eq!(res.status, 200, "{:?}", res.body);
+        let items: Vec<Value> =
+            res.body["documents"].as_array().unwrap().iter().map(|d| d["item"].clone()).collect();
+        assert_eq!(Value::from(items), want, "sort {direction}: {:?}", res.body);
+        assert!(res.body["documents"][0].get("qty").is_none(), "projected: {:?}", res.body);
+    }
+
+    let res = server
+        .post(
+            "/v1/db/shop/coll/orders/find_and_modify",
+            Some(&token),
+            json!({
+                "filter": {},
+                "sort": {"qty": 1},
+                "update": {"$set": {"seen": true}},
+                "projection": {"item": 1, "_id": 0},
+            }),
+        )
+        .await;
+    assert_eq!(res.status, 200, "{:?}", res.body);
+    assert_eq!(res.body["document"], json!({"item": "c"}));
+}
+
+/// A projection through an array keeps the array and reduces every element
+/// (ADR-214), where it used to answer the first element as a document with a
+/// `200`. Every route that takes a projection shapes through the one
+/// `shape::project`, so each is driven once: `find`, the `$project` stage and
+/// `find_and_modify`, inclusion and exclusion.
+#[tokio::test]
+async fn a_projection_through_an_array_keeps_every_element_on_every_route() {
+    let server = Server::start().await;
+    let token = server.root().await;
+    server.post("/v1/db/shop/collections", Some(&token), json!({"name":"c"})).await;
+    let stored = json!({"_id": 7, "name": "n", "p": [
+        {"_id": 1, "name": "a", "tags": [{"k": 1, "v": 2}, 3]},
+        5,
+        {"_id": 2, "name": "b"},
+        {"other": 1},
+    ]});
+    let res = server.post("/v1/db/shop/coll/c/docs", Some(&token), stored).await;
+    assert_eq!(res.status, 200, "{:?}", res.body);
+
+    // Inclusion: one array, every document element kept and reduced, a
+    // scalar dropped, an element without the fields kept as `{}`; two paths
+    // into the array land in the same elements, beside a top-level field.
+    let included = json!({"_id": 7, "name": "n", "p": [
+        {"_id": 1, "name": "a"}, {"_id": 2, "name": "b"}, {}
+    ]});
+    let spec = json!({"p._id": 1, "p.name": 1, "name": 1});
+    let res =
+        server.post("/v1/db/shop/coll/c/find", Some(&token), json!({"projection": spec})).await;
+    assert_eq!(res.status, 200, "{:?}", res.body);
+    assert_eq!(res.body["documents"][0], included);
+    let res = server
+        .post(
+            "/v1/db/shop/coll/c/aggregate",
+            Some(&token),
+            json!({"pipeline": [{"$project": spec}]}),
+        )
+        .await;
+    assert_eq!(res.status, 200, "{:?}", res.body);
+    assert_eq!(res.body["documents"][0], included);
+
+    // Two levels down, `_id` dropped.
+    let res = server
+        .post(
+            "/v1/db/shop/coll/c/find",
+            Some(&token),
+            json!({"projection": {"p.tags.k": 1, "_id": 0}}),
+        )
+        .await;
+    assert_eq!(res.status, 200, "{:?}", res.body);
+    assert_eq!(res.body["documents"][0], json!({"p": [{"tags": [{"k": 1}]}, {}, {}]}));
+
+    // Exclusion: the path leaves every element, and the rest stays.
+    let excluded = json!({"_id": 7, "name": "n", "p": [
+        {"_id": 1, "tags": [{"k": 1, "v": 2}, 3]}, 5, {"_id": 2}, {"other": 1}
+    ]});
+    let res = server
+        .post("/v1/db/shop/coll/c/find", Some(&token), json!({"projection": {"p.name": 0}}))
+        .await;
+    assert_eq!(res.status, 200, "{:?}", res.body);
+    assert_eq!(res.body["documents"][0], excluded);
+    let res = server
+        .post(
+            "/v1/db/shop/coll/c/aggregate",
+            Some(&token),
+            json!({"pipeline": [{"$project": {"p.name": 0}}]}),
+        )
+        .await;
+    assert_eq!(res.status, 200, "{:?}", res.body);
+    assert_eq!(res.body["documents"][0], excluded);
+
+    // `find_and_modify` returns the document through the same projection.
+    let res = server
+        .post(
+            "/v1/db/shop/coll/c/find_and_modify",
+            Some(&token),
+            json!({
+                "filter": {"_id": 7},
+                "update": {"$set": {"seen": true}},
+                "projection": {"p._id": 1, "_id": 0},
+            }),
+        )
+        .await;
+    assert_eq!(res.status, 200, "{:?}", res.body);
+    assert_eq!(res.body["document"], json!({"p": [{"_id": 1}, {"_id": 2}, {}]}));
+}
+
 /// `$expr` is parsed by the one filter parser every endpoint shares, so proving
 /// it on `find`, `count`, `$match` and `update` is proving the parser once and
 /// the plumbing four times. The predicate compares two fields of the same

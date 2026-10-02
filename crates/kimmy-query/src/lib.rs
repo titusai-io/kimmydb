@@ -21,5 +21,5 @@ pub use aggregate::{Accumulator, Limits, Stage};
 pub use expr::{Expr, Op};
 pub use filter::{Condition, Filter, matches};
 pub use plan::{IndexPlan, choose};
-pub use shape::{Projection, SortKey};
+pub use shape::{Projection, ProjectionPaths, SortKey};
 pub use update::Update;

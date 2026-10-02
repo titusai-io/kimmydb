@@ -379,7 +379,7 @@ fn parse_project(doc: &Document, vars: &[String]) -> Result<Stage> {
         include.push(ID_FIELD.to_string());
     }
 
-    Ok(Stage::Project { projection: Some(Projection::Include(include)), computed })
+    Ok(Stage::Project { projection: Some(Projection::Include(include.into())), computed })
 }
 
 fn parse_replace_root(spec: &Document, vars: &[String]) -> Result<Stage> {
@@ -2108,6 +2108,32 @@ mod tests {
                 doc! {"city": "Paris", "_id": 3},
             ]
         );
+    }
+
+    #[test]
+    fn project_through_an_array_keeps_the_array_beside_computed_fields() {
+        let input = vec![doc! {"_id": 7, "qty": 2, "p": [{"_id": 1, "n": "a"}, 5, {"n": "b"}]}];
+        // The flags alone, inclusion and exclusion, and with a computed
+        // field beside them: one projection, so one answer.
+        let out = run(vec![doc! {"$project": {"p._id": 1}}], input.clone()).unwrap();
+        assert_eq!(out, vec![doc! {"_id": 7, "p": [{"_id": 1}, {}]}]);
+        let out = run(vec![doc! {"$project": {"p._id": 1, "q": "$qty"}}], input.clone()).unwrap();
+        assert_eq!(out, vec![doc! {"_id": 7, "p": [{"_id": 1}, {}], "q": 2}]);
+        let out = run(vec![doc! {"$project": {"p._id": 0}}], input.clone()).unwrap();
+        assert_eq!(out, vec![doc! {"_id": 7, "qty": 2, "p": [{"n": "a"}, 5, {"n": "b"}]}]);
+        // A computed field written into the kept array has no one place to
+        // go, and is refused as `$addFields` refuses it, not written into a
+        // document standing in for the array.
+        let err =
+            run(vec![doc! {"$project": {"p._id": 1, "p.q": "$qty"}}], input.clone()).unwrap_err();
+        assert!(err.to_string().contains("cannot set \"p.q\""), "{err}");
+        // A numeric segment is the documented exception: the write follows
+        // the write rules and replaces element 0 by position, as `$addFields`
+        // does, while the flags beside it read `p.0` as a field name.
+        let out = run(vec![doc! {"$project": {"p._id": 1, "p.0": "$qty"}}], input.clone()).unwrap();
+        assert_eq!(out, vec![doc! {"_id": 7, "p": [2, {}]}]);
+        let out = run(vec![doc! {"$addFields": {"p.0": "$qty"}}], input).unwrap();
+        assert_eq!(out, vec![doc! {"_id": 7, "qty": 2, "p": [2, 5, {"n": "b"}]}]);
     }
 
     #[test]
