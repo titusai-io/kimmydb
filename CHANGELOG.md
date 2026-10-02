@@ -127,6 +127,27 @@ breaking changes and says so here; a `0.x.PATCH` bump never does.
   meant, and narrow a join that over-attaches with an earlier `$match`. See
   Aggregation, "$lookup", and ADR-210.
 
+- **Breaking: a projection through an array keeps the array and every
+  element.** `{"p._id": 1}` over `p: [{_id: 1, name: "a"}, {_id: 2, name:
+  "b"}]` answered `p: {_id: 1}`: the first element alone, turned from an array
+  into a document, with a `200`. It now answers `p: [{_id: 1}, {_id: 2}]`. An
+  inclusion reduces each element that is a document to the included
+  sub-paths, keeps an element holding none of them as `{}`, drops an element
+  that is not a document, and recurses into nested arrays; several paths into
+  one array (`{"p._id": 1, "p.name": 1}`) fill the same elements. An exclusion
+  through an array (`{"p.name": 0}`) removed nothing and now removes the path
+  from every element. A numeric segment names a field in each element rather
+  than a position, so `{"a.1": 0}` over `a: [1, 2, 3]` no longer leaves
+  `[1, null, 3]`, and `{"a.0": 1}` answers `a: []`. The same on `find`,
+  `find_and_modify`, the `$project` stage and the MCP `find` and `aggregate`
+  tools. A `$project` that also computes a field into the kept array through a
+  named segment (`{"p._id": 1, "p.total": …}`) is now a `400`, as the same
+  field under `$addFields` already was, where it used to be written into the
+  document that stood in for the array; one computed through a numeric segment
+  (`"p.0"`) is written by position, as under `$addFields`. Projections that do
+  not cross an array are unchanged. See Query language, "Sort and projection",
+  and ADR-214.
+
 - **Breaking: an update that writes one path twice is a `400`, and writes
   nothing.** Two writes to the same path, or to a path and a path inside it,
   were applied in the order their keys arrived: `{"$set": {"a": 1}, "$inc":

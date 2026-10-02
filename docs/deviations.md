@@ -17,6 +17,39 @@ Status meanings:
 
 ---
 
+## 🟡 An inclusion projection leaves out a sub-document that holds none of its paths, where MongoDB answers it empty
+
+**Raised 2026-10-01, with ADR-214.** A projection through an array now does
+what MongoDB's does: the array is kept, each document element is reduced to
+the included sub-paths (or has the excluded ones removed), an element that is
+not a document is dropped from an inclusion, an element holding none of the
+paths is `{}`, nested arrays recurse, and a numeric segment names a field
+rather than a position. Until then KimmyDB answered the first element alone,
+as a document (`p: {_id: 1}` for `{"p._id": 1}`), and an exclusion through an
+array removed nothing; both are fixed, not deviations, and are recorded under
+`### Changed` in the changelog.
+
+What still differs is a **sub-document outside an array**: `{"a.b": 1}` over
+`{a: {c: 1}}` answers no `a` here, where MongoDB answers `a: {}`, and the same
+holds one level into an element — `{"p.q.r": 1}` over `p: [{q: {x: 1}}]` is
+`p: [{}]` here and `p: [{q: {}}]` there. The field a caller asked for is
+absent either way; only the empty container around it differs. It is the rule
+KimmyDB's projection has always had for documents, and changing it is a change
+of its own that nobody has asked for.
+
+**Three smaller points, same entry.** `{"a": 1, "a.b": 1}` is accepted and
+includes `a` whole, where MongoDB refuses the overlap as a path collision; a
+request MongoDB refuses means something here, so nothing ported changes
+meaning. `{"items.$": 1}` is a field called `$`, not the positional projection
+([Query language](query-language.md#sort-and-projection)), so it answers
+`items: [{}, …]` over an array of documents where MongoDB answers the first
+element the filter matched. And a `$project` or `$addFields` field computed
+into an array through a named segment — `{"p.total": …}` with `p` an array —
+is refused `400`, where MongoDB writes it into each element; through a
+numeric segment (`"p.0"`) it replaces that element by position.
+
+---
+
 ## 🟡 A compound index over two array fields indexes nothing for that document, where MongoDB refuses the write
 
 **Raised 2026-09-06, with ADR-139.** MongoDB refuses a write that would put

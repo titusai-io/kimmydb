@@ -5,6 +5,7 @@ use bson::{Bson, Document};
 use kimmy_core::cmp::{canonical_cmp, holds_decimal128};
 use kimmy_core::{Error, Result};
 use std::cmp::Ordering;
+use std::collections::HashMap;
 
 use crate::path;
 
@@ -154,9 +155,25 @@ pub fn refuse_unsortable(keys: &[SortKey], doc: &Document) -> Result<()> {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Projection {
     /// Keep only these paths.
-    Include(Vec<String>),
+    Include(ProjectionPaths),
     /// Keep everything except these paths.
-    Exclude(Vec<String>),
+    Exclude(ProjectionPaths),
+}
+
+/// A projection's paths, as the tree [`project`] walks.
+///
+/// The tree is built once, when the projection is made, and every document
+/// the request shapes walks the same one: building it per document cost a
+/// projection naming hundreds of fields more than the shaping itself.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ProjectionPaths {
+    tree: PathTree,
+}
+
+impl From<Vec<String>> for ProjectionPaths {
+    fn from(listed: Vec<String>) -> Self {
+        ProjectionPaths { tree: PathTree::of(&listed) }
+    }
 }
 
 /// Parse a projection like `{name: 1, age: 1}` or `{secret: 0}`.
@@ -213,66 +230,262 @@ pub fn parse_projection(doc: &Document) -> Result<Option<Projection>> {
         if !excludes_only_id && !include.iter().any(|p| p == ID_FIELD) {
             include.push(ID_FIELD.to_string());
         }
-        return Ok(Some(Projection::Include(include)));
+        return Ok(Some(Projection::Include(include.into())));
     }
-    Ok(Some(Projection::Exclude(exclude)))
+    Ok(Some(Projection::Exclude(exclude.into())))
 }
 
 /// Apply a projection, returning the reshaped document.
+///
+/// Both kinds walk the document and the projection's paths together, segment
+/// by segment, and **a path that meets an array applies its remaining segments
+/// to every element** — the reading a path has in a filter, where `p._id`
+/// reaches every element's `_id`. The array is kept, in its own order, so a
+/// projection never changes an array into something else:
+///
+/// - an inclusion reduces each element that is a document to the included
+///   sub-paths, as `{}` when it holds none of them; drops each element that is
+///   not a document, which has no such sub-path; and reduces an element that is
+///   itself an array the same way, recursively;
+/// - an exclusion removes the sub-path from each element that is a document,
+///   recurses into one that is an array, and leaves every other element as it
+///   was.
+///
+/// A segment is a field name throughout, a numeric one too: `a.0` names a
+/// field called `0` in each element of `a`, never the element at position 0.
+/// Several paths into one array (`p._id`, `p.name`) are one walk, so each
+/// element carries all of them. Where one path is a prefix of another
+/// (`a` and `a.b`), the shorter one decides: `a` is included, or removed,
+/// whole.
+///
+/// Outside arrays an inclusion keeps a sub-document only when it holds at least
+/// one included path, so `{"a.b": 1}` over `{a: {c: 1}}` leaves `a` out; an
+/// element of an array is kept as `{}` instead, so the array keeps one entry
+/// per document it held. An inclusion's fields come out in the order the
+/// document holds them, at every level, not the order the specification names
+/// them (`_id`, which the parser appends, stays where the document has it).
 pub fn project(projection: Option<&Projection>, doc: &Document) -> Document {
     match projection {
         None => doc.clone(),
-        Some(Projection::Exclude(paths)) => {
-            let mut out = doc.clone();
-            for p in paths {
-                path::unset(&mut out, p);
+        Some(Projection::Exclude(paths)) => excluded(doc, &paths.tree),
+        Some(Projection::Include(paths)) => include_fields(doc, &paths.tree),
+    }
+}
+
+/// A projection's paths as a tree of segments, so that every path through one
+/// field is applied in a single walk of it.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+struct PathTree {
+    /// A path ends here: the field is included, or removed, whole, and any
+    /// longer path through it adds nothing.
+    whole: bool,
+    /// The next segments of the paths that continue past this one, in the
+    /// order the specification first names them.
+    fields: Vec<(String, PathTree)>,
+    /// Where each of `fields` is, by name, once there are more than
+    /// [`SCAN_UP_TO`] of them; below that a scan comparing names is cheaper
+    /// than hashing one.
+    index: Option<HashMap<String, usize>>,
+    /// How many of `fields` are `whole`, which decides how an exclusion
+    /// removes them (see [`excluded`]).
+    wholes: usize,
+}
+
+impl PathTree {
+    fn of(paths: &[String]) -> Self {
+        let mut root = PathTree::default();
+        for p in paths {
+            let mut node = &mut root;
+            for seg in path::segments(p) {
+                let at = match node.fields.iter().position(|(name, _)| name == seg) {
+                    Some(at) => at,
+                    None => {
+                        node.fields.push((seg.to_string(), PathTree::default()));
+                        node.fields.len() - 1
+                    }
+                };
+                node = &mut node.fields[at].1;
             }
-            out
+            node.whole = true;
         }
-        Some(Projection::Include(paths)) => {
-            let mut picked = Document::new();
-            for p in paths {
-                // Take the first match: a projection names one destination, so
-                // fanning an array traversal out would change the shape.
-                if let Some(value) = path::resolve(doc, p).first() {
-                    // Ignore errors: a path that cannot be written (e.g. into
-                    // an array without an index) simply is not projected.
-                    let _ = path::set(&mut picked, p, (*value).clone());
-                }
-            }
-            in_document_order(picked, doc)
+        root.finish();
+        root
+    }
+
+    /// Count each level's whole fields and index the wide levels, once the
+    /// tree holds every path.
+    fn finish(&mut self) {
+        self.wholes = self.fields.iter().filter(|(_, node)| node.whole).count();
+        if self.fields.len() > SCAN_UP_TO {
+            self.index = Some(
+                self.fields.iter().enumerate().map(|(at, (name, _))| (name.clone(), at)).collect(),
+            );
+        }
+        for (_, node) in &mut self.fields {
+            node.finish();
+        }
+    }
+
+    fn field(&self, name: &str) -> Option<&PathTree> {
+        match &self.index {
+            Some(index) => index.get(name).map(|&at| &self.fields[at].1),
+            None => self.fields.iter().find(|(field, _)| field == name).map(|(_, node)| node),
         }
     }
 }
 
-/// Reorder an inclusion projection's output to the source document's field
-/// order, at every level the projection reached into.
-///
-/// Walking the projection's paths builds the output in *specification* order —
-/// `{alpha: 1, zeta: 1}` over `{_id, zeta, alpha}` gave `{alpha, zeta, _id}`,
-/// with `_id` last because the parser appends the implicit `_id` to the list.
-/// That was invisible while the JSON boundary sorted every object (ADR-120)
-/// and wrong once it stopped: MongoDB returns projected fields in the order
-/// the document holds them, `_id` first, and `docs/compatibility.md` now says
-/// a client may rely on stored order. The picking is left as it was and the
-/// result is reordered afterwards, so the array and dotted-path rules above
-/// are untouched; a field that was picked but has no counterpart at this
-/// level of the source (a path set through an array, say) keeps its place at
-/// the end.
-fn in_document_order(mut picked: Document, source: &Document) -> Document {
+/// The fields of `doc` that `tree` includes, in `doc`'s order.
+fn include_fields(doc: &Document, tree: &PathTree) -> Document {
     let mut out = Document::new();
-    for (key, original) in source {
-        let Some(value) = picked.remove(key) else { continue };
-        let value = match (value, original) {
-            (Bson::Document(inner), Bson::Document(from)) => {
-                Bson::Document(in_document_order(inner, from))
+    // A document holds each name once, so once every field the tree names
+    // has been met, the rest of the document holds nothing to include. When
+    // the tree names few fields of a wide document, asking the document for
+    // each is cheaper than walking it: none present is an empty answer, one
+    // is the answer with no order to keep, and otherwise the walk stops at
+    // the last one present rather than the last one named.
+    let mut unmet = tree.fields.len();
+    if unmet * 4 < doc.len() {
+        let mut present = tree.fields.iter().filter(|(name, _)| doc.contains_key(name));
+        match (present.next(), present.next()) {
+            (None, _) => return out,
+            (Some((name, node)), None) => {
+                let value = doc.get(name).expect("present");
+                include_field(&mut out, name, value, node);
+                return out;
             }
-            (value, _) => value,
-        };
-        out.insert(key.clone(), value);
+            (Some(_), Some(_)) => unmet = 2 + present.count(),
+        }
     }
-    out.extend(picked);
+    for (key, value) in doc {
+        if unmet == 0 {
+            break;
+        }
+        let Some(node) = tree.field(key) else { continue };
+        unmet -= 1;
+        include_field(&mut out, key, value, node);
+    }
     out
+}
+
+/// Add to `out` what `node` includes of the field `key`, holding `value`.
+fn include_field(out: &mut Document, key: &str, value: &Bson, node: &PathTree) {
+    if node.whole {
+        out.insert(key, value.clone());
+        return;
+    }
+    match value {
+        Bson::Document(inner) => {
+            let picked = include_fields(inner, node);
+            if !picked.is_empty() {
+                out.insert(key, picked);
+            }
+        }
+        Bson::Array(items) => {
+            out.insert(key, include_elements(items, node));
+        }
+        // A scalar has no field for the rest of the path to name.
+        _ => {}
+    }
+}
+
+/// An array that an inclusion's path continues through, each element reduced
+/// to what the rest of the path includes.
+fn include_elements(items: &[Bson], node: &PathTree) -> Bson {
+    Bson::Array(
+        items
+            .iter()
+            .filter_map(|item| match item {
+                Bson::Document(inner) => Some(Bson::Document(include_fields(inner, node))),
+                Bson::Array(inner) => Some(include_elements(inner, node)),
+                _ => None,
+            })
+            .collect(),
+    )
+}
+
+/// How many fields a level of a [`PathTree`] may name before it is indexed
+/// by name rather than scanned.
+const SCAN_UP_TO: usize = 8;
+
+/// Whether an exclusion removes most of a document's fields, so that building
+/// the fields that stay is cheaper than removing the ones that go.
+///
+/// A document keeps its fields in order, so removing one shifts every field
+/// after it, and removing many from a wide document costs their product;
+/// building costs one insertion, and one hash of the name, per field kept.
+/// Removal is the cheaper while the fields that go are few, or sit near the
+/// end, which is where the cut-over is put: at more than half.
+fn mostly_removed(doc: &Document, tree: &PathTree) -> bool {
+    tree.wholes * 2 > doc.len()
+}
+
+/// `doc` without every path `tree` excludes.
+fn excluded(doc: &Document, tree: &PathTree) -> Document {
+    if !mostly_removed(doc, tree) {
+        let mut out = doc.clone();
+        exclude_fields(&mut out, tree);
+        return out;
+    }
+    let mut out = Document::new();
+    for (key, value) in doc {
+        match tree.field(key) {
+            None => {
+                out.insert(key.clone(), value.clone());
+            }
+            Some(node) if node.whole => {}
+            Some(node) => {
+                let value = match value {
+                    Bson::Document(inner) => Bson::Document(excluded(inner, node)),
+                    Bson::Array(items) => {
+                        let mut items = items.clone();
+                        exclude_elements(&mut items, node);
+                        Bson::Array(items)
+                    }
+                    other => other.clone(),
+                };
+                out.insert(key.clone(), value);
+            }
+        }
+    }
+    out
+}
+
+/// Remove from `doc` every path `tree` excludes, in place.
+fn exclude_fields(doc: &mut Document, tree: &PathTree) {
+    if mostly_removed(doc, tree) {
+        *doc = std::mem::take(doc)
+            .into_iter()
+            .filter(|(key, _)| !tree.field(key).is_some_and(|node| node.whole))
+            .collect();
+    } else if tree.wholes > 0 {
+        for (name, node) in &tree.fields {
+            if node.whole {
+                doc.remove(name);
+            }
+        }
+    }
+    for (name, node) in &tree.fields {
+        if node.whole {
+            continue;
+        }
+        match doc.get_mut(name) {
+            Some(Bson::Document(inner)) => exclude_fields(inner, node),
+            Some(Bson::Array(items)) => exclude_elements(items, node),
+            _ => {}
+        }
+    }
+}
+
+/// An array that an exclusion's path continues through: the rest of the path
+/// is removed from each element that can hold it.
+fn exclude_elements(items: &mut [Bson], node: &PathTree) {
+    for item in items {
+        match item {
+            Bson::Document(inner) => exclude_fields(inner, node),
+            Bson::Array(inner) => exclude_elements(inner, node),
+            _ => {}
+        }
+    }
 }
 
 #[cfg(test)]
@@ -482,15 +695,28 @@ mod tests {
         // change here is a change there.
         assert_eq!(
             parse_projection(&doc! { "a": 2, "b": true, "c": 1.5 }).unwrap(),
-            Some(Projection::Include(vec!["a".into(), "b".into(), "c".into(), "_id".into()]))
+            Some(Projection::Include(
+                vec!["a".into(), "b".into(), "c".into(), "_id".into()].into()
+            ))
         );
         assert_eq!(
             parse_projection(&doc! { "a": 0.0, "b": false }).unwrap(),
-            Some(Projection::Exclude(vec!["a".into(), "b".into()]))
+            Some(Projection::Exclude(vec!["a".into(), "b".into()].into()))
         );
         for bad in [doc! { "a": "1" }, doc! { "a": Bson::Null }, doc! { "a": [1] }] {
             assert!(parse_projection(&bad).is_err(), "{bad:?}");
         }
+    }
+
+    #[test]
+    fn a_dotted_exclusion_beside_an_inclusion_is_still_a_mix() {
+        // A path through an array is an ordinary path to the parser: only
+        // `_id: 0` may sit beside inclusions, not `p._id: 0`, in either order.
+        for spec in [doc! { "a": 1, "p._id": 0 }, doc! { "p._id": 0, "a": 1 }] {
+            let err = parse_projection(&spec).unwrap_err().to_string();
+            assert!(err.contains("cannot mix inclusion and exclusion"), "{spec}: {err}");
+        }
+        assert!(parse_projection(&doc! { "p._id": 1, "_id": 0 }).is_ok());
     }
 
     #[test]
@@ -512,6 +738,247 @@ mod tests {
     fn projecting_a_missing_field_simply_omits_it() {
         let out = projected(doc! { "zzz": 1, "_id": 0 }, doc! { "a": 1 });
         assert_eq!(out, doc! {});
+    }
+
+    /// `assert_eq!` on two documents ignores field order, and the order of an
+    /// element's fields is part of what these tests claim, so they compare
+    /// the rendered text, which keeps it.
+    #[track_caller]
+    fn same(got: Document, want: Document) {
+        assert_eq!(got.to_string(), want.to_string());
+    }
+
+    #[test]
+    fn an_inclusion_through_an_array_keeps_the_array_and_reduces_every_element() {
+        // The worked example: every element, as an array, not the first one
+        // as a document.
+        let stored = doc! { "_id": 7, "p": [{ "_id": 1, "name": "a" }, { "_id": 2, "name": "b" }] };
+        same(
+            projected(doc! { "p._id": 1 }, stored.clone()),
+            doc! {
+                "_id": 7, "p": [{ "_id": 1 }, { "_id": 2 }]
+            },
+        );
+        // Several paths into one array are one array, each element carrying
+        // all of them in the element's own order, whatever order they are
+        // named in.
+        same(
+            projected(doc! { "p.name": 1, "p._id": 1 }, stored.clone()),
+            doc! {
+                "_id": 7, "p": [{ "_id": 1, "name": "a" }, { "_id": 2, "name": "b" }]
+            },
+        );
+        // `_id` excluded, and a top-level field beside the dotted path.
+        let with_name = doc! { "_id": 7, "name": "n", "p": stored.get_array("p").unwrap().clone() };
+        same(
+            projected(doc! { "p.name": 1, "name": 1, "_id": 0 }, with_name),
+            doc! {
+                "name": "n", "p": [{ "name": "a" }, { "name": "b" }]
+            },
+        );
+    }
+
+    #[test]
+    fn an_inclusion_through_an_array_drops_scalars_and_keeps_an_element_missing_the_field() {
+        let stored = doc! {
+            "_id": 1,
+            "p": [{ "x": 1, "y": 2 }, 5, "s", Bson::Null, { "y": 3 }, { "x": [1, 2] }]
+        };
+        same(
+            projected(doc! { "p.x": 1, "_id": 0 }, stored),
+            doc! {
+                "p": [{ "x": 1 }, {}, { "x": [1, 2] }]
+            },
+        );
+        // An array of scalars alone keeps its place, empty.
+        same(projected(doc! { "p.x": 1, "_id": 0 }, doc! { "p": [1, 2, 3] }), doc! { "p": [] });
+        same(projected(doc! { "p.x": 1, "_id": 0 }, doc! { "p": [] }), doc! { "p": [] });
+        // A scalar where the path continues has no field to give, as before.
+        same(projected(doc! { "p.x": 1, "_id": 0 }, doc! { "p": 5 }), doc! {});
+    }
+
+    #[test]
+    fn an_inclusion_through_two_levels_of_array_keeps_both() {
+        let stored = doc! { "a": [
+            { "b": [{ "c": 1, "d": 2 }, { "d": 3 }, 7], "e": 1 },
+            { "b": { "c": 5, "e": 6 } },
+            { "b": { "e": 6 } },
+            3,
+            { "x": 1 },
+        ] };
+        same(
+            projected(doc! { "a.b.c": 1, "_id": 0 }, stored),
+            doc! { "a": [
+                { "b": [{ "c": 1 }, {}] },
+                { "b": { "c": 5 } },
+                // Outside an array a sub-document holding none of the paths is
+                // left out, as it always was; the element itself stays.
+                {},
+                {},
+            ] },
+        );
+    }
+
+    #[test]
+    fn a_nested_array_is_reduced_the_same_way() {
+        let stored =
+            doc! { "p": [[{ "k": 1, "v": 1 }, 5, [{ "k": 2, "v": 2 }]], { "k": 3, "v": 3 }, 4] };
+        same(
+            projected(doc! { "p.k": 1, "_id": 0 }, stored),
+            doc! {
+                "p": [[{ "k": 1 }, [{ "k": 2 }]], { "k": 3 }]
+            },
+        );
+    }
+
+    #[test]
+    fn a_shorter_path_includes_the_field_whole() {
+        let stored = doc! { "_id": 1, "p": [{ "x": 1, "y": 2 }, 5] };
+        for spec in [doc! { "p": 1, "p.x": 1 }, doc! { "p.x": 1, "p": 1 }] {
+            same(projected(spec, stored.clone()), stored.clone());
+        }
+        let mut gone = stored.clone();
+        gone.remove("p");
+        for spec in [doc! { "p": 0, "p.x": 0 }, doc! { "p.x": 0, "p": 0 }] {
+            same(projected(spec, stored.clone()), gone.clone());
+        }
+    }
+
+    #[test]
+    fn a_few_fields_named_over_a_wide_document_are_found_wherever_they_are() {
+        // A tree naming under a quarter of a document's fields asks for each
+        // rather than walking (`include_fields`): none present, one, or
+        // several, at the start, the end, through a sub-document or an array.
+        let mut stored = doc! { "_id": 7 };
+        for f in 0..20 {
+            stored.insert(format!("f{f}"), f);
+        }
+        stored.insert("sub", doc! { "y": 1, "x": 2 });
+        stored.insert("arr", vec![Bson::Document(doc! { "x": 1, "y": 2 }), Bson::Int32(3)]);
+        let cases = [
+            (doc! { "missing": 1 }, doc! { "_id": 7 }),
+            (doc! { "missing": 1, "_id": 0 }, doc! {}),
+            (doc! { "sub.x": 1, "_id": 0 }, doc! { "sub": { "x": 2 } }),
+            (doc! { "sub.zz": 1, "_id": 0 }, doc! {}),
+            (doc! { "arr.x": 1, "_id": 0 }, doc! { "arr": [{ "x": 1 }] }),
+            (doc! { "f19": 1 }, doc! { "_id": 7, "f19": 19 }),
+            (doc! { "f19": 1, "_id": 0 }, doc! { "f19": 19 }),
+            (doc! { "f19": 1, "missing": 1, "f0": 1 }, doc! { "_id": 7, "f0": 0, "f19": 19 }),
+            (doc! { "arr.y": 1, "f3": 1, "_id": 0 }, doc! { "f3": 3, "arr": [{ "y": 2 }] }),
+        ];
+        for (spec, want) in cases {
+            same(projected(spec, stored.clone()), want);
+        }
+    }
+
+    #[test]
+    fn a_level_naming_many_fields_finds_each_by_name() {
+        // Past `SCAN_UP_TO` names a level is indexed rather than scanned; the
+        // answer is the same, through an array as at the top.
+        let names: Vec<String> = (0..12).map(|f| format!("f{f}")).collect();
+        let mut element = Document::new();
+        let mut spec = doc! { "_id": 0 };
+        let mut want_element = Document::new();
+        for (at, name) in names.iter().enumerate() {
+            element.insert(name.clone(), at as i32);
+            element.insert(format!("other{at}"), at as i32);
+            if at % 2 == 0 {
+                spec.insert(format!("p.{name}"), 1);
+                want_element.insert(name.clone(), at as i32);
+            }
+        }
+        // Six named at this level by `p.*`, plus names that are absent.
+        for absent in 0..6 {
+            spec.insert(format!("p.none{absent}"), 1);
+        }
+        let stored = doc! { "_id": 1, "p": [element.clone(), 5, element] };
+        same(projected(spec, stored), doc! { "p": [want_element.clone(), want_element] });
+    }
+
+    #[test]
+    fn a_numeric_segment_names_a_field_in_each_element_not_a_position() {
+        let scalars = doc! { "a": [10, 20, 30] };
+        same(projected(doc! { "a.0": 1, "_id": 0 }, scalars.clone()), doc! { "a": [] });
+        same(projected(doc! { "a.1": 0 }, scalars.clone()), scalars);
+        let named = doc! { "a": [{ "0": "x", "1": "y" }, { "1": "z" }] };
+        same(
+            projected(doc! { "a.0": 1, "_id": 0 }, named.clone()),
+            doc! {
+                "a": [{ "0": "x" }, {}]
+            },
+        );
+        same(projected(doc! { "a.1": 0 }, named), doc! { "a": [{ "0": "x" }, {}] });
+        // In a document it is a field name, as it always was.
+        same(
+            projected(doc! { "a.0": 1, "_id": 0 }, doc! { "a": { "0": 1, "1": 2 } }),
+            doc! {
+                "a": { "0": 1 }
+            },
+        );
+    }
+
+    #[test]
+    fn a_dollar_segment_is_a_field_name_through_an_array_too() {
+        // Not the positional operator (query-language.md): over an array of
+        // documents it reaches a field called `$` in each, and finds none.
+        let stored = doc! { "items": [{ "q": 1 }, { "q": 2 }, 3] };
+        same(projected(doc! { "items.$": 1, "_id": 0 }, stored), doc! { "items": [{}, {}] });
+    }
+
+    #[test]
+    fn an_exclusion_through_an_array_removes_the_path_from_every_element() {
+        let stored = doc! {
+            "_id": 7,
+            "p": [{ "_id": 1, "name": "a" }, 5, { "_id": 2, "name": "b" }, { "other": 1 }]
+        };
+        // Scalars and an element without the field are left as they were.
+        same(
+            projected(doc! { "p.name": 0 }, stored.clone()),
+            doc! {
+                "_id": 7, "p": [{ "_id": 1 }, 5, { "_id": 2 }, { "other": 1 }]
+            },
+        );
+        same(
+            projected(doc! { "p.name": 0, "p._id": 0 }, stored),
+            doc! {
+                "_id": 7, "p": [{}, 5, {}, { "other": 1 }]
+            },
+        );
+    }
+
+    #[test]
+    fn an_exclusion_that_removes_most_of_a_document_answers_the_same() {
+        // More than half of a level's fields removed whole switches it from
+        // removing them to building what stays (`mostly_removed`), at the top
+        // (`_id`, `a`, `b` of four), from a copy (`x`, `y` of an element's
+        // three) and by removal below that (`r` of two). Every level must
+        // answer what the rules say: `a` goes whole beside `a.k`, the path
+        // still reaches into `p`, and `q` stays because `p.q.r` reaches past it.
+        let stored = doc! {
+            "_id": 1, "a": { "k": 1 }, "b": 2,
+            "p": [{ "x": 1, "y": 2, "q": { "r": 1, "s": 2 } }, 3]
+        };
+        let spec = doc! {
+            "_id": 0, "a": 0, "a.k": 0, "b": 0, "p.x": 0, "p.y": 0, "p.q.r": 0
+        };
+        same(projected(spec, stored), doc! { "p": [{ "q": { "s": 2 } }, 3] });
+    }
+
+    #[test]
+    fn an_exclusion_through_two_levels_and_a_nested_array() {
+        let stored = doc! { "a": [
+            { "b": [{ "c": 1, "d": 2 }, 7, [{ "c": 3, "d": 4 }]], "e": 1 },
+            { "b": { "c": 5, "e": 6 } },
+            3,
+        ] };
+        same(
+            projected(doc! { "a.b.c": 0 }, stored),
+            doc! { "a": [
+                { "b": [{ "d": 2 }, 7, [{ "d": 4 }]], "e": 1 },
+                { "b": { "e": 6 } },
+                3,
+            ] },
+        );
     }
 }
 

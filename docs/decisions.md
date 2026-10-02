@@ -23388,3 +23388,172 @@ keyed by the first key only; the union not de-duplicated; the union not sorted;
 the held count counting index entries or not checked; the attached count not
 checked, or counting only the held documents; an input document without the
 field wanting a `null` key.
+
+---
+
+## ADR-214 — A projection through an array keeps the array and projects every element
+
+**Status:** accepted, for the next `0.MINOR`. Breaking, in the shape of an
+answer. A new decision, under the rule ADR-210 applied to `$lookup`'s join
+key: a request the server can honour is answered whole, and one it cannot is
+refused; it is never answered in part, in the shape of a whole answer.
+
+**The defect.** Over `{_id: 7, p: [{_id: 1, name: "a"}, {_id: 2, name: "b"}]}`,
+`find` with the projection `{"p._id": 1}` answered `{_id: 7, p: {_id: 1}}` with
+a `200`: the first element alone, and the array turned into a document. The
+inclusion branch of `shape::project` resolved each path, which through an
+array yields one value per element, kept `.first()`, and wrote it back with
+`path::set`, which builds documents. The `$project` stage, `find_and_modify`
+and the MCP `find` and `aggregate` tools shape through the same function, so
+all of them answered the same. The exclusion branch had the twin defect the
+other way: `path::unset` crosses an array only by numeric index, so
+`{"p.name": 0}` removed nothing, and `{"a.1": 0}` over `[1, 2, 3]` left a
+`null` hole at a position. Nothing in the docs said either. It is the class of
+the `$lookup` that read only the first element of a join key: a partial
+answer in a whole answer's shape.
+
+**Decision.**
+
+- **A projection walks the document and its paths together, segment by
+  segment, and a path that meets an array applies its remaining segments to
+  every element.** That is the reading a filter path has (query-language.md,
+  "Paths traverse into arrays") and that an expression field path has
+  (ADR-116), so all three agree on what `p._id` reaches.
+- **The array is kept, in its own order.** An inclusion reduces each element
+  that is a document to the included sub-paths, and keeps one that holds none
+  of them as `{}`, so the array keeps one entry per document it held. An
+  element that is not a document has no such sub-path and is dropped: an
+  array of scalars comes back `[]`. An element that is an array is reduced by
+  the same rule and stays an array, at any depth.
+- **An exclusion removes the sub-path from every element that is a document**,
+  recurses into one that is an array, and leaves every other element as it
+  was.
+- **Several paths are one walk.** The paths are built into a tree of segments
+  (`PathTree`) once, when the projection is parsed, and every document the
+  request shapes walks that one tree, so `{"p._id": 1, "p.name": 1}` is
+  one array whose elements carry both, not two writes into one place. Where
+  one path is a prefix of another, the shorter decides: the field is included,
+  or removed, whole, whichever is written first.
+- **A segment is a field name throughout.** `a.0` names a field called `0`
+  inside each element of `a`. A filter also reads a numeric segment as a
+  position; a projection cannot, because a position picks one element and the
+  rule above keeps all of them, so a projection path that meant a position
+  would reach both readings at once and answer neither. There is no
+  projection that selects by position; `$slice` in a pipeline does that.
+- **An inclusion's fields come out in the document's order**, at every level,
+  because the walk follows the document. The reordering pass that followed
+  the old path-by-path build (`in_document_order`) has nothing left to do and
+  is removed.
+- **Outside an array, nothing changes.** A sub-document that holds none of the
+  included paths is left out, as it always was; an element of an array is the
+  one place an empty `{}` is kept, so the array's length says how many
+  documents it held. A `$project` field computed *into* a kept array through
+  a named segment has no single place to go and is refused, `400`, by the same
+  `path::set` check that refuses it under `$addFields`; before, it was written
+  into the document that stood in for the array. Through a numeric segment
+  `path::set` writes by position, as it does under `$addFields` and in an
+  update: `{"p._id": 1, "p.0": "$qty"}` replaces element `0` of the kept
+  array. The write follows the write rules, not the projection's reading, and
+  that is not changed here.
+- **Projection operators stay refused** by name (`$slice`, `$elemMatch`), and
+  `$` in a projection path stays a literal field name, so `{"items.$": 1}`
+  over an array of documents answers `items: [{}, …]`.
+
+**Why.** The old answer was not a choice anyone made: the comment above
+`.first()` said a projection names one destination, which is true of
+`path::set` and not of a projection, whose destination is the shape it
+reads. A caller reading `p` got a document where the stored value was an
+array and one element where there were several, and nothing told them. The
+shape that keeps the array is the one every other reader of a path through
+an array already uses here.
+
+**Rejected.**
+
+- *Refuse a projection path that crosses an array.* Honest, and it would
+  refuse the commonest projection over embedded lists, which the server can
+  answer.
+- *Fan out into a flat array of the leaf values* (`p: [1, 2]` for `p._id`).
+  It is what an expression path yields (ADR-116), but a projection reshapes a
+  document rather than computing a value, and a flat array loses which element
+  each value came from as soon as one element lacks the field.
+- *Keep scalar elements in an inclusion.* They hold none of the included
+  sub-paths; keeping them would answer fields nobody included.
+- *Keep the positional reading of a numeric segment for exclusion.* It would
+  make `{"a.0": 1}` and `{"a.0": 0}` address different values.
+
+**Cost.** The tree is built once per request, in `parse_projection`, and kept
+in `Projection` (`ProjectionPaths`). A level naming eight fields or fewer finds
+one by comparing names, and a wider level by a hash lookup. An inclusion
+walks the document once and stops when every field the tree names at that
+level has been met. When the tree names under a quarter of a document's
+fields it asks the document for each first: none present is an empty answer,
+one is answered without a walk, and otherwise the walk stops at the last one
+present. An exclusion copies the document and removes what goes, as before,
+unless more than half of a document's fields go, when it builds the fields
+that stay instead: a document keeps its fields in order, so each removal
+shifts every later field and many removals from a wide document cost their
+product. A first build rebuilt the tree for every document and searched its
+children in a list, and a second walked every field for a projection naming
+one; both were measured slower than the code they replaced. Measured over
+10,000 documents of `w` integer fields (the last a sub-document `{y, x}` in
+the narrow rows), a release build, the least of five rounds of best-of-five,
+against the code before this change:
+
+| Projection | before | after |
+|---|---|---|
+| include all 25 | 46 ms | 12 ms |
+| exclude all 25 | 23 ms | 3 ms |
+| include all 200 | 776 ms | 93 ms |
+| exclude all 200 | 599 ms | 20 ms |
+| include all 500 | 3.32 s | 250 ms |
+| exclude all 500 | 2.88 s | 63 ms |
+| include 2 of 500, at the start / the end | 47 / 59 ms | 2 / 38 ms |
+| exclude 2 of 500, at the start / the end | 113 / 81 ms | 109 / 78 ms |
+| include 12, 13, 40 of 500, at the end | 83, 89, 134 ms | 68, 74, 80 ms |
+| exclude 12, 13, 40 of 500, at the end | 87, 85, 112 ms | 82, 82, 104 ms |
+| include one absent field of 500 (of 50) | 42 (3.5) ms | 1.0 (0.9) ms |
+| the same with `_id: 0` | 38 (1.8) ms | 0.1 (0.2) ms |
+| include the last field of 500 (of 50) | 50 (5.1) ms | 43 (3.9) ms |
+| the same with `_id: 0` | 47 (3.8) ms | 1.3 (1.3) ms |
+| include `sub.x`, the last field, of 500 (of 50) | 39 (6.7) ms | 37 (4.6) ms |
+| exclude one absent, or the last, field of 500 | 84 ms | 80 ms |
+
+`path::set` and `path::unset` are untouched: updates keep their own rules for
+arrays.
+
+### Test
+
+`kimmy-query` unit tests: the worked example; inclusion and exclusion through
+one and two levels of array and through a nested array; scalars in the array,
+an array of scalars alone, and a scalar where the path continues; an element
+missing the field; two paths into one array in either order, with `_id`
+dropped and a top-level field beside them, asserting the element's field
+order; a shorter path beside a longer one in either order; a numeric segment
+over scalars, over documents with numeric field names, and in a sub-document;
+`items.$` over an array; `{"a": 1, "p._id": 0}` refused as a mix in either
+order. `$project` through an array with and without a computed field, a
+computed field into the kept array through a named segment refused, and one
+through a numeric segment written by position, as under `$addFields`. A
+property test (`tests/projection_through_arrays.rs`, 4,000 cases each) over
+generated documents and paths, numeric field names among them: an inclusion
+is a sub-document of the stored one, element by element and in order, and
+reads back every included value the stored document gives at each path; an
+exclusion is a sub-document, gives nothing at an excluded path, and gives the
+stored values at every unrelated path. A differential
+(`tests/projection_reference.rs`, 5,000 cases each) compares `project` with a
+reference projector written from the rules alone, exactly and in field order,
+over documents and paths with numeric segments and `_id`; it reaches both of
+an exclusion's ways of removing fields, and a unit test reaches both in one
+document. `kimmy-api` drives `find`, `$project`
+and `find_and_modify`, inclusion and exclusion, two levels down, and a sort
+with a `limit` whose projection drops the sort key, in both directions and
+through `find_and_modify`; `kimmy-mcp` drives the `find` and `aggregate`
+tools. Each guard was broken and a test failed: `.first()` restored; the array
+answered as a document; nested arrays flattened into the outer one; scalar
+elements kept; an element holding none of the paths dropped instead of kept
+as `{}`; the walk not entering arrays, for inclusion and for exclusion; the
+inclusion or the exclusion not recursing into a nested array; a sub-document
+holding none of the paths kept as `{}` outside an array; the shorter path not
+winning, in the tree and in each walk; fields put in specification order. The
+`kimmy-api` and `kimmy-mcp` tests fail on the code before this change, with
+the first element answered as a document.

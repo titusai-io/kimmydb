@@ -360,9 +360,12 @@ Which leads directly to the `$elemMatch` distinction:
 
 A numeric segment is read both ways: `{"items.0.sku": "a"}` matches when the
 first element's `sku` is `"a"` *or* when any element has a field named `0`
-whose `sku` is. That is a filter rule only — in an aggregation expression
-`$items.0.sku` is a field name and never a position; see
-[aggregation.md](aggregation.md#arrays).
+whose `sku` is. A [sort](#sort-and-projection) key reads it the same two
+ways, and an [update](#update-operators) path writes by position. That is not
+every path's rule: a [projection](#sort-and-projection) path and an
+aggregation expression read a numeric segment as a field name only, never a
+position — `{"items.0": 1}` and `$items.0.sku` both name a field called `0`
+in each element; see [aggregation.md](aggregation.md#arrays).
 
 ### 3. Comparisons do not cross type groups
 
@@ -846,7 +849,58 @@ included by default and this is how to turn that off. The other direction,
 `{"_id": 1, "note": 0}`, is refused — `a projection cannot mix inclusion and
 exclusion (except excluding _id)` — since an exclusion projection already
 keeps `_id`, and naming it adds an inclusion to a list of exclusions.
-Projection reaches nested paths (`"a.b": 1`).
+Projection reaches nested paths (`"a.b": 1`). An inclusion answers its fields
+in the order the document holds them, at every level, not the order the
+projection names them, and `_id` stays where the document has it.
+
+**A path through an array keeps the array and applies the rest of the path
+to every element**, the way a [filter path](#2-paths-traverse-into-arrays)
+reaches every element. A projection never turns an array into something
+else, and never answers part of one:
+
+```javascript
+// Stored
+{ "_id": 7, "p": [ { "_id": 1, "name": "a", "qty": 3 }, 5, { "qty": 4 }, { "_id": 2, "name": "b" } ] }
+
+{ "projection": { "p._id": 1 } }
+// { "_id": 7, "p": [ { "_id": 1 }, {}, { "_id": 2 } ] }
+
+{ "projection": { "p._id": 1, "p.name": 1, "_id": 0 } }
+// { "p": [ { "_id": 1, "name": "a" }, {}, { "_id": 2, "name": "b" } ] }
+
+{ "projection": { "p.qty": 0 } }
+// { "_id": 7, "p": [ { "_id": 1, "name": "a" }, 5, {}, { "_id": 2, "name": "b" } ] }
+```
+
+- **Inclusion** reduces each element that is a document to the included
+  sub-paths. An element holding none of them stays, as `{}`, so the array
+  keeps one entry per document it held. An element that is not a document —
+  a number, a string, `null` — has no such sub-path and is **dropped**, so an
+  array of scalars alone comes back `[]`.
+- **Exclusion** removes the sub-path from each element that is a document,
+  and leaves every other element, and every element without the field, as it
+  was.
+- **Nested arrays recurse**: an element that is itself an array is reduced, or
+  has the path removed from its elements, by the same rules, and stays an
+  array. Two levels of array (`"a.b.c"` with `a` and `b` both arrays) keep
+  both.
+- **Several paths into one array are one array.** `{"p._id": 1, "p.name": 1}`
+  gives each element both fields, in the element's own order, and names
+  beside it at the top level (`{"name": 1, "p._id": 1}`) are unaffected.
+- **A shorter path wins.** `{"p": 1, "p._id": 1}` includes `p` whole, and
+  `{"p": 0, "p._id": 0}` removes it, whichever is written first.
+- **A numeric segment is a field name, never a position.** `{"a.0": 1}`
+  names a field called `0` inside each element of `a`, so over `a: [10, 20]`
+  it answers `a: []`, and `{"a.1": 0}` leaves `[10, 20]` as it was. A filter
+  reads a numeric segment both ways; a projection keeps every element, so it
+  takes only the field-name reading, which is also the one an [aggregation
+  expression](aggregation.md#arrays) takes. No projection selects an element
+  by position; `$slice` in a pipeline does that.
+- **Outside an array, an inclusion leaves out a sub-document that holds none
+  of the paths**: `{"a.b": 1}` over `{a: {c: 1}}` answers no `a` at all,
+  where an element of an array would be `{}`. A field the path cannot
+  continue through — a number where `a.b` needs a document — is left out
+  the same way.
 
 A value is read as a flag, not as the literal `0` or `1`: any non-zero number
 or `true` includes, `0`, `0.0` and `false` exclude, and a string, `null`, an
@@ -859,8 +913,9 @@ are no projection operators; reshape an array in an
 
 **`$` in a find projection path is not the positional operator.** A projection
 path is read literally, so `{"items.$": 1}` names a field called `$` inside
-`items`, finds none, and projects nothing: the request succeeds and the field
-is simply absent from the result. The refusal of `$` under [positional
+`items` and finds none: the request succeeds, and when `items` is an array
+each document element comes back `{}` (`items: [{}, {}]`) by the array rule
+above; when it is a document, `items` is absent. The refusal of `$` under [positional
 updates](#positional-updates) is a rule about *update* paths and does not
 reach projections.
 

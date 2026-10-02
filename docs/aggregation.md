@@ -22,7 +22,7 @@ can answer it, which only a *leading* `$match` gets (see
 | Stage | Notes |
 |---|---|
 | `$match` | The same filter language as `find` — every operator it has, `$expr` and `$mod` included. **Planned like `find` when it is the first stage** |
-| `$project` | The same projection language as `find`, **plus computed fields** |
+| `$project` | The same [projection language](query-language.md#sort-and-projection) as `find`, a path through an array included, **plus computed fields**. Below |
 | `$addFields`, `$set` | Add computed fields, keeping everything else. Two names for one stage |
 | `$replaceRoot` | `{$replaceRoot: {newRoot: <expression>}}` — the computed document becomes the document |
 | `$sort` | The same [sort language](query-language.md#sort-and-projection), down to which element a key through an array reads. [Blocking](#the-memory-limit) |
@@ -59,6 +59,36 @@ is read. `[0]["n"]` after a `$count` is always there, so a total needs no
 defensive read; `[0]` after a `$group` may not be, so a pipeline ending in
 `$group` can legitimately answer `[]`, and `{"_id": null}` is not a promise of
 one row.
+
+### `$project`
+
+The flags are `find`'s projection, rule for rule — one implementation serves
+both — so **a path through an array keeps the array and reduces every
+element** ([Query language](query-language.md#sort-and-projection)):
+
+```json
+// Stored: { "_id": 7, "p": [ { "_id": 1, "name": "a" }, 5, { "_id": 2, "name": "b" } ] }
+
+{ "$project": { "p._id": 1 } }
+// { "_id": 7, "p": [ { "_id": 1 }, { "_id": 2 } ] }
+
+{ "$project": { "p.name": 0 } }
+// { "_id": 7, "p": [ { "_id": 1 }, 5, { "_id": 2 } ] }
+
+{ "$project": { "p._id": 1, "count": { "$size": "$p" } } }
+// { "_id": 7, "p": [ { "_id": 1 }, { "_id": 2 } ], "count": 3 }
+```
+
+A computed field reads the input document, not the projection's output, and
+is written after the flags are applied. A computed field written *into* the
+kept array through a named segment — `{"p._id": 1, "p.total": …}` with `p` an
+array — has no one place to go and is refused, `400`, `cannot set "p.total"`,
+as `$addFields` refuses it; it is not written into a document standing in for
+the array. **A numeric segment is the exception, and it is a position:** a
+computed field is written the way an update writes, so `{"p._id": 1, "p.0":
+"$qty"}` over `p: [{_id: 1}, {_id: 2}]` and `qty: 2` replaces element `0` and
+answers `p: [2, {_id: 2}]`, exactly as `$addFields` with `"p.0"` does. The
+flags beside it read `p.0` as a field name; the write does not.
 
 ### `$unwind`
 
@@ -373,9 +403,12 @@ is flattened further:** `$a.b` over `a: [{b: [1, 2]}, {b: 3}]` is `[[1, 2], 3]`
 1}, {c: 2}]}]` is `[[1, 2]]`. `$reduce` with `$concatArrays` flattens a level
 when that is what you want. **A numeric segment is a field name here, never an
 index:** `$items.0.sku` reads the field called `0` of each element and finds
-nothing; `{$arrayElemAt: ["$items", 0]}` is the element. That is the one place
-an expression path and a filter path disagree — the filter language reads
-`items.0` both ways — and `$unwind`, `$sort` and `$lookup`'s `localField` and
+nothing; `{$arrayElemAt: ["$items", 0]}` is the element. A
+[projection](query-language.md#sort-and-projection) path — `$project`'s flags,
+and `find`'s — reads it the same way, as a field name in each element. The
+filter language and a sort key read `items.0` both ways, and an update path
+writes by position; that is where an expression path and a filter path
+disagree — and `$unwind`, `$sort` and `$lookup`'s `localField` and
 `foreignField` name a field rather than compute one, so they do not fan out.
 **`$unwind` also has to write each expanded element back to its path**, not
 only read it, and a path crossing an array by a named segment has no single
