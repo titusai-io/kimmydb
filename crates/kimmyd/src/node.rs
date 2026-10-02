@@ -709,6 +709,9 @@ async fn start_and_serve(
             .mark(kimmy_cluster::CatchUpReason::SeededEmpty)
             .context("writing the catching-up marker")
             .map_err(failed_before_open)?;
+        // This run created the store: it has no history of its own origin to
+        // have lost, which the clear's owed hold reads (ADR-212).
+        catch_up.note_store_created_this_run();
     }
     if let Ok(value) = std::env::var("KIMMY_TEST_OPEN_STEP_MS") {
         let ms = value.parse::<u64>().ok();

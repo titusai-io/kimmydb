@@ -2555,42 +2555,27 @@ async fn a_fresh_member_seeded_only_with_itself_is_not_marked_and_one_with_anoth
 /// once the wait runs out. It must never clear by the mutual clear against itself,
 /// which it did before the transport refused a contact with its own node id, before
 /// HTTP served.
-#[tokio::test]
-async fn a_member_whose_seed_reaches_itself_is_not_cleared_by_itself() {
-    let dir = tempfile::tempdir().unwrap();
-    let client = reqwest::Client::new();
+///
+/// The wait counts from the member's first sync tick, so a slow open cannot use it
+/// up, but a runner stalled after that can. Each half is therefore asserted of a
+/// member whose wait does not decide it: the marked state of one whose wait is far
+/// longer than the test, and `unknown`, which holds from then on, of one whose wait
+/// is short.
+async fn spawn_self_seeded(dir: &Path, name: &str, wait: u64) -> Run {
     let cluster = ports::choose();
-    let mut run =
-        Run::spawn_clustered_at(dir.path(), "self-seeded", "0.0.0.0", cluster, &[cluster], 3);
-    let deadline = Instant::now() + PATIENCE;
-    while run.http.get().is_none() {
-        let bound = ports::bound_http_port(&run.stdout, ports::BOUND_HTTP_LINE, run.pid, &[]);
-        if let Ok(Some(port)) = ports::LineWait::default().judge(bound, ports::BOUND_HTTP_LINE) {
-            let _ = run.http.set(port);
-        }
-        assert!(Instant::now() < deadline, "no port; log: {}", run.log());
-        tokio::time::sleep(POLL).await;
-    }
-    until_ready_is(&run, &client, "503 catching_up seeded_empty", |status, header, _| {
-        status == 503 && header.as_deref() == Some("seeded_empty")
-    })
-    .await;
-    // Longer than the discovery interval, so it has dialled itself more than once.
-    tokio::time::sleep(Duration::from_millis(2_500)).await;
-    until_ready_is(&run, &client, "200 unknown", |status, header, _| {
-        status == 200 && header.as_deref() == Some("unknown")
-    })
-    .await;
+    let run = Run::spawn_clustered_at(dir, name, "0.0.0.0", cluster, &[cluster], wait);
+    until_bound(&run).await;
+    run
+}
+
+/// Never cleared by itself, and the self-contact is not a failed round.
+async fn assert_not_cleared_by_itself(run: &Run, client: &reqwest::Client, dir: &Path) {
     let log = run.log();
-    assert!(
-        log.contains("a connection reached a node with this node's own id"),
-        "the self-contact is said once: {log}"
-    );
     assert!(
         !log.contains("the catching-up marker was cleared"),
         "a member cleared its own marker against itself: {log}"
     );
-    assert!(catching_up_marker(dir.path()).is_some(), "still set");
+    assert!(catching_up_marker(dir).is_some(), "still set");
     // It is not a peer that failed: no failed round counted, no back-off, and no
     // warning per tick.
     let port = *run.http.get().unwrap();
@@ -2607,6 +2592,46 @@ async fn a_member_whose_seed_reaches_itself_is_not_cleared_by_itself() {
         "a self-contact was counted as a failed round:\n{page}"
     );
     assert!(!log.contains("sync round failed"), "and warned about: {log}");
+}
+
+/// The marked half: with a wait that cannot run out, the member stays `503`
+/// `seeded_empty` after it has dialled itself more than once.
+#[tokio::test]
+async fn a_member_whose_seed_reaches_itself_stays_marked_and_is_not_cleared_by_itself() {
+    let dir = tempfile::tempdir().unwrap();
+    let client = reqwest::Client::new();
+    let mut run = spawn_self_seeded(dir.path(), "self-seeded", 3600).await;
+    until_ready_is(&run, &client, "503 catching_up seeded_empty", |status, header, _| {
+        status == 503 && header.as_deref() == Some("seeded_empty")
+    })
+    .await;
+    // It has dialled itself: the contact is said once, and ended.
+    let deadline = Instant::now() + PATIENCE;
+    while !run.log().contains("a connection reached a node with this node's own id") {
+        assert!(Instant::now() < deadline, "no self-contact; log: {}", run.log());
+        tokio::time::sleep(POLL).await;
+    }
+    // Longer than the discovery interval, so it has dialled itself more than once.
+    tokio::time::sleep(Duration::from_millis(2_500)).await;
+    let (status, header, _) = readyz(&run, &client).await;
+    assert_eq!((status, header.as_deref()), (503, Some("seeded_empty")), "{}", run.log());
+    assert_not_cleared_by_itself(&run, &client, dir.path()).await;
+    run.signal("TERM");
+    assert!(run.wait_exit().success());
+}
+
+/// The `unknown` half: with a short wait and nobody else reached, it serves as
+/// `unknown` with the marker still set.
+#[tokio::test]
+async fn a_member_whose_seed_reaches_itself_serves_as_unknown_with_the_marker_set() {
+    let dir = tempfile::tempdir().unwrap();
+    let client = reqwest::Client::new();
+    let mut run = spawn_self_seeded(dir.path(), "self-seeded-short", 3).await;
+    until_ready_is(&run, &client, "200 unknown", |status, header, _| {
+        status == 200 && header.as_deref() == Some("unknown")
+    })
+    .await;
+    assert_not_cleared_by_itself(&run, &client, dir.path()).await;
     run.signal("TERM");
     assert!(run.wait_exit().success());
 }

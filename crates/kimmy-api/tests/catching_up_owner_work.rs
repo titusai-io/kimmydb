@@ -144,6 +144,7 @@ fn owner_work_stays_off_past_the_bound() {
     let (engine, meta) = fixture(&dir);
     let marker_dir = tempfile::tempdir().unwrap();
     let catch_up = CatchUp::open(marker_dir.path(), Duration::from_millis(1));
+    catch_up.first_tick(std::time::Instant::now());
     catch_up.mark(CatchUpReason::SeededEmpty).unwrap();
     std::thread::sleep(Duration::from_millis(30));
     assert!(catch_up.unknown(std::time::Instant::now()), "the wait has run out");
@@ -228,4 +229,100 @@ async fn the_expiry_loop_reads_the_marker_from_the_state() {
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
     looping.abort();
+}
+
+/// Drive `catch_up` into `unknown (owed)` with virtual instants (ADR-212): B
+/// (node 1) reached and answered, C (node 2) listed live and never answering,
+/// judged five seconds after the arming and past C's hold.
+fn into_owed_replay(catch_up: &CatchUp) {
+    use kimmy_cluster::catchup::{Decision, Reached, ReplayTick, Tick, UnknownCause};
+    use kimmy_core::{Hlc, NodeId, VersionVector};
+    let id = |n: u8| NodeId::from_bytes([n; 16]);
+    let (me, b, c) = (id(9), id(1), id(2));
+    let members = Members::default();
+    members.insert_for_test("127.0.0.1:7001".parse().unwrap(), b);
+    members.insert_for_test("127.0.0.1:7002".parse().unwrap(), c);
+    let live = members.node_ids();
+    let mut servable = VersionVector::new();
+    servable.insert(b, Hlc::new(100, 0));
+    let mut mine = servable.clone();
+    mine.insert(me, Hlc::new(200, 0));
+    let reached = [Reached { node: b, servable, witnessed: None, facts: None }];
+    let t0 = std::time::Instant::now();
+    catch_up.arm_replay_at(Hlc::new(50, 0), None, t0).unwrap();
+    catch_up.replay_finished(b);
+    for at in [5, 130] {
+        let now = t0 + Duration::from_secs(at);
+        catch_up.replay_note_members(&ReplayTick {
+            me,
+            members: Some(&members),
+            reached: &reached,
+            expected_members: None,
+            now,
+        });
+        catch_up.replay_settle();
+        let decision = catch_up.evaluate(&Tick {
+            me,
+            reached: &reached,
+            mine_witnessed: &mine,
+            mine_servable: &mine,
+            snapshot_pending: false,
+            live: Some(&live),
+            expected_members: None,
+            now,
+        });
+        assert_eq!(decision, Decision::Kept, "{at} s");
+    }
+    assert_eq!(
+        catch_up.unknown_because(t0 + Duration::from_secs(130)),
+        Some(UnknownCause::OwedReplay),
+        "premise: C owes the replay past its hold"
+    );
+}
+
+/// A restored member serving as `unknown` because a member owes it the replay.
+fn owed() -> (Arc<CatchUp>, tempfile::TempDir) {
+    let dir = tempfile::tempdir().unwrap();
+    kimmy_cluster::catchup::write_marker(dir.path(), CatchUpReason::Restored).unwrap();
+    let catch_up = CatchUp::open(dir.path(), Duration::from_secs(120));
+    into_owed_replay(&catch_up);
+    (catch_up, dir)
+}
+
+/// Serving as `unknown (owed)` (ADR-212), the gate is open but the marker is set,
+/// so TTL expiry deletes nothing.
+#[test]
+fn expiry_deletes_nothing_while_owed_the_replay() {
+    let dir = tempfile::tempdir().unwrap();
+    let (engine, meta) = fixture(&dir);
+    let (catch_up, _marker_dir) = owed();
+    assert!(!catch_up.gated(std::time::Instant::now()), "premise: the gate is open");
+    let owners = Owners::over(engine.node_id(), None).gated_by(Some(catch_up));
+    assert!(!owners.owns_ttl(&meta));
+    assert_eq!(pass_with(&engine, &owners, physical_now_ms()).deleted, 0);
+    assert_eq!(remaining(&engine, &meta), DOCS);
+}
+
+/// The same for embeddings.
+#[test]
+fn embeddings_are_not_owned_while_owed_the_replay() {
+    let dir = tempfile::tempdir().unwrap();
+    let (engine, _meta) = fixture(&dir);
+    let (catch_up, _marker_dir) = owed();
+    let owners = Owners::over(engine.node_id(), None).gated_by(Some(catch_up));
+    for key in ["app/docs", "app/notes", "shop/items"] {
+        assert!(!owners.owns_embedding(key), "{key}");
+    }
+}
+
+/// The same for webhook dispatch.
+#[test]
+fn webhooks_are_not_delivered_while_owed_the_replay() {
+    let dir = tempfile::tempdir().unwrap();
+    let (engine, _meta) = fixture(&dir);
+    let (catch_up, _marker_dir) = owed();
+    let owners = Owners::over(engine.node_id(), None).gated_by(Some(catch_up));
+    for id in ["wh_a", "wh_b", "wh_c"] {
+        assert!(!owners.owns_subscription(id), "{id}");
+    }
 }

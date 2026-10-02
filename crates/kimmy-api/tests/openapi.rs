@@ -2199,3 +2199,116 @@ fn walk_refs(root: &Value, node: &Value, dangling: &mut Vec<String>) {
         _ => {}
     }
 }
+
+/// Drive `catch_up` into `unknown (owed)` with virtual instants (ADR-212): B
+/// (node 1) reached and answered, C (node 2) listed live and never answering,
+/// judged five seconds after the arming and past C's hold.
+fn into_owed_replay(catch_up: &kimmy_cluster::catchup::CatchUp) {
+    use kimmy_cluster::catchup::{Decision, Reached, ReplayTick, Tick, UnknownCause};
+    use kimmy_core::{Hlc, NodeId, VersionVector};
+    let id = |n: u8| NodeId::from_bytes([n; 16]);
+    let (me, b, c) = (id(9), id(1), id(2));
+    let members = kimmy_cluster::Members::default();
+    members.insert_for_test("127.0.0.1:7001".parse().unwrap(), b);
+    members.insert_for_test("127.0.0.1:7002".parse().unwrap(), c);
+    let live = members.node_ids();
+    let mut servable = VersionVector::new();
+    servable.insert(b, Hlc::new(100, 0));
+    let mut mine = servable.clone();
+    mine.insert(me, Hlc::new(200, 0));
+    let reached = [Reached { node: b, servable, witnessed: None, facts: None }];
+    let t0 = std::time::Instant::now();
+    catch_up.arm_replay_at(Hlc::new(50, 0), None, t0).unwrap();
+    catch_up.replay_finished(b);
+    for at in [5, 130] {
+        let now = t0 + std::time::Duration::from_secs(at);
+        catch_up.replay_note_members(&ReplayTick {
+            me,
+            members: Some(&members),
+            reached: &reached,
+            expected_members: None,
+            now,
+        });
+        catch_up.replay_settle();
+        let decision = catch_up.evaluate(&Tick {
+            me,
+            reached: &reached,
+            mine_witnessed: &mine,
+            mine_servable: &mine,
+            snapshot_pending: false,
+            live: Some(&live),
+            expected_members: None,
+            now,
+        });
+        assert_eq!(decision, Decision::Kept, "{at} s");
+    }
+    assert_eq!(
+        catch_up.unknown_because(t0 + std::time::Duration::from_secs(130)),
+        Some(UnknownCause::OwedReplay),
+        "premise: C owes the replay past its hold"
+    );
+}
+
+/// `/readyz` while the catching-up marker is set (ADR-212): the 503 of a gated
+/// member that is owed the replay, and the 200 of a member serving as `unknown`
+/// for each cause, each validated against the schema the specification declares
+/// for it. The conformance run above reaches only a member with no marker.
+#[tokio::test]
+async fn readyz_while_catching_up_matches_its_documented_responses() {
+    use kimmy_cluster::catchup::{CatchUp, ReplayTick};
+    use kimmy_cluster::{CatchUpReason, Members};
+
+    // Gated, with a member owing the replay: the 503 names it.
+    let server = Server::start().await;
+    let marker = tempfile::tempdir().unwrap();
+    kimmy_cluster::catchup::write_marker(marker.path(), CatchUpReason::Restored).unwrap();
+    let catch_up = CatchUp::open(marker.path(), std::time::Duration::from_secs(120));
+    server.state.set_catch_up(Arc::clone(&catch_up));
+    let members = Members::default();
+    members.insert_for_test(
+        "127.0.0.1:7002".parse().unwrap(),
+        kimmy_core::NodeId::from_bytes([2; 16]),
+    );
+    let now = std::time::Instant::now();
+    catch_up.arm_replay_at(kimmy_core::Hlc::new(50, 0), None, now).unwrap();
+    let nobody: [kimmy_cluster::catchup::Reached; 0] = [];
+    catch_up.replay_note_members(&ReplayTick {
+        me: kimmy_core::NodeId::from_bytes([9; 16]),
+        members: Some(&members),
+        reached: &nobody,
+        expected_members: None,
+        now,
+    });
+    let gated = server.request("GET", "/readyz", None, None).await;
+    assert_eq!(gated.status, 503);
+    let body = gated.json();
+    validate_response("GET", "/readyz", 503, &body);
+    assert!(body.get("owed_members").is_some(), "{body}");
+
+    // Serving as unknown, owed the replay.
+    let server = Server::start().await;
+    let marker = tempfile::tempdir().unwrap();
+    kimmy_cluster::catchup::write_marker(marker.path(), CatchUpReason::Restored).unwrap();
+    let catch_up = CatchUp::open(marker.path(), std::time::Duration::from_secs(120));
+    server.state.set_catch_up(Arc::clone(&catch_up));
+    into_owed_replay(&catch_up);
+    let owed = server.request("GET", "/readyz", None, None).await;
+    assert_eq!(owed.status, 200);
+    let body = owed.json();
+    validate_response("GET", "/readyz", 200, &body);
+    assert_eq!(body["unknown_because"], "owed_replay", "{body}");
+
+    // Serving as unknown, with no counting peer for the wait.
+    let server = Server::start().await;
+    let marker = tempfile::tempdir().unwrap();
+    kimmy_cluster::catchup::write_marker(marker.path(), CatchUpReason::SeededEmpty).unwrap();
+    let catch_up = CatchUp::open(marker.path(), std::time::Duration::from_millis(1));
+    catch_up.first_tick(std::time::Instant::now());
+    server.state.set_catch_up(catch_up);
+    tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+    let unknown = server.request("GET", "/readyz", None, None).await;
+    assert_eq!(unknown.status, 200);
+    let body = unknown.json();
+    validate_response("GET", "/readyz", 200, &body);
+    assert_eq!(body["unknown_because"], "no_counting_peer", "{body}");
+}

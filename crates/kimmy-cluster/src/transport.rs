@@ -1309,9 +1309,17 @@ where
                 "the peer holds writes this member made and no longer holds; it is marked \
                  restored until it has caught up, and reads them back"
             );
-            catch_up.mark(crate::facts::CatchUpReason::Restored).map_err(|e| {
-                ProtocolError::Local(format!("writing the catching-up marker: {e}"))
-            })?;
+            let lost_max = lost.iter().map(|entry| entry.stamp.hlc).max().unwrap_or_default();
+            catch_up
+                .mark_proven(
+                    crate::facts::CatchUpReason::Restored,
+                    their_node,
+                    lost_max,
+                    std::time::Instant::now(),
+                )
+                .map_err(|e| {
+                    ProtocolError::Local(format!("writing the catching-up marker: {e}"))
+                })?;
             let outcome = kimmy_storage::blocking(|| engine.apply_batch(&lost))
                 .map_err(|e| ProtocolError::Local(e.to_string()))?;
             if outcome.unknown.is_some() || outcome.purge_pending > 0 {
@@ -7147,6 +7155,172 @@ mod tests {
         assert!(progress.is_complete(), "premise: the one page was the last");
         stalls.snapshots.insert(peer, progress);
         assert!(!stalls.snapshot_pending(None), "complete");
+    }
+
+    /// ADR-212: A replay whose lost entries name a collection this
+    /// member cannot take yet (its creation waits for this member's drop purger)
+    /// returns from each round with the peer unanswered: past the peer's hold the
+    /// member serves as `unknown (owed)`, and the rounds that prove the same lost
+    /// entries again neither gate it again nor wake its streams. Once the
+    /// collection can be taken, the next round answers and a covering tick clears
+    /// the member.
+    #[tokio::test]
+    async fn a_replay_stuck_on_a_collection_not_here_yet_serves_as_unknown_and_does_not_flap() {
+        use crate::catchup::{CatchUp, Decision, Reached, ReplayTick, Tick, UnknownCause};
+        use tokio::io::DuplexStream;
+
+        let dir = tempfile::tempdir().unwrap();
+        let engine = Engine::open(&dir.path().join("kimmy.redb")).unwrap();
+        let me = engine.node_id();
+        // The collection the lost entries name was dropped here, and its purge is
+        // still to run.
+        let old = engine.create_collection("shop", "gone").unwrap();
+        engine.insert(&old, bson::doc! { "_id": 1 }).unwrap();
+        engine.drop_collection("shop", "gone").unwrap();
+        let at_open = engine.own_position_at_open();
+        // Writes this member made and lost, later than the local drop.
+        let base = kimmy_storage::physical_now_ms() + 60_000;
+        let create = OplogEntry {
+            stamp: kimmy_core::Stamp::new(Hlc::new(base + 3_000, 0), me),
+            kind: kimmy_core::OpKind::CreateCollection,
+            collection: CollectionId::derive("shop", "gone"),
+            doc_id: None,
+            body: Some(
+                bson::serialize_to_vec(&kimmy_core::CollectionRef::new("shop", "gone")).unwrap(),
+            ),
+        };
+        let insert = OplogEntry {
+            stamp: kimmy_core::Stamp::new(Hlc::new(base + 4_000, 0), me),
+            kind: kimmy_core::OpKind::Insert,
+            collection: CollectionId::derive("shop", "gone"),
+            doc_id: Some(kimmy_core::DocId::Int64(7)),
+            body: Some(bson::serialize_to_vec(&bson::doc! { "_id": 7_i64 }).unwrap()),
+        };
+        let served = std::cell::RefCell::new(vec![create, insert]);
+        // This member's own startup write, above the lost ones.
+        engine.advance_clock_past(&kimmy_core::Stamp::new(Hlc::new(base + 5_000, 0), me));
+        let startup = engine.create_collection("shop", "startup").unwrap();
+        engine.insert(&startup, bson::doc! { "_id": "registered" }).unwrap();
+
+        let marker_dir = tempfile::tempdir().unwrap();
+        crate::catchup::write_marker(marker_dir.path(), crate::CatchUpReason::Restored).unwrap();
+        let catch_up = CatchUp::open(marker_dir.path(), Duration::from_secs(120));
+        let t0 = std::time::Instant::now();
+        catch_up.arm_replay_at(at_open, None, t0).unwrap();
+        let (b, c) = (node(1), node(2));
+        catch_up.replay_finished(b);
+        let mut theirs = VersionVector::new();
+        theirs.insert(me, Hlc::new(base + 4_000, 0));
+
+        async fn holder(mut stream: DuplexStream, window: Vec<OplogEntry>) {
+            while let Ok(message) = read_frame(&mut stream).await {
+                let Message::AskEntries { .. } = message else { panic!("{message:?}") };
+                let scanned_to = window.last().unwrap().stamp.hlc;
+                let entries = Message::Entries {
+                    entries: window.clone(),
+                    scanned_to,
+                    exhausted: true,
+                    passed_through: None,
+                };
+                if write_frame(&mut stream, &entries).await.is_err() {
+                    return;
+                }
+            }
+        }
+        let addr: SocketAddr = "127.0.0.1:1".parse().unwrap();
+        let round = || async {
+            let (mut ours, theirs_end) = tokio::io::duplex(MAX_FRAME);
+            let peer = tokio::spawn(holder(theirs_end, served.borrow().clone()));
+            replay_own_origin(&engine, &mut ours, addr, c, &theirs, &catch_up, ample())
+                .await
+                .unwrap();
+            drop(ours);
+            peer.await.unwrap();
+        };
+
+        let members = crate::Members::default();
+        members.insert_for_test("127.0.0.1:7001".parse().unwrap(), b);
+        members.insert_for_test("127.0.0.1:7002".parse().unwrap(), c);
+        let live = members.node_ids();
+        let judge = |at: std::time::Instant| {
+            let reached = [
+                Reached {
+                    node: b,
+                    servable: engine.version_vector().unwrap(),
+                    witnessed: None,
+                    facts: None,
+                },
+                Reached { node: c, servable: theirs.clone(), witnessed: None, facts: None },
+            ];
+            catch_up.replay_note_members(&ReplayTick {
+                me,
+                members: Some(&members),
+                reached: &reached,
+                expected_members: None,
+                now: at,
+            });
+            catch_up.replay_settle();
+            let mine = engine.witnessed_vector().unwrap();
+            let servable = engine.version_vector().unwrap();
+            catch_up.evaluate(&Tick {
+                me,
+                reached: &reached,
+                mine_witnessed: &mine,
+                mine_servable: &servable,
+                snapshot_pending: false,
+                live: Some(&live),
+                expected_members: None,
+                now: at,
+            })
+        };
+        let secs = Duration::from_secs;
+
+        round().await;
+        assert!(!catch_up.replay_answered(c), "the round is Ok, and C has not answered");
+        assert_eq!(judge(t0 + secs(5)), Decision::Kept);
+        assert_eq!(judge(t0 + secs(130)), Decision::Kept);
+        assert_eq!(catch_up.unknown_because(t0 + secs(130)), Some(UnknownCause::OwedReplay));
+        assert_eq!(catch_up.owed_members(), [c]);
+
+        // The collection is still not here: the same entries are proven lost again.
+        let mut changes = catch_up.subscribe();
+        changes.mark_unchanged();
+        for at in [135, 140] {
+            round().await;
+            assert_eq!(judge(t0 + secs(at)), Decision::Kept);
+            assert!(!catch_up.gated(t0 + secs(at)), "{at} s: a repeated proof does not gate");
+        }
+        assert!(!changes.has_changed().unwrap(), "and wakes no stream");
+
+        // A later round serves the same entries and one more, stamped above every
+        // one proven so far: new evidence, so the member gates again, once. The
+        // proof's stamp is the highest of the lost entries, not the lowest (which
+        // is still the one already proven).
+        served.borrow_mut().push(OplogEntry {
+            stamp: kimmy_core::Stamp::new(Hlc::new(base + 4_500, 0), me),
+            kind: kimmy_core::OpKind::Insert,
+            collection: CollectionId::derive("shop", "gone"),
+            doc_id: Some(kimmy_core::DocId::Int64(8)),
+            body: Some(bson::serialize_to_vec(&bson::doc! { "_id": 8_i64 }).unwrap()),
+        });
+        let woken = |changes: &mut tokio::sync::watch::Receiver<u64>| *changes.borrow_and_update();
+        let before = woken(&mut changes);
+        round().await;
+        assert_eq!(woken(&mut changes), before + 1, "a higher proof wakes the streams once");
+        assert!(catch_up.gated(t0 + secs(141)), "and gates the member again");
+        assert_eq!(judge(t0 + secs(142)), Decision::Kept);
+        // The same three again: nothing new.
+        let before = woken(&mut changes);
+        round().await;
+        assert_eq!(judge(t0 + secs(145)), Decision::Kept);
+        assert_eq!(woken(&mut changes), before, "the same proof again wakes nothing");
+
+        // The purge runs; the next round takes the entries and answers.
+        engine.finish_purges_now().unwrap();
+        round().await;
+        assert!(catch_up.replay_answered(c));
+        assert!(engine.get_collection("shop", "gone").is_ok(), "the lost creation is back");
+        assert_eq!(judge(t0 + secs(150)), Decision::Cleared("dominance"));
     }
 
     /// A replay the round cannot finish (its budget is spent after one window)
