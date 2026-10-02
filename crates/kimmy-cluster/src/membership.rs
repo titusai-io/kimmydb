@@ -437,6 +437,14 @@ impl Members {
     pub fn remove_for_test(&self, addr: &SocketAddr) {
         self.remove(addr);
     }
+
+    /// Move `addr`'s generation on, as SWIM bringing it up and declaring it down
+    /// again between two looks would, and leave whether it is live as it was.
+    #[cfg(test)]
+    pub(crate) fn bump_generation_for_test(&self, addr: &SocketAddr) {
+        let generation = self.0.next.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+        self.0.generations.write().insert(*addr, generation);
+    }
 }
 
 /// Everything the membership task reacts to.

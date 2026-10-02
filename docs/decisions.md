@@ -21985,6 +21985,21 @@ The consumers: a top-ranked member without the index, with a stale listing, catc
 
 ## ADR-202 — A member that knows it is behind says so, refuses requests, and does no owner work until it has caught up
 
+> **Amended by [ADR-212](#adr-212--a-catching-up-member-is-not-cleared-while-a-member-that-owes-it-the-replay-has-neither-answered-nor-left).**
+> A member that owes the replay of this member's own origin no longer stops
+> holding the clear at the end of its hold, nor stops owing it on a tick when
+> SWIM does not list it: it owes until it answers or has been gone from the
+> cluster continuously for the dwell (the longer of 600 s and the wait), past its
+> hold the member serves as `unknown` (`unknown_because: "owed_replay"`) rather
+> than clearing, and the floor is kept for as long as anyone owes. `mark` gates a
+> member serving as `unknown` again on new evidence. The sentences below that said
+> otherwise are rewritten.
+>
+> **Also amended by ADR-212: the wait counts from the first sync tick.** It
+> counted from when the marker was set, before the store opened, so a member
+> whose open outlasted the wait served `unknown` at its first answer without
+> having dialled a peer. It now counts from the member's first sync tick.
+
 **Status:** accepted, 0.43.0. The marker, its gate, its clearing rules and the owner-work exclusion, set for a member that creates its store in a cluster it has seeds for (`seeded_empty`), for one restored from a backup or found to have lost writes it made (`restored`), and for one that a peer can only serve with a whole-database snapshot (`snapshot`).
 
 **The defect.** A member whose store was wiped answered every read from an empty store as soon as it opened, with `/readyz` green and nothing anywhere saying it was behind: a client saw "no such document" for data its peers hold. Its ownership was worse. A member that expires a document from a stale copy mints a delete stamped *now*, which beats a refreshed copy that arrived from a peer with an earlier stamp under last-writer-wins, so an update is lost; an embedding written from a stale copy and a webhook dispatched from stale state are the same mistake. A member cannot tell "the first node of a new cluster" from "a wiped member of an old one" by looking at itself, and readiness must never wait on a peer (a gate that did would deadlock a whole-cluster cold start, and a partitioned member of a leaderless store is still a correct replica).
@@ -21993,13 +22008,13 @@ The consumers: a top-ranked member without the index, with a stale listing, catc
 
 - **The gate rests on a fact the member knows locally and durably: a marker file, `kimmy.catching-up`, in the data directory.** It is not a key in the store: a backup copies the store's meta table, so a restored or copied store would carry the marker, or lose it, for the wrong reason. It holds a few `key = value` lines (`reason`, `since`, and the node ids seen since it was set), and is written atomically (a temporary file, fsynced, renamed, the directory fsynced). An older build ignores an unknown file in its data directory, so there is **no rollback boundary**. The two keys this adds to `[cluster]`, `catch_up_wait_secs` and `expected_members`, are a configuration change and not a stored one: an older build refuses an unknown key in `[cluster]` when it parses the file, so a rollback removes them first (a real rollback to 0.42.0 found this).
 - **When it is set.** A start that creates the store (`kimmy.redb` did not exist), with clustering enabled and a non-empty seed list, writes it with `seeded_empty` **after the HTTP port is bound and before the store is opened**: a bind that fails leaves no marker, and a marker that cannot be written fails the start before the open, like a bind that fails does (the port was bound, but the answer is "failed to start" and never "catching up"). A crash after the marker and before the store leaves a marker, and the next start finds the file and stays gated: it is the file, not the absence of a store, that carries the gate. A wiped directory gets a new node identity (the id lives in the store), so a wiped member is a stranger to the cluster and to its own earlier writes, and is recognised as fresh by the absence of a store. **Seeds that name only this member do not count**: a static address equal to the member's own cluster address is taken out, the way discovery takes it out of what a seed resolves to, so a member that starts alone is not held for a wait with nobody to hear from; a name (`k8s:`, `dns:`, `dns-srv:`) is resolved by the discovery loop and not at the start, and is taken to name others. **A member with no peers to catch up from discards the file at the start** (clustering off, or seeds that name only itself), so a stale file from a node that left a cluster, or a marker the restore command wrote for a node that then runs standalone, cannot gate it for ever. `restored` and `snapshot` are stronger reasons that replace a weaker one (they clear by fewer rules). **`kimmyd restore` writes `restored`** beside the exit marker it already writes. **A peer's `BeyondHorizon` answer** to a pull, when this member goes on to take a whole-database snapshot (a repair's snapshot of one collection is the ordinary machinery on a member that is otherwise current, and marks nothing), writes `snapshot` before the first page lands: the member is stale until the snapshot has, and an open change stream is closed as it is for any mark.
-- **Every clustered start replays the member's own origin, against each peer.** A member that lost writes it made (a volume restored from a backup, a crash under `coalesced` durability after a peer had pulled a commit that was not yet flushed) writes again at start (the root user, its topology record) at a stamp above the lost ones, and a version vector keeps only the highest stamp per origin, so its vector then says it holds everything of its own origin that a peer has, and no ordinary pull serves the lost entries again. With clustering on, **the first time each distinct peer is reached in a run** the member asks it for its entries of this member's origin above the replay floor (an ordinary `AskEntries` naming everything else as held, which an older peer answers), page by page and resumably; a peer that holds nothing of the origin above the floor answers at once. **A peer that is behind on this origin settles nothing for a peer that is not**: the peer that holds the tail may be reached later, or never first. **An entry it returns that the member's own oplog does not hold is proof of loss**: this run's own writes are in the oplog before any peer can be served them, so a plain restart finds nothing, and this is exact where a comparison with the run's first own stamp is not (a wall clock behind the lost writes after a rollback puts them above it). The member is marked `restored` before the entries are applied, whether or not a marker was set before. **The marker does not clear until every peer reached within the wait, and every member SWIM lists live, has answered the replay, and at least one has**: a live member that has not been reached yet may be the one that holds the tail, and a clear before it answers would serve, and run owner work, without the lost writes until the replay re-marked the member. **The hold on a live member is bounded**: it lasts `cluster.catch_up_wait_secs` from the later of the replay's arming and the member first being seen live in this run, and no longer (the gate's own `unknown` bound is reset by every counting peer reached, so it cannot be the bound here). Past that the member no longer holds the clear; it keeps the floor, and the replay still asks it when it is reached. A peer reached in the window holds the clear until it has answered, or the replay has given up on it (below). Every stamp read, lost or not, moves the local clock past itself (`Engine::advance_clock_past`), so a write made from here on is stamped above the lost ones whatever the wall clock says. **A `BeyondHorizon` answer is "cannot tell", not an answer.** A peer that has collected the oplog the replay asks from cannot say what it holds of this member's origin, and no snapshot follows for the replay's sake (the ordinary pull takes one, and marks `snapshot`, only when the member is itself behind the horizon). The replay stays owed by that peer, is reported once at `WARN`, and asks again next round from a position that has moved on with the retention. **It gives up on a peer that has answered `BeyondHorizon` for `cluster.catch_up_wait_secs` running** (an answer in between starts the count again): one `WARN` names the peer, it counts as settled for the clear and the floor, and it is not asked again this run, since it cannot serve those entries. It is never finished silently. **The clamp assumes `storage.oplog_retention_secs` is the same on every member**, because the clamp uses this member's value and the answer depends on the peer's: a peer that keeps the oplog for less than this member does is given up on after the wait (the entries between the two horizons are not read back from it: a member whose own vector is current takes no snapshot, so nothing else fetches them from that peer, and only another member that still holds them can serve them); a peer that keeps it for more is asked from a position younger than it could serve, and entries between are not read back from it.
-- **The replay floor is persisted** (`kimmy.replay-floor`, in the data directory, written atomically). At open, before the run writes anything, it becomes the lower of what an earlier start left and the own-origin position the store has, **clamped to no older than `now − storage.oplog_retention_secs`** (entries below the peers' oplog horizon cannot be read back by any replay, and a floor older than every peer's horizon would be answered `BeyondHorizon` and blind the replay to a newer loss; with retention collection off there is no clamp); `kimmyd restore` writes the backup's own position. A floor file that cannot be read (permission denied, an I/O error) counts as the lowest floor, not as no floor, and a floor that cannot be written fails the start, as the marker does. **An unwritable floor path is refused before the open; the floor's contents are written right after the open, before anything is served.** The contents need the open's own-origin position, so they cannot be written earlier, but a path that can never take them is known without it: a clustered start checks, before the open and before the marker is written, that `kimmy.replay-floor` is absent or a regular file (judged on what a symlink points at, which is followed) and that the data directory takes the temporary file the write goes through, and refuses the start otherwise, tagged as a failure before the open (the store is not created or touched, and the failed start is recorded where the start holds the directory lock). A write that fails after its temporary file exists removes it, and a stale temporary file, or a link planted at its name, is removed before the new one is created, never followed. A start that writes and stops before it reaches a peer would otherwise open the next time with a position past the entries it lost, and find nothing to read back. **It is removed only when every member that can answer has answered the replay at least once: the members SWIM lists live, and the peers reached in this run.** The origins named in a contact's version vector do not count: a vector keeps the id of a departed or wiped member for ever, and such an origin holds nothing a live peer cannot also serve, so waiting on it would keep the floor until it aged past every peer's horizon. Until the floor is removed every newly reached peer is asked once, even after the marker has cleared: the lost entries sit below the member's own vector, so the replay is the only path that fetches them. **What it costs:** one request per distinct peer per run, plus the pages that carry this member's own entries above the floor (a peer that holds a long tail of them, or a floor kept since an earlier run, reads them all, page by page), and one request per round to a peer that answers `BeyondHorizon` until it answers otherwise. A live member that never answers keeps the floor, and the cost, until the operator deletes the file. It is a file for the reason the marker is: a backup copies the store.
+- **Every clustered start replays the member's own origin, against each peer.** A member that lost writes it made (a volume restored from a backup, a crash under `coalesced` durability after a peer had pulled a commit that was not yet flushed) writes again at start (the root user, its topology record) at a stamp above the lost ones, and a version vector keeps only the highest stamp per origin, so its vector then says it holds everything of its own origin that a peer has, and no ordinary pull serves the lost entries again. With clustering on, **the first time each distinct peer is reached in a run** the member asks it for its entries of this member's origin above the replay floor (an ordinary `AskEntries` naming everything else as held, which an older peer answers), page by page and resumably; a peer that holds nothing of the origin above the floor answers at once. **A peer that is behind on this origin settles nothing for a peer that is not**: the peer that holds the tail may be reached later, or never first. **An entry it returns that the member's own oplog does not hold is proof of loss**: this run's own writes are in the oplog before any peer can be served them, so a plain restart finds nothing, and this is exact where a comparison with the run's first own stamp is not (a wall clock behind the lost writes after a rollback puts them above it). The member is marked `restored` before the entries are applied, whether or not a marker was set before. **The marker does not clear while a member owes the replay, and not before at least one has answered**: a live member that has not been reached yet may be the one that holds the tail, and a clear before it answers would serve, and run owner work, without the lost writes until the replay re-marked the member. A member owes it from when it is first present in the run (listed live by SWIM, or reached) until it answers, or has been gone from the cluster continuously for the dwell ([ADR-212](#adr-212--a-catching-up-member-is-not-cleared-while-a-member-that-owes-it-the-replay-has-neither-answered-nor-left)). **The hold on an owing member is bounded**: it gates the member for `cluster.catch_up_wait_secs` from the later of the replay's arming and the owing member first being present in this run (the gate's own `unknown` bound is reset by every counting peer reached, so it cannot be the bound here). Past that, while it still owes, the member serves as `unknown` with owner work off and does not clear ([ADR-212](#adr-212--a-catching-up-member-is-not-cleared-while-a-member-that-owes-it-the-replay-has-neither-answered-nor-left)); it keeps the floor, and the replay still asks it when it is reached. A peer reached in the window that has not answered is an owing member like any other, and the replay's give-up on a peer (below) is an answer. Every stamp read, lost or not, moves the local clock past itself (`Engine::advance_clock_past`), so a write made from here on is stamped above the lost ones whatever the wall clock says. **A `BeyondHorizon` answer is "cannot tell", not an answer.** A peer that has collected the oplog the replay asks from cannot say what it holds of this member's origin, and no snapshot follows for the replay's sake (the ordinary pull takes one, and marks `snapshot`, only when the member is itself behind the horizon). The replay stays owed by that peer, is reported once at `WARN`, and asks again next round from a position that has moved on with the retention. **It gives up on a peer that has answered `BeyondHorizon` for `cluster.catch_up_wait_secs` running** (an answer in between starts the count again): one `WARN` names the peer, it counts as settled for the clear and the floor, and it is not asked again this run, since it cannot serve those entries. It is never finished silently. **The clamp assumes `storage.oplog_retention_secs` is the same on every member**, because the clamp uses this member's value and the answer depends on the peer's: a peer that keeps the oplog for less than this member does is given up on after the wait (the entries between the two horizons are not read back from it: a member whose own vector is current takes no snapshot, so nothing else fetches them from that peer, and only another member that still holds them can serve them); a peer that keeps it for more is asked from a position younger than it could serve, and entries between are not read back from it.
+- **The replay floor is persisted** (`kimmy.replay-floor`, in the data directory, written atomically). At open, before the run writes anything, it becomes the lower of what an earlier start left and the own-origin position the store has, **clamped to no older than `now − storage.oplog_retention_secs`** (entries below the peers' oplog horizon cannot be read back by any replay, and a floor older than every peer's horizon would be answered `BeyondHorizon` and blind the replay to a newer loss; with retention collection off there is no clamp); `kimmyd restore` writes the backup's own position. A floor file that cannot be read (permission denied, an I/O error) counts as the lowest floor, not as no floor, and a floor that cannot be written fails the start, as the marker does. **An unwritable floor path is refused before the open; the floor's contents are written right after the open, before anything is served.** The contents need the open's own-origin position, so they cannot be written earlier, but a path that can never take them is known without it: a clustered start checks, before the open and before the marker is written, that `kimmy.replay-floor` is absent or a regular file (judged on what a symlink points at, which is followed) and that the data directory takes the temporary file the write goes through, and refuses the start otherwise, tagged as a failure before the open (the store is not created or touched, and the failed start is recorded where the start holds the directory lock). A write that fails after its temporary file exists removes it, and a stale temporary file, or a link planted at its name, is removed before the new one is created, never followed. A start that writes and stops before it reaches a peer would otherwise open the next time with a position past the entries it lost, and find nothing to read back. **It is removed only when nobody owes the replay any longer and at least one member has answered it** ([ADR-212](#adr-212--a-catching-up-member-is-not-cleared-while-a-member-that-owes-it-the-replay-has-neither-answered-nor-left)): every member present in this run (listed live, or reached) has answered, or has been gone from the cluster continuously for the dwell, and the start-race guard does not hold. The origins named in a contact's version vector do not count: a vector keeps the id of a departed or wiped member for ever, and such an origin holds nothing a live peer cannot also serve, so waiting on it would keep the floor until it aged past every peer's horizon. Until the floor is removed every newly reached peer is asked once, even after the marker has cleared: the lost entries sit below the member's own vector, so the replay is the only path that fetches them. **What it costs:** one request per distinct peer per run, plus the pages that carry this member's own entries above the floor (a peer that holds a long tail of them, or a floor kept since an earlier run, reads them all, page by page), and one request per round to a peer that answers `BeyondHorizon` until it answers otherwise. A live member that never answers keeps the floor, and the cost, until it has been gone for the dwell or the operator deletes the file. It is a file for the reason the marker is: a backup copies the store.
 - **Armed whenever clustering is on.** A restored node whose static seeds name only itself can still have SWIM peers: it discards the *marker* at its start (nobody in its seeds to catch up from), but keeps the replay armed, and marks itself `restored` then if the replay proves a loss. With clustering off, both are dropped.
 - **A narrow interaction, accepted:** a start whose clock is behind the lost writes stamps its own startup writes (the topology record) below them, and the replay's entries beat those writes under last-writer-wins. The write is the member's own registration, rewritten by the next start; the replay moves the clock, so nothing written after it is affected.
 - **While it is set and the wait has not run out, the member is gated.** Every route answers **`503 catching_up`** (`retry: elsewhere`, no `Retry-After`: another member holds what this one is fetching, and no timing it could honour is known), except `/healthz`, `/readyz`, `/metrics` and `/v1/topology`. `/v1/version`, a login, `/mcp` and a WebSocket upgrade are refused: the deploy tooling polls `/v1/version` to decide a rolled member is up, and a member that is gated must not read as up. `/readyz` is `503 catching_up` in the error envelope, so a readiness probe keeps the member out of the Service, and `/v1/topology` stays served and marks the member (`catchingUp` with the state) and a peer that says it is catching up (`catchingUp: true`), so a client that routes by topology can avoid both. Every response carries **`x-kimmy-catching-up: <state>`** while the marker is set at all, gated or `unknown`, so a caller behind a load balancer sees it per response.
 - **A member never counts as a peer to itself.** Discovery takes out only the address the member binds, so a seed that names it by another address (a wildcard bind reached by a loopback or service address) dials it. The handshake names the peer, and a contact whose peer is this node ends at the transport, at the dialler and at the listener, with one line in the log per process; the marker's judgement also drops any contact with this member. The loop takes it as "this address is me": it is left out of the peers for five minutes (`SELF_RECHECK`) and then dialled once more, because the address can come to name another node (a service or load-balancer address whose backends changed, a copy of a data directory fixed and restarted with a new id); the contact is no failed round (no back-off, no failure counted, no warning per tick). The same handshake catches a second host started from a copy of this node's data directory, which presents the same node id. Before, such a member counted its own contact as a member reached, and cleared by the mutual clear against itself before it served.
-- **The wait is a bound on refusing on a guess, and restarts.** `cluster.catch_up_wait_secs` (120) counts from when the marker is set, and restarts whenever a *counting* peer is reached. A counting peer is one that was reached by a successful contact and is not itself catching up; a peer that has sent no block (an older version) counts, and so does a peer that holds at least as much of its own origin as this member holds of it (a peer that holds *less* of its own origin than this member has lost data, and is not evidence about the cluster). With no counting peer reached for the wait, the gate opens and the state reads **`unknown`**: requests are served and `/readyz` is 200 with `catching_up: "unknown"`, but the marker stays and **owner work stays off**. Once a counting peer is reached that is ahead, the gate closes again and holds for as long as the catch-up takes, with no time limit: that is knowledge, not a guess. A `WARN` is logged every ten minutes for as long as the marker is set past the bound, naming the reason, its age and the members not reached.
+- **The wait is a bound on refusing on a guess, and restarts.** `cluster.catch_up_wait_secs` (120) counts from the member's first sync tick (from when the marker is set until [ADR-212](#adr-212--a-catching-up-member-is-not-cleared-while-a-member-that-owes-it-the-replay-has-neither-answered-nor-left) amended it: that was before the store opened, so a slow open used the wait up), and restarts whenever a *counting* peer is reached. A counting peer is one that was reached by a successful contact and is not itself catching up; a peer that has sent no block (an older version) counts, and so does a peer that holds at least as much of its own origin as this member holds of it (a peer that holds *less* of its own origin than this member has lost data, and is not evidence about the cluster). With no counting peer reached for the wait, the gate opens and the state reads **`unknown`**: requests are served and `/readyz` is 200 with `catching_up: "unknown"`, but the marker stays and **owner work stays off**. (`unknown` has a second cause since [ADR-212](#adr-212--a-catching-up-member-is-not-cleared-while-a-member-that-owes-it-the-replay-has-neither-answered-nor-left): a member that owes the replay past its hold; `/readyz` names which, as `unknown_because`.) Once a counting peer is reached that is ahead, the gate closes again and holds for as long as the catch-up takes, with no time limit: that is knowledge, not a guess. A `WARN` is logged every ten minutes for as long as the marker is set past the bound, naming the reason, its age and the members not reached.
 - **It clears in exactly three ways, judged once per sync tick from what that tick's successful contacts read.**
   - **By dominance.** A contact succeeded this tick, and this member's *witnessed* vector covers the *servable* vector of every counting peer **reached in the window**, each read from the same `Vectors` frame of that peer's last successful contact (never a value from a failed round: a round that failed after its vectors were read contributes nothing), and no whole-database snapshot cursor remains for a current member. A peer reached a moment ago and in health back-off now still stands between this member and a clear. Without membership, a cursor for a peer not reached within the wait is a ghost and holds nothing. `CaughtUp` is not a catch-up signal: it means only that the last pull did not come back truncated, and the round that completes a snapshot is granted the vector of its first page. An origin this member has never seen counts as its position zero.
   - **By the mutual clear, for a `seeded_empty` member only.** A brand-new cluster starts with every member `seeded_empty`, and a catching-up peer never counts toward dominance, so without this the whole-cluster cold start, the most ordinary start there is, ends with every member `unknown` and expiry off for ever. All of these must hold within the wait, over every peer reached in it by what its last successful contact read: every member this one must hear from has been reached; no whole-database snapshot is under way; every such peer is itself `seeded_empty` (if any is not catching up, dominance against it applies; if any is catching up for another reason, the mutual clear does not apply); every origin named in any reached vector belongs to a reached member or to this one (a wiped member of an old cluster fails here, because the old cluster's origins appear in the vectors it is shown); and, for every reached peer, this member's witnessed vector covers the peer's servable vector and the peer's witnessed vector covers this member's servable vector, from the same frame. Coverage and not equality, because a fresh member's vector is never empty (the root user and the topology record are stamped with its own origin before its first contact) and the members are still converging on each other's startup writes. **A restored cluster does not take the mutual clear**: two restored members converging on each other before the third, which holds the newest backup, would turn expiry on and delete documents the third has since updated.
@@ -23920,3 +23935,318 @@ bounds them and are held to the ceiling, naming the stage; the `filter`; `query`
 message; a misplaced stage and a refused name as `400`s; a `read` grant searches
 and a `search`-only grant is answered by the endpoint and refused by aggregate,
 a token with neither getting the same `403` body from both.
+
+---
+
+## ADR-212 — A catching-up member is not cleared while a member that owes it the replay has neither answered nor left
+
+**Status:** accepted, for the next `0.MINOR`. Amends
+[ADR-202](#adr-202--a-member-that-knows-it-is-behind-says-so-refuses-requests-and-does-no-owner-work-until-it-has-caught-up):
+its replay bullet ("The hold on a live member is bounded … Past that the
+member no longer holds the clear"), its floor bullet ("removed only when every
+member that can answer has answered"), and its wait bullet's definition of
+`unknown`. Follows its rule that a member says what it does not know rather
+than serve as if it knew it.
+
+**The defect, shipped in 0.43.0.** Three members A, B and C. A writes L1..L5;
+C pulls them, B is down. The operator restores A from a backup taken before
+L1 with `kimmyd restore`, which writes the marker (`restored`) and the replay
+floor, and A starts and writes its topology record at a stamp above L5. B
+comes back and pulls that record from A, so B's vector for A's origin covers
+L1..L5 and B never pulls them from anyone. A's replay asks B, and B answers
+"nothing lost". C is listed live by SWIM, but A cannot complete a round with
+it (its cluster port is filtered from A, or its writer is held past a round's
+deadline). Two things then went wrong:
+
+- **One tick with C missing from SWIM's live set settled the replay.** The
+  settle judged only the live set of that tick. A six-second network cut, or
+  C's own restart, made SWIM declare C down; on that tick every member listed
+  live and every peer reached had answered, so the floor file was removed, the
+  replay disarmed, and the marker cleared by dominance, inside C's hold. The
+  transport asks a peer only while the replay is armed, so C was never asked
+  again, and nothing else fetches entries below a member's own vector. A served
+  `GET L1` as 404 with `/readyz` 200 and no header, and with owner work on: a
+  TTL expiry of a document L3 had updated mints a delete stamped *now*, which
+  beats L3 everywhere once it replicates.
+- **Past C's hold A cleared anyway.** ADR-202 bounded the hold of a live member
+  to the wait, so at 120 s A cleared by dominance against B with the same
+  result, whether or not SWIM ever had C down.
+- **A proof of loss did not gate a member serving as `unknown`.** `mark`
+  returned at once when the held reason was at least as strong, so a
+  `restored` member past the wait that the replay then showed to have lost
+  writes kept serving them, and its change streams stayed open.
+
+**Decision.**
+
+- **The owed set, and "left" is sticky.** While the replay is armed, every
+  member present in this run (listed live by SWIM, or reached by a successful
+  contact; with membership off, reached) that has not answered **owes** the
+  replay. A member stops owing when it answers (as ADR-202 defines an answer,
+  a give-up after `BeyondHorizon` included) or when it has been **absent
+  continuously for the dwell**. A return, or a move of its address's SWIM
+  generation between two ticks (SWIM brought it back up and lost it again in
+  between), restarts the count. A suspect member is still listed, so it is
+  present; a member in health or confirmation back-off on this member's link is
+  present if SWIM lists it, since one link's opinion is not leaving. Only
+  members present in this run, or carried over from the floor file, are
+  tracked: an origin named only in a vector is not, for ADR-202's reason. **The
+  owed set governs both the clear and the floor**, so a blip shorter than the
+  dwell neither settles the replay nor releases the clear.
+- **The dwell is the longer of 600 s and `cluster.catch_up_wait_secs`**, a
+  constant and not a configuration key: configuration refuses unknown keys, so
+  a new key would make the file refuse to load on an older build. The dwell
+  must outlast an ordinary absence of a member that is coming back (a start
+  that walks a large oplog, a migration, an image pull, a reschedule); with a
+  dwell equal to the wait, the advice to lower the wait for a deployment that
+  starts one member first would bring the loss back through a 40 s restart.
+  The dwell never gates: it keeps the owed state and the floor. **A member gone
+  for longer than the dwell is treated as having left and the replay against it
+  is forfeited**: if it held writes this member lost and no other member holds
+  them, the replay does not read them back. That is a `WARN` naming the member,
+  its last address, how long it was gone, the dwell and the cause (`swim_down`
+  or `unreached`).
+  **Steady arrivals of new members keep a marked member gated before the
+  latch:** each owing member's hold runs from its own first being present, so a
+  new member that has not answered, arriving inside every wait, holds the
+  clear again, each for the wait from its arrival.
+- **The hold, and `unknown (owed)`.** An owing member holds the clear, gated, for
+  the wait from the later of the arming and its first being present in this run
+  (a member that leaves and returns owes again at once, with no new hold). A
+  peer reached in the window that has not answered is an owing member like any
+  other, so the hold also bounds a peer that never finishes the replay (its
+  entries name a collection not here yet, or the page budget runs out), which
+  ADR-202 held without bound. When a clear rule holds and every owing member is
+  past its hold, the member does not clear: it **serves as `unknown`**, with
+  owner work off, until each has answered or left. That is the **owed latch**.
+  While it is set a counting peer that is ahead does not close the gate (the
+  latch can hide only lag: entry needs a clear rule, so the member covered every
+  counting peer in the window then), and a counting contact wakes change streams
+  only when it actually closes the gate. **The latch drops when nothing is
+  owed**: the member is then judged as any marked member is, cleared by a tick on
+  which a rule holds and gated otherwise (streams closed once). A WARN says so on
+  entry and every ten minutes, naming the owed members and their addresses.
+- **Two causes of `unknown`, and which one `/readyz` names.** `unknown_because`
+  is `no_counting_peer` (ADR-202's bound) or `owed_replay` (the latch); when
+  both hold it is `owed_replay`, the one that governs what happens next, since a
+  peer that is ahead gates the first and not the second. `/readyz` 200 carries
+  `unknown_because` and `owed_members` (every member that owes, sorted node ids;
+  never empty under `owed_replay`) whenever it carries `catching_up`; the `503`
+  of a gated member whose replay is owed names `owed_members` beside `reason`.
+  Under the latch the list is the set as of the last tick that judged it, not
+  the live set: a member that answers between two ticks stays in the list until
+  the next tick drops the latch, so the list and the state change together.
+  No series is added: `kimmy_catching_up{reason="unknown"}` is 1 in both causes.
+- **`mark` gates again on new evidence, and only on it.** New evidence is a
+  stronger reason; lost entries a peer's replay had not proven before (the
+  highest lost stamp of a page above the highest that peer has proven lost in
+  this run); the first `snapshot` mark since the marker was set; or a `restored`
+  mark that names no peer. Gating resets the wait and the latch, and wakes
+  change streams if the gate was open; the file is rewritten only for a stronger
+  reason. A repeated proof does nothing: the replay re-reads the same lost
+  entries every round while a collection they name is missing, and gating on
+  each would flap the gate and close every stream every tick. A second peer that
+  re-proves the same entries gates once more, which bounds the flap to one per
+  peer per new proof; a run-wide set of proven stamps would be exact but grow
+  with every lost write. **The residual of that first departure:** a later page
+  from the same peer whose highest lost stamp is above the proven one gates
+  once, but new lost entries stamped below it after a first proof do not gate.
+  They are applied anyway; only the gate is not taken again for them.
+  **`clear`, by any rule, resets the latch**, so a later mark cannot inherit an
+  open state.
+- **The wait counts from the first sync tick, not from the marker.** The marker
+  is set before the store opens, and the wait ran on the member's clock from
+  then, so a member whose open outlasted `cluster.catch_up_wait_secs` (a large
+  store: the oplog walk, the count rebuild, redb's own open on a slow disk)
+  answered its first request as `unknown (no_counting_peer)` without having
+  dialled a peer. The wait now starts at the member's first sync tick, the first
+  point at which it can ask one, and until that tick the member is not
+  `unknown` for want of a counting peer. One `INFO`, `the catching-up wait
+  starts`, with `reason` and `wait_s`, says when the clock starts, once per
+  start of a marked member. A marker set later in the run (a proven loss, a
+  snapshot) restarts the wait from then, as before. This is a fix to ADR-202's
+  wait and is in force for every marked member, not only ones with an owed set.
+- **The start-race guard.** On the first tick B may have answered while SWIM
+  lists only B (any datagram's sender is applied as alive before its payload is
+  read, so B is live from its own ping), and C is not yet tracked: without a
+  guard the floor would be removed before C is ever asked. For the wait from the
+  **first successful contact of the run** (not from the arming: the seeds are
+  resolved beside the loop, and a slow resolver can put the first contact past
+  a wait after it), a clear, entry to `unknown (owed)` and the settle also need
+  every origin named in a reached peer's vectors in this run to have been
+  present in this run, and, with `cluster.expected_members` set, that many
+  members live counting this one (reached within the wait, without
+  membership). C's topology record, or any write C made, names C in B's vector
+  whatever SWIM lists. Past the window the guard lapses, so a departed origin
+  does not hold anything for ever. A `WARN` names what holds it, once. **What it
+  costs:** a marked member whose peers' vectors name a departed member, or with
+  `expected_members` above the live count, waits until a wait after its first
+  contact before it can clear by dominance or go `unknown (owed)`; every
+  clustered start in such a cluster keeps the floor file that long (one replay
+  ask per newly reached peer, invisible otherwise). An all-fresh cold start
+  clears by the mutual clear, which already requires every id the marker has
+  seen, a superset of those origins, and `expected_members`, so it waits no
+  longer; its dominance path, and a start in which an id is named and never
+  present (an orphan id from a member wiped again during bring-up), can. **What
+  it cannot close:** a member that has never written anything and is not yet
+  listed is invisible; `cluster.expected_members` is the setting for that.
+- **The floor file carries the owed set across a restart.** After the two floor
+  lines, which every write carries first, it holds one `owed = <node id>` line
+  per owing member, sorted, at most 1,024 (past that a `WARN` on the write, and
+  the rest are kept in memory only; a file that already holds more than that is
+  loaded up to the cap, with a `WARN` naming how many were left out). It is
+  rewritten when the set's membership changes, never
+  over a file the operator has removed. At arming the listed members owe again,
+  absent from the arming and first seen at it: a member that was down while
+  this one restarted is still waited on for the dwell, and holds a marked
+  member's clear for the wait. **Restarting a member restarts every owed
+  member's dwell, and holds a marked member at `503` for the wait again**; it
+  does not help. A line that does not name a node is skipped with one `WARN`
+  and never voids the floor. The arming rewrite (when the floor moves down, or
+  the retention clamp moves it up) keeps the owed lines it loaded. The arming
+  write stays fatal, as ADR-202 has it; a rewrite from a tick that fails is a
+  `WARN`, the set stays in memory, and the next change retries, since the floor
+  is already durable and the rename leaves the old file whole. `kimmyd restore`
+  writes a fresh floor with no owed lines.
+- **The `seeded_empty` exemption.** The owed hold and `unknown (owed)` do not
+  apply to a member whose marker is `seeded_empty`, written by this run because
+  this run created the store, with no floor file before this run's arming: it
+  has no history of its own origin from before this run to have lost. A
+  `seeded_empty` marker left by an earlier run is not exempt (the member may
+  have taken writes while `unknown` and lost them in a `coalesced` crash), and
+  the replay and the floor run for everyone. The guard applies to an exempt
+  member too.
+- **No time bound on `unknown (owed)`.** It ends by an answer, by the member
+  leaving for the dwell, by a mark (which gates), or by the operator. A bound
+  would be a guess at how long a lost write may sit on an unreachable member,
+  and would bring back the clear it exists to stop. Every window comparison is
+  `now − start < d`, saturating, because `cluster.catch_up_wait_secs` has no
+  upper bound.
+- **Past `storage.oplog_retention_secs` the replay cannot recover.** The replay
+  asks from no older than the retention horizon. When the horizon passes the
+  lowest floor this run would have asked from while a member owes past its
+  hold, one `WARN` says so; when that member is reached it answers from the
+  horizon (the `a member owing the replay has answered` line carries `from`),
+  and the member clears without writes older than that. The owing member's own
+  oplog collection has taken those entries by then anyway.
+- **An unmarked member.** The replay is armed on every clustered start, and the
+  owed set runs for an unmarked member too (it holds only the floor). One whose
+  replay is still owed past the hold logs a `WARN` every ten minutes saying it is
+  not marked, serves and does owner work, and would be marked `restored` if an
+  owing member answered with a loss. The operator's deletion of the marker
+  leaves the replay armed and the floor kept: a later answer with a loss marks
+  the member again, and it refuses again, possibly long after the deletion.
+
+**What this changes for owner work: nothing in the rule.** Owner work stays off
+while the marker is set, both `unknown` causes included, and `facts.catching_up`
+is true in both, so 0.43 peers leave the member out of their owner candidates as
+for today's `unknown`. **A cluster where every member is marked** has no counting
+peer and is already `unknown`; nobody owns expiry or webhooks there until the
+operator clears, and one unmarked member is enough to own everything. **No
+deadlock**: the transport serves a replay whatever its own marker says, so two
+members that cannot reach each other's cluster port both serve as `unknown
+(owed)` and a third does the owner work. The replay is started only by the
+dialler, so when only A→C is blocked C's contacts to A do not carry it.
+
+**Stated limits.**
+
+- **B is as stale as A, and this does not change that.** In the example B
+  answered "nothing lost" because its vector covered L1..L5 without holding
+  them. B is unmarked, reads `none`, serves `GET L1` as 404, and runs owner work
+  from that copy, its own share and the part of A's share handed to it while A
+  is `unknown`: if B owns D3's collection, its expiry of the pre-L3 copy beats
+  L3 on C, and the update is lost through B. This decision stops A from doing
+  that, not B. Lost inserts can be repaired by the divergence check's count half
+  and the replay from the collection's creation it plans
+  ([ADR-133](#adr-133--a-periodic-cross-member-check-makes-a-divergence-no-counter-can-express-visible-without-repairing-it),
+  ADR-148), on their own rotation and deferred while either member is behind
+  and advancing (ADR-146, ADR-168). Lost updates to documents B already holds
+  change no count, and nothing repairs them but a later write to the document.
+- **A rollback done without `kimmyd restore` gets none of this.** Only the
+  command marks the member before it serves. A volume or snapshot revert is
+  marked only by the replay's proof, and while the member that holds the lost
+  writes is reachable over SWIM and not over the cluster port, the rolled-back
+  member serves and does owner work without them. Turning owner work off for
+  an unmarked member whose replay is owed was evaluated and declined: the peers
+  would have to be told (the only bit they read is `facts.catching_up`, and
+  reusing it changes what it means to 0.43 peers in the middle of a roll), it
+  would fire on ordinary restarts behind an asymmetric partition, it helps
+  only the share that lands on the holder, and it would be a state with no
+  signal. The unmarked `WARN` above is what is done instead.
+- **"Answered" is a point in time.** Each peer is asked once per run; one that
+  answered "nothing" and later pulls the lost writes from the holder is not
+  asked again (ADR-202's residual, unchanged).
+- **Stale owed lines can survive a 0.43 run.** 0.43 keeps the file verbatim
+  when it does not move the floor (it rewrites it without the lines when the
+  floor moves, and removes it on its settle). Back on this build the lines are
+  loaded: each holds a marked member gated for a wait, and is released after the
+  dwell if it never comes back; on an unmarked member they keep the floor for
+  the dwell.
+
+**Rollback.** No rollback boundary: no wire field, no configuration key, no
+marker key. 0.43's reader of the floor file reads `floor_ms` and
+`floor_counter` and skips every other key, so it reads the same floor from a file
+with `owed` lines. Rolling back brings back the one-tick settle and the clear
+past the hold.
+
+**Rejected.**
+
+- *Gating until every owing member answers:* one member that never answers
+  would keep this one refusing indefinitely.
+- *A second bound after which `unknown (owed)` clears:* a guess, and the clear
+  it stops comes back after it.
+- *A local link failure counting as "left":* it is one link's opinion, and the
+  member is serving the lost writes to clients meanwhile.
+- *"Every window peer is listed live" as the start-race guard:* SWIM makes B
+  live from B's own ping, with nothing about C.
+- *A guard on resolved seed addresses:* an address is not an identity
+  (dual-stack resolution, a service or load-balancer address, NAT), and once
+  SWIM lists anyone the loop dials only its members, so such a condition would
+  hold the whole window on ordinary deployments for no information.
+- *Settling on the union of every member seen this run, with no dwell:* a
+  member gone for good would keep the floor for ever.
+- *A dwell equal to `cluster.catch_up_wait_secs`:* the documented advice to
+  lower the wait would release a member through its own restart.
+- *A new gauge for the cause:* `/readyz` names it, and the existing series is 1
+  in both.
+
+### Test
+
+Unit tests on injected instants (`arm_replay_at`, `mark_at`, `mark_proven`,
+`replay_note_members` and the judgement take the instant): a live member that
+never answers holds the clear for the wait and then serves as `unknown (owed)`,
+naming both members, with the floor kept; one SWIM-down tick of an owing member,
+inside its hold and past it, settles nothing and clears nothing, and the member
+is asked when it is back; a member gone for the dwell has left and the covering
+tick clears, while a return inside the dwell, or a SWIM generation that moved
+between two ticks, restarts it; a suspect member is present; a reached member
+SWIM has not listed, and every member with membership off, is released after
+the dwell unreached; an answer, and a give-up after `BeyondHorizon`, let the
+clear happen; while latched a counting peer that is ahead neither closes the
+gate nor wakes streams, a newly reached peer far ahead and a member first seen
+live join without gating, and the latch drops when nothing is owed; `mark`
+gates in both causes, a snapshot under `restored` gates once, an equal reason
+does not rewrite the file, a repeated proof does not gate and a new one does;
+the operator's clear resets the latch; `unknown (owed)` clears only on a
+covering tick; a peer that never finishes the replay holds only for its hold,
+and a window peer that is ahead keeps the gate; `first_seen` is recorded on
+every tick; the guard holds for an origin named in a reached vector and for
+`expected_members`, with and without membership, is timed from the first
+contact, lapses at the end of its window, and holds the floor; the
+`seeded_empty` exemption, and its absence for an earlier run's marker or a
+floor file left before the arming; the mutual clear with a member owing serves
+as `unknown`; `expected_members` does not pad the owed set; the owed set
+survives a restart and is capped on load; the cause precedence; lowering the
+wait does not shrink the dwell; the release and retention `WARN`s; the floor
+file's format, its arming rewrite keeping the owed lines and skipping one that
+does not parse, read by 0.43's parser verbatim; and a failed rewrite from a
+tick. Through the judgement, one down tick of an owing member settles nothing
+(also shown failing on 0.43's code). Through a scripted replay, entries naming
+a collection still waiting for its purge leave the member `unknown (owed)`, and
+the rounds that prove them again neither gate it nor wake streams, until the
+collection can be taken. Through real replication, a restored member owed by a
+live holder serves as `unknown` until the first round with the holder proves
+the loss, gates it, reads the writes back, and a covering tick clears it.
+Through the router, `/readyz`'s exact keys and values for each cause and the
+`503`'s `owed_members`, validated against the specification, and no owner work
+of any class while owed. Each guard was broken and its test failed (recorded in
+the pull request).

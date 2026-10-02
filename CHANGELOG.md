@@ -186,6 +186,32 @@ breaking changes and says so here; a `0.x.PATCH` bump never does.
   not cross an array are unchanged. See Query language, "Sort and projection",
   and ADR-214.
 
+- **A member that is catching up no longer clears while a member the cluster
+  lists live still owes it the replay of its own origin.** It used to clear by
+  dominance once that member had been owed for `cluster.catch_up_wait_secs`,
+  serving and doing owner work without whatever writes that member held. Past
+  that wait it now serves as `unknown`, with owner work off, until that member
+  answers or has been gone from the cluster for the dwell; with no time bound.
+  `/readyz` says why: beside `catching_up`, `unknown_because`
+  (`no_counting_peer` or `owed_replay`) and `owed_members` (the node ids that
+  owe the replay), and a gated member's `503` names `owed_members` beside
+  `reason`. `kimmy_catching_up{reason="unknown"}` is 1 in both causes, and
+  reads `unknown` where it used to read `none`, so the documented alert on
+  `unknown` fires for it. A `WARN` names the owing members and their addresses
+  on entry and every ten minutes; operations.md, "Serving as `unknown` because
+  a member owes the replay", lists what to do. **A marked member can also
+  refuse for longer at a start**: for `cluster.catch_up_wait_secs` after its
+  first contact it does not clear while an origin its peers' vectors name has
+  not been seen, or fewer members than `cluster.expected_members` are live, so
+  a cluster that once replaced a member, or an `expected_members` above the
+  live count, holds a restored member at `503` for up to that wait; and a
+  restart of a member serving as `unknown` because it is owed the replay holds
+  it at `503` for the wait again. A deploy roll that waits on `/v1/version`
+  waits that much longer for such a member. Not breaking: `/readyz` only gains
+  fields, and every added refusal is the existing `503 catching_up` with
+  `retry: elsewhere` from a member whose marker is set
+  ([ADR-212](docs/decisions.md)).
+
 - **Breaking: an update that writes one path twice is a `400`, and writes
   nothing.** Two writes to the same path, or to a path and a path inside it,
   were applied in the order their keys arrived: `{"$set": {"a": 1}, "$inc":
@@ -382,6 +408,38 @@ breaking changes and says so here; a `0.x.PATCH` bump never does.
   sixteen variables keeps them in name order and bisects. Nothing about what an
   expression means changes; shadowing and scope are as they were
   ([ADR-105](docs/decisions.md)).
+
+- **A marked member whose store takes longer to open than
+  `cluster.catch_up_wait_secs` no longer serves `unknown` at its first answer.**
+  The wait counted from when the catching-up marker was set, which is before the
+  store opens, so a large store whose open outlasted it (120 s by default) answered
+  its first request as `unknown` (`no_counting_peer`) without having dialled a
+  peer. The wait now counts from the member's first sync tick, the first point at
+  which it can ask one; one `INFO`, `the catching-up wait starts`, says when
+  ([ADR-212](docs/decisions.md), amending ADR-202). A marked start that opens
+  slowly is refused for the wait after that tick, not before it.
+
+- **A restored member no longer stops waiting for the member that holds the
+  writes it lost because that member was missing from the live set for a
+  moment.** A member whose replay of its own origin was still owed by a member
+  the cluster lists live settled the replay, removed `kimmy.replay-floor` and
+  cleared its catching-up marker by dominance on the first sync tick on which
+  SWIM did not list that member: a network cut of a few seconds, or that
+  member's own restart, inside the hold or past it. The member that held the
+  lost writes was then never asked again, so the restored member served reads
+  without them, with `/readyz` 200 and no header, and ran owner work from that
+  copy: a TTL expiry of a document a lost write had updated deletes it
+  everywhere. A member now stops being waited on only once it has answered or
+  has been gone from the cluster continuously for the dwell, the longer of 600 s
+  and `cluster.catch_up_wait_secs`; the floor file records the members that owe
+  the replay, so a restart of this member does not forget them
+  ([ADR-212](docs/decisions.md)), shipped in 0.43.0.
+
+- **A member serving as `unknown` that finds it has lost writes of its own now
+  refuses requests again and closes its change streams.** A proof of loss from
+  the replay did not gate a member whose marker was already `restored` and
+  whose wait had run out, so it kept serving reads of the lost documents until a
+  counting peer was next reached ([ADR-212](docs/decisions.md)), shipped in 0.43.0.
 
 - **A start that fails after it opens the store no longer leaves it needing
   repair.** The cluster listener's port in use, or any other failure past the

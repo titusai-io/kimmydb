@@ -714,18 +714,37 @@ async fn readyz(State(state): State<SharedState>) -> Result<Json<Value>, ApiErro
             ),
         );
         // Beside `error`, `message` and `retry`, as the opening state's fields are:
-        // what a probe or an operator reads without parsing the message.
-        refusal.extra = Some(Box::new(serde_json::Map::from_iter([(
-            "reason".to_string(),
-            json!(catch_up.state_label(now)),
-        )])));
+        // what a probe or an operator reads without parsing the message. While
+        // members owe the replay of this member's own origin, they are named too:
+        // the hold is where an operator looks (ADR-212).
+        let mut extra =
+            serde_json::Map::from_iter([("reason".to_string(), json!(catch_up.state_label(now)))]);
+        let owed = owed_members(catch_up);
+        if catch_up.replay_armed() && !owed.is_empty() {
+            extra.insert("owed_members".to_string(), json!(owed));
+        }
+        refusal.extra = Some(Box::new(extra));
         return Err(refusal);
     }
     let mut body = json!({ "status": "ready", "node": state.engine.node_id().to_string() });
     if let Some(catch_up) = catching_up {
+        // Serving as `unknown`: why, and who owes the replay (ADR-212).
         body["catching_up"] = json!(catch_up.state_label(now));
+        body["unknown_because"] = json!(
+            catch_up
+                .unknown_because(now)
+                .unwrap_or(kimmy_cluster::catchup::UnknownCause::NoCountingPeer)
+                .label()
+        );
+        body["owed_members"] = json!(owed_members(catch_up));
     }
     Ok(Json(body))
+}
+
+/// The members that owe the replay of this member's own origin, as node ids, in
+/// the order the tick left them (sorted).
+fn owed_members(catch_up: &kimmy_cluster::catchup::CatchUp) -> Vec<String> {
+    catch_up.owed_members().iter().map(ToString::to_string).collect()
 }
 
 // ---------------------------------------------------------------------------

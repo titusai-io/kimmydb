@@ -7412,7 +7412,21 @@ async fn a_peer_that_answers_a_horizon_for_the_whole_wait_is_given_up_on() {
     round_with(&scenario.restored, &scenario.peer, &catch_up).await;
     assert!(catch_up.replay_answered(peer), "a horizon for the whole wait is given up on");
 
-    catch_up.replay_note_members(me, [peer], [peer]);
+    let members = kimmy_cluster::Members::default();
+    members.insert_for_test(scenario.peer.addr, peer);
+    let reached = [kimmy_cluster::catchup::Reached {
+        node: peer,
+        servable: scenario.peer.engine.version_vector().unwrap(),
+        witnessed: None,
+        facts: None,
+    }];
+    catch_up.replay_note_members(&kimmy_cluster::catchup::ReplayTick {
+        me,
+        members: Some(&members),
+        reached: &reached,
+        expected_members: None,
+        now: std::time::Instant::now(),
+    });
     catch_up.replay_settle();
     assert!(!catch_up.replay_armed(), "nothing else is owed");
     assert_eq!(
@@ -7559,6 +7573,86 @@ async fn a_live_peer_that_holds_the_tail_holds_the_clear_until_it_has_answered()
     round_with(&scenario.restored, &scenario.peer, &catch_up).await;
     assert_eq!(catch_up.reason(), Some(kimmy_cluster::CatchUpReason::Restored));
     assert_eq!(judge(&[&scenario.behind, &scenario.peer]), Decision::Cleared("dominance"));
+}
+
+/// ADR-212: A restored member whose only holder of the lost writes is
+/// listed live and not reached (its cluster port filtered, say) serves as
+/// `unknown (owed)` past the holder's hold, naming it, where it used to clear by
+/// dominance against the peer that is behind. The first round with the holder
+/// proves the loss and gates the member again, the writes are read back, and a
+/// covering tick clears it.
+#[tokio::test]
+async fn a_restored_member_owed_by_a_live_holder_serves_as_unknown_until_it_answers() {
+    use kimmy_cluster::catchup::{Decision, Reached, ReplayTick, Tick, UnknownCause};
+    let scenario = lost_tail(2, 3, true).await;
+    let marker_dir = tempfile::tempdir().unwrap();
+    kimmy_cluster::catchup::write_marker(marker_dir.path(), kimmy_cluster::CatchUpReason::Restored)
+        .unwrap();
+    let catch_up = marker_in(&marker_dir);
+    let t0 = std::time::Instant::now();
+    catch_up.arm_replay_at(scenario.restored.engine.own_position_at_open(), None, t0).unwrap();
+    let me = scenario.restored.engine.node_id();
+    let (behind, holder) = (scenario.behind.engine.node_id(), scenario.peer.engine.node_id());
+    let members = kimmy_cluster::Members::default();
+    members.insert_for_test(scenario.behind.addr, behind);
+    members.insert_for_test(scenario.peer.addr, holder);
+    let live = members.node_ids();
+    let judge = |reached: &[&Node], at: std::time::Instant| {
+        let reached: Vec<Reached> = reached
+            .iter()
+            .map(|peer| Reached {
+                node: peer.engine.node_id(),
+                servable: peer.engine.version_vector().unwrap(),
+                witnessed: None,
+                facts: None,
+            })
+            .collect();
+        catch_up.replay_note_members(&ReplayTick {
+            me,
+            members: Some(&members),
+            reached: &reached,
+            expected_members: None,
+            now: at,
+        });
+        catch_up.replay_settle();
+        let mine = scenario.restored.engine.witnessed_vector().unwrap();
+        let servable = scenario.restored.engine.version_vector().unwrap();
+        catch_up.evaluate(&Tick {
+            me,
+            reached: &reached,
+            mine_witnessed: &mine,
+            mine_servable: &servable,
+            snapshot_pending: false,
+            live: Some(&live),
+            expected_members: None,
+            now: at,
+        })
+    };
+    let secs = Duration::from_secs;
+
+    round_with(&scenario.restored, &scenario.behind, &catch_up).await;
+    assert!(catch_up.replay_answered(behind), "the peer that is behind answers: nothing lost");
+    assert_eq!(judge(&[&scenario.behind], t0 + secs(5)), Decision::Kept);
+    assert!(catch_up.gated(t0 + secs(5)), "the holder's hold");
+    assert_eq!(judge(&[&scenario.behind], t0 + secs(130)), Decision::Kept, "no clear");
+    assert_eq!(catch_up.unknown_because(t0 + secs(130)), Some(UnknownCause::OwedReplay));
+    assert_eq!(catch_up.owed_members(), [holder]);
+
+    let mut changes = catch_up.subscribe();
+    changes.mark_unchanged();
+    round_with(&scenario.restored, &scenario.peer, &catch_up).await;
+    assert!(catch_up.gated(std::time::Instant::now()), "the proof gates the member again");
+    assert!(changes.has_changed().unwrap(), "and closes its streams");
+    let orders = scenario.restored.engine.get_collection("shop", "orders").unwrap();
+    assert_eq!(
+        scenario.restored.engine.count(&orders, kimmy_storage::WalkScope::Request).unwrap(),
+        scenario.documents,
+        "the lost writes are read back"
+    );
+    assert_eq!(
+        judge(&[&scenario.behind, &scenario.peer], t0 + secs(135)),
+        Decision::Cleared("dominance")
+    );
 }
 
 /// A peer that answers a pull with `BeyondHorizon` and takes this member to a

@@ -1095,7 +1095,7 @@ impl TelemetryGuard {
             u64_observable_gauge,
             "kimmy.catching_up.unknown",
             "{state}",
-            "The catching-up marker is set and no peer that could say has been reached within the wait: serving, with owner work off. One of five, exactly one is 1.",
+            "The catching-up marker is set and either no peer that could say has been reached within the wait, or a member listed live has not answered the replay of this member's own origin past it: serving, with owner work off. One of five, exactly one is 1.",
             |s| u64::from(s.ownership.catching_up == kimmy_cluster::catchup::slot_of("unknown"))
         );
         observe!(

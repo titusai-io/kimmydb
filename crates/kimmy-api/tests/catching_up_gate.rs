@@ -44,6 +44,8 @@ async fn member(reason: Option<CatchUpReason>, wait: Duration) -> Member {
     )
     .unwrap();
     let catch_up = CatchUp::open(marker_dir.path(), wait);
+    // The wait counts from the first sync tick: this is it.
+    catch_up.first_tick(std::time::Instant::now());
     state.set_catch_up(Arc::clone(&catch_up));
 
     // `/mcp` is merged beside the table before its layers, as the daemon merges
@@ -583,4 +585,131 @@ async fn a_member_without_membership_reads_its_ttl_collections_as_waiting_while_
 
     member.catch_up.clear("the test");
     assert_eq!(slots(&member)[TtlState::Owned.slot()], 1);
+}
+
+/// Drive `catch_up` into `unknown (owed)` with virtual instants (ADR-212): B
+/// (node 1) reached and answered, C (node 2) listed live and never answering,
+/// judged five seconds after the arming and past C's hold. The routes read the
+/// latch, a flag, so nothing sleeps. Returns C's id.
+fn into_owed_replay(catch_up: &CatchUp) -> kimmy_core::NodeId {
+    use kimmy_cluster::catchup::{Decision, Reached, ReplayTick, Tick, UnknownCause};
+    use kimmy_core::{Hlc, NodeId, VersionVector};
+    let id = |n: u8| NodeId::from_bytes([n; 16]);
+    let (me, b, c) = (id(9), id(1), id(2));
+    let members = Members::default();
+    members.insert_for_test("127.0.0.1:7001".parse().unwrap(), b);
+    members.insert_for_test("127.0.0.1:7002".parse().unwrap(), c);
+    let live = members.node_ids();
+    let mut servable = VersionVector::new();
+    servable.insert(b, Hlc::new(100, 0));
+    let mut mine = servable.clone();
+    mine.insert(me, Hlc::new(200, 0));
+    let reached = [Reached { node: b, servable, witnessed: None, facts: None }];
+    let t0 = std::time::Instant::now();
+    catch_up.arm_replay_at(Hlc::new(50, 0), None, t0).unwrap();
+    catch_up.replay_finished(b);
+    for at in [5, 130] {
+        let now = t0 + Duration::from_secs(at);
+        catch_up.replay_note_members(&ReplayTick {
+            me,
+            members: Some(&members),
+            reached: &reached,
+            expected_members: None,
+            now,
+        });
+        catch_up.replay_settle();
+        let decision = catch_up.evaluate(&Tick {
+            me,
+            reached: &reached,
+            mine_witnessed: &mine,
+            mine_servable: &mine,
+            snapshot_pending: false,
+            live: Some(&live),
+            expected_members: None,
+            now,
+        });
+        assert_eq!(decision, Decision::Kept, "{at} s");
+    }
+    assert_eq!(
+        catch_up.unknown_because(t0 + Duration::from_secs(130)),
+        Some(UnknownCause::OwedReplay),
+        "premise: C owes the replay past its hold"
+    );
+    c
+}
+
+fn keys(body: &Value) -> std::collections::BTreeSet<String> {
+    body.as_object().map(|o| o.keys().cloned().collect()).unwrap_or_default()
+}
+
+/// A member serving as `unknown` because a member owes it the replay says so in
+/// `/readyz`, by cause and by member, with exactly these keys; a data route is
+/// served, with the header (ADR-212).
+#[tokio::test]
+async fn in_owed_replay_readyz_names_the_cause_and_the_members_that_owe() {
+    let member = member(Some(CatchUpReason::Restored), Duration::from_secs(120)).await;
+    let owed = into_owed_replay(&member.catch_up);
+    let ready = get(&member, "/readyz").await;
+    assert_eq!(ready.status, 200, "{}", ready.text);
+    assert_eq!(
+        keys(&ready.body),
+        ["catching_up", "node", "owed_members", "status", "unknown_because"]
+            .map(String::from)
+            .into(),
+        "{}",
+        ready.text
+    );
+    assert_eq!(ready.body["catching_up"], "unknown");
+    assert_eq!(ready.body["unknown_because"], "owed_replay");
+    assert_eq!(ready.body["owed_members"], serde_json::json!([owed.to_string()]));
+    assert_eq!(ready.header.as_deref(), Some("unknown"));
+
+    let version = get(&member, "/v1/version").await;
+    assert_eq!(version.status, 200, "{}", version.text);
+    assert_eq!(version.header.as_deref(), Some("unknown"));
+}
+
+/// With no counting peer for the wait, `/readyz` gives the other cause, and the
+/// same keys.
+#[tokio::test]
+async fn with_no_counting_peer_readyz_names_that_cause() {
+    let member = member(Some(CatchUpReason::SeededEmpty), Duration::from_millis(1)).await;
+    tokio::time::sleep(Duration::from_millis(5)).await;
+    let ready = get(&member, "/readyz").await;
+    assert_eq!(ready.status, 200, "{}", ready.text);
+    assert_eq!(
+        keys(&ready.body),
+        ["catching_up", "node", "owed_members", "status", "unknown_because"]
+            .map(String::from)
+            .into(),
+        "{}",
+        ready.text
+    );
+    assert_eq!(ready.body["unknown_because"], "no_counting_peer");
+    assert_eq!(ready.body["owed_members"], serde_json::json!([]));
+}
+
+/// While gated with members owing the replay, the `503` names them beside the
+/// reason: that is where an operator looks during the hold.
+#[tokio::test]
+async fn a_gated_member_that_is_owed_the_replay_names_the_members_in_the_refusal() {
+    use kimmy_cluster::catchup::{Reached, ReplayTick};
+    let member = member(Some(CatchUpReason::Restored), Duration::from_secs(120)).await;
+    let c = kimmy_core::NodeId::from_bytes([2; 16]);
+    let members = Members::default();
+    members.insert_for_test("127.0.0.1:7002".parse().unwrap(), c);
+    let now = std::time::Instant::now();
+    member.catch_up.arm_replay_at(kimmy_core::Hlc::new(50, 0), None, now).unwrap();
+    let reached: [Reached; 0] = [];
+    member.catch_up.replay_note_members(&ReplayTick {
+        me: kimmy_core::NodeId::from_bytes([9; 16]),
+        members: Some(&members),
+        reached: &reached,
+        expected_members: None,
+        now,
+    });
+    let ready = get(&member, "/readyz").await;
+    assert_eq!(ready.status, 503, "{}", ready.text);
+    assert_eq!(ready.body["reason"], "restored");
+    assert_eq!(ready.body["owed_members"], serde_json::json!([c.to_string()]), "{}", ready.text);
 }

@@ -264,9 +264,31 @@ paths:
                     const: unknown
                     description: |
                       Present only when the member's catching-up marker is set
-                      and `cluster.catch_up_wait_secs` has run out with no peer
-                      reached that could say whether it is behind: it serves,
-                      and does no expiry, embedding or webhook work.
+                      and it serves as `unknown`: it serves, and does no expiry,
+                      embedding or webhook work. `unknown_because` says why, and
+                      is always present with it, as is `owed_members`.
+                  unknown_because:
+                    type: string
+                    enum: [no_counting_peer, owed_replay]
+                    description: |
+                      Why the member serves as `unknown`. `no_counting_peer`:
+                      `cluster.catch_up_wait_secs` has run out with no peer
+                      reached that could say whether it is behind; reaching one
+                      that is ahead returns it to `503`. `owed_replay`: a clear
+                      rule held, but members the cluster lists live have not
+                      answered the replay of this member's own origin within
+                      that wait, and writes it lost may be on them; it stays so
+                      until each has answered or has been gone from the cluster
+                      for the dwell, and a peer that is ahead does not return it
+                      to `503`. When both hold, `owed_replay`. Either returns to
+                      `503` when the replay proves writes lost.
+                  owed_members:
+                    type: array
+                    items: { type: string }
+                    description: |
+                      The node ids of the members that owe the replay of this
+                      member's own origin, sorted, as of the last tick: never
+                      empty when `unknown_because` is `owed_replay`.
         "503":
           description: |
             Not ready. While the node's store is opening the body is the error
@@ -276,7 +298,8 @@ paths:
             phase counts. It is also the answer of a node whose storage engine
             has hit an I/O error, and of a member that knows it is behind
             (`error: catching_up`, `retry: elsewhere`, and `reason`, the state; its
-            catching-up marker is set, see `x-kimmy-catching-up`).
+            catching-up marker is set, see `x-kimmy-catching-up`), with
+            `owed_members` while members owe it the replay of its own origin.
           content:
             application/json:
               schema:
@@ -291,6 +314,18 @@ paths:
                       phase_age_seconds: { type: number }
                       done: { type: integer }
                       total: { type: integer }
+                      reason:
+                        type: string
+                        enum: [seeded_empty, restored, snapshot]
+                        description: |
+                          The catching-up state, with `error: catching_up`.
+                      owed_members:
+                        type: array
+                        items: { type: string }
+                        description: |
+                          With `error: catching_up`, while members owe the
+                          replay of this member's own origin: their node ids,
+                          sorted.
         "400": { $ref: "#/components/responses/BadRequest" }
 
   /metrics:

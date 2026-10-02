@@ -793,7 +793,22 @@ WebSocket upgrade included. Every response of a member whose marker is set carri
 `x-kimmy-catching-up: <state>` (`seeded_empty`, `restored`, `snapshot` or `unknown`).
 Past `cluster.catch_up_wait_secs` with no peer reached that could say whether it is
 behind, the member serves as `unknown`: `/readyz` is `200` and carries
-`"catching_up": "unknown"`. `GET /v1/topology` marks the member (`catchingUp` with the
+`"catching_up": "unknown"`. It also serves as `unknown`, rather than clearing, while a
+member the cluster lists live still owes it the replay of its own origin past that
+wait ([ADR-212](decisions.md)). Beside `catching_up`, `/readyz` then carries
+`unknown_because`, `"no_counting_peer"` or `"owed_replay"` (the second when both hold),
+and `owed_members`, the node ids of the members that owe the replay, sorted (never
+empty under `owed_replay`):
+
+```json
+{"status":"ready","node":"9d5200f2-…","catching_up":"unknown",
+ "unknown_because":"owed_replay","owed_members":["4c1e07a9-…"]}
+```
+
+The two differ in what comes next: `no_counting_peer` returns to `503` when a peer that
+is ahead is reached, `owed_replay` does not, and either returns to `503` when the replay
+proves this member lost writes. While a member is gated and members owe it the replay,
+the `503` carries `owed_members` beside `reason`. `GET /v1/topology` marks the member (`catchingUp` with the
 state) and a peer that says it is catching up (`catchingUp: true`).
 
 Metrics deliberately expose **counts only** — naming collections there would
