@@ -653,22 +653,32 @@ impl Engine {
         upsert: bool,
         expected: Option<Stamp>,
     ) -> Result<(WriteOutcome, Option<OplogEntry>)> {
-        // The id is part of the document's identity, not its content: a replace
-        // must not be able to move a document to a different key.
-        let doc = with_id_first(doc, id.to_bson());
-
         let key = doc_key(id)?;
-        let body = bson::serialize_to_vec(&doc)?;
 
-        let (existed, previous, stamp) = {
+        let (existed, previous, stamp, doc, body) = {
             let mut docs = txn.open_table(tables::DOCS)?;
+            // The id is part of the document's identity, not its content: a
+            // replace must not be able to move a document to a different
+            // key. Its stored type is kept (see `replace_id_value`), so the
+            // key is the same and `$type` does not change under the caller.
+            let existing = match docs.get((coll.id.0, key.as_slice()))? {
+                Some(raw) => Some(codec::decode_doc_record(raw.value())?),
+                None => None,
+            };
+            let stored_doc = match &existing {
+                Some(record) => record.document()?,
+                None => None,
+            };
+            let stored_id = stored_doc.as_ref().and_then(|d| d.get(ID_FIELD));
+            let id_value = replace_id_value(id, stored_id, doc.get(ID_FIELD));
+            let doc = with_id_first(doc, id_value);
+            let body = bson::serialize_to_vec(&doc)?;
             // The previous image is needed to remove the index entries it
             // contributed — they are derived from the old value, not the new.
-            let (current, previous, unchanged) = match docs.get((coll.id.0, key.as_slice()))? {
-                Some(raw) => {
-                    let record = codec::decode_doc_record(raw.value())?;
+            let (current, previous, unchanged) = match &existing {
+                Some(record) => {
                     let unchanged = record.is_live() && record.body == body;
-                    (record.is_live().then_some(record.stamp), record.document()?, unchanged)
+                    (record.is_live().then_some(record.stamp), stored_doc, unchanged)
                 }
                 None => (None, None, false),
             };
@@ -701,7 +711,7 @@ impl Engine {
                 &key,
                 &codec::encode_doc_record(&record),
             )?;
-            (existed, previous, stamp)
+            (existed, previous, stamp, doc, body)
         };
 
         // Same transaction as the document write, so the index cannot describe
@@ -1652,6 +1662,31 @@ impl Engine {
             Some(doc) => Ok(Some(extract_id(&doc)?)),
             None => Ok(None),
         }
+    }
+}
+
+/// The `_id` value a replace stores for the document keyed `id`.
+///
+/// The key encoding ranks every integer type equal, so any integer type finds
+/// the document; what differs is the type the caller sees. The rule, in order:
+/// the stored `_id` when it is that same id, so a replace never re-types an
+/// existing document; else the body's own `_id` when it is that same id, as an
+/// insert keeps it; else, for an integer id, the narrowest type that holds it
+/// (an int32 when it fits), the type a JSON insert of the same number stores.
+/// Other id types have one representation.
+fn replace_id_value<'a>(id: &DocId, stored: Option<&'a Bson>, body: Option<&'a Bson>) -> Bson {
+    let same = |value: Option<&'a Bson>| {
+        value.filter(|v| DocId::try_from_bson(v).is_ok_and(|other| &other == id))
+    };
+    if let Some(value) = same(stored).or_else(|| same(body)) {
+        return value.clone();
+    }
+    match id {
+        DocId::Int64(i) => match i32::try_from(*i) {
+            Ok(narrow) => Bson::Int32(narrow),
+            Err(_) => Bson::Int64(*i),
+        },
+        other => other.to_bson(),
     }
 }
 
@@ -3138,5 +3173,41 @@ mod tests {
                 .unwrap()
                 .is_empty()
         );
+    }
+
+    fn stored_id(engine: &Engine, coll: &CollectionMeta, id: &DocId) -> Bson {
+        engine.get(coll, id).unwrap().unwrap().get(ID_FIELD).cloned().unwrap()
+    }
+
+    #[test]
+    fn a_replace_keeps_the_type_of_the_stored_id() {
+        let (engine, coll, _dir) = engine();
+        engine.insert(&coll, doc! {"_id": 3_i32, "a": 1}).unwrap();
+        engine.insert(&coll, doc! {"_id": 4_i64, "a": 1}).unwrap();
+        let narrow = engine.replace(&coll, &DocId::Int64(3), doc! {"a": 1}, false).unwrap();
+        let wide = engine.replace(&coll, &DocId::Int64(4), doc! {"a": 1}, false).unwrap();
+        assert_eq!(stored_id(&engine, &coll, &DocId::Int64(3)), Bson::Int32(3));
+        assert_eq!(stored_id(&engine, &coll, &DocId::Int64(4)), Bson::Int64(4));
+        // Nothing changed, so nothing is written.
+        assert!(!narrow.modified && !wide.modified, "{narrow:?} {wide:?}");
+        assert!(narrow.stamp.is_none() && wide.stamp.is_none());
+        // A body naming a different type does not re-type the stored id.
+        engine.replace(&coll, &DocId::Int64(3), doc! {"_id": 3_i64, "a": 2}, false).unwrap();
+        assert_eq!(stored_id(&engine, &coll, &DocId::Int64(3)), Bson::Int32(3));
+    }
+
+    #[test]
+    fn an_upserting_replace_stores_an_integer_id_as_a_json_insert_would() {
+        let (engine, coll, _dir) = engine();
+        engine.replace(&coll, &DocId::Int64(7), doc! {"a": 1}, true).unwrap();
+        engine.replace(&coll, &DocId::Int64(1 << 40), doc! {"a": 1}, true).unwrap();
+        engine.replace(&coll, &DocId::Int64(8), doc! {"_id": 8_i64, "a": 1}, true).unwrap();
+        // A body naming another id never moves the document off its key.
+        engine.replace(&coll, &DocId::Int64(9), doc! {"_id": 999, "a": 1}, true).unwrap();
+        assert_eq!(stored_id(&engine, &coll, &DocId::Int64(9)), Bson::Int32(9));
+        assert_eq!(stored_id(&engine, &coll, &DocId::Int64(7)), Bson::Int32(7));
+        assert_eq!(stored_id(&engine, &coll, &DocId::Int64(1 << 40)), Bson::Int64(1 << 40));
+        // The body's own `_id` is kept as written, as an insert keeps it.
+        assert_eq!(stored_id(&engine, &coll, &DocId::Int64(8)), Bson::Int64(8));
     }
 }

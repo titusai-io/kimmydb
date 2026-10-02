@@ -22707,14 +22707,14 @@ one that did.
   here, since it is checked against this member's own version and a no-op
   under it still writes nothing.
 
-**Two places still count where nothing looks different**, both because the
-stored type changes. Integer arithmetic answers a 64-bit integer, so `$inc`
-by `0` or `$mul` by `1` on a 32-bit field widens it and is a change. A
-`PUT` stores the `_id` the path names, and an integer path is a 64-bit
-integer, so the first replace of a document inserted with a small integer
-`_id`, stored as 32-bit, changes its `_id`'s type and is a change; the
-second is not. Each is a change of stored bytes, which is the rule, and
-changing either is a decision of its own, tracked separately.
+> **Amended (0.44.0, item B15).** Two places counted where nothing looked
+> different, because the stored type changed: integer arithmetic answered a
+> 64-bit integer, so `$inc` by `0` or `$mul` by `1` on a 32-bit field was a
+> change, and a `PUT` stored the `_id` the path names as a 64-bit integer, so
+> the first replace over a small integer `_id` was one. Both now keep the
+> stored type (arithmetic keeps the narrowest integer type that holds the
+> result; a replace keeps the stored `_id`'s type), so neither counts. See the
+> Query language page, "Integers stay integral".
 
 **Why.** Reporting a change that did not happen is answering a question the
 caller did not ask, and the cost was never the number: it was a write, an

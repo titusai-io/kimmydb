@@ -234,10 +234,11 @@ are dropped — and `_id` always comes from the path, never the body.
 ([ADR-208](decisions.md)): `{"matched": 1, "modified": 0, "upserted": false}`,
 no `stamp`, and the document keeps its version, so no oplog entry, no change
 event and nothing for other nodes. Identical means the stored bytes: the same
-fields in another order are a change. `_id` is stored as the path names it,
-and an integer in the path is a 64-bit integer, so the first `PUT` over a
-document inserted with a small integer `_id` (stored as 32-bit) changes that
-type and counts as modified.
+fields in another order are a change. `_id` keeps the type it was
+stored with, so a `PUT` over a document inserted with a 32-bit integer `_id`
+leaves it 32-bit and an identical body is no change. A `PUT` with `upsert` that
+creates the document keeps the body's `_id` when it names the same id, else
+stores a 32-bit integer for a path id that fits one.
 
 **Without `?upsert=true` a missing document is not an error.** The answer is
 `200 {"matched": 0}` and nothing is written. A test built on the assumption

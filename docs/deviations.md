@@ -720,12 +720,9 @@ no index maintenance, no oplog entry, nothing replicated or published.
 `stamp` for a write that wrote nothing. A `multi` chunk that changed nothing
 is not committed and not counted in `commits`. "The same" is the stored
 bytes: a `1` over a `1.0`, or the same fields in another order, is a change,
-which is also MongoDB's rule. Two places still differ from MongoDB, both
-because a value's stored type changes: `$inc` and `$mul` on a 32-bit integer
-answer a 64-bit one, so `$inc` by `0` on one counts, and a `PUT` stores the
-`_id` the path names, so the first replace of a document inserted with a
-32-bit integer `_id` stores a 64-bit one and counts. Both are tracked
-separately. Breaking for callers
+which is also MongoDB's rule. Two places differed because a value's stored
+type changed, `$inc` and `$mul` on a 32-bit integer and a `PUT` over a 32-bit
+integer `_id`; both now keep the stored type and are closed. Breaking for callers
 who relied on `modified == matched`, in a `0.MINOR`.
 
 ---

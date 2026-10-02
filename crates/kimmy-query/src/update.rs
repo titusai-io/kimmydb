@@ -1110,7 +1110,7 @@ enum Arith {
     Mul,
 }
 
-/// Apply arithmetic, preserving integer types where the result still fits.
+/// Apply arithmetic, keeping the narrowest integer type that holds the result.
 fn arithmetic(base: &Bson, operand: &Bson, op: Arith, path: &str) -> Result<Bson> {
     let both_int = matches!(base, Bson::Int32(_) | Bson::Int64(_))
         && matches!(operand, Bson::Int32(_) | Bson::Int64(_));
@@ -1125,7 +1125,15 @@ fn arithmetic(base: &Bson, operand: &Bson, op: Arith, path: &str) -> Result<Bson
         // On overflow, widening to a double loses precision silently; refusing
         // is the honest outcome.
         return match result {
-            Some(v) => Ok(Bson::Int64(v)),
+            // The narrowest type that holds the result: two int32s stay an
+            // int32 until the result no longer fits one, and anything with an
+            // int64 operand is an int64.
+            Some(v) => match (base, operand) {
+                (Bson::Int32(_), Bson::Int32(_)) => {
+                    Ok(i32::try_from(v).map_or(Bson::Int64(v), Bson::Int32))
+                }
+                _ => Ok(Bson::Int64(v)),
+            },
             None => Err(Error::InvalidUpdate(format!(
                 "arithmetic on field {path:?} overflowed a 64-bit integer"
             ))),
@@ -1238,9 +1246,9 @@ mod tests {
 
     #[test]
     fn inc_starts_a_missing_field_from_zero() {
-        assert_eq!(applied(doc! { "$inc": { "n": 5 } }, doc! {}), doc! { "n": 5i64 });
-        assert_eq!(applied(doc! { "$inc": { "n": 5 } }, doc! { "n": 1 }), doc! { "n": 6i64 });
-        assert_eq!(applied(doc! { "$inc": { "n": -2 } }, doc! { "n": 1 }), doc! { "n": -1i64 });
+        assert_eq!(applied(doc! { "$inc": { "n": 5 } }, doc! {}), doc! { "n": 5 });
+        assert_eq!(applied(doc! { "$inc": { "n": 5 } }, doc! { "n": 1 }), doc! { "n": 6 });
+        assert_eq!(applied(doc! { "$inc": { "n": -2 } }, doc! { "n": 1 }), doc! { "n": -1 });
     }
 
     #[test]
@@ -1248,6 +1256,38 @@ mod tests {
         // Silently widening to a double would lose precision on large ids.
         let out = applied(doc! { "$inc": { "n": 1 } }, doc! { "n": 9_007_199_254_740_992i64 });
         assert_eq!(out.get_i64("n").unwrap(), 9_007_199_254_740_993);
+    }
+
+    #[test]
+    fn arithmetic_keeps_the_narrowest_integer_type_that_holds_the_result() {
+        let n = |update: Document, doc: Document| applied(update, doc).get("n").cloned().unwrap();
+        // int32 with int32 stays int32, for both operators and for an absent field.
+        assert_eq!(n(doc! { "$inc": { "n": 1 } }, doc! { "n": 5 }), Bson::Int32(6));
+        assert_eq!(n(doc! { "$mul": { "n": 3 } }, doc! { "n": 4 }), Bson::Int32(12));
+        assert_eq!(n(doc! { "$inc": { "n": 7 } }, doc! {}), Bson::Int32(7));
+        assert_eq!(n(doc! { "$mul": { "n": 7 } }, doc! {}), Bson::Int32(0));
+        assert_eq!(n(doc! { "$inc": { "n": 0 } }, doc! { "n": 5 }), Bson::Int32(5));
+        // Past the int32 range it becomes an int64, in both directions.
+        assert_eq!(
+            n(doc! { "$inc": { "n": 1 } }, doc! { "n": i32::MAX }),
+            Bson::Int64(i64::from(i32::MAX) + 1)
+        );
+        assert_eq!(
+            n(doc! { "$inc": { "n": -1 } }, doc! { "n": i32::MIN }),
+            Bson::Int64(i64::from(i32::MIN) - 1)
+        );
+        assert_eq!(
+            n(doc! { "$mul": { "n": 2 } }, doc! { "n": i32::MAX }),
+            Bson::Int64(i64::from(i32::MAX) * 2)
+        );
+        // An int64 on either side gives an int64, even when the result fits an int32.
+        assert_eq!(n(doc! { "$inc": { "n": 1i64 } }, doc! { "n": 5 }), Bson::Int64(6));
+        assert_eq!(n(doc! { "$inc": { "n": 1 } }, doc! { "n": 5i64 }), Bson::Int64(6));
+        assert_eq!(n(doc! { "$inc": { "n": 1i64 } }, doc! {}), Bson::Int64(1));
+        assert_eq!(n(doc! { "$mul": { "n": 2 } }, doc! { "n": 5i64 }), Bson::Int64(10));
+        // Any double gives a double.
+        assert_eq!(n(doc! { "$inc": { "n": 1.0 } }, doc! { "n": 5 }), Bson::Double(6.0));
+        assert_eq!(n(doc! { "$mul": { "n": 2 } }, doc! { "n": 2.5 }), Bson::Double(5.0));
     }
 
     #[test]
@@ -1269,9 +1309,9 @@ mod tests {
 
     #[test]
     fn mul_multiplies() {
-        assert_eq!(applied(doc! { "$mul": { "n": 3 } }, doc! { "n": 4 }), doc! { "n": 12i64 });
+        assert_eq!(applied(doc! { "$mul": { "n": 3 } }, doc! { "n": 4 }), doc! { "n": 12 });
         // A missing field is treated as zero, as in Mongo.
-        assert_eq!(applied(doc! { "$mul": { "n": 3 } }, doc! {}), doc! { "n": 0i64 });
+        assert_eq!(applied(doc! { "$mul": { "n": 3 } }, doc! {}), doc! { "n": 0 });
     }
 
     #[test]
@@ -1557,7 +1597,7 @@ mod tests {
             doc! { "n": 5, "tags": [] },
         );
         assert_eq!(out.get_i32("a").unwrap(), 1);
-        assert_eq!(out.get_i64("n").unwrap(), 6);
+        assert_eq!(out.get_i32("n").unwrap(), 6);
         assert_eq!(out.get_array("tags").unwrap().len(), 1);
     }
 
@@ -1718,7 +1758,7 @@ mod tests {
                 vec![doc! { "g": { "$gte": 80 } }],
                 doc! { "grades": [70, 80, 90] },
             ),
-            doc! { "grades": [70, 90i64, 100i64] }
+            doc! { "grades": [70, 90, 100] }
         );
         // Equality against the element itself.
         assert_eq!(
@@ -1739,7 +1779,7 @@ mod tests {
                 vec![],
                 doc! { "grades": [1, 2, 3] },
             ),
-            doc! { "grades": [6i64, 7i64, 8i64] }
+            doc! { "grades": [6, 7, 8] }
         );
         let out = applied_with(doc! { "$set": { "items.$[].shipped": true } }, vec![], order());
         assert_eq!(shipped(&out), vec![true, true, true]);
@@ -1795,8 +1835,8 @@ mod tests {
             doc! { "items": [ { "sku": "a", "qty": 1 }, { "sku": "b", "qty": 5, "price": 3 } ] },
         );
         let line = out.get_array("items").unwrap()[1].as_document().unwrap();
-        assert_eq!(line.get_i64("qty").unwrap(), 6);
-        assert_eq!(line.get_i64("price").unwrap(), 6);
+        assert_eq!(line.get_i32("qty").unwrap(), 6);
+        assert_eq!(line.get_i32("price").unwrap(), 6);
         assert_eq!(line.get_i32("seen").unwrap(), 7);
         assert_eq!(line.get_datetime("at").unwrap().timestamp_millis(), NOW);
         // The unselected line is exactly as it was.
@@ -2328,14 +2368,14 @@ mod tests {
         // The upsert path: the filter's seed, then $setOnInsert, then the rest.
         assert_eq!(
             inserted(update.clone(), doc! { "_id": "hits" }),
-            doc! { "_id": "hits", "created_at": 100, "n": 1i64 }
+            doc! { "_id": "hits", "created_at": 100, "n": 1 }
         );
         // The match path: the field is left exactly as it was — present or not.
         assert_eq!(
             applied(update.clone(), doc! { "_id": "hits", "created_at": 1, "n": 1 }),
-            doc! { "_id": "hits", "created_at": 1, "n": 2i64 }
+            doc! { "_id": "hits", "created_at": 1, "n": 2 }
         );
-        assert_eq!(applied(update, doc! { "n": 1 }), doc! { "n": 2i64 });
+        assert_eq!(applied(update, doc! { "n": 1 }), doc! { "n": 2 });
         // Alone, on an existing document, it is a no-op rather than an error.
         assert_eq!(applied(doc! { "$setOnInsert": { "a": 1 } }, doc! { "b": 2 }), doc! { "b": 2 });
     }
@@ -2362,7 +2402,7 @@ mod tests {
         // $inc sees the value $setOnInsert put there, on insert only.
         assert_eq!(
             inserted(doc! { "$setOnInsert": { "n": 10 }, "$inc": { "m": 1 } }, doc! {}),
-            doc! { "n": 10, "m": 1i64 }
+            doc! { "n": 10, "m": 1 }
         );
     }
 
@@ -2486,7 +2526,7 @@ mod tests {
     fn writes_to_separate_paths_still_apply_together() {
         assert_eq!(
             applied(doc! { "$set": { "a": 1 }, "$inc": { "b": 5 } }, doc! { "a": 0, "b": 1 }),
-            doc! { "a": 1, "b": 6i64 }
+            doc! { "a": 1, "b": 6 }
         );
         assert_eq!(
             applied(
@@ -2498,7 +2538,7 @@ mod tests {
         // A shared prefix of the name is not a shared path.
         assert_eq!(
             applied(doc! { "$set": { "ab": 1 }, "$inc": { "a": 1 } }, doc! {}),
-            doc! { "ab": 1, "a": 1i64 }
+            doc! { "ab": 1, "a": 1 }
         );
         assert_eq!(
             applied(doc! { "$rename": { "a": "b" }, "$set": { "c": 1 } }, doc! { "a": 7 }),
@@ -2580,11 +2620,11 @@ mod tests {
             vec![doc! { "l.sku": "z" }],
             order(),
         );
-        let qty: Vec<i64> = out
+        let qty: Vec<i32> = out
             .get_array("items")
             .unwrap()
             .iter()
-            .map(|line| line.as_document().unwrap().get_i64("qty").unwrap())
+            .map(|line| line.as_document().unwrap().get_i32("qty").unwrap())
             .collect();
         assert_eq!(qty, vec![2, 6, 10]);
         // Two filters that select different lines, on one field.
@@ -2639,7 +2679,7 @@ mod tests {
             filters(),
             start(),
         );
-        assert_eq!(one, doc! { "items": [ { "qty": 3i64 } ] });
+        assert_eq!(one, doc! { "items": [ { "qty": 3 } ] });
         assert_eq!(one, other);
 
         // With no conflict at all: `m` reads the sku as it was, so the line

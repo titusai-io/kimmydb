@@ -111,6 +111,20 @@ breaking changes and says so here; a `0.x.PATCH` bump never does.
   text now reads the value; write the array as `{"$literal": [...]}` to keep
   the text. See aggregation.md, "Arrays and `$literal`", and ADR-215.
 
+- **Breaking: `$inc` and `$mul` keep a 32-bit integer 32-bit, and `PUT` keeps
+  `_id`'s type.** Integer arithmetic answers the narrowest type that holds the
+  result: two 32-bit integers stay a 32-bit integer until the result leaves
+  its range, then a 64-bit integer; a 64-bit operand gives a 64-bit integer; a
+  double gives a double; an absent field starts as a 32-bit `0`. A `PUT` over
+  an existing document keeps the `_id` type it was stored with, and one that
+  creates a document with `upsert` keeps the body's `_id` when it names the
+  same id, else stores a 32-bit integer for a path id that fits one. Before,
+  both stored a 64-bit integer, so `$type: "int"` stopped finding the field or
+  the `_id`, and `$inc` by `0` or the first identical `PUT` counted in
+  `modified`. For callers that read the type, `$type` and the stored type
+  answer 32-bit where they answered 64-bit; values are unchanged. See Query
+  language, "Integers stay integral".
+
 - **Breaking: `modified` counts the documents an update changed, and a
   document it leaves as it was is not written.** An `update` (single or
   `multi`), a `find_and_modify` or a `PUT .../docs/{id}` whose new document is
@@ -125,10 +139,7 @@ breaking changes and says so here; a `0.x.PATCH` bump never does.
   which nothing changed spends no commit and does not count in `commits`. The
   comparison is of the stored bytes: a value of another type (`1` over
   `1.0`), `-0.0` over `0.0`, or the same fields in another order is a change.
-  `$inc` by `0` on a 32-bit integer still counts, because integer arithmetic
-  stores a 64-bit result, and so does the first `PUT` over a document
-  inserted with a small integer `_id`, which the path stores as a 64-bit
-  integer; both are tracked separately. A replacement through `update` or
+  A replacement through `update` or
   `find_and_modify` now stores `_id` first, as an insert and a `PUT` do, where
   it used to put it last when the replacement left it out; a document an
   earlier such replacement stored with `_id` last counts as changed once, the

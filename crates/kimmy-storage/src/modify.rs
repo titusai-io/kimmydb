@@ -2033,9 +2033,11 @@ mod tests {
 
         // A change, even where it looks like none.
         //
-        // Integer arithmetic answers a 64-bit integer, so `$inc` by zero on
-        // a 32-bit field widens it: a different type, so a write.
-        assert!(changes(doc! {"n": 5_i32}, doc! {"$inc": {"n": 0_i32}}));
+        // An int64 operand widens a 32-bit field: a different type, so a
+        // write. An int32 operand keeps it, so `$inc` by zero is no change.
+        assert!(changes(doc! {"n": 5_i32}, doc! {"$inc": {"n": 0_i64}}));
+        assert!(!changes(doc! {"n": 5_i32}, doc! {"$inc": {"n": 0_i32}}));
+        assert!(!changes(doc! {"n": 5_i32}, doc! {"$mul": {"n": 1_i32}}));
         // `$currentDate` sets the time of the write over an earlier one.
         assert!(changes(
             doc! {"t": bson::DateTime::from_millis(0)},

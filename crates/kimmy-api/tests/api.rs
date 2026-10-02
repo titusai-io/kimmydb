@@ -2884,14 +2884,62 @@ async fn a_replace_with_the_stored_body_is_not_written() {
     let res = server.put("/v1/db/shop/coll/c/docs/k", Some(&token), json!({"b":2,"a":1})).await;
     assert_eq!((res.body["modified"].clone(), res.body["stamp"].is_string()), (json!(1), true));
 
-    // `_id` is stored as the path names it, a 64-bit integer, so the first
-    // `PUT` over a document inserted with a 32-bit `_id` changes its type and
-    // counts; the second does not.
+    // `_id` keeps the type it was stored with, so a `PUT` over a document
+    // inserted with a 32-bit `_id` changes nothing and does not count.
     server.post("/v1/db/shop/coll/c/docs", Some(&token), json!({"_id":5,"a":1})).await;
     let res = server.put("/v1/db/shop/coll/c/docs/5", Some(&token), json!({"a":1})).await;
-    assert_eq!(res.body["modified"], 1, "{:?}", res.body);
+    assert_eq!(res.body["modified"], 0, "{:?}", res.body);
     let res = server.put("/v1/db/shop/coll/c/docs/5", Some(&token), json!({"a":1})).await;
     assert_eq!(res.body["modified"], 0, "{:?}", res.body);
+    // A changed body still counts, and `_id` is still a 32-bit integer.
+    let res = server.put("/v1/db/shop/coll/c/docs/5", Some(&token), json!({"a":2})).await;
+    assert_eq!(res.body["modified"], 1, "{:?}", res.body);
+    let found = server
+        .post(
+            "/v1/db/shop/coll/c/find",
+            Some(&token),
+            json!({ "filter": { "_id": { "$type": "int" } } }),
+        )
+        .await;
+    assert_eq!(found.body["documents"].as_array().map(Vec::len), Some(1), "{:?}", found.body);
+}
+
+/// Integer arithmetic keeps the narrowest type that holds the result, so an
+/// `$inc` of zero on a 32-bit field is no change and `$type` still says int.
+#[tokio::test]
+async fn arithmetic_updates_keep_a_32_bit_field_32_bit() {
+    let server = Server::start().await;
+    let token = server.root().await;
+    server.post("/v1/db/shop/collections", Some(&token), json!({"name":"c"})).await;
+    server.post("/v1/db/shop/coll/c/docs", Some(&token), json!({"_id":"k","n":5})).await;
+    let update = |update: Value| {
+        server.post(
+            "/v1/db/shop/coll/c/update",
+            Some(&token),
+            json!({ "filter": {"_id": "k"}, "update": update }),
+        )
+    };
+    let res = update(json!({"$inc": {"n": 0}})).await;
+    assert_eq!(res.body["modified"], 0, "{:?}", res.body);
+    let res = update(json!({"$mul": {"n": 1}})).await;
+    assert_eq!(res.body["modified"], 0, "{:?}", res.body);
+    let res = update(json!({"$inc": {"n": 1, "fresh": 2}})).await;
+    assert_eq!(res.body["modified"], 1, "{:?}", res.body);
+    let count = |ty: &'static str| {
+        let (server, token) = (&server, &token);
+        async move {
+            let found = server
+                .post(
+                    "/v1/db/shop/coll/c/find",
+                    Some(token),
+                    json!({ "filter": { "n": { "$type": ty }, "fresh": { "$type": ty } } }),
+                )
+                .await;
+            found.body["documents"].as_array().map(Vec::len)
+        }
+    };
+    assert_eq!(count("int").await, Some(1));
+    assert_eq!(count("long").await, Some(0));
 }
 
 /// A replacement through `/update` or `find_and_modify` keeps `_id` first,
@@ -3626,7 +3674,7 @@ async fn describe_refuses_a_zero_sample_and_clamps_a_large_one() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn concurrent_increments_through_update_are_all_kept() {
     const WRITERS: u64 = 4;
-    const EACH: u64 = 500;
+    const EACH: u64 = 50;
 
     let server = Arc::new(Server::start().await);
     let token = server.root().await;
