@@ -63,6 +63,7 @@ use std::time::Duration;
 
 use bson::{Document, doc};
 use kimmy_core::{Hlc, NodeId, OpKind, OplogEntry, Stamp, VersionVector};
+use kimmy_storage::sync::{WindowEnd, coverage_up_to};
 use serde_json::{Value, json};
 use tracing::{debug, info, warn};
 use tracing_opentelemetry::OpenTelemetrySpanExt;
@@ -168,9 +169,23 @@ pub struct DispatchOutcome {
 #[derive(Default)]
 pub struct Backoff {
     failures: std::collections::HashMap<String, (u32, std::time::Instant)>,
+    /// When this process last wrote a subscription's progress on the heartbeat.
+    wrote: std::collections::HashMap<String, std::time::Instant>,
+    /// Test seam: called right after a subscription's window has been scanned, so a
+    /// test can land an entry at the one point where reading this node's position
+    /// too late would cover an entry the scan never saw.
+    #[cfg(test)]
+    after_scan: Option<Arc<dyn Fn() + Send + Sync>>,
 }
 
 impl Backoff {
+    /// Call `hook` after each window scan (tests only).
+    #[cfg(test)]
+    pub(crate) fn with_after_scan_hook(mut self, hook: impl Fn() + Send + Sync + 'static) -> Self {
+        self.after_scan = Some(Arc::new(hook));
+        self
+    }
+
     /// Whether this subscription may be attempted now.
     fn ready(&self, subscription: &str) -> bool {
         match self.failures.get(subscription) {
@@ -201,6 +216,17 @@ impl Backoff {
     /// its endpoint was failing would leave its entry behind forever.
     fn prune(&mut self, live: &std::collections::HashSet<&str>) {
         self.failures.retain(|id, _| live.contains(id.as_str()));
+        self.wrote.retain(|id, _| live.contains(id.as_str()));
+    }
+
+    /// Whether the heartbeat wrote this subscription's progress less than `window` ago.
+    fn wrote_within(&self, subscription: &str, window: Duration) -> bool {
+        self.wrote.get(subscription).is_some_and(|at| at.elapsed() < window)
+    }
+
+    /// The heartbeat has just written this subscription's progress.
+    fn note_wrote(&mut self, subscription: &str) {
+        self.wrote.insert(subscription.to_string(), std::time::Instant::now());
     }
 
     /// Consecutive failures recorded for a subscription.
@@ -678,11 +704,39 @@ fn load_jobs(state: &SharedState) -> kimmy_storage::Result<Vec<Job>> {
     Ok(jobs)
 }
 
+/// Where a scanned window ended: the oplog's end, or the last entry it examined.
+/// Every entry from where it began through there was looked at, wanted or not.
+fn window_end(window: &kimmy_storage::OplogWindow) -> WindowEnd {
+    if window.exhausted {
+        return WindowEnd::Exhausted;
+    }
+    match window.entries.last() {
+        Some(last) if last.stamp.hlc <= window.scanned_to => WindowEnd::Through(last.stamp),
+        Some(last) => WindowEnd::Through(Stamp::new(window.scanned_to, last.stamp.node)),
+        // An empty window that is not the tail cannot be: nothing was examined, so
+        // nothing is claimed.
+        None => WindowEnd::Before(Stamp::new(Hlc::ZERO, NodeId::from_bytes([0; 16]))),
+    }
+}
+
+/// Raise `progress`, for every origin in `current`, to the lower of this node's
+/// position for it (as it stood before the window was scanned) and where the
+/// window ended, and never lower anything: the same rule as ADR-082's for a sync
+/// window, through the same function.
+fn carry_forward(progress: &mut VersionVector, current: &VersionVector, end: WindowEnd) {
+    progress.merge(&coverage_up_to(current, end));
+}
+
 /// A subscription with a batch ready to go out.
 struct Planned {
     job: Job,
     /// The union progress as it stood, to be advanced once the batch lands.
     progress: VersionVector,
+    /// This node's position as it stood **before the window was scanned**, and how
+    /// far the pass got through that window: once the batch lands, every origin is
+    /// raised to the lower of the two (see `covered_by`).
+    current: VersionVector,
+    through: WindowEnd,
     delivery: Delivery,
     /// Events in the batch — the count `DispatchOutcome` and the metrics report.
     events: usize,
@@ -810,6 +864,13 @@ pub async fn dispatch_once_owned(
             // anti-entropy asks of a peer. `None` means the subscription's progress
             // already covers everything this node holds — it is caught up, and
             // there is nothing to read, invalidate or deliver.
+            // Read **before** the window is scanned, and the position it names is a
+            // coverage claim (`OPLOG_VERSIONS`, invariant I): every entry of an origin
+            // at or below it is held or marked held, so raising progress to it, capped
+            // by how far the window went, can never step over an entry that arrives
+            // later. An entry appended between this read and the scan is above it, so
+            // it stays uncovered and is delivered by the next pass. Reading it after
+            // the scan would cover that entry without ever having looked at it.
             let current = match state.engine.version_vector() {
                 Ok(current) => current,
                 Err(e) => {
@@ -855,12 +916,12 @@ pub async fn dispatch_once_owned(
                 continue;
             }
 
-            let scanned = match state.engine.entries_for_peer(
+            let window = match state.engine.entries_for_peer(
                 from,
                 BATCH * 4,
                 kimmy_storage::WalkScope::Background,
             ) {
-                Ok(window) => window.entries,
+                Ok(window) => window,
                 // The node is stopping: the pass ends quietly, and the next
                 // start's delivers what this one did not.
                 Err(kimmy_storage::StorageError::Stopping(reason)) => {
@@ -875,6 +936,19 @@ pub async fn dispatch_once_owned(
                     continue;
                 }
             };
+            #[cfg(test)]
+            if let Some(hook) = &backoff.after_scan {
+                hook();
+            }
+            // Where the window ended: the oplog's end, or the last entry it examined.
+            // Every entry from `from` through there was looked at, wanted or not.
+            let end = window_end(&window);
+            let scanned = window.entries;
+            let undelivered_wanted = scanned
+                .iter()
+                .filter(|e| wanted(e, job.collection_id, &job.operations))
+                .filter(|e| progress.get(e.stamp.node) < e.stamp.hlc)
+                .count();
             let batch: Vec<OplogEntry> = scanned
                 .iter()
                 .filter(|e| wanted(e, job.collection_id, &job.operations))
@@ -902,14 +976,33 @@ pub async fn dispatch_once_owned(
                 // to the oplog — and replicating it — every two seconds forever.
                 // Once a minute is far more often than retention needs and rare
                 // enough to cost nothing. See `Limits::DEFAULT_PROGRESS_HEARTBEAT`.
+                //
+                // **Once per heartbeat, not twice.** The write is itself an entry of this
+                // node's that the progress it records cannot hold, so the next pass finds
+                // this node's own origin one entry behind with a resume point still old
+                // enough to be stale, and would write again to catch up, leaving one more
+                // entry behind. A subscription this node wrote for within the interval
+                // waits for the next one, **when this window reached the end of the
+                // oplog**: that is where nothing is left to walk and the write only
+                // chases itself. A window that stopped short leaves the next to the next
+                // pass, and what carries it there is the position this pass records, so
+                // a long run of entries that are not the subscription's is walked one
+                // window per pass and not one per interval.
                 let stale = now_ms.saturating_sub(from.wall_ms)
-                    >= limits.progress_heartbeat.as_millis() as u64;
+                    >= limits.progress_heartbeat.as_millis() as u64
+                    && !(matches!(end, WindowEnd::Exhausted)
+                        && backoff.wrote_within(&job.id, limits.progress_heartbeat));
                 if stale {
                     for entry in &scanned {
                         progress.observe(entry.stamp);
                     }
+                    // And every origin the window did not mention: the whole window
+                    // was looked at, so each is as far on as the window reached,
+                    // and not past what this node held when it was read.
+                    carry_forward(&mut progress, &current, end);
                     match record_progress(state, &job.id, &progress) {
                         Ok(()) => {
+                            backoff.note_wrote(&job.id);
                             local_oks += 1;
                             class_step::ok();
                         }
@@ -934,7 +1027,14 @@ pub async fn dispatch_once_owned(
 
             let delivery = assemble(&job, &batch, limits.max_payload_bytes);
             let events = delivery.stamps.len();
-            planned.push(Planned { job, progress, delivery, events });
+            // Through the whole window when this batch takes every wanted entry in it;
+            // otherwise (the batch cap, the payload cap) only through the last entry
+            // it takes, since the wanted ones after that are still to come.
+            let through = match delivery.stamps.last() {
+                Some(last) if events < undelivered_wanted => WindowEnd::Through(*last),
+                _ => end,
+            };
+            planned.push(Planned { job, progress, current, through, delivery, events });
         }
         // The owner checks ran: what this member owns, and a plan that read what it
         // needed is a local success.
@@ -981,10 +1081,17 @@ pub async fn dispatch_once_owned(
                 for stamp in &plan.delivery.stamps {
                     plan.progress.observe(*stamp);
                 }
+                // Every origin as far on as the window was gone through, so an origin
+                // with nothing wanted in it (this node's own, say) does not pin the
+                // next scan at its floor.
+                carry_forward(&mut plan.progress, &plan.current, plan.through);
                 // Recorded only after the endpoint accepted it. Recording first
                 // would turn a failed delivery into a silently skipped event.
                 match record_progress(state, &plan.job.id, &plan.progress) {
                     Ok(()) => {
+                        // The position was just written: the heartbeat waits out its interval
+                        // from here, not writing again on the first idle pass.
+                        backoff.note_wrote(&plan.job.id);
                         local_oks += 1;
                         class_step::ok();
                     }
@@ -1266,6 +1373,186 @@ pub(crate) mod tests {
     use kimmy_core::{DocId, NodeId, Stamp};
 
     use super::*;
+
+    fn node(byte: u8) -> NodeId {
+        NodeId::from_bytes([byte; 16])
+    }
+
+    /// **The position is read before the window is scanned.** An entry that lands
+    /// after the scan, older than the window's end but above this node's position for
+    /// its origin as the pass read it, was never looked at, so it must not be covered:
+    /// the next pass delivers it. Read after the scan, the position would include it
+    /// and progress would be raised over an event nobody sent.
+    ///
+    /// The entry is landed by the seam (`Backoff::with_after_scan_hook`) right after
+    /// the scan.
+    #[tokio::test]
+    async fn an_entry_that_lands_after_the_scan_is_not_covered_by_the_pass() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let dir = tempfile::tempdir().unwrap();
+        let state = crate::state::tests::a_state(&dir);
+        let watched = state.engine.create_collection("shop", "orders").unwrap();
+
+        // A receiver that accepts every delivery.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            while let Ok((mut stream, _)) = listener.accept().await {
+                tokio::spawn(async move {
+                    let mut raw = Vec::new();
+                    let mut buf = [0u8; 4096];
+                    loop {
+                        let Ok(n) = stream.read(&mut buf).await else { return };
+                        if n == 0 {
+                            return;
+                        }
+                        raw.extend_from_slice(&buf[..n]);
+                        let text = String::from_utf8_lossy(&raw).into_owned();
+                        if let Some((head, body)) = text.split_once("\r\n\r\n") {
+                            let len: usize = head
+                                .lines()
+                                .find_map(|l| {
+                                    l.to_lowercase()
+                                        .strip_prefix("content-length:")
+                                        .and_then(|v| v.trim().parse().ok())
+                                })
+                                .unwrap_or(0);
+                            if body.len() >= len {
+                                break;
+                            }
+                        }
+                    }
+                    let _ = stream
+                        .write_all(
+                            b"HTTP/1.1 200 X\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                        )
+                        .await;
+                });
+            }
+        });
+        subscribe(
+            &state,
+            "wh_a",
+            bson::doc! {
+                "url": format!("http://{addr}/hook"), "secret": "s", "database": "shop",
+                "collection": "orders", "operations": ["insert"],
+            },
+        );
+
+        let (q, x) = (node(0x11), node(0x22));
+        let base = kimmy_storage::physical_now_ms() - 600_000;
+        let entry = |origin: NodeId, ms: u64, n: i64| kimmy_core::OplogEntry {
+            stamp: Stamp::new(Hlc::new(base + ms, 0), origin),
+            kind: OpKind::Insert,
+            collection: watched.id,
+            doc_id: Some(DocId::Int64(n)),
+            body: Some(bson::serialize_to_vec(&bson::doc! { "_id": n }).unwrap()),
+        };
+        // More than a window of `Q`'s entries, and one early entry of `X`, all of it
+        // covered by a record another node wrote.
+        for n in 0..300i64 {
+            state.engine.apply_remote(&watched, &entry(q, n as u64, n)).unwrap();
+        }
+        state.engine.apply_remote(&watched, &entry(x, 10, 1_000)).unwrap();
+        let progress =
+            state.engine.create_system_collection("__kimmy", "__webhook_progress").unwrap_or_else(
+                |_| state.engine.get_collection("__kimmy", "__webhook_progress").unwrap(),
+            );
+        let bytes = |ms: u64| bson::Binary {
+            subtype: bson::spec::BinarySubtype::Generic,
+            bytes: Hlc::new(base + ms, 0).to_bytes().to_vec(),
+        };
+        state
+            .engine
+            .insert(
+                &progress,
+                bson::doc! { "_id": format!("wh_a:{q}"),
+                "delivered": { q.to_string(): bytes(299), x.to_string(): bytes(10) } },
+            )
+            .unwrap();
+
+        // The seam lands `X`'s second entry once, after the first window is scanned:
+        // older than that window's end (the 256th entry), above `X`'s position.
+        let landed = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let (engine, meta, flag) =
+            (Arc::clone(&state.engine), watched.clone(), Arc::clone(&landed));
+        let late = entry(x, 100, 1_001);
+        let mut backoff = Backoff::default().with_after_scan_hook(move || {
+            if !flag.swap(true, std::sync::atomic::Ordering::SeqCst) {
+                engine.apply_remote(&meta, &late).unwrap();
+            }
+        });
+
+        let policy = EgressPolicy::new(crate::egress::WEBHOOKS, vec!["127.0.0.1".into()]);
+        let client = client(&policy).unwrap();
+        let (me, live) = (NodeId::generate(), BTreeSet::new());
+        let mut delivered = 0;
+        for _ in 0..8 {
+            delivered +=
+                dispatch_once(&state, &client, &policy, me, &live, &mut backoff, Limits::default())
+                    .await
+                    .delivered;
+        }
+        assert!(landed.load(std::sync::atomic::Ordering::SeqCst), "the seam ran");
+        assert_eq!(delivered, 1, "the entry that landed after the scan is delivered, once");
+    }
+
+    /// An origin is raised to the lower of its position and the window's end, and an
+    /// origin already further on is left where it is: progress only moves forward.
+    #[test]
+    fn carrying_forward_raises_to_the_lower_of_position_and_window_end_and_never_lowers() {
+        let (a, b, c) = (node(1), node(2), node(3));
+        let mut progress = VersionVector::new();
+        progress.insert(a, Hlc::new(900, 0)); // already past the window
+        progress.insert(b, Hlc::new(10, 0));
+        let mut current = VersionVector::new();
+        current.insert(a, Hlc::new(1_000, 0));
+        current.insert(b, Hlc::new(1_000, 0));
+        current.insert(c, Hlc::new(50, 0)); // below the window's end: only its own position
+        carry_forward(&mut progress, &current, WindowEnd::Through(Stamp::new(Hlc::new(500, 0), c)));
+        assert_eq!(progress.get(a), Hlc::new(900, 0), "never lowered");
+        assert_eq!(progress.get(b), Hlc::new(500, 0), "raised to the window's end");
+        assert_eq!(progress.get(c), Hlc::new(50, 0), "and no further than this node held");
+        // The tail of the oplog: everything this node held.
+        carry_forward(&mut progress, &current, WindowEnd::Exhausted);
+        assert_eq!(progress.get(b), Hlc::new(1_000, 0));
+        assert_eq!(progress.get(c), Hlc::new(50, 0));
+    }
+
+    /// A window that reached the end of the oplog is the whole tail, and one that did
+    /// not ends at the last entry it examined.
+    #[test]
+    fn a_window_ends_at_the_tail_or_at_its_last_entry() {
+        let entry = |ms: u64, byte: u8| kimmy_core::OplogEntry {
+            stamp: Stamp::new(Hlc::new(ms, 0), node(byte)),
+            kind: OpKind::Insert,
+            collection: kimmy_core::CollectionId(1),
+            doc_id: Some(DocId::Int64(1)),
+            body: None,
+        };
+        let window = |exhausted: bool, scanned_to: u64| kimmy_storage::OplogWindow {
+            entries: vec![entry(10, 1), entry(20, 2)],
+            scanned_to: Hlc::new(scanned_to, 0),
+            exhausted,
+            passed_through: None,
+        };
+        assert_eq!(window_end(&window(true, 20)), WindowEnd::Exhausted);
+        assert_eq!(
+            window_end(&window(false, 20)),
+            WindowEnd::Through(Stamp::new(Hlc::new(20, 0), node(2)))
+        );
+        // The scan examined rows past the last one kept: the last entry is as far as
+        // anything was delivered. And one that stopped short of it (a row withheld at
+        // the end) claims only what it examined, under the last entry's origin.
+        assert_eq!(
+            window_end(&window(false, 25)),
+            WindowEnd::Through(Stamp::new(Hlc::new(20, 0), node(2)))
+        );
+        assert_eq!(
+            window_end(&window(false, 15)),
+            WindowEnd::Through(Stamp::new(Hlc::new(15, 0), node(2)))
+        );
+    }
 
     fn subscribe(state: &SharedState, id: &str, record: bson::Document) {
         let meta =
@@ -1916,10 +2203,18 @@ pub(crate) mod tests {
         let mut backoff = Backoff::default();
         backoff.failed("wh_kept");
         backoff.failed("wh_removed");
+        backoff.note_wrote("wh_kept");
+        backoff.note_wrote("wh_removed");
 
         backoff.prune(&std::collections::HashSet::from(["wh_kept"]));
 
         assert_eq!(backoff.failure_count("wh_kept"), 1, "a live subscription keeps its state");
         assert_eq!(backoff.failure_count("wh_removed"), 0, "a removed one is forgotten");
+        let hour = Duration::from_secs(3_600);
+        assert!(backoff.wrote_within("wh_kept", hour), "and keeps when it was last written");
+        assert!(
+            !backoff.wrote_within("wh_removed", hour),
+            "a removed one's write is forgotten too"
+        );
     }
 }
