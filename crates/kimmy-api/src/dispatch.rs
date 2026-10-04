@@ -87,6 +87,17 @@ const DELIVERY_TIMEOUT: Duration = Duration::from_secs(10);
 /// How often a node looks for work.
 const TICK: Duration = Duration::from_secs(2);
 
+// The yield evaluator's bounds for this class derive from these two (ADR-213): a
+// `Waiting` bound of 15 ticks and a `Remote` bound of one delivery's deadline plus
+// grace. They are mirrored in `kimmy_cluster::yielding::tied`, and a change here
+// that would loosen a bound there fails to compile.
+const _: () = {
+    assert!(TICK.as_millis() == kimmy_cluster::yielding::tied::DISPATCH_TICK.as_millis());
+    assert!(
+        DELIVERY_TIMEOUT.as_millis() == kimmy_cluster::yielding::tied::DELIVERY_TIMEOUT.as_millis()
+    );
+};
+
 /// Backoff bounds for an endpoint that is failing.
 const BACKOFF_MIN: Duration = Duration::from_secs(2);
 const BACKOFF_MAX: Duration = Duration::from_secs(300);
@@ -711,8 +722,15 @@ pub async fn dispatch_once_owned(
     backoff: &mut Backoff,
     limits: Limits,
 ) -> DispatchOutcome {
+    use kimmy_storage::class_step::{self, Phase};
     let mut outcome = DispatchOutcome::default();
     let mut planned: Vec<Planned> = Vec::new();
+    // The class's heartbeat for this pass (ADR-213): what it did locally, so a
+    // pass that failed locally and succeeded at nothing is a bad cycle, and how
+    // many subscriptions it owns.
+    class_step::phase(Phase::Local);
+    let mut local_faults = 0u64;
+    let mut local_oks = 0u64;
 
     // The backlog, gathered as the pass already walks the registry rather
     // than recomputed on every `/metrics` scrape. The subscription counts are
@@ -731,7 +749,13 @@ pub async fn dispatch_once_owned(
     // are a client's to add, and the plan awaits nothing, so one hand-off
     // covers it. `true` when the pass ends here.
     let ended = kimmy_storage::blocking(|| {
-        let jobs = match load_jobs(state) {
+        // The test switch fails this step **without calling the backend**.
+        let loaded = if class_step::test_fail_step(class_step::Class::Webhooks) {
+            Err(kimmy_storage::StorageError::Transaction("test fail step".into()))
+        } else {
+            load_jobs(state)
+        };
+        let jobs = match loaded {
             Ok(jobs) => jobs,
             Err(kimmy_storage::StorageError::Stopping(reason)) => {
                 debug!(%reason, "webhook dispatch ended: this node is shutting down");
@@ -740,13 +764,21 @@ pub async fn dispatch_once_owned(
             Err(e) => {
                 // Nothing is written: no backlog and no progress, so the
                 // dispatcher's age goes on rising until a pass can read the
-                // registry again.
+                // registry again. A bad cycle: no owner check ran, so `owned`
+                // keeps its last value and the pass counts as a local failure
+                // with no success.
                 warn!(error = %e, "could not read the webhook registry; nothing was dispatched");
+                class_step::local_fault();
+                class_step::cycle(true);
                 return true;
             }
         };
         backoff.prune(&jobs.iter().map(|j| j.id.as_str()).collect());
+        let mut owned_jobs = 0u64;
         for job in jobs {
+            // A beat per subscription planned: a plan over a great many is long
+            // and must not read as stuck.
+            class_step::beat();
             if !owners.owns_subscription(&job.id) {
                 outcome.skipped_not_owner += 1;
                 continue;
@@ -754,6 +786,7 @@ pub async fn dispatch_once_owned(
             if job.invalidated {
                 continue;
             }
+            owned_jobs += 1;
 
             let mut progress = match union_progress(state, &job.id) {
                 Ok(progress) => progress,
@@ -768,6 +801,8 @@ pub async fn dispatch_once_owned(
                 Err(e) => {
                     warn!(subscription = %job.id, error = %e, "could not read a subscription's progress");
                     read_failed = true;
+                    local_faults += 1;
+                    class_step::local_fault();
                     continue;
                 }
             };
@@ -780,6 +815,8 @@ pub async fn dispatch_once_owned(
                 Err(e) => {
                     warn!(subscription = %job.id, error = %e, "could not read this node's version vector");
                     read_failed = true;
+                    local_faults += 1;
+                    class_step::local_fault();
                     continue;
                 }
             };
@@ -833,6 +870,8 @@ pub async fn dispatch_once_owned(
                 Err(e) => {
                     warn!(subscription = %job.id, error = %e, "could not read the oplog for a subscription");
                     read_failed = true;
+                    local_faults += 1;
+                    class_step::local_fault();
                     continue;
                 }
             };
@@ -869,8 +908,16 @@ pub async fn dispatch_once_owned(
                     for entry in &scanned {
                         progress.observe(entry.stamp);
                     }
-                    if let Err(e) = record_progress(state, &job.id, &progress) {
-                        warn!(subscription = %job.id, error = %e, "could not record webhook progress");
+                    match record_progress(state, &job.id, &progress) {
+                        Ok(()) => {
+                            local_oks += 1;
+                            class_step::ok();
+                        }
+                        Err(e) => {
+                            warn!(subscription = %job.id, error = %e, "could not record webhook progress");
+                            local_faults += 1;
+                            class_step::local_fault();
+                        }
                     }
                 }
                 continue;
@@ -889,6 +936,9 @@ pub async fn dispatch_once_owned(
             let events = delivery.stamps.len();
             planned.push(Planned { job, progress, delivery, events });
         }
+        // The owner checks ran: what this member owns, and a plan that read what it
+        // needed is a local success.
+        class_step::with_cell(|cell| cell.set_owned(owned_jobs));
         false
     });
     if ended {
@@ -905,16 +955,24 @@ pub async fn dispatch_once_owned(
     // refuses zero at startup; this makes a hand-built `Limits` in a test
     // deliver slowly rather than hang forever.
     let permits = Arc::new(tokio::sync::Semaphore::new(limits.max_concurrent_deliveries.max(1)));
+    // `Remote`: every wait in these deliveries is bounded by a timer of ours (one
+    // deadline covers the egress check and the send), and each completion beats.
+    if !planned.is_empty() {
+        class_step::phase(Phase::Remote);
+    }
     let results = futures::future::join_all(planned.iter().map(|plan| {
         let permits = Arc::clone(&permits);
         async move {
             // Held for the request only. A subscription waiting for a permit is
             // not holding one.
             let _permit = permits.acquire().await;
-            deliver(client, policy, &plan.job, &plan.delivery).await
+            let result = deliver(client, policy, &plan.job, &plan.delivery).await;
+            class_step::beat();
+            result
         }
     }))
     .await;
+    class_step::phase(Phase::Local);
 
     // --- Phase 3: apply, serially ------------------------------------------
     for (mut plan, result) in planned.into_iter().zip(results) {
@@ -925,8 +983,18 @@ pub async fn dispatch_once_owned(
                 }
                 // Recorded only after the endpoint accepted it. Recording first
                 // would turn a failed delivery into a silently skipped event.
-                if let Err(e) = record_progress(state, &plan.job.id, &plan.progress) {
-                    warn!(subscription = %plan.job.id, error = %e, "could not record webhook progress");
+                match record_progress(state, &plan.job.id, &plan.progress) {
+                    Ok(()) => {
+                        local_oks += 1;
+                        class_step::ok();
+                    }
+                    // A `record_progress` error after a delivery that landed: this
+                    // member's store, so a local fault.
+                    Err(e) => {
+                        warn!(subscription = %plan.job.id, error = %e, "could not record webhook progress");
+                        local_faults += 1;
+                        class_step::local_fault();
+                    }
                 }
                 backoff.succeeded(&plan.job.id);
                 state.metrics.record_webhook_delivery(true, plan.events);
@@ -934,6 +1002,15 @@ pub async fn dispatch_once_owned(
                 debug!(subscription = %plan.job.id, events = plan.events, "delivered");
             }
             Err(failure) => {
+                // Neutral for yielding either way: a delivery that fails is an
+                // endpoint, a resolver or a network, which says nothing of this
+                // member's health; a policy refusal of an address is this node's
+                // configuration, and not health either.
+                if failure.config {
+                    class_step::config_fault();
+                } else {
+                    class_step::remote_fault();
+                }
                 // A host not looked up because the node's lookups were all
                 // busy says nothing about this subscription's endpoint, and
                 // they can be filled by somebody else's names: it is retried
@@ -965,22 +1042,32 @@ pub async fn dispatch_once_owned(
             }
         }
     }
+    // A pass in which local steps failed and none succeeded is a bad cycle.
+    class_step::cycle(local_faults > 0 && local_oks == 0);
     outcome
 }
 
 /// Why a delivery failed.
 #[derive(Debug)]
 struct Failure {
+    /// The egress policy refused an address (blocked, not http, no host): this
+    /// node's configuration, which counts as a config fault and not as a remote
+    /// one. Everything else (transport, a status, a timeout, an unresolvable host)
+    /// is remote.
+    config: bool,
     message: String,
     /// The host was not looked up because the node's lookups were all busy
     /// (`kimmy_egress::MAX_LOOKUPS_IN_FLIGHT`): not counted against the
     /// subscription's backoff.
     lookups_busy: bool,
+    /// The delivery's own deadline ran out, in the lookup of the host or in the
+    /// send: a typed remote failure, whatever the message says.
+    timed_out: bool,
 }
 
 impl From<String> for Failure {
     fn from(message: String) -> Self {
-        Self { message, lookups_busy: false }
+        Self { message, lookups_busy: false, config: false, timed_out: false }
     }
 }
 
@@ -989,6 +1076,19 @@ async fn deliver(
     policy: &EgressPolicy,
     job: &Job,
     delivery: &Delivery,
+) -> Result<(), Failure> {
+    deliver_within(client, policy, job, delivery, DELIVERY_TIMEOUT).await
+}
+
+/// [`deliver`] under a deadline the caller names: [`DELIVERY_TIMEOUT`] in the
+/// dispatcher, and a short one in the test that proves a hung resolver fails the
+/// delivery as a timeout and holds no runtime worker meanwhile.
+async fn deliver_within(
+    client: &reqwest::Client,
+    policy: &EgressPolicy,
+    job: &Job,
+    delivery: &Delivery,
+    timeout: Duration,
 ) -> Result<(), Failure> {
     // No URL and no subscription id on the span. A webhook URL is an operator's
     // endpoint and its path routinely carries a token; the subscription id is
@@ -1006,21 +1106,29 @@ async fn deliver(
     // under the subscription's backoff like an endpoint that does not answer:
     // neither may hold the pass past the delivery timeout, and the lookup runs
     // on the blocking pool, so it holds no runtime worker while it waits.
-    let deadline = tokio::time::Instant::now() + DELIVERY_TIMEOUT;
+    let deadline = tokio::time::Instant::now() + timeout;
 
     // Re-checked here, not just at registration: a name that resolved publicly
     // then can resolve inward now. And kept beside the client's own resolver,
     // because behind a proxy that resolver sees only the proxy's name: this is
     // then the only check of the target's addresses.
     match tokio::time::timeout_at(deadline, policy.check_async(&job.url)).await {
-        Ok(checked) => checked
-            .map_err(|e| Failure { message: e.to_string(), lookups_busy: e.is_lookups_busy() })?,
+        Ok(checked) => checked.map_err(|e| Failure {
+            message: e.to_string(),
+            lookups_busy: e.is_lookups_busy(),
+            config: !e.is_transient(),
+            timed_out: false,
+        })?,
         Err(_) => {
-            return Err(format!(
-                "the host did not resolve within the {} s delivery timeout",
-                DELIVERY_TIMEOUT.as_secs()
-            )
-            .into());
+            return Err(Failure {
+                message: format!(
+                    "the host did not resolve within the {} s delivery timeout",
+                    timeout.as_secs()
+                ),
+                lookups_busy: false,
+                config: false,
+                timed_out: true,
+            });
         }
     }
 
@@ -1060,11 +1168,15 @@ async fn deliver(
     let response = match tokio::time::timeout_at(deadline, request.send()).await {
         Ok(sent) => sent.map_err(|e| Failure::from(e.to_string()))?,
         Err(_) => {
-            return Err(format!(
-                "the endpoint did not answer within the {} s delivery timeout",
-                DELIVERY_TIMEOUT.as_secs()
-            )
-            .into());
+            return Err(Failure {
+                message: format!(
+                    "the endpoint did not answer within the {} s delivery timeout",
+                    timeout.as_secs()
+                ),
+                lookups_busy: false,
+                config: false,
+                timed_out: true,
+            });
         }
     };
 
@@ -1126,7 +1238,9 @@ pub async fn run(
     members: Option<kimmy_cluster::Members>,
     limits: Limits,
     client: reqwest::Client,
+    shutdown: kimmy_task::Shutdown,
 ) {
+    use kimmy_storage::class_step::{self, Phase};
     info!("webhook dispatcher started");
     let owners = crate::ownership::Owners::over(me, members).gated_by(state.catch_up().cloned());
     let mut backoff = Backoff::default();
@@ -1139,6 +1253,10 @@ pub async fn run(
         // subscription inside it, so a failing endpoint delays only its own
         // deliveries and every other subscription keeps its cadence.
         dispatch_once_owned(&state, &client, &policy, &owners, &mut backoff, limits).await;
+        // At the task's own `Waiting` point: where the test switch's stall blocks,
+        // and where the heartbeat's phase says it is between passes.
+        class_step::phase(Phase::Waiting);
+        kimmy_task::stall_point("webhook_dispatcher", &shutdown).await;
         tokio::time::sleep(TICK).await;
     }
 }
@@ -1295,6 +1413,46 @@ pub(crate) mod tests {
         hung.release();
     }
 
+    /// **The canary** (A9, on real time). A runtime of **one worker**, a resolver
+    /// that blocks on a channel the test holds, and a delivery with a short
+    /// injected deadline. While the resolver is blocked a canary task on the same
+    /// single worker must complete (it can only if the lookup holds no runtime
+    /// worker), and the delivery then fails as a typed remote timeout, and not as a
+    /// configuration fault. **No assertion depends on elapsed time**: the 30 s is a
+    /// ceiling that fails only on a hang, which is what the synchronous check
+    /// restored would be.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+    async fn a_hung_resolver_holds_no_worker_and_the_delivery_times_out_as_remote() {
+        let hung = HungLookup::new();
+        let policy =
+            EgressPolicy::new(crate::egress::WEBHOOKS, Vec::new()).with_lookup(hung.lookup());
+        let client = client(&policy).unwrap();
+        let (job, delivery) = a_delivery("http://hung.example/hook");
+        let ceiling = Duration::from_secs(30);
+        let delivering = tokio::spawn(async move {
+            deliver_within(&client, &policy, &job, &delivery, Duration::from_millis(200)).await
+        });
+        hung.until_entered().await;
+        assert!(hung.held(), "premise: the resolver is blocked on the test's channel");
+        let (told, canary) = tokio::sync::oneshot::channel();
+        tokio::spawn(async move {
+            let _ = told.send(());
+        });
+        tokio::time::timeout(ceiling, canary)
+            .await
+            .expect("the canary ran while the resolver was held (the ceiling is for a hang)")
+            .unwrap();
+        assert!(hung.held(), "the canary finished while the resolver was still blocked");
+        let failed = tokio::time::timeout(ceiling, delivering)
+            .await
+            .expect("the delivery ended (the ceiling is for a hang)")
+            .unwrap()
+            .unwrap_err();
+        assert!(failed.timed_out, "typed as a timeout: {failed:?}");
+        assert!(!failed.config && !failed.lookups_busy, "and remote: {failed:?}");
+        hung.release();
+    }
+
     /// **A stop during a hung lookup does not wait for it.** The supervisor
     /// stops the dispatcher by aborting it, which lands at its next yield; the
     /// lookup holds a blocking-pool thread, not the task, so the delivery ends
@@ -1315,6 +1473,82 @@ pub(crate) mod tests {
         assert!(ended.as_ref().is_err_and(|e| e.is_cancelled()), "{ended:?}");
         assert!(hung.held(), "the delivery ended while the lookup was still unanswered");
         hung.release();
+    }
+
+    /// The heartbeat a pass leaves (ADR-213), read back from the class's own cell: a
+    /// delivery that fails is **remote** (an endpoint's doing, never this member's),
+    /// an address the egress policy refuses is **config**, a registry that cannot be
+    /// read is **local** and a bad cycle, and what the member owned is counted. A
+    /// cell on the pass's task, so only it sees them.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_pass_classifies_what_it_saw_as_remote_config_or_local_and_counts_what_it_owns() {
+        use kimmy_storage::class_step::{self, ClassCell, MonotonicClock};
+        let cell = |_: &str| ClassCell::leak(std::sync::Arc::new(MonotonicClock::new()));
+        let pass = |state: SharedState, policy: EgressPolicy, cell: &'static ClassCell| async move {
+            let client = client(&policy).unwrap();
+            let mut backoff = Backoff::default();
+            let (me, live) = (NodeId::generate(), BTreeSet::new());
+            class_step::scope(cell, async {
+                dispatch_once(&state, &client, &policy, me, &live, &mut backoff, Limits::default())
+                    .await
+            })
+            .await
+        };
+        let event_for = |dir: &tempfile::TempDir, url: &str| {
+            let state = crate::state::tests::a_state(dir);
+            let coll = state.engine.create_collection("shop", "orders").unwrap();
+            subscribe(
+                &state,
+                "wh_a",
+                bson::doc! {
+                    "url": url, "secret": "s", "database": "shop",
+                    "collection": "orders", "operations": ["insert"],
+                },
+            );
+            state.engine.insert(&coll, bson::doc! { "_id": 1 }).unwrap();
+            state
+        };
+
+        // An endpoint nothing listens on: remote.
+        let dir = tempfile::tempdir().unwrap();
+        let state = event_for(&dir, "http://127.0.0.1:1/hook");
+        let remote = cell("remote");
+        let outcome = pass(
+            state,
+            EgressPolicy::new(crate::egress::WEBHOOKS, vec!["127.0.0.1".into()]),
+            remote,
+        )
+        .await;
+        assert_eq!(outcome.failed, 1, "the delivery failed");
+        let r = remote.reading();
+        assert_eq!((r.remote_fault, r.config_fault, r.local_fault), (1, 0, 0), "{r:?}");
+        assert_eq!(
+            (r.owned, r.cycles, r.cycles_bad),
+            (1, 1, 0),
+            "it owned the subscription: {r:?}"
+        );
+
+        // An address the policy refuses: config, and not remote.
+        let dir = tempfile::tempdir().unwrap();
+        let state = event_for(&dir, "http://127.0.0.1:1/hook");
+        let config = cell("config");
+        let outcome =
+            pass(state, EgressPolicy::new(crate::egress::WEBHOOKS, Vec::new()), config).await;
+        assert_eq!(outcome.failed, 1);
+        let r = config.reading();
+        assert_eq!((r.config_fault, r.remote_fault, r.local_fault), (1, 0, 0), "{r:?}");
+
+        // A registry the pass cannot read: a local fault and a bad cycle, owning
+        // nothing it could count.
+        let dir = tempfile::tempdir().unwrap();
+        let state = event_for(&dir, "http://127.0.0.1:1/hook");
+        let local = cell("local");
+        class_step::test_fail_step_on_this_thread(class_step::Class::Webhooks, true);
+        pass(state, EgressPolicy::new(crate::egress::WEBHOOKS, Vec::new()), local).await;
+        class_step::test_fail_step_on_this_thread(class_step::Class::Webhooks, false);
+        let r = local.reading();
+        assert_eq!((r.local_fault, r.remote_fault, r.config_fault), (1, 0, 0), "{r:?}");
+        assert_eq!((r.cycles, r.cycles_bad, r.owned), (1, 1, 0), "{r:?}");
     }
 
     /// **A delivery whose host was not looked up, because the node's lookups

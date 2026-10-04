@@ -418,9 +418,12 @@ async fn a_peer_that_never_proves_itself_learns_nothing() {
 
     let mut stream = TcpStream::connect(a.addr).await.unwrap();
     // Skip the handshake entirely and ask straight out.
-    write_frame(&mut stream, &Message::AskVersions { witnessed: false, facts: None })
-        .await
-        .unwrap();
+    write_frame(
+        &mut stream,
+        &Message::AskVersions { witnessed: false, facts: None, facts_gen: None, echo: None },
+    )
+    .await
+    .unwrap();
 
     let response = tokio::time::timeout(Duration::from_secs(5), read_frame(&mut stream)).await;
     match response {
@@ -3458,6 +3461,8 @@ async fn a_tick_at_the_pull_ceiling(fresh: bool, margin: u32) -> CeilingTick {
                                 servable: theirs.clone(),
                                 witnessed: theirs.clone(),
                                 facts: None,
+                                facts_gen: None,
+                                echo: None,
                             },
                             Message::AskEntries { .. } => {
                                 let n = pulls.fetch_add(1, Ordering::SeqCst) as u64;
@@ -6053,6 +6058,8 @@ async fn wedged_fake(b: &Node) -> std::net::SocketAddr {
                             servable: theirs.clone(),
                             witnessed: theirs.clone(),
                             facts: None,
+                            facts_gen: None,
+                            echo: None,
                         },
                         Message::AskEntries { .. } => Message::Entries {
                             entries: vec![entry.clone()],
@@ -6168,6 +6175,8 @@ async fn advance_then_wedge(b: &Node) -> std::net::SocketAddr {
                             servable: theirs.clone(),
                             witnessed: theirs.clone(),
                             facts: None,
+                            facts_gen: None,
+                            echo: None,
                         },
                         Message::AskEntries { .. } => Message::Entries {
                             entries: vec![entry.clone()],
@@ -6282,6 +6291,8 @@ async fn wedged_fake_slow(b: &Node, delay: Duration) -> std::net::SocketAddr {
                             servable: theirs.clone(),
                             witnessed: theirs.clone(),
                             facts: None,
+                            facts_gen: None,
+                            echo: None,
                         },
                         Message::AskEntries { .. } => {
                             tokio::time::sleep(delay).await;
@@ -6683,6 +6694,8 @@ async fn a_reset_chain_opens_about_once_an_interval_not_once_a_tick() {
                                 servable: theirs.clone(),
                                 witnessed: theirs.clone(),
                                 facts: None,
+                                facts_gen: None,
+                                echo: None,
                             },
                             Message::AskEntries { .. } => {
                                 tokio::time::sleep(PULL_HOLD).await;
@@ -6845,6 +6858,8 @@ async fn an_advancing_contact_ending_at_the_ceiling_is_not_reset_or_carried() {
                                 servable: theirs.clone(),
                                 witnessed: theirs.clone(),
                                 facts: None,
+                                facts_gen: None,
+                                echo: None,
                             },
                             Message::AskEntries { .. } => {
                                 let n = pulls.fetch_add(1, Ordering::SeqCst) as u64;

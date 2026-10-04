@@ -377,13 +377,55 @@ struct Stop {
     shutdown: kimmy_task::Shutdown,
     engine: Arc<Engine>,
     by: Arc<std::sync::OnceLock<std::time::Instant>>,
+    /// The yield evaluator's handle, once it runs (ADR-213, section 6.18).
+    evaluator: Arc<std::sync::OnceLock<kimmy_cluster::yielding::driver::EvaluatorHandle>>,
+    /// Read by the evaluator's inputs: the stop has begun. An atomic, because the
+    /// evaluator takes no lock a runtime task takes.
+    stopping: Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl Stop {
+    /// Install the evaluator's handle, late in a start. **A stop that began
+    /// before this froze nothing** (there was no handle to freeze), so the handle
+    /// is frozen here when the stop is already under way: otherwise the evaluator
+    /// would run through the stop and could publish a withdraw the stop's own
+    /// freeze exists to prevent.
+    fn attach_evaluator(&self, handle: kimmy_cluster::yielding::driver::EvaluatorHandle) {
+        let _ = self.evaluator.set(handle.clone());
+        std::sync::atomic::fence(std::sync::atomic::Ordering::SeqCst);
+        if self.stopping.load(std::sync::atomic::Ordering::SeqCst) {
+            handle.freeze();
+        }
+    }
+
     /// Announce the stop: to every supervised task, so one ending from here on
     /// is a stop rather than a death, and to the engine's walks. The stop's
     /// deadline is taken from the first call, so a second changes nothing.
+    ///
+    /// **The yield evaluator is frozen first**, at the stop's first signal and
+    /// before `shutdown` is triggered for the supervised tasks (ADR-213, B9): from
+    /// then on it makes no verdict, no transition and no publication, so the stall
+    /// probe's own end is never read as "no wake" and a ring already at N - 1
+    /// cannot enter during a stop. It is **not joined**: it holds no engine and no
+    /// lock, and `freeze` unparks it, so it ends at once and the stop pays nothing.
     fn begin(&self) {
+        // `stopping` is stored first, and the evaluator looked up after a full
+        // fence, so a start that is still installing its evaluator
+        // ([`Stop::attach_evaluator`]) sees one or the other: the handle here, or
+        // the flag there. Neither order lets a freeze be missed.
+        //
+        // The two sides are a store-then-load pair that must not be reordered: this
+        // one stores `stopping` and then loads `evaluator`, `attach_evaluator`
+        // stores `evaluator` and then loads `stopping`, and the `SeqCst` fences
+        // between each store and load are what forbid both loads seeing the old
+        // value. Weaken either fence, or move the store below the load, and a stop
+        // that lands while the evaluator is installed freezes nothing. A sequential
+        // test cannot pin this; it is a race, which is why it is written down here.
+        self.stopping.store(true, std::sync::atomic::Ordering::SeqCst);
+        std::sync::atomic::fence(std::sync::atomic::Ordering::SeqCst);
+        if let Some(evaluator) = self.evaluator.get() {
+            evaluator.freeze();
+        }
         let _ = self.by.set(std::time::Instant::now() + STOP_BUDGET);
         // Announced to the tasks first, so a task that sees its walk stop
         // finds the stop already begun, and ends rather than retries.
@@ -614,6 +656,21 @@ async fn start_and_serve(
         lifecycle::announce(&config.storage.data_dir, &previous);
         e.context(BeforeOpen)
     };
+    // The off switch and the test switches (ADR-213): environment only, and a value
+    // that is not understood refuses the start, before anything is bound or opened,
+    // so a typo cannot silently leave yielding on.
+    let yield_enabled = crate::yielding::ownership_yield_from_env()
+        .map_err(|e| failed_before_open(anyhow::anyhow!(e)))?;
+    let test_switches = crate::yielding::TestSwitches::from_env()
+        .map_err(|e| failed_before_open(anyhow::anyhow!(e)))?;
+    // Whether this start begins in probation: read before the store opens, because
+    // the open rewrites the format sidecar the decision compares the start record
+    // with (ADR-213, C4).
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_millis() as u64);
+    let (probation, probation_inputs) =
+        crate::probation::decide_for_start(&config.storage.data_dir, &path, &previous, now_ms);
     // Loaded before binding, so a bad certificate is a startup failure rather
     // than a handshake error for whoever connects first.
     let tls = load_tls(&config).await.map_err(failed_before_open)?;
@@ -809,6 +866,7 @@ async fn start_and_serve(
     // After the banner, so the line an operator is sent to look for sits
     // under the identity of the run that is reporting it.
     lifecycle::announce(&config.storage.data_dir, &previous);
+    crate::probation::announce(&probation, &probation_inputs);
 
     // The storage engine's: an I/O error leaves it serving nothing, so the
     // process stops to be restarted (ADR-188). Installed as soon as there is an
@@ -819,7 +877,13 @@ async fn start_and_serve(
     // Announced at the signal, before anything drains, so that a supervised
     // task ending during the drain is a stop rather than a death.
     let shutdown = kimmy_task::Shutdown::new();
-    let stop = Stop { shutdown: shutdown.clone(), engine: Arc::clone(&engine), by: Arc::default() };
+    let stop = Stop {
+        shutdown: shutdown.clone(),
+        engine: Arc::clone(&engine),
+        by: Arc::default(),
+        evaluator: Arc::default(),
+        stopping: Arc::default(),
+    };
     let _ = engine_slot.set(Arc::clone(&engine));
     // For `run`, which tells the tasks to stop if this start fails below.
     let _ = stop_kept.set(stop.clone());
@@ -944,6 +1008,8 @@ async fn start_and_serve(
         );
     }
 
+    test_switches.announce();
+
     if config.auth.insecure_no_auth {
         warn!("authentication is DISABLED; every request runs with full privileges");
     } else {
@@ -1018,6 +1084,47 @@ async fn start_and_serve(
     // Before any task that reads it is spawned: expiry and the dispatcher take the
     // marker from the state when they start.
     state.set_catch_up(Arc::clone(&catch_up));
+
+    // The yield evaluator's pieces (ADR-213), built before anything sends a block:
+    // with probation its start decision (every class stalled, the yield bits set)
+    // is published here, so the very first block this process sends already yields.
+    // The thread that ticks it starts below, once the classes it judges exist.
+    let cells = crate::yielding::Cells::new();
+    let published = Arc::new(kimmy_cluster::yielding::Published::default());
+    let eval_clock = Arc::new(kimmy_cluster::yielding::driver::RealClock::new());
+    let timings = kimmy_cluster::yielding::Timings::scaled(test_switches.scale.unwrap_or(1));
+    let mut eval_config = kimmy_cluster::yielding::Config::new(engine.node_id());
+    eval_config.enabled = yield_enabled;
+    eval_config.timings = timings;
+    eval_config.ttl_interval = Duration::from_secs(config.storage.ttl_interval_secs.max(1));
+    eval_config.probation = probation.probation;
+    // A class switched off, or whose worker does not beat yet, does not start in
+    // probation: it could never leave it.
+    eval_config.off = kimmy_cluster::PerClass {
+        ttl: config.storage.ttl_interval_secs == 0,
+        webhooks: false,
+        embeddings: !config.vector.worker_enabled || !crate::yielding::EMBEDDINGS_INSTRUMENTED,
+    };
+    crate::yielding::announce(yield_enabled, probation.probation, &timings);
+    let prepared =
+        kimmy_cluster::yielding::driver::prepare(eval_config, eval_clock.as_ref(), &published);
+    let ttl_holders: Arc<arc_swap::ArcSwap<Vec<kimmy_core::CollectionId>>> = Arc::default();
+    let facts_hook = crate::yielding::FactsHook {
+        published: Arc::clone(&published),
+        clock: Arc::clone(&eval_clock),
+        e: timings.e,
+        ttl_holders: Arc::clone(&ttl_holders),
+    };
+    state.metrics.set_yield_handle(Arc::new(kimmy_api::yielding::YieldHandle {
+        published: Arc::clone(&published),
+        cells: cells.0,
+        clock: Arc::clone(&eval_clock),
+        e: timings.e,
+        enabled: yield_enabled,
+        probation: probation.probation,
+    }));
+    // This process's random id, which the block carries and the start record keeps.
+    let boot = uuid::Uuid::new_v4();
 
     // Where a local token may be minted from (ADR-100). Validation already
     // refused an unknown name and `disabled` without a provider; this is the
@@ -1153,8 +1260,15 @@ async fn start_and_serve(
     let gc_handle = spawn_collector(Arc::clone(&engine), &config, shutdown.clone());
     state.metrics.set_purge_counters(engine.purge_counters());
     let purger_handle = spawn_drop_purger(Arc::clone(&engine), shutdown.clone());
-    let cluster =
-        spawn_cluster(Arc::clone(&engine), Arc::clone(&state), &config, shutdown.clone()).await?;
+    let cluster = spawn_cluster(
+        Arc::clone(&engine),
+        Arc::clone(&state),
+        &config,
+        shutdown.clone(),
+        boot.as_bytes().to_vec(),
+        facts_hook,
+    )
+    .await?;
 
     // The routes see the live member set only once the cluster is up, which is
     // after the router was built — hence a late hand-off rather than a
@@ -1191,8 +1305,25 @@ async fn start_and_serve(
         // delivery off and a subscription can be created at runtime (ADR-184).
         let client =
             kimmy_api::dispatch::client(&egress).context("building the webhook delivery client")?;
+        let class_shutdown = shutdown.clone();
+        let cell = cells.webhooks();
         kimmy_task::supervise("webhook_dispatcher", shutdown.clone(), async move {
-            kimmy_api::dispatch::run(state, egress, me, members, limits, client).await;
+            // The class's heartbeat is visible to this task and to no other
+            // (ADR-213): a task-local, so another task's commit on the same worker
+            // can never beat this class.
+            kimmy_storage::class_step::scope(
+                cell,
+                kimmy_api::dispatch::run(
+                    state,
+                    egress,
+                    me,
+                    members,
+                    limits,
+                    client,
+                    class_shutdown,
+                ),
+            )
+            .await;
         })
     };
 
@@ -1221,6 +1352,7 @@ async fn start_and_serve(
         cluster.members.clone(),
         config.storage.ttl_interval_secs,
         shutdown.clone(),
+        cells.ttl(),
     ));
 
     // Keeps each node's view of "is this token still good" honest. Another
@@ -1297,11 +1429,16 @@ async fn start_and_serve(
         let worker_counters = Arc::new(kimmy_vector::WorkerCounters::default());
         state.metrics.set_vector_counters(Arc::clone(&worker_counters));
         let batching = config.vector.batch.settings();
+        let worker_cell = cells.embeddings();
+        let worker_stop = shutdown.clone();
         Some(kimmy_task::supervise("embedding_worker", shutdown.clone(), {
             let engine = Arc::clone(&engine);
             let retrying = shutdown.clone();
-            async move {
+            // The whole task runs under the embedding class's cell, which is what
+            // lets the worker's beats, phases and faults reach it (ADR-213).
+            kimmy_storage::class_step::scope(worker_cell, async move {
                 let mut worker = kimmy_vector::EmbeddingWorker::new(engine);
+                worker.set_shutdown(worker_stop);
                 worker.set_batching(batching);
                 worker.set_policy(providers);
                 if let Some(check) =
@@ -1329,7 +1466,7 @@ async fn start_and_serve(
                 // from `forever` is a death, which is what should happen if
                 // this worker ever finishes.
                 retry.forever(&retrying, &mut worker, |w| Box::pin(w.run())).await;
-            }
+            })
         }))
     } else {
         warn!(
@@ -1352,6 +1489,35 @@ async fn start_and_serve(
         _ => None,
     };
 
+    // The yield evaluator: a named OS thread, **supervised** (a panic in it ends the
+    // process as a task's does) and never a runtime task, because its whole point is
+    // that a stalled runtime cannot stop it (ADR-213). It reads atomics and one view
+    // load, holds no engine, and is frozen at the stop's first signal and not joined.
+    {
+        let handle = kimmy_cluster::yielding::driver::EvaluatorHandle::new(
+            Arc::clone(&eval_clock) as Arc<dyn kimmy_cluster::yielding::driver::Clock>,
+            Arc::clone(&published),
+        );
+        let inputs = crate::yielding::YieldInputs {
+            cells: cells.0,
+            marks: state.metrics.probe_marks(),
+            members: cluster.members.clone(),
+            catch_up: state.catch_up().cloned(),
+            ttl_disabled: config.storage.ttl_interval_secs == 0,
+            embeddings_disabled: !config.vector.worker_enabled,
+            stopping: Arc::clone(&stop.stopping),
+            ttl_holders: Arc::clone(&ttl_holders),
+        };
+        let body = handle.clone();
+        stop.attach_evaluator(handle);
+        let thread = kimmy_task::supervise_thread("yield_evaluator", shutdown.clone(), move || {
+            kimmy_cluster::yielding::driver::run(prepared, inputs, &body);
+        })
+        .context("starting the yield evaluator thread")?;
+        // Not joined at the stop (it is frozen and ends at once, holding nothing).
+        drop(thread);
+    }
+
     // Every background writer has been spawned, so which of them this node
     // runs is known, and it is fixed before anything can scrape: a
     // progress-age row that appeared after the first scrape would be a series
@@ -1361,6 +1527,13 @@ async fn start_and_serve(
     // Serving from here on: what this start inherited has been announced, and
     // an exit of this run no longer carries it (ADR-190's lifecycle half).
     lifecycle::settle(&config.storage.data_dir);
+    // This start reached serving: a record for the next, which reads it to measure
+    // this run's length and to see what this start itself followed (ADR-213).
+    lifecycle::record_start(
+        &config.storage.data_dir,
+        &boot.simple().to_string(),
+        probation_inputs.end.label(),
+    );
 
     if stop.by.get().is_some() {
         // A stop asked for while the node started: it stops as soon as serving
@@ -1394,6 +1567,9 @@ async fn start_and_serve(
     // can never turn a start into a crash loop, and can never be mistaken for a
     // startup failure.
     kimmy_task::arm_test_kills();
+    // The yield test switches wait for the node to serve as well (ADR-213): the
+    // fail steps count their delay from here, and the runtime stall begins.
+    test_switches.arm(shutdown.clone());
     if let [rows, ms] = &serve_walk
         && (rows.is_some() || ms.is_some())
     {
@@ -2347,6 +2523,8 @@ async fn spawn_cluster(
     state: kimmy_api::SharedState,
     config: &Config,
     shutdown: kimmy_task::Shutdown,
+    boot: Vec<u8>,
+    evaluator: crate::yielding::FactsHook,
 ) -> Result<Cluster> {
     if !config.cluster.enabled {
         return Ok(Cluster { tasks: Vec::new(), members: None, confirmer: None });
@@ -2388,10 +2566,11 @@ async fn spawn_cluster(
         );
         live.set_facts_source(crate::facts::source(
             Arc::downgrade(&engine),
-            uuid::Uuid::new_v4().as_bytes().to_vec(),
+            boot,
             config.storage.ttl_interval_secs == 0,
             !config.vector.worker_enabled,
             state.catch_up().cloned(),
+            Some(evaluator),
         ));
     }
     let serving = kimmy_task::supervise(
@@ -2788,17 +2967,28 @@ fn spawn_expiry(
     members: Option<kimmy_cluster::Members>,
     ttl_interval_secs: u64,
     shutdown: kimmy_task::Shutdown,
+    cell: &'static kimmy_storage::class_step::ClassCell,
 ) -> tokio::task::JoinHandle<()> {
     let me = state.engine.node_id();
     if ttl_interval_secs == 0 {
         warn!("TTL expiry is disabled; documents with an expiry policy will not be removed");
         return kimmy_task::supervise("ttl_expiry", shutdown, async move {
-            kimmy_api::expiry::watch_unowned(state, me, members).await;
+            kimmy_storage::class_step::scope(
+                cell,
+                kimmy_api::expiry::watch_unowned(state, me, members),
+            )
+            .await;
         });
     }
     let interval = Duration::from_secs(ttl_interval_secs);
+    let class_shutdown = shutdown.clone();
     kimmy_task::supervise("ttl_expiry", shutdown, async move {
-        kimmy_api::expiry::run(state, me, members, interval).await;
+        // Scoped to this task alone (ADR-213): see `class_step`.
+        kimmy_storage::class_step::scope(
+            cell,
+            kimmy_api::expiry::run(state, me, members, interval, class_shutdown),
+        )
+        .await;
     })
 }
 
@@ -3141,6 +3331,94 @@ async fn shutdown_signal() {
 
 #[cfg(test)]
 mod tests {
+
+    /// **The stop freezes the yield evaluator first** (ADR-213, B9): at the stop's
+    /// first signal, before `shutdown` is announced to the supervised tasks. A task
+    /// that wakes on the announcement therefore always finds the evaluator frozen,
+    /// so the probe's own end is never read as "no wake". Asked many times, because
+    /// the wrong order loses a race and not every one.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn the_stop_freezes_the_evaluator_before_it_announces_to_the_tasks() {
+        use kimmy_cluster::yielding::Published;
+        use kimmy_cluster::yielding::driver::{EvaluatorHandle, ManualClock};
+        let dir = tempfile::tempdir().unwrap();
+        let engine = Arc::new(Engine::open(&dir.path().join(DATABASE_FILE)).unwrap());
+        for round in 0..300 {
+            let shutdown = kimmy_task::Shutdown::new();
+            let handle =
+                EvaluatorHandle::new(Arc::new(ManualClock::new()), Arc::new(Published::default()));
+            let stop = Stop {
+                shutdown: shutdown.clone(),
+                engine: Arc::clone(&engine),
+                by: Arc::default(),
+                evaluator: Arc::default(),
+                stopping: Arc::default(),
+            };
+            let _ = stop.evaluator.set(handle.clone());
+            // An OS thread spinning on the announcement reads the freeze the
+            // instant the announcement is visible, with no scheduler between.
+            let spinner = std::thread::spawn({
+                let (shutdown, handle) = (shutdown.clone(), handle.clone());
+                move || {
+                    while !shutdown.has_begun() {
+                        std::hint::spin_loop();
+                    }
+                    handle.is_frozen()
+                }
+            });
+            let woken = tokio::spawn({
+                let (shutdown, handle) = (shutdown.clone(), handle.clone());
+                async move {
+                    shutdown.wait_begun().await;
+                    handle.is_frozen()
+                }
+            });
+            tokio::task::yield_now().await;
+            stop.begin();
+            assert!(
+                woken.await.unwrap(),
+                "round {round}: a task woke on the stop's announcement and found the evaluator not \
+                 yet frozen"
+            );
+            assert!(
+                spinner.join().unwrap(),
+                "round {round}: a thread watching the announcement saw it before the freeze"
+            );
+            assert!(stop.stopping.load(std::sync::atomic::Ordering::SeqCst));
+        }
+    }
+
+    /// A stop that began before the evaluator was installed
+    /// freezes it as it is installed, and one that begins after freezes it as before.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_evaluator_installed_after_the_stop_began_is_frozen_at_once() {
+        use kimmy_cluster::yielding::Published;
+        use kimmy_cluster::yielding::driver::{EvaluatorHandle, ManualClock};
+        let dir = tempfile::tempdir().unwrap();
+        let engine = Arc::new(Engine::open(&dir.path().join(DATABASE_FILE)).unwrap());
+        let new_handle =
+            || EvaluatorHandle::new(Arc::new(ManualClock::new()), Arc::new(Published::default()));
+        let stop = |engine: &Arc<Engine>| Stop {
+            shutdown: kimmy_task::Shutdown::new(),
+            engine: Arc::clone(engine),
+            by: Arc::default(),
+            evaluator: Arc::default(),
+            stopping: Arc::default(),
+        };
+        // The stop first, the install after.
+        let early = stop(&engine);
+        early.begin();
+        let handle = new_handle();
+        early.attach_evaluator(handle.clone());
+        assert!(handle.is_frozen(), "installed into a stop that had begun");
+        // The control: the install first, the stop after.
+        let late = stop(&engine);
+        let handle = new_handle();
+        late.attach_evaluator(handle.clone());
+        assert!(!handle.is_frozen(), "installed before any stop: still running");
+        late.begin();
+        assert!(handle.is_frozen());
+    }
 
     /// A start that failed before it opened the store, and holds no lock on
     /// the directory, cannot know the directory is its own: it puts back the
@@ -4467,7 +4745,13 @@ mod tests {
         let _recording = captured.record();
         let shutdown = kimmy_task::Shutdown::new();
         let start = tokio::time::Instant::now();
-        let task = spawn_expiry(Arc::clone(&state), members, 0, shutdown.clone());
+        let task = spawn_expiry(
+            Arc::clone(&state),
+            members,
+            0,
+            shutdown.clone(),
+            crate::yielding::Cells::new().ttl(),
+        );
         let mut counts = Vec::new();
         for minute in minutes {
             tokio::time::sleep_until(start + Duration::from_secs(minute * 60 + 1)).await;

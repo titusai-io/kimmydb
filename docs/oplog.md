@@ -512,6 +512,29 @@ served every entry it lacks has nothing to resurrect, whatever the span says.
 
 ---
 
+### What a contact says about its sender
+
+Both messages of a contact, `AskVersions` (the request) and `Vectors` (the
+reply), carry more than versions. Every field below is optional, decoded on its
+own (one of another shape costs that field, never the frame), and absent from a
+0.43.0 member, which ignores all of them; the BSON frames need no version
+negotiation for this.
+
+| Field | On | Meaning |
+|---|---|---|
+| `facts` | both | The sender's block about itself: whether it is catching up, which classes it yields (`yielding`), which of expiry and embeddings it has off, its TTL holder list, and, from 0.44.0, `class_state` and `class_cause` (per class: `ok`, `idle`, `suspect`, `stalled`, and why), `responsive` and `started_ms` (its process start, in its own clock). A block that does not decode is no block and is counted |
+| `facts_gen` | both | The generation of the sender's block: a counter per process, an `Int64`, that rises each time the block changes. A receiver never replaces a held block with a lower generation from the same process, so a late-decoded older frame cannot undo a newer one |
+| `echo` | both | `{ boot, generation }`: the **other** side's block as the sender holds it. On `AskVersions` it is the server's block as the requester holds it; on `Vectors` it is the requester's block as the server holds it after recording the request's, which it does before it replies. A sender that holds nothing of the other side sends an empty `boot` and generation 0 |
+
+An `echo` is how a yield is confirmed: a member that yields a class keeps owning
+it until every live peer has sent an echo with the member's current `boot` and a
+generation at least the one that set the bit, so confirmation is the reader's, on
+the serve path and on the sync path alike, and a frame written but never applied
+confirms nothing. A member that sends no `echo` at all (0.43.0) never confirms,
+and one that does but holds nothing sends the empty echo, which confirms
+nothing either. See Operations, "A member that yields a class of work", and
+ADR-213.
+
 ## Replication
 
 The intended flow, with the primitives that already exist marked:

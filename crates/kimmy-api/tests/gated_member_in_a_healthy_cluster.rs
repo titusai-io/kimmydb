@@ -116,6 +116,7 @@ fn a_catching_up_member_whose_peer_holds_the_index_reads_owed_elsewhere_and_warn
             engine.node_id(),
             Some(members),
             Duration::from_millis(20),
+            kimmy_task::Shutdown::new(),
         ));
         tokio::time::sleep(Duration::from_millis(400)).await;
         looping.abort();

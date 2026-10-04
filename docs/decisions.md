@@ -19404,6 +19404,10 @@ The third arrived after this record was written, in ADR-181's own review. `decli
 
 ## ADR-184 — A background task that dies stops the process
 
+> **Amended by [ADR-213](#adr-213--a-member-that-cannot-do-a-class-of-work-yields-it-judged-by-its-own-heartbeats-against-its-peers).**
+> an OS thread can be supervised too, and a panic in it ends the process the
+> same way.
+
 **Decision.** Every long-lived background task is spawned through one supervisor. A **panic, or a return that should not have happened, ends the process** with status 70, after recording in the exit marker which task died and how. A **transient error is retried in place**, with backoff, for ever. The exclusions — one task per inbound connection, one per request — are named in code with their reasons, and a lint fails if a production spawn is neither supervised nor named.
 
 **The defect.** The release profile unwinds rather than aborting, and `start_and_serve` held a `JoinHandle` for every background task without awaiting any of them until shutdown. So a panicking task ended alone, with one plain-text line on stderr outside the structured log, and stayed ended until someone restarted the node. Some tasks ended without panicking at all: the embedding worker returned `Err` on any storage error but a lost position, and node.rs logged `embedding worker stopped` while embedding stayed stopped.
@@ -19792,6 +19796,9 @@ The differential (the members of `$addToSet: "$v"` are exactly the buckets of `$
 
 ## ADR-187 — A gauge is read at the scrape where it can be, and every other gauge's writer publishes its age
 
+> **Amended by [ADR-213](#adr-213--a-member-that-cannot-do-a-class-of-work-yields-it-judged-by-its-own-heartbeats-against-its-peers).**
+> `ttl_expiry` and `yield_evaluator` join the progress rows.
+
 **Decision.** In two tiers, in this order.
 
 1. **What can be read at the scrape is read at the scrape.** `kimmy_cluster_members` is counted from the member set, and `kimmy_webhook_subscriptions{active,invalidated,unreadable}` from the registry, every time `/metrics` renders or the OTLP bridge exports. Neither has a background writer any more, so neither can be unwritten, frozen or late. A registry that cannot be read fails the scrape, as every other engine reading does, rather than reporting 0. **One record that does not decode is not an unreadable registry**: it is counted under `unreadable`, so a single damaged record is visible without taking the page, and every OTLP instrument, down with it. The walk runs off the async worker, since any principal with a webhook grant decides how long it is (ADR-153), and the OTLP bridge takes one reading per export rather than one per instrument.
@@ -19853,6 +19860,10 @@ The last row belongs to the spawn lint (ADR-184). That walk ends a `#[cfg(test)]
 ---
 
 ## ADR-188 — A storage engine that hits an I/O error stops the process
+
+> **Amended by [ADR-213](#adr-213--a-member-that-cannot-do-a-class-of-work-yields-it-judged-by-its-own-heartbeats-against-its-peers).**
+> a start after a failed or unclean end can begin in probation, with every
+> class yielded.
 
 **Decision.** The first I/O error the storage backend returns, of any kind, marks the engine failed, and the daemon stops the process with status 70 so that it is restarted. On restart redb repairs the file before the node serves. This applies the ruling that a poisoned engine exits rather than failing liveness: exiting is the restart that works in every deployment, and compose consumes no health signal. It uses ADR-184's exit path.
 
@@ -21974,6 +21985,12 @@ the decision above refused) and *delaying the first step until the node
 serves*, which leaves the commit on the start and depends on task order.
 
 ## ADR-201 — What a member says about itself on the sync contact decides who may own expiry, webhooks and embeddings
+
+> **Amended by [ADR-213](#adr-213--a-member-that-cannot-do-a-class-of-work-yields-it-judged-by-its-own-heartbeats-against-its-peers).**
+> the sender now sets `yielding`, confirmation is the reader's (an echo or the
+> sync path), a block never replaces an older one from the same process, and
+> an unheard peer is no candidate for webhooks and embeddings; the block and
+> the frames gain fields.
 
 > **Amended by [ADR-203](#adr-203--a-vector-record-carries-the-configuration-that-made-it).**
 > A vector record carries the fingerprint of the configuration that made it, so
@@ -24438,3 +24455,576 @@ through `$expr` and `$literal` and still refused bare. The refusals this ADR
 keeps are pinned where they were built: the `$` positional refusal and the
 `$push` unrecognized clause in `update`, the closed key sets in `expr` and
 `aggregate`, and the combined `$lookup` in `aggregate`.
+
+---
+
+## ADR-213 — A member that cannot do a class of work yields it, judged by its own heartbeats against its peers'
+
+> **Amends [ADR-201](#adr-201--what-a-member-says-about-itself-on-the-sync-contact-decides-who-may-own-expiry-webhooks-and-embeddings),
+> [ADR-187](#adr-187--a-gauge-is-read-at-the-scrape-where-it-can-be-and-every-other-gauges-writer-publishes-its-age),
+> [ADR-184](#adr-184--a-background-task-that-dies-stops-the-process) and
+> [ADR-188](#adr-188--a-storage-engine-that-hits-an-io-error-stops-the-process)**,
+> each in the section "What it changes in earlier decisions".
+
+**Status:** accepted, for the next `0.MINOR`. No rollback boundary: every wire
+field is optional, no stored format changes, and the one new file
+(`kimmy.last-start`) is advisory and ignored by 0.43.0. No new config key.
+
+**The defect.** SWIM answers one question, whether a member is reachable.
+Expiry, webhook delivery and embedding are owned by rendezvous over the live
+set, so a member that is reachable but cannot do one of them keeps its share
+for as long as it is up. A wedged webhook dispatcher, an expiry task that
+fails every pass, a runtime whose workers are held, a node in a restart loop on
+a full disk: each leaves that member's share of the work undone while SWIM
+reports it healthy. ADR-201 gave members a way to say "I am yielding" and
+honoured it, but nothing ever set it, and the way it was confirmed and read had
+gaps of its own (below).
+
+**Decision.**
+
+- **Each class of owned work beats a heartbeat** (`ttl`, `webhooks`,
+  `embeddings`, `kimmy_storage::class_step`). A beat records a phase:
+  `Waiting`, `Local`, `Remote` or `WriterGate`. A class is **overdue** when it
+  has not beaten or changed phase for longer than its phase's bound, and every
+  bound is an expression over the constants the code already has (the delivery
+  timeout, the provider's attempt timeout, the sync and ownership ticks).
+  `Remote` is stamped per attempt, so every wait on a peer or a provider is
+  bounded by a timer of ours; a wait past its bound means our timer failed and
+  counts as a local fault. `WriterGate` is never overdue: an index build, a
+  repair page or a purge holds every class at the gate together. A class's
+  cell is visible to that class's own task only (a task-local), so another
+  task's commit on the same worker thread never beats it.
+- **Each outcome is classified.** Local (storage, the node's own steps) counts
+  against the class. Remote (a provider that hangs, answers 5xx or 429, a
+  webhook endpoint that is down, an unresolvable host) is neutral, so a bad
+  third party never makes a member yield. Configuration (a missing key, a
+  refused address, an unknown profile, a local provider that is not compiled
+  in) is neutral too: it is not health either way. Every failure stays visible
+  in `kimmy_yield_faults_total{class,kind}`.
+- **A dedicated OS thread, the evaluator, decides every 5 s** and takes no lock
+  the runtime takes (cells, probe marks, the catching-up marker, the peer view
+  and the stop flag are all atomics or an `arc_swap` load). Its subject is the
+  runtime's 250 ms stall probe; its control is the gap between its own wakes.
+  A tick whose control is more than 0.5 s late, and the tick after it, judge
+  nothing (**void**), so a paused process, a loaded host or a debugger is never
+  read as a stall. Otherwise the probe more than 1 s late, or not waking at
+  all, is a runtime stall. `responsive` is advertised only after six non-void
+  ticks without one. The thread is supervised (below).
+- **Evidence becomes a class state**: `ok`, `idle`, `suspect` or `stalled`. At
+  most one item per class per tick: bad (overdue, a bad cycle, or a runtime
+  stall while the class owns work), good, idle-alive, or neutral (gated,
+  switched off, stopping). `suspect` is advertised at once on any bad item and
+  takes the member out of target eligibility at once; `stalled` needs N bad
+  items of the last M inside the class's window (webhooks and embeddings 6 of
+  12 in 60 s, ttl 3 of 5 in five times the longer of its interval and 5 s).
+- **A `stalled` class yields only to a target**: a live peer with a fresh block
+  from its current process that is not catching up, does not itself yield the
+  class, would own the class's work, has `ok` or `idle` in it and is
+  `responsive`. A 0.43 member, which advertises no state, is never a target.
+  The target is needed to enter only; once yielded the class leaves by reclaim,
+  the latch, the tie-break or a stop. At most `max(1, ⌊(n−1)/2⌋)` members yield
+  a class, counting stale bits because ownership honours them; the members
+  beyond the cap in ascending node id withdraw. A suppressed yield says why
+  (`switched_off`, `shared_fault`, `no_target`, `cap`) in
+  `kimmy_yield_suppressed` and a `WARN`, once per class per 300 s, which names
+  every live peer that is not a target and the reason.
+- **A shared-fault latch.** While two or more members are `stalled` in a class,
+  none yields it and every yielder withdraws at once; it clears after fewer
+  than two have been `stalled` for 30 minutes. A fault that follows the data (a
+  replicated poison record, a defect on every member) therefore costs one
+  hand-off, then today's behaviour.
+- **Reclaim** after R consecutive good or idle-alive ticks with `responsive`:
+  120 s, doubled for each new yield of the class within 30 minutes of its last
+  reclaim up to 32 minutes, reset after 30 minutes with no yield. Void and
+  neutral ticks neither count nor break the run. The back-off is per process.
+  A member that fails only while it does the work therefore owns it for a
+  shrinking share of each cycle and never permanently.
+- **Confirmation is the reader's.** A yielder keeps owning until every live
+  peer has applied the block. A peer confirms only by echoing, on its next
+  request, the `(boot, generation)` of the block it holds, or on the sync path
+  by answering a request with an `echo` of the requester's block as it holds it
+  after recording it, before replying. Both paths are one rule: an echo of the
+  same boot at a generation at least the one that set the bit. The serve side no longer marks a peer as having read a block when it
+  writes the frame; that was a false confirmation whenever the frame was not
+  applied. A peer that sends no echo (0.43) never confirms, so a yielder
+  keeps owning while one is live. Per class, the confirmation is held against
+  the generation that first set the bit, so an unrelated block change never
+  re-opens it. `Owners` masks the member's own block to the effective bits
+  before it asks `candidates`, which fixes the member dropping out of its own
+  candidate set the moment it set the bit.
+- **A block never replaces an older one from the same process**, and a peer
+  from which a member holds no block is no candidate for webhooks and
+  embeddings (expiry already worked that way). On its own `Defunct` or `Rejoin`
+  a member drops every peer block it holds and clears its read map. Exclusion
+  only adds owners, so these cost duplicates, never gaps.
+- **Probation.** A start that follows `storage_failed` or `task_died` begins
+  with every class `stalled` and yields through the ordinary rules. A start that
+  follows `unclean` or `storage_not_closed` does so only with corroboration: the
+  data directory's free space is below `min(1 GiB, 5% of the filesystem)`, or the
+  previous run was shorter than 10 minutes, or the previous start was itself
+  not clean. A new advisory file `kimmy.last-start`, written when a start
+  reaches serving, carries the start time and the verdict it inherited. An
+  ordinary roll satisfies none of this, and a missing file makes the
+  corroborations false. A whole-cluster unclean restart starts every member in
+  probation, advertising a yield of every class. The latch counts only stalls with
+  a local cause and a probation stall is not one, so the cap holds the yields back:
+  it is max(1, ⌊(n−1)/2⌋), which is one at three members, and once the members
+  have heard each other the ones beyond the cap in node id order withdraw while
+  the lowest node id keeps advertising a yield on every class for about 24 quiet
+  ticks (two minutes). No member is a target, so it
+  keeps owning and nothing is left unowned.
+- **The off switch** is `KIMMY_OWNERSHIP_YIELD=off`, environment only (a config
+  key would break config rollback to 0.43.0 under `deny_unknown_fields`).
+  Unset, `on` and `off` are the values, case-insensitive; any other value
+  refuses the start, so a typo cannot leave yielding on. Off, the member still
+  judges, advertises, honours its peers' bits and can be a target; it never
+  sets its own bits. The confirmation and candidate rules above are correctness
+  fixes and are not switched.
+- **The evaluator is a supervised thread** (`kimmy_task::supervise_thread`): a
+  panic exits the process with status 70 and a `task_died` marker, like every
+  background task, and a thread is not retried. If it stops ticking, the facts
+  block advertises every class state as `unknown` and `responsive` as absent
+  after two ticks, keeps the yield bits as they are, and the member is never a
+  target.
+- **The wire.** The block gains `class_state` and `class_cause` (documents of
+  three strings, each decoded on its own, so an unknown or malformed entry reads
+  as `unknown` and never as `idle`), `responsive` and `started_ms` (the sender's
+  process start, so two processes of one member can be ordered); `Vectors` and
+  `AskVersions` each gain `facts_gen` (the generation of the sender's block) and
+  `echo` (the other side's block as the sender holds it). Every field is
+  optional, so a 0.43 build decodes every frame, and a 0.43 block decodes here
+  with no state.
+- **The precursor.** The egress pre-check's lookup, which ran on a runtime worker
+  outside the delivery deadline, was moved to the blocking pool under that
+  deadline first (the addendum to
+  [ADR-199](#adr-199--a-background-tasks-storage-walk-runs-under-blocking-its-point-reads-stay-on-the-worker)),
+  so a hung lookup is a remote timeout for one attempt, and a held worker is
+  what the runtime measure sees.
+
+**What it changes in earlier decisions.**
+
+- **ADR-201:** the sender now sets `yielding`; confirmation is the reader's;
+  blocks never regress; an unheard peer is no longer a candidate for webhooks
+  and embeddings; the block and the frames gain the fields above; and its
+  `read` map and the `note_read_by` on the serve write are replaced by the echo.
+- **ADR-187:** `ttl_expiry` and `yield_evaluator` join the progress rows. The
+  ttl row is the age of its class cell's last beat, the evaluator row the age
+  of its last tick.
+- **ADR-184:** a supervised thread exists beside a supervised task.
+- **ADR-188:** a start after a failed or unclean end can begin in probation.
+- **ADR-199's egress addendum** is the precursor named above; nothing in it changes.
+
+**Rejected.**
+
+- *Ages on the wire,* and the evaluator's own timer as the runtime measure:
+  both read the sender's clock or the sender's own stall, which is what is
+  being judged.
+- *ADR-187's ages as triggers:* the dispatcher stamps progress after planning,
+  the embedding worker's age is not reset by retries, and expiry had no writer.
+- *A probe commit,* a write the member makes to see whether it can write: it
+  makes the fault worse and measures the writer, not the class.
+- *Whole-member yielding:* a member with a wedged dispatcher still expires and
+  embeds correctly.
+- *Unknown, stale, `suspect` or unresponsive targets:* each hands work to a
+  member that cannot be shown to do it.
+- *No cap,* and *confirmation on write,* and *a latched confirmation:* a
+  yielder that stopped owning on the strength of one old confirmation would
+  leave work unowned when a peer restarted or a block was lost.
+- *A config key for the switch,* for the rollback reason above.
+- *A writer-wedge trigger in 0.44.0.*
+
+**What it states.**
+
+- **A wedged writer yields nothing in 0.44.0.** `WriterGate` is never overdue,
+  so a writer held for good delays every class and is not detected. A later
+  trigger can be node-level and read the writer-holder labels.
+- **Independent faults on two members of one class are treated as shared.**
+  The latch cannot tell them from a fault that follows the data, so both stay
+  as they are. That is today's behaviour.
+- **A shared fault that shows only as runtime stalls no longer latches**, and
+  the latch counts only `stalled` members whose cause is `local`. A record whose
+  reads block the workers of whichever member owns it makes each owner
+  `stalled(runtime)` in turn, so the hand-off ping-pong returns for those. It is
+  bounded by the cap (one yielder per class at n ≤ 4), by the reclaim back-off
+  (120 s doubling to 32 minutes), and by the responsive-target rule, because a
+  runtime-stalled peer is never a target.
+- **The probation tie-break can force out the wrong yielder at n ≤ 4.** The
+  cap is 1 there and the tie-break keeps the lowest node id. A probation
+  yielder with a lower node id than a member already yielded for a local fault
+  makes that member withdraw and take its broken class back, on every restart of
+  the probation member, until it reclaims or stops restarting. Duplicates and
+  failures follow, never a gap.
+- **A stalled TTL task's list of what it owns can be stale.** The target rule
+  reads a peer against the collections this member's last completed pass owned,
+  and a stalled task cannot refresh that. A collection whose ownership moved to
+  the member after that pass may then be one no peer is asked to list, so a yield
+  can be advertised and counted and still hand that collection to nobody. The
+  member stays its owner (the empty-candidate fallback never removes an owner), so
+  the cost is delay or duplicates, never a gap.
+- **A local success masks failures within one cycle.** Per-class yielding
+  cannot fix a per-key fault; the failures stay in
+  `kimmy_yield_faults_total{class,kind="local"}`.
+- **The back-off is per process.** A restart resets it.
+- **The cost of the unheard rule.** Every start, and every own `Defunct`, owns
+  every webhook subscription and embedding collection until it has heard each
+  live peer, up to ⌈(n−1)/fanout⌉ ticks. A fault that stops replication
+  contacts while SWIM stays up (a blocked port, a certificate mistake) owns them
+  for the fault's whole length. Both are duplicates, never gaps, and a `WARN`
+  names a live peer that has sent no block for more than a lease and says that
+  this member is therefore also owning that peer's share.
+- **Duplicates, by class.** TTL: both delete the same expired document, and
+  last-writer-wins converges to one tombstone at the cost of one extra oplog
+  entry. Webhooks: both deliver the same events, which is the at-least-once
+  contract, so a receiver deduplicates per event and not per envelope (batch
+  boundaries may differ, so `x-kimmy-event-id`, the first event's id, does not
+  identify a duplicate). Embeddings: both call the provider and write the same
+  fingerprinted, stamp-checked vectors, correct but costing provider spend and
+  rate-limit pressure.
+- **The one residual gap: asymmetric SWIM views.** If X has removed P from its
+  live set while P still holds X's pre-yield block, P can route X's keys to X.
+  It ends at the earlier of P's next completed request to X (whose reply carries
+  X's current block) and P's own `Defunct`, about one sync interval or SWIM's
+  dissemination of the down declaration. Every other no-owner window is closed:
+  for members whose live sets agree, no key is without an owner at any instant.
+  The catching-up start (ADR-202) and a TTL index dropped mid-pass stay as
+  they were.
+
+**Timing, defaults, three members.** The lease is 15 s. A webhook dispatcher
+wedged in `Waiting` or `Local` is detected after 60 s and its share is
+delivered by a peer about 78 s after the wedge. An embedding worker wedged in a
+local step is detected after 60 s and a peer embeds about 81 s after, with the
+rescan starting about 30 s later. Expiry wedged between passes is detected
+after 135 s and a peer's pass follows within 60 s. An intermittently stalled
+runtime is detected after 30 s. A runtime stalled continuously for more than
+about 5 s is marked down by SWIM first (a missed 1 s probe, then 4.8 s of
+suspicion), which is SWIM's case. A provider that hangs or an Ollama that is
+slow is never overdue, because each attempt ends in its own timeout, so the
+member does not yield.
+
+**The new series**, always rendered, on the OTLP bridge and in
+[Operations](operations.md): `kimmy_owner_class_state{class,state,cause}`,
+`kimmy_owner_class_owned{class}`, `kimmy_yielding{class}`,
+`kimmy_yield_transitions_total{class,direction}`,
+`kimmy_yield_suppressed{class,reason}`,
+`kimmy_yield_observations_total{class,verdict}`,
+`kimmy_yield_evaluator_ticks_total`, `kimmy_yield_faults_total{class,kind}`,
+`kimmy_runtime_responsive`, `kimmy_ownership_yield_enabled` and
+`kimmy_yield_probation`. The HELP of
+`kimmy_yield_unconfirmed_peers` (it now counts non-echoing peers) and of
+`kimmy_ownership_peers{state="unknown"}` changes. `/v1/topology` gains, per node,
+`yielding` and `classState` as this member sees them, and the answer gains
+`view`.
+
+### Where the build departs from the design
+
+The design this ADR records and the build differ in 38 places. Each is listed with the design's text, what
+was built and why, so that a reader of the code who finds one does not take it
+for a mistake. The groups below are the cluster core, the daemon, the embedding
+worker and the refusing-peer switch; the numbers run through all of them.
+
+**The cluster core.**
+
+1. **A class enters `stalled` only on a tick whose verdict is bad.**
+   *Design:* "N bad items of the last M, inside the window." *Built:* `stalled`
+   is entered when this tick's verdict is bad **and** at least N bad items are in
+   the window. *Why:* ttl's window is 300 s, longer than the 120 s reclaim, so
+   after a reclaim the old bad items are still in the window and "N of M"
+   alone re-stalls the class on the next tick with no new evidence. With the
+   rule, a class whose window still holds N−1 bad items goes `suspect` and one
+   more bad item re-enters at once. For webhooks and embeddings (window 60 s,
+   shorter than the reclaim) it changes nothing.
+2. **Void ticks.** *Design:* "L_eval > V, or the previous tick was void by this
+   rule." *Built:* a tick is void when its own control gap is above V or the
+   previous tick's own gap was; a tick void only because of its predecessor does
+   not void the next. Counters are not read on a void tick, so their deltas
+   accumulate into the next judged one, and the latch is not updated. *Why:*
+   "by this rule" is ambiguous between chaining and not. Chaining turns one
+   pause into an unbounded run of void ticks while the control stays late. The
+   pause sweep (every phase offset, 0.5–2 s) needs only two void ticks: the late
+   one and the one that holds the probe's late wake.
+3. **The back-off step.** *Design:* "R doubles for each new yield of the class
+   within 30 min of its last reclaim." *Built:* the step is applied once per
+   episode, at its first yield, so a withdraw and a re-yield inside one episode
+   do not double again; `last_reclaim` is set only when the episode had yielded,
+   and an episode that never yielded reclaims at the base R. *Why:* "new yield"
+   is ambiguous inside an episode with withdraws, and counting each re-yield
+   would double R every time the latch flaps.
+4. **The probation waiver lasts the episode.** *Design:* "A probation start
+   waives the target condition. The cap, the tie-break and the switch still
+   apply." *Built:* the target condition is waived for the whole probation
+   episode, including a re-yield after a tie-break withdraw and after the
+   episode's cause is upgraded to `local`; it ends at reclaim. *Why:* the design
+   states the waiver for the start. Without persistence, a probation member that
+   loses the tie-break (the cost stated above) could never re-yield when the
+   winner's block goes stale, because it would then need a target it never had.
+5. **The echo's representation.** *Design:* `echo: Option<Echo { boot,
+   generation }>`, and an "echoing peer" is one whose last frame carried an
+   `echo` at all. *Built:* a 0.44 sender always sends an echo, and "holds
+   nothing" is an empty boot with generation 0. Absent or undecodable is
+   non-echoing. `facts_gen` and `started_ms` decode as non-negative integers or
+   none. *Why:* without a "holds nothing" value, a 0.44 peer that has not yet
+   heard the sender is indistinguishable from a 0.43 peer.
+6. **Echo timing, the decode sequence and the Defunct floor.** *Design:* the
+   echo is "as the requester currently holds"; the decode stamp is "a
+   process-wide `AtomicU64`"; an own `Defunct` "clears". *Built:* the echo on a
+   request is read at send time, not at the start of the tick; the sequence is a
+   process-wide static counter; and an own `Defunct` or `Rejoin` sets a global
+   floor (every slot, heard or never heard) in addition to the per-slot drop
+   floors. *Why:* an echo read at the start of the tick would not count a block an
+   earlier contact in the same tick applied, and a per-slot floor does not cover
+   a peer never heard before the `Defunct`.
+7. **The stable-live-set timer starts at the first question.** *Design:* "A yield
+   becomes effective only after this member's SWIM live set has been unchanged
+   for one lease." *Built:* the lease counts from the last SWIM change
+   (`MemberUp`, `MemberDown`, `Rename`); a member that has seen no change since it
+   was created counts from the first time ownership asks. *Why:* `Members` is
+   created before SWIM runs and has no clock of its own to start from, and the
+   first question is within a second of the first block.
+8. **The probation decision is a pure function in `kimmy-cluster`, over a mirror
+   of `PreviousRun`.** *Design:* the decision reads the lifecycle's verdict.
+   *Built:* `kimmy_cluster::yielding::probation::{decide, PreviousEnd, Inputs}`;
+   the daemon maps its `PreviousRun` into `PreviousEnd`, and a test holds the
+   mapping against the real struct so they cannot drift. *Why:* the decision
+   table has to be testable without a daemon.
+9. **Two existing tests changed meaning.** `unheard_peers_count_as_before` became
+   `unheard_peers_are_no_candidates` (the design's own rule that an unheard peer
+   is no candidate), and the `note_read_by` tests became echo tests (removing the
+   write-time confirmation). Not departures from the design; listed because they
+   changed behaviour that tests pinned.
+
+**The daemon.**
+
+10. **The class cells, the writer-gate hook and the TTL and webhook beats landed
+    with the daemon, not with the cells.** *Design:* the cells own `class_step`,
+    `begin_write_as` and the beats, the daemon owns the thread. *Built:* all of
+    them arrived with the daemon, because the process tests for a stalled expiry
+    task and a stalled dispatcher cannot be judged without them. The embedding
+    worker's beats and the provider's per-attempt `Remote` came with the worker
+    (26–33). *Why:* the order of work; the end state is the design's.
+11. **Probation skips a class that is switched off.** *Design:* "Every class
+    starts `stalled`." *Built:* `Config.off` names the classes the operator has
+    off (ttl with `ttl_interval_secs = 0`, embeddings with the worker off) and
+    probation does not start them stalled or yielding. *Why:* a switched-off
+    class judges every tick neutral, and a neutral tick neither counts towards
+    reclaim nor breaks it, so a class started `stalled` could never leave. Found
+    by the probation process test on a real node.
+12. **A failed start passes on the verdict it carried.** *Design:* `error` never
+    starts probation. *Built:* a start that failed before serving writes an
+    `error` marker that carries the verdict it inherited, and probation reads the
+    carried verdict, so a node that cannot start over a full disk keeps reading
+    `storage_failed`; a failed start carrying nothing is `error`. *Why:*
+    ADR-190's lifecycle already carries the verdict through refused starts so
+    evidence is not buried, and the full-disk restart loop depends on it.
+13. **`KIMMY_TEST_KILL_TASK` entries that cannot act are named and ignored, not
+    refused.** *Design:* "`:error` is refused at start, as for every non-retrying
+    task." *Built:* such an entry, an unknown task, a stall on a task with no
+    stall point and a thread asked to return are named in the start's `WARN` and
+    ignored; the other entries still act. *Why:* the code at this base already
+    warned and ignored an `error` on a non-retrying task ("nothing will happen"),
+    and refusing the start would be a new refusal for one case only.
+14. **`kimmy_owner_class_state` has no `unknown` series and no cause-less
+    `stalled` series.** *Design:* one-hot over four states, with a `cause` label
+    on the `stalled` series only. *Built:* `ok`, `idle` and `suspect` are one
+    series each, and `stalled` is three series, one per cause (`local`,
+    `runtime`, `probation`). An evaluator that stopped ticking is told by its age
+    (`kimmy_task_progress_age_seconds{task="yield_evaluator"}` and the advertised
+    `unknown`), not by a series. *Why:* a one-hot gauge with a label on one state
+    is awkward to sum, and the stopped evaluator already has two better signals.
+15. **The `ttl_expiry` and `yield_evaluator` progress rows read existing marks.**
+    *Design:* "the progress rows `ttl_expiry` and `yield_evaluator`." *Built:*
+    no second mark a writer sets. The ttl row is the age of the class cell's last
+    beat (a member with expiry off beats it at each unowned check) and the
+    evaluator row is its age of last tick. *Why:* a second mark is a second thing
+    to keep true, and ADR-187's lesson is that a mark set apart from the work
+    drifts.
+16. **`kimmy_owner_class_owned` is the cell's last owner check, so a stalled
+    class reads stale.** *Design:* the test of a lease: "summed `owned` is 1 after
+    a lease." *Built:* the test sums `kimmy_ttl_collections{state="owned"}`,
+    which is computed at the scrape from this member's own view; `owned` for a
+    class whose task is stuck keeps its last value. *Why:* the gauge is the cell's,
+    and the cell is the stuck task's.
+17. **`kimmy.last-start`'s `inherited` is the mapped verdict label.**
+    *Design:* "an `Exit` name, `unclean`, `unreadable` or `first_start`."
+    *Built:* from `PreviousEnd::label()`, which is the same set after the rule of
+    12.
+18. **The runtime-stall injector sends one task per worker every 10 ms to the
+    common deadline, and ends on `Shutdown::has_begun`.** *Design:* the injector
+    "keeps spawning one task every 10 ms until the common deadline, each sleeping
+    in 50 ms slices to that deadline", so any worker that frees up picks one up.
+    *Built:* that, one task per worker per round, and the loop ends when the stop
+    begins, which the stop sets after the freeze. *Why:* a stop must not wait for
+    the injector, and one task per worker is what holds every worker, not one,
+    for the stall's length.
+
+**Corrections, not departures.** The escape rule
+applies across boots only (a held block past its lease is replaced by a
+later-decoded block of another boot; within one boot the generation never goes
+backwards), the echo is keyed by the peer's boot, the dropped-floor map is
+pruned, and the freeze is checked again before the yield publishes. They are
+listed so that this ADR states the final rule.
+
+**What the process tests assert, and where they stop short of the design's text.**
+
+19. **The first test of the lease sums `kimmy_ttl_collections{state="owned"}`,
+    not `kimmy_owner_class_owned`** (see 16). Its control, the owner's count
+    before, uses the same series.
+20. **The probation tests judge ttl and webhooks, then all three.** *Design:*
+    "the start advertises `stalled` and yields", for every class. *Built:* the
+    embeddings class was neutral until the worker beat its cell (10), so the
+    first version of the tests left it `idle`; the worker's beats widened them to
+    all three. Recorded because the early history of the tests would otherwise
+    read as a gap.
+21. **The worker's own tests and the refusing-peer test came with their parts.**
+    The tests of a stalled and of a failing embedding worker need the worker's
+    beats (26–33), and the test of an unconfirmed yield needs the switch of 36.
+22. **The mutation row for the latch counting runtime or probation stalls has a
+    pure killer and no process killer.** The pure latch tests kill it; the
+    process tests pass under it, because none runs two stalled members of
+    different causes at once. The design's own mapping for that row is "pure latch
+    tests".
+23. **The echo fix is read as "an echo that holds nothing of this boot's block
+    resets the record".** The wording first asked to "key it on the peer's boot or
+    forget it on a boot change". The frame that carries an echo does not carry the
+    peer's own boot, so the peer's boot cannot key the note; the forget on a heard
+    boot change stays, and a not-ours echo now resets the record to zero as well.
+    A new boot's first frame before its block is heard therefore withdraws a
+    stale confirmation.
+24. **The drop floors are pruned in `record_peer_facts`,** not on a timer, and
+    carry the instant of the drop beside the sequence.
+25. **The mutant for "the evaluator never depends on the runtime" is "the
+    evaluator's inputs call into the runtime",** not "the thread spawned as a
+    task": the evaluator's code has no spawn site to move, so the mutant makes the
+    thread wait on a runtime task each tick, which is what a runtime task would do
+    to it.
+
+**The embedding worker.**
+
+26. **`remote_fault` counts one per failed provider call, not one per HTTP
+    attempt.** *Design:* "`remote_fault` counts each attempt." *Built:* the
+    provider re-stamps `Remote` before each attempt (the host check, each send,
+    the in-client retry, each Ollama text) and ends it with a beat, so the bound
+    is per attempt; the count is noted where the call's error ends, once per
+    `call_provider`. A split batch notes once for the batch and once per document
+    sent alone. *Why:* counting inside the provider would double-count with the
+    worker's own classification, and the evaluator reads the delta, not the
+    number.
+27. **A `ResolverBusy` error is configuration, not remote.** The design does not
+    list it. It says the node's own lookups were all busy, which is neither the
+    provider's fault nor this member's storage, and the dispatcher already keeps
+    it out of a subscription's back-off.
+28. **A local fault by the worker is also a bad cycle, and a stored batch is a
+    good cycle.** For ttl and webhooks a cycle is a pass; the worker has no pass,
+    so a cycle is what its flush does. A storage or registry error that reaches
+    the class is a bad cycle beside its `local_fault`, and a `store` that commits
+    is a good one. Without a bad cycle the evaluator would never see an embedding
+    local fault.
+29. **The provider-fault test asserts four remote faults, not ten cycles.** The
+    worker's own back-off is 5 s doubling to 300 s, so four failed attempts take
+    about 35 s and ten take over 20 minutes. A provider that never answers
+    starts the hang once the owner is known, on a document written then (the owner
+    is found at the worker's ownership tick, which a worker already inside a hung
+    call does not reach), and asserts that a request reached the provider, that by
+    the provider's own clock the first request of the hang has then been held for
+    longer than the local stall bound
+    (30 s) with no member having counted a local fault, that while it is younger than
+    one attempt (60 s) no member has counted a remote fault either (no call can have
+    ended), and that no member is stalled or yields: one call alone is two attempts
+    of 60 s, and the request count is shared by every member, so no second request
+    is waited for and none is asserted unchanged. Ten cycles take over twenty
+    minutes, which only a longer run covers.
+30. **The canary is in the dispatcher's tests,** with a `deliver_within(timeout)`
+    seam and a `timed_out` flag on `Failure`. That flag is the "typed remote
+    `Timeout`" the design asks for; no new error type exists in the dispatcher.
+31. **`kimmy-vector` has a dev-dependency on `kimmy-cluster`,** only for the
+    equality test of the tied constants, which is a compile-time assertion in a
+    test target. The design's "fails to compile" for a loosening change is met
+    for `cargo test`, not for a plain build.
+32. **`KIMMY_TEST_FAIL_STEP` for the embeddings class is not wired** (the hook's
+    seam only). The worker's only local steps are the engine's, which have their
+    own fault injection (`KIMMY_TEST_FAIL_STORAGE`).
+33. **A drive loop with no ownership check never reports `owned`.**
+    `kimmy_owner_class_owned{class="embeddings"}` is set at the ownership tick,
+    which a single-node build does not run, so its value there is 0 and the
+    class's beats come from the loop's `Waiting` alone. Nothing could yield to
+    anything on such a node. The same structure makes the count lag during a
+    held provider call: the ownership tick runs in the worker's loop, which is
+    inside the call, so the count is set when the call ends (up to two attempts
+    of 60 s). It was always so; yielding judges the `Remote` phase and the
+    heartbeat instead, and a handover is decided by the live owner check, which
+    nothing caches.
+34. **A diagnostic dump stays in the test of a TTL target after a restart.** It
+    was added when that test failed on a rebase; the cause was found and fixed (see
+    "A clarification, not a departure", below), and the dump names the cause if it
+    recurs.
+35. **Two Low items.** The `Stopping` arm already preceded the generic one, so the
+    new test pins it and a mutation row shows the arm matters; and `Stop::begin`
+    stores its flag before it looks the handle up, so neither order of install and
+    stop misses a freeze.
+
+**The refusing-peer switch.**
+
+36. **`KIMMY_TEST_REFUSE_SYNC=1` refuses replication in both directions.**
+    *Design:* "the replication listener accepts and drops peer connections
+    without answering." *Built:* that, and `transport::dial` refuses while the
+    switch is armed, so the member dials no peer. *Why:* a first version with the
+    listener alone did not hold the test. The refusing peer's own requests to the
+    yielder carry an echo of the yielder's block, so it confirmed the yield
+    through its outbound pulls, the unconfirmed count fell to 0 and the yield
+    became effective. "A peer that never completes a contact" needs both
+    directions. SWIM (its own UDP socket) and the client API are left alone, and a
+    process test logs in, writes and reads on the refusing node and shows the write
+    is not replicated.
+37. **The unconfirmed-yield test chooses the refusing peer from the seed graph,
+    and "keeps owning" is read from the yielder's own
+    `kimmy_ttl_collections{state="owned"}`.** A member dials only its seeds. With
+    A and B seeding each other and C seeding A, C and B hear only A and A hears
+    both, so a refusing hub would leave a non-hub yielder with no target at all.
+    The test refuses the other non-hub, or B when the yielder is the hub. A peer
+    that has read the yield takes the work up as well (the designed overlap), so
+    "nobody else expires a due document" is not an observable of the yielder still
+    owning; the yielder's own owned count is.
+
+**A clarification, not a departure.** The target rule reads a TTL peer against
+the collections this member's last completed pass **owned**, "or, before its first
+pass, in its own TTL holder list". A pass that ran while the member was catching
+up owned nothing because it knew nothing, so it records nothing (the cell's owned
+list stays as it was before the first pass) and the holder list applies; a pass
+that ran ungated and owned nothing records an empty list, which means the member
+owns nothing, so no peer is asked to list anything and the class says `no_target`
+and does not yield. A member that owns nothing has nothing to hand over. An
+earlier build read any empty list as "unknown" and fell back on the holder list,
+which let such a member yield; the process test that had suggested it restarted a
+member it had read as the owner while the other two were still catching up.
+
+**One more place the build departs.**
+
+38. **Tenant-driven errors are no fault of the member.** *Design (the
+    embedding worker's classification):* a storage or registry error that reaches
+    the class is a local fault and a bad cycle, except the stop. *Built:* a
+    database, collection or document the tenant removed or changed
+    (`DatabaseNotFound`, `CollectionNotFound`, `DocumentNotFound`, from the core or
+    through storage), a conditional write that found another version (`Stale`) and a
+    write that waited for the writer and gave up (`WriterBusy`) count as no fault and
+    no bad cycle; every other storage or registry error stays local. *Why:* a
+    tenant dropping collections while a bulk embed runs could otherwise make the
+    class look stalled and the member yield, and time spent at the writer's gate is
+    by design never a stall.
+
+### Test
+
+`kimmy-cluster`: the evaluator as a pure state machine (the verdicts, void ticks
+over every phase offset, entering, the target, the cap and the tie-break, the
+latch, reclaim and its back-off), the probation table, the codec in both
+directions across a version boundary with every malformed shape of the new
+fields, the confirmation paths (echo, sync path, a scripted fake peer that
+echoes an old boot, a scripted requester), and the no-owner argument of the
+claim above as tests over `Members`. `kimmy-storage`: the cells, the task-local
+scope, the writer-gate phase and the TTL beats. `kimmy-vector`: the worker's
+beats and classification, the provider's per-attempt `Remote`, and the tied
+constants. `kimmy-task`: the supervised thread and the stall points. `kimmyd`
+(process tests, `cargo test -p kimmyd --test yielding -- --ignored
+--test-threads=1`, their own job in CI): a stalled expiry task, a stalled
+dispatcher, a stalled and a failing embedding worker, the latch, a runtime stall,
+probation after a storage failure and a start that is not probation, an evaluator that panics and one that stops
+ticking, the off switch and its refusal of a bad value, and an unconfirmed
+yield. Every mutation row of the design was applied and killed.

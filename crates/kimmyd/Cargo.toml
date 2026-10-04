@@ -31,6 +31,7 @@ kimmy-vector.workspace = true
 kimmy-auth.workspace = true
 axum.workspace = true
 kimmy-cluster.workspace = true
+arc-swap.workspace = true
 clap.workspace = true
 serde.workspace = true
 toml.workspace = true
@@ -61,6 +62,9 @@ mimalloc.workspace = true
 # The one trait the listener's front implements (`front::Front`): axum's own
 # service type is this crate's, already in the tree.
 tower = { version = "0.5", default-features = false }
+
+[target.'cfg(unix)'.dependencies]
+libc.workspace = true
 
 [dev-dependencies]
 # The front's tests call it as a service and read a response body.

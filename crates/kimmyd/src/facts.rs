@@ -17,7 +17,14 @@ pub fn source(
     ttl_disabled: bool,
     embeddings_disabled: bool,
     catch_up: Option<Arc<CatchUp>>,
+    evaluator: Option<crate::yielding::FactsHook>,
 ) -> FactsSource {
+    // Read once, here: the same in every block of this process, so a receiver can
+    // order two processes of this member by this member's own clock (ADR-213).
+    let started_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .ok()
+        .and_then(|since| u64::try_from(since.as_millis()).ok());
     Arc::new(move || {
         let (catching_up, catching_up_reason) =
             catch_up.as_ref().map_or((false, None), |c| (c.is_set(), c.marker().map(|m| m.reason)));
@@ -27,14 +34,25 @@ pub fn source(
             embeddings_disabled,
             catching_up,
             catching_up_reason,
+            started_ms,
             ..Facts::default()
         };
-        let Some(engine) = engine.upgrade() else { return base };
-        // A schema that cannot be read is sent as holding nothing: the peers
-        // then do not count this member a holder, which fails toward another
-        // holder taking the work, and the next read may succeed.
-        let collections = engine.all_collections().unwrap_or_default();
-        base.with_ttl(held(&collections))
+        let mut block = match engine.upgrade() {
+            // A schema that cannot be read is sent as holding nothing: the peers
+            // then do not count this member a holder, which fails toward another
+            // holder taking the work, and the next read may succeed.
+            Some(engine) => {
+                let collections = engine.all_collections().unwrap_or_default();
+                base.with_ttl(held(&collections))
+            }
+            None => base,
+        };
+        // What the yield evaluator last decided, and the TTL list it needs
+        // (ADR-213): read from atomics, never from the store.
+        if let Some(hook) = &evaluator {
+            hook.apply(&mut block);
+        }
+        block
     })
 }
 
@@ -106,7 +124,7 @@ mod tests {
         let (engine, _dir) = engine();
         ttl(&engine, "app", "sessions", 60);
         engine.create_collection("app", "plain").unwrap();
-        let source = source(Arc::downgrade(&engine), vec![1; 16], false, true, None);
+        let source = source(Arc::downgrade(&engine), vec![1; 16], false, true, None, None);
         let block = source();
         assert_eq!(block.boot, vec![1; 16]);
         assert!(block.embeddings_disabled && !block.ttl_disabled);
@@ -119,12 +137,34 @@ mod tests {
 
         let (other, _dir2) = engine_pair();
         ttl(&other, "app", "sessions", 120);
-        let other_block = super::source(Arc::downgrade(&other), vec![2; 16], false, false, None)();
+        let other_block =
+            super::source(Arc::downgrade(&other), vec![2; 16], false, false, None, None)();
         assert_ne!(block.ttl[0].digest, other_block.ttl[0].digest, "a different definition");
     }
 
     fn engine_pair() -> (Arc<Engine>, tempfile::TempDir) {
         engine()
+    }
+
+    /// The block says when this process started, in the member's own wall-clock
+    /// milliseconds, read once: the same in every block of the process, so a peer can
+    /// order two processes of this member without comparing clocks (ADR-213). It
+    /// says nothing yet of how the member's classes stand, which a 0.43 peer reads
+    /// the same way.
+    #[test]
+    fn the_block_carries_the_start_time_read_once() {
+        let before =
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis()
+                as u64;
+        let (engine, _dir) = engine();
+        let source = source(Arc::downgrade(&engine), vec![1; 16], false, false, None, None);
+        let first = source();
+        std::thread::sleep(std::time::Duration::from_millis(5));
+        let second = source();
+        let started = first.started_ms.expect("a start time");
+        assert!(started >= before, "read when the source was made, not before");
+        assert_eq!(second.started_ms, Some(started), "and not again");
+        assert!(first.class_state.is_none() && first.responsive.is_none());
     }
 
     /// With the engine gone the block still says who it is, and lists nothing.
@@ -133,7 +173,7 @@ mod tests {
         let (engine, _dir) = engine();
         let weak = Arc::downgrade(&engine);
         drop(engine);
-        let block = source(weak, vec![3; 16], true, false, None)();
+        let block = source(weak, vec![3; 16], true, false, None, None)();
         assert_eq!(block.boot, vec![3; 16]);
         assert!(block.ttl.is_empty() && block.ttl_disabled);
     }
@@ -146,9 +186,15 @@ mod tests {
         let (engine, _dir) = engine();
         let marker_dir = tempfile::tempdir().unwrap();
         let catch_up = CatchUp::open(marker_dir.path(), std::time::Duration::from_secs(120));
-        let with =
-            source(Arc::downgrade(&engine), vec![1; 16], false, false, Some(Arc::clone(&catch_up)));
-        let without = source(Arc::downgrade(&engine), vec![1; 16], false, false, None);
+        let with = source(
+            Arc::downgrade(&engine),
+            vec![1; 16],
+            false,
+            false,
+            Some(Arc::clone(&catch_up)),
+            None,
+        );
+        let without = source(Arc::downgrade(&engine), vec![1; 16], false, false, None, None);
 
         assert!(!with().catching_up && with().catching_up_reason.is_none());
         catch_up.mark(kimmy_cluster::CatchUpReason::Restored).unwrap();

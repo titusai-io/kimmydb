@@ -679,3 +679,56 @@ fn no_profile_makes_a_panic_abort_the_process() {
     // answer is not an empty read.
     assert!(manifest.contains("[profile.release]"), "the release profile is not in this manifest");
 }
+
+/// Every supervised **thread** (ADR-213): each `THREADS` entry has a
+/// `supervise_thread` call site under its literal name, and every such call names a
+/// `THREADS` entry. A thread is not a task: nothing retries it, `TASKS` and
+/// `kimmy_task_retries_total` do not carry it, and a panic in it is still a death,
+/// which only `supervise_thread` makes true.
+#[test]
+fn every_supervised_thread_is_declared_and_every_declared_thread_is_supervised() {
+    let mut called: Vec<String> = Vec::new();
+    for (path, body) in &production_sources() {
+        let flat = body.replace(['\n', ' '], "");
+        let mut rest = flat.as_str();
+        while let Some(at) = rest.find("supervise_thread(") {
+            rest = &rest[at + "supervise_thread(".len()..];
+            match rest.strip_prefix('"') {
+                Some(after) => called.push(after.chars().take_while(|c| *c != '"').collect()),
+                None => panic!(
+                    "a thread is supervised under a name that is not a string literal, so this \
+                     check cannot read it: {}",
+                    path.strip_prefix(root()).unwrap_or(path).display()
+                ),
+            }
+        }
+    }
+    // The definition's own signature is not a call.
+    called.retain(|name| !name.is_empty() && name != "name:&'staticstr,");
+    called.sort();
+    called.dedup();
+    let declared: Vec<String> = kimmy_task::THREADS.iter().map(|t| (*t).to_string()).collect();
+    assert_eq!(
+        called, declared,
+        "kimmy_task::THREADS and the supervise_thread call sites disagree: a thread supervised \
+         under a name that is not declared, or a declared thread nothing supervises"
+    );
+    for thread in &declared {
+        assert!(
+            !kimmy_task::TASKS.contains(&thread.as_str()),
+            "{thread} is a thread, and a thread is not retried, so it is not a task"
+        );
+    }
+}
+
+/// Every progress writer is a task or a thread: a row whose writer nothing
+/// supervises would climb for ever or read 0, and say nothing true.
+#[test]
+fn every_progress_writer_is_a_task_or_a_thread() {
+    for writer in kimmy_api::metrics::PROGRESS_WRITERS {
+        assert!(
+            kimmy_task::TASKS.contains(&writer) || kimmy_task::THREADS.contains(&writer),
+            "{writer} is a progress writer and neither a supervised task nor a supervised thread"
+        );
+    }
+}

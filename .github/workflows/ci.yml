@@ -366,6 +366,60 @@ jobs:
           if-no-files-found: ignore
           retention-days: 14
 
+  # The ownership-yielding process tests (ADR-213): real kimmyd processes with
+  # a stalled task, a held runtime, a failing store or a refusing peer, and a
+  # yield judged by what the other members then did. A job of its own and not a
+  # step of the cluster harness: the twenty-one tests take about fourteen
+  # minutes on a development machine and longer on a two-core runner, and the
+  # cluster harness's own ten minutes should not grow by that. It runs beside
+  # the other jobs, so the pull request waits for the longest of them rather
+  # than for their sum. Serialized, like the harness: a test here reads the
+  # order and timing of what three daemons did, and daemons from two tests at
+  # once on two cores prove nothing about either.
+  yielding:
+    name: yielding process tests
+    runs-on: ubuntu-latest
+    needs: changes
+    if: needs.changes.outputs.docs_only != 'true'
+    # Longer than the longest run seen, so that a hang is a failure that says
+    # which test and not a job GitHub ends after six hours.
+    timeout-minutes: 75
+    env:
+      # Debug info roughly doubles CI build time and nothing here reads a
+      # backtrace symbol table.
+      CARGO_PROFILE_TEST_DEBUG: 0
+      RUSTFLAGS: -D warnings
+      # The same headroom as the cluster harness, for the same reason: a node
+      # booting three daemons on two cores. A test fails on a hang, never on
+      # this number being reached.
+      KIMMY_TEST_PATIENCE_SECS: "240"
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      # Save only from main — see the note on the `lint` job above.
+      - uses: Swatinem/rust-cache@v2
+        with:
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+
+      - name: Yielding process tests
+        env:
+          KIMMY_TEST_NODE_LOGS: ${{ runner.temp }}/node-logs
+        run: cargo test -p kimmyd --test yielding -- --ignored --test-threads=1
+
+      # Every node of a failed test, as the nodes logged it: the yield, its
+      # evidence and the targets are in the WARN lines, and a red run can
+      # otherwise only be repeated, not read.
+      - uses: actions/upload-artifact@v7
+        if: failure()
+        with:
+          name: node-logs-yielding
+          path: ${{ runner.temp }}/node-logs
+          if-no-files-found: ignore
+          retention-days: 14
+
   # On pull requests as well as on main, like the cluster harness above.
   vector-reachability:
     name: vector reachability

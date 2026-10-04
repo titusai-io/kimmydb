@@ -1861,6 +1861,126 @@ async fn every_documented_operation_answers_as_the_specification_says() {
 ///
 /// A client branches on these, so a status or an envelope that changes here is
 /// a breaking change whether or not anyone meant it to be.
+/// `/v1/topology` reports what each node yields, as the answering node sees it
+/// (ADR-213), and the answer matches its documented schema: `view` names the node
+/// that answered; the answering node's own entry carries what its evaluator last
+/// decided; a peer's carries what its last block said, `unknown` for a class the
+/// block does not name and **no `classState` at all** for an older build's peer,
+/// which is never a target.
+#[tokio::test]
+async fn topology_reports_what_each_node_yields_and_matches_its_schema() {
+    use kimmy_cluster::yielding::driver::RealClock;
+    use kimmy_cluster::yielding::{Config, Evaluator, Published};
+    use kimmy_cluster::{ClassState, Facts, Members, PerClass, Yielding};
+
+    let mut c = Conformance::start().await;
+    let state = Arc::clone(&c.server.state);
+    let me = state.engine.node_id();
+
+    // This node's evaluator, in probation: every class stalled and yielded.
+    let published = Arc::new(Published::default());
+    let mut config = Config::new(me);
+    config.probation = true;
+    let (_, start) = Evaluator::start(config, std::time::Instant::now());
+    let clock = Arc::new(RealClock::new());
+    published.store_start(&start, 0);
+    let cell = || {
+        kimmy_storage::class_step::ClassCell::leak(Arc::new(
+            kimmy_storage::class_step::MonotonicClock::new(),
+        ))
+    };
+    state.metrics.set_yield_handle(Arc::new(kimmy_api::yielding::YieldHandle {
+        published,
+        cells: [cell(), cell(), cell()],
+        clock,
+        e: std::time::Duration::from_secs(5),
+        enabled: true,
+        probation: true,
+    }));
+
+    // Two live peers, both in the registry: one that sent a 0.44 block yielding
+    // webhooks and naming two classes, and one that sent a block with no class
+    // fields at all (a 0.43 build's).
+    let (modern, older) = (kimmy_core::NodeId::generate(), kimmy_core::NodeId::generate());
+    let members = Members::default();
+    members.insert_for_test("127.0.0.1:7001".parse().unwrap(), modern);
+    members.insert_for_test("127.0.0.1:7002".parse().unwrap(), older);
+    members.record_peer_facts_for_test(
+        modern,
+        Facts {
+            boot: vec![1; 16],
+            yielding: Yielding { webhooks: true, ..Yielding::default() },
+            class_state: Some(PerClass {
+                ttl: ClassState::Ok,
+                webhooks: ClassState::Stalled,
+                embeddings: ClassState::Unknown,
+            }),
+            ..Facts::default()
+        },
+        std::time::Duration::ZERO,
+    );
+    members.record_peer_facts_for_test(
+        older,
+        Facts { boot: vec![2; 16], ..Facts::default() },
+        std::time::Duration::ZERO,
+    );
+    state.set_members(members);
+    let registry = state
+        .engine
+        .create_system_collection(
+            kimmy_api::topology::NODES_DB,
+            kimmy_api::topology::NODES_COLLECTION,
+        )
+        .unwrap_or_else(|_| {
+            state
+                .engine
+                .get_collection(
+                    kimmy_api::topology::NODES_DB,
+                    kimmy_api::topology::NODES_COLLECTION,
+                )
+                .unwrap()
+        });
+    for node in [modern, older] {
+        state
+            .engine
+            .insert(
+                &registry,
+                bson::doc! { "_id": node.to_string(), "endpoint": "http://127.0.0.1:1", "version": "0.44.0" },
+            )
+            .unwrap();
+    }
+
+    let root = c.login("root", ROOT_PASSWORD).await;
+    let topology = c.check("GET", "/v1/topology", "/v1/topology", Some(&root), None, 200).await;
+    assert_eq!(topology["view"], me.to_string(), "whose eyes these are");
+    let entry = |node: kimmy_core::NodeId| {
+        topology["nodes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|n| n["node"] == node.to_string())
+            .unwrap_or_else(|| panic!("{node} is not listed: {topology}"))
+            .clone()
+    };
+    let this = entry(me);
+    assert_eq!(this["self"], true);
+    assert_eq!(this["yielding"], json!(["ttl", "webhooks", "embeddings"]), "probation yields all");
+    assert_eq!(
+        this["classState"],
+        json!({ "ttl": "stalled", "webhooks": "stalled", "embeddings": "stalled" })
+    );
+    let modern = entry(modern);
+    assert_eq!(modern["yielding"], json!(["webhooks"]));
+    assert_eq!(
+        modern["classState"],
+        json!({ "ttl": "ok", "webhooks": "stalled", "embeddings": "unknown" }),
+        "a class the block does not name reads unknown, never idle"
+    );
+    let older = entry(older);
+    assert_eq!(older["yielding"], json!([]));
+    assert!(older.get("classState").is_none(), "an older build's peer says nothing of its classes");
+}
+
 #[tokio::test]
 async fn documented_refusals_use_the_documented_envelope() {
     let mut c = Conformance::start().await;

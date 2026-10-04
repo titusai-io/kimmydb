@@ -53,7 +53,7 @@ use crate::policy::{PolicyError, ProviderPolicy};
 pub(crate) const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 /// The whole request, connect included. A hung provider must not hold the
 /// worker's position forever; the worker's own retry takes it from here.
-const REQUEST_TIMEOUT: Duration = Duration::from_secs(60);
+pub const REQUEST_TIMEOUT: Duration = Duration::from_secs(60);
 /// How long a pooled connection may sit idle before the client drops it.
 /// Shorter than the typical load-balancer idle limit, so the client never
 /// reuses a connection the far side has already closed.
@@ -250,9 +250,28 @@ fn refused(e: PolicyError, provider: &'static str) -> VectorError {
     }
 }
 
+/// Run `work` with the class stamped `Remote`, putting it back to `Local` after,
+/// whichever way it ends. For work the heartbeat cannot beat inside: the in-process
+/// model's download and load, and its inference, which hold a runtime worker for
+/// longer than the 30 s local bound without a point to beat at. `Remote` is the
+/// phase with the longer bound (an attempt's 60 s and its grace, 75 s: the nearest to
+/// the design's 30 s and a second per text, 62 s at the default 32 chunks), and past
+/// it the class is overdue and counted a local fault, as for any call that outlives
+/// its own timer. A stand-in, since the cell has no per-call local bound. **A
+/// first-use model download that takes more than 75 s therefore reads as a local
+/// fault and can make the member yield embeddings.** That is accepted: while the
+/// model downloads the member cannot embed anyway.
+#[cfg(any(feature = "local-embeddings", test))]
+pub(crate) fn held_as_remote<T>(work: impl FnOnce() -> T) -> T {
+    let _remote = RemoteCall::begin();
+    work()
+}
+
 #[cfg(feature = "local-embeddings")]
 fn local_provider(model: &str, dim: usize) -> Result<Box<dyn EmbeddingProvider>> {
-    Ok(Box::new(crate::local::LocalProvider::new(model, dim)?))
+    // The model's download and load run on the caller's worker, with nothing to beat
+    // at: held as `Remote` for the length of it.
+    Ok(Box::new(held_as_remote(|| crate::local::LocalProvider::new(model, dim))?))
 }
 
 #[cfg(not(feature = "local-embeddings"))]
@@ -575,6 +594,32 @@ fn read_key(var: &str) -> Result<String> {
     std::env::var(var).map_err(|_| VectorError::MissingApiKey { var: var.to_string() })
 }
 
+/// A provider call in progress, as the class cell of the task that made it sees
+/// it (ADR-213): the class is `Remote` for as long as this lives, **re-stamped
+/// before each attempt** (the check of the host, each send, the in-client retry,
+/// each of Ollama's per-text requests) so the bound is one attempt's own timeout
+/// and never the whole call's. Dropped however the call ends, an error or a
+/// cancellation included, which puts the class back to `Local` with a beat.
+struct RemoteCall;
+
+impl RemoteCall {
+    fn begin() -> Self {
+        kimmy_storage::class_step::remote_attempt();
+        Self
+    }
+
+    /// Another attempt of the same call begins.
+    fn attempt(&self) {
+        kimmy_storage::class_step::remote_attempt();
+    }
+}
+
+impl Drop for RemoteCall {
+    fn drop(&mut self) {
+        kimmy_storage::class_step::remote_done();
+    }
+}
+
 #[async_trait]
 impl EmbeddingProvider for HttpProvider {
     async fn embed(&self, texts: &[String]) -> Result<Vec<Vec<f32>>> {
@@ -582,6 +627,7 @@ impl EmbeddingProvider for HttpProvider {
             return Ok(Vec::new());
         }
 
+        let remote = RemoteCall::begin();
         self.check_destination().await?;
 
         // Ollama takes one text per request; the others take the whole batch.
@@ -608,6 +654,7 @@ impl EmbeddingProvider for HttpProvider {
                     Auth::Bearer(key) => request.bearer_auth(key),
                     Auth::Header(name, key) => request.header(*name, key),
                 };
+                remote.attempt();
                 match request.send().await {
                     Ok(response) => break response,
                     Err(e) => {
@@ -702,6 +749,158 @@ mod tests {
             Default::default(),
         )
         .unwrap()
+    }
+
+    /// A provider that accepts the connection and never answers (a provider that hangs),
+    /// against the class cell of the task that called it, on paused time. **The class
+    /// is `Remote` for the whole call and the phase is re-stamped per attempt**: no
+    /// sample ever reads more than one attempt's timeout (plus a margin) since the
+    /// phase began, though the call lasts two of them, so `ATTEMPT_TIMEOUT + 15 s`
+    /// is a real bound and a hung provider never makes the class overdue. When the
+    /// call ends, however it ends, the class is `Local` again.
+    #[tokio::test(flavor = "current_thread")]
+    async fn work_held_as_remote_reads_remote_inside_and_local_again_after() {
+        use kimmy_storage::class_step::{self, ClassCell, MonotonicClock, Phase};
+        let cell = ClassCell::leak(std::sync::Arc::new(MonotonicClock::new()));
+        class_step::scope(cell, async {
+            class_step::phase(Phase::Local);
+            assert_eq!(cell.phase(), Phase::Local, "control");
+            let inside = held_as_remote(|| cell.phase());
+            assert_eq!(inside, Phase::Remote);
+            assert_eq!(cell.phase(), Phase::Local, "back to local with a beat");
+            // However the work ends: a panic inside it unwinds through the guard.
+            let caught = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                held_as_remote(|| -> () { panic!("model load failed") })
+            }));
+            assert!(caught.is_err());
+            assert_eq!(cell.phase(), Phase::Local, "put back on the way out of a panic");
+        })
+        .await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_hung_provider_is_remote_for_one_attempt_at_a_time_and_local_again_after() {
+        use kimmy_storage::class_step::{self, ClassCell, Phase, StepClock};
+        struct Paused(tokio::time::Instant);
+        impl StepClock for Paused {
+            fn now_ms(&self) -> u64 {
+                self.0.elapsed().as_millis() as u64
+            }
+        }
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let held = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let keep = std::sync::Arc::clone(&held);
+        tokio::spawn(async move {
+            loop {
+                let Ok((stream, _)) = listener.accept().await else { return };
+                keep.lock().unwrap().push(stream);
+            }
+        });
+        let p = HttpProvider {
+            endpoint: format!("http://{addr}/embed"),
+            model: String::new(),
+            dialect: Dialect::Custom,
+            auth: Auth::None,
+            dim: 2,
+            client: outbound(&loopback_policy()),
+            dimensions: None,
+        };
+        let cell = ClassCell::leak(std::sync::Arc::new(Paused(tokio::time::Instant::now())));
+        let call = tokio::spawn(class_step::scope(cell, async move {
+            class_step::phase(Phase::Local);
+            let outcome = p.embed(&["x".to_string()]).await;
+            (outcome.is_err(), cell.reading().phase)
+        }));
+        let mut longest = Duration::ZERO;
+        let mut samples = 0;
+        let started = tokio::time::Instant::now();
+        while !call.is_finished() {
+            tokio::time::sleep(Duration::from_secs(1)).await;
+            let r = cell.reading();
+            if r.phase == Phase::Remote {
+                longest = longest.max(r.since_phase);
+                samples += 1;
+            }
+        }
+        let (failed, after) = call.await.unwrap();
+        assert!(failed, "the hung provider's call fails");
+        assert_eq!(after, Phase::Local, "the attempt ended: not Remote any more");
+        assert!(
+            started.elapsed() > REQUEST_TIMEOUT * 2,
+            "premise: the call ran two attempts' worth, {:?}",
+            started.elapsed()
+        );
+        assert!(samples > 100, "premise: it was Remote throughout, {samples} samples");
+        assert!(
+            longest <= REQUEST_TIMEOUT + Duration::from_secs(2),
+            "the phase is stamped per attempt, never per call: {longest:?}"
+        );
+    }
+
+    /// Ollama takes one text per request: 32 texts answered 5 s each is one call of 160 s
+    /// and 32 attempts of 5 s, and the phase is stamped per text, so the class is
+    /// never anywhere near its bound while a slow but answering provider works.
+    #[tokio::test(start_paused = true)]
+    async fn a_slow_ollama_is_remote_one_text_at_a_time() {
+        use kimmy_storage::class_step::{self, ClassCell, Phase, StepClock};
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        struct Paused(tokio::time::Instant);
+        impl StepClock for Paused {
+            fn now_ms(&self) -> u64 {
+                self.0.elapsed().as_millis() as u64
+            }
+        }
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut stream, _)) = listener.accept().await else { return };
+                tokio::spawn(async move {
+                    let mut buf = vec![0u8; 4096];
+                    let _ = stream.read(&mut buf).await;
+                    tokio::time::sleep(Duration::from_secs(5)).await;
+                    let body = r#"{"embedding":[1.0,2.0]}"#;
+                    let response = format!(
+                        "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                        body.len()
+                    );
+                    let _ = stream.write_all(response.as_bytes()).await;
+                });
+            }
+        });
+        let p = HttpProvider {
+            endpoint: format!("http://{addr}/api/embeddings"),
+            model: "m".into(),
+            dialect: Dialect::Ollama,
+            auth: Auth::None,
+            dim: 2,
+            client: outbound(&loopback_policy()),
+            dimensions: None,
+        };
+        let cell = ClassCell::leak(std::sync::Arc::new(Paused(tokio::time::Instant::now())));
+        let texts: Vec<String> = (0..32).map(|i| format!("text {i}")).collect();
+        let call = tokio::spawn(class_step::scope(cell, async move {
+            class_step::phase(Phase::Local);
+            p.embed(&texts).await.map(|v| v.len())
+        }));
+        let mut longest = Duration::ZERO;
+        let started = tokio::time::Instant::now();
+        while !call.is_finished() {
+            tokio::time::sleep(Duration::from_secs(1)).await;
+            let r = cell.reading();
+            if call.is_finished() {
+                break;
+            }
+            assert_eq!(r.phase, Phase::Remote, "{r:?}");
+            longest = longest.max(r.since_phase);
+        }
+        assert_eq!(call.await.unwrap().unwrap(), 32, "the call answered all 32");
+        assert!(started.elapsed() >= Duration::from_secs(150), "premise: one long call");
+        assert!(
+            longest <= Duration::from_secs(15),
+            "stamped per text, not per call of 160 s: {longest:?}"
+        );
     }
 
     /// The far side closing a connection before answering is the failure a

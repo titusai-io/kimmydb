@@ -108,8 +108,9 @@ impl OwnerClass {
 }
 
 /// Which classes this member has stopped owning because it cannot do them.
-/// Defined and honoured by a reader in 0.43.0; a 0.43.0 sender always sends
-/// `false`, and nothing yields until the predicate that sets these ships.
+/// Honoured by a reader since 0.43.0 and set by the evaluator since 0.44.0
+/// (ADR-213); the **effective** bits, which a member acts on itself, are these
+/// masked by what every live peer has echoed.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Yielding {
     #[serde(default)]
@@ -131,6 +132,14 @@ impl Yielding {
 
     pub const fn any(&self) -> bool {
         self.ttl || self.webhooks || self.embeddings
+    }
+
+    pub fn set(&mut self, class: OwnerClass, value: bool) {
+        match class {
+            OwnerClass::Ttl => self.ttl = value,
+            OwnerClass::Webhooks => self.webhooks = value,
+            OwnerClass::Embeddings => self.embeddings = value,
+        }
     }
 }
 
@@ -175,6 +184,203 @@ pub struct Facts {
     pub ttl: Vec<TtlHeld>,
     #[serde(default)]
     pub ttl_truncated: bool,
+    /// How each class of owned work stands on this member (ADR-213). Absent from
+    /// a 0.43 sender, which reads as *not a target*; a key that is missing, or a
+    /// value that is not one of the four names, reads `Unknown` for that class,
+    /// never `Idle`.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "lenient_per_class"
+    )]
+    pub class_state: Option<PerClass<ClassState>>,
+    /// Why each `stalled` class is stalled, for the shared-fault latch, which
+    /// counts only `local` (ADR-213).
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "lenient_per_class"
+    )]
+    pub class_cause: Option<PerClass<StallCause>>,
+    /// The member's runtime has not stalled for the last
+    /// `yielding::RESPONSIVE_TICKS` judged ticks. Anything but a bool
+    /// reads as `None`.
+    #[serde(default, skip_serializing_if = "Option::is_none", deserialize_with = "lenient_bool")]
+    pub responsive: Option<bool>,
+    /// The sender's wall-clock milliseconds at its process start, read once: the
+    /// same in every block of a process, so a receiver can order two processes of
+    /// one member by the sender's own clock (ADR-213).
+    #[serde(default, skip_serializing_if = "Option::is_none", deserialize_with = "lenient_millis")]
+    pub started_ms: Option<u64>,
+}
+
+/// One value per class of owned work.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+pub struct PerClass<T> {
+    pub ttl: T,
+    pub webhooks: T,
+    pub embeddings: T,
+}
+
+impl<T: Copy> PerClass<T> {
+    pub const fn all(value: T) -> Self {
+        Self { ttl: value, webhooks: value, embeddings: value }
+    }
+
+    pub const fn of(&self, class: OwnerClass) -> T {
+        match class {
+            OwnerClass::Ttl => self.ttl,
+            OwnerClass::Webhooks => self.webhooks,
+            OwnerClass::Embeddings => self.embeddings,
+        }
+    }
+
+    pub fn set(&mut self, class: OwnerClass, value: T) {
+        match class {
+            OwnerClass::Ttl => self.ttl = value,
+            OwnerClass::Webhooks => self.webhooks = value,
+            OwnerClass::Embeddings => self.embeddings = value,
+        }
+    }
+}
+
+/// A value that reads from one string of a block, and is `UNKNOWN` for anything
+/// else.
+pub trait WireName: Copy {
+    const UNKNOWN: Self;
+    fn parse(text: &str) -> Self;
+}
+
+/// How a class of owned work stands on a member (ADR-213).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum ClassState {
+    /// Owns work in the class and is doing it.
+    Ok,
+    /// Owns nothing in the class, and nothing is wrong.
+    Idle,
+    /// Bad evidence now, not yet enough to yield: out of target eligibility.
+    Suspect,
+    /// Enough bad evidence to yield the class.
+    Stalled,
+    /// Said nothing usable: a 0.43 sender, a key that is missing, a value that is
+    /// not a name, or an evaluator that stopped ticking.
+    Unknown,
+}
+
+impl ClassState {
+    pub const ALL: [Self; 4] = [Self::Ok, Self::Idle, Self::Suspect, Self::Stalled];
+
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Ok => "ok",
+            Self::Idle => "idle",
+            Self::Suspect => "suspect",
+            Self::Stalled => "stalled",
+            Self::Unknown => "unknown",
+        }
+    }
+}
+
+impl WireName for ClassState {
+    const UNKNOWN: Self = Self::Unknown;
+
+    fn parse(text: &str) -> Self {
+        Self::ALL.into_iter().find(|state| state.label() == text).unwrap_or(Self::Unknown)
+    }
+}
+
+impl Serialize for ClassState {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_str(self.label())
+    }
+}
+
+/// Why a class is `stalled` (ADR-213): only `local` evidence latches.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum StallCause {
+    /// Overdue, or cycles that failed locally.
+    Local,
+    /// The runtime was judged stalled: a member-level fault.
+    Runtime,
+    /// The start followed an unclean end.
+    Probation,
+    Unknown,
+}
+
+impl StallCause {
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Local => "local",
+            Self::Runtime => "runtime",
+            Self::Probation => "probation",
+            Self::Unknown => "unknown",
+        }
+    }
+}
+
+impl WireName for StallCause {
+    const UNKNOWN: Self = Self::Unknown;
+
+    fn parse(text: &str) -> Self {
+        [Self::Local, Self::Runtime, Self::Probation]
+            .into_iter()
+            .find(|cause| cause.label() == text)
+            .unwrap_or(Self::Unknown)
+    }
+}
+
+impl Serialize for StallCause {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_str(self.label())
+    }
+}
+
+/// Read a per-class document leniently, a key at a time: a value that is not a
+/// document gives `Unknown` for all three classes, a missing key, a non-string or
+/// an unknown name gives `Unknown` for that class. **Never a default that reads
+/// as healthy**, and never a failure of the whole block (ADR-213). Absent or
+/// `null` is `None`.
+fn lenient_per_class<'de, D, T>(deserializer: D) -> Result<Option<PerClass<T>>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: WireName,
+{
+    let raw = Option::<bson::Bson>::deserialize(deserializer)?;
+    Ok(match raw {
+        None | Some(bson::Bson::Null) => None,
+        Some(bson::Bson::Document(doc)) => {
+            let read = |key: &str| match doc.get(key) {
+                Some(bson::Bson::String(text)) => T::parse(text),
+                _ => T::UNKNOWN,
+            };
+            Some(PerClass {
+                ttl: read("ttl"),
+                webhooks: read("webhooks"),
+                embeddings: read("embeddings"),
+            })
+        }
+        Some(_) => Some(PerClass::all(T::UNKNOWN)),
+    })
+}
+
+fn lenient_bool<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<Option<bool>, D::Error> {
+    Ok(match Option::<bson::Bson>::deserialize(deserializer)? {
+        Some(bson::Bson::Boolean(value)) => Some(value),
+        _ => None,
+    })
+}
+
+/// An integer of either BSON width that is not negative; anything else is `None`.
+pub(crate) fn lenient_millis<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<Option<u64>, D::Error> {
+    Ok(match Option::<bson::Bson>::deserialize(deserializer)? {
+        Some(bson::Bson::Int64(value)) => u64::try_from(value).ok(),
+        Some(bson::Bson::Int32(value)) => u64::try_from(value).ok(),
+        _ => None,
+    })
 }
 
 impl Facts {
@@ -200,8 +406,9 @@ pub type FactsSource = Arc<dyn Fn() -> Facts + Send + Sync>;
 
 /// This member's block, cached: rebuilt when the source says something else,
 /// and at most once a second, so a serve reply costs one `Arc` clone and the
-/// schema is not read per contact. Also which peers have read the current
-/// block, for [`crate::membership::Members::unconfirmed_peers`].
+/// schema is not read per contact. Also which peers have echoed the current
+/// block, for [`crate::membership::Members::unconfirmed_peers`] and the
+/// effective-yield mask.
 pub(crate) struct LocalFacts {
     source: Option<FactsSource>,
     state: Mutex<LocalState>,
@@ -217,8 +424,16 @@ struct LocalState {
     current: Arc<Facts>,
     /// Bumped whenever the block changes.
     generation: u64,
-    /// The generation each peer last read.
-    read: BTreeMap<NodeId, u64>,
+    /// The generation that first set `yielding.C`, per class, and `None` while
+    /// the bit is clear (ADR-213): a peer has confirmed the yield by
+    /// echoing at least this generation, so an unrelated later rebuild never
+    /// re-opens the confirmation.
+    yield_gen: PerClass<Option<u64>>,
+    /// What each peer's frames echoed of this member's block: **the confirmation
+    /// is the reader's**. A peer is present once a frame of its current boot
+    /// carried an echo at all, and holds the highest generation it echoed *of
+    /// this member's current boot*; zero when it echoed another boot or nothing.
+    echoed: BTreeMap<NodeId, u64>,
 }
 
 /// The longest a cached block is reused.
@@ -234,7 +449,8 @@ impl Default for LocalFacts {
                 published_ticket: 0,
                 current: Arc::default(),
                 generation: 0,
-                read: BTreeMap::new(),
+                yield_gen: PerClass::all(None),
+                echoed: BTreeMap::new(),
             }),
         }
     }
@@ -282,44 +498,139 @@ impl LocalFacts {
             state.published_ticket = ticket;
             state.built = Some(now);
             if *state.current != fresh || state.generation == 0 {
+                let generation = state.generation + 1;
+                for class in OwnerClass::ALL {
+                    // The generation that first set a bit; cleared with it.
+                    match (state.current.yielding.of(class), fresh.yielding.of(class)) {
+                        (false, true) => state.yield_gen.set(class, Some(generation)),
+                        (_, false) => state.yield_gen.set(class, None),
+                        (true, true) => {}
+                    }
+                }
                 state.current = Arc::new(fresh);
-                state.generation += 1;
+                state.generation = generation;
             }
         }
         Some((Arc::clone(&state.current), state.generation))
     }
 
-    /// Forget what `peer` has read: it is a new process, or SWIM declared it
-    /// down, and what the old one read says nothing of this one.
+    /// Forget what `peer` echoed: it is a new process, or SWIM declared it
+    /// down, and what the old one held says nothing of this one.
     pub(crate) fn forget(&self, peer: NodeId) {
-        self.state.lock().read.remove(&peer);
+        self.state.lock().echoed.remove(&peer);
     }
 
-    /// Keep only the read records of peers still in `live`.
+    /// Keep only the records of peers still in `live`.
     pub(crate) fn retain(&self, live: &BTreeSet<NodeId>) {
-        self.state.lock().read.retain(|peer, _| live.contains(peer));
+        self.state.lock().echoed.retain(|peer, _| live.contains(peer));
     }
 
-    /// `peer` was sent block `generation`.
-    pub(crate) fn note_read(&self, peer: NodeId, generation: u64) {
-        self.state.lock().read.insert(peer, generation);
+    /// Forget every record: this member was declared down itself, and what its
+    /// peers hold of its block may have moved without it hearing (ADR-213).
+    pub(crate) fn clear_echoes(&self) {
+        self.state.lock().echoed.clear();
     }
 
-    /// The peers among `live` that have not read the current block.
-    pub(crate) fn unread_by(&self, live: &BTreeSet<NodeId>) -> Vec<NodeId> {
+    /// A frame from `peer` carried `echo`, or none. **An echo confirms only for
+    /// this member's own current boot**, and only the highest generation counts;
+    /// a frame without one makes the peer a non-echoing one, which never
+    /// confirms (a 0.43 peer, or a peer whose echo did not decode).
+    pub(crate) fn note_echo(&self, peer: NodeId, echo: Option<&crate::protocol::Echo>) {
+        let mut state = self.state.lock();
+        let Some(echo) = echo else {
+            state.echoed.remove(&peer);
+            return;
+        };
+        let mine = !echo.boot.is_empty() && echo.boot == state.current.boot;
+        let record = state.echoed.entry(peer).or_insert(0);
+        if mine {
+            *record = (*record).max(echo.generation);
+        } else {
+            // The peer holds nothing of this boot's block now (it restarted, or
+            // dropped it): what it echoed before is gone, whether or not its own
+            // block has been heard yet to say it is a new process.
+            *record = 0;
+        }
+    }
+
+    /// The peers among `live` that have not confirmed `class`'s yield: those that
+    /// do not echo, and those whose echo is below the generation that first set
+    /// the bit. Empty when the bit is not set.
+    pub(crate) fn unconfirmed(&self, class: OwnerClass, live: &BTreeSet<NodeId>) -> Vec<NodeId> {
         let state = self.state.lock();
+        Self::unconfirmed_in(&state, class, live)
+    }
+
+    fn unconfirmed_in(
+        state: &LocalState,
+        class: OwnerClass,
+        live: &BTreeSet<NodeId>,
+    ) -> Vec<NodeId> {
+        let Some(needed) = state.yield_gen.of(class) else { return Vec::new() };
         live.iter()
-            .filter(|peer| state.read.get(*peer) != Some(&state.generation))
+            .filter(|peer| state.echoed.get(*peer).is_none_or(|echoed| *echoed < needed))
             .copied()
             .collect()
     }
+
+    /// The block with `yielding` masked to the **effective** bits (ADR-213):
+    /// a class counts as yielded only once every peer in `live` has echoed the
+    /// generation that set it, and only when `stable` says this member's live set
+    /// has not moved for a lease. Until then this member keeps owning the class.
+    pub(crate) fn effective(
+        &self,
+        now: Instant,
+        inputs: impl FnOnce() -> (BTreeSet<NodeId>, bool),
+    ) -> Option<Arc<Facts>> {
+        let (block, _) = self.current(now)?;
+        if !block.yielding.any() {
+            // Nothing yields, which is every member until the evaluator says
+            // otherwise: no live set is read and nothing is cloned.
+            return Some(block);
+        }
+        let (live, stable) = inputs();
+        let live = &live;
+        let state = self.state.lock();
+        let mut masked = block.yielding;
+        for class in OwnerClass::ALL {
+            if masked.of(class) {
+                let confirmed = stable && Self::unconfirmed_in(&state, class, live).is_empty();
+                masked.set(class, confirmed);
+            }
+        }
+        drop(state);
+        if masked == block.yielding {
+            return Some(block);
+        }
+        let mut facts = (*block).clone();
+        facts.yielding = masked;
+        Some(Arc::new(facts))
+    }
 }
 
-/// A block a peer sent, and when.
+/// A block a peer sent, when it was recorded, and where it stands in the order
+/// blocks are held in (ADR-213).
 #[derive(Clone, Debug)]
 pub(crate) struct PeerFacts {
     pub facts: Arc<Facts>,
     pub received: Instant,
+    /// The sender's generation of the block; `None` from a 0.43 sender.
+    pub generation: Option<u64>,
+    /// The process-wide sequence taken when the frame that carried it decoded.
+    pub decoded_seq: u64,
+}
+
+static DECODE_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// The next decode sequence number: taken as a frame decodes, so a block read
+/// earlier never replaces one read later, however late it is applied.
+pub(crate) fn next_decoded_seq() -> u64 {
+    DECODE_SEQ.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1
+}
+
+/// The last sequence number taken.
+pub(crate) fn last_decoded_seq() -> u64 {
+    DECODE_SEQ.load(std::sync::atomic::Ordering::SeqCst)
 }
 
 /// How this member sees one live peer, for the gauge and the topology.
@@ -383,9 +694,13 @@ pub(crate) fn may_own(
     fresh: bool,
 ) -> bool {
     let Some(facts) = facts else {
-        // Never sent a block: an older member. It owns as it always did for the
-        // classes with no holder rule, and is not *known* to hold a TTL index.
-        return class != OwnerClass::Ttl;
+        // No block held from this member's current process: never heard, or
+        // forgotten on SWIM down, a rename, a new boot or this member's own
+        // `Defunct`. **Not a candidate for any class** (ADR-213): an unheard peer
+        // may be yielding and this member cannot know, so it is left out, which
+        // only ever adds owners (duplicates, never a gap). A TTL holder was
+        // always positive knowledge.
+        return false;
     };
     if facts.catching_up || (!ignore_yielding && facts.yielding.of(class)) {
         return false;
@@ -507,7 +822,14 @@ mod tests {
     }
 
     fn hear(members: &Members, n: u8, facts: Facts) {
-        members.record_peer_facts(node(n), Arc::new(facts), Instant::now());
+        members.record_peer_facts_for_test(node(n), facts, Duration::ZERO);
+    }
+
+    /// `peer` echoed generation `generation` of this member's block, whose boot is
+    /// `block()`'s.
+    fn echo(members: &Members, peer: u8, generation: u64) {
+        let echo = crate::protocol::Echo { boot: vec![1; 16], generation };
+        members.note_echo(node(peer), Some(&echo));
     }
 
     fn set(
@@ -583,9 +905,9 @@ mod tests {
         let members = cluster(&[1, 2]);
         assert_eq!(members.peer_states()[&node(1)], PeerState::Unknown);
         // Heard long ago: well past any lease.
-        let then = Instant::now().checked_sub(Duration::from_secs(600)).unwrap();
-        members.record_peer_facts(node(1), Arc::new(Facts { catching_up: true, ..block() }), then);
-        members.record_peer_facts(node(2), Arc::new(block()), then);
+        let then = Duration::from_secs(600);
+        members.record_peer_facts_for_test(node(1), Facts { catching_up: true, ..block() }, then);
+        members.record_peer_facts_for_test(node(2), block(), then);
         let states = members.peer_states();
         assert_eq!(states[&node(1)], PeerState::Stale);
         assert_eq!(states[&node(2)], PeerState::Stale);
@@ -678,15 +1000,16 @@ mod tests {
         );
     }
 
-    /// Embeddings skip a member whose worker is off, and webhooks count a peer
-    /// that has sent nothing.
+    /// Embeddings skip a member whose worker is off, and a peer that has sent
+    /// nothing is no candidate for either class (ADR-213): it may be yielding, and
+    /// this member cannot know.
     #[test]
-    fn the_embedding_worker_off_and_an_older_peer_are_handled_as_stated() {
+    fn the_embedding_worker_off_and_an_unheard_peer_are_handled_as_stated() {
         let members = cluster(&[1, 2]);
         hear(&members, 1, Facts { embeddings_disabled: true, ..block() });
         let mine = block();
-        assert_eq!(set(&members, OwnerClass::Embeddings, None, 9, &mine, false), vec![2, 9]);
-        assert_eq!(set(&members, OwnerClass::Webhooks, None, 9, &mine, false), vec![1, 2, 9]);
+        assert_eq!(set(&members, OwnerClass::Embeddings, None, 9, &mine, false), vec![9]);
+        assert_eq!(set(&members, OwnerClass::Webhooks, None, 9, &mine, false), vec![1, 9]);
     }
 
     /// With no peers the member owns everything it may, as a single node does.
@@ -738,7 +1061,7 @@ mod tests {
         std::thread::sleep(Duration::from_millis(1_100));
         assert_eq!(members.unconfirmed_peers(OwnerClass::Ttl).len(), 2);
         let (_, generation) = members.local_facts().unwrap();
-        members.note_read_by(node(1), generation);
+        echo(&members, 1, generation);
         assert_eq!(members.unconfirmed_peers(OwnerClass::Ttl), vec![node(2)]);
         assert!(
             members.unconfirmed_peers(OwnerClass::Webhooks).is_empty(),
@@ -753,12 +1076,12 @@ mod tests {
     fn a_stale_ttl_listing_is_not_a_holder_but_a_stale_catching_up_bit_still_excludes() {
         let c = CollectionId(42);
         let members = cluster(&[1, 2, 3]);
-        let long_ago = Instant::now().checked_sub(Duration::from_secs(600)).unwrap();
-        members.record_peer_facts(node(1), Arc::new(block().with_ttl(vec![held(42)])), long_ago);
+        let long_ago = Duration::from_secs(600);
+        members.record_peer_facts_for_test(node(1), block().with_ttl(vec![held(42)]), long_ago);
         hear(&members, 2, block().with_ttl(vec![held(42)]));
-        members.record_peer_facts(
+        members.record_peer_facts_for_test(
             node(3),
-            Arc::new(Facts { catching_up: true, ..block() }),
+            Facts { catching_up: true, ..block() },
             long_ago,
         );
         let mine = block();
@@ -803,8 +1126,8 @@ mod tests {
         let (_, generation) = members.local_facts().unwrap();
         hear(&members, 1, block());
         hear(&members, 2, block());
-        members.note_read_by(node(1), generation);
-        members.note_read_by(node(2), generation);
+        echo(&members, 1, generation);
+        echo(&members, 2, generation);
         assert!(members.unconfirmed_peers(OwnerClass::Ttl).is_empty());
         // Peer 1 restarts: a new boot id, so what the old process read counts for
         // nothing.

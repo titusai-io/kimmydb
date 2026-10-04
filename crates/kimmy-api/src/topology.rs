@@ -129,6 +129,7 @@ pub async fn topology(
         } else if peers_catching_up.iter().any(|n| n.to_string() == node) {
             listed["catchingUp"] = json!(true);
         }
+        add_class_view(&state, &mut listed, node.parse().ok(), is_me);
         nodes.push(listed);
         Ok(true)
     })?;
@@ -148,6 +149,8 @@ pub async fn topology(
             let last = nodes.len() - 1;
             nodes[last]["catchingUp"] = json!(catch_up.state_label(std::time::Instant::now()));
         }
+        let last = nodes.len() - 1;
+        add_class_view(&state, &mut nodes[last], Some(me), true);
     }
 
     // Stable order, with this node first: a client reading the list top-down
@@ -156,7 +159,68 @@ pub async fn topology(
         (!n["self"].as_bool().unwrap_or(false), n["node"].as_str().unwrap_or("").to_string())
     });
 
-    Ok(axum::Json(json!({ "nodes": nodes, "count": nodes.len() })))
+    // `view` says whose eyes these are: `yielding` and `classState` are what **this
+    // member** sees of each node, from the blocks it holds, and views differ while
+    // blocks converge (ADR-213).
+    Ok(axum::Json(json!({ "nodes": nodes, "count": nodes.len(), "view": me.to_string() })))
+}
+
+/// Add `yielding` (the classes the node yields) and `classState` (how each class
+/// stands on it) to a node's entry, as this member sees them (ADR-213).
+///
+/// For this member, what its own evaluator last decided; for a peer, what its
+/// last block said, **present only when this member holds one**: a peer that
+/// predates the fields, or that has not been heard, has neither, and a peer whose
+/// block lacks a class says `unknown` for it, never `idle`. A node with nothing to
+/// say keeps the shape it always had.
+fn add_class_view(
+    state: &SharedState,
+    entry: &mut Value,
+    node: Option<kimmy_core::NodeId>,
+    is_me: bool,
+) {
+    use kimmy_cluster::{ClassState, OwnerClass};
+    let label = |state: ClassState| match state {
+        ClassState::Ok => "ok",
+        ClassState::Idle => "idle",
+        ClassState::Suspect => "suspect",
+        ClassState::Stalled => "stalled",
+        ClassState::Unknown => "unknown",
+    };
+    let (yielding, states): (Vec<&str>, Option<[ClassState; 3]>) = if is_me {
+        let Some(handle) = state.metrics.yield_handle() else { return };
+        let current = handle.published.current();
+        (
+            OwnerClass::ALL
+                .into_iter()
+                .filter(|c| current.yielding.of(*c))
+                .map(|c| c.label())
+                .collect(),
+            Some(OwnerClass::ALL.map(|c| current.state.of(c))),
+        )
+    } else {
+        let (Some(node), Some(members)) = (node, state.members()) else { return };
+        let view = members.view();
+        let Some(block) = view.blocks.get(&node).filter(|_| view.live.contains(&node)) else {
+            return;
+        };
+        (
+            OwnerClass::ALL
+                .into_iter()
+                .filter(|c| block.facts.yielding.of(*c))
+                .map(|c| c.label())
+                .collect(),
+            block.facts.class_state.map(|states| OwnerClass::ALL.map(|c| states.of(c))),
+        )
+    };
+    entry["yielding"] = json!(yielding);
+    if let Some(states) = states {
+        entry["classState"] = json!({
+            "ttl": label(states[0]),
+            "webhooks": label(states[1]),
+            "embeddings": label(states[2]),
+        });
+    }
 }
 
 fn entry(

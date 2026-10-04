@@ -27,6 +27,7 @@ hmac = "0.13"
 sha2 = "0.11"
 subtle = "2"
 parking_lot.workspace = true
+arc-swap.workspace = true
 serde_bytes.workspace = true
 postcard = { version = "1", features = ["alloc"] }
 # SWIM membership. MPL-2.0 — permitted for an unmodified dependency, and

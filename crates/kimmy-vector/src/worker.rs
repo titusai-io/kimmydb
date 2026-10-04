@@ -31,6 +31,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use kimmy_core::{ChunkConfig, Hlc, OpKind, Unstamped, VectorConfig, VectorRecord, path};
+use kimmy_storage::class_step;
 use kimmy_storage::{
     ChangeEvent, CollectionMeta, Engine, VectorWrite, WatchOptions, WatchScope, WriterHolder,
 };
@@ -48,7 +49,7 @@ pub const CONSUMER: &str = "embedding-worker";
 /// A remote provider being briefly unavailable must not cost the position:
 /// the worker retries the same entry rather than skipping it, so a rate limit
 /// delays embedding but never silently loses it.
-const RETRY_DELAY: std::time::Duration = std::time::Duration::from_secs(5);
+pub const RETRY_DELAY: std::time::Duration = std::time::Duration::from_secs(5);
 
 /// The longest a collection whose provider keeps failing waits between two
 /// attempts: its delay starts at [`RETRY_DELAY`] and doubles per failed
@@ -93,10 +94,10 @@ const DEFERRAL_MAX_AGE: Duration = Duration::from_secs(10 * 60);
 
 /// How often the worker wakes to re-check deferred documents when no writes
 /// are arriving to wake it anyway.
-const DEFERRAL_TICK: Duration = Duration::from_secs(5);
+pub const DEFERRAL_TICK: Duration = Duration::from_secs(5);
 
 /// How often the worker asks again which embedded collections it owns.
-const OWNERSHIP_TICK: Duration = Duration::from_secs(5);
+pub const OWNERSHIP_TICK: Duration = Duration::from_secs(5);
 
 /// What a scan does for a collection this member has no configuration
 /// fingerprint for: it has never completed a scan of it, which is every member
@@ -536,6 +537,40 @@ fn stopped(reason: kimmy_storage::StopReason) -> VectorError {
     VectorError::Storage(kimmy_storage::StorageError::Stopping(reason))
 }
 
+/// The last error the worker told the class cell about, by its text. An error that
+/// `call_provider` or `store` noted can still travel up through `?` and leave `run`;
+/// [`note_ending`] must not say it a second time.
+#[derive(Default)]
+struct Noted(std::sync::Mutex<Option<String>>);
+
+impl Noted {
+    /// Tell the cell about `error` and remember that it was told.
+    fn note(&self, error: &VectorError) {
+        error.note_fault();
+        if let Ok(mut last) = self.0.lock() {
+            *last = Some(error.to_string());
+        }
+    }
+
+    /// Whether `error` is the one noted last, which it is when it has travelled up
+    /// from where it was noted.
+    fn is_the_last(&self, error: &VectorError) -> bool {
+        self.0.lock().is_ok_and(|last| last.as_deref() == Some(error.to_string().as_str()))
+    }
+}
+
+/// An error that leaves `run` is classified here, per variant, for the yield
+/// evaluator, **unless it was noted where it ended** (`call_provider` and `store`
+/// note theirs, and a `?` can carry one up): the class counts each fault once.
+fn note_ending(ended: Result<()>, noted: &Noted) -> Result<()> {
+    if let Err(e) = &ended
+        && !noted.is_the_last(e)
+    {
+        e.note_fault();
+    }
+    ended
+}
+
 /// Keeps a collection's vectors in step with its documents.
 pub struct EmbeddingWorker {
     engine: Arc<Engine>,
@@ -570,6 +605,8 @@ pub struct EmbeddingWorker {
     deferred_retrying: bool,
     /// Collections whose provider is failing, by collection id ([`Backoff`]).
     backoff: HashMap<u64, Backoff>,
+    /// The last error told to the class cell, so one that travels up is not told twice.
+    noted: Noted,
     /// A test's way to make every scan mark fail to write.
     #[cfg(test)]
     refuse_marks: bool,
@@ -601,6 +638,9 @@ pub struct EmbeddingWorker {
     /// does not want a registry dependency. Shared by handle so the
     /// renderer can read them after the worker has been spawned.
     counters: Arc<WorkerCounters>,
+    /// The node's stop, for the `embedding_worker:stall` test switch's own stall
+    /// point (ADR-213). `None` in a build or test that wires none.
+    shutdown: Option<kimmy_task::Shutdown>,
 }
 
 /// Worker-side counts for `/metrics`, shared between the worker task and the
@@ -774,6 +814,7 @@ impl EmbeddingWorker {
             deferred: VecDeque::new(),
             deferred_retrying: false,
             backoff: HashMap::new(),
+            noted: Noted::default(),
             #[cfg(test)]
             refuse_marks: false,
             am_owner: None,
@@ -783,7 +824,14 @@ impl EmbeddingWorker {
             ownership_tick: OWNERSHIP_TICK,
             ownership_settle: OWNERSHIP_SETTLE,
             counters: Arc::new(WorkerCounters::default()),
+            shutdown: None,
         }
+    }
+
+    /// Hand the worker the node's stop, so the `embedding_worker:stall` test
+    /// switch can hold the loop at its `Waiting` point until the stop begins.
+    pub fn set_shutdown(&mut self, shutdown: kimmy_task::Shutdown) {
+        self.shutdown = Some(shutdown);
     }
 
     /// Set how documents are gathered into provider calls. See
@@ -858,6 +906,11 @@ impl EmbeddingWorker {
     /// collected. Embedding is idempotent (`vectors_are_stale`), so the
     /// overlap between the two costs storage reads, not provider calls.
     pub async fn run(&mut self) -> Result<()> {
+        let ended = self.run_loop().await;
+        note_ending(ended, &self.noted)
+    }
+
+    async fn run_loop(&mut self) -> Result<()> {
         let mut resume = self.engine.consumer_position(CONSUMER)?;
         let mut recovering = false;
         // What the last run left owed: its held and skipped batches were
@@ -966,7 +1019,17 @@ impl EmbeddingWorker {
             // No separate wake-up for a collection's next attempt: the tick is
             // never longer than the shortest delay, `RETRY_DELAY`, so an
             // attempt is made at most one turn after it falls due.
-            let event = match tokio::time::timeout(wait, stream.next(&self.engine)).await {
+            // The loop's own wait: the class is `Waiting`, with its own bound, and
+            // the `embedding_worker:stall` test switch holds it here, where a real
+            // stall of this loop would be (ADR-213). Back to `Local` the moment
+            // the wait ends: what follows is the worker's own work.
+            class_step::phase(class_step::Phase::Waiting);
+            if let Some(shutdown) = &self.shutdown {
+                kimmy_task::stall_point("embedding_worker", shutdown).await;
+            }
+            let waited = tokio::time::timeout(wait, stream.next(&self.engine)).await;
+            class_step::phase(class_step::Phase::Local);
+            let event = match waited {
                 Ok(Some(event)) => event,
                 Ok(None) => {
                     // A stream the stop ended: what it gathered is embedded
@@ -1250,6 +1313,11 @@ impl EmbeddingWorker {
                 }
                 Ok(embedded)
             })?;
+        // What this member owns of the embedded collections, as of this ownership
+        // tick, and a beat: the class's heartbeat while it is idle (ADR-213).
+        let owned = embedded.iter().filter(|(_, _, owner)| *owner).count();
+        class_step::with_cell(|cell| cell.set_owned(owned as u64));
+        class_step::beat();
         let mut seen = std::collections::HashSet::new();
         let mut due: Option<(CollectionMeta, String)> = None;
         for (collection, key, owner) in embedded {
@@ -1821,6 +1889,9 @@ impl EmbeddingWorker {
             // The backfill serves no client: it ends at the signal, and its
             // next start lists the collection again.
             self.engine.for_each_doc(collection, kimmy_storage::WalkScope::Background, |id, _| {
+                // The walk of a large collection is long and local: a beat per row,
+                // so it never reads as a stuck worker (ADR-213).
+                class_step::beat();
                 ids.push(id);
                 Ok(true)
             })
@@ -1838,6 +1909,9 @@ impl EmbeddingWorker {
         // is backing off, and the rest is scanned once it answers.
         let mut cut_short = false;
         for source in ids {
+            // One beat a document, and the batches' own provider attempts and
+            // commits beat as they end: a scan of a big collection is progress.
+            class_step::beat();
             let Some(mut job) = self.scanned_job(collection, shadow, config, &source, judgement)?
             else {
                 continue;
@@ -2124,10 +2198,12 @@ impl EmbeddingWorker {
             // was made.
             Err(e) if e.is_refused_by_policy() => {
                 self.remember_refusal(collection.id.0, config, &e);
+                self.noted.note(&e);
                 Err(e)
             }
             Err(e) => {
                 self.counters.failed(&e);
+                self.noted.note(&e);
                 Err(e)
             }
         }
@@ -2152,6 +2228,28 @@ impl EmbeddingWorker {
     /// how many calls it took. The shadow's generation is bumped by the
     /// scope, after the commit, never inside it.
     fn store(
+        &self,
+        collection: &CollectionMeta,
+        shadow: &CollectionMeta,
+        config: &VectorConfig,
+        jobs: Vec<Job>,
+        vectors: Vec<Vec<f32>>,
+        checkpoint: &mut Checkpoint,
+    ) -> Result<usize> {
+        let stored = self.store_unclassified(collection, shadow, config, jobs, vectors, checkpoint);
+        match &stored {
+            // The commit is a local success (the cell counts it); the flush that
+            // committed is a good cycle.
+            Ok(_) => class_step::cycle(false),
+            // Classified **per variant**, here, where `store`'s own errors end:
+            // a storage or registry error is this member's fault, and the
+            // vector-count check's `MalformedResponse` is the provider's.
+            Err(e) => self.noted.note(e),
+        }
+        stored
+    }
+
+    fn store_unclassified(
         &self,
         collection: &CollectionMeta,
         shadow: &CollectionMeta,
@@ -2902,7 +3000,93 @@ fn extract_text(document: &bson::Document, config: &VectorConfig) -> String {
     parts.join("\n\n")
 }
 
+/// What an error says of **this member's health** to the yield evaluator (ADR-213),
+/// by variant. Only `Local` and `Remote` are evidence, and only `Local` can make
+/// the class stalled: a provider that is down, rate limited or sending rubbish says
+/// nothing of whether another member could embed, and a configuration this node
+/// cannot use is neither a fault of the node nor of the provider.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Fault {
+    /// The storage engine or the registry failed: this member's own fault.
+    Local,
+    /// The provider, the network or the answer: not this member's fault.
+    Remote,
+    /// The node's configuration or policy cannot do what was asked: permanent
+    /// for the configuration, neither a stall nor a good sign.
+    Config,
+    /// The node's stop ended the work, which is no fault at all.
+    Stopping,
+    /// A tenant's own doing, or the writer's gate: a collection or database dropped
+    /// while a batch was in flight, a document changed under it, a write that waited
+    /// for the writer and gave up. Counts for nothing, so a tenant who drops
+    /// collections while a bulk embed runs cannot make this member look unwell.
+    Tenant,
+}
+
+/// A core error that names something the tenant removed or changed (a database, a
+/// collection or a document that is not there), as against one that says the
+/// engine or the registry failed.
+fn tenant_driven(error: &kimmy_core::Error) -> bool {
+    matches!(
+        error,
+        kimmy_core::Error::DatabaseNotFound(_)
+            | kimmy_core::Error::CollectionNotFound { .. }
+            | kimmy_core::Error::DocumentNotFound(_)
+    )
+}
+
 impl VectorError {
+    /// The class's view of this error. **Per variant, never by a catch-all**: a new
+    /// variant is a compile error here, so it is classified on purpose.
+    pub fn fault(&self) -> Fault {
+        match self {
+            VectorError::Storage(kimmy_storage::StorageError::Stopping(_)) => Fault::Stopping,
+            // Time spent at the writer's gate is not a stall (it is never overdue),
+            // and a changed document is the tenant's.
+            VectorError::Storage(
+                kimmy_storage::StorageError::WriterBusy { .. }
+                | kimmy_storage::StorageError::Stale { .. },
+            ) => Fault::Tenant,
+            VectorError::Storage(kimmy_storage::StorageError::Core(e)) | VectorError::Core(e)
+                if tenant_driven(e) =>
+            {
+                Fault::Tenant
+            }
+            VectorError::Storage(_) | VectorError::Core(_) | VectorError::Snapshot(_) => {
+                Fault::Local
+            }
+            // The node's own lookups were busy: its state, not the provider's, and
+            // it says nothing of whether a peer could do the work either.
+            VectorError::ResolverBusy { .. } => Fault::Config,
+            VectorError::Transport { .. }
+            | VectorError::ProviderRejected { .. }
+            // From the parse, and from the vector-count check of `store`: the
+            // provider answered with something unusable.
+            | VectorError::MalformedResponse { .. }
+            | VectorError::DimensionMismatch { .. } => Fault::Remote,
+            VectorError::MissingApiKey { .. }
+            | VectorError::PolicyRefused(_)
+            | VectorError::UnknownProfile { .. }
+            | VectorError::LocalUnavailable
+            | VectorError::ModelUnavailable { .. }
+            | VectorError::NoProvider => Fault::Config,
+        }
+    }
+
+    /// Say what this error is to the class cell, once. A local fault is also a
+    /// bad cycle: the operation that met it did not complete.
+    pub fn note_fault(&self) {
+        match self.fault() {
+            Fault::Local => {
+                class_step::local_fault();
+                class_step::cycle(true);
+            }
+            Fault::Remote => class_step::remote_fault(),
+            Fault::Config => class_step::config_fault(),
+            Fault::Stopping | Fault::Tenant => {}
+        }
+    }
+
     /// Whether retrying could plausibly succeed.
     ///
     /// Transport failures and rate limits are temporary; a wrong dimension or
@@ -4964,6 +5148,35 @@ pub(crate) mod tests {
         assert_eq!(worker.counters.transport_failures(TransportKind::Connect), 1);
         let after = worker.provider_for(coll.id.0, &config).unwrap();
         assert!(Arc::ptr_eq(&first, &after), "a failed call does not cost the cached provider");
+    }
+
+    /// A provider error is told to the class cell once: `call_provider` notes it where
+    /// it ends, and when it travels up through `?` and leaves `run`, `note_ending`
+    /// does not say it again. The control is an error nobody noted, which `note_ending`
+    /// does tell the cell about.
+    #[tokio::test]
+    async fn a_provider_error_that_leaves_run_is_counted_once() {
+        let (_engine, coll, mut worker, _dir) = setup().await;
+        let (lookup, _calls) = answering(None);
+        worker.set_policy(ProviderPolicy::default().with_egress_lookup(lookup));
+        worker.providers.clear();
+        let config = named_endpoint("nowhere.example");
+        let cell = embedding_cell();
+        class_step::scope(cell, async {
+            let err = worker.call_provider(&coll, &config, &[a_job()]).await.unwrap_err();
+            assert_eq!(err.fault(), Fault::Remote, "{err:?}");
+            assert_eq!(cell.reading().remote_fault, 1, "noted where it ended");
+            let ended = note_ending(Err(err), &worker.noted);
+            assert!(ended.is_err(), "it still reaches the caller");
+            assert_eq!(cell.reading().remote_fault, 1, "and is not counted again on the way out");
+            // Control: an error nothing noted is counted on the way out.
+            let _ = note_ending(
+                Err(VectorError::Storage(kimmy_storage::StorageError::Corrupt("y".into()))),
+                &worker.noted,
+            );
+            assert_eq!(cell.reading().local_fault, 1);
+        })
+        .await;
     }
 
     /// **A lookup that does not answer fails the call at the connect timeout,
@@ -7535,5 +7748,372 @@ pub(crate) mod tests {
         for id in &ids {
             assert_eq!(made_under(&engine, id), Some(b.fingerprint()), "{id} is under B");
         }
+    }
+
+    // -----------------------------------------------------------------------
+    // The class cell (ADR-213): what the worker says of its health.
+    // -----------------------------------------------------------------------
+
+    /// A cell on the real clock, for tests that read counters and phases and not ages.
+    fn embedding_cell() -> &'static class_step::ClassCell {
+        class_step::ClassCell::leak(Arc::new(class_step::MonotonicClock::new()))
+    }
+
+    /// Every error variant, classified: the storage and registry are this member's
+    /// fault; the provider, the network and what the provider answered are not, and
+    /// say so as such; what the node's configuration cannot do is neither; the stop
+    /// is nothing.
+    #[test]
+    fn every_error_is_classified_by_variant() {
+        use kimmy_storage::StorageError;
+        let storage = || VectorError::Storage(StorageError::Corrupt("x".into()));
+        let cases: Vec<(VectorError, Fault)> = vec![
+            (storage(), Fault::Local),
+            (VectorError::Core(kimmy_core::Error::InvalidQuery("x".into())), Fault::Local),
+            // What a tenant does, or the writer's gate, is nobody's fault.
+            (VectorError::Core(kimmy_core::Error::DatabaseNotFound("x".into())), Fault::Tenant),
+            (
+                VectorError::Core(kimmy_core::Error::CollectionNotFound {
+                    db: "d".into(),
+                    collection: "c".into(),
+                }),
+                Fault::Tenant,
+            ),
+            (VectorError::Core(kimmy_core::Error::DocumentNotFound("x".into())), Fault::Tenant),
+            (
+                VectorError::Storage(StorageError::Core(kimmy_core::Error::CollectionNotFound {
+                    db: "d".into(),
+                    collection: "c".into(),
+                })),
+                Fault::Tenant,
+            ),
+            (
+                VectorError::Storage(StorageError::WriterBusy {
+                    waited: std::time::Duration::from_millis(5),
+                }),
+                Fault::Tenant,
+            ),
+            (VectorError::Storage(StorageError::Stale { current: None }), Fault::Tenant),
+            (VectorError::Storage(StorageError::Database("x".into())), Fault::Local),
+            // A disk failing is this member's own fault, whatever its kind.
+            (VectorError::Storage(StorageError::Io(std::io::Error::other("x"))), Fault::Local),
+            (
+                VectorError::Storage(StorageError::Io(std::io::Error::from(
+                    std::io::ErrorKind::StorageFull,
+                ))),
+                Fault::Local,
+            ),
+            (
+                VectorError::Storage(StorageError::Io(std::io::Error::from(
+                    std::io::ErrorKind::NotFound,
+                ))),
+                Fault::Local,
+            ),
+            (VectorError::Snapshot("x".into()), Fault::Local),
+            (
+                VectorError::Storage(StorageError::Stopping(kimmy_storage::StopReason::Shutdown)),
+                Fault::Stopping,
+            ),
+            (
+                VectorError::Transport {
+                    provider: "x",
+                    kind: TransportKind::Reset,
+                    detail: String::new(),
+                },
+                Fault::Remote,
+            ),
+            (
+                VectorError::ProviderRejected { provider: "x", status: 503, detail: String::new() },
+                Fault::Remote,
+            ),
+            (
+                VectorError::MalformedResponse { provider: "x", detail: String::new() },
+                Fault::Remote,
+            ),
+            (VectorError::DimensionMismatch { expected: 4, found: 8 }, Fault::Remote),
+            (VectorError::ResolverBusy { provider: "x", detail: String::new() }, Fault::Config),
+            (VectorError::MissingApiKey { var: "K".into() }, Fault::Config),
+            (VectorError::PolicyRefused("x".into()), Fault::Config),
+            (VectorError::UnknownProfile { name: "p".into() }, Fault::Config),
+            (VectorError::LocalUnavailable, Fault::Config),
+            (
+                VectorError::ModelUnavailable { model: "m".into(), detail: String::new() },
+                Fault::Config,
+            ),
+            (VectorError::NoProvider, Fault::Config),
+        ];
+        for (error, want) in cases {
+            assert_eq!(error.fault(), want, "{error}");
+        }
+    }
+
+    /// What reaches the cell: a local fault is a local fault **and a bad cycle**, a
+    /// remote one only a remote fault, a configuration one only a configuration fault,
+    /// and the stop nothing at all.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_noted_fault_reaches_the_cell_under_its_own_kind() {
+        let cell = embedding_cell();
+        class_step::scope(cell, async {
+            VectorError::Storage(kimmy_storage::StorageError::Corrupt("x".into())).note_fault();
+            let r = cell.reading();
+            assert_eq!((r.local_fault, r.remote_fault, r.config_fault), (1, 0, 0), "{r:?}");
+            assert_eq!((r.cycles, r.cycles_bad), (1, 1), "a local fault is a bad cycle");
+            VectorError::ProviderRejected { provider: "x", status: 503, detail: String::new() }
+                .note_fault();
+            let r = cell.reading();
+            assert_eq!((r.local_fault, r.remote_fault, r.config_fault), (1, 1, 0), "{r:?}");
+            VectorError::MissingApiKey { var: "K".into() }.note_fault();
+            let r = cell.reading();
+            assert_eq!((r.local_fault, r.remote_fault, r.config_fault), (1, 1, 1), "{r:?}");
+            VectorError::Storage(kimmy_storage::StorageError::Stopping(
+                kimmy_storage::StopReason::Shutdown,
+            ))
+            .note_fault();
+            assert_eq!(cell.reading().local_fault, 1, "the stop is no fault");
+            // What a tenant did counts for nothing: no fault, no bad cycle.
+            let before = cell.reading();
+            VectorError::Core(kimmy_core::Error::CollectionNotFound {
+                db: "d".into(),
+                collection: "c".into(),
+            })
+            .note_fault();
+            VectorError::Storage(kimmy_storage::StorageError::WriterBusy {
+                waited: std::time::Duration::from_millis(5),
+            })
+            .note_fault();
+            let after = cell.reading();
+            assert_eq!(
+                (after.local_fault, after.remote_fault, after.config_fault, after.cycles_bad),
+                (before.local_fault, before.remote_fault, before.config_fault, before.cycles_bad),
+                "{after:?}"
+            );
+            assert_eq!(after.cycles, before.cycles, "and no cycle");
+        })
+        .await;
+    }
+
+    /// A provider answering with the wrong number of vectors: `store` refuses the
+    /// answer, and **that is the provider's fault, not this member's**: classified
+    /// per variant at the store arm, remote and never local.
+    #[tokio::test(start_paused = true)]
+    async fn an_answer_store_refuses_counts_as_the_providers_fault() {
+        struct Miscounts;
+
+        #[async_trait]
+        impl EmbeddingProvider for Miscounts {
+            async fn embed(&self, texts: &[String]) -> Result<Vec<Vec<f32>>> {
+                Ok(vec![vec![1.0, 0.0, 0.0, 0.0]; texts.len() + 1])
+            }
+
+            fn dim(&self) -> usize {
+                4
+            }
+
+            fn name(&self) -> &'static str {
+                "fake"
+            }
+        }
+
+        let (engine, mut worker, [(a, _), _], _dir) = two_collections().await;
+        worker.set_provider(a.id.0, Arc::new(Miscounts));
+        let mut pending = Pending::default();
+        gathered(&engine, &worker, &mut pending, &a, 1..4);
+        let cell = embedding_cell();
+        class_step::scope(cell, flushed(&mut worker, &mut pending)).await;
+        let r = cell.reading();
+        assert_eq!((r.local_fault, r.config_fault), (0, 0), "{r:?}");
+        assert!(r.remote_fault >= 1, "the unusable answer is a remote fault: {r:?}");
+        assert_eq!(r.cycles_bad, 0, "and no bad cycle, which only a local fault makes: {r:?}");
+    }
+
+    /// The provider's failures are remote, a key it was never given is configuration,
+    /// and neither is a local fault: the whole point of classifying by
+    /// where the failure is.
+    #[tokio::test(start_paused = true)]
+    async fn a_failing_provider_is_remote_and_a_missing_key_is_configuration() {
+        struct NoKey;
+
+        #[async_trait]
+        impl EmbeddingProvider for NoKey {
+            async fn embed(&self, _: &[String]) -> Result<Vec<Vec<f32>>> {
+                Err(VectorError::MissingApiKey { var: "KEY".into() })
+            }
+
+            fn dim(&self) -> usize {
+                4
+            }
+
+            fn name(&self) -> &'static str {
+                "fake"
+            }
+        }
+
+        let (engine, mut worker, [(a, fa), (b, _)], _dir) = two_collections().await;
+        fa.fail_times.store(1, std::sync::atomic::Ordering::SeqCst);
+        let cell = embedding_cell();
+        let mut pending = Pending::default();
+        gathered(&engine, &worker, &mut pending, &a, 1..3);
+        class_step::scope(cell, flushed(&mut worker, &mut pending)).await;
+        let r = cell.reading();
+        assert_eq!((r.local_fault, r.config_fault), (0, 0), "{r:?}");
+        assert_eq!(r.remote_fault, 1, "the transport failure is remote: {r:?}");
+
+        worker.set_provider(b.id.0, Arc::new(NoKey));
+        let mut pending = Pending::default();
+        gathered(&engine, &worker, &mut pending, &b, 1..3);
+        class_step::scope(cell, flushed(&mut worker, &mut pending)).await;
+        let r = cell.reading();
+        assert_eq!((r.local_fault, r.remote_fault), (0, 1), "{r:?}");
+        // Once for the batch and once for each document it is then split into.
+        assert!(r.config_fault >= 1, "a missing key is configuration: {r:?}");
+    }
+
+    /// The drive loop's own wait is the class's `Waiting`, and the ownership tick
+    /// reports what this member owns and beats (the idle heartbeat): a loop with
+    /// nothing to do reads as `Waiting` and owning what it owns, which is what keeps
+    /// an idle worker from looking stuck.
+    #[tokio::test]
+    async fn an_idle_drive_loop_waits_and_reports_what_it_owns() {
+        let (engine, coll, mut worker, _dir) = setup().await;
+        position_at_latest(&engine);
+        let owns = switchable_owner(&mut worker, true);
+        // Real time, with the tick shortened: the worker's own clock is the real one.
+        worker.ownership_tick = Duration::from_millis(50);
+        let cell = embedding_cell();
+        // Not the cell's initial phase, so seeing `Waiting` proves the loop set it.
+        cell.set_phase(class_step::Phase::Local);
+        let running = tokio::spawn(class_step::scope(cell, async move {
+            let _ = worker.run().await;
+        }));
+        let until = |what: &'static str, mut done: Box<dyn FnMut() -> bool>| async move {
+            let deadline = std::time::Instant::now() + Duration::from_secs(30);
+            while !done() {
+                assert!(std::time::Instant::now() < deadline, "hung waiting for {what}");
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        };
+        until(
+            "the loop to wait and count what it owns",
+            Box::new(move || {
+                let r = cell.reading();
+                r.phase == class_step::Phase::Waiting && r.owned == 1
+            }),
+        )
+        .await;
+        owns.store(false, std::sync::atomic::Ordering::SeqCst);
+        until("it to own nothing", Box::new(move || cell.reading().owned == 0)).await;
+        running.abort();
+        let _ = coll;
+    }
+
+    /// The loop is `Local` while it works, not `Waiting`: a flush that calls the
+    /// provider reads its phase in the call, and it is not the loop's wait.
+    #[tokio::test]
+    async fn the_loop_is_local_while_it_works() {
+        let (engine, coll, mut worker, _dir) = setup().await;
+        position_at_latest(&engine);
+        let cell = embedding_cell();
+        let fake = FakeProvider::new(4);
+        let seen = Arc::new(std::sync::Mutex::new(None));
+        let record = Arc::clone(&seen);
+        *fake.on_call.lock().unwrap() = Some(Box::new(move || {
+            *record.lock().unwrap() = Some(cell.reading().phase);
+        }));
+        worker.set_provider(coll.id.0, Arc::clone(&fake) as Arc<dyn EmbeddingProvider>);
+        let running = tokio::spawn(class_step::scope(cell, async move {
+            let _ = worker.run().await;
+        }));
+        engine.insert(&coll, doc! { "_id": "a", "title": "hello", "body": "world" }).unwrap();
+        let deadline = std::time::Instant::now() + Duration::from_secs(30);
+        while seen.lock().unwrap().is_none() {
+            assert!(std::time::Instant::now() < deadline, "the provider was never called");
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        running.abort();
+        assert_eq!(*seen.lock().unwrap(), Some(class_step::Phase::Local));
+    }
+
+    /// A scan beats once per row of its walk and once per document it considers, so a
+    /// scan of a big collection is never a worker that went quiet: each further
+    /// document costs the clock at least two more readings (the rows' and the
+    /// documents' beats), whatever a batch's own commit costs.
+    #[tokio::test]
+    async fn a_scan_beats_per_row_and_per_document() {
+        struct Counting(std::sync::atomic::AtomicU64);
+        impl class_step::StepClock for Counting {
+            fn now_ms(&self) -> u64 {
+                self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+            }
+        }
+        let (engine, mut worker, [(a, fa), (b, fb)], _dir) = two_collections().await;
+        worker.set_provider(a.id.0, fa);
+        worker.set_provider(b.id.0, fb);
+        for (coll, documents) in [(&a, 5i64), (&b, 25)] {
+            for i in 0..documents {
+                engine.insert(coll, doc! { "_id": i, "title": format!("doc {i}") }).unwrap();
+            }
+        }
+        let mut reads = Vec::new();
+        for coll in [&a, &b] {
+            let shadow = engine.vector_collection(&coll.db, &coll.name).unwrap().unwrap();
+            let config = coll.vector.clone().unwrap();
+            let clock = Arc::new(Counting(Default::default()));
+            let cell =
+                class_step::ClassCell::leak(Arc::clone(&clock) as Arc<dyn class_step::StepClock>);
+            class_step::scope(cell, async {
+                worker
+                    .scan_collection(coll, &shadow, &config, "a test", Unscanned::Force)
+                    .await
+                    .unwrap();
+            })
+            .await;
+            reads.push(clock.0.load(std::sync::atomic::Ordering::SeqCst));
+        }
+        assert!(
+            reads[1] >= reads[0] + 2 * 20,
+            "twenty more documents cost {} more readings, not forty",
+            reads[1] - reads[0].min(reads[1])
+        );
+    }
+
+    /// A batch that stores is a **good cycle** for the class: the cycle is counted,
+    /// and it is not a bad one.
+    #[tokio::test]
+    async fn a_batch_that_stores_is_a_good_cycle() {
+        let (engine, coll, mut worker, _dir) = setup().await;
+        engine.insert(&coll, doc! { "_id": 1, "title": "a note" }).unwrap();
+        let shadow = engine.vector_collection(&coll.db, &coll.name).unwrap().unwrap();
+        let config = coll.vector.clone().unwrap();
+        let cell = embedding_cell();
+        class_step::scope(cell, async {
+            worker
+                .scan_collection(&coll, &shadow, &config, "a test", Unscanned::Force)
+                .await
+                .unwrap();
+        })
+        .await;
+        let r = cell.reading();
+        assert!(r.cycles >= 1, "the stored batch is a cycle: {r:?}");
+        assert_eq!(r.cycles_bad, 0, "and a good one: {r:?}");
+    }
+
+    /// What leaves `run` is classified for the class on the way out: storage failing
+    /// is this member's own fault, and a clean end or the stop is no fault.
+    #[tokio::test]
+    async fn what_ends_the_run_is_noted_by_what_it_is() {
+        let cell = embedding_cell();
+        class_step::scope(cell, async {
+            let noted = Noted::default();
+            let ended = note_ending(
+                Err(VectorError::Storage(kimmy_storage::StorageError::Corrupt("x".into()))),
+                &noted,
+            );
+            assert!(ended.is_err(), "the error still reaches the caller");
+            assert_eq!(cell.reading().local_fault, 1);
+            assert!(note_ending(Ok(()), &noted).is_ok());
+            let _ = note_ending(Err(stopped(kimmy_storage::StopReason::Shutdown)), &noted);
+            assert_eq!(cell.reading().local_fault, 1, "the stop is no fault");
+        })
+        .await;
     }
 }
