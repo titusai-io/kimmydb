@@ -3070,6 +3070,19 @@ mod tests {
         );
     }
 
+    /// A `$lookup` `let` binds every variable for each input document, read or
+    /// not, unlike `$let` (ADR-219): its sub-pipeline runs in the frame these
+    /// make, which holds values and not expressions.
+    #[test]
+    fn a_lookup_let_still_evaluates_a_variable_nothing_reads() {
+        let vars = vec![
+            ("kept".to_string(), Expr::Literal(1.into())),
+            ("unread".to_string(), Expr::parse(&doc! {"$size": "$name"}.into()).unwrap()),
+        ];
+        let err = bind_let(&vars, &doc! {"name": "text"}, &[]).unwrap_err().to_string();
+        assert!(err.contains("$size needs an array"), "{err}");
+    }
+
     #[test]
     fn bind_let_layers_over_outer_bindings_and_shadows_them() {
         let vars = vec![

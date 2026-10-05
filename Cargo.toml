@@ -44,6 +44,12 @@ kimmy-cluster = { path = "crates/kimmy-cluster" }
 kimmy-mcp = { path = "crates/kimmy-mcp" }
 kimmy-api = { path = "crates/kimmy-api" }
 
+# The expression evaluator grows its stack on the heap when a `$let` variable
+# is evaluated deep in a body that is itself deep (ADR-219). `psm`, which it
+# stands on, assembles a few instructions per target with the `cc` that `ring`
+# already brings to the build (scripts/allowed-native-deps.txt).
+stacker = "0.1"
+
 # HTTP
 axum = { version = "0.8", features = ["ws", "macros"] }
 tower = "0.5"

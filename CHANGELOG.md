@@ -12,6 +12,19 @@ breaking changes and says so here; a `0.x.PATCH` bump never does.
 
 ## Unreleased
 
+### Changed
+
+- **A `$let` variable the body does not read can no longer fail the expression.**
+  `$let` evaluated every variable before its body, so a guard that kept the body
+  from reading a variable did not keep the variable from failing: `{$let: {vars:
+  {r: {$divide: [1, "$n"]}}, in: {$cond: [{$eq: ["$n", 0]}, 0, "$$r"]}}}` was a
+  `400` over `n: 0` and now answers `0`. A variable is evaluated when the body
+  first reads it, once, and a variable nothing reads is not evaluated at all.
+  Only requests that failed are affected: an answer that was given is the same.
+  When two variables would fail, the error is now the first one read rather than
+  the first one written. A `$lookup` `let` still evaluates every variable it
+  declares. See aggregation.md, "Variables", and ADR-219.
+
 ### Documented
 
 - **When a schema-change confirmation answers `backoff`.** A confirmation that

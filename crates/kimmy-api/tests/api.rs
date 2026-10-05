@@ -14527,3 +14527,41 @@ async fn adr208_chunks_skip_unchanged_commit_mixed_and_resume_after_the_last_mat
         server.post("/v1/db/shop/coll/c/find", Some(&token), json!({ "filter": {"g": "x"} })).await;
     assert_eq!(all.body["documents"].as_array().map(Vec::len), Some(8));
 }
+
+/// ADR-219: a `$let` variable is evaluated when its body first reads it, so a
+/// guard that keeps the body from reading `r` also keeps `r` from failing the
+/// request, in a stage a caller writes it in.
+#[tokio::test]
+async fn a_guarded_let_variable_does_not_fail_an_aggregation() {
+    let server = Server::start().await;
+    let token = server.root().await;
+    server.post("/v1/db/shop/collections", Some(&token), json!({"name":"c"})).await;
+    for (id, n) in [(1, 0), (2, 4)] {
+        server.post("/v1/db/shop/coll/c/docs", Some(&token), json!({"_id": id, "n": n})).await;
+    }
+    let guarded = json!({"$let": {
+        "vars": {"r": {"$divide": [1, "$n"]}},
+        "in": {"$cond": [{"$eq": ["$n", 0]}, 0, "$$r"]},
+    }});
+    let res = server
+        .post(
+            "/v1/db/shop/coll/c/aggregate",
+            Some(&token),
+            json!({"pipeline": [{"$sort": {"_id": 1}}, {"$project": {"_id": 1, "inv": guarded}}]}),
+        )
+        .await;
+    assert_eq!(res.status, 200, "{:?}", res.body);
+    assert_eq!(res.body["documents"], json!([{"_id": 1, "inv": 0}, {"_id": 2, "inv": 0.25}]));
+
+    // A variable the body reads still fails the request with its own error.
+    let unguarded = json!({"$let": {"vars": {"r": {"$divide": [1, "$n"]}}, "in": "$$r"}});
+    let res = server
+        .post(
+            "/v1/db/shop/coll/c/aggregate",
+            Some(&token),
+            json!({"pipeline": [{"$project": {"inv": unguarded}}]}),
+        )
+        .await;
+    assert_eq!(res.status, 400, "{:?}", res.body);
+    assert!(res.body["message"].as_str().unwrap_or_default().contains("divide"), "{:?}", res.body);
+}
