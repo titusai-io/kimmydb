@@ -458,9 +458,11 @@ a peer that appears later is found without a restart.
 **A `dns:` or `k8s:` lookup can hold a stop.** These resolve with the system
 resolver (`getaddrinfo`), which cannot be cancelled. A `kimmyd` stopped while one
 is in flight waits for it, up to the 22 s stop budget, then exits 0 with the store
-closed. The lookup lasts at most `timeout` × `attempts` × the nameservers in the
-node's `resolv.conf`, so with a resolver that may not answer, set for example
-`options timeout:2 attempts:2`, or expect stops of up to 22 s. A stop between
+closed. On the static musl release build, and so in the container, a lookup lasts
+at most `timeout` in total: musl asks every nameserver in the node's `resolv.conf`
+at once and spreads `attempts` within that time. On a glibc build it lasts at most
+`timeout` × `attempts` × the nameservers. So with a resolver that may not answer,
+set for example `options timeout:2`, or expect stops of up to 22 s. A stop between
 lookups does not wait, and `dns-srv:` seeds never hold a stop.
 
 **Webhook and embedding provider hosts are looked up the same way.** The egress
@@ -2325,7 +2327,7 @@ to the release, and no more than that: it sits beside the archive, and whoever
 could replace one could replace both.
 
 ```bash
-V=0.43.0; A=kimmyd-x86_64-unknown-linux-musl.tar.xz
+V=0.44.0; A=kimmyd-x86_64-unknown-linux-musl.tar.xz
 curl -LO "https://github.com/titusai-io/kimmydb/releases/download/v$V/$A"
 curl -LO "https://github.com/titusai-io/kimmydb/releases/download/v$V/$A.sha256"
 shasum -a 256 -c "$A.sha256"
@@ -2345,7 +2347,7 @@ signing key, because there is none to copy. `gh` performs the check:
 gh attestation verify kimmyd-x86_64-unknown-linux-musl.tar.xz -R titusai-io/kimmydb
 
 # The container image, by tag or by digest
-gh attestation verify oci://ghcr.io/titusai-io/kimmydb:0.43.0 -R titusai-io/kimmydb
+gh attestation verify oci://ghcr.io/titusai-io/kimmydb:0.44.0 -R titusai-io/kimmydb
 ```
 
 A successful verification prints the workflow that produced the artifact and
@@ -2452,7 +2454,7 @@ variable `KIMMY_CLUSTER_EXPECTED_MEMBERS` (`catch_up_wait_secs` has none) is
 ignored by 0.42.0, so a manifest that sets it needs no edit. A member on the
 defaults rolls back untouched.
 
-**Rolling back from the next release to 0.43.0 needs nothing.** The replay floor file, `kimmy.replay-floor`, gains `owed = <node id>` lines after its two floor lines ([ADR-212](decisions.md)); 0.43.0 reads the floor lines and skips every other key, so it reads the same floor. It keeps the file as it is when it does not move the floor, so **stale `owed` lines can survive a 0.43.0 run**: back on the newer build each holds a marked member at `503` for `cluster.catch_up_wait_secs` and is released after the dwell if it never comes back. 0.43.0 has the one-tick settle and the clear past the hold that this change ends.
+**Rolling back from 0.44.0 to 0.43.0 needs no store work and no edit to the configuration.** The replay floor file, `kimmy.replay-floor`, gains `owed = <node id>` lines after its two floor lines ([ADR-212](decisions.md)); 0.43.0 reads the floor lines and skips every other key, so it reads the same floor. It keeps the file as it is when it does not move the floor, so **stale `owed` lines can survive a 0.43.0 run**: back on 0.44.0 each holds a marked member at `503` for `cluster.catch_up_wait_secs` and is released after the dwell if it never comes back. 0.43.0 has the one-tick settle (a member that owes the replay is dropped from the wait on the first tick SWIM does not list it) and the clear past the hold, both of which 0.44.0 ends ([ADR-212](decisions.md)). A collection owed an embedding scan is marked in the store's metadata table (`vector_rescan:<collection id>`); 0.43.0 looks metadata keys up by name and never lists them, so it ignores the marks, does not run those scans, and the documents a scan would have embedded wait. The marks stay in the store and 0.44.0 scans the marked collections at its next start. Ownership yielding ([ADR-213](decisions.md)) adds the advisory file `kimmy.last-start`, which 0.43.0 never opens, and optional fields on the replication frames and the facts block, which 0.43.0 decodes leniently and skips; a member that yields keeps owning the class until no 0.43.0 member is live, because an older peer never confirms. `kimmyd check-store` and `kimmy_store_repairs_total` do not exist in 0.43.0.
 
 **Rolling back from 0.40.1 to 0.40.0 or earlier** after a stop that could not
 close its store: the older build does not know the marker `storage_not_closed`.
