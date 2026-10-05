@@ -10,7 +10,66 @@ Versioning follows the pre-1.0 policy in
 [docs/compatibility.md](docs/compatibility.md): a `0.MINOR` bump may carry
 breaking changes and says so here; a `0.x.PATCH` bump never does.
 
-## Unreleased
+## 0.44.0 - 2026-10-05
+
+This is a minor release with breaking changes. Several requests that used to
+answer `200` with a quietly wrong result are now refused with a `400`, and a few
+answers that were wrong are now right, so a client that depended on the old
+answer sees a change. Read the **Breaking:** entries below before rolling.
+
+Breaking changes in this release:
+
+- An array written inside an expression is evaluated, so a field path in it is the field's value.
+- `$inc` and `$mul` keep a 32-bit integer 32-bit, and `PUT` keeps `_id`'s type.
+- `modified` counts the documents an update changed, and a document left as it was is not written (and has no change event).
+- A `$lookup` joins on every element of an array its key crosses or holds, and its attachments are held to the ceiling.
+- A projection through an array keeps the array and every element.
+- An update that writes one path twice is a `400` and writes nothing.
+- A filter's `$expr` that cannot be evaluated against a document fails the request with a `400` instead of dropping the document.
+- A `$regex` pattern, and the patterns of one filter together, have a size limit.
+- A regular expression inside `$in`, `$nin` or `$all`, or as the operand of `$ne`, is a `400`.
+- An `$elemMatch` inside `$all` is a `400`.
+- An empty `$all` is a `400`.
+
+A member that cannot do a class of work (expiry, webhook delivery or
+embedding) now hands it to a healthy peer that can, and takes it back after a
+quiet spell; it keeps owning the class until every live peer has confirmed, so
+the overlap is a duplicate and never a gap (ADR-213). It adds no Breaking
+entry: nothing that was accepted is now refused. A webhook subscription taken
+over behind a long run of older entries keeps delivering (ADR-218).
+
+Rolling back to 0.43.0: no configuration key was added (every knob of this
+release is an environment variable or a constant), no table, `kimmy.format`
+schema (still 4) or wire frame changed, so 0.43.0 starts on a 0.44.0 data
+directory and its config file without edits. What it loses or ignores:
+
+- `kimmy.replay-floor` gains `owed = <node id>` lines after its two floor
+  lines. 0.43.0 reads the floor lines and skips every other key, so it reads
+  the same floor. It keeps the file as it is when it does not move the floor,
+  so stale `owed` lines can survive a 0.43.0 run; back on 0.44.0 each holds a
+  marked member at `503` for `cluster.catch_up_wait_secs`, and is released
+  after the dwell if that member never returns.
+- A collection owed an embedding scan is marked in the store's metadata table
+  (`vector_rescan:<collection id>`). 0.43.0 looks metadata keys up by name and
+  never lists them, so it ignores the marks: it does not run those scans, and
+  documents the scan would have embedded wait. The marks stay in the store, and
+  0.44.0 scans the marked collections at its next start.
+- Answers revert to 0.43.0's: the `400`s above answer `200` again, with the
+  results described in each entry. A mixed roll answers by member until every
+  member is rolled.
+- `kimmyd check-store` and `kimmy_store_repairs_total` do not exist in 0.43.0;
+  nothing is stored for them.
+- Ownership yielding (ADR-213) stores and sends nothing 0.43.0 reads
+  differently. `kimmy.last-start` is an advisory file beside `kimmy.last-exit`;
+  0.43.0 never opens it, so it is ignored (an interrupted write can leave a
+  `kimmy.last-start.tmp.<pid>` that 0.43.0 does not clean up, harmlessly). The
+  replication frames gain optional `facts_gen` and `echo` fields, and the facts
+  block optional fields for each class's state, cause and responsiveness; the
+  frames and the block are decoded leniently, and 0.43.0 skips fields it does
+  not know, so a mixed cluster works, with a 0.44.0 member that yields owning
+  the class until no 0.43.0 member is live, as an older peer never confirms.
+  There is no table or schema change. The webhook fix (ADR-218) changes no wire,
+  schema or configuration.
 
 ### Added
 
@@ -595,8 +654,11 @@ breaking changes and says so here; a `0.x.PATCH` bump never does.
   the next discovery tick comes is said at `WARN` only once it has run for a
   discovery interval or longer, and not stacked on. A stop still waits for a
   `dns:` or `k8s:` lookup that is in flight when it begins, for what is left of
-  that lookup (at most `timeout` × `attempts` × the nameservers in resolv.conf)
-  and never past the 22 s stop budget, then exits 0, as before; between lookups,
+  that lookup (on the static musl release build and the container, at most
+  `timeout` in total, as musl asks every nameserver at once and spreads
+  `attempts` within that time; on a glibc build, `timeout` × `attempts` × the
+  nameservers in resolv.conf) and never past the 22 s stop budget, then exits 0,
+  as before; between lookups,
   or with a `dns-srv:` seed, it does not wait.
 
 - **A webhook or embedding host that does not resolve no longer holds a runtime
