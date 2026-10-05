@@ -701,6 +701,12 @@ impl Engine {
         if body.as_deref() == Some(found.body.as_slice()) {
             return Ok(None);
         }
+        // The indexes first: a unique violation returns here, before anything
+        // is minted, and the caller aborts, which discards the entries with
+        // the rest.
+        let newly_multikey = index::maintain(self, txn, coll, Some(&found.doc), next, &key)?;
+        index::mark_multikey(txn, &coll.db, &coll.name, &newly_multikey)?;
+
         // Minted only once there is something to write, under the writer
         // (ADR-148): an unchanged document must not advance the clock.
         let stamp = self.next_stamp();
@@ -722,9 +728,6 @@ impl Engine {
                 &codec::encode_doc_record(&record),
             )?;
         }
-
-        let newly_multikey = index::maintain(self, txn, coll, Some(&found.doc), next, &key)?;
-        index::mark_multikey(txn, &coll.db, &coll.name, &newly_multikey)?;
 
         let entry = OplogEntry { stamp, kind, collection: coll.id, doc_id: Some(id.clone()), body };
         append_oplog(txn, &entry)?;
@@ -1236,6 +1239,52 @@ mod tests {
             assert_eq!(doc.get_str("status").unwrap(), "pending", "_id {id} must be untouched");
         }
         assert!(rx.try_recv().is_err(), "a failed request must publish nothing");
+    }
+
+    /// A change a unique index refuses is found before its stamp is minted, so
+    /// it leaves the clock as it was; one the index allows still mints.
+    #[test]
+    fn a_change_a_unique_index_refuses_mints_nothing() {
+        let (engine, _coll, _dir) = engine();
+        engine
+            .create_index(
+                "app",
+                "jobs",
+                vec![crate::meta::IndexField::ascending("email")],
+                true,
+                None,
+            )
+            .unwrap();
+        let coll = engine.get_collection("app", "jobs").unwrap();
+        engine.insert(&coll, doc! {"_id": 1_i64, "email": "a@x.com"}).unwrap();
+        engine.insert(&coll, doc! {"_id": 2_i64, "email": "b@x.com"}).unwrap();
+        let (commits, oplog, clock) =
+            (engine.commits(), engine.oplog_entries().unwrap(), engine.clock_last());
+        let mut rx = engine.subscribe();
+        let set_email = |email: &'static str| TestSpec {
+            matches: |d: &Document| i64_of(d, "_id") == 2,
+            compare: |_: &Document, _: &Document| Ordering::Equal,
+            apply: move |d: &Document| {
+                let mut next = d.clone();
+                next.insert("email", email);
+                Ok(Some(next))
+            },
+            upsert: None,
+        };
+
+        assert!(
+            engine.modify_where(&coll, &Candidates::Scan, &set_email("a@x.com"), None).is_err()
+        );
+        assert!(engine.find_and_modify(&coll, &Candidates::Scan, &set_email("a@x.com")).is_err());
+        assert_eq!(engine.clock_last(), clock, "no stamp minted");
+        assert_eq!(engine.oplog_entries().unwrap(), oplog, "nothing logged");
+        assert_eq!(engine.commits(), commits, "nothing committed");
+        assert!(rx.try_recv().is_err(), "nothing published");
+
+        let out =
+            engine.modify_where(&coll, &Candidates::Scan, &set_email("c@x.com"), None).unwrap();
+        assert_eq!(out.modified, 1);
+        assert!(engine.clock_last() > clock);
     }
 
     #[test]

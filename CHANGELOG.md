@@ -10,6 +10,26 @@ Versioning follows the pre-1.0 policy in
 [docs/compatibility.md](docs/compatibility.md): a `0.MINOR` bump may carry
 breaking changes and says so here; a `0.x.PATCH` bump never does.
 
+## Unreleased
+
+### Fixed
+
+- **A write a batch or a unique index refuses no longer advances the clock.**
+  A batch insert whose later document collided, or repeated a unique value,
+  still ticked the hybrid clock for the documents before it, and an insert, a
+  replace or a `find_and_modify` that a unique index refused ticked it too,
+  because the refusal was found after the stamp was minted (the two leftovers
+  of 0.44.0's entry on writes that find nothing to do). A batch now checks every
+  document, in order, against the stored documents, the ids before it and the
+  indexes, and mints a stamp for each, in submission order, only once all have
+  passed; a single write files its index entries before it mints. Nothing a
+  caller sees changes except the clock: the same request fails with the same
+  answer. Still leftover: a `multi` update chunk, or a scoped batch, whose
+  later document fails (an update operator that cannot apply to it, or a unique
+  value) aborts after the documents before it in the same chunk were minted
+  for, and so still ticks the clock; the abort writes, logs and publishes
+  nothing.
+
 ## 0.44.0 - 2026-10-05
 
 This is a minor release with breaking changes. Several requests that used to
