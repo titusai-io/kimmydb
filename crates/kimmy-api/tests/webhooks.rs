@@ -1237,3 +1237,341 @@ async fn a_stop_while_planning_invalidates_no_subscription() {
         assert_ne!(stored.get_str("state").ok(), Some("invalidated"), "{id} was invalidated");
     }
 }
+
+/// A foreign origin's entry, as a replicated write arrives.
+fn foreign(
+    origin: kimmy_core::NodeId,
+    collection: kimmy_core::CollectionId,
+    wall_ms: u64,
+    n: i64,
+) -> kimmy_core::OplogEntry {
+    kimmy_core::OplogEntry {
+        stamp: kimmy_core::Stamp::new(kimmy_core::Hlc::new(wall_ms, 0), origin),
+        kind: kimmy_core::OpKind::Insert,
+        collection,
+        doc_id: Some(kimmy_core::DocId::Int64(n)),
+        body: Some(bson::serialize_to_vec(&doc! { "_id": n }).unwrap()),
+    }
+}
+
+/// A progress record for `id` covering `origin` up to `through`, as another node
+/// that delivered that far would have written it.
+fn progress_covering(
+    state: &kimmy_api::SharedState,
+    id: &str,
+    covered: &[(kimmy_core::NodeId, kimmy_core::Hlc)],
+) {
+    let meta = state
+        .engine
+        .create_system_collection("__kimmy", "__webhook_progress")
+        .unwrap_or_else(|_| state.engine.get_collection("__kimmy", "__webhook_progress").unwrap());
+    let mut delivered = bson::Document::new();
+    for (node, through) in covered {
+        delivered.insert(
+            node.to_string(),
+            bson::Binary {
+                subtype: bson::spec::BinarySubtype::Generic,
+                bytes: through.to_bytes().to_vec(),
+            },
+        );
+    }
+    let record = format!("{id}:{}", covered[0].0);
+    state.engine.insert(&meta, doc! { "_id": record, "delivered": delivered }).unwrap();
+}
+
+fn q_origin() -> kimmy_core::NodeId {
+    kimmy_core::NodeId::from_bytes([0x11; 16])
+}
+
+/// The oplog entries on this node, for counting what an idle pass writes.
+fn oplog_entries(state: &kimmy_api::SharedState) -> usize {
+    state
+        .engine
+        .read_oplog_from(kimmy_core::Hlc::ZERO, 100_000, kimmy_storage::WalkScope::Background)
+        .unwrap()
+        .len()
+}
+
+/// A subscription taken over by a member that has not delivered for it keeps
+/// delivering, however much of another member's history sits ahead of that
+/// member's own first entry.
+///
+/// The resume point is the lowest point the subscription is behind at over every
+/// origin the node holds. The new owner `R` has entries of its own (its progress
+/// records are among them) that the subscription's progress, which only observes
+/// what was delivered, has never covered, so the resume point is zero. The scan
+/// from zero returns the oldest `BATCH * 4` entries of the whole oplog; with more
+/// than that from one origin `Q` ahead of `R`'s first, the window holds nothing
+/// that is still wanted, the pass finds the batch empty, and every later pass does
+/// the same while the events `Q` wrote since sit beyond it.
+///
+/// Counts only: the events delivered, and the entries `R` appends while idle.
+#[tokio::test]
+async fn a_subscription_taken_over_behind_a_long_foreign_history_keeps_delivering() {
+    const OLD: i64 = 300; // more than BATCH * 4 = 256
+    const NEW: i64 = 5;
+    let dir = tempfile::tempdir().unwrap();
+    let state = state_for(&dir);
+    let (addr, _seen, _hits) = receiver(200).await;
+    let watched = state.engine.create_collection("shop", "orders").unwrap();
+    let id = register(&state, &format!("http://{addr}/hook"), vec![]);
+
+    // `Q`'s entries, all older than anything `R` has written, applied the way a
+    // replicated write is.
+    let q = q_origin();
+    let base = kimmy_storage::physical_now_ms() - 600_000;
+    for n in 0..OLD {
+        state.engine.apply_remote(&watched, &foreign(q, watched.id, base + n as u64, n)).unwrap();
+    }
+    // Progress that covers `Q` up to what it had written, and nothing of `R`'s.
+    progress_covering(&state, &id, &[(q, kimmy_core::Hlc::new(base + OLD as u64 - 1, 0))]);
+    // What `Q` writes afterwards, which is what must still be delivered.
+    for n in OLD..OLD + NEW {
+        state.engine.apply_remote(&watched, &foreign(q, watched.id, base + n as u64, n)).unwrap();
+    }
+
+    // Passes under the default limits, whose progress heartbeat is a minute: an idle
+    // pass writes nothing unless its resume point is that old.
+    let mut backoff = dispatch::Backoff::default();
+    let mut delivered_events = 0;
+    for _ in 0..8 {
+        delivered_events += pass_with(&state, &mut backoff).await.delivered;
+    }
+    assert_eq!(delivered_events, NEW as usize, "every event written after the progress arrives");
+
+    // Idle from here: the entries `R` appends for its progress stay bounded.
+    let before = oplog_entries(&state);
+    for _ in 0..10 {
+        assert_eq!(pass_with(&state, &mut backoff).await.delivered, 0);
+    }
+    let appended = oplog_entries(&state) - before;
+    assert!(appended <= 2, "an idle subscription appended {appended} entries in 10 passes");
+
+    // The heartbeat writes the position forward **once**, not twice: the write is an
+    // entry of this node's that the position it records cannot hold, and a second pass
+    // that wrote to catch up would leave one more behind. Passes 100 ms apart under a
+    // one-second heartbeat, with what each appended: no two in a row, and at least one.
+    let limits = dispatch::Limits {
+        progress_heartbeat: std::time::Duration::from_millis(1000),
+        ..Default::default()
+    };
+    let mut writes = Vec::new();
+    for _ in 0..40 {
+        let before = oplog_entries(&state);
+        pass_under(&state, &mut backoff, limits).await;
+        writes.push(oplog_entries(&state) - before);
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+    assert!(writes.iter().any(|w| *w > 0), "the heartbeat wrote: {writes:?}");
+    assert!(
+        writes.windows(2).all(|pair| pair[0] == 0 || pair[1] == 0),
+        "no heartbeat writes on two passes in a row: {writes:?}"
+    );
+}
+
+/// What the pass raises progress to is what this node **held when it read its
+/// position**, never what the window happened to end at. An entry from a third
+/// origin `X`, older than the window's end but newer than this node's position for
+/// `X` when the pass began, arrives after the pass has run and must still be
+/// delivered: the pass never saw it, so it cannot have covered it.
+#[tokio::test]
+async fn an_entry_that_arrives_behind_a_window_the_pass_has_gone_through_is_still_delivered() {
+    const OLD: i64 = 300;
+    let dir = tempfile::tempdir().unwrap();
+    let state = state_for(&dir);
+    let (addr, _seen, _hits) = receiver(200).await;
+    let watched = state.engine.create_collection("shop", "orders").unwrap();
+    let id = register(&state, &format!("http://{addr}/hook"), vec![]);
+
+    let (q, x) = (q_origin(), kimmy_core::NodeId::from_bytes([0x22; 16]));
+    let base = kimmy_storage::physical_now_ms() - 600_000;
+    for n in 0..OLD {
+        state.engine.apply_remote(&watched, &foreign(q, watched.id, base + n as u64, n)).unwrap();
+    }
+    // `X` has one entry, early in the window, which the progress already covers.
+    let x_first = kimmy_core::Hlc::new(base + 10, 0);
+    state.engine.apply_remote(&watched, &foreign(x, watched.id, base + 10, 1_000)).unwrap();
+    progress_covering(
+        &state,
+        &id,
+        &[(q, kimmy_core::Hlc::new(base + OLD as u64 - 1, 0)), (x, x_first)],
+    );
+
+    // Five of `Q`'s events newer than the progress, which the delivery path will carry
+    // forward over every origin the node held, `X` among them.
+    for n in OLD..OLD + 5 {
+        state.engine.apply_remote(&watched, &foreign(q, watched.id, base + n as u64, n)).unwrap();
+    }
+    // Passes: the first goes through a window of the oldest 256 entries and delivers
+    // nothing, a later one delivers the five, and each raises every origin the node
+    // held to the lower of its own position and where the window ended.
+    let mut backoff = dispatch::Backoff::default();
+    let mut first = 0;
+    for _ in 0..6 {
+        first += pass_with(&state, &mut backoff).await.delivered;
+    }
+    assert_eq!(first, 5);
+
+    // `X`'s entry arrives now: older than that window's end, above this node's
+    // position for `X` when the pass read it.
+    state.engine.apply_remote(&watched, &foreign(x, watched.id, base + 100, 1_001)).unwrap();
+    let mut delivered = 0;
+    for _ in 0..8 {
+        delivered += pass_with(&state, &mut backoff).await.delivered;
+    }
+    assert_eq!(delivered, 1, "the late entry is delivered, and this run delivers no event twice");
+}
+
+/// Wanted entries that are sparse in a window, interleaved with an origin that has
+/// none, keep being delivered as the window moves on: the origin with nothing wanted
+/// in it is raised with the rest, so it does not pin the next scan at its floor.
+#[tokio::test]
+async fn sparse_wanted_entries_among_another_origins_history_do_not_pin_the_scan() {
+    let dir = tempfile::tempdir().unwrap();
+    let state = state_for(&dir);
+    let (addr, _seen, _hits) = receiver(200).await;
+    let watched = state.engine.create_collection("shop", "orders").unwrap();
+    let busy = state.engine.create_collection("shop", "clicks").unwrap();
+    let id = register(&state, &format!("http://{addr}/hook"), vec![]);
+
+    // 300 of `Q`'s entries, every twentieth in the watched collection, and 300 of
+    // `Z`'s, none of them: 600 entries, older than anything `R` wrote.
+    let (q, z) = (q_origin(), kimmy_core::NodeId::from_bytes([0x33; 16]));
+    let base = kimmy_storage::physical_now_ms() - 600_000;
+    let mut wanted = 0;
+    for n in 0..300i64 {
+        let (meta, coll) = if n % 20 == 0 {
+            wanted += 1;
+            (&watched, watched.id)
+        } else {
+            (&busy, busy.id)
+        };
+        state.engine.apply_remote(meta, &foreign(q, coll, base + 2 * n as u64, n)).unwrap();
+        state
+            .engine
+            .apply_remote(&busy, &foreign(z, busy.id, base + 2 * n as u64 + 1, 10_000 + n))
+            .unwrap();
+    }
+
+    let mut backoff = dispatch::Backoff::default();
+    let mut delivered = pass_with(&state, &mut backoff).await.delivered;
+    assert!(delivered > 0, "the first window holds wanted entries");
+    // After the first delivery, with no empty pass to help: the origin with nothing
+    // wanted in the window was raised with the rest, so the next scan starts past it.
+    let progress = dispatch::union_progress(&state, &id).unwrap();
+    assert!(
+        progress.get(z) > kimmy_core::Hlc::ZERO,
+        "the origin with nothing wanted in it was raised with the rest"
+    );
+    // Three windows hold the 600 entries; one pass each, and one to spare.
+    for _ in 0..3 {
+        delivered += pass_with(&state, &mut backoff).await.delivered;
+    }
+    assert_eq!(delivered, wanted, "every wanted entry arrives, past the first window");
+}
+
+/// A batch the cap cuts short covers only what it sent: the wanted entries behind
+/// it in the same window are still to come, whatever origins they are from.
+#[tokio::test]
+async fn a_batch_cut_at_the_cap_does_not_cover_what_it_did_not_send() {
+    const WANTED: i64 = 100; // more than one batch of 64
+    let dir = tempfile::tempdir().unwrap();
+    let state = state_for(&dir);
+    let (addr, _seen, _hits) = receiver(200).await;
+    let watched = state.engine.create_collection("shop", "orders").unwrap();
+    register(&state, &format!("http://{addr}/hook"), vec![]);
+    let (q, z) = (q_origin(), kimmy_core::NodeId::from_bytes([0x33; 16]));
+    let base = kimmy_storage::physical_now_ms() - 600_000;
+    for n in 0..WANTED {
+        state
+            .engine
+            .apply_remote(&watched, &foreign(q, watched.id, base + 2 * n as u64, n))
+            .unwrap();
+        // Another origin's entries between them, in the same window, also wanted.
+        state
+            .engine
+            .apply_remote(&watched, &foreign(z, watched.id, base + 2 * n as u64 + 1, 10_000 + n))
+            .unwrap();
+    }
+    let mut backoff = dispatch::Backoff::default();
+    let mut delivered = 0;
+    for _ in 0..6 {
+        delivered += pass_with(&state, &mut backoff).await.delivered;
+    }
+    assert_eq!(
+        delivered,
+        2 * WANTED as usize,
+        "every wanted entry is delivered, and this run delivers none twice"
+    );
+}
+
+/// Where a batch is cut at the cap, the end it covers is exactly the last entry it
+/// sent: an entry of **another origin at the same stamp** that sorts after it is not
+/// covered, and the next pass delivers it. A cut that claimed the whole stamp, under
+/// an origin that sorts last, would raise that origin over an entry nobody sent.
+#[tokio::test]
+async fn a_batch_cut_at_the_cap_leaves_an_entry_of_another_origin_at_the_same_stamp() {
+    const BEFORE: i64 = 63; // the 64th wanted entry shares its stamp with the 65th
+    let dir = tempfile::tempdir().unwrap();
+    let state = state_for(&dir);
+    let (addr, _seen, _hits) = receiver(200).await;
+    let watched = state.engine.create_collection("shop", "orders").unwrap();
+    register(&state, &format!("http://{addr}/hook"), vec![]);
+    let (q, z) = (q_origin(), kimmy_core::NodeId::from_bytes([0x33; 16]));
+    let base = kimmy_storage::physical_now_ms() - 600_000;
+    for n in 0..BEFORE {
+        state.engine.apply_remote(&watched, &foreign(q, watched.id, base + n as u64, n)).unwrap();
+    }
+    // `Q`'s 64th and `Z`'s 65th, at one stamp: the oplog sorts `Q` first.
+    let tie = base + BEFORE as u64;
+    state.engine.apply_remote(&watched, &foreign(q, watched.id, tie, BEFORE)).unwrap();
+    state.engine.apply_remote(&watched, &foreign(z, watched.id, tie, 10_000)).unwrap();
+
+    let mut backoff = dispatch::Backoff::default();
+    let first = pass_with(&state, &mut backoff).await.delivered;
+    assert_eq!(first, 64, "the first batch is cut at the cap");
+    let mut delivered = first;
+    for _ in 0..4 {
+        delivered += pass_with(&state, &mut backoff).await.delivered;
+    }
+    assert_eq!(delivered, 65, "the entry of the other origin at the same stamp arrives, too");
+}
+
+/// A subscription behind a long run of entries that are not its own walks it one
+/// window per pass, however old the run and however often the node writes: the
+/// pass that writes its position forward is not held back by having written a pass
+/// ago, because a window that does not reach the oplog's end leaves the next window
+/// to the next pass, and the position is what carries it there.
+///
+/// About 5,000 unwanted entries and one wanted one at the end, the default
+/// heartbeat: counts only, the passes it takes and the one event.
+#[tokio::test]
+async fn a_long_run_of_entries_that_are_not_wanted_is_walked_one_window_per_pass() {
+    const UNWANTED: i64 = 5_000;
+    let dir = tempfile::tempdir().unwrap();
+    let state = state_for(&dir);
+    let (addr, _seen, _hits) = receiver(200).await;
+    let watched = state.engine.create_collection("shop", "orders").unwrap();
+    let busy = state.engine.create_collection("shop", "clicks").unwrap();
+    register(&state, &format!("http://{addr}/hook"), vec![]);
+    let q = q_origin();
+    let base = kimmy_storage::physical_now_ms() - 3_600_000;
+    for n in 0..UNWANTED {
+        state.engine.apply_remote(&busy, &foreign(q, busy.id, base + n as u64, n)).unwrap();
+    }
+    state
+        .engine
+        .apply_remote(&watched, &foreign(q, watched.id, base + UNWANTED as u64, UNWANTED))
+        .unwrap();
+
+    // Twenty windows of 256 cover 5,000 entries; a few passes more for the one that
+    // reaches the wanted entry and the one that delivers it.
+    let mut backoff = dispatch::Backoff::default();
+    let mut delivered = 0;
+    let mut passes = 0;
+    while delivered == 0 && passes < 20 + 4 {
+        delivered += pass_with(&state, &mut backoff).await.delivered;
+        passes += 1;
+    }
+    assert_eq!(delivered, 1, "the wanted entry is delivered within {passes} passes");
+}

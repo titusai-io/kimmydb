@@ -25028,3 +25028,80 @@ dispatcher, a stalled and a failing embedding worker, the latch, a runtime stall
 probation after a storage failure and a start that is not probation, an evaluator that panics and one that stops
 ticking, the off switch and its refusal of a bad value, and an unconfirmed
 yield. Every mutation row of the design was applied and killed.
+
+---
+
+## ADR-218 — A webhook subscription's progress is carried over every origin a window covers
+
+**Status:** accepted, for the next `0.MINOR`. Applies
+[ADR-082](#adr-082--a-full-batch-proves-coverage-of-its-window-for-every-origin-the-peer-advertised)'s
+rule to the webhook dispatcher, which kept the trap ADR-082 closed in sync.
+
+**The defect, shipped since the dispatcher read replicated progress.** A subscription's
+progress, a version vector, only observes the stamps it delivered or looked over. The
+dispatcher resumes at the lowest point the subscription is behind at over every origin
+this node holds (`VersionVector::behind`). A member that takes a subscription over has
+entries of its own, its progress records among them, and nothing it delivered carries
+one, so its own origin sat at zero in the progress and the resume point stayed at zero.
+The scan from zero returns the oldest 256 entries of the whole oplog. With more than that
+from another origin ahead of the new owner's first entry, the window held nothing still
+wanted, the pass found its batch empty, and every later pass read the same window while the
+events written since lay beyond it: one batch delivered, then nothing, with replication
+healthy. A crash-looping member's handover showed it, and so can any ownership move on a
+busy store. The empty-batch heartbeat could not help: it only observes the entries it
+scanned.
+
+**Decision.** After a pass goes through a window, progress is raised, for every origin in
+this node's position, to the lower of that position and where the window ended, through
+`coverage_up_to`, the function sync uses, with the same `(hlc, node)` tie rule (ADR-148).
+Progress only moves forward (a merge, never an assignment).
+
+- **The end.** A window that reached the oplog's end is the whole tail, so every origin is
+  raised to this node's position. One that stopped earlier ends at the last entry it
+  examined.
+- **The empty-batch pass** applies it to the window it scanned, beside the observation it
+  already made, so an origin that never appears in the window is carried with the rest.
+- **A delivery** applies it once the endpoint has accepted the batch, with the end
+  being the whole window when the batch took every wanted entry in it, and only the last
+  entry sent when the batch cap or the payload cap cut it short: the wanted entries behind
+  that are still to come, whatever origin they are from.
+- **The position is read before the window is scanned, and it is a coverage claim.**
+  `Engine::version_vector` is the served position (`OPLOG_VERSIONS`): an entry of an origin
+  is at or below it or marked held (invariant I), and only an entry appended in position
+  raises it. An entry appended between that read and the scan is above it, so it stays
+  uncovered and the next pass delivers it. Reading it after the scan would cover such an
+  entry without having looked at it.
+
+**Not changed.** `VersionVector::behind` and every other caller: sync raises its witnessed
+vector by ADR-082 and ADR-148, the push filters by the vector the peer holds so a pinned
+resume point cannot starve it, and change streams and the embedding worker keep a single
+resume token, not a vector.
+
+**Alternatives rejected.** Resuming a subscription from its own newest progress stamp
+instead of the lowest: it would skip an origin whose progress is the one behind. Letting
+the heartbeat observe the whole oplog rather than the window: it reads what a node may not
+serve and costs a scan of the store. Raising each origin to the window's end regardless of
+the node's position: it steps over entries that arrive later with an older stamp.
+
+**Test.** In `kimmy-api`: a subscription taken over behind 300 entries of another origin
+(more than the window) delivers every later event and an idle pass appends at most two
+entries; with 100 entries it already did; a late entry from a third origin, older than the
+window's end and above the node's position when the pass read it, is delivered after a
+pass has carried progress forward, through the empty and the delivery path; sparse wanted
+entries among another origin's history are all delivered within one pass per window, with
+the unwanted origin raised after the first; a batch cut at the cap covers only what it
+sent, including where another origin has an entry at the same stamp as the last one sent;
+an entry that lands after a window has been scanned (landed through a test-only hook) is not
+covered by the pass, and a run of 5,000 entries that are not wanted is walked one window per
+pass under the default heartbeat. The carry and the window's end are tested as functions.
+Fourteen mutation rows were run, and each fails a named test: an assignment for the merge;
+every window read as the tail (a process test and a unit test); the tail read as a cut; a cut
+batch covering its whole window; a cut batch covering a whole stamp; the position ignored (a
+process test and a unit test); the position read after the scan; the carry dropped in the
+delivery path; the carry dropped in the empty path; a second heartbeat write inside the
+interval; that wait applied to a window that stopped short of the tail; and the heartbeat's
+record of its writes kept for a subscription that has been removed.
+The heartbeat writes a subscription's progress once per interval when the window reached the
+tail: its own write leaves this node's origin one entry behind, which used to draw a second
+write. A window short of the tail is walked on the next pass, and what carries it there is the
+position the pass records, so no wait applies to it.

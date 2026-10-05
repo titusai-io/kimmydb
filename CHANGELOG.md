@@ -457,6 +457,17 @@ breaking changes and says so here; a `0.x.PATCH` bump never does.
 
 ### Fixed
 
+- **A webhook subscription taken over by another member could stop delivering for good.**
+  When a member took over a subscription (a crash-looping node's handover, or any ownership
+  move on a busy store), it delivered the first batch and then nothing, with replication
+  healthy and its event count flat. The subscription's progress only recorded what it had
+  delivered, so the new owner's own origin stayed at zero and each pass re-read the oldest
+  256 oplog entries, none of them wanted any more, while the events written since lay beyond
+  that window. After each window a pass now carries the progress over every origin the node
+  holds, as far as the window went and no further than this node held when it read its
+  position, the rule sync already used (ADR-082). The fix adds no redelivery: delivery stays
+  at-least-once, and a receiver still deduplicates on `eventId`. See ADR-218.
+
 - **A stored `Decimal128` zero reads as false wherever truth is read.** The
   expression language had no reading of a `Decimal128` and took every one as
   true, so over `{qty: Decimal128("0")}`, `{"$cond": ["$qty", "has stock",
