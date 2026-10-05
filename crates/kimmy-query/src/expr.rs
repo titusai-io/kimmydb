@@ -519,12 +519,33 @@ pub type Binding<'a> = (&'a str, &'a Bson);
 #[derive(Clone, Copy, Debug)]
 pub struct Scope<'a> {
     root: &'a Document,
-    bindings: &'a [Binding<'a>],
-    /// Whether `bindings` is in name order, so a lookup in it can bisect: a frame
-    /// of more than [`BISECT_FRAME`] names is built that way, and a smaller one
-    /// is scanned.
+    bindings: Frame<'a>,
+    /// Whether `bindings` is a `$let`'s frame in name order, so a lookup in it can
+    /// bisect: a frame of more than [`BISECT_FRAME`] names is built that way, and
+    /// a smaller one is scanned.
     sorted: bool,
     parent: Option<&'a Scope<'a>>,
+}
+
+/// The names one scope frame binds: values already in hand, or a `$let`'s
+/// variables, each evaluated when it is first read.
+#[derive(Clone, Copy, Debug)]
+enum Frame<'a> {
+    Values(&'a [Binding<'a>]),
+    Needed(&'a [Needed<'a>]),
+}
+
+/// One variable of a `$let`, bound by need (ADR-219): its expression is evaluated
+/// in the scope around the `$let`, the frame's parent, when the body first reads
+/// it, and the value is kept for the reads after. A variable the body never reads
+/// is never evaluated, so it cannot fail the expression. A failed evaluation is
+/// not kept: the failure is returned, and a second read evaluates again and fails
+/// the same way, since an expression is a pure function of its scope.
+#[derive(Debug)]
+struct Needed<'a> {
+    name: &'a str,
+    expr: &'a Expr,
+    value: std::cell::OnceCell<Bson>,
 }
 
 /// The size of a frame past which its names are kept in order and bisected, so
@@ -537,7 +558,7 @@ impl<'a> Scope<'a> {
     /// A scope over a document with nothing bound beyond `$$ROOT` and
     /// `$$CURRENT` — what every stage outside a `$lookup` sub-pipeline wants.
     pub fn new(root: &'a Document) -> Self {
-        Self { root, bindings: &[], sorted: false, parent: None }
+        Self { root, bindings: Frame::Values(&[]), sorted: false, parent: None }
     }
 
     /// A scope over a document with variables already in place — what a
@@ -546,7 +567,7 @@ impl<'a> Scope<'a> {
     /// A later binding shadows an earlier one of the same name, so a caller
     /// layering an inner set over an outer one appends rather than prepends.
     pub fn with_bindings(root: &'a Document, bindings: &'a [Binding<'a>]) -> Self {
-        Self { root, bindings, sorted: false, parent: None }
+        Self { root, bindings: Frame::Values(bindings), sorted: false, parent: None }
     }
 
     /// The document `$$ROOT` names.
@@ -555,39 +576,94 @@ impl<'a> Scope<'a> {
     }
 
     fn nested<'b>(&'b self, bindings: &'b [Binding<'b>]) -> Scope<'b> {
-        Scope { root: self.root, bindings, sorted: false, parent: Some(self) }
+        Scope {
+            root: self.root,
+            bindings: Frame::Values(bindings),
+            sorted: false,
+            parent: Some(self),
+        }
     }
 
-    /// [`Self::nested`] over a frame already in name order, which a lookup in it
-    /// bisects. Names in a frame are distinct, so the order is a total one.
-    fn nested_sorted<'b>(&'b self, bindings: &'b [Binding<'b>]) -> Scope<'b> {
-        Scope { root: self.root, bindings, sorted: true, parent: Some(self) }
+    /// A frame of a `$let`'s variables, bound by need, in the order written.
+    fn nested_needed<'b>(&'b self, needed: &'b [Needed<'b>]) -> Scope<'b> {
+        Scope {
+            root: self.root,
+            bindings: Frame::Needed(needed),
+            sorted: false,
+            parent: Some(self),
+        }
     }
 
-    fn get(&self, name: &str) -> Option<&'a Bson> {
-        let found = if self.sorted {
-            self.bindings
-                .binary_search_by(|(bound, _)| {
-                    #[cfg(test)]
-                    FRAME_COMPARISONS.with(|n| n.set(n.get() + 1));
-                    (*bound).cmp(name)
-                })
-                .ok()
-                .map(|at| self.bindings[at].1)
-        } else {
-            self.bindings
-                .iter()
-                .rev()
-                .find(|(bound, _)| {
-                    #[cfg(test)]
-                    FRAME_COMPARISONS.with(|n| n.set(n.get() + 1));
-                    *bound == name
-                })
-                .map(|(_, value)| *value)
+    /// [`Self::nested_needed`] over a frame already in name order, which a lookup
+    /// in it bisects. Names in a frame are distinct, so the order is a total one.
+    fn nested_needed_sorted<'b>(&'b self, needed: &'b [Needed<'b>]) -> Scope<'b> {
+        Scope { root: self.root, bindings: Frame::Needed(needed), sorted: true, parent: Some(self) }
+    }
+
+    /// The value of `name`, searching the innermost frame first. `None` when no
+    /// frame binds it; `Some(Err(_))` when a variable bound by need fails to
+    /// evaluate, which is the failure of the expression that read it.
+    fn get(&self, name: &str) -> Option<Result<&'a Bson>> {
+        let compared = |bound: &str| {
+            #[cfg(test)]
+            FRAME_COMPARISONS.with(|n| n.set(n.get() + 1));
+            bound.cmp(name)
+        };
+        let found = match self.bindings {
+            Frame::Values(bindings) => {
+                // Only a `$let`'s frame can be large, and it is bound by need.
+                let at = bindings.iter().rposition(|(bound, _)| compared(bound).is_eq());
+                at.map(|at| Ok(bindings[at].1))
+            }
+            Frame::Needed(needed) => {
+                let at = if self.sorted {
+                    needed.binary_search_by(|n| compared(n.name)).ok()
+                } else {
+                    needed.iter().rposition(|n| compared(n.name).is_eq())
+                };
+                at.map(|at| self.need(&needed[at]))
+            }
         };
         found.or_else(|| self.parent.and_then(|parent| parent.get(name)))
     }
+
+    /// A variable bound by need: its value, evaluated on the first read in the
+    /// scope around the `$let` (this frame's parent) and kept.
+    fn need(&self, variable: &'a Needed<'a>) -> Result<&'a Bson> {
+        if let Some(value) = variable.value.get() {
+            return Ok(value);
+        }
+        let enclosing = self.parent.expect("a `$let` frame has the scope around it");
+        #[cfg(test)]
+        NEEDED_EVALUATIONS.with(|n| n.set(n.get() + 1));
+        // The variable is evaluated here, on top of the stack that read it, so a
+        // variable read deep in a body that is itself deep stands on both. Each
+        // is bounded by the 128 levels a request body may nest, but their sum is
+        // not, and a chain of variables each read through the one before sums
+        // them again (ADR-219): the stack grows onto the heap when it runs low,
+        // so no request is refused for it and none can find the end of a worker's.
+        let value = stacker::maybe_grow(NEEDED_RED_ZONE, NEEDED_STACK_SEGMENT, || {
+            variable.expr.eval_in(enclosing)
+        })?;
+        Ok(variable.value.get_or_init(|| value))
+    }
 }
+
+/// The stack a variable's evaluation must find left when it begins, or the stack
+/// grows first: the most one evaluation may use between two such checks. The
+/// deepest eager `$let` measured under 128 KiB in a release build (a request body
+/// is held to 128 levels of nesting), so this is twice that. A debug build's
+/// frames are about ten times larger, so its margin is the same in proportion.
+#[cfg(not(debug_assertions))]
+const NEEDED_RED_ZONE: usize = 256 * 1024;
+#[cfg(debug_assertions)]
+const NEEDED_RED_ZONE: usize = 2 * 1024 * 1024;
+
+/// The size of the stack segment that is grown when the red zone is reached.
+#[cfg(not(debug_assertions))]
+const NEEDED_STACK_SEGMENT: usize = 1024 * 1024;
+#[cfg(debug_assertions)]
+const NEEDED_STACK_SEGMENT: usize = 8 * 1024 * 1024;
 
 /// The variables bound without being asked. `$$CURRENT` is `$$ROOT`: nothing
 /// here rebinds it, because `$map` and its relatives bind `$$this` instead.
@@ -627,6 +703,10 @@ thread_local! {
     /// reading a `$let`'s variables to a bisect and not a walk.
     #[cfg(test)]
     static FRAME_COMPARISONS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    /// `$let` variables evaluated by [`Scope::need`] on this thread, for the
+    /// tests that hold a variable to one evaluation however often it is read.
+    #[cfg(test)]
+    static NEEDED_EVALUATIONS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
 /// A scope, for the life of the guard, in which the parser on this thread
@@ -1306,17 +1386,23 @@ impl Expr {
                 }
             }
             Expr::Let { vars, body } => {
-                // Values are evaluated in the enclosing scope, then bound
-                // together: `{a: 1, b: "$$a"}` is an error at parse, not 1.
-                let values =
-                    vars.iter().map(|(_, e)| e.eval_in(scope)).collect::<Result<Vec<_>>>()?;
-                let mut frame: Vec<Binding<'_>> =
-                    vars.iter().zip(&values).map(|((name, _), v)| (name.as_str(), v)).collect();
+                // Variables see the enclosing scope, not each other (`{a: 1,
+                // b: "$$a"}` is an error at parse, not 1), and are evaluated
+                // when the body first reads them, in that enclosing scope: one
+                // the body never reads is never evaluated (ADR-219).
+                let mut frame: Vec<Needed<'_>> = vars
+                    .iter()
+                    .map(|(name, expr)| Needed {
+                        name: name.as_str(),
+                        expr,
+                        value: std::cell::OnceCell::new(),
+                    })
+                    .collect();
                 if frame.len() > BISECT_FRAME {
-                    frame.sort_unstable_by(|a, b| a.0.cmp(b.0));
-                    return body.eval_in(&scope.nested_sorted(&frame));
+                    frame.sort_unstable_by(|a, b| a.name.cmp(b.name));
+                    return body.eval_in(&scope.nested_needed_sorted(&frame));
                 }
-                body.eval_in(&scope.nested(&frame))
+                body.eval_in(&scope.nested_needed(&frame))
             }
             Expr::Filter { input, as_name, cond, limit } => {
                 eval_filter(input, as_name, cond, limit.as_deref(), scope)
@@ -1430,6 +1516,7 @@ fn eval_variable(name: &str, path: Option<&str>, scope: &Scope<'_>) -> Result<Bs
         // which an `$or` with a true argument must not hide (ADR-211).
         return Err(Error::Internal(format!("variable $${name} is not bound")));
     };
+    let value = value?;
     Ok(match path {
         None => value.clone(),
         Some(p) => value_path(value, p).unwrap_or(Bson::Null),
@@ -3851,6 +3938,229 @@ mod tests {
         assert!(Expr::parse(&doc! {"$let": {"vars": {"": 1}, "in": 1}}.into()).is_err());
         assert!(Expr::parse(&doc! {"$let": {"vars": {"a_1": 1}, "in": "$$a_1"}}.into()).is_ok());
         assert!(Expr::parse(&doc! {"$map": {"input": [], "as": "X", "in": 1}}.into()).is_err());
+    }
+
+    /// Evaluations of a `$let`'s variables by `expr` over `d`, and its answer.
+    fn counted(expr: Document, d: Document) -> (usize, Result<Bson>) {
+        let before = NEEDED_EVALUATIONS.with(std::cell::Cell::get);
+        let answer = ev(expr.into(), &d);
+        (NEEDED_EVALUATIONS.with(std::cell::Cell::get) - before, answer)
+    }
+
+    /// ADR-219: a variable is evaluated when the body first reads it. The case
+    /// ADR-211 recorded as known: the guard that keeps `r` from being read
+    /// also keeps it from failing.
+    #[test]
+    fn a_let_variable_the_body_does_not_read_cannot_fail_it() {
+        let guarded = doc! {"$let": {
+            "vars": {"r": {"$divide": [1, "$n"]}},
+            "in": {"$cond": [{"$eq": ["$n", 0]}, 0, "$$r"]},
+        }};
+        assert_eq!(on(guarded.clone().into(), doc! {"n": 0}), Bson::Int32(0));
+        assert_eq!(on(guarded.into(), doc! {"n": 4}), Bson::Double(0.25));
+        // A variable nothing reads at all.
+        let unread = doc! {"$let": {"vars": {"x": {"$size": "$name"}}, "in": 1}};
+        let (evaluated, answer) = counted(unread, doc! {"name": "text"});
+        assert_eq!(answer.unwrap(), Bson::Int32(1));
+        assert_eq!(evaluated, 0, "an unread variable is never evaluated");
+    }
+
+    /// A variable the body does read still fails the expression, with its own
+    /// error, and a second read fails the same way.
+    #[test]
+    fn a_let_variable_the_body_reads_still_fails_with_its_own_error() {
+        let read = doc! {"$let": {"vars": {"x": {"$size": "$name"}}, "in": "$$x"}};
+        let message = err(read, doc! {"name": "text"});
+        assert!(message.contains("$size needs an array"), "{message}");
+
+        // Read twice, in two arguments an `$or` holds: the request fails with
+        // the one error, and the second read gives the first one's words.
+        let twice = doc! {"$let": {"vars": {"x": {"$size": "$name"}}, "in": {
+            "$or": [{"$gt": ["$$x", 0]}, {"$lt": ["$$x", 0]}]
+        }}};
+        let (evaluated, answer) = counted(twice, doc! {"name": "text"});
+        assert_eq!(answer.unwrap_err().to_string(), message_of_size_error());
+        assert_eq!(evaluated, 2, "a failed evaluation is not kept, so each read tries again");
+    }
+
+    fn message_of_size_error() -> String {
+        err(doc! {"$size": "$name"}, doc! {"name": "text"})
+    }
+
+    /// A variable read many times is evaluated once.
+    #[test]
+    fn a_let_variable_is_evaluated_once_however_often_it_is_read() {
+        let thrice = doc! {"$let": {
+            "vars": {"a": {"$multiply": ["$qty", "$price"]}, "b": {"$add": ["$qty", 1]}},
+            "in": {"$add": ["$$a", "$$a", "$$a", "$$b"]},
+        }};
+        let (evaluated, answer) = counted(thrice, doc! {"qty": 2, "price": 5});
+        assert_eq!(answer.unwrap(), Bson::Int64(33));
+        assert_eq!(evaluated, 2, "one evaluation each for `a` and `b`");
+    }
+
+    /// When two variables would fail, the error is the first one read, not
+    /// the first one written.
+    #[test]
+    fn the_error_of_a_let_is_the_first_failing_variable_read() {
+        let vars = doc! {"a": {"$size": "$s"}, "b": {"$divide": [1, "$n"]}};
+        let d = doc! {"s": "text", "n": 0};
+        let a_then_b = doc! {"$let": {"vars": vars.clone(), "in": {"$add": ["$$a", "$$b"]}}};
+        assert!(err(a_then_b, d.clone()).contains("$size needs an array"));
+        let b_then_a = doc! {"$let": {"vars": vars, "in": {"$add": ["$$b", "$$a"]}}};
+        assert!(err(b_then_a, d).contains("divide by zero"));
+    }
+
+    /// A `$let` in the body of `$map`, `$filter` or `$reduce` has a frame per
+    /// element, so nothing a variable kept for one element reaches the next.
+    #[test]
+    fn a_let_in_an_array_operators_body_binds_afresh_for_each_element() {
+        let map = doc! {"$map": {"input": [1, 2, 3], "as": "e", "in": {"$let": {
+            "vars": {"y": {"$multiply": ["$$e", 10]}},
+            "in": {"$add": ["$$y", "$$y"]},
+        }}}};
+        let (evaluated, answer) = counted(map, doc! {});
+        assert_eq!(answer.unwrap(), bson::bson!([20_i64, 40_i64, 60_i64]));
+        assert_eq!(evaluated, 3, "one evaluation per element");
+
+        let filter = doc! {"$filter": {"input": [1, 2, 3, 4], "as": "e", "cond": {"$let": {
+            "vars": {"even": {"$eq": [{"$mod": ["$$e", 2]}, 0]}},
+            "in": "$$even",
+        }}}};
+        assert_eq!(on(filter.into(), doc! {}), bson::bson!([2, 4]));
+
+        let reduce = doc! {"$reduce": {"input": [1, 2, 3], "initialValue": 0, "in": {"$let": {
+            "vars": {"next": {"$add": ["$$value", "$$this"]}},
+            "in": "$$next",
+        }}}};
+        assert_eq!(on(reduce.into(), doc! {}), Bson::Int64(6));
+    }
+
+    /// A variable is bound to the scope around the `$let`, and so reads an
+    /// outer variable of the same name even when the body rebinds it, and an
+    /// inner `$let` over an unread failing outer variable is unaffected.
+    #[test]
+    fn a_let_variable_reads_the_scope_around_the_let_when_it_is_first_read() {
+        let expr = doc! {"$let": {"vars": {"x": 1}, "in": {"$let": {
+            "vars": {"x": {"$add": ["$$x", 10]}, "z": {"$size": "$name"}},
+            "in": "$$x",
+        }}}};
+        assert_eq!(on(expr.into(), doc! {"name": "text"}), Bson::Int64(11));
+    }
+
+    /// `n` nested `$let`s, each variable's expression `depth` `$add`s deep over the
+    /// variable before it, and the innermost body reading the last.
+    fn let_chain(n: usize, depth: usize) -> Bson {
+        let mut body = Bson::String(format!("$$v{n}"));
+        for k in (1..=n).rev() {
+            let mut variable =
+                if k == 1 { Bson::Int32(1) } else { Bson::String(format!("$$v{}", k - 1)) };
+            for _ in 0..depth {
+                variable = Bson::Document(doc! {"$add": [variable, 1]});
+            }
+            body = Bson::Document(doc! {"$let": {"vars": {format!("v{k}"): variable}, "in": body}});
+        }
+        body
+    }
+
+    fn nesting_of(value: &Bson) -> usize {
+        match value {
+            Bson::Document(d) => 1 + d.values().map(nesting_of).max().unwrap_or(0),
+            Bson::Array(a) => 1 + a.iter().map(nesting_of).max().unwrap_or(0),
+            _ => 0,
+        }
+    }
+
+    /// ADR-219: a variable is evaluated where the body reads it, so a chain of
+    /// variables that read variables stands on the stack of every one of them. A
+    /// request body is held to 128 levels (`serde_json`'s recursion limit); the
+    /// worst chain that allows is built here, thirty-two `$let`s each variable
+    /// `$add`s deep to the levels the request has left, which needed between 1 and
+    /// 2 MiB in a release build before the stack grew. It runs on a thread whose
+    /// stack is smaller than that (256 KiB in a release build, 4 MiB in a debug
+    /// build, whose frames are about ten times larger), and must finish: the stack
+    /// grows onto the heap when it runs low. Run in a child process, so that a
+    /// stack that does not grow aborts a child and fails this test and not the
+    /// suite.
+    #[test]
+    fn the_worst_chain_of_variables_the_limit_allows_runs_on_a_small_stack() {
+        const N: usize = 32;
+        let run = || {
+            let depth = (128 - nesting_of(&let_chain(N, 0))) / 2;
+            let chain = let_chain(N, depth);
+            assert!(nesting_of(&chain) <= 128, "a legal request: {}", nesting_of(&chain));
+            let expr = Expr::parse(&chain).unwrap();
+            let stack = if cfg!(debug_assertions) { 4 << 20 } else { 256 << 10 };
+            let answer = std::thread::Builder::new()
+                .stack_size(stack)
+                .spawn(move || expr.eval(&Document::new()))
+                .unwrap()
+                .join()
+                .unwrap();
+            assert_eq!(answer.unwrap(), Bson::Int64((N * depth + 1) as i64));
+        };
+        if std::env::var_os("KIMMY_STACK_PROBE").is_some() {
+            run();
+            println!("STACK_PROBE_FINISHED");
+            return;
+        }
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "expr::tests::the_worst_chain_of_variables_the_limit_allows_runs_on_a_small_stack",
+                "--nocapture",
+            ])
+            .env("KIMMY_STACK_PROBE", "1")
+            .output()
+            .unwrap();
+        let said = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            output.status.success() && said.contains("STACK_PROBE_FINISHED"),
+            "the chain did not finish on a small stack ({}): {}",
+            output.status,
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    /// There is no limit on how far variables are read through each other: forty
+    /// `$let`s, each variable reading the one before, answer as the same
+    /// expression did when every variable was evaluated first; and a hundred
+    /// variables read one after another are fine too.
+    #[test]
+    fn variables_read_through_each_other_are_not_limited() {
+        assert_eq!(ok(let_chain(40, 1)), Bson::Int64(41));
+        let mut vars = Document::new();
+        let mut sum = Vec::new();
+        for i in 0..100 {
+            vars.insert(format!("w{i}"), doc! {"$add": [i, 1]});
+            sum.push(Bson::String(format!("$$w{i}")));
+        }
+        let wide = doc! {"$let": {"vars": vars, "in": {"$add": sum}}};
+        assert_eq!(ok(wide.into()), Bson::Int64((1..=100).sum::<i64>()));
+    }
+
+    /// A `$let` outside a `$map` whose variable reads the document is evaluated
+    /// once for all the elements that read it, and every element sees the one
+    /// value.
+    #[test]
+    fn a_variable_outside_a_map_is_evaluated_once_for_every_element() {
+        let expr = doc! {"$let": {"vars": {"t": {"$add": ["$$ROOT.a", "$b"]}}, "in": {
+            "$map": {"input": [1, 2, 3], "in": {"$multiply": ["$$this", "$$t"]}}
+        }}};
+        let (evaluated, answer) = counted(expr, doc! {"a": 2, "b": 3});
+        assert_eq!(answer.unwrap(), bson::bson!([5_i64, 10_i64, 15_i64]));
+        assert_eq!(evaluated, 1);
+    }
+
+    /// A variable sees the `$$this` of the scope around its `$let`, though the
+    /// body that reads it sits under a `$map` that rebinds `$$this`.
+    #[test]
+    fn a_variable_reads_its_own_this_under_a_map_that_rebinds_it() {
+        let expr = doc! {"$map": {"input": [10, 20], "in": {"$let": {
+            "vars": {"x": "$$this"},
+            "in": {"$map": {"input": [1, 2], "in": {"$add": ["$$x", "$$this"]}}},
+        }}}};
+        assert_eq!(on(expr.into(), doc! {}), bson::bson!([[11_i64, 12_i64], [21_i64, 22_i64]]));
     }
 
     #[test]

@@ -23333,6 +23333,9 @@ and the MCP tools.
   reads `r`. Making bindings call-by-need is a change to `Scope` and its own
   question, recorded for a later release.
 
+  > **Amended by [ADR-219](#adr-219--a-let-variable-is-evaluated-when-its-body-first-reads-it).**
+  > `$let` now binds by need, so this case answers `0`.
+
 **Cost.** With nothing failing, the work is never more than before, and less
 whenever an argument decides before the last: the old path evaluated every
 argument. After an error, the scan goes on to the argument that decides, or to
@@ -25137,3 +25140,140 @@ The heartbeat writes a subscription's progress once per interval when the window
 tail: its own write leaves this node's origin one entry behind, which used to draw a second
 write. A window short of the tail is walked on the next pass, and what carries it there is the
 position the pass records, so no wait applies to it.
+
+## ADR-219 — A `$let` variable is evaluated when its body first reads it
+
+> **Amends [ADR-211](#adr-211--an-expressions-and-and-or-fail-only-when-the-answer-depends-on-an-argument-that-cannot-be-evaluated)**,
+> its paragraph "Known, and not changed here: `$let` binds its variables
+> eagerly".
+
+**Status:** accepted, for the next `0.MINOR`. No rollback boundary: nothing
+stored or sent changes, and a build that predates it refuses the requests this
+one answers.
+
+**The defect.** `$let` evaluated every variable, in the order written, before
+it evaluated its body, whether the body read the variable or not. A variable
+that could not be evaluated therefore failed the expression even when the body
+never needed it:
+
+```json
+{"$let": {"vars": {"r": {"$divide": [1, "$n"]}},
+          "in":   {"$cond": [{"$eq": ["$n", 0]}, 0, "$$r"]}}}
+```
+
+failed over `{n: 0}` with `$divide by zero`, though the branch that reads `r`
+is the one the guard rules out. That is ADR-206's and ADR-211's rule broken one
+level up: a request should fail exactly when its answer depends on something
+that cannot be evaluated, and here the answer, `0`, depends on no such thing.
+The `$cond` spelled with the division inline answered `0`; the `$let` spelling
+of the same question failed.
+
+**Decision.**
+
+- **A variable is evaluated on its first read.** The expression is evaluated in
+  the scope around the `$let`, as before, so a variable still sees the
+  enclosing scope and not its siblings (`{a: 1, b: "$$a"}` is still refused at
+  parse), and a variable that rebinds an outer name reads the outer one in its
+  own expression. One the body never reads is never evaluated and cannot fail
+  the expression.
+- **The value is kept for the reads after.** A variable read many times is
+  evaluated once, per evaluation of the `$let`: each document, and each element
+  of a `$map`, `$filter` or `$reduce` body that holds a `$let`, evaluates the
+  `$let` afresh and binds afresh, so nothing carries from one to the next.
+- **A failed evaluation is not kept.** A read that fails returns the failure
+  and stores nothing, so a second read of the same variable evaluates again and
+  fails with the same error. This matters only where a failure is set aside
+  (an argument of `$and` or `$or` that another argument decides, ADR-211) and
+  the variable is then read again; the expression is pure, so the repeat gives
+  the same words.
+- **When two variables would fail, the error is the first one read.** It was the
+  first one written. A body that reads `b` before `a` reports `b`'s failure. The
+  message of a failure is unchanged.
+- **The stack grows when a variable is evaluated with little left.** A variable
+  is evaluated where the body reads it, on top of the stack that read it, so a
+  variable read deep in a body that is itself deep stands on both, and a chain of
+  `$let`s each variable reading the one before stands on all of them. A request
+  body is held to 128 levels of nesting (`serde_json`'s recursion limit decodes
+  every JSON route), which bounded what an eager `$let` used; lazily, the depths
+  of the expressions in a chain add. Built to the limit (about thirty-two `$let`s,
+  each variable's expression `$add`s deep to the levels the request has left) the
+  worst chain needed between 1 and 2 MiB of a runtime worker's 2 MiB stack in a
+  release build, against about 128 KiB for the deepest eager `$let`: it did not
+  overflow, with a margin under two, and a debug build, whose frames are about ten
+  times larger, overflowed 2 MiB from four `$let`s. A stack overflow aborts the
+  process. So each evaluation of a variable runs under `stacker::maybe_grow`,
+  which, when less than 256 KiB of stack is left, runs it on a fresh 1 MiB
+  segment from the heap. The depth stays bounded by the same 128 levels, so the
+  growth does: the worst chain above takes at most two or three segments, about
+  3 MiB of heap for as long as the evaluation lasts, and the segments are
+  released when it returns. Nothing is refused for depth, and the 256 KiB is twice
+  the most one evaluation uses between two such checks (a debug build's constants
+  are ten times larger, by the same proportion). `stacker`, and `psm` under it,
+  assemble a few instructions per target with the `cc` that `ring` already brings
+  to the build, so `scripts/allowed-native-deps.txt` does not change.
+- **`$lookup`'s `let` is not changed.** Its values are bound once per input
+  document, as values, for a sub-pipeline that runs stages and not one
+  expression; it still evaluates every variable it declares, read or not. That
+  frame is a separate decision.
+
+**Why no answer that succeeded changes.** An evaluation that succeeded
+eagerly succeeds by need and gives the same answer, because an expression of
+this language is a pure function of the document and the variables in scope.
+That was checked in the code and not assumed: the language has no random
+operator, no clock, no counter and no identifier generator (the operators are
+arithmetic, string, comparison, boolean, date-part extraction from a value it
+is given, array, set, object and `$convert`), `$$NOW`, `$$CLUSTER_TIME` and the
+other system variables are refused at parse, and `$$ROOT` and `$$CURRENT` are
+the one document under evaluation. Evaluating a variable later, or once, or
+not at all, can therefore not change a value that is read. What changes is only
+which requests fail: those that failed because of a variable nothing read now
+answer.
+
+**Cost.** Never more time than before, and less whenever a variable is unread; the
+deepest chain the request limit allows holds up to about 3 MiB of heap while it
+runs, freed on return. A `$group`
+accumulator over 100,000 documents with a `$let` of three variables,
+the body reading all of them twice, took 54 to 57 ms before and 56 ms after (a
+release build on one machine, the median of seven runs, two rounds each), and
+the same with the body reading one of the three took 44 to 47 ms before and 30
+ms after. Reading a variable allocates nothing beyond the copy of its value that
+a read always made. A `$let` allocates one frame of its variables where it
+allocated two, and each variable holds one cell for its value.
+
+**Rejected.**
+
+- *Keep the failure of an unread variable.* It is the defect.
+- *Keep a failed evaluation's error.* The error type is not clonable, and the
+  only reader that could tell is a deferred error read twice, which is pure.
+- *Evaluate in the order written up to the last variable the body reads.* It
+  keeps the old error order and the old cost for nothing.
+- *Lazy `$lookup` `let`.* Its frame holds values the sub-pipeline's stages
+  borrow; changing that is the `$lookup` frames' own item.
+
+**Caller-visible.** Requests that answered `400` for a variable nothing read
+answer `200`; the CHANGELOG lists it under Changed, not Breaking, since no
+answer that was given is different.
+
+### Test
+
+`kimmy-query`: the guarded `$divide` answers `0` over `n: 0` and `0.25` over
+`n: 4`; a variable nothing reads is never evaluated (counted); a variable the
+body reads still fails with its own error, and read twice under an `$or` it
+gives the same words and is tried twice; a variable read many times is
+evaluated once (counted); with two failing variables the error is the one read
+first, in both orders; a `$let` in a `$map`, `$filter` and `$reduce` body binds
+afresh for each element (counted: one evaluation per element); a variable
+reads the scope around the `$let`; `$lookup`'s `let` still fails on a variable
+nothing reads; the worst chain a 128-level request allows (thirty-two `$let`s)
+finishes on a thread with 256 KiB of stack (4 MiB in a debug build) in a child
+process, so that a stack that did not grow would abort the child and fail the test
+and not the suite; forty `$let`s and a hundred variables read in turn are not
+limited; a variable outside a `$map` is
+evaluated once for every element; a variable reads its own `$$this` under a
+`$map` that rebinds it; and the existing nesting, shadowing and 50,000-variable
+bisection tests are unchanged. `kimmy-api`: the guarded example through
+`aggregate`'s `$project` answers `200`, and unguarded answers `400`. Five
+mutation rows each fail a named test: variables bound eagerly (five tests),
+no memo (two tests), a memo shared across frames (the `$map` test), `$lookup`'s
+`let` ignoring a failure (its test) and the evaluation run without `maybe_grow`
+(the chain test, whose child aborts, in a debug and in a release build).

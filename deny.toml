@@ -97,6 +97,11 @@ allow = [
     "Unlicense",
     "CDLA-Permissive-2.0",
     "MPL-2.0",
+    # Apache-2.0 with an exception that lifts the attribution duty for the
+    # compiled output: more permissive than Apache-2.0, which is already on
+    # the list. `ar_archive_writer`, a build dependency of `psm`, under
+    # `stacker`, which the expression evaluator grows its stack with (ADR-219).
+    "Apache-2.0 WITH LLVM-exception",
 ]
 # The workspace's own license, permitted for the workspace's own crates by
 # name and for nothing else: a third-party AGPL crate is refused like any

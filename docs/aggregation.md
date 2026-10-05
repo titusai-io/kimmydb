@@ -350,8 +350,9 @@ The result is always a boolean. Evaluation stops at the argument that decides,
 so writing the cheap guard first gives the same answer with less work. This
 holds wherever an expression is evaluated: a `$match`'s `$expr`, `$project`,
 `$addFields`, `$group`, `$filter`'s `cond`, a `$lookup`'s `let` and the rest. An error that is not
-about a value, a bug in the server, is never held back this way. `$let` still
-evaluates every variable before its body, whether the body reads it or not.
+about a value, a bug in the server, is never held back this way. `$let` binds
+by need ([ADR-219](decisions.md)): a variable that cannot be evaluated fails the
+expression only if the body reads it.
 
 **Null propagates; a type violation refuses.** `{$add: ["$typo", 1]}` is null
 because a missing field is null. `{$add: ["text", 1]}` is a 400. Returning null
@@ -416,7 +417,13 @@ would silently yield null in every row. MongoDB's other system variables —
 says they are unsupported rather than misspelled.
 
 **`$let` values see the enclosing scope, not each other.** `{vars: {a: 1, b:
-"$$a"}}` is refused; nest a second `$let` to build on the first. **A user
+"$$a"}}` is refused; nest a second `$let` to build on the first. **A `$let`
+variable is evaluated when the body first reads it** ([ADR-219](decisions.md)),
+once, and not at all if nothing reads it: `{$let: {vars: {r: {$divide: [1,
+"$n"]}}, in: {$cond: [{$eq: ["$n", 0]}, 0, "$$r"]}}}` answers `0` over `n: 0`.
+When two variables would fail, the error is the one the body read first, not the
+one written first. A `$lookup` `let` is not lazy: it evaluates every variable it
+declares, for each input document. **A user
 variable name** starts with a lowercase letter and continues with letters,
 digits and underscores — MongoDB's rule, which also keeps user names from ever
 colliding with the uppercase system ones.
