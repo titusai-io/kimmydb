@@ -1968,6 +1968,7 @@ async fn p11_a_yield_the_refusing_peer_never_confirms_keeps_the_owner_owning() {
     let target = (0..nodes.len()).find(|i| *i != owner && *i != refusing).unwrap();
     let others = [refusing, target];
     let refusing_id = nodes[refusing].node_id(&client).await.to_string();
+    let target_id = nodes[target].node_id(&client).await.to_string();
     nodes[refusing].restart(false, &[SCALE, ("KIMMY_TEST_REFUSE_SYNC", "1")]);
     nodes[refusing].wait_ready(&client).await;
     nodes[owner].restart(false, &[SCALE, ("KIMMY_TEST_KILL_TASK", "ttl_expiry:stall")]);
@@ -2011,6 +2012,26 @@ async fn p11_a_yield_the_refusing_peer_never_confirms_keeps_the_owner_owning() {
     // Control: the other peer did read it and confirmed, so the one unconfirmed peer
     // is exactly the refusing one.
     assert_eq!(nodes[others[1]].unconfirmed(&client, "ttl").await, Some(0.0));
+    // And the WARN never named it: a current-version peer that echoes within a
+    // sync round or two is not "a peer that has not echoed", and the first WARN
+    // for a peer waits a lease for exactly that. This is a guard, not the red
+    // proof: whether the first sweep beats the echo is a race (it went red in one
+    // of five runs with the grace removed), and the proof is
+    // `a_sweep_before_any_echo_names_nobody_and_later_only_the_peer_that_never_echoes`
+    // in `kimmy-cluster`, which drives that order. The positive controls are the
+    // WARN that did name the refusing peer, over the same log, and the target's
+    // confirmation just above.
+    let warns: Vec<String> = nodes[owner]
+        .log()
+        .lines()
+        .filter(|l| l.contains("has not echoed this member's block"))
+        .map(str::to_owned)
+        .collect();
+    assert!(warns.iter().any(|l| l.contains(&refusing_id)), "control: the refusing peer is named");
+    assert!(
+        !warns.iter().any(|l| l.contains(&target_id)),
+        "a peer that echoed was named as one that has not: {warns:?}"
+    );
     assert_eq!(nodes[owner].series(&client, "kimmy_yielding{class=\"ttl\"}").await, Some(1.0));
     assert_eq!(nodes[owner].unconfirmed(&client, "ttl").await, Some(1.0));
     // Controls: the refusing peer is live (SWIM), and its refusal is armed.

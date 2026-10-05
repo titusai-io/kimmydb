@@ -1082,28 +1082,16 @@ pub async fn replicate(engine: Arc<Engine>, config: ReplicationConfig) {
                         apply_facts_read(members, &mut stalls);
                     }
                     if let Some(members) = &config.members {
-                        let mut waiting = Vec::new();
-                        for class in crate::facts::OwnerClass::ALL {
-                            for peer in members.unconfirmed_peers(class) {
-                                waiting.push((class, peer));
-                                if unconfirmed_warned.due(
-                                    class,
-                                    peer,
-                                    Instant::now(),
-                                    crate::health::WARN_INTERVAL,
-                                ) {
-                                    warn!(
-                                        class = class.label(),
-                                        %peer,
-                                        "a peer has not echoed this member's block, which says it \
-                                         yields the class; this member keeps owning the class \
-                                         until every live peer has echoed it (an older version \
-                                         never does)"
-                                    );
-                                }
-                            }
+                        for (class, peer) in unconfirmed_warned.sweep(members, Instant::now()) {
+                            warn!(
+                                class = class.label(),
+                                %peer,
+                                "a peer has not echoed this member's block, which says it \
+                                 yields the class; this member keeps owning the class \
+                                 until every live peer has echoed it (an older version \
+                                 never does)"
+                            );
                         }
-                        unconfirmed_warned.retain(&waiting);
                         // A live peer heard from not at all keeps this member
                         // owning that peer's webhook and embedding share too.
                         for peer in members.unheard_beyond_lease(Instant::now()) {
