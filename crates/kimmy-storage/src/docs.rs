@@ -247,6 +247,14 @@ impl WriteScope<'_> {
     }
 }
 
+/// An insert that has passed every check and is not yet written: its id, its
+/// key and its encoded body.
+struct CheckedInsert {
+    id: DocId,
+    key: Vec<u8>,
+    body: Vec<u8>,
+}
+
 impl Engine {
     // -----------------------------------------------------------------------
     // Reads
@@ -480,15 +488,34 @@ impl Engine {
         }
 
         let txn = self.begin_write(WriterHolder::Bulk).map_err(BulkInsertError::transaction)?;
-        let mut ids = Vec::with_capacity(docs.len());
-        let mut entries = Vec::with_capacity(docs.len());
 
+        // First every document is checked, in order, against the stored state
+        // and against the ones before it in the batch, and filed in the
+        // indexes: all that can refuse it. Nothing is minted until the whole
+        // batch is certain, so a batch that fails at a later document leaves
+        // the clock where it was, as a lone refused insert does.
+        let mut seen = std::collections::HashSet::with_capacity(docs.len());
+        let mut pending = Vec::with_capacity(docs.len());
         for (index, doc) in docs.into_iter().enumerate() {
             // Each document is checked against this transaction's own
             // uncommitted writes, so two documents colliding *within* the batch
             // are caught by exactly the checks that catch a collision with
-            // stored state — redb reads see the writes of their own txn.
-            match self.insert_in_txn(&txn, coll, doc) {
+            // stored state — redb reads see the writes of their own txn, and
+            // the ids seen so far stand in for the records not yet written.
+            match self.check_insert(&txn, coll, doc, Some(&mut seen)) {
+                Ok(checked) => pending.push(checked),
+                Err(source) => {
+                    txn.abort().map_err(BulkInsertError::transaction)?;
+                    return Err(BulkInsertError { index: Some(index), source });
+                }
+            }
+        }
+
+        // Then each is written, and takes its own stamp, in submission order.
+        let mut ids = Vec::with_capacity(pending.len());
+        let mut entries = Vec::with_capacity(pending.len());
+        for (index, checked) in pending.into_iter().enumerate() {
+            match self.write_insert(&txn, coll, checked) {
                 Ok((id, entry)) => {
                     ids.push((id, entry.stamp));
                     entries.push(entry);
@@ -517,6 +544,22 @@ impl Engine {
         coll: &CollectionMeta,
         doc: Document,
     ) -> Result<(DocId, OplogEntry)> {
+        let checked = self.check_insert(txn, coll, doc, None)?;
+        self.write_insert(txn, coll, checked)
+    }
+
+    /// The half of an insert that can refuse it: the id, the stored state, the
+    /// ids earlier in the same batch (`seen`, when there is one) and the
+    /// indexes, filed in the transaction. Nothing is minted, written to the
+    /// document table or logged, so a refusal leaves the clock alone and an
+    /// abort discards the index entries with the rest.
+    fn check_insert(
+        &self,
+        txn: &WriteTxn<'_>,
+        coll: &CollectionMeta,
+        doc: Document,
+        seen: Option<&mut std::collections::HashSet<Vec<u8>>>,
+    ) -> Result<CheckedInsert> {
         // The value the client wrote is kept as written, so an `Int32` id
         // stays an `Int32` rather than passing through `DocId` and back.
         let (id, id_value) = match doc.get(ID_FIELD) {
@@ -532,21 +575,43 @@ impl Engine {
         let key = doc_key(&id)?;
         let body = bson::serialize_to_vec(&doc)?;
 
-        let stamp = {
-            let mut docs = txn.open_table(tables::DOCS)?;
-            // A tombstone may still occupy the key; overwriting it is a
-            // legitimate resurrection, but a live document is a conflict.
-            let occupied = match docs.get((coll.id.0, key.as_slice()))? {
+        // A tombstone may still occupy the key; overwriting it is a
+        // legitimate resurrection, but a live document is a conflict.
+        let occupied = {
+            let docs = txn.open_table(tables::DOCS)?;
+            match docs.get((coll.id.0, key.as_slice()))? {
                 Some(raw) => codec::decode_doc_record(raw.value())?.is_live(),
                 None => false,
-            };
-            if occupied {
-                return Err(CoreError::DuplicateKey(id.to_string()).into());
             }
-            // Minted once the write is certain to be made, under the writer
-            // (ADR-148): a refused insert is not an event, so it does not tick
-            // the clock.
-            let stamp = self.next_stamp();
+        };
+        if occupied || seen.is_some_and(|seen| !seen.insert(key.clone())) {
+            return Err(CoreError::DuplicateKey(id.to_string()).into());
+        }
+
+        // Same transaction as the document write, so the index cannot describe
+        // a state that never existed. A unique violation returns here, before
+        // anything is minted, and the caller aborts, which discards the index
+        // entries with the rest.
+        let newly_multikey = index::maintain(self, txn, coll, None, Some(&doc), &key)?;
+        index::mark_multikey(txn, &coll.db, &coll.name, &newly_multikey)?;
+        Ok(CheckedInsert { id, key, body })
+    }
+
+    /// The half of an insert that writes: the stamp, the record and the oplog
+    /// entry, for a document [`Self::check_insert`] has passed.
+    fn write_insert(
+        &self,
+        txn: &WriteTxn<'_>,
+        coll: &CollectionMeta,
+        checked: CheckedInsert,
+    ) -> Result<(DocId, OplogEntry)> {
+        let CheckedInsert { id, key, body } = checked;
+        // Minted once the write is certain to be made, under the writer
+        // (ADR-148): a refused insert is not an event, so it does not tick
+        // the clock.
+        let stamp = self.next_stamp();
+        {
+            let mut docs = txn.open_table(tables::DOCS)?;
             let record = DocRecord::live(stamp, body.clone());
             crate::live_count::put_record(
                 txn,
@@ -555,14 +620,7 @@ impl Engine {
                 &key,
                 &codec::encode_doc_record(&record),
             )?;
-            stamp
-        };
-
-        // Same transaction as the document write, so the index cannot describe
-        // a state that never existed. A unique violation returns here and the
-        // caller aborts, which discards the document write with it.
-        let newly_multikey = index::maintain(self, txn, coll, None, Some(&doc), &key)?;
-        index::mark_multikey(txn, &coll.db, &coll.name, &newly_multikey)?;
+        }
 
         let entry = OplogEntry {
             stamp,
@@ -655,7 +713,7 @@ impl Engine {
     ) -> Result<(WriteOutcome, Option<OplogEntry>)> {
         let key = doc_key(id)?;
 
-        let (existed, previous, stamp, doc, body) = {
+        let (existed, stamp, body) = {
             let mut docs = txn.open_table(tables::DOCS)?;
             // The id is part of the document's identity, not its content: a
             // replace must not be able to move a document to a different
@@ -700,6 +758,14 @@ impl Engine {
                 return Ok((unchanged, None));
             }
 
+            // Same transaction as the document write, so the index cannot
+            // describe a state that never existed. A unique violation returns
+            // here, before anything is minted, and the caller aborts, which
+            // discards the index entries with the rest.
+            let newly_multikey =
+                index::maintain(self, txn, coll, previous.as_ref(), Some(&doc), &key)?;
+            index::mark_multikey(txn, &coll.db, &coll.name, &newly_multikey)?;
+
             // Minted only once there is something to write, and still under
             // the writer (ADR-148).
             let stamp = self.next_stamp();
@@ -711,14 +777,8 @@ impl Engine {
                 &key,
                 &codec::encode_doc_record(&record),
             )?;
-            (existed, previous, stamp, doc, body)
+            (existed, stamp, body)
         };
-
-        // Same transaction as the document write, so the index cannot describe
-        // a state that never existed. A unique violation returns here and the
-        // caller aborts, which discards the document write with it.
-        let newly_multikey = index::maintain(self, txn, coll, previous.as_ref(), Some(&doc), &key)?;
-        index::mark_multikey(txn, &coll.db, &coll.name, &newly_multikey)?;
 
         let entry = OplogEntry {
             stamp,
@@ -2973,6 +3033,132 @@ mod tests {
         assert!(engine.delete(&coll, &DocId::Int64(1)).unwrap());
         let clock = engine.clock_last();
         engine.insert(&coll, doc! {"_id": 1_i64, "back": true}).unwrap();
+        assert!(engine.clock_last() > clock);
+    }
+
+    /// A batch is all or nothing, so a document that fails after earlier ones
+    /// in it passed leaves the clock where it was: nothing is minted until the
+    /// whole batch is certain. The failure may be a stored id, an id repeated
+    /// inside the batch, or a unique index, and it may be the last document.
+    #[test]
+    fn a_batch_that_fails_at_a_later_document_mints_nothing() {
+        let (engine, _coll, _dir) = engine();
+        engine
+            .create_index(
+                "app",
+                "docs",
+                vec![crate::meta::IndexField::ascending("email")],
+                true,
+                None,
+            )
+            .unwrap();
+        let coll = engine.get_collection("app", "docs").unwrap();
+        engine.insert(&coll, doc! {"_id": 1_i64, "email": "held@x.com"}).unwrap();
+        let (commits, oplog, clock) =
+            (engine.commits(), engine.oplog_entries().unwrap(), engine.clock_last());
+        let mut rx = engine.subscribe();
+
+        let batches: [(&str, Vec<Document>, usize); 3] = [
+            (
+                "a stored id",
+                vec![
+                    doc! {"_id": 10_i64, "email": "u10@x.com"},
+                    doc! {"_id": 11_i64, "email": "u11@x.com"},
+                    doc! {"_id": 1_i64, "email": "u1@x.com"},
+                ],
+                2,
+            ),
+            (
+                "an id repeated in the batch",
+                vec![
+                    doc! {"_id": 20_i64, "email": "u20@x.com"},
+                    doc! {"_id": 21_i64, "email": "u21@x.com"},
+                    doc! {"_id": 20_i64, "email": "u20@x.com"},
+                ],
+                2,
+            ),
+            (
+                "a unique value held by a stored document",
+                vec![
+                    doc! {"_id": 30_i64, "email": "a@x.com"},
+                    doc! {"_id": 31_i64, "email": "held@x.com"},
+                ],
+                1,
+            ),
+        ];
+        for (what, batch, at) in batches {
+            let err = engine.insert_many(&coll, batch).expect_err(what);
+            assert_eq!(err.index, Some(at), "{what}: the caller is told which document to fix");
+            assert_eq!(engine.clock_last(), clock, "{what}: no stamp minted");
+        }
+        // A unique value repeated inside the batch.
+        let err = engine
+            .insert_many(
+                &coll,
+                vec![
+                    doc! {"_id": 40_i64, "email": "b@x.com"},
+                    doc! {"_id": 41_i64, "email": "b@x.com"},
+                ],
+            )
+            .expect_err("a unique value repeated in a batch");
+        assert!(matches!(err.source, StorageError::Core(CoreError::UniqueViolation { .. })));
+        assert_eq!(err.index, Some(1));
+
+        assert_eq!(engine.clock_last(), clock, "no stamp minted");
+        assert_eq!(engine.oplog_entries().unwrap(), oplog, "nothing logged");
+        assert_eq!(engine.commits(), commits, "nothing committed");
+        assert!(rx.try_recv().is_err(), "nothing published");
+        for id in [10, 11, 20, 21, 30, 31, 40, 41] {
+            assert!(engine.get(&coll, &DocId::Int64(id)).unwrap().is_none(), "{id} was kept");
+        }
+
+        // A batch that is certain still mints once per document, in order.
+        let stamped = engine
+            .insert_many_stamped(
+                &coll,
+                vec![
+                    doc! {"_id": 50_i64, "email": "u50@x.com"},
+                    doc! {"_id": 51_i64, "email": "u51@x.com"},
+                ],
+            )
+            .unwrap();
+        assert_eq!(stamped.len(), 2);
+        assert!(clock < stamped[0].1.hlc && stamped[0].1.hlc < stamped[1].1.hlc);
+        assert_eq!(engine.clock_last(), stamped[1].1.hlc);
+    }
+
+    /// A single write a unique index refuses does not tick the clock either: an
+    /// insert, a replace and an upsert.
+    #[test]
+    fn a_write_a_unique_index_refuses_mints_nothing() {
+        let (engine, _coll, _dir) = engine();
+        engine
+            .create_index(
+                "app",
+                "docs",
+                vec![crate::meta::IndexField::ascending("email")],
+                true,
+                None,
+            )
+            .unwrap();
+        let coll = engine.get_collection("app", "docs").unwrap();
+        engine.insert(&coll, doc! {"_id": 1_i64, "email": "a@x.com"}).unwrap();
+        engine.insert(&coll, doc! {"_id": 2_i64, "email": "b@x.com"}).unwrap();
+        let (commits, oplog, clock) =
+            (engine.commits(), engine.oplog_entries().unwrap(), engine.clock_last());
+        let mut rx = engine.subscribe();
+
+        assert!(engine.insert(&coll, doc! {"_id": 3_i64, "email": "a@x.com"}).is_err());
+        assert!(engine.replace(&coll, &DocId::Int64(2), doc! {"email": "a@x.com"}, false).is_err());
+        assert!(engine.replace(&coll, &DocId::Int64(4), doc! {"email": "a@x.com"}, true).is_err());
+
+        assert_eq!(engine.clock_last(), clock, "no stamp minted");
+        assert_eq!(engine.oplog_entries().unwrap(), oplog, "nothing logged");
+        assert_eq!(engine.commits(), commits, "nothing committed");
+        assert!(rx.try_recv().is_err(), "nothing published");
+
+        // The write that is allowed still mints once.
+        engine.replace(&coll, &DocId::Int64(2), doc! {"email": "c@x.com"}, false).unwrap();
         assert!(engine.clock_last() > clock);
     }
 
