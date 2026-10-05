@@ -25010,6 +25010,22 @@ member it had read as the owner while the other two were still catching up.
     class look stalled and the member yield, and time spent at the writer's gate is
     by design never a stall.
 
+39. **The unconfirmed-peer `WARN` waits a lease for a peer first.** *Design:* a
+    `WARN` names a live peer that has not echoed the block, said once per five
+    minutes per class and peer. *Built:* the first `WARN` for a class and peer
+    waits until that wait has been seen for the member's lease (at least
+    `ceil((N - 1) / fanout) + 2` sync intervals), counted from the first sweep that
+    sees the peer unconfirmed and restarted when the peer is confirmed or the
+    yield is set again at a higher generation; then it is said at most once per
+    five minutes as before. *Why:* the echo comes on the peer's next request or in
+    this member's reply, so the first sweep after an advertise, which came a
+    fraction of a second after it, named a healthy current peer on every yield,
+    and an operator reads that as an old or broken peer. A lease is the time a live
+    peer's facts must be refreshed in anyway, so a peer still unconfirmed after it
+    is the one worth naming. `kimmy_yield_unconfirmed_peers` is unchanged and
+    counts at once. The refusing-peer test also asserts that the confirming target
+    is never named.
+
 ### Test
 
 `kimmy-cluster`: the evaluator as a pure state machine (the verdicts, void ticks

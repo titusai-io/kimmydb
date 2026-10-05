@@ -101,7 +101,10 @@ breaking changes and says so here; a `0.x.PATCH` bump never does.
   begins with every class yielded, so a node in a full-disk restart loop stops
   holding its share. A stuck writer is not detected yet. A member that sends
   nothing is treated as before, so a cluster with 0.43.0 members works, with the
-  yielder owning until none is live. New series, all in Operations:
+  yielder owning until none is live. A `WARN` names a live peer that has not
+  echoed the block only once it has been waited on for a lease, so a current
+  peer that confirms within a sync round or two is never named. New series, all
+  in Operations:
   `kimmy_owner_class_state`, `kimmy_owner_class_owned`, `kimmy_yielding`,
   `kimmy_yield_transitions_total`, `kimmy_yield_suppressed`,
   `kimmy_yield_observations_total`, `kimmy_yield_evaluator_ticks_total`,

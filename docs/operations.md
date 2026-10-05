@@ -934,7 +934,12 @@ echoed the block back and its own live set has held still for a lease, so
 peer is not confirming: an older version (it never does, so a mixed cluster
 keeps the member owning until none is live), a peer whose replication contacts
 fail while SWIM stays up, or a peer whose blocks do not decode. Both members own
-the class meanwhile, which is a duplicate and never a gap.
+the class meanwhile, which is a duplicate and never a gap. The member logs a
+`WARN` naming each such peer, but only once it has waited on that peer for a
+lease, and then at most once per five minutes: a peer that runs this version
+confirms within a sync round or two, so a peer named in it is one that is not
+confirming, not one that is slow to. The gauge does not wait; it reads the
+peers not yet confirmed at once.
 
 **Why it does not yield.** A stalled class that is not yielding says why in
 `kimmy_yield_suppressed{class,reason}` and in a `WARN` once per class per five

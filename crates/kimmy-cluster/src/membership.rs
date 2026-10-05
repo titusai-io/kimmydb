@@ -696,6 +696,12 @@ impl Members {
         local.unconfirmed(class, &self.node_ids())
     }
 
+    /// The generation that set this member's yield of `class`, `None` while it
+    /// does not yield it: what [`Self::unconfirmed_peers`] waits for an echo of.
+    pub fn yield_generation(&self, class: OwnerClass) -> Option<u64> {
+        self.0.local.get()?.yield_generation(class)
+    }
+
     /// Record a block a peer sent, as if a contact had carried it now. For
     /// tests in crates that consume this set, whose point is what ownership does
     /// with what members say (ADR-201).

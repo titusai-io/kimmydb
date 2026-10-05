@@ -553,6 +553,11 @@ impl LocalFacts {
         }
     }
 
+    /// The generation that set `class`'s yield bit, `None` while it is not set.
+    pub(crate) fn yield_generation(&self, class: OwnerClass) -> Option<u64> {
+        self.state.lock().yield_gen.of(class)
+    }
+
     /// The peers among `live` that have not confirmed `class`'s yield: those that
     /// do not echo, and those whose echo is below the generation that first set
     /// the bit. Empty when the bit is not set.
@@ -764,28 +769,100 @@ pub(crate) fn take_undecodable() -> bool {
     LAST_UNDECODABLE.with(|flag| flag.replace(false))
 }
 
-/// Says once per interval, per class and peer, that a yielding member is still
-/// waiting on a peer that has not read its block.
+/// Says that a yielding member is waiting on a peer that has not read its block:
+/// not before `grace` has passed since it first saw the peer waiting, and then
+/// once per interval, per class and peer.
+///
+/// The grace is why a normal yield is silent. The echo of a block comes on the
+/// peer's next request or in this member's reply, so a live peer that runs the
+/// current version confirms within a sync round or two; saying so on the first
+/// sight would name a healthy peer on every yield. Only a peer still waiting
+/// after that is worth an operator's attention.
 #[derive(Default)]
 pub struct UnconfirmedWarn {
-    last: std::collections::HashMap<(OwnerClass, NodeId), Instant>,
+    seen: std::collections::HashMap<(OwnerClass, NodeId), Waiting>,
+}
+
+/// What is known of one (class, peer) that is waited on.
+struct Waiting {
+    /// The generation that set the class's yield bit: a re-yield is a new wait
+    /// and gets a new grace, even when the peer never left the waiting set.
+    generation: u64,
+    first_seen: Instant,
+    last_said: Option<Instant>,
 }
 
 impl UnconfirmedWarn {
-    /// Whether to say it now for `class` and `peer`.
-    pub fn due(&mut self, class: OwnerClass, peer: NodeId, now: Instant, every: Duration) -> bool {
-        match self.last.get(&(class, peer)) {
-            Some(at) if now.saturating_duration_since(*at) < every => false,
+    /// Whether to say it now for `class` and `peer`, waiting on `generation`: false
+    /// until `grace` has passed since the wait was first seen, then true, then
+    /// again each `every`.
+    pub fn due(
+        &mut self,
+        class: OwnerClass,
+        peer: NodeId,
+        generation: u64,
+        now: Instant,
+        grace: Duration,
+        every: Duration,
+    ) -> bool {
+        let waiting = self.seen.entry((class, peer)).or_insert(Waiting {
+            generation,
+            first_seen: now,
+            last_said: None,
+        });
+        if waiting.generation != generation {
+            *waiting = Waiting { generation, first_seen: now, last_said: None };
+        }
+        if now.saturating_duration_since(waiting.first_seen) < grace {
+            return false;
+        }
+        match waiting.last_said {
+            Some(at) if now.saturating_duration_since(at) < every => false,
             _ => {
-                self.last.insert((class, peer), now);
+                waiting.last_said = Some(now);
                 true
             }
         }
     }
 
-    /// Forget what is no longer waited on, so the map follows the cluster.
+    /// One sweep of `members`: the (class, peer) pairs to say now, and the map
+    /// brought up to date. The grace is a lease. The echo comes on the peer's
+    /// next request or in our reply, so a live peer on this version confirms
+    /// within the sync rounds that reach it, and a lease is at least
+    /// `ceil((N - 1) / fanout) + 2` intervals of exactly that; a peer that has not
+    /// echoed after a lease has not read the block in the time its own facts must
+    /// be refreshed in. Derived from the sync interval, so a faster test cluster
+    /// waits less. The first sweep after an advertise lists every live peer, as no
+    /// contact has yet carried the block; naming them would blame a healthy one on
+    /// every yield.
+    pub fn sweep(
+        &mut self,
+        members: &crate::membership::Members,
+        now: Instant,
+    ) -> Vec<(OwnerClass, NodeId)> {
+        let grace = members.lease();
+        let mut waiting = Vec::new();
+        let mut say = Vec::new();
+        for class in OwnerClass::ALL {
+            let peers = members.unconfirmed_peers(class);
+            // Read after the peers: a yield that cleared in between has no
+            // generation, and nobody is waited on.
+            let Some(generation) = members.yield_generation(class) else { continue };
+            for peer in peers {
+                waiting.push((class, peer));
+                if self.due(class, peer, generation, now, grace, crate::health::WARN_INTERVAL) {
+                    say.push((class, peer));
+                }
+            }
+        }
+        self.retain(&waiting);
+        say
+    }
+
+    /// Forget what is no longer waited on, so the map follows the cluster and a
+    /// later wait starts a fresh grace.
     pub fn retain(&mut self, waiting: &[(OwnerClass, NodeId)]) {
-        self.last.retain(|key, _| waiting.contains(key));
+        self.seen.retain(|key, _| waiting.contains(key));
     }
 }
 
@@ -1139,22 +1216,102 @@ mod tests {
         assert_eq!(members.unconfirmed_peers(OwnerClass::Ttl), vec![node(1), node(2)]);
     }
 
-    /// The unconfirmed-peer warning is said once per interval per class and peer.
+    /// The unconfirmed-peer warning waits out a grace, then is said once per
+    /// interval per class and peer.
     #[test]
     fn the_unconfirmed_warning_is_rate_limited_per_class_and_peer() {
         let mut warned = UnconfirmedWarn::default();
         let every = Duration::from_secs(300);
+        let grace = Duration::from_secs(20);
         let t0 = Instant::now();
-        assert!(warned.due(OwnerClass::Ttl, node(1), t0, every));
-        assert!(!warned.due(OwnerClass::Ttl, node(1), t0 + Duration::from_secs(10), every));
-        assert!(warned.due(OwnerClass::Ttl, node(2), t0, every), "another peer");
-        assert!(warned.due(OwnerClass::Webhooks, node(1), t0, every), "another class");
-        assert!(warned.due(OwnerClass::Ttl, node(1), t0 + every, every), "the interval passed");
-        warned.retain(&[(OwnerClass::Ttl, node(2))]);
+        let t1 = t0 + grace;
+        assert!(!warned.due(OwnerClass::Ttl, node(1), 1, t0, grace, every));
+        assert!(!warned.due(OwnerClass::Webhooks, node(1), 1, t0, grace, every));
+        assert!(!warned.due(OwnerClass::Ttl, node(2), 1, t0, grace, every));
+        assert!(warned.due(OwnerClass::Ttl, node(1), 1, t1, grace, every));
+        assert!(!warned.due(
+            OwnerClass::Ttl,
+            node(1),
+            1,
+            t1 + Duration::from_secs(10),
+            grace,
+            every
+        ));
+        assert!(warned.due(OwnerClass::Ttl, node(2), 1, t1, grace, every), "another peer");
+        assert!(warned.due(OwnerClass::Webhooks, node(1), 1, t1, grace, every), "another class");
         assert!(
-            warned.due(OwnerClass::Ttl, node(1), t0 + every, every),
-            "forgotten once not waited on"
+            warned.due(OwnerClass::Ttl, node(1), 1, t1 + every, grace, every),
+            "the interval passed"
         );
+    }
+
+    /// Never due within the grace, however often it is asked; due once at it.
+    #[test]
+    fn the_unconfirmed_warning_is_never_due_within_the_grace() {
+        let mut warned = UnconfirmedWarn::default();
+        let every = Duration::from_secs(300);
+        let grace = Duration::from_secs(20);
+        let t0 = Instant::now();
+        for s in 0..20 {
+            assert!(
+                !warned.due(OwnerClass::Ttl, node(1), 1, t0 + Duration::from_secs(s), grace, every),
+                "{s} s into a {grace:?} grace"
+            );
+        }
+        assert!(warned.due(OwnerClass::Ttl, node(1), 1, t0 + grace, grace, every));
+        assert!(!warned.due(OwnerClass::Ttl, node(1), 1, t0 + grace, grace, every), "once");
+    }
+
+    /// A peer that stops being waited on and is waited on again (a new yield)
+    /// starts a new grace; and so does a re-yield at a higher generation.
+    #[test]
+    fn a_fresh_wait_gets_a_fresh_grace() {
+        let mut warned = UnconfirmedWarn::default();
+        let every = Duration::from_secs(300);
+        let grace = Duration::from_secs(20);
+        let t0 = Instant::now();
+        assert!(!warned.due(OwnerClass::Ttl, node(1), 1, t0, grace, every));
+        assert!(warned.due(OwnerClass::Ttl, node(1), 1, t0 + grace, grace, every));
+        // Confirmed, and dropped.
+        warned.retain(&[]);
+        let t2 = t0 + Duration::from_secs(100);
+        assert!(!warned.due(OwnerClass::Ttl, node(1), 1, t2, grace, every), "fresh grace");
+        assert!(!warned.due(OwnerClass::Ttl, node(1), 1, t2 + grace / 2, grace, every));
+        assert!(warned.due(OwnerClass::Ttl, node(1), 1, t2 + grace, grace, every));
+        // Never dropped, but the yield was set again at a higher generation.
+        let t3 = t2 + Duration::from_secs(40);
+        assert!(!warned.due(OwnerClass::Ttl, node(1), 2, t3, grace, every), "re-yield");
+        assert!(warned.due(OwnerClass::Ttl, node(1), 2, t3 + grace, grace, every));
+    }
+
+    /// The race the grace closes, over a real `Members`: the first sweep after an
+    /// advertise finds every live peer unconfirmed, because no contact has yet
+    /// carried the block. It names nobody; a peer that then echoes is never named;
+    /// one that never does is named once the lease has passed, and only it.
+    #[test]
+    fn a_sweep_before_any_echo_names_nobody_and_later_only_the_peer_that_never_echoes() {
+        let members = cluster(&[1, 2]);
+        members.set_facts_source(Arc::new(|| Facts {
+            yielding: Yielding { ttl: true, ..Yielding::default() },
+            ..block()
+        }));
+        let mut warned = UnconfirmedWarn::default();
+        let t0 = Instant::now();
+        let lease = members.lease();
+        // The first sweep builds the block, so both peers are unconfirmed in it.
+        assert_eq!(members.unconfirmed_peers(OwnerClass::Ttl), vec![node(1), node(2)]);
+        assert!(warned.sweep(&members, t0).is_empty(), "before any echo");
+        hear(&members, 1, block());
+        hear(&members, 2, block());
+        let (_, generation) = members.local_facts().unwrap();
+        echo(&members, 1, generation);
+        assert!(warned.sweep(&members, t0 + lease / 2).is_empty(), "inside the grace");
+        assert_eq!(
+            warned.sweep(&members, t0 + lease),
+            vec![(OwnerClass::Ttl, node(2))],
+            "only the peer that never echoed"
+        );
+        assert!(warned.sweep(&members, t0 + lease + Duration::from_secs(1)).is_empty(), "once");
     }
 
     /// Two builds that overlap: the one that started first and finished last must
