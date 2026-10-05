@@ -1738,7 +1738,10 @@ impl crate::Engine {
                 return Ok(Dropped { stamp: Some(stamp), removed: false, declined: None });
             };
 
-            let txn = self.begin_write(WriterHolder::Drop)?;
+            // An index's own label, not the collection purge's: this removes
+            // every entry of the index in one transaction, so the hold scales
+            // with the index and is not judged a wedge (ADR-220).
+            let txn = self.begin_write(WriterHolder::IndexDrop)?;
             // The definition written back below was read before the writer
             // (`Engine::definition_is`).
             if !crate::Engine::definition_is(&txn, &read)? {

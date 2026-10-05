@@ -23,7 +23,7 @@ use std::time::Duration;
 
 use arc_swap::ArcSwap;
 use kimmy_cluster::yielding::driver::{Clock, Inputs, KillSwitch, RealClock};
-use kimmy_cluster::yielding::{ClassSample, Phase, ProbeMarks, Published};
+use kimmy_cluster::yielding::{ClassSample, Phase, ProbeMarks, Published, WriterHoldSample};
 use kimmy_cluster::{Facts, PeerView, PerClass};
 use kimmy_core::CollectionId;
 use kimmy_storage::class_step::{self, Class, ClassCell, MonotonicClock};
@@ -67,6 +67,38 @@ pub struct StallRuntime {
     pub period: Duration,
 }
 
+/// `KIMMY_TEST_HOLD_WRITER=<ms>,<holder>`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct HoldWriter {
+    pub ms: u64,
+    pub holder: kimmy_storage::WriterHolder,
+}
+
+/// The longest `KIMMY_TEST_HOLD_WRITER` may hold for: an hour.
+pub const HOLD_WRITER_MAX_MS: u64 = 3_600_000;
+
+fn parse_hold_writer(value: &str) -> Result<HoldWriter, String> {
+    let bad = || {
+        let holders: Vec<&str> =
+            kimmy_storage::WriterHolder::ALL.iter().map(|h| h.label()).collect();
+        format!(
+            "KIMMY_TEST_HOLD_WRITER={value:?} is not <ms>,<holder>, with ms from 1 to \
+             {HOLD_WRITER_MAX_MS} and a holder one of {}",
+            holders.join(", ")
+        )
+    };
+    let (ms, holder) = value.split_once(',').ok_or_else(bad)?;
+    let ms: u64 = ms.trim().parse().map_err(|_| bad())?;
+    let holder = kimmy_storage::WriterHolder::ALL
+        .into_iter()
+        .find(|h| h.label() == holder.trim())
+        .ok_or_else(bad)?;
+    if ms == 0 || ms > HOLD_WRITER_MAX_MS {
+        return Err(bad());
+    }
+    Ok(HoldWriter { ms, holder })
+}
+
 fn parse_stall_runtime(value: &str) -> Result<StallRuntime, String> {
     let bad = || {
         format!(
@@ -92,6 +124,9 @@ pub struct TestSwitches {
     pub fail_steps: Vec<(Class, Duration)>,
     /// `KIMMY_TEST_REFUSE_SYNC=1`: no replication contact completes, either way.
     pub refuse_sync: bool,
+    /// `KIMMY_TEST_HOLD_WRITER=<ms>,<holder>`: take the writer as `holder` and hold
+    /// it for `ms` once the node serves (ADR-220).
+    pub hold_writer: Option<HoldWriter>,
     /// What each switch said, for the announcement: `(variable, value, note)`.
     pub notes: Vec<(&'static str, String, String)>,
 }
@@ -156,6 +191,15 @@ impl TestSwitches {
                 "blocks every runtime worker on purpose once the node serves".into(),
             ));
         }
+        if let Some(value) = var("KIMMY_TEST_HOLD_WRITER") {
+            let hold = parse_hold_writer(&value)?;
+            switches.hold_writer = Some(hold);
+            switches.notes.push((
+                "KIMMY_TEST_HOLD_WRITER",
+                value,
+                "takes the single writer on purpose once the node serves, and holds it".into(),
+            ));
+        }
         if let Some(value) = var("KIMMY_TEST_FAIL_STEP") {
             let (steps, complaints) = parse_fail_steps(&value);
             let note = if complaints.is_empty() {
@@ -204,7 +248,7 @@ impl TestSwitches {
     /// The node serves: arm what waits for it. The fail steps count their delay from
     /// here, and the runtime stall begins. `stop` ends the stall at the stop's first
     /// signal.
-    pub fn arm(&self, stop: kimmy_task::Shutdown) {
+    pub fn arm(&self, stop: kimmy_task::Shutdown, engine: &Arc<kimmy_storage::Engine>) {
         for (class, after) in &self.fail_steps {
             class_step::set_test_fail_step(*class, *after);
         }
@@ -215,6 +259,14 @@ impl TestSwitches {
             info!("test switch armed: the replication listener now drops every peer connection");
             kimmy_cluster::transport::set_test_refuse_sync(true);
         }
+        if let Some(hold) = self.hold_writer {
+            info!(
+                ms = hold.ms,
+                holder = hold.holder.label(),
+                "test switch armed: the writer is held now that the node serves"
+            );
+            hold_writer(hold, Arc::clone(engine));
+        }
         if let Some(stall) = self.stall_runtime {
             info!(
                 ms = stall.ms,
@@ -223,6 +275,23 @@ impl TestSwitches {
             );
             inject_stalls(stall, stop);
         }
+    }
+}
+
+/// Take the writer as `hold.holder` from a plain OS thread and keep it for
+/// `hold.ms`: the wedge `KIMMY_TEST_HOLD_WRITER` stands for. The engine is moved
+/// into the thread, so it is held for the length of the hold; a stop that arrives
+/// during it waits on the writer as it would behind any hold.
+fn hold_writer(hold: HoldWriter, engine: Arc<kimmy_storage::Engine>) {
+    // UNSUPERVISED: a test switch's holder, ended by its own deadline; the wedge it causes is the point of it, and nothing restarts it
+    let spawned = std::thread::Builder::new().name("test-hold-writer".into()).spawn(move || {
+        let guard = engine.hold_writer(hold.holder);
+        std::thread::sleep(Duration::from_millis(hold.ms));
+        drop(guard);
+        info!(holder = hold.holder.label(), "test switch ended: the writer is let go");
+    });
+    if let Err(e) = spawned {
+        warn!(error = %e, "could not start the writer-holding thread, so nothing will happen");
     }
 }
 
@@ -337,6 +406,9 @@ pub struct YieldInputs {
     /// The collections this member's own block lists as TTL-indexed, kept by the
     /// facts hook: the target rule before the first TTL pass.
     pub ttl_holders: Arc<ArcSwap<Vec<CollectionId>>>,
+    /// Which hold has the writer, and since when: the engine's word, read without
+    /// the engine (ADR-220).
+    pub writer_hold: Arc<kimmy_storage::writer_hold::WriterHoldWord>,
 }
 
 impl Inputs for YieldInputs {
@@ -388,6 +460,15 @@ impl Inputs for YieldInputs {
 
     fn view(&self) -> Arc<PeerView> {
         self.members.as_ref().map_or_else(Arc::default, kimmy_cluster::Members::view)
+    }
+
+    /// The hold that has the writer now, unless its holder has no bound (an index
+    /// build or drop, which scale with the data): those are never judged
+    /// (ADR-220).
+    fn writer_hold(&self) -> Option<WriterHoldSample> {
+        let hold = self.writer_hold.reading()?;
+        (!hold.holder.is_unbounded())
+            .then(|| WriterHoldSample { age: hold.age(), holder: hold.holder.label() })
     }
 
     fn kill_switch(&self) -> Option<KillSwitch> {
@@ -548,6 +629,7 @@ mod tests {
             embeddings_disabled: false,
             stopping: Arc::default(),
             ttl_holders: Arc::default(),
+            writer_hold: Arc::default(),
         }
     }
 
@@ -605,6 +687,82 @@ mod tests {
         assert_eq!(inputs.kill_switch(), None, "nothing armed");
     }
 
+    /// The evaluator is given the hold that has the writer, with its age and the
+    /// holder's label, unless the holder has no bound: an index build, an index
+    /// drop and a rewind are never judged, however long they last (ADR-220).
+    #[test]
+    fn the_inputs_read_the_writers_hold_and_skip_the_holders_that_have_no_bound() {
+        use kimmy_storage::WriterHolder;
+        let cells = Cells::new();
+        let inputs = inputs(&cells);
+        assert_eq!(inputs.writer_hold(), None, "free");
+        for holder in WriterHolder::ALL {
+            // The word is the engine's; a bare one of its own is published through
+            // an engine, as the daemon's is.
+            let dir = tempfile::tempdir().unwrap();
+            let engine = kimmy_storage::Engine::open(&dir.path().join("kimmy.redb")).unwrap();
+            let inputs =
+                YieldInputs { writer_hold: engine.writer_hold_word(), ..self::inputs(&cells) };
+            let hold = engine.hold_writer(holder);
+            std::thread::sleep(Duration::from_millis(20));
+            let read = inputs.writer_hold();
+            match holder {
+                WriterHolder::IndexBuild | WriterHolder::IndexDrop | WriterHolder::Rewind => {
+                    assert_eq!(read, None, "{} is never judged", holder.label());
+                }
+                _ => {
+                    let read = read.unwrap_or_else(|| panic!("{} is judged", holder.label()));
+                    assert_eq!(read.holder, holder.label());
+                    assert!(read.age >= Duration::from_millis(20), "{:?}", read.age);
+                }
+            }
+            drop(hold);
+            assert_eq!(inputs.writer_hold(), None, "{}: let go", holder.label());
+        }
+    }
+
+    /// `KIMMY_TEST_HOLD_WRITER` is `<ms>,<holder>` with a holder by its label, and
+    /// anything else refuses the start, so a typo cannot leave a test believing the
+    /// writer is held.
+    #[test]
+    fn the_hold_writer_switch_reads_a_duration_and_a_holder_and_refuses_the_rest() {
+        let ok = read(&[("KIMMY_TEST_HOLD_WRITER", "70000, replication")]).unwrap();
+        assert_eq!(
+            ok.hold_writer,
+            Some(HoldWriter { ms: 70_000, holder: kimmy_storage::WriterHolder::Replication })
+        );
+        assert!(ok.notes.iter().any(|(name, _, _)| *name == "KIMMY_TEST_HOLD_WRITER"));
+        for holder in kimmy_storage::WriterHolder::ALL {
+            let value = format!("1,{}", holder.label());
+            assert_eq!(
+                read(&[("KIMMY_TEST_HOLD_WRITER", &value)]).unwrap().hold_writer.map(|h| h.holder),
+                Some(holder),
+                "{value}"
+            );
+        }
+        assert!(
+            read(&[("KIMMY_TEST_HOLD_WRITER", &format!("{HOLD_WRITER_MAX_MS},write"))]).is_ok()
+        );
+        for bad in [
+            "",
+            "5000",
+            ",write",
+            "write",
+            "x,write",
+            "0,write",
+            "-5,write",
+            "3600001,write",
+            "5000,",
+            "5000,nobody",
+            "5000,Write",
+            "5000,write,extra",
+        ] {
+            let refused = read(&[("KIMMY_TEST_HOLD_WRITER", bad)]).expect_err(bad);
+            assert!(refused.contains("KIMMY_TEST_HOLD_WRITER"), "{refused}");
+        }
+        assert_eq!(read(&[]).unwrap().hold_writer, None);
+    }
+
     /// A class that is catching up is gated, whichever class it is.
     #[test]
     fn a_member_that_is_catching_up_gates_every_class() {
@@ -648,6 +806,7 @@ mod tests {
             "a probation start yields from its first block"
         );
         assert_eq!(block.class_state.unwrap().ttl, kimmy_cluster::ClassState::Stalled);
+        assert_eq!(block.writer_wedged, Some(false), "the flag is in every block that has ticked");
         assert_eq!(hook.ttl_holders.load().as_slice(), [CollectionId(9)]);
         // An evaluator that never ticked is told by its age.
         let wedged = FactsHook { e: Duration::ZERO, ..hook.clone() };
@@ -656,6 +815,7 @@ mod tests {
         wedged.apply(&mut later);
         assert_eq!(later.class_state.unwrap().ttl, kimmy_cluster::ClassState::Unknown);
         assert_eq!(later.responsive, None);
+        assert_eq!(later.writer_wedged, None, "a silent evaluator claims nothing of the writer");
         assert!(later.yielding.ttl, "the bits stay: silence is not evidence of recovery");
     }
 }

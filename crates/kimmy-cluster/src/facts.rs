@@ -207,6 +207,13 @@ pub struct Facts {
     /// reads as `None`.
     #[serde(default, skip_serializing_if = "Option::is_none", deserialize_with = "lenient_bool")]
     pub responsive: Option<bool>,
+    /// The member's writer has been held past `yielding::WRITER_WEDGE` by a hold
+    /// that is bounded by nature (ADR-220): it can do no write, and no peer may
+    /// hand it work, whatever its classes own. Absent from a 0.44.0 sender, and
+    /// anything but a bool reads as `None`, which is *not known*, never `false`
+    /// for a decision that needs a positive.
+    #[serde(default, skip_serializing_if = "Option::is_none", deserialize_with = "lenient_bool")]
+    pub writer_wedged: Option<bool>,
     /// The sender's wall-clock milliseconds at its process start, read once: the
     /// same in every block of a process, so a receiver can order two processes of
     /// one member by the sender's own clock (ADR-213).

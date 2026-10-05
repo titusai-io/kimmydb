@@ -76,6 +76,10 @@ impl YieldHandle {
         let mut reading = YieldReading {
             ticks: self.published.ticks(),
             responsive: current.responsive,
+            runtime_stalled: current.runtime_stalled,
+            writer_wedged: current.writer_wedged,
+            writer_hold_age_ms: u64::try_from(current.writer_hold_age.as_millis())
+                .unwrap_or(u64::MAX),
             enabled: self.enabled,
             probation: self.probation,
             ..YieldReading::default()

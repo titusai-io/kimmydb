@@ -62,6 +62,8 @@ struct Rig {
     owned_ttl: Option<Vec<CollectionId>>,
     ttl_holders: Vec<CollectionId>,
     stopping: bool,
+    /// The hold that has the writer, as the tick finds it (ADR-220).
+    writer_hold: Option<WriterHoldSample>,
     e: Duration,
     steps: u32,
     last: Decision,
@@ -86,6 +88,7 @@ impl Rig {
             owned_ttl: Some(Vec::new()),
             ttl_holders: Vec::new(),
             stopping: false,
+            writer_hold: None,
             e,
             steps,
             last,
@@ -106,6 +109,17 @@ impl Rig {
         let peer = self.peers.get_mut(&node(n)).unwrap();
         peer.received = self.now - Duration::from_secs(secs);
         peer.renewed = false;
+    }
+
+    /// The writer is held, and has been for `secs`.
+    fn held(&mut self, secs: u64) {
+        self.writer_hold =
+            Some(WriterHoldSample { age: Duration::from_secs(secs), holder: "replication" });
+    }
+
+    /// The writer is free.
+    fn free(&mut self) {
+        self.writer_hold = None;
     }
 
     fn drop_peer(&mut self, n: u8) {
@@ -190,6 +204,7 @@ impl Rig {
         sample.stopping = self.stopping;
         sample.owned_ttl = self.owned_ttl.clone();
         sample.ttl_holders = self.ttl_holders.clone();
+        sample.writer_hold = self.writer_hold;
         self.last = self.ev.tick(&sample, self.now);
         self.last.clone()
     }
@@ -1628,4 +1643,343 @@ fn the_constants_are_the_designs() {
     assert_eq!(Bounds::of(T, Duration::from_secs(2), e).waiting, Duration::from_secs(14));
     assert_eq!(Timings::scaled(5).latch_hold, Duration::from_secs(360));
     assert_eq!((0..6).map(reclaim_ticks).collect::<Vec<_>>(), vec![24, 48, 96, 192, 384, 384]);
+}
+
+// ---------------------------------------------------------------------------
+// A wedged writer (ADR-220).
+// ---------------------------------------------------------------------------
+
+fn wedge_secs() -> u64 {
+    WRITER_WEDGE.as_secs() + 1
+}
+
+/// An overdue hold is a bad item for a class that owns work and for none that
+/// owns nothing; and the member's own fact is set either way.
+#[test]
+fn a_wedge_is_bad_for_the_classes_that_own_work_and_not_for_those_that_own_nothing() {
+    let mut rig = Rig::new();
+    rig.responsive();
+    rig.owned(W, 1);
+    rig.held(wedge_secs());
+    let d = rig.tick();
+    assert!(d.writer_wedged, "the member's fact does not depend on its classes");
+    assert_eq!(d.classes.webhooks.verdict, Verdict::Bad);
+    assert_eq!(rig.state(W), ClassState::Suspect, "suspect at once");
+    for idle in [T, E] {
+        assert_eq!(d.classes.of(idle).verdict, Verdict::Idle, "{idle:?} owns nothing");
+        assert_eq!(rig.state(idle), ClassState::Idle);
+    }
+}
+
+/// The bound is exclusive and the hold's age is what is judged: at the bound, or
+/// under it, nothing is wedged, whatever holds.
+#[test]
+fn a_hold_at_the_bound_or_under_it_is_not_a_wedge() {
+    let mut rig = Rig::new();
+    rig.responsive();
+    rig.owned(W, 1);
+    rig.work(W);
+    for secs in [0, 1, 5, WRITER_WEDGE.as_secs() - 1, WRITER_WEDGE.as_secs()] {
+        rig.held(secs);
+        rig.work(W);
+        let d = rig.tick();
+        assert!(!d.writer_wedged, "{secs} s");
+        assert_eq!(d.classes.webhooks.verdict, Verdict::Good, "{secs} s");
+    }
+}
+
+/// Holds that recur just under the bound never go bad and never flap: the item is
+/// of the hold now, and a new hold starts at zero.
+#[test]
+fn holds_just_under_the_bound_never_flap() {
+    let mut rig = Rig::new();
+    rig.responsive();
+    rig.owned(W, 1);
+    for _ in 0..60 {
+        rig.work(W);
+        rig.held(WRITER_WEDGE.as_secs());
+        let a = rig.tick();
+        rig.free();
+        rig.work(W);
+        let b = rig.tick();
+        assert!(!a.writer_wedged && !b.writer_wedged);
+        assert!(a.events.is_empty() && b.events.is_empty(), "{:?} {:?}", a.events, b.events);
+    }
+    assert_eq!(rig.state(W), ClassState::Ok);
+}
+
+/// The windows are the class's own: ttl is stalled after three bad ticks, webhooks
+/// and embeddings after six, so the earliest yield is the bound plus those.
+#[test]
+fn a_wedge_stalls_a_class_on_its_own_window_with_a_local_cause() {
+    for (class, n) in [(T, 3), (W, 6), (E, 6)] {
+        let mut rig = Rig::new();
+        rig.responsive();
+        rig.owned(class, 1);
+        rig.held(wedge_secs());
+        for i in 1..n {
+            rig.tick();
+            assert_eq!(rig.state(class), ClassState::Suspect, "{class:?} after {i}");
+        }
+        let d = rig.tick();
+        assert_eq!(rig.state(class), ClassState::Stalled, "{class:?} at {n}");
+        assert_eq!(d.classes.of(class).cause, Some(StallCause::Local), "{class:?}: local");
+    }
+}
+
+/// A stalled class yields to a healthy target as it would for any local fault.
+#[test]
+fn a_wedge_yields_to_a_target() {
+    let mut rig = Rig::new();
+    rig.responsive();
+    rig.peer(1, peer_facts(ClassState::Ok, true));
+    rig.owned(W, 1);
+    rig.held(wedge_secs());
+    rig.until(20, |d| d.classes.webhooks.yielding);
+    assert!(rig.yielding(W));
+}
+
+/// A wedged peer is no target for any class, however idle it reports itself, and a
+/// peer that does not send the fact is refused for nothing of the kind.
+#[test]
+fn a_wedged_member_is_no_target_whatever_it_owns() {
+    let mut rig = Rig::new();
+    rig.responsive();
+    rig.owned(W, 1);
+    rig.held(wedge_secs());
+    // Idle, responsive, not catching up: a target for every class but for the fact.
+    let wedged = Facts { writer_wedged: Some(true), ..peer_facts(ClassState::Idle, true) };
+    rig.peer(1, wedged.clone());
+    rig.ticks(40);
+    assert_eq!(rig.state(W), ClassState::Stalled);
+    assert!(!rig.yielding(W), "the only peer is wedged");
+    assert_eq!(rig.suppressed(W), Some(Suppression::NoTarget));
+    let sample = {
+        let mut sample = Sample::new(rig.measure, rig.cs, rig.view());
+        sample.writer_hold = rig.writer_hold;
+        sample
+    };
+    for class in OwnerClass::ALL {
+        assert_eq!(
+            target_refusal(&sample.view, &node(1), &sample, class, rig.now),
+            Some("writer wedged"),
+            "{class:?}"
+        );
+    }
+    // The same peer without the fact, or with it false, is a target.
+    for fact in [None, Some(false)] {
+        rig.peer(1, Facts { writer_wedged: fact, ..wedged.clone() });
+        rig.tick();
+        assert!(rig.last.classes.webhooks.yielding, "writer_wedged {fact:?}");
+    }
+}
+
+/// Every member wedged: none yields, and each is stalled locally, so the latch
+/// holds the class where it is.
+#[test]
+fn when_every_member_is_wedged_none_yields() {
+    let mut rig = Rig::new();
+    rig.responsive();
+    rig.owned(W, 1);
+    rig.held(wedge_secs());
+    rig.peer(1, Facts { writer_wedged: Some(true), ..stalled_peer(StallCause::Local) });
+    rig.ticks(40);
+    assert_eq!(rig.state(W), ClassState::Stalled);
+    assert!(!rig.yielding(W));
+    assert!(rig.last.classes.webhooks.latched, "two members stalled locally: the latch");
+    assert_eq!(rig.suppressed(W), Some(Suppression::SharedFault));
+}
+
+/// A void tick judges nothing: the hold it found is discarded, and the fact and
+/// the age stand as the last judged tick left them.
+#[test]
+fn a_void_tick_during_a_hold_discards_it_and_leaves_the_fact() {
+    let mut rig = Rig::new();
+    rig.responsive();
+    rig.owned(W, 1);
+    rig.held(wedge_secs());
+    rig.tick();
+    let wedged_age = rig.last.writer_hold_age;
+    assert!(rig.last.writer_wedged);
+    // A paused process: the control is late. The hold is still there, and long.
+    rig.held(wedge_secs() + 3_000);
+    let d = rig.tick_with(measure(5_000, 5_000, true));
+    assert_eq!(d.runtime, RuntimeVerdict::Void);
+    assert!(d.writer_wedged, "a void tick leaves the fact as it was");
+    assert_eq!(d.writer_hold_age, wedged_age, "and the age the last judged tick found");
+    assert_eq!(d.classes.webhooks.verdict, Verdict::Void);
+    assert!(d.events.is_empty());
+    // And a void tick does not set it either, for a member that was not wedged.
+    let mut rig = Rig::new();
+    rig.responsive();
+    rig.held(wedge_secs() + 3_000);
+    let d = rig.tick_with(measure(5_000, 5_000, true));
+    assert!(!d.writer_wedged);
+}
+
+/// The hold only adds to the bad side. A class that is gated, switched off or
+/// stopping stays neutral through a wedge, and the member's own fact is still set.
+#[test]
+fn a_wedge_never_overrides_a_neutral_class_and_never_makes_a_tick_good() {
+    for gate in 0..3 {
+        let mut rig = Rig::new();
+        rig.responsive();
+        rig.owned(W, 1);
+        rig.held(wedge_secs());
+        match gate {
+            0 => rig.cs.webhooks.gated = true,
+            1 => rig.cs.webhooks.switched_off = true,
+            _ => rig.stopping = true,
+        }
+        let d = rig.ticks(20);
+        assert_eq!(d.classes.webhooks.verdict, Verdict::Neutral, "gate {gate}");
+        assert_ne!(rig.state(W), ClassState::Stalled, "gate {gate}");
+        assert!(d.writer_wedged, "gate {gate}: the member's fact is independent of its classes");
+    }
+    // Work done under a wedge is not a good tick: the bad item takes the tick.
+    let mut rig = Rig::new();
+    rig.responsive();
+    rig.owned(W, 1);
+    rig.held(wedge_secs());
+    rig.work(W);
+    assert_eq!(rig.tick().classes.webhooks.verdict, Verdict::Bad);
+}
+
+/// A yielded class does not come back into a wedged writer: the bad item resets the
+/// good run every tick; when the hold ends it takes R good ticks from then, exactly.
+#[test]
+fn reclaim_waits_for_the_hold_to_end_and_then_takes_r_ticks_exactly() {
+    let mut rig = Rig::new();
+    rig.responsive();
+    rig.peer(1, peer_facts(ClassState::Ok, true));
+    rig.owned(W, 1);
+    rig.held(wedge_secs());
+    rig.until(20, |d| d.classes.webhooks.yielding);
+    // Work goes on under the hold, and nothing reclaims.
+    for _ in 0..(RECLAIM_TICKS as usize * 3) {
+        rig.work(W);
+        let d = rig.tick();
+        assert!(rig.yielding(W) && d.classes.webhooks.verdict == Verdict::Bad);
+    }
+    // The hold ends. R minus one good ticks leave it yielded, and the R-th reclaims.
+    rig.free();
+    for i in 1..RECLAIM_TICKS {
+        rig.work(W);
+        let d = rig.tick();
+        assert!(rig.yielding(W), "good tick {i} of {RECLAIM_TICKS}");
+        assert!(!d.writer_wedged);
+    }
+    rig.work(W);
+    let d = rig.tick();
+    assert!(!rig.yielding(W), "reclaimed at exactly R");
+    assert_eq!(
+        events_of(
+            &d,
+            |e| matches!(e, Event::Reclaimed { r_ticks, .. } if *r_ticks == RECLAIM_TICKS)
+        ),
+        1
+    );
+}
+
+/// A wedge that recurs soon after a reclaim is a new yield inside the back-off
+/// window: R doubles.
+#[test]
+fn a_wedge_that_recurs_near_a_reclaim_backs_off() {
+    let mut rig = Rig::new();
+    rig.responsive();
+    rig.peer(1, peer_facts(ClassState::Ok, true));
+    rig.owned(W, 1);
+    rig.held(wedge_secs());
+    rig.until(20, |d| d.classes.webhooks.yielding);
+    rig.free();
+    for _ in 0..RECLAIM_TICKS {
+        rig.work(W);
+        rig.tick();
+    }
+    assert!(!rig.yielding(W));
+    // Again, inside the thirty minutes.
+    rig.held(wedge_secs());
+    rig.until(20, |d| d.classes.webhooks.yielding);
+    rig.free();
+    for i in 1..(RECLAIM_TICKS * 2) {
+        rig.work(W);
+        rig.tick();
+        assert!(rig.yielding(W), "good tick {i} of {}", RECLAIM_TICKS * 2);
+    }
+    rig.work(W);
+    rig.tick();
+    assert!(!rig.yielding(W), "reclaimed at 2R");
+}
+
+/// The wedge is said once, and its end once.
+#[test]
+fn a_wedge_is_announced_once_and_so_is_its_end() {
+    let mut rig = Rig::new();
+    rig.responsive();
+    rig.held(wedge_secs());
+    let first = rig.tick();
+    assert_eq!(
+        events_of(&first, |e| matches!(e, Event::WriterWedged { holder: "replication", .. })),
+        1
+    );
+    for _ in 0..5 {
+        assert!(rig.tick().events.is_empty(), "said once");
+    }
+    rig.free();
+    let end = rig.tick();
+    assert_eq!(events_of(&end, |e| matches!(e, Event::WriterFree)), 1);
+    assert!(rig.tick().events.is_empty());
+}
+
+/// What the block says of the runtime: nothing while the member is warming up,
+/// `false` for a stall, `true` once six judged ticks have passed without one; and
+/// the wedge flag follows the evaluator.
+#[test]
+fn the_block_says_nothing_of_the_runtime_until_it_has_been_judged_and_says_the_wedge() {
+    let e = Duration::from_secs(5);
+    let mut rig = Rig::new();
+    let published = Published::default();
+    published.store_start(&rig.last, 0);
+    let at = |n: u64| n * 5_000;
+    assert_eq!(published.advertised(at(0), e).responsive, None, "before any tick");
+    for i in 1..RESPONSIVE_TICKS as u64 {
+        let d = rig.tick();
+        published.store(&d, at(i));
+        assert!(d.warming);
+        assert_eq!(published.advertised(at(i), e).responsive, None, "warming, tick {i}");
+        assert!(!published.current().runtime_stalled, "warming is not a stall");
+    }
+    let d = rig.tick();
+    published.store(&d, at(RESPONSIVE_TICKS as u64));
+    assert_eq!(published.advertised(at(RESPONSIVE_TICKS as u64), e).responsive, Some(true));
+    // A stall: false, and it is a stall.
+    let d = rig.tick_with(measure(0, 2_000, true));
+    published.store(&d, at(RESPONSIVE_TICKS as u64 + 1));
+    let advertised = published.advertised(at(RESPONSIVE_TICKS as u64 + 1), e);
+    assert_eq!(advertised.responsive, Some(false));
+    assert!(published.current().runtime_stalled);
+    // The wedge flag, and the age for the gauge.
+    assert_eq!(advertised.writer_wedged, Some(false));
+    rig.held(wedge_secs());
+    let d = rig.tick();
+    published.store(&d, at(RESPONSIVE_TICKS as u64 + 2));
+    let now = published.advertised(at(RESPONSIVE_TICKS as u64 + 2), e);
+    assert_eq!(now.writer_wedged, Some(true));
+    assert_eq!(published.current().writer_hold_age, Duration::from_secs(wedge_secs()));
+    // Stale: nothing is claimed of either.
+    let stale = published.advertised(at(RESPONSIVE_TICKS as u64 + 40), e);
+    assert_eq!((stale.responsive, stale.writer_wedged), (None, None));
+}
+
+/// The bound is the documented sixty seconds, in seconds and not only in terms of
+/// itself: sixty is a hold, sixty-one is a wedge.
+#[test]
+fn the_bound_is_sixty_seconds() {
+    assert_eq!(WRITER_WEDGE, Duration::from_secs(60));
+    let mut rig = Rig::new();
+    rig.responsive();
+    rig.held(60);
+    assert!(!rig.tick().writer_wedged);
+    rig.held(61);
+    assert!(rig.tick().writer_wedged);
 }

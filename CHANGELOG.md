@@ -12,6 +12,22 @@ breaking changes and says so here; a `0.x.PATCH` bump never does.
 
 ## Unreleased
 
+### Added
+
+- **A member whose writer is wedged says so, and `/v1/topology` stops
+  recommending it.** One hold of the single writer that lasts more than 60
+  seconds is now a bad item for every class of owned work the member holds, so it
+  yields them to a peer that can do them (it was undetected before), no peer hands
+  it work, and `GET /v1/topology` lists it `degraded: "writer"`; `degraded:
+  "runtime"` says its async runtime has stalled. `degraded` is an optional field
+  on a node, advisory (prefer a node without it), and its absence is not a promise
+  of health. Index builds and index drops are never read as a wedge, which is a
+  stated gap. New series: `kimmy_writer_wedged` and `kimmy_writer_hold_age_seconds`;
+  `kimmy_write_lock_*{holder}` gains `index_drop` (an index drop was `drop`).
+  `responsive` in a member's block is now absent until six ticks have been judged,
+  where it read false. No rollback boundary. See operations.md, "A wedged writer",
+  and ADR-220.
+
 ### Changed
 
 - **A `$let` variable the body does not read can no longer fail the expression.**

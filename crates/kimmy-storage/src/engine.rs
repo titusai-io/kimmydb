@@ -155,6 +155,9 @@ pub struct Engine {
     /// hand it over rather than winning every time against a thread that
     /// was woken and had to race for it.
     writer_gate: parking_lot::Mutex<()>,
+    /// Which hold has the writer, and since when, for the yield evaluator
+    /// (ADR-220).
+    writer_hold: Arc<crate::writer_hold::WriterHoldWord>,
     /// How long callers waited for the writer, as a histogram over
     /// [`WRITER_WAIT_BUCKETS_US`]; `count` and `sum` beside it.
     writer_wait_buckets: [std::sync::atomic::AtomicU64; WRITER_WAIT_BUCKETS_US.len()],
@@ -338,6 +341,11 @@ pub enum WriterHolder {
     /// Creating an index: every document of the collection is read and
     /// filed under the new definition in the transaction that creates it.
     IndexBuild,
+    /// Dropping an index: every entry of it is removed in the one transaction
+    /// that drops it, so the hold scales with the index, as an index build's
+    /// does. Apart from [`WriterHolder::Drop`], which is a collection's purge
+    /// in chunks and so bounded (ADR-220).
+    IndexDrop,
     /// The destructive half of a drop: one chunk of a collection's purge
     /// (ADR-158), or an index drop, which is still one transaction. **Not**
     /// the burial that precedes a collection's purge — that writes metadata
@@ -383,6 +391,7 @@ impl WriterHolder {
         Self::Bulk,
         Self::Ddl,
         Self::IndexBuild,
+        Self::IndexDrop,
         Self::Drop,
         Self::Replication,
         Self::Repair,
@@ -395,7 +404,7 @@ impl WriterHolder {
     ];
 
     /// How many there are; the width of every per-holder array.
-    pub const COUNT: usize = 13;
+    pub const COUNT: usize = 14;
 
     /// The word a metric label and a log line name this holder by.
     ///
@@ -409,6 +418,7 @@ impl WriterHolder {
             Self::Bulk => "bulk",
             Self::Ddl => "ddl",
             Self::IndexBuild => "index_build",
+            Self::IndexDrop => "index_drop",
             Self::Drop => "drop",
             Self::Replication => "replication",
             Self::Repair => "repair",
@@ -424,6 +434,14 @@ impl WriterHolder {
     /// Its row in the per-holder arrays; `ALL[h.slot()] == h`.
     pub const fn slot(self) -> usize {
         self as usize
+    }
+
+    /// Whether a hold by this holder has no bound: it scales with the data it
+    /// works on and is judged by nothing but its own end (ADR-220). The yield
+    /// evaluator does not read such a hold as a wedge, which is a gap the ADR
+    /// states: a build or an index drop that never ends is not detected.
+    pub const fn is_unbounded(self) -> bool {
+        matches!(self, Self::IndexBuild | Self::IndexDrop | Self::Rewind)
     }
 }
 
@@ -509,6 +527,7 @@ impl WriterHold<'_> {
         gate: parking_lot::MutexGuard<'a, ()>,
         holder: WriterHolder,
     ) -> WriterHold<'a> {
+        engine.writer_hold.publish(holder);
         WriterHold {
             gate: Some(gate),
             engine,
@@ -527,7 +546,11 @@ impl Drop for WriterHold<'_> {
         // `WRITER_HOLD_WARN`, a log call; small, but it is not work the
         // next writer in the queue should be waiting through, and two
         // paths that release the same gate should not do it in two orders.
-        if self.gate.take().is_some() {
+        if self.gate.is_some() {
+            // Cleared while the gate is still held (ADR-220): the next writer
+            // publishes its own word after this one is gone.
+            self.engine.writer_hold.clear();
+            drop(self.gate.take());
             let released = std::time::Instant::now();
             let from = self.held_from;
             let commit_from = self.commit_from.unwrap_or(released);
@@ -812,7 +835,10 @@ pub(crate) struct WriteTxn<'a> {
 impl WriteTxn<'_> {
     /// Let go of the writer and record how long it was held.
     fn release(&mut self) {
-        if self.gate.take().is_some() {
+        if self.gate.is_some() {
+            // Cleared while the gate is still held (ADR-220).
+            self.engine.writer_hold.clear();
+            drop(self.gate.take());
             let released = std::time::Instant::now();
             let from = self.held_from;
             let commit_from = self.commit_from.unwrap_or(released);
@@ -1373,6 +1399,7 @@ impl Engine {
             fsyncs: std::sync::atomic::AtomicU64::new(0),
             grouped_commits: std::sync::atomic::AtomicU64::new(0),
             writer_gate: parking_lot::Mutex::new(()),
+            writer_hold: Arc::new(crate::writer_hold::WriterHoldWord::new()),
             writer_wait_buckets: std::array::from_fn(|_| std::sync::atomic::AtomicU64::new(0)),
             writer_wait_count: std::sync::atomic::AtomicU64::new(0),
             writer_wait_sum_us: std::sync::atomic::AtomicU64::new(0),
@@ -1500,6 +1527,20 @@ impl Engine {
             count: std::array::from_fn(|holder| self.writer_hold_count[holder].load(Relaxed)),
             sum_us: std::array::from_fn(|holder| self.writer_hold_sum_us[holder].load(Relaxed)),
         }
+    }
+
+    /// The gate, taken raw if it is free and with no hold built on it: the way a
+    /// test asks what a reader would find the instant it is let go (ADR-220).
+    #[cfg(test)]
+    pub(crate) fn try_raw_gate_for_test(&self) -> Option<parking_lot::MutexGuard<'_, ()>> {
+        self.writer_gate.try_lock()
+    }
+
+    /// The word that says which hold has the writer, and since when. Cloned
+    /// into the yield evaluator's inputs, which read it without the engine
+    /// (ADR-220).
+    pub fn writer_hold_word(&self) -> Arc<crate::writer_hold::WriterHoldWord> {
+        Arc::clone(&self.writer_hold)
     }
 
     /// Take the writer as `holder` and hold it until the guard is dropped
@@ -3422,6 +3463,7 @@ impl Engine {
             txn.set_durability(redb::Durability::None)
                 .expect("no persistent savepoint was touched in a fresh transaction");
         }
+        self.writer_hold.publish(holder);
         Ok(WriteTxn {
             txn: Some(txn),
             engine: self,

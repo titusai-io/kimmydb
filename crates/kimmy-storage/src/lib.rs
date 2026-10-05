@@ -49,6 +49,7 @@ pub use verified::VerifiedWalk;
 pub use violations_table::{BackfillStep, ViolationsSnapshot};
 pub use walk::WalkScope;
 pub mod watch;
+pub mod writer_hold;
 
 #[cfg(test)]
 mod key_walk_tests;

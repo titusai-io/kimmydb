@@ -3447,6 +3447,26 @@ components:
             ttl: { $ref: "#/components/schemas/ClassState" }
             webhooks: { $ref: "#/components/schemas/ClassState" }
             embeddings: { $ref: "#/components/schemas/ClassState" }
+        degraded:
+          type: string
+          enum: [writer, runtime]
+          description: |
+            Present only while the answering node (`view`) sees this node unable
+            to serve as it should (ADR-220), and only on a `live` node. **Advisory:
+            writes and owner work on this node may stall; reads may still be
+            served. Prefer a node without it.** `writer`: its single writer has
+            been held past 60 seconds by one hold, a write, a replication batch, a
+            repair page: no write can be made, and a peer hands it no work.
+            `runtime`: its async runtime stalled within the last judged
+            evaluator ticks, so requests may be slow. `writer` wins when both hold.
+
+            For the answering node's own entry it is what its evaluator last
+            decided; for a peer, what its last block said. **An absent `degraded`
+            is not "healthy"**: a peer of an older build, a peer the answering
+            node holds no block from and a member still warming up all have none.
+            It says nothing of `catchingUp` or of `classState`, which are separate
+            statements. When every node has it, a client uses them anyway: it
+            orders a preference and forbids nothing.
 
     ClassState:
       type: string

@@ -14213,6 +14213,13 @@ work the transaction does, not who asked for it**:
 | `durability` | The shared fsync of the coalescing barrier ([ADR-088](#adr-088--two-durability-classes-and-the-one-there-is-not)) | One marker write and one fsync |
 | `rewind` | Rewinding the database to a point in time | The oplog above the target |
 
+> **Clarified (0.45.0).** An index drop has a holder of its own, `index_drop`,
+> apart from `drop`: it removes every entry of the index in the one transaction
+> that drops it, so it scales with the index, where a collection's purge is
+> chunked. `drop` is now the purge's chunks alone. The hold of the writer is
+> published for the yield evaluator, which reads these labels
+> ([ADR-220](#adr-220--a-writer-held-past-a-bound-is-a-wedge-the-member-yields-what-it-owns-is-no-target-and-topology-says-it-is-degraded)).
+
 Three of those divisions are the ones the round below could not make, and they
 are different work rather than different callers: `ddl` writes metadata and is
 constant, `index_build` reads and files a whole collection under the writer,
@@ -24657,6 +24664,11 @@ gaps of its own (below).
 - **A wedged writer yields nothing in 0.44.0.** `WriterGate` is never overdue,
   so a writer held for good delays every class and is not detected. A later
   trigger can be node-level and read the writer-holder labels.
+
+  > **Amended by [ADR-220](#adr-220--a-writer-held-past-a-bound-is-a-wedge-the-member-yields-what-it-owns-is-no-target-and-topology-says-it-is-degraded).**
+  > A hold of the writer past 60 seconds is now a bad item for every class that
+  > owns work, and the member advertises it. A stuck index build or index drop is
+  > still not detected.
 - **Independent faults on two members of one class are treated as shared.**
   The latch cannot tell them from a fault that follows the data, so both stay
   as they are. That is today's behaviour.
@@ -25277,3 +25289,149 @@ mutation rows each fail a named test: variables bound eagerly (five tests),
 no memo (two tests), a memo shared across frames (the `$map` test), `$lookup`'s
 `let` ignoring a failure (its test) and the evaluation run without `maybe_grow`
 (the chain test, whose child aborts, in a debug and in a release build).
+## ADR-220 — A writer held past a bound is a wedge: the member yields what it owns, is no target, and topology says it is degraded
+
+> **Amends [ADR-213](#adr-213--a-member-that-cannot-do-a-class-of-work-yields-it-judged-by-its-own-heartbeats-against-its-peers),**
+> its paragraph "A wedged writer yields nothing in 0.44.0", **and
+> [ADR-060](#adr-060--client-topology-comes-from-a-replicated-registry-liveness-from-swim)**
+> (what `/v1/topology` says of a node that is live).
+
+**Status:** accepted, for the next `0.MINOR`. No rollback boundary, in
+[ADR-190](#adr-190--a-store-is-checked-before-it-is-opened-for-writing)'s
+terms: every wire field is optional and decoded on its own, no stored format, file
+or configuration key changes, and what a build that predates this does not know
+(the facts field, the topology field, two gauges, one label value) it ignores or
+never reads. The off switch is the existing `KIMMY_OWNERSHIP_YIELD=off`.
+
+**The defect.** Two things ADR-213 left. **A wedged writer yielded nothing.** The
+class heartbeats count a wait at the writer's gate as neutral (`WriterGate` has no
+bound), because an index build, a purge chunk or a repair page legitimately holds
+the gate while every class waits. So a gate held for good delayed every class,
+stopped replication from being applied, and was not detected: no peer took the
+work. And **`/v1/topology` called a member `live` whenever SWIM did**, so a client
+that routes by topology went on sending its writes to a node whose writes would
+wait out their timeout.
+
+**Decision.**
+
+- **The writer publishes its hold.** The engine keeps one packed word, `((since_ms
+  + 1) << 8) | holder_slot`, `0` when the writer is free, in an `Arc` it owns and
+  the daemon clones into the evaluator's inputs: the evaluator reads it without the
+  engine and takes no lock the runtime takes. It is stored where a hold is built
+  (`WriterHold`, `WriteTxn`) and cleared in their release **before** the gate is
+  let go, so a reader that finds the gate free finds the word free. The paths that
+  take the raw gate and build neither (a write refused because writes are closed, a
+  stop with nothing pending, a barrier flush once writes are closed) never store,
+  so never clear.
+- **A hold is overdue past 60 seconds.** `W` is twice `LOCAL_BOUND` and at least
+  twelve times the five-second line the engine warns a long hold at, asserted
+  where it is declared; no configuration key (it would break a config rollback
+  under `deny_unknown_fields`), and not scaled by `KIMMY_TEST_YIELD_SCALE`. The
+  hold's age is judged on every non-void tick. **A void tick judges nothing and
+  leaves the flag as it was**, so a paused process is never read as a wedge.
+- **The holders whose work scales with the data are not judged.** `index_build`
+  and the new `index_drop`, which removes every entry of the index in one
+  transaction (apart from `drop`, a collection purge in chunks), and `rewind`,
+  which runs only in a process that serves nothing. **A stuck index build or index
+  drop is therefore not detected**, which this decision states as a gap: no bound
+  can tell a long build from a stuck one without progress, and a progress-bounded
+  rule waits until a stuck build is seen.
+- **It adds to the bad side only.** An overdue hold is one more bad item for every
+  class that **owns work** (a local cause, which the shared-fault latch counts),
+  through the evidence ADR-213 already has: it never produces a good, idle or
+  neutral tick, and never overrides a class that is gated, switched off or
+  stopping. Work done under a wedge is not a good tick; the bad item takes it, so
+  a yielded member does not reclaim into a wedged writer, and reclaim follows once
+  the hold ends, after R good ticks as before. The class windows (ttl 3 of 5, the
+  others 6 of 12), the target rule, the cap (`max(1, live/2)`, `live` being the
+  peers), the latch and the back-off are unchanged and inherit their proofs.
+- **A wedged member is no target for any class.** `Facts` gains `writer_wedged`,
+  an optional bool, advertised at once and independent of class state, and
+  `target_refusal` refuses a peer that sends `true` for every class, because a
+  member that owns nothing in a class reads `idle` in it and would otherwise be
+  accepted as the place to send another member's work. A peer that sends nothing
+  is refused for nothing of the kind.
+- **`degraded` in topology.** An optional `degraded` on a node's entry, `"writer"`
+  while its writer is wedged and `"runtime"` while its async runtime has stalled
+  within the last judged ticks, present only while that holds and only on a `live`
+  node. **Advisory:** writes and owner work on the node may stall, reads may still
+  be served, prefer a node without it. It is computed from the writer and the
+  runtime and from nothing about the classes, so it holds while the classes are
+  gated at a wedged writer (a repair page). `status` stays `live` or `unknown`: its
+  enum is closed, and a client that tests it would lose a node that merely lost a
+  minute. **A missing `degraded` is not "healthy"**: an older build's peer, a peer
+  this member holds no block from, and a member still warming up all have none.
+  When every node has it, a client uses them anyway: it orders a preference and
+  forbids nothing.
+- **The runtime fact is `responsive`, now silent while warming up.** Until six
+  non-void ticks have been judged a member advertises no `responsive` at all
+  (`None`), where it advertised `false`; `false` now means the runtime stalled.
+  `kimmy_runtime_responsive` is unchanged. A peer reads `None` as it read `false`
+  for a target (not one), and `degraded: "runtime"` is set only for `false`.
+- **Two gauges.** `kimmy_writer_wedged` and `kimmy_writer_hold_age_seconds`, read at
+  the evaluator's last judged tick and not at the scrape, because a scrape after a
+  paused process would read an age that includes the pause. A `WARN` names the
+  holder and the age once per wedge, and the end is said once.
+- **A test switch** `KIMMY_TEST_HOLD_WRITER=<ms>,<holder>`, environment only,
+  announced at `WARN` and armed once the node serves: it takes the writer as that
+  holder and keeps it. A value that does not read refuses the start.
+
+**What was measured for the bound** (rounds 0460 and 0470 on mars, the writer-hold
+histograms and the sampler files): no hold over 30 s in either round; the worst
+hold that is not a drop was the embedding worker's at 8.04 s; replication's largest
+populated bucket was (1, 5] s; the drop's 26.8 s in round 0460 was before #104
+moved the purge to bounded chunks and cold reads, and round 0470 measured every
+drop hold at 1 s or less. Sixty seconds is twice the worst observed on the slowest
+disk run. This is a bound on a disk that is slow, not a promise about a disk that
+is failing, which ADR-188 handles by stopping the process.
+
+**What it changes in earlier decisions.** ADR-213: the paragraph named above.
+ADR-159: the label set gains `index_drop`, and the labels gain a reader. ADR-060:
+a node's entry gains `degraded`. ADR-187: the evaluator publishes two more series.
+
+**Rejected.**
+
+- *A class cell for the writer:* the classes have owners by rendezvous and the
+  writer is not owned work, so a fourth class adds a bit and a set of wire fields.
+- *The writer-wait histogram, or counting a hold only while somebody waits:* a
+  consequence, measured after clients have been failed; and an unwaited wedged gate
+  still blocks apply, expiry, embedding and the stop.
+- *Exiting the process on a wedge:* a long fsync on a failing disk recovers;
+  yielding is reversible and an exit is not.
+- *`status: "degraded"`:* a closed enum a client tests; the field is the weaker
+  signal for a client that has not been updated and the safer one for the rest.
+- *Folding the catching-up marker into `degraded`:* `catchingUp` says it, and the
+  two are separate statements.
+
+### Test
+
+`kimmy-storage`: the word is published for each way of holding the writer and
+cleared by commit, abort, drop and error; a write that times out waiting leaves the
+holder's word alone; the raw-gate paths never store; a hold and a transaction each
+clear the word before the gate is free, seen by a thread that takes the gate raw
+the instant it is let go; the word follows the gate under two writers and a reader
+(never free in a hold, never naming the wrong holder, free after); engines do not
+share a word. `kimmy-cluster`: the evaluator turns an overdue hold into a bad item
+for the classes that own work and for none that own nothing; the bound is exactly
+sixty seconds; holds just under it never flap; each class stalls on its own window
+with a local cause; a wedge yields to a target; a wedged peer is refused for every
+class and one that sends nothing is not; with every member wedged nothing yields and
+the latch holds; a void tick leaves the fact and discards the hold; a gated,
+switched-off or stopping class stays neutral and work under a wedge is not a good
+tick; reclaim waits for the hold to end and then takes R ticks exactly; a wedge
+that recurs backs off; the wedge and its end are said once; the block says nothing
+of the runtime while warming up, `false` for a stall; and the field reads a bool and
+nothing else. `kimmyd`: the inputs skip the holders that have no bound; the switch
+reads and refuses; the block carries the flag. `kimmy-api`: topology says
+`degraded` for self and peers in each case, never for a warming member, an older
+peer or a member SWIM does not vouch for, and answers while the writer is held. On
+real nodes (P16): a TTL owner holding its writer for 75 s says so, a peer lists it
+`degraded: "writer"` and nobody else, it yields to one other member, and when the
+hold ends the flag and the entry clear and it reclaims at R. Fourteen mutation rows
+each fail a named test: the word cleared after the gate was let go (two
+paths), the holder read apart from the start, a raw-gate path that stores, no bound,
+index builds and drops judged, a non-local cause, `degraded` read from the classes,
+a target that ignores the wedge, work under a wedge counted good, a void tick that
+sets the flag, a warming member that says not responsive, a block that omits the
+flag, a wedge that is bad for a class owning nothing, a wedge that overrides a
+neutral class, and a bad tick that does not reset the good run.
