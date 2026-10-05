@@ -12,6 +12,14 @@ breaking changes and says so here; a `0.x.PATCH` bump never does.
 
 ## Unreleased
 
+### Documented
+
+- **When a schema-change confirmation answers `backoff`.** A confirmation that
+  arrives during a member's back-off is answered at once, as ADR-191 says; one
+  already waiting behind the push that failed is answered `backoff` when that
+  push fails, so the answer can take up to the request timeout. See
+  operations.md, `kimmy_ddl_confirmations_total`.
+
 ### Fixed
 
 - **A write a batch or a unique index refuses no longer advances the clock.**
