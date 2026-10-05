@@ -14355,3 +14355,175 @@ async fn deleting_a_role_twice_reaches_its_holders_both_times() {
     assert_eq!(again.status, 200, "{:?}", again.body);
     assert_eq!(again.body, json!({ "deleted": false, "invalidated": 1 }));
 }
+
+// ---------------------------------------------------------------------------
+// ADR-208 clauses: what counts as unchanged, `if_stamp` first, and chunks
+// ---------------------------------------------------------------------------
+
+/// A server with one collection `c` in `shop`, for the ADR-208 clause tests.
+async fn adr208_server() -> (Server, String) {
+    let server = Server::start().await;
+    let token = server.root().await;
+    server.post("/v1/db/shop/collections", Some(&token), json!({"name":"c"})).await;
+    (server, token)
+}
+
+/// "The same fields in another order ... is a change." A replacement through
+/// `/update` that only reorders the stored fields counts, and the new order is
+/// what is stored, where `bson::Document` equality would call it unchanged.
+#[tokio::test]
+async fn adr208_reordered_fields_are_a_change() {
+    let (server, token) = adr208_server().await;
+    server.post("/v1/db/shop/coll/c/docs", Some(&token), json!({"_id":"k","a":1,"b":2})).await;
+    let res = server
+        .post(
+            "/v1/db/shop/coll/c/update",
+            Some(&token),
+            json!({ "filter": {"_id": "k"}, "update": {"b": 2, "a": 1} }),
+        )
+        .await;
+    assert_eq!(
+        (&res.body["matched"], &res.body["modified"]),
+        (&json!(1), &json!(1)),
+        "{:?}",
+        res.body
+    );
+    assert!(res.body["stamp"].is_string(), "a change is written: {:?}", res.body);
+    let stored = server.get("/v1/db/shop/coll/c/docs/k", Some(&token)).await.body;
+    assert_eq!(stored.to_string(), r#"{"_id":"k","b":2,"a":1}"#);
+}
+
+/// "`-0.0` over `0.0`, which compare equal as numbers" is a change, and
+/// "a NaN over the same NaN is no change". The comparison is the stored
+/// bytes, not numeric or `bson::Document` equality.
+#[tokio::test]
+async fn adr208_the_sign_of_zero_is_a_change_and_nan_over_nan_is_not() {
+    let (server, token) = adr208_server().await;
+    let nan = json!({"$numberDouble": "NaN"});
+    let neg_zero = json!({"$numberDouble": "-0.0"});
+    server
+        .post(
+            "/v1/db/shop/coll/c/docs",
+            Some(&token),
+            json!({"_id":"z","v":{"$numberDouble":"0.0"}}),
+        )
+        .await;
+    server.post("/v1/db/shop/coll/c/docs", Some(&token), json!({"_id":"n","v":nan})).await;
+    let set = |id: &'static str, v: Value| {
+        server.post(
+            "/v1/db/shop/coll/c/update",
+            Some(&token),
+            json!({ "filter": {"_id": id}, "update": {"$set": {"v": v}} }),
+        )
+    };
+
+    let res = set("z", neg_zero.clone()).await;
+    assert_eq!(res.body["modified"], 1, "-0.0 over 0.0 is a change: {:?}", res.body);
+    assert!(res.body["stamp"].is_string(), "{:?}", res.body);
+    let res = set("z", neg_zero).await;
+    assert_eq!(res.body["modified"], 0, "-0.0 over -0.0 is not: {:?}", res.body);
+
+    let res = set("n", nan).await;
+    assert_eq!(
+        (&res.body["matched"], &res.body["modified"]),
+        (&json!(1), &json!(0)),
+        "{:?}",
+        res.body
+    );
+    assert!(res.body.get("stamp").is_none(), "nothing written, no stamp: {:?}", res.body);
+}
+
+/// "A stale stamp is `409 stale` even when the update would have changed
+/// nothing. A matched stamp with nothing to change answers `matched: 1,
+/// modified: 0` and no `stamp`."
+#[tokio::test]
+async fn adr208_a_stale_if_stamp_is_refused_before_a_no_op() {
+    let (server, token) = adr208_server().await;
+    let inserted =
+        server.post("/v1/db/shop/coll/c/docs", Some(&token), json!({"_id":1,"g":"x"})).await;
+    let first = stamp_of(&inserted.body);
+    let moved = server
+        .post(
+            "/v1/db/shop/coll/c/update",
+            Some(&token),
+            json!({ "filter": {"_id": 1}, "update": {"$set": {"g": "y"}} }),
+        )
+        .await;
+    let current = stamp_of(&moved.body);
+
+    let oplog_before = oplog_len(&server.state);
+    let commits_before = server.state.engine.commits();
+    // `first` is stale and `g: "y"` is already so: it would change nothing.
+    let no_op = |stamp: String| {
+        server.post(
+            "/v1/db/shop/coll/c/update",
+            Some(&token),
+            json!({ "filter": {"_id": 1}, "update": {"$set": {"g": "y"}}, "if_stamp": stamp }),
+        )
+    };
+    let stale = no_op(first.clone()).await;
+    assert_eq!(stale.status, 409, "{:?}", stale.body);
+    assert_eq!(stale.body["error"], "stale");
+    let fam = server
+        .post(
+            "/v1/db/shop/coll/c/find_and_modify",
+            Some(&token),
+            json!({ "filter": {"_id": 1}, "update": {"$set": {"g": "y"}}, "if_stamp": first }),
+        )
+        .await;
+    assert_eq!(fam.status, 409, "{:?}", fam.body);
+
+    let matched = no_op(current.clone()).await;
+    assert_eq!(matched.status, 200, "{:?}", matched.body);
+    assert_eq!((&matched.body["matched"], &matched.body["modified"]), (&json!(1), &json!(0)));
+    assert!(matched.body.get("stamp").is_none(), "no stamp for a no-op: {:?}", matched.body);
+    assert_eq!(oplog_len(&server.state), oplog_before);
+    assert_eq!(server.state.engine.commits(), commits_before);
+    // The caller's stamp still names the document.
+    let again = no_op(current).await;
+    assert_eq!(again.body["modified"], 0, "{:?}", again.body);
+}
+
+/// The chunk clauses: "A `multi` chunk whose matches were all unchanged ...
+/// is aborted ... not counted in `commits`. The next chunk still resumes
+/// strictly after its last match. A chunk holding both kinds commits once.
+/// `stamp` is the last written document's, and an empty chunk after it does
+/// not clear it." (The last sentence is the engine outcome's; the wire omits a
+/// `multi` stamp, ADR-084, and the storage tests hold it.)
+#[tokio::test]
+async fn adr208_chunks_skip_unchanged_commit_mixed_and_resume_after_the_last_match() {
+    let (server, token) = adr208_server().await;
+    server.state.engine.set_multi_chunk_docs(2);
+    // Chunks of two, in `_id` order: A unchanged, B mixed, C changed, D
+    // unchanged (after a write, so it must not clear the stamp).
+    for (id, g) in [(0, "x"), (1, "x"), (2, "x"), (3, "y"), (4, "y"), (5, "y"), (6, "x"), (7, "x")]
+    {
+        server.post("/v1/db/shop/coll/c/docs", Some(&token), json!({"_id": id, "g": g})).await;
+    }
+    let commits_before = server.state.engine.commits();
+    let oplog_before = oplog_len(&server.state);
+    let res = server
+        .post(
+            "/v1/db/shop/coll/c/update",
+            Some(&token),
+            json!({ "filter": {}, "update": {"$set": {"g": "x"}}, "multi": true }),
+        )
+        .await;
+    assert_eq!(res.status, 200, "{:?}", res.body);
+    // Every document is matched once (no chunk revisits), three changed, and
+    // only the mixed and the changed chunk committed.
+    assert_eq!(res.body["matched"], 8, "{:?}", res.body);
+    assert_eq!(res.body["modified"], 3, "{:?}", res.body);
+    assert_eq!(res.body["commits"], 2, "{:?}", res.body);
+    assert_eq!(server.state.engine.commits() - commits_before, 2);
+
+    // Over HTTP a `multi` write names no single version (ADR-084), so the
+    // engine's "last written" stamp is not in the answer; the storage tests
+    // hold that clause. What the wire shows is entries for the changed
+    // documents only.
+    assert!(res.body.get("stamp").is_none(), "{:?}", res.body);
+    assert_eq!(oplog_len(&server.state) - oplog_before, 3, "one entry per changed document");
+    let all =
+        server.post("/v1/db/shop/coll/c/find", Some(&token), json!({ "filter": {"g": "x"} })).await;
+    assert_eq!(all.body["documents"].as_array().map(Vec::len), Some(8));
+}
