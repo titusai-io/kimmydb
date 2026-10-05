@@ -271,12 +271,18 @@ fn add_degraded(
     } else {
         let (Some(node), Some(members)) = (node, state.members()) else { return };
         let view = members.view();
-        let Some(block) = view.blocks.get(&node).filter(|_| view.live.contains(&node)) else {
+        // A block that is within its lease: one past it says nothing new, and
+        // not hearing from a member is not evidence it is well or unwell.
+        let Some((block, true)) = view.live_block(&node, std::time::Instant::now()) else {
             return;
         };
-        if block.facts.writer_wedged == Some(true) {
+        let facts = &block.facts;
+        if facts.writer_wedged == Some(true) {
             Some("writer")
-        } else if block.facts.responsive == Some(false) {
+        } else if facts.writer_wedged.is_some() && facts.responsive == Some(false) {
+            // Only from a block that carries `writer_wedged`, which a 0.44.0
+            // build's does not: it advertises `responsive: false` through its
+            // whole first thirty seconds, which is warming up and no stall.
             Some("runtime")
         } else {
             None

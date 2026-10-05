@@ -2045,6 +2045,7 @@ async fn topology_says_degraded_only_while_a_member_cannot_serve() {
     let node = |_: u8| kimmy_core::NodeId::generate();
     let (writer_peer, runtime_peer, both_peer, fine_peer, silent_peer, warming_peer, gone_peer) =
         (node(1), node(2), node(3), node(4), node(5), node(6), node(7));
+    let (older_warming_peer, stale_peer) = (node(8), node(9));
     let members = Members::default();
     let blocks = [
         (
@@ -2071,14 +2072,26 @@ async fn topology_says_degraded_only_while_a_member_cannot_serve() {
         // A member warming up advertises no `responsive`, which is no stall.
         (warming_peer, Facts { writer_wedged: Some(false), responsive: None, ..Facts::default() }),
         (gone_peer, Facts { writer_wedged: Some(true), ..Facts::default() }),
+        // A 0.44.0 build advertises `responsive: false` through its whole warm-up
+        // and knows no `writer_wedged`: that is no stall, so a roll does not make
+        // every restarted member look degraded.
+        (older_warming_peer, Facts { responsive: Some(false), ..Facts::default() }),
+        // A block past its lease, wedged when it was sent, that SWIM still vouches
+        // for: it says nothing about now.
+        (stale_peer, Facts { writer_wedged: Some(true), ..Facts::default() }),
     ];
     for (i, (peer, facts)) in blocks.into_iter().enumerate() {
         let addr: std::net::SocketAddr = format!("127.0.0.1:{}", 7100 + i).parse().unwrap();
         members.insert_for_test(addr, peer);
+        let age = if peer == stale_peer {
+            std::time::Duration::from_secs(3_600)
+        } else {
+            std::time::Duration::ZERO
+        };
         members.record_peer_facts_for_test(
             peer,
             Facts { boot: vec![i as u8 + 1; 16], ..facts },
-            std::time::Duration::ZERO,
+            age,
         );
         if peer == gone_peer {
             // SWIM no longer vouches for it: still in the registry, its block's
@@ -2102,9 +2115,17 @@ async fn topology_says_degraded_only_while_a_member_cannot_serve() {
                 )
                 .unwrap()
         });
-    for peer in
-        [writer_peer, runtime_peer, both_peer, fine_peer, silent_peer, warming_peer, gone_peer]
-    {
+    for peer in [
+        writer_peer,
+        runtime_peer,
+        both_peer,
+        fine_peer,
+        silent_peer,
+        warming_peer,
+        gone_peer,
+        older_warming_peer,
+        stale_peer,
+    ] {
         state
             .engine
             .insert(
@@ -2157,6 +2178,12 @@ async fn topology_says_degraded_only_while_a_member_cannot_serve() {
     assert_eq!(peer_degraded(fine_peer), None);
     assert_eq!(peer_degraded(silent_peer), None, "a build that says neither is not degraded");
     assert_eq!(peer_degraded(warming_peer), None, "warming up is not a stall");
+    assert_eq!(
+        peer_degraded(older_warming_peer),
+        None,
+        "a 0.44.0 block's `responsive: false` is its warm-up, not a stall"
+    );
+    assert_eq!(peer_degraded(stale_peer), None, "a block past its lease says nothing about now");
     assert_eq!(
         topology["nodes"]
             .as_array()

@@ -298,13 +298,15 @@ mod tests {
         drop(hold);
     }
 
-    /// Writers taking and letting go of the gate against a reader: the word never
-    /// reads as free while a hold is in progress (a clear that landed after the
-    /// release would wipe the next holder's), never names a holder that is not the
-    /// one that began at that instant (a start and a holder read apart would), and
-    /// is free once they stop.
+    /// Writers taking and letting go of the gate against a reader: the reader never
+    /// names a holder that is not the one that began at the start it reads (a start
+    /// and a holder read apart would), and the word is free once they stop. A hold
+    /// also checks, twice, that the word still names it (a late clear would wipe
+    /// it), but that window is too narrow for this test to be the guard against a
+    /// clear after the release: the `clears_the_word_before_it_frees_the_gate` tests
+    /// are.
     #[test]
-    fn the_word_follows_the_gate_under_contention() {
+    fn a_reader_never_pairs_a_start_with_another_holds_holder_under_contention() {
         let (engine, _dir) = engine();
         let word = engine.writer_hold_word();
         let began: parking_lot::Mutex<std::collections::HashMap<u64, WriterHolder>> =

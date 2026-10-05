@@ -1175,6 +1175,20 @@ impl TelemetryGuard {
         );
         observe!(
             u64_observable_gauge,
+            "kimmy.writer.wedged",
+            "1",
+            "1 while the single writer has been held past the wedge bound by a hold whose length is judged (ADR-220).",
+            |s| u64::from(s.ownership.evaluator.writer_wedged)
+        );
+        observe!(
+            f64_observable_gauge,
+            "kimmy.writer.hold_age",
+            "s",
+            "How long the hold that has the single writer had lasted at the evaluator's last judged tick; 0 when the writer was free or held by an index build or drop.",
+            |s| s.ownership.evaluator.writer_hold_age_ms as f64 / 1000.0
+        );
+        observe!(
+            u64_observable_gauge,
             "kimmy.ownership.yield.enabled",
             "1",
             "1 unless KIMMY_OWNERSHIP_YIELD=off keeps this member from setting its own yield bits.",
