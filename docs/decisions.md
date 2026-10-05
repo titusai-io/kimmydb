@@ -20476,6 +20476,16 @@ resolved by the first push to it whose *answered* window covers the change:
   cluster tasks.
 - Any push added later goes through the same queue.
 
+> **Clarified (0.45.0).** "A confirmation there answers `pending` at once" holds
+> for a confirmation that **arrives during** a back-off. A confirmation already
+> waiting behind a push that was sent and then fails is resolved as `backoff` at
+> the instant the push fails (`Confirmer::settle` in `confirm.rs`, once the
+> failure has started the back-off): it was queued after the push's snapshot and
+> was waiting to be carried to the next push, which the back-off now holds off.
+> So a `backoff` answer can take up to the request timeout, the length of the
+> push it waited behind. A confirmation queued before the snapshot is resolved
+> `failed` by that same failure, as the snapshot rule above says.
+
 `kimmy_ddl_confirmations_total{outcome}` counts each confirmation by how it
 ended, and `kimmy_ddl_confirm_pushes_total` the windows sent for them.
 
