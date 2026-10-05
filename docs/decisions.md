@@ -22784,6 +22784,12 @@ one that did.
 > result; a replace keeps the stored `_id`'s type), so neither counts. See the
 > Query language page, "Integers stay integral".
 
+> **Clarified (0.45.0).** "`stamp` is the last written document's" in the
+> Chunks clause above describes the engine's outcome for a `multi` update. The
+> HTTP answer to a `multi` update carries no `stamp`, as ADR-084 settled: a
+> version names one document, so only a request that wrote exactly one
+> document without `multi` reports one.
+
 **Why.** Reporting a change that did not happen is answering a question the
 caller did not ask, and the cost was never the number: it was a write, an
 oplog entry, a replication round, an event and a commit per document, for
