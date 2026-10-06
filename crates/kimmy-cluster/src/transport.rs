@@ -878,10 +878,6 @@ where
                     }
                     ReplayPage::Done { next } => {
                         replay_cursor = None;
-                        info!(
-                            ?peer,
-                            "the peer answered the replay of this member's origin on its own contact"
-                        );
                         Message::ReplayAck { next_from: next, done: true, stalled: None }
                     }
                     ReplayPage::Advanced { next } | ReplayPage::Empty { next } => {
@@ -1581,12 +1577,19 @@ pub(crate) fn replay_apply(
     .map(|(entry, _)| entry.clone())
     .collect();
     if !lost.is_empty() {
-        warn!(
-            %peer,
-            entries = lost.len(),
-            "the peer holds writes this member made and no longer holds; it is marked \
-             restored until it has caught up, and reads them back"
-        );
+        // Said once for each peer in an armed episode, the first page that shows it, and
+        // not once for every page of a long replay (the same line for the outbound and
+        // the inbound way); what each later page did is counted, and the end is said.
+        if catch_up.replay_first_loss_from(their_node) {
+            warn!(
+                %peer,
+                entries = lost.len(),
+                "the peer holds writes this member made and no longer holds; it is marked \
+                 restored until it has caught up, and reads them back"
+            );
+        } else {
+            debug!(%peer, entries = lost.len(), "another page of writes this member lost");
+        }
         let lost_max = lost.iter().map(|entry| entry.stamp.hlc).max().unwrap_or_default();
         catch_up
             .mark_proven(
@@ -1608,9 +1611,25 @@ pub(crate) fn replay_apply(
     if !own.is_empty() {
         replay_counters().applied(via);
     }
+    catch_up.replay_count_page(their_node, own.len());
+    // The end of a peer's replay is said once, with what it came to.
+    let finish = || {
+        let (pages, entries) = catch_up.replay_take_progress(their_node);
+        info!(
+            %peer,
+            pages,
+            entries,
+            via = match via {
+                Via::Outbound => "outbound",
+                Via::Inbound => "inbound",
+            },
+            "the peer's replay of this member's own origin is finished"
+        );
+        catch_up.replay_finished(their_node);
+    };
     let Some(last) = own.last().map(|entry| entry.stamp.hlc) else {
         if exhausted {
-            catch_up.replay_finished(their_node);
+            finish();
             return Ok(ReplayPage::Done { next: from });
         }
         let next = scanned_to.max(from);
@@ -1621,7 +1640,7 @@ pub(crate) fn replay_apply(
     };
     catch_up.replay_advanced(their_node, last);
     if exhausted {
-        catch_up.replay_finished(their_node);
+        finish();
         return Ok(ReplayPage::Done { next: last });
     }
     Ok(ReplayPage::Advanced { next: last })

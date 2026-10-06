@@ -1119,3 +1119,93 @@ async fn a_missing_ack_is_no_failed_round_and_no_back_off_in_the_loop() {
     looping.abort();
     serving.abort();
 }
+
+/// What a test's subscriber saw: the level and message of each event.
+#[derive(Clone, Default)]
+struct Seen(Arc<std::sync::Mutex<Vec<(tracing::Level, String)>>>);
+
+impl tracing::Subscriber for Seen {
+    fn enabled(&self, _: &tracing::Metadata<'_>) -> bool {
+        true
+    }
+    fn new_span(&self, _: &tracing::span::Attributes<'_>) -> tracing::Id {
+        tracing::Id::from_u64(1)
+    }
+    fn record(&self, _: &tracing::Id, _: &tracing::span::Record<'_>) {}
+    fn record_follows_from(&self, _: &tracing::Id, _: &tracing::Id) {}
+    fn event(&self, event: &tracing::Event<'_>) {
+        struct Message(String);
+        impl tracing::field::Visit for Message {
+            fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+                if field.name() == "message" {
+                    self.0 = format!("{value:?}");
+                }
+            }
+        }
+        let mut message = Message(String::new());
+        event.record(&mut message);
+        self.0.lock().unwrap().push((*event.metadata().level(), message.0));
+    }
+    fn enter(&self, _: &tracing::Id) {}
+    fn exit(&self, _: &tracing::Id) {}
+}
+
+/// A replay of many pages from one peer says once that the peer holds writes the member
+/// lost, and once that it is finished: the same for the pages a peer serves on its own
+/// contact and the ones the member asks for.
+#[tokio::test]
+async fn a_replay_of_many_pages_is_reported_once_not_once_per_page() {
+    let f = fixture(10, 0);
+    let c = f.c.node_id();
+    let from = f.catch_up.replay_from(c);
+    let at = |n: u64| Hlc::new(from.wall_ms + n, 0);
+    let pages: Vec<(Vec<OplogEntry>, bool, Hlc)> = vec![
+        ((1..=3).map(|n| own_entry(&f, at(n), &format!("p{n}"))).collect(), false, at(3)),
+        ((4..=6).map(|n| own_entry(&f, at(n), &format!("p{n}"))).collect(), false, at(6)),
+        ((7..=9).map(|n| own_entry(&f, at(n), &format!("p{n}"))).collect(), true, at(9)),
+    ];
+    let seen = Seen::default();
+    let log = Arc::clone(&seen.0);
+    let _recording = tracing::subscriber::set_default(seen);
+    scripted(&f, |mut stream| async move {
+        assert!(ask_versions(&mut stream).await.is_some());
+        let mut cursor = from;
+        for (entries, exhausted, scanned_to) in pages {
+            write_frame(
+                &mut stream,
+                &Message::ReplayEntries {
+                    from: cursor,
+                    entries,
+                    exhausted,
+                    horizon: false,
+                    scanned_to,
+                },
+            )
+            .await
+            .unwrap();
+            match read_frame(&mut stream).await.unwrap() {
+                Message::ReplayAck { next_from, .. } => cursor = next_from,
+                other => panic!("{other:?}"),
+            }
+        }
+    })
+    .await
+    .unwrap();
+    let log = log.lock().unwrap();
+    let said = |needle: &str, level: tracing::Level| {
+        log.iter().filter(|(l, m)| *l == level && m.contains(needle)).count()
+    };
+    assert_eq!(
+        said("holds writes this member made and no longer holds", tracing::Level::WARN),
+        1,
+        "three pages, one warning: {log:?}"
+    );
+    assert_eq!(
+        said("replay of this member's own origin is finished", tracing::Level::INFO),
+        1,
+        "and one line for the end: {log:?}"
+    );
+    // A later episode (a new arming) says it again.
+    f.catch_up.arm_replay(f.a.own_position_at_open(), None).unwrap();
+    assert!(f.catch_up.replay_first_loss_from(c), "armed afresh, it is the first again");
+}
