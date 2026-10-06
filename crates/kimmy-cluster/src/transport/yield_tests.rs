@@ -215,6 +215,7 @@ async fn the_sync_path_confirms_only_on_an_echo() {
             facts: facts.map(Arc::new),
             facts_gen,
             echo,
+            replay_from: None,
         };
         let mut stalls = stalls_for(&a);
         let (ours, theirs) = tokio::io::duplex(MAX_FRAME);
@@ -280,6 +281,7 @@ async fn an_echo_of_the_previous_process_confirms_nothing_on_either_path() {
         facts: Some(Arc::new(Facts { boot: vec![0xB; 16], ..Facts::default() })),
         facts_gen: Some(500),
         echo: Some(old),
+        replay_from: None,
     };
     let mut stalls = stalls_for(&a);
     let (ours, mut theirs) = tokio::io::duplex(MAX_FRAME);

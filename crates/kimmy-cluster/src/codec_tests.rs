@@ -236,6 +236,7 @@ fn a_043_decoder_reads_the_new_block_and_frames() {
             facts: Some(Arc::new(block.clone())),
             facts_gen: Some(3),
             echo,
+            replay_from: None,
         },
     ] {
         let bytes = bson::serialize_to_vec(&message).unwrap();

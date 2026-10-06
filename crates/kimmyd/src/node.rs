@@ -663,6 +663,7 @@ async fn start_and_serve(
         .map_err(|e| failed_before_open(anyhow::anyhow!(e)))?;
     let test_switches = crate::yielding::TestSwitches::from_env()
         .map_err(|e| failed_before_open(anyhow::anyhow!(e)))?;
+    test_switches.arm_at_start();
     // Whether this start begins in probation: read before the store opens, because
     // the open rewrites the format sidecar the decision compares the start record
     // with (ADR-213, C4).
@@ -2565,6 +2566,11 @@ async fn spawn_cluster(
             Duration::from_secs(config.cluster.sync_interval_secs),
             config.cluster.fanout,
         );
+        // What a connection served here asks a peer for and applies, when this
+        // member's replay of its own origin is owed (ADR-212's addendum).
+        if let Some(catch_up) = state.catch_up() {
+            live.set_catch_up(Arc::clone(catch_up));
+        }
         live.set_facts_source(crate::facts::source(
             Arc::downgrade(&engine),
             boot,

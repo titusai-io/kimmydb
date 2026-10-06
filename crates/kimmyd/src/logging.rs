@@ -1477,6 +1477,76 @@ impl TelemetryGuard {
         );
         observe!(
             u64_observable_counter,
+            "kimmy.replay.inbound.served",
+            "{page}",
+            "Restored-member replay pages, inbound, served (ADR-212).",
+            |s| s.replay[0][0]
+        );
+        observe!(
+            u64_observable_counter,
+            "kimmy.replay.inbound.applied",
+            "{page}",
+            "Restored-member replay pages, inbound, applied (ADR-212).",
+            |s| s.replay[0][1]
+        );
+        observe!(
+            u64_observable_counter,
+            "kimmy.replay.inbound.refused",
+            "{page}",
+            "Restored-member replay pages, inbound, refused (ADR-212).",
+            |s| s.replay[0][2]
+        );
+        observe!(
+            u64_observable_counter,
+            "kimmy.replay.inbound.ack_timeout",
+            "{page}",
+            "Restored-member replay pages, inbound, ack_timeout (ADR-212).",
+            |s| s.replay[0][3]
+        );
+        observe!(
+            u64_observable_counter,
+            "kimmy.replay.inbound.stalled",
+            "{page}",
+            "Restored-member replay pages, inbound, stalled (ADR-212).",
+            |s| s.replay[0][4]
+        );
+        observe!(
+            u64_observable_counter,
+            "kimmy.replay.outbound.served",
+            "{page}",
+            "Restored-member replay pages, outbound, served (ADR-212).",
+            |s| s.replay[1][0]
+        );
+        observe!(
+            u64_observable_counter,
+            "kimmy.replay.outbound.applied",
+            "{page}",
+            "Restored-member replay pages, outbound, applied (ADR-212).",
+            |s| s.replay[1][1]
+        );
+        observe!(
+            u64_observable_counter,
+            "kimmy.replay.outbound.refused",
+            "{page}",
+            "Restored-member replay pages, outbound, refused (ADR-212).",
+            |s| s.replay[1][2]
+        );
+        observe!(
+            u64_observable_counter,
+            "kimmy.replay.outbound.ack_timeout",
+            "{page}",
+            "Restored-member replay pages, outbound, ack_timeout (ADR-212).",
+            |s| s.replay[1][3]
+        );
+        observe!(
+            u64_observable_counter,
+            "kimmy.replay.outbound.stalled",
+            "{page}",
+            "Restored-member replay pages, outbound, stalled (ADR-212).",
+            |s| s.replay[1][4]
+        );
+        observe!(
+            u64_observable_counter,
             "kimmy.sync.ddl_relogged",
             "{change}",
             "Schema changes a snapshot restore appended to this node's oplog so that it can serve them onward.",

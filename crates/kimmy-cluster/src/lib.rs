@@ -50,6 +50,7 @@ pub use peers::{
 };
 pub use transport::{
     AcceptErrorHook, AcceptListener, FROZEN_CONTACTS, PeerPosition, PeerStalls, PushHook,
-    REPAIR_ATTEMPTS, REPAIR_COOLDOWN_ROUNDS, Repair, ServeFailHook, ServeFailure,
-    accept_error_is_the_listeners, serve, serve_with, sync_once, sync_once_with,
+    REPAIR_ATTEMPTS, REPAIR_COOLDOWN_ROUNDS, Repair, ReplayCounters, ReplayResult, ServeFailHook,
+    ServeFailure, accept_error_is_the_listeners, replay_counters, serve, serve_with, sync_once,
+    sync_once_with,
 };
