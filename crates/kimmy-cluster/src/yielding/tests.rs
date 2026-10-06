@@ -1881,6 +1881,46 @@ fn reclaim_waits_for_the_hold_to_end_and_then_takes_r_ticks_exactly() {
     );
 }
 
+/// A yielded class owns nothing, so a wedge adds it no bad item (ADR-220); it reads
+/// idle, and idle ticks count towards R. They must not count while the writer is still
+/// held, or a hold longer than the yield plus R ticks reclaims the class into the
+/// wedged writer it left. Found by the lab: a 120 s hold reclaimed the ttl class 75 s
+/// after the hold ended, about 15 ticks, not R.
+#[test]
+fn a_yielded_class_that_owns_nothing_does_not_reclaim_under_a_still_held_writer() {
+    let mut rig = Rig::new();
+    rig.responsive();
+    rig.peer(1, peer_facts(ClassState::Ok, true));
+    rig.owned(W, 1);
+    rig.held(wedge_secs());
+    rig.work(W);
+    rig.until(20, |d| d.classes.webhooks.yielding);
+    // The yield has taken the work away: the class owns nothing and reads idle.
+    rig.owned(W, 0);
+    rig.healthy(W);
+    for i in 0..(RECLAIM_TICKS as usize * 3) {
+        let d = rig.tick();
+        assert!(d.writer_wedged);
+        assert!(rig.yielding(W), "tick {i} of a hold that is still on: reclaimed into the wedge");
+    }
+    // The hold ends: R good (idle) ticks from now, exactly.
+    rig.free();
+    for i in 1..RECLAIM_TICKS {
+        let d = rig.tick();
+        assert!(rig.yielding(W), "tick {i} of {RECLAIM_TICKS} after the hold");
+        assert!(!d.writer_wedged);
+    }
+    let d = rig.tick();
+    assert!(!rig.yielding(W), "reclaimed at exactly R after the hold");
+    assert_eq!(
+        events_of(
+            &d,
+            |e| matches!(e, Event::Reclaimed { r_ticks, .. } if *r_ticks == RECLAIM_TICKS)
+        ),
+        1
+    );
+}
+
 /// A wedge that recurs soon after a reclaim is a new yield inside the back-off
 /// window: R doubles.
 #[test]

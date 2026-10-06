@@ -1104,6 +1104,11 @@ impl Evaluator {
         // --- reclaim ---
         if track.stalled {
             match verdict {
+                // A tick under a wedged writer is not good for reclaim whatever the class
+                // owns (ADR-220): a yielded class owns nothing, so the wedge adds it no
+                // bad item and it reads idle, and idle ticks counted here would reclaim
+                // it into the wedge it left. The R good ticks start at the let-go.
+                _ if self.writer_wedged => track.good_run = 0,
                 Verdict::Good | Verdict::Idle => track.good_run += 1,
                 Verdict::Bad => track.good_run = 0,
                 _ => {}
