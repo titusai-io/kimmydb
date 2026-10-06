@@ -2357,7 +2357,7 @@ to the release, and no more than that: it sits beside the archive, and whoever
 could replace one could replace both.
 
 ```bash
-V=0.44.0; A=kimmyd-x86_64-unknown-linux-musl.tar.xz
+V=0.45.0; A=kimmyd-x86_64-unknown-linux-musl.tar.xz
 curl -LO "https://github.com/titusai-io/kimmydb/releases/download/v$V/$A"
 curl -LO "https://github.com/titusai-io/kimmydb/releases/download/v$V/$A.sha256"
 shasum -a 256 -c "$A.sha256"
@@ -2377,7 +2377,7 @@ signing key, because there is none to copy. `gh` performs the check:
 gh attestation verify kimmyd-x86_64-unknown-linux-musl.tar.xz -R titusai-io/kimmydb
 
 # The container image, by tag or by digest
-gh attestation verify oci://ghcr.io/titusai-io/kimmydb:0.44.0 -R titusai-io/kimmydb
+gh attestation verify oci://ghcr.io/titusai-io/kimmydb:0.45.0 -R titusai-io/kimmydb
 ```
 
 A successful verification prints the workflow that produced the artifact and
@@ -2483,6 +2483,8 @@ refuses an unknown key in `[cluster]` when it parses the file, and exits: remove
 variable `KIMMY_CLUSTER_EXPECTED_MEMBERS` (`catch_up_wait_secs` has none) is
 ignored by 0.42.0, so a manifest that sets it needs no edit. A member on the
 defaults rolls back untouched.
+
+**Rolling back from 0.45.0 to 0.44.0 needs no store work and no edit to the configuration.** No table, `kimmy.format` schema (still 4), redb version or configuration key changed. The wire gained one optional field on `Vectors` (`replay_from`, [ADR-212](decisions.md)'s addendum) and one in the facts block (`writer_wedged`, [ADR-220](decisions.md)), both of which 0.44.0 skips, and two frames, `ReplayEntries` and `ReplayAck`, which a member sends only to a peer that asked for the replay on its `Vectors`; 0.44.0 never asks, so it never meets them (it would read one as malformed, ending that contact). A wedged 0.45.0 member is refused as a target only by 0.45.0 peers, and a 0.44.0 member does not read `degraded` in `/v1/topology`. `aggregate` with `explain` is a `422` on 0.44.0, and a `let` name inside a sub-pipeline `$expr` a `400`. A restored member's replay asked of a 0.44.0 peer is answered over the member's own dial, as before. Nothing is stored for the new counters.
 
 **Rolling back from 0.44.0 to 0.43.0 needs no store work and no edit to the configuration.** The replay floor file, `kimmy.replay-floor`, gains `owed = <node id>` lines after its two floor lines ([ADR-212](decisions.md)); 0.43.0 reads the floor lines and skips every other key, so it reads the same floor. It keeps the file as it is when it does not move the floor, so **stale `owed` lines can survive a 0.43.0 run**: back on 0.44.0 each holds a marked member at `503` for `cluster.catch_up_wait_secs` and is released after the dwell if it never comes back. 0.43.0 has the one-tick settle (a member that owes the replay is dropped from the wait on the first tick SWIM does not list it) and the clear past the hold, both of which 0.44.0 ends ([ADR-212](decisions.md)). A collection owed an embedding scan is marked in the store's metadata table (`vector_rescan:<collection id>`); 0.43.0 looks metadata keys up by name and never lists them, so it ignores the marks, does not run those scans, and the documents a scan would have embedded wait. The marks stay in the store and 0.44.0 scans the marked collections at its next start. Ownership yielding ([ADR-213](decisions.md)) adds the advisory file `kimmy.last-start`, which 0.43.0 never opens, and optional fields on the replication frames and the facts block, which 0.43.0 decodes leniently and skips; a member that yields keeps owning the class until no 0.43.0 member is live, because an older peer never confirms. `kimmyd check-store` and `kimmy_store_repairs_total` do not exist in 0.43.0.
 
