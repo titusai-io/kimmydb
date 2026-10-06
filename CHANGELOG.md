@@ -10,7 +10,37 @@ Versioning follows the pre-1.0 policy in
 [docs/compatibility.md](docs/compatibility.md): a `0.MINOR` bump may carry
 breaking changes and says so here; a `0.x.PATCH` bump never does.
 
-## Unreleased
+## 0.45.0 - 2026-10-06
+
+This is a minor release with no breaking change and no rollback boundary: no
+configuration key, table, `kimmy.format` schema (still 4), redb version (4.3.0)
+or wire frame that 0.44.0 cannot read changed, and every answer that differs
+from 0.44.0's is a request that was refused before and works now. What is new:
+
+- **A `$lookup` sub-pipeline's `$match` reads the `let` names through `$expr`, and
+  a correlated equality is a hash join** (10,000 inputs against 100,000 foreign
+  documents: 104 s to 86 ms), with `explain` on `aggregate` to see the plan.
+- **A member whose single writer is wedged yields what it owns and says so** in
+  `/v1/topology` (`degraded`), and does not take the work back while the writer
+  is still held (ADR-220).
+- **A restored member reads its lost writes back over its peers' contacts as well
+  as its own**, so a filter that drops only what it opens no longer leaves it owing
+  the replay (ADR-212's addendum); `kimmy_replay_total` counts it.
+- **A `$let` variable the body does not read can no longer fail the expression**
+  (ADR-219), and a write a batch or a unique index refuses no longer advances the
+  clock.
+
+Rolling back to 0.44.0: nothing to do. A three-member cluster on this build wrote
+documents, held a writer wedge, restored a member from a backup (and replayed its
+lost writes), and 0.44.0 started on the same data directories and configuration
+with no repair and no refusal, held the same counts and replicated writes; 0.45.0
+then started on them again and did the same. What 0.44.0 does not know of: the
+new optional `replay_from` field on `Vectors` and `writer_wedged` in the facts
+block, which it ignores; the `ReplayEntries` and `ReplayAck` frames, which a
+member sends only to a peer that asked, and 0.44.0 never asks; `degraded` in
+`/v1/topology`, which a client ignores. `explain` on `aggregate` is a `422` on
+0.44.0, and a `let` name in a sub-pipeline `$expr` a `400`, as before. A mixed
+roll answers by member until every member is rolled.
 
 ### Added
 
