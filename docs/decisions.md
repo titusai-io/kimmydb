@@ -24295,12 +24295,23 @@ peer can reach A, so A now asks over the contact the peer opened.
   that is oversize, unordered, of another origin or below `from` is refused as
   malformed. The ack is a check, not a command: the peer trusts its own cursor.
 - **No livelock.** A page naming a collection A lacks, or one A is purging,
-  *stalls*: the ack says so (`stalled`), the replay ends for that contact only,
-  and the ordinary pull that follows, or the next contact, brings the
-  collection. An empty page that is not the end only advances the cursor. A
-  replay finishes only on `exhausted`. An ack that does not advance, or that is
-  not read within two seconds, ends the replay for the contact and does not fail
-  it.
+  *stalls*: the ack says so (`stalled`), the replay ends for that contact only, and
+  the contact goes on with the peer's ordinary round (it is not spent). The
+  collection reaches A as collections always do, by A's own rounds with a member
+  that holds it (a contact the peer opens does not push its collections to A), and
+  the next contact's page applies. A member that can reach no such member stays
+  owed, which is the limit stated below. An empty page that is not the end only
+  advances the cursor, to where the holder's walk got (`scanned_to`, on the page, at
+  least the page's last entry and at least its start): a walk cut by the holder's
+  budget before it reached the member's entries still makes progress at every
+  contact, and the replay never repeats the first. The holder's walk passes over
+  every origin but the member's, so neither a long tail of another origin nor
+  another origin's collected entries holds the member's replay back. A replay
+  finishes only on `exhausted`. An ack that does not advance ends the replay for the
+  contact. An ack not read within two seconds ends the **contact**, not just the
+  replay: a late ack would desynchronise the stream, so nothing more is sent on it,
+  the ordinary pull and push happen at the next contact, `ack_timeout` is counted,
+  and no sync failure is counted and no back-off starts.
 - **Counted** on `kimmy_replay_total{via,result}`: `inbound` or `outbound`; `served`,
   `applied`, `refused`, `ack_timeout`.
 - **Test switch.** `KIMMY_TEST_REFUSE_DIAL=<addr|node id>[,...]` makes one member
