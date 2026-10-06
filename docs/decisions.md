@@ -25403,7 +25403,14 @@ wait out their timeout.
   neutral tick, and never overrides a class that is gated, switched off or
   stopping. Work done under a wedge is not a good tick; the bad item takes it, so
   a yielded member does not reclaim into a wedged writer, and reclaim follows once
-  the hold ends, after R good ticks as before. The class windows (ttl 3 of 5, the
+  the hold ends, after R good ticks as before. **That holds for a class that owns
+  nothing too** (found by the lab, 2026-10-06): a yielded class owns nothing, so the
+  wedge adds it no bad item and it reads idle, and idle ticks counted towards R while
+  the writer was still held reclaimed it, after the yield plus R ticks, into the wedge
+  it had left (a 120 s hold reclaimed 75 s after it ended). A tick under a wedged
+  writer now resets the good run whatever the class owns, so the R good ticks start
+  at the let-go. A runtime stall never had the gap: an idle tick needs a responsive
+  member. The class windows (ttl 3 of 5, the
   others 6 of 12), the target rule, the cap (`max(1, live/2)`, `live` being the
   peers), the latch and the back-off are unchanged and inherit their proofs.
 - **A wedged member is no target for any class.** `Facts` gains `writer_wedged`,
@@ -25484,7 +25491,7 @@ with a local cause; a wedge yields to a target; a wedged peer is refused for eve
 class and one that sends nothing is not; with every member wedged nothing yields and
 the latch holds; a void tick leaves the fact and discards the hold; a gated,
 switched-off or stopping class stays neutral and work under a wedge is not a good
-tick; reclaim waits for the hold to end and then takes R ticks exactly; a wedge
+tick; reclaim waits for the hold to end and then takes R ticks exactly, for a class that owns nothing as for one that works; a wedge
 that recurs backs off; the wedge and its end are said once; the block says nothing
 of the runtime while warming up, `false` for a stall; and the field reads a bool and
 nothing else. `kimmyd`: the inputs skip the holders that have no bound; the switch
