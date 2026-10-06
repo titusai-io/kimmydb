@@ -25,6 +25,7 @@ pub mod egress {
 pub mod error;
 pub mod exec;
 pub mod expiry;
+pub mod explain;
 pub mod federation;
 pub mod json;
 pub mod limits;

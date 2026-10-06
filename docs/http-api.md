@@ -710,7 +710,7 @@ the collection has — is `200 {"index": "<name>", "count": 0, "groups": []}`,
 not a 404: the question was what collides there, and the answer is nothing.
 
 Add `"explain": true` to `find`, `count`, `update` or `delete` to see whether
-an index was used:
+an index was used (and to `aggregate` to see its plan without running it: below):
 
 ```json
 { "explain": { "strategy": "index", "index": "qty_1", "indexFieldsUsed": 1,
@@ -727,6 +727,17 @@ many entries as it returns, a range put in `_id` order reads the whole range.
 
 `count` visits every match and holds none of them: its cost is the time of
 the scan, not the memory of the result.
+
+**On `aggregate`, `explain: true` plans and runs nothing**
+([ADR-221](decisions.md), [Aggregation](aggregation.md#performance)). It answers
+`{"explain": {"executed": false, "source": ..., "stages": [...]}}` with no
+`documents` and no `count`, and without `documentsExamined`, `documentsMatched` or
+`indexEntriesRead`, which are what a scan found. It is the one `explain` that does
+not execute the read it describes. `source` carries the same `strategy`, `index`,
+`indexFieldsUsed` and `probes` as a `find` over the leading `$match`. A
+non-boolean `explain`, `null` included, is `422`, and so is any other field the
+route does not define; `?explain=true` is `400`, as on any route with no query
+string. It needs the access a run needs, `$lookup` collections included.
 
 **On `update` and `delete`, `explain: true` plans the write; it does not
 perform it** ([ADR-131](decisions.md)). It answers with the same
@@ -937,7 +948,7 @@ round-trips exactly, and there is a test pinning it.
 `null`, so a number never silently becomes a missing value.
 
 **Every request body is closed.** A field the route does not define — a
-misspelt `limitt`, an `explain` on `aggregate`, anything the route's section
+misspelt `limitt`, an `explainn` on `aggregate`, anything the route's section
 does not list — is refused `422 bad_request`, and the message names the field
 and lists the ones the route takes ([ADR-121](decisions.md)). Nested shapes
 are closed too: an entry in an index's `fields`, a search's `weights`, a

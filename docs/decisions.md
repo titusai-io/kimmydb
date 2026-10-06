@@ -24005,6 +24005,11 @@ not have.
 **Not done.** `aggregate` has no `explain`, so there is nothing to report the
 stage in; see Aggregation, "Performance".
 
+> **Clarified by [ADR-221](#adr-221--aggregate-takes-explain-true-and-answers-with-a-plan-without-running-anything).**
+> `aggregate` now has a plan-only `explain`, which reports a `$vectorSearch`
+> source from the collection's configuration. Until then `explain` on `aggregate`
+> was refused as an unknown field (ADR-121), never accepted and ignored.
+
 **Test.** `kimmy-query`: the fields parsed, first-stage-only (second place and
 inside a `$lookup`), each of the four refused names with the spelling it gives,
 unknown and malformed fields, and the supported-stages message. `kimmy-api`
@@ -25440,3 +25445,101 @@ a target that ignores the wedge, work under a wedge counted good, a void tick th
 sets the flag, a warming member that says not responsive, a block that omits the
 flag, a wedge that is bad for a class owning nothing, a wedge that overrides a
 neutral class, and a bad tick that does not reset the good run.
+
+## ADR-221 — `aggregate` takes `explain: true` and answers with a plan, without running anything
+
+> **Amends [ADR-216](#adr-216--vectorsearch-is-the-first-aggregation-stage-spelled-as-the-vector-search-endpoint-is)'s
+> "Not done".** It also replaces, for the one documented form, the refusal ADR-121
+> and ADR-124 gave `explain` on `aggregate`.
+
+**Status:** accepted, for the next `0.MINOR`. No stored format, file or configuration
+key changes, so no rollback boundary: a 0.44 member answers a body with `explain` as
+it always did, `422`, which a client sees during a roll.
+
+**What it was.** `explain` on `aggregate` was **refused**, not ignored: the body is
+closed (`422`, `explain: unknown field`) and the route reads no query string (`400`).
+Nothing named it in a test. Chris chose to build it, as `find`, `count`, `update` and
+`delete` have it, with one difference that matters.
+
+**Decision.**
+
+- **The request mirrors the others:** `"explain": true` in the body of the existing
+  route, no new route. The body stays closed: any other field, a non-boolean
+  `explain` (`null` included) is `422`; `?explain=true` is `400`; `explain: false`
+  is an ordinary run.
+- **It runs nothing.** `find`'s `explain` runs a read-only scan and reports what it
+  found; an aggregate can be arbitrarily large, so this one reports only what is
+  decided before anything is read: the parsed pipeline, the collections' definitions
+  and the leading filter's access path. The answer is `{"explain": {"executed":
+  false, "planner": ..., "source": ..., "stages": [...]}}` with no `documents` and no
+  `count`, and none of `documentsExamined`, `documentsMatched`, `indexEntriesRead`,
+  `unkeyedCandidates`, `undecidableCandidates`: not as `null` either.
+- **The source plan is the read's, by construction.** `plan_access(filter, indexes)`
+  chooses the primary key, then an index, then a scan, and `visit_matching` and
+  `explain` both call it; `QueryStats::planned` and `plan_json` render the plan's
+  own keys with `find`'s names. A test compares what a real aggregate's source read
+  answers with against what `explain` reports.
+- **The multikey note** is made only for a plan with both bounds, the one plan the
+  scan re-checks and can fall back from.
+- **Stages after the source** each say they run in memory and what they do; `$sort`,
+  `$group` and `$count` say they block. No counts, no timings.
+- **`$lookup`** says what the executor does: the equality form scans the foreign
+  collection once and files it in memory (`foreignScanHashed`; no foreign index is
+  used), the `let`/`pipeline` form scans it once and runs the sub-pipeline for each
+  input document (`foreignScanNestedLoop`) and reads nothing when no document reaches
+  it. The equality form reads the foreign side whatever reaches it. Sub-pipeline
+  stages are listed and marked `perInputDocument`, except the leading `$match`, which
+  is applied once and is never planned.
+- **`$vectorSearch`** reports the collection's configuration (`configured`,
+  `dimension`, `metric`, `embedsServerSide`) and `queryUsable`: false where a run
+  would refuse the query as sent (no configuration, query text under a client-vector
+  provider, a vector of the wrong width). It calls no provider and **reads no stored
+  vector, so it cannot report the `409` a run gives an empty collection**, and says
+  so.
+- **Authorization is a run's, and can be a little stricter:** `read` on the
+  collection, then the parse (`400`), then `read` on every collection a `$lookup`
+  names, nested ones included, and `search` for `$vectorSearch`. A run never reaches
+  a nested `$lookup` that no document reaches; explain checks it.
+- **No writes:** `aggregate` is a read, and `$out` and `$merge` do not exist. The day
+  one is built its explain must plan it and not act.
+- **MCP:** the aggregate tool takes `explain` too, as the `find` tool does, and
+  answers with the plan and no documents.
+- **The span** is `aggregate_explain`.
+
+**Not Breaking.** A request that was a `422` is a `200`; nothing that worked changes.
+
+**Rejected.**
+
+- *A new route:* a second place to keep in step with the executor, for a flag four
+  routes already spell this way.
+- *`find`'s measured keys as zero or `null`:* a zero reads as a measurement.
+- *Running the pipeline to count per stage:* the cost an explain exists to avoid.
+
+### Test
+
+`kimmy-api` (`explain.rs`): the source plan equals the one a real aggregate's read
+reports, over filters that reach `idLookup`, `index`, `indexUnion` and
+`collectionScan`; no leading `$match` plans the collection and took no stage; the
+answer has no documents and no measured key; pipelines that fail on data when run
+(`$divide` by zero, a `$match` `$expr` that fails), and one over a ceiling, are
+planned; the multikey note is made only with both bounds; a partial index the
+filter does not provably fall within is not planned; every stage kind, in order;
+both `$lookup` forms, including what is hoisted and what reads nothing; the order of
+authorization over every collection named, nested ones too; a `$vectorSearch`
+source for no configuration, text under a client-vector provider, a wrong-width
+vector and a good one. Through the router: the plan, the same plan as `find`'s,
+`explain: false` as a run, `null`, a string, a number, a misspelt field and an extra
+field each `422`, `?explain=true` `400`, and a malformed pipeline, an unknown stage
+and a missing collection answering as a run does; against the OpenAPI schema. MCP:
+the plan with no documents, the same refusal for a collection the caller cannot
+read, and an unknown argument still refused. The access path's priority (the primary
+key over an index that also applies, an index over a scan) is pinned directly,
+because `explain` and the read share it and would move together. A caller
+granted only `search` is refused as a run refuses it, and with the walks armed to
+stop at their first row an explain leaves them running where the same pipeline run
+stops them. Fourteen mutation rows each fail a named test: the order of the access path swapped, a measured key in
+the plan, the flag ignored (route and MCP), the body opened, a foreign collection not
+authorized, the multikey note always made, an empty-input `$lookup` reported as
+scanning, the hoisted `$match` reported per input document, `executed: true`, a
+`$vectorSearch` query always usable, the pipeline run, the source authorized as
+`search` and the source collected.

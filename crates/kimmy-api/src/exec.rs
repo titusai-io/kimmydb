@@ -65,7 +65,7 @@ pub const MAX_BULK_INSERT: usize = 1000;
 /// (ADR-068); declared `Empty` and filled afterwards, because a field never
 /// filled is not exported at all, whereas an empty string would be an attribute
 /// asserting the collection is called "".
-fn op_span(operation: &'static str, db: &str, coll: Option<&str>) -> tracing::Span {
+pub(crate) fn op_span(operation: &'static str, db: &str, coll: Option<&str>) -> tracing::Span {
     use opentelemetry_semantic_conventions::attribute as semconv;
 
     use crate::telemetry::{DB_SYSTEM, include_names};
@@ -811,6 +811,84 @@ impl<F: FnMut(kimmy_core::Stamp, bson::Document)> Recheck<'_, F> {
     }
 }
 
+/// How a filter will be answered, decided from the filter and the collection's
+/// index definitions alone: no document and no index entry is read to decide.
+///
+/// `visit_matching` and an aggregate's `explain` both ask this and nothing else,
+/// so what `explain` reports is what the read does, by construction (ADR-221).
+#[derive(Debug)]
+pub(crate) enum Access {
+    /// The filter pins `_id`: these encoded keys are read from the primary key.
+    IdLookup(plan::PrimaryKeyPlan),
+    /// An index narrows the candidates.
+    Index(plan::IndexPlan),
+    /// Every document of the collection.
+    Scan,
+}
+
+/// Choose the access path: the primary key first, then an index, then the
+/// collection.
+pub(crate) fn plan_access(filter: &filter::Filter, indexes: &[kimmy_storage::IndexMeta]) -> Access {
+    if let Some(pk) = plan::choose_primary_key(filter) {
+        return Access::IdLookup(pk);
+    }
+    match plan::choose(filter, indexes) {
+        Some(index) => Access::Index(index),
+        None => Access::Scan,
+    }
+}
+
+impl QueryStats {
+    /// The stats of a read that has not run: the plan's own fields and nothing
+    /// measured (ADR-221).
+    pub(crate) fn planned(access: &Access) -> Self {
+        let mut stats = QueryStats {
+            index: None,
+            fields_used: 0,
+            examined: 0,
+            matched: 0,
+            probes: 0,
+            index_entries: None,
+            unkeyed: None,
+            undecidable: None,
+            id_lookup: false,
+        };
+        match access {
+            Access::IdLookup(pk) => {
+                stats.id_lookup = true;
+                stats.probes = pk.keys.len();
+            }
+            Access::Index(p) => {
+                stats.index = Some(p.index_name.clone());
+                stats.fields_used = p.fields_used;
+                stats.probes = p.ranges.len();
+            }
+            Access::Scan => {}
+        }
+        stats
+    }
+
+    /// The keys of [`Self::to_json`] that say what the plan is, and none of
+    /// those that say what a scan found.
+    pub(crate) fn plan_json(&self) -> Value {
+        let strategy = match (&self.index, self.probes) {
+            _ if self.id_lookup => "idLookup",
+            (None, _) => "collectionScan",
+            (Some(_), n) if n > 1 => "indexUnion",
+            (Some(_), _) => "index",
+        };
+        let mut out = json!({
+            "strategy": strategy,
+            "index": self.index,
+            "indexFieldsUsed": self.fields_used,
+        });
+        if self.probes > 1 {
+            out["probes"] = json!(self.probes);
+        }
+        out
+    }
+}
+
 /// The one read scan. Every match is handed to `visit` as it is found and
 /// nothing is kept here, so what a read holds is decided by the caller — a
 /// page, a bounded sort window, or nothing at all for a count (ADR-098).
@@ -845,7 +923,8 @@ where
     // same predicate. The keys are already document keys, so this produces the
     // same candidate shape an index scan does and the filter is re-applied to
     // each exactly as it is there.
-    if let Some(pk) = plan::choose_primary_key(filter) {
+    let access = plan_access(filter, &meta.indexes);
+    if let Access::IdLookup(pk) = &access {
         for key in &pk.keys {
             if after.is_some_and(|bound| key.as_slice() <= bound) {
                 continue;
@@ -883,7 +962,10 @@ where
     // and the walk keeps the thread it is on. The primary-key probes above
     // stay inline: each is one page read, and the cost of giving up a worker
     // for it would be paid on the fastest path there is.
-    let mut plan = plan::choose(filter, &meta.indexes);
+    let mut plan = match access {
+        Access::Index(index) => Some(index),
+        _ => None,
+    };
     let mut entries = None;
     let mut unkeyed = None;
     let mut undecidable = None;
@@ -1994,6 +2076,20 @@ async fn aggregate_run(
     pipeline: &Value,
     limits: aggregate::Limits,
 ) -> Result<Value, ApiError> {
+    Ok(aggregate_run_stats(state, auth, db, coll, pipeline, limits).await?.0)
+}
+
+/// [`aggregate_run`], also answering how the source read was done, which `explain`
+/// is held to by a test that compares the two (ADR-221). `None` for a
+/// `$vectorSearch` source, which is not a filtered read.
+pub(crate) async fn aggregate_run_stats(
+    state: &SharedState,
+    auth: &Auth,
+    db: &str,
+    coll: &str,
+    pipeline: &Value,
+    limits: aggregate::Limits,
+) -> Result<(Value, Option<QueryStats>), ApiError> {
     let meta = authorize(state, auth, Action::Read, db, coll)?;
 
     let stages = parse_pipeline(pipeline)?;
@@ -2001,9 +2097,11 @@ async fn aggregate_run(
     // A `$vectorSearch` first stage is the source (ADR-216): the hits, as
     // documents, take the collection scan's place. It needs `search` as well
     // as the `read` above, and `k` bounds what enters the pipeline.
-    let (docs, consumed) = if let Some(aggregate::Stage::VectorSearch(spec)) = stages.first() {
+    let (docs, consumed, source_stats) = if let Some(aggregate::Stage::VectorSearch(spec)) =
+        stages.first()
+    {
         let docs = crate::vectors::stage_documents(state, auth, db, coll, spec, &limits).await?;
-        (docs, 1)
+        (docs, 1, None)
     } else {
         // The source. A pipeline that begins with `$match` is read the way `find`
         // reads: the leading filter goes through `collect_matching`, so an indexed
@@ -2019,7 +2117,7 @@ async fn aggregate_run(
         };
         // One past the ceiling: the scan stops as soon as it is over, rather than
         // materialising everything the filter admits in order to refuse it.
-        let (docs, _stats) =
+        let (docs, stats) =
             collect_matching(state, &meta, &filter, Some(limits.max_documents + 1))?;
         if docs.len() > limits.max_documents {
             return Err(ApiError::bad_request(format!(
@@ -2028,13 +2126,13 @@ async fn aggregate_run(
                 limits.max_documents
             )));
         }
-        (docs, consumed)
+        (docs, consumed, Some(stats))
     };
 
     let docs = run_stages(state, auth, db, &stages[consumed..], docs, &limits, &[])?;
 
     let documents: Vec<Value> = docs.iter().map(document_to_json).collect();
-    Ok(json!({ "documents": documents, "count": documents.len() }))
+    Ok((json!({ "documents": documents, "count": documents.len() }), source_stats))
 }
 
 /// Run stages in order: the two `$lookup` forms go to the functions here that
@@ -2073,7 +2171,7 @@ fn run_stages(
     Ok(docs)
 }
 
-fn parse_pipeline(pipeline: &Value) -> Result<Vec<aggregate::Stage>, ApiError> {
+pub(crate) fn parse_pipeline(pipeline: &Value) -> Result<Vec<aggregate::Stage>, ApiError> {
     let Some(array) = pipeline.as_array() else {
         return Err(ApiError::bad_request("pipeline must be an array of stages"));
     };
