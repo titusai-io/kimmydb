@@ -25358,7 +25358,8 @@ wait out their timeout.
   its lease, and `"runtime"` only from a block that carries `writer_wedged`: a
   0.44.0 build advertises `responsive: false` through its whole first thirty
   seconds, which is warming up and no stall, so a rolling upgrade does not make
-  every restarted member look degraded. **Advisory:** writes and owner work on the node may stall, reads may still
+  every restarted member look degraded. **Advisory:** writes and owner work on
+  the node may stall, reads may still
   be served, prefer a node without it. It is computed from the writer and the
   runtime and from nothing about the classes, so it holds while the classes are
   gated at a wedged writer (a repair page). `status` stays `live` or `unknown`: its
@@ -25414,7 +25415,8 @@ cleared by commit, abort, drop and error; a write that times out waiting leaves 
 holder's word alone; the raw-gate paths never store; a hold and a transaction each
 clear the word before the gate is free, seen by a thread that takes the gate raw
 the instant it is let go; a reader never pairs a start with another hold's holder under two
-writers, and the word is free after; engines do not share a word. `kimmy-cluster`: the evaluator turns an overdue hold into a bad item
+writers, and the word is free after; engines do not share a word.
+`kimmy-cluster`: the evaluator turns an overdue hold into a bad item
 for the classes that own work and for none that own nothing; the bound is exactly
 sixty seconds; holds just under it never flap; each class stalls on its own window
 with a local cause; a wedge yields to a target; a wedged peer is refused for every
