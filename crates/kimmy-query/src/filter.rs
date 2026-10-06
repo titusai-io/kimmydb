@@ -82,7 +82,31 @@ pub enum Condition {
 /// ([`REGEX_CONDITIONS_LIMIT`], [`REGEX_TOTAL_LIMIT_BYTES`]), or to the
 /// budget of the enclosing pipeline when one is being parsed.
 pub fn parse(doc: &Document) -> Result<Filter> {
-    parse_with_vars(doc, &[])
+    parse_scoped(doc, Scope::NONE)
+}
+
+/// Which names a parse binds for its `$expr` clauses, and what they mean.
+#[derive(Clone, Copy)]
+struct Scope<'a> {
+    vars: &'a [String],
+    /// The one name is an `arrayFilters` element (ADR-209): an expression may not
+    /// read the document, and an `$elemMatch` body binds nothing. Otherwise the
+    /// names are a `$lookup` sub-pipeline's `let` variables, which an expression
+    /// reads beside the document.
+    element: bool,
+}
+
+impl Scope<'_> {
+    const NONE: Scope<'static> = Scope { vars: &[], element: false };
+}
+
+/// [`parse`] for a `$match` in a `$lookup` sub-pipeline: the names in `vars` are the
+/// `let` variables in scope (this `$lookup`'s and any enclosing one's), which a
+/// `$expr` anywhere in the filter, an `$elemMatch` body included, reads as `$$name`
+/// beside the document's fields. A bare `"$$name"` string value is still a string
+/// here; the pipeline parser refuses it before this runs.
+pub fn parse_in_scope(doc: &Document, vars: &[String]) -> Result<Filter> {
+    parse_scoped(doc, Scope { vars, element: false })
 }
 
 /// [`parse`] for an `arrayFilters` entry (ADR-209): the element is bound to
@@ -94,16 +118,20 @@ pub fn parse(doc: &Document) -> Result<Filter> {
 /// document (a field, `$$ROOT`, `$$CURRENT`) is refused there, so that the
 /// element has one spelling.
 pub fn parse_with_vars(doc: &Document, vars: &[String]) -> Result<Filter> {
+    parse_scoped(doc, Scope { vars, element: true })
+}
+
+fn parse_scoped(doc: &Document, scope: Scope<'_>) -> Result<Filter> {
     let _budget = RegexBudget::open();
     let mut clauses = Vec::new();
 
     for (key, value) in doc {
         if let Some(op) = key.strip_prefix('$') {
-            clauses.push(parse_logical(op, value, vars)?);
+            clauses.push(parse_logical(op, value, scope)?);
         } else {
             clauses.push(Filter::Field {
                 path: key.clone(),
-                conditions: parse_conditions(key, value)?,
+                conditions: parse_conditions(key, value, scope)?,
             });
         }
     }
@@ -135,7 +163,7 @@ fn cheap_first<T>(items: Vec<T>, has_expr: fn(&T) -> bool) -> Vec<T> {
     cheap.into_iter().chain(expensive).collect()
 }
 
-fn parse_logical(op: &str, value: &Bson, vars: &[String]) -> Result<Filter> {
+fn parse_logical(op: &str, value: &Bson, scope: Scope<'_>) -> Result<Filter> {
     let branches = |value: &Bson| -> Result<Vec<Filter>> {
         let Bson::Array(items) = value else {
             return Err(Error::InvalidQuery(format!("${op} requires an array")));
@@ -146,7 +174,7 @@ fn parse_logical(op: &str, value: &Bson, vars: &[String]) -> Result<Filter> {
         let parsed = items
             .iter()
             .map(|item| match item {
-                Bson::Document(d) => parse_with_vars(d, vars),
+                Bson::Document(d) => parse_scoped(d, scope),
                 _ => Err(Error::InvalidQuery(format!("${op} entries must be documents"))),
             })
             .collect::<Result<Vec<_>>>()?;
@@ -162,8 +190,9 @@ fn parse_logical(op: &str, value: &Bson, vars: &[String]) -> Result<Filter> {
         // so a caller sees one kind of `400` whichever half of the filter was
         // malformed.
         "expr" => {
-            let expr = Expr::parse_with_vars(value, vars)?;
-            if let Some(element) = vars.first()
+            let expr = Expr::parse_with_vars(value, scope.vars)?;
+            if scope.element
+                && let Some(element) = scope.vars.first()
                 && expr.reads_document()
             {
                 return Err(Error::InvalidQuery(format!(
@@ -195,7 +224,7 @@ fn parse_logical(op: &str, value: &Bson, vars: &[String]) -> Result<Filter> {
 ///
 /// `path` is the field the conditions apply to, empty for an array element,
 /// and only names it in a refusal.
-fn parse_conditions(path: &str, value: &Bson) -> Result<Vec<Condition>> {
+fn parse_conditions(path: &str, value: &Bson, scope: Scope<'_>) -> Result<Vec<Condition>> {
     let equality = |value: &Bson| -> Result<Vec<Condition>> {
         comparable("equality", value)?;
         Ok(vec![Condition::Eq(value.clone())])
@@ -229,7 +258,7 @@ fn parse_conditions(path: &str, value: &Bson) -> Result<Vec<Condition>> {
 
     let conditions = doc
         .iter()
-        .map(|(key, arg)| parse_condition(path, &key[1..], arg, &sibling_options))
+        .map(|(key, arg)| parse_condition(path, &key[1..], arg, &sibling_options, scope))
         .collect::<Result<Vec<_>>>()?;
     Ok(cheap_first(conditions, condition_has_expr))
 }
@@ -246,7 +275,7 @@ fn parse_conditions(path: &str, value: &Bson) -> Result<Vec<Condition>> {
 /// fields, so `{$elemMatch: {$expr: {$gt: ["$qty", "$min"]}}}` compares two
 /// fields of one element. MongoDB refuses `$expr` under `$elemMatch` outright;
 /// accepting it here is a strict superset, noted in `docs/deviations.md`.
-fn parse_elem_match(doc: &Document) -> Result<Filter> {
+fn parse_elem_match(doc: &Document, scope: Scope<'_>) -> Result<Filter> {
     const DOCUMENT_LEVEL: [&str; 4] = ["$and", "$or", "$nor", "$expr"];
     let scalar_form = !doc.is_empty()
         && doc.keys().all(|k| k.starts_with('$') && !DOCUMENT_LEVEL.contains(&k.as_str()));
@@ -256,13 +285,19 @@ fn parse_elem_match(doc: &Document) -> Result<Filter> {
         // element itself; see `matches_scalar_against`.
         return Ok(Filter::Field {
             path: String::new(),
-            conditions: parse_conditions("", &Bson::Document(doc.clone()))?,
+            conditions: parse_conditions("", &Bson::Document(doc.clone()), scope)?,
         });
     }
-    parse(doc)
+    parse_scoped(doc, scope)
 }
 
-fn parse_condition(path: &str, op: &str, arg: &Bson, sibling_options: &str) -> Result<Condition> {
+fn parse_condition(
+    path: &str,
+    op: &str,
+    arg: &Bson,
+    sibling_options: &str,
+    scope: Scope<'_>,
+) -> Result<Condition> {
     let array_arg = |arg: &Bson| -> Result<Vec<Bson>> {
         match arg {
             Bson::Array(items) => Ok(items.clone()),
@@ -322,14 +357,18 @@ fn parse_condition(path: &str, op: &str, arg: &Bson, sibling_options: &str) -> R
             Condition::AlwaysTrue
         }
         "elemMatch" => match arg {
-            Bson::Document(d) => Condition::ElemMatch(Box::new(parse_elem_match(d)?)),
+            Bson::Document(d) => Condition::ElemMatch(Box::new(parse_elem_match(
+                // An `arrayFilters` entry's `$elemMatch` body binds nothing.
+                d,
+                if scope.element { Scope::NONE } else { scope },
+            )?)),
             _ => return Err(Error::InvalidQuery("$elemMatch requires a document".into())),
         },
         "not" => match arg {
             Bson::Document(d) => {
                 // `{$not: {$gt: 1, $lt: 5}}` negates the whole conjunction, so
                 // the operators are combined before the negation is applied.
-                let combined = parse_conditions(path, &Bson::Document(d.clone()))?
+                let combined = parse_conditions(path, &Bson::Document(d.clone()), scope)?
                     .into_iter()
                     .reduce(|a, b| Condition::Both(Box::new(a), Box::new(b)))
                     .ok_or_else(|| {
@@ -862,7 +901,14 @@ fn type_name_of(value: &Bson) -> &'static str {
 /// and evaluation stops at the first clause that decides, so an expression is
 /// not evaluated where a cheaper clause has already answered.
 pub fn matches(filter: &Filter, doc: &Document) -> Result<bool> {
-    evaluate(filter, doc).map_err(|e| unevaluable(e, doc.get("_id"), ""))
+    matches_with(filter, doc, &[])
+}
+
+/// [`matches`] for a filter parsed by [`parse_in_scope`]: `vars` are the `$lookup`
+/// `let` bindings a `$expr` in it reads as `$$name`. With none bound it is exactly
+/// [`matches`].
+pub fn matches_with(filter: &Filter, doc: &Document, vars: &[expr::Binding<'_>]) -> Result<bool> {
+    evaluate(filter, doc, vars).map_err(|e| unevaluable(e, doc.get("_id"), ""))
 }
 
 /// The refusal for a `$expr` that could not be evaluated, against the
@@ -883,6 +929,42 @@ fn unevaluable(e: Error, id: Option<&Bson>, within: &str) -> Error {
         None => format!(" for {}", within.trim_end_matches(" of ")),
     };
     Error::InvalidQuery(format!("$expr cannot be evaluated{at}: {reason}"))
+}
+
+/// Whether any `$expr` in the filter, an `$elemMatch` body's included, names one of
+/// `names` as a variable. Conservative as [`Expr::reads_variable`] is, and
+/// exhaustive for the same reason.
+pub fn reads_variable(filter: &Filter, names: &[String]) -> bool {
+    fn condition(c: &Condition, names: &[String]) -> bool {
+        match c {
+            Condition::ElemMatch(inner) => reads_variable(inner, names),
+            Condition::Not(inner) => condition(inner, names),
+            Condition::Both(a, b) => condition(a, names) || condition(b, names),
+            Condition::AlwaysTrue
+            | Condition::Eq(_)
+            | Condition::Ne(_)
+            | Condition::Gt(_)
+            | Condition::Gte(_)
+            | Condition::Lt(_)
+            | Condition::Lte(_)
+            | Condition::In(_)
+            | Condition::Nin(_)
+            | Condition::Exists(_)
+            | Condition::Type(_)
+            | Condition::Regex(_)
+            | Condition::All(_)
+            | Condition::Size(_)
+            | Condition::Mod { .. } => false,
+        }
+    }
+    match filter {
+        Filter::AlwaysTrue => false,
+        Filter::And(branches) | Filter::Or(branches) | Filter::Nor(branches) => {
+            branches.iter().any(|f| reads_variable(f, names))
+        }
+        Filter::Field { conditions, .. } => conditions.iter().any(|c| condition(c, names)),
+        Filter::Expr(e) => e.reads_variable(names),
+    }
 }
 
 /// Whether a filter holds a `$expr` anywhere it is evaluated from.
@@ -912,17 +994,17 @@ fn condition_has_expr(condition: &Condition) -> bool {
 // an error by the same truth table (ADR-206, ADR-211). Each list reaches them
 // in the order the parser left it in: cheap first, the clauses that can fail
 // still in the order written.
-fn evaluate(filter: &Filter, doc: &Document) -> Result<bool> {
+fn evaluate(filter: &Filter, doc: &Document, vars: &[expr::Binding<'_>]) -> Result<bool> {
     match filter {
         Filter::AlwaysTrue => Ok(true),
-        Filter::And(branches) => all_of(branches, |f| evaluate(f, doc)),
-        Filter::Or(branches) => any_of(branches, |f| evaluate(f, doc)),
-        Filter::Nor(branches) => Ok(!any_of(branches, |f| evaluate(f, doc))?),
+        Filter::And(branches) => all_of(branches, |f| evaluate(f, doc, vars)),
+        Filter::Or(branches) => any_of(branches, |f| evaluate(f, doc, vars)),
+        Filter::Nor(branches) => Ok(!any_of(branches, |f| evaluate(f, doc, vars))?),
         Filter::Field { path, conditions } => {
             let values = path::resolve(doc, path);
-            all_of(conditions, |c| condition_matches(c, &values))
+            all_of(conditions, |c| condition_matches(c, &values, vars))
         }
-        Filter::Expr(e) => expr_matches(e, doc),
+        Filter::Expr(e) => expr_matches(e, doc, vars),
     }
 }
 
@@ -939,10 +1021,15 @@ fn evaluate(filter: &Filter, doc: &Document) -> Result<bool> {
 /// bad data look like one that did not satisfy the filter: the result could
 /// not be told from a correct one. It used to be read that way because this
 /// function answered a `bool` to every caller.
-fn expr_matches(e: &Expr, doc: &Document) -> Result<bool> {
+fn expr_matches(e: &Expr, doc: &Document, vars: &[expr::Binding<'_>]) -> Result<bool> {
     #[cfg(test)]
     EXPR_EVALUATIONS.with(|n| n.set(n.get() + 1));
-    e.eval(doc).map(|v| expr::truthy(&v))
+    let value = if vars.is_empty() {
+        e.eval(doc)
+    } else {
+        e.eval_in(&expr::Scope::with_bindings(doc, vars))
+    };
+    value.map(|v| expr::truthy(&v))
 }
 
 #[cfg(test)]
@@ -962,7 +1049,11 @@ pub(crate) fn expr_evaluations() -> usize {
 ///
 /// `values` is empty when the path is absent, which several operators treat
 /// specially. Only `$elemMatch` can fail, through a `$expr` in its body.
-fn condition_matches(condition: &Condition, values: &[&Bson]) -> Result<bool> {
+fn condition_matches(
+    condition: &Condition,
+    values: &[&Bson],
+    vars: &[expr::Binding<'_>],
+) -> Result<bool> {
     Ok(match condition {
         // The operators a partial filter may also carry are evaluated in
         // `kimmy_core::matching`, once, for both (ADR-181).
@@ -1008,10 +1099,10 @@ fn condition_matches(condition: &Condition, values: &[&Bson]) -> Result<bool> {
 
         Condition::ElemMatch(inner) => any_of(values, |v| match v {
             Bson::Array(items) => any_of(items, |item| match item {
-                Bson::Document(d) => evaluate(inner, d),
+                Bson::Document(d) => evaluate(inner, d, vars),
                 // A scalar element is tested by wrapping it so that
                 // `{$elemMatch: {$gt: 5}}` works on an array of numbers.
-                scalar => matches_scalar_against(inner, scalar),
+                scalar => matches_scalar_against(inner, scalar, vars),
             }),
             _ => Ok(false),
         })?,
@@ -1034,11 +1125,11 @@ fn condition_matches(condition: &Condition, values: &[&Bson]) -> Result<bool> {
             n.checked_rem(*divisor).unwrap_or(0) == *remainder
         }),
 
-        Condition::Not(inner) => !condition_matches(inner, values)?,
+        Condition::Not(inner) => !condition_matches(inner, values, vars)?,
 
         Condition::AlwaysTrue => true,
         Condition::Both(a, b) => {
-            all_of(&[a.as_ref(), b.as_ref()], |c| condition_matches(c, values))?
+            all_of(&[a.as_ref(), b.as_ref()], |c| condition_matches(c, values, vars))?
         }
     })
 }
@@ -1083,13 +1174,13 @@ fn element_matches(filter: &Filter, identifier: &str, element: &Bson) -> Result<
         }
         Filter::Field { path, conditions } => {
             if path.is_empty() {
-                return all_of(conditions, |c| condition_matches(c, &[element]));
+                return all_of(conditions, |c| condition_matches(c, &[element], &[]));
             }
             let values = match element {
                 Bson::Document(doc) => path::resolve(doc, path),
                 _ => Vec::new(),
             };
-            all_of(conditions, |c| condition_matches(c, &values))
+            all_of(conditions, |c| condition_matches(c, &values, &[]))
         }
         Filter::Expr(e) => {
             #[cfg(test)]
@@ -1103,18 +1194,24 @@ fn element_matches(filter: &Filter, identifier: &str, element: &Bson) -> Result<
 
 /// Evaluate a filter whose conditions target the element itself, used by
 /// `$elemMatch` over an array of scalars.
-fn matches_scalar_against(filter: &Filter, scalar: &Bson) -> Result<bool> {
+fn matches_scalar_against(
+    filter: &Filter,
+    scalar: &Bson,
+    vars: &[expr::Binding<'_>],
+) -> Result<bool> {
     match filter {
         Filter::AlwaysTrue => Ok(true),
-        Filter::And(branches) => all_of(branches, |f| matches_scalar_against(f, scalar)),
-        Filter::Or(branches) => any_of(branches, |f| matches_scalar_against(f, scalar)),
-        Filter::Nor(branches) => Ok(!any_of(branches, |f| matches_scalar_against(f, scalar))?),
+        Filter::And(branches) => all_of(branches, |f| matches_scalar_against(f, scalar, vars)),
+        Filter::Or(branches) => any_of(branches, |f| matches_scalar_against(f, scalar, vars)),
+        Filter::Nor(branches) => {
+            Ok(!any_of(branches, |f| matches_scalar_against(f, scalar, vars))?)
+        }
         Filter::Field { path, conditions } => {
             // A scalar element has no fields, so only an empty path applies.
             if !path.is_empty() {
                 return Ok(false);
             }
-            all_of(conditions, |c| condition_matches(c, &[scalar]))
+            all_of(conditions, |c| condition_matches(c, &[scalar], vars))
         }
         // An expression reads fields, and a scalar has none to read: nothing
         // is evaluated, so there is nothing to fail.
@@ -2553,5 +2650,88 @@ mod decimal128 {
         let exists = parse(&doc! { "v": { "$exists": true } }).unwrap();
         assert!(matches(&exists, &stored).unwrap());
         assert!(parse(&doc! { "v": { "$eq": 1.5 } }).is_ok(), "a double compares as ever");
+    }
+}
+
+/// A `$match` in a `$lookup` sub-pipeline reading `let` names through `$expr` (ADR-222).
+#[cfg(test)]
+mod scoped {
+    use bson::doc;
+
+    use super::*;
+
+    fn names() -> Vec<String> {
+        vec!["v".to_string()]
+    }
+
+    fn hit(filter: &Document, d: &Document, v: Bson) -> Result<bool> {
+        let parsed = parse_in_scope(filter, &names())?;
+        matches_with(&parsed, d, &[("v", &v)])
+    }
+
+    #[test]
+    fn an_expr_reads_the_name_beside_the_documents_fields() {
+        let f = doc! {"$expr": {"$eq": ["$k", "$$v"]}};
+        assert!(hit(&f, &doc! {"k": 5}, Bson::Int64(5)).unwrap());
+        assert!(!hit(&f, &doc! {"k": 5}, Bson::Int64(6)).unwrap());
+        // Under the logical operators, with the cheap clause deciding first.
+        let f = doc! {"$or": [{"kind": "a"}, {"$expr": {"$gt": ["$k", "$$v"]}}]};
+        assert!(hit(&f, &doc! {"kind": "a", "k": 0}, Bson::Int64(9)).unwrap());
+        assert!(hit(&f, &doc! {"kind": "b", "k": 10}, Bson::Int64(9)).unwrap());
+        assert!(!hit(&f, &doc! {"kind": "b", "k": 1}, Bson::Int64(9)).unwrap());
+    }
+
+    /// An `$elemMatch` body evaluates its `$expr` over the element with the same
+    /// names bound, for a document element and, as ever, never for a scalar one.
+    #[test]
+    fn an_elem_match_body_reads_the_name_over_the_element() {
+        let f = doc! {"lines": {"$elemMatch": {"$expr": {"$eq": ["$q", "$$v"]}}}};
+        let d = doc! {"lines": [{"q": 1}, {"q": 5}]};
+        assert!(hit(&f, &d, Bson::Int64(5)).unwrap());
+        assert!(!hit(&f, &d, Bson::Int64(7)).unwrap());
+    }
+
+    #[test]
+    fn a_name_not_in_scope_is_refused_and_a_plain_parse_binds_nothing() {
+        let f = doc! {"$expr": {"$eq": ["$k", "$$nope"]}};
+        assert!(parse_in_scope(&f, &names()).is_err());
+        let f = doc! {"$expr": {"$eq": ["$k", "$$v"]}};
+        assert!(parse(&f).is_err());
+        // The arrayFilters form is unchanged: one name, the document unreadable.
+        assert!(parse_with_vars(&f, &names()).is_err());
+        assert!(parse_with_vars(&doc! {"$expr": {"$gt": ["$$v", 1]}}, &names()).is_ok());
+    }
+
+    /// A filter outside a sub-pipeline binds no names: `$$x` in its `$expr` is refused,
+    /// as a plain value it is the string it is, and `find` parses with `parse`.
+    #[test]
+    fn a_top_level_filter_reads_no_names_and_a_dollar_dollar_value_is_a_string() {
+        assert!(parse(&doc! {"$expr": {"$eq": ["$k", "$$x"]}}).is_err());
+        assert!(parse(&doc! {"$and": [{"a": 1}, {"$expr": {"$gt": ["$$x", 1]}}]}).is_err());
+        let literal = parse(&doc! {"code": "$$x"}).unwrap();
+        assert!(matches(&literal, &doc! {"code": "$$x"}).unwrap());
+        assert!(!matches(&literal, &doc! {"code": "x"}).unwrap());
+    }
+
+    /// Without bindings, `matches_with` is `matches`.
+    #[test]
+    fn matches_with_no_names_is_matches() {
+        let f = parse(&doc! {"$expr": {"$gt": ["$a", 1]}, "b": 2}).unwrap();
+        for d in [doc! {"a": 2, "b": 2}, doc! {"a": 0, "b": 2}, doc! {"a": 2, "b": 3}] {
+            assert_eq!(matches_with(&f, &d, &[]).unwrap(), matches(&f, &d).unwrap());
+        }
+    }
+
+    #[test]
+    fn reads_variable_sees_through_every_clause_form() {
+        let n = names();
+        let read = |d: Document| reads_variable(&parse_in_scope(&d, &n).unwrap(), &n);
+        assert!(read(doc! {"$expr": {"$eq": ["$k", "$$v"]}}));
+        assert!(read(doc! {"$or": [{"a": 1}, {"$expr": {"$eq": ["$k", "$$v"]}}]}));
+        assert!(read(doc! {"$nor": [{"$expr": {"$eq": ["$k", "$$v"]}}]}));
+        assert!(read(doc! {"l": {"$elemMatch": {"$expr": {"$eq": ["$q", "$$v"]}}}}));
+        assert!(read(doc! {"l": {"$not": {"$elemMatch": {"$expr": {"$eq": ["$q", "$$v"]}}}}}));
+        assert!(!read(doc! {"$expr": {"$eq": ["$k", 1]}, "a": {"$gt": 1}}));
+        assert!(!read(doc! {}));
     }
 }

@@ -22469,6 +22469,14 @@ claimed; the apply-time claim not run; plain operations' paths not claimed.
 
 ## ADR-206 — A filter's `$expr` that cannot be evaluated fails the request
 
+> **Amended 2026-10-06 by [ADR-222](#adr-222--a-lookup-sub-pipelines-match-reads-the-let-names-through-expr-and-a-correlated-eq-is-a-hash-join).**
+> A `$lookup` with no input documents still runs nothing of its pipeline, its
+> leading `$match` included, and is still authorized first: a missing or forbidden
+> foreign collection answers `404` or `403` whether or not any document reaches
+> the stage. A test pins both. A sub-pipeline `$match` may now read `let` names
+> through `$expr`, and a mixed one's independent part is applied once only as an
+> attempt that declines on any error.
+
 > **Amended by [ADR-211](#adr-211--an-expressions-and-and-or-fail-only-when-the-answer-depends-on-an-argument-that-cannot-be-evaluated).**
 > Inside one `$expr` the expression's own `$and` and `$or` are now
 > three-valued too, by the same scan as the filter level's, so the bullet
@@ -25511,6 +25519,14 @@ neutral class, and a bad tick that does not reset the good run.
 
 ## ADR-221 — `aggregate` takes `explain: true` and answers with a plan, without running anything
 
+> **Amended 2026-10-06 by [ADR-222](#adr-222--a-lookup-sub-pipelines-match-reads-the-let-names-through-expr-and-a-correlated-eq-is-a-hash-join).**
+> A sub-pipeline `$match` that reads a `let` name is no longer hoisted whole: it
+> is reported as two entries, its independent part (`part: "independent"`,
+> `perInputDocument: false`) and the rest (`part: "variable"`, `perInputDocument:
+> true`); a recognised correlated `$eq` makes the stage `foreignScanHashJoin`, with
+> `joinKey`, `residualClauses` and `fallback`. A `$match` that reads no variable is
+> reported as hoisted, as before.
+
 > **Amends [ADR-216](#adr-216--vectorsearch-is-the-first-aggregation-stage-spelled-as-the-vector-search-endpoint-is)'s
 > "Not done".** It also replaces, for the one documented form, the refusal ADR-121
 > and ADR-124 gave `explain` on `aggregate`.
@@ -25606,3 +25622,145 @@ authorized, the multikey note always made, an empty-input `$lookup` reported as
 scanning, the hoisted `$match` reported per input document, `executed: true`, a
 `$vectorSearch` query always usable, the pipeline run, the source authorized as
 `search` and the source collected.
+
+## ADR-222 — A `$lookup` sub-pipeline's `$match` reads the `let` names through `$expr`, and a correlated `$eq` is a hash join
+
+**Status:** accepted, for the next `0.MINOR`. Amends
+[ADR-206](#adr-206--a-filters-expr-that-cannot-be-evaluated-fails-the-request)
+(a dated note), [ADR-221](#adr-221--aggregate-takes-explain-true-and-answers-with-a-plan-without-running-anything)
+(explain) and the refusal ADR-217 kept (a `$$` *value* in a sub-pipeline `$match` is
+still refused; the way to write the comparison is now `$expr`). Follows
+[ADR-211](#adr-211--an-expressions-and-and-or-fail-only-when-the-answer-depends-on-an-argument-that-cannot-be-evaluated):
+a false clause decides a pair before a clause that cannot be evaluated.
+
+**The defect.** The `let` / `pipeline` form of `$lookup` ran its sub-pipeline once per
+input document over a copy of the foreign collection, so a correlated equality, the
+commonest use, cost O(local x foreign): 10,000 inputs against 100,000 foreign
+documents took 104 s in a release build (453 s through the HTTP stack on the
+measuring host), and about a fifth of that was the per-input clone of the whole
+foreign set. Writing the correlation was also awkward: the filter language has no
+variables, so it had to be computed in an `$addFields` and matched in a second
+`$match`, a shape no plan could see through. `aggregation.md` and the refusal's own
+message already named `{$match: {$expr: {$eq: ["$order", "$$oid"]}}}` as the intended
+spelling, "once the two compose".
+
+**Decision.**
+
+- **A sub-pipeline `$match` reads the `let` names through `$expr`**: this `$lookup`'s
+  and an enclosing one's, at any depth of the filter (top level, under `$and`, `$or`,
+  `$nor`, in an `$elemMatch` body, where the element is the document and the names
+  are bound beside it), in any `$match` of the sub-pipeline, not only the first. It is
+  additive: `$$name` in that `$expr` was a `400` (unbound) and nothing accepted
+  before changes meaning. A bare `"$$name"` string value is still refused, outside an
+  `$expr`; a name not in scope is still refused; a top-level `$match` and `find`
+  bind nothing. `filter::parse_in_scope`, `filter::matches_with`, and an exhaustive
+  `Expr::reads_variable` and `filter::reads_variable` (no catch-all arm: a new form
+  must say what it reads; they err towards `true`).
+- **The leading `$match` is taken apart at parse time** (`aggregate::Lead`). Its
+  conjunction is flattened through `$and` only, never `$or`, `$nor` or an `$expr`'s
+  own `$and`, into leaf clauses in evaluation order (ADR-206's cheap-first order is
+  kept, and no clause is reordered). A leaf that reads a variable is variable-reading,
+  the others independent. The first variable leaf of the form `{$expr: {$eq: [A, B]}}`
+  with `A` reading the document and no variable and `B` not reading the document is the
+  **key**; either argument may come first and both may be any expression. The other
+  variable leaves are the **residual**, in written order.
+- **Execution, per input document, never raises where the loop would not.** A
+  `$match` that reads no variable is applied once to the foreign set before the loop,
+  and its errors are the request's, as before. For a mixed `$match`:
+  1. its independent part is applied once as an *attempt*: any error abandons the
+     hoist, and the loop evaluates the whole conjunction for each pair as ADR-211
+     defines it (a pair another clause has decided false raises nothing);
+  2. the first input document is the plain nested loop, so a one-input `$lookup`
+     builds nothing;
+  3. from the second, a recognised key is answered from a hash table of the foreign
+     documents the hoist kept, filed by `keyenc::encode(A(d))` in the foreign scan's
+     order; the residual clauses run on the bucket, in order; the rest of the
+     sub-pipeline runs over what is left, an empty bucket included;
+  4. **any error while building** the table (evaluating `A`, or a key that cannot be
+     encoded, which is a `Decimal128`) puts the **whole execution** on the loop from
+     then on, and **any error in a probe** (`B(i)`, a key that cannot be encoded, a
+     residual clause) sends **that input** through the full loop. Any error, whatever
+     its class: the loop then raises exactly what it always did, or nothing, so a
+     join never returns an answer or an error the loop would not.
+- **The equality is `$expr`'s `$eq`**, `canonical_cmp` equal: numbers are equal across
+  types, `null`, `undefined` and a missing field are one value, `NaN` equals `NaN`,
+  `Symbol` equals a string of the same text, an array is compared whole and a document
+  field by field in order, a `Decimal128` equals every number (so is never filed).
+  `keyenc` encodes equal values identically (its property tests are the oracle), and
+  a test row per type pair checks the join against the loop. This differs, by
+  design, from the `localField`/`foreignField` form, where a missing key joins nothing
+  and an array joins under each element (ADR-210); aggregation.md says so.
+- **What does not join** runs as the loop, bounded only by the 100,000 ceilings: an
+  `$or` or `$nor` with a variable in it, an inequality, a variable inside an
+  `$elemMatch`, an `$eq` with the document and a variable on one side, a `$match`
+  that is not first. A nested `$lookup` rebuilds its table for each outer input; no
+  cache is kept across them.
+- **Explain** (ADR-221): `strategy: foreignScanHashJoin` with `joinKey`,
+  `residualClauses` and `fallback`; a split `$match` is two entries.
+- **The ceilings** are counted as before (the foreign set once, each stage's output,
+  the attached total), and a ceiling met on the first input and on a later one
+  reads the same.
+
+**Measured** (release, `cargo test --release -- --ignored join_cell`, one key per
+input unless stated): 100 x 1,000 3 ms; 100 x 100,000 77 ms; 10,000 x 1,000 13 ms;
+10,000 x 100,000 86 ms (the nested loop: 103,721 ms). With 100 matches for each of
+1,000 inputs over 10,000 documents, 100,000 attached: 76 ms against 717 ms. A
+`$lookup` with an independent leading `$match` and the correlation computed in
+`$addFields`, which does not join, 1,000 x 10,000: 3,708 ms against 3,810 ms on the
+code before this change, so no regression. With one `Decimal128` key among 10,000
+(the stage falls back after the build): 671 ms against 691 ms with recognition off.
+Peak resident size on 2,000-byte documents, 1,000 inputs against 100,000 documents:
+1,815 MB with the join, 1,800 MB without, both dominated by the foreign copy the
+stage already holds; 10,000 inputs against the same: 1,898 MB, 157 ms. The first
+input pays one nested pass.
+
+**Rollback.** No rollback boundary: no stored state, no wire format, no
+configuration. An older member answers `400` to a `$$name` in a sub-pipeline
+`$expr` during a roll, as it did, and a request that does not use it is unchanged.
+
+**Rejected.**
+
+- *A new operator, or `localField` with `pipeline`:* ADR-217 keeps the two forms
+  apart on purpose, and the `$expr` spelling is the one the documentation already
+  named.
+- *An index on the foreign field:* the index keys the stored value, and `$eq` equates
+  what it does not (a missing field is `null`; a `Decimal128` equals every number; an
+  array field is indexed per element and compared whole), so each probe would need a
+  recheck and a fallback, for a saving the one read of the collection the stage
+  already makes does not leave. A follow-up, if a foreign side too large to read
+  per execution ever matters.
+- *Hoisting the independent part and raising its errors:* a pair another clause has
+  decided false must not raise (ADR-211), and that is what the loop does.
+- *Treating a deferrable error in the build as a fallback and any other as a failure:*
+  the loop would not have reached it for a pair already decided, and an error that
+  depends on accumulated state (a budget) is not the same twice. Declining on any
+  error is exact.
+- *Substituting the variables into the filter per input:* a rewrite per input that
+  has to respect `$let`, `$map`, `$filter` and `$reduce` shadowing, where binding is
+  a lookup the evaluator already does.
+
+### Test
+
+`kimmy-query`: a lead's split, key and residual for every shape (either argument
+first, expression sides, `$and` nesting flattened in order, a residual written
+before the key); no key under `$or`, `$nor`, an `$expr`'s own `$and`, an inequality,
+two sides that each read both, a variable in an `$elemMatch`; an enclosing
+`$lookup`'s names in scope; `$$NOW` and the other system variables refused; a bare
+`$$` value, an unbound name and a top-level `$match` still refused; `reads_variable`
+over every expression form and `describe`. `kimmy-api` (`join_tests.rs`): the join
+equals the loop, in answer, order and error, over generated corpora of mixed types,
+`null`, missing, arrays, reordered documents and `Decimal128` on either side, for
+eleven pipeline shapes; a row per type pair (2^53 + 1 against 2^53 as a double,
+`i64::MAX` against 2^63 as a double, -0.0, `NaN`, `Symbol` against a string, binary
+subtypes, an array and a document across numeric types); a missing key is `null`;
+bucket order; an empty bucket still runs `$group` and `$count`; a single input never
+builds, two inputs build once; a local key that raises where the loop would not
+evaluate it, a foreign key that raises on a document no input reaches, an
+independent clause that raises for a pair another clause has decided, a residual that
+raises (each: no error where the loop has none, the loop's error where it has);
+`Decimal128` on the build side and on a probe; the ceilings on any input; empty
+sides; the independent part applied once for six inputs; a later `$match` and an
+`$elemMatch` reading the name; a nested `$lookup`. Explain: the plan of a join, of a
+split `$match`, and of a nested loop with nothing to join on. Mutation rows, each
+failing a named test, in the order of the code review that asked for them.
+

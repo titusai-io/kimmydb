@@ -2161,10 +2161,20 @@ fn run_stages(
             aggregate::Stage::Lookup {
                 from,
                 as_field,
-                join: aggregate::Join::Pipeline { vars: let_vars, stages: sub },
-            } => {
-                lookup_pipeline(state, auth, db, from, let_vars, sub, as_field, docs, limits, vars)?
-            }
+                join: aggregate::Join::Pipeline { vars: let_vars, stages: sub, lead },
+            } => lookup_pipeline(
+                state,
+                auth,
+                db,
+                from,
+                let_vars,
+                sub,
+                lead.as_deref(),
+                as_field,
+                docs,
+                limits,
+                vars,
+            )?,
             other => aggregate::apply_with_vars(other, docs, limits, vars)?,
         };
     }
@@ -2292,6 +2302,7 @@ fn lookup_pipeline(
     from: &str,
     let_vars: &[(String, kimmy_query::Expr)],
     stages: &[aggregate::Stage],
+    lead: Option<&aggregate::Lead>,
     as_field: &str,
     input: Vec<bson::Document>,
     limits: &aggregate::Limits,
@@ -2316,21 +2327,43 @@ fn lookup_pipeline(
     })?;
     aggregate::check_limit("$lookup", foreign.len(), limits)?;
 
-    let (base, rest) = match stages.split_first() {
-        Some((first @ aggregate::Stage::Match(_), rest)) => {
-            (aggregate::apply(first, foreign, limits)?, rest)
+    // A leading `$match` that reads no `let` variable is applied once, before the
+    // loop, and its errors are the request's, as they always were. One that does
+    // read a variable (ADR-222) is evaluated per input document, and only its
+    // independent part may be applied once: an attempt that can only decline.
+    let (first, rest) = match stages.split_first() {
+        Some((first @ aggregate::Stage::Match(_), rest)) => (Some(first), rest),
+        _ => (None, stages),
+    };
+    let mut plan = LeadPlan::default();
+    let base = match (first, lead) {
+        (Some(first), None) => aggregate::apply(first, foreign, limits)?,
+        (Some(aggregate::Stage::Match(_)), Some(lead)) => {
+            match hoist_independent(&lead.independent, &foreign) {
+                Some(kept) => {
+                    plan.hoisted = true;
+                    kept.unwrap_or(foreign)
+                }
+                None => foreign,
+            }
         }
-        _ => (foreign, stages),
+        _ => foreign,
     };
 
     let mut held = 0usize;
     let mut out = Vec::with_capacity(input.len());
-    for mut doc in input {
+    for (n, mut doc) in input.into_iter().enumerate() {
         let bound = aggregate::bind_let(let_vars, &doc, outer)?;
         // Inner bindings after outer ones, so a name rebound here shadows.
         let vars: Vec<Binding<'_>> =
             outer.iter().copied().chain(bound.iter().map(|(n, v)| (n.as_str(), v))).collect();
-        let joined = run_stages(state, auth, db, rest, base.clone(), limits, &vars)?;
+        let joined = match (first, lead) {
+            (Some(aggregate::Stage::Match(whole)), Some(lead)) => {
+                let matched = matched_for_input(&mut plan, n, whole, lead, &base, &vars)?;
+                run_stages(state, auth, db, rest, matched, limits, &vars)?
+            }
+            _ => run_stages(state, auth, db, rest, base.clone(), limits, &vars)?,
+        };
         // Joined documents are held alongside the input, so the total across
         // every input document is what the ceiling bounds.
         held += joined.len();
@@ -2342,6 +2375,187 @@ fn lookup_pipeline(
         out.push(doc);
     }
     Ok(out)
+}
+
+/// What a `$lookup` execution knows about its variable-reading leading `$match`.
+#[derive(Default)]
+struct LeadPlan {
+    /// The independent part was applied once to the foreign side, without error.
+    hoisted: bool,
+    /// The hash table, built from the second input document on. `Declined` once
+    /// the build raised or met a key it cannot encode: the loop answers from then on.
+    table: JoinTable,
+}
+
+#[derive(Default)]
+enum JoinTable {
+    #[default]
+    NotBuilt,
+    Built(std::collections::HashMap<Vec<u8>, Vec<usize>>),
+    Declined,
+}
+
+/// The independent clauses of a mixed leading `$match`, applied once. `None` when
+/// applying them raised anything: the hoist is then abandoned, and the loop
+/// evaluates the whole conjunction for each pair as ADR-211 defines it (a false
+/// clause decides a pair before a later clause that cannot be evaluated). `Some(None)`
+/// when there is nothing to apply.
+///
+/// **Why declining is enough, and what would stop it being.** Splitting a conjunction
+/// and evaluating its independent part first can only hide or surface an error that
+/// ADR-211 lets a false clause hold back, and such an error is one this attempt
+/// declines on (any error is). What the split cannot reproduce is an error that the
+/// whole conjunction would return *at once*, before a later clause decides: a
+/// non-deferrable one (`Error::is_deferrable`), written before a clause that is false.
+/// Every error an expression or a filter raises from the *data* it evaluates is
+/// `InvalidQuery` today, which is deferrable. The one non-deferrable error the
+/// evaluator has, `Internal` ("variable not bound"), comes only from a caller that
+/// bound too few names, never from a document. `an_evaluation_error_is_always_deferrable`
+/// classifies every `Error` variant with no catch-all arm, so a new variant does not
+/// compile until someone says whether data can raise it; that is the point to rethink
+/// this split, not to edit the test.
+fn hoist_independent(
+    independent: &filter::Filter,
+    foreign: &[bson::Document],
+) -> Option<Option<Vec<bson::Document>>> {
+    if matches!(independent, filter::Filter::AlwaysTrue) {
+        return Some(None);
+    }
+    #[cfg(test)]
+    if join_counters::WHOLE.with(std::cell::Cell::get) {
+        return None;
+    }
+    #[cfg(test)]
+    join_counters::hoists();
+    let mut kept = Vec::new();
+    for doc in foreign {
+        match filter::matches(independent, doc) {
+            Ok(true) => kept.push(doc.clone()),
+            Ok(false) => {}
+            Err(_) => return None,
+        }
+    }
+    Some(Some(kept))
+}
+
+/// The foreign documents the leading `$match` keeps for input document `n`.
+///
+/// The first input document is always the plain loop, so a single-input `$lookup`
+/// never builds a table. From the second, a recognised `$eq` is answered from a
+/// hash table, **and anything that raises sends that input back to the loop**,
+/// which raises exactly what it always did, or nothing (ADR-222).
+fn matched_for_input(
+    plan: &mut LeadPlan,
+    n: usize,
+    whole: &filter::Filter,
+    lead: &aggregate::Lead,
+    base: &[bson::Document],
+    vars: &[Binding<'_>],
+) -> Result<Vec<bson::Document>, ApiError> {
+    if n >= 1
+        && plan.hoisted
+        && !base.is_empty()
+        && let Some(key) = lead.key.as_ref()
+        && !join_disabled_for_test()
+    {
+        if matches!(plan.table, JoinTable::NotBuilt) {
+            plan.table = build_table(key, base);
+        }
+        if let JoinTable::Built(table) = &plan.table
+            && let Some(found) = probe(table, key, &lead.residual, base, vars)
+        {
+            return Ok(found);
+        }
+    }
+    // The loop. With the independent part already applied, the rest of the
+    // conjunction decides a pair; otherwise the whole filter does.
+    let deciding = if plan.hoisted { &lead.variable } else { whole };
+    let mut kept = Vec::new();
+    for doc in base {
+        if filter::matches_with(deciding, doc, vars)? {
+            kept.push(doc.clone());
+        }
+    }
+    Ok(kept)
+}
+
+/// The foreign side filed by `A(d)`, or `Declined` if evaluating or encoding it
+/// failed for any document (an error, or a `Decimal128`, which has no key).
+fn build_table(key: &aggregate::JoinKey, base: &[bson::Document]) -> JoinTable {
+    #[cfg(test)]
+    join_counters::builds();
+    let mut table: std::collections::HashMap<Vec<u8>, Vec<usize>> =
+        std::collections::HashMap::new();
+    for (at, doc) in base.iter().enumerate() {
+        let Ok(value) = key.foreign.eval(doc) else { return JoinTable::Declined };
+        let Some(bytes) = encode_key(&value) else { return JoinTable::Declined };
+        table.entry(bytes).or_default().push(at);
+    }
+    JoinTable::Built(table)
+}
+
+/// The documents under `B(i)`, passed through the residual clauses in order; `None`
+/// when anything raised or `B(i)` cannot be encoded, and the input must take the loop.
+/// Declining on any error is what keeps this exact (see [`hoist_independent`] for the one
+/// thing that would break it): the loop then decides the input as the whole conjunction
+/// does.
+fn probe(
+    table: &std::collections::HashMap<Vec<u8>, Vec<usize>>,
+    key: &aggregate::JoinKey,
+    residual: &filter::Filter,
+    base: &[bson::Document],
+    vars: &[Binding<'_>],
+) -> Option<Vec<bson::Document>> {
+    #[cfg(test)]
+    join_counters::probes();
+    let empty = bson::Document::new();
+    let value = key.local.eval_in(&kimmy_query::expr::Scope::with_bindings(&empty, vars)).ok()?;
+    let bytes = encode_key(&value)?;
+    let mut kept = Vec::new();
+    for &at in table.get(&bytes).map_or(&[][..], Vec::as_slice) {
+        match filter::matches_with(residual, &base[at], vars) {
+            Ok(true) => kept.push(base[at].clone()),
+            Ok(false) => {}
+            Err(_) => return None,
+        }
+    }
+    Some(kept)
+}
+
+#[cfg(test)]
+fn join_disabled_for_test() -> bool {
+    join_counters::DISABLED.with(std::cell::Cell::get)
+}
+
+#[cfg(not(test))]
+fn join_disabled_for_test() -> bool {
+    false
+}
+
+/// Counters and a switch for the tests of the join, on the thread that runs them.
+#[cfg(test)]
+pub(crate) mod join_counters {
+    use std::cell::Cell;
+    thread_local! {
+        pub static BUILDS: Cell<usize> = const { Cell::new(0) };
+        pub static PROBES: Cell<usize> = const { Cell::new(0) };
+        /// Times the independent part of a mixed leading `$match` was applied once.
+        pub static HOISTS: Cell<usize> = const { Cell::new(0) };
+        /// The shape before the split: the whole conjunction evaluated for every
+        /// pair, no hoist and no table, as the reference the join is held to.
+        pub static WHOLE: Cell<bool> = const { Cell::new(false) };
+        /// Recognition switched off: every input takes the loop, for the differential.
+        pub static DISABLED: Cell<bool> = const { Cell::new(false) };
+    }
+    pub fn builds() {
+        BUILDS.with(|n| n.set(n.get() + 1));
+    }
+    pub fn probes() {
+        PROBES.with(|n| n.set(n.get() + 1));
+    }
+    pub fn hoists() {
+        HOISTS.with(|n| n.set(n.get() + 1));
+    }
 }
 
 fn encode_key(value: &bson::Bson) -> Option<Vec<u8>> {
@@ -2378,7 +2592,7 @@ mod tests {
         agg_limits(state, auth, db, coll, pipeline, aggregate::Limits::default())
     }
 
-    fn agg_limits(
+    pub(super) fn agg_limits(
         state: &SharedState,
         auth: &Auth,
         db: &str,
@@ -2486,7 +2700,7 @@ mod tests {
     // collect_matching routing — the guards that decide which scan runs
     // -----------------------------------------------------------------------
 
-    fn live_state(dir: &tempfile::TempDir) -> SharedState {
+    pub(super) fn live_state(dir: &tempfile::TempDir) -> SharedState {
         let engine = std::sync::Arc::new(
             kimmy_storage::Engine::open(&dir.path().join("kimmy.redb")).unwrap(),
         );
@@ -2802,7 +3016,7 @@ mod tests {
     }
 
     /// `app.<coll>` holding `docs`, for the join tests.
-    fn seed_docs(state: &SharedState, coll: &str, docs: Vec<bson::Document>) {
+    pub(super) fn seed_docs(state: &SharedState, coll: &str, docs: Vec<bson::Document>) {
         state.engine.create_collection("app", coll).unwrap();
         let meta = state.engine.get_collection("app", coll).unwrap();
         for doc in docs {
@@ -3596,3 +3810,6 @@ mod join_differential {
         assert!(attached_in_all > 30, "{attached_in_all} attachments over 120 generated joins");
     }
 }
+
+#[cfg(test)]
+mod join_tests;
