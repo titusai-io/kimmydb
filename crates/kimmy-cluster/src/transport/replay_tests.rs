@@ -286,16 +286,6 @@ async fn pages_that_were_not_asked_for_are_refused() {
             },
         ),
         (
-            "scanned to before it began",
-            Message::ReplayEntries {
-                from,
-                entries: Vec::new(),
-                exhausted: false,
-                horizon: false,
-                scanned_to: Hlc::new(from.wall_ms - 1, 0),
-            },
-        ),
-        (
             "scanned to before its own last entry",
             Message::ReplayEntries {
                 from,
@@ -1019,4 +1009,22 @@ async fn a_frame_a_build_does_not_know_is_malformed_through_the_real_decoder() {
     let err = read_frame(&mut &bytes[..]).await.unwrap_err();
     assert!(matches!(err, ProtocolError::Malformed(_)), "{err:?}");
     assert_eq!(ServeFailure::of(&err), Some(ServeFailure::Malformed));
+}
+
+/// A holder that has collected another origin's entries, which the member does not
+/// hold, still answers the replay of the member's own: the horizon is judged for the
+/// member's origin alone, so the member is not told its own writes are out of reach
+/// because of someone else's.
+#[tokio::test]
+async fn another_origins_collected_entries_do_not_put_the_replay_out_of_reach() {
+    let f = fixture_with_tail(10, 0, 50);
+    let c = f.c.node_id();
+    let backup_at = f.catch_up.replay_from(c);
+    // A cutoff between the third origin's entries (just after the backup) and the
+    // member's lost writes (fifteen milliseconds later).
+    let now = backup_at.wall_ms + 6 + 1_000;
+    f.c.collect_garbage_at(now, kimmy_storage::RetentionPolicy::new(1, 1)).unwrap();
+    f.round().await.unwrap();
+    assert!(f.catch_up.replay_answered(c), "answered, not put beyond the horizon");
+    assert_eq!(f.orders(), 2 + f.lost as u64);
 }

@@ -849,9 +849,6 @@ where
                 if entries.len() > MAX_BATCH {
                     return Err(refuse("it carries more entries than a batch"));
                 }
-                if scanned_to < from {
-                    return Err(refuse("it scanned to before where it began"));
-                }
                 let mut previous = from;
                 for entry in &entries {
                     if entry.stamp.node != me || entry.stamp.hlc <= previous {

@@ -24302,7 +24302,7 @@ peer can reach A, so A now asks over the contact the peer opened.
   the next contact's page applies. A member that can reach no such member stays
   owed, which is the limit stated below. An empty page that is not the end only
   advances the cursor, to where the holder's walk got (`scanned_to`, on the page, at
-  least the page's last entry and at least its start): a walk cut by the holder's
+  least the page's last entry): a walk cut by the holder's
   budget before it reached the member's entries still makes progress at every
   contact, and the replay never repeats the first. The holder's walk passes over
   every origin but the member's, so neither a long tail of another origin nor
