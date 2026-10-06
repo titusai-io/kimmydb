@@ -1981,6 +1981,235 @@ async fn topology_reports_what_each_node_yields_and_matches_its_schema() {
     assert!(older.get("classState").is_none(), "an older build's peer says nothing of its classes");
 }
 
+/// `/v1/topology` says `degraded` only while a member's writer is wedged or its
+/// runtime has stalled, never while it is merely starting, and never for a member
+/// SWIM no longer vouches for (ADR-220). The answer matches its documented schema.
+#[tokio::test]
+async fn topology_says_degraded_only_while_a_member_cannot_serve() {
+    use kimmy_cluster::yielding::driver::RealClock;
+    use kimmy_cluster::yielding::{
+        ClassSample, Config, Evaluator, Published, RESPONSIVE_TICKS, Sample, TickMeasure,
+        WRITER_WEDGE, WriterHoldSample,
+    };
+    use kimmy_cluster::{ClassState, Facts, Members, PerClass};
+
+    let mut c = Conformance::start().await;
+    let state = Arc::clone(&c.server.state);
+    let me = state.engine.node_id();
+
+    let published = Arc::new(Published::default());
+    let (mut evaluator, start) = Evaluator::start(Config::new(me), std::time::Instant::now());
+    published.store_start(&start, 0);
+    let cell = || {
+        kimmy_storage::class_step::ClassCell::leak(Arc::new(
+            kimmy_storage::class_step::MonotonicClock::new(),
+        ))
+    };
+    state.metrics.set_yield_handle(Arc::new(kimmy_api::yielding::YieldHandle {
+        published: Arc::clone(&published),
+        cells: [cell(), cell(), cell()],
+        clock: Arc::new(RealClock::new()),
+        e: std::time::Duration::from_secs(5),
+        enabled: true,
+        probation: false,
+    }));
+    let mut now = std::time::Instant::now();
+    let mut ticks = 0u64;
+    let mut tick = |measure: TickMeasure, hold: Option<WriterHoldSample>| {
+        now += std::time::Duration::from_secs(5);
+        ticks += 1;
+        let mut sample = Sample::new(
+            measure,
+            PerClass::all(ClassSample::at_rest(0)),
+            Arc::new(Default::default()),
+        );
+        sample.writer_hold = hold;
+        let decision = evaluator.tick(&sample, now);
+        published.store(&decision, ticks * 5_000);
+    };
+    let quiet = || TickMeasure::quiet(20);
+    let stalled = || TickMeasure {
+        steps: 20,
+        control_worst_gap: std::time::Duration::ZERO,
+        probe_worst: std::time::Duration::from_secs(2),
+        probe_woke: true,
+    };
+    let wedged = || {
+        Some(WriterHoldSample {
+            age: WRITER_WEDGE + std::time::Duration::from_secs(1),
+            holder: "replication",
+        })
+    };
+
+    // Peers: each block says one thing, and two are not in the live set.
+    let node = |_: u8| kimmy_core::NodeId::generate();
+    let (writer_peer, runtime_peer, both_peer, fine_peer, silent_peer, warming_peer, gone_peer) =
+        (node(1), node(2), node(3), node(4), node(5), node(6), node(7));
+    let (older_warming_peer, stale_peer) = (node(8), node(9));
+    let members = Members::default();
+    let blocks = [
+        (
+            writer_peer,
+            Facts { writer_wedged: Some(true), responsive: Some(true), ..Facts::default() },
+        ),
+        (
+            runtime_peer,
+            Facts { writer_wedged: Some(false), responsive: Some(false), ..Facts::default() },
+        ),
+        (
+            both_peer,
+            Facts { writer_wedged: Some(true), responsive: Some(false), ..Facts::default() },
+        ),
+        (
+            fine_peer,
+            Facts { writer_wedged: Some(false), responsive: Some(true), ..Facts::default() },
+        ),
+        // A 0.44 build's block says neither.
+        (
+            silent_peer,
+            Facts { class_state: Some(PerClass::all(ClassState::Ok)), ..Facts::default() },
+        ),
+        // A member warming up advertises no `responsive`, which is no stall.
+        (warming_peer, Facts { writer_wedged: Some(false), responsive: None, ..Facts::default() }),
+        (gone_peer, Facts { writer_wedged: Some(true), ..Facts::default() }),
+        // A 0.44.0 build advertises `responsive: false` through its whole warm-up
+        // and knows no `writer_wedged`: that is no stall, so a roll does not make
+        // every restarted member look degraded.
+        (older_warming_peer, Facts { responsive: Some(false), ..Facts::default() }),
+        // A block past its lease, wedged when it was sent, that SWIM still vouches
+        // for: it says nothing about now.
+        (stale_peer, Facts { writer_wedged: Some(true), ..Facts::default() }),
+    ];
+    for (i, (peer, facts)) in blocks.into_iter().enumerate() {
+        let addr: std::net::SocketAddr = format!("127.0.0.1:{}", 7100 + i).parse().unwrap();
+        members.insert_for_test(addr, peer);
+        let age = if peer == stale_peer {
+            std::time::Duration::from_secs(3_600)
+        } else {
+            std::time::Duration::ZERO
+        };
+        members.record_peer_facts_for_test(
+            peer,
+            Facts { boot: vec![i as u8 + 1; 16], ..facts },
+            age,
+        );
+        if peer == gone_peer {
+            // SWIM no longer vouches for it: still in the registry, its block's
+            // last words are not a claim about now.
+            members.remove_for_test(&addr);
+        }
+    }
+    state.set_members(members);
+    let registry = state
+        .engine
+        .create_system_collection(
+            kimmy_api::topology::NODES_DB,
+            kimmy_api::topology::NODES_COLLECTION,
+        )
+        .unwrap_or_else(|_| {
+            state
+                .engine
+                .get_collection(
+                    kimmy_api::topology::NODES_DB,
+                    kimmy_api::topology::NODES_COLLECTION,
+                )
+                .unwrap()
+        });
+    for peer in [
+        writer_peer,
+        runtime_peer,
+        both_peer,
+        fine_peer,
+        silent_peer,
+        warming_peer,
+        gone_peer,
+        older_warming_peer,
+        stale_peer,
+    ] {
+        state
+            .engine
+            .insert(
+                &registry,
+                bson::doc! { "_id": peer.to_string(), "endpoint": "http://127.0.0.1:1", "version": "0.45.0" },
+            )
+            .unwrap();
+    }
+
+    let root = c.login("root", ROOT_PASSWORD).await;
+    let degraded = async |c: &mut Conformance| {
+        let topology = c.check("GET", "/v1/topology", "/v1/topology", Some(&root), None, 200).await;
+        let by_node = |wanted: kimmy_core::NodeId| {
+            let listed = topology["nodes"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|n| n["node"] == wanted.to_string())
+                .unwrap_or_else(|| panic!("{wanted} is not listed: {topology}"))
+                .clone();
+            listed.get("degraded").cloned()
+        };
+        (by_node(me), topology)
+    };
+
+    // A fresh start says nothing: nothing has been judged, and warming up is no stall.
+    assert_eq!(degraded(&mut c).await.0, None, "a member that has just started");
+    for _ in 0..RESPONSIVE_TICKS - 1 {
+        tick(quiet(), None);
+        assert_eq!(degraded(&mut c).await.0, None, "still warming");
+    }
+    tick(quiet(), None);
+    assert_eq!(degraded(&mut c).await.0, None, "judged, and fine");
+
+    // The peers, as this member sees them.
+    let (_, topology) = degraded(&mut c).await;
+    let peer_degraded = |peer: kimmy_core::NodeId| {
+        topology["nodes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|n| n["node"] == peer.to_string())
+            .unwrap_or_else(|| panic!("{peer} is not listed"))
+            .get("degraded")
+            .cloned()
+    };
+    assert_eq!(peer_degraded(writer_peer), Some(json!("writer")));
+    assert_eq!(peer_degraded(runtime_peer), Some(json!("runtime")));
+    assert_eq!(peer_degraded(both_peer), Some(json!("writer")), "writer wins");
+    assert_eq!(peer_degraded(fine_peer), None);
+    assert_eq!(peer_degraded(silent_peer), None, "a build that says neither is not degraded");
+    assert_eq!(peer_degraded(warming_peer), None, "warming up is not a stall");
+    assert_eq!(
+        peer_degraded(older_warming_peer),
+        None,
+        "a 0.44.0 block's `responsive: false` is its warm-up, not a stall"
+    );
+    assert_eq!(peer_degraded(stale_peer), None, "a block past its lease says nothing about now");
+    assert_eq!(
+        topology["nodes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|n| n["node"] == gone_peer.to_string())
+            .unwrap()["status"],
+        "unknown"
+    );
+    assert_eq!(peer_degraded(gone_peer), None, "SWIM does not vouch for it");
+
+    // This member: a wedged writer, then a stalled runtime, then both, then well.
+    tick(quiet(), wedged());
+    assert_eq!(degraded(&mut c).await.0, Some(json!("writer")));
+    tick(quiet(), None);
+    assert_eq!(degraded(&mut c).await.0, None, "the wedge ended");
+    tick(stalled(), None);
+    assert_eq!(degraded(&mut c).await.0, Some(json!("runtime")));
+    tick(stalled(), wedged());
+    assert_eq!(degraded(&mut c).await.0, Some(json!("writer")), "writer wins");
+    for _ in 0..RESPONSIVE_TICKS {
+        tick(quiet(), None);
+    }
+    assert_eq!(degraded(&mut c).await.0, None, "six judged ticks without a stall");
+}
+
 #[tokio::test]
 async fn documented_refusals_use_the_documented_envelope() {
     let mut c = Conformance::start().await;

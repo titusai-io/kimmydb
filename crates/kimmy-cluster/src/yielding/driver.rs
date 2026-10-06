@@ -131,6 +131,11 @@ pub trait Inputs: Send + 'static {
         false
     }
     fn view(&self) -> Arc<PeerView>;
+    /// The hold that has the writer now, if it is one whose length is judged
+    /// (ADR-220): an atomic load, never the engine.
+    fn writer_hold(&self) -> Option<super::WriterHoldSample> {
+        None
+    }
     /// What `KIMMY_TEST_KILL_TASK` asks of this thread, if anything: read each
     /// tick, so a panic lands at the next tick and a stall stops the ticking.
     fn kill_switch(&self) -> Option<KillSwitch> {
@@ -283,6 +288,7 @@ pub fn run(prepared: Prepared, inputs: impl Inputs, handle: &EvaluatorHandle) {
         sample.stopping = inputs.stopping();
         sample.owned_ttl = inputs.owned_ttl();
         sample.ttl_holders = inputs.ttl_holders();
+        sample.writer_hold = inputs.writer_hold();
         let decision = evaluator.tick(&sample, origin + at);
         // The stop may have frozen the decision while this tick ran: what it
         // decided is never published, and the frozen decision stands.
@@ -355,6 +361,17 @@ fn log_events(events: &[Event]) {
                 reason = reason.label(),
                 "a stalled class could not be yielded, so this member keeps owning it"
             ),
+            Event::WriterWedged { holder, age } => warn!(
+                holder = *holder,
+                held_secs = age.as_secs(),
+                bound_secs = super::WRITER_WEDGE.as_secs(),
+                "the single writer has been held past the wedge bound: this member can do no \
+                 write and is no target for a peer's yield, and its classes that own work count \
+                 it against them"
+            ),
+            Event::WriterFree => {
+                info!("the writer is free again, or held by a hold that is not judged")
+            }
         }
     }
 }

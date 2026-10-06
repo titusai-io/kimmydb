@@ -60,6 +60,36 @@ fn every_odd_shape_costs_the_field_and_never_the_block() {
     );
 }
 
+/// `writer_wedged` (ADR-220) reads a bool as a bool; a string, a number, a null
+/// and an absent key all read `None`, which is *not known*: never `false`, and
+/// never `true`. A value that does not read does not spoil the block.
+#[test]
+fn writer_wedged_reads_a_bool_and_nothing_else() {
+    assert_eq!(facts_of(doc! { "writer_wedged": true }).writer_wedged, Some(true));
+    assert_eq!(facts_of(doc! { "writer_wedged": false }).writer_wedged, Some(false));
+    for bad in [
+        Bson::String("true".into()),
+        Bson::Int32(1),
+        Bson::Int64(1),
+        Bson::Double(1.0),
+        Bson::Null,
+        Bson::Array(vec![Bson::Boolean(true)]),
+        Bson::Document(doc! { "wedged": true }),
+    ] {
+        let facts = facts_of(doc! { "catching_up": true, "writer_wedged": bad.clone() });
+        assert!(facts.catching_up, "{bad:?}: the rest of the block still reads");
+        assert_eq!(facts.writer_wedged, None, "{bad:?}");
+    }
+    assert_eq!(facts_of(doc! { "catching_up": true }).writer_wedged, None, "absent");
+    // It is set on the wire only when it is known, so a block that does not know
+    // adds no key to what 0.44.0 decodes.
+    let unknown = bson::serialize_to_bson(&Facts::default()).unwrap();
+    assert!(!unknown.as_document().unwrap().contains_key("writer_wedged"));
+    let known =
+        bson::serialize_to_bson(&Facts { writer_wedged: Some(true), ..Facts::default() }).unwrap();
+    assert!(known.as_document().unwrap().get_bool("writer_wedged").unwrap());
+}
+
 /// A missing class key, a non-string, or an unknown name is `unknown`, **never
 /// `idle`**: a member that said nothing about a class is not a target in it.
 #[test]
@@ -187,6 +217,7 @@ fn a_043_decoder_reads_the_new_block_and_frames() {
         class_state: Some(PerClass::all(ClassState::Stalled)),
         class_cause: Some(PerClass::all(StallCause::Local)),
         responsive: Some(false),
+        writer_wedged: Some(true),
         started_ms: Some(1_700_000_000_000),
         ..Facts::default()
     }
@@ -247,7 +278,7 @@ fn this_build_reads_a_043_block_and_frames() {
 fn unset_fields_add_no_keys() {
     let facts = bson::serialize_to_bson(&Facts::default()).unwrap();
     let doc = facts.as_document().unwrap();
-    for key in ["class_state", "class_cause", "responsive", "started_ms"] {
+    for key in ["class_state", "class_cause", "responsive", "writer_wedged", "started_ms"] {
         assert!(!doc.contains_key(key), "{key}");
     }
     let frame = bson::serialize_to_bson(&Message::AskVersions {

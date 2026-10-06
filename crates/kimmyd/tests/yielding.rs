@@ -2187,3 +2187,142 @@ async fn p15_a_member_whose_evaluator_is_wedged_is_unknown_and_no_target() {
         "B is not stalled, so the latch cannot be what holds A"
     );
 }
+
+/// P16: a member whose writer is held past the wedge bound (ADR-220). One TTL
+/// collection, and `KIMMY_TEST_HOLD_WRITER=<ms>,replication` on its owner, which
+/// takes the writer once it serves and keeps it for longer than the bound. The
+/// owner says so (`kimmy_writer_wedged`, the hold's age), a peer's `/v1/topology`
+/// lists it `degraded: "writer"` while the hold lasts, it yields the expiry to
+/// another holder, and when the hold ends the flag clears, the topology entry
+/// loses `degraded`, and the member reclaims after R good ticks.
+///
+/// The bound is 60 s and is not scaled by `KIMMY_TEST_YIELD_SCALE`, so the hold is
+/// 75 s. The hold is taken from the moment the node serves: the member's HTTP
+/// reads go on, and its writes wait, so everything asked of the wedged member here
+/// is a scrape.
+#[tokio::test]
+#[ignore = "boots real nodes; run with --ignored"]
+async fn p16_a_member_whose_writer_is_wedged_says_so_yields_and_reclaims_after_the_hold() {
+    const HOLD_MS: &str = "75000,replication";
+    let client = reqwest::Client::new();
+    let mut nodes = cluster(&client, &[&[], &[], &[]]).await;
+    let (_token, owner) = ttl_collection(&client, &nodes).await;
+    let peer = (owner + 1) % nodes.len();
+    let owner_id = nodes[owner].node_id(&client).await.to_string();
+    // Controls: before the hold nothing is wedged anywhere, and nobody is degraded.
+    for node in &nodes {
+        assert_eq!(node.required(&client, "kimmy_writer_wedged").await, 0, "{}", node.name);
+    }
+
+    nodes[owner].restart(false, &[SCALE, ("KIMMY_TEST_HOLD_WRITER", HOLD_MS)]);
+    nodes[owner].wait_ready(&client).await;
+
+    // The owner reads its own hold as old, then as past the bound.
+    eventually("the owner to see the writer wedged", || {
+        let (node, client) = (&nodes[owner], &client);
+        async move { node.series(client, "kimmy_writer_wedged").await == Some(1.0) }
+    })
+    .await;
+    let age = nodes[owner]
+        .series(&client, "kimmy_writer_hold_age_seconds")
+        .await
+        .expect("the hold age is scraped");
+    assert!(age > 60.0, "wedged means held past the bound; the age is {age}");
+    assert!(nodes[owner].log().contains("test switch armed: the writer is held"));
+    assert!(nodes[owner].log().contains("held past the wedge bound"), "{}", nodes[owner].log());
+
+    // A peer's topology lists it degraded, and lists nobody else so.
+    let peer_token = nodes[peer].login(&client).await;
+    let degraded_of = |client: reqwest::Client, url: String, token: String| async move {
+        let topology: serde_json::Value =
+            client.get(url).bearer_auth(&token).send().await.unwrap().json().await.unwrap();
+        topology["nodes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|n| (n["node"].as_str().unwrap().to_string(), n.get("degraded").cloned()))
+            .collect::<Vec<_>>()
+    };
+    eventually("a peer to list the owner degraded for its writer", || {
+        let (client, url, token, owner_id) =
+            (client.clone(), nodes[peer].url("/v1/topology"), peer_token.clone(), owner_id.clone());
+        async move {
+            degraded_of(client, url, token)
+                .await
+                .iter()
+                .any(|(node, degraded)| *node == owner_id && *degraded == Some("writer".into()))
+        }
+    })
+    .await;
+    let listed =
+        degraded_of(client.clone(), nodes[peer].url("/v1/topology"), peer_token.clone()).await;
+    for (node, degraded) in &listed {
+        assert_eq!(
+            degraded.is_some(),
+            *node == owner_id,
+            "only the owner is degraded: {node} {degraded:?}"
+        );
+    }
+
+    // It yields the expiry, and exactly one other member owns it.
+    eventually("the wedged owner to yield its expiry", || {
+        let (node, client) = (&nodes[owner], &client);
+        async move { node.yielding(client, "ttl").await }
+    })
+    .await;
+    assert!(nodes[owner].stalled_by(&client, "ttl", "local").await, "a wedge is a local cause");
+    eventually("one other member to own the expiry, and the wedged one not", || {
+        let (nodes, client) = (&nodes, &client);
+        async move {
+            let mut owners = Vec::new();
+            for (i, node) in nodes.iter().enumerate() {
+                if node.series(client, "kimmy_ttl_collections{state=\"owned\"}").await >= Some(1.0)
+                {
+                    owners.push(i);
+                }
+            }
+            owners.len() == 1 && owners[0] != owner
+        }
+    })
+    .await;
+    // Controls over the same window: the evaluator went on ticking, and the others
+    // are neither wedged nor yielding.
+    assert!(nodes[owner].ticks(&client).await >= 20);
+    for (i, node) in nodes.iter().enumerate() {
+        if i != owner {
+            assert_eq!(node.required(&client, "kimmy_writer_wedged").await, 0, "{}", node.name);
+            assert!(!node.yielding(&client, "ttl").await, "{}", node.name);
+        }
+    }
+
+    // The hold ends: the flag clears, the entry loses `degraded`, and the member
+    // reclaims after R good ticks.
+    eventually("the hold to end", || {
+        let node = &nodes[owner];
+        async move { node.log().contains("test switch ended: the writer is let go") }
+    })
+    .await;
+    eventually("the owner to read the writer free again", || {
+        let (node, client) = (&nodes[owner], &client);
+        async move { node.series(client, "kimmy_writer_wedged").await == Some(0.0) }
+    })
+    .await;
+    eventually("a peer to list the owner without `degraded`", || {
+        let (client, url, token, owner_id) =
+            (client.clone(), nodes[peer].url("/v1/topology"), peer_token.clone(), owner_id.clone());
+        async move {
+            degraded_of(client, url, token)
+                .await
+                .iter()
+                .any(|(node, degraded)| *node == owner_id && degraded.is_none())
+        }
+    })
+    .await;
+    eventually("the reclaim", || {
+        let (node, client) = (&nodes[owner], &client);
+        async move { node.transitions(client, "ttl", "reclaim").await == 1 }
+    })
+    .await;
+    assert_eq!(nodes[owner].transitions(&client, "ttl", "yield").await, 1);
+    assert!(nodes[owner].log().contains("r_ticks=24"), "{}", nodes[owner].log());
+}

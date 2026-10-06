@@ -198,6 +198,14 @@ pub struct YieldReading {
     pub observations: [[u64; 5]; 3],
     pub ticks: u64,
     pub responsive: bool,
+    /// The runtime stalled within the last judged ticks, as `responsive` is false
+    /// for that and not for want of evidence at the start (ADR-220).
+    pub runtime_stalled: bool,
+    /// The writer's hold is past the wedge bound (ADR-220).
+    pub writer_wedged: bool,
+    /// The age of the hold the last judged tick found, in milliseconds: zero when
+    /// the writer was free or held by a holder that is not judged.
+    pub writer_hold_age_ms: u64,
     /// `KIMMY_OWNERSHIP_YIELD` is not `off`.
     pub enabled: bool,
     /// This start began in probation.
@@ -2322,6 +2330,20 @@ fn render_yield(out: &mut String, y: &YieldReading) {
     );
     let _ = writeln!(
         out,
+        "# HELP kimmy_writer_wedged Whether the single writer has been held past the wedge bound (0 or 1): one hold, of a holder whose length is bounded by nature (an index build or drop is never judged), for longer than 60 s. While 1 this member can do no write, its classes that own work count it against them, and no peer hands it work. Read at the last judged evaluator tick; a paused process leaves it as it was.\n\
+         # TYPE kimmy_writer_wedged gauge\n\
+         kimmy_writer_wedged {}",
+        u8::from(y.writer_wedged)
+    );
+    let _ = writeln!(
+        out,
+        "# HELP kimmy_writer_hold_age_seconds How long the hold that has the single writer had lasted at the last judged evaluator tick, in seconds: 0 when the writer was free or held by an index build or drop, which are not judged.\n\
+         # TYPE kimmy_writer_hold_age_seconds gauge\n\
+         kimmy_writer_hold_age_seconds {}",
+        y.writer_hold_age_ms as f64 / 1000.0
+    );
+    let _ = writeln!(
+        out,
         "# HELP kimmy_ownership_yield_enabled Whether this member may set its own yield bits (1), or KIMMY_OWNERSHIP_YIELD=off is set (0). Off, it still judges, advertises its states, honours its peers' bits and can be a target.\n\
          # TYPE kimmy_ownership_yield_enabled gauge\n\
          kimmy_ownership_yield_enabled {}",
@@ -2561,6 +2583,9 @@ mod tests {
             owned: [1_601, 1_602, 1_603],
             ticks: 1_699,
             responsive: true,
+            runtime_stalled: false,
+            writer_wedged: true,
+            writer_hold_age_ms: 61_500,
             enabled: false,
             probation: true,
             ..YieldReading::default()
@@ -2797,96 +2822,106 @@ kimmy_write_lock_held_seconds_bucket{holder=\"index_build\",le=\"300\"} 5
 kimmy_write_lock_held_seconds_bucket{holder=\"index_build\",le=\"+Inf\"} 6
 kimmy_write_lock_held_seconds_sum{holder=\"index_build\"} 6
 kimmy_write_lock_held_seconds_count{holder=\"index_build\"} 6
+kimmy_write_lock_held_seconds_bucket{holder=\"index_drop\",le=\"0.001\"} 0
+kimmy_write_lock_held_seconds_bucket{holder=\"index_drop\",le=\"0.01\"} 0
+kimmy_write_lock_held_seconds_bucket{holder=\"index_drop\",le=\"0.1\"} 0
+kimmy_write_lock_held_seconds_bucket{holder=\"index_drop\",le=\"1\"} 0
+kimmy_write_lock_held_seconds_bucket{holder=\"index_drop\",le=\"5\"} 5
+kimmy_write_lock_held_seconds_bucket{holder=\"index_drop\",le=\"30\"} 5
+kimmy_write_lock_held_seconds_bucket{holder=\"index_drop\",le=\"300\"} 6
+kimmy_write_lock_held_seconds_bucket{holder=\"index_drop\",le=\"+Inf\"} 7
+kimmy_write_lock_held_seconds_sum{holder=\"index_drop\"} 7.5
+kimmy_write_lock_held_seconds_count{holder=\"index_drop\"} 7
 kimmy_write_lock_held_seconds_bucket{holder=\"drop\",le=\"0.001\"} 0
 kimmy_write_lock_held_seconds_bucket{holder=\"drop\",le=\"0.01\"} 0
 kimmy_write_lock_held_seconds_bucket{holder=\"drop\",le=\"0.1\"} 0
 kimmy_write_lock_held_seconds_bucket{holder=\"drop\",le=\"1\"} 0
-kimmy_write_lock_held_seconds_bucket{holder=\"drop\",le=\"5\"} 5
-kimmy_write_lock_held_seconds_bucket{holder=\"drop\",le=\"30\"} 5
-kimmy_write_lock_held_seconds_bucket{holder=\"drop\",le=\"300\"} 6
-kimmy_write_lock_held_seconds_bucket{holder=\"drop\",le=\"+Inf\"} 7
-kimmy_write_lock_held_seconds_sum{holder=\"drop\"} 7.5
-kimmy_write_lock_held_seconds_count{holder=\"drop\"} 7
+kimmy_write_lock_held_seconds_bucket{holder=\"drop\",le=\"5\"} 0
+kimmy_write_lock_held_seconds_bucket{holder=\"drop\",le=\"30\"} 6
+kimmy_write_lock_held_seconds_bucket{holder=\"drop\",le=\"300\"} 7
+kimmy_write_lock_held_seconds_bucket{holder=\"drop\",le=\"+Inf\"} 8
+kimmy_write_lock_held_seconds_sum{holder=\"drop\"} 9
+kimmy_write_lock_held_seconds_count{holder=\"drop\"} 8
 kimmy_write_lock_held_seconds_bucket{holder=\"replication\",le=\"0.001\"} 0
 kimmy_write_lock_held_seconds_bucket{holder=\"replication\",le=\"0.01\"} 0
 kimmy_write_lock_held_seconds_bucket{holder=\"replication\",le=\"0.1\"} 0
 kimmy_write_lock_held_seconds_bucket{holder=\"replication\",le=\"1\"} 0
 kimmy_write_lock_held_seconds_bucket{holder=\"replication\",le=\"5\"} 0
-kimmy_write_lock_held_seconds_bucket{holder=\"replication\",le=\"30\"} 6
-kimmy_write_lock_held_seconds_bucket{holder=\"replication\",le=\"300\"} 7
-kimmy_write_lock_held_seconds_bucket{holder=\"replication\",le=\"+Inf\"} 8
-kimmy_write_lock_held_seconds_sum{holder=\"replication\"} 9
-kimmy_write_lock_held_seconds_count{holder=\"replication\"} 8
-kimmy_write_lock_held_seconds_bucket{holder=\"repair\",le=\"0.001\"} 0
-kimmy_write_lock_held_seconds_bucket{holder=\"repair\",le=\"0.01\"} 0
-kimmy_write_lock_held_seconds_bucket{holder=\"repair\",le=\"0.1\"} 0
-kimmy_write_lock_held_seconds_bucket{holder=\"repair\",le=\"1\"} 0
-kimmy_write_lock_held_seconds_bucket{holder=\"repair\",le=\"5\"} 0
-kimmy_write_lock_held_seconds_bucket{holder=\"repair\",le=\"30\"} 0
-kimmy_write_lock_held_seconds_bucket{holder=\"repair\",le=\"300\"} 8
-kimmy_write_lock_held_seconds_bucket{holder=\"repair\",le=\"+Inf\"} 9
-kimmy_write_lock_held_seconds_sum{holder=\"repair\"} 10.5
-kimmy_write_lock_held_seconds_count{holder=\"repair\"} 9
-kimmy_write_lock_held_seconds_bucket{holder=\"retention\",le=\"0.001\"} 8
-kimmy_write_lock_held_seconds_bucket{holder=\"retention\",le=\"0.01\"} 8
-kimmy_write_lock_held_seconds_bucket{holder=\"retention\",le=\"0.1\"} 8
-kimmy_write_lock_held_seconds_bucket{holder=\"retention\",le=\"1\"} 8
-kimmy_write_lock_held_seconds_bucket{holder=\"retention\",le=\"5\"} 8
-kimmy_write_lock_held_seconds_bucket{holder=\"retention\",le=\"30\"} 8
-kimmy_write_lock_held_seconds_bucket{holder=\"retention\",le=\"300\"} 9
-kimmy_write_lock_held_seconds_bucket{holder=\"retention\",le=\"+Inf\"} 10
-kimmy_write_lock_held_seconds_sum{holder=\"retention\"} 12
-kimmy_write_lock_held_seconds_count{holder=\"retention\"} 10
+kimmy_write_lock_held_seconds_bucket{holder=\"replication\",le=\"30\"} 0
+kimmy_write_lock_held_seconds_bucket{holder=\"replication\",le=\"300\"} 8
+kimmy_write_lock_held_seconds_bucket{holder=\"replication\",le=\"+Inf\"} 9
+kimmy_write_lock_held_seconds_sum{holder=\"replication\"} 10.5
+kimmy_write_lock_held_seconds_count{holder=\"replication\"} 9
+kimmy_write_lock_held_seconds_bucket{holder=\"repair\",le=\"0.001\"} 8
+kimmy_write_lock_held_seconds_bucket{holder=\"repair\",le=\"0.01\"} 8
+kimmy_write_lock_held_seconds_bucket{holder=\"repair\",le=\"0.1\"} 8
+kimmy_write_lock_held_seconds_bucket{holder=\"repair\",le=\"1\"} 8
+kimmy_write_lock_held_seconds_bucket{holder=\"repair\",le=\"5\"} 8
+kimmy_write_lock_held_seconds_bucket{holder=\"repair\",le=\"30\"} 8
+kimmy_write_lock_held_seconds_bucket{holder=\"repair\",le=\"300\"} 9
+kimmy_write_lock_held_seconds_bucket{holder=\"repair\",le=\"+Inf\"} 10
+kimmy_write_lock_held_seconds_sum{holder=\"repair\"} 12
+kimmy_write_lock_held_seconds_count{holder=\"repair\"} 10
+kimmy_write_lock_held_seconds_bucket{holder=\"retention\",le=\"0.001\"} 0
+kimmy_write_lock_held_seconds_bucket{holder=\"retention\",le=\"0.01\"} 9
+kimmy_write_lock_held_seconds_bucket{holder=\"retention\",le=\"0.1\"} 9
+kimmy_write_lock_held_seconds_bucket{holder=\"retention\",le=\"1\"} 9
+kimmy_write_lock_held_seconds_bucket{holder=\"retention\",le=\"5\"} 9
+kimmy_write_lock_held_seconds_bucket{holder=\"retention\",le=\"30\"} 9
+kimmy_write_lock_held_seconds_bucket{holder=\"retention\",le=\"300\"} 10
+kimmy_write_lock_held_seconds_bucket{holder=\"retention\",le=\"+Inf\"} 11
+kimmy_write_lock_held_seconds_sum{holder=\"retention\"} 13.5
+kimmy_write_lock_held_seconds_count{holder=\"retention\"} 11
 kimmy_write_lock_held_seconds_bucket{holder=\"expiry\",le=\"0.001\"} 0
-kimmy_write_lock_held_seconds_bucket{holder=\"expiry\",le=\"0.01\"} 9
-kimmy_write_lock_held_seconds_bucket{holder=\"expiry\",le=\"0.1\"} 9
-kimmy_write_lock_held_seconds_bucket{holder=\"expiry\",le=\"1\"} 9
-kimmy_write_lock_held_seconds_bucket{holder=\"expiry\",le=\"5\"} 9
-kimmy_write_lock_held_seconds_bucket{holder=\"expiry\",le=\"30\"} 9
-kimmy_write_lock_held_seconds_bucket{holder=\"expiry\",le=\"300\"} 10
-kimmy_write_lock_held_seconds_bucket{holder=\"expiry\",le=\"+Inf\"} 11
-kimmy_write_lock_held_seconds_sum{holder=\"expiry\"} 13.5
-kimmy_write_lock_held_seconds_count{holder=\"expiry\"} 11
+kimmy_write_lock_held_seconds_bucket{holder=\"expiry\",le=\"0.01\"} 0
+kimmy_write_lock_held_seconds_bucket{holder=\"expiry\",le=\"0.1\"} 10
+kimmy_write_lock_held_seconds_bucket{holder=\"expiry\",le=\"1\"} 10
+kimmy_write_lock_held_seconds_bucket{holder=\"expiry\",le=\"5\"} 10
+kimmy_write_lock_held_seconds_bucket{holder=\"expiry\",le=\"30\"} 10
+kimmy_write_lock_held_seconds_bucket{holder=\"expiry\",le=\"300\"} 11
+kimmy_write_lock_held_seconds_bucket{holder=\"expiry\",le=\"+Inf\"} 12
+kimmy_write_lock_held_seconds_sum{holder=\"expiry\"} 15
+kimmy_write_lock_held_seconds_count{holder=\"expiry\"} 12
 kimmy_write_lock_held_seconds_bucket{holder=\"embedding\",le=\"0.001\"} 0
 kimmy_write_lock_held_seconds_bucket{holder=\"embedding\",le=\"0.01\"} 0
-kimmy_write_lock_held_seconds_bucket{holder=\"embedding\",le=\"0.1\"} 10
-kimmy_write_lock_held_seconds_bucket{holder=\"embedding\",le=\"1\"} 10
-kimmy_write_lock_held_seconds_bucket{holder=\"embedding\",le=\"5\"} 10
-kimmy_write_lock_held_seconds_bucket{holder=\"embedding\",le=\"30\"} 10
-kimmy_write_lock_held_seconds_bucket{holder=\"embedding\",le=\"300\"} 11
-kimmy_write_lock_held_seconds_bucket{holder=\"embedding\",le=\"+Inf\"} 12
-kimmy_write_lock_held_seconds_sum{holder=\"embedding\"} 15
-kimmy_write_lock_held_seconds_count{holder=\"embedding\"} 12
+kimmy_write_lock_held_seconds_bucket{holder=\"embedding\",le=\"0.1\"} 0
+kimmy_write_lock_held_seconds_bucket{holder=\"embedding\",le=\"1\"} 11
+kimmy_write_lock_held_seconds_bucket{holder=\"embedding\",le=\"5\"} 11
+kimmy_write_lock_held_seconds_bucket{holder=\"embedding\",le=\"30\"} 11
+kimmy_write_lock_held_seconds_bucket{holder=\"embedding\",le=\"300\"} 12
+kimmy_write_lock_held_seconds_bucket{holder=\"embedding\",le=\"+Inf\"} 13
+kimmy_write_lock_held_seconds_sum{holder=\"embedding\"} 16.5
+kimmy_write_lock_held_seconds_count{holder=\"embedding\"} 13
 kimmy_write_lock_held_seconds_bucket{holder=\"durability\",le=\"0.001\"} 0
 kimmy_write_lock_held_seconds_bucket{holder=\"durability\",le=\"0.01\"} 0
 kimmy_write_lock_held_seconds_bucket{holder=\"durability\",le=\"0.1\"} 0
-kimmy_write_lock_held_seconds_bucket{holder=\"durability\",le=\"1\"} 11
-kimmy_write_lock_held_seconds_bucket{holder=\"durability\",le=\"5\"} 11
-kimmy_write_lock_held_seconds_bucket{holder=\"durability\",le=\"30\"} 11
-kimmy_write_lock_held_seconds_bucket{holder=\"durability\",le=\"300\"} 12
-kimmy_write_lock_held_seconds_bucket{holder=\"durability\",le=\"+Inf\"} 13
-kimmy_write_lock_held_seconds_sum{holder=\"durability\"} 16.5
-kimmy_write_lock_held_seconds_count{holder=\"durability\"} 13
+kimmy_write_lock_held_seconds_bucket{holder=\"durability\",le=\"1\"} 0
+kimmy_write_lock_held_seconds_bucket{holder=\"durability\",le=\"5\"} 12
+kimmy_write_lock_held_seconds_bucket{holder=\"durability\",le=\"30\"} 12
+kimmy_write_lock_held_seconds_bucket{holder=\"durability\",le=\"300\"} 13
+kimmy_write_lock_held_seconds_bucket{holder=\"durability\",le=\"+Inf\"} 14
+kimmy_write_lock_held_seconds_sum{holder=\"durability\"} 18
+kimmy_write_lock_held_seconds_count{holder=\"durability\"} 14
 kimmy_write_lock_held_seconds_bucket{holder=\"rewind\",le=\"0.001\"} 0
 kimmy_write_lock_held_seconds_bucket{holder=\"rewind\",le=\"0.01\"} 0
 kimmy_write_lock_held_seconds_bucket{holder=\"rewind\",le=\"0.1\"} 0
 kimmy_write_lock_held_seconds_bucket{holder=\"rewind\",le=\"1\"} 0
-kimmy_write_lock_held_seconds_bucket{holder=\"rewind\",le=\"5\"} 12
-kimmy_write_lock_held_seconds_bucket{holder=\"rewind\",le=\"30\"} 12
-kimmy_write_lock_held_seconds_bucket{holder=\"rewind\",le=\"300\"} 13
-kimmy_write_lock_held_seconds_bucket{holder=\"rewind\",le=\"+Inf\"} 14
-kimmy_write_lock_held_seconds_sum{holder=\"rewind\"} 18
-kimmy_write_lock_held_seconds_count{holder=\"rewind\"} 14
+kimmy_write_lock_held_seconds_bucket{holder=\"rewind\",le=\"5\"} 0
+kimmy_write_lock_held_seconds_bucket{holder=\"rewind\",le=\"30\"} 13
+kimmy_write_lock_held_seconds_bucket{holder=\"rewind\",le=\"300\"} 14
+kimmy_write_lock_held_seconds_bucket{holder=\"rewind\",le=\"+Inf\"} 15
+kimmy_write_lock_held_seconds_sum{holder=\"rewind\"} 19.5
+kimmy_write_lock_held_seconds_count{holder=\"rewind\"} 15
 kimmy_write_lock_held_seconds_bucket{holder=\"violations\",le=\"0.001\"} 0
 kimmy_write_lock_held_seconds_bucket{holder=\"violations\",le=\"0.01\"} 0
 kimmy_write_lock_held_seconds_bucket{holder=\"violations\",le=\"0.1\"} 0
 kimmy_write_lock_held_seconds_bucket{holder=\"violations\",le=\"1\"} 0
 kimmy_write_lock_held_seconds_bucket{holder=\"violations\",le=\"5\"} 0
-kimmy_write_lock_held_seconds_bucket{holder=\"violations\",le=\"30\"} 13
-kimmy_write_lock_held_seconds_bucket{holder=\"violations\",le=\"300\"} 14
-kimmy_write_lock_held_seconds_bucket{holder=\"violations\",le=\"+Inf\"} 15
-kimmy_write_lock_held_seconds_sum{holder=\"violations\"} 19.5
-kimmy_write_lock_held_seconds_count{holder=\"violations\"} 15
+kimmy_write_lock_held_seconds_bucket{holder=\"violations\",le=\"30\"} 0
+kimmy_write_lock_held_seconds_bucket{holder=\"violations\",le=\"300\"} 15
+kimmy_write_lock_held_seconds_bucket{holder=\"violations\",le=\"+Inf\"} 16
+kimmy_write_lock_held_seconds_sum{holder=\"violations\"} 21
+kimmy_write_lock_held_seconds_count{holder=\"violations\"} 16
 # HELP kimmy_write_lock_held_component_seconds_total Seconds holds of the storage writer spent, by holder and by what the holding thread was doing. read, write, sync: inside the storage file's page reads, page writes and fsyncs. cpu: on the CPU outside those - B-tree work over cached pages, encoding, index keys, bookkeeping. off_cpu: the rest - off the CPU outside any file call, which is scheduler delay or a wait on a lock inside the storage engine. The five add up to kimmy_write_lock_held_seconds_sum. off_cpu is a residual, so anything the other four fail to capture lands there too; read it beside kimmy_write_lock_held_write_estimated_seconds_total. cpu and off_cpu leave out holds counted in kimmy_write_lock_held_cpu_unmeasured_total.
 # TYPE kimmy_write_lock_held_component_seconds_total counter
 kimmy_write_lock_held_component_seconds_total{holder=\"write\",component=\"read\"} 0.101
@@ -2909,51 +2944,56 @@ kimmy_write_lock_held_component_seconds_total{holder=\"index_build\",component=\
 kimmy_write_lock_held_component_seconds_total{holder=\"index_build\",component=\"sync\"} 0.403
 kimmy_write_lock_held_component_seconds_total{holder=\"index_build\",component=\"cpu\"} 0.404
 kimmy_write_lock_held_component_seconds_total{holder=\"index_build\",component=\"off_cpu\"} 0.405
-kimmy_write_lock_held_component_seconds_total{holder=\"drop\",component=\"read\"} 0.501
-kimmy_write_lock_held_component_seconds_total{holder=\"drop\",component=\"write\"} 0.502
-kimmy_write_lock_held_component_seconds_total{holder=\"drop\",component=\"sync\"} 0.503
-kimmy_write_lock_held_component_seconds_total{holder=\"drop\",component=\"cpu\"} 0.504
-kimmy_write_lock_held_component_seconds_total{holder=\"drop\",component=\"off_cpu\"} 0.505
-kimmy_write_lock_held_component_seconds_total{holder=\"replication\",component=\"read\"} 0.601
-kimmy_write_lock_held_component_seconds_total{holder=\"replication\",component=\"write\"} 0.602
-kimmy_write_lock_held_component_seconds_total{holder=\"replication\",component=\"sync\"} 0.603
-kimmy_write_lock_held_component_seconds_total{holder=\"replication\",component=\"cpu\"} 0.604
-kimmy_write_lock_held_component_seconds_total{holder=\"replication\",component=\"off_cpu\"} 0.605
-kimmy_write_lock_held_component_seconds_total{holder=\"repair\",component=\"read\"} 0.701
-kimmy_write_lock_held_component_seconds_total{holder=\"repair\",component=\"write\"} 0.702
-kimmy_write_lock_held_component_seconds_total{holder=\"repair\",component=\"sync\"} 0.703
-kimmy_write_lock_held_component_seconds_total{holder=\"repair\",component=\"cpu\"} 0.704
-kimmy_write_lock_held_component_seconds_total{holder=\"repair\",component=\"off_cpu\"} 0.705
-kimmy_write_lock_held_component_seconds_total{holder=\"retention\",component=\"read\"} 0.801
-kimmy_write_lock_held_component_seconds_total{holder=\"retention\",component=\"write\"} 0.802
-kimmy_write_lock_held_component_seconds_total{holder=\"retention\",component=\"sync\"} 0.803
-kimmy_write_lock_held_component_seconds_total{holder=\"retention\",component=\"cpu\"} 0.804
-kimmy_write_lock_held_component_seconds_total{holder=\"retention\",component=\"off_cpu\"} 0.805
-kimmy_write_lock_held_component_seconds_total{holder=\"expiry\",component=\"read\"} 0.901
-kimmy_write_lock_held_component_seconds_total{holder=\"expiry\",component=\"write\"} 0.902
-kimmy_write_lock_held_component_seconds_total{holder=\"expiry\",component=\"sync\"} 0.903
-kimmy_write_lock_held_component_seconds_total{holder=\"expiry\",component=\"cpu\"} 0.904
-kimmy_write_lock_held_component_seconds_total{holder=\"expiry\",component=\"off_cpu\"} 0.905
-kimmy_write_lock_held_component_seconds_total{holder=\"embedding\",component=\"read\"} 1.001
-kimmy_write_lock_held_component_seconds_total{holder=\"embedding\",component=\"write\"} 1.002
-kimmy_write_lock_held_component_seconds_total{holder=\"embedding\",component=\"sync\"} 1.003
-kimmy_write_lock_held_component_seconds_total{holder=\"embedding\",component=\"cpu\"} 1.004
-kimmy_write_lock_held_component_seconds_total{holder=\"embedding\",component=\"off_cpu\"} 1.005
-kimmy_write_lock_held_component_seconds_total{holder=\"durability\",component=\"read\"} 1.101
-kimmy_write_lock_held_component_seconds_total{holder=\"durability\",component=\"write\"} 1.102
-kimmy_write_lock_held_component_seconds_total{holder=\"durability\",component=\"sync\"} 1.103
-kimmy_write_lock_held_component_seconds_total{holder=\"durability\",component=\"cpu\"} 1.104
-kimmy_write_lock_held_component_seconds_total{holder=\"durability\",component=\"off_cpu\"} 1.105
-kimmy_write_lock_held_component_seconds_total{holder=\"rewind\",component=\"read\"} 1.201
-kimmy_write_lock_held_component_seconds_total{holder=\"rewind\",component=\"write\"} 1.202
-kimmy_write_lock_held_component_seconds_total{holder=\"rewind\",component=\"sync\"} 1.203
-kimmy_write_lock_held_component_seconds_total{holder=\"rewind\",component=\"cpu\"} 1.204
-kimmy_write_lock_held_component_seconds_total{holder=\"rewind\",component=\"off_cpu\"} 1.205
-kimmy_write_lock_held_component_seconds_total{holder=\"violations\",component=\"read\"} 1.301
-kimmy_write_lock_held_component_seconds_total{holder=\"violations\",component=\"write\"} 1.302
-kimmy_write_lock_held_component_seconds_total{holder=\"violations\",component=\"sync\"} 1.303
-kimmy_write_lock_held_component_seconds_total{holder=\"violations\",component=\"cpu\"} 1.304
-kimmy_write_lock_held_component_seconds_total{holder=\"violations\",component=\"off_cpu\"} 1.305
+kimmy_write_lock_held_component_seconds_total{holder=\"index_drop\",component=\"read\"} 0.501
+kimmy_write_lock_held_component_seconds_total{holder=\"index_drop\",component=\"write\"} 0.502
+kimmy_write_lock_held_component_seconds_total{holder=\"index_drop\",component=\"sync\"} 0.503
+kimmy_write_lock_held_component_seconds_total{holder=\"index_drop\",component=\"cpu\"} 0.504
+kimmy_write_lock_held_component_seconds_total{holder=\"index_drop\",component=\"off_cpu\"} 0.505
+kimmy_write_lock_held_component_seconds_total{holder=\"drop\",component=\"read\"} 0.601
+kimmy_write_lock_held_component_seconds_total{holder=\"drop\",component=\"write\"} 0.602
+kimmy_write_lock_held_component_seconds_total{holder=\"drop\",component=\"sync\"} 0.603
+kimmy_write_lock_held_component_seconds_total{holder=\"drop\",component=\"cpu\"} 0.604
+kimmy_write_lock_held_component_seconds_total{holder=\"drop\",component=\"off_cpu\"} 0.605
+kimmy_write_lock_held_component_seconds_total{holder=\"replication\",component=\"read\"} 0.701
+kimmy_write_lock_held_component_seconds_total{holder=\"replication\",component=\"write\"} 0.702
+kimmy_write_lock_held_component_seconds_total{holder=\"replication\",component=\"sync\"} 0.703
+kimmy_write_lock_held_component_seconds_total{holder=\"replication\",component=\"cpu\"} 0.704
+kimmy_write_lock_held_component_seconds_total{holder=\"replication\",component=\"off_cpu\"} 0.705
+kimmy_write_lock_held_component_seconds_total{holder=\"repair\",component=\"read\"} 0.801
+kimmy_write_lock_held_component_seconds_total{holder=\"repair\",component=\"write\"} 0.802
+kimmy_write_lock_held_component_seconds_total{holder=\"repair\",component=\"sync\"} 0.803
+kimmy_write_lock_held_component_seconds_total{holder=\"repair\",component=\"cpu\"} 0.804
+kimmy_write_lock_held_component_seconds_total{holder=\"repair\",component=\"off_cpu\"} 0.805
+kimmy_write_lock_held_component_seconds_total{holder=\"retention\",component=\"read\"} 0.901
+kimmy_write_lock_held_component_seconds_total{holder=\"retention\",component=\"write\"} 0.902
+kimmy_write_lock_held_component_seconds_total{holder=\"retention\",component=\"sync\"} 0.903
+kimmy_write_lock_held_component_seconds_total{holder=\"retention\",component=\"cpu\"} 0.904
+kimmy_write_lock_held_component_seconds_total{holder=\"retention\",component=\"off_cpu\"} 0.905
+kimmy_write_lock_held_component_seconds_total{holder=\"expiry\",component=\"read\"} 1.001
+kimmy_write_lock_held_component_seconds_total{holder=\"expiry\",component=\"write\"} 1.002
+kimmy_write_lock_held_component_seconds_total{holder=\"expiry\",component=\"sync\"} 1.003
+kimmy_write_lock_held_component_seconds_total{holder=\"expiry\",component=\"cpu\"} 1.004
+kimmy_write_lock_held_component_seconds_total{holder=\"expiry\",component=\"off_cpu\"} 1.005
+kimmy_write_lock_held_component_seconds_total{holder=\"embedding\",component=\"read\"} 1.101
+kimmy_write_lock_held_component_seconds_total{holder=\"embedding\",component=\"write\"} 1.102
+kimmy_write_lock_held_component_seconds_total{holder=\"embedding\",component=\"sync\"} 1.103
+kimmy_write_lock_held_component_seconds_total{holder=\"embedding\",component=\"cpu\"} 1.104
+kimmy_write_lock_held_component_seconds_total{holder=\"embedding\",component=\"off_cpu\"} 1.105
+kimmy_write_lock_held_component_seconds_total{holder=\"durability\",component=\"read\"} 1.201
+kimmy_write_lock_held_component_seconds_total{holder=\"durability\",component=\"write\"} 1.202
+kimmy_write_lock_held_component_seconds_total{holder=\"durability\",component=\"sync\"} 1.203
+kimmy_write_lock_held_component_seconds_total{holder=\"durability\",component=\"cpu\"} 1.204
+kimmy_write_lock_held_component_seconds_total{holder=\"durability\",component=\"off_cpu\"} 1.205
+kimmy_write_lock_held_component_seconds_total{holder=\"rewind\",component=\"read\"} 1.301
+kimmy_write_lock_held_component_seconds_total{holder=\"rewind\",component=\"write\"} 1.302
+kimmy_write_lock_held_component_seconds_total{holder=\"rewind\",component=\"sync\"} 1.303
+kimmy_write_lock_held_component_seconds_total{holder=\"rewind\",component=\"cpu\"} 1.304
+kimmy_write_lock_held_component_seconds_total{holder=\"rewind\",component=\"off_cpu\"} 1.305
+kimmy_write_lock_held_component_seconds_total{holder=\"violations\",component=\"read\"} 1.401
+kimmy_write_lock_held_component_seconds_total{holder=\"violations\",component=\"write\"} 1.402
+kimmy_write_lock_held_component_seconds_total{holder=\"violations\",component=\"sync\"} 1.403
+kimmy_write_lock_held_component_seconds_total{holder=\"violations\",component=\"cpu\"} 1.404
+kimmy_write_lock_held_component_seconds_total{holder=\"violations\",component=\"off_cpu\"} 1.405
 # HELP kimmy_write_lock_held_phase_seconds_total Seconds holds of the storage writer spent, by holder and by where in the transaction. work: from taking the writer to asking to commit, the whole hold of one that aborted. counts: writing the collections' live document counts, once per transaction. commit: the storage engine's commit, its page writes and fsync, to letting go. The three add up to kimmy_write_lock_held_seconds_sum.
 # TYPE kimmy_write_lock_held_phase_seconds_total counter
 kimmy_write_lock_held_phase_seconds_total{holder=\"write\",phase=\"work\"} 0.111
@@ -2968,33 +3008,36 @@ kimmy_write_lock_held_phase_seconds_total{holder=\"ddl\",phase=\"commit\"} 0.313
 kimmy_write_lock_held_phase_seconds_total{holder=\"index_build\",phase=\"work\"} 0.411
 kimmy_write_lock_held_phase_seconds_total{holder=\"index_build\",phase=\"counts\"} 0.412
 kimmy_write_lock_held_phase_seconds_total{holder=\"index_build\",phase=\"commit\"} 0.413
-kimmy_write_lock_held_phase_seconds_total{holder=\"drop\",phase=\"work\"} 0.511
-kimmy_write_lock_held_phase_seconds_total{holder=\"drop\",phase=\"counts\"} 0.512
-kimmy_write_lock_held_phase_seconds_total{holder=\"drop\",phase=\"commit\"} 0.513
-kimmy_write_lock_held_phase_seconds_total{holder=\"replication\",phase=\"work\"} 0.611
-kimmy_write_lock_held_phase_seconds_total{holder=\"replication\",phase=\"counts\"} 0.612
-kimmy_write_lock_held_phase_seconds_total{holder=\"replication\",phase=\"commit\"} 0.613
-kimmy_write_lock_held_phase_seconds_total{holder=\"repair\",phase=\"work\"} 0.711
-kimmy_write_lock_held_phase_seconds_total{holder=\"repair\",phase=\"counts\"} 0.712
-kimmy_write_lock_held_phase_seconds_total{holder=\"repair\",phase=\"commit\"} 0.713
-kimmy_write_lock_held_phase_seconds_total{holder=\"retention\",phase=\"work\"} 0.811
-kimmy_write_lock_held_phase_seconds_total{holder=\"retention\",phase=\"counts\"} 0.812
-kimmy_write_lock_held_phase_seconds_total{holder=\"retention\",phase=\"commit\"} 0.813
-kimmy_write_lock_held_phase_seconds_total{holder=\"expiry\",phase=\"work\"} 0.911
-kimmy_write_lock_held_phase_seconds_total{holder=\"expiry\",phase=\"counts\"} 0.912
-kimmy_write_lock_held_phase_seconds_total{holder=\"expiry\",phase=\"commit\"} 0.913
-kimmy_write_lock_held_phase_seconds_total{holder=\"embedding\",phase=\"work\"} 1.011
-kimmy_write_lock_held_phase_seconds_total{holder=\"embedding\",phase=\"counts\"} 1.012
-kimmy_write_lock_held_phase_seconds_total{holder=\"embedding\",phase=\"commit\"} 1.013
-kimmy_write_lock_held_phase_seconds_total{holder=\"durability\",phase=\"work\"} 1.111
-kimmy_write_lock_held_phase_seconds_total{holder=\"durability\",phase=\"counts\"} 1.112
-kimmy_write_lock_held_phase_seconds_total{holder=\"durability\",phase=\"commit\"} 1.113
-kimmy_write_lock_held_phase_seconds_total{holder=\"rewind\",phase=\"work\"} 1.211
-kimmy_write_lock_held_phase_seconds_total{holder=\"rewind\",phase=\"counts\"} 1.212
-kimmy_write_lock_held_phase_seconds_total{holder=\"rewind\",phase=\"commit\"} 1.213
-kimmy_write_lock_held_phase_seconds_total{holder=\"violations\",phase=\"work\"} 1.311
-kimmy_write_lock_held_phase_seconds_total{holder=\"violations\",phase=\"counts\"} 1.312
-kimmy_write_lock_held_phase_seconds_total{holder=\"violations\",phase=\"commit\"} 1.313
+kimmy_write_lock_held_phase_seconds_total{holder=\"index_drop\",phase=\"work\"} 0.511
+kimmy_write_lock_held_phase_seconds_total{holder=\"index_drop\",phase=\"counts\"} 0.512
+kimmy_write_lock_held_phase_seconds_total{holder=\"index_drop\",phase=\"commit\"} 0.513
+kimmy_write_lock_held_phase_seconds_total{holder=\"drop\",phase=\"work\"} 0.611
+kimmy_write_lock_held_phase_seconds_total{holder=\"drop\",phase=\"counts\"} 0.612
+kimmy_write_lock_held_phase_seconds_total{holder=\"drop\",phase=\"commit\"} 0.613
+kimmy_write_lock_held_phase_seconds_total{holder=\"replication\",phase=\"work\"} 0.711
+kimmy_write_lock_held_phase_seconds_total{holder=\"replication\",phase=\"counts\"} 0.712
+kimmy_write_lock_held_phase_seconds_total{holder=\"replication\",phase=\"commit\"} 0.713
+kimmy_write_lock_held_phase_seconds_total{holder=\"repair\",phase=\"work\"} 0.811
+kimmy_write_lock_held_phase_seconds_total{holder=\"repair\",phase=\"counts\"} 0.812
+kimmy_write_lock_held_phase_seconds_total{holder=\"repair\",phase=\"commit\"} 0.813
+kimmy_write_lock_held_phase_seconds_total{holder=\"retention\",phase=\"work\"} 0.911
+kimmy_write_lock_held_phase_seconds_total{holder=\"retention\",phase=\"counts\"} 0.912
+kimmy_write_lock_held_phase_seconds_total{holder=\"retention\",phase=\"commit\"} 0.913
+kimmy_write_lock_held_phase_seconds_total{holder=\"expiry\",phase=\"work\"} 1.011
+kimmy_write_lock_held_phase_seconds_total{holder=\"expiry\",phase=\"counts\"} 1.012
+kimmy_write_lock_held_phase_seconds_total{holder=\"expiry\",phase=\"commit\"} 1.013
+kimmy_write_lock_held_phase_seconds_total{holder=\"embedding\",phase=\"work\"} 1.111
+kimmy_write_lock_held_phase_seconds_total{holder=\"embedding\",phase=\"counts\"} 1.112
+kimmy_write_lock_held_phase_seconds_total{holder=\"embedding\",phase=\"commit\"} 1.113
+kimmy_write_lock_held_phase_seconds_total{holder=\"durability\",phase=\"work\"} 1.211
+kimmy_write_lock_held_phase_seconds_total{holder=\"durability\",phase=\"counts\"} 1.212
+kimmy_write_lock_held_phase_seconds_total{holder=\"durability\",phase=\"commit\"} 1.213
+kimmy_write_lock_held_phase_seconds_total{holder=\"rewind\",phase=\"work\"} 1.311
+kimmy_write_lock_held_phase_seconds_total{holder=\"rewind\",phase=\"counts\"} 1.312
+kimmy_write_lock_held_phase_seconds_total{holder=\"rewind\",phase=\"commit\"} 1.313
+kimmy_write_lock_held_phase_seconds_total{holder=\"violations\",phase=\"work\"} 1.411
+kimmy_write_lock_held_phase_seconds_total{holder=\"violations\",phase=\"counts\"} 1.412
+kimmy_write_lock_held_phase_seconds_total{holder=\"violations\",phase=\"commit\"} 1.413
 # HELP kimmy_write_lock_held_io_bytes_total Bytes holds of the storage writer read from and wrote to the storage file, by holder. Beside the read and write components: more bytes is more pages, and the same bytes in more seconds is slower pages.
 # TYPE kimmy_write_lock_held_io_bytes_total counter
 kimmy_write_lock_held_io_bytes_total{holder=\"write\",io=\"read\"} 1001
@@ -3005,54 +3048,58 @@ kimmy_write_lock_held_io_bytes_total{holder=\"ddl\",io=\"read\"} 3001
 kimmy_write_lock_held_io_bytes_total{holder=\"ddl\",io=\"write\"} 3002
 kimmy_write_lock_held_io_bytes_total{holder=\"index_build\",io=\"read\"} 4001
 kimmy_write_lock_held_io_bytes_total{holder=\"index_build\",io=\"write\"} 4002
-kimmy_write_lock_held_io_bytes_total{holder=\"drop\",io=\"read\"} 5001
-kimmy_write_lock_held_io_bytes_total{holder=\"drop\",io=\"write\"} 5002
-kimmy_write_lock_held_io_bytes_total{holder=\"replication\",io=\"read\"} 6001
-kimmy_write_lock_held_io_bytes_total{holder=\"replication\",io=\"write\"} 6002
-kimmy_write_lock_held_io_bytes_total{holder=\"repair\",io=\"read\"} 7001
-kimmy_write_lock_held_io_bytes_total{holder=\"repair\",io=\"write\"} 7002
-kimmy_write_lock_held_io_bytes_total{holder=\"retention\",io=\"read\"} 8001
-kimmy_write_lock_held_io_bytes_total{holder=\"retention\",io=\"write\"} 8002
-kimmy_write_lock_held_io_bytes_total{holder=\"expiry\",io=\"read\"} 9001
-kimmy_write_lock_held_io_bytes_total{holder=\"expiry\",io=\"write\"} 9002
-kimmy_write_lock_held_io_bytes_total{holder=\"embedding\",io=\"read\"} 10001
-kimmy_write_lock_held_io_bytes_total{holder=\"embedding\",io=\"write\"} 10002
-kimmy_write_lock_held_io_bytes_total{holder=\"durability\",io=\"read\"} 11001
-kimmy_write_lock_held_io_bytes_total{holder=\"durability\",io=\"write\"} 11002
-kimmy_write_lock_held_io_bytes_total{holder=\"rewind\",io=\"read\"} 12001
-kimmy_write_lock_held_io_bytes_total{holder=\"rewind\",io=\"write\"} 12002
-kimmy_write_lock_held_io_bytes_total{holder=\"violations\",io=\"read\"} 13001
-kimmy_write_lock_held_io_bytes_total{holder=\"violations\",io=\"write\"} 13002
+kimmy_write_lock_held_io_bytes_total{holder=\"index_drop\",io=\"read\"} 5001
+kimmy_write_lock_held_io_bytes_total{holder=\"index_drop\",io=\"write\"} 5002
+kimmy_write_lock_held_io_bytes_total{holder=\"drop\",io=\"read\"} 6001
+kimmy_write_lock_held_io_bytes_total{holder=\"drop\",io=\"write\"} 6002
+kimmy_write_lock_held_io_bytes_total{holder=\"replication\",io=\"read\"} 7001
+kimmy_write_lock_held_io_bytes_total{holder=\"replication\",io=\"write\"} 7002
+kimmy_write_lock_held_io_bytes_total{holder=\"repair\",io=\"read\"} 8001
+kimmy_write_lock_held_io_bytes_total{holder=\"repair\",io=\"write\"} 8002
+kimmy_write_lock_held_io_bytes_total{holder=\"retention\",io=\"read\"} 9001
+kimmy_write_lock_held_io_bytes_total{holder=\"retention\",io=\"write\"} 9002
+kimmy_write_lock_held_io_bytes_total{holder=\"expiry\",io=\"read\"} 10001
+kimmy_write_lock_held_io_bytes_total{holder=\"expiry\",io=\"write\"} 10002
+kimmy_write_lock_held_io_bytes_total{holder=\"embedding\",io=\"read\"} 11001
+kimmy_write_lock_held_io_bytes_total{holder=\"embedding\",io=\"write\"} 11002
+kimmy_write_lock_held_io_bytes_total{holder=\"durability\",io=\"read\"} 12001
+kimmy_write_lock_held_io_bytes_total{holder=\"durability\",io=\"write\"} 12002
+kimmy_write_lock_held_io_bytes_total{holder=\"rewind\",io=\"read\"} 13001
+kimmy_write_lock_held_io_bytes_total{holder=\"rewind\",io=\"write\"} 13002
+kimmy_write_lock_held_io_bytes_total{holder=\"violations\",io=\"read\"} 14001
+kimmy_write_lock_held_io_bytes_total{holder=\"violations\",io=\"write\"} 14002
 # HELP kimmy_write_lock_held_write_estimated_seconds_total Seconds of page writes, inside holds of the storage writer, whose CPU time was estimated from a sample rather than read. The most by which cpu and off_cpu in kimmy_write_lock_held_component_seconds_total can be misattributed between each other, in either direction; 0 for a hold of 32 page writes or fewer, which is measured exactly.
 # TYPE kimmy_write_lock_held_write_estimated_seconds_total counter
 kimmy_write_lock_held_write_estimated_seconds_total{holder=\"write\"} 0.121
 kimmy_write_lock_held_write_estimated_seconds_total{holder=\"bulk\"} 0.221
 kimmy_write_lock_held_write_estimated_seconds_total{holder=\"ddl\"} 0.321
 kimmy_write_lock_held_write_estimated_seconds_total{holder=\"index_build\"} 0.421
-kimmy_write_lock_held_write_estimated_seconds_total{holder=\"drop\"} 0.521
-kimmy_write_lock_held_write_estimated_seconds_total{holder=\"replication\"} 0.621
-kimmy_write_lock_held_write_estimated_seconds_total{holder=\"repair\"} 0.721
-kimmy_write_lock_held_write_estimated_seconds_total{holder=\"retention\"} 0.821
-kimmy_write_lock_held_write_estimated_seconds_total{holder=\"expiry\"} 0.921
-kimmy_write_lock_held_write_estimated_seconds_total{holder=\"embedding\"} 1.021
-kimmy_write_lock_held_write_estimated_seconds_total{holder=\"durability\"} 1.121
-kimmy_write_lock_held_write_estimated_seconds_total{holder=\"rewind\"} 1.221
-kimmy_write_lock_held_write_estimated_seconds_total{holder=\"violations\"} 1.321
+kimmy_write_lock_held_write_estimated_seconds_total{holder=\"index_drop\"} 0.521
+kimmy_write_lock_held_write_estimated_seconds_total{holder=\"drop\"} 0.621
+kimmy_write_lock_held_write_estimated_seconds_total{holder=\"replication\"} 0.721
+kimmy_write_lock_held_write_estimated_seconds_total{holder=\"repair\"} 0.821
+kimmy_write_lock_held_write_estimated_seconds_total{holder=\"retention\"} 0.921
+kimmy_write_lock_held_write_estimated_seconds_total{holder=\"expiry\"} 1.021
+kimmy_write_lock_held_write_estimated_seconds_total{holder=\"embedding\"} 1.121
+kimmy_write_lock_held_write_estimated_seconds_total{holder=\"durability\"} 1.221
+kimmy_write_lock_held_write_estimated_seconds_total{holder=\"rewind\"} 1.321
+kimmy_write_lock_held_write_estimated_seconds_total{holder=\"violations\"} 1.421
 # HELP kimmy_write_lock_held_overcounted_total Holds of the storage writer whose measured components came to more than the hold, past the clocks' tolerance: something was counted twice. Should read 0; it cannot see a component that was missed, which lands in off_cpu instead.
 # TYPE kimmy_write_lock_held_overcounted_total counter
 kimmy_write_lock_held_overcounted_total{holder=\"write\"} 61
 kimmy_write_lock_held_overcounted_total{holder=\"bulk\"} 62
 kimmy_write_lock_held_overcounted_total{holder=\"ddl\"} 63
 kimmy_write_lock_held_overcounted_total{holder=\"index_build\"} 64
-kimmy_write_lock_held_overcounted_total{holder=\"drop\"} 65
-kimmy_write_lock_held_overcounted_total{holder=\"replication\"} 66
-kimmy_write_lock_held_overcounted_total{holder=\"repair\"} 67
-kimmy_write_lock_held_overcounted_total{holder=\"retention\"} 68
-kimmy_write_lock_held_overcounted_total{holder=\"expiry\"} 69
-kimmy_write_lock_held_overcounted_total{holder=\"embedding\"} 70
-kimmy_write_lock_held_overcounted_total{holder=\"durability\"} 71
-kimmy_write_lock_held_overcounted_total{holder=\"rewind\"} 72
-kimmy_write_lock_held_overcounted_total{holder=\"violations\"} 73
+kimmy_write_lock_held_overcounted_total{holder=\"index_drop\"} 65
+kimmy_write_lock_held_overcounted_total{holder=\"drop\"} 66
+kimmy_write_lock_held_overcounted_total{holder=\"replication\"} 67
+kimmy_write_lock_held_overcounted_total{holder=\"repair\"} 68
+kimmy_write_lock_held_overcounted_total{holder=\"retention\"} 69
+kimmy_write_lock_held_overcounted_total{holder=\"expiry\"} 70
+kimmy_write_lock_held_overcounted_total{holder=\"embedding\"} 71
+kimmy_write_lock_held_overcounted_total{holder=\"durability\"} 72
+kimmy_write_lock_held_overcounted_total{holder=\"rewind\"} 73
+kimmy_write_lock_held_overcounted_total{holder=\"violations\"} 74
 # HELP kimmy_write_lock_held_cpu_unmeasured_total Holds of the storage writer, of any holder, whose thread CPU time could not be read, so they are not in the cpu and off_cpu components. Rises on every hold on a platform without a per-thread CPU clock; 0 on Linux and macOS.
 # TYPE kimmy_write_lock_held_cpu_unmeasured_total counter
 kimmy_write_lock_held_cpu_unmeasured_total 99
@@ -3575,6 +3622,12 @@ kimmy_yield_faults_total{class=\"embeddings\",kind=\"config\"} 1724
 # HELP kimmy_runtime_responsive Whether this member's async runtime has not stalled for the last six judged evaluator ticks (0 or 1): quick to 0, slow to 1. Only a responsive member is a target for a peer's yield.
 # TYPE kimmy_runtime_responsive gauge
 kimmy_runtime_responsive 1
+# HELP kimmy_writer_wedged Whether the single writer has been held past the wedge bound (0 or 1): one hold, of a holder whose length is bounded by nature (an index build or drop is never judged), for longer than 60 s. While 1 this member can do no write, its classes that own work count it against them, and no peer hands it work. Read at the last judged evaluator tick; a paused process leaves it as it was.
+# TYPE kimmy_writer_wedged gauge
+kimmy_writer_wedged 1
+# HELP kimmy_writer_hold_age_seconds How long the hold that has the single writer had lasted at the last judged evaluator tick, in seconds: 0 when the writer was free or held by an index build or drop, which are not judged.
+# TYPE kimmy_writer_hold_age_seconds gauge
+kimmy_writer_hold_age_seconds 61.5
 # HELP kimmy_ownership_yield_enabled Whether this member may set its own yield bits (1), or KIMMY_OWNERSHIP_YIELD=off is set (0). Off, it still judges, advertises its states, honours its peers' bits and can be a target.
 # TYPE kimmy_ownership_yield_enabled gauge
 kimmy_ownership_yield_enabled 0
@@ -4194,7 +4247,10 @@ kimmy_storage_cache_reads_total{result=\"miss\"} 9104
                 // reasons, five verdicts and three fault kinds; then the ticks, the
                 // responsive flag, the off switch and probation.
                 + 3 * (3 + 3 + 1 + 1 + 3 + 4 + 5 + 3)
-                + 4,
+                + 4
+                // And the writer's wedge flag and the age of the hold it judges
+                // (ADR-220).
+                + 2,
             "expected one sample per series: {out}"
         );
     }

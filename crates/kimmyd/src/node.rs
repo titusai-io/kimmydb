@@ -1507,6 +1507,7 @@ async fn start_and_serve(
             embeddings_disabled: !config.vector.worker_enabled,
             stopping: Arc::clone(&stop.stopping),
             ttl_holders: Arc::clone(&ttl_holders),
+            writer_hold: engine.writer_hold_word(),
         };
         let body = handle.clone();
         stop.attach_evaluator(handle);
@@ -1569,7 +1570,7 @@ async fn start_and_serve(
     kimmy_task::arm_test_kills();
     // The yield test switches wait for the node to serve as well (ADR-213): the
     // fail steps count their delay from here, and the runtime stall begins.
-    test_switches.arm(shutdown.clone());
+    test_switches.arm(shutdown.clone(), &engine);
     if let [rows, ms] = &serve_walk
         && (rows.is_some() || ms.is_some())
     {

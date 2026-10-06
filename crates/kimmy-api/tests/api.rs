@@ -10368,7 +10368,13 @@ async fn the_metrics_body_exposes_exactly_these_series_in_exactly_this_order() {
     .chain(std::iter::repeat_n("kimmy_yield_observations_total", 3 * 5))
     .chain(["kimmy_yield_evaluator_ticks_total"])
     .chain(std::iter::repeat_n("kimmy_yield_faults_total", 3 * 3))
-    .chain(["kimmy_runtime_responsive", "kimmy_ownership_yield_enabled", "kimmy_yield_probation"])
+    .chain([
+        "kimmy_runtime_responsive",
+        "kimmy_writer_wedged",
+        "kimmy_writer_hold_age_seconds",
+        "kimmy_ownership_yield_enabled",
+        "kimmy_yield_probation",
+    ])
     .chain(["kimmy_ownership_facts_undecodable_total"])
     .chain(std::iter::repeat_n("kimmy_catching_up", kimmy_cluster::catchup::STATES.len()))
     .chain(std::iter::repeat_n("kimmy_ttl_collections", kimmy_api::ownership::TtlState::ALL.len()))
@@ -14564,4 +14570,36 @@ async fn a_guarded_let_variable_does_not_fail_an_aggregation() {
         .await;
     assert_eq!(res.status, 400, "{:?}", res.body);
     assert!(res.body["message"].as_str().unwrap_or_default().contains("divide"), "{:?}", res.body);
+}
+
+/// A wedged writer must not take the answer that says so: `/v1/topology` reads
+/// with a read transaction and does not queue for the writer, so a member whose
+/// gate is held for good still tells a client it is degraded (ADR-220). The node
+/// registers itself at startup, which is the one write on that path.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn topology_answers_while_the_writer_is_held() {
+    let server = Server::start().await;
+    let token = server.root().await;
+    kimmy_api::topology::register(&server.state, "http://127.0.0.1:1").unwrap();
+    let engine = Arc::clone(&server.state.engine);
+    let (held, is_held) = std::sync::mpsc::channel();
+    let (release, released) = std::sync::mpsc::channel::<()>();
+    let holder = std::thread::spawn(move || {
+        let hold = engine.hold_writer(kimmy_storage::WriterHolder::Replication);
+        held.send(()).unwrap();
+        let _ = released.recv();
+        drop(hold);
+    });
+    is_held.recv().unwrap();
+    let started = std::time::Instant::now();
+    let res = tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        server.get("/v1/topology", Some(&token)),
+    )
+    .await
+    .expect("the topology waited for the writer");
+    assert_eq!(res.status, 200, "{:?}", res.body);
+    assert!(started.elapsed() < std::time::Duration::from_secs(2), "{:?}", started.elapsed());
+    release.send(()).unwrap();
+    holder.join().unwrap();
 }

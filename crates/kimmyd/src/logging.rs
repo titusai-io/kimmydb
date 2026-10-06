@@ -273,10 +273,16 @@ impl TelemetryGuard {
             "an index build, which files every document of the collection in the transaction that creates it"
         );
         held_by!(
+            "kimmy.write_lock.held_seconds.index_drop",
+            "kimmy.write_lock.holds.index_drop",
+            WriterHolder::IndexDrop,
+            "an index drop, which removes every entry of the index in the one transaction that drops it"
+        );
+        held_by!(
             "kimmy.write_lock.held_seconds.drop",
             "kimmy.write_lock.holds.drop",
             WriterHolder::Drop,
-            "the destructive half of a drop: one chunk of a collection's purge, or an index drop, which is still one transaction"
+            "the destructive half of a collection's drop: one chunk of its purge"
         );
         held_by!(
             "kimmy.write_lock.held_seconds.replication",
@@ -1166,6 +1172,20 @@ impl TelemetryGuard {
             "1",
             "1 while this member's runtime has not stalled for the last six judged evaluator ticks.",
             |s| u64::from(s.ownership.evaluator.responsive)
+        );
+        observe!(
+            u64_observable_gauge,
+            "kimmy.writer.wedged",
+            "1",
+            "1 while the single writer has been held past the wedge bound by a hold whose length is judged (ADR-220).",
+            |s| u64::from(s.ownership.evaluator.writer_wedged)
+        );
+        observe!(
+            f64_observable_gauge,
+            "kimmy.writer.hold_age",
+            "s",
+            "How long the hold that has the single writer had lasted at the evaluator's last judged tick; 0 when the writer was free or held by an index build or drop.",
+            |s| s.ownership.evaluator.writer_hold_age_ms as f64 / 1000.0
         );
         observe!(
             u64_observable_gauge,

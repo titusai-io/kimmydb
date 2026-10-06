@@ -12,7 +12,29 @@ breaking changes and says so here; a `0.x.PATCH` bump never does.
 
 ## Unreleased
 
+### Added
+
+- **`/v1/topology` says when a node cannot serve.** A node's entry gains an
+  optional `degraded`: `"writer"` while its single writer is wedged (below) and
+  `"runtime"` while its async runtime has stalled. It is advisory (prefer a node
+  without it), appears only on a `live` node, and its absence is not a promise of
+  health. New series: `kimmy_writer_wedged` and `kimmy_writer_hold_age_seconds`.
+  A new test switch, `KIMMY_TEST_HOLD_WRITER=<ms>,<holder>`. See operations.md,
+  "A wedged writer", and ADR-220.
+
 ### Changed
+
+- **A member whose writer is wedged now yields what it owns, and no peer hands it
+  work.** One hold of the single writer that lasts more than 60 seconds used to
+  delay every class of owned work (expiry, webhooks, embeddings) on the member and
+  be detected by nothing. It is now a bad item for every class that owns work, so
+  the member yields them to a peer by the usual rules, and a member that advertises
+  it (`writer_wedged`, optional on the wire) is refused as a target for every
+  class. Index builds and index drops are never read as a wedge, which is a stated
+  gap. An index drop now has a holder of its own, `index_drop`, in
+  `kimmy_write_lock_*{holder}` (it was `drop`). `responsive` in a member's block is
+  now absent until six ticks have been judged, where it read false. No rollback
+  boundary.
 
 - **A `$let` variable the body does not read can no longer fail the expression.**
   `$let` evaluated every variable before its body, so a guard that kept the body

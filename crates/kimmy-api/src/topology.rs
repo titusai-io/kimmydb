@@ -130,6 +130,13 @@ pub async fn topology(
             listed["catchingUp"] = json!(true);
         }
         add_class_view(&state, &mut listed, node.parse().ok(), is_me);
+        add_degraded(
+            &state,
+            &mut listed,
+            node.parse().ok(),
+            is_me,
+            is_me || contains(&live, &node),
+        );
         nodes.push(listed);
         Ok(true)
     })?;
@@ -151,6 +158,7 @@ pub async fn topology(
         }
         let last = nodes.len() - 1;
         add_class_view(&state, &mut nodes[last], Some(me), true);
+        add_degraded(&state, &mut nodes[last], Some(me), true, true);
     }
 
     // Stable order, with this node first: a client reading the list top-down
@@ -220,6 +228,68 @@ fn add_class_view(
             "webhooks": label(states[1]),
             "embeddings": label(states[2]),
         });
+    }
+}
+
+/// Add `degraded` to a node's entry, as this member sees it (ADR-220): `"writer"`
+/// while its single writer has been held past the wedge bound, `"runtime"` while
+/// its async runtime has stalled within the last judged ticks, and absent
+/// otherwise.
+///
+/// **Advisory:** writes and owner work on that member may stall; reads may still be
+/// served; prefer a node without it. It says nothing of a member that is merely
+/// catching up (`catchingUp` says that) or whose classes are stalled (`classState`).
+/// Computed from the writer and the runtime and from nothing about the classes, so
+/// it holds while the classes are gated at a wedged writer.
+///
+/// For this member, what its own evaluator last decided; for a peer, what its last
+/// block said, **only while SWIM vouches for it** (`live`): a member this one no
+/// longer hears is `unknown`, and a block's last words are not a claim about now.
+/// **A missing `degraded` is not "healthy"**: a peer of an older build, or one this
+/// member holds no block from, has none, and a member warming up says nothing
+/// either.
+fn add_degraded(
+    state: &SharedState,
+    entry: &mut Value,
+    node: Option<kimmy_core::NodeId>,
+    is_me: bool,
+    live: bool,
+) {
+    if !live {
+        return;
+    }
+    let reason = if is_me {
+        let Some(handle) = state.metrics.yield_handle() else { return };
+        let current = handle.published.current();
+        if current.writer_wedged {
+            Some("writer")
+        } else if current.runtime_stalled {
+            Some("runtime")
+        } else {
+            None
+        }
+    } else {
+        let (Some(node), Some(members)) = (node, state.members()) else { return };
+        let view = members.view();
+        // A block that is within its lease: one past it says nothing new, and
+        // not hearing from a member is not evidence it is well or unwell.
+        let Some((block, true)) = view.live_block(&node, std::time::Instant::now()) else {
+            return;
+        };
+        let facts = &block.facts;
+        if facts.writer_wedged == Some(true) {
+            Some("writer")
+        } else if facts.writer_wedged.is_some() && facts.responsive == Some(false) {
+            // Only from a block that carries `writer_wedged`, which a 0.44.0
+            // build's does not: it advertises `responsive: false` through its
+            // whole first thirty seconds, which is warming up and no stall.
+            Some("runtime")
+        } else {
+            None
+        }
+    };
+    if let Some(reason) = reason {
+        entry["degraded"] = json!(reason);
     }
 }
 

@@ -1128,7 +1128,18 @@ only when there is something to say: for a peer from an older build `yielding` i
 keeps owning a class it yields until every live peer has confirmed it, so read
 them as "where work is going", and compare members after a lease, never a single
 answer. A client choosing where to send a request should still prefer `live`
-nodes without `catchingUp`, and need not read these at all.
+nodes without `catchingUp` or `degraded`, and need not read these at all.
+
+**`degraded`** ([ADR-220](decisions.md)) is present on a `live` node while that
+node cannot serve as it should, as the answering node sees it: `"writer"` when its
+single writer has been held for more than 60 seconds, so no write can be made and no
+peer hands it work, and `"runtime"` when its async runtime stalled within the last
+judged ticks. **Advisory:** writes and owner work on that node may stall, reads may
+still be served, prefer a node without it. It says nothing of `catchingUp` or
+`classState`. **A missing `degraded` is not "healthy"**: a peer of an older build, a
+peer the answering node holds no block from and a member still starting have none.
+When every node has it, use them anyway; it orders a preference and forbids nothing.
+`status` is unchanged.
 
 A node appears with a null `endpoint` when it has not been told what to
 advertise. Set `server.advertise` to the URL clients should use; it cannot be

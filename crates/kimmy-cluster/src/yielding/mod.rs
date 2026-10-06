@@ -65,6 +65,13 @@ pub const RESPONSIVE_TICKS: usize = 6;
 
 /// The longest a `Local` step may go without a beat.
 pub const LOCAL_BOUND: Duration = Duration::from_secs(30);
+/// W: the longest one hold of the writer may last before it is read as a wedge
+/// (ADR-220). Twice [`LOCAL_BOUND`], and at least twelve times the warn line the
+/// storage engine logs a long hold at, so a hold that is merely long is never
+/// one. It does not apply to a holder whose work scales with the data it works
+/// on (`WriterHolder::is_unbounded`): the evaluator is never given those.
+pub const WRITER_WEDGE: Duration = Duration::from_secs(2 * LOCAL_BOUND.as_secs());
+
 /// What a `Remote` wait's bound adds to our own timer: the timer firing, the
 /// response handled, the in-client retry pause.
 pub const REMOTE_GRACE: Duration = Duration::from_secs(15);
@@ -145,6 +152,10 @@ const _: () = {
     );
     // A Local bound is at least six ticks.
     assert!(LOCAL_BOUND.as_millis() >= 6 * EVAL_TICK.as_millis());
+    // A wedge is longer than any step a class waits on, and than the line the
+    // storage engine warns at by a wide margin.
+    assert!(WRITER_WEDGE.as_millis() > LOCAL_BOUND.as_millis());
+    assert!(WRITER_WEDGE.as_millis() >= 12 * kimmy_storage::WRITER_HOLD_WARN.as_millis());
     // Waiting embeddings covers six deferral ticks and six retry delays.
     assert!(EMBEDDINGS_WAITING.as_millis() >= 6 * tied::DEFERRAL_TICK.as_millis());
     assert!(EMBEDDINGS_WAITING.as_millis() >= 6 * tied::RETRY_DELAY.as_millis());
@@ -395,6 +406,19 @@ pub struct Sample {
     /// The collections this member's own block lists as TTL-indexed: the target
     /// rule before the first pass.
     pub ttl_holders: Vec<CollectionId>,
+    /// The hold that has the writer now, when it is one whose length is judged
+    /// (ADR-220): never a build or an index drop. `None` when the writer is free,
+    /// or held by one of those.
+    pub writer_hold: Option<WriterHoldSample>,
+}
+
+/// The hold of the writer the tick found.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct WriterHoldSample {
+    /// How long ago the hold began.
+    pub age: Duration,
+    /// What it is doing: the holder's label.
+    pub holder: &'static str,
 }
 
 impl Sample {
@@ -406,6 +430,7 @@ impl Sample {
             view,
             owned_ttl: Some(Vec::new()),
             ttl_holders: Vec::new(),
+            writer_hold: None,
         }
     }
 }
@@ -528,6 +553,13 @@ pub enum Event {
         class: OwnerClass,
         reason: Suppression,
     },
+    /// The writer's hold passed [`WRITER_WEDGE`]: said once per wedge (ADR-220).
+    WriterWedged {
+        holder: &'static str,
+        age: Duration,
+    },
+    /// The wedge ended: the writer is free, or held by something else.
+    WriterFree,
 }
 
 /// One class's result.
@@ -550,6 +582,16 @@ pub struct ClassDecision {
 pub struct Decision {
     pub runtime: RuntimeVerdict,
     pub responsive: bool,
+    /// Fewer than [`RESPONSIVE_TICKS`] non-void ticks have been judged since the
+    /// start: `responsive` is false because nothing has been shown yet, and not
+    /// because the runtime stalled (ADR-220).
+    pub warming: bool,
+    /// The writer's hold is past [`WRITER_WEDGE`] (ADR-220). A void tick leaves it
+    /// as it was.
+    pub writer_wedged: bool,
+    /// How old the hold the last judged tick found was: zero when the writer was
+    /// free, or held by a holder that is not judged.
+    pub writer_hold_age: Duration,
     pub classes: PerClass<ClassDecision>,
     pub events: Vec<Event>,
 }
@@ -721,6 +763,8 @@ pub struct Evaluator {
     /// Consecutive on-time control steps, in non-void ticks, with no probe wake.
     no_wake_run: u32,
     responsive: bool,
+    writer_wedged: bool,
+    writer_hold_age: Duration,
     last: Option<Decision>,
 }
 
@@ -748,6 +792,8 @@ impl Evaluator {
             prev_late: false,
             no_wake_run: 0,
             responsive: false,
+            writer_wedged: false,
+            writer_hold_age: Duration::ZERO,
             last: None,
         };
         let mut events = Vec::new();
@@ -793,6 +839,9 @@ impl Evaluator {
         Decision {
             runtime,
             responsive: self.responsive,
+            warming: self.non_void_ticks < RESPONSIVE_TICKS as u64,
+            writer_wedged: self.writer_wedged,
+            writer_hold_age: self.writer_hold_age,
             classes: PerClass {
                 ttl: ttl.decision(),
                 webhooks: webhooks.decision(),
@@ -850,6 +899,19 @@ impl Evaluator {
             self.non_void_ticks >= RESPONSIVE_TICKS as u64 && self.recent.iter().all(|fine| *fine);
 
         let mut events = Vec::new();
+        // The writer's hold is judged on every non-void tick, before and apart
+        // from the classes (ADR-220): it is a fact about the member, and a Repair
+        // hold wedges exactly while the classes are gated at the writer.
+        let wedged_now = sample.writer_hold.filter(|hold| hold.age > WRITER_WEDGE);
+        self.writer_hold_age = sample.writer_hold.map_or(Duration::ZERO, |hold| hold.age);
+        match (self.writer_wedged, wedged_now) {
+            (false, Some(hold)) => {
+                events.push(Event::WriterWedged { holder: hold.holder, age: hold.age });
+            }
+            (true, None) => events.push(Event::WriterFree),
+            _ => {}
+        }
+        self.writer_wedged = wedged_now.is_some();
         for class in OwnerClass::ALL {
             self.tick_class(class, sample, runtime, now, &mut events);
         }
@@ -894,9 +956,14 @@ impl Evaluator {
                 .is_some_and(|bound| cs.since_beat.min(cs.since_phase) > bound);
         let bad_local = overdue || d_bad_cycles > 0;
         let bad_runtime = runtime == RuntimeVerdict::Stalled && cs.owned > 0;
+        // A wedged writer is the member's own fault (a local cause, which the
+        // shared-fault latch counts), and a bad item only for a class that owns
+        // work, as a runtime stall is; for a class that owns nothing the fact is
+        // the member's `writer_wedged`, which refuses it as a target (ADR-220).
+        let bad_writer = self.writer_wedged && cs.owned > 0;
         let verdict = if neutral {
             Verdict::Neutral
-        } else if bad_local || bad_runtime {
+        } else if bad_local || bad_runtime || bad_writer {
             Verdict::Bad
         } else if cs.owned > 0 && (d_ok > 0 || d_cycles > 0) {
             Verdict::Good
@@ -908,7 +975,7 @@ impl Evaluator {
         track.verdict = verdict;
         match verdict {
             Verdict::Bad => {
-                let kind = if bad_local { Kind::Local } else { Kind::Runtime };
+                let kind = if bad_local || bad_writer { Kind::Local } else { Kind::Runtime };
                 track.ring.push_back((now, Item::Bad(kind)));
             }
             Verdict::Good => track.ring.push_back((now, Item::Good)),
@@ -1122,6 +1189,12 @@ pub fn target_refusal(
     if facts.catching_up {
         return Some("catching up");
     }
+    // A member whose writer is wedged can do no write, whatever its classes own:
+    // a class it owns nothing in reads `idle` and would pass the check below
+    // (ADR-220).
+    if facts.writer_wedged == Some(true) {
+        return Some("writer wedged");
+    }
     if facts.yielding.of(class) {
         return Some("already yields the class");
     }
@@ -1269,6 +1342,15 @@ pub struct Published {
     causes: [AtomicU8; 3],
     yields: [AtomicU8; 3],
     responsive: AtomicU8,
+    /// No tick has judged the runtime six times yet, so `responsive` is not
+    /// false for a stall but for want of evidence (ADR-220).
+    warming: AtomicU8,
+    /// The writer's hold is past [`WRITER_WEDGE`] (ADR-220).
+    writer_wedged: AtomicU8,
+    /// The age, in milliseconds, of the hold the last judged tick found: zero
+    /// when the writer was free or held by a holder that is not judged. A void
+    /// tick leaves it as it was.
+    writer_hold_age_ms: AtomicU64,
     /// Milliseconds on the driver's clock of the last tick, plus one so zero means
     /// never.
     last_tick_ms: AtomicU64,
@@ -1289,6 +1371,11 @@ pub struct Current {
     pub cause: PerClass<Option<StallCause>>,
     pub yielding: PerClass<bool>,
     pub responsive: bool,
+    /// The runtime stalled within the last judged ticks: `responsive` is false
+    /// for that, and not because the member has not been judged long enough yet.
+    pub runtime_stalled: bool,
+    pub writer_wedged: bool,
+    pub writer_hold_age: Duration,
 }
 
 /// What the block advertises, after the staleness rule.
@@ -1296,7 +1383,10 @@ pub struct Current {
 pub struct Advertised {
     pub class_state: PerClass<ClassState>,
     pub class_cause: PerClass<StallCause>,
+    /// `None` while the member is warming up as well as when the evaluator is
+    /// stale (ADR-220): `Some(false)` says the runtime stalled.
     pub responsive: Option<bool>,
+    pub writer_wedged: Option<bool>,
     pub yielding: Yielding,
 }
 
@@ -1327,6 +1417,9 @@ impl Default for Published {
             causes: Default::default(),
             yields: Default::default(),
             responsive: AtomicU8::new(0),
+            warming: AtomicU8::new(1),
+            writer_wedged: AtomicU8::new(0),
+            writer_hold_age_ms: AtomicU64::new(0),
             last_tick_ms: AtomicU64::new(0),
             version: AtomicU64::new(0),
             ticks: AtomicU64::new(0),
@@ -1360,6 +1453,14 @@ impl Published {
         }
         changed |= self.responsive.swap(u8::from(decision.responsive), Ordering::SeqCst)
             != u8::from(decision.responsive);
+        changed |= self.warming.swap(u8::from(decision.warming), Ordering::SeqCst)
+            != u8::from(decision.warming);
+        changed |= self.writer_wedged.swap(u8::from(decision.writer_wedged), Ordering::SeqCst)
+            != u8::from(decision.writer_wedged);
+        self.writer_hold_age_ms.store(
+            u64::try_from(decision.writer_hold_age.as_millis()).unwrap_or(u64::MAX),
+            Ordering::Relaxed,
+        );
         for event in &decision.events {
             let (class, direction) = match event {
                 Event::Yielded { class, .. } => (*class, Direction::Yield),
@@ -1403,6 +1504,10 @@ impl Published {
             cause: PerClass { ttl: cause(c0), webhooks: cause(c1), embeddings: cause(c2) },
             yielding: PerClass { ttl: y0 != 0, webhooks: y1 != 0, embeddings: y2 != 0 },
             responsive: self.responsive.load(Ordering::SeqCst) != 0,
+            runtime_stalled: self.responsive.load(Ordering::SeqCst) == 0
+                && self.warming.load(Ordering::SeqCst) == 0,
+            writer_wedged: self.writer_wedged.load(Ordering::SeqCst) != 0,
+            writer_hold_age: Duration::from_millis(self.writer_hold_age_ms.load(Ordering::Relaxed)),
         }
     }
 
@@ -1448,6 +1553,7 @@ impl Published {
                 class_state: PerClass::all(ClassState::Unknown),
                 class_cause: PerClass::all(StallCause::Unknown),
                 responsive: None,
+                writer_wedged: None,
                 yielding,
             };
         }
@@ -1465,7 +1571,16 @@ impl Published {
                 webhooks: cause_of(c1),
                 embeddings: cause_of(c2),
             },
-            responsive: Some(self.responsive.load(Ordering::SeqCst) != 0),
+            // Warming up says nothing: the runtime has not been judged long
+            // enough to be called responsive, and has not stalled (ADR-220). A
+            // peer reads `Some(false)` as a stall, and still refuses `None` as a
+            // target.
+            responsive: if self.warming.load(Ordering::SeqCst) != 0 {
+                None
+            } else {
+                Some(self.responsive.load(Ordering::SeqCst) != 0)
+            },
+            writer_wedged: Some(self.writer_wedged.load(Ordering::SeqCst) != 0),
             yielding,
         }
     }
@@ -1476,6 +1591,7 @@ impl Published {
         facts.class_state = Some(advertised.class_state);
         facts.class_cause = Some(advertised.class_cause);
         facts.responsive = advertised.responsive;
+        facts.writer_wedged = advertised.writer_wedged;
         facts.yielding = advertised.yielding;
     }
 }
