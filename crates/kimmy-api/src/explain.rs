@@ -17,6 +17,7 @@
 //! nested `$lookup` when no document reaches it, so explain can be stricter than
 //! a run there, and says so in the documentation.
 
+use kimmy_query::Filter;
 use kimmy_query::aggregate::{self, Join, Stage};
 use serde_json::{Value, json};
 
@@ -214,31 +215,82 @@ fn describe(stage: &Stage, per_input: bool) -> Value {
                      no index on the foreign field is used"
                         .into()
                 }
-                Join::Pipeline { vars, stages: sub } => {
-                    out["strategy"] = json!("foreignScanNestedLoop");
+                Join::Pipeline { vars, stages: sub, lead } => {
+                    let joined = lead.as_ref().is_some_and(|l| l.key.is_some());
+                    out["strategy"] =
+                        json!(if joined { "foreignScanHashJoin" } else { "foreignScanNestedLoop" });
                     out["let"] =
                         json!(vars.iter().map(|(name, _)| name.clone()).collect::<Vec<_>>());
                     out["readsForeign"] = json!(
                         "once per execution of the stage, and not at all when no document reaches it"
                     );
+                    if let Some(key) = lead.as_ref().and_then(|l| l.key.as_ref()) {
+                        out["joinKey"] = json!({
+                            "foreign": key.foreign.describe(),
+                            "local": key.local.describe(),
+                        });
+                        let residual = match lead.as_ref().map(|l| &l.residual) {
+                            Some(Filter::And(clauses)) => clauses.len(),
+                            Some(Filter::AlwaysTrue) | None => 0,
+                            Some(_) => 1,
+                        };
+                        out["residualClauses"] = json!(residual);
+                        out["fallback"] = json!(
+                            "nested loop at run time if a key holds a Decimal128, or the build or a \
+                             probe raises"
+                        );
+                    }
                     let mut inner = Vec::new();
                     for (i, stage) in sub.iter().enumerate() {
                         let mut d = describe(stage, true);
                         if i == 0 && matches!(stage, Stage::Match(_)) {
-                            // Hoisted: applied once to the foreign side before the loop,
-                            // because a filter cannot name a `let` variable.
-                            d["perInputDocument"] = json!(false);
-                            d["detail"] = json!(
-                                "an in-memory filter over the foreign collection, applied once \
-                                 before the loop; never planned, and no index is used"
-                            );
+                            match lead {
+                                // Reads no variable: applied once, as always.
+                                None => {
+                                    d["perInputDocument"] = json!(false);
+                                    d["detail"] = json!(
+                                        "an in-memory filter over the foreign collection, applied \
+                                         once before the loop; never planned, and no index is used"
+                                    );
+                                }
+                                // Reads a variable: split in two, the independent part once.
+                                Some(lead) => {
+                                    if !matches!(lead.independent, Filter::AlwaysTrue) {
+                                        let mut once = d.clone();
+                                        once["part"] = json!("independent");
+                                        once["perInputDocument"] = json!(false);
+                                        once["detail"] = json!(
+                                            "the clauses that name no `let` variable: an in-memory \
+                                             filter applied once to the foreign collection before \
+                                             the loop; never planned, and no index is used"
+                                        );
+                                        inner.push(once);
+                                    }
+                                    d["part"] = json!("variable");
+                                    d["perInputDocument"] = json!(true);
+                                    d["detail"] = json!(if joined {
+                                        "the clauses that name a `let` variable: one `$eq` is \
+                                         answered from a hash table of the foreign collection \
+                                         from the second input document on; the rest are checked \
+                                         on what it finds"
+                                    } else {
+                                        "the clauses that name a `let` variable: checked against \
+                                         every foreign document for each input document"
+                                    });
+                                }
+                            }
                         }
                         inner.push(d);
                     }
                     out["stages"] = json!(inner);
-                    "runs its sub-pipeline over the foreign collection once for each document \
-                     that reaches it: a nested loop"
-                        .into()
+                    if joined {
+                        "joins on one `$eq` from the second input document on, through a hash \
+                         table; the first input document is a nested loop"
+                    } else {
+                        "runs its sub-pipeline over the foreign collection once for each document \
+                         that reaches it: a nested loop"
+                    }
+                    .into()
                 }
             }
         }
@@ -612,6 +664,49 @@ mod tests {
         );
     }
 
+    /// A correlated `$eq` in a sub-pipeline `$match` is planned as a hash join, with the
+    /// independent part of the `$match` its own entry (ADR-222); a variable-reading
+    /// `$match` with no `$eq` to join on is the nested loop, and says its clauses run
+    /// for every input document.
+    #[test]
+    fn a_correlated_lookup_says_it_is_a_hash_join() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = live_state(&dir);
+        seed(&state, "a", 10, true);
+        seed(&state, "b", 10, false);
+        let join = json!([{ "$lookup": { "from": "b", "let": { "n": "$n" }, "as": "j",
+            "pipeline": [
+                { "$match": { "$and": [
+                    { "k": { "$gt": 2 } },
+                    { "$expr": { "$lte": ["$k", "$$n"] } },
+                    { "$expr": { "$eq": ["$n", "$$n"] } } ] } },
+                { "$limit": 3 } ] } }]);
+        let out = explain(&state, &root(), "a", join).unwrap();
+        let lookup = &out["explain"]["stages"].as_array().unwrap()[0];
+        assert_eq!(lookup["strategy"], "foreignScanHashJoin");
+        assert_eq!(lookup["joinKey"], json!({ "foreign": "$n", "local": "$$n" }));
+        assert_eq!(lookup["residualClauses"], 1);
+        assert!(lookup["fallback"].as_str().unwrap().contains("Decimal128"));
+        let inner = lookup["stages"].as_array().unwrap();
+        assert_eq!(inner[0]["part"], "independent");
+        assert_eq!(inner[0]["perInputDocument"], false);
+        assert_eq!(inner[1]["part"], "variable");
+        assert_eq!(inner[1]["perInputDocument"], true);
+        assert_eq!(inner[2]["stage"], "$limit");
+        assert_eq!(inner[2]["perInputDocument"], true);
+
+        let no_join = json!([{ "$lookup": { "from": "b", "let": { "n": "$n" }, "as": "j",
+            "pipeline": [{ "$match": { "$expr": { "$gt": ["$k", "$$n"] } } }] } }]);
+        let out = explain(&state, &root(), "a", no_join).unwrap();
+        let lookup = &out["explain"]["stages"].as_array().unwrap()[0];
+        assert_eq!(lookup["strategy"], "foreignScanNestedLoop");
+        assert!(lookup.get("joinKey").is_none());
+        let inner = lookup["stages"].as_array().unwrap();
+        assert_eq!(inner.len(), 1, "no independent part, so one entry");
+        assert_eq!(inner[0]["perInputDocument"], true);
+        assert!(inner[0]["detail"].as_str().unwrap().contains("every foreign document"));
+    }
+
     /// Authorization is a run's, in a run's order, and covers every collection named,
     /// a nested `$lookup`'s too.
     #[test]
@@ -745,6 +840,8 @@ mod tests {
         let pipeline = json!([
             { "$match": { "n": 2 } },
             { "$lookup": { "from": "b", "localField": "n", "foreignField": "n", "as": "j" } },
+            { "$lookup": { "from": "b", "let": { "n": "$n" }, "as": "k", "pipeline": [
+                { "$match": { "$expr": { "$eq": ["$n", "$$n"] } } } ] } },
         ]);
         state.engine.stop_walks_after_rows(1);
         let planned = explain(&state, &root(), "a", pipeline.clone());

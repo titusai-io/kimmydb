@@ -158,7 +158,96 @@ pub enum Join {
     /// input document**, with `vars` evaluated against that document and bound
     /// for the sub-pipeline to read as `$$name`. A nested loop by construction;
     /// see `docs/aggregation.md` for when to prefer the other form.
-    Pipeline { vars: Vec<(String, Expr)>, stages: Vec<Stage> },
+    ///
+    /// `lead` is set when the leading `$match` reads a `let` variable, and says how
+    /// to split it (see [`Lead`]); `None` for a sub-pipeline whose leading `$match`,
+    /// if any, reads none (it is applied once, before the loop).
+    Pipeline { vars: Vec<(String, Expr)>, stages: Vec<Stage>, lead: Option<Box<Lead>> },
+}
+
+/// A sub-pipeline's leading `$match` that reads `let` variables, taken apart at
+/// parse time. The conjunction is flattened through `$and` only (never `$or`,
+/// `$nor` or an `$expr`'s own `$and`) into its leaf clauses **in evaluation
+/// order**, and each leaf is independent (reads no variable) or variable-reading.
+///
+/// Both halves are `And` of their leaves in that order, so evaluating `variable`
+/// over a pair that `independent` accepts decides it exactly as the whole
+/// conjunction does (ADR-211: a false clause decides, a clause that cannot be
+/// evaluated is held back). The executor uses them as an attempt that may only
+/// decline: see `docs/decisions.md`, ADR-222.
+#[derive(Clone, Debug)]
+pub struct Lead {
+    /// The leaves that read no variable, applied once to the foreign set.
+    pub independent: Filter,
+    /// The leaves that read a variable, evaluated per input document.
+    pub variable: Filter,
+    /// A variable leaf `{$expr: {$eq: [A, B]}}` that the executor may hash on.
+    pub key: Option<JoinKey>,
+    /// `variable` without the key leaf, in order.
+    pub residual: Filter,
+}
+
+/// The two sides of a recognised `$eq`: `foreign` reads the document and no
+/// variable, `local` does not read the document.
+#[derive(Clone, Debug)]
+pub struct JoinKey {
+    pub foreign: Expr,
+    pub local: Expr,
+    /// Whether `$eq` was written `[local, foreign]`, which fixes the order a
+    /// fallback evaluates them in.
+    pub local_first: bool,
+}
+
+impl Lead {
+    fn analyze(filter: &Filter, names: &[String]) -> Option<Lead> {
+        fn flatten<'f>(filter: &'f Filter, out: &mut Vec<&'f Filter>) {
+            match filter {
+                Filter::AlwaysTrue => {}
+                Filter::And(branches) => branches.iter().for_each(|b| flatten(b, out)),
+                leaf => out.push(leaf),
+            }
+        }
+        fn key_of(leaf: &Filter, names: &[String]) -> Option<JoinKey> {
+            let Filter::Expr(e) = leaf else { return None };
+            let Expr::Op(crate::expr::Op::Eq, args) = e.as_ref() else { return None };
+            let [a, b] = args.as_slice() else { return None };
+            let foreign_side = |x: &Expr, y: &Expr| {
+                x.reads_document() && !x.reads_variable(names) && !y.reads_document()
+            };
+            if foreign_side(a, b) {
+                Some(JoinKey { foreign: a.clone(), local: b.clone(), local_first: false })
+            } else if foreign_side(b, a) {
+                Some(JoinKey { foreign: b.clone(), local: a.clone(), local_first: true })
+            } else {
+                None
+            }
+        }
+        let mut leaves = Vec::new();
+        flatten(filter, &mut leaves);
+        let (variable, independent): (Vec<&Filter>, Vec<&Filter>) =
+            leaves.into_iter().partition(|leaf| filter::reads_variable(leaf, names));
+        if variable.is_empty() {
+            return None;
+        }
+        let all = |leaves: &[&Filter]| match leaves {
+            [] => Filter::AlwaysTrue,
+            leaves => Filter::And(leaves.iter().map(|l| (*l).clone()).collect()),
+        };
+        let key_at = variable.iter().position(|leaf| key_of(leaf, names).is_some());
+        let key = key_at.and_then(|at| key_of(variable[at], names));
+        let residual: Vec<&Filter> = variable
+            .iter()
+            .enumerate()
+            .filter(|(at, _)| Some(*at) != key_at)
+            .map(|(_, leaf)| *leaf)
+            .collect();
+        Some(Lead {
+            independent: all(&independent),
+            variable: all(&variable),
+            key,
+            residual: all(&residual),
+        })
+    }
 }
 
 impl Stage {
@@ -270,6 +359,8 @@ fn parse_stage(stage: &Document, vars: &[String], at: Placement, index: usize) -
             let raw = as_document(name, value)?;
             if at == Placement::SubPipeline {
                 refuse_variables_in_match(raw)?;
+                // A `$expr` here reads the `let` names in scope (ADR-222).
+                return Ok(Stage::Match(Box::new(filter::parse_in_scope(raw, vars)?)));
             }
             Ok(Stage::Match(Box::new(filter::parse(raw)?)))
         }
@@ -434,9 +525,10 @@ fn refuse_variables_in_match(doc: &Document) -> Result<()> {
     fn walk(value: &Bson) -> Result<()> {
         match value {
             Bson::String(s) if s.starts_with("$$") => Err(Error::InvalidQuery(format!(
-                "{s} is not available in a $match: the filter language has no variables; bind \
-                 it in an $addFields stage and $match on the computed field, or use $expr once \
-                 it composes with let"
+                "{s} is not available as a value in a $match: the filter language has no \
+                 variables; write the comparison in $expr, {{$expr: {{$eq: [\"$field\", \
+                 \"{s}\"]}}}}, or bind it in an $addFields stage and $match on the computed \
+                 field"
             ))),
             Bson::Document(doc) => walk_doc(doc),
             Bson::Array(items) => items.iter().try_for_each(walk),
@@ -783,7 +875,11 @@ fn parse_lookup(spec: &Document, vars: &[String]) -> Result<Stage> {
             // A sub-pipeline is one whether or not this `$lookup` has a
             // `let`, and wherever the `$lookup` itself sits.
             let stages = parse_pipeline(&raw_stages, &in_scope, Placement::SubPipeline)?;
-            Join::Pipeline { vars: let_vars, stages }
+            let lead = match stages.first() {
+                Some(Stage::Match(f)) => Lead::analyze(f, &in_scope).map(Box::new),
+                _ => None,
+            };
+            Join::Pipeline { vars: let_vars, stages, lead }
         }
     };
     Ok(Stage::Lookup { from, as_field, join })
@@ -854,7 +950,7 @@ pub fn apply_with_vars(
         Stage::Match(f) => {
             let mut out = Vec::with_capacity(input.len());
             for doc in input {
-                if filter::matches(f, &doc)? {
+                if filter::matches_with(f, &doc, vars)? {
                     out.push(doc);
                 }
             }
@@ -2840,28 +2936,48 @@ mod tests {
         .is_err());
     }
 
-    /// `$match` is parsed with no names bound, so a `let` variable cannot reach
-    /// it — which is what lets the executor hoist a leading `$match` out of the
-    /// per-input-document loop and apply it to the foreign collection once.
-    /// `$expr` put variables within a filter's reach (ADR-106 over ADR-105), so
-    /// the boundary is worth holding down: a `let` name is refused, and
-    /// `$$ROOT` is accepted because it names the foreign document either way.
-    /// If this ever starts parsing, `exec::lookup_pipeline`'s hoist is wrong.
+    /// A `$match` in a sub-pipeline reads the `let` names in scope through `$expr`
+    /// and nowhere else (ADR-222; the filter language has no variables, so a bare
+    /// `"$$oid"` value is refused below). A name that is not in scope is still
+    /// refused, and `$$ROOT` still names the foreign document. A `$match` outside a
+    /// sub-pipeline binds nothing.
     #[test]
-    fn a_match_in_a_lookup_sub_pipeline_cannot_read_the_let() {
-        assert!(
+    fn a_match_in_a_lookup_sub_pipeline_reads_the_let_through_expr_only() {
+        let lookup = |stage: Document| {
             parse(&[doc! {"$lookup": {
-                "from": "items", "let": {"oid": "$_id"},
-                "pipeline": [{"$match": {"$expr": {"$eq": ["$order", "$$oid"]}}}], "as": "items"
+                "from": "items", "let": {"oid": "$_id"}, "pipeline": [stage], "as": "items"
             }}])
-            .is_err()
+        };
+        assert!(lookup(doc! {"$match": {"$expr": {"$eq": ["$order", "$$oid"]}}}).is_ok());
+        assert!(lookup(doc! {"$match": {"$expr": {"$eq": ["$order", "$$nope"]}}}).is_err());
+        assert!(lookup(doc! {"$match": {"$expr": {"$gt": ["$$ROOT.qty", 0]}}}).is_ok());
+        // Under the logical operators and an `$elemMatch` body too.
+        assert!(
+            lookup(doc! {"$match": {"$or": [{"k": 1}, {"$expr": {"$eq": ["$o", "$$oid"]}}]}})
+                .is_ok()
         );
         assert!(
+            lookup(doc! {"$match": {"lines": {"$elemMatch": {"$expr": {"$eq": ["$o", "$$oid"]}}}}})
+                .is_ok()
+        );
+        // A later stage's `$match` reads it as well.
+        assert!(
             parse(&[doc! {"$lookup": {
                 "from": "items", "let": {"oid": "$_id"},
-                "pipeline": [{"$match": {"$expr": {"$gt": ["$$ROOT.qty", 0]}}}], "as": "items"
+                "pipeline": [{"$limit": 5}, {"$match": {"$expr": {"$eq": ["$o", "$$oid"]}}}],
+                "as": "items"
             }}])
             .is_ok()
+        );
+        // A top-level `$match` has no names to read.
+        assert!(parse(&[doc! {"$match": {"$expr": {"$eq": ["$o", "$$oid"]}}}]).is_err());
+        // Outside the lookup the name is gone again.
+        assert!(
+            parse(&[
+                doc! {"$lookup": {"from": "a", "let": {"oid": "$_id"}, "pipeline": [], "as": "i"}},
+                doc! {"$match": {"$expr": {"$eq": ["$o", "$$oid"]}}},
+            ])
+            .is_err()
         );
     }
 
@@ -2896,11 +3012,18 @@ mod tests {
         // A regex pattern is a value too and is not special-cased.
         refused(doc! {"$match": {"name": {"$regex": "$$oid"}}});
 
-        // `$expr` is the expression parser's subtree and keeps its own,
-        // more specific, refusal.
+        // `$expr` is the expression parser's subtree: it reads the names in scope,
+        // and keeps its own, more specific, refusal for one that is not.
+        assert!(
+            parse(&[doc! {"$lookup": {
+                "from": "a", "let": {"oid": "$_id"},
+                "pipeline": [{"$match": {"$expr": {"$eq": ["$_id", "$$oid"]}}}], "as": "x"
+            }}])
+            .is_ok()
+        );
         let err = parse(&[doc! {"$lookup": {
             "from": "a", "let": {"oid": "$_id"},
-            "pipeline": [{"$match": {"$expr": {"$eq": ["$_id", "$$oid"]}}}], "as": "x"
+            "pipeline": [{"$match": {"$expr": {"$eq": ["$_id", "$$nope"]}}}], "as": "x"
         }}])
         .unwrap_err()
         .to_string();
@@ -2983,7 +3106,8 @@ mod tests {
     /// What `kimmy-api` does with a storage handle, done here over vectors so
     /// the variable plumbing is tested where it lives.
     fn join_in_memory(stage: &Stage, input: Vec<Document>, foreign: &[Document]) -> Vec<Document> {
-        let Stage::Lookup { as_field, join: Join::Pipeline { vars, stages }, .. } = stage else {
+        let Stage::Lookup { as_field, join: Join::Pipeline { vars, stages, .. }, .. } = stage
+        else {
             panic!("expected the pipeline form");
         };
         let limits = Limits::default();
@@ -3206,5 +3330,162 @@ mod decimal128 {
         let stages = parse(&[doc! { "$sort": { "_id": -1 } }]).unwrap();
         let out = apply(&stages[0], input, &Limits::default()).unwrap();
         assert_eq!(out[0].get_i32("_id").unwrap(), 3);
+    }
+}
+
+/// How a sub-pipeline's leading `$match` is taken apart for the join (ADR-222).
+#[cfg(test)]
+mod lead {
+    use super::*;
+    use bson::doc;
+
+    fn lead_of(stage: Document) -> Option<Box<Lead>> {
+        let stages = parse(&[doc! {"$lookup": {
+            "from": "a", "let": {"v": "$v", "w": "$w"}, "pipeline": [stage], "as": "x"
+        }}])
+        .unwrap();
+        let Stage::Lookup { join: Join::Pipeline { lead, .. }, .. } =
+            stages.into_iter().next().unwrap()
+        else {
+            panic!("a pipeline lookup");
+        };
+        lead
+    }
+
+    fn clauses(filter: &Filter) -> usize {
+        match filter {
+            Filter::AlwaysTrue => 0,
+            Filter::And(leaves) => leaves.len(),
+            _ => 1,
+        }
+    }
+
+    #[test]
+    fn a_match_that_reads_no_variable_has_no_lead() {
+        assert!(lead_of(doc! {"$match": {"kind": "x", "$expr": {"$gt": ["$q", 1]}}}).is_none());
+    }
+
+    #[test]
+    fn an_eq_between_the_document_and_a_variable_is_the_key_either_way_round() {
+        for eq in [json_eq("$k", "$$v"), json_eq("$$v", "$k")] {
+            let lead = lead_of(doc! {"$match": {"$expr": eq}}).expect("a lead");
+            let key = lead.key.expect("the key");
+            assert!(key.foreign.reads_document());
+            assert!(!key.local.reads_document());
+            assert_eq!(clauses(&lead.residual), 0);
+            assert_eq!(clauses(&lead.independent), 0);
+        }
+        let flipped = lead_of(doc! {"$match": {"$expr": json_eq("$$v", "$k")}}).unwrap();
+        assert!(flipped.key.unwrap().local_first);
+    }
+
+    fn json_eq(a: &str, b: &str) -> Document {
+        doc! {"$eq": [a, b]}
+    }
+
+    /// The key is any expression of the document alone against any of the variables
+    /// alone, not only a field path.
+    #[test]
+    fn the_sides_are_any_expressions_of_the_document_and_of_the_variables() {
+        let lead = lead_of(doc! {"$match": {"$expr": {"$eq": [
+        {"$toLower": "$k"}, {"$toLower": {"$concat": ["$$v", "x"]}}]}}})
+        .unwrap();
+        assert!(lead.key.is_some());
+    }
+
+    #[test]
+    fn independent_clauses_are_split_off_and_the_rest_are_residual_in_written_order() {
+        let lead = lead_of(doc! {"$match": {"$and": [
+        {"kind": "line"},
+        {"$expr": {"$gt": ["$q", 1]}},
+        {"$expr": {"$lte": ["$z", "$$w"]}},
+        {"$expr": {"$eq": ["$k", "$$v"]}},
+        {"$expr": {"$gte": ["$z", "$$w"]}}]}})
+        .unwrap();
+        assert!(lead.key.is_some());
+        // Two independent clauses (the plain field and the independent `$expr`),
+        // and the variable-reading ones other than the key.
+        assert_eq!(clauses(&lead.independent), 2);
+        assert_eq!(clauses(&lead.variable), 3);
+        assert_eq!(clauses(&lead.residual), 2);
+        // The first recognised `$eq` is the key even when other variable clauses
+        // are written before it.
+        let Filter::And(rest) = &lead.residual else { panic!() };
+        assert!(matches!(&rest[0], Filter::Expr(e) if format!("{e:?}").contains("Lte")));
+        assert!(matches!(&rest[1], Filter::Expr(e) if format!("{e:?}").contains("Gte")));
+    }
+
+    #[test]
+    fn nested_and_is_flattened_in_order_and_nothing_else_is() {
+        let lead = lead_of(doc! {"$match": {"$and": [
+        {"$and": [{"kind": "line"}, {"$expr": {"$eq": ["$k", "$$v"]}}]},
+        {"$expr": {"$gt": ["$z", "$$w"]}}]}})
+        .unwrap();
+        assert!(lead.key.is_some());
+        assert_eq!(clauses(&lead.independent), 1);
+        assert_eq!(clauses(&lead.residual), 1);
+    }
+
+    /// A join is recognised through `$and` and nowhere else: under `$or`, `$nor`, and
+    /// an `$expr`'s own `$and`, or with the wrong number of arguments, there is a lead
+    /// (the clause reads a variable) and no key.
+    #[test]
+    fn a_join_is_not_recognised_below_or_nor_or_an_expressions_own_and() {
+        let eq = doc! {"$expr": {"$eq": ["$k", "$$v"]}};
+        let shapes = [
+            doc! {"$match": {"$or": [eq.clone(), {"kind": "x"}]}},
+            doc! {"$match": {"$nor": [eq.clone()]}},
+            doc! {"$match": {"$expr": {"$and": [{"$eq": ["$k", "$$v"]}, {"$gt": ["$q", 0]}]}}},
+            doc! {"$match": {"$expr": {"$gt": ["$k", "$$v"]}}},
+            doc! {"$match": {"$expr": {"$ne": ["$k", "$$v"]}}},
+            // Both sides read the document and a variable.
+            doc! {"$match": {"$expr": {"$eq": [{"$add": ["$k", "$$w"]}, "$$v"]}}},
+            // The other side reads the document.
+            doc! {"$match": {"$expr": {"$eq": ["$k", {"$add": ["$$v", "$q"]}]}}},
+            doc! {"$match": {"lines": {"$elemMatch": {"$expr": {"$eq": ["$q", "$$v"]}}}}},
+        ];
+        // Another arity is no `$eq` at all: the parser refuses it before a join is asked.
+        assert!(
+            parse(&[doc! {"$lookup": {"from": "a", "let": {"v": "$v"}, "as": "x", "pipeline": [
+            {"$match": {"$expr": {"$eq": ["$k", "$$v", 1]}}}]}}])
+            .is_err()
+        );
+        for shape in shapes {
+            let lead = lead_of(shape.clone()).unwrap_or_else(|| panic!("a lead for {shape}"));
+            assert!(lead.key.is_none(), "no key for {shape}");
+        }
+    }
+
+    /// `$$NOW` and the other system variables a build might one day add are refused as
+    /// they are today, so a key expression is a function of the document and the bound
+    /// variables only.
+    #[test]
+    fn system_variables_other_than_root_and_current_stay_refused() {
+        for name in ["NOW", "CLUSTER_TIME", "REMOVE", "USER_ROLES"] {
+            let refused = parse(&[doc! {"$lookup": {
+                "from": "a", "let": {"v": "$v"},
+                "pipeline": [{"$match": {"$expr": {"$eq": ["$k", format!("$${name}")]}}}],
+                "as": "x"
+            }}]);
+            assert!(refused.is_err(), "$${name} must stay refused");
+        }
+    }
+
+    /// Variables from an enclosing `$lookup` are in scope for the inner one's `$match`.
+    #[test]
+    fn an_enclosing_lookups_names_are_in_scope_for_the_inner_match() {
+        let stages = parse(&[doc! {"$lookup": {
+            "from": "a", "let": {"outer": "$v"}, "as": "x",
+            "pipeline": [{"$lookup": {
+                "from": "b", "let": {"inner": "$k"}, "as": "y",
+                "pipeline": [{"$match": {"$expr": {"$eq": ["$z", "$$outer"]}}}]
+            }}]
+        }}])
+        .unwrap();
+        let Stage::Lookup { join: Join::Pipeline { stages: inner, .. }, .. } = &stages[0] else {
+            panic!()
+        };
+        let Stage::Lookup { join: Join::Pipeline { lead, .. }, .. } = &inner[0] else { panic!() };
+        assert!(lead.as_ref().is_some_and(|l| l.key.is_some()));
     }
 }

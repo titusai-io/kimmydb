@@ -797,44 +797,76 @@ equality `$lookup` into `unpaid`. The equality join attaches every match
 before the filter drops any, so the ceiling below counts what the join
 attached. The refusal is revisited if a caller meets that ceiling.
 
-**This form is O(local × foreign).** The sub-pipeline may do anything at all
-with the variables, so there is no one key to index the foreign side by; it is
-run once per input document, over a copy of the foreign collection. Two things
-keep that tolerable: the foreign collection is read from storage **once** and
-held in memory for the stage, and a **leading `$match`** is applied once,
-before the loop, because a filter has no access to the variables. Put one
-first whenever there is a constant condition — it shrinks what every iteration
-copies. A join that is an equality on one field belongs in the
-`localField`/`foreignField` form, which is a single pass however large either
-side is; the pipeline form is for the joins that form cannot express — a
-range, a computed key, a sub-pipeline that groups or reshapes before
-attaching.
+**A correlated equality is a join; anything else is a nested loop**
+([ADR-222](decisions.md)). The sub-pipeline may do anything at all with the
+variables, so in general there is no one key to index the foreign side by, and
+the stage runs once per input document over the foreign collection, which is
+O(local × foreign). The common case is recognised and is not that: when the
+leading `$match` holds a clause
+
+```json
+{ "$expr": { "$eq": [ <an expression of the foreign document>, <an expression of the let variables> ] } }
+```
+
+(either argument first, any expressions, at the top of the `$match` or inside
+`$and`, however deeply nested), the stage files the foreign collection in memory
+by the first side, once, and looks each input document up by the second. The
+first input document is run as a nested loop, so a `$lookup` with a single input
+document pays for no table; the table is built for the second. What the join
+returns is what the nested loop returns: the same documents, in the foreign
+collection's scan order. The cost goes from O(local × foreign) to O(local +
+foreign) plus what is attached: 10,000 inputs against 100,000 foreign documents
+took 104 s as a nested loop and 86 ms as the join. The other clauses of the
+`$match` stay: the ones that name no variable are applied once to the foreign
+collection, before the loop, as a `$match` with no variable always was, and
+the rest (further `$eq` terms, `$gt`, anything under `$or`) are checked on the
+documents the key finds.
+
+The equality is `$expr`'s `$eq`, not the filter's and not the `localField` form's:
+numbers are equal across types (`5`, `5.0`), `null` and a missing field are the
+same value (so a foreign document without the field joins an input whose variable
+is `null`, where the `localField` form joins nothing), `NaN` equals `NaN`, an array
+is compared whole (never opened) and a document field by field in order. A key
+that holds a `Decimal128` cannot be filed, because `$eq` ranks it equal to every
+number: the stage then runs as the nested loop, and so does any input document
+whose evaluation raises, which raises exactly what the loop would, or nothing. A
+join never raises an error the loop would not.
+
+What does not join runs as the nested loop, bounded only by the 100,000 ceilings
+below: an `$or` or `$nor` with a variable in it, a comparison other than `$eq`
+(`$gt`, `$ne`), a variable read inside an `$elemMatch` body, an `$eq` whose two
+sides both read the document and a variable, a `$match` that is not first. For
+an equality on one field, the `localField`/`foreignField` form is still the
+simplest; the `$expr` form is for a join that has more to say (a key that is
+computed, an extra range, a filter on the foreign side) and keeps the pipeline.
+A nested `$lookup` inside a sub-pipeline is run for each outer input, so its table
+is built again for each. An input document that falls back to the nested loop
+costs one scan of the foreign collection.
 
 **The ceiling applies throughout.** The foreign collection, each sub-pipeline
 stage's output and the total of everything attached across all input documents
 are each held to the 100,000-document limit below, so the nested loop cannot
 be used to occupy a node's memory by degrees.
 
-**Where `$match` meets `let`.** A `$match` inside the sub-pipeline is the
-ordinary filter language, and the filter language has no variables, so a
-`$$oid` in one is refused: any string value beginning with `$$`, anywhere in
-a sub-pipeline `$match` — a plain equality, inside `$in` or `$elemMatch`,
-under `$and`/`$or`/`$nor`, a `$regex` pattern — is a 400 naming it, whether
-or not the `$lookup` has a `let`. The one exception is the subtree under
-`$expr`, which the expression parser owns and checks by its own rule. The
-scope is the sub-pipeline: a top-level `$match`, and a `find` filter, read
-`"$$oid"` as the literal string a stored document may hold. There is no
+**Where `$match` meets `let`.** A `$match` in the sub-pipeline reads the `let`
+names (this `$lookup`'s and any enclosing one's) through `$expr`, and only
+there: `{"$match": {"$expr": {"$eq": ["$order", "$$oid"]}}}`, at any depth of the
+filter, an `$elemMatch` body included, where the element is the document and the
+names are bound beside it. The filter language itself has no variables, so a
+`$$oid` as a *value* of a clause is refused: any string value beginning with `$$`,
+anywhere in a sub-pipeline `$match` outside an `$expr` (a plain equality, inside
+`$in` or `$elemMatch`, under `$and`/`$or`/`$nor`, a `$regex` pattern) is a 400
+naming it, whether or not the `$lookup` has a `let`. The scope is the
+sub-pipeline: a top-level `$match`, and a `find` filter, read `"$$oid"` as the
+literal string a stored document may hold and bind no names. There is no
 plain-value escape inside a sub-pipeline `$match`, and the register records
 that as a deliberate difference from MongoDB ([ADR-217](decisions.md#adr-217--the-refusals-and-differences-ruled-to-stay-are-recorded-as-a-set)). **A stored string
 that begins with `$$` is matched there through `$expr` and `$literal`**, which
 the expression parser reads as a string and never as a reference:
 `{"$match": {"$expr": {"$eq": ["$code", {"$literal": "$$promo"}]}}}`. That
-comparison is `$expr`'s `$eq`, not the filter's. To correlate, compute a
-field and `$match` on that, as the example does. `$expr` in a filter
-— which is the natural place for a correlation,
-`{$match: {$expr: {$eq: ["$order", "$$oid"]}}}` — is a separate addition to
-the filter language and, once the two compose, will be the direct way to
-write it.
+comparison is `$expr`'s `$eq`, not the filter's. A name that is not in scope is
+refused, naming it. Variables still bind by need ([ADR-219](decisions.md)): a
+name nothing reads is never evaluated, except in a `$lookup`'s own `let`.
 
 **No cross-collection snapshot.** A `$lookup` sees the foreign collection as of
 when the stage runs. There are no multi-document transactions in a leaderless
@@ -942,8 +974,17 @@ examined or read.
   (`foreignScanHashed`; no index on the foreign field is used), and the
   `let`/`pipeline` form scans it once and runs its sub-pipeline for each input
   document (`foreignScanNestedLoop`), reading nothing when no document reaches it.
-  The sub-pipeline's own stages are listed, marked `perInputDocument`; its leading
-  `$match` is applied once, in memory, and is never planned.
+  When the leading `$match` holds a correlated `$eq` ([ADR-222](decisions.md)) the
+  strategy is `foreignScanHashJoin`, with `joinKey` (`foreign` and `local`, as
+  `$field`, `$$name` or `an expression`), `residualClauses` (how many other clauses
+  that read a `let` variable are checked on what the key finds) and `fallback` (the
+  run-time conditions under which it runs as the nested loop instead). The
+  sub-pipeline's own stages are listed, marked `perInputDocument`. A leading `$match`
+  that reads no variable is applied once, in memory, and is never planned. One that
+  reads a variable is two entries when part of it does not: `part: independent`
+  (`perInputDocument: false`, applied once) and `part: variable` (`true`, per input
+  document, or answered from the hash table); with nothing independent it is one
+  entry.
 - **`$vectorSearch`** is the source: `strategy: vectorIndex`, the collection's
   vector configuration and `queryUsable`, whether a run would take the query as
   sent. It calls no embedding provider and reads no vector, so it cannot say

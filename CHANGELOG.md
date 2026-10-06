@@ -14,6 +14,22 @@ breaking changes and says so here; a `0.x.PATCH` bump never does.
 
 ### Added
 
+- **A `$lookup` sub-pipeline's `$match` can read the `let` names, and a correlated
+  equality is a hash join.** `{"$match": {"$expr": {"$eq": ["$order", "$$oid"]}}}`
+  now works in a sub-pipeline (it was a `400`), at any depth of the filter and in any
+  `$match` of it, and a `$match` whose conjunction holds such an `$eq` (either
+  argument first, any expressions) is answered from a table of the foreign
+  collection instead of a nested loop: 10,000 inputs against 100,000 foreign
+  documents went from 104 s to 86 ms in a release build. The first input document
+  is run as the nested loop, anything that would raise falls back to it, and the
+  join never answers or fails differently from it. The equality is `$expr`'s `$eq`:
+  numbers across types are equal, `null` and a missing field are the same value
+  (unlike the `localField` form, where a missing key joins nothing), arrays compare
+  whole. Shapes that do not join (`$or`, `$gt`, `$elemMatch`) run as the nested
+  loop. A `$$name` as a plain value of a clause is still refused. `explain` reports
+  `foreignScanHashJoin`, with the key, the residual clauses and the fallback. No
+  action on upgrade; an older member answers `400` during a roll. See
+  aggregation.md, "The `let` / `pipeline` form", and ADR-222.
 - **`/v1/topology` says when a node cannot serve.** A node's entry gains an
   optional `degraded`: `"writer"` while its single writer is wedged (below) and
   `"runtime"` while its async runtime has stalled. It is advisory (prefer a node

@@ -877,6 +877,75 @@ impl Expr {
         }
     }
 
+    /// A short rendering for a plan: a field as `$a.b`, a variable as `$$name`, and
+    /// anything else as `an expression`.
+    pub fn describe(&self) -> String {
+        match self {
+            Expr::Field(path) => format!("${path}"),
+            Expr::Var { name, path: Some(path) } => format!("$${name}.{path}"),
+            Expr::Var { name, path: None } => format!("$${name}"),
+            Expr::Literal(_)
+            | Expr::Op(..)
+            | Expr::Switch { .. }
+            | Expr::DateToString { .. }
+            | Expr::Convert { .. }
+            | Expr::Let { .. }
+            | Expr::Filter { .. }
+            | Expr::Map { .. }
+            | Expr::Reduce { .. }
+            | Expr::Object(_)
+            | Expr::Array(_) => "an expression".to_string(),
+        }
+    }
+
+    /// Whether this names any of `names` as a variable (`"$$oid"`, `"$$oid.a"`)
+    /// anywhere in the tree. **Conservative**: a name that an inner `$let`,
+    /// `$map`, `$filter` or `$reduce` rebinds still counts, so the answer is
+    /// `true` when in doubt. A caller that asks it (a `$lookup` sub-pipeline's
+    /// `$match`, to tell a clause that reads a `let` variable from one that does
+    /// not) only ever loses speed to a `true`, never an answer. Exhaustive on
+    /// purpose, with no catch-all arm: a new expression form must say here what
+    /// it reads.
+    pub fn reads_variable(&self, names: &[String]) -> bool {
+        let any = |exprs: &[Expr]| exprs.iter().any(|e| e.reads_variable(names));
+        match self {
+            Expr::Field(_) => false,
+            Expr::Var { name, .. } => names.iter().any(|n| n == name),
+            Expr::Literal(_) => false,
+            Expr::Op(_, args) => any(args),
+            Expr::Switch { branches, default } => {
+                branches
+                    .iter()
+                    .any(|(case, then)| case.reads_variable(names) || then.reads_variable(names))
+                    || default.as_ref().is_some_and(|d| d.reads_variable(names))
+            }
+            Expr::DateToString { date, .. } => date.reads_variable(names),
+            Expr::Convert { input, on_error, on_null, .. } => {
+                input.reads_variable(names)
+                    || on_error.as_ref().is_some_and(|e| e.reads_variable(names))
+                    || on_null.as_ref().is_some_and(|e| e.reads_variable(names))
+            }
+            Expr::Let { vars, body } => {
+                vars.iter().any(|(_, e)| e.reads_variable(names)) || body.reads_variable(names)
+            }
+            Expr::Filter { input, cond, limit, .. } => {
+                input.reads_variable(names)
+                    || cond.reads_variable(names)
+                    || limit.as_ref().is_some_and(|l| l.reads_variable(names))
+            }
+            Expr::Map { input, body, .. } => {
+                input.reads_variable(names) || body.reads_variable(names)
+            }
+            Expr::Reduce { input, initial, body } => {
+                input.reads_variable(names)
+                    || initial.reads_variable(names)
+                    || body.reads_variable(names)
+            }
+            Expr::Object(fields) => fields.iter().any(|(_, e)| e.reads_variable(names)),
+            Expr::Array(items) => any(items),
+        }
+    }
+
     /// `{name: <expr>, ...}` — the `vars` of `$let` and the `let` of `$lookup`.
     ///
     /// The values are parsed against `vars`, the enclosing scope: one binding
@@ -6357,5 +6426,77 @@ mod arrays {
             let sized = Expr::parse(&bson!({"$size": [array.clone()]})).unwrap();
             prop_assert_eq!(sized.eval(&row()).unwrap(), Bson::Int64(items.len() as i64));
         }
+    }
+}
+
+/// `reads_variable` is conservative and exhaustive (ADR-222).
+#[cfg(test)]
+mod reads_variable {
+    use bson::bson;
+
+    use super::*;
+
+    fn reads(v: Bson, names: &[&str]) -> bool {
+        let scope: Vec<String> = names.iter().map(|n| (*n).to_string()).collect();
+        let parsed = Expr::parse_with_vars(&v, &scope).unwrap();
+        parsed.reads_variable(&scope)
+    }
+
+    #[test]
+    fn a_variable_anywhere_in_the_tree_is_read() {
+        let n = ["v"];
+        assert!(reads(bson!("$$v"), &n));
+        assert!(reads(bson!("$$v.a"), &n));
+        assert!(reads(bson!({"$add": [1, "$$v"]}), &n));
+        assert!(reads(bson!({"$cond": [true, "$$v", 0]}), &n));
+        assert!(reads(
+            bson!({"$switch": {"branches": [{"case": true, "then": "$$v"}], "default": 0}}),
+            &n
+        ));
+        assert!(reads(bson!({"$let": {"vars": {"x": "$$v"}, "in": "$$x"}}), &n));
+        assert!(reads(
+            bson!({"$map": {"input": [1], "as": "i", "in": {"$add": ["$$i", "$$v"]}}}),
+            &n
+        ));
+        assert!(reads(
+            bson!({"$filter": {"input": "$a", "as": "i", "cond": {"$eq": ["$$i", "$$v"]}}}),
+            &n
+        ));
+        assert!(reads(bson!({"$reduce": {"input": "$a", "initialValue": "$$v", "in": 1}}), &n));
+        assert!(reads(bson!({"$convert": {"input": "$a", "to": "int", "onError": "$$v"}}), &n));
+        assert!(reads(bson!({"$dateToString": {"date": "$$v", "format": "%Y"}}), &n));
+        assert!(reads(bson!({"a": "$$v"}), &n));
+        assert!(reads(bson!(["$a", "$$v"]), &n));
+    }
+
+    #[test]
+    fn nothing_but_the_document_and_literals_reads_none() {
+        let n = ["v"];
+        assert!(!reads(bson!("$a.b"), &n));
+        assert!(!reads(bson!("$$ROOT.a"), &n));
+        assert!(!reads(bson!({"$add": ["$a", 1]}), &n));
+        assert!(!reads(bson!({"$map": {"input": "$a", "as": "i", "in": "$$i"}}), &n));
+        assert!(!reads(bson!({"$literal": "$$v"}), &n));
+        assert!(!reads(bson!(5), &n));
+    }
+
+    /// Conservative: a name an inner binding rebinds still counts, which only makes a
+    /// clause a per-pair residual and never changes an answer.
+    #[test]
+    fn a_rebound_name_still_counts() {
+        let scope = vec!["v".to_string()];
+        let rebound =
+            Expr::parse_with_vars(&bson!({"$let": {"vars": {"v": 1}, "in": "$$v"}}), &scope)
+                .unwrap();
+        assert!(rebound.reads_variable(&scope));
+    }
+
+    #[test]
+    fn describe_names_a_field_and_a_variable_and_calls_the_rest_an_expression() {
+        let p = |v: Bson| Expr::parse_with_vars(&v, &["v".to_string()]).unwrap().describe();
+        assert_eq!(p(bson!("$a.b")), "$a.b");
+        assert_eq!(p(bson!("$$v")), "$$v");
+        assert_eq!(p(bson!("$$v.x")), "$$v.x");
+        assert_eq!(p(bson!({"$add": [1, 2]})), "an expression");
     }
 }

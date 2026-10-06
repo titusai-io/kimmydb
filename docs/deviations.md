@@ -677,7 +677,8 @@ refusal now exists, and it is stricter than MongoDB.
 any nesting depth — any string value beginning with `$$`, at any depth of a
 `$match` (a plain equality, `$eq`/`$ne`/`$gt`, `$in`/`$nin`/`$all`, `$not`,
 `$elemMatch`, the arrays under `$and`/`$or`/`$nor`, a `$regex` pattern), is
-a 400 naming the variable and the idiom that works: bind it in an
+a 400 naming the variable and the idiom that works: write the
+comparison in `$expr`, which reads the name (ADR-222), or bind it in an
 `$addFields` stage and `$match` on the computed field. The subtree under
 `$expr` is exempt; the expression parser owns variables there and refuses an
 unbound one by its own rule.
