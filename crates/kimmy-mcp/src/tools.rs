@@ -194,6 +194,10 @@ pub struct AggregateArgs {
     pub collection: String,
     /// The pipeline: an array of stage documents, applied in order.
     pub pipeline: Value,
+    /// Plan the pipeline and answer with the plan only: nothing runs and no
+    /// documents come back.
+    #[serde(default)]
+    pub explain: bool,
 }
 
 #[derive(Deserialize, JsonSchema)]
@@ -564,13 +568,25 @@ impl KimmyMcp {
                        Field references are written \"$field\"; computed expressions \
                        ($add, $concat, $cond, $size, $filter, $map and the rest) work \
                        anywhere a value is derived. A pipeline that would hold too many \
-                       documents is refused, naming the stage — add an earlier $match.")]
+                       documents is refused, naming the stage — add an earlier $match. \
+                       Pass explain: true to see the plan instead: how the leading $match \
+                       will be read (index or scan) and what each later stage does, with \
+                       no documents and nothing run.")]
     async fn aggregate(
         &self,
         Parameters(args): Parameters<AggregateArgs>,
         ctx: RequestContext<RoleServer>,
     ) -> Result<CallToolResult, ErrorData> {
         let auth = principal(&ctx)?;
+        if args.explain {
+            return render(kimmy_api::explain::aggregate_explain(
+                &self.state,
+                &auth,
+                &args.database,
+                &args.collection,
+                &args.pipeline,
+            ));
+        }
         render(
             exec::aggregate(&self.state, &auth, &args.database, &args.collection, &args.pipeline)
                 .await,

@@ -14603,3 +14603,71 @@ async fn topology_answers_while_the_writer_is_held() {
     release.send(()).unwrap();
     holder.join().unwrap();
 }
+
+/// ADR-221: `explain: true` on `aggregate` plans the pipeline and runs nothing, and
+/// the rest of the body stays closed.
+#[tokio::test]
+async fn aggregate_explain_plans_and_the_body_stays_closed() {
+    let server = Server::start().await;
+    let token = server.root().await;
+    server.post("/v1/db/shop/collections", Some(&token), json!({"name":"c"})).await;
+    for i in 0..5 {
+        server.post("/v1/db/shop/coll/c/docs", Some(&token), json!({"_id": i, "n": i})).await;
+    }
+    server
+        .post("/v1/db/shop/coll/c/indexes", Some(&token), json!({"fields": [{"path": "n"}]}))
+        .await;
+    let url = "/v1/db/shop/coll/c/aggregate";
+    let pipeline = json!([{"$match": {"n": 2}}, {"$group": {"_id": "$n", "c": {"$sum": 1}}}]);
+
+    // The plan: no documents, no count, `executed: false`, the index named.
+    let res = server.post(url, Some(&token), json!({"pipeline": pipeline, "explain": true})).await;
+    assert_eq!(res.status, 200, "{:?}", res.body);
+    assert!(res.body.get("documents").is_none() && res.body.get("count").is_none());
+    let explain = &res.body["explain"];
+    assert_eq!(explain["executed"], false);
+    assert_eq!(explain["source"]["strategy"], "index");
+    assert_eq!(explain["source"]["index"], "n_1");
+    assert_eq!(explain["stages"][0]["stage"], "$group");
+
+    // The same source plan as `find`'s explain for the same filter.
+    let found = server
+        .post("/v1/db/shop/coll/c/find", Some(&token), json!({"filter": {"n": 2}, "explain": true}))
+        .await;
+    for key in ["strategy", "index", "indexFieldsUsed"] {
+        assert_eq!(explain["source"][key], found.body["explain"][key], "{key}");
+    }
+
+    // `explain: false` is an ordinary run.
+    let run = server.post(url, Some(&token), json!({"pipeline": pipeline, "explain": false})).await;
+    assert_eq!(run.status, 200, "{:?}", run.body);
+    assert_eq!(run.body["count"], 1);
+
+    // Everything else stays refused.
+    for body in [
+        json!({"pipeline": [], "explain": null}),
+        json!({"pipeline": [], "explain": "yes"}),
+        json!({"pipeline": [], "explain": 1}),
+        json!({"pipeline": [], "explainn": true}),
+        json!({"pipeline": [], "explain": true, "limit": 5}),
+    ] {
+        let res = server.post(url, Some(&token), body.clone()).await;
+        assert_eq!(res.status, 422, "{body}: {:?}", res.body);
+    }
+    let query =
+        server.post(&format!("{url}?explain=true"), Some(&token), json!({"pipeline": []})).await;
+    assert_eq!(query.status, 400, "{:?}", query.body);
+
+    // A malformed pipeline, an unknown stage and a missing collection answer as a
+    // run does.
+    for (coll, pipeline) in
+        [("c", json!([{"$nope": 1}])), ("c", json!("not an array")), ("gone", json!([]))]
+    {
+        let url = format!("/v1/db/shop/coll/{coll}/aggregate");
+        let planned =
+            server.post(&url, Some(&token), json!({"pipeline": pipeline, "explain": true})).await;
+        let ran = server.post(&url, Some(&token), json!({"pipeline": pipeline})).await;
+        assert_eq!(planned.status, ran.status, "{coll} {pipeline}");
+        assert_eq!(planned.body, ran.body, "{coll} {pipeline}");
+    }
+}

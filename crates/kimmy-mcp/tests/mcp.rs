@@ -1481,6 +1481,60 @@ async fn the_aggregate_tool_runs_a_pipeline_as_the_calling_principal() {
     assert_eq!(docs[1]["n"], 2);
 }
 
+/// ADR-221: the tool takes `explain` as the route does, answers with the plan and
+/// no documents, authorizes as a run does, and still refuses what it does not know.
+#[tokio::test]
+async fn the_aggregate_tool_explains_without_running_and_stays_closed() {
+    let server = Server::start().await;
+    seed(&server);
+    let token = server.token(
+        "analyst",
+        vec![Grant {
+            db: "sales".into(),
+            collection: "orders".into(),
+            actions: vec![Action::Read],
+        }],
+    );
+    let plan = server
+        .call_ok(
+            &token,
+            "aggregate",
+            json!({
+                "database": "sales", "collection": "orders", "explain": true,
+                "pipeline": [{"$match": {"status": "open"}}, {"$group": {"_id": "$status"}}]
+            }),
+        )
+        .await;
+    assert!(plan.get("documents").is_none() && plan.get("count").is_none(), "{plan}");
+    assert_eq!(plan["explain"]["executed"], false);
+    assert_eq!(plan["explain"]["stages"][0]["stage"], "$group");
+
+    // The same refusal a run makes for a collection the caller cannot read.
+    let denied = server
+        .call(
+            &token,
+            "aggregate",
+            json!({
+                "database": "sales", "collection": "orders", "explain": true,
+                "pipeline": [{"$lookup": {"from": "secrets", "localField": "status",
+                                          "foreignField": "_id", "as": "joined"}}]
+            }),
+        )
+        .await;
+    let rendered = format!("{denied:?}");
+    assert!(rendered.contains("not authorized") || rendered.contains("forbidden"), "{rendered}");
+
+    // Anything else unknown is still refused by name.
+    let unknown = server
+        .call(
+            &token,
+            "aggregate",
+            json!({"database": "sales", "collection": "orders", "pipeline": [], "explainn": true}),
+        )
+        .await;
+    assert!(format!("{unknown:?}").contains("unknown field"), "{unknown:?}");
+}
+
 #[tokio::test]
 async fn the_aggregate_tool_refuses_a_lookup_the_caller_cannot_read() {
     // Same boundary as the REST route, asserted at the MCP edge too, because

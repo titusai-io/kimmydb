@@ -1544,6 +1544,26 @@ async fn every_documented_operation_answers_as_the_specification_says() {
         200,
     )
     .await;
+    // The plan, validated against `PipelineExplain`: no documents, nothing measured.
+    let plan = c
+        .check(
+            "POST",
+            "/v1/db/{db}/coll/{coll}/aggregate",
+            "/v1/db/shop/coll/orders/aggregate",
+            Some(&root),
+            Some(json!({
+                "pipeline": [
+                    { "$match": { "sku": "a" } },
+                    { "$lookup": { "from": "orders", "localField": "sku", "foreignField": "sku", "as": "j" } },
+                    { "$group": { "_id": "$sku", "total": { "$sum": "$qty" } } },
+                ],
+                "explain": true,
+            })),
+            200,
+        )
+        .await;
+    assert_eq!(plan["explain"]["executed"], false);
+    assert!(plan.get("documents").is_none());
     c.check(
         "POST",
         "/v1/db/{db}/coll/{coll}/update",

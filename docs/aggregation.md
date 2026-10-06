@@ -886,7 +886,7 @@ POST /v1/db/shop/coll/products/aggregate
   be `vector` and `limit` should be `k`; `numCandidates` and `index` have no
   equivalent, because KimmyDB has no candidate knob and one vector index per
   collection. Each is a `400` saying so. See [ADR-216](decisions.md).
-- **No `explain`.** `aggregate` has none; see [Performance](#performance).
+- **`explain`.** `explain: true` plans the pipeline and reports the vector search as its source; see [Performance](#performance).
 
 ---
 
@@ -915,9 +915,43 @@ stays where it was written and runs as an ordinary in-memory filter over what
 reaches it. The rule is the same one MongoDB's optimizer follows, and it is
 what keeps a pipeline's meaning independent of whether an index exists.
 
-**`aggregate` has no `explain`.** To see which access path a leading `$match`
-gets, send the same filter to `find` with `"explain": true` — it is the same
-planner reading the same indexes, so the answer is the same.
+**`explain: true` plans a pipeline and runs nothing** ([ADR-221](decisions.md)).
+Send `{"pipeline": [...], "explain": true}`: the answer is `{"explain": {...}}`
+with `"executed": false`, **no documents and no count**. It is the only `explain`
+that does not run what it explains, and so the only one with no
+`documentsExamined`, `documentsMatched` or `indexEntriesRead`: nothing was
+examined or read.
+
+```json
+{ "explain": { "executed": false,
+    "source": { "strategy": "index", "index": "city_1", "indexFieldsUsed": 1,
+                "stages": 1, "maxDocuments": 100000 },
+    "stages": [ { "stage": "$group", "runs": "inMemory",
+                  "detail": "groups everything that reaches it in memory; blocking, ..." } ] } }
+```
+
+- **`source`** is the plan `find` would make for the leading `$match` (the same
+  planner: `strategy`, `index`, `indexFieldsUsed`, `probes`), with `stages` saying
+  how many leading stages it took and `maxDocuments` the ceiling a run enforces.
+  A range plan that used both ends carries a `note`: the scan re-checks the index
+  when it runs and falls back to a collection scan if it has become multikey since.
+- **`stages`** has one entry for each later stage: it runs in memory, and says what
+  it does. No counts and no timings: nothing ran.
+- **`$lookup`** says what it will do: the `localField`/`foreignField` form scans
+  the foreign collection once and files it in memory by the key
+  (`foreignScanHashed`; no index on the foreign field is used), and the
+  `let`/`pipeline` form scans it once and runs its sub-pipeline for each input
+  document (`foreignScanNestedLoop`), reading nothing when no document reaches it.
+  The sub-pipeline's own stages are listed, marked `perInputDocument`; its leading
+  `$match` is applied once, in memory, and is never planned.
+- **`$vectorSearch`** is the source: `strategy: vectorIndex`, the collection's
+  vector configuration and `queryUsable`, whether a run would take the query as
+  sent. It calls no embedding provider and reads no vector, so it cannot say
+  whether any is stored.
+- **It needs what a run needs**: `read` on the collection and on every `$lookup`
+  collection, nested ones included (so it can ask for more than a run that no
+  document reaches), and `search` for `$vectorSearch`. Pipelines that fail on data
+  when run still plan. There is no `$out` or `$merge`: nothing is written.
 
 ---
 

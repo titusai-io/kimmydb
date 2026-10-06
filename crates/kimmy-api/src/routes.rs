@@ -1138,6 +1138,10 @@ async fn count_docs(
 #[serde(deny_unknown_fields)]
 struct AggregateRequest {
     pipeline: Value,
+    /// Plan the pipeline and report the plan; run nothing (ADR-221). A
+    /// non-boolean, `null` included, is refused as any wrong-typed field is.
+    #[serde(default)]
+    explain: bool,
 }
 
 async fn aggregate_docs(
@@ -1146,6 +1150,15 @@ async fn aggregate_docs(
     Path((db, coll)): Path<(String, String)>,
     JsonBody(body): JsonBody<AggregateRequest>,
 ) -> Result<Json<Value>, ApiError> {
+    if body.explain {
+        return Ok(Json(crate::explain::aggregate_explain(
+            &state,
+            &auth,
+            &db,
+            &coll,
+            &body.pipeline,
+        )?));
+    }
     Ok(Json(exec::aggregate(&state, &auth, &db, &coll, &body.pipeline).await?))
 }
 

@@ -1611,8 +1611,17 @@ paths:
     post:
       tags: [documents]
       operationId: aggregate
-      summary: Run an aggregation pipeline.
-      description: See `docs/aggregation.md` for the stages and expression operators.
+      summary: Run an aggregation pipeline, or plan it.
+      description: |
+        See `docs/aggregation.md` for the stages and expression operators.
+
+        **`explain: true` plans the pipeline and runs nothing** (ADR-221). The
+        answer is `{explain: ...}` with no `documents` and no `count`, and none of
+        the measured keys of `find`'s `explain` (`documentsExamined`,
+        `documentsMatched`, `indexEntriesRead`): nothing was examined or read. It
+        reads the pipeline and the definitions of the collections it names, and
+        needs the access a run needs: `read` on the collection and on every
+        `$lookup` collection (nested ones included), `search` for `$vectorSearch`.
       x-kimmy-action: read
       requestBody:
         required: true
@@ -1626,20 +1635,31 @@ paths:
                 pipeline:
                   type: array
                   items: { $ref: "#/components/schemas/Document" }
+                explain:
+                  type: boolean
+                  default: false
+                  description: |
+                    Plan the pipeline and answer with the plan only. Any other
+                    type, `null` included, is `422`.
       responses:
         "200":
-          description: The pipeline's output.
+          description: "The pipeline's output, or its plan under `explain: true`."
           content:
             application/json:
               schema:
-                type: object
-                required: [documents, count]
-                properties:
-                  documents:
-                    type: array
-                    items: { $ref: "#/components/schemas/Document" }
-                  count:
-                    type: integer
+                oneOf:
+                  - type: object
+                    required: [documents, count]
+                    properties:
+                      documents:
+                        type: array
+                        items: { $ref: "#/components/schemas/Document" }
+                      count:
+                        type: integer
+                  - type: object
+                    required: [explain]
+                    properties:
+                      explain: { $ref: "#/components/schemas/PipelineExplain" }
         "400": { $ref: "#/components/responses/BadRequest" }
         "422": { $ref: "#/components/responses/WrongShape" }
         "401": { $ref: "#/components/responses/Unauthorized" }
@@ -3467,6 +3487,57 @@ components:
             It says nothing of `catchingUp` or of `classState`, which are separate
             statements. When every node has it, a client uses them anyway: it
             orders a preference and forbids nothing.
+
+    PipelineExplain:
+      type: object
+      description: |
+        What an aggregation would do, decided without doing any of it
+        (ADR-221). Open: stage entries gain keys as stages do, and a client
+        ignores those it does not know.
+      required: [executed, source, stages]
+      properties:
+        executed:
+          type: boolean
+          enum: [false]
+          description: "Always `false`: nothing ran."
+        planner:
+          type: string
+          description: What the planner touched, in words.
+        source:
+          type: object
+          description: |
+            How the pipeline's documents enter it. For a filtered source it carries
+            `find`'s plan keys and none of its measured ones: `strategy`
+            (`idLookup`, `index`, `indexUnion`, `collectionScan`), `index`,
+            `indexFieldsUsed`, `probes` (when more than one), plus `stages` (how
+            many leading stages the source took), `maxDocuments` (the pipeline's
+            ceiling) and, for a range plan that can be overtaken at run time, a
+            `note`. For `$vectorSearch`: `strategy: vectorIndex`, the
+            collection's vector configuration (`configured`, `dimension`,
+            `metric`, `embedsServerSide`) and `queryUsable`, whether a run would
+            accept the query as sent. It reads no stored vector, so whether any
+            exist is not checked.
+          required: [strategy]
+          properties:
+            strategy:
+              type: string
+              description: |
+                An unrecognized value is an access path this client does not know
+                about; new names are additive.
+        stages:
+          type: array
+          description: |
+            One entry for each stage after the source, in order. `$lookup` names
+            its strategy (`foreignScanHashed`, `foreignScanNestedLoop`), when it
+            reads the foreign collection, and, for the pipeline form, its own
+            `stages`, each marked `perInputDocument`.
+          items:
+            type: object
+            required: [stage, runs]
+            properties:
+              stage: { type: string }
+              runs: { type: string }
+              detail: { type: string }
 
     ClassState:
       type: string

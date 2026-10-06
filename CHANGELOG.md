@@ -21,6 +21,16 @@ breaking changes and says so here; a `0.x.PATCH` bump never does.
   health. New series: `kimmy_writer_wedged` and `kimmy_writer_hold_age_seconds`.
   A new test switch, `KIMMY_TEST_HOLD_WRITER=<ms>,<holder>`. See operations.md,
   "A wedged writer", and ADR-220.
+- **`aggregate` takes `explain: true` and answers with a plan, running nothing.**
+  `{"pipeline": [...], "explain": true}` answers `{"explain": {"executed": false,
+  "source": ..., "stages": [...]}}` with no documents and no count: the leading
+  `$match`'s access path as `find` would take it (`strategy`, `index`,
+  `indexFieldsUsed`, `probes`, without the counts a scan finds), one entry for each
+  later stage, a `$lookup`'s strategy, and a `$vectorSearch`'s configuration. It
+  needs the access a run needs, `$lookup` collections included. It was a `422`
+  (`explain: unknown field`); an older member still answers that during a roll.
+  The MCP aggregate tool takes it too. See aggregation.md, "Performance", and
+  ADR-221.
 
 ### Changed
 
