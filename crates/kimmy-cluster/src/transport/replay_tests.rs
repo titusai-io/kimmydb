@@ -1060,6 +1060,7 @@ async fn a_missing_ack_is_no_failed_round_and_no_back_off_in_the_loop() {
     let (held, is_held) = std::sync::mpsc::channel();
     let (release, released) = std::sync::mpsc::channel::<()>();
     let holder = Arc::clone(&a);
+    // UNSUPERVISED: holds a writer for a test, released and joined below, and its panic fails the test
     let watcher = std::thread::spawn(move || {
         let hold = holder.hold_writer(kimmy_storage::WriterHolder::Bulk);
         held.send(()).unwrap();
