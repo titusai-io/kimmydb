@@ -492,7 +492,12 @@ async fn a_stalled_page_still_lets_the_ordinary_pull_run_and_the_next_contact_fi
     // First contact: the page stalls and nothing is answered, but the contact is not
     // spent: C's ordinary round on the same connection ran (it pulled A's own
     // collection), and the next contact is not blocked.
+    let stalled = replay_counters().get(true, ReplayResult::Stalled);
     f.round().await.unwrap();
+    assert!(
+        replay_counters().get(true, ReplayResult::Stalled) > stalled,
+        "the stalled page is counted, by way"
+    );
     assert!(!f.catch_up.replay_answered(f.c.node_id()), "stalled: nothing is answered");
     assert!(
         f.c.get_collection("shop", "startup").is_ok(),
@@ -1168,6 +1173,9 @@ async fn a_replay_of_many_pages_is_reported_once_not_once_per_page() {
     let seen = Seen::default();
     let log = Arc::clone(&seen.0);
     let _recording = tracing::subscriber::set_default(seen);
+    // A callsite first hit on a thread with no subscriber is cached as uninteresting for
+    // every thread; rebuild so this test's subscriber sees the events of a parallel run.
+    tracing::callsite::rebuild_interest_cache();
     scripted(&f, |mut stream| async move {
         assert!(ask_versions(&mut stream).await.is_some());
         let mut cursor = from;

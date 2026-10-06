@@ -413,7 +413,7 @@ pub struct MetricsSnapshot {
     /// The restored-member replay, `[inbound, outbound]` by
     /// `ReplayResult::ALL` order: what the process-wide counters hold plus what
     /// was recorded here (the tests' door).
-    pub replay: [[u64; 4]; 2],
+    pub replay: [[u64; 5]; 2],
     /// Peer connections this node failed to serve, by reason, in
     /// `ServeFailure::ALL` order.
     pub sync_serve_failures: [u64; kimmy_cluster::ServeFailure::COUNT],
@@ -540,7 +540,7 @@ pub struct Metrics {
     ddl_confirmations: [AtomicU64; kimmy_cluster::ConfirmOutcome::COUNT],
     ddl_confirm_pushes: AtomicU64,
     /// [`Self::record_replay`]'s count, added to the transport's own counters.
-    replay_recorded: [[AtomicU64; 4]; 2],
+    replay_recorded: [[AtomicU64; 5]; 2],
     sync_serve_failures: [AtomicU64; kimmy_cluster::ServeFailure::COUNT],
     accept_errors: [AtomicU64; kimmy_cluster::AcceptListener::COUNT],
     sync_divergent_collections: AtomicU64,
@@ -984,7 +984,7 @@ impl Metrics {
     }
 
     /// `[inbound, outbound][result]` since start.
-    fn replay_totals(&self) -> [[u64; 4]; 2] {
+    fn replay_totals(&self) -> [[u64; 5]; 2] {
         let live = kimmy_cluster::replay_counters();
         std::array::from_fn(|way| {
             std::array::from_fn(|slot| {
@@ -1661,7 +1661,7 @@ impl Metrics {
              # HELP kimmy_ddl_confirm_pushes_total Windows pushed to members to confirm schema changes (ADR-191). At most one is in flight per member, and each carries everything queued for it, so in a burst this rises far slower than kimmy_ddl_confirmations_total.\n\
              # TYPE kimmy_ddl_confirm_pushes_total counter\n\
              kimmy_ddl_confirm_pushes_total {ddl_confirm_pushes}\n\
-             # HELP kimmy_replay_total The restored-member replay (ADR-212): pages of a restored member's own writes that a peer holds, by way and result. inbound: a peer that contacted this member served them; outbound: this member asked on a connection it dialled. served: a page this member sent to a peer that asked; applied: a page carrying this member's own entries applied here (an empty page is not counted); refused: a page that was not what was asked for; ack_timeout: the acknowledgement did not come and the replay ended for that contact (the ordinary pull still ran). A restored member that rises on outbound but never on inbound cannot be dialled, which is the case inbound exists for.\n\
+             # HELP kimmy_replay_total The restored-member replay (ADR-212): pages of a restored member's own writes that a peer holds, by way and result. inbound: a peer that contacted this member served them; outbound: this member asked on a connection it dialled. served: a page this member sent to a peer that asked; applied: a page carrying this member's own entries applied here (an empty page is not counted); refused: a page that was not what was asked for; ack_timeout: the acknowledgement did not come, so the contact ended (the ordinary pull and push happen at the next one); stalled: a page named a collection this member lacks or is purging and was not applied, which clears itself once an ordinary round brings the collection. A restored member that rises on outbound but never on inbound cannot be dialled, which is the case inbound exists for.\n\
              # TYPE kimmy_replay_total counter\n\
              {replay_series}\
              # HELP kimmy_sync_ddl_relogged_total Schema changes a snapshot restore appended to this node's oplog so that it can serve them onward. Not an error: 0 on a member that never caught up by snapshot, and one per index definition a snapshot restored where it did not already hold the entry.\n\
@@ -3329,16 +3329,18 @@ kimmy_ddl_confirmations_total{outcome=\"cancelled\"} 131
 # HELP kimmy_ddl_confirm_pushes_total Windows pushed to members to confirm schema changes (ADR-191). At most one is in flight per member, and each carries everything queued for it, so in a burst this rises far slower than kimmy_ddl_confirmations_total.
 # TYPE kimmy_ddl_confirm_pushes_total counter
 kimmy_ddl_confirm_pushes_total 137
-# HELP kimmy_replay_total The restored-member replay (ADR-212): pages of a restored member's own writes that a peer holds, by way and result. inbound: a peer that contacted this member served them; outbound: this member asked on a connection it dialled. served: a page this member sent to a peer that asked; applied: a page carrying this member's own entries applied here (an empty page is not counted); refused: a page that was not what was asked for; ack_timeout: the acknowledgement did not come and the replay ended for that contact (the ordinary pull still ran). A restored member that rises on outbound but never on inbound cannot be dialled, which is the case inbound exists for.
+# HELP kimmy_replay_total The restored-member replay (ADR-212): pages of a restored member's own writes that a peer holds, by way and result. inbound: a peer that contacted this member served them; outbound: this member asked on a connection it dialled. served: a page this member sent to a peer that asked; applied: a page carrying this member's own entries applied here (an empty page is not counted); refused: a page that was not what was asked for; ack_timeout: the acknowledgement did not come, so the contact ended (the ordinary pull and push happen at the next one); stalled: a page named a collection this member lacks or is purging and was not applied, which clears itself once an ordinary round brings the collection. A restored member that rises on outbound but never on inbound cannot be dialled, which is the case inbound exists for.
 # TYPE kimmy_replay_total counter
 kimmy_replay_total{via=\"inbound\",result=\"served\"} 160
 kimmy_replay_total{via=\"inbound\",result=\"applied\"} 161
 kimmy_replay_total{via=\"inbound\",result=\"refused\"} 162
 kimmy_replay_total{via=\"inbound\",result=\"ack_timeout\"} 163
+kimmy_replay_total{via=\"inbound\",result=\"stalled\"} 164
 kimmy_replay_total{via=\"outbound\",result=\"served\"} 170
 kimmy_replay_total{via=\"outbound\",result=\"applied\"} 171
 kimmy_replay_total{via=\"outbound\",result=\"refused\"} 172
 kimmy_replay_total{via=\"outbound\",result=\"ack_timeout\"} 173
+kimmy_replay_total{via=\"outbound\",result=\"stalled\"} 174
 # HELP kimmy_sync_ddl_relogged_total Schema changes a snapshot restore appended to this node's oplog so that it can serve them onward. Not an error: 0 on a member that never caught up by snapshot, and one per index definition a snapshot restored where it did not already hold the entry.
 # TYPE kimmy_sync_ddl_relogged_total counter
 kimmy_sync_ddl_relogged_total 91

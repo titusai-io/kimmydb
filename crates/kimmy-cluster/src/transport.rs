@@ -1602,9 +1602,11 @@ pub(crate) fn replay_apply(
         let outcome = kimmy_storage::blocking(|| engine.apply_batch(&lost))
             .map_err(|e| ProtocolError::Local(e.to_string()))?;
         if outcome.unknown.is_some() {
+            replay_counters().bump(via, ReplayResult::Stalled);
             return Ok(ReplayPage::Stalled(crate::protocol::ReplayStall::UnknownCollection));
         }
         if outcome.purge_pending > 0 {
+            replay_counters().bump(via, ReplayResult::Stalled);
             return Ok(ReplayPage::Stalled(crate::protocol::ReplayStall::PurgePending));
         }
     }
@@ -1650,7 +1652,7 @@ pub(crate) fn replay_apply(
 /// `inbound` is the replay a peer served on a connection it opened, `outbound` the
 /// one this member asked for on a connection it dialled.
 pub struct ReplayCounters {
-    cells: [[std::sync::atomic::AtomicU64; 4]; 2],
+    cells: [[std::sync::atomic::AtomicU64; 5]; 2],
 }
 
 /// The result a replay page ended in.
@@ -1665,10 +1667,15 @@ pub enum ReplayResult {
     Refused,
     /// The ack did not come in time, and the replay ended for that contact.
     AckTimeout,
+    /// A page named a collection this member lacks, or one it is purging: the page is
+    /// not applied, and the replay goes on at a later contact, once an ordinary
+    /// round has brought the collection.
+    Stalled,
 }
 
 impl ReplayResult {
-    pub const ALL: [Self; 4] = [Self::Served, Self::Applied, Self::Refused, Self::AckTimeout];
+    pub const ALL: [Self; 5] =
+        [Self::Served, Self::Applied, Self::Refused, Self::AckTimeout, Self::Stalled];
 
     pub const fn label(self) -> &'static str {
         match self {
@@ -1676,6 +1683,7 @@ impl ReplayResult {
             Self::Applied => "applied",
             Self::Refused => "refused",
             Self::AckTimeout => "ack_timeout",
+            Self::Stalled => "stalled",
         }
     }
 }
@@ -1684,18 +1692,8 @@ impl ReplayCounters {
     const fn new() -> Self {
         Self {
             cells: [
-                [
-                    std::sync::atomic::AtomicU64::new(0),
-                    std::sync::atomic::AtomicU64::new(0),
-                    std::sync::atomic::AtomicU64::new(0),
-                    std::sync::atomic::AtomicU64::new(0),
-                ],
-                [
-                    std::sync::atomic::AtomicU64::new(0),
-                    std::sync::atomic::AtomicU64::new(0),
-                    std::sync::atomic::AtomicU64::new(0),
-                    std::sync::atomic::AtomicU64::new(0),
-                ],
+                [const { std::sync::atomic::AtomicU64::new(0) }; 5],
+                [const { std::sync::atomic::AtomicU64::new(0) }; 5],
             ],
         }
     }

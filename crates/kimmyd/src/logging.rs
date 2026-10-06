@@ -1505,6 +1505,13 @@ impl TelemetryGuard {
         );
         observe!(
             u64_observable_counter,
+            "kimmy.replay.inbound.stalled",
+            "{page}",
+            "Restored-member replay pages, inbound, stalled (ADR-212).",
+            |s| s.replay[0][4]
+        );
+        observe!(
+            u64_observable_counter,
             "kimmy.replay.outbound.served",
             "{page}",
             "Restored-member replay pages, outbound, served (ADR-212).",
@@ -1530,6 +1537,13 @@ impl TelemetryGuard {
             "{page}",
             "Restored-member replay pages, outbound, ack_timeout (ADR-212).",
             |s| s.replay[1][3]
+        );
+        observe!(
+            u64_observable_counter,
+            "kimmy.replay.outbound.stalled",
+            "{page}",
+            "Restored-member replay pages, outbound, stalled (ADR-212).",
+            |s| s.replay[1][4]
         );
         observe!(
             u64_observable_counter,
