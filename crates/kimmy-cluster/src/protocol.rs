@@ -325,10 +325,11 @@ pub enum Message {
         exhausted: bool,
         #[serde(default)]
         horizon: bool,
-        /// How far the sender's walk got: at least the last entry's stamp (a page
-        /// that says less is refused), and read as `from` when below it. An empty page that is not the end moves the requester's
-        /// cursor here, as `Entries::scanned_to` moves a pull's, so a walk cut by
-        /// the sender's budget before it reached the requester's entries still
+        /// How far the sender's walk got. It is at least the last entry's stamp (a
+        /// page that says less is refused); a value below `from` is read as `from`.
+        /// On an empty page that is not the end, the requester moves its cursor
+        /// here, as `Entries::scanned_to` moves a pull's. A walk the sender's budget
+        /// cut short before it reached the requester's entries therefore still
         /// makes progress at every contact.
         scanned_to: Hlc,
     },

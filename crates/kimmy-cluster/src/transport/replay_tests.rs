@@ -1028,3 +1028,94 @@ async fn another_origins_collected_entries_do_not_put_the_replay_out_of_reach() 
     assert!(f.catch_up.replay_answered(c), "answered, not put beyond the horizon");
     assert_eq!(f.orders(), 2 + f.lost as u64);
 }
+
+/// **The sync loop's own books, through a real listener.** C's loop dials A over TLS;
+/// A's writer is held, so its apply of the replay page waits and C's two seconds for
+/// the ack run out. The contact ends quietly: the tick's report counts no failed
+/// round and no peer backing off, and the peer is not in back-off afterwards either:
+/// the next tick dials it again at once, finds the writer free, and finishes the replay.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_missing_ack_is_no_failed_round_and_no_back_off_in_the_loop() {
+    use crate::discovery::SeedSource;
+    use crate::peers::{ReplicationConfig, RoundReport, replicate};
+
+    let Fixture { a, c, catch_up, members, lost, _dirs } = fixture(10, 0);
+    let (a, c) = (Arc::new(a), Arc::new(c));
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let a_addr = listener.local_addr().unwrap();
+    let tls = Arc::new(crate::tls::ClusterTls::new().unwrap());
+    // UNSUPERVISED: the member's listener in a test, aborted below; a panic in it fails the round the test makes
+    let serving = tokio::spawn(serve_with(
+        Arc::clone(&a),
+        listener,
+        SECRET.to_string(),
+        None,
+        None,
+        None,
+        tls,
+        Some(members),
+    ));
+
+    // The member's writer is held until the first tick has reported.
+    let (held, is_held) = std::sync::mpsc::channel();
+    let (release, released) = std::sync::mpsc::channel::<()>();
+    let holder = Arc::clone(&a);
+    let watcher = std::thread::spawn(move || {
+        let hold = holder.hold_writer(kimmy_storage::WriterHolder::Bulk);
+        held.send(()).unwrap();
+        let _ = released.recv_timeout(Duration::from_secs(30));
+        drop(hold);
+    });
+    is_held.recv().unwrap();
+
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<RoundReport>();
+    let mut config = ReplicationConfig::new(
+        vec![SeedSource::Static(vec![a_addr])],
+        SECRET.to_string(),
+        "127.0.0.1:1".parse().unwrap(),
+    );
+    config.sync_interval = Duration::from_secs(1);
+    config.discovery_interval = Duration::from_secs(600);
+    config.members = Some(Members::default());
+    config.on_round = Some(Arc::new(move |report| {
+        let _ = tx.send(report);
+    }));
+    let before = replay_counters().get(true, ReplayResult::AckTimeout);
+    // UNSUPERVISED: the dialler's loop in a test, aborted below; its reports are what the test reads
+    let looping = tokio::spawn(replicate(Arc::clone(&c), config));
+    async fn next(rx: &mut tokio::sync::mpsc::UnboundedReceiver<RoundReport>) -> RoundReport {
+        tokio::time::timeout(Duration::from_secs(30), rx.recv())
+            .await
+            .expect("the loop ticks")
+            .expect("it is running")
+    }
+
+    // The first tick that reached the peer: the ack timed out, and nothing failed.
+    let mut report = next(&mut rx).await;
+    while report.peers_known == 0 {
+        report = next(&mut rx).await;
+    }
+    assert_eq!(report.failed, 0, "no failed round: {report:?}");
+    assert_eq!(report.backing_off, 0, "no peer backing off: {report:?}");
+    assert!(
+        replay_counters().get(true, ReplayResult::AckTimeout) > before,
+        "the missing ack was counted"
+    );
+    release.send(()).unwrap();
+    watcher.join().unwrap();
+
+    // Not in back-off: the next ticks dial it, and the replay finishes.
+    for _ in 0..6 {
+        if catch_up.replay_answered(c.node_id()) {
+            break;
+        }
+        let report = next(&mut rx).await;
+        assert_eq!(report.failed, 0, "{report:?}");
+        assert_eq!(report.backing_off, 0, "{report:?}");
+    }
+    assert!(catch_up.replay_answered(c.node_id()), "a later contact finished it");
+    let held_orders = a.get_collection("shop", "orders").unwrap();
+    assert_eq!(a.count(&held_orders, kimmy_storage::WalkScope::Request).unwrap(), 2 + lost as u64);
+    looping.abort();
+    serving.abort();
+}
