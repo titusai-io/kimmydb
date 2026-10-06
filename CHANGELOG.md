@@ -45,7 +45,6 @@ breaking changes and says so here; a `0.x.PATCH` bump never does.
   `kimmy_write_lock_*{holder}` (it was `drop`). `responsive` in a member's block is
   now absent until six ticks have been judged, where it read false. No rollback
   boundary.
-
 - **A restored member now reads its lost writes back over its peers' contacts
   too.** A member restored from a backup asked the peers that hold its later
   writes only on connections it opened, so a firewall that dropped what it opened

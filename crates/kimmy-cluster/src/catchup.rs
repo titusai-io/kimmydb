@@ -2418,6 +2418,35 @@ mod tests {
         assert!(!catchup.replay_armed(), "gone for the dwell, it has left");
     }
 
+    /// **The control for the inbound replay (ADR-212's addendum).** A peer the cluster
+    /// still lists that never answers holds the replay armed for as long as it is
+    /// listed, however far past the dwell and the wait the clock goes: on a clock that
+    /// is only ever moved by hand, ten dwells later it is still owed. What ends the
+    /// hold is an answer, which a peer's own contact on this member now supplies
+    /// (`replay_finished`) where the member could not dial it; and the same call
+    /// with the peer already gone for the dwell is the release the old build had.
+    #[test]
+    fn a_listed_peer_that_never_answers_holds_the_replay_until_it_answers() {
+        let dir = tempfile::tempdir().unwrap();
+        let catchup = CatchUp::open(dir.path(), Duration::from_secs(120));
+        let t0 = Instant::now();
+        catchup.arm_replay_at(kimmy_core::Hlc::new(50, 0), None, t0).unwrap();
+        let dwell = catchup.dwell();
+        note(&catchup, &[1, 2], &[1, 2], t0);
+        catchup.replay_finished(node(1));
+        for dwells in 1..=100u32 {
+            note(&catchup, &[1, 2], &[], t0 + dwell * dwells);
+            catchup.replay_settle();
+            assert!(catchup.replay_armed(), "peer 2 is listed and has not answered: {dwells}");
+        }
+        assert!(!catchup.replay_answered(node(2)));
+        // Its answer, however it arrives, ends the hold.
+        catchup.replay_finished(node(2));
+        note(&catchup, &[1, 2], &[], t0 + dwell * 101);
+        catchup.replay_settle();
+        assert!(!catchup.replay_armed(), "answered by both");
+    }
+
     /// The floor is no older than what a peer keeping the oplog for the retention
     /// can serve, and the clamp is what is persisted; with no retention it is left.
     #[test]

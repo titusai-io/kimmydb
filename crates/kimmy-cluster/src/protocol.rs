@@ -325,6 +325,12 @@ pub enum Message {
         exhausted: bool,
         #[serde(default)]
         horizon: bool,
+        /// How far the sender's walk got: at least the last entry's stamp and at
+        /// least `from`. An empty page that is not the end moves the requester's
+        /// cursor here, as `Entries::scanned_to` moves a pull's, so a walk cut by
+        /// the sender's budget before it reached the requester's entries still
+        /// makes progress at every contact.
+        scanned_to: Hlc,
     },
     /// The answer to [`Message::ReplayEntries`]: where the replay stands now.
     /// `next_from` is the position it asks from next; `done` that the sender has

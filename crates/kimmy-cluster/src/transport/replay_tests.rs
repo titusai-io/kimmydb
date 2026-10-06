@@ -33,12 +33,21 @@ struct Fixture {
 
 /// `lost` documents written after the backup, `big` bytes each.
 fn fixture(lost: i64, big: usize) -> Fixture {
+    fixture_with_tail(lost, big, 0)
+}
+
+/// [`fixture`], and C also holds `tail` entries of a third origin that sort between
+/// the backup and the lost writes: what a serve's walk must read past to reach them.
+fn fixture_with_tail(lost: i64, big: usize, tail: usize) -> Fixture {
     let writer_dir = tempfile::tempdir().unwrap();
     let writer = Engine::open(&writer_dir.path().join("kimmy.redb")).unwrap();
     let orders = writer.create_collection("shop", "orders").unwrap();
     writer.insert_many(&orders, (0..2).map(|i| bson::doc! { "_id": i }).collect()).unwrap();
     let mut backup = Vec::new();
     writer.backup_to(&mut backup, kimmy_storage::WalkScope::Request).unwrap();
+    let backup_at = writer.version_vector().unwrap().get(writer.node_id());
+    // The lost writes are stamped after the third origin's entries.
+    std::thread::sleep(Duration::from_millis(15));
     let pad = "x".repeat(big);
     for chunk in (2..2 + lost).collect::<Vec<_>>().chunks(100) {
         writer
@@ -59,6 +68,23 @@ fn fixture(lost: i64, big: usize) -> Fixture {
             break;
         }
         from = window.entries.last().unwrap().stamp.hlc;
+    }
+    if tail > 0 {
+        let third = NodeId::generate();
+        let entries: Vec<OplogEntry> = (0..tail)
+            .map(|k| OplogEntry {
+                stamp: Stamp::new(Hlc::new(backup_at.wall_ms + 1, k as u16), third),
+                kind: OpKind::Insert,
+                collection: orders.id,
+                doc_id: Some(kimmy_core::DocId::String(format!("third{k}"))),
+                body: Some(
+                    bson::serialize_to_vec(&bson::doc! { "_id": format!("third{k}") }).unwrap(),
+                ),
+            })
+            .collect();
+        for chunk in entries.chunks(500) {
+            c.apply_batch(chunk).unwrap();
+        }
     }
     let a_dir = tempfile::tempdir().unwrap();
     let path = a_dir.path().join("kimmy.redb");
@@ -233,7 +259,13 @@ async fn pages_that_were_not_asked_for_are_refused() {
     let r = scripted(&f, |mut stream| async move {
         write_frame(
             &mut stream,
-            &Message::ReplayEntries { from, entries: Vec::new(), exhausted: true, horizon: false },
+            &Message::ReplayEntries {
+                from,
+                entries: Vec::new(),
+                exhausted: true,
+                horizon: false,
+                scanned_to: from,
+            },
         )
         .await
         .unwrap();
@@ -250,6 +282,27 @@ async fn pages_that_were_not_asked_for_are_refused() {
                 entries: Vec::new(),
                 exhausted: true,
                 horizon: false,
+                scanned_to: at(1),
+            },
+        ),
+        (
+            "scanned to before it began",
+            Message::ReplayEntries {
+                from,
+                entries: Vec::new(),
+                exhausted: false,
+                horizon: false,
+                scanned_to: Hlc::new(from.wall_ms - 1, 0),
+            },
+        ),
+        (
+            "scanned to before its own last entry",
+            Message::ReplayEntries {
+                from,
+                entries: vec![own_entry(&f, at(5), "a")],
+                exhausted: false,
+                horizon: false,
+                scanned_to: at(4),
             },
         ),
         (
@@ -259,6 +312,7 @@ async fn pages_that_were_not_asked_for_are_refused() {
                 entries: vec![own_entry(&f, at(5), "b"), own_entry(&f, at(4), "a")],
                 exhausted: false,
                 horizon: false,
+                scanned_to: at(9),
             },
         ),
         (
@@ -268,6 +322,7 @@ async fn pages_that_were_not_asked_for_are_refused() {
                 entries: vec![own_entry(&f, from, "a")],
                 exhausted: false,
                 horizon: false,
+                scanned_to: at(9),
             },
         ),
         (
@@ -280,6 +335,7 @@ async fn pages_that_were_not_asked_for_are_refused() {
                 }],
                 exhausted: false,
                 horizon: false,
+                scanned_to: at(9),
             },
         ),
         (
@@ -291,6 +347,7 @@ async fn pages_that_were_not_asked_for_are_refused() {
                     .collect(),
                 exhausted: false,
                 horizon: false,
+                scanned_to: at(MAX_BATCH as u64 + 9),
             },
         ),
     ];
@@ -317,7 +374,13 @@ async fn an_empty_page_that_is_not_the_end_does_not_finish_the_replay() {
         assert!(ask_versions(&mut stream).await.is_some());
         write_frame(
             &mut stream,
-            &Message::ReplayEntries { from, entries: Vec::new(), exhausted: false, horizon: false },
+            &Message::ReplayEntries {
+                from,
+                entries: Vec::new(),
+                exhausted: false,
+                horizon: false,
+                scanned_to: from,
+            },
         )
         .await
         .unwrap();
@@ -330,7 +393,13 @@ async fn an_empty_page_that_is_not_the_end_does_not_finish_the_replay() {
         // The end: empty and exhausted.
         write_frame(
             &mut stream,
-            &Message::ReplayEntries { from, entries: Vec::new(), exhausted: true, horizon: false },
+            &Message::ReplayEntries {
+                from,
+                entries: Vec::new(),
+                exhausted: true,
+                horizon: false,
+                scanned_to: from,
+            },
         )
         .await
         .unwrap();
@@ -355,7 +424,13 @@ async fn a_horizon_page_is_recorded_and_answers_nothing() {
         assert!(ask_versions(&mut stream).await.is_some());
         write_frame(
             &mut stream,
-            &Message::ReplayEntries { from, entries: Vec::new(), exhausted: false, horizon: true },
+            &Message::ReplayEntries {
+                from,
+                entries: Vec::new(),
+                exhausted: false,
+                horizon: true,
+                scanned_to: from,
+            },
         )
         .await
         .unwrap();
@@ -391,9 +466,11 @@ async fn a_stalled_page_still_lets_the_ordinary_pull_run_and_the_next_contact_fi
     let c_dir = tempfile::tempdir().unwrap();
     let c = Engine::open(&c_dir.path().join("kimmy.redb")).unwrap();
     let elsewhere = c.create_collection("shop", "peer_only").unwrap();
-    let ahead = kimmy_storage::physical_now_ms() + 3_600_000;
+    // Just after the backup, so that A's own later writes sort above it and C still
+    // lacks them.
+    let backup_at = writer.version_vector().unwrap().get(writer.node_id());
     let lost = OplogEntry {
-        stamp: Stamp::new(Hlc::new(ahead, 0), writer.node_id()),
+        stamp: Stamp::new(Hlc::new(backup_at.wall_ms + 1, 0), writer.node_id()),
         kind: OpKind::Insert,
         collection: elsewhere.id,
         doc_id: Some(kimmy_core::DocId::String("lost".into())),
@@ -405,6 +482,7 @@ async fn a_stalled_page_still_lets_the_ordinary_pull_run_and_the_next_contact_fi
     let path = a_dir.path().join("kimmy.redb");
     kimmy_storage::backup::restore(&path, &mut backup.as_slice()).unwrap();
     let a = Engine::open(&path).unwrap();
+    std::thread::sleep(Duration::from_millis(10));
     a.create_collection("shop", "startup").unwrap();
     let marker_dir = tempfile::tempdir().unwrap();
     let catch_up = CatchUp::open(marker_dir.path(), Duration::from_secs(120));
@@ -421,17 +499,39 @@ async fn a_stalled_page_still_lets_the_ordinary_pull_run_and_the_next_contact_fi
     };
     assert!(f.a.get_collection("shop", "peer_only").is_err(), "premise: A lacks the collection");
 
-    // First contact: the page stalls, the replay is not answered, and the ordinary
-    // pull on the same connection still ran and brought the collection.
+    // First contact: the page stalls and nothing is answered, but the contact is not
+    // spent: C's ordinary round on the same connection ran (it pulled A's own
+    // collection), and the next contact is not blocked.
     f.round().await.unwrap();
     assert!(!f.catch_up.replay_answered(f.c.node_id()), "stalled: nothing is answered");
-    // A's own pull from C (its dial, a different connection) brings the collection.
+    assert!(
+        f.c.get_collection("shop", "startup").is_ok(),
+        "the stalled contact still ran C's ordinary pull from A"
+    );
+    // A contact the peer opens does not push its own collections to A, so A learns
+    // the collection as it always did: by its own round with a member that has it
+    // (here a member B, which A can dial).
+    assert!(f.a.get_collection("shop", "peer_only").is_err());
+    let b_dir = tempfile::tempdir().unwrap();
+    let b = Engine::open(&b_dir.path().join("kimmy.redb")).unwrap();
     let window =
         f.c.entries_for_peer(Hlc::ZERO, MAX_BATCH, kimmy_storage::WalkScope::Background).unwrap();
-    let own: Vec<_> =
+    let theirs: Vec<_> =
         window.entries.iter().filter(|e| e.stamp.node == f.c.node_id()).cloned().collect();
-    f.a.apply_batch(&own).unwrap();
-    assert!(f.a.get_collection("shop", "peer_only").is_ok());
+    b.apply_batch(&theirs).unwrap();
+    let (mut ours, far) = tokio::io::duplex(MAX_FRAME);
+    let serving =
+        serve_peer(&b, far, SECRET, BINDING, None, ServeBudgets::serving(), None::<&Members>);
+    let asking = async {
+        open_handshake(&f.a, &mut ours, SECRET, BINDING).await.unwrap();
+        let mut stalls = PeerStalls::new();
+        let outcome = sync_over(&f.a, &mut ours, addr(), b.node_id(), None, &mut stalls).await;
+        drop(ours);
+        outcome
+    };
+    let (_, outcome) = tokio::join!(serving, asking);
+    outcome.unwrap();
+    assert!(f.a.get_collection("shop", "peer_only").is_ok(), "A's own round brought it");
     // Second contact: the collection is here, the page applies, and it is answered.
     f.round().await.unwrap();
     assert!(f.catch_up.replay_answered(f.c.node_id()));
@@ -449,6 +549,7 @@ fn the_new_frames_round_trip_and_an_older_build_ignores_the_ask() {
             entries: Vec::new(),
             exhausted: true,
             horizon: false,
+            scanned_to: Hlc::new(3, 1),
         },
         Message::ReplayAck { next_from: Hlc::new(4, 0), done: false, stalled: None },
         Message::ReplayAck {
@@ -504,7 +605,13 @@ fn the_new_frames_round_trip_and_an_older_build_ignores_the_ask() {
 }
 
 fn frames_page() -> Message {
-    Message::ReplayEntries { from: Hlc::ZERO, entries: Vec::new(), exhausted: true, horizon: false }
+    Message::ReplayEntries {
+        from: Hlc::ZERO,
+        entries: Vec::new(),
+        exhausted: true,
+        horizon: false,
+        scanned_to: Hlc::ZERO,
+    }
 }
 
 /// The dialer's side, against a scripted answerer: it ends its replay for the
@@ -653,11 +760,19 @@ fn applying_a_page_twice_and_at_once_is_safe() {
 /// replay still finishes across several.
 #[tokio::test]
 async fn pages_of_large_entries_are_sized_by_the_holder() {
-    // Eight entries of about 100 KiB each cannot be one frame of MAX_BATCH.
-    let f = fixture(8, 100 * 1024);
+    // Five entries of 14 MiB each are more than one frame of MAX_FRAME (64 MiB), and
+    // far fewer than MAX_BATCH entries: the holder sizes the page, the member cannot.
+    let f = fixture(5, 14 * 1024 * 1024);
+    TEST_REPLAY_SERVE_TIME.with(|t| t.set(Some(Duration::from_secs(3600))));
+    TEST_REPLAY_PAGES_SENT.with(|n| n.set(0));
     f.round().await.unwrap();
+    let pages = TEST_REPLAY_PAGES_SENT.with(std::cell::Cell::get);
+    TEST_REPLAY_SERVE_TIME.with(|t| t.set(None));
+    // `write_frame` refuses a frame over MAX_FRAME, so every page that went out fits,
+    // and the tail needed more than one of them.
+    assert!(pages > 1, "the tail went in {pages} pages, each under MAX_FRAME ({MAX_FRAME})");
     assert!(f.catch_up.replay_answered(f.c.node_id()));
-    assert_eq!(f.orders(), 2 + 8);
+    assert_eq!(f.orders(), 2 + 5);
 }
 
 /// One contact serves at most the page cap, and the replay goes on at the next.
@@ -703,7 +818,13 @@ async fn the_ack_names_the_cursor_the_page_reached() {
         assert!(ask_versions(&mut stream).await.is_some());
         write_frame(
             &mut stream,
-            &Message::ReplayEntries { from, entries: page, exhausted: false, horizon: false },
+            &Message::ReplayEntries {
+                from,
+                entries: page,
+                exhausted: false,
+                horizon: false,
+                scanned_to: at(2),
+            },
         )
         .await
         .unwrap();
@@ -717,4 +838,185 @@ async fn the_ack_names_the_cursor_the_page_reached() {
     })
     .await
     .unwrap();
+}
+
+/// **Liveness.** The holder's walk reads past a long tail of another origin before it
+/// reaches the member's entries, and its row budget cuts the walk short. Each contact
+/// still moves the member's cursor to where the walk got (`scanned_to`), so the replay
+/// finishes over several contacts instead of repeating the first one for ever.
+#[tokio::test]
+async fn a_walk_cut_short_by_the_budget_still_finishes_over_contacts() {
+    let f = fixture_with_tail(10, 0, 400);
+    let c = f.c.node_id();
+    TEST_REPLAY_EXAMINE_TIME.with(|t| t.set(Some(Duration::ZERO)));
+    let mut contacts = 0;
+    let mut advanced_each_time = true;
+    while !f.catch_up.replay_answered(c) && contacts < 600 {
+        let before = f.catch_up.replay_from(c);
+        f.round().await.unwrap();
+        contacts += 1;
+        if !f.catch_up.replay_answered(c) && f.catch_up.replay_from(c) <= before {
+            advanced_each_time = false;
+        }
+    }
+    TEST_REPLAY_EXAMINE_TIME.with(|t| t.set(None));
+    assert!(f.catch_up.replay_answered(c), "answered within {contacts} contacts");
+    assert!(advanced_each_time, "every contact that did not finish moved the cursor");
+    assert!(contacts > 1, "the budget really cut the first walk short");
+    assert_eq!(f.orders(), 2 + f.lost as u64, "every lost write is back");
+}
+
+/// **A page the member cannot apply in time ends the contact, not the member's
+/// standing with the peer.** With A's writer held, the apply waits, C's two-second
+/// wait for the ack runs out, and the contact ends quietly: no error comes back (so
+/// no sync failure is counted and no back-off starts), `ack_timeout` is counted, and
+/// the replay finishes on a later contact once the writer is free. A late ack would
+/// desynchronise the stream, so the contact is over rather than waited on.
+#[test]
+fn a_member_that_cannot_apply_in_time_ends_the_contact_without_failing_it() {
+    let f = fixture(10, 0);
+    let c = f.c.node_id();
+    let before = replay_counters().get(true, ReplayResult::AckTimeout);
+    let (held, is_held) = std::sync::mpsc::channel();
+    let (release, released) = std::sync::mpsc::channel::<()>();
+    let member = &f.a;
+    let outcome = std::thread::scope(|scope| {
+        // UNSUPERVISED: a scripted peer or racing applier in a test, joined below, whose panic fails it
+        let watcher = scope.spawn(move || {
+            let hold = member.hold_writer(kimmy_storage::WriterHolder::Bulk);
+            held.send(()).unwrap();
+            let _ = released.recv_timeout(Duration::from_secs(30));
+            drop(hold);
+        });
+        is_held.recv().unwrap();
+        let (mut ours, far) = tokio::io::duplex(MAX_FRAME);
+        // The member's side runs on a thread of its own: its apply blocks on the
+        // writer, and must not hold the dialler's timer with it.
+        // UNSUPERVISED: a scripted peer or racing applier in a test, joined below, whose panic fails it
+        let server = scope.spawn(|| {
+            tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap().block_on(
+                serve_peer(
+                    &f.a,
+                    far,
+                    SECRET,
+                    BINDING,
+                    None,
+                    ServeBudgets::serving(),
+                    Some(&f.members),
+                ),
+            )
+        });
+        let mut stalls = PeerStalls::new();
+        let outcome =
+            tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap().block_on(
+                async {
+                    open_handshake(&f.c, &mut ours, SECRET, BINDING).await.unwrap();
+                    let outcome =
+                        sync_over(&f.c, &mut ours, addr(), f.a.node_id(), None, &mut stalls).await;
+                    drop(ours);
+                    outcome
+                },
+            );
+        release.send(()).unwrap();
+        watcher.join().unwrap();
+        let _ = server.join().unwrap();
+        outcome
+    });
+    assert!(outcome.is_ok(), "the contact ended without an error: {outcome:?}");
+    assert!(
+        replay_counters().get(true, ReplayResult::AckTimeout) > before,
+        "the missing ack was counted"
+    );
+    // The writer is free: a later contact finishes the replay.
+    let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+    for _ in 0..4 {
+        if f.catch_up.replay_answered(c) {
+            break;
+        }
+        rt.block_on(f.round()).unwrap();
+    }
+    assert!(f.catch_up.replay_answered(c), "a later contact finished it");
+    assert_eq!(f.orders(), 2 + f.lost as u64);
+}
+
+/// This member's own stop, met while serving, ends the contact as a stop: neither the
+/// peer's failure nor the round's (`ProtocolError::Stopping`), and nothing is sent.
+#[tokio::test]
+async fn a_stop_during_the_serve_ends_the_contact_as_a_stop() {
+    let f = fixture(10, 0);
+    f.c.set_stopping();
+    let (mut ours, mut theirs) = tokio::io::duplex(MAX_FRAME);
+    let from = f.catch_up.replay_from(f.c.node_id());
+    let served = serve_replay(
+        &f.c,
+        &mut ours,
+        addr(),
+        f.a.node_id(),
+        &kimmy_core::VersionVector::new(),
+        from,
+    )
+    .await;
+    drop(ours);
+    assert!(matches!(served, Err(ProtocolError::Stopping(_))), "{served:?}");
+    assert_eq!(ServeFailure::of(&served.unwrap_err()), None, "a stop is no failure");
+    assert!(read_frame(&mut theirs).await.is_err(), "no page was sent");
+}
+
+/// A frame as the wire carries it: the length, then the BSON.
+fn framed(doc: &bson::Document) -> Vec<u8> {
+    let body = bson::serialize_to_vec(doc).unwrap();
+    let mut out = (body.len() as u32).to_be_bytes().to_vec();
+    out.extend(body);
+    out
+}
+
+/// Through the real decoder, an ask that is not a position reads as no ask: it costs
+/// the field, never the frame, and a later well-formed ask still reads.
+#[tokio::test]
+async fn a_malformed_replay_from_decodes_as_absent_through_the_real_decoder() {
+    let mut sent = bson::serialize_to_document(&Message::Vectors {
+        servable: Default::default(),
+        witnessed: Default::default(),
+        facts: None,
+        facts_gen: None,
+        echo: None,
+        replay_from: Some(Hlc::new(9, 0)),
+    })
+    .unwrap();
+    for bad in [
+        bson::Bson::String("not a position".into()),
+        bson::Bson::Int32(7),
+        bson::Bson::Document(bson::doc! { "wall_ms": "x" }),
+        bson::Bson::Array(vec![]),
+    ] {
+        sent.get_document_mut("Vectors").unwrap().insert("replay_from", bad.clone());
+        let bytes = framed(&sent);
+        match read_frame(&mut &bytes[..]).await.unwrap() {
+            Message::Vectors { replay_from, .. } => {
+                assert_eq!(replay_from, None, "{bad:?} reads as no ask")
+            }
+            other => panic!("{other:?}"),
+        }
+    }
+    sent.get_document_mut("Vectors")
+        .unwrap()
+        .insert("replay_from", bson::serialize_to_bson(&Hlc::new(9, 0)).unwrap());
+    let bytes = framed(&sent);
+    assert!(matches!(
+        read_frame(&mut &bytes[..]).await.unwrap(),
+        Message::Vectors { replay_from: Some(h), .. } if h == Hlc::new(9, 0)
+    ));
+}
+
+/// A build that predates the pages meets `ReplayEntries` as a variant it does not
+/// know, and the real decoder says that is `Malformed` (a protocol error that ends the
+/// contact), which is what the ask's being sent only to a peer that sent it makes
+/// unreachable in practice. Proven here on the decoder, with a name no build knows.
+#[tokio::test]
+async fn a_frame_a_build_does_not_know_is_malformed_through_the_real_decoder() {
+    let unknown = bson::doc! { "ReplayEntriesFromAFutureBuild": { "from": 1 } };
+    let bytes = framed(&unknown);
+    let err = read_frame(&mut &bytes[..]).await.unwrap_err();
+    assert!(matches!(err, ProtocolError::Malformed(_)), "{err:?}");
+    assert_eq!(ServeFailure::of(&err), Some(ServeFailure::Malformed));
 }

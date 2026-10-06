@@ -796,7 +796,7 @@ where
                 )
                 .await?;
             }
-            Message::ReplayEntries { from, entries, exhausted, horizon } => {
+            Message::ReplayEntries { from, entries, exhausted, horizon, scanned_to } => {
                 let counters = replay_counters();
                 let refuse = |why: &str| {
                     counters.bump(Via::Inbound, ReplayResult::Refused);
@@ -849,6 +849,9 @@ where
                 if entries.len() > MAX_BATCH {
                     return Err(refuse("it carries more entries than a batch"));
                 }
+                if scanned_to < from {
+                    return Err(refuse("it scanned to before where it began"));
+                }
                 let mut previous = from;
                 for entry in &entries {
                     if entry.stamp.node != me || entry.stamp.hlc <= previous {
@@ -858,6 +861,9 @@ where
                     }
                     previous = entry.stamp.hlc;
                 }
+                if scanned_to < previous {
+                    return Err(refuse("it scanned to before its own last entry"));
+                }
                 let page = replay_apply(
                     engine,
                     catch_up,
@@ -865,7 +871,7 @@ where
                     peer,
                     from,
                     entries,
-                    from,
+                    scanned_to,
                     exhausted,
                     Via::Inbound,
                 )?;
@@ -1720,8 +1726,28 @@ thread_local! {
     static TEST_REPLAY_MAX_PAGES: std::cell::Cell<Option<usize>> = const { std::cell::Cell::new(None) };
     /// A test's own serve time box, so a loaded runner cannot end a serve early.
     static TEST_REPLAY_SERVE_TIME: std::cell::Cell<Option<Duration>> = const { std::cell::Cell::new(None) };
+    /// A test's own time budget for the serve's walk, to cut it short.
+    static TEST_REPLAY_EXAMINE_TIME: std::cell::Cell<Option<Duration>> = const { std::cell::Cell::new(None) };
+    /// A test's own row budget for the serve's walk, to cut it short.
+    static TEST_REPLAY_EXAMINE_ROWS: std::cell::Cell<Option<u64>> = const { std::cell::Cell::new(None) };
     /// Pages the serve on this thread has sent since the test cleared it.
     static TEST_REPLAY_PAGES_SENT: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+fn replay_examine_time(left: Duration) -> Duration {
+    #[cfg(test)]
+    if let Some(time) = TEST_REPLAY_EXAMINE_TIME.with(std::cell::Cell::get) {
+        return time;
+    }
+    left
+}
+
+fn replay_examine_rows() -> u64 {
+    #[cfg(test)]
+    if let Some(rows) = TEST_REPLAY_EXAMINE_ROWS.with(std::cell::Cell::get) {
+        return rows;
+    }
+    kimmy_storage::ExamineBudget::serve().rows
 }
 
 fn replay_serve_time() -> Duration {
@@ -1780,35 +1806,41 @@ where
             return Ok(ReplayServed::InStep);
         }
         sent_pages += 1;
-        // What the peer holds of every other origin is "held", so the walk passes
-        // over it and serves only the peer's own entries above `from`.
+        // Every other origin is "held", whatever the peer says it holds of them: the
+        // replay is about the peer's own origin alone, so the walk passes over
+        // the rest unread and uncounted, and the horizon is judged for that origin
+        // alone (a peer that lacks another origin's collected entries must not be
+        // told the replay is out of reach).
+        let ours = engine.version_vector().map_err(|e| from_storage(e, ProtocolError::Local))?;
         let mut held = theirs.clone();
+        for (node, _) in ours.iter().filter(|(node, _)| *node != their_node) {
+            held.insert(node, kimmy_core::Hlc::MAX);
+        }
         held.insert(their_node, from);
         let servable = engine
             .can_serve_peer_holding(&held)
-            .map_err(|e| ProtocolError::Local(e.to_string()))?;
+            .map_err(|e| from_storage(e, ProtocolError::Local))?;
         let (entries, exhausted, horizon, scanned_to) = if !servable {
             (Vec::new(), false, true, from)
         } else {
-            let ours = engine.version_vector().map_err(|e| ProtocolError::Local(e.to_string()))?;
             if ours.get(their_node) <= from {
                 // Nothing held above where the replay asks: the whole answer.
                 (Vec::new(), true, false, from)
             } else {
                 let budget = kimmy_storage::ExamineBudget {
-                    time: replay_serve_time().saturating_sub(started.elapsed()),
-                    ..kimmy_storage::ExamineBudget::serve()
+                    time: replay_examine_time(
+                        replay_serve_time().saturating_sub(started.elapsed()),
+                    ),
+                    rows: replay_examine_rows(),
                 };
                 let window = match kimmy_storage::blocking(|| {
                     let _walk = ServeWalk::begin(their_node);
                     engine.serve_entries_to_peer(from, MAX_BATCH, Some(&held), &[], Some(budget))
                 }) {
                     Ok(window) => window,
-                    Err(kimmy_storage::StorageError::Stopping(reason)) => {
-                        debug!(%reason, "stopped serving a peer's replay: this node is shutting down");
-                        return Ok(ReplayServed::InStep);
-                    }
-                    Err(e) => return Err(ProtocolError::Local(e.to_string())),
+                    // This node's own stop is neither the peer's failure nor the
+                    // round's: it ends the contact quietly (`ProtocolError::Stopping`).
+                    Err(e) => return Err(from_storage(e, ProtocolError::Local)),
                 };
                 let mut entries: Vec<_> = window
                     .entries
@@ -1829,7 +1861,11 @@ where
         // where an empty page's walk reached.
         let after = last_sent.unwrap_or(scanned_to).max(from);
         let count = entries.len();
-        write_frame(stream, &Message::ReplayEntries { from, entries, exhausted, horizon }).await?;
+        write_frame(
+            stream,
+            &Message::ReplayEntries { from, entries, exhausted, horizon, scanned_to: after },
+        )
+        .await?;
         counters.bump(Via::Inbound, ReplayResult::Served);
         #[cfg(test)]
         TEST_REPLAY_PAGES_SENT.with(|n| n.set(n.get() + 1));
