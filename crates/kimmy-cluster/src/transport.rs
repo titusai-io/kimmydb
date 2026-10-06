@@ -469,6 +469,29 @@ pub fn set_test_refuse_sync(on: bool) {
     TEST_REFUSE_SYNC.store(on, std::sync::atomic::Ordering::SeqCst);
 }
 
+/// One peer `KIMMY_TEST_REFUSE_DIAL` makes this member dial nobody at: by its
+/// cluster address, or by its node id (known only once the handshake has proved
+/// it, so that dial is refused after it).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DialRefusal {
+    Address(SocketAddr),
+    Node(kimmy_core::NodeId),
+}
+
+static TEST_REFUSE_DIAL: std::sync::RwLock<Vec<DialRefusal>> = std::sync::RwLock::new(Vec::new());
+
+/// Make this member dial none of `peers` (a test switch: ADR-212's addendum).
+/// Their dials to this member, and everything else, go on: a one-way partition.
+pub fn set_test_refuse_dial(peers: Vec<DialRefusal>) {
+    if let Ok(mut refused) = TEST_REFUSE_DIAL.write() {
+        *refused = peers;
+    }
+}
+
+fn dial_refused(check: impl Fn(&DialRefusal) -> bool) -> bool {
+    TEST_REFUSE_DIAL.read().is_ok_and(|refused| refused.iter().any(check))
+}
+
 #[allow(clippy::too_many_arguments)]
 pub async fn serve_with(
     engine: Arc<Engine>,
@@ -701,6 +724,11 @@ where
         return Ok(());
     }
 
+    // The replay this connection asked the peer for, and where it stands: the
+    // running cursor a page is validated against. Advanced only from this side's
+    // own ack, never from the shared cursor the outbound path moves (ADR-212's
+    // addendum).
+    let mut replay_cursor: Option<kimmy_core::Hlc> = None;
     loop {
         let (frame, undecodable, decoded_seq) =
             crate::protocol::read_frame_noting_facts(&mut stream).await?;
@@ -749,11 +777,116 @@ where
                 let facts = ours.map(|(block, _)| block);
                 // The requester's block as held **after** recording the request's.
                 let echo = members.map(|members| members.echo_for(peer));
+                // This member's replay of its own origin is owed by this peer: ask
+                // for it here, on the contact the peer opened.
+                let catch_up = members.and_then(Members::catch_up);
+                replay_cursor = catch_up
+                    .filter(|c| c.replay_armed() && !c.replay_answered(peer))
+                    .map(|c| c.replay_from(peer));
                 write_frame(
                     &mut stream,
-                    &Message::Vectors { servable, witnessed, facts, facts_gen, echo },
+                    &Message::Vectors {
+                        servable,
+                        witnessed,
+                        facts,
+                        facts_gen,
+                        echo,
+                        replay_from: replay_cursor,
+                    },
                 )
                 .await?;
+            }
+            Message::ReplayEntries { from, entries, exhausted, horizon } => {
+                let counters = replay_counters();
+                let refuse = |why: &str| {
+                    counters.bump(Via::Inbound, ReplayResult::Refused);
+                    warn!(?peer, why, "refused a page of a replay");
+                    ProtocolError::Malformed(format!("a page of a replay: {why}"))
+                };
+                let (Some(catch_up), Some(cursor)) =
+                    (members.and_then(Members::catch_up), replay_cursor)
+                else {
+                    return Err(refuse("this connection asked for none"));
+                };
+                if !catch_up.replay_armed() || catch_up.replay_answered(peer) {
+                    // Answered meanwhile, by the outbound path: nothing more is owed.
+                    replay_cursor = None;
+                    write_frame(
+                        &mut stream,
+                        &Message::ReplayAck { next_from: cursor, done: true, stalled: None },
+                    )
+                    .await?;
+                    continue;
+                }
+                if from != cursor {
+                    return Err(refuse("it does not begin where this connection's replay is"));
+                }
+                if horizon {
+                    match catch_up.replay_beyond_horizon(peer, std::time::Instant::now()) {
+                        crate::catchup::Horizon::First => warn!(
+                            ?peer,
+                            "the peer has collected the oplog this member's replay asks from, so \
+                             it cannot say what it holds of this member's own origin; the replay \
+                             stays owed and asks again next contact"
+                        ),
+                        crate::catchup::Horizon::Again => {}
+                        crate::catchup::Horizon::GaveUp => warn!(
+                            ?peer,
+                            "the peer has answered this member's replay with a horizon for the \
+                             whole catch-up wait; the replay stops asking it (the members may \
+                             keep the oplog for different times: storage.oplog_retention_secs \
+                             should be the same on every member)"
+                        ),
+                    }
+                    write_frame(
+                        &mut stream,
+                        &Message::ReplayAck { next_from: cursor, done: false, stalled: None },
+                    )
+                    .await?;
+                    continue;
+                }
+                let me = engine.node_id();
+                if entries.len() > MAX_BATCH {
+                    return Err(refuse("it carries more entries than a batch"));
+                }
+                let mut previous = from;
+                for entry in &entries {
+                    if entry.stamp.node != me || entry.stamp.hlc <= previous {
+                        return Err(refuse(
+                            "its entries are not this member's own, in order, above its start",
+                        ));
+                    }
+                    previous = entry.stamp.hlc;
+                }
+                let page = replay_apply(
+                    engine,
+                    catch_up,
+                    &format!("{peer:?}"),
+                    peer,
+                    from,
+                    entries,
+                    from,
+                    exhausted,
+                    Via::Inbound,
+                )?;
+                let ack = match page {
+                    ReplayPage::Stalled(stall) => {
+                        Message::ReplayAck { next_from: cursor, done: false, stalled: Some(stall) }
+                    }
+                    ReplayPage::Done { next } => {
+                        replay_cursor = None;
+                        info!(
+                            ?peer,
+                            "the peer answered the replay of this member's origin on its own contact"
+                        );
+                        Message::ReplayAck { next_from: next, done: true, stalled: None }
+                    }
+                    ReplayPage::Advanced { next } | ReplayPage::Empty { next } => {
+                        replay_cursor = Some(next);
+                        Message::ReplayAck { next_from: next, done: false, stalled: None }
+                    }
+                };
+                write_frame(&mut stream, &ack).await?;
             }
             Message::AskWitnessed {} => {
                 let witnessed =
@@ -1126,6 +1259,13 @@ pub(crate) async fn dial(
         )
         .into());
     }
+    if dial_refused(|r| *r == DialRefusal::Address(peer)) {
+        return Err(io::Error::new(
+            io::ErrorKind::ConnectionRefused,
+            "KIMMY_TEST_REFUSE_DIAL: this member dials no such peer",
+        )
+        .into());
+    }
     let tcp =
         tokio::time::timeout(CONNECT_TIMEOUT, TcpStream::connect(peer)).await.map_err(|_| {
             io::Error::new(
@@ -1167,6 +1307,13 @@ pub(crate) async fn dial(
     )
     .await
     .map_err(|_| ProtocolError::TimedOut("handshake".into()))??;
+    if dial_refused(|r| *r == DialRefusal::Node(their_node)) {
+        return Err(io::Error::new(
+            io::ErrorKind::ConnectionRefused,
+            "KIMMY_TEST_REFUSE_DIAL: this member dials no such peer",
+        )
+        .into());
+    }
     // A node that dials an address of its own gets its own id back. Nothing it
     // reads there is a statement about the cluster, and the catching-up marker
     // must never count it as a member reached (ADR-202).
@@ -1308,7 +1455,9 @@ where
         )
         .await?;
         let entries = match read_frame(stream).await? {
-            Message::Entries { entries, exhausted, .. } => (entries, exhausted),
+            Message::Entries { entries, exhausted, scanned_to, .. } => {
+                (entries, exhausted, scanned_to)
+            }
             Message::BatchTooLarge { fits } if fits > 0 && fits < limit => {
                 limit = fits;
                 continue;
@@ -1339,62 +1488,385 @@ where
                 )));
             }
         };
-        let (entries, exhausted) = entries;
-        let own: Vec<_> = entries
-            .into_iter()
-            .filter(|entry| entry.stamp.node == me && entry.stamp.hlc > from)
-            .collect();
-        for entry in &own {
-            engine.advance_clock_past(&entry.stamp);
-        }
-        let lost: Vec<_> = kimmy_storage::blocking(|| {
-            own.iter()
-                .map(|entry| engine.has_oplog_entry(&entry.stamp).map(|held| (entry, held)))
-                .collect::<Result<Vec<_>, _>>()
-        })
-        .map_err(|e| ProtocolError::Local(e.to_string()))?
-        .into_iter()
-        .filter(|(_, held)| !held)
-        .map(|(entry, _)| entry.clone())
-        .collect();
-        if !lost.is_empty() {
-            warn!(
-                %peer,
-                entries = lost.len(),
-                "the peer holds writes this member made and no longer holds; it is marked \
-                 restored until it has caught up, and reads them back"
-            );
-            let lost_max = lost.iter().map(|entry| entry.stamp.hlc).max().unwrap_or_default();
-            catch_up
-                .mark_proven(
-                    crate::facts::CatchUpReason::Restored,
-                    their_node,
-                    lost_max,
-                    std::time::Instant::now(),
-                )
-                .map_err(|e| {
-                    ProtocolError::Local(format!("writing the catching-up marker: {e}"))
-                })?;
-            let outcome = kimmy_storage::blocking(|| engine.apply_batch(&lost))
-                .map_err(|e| ProtocolError::Local(e.to_string()))?;
-            if outcome.unknown.is_some() || outcome.purge_pending > 0 {
+        let (entries, exhausted, scanned_to) = entries;
+        match replay_apply(
+            engine,
+            catch_up,
+            &peer,
+            their_node,
+            from,
+            entries,
+            scanned_to,
+            exhausted,
+            Via::Outbound,
+        )? {
+            ReplayPage::Stalled(_) => {
                 // A collection these entries name is not here yet: the ordinary
                 // machinery brings it, and the replay goes on from where it was.
                 return Ok(());
             }
+            ReplayPage::Done { .. } => return Ok(()),
+            ReplayPage::Advanced { next } => from = next,
+            // An empty page that is not the end: the walk was cut where it
+            // stopped, and the replay goes on from there if that moved.
+            ReplayPage::Empty { next } if next > from => from = next,
+            ReplayPage::Empty { .. } => return Ok(()),
         }
-        let Some(last) = own.last().map(|entry| entry.stamp.hlc) else {
-            catch_up.replay_finished(their_node);
-            return Ok(());
-        };
-        catch_up.replay_advanced(their_node, last);
-        if exhausted {
-            catch_up.replay_finished(their_node);
-            return Ok(());
-        }
-        from = last;
         if Instant::now() >= deadline {
             return Ok(());
+        }
+    }
+}
+
+/// What applying one page of a replay came to.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum ReplayPage {
+    /// The page named something this member must first receive by the ordinary
+    /// pull: nothing was advanced, and nothing is answered.
+    Stalled(crate::protocol::ReplayStall),
+    /// The replay reached the end of what the peer holds: it is answered.
+    Done { next: kimmy_core::Hlc },
+    /// More may follow, from `next`.
+    Advanced { next: kimmy_core::Hlc },
+    /// No entry of this member's origin in the page, and not the end.
+    Empty { next: kimmy_core::Hlc },
+}
+
+/// Which way a replay page travelled, for the counters and the log.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Via {
+    Outbound,
+    Inbound,
+}
+
+/// Apply one page of the entries a peer holds of this member's own origin: the
+/// body both the replay this member asks for and the one a peer serves it share
+/// (ADR-212's addendum), so there is one behaviour to prove.
+///
+/// **It finishes only on `exhausted`.** An empty page that is not the end (a
+/// walk cut by a budget, a batch cut to fit a frame) says nothing about what
+/// lies beyond it, so it never answers the replay: it can only move the cursor to
+/// where the peer's walk reached.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn replay_apply(
+    engine: &Engine,
+    catch_up: &crate::catchup::CatchUp,
+    peer: &dyn std::fmt::Display,
+    their_node: kimmy_core::NodeId,
+    from: kimmy_core::Hlc,
+    entries: Vec<kimmy_core::OplogEntry>,
+    scanned_to: kimmy_core::Hlc,
+    exhausted: bool,
+    via: Via,
+) -> Result<ReplayPage, ProtocolError> {
+    let me = engine.node_id();
+    let own: Vec<_> = entries
+        .into_iter()
+        .filter(|entry| entry.stamp.node == me && entry.stamp.hlc > from)
+        .collect();
+    for entry in &own {
+        engine.advance_clock_past(&entry.stamp);
+    }
+    let lost: Vec<_> = kimmy_storage::blocking(|| {
+        own.iter()
+            .map(|entry| engine.has_oplog_entry(&entry.stamp).map(|held| (entry, held)))
+            .collect::<Result<Vec<_>, _>>()
+    })
+    .map_err(|e| ProtocolError::Local(e.to_string()))?
+    .into_iter()
+    .filter(|(_, held)| !held)
+    .map(|(entry, _)| entry.clone())
+    .collect();
+    if !lost.is_empty() {
+        warn!(
+            %peer,
+            entries = lost.len(),
+            "the peer holds writes this member made and no longer holds; it is marked \
+             restored until it has caught up, and reads them back"
+        );
+        let lost_max = lost.iter().map(|entry| entry.stamp.hlc).max().unwrap_or_default();
+        catch_up
+            .mark_proven(
+                crate::facts::CatchUpReason::Restored,
+                their_node,
+                lost_max,
+                std::time::Instant::now(),
+            )
+            .map_err(|e| ProtocolError::Local(format!("writing the catching-up marker: {e}")))?;
+        let outcome = kimmy_storage::blocking(|| engine.apply_batch(&lost))
+            .map_err(|e| ProtocolError::Local(e.to_string()))?;
+        if outcome.unknown.is_some() {
+            return Ok(ReplayPage::Stalled(crate::protocol::ReplayStall::UnknownCollection));
+        }
+        if outcome.purge_pending > 0 {
+            return Ok(ReplayPage::Stalled(crate::protocol::ReplayStall::PurgePending));
+        }
+    }
+    if !own.is_empty() {
+        replay_counters().applied(via);
+    }
+    let Some(last) = own.last().map(|entry| entry.stamp.hlc) else {
+        if exhausted {
+            catch_up.replay_finished(their_node);
+            return Ok(ReplayPage::Done { next: from });
+        }
+        let next = scanned_to.max(from);
+        if next > from {
+            catch_up.replay_advanced(their_node, next);
+        }
+        return Ok(ReplayPage::Empty { next });
+    };
+    catch_up.replay_advanced(their_node, last);
+    if exhausted {
+        catch_up.replay_finished(their_node);
+        return Ok(ReplayPage::Done { next: last });
+    }
+    Ok(ReplayPage::Advanced { next: last })
+}
+
+/// What the replay did, by way and result, for `kimmy_replay_total{via,result}`.
+/// `inbound` is the replay a peer served on a connection it opened, `outbound` the
+/// one this member asked for on a connection it dialled.
+pub struct ReplayCounters {
+    cells: [[std::sync::atomic::AtomicU64; 4]; 2],
+}
+
+/// The result a replay page ended in.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ReplayResult {
+    /// This member sent a page to a peer that asked.
+    Served,
+    /// This member applied a page that carried entries of its own origin, the peer's
+    /// served or its own asked-for; an empty page is not counted.
+    Applied,
+    /// A page was refused as not what was asked for.
+    Refused,
+    /// The ack did not come in time, and the replay ended for that contact.
+    AckTimeout,
+}
+
+impl ReplayResult {
+    pub const ALL: [Self; 4] = [Self::Served, Self::Applied, Self::Refused, Self::AckTimeout];
+
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Served => "served",
+            Self::Applied => "applied",
+            Self::Refused => "refused",
+            Self::AckTimeout => "ack_timeout",
+        }
+    }
+}
+
+impl ReplayCounters {
+    const fn new() -> Self {
+        Self {
+            cells: [
+                [
+                    std::sync::atomic::AtomicU64::new(0),
+                    std::sync::atomic::AtomicU64::new(0),
+                    std::sync::atomic::AtomicU64::new(0),
+                    std::sync::atomic::AtomicU64::new(0),
+                ],
+                [
+                    std::sync::atomic::AtomicU64::new(0),
+                    std::sync::atomic::AtomicU64::new(0),
+                    std::sync::atomic::AtomicU64::new(0),
+                    std::sync::atomic::AtomicU64::new(0),
+                ],
+            ],
+        }
+    }
+
+    fn bump(&self, via: Via, result: ReplayResult) {
+        self.cells[via as usize][result as usize]
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    pub(crate) fn applied(&self, via: Via) {
+        self.bump(via, ReplayResult::Applied);
+    }
+
+    /// The count for one way and result, since start.
+    pub fn get(&self, inbound: bool, result: ReplayResult) -> u64 {
+        let via = if inbound { Via::Inbound } else { Via::Outbound };
+        self.cells[via as usize][result as usize].load(std::sync::atomic::Ordering::Relaxed)
+    }
+}
+
+static REPLAY_COUNTERS: ReplayCounters = ReplayCounters::new();
+
+/// The process's replay counters.
+pub fn replay_counters() -> &'static ReplayCounters {
+    &REPLAY_COUNTERS
+}
+
+/// How long a replay may spend serving one contact: the smaller of a second and a
+/// quarter of a request's timeout, so it never eats the ordinary round.
+pub(crate) const REPLAY_SERVE_TIME: Duration = {
+    let quarter = REQUEST_TIMEOUT.as_millis() as u64 / 4;
+    Duration::from_millis(if quarter < 1_000 { quarter } else { 1_000 })
+};
+
+/// How long the serving side waits for the ack of one page: well inside a round.
+pub(crate) const REPLAY_ACK_WAIT: Duration = Duration::from_secs(2);
+
+/// The most pages a replay serves on one contact.
+pub(crate) const REPLAY_MAX_PAGES: usize = 16;
+
+#[cfg(test)]
+thread_local! {
+    /// A test's own page cap, on the thread its round runs on.
+    static TEST_REPLAY_MAX_PAGES: std::cell::Cell<Option<usize>> = const { std::cell::Cell::new(None) };
+    /// A test's own serve time box, so a loaded runner cannot end a serve early.
+    static TEST_REPLAY_SERVE_TIME: std::cell::Cell<Option<Duration>> = const { std::cell::Cell::new(None) };
+    /// Pages the serve on this thread has sent since the test cleared it.
+    static TEST_REPLAY_PAGES_SENT: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+fn replay_serve_time() -> Duration {
+    #[cfg(test)]
+    if let Some(time) = TEST_REPLAY_SERVE_TIME.with(std::cell::Cell::get) {
+        return time;
+    }
+    REPLAY_SERVE_TIME
+}
+
+fn replay_max_pages() -> usize {
+    #[cfg(test)]
+    if let Some(cap) = TEST_REPLAY_MAX_PAGES.with(std::cell::Cell::get) {
+        return cap;
+    }
+    REPLAY_MAX_PAGES
+}
+
+/// How the replay served on a contact ended.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum ReplayServed {
+    /// The connection is in step and the round goes on: the replay ended
+    /// (answered, stalled, out of budget or pages), and the ordinary pull and
+    /// push follow on it.
+    InStep,
+    /// An ack did not come in time. The stream may still hold it, so nothing more
+    /// can be read from it: the round ends here, as a quiet end and not a failure.
+    OutOfStep,
+}
+
+/// Serve the replay a peer asked for on this connection (ADR-212's addendum):
+/// the entries this member holds of the **peer's own origin** above `asked`, in
+/// pages, each answered by an ack, until the peer has all of them, a page cap, the
+/// time box, a stall (which the ordinary pull must first clear) or a stop.
+///
+/// **A read only.** It takes no writer and runs under `kimmy_storage::blocking`.
+/// The cursor is this member's own last-sent stamp; the ack is a check on it, and
+/// the replay ends for this contact when the ack does not advance it.
+async fn serve_replay<S>(
+    engine: &Engine,
+    stream: &mut S,
+    peer: SocketAddr,
+    their_node: kimmy_core::NodeId,
+    theirs: &VersionVector,
+    asked: kimmy_core::Hlc,
+) -> Result<ReplayServed, ProtocolError>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
+    let started = Instant::now();
+    let counters = replay_counters();
+    let mut from = asked;
+    let mut sent_pages = 0usize;
+    loop {
+        if sent_pages >= replay_max_pages() || started.elapsed() >= replay_serve_time() {
+            return Ok(ReplayServed::InStep);
+        }
+        sent_pages += 1;
+        // What the peer holds of every other origin is "held", so the walk passes
+        // over it and serves only the peer's own entries above `from`.
+        let mut held = theirs.clone();
+        held.insert(their_node, from);
+        let servable = engine
+            .can_serve_peer_holding(&held)
+            .map_err(|e| ProtocolError::Local(e.to_string()))?;
+        let (entries, exhausted, horizon, scanned_to) = if !servable {
+            (Vec::new(), false, true, from)
+        } else {
+            let ours = engine.version_vector().map_err(|e| ProtocolError::Local(e.to_string()))?;
+            if ours.get(their_node) <= from {
+                // Nothing held above where the replay asks: the whole answer.
+                (Vec::new(), true, false, from)
+            } else {
+                let budget = kimmy_storage::ExamineBudget {
+                    time: replay_serve_time().saturating_sub(started.elapsed()),
+                    ..kimmy_storage::ExamineBudget::serve()
+                };
+                let window = match kimmy_storage::blocking(|| {
+                    let _walk = ServeWalk::begin(their_node);
+                    engine.serve_entries_to_peer(from, MAX_BATCH, Some(&held), &[], Some(budget))
+                }) {
+                    Ok(window) => window,
+                    Err(kimmy_storage::StorageError::Stopping(reason)) => {
+                        debug!(%reason, "stopped serving a peer's replay: this node is shutting down");
+                        return Ok(ReplayServed::InStep);
+                    }
+                    Err(e) => return Err(ProtocolError::Local(e.to_string())),
+                };
+                let mut entries: Vec<_> = window
+                    .entries
+                    .into_iter()
+                    .filter(|entry| entry.stamp.node == their_node && entry.stamp.hlc > from)
+                    .collect();
+                let mut exhausted = window.exhausted && window.passed_through.is_none();
+                if let Fits::Only(fits) = how_many_fit(&entries) {
+                    // This side sizes the page: the peer cannot negotiate a limit.
+                    entries.truncate(fits.max(1).min(entries.len()));
+                    exhausted = false;
+                }
+                (entries, exhausted, false, window.scanned_to)
+            }
+        };
+        let last_sent = entries.last().map(|entry| entry.stamp.hlc);
+        // The cursor after this page is this member's own: the last stamp sent, or
+        // where an empty page's walk reached.
+        let after = last_sent.unwrap_or(scanned_to).max(from);
+        let count = entries.len();
+        write_frame(stream, &Message::ReplayEntries { from, entries, exhausted, horizon }).await?;
+        counters.bump(Via::Inbound, ReplayResult::Served);
+        #[cfg(test)]
+        TEST_REPLAY_PAGES_SENT.with(|n| n.set(n.get() + 1));
+        let ack = match tokio::time::timeout(REPLAY_ACK_WAIT, read_frame(stream)).await {
+            Ok(frame) => frame?,
+            Err(_) => {
+                counters.bump(Via::Inbound, ReplayResult::AckTimeout);
+                warn!(
+                    %peer,
+                    "the peer did not acknowledge a page of the replay of its own origin in \
+                     time; the replay ends for this contact and goes on at the next"
+                );
+                return Ok(ReplayServed::OutOfStep);
+            }
+        };
+        match ack {
+            Message::ReplayAck { next_from, done, stalled } => {
+                info!(%peer, entries = count, exhausted, done, "served a page of a peer's replay");
+                if done || stalled.is_some() || horizon || exhausted {
+                    return Ok(ReplayServed::InStep);
+                }
+                // The ack is a check, not the cursor: a peer that does not advance
+                // past what was sent, or past where the last page began, ends it.
+                if next_from <= from || last_sent.is_some_and(|sent| next_from < sent) {
+                    return Ok(ReplayServed::InStep);
+                }
+                if after <= from {
+                    return Ok(ReplayServed::InStep);
+                }
+                from = after;
+            }
+            Message::Fault(reason) => return Err(ProtocolError::Fault(reason)),
+            other => {
+                return Err(ProtocolError::Malformed(format!(
+                    "expected ReplayAck for a page of a replay, got {other:?}"
+                )));
+            }
         }
     }
 }
@@ -1435,8 +1907,10 @@ where
     let (frame, undecodable, decoded_seq) =
         crate::protocol::read_frame_noting_facts(stream).await?;
     let mut their_facts = None;
+    let mut asked_replay = None;
     let (theirs, their_witnessed) = match frame {
-        Message::Vectors { servable, witnessed, facts, facts_gen, echo } => {
+        Message::Vectors { servable, witnessed, facts, facts_gen, echo, replay_from } => {
+            asked_replay = replay_from;
             if undecodable {
                 stalls.facts_undecodable.push(their_node);
             }
@@ -1473,6 +1947,18 @@ where
         witnessed: their_witnessed.clone(),
         facts: their_facts,
     });
+
+    // The replay this peer asked for, answered **before** the ordinary pull and push
+    // (ADR-212's addendum): a push naming a collection the peer's lost DDL created
+    // would otherwise stop at an unknown collection. A read only, time-boxed, and it
+    // never costs the round: when it ends the ordinary round goes on, unless an ack
+    // did not come and the stream may still hold it, which ends the round quietly.
+    if let Some(asked) = asked_replay
+        && serve_replay(engine, stream, peer, their_node, &theirs, asked).await?
+            == ReplayServed::OutOfStep
+    {
+        return Ok(SyncOutcome::default());
+    }
 
     // This run's replay of its own origin (ADR-202), once against each distinct
     // peer, the first time it is reached: what that peer holds of this member's
@@ -3696,6 +4182,9 @@ pub(crate) mod test_serving {
 mod yield_tests;
 
 #[cfg(test)]
+mod replay_tests;
+
+#[cfg(test)]
 mod tests {
     use super::*;
 
@@ -4766,6 +5255,7 @@ mod tests {
             facts: None,
             facts_gen: None,
             echo: None,
+            replay_from: None,
         };
         let peer = tokio::spawn(fake_peer(theirs, answer));
         let mut stalls = PeerStalls::new();
@@ -4997,6 +5487,7 @@ mod tests {
             facts: Some(Arc::new(answered.clone())),
             facts_gen: Some(8),
             echo: None,
+            replay_from: None,
         };
         let far = tokio::spawn(peer(theirs, answer, Some(sent)));
         let _ = sync_over(&engine, ours, addr, node(9), None, &mut stalls).await;
@@ -5019,6 +5510,7 @@ mod tests {
             facts: None,
             facts_gen: None,
             echo: None,
+            replay_from: None,
         };
         let far = tokio::spawn(peer(theirs, bare, None));
         let _ = sync_over(&engine, ours, addr, node(9), None, &mut stalls).await;
@@ -5050,6 +5542,7 @@ mod tests {
                 facts: None,
                 facts_gen: None,
                 echo: None,
+                replay_from: None,
             };
             write_frame(&mut stream, &answer).await.unwrap();
             // Asked for entries, it hangs up: the round fails here.
@@ -5107,6 +5600,7 @@ mod tests {
                 facts: None,
                 facts_gen: None,
                 echo: None,
+                replay_from: None,
             };
             write_frame(&mut stream, &answer).await.unwrap();
             match read_frame(&mut stream).await.unwrap() {
@@ -5221,6 +5715,7 @@ mod tests {
                 facts: None,
                 facts_gen: None,
                 echo: None,
+                replay_from: None,
             };
             write_frame(&mut stream, &answer).await.unwrap();
             match read_frame(&mut stream).await.unwrap() {
@@ -5301,6 +5796,7 @@ mod tests {
                 facts: None,
                 facts_gen: None,
                 echo: None,
+                replay_from: None,
             };
             write_frame(&mut stream, &answer).await.unwrap();
             match read_frame(&mut stream).await.unwrap() {
@@ -5473,6 +5969,7 @@ mod tests {
                 facts: None,
                 facts_gen: None,
                 echo: None,
+                replay_from: None,
             };
             write_frame(&mut stream, &answer).await.unwrap();
             match read_frame(&mut stream).await.unwrap() {
@@ -5639,6 +6136,7 @@ mod tests {
                 facts: None,
                 facts_gen: None,
                 echo: None,
+                replay_from: None,
             };
             write_frame(&mut stream, &answer).await.unwrap();
             match read_frame(&mut stream).await.unwrap() {
@@ -5748,6 +6246,7 @@ mod tests {
                 facts: None,
                 facts_gen: None,
                 echo: None,
+                replay_from: None,
             };
             write_frame(&mut stream, &answer).await.unwrap();
             // A round that fails before a page lands: the peer goes away.
@@ -5985,6 +6484,7 @@ mod tests {
                 facts: None,
                 facts_gen: None,
                 echo: None,
+                replay_from: None,
             };
             write_frame(&mut stream, &answer).await.unwrap();
             match read_frame(&mut stream).await.unwrap() {
@@ -6793,6 +7293,7 @@ mod tests {
             facts: None,
             facts_gen: None,
             echo: None,
+            replay_from: None,
         };
         write_frame(&mut stream, &answer).await.unwrap();
         match read_frame(&mut stream).await.unwrap() {
@@ -6957,6 +7458,7 @@ mod tests {
                 facts: None,
                 facts_gen: None,
                 echo: None,
+                replay_from: None,
             };
             write_frame(&mut peer_end, &answer).await.unwrap();
             let _ = read_frame(&mut peer_end).await;
@@ -6996,6 +7498,7 @@ mod tests {
                 facts: None,
                 facts_gen: None,
                 echo: None,
+                replay_from: None,
             };
             write_frame(&mut peer_end, &answer).await.unwrap();
             let _ = read_frame(&mut peer_end).await;
@@ -7067,6 +7570,7 @@ mod tests {
                 facts: None,
                 facts_gen: None,
                 echo: None,
+                replay_from: None,
             };
             write_frame(&mut peer_end, &answer).await.unwrap();
             let _ = read_frame(&mut peer_end).await;
@@ -7168,6 +7672,7 @@ mod tests {
                 facts: None,
                 facts_gen: None,
                 echo: None,
+                replay_from: None,
             };
             write_frame(&mut stream, &answer).await.unwrap();
             let _ = read_frame(&mut stream).await;

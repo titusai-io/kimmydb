@@ -410,6 +410,10 @@ pub struct MetricsSnapshot {
     /// them, whose ratio to the confirmations is the coalescing.
     pub ddl_confirmations: [u64; kimmy_cluster::ConfirmOutcome::COUNT],
     pub ddl_confirm_pushes: u64,
+    /// The restored-member replay, `[inbound, outbound]` by
+    /// `ReplayResult::ALL` order: what the process-wide counters hold plus what
+    /// was recorded here (the tests' door).
+    pub replay: [[u64; 4]; 2],
     /// Peer connections this node failed to serve, by reason, in
     /// `ServeFailure::ALL` order.
     pub sync_serve_failures: [u64; kimmy_cluster::ServeFailure::COUNT],
@@ -535,6 +539,8 @@ pub struct Metrics {
     sync_ddl_held_push: AtomicU64,
     ddl_confirmations: [AtomicU64; kimmy_cluster::ConfirmOutcome::COUNT],
     ddl_confirm_pushes: AtomicU64,
+    /// [`Self::record_replay`]'s count, added to the transport's own counters.
+    replay_recorded: [[AtomicU64; 4]; 2],
     sync_serve_failures: [AtomicU64; kimmy_cluster::ServeFailure::COUNT],
     accept_errors: [AtomicU64; kimmy_cluster::AcceptListener::COUNT],
     sync_divergent_collections: AtomicU64,
@@ -658,6 +664,7 @@ impl Default for Metrics {
             sync_ddl_held_push: AtomicU64::new(0),
             ddl_confirmations: std::array::from_fn(|_| AtomicU64::new(0)),
             ddl_confirm_pushes: AtomicU64::new(0),
+            replay_recorded: std::array::from_fn(|_| std::array::from_fn(|_| AtomicU64::new(0))),
             sync_serve_failures: std::array::from_fn(|_| AtomicU64::new(0)),
             accept_errors: std::array::from_fn(|_| AtomicU64::new(0)),
             sync_divergent_collections: AtomicU64::new(0),
@@ -968,6 +975,25 @@ impl Metrics {
 
     /// One accept error that was `listener`'s own: out of descriptors or
     /// memory, not one client's connection going away first.
+    /// Counts one replay result as the transport would, without a cluster: for
+    /// tests of the series. A running node's counts come from the transport's
+    /// process-wide counters, which [`Self::snapshot`] adds.
+    pub fn record_replay(&self, inbound: bool, result: kimmy_cluster::ReplayResult) {
+        self.replay_recorded[usize::from(!inbound)][result as usize]
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// `[inbound, outbound][result]` since start.
+    fn replay_totals(&self) -> [[u64; 4]; 2] {
+        let live = kimmy_cluster::replay_counters();
+        std::array::from_fn(|way| {
+            std::array::from_fn(|slot| {
+                let result = kimmy_cluster::ReplayResult::ALL[slot];
+                self.get(&self.replay_recorded[way][slot]) + live.get(way == 0, result)
+            })
+        })
+    }
+
     pub fn record_accept_error(&self, listener: kimmy_cluster::AcceptListener) {
         self.accept_errors[listener.slot()].fetch_add(1, Ordering::Relaxed);
     }
@@ -1269,6 +1295,7 @@ impl Metrics {
             sync_ddl_held_push: self.get(&self.sync_ddl_held_push),
             ddl_confirmations: std::array::from_fn(|slot| self.get(&self.ddl_confirmations[slot])),
             ddl_confirm_pushes: self.get(&self.ddl_confirm_pushes),
+            replay: self.replay_totals(),
             accept_errors: std::array::from_fn(|slot| self.get(&self.accept_errors[slot])),
             sync_serve_failures: std::array::from_fn(|slot| {
                 self.get(&self.sync_serve_failures[slot])
@@ -1389,6 +1416,21 @@ impl Metrics {
                     reason.label(),
                     self.get(&self.sync_serve_failures[reason.slot()])
                 )
+            })
+            .collect::<String>();
+        // One line per way and result, always.
+        let replay_series = self
+            .replay_totals()
+            .iter()
+            .zip(["inbound", "outbound"])
+            .flat_map(|(row, via)| {
+                kimmy_cluster::ReplayResult::ALL.iter().map(move |result| {
+                    format!(
+                        "kimmy_replay_total{{via=\"{via}\",result=\"{}\"}} {}\n",
+                        result.label(),
+                        row[*result as usize]
+                    )
+                })
             })
             .collect::<String>();
         let accept_errors = kimmy_cluster::AcceptListener::ALL
@@ -1619,6 +1661,9 @@ impl Metrics {
              # HELP kimmy_ddl_confirm_pushes_total Windows pushed to members to confirm schema changes (ADR-191). At most one is in flight per member, and each carries everything queued for it, so in a burst this rises far slower than kimmy_ddl_confirmations_total.\n\
              # TYPE kimmy_ddl_confirm_pushes_total counter\n\
              kimmy_ddl_confirm_pushes_total {ddl_confirm_pushes}\n\
+             # HELP kimmy_replay_total The restored-member replay (ADR-212): pages of a restored member's own writes that a peer holds, by way and result. inbound: a peer that contacted this member served them; outbound: this member asked on a connection it dialled. served: a page this member sent to a peer that asked; applied: a page carrying this member's own entries applied here (an empty page is not counted); refused: a page that was not what was asked for; ack_timeout: the acknowledgement did not come and the replay ended for that contact (the ordinary pull still ran). A restored member that rises on outbound but never on inbound cannot be dialled, which is the case inbound exists for.\n\
+             # TYPE kimmy_replay_total counter\n\
+             {replay_series}\
              # HELP kimmy_sync_ddl_relogged_total Schema changes a snapshot restore appended to this node's oplog so that it can serve them onward. Not an error: 0 on a member that never caught up by snapshot, and one per index definition a snapshot restored where it did not already hold the entry.\n\
              # TYPE kimmy_sync_ddl_relogged_total counter\n\
              kimmy_sync_ddl_relogged_total {sync_ddl_relogged}\n\
@@ -2522,6 +2567,14 @@ mod tests {
                 m.record_sync_serve_failure(reason);
             }
         }
+        // Likewise per way and result: 160.. inbound, 170.. outbound.
+        for (way, inbound) in [true, false].into_iter().enumerate() {
+            for result in kimmy_cluster::ReplayResult::ALL {
+                for _ in 0..(160 + way * 10 + result as usize) {
+                    m.record_replay(inbound, result);
+                }
+            }
+        }
         // Likewise per listener: 150 for the first, 151 for the second.
         for listener in kimmy_cluster::AcceptListener::ALL {
             for _ in 0..(150 + listener.slot()) {
@@ -3276,6 +3329,16 @@ kimmy_ddl_confirmations_total{outcome=\"cancelled\"} 131
 # HELP kimmy_ddl_confirm_pushes_total Windows pushed to members to confirm schema changes (ADR-191). At most one is in flight per member, and each carries everything queued for it, so in a burst this rises far slower than kimmy_ddl_confirmations_total.
 # TYPE kimmy_ddl_confirm_pushes_total counter
 kimmy_ddl_confirm_pushes_total 137
+# HELP kimmy_replay_total The restored-member replay (ADR-212): pages of a restored member's own writes that a peer holds, by way and result. inbound: a peer that contacted this member served them; outbound: this member asked on a connection it dialled. served: a page this member sent to a peer that asked; applied: a page carrying this member's own entries applied here (an empty page is not counted); refused: a page that was not what was asked for; ack_timeout: the acknowledgement did not come and the replay ended for that contact (the ordinary pull still ran). A restored member that rises on outbound but never on inbound cannot be dialled, which is the case inbound exists for.
+# TYPE kimmy_replay_total counter
+kimmy_replay_total{via=\"inbound\",result=\"served\"} 160
+kimmy_replay_total{via=\"inbound\",result=\"applied\"} 161
+kimmy_replay_total{via=\"inbound\",result=\"refused\"} 162
+kimmy_replay_total{via=\"inbound\",result=\"ack_timeout\"} 163
+kimmy_replay_total{via=\"outbound\",result=\"served\"} 170
+kimmy_replay_total{via=\"outbound\",result=\"applied\"} 171
+kimmy_replay_total{via=\"outbound\",result=\"refused\"} 172
+kimmy_replay_total{via=\"outbound\",result=\"ack_timeout\"} 173
 # HELP kimmy_sync_ddl_relogged_total Schema changes a snapshot restore appended to this node's oplog so that it can serve them onward. Not an error: 0 on a member that never caught up by snapshot, and one per index definition a snapshot restored where it did not already hold the entry.
 # TYPE kimmy_sync_ddl_relogged_total counter
 kimmy_sync_ddl_relogged_total 91
@@ -3832,6 +3895,15 @@ kimmy_storage_cache_reads_total{result=\"miss\"} 9104
             ));
         }
         expect(&format!("kimmy_ddl_confirm_pushes_total {}\n", s.ddl_confirm_pushes));
+        for (row, via) in s.replay.iter().zip(["inbound", "outbound"]) {
+            for result in kimmy_cluster::ReplayResult::ALL {
+                expect(&format!(
+                    "kimmy_replay_total{{via=\"{via}\",result=\"{}\"}} {}\n",
+                    result.label(),
+                    row[result as usize]
+                ));
+            }
+        }
         expect(&format!("kimmy_sync_ddl_relogged_total {}\n", s.sync_ddl_relogged));
         expect(&format!("kimmy_sync_divergent_collections {}\n", s.sync_divergent_collections));
         expect(&format!(
@@ -4223,6 +4295,8 @@ kimmy_storage_cache_reads_total{result=\"miss\"} 9104
                 // Schema-change confirmations by outcome, and the pushes
                 // made for them (ADR-191).
                 + kimmy_cluster::ConfirmOutcome::COUNT
+                // The restored-member replay, by way and result (ADR-212).
+                + 2 * kimmy_cluster::ReplayResult::ALL.len()
                 // The storage engine's page cache: its fill, its evictions,
                 // and its reads hit and missed; only with its statistics.
                 + if cfg!(feature = "storage-cache-metrics") { 4 } else { 0 }

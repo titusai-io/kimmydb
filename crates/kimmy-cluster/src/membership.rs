@@ -165,6 +165,10 @@ struct MembersInner {
     next: std::sync::atomic::AtomicU64,
     /// This member's own block, once the daemon has given a source for it.
     local: std::sync::OnceLock<LocalFacts>,
+    /// The catching-up marker and its replay, once the daemon has given them: what a
+    /// connection served here asks the peer for, and applies, when this member's
+    /// replay of its own origin is owed (ADR-212's addendum).
+    catch_up: std::sync::OnceLock<Arc<crate::catchup::CatchUp>>,
     /// The last block each peer sent (ADR-201), and the floors that keep an
     /// earlier-decoded block from coming back after a drop (ADR-213).
     ///
@@ -234,6 +238,17 @@ impl PeerView {
 }
 
 impl Members {
+    /// Give the connections served from this handle the catching-up state. Set
+    /// once, at start.
+    pub fn set_catch_up(&self, catch_up: Arc<crate::catchup::CatchUp>) {
+        let _ = self.0.catch_up.set(catch_up);
+    }
+
+    /// The catching-up state, if the daemon gave it.
+    pub fn catch_up(&self) -> Option<&Arc<crate::catchup::CatchUp>> {
+        self.0.catch_up.get()
+    }
+
     /// Peer addresses, for anything that needs to dial one.
     pub fn snapshot(&self) -> BTreeSet<SocketAddr> {
         self.0.live.read().keys().copied().collect()

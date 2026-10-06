@@ -3720,8 +3720,37 @@ async fn without_expected_members_two_fresh_members_clear_against_each_other() {
 #[tokio::test]
 #[ignore = "boots a real three-node cluster; run with --ignored"]
 async fn a_member_restored_from_a_backup_reads_back_the_writes_it_made_after_it() {
+    restore_and_read_back(false).await;
+}
+
+/// The same restore, but the restored member cannot dial either peer
+/// (`KIMMY_TEST_REFUSE_DIAL` names the one peer that holds the lost writes; the other is down), as behind a filter that
+/// drops what it opens and lets in what the peers open. Its only road to the writes
+/// it lost is the peers' own contacts, which serve the replay (ADR-212's addendum).
+/// The switch is armed before the first tick, and the counters assert the way: pages
+/// applied inbound, none outbound.
+#[tokio::test]
+#[ignore = "boots a real three-node cluster; run with --ignored"]
+async fn a_restored_member_that_cannot_dial_reads_its_writes_back_over_its_peers_contacts() {
+    restore_and_read_back(true).await;
+}
+
+/// `kimmy_replay_total{via,result}` on a member.
+async fn replay_count(client: &reqwest::Client, node: &Node, via: &str, result: &str) -> u64 {
+    let series = format!("kimmy_replay_total{{via=\"{via}\",result=\"{result}\"}} ");
+    let body = client.get(node.url("/metrics")).send().await.unwrap().text().await.unwrap();
+    body.lines()
+        .find_map(|line| line.strip_prefix(&series))
+        .and_then(|n| n.trim().parse().ok())
+        .expect("the replay series is always rendered")
+}
+
+/// Restore member A from a backup that lacks its later writes, start it (refusing
+/// to dial its peers when `refuse_dial`), and check it reads them all back and
+/// clears.
+async fn restore_and_read_back(refuse_dial: bool) {
     let client = reqwest::Client::new();
-    let (mut a, b, c) = three_nodes(&client).await;
+    let (mut a, mut b, mut c) = three_nodes(&client).await;
     eventually("gossip to form", || all_report(&client, vec![&a, &b, &c], 2)).await;
     let token = a.login(&client).await;
     client
@@ -3754,11 +3783,18 @@ async fn a_member_restored_from_a_backup_reads_back_the_writes_it_made_after_it(
     assert_eq!(backup.status(), 200);
     let backup_path = a.dir.path().join("backup.bin");
     std::fs::write(&backup_path, backup.bytes().await.unwrap()).unwrap();
+    // With the dial refused, one peer is down for the later writes and returns knowing nothing of them, so the one that
+    // is up and holds them is the one the member cannot dial.
+    if refuse_dial {
+        b.signal("TERM");
+        b.wait_exit(Duration::from_secs(60));
+    }
     for id in 4..=8 {
         insert(id).await;
     }
     // Held by a peer before the member is lost.
-    for node in [&b, &c] {
+    let holders = if refuse_dial { vec![&c] } else { vec![&b, &c] };
+    for node in holders {
         let token = node.login(&client).await;
         eventually("a peer to hold the later writes", || {
             let (client, url, token) =
@@ -3766,6 +3802,18 @@ async fn a_member_restored_from_a_backup_reads_back_the_writes_it_made_after_it(
             async move { client.get(url).bearer_auth(&token).send().await.unwrap().status() == 200 }
         })
         .await;
+    }
+
+    // The down peer returns, unable to dial the one that holds the writes, so it
+    // stays as ignorant as it was and the member can reach it but learns nothing there.
+    if refuse_dial {
+        // The returning peer dials neither the holder nor the member (still running),
+        // and the holder does not dial it, so nothing reaches it (a push would).
+        let b_refuses = format!("127.0.0.1:{},127.0.0.1:{}", c.cluster, a.cluster);
+        b.restart_with(&[("KIMMY_TEST_REFUSE_DIAL", &b_refuses)]);
+        c.restart_with(&[("KIMMY_TEST_REFUSE_DIAL", &format!("127.0.0.1:{}", b.cluster))]);
+        b.wait_ready(&client).await;
+        c.wait_ready(&client).await;
     }
 
     // The member is stopped, its data replaced by the restore, and started again.
@@ -3782,7 +3830,12 @@ async fn a_member_restored_from_a_backup_reads_back_the_writes_it_made_after_it(
         .output()
         .expect("running kimmyd restore");
     assert!(restored.status.success(), "{}", String::from_utf8_lossy(&restored.stderr));
-    a.restart_with(&[]);
+    let refused = format!("127.0.0.1:{}", c.cluster);
+    if refuse_dial {
+        a.restart_with(&[("KIMMY_TEST_REFUSE_DIAL", &refused)]);
+    } else {
+        a.restart_with(&[]);
+    }
     a.wait_ready(&client).await;
 
     // It reads back what it made and lost, and says so.
@@ -3804,6 +3857,17 @@ async fn a_member_restored_from_a_backup_reads_back_the_writes_it_made_after_it(
         "the replay says what it found: {}",
         a.log()
     );
+    if refuse_dial {
+        assert!(
+            replay_count(&client, &a, "inbound", "applied").await > 0,
+            "the replay came over the peers' contact"
+        );
+        assert_eq!(
+            replay_count(&client, &a, "outbound", "applied").await,
+            0,
+            "this member dialled nobody that held its writes"
+        );
+    }
 }
 
 /// Pulls the integer value out of a `key=123` field in a log line, such as

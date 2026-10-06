@@ -24272,6 +24272,51 @@ marker key. 0.43's reader of the floor file reads `floor_ms` and
 with `owed` lines. Rolling back brings back the one-tick settle and the clear
 past the hold.
 
+**Addendum, 0.45.0: the replay also rides the restored member's inbound
+contacts.** The defect above leaves a member owing the replay whenever a peer
+that holds the lost writes cannot be dialled *by the restored member*: a rule
+that drops what A opens and lets in what C opens is the same case as "its cluster
+port is filtered from A", and A then waits on C with the writes one hop away. The
+peer can reach A, so A now asks over the contact the peer opened.
+
+- **The ask.** While a restored member owes a peer the replay, the `Vectors`
+  frame it sends in answer to an inbound contact carries `replay_from`, the
+  cursor its outbound ask would have used. The field is optional and
+  skipped when absent, so a 0.44 peer neither sends nor reads it.
+- **The serve.** The peer (the dialler, which holds the entries) serves the same
+  window of A's own origin it would have served on A's ask, as `ReplayEntries`
+  pages (at most 16 a contact, each sized by the holder), before the ordinary
+  pull on that connection, within a sub-budget of the smaller of one second and a
+  quarter of the request timeout. It is a read: no write gate is taken, and a
+  held writer on the peer does not delay it.
+- **The apply.** A applies a page through the same `replay_apply` as the
+  outbound replay and answers `ReplayAck {next_from, done, stalled}`. A page that
+  A did not ask for on this connection, that does not start at A's running cursor,
+  that is oversize, unordered, of another origin or below `from` is refused as
+  malformed. The ack is a check, not a command: the peer trusts its own cursor.
+- **No livelock.** A page naming a collection A lacks, or one A is purging,
+  *stalls*: the ack says so (`stalled`), the replay ends for that contact only,
+  and the ordinary pull that follows, or the next contact, brings the
+  collection. An empty page that is not the end only advances the cursor. A
+  replay finishes only on `exhausted`. An ack that does not advance, or that is
+  not read within two seconds, ends the replay for the contact and does not fail
+  it.
+- **Counted** on `kimmy_replay_total{via,result}`: `inbound` or `outbound`; `served`,
+  `applied`, `refused`, `ack_timeout`.
+- **Test switch.** `KIMMY_TEST_REFUSE_DIAL=<addr|node id>[,...]` makes one member
+  dial the named peers none, while theirs to it go on: the one-way partition
+  `KIMMY_TEST_REFUSE_SYNC` cannot make.
+
+*A stalled page* does not advance the member's cursor, as `replay_own_origin` never did: the next contact re-sends from the last fully acknowledged page, which is idempotent.
+
+*Stated limits.* A member that can dial nobody still cannot clear: clearing needs
+an ordinary pull from a counting peer, which the replay does not replace. This
+removes the owed-replay case for a partition that is one way per peer pair.
+
+*Rollback.* No rollback boundary. A 0.44 peer ignores `replay_from` (a restored
+0.45 member then waits as it did, on its own dial) and a 0.44 restored member
+never sends it.
+
 **Rejected.**
 
 - *Gating until every owing member answers:* one member that never answers

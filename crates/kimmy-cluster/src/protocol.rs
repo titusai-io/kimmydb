@@ -84,6 +84,13 @@ fn lenient_generation<'de, D: serde::Deserializer<'de>>(
     crate::facts::lenient_millis(deserializer)
 }
 
+/// A position on a frame, read leniently: anything that is not one reads as
+/// absent, so a field of another shape costs the field and never the frame.
+fn lenient_hlc<'de, D: serde::Deserializer<'de>>(deserializer: D) -> Result<Option<Hlc>, D::Error> {
+    let raw = Option::<bson::Bson>::deserialize(deserializer)?;
+    Ok(raw.and_then(|raw| bson::deserialize_from_bson::<Hlc>(raw).ok()))
+}
+
 /// An echo, read leniently: one that does not decode is none, which reads as a
 /// peer that does not echo.
 fn lenient_echo<'de, D: serde::Deserializer<'de>>(
@@ -91,6 +98,15 @@ fn lenient_echo<'de, D: serde::Deserializer<'de>>(
 ) -> Result<Option<Echo>, D::Error> {
     let raw = Option::<bson::Bson>::deserialize(deserializer)?;
     Ok(raw.and_then(|raw| bson::deserialize_from_bson::<Echo>(raw).ok()))
+}
+
+/// Why a replay page could not be applied yet, and is not a failure.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ReplayStall {
+    /// A page named a collection this member does not hold yet.
+    UnknownCollection,
+    /// A page named a collection whose drop this member is still purging.
+    PurgePending,
 }
 
 /// What one side says to the other.
@@ -186,6 +202,17 @@ pub enum Message {
             deserialize_with = "lenient_echo"
         )]
         echo: Option<Echo>,
+        /// This member's replay of its own origin is armed and the requester has
+        /// not answered it: the position the replay asks from, so the requester
+        /// serves it on this connection (ADR-212's addendum). Absent when there
+        /// is nothing to ask, and from an older answerer, which an older
+        /// requester reads by ignoring the key.
+        #[serde(
+            default,
+            skip_serializing_if = "Option::is_none",
+            deserialize_with = "lenient_hlc"
+        )]
+        replay_from: Option<Hlc>,
     },
     /// "Send me everything at or after this point."
     ///
@@ -287,6 +314,29 @@ pub enum Message {
     /// pulls a snapshot; per origin, nothing it lacks was collected and it is
     /// served the entry (ADR-097).
     BeyondHorizon {},
+    /// A page of the entries the requester holds of the **answerer's own origin**
+    /// above `from`, sent on a connection whose `Vectors` asked for them
+    /// (`replay_from`). `exhausted` says the sender holds nothing more above this
+    /// page; `horizon` says it has collected the oplog below `from` and cannot
+    /// say. Only ever sent to a peer that asked, so an older build never meets it.
+    ReplayEntries {
+        from: Hlc,
+        entries: Vec<OplogEntry>,
+        exhausted: bool,
+        #[serde(default)]
+        horizon: bool,
+    },
+    /// The answer to [`Message::ReplayEntries`]: where the replay stands now.
+    /// `next_from` is the position it asks from next; `done` that the sender has
+    /// answered it completely; `stalled` that a page named something this member
+    /// must first receive by the ordinary pull, so the replay stops for this
+    /// contact and goes on at the next, with nothing answered.
+    ReplayAck {
+        next_from: Hlc,
+        done: bool,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        stalled: Option<ReplayStall>,
+    },
     /// "Send me current state instead of history."
     ///
     /// `collection` scopes the snapshot to one collection (ADR-152): a
@@ -804,6 +854,7 @@ mod tests {
                 facts: None,
                 facts_gen: None,
                 echo: None,
+                replay_from: None,
             },
             Message::Entries {
                 entries: Vec::new(),
@@ -1374,6 +1425,7 @@ mod tests {
                 facts: Some(std::sync::Arc::new(facts.clone())),
                 facts_gen: None,
                 echo: None,
+                replay_from: None,
             },
         ] {
             let mut written = Vec::new();
@@ -1447,6 +1499,7 @@ mod tests {
             facts: Some(std::sync::Arc::new(facts)),
             facts_gen: None,
             echo: None,
+            replay_from: None,
         };
         write_frame(&mut wire, &full).await.unwrap();
         assert_eq!(read_frame(&mut wire.as_slice()).await.unwrap(), full);
@@ -1459,6 +1512,7 @@ mod tests {
                 facts: None,
                 facts_gen: None,
                 echo: None,
+                replay_from: None,
             },
         )
         .await

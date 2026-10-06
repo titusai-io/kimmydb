@@ -46,6 +46,16 @@ breaking changes and says so here; a `0.x.PATCH` bump never does.
   now absent until six ticks have been judged, where it read false. No rollback
   boundary.
 
+- **A restored member now reads its lost writes back over its peers' contacts
+  too.** A member restored from a backup asked the peers that hold its later
+  writes only on connections it opened, so a firewall that dropped what it opened
+  and let in what the peers opened left it owing the replay (serving as
+  `unknown`, `owed_replay`) with the writes one hop away. It now asks on the
+  contacts its peers open as well. No configuration, and no action on upgrade:
+  a 0.44 peer ignores the ask and the member waits as before. Counted on
+  `kimmy_replay_total{via,result}`. A member that can dial nobody still cannot
+  clear. See operations.md, "Serving as `unknown` because a member owes the
+  replay", and ADR-212's addendum. `KIMMY_TEST_REFUSE_DIAL` is a new test switch.
 - **A `$let` variable the body does not read can no longer fail the expression.**
   `$let` evaluated every variable before its body, so a guard that kept the body
   from reading a variable did not keep the variable from failing: `{$let: {vars:

@@ -99,6 +99,33 @@ fn parse_hold_writer(value: &str) -> Result<HoldWriter, String> {
     Ok(HoldWriter { ms, holder })
 }
 
+/// `KIMMY_TEST_REFUSE_DIAL`: one or more peers, comma-separated, each a cluster
+/// `host:port` address or a node id. Anything else refuses the start, so a typo
+/// cannot leave a test believing a peer is unreachable when it is not.
+fn parse_refuse_dial(value: &str) -> Result<Vec<kimmy_cluster::transport::DialRefusal>, String> {
+    use kimmy_cluster::transport::DialRefusal;
+    let bad = |entry: &str| {
+        format!(
+            "KIMMY_TEST_REFUSE_DIAL={value:?}: {entry:?} is neither a `host:port` address nor a \
+             node id"
+        )
+    };
+    let mut peers = Vec::new();
+    for entry in value.split(',').map(str::trim) {
+        if entry.is_empty() {
+            return Err(bad(entry));
+        }
+        if let Ok(addr) = entry.parse::<std::net::SocketAddr>() {
+            peers.push(DialRefusal::Address(addr));
+        } else if let Ok(node) = entry.parse::<kimmy_core::NodeId>() {
+            peers.push(DialRefusal::Node(node));
+        } else {
+            return Err(bad(entry));
+        }
+    }
+    Ok(peers)
+}
+
 fn parse_stall_runtime(value: &str) -> Result<StallRuntime, String> {
     let bad = || {
         format!(
@@ -127,6 +154,9 @@ pub struct TestSwitches {
     /// `KIMMY_TEST_HOLD_WRITER=<ms>,<holder>`: take the writer as `holder` and hold
     /// it for `ms` once the node serves (ADR-220).
     pub hold_writer: Option<HoldWriter>,
+    /// `KIMMY_TEST_REFUSE_DIAL=<node id or address>[,...]`: this member dials none of
+    /// these peers from the start; theirs to it go on (ADR-212's addendum).
+    pub refuse_dial: Vec<kimmy_cluster::transport::DialRefusal>,
     /// What each switch said, for the announcement: `(variable, value, note)`.
     pub notes: Vec<(&'static str, String, String)>,
 }
@@ -230,6 +260,17 @@ impl TestSwitches {
                     .into(),
             ));
         }
+        if let Some(value) = var("KIMMY_TEST_REFUSE_DIAL") {
+            let peers = parse_refuse_dial(&value)?;
+            switches.refuse_dial = peers;
+            switches.notes.push((
+                "KIMMY_TEST_REFUSE_DIAL",
+                value,
+                "makes this member dial none of the named peers from the start, while theirs to \
+                 it go on: a one-way partition (REFUSE_SYNC, if also set, dominates)"
+                    .into(),
+            ));
+        }
         Ok(switches)
     }
 
@@ -242,6 +283,19 @@ impl TestSwitches {
                 value = %value,
                 "a test switch is set that {note}; unset it outside a test"
             );
+        }
+    }
+
+    /// Arm what is a fault from the start, before anything dials: the refused
+    /// peers. A partition exists before the member does, so no outbound contact
+    /// may slip through ahead of it (the replay's direction is proved on it).
+    pub fn arm_at_start(&self) {
+        if !self.refuse_dial.is_empty() {
+            info!(
+                peers = self.refuse_dial.len(),
+                "test switch armed from the start: this member dials none of the named peers"
+            );
+            kimmy_cluster::transport::set_test_refuse_dial(self.refuse_dial.clone());
         }
     }
 
@@ -522,6 +576,25 @@ mod tests {
         TestSwitches::read(|name| {
             vars.iter().find(|(k, _)| *k == name).map(|(_, v)| (*v).to_string())
         })
+    }
+
+    /// Addresses and node ids, comma-separated, are read; anything else refuses the start.
+    #[test]
+    fn the_refuse_dial_switch_reads_addresses_and_node_ids_and_refuses_the_rest() {
+        use kimmy_cluster::transport::DialRefusal;
+        let node = kimmy_core::NodeId::generate();
+        let both = format!("10.0.0.7:7000, {node}");
+        let parsed = parse_refuse_dial(&both).unwrap();
+        assert_eq!(
+            parsed,
+            vec![DialRefusal::Address("10.0.0.7:7000".parse().unwrap()), DialRefusal::Node(node)]
+        );
+        for bad in ["", "kimmy2", "10.0.0.7", "10.0.0.7:7000,", ",", "10.0.0.7:7000;x"] {
+            assert!(parse_refuse_dial(bad).is_err(), "{bad:?} must refuse");
+        }
+        let switches = read(&[("KIMMY_TEST_REFUSE_DIAL", "10.0.0.7:7000")]).unwrap();
+        assert_eq!(switches.refuse_dial.len(), 1);
+        assert!(read(&[("KIMMY_TEST_REFUSE_DIAL", "nonsense")]).is_err());
     }
 
     /// Unset or `on` is on and `off` is off, in any case; any other value refuses.
