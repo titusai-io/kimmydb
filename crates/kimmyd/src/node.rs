@@ -1258,6 +1258,23 @@ async fn start_and_serve(
         }
     };
 
+    // What a database's drop covers and this member still holds is buried before
+    // it serves, the cluster is spawned or the purger starts (ADR-229): a drop
+    // a member on the previous build applied as a plain collection drop, one
+    // that stopped between its tombstone and its burials, a restore. The
+    // purger's first turn finds the burials owed. A stop ends it at a safe
+    // point, between two burials, and the next start does what is left.
+    match kimmy_storage::blocking(|| engine.reconcile_database_tombstones()) {
+        Ok(_) => {}
+        Err(kimmy_storage::StorageError::Stopping(_)) => {
+            info!("a stop was asked for while databases were reconciled; stopping without serving");
+            return Ok(ended_before_serving(serving, Some(engine), Arc::clone(&stop.by)).await);
+        }
+        Err(e) => {
+            return Err(anyhow::Error::new(e).context("burying what a database's drop covers"));
+        }
+    }
+
     let gc_handle = spawn_collector(Arc::clone(&engine), &config, shutdown.clone());
     state.metrics.set_purge_counters(engine.purge_counters());
     let purger_handle = spawn_drop_purger(Arc::clone(&engine), shutdown.clone());

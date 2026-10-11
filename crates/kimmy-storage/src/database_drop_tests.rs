@@ -366,3 +366,551 @@ fn the_sentinel_is_an_ordinary_drop_collection_entry() {
     c.apply_batch(&window.entries).unwrap();
     assert_eq!(c.collection_dropped_at(id).unwrap(), Some(entry.stamp));
 }
+
+// ---------------------------------------------------------------------------
+// The sweep, its retries, its refusals and its ties
+// ---------------------------------------------------------------------------
+
+fn stamp_of(hlc: u64, node: u8) -> Stamp {
+    Stamp::new(Hlc::new(hlc, 0), NodeId::from_bytes([node; 16]))
+}
+
+fn create_entry(db: &str, name: &str, at: Stamp) -> kimmy_core::OplogEntry {
+    crate::engine::ddl_entry(
+        at,
+        OpKind::CreateCollection,
+        CollectionId::derive(db, name),
+        &CollectionRef::new(db, name),
+    )
+    .unwrap()
+}
+
+fn drop_database_entry(db: &str, at: Stamp) -> kimmy_core::OplogEntry {
+    crate::engine::ddl_entry(
+        at,
+        OpKind::DropCollection,
+        kimmy_core::database_drop_id(db),
+        &CollectionRef::new(db, RESERVED),
+    )
+    .unwrap()
+}
+
+/// Review M2. Three members and a fourth that refused the creation: a
+/// collection created after the drop, on a member that had not heard of it,
+/// refuses a straggler of the life before it exactly as the member that
+/// refused the creation first and accepted the new one later does.
+#[test]
+fn a_survivor_of_the_sweep_refuses_a_pre_drop_straggler_like_every_other_member() {
+    let (z, _dz) = engine();
+    let (a, _da) = engine();
+    let (y, _dy) = engine();
+    let (m, _dm) = engine();
+    let zl = z.create_collection("shop", "late").unwrap();
+    z.insert(&zl, doc! { "_id": "d1" }).unwrap();
+    a.create_collection("shop", "orders").unwrap();
+    later();
+    assert!(a.drop_database("shop").unwrap());
+    later();
+    // `y` makes the name again before it has heard of the drop.
+    let yl = y.create_collection("shop", "late").unwrap();
+    y.insert(&yl, doc! { "_id": "y1" }).unwrap();
+
+    pull(&m, &a);
+    pull(&m, &z);
+    later();
+    pull(&m, &y);
+
+    pull(&y, &a);
+    pull(&y, &z);
+
+    let has = |e: &Engine, id: &str| -> bool {
+        let meta = e.get_collection("shop", "late").unwrap();
+        e.get(&meta, &kimmy_core::DocId::String(id.into())).unwrap().is_some()
+    };
+    assert!(has(&m, "y1") && !has(&m, "d1"), "the member that refused the creation");
+    assert!(has(&y, "y1"), "the survivor lost its own document");
+    assert!(!has(&y, "d1"), "the survivor took a straggler of the life before it");
+}
+
+/// Reviews m1 and F5: a creation and a drop stamped with the same `Hlc` agree
+/// on every member whichever arrives first, whichever node sorts higher.
+#[test]
+fn a_create_and_a_database_drop_with_equal_hlc_agree_in_both_arrival_orders() {
+    for (create_node, drop_node) in [(2u8, 1u8), (1u8, 2u8)] {
+        let create = create_entry("shop", "late", stamp_of(5_000, create_node));
+        let drop = drop_database_entry("shop", stamp_of(5_000, drop_node));
+        for create_first in [true, false] {
+            let (e, _d) = engine();
+            let order = if create_first { [&create, &drop] } else { [&drop, &create] };
+            for entry in order {
+                e.apply_batch(std::slice::from_ref(entry)).unwrap();
+            }
+            assert!(
+                !holds(&e, "shop", "late"),
+                "create node {create_node}, drop node {drop_node}, create first: {create_first}"
+            );
+            assert!(!e.database_exists("shop").unwrap());
+        }
+    }
+}
+
+#[test]
+fn a_replicated_create_of_the_reserved_name_is_refused() {
+    let (e, _d) = engine();
+    let entry = create_entry("shop", RESERVED, stamp_of(5_000, 3));
+    e.apply_batch(std::slice::from_ref(&entry)).unwrap();
+    assert!(!holds(&e, "shop", RESERVED));
+    assert!(!e.database_exists("shop").unwrap());
+}
+
+#[test]
+fn the_floor_of_a_recreated_collection_is_the_larger_of_the_two_tombstones() {
+    let (a, b, _da, _db, _late) = the_field_sequence();
+    let (c, _dc) = engine();
+    pull(&c, &a);
+    later();
+    let first = c.create_collection("shop", "late").unwrap();
+    let database = c.database_dropped_at("shop").unwrap().unwrap();
+    assert_eq!(first.incarnation_floor, Some(database.hlc));
+    later();
+    assert!(c.drop_collection("shop", "late").unwrap());
+    let collection = c.collection_dropped_at(first.id).unwrap().unwrap();
+    assert!(collection > database);
+    later();
+    let second = c.create_collection("shop", "late").unwrap();
+    assert_eq!(second.incarnation_floor, Some(collection.hlc), "the newer tombstone is the floor");
+    drop(b);
+}
+
+/// The drop's tombstone committed and the burials did not: the next start
+/// finishes them.
+#[test]
+fn a_crash_between_the_head_and_the_burials_is_finished_by_the_reconcile() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("kimmy.redb");
+    {
+        let engine = Arc::new(Engine::open(&path).unwrap());
+        for name in ["a", "b"] {
+            engine.create_collection("shop", name).unwrap();
+        }
+        let stopper = Arc::clone(&engine);
+        crate::sync::race_hooks::at(crate::sync::race_hooks::Race::Burial, move || {
+            stopper.set_stopping();
+        });
+        let failed = engine.drop_database("shop").unwrap_err();
+        assert!(matches!(failed, crate::StorageError::PartiallyApplied { .. }), "{failed:?}");
+    }
+    let engine = Engine::open(&path).unwrap();
+    assert!(engine.database_dropped_at("shop").unwrap().is_some(), "the head is durable");
+    assert!(holds(&engine, "shop", "a") && holds(&engine, "shop", "b"), "no burial landed");
+    let swept = engine.reconcile_database_tombstones().unwrap();
+    assert_eq!(swept.buried.len(), 2);
+    assert!(!engine.database_exists("shop").unwrap());
+}
+
+/// What a 0.46.0 member leaves: the tombstone, recorded as a plain drop of a
+/// collection it never held, over collections it still holds.
+#[test]
+fn a_member_that_took_the_drop_as_a_plain_collection_drop_buries_under_it_on_reconcile() {
+    let (e, _d) = engine();
+    e.create_collection("shop", "orders").unwrap();
+    later();
+    let after =
+        Stamp::new(Hlc::new(crate::physical_now_ms() + 1_000, 0), NodeId::from_bytes([7; 16]));
+    e.record_collection_drop(kimmy_core::database_drop_id("shop"), after).unwrap();
+    assert!(holds(&e, "shop", "orders"), "nothing has acted on the tombstone yet");
+    let swept = e.reconcile_database_tombstones().unwrap();
+    assert_eq!(swept.buried.len(), 1);
+    assert!(!holds(&e, "shop", "orders"));
+    assert!(!e.database_exists("shop").unwrap());
+}
+
+/// Review M1: the page that recorded the tombstone is retried after a sweep
+/// that failed; it carries nothing new, and must still bury.
+#[test]
+fn a_retried_page_still_buries_under_a_tombstone_an_earlier_attempt_recorded() {
+    let (a, b, _da, _db, _late) = the_field_sequence();
+    let (c, _dc) = engine();
+    pull(&c, &b);
+    assert!(holds(&c, "shop", "late"));
+    let page = a.snapshot_page(None, None).unwrap();
+    let drop = a.database_dropped_at("shop").unwrap().unwrap();
+    // The first attempt: the tombstone committed, the sweep did not.
+    c.record_collection_drop(kimmy_core::database_drop_id("shop"), drop).unwrap();
+    assert!(holds(&c, "shop", "late"));
+    c.apply_snapshot_page(a.node_id(), &mut SnapshotProgress::whole_database(), &page).unwrap();
+    assert!(!holds(&c, "shop", "late"), "a retried page left what the tombstone covers");
+}
+
+#[test]
+fn a_tombstone_the_senders_coverage_does_not_name_buries_nothing() {
+    let (a, b, _da, _db, _late) = the_field_sequence();
+    let (c, _dc) = engine();
+    pull(&c, &b);
+    let mut page = a.snapshot_page(None, None).unwrap();
+    page.versions = kimmy_core::VersionVector::new();
+    c.apply_snapshot_page(a.node_id(), &mut SnapshotProgress::whole_database(), &page).unwrap();
+    assert!(
+        holds(&c, "shop", "late"),
+        "a denial above the sender's coverage destroyed a collection"
+    );
+    assert!(c.database_dropped_at("shop").unwrap().is_none());
+}
+
+#[test]
+fn a_page_carries_the_database_tombstone() {
+    let (a, _b, _da, _db, _late) = the_field_sequence();
+    let page = a.snapshot_page(None, None).unwrap();
+    let id = kimmy_core::database_drop_id("shop");
+    assert!(page.dropped_collections.iter().any(|(held, _)| *held == id), "{page:?}");
+}
+
+/// The sweep is skipped when nothing it reads has changed, and not memoised
+/// when it fails.
+#[test]
+fn a_sweep_of_an_unchanged_database_does_not_walk_its_collections_again() {
+    let (a, _da) = engine();
+    let (c, _dc) = engine();
+    a.create_collection("shop", "orders").unwrap();
+    later();
+    assert!(a.drop_database("shop").unwrap());
+    later();
+    let fresh = c.create_collection("shop", "late").unwrap();
+    c.insert(&fresh, doc! { "_id": 1 }).unwrap();
+    pull(&c, &a);
+    // A sweep's own record moves the generation, so the first sweep after it
+    // walks once more, finds nothing to write and is memoised; from then on a
+    // sweep walks nothing.
+    let settled = (0..3).find(|_| c.bury_under_database_tombstones().unwrap().spared == 0);
+    assert!(settled.is_some(), "the sweep never settled");
+    assert_eq!(c.bury_under_database_tombstones().unwrap().spared, 0);
+    // A creation moves the generation, so the next sweep walks again and finds
+    // both survivors, then settles again.
+    later();
+    c.create_collection("shop", "newer").unwrap();
+    assert_eq!(c.bury_under_database_tombstones().unwrap().spared, 2);
+    let settled = (0..3).find(|_| c.bury_under_database_tombstones().unwrap().spared == 0);
+    assert!(settled.is_some());
+}
+
+#[test]
+fn a_failed_sweep_is_not_memoised() {
+    let (a, _da) = engine();
+    let (c, _dc) = engine();
+    a.create_collection("shop", "orders").unwrap();
+    later();
+    assert!(a.drop_database("shop").unwrap());
+    later();
+    c.create_collection("shop", "late").unwrap();
+    // The tombstone is here and the sweep stops at its first checkpoint.
+    c.record_collection_drop(
+        kimmy_core::database_drop_id("shop"),
+        a.database_dropped_at("shop").unwrap().unwrap(),
+    )
+    .unwrap();
+    let stopped = c.sweep(&|| Err(crate::StorageError::Stopping(crate::StopReason::Shutdown)));
+    assert!(stopped.is_err());
+    assert_eq!(c.bury_under_database_tombstones().unwrap().spared, 1, "the retry walked");
+}
+
+#[test]
+fn a_burial_that_loses_documents_logs_their_number() {
+    let (a, b, _da, _db, _late) = the_field_sequence();
+    let (c, _dc) = engine();
+    pull(&c, &b);
+    let late = c.get_collection("shop", "late").unwrap();
+    later();
+    // Written into the collection after the drop was stamped.
+    c.insert(&late, doc! { "_id": "after" }).unwrap();
+    let logs = crate::log_capture::logs_of(|| {
+        pull(&c, &a);
+    });
+    assert!(logs.contains("a database drop buried a collection that holds documents"), "{logs}");
+    assert!(logs.contains("written_after_the_drop=1"), "{logs}");
+    assert!(logs.contains("documents=2"), "{logs}");
+}
+
+// ---------------------------------------------------------------------------
+// The head of the drop
+// ---------------------------------------------------------------------------
+
+fn three_collections() -> (Arc<Engine>, tempfile::TempDir) {
+    let dir = tempfile::tempdir().unwrap();
+    let engine = Engine::open(&dir.path().join("k.redb")).unwrap();
+    for name in ["a", "b", "c"] {
+        engine.create_collection("shop", name).unwrap();
+    }
+    (Arc::new(engine), dir)
+}
+
+#[test]
+fn a_drop_of_an_empty_database_row_mints_the_sentinel() {
+    let (e, _d) = engine();
+    e.create_database("empty").unwrap();
+    let before = e.version_vector().unwrap();
+    assert!(e.drop_database("empty").unwrap());
+    assert!(e.database_dropped_at("empty").unwrap().is_some());
+    assert_ne!(e.version_vector().unwrap(), before);
+}
+
+/// The burial after the head continues the request (ADR-192): a writer held
+/// past the budget between the head and the first burial is waited out.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_database_drop_whose_first_burial_waits_for_the_writer_after_the_head() {
+    let (engine, _dir) = three_collections();
+    let budget = Duration::from_millis(100);
+    let dropped = {
+        let engine = Arc::clone(&engine);
+        crate::with_write_wait_budget(budget, async move {
+            let holder = Arc::clone(&engine);
+            crate::sync::race_hooks::at(crate::sync::race_hooks::Race::Burial, move || {
+                let (held, is_held) = std::sync::mpsc::channel();
+                std::thread::spawn(move || {
+                    let guard = holder.hold_writer(crate::WriterHolder::Bulk);
+                    held.send(()).unwrap();
+                    std::thread::sleep(budget * 3);
+                    drop(guard);
+                });
+                is_held.recv().unwrap();
+            });
+            engine.drop_database("shop")
+        })
+        .await
+    };
+    assert!(dropped.expect("the first burial waits for the writer"));
+    assert!(!engine.database_exists("shop").unwrap());
+    assert_eq!(engine.writer_wait_timeouts(), 0);
+}
+
+#[test]
+fn a_failed_burial_after_the_head_is_partially_applied_with_an_empty_dropped() {
+    let (engine, _dir) = three_collections();
+    let stopper = Arc::clone(&engine);
+    crate::sync::race_hooks::at(crate::sync::race_hooks::Race::Burial, move || {
+        stopper.set_stopping();
+    });
+    let failed = engine.drop_database("shop").unwrap_err();
+    let crate::StorageError::PartiallyApplied { applied, cause } = failed else {
+        panic!("a stop after the head is partly applied: {failed:?}");
+    };
+    assert_eq!(applied, crate::Applied::DropDatabase { dropped: Vec::new(), in_doubt: None });
+    assert!(matches!(*cause, crate::StorageError::Stopping(_)), "{cause:?}");
+    assert!(engine.database_dropped_at("shop").unwrap().is_some());
+}
+
+#[test]
+fn a_head_whose_commit_outcome_is_unknown_is_a_plain_outcome_unknown_and_buries_nothing() {
+    let (engine, _dir) = three_collections();
+    assert!(engine.arm_test_storage_failure("sync_data"));
+    let failed = engine.drop_database("shop").unwrap_err();
+    assert!(matches!(failed, crate::StorageError::OutcomeUnknown(_)), "{failed:?}");
+}
+
+#[test]
+fn gc_collects_a_database_tombstone_with_the_collection_tombstones() {
+    let (a, _b, _da, _db, _late) = the_field_sequence();
+    // The drop's rows are the purger's; none is owed under the reserved id.
+    for meta in a.all_collections().unwrap() {
+        a.purge_dropped_collection(meta.id).unwrap();
+    }
+    assert!(a.database_dropped_at("shop").unwrap().is_some());
+    let day = 24 * 60 * 60;
+    let later = crate::physical_now_ms() + 365 * day * 1_000;
+    a.collect_garbage_at(later, crate::gc::RetentionPolicy::new(day, day)).unwrap();
+    assert!(a.database_dropped_at("shop").unwrap().is_none(), "the tombstone outlived retention");
+}
+
+// ---------------------------------------------------------------------------
+// Streams: told of a burial that minted no entry, and resumable on a survivor
+// ---------------------------------------------------------------------------
+
+use crate::watch::{ChangeEvent, ChangeStream, InvalidateReason, WatchOptions, WatchScope};
+
+async fn next(stream: &mut ChangeStream, engine: &Engine) -> Option<ChangeEvent> {
+    tokio::time::timeout(Duration::from_secs(5), stream.next(engine))
+        .await
+        .expect("the stream answered within five seconds")
+}
+
+/// The next document change of `stream`, past the schema changes it carries.
+async fn next_document(stream: &mut ChangeStream, engine: &Engine) -> kimmy_core::OplogEntry {
+    loop {
+        match next(stream, engine).await {
+            Some(ChangeEvent::Change { entry, .. }) if entry.kind.is_document() => {
+                return (*entry).clone();
+            }
+            Some(ChangeEvent::Change { .. }) => {}
+            other => panic!("expected a document change: {other:?}"),
+        }
+    }
+}
+
+fn dropped(event: Option<ChangeEvent>) -> bool {
+    matches!(event, Some(ChangeEvent::Invalidate { reason: InvalidateReason::CollectionDropped }))
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_collection_stream_on_a_collection_the_sweep_buries_ends_with_collection_dropped() {
+    let (a, b, _da, _db, late) = the_field_sequence();
+    let (c, _dc) = engine();
+    pull(&c, &b);
+    // Opened before the sweep. `late` has no entry of its own to end it: the
+    // dropper never held it, so nothing it minted names it.
+    let mut stream = c.watch(WatchScope::Collection(late), WatchOptions::default()).unwrap();
+    pull(&c, &a);
+    assert!(!holds(&c, "shop", "late"));
+    assert!(dropped(next(&mut stream, &c).await));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_collection_stream_opened_during_the_sweep_ends_too() {
+    let (a, b, _da, _db, late) = the_field_sequence();
+    let (c, _dc) = engine();
+    let c = Arc::new(c);
+    pull(&c, &b);
+    let opener = Arc::clone(&c);
+    let ((), stream) = crate::sync::race_hooks::race(
+        crate::sync::race_hooks::Race::Burial,
+        move || opener.watch(WatchScope::Collection(late), WatchOptions::default()).unwrap(),
+        || {
+            pull(&c, &a);
+        },
+    );
+    let mut stream = stream;
+    assert!(dropped(next(&mut stream, &c).await));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_collection_stream_ends_on_a_lagged_notice_channel_when_the_collection_is_gone() {
+    let (a, b, _da, _db, late) = the_field_sequence();
+    let (c, _dc) = engine();
+    pull(&c, &b);
+    let mut stream = c.watch(WatchScope::Collection(late), WatchOptions::default()).unwrap();
+    // More notices about other collections than the channel holds, so the one
+    // that names this collection is lost with them.
+    for i in 0..2_000u64 {
+        c.send_buried(vec![crate::BuriedCollection {
+            db: "other".into(),
+            name: format!("c{i}"),
+            ids: vec![CollectionId(1_000_000 + i)],
+        }]);
+    }
+    pull(&c, &a);
+    assert!(dropped(next(&mut stream, &c).await));
+}
+
+/// Review N6: a sweep of more collections than the channel holds is one notice.
+#[test]
+fn a_sweep_of_more_collections_than_the_buffer_holds_does_not_lag_a_subscriber() {
+    let (a, _da) = engine();
+    let (c, _dc) = engine();
+    let mut rx = c.subscribe_buried();
+    for i in 0..1_100 {
+        a.create_collection("shop", &format!("c{i}")).unwrap();
+    }
+    // A window carries a thousand entries.
+    for _ in 0..3 {
+        pull(&c, &a);
+    }
+    assert!(holds(&c, "shop", "c1099"), "premise: the member holds them");
+    later();
+    assert!(a.drop_database("shop").unwrap());
+    pull(&c, &a);
+    assert!(!holds(&c, "shop", "c0") && !holds(&c, "shop", "c1099"));
+    let mut named = 0;
+    loop {
+        match rx.try_recv() {
+            Ok(notice) => named += notice.collections.len(),
+            Err(tokio::sync::broadcast::error::TryRecvError::Empty) => break,
+            Err(e) => panic!("a subscriber lagged: {e:?}"),
+        }
+    }
+    assert!(named >= 1_100, "{named}");
+}
+
+/// A survivor learned of the drop after its own entries arrived, so a position
+/// taken from the drop's entry would skip them or refuse a token for them.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_token_issued_before_the_sentinel_arrives_still_resumes_on_a_survivor() {
+    let (a, _da) = engine();
+    a.create_collection("shop", "orders").unwrap();
+    later();
+    assert!(a.drop_database("shop").unwrap());
+    later();
+    let (c, _dc) = engine();
+    let late = c.create_collection("shop", "late").unwrap();
+    c.insert(&late, doc! { "_id": 1 }).unwrap();
+    let from_start = WatchOptions { resume_after: None, start_at: Some(Hlc::ZERO) };
+    let mut stream = c.watch(WatchScope::Collection(late.id), from_start).unwrap();
+    let first = next_document(&mut stream, &c).await;
+    assert_eq!(first.doc_id, Some(kimmy_core::DocId::Int64(1)));
+    let token = stream.resume_token().unwrap();
+
+    pull(&c, &a);
+    assert!(holds(&c, "shop", "late"), "premise: the collection stands");
+    assert!(c.collection_dropped_at(late.id).unwrap().is_some(), "premise: it holds the tombstone");
+
+    let options = WatchOptions { resume_after: Some(token), start_at: None };
+    let mut resumed = c
+        .watch(WatchScope::Collection(late.id), options)
+        .expect("a token for the survivor's own entries was refused");
+    c.insert(&c.get_collection("shop", "late").unwrap(), doc! { "_id": 2 }).unwrap();
+    let second = next_document(&mut resumed, &c).await;
+    assert_eq!(second.doc_id, Some(kimmy_core::DocId::Int64(2)));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_tokenless_stream_on_a_survivor_keeps_the_entries_that_arrived_before_the_sentinel() {
+    let (a, _da) = engine();
+    a.create_collection("shop", "orders").unwrap();
+    later();
+    assert!(a.drop_database("shop").unwrap());
+    later();
+    let (c, _dc) = engine();
+    let late = c.create_collection("shop", "late").unwrap();
+    c.insert(&late, doc! { "_id": 1 }).unwrap();
+    pull(&c, &a);
+    let from_start = WatchOptions { resume_after: None, start_at: Some(Hlc::ZERO) };
+    let mut stream = c.watch(WatchScope::Collection(late.id), from_start).unwrap();
+    let first = next_document(&mut stream, &c).await;
+    assert_eq!(
+        first.doc_id,
+        Some(kimmy_core::DocId::Int64(1)),
+        "the survivor's first write was skipped"
+    );
+}
+
+/// Control: on a collection dropped and recreated on this member, a token of
+/// the life before is still refused, and a replay starts at the new life.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_token_from_the_previous_life_of_a_recreated_collection_still_expires() {
+    let (e, _d) = engine();
+    let first = e.create_collection("shop", "x").unwrap();
+    e.insert(&first, doc! { "_id": "old" }).unwrap();
+    let from_start = WatchOptions { resume_after: None, start_at: Some(Hlc::ZERO) };
+    let mut stream = e.watch(WatchScope::Collection(first.id), from_start).unwrap();
+    let _ = next_document(&mut stream, &e).await;
+    let token = stream.resume_token().unwrap();
+    assert!(e.drop_collection("shop", "x").unwrap());
+    e.purge_dropped_collection(first.id).unwrap();
+    later();
+    let second = e.create_collection("shop", "x").unwrap();
+    e.insert(&second, doc! { "_id": "new" }).unwrap();
+
+    let refused = e.watch(
+        WatchScope::Collection(second.id),
+        WatchOptions { resume_after: Some(token), start_at: None },
+    );
+    assert!(
+        matches!(refused, Err(crate::StorageError::Core(kimmy_core::Error::ResumeTokenExpired))),
+        "a token of the life before resumed on the new one"
+    );
+    let from_start = WatchOptions { resume_after: None, start_at: Some(Hlc::ZERO) };
+    let mut fresh = e.watch(WatchScope::Collection(second.id), from_start).unwrap();
+    let only = next_document(&mut fresh, &e).await;
+    assert_eq!(
+        only.doc_id,
+        Some(kimmy_core::DocId::String("new".into())),
+        "the replay began in the life before"
+    );
+}

@@ -303,11 +303,21 @@ pub async fn disable_vectors(
 /// the task being polled for the first time.
 pub fn invalidator(state: &SharedState) -> impl std::future::Future<Output = ()> + use<> {
     let mut events = state.engine.subscribe();
+    let mut buried = state.engine.subscribe_buried();
     let state = Arc::clone(state);
 
     async move {
         loop {
-            match events.recv().await {
+            let received = tokio::select! {
+                received = events.recv() => received,
+                notice = buried.recv() => {
+                    if !forget_buried(&state, notice) {
+                        return;
+                    }
+                    continue;
+                }
+            };
+            match received {
                 Ok(entry) if entry.kind == OpKind::DropCollection => {
                     // The entry names what was dropped: the shadow itself when
                     // the vectors were discarded on their own, the parent when
@@ -389,45 +399,78 @@ pub fn invalidator(state: &SharedState) -> impl std::future::Future<Output = ()>
                 // every snapshot on the node and charge a rebuild for
                 // collections that are perfectly alive.
                 Err(tokio::sync::broadcast::error::RecvError::Lagged(missed)) => {
-                    // One read transaction over the catalogue, on a task that
-                    // is otherwise only ever waiting: off the worker, like
-                    // every other storage step. `live_collections`, not
-                    // `all_collection_ids`: the latter hides every paired
-                    // shadow (ADR-138), which is every id a graph is keyed by.
-                    match kimmy_storage::blocking(|| state.engine.live_collections()) {
-                        Ok(live) => {
-                            // Resident entries first, then the disk. A snapshot
-                            // whose entry was evicted under the budget, or that
-                            // a previous process wrote, has no entry to be
-                            // forgotten through, so the map walk alone would
-                            // leave it — and a lost drop is exactly the case
-                            // where nothing else will ever name it. Staging
-                            // directories are kept: this is a running node, and
-                            // a build may be writing one this instant.
-                            let forgotten = state.vectors.forget_absent(&live);
-                            let swept = kimmy_storage::blocking(|| {
-                                state.vectors.sweep_snapshots(&live, kimmy_vector::Staging::Keep)
-                            });
-                            warn!(
-                                missed,
-                                forgotten,
-                                swept,
-                                "vector index consumer fell behind; reconciled the cache \
-                                 against the collections this node holds"
-                            );
-                        }
-                        Err(e) => warn!(
-                            missed,
-                            error = %e,
-                            "vector index consumer fell behind and could not list this \
-                             node's collections; a collection dropped in the meantime may \
-                             keep its index and its snapshot until this node restarts"
-                        ),
-                    }
+                    reconcile_cache(&state, missed);
                 }
                 Err(tokio::sync::broadcast::error::RecvError::Closed) => return,
             }
         }
+    }
+}
+
+/// Reconcile the vector cache against the collections this node holds, for a
+/// consumer that missed notices and so cannot say which collections went.
+fn reconcile_cache(state: &SharedState, missed: u64) {
+    // One read transaction over the catalogue, on a task that
+    // is otherwise only ever waiting: off the worker, like
+    // every other storage step. `live_collections`, not
+    // `all_collection_ids`: the latter hides every paired
+    // shadow (ADR-138), which is every id a graph is keyed by.
+    match kimmy_storage::blocking(|| state.engine.live_collections()) {
+        Ok(live) => {
+            // Resident entries first, then the disk. A snapshot
+            // whose entry was evicted under the budget, or that
+            // a previous process wrote, has no entry to be
+            // forgotten through, so the map walk alone would
+            // leave it — and a lost drop is exactly the case
+            // where nothing else will ever name it. Staging
+            // directories are kept: this is a running node, and
+            // a build may be writing one this instant.
+            let forgotten = state.vectors.forget_absent(&live);
+            let swept = kimmy_storage::blocking(|| {
+                state.vectors.sweep_snapshots(&live, kimmy_vector::Staging::Keep)
+            });
+            warn!(
+                missed,
+                forgotten,
+                swept,
+                "vector index consumer fell behind; reconciled the cache \
+                 against the collections this node holds"
+            );
+        }
+        Err(e) => warn!(
+            missed,
+            error = %e,
+            "vector index consumer fell behind and could not list this \
+             node's collections; a collection dropped in the meantime may \
+             keep its index and its snapshot until this node restarts"
+        ),
+    }
+}
+
+/// Forget the graphs of collections buried with no entry to say so (ADR-229): a
+/// sweep under a database's tombstone, a snapshot page's drop. A notice names
+/// each collection by database and name, which is what [`forget_dropped`] reads
+/// the shadow from; one missed is reconciled as an entry missed is. `false`
+/// when the channel has closed.
+fn forget_buried(
+    state: &SharedState,
+    notice: std::result::Result<
+        Arc<kimmy_storage::Buried>,
+        tokio::sync::broadcast::error::RecvError,
+    >,
+) -> bool {
+    match notice {
+        Ok(notice) => {
+            for collection in &notice.collections {
+                forget_dropped(state, &collection.db, &collection.name);
+            }
+            true
+        }
+        Err(tokio::sync::broadcast::error::RecvError::Lagged(missed)) => {
+            reconcile_cache(state, missed);
+            true
+        }
+        Err(tokio::sync::broadcast::error::RecvError::Closed) => false,
     }
 }
 

@@ -38,6 +38,9 @@ pub enum OpenPhase {
     /// The store is open and the node is starting its tasks, before it
     /// serves.
     Starting = 6,
+    /// Burying what a database's drop covers (ADR-229): `done` of `total`
+    /// databases, before the node serves.
+    Reconciling = 7,
 }
 
 impl OpenPhase {
@@ -50,6 +53,7 @@ impl OpenPhase {
             Self::Verifying => "verifying",
             Self::Counting => "counting",
             Self::Starting => "starting",
+            Self::Reconciling => "reconciling",
         }
     }
 
@@ -61,6 +65,7 @@ impl OpenPhase {
             4 => Self::Verifying,
             5 => Self::Counting,
             6 => Self::Starting,
+            7 => Self::Reconciling,
             _ => Self::Idle,
         }
     }

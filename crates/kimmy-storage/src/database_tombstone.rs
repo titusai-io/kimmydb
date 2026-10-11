@@ -211,15 +211,42 @@ impl Engine {
     /// serves: ended at a safe point by a stop, since every burial is a commit
     /// of its own and the next start repeats what is left.
     pub fn reconcile_database_tombstones(&self) -> Result<Swept> {
-        self.sweep(&|| {
-            if crate::open_progress::open_stop_requested() {
+        use crate::open_progress::{OpenPhase, open_stop_requested, set_open_phase};
+
+        // Said on `/readyz` only when there is something to do: a start with no
+        // database tombstone passes through without a flicker of a new phase.
+        let mut owed = 0u64;
+        for database in self.list_databases()? {
+            if self.database_dropped_at(&database.name)?.is_some() {
+                owed += 1;
+            }
+        }
+        if owed == 0 {
+            return Ok(Swept::default());
+        }
+        crate::open_progress::set_open_phase_of(OpenPhase::Reconciling, owed);
+        let done = std::cell::Cell::new(0u64);
+        let swept = self.sweep(&|| {
+            if open_stop_requested() {
                 return Err(StorageError::Stopping(crate::StopReason::Shutdown));
             }
+            crate::open_progress::set_open_done(done.get().min(owed));
+            done.set(done.get() + 1);
             Ok(())
-        })
+        });
+        set_open_phase(OpenPhase::Starting);
+        let swept = swept?;
+        if !swept.buried.is_empty() || swept.spared > 0 {
+            info!(
+                buried = swept.buried.len(),
+                spared = swept.spared,
+                "buried what a database's drop covers before serving"
+            );
+        }
+        Ok(swept)
     }
 
-    fn sweep(&self, checkpoint: &dyn Fn() -> Result<()>) -> Result<Swept> {
+    pub(crate) fn sweep(&self, checkpoint: &dyn Fn() -> Result<()>) -> Result<Swept> {
         let mut swept = Swept::default();
         let mut notice = Vec::new();
         let result = self.sweep_databases(checkpoint, &mut swept, &mut notice);
