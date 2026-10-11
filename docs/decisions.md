@@ -16999,6 +16999,29 @@ an ordinary page read verifies nothing ([storage.md](storage.md#what-the-storage
   just before it commits, and checks that neither the record nor the raise
   landed.
 
+### Addendum (0.46.0) — A bare-stamp token is refused by the recorded horizon too, not by the oplog's first key alone
+
+A single-stamp token (issued before 0.30.0, or `start_at` a stamp) that names an entry this
+member does not hold was refused as expired when it was **older than the oldest entry the oplog
+retains**. That reads retention's reach off the oplog's first key, and an entry stamped before
+everything retention collected can arrive late and become it: a delete of a document the member
+never held, applied by entries, or any entry from a slow origin. The bar fell with it, and a token
+inside the collected range resumed from the first entry stamped after it, **skipping the events
+retention had removed, silently**.
+
+A bare-stamp token is now also expired when retention has collected an entry **above** it: for any
+origin `o`, `Stamp(min(collected[o], witnessed[o]), o) > token`, from the per-origin record
+(`OPLOG_COLLECTED`) that `gc` raises in the transaction that removes the entries and that only moves
+forward, so a later arrival cannot lower it. The `witnessed` cap is the one the vector-token branch
+applies: the record is seeded from the coarse horizon on a database an earlier build collected from,
+which can put an origin this member never saw above anything it wrote. **The first test is kept**
+(a token older than everything this member holds, with nothing collected, is still refused), so the
+change only adds refusals; none is removed. A token above every collected stamp lost nothing and resumes. Tests: the red one
+(`a_single_stamp_token_inside_what_retention_collected_is_refused_after_an_old_entry_arrives`), a
+token above the collected range still resuming after a late old entry, and a record above what was
+witnessed of its origin refusing nothing. Mutations, each red: the new check removed; the cap
+removed; the comparison reversed; the first test dropped. No wire or disk change.
+
 ## ADR-174 — A collection keeps its live document count, and the divergence check reads it
 
 > **Extends [ADR-133](#adr-133--a-periodic-cross-member-check-makes-a-divergence-no-counter-can-express-visible-without-repairing-it)**,

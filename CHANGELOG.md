@@ -36,6 +36,16 @@ breaking changes and says so here; a `0.x.PATCH` bump never does.
 
 ### Fixed
 
+- **A bare-stamp resume token inside a range retention had collected could resume and skip
+  events silently after an old entry arrived late.** Such a token (issued before 0.30.0, or
+  `start_at` a stamp) was refused when it was older than the oldest entry the oplog retains, and
+  an entry stamped before everything retention collected (a delete of a document the member never
+  held, by entries) could arrive late and become that oldest entry, lowering the bar; the token
+  then resumed with the collected events missing. It is now also refused when retention has
+  collected an entry above it, from the recorded per-origin horizon, which a late arrival cannot
+  lower. A token above everything collected still resumes. ADR-173's addendum. No rollback
+  boundary and no wire or disk change.
+
 - **A delete now reaches a member through a member that never held the document.** A
   member that took a whole-database snapshot recorded nothing for a document it had never
   held and the sender had deleted, so a member that then took *its* snapshot kept the

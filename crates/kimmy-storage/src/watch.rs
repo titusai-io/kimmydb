@@ -498,16 +498,40 @@ impl Engine {
         }
     }
 
-    /// Whether retention has collected past `stamp`: it is older than the
-    /// oldest entry the oplog retains.
+    /// Whether `stamp` is older than what this member can resume from: it is
+    /// older than the oldest entry the oplog retains, **or** retention has
+    /// collected an entry above it.
+    ///
+    /// The second test is the recorded horizon, per origin, capped at what this
+    /// member witnessed of the origin (the record is seeded from the coarse
+    /// horizon on a database an earlier build collected from, which can put a
+    /// quiet origin above anything it wrote; the vector-token branch of
+    /// `resume_point` caps it the same way). The first test alone is the oplog's
+    /// *first key*, and an entry stamped before everything retention collected
+    /// can arrive late (a delete of a document this member never held, by
+    /// entries) and become it, which lowers the bar: a token inside the
+    /// collected range then read as "not collected" and resumed with the
+    /// events retention removed skipped, silently. The record is raised in the
+    /// transaction that removes the entries and only moves forward, so a late
+    /// arrival cannot lower it (ADR-173's addendum).
     fn stamp_collected(&self, stamp: &Stamp) -> Result<bool> {
-        let txn = self.db().begin_read()?;
-        let oplog = txn.open_table(tables::OPLOG)?;
-        Ok(match oplog.first()? {
-            Some((oldest, _)) => *stamp < codec::decode_oplog_key(oldest.value())?,
-            // An empty log cannot have collected anything.
-            None => false,
-        })
+        let below_the_oldest = {
+            let txn = self.db().begin_read()?;
+            let oplog = txn.open_table(tables::OPLOG)?;
+            match oplog.first()? {
+                Some((oldest, _)) => *stamp < codec::decode_oplog_key(oldest.value())?,
+                // An empty log cannot have collected anything.
+                None => false,
+            }
+        };
+        if below_the_oldest {
+            return Ok(true);
+        }
+        let witnessed = self.witnessed_vector()?;
+        Ok(self
+            .oplog_collected()?
+            .iter()
+            .any(|(origin, hlc)| Stamp::new(hlc.min(witnessed.get(origin)), origin) > *stamp))
     }
 
     /// The first arrival position whose entry is stamped at or after `at`.
@@ -2661,6 +2685,139 @@ mod tests {
             .expect("the token resumes");
         let delivered = changes_until(&engine, &mut stream, &["after"]).await;
         assert_eq!(ids(&delivered), vec!["after"]);
+    }
+
+    fn first_retained_stamp(engine: &Engine) -> Stamp {
+        let txn = engine.db().begin_read().unwrap();
+        let oplog = txn.open_table(tables::OPLOG).unwrap();
+        let (key, _) = oplog.first().unwrap().expect("a non-empty oplog");
+        codec::decode_oplog_key(key.value()).unwrap()
+    }
+
+    #[tokio::test]
+    async fn a_single_stamp_token_inside_what_retention_collected_is_refused_after_an_old_entry_arrives()
+     {
+        // Retention has collected entries up to S1. An entry stamped before them then
+        // arrives (a delete of a document this member never held, by entries) and
+        // becomes the oplog's first, so "older than the oldest retained entry" no longer
+        // says where retention reached. A token inside what retention collected, above the old entry, names a span
+        // whose events retention removed: it must be refused, not resumed with a silent
+        // gap.
+        let (engine, coll, _dir) = setup();
+        let mut written = Vec::new();
+        for i in 0..3i64 {
+            engine.insert(&coll, doc! { "_id": i }).unwrap();
+            written.push(newest_stamp(&engine));
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        engine
+            .collect_garbage_at(
+                crate::engine::physical_now_ms() + 1_000_000_000,
+                crate::gc::RetentionPolicy::new(0, u64::MAX),
+            )
+            .unwrap();
+        // Retention keeps the origin's newest entry and collected the first write.
+        assert_eq!(first_retained_stamp(&engine), written[2], "premise");
+        let between = written[0];
+        let refused = |engine: &Engine| {
+            matches!(
+                engine
+                    .watch(
+                        WatchScope::Cluster,
+                        WatchOptions {
+                            resume_after: Some(ResumeToken::from_stamp(between)),
+                            ..Default::default()
+                        },
+                    )
+                    .err(),
+                Some(StorageError::Core(kimmy_core::Error::ResumeTokenExpired))
+            )
+        };
+        assert!(refused(&engine), "premise: refused while the first retained entry is above it");
+
+        let old = OplogEntry {
+            stamp: Stamp::new(Hlc::new(1_000, 0), NodeId::from_bytes([7; 16])),
+            kind: OpKind::Delete,
+            collection: coll.id,
+            doc_id: Some(kimmy_core::DocId::Int64(99)),
+            body: None,
+        };
+        engine.apply_batch(std::slice::from_ref(&old)).unwrap();
+        assert_eq!(first_retained_stamp(&engine), old.stamp, "premise: the old entry leads");
+
+        assert!(
+            refused(&engine),
+            "still refused: retention reached past it, whatever leads the log"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_single_stamp_token_above_everything_collected_still_resumes_after_an_old_entry_arrives()
+     {
+        // The recorded horizon only adds refusals where retention reached: a token above
+        // every collected stamp lost nothing and resumes, whatever leads the log.
+        let (engine, coll, _dir) = setup();
+        for i in 0..3i64 {
+            engine.insert(&coll, doc! { "_id": i }).unwrap();
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        engine
+            .collect_garbage_at(
+                crate::engine::physical_now_ms() + 1_000_000_000,
+                crate::gc::RetentionPolicy::new(0, u64::MAX),
+            )
+            .unwrap();
+        let newest = first_retained_stamp(&engine);
+        let above_the_collected = Stamp::new(newest.hlc.predecessor(), engine.node_id());
+        let old = OplogEntry {
+            stamp: Stamp::new(Hlc::new(1_000, 0), NodeId::from_bytes([7; 16])),
+            kind: OpKind::Delete,
+            collection: coll.id,
+            doc_id: Some(kimmy_core::DocId::Int64(99)),
+            body: None,
+        };
+        engine.apply_batch(std::slice::from_ref(&old)).unwrap();
+        assert_eq!(first_retained_stamp(&engine), old.stamp, "premise: the old entry leads");
+
+        assert!(
+            engine
+                .watch(
+                    WatchScope::Cluster,
+                    WatchOptions {
+                        resume_after: Some(ResumeToken::from_stamp(above_the_collected)),
+                        ..Default::default()
+                    },
+                )
+                .is_ok(),
+            "nothing above this token was collected"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_collected_record_above_what_was_witnessed_of_its_origin_refuses_nothing() {
+        // The record is seeded from the coarse horizon on a database an earlier build
+        // collected from, which can put an origin this member never saw above anything
+        // it wrote. Nothing of it above what was witnessed can have been collected.
+        let (engine, coll, _dir) = setup();
+        engine.insert(&coll, doc! { "_id": 1i64 }).unwrap();
+        let held = newest_stamp(&engine);
+        let stranger = Stamp::new(Hlc::new(u64::MAX / 2, 0), NodeId::from_bytes([9; 16]));
+        let txn = engine.begin_write(crate::engine::WriterHolder::Replication).unwrap();
+        crate::engine::raise_version(&txn, tables::OPLOG_COLLECTED, &stranger).unwrap();
+        txn.commit().unwrap();
+
+        let token = Stamp::new(held.hlc.predecessor(), held.node);
+        assert!(
+            engine
+                .watch(
+                    WatchScope::Cluster,
+                    WatchOptions {
+                        resume_after: Some(ResumeToken::from_stamp(token)),
+                        ..Default::default()
+                    },
+                )
+                .is_ok()
+        );
     }
 
     #[tokio::test]
