@@ -10,6 +10,55 @@ Versioning follows the pre-1.0 policy in
 [docs/compatibility.md](docs/compatibility.md): a `0.MINOR` bump may carry
 breaking changes and says so here; a `0.x.PATCH` bump never does.
 
+## 0.47.0 - Unreleased
+
+This is a minor release with **one Breaking change**: a dropped database now stays dropped,
+by dropping everything it held, on every member. There is no rollback boundary: no
+configuration key, table, `kimmy.format` schema (still 4), redb version, backup tag, snapshot
+field or entry kind changed, and 0.46.0 applies the new drop as the drop of a collection it
+never held ([Rolling back](docs/operations.md)). **A roll or a rollback must finish within
+`storage.tombstone_retention_secs` of any database drop made during it.**
+
+- **Breaking: `DELETE /v1/db/{db}` also deletes, on every member, the collections created
+  before it that the member answering it had not received** (ADR-229). It used to drop the
+  collections that member held when it was applied; a collection a peer had created and the
+  dropper had not yet received then brought the database back on every member, with that
+  collection in it, and the deleted data was served again. The drop is now a stamped tombstone of
+  the database: on every member, every collection of it created at or before that stamp is
+  dropped with its documents, and none can be created at or before it. A collection created
+  after it stands. **Recreate a dropped database on the member that dropped it, or wait until
+  every member lists it gone**: a member that has not received the drop can stamp a creation
+  before it, and that creation is dropped too, with the documents written into it afterwards
+  and the writes answered `200`. The same holds for a write acknowledged into such a collection
+  on a member that has not applied the drop, and for one on a 0.46.0 member in a roll.
+  Resurrection is no longer possible except for a creation concurrent with the drop (within
+  clock skew, replication lag or the time the drop takes to bury its collections) and for a
+  member behind longer than the tombstone's retention. The sweep logs each collection it buries
+  that held documents (`a database drop buried a collection that holds documents`).
+
+**Read before upgrading:**
+
+- **A roll or a rollback must finish within `storage.tombstone_retention_secs` (default 24 h)
+  of any database drop made during it.** A member on 0.46.0 keeps a collection the dropper
+  never held, and keeps serving it, until it restarts on 0.47.0; it needs the drop's tombstone
+  to then bury it, and every member collects that tombstone after the retention. Past it the
+  collection, and the database, come back on every member.
+- **A `partially_applied` answer from a database drop can carry an empty `dropped` list**: the
+  drop's tombstone is its first commit, so the drop is recorded and replicates even when no
+  collection has been buried yet.
+- **A start buries what a database's drop covers before it serves**, and `/readyz` shows
+  `phase: reconciling` while it does. A store left by a member that applied a drop as a plain
+  collection drop, or that stopped between the tombstone and the burials, is finished then.
+
+### Fixed
+
+- **A collection a member never held, with vectors, stopped replication at its first vector
+  chunk after its drop** until a snapshot: the drop recorded the collection's tombstone and not
+  its shadow's, so the chunk was an entry for an unknown collection (ADR-229).
+- **A change stream or the vector cache on a collection buried by a snapshot page or a
+  replicated drop with no entry of its own** was never ended, or never forgot the graph; both
+  are now told (ADR-229).
+
 ## 0.46.0 - 2026-10-11
 
 This is a minor release with no rollback boundary: no configuration key, table,

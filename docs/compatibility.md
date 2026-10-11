@@ -151,6 +151,17 @@ property being bought, and it is why this one does not join the
 stop-the-cluster list. Finish inside `storage.oplog_retention_secs` — see
 [Operations](operations.md).
 
+**A database drop (0.47.0, [ADR-229](decisions.md)) changes what a route means,
+and a roll has a clock on it.** `DELETE /v1/db/{db}` now also deletes, on every
+member, the collections created before it that the answering member had not
+received. A 0.46.0 member in a mixed cluster does not act on the drop's tombstone
+(it applies it as the drop of a collection it never held) and keeps serving a
+collection the dropper never held until it restarts on 0.47.0, which buries it.
+That restart needs the tombstone, which every member collects after
+`storage.tombstone_retention_secs`: **a roll or rollback must finish inside it of
+any database drop made during it**, or the collection, and with it the database,
+comes back on every member.
+
 **A member-at-a-time roll is not evidence that mixed versions work together.**
 The 0.28.0 roll took about 10 s from first member to last, the cluster was
 mixed for 6.8 s of it, and no sync round crossed versions in that window, so a

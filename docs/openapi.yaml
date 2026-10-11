@@ -1311,13 +1311,21 @@ paths:
       operationId: dropDatabase
       summary: Drop every collection in a database.
       description: >-
-        Each collection is dropped in turn as its own replicated change; the
-        last drop removes the database from listings on every member.
+        The drop is recorded first, as a stamped tombstone of the database that
+        replicates (ADR-229), and each collection this member holds is then
+        dropped in turn as its own replicated change; the last drop removes the
+        database from listings on every member. **On every member, every
+        collection of the database created at or before the drop's stamp is
+        dropped with it, including one this member had not received**; one
+        created after it stands. Recreate the database on this member, or wait
+        until every member lists it gone: a creation on another member that
+        has not received the drop can be stamped before it and is dropped too.
         Databases are otherwise implicit — created by their first collection,
-        removed with their last. System databases (`__…`) are refused. Answers
-        once every collection is dropped, which is one short commit each: what
-        they held is removed afterwards, and until it is, creating one of those
-        names again answers `503 collection_purging`.
+        removed with their last. System databases (`__…`) are refused, and a
+        database this member does not hold answers `dropped: false` and records
+        nothing. Answers once every collection is dropped, which is one short
+        commit each: what they held is removed afterwards, and until it is,
+        creating one of those names again answers `503 collection_purging`.
       x-kimmy-action: ddl
       responses:
         "200":
@@ -3132,7 +3140,9 @@ components:
             written in a chunk whose commit's outcome is unknown). `matched`
             also counts documents in chunks where nothing changed, which
             commit nothing (ADR-208). For a database drop,
-            `dropped` (the collections whose drop committed) and `in_doubt`.
+            `dropped` (the collections whose drop committed, which can be
+            empty: the database's tombstone is the first commit, ADR-229) and
+            `in_doubt`.
         cause:
           type: object
           description: |

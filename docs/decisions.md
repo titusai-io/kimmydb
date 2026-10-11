@@ -10156,7 +10156,8 @@ any member, whoever owns it.
 
 **Not fixed here.** The drop race itself. `DELETE /v1/db/{db}` still has no
 database-level tombstone, so a late entry can still recreate a dropped database;
-what changes is that the cluster can now *see* it. The drop contract in
+what changes is that the cluster can now *see* it. **Closed by
+[ADR-229](#adr-229--a-database-drop-is-a-tombstone-filed-under-a-reserved-collection-name-and-every-member-buries-what-it-covers).** The drop contract in
 `docs/http-api.md` now says the drop is applied where it lands and should be
 issued once rather than per member.
 
@@ -26346,3 +26347,118 @@ failing the page, and the loop test with the exemption removed.
 **Wire and disk.** None. The tombstone is an ordinary `DocRecord` under an ordinary key; nothing about it is new to 0.45. **Rollback checked by hand on the 0.45.0 build:** a store restored by this build from a backup that carries a bare tombstone starts, answers `/readyz` 200 and stops clean on 0.45.0, and 0.45.0's own `kimmyd restore` of that 0.46 backup starts and stops clean (no error or panic lines). Retention collects a bare tombstone at tombstone retention like any other (tested). No rollback boundary.
 
 **Tests.** `kimmy-storage`: the bare tombstone writes no count, index entry or event; an equal-stamp delete appends the missing entry, publishes it once, and a re-delivery adds no second arrival row nor an event; no append at or below retention's record for the origin; a delete under `Hold` is never appended; only an equal-stamp tombstone delete reads the oplog (a counter); a live write below a bare or an appended tombstone still loses, by entries and by page; a carried delete the sender's coverage does not name is not recorded; recorded only over nothing or an older tombstone (a newer one stays); a bare tombstone is collected at tombstone retention; the cut-mechanism test `a_pull_that_holds_nothing_records_a_tombstone_and_the_delete_entry_still_lands` (a scoped repair, and a pull interrupted after its first page) now records the tombstone and still gets the entry. `kimmy-cluster`: the two pinned tests flipped, and the sweep's delete pair re-added (bare rounds and the member's own loop). **Mutation rows** (each fails a test): the receiver records nothing; the equal-stamp rule off; allowed under `Hold`; the retention gate dropped; the in-transaction lookup dropped; the coverage gate off; a newer tombstone overwritten. A plain `Raise` apply and a `Hold` apply of the delete leave a held mark alone (mutations: release for `Raise`, release for `Hold`); a bare tombstone and an owed append each move the clock to their stamp; the owed delete under `InWindow` raises the vectors and clears a stale mark; the interrupted multi-page pull (entries arrive after page 1, the pull never completes, a downstream member pulls by entries) ends without the document (mutation: the rule off). A page of only bare tombstones is committed (mutation: the page does not count them); a page whose only write is an index drop, a vector change or a refusal is durable and counted (mutations: the drops, the vector step, the count). **The kind and body guard is not redundant.** The owed test requires the entry to be a `Delete` **and** to carry no body, beside the tombstone at an equal stamp. A stamp is one write on an honest feed, and the first version of this change relied on that and dropped the body term; the break-the-guard pass showed an `Insert` with a body applied at exactly a tombstone's stamp was then appended to the oplog while the document stayed a tombstone, and served onward as an insert contradicting the state. Only a buggy or corrupt feed produces equal stamps, which is what a guard is for. Each term answers a malformed entry the other lets through (a `Delete` carrying a body; an `Insert` with none), and each has a test. A later stamp-equality row survived the first matrix too and has its own test (an older delete from another origin is superseded, not appended), as did the witness on the owed path (an appended entry moves the clock).
+
+## ADR-229 — A database drop is a tombstone, filed under a reserved collection name, and every member buries what it covers
+
+> **Closes the residual [ADR-138](#adr-138--an-orphaned-vector-shadow-is-compared-for-divergence-one-beside-its-collection-still-is-not) left**
+> ("`DELETE /v1/db/{db}` still has no database-level tombstone"). **Breaking** in the sense of
+> `compatibility.md`: the meaning of a route changes.
+
+**Decision.**
+
+1. **The tombstone** is a row of `COLLECTIONS_DROPPED` (ADR-034) keyed by
+   `CollectionId::derive(db, "__dropped_database")`, with the stamp of the drop. No table, `META` key,
+   `OpKind`, snapshot field or backup tag is new. The name is reserved: `validate_name` refuses every `__`
+   name, and a replicated creation of it is refused.
+2. **`drop_database` commits it first**, in a transaction of its own under the writer (ADR-148), with a
+   `DropCollection` entry whose body names the reserved collection. The burials that follow are unchanged and
+   still mint one entry each. The head is the request's first commit (ADR-192): the burials after it take the
+   writer with no budget, and a failure after it is `partially_applied` even when no collection has been
+   buried, with an empty `dropped`. A head whose commit's outcome is unknown is a plain `OutcomeUnknown`. A
+   drop of a database the member does not hold answers `{"dropped": false}` and writes nothing.
+3. **One rule, one comparison, on every route.** A creation stamped (origin `Hlc`) `c` is refused iff
+   `c <= S.hlc`, where `S` is the database's tombstone; a creation naming no `created` reads as older. The
+   entries path, a snapshot page's definition and the sweep all ask this and nothing else, so the order in which
+   a creation and the drop arrive cannot change the outcome. The collection tombstone keeps its own rule. A
+   local creation is never refused (it mints after what the member has seen) and is floored at `S`.
+4. **The sweep** buries every held collection with `created <= S.hlc` through the replicated path (the drop's
+   stamp, no new entry, chunked and handed to the purger, ADR-158/189), and **gives every collection it leaves
+   standing a tombstone of its own at `S`**, its shadow's with it. Floors are not carried between members, so
+   without this a survivor accepted a straggler of the life before it that a member which had refused the
+   creation did not. A refusal records the same two tombstones, which is how the database tombstone expands
+   into the id-only tombstones every other path reads: a document, an index or a vector configuration for a
+   refused collection is history, not a stop that lasts until a snapshot. It runs on the entry (after the
+   tombstone is recorded, and again on every redelivery), on **every** whole-database snapshot page that carries
+   a list of drops (not only one that recorded something new: a page whose sweep failed after its record
+   committed is retried with nothing new, completes and grants coverage of an entry nobody then serves), and
+   at a start. It is memoised per database by the tombstone and a generation of the collections, written only
+   after it succeeds.
+5. **The start** (`Engine::reconcile_database_tombstones`, called from `node::run` before the purger and the
+   cluster start, and not from `Engine::open`, which `restore --until` and tests also run) buries what a
+   tombstone covers. It heals a crash between the head and the burials, a drop a member on the previous build
+   applied as a plain collection drop, and a restore. It stops at a safe point between two burials and
+   shows as the `reconciling` phase on `/readyz`.
+6. **Subscribers are told.** A burial that mints no entry sends a notice on `Engine::subscribe_buried`, one per
+   burial or per sweep carrying every collection it took. A stream of one collection ends with
+   `CollectionDropped`; the vector cache forgets the shadow's graph, and reconciles against the catalogue if it
+   lagged. A stream subscribes before it resolves where it starts.
+7. **The incarnation clamp reads stamps.** For a collection that began after the tombstone,
+   `clamp_to_incarnation` bounds the incarnation by the tombstone's stamp and not by where the drop's entry
+   arrived: a token naming an entry at or before the stamp is of the life before (refused), any other token
+   resumes, a start with no token begins at the first entry stamped after it, and an entry of the life before
+   that arrives later is passed over by the floor. This is exact because every entry of the live life is
+   stamped above the tombstone and every one of the life before is refused by it. The position branch stays for
+   a collection that is absent and for a creation stamped at the tombstone's own `Hlc`.
+8. **A pre-existing defect is fixed with it.** The ordinary replicated `DropCollection` arm recorded only the
+   parent's id for a collection the member never held, so the first vector chunk for it stopped the batch as an
+   unknown collection until a snapshot. It records the shadow's id too, as a burial does.
+
+**Why.** The 0.26.0 field case had three causes. Two were closed by ADR-155/158/162/163/189. The third is a
+collection the dropping member never held, created on a peer shortly before: it has no tombstone anywhere, its
+`CreateCollection` entry applied, and the database came back on every member. A tombstone only the dropper
+holds leaves the cluster permanently split (the dropper refuses what its peers keep), so the drop has to
+destroy on every member what the database held at `S`; any design that converges does. Reproduced on 0.46.0
+before the change: the database is listed again on both members, with `late` in it.
+
+**Why a reserved collection and not a new entry kind.** A new `OpKind` is a frame decode failure on 0.46.0
+(`OpKind` is a serde enum and `protocol::decode` maps any error to `Malformed`): the window to that peer stalls
+for good. The on-disk codec has the same property, so a rolled-back 0.46.0 could not read its own oplog. There
+is no peer capability to gate on (the handshake negotiates no version), and withholding the entry from older
+peers is the ADR-224 hole by another route. The reserved collection is an entry every build already decodes,
+stores, serves and applies. **Measured on f1e725fd (0.46.0):** a `DropCollection` for the reserved name
+round-trips the oplog codec, applies on a 0.46.0 member holding the database's collections without an error
+and without touching them, records the tombstone, and is served onward and recorded by a third member.
+
+**Wire and disk. No rollback boundary.** No table, schema, backup tag, snapshot field or entry kind is new, and
+`SCHEMA_VERSION` stays 4. A 0.47.0 backup restores on 0.46.0 and the reverse. A member rolled back to 0.46.0
+carries the tombstone inert and applies a database drop as a plain collection drop. **A roll or a rollback has
+a clock on it:** a member on 0.46.0 keeps serving a collection the dropper never held until it restarts on
+0.47.0, which then buries it, and the tombstone it needs is collected after `tombstone_retention_secs`. A member
+left on 0.46.0 longer than that after a database drop, like any member behind that long, holds the collection
+with no tombstone left anywhere, and the database comes back cluster-wide. A roll or rollback must finish
+within `tombstone_retention_secs` of any database drop made during it.
+
+**Breaking, and what it costs.**
+- A `DELETE /v1/db/{db}` on a member that is behind also deletes, on every member, a collection created before
+  the drop that the member had not received, with its documents. It used to leave it, and the database came
+  back with it in it.
+- A write acknowledged into such a collection on a member that has not applied the drop (a 0.46.0 member in a
+  roll; a member that has not received it) is lost with it. The sweep logs the collection, its live documents
+  and how many of the first thousand were written after the drop.
+- **Resurrection is impossible except** for a creation concurrent with the drop within clock skew,
+  replication lag or the drop's burial duration (the dropper's burials are stamped after the tombstone, so a
+  same-named collection created in between is spared by the sweep and buried by the entry), and for a member
+  behind longer than the tombstone's retention. The pattern "drop `x` on one member, then create `x` on
+  another" is exposed to the first: the whole new database can be buried. **Recreate it on the same member, or
+  wait until every member lists it gone.**
+
+**Residuals, inherited.** A far-future stamp from a mis-clocked member (`HlcClock::observe` has no drift clamp,
+ADR-163) would bury and block the database as it does a collection. A pre-drop straggler **document** stamped
+exactly at the tombstone's `Hlc` with a node above the dropper's is judged by the floor on a member that
+refused and recreated, and by the stamp on one that did not; it needs a same-`Hlc` tie and exists today for
+collection drops. A name-bearing entry for a collection whose creation was collected and never seen stops the
+batch until a snapshot, as before.
+
+**Cost.** The head is one short commit. A sweep costs `list_databases` and a point read per database, plus a
+walk of the collections of a database with a tombstone only when its tombstone or its collections changed. The
+reconcile runs once at a start. The page sweep runs on every page with a list of drops, which the memo makes a
+point read.
+
+**Tests.** See `database_drop_tests.rs`, `watch.rs`, `kimmy-api/tests/api.rs`, `kimmyd/tests/lifecycle.rs`,
+`kimmy-cluster/tests/replication.rs` and the three-process case in `kimmyd/tests/cluster.rs`. Nine are red on
+0.46.0: the field sequence on two and three members, an older creation on a member that never held anything,
+a recreate floored at the drop, the tombstone ahead of the first burial, a page and a snapshot definition
+under the tombstone, a restored member, and the shadow defect. Four controls hold on both sides: a collection
+created after the drop stands and replicates, a newer life is not taken by a late drop, a drop of a database
+the member does not hold writes nothing, and the entry is an ordinary `DropCollection` (written to run
+unchanged on 0.46.0).

@@ -240,6 +240,22 @@ invisible the moment a drop became something a stream cares about. The
 cluster harness is what found it: a single node applies its own drop directly,
 so no in-process test could have.
 
+### A collection a database's drop buries ends streams too
+
+A database's drop (ADR-229) buries, on every member, the collections the
+database held when it was stamped, including ones the dropping member never
+held, and a member that buries one has no entry of its own to end the stream on
+it: the sweep, a snapshot page and a start bury without minting one. The engine
+sends a notice instead, and a stream of that collection ends with
+`Invalidate{CollectionDropped}` as it does for an entry. A stream opened while
+the sweep runs, or after a notice was missed, is ended too.
+
+A collection that **stands** under a database's drop (created after it) keeps
+its streams and its resume tokens, including a token issued before the drop
+reached the member: the stream's incarnation is bounded by the drop's stamp,
+which every entry of the live collection is above, and not by the position the
+drop's entry arrived at.
+
 ---
 
 ## Scopes
