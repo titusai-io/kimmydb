@@ -10,7 +10,43 @@ Versioning follows the pre-1.0 policy in
 [docs/compatibility.md](docs/compatibility.md): a `0.MINOR` bump may carry
 breaking changes and says so here; a `0.x.PATCH` bump never does.
 
-## Unreleased
+## 0.46.0 - 2026-10-11
+
+This is a minor release with no rollback boundary: no configuration key, table,
+`kimmy.format` schema (still 4) or redb version (4.3.0) changed, and the wire gained only
+optional fields and one list that 0.45.0 skips ([Rolling
+back](docs/operations.md)). What is new is that a member that caught up by a
+whole-database snapshot gives its peers, and receives, what a snapshot used to leave out, and
+serves only the history it actually holds:
+
+- **A snapshot-caught-up member no longer relays a window it cannot serve** (a vector
+  configuration, a collection drop, a collection creation), and the snapshot now carries
+  **index drops**, **a vector configuration turned off** and **deletes of documents a member
+  never held** (ADR-224, 225, 226, 228). New `kimmy_sync_horizon_state_held_total`.
+- **A change stream never skips events silently across a collected range or a snapshot's
+  hole**: it is refused with `ResumeTokenExpired` instead (ADR-173's addendum).
+- **A member could be stuck catching up indefinitely** on a snapshot page that changed a
+  client-supplied vector width; it no longer is (ADR-227).
+- **`dns:` and `k8s:` seeds resolve with the resolver `dns-srv:` uses**, so a stop does not
+  wait for a lookup (ADR-223).
+
+**Read before upgrading** (none is Breaking in the API, wire, disk or configuration sense):
+
+- **A missing `resolv.conf`, or one with no nameserver, is now an error** for `dns:` and
+  `k8s:` seeds (ADR-223).
+- **A member behind a snapshot-caught-up peer's grant may take a whole snapshot from it**,
+  where it was served entries across history the peer did not hold: the peer answers
+  `BeyondHorizon`, the member asks its other contacts first, and snapshots only if none can
+  serve it, at most one tick late (ADR-224).
+- **A retried `disable` of a vector configuration that is already off now writes and
+  replicates an entry**, and the entries path is last-writer-wins on the configuration's stamp
+  (ADR-226).
+- **Change-stream clients resuming across a member that caught up by snapshot may get
+  `ResumeTokenExpired` and must re-list** (the refusal is conservative: one maximum per
+  origin) (ADR-173's addendum).
+- **Holes from snapshots taken on 0.45.0 (or before this release) are not known**, so a member
+  that caught up that way serves across history it holds only as state until it is rebuilt from
+  a peer.
 
 ### Changed
 
@@ -63,7 +99,7 @@ breaking changes and says so here; a `0.x.PATCH` bump never does.
   the tombstone, and a `Delete` entry that arrives for a tombstone it already holds under
   the same stamp is appended to the oplog when it is missing (one extra read, only on that
   path) instead of being taken as already applied. It does not change a member whose pull
-  a completed snapshot's grant already covers; the hole (above) is what handles that.
+  a completed snapshot's grant already covers; the hole (ADR-224, below) is what handles that.
   ADR-228. No rollback boundary: the tombstone is an ordinary one.
 
 - **A member could be stuck catching up indefinitely when a snapshot page changed the width
@@ -114,9 +150,9 @@ breaking changes and says so here; a `0.x.PATCH` bump never does.
   would begin below it `BeyondHorizon`, which the peer meets by asking its other
   contacts first and taking the snapshot only if none can serve it (at most one tick
   late; at once with no other peer). This closes a vector configuration turned on, a
-  collection drop and a collection creation. **It does not yet close an index drop, a
-  vector configuration turned off, or a delete the member never held**: a snapshot
-  does not carry them, from any sender. New `kimmy_sync_horizon_state_held_total`.
+  collection drop and a collection creation; an index drop, a vector configuration turned
+  off and a delete the member never held are closed by the entries above, which make the
+  snapshot carry them. New `kimmy_sync_horizon_state_held_total`.
   ADR-224; amends ADR-180. No rollback boundary and no wire change: the record is
   `META` rows (`state_held:<node id>`), which a backup carries, which a restore keeps,
   and which 0.45.0 restores and never reads. **A snapshot taken before this release, or

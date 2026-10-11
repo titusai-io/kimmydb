@@ -2470,7 +2470,7 @@ to the release, and no more than that: it sits beside the archive, and whoever
 could replace one could replace both.
 
 ```bash
-V=0.45.0; A=kimmyd-x86_64-unknown-linux-musl.tar.xz
+V=0.46.0; A=kimmyd-x86_64-unknown-linux-musl.tar.xz
 curl -LO "https://github.com/titusai-io/kimmydb/releases/download/v$V/$A"
 curl -LO "https://github.com/titusai-io/kimmydb/releases/download/v$V/$A.sha256"
 shasum -a 256 -c "$A.sha256"
@@ -2490,7 +2490,7 @@ signing key, because there is none to copy. `gh` performs the check:
 gh attestation verify kimmyd-x86_64-unknown-linux-musl.tar.xz -R titusai-io/kimmydb
 
 # The container image, by tag or by digest
-gh attestation verify oci://ghcr.io/titusai-io/kimmydb:0.45.0 -R titusai-io/kimmydb
+gh attestation verify oci://ghcr.io/titusai-io/kimmydb:0.46.0 -R titusai-io/kimmydb
 ```
 
 A successful verification prints the workflow that produced the artifact and
@@ -2596,6 +2596,8 @@ refuses an unknown key in `[cluster]` when it parses the file, and exits: remove
 variable `KIMMY_CLUSTER_EXPECTED_MEMBERS` (`catch_up_wait_secs` has none) is
 ignored by 0.42.0, so a manifest that sets it needs no edit. A member on the
 defaults rolls back untouched.
+
+**Rolling back from 0.46.0 to 0.45.0 needs no store work and no edit to the configuration.** No table, `kimmy.format` schema (still 4), redb version or configuration key changed. The store gains `META` rows (`state_held:<node id>`, [ADR-224](decisions.md)), which a backup carries and 0.45.0 restores and never reads; a store holding them, and a backup holding them (with a bare tombstone, [ADR-228](decisions.md)), was started on a 0.45.0 build, answered `/readyz` and stopped clean, and 0.45.0's own `kimmyd restore` of such a backup did the same. The wire gained optional fields (`vector_changed` on a collection's state in a snapshot page, [ADR-226](decisions.md)) and one list (`dropped_indexes`, [ADR-225](decisions.md)), both of which 0.45.0 skips, so a mixed cluster keeps the old behaviour for them until every member has rolled. **What reopens on rolling back and forward:** *holes* — a snapshot taken while a member ran 0.45.0 records none, so that member serves across the span it holds only as state until it is rebuilt from a peer; and *unstamped vector changes* — a 0.45.0 build that rewrites a collection's metadata drops the vector stamp, so a vector change made on 0.45.0 reads as older than any stamped change when 0.46.0 returns ([ADR-226](decisions.md)). The tombstones recorded for documents a member never held are ordinary tombstones, collected at tombstone retention. `dns:` and `k8s:` seeds resolve through `getaddrinfo` again on 0.45.0 (no `resolv.conf` requirement), and `KIMMY_TEST_DNS_SERVER` is ignored there. Resume tokens are not changed on the wire; 0.45.0 does not refuse a token inside a hole. Nothing is stored for the new counter.
 
 **Rolling back from 0.45.0 to 0.44.0 needs no store work and no edit to the configuration.** No table, `kimmy.format` schema (still 4), redb version or configuration key changed. The wire gained one optional field on `Vectors` (`replay_from`, [ADR-212](decisions.md)'s addendum) and one in the facts block (`writer_wedged`, [ADR-220](decisions.md)), both of which 0.44.0 skips, and two frames, `ReplayEntries` and `ReplayAck`, which a member sends only to a peer that asked for the replay on its `Vectors`; 0.44.0 never asks, so it never meets them (it would read one as malformed, ending that contact). A wedged 0.45.0 member is refused as a target only by 0.45.0 peers, and a 0.44.0 member does not read `degraded` in `/v1/topology`. `aggregate` with `explain` is a `422` on 0.44.0, and a `let` name inside a sub-pipeline `$expr` a `400`. A restored member's replay asked of a 0.44.0 peer is answered over the member's own dial, as before. Nothing is stored for the new counters.
 
