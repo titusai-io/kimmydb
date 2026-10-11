@@ -5802,6 +5802,452 @@ async fn an_index_relays_through_two_snapshot_hops() {
     assert_eq!(entry.stamp.node, a.engine.node_id(), "at a's stamp, not p's");
 }
 
+// ---------------------------------------------------------------------------
+// The rest of ADR-180's sweep: every other change a whole-database snapshot
+// grants as state, relayed through the member that took the snapshot.
+//
+// The topology is the index case's. `m` holds a prefix of `a`'s history and
+// is behind one change; `a` then writes a trailing document into a
+// collection `m` holds, so `p`'s window to `m` is not empty; `a`'s oplog is
+// aged out entirely, so `p` joining afresh can only catch up by snapshot; `m`
+// then talks to `p` alone, in four bare rounds (`Pull::Rounds`) and again in
+// the member's own replication loop (`Pull::Loop`), which adds the divergence
+// check and its repairs. A control for each shows the same change reaching
+// `m` by entries, so a red here is the snapshot hop and not the harness.
+//
+// On main: vector configuration on and off, an index drop, a collection drop
+// and a document delete fail both ways. An empty collection's creation fails
+// the bare rounds only; the loop heals it. The settled definition (ADR-132)
+// and a delete through a member that held the document pass: ADR-180 and
+// ADR-167 cover them.
+// ---------------------------------------------------------------------------
+
+/// `a` with `shop.orders` and document 1, `m` having pulled all of it, and
+/// `setup` run on `a` before `m` pulls (what `m` is to hold already).
+async fn origin_and_a_member_that_holds_it(
+    setup: impl FnOnce(&Engine, &kimmy_storage::CollectionMeta),
+) -> (Node, Node, kimmy_storage::CollectionMeta) {
+    let a = node().await;
+    let ca = a.engine.create_collection("shop", "orders").unwrap();
+    a.engine.insert(&ca, doc! { "_id": 1, "x": 1 }).unwrap();
+    setup(&a.engine, &ca);
+    let m = node().await;
+    sync_once(&m.engine, a.addr, SECRET, None).await.unwrap();
+    (a, m, ca)
+}
+
+/// How `m` pulls from `p`: four bare rounds, or the member's own replication
+/// loop (discovery, the divergence check, repairs) for a dozen rounds.
+#[derive(Clone, Copy)]
+enum Pull {
+    Rounds,
+    Loop,
+}
+
+/// Have `p` take `a`'s state by snapshot (`age_out` first, so it can only be
+/// that) or by entries. Returns `p`.
+async fn p_catches_up_from(a: &Node, by_snapshot: bool) -> Node {
+    if by_snapshot {
+        age_out_fully(&a.engine);
+    }
+    let p = node().await;
+    sync_once(&p.engine, a.addr, SECRET, None).await.unwrap();
+    p
+}
+
+/// Let `m` pull from `p` alone.
+async fn m_pulls_from(m: &Node, p: &Node, how: Pull) {
+    match how {
+        Pull::Rounds => {
+            for _ in 0..4 {
+                sync_once(&m.engine, p.addr, SECRET, None).await.unwrap();
+            }
+        }
+        Pull::Loop => {
+            use kimmy_cluster::{ReplicationConfig, RoundReport, SeedSource, replicate};
+            let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<RoundReport>();
+            let mut config = ReplicationConfig::new(
+                vec![SeedSource::Static(vec![p.addr])],
+                SECRET.into(),
+                m.addr,
+            );
+            config.sync_interval = Duration::from_millis(50);
+            config.discovery_interval = Duration::from_millis(50);
+            config.on_round = Some(Arc::new(move |report| {
+                let _ = tx.send(report);
+            }));
+            let looping = tokio::spawn(replicate(Arc::clone(&m.engine), config));
+            let (mut repairs, mut divergent) = (0, 0);
+            for _ in 0..24 {
+                let report = tokio::time::timeout(Duration::from_secs(20), rx.recv())
+                    .await
+                    .expect("the loop reports")
+                    .expect("the loop keeps reporting");
+                repairs += report.repair_rounds;
+                divergent = divergent.max(report.divergent_collections);
+            }
+            looping.abort();
+            eprintln!(
+                "loop: repair rounds {repairs}, most collections divergent at once {divergent}"
+            );
+        }
+    }
+}
+
+fn documents_of(engine: &Engine, db: &str, name: &str) -> i64 {
+    let held = engine.get_collection(db, name).unwrap();
+    engine.count(&held, kimmy_storage::WalkScope::Request).unwrap() as i64
+}
+
+// -- CreateCollection --------------------------------------------------------
+
+async fn a_collection_created_after_m_pulled(
+    by_snapshot: bool,
+    with_document: bool,
+    how: Pull,
+) -> (Node, Node) {
+    let (a, m, ca) = origin_and_a_member_that_holds_it(|_, _| {}).await;
+    let audit = a.engine.create_collection("shop", "audit").unwrap();
+    if with_document {
+        a.engine.insert(&audit, doc! { "_id": "a" }).unwrap();
+    }
+    a.engine.insert(&ca, doc! { "_id": 2, "x": 2 }).unwrap();
+    let p = p_catches_up_from(&a, by_snapshot).await;
+    m_pulls_from(&m, &p, how).await;
+    (a, m)
+}
+
+/// Red on main for a bare round, which is the skip. The member's own loop
+/// heals it (existence half of the divergence check, then a scoped snapshot),
+/// which `..._in_the_loop` pins green: a lag, not a permanent gap.
+#[tokio::test]
+async fn relay_an_empty_collection_created_after_m_pulled() {
+    let (_a, m) = a_collection_created_after_m_pulled(true, false, Pull::Rounds).await;
+    assert_eq!(documents_of(&m.engine, "shop", "orders"), 2, "m took p's window");
+    assert!(
+        m.engine.get_collection("shop", "audit").is_ok(),
+        "m learned the collection it was relayed past"
+    );
+}
+
+#[tokio::test]
+async fn control_relay_an_empty_collection_without_the_snapshot_hop() {
+    let (_a, m) = a_collection_created_after_m_pulled(false, false, Pull::Rounds).await;
+    assert!(m.engine.get_collection("shop", "audit").is_ok(), "control");
+}
+
+// -- ConfigureVectors (on) ---------------------------------------------------
+
+async fn vectors_configured_after_m_pulled(by_snapshot: bool, how: Pull) -> (Node, Node) {
+    let (a, m, ca) = origin_and_a_member_that_holds_it(|_, _| {}).await;
+    a.engine.configure_vectors("shop", "orders", vector_config()).unwrap();
+    a.engine.insert(&ca, doc! { "_id": 2, "x": 2 }).unwrap();
+    let p = p_catches_up_from(&a, by_snapshot).await;
+    m_pulls_from(&m, &p, how).await;
+    (a, m)
+}
+
+#[tokio::test]
+async fn relay_a_vector_configuration_turned_on_after_m_pulled() {
+    let (_a, m) = vectors_configured_after_m_pulled(true, Pull::Rounds).await;
+    assert_eq!(documents_of(&m.engine, "shop", "orders"), 2, "m took p's window");
+    let held = m.engine.get_collection("shop", "orders").unwrap();
+    assert!(held.vector.is_some(), "and the configuration in it: {:?}", held.vector);
+}
+
+#[tokio::test]
+async fn control_relay_a_vector_configuration_without_the_snapshot_hop() {
+    let (_a, m) = vectors_configured_after_m_pulled(false, Pull::Rounds).await;
+    let held = m.engine.get_collection("shop", "orders").unwrap();
+    assert!(held.vector.is_some(), "control: {:?}", held.vector);
+}
+
+// -- ConfigureVectors (off) --------------------------------------------------
+
+async fn vectors_disabled_after_m_pulled(by_snapshot: bool, how: Pull) -> (Node, Node) {
+    let (a, m, ca) = origin_and_a_member_that_holds_it(|engine, _| {
+        engine.configure_vectors("shop", "orders", vector_config()).unwrap();
+    })
+    .await;
+    assert!(
+        m.engine.get_collection("shop", "orders").unwrap().vector.is_some(),
+        "premise: m holds the configuration"
+    );
+    a.engine.disable_vectors("shop", "orders", false).unwrap();
+    a.engine.insert(&ca, doc! { "_id": 2, "x": 2 }).unwrap();
+    let p = p_catches_up_from(&a, by_snapshot).await;
+    m_pulls_from(&m, &p, how).await;
+    (a, m)
+}
+
+#[tokio::test]
+async fn relay_a_vector_configuration_turned_off_after_m_pulled() {
+    let (_a, m) = vectors_disabled_after_m_pulled(true, Pull::Rounds).await;
+    assert_eq!(documents_of(&m.engine, "shop", "orders"), 2, "m took p's window");
+    let held = m.engine.get_collection("shop", "orders").unwrap();
+    assert!(held.vector.is_none(), "and the configuration it was relayed past: {:?}", held.vector);
+}
+
+#[tokio::test]
+async fn control_relay_a_vector_configuration_turned_off_without_the_snapshot_hop() {
+    let (_a, m) = vectors_disabled_after_m_pulled(false, Pull::Rounds).await;
+    let held = m.engine.get_collection("shop", "orders").unwrap();
+    assert!(held.vector.is_none(), "control: {:?}", held.vector);
+}
+
+// -- DropIndex ---------------------------------------------------------------
+
+async fn index_dropped_after_m_pulled(by_snapshot: bool, how: Pull) -> (Node, Node) {
+    let (a, m, ca) = origin_and_a_member_that_holds_it(|engine, _| {
+        engine.create_index("shop", "orders", vec![field("x")], true, Some("by_x".into())).unwrap();
+    })
+    .await;
+    assert!(
+        m.engine.get_collection("shop", "orders").unwrap().index("by_x").is_some(),
+        "premise: m holds the index"
+    );
+    assert!(a.engine.drop_index("shop", "orders", "by_x").unwrap());
+    a.engine.insert(&ca, doc! { "_id": 2, "x": 2 }).unwrap();
+    let p = p_catches_up_from(&a, by_snapshot).await;
+    m_pulls_from(&m, &p, how).await;
+    (a, m)
+}
+
+#[tokio::test]
+async fn relay_an_index_dropped_after_m_pulled() {
+    let (_a, m) = index_dropped_after_m_pulled(true, Pull::Rounds).await;
+    assert_eq!(documents_of(&m.engine, "shop", "orders"), 2, "m took p's window");
+    let held = m.engine.get_collection("shop", "orders").unwrap();
+    assert!(held.index("by_x").is_none(), "and the drop in it: {:?}", held.indexes);
+}
+
+#[tokio::test]
+async fn control_relay_an_index_drop_without_the_snapshot_hop() {
+    let (_a, m) = index_dropped_after_m_pulled(false, Pull::Rounds).await;
+    let held = m.engine.get_collection("shop", "orders").unwrap();
+    assert!(held.index("by_x").is_none(), "control: {:?}", held.indexes);
+}
+
+// -- DropCollection ----------------------------------------------------------
+
+async fn collection_dropped_after_m_pulled(by_snapshot: bool, how: Pull) -> (Node, Node) {
+    let a = node().await;
+    let doomed = a.engine.create_collection("shop", "doomed").unwrap();
+    a.engine.insert(&doomed, doc! { "_id": 1 }).unwrap();
+    let kept = a.engine.create_collection("shop", "orders").unwrap();
+    a.engine.insert(&kept, doc! { "_id": 1 }).unwrap();
+    let m = node().await;
+    sync_once(&m.engine, a.addr, SECRET, None).await.unwrap();
+    assert!(m.engine.get_collection("shop", "doomed").is_ok(), "premise: m holds it");
+
+    assert!(a.engine.drop_collection("shop", "doomed").unwrap());
+    a.engine.insert(&kept, doc! { "_id": 2 }).unwrap();
+    let p = p_catches_up_from(&a, by_snapshot).await;
+    m_pulls_from(&m, &p, how).await;
+    (a, m)
+}
+
+#[tokio::test]
+async fn relay_a_collection_dropped_after_m_pulled() {
+    let (_a, m) = collection_dropped_after_m_pulled(true, Pull::Rounds).await;
+    assert_eq!(documents_of(&m.engine, "shop", "orders"), 2, "m took p's window");
+    assert!(m.engine.get_collection("shop", "doomed").is_err(), "and the drop it was relayed past");
+}
+
+#[tokio::test]
+async fn control_relay_a_collection_drop_without_the_snapshot_hop() {
+    let (_a, m) = collection_dropped_after_m_pulled(false, Pull::Rounds).await;
+    assert!(m.engine.get_collection("shop", "doomed").is_err(), "control");
+}
+
+// -- Document delete ---------------------------------------------------------
+
+async fn document_deleted_after_m_pulled(
+    by_snapshot: bool,
+    p_held_it: bool,
+    how: Pull,
+) -> (Node, Node) {
+    let (a, m, ca) = origin_and_a_member_that_holds_it(|engine, ca| {
+        engine.insert(ca, doc! { "_id": 2, "x": 2 }).unwrap();
+    })
+    .await;
+    // `p` that held the document before the delete is ADR-167's case.
+    let held_before = node().await;
+    if p_held_it {
+        sync_once(&held_before.engine, a.addr, SECRET, None).await.unwrap();
+    }
+    assert!(a.engine.delete(&ca, &DocId::Int64(2)).unwrap());
+    a.engine.insert(&ca, doc! { "_id": 3, "x": 3 }).unwrap();
+    if by_snapshot {
+        age_out_fully(&a.engine);
+    }
+    let p = if p_held_it { held_before } else { node().await };
+    sync_once(&p.engine, a.addr, SECRET, None).await.unwrap();
+    m_pulls_from(&m, &p, how).await;
+    (a, m)
+}
+
+#[tokio::test]
+async fn relay_a_delete_through_a_member_that_never_held_the_document() {
+    let (_a, m) = document_deleted_after_m_pulled(true, false, Pull::Rounds).await;
+    let held = m.engine.get_collection("shop", "orders").unwrap();
+    assert!(m.engine.get(&held, &DocId::Int64(3)).unwrap().is_some(), "m took p's window");
+    assert!(
+        m.engine.get(&held, &DocId::Int64(2)).unwrap().is_none(),
+        "and the delete it was relayed past"
+    );
+}
+
+#[tokio::test]
+async fn control_relay_a_delete_without_the_snapshot_hop() {
+    let (_a, m) = document_deleted_after_m_pulled(false, false, Pull::Rounds).await;
+    let held = m.engine.get_collection("shop", "orders").unwrap();
+    assert!(m.engine.get(&held, &DocId::Int64(2)).unwrap().is_none(), "control");
+}
+
+#[tokio::test]
+async fn lookalike_relay_a_delete_through_a_member_that_held_the_document() {
+    // ADR-167: `p` held the document, so its restore builds the Delete entry.
+    // Passes on main.
+    let (_a, m) = document_deleted_after_m_pulled(true, true, Pull::Rounds).await;
+    let held = m.engine.get_collection("shop", "orders").unwrap();
+    assert!(m.engine.get(&held, &DocId::Int64(2)).unwrap().is_none());
+}
+
+// -- Settling rival index definitions (ADR-132) ------------------------------
+
+async fn rival_definitions_settled_by_the_restore(by_snapshot: bool, how: Pull) -> (Node, Node) {
+    let (a, m, ca) = origin_and_a_member_that_holds_it(|_, _| {}).await;
+    // `p` holds the collection, and its own `by_x` over y, made before a's
+    // over x -- the later stamp wins when p restores a's.
+    let p = node().await;
+    sync_once(&p.engine, a.addr, SECRET, None).await.unwrap();
+    p.engine.create_index("shop", "orders", vec![field("y")], false, Some("by_x".into())).unwrap();
+    a.engine.create_index("shop", "orders", vec![field("x")], false, Some("by_x".into())).unwrap();
+    a.engine.insert(&ca, doc! { "_id": 2, "x": 2 }).unwrap();
+    if by_snapshot {
+        age_out_fully(&a.engine);
+    }
+    sync_once(&p.engine, a.addr, SECRET, None).await.unwrap();
+    let winner = a.engine.get_collection("shop", "orders").unwrap().index("by_x").unwrap().clone();
+    assert_eq!(
+        p.engine.get_collection("shop", "orders").unwrap().index("by_x").unwrap().fields,
+        winner.fields,
+        "premise: p settled on a's definition"
+    );
+    m_pulls_from(&m, &p, how).await;
+    (a, m)
+}
+
+#[tokio::test]
+async fn relay_a_definition_settled_by_the_restore() {
+    let (a, m) = rival_definitions_settled_by_the_restore(true, Pull::Rounds).await;
+    let winner = a.engine.get_collection("shop", "orders").unwrap().index("by_x").unwrap().clone();
+    let held = m.engine.get_collection("shop", "orders").unwrap();
+    assert_eq!(
+        held.index("by_x").map(|i| i.fields.clone()),
+        Some(winner.fields),
+        "{:?}",
+        held.indexes
+    );
+}
+
+#[tokio::test]
+async fn control_relay_a_settled_definition_without_the_snapshot_hop() {
+    let (a, m) = rival_definitions_settled_by_the_restore(false, Pull::Rounds).await;
+    let winner = a.engine.get_collection("shop", "orders").unwrap().index("by_x").unwrap().clone();
+    let held = m.engine.get_collection("shop", "orders").unwrap();
+    assert_eq!(held.index("by_x").map(|i| i.fields.clone()), Some(winner.fields), "control");
+}
+
+// -- The same, through the member's own replication loop -----------------
+// The loop adds discovery, the divergence check (existence and count) and the
+// repairs they plan, which a bare round does not.
+
+#[tokio::test]
+async fn relay_an_empty_collection_created_after_m_pulled_in_the_loop() {
+    let (_a, m) = a_collection_created_after_m_pulled(true, false, Pull::Loop).await;
+    assert_eq!(documents_of(&m.engine, "shop", "orders"), 2, "m took p's window");
+    assert!(
+        m.engine.get_collection("shop", "audit").is_ok(),
+        "m learned the collection it was relayed past"
+    );
+}
+
+#[tokio::test]
+async fn lookalike_relay_a_collection_holding_a_document_heals_on_the_unknown_collection_stop_in_the_loop()
+ {
+    // The variant the finding calls covered: the window's document names a
+    // collection `m` lacks, the batch stops there and a scoped snapshot
+    // restores the definition. Passes on main.
+    let (_a, m) = a_collection_created_after_m_pulled(true, true, Pull::Loop).await;
+    assert!(m.engine.get_collection("shop", "audit").is_ok(), "healed through the stop");
+}
+
+#[tokio::test]
+async fn relay_a_vector_configuration_turned_on_after_m_pulled_in_the_loop() {
+    let (_a, m) = vectors_configured_after_m_pulled(true, Pull::Loop).await;
+    assert_eq!(documents_of(&m.engine, "shop", "orders"), 2, "m took p's window");
+    let held = m.engine.get_collection("shop", "orders").unwrap();
+    assert!(held.vector.is_some(), "and the configuration in it: {:?}", held.vector);
+}
+
+#[tokio::test]
+async fn relay_a_vector_configuration_turned_off_after_m_pulled_in_the_loop() {
+    let (_a, m) = vectors_disabled_after_m_pulled(true, Pull::Loop).await;
+    assert_eq!(documents_of(&m.engine, "shop", "orders"), 2, "m took p's window");
+    let held = m.engine.get_collection("shop", "orders").unwrap();
+    assert!(held.vector.is_none(), "and the configuration it was relayed past: {:?}", held.vector);
+}
+
+#[tokio::test]
+async fn relay_an_index_dropped_after_m_pulled_in_the_loop() {
+    let (_a, m) = index_dropped_after_m_pulled(true, Pull::Loop).await;
+    assert_eq!(documents_of(&m.engine, "shop", "orders"), 2, "m took p's window");
+    let held = m.engine.get_collection("shop", "orders").unwrap();
+    assert!(held.index("by_x").is_none(), "and the drop in it: {:?}", held.indexes);
+}
+
+#[tokio::test]
+async fn relay_a_collection_dropped_after_m_pulled_in_the_loop() {
+    let (_a, m) = collection_dropped_after_m_pulled(true, Pull::Loop).await;
+    assert_eq!(documents_of(&m.engine, "shop", "orders"), 2, "m took p's window");
+    assert!(m.engine.get_collection("shop", "doomed").is_err(), "and the drop it was relayed past");
+}
+
+#[tokio::test]
+async fn relay_a_delete_through_a_member_that_never_held_the_document_in_the_loop() {
+    let (_a, m) = document_deleted_after_m_pulled(true, false, Pull::Loop).await;
+    let held = m.engine.get_collection("shop", "orders").unwrap();
+    assert!(m.engine.get(&held, &DocId::Int64(3)).unwrap().is_some(), "m took p's window");
+    assert!(
+        m.engine.get(&held, &DocId::Int64(2)).unwrap().is_none(),
+        "and the delete it was relayed past"
+    );
+}
+
+#[tokio::test]
+async fn lookalike_relay_a_delete_through_a_member_that_held_the_document_in_the_loop() {
+    // ADR-167: `p` held the document, so its restore builds the Delete entry.
+    // Passes on main.
+    let (_a, m) = document_deleted_after_m_pulled(true, true, Pull::Loop).await;
+    let held = m.engine.get_collection("shop", "orders").unwrap();
+    assert!(m.engine.get(&held, &DocId::Int64(2)).unwrap().is_none());
+}
+
+#[tokio::test]
+async fn relay_a_definition_settled_by_the_restore_in_the_loop() {
+    let (a, m) = rival_definitions_settled_by_the_restore(true, Pull::Loop).await;
+    let winner = a.engine.get_collection("shop", "orders").unwrap().index("by_x").unwrap().clone();
+    let held = m.engine.get_collection("shop", "orders").unwrap();
+    assert_eq!(
+        held.index("by_x").map(|i| i.fields.clone()),
+        Some(winner.fields),
+        "{:?}",
+        held.indexes
+    );
+}
+
 // -----------------------------------------------------------------------
 // A large collection drop does not stop a member's replication (ADR-189)
 
