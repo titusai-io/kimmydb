@@ -5126,13 +5126,10 @@ async fn a_delete_crosses_the_wire_in_a_snapshot_to_a_member_that_held_the_docum
 }
 
 #[tokio::test]
-async fn a_delete_does_not_yet_reach_a_member_through_one_that_never_held_the_document() {
-    // A KNOWN GAP, pinned over the wire so a change to it is noticed. C holds
-    // the document; A deletes it; B, which never held it, catches up from A by
-    // snapshot and records nothing; C then catches up from B by snapshot, and
-    // B's walk has no tombstone to carry, so C keeps the document. Tracked by
-    // the plan "a delete relayed through a member that never held the document
-    // does not travel", whose first step is to flip the final assertion.
+async fn a_delete_reaches_a_member_through_one_that_never_held_the_document() {
+    // C holds the document; A deletes it; B, which never held it, catches up from A by
+    // snapshot and records the tombstone (ADR-228); C then catches up from B by
+    // snapshot, and B's walk carries it, so C loses the document.
     //
     // Both catch-ups are snapshots, which takes arranging: a member is served
     // one only when its peer has collected an entry it lacks.
@@ -5178,8 +5175,54 @@ async fn a_delete_does_not_yet_reach_a_member_through_one_that_never_held_the_do
         "the snapshot must have served"
     );
     assert!(
-        c.engine.get(&cc, &DocId::Int64(2)).unwrap().is_some(),
-        "the known gap: C keeps the document -- if this now fails, the gap closed; update the plan"
+        c.engine.get(&cc, &DocId::Int64(2)).unwrap().is_none(),
+        "the delete travelled through the member that never held the document"
+    );
+}
+
+#[tokio::test]
+async fn a_delete_arriving_by_entries_in_an_interrupted_multi_page_pull_still_reaches_a_downstream_member()
+ {
+    // The shape the review reproduced for ADR-167's cut mechanism. B takes the first page
+    // of A's snapshot, which carries the delete of a document B never held as a bare
+    // tombstone, and the pull is then interrupted: no grant, no hole. The `Delete` entry
+    // reaches B by entries. C holds the document and pulls from B by entries. The entry
+    // must be appended when it meets the tombstone (ADR-228): otherwise B has nothing to
+    // serve C for the delete, and C keeps the document.
+    let a = node().await;
+    let ca = a.engine.create_collection("shop", "orders").unwrap();
+    let docs = kimmy_storage::SNAPSHOT_PAGE as i64 + 1;
+    for i in 0..docs {
+        a.engine.insert(&ca, doc! { "_id": i }).unwrap();
+    }
+    let c = node().await;
+    for _ in 0..8 {
+        sync_once(&c.engine, a.addr, SECRET, None).await.unwrap();
+    }
+    let cc = c.engine.get_collection("shop", "orders").unwrap();
+    assert!(c.engine.get(&cc, &DocId::Int64(0)).unwrap().is_some(), "premise: C holds it");
+
+    assert!(a.engine.delete(&ca, &DocId::Int64(0)).unwrap());
+    let entries = a
+        .engine
+        .read_oplog_from(kimmy_core::Hlc::ZERO, 100_000, kimmy_storage::WalkScope::Background)
+        .unwrap();
+
+    let b = node().await;
+    let mut progress = kimmy_storage::SnapshotProgress::whole_database();
+    let first = a.engine.snapshot_page(None, None).unwrap();
+    assert!(first.next.is_some() && !first.deleted_documents.is_empty(), "premise: a first page");
+    b.engine.apply_snapshot_page(a.engine.node_id(), &mut progress, &first).unwrap();
+    assert!(!progress.is_complete(), "premise: the pull is interrupted");
+    // The entries arrive after page 1.
+    b.engine.apply_batch(&entries).unwrap();
+
+    for _ in 0..4 {
+        sync_once(&c.engine, b.addr, SECRET, None).await.unwrap();
+    }
+    assert!(
+        c.engine.get(&cc, &DocId::Int64(0)).unwrap().is_none(),
+        "C, which held the document, ends without it"
     );
 }
 
@@ -6096,6 +6139,17 @@ async fn document_deleted_after_m_pulled(
 }
 
 #[tokio::test]
+async fn relay_a_delete_through_a_member_that_never_held_the_document() {
+    let (_a, m) = document_deleted_after_m_pulled(true, false, Pull::Rounds).await;
+    let held = m.engine.get_collection("shop", "orders").unwrap();
+    assert!(m.engine.get(&held, &DocId::Int64(3)).unwrap().is_some(), "m took p's window");
+    assert!(
+        m.engine.get(&held, &DocId::Int64(2)).unwrap().is_none(),
+        "and the delete it was relayed past"
+    );
+}
+
+#[tokio::test]
 async fn control_relay_a_delete_without_the_snapshot_hop() {
     let (_a, m) = document_deleted_after_m_pulled(false, false, Pull::Rounds).await;
     let held = m.engine.get_collection("shop", "orders").unwrap();
@@ -6194,6 +6248,17 @@ async fn relay_a_collection_dropped_after_m_pulled_in_the_loop() {
     let (_a, m) = collection_dropped_after_m_pulled(true, Pull::Loop).await;
     assert_eq!(documents_of(&m.engine, "shop", "orders"), 2, "m took p's window");
     assert!(m.engine.get_collection("shop", "doomed").is_err(), "and the drop it was relayed past");
+}
+
+#[tokio::test]
+async fn relay_a_delete_through_a_member_that_never_held_the_document_in_the_loop() {
+    let (_a, m) = document_deleted_after_m_pulled(true, false, Pull::Loop).await;
+    let held = m.engine.get_collection("shop", "orders").unwrap();
+    assert!(m.engine.get(&held, &DocId::Int64(3)).unwrap().is_some(), "m took p's window");
+    assert!(
+        m.engine.get(&held, &DocId::Int64(2)).unwrap().is_none(),
+        "and the delete it was relayed past"
+    );
 }
 
 #[tokio::test]

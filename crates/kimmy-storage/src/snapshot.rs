@@ -918,7 +918,7 @@ impl Engine {
 
             // The page's deletes, in the same transaction as its documents, so
             // they share its cursor and, on the last page, its grant (ADR-167).
-            self.apply_carried_document_deletes(
+            let recorded = self.apply_carried_document_deletes(
                 &txn,
                 &mut memo,
                 page,
@@ -931,7 +931,9 @@ impl Engine {
             // been sent. It rides in the last page's transaction, so a
             // snapshot costs no commit of bookkeeping (ADR-119's rule for a
             // batch's vector).
-            let mut wrote = !pending.is_empty();
+            // A bare tombstone (ADR-228) is a write that has nothing to publish, so it
+            // is not in `pending`; a page that only recorded those must still commit.
+            let mut wrote = !pending.is_empty() || recorded > 0;
             if let Some(granted) = &grant {
                 wrote |= Engine::absorb_version_vector_in_txn(&txn, granted)?;
             }
@@ -1071,7 +1073,8 @@ impl Engine {
         page: &SnapshotPage,
         pending: &mut Vec<Pending>,
         superseded: &mut usize,
-    ) -> Result<()> {
+    ) -> Result<usize> {
+        let mut recorded = 0usize;
         for tombstone in &page.deleted_documents {
             if tombstone.stamp.hlc > page.versions.get(tombstone.stamp.node) {
                 warn!(
@@ -1105,12 +1108,18 @@ impl Engine {
                 }
             };
             let Some(current) = existing else {
+                self.record_bare_tombstone(txn, &collection, tombstone)?;
+                recorded += 1;
                 continue;
             };
             if !tombstone.stamp.wins_over(&current.stamp) {
                 continue;
             }
             let Some(document) = current.document()? else {
+                // A tombstone here, at an older stamp: the newer delete is the one to
+                // carry (ADR-228).
+                self.record_bare_tombstone(txn, &collection, tombstone)?;
+                recorded += 1;
                 continue;
             };
             let id = match document.get(crate::ID_FIELD) {
@@ -1144,6 +1153,41 @@ impl Engine {
                 pending.push(Pending { collection, entry, id, violations });
             }
         }
+        Ok(recorded)
+    }
+
+    /// Record a delete this node holds nothing for, as a tombstone under the key the
+    /// page names (ADR-228), so that it carries the delete onward and the entry that
+    /// comes for it is not mistaken for a write it has applied.
+    ///
+    /// Reached only for a tombstone the sender's coverage names (ADR-163), that is not
+    /// history here, and whose key is **absent or held as a tombstone at an older
+    /// stamp**; a live document keeps its delete through the replicated path, and a
+    /// newer record keeps its own. **Writes the record and nothing else**: no oplog
+    /// entry (there is no `_id` to mint one from, and the entry that does come is
+    /// appended by the equal-stamp rule in `apply_remote_in_txn`), no index
+    /// maintenance (nothing was held to unindex), no count decrement (`put_record`
+    /// moves the count by liveness, and a tombstone over nothing or over a tombstone
+    /// moves nothing), and nothing published (no entry is made; the entry that does
+    /// arrive is published once, as a delete of a document never held is by entries).
+    fn record_bare_tombstone(
+        &self,
+        txn: &crate::engine::WriteTxn<'_>,
+        collection: &CollectionMeta,
+        tombstone: &SnapshotTombstone,
+    ) -> Result<()> {
+        let record = kimmy_core::DocRecord::tombstone(tombstone.stamp);
+        let mut docs = txn.open_table(tables::DOCS)?;
+        crate::live_count::put_record(
+            txn,
+            &mut docs,
+            collection.id.0,
+            &tombstone.key,
+            &codec::encode_doc_record(&record),
+        )?;
+        drop(docs);
+        // The clock, as `apply_remote_in_txn` does for any entry it meets.
+        self.witness(&tombstone.stamp);
         Ok(())
     }
 
@@ -4985,14 +5029,14 @@ mod tests {
     }
 
     #[test]
-    fn a_pull_that_holds_nothing_records_nothing_and_the_delete_entry_still_lands() {
-        // What stops a tombstone recorded by key from coming back. Such a
-        // record was built and cut: where the `Delete` entry was still owed it
-        // met a tombstone at its own stamp when it came, was superseded before
-        // it was appended, and never reached this node's oplog -- so a member
-        // pulling entries from here kept the document. Both routes, and the
-        // shape the review reproduced: entries arriving part-way through a
-        // multi-page pull.
+    fn a_pull_that_holds_nothing_records_a_tombstone_and_the_delete_entry_still_lands() {
+        // What makes a tombstone recorded by key safe (ADR-228). Such a record was
+        // built and cut (ADR-167): where the `Delete` entry was still owed it met a
+        // tombstone at its own stamp when it came, was superseded before it was
+        // appended, and never reached this node's oplog -- so a member pulling
+        // entries from here kept the document. The equal-stamp rule appends it.
+        // Both routes, and the shape the review reproduced: entries arriving
+        // part-way through a multi-page pull.
         let (a, _da) = engine();
         let ca = a.create_collection("shop", "orders").unwrap();
         for i in 0..=(SNAPSHOT_PAGE as i64) {
@@ -5006,7 +5050,8 @@ mod tests {
         let (b, _db) = engine();
         transfer_under(&b, &a, &mut SnapshotProgress::of_collection(ca.id));
         let cb = b.get_collection("shop", "orders").unwrap();
-        assert!(!holds_tombstone(&b, &cb, &gone), "nothing held, nothing recorded");
+        assert!(holds_tombstone(&b, &cb, &gone), "nothing held, the tombstone recorded");
+        assert_eq!(deletes_in_oplog(&b, &gone), 0, "and no entry made up for it");
         b.apply_batch(&entries).unwrap();
         assert_eq!(deletes_in_oplog(&b, &gone), 1, "the entry lands when it comes");
 
@@ -5017,7 +5062,8 @@ mod tests {
         c.apply_snapshot_page(a.node_id(), &mut SnapshotProgress::whole_database(), &first)
             .unwrap();
         let cc = c.get_collection("shop", "orders").unwrap();
-        assert!(!holds_tombstone(&c, &cc, &gone));
+        assert!(holds_tombstone(&c, &cc, &gone));
+        assert_eq!(deletes_in_oplog(&c, &gone), 0);
         c.apply_batch(&entries).unwrap();
         assert_eq!(deletes_in_oplog(&c, &gone), 1, "and on this route too");
     }
@@ -5752,15 +5798,10 @@ mod tests {
     }
 
     #[test]
-    fn a_receiver_that_never_held_the_document_does_not_yet_carry_the_delete_on() {
-        // A KNOWN GAP, pinned so a change to it is noticed rather than silent.
-        // B never held the document, so there is nothing for B to delete and
-        // nothing is recorded (see the test above for why). C, which did hold
-        // it, then catches up from B, and B's walk has no tombstone to carry:
-        // C keeps the document. Tracked by the plan "a delete relayed through a
-        // member that never held the document does not travel"; its fix makes
-        // an equal-stamp delete append the entry it is missing, and its first
-        // step is to flip this assertion.
+    fn a_receiver_that_never_held_the_document_carries_the_delete_on() {
+        // B never held the document, so there is nothing for B to delete, but it records
+        // the tombstone the page named (ADR-228). C, which did hold the document, then
+        // catches up from B, and B's walk carries it.
         let (a, _da) = engine();
         let (b, _db) = engine();
         let (c, _dc) = engine();
@@ -5772,14 +5813,555 @@ mod tests {
 
         transfer(&b, &a);
         let cb = b.get_collection("shop", "orders").unwrap();
-        assert!(!holds_tombstone(&b, &cb, &DocId::Int64(2)));
+        assert!(holds_tombstone(&b, &cb, &DocId::Int64(2)), "B records the tombstone");
 
         transfer(&c, &b);
         let cc = c.get_collection("shop", "orders").unwrap();
-        assert!(
-            c.get(&cc, &DocId::Int64(2)).unwrap().is_some(),
-            "the known gap: C keeps the document -- if this now fails, the gap closed; update the plan"
+        assert!(c.get(&cc, &DocId::Int64(2)).unwrap().is_none(), "and C loses the document");
+        assert!(c.get(&cc, &DocId::Int64(1)).unwrap().is_some());
+    }
+
+    // -----------------------------------------------------------------------
+    // A delete a member never held (ADR-228)
+    // -----------------------------------------------------------------------
+
+    /// `a` holding documents 1 and 2 with an index on `x`, then deleting 2; `b` having
+    /// taken `a`'s snapshot, so it holds a bare tombstone for 2 and no `Delete` entry.
+    /// Returns `a`'s entries, which are what owes `b` the entry.
+    #[allow(clippy::type_complexity)]
+    fn a_member_holding_a_bare_tombstone()
+    -> (Engine, tempfile::TempDir, Engine, tempfile::TempDir, CollectionMeta, Vec<OplogEntry>) {
+        let (a, da) = engine();
+        let ca = a.create_collection("shop", "orders").unwrap();
+        a.create_index("shop", "orders", vec![field("x")], false, Some("by_x".into())).unwrap();
+        a.insert(&ca, doc! { "_id": 1, "x": 1 }).unwrap();
+        a.insert(&ca, doc! { "_id": 2, "x": 2 }).unwrap();
+        assert!(a.delete(&ca, &DocId::Int64(2)).unwrap());
+        let entries = a.read_oplog_from(Hlc::ZERO, 10_000, crate::WalkScope::Background).unwrap();
+        let (b, db) = engine();
+        transfer(&b, &a);
+        let cb = b.get_collection("shop", "orders").unwrap();
+        assert!(holds_tombstone(&b, &cb, &DocId::Int64(2)), "premise: the bare tombstone");
+        assert_eq!(deletes_in_oplog(&b, &DocId::Int64(2)), 0, "premise: and no entry");
+        (a, da, b, db, cb, entries)
+    }
+
+    fn index_entries(engine: &Engine) -> usize {
+        let txn = engine.db().begin_read().unwrap();
+        txn.open_table(tables::INDEX_ENTRIES).unwrap().iter().unwrap().count()
+    }
+
+    fn arrivals(engine: &Engine) -> usize {
+        let txn = engine.db().begin_read().unwrap();
+        txn.open_table(tables::OPLOG_ARRIVAL).unwrap().iter().unwrap().count()
+    }
+
+    fn delete_events(
+        rx: &mut tokio::sync::broadcast::Receiver<std::sync::Arc<OplogEntry>>,
+    ) -> usize {
+        let mut n = 0;
+        while let Ok(entry) = rx.try_recv() {
+            if entry.kind == OpKind::Delete && entry.doc_id == Some(DocId::Int64(2)) {
+                n += 1;
+            }
+        }
+        n
+    }
+
+    #[test]
+    fn the_bare_tombstone_writes_no_count_index_entry_or_event() {
+        let (a, _da, b, _db, cb, _entries) = a_member_holding_a_bare_tombstone();
+        assert_eq!(
+            b.count(&cb, crate::WalkScope::Request).unwrap(),
+            1,
+            "the count is the live set"
         );
+        assert_eq!(
+            index_entries(&b),
+            index_entries(&a),
+            "no index maintenance for a key never held"
+        );
+
+        let (b2, _d) = engine();
+        let mut rx = b2.subscribe();
+        transfer(&b2, &a);
+        assert_eq!(delete_events(&mut rx), 0, "nothing is published for the bare tombstone");
+    }
+
+    #[test]
+    fn an_equal_stamp_delete_appends_the_entry_a_bare_tombstone_lacks_and_publishes_it_once() {
+        let (_a, _da, b, _db, cb, entries) = a_member_holding_a_bare_tombstone();
+        let mut rx = b.subscribe();
+        let live_before = b.count(&cb, crate::WalkScope::Request).unwrap();
+
+        b.apply_batch(&entries).unwrap();
+
+        assert_eq!(deletes_in_oplog(&b, &DocId::Int64(2)), 1, "the entry is appended");
+        assert_eq!(delete_events(&mut rx), 1, "and published once");
+        assert_eq!(b.count(&cb, crate::WalkScope::Request).unwrap(), live_before);
+        assert!(holds_tombstone(&b, &cb, &DocId::Int64(2)));
+
+        let rows = arrivals(&b);
+        b.apply_batch(&entries).unwrap();
+        assert_eq!(deletes_in_oplog(&b, &DocId::Int64(2)), 1, "a re-delivery appends nothing");
+        assert_eq!(arrivals(&b), rows, "and adds no second arrival row");
+        assert_eq!(delete_events(&mut rx), 0, "nor publishes");
+    }
+
+    #[test]
+    fn the_append_for_an_owed_delete_is_not_made_below_retentions_record_for_the_origin() {
+        let (a, _da, b, _db, _cb, entries) = a_member_holding_a_bare_tombstone();
+        let delete = entries.iter().find(|e| e.kind == OpKind::Delete).unwrap();
+        let txn = b.begin_write(crate::engine::WriterHolder::Replication).unwrap();
+        crate::engine::raise_version(&txn, tables::OPLOG_COLLECTED, &delete.stamp).unwrap();
+        txn.commit().unwrap();
+
+        b.apply_batch(&entries).unwrap();
+
+        assert_eq!(
+            deletes_in_oplog(&b, &DocId::Int64(2)),
+            0,
+            "retention took it; it is not rebuilt"
+        );
+        let _ = a;
+    }
+
+    #[test]
+    fn a_delete_under_hold_is_never_appended_for_an_equal_stamp() {
+        let (_a, _da, b, _db, cb, entries) = a_member_holding_a_bare_tombstone();
+        let delete = entries.iter().find(|e| e.kind == OpKind::Delete).unwrap();
+        let txn = b.begin_write(crate::engine::WriterHolder::Replication).unwrap();
+        let applied =
+            b.apply_remote_in_txn(&txn, &cb, delete, crate::engine::Position::Hold).unwrap();
+        assert!(matches!(applied, RemoteApplied::Superseded { .. }), "{applied:?}");
+        txn.commit().unwrap();
+        assert_eq!(deletes_in_oplog(&b, &DocId::Int64(2)), 0);
+        assert_eq!(b.held_len().unwrap(), 0, "and no mark is left");
+    }
+
+    #[test]
+    fn an_owed_delete_applied_in_a_window_raises_the_vectors_and_leaves_no_held_mark() {
+        // A scoped repair gives `b` the bare tombstone and grants no coverage, so its
+        // vectors are below the delete. A stale mark on the delete's key (what a rewind
+        // can leave, `append_oplog_at`) must go with the append, or `Engine::open` would
+        // later read the entry as held state.
+        let (a, _da) = engine();
+        let ca = a.create_collection("shop", "orders").unwrap();
+        a.insert(&ca, doc! { "_id": 2 }).unwrap();
+        assert!(a.delete(&ca, &DocId::Int64(2)).unwrap());
+        let entries = a.read_oplog_from(Hlc::ZERO, 10_000, crate::WalkScope::Background).unwrap();
+        let delete = entries.iter().find(|e| e.kind == OpKind::Delete).unwrap().clone();
+        let (b, _db) = engine();
+        transfer_under(&b, &a, &mut SnapshotProgress::of_collection(ca.id));
+        let cb = b.get_collection("shop", "orders").unwrap();
+        assert!(holds_tombstone(&b, &cb, &DocId::Int64(2)), "premise: the bare tombstone");
+        assert!(b.version_vector().unwrap().get(a.node_id()) < delete.stamp.hlc, "premise: below");
+        let txn = b.begin_write(crate::engine::WriterHolder::Replication).unwrap();
+        txn.open_table(tables::OPLOG_HELD)
+            .unwrap()
+            .insert(codec::oplog_key(&delete.stamp).as_slice(), ())
+            .unwrap();
+        txn.commit().unwrap();
+        assert_eq!(b.held_len().unwrap(), 1, "premise: a mark on the key");
+
+        let txn = b.begin_write(crate::engine::WriterHolder::Replication).unwrap();
+        let applied =
+            b.apply_remote_in_txn(&txn, &cb, &delete, crate::engine::Position::InWindow).unwrap();
+        assert!(matches!(applied, RemoteApplied::Applied { .. }), "{applied:?}");
+        txn.commit().unwrap();
+
+        assert_eq!(deletes_in_oplog(&b, &DocId::Int64(2)), 1, "in the oplog once");
+        assert_eq!(b.held_len().unwrap(), 0, "no mark remains");
+        assert!(b.version_vector().unwrap().get(a.node_id()) >= delete.stamp.hlc, "vectors rose");
+        assert!(b.witnessed_vector().unwrap().get(a.node_id()) >= delete.stamp.hlc);
+    }
+
+    #[test]
+    fn an_equal_stamp_entry_with_a_body_is_not_appended_over_a_tombstone() {
+        // The guard on the kind: a stamp is one write on an honest feed, but a buggy or
+        // corrupt one can put an insert at a tombstone's stamp. Appended, it would be
+        // served onward as an insert contradicting the state here.
+        let (_a, _da, b, _db, cb, entries) = a_member_holding_a_bare_tombstone();
+        let delete = entries.iter().find(|e| e.kind == OpKind::Delete).unwrap();
+        let forged = OplogEntry {
+            stamp: delete.stamp,
+            kind: OpKind::Insert,
+            collection: cb.id,
+            doc_id: Some(DocId::Int64(2)),
+            body: Some(bson::serialize_to_vec(&doc! { "_id": 2, "x": 2 }).unwrap()),
+        };
+
+        b.apply_batch(std::slice::from_ref(&forged)).unwrap();
+
+        let held_at_the_stamp = b
+            .read_oplog_from(Hlc::ZERO, 10_000, crate::WalkScope::Background)
+            .unwrap()
+            .iter()
+            .filter(|e| e.stamp == delete.stamp)
+            .count();
+        assert_eq!(
+            held_at_the_stamp, 0,
+            "a body-carrying entry at a tombstone's stamp was appended"
+        );
+        assert!(b.get(&cb, &DocId::Int64(2)).unwrap().is_none());
+    }
+
+    /// `a` with documents spanning more than one page, `b` holding all of them live and
+    /// then, after `a` deletes document 0, the first page of `a`'s snapshot: `b` holds
+    /// document 0's delete as a held entry mark (it held the document), which an entry
+    /// applied outside a window must not release.
+    fn a_member_holding_a_delete_as_state()
+    -> (Engine, Engine, Vec<OplogEntry>, tempfile::TempDir, tempfile::TempDir) {
+        let (a, da) = engine();
+        let (b, db) = engine();
+        let ca = a.create_collection("shop", "orders").unwrap();
+        for i in 0..=(SNAPSHOT_PAGE as i64) {
+            a.insert(&ca, doc! { "_id": i }).unwrap();
+        }
+        transfer(&b, &a);
+        assert!(a.delete(&ca, &DocId::Int64(0)).unwrap());
+        let first = a.snapshot_page(None, None).unwrap();
+        b.apply_snapshot_page(a.node_id(), &mut SnapshotProgress::whole_database(), &first)
+            .unwrap();
+        assert!(b.held_len().unwrap() > 0, "premise: a held mark");
+        let entries = a.read_oplog_from(Hlc::ZERO, 10_000, crate::WalkScope::Background).unwrap();
+        (a, b, entries, da, db)
+    }
+
+    #[test]
+    fn a_plain_raise_apply_of_the_delete_does_not_release_its_held_mark() {
+        // Only a window contiguous from this node's position vouches that an entry
+        // arrived as history (ADR-169); an `apply_batch` has none behind it.
+        let (_a, b, entries, _da, _db) = a_member_holding_a_delete_as_state();
+        let held = b.held_len().unwrap();
+
+        b.apply_batch(&entries).unwrap();
+
+        assert_eq!(b.held_len().unwrap(), held, "Raise must not release");
+    }
+
+    #[test]
+    fn a_hold_apply_of_the_delete_does_not_release_its_held_mark() {
+        let (_a, b, entries, _da, _db) = a_member_holding_a_delete_as_state();
+        let held = b.held_len().unwrap();
+        let cb = b.get_collection("shop", "orders").unwrap();
+        let delete = entries.iter().find(|e| e.kind == OpKind::Delete).unwrap();
+
+        let txn = b.begin_write(crate::engine::WriterHolder::Replication).unwrap();
+        b.apply_remote_in_txn(&txn, &cb, delete, crate::engine::Position::Hold).unwrap();
+        txn.commit().unwrap();
+
+        assert_eq!(b.held_len().unwrap(), held, "Hold must not release");
+    }
+
+    #[test]
+    fn a_bare_tombstone_moves_the_clock_to_its_stamp() {
+        // The recorded stamp is covered by the sender, so safe to witness: a later local
+        // write must not be minted below it.
+        let (a, _da) = engine();
+        let ca = a.create_collection("shop", "orders").unwrap();
+        a.insert(&ca, doc! { "_id": 2 }).unwrap();
+        assert!(a.delete(&ca, &DocId::Int64(2)).unwrap());
+        let (b, _db) = engine();
+        let mut page = a.snapshot_page(None, None).unwrap();
+        let far =
+            Stamp::new(Hlc::new(crate::engine::physical_now_ms() + 3_600_000, 0), a.node_id());
+        page.deleted_documents[0].stamp = far;
+        page.versions.insert(far.node, far.hlc);
+
+        b.apply_snapshot_page(a.node_id(), &mut SnapshotProgress::whole_database(), &page).unwrap();
+
+        let cb = b.get_collection("shop", "orders").unwrap();
+        assert!(holds_tombstone(&b, &cb, &DocId::Int64(2)), "premise");
+        assert!(b.clock_last() >= far.hlc, "the clock did not move over the recorded stamp");
+    }
+
+    /// An entry as a feed could carry it at `stamp`, for the guards on what is appended.
+    fn forged_at(
+        stamp: Stamp,
+        kind: OpKind,
+        coll: &CollectionMeta,
+        body: Option<Vec<u8>>,
+    ) -> OplogEntry {
+        OplogEntry { stamp, kind, collection: coll.id, doc_id: Some(DocId::Int64(2)), body }
+    }
+
+    fn entries_at(engine: &Engine, stamp: Stamp) -> usize {
+        engine
+            .read_oplog_from(Hlc::ZERO, 10_000, crate::WalkScope::Background)
+            .unwrap()
+            .iter()
+            .filter(|e| e.stamp == stamp)
+            .count()
+    }
+
+    #[test]
+    fn a_delete_carrying_a_body_at_the_tombstones_stamp_is_not_appended() {
+        // Each of the two terms of the guard (a delete has no body; the kind is a delete)
+        // answers a malformed entry the other lets through.
+        let (_a, _da, b, _db, cb, entries) = a_member_holding_a_bare_tombstone();
+        let stamp = entries.iter().find(|e| e.kind == OpKind::Delete).unwrap().stamp;
+        let body = Some(bson::serialize_to_vec(&doc! { "_id": 2 }).unwrap());
+
+        b.apply_batch(&[forged_at(stamp, OpKind::Delete, &cb, body)]).unwrap();
+
+        assert_eq!(entries_at(&b, stamp), 0);
+    }
+
+    #[test]
+    fn an_insert_without_a_body_at_the_tombstones_stamp_is_not_appended() {
+        let (_a, _da, b, _db, cb, entries) = a_member_holding_a_bare_tombstone();
+        let stamp = entries.iter().find(|e| e.kind == OpKind::Delete).unwrap().stamp;
+
+        b.apply_batch(&[forged_at(stamp, OpKind::Insert, &cb, None)]).unwrap();
+
+        assert_eq!(entries_at(&b, stamp), 0);
+    }
+
+    #[test]
+    fn a_delete_older_than_the_tombstone_is_superseded_and_not_appended() {
+        // Only the same write arriving again is owed an entry. An older delete from
+        // another origin meets a newer tombstone and is history, as for any entry.
+        let (_a, _da, b, _db, cb, entries) = a_member_holding_a_bare_tombstone();
+        let tombstone = entries.iter().find(|e| e.kind == OpKind::Delete).unwrap().stamp;
+        let older = Stamp::new(tombstone.hlc.predecessor(), NodeId::from_bytes([5; 16]));
+
+        b.apply_batch(&[forged_at(older, OpKind::Delete, &cb, None)]).unwrap();
+
+        assert_eq!(entries_at(&b, older), 0);
+    }
+
+    #[test]
+    fn an_owed_delete_moves_the_clock_to_its_stamp() {
+        // The tombstone is written without witnessing (as a store carrying one from an
+        // earlier run would hold it); the entry that arrives for it is covered and
+        // witnessed, so a later local write is minted above it.
+        let (b, _db) = engine();
+        let cb = b.create_collection("shop", "orders").unwrap();
+        let far = Stamp::new(
+            Hlc::new(crate::engine::physical_now_ms() + 3_600_000, 0),
+            NodeId::from_bytes([6; 16]),
+        );
+        let key = crate::docs::doc_key(&DocId::Int64(2)).unwrap();
+        let txn = b.begin_write(crate::engine::WriterHolder::Replication).unwrap();
+        let mut docs = txn.open_table(tables::DOCS).unwrap();
+        crate::live_count::put_record(
+            &txn,
+            &mut docs,
+            cb.id.0,
+            &key,
+            &codec::encode_doc_record(&kimmy_core::DocRecord::tombstone(far)),
+        )
+        .unwrap();
+        drop(docs);
+        txn.commit().unwrap();
+        assert!(b.clock_last() < far.hlc, "premise: the clock has not seen it");
+
+        b.apply_batch(&[forged_at(far, OpKind::Delete, &cb, None)]).unwrap();
+
+        assert_eq!(entries_at(&b, far), 1, "premise: the entry was appended");
+        assert!(b.clock_last() >= far.hlc, "the clock did not move over the appended entry");
+    }
+
+    #[test]
+    fn only_an_equal_stamp_tombstone_delete_reads_the_oplog_to_apply() {
+        let (a, _da) = engine();
+        let ca = a.create_collection("shop", "orders").unwrap();
+        a.insert(&ca, doc! { "_id": 1 }).unwrap();
+        a.insert(&ca, doc! { "_id": 2 }).unwrap();
+        assert!(a.delete(&ca, &DocId::Int64(2)).unwrap());
+        let entries = a.read_oplog_from(Hlc::ZERO, 10_000, crate::WalkScope::Background).unwrap();
+        let (b, _db) = engine();
+        let before = crate::engine::owed_reads::count();
+
+        b.apply_batch(&entries).unwrap();
+        assert_eq!(
+            crate::engine::owed_reads::count(),
+            before,
+            "new writes and a new delete read nothing"
+        );
+        b.apply_batch(&entries).unwrap();
+        assert_eq!(
+            crate::engine::owed_reads::count(),
+            before + 1,
+            "a re-delivery reads once: the one equal-stamp delete, and no insert does"
+        );
+    }
+
+    #[test]
+    fn a_live_write_below_a_bare_or_appended_tombstone_still_loses() {
+        let (a, _da, b, _db, cb, entries) = a_member_holding_a_bare_tombstone();
+        let delete = entries.iter().find(|e| e.kind == OpKind::Delete).unwrap();
+        let older = Stamp::new(delete.stamp.hlc.predecessor(), delete.stamp.node);
+        let write = OplogEntry {
+            stamp: older,
+            kind: OpKind::Insert,
+            collection: cb.id,
+            doc_id: Some(DocId::Int64(2)),
+            body: Some(bson::serialize_to_vec(&doc! { "_id": 2, "x": 2 }).unwrap()),
+        };
+
+        // By entries, against the bare tombstone and then against the appended one.
+        b.apply_batch(std::slice::from_ref(&write)).unwrap();
+        assert!(b.get(&cb, &DocId::Int64(2)).unwrap().is_none(), "bare");
+        b.apply_batch(&entries).unwrap();
+        b.apply_batch(std::slice::from_ref(&write)).unwrap();
+        assert!(b.get(&cb, &DocId::Int64(2)).unwrap().is_none(), "appended");
+
+        // By page: a sender still holding the live document at the lower stamp.
+        let (c, _dc) = engine();
+        transfer(&c, &a);
+        let mut page = a.snapshot_page(None, None).unwrap();
+        page.documents.push(SnapshotDoc {
+            collection: cb.id,
+            id: DocId::Int64(2),
+            body: Some(bson::serialize_to_vec(&doc! { "_id": 2, "x": 2 }).unwrap()),
+            stamp: older,
+        });
+        let cc = c.get_collection("shop", "orders").unwrap();
+        c.apply_snapshot_page(a.node_id(), &mut SnapshotProgress::whole_database(), &page).unwrap();
+        assert!(c.get(&cc, &DocId::Int64(2)).unwrap().is_none(), "by page");
+    }
+
+    #[test]
+    fn a_carried_delete_the_senders_coverage_does_not_name_is_not_recorded() {
+        let (a, _da) = engine();
+        let ca = a.create_collection("shop", "orders").unwrap();
+        a.insert(&ca, doc! { "_id": 2 }).unwrap();
+        assert!(a.delete(&ca, &DocId::Int64(2)).unwrap());
+        let (b, _db) = engine();
+        let mut page = a.snapshot_page(None, None).unwrap();
+        let stamp = page.deleted_documents[0].stamp;
+        page.versions.insert(stamp.node, stamp.hlc.predecessor());
+
+        b.apply_snapshot_page(a.node_id(), &mut SnapshotProgress::whole_database(), &page).unwrap();
+
+        let cb = b.get_collection("shop", "orders").unwrap();
+        assert!(!holds_tombstone(&b, &cb, &DocId::Int64(2)));
+    }
+
+    #[test]
+    fn a_carried_delete_is_recorded_only_over_nothing_or_an_older_tombstone() {
+        let (a, _da) = engine();
+        let ca = a.create_collection("shop", "orders").unwrap();
+        for id in 1..=3 {
+            a.insert(&ca, doc! { "_id": id }).unwrap();
+        }
+        // 1: the receiver holds it live, so the ordinary replicated delete takes it;
+        // 2: it holds a newer tombstone, which stays; 3: it holds an older tombstone,
+        // which the newer delete replaces. (Over nothing is the case every other test
+        // here is built on.)
+        let (b, _db) = engine();
+        transfer(&b, &a);
+        let cb = b.get_collection("shop", "orders").unwrap();
+        assert!(b.delete(&cb, &DocId::Int64(3)).unwrap());
+        for id in [1, 2, 3] {
+            assert!(a.delete(&ca, &DocId::Int64(id)).unwrap());
+        }
+        let newer_than_a = |engine: &Engine, id: i64| {
+            let key = crate::docs::doc_key(&DocId::Int64(id)).unwrap();
+            let txn = engine.begin_write(crate::engine::WriterHolder::Replication).unwrap();
+            let stamp = Stamp::new(
+                Hlc::new(crate::engine::physical_now_ms() + 10_000, 0),
+                NodeId::from_bytes([9; 16]),
+            );
+            let record = kimmy_core::DocRecord::tombstone(stamp);
+            let mut docs = txn.open_table(tables::DOCS).unwrap();
+            crate::live_count::put_record(
+                &txn,
+                &mut docs,
+                cb.id.0,
+                &key,
+                &codec::encode_doc_record(&record),
+            )
+            .unwrap();
+            drop(docs);
+            txn.commit().unwrap();
+            stamp
+        };
+        let held_two = newer_than_a(&b, 2);
+
+        transfer(&b, &a);
+
+        let stamp_of = |id: i64| {
+            let txn = b.db().begin_read().unwrap();
+            let docs = txn.open_table(tables::DOCS).unwrap();
+            let key = crate::docs::doc_key(&DocId::Int64(id)).unwrap();
+            let raw = docs.get((cb.id.0, key.as_slice())).unwrap().unwrap();
+            codec::decode_doc_record(raw.value()).unwrap()
+        };
+        assert_eq!(stamp_of(2).stamp, held_two, "a newer tombstone is kept");
+        assert!(!stamp_of(3).is_live(), "and the older one is replaced by the newer delete");
+        let page = a.snapshot_page(None, None).unwrap();
+        let carried = page
+            .deleted_documents
+            .iter()
+            .find(|t| t.key == crate::docs::doc_key(&DocId::Int64(3)).unwrap());
+        assert_eq!(stamp_of(3).stamp, carried.unwrap().stamp);
+    }
+
+    #[test]
+    fn a_page_that_only_records_bare_tombstones_commits_them() {
+        // The tombstone has nothing to publish, so it is not among the page's applied
+        // documents; a page whose only write it is must still commit, or the delete
+        // is dropped with the transaction (a later page of a pull, a scoped repair).
+        let (a, _da) = engine();
+        let ca = a.create_collection("shop", "orders").unwrap();
+        a.insert(&ca, doc! { "_id": 2 }).unwrap();
+        assert!(a.delete(&ca, &DocId::Int64(2)).unwrap());
+        let (b, _db) = engine();
+        let mut page = a.snapshot_page(None, None).unwrap();
+        // The collection's definition first, as an earlier page of the pull gave it.
+        b.apply_snapshot_page(
+            a.node_id(),
+            &mut SnapshotProgress::of_collection(ca.id),
+            &SnapshotPage { deleted_documents: Vec::new(), documents: Vec::new(), ..page.clone() },
+        )
+        .unwrap();
+        page.documents.clear();
+        assert!(!page.deleted_documents.is_empty(), "premise");
+        let before = b.commits();
+
+        b.apply_snapshot_page(a.node_id(), &mut SnapshotProgress::of_collection(ca.id), &page)
+            .unwrap();
+
+        let cb = b.get_collection("shop", "orders").unwrap();
+        assert!(holds_tombstone(&b, &cb, &DocId::Int64(2)), "the tombstone survived the page");
+        assert!(b.commits() > before);
+    }
+
+    #[test]
+    fn a_bare_tombstone_for_a_key_that_never_existed_is_collected_too() {
+        // An orphan: a key no document was ever stored under, which nothing will ever
+        // match. It is an ordinary tombstone and goes at tombstone retention.
+        let (a, _da, b, _db, cb, _entries) = a_member_holding_a_bare_tombstone();
+        let orphan = DocId::Int64(777);
+        let mut page = a.snapshot_page(None, None).unwrap();
+        for t in &mut page.deleted_documents {
+            t.key = crate::docs::doc_key(&orphan).unwrap();
+        }
+        b.apply_snapshot_page(a.node_id(), &mut SnapshotProgress::whole_database(), &page).unwrap();
+        assert!(holds_tombstone(&b, &cb, &orphan), "premise: recorded");
+        assert_eq!(b.count(&cb, crate::WalkScope::Request).unwrap(), 1, "the count is untouched");
+
+        b.collect_garbage_at(
+            crate::engine::physical_now_ms() + 1_000_000_000,
+            crate::gc::RetentionPolicy::new(u64::MAX, 0),
+        )
+        .unwrap();
+
+        assert!(!holds_tombstone(&b, &cb, &orphan));
+    }
+
+    #[test]
+    fn a_bare_tombstone_is_collected_at_tombstone_retention_like_any_other() {
+        let (_a, _da, b, _db, cb, _entries) = a_member_holding_a_bare_tombstone();
+        b.collect_garbage_at(
+            crate::engine::physical_now_ms() + 1_000_000_000,
+            crate::gc::RetentionPolicy::new(u64::MAX, 0),
+        )
+        .unwrap();
+        assert!(!holds_tombstone(&b, &cb, &DocId::Int64(2)));
     }
 
     // -----------------------------------------------------------------------
@@ -6042,6 +6624,88 @@ mod tests {
             dropped_at,
             "and is recorded at the sender's stamp"
         );
+    }
+
+    /// Close `engine` and open its store again: what the page left is what was
+    /// committed, not what a live handle still holds.
+    fn reopened(engine: Engine, dir: &tempfile::TempDir) -> Engine {
+        drop(engine);
+        Engine::open(&dir.path().join("kimmy.redb")).unwrap()
+    }
+
+    #[test]
+    fn a_page_whose_only_write_is_an_index_drop_commits_it() {
+        // The page carries no document and no grant (a scoped repair), so the transaction
+        // for its documents commits nothing. The drop is made by the DDL path in
+        // transactions of its own and is durable all the same.
+        let (a, _da, b, db) = both_hold_an_index();
+        let id = a.get_collection("shop", "orders").unwrap().id;
+        assert!(a.drop_index("shop", "orders", "by_x").unwrap());
+        age_out(&a);
+        let mut page = a.snapshot_page(None, Some(id)).unwrap();
+        page.documents.clear();
+        page.deleted_documents.clear();
+
+        b.apply_snapshot_page(a.node_id(), &mut SnapshotProgress::of_collection(id), &page)
+            .unwrap();
+
+        let b = reopened(b, &db);
+        assert!(b.get_collection("shop", "orders").unwrap().index("by_x").is_none());
+        assert!(
+            b.index_dropped_at(id, kimmy_core::IndexMeta::derive_id("by_x")).unwrap().is_some()
+        );
+    }
+
+    #[test]
+    fn a_page_whose_only_write_is_a_vector_change_commits_it() {
+        // As above, for a dated configuration, including the change of a client-supplied
+        // width (ADR-227), and for the stamp of one turned off.
+        let (a, _da, b, db) = both_hold_a_configuration();
+        let id = a.get_collection("shop", "orders").unwrap().id;
+        assert!(a.disable_vectors("shop", "orders", false).unwrap());
+        a.configure_vectors("shop", "orders", vector_config_of(16)).unwrap();
+        age_the_oplog_out(&a);
+        let want = a.get_collection("shop", "orders").unwrap();
+        let mut page = a.snapshot_page(None, Some(id)).unwrap();
+        page.documents.clear();
+        page.deleted_documents.clear();
+
+        b.apply_snapshot_page(a.node_id(), &mut SnapshotProgress::of_collection(id), &page)
+            .unwrap();
+
+        let b = reopened(b, &db);
+        let held = b.get_collection("shop", "orders").unwrap();
+        assert_eq!(held.vector, want.vector);
+        assert_eq!(held.vector_changed, want.vector_changed);
+    }
+
+    #[test]
+    fn a_page_whose_only_outcome_is_a_refusal_counts_it_in_memory_only() {
+        // `ddl_refused` is the page's answer to its caller, which adds it to a process
+        // counter (`kimmy_sync_ddl_refused_total`); nothing is persisted for it, so there
+        // is nothing for the page to commit.
+        let (a, _da, b, _db) = both_hold_a_configuration();
+        let id = a.get_collection("shop", "orders").unwrap().id;
+        let mut page = a.snapshot_page(None, Some(id)).unwrap();
+        page.documents.clear();
+        page.deleted_documents.clear();
+        let held = b.get_collection("shop", "orders").unwrap();
+        let newer = Stamp::new(held.vector_changed.unwrap().hlc.successor(), a.node_id());
+        for state in &mut page.collections {
+            if state.name == "orders" {
+                state.vector = Some(kimmy_core::VectorConfig { fields: vec![], ..vector_config() });
+                state.vector_changed = Some(newer);
+            }
+        }
+        page.versions.insert(newer.node, newer.hlc);
+        let before = b.commits();
+
+        let outcome = b
+            .apply_snapshot_page(a.node_id(), &mut SnapshotProgress::of_collection(id), &page)
+            .unwrap();
+
+        assert_eq!(outcome.ddl_refused, 1);
+        assert_eq!(b.commits(), before, "and nothing is committed for it");
     }
 
     #[test]

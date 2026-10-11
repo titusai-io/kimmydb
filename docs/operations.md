@@ -977,6 +977,14 @@ same.
   page carries that this build cannot hold is skipped with a warning and counted in
   `kimmy_sync_ddl_refused_total`, so that counter now also rises for a vector configuration in a
   snapshot; resolve it as for an index (reconfigure on the origin).
+- **A delete reaches a member through one that never held the document** ([ADR-228](decisions.md)).
+  A member that took a snapshot recorded nothing for a document it had never held and that the
+  sender had deleted, so a member that took *its* snapshot kept the document. It now records the
+  tombstone, and a `Delete` entry that arrives for it afterwards (a scoped repair, a later page,
+  an interrupted pull) is appended to its oplog instead of being taken as already applied. Not a
+  fix for a member whose pull a completed snapshot's grant already covers: that is the hole above.
+  No configuration, wire or disk change; the tombstone is an ordinary one and is collected at
+  tombstone retention.
 - **One maximum per origin, so it is conservative.** A requester behind the member's
   own prefix of an origin is refused too, though the prefix could be served; it asks
   elsewhere or snapshots.
