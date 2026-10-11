@@ -17022,6 +17022,37 @@ token above the collected range still resuming after a late old entry, and a rec
 witnessed of its origin refusing nothing. Mutations, each red: the new check removed; the cap
 removed; the comparison reversed; the first test dropped. No wire or disk change.
 
+
+**A span held only as a snapshot's state is refused too.** A member that took a whole-database
+snapshot holds the sender's documents (and the tombstones of ones it held) but none of the events
+inside the span the snapshot summarised (ADR-224's hole). A client resuming across it, with a bare
+or a vector token, was resumed and sent the entries above its token: the current versions, and
+**not the delete of a document the member never held**, nor any intermediate version. The client's
+cache stayed wrong with nothing to say so (a probe: the member delivered `z` and never the delete of
+`y`). A token, bare or vector, is now expired when, for some origin `o`, the member's hole record
+`state_held[o]` is above it (above the stamp for a bare token; above `delivered[o]` for a vector
+token), OR'd with the other checks, so it only adds refusals. A token whose vector covers the hole,
+or a stamp above every hole stamp, lost nothing and resumes. **The cost, plainly:** a client resuming
+across a member that caught up by a snapshot may get `ResumeTokenExpired` and must re-list, and the
+record is one maximum per origin, so it is conservative: a token below the top of a hole is refused
+even when the delete it would have missed does not exist. That is the answer the API already gives for
+history a member no longer holds (a re-list), and it is not a change of API, wire or error shape.
+
+**This amends the "no gap" claim above.** ADR-173 says, of a token on another member: "**On another
+member: no gap.** Every entry it holds that the issuing stream had not sent is delivered, in this
+member's arrival order", and its premise lists "a snapshot's grant (ADR-152)" among the ways a vector
+moves, "each ... a claim to have processed everything it covers". For a snapshot's grant that claim is
+about **state**: the member holds what the sender held, not the events that produced it. "Every entry it
+holds" stays true; "no gap" does not hold across a hole, because what the member holds omits events, a
+delete it never held among them. `a_token_for_a_write_a_snapshot_superseded_resumes_without_a_gap`
+asserted the converging half (the client got the current version of `x`) and is replaced by
+`a_token_below_a_span_a_snapshot_gave_a_member_as_state_is_refused` (the stale token is refused) and
+`a_token_whose_vector_covers_the_span_resumes_on_the_member_built_from_the_snapshot` (a client that had
+read everything the snapshot summarised resumes and gets what follows). Further tests: a bare and a
+vector token inside a hole are refused; the same tokens resume on a member whose oplog is intact and
+get the delete; a token above every hole stamp still resumes on a member that holds one. Mutations,
+each red: the bare-path hole check removed, its comparison reversed, the vector path not consulting it.
+
 ## ADR-174 — A collection keeps its live document count, and the divergence check reads it
 
 > **Extends [ADR-133](#adr-133--a-periodic-cross-member-check-makes-a-divergence-no-counter-can-express-visible-without-repairing-it)**,

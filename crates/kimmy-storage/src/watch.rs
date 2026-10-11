@@ -409,6 +409,14 @@ impl Engine {
                 }) {
                     return Err(expired());
                 }
+                // And a span this member holds only as the state a snapshot gave it
+                // (ADR-224): the events inside it, a delete of a document it never held
+                // among them, are not here to send, and nothing says the client was sent
+                // them. Only what the client's own vector covers is safe.
+                if self.state_held()?.iter().any(|(origin, hlc)| hlc > issued.delivered.get(origin))
+                {
+                    return Err(expired());
+                }
                 Ok(Opened {
                     start: self.first_arrival_beyond(&issued.delivered, walked)?,
                     delivered: issued.delivered.clone(),
@@ -528,10 +536,18 @@ impl Engine {
             return Ok(true);
         }
         let witnessed = self.witnessed_vector()?;
-        Ok(self
+        if self
             .oplog_collected()?
             .iter()
-            .any(|(origin, hlc)| Stamp::new(hlc.min(witnessed.get(origin)), origin) > *stamp))
+            .any(|(origin, hlc)| Stamp::new(hlc.min(witnessed.get(origin)), origin) > *stamp)
+        {
+            return Ok(true);
+        }
+        // A span held only as a snapshot's state is as unservable as one retention took:
+        // the oplog's first key can sit below it (the snapshot's documents are entries at
+        // their own old stamps), and the events inside it, a delete of a document this
+        // member never held among them, are not here to send.
+        Ok(self.state_held()?.iter().any(|(origin, hlc)| Stamp::new(hlc, origin) > *stamp))
     }
 
     /// The first arrival position whose entry is stamped at or after `at`.
@@ -2587,9 +2603,13 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn a_token_for_a_write_a_snapshot_superseded_resumes_without_a_gap() {
-        let (a, coll, _da) = setup();
+    /// `a` wrote `x` (the write the token names), then, while the client was away,
+    /// replaced it and wrote `z`; `b` is built from `a`'s snapshot, which carries `x` as
+    /// it is now and never the version the token names. Returns `a`, `b`, the token
+    /// `a` issued at `x`, and the collection.
+    async fn a_member_built_from_a_snapshot_of_a_write_after_the_token()
+    -> (Engine, Engine, ResumeToken, CollectionMeta, tempfile::TempDir, tempfile::TempDir) {
+        let (a, coll, da) = setup();
         let dir = tempfile::tempdir().unwrap();
         let b = Engine::open(&dir.path().join("kimmy.redb")).unwrap();
 
@@ -2598,8 +2618,6 @@ mod tests {
         let (_, token) = next_change(&a, &mut on_a).await;
         drop(on_a);
 
-        // Written while the client is away. B is built from A's snapshot, which
-        // carries x as it is now and never the version the token names.
         a.replace(
             &coll,
             &kimmy_core::DocId::String("x".into()),
@@ -2613,17 +2631,56 @@ mod tests {
             let page = a.snapshot_page(progress.after().cloned(), progress.scope()).unwrap();
             b.apply_snapshot_page(a.node_id(), &mut progress, &page).unwrap();
         }
+        (a, b, token, coll, da, dir)
+    }
 
-        let mut on_b = b
+    #[tokio::test]
+    async fn a_token_below_a_span_a_snapshot_gave_a_member_as_state_is_refused() {
+        // Was `..._resumes_without_a_gap`: the client got the current version of every
+        // document above its token. That is convergence of versions, not delivery of
+        // events: a delete of a document the member never held, and every intermediate
+        // version, are not here to send, and nothing says the client was sent them
+        // (ADR-173's addendum, ADR-224). The client re-lists.
+        let (_a, b, token, _coll, _da, _dir) =
+            a_member_built_from_a_snapshot_of_a_write_after_the_token().await;
+        assert!(!b.state_held().unwrap().is_empty(), "premise: b holds the span as state");
+
+        let refused = b.watch(
+            WatchScope::Cluster,
+            WatchOptions { resume_after: Some(token), ..Default::default() },
+        );
+
+        assert!(
+            matches!(
+                refused.err(),
+                Some(StorageError::Core(kimmy_core::Error::ResumeTokenExpired))
+            ),
+            "a token below the span must be refused"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_token_whose_vector_covers_the_span_resumes_on_the_member_built_from_the_snapshot() {
+        // The same member, a client that had already read everything the snapshot
+        // summarised: its vector covers the hole, so nothing the member holds only as
+        // state lies above it. It resumes and receives what follows.
+        let (a, b, _stale, coll, _da, _dir) =
+            a_member_built_from_a_snapshot_of_a_write_after_the_token().await;
+        let covering =
+            ResumeToken::issued(newest_stamp(&a), a.node_id(), a.version_vector().unwrap());
+        let cb = b.get_collection("app", "docs").unwrap();
+        assert_eq!(cb.id, coll.id, "premise: the same collection");
+        b.insert(&cb, doc! { "_id": "after" }).unwrap();
+
+        let mut stream = b
             .watch(
                 WatchScope::Collection(coll.id),
-                WatchOptions { resume_after: Some(token), ..Default::default() },
+                WatchOptions { resume_after: Some(covering), ..Default::default() },
             )
-            .expect("the token resumes on B");
-        let delivered = changes_until(&b, &mut on_b, &["x", "z"]).await;
-        assert_eq!(ids(&delivered), vec!["x", "z"]);
-        let x = delivered[0].document().unwrap().unwrap();
-        assert_eq!(x.get_i32("v").unwrap(), 2, "the version the client missed");
+            .expect("the token resumes on b");
+        let delivered = changes_until(&b, &mut stream, &["after"]).await;
+
+        assert_eq!(ids(&delivered), vec!["after"]);
     }
 
     #[tokio::test]
@@ -2818,6 +2875,105 @@ mod tests {
                 )
                 .is_ok()
         );
+    }
+
+    /// `a` wrote `old`, `y`, then deleted `y`, then wrote `z`; the client's tokens name
+    /// the insert of `y`. `a`'s oplog is intact when `keep_a_oplog`, else aged out and
+    /// `p` took `a`'s snapshot (so it holds the span as state and has no entry for the
+    /// delete of `y`). Returns the member the client resumes on, the bare and the
+    /// vector token at `y`.
+    fn a_client_that_saw_y_and_a_member_to_resume_on(
+        keep_a_oplog: bool,
+    ) -> (Engine, ResumeToken, ResumeToken, Stamp, tempfile::TempDir, tempfile::TempDir) {
+        let (a, coll, da) = setup();
+        a.insert(&coll, doc! { "_id": "old" }).unwrap();
+        a.insert(&coll, doc! { "_id": "y" }).unwrap();
+        let at_y = newest_stamp(&a);
+        let issued = ResumeToken::issued(at_y, a.node_id(), a.version_vector().unwrap());
+        assert!(a.delete(&coll, &kimmy_core::DocId::String("y".into())).unwrap());
+        a.insert(&coll, doc! { "_id": "z" }).unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        if keep_a_oplog {
+            return (a, ResumeToken::from_stamp(at_y), issued, at_y, da, dir);
+        }
+        a.collect_garbage_at(
+            crate::engine::physical_now_ms() + 1_000_000_000,
+            crate::gc::RetentionPolicy::new(0, u64::MAX),
+        )
+        .unwrap();
+        let p = Engine::open(&dir.path().join("kimmy.redb")).unwrap();
+        let mut progress = crate::SnapshotProgress::whole_database();
+        while !progress.is_complete() {
+            let page = a.snapshot_page(progress.after().cloned(), progress.scope()).unwrap();
+            p.apply_snapshot_page(a.node_id(), &mut progress, &page).unwrap();
+        }
+        assert!(!p.state_held().unwrap().is_empty(), "premise: p holds a hole");
+        (p, ResumeToken::from_stamp(at_y), issued, at_y, da, dir)
+    }
+
+    /// The document entries delivered to a client resuming with `token`, in a short window.
+    async fn resumed_with(engine: &Engine, token: ResumeToken) -> Result<Vec<String>> {
+        let mut stream = engine.watch(
+            WatchScope::Cluster,
+            WatchOptions { resume_after: Some(token), ..Default::default() },
+        )?;
+        let mut seen = Vec::new();
+        while let Ok(Some(event)) =
+            tokio::time::timeout(std::time::Duration::from_millis(400), stream.next(engine)).await
+        {
+            if let ChangeEvent::Change { entry, .. } = event
+                && entry.kind.is_document()
+            {
+                seen.push(format!("{:?}:{:?}", entry.kind, entry.doc_id));
+            }
+        }
+        Ok(seen)
+    }
+
+    fn is_expired<T: std::fmt::Debug>(outcome: &Result<T>) -> bool {
+        matches!(outcome, Err(StorageError::Core(kimmy_core::Error::ResumeTokenExpired)))
+    }
+
+    #[tokio::test]
+    async fn a_bare_stamp_token_inside_a_state_held_hole_is_refused() {
+        let (p, token, _issued, _at_y, _da, _dir) =
+            a_client_that_saw_y_and_a_member_to_resume_on(false);
+        let outcome = resumed_with(&p, token).await;
+        assert!(is_expired(&outcome), "a token inside a hole must be refused, got {outcome:?}");
+    }
+
+    #[tokio::test]
+    async fn a_vector_token_inside_a_state_held_hole_is_refused() {
+        let (p, _bare, issued, _at_y, _da, _dir) =
+            a_client_that_saw_y_and_a_member_to_resume_on(false);
+        let outcome = resumed_with(&p, issued).await;
+        assert!(is_expired(&outcome), "a token inside a hole must be refused, got {outcome:?}");
+    }
+
+    #[tokio::test]
+    async fn the_same_tokens_resume_on_the_member_whose_oplog_is_intact_and_get_the_delete() {
+        // The control: on `a`, with the delete an entry above both tokens, nothing is
+        // withheld, which is what the refusal above protects.
+        let (a, bare, issued, _at_y, _da, _dir) =
+            a_client_that_saw_y_and_a_member_to_resume_on(true);
+        for (name, token) in [("bare", bare), ("vector", issued)] {
+            let delivered = resumed_with(&a, token).await.unwrap_or_else(|e| panic!("{name}: {e}"));
+            assert!(
+                delivered.iter().any(|d| d.starts_with("Delete:") && d.contains("\"y\"")),
+                "{name}: the delete of y is delivered: {delivered:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn a_token_above_every_hole_stamp_still_resumes_on_a_member_that_holds_one() {
+        let (p, _bare, _issued, _at_y, _da, _dir) =
+            a_client_that_saw_y_and_a_member_to_resume_on(false);
+        let top = p.state_held().unwrap();
+        let (origin, hlc) = top.iter().next().expect("a hole");
+        let above = Stamp::new(hlc.successor(), origin);
+        let delivered = resumed_with(&p, ResumeToken::from_stamp(above)).await;
+        assert!(delivered.is_ok(), "nothing above this token is held only as state: {delivered:?}");
     }
 
     #[tokio::test]

@@ -36,6 +36,16 @@ breaking changes and says so here; a `0.x.PATCH` bump never does.
 
 ### Fixed
 
+- **A change stream resumed across a member that caught up by snapshot could silently miss a
+  delete.** A member that took a whole-database snapshot holds the sender's documents but not the
+  events inside the span, so a client resuming on it with a token below the span was sent the
+  current versions and never the delete of a document the member had not held: its cache stayed
+  wrong with nothing to say so. Such a token (bare or vector) is now refused with
+  `ResumeTokenExpired`, and the client re-lists, as for any history a member no longer holds. A
+  token that covers the span still resumes. **Clients resuming across a snapshot-caught-up member
+  may now get `ResumeTokenExpired`;** the refusal is conservative (one maximum per origin). ADR-173's
+  addendum amends its "no gap on another member" claim. No API, wire or disk change.
+
 - **A bare-stamp resume token inside a range retention had collected could resume and skip
   events silently after an old entry arrived late.** Such a token (issued before 0.30.0, or
   `start_at` a stamp) was refused when it was older than the oldest entry the oplog retains, and
