@@ -4942,6 +4942,46 @@ pub(crate) fn raise_version(
     Ok(higher)
 }
 
+/// Whether a `Delete` entry whose tombstone is already here under the same stamp is
+/// missing from the oplog and may be appended: read **in the write transaction**, so two
+/// appliers of one entry cannot both decide yes, and gated **above** retention's record
+/// for the origin, which `gc` raises in the transaction that removes the entries (an
+/// entry retention took is not rebuilt below its own horizon). ADR-228.
+pub(crate) fn delete_entry_is_owed(txn: &WriteTxn<'_>, stamp: &Stamp) -> Result<bool> {
+    #[cfg(test)]
+    owed_reads::note();
+    let key = codec::oplog_key(stamp);
+    if txn.open_table(tables::OPLOG)?.get(key.as_slice())?.is_some() {
+        return Ok(false);
+    }
+    let node = stamp.node.to_bytes();
+    let collected = txn.open_table(tables::OPLOG_COLLECTED)?;
+    let above = match collected.get(node.as_slice())? {
+        Some(current) => stamp.hlc > decode_hlc(current.value())?,
+        None => true,
+    };
+    Ok(above)
+}
+
+/// Test-only: how many times this thread asked whether a delete's entry is owed, so a
+/// test can say which apply paths pay the oplog read and which do not.
+#[cfg(test)]
+pub(crate) mod owed_reads {
+    use std::cell::Cell;
+
+    thread_local! {
+        static COUNT: Cell<usize> = const { Cell::new(0) };
+    }
+
+    pub(crate) fn note() {
+        COUNT.with(|c| c.set(c.get() + 1));
+    }
+
+    pub(crate) fn count() -> usize {
+        COUNT.with(Cell::get)
+    }
+}
+
 impl Engine {
     /// Decide at open whether the table is complete: it is when `through` is at
     /// the oplog's tail (or the oplog is empty). A `through` **above** the tail

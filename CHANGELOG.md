@@ -36,6 +36,16 @@ breaking changes and says so here; a `0.x.PATCH` bump never does.
 
 ### Fixed
 
+- **A delete now reaches a member through a member that never held the document.** A
+  member that took a whole-database snapshot recorded nothing for a document it had never
+  held and the sender had deleted, so a member that then took *its* snapshot kept the
+  document: detected by the count check, never repaired. The snapshot receiver now records
+  the tombstone, and a `Delete` entry that arrives for a tombstone it already holds under
+  the same stamp is appended to the oplog when it is missing (one extra read, only on that
+  path) instead of being taken as already applied. It does not change a member whose pull
+  a completed snapshot's grant already covers; the hole (above) is what handles that.
+  ADR-228. No rollback boundary: the tombstone is an ordinary one.
+
 - **A member could be stuck catching up indefinitely when a snapshot page changed the width
   of a client-supplied vector configuration, and now it is not.** A member holding a `byo`
   configuration of one width, whose peer turned it off and configured another (the only way to

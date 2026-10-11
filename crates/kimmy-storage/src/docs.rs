@@ -1173,15 +1173,36 @@ impl Engine {
             };
 
             if !wins {
+                // The same write, arriving again: a `Delete` whose stamp is the
+                // one the tombstone here already carries. Usually the entry is
+                // in the oplog too and there is nothing to do. But a tombstone
+                // can stand without it: a snapshot records one for a document
+                // this node never held (ADR-228), and that tombstone has no
+                // `_id` to mint an entry from. The entry has come; without it
+                // this node's oplog never holds the delete and a member pulling
+                // entries from here keeps the document. One point read, and only
+                // on this path (ADR-228).
+                //
+                // Never under `Hold`: that is a snapshot document, which is
+                // state and not history.
+                // (The same stamp is the same write, so a tombstone under it means the
+                // write was a delete: there is no separate test of the entry's kind.)
+                let owed = position != Position::Hold
+                    && existing.as_ref().is_some_and(|c| !c.is_live() && c.stamp == entry.stamp);
+                drop(docs);
+                if owed && crate::engine::delete_entry_is_owed(txn, &entry.stamp)? {
+                    // No document, index or count write: the tombstone stands.
+                    let released = crate::engine::append_oplog_at(txn, entry, position)?;
+                    self.witness(&entry.stamp);
+                    return Ok(RemoteApplied::Applied { id, violations: Vec::new(), released });
+                }
                 // Superseded, but in a window contiguous from this node's
                 // position: an entry this node holds as state (ADR-160) has
                 // now arrived as history, so its mark goes and the vectors
                 // cover it (ADR-169). Nothing is appended and nothing
                 // published; the entry already has both.
-                let released = position == Position::InWindow && {
-                    drop(docs);
-                    crate::engine::release_held_in_position(txn, &entry.stamp)?
-                };
+                let released = position == Position::InWindow
+                    && crate::engine::release_held_in_position(txn, &entry.stamp)?;
                 self.witness(&entry.stamp);
                 return Ok(RemoteApplied::Superseded { released });
             }
