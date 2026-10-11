@@ -6095,8 +6095,7 @@ mod tests {
             .unwrap()
             .entries
             .into_iter()
-            .filter(|e| e.kind == OpKind::CreateIndex)
-            .next_back()
+            .rfind(|e| e.kind == OpKind::CreateIndex)
             .unwrap();
         c.apply_batch(std::slice::from_ref(&recreate)).unwrap();
 
