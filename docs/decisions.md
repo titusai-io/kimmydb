@@ -26221,7 +26221,9 @@ the relay through real rounds and the member's own loop, the direct snapshot, tw
   what it was. The last-writer-wins guard therefore does not turn away a later page (or the same
   stamp) carrying a configuration this node can hold; the member stays diverged only until one arrives.
   The member's clock does observe the stamp (the sender's coverage names it, so it is safe). A collection dropped here while
-  the page applied is `Gone` and is skipped, in the vector step and at the start of each index
+  the page applied is `Gone` and is skipped; a `PurgePending` there fails the page and retries (unreachable
+  today, since a page's configuration creates no shadow, and the safe default if it ever is: a skip would grant
+  the page's coverage with the definition never applied), in the vector step and at the start of each index
   (it failed the page before, and was retried; it is no longer a failure).
 
 **The sweep.** Every refusal a page apply can hit, and whether the entries path accepts the same

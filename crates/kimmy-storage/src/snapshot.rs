@@ -1498,9 +1498,9 @@ impl Engine {
         for index in &state.indexes {
             // Gone since the check above: a concurrent local drop, as for the index
             // creation below (`Ddl::Gone`), and not a failure of the page.
-            let existing = match crate::sync::settle(self.get_collection(&state.db, &state.name))? {
-                crate::sync::Ddl::Applied(existing) => existing,
-                _ => break,
+            let Some(existing) = Self::unless_gone(self.get_collection(&state.db, &state.name))?
+            else {
+                break;
             };
             let created = self.create_index_inner(
                 &state.db,
@@ -1589,10 +1589,9 @@ impl Engine {
         versions: &VersionVector,
         history: &dyn Fn(&CollectionMeta) -> bool,
     ) -> Result<usize> {
-        let existing = match crate::sync::settle(self.get_collection(&state.db, &state.name))? {
-            crate::sync::Ddl::Applied(existing) => existing,
+        let Some(existing) = Self::unless_gone(self.get_collection(&state.db, &state.name))? else {
             // Dropped here since the definitions began: nothing to put it on.
-            _ => return Ok(0),
+            return Ok(0);
         };
         let Some(stamp) = state.vector_changed else {
             // Undated: the old rule, and only where nothing dated stands here.
@@ -1644,6 +1643,19 @@ impl Engine {
         }
     }
 
+    /// `None` for a collection that is gone, the error otherwise. Not `settle`: a
+    /// collection waiting on the drop purger is not gone, and a page reading it fails and
+    /// retries rather than skipping what it cannot place (unreachable for a read today).
+    fn unless_gone<T>(read: Result<T>) -> Result<Option<T>> {
+        match read {
+            Ok(value) => Ok(Some(value)),
+            Err(crate::StorageError::Core(kimmy_core::Error::CollectionNotFound { .. })) => {
+                Ok(None)
+            }
+            Err(e) => Err(e),
+        }
+    }
+
     /// What a page's vector step came to, settled as the entries path settles the same
     /// change (ADR-227): a refusal is skipped, logged and counted, not raised.
     ///
@@ -1657,7 +1669,18 @@ impl Engine {
     fn settled_vector_step<T>(&self, state: &CollectionState, applied: Result<T>) -> Result<usize> {
         match crate::sync::settle(applied)? {
             crate::sync::Ddl::Applied(_) => Ok(0),
-            crate::sync::Ddl::Gone | crate::sync::Ddl::PurgePending(_) => Ok(0),
+            crate::sync::Ddl::Gone => Ok(0),
+            // Unreachable today: a configuration applied from a page creates no shadow (it
+            // is its own collection on the page), so nothing in it waits on a purge. Were
+            // that ever to change, the safe answer is to fail the page and retry it once
+            // the purger has finished, as for a creation (`restore_collection`): skipped,
+            // the page would grant its coverage with the definition never applied and no
+            // entry left to bring it.
+            crate::sync::Ddl::PurgePending(_) => Err(crate::StorageError::CollectionPurging {
+                db: state.db.clone(),
+                name: state.name.clone(),
+                id: CollectionId::derive(&state.db, &state.name),
+            }),
             crate::sync::Ddl::Refused(reason) => {
                 warn!(
                     db = %state.db,
