@@ -1236,3 +1236,40 @@ async fn a_stream_opened_while_its_start_resolves_hears_a_sweep_that_runs_then()
     assert!(!holds(&c, "shop", "late"), "premise: the sweep ran during the resolve");
     assert!(dropped(next(&mut stream, &c).await), "the notice sent during the resolve was missed");
 }
+
+/// A survivor holds, applied before it learned of the drop, documents of the
+/// life before it; a stream of it passes over them by the floor, however late
+/// they arrived. (They stay in the collection: a tombstone refuses what comes
+/// after it, it does not unwrite. ADR-229 names that as a residual.)
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_stream_of_a_survivor_passes_over_entries_of_the_life_before_that_arrived_after_its_start()
+ {
+    let (z, _dz) = engine();
+    let (a, _da) = engine();
+    let (y, _dy) = engine();
+    let zl = z.create_collection("shop", "late").unwrap();
+    z.insert(&zl, doc! { "_id": "old" }).unwrap();
+    a.create_collection("shop", "orders").unwrap();
+    later();
+    assert!(a.drop_database("shop").unwrap());
+    later();
+    let yl = y.create_collection("shop", "late").unwrap();
+    y.insert(&yl, doc! { "_id": "mine" }).unwrap();
+    // `y` takes the life before's document while it knows nothing of the drop,
+    // and learns of the drop afterwards.
+    pull(&y, &z);
+    pull(&y, &a);
+    assert!(y.collection_dropped_at(yl.id).unwrap().is_some(), "premise: y holds the tombstone");
+
+    let from_start = WatchOptions { resume_after: None, start_at: Some(Hlc::ZERO) };
+    let mut stream = y.watch(WatchScope::Collection(yl.id), from_start).unwrap();
+    let mut seen = Vec::new();
+    while let Ok(Some(ChangeEvent::Change { entry, .. })) =
+        tokio::time::timeout(Duration::from_millis(300), stream.next(&y)).await
+    {
+        if entry.kind.is_document() {
+            seen.push(entry.doc_id.clone().unwrap());
+        }
+    }
+    assert_eq!(seen, vec![kimmy_core::DocId::String("mine".into())], "{seen:?}");
+}

@@ -26442,7 +26442,12 @@ within `tombstone_retention_secs` of any database drop made during it.
   another" is exposed to the first: the whole new database can be buried. **Recreate it on the same member, or
   wait until every member lists it gone.**
 
-**Residuals, inherited.** A far-future stamp from a mis-clocked member (`HlcClock::observe` has no drift clamp,
+**Residuals.** A survivor that merged documents of an earlier life of its name **before it learned of the
+drop** keeps them: two members creating the same name independently is convergence, and a tombstone refuses
+what comes after it and does not unwrite what came before. The survivor's count then differs from a member
+that refused the creation, and the divergence check reports it. It needs a creation concurrent with the drop
+and documents from the other life, and is the same race the Breaking note above describes. Streams pass over
+those documents by the floor. **Inherited:** a far-future stamp from a mis-clocked member (`HlcClock::observe` has no drift clamp,
 ADR-163) would bury and block the database as it does a collection. A pre-drop straggler **document** stamped
 exactly at the tombstone's `Hlc` with a node above the dropper's is judged by the floor on a member that
 refused and recreated, and by the stamp on one that did not; it needs a same-`Hlc` tie and exists today for
