@@ -17023,6 +17023,19 @@ witnessed of its origin refusing nothing. Mutations, each red: the new check rem
 removed; the comparison reversed; the first test dropped. No wire or disk change.
 
 
+**Held and not-held tokens are both covered.** A bare token that names an entry this member *holds*
+used to skip the oplog-first-key test, and with it everything above: a held late-arrived old entry
+can have collected events above it, and a held live document can lie below a hole (probe: the client's
+token names `w`, held by the snapshot-built member; the delete of `y` above it is not). Both horizon
+checks now run for a held bare token as well; only the "below the oldest retained entry" test is for
+a token not held, since a held entry is retained by definition. An ordinary held token (nothing
+collected above it, no hole above it) resumes as before. A token **equal** to a horizon stamp or to a
+hole stamp resumes: the client has seen that event. **A member's own vector token** whose entry is
+held does not take the hole check, deliberately: it is that member's own position in its own arrival
+order, delivered to a client by that member's stream, so the client cannot have seen an event the
+member lacks (a document it never held was never sent), and the position stays valid across the
+member's own snapshot catch-up.
+
 **A span held only as a snapshot's state is refused too.** A member that took a whole-database
 snapshot holds the sender's documents (and the tombstones of ones it held) but none of the events
 inside the span the snapshot summarised (ADR-224's hole). A client resuming across it, with a bare
@@ -17051,7 +17064,7 @@ asserted the converging half (the client got the current version of `x`) and is 
 read everything the snapshot summarised resumes and gets what follows). Further tests: a bare and a
 vector token inside a hole are refused; the same tokens resume on a member whose oplog is intact and
 get the delete; a token above every hole stamp still resumes on a member that holds one. Mutations,
-each red: the bare-path hole check removed, its comparison reversed, the vector path not consulting it.
+each red: the bare-path hole check removed, its comparison reversed, the vector path not consulting it; the held-token check removed; the held branch refusing every token; each `>` made `>=` (collected and hole).
 
 ## ADR-174 — A collection keeps its live document count, and the divergence check reads it
 
