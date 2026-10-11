@@ -8493,3 +8493,46 @@ async fn a_peer_that_is_behind_does_not_settle_the_replay_for_the_one_that_is_ah
         "the tail is back, though the first peer reached was behind"
     );
 }
+
+// The two kinds a page cannot express at all. A member behind the origin's
+// horizon takes the origin's own snapshot -- no relay -- and still keeps what
+// the origin removed, so refusing a window (or relaying it) cannot close them
+// without the page learning to say it.
+
+/// `m` below `a`'s horizon takes `a`'s whole-database snapshot, three rounds.
+async fn m_takes_the_origins_snapshot(a: &Node, m: &Node) {
+    age_out_fully(&a.engine);
+    for _ in 0..3 {
+        sync_once(&m.engine, a.addr, SECRET, None).await.unwrap();
+    }
+}
+
+#[tokio::test]
+async fn a_snapshot_carries_an_index_drop_to_the_member_taking_it() {
+    let (a, m, ca) = origin_and_a_member_that_holds_it(|engine, _| {
+        engine.create_index("shop", "orders", vec![field("x")], true, Some("by_x".into())).unwrap();
+    })
+    .await;
+    assert!(a.engine.drop_index("shop", "orders", "by_x").unwrap());
+    a.engine.insert(&ca, doc! { "_id": 2, "x": 2 }).unwrap();
+    m_takes_the_origins_snapshot(&a, &m).await;
+
+    assert_eq!(documents_of(&m.engine, "shop", "orders"), 2, "m took the snapshot");
+    let held = m.engine.get_collection("shop", "orders").unwrap();
+    assert!(held.index("by_x").is_none(), "and the drop in it: {:?}", held.indexes);
+}
+
+#[tokio::test]
+async fn a_snapshot_carries_a_vector_configuration_turned_off_to_the_member_taking_it() {
+    let (a, m, ca) = origin_and_a_member_that_holds_it(|engine, _| {
+        engine.configure_vectors("shop", "orders", vector_config()).unwrap();
+    })
+    .await;
+    a.engine.disable_vectors("shop", "orders", false).unwrap();
+    a.engine.insert(&ca, doc! { "_id": 2, "x": 2 }).unwrap();
+    m_takes_the_origins_snapshot(&a, &m).await;
+
+    assert_eq!(documents_of(&m.engine, "shop", "orders"), 2, "m took the snapshot");
+    let held = m.engine.get_collection("shop", "orders").unwrap();
+    assert!(held.vector.is_none(), "and the configuration it turned off: {:?}", held.vector);
+}
