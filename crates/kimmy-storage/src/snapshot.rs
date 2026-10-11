@@ -5940,6 +5940,43 @@ mod tests {
     }
 
     #[test]
+    fn an_owed_delete_applied_in_a_window_raises_the_vectors_and_leaves_no_held_mark() {
+        // A scoped repair gives `b` the bare tombstone and grants no coverage, so its
+        // vectors are below the delete. A stale mark on the delete's key (what a rewind
+        // can leave, `append_oplog_at`) must go with the append, or `Engine::open` would
+        // later read the entry as held state.
+        let (a, _da) = engine();
+        let ca = a.create_collection("shop", "orders").unwrap();
+        a.insert(&ca, doc! { "_id": 2 }).unwrap();
+        assert!(a.delete(&ca, &DocId::Int64(2)).unwrap());
+        let entries = a.read_oplog_from(Hlc::ZERO, 10_000, crate::WalkScope::Background).unwrap();
+        let delete = entries.iter().find(|e| e.kind == OpKind::Delete).unwrap().clone();
+        let (b, _db) = engine();
+        transfer_under(&b, &a, &mut SnapshotProgress::of_collection(ca.id));
+        let cb = b.get_collection("shop", "orders").unwrap();
+        assert!(holds_tombstone(&b, &cb, &DocId::Int64(2)), "premise: the bare tombstone");
+        assert!(b.version_vector().unwrap().get(a.node_id()) < delete.stamp.hlc, "premise: below");
+        let txn = b.begin_write(crate::engine::WriterHolder::Replication).unwrap();
+        txn.open_table(tables::OPLOG_HELD)
+            .unwrap()
+            .insert(codec::oplog_key(&delete.stamp).as_slice(), ())
+            .unwrap();
+        txn.commit().unwrap();
+        assert_eq!(b.held_len().unwrap(), 1, "premise: a mark on the key");
+
+        let txn = b.begin_write(crate::engine::WriterHolder::Replication).unwrap();
+        let applied =
+            b.apply_remote_in_txn(&txn, &cb, &delete, crate::engine::Position::InWindow).unwrap();
+        assert!(matches!(applied, RemoteApplied::Applied { .. }), "{applied:?}");
+        txn.commit().unwrap();
+
+        assert_eq!(deletes_in_oplog(&b, &DocId::Int64(2)), 1, "in the oplog once");
+        assert_eq!(b.held_len().unwrap(), 0, "no mark remains");
+        assert!(b.version_vector().unwrap().get(a.node_id()) >= delete.stamp.hlc, "vectors rose");
+        assert!(b.witnessed_vector().unwrap().get(a.node_id()) >= delete.stamp.hlc);
+    }
+
+    #[test]
     fn only_an_equal_stamp_tombstone_delete_reads_the_oplog_to_apply() {
         let (a, _da) = engine();
         let ca = a.create_collection("shop", "orders").unwrap();
