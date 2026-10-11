@@ -157,6 +157,10 @@ pub struct TestSwitches {
     /// `KIMMY_TEST_REFUSE_DIAL=<node id or address>[,...]`: this member dials none of
     /// these peers from the start; theirs to it go on (ADR-212's addendum).
     pub refuse_dial: Vec<kimmy_cluster::transport::DialRefusal>,
+    /// `KIMMY_TEST_DNS_SERVER=<ip:port>`: `dns:` and `k8s:` seeds resolve against
+    /// this one name server and not the host's `resolv.conf`, which cannot name a
+    /// port.
+    pub dns_server: Option<std::net::SocketAddr>,
     /// What each switch said, for the announcement: `(variable, value, note)`.
     pub notes: Vec<(&'static str, String, String)>,
 }
@@ -271,6 +275,21 @@ impl TestSwitches {
                     .into(),
             ));
         }
+        if let Some(value) = var("KIMMY_TEST_DNS_SERVER") {
+            // Refused rather than ignored: a seed that silently went to the host's
+            // resolver would make a test of a hung nameserver pass for nothing.
+            let server = value
+                .trim()
+                .parse::<std::net::SocketAddr>()
+                .map_err(|e| format!("KIMMY_TEST_DNS_SERVER={value:?} is not <ip>:<port>: {e}"))?;
+            switches.dns_server = Some(server);
+            switches.notes.push((
+                "KIMMY_TEST_DNS_SERVER",
+                value,
+                "makes this member resolve its `dns:` and `k8s:` seeds against that one name                  server from the start, and not the host's resolv.conf"
+                    .into(),
+            ));
+        }
         Ok(switches)
     }
 
@@ -290,6 +309,10 @@ impl TestSwitches {
     /// peers. A partition exists before the member does, so no outbound contact
     /// may slip through ahead of it (the replay's direction is proved on it).
     pub fn arm_at_start(&self) {
+        if let Some(server) = self.dns_server {
+            info!(%server, "test switch armed from the start: dns: and k8s: seeds resolve against this name server");
+            kimmy_cluster::discovery::set_test_dns_server(Some(server));
+        }
         if !self.refuse_dial.is_empty() {
             info!(
                 peers = self.refuse_dial.len(),
@@ -595,6 +618,25 @@ mod tests {
         let switches = read(&[("KIMMY_TEST_REFUSE_DIAL", "10.0.0.7:7000")]).unwrap();
         assert_eq!(switches.refuse_dial.len(), 1);
         assert!(read(&[("KIMMY_TEST_REFUSE_DIAL", "nonsense")]).is_err());
+    }
+
+    /// `KIMMY_TEST_DNS_SERVER` reads an `ip:port` and nothing else: a value that did not
+    /// would leave a seed going to the host's resolver and a test of a hung name server
+    /// passing for nothing, so it refuses the start.
+    #[test]
+    fn the_dns_server_switch_reads_an_address_and_refuses_the_rest() {
+        let on = read(&[("KIMMY_TEST_DNS_SERVER", "127.0.0.1:5353")]).unwrap();
+        assert_eq!(on.dns_server, Some("127.0.0.1:5353".parse().unwrap()));
+        assert!(on.notes.iter().any(|(name, _, _)| *name == "KIMMY_TEST_DNS_SERVER"));
+        let v6 = read(&[("KIMMY_TEST_DNS_SERVER", "[::1]:5353")]).unwrap();
+        assert_eq!(v6.dns_server, Some("[::1]:5353".parse().unwrap()));
+        for bad in ["", "127.0.0.1", "localhost:53", "127.0.0.1:99999", "8.8.8.8:53,1.1.1.1:53"] {
+            assert!(
+                read(&[("KIMMY_TEST_DNS_SERVER", bad)]).is_err(),
+                "{bad:?} must refuse the start"
+            );
+        }
+        assert_eq!(read(&[]).unwrap().dns_server, None, "unset is off");
     }
 
     /// Unset or `on` is on and `off` is off, in any case; any other value refuses.

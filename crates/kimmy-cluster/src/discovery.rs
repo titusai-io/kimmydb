@@ -11,6 +11,7 @@
 
 use std::fmt;
 use std::net::SocketAddr;
+use std::time::Duration;
 
 use hickory_resolver::proto::rr::RData;
 use serde::{Deserialize, Serialize};
@@ -53,11 +54,7 @@ impl SeedSource {
         match self {
             Self::Static(addrs) => Ok(addrs.clone()),
             Self::Dns { name, port } | Self::Kubernetes { name, port } => {
-                let host = format!("{name}:{port}");
-                match tokio::net::lookup_host(host.clone()).await {
-                    Ok(addrs) => Ok(addrs.collect()),
-                    Err(source) => Err(ResolveError::Lookup { target: host, source }),
-                }
+                resolve_host(name, *port, SEED_LOOKUP_BOUND).await
             }
             // SRV names a host *and* a port, which the standard library cannot
             // read — it resolves names, not arbitrary record types.
@@ -92,6 +89,102 @@ pub fn names_another_member(seeds: &[SeedSource], own: SocketAddr) -> bool {
         SeedSource::Static(addrs) => addrs.iter().any(|addr| *addr != own),
         SeedSource::Dns { .. } | SeedSource::DnsSrv { .. } | SeedSource::Kubernetes { .. } => true,
     })
+}
+
+/// How long one `dns:` or `k8s:` seed may take to resolve before it is given up
+/// for this tick.
+///
+/// A lookup is `timeout` × `attempts` per name in the search list, one name after
+/// another, so a resolver that drops queries can keep one going for minutes.
+/// Half the default discovery interval: longer than a single dead nameserver
+/// takes to give up on one name (5 s × 2), short enough that the next tick is
+/// not still waiting on this one. The loop starts no second resolution while one
+/// is in flight (`peers::replicate`), so a bound is what lets a tick fail at all.
+pub const SEED_LOOKUP_BOUND: Duration = Duration::from_secs(15);
+
+/// `KIMMY_TEST_DNS_SERVER=ip:port`, as `kimmyd` read it: resolve `dns:` and
+/// `k8s:` seeds against this one name server and nothing from the host's
+/// `resolv.conf`.
+///
+/// `resolv.conf` cannot name a port, so a test of a real `kimmyd` could not
+/// otherwise point it at a server of its own. Set at the start and never
+/// outside a test.
+static TEST_DNS_SERVER: std::sync::RwLock<Option<SocketAddr>> = std::sync::RwLock::new(None);
+
+/// The tests that set the process-wide test name server hold this one at a
+/// time: it is global, and the tests of this crate run in one process.
+#[cfg(test)]
+pub(crate) static TEST_DNS_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+/// Resolve `dns:` and `k8s:` seeds against `server` alone (a test switch).
+pub fn set_test_dns_server(server: Option<SocketAddr>) {
+    if let Ok(mut set) = TEST_DNS_SERVER.write() {
+        *set = server;
+    }
+}
+
+/// A resolver for one lookup, built from the host's DNS configuration as it is
+/// now.
+///
+/// **Built per lookup, and dropped with it.** The library reads `/etc/hosts` and
+/// `/etc/resolv.conf` when a resolver is built and keeps them, and keeps an LRU
+/// of answers that honours record TTLs, negative ones included. `getaddrinfo`
+/// does none of that: it reads both files on every call and keeps nothing. A
+/// shared resolver would never see an edit to either file, and would answer the
+/// discovery loop's early retries (250 ms, 500 ms, …) from a cached "no such
+/// name" for as long as the Service's negative TTL (30 s on CoreDNS), which is
+/// exactly when a cluster starting from cold is looking for its first peer.
+fn fresh_resolver() -> Result<hickory_resolver::TokioResolver, ResolveError> {
+    let test_server = TEST_DNS_SERVER.read().ok().and_then(|server| *server);
+    let built = match test_server {
+        Some(server) => {
+            let mut ns = hickory_resolver::config::NameServerConfig::udp(server.ip());
+            for connection in &mut ns.connections {
+                connection.port = server.port();
+            }
+            let config =
+                hickory_resolver::config::ResolverConfig::from_parts(None, Vec::new(), vec![ns]);
+            hickory_resolver::TokioResolver::builder_with_config(
+                config,
+                hickory_resolver::net::runtime::TokioRuntimeProvider::default(),
+            )
+            .build()
+        }
+        None => hickory_resolver::TokioResolver::builder_tokio()
+            .map_err(|e| ResolveError::Resolver(e.to_string()))?
+            .build(),
+    };
+    built.map_err(|e| ResolveError::Resolver(e.to_string()))
+}
+
+/// Resolve `name` to every address it holds, each paired with `port`.
+async fn resolve_host(
+    name: &str,
+    port: u16,
+    bound: Duration,
+) -> Result<Vec<SocketAddr>, ResolveError> {
+    resolve_host_with(fresh_resolver, name, port, bound).await
+}
+
+/// [`resolve_host`], with the resolver built by `build`, so the tests can point
+/// each lookup at a DNS server of their own.
+///
+/// Dropping this future ends the lookup: no thread is blocked on it, which is
+/// what `getaddrinfo` on the blocking pool could not offer, and why a stop no
+/// longer waits for one.
+async fn resolve_host_with(
+    build: impl FnOnce() -> Result<hickory_resolver::TokioResolver, ResolveError>,
+    name: &str,
+    port: u16,
+    bound: Duration,
+) -> Result<Vec<SocketAddr>, ResolveError> {
+    let target = format!("{name}:{port}");
+    let resolver = build()?;
+    match tokio::time::timeout(bound, resolver.lookup_ip(name)).await {
+        Ok(Ok(ips)) => Ok(ips.iter().map(|ip| SocketAddr::new(ip, port)).collect()),
+        Ok(Err(e)) => Err(ResolveError::Lookup { target, detail: e.to_string() }),
+        Err(_) => Err(ResolveError::TimedOut { target, after: bound }),
+    }
 }
 
 /// The process-wide resolver, built from `/etc/resolv.conf` on first use.
@@ -185,8 +278,10 @@ async fn resolve_srv_with(
 
 #[derive(Debug, thiserror::Error)]
 pub enum ResolveError {
-    #[error("could not resolve {target}: {source}")]
-    Lookup { target: String, source: std::io::Error },
+    #[error("could not resolve {target}: {detail}")]
+    Lookup { target: String, detail: String },
+    #[error("could not resolve {target}: no answer in {after:?}")]
+    TimedOut { target: String, after: Duration },
     #[error("could not look up SRV records for {name}: {detail}")]
     Srv { name: String, detail: String },
     #[error("could not build a DNS resolver from the system configuration: {0}")]
@@ -654,5 +749,321 @@ mod tests {
             !matches!(&resolved, Err(ResolveError::Resolver(_))),
             "must reach a lookup rather than failing to build a resolver: {resolved:?}"
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // dns: and k8s: resolution (H1)
+    // -----------------------------------------------------------------------
+
+    use hickory_resolver::proto::rr::rdata::{AAAA, SOA};
+    use std::collections::BTreeMap;
+    use std::net::Ipv6Addr;
+    use std::sync::Mutex;
+
+    /// What a [`zone_server`] knows and what it was asked.
+    #[derive(Default)]
+    struct Zone {
+        /// Names (no trailing dot) and the addresses they hold.
+        hosts: Mutex<BTreeMap<String, Vec<IpAddr>>>,
+        /// Every name asked for, in order, A and AAAA alike, as the server read it.
+        asked: Mutex<Vec<String>>,
+        /// The negative answer's TTL, in a SOA the server attaches to it: what a
+        /// real server says for a name it does not have.
+        negative_ttl: u32,
+    }
+
+    impl Zone {
+        fn with(hosts: &[(&str, &[IpAddr])]) -> Arc<Zone> {
+            let zone = Zone { negative_ttl: 30, ..Zone::default() };
+            for (name, addrs) in hosts {
+                zone.hosts.lock().unwrap().insert((*name).into(), addrs.to_vec());
+            }
+            Arc::new(zone)
+        }
+
+        fn add(&self, name: &str, addrs: &[IpAddr]) {
+            self.hosts.lock().unwrap().insert(name.into(), addrs.to_vec());
+        }
+
+        fn asked(&self) -> Vec<String> {
+            self.asked.lock().unwrap().clone()
+        }
+    }
+
+    use std::sync::Arc;
+
+    /// A UDP DNS server over `zone`: A and AAAA for the names it holds, and for
+    /// any other name NXDOMAIN with a SOA, as a real server answers.
+    async fn zone_server(zone: Arc<Zone>) -> SocketAddr {
+        let socket = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let addr = socket.local_addr().unwrap();
+        tokio::spawn(async move {
+            let mut buf = vec![0u8; 1024];
+            loop {
+                let Ok((len, from)) = socket.recv_from(&mut buf).await else {
+                    return;
+                };
+                let Ok(request) = Message::from_vec(&buf[..len]) else {
+                    continue;
+                };
+                let Some(query) = request.queries.first().cloned() else {
+                    continue;
+                };
+                let asked = query.name().to_utf8().trim_end_matches('.').to_ascii_lowercase();
+                zone.asked.lock().unwrap().push(asked.clone());
+
+                let mut response = Message::response(request.id, request.op_code);
+                response.add_query(query.clone());
+                response.metadata.authoritative = true;
+                response.metadata.recursion_desired = request.metadata.recursion_desired;
+                response.metadata.recursion_available = true;
+
+                let held = zone.hosts.lock().unwrap().get(&asked).cloned();
+                match held {
+                    Some(addrs) => {
+                        response.metadata.response_code = ResponseCode::NoError;
+                        for ip in addrs {
+                            let rdata = match (query.query_type(), ip) {
+                                (RecordType::A, IpAddr::V4(ip)) => RData::A(A(ip)),
+                                (RecordType::AAAA, IpAddr::V6(ip)) => RData::AAAA(AAAA(ip)),
+                                _ => continue,
+                            };
+                            response.add_answer(Record::from_rdata(
+                                query.name().clone(),
+                                60,
+                                rdata,
+                            ));
+                        }
+                    }
+                    None => {
+                        response.metadata.response_code = ResponseCode::NXDomain;
+                        let apex = Name::from_utf8("test.").unwrap();
+                        response.add_authority(Record::from_rdata(
+                            apex.clone(),
+                            zone.negative_ttl,
+                            RData::SOA(SOA::new(
+                                apex.clone(),
+                                apex,
+                                1,
+                                3600,
+                                600,
+                                86400,
+                                zone.negative_ttl,
+                            )),
+                        ));
+                    }
+                }
+                if let Ok(bytes) = response.to_vec() {
+                    let _ = socket.send_to(&bytes, from).await;
+                }
+            }
+        });
+        addr
+    }
+
+    /// A name server that reads every query and never answers one.
+    async fn silent_server() -> (SocketAddr, tokio::task::JoinHandle<()>) {
+        let socket = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let addr = socket.local_addr().unwrap();
+        let task = tokio::spawn(async move {
+            let mut buf = vec![0u8; 1024];
+            while socket.recv_from(&mut buf).await.is_ok() {}
+        });
+        (addr, task)
+    }
+
+    /// A resolver builder for `server`, with `search` as the host's search list.
+    fn builder_for(
+        server: SocketAddr,
+        search: &'static [&'static str],
+    ) -> impl Fn() -> Result<hickory_resolver::TokioResolver, ResolveError> {
+        move || {
+            let mut ns = NameServerConfig::udp(server.ip());
+            for connection in &mut ns.connections {
+                connection.port = server.port();
+            }
+            let search = search.iter().map(|d| Name::from_utf8(d).unwrap()).collect();
+            let config = ResolverConfig::from_parts(None, search, vec![ns]);
+            let mut builder = hickory_resolver::TokioResolver::builder_with_config(
+                config,
+                hickory_resolver::net::runtime::TokioRuntimeProvider::default(),
+            );
+            builder.options_mut().attempts = 1;
+            builder.build().map_err(|e| ResolveError::Resolver(e.to_string()))
+        }
+    }
+
+    const V4: IpAddr = IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1));
+    const V4_B: IpAddr = IpAddr::V4(Ipv4Addr::new(10, 0, 0, 2));
+    const V6: IpAddr = IpAddr::V6(Ipv6Addr::new(0xfd00, 0, 0, 0, 0, 0, 0, 1));
+
+    #[tokio::test]
+    async fn a_host_resolves_to_every_address_it_holds_each_with_the_seeds_port() {
+        let zone = Zone::with(&[("seeds.test", &[V4, V4_B, V6])]);
+        let server = zone_server(zone).await;
+
+        let mut found =
+            resolve_host_with(builder_for(server, &[]), "seeds.test", 7911, Duration::from_secs(5))
+                .await
+                .unwrap();
+        found.sort();
+
+        let mut want: Vec<SocketAddr> = [V4, V4_B, V6].map(|ip| SocketAddr::new(ip, 7911)).into();
+        want.sort();
+        assert_eq!(found, want, "both families, every address, the seed's port");
+    }
+
+    #[tokio::test]
+    async fn a_name_that_does_not_exist_is_an_error_and_not_an_empty_set() {
+        // Unlike `dns-srv:`, where "no records yet" is the normal state: a
+        // mistyped `dns:` name has to stay visible, as it was under getaddrinfo.
+        let server = zone_server(Zone::with(&[])).await;
+
+        let err = resolve_host_with(
+            builder_for(server, &[]),
+            "nobody.test",
+            7900,
+            Duration::from_secs(5),
+        )
+        .await
+        .unwrap_err();
+
+        assert!(matches!(err, ResolveError::Lookup { .. }), "{err:?}");
+        assert!(err.to_string().contains("nobody.test:7900"), "names the seed: {err}");
+    }
+
+    #[tokio::test]
+    async fn a_lookup_nobody_answers_gives_up_at_its_bound() {
+        let (server, _task) = silent_server().await;
+        let bound = Duration::from_millis(300);
+
+        let started = std::time::Instant::now();
+        let err = resolve_host_with(builder_for(server, &[]), "hung.test", 7900, bound)
+            .await
+            .unwrap_err();
+
+        assert!(matches!(err, ResolveError::TimedOut { after, .. } if after == bound), "{err:?}");
+        let took = started.elapsed();
+        assert!(took >= bound && took < bound + Duration::from_secs(2), "{took:?}");
+    }
+
+    #[test]
+    fn dropping_a_lookup_nobody_answers_ends_it() {
+        // What a stop does to a resolution: the loop's guard aborts the task. The
+        // future goes with it, and the runtime that held it ends at once, where a
+        // blocking-pool `getaddrinfo` held the runtime until it returned.
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(1)
+            .enable_all()
+            .build()
+            .unwrap();
+        let (server, _task) = runtime.block_on(silent_server());
+        let lookup = runtime.spawn(resolve_host_with(
+            builder_for(server, &[]),
+            "hung.test",
+            7900,
+            Duration::from_secs(60),
+        ));
+        runtime.block_on(async { tokio::time::sleep(Duration::from_millis(200)).await });
+        lookup.abort();
+
+        let started = std::time::Instant::now();
+        runtime.shutdown_timeout(Duration::from_secs(30));
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "the runtime ended with the lookup: {:?}",
+            started.elapsed()
+        );
+    }
+
+    #[tokio::test]
+    async fn a_name_is_looked_up_afresh_each_time_and_a_cached_no_is_not_kept() {
+        // The discovery loop asks again after 250 ms, 500 ms, ... while a cluster
+        // starts, and a Service answers "no such name" with a 30 s TTL until its
+        // first pod registers. A resolver that kept that answer would turn every
+        // early retry into the same "no".
+        let zone = Zone::with(&[]);
+        let server = zone_server(zone.clone()).await;
+        let build = builder_for(server, &[]);
+
+        // The control, so the test has power: one resolver, asked twice, keeps
+        // its first answer.
+        let shared = build().unwrap();
+        assert!(shared.lookup_ip("late.test").await.is_err());
+        zone.add("late.test", &[V4]);
+        assert!(
+            shared.lookup_ip("late.test").await.is_err(),
+            "the control: a resolver kept across ticks answers from its cache"
+        );
+
+        // The code under test builds one per lookup: asked before the name
+        // exists, then after, as the early retries are.
+        zone.hosts.lock().unwrap().clear();
+        let before = resolve_host_with(&build, "late.test", 7900, Duration::from_secs(5)).await;
+        assert!(before.is_err(), "the name does not exist yet: {before:?}");
+        zone.add("late.test", &[V4]);
+        let found = resolve_host_with(&build, "late.test", 7900, Duration::from_secs(5))
+            .await
+            .expect("the name appeared, and the next lookup sees it");
+        assert_eq!(found, vec![SocketAddr::new(V4, 7900)]);
+    }
+
+    #[tokio::test]
+    async fn a_short_name_is_tried_under_the_search_list_and_a_final_dot_is_not() {
+        let zone = Zone::with(&[("db.corp.test", &[V4])]);
+        let server = zone_server(zone.clone()).await;
+
+        let found = resolve_host_with(
+            builder_for(server, &["corp.test."]),
+            "db",
+            7900,
+            Duration::from_secs(5),
+        )
+        .await
+        .unwrap();
+        assert_eq!(found, vec![SocketAddr::new(V4, 7900)], "found under the search domain");
+
+        let before = zone.asked().len();
+        let absolute = resolve_host_with(
+            builder_for(server, &["corp.test."]),
+            "db.corp.test.",
+            7900,
+            Duration::from_secs(5),
+        )
+        .await
+        .unwrap();
+        assert_eq!(absolute, found);
+        let asked = &zone.asked()[before..];
+        assert!(
+            asked.iter().all(|name| name == "db.corp.test"),
+            "a name with a final dot is asked for alone: {asked:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_numeric_host_is_returned_as_it_is() {
+        let (server, _task) = silent_server().await;
+        let found =
+            resolve_host_with(builder_for(server, &[]), "10.1.2.3", 7900, Duration::from_secs(5))
+                .await
+                .unwrap();
+        assert_eq!(found, vec!["10.1.2.3:7900".parse::<SocketAddr>().unwrap()]);
+    }
+
+    #[tokio::test]
+    async fn the_test_switch_points_the_seed_source_at_one_name_server() {
+        let _only = super::TEST_DNS_LOCK.lock().await;
+        let zone = Zone::with(&[("seeds.test", &[V4])]);
+        set_test_dns_server(Some(zone_server(zone.clone()).await));
+
+        let dns = parse("dns:seeds.test").resolve().await;
+        let k8s = parse("k8s:seeds.test").resolve().await;
+        let missing = parse("dns:missing.test").resolve().await;
+        set_test_dns_server(None);
+
+        assert_eq!(dns.unwrap(), vec![SocketAddr::new(V4, DEFAULT_CLUSTER_PORT)]);
+        assert_eq!(k8s.unwrap(), vec![SocketAddr::new(V4, DEFAULT_CLUSTER_PORT)]);
+        assert!(missing.is_err());
+        assert!(!zone.asked().is_empty(), "the lookups went to the switch's server");
     }
 }

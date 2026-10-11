@@ -455,15 +455,40 @@ means the store is damaged ([Checking a store](#checking-a-store)).
 All four resolve. Every form is re-resolved each `discovery_interval_secs`, so
 a peer that appears later is found without a restart.
 
-**A `dns:` or `k8s:` lookup can hold a stop.** These resolve with the system
-resolver (`getaddrinfo`), which cannot be cancelled. A `kimmyd` stopped while one
-is in flight waits for it, up to the 22 s stop budget, then exits 0 with the store
-closed. On the static musl release build, and so in the container, a lookup lasts
-at most `timeout` in total: musl asks every nameserver in the node's `resolv.conf`
-at once and spreads `attempts` within that time. On a glibc build it lasts at most
-`timeout` × `attempts` × the nameservers. So with a resolver that may not answer,
-set for example `options timeout:2`, or expect stops of up to 22 s. A stop between
-lookups does not wait, and `dns-srv:` seeds never hold a stop.
+**A `dns:` or `k8s:` lookup does not hold a stop.** These resolve with the same
+DNS library as `dns-srv:` ([ADR-223](decisions.md)), and a lookup in flight when a
+`kimmyd` is stopped is dropped with its task. It used to be `getaddrinfo` on the
+blocking pool, which cannot be cancelled, and a stop waited for it, up to the 22 s
+stop budget. What differs from the system resolver, so that a seed that resolved
+before still does:
+
+- **Each lookup builds its own resolver and keeps nothing.** `/etc/hosts` and
+  `/etc/resolv.conf` are read on every lookup, as `getaddrinfo` reads them, and
+  no answer is cached between discovery ticks, a "no such name" included. (A
+  cache would have answered the early retries at 250 ms, 500 ms … from the first
+  "no", for as long as the Service's negative TTL, 30 s on CoreDNS, which is when
+  a cluster starting from cold is looking for its first peer.) `dns-srv:` keeps
+  one resolver for the process and is not changed by this.
+- **From `resolv.conf` it honours the nameservers, `search`/`domain`, and
+  `options ndots`, `timeout`, `attempts` and `edns0`**; other options are ignored.
+  A name with fewer dots than `ndots` is tried under the search list first and
+  then as given, one name after another; a name ending in a dot is tried alone,
+  which saves the queries in Kubernetes (`ndots:5`). Both A and AAAA are asked.
+- **A missing `resolv.conf`, or one with no nameserver, is an error** on the
+  `could not resolve seed` line each tick. `getaddrinfo` falls back to a
+  resolver on `127.0.0.1`; this does not.
+- **`nsswitch.conf` is not read.** The static musl release build and so the
+  container never read it either; a glibc build loses `mdns`, `sssd` and the
+  rest, and a macOS build loses the system's scoped resolvers (VPN, `/etc/resolver`),
+  because the library reads `/etc/resolv.conf` alone.
+- **One seed gets 15 s.** The library's own limit is `timeout` × `attempts` per
+  name, one name after another, so a resolver that drops queries could keep one
+  lookup for minutes. A seed that has not answered in 15 s is reported
+  (`could not resolve … no answer in 15s`) and tried again at the next tick or
+  early retry. Seeds are resolved together, so several that do not answer cost
+  15 s in all, not 15 s each.
+
+A stop between lookups never waited. `dns-srv:` seeds never held a stop.
 
 **Webhook and embedding provider hosts are looked up the same way.** The egress
 check before each webhook delivery and each embedding provider call resolves the
@@ -480,8 +505,9 @@ backoff. Checks made on a client's request (registering a webhook, configuring
 a provider) have **4 slots of their own**, so a client registering names that
 never answer cannot take the node's; past them the request is answered `503
 resolver_busy` with `Retry-After: 5`, as is a search whose query's provider
-lookup is refused for busy lookups. A stop waits for a lookup in flight as it
-does for a `dns:` lookup, and the same resolver options bound it.
+lookup is refused for busy lookups. A stop waits for a lookup in flight, up to the
+22 s stop budget, which `resolv.conf`'s `timeout` and `attempts` bound as they do the
+lookup. (Unlike a `dns:` seed, which a stop does not wait for.)
 
 **`dns-srv:` is the one form where peers need not agree on a port**, because
 each record carries its own:
@@ -1178,11 +1204,12 @@ deployment.
 | `KIMMY_TEST_STALL_RUNTIME=<ms>/<period_s>` | Blocks every runtime worker for `ms` (at most 3000) every `period_s` |
 | `KIMMY_TEST_HOLD_WRITER=<ms>,<holder>` | Takes the single writer as `holder` (a label of `kimmy_write_lock_held_seconds`, such as `replication`) once the node serves, and holds it for `ms` (1 to 3,600,000). The member's reads go on; its writes wait. The thread keeps the engine for the whole hold, so a stop that arrives while it lasts waits `WRITES_CLOSE_CAP` (10 s) for the writer after the drain, then exits without closing the storage engine (exit 75): it records `storage_not_closed`, logs `exiting without closing the storage engine`, and the next start repairs the store. That is expected of a deliberate wedge. Any other value refuses the start |
 | `KIMMY_TEST_REFUSE_SYNC=1` | The member completes no replication contact in either direction: its listener accepts and drops peers and it dials none. SWIM and the client API are untouched. Any other value refuses the start |
+| `KIMMY_TEST_DNS_SERVER=<ip>:<port>` | `dns:` and `k8s:` seeds resolve against this one name server, from the start, and not the host's `resolv.conf` (which cannot name a port). So a test can stop a real node while a lookup waits on a name server that never answers. Any other value refuses the start |
 | `KIMMY_TEST_REFUSE_DIAL=<addr\|node id>[,...]` | The member dials none of the named peers (a cluster `host:port`, or a node id, checked after the handshake); their dials to it go on. A one-way partition per peer. Armed at the start, before the first sync tick, as a partition that exists from the start (the other switches wait for the node to serve). Any other value refuses the start |
 
 **A bad value is not always the same answer.** A malformed or too large
 `KIMMY_TEST_STALL_RUNTIME` (more than 3000 ms, or a period under a second) and a
-`KIMMY_TEST_REFUSE_SYNC` that is not exactly `1`, and a `KIMMY_TEST_HOLD_WRITER` that is not `<ms>,<holder>` **refuse the start**, as does a
+`KIMMY_TEST_REFUSE_SYNC` that is not exactly `1`, a `KIMMY_TEST_DNS_SERVER` that is not `<ip>:<port>`, and a `KIMMY_TEST_HOLD_WRITER` that is not `<ms>,<holder>` **refuse the start**, as does a
 `KIMMY_OWNERSHIP_YIELD` that is not `on` or `off`, so that a test never believes it
 has armed a switch it has not. A `KIMMY_TEST_YIELD_SCALE` that is not a whole number
 of at least 1, a `KIMMY_TEST_FAIL_STEP` entry that does not read, and a
