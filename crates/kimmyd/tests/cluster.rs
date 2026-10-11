@@ -1831,6 +1831,132 @@ async fn a_replicated_drop_ends_a_stream_on_another_node() {
 }
 
 // ---------------------------------------------------------------------------
+// A database dropped by a member that was behind stays dropped (ADR-229)
+// ---------------------------------------------------------------------------
+
+/// Whether `node` lists `db`.
+async fn lists_database(
+    client: &reqwest::Client,
+    node: &Node,
+    token: &str,
+    db: &str,
+) -> Option<bool> {
+    let response = client.get(node.url("/v1/databases")).bearer_auth(token).send().await.ok()?;
+    if !response.status().is_success() {
+        return None;
+    }
+    let body: serde_json::Value = response.json().await.ok()?;
+    let names = body["databases"].as_array()?;
+    Some(names.iter().any(|d| d["name"] == db || d == db))
+}
+
+/// Whether `node` has the collection, by a read of its indexes.
+async fn has_collection(
+    client: &reqwest::Client,
+    node: &Node,
+    token: &str,
+    db: &str,
+    name: &str,
+) -> bool {
+    client
+        .get(node.url(&format!("/v1/db/{db}/coll/{name}/indexes")))
+        .bearer_auth(token)
+        .send()
+        .await
+        .map(|r| r.status().is_success())
+        .unwrap_or(false)
+}
+
+#[tokio::test]
+#[ignore = "boots a real three-node cluster; run with --ignored"]
+async fn a_database_dropped_by_a_member_that_was_behind_stays_dropped() {
+    let client = reqwest::Client::new();
+    let (a, b, c) = three_nodes(&client).await;
+    let (ta, tb, tc) = (a.login(&client).await, b.login(&client).await, c.login(&client).await);
+
+    let made = client
+        .post(a.url("/v1/db/shop/collections"))
+        .bearer_auth(&ta)
+        .json(&serde_json::json!({ "name": "orders" }))
+        .send()
+        .await
+        .unwrap();
+    assert!(made.status().is_success());
+    eventually("every member to hold shop.orders", || async {
+        has_collection(&client, &b, &tb, "shop", "orders").await
+            && has_collection(&client, &c, &tc, "shop", "orders").await
+    })
+    .await;
+
+    // `a` is held back while `b` creates a collection `c` then learns.
+    a.signal("STOP");
+    let made = client
+        .post(b.url("/v1/db/shop/collections"))
+        .bearer_auth(&tb)
+        .json(&serde_json::json!({ "name": "late" }))
+        .send()
+        .await
+        .unwrap();
+    assert!(made.status().is_success());
+    client
+        .post(b.url("/v1/db/shop/coll/late/documents"))
+        .bearer_auth(&tb)
+        .json(&serde_json::json!({ "_id": "x" }))
+        .send()
+        .await
+        .unwrap();
+    eventually("c to learn shop.late", || async {
+        has_collection(&client, &c, &tc, "shop", "late").await
+    })
+    .await;
+
+    // `b` and `c` are held while `a` resumes and drops the database: `a` cannot
+    // have received `late`, so it is the member that was behind.
+    b.signal("STOP");
+    c.signal("STOP");
+    a.signal("CONT");
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert!(
+        !has_collection(&client, &a, &ta, "shop", "late").await,
+        "premise: a never heard of late"
+    );
+    let dropped = client.delete(a.url("/v1/db/shop")).bearer_auth(&ta).send().await.unwrap();
+    assert_eq!(dropped.status(), 200);
+    b.signal("CONT");
+    c.signal("CONT");
+
+    eventually("every member to list shop gone", || async {
+        let mut gone = true;
+        for (node, token) in [(&a, &ta), (&b, &tb), (&c, &tc)] {
+            gone &= lists_database(&client, node, token, "shop").await == Some(false);
+        }
+        gone
+    })
+    .await;
+    // Not a moment's agreement: it stays gone through further rounds.
+    tokio::time::sleep(Duration::from_secs(5)).await;
+    for (node, token) in [(&a, &ta), (&b, &tb), (&c, &tc)] {
+        assert_eq!(lists_database(&client, node, token, "shop").await, Some(false));
+        assert!(!has_collection(&client, node, token, "shop", "late").await);
+    }
+
+    // And it can be made again, on the member that dropped it, and replicates.
+    let made = client
+        .post(a.url("/v1/db/shop/collections"))
+        .bearer_auth(&ta)
+        .json(&serde_json::json!({ "name": "fresh" }))
+        .send()
+        .await
+        .unwrap();
+    assert!(made.status().is_success(), "{}", made.text().await.unwrap());
+    eventually("the recreated database to reach the others", || async {
+        has_collection(&client, &b, &tb, "shop", "fresh").await
+            && has_collection(&client, &c, &tc, "shop", "fresh").await
+    })
+    .await;
+}
+
+// ---------------------------------------------------------------------------
 // A document an index cannot key is filed the same way on every member
 // ---------------------------------------------------------------------------
 

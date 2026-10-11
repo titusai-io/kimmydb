@@ -13177,6 +13177,46 @@ async fn a_replicated_drop_forgets_the_index_on_the_member_that_applies_it() {
 }
 
 #[tokio::test]
+async fn a_database_drop_that_buries_a_collection_the_dropper_never_held_forgets_its_index() {
+    // The case a database's tombstone adds (ADR-229): the issuer never held
+    // `docs`, so no entry of its own names it, and the member holding the
+    // graph is told by the sweep that buries the collection and by nothing
+    // else. Without the notice the graph and its snapshot stay for the life of
+    // the process.
+    let issuer = Server::start().await;
+    let applier = Server::start().await;
+    let issuer_token = issuer.root().await;
+    let applier_token = applier.root().await;
+
+    let res = issuer
+        .post("/v1/db/shop/collections", Some(&issuer_token), json!({ "name": "seed" }))
+        .await;
+    assert_eq!(res.status, 200, "{:?}", res.body);
+    replicate(&issuer, &applier);
+    configure_vectors(&applier, &applier_token, "shop", "docs").await;
+    let shadow = build_graph(&applier, "shop", "docs");
+    assert_eq!(applier.state.vectors.len(), 1);
+    assert!(snapshot_of(&applier, shadow).is_dir());
+    let consumer = tokio::spawn(kimmy_api::vectors::invalidator(&applier.state));
+
+    tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    let res = issuer.delete("/v1/db/shop", Some(&issuer_token)).await;
+    assert_eq!(res.body, json!({ "dropped": true }));
+    replicate(&issuer, &applier);
+    assert!(
+        applier.state.engine.get_collection("shop", "docs").is_err(),
+        "the sweep should have buried a collection created before the drop"
+    );
+
+    assert!(
+        wait_until(|| applier.state.vectors.is_empty()).await,
+        "the applying member kept a graph for a collection the database's drop buried"
+    );
+    assert!(!snapshot_of(&applier, shadow).exists(), "and kept its snapshot on disk");
+    consumer.abort();
+}
+
+#[tokio::test]
 async fn a_replicated_drop_that_names_the_shadow_itself_forgets_its_index() {
     // The other shape a drop entry takes: the shadow's own, minted when the
     // vectors are discarded without their parent. The consumer derives the id

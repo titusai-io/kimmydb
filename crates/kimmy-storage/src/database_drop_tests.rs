@@ -914,3 +914,57 @@ async fn a_token_from_the_previous_life_of_a_recreated_collection_still_expires(
         "the replay began in the life before"
     );
 }
+
+// ---------------------------------------------------------------------------
+// The reconcile at a start
+// ---------------------------------------------------------------------------
+
+/// A store holding a tombstone over two collections it still holds.
+fn tombstoned_store() -> (Arc<Engine>, tempfile::TempDir) {
+    let (engine, dir) = three_collections();
+    engine
+        .record_collection_drop(
+            kimmy_core::database_drop_id("shop"),
+            Stamp::new(Hlc::new(crate::physical_now_ms() + 1_000, 0), NodeId::from_bytes([7; 16])),
+        )
+        .unwrap();
+    (engine, dir)
+}
+
+#[test]
+fn the_reconcile_stops_at_a_safe_point_when_a_stop_is_asked() {
+    use crate::open_progress::tests::THIS_THREAD_STOPS;
+    let (engine, _dir) = tombstoned_store();
+    // The stop comes while the first collection is being buried; the next
+    // checkpoint ends the reconcile, and what is left is the next start's.
+    crate::sync::race_hooks::at(crate::sync::race_hooks::Race::Burial, || {
+        THIS_THREAD_STOPS.with(|stops| stops.set(true));
+    });
+    let stopped = engine.reconcile_database_tombstones();
+    THIS_THREAD_STOPS.with(|stops| stops.set(false));
+    assert!(
+        matches!(stopped, Err(crate::StorageError::Stopping(_))),
+        "a stop did not end the reconcile"
+    );
+    let left: Vec<String> =
+        engine.list_collections("shop").unwrap().into_iter().map(|c| c.name).collect();
+    assert_eq!(left, vec!["b".to_string(), "c".to_string()], "one burial landed whole");
+    assert_eq!(engine.reconcile_database_tombstones().unwrap().buried.len(), 2);
+    assert!(!engine.database_exists("shop").unwrap());
+}
+
+#[test]
+fn the_reconcile_says_what_it_is_doing_on_the_readiness_probe() {
+    use crate::open_progress::{OpenPhase, open_snapshot};
+    let (engine, _dir) = tombstoned_store();
+    let seen = std::rc::Rc::new(std::cell::Cell::new(None));
+    let into = std::rc::Rc::clone(&seen);
+    crate::sync::race_hooks::at(crate::sync::race_hooks::Race::Burial, move || {
+        let now = open_snapshot();
+        into.set(Some((now.phase, now.total)));
+    });
+    let before = open_snapshot().phase;
+    engine.reconcile_database_tombstones().unwrap();
+    assert_eq!(seen.get(), Some((OpenPhase::Reconciling, 1)));
+    assert_eq!(open_snapshot().phase, before, "the phase it found is the phase it leaves");
+}

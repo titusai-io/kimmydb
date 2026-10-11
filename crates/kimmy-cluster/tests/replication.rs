@@ -9380,3 +9380,38 @@ async fn a_peer_that_is_behind_does_not_settle_the_replay_for_the_one_that_is_ah
         "the tail is back, though the first peer reached was behind"
     );
 }
+
+/// The 0.26.0 field sequence, over real transport and three members: the member
+/// that drops the database has not received a collection a peer created, and
+/// the peer's catch-up must not bring the database back (ADR-229).
+#[tokio::test]
+async fn a_database_dropped_by_a_member_that_was_behind_stays_dropped() {
+    let a = node().await;
+    let b = node().await;
+    let c = node().await;
+    a.engine.create_collection("shop", "orders").unwrap();
+    converge(&a, &b, &c).await;
+
+    let late = b.engine.create_collection("shop", "late").unwrap();
+    b.engine.insert(&late, doc! { "_id": "x" }).unwrap();
+    tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+    assert!(a.engine.drop_database("shop").unwrap(), "a still holds orders");
+
+    converge(&a, &b, &c).await;
+    for (name, member) in [("a", &a), ("b", &b), ("c", &c)] {
+        assert!(
+            member.engine.get_collection("shop", "late").is_err(),
+            "{name} still holds shop.late"
+        );
+        assert!(!member.engine.database_exists("shop").unwrap(), "{name} still lists shop");
+    }
+
+    // And the database can be made again, and replicates.
+    tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+    a.engine.create_collection("shop", "fresh").unwrap();
+    converge(&a, &b, &c).await;
+    for (name, member) in [("b", &b), ("c", &c)] {
+        assert!(member.engine.get_collection("shop", "fresh").is_ok(), "{name} lacks shop.fresh");
+        assert!(member.engine.get_collection("shop", "late").is_err());
+    }
+}

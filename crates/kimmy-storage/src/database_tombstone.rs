@@ -224,6 +224,7 @@ impl Engine {
         if owed == 0 {
             return Ok(Swept::default());
         }
+        let before = crate::open_progress::open_snapshot().phase;
         crate::open_progress::set_open_phase_of(OpenPhase::Reconciling, owed);
         let done = std::cell::Cell::new(0u64);
         let swept = self.sweep(&|| {
@@ -234,7 +235,7 @@ impl Engine {
             done.set(done.get() + 1);
             Ok(())
         });
-        set_open_phase(OpenPhase::Starting);
+        set_open_phase(before);
         let swept = swept?;
         if !swept.buried.is_empty() || swept.spared > 0 {
             info!(
@@ -330,6 +331,14 @@ impl Engine {
             swept.spared += 1;
         }
         Ok(())
+    }
+
+    /// Record a database's tombstone and nothing else, the way a member on the
+    /// previous build records the drop of a collection it never held. For a test
+    /// of a start that finds one.
+    #[cfg(any(test, feature = "test-hooks"))]
+    pub fn record_database_tombstone_for_test(&self, id: CollectionId, at: Stamp) -> Result<()> {
+        self.record_collection_drop(id, at)
     }
 
     /// For a collection about to be buried: its live documents, how many of its
