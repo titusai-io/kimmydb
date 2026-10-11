@@ -498,7 +498,7 @@ fn dial_refused(check: impl Fn(&DialRefusal) -> bool) -> bool {
 /// The peer is told `BeyondHorizon`, which for retention reads as "storage
 /// retention should be the same on every member". That is not the reason here, and
 /// only this side knows which it is.
-fn say_state_held_refusal(engine: &Engine, peer: NodeId) {
+pub(crate) fn say_state_held_refusal(engine: &Engine, peer: NodeId) {
     static LAST: std::sync::Mutex<Vec<(NodeId, Instant)>> = std::sync::Mutex::new(Vec::new());
     let now = Instant::now();
     let due = {
@@ -1875,10 +1875,17 @@ where
             held.insert(node, kimmy_core::Hlc::MAX);
         }
         held.insert(their_node, from);
-        let servable = engine
-            .can_serve_peer_holding(&held)
-            .map_err(|e| from_storage(e, ProtocolError::Local))?;
-        let (entries, exhausted, horizon, scanned_to) = if !servable {
+        let verdict =
+            engine.serve_verdict(&held).map_err(|e| from_storage(e, ProtocolError::Local))?;
+        if verdict == kimmy_storage::ServeVerdict::StateHeld {
+            // As the listener does for a pull (ADR-224): counted and said here, because
+            // the peer is told a horizon and cannot tell which kind.
+            engine.note_state_held_refusal();
+            say_state_held_refusal(engine, their_node);
+        }
+        let (entries, exhausted, horizon, scanned_to) = if verdict
+            != kimmy_storage::ServeVerdict::Serve
+        {
             (Vec::new(), false, true, from)
         } else {
             if ours.get(their_node) <= from {
@@ -3193,18 +3200,30 @@ impl PeerStalls {
     /// What to do with a `BeyondHorizon` from `node` to an ordinary pull.
     ///
     /// **Bounded.** A peer is set aside once, then asked again after the tick's
-    /// other contacts; if it answers `BeyondHorizon` again, in that tick or in any
-    /// later one, the snapshot is taken. So the snapshot is at most one tick late,
-    /// whatever the other contacts did, and a peer set aside in a tick that ended
-    /// before the second ask is snapshotted on its next contact.
+    /// other contacts; if it answers `BeyondHorizon` again, in that tick or the next,
+    /// the snapshot is taken. So the snapshot is at most one tick late, whatever the
+    /// other contacts did, and a peer set aside in a tick that ended before the second
+    /// ask is snapshotted on its next contact. An entry older than that is stale and
+    /// ignored.
     fn horizon_decision(&mut self, node: NodeId) -> HorizonDecision {
-        match self.horizon_deferred.get(&node) {
-            None if self.deferral_open => {
+        // A peer set aside in this tick or the one before is still owed its second ask.
+        // One set aside longer ago was never settled (the contact failed, or the peer
+        // fell out of the tick's choice): that episode is over, and this refusal is a
+        // new one, set aside again if there is someone to ask first. Without the
+        // expiry a failed contact left a stale entry that turned a later, unrelated
+        // refusal into a snapshot at once.
+        let standing = self.horizon_deferred.get(&node).copied();
+        let live = standing.is_some_and(|set| self.deferral_tick <= set.saturating_add(1));
+        match (live, self.deferral_open) {
+            (true, _) => {
+                self.horizon_deferred.remove(&node);
+                HorizonDecision::Snapshot
+            }
+            (false, true) => {
                 self.horizon_deferred.insert(node, self.deferral_tick);
                 HorizonDecision::Defer
             }
-            None => HorizonDecision::Snapshot,
-            Some(_) => {
+            (false, false) => {
                 self.horizon_deferred.remove(&node);
                 HorizonDecision::Snapshot
             }

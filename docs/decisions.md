@@ -25942,10 +25942,19 @@ this is intended. Retention refusals take the same path, so a member some peer c
 serve by entries gets entries instead of a snapshot, and one past every peer's horizon
 snapshots in the same tick.
 
-**The server says which refusal it was.** The wire carries no reason and gets none. The
-refusing member counts `kimmy_sync_horizon_state_held_total`, and logs at `WARN`, no
-more than once a minute per requester, that it refused across a hole and not retention.
-The replay's own refusal message, which blamed retention, is neutral.
+**The server says which refusal it was.** The wire carries no reason, and gets none. The refusing
+member counts `kimmy_sync_horizon_state_held_total` and logs at `WARN`, no more than once a minute
+per requesting member, that it refused across a hole and not retention. It does so at **every
+site that refuses**: the listener's pull, the replay it serves a restored member (`serve_replay`),
+and the confirmation push of a schema change; each answers the same `BeyondHorizon` (or leaves the
+member to anti-entropy), and only this side knows which kind it was. The asking side's messages
+(`replay_own_origin`, the push's `unreached`) are neutral.
+
+**A deferral nobody settled expires.** A peer is set aside in a tick and owed a second ask in that
+tick or the next. An entry older than that is stale, ignored, and removed: the contact failed, or the
+peer fell out of the tick's choice, and a later refusal is a new episode, set aside again if there is
+someone to ask first. Before the expiry a stale entry turned an unrelated refusal, many ticks on, into
+a snapshot at once. A window answer, or a member that is level with the peer, settles it at once.
 
 **The request with no vector.** `held: None` is sent by this build's `Repair::Replay`
 and by a requester older than ADR-097. Both ask for every origin's entries from
@@ -25977,17 +25986,19 @@ refusal); a member past every peer's horizon snapshots in the same tick; a membe
 peer snapshots at once; a refusing peer is asked again after the other contacts, in the
 same tick (the interval is a minute); a set-aside peer is snapshotted within two ticks
 though the other contact never answers, and is contacted first in the next tick though
-one contact a tick would rotate away from it; a settled deferral is not remembered; a
-repair is not set aside; the set-aside round does nothing but say so and counts as
-reaching nobody; a hole is refused through two snapshot hops; a restored member's replay
-refused for a hole is not answered, is counted as the hole's, and is given up on after the
-wait. The mutations: no set-aside; a refusal always set aside; a set-aside never asked
-again; never carried; a settled deferral remembered; a repair set aside; the round counted
-as reached; the hole not recorded; recorded when nothing was raised over; the verdict or
-the scalar rule ignoring the hole; the pull arm serving a hole: each fails a test. One
-survives: a snapshot already resuming being set aside too (reachable only mid-snapshot,
-where it would delay a resume by a tick; the round's deadline for a resumable snapshot is
-not reachable from a test).
+one contact a tick would rotate away from it, counted in ticks and not seconds; a deferral
+a window answer or a level member settled is not remembered, and one nobody settled expires; a
+repair is not set aside; a snapshot already resuming is not set aside; the set-aside round does
+nothing but say so and counts as reaching nobody; a hole is refused through two snapshot hops; a
+restored member's replay refused for a hole is not answered, is counted as the hole's, and is
+given up on after the wait; the replay a member serves a restored one, and a schema change's
+confirmation push, are counted as the hole's when they are refused for one. The mutations,
+nineteen, each fails a test: no set-aside; a refusal always set aside; a set-aside peer never asked
+again; never carried; a window answer, and a level member, not settling the deferral; a stale
+deferral never expiring; a repair set aside; a snapshot already resuming set aside; the round
+counted as reached; the set-aside allowed with nobody to wait for; a refused replay, push and pull
+not counted; the hole not recorded; recorded when nothing was raised over; the verdict or the
+scalar rule ignoring the hole; the pull arm serving a hole.
 
 **The rollback check.** A backup taken on this build with a recorded hole was restored by
 a 0.45.0 `kimmyd restore` (the record is a `META` row and the restore copies it), and the

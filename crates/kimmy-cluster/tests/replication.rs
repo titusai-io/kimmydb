@@ -76,6 +76,30 @@ async fn listen(
     (addr, serving, pushed)
 }
 
+/// [`listen`], with the member set a daemon gives its listener: the catching-up state
+/// among it, so a restored member's listener asks a contact for the replay of its own
+/// origin.
+async fn listen_with_members(
+    engine: &Arc<Engine>,
+    secret: &str,
+    members: kimmy_cluster::Members,
+) -> (std::net::SocketAddr, tokio::task::JoinHandle<()>) {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let tls = Arc::new(kimmy_cluster::tls::ClusterTls::new().expect("cluster TLS"));
+    let serving = tokio::spawn(serve_with(
+        Arc::clone(engine),
+        listener,
+        secret.to_string(),
+        None,
+        None,
+        None,
+        tls,
+        Some(members),
+    ));
+    (addr, serving)
+}
+
 /// Confirm `entry` from `from` on the member at `addr`, known as `node`, the
 /// way the node does: through a [`kimmy_cluster::Confirmer`] (ADR-191).
 async fn confirm_at(
@@ -6220,11 +6244,34 @@ async fn m_replicates_every(
     within: Duration,
     done: impl Fn(&Engine) -> bool,
 ) -> bool {
+    m_replicates_counting_ticks(m, seeds, fanout, interval, within, done).await.0
+}
+
+/// [`m_replicates_every`], also saying how many ticks had been reported when `done` held.
+async fn m_replicates_counting_ticks(
+    m: &Node,
+    seeds: Vec<std::net::SocketAddr>,
+    fanout: usize,
+    interval: Duration,
+    within: Duration,
+    done: impl Fn(&Engine) -> bool,
+) -> (bool, usize) {
     use kimmy_cluster::{ReplicationConfig, SeedSource, replicate};
+    let ticks = Arc::new(AtomicUsize::new(0));
     let mut config = ReplicationConfig::new(vec![SeedSource::Static(seeds)], SECRET.into(), m.addr);
     config.sync_interval = interval;
     config.discovery_interval = Duration::from_millis(100);
     config.fanout = fanout;
+    config.on_round = Some(Arc::new({
+        let ticks = Arc::clone(&ticks);
+        move |report| {
+            // A tick that found nobody is an early retry's, not a sync tick of this
+            // member's cluster.
+            if report.peers_known > 0 {
+                ticks.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+    }));
     let looping = tokio::spawn(replicate(Arc::clone(&m.engine), config));
     let deadline = tokio::time::Instant::now() + within;
     let mut held = false;
@@ -6236,7 +6283,7 @@ async fn m_replicates_every(
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
     looping.abort();
-    held
+    (held, ticks.load(Ordering::SeqCst))
 }
 
 /// `a`, an origin whose oldest entry retention has collected and whose newer ones
@@ -6464,7 +6511,8 @@ async fn a_new_refusal_after_a_settled_one_is_set_aside_again() {
     a.engine.insert(&ca, doc! { "_id": 6 }).unwrap();
     sync_once(&p.engine, a.addr, SECRET, None).await.unwrap();
 
-    stalls.begin_tick(3);
+    // Still tick 2: a deferral from tick 1 that nothing settled would still be owed its
+    // second ask here, and this refusal would be a snapshot at once.
     stalls.allow_horizon_deferral(true);
     let second =
         kimmy_cluster::transport::sync_once_with(&m.engine, p.addr, SECRET, None, &mut stalls)
@@ -6476,26 +6524,30 @@ async fn a_new_refusal_after_a_settled_one_is_set_aside_again() {
 
 #[tokio::test]
 async fn a_member_with_one_peer_snapshots_at_once() {
-    // Nobody to ask first: the set-aside would only delay it.
+    // Nobody to ask first: the set-aside would only delay it. The peer is asked once,
+    // and the answer is the snapshot; a set-aside with nobody to wait for would ask it
+    // twice (refused, set aside, asked again).
     let (_a, _m, p) = an_origin_that_can_serve_m_and_a_member_with_a_hole().await;
     let fresh = node().await;
-    let started = tokio::time::Instant::now();
     let caught_up = m_replicates_until(&fresh, vec![p.addr], 1, Duration::from_secs(20), |m| {
         !m.state_held().unwrap().is_empty()
     })
     .await;
     assert!(caught_up);
-    assert!(started.elapsed() < Duration::from_secs(5), "{:?}", started.elapsed());
+    assert_eq!(
+        p.engine.state_held_refusals(),
+        1,
+        "asked once, refused once, and then the snapshot"
+    );
 }
 
 #[tokio::test]
 async fn a_peer_set_aside_is_snapshotted_within_two_ticks_whatever_the_others_do() {
     // The other contact answers the TCP connect and nothing after it, so every tick
     // spends its whole budget on it before the set-aside peer can be asked again.
-    // The bound: the peer is carried to the next tick -- contacted first, though one
-    // contact a tick would otherwise rotate to the silent one -- where its second
-    // refusal is a snapshot. Within two ticks of the first refusal, not "when the
-    // other recovers" and not when the rotation comes round to it.
+    // The bound: the peer is carried to the next tick, where its second refusal is a
+    // snapshot. Within two ticks of the first refusal, counted in ticks and not in
+    // seconds: not "when the other recovers".
     let (_a, _m, p) = an_origin_that_can_serve_m_and_a_member_with_a_hole().await;
     let silent = loop {
         let silent = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
@@ -6505,16 +6557,20 @@ async fn a_peer_set_aside_is_snapshotted_within_two_ticks_whatever_the_others_do
     };
     let silent_at = silent.local_addr().unwrap();
     let fresh = node().await;
-    let started = tokio::time::Instant::now();
-    let caught_up =
-        m_replicates_until(&fresh, vec![p.addr, silent_at], 1, Duration::from_secs(40), |m| {
-            !m.state_held().unwrap().is_empty()
-        })
-        .await;
+    let (caught_up, ticks) = m_replicates_counting_ticks(
+        &fresh,
+        vec![p.addr, silent_at],
+        2,
+        Duration::from_millis(300),
+        Duration::from_secs(60),
+        |m| !m.state_held().unwrap().is_empty(),
+    )
+    .await;
     assert!(caught_up, "the snapshot happened though the other contact never answered");
-    // One tick on the silent contact's 5 s, then the carried peer first: not a
-    // second 5 s on the silent contact, which is where the rotation would go.
-    assert!(started.elapsed() < Duration::from_secs(9), "{:?}", started.elapsed());
+    // The first tick spent its budget on the silent contact; the second asked the
+    // carried peer first, and the snapshot was taken in it. Counted in ticks reported
+    // when it was seen, the second included if it had already reported.
+    assert!(ticks <= 2, "the snapshot came within two ticks: {ticks} reported");
     drop(silent);
 }
 
@@ -6559,6 +6615,164 @@ async fn a_peer_set_aside_when_the_tick_runs_out_is_contacted_first_in_the_next(
         1,
         "the slow contact had its one turn, and the carried peer had the next tick"
     );
+}
+
+#[tokio::test]
+async fn a_replay_a_member_cannot_serve_for_a_hole_is_counted_as_the_holes() {
+    // A restored member's listener asks the contact that dialled it for the replay of
+    // its own origin. The contact holds that origin only as a snapshot's state, so it
+    // cannot serve it: it answers a horizon, and it says (and counts) it was a hole.
+    let scenario = lost_tail(2, 3, true).await;
+    let hole = a_peer_with_a_hole_at_the_restored_members_origin(&scenario).await;
+    let marker_dir = tempfile::tempdir().unwrap();
+    let catch_up = marker_in(&marker_dir);
+    catch_up.arm_replay(scenario.restored.engine.own_position_at_open(), None).unwrap();
+    let members = kimmy_cluster::Members::default();
+    members.set_catch_up(Arc::clone(&catch_up));
+    scenario.restored.serving.abort();
+    let (addr, _serving) = listen_with_members(&scenario.restored.engine, SECRET, members).await;
+    let before = hole.engine.state_held_refusals();
+
+    // The hole-holder dials the restored member, which asks it for the replay.
+    sync_once(&hole.engine, addr, SECRET, None).await.unwrap();
+
+    assert!(
+        hole.engine.state_held_refusals() > before,
+        "the replay it could not serve was counted: {} -> {}",
+        before,
+        hole.engine.state_held_refusals()
+    );
+    assert!(!catch_up.replay_answered(hole.engine.node_id()), "and it did not answer the replay");
+}
+
+#[tokio::test]
+async fn a_confirmation_push_refused_for_a_hole_is_counted_as_the_holes() {
+    // A member with a hole confirms a schema change it made on a member that is behind
+    // the hole: the push cannot serve it a window across the hole, leaves it to
+    // anti-entropy, and says (and counts) why.
+    let (_a, m, p) = an_origin_that_can_serve_m_and_a_member_with_a_hole().await;
+    let index = p
+        .engine
+        .create_index("shop", "orders", vec![field("x")], false, Some("by_x".into()))
+        .unwrap();
+    let entry = p.engine.oplog_entry(&index.created.unwrap()).unwrap().unwrap();
+    let before = p.engine.state_held_refusals();
+
+    let (_resolution, windows) = confirm(&p, &m, &entry).await;
+
+    assert!(windows.is_empty(), "nothing was pushed across the hole");
+    assert!(
+        p.engine.state_held_refusals() > before,
+        "and the push said it was the hole: {} -> {}",
+        before,
+        p.engine.state_held_refusals()
+    );
+}
+
+#[tokio::test]
+async fn a_deferral_nobody_settled_expires() {
+    // The first refusal is set aside. The contact then failed (nothing settled it), and
+    // ticks went by. A refusal several ticks later is a new episode and is set aside
+    // again; the stale entry must not turn it into a snapshot at once.
+    let (_a, m, p) = an_origin_that_can_serve_m_and_a_member_with_a_hole().await;
+    let mut stalls = kimmy_cluster::transport::PeerStalls::new();
+    stalls.begin_tick(1);
+    stalls.allow_horizon_deferral(true);
+    let first =
+        kimmy_cluster::transport::sync_once_with(&m.engine, p.addr, SECRET, None, &mut stalls)
+            .await
+            .unwrap();
+    assert!(first.horizon_deferred);
+
+    stalls.begin_tick(5);
+    stalls.allow_horizon_deferral(true);
+    let later =
+        kimmy_cluster::transport::sync_once_with(&m.engine, p.addr, SECRET, None, &mut stalls)
+            .await
+            .unwrap();
+    assert!(later.horizon_deferred, "a stale entry is not an owed second ask: {later:?}");
+    assert!(m.engine.state_held().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn a_window_answer_settles_a_deferral_and_the_next_refusal_is_set_aside() {
+    // Settled by a WINDOW (not by the member being level, which another branch
+    // settles): `p` serves `m` entries after the refusal, and a refusal again in the
+    // same tick is a new episode.
+    let (a, m, p) = an_origin_that_can_serve_m_and_a_member_with_a_hole().await;
+    let ca = a.engine.get_collection("shop", "orders").unwrap();
+    let mut stalls = kimmy_cluster::transport::PeerStalls::new();
+    stalls.begin_tick(1);
+    stalls.allow_horizon_deferral(true);
+    let first =
+        kimmy_cluster::transport::sync_once_with(&m.engine, p.addr, SECRET, None, &mut stalls)
+            .await
+            .unwrap();
+    assert!(first.horizon_deferred, "premise");
+
+    // The origin serves `m` up to what `p` took in its snapshot, and then writes one
+    // more document that `p` pulls (by entries, in position) and `m` has not.
+    sync_once(&m.engine, a.addr, SECRET, None).await.unwrap();
+    a.engine.insert(&ca, doc! { "_id": 9 }).unwrap();
+    sync_once(&p.engine, a.addr, SECRET, None).await.unwrap();
+    stalls.begin_tick(2);
+    let window =
+        kimmy_cluster::transport::sync_once_with(&m.engine, p.addr, SECRET, None, &mut stalls)
+            .await
+            .unwrap();
+    assert!(!window.horizon_deferred && window.applied >= 1, "a window with the new document");
+
+    // `p` falls behind `a`'s horizon again (two writes, the older collected), takes
+    // another snapshot -- a new hole over writes `m` lacks -- and refuses again.
+    a.engine.insert(&ca, doc! { "_id": 10 }).unwrap();
+    a.engine.insert(&ca, doc! { "_id": 11 }).unwrap();
+    age_out_fully(&a.engine);
+    let holes_before = p.engine.state_held().unwrap();
+    sync_once(&p.engine, a.addr, SECRET, None).await.unwrap();
+    assert_ne!(p.engine.state_held().unwrap(), holes_before, "premise: p's hole moved up");
+    a.engine.insert(&ca, doc! { "_id": 12 }).unwrap();
+    sync_once(&p.engine, a.addr, SECRET, None).await.unwrap();
+    stalls.allow_horizon_deferral(true);
+    let second =
+        kimmy_cluster::transport::sync_once_with(&m.engine, p.addr, SECRET, None, &mut stalls)
+            .await
+            .unwrap();
+    assert!(second.horizon_deferred, "a new episode after a window answer: {second:?}");
+    assert!(m.engine.state_held().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn a_snapshot_already_resuming_is_not_set_aside() {
+    // `m` has applied the first page of `p`'s snapshot and holds the cursor for the
+    // rest. `p` refuses its pull again (it is still behind `p`'s hole); setting that
+    // aside would stall a transfer part-way through. It goes on.
+    let a = node().await;
+    let ca = a.engine.create_collection("shop", "orders").unwrap();
+    let docs = (kimmy_storage::SNAPSHOT_PAGE + 100) as i64;
+    a.engine.insert_many(&ca, (0..docs).map(|i| doc! { "_id": i }).collect()).unwrap();
+    age_out_fully(&a.engine);
+    let p = node().await;
+    sync_once(&p.engine, a.addr, SECRET, None).await.unwrap();
+    assert!(!p.engine.state_held().unwrap().is_empty(), "premise: p holds a hole");
+
+    let m = node().await;
+    let mut progress = kimmy_storage::SnapshotProgress::whole_database();
+    let first = p.engine.snapshot_page(None, None).unwrap();
+    assert!(first.next.is_some(), "premise: more than one page");
+    m.engine.apply_snapshot_page(p.engine.node_id(), &mut progress, &first).unwrap();
+    assert!(progress.pages() > 0 && !progress.is_complete(), "premise: part-way");
+    let mut stalls = kimmy_cluster::transport::PeerStalls::new();
+    stalls.resume_snapshots(vec![(p.engine.node_id(), progress)]);
+    stalls.begin_tick(1);
+    stalls.allow_horizon_deferral(true);
+
+    let outcome =
+        kimmy_cluster::transport::sync_once_with(&m.engine, p.addr, SECRET, None, &mut stalls)
+            .await
+            .unwrap();
+
+    assert!(!outcome.horizon_deferred, "a transfer under way is not set aside: {outcome:?}");
+    assert_eq!(documents_of(&m.engine, "shop", "orders"), docs, "and it went on to the end");
 }
 
 #[tokio::test]
