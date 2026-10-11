@@ -2075,6 +2075,17 @@ impl Engine {
             OpKind::CreateCollection => {
                 let target: kimmy_core::CollectionRef = bson::deserialize_from_slice(body)?;
 
+                // The name a database's drop is filed under is no collection
+                // (ADR-229): a client cannot create it, and a peer that sends
+                // its creation is wrong, not early.
+                if target.name == kimmy_core::DATABASE_DROP_NAME {
+                    warn!(
+                        db = %target.db,
+                        "ignored the creation of the reserved name a database's drop is filed under"
+                    );
+                    return Ok(DdlOutcome::Applied);
+                }
+
                 // A creation older than the drop that removed it is history,
                 // not an instruction. Without this a peer partitioned across
                 // the drop would recreate the collection on rejoining.
@@ -2085,6 +2096,18 @@ impl Engine {
                         db = %target.db,
                         collection = %target.name,
                         "ignored a creation older than the drop that removed it"
+                    );
+                    return Ok(DdlOutcome::Applied);
+                }
+                // And older than the drop of its database (ADR-229): the
+                // collection is history here, and so are its documents, which
+                // name it by an id this node can only judge by a tombstone.
+                if self.database_refusal(&target.db, Some(entry.stamp.hlc))?.is_some() {
+                    self.record_database_refusal(&target.db, &target.name, Some(entry.stamp.hlc))?;
+                    debug!(
+                        db = %target.db,
+                        collection = %target.name,
+                        "ignored a creation older than the drop of its database"
                     );
                     return Ok(DdlOutcome::Applied);
                 }
@@ -2111,6 +2134,14 @@ impl Engine {
                             Ok(None) => {
                                 #[cfg(test)]
                                 race_hooks::absorbed(race_hooks::Race::ReplicatedCreate);
+                                // A database's drop that landed while this applied
+                                // (ADR-229) leaves the collection's own tombstone
+                                // here, as it does where it was seen first.
+                                self.record_database_refusal(
+                                    &target.db,
+                                    &target.name,
+                                    Some(entry.stamp.hlc),
+                                )?;
                                 debug!(
                                     db = %target.db,
                                     collection = %target.name,
@@ -2154,6 +2185,20 @@ impl Engine {
             }
             OpKind::DropCollection => {
                 let target: kimmy_core::CollectionRef = bson::deserialize_from_slice(body)?;
+                // A database's drop (ADR-229): the entry's tombstone, then every
+                // collection of the database it covers. In that order: the sweep
+                // reads the tombstone. It runs again on every redelivery, which
+                // costs nothing when it has already been done.
+                if target.name == kimmy_core::DATABASE_DROP_NAME {
+                    self.record_collection_drop(
+                        kimmy_core::database_drop_id(&target.db),
+                        entry.stamp,
+                    )?;
+                    self.bury_under_database_tombstones()?;
+                    // Held and served onward like every drop: the members that
+                    // learn of it from this one learn it from the entry.
+                    return self.append_replicated_ddl(entry);
+                }
                 // A drop is the one arm that destroys state, so it is the one
                 // arm that has to know *which* incarnation it was aimed at. A
                 // recreated collection derives the same id as the one that was
@@ -2195,6 +2240,19 @@ impl Engine {
                 // tombstone is what stops a *later* replay from recreating it,
                 // and a node that never had the collection still needs it.
                 self.record_collection_drop(entry.collection, entry.stamp)?;
+                // And the shadow's, as a burial records both: a collection this
+                // node never held, with vectors, has chunks that are judged by
+                // the shadow's id, and with no tombstone for it the first of
+                // them stopped the batch until a snapshot.
+                if !kimmy_core::vector_meta::is_shadow(&target.name) {
+                    self.record_collection_drop(
+                        CollectionId::derive(
+                            &target.db,
+                            &kimmy_core::vector_meta::shadow_name(&target.name),
+                        ),
+                        entry.stamp,
+                    )?;
+                }
             }
             OpKind::CreateIndex => {
                 let target: kimmy_core::IndexCreate = bson::deserialize_from_slice(body)?;

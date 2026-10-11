@@ -1,0 +1,334 @@
+//! A database drop is a tombstone (ADR-229).
+//!
+//! `DELETE /v1/db/{db}` used to drop the collections the member held when it
+//! was applied and leave only their tombstones. A collection the dropper had
+//! not received, created on a peer shortly before, had none, so its
+//! `CreateCollection` entry applied on the dropper and brought the database
+//! back, and the cluster converged on a database someone had deleted.
+//!
+//! The drop now leaves a tombstone of its own, filed in `COLLECTIONS_DROPPED`
+//! under the id of a reserved collection name in the database
+//! ([`kimmy_core::DATABASE_DROP_NAME`]), with the stamp of the drop, and
+//! replicates as an ordinary `DropCollection` entry that names it. Nothing
+//! about it is new to a build that predates the rule: it decodes, applies,
+//! stores and serves the entry as the drop of a collection it never held.
+//!
+//! One rule, one comparison, on every route: with a database tombstone at `S`,
+//! a collection whose creation was stamped at or before `S.hlc` is buried, and
+//! one that is not stands and is given a tombstone of its own at `S`, so that a
+//! straggler of the life before it is refused the same way on every member
+//! whether or not that member refused the creation itself.
+
+use std::sync::Arc;
+use std::sync::atomic::Ordering;
+
+use kimmy_core::{
+    CollectionId, CollectionRef, DATABASE_DROP_NAME, Hlc, OpKind, Stamp, database_drop_id,
+    vector_meta,
+};
+use redb::{ReadableDatabase, ReadableTable};
+use tracing::{info, warn};
+
+use crate::codec;
+use crate::engine::{Continuing, Engine, WriterHolder, append_oplog, ddl_entry};
+use crate::error::{Result, StorageError};
+use crate::meta::CollectionMeta;
+use crate::tables;
+
+/// How many of a buried collection's documents are read to say how many of them
+/// were written after the drop.
+const WARN_SAMPLE: usize = 1_000;
+
+/// A collection buried without an entry of its own, and every id that went
+/// with it (its vector shadow's included).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct BuriedCollection {
+    pub db: String,
+    pub name: String,
+    pub ids: Vec<CollectionId>,
+}
+
+/// One notice on [`Engine::subscribe_buried`]: everything one burial, or one
+/// sweep, took. One per sweep rather than one per collection, because a sweep
+/// of thousands of collections would otherwise burst past the buffer.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Buried {
+    pub collections: Vec<BuriedCollection>,
+}
+
+impl Buried {
+    /// Whether `id` is among the ids this notice buried.
+    pub fn names(&self, id: CollectionId) -> bool {
+        self.collections.iter().any(|c| c.ids.contains(&id))
+    }
+}
+
+/// What a sweep did.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub struct Swept {
+    /// The collections it buried.
+    pub buried: Vec<BuriedCollection>,
+    /// The collections it left standing, each given a tombstone of its own.
+    pub spared: usize,
+}
+
+/// Where a burial that minted no entry announces itself.
+pub(crate) enum Notify<'a> {
+    /// At once, as a notice of its own.
+    Each,
+    /// Into a sweep's list, sent as one notice when the sweep is done.
+    Collect(&'a mut Vec<BuriedCollection>),
+}
+
+impl Notify<'_> {
+    pub(crate) fn buried(self, engine: &Engine, db: &str, name: &str, ids: &[CollectionId]) {
+        let item =
+            BuriedCollection { db: db.to_string(), name: name.to_string(), ids: ids.to_vec() };
+        match self {
+            Self::Each => engine.send_buried(vec![item]),
+            Self::Collect(into) => into.push(item),
+        }
+    }
+}
+
+impl Engine {
+    /// When `db`'s drop was recorded, if a tombstone still records it.
+    pub fn database_dropped_at(&self, db: &str) -> Result<Option<Stamp>> {
+        self.collection_dropped_at(database_drop_id(db))
+    }
+
+    /// The stamp of the drop that makes a creation history, if there is one: a
+    /// creation whose origin stamped it at `created` is refused iff
+    /// `created <= S.hlc`. **One comparison, an `Hlc` against an `Hlc`, on every
+    /// route** (the entries path, a snapshot page, the sweep), so the order in
+    /// which a creation and the drop arrive cannot change the outcome. A
+    /// creation naming no `created` (a page from a sender before the field)
+    /// reads as older.
+    pub(crate) fn database_refusal(&self, db: &str, created: Option<Hlc>) -> Result<Option<Stamp>> {
+        Ok(self
+            .database_dropped_at(db)?
+            .filter(|dropped| created.is_none_or(|created| created <= dropped.hlc)))
+    }
+
+    /// Record, for a creation the database's drop refused, the tombstone of the
+    /// collection and of its vector shadow, at the drop's stamp.
+    ///
+    /// This is how the database tombstone **expands lazily** into the
+    /// tombstones every id-only path already understands. A document, an index
+    /// or a vector configuration for the collection names it by id or by a name
+    /// the receiver cannot resolve; with no collection and no tombstone it
+    /// stops the batch as unknown until a snapshot, and a snapshot's coverage
+    /// hides the creation that would have recorded it. Both ids, as a burial
+    /// records both: a shadow's chunks are judged by the shadow's id.
+    pub(crate) fn record_database_refusal(
+        &self,
+        db: &str,
+        name: &str,
+        created: Option<Hlc>,
+    ) -> Result<()> {
+        let Some(dropped) = self.database_refusal(db, created)? else {
+            return Ok(());
+        };
+        self.record_tombstones_at(db, name, dropped)
+    }
+
+    /// Tombstones for `db.name` and its shadow at `at`, where none that new is
+    /// held. Read first: a page that is already held must cost no writer.
+    fn record_tombstones_at(&self, db: &str, name: &str, at: Stamp) -> Result<()> {
+        let mut ids = vec![CollectionId::derive(db, name)];
+        if !vector_meta::is_shadow(name) {
+            ids.push(CollectionId::derive(db, &vector_meta::shadow_name(name)));
+        }
+        let mut batch = Vec::new();
+        for id in ids {
+            if self.collection_dropped_at(id)?.is_none_or(|held| held < at) {
+                batch.push((id, at));
+            }
+        }
+        self.record_collection_drops(&batch)
+    }
+
+    /// Announce collections buried without an entry. Nobody listening is not an
+    /// error.
+    pub(crate) fn send_buried(&self, collections: Vec<BuriedCollection>) {
+        if !collections.is_empty() {
+            let _ = self.buried.send(Arc::new(Buried { collections }));
+        }
+    }
+
+    /// The first commit of a database drop: the tombstone and the entry that
+    /// carries it (ADR-229). Minted under the writer (ADR-148), so its stamp
+    /// sorts with the commit order and every entry this node serves after it
+    /// is contiguous for its origin.
+    pub(crate) fn record_database_drop(&self, db: &str) -> Result<Stamp> {
+        let txn = self.begin_write(WriterHolder::Ddl)?;
+        let stamp = self.next_stamp();
+        let id = database_drop_id(db);
+        {
+            let mut dropped = txn.open_table(tables::COLLECTIONS_DROPPED)?;
+            let newer = match dropped.get(id.0)? {
+                Some(held) => stamp > codec::decode_oplog_key(held.value())?,
+                None => true,
+            };
+            if newer {
+                dropped.insert(id.0, codec::oplog_key(&stamp).as_slice())?;
+            }
+        }
+        let entry = ddl_entry(
+            stamp,
+            OpKind::DropCollection,
+            id,
+            &CollectionRef::new(db, DATABASE_DROP_NAME),
+        )?;
+        append_oplog(&txn, &entry)?;
+        txn.commit()?;
+        self.publish(vec![entry]);
+        info!(db, "recorded a database drop");
+        Ok(stamp)
+    }
+
+    /// Bury every collection a database tombstone covers and mark every one it
+    /// does not, in every database this member holds a tombstone for.
+    ///
+    /// For each held collection of such a database, with the drop at `S`:
+    ///
+    /// - `created <= S.hlc`: **buried**, through the replicated path (the
+    ///   drop's stamp, no new entry, chunked and handed to the purger as every
+    ///   burial is);
+    /// - otherwise: **spared, and given its own tombstone at `S`**, with its
+    ///   shadow's. Floors are not carried between members, so without this a
+    ///   survivor accepted a straggler of the life before it that another
+    ///   member, which had refused the creation and so held the floor, did not.
+    ///
+    /// Idempotent, and cheap when nothing has changed: a database swept at the
+    /// same tombstone and the same collections generation is not walked again.
+    /// The memo is written only after a sweep succeeds.
+    pub fn bury_under_database_tombstones(&self) -> Result<Swept> {
+        self.sweep(&|| Ok(()))
+    }
+
+    /// [`Self::bury_under_database_tombstones`] at a start, before the node
+    /// serves: ended at a safe point by a stop, since every burial is a commit
+    /// of its own and the next start repeats what is left.
+    pub fn reconcile_database_tombstones(&self) -> Result<Swept> {
+        self.sweep(&|| {
+            if crate::open_progress::open_stop_requested() {
+                return Err(StorageError::Stopping(crate::StopReason::Shutdown));
+            }
+            Ok(())
+        })
+    }
+
+    fn sweep(&self, checkpoint: &dyn Fn() -> Result<()>) -> Result<Swept> {
+        let mut swept = Swept::default();
+        let mut notice = Vec::new();
+        let result = self.sweep_databases(checkpoint, &mut swept, &mut notice);
+        // What was buried is announced even when a later burial failed: the
+        // streams on it are on collections that are gone.
+        swept.buried = notice.clone();
+        self.send_buried(notice);
+        result.map(|()| swept)
+    }
+
+    fn sweep_databases(
+        &self,
+        checkpoint: &dyn Fn() -> Result<()>,
+        swept: &mut Swept,
+        notice: &mut Vec<BuriedCollection>,
+    ) -> Result<()> {
+        for database in self.list_databases()? {
+            checkpoint()?;
+            let db = database.name;
+            let Some(dropped) = self.database_dropped_at(&db)? else {
+                continue;
+            };
+            // Read before the walk: the walk's own commits move it, so the next
+            // sweep walks once more, finds nothing to do, and memoises.
+            let generation = self.collections_generation.load(Ordering::SeqCst);
+            if self.swept.lock().get(&db) == Some(&(dropped, generation)) {
+                continue;
+            }
+            // Non-shadows first, so a parent takes its shadow in its own
+            // burial; what is left of the shadows afterwards has no parent to
+            // take it (ADR-138), or belongs to a collection that stands.
+            for collection in self.list_collections(&db)? {
+                if !vector_meta::is_shadow(&collection.name) {
+                    checkpoint()?;
+                    self.sweep_collection(&db, &collection, dropped, swept, notice)?;
+                }
+            }
+            for collection in self.list_collections(&db)? {
+                if vector_meta::is_shadow(&collection.name) {
+                    checkpoint()?;
+                    self.sweep_collection(&db, &collection, dropped, swept, notice)?;
+                }
+            }
+            self.swept.lock().insert(db, (dropped, generation));
+        }
+        Ok(())
+    }
+
+    fn sweep_collection(
+        &self,
+        db: &str,
+        collection: &CollectionMeta,
+        dropped: Stamp,
+        swept: &mut Swept,
+        notice: &mut Vec<BuriedCollection>,
+    ) -> Result<()> {
+        if collection.created <= dropped.hlc {
+            let held = self.documents_a_drop_loses(collection, dropped)?;
+            let buried = self.bury_collection_as(
+                db,
+                &collection.name,
+                Some(dropped),
+                Continuing::No,
+                Notify::Collect(notice),
+            )?;
+            if buried.is_some()
+                && let Some((live, checked, after)) = held
+            {
+                warn!(
+                    db,
+                    collection = %collection.name,
+                    documents = live,
+                    checked,
+                    written_after_the_drop = after,
+                    "a database drop buried a collection that holds documents; the writes \
+                     stamped after the drop were acknowledged to clients"
+                );
+            }
+        } else {
+            self.record_tombstones_at(db, &collection.name, dropped)?;
+            swept.spared += 1;
+        }
+        Ok(())
+    }
+
+    /// For a collection about to be buried: its live documents, how many of its
+    /// first [`WARN_SAMPLE`] were read, and how many of those were written after
+    /// the drop. `None` when it holds none.
+    fn documents_a_drop_loses(
+        &self,
+        collection: &CollectionMeta,
+        dropped: Stamp,
+    ) -> Result<Option<(u64, usize, usize)>> {
+        let txn = self.db().begin_read()?;
+        let live = crate::live_count::live_count(&txn, collection.id)?;
+        if live == 0 {
+            return Ok(None);
+        }
+        let docs = txn.open_table(tables::DOCS)?;
+        let mut checked = 0usize;
+        let mut after = 0usize;
+        for row in docs.range(crate::engine::doc_range(collection.id))?.take(WARN_SAMPLE) {
+            let (_, value) = row?;
+            let record = codec::decode_doc_record(value.value())?;
+            checked += 1;
+            if !record.deleted && record.stamp.hlc > dropped.hlc {
+                after += 1;
+            }
+        }
+        Ok(Some((live, checked, after)))
+    }
+}

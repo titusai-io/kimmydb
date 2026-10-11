@@ -734,6 +734,10 @@ impl Engine {
             {
                 continue;
             }
+            // Nor one the drop of its database makes history (ADR-229).
+            if self.database_refusal(&state.db, state.created)?.is_some() {
+                continue;
+            }
             if self.purge_pending(id)? {
                 self.prioritise_purge(id);
                 waits.get_or_insert(id);
@@ -809,6 +813,16 @@ impl Engine {
         // without a gate an arbitrary pair destroys an arbitrary collection.
         if progress.scope.is_none() {
             self.apply_carried_drops(page)?;
+            // Under a database's tombstone the page may have just recorded or
+            // may already hold (ADR-229). On every page that carries a list, not
+            // only the one that recorded something new: a sweep that failed
+            // after its tombstone committed would otherwise be retried with
+            // nothing new to do, and the page would complete and grant coverage
+            // of the drop entry nobody would then serve. An error here fails the
+            // page, and `progress` does not move.
+            if !page.dropped_collections.is_empty() {
+                self.bury_under_database_tombstones()?;
+            }
         }
         // And the indexes it dropped, on both routes, before the definitions for the
         // reason above: an index dropped and recreated arrives as the new
@@ -1472,6 +1486,21 @@ impl Engine {
                 );
                 return Ok(0);
             }
+            // And one older than the drop of its database (ADR-229), which
+            // leaves the collection's own tombstone behind: the entries that
+            // follow this definition (an index, a vector configuration, a
+            // write after the page's vector) are history here, not a stop that
+            // lasts until a snapshot, and snapshot coverage would hide the
+            // creation that would have recorded it.
+            if self.database_refusal(&state.db, state.created)?.is_some() {
+                self.record_database_refusal(&state.db, &state.name, state.created)?;
+                debug!(
+                    db = %state.db,
+                    collection = %state.name,
+                    "ignored a definition older than the drop of its database"
+                );
+                return Ok(0);
+            }
             if self.parent_buried_since(&state.db, &state.name, state.created)? {
                 debug!(
                     db = %state.db,
@@ -1500,6 +1529,8 @@ impl Engine {
                 Ok(None) => {
                     #[cfg(test)]
                     crate::sync::race_hooks::absorbed(crate::sync::race_hooks::Race::Restore);
+                    // A database's drop that landed since the check above.
+                    self.record_database_refusal(&state.db, &state.name, state.created)?;
                     return Ok(0);
                 }
                 // Checked outside the writer, so the name can be created in
