@@ -783,7 +783,7 @@ pub async fn replicate(engine: Arc<Engine>, config: ReplicationConfig) {
     let mut discoveries: u64 = 0;
     // The seeds are resolved beside the loop, never inside it: a resolver that
     // hangs (DNS that does not answer) holds a task for its own timeout (at
-    // most `SEED_LOOKUP_BOUND` for `dns:` and `k8s:`), and awaited in the
+    // the bound its resolver configuration gives it, 15 s at least, for `dns:` and `k8s:`), and awaited in the
     // loop's own arm it held every sync tick with it. One at a
     // time, so a hung one is not stacked on by the next; the peers last resolved
     // are kept until a resolution completes. A resolution is a task the loop owns:
@@ -1758,7 +1758,7 @@ fn advance_probe_on<E>(
 async fn resolve(seeds: &[SeedSource], local: SocketAddr) -> BTreeSet<SocketAddr> {
     let mut out = BTreeSet::new();
     // All at once, so the seeds share their time and do not add it: a bound on
-    // each seed (`SEED_LOOKUP_BOUND`) is a bound on the whole when no seed waits
+    // each seed (`SEED_LOOKUP_FLOOR` or more) is a bound on the whole when no seed waits
     // for another.
     // Dropped with this future, which aborts the lookups still going: a stop
     // does not wait for one.
@@ -2709,7 +2709,7 @@ mod tests {
         crate::discovery::set_test_dns_server(None);
         server.abort();
 
-        let bound = crate::discovery::SEED_LOOKUP_BOUND;
+        let bound = crate::discovery::SEED_LOOKUP_FLOOR;
         assert_eq!(peers, BTreeSet::from([good]), "the seed that answers is not lost");
         assert!(took >= bound, "each hung seed waited out its bound: {took:?}");
         assert!(

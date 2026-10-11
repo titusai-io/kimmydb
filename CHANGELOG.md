@@ -24,14 +24,15 @@ breaking changes and says so here; a `0.x.PATCH` bump never does.
   ndots/timeout/attempts/edns0`; **a missing `resolv.conf`, or none with a
   nameserver, is now an error** (it was a resolver on `127.0.0.1`); `nsswitch.conf`
   is not read (the static musl build and so the container never read it; a glibc or
-  macOS build loses `mdns`/`sssd`/scoped resolvers); and a seed that has not
-  answered in **15 s** is reported and tried again at the next tick, where it used
-  to wait on the resolver's own timeouts. Seeds are resolved together, so several
-  that do not answer cost 15 s in all. No rollback boundary and no configuration
+  macOS build loses `mdns`/`sssd`/scoped resolvers); and a seed is given the time `resolv.conf`'s `timeout` and `attempts` allow for the
+  names it tries (at least **15 s**) and is then reported and tried again at the next
+  tick, where it used to wait on the resolver's own timeouts. Seeds are resolved
+  together, so several that do not answer cost one bound in all. No rollback boundary and no configuration
   change. The webhook and embedding-provider lookups still use `getaddrinfo`.
   ADR-223; amends ADR-202.
 - New test switch `KIMMY_TEST_DNS_SERVER=<ip>:<port>` (`docs/testing.md`,
-  `docs/operations.md`): never set it in a deployment; it logs a `WARN` at start.
+  `docs/operations.md`): it reaches `dns:` and `k8s:` seeds, not `dns-srv:`. Never set
+  it in a deployment; it logs a `WARN` at start.
 
 ## 0.45.0 - 2026-10-06
 

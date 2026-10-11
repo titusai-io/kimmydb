@@ -481,12 +481,17 @@ before still does:
   container never read it either; a glibc build loses `mdns`, `sssd` and the
   rest, and a macOS build loses the system's scoped resolvers (VPN, `/etc/resolver`),
   because the library reads `/etc/resolv.conf` alone.
-- **One seed gets 15 s.** The library's own limit is `timeout` × `attempts` per
-  name, one name after another, so a resolver that drops queries could keep one
-  lookup for minutes. A seed that has not answered in 15 s is reported
-  (`could not resolve … no answer in 15s`) and tried again at the next tick or
+- **A seed gets the time its configuration allows, and at least 15 s.** The
+  library spends `timeout` × `attempts` on each name, one name after another, so
+  a resolver that drops queries could keep one lookup for minutes. The bound is
+  that product for each name tried (the name and each search domain, or the name
+  alone if it ends in a dot), plus a second, and never less than 15 s: so a
+  Kubernetes short name under `ndots:5` and four search domains on a slow name
+  server can still be answered, as `getaddrinfo` eventually would, and it is
+  still bounded by `resolv.conf`. A seed not answered within it is reported
+  (`could not resolve … no answer in …`) and tried again at the next tick or
   early retry. Seeds are resolved together, so several that do not answer cost
-  15 s in all, not 15 s each.
+  one bound in all, not one each. A stop does not wait for any of it.
 
 A stop between lookups never waited. `dns-srv:` seeds never held a stop.
 
@@ -1204,7 +1209,7 @@ deployment.
 | `KIMMY_TEST_STALL_RUNTIME=<ms>/<period_s>` | Blocks every runtime worker for `ms` (at most 3000) every `period_s` |
 | `KIMMY_TEST_HOLD_WRITER=<ms>,<holder>` | Takes the single writer as `holder` (a label of `kimmy_write_lock_held_seconds`, such as `replication`) once the node serves, and holds it for `ms` (1 to 3,600,000). The member's reads go on; its writes wait. The thread keeps the engine for the whole hold, so a stop that arrives while it lasts waits `WRITES_CLOSE_CAP` (10 s) for the writer after the drain, then exits without closing the storage engine (exit 75): it records `storage_not_closed`, logs `exiting without closing the storage engine`, and the next start repairs the store. That is expected of a deliberate wedge. Any other value refuses the start |
 | `KIMMY_TEST_REFUSE_SYNC=1` | The member completes no replication contact in either direction: its listener accepts and drops peers and it dials none. SWIM and the client API are untouched. Any other value refuses the start |
-| `KIMMY_TEST_DNS_SERVER=<ip>:<port>` | `dns:` and `k8s:` seeds resolve against this one name server, from the start, and not the host's `resolv.conf` (which cannot name a port). So a test can stop a real node while a lookup waits on a name server that never answers. Any other value refuses the start |
+| `KIMMY_TEST_DNS_SERVER=<ip>:<port>` | `dns:` and `k8s:` seeds (**not** `dns-srv:`) resolve against this one name server, from the start, and not the host's `resolv.conf` (which cannot name a port). So a test can stop a real node while a lookup waits on a name server that never answers. Any other value refuses the start |
 | `KIMMY_TEST_REFUSE_DIAL=<addr\|node id>[,...]` | The member dials none of the named peers (a cluster `host:port`, or a node id, checked after the handshake); their dials to it go on. A one-way partition per peer. Armed at the start, before the first sync tick, as a partition that exists from the start (the other switches wait for the node to serve). Any other value refuses the start |
 
 **A bad value is not always the same answer.** A malformed or too large

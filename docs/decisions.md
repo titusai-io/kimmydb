@@ -25772,7 +25772,8 @@ failing a named test, in the order of the code review that asked for them.
 
 **Decision.** `SeedSource::resolve` resolves a `dns:` or `k8s:` seed with
 `hickory-resolver`'s `lookup_ip`, in a resolver **built for that lookup and dropped
-with it**, inside a bound of 15 s, and pairs every address with the seed's port.
+with it**, inside a bound its resolver configuration gives it (at least 15 s), and pairs
+every address with the seed's port.
 `peers::resolve` resolves the seeds **concurrently**, so the bounds overlap and do
 not add. `dns-srv:` is unchanged, and so are the egress lookups of webhook
 deliveries and embedding providers (`kimmy-egress`), which are still `getaddrinfo`.
@@ -25794,7 +25795,7 @@ the loop's guard aborts the task and the lookup ends with it, sockets included.
 | `options` | musl and glibc read their own set | `ndots`, `timeout`, `attempts`, `edns0` |
 | `nsswitch.conf` | glibc obeys it, musl never reads it | never read; no change on the static musl release build |
 | No `resolv.conf` or no nameserver | a resolver on `127.0.0.1` | an error, named on the `could not resolve seed` line |
-| Time | musl: `timeout` in all; glibc: `timeout` × `attempts` × nameservers | `timeout` × `attempts` per name, names one after another, so **15 s per seed** (half the discovery interval) |
+| Time | musl: about `timeout` × `attempts`; glibc: `timeout` × `attempts` × nameservers | `timeout` × `attempts` per name, names one after another: bounded at that product over the names tried, and at least 15 s |
 | A name that does not exist | an error | an error (unlike `dns-srv:`, where it is an empty set): a mistyped seed stays visible |
 | A stop in flight | held, up to the 22 s budget | not held |
 
@@ -25808,20 +25809,36 @@ the code under test, a resolver per lookup, sees the name. `dns-srv:` keeps its 
 resolver for the process and so has that behaviour, and reads `/etc/hosts` and
 `/etc/resolv.conf` once. That is not part of this record.
 
-**The bound.** `SEED_LOOKUP_BOUND` is 15 s: longer than one dead nameserver takes to
-give up on one name (5 s × 2 attempts), shorter than the 30 s discovery interval it
-would otherwise pin. The loop starts no second resolution while one is in flight,
-so without a bound a resolver that drops queries could keep one lookup, and so
-discovery, going for as long as the search list and the library's retries took. It
-is also what stops a seed list from adding its seeds' waits up: with the seeds
-resolved together, N hung seeds take one bound. Neither the bound nor the
-resolution is on the start or on readiness: a seed given as a name is resolved by
-the discovery loop and not at the start (ADR-202), and the bound is below the
-unbounded wait it replaces.
+**The bound.** A seed is given the time its resolver configuration allows, and at least
+15 s (`SEED_LOOKUP_FLOOR`). The library spends `timeout` × `attempts` on each name, one
+after another: the name and each search domain (and the `domain`, if `resolv.conf` has
+one), or the name alone if it ends in a dot. The bound is that product over the names
+tried, plus a second so that the library's own timeout is what ends a name nobody
+resolves, and the bound is what ends a lookup that stalls. A fixed 15 s would have
+failed, every tick, a name the configuration says takes longer (a Kubernetes short name
+under `ndots:5` and four search domains, on a slow name server), where `getaddrinfo`
+eventually answered it; with a fresh resolver per tick that name would never resolve.
+The floor is half the discovery interval and longer than one dead name server takes to
+give up on one name (5 s × 2). The loop starts no second resolution while one is in
+flight, so without a bound a resolver that drops queries could keep one lookup, and so
+discovery, going as long as the search list took. It is still bounded, by `resolv.conf`,
+and a stop does not wait for it: the abort drops the future. With the seeds resolved
+together, N seeds that nobody answers take one bound and not N. Nothing waits on the
+resolution at the start or for readiness: a seed given as a name is resolved by the
+discovery loop and not at the start (ADR-202), and the catching-up wait is
+`catch_up_wait_secs` whatever the resolution does. The comparison with the old call is
+not "unbounded": on the static musl build a hung seed's `getaddrinfo` lasted about
+`timeout` × `attempts`, on glibc `timeout` × `attempts` × the name servers. What
+differs is that the bound now follows the same configuration, the seeds run
+concurrently, and a stop no longer waits.
+
+**Both families, asked for by name.** The lookup strategy is set to ask for A and
+AAAA together and not left to the library's default; a name that holds only an A record
+is an answer, and one that does not exist is an error.
 
 **A test switch, `KIMMY_TEST_DNS_SERVER=<ip>:<port>`**, makes `dns:` and `k8s:`
-seeds resolve against one name server from the start and not against
-`resolv.conf`, which cannot name a port. It follows `KIMMY_TEST_REFUSE_DIAL`: read
+seeds (not `dns-srv:`, whose resolver is the process's own) resolve against one name
+server from the start and not against `resolv.conf`, which cannot name a port. It follows `KIMMY_TEST_REFUSE_DIAL`: read
 by `kimmyd` at the start, a value that is not an address refuses the start, and
 every start where it is set logs a `WARN` naming it. It is in the shipped binary,
 like the others, so that a stop is timed against the process that ships.
@@ -25833,7 +25850,10 @@ files; the egress lookups, which still hold a stop and are bounded as
 **Tests.** Against a UDP name server of the test's own: a name resolves to every
 address it holds, both families, each with the seed's port; a name that does not
 exist is an error and not an empty set; a server that never answers is given up on
-at its bound; a dropped lookup lets its runtime end at once; a name is looked up
+at its bound; the bound follows the configuration (a short name under a long search
+list, on a server that answers only the last name, is answered where a fixed bound would
+have failed it, with that fixed bound as the control); a name that holds only an A record
+resolves to it; a dropped lookup lets its runtime end at once; a name is looked up
 afresh each time (with the control above); a short name goes through the search
 list and a name with a final dot is asked alone; a numeric host is returned as it
 is; the switch points the seed source at the server. `peers`: an unresolvable seed
