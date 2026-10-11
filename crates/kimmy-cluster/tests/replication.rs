@@ -9415,3 +9415,55 @@ async fn a_database_dropped_by_a_member_that_was_behind_stays_dropped() {
         assert!(member.engine.get_collection("shop", "late").is_err());
     }
 }
+
+// -- A database's drop (ADR-229) ----------------------------------------------
+
+/// `a` holds `shop.orders`, which `m` has pulled; `m` then creates `shop.late`
+/// itself, which `a` never receives; `a` drops the database. `p` catches up from
+/// `a`, by snapshot or by entries, and `m` talks to `p` alone.
+async fn database_dropped_after_m_made_a_collection_a_never_held(
+    by_snapshot: bool,
+    how: Pull,
+) -> (Node, Node) {
+    let (a, m, _ca) = origin_and_a_member_that_holds_it(|_, _| {}).await;
+    let late = m.engine.create_collection("shop", "late").unwrap();
+    m.engine.insert(&late, doc! { "_id": "x" }).unwrap();
+    tokio::time::sleep(Duration::from_millis(5)).await;
+    assert!(a.engine.drop_database("shop").unwrap());
+    let p = p_catches_up_from(&a, by_snapshot).await;
+    m_pulls_from(&m, &p, how).await;
+    (a, m)
+}
+
+#[tokio::test]
+async fn a_relay_member_behind_a_snapshot_caught_up_peer_is_refused_and_takes_the_tombstone_from_the_page()
+ {
+    // `p` can only have the drop by snapshot, so it serves `m` no entry for it,
+    // and it holds a hole (ADR-224) that makes it refuse `m`'s pull. `m` takes
+    // `p`'s snapshot, whose page carries the database's tombstone `p` recorded
+    // from `a`'s, and buries `late`, a collection neither `a` nor `p` ever held.
+    let (a, m) = database_dropped_after_m_made_a_collection_a_never_held(true, Pull::Rounds).await;
+    assert!(
+        m.engine.get_collection("shop", "late").is_err(),
+        "m kept a collection the drop covers"
+    );
+    assert!(m.engine.get_collection("shop", "orders").is_err());
+    assert!(!m.engine.database_exists("shop").unwrap());
+    assert!(a.engine.get_collection("shop", "late").is_err(), "a never held it and still does not");
+}
+
+#[tokio::test]
+async fn a_relay_member_behind_a_snapshot_caught_up_peer_buries_in_the_loop() {
+    let (_a, m) = database_dropped_after_m_made_a_collection_a_never_held(true, Pull::Loop).await;
+    assert!(m.engine.get_collection("shop", "late").is_err());
+    assert!(!m.engine.database_exists("shop").unwrap());
+}
+
+#[tokio::test]
+async fn control_the_same_database_drop_without_the_snapshot_hop() {
+    // `p` catches up by entries, so `m` is served the drop's own entry.
+    let (_a, m) =
+        database_dropped_after_m_made_a_collection_a_never_held(false, Pull::Rounds).await;
+    assert!(m.engine.get_collection("shop", "late").is_err(), "control");
+    assert!(!m.engine.database_exists("shop").unwrap());
+}

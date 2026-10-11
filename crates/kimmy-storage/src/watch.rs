@@ -322,6 +322,14 @@ impl Engine {
                 )),
             };
         }
+        // From here the incarnation is bounded by where the drop's entry arrived,
+        // which is exact only if every entry of the live life arrived after it.
+        // Two cases still reach this, and each has a test that fails if the
+        // branch is removed: the collection is **absent** (dropped and not
+        // recreated: `a_stream_of_a_dropped_collection_starts_after_its_drop`),
+        // and its creation was stamped at the tombstone's own `Hlc`, which the
+        // stamp-based branch above cannot place (`a_creation_stamped_at_the_drops_hlc_...`).
+        // Every other live collection with a tombstone began after it (ADR-229).
         let Some(drop_seq) = self.arrival_of(&dropped_at)? else {
             // The drop is not in the log, so its position is not known. The
             // tombstone's stamp still bounds the incarnation: a token at or

@@ -13217,6 +13217,39 @@ async fn a_database_drop_that_buries_a_collection_the_dropper_never_held_forgets
 }
 
 #[tokio::test]
+async fn a_vector_cache_that_lags_behind_burial_notices_reconciles_against_the_catalogue() {
+    // The notices of collections buried with no entry (ADR-229) come in one per
+    // sweep, but a consumer can still be behind them. It cannot say which
+    // collections went, so it reconciles against what the node holds, as it does
+    // for the entries it misses, at the cost of a rebuild and never a wrong answer.
+    let server = Server::start().await;
+    let token = server.root().await;
+    configure_vectors(&server, &token, "shop", "docs").await;
+    let shadow = build_graph(&server, "shop", "docs");
+    assert_eq!(server.state.vectors.len(), 1);
+    // Gone from the catalogue before the consumer exists, so no entry it will see
+    // names it, and nothing has forgotten the graph.
+    assert!(server.state.engine.drop_collection("shop", "docs").unwrap());
+    assert_eq!(server.state.vectors.len(), 1, "premise: the graph outlived its collection");
+    let consumer = tokio::spawn(kimmy_api::vectors::invalidator(&server.state));
+    tokio::task::yield_now().await;
+
+    for i in 0..2_000u64 {
+        server.state.engine.send_buried_for_test(vec![kimmy_storage::BuriedCollection {
+            db: "other".into(),
+            name: format!("c{i}"),
+            ids: vec![kimmy_core::CollectionId(1_000_000 + i)],
+        }]);
+    }
+    assert!(
+        wait_until(|| server.state.vectors.is_empty()).await,
+        "a consumer that lagged behind the notices kept a graph for a collection that is gone"
+    );
+    assert!(!snapshot_of(&server, shadow).exists());
+    consumer.abort();
+}
+
+#[tokio::test]
 async fn a_replicated_drop_that_names_the_shadow_itself_forgets_its_index() {
     // The other shape a drop entry takes: the shadow's own, minted when the
     // vectors are discarded without their parent. The consumer derives the id

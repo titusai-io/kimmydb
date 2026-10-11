@@ -156,6 +156,12 @@ impl Engine {
         }
     }
 
+    /// [`Self::send_buried`], for a test of a consumer that lags behind it.
+    #[cfg(any(test, feature = "test-hooks"))]
+    pub fn send_buried_for_test(&self, collections: Vec<BuriedCollection>) {
+        self.send_buried(collections);
+    }
+
     /// The first commit of a database drop: the tombstone and the entry that
     /// carries it (ADR-229). Minted under the writer (ADR-148), so its stamp
     /// sorts with the commit order and every entry this node serves after it

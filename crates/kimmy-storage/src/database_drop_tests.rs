@@ -138,6 +138,16 @@ fn a_create_older_than_a_database_drop_is_history_and_its_documents_are_supersed
         "the refusal must leave the collection's own tombstone, or its documents stop the batch"
     );
     assert_eq!(outcome.unknown_collection, 0, "{:?}", outcome.unknown);
+    // A creation judged history is not served onward, as one older than the
+    // collection's own tombstone is not.
+    let created = b
+        .entries_for_peer(Hlc::ZERO, BATCH, crate::WalkScope::Background)
+        .unwrap()
+        .entries
+        .into_iter()
+        .find(|e| e.kind == OpKind::CreateCollection && e.collection == late)
+        .expect("b holds the creation");
+    assert!(c.oplog_entry(&created.stamp).unwrap().is_none(), "a refused creation was kept");
 
     // And more of the old life, after the create was refused, is history, not a stop.
     let bl = b.get_collection("shop", "late").unwrap();
@@ -608,7 +618,15 @@ fn a_failed_sweep_is_not_memoised() {
         a.database_dropped_at("shop").unwrap().unwrap(),
     )
     .unwrap();
-    let stopped = c.sweep(&|| Err(crate::StorageError::Stopping(crate::StopReason::Shutdown)));
+    // Past the first checkpoint, so the failure comes after the walk has begun.
+    let calls = std::cell::Cell::new(0);
+    let stopped = c.sweep(&|| {
+        calls.set(calls.get() + 1);
+        if calls.get() > 1 {
+            return Err(crate::StorageError::Stopping(crate::StopReason::Shutdown));
+        }
+        Ok(())
+    });
     assert!(stopped.is_err());
     assert_eq!(c.bury_under_database_tombstones().unwrap().spared, 1, "the retry walked");
 }
@@ -967,4 +985,254 @@ fn the_reconcile_says_what_it_is_doing_on_the_readiness_probe() {
     engine.reconcile_database_tombstones().unwrap();
     assert_eq!(seen.get(), Some((OpenPhase::Reconciling, 1)));
     assert_eq!(open_snapshot().phase, before, "the phase it found is the phase it leaves");
+}
+
+/// One measurement, not a guard: what a stream opened with no token on a
+/// survivor pays for the stamp-based start. The walk reads the arrival index
+/// from the stream's start to the first entry stamped after the tombstone, so
+/// it is the retained prefix older than the drop and no more: here the worst
+/// case, the whole oplog older than the drop.
+/// `cargo test --release -p kimmy-storage --lib the_stamp_based_start -- --ignored --nocapture`
+#[test]
+#[ignore = "a measurement"]
+fn the_stamp_based_start_of_a_stream_on_a_survivor_costs_one_pass_over_the_older_prefix() {
+    let (c, _d) = engine();
+    let bulk = c.create_collection("other", "bulk").unwrap();
+    let rows: usize =
+        std::env::var("KIMMY_MEASURE_ROWS").ok().and_then(|v| v.parse().ok()).unwrap_or(500_000);
+    let started = std::time::Instant::now();
+    for chunk in 0..(rows / 10_000) {
+        let docs = (0..10_000).map(|i| doc! { "_id": format!("d{chunk}-{i}") }).collect();
+        c.insert_many(&bulk, docs).unwrap();
+    }
+    eprintln!("MEASURE wrote {rows} entries in {:?}", started.elapsed());
+    later();
+    let dropped = Stamp::new(Hlc::new(crate::physical_now_ms(), 0), NodeId::from_bytes([7; 16]));
+    c.record_collection_drop(kimmy_core::database_drop_id("shop"), dropped).unwrap();
+    c.record_collection_drop(CollectionId::derive("shop", "late"), dropped).unwrap();
+    later();
+    let late = c.create_collection("shop", "late").unwrap();
+    c.insert(&late, doc! { "_id": 1 }).unwrap();
+    let from_start = WatchOptions { resume_after: None, start_at: Some(Hlc::ZERO) };
+    let began = std::time::Instant::now();
+    let _stream = c.watch(WatchScope::Collection(late.id), from_start).unwrap();
+    eprintln!(
+        "MEASURE opened a stream with no token over {rows} older entries in {:?}",
+        began.elapsed()
+    );
+}
+
+// -- The position branch of the incarnation clamp, which two cases still reach --
+
+/// A collection dropped and not recreated: there is no live life to read stamps
+/// from, so a stream starts after the drop's entry.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_stream_of_a_dropped_collection_starts_after_its_drop() {
+    let (e, _d) = engine();
+    let x = e.create_collection("shop", "x").unwrap();
+    e.insert(&x, doc! { "_id": "old" }).unwrap();
+    assert!(e.drop_collection("shop", "x").unwrap());
+    let from_start = WatchOptions { resume_after: None, start_at: Some(Hlc::ZERO) };
+    let mut stream = e.watch(WatchScope::Collection(x.id), from_start).unwrap();
+    let heard = tokio::time::timeout(Duration::from_millis(300), stream.next(&e)).await;
+    assert!(
+        heard.is_err(),
+        "the stream of a dropped collection replayed the life before: {heard:?}"
+    );
+}
+
+/// A creation stamped at the tombstone's own `Hlc` (the node breaks the tie in
+/// its favour), so the live life did not begin *after* the tombstone and the
+/// stamp-based branch does not apply: the position the drop's entry arrived at
+/// still bounds the incarnation.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_creation_stamped_at_the_drops_hlc_is_placed_by_where_the_drop_arrived() {
+    let (e, _d) = engine();
+    let x = CollectionId::derive("shop", "x");
+    let insert = |at: Stamp, id: &str| kimmy_core::OplogEntry {
+        stamp: at,
+        kind: OpKind::Insert,
+        collection: x,
+        doc_id: Some(kimmy_core::DocId::String(id.into())),
+        body: Some(bson::serialize_to_vec(&doc! { "_id": id }).unwrap()),
+    };
+    let drop = crate::engine::ddl_entry(
+        stamp_of(5_000, 1),
+        OpKind::DropCollection,
+        x,
+        &CollectionRef::new("shop", "x"),
+    )
+    .unwrap();
+    for entry in
+        [create_entry("shop", "x", stamp_of(4_900, 1)), insert(stamp_of(4_950, 1), "old"), drop]
+    {
+        e.apply_batch(std::slice::from_ref(&entry)).unwrap();
+    }
+    // What the drop held is the purger's before the name can be made again.
+    e.finish_purges_now().unwrap();
+    for entry in [
+        // The same `Hlc` as the drop, from a node that sorts above it: not history.
+        create_entry("shop", "x", stamp_of(5_000, 2)),
+        insert(stamp_of(5_100, 2), "new"),
+    ] {
+        e.apply_batch(std::slice::from_ref(&entry)).unwrap();
+    }
+    let live = e.get_collection("shop", "x").unwrap();
+    assert_eq!(live.created, Hlc::new(5_000, 0), "premise: the creation is at the tombstone's Hlc");
+    let from_start = WatchOptions { resume_after: None, start_at: Some(Hlc::ZERO) };
+    let mut stream = e.watch(WatchScope::Collection(x), from_start).unwrap();
+    let only = next_document(&mut stream, &e).await;
+    assert_eq!(
+        only.doc_id,
+        Some(kimmy_core::DocId::String("new".into())),
+        "the life before was replayed"
+    );
+}
+
+// -- The races a drop can lose, and the shapes it must keep ------------------------
+
+/// The drop lands between a replicated creation's check and its writer: the
+/// creation is judged again under the writer, and refused, and the collection's
+/// own tombstone is left.
+#[test]
+fn a_database_drop_that_lands_while_a_creation_applies_still_refuses_it() {
+    let (a, b, _da, _db, late) = the_field_sequence();
+    let (c, _dc) = engine();
+    let c = Arc::new(c);
+    let theirs: Vec<_> = b
+        .entries_for_peer(Hlc::ZERO, BATCH, crate::WalkScope::Background)
+        .unwrap()
+        .entries
+        .into_iter()
+        .filter(|e| e.collection == late)
+        .collect();
+    assert!(theirs.iter().any(|e| e.kind == OpKind::CreateCollection), "premise");
+    let drop = a.entries_for_peer(Hlc::ZERO, BATCH, crate::WalkScope::Background).unwrap().entries;
+    let landing = Arc::clone(&c);
+    let (applied, ()) = crate::sync::race_hooks::race(
+        crate::sync::race_hooks::Race::ReplicatedCreate,
+        move || {
+            landing.apply_batch(&drop).unwrap();
+        },
+        || c.apply_batch(&theirs),
+    );
+    let outcome = applied.unwrap();
+    assert_eq!(outcome.unknown_collection, 0, "{:?}", outcome.unknown);
+    assert!(!holds(&c, "shop", "late"), "a creation older than the drop stood");
+    assert!(c.collection_dropped_at(late).unwrap().is_some(), "and left no tombstone of its own");
+}
+
+/// The same for a snapshot's definition.
+#[test]
+fn a_database_drop_that_lands_while_a_definition_is_restored_still_refuses_it() {
+    let (a, b, _da, _db, late) = the_field_sequence();
+    let (c, _dc) = engine();
+    let c = Arc::new(c);
+    // `c` holds `orders`, so `late` is the first definition it has to create.
+    let orders =
+        a.entries_for_peer(Hlc::ZERO, BATCH, crate::WalkScope::Background).unwrap().entries;
+    let orders_create: Vec<_> =
+        orders.iter().filter(|e| e.kind == OpKind::CreateCollection).cloned().collect();
+    c.apply_batch(&orders_create).unwrap();
+    assert!(holds(&c, "shop", "orders"));
+    let page = b.snapshot_page(None, None).unwrap();
+    let landing = Arc::clone(&c);
+    let (restored, ()) = crate::sync::race_hooks::race(
+        crate::sync::race_hooks::Race::Restore,
+        move || {
+            landing.apply_batch(&orders).unwrap();
+        },
+        || c.apply_snapshot_page(b.node_id(), &mut SnapshotProgress::whole_database(), &page),
+    );
+    restored.unwrap();
+    assert!(!holds(&c, "shop", "late"), "a definition older than the drop was restored");
+    assert!(c.collection_dropped_at(late).unwrap().is_some(), "and left no tombstone of its own");
+}
+
+/// A refused collection with vectors leaves its shadow's tombstone too: the
+/// chunks that follow are judged by the shadow's id.
+#[test]
+fn a_database_drop_covers_a_never_held_vector_configured_collection_and_its_chunks() {
+    let (a, _da) = engine();
+    let (b, _db) = engine();
+    let (c, _dc) = engine();
+    a.create_collection("shop", "orders").unwrap();
+    sync(&a, &b);
+    b.create_collection("shop", "late").unwrap();
+    b.configure_vectors("shop", "late", vector_config()).unwrap();
+    let shadow = b.vector_collection("shop", "late").unwrap().unwrap();
+    let put = |n: i64| {
+        let source = kimmy_core::DocId::Int64(n);
+        b.put_vectors(
+            &shadow,
+            &source,
+            &[kimmy_core::VectorRecord {
+                source: source.clone(),
+                chunk: 0,
+                source_hlc: Hlc::new(1, 0),
+                vector: vec![1.0, 0.0, 0.0, 0.0],
+                text: "t".into(),
+                config: None,
+            }],
+        )
+        .unwrap();
+    };
+    put(1);
+    later();
+    assert!(a.drop_database("shop").unwrap());
+    pull(&c, &a);
+    let outcome = pull(&c, &b);
+    assert_eq!(
+        outcome.unknown_collection, 0,
+        "the first chunk stopped the batch: {:?}",
+        outcome.unknown
+    );
+    put(2);
+    let outcome = pull(&c, &b);
+    assert_eq!(outcome.unknown_collection, 0, "{:?}", outcome.unknown);
+    assert!(!holds(&c, "shop", "late"));
+}
+
+/// What the head mints is an ordinary `DropCollection` that names the reserved
+/// collection, in the shape a build that predates the rule applies (ADR-229).
+#[test]
+fn the_head_of_a_database_drop_mints_an_ordinary_drop_collection_entry() {
+    let (a, _da) = engine();
+    a.create_collection("shop", "orders").unwrap();
+    assert!(a.drop_database("shop").unwrap());
+    let id = kimmy_core::database_drop_id("shop");
+    let entries =
+        a.entries_for_peer(Hlc::ZERO, BATCH, crate::WalkScope::Background).unwrap().entries;
+    let head: Vec<_> = entries.iter().filter(|e| e.collection == id).collect();
+    assert_eq!(head.len(), 1, "one head entry: {head:?}");
+    assert_eq!(head[0].kind, OpKind::DropCollection);
+    let body: CollectionRef = bson::deserialize_from_slice(head[0].body.as_ref().unwrap()).unwrap();
+    assert_eq!(body, CollectionRef::new("shop", RESERVED));
+    assert_eq!(a.database_dropped_at("shop").unwrap(), Some(head[0].stamp));
+    // And it is stamped before the burial of the collection it covers.
+    let burial = entries
+        .iter()
+        .find(|e| {
+            e.kind == OpKind::DropCollection
+                && e.collection == CollectionId::derive("shop", "orders")
+        })
+        .unwrap();
+    assert!(head[0].stamp < burial.stamp);
+}
+
+/// A stream subscribes to the buried notices before it resolves where it starts:
+/// a sweep that runs *during* the resolve is heard.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_stream_opened_while_its_start_resolves_hears_a_sweep_that_runs_then() {
+    let (a, b, _da, _db, late) = the_field_sequence();
+    let (c, _dc) = engine();
+    let (a, c) = (Arc::new(a), Arc::new(c));
+    pull(&c, &b);
+    let (sweeping, from) = (Arc::clone(&c), Arc::clone(&a));
+    c.during_next_watch_resolve(move || {
+        pull(&sweeping, &from);
+    });
+    let mut stream = c.watch(WatchScope::Collection(late), WatchOptions::default()).unwrap();
+    assert!(!holds(&c, "shop", "late"), "premise: the sweep ran during the resolve");
+    assert!(dropped(next(&mut stream, &c).await), "the notice sent during the resolve was missed");
 }
