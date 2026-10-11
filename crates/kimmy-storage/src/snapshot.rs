@@ -6613,6 +6613,174 @@ mod tests {
         assert!(b.get_collection("shop", "orders.__vectors").is_ok(), "and the vectors are kept");
     }
 
+    /// Two origins' changes at one `Hlc`: ON from the lower node id, OFF from the higher.
+    /// The whole `Stamp` orders them (the node breaks the tie), so the OFF wins.
+    fn on_and_off_at_one_hlc() -> (Stamp, Stamp) {
+        let hlc = Hlc::new(crate::engine::physical_now_ms() + 3_600_000, 0);
+        let x = NodeId::from_bytes([1; 16]);
+        let y = NodeId::from_bytes([2; 16]);
+        (Stamp::new(hlc, x), Stamp::new(hlc, y))
+    }
+
+    #[test]
+    fn two_origins_at_one_hlc_converge_whatever_the_order_by_entries() {
+        let (on_at, off_at) = on_and_off_at_one_hlc();
+        for order in [[true, false], [false, true]] {
+            let (m, _dm) = engine();
+            let orders = m.create_collection("shop", "orders").unwrap();
+            let change = |on: bool| {
+                let stamp = if on { on_at } else { off_at };
+                crate::engine::ddl_entry(
+                    stamp,
+                    OpKind::ConfigureVectors,
+                    orders.id,
+                    &kimmy_core::VectorSet {
+                        db: "shop".into(),
+                        collection: "orders".into(),
+                        config: on.then(vector_config),
+                    },
+                )
+                .unwrap()
+            };
+            for on in order {
+                m.apply_batch(std::slice::from_ref(&change(on))).unwrap();
+            }
+            assert_eq!(
+                vector_state(&m),
+                (false, Some(off_at)),
+                "order {order:?}: the higher node wins the tie, whichever came first"
+            );
+        }
+    }
+
+    #[test]
+    fn two_origins_at_one_hlc_converge_whatever_the_order_by_page() {
+        let (on_at, off_at) = on_and_off_at_one_hlc();
+        let (a, _da) = engine();
+        a.create_collection("shop", "orders").unwrap();
+        let template = a.snapshot_page(None, None).unwrap();
+        let page_of = |on: bool| {
+            let mut page = template.clone();
+            page.collections.retain(|c| c.name == "orders");
+            let stamp = if on { on_at } else { off_at };
+            for state in &mut page.collections {
+                state.vector = on.then(vector_config);
+                state.vector_changed = Some(stamp);
+            }
+            page.versions.insert(on_at.node, on_at.hlc);
+            page.versions.insert(off_at.node, off_at.hlc);
+            page
+        };
+        for order in [[true, false], [false, true]] {
+            let (m, _dm) = engine();
+            m.create_collection("shop", "orders").unwrap();
+            for on in order {
+                let mut progress = SnapshotProgress::whole_database();
+                m.apply_snapshot_page(a.node_id(), &mut progress, &page_of(on)).unwrap();
+            }
+            assert_eq!(
+                vector_state(&m),
+                (false, Some(off_at)),
+                "order {order:?}: the higher node wins the tie, whichever page came first"
+            );
+        }
+    }
+
+    #[test]
+    fn a_restart_mints_no_vector_change_below_one_a_completed_snapshot_applied() {
+        // The page's stamp is far ahead of the wall clock and has no entry in the oplog:
+        // only the version vector, raised by the snapshot's grant, names it. A clock
+        // resumed from the oplog tail alone would mint the next change below it.
+        let (a, _da, b, _db) = both_hold_a_configuration();
+        a.disable_vectors("shop", "orders", false).unwrap();
+        let ahead = Hlc::new(crate::engine::physical_now_ms() + 3_600_000, 0);
+        let mut page = a.snapshot_page(None, None).unwrap();
+        for state in &mut page.collections {
+            if let Some(stamp) = &mut state.vector_changed {
+                stamp.hlc = ahead;
+            }
+        }
+        page.versions.insert(a.node_id(), ahead);
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("kimmy.redb");
+        drop(b);
+        {
+            let c = Engine::open(&path).unwrap();
+            c.create_collection("shop", "orders").unwrap();
+            let mut progress = SnapshotProgress::whole_database();
+            c.apply_snapshot_page(a.node_id(), &mut progress, &page).unwrap();
+            assert!(!vector_state(&c).0, "premise: applied");
+        }
+
+        let reopened = Engine::open(&path).unwrap();
+        reopened.configure_vectors("shop", "orders", vector_config()).unwrap();
+
+        let (_, stamp) = vector_state(&reopened);
+        assert!(stamp.unwrap().hlc > ahead, "stamped above the page's after a restart: {stamp:?}");
+    }
+
+    #[test]
+    fn a_restart_resumes_the_clock_from_the_version_vectors_as_well_as_the_oplog() {
+        // A completed snapshot raises the vectors over what its sender covered, and the
+        // stamps it covers need not be in the oplog. The clock had folded them in; a
+        // restart must not lose them.
+        let (a, _da) = aged_origin(3);
+        let ahead = Hlc::new(crate::engine::physical_now_ms() + 3_600_000, 0);
+        let mut page = a.snapshot_page(None, None).unwrap();
+        page.versions.insert(a.node_id(), ahead);
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("kimmy.redb");
+        {
+            let c = Engine::open(&path).unwrap();
+            let mut progress = SnapshotProgress::whole_database();
+            c.apply_snapshot_page(a.node_id(), &mut progress, &page).unwrap();
+            assert!(progress.is_complete(), "premise");
+        }
+
+        let reopened = Engine::open(&path).unwrap();
+
+        assert!(reopened.clock_last() >= ahead, "{:?} < {ahead:?}", reopened.clock_last());
+    }
+
+    #[test]
+    fn a_restart_after_a_partial_snapshot_still_mints_above_the_standing_stamp() {
+        // Only the first page has landed: no grant yet, so no vector names the stamp the
+        // definition carried, and the oplog tail is below it. The local change is
+        // stamped above the one it replaces all the same, whatever the clock says.
+        let (a, _da, _b, _db) = both_hold_a_configuration();
+        let ca = a.get_collection("shop", "orders").unwrap();
+        for i in 0..(SNAPSHOT_PAGE as i64 + 20) {
+            a.insert(&ca, doc! { "_id": i }).unwrap();
+        }
+        a.disable_vectors("shop", "orders", false).unwrap();
+        let ahead = Hlc::new(crate::engine::physical_now_ms() + 3_600_000, 0);
+        let mut page = a.snapshot_page(None, None).unwrap();
+        assert!(page.next.is_some(), "premise: more than one page");
+        for state in &mut page.collections {
+            if let Some(stamp) = &mut state.vector_changed {
+                stamp.hlc = ahead;
+            }
+        }
+        page.versions.insert(a.node_id(), ahead);
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("kimmy.redb");
+        {
+            let c = Engine::open(&path).unwrap();
+            c.create_collection("shop", "orders").unwrap();
+            c.configure_vectors("shop", "orders", vector_config()).unwrap();
+            let mut progress = SnapshotProgress::whole_database();
+            c.apply_snapshot_page(a.node_id(), &mut progress, &page).unwrap();
+            let (on, stamp) = vector_state(&c);
+            assert!(!on && stamp.unwrap().hlc == ahead, "premise: the first page applied");
+        }
+
+        let reopened = Engine::open(&path).unwrap();
+        reopened.configure_vectors("shop", "orders", vector_config()).unwrap();
+
+        let (_, stamp) = vector_state(&reopened);
+        assert!(stamp.unwrap().hlc > ahead, "a change never moves the stamp backwards: {stamp:?}");
+    }
+
     #[test]
     fn a_disable_of_a_configuration_already_off_is_stamped_and_logged() {
         // So its stamp is in the servable vector and a page carrying it passes the

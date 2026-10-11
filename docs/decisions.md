@@ -26143,8 +26143,23 @@ Tested at one hop and two, with the observer talking to one peer only.
 
 **Accepted and documented.** An unstamped local state counts as older than any stamped page, so
 state written before this release converges. A 0.45-era local change made *after* the origin's off
-is therefore lost when a page arrives: the page is dated and the local value is not. The two
-directions of the comparison are tested.
+is therefore lost when a page arrives: the page is dated and the local value is not. The same
+reading names the **rollback-and-forward** case: a vector change made while on 0.45 leaves the
+collection unstamped (0.45 rewrites the metadata without the field), so after rolling forward again it
+reads as older than any stamped change, and a page stamped older than that change in real time, but
+newer than the member's last stamped one, replaces it. The two directions of the comparison are
+tested.
+
+**The tie is the whole stamp, and a stamp only moves forward.** Two origins can make changes at one
+`Hlc`; the node id breaks the tie (`Stamp` orders by both), so every member picks the same winner
+whichever change reached it first. Entries and pages are tested in both orders with two origins at one
+`Hlc`; judging by the `Hlc` alone makes the answer depend on the order. A local change is stamped
+**above the one it replaces** whatever the clock says (`next_stamp_above`), and the clock itself
+resumes at the highest stamp the store has seen: the oplog's tail **or** a stamp a version vector names.
+A completed snapshot raises the vectors over stamps it applied as state (a vector change's among them)
+that have no entry here; resuming from the oplog tail alone would lose what the clock had folded in and
+mint the next change below one already standing, and a partial snapshot, which has granted no vector
+yet, can leave a stamp in the definition that only the clamp protects.
 
 **Wire and disk.** Additive, defaulted fields: an older sender writes none and an older receiver
 ignores the key, so a mixed pair keeps the previous behaviour until both have rolled. A build
@@ -26159,5 +26174,8 @@ and still adds a configuration to unstamped state; a stamp the sender's coverage
 ignored; applying a stamp moves the local clock past it; an entry is last-writer-wins on its stamp
 (an earlier configuration delivered after the later off does not undo it); a disable of a
 configuration already off is stamped and logged, and a page from a sender whose configuration was
-never on still turns a receiver's off; a state without the stamp reads as unstamped. `kimmy-cluster`:
+never on still turns a receiver's off; a state without the stamp reads as unstamped; two origins' changes
+at one `Hlc` converge in both orders, by entries and by page; a restart mints no change below one a completed
+snapshot applied, resumes the clock from the version vectors as well as the oplog, and a restart part-way
+through a snapshot still mints above the standing stamp. `kimmy-cluster`:
 the relay through real rounds and the member's own loop, the direct snapshot, two snapshot hops.

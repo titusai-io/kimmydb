@@ -271,7 +271,7 @@ impl crate::Engine {
             // one, and the entry's own for a peer's. A page from a sender that did not
             // stamp it leaves the standing stamp alone.
             let stamp = match by {
-                Configured::Locally => Some(self.next_stamp()),
+                Configured::Locally => Some(self.next_stamp_above(meta.vector_changed)),
                 other => other.stamp(),
             };
             if stamp.is_some() {
@@ -436,7 +436,7 @@ impl crate::Engine {
                 continue;
             }
             let stamp = match by {
-                Configured::Locally => Some(self.next_stamp()),
+                Configured::Locally => Some(self.next_stamp_above(meta.vector_changed)),
                 other => other.stamp(),
             };
             if stamp.is_some() {
