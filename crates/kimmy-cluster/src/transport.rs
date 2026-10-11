@@ -6095,6 +6095,7 @@ mod tests {
                 // The incarnation the sender holds, older than every
                 // document it carries, as a real sender's would be.
                 created: Some(Hlc::ZERO),
+                vector_changed: None,
             }]
         } else {
             Vec::new()

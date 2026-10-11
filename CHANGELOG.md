@@ -42,9 +42,24 @@ breaking changes and says so here; a `0.x.PATCH` bump never does.
   a TTL index went on expiring documents, and nothing detected it. The page now lists the
   sender's index-drop tombstones; the receiver judges each as a replicated `DropIndex`
   (an index created after the drop is left alone), records it, and serves it onward.
-  Together with the next entry, a member behind a snapshot-caught-up peer gets the drop
+  Together with the entry below about a member that caught up by snapshot (ADR-224), a member behind a snapshot-caught-up peer gets the drop
   too. An older sender writes nothing and an older receiver ignores the list, so a mixed
   cluster keeps the old behaviour until every member has rolled. ADR-225. No rollback boundary.
+
+- **A snapshot now carries a vector configuration that was turned off.** A member that took a
+  snapshot (or a scoped repair) from a member that had turned a collection's vector
+  configuration off kept it, and went on embedding, refusing chunk writes and answering vector
+  search from a configuration the cluster had dropped; nothing detected it. A configuration now
+  carries the stamp of its latest change, a page says when it was turned off, and the receiver
+  applies the later of its own and the page's. **Two behaviours change with it:** the entries
+  path is last-writer-wins on that stamp (two concurrent changes from two members now converge on
+  the later one, and a re-served older entry no longer flips a configuration back), and a
+  `disable` of a configuration that is already off is now stamped and logged, so a retried
+  disable writes (and replicates) where it used to do nothing. An unstamped state written before
+  this release counts as older than any stamped change, so a 0.45-era change made after the
+  origin's off is lost when a page arrives. Together with the entry below about a member that caught up by snapshot (ADR-224), a member behind a
+  snapshot-caught-up peer gets the off too. An older sender writes no stamp and an older receiver
+  ignores it. ADR-226. No rollback boundary.
 
 - **A member that caught up by a whole-database snapshot no longer serves a peer a
   window across history it holds only as state.** It held the sender's documents as

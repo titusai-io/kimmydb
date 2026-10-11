@@ -169,6 +169,18 @@ pub struct CollectionState {
     /// receiver does with the absence is on `Engine::restore_collection`.
     #[serde(default)]
     pub created: Option<Hlc>,
+    /// The stamp of the latest change to `vector`: a configuration, a change of it,
+    /// or turning it off (`CollectionMeta::vector_changed`, ADR-226).
+    ///
+    /// `vector` is a presence only, so a page could say "configured" and not "turned
+    /// off": a member holding the configuration kept it, and a completed snapshot's
+    /// grant meant the entry that turned it off was never served again. With the
+    /// stamp, "off at s" is a dated fact, and a receiver applies it when it is newer
+    /// than its own and the sender's coverage names it (ADR-163). Optional on the
+    /// wire: a sender that predates it writes none, and a page without one never
+    /// overrides a stamped local value.
+    #[serde(default)]
+    pub vector_changed: Option<Stamp>,
 }
 
 impl From<CollectionMeta> for CollectionState {
@@ -179,6 +191,7 @@ impl From<CollectionMeta> for CollectionState {
             indexes: meta.indexes,
             vector: meta.vector,
             created: Some(meta.created),
+            vector_changed: meta.vector_changed,
         }
     }
 }
@@ -803,7 +816,7 @@ impl Engine {
         self.apply_carried_index_drops(page, progress.scope)?;
         let mut ddl_refused = 0usize;
         for state in &page.collections {
-            match self.restore_collection(state) {
+            match self.restore_collection(state, &page.versions) {
                 Ok(refused) => ddl_refused += refused,
                 // The page's own drops just buried a life of this name, and
                 // its rows are the purger's now. What the page committed so
@@ -1385,7 +1398,11 @@ impl Engine {
     /// (`sync::settle`, ADR-123): a refused one is warned and counted, and
     /// the restore goes on to the documents; any other error still fails
     /// the page.
-    fn restore_collection(&self, state: &CollectionState) -> Result<usize> {
+    fn restore_collection(
+        &self,
+        state: &CollectionState,
+        versions: &VersionVector,
+    ) -> Result<usize> {
         if self.get_collection(&state.db, &state.name).is_err() {
             // A snapshot must not recreate a life this node has buried. The
             // page is current state on its sender, not an instruction: a peer
@@ -1543,19 +1560,75 @@ impl Engine {
             }
         }
 
-        if let Some(config) = &state.vector {
-            let existing = self.get_collection(&state.db, &state.name)?;
-            if existing.vector.as_ref() != Some(config) {
+        self.restore_vector_state(state, versions, &earlier)?;
+        Ok(refused)
+    }
+
+    /// The vector configuration a page describes, applied by the stamp it carries
+    /// (ADR-226).
+    ///
+    /// - **A dated page** (`vector_changed`): applied when the sender's own coverage
+    ///   names the stamp (ADR-163; it comes off the wire) and it is **newer than the
+    ///   standing change**, an unstamped standing state reading as older than any
+    ///   (judged where the change is made, under the writer). A
+    ///   configuration is set, a turned-off configuration is turned off, and the stamp
+    ///   is recorded either way. The clock observes the stamp, so a later local change
+    ///   cannot mint one below it.
+    /// - **An undated page** (a sender that predates the stamp) never overrides a
+    ///   stamped local value: it can only add a configuration to a collection whose
+    ///   vector state was last written unstamped, as it always did, and it can never
+    ///   turn one off.
+    fn restore_vector_state(
+        &self,
+        state: &CollectionState,
+        versions: &VersionVector,
+        history: &dyn Fn(&CollectionMeta) -> bool,
+    ) -> Result<()> {
+        let existing = self.get_collection(&state.db, &state.name)?;
+        let Some(stamp) = state.vector_changed else {
+            // Undated: the old rule, and only where nothing dated stands here.
+            if let Some(config) = &state.vector
+                && existing.vector_changed.is_none()
+                && existing.vector.as_ref() != Some(config)
+            {
                 self.configure_vectors_inner(
                     &state.db,
                     &state.name,
                     config.clone(),
-                    crate::vectors::Configured::FromSnapshot,
-                    &earlier,
+                    crate::vectors::Configured::FromSnapshot(None),
+                    history,
                 )?;
             }
+            return Ok(());
+        };
+        if stamp.hlc > versions.get(stamp.node) {
+            warn!(
+                db = %state.db,
+                collection = %state.name,
+                stamp = ?stamp,
+                covered_to = ?versions.get(stamp.node),
+                "a snapshot page changed a vector configuration at a stamp its sender's own \
+                 coverage does not name; ignored"
+            );
+            return Ok(());
         }
-        Ok(refused)
+        // The clock observes a stamp the sender's coverage names whether or not it is
+        // newer than ours: it is covered, so safe, and the judgement of which change
+        // wins is made once, under the writer, in `configure_vectors_inner` and
+        // `disable_vectors_inner` (last writer wins, on the stamp).
+        self.witness(&stamp);
+        let by = crate::vectors::Configured::FromSnapshot(Some(stamp));
+        match &state.vector {
+            Some(config) => {
+                self.configure_vectors_inner(&state.db, &state.name, config.clone(), by, history)?;
+            }
+            // Never `drop_vectors`: the stored vectors are not this page's to
+            // discard, as for an entry from elsewhere.
+            None => {
+                self.disable_vectors_inner(&state.db, &state.name, false, by, history)?;
+            }
+        }
+        Ok(())
     }
 
     /// The shadows of the vector configurations `page` restored or found
@@ -6124,7 +6197,7 @@ mod tests {
 
                 let definitions = |b: &Engine| {
                     for state in &page.collections {
-                        b.restore_collection(state).unwrap();
+                        b.restore_collection(state, &page.versions).unwrap();
                     }
                 };
                 if drops_first {
@@ -6240,6 +6313,340 @@ mod tests {
             b.get_collection("shop", "orders").unwrap().index(&second).is_none(),
             "{first} and {second} are one id"
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // The vector configuration a snapshot says was turned off (ADR-226)
+    // -----------------------------------------------------------------------
+
+    /// Age `a`'s oplog out entirely: whoever joins can only have its state by snapshot.
+    fn age_the_oplog_out(a: &Engine) {
+        a.collect_garbage_at(
+            crate::engine::physical_now_ms() + 1_000_000_000,
+            crate::gc::RetentionPolicy::new(0, u64::MAX),
+        )
+        .unwrap();
+    }
+
+    fn vector_config() -> kimmy_core::VectorConfig {
+        kimmy_core::VectorConfig {
+            fields: vec!["body".into()],
+            provider: kimmy_core::ProviderConfig::Byo {},
+            dim: 8,
+            metric: kimmy_core::Metric::Cosine,
+            document_prefix: None,
+            query_prefix: None,
+            chunk: Default::default(),
+        }
+    }
+
+    /// `a` with `shop.orders` configured for vectors, and `b` holding the same by entries.
+    fn both_hold_a_configuration() -> (Engine, tempfile::TempDir, Engine, tempfile::TempDir) {
+        let (a, da) = engine();
+        a.create_collection("shop", "orders").unwrap();
+        a.configure_vectors("shop", "orders", vector_config()).unwrap();
+        let (b, db) = engine();
+        let entries =
+            a.entries_for_peer(Hlc::ZERO, 100, crate::WalkScope::Request).unwrap().entries;
+        b.apply_batch(&entries).unwrap();
+        assert!(b.get_collection("shop", "orders").unwrap().vector.is_some(), "premise");
+        (a, da, b, db)
+    }
+
+    /// Write `engine`'s vector state back as a build that did not stamp it left it.
+    fn unstamp(engine: &Engine, db: &str, name: &str) {
+        let mut meta = engine.get_collection(db, name).unwrap();
+        meta.vector_changed = None;
+        let txn = engine.begin_write(crate::engine::WriterHolder::Ddl).unwrap();
+        Engine::put_collection_meta(&txn, &meta).unwrap();
+        txn.commit().unwrap();
+    }
+
+    fn vector_state(engine: &Engine) -> (bool, Option<Stamp>) {
+        let meta = engine.get_collection("shop", "orders").unwrap();
+        (meta.vector.is_some(), meta.vector_changed)
+    }
+
+    #[test]
+    fn a_page_carries_the_stamp_of_the_latest_vector_change() {
+        let (a, _da, _b, _db) = both_hold_a_configuration();
+        let on = a.get_collection("shop", "orders").unwrap().vector_changed;
+        assert!(on.is_some(), "a configuration is stamped");
+        assert!(a.disable_vectors("shop", "orders", false).unwrap());
+        let off = a.get_collection("shop", "orders").unwrap().vector_changed;
+        assert!(off > on, "and so is turning it off, later");
+
+        let page = a.snapshot_page(None, None).unwrap();
+        let state = page.collections.iter().find(|c| c.name == "orders").unwrap();
+        assert!(state.vector.is_none() && state.vector_changed == off, "{state:?}");
+        assert!(
+            page.versions.get(off.unwrap().node) >= off.unwrap().hlc,
+            "and the sender's own coverage names it"
+        );
+    }
+
+    #[test]
+    fn a_state_from_a_sender_that_predates_the_stamp_reads_as_unstamped() {
+        // On the wire the stamp is optional: an older sender writes none, and an older
+        // receiver ignores the key.
+        let (a, _da, _b, _db) = both_hold_a_configuration();
+        let state = a
+            .snapshot_page(None, None)
+            .unwrap()
+            .collections
+            .into_iter()
+            .find(|c| c.name == "orders")
+            .unwrap();
+        assert!(state.vector_changed.is_some(), "premise");
+        let mut written = bson::serialize_to_document(&state).unwrap();
+        assert!(written.remove("vector_changed").is_some());
+        let read: CollectionState = bson::deserialize_from_document(written).unwrap();
+        assert_eq!(read.vector_changed, None);
+        assert_eq!(read.vector, state.vector, "and everything else as sent");
+
+        let mut future = bson::serialize_to_document(&state).unwrap();
+        future.insert("somethingNewer", true);
+        let read: CollectionState = bson::deserialize_from_document(future).unwrap();
+        assert_eq!(read, state, "a key this build does not know does not fail the state");
+    }
+
+    #[test]
+    fn a_snapshot_turns_off_a_vector_configuration_the_sender_turned_off() {
+        let (a, _da, b, _db) = both_hold_a_configuration();
+        a.disable_vectors("shop", "orders", false).unwrap();
+        let off = a.get_collection("shop", "orders").unwrap().vector_changed;
+        age_the_oplog_out(&a);
+
+        transfer(&b, &a);
+
+        assert_eq!(vector_state(&b), (false, off), "off, at the sender's stamp");
+    }
+
+    #[test]
+    fn a_member_that_took_the_off_serves_it_onward() {
+        let (a, _da, b, _db) = both_hold_a_configuration();
+        a.disable_vectors("shop", "orders", false).unwrap();
+        let off = a.get_collection("shop", "orders").unwrap().vector_changed;
+        age_the_oplog_out(&a);
+        transfer(&b, &a);
+
+        let page = b.snapshot_page(None, None).unwrap();
+        let state = page.collections.iter().find(|c| c.name == "orders").unwrap();
+        assert!(state.vector.is_none() && state.vector_changed == off, "{state:?}");
+    }
+
+    #[test]
+    fn unstamped_local_state_reads_as_older_than_a_stamped_off() {
+        // A member that last wrote its vector state before 0.46 has no stamp.
+        let (a, _da, b, _db) = both_hold_a_configuration();
+        unstamp(&b, "shop", "orders");
+        a.disable_vectors("shop", "orders", false).unwrap();
+        age_the_oplog_out(&a);
+
+        transfer(&b, &a);
+
+        assert!(!vector_state(&b).0, "converges to the sender's off");
+    }
+
+    #[test]
+    fn a_stamped_local_configuration_newer_than_the_pages_off_stays() {
+        let (a, _da, b, _db) = both_hold_a_configuration();
+        a.disable_vectors("shop", "orders", false).unwrap();
+        // `b` turns it on again after `a` turned it off.
+        std::thread::sleep(std::time::Duration::from_millis(5));
+        b.configure_vectors("shop", "orders", vector_config()).unwrap();
+        let mine = vector_state(&b);
+        age_the_oplog_out(&a);
+
+        transfer(&b, &a);
+
+        assert_eq!(vector_state(&b), mine, "a later local change is not undone by an older off");
+        assert!(mine.0);
+    }
+
+    #[test]
+    fn a_page_without_a_stamp_never_overrides_a_stamped_local_value() {
+        // A sender from before the stamp writes none. Against a stamped local value it
+        // changes nothing, whichever way it points.
+        let (a, _da, b, _db) = both_hold_a_configuration();
+        let mine = vector_state(&b);
+        let mut page = a.snapshot_page(None, None).unwrap();
+        for state in &mut page.collections {
+            state.vector_changed = None;
+            state.vector = None; // would turn it off
+        }
+        let mut progress = SnapshotProgress::whole_database();
+        b.apply_snapshot_page(a.node_id(), &mut progress, &page).unwrap();
+        assert_eq!(vector_state(&b), mine, "an undated off turns nothing off");
+
+        for state in page.collections.iter_mut().filter(|c| c.name == "orders") {
+            let mut other = vector_config();
+            other.dim = 16;
+            state.vector = Some(other);
+        }
+        let mut progress = SnapshotProgress::whole_database();
+        b.apply_snapshot_page(a.node_id(), &mut progress, &page).unwrap();
+        assert_eq!(vector_state(&b), mine, "and an undated configuration changes nothing");
+    }
+
+    #[test]
+    fn a_page_without_a_stamp_still_adds_a_configuration_to_unstamped_state() {
+        // The old rule, kept for a pair that has not rolled: it only ever added.
+        let (a, _da) = engine();
+        a.create_collection("shop", "orders").unwrap();
+        a.configure_vectors("shop", "orders", vector_config()).unwrap();
+        let (b, _db) = engine();
+        b.create_collection("shop", "orders").unwrap();
+        let mut page = a.snapshot_page(None, None).unwrap();
+        for state in &mut page.collections {
+            state.vector_changed = None;
+        }
+        let mut progress = SnapshotProgress::whole_database();
+        b.apply_snapshot_page(a.node_id(), &mut progress, &page).unwrap();
+        assert!(vector_state(&b).0);
+    }
+
+    #[test]
+    fn a_stamp_the_senders_coverage_does_not_name_is_ignored() {
+        let (a, _da, b, _db) = both_hold_a_configuration();
+        a.disable_vectors("shop", "orders", false).unwrap();
+        let mut page = a.snapshot_page(None, None).unwrap();
+        for state in &mut page.collections {
+            if let Some(stamp) = &mut state.vector_changed {
+                stamp.hlc = Hlc::new(stamp.hlc.wall_ms + 1_000_000, 0);
+            }
+        }
+        let mine = vector_state(&b);
+        let mut progress = SnapshotProgress::whole_database();
+        b.apply_snapshot_page(a.node_id(), &mut progress, &page).unwrap();
+        assert_eq!(vector_state(&b), mine, "ahead of the sender's own coverage: ignored");
+    }
+
+    #[test]
+    fn applying_a_stamp_moves_the_local_clock_past_it() {
+        let (a, _da, b, _db) = both_hold_a_configuration();
+        a.disable_vectors("shop", "orders", false).unwrap();
+        let mut page = a.snapshot_page(None, None).unwrap();
+        let ahead = Hlc::new(crate::engine::physical_now_ms() + 3_600_000, 0);
+        for state in &mut page.collections {
+            if let Some(stamp) = &mut state.vector_changed {
+                stamp.hlc = ahead;
+            }
+        }
+        page.versions.insert(a.node_id(), ahead);
+        let mut progress = SnapshotProgress::whole_database();
+        b.apply_snapshot_page(a.node_id(), &mut progress, &page).unwrap();
+        assert!(!vector_state(&b).0, "premise: applied");
+
+        b.configure_vectors("shop", "orders", vector_config()).unwrap();
+
+        let (_, stamp) = vector_state(&b);
+        assert!(stamp.unwrap().hlc > ahead, "a later local change is stamped above it: {stamp:?}");
+    }
+
+    #[test]
+    fn a_vector_entry_is_last_writer_wins_on_its_stamp() {
+        let (a, _da) = engine();
+        a.create_collection("shop", "orders").unwrap();
+        a.configure_vectors("shop", "orders", vector_config()).unwrap();
+        a.disable_vectors("shop", "orders", false).unwrap();
+        let entries: Vec<_> = a
+            .entries_for_peer(Hlc::ZERO, 100, crate::WalkScope::Request)
+            .unwrap()
+            .entries
+            .into_iter()
+            .filter(|e| e.kind == OpKind::ConfigureVectors)
+            .collect();
+        assert_eq!(entries.len(), 2, "premise: on, then off");
+
+        // Delivered in the wrong order: the later off first, then the earlier on.
+        let (b, _db) = engine();
+        let creates =
+            a.entries_for_peer(Hlc::ZERO, 100, crate::WalkScope::Request).unwrap().entries;
+        let until = creates.iter().position(|e| e.kind == OpKind::ConfigureVectors).unwrap();
+        b.apply_batch(&creates[..until]).unwrap();
+        b.apply_batch(&entries[1..]).unwrap();
+        b.apply_batch(&entries[..1]).unwrap();
+
+        let held = b.get_collection("shop", "orders").unwrap();
+        assert!(held.vector.is_none(), "the earlier configuration does not undo the later off");
+        assert_eq!(held.vector_changed, Some(entries[1].stamp));
+    }
+
+    #[test]
+    fn the_same_vector_entry_delivered_again_leaves_the_state_as_it_was() {
+        // At or below the standing stamp is the same change again (or an older one):
+        // not applied. The state, the stamp and the shadow are as they were.
+        let (a, _da, b, _db) = both_hold_a_configuration();
+        let entries: Vec<_> = a
+            .entries_for_peer(Hlc::ZERO, 100, crate::WalkScope::Request)
+            .unwrap()
+            .entries
+            .into_iter()
+            .filter(|e| e.kind == OpKind::ConfigureVectors)
+            .collect();
+        let before = (vector_state(&b), b.get_collection("shop", "orders.__vectors").is_ok());
+
+        b.apply_batch(&entries).unwrap();
+
+        assert_eq!(
+            (vector_state(&b), b.get_collection("shop", "orders.__vectors").is_ok()),
+            before
+        );
+    }
+
+    #[test]
+    fn a_page_turning_a_configuration_off_keeps_the_stored_vectors() {
+        // As for an entry from elsewhere: discarding the stored vectors is not a page's
+        // to decide.
+        let (a, _da, b, _db) = both_hold_a_configuration();
+        assert!(b.get_collection("shop", "orders.__vectors").is_ok(), "premise: the shadow");
+        a.disable_vectors("shop", "orders", false).unwrap();
+        let mut page = a.snapshot_page(None, None).unwrap();
+        // Only the parent's definition: the shadow collection stays as `b` holds it.
+        page.collections.retain(|c| c.name == "orders");
+        let mut progress = SnapshotProgress::whole_database();
+
+        b.apply_snapshot_page(a.node_id(), &mut progress, &page).unwrap();
+
+        assert!(!vector_state(&b).0, "off");
+        assert!(b.get_collection("shop", "orders.__vectors").is_ok(), "and the vectors are kept");
+    }
+
+    #[test]
+    fn a_disable_of_a_configuration_already_off_is_stamped_and_logged() {
+        // So its stamp is in the servable vector and a page carrying it passes the
+        // receiver's coverage gate; a retried disable now writes.
+        let (a, _da) = engine();
+        a.create_collection("shop", "orders").unwrap();
+        let before = a.commits();
+        let mut rx = a.subscribe();
+
+        assert!(!a.disable_vectors("shop", "orders", false).unwrap(), "nothing was on");
+
+        assert_eq!(a.commits() - before, 1, "one commit");
+        let entry = rx.try_recv().expect("and its entry");
+        assert_eq!(entry.kind, OpKind::ConfigureVectors);
+        let stamp = a.get_collection("shop", "orders").unwrap().vector_changed;
+        assert_eq!(stamp, Some(entry.stamp));
+        assert!(a.version_vector().unwrap().get(entry.stamp.node) >= entry.stamp.hlc);
+    }
+
+    #[test]
+    fn a_page_off_from_a_disable_that_changed_nothing_still_turns_a_configuration_off() {
+        // The sender never had it on; its disable is the dated fact that says off.
+        let (a, _da) = engine();
+        a.create_collection("shop", "orders").unwrap();
+        let (b, _db) = engine();
+        b.create_collection("shop", "orders").unwrap();
+        b.configure_vectors("shop", "orders", vector_config()).unwrap();
+        unstamp(&b, "shop", "orders");
+        a.disable_vectors("shop", "orders", false).unwrap();
+        age_the_oplog_out(&a);
+
+        transfer(&b, &a);
+
+        assert!(!vector_state(&b).0);
     }
 }
 

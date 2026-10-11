@@ -2407,7 +2407,7 @@ impl Engine {
                         &target.db,
                         &target.collection,
                         false,
-                        false,
+                        crate::vectors::Configured::FromEntry(entry.stamp),
                         &|standing| below_floor(standing, entry.stamp),
                     ))?
                     .map(|_| ()),
@@ -8758,10 +8758,13 @@ mod tests {
         a.configure_vectors("shop", "orders", vector_config()).unwrap();
         let theirs = a.version_vector().unwrap();
         let whole = a.entries_for_peer(Hlc::ZERO, BATCH, crate::WalkScope::Background).unwrap();
-        apply(&b, &theirs, &whole).unwrap();
-        assert!(shadow_held(&b));
         let configure =
             whole.entries.iter().position(|e| e.kind == OpKind::ConfigureVectors).unwrap();
+        // Everything before the configuration, the shadow's creation included: the
+        // configuration then applies for the first time, as it must to be racing the
+        // drop. (Applied once already, its replay is a no-op by the stamp -- ADR-226.)
+        apply(&b, &theirs, &slice(&whole, 0, configure)).unwrap();
+        assert!(shadow_held(&b));
 
         let dropping = Arc::clone(&b);
         let (configured, disabled) = race_hooks::race(
