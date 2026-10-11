@@ -55,6 +55,9 @@ pub mod writer_hold;
 mod key_walk_tests;
 
 #[cfg(test)]
+mod database_drop_tests;
+
+#[cfg(test)]
 mod log_capture;
 
 pub use divergence::{
