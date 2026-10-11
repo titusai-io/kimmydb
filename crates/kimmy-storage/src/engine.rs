@@ -2639,6 +2639,31 @@ impl Engine {
         Ok(out)
     }
 
+    /// The indexes dropped, by collection and derived index id, with the stamp of
+    /// each drop (`INDEXES_DROPPED`, ADR-123): those of `scope`'s collection alone, or
+    /// of every collection.
+    ///
+    /// Bounded by `tombstone_retention_secs` as the collection tombstones are
+    /// (`gc.rs` collects both on the same window), which is what makes it
+    /// affordable to put on a snapshot page (ADR-225).
+    pub fn indexes_dropped(
+        &self,
+        scope: Option<CollectionId>,
+    ) -> Result<Vec<(CollectionId, u32, Stamp)>> {
+        let txn = self.db.begin_read()?;
+        let dropped = txn.open_table(tables::INDEXES_DROPPED)?;
+        let mut out = Vec::new();
+        for row in dropped.iter()? {
+            let (key, raw) = row?;
+            let (collection, index_id) = key.value();
+            if scope.is_some_and(|scope| scope.0 != collection) {
+                continue;
+            }
+            out.push((CollectionId(collection), index_id, codec::decode_oplog_key(raw.value())?));
+        }
+        Ok(out)
+    }
+
     /// Record that a collection was dropped at `stamp`, if that is newer.
     pub(crate) fn record_collection_drop(&self, id: CollectionId, stamp: Stamp) -> Result<()> {
         // Read first, outside the writer. A tombstone this node already holds

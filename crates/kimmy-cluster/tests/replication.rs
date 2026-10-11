@@ -6219,6 +6219,78 @@ async fn relay_a_definition_settled_by_the_restore_in_the_loop() {
 }
 
 // ---------------------------------------------------------------------------
+// ADR-225: a snapshot carries an index drop, to the member taking it and, through
+// a member that took it, to the next.
+// ---------------------------------------------------------------------------
+
+/// `m` below `a`'s horizon takes `a`'s whole-database snapshot, three rounds.
+async fn m_takes_the_origins_snapshot(a: &Node, m: &Node) {
+    age_out_fully(&a.engine);
+    for _ in 0..3 {
+        sync_once(&m.engine, a.addr, SECRET, None).await.unwrap();
+    }
+}
+
+#[tokio::test]
+async fn relay_an_index_dropped_after_m_pulled() {
+    let (_a, m) = index_dropped_after_m_pulled(true, Pull::Rounds).await;
+    assert_eq!(documents_of(&m.engine, "shop", "orders"), 2, "m took p's window");
+    let held = m.engine.get_collection("shop", "orders").unwrap();
+    assert!(held.index("by_x").is_none(), "and the drop in it: {:?}", held.indexes);
+}
+
+#[tokio::test]
+async fn relay_an_index_dropped_after_m_pulled_in_the_loop() {
+    let (_a, m) = index_dropped_after_m_pulled(true, Pull::Loop).await;
+    assert_eq!(documents_of(&m.engine, "shop", "orders"), 2, "m took p's window");
+    let held = m.engine.get_collection("shop", "orders").unwrap();
+    assert!(held.index("by_x").is_none(), "and the drop in it: {:?}", held.indexes);
+}
+
+#[tokio::test]
+async fn a_snapshot_carries_an_index_drop_to_the_member_taking_it() {
+    let (a, m, ca) = origin_and_a_member_that_holds_it(|engine, _| {
+        engine.create_index("shop", "orders", vec![field("x")], true, Some("by_x".into())).unwrap();
+    })
+    .await;
+    assert!(a.engine.drop_index("shop", "orders", "by_x").unwrap());
+    a.engine.insert(&ca, doc! { "_id": 2, "x": 2 }).unwrap();
+    m_takes_the_origins_snapshot(&a, &m).await;
+
+    assert_eq!(documents_of(&m.engine, "shop", "orders"), 2, "m took the snapshot");
+    let held = m.engine.get_collection("shop", "orders").unwrap();
+    assert!(held.index("by_x").is_none(), "and the drop in it: {:?}", held.indexes);
+}
+
+#[tokio::test]
+async fn an_index_drop_reaches_a_member_through_two_snapshot_hops() {
+    // `a` drops the index; `p` snapshots from `a`; `q` snapshots from `p`; `m`, which
+    // holds the index and is behind, talks to `q` ALONE -- with the origin in reach it
+    // would be served by entries and the test would pass for the wrong reason. `q`
+    // holds a hole (ADR-224) so refuses `m`, `m` takes `q`'s snapshot, and `q`'s page
+    // carries the tombstone it recorded from `p`'s, which recorded it from `a`'s.
+    let (a, m, ca) = origin_and_a_member_that_holds_it(|engine, _| {
+        engine.create_index("shop", "orders", vec![field("x")], true, Some("by_x".into())).unwrap();
+    })
+    .await;
+    assert!(m.engine.get_collection("shop", "orders").unwrap().index("by_x").is_some(), "premise");
+    assert!(a.engine.drop_index("shop", "orders", "by_x").unwrap());
+    a.engine.insert(&ca, doc! { "_id": 2, "x": 2 }).unwrap();
+    age_out_fully(&a.engine);
+    let p = node().await;
+    sync_once(&p.engine, a.addr, SECRET, None).await.unwrap();
+    age_out_fully(&p.engine);
+    let q = node().await;
+    sync_once(&q.engine, p.addr, SECRET, None).await.unwrap();
+    assert!(q.engine.get_collection("shop", "orders").unwrap().index("by_x").is_none());
+
+    sync_once(&m.engine, q.addr, SECRET, None).await.unwrap();
+
+    let held = m.engine.get_collection("shop", "orders").unwrap();
+    assert!(held.index("by_x").is_none(), "m took q's snapshot: {:?}", held.indexes);
+}
+
+// ---------------------------------------------------------------------------
 // ADR-224: a member refused for a hole asks the others first, snapshots only
 // when none can serve it, and is bounded in how long it waits to.
 // ---------------------------------------------------------------------------

@@ -6115,6 +6115,7 @@ mod tests {
             versions,
             dropped: None,
             dropped_collections: Vec::new(),
+            dropped_indexes: Vec::new(),
             deleted_documents: Vec::new(),
         }
     }

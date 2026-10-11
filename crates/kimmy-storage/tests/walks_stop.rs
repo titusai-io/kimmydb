@@ -92,6 +92,10 @@ const BOUNDED_READS: &[(&str, &str)] = &[
     ),
     ("divergence::next_probe", "an in-memory set's range, not a table"),
     (
+        "engine::Engine::indexes_dropped",
+        "the index-drop registry: one row per index dropped within tombstone retention, collected on the same window as the oplog",
+    ),
+    (
         "engine::Engine::state_held",
         "the metadata keys of one prefix: one row per origin a snapshot raised the servable vector over, a few in a cluster, read per pull served",
     ),

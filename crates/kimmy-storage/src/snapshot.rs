@@ -355,6 +355,33 @@ pub struct SnapshotPage {
     /// `Engine::apply_carried_document_deletes`.
     #[serde(default)]
     pub deleted_documents: Vec<SnapshotTombstone>,
+    /// The indexes the sender has dropped, by collection and derived index id with
+    /// the stamp of the drop, so a page conveys an index's **absence** as well as
+    /// its presence (ADR-225).
+    ///
+    /// `collections` lists the indexes the sender still has. Nothing on the page
+    /// used to say what it had dropped, so a receiver holding an index the sender
+    /// had dropped kept it, and on a whole-database snapshot that is permanent for
+    /// the reason ADR-162 gives for collections: completing the snapshot grants
+    /// the receiver coverage of the sender's history, the `DropIndex` entry is
+    /// inside it, and no peer serves it again. A unique index the cluster had
+    /// dropped went on refusing inserts on that one member.
+    ///
+    /// On **every** page, for the reason ADR-152 found for the scoped route and
+    /// ADR-162 applied to the whole-database one: a drop can land between two
+    /// pages of a transfer that runs for minutes. For a scoped snapshot, those of
+    /// the one collection. Bounded by `tombstone_retention_secs`, as the sender's
+    /// collection tombstones are. Defaulted on the wire as `dropped_collections`
+    /// is: an older sender writes nothing and an older receiver ignores the list,
+    /// so a mixed pair keeps the previous behaviour until both have rolled.
+    ///
+    /// **A receiver honours an entry only where `versions` covers its stamp**
+    /// (ADR-163), and judges it as a replicated `DropIndex` is judged (ADR-132): an
+    /// index created after the drop is left alone. Denials are applied before the
+    /// definitions on the same page, so an index dropped and recreated arrives as
+    /// the new definition and the old drop, and the new one stands.
+    #[serde(default)]
+    pub dropped_indexes: Vec<(CollectionId, u32, Stamp)>,
 }
 
 /// Where a snapshot pull stands on the receiver.
@@ -508,6 +535,9 @@ impl Engine {
         // ADR-162's application of it).
         let dropped_collections =
             if scope.is_none() { self.collections_dropped()? } else { Vec::new() };
+        // And the indexes it has dropped, on both routes (ADR-225): all of them for
+        // the whole database, the one collection's for a repair.
+        let dropped_indexes = self.indexes_dropped(scope)?;
 
         let (documents, deleted_documents, next) = self.snapshot_documents(after, scope)?;
         Ok(SnapshotPage {
@@ -518,6 +548,7 @@ impl Engine {
             dropped,
             dropped_collections,
             deleted_documents,
+            dropped_indexes,
         })
     }
 
@@ -766,6 +797,10 @@ impl Engine {
         if progress.scope.is_none() {
             self.apply_carried_drops(page)?;
         }
+        // And the indexes it dropped, on both routes, before the definitions for the
+        // reason above: an index dropped and recreated arrives as the new
+        // definition and the old drop (ADR-225).
+        self.apply_carried_index_drops(page, progress.scope)?;
         let mut ddl_refused = 0usize;
         for state in &page.collections {
             match self.restore_collection(state) {
@@ -1199,6 +1234,81 @@ impl Engine {
         // first page of a catch-up records the sender's whole list, and
         // `record_collection_drop` takes the writer and fsyncs for each.
         self.record_collection_drops(&to_record)
+    }
+
+    /// Apply the index drops a page carries (ADR-225): each is judged as the
+    /// replicated `DropIndex` is (ADR-132), and **recorded** whether or not the
+    /// index is held here, so a member that took a snapshot serves the drop onward
+    /// and treats an older `CreateIndex` as history.
+    ///
+    /// - **Gated by the sender's coverage** (ADR-163): a stamp its `versions` does
+    ///   not name is ignored. The id and the stamp both come off the wire.
+    /// - **A scoped snapshot honours only its own collection's.** The page builder
+    ///   sends only those, and this does not trust it.
+    /// - **Matched by the derived index id**, which is all a page carries (the
+    ///   tombstone table is keyed by it, as is the `DropIndex` entry's tombstone).
+    ///   The entries path matches by name. Two index names that derive the same
+    ///   32-bit id on one collection are therefore one index to a page's drop,
+    ///   where the entries path tells them apart; the chance is 2^-32 per pair of
+    ///   names, the standing index is spared when it was created after the drop,
+    ///   and the tombstone table already conflates them (ADR-123). Pinned by a
+    ///   test, so it is a decision and not an accident.
+    /// - **Idempotent across pages.** The list rides every page; the tombstones
+    ///   already held are read once, and an entry at or below one is skipped
+    ///   without taking the writer.
+    fn apply_carried_index_drops(
+        &self,
+        page: &SnapshotPage,
+        scope: Option<CollectionId>,
+    ) -> Result<()> {
+        if page.dropped_indexes.is_empty() {
+            return Ok(());
+        }
+        let held: std::collections::HashMap<(CollectionId, u32), Stamp> =
+            self.indexes_dropped(None)?.into_iter().map(|(c, i, s)| ((c, i), s)).collect();
+        for (collection, index_id, dropped) in &page.dropped_indexes {
+            if scope.is_some_and(|scope| scope != *collection) {
+                continue;
+            }
+            if dropped.hlc > page.versions.get(dropped.node) {
+                warn!(
+                    collection = %collection,
+                    stamp = ?dropped,
+                    covered_to = ?page.versions.get(dropped.node),
+                    "a snapshot page dropped an index with a stamp its sender's own coverage \
+                     does not name; ignored"
+                );
+                continue;
+            }
+            if held.get(&(*collection, *index_id)).is_some_and(|seen| seen >= dropped) {
+                continue;
+            }
+            let standing = match self.collection_by_id(*collection)? {
+                Some(meta) => meta
+                    .indexes
+                    .iter()
+                    .find(|index| index.id == *index_id)
+                    .map(|index| (meta.db.clone(), meta.name.clone(), index.name.clone())),
+                None => None,
+            };
+            match standing {
+                Some((db, name, index)) => {
+                    // Through the replicated drop, which judges the incarnation
+                    // under the writer, removes the entries and records the
+                    // tombstone in one transaction. A collection that went away
+                    // in between is history and the tombstone is still recorded.
+                    match self.drop_index_inner(&db, &name, &index, Some(*dropped)) {
+                        Ok(_) => {}
+                        Err(crate::StorageError::Core(kimmy_core::Error::CollectionNotFound {
+                            ..
+                        })) => self.record_index_drop(*collection, *index_id, *dropped)?,
+                        Err(e) => return Err(e),
+                    }
+                }
+                None => self.record_index_drop(*collection, *index_id, *dropped)?,
+            }
+        }
+        Ok(())
     }
 
     /// Apply a drop the sender carried: the one collection a scoped snapshot
@@ -3290,6 +3400,7 @@ mod tests {
             dropped: Some(dropped),
             dropped_collections: Vec::new(),
             deleted_documents: Vec::new(),
+            dropped_indexes: Vec::new(),
         };
         b.apply_snapshot_page(no_sender(), &mut SnapshotProgress::of_collection(current.id), &page)
             .unwrap();
@@ -3350,6 +3461,7 @@ mod tests {
             dropped: None,
             dropped_collections: Vec::new(),
             deleted_documents: Vec::new(),
+            dropped_indexes: Vec::new(),
         };
         let outcome = b
             .apply_snapshot_page(no_sender(), &mut SnapshotProgress::of_collection(id), &page)
@@ -3835,6 +3947,7 @@ mod tests {
             dropped: None,
             dropped_collections: Vec::new(),
             deleted_documents: Vec::new(),
+            dropped_indexes: Vec::new(),
         };
         let _ = own;
         b.apply_snapshot_page(a.node_id(), &mut SnapshotProgress::whole_database(), &page).unwrap();
@@ -5745,6 +5858,234 @@ mod tests {
         let first = b.state_held().unwrap();
         transfer(&b, &a);
         assert_eq!(b.state_held().unwrap(), first, "the same grant raises nothing");
+    }
+
+    // -----------------------------------------------------------------------
+    // The indexes a snapshot says the sender dropped (ADR-225)
+    // -----------------------------------------------------------------------
+
+    /// `a` with `shop.orders` and an index `by_x`, and `b` holding both by entries.
+    fn both_hold_an_index() -> (Engine, tempfile::TempDir, Engine, tempfile::TempDir) {
+        let (a, da) = engine();
+        let ca = a.create_collection("shop", "orders").unwrap();
+        a.insert(&ca, doc! { "_id": 1, "x": 1 }).unwrap();
+        a.create_index("shop", "orders", vec![field("x")], false, Some("by_x".into())).unwrap();
+        let (b, db) = engine();
+        let entries =
+            a.entries_for_peer(Hlc::ZERO, 100, crate::WalkScope::Request).unwrap().entries;
+        b.apply_batch(&entries).unwrap();
+        assert!(b.get_collection("shop", "orders").unwrap().index("by_x").is_some(), "premise");
+        (a, da, b, db)
+    }
+
+    /// Age `a`'s oplog out entirely, keeping its tombstones: `b` can only have the
+    /// drop by snapshot.
+    fn age_out(a: &Engine) {
+        a.collect_garbage_at(
+            crate::engine::physical_now_ms() + 1_000_000_000,
+            crate::gc::RetentionPolicy::new(0, u64::MAX),
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn a_snapshot_carries_an_index_drop_and_the_member_taking_it_loses_the_index() {
+        let (a, _da, b, _db) = both_hold_an_index();
+        let id = a.get_collection("shop", "orders").unwrap().id;
+        assert!(a.drop_index("shop", "orders", "by_x").unwrap());
+        let dropped_at = a.index_dropped_at(id, kimmy_core::IndexMeta::derive_id("by_x")).unwrap();
+        age_out(&a);
+
+        transfer(&b, &a);
+
+        let held = b.get_collection("shop", "orders").unwrap();
+        assert!(held.index("by_x").is_none(), "the drop travelled: {:?}", held.indexes);
+        assert_eq!(
+            b.index_dropped_at(id, kimmy_core::IndexMeta::derive_id("by_x")).unwrap(),
+            dropped_at,
+            "and is recorded at the sender's stamp"
+        );
+    }
+
+    #[test]
+    fn a_member_that_took_the_drop_serves_it_onward() {
+        let (a, _da, b, _db) = both_hold_an_index();
+        let id = a.get_collection("shop", "orders").unwrap().id;
+        a.drop_index("shop", "orders", "by_x").unwrap();
+        age_out(&a);
+        transfer(&b, &a);
+
+        let page = b.snapshot_page(None, None).unwrap();
+        assert!(
+            page.dropped_indexes
+                .iter()
+                .any(|(c, i, _)| *c == id && *i == kimmy_core::IndexMeta::derive_id("by_x")),
+            "{:?}",
+            page.dropped_indexes
+        );
+    }
+
+    #[test]
+    fn an_index_dropped_and_recreated_arrives_as_the_new_definition_and_the_old_drop() {
+        // Drops first, then definitions: the old index goes, the recreated one (created
+        // after the drop) stands.
+        let (a, _da, b, _db) = both_hold_an_index();
+        let old = b.get_collection("shop", "orders").unwrap().index("by_x").unwrap().created;
+        a.drop_index("shop", "orders", "by_x").unwrap();
+        a.create_index("shop", "orders", vec![field("x")], false, Some("by_x".into())).unwrap();
+        let new = a.get_collection("shop", "orders").unwrap().index("by_x").unwrap().created;
+        assert!(new > old, "premise");
+        age_out(&a);
+
+        transfer(&b, &a);
+
+        let held = b.get_collection("shop", "orders").unwrap();
+        assert_eq!(held.index("by_x").map(|i| i.created), Some(new), "the new life stands");
+    }
+
+    #[test]
+    fn an_index_created_after_the_drop_is_left_alone_and_the_drop_is_still_recorded() {
+        // `b` holds the recreated index already; the page's drop is older than it.
+        let (a, _da, b, _db) = both_hold_an_index();
+        let id = a.get_collection("shop", "orders").unwrap().id;
+        a.drop_index("shop", "orders", "by_x").unwrap();
+        a.create_index("shop", "orders", vec![field("x")], false, Some("by_x".into())).unwrap();
+        let entries =
+            a.entries_for_peer(Hlc::ZERO, 100, crate::WalkScope::Request).unwrap().entries;
+        b.apply_batch(&entries).unwrap();
+        let created = b.get_collection("shop", "orders").unwrap().index("by_x").unwrap().created;
+        age_out(&a);
+
+        transfer(&b, &a);
+
+        let held = b.get_collection("shop", "orders").unwrap();
+        assert_eq!(held.index("by_x").map(|i| i.created), Some(created));
+        assert!(
+            b.index_dropped_at(id, kimmy_core::IndexMeta::derive_id("by_x")).unwrap().is_some()
+        );
+    }
+
+    #[test]
+    fn a_drop_the_senders_coverage_does_not_name_is_ignored() {
+        let (a, _da, b, _db) = both_hold_an_index();
+        a.drop_index("shop", "orders", "by_x").unwrap();
+        let mut page = a.snapshot_page(None, None).unwrap();
+        for (_, _, stamp) in &mut page.dropped_indexes {
+            stamp.hlc = Hlc::new(stamp.hlc.wall_ms + 1_000_000, 0);
+        }
+        assert!(!page.dropped_indexes.is_empty(), "premise");
+        let mut progress = SnapshotProgress::whole_database();
+
+        b.apply_snapshot_page(a.node_id(), &mut progress, &page).unwrap();
+
+        assert!(
+            b.get_collection("shop", "orders").unwrap().index("by_x").is_some(),
+            "a stamp ahead of the sender's own coverage destroys nothing"
+        );
+    }
+
+    #[test]
+    fn a_member_that_does_not_hold_the_collection_records_the_drop_and_an_older_create_is_history()
+    {
+        let (a, _da, _b, _db) = both_hold_an_index();
+        let id = a.get_collection("shop", "orders").unwrap().id;
+        let create = a
+            .entries_for_peer(Hlc::ZERO, 100, crate::WalkScope::Request)
+            .unwrap()
+            .entries
+            .into_iter()
+            .find(|e| e.kind == OpKind::CreateIndex)
+            .unwrap();
+        a.drop_index("shop", "orders", "by_x").unwrap();
+        age_out(&a);
+        let (c, _dc) = engine();
+
+        transfer(&c, &a);
+
+        assert!(
+            c.index_dropped_at(id, kimmy_core::IndexMeta::derive_id("by_x")).unwrap().is_some()
+        );
+        c.apply_batch(std::slice::from_ref(&create)).unwrap();
+        assert!(
+            c.get_collection("shop", "orders").unwrap().index("by_x").is_none(),
+            "the create the drop followed is history here"
+        );
+    }
+
+    #[test]
+    fn a_scoped_snapshot_carries_and_honours_its_own_collections_drops_only() {
+        let (a, _da, b, _db) = both_hold_an_index();
+        let other = a.create_collection("shop", "other").unwrap();
+        a.insert(&other, doc! { "_id": 1, "y": 1 }).unwrap();
+        a.create_index("shop", "other", vec![field("y")], false, Some("by_y".into())).unwrap();
+        let entries =
+            a.entries_for_peer(Hlc::ZERO, 100, crate::WalkScope::Request).unwrap().entries;
+        b.apply_batch(&entries).unwrap();
+        a.drop_index("shop", "orders", "by_x").unwrap();
+        a.drop_index("shop", "other", "by_y").unwrap();
+        let orders = a.get_collection("shop", "orders").unwrap().id;
+
+        let page = a.snapshot_page(None, Some(orders)).unwrap();
+        assert!(page.dropped_indexes.iter().all(|(c, _, _)| *c == orders), "{page:?}");
+        assert_eq!(page.dropped_indexes.len(), 1);
+
+        // A page that carried the other collection's drop as well is not trusted.
+        let mut wide = page.clone();
+        wide.dropped_indexes = a.indexes_dropped(None).unwrap();
+        let mut progress = SnapshotProgress::of_collection(orders);
+        b.apply_snapshot_page(a.node_id(), &mut progress, &wide).unwrap();
+        assert!(b.get_collection("shop", "orders").unwrap().index("by_x").is_none());
+        assert!(
+            b.get_collection("shop", "other").unwrap().index("by_y").is_some(),
+            "a repair of one collection takes no other collection's drop"
+        );
+    }
+
+    #[test]
+    fn a_drop_already_held_is_not_applied_again_on_the_next_page() {
+        // The list rides every page; the second costs no writer and changes nothing.
+        let (a, _da, b, _db) = both_hold_an_index();
+        a.drop_index("shop", "orders", "by_x").unwrap();
+        age_out(&a);
+        transfer(&b, &a);
+        let commits = b.commits();
+
+        transfer(&b, &a);
+
+        assert_eq!(b.commits(), commits, "a snapshot this member already holds commits nothing");
+    }
+
+    #[test]
+    fn two_index_names_that_derive_one_id_are_one_index_to_a_page_drop() {
+        // A decision, not an accident (see `apply_carried_index_drops`): a page names
+        // an index by its derived id, so a standing index of another name that
+        // derives the same id, created before the drop, is dropped with it.
+        let mut seen = std::collections::HashMap::new();
+        let (first, second) = (0u64..)
+            .find_map(|i| {
+                let name = format!("ix{i}");
+                let id = kimmy_core::IndexMeta::derive_id(&name);
+                seen.insert(id, name.clone()).map(|earlier| (earlier, name))
+            })
+            .unwrap();
+        let (b, _db) = engine();
+        let cb = b.create_collection("shop", "orders").unwrap();
+        b.insert(&cb, doc! { "_id": 1, "x": 1 }).unwrap();
+        b.create_index("shop", "orders", vec![field("x")], false, Some(second.clone())).unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(5));
+        let (a, _da) = engine();
+        let ca = a.create_collection("shop", "orders").unwrap();
+        a.insert(&ca, doc! { "_id": 1, "x": 1 }).unwrap();
+        a.create_index("shop", "orders", vec![field("x")], false, Some(first.clone())).unwrap();
+        a.drop_index("shop", "orders", &first).unwrap();
+        age_out(&a);
+
+        transfer(&b, &a);
+
+        assert!(
+            b.get_collection("shop", "orders").unwrap().index(&second).is_none(),
+            "{first} and {second} are one id"
+        );
     }
 }
 

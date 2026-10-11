@@ -26004,3 +26004,80 @@ scalar rule ignoring the hole; the pull arm serving a hole.
 a 0.45.0 `kimmyd restore` (the record is a `META` row and the restore copies it), and the
 store started, answered `/readyz` and stopped clean; a store this build wrote with the row
 was opened by 0.45.0 the same way (`kimmy.format` unchanged: schema 4, redb 4.3).
+
+## ADR-225 — A snapshot page carries the indexes the sender has dropped, and the receiver judges each as a replicated `DropIndex`
+
+**Decision.** `SnapshotPage` gains `dropped_indexes: Vec<(CollectionId, u32, Stamp)>`
+(`#[serde(default)]`): the sender's index-drop tombstones (`INDEXES_DROPPED`, ADR-123), on
+every page of a whole-database snapshot and, for a repair, those of its one collection. The
+receiver applies the list **before** the page's definitions, on both routes, and for each
+entry:
+
+1. ignores it if the sender's own `versions` does not cover its stamp (ADR-163; the id and the
+   stamp both come off the wire);
+2. for a scoped snapshot, ignores it if it is not the pull's collection;
+3. skips it if a tombstone at or above it is already held (the list rides every page, so the
+   second page finds all of it recorded and takes no writer);
+4. otherwise, if the collection is here and holds an index with that derived id, drops it
+   through the replicated path (`drop_index_inner` with the sender's stamp), which judges the
+   incarnation under the writer exactly as a `DropIndex` entry is judged (ADR-132: an index
+   created after the drop is left alone), removes its entries and records the tombstone in
+   one transaction; and otherwise records the tombstone alone.
+
+The tombstone is recorded whether or not the index is here, so the member **serves the drop
+onward** on its own pages and treats an older `CreateIndex` as history.
+
+**Why.** `collections` lists the indexes the sender still has; nothing on the page said what it
+had dropped, and `restore_collection` only ever adds. A receiver holding an index the sender
+had dropped kept it, and on a whole-database snapshot that is permanent for the reason ADR-162
+gives for collections: the grant covers the `DropIndex` entry, so no peer serves it again.
+The cost was not data loss: a unique index the cluster had dropped went on refusing inserts on
+that one member, a TTL index that should be gone went on expiring documents, and plans differed.
+Nothing detected it: the divergence check compares collection existence and one count. Swept
+2026-10-10 through real rounds and the member's own loop: silent, and not carried by a snapshot
+from the origin itself either.
+
+**What this closes, and what it needs.** A snapshot taken **directly** from the member that
+dropped, or from any member that took the page, carries the drop. A **relay** (a member
+behind a snapshot-caught-up peer's window) additionally needs ADR-224: the peer taking the page
+applies the drop with no `DropIndex` entry behind it, so what it serves a third member by
+entries lacks it, and ADR-224 is what makes it refuse that member until it takes the
+snapshot, whose page carries the tombstone. Tested at one hop and two, with the observer
+talking to one peer only (with the origin in reach it would be served by entries).
+
+**Not "remove any index the definition omits".** ADR-155 settled that an absence is not a drop:
+a receiver's newer local index would be destroyed. Only a stamped tombstone the sender's
+coverage names removes anything.
+
+**Drops before definitions, and why it is not load-bearing here.** A page may carry an index's
+definition and an older drop's tombstone for the same id (dropped, then recreated). The drops
+are applied first, as the collection drops are (ADR-162), and the definition then restores the
+recreated index. For collections the order is load-bearing (`restore_collection` does not
+compare incarnations); for indexes it is not: the incarnation rule of ADR-132 declines a drop
+older than the index standing, and `restore_collection` settles rival definitions on the later
+creation stamp, so either order ends with the recreated index standing. The test pins the
+outcome, not the order. **An index with no creation stamp reads as older than any drop** (ADR-132).
+
+**Two names, one id.** A page names an index by its derived 32-bit id, which is all the
+tombstone table holds; the entries path matches by name. Two index names on one collection
+that derive the same id are one index to a page's drop, so a standing index of the other name,
+created before the drop, is dropped with it. The chance is 2^-32 per pair of names on a
+collection, the tombstone table already conflates them (ADR-123), and carrying the name would
+change what the table stores. Pinned by a test, so it is a decision.
+
+**Wire and disk.** Additive field, defaulted: an older sender writes nothing and an older
+receiver ignores it, so a mixed pair keeps the previous behaviour until both have rolled
+(ADR-162, ADR-167). No disk change; no rollback boundary. A page is larger by one entry per
+index dropped within tombstone retention.
+
+**Tests.** `kimmy-storage`: a snapshot carries the drop and the member taking it loses the index
+and records the tombstone at the sender's stamp; a member that took it serves it onward; an index
+dropped and recreated arrives as the new definition and the old drop; an index created after the
+drop is left alone and the drop is still recorded; a stamp the sender's coverage does not name
+destroys nothing; a member without the collection records the drop and an older `CreateIndex` is
+history; a scoped snapshot honours its own collection's drops only, including against a page that
+carries others; a snapshot already held commits nothing; two names that derive one id. `kimmy-cluster`:
+the relay through real rounds and the member's own loop, the direct snapshot, two snapshot hops. The
+mutations: the drops not applied, no coverage gate, a scoped snapshot taking every collection's. Each
+fails a test. The order (definitions before drops) survives by design, above.
+
