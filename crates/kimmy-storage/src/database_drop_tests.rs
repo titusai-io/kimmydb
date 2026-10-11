@@ -545,7 +545,11 @@ fn a_retried_page_still_buries_under_a_tombstone_an_earlier_attempt_recorded() {
     assert!(holds(&c, "shop", "late"));
     let page = a.snapshot_page(None, None).unwrap();
     let drop = a.database_dropped_at("shop").unwrap().unwrap();
-    // The first attempt: the tombstone committed, the sweep did not.
+    // The first attempt: every tombstone the page carries committed (the
+    // collection's, and the database's), the sweep did not. The retry has
+    // nothing new to record.
+    let orders = CollectionId::derive("shop", "orders");
+    c.record_collection_drop(orders, a.collection_dropped_at(orders).unwrap().unwrap()).unwrap();
     c.record_collection_drop(kimmy_core::database_drop_id("shop"), drop).unwrap();
     assert!(holds(&c, "shop", "late"));
     c.apply_snapshot_page(a.node_id(), &mut SnapshotProgress::whole_database(), &page).unwrap();
@@ -804,8 +808,9 @@ async fn a_collection_stream_ends_on_a_lagged_notice_channel_when_the_collection
     let (c, _dc) = engine();
     pull(&c, &b);
     let mut stream = c.watch(WatchScope::Collection(late), WatchOptions::default()).unwrap();
-    // More notices about other collections than the channel holds, so the one
-    // that names this collection is lost with them.
+    pull(&c, &a);
+    // More notices about other collections than the channel holds, after the one
+    // that names this collection, so that one is lost with the rest.
     for i in 0..2_000u64 {
         c.send_buried(vec![crate::BuriedCollection {
             db: "other".into(),
@@ -813,7 +818,6 @@ async fn a_collection_stream_ends_on_a_lagged_notice_channel_when_the_collection
             ids: vec![CollectionId(1_000_000 + i)],
         }]);
     }
-    pull(&c, &a);
     assert!(dropped(next(&mut stream, &c).await));
 }
 
@@ -1181,14 +1185,32 @@ fn a_database_drop_covers_a_never_held_vector_configured_collection_and_its_chun
     later();
     assert!(a.drop_database("shop").unwrap());
     pull(&c, &a);
-    let outcome = pull(&c, &b);
+    // The shadow's own creation entry, if `b` logged one, would leave its
+    // tombstone by itself. Retention can have collected it while the chunks
+    // remain, and then the parent's refusal is all there is.
+    let shadow_id = CollectionId::derive("shop", &kimmy_core::vector_meta::shadow_name("late"));
+    let entries: Vec<_> = b
+        .entries_for_peer(Hlc::ZERO, BATCH, crate::WalkScope::Background)
+        .unwrap()
+        .entries
+        .into_iter()
+        .filter(|e| !(e.kind == OpKind::CreateCollection && e.collection == shadow_id))
+        .collect();
+    let outcome = c.apply_batch(&entries).unwrap();
     assert_eq!(
         outcome.unknown_collection, 0,
         "the first chunk stopped the batch: {:?}",
         outcome.unknown
     );
     put(2);
-    let outcome = pull(&c, &b);
+    let more: Vec<_> = b
+        .entries_for_peer(Hlc::ZERO, BATCH, crate::WalkScope::Background)
+        .unwrap()
+        .entries
+        .into_iter()
+        .filter(|e| e.collection == shadow_id && e.kind != OpKind::CreateCollection)
+        .collect();
+    let outcome = c.apply_batch(&more).unwrap();
     assert_eq!(outcome.unknown_collection, 0, "{:?}", outcome.unknown);
     assert!(!holds(&c, "shop", "late"));
 }
@@ -1272,4 +1294,36 @@ async fn a_stream_of_a_survivor_passes_over_entries_of_the_life_before_that_arri
         }
     }
     assert_eq!(seen, vec![kimmy_core::DocId::String("mine".into())], "{seen:?}");
+}
+
+/// A survivor that took the other life's creation before it learned of the drop
+/// has no creation entry left to be refused when the documents arrive after it:
+/// the tombstone the sweep gave it is what refuses them (review M2).
+#[test]
+fn a_survivor_refuses_a_straggler_that_arrives_after_the_drop_though_its_creation_arrived_before() {
+    let (z, _dz) = engine();
+    let (a, _da) = engine();
+    let (y, _dy) = engine();
+    let zl = z.create_collection("shop", "late").unwrap();
+    z.insert(&zl, doc! { "_id": "old" }).unwrap();
+    a.create_collection("shop", "orders").unwrap();
+    later();
+    assert!(a.drop_database("shop").unwrap());
+    later();
+    let yl = y.create_collection("shop", "late").unwrap();
+    y.insert(&yl, doc! { "_id": "mine" }).unwrap();
+
+    let entries =
+        z.entries_for_peer(Hlc::ZERO, BATCH, crate::WalkScope::Background).unwrap().entries;
+    let (creation, documents): (Vec<_>, Vec<_>) =
+        entries.into_iter().partition(|e| e.kind == OpKind::CreateCollection);
+    y.apply_batch(&creation).unwrap();
+    pull(&y, &a);
+    y.apply_batch(&documents).unwrap();
+    let meta = y.get_collection("shop", "late").unwrap();
+    assert!(
+        y.get(&meta, &kimmy_core::DocId::String("old".into())).unwrap().is_none(),
+        "the survivor took a document of the life before it, stamped before the drop"
+    );
+    assert!(y.get(&meta, &kimmy_core::DocId::String("mine".into())).unwrap().is_some());
 }

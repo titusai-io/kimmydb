@@ -1899,7 +1899,7 @@ async fn a_database_dropped_by_a_member_that_was_behind_stays_dropped() {
         .unwrap();
     assert!(made.status().is_success());
     client
-        .post(b.url("/v1/db/shop/coll/late/documents"))
+        .post(b.url("/v1/db/shop/coll/late/docs"))
         .bearer_auth(&tb)
         .json(&serde_json::json!({ "_id": "x" }))
         .send()
