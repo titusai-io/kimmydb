@@ -5180,6 +5180,52 @@ async fn a_delete_reaches_a_member_through_one_that_never_held_the_document() {
     );
 }
 
+#[tokio::test]
+async fn a_delete_arriving_by_entries_in_an_interrupted_multi_page_pull_still_reaches_a_downstream_member()
+ {
+    // The shape the review reproduced for ADR-167's cut mechanism. B takes the first page
+    // of A's snapshot, which carries the delete of a document B never held as a bare
+    // tombstone, and the pull is then interrupted: no grant, no hole. The `Delete` entry
+    // reaches B by entries. C holds the document and pulls from B by entries. The entry
+    // must be appended when it meets the tombstone (ADR-228): otherwise B has nothing to
+    // serve C for the delete, and C keeps the document.
+    let a = node().await;
+    let ca = a.engine.create_collection("shop", "orders").unwrap();
+    let docs = kimmy_storage::SNAPSHOT_PAGE as i64 + 1;
+    for i in 0..docs {
+        a.engine.insert(&ca, doc! { "_id": i }).unwrap();
+    }
+    let c = node().await;
+    for _ in 0..8 {
+        sync_once(&c.engine, a.addr, SECRET, None).await.unwrap();
+    }
+    let cc = c.engine.get_collection("shop", "orders").unwrap();
+    assert!(c.engine.get(&cc, &DocId::Int64(0)).unwrap().is_some(), "premise: C holds it");
+
+    assert!(a.engine.delete(&ca, &DocId::Int64(0)).unwrap());
+    let entries = a
+        .engine
+        .read_oplog_from(kimmy_core::Hlc::ZERO, 100_000, kimmy_storage::WalkScope::Background)
+        .unwrap();
+
+    let b = node().await;
+    let mut progress = kimmy_storage::SnapshotProgress::whole_database();
+    let first = a.engine.snapshot_page(None, None).unwrap();
+    assert!(first.next.is_some() && !first.deleted_documents.is_empty(), "premise: a first page");
+    b.engine.apply_snapshot_page(a.engine.node_id(), &mut progress, &first).unwrap();
+    assert!(!progress.is_complete(), "premise: the pull is interrupted");
+    // The entries arrive after page 1.
+    b.engine.apply_batch(&entries).unwrap();
+
+    for _ in 0..4 {
+        sync_once(&c.engine, b.addr, SECRET, None).await.unwrap();
+    }
+    assert!(
+        c.engine.get(&cc, &DocId::Int64(0)).unwrap().is_none(),
+        "C, which held the document, ends without it"
+    );
+}
+
 // -----------------------------------------------------------------------
 // The count half on both sides (ADR-168)
 // -----------------------------------------------------------------------

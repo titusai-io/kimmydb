@@ -1185,9 +1185,13 @@ impl Engine {
                 //
                 // Never under `Hold`: that is a snapshot document, which is
                 // state and not history.
-                // (The same stamp is the same write, so a tombstone under it means the
-                // write was a delete: there is no separate test of the entry's kind.)
+                // The entry must itself be a delete (no body). A stamp is unique to one
+                // write on an honest feed, but an entry carrying a body at a tombstone's
+                // stamp (a buggy or corrupt feed) would otherwise be appended and served
+                // onward as an insert contradicting the state here.
                 let owed = position != Position::Hold
+                    && entry.kind == OpKind::Delete
+                    && entry.body.is_none()
                     && existing.as_ref().is_some_and(|c| !c.is_live() && c.stamp == entry.stamp);
                 drop(docs);
                 if owed && crate::engine::delete_entry_is_owed(txn, &entry.stamp)? {

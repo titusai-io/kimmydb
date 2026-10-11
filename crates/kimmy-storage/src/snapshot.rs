@@ -5977,6 +5977,193 @@ mod tests {
     }
 
     #[test]
+    fn an_equal_stamp_entry_with_a_body_is_not_appended_over_a_tombstone() {
+        // The guard on the kind: a stamp is one write on an honest feed, but a buggy or
+        // corrupt one can put an insert at a tombstone's stamp. Appended, it would be
+        // served onward as an insert contradicting the state here.
+        let (_a, _da, b, _db, cb, entries) = a_member_holding_a_bare_tombstone();
+        let delete = entries.iter().find(|e| e.kind == OpKind::Delete).unwrap();
+        let forged = OplogEntry {
+            stamp: delete.stamp,
+            kind: OpKind::Insert,
+            collection: cb.id,
+            doc_id: Some(DocId::Int64(2)),
+            body: Some(bson::serialize_to_vec(&doc! { "_id": 2, "x": 2 }).unwrap()),
+        };
+
+        b.apply_batch(std::slice::from_ref(&forged)).unwrap();
+
+        let held_at_the_stamp = b
+            .read_oplog_from(Hlc::ZERO, 10_000, crate::WalkScope::Background)
+            .unwrap()
+            .iter()
+            .filter(|e| e.stamp == delete.stamp)
+            .count();
+        assert_eq!(
+            held_at_the_stamp, 0,
+            "a body-carrying entry at a tombstone's stamp was appended"
+        );
+        assert!(b.get(&cb, &DocId::Int64(2)).unwrap().is_none());
+    }
+
+    /// `a` with documents spanning more than one page, `b` holding all of them live and
+    /// then, after `a` deletes document 0, the first page of `a`'s snapshot: `b` holds
+    /// document 0's delete as a held entry mark (it held the document), which an entry
+    /// applied outside a window must not release.
+    fn a_member_holding_a_delete_as_state()
+    -> (Engine, Engine, Vec<OplogEntry>, tempfile::TempDir, tempfile::TempDir) {
+        let (a, da) = engine();
+        let (b, db) = engine();
+        let ca = a.create_collection("shop", "orders").unwrap();
+        for i in 0..=(SNAPSHOT_PAGE as i64) {
+            a.insert(&ca, doc! { "_id": i }).unwrap();
+        }
+        transfer(&b, &a);
+        assert!(a.delete(&ca, &DocId::Int64(0)).unwrap());
+        let first = a.snapshot_page(None, None).unwrap();
+        b.apply_snapshot_page(a.node_id(), &mut SnapshotProgress::whole_database(), &first)
+            .unwrap();
+        assert!(b.held_len().unwrap() > 0, "premise: a held mark");
+        let entries = a.read_oplog_from(Hlc::ZERO, 10_000, crate::WalkScope::Background).unwrap();
+        (a, b, entries, da, db)
+    }
+
+    #[test]
+    fn a_plain_raise_apply_of_the_delete_does_not_release_its_held_mark() {
+        // Only a window contiguous from this node's position vouches that an entry
+        // arrived as history (ADR-169); an `apply_batch` has none behind it.
+        let (_a, b, entries, _da, _db) = a_member_holding_a_delete_as_state();
+        let held = b.held_len().unwrap();
+
+        b.apply_batch(&entries).unwrap();
+
+        assert_eq!(b.held_len().unwrap(), held, "Raise must not release");
+    }
+
+    #[test]
+    fn a_hold_apply_of_the_delete_does_not_release_its_held_mark() {
+        let (_a, b, entries, _da, _db) = a_member_holding_a_delete_as_state();
+        let held = b.held_len().unwrap();
+        let cb = b.get_collection("shop", "orders").unwrap();
+        let delete = entries.iter().find(|e| e.kind == OpKind::Delete).unwrap();
+
+        let txn = b.begin_write(crate::engine::WriterHolder::Replication).unwrap();
+        b.apply_remote_in_txn(&txn, &cb, delete, crate::engine::Position::Hold).unwrap();
+        txn.commit().unwrap();
+
+        assert_eq!(b.held_len().unwrap(), held, "Hold must not release");
+    }
+
+    #[test]
+    fn a_bare_tombstone_moves_the_clock_to_its_stamp() {
+        // The recorded stamp is covered by the sender, so safe to witness: a later local
+        // write must not be minted below it.
+        let (a, _da) = engine();
+        let ca = a.create_collection("shop", "orders").unwrap();
+        a.insert(&ca, doc! { "_id": 2 }).unwrap();
+        assert!(a.delete(&ca, &DocId::Int64(2)).unwrap());
+        let (b, _db) = engine();
+        let mut page = a.snapshot_page(None, None).unwrap();
+        let far =
+            Stamp::new(Hlc::new(crate::engine::physical_now_ms() + 3_600_000, 0), a.node_id());
+        page.deleted_documents[0].stamp = far;
+        page.versions.insert(far.node, far.hlc);
+
+        b.apply_snapshot_page(a.node_id(), &mut SnapshotProgress::whole_database(), &page).unwrap();
+
+        let cb = b.get_collection("shop", "orders").unwrap();
+        assert!(holds_tombstone(&b, &cb, &DocId::Int64(2)), "premise");
+        assert!(b.clock_last() >= far.hlc, "the clock did not move over the recorded stamp");
+    }
+
+    /// An entry as a feed could carry it at `stamp`, for the guards on what is appended.
+    fn forged_at(
+        stamp: Stamp,
+        kind: OpKind,
+        coll: &CollectionMeta,
+        body: Option<Vec<u8>>,
+    ) -> OplogEntry {
+        OplogEntry { stamp, kind, collection: coll.id, doc_id: Some(DocId::Int64(2)), body }
+    }
+
+    fn entries_at(engine: &Engine, stamp: Stamp) -> usize {
+        engine
+            .read_oplog_from(Hlc::ZERO, 10_000, crate::WalkScope::Background)
+            .unwrap()
+            .iter()
+            .filter(|e| e.stamp == stamp)
+            .count()
+    }
+
+    #[test]
+    fn a_delete_carrying_a_body_at_the_tombstones_stamp_is_not_appended() {
+        // Each of the two terms of the guard (a delete has no body; the kind is a delete)
+        // answers a malformed entry the other lets through.
+        let (_a, _da, b, _db, cb, entries) = a_member_holding_a_bare_tombstone();
+        let stamp = entries.iter().find(|e| e.kind == OpKind::Delete).unwrap().stamp;
+        let body = Some(bson::serialize_to_vec(&doc! { "_id": 2 }).unwrap());
+
+        b.apply_batch(&[forged_at(stamp, OpKind::Delete, &cb, body)]).unwrap();
+
+        assert_eq!(entries_at(&b, stamp), 0);
+    }
+
+    #[test]
+    fn an_insert_without_a_body_at_the_tombstones_stamp_is_not_appended() {
+        let (_a, _da, b, _db, cb, entries) = a_member_holding_a_bare_tombstone();
+        let stamp = entries.iter().find(|e| e.kind == OpKind::Delete).unwrap().stamp;
+
+        b.apply_batch(&[forged_at(stamp, OpKind::Insert, &cb, None)]).unwrap();
+
+        assert_eq!(entries_at(&b, stamp), 0);
+    }
+
+    #[test]
+    fn a_delete_older_than_the_tombstone_is_superseded_and_not_appended() {
+        // Only the same write arriving again is owed an entry. An older delete from
+        // another origin meets a newer tombstone and is history, as for any entry.
+        let (_a, _da, b, _db, cb, entries) = a_member_holding_a_bare_tombstone();
+        let tombstone = entries.iter().find(|e| e.kind == OpKind::Delete).unwrap().stamp;
+        let older = Stamp::new(tombstone.hlc.predecessor(), NodeId::from_bytes([5; 16]));
+
+        b.apply_batch(&[forged_at(older, OpKind::Delete, &cb, None)]).unwrap();
+
+        assert_eq!(entries_at(&b, older), 0);
+    }
+
+    #[test]
+    fn an_owed_delete_moves_the_clock_to_its_stamp() {
+        // The tombstone is written without witnessing (as a store carrying one from an
+        // earlier run would hold it); the entry that arrives for it is covered and
+        // witnessed, so a later local write is minted above it.
+        let (b, _db) = engine();
+        let cb = b.create_collection("shop", "orders").unwrap();
+        let far = Stamp::new(
+            Hlc::new(crate::engine::physical_now_ms() + 3_600_000, 0),
+            NodeId::from_bytes([6; 16]),
+        );
+        let key = crate::docs::doc_key(&DocId::Int64(2)).unwrap();
+        let txn = b.begin_write(crate::engine::WriterHolder::Replication).unwrap();
+        let mut docs = txn.open_table(tables::DOCS).unwrap();
+        crate::live_count::put_record(
+            &txn,
+            &mut docs,
+            cb.id.0,
+            &key,
+            &codec::encode_doc_record(&kimmy_core::DocRecord::tombstone(far)),
+        )
+        .unwrap();
+        drop(docs);
+        txn.commit().unwrap();
+        assert!(b.clock_last() < far.hlc, "premise: the clock has not seen it");
+
+        b.apply_batch(&[forged_at(far, OpKind::Delete, &cb, None)]).unwrap();
+
+        assert_eq!(entries_at(&b, far), 1, "premise: the entry was appended");
+        assert!(b.clock_last() >= far.hlc, "the clock did not move over the appended entry");
+    }
+
+    #[test]
     fn only_an_equal_stamp_tombstone_delete_reads_the_oplog_to_apply() {
         let (a, _da) = engine();
         let ca = a.create_collection("shop", "orders").unwrap();
