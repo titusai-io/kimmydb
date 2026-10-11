@@ -26055,8 +26055,11 @@ are applied first, as the collection drops are (ADR-162), and the definition the
 recreated index. For collections the order is load-bearing (`restore_collection` does not
 compare incarnations); for indexes it is not: the incarnation rule of ADR-132 declines a drop
 older than the index standing, and `restore_collection` settles rival definitions on the later
-creation stamp, so either order ends with the recreated index standing. The test pins the
-outcome, not the order. **An index with no creation stamp reads as older than any drop** (ADR-132).
+creation stamp, so either order ends with the recreated index standing. The outcome is
+pinned for **both orders and both kinds of recreation** (the same definition and a changed one) by
+applying a hand-built page's drops and definitions each way round; the swap of the code's order is
+therefore an argued-equivalent mutation, not a missing test. **An index with no creation stamp reads as older than any drop** (ADR-132), and a test pins it: the drop applies to
+an index whose stamp is cleared.
 
 **Two names, one id.** A page names an index by its derived 32-bit id, which is all the
 tombstone table holds; the entries path matches by name. Two index names on one collection
@@ -26064,6 +26067,16 @@ that derive the same id are one index to a page's drop, so a standing index of t
 created before the drop, is dropped with it. The chance is 2^-32 per pair of names on a
 collection, the tombstone table already conflates them (ADR-123), and carrying the name would
 change what the table stores. Pinned by a test, so it is a decision.
+
+**What it costs on the wire.** One entry per index dropped within tombstone retention, on **every**
+page (the lesson ADR-152 found for the scoped route: a drop can land between two pages), with no cap.
+Measured, not estimated: **127 bytes** per entry in the BSON frame (the array index keys and the
+embedded stamp are most of it). `MAX_FRAME` is 64 MiB, so a page's list alone would reach it at
+about **528,000** drops. That is not a count a cluster reaches within retention (it is some 50 index
+drops a second for a week), and the collection tombstones the same page already carries have the same
+shape and the same bound. It is the one way this field could make a snapshot impossible to serve, so
+the figure is here to be checked against, and a deployment that churns indexes at that rate would
+need the list sent once and resumed by cursor, which is a protocol change of its own.
 
 **Wire and disk.** Additive field, defaulted: an older sender writes nothing and an older
 receiver ignores it, so a mixed pair keeps the previous behaviour until both have rolled
@@ -26076,8 +26089,15 @@ dropped and recreated arrives as the new definition and the old drop; an index c
 drop is left alone and the drop is still recorded; a stamp the sender's coverage does not name
 destroys nothing; a member without the collection records the drop and an older `CreateIndex` is
 history; a scoped snapshot honours its own collection's drops only, including against a page that
-carries others; a snapshot already held commits nothing; two names that derive one id. `kimmy-cluster`:
+carries others; a snapshot already held commits nothing; two names that derive one id; a drop that lands between
+two pages is applied by the second; an index recreated after the drop arrives by the entry that follows
+and stands; a dropped-and-recreated index stands in both orders and for both kinds of recreation; an
+index with no creation stamp is dropped; a collection that goes while its index is being dropped still
+has the drop recorded (driven through the race hook). `kimmy-cluster`:
 the relay through real rounds and the member's own loop, the direct snapshot, two snapshot hops. The
-mutations: the drops not applied, no coverage gate, a scoped snapshot taking every collection's. Each
-fails a test. The order (definitions before drops) survives by design, above.
+mutations, each failing a test: the drops not applied, no coverage gate, a scoped snapshot taking
+every collection's, `is_some_and` turned `is_none_or` on the creation-stamp guard, a vanished collection
+an error, and its tombstone not recorded. **Two survive, argued equivalent:** the order (definitions
+before drops), above; and `stamp <= created` for `stamp < created` in the incarnation guard, because
+the two stamps are never equal (a stamp is unique per write).
 

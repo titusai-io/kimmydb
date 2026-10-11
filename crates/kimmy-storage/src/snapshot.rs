@@ -6042,6 +6042,161 @@ mod tests {
     }
 
     #[test]
+    fn a_drop_that_lands_between_two_pages_is_applied_by_the_second() {
+        // The index is on the sender when the first page is cut, so the page lists it
+        // and the receiver restores it; it is dropped before the second, which carries
+        // the tombstone (every page does) with a stamp the second page's coverage names.
+        let (a, _da) = engine();
+        let ca = a.create_collection("shop", "orders").unwrap();
+        for i in 0..(SNAPSHOT_PAGE as i64 + 20) {
+            a.insert(&ca, doc! { "_id": i, "x": i }).unwrap();
+        }
+        a.create_index("shop", "orders", vec![field("x")], false, Some("by_x".into())).unwrap();
+        age_out(&a);
+        let (b, _db) = engine();
+        let mut progress = SnapshotProgress::whole_database();
+
+        let first = a.snapshot_page(None, None).unwrap();
+        assert!(first.next.is_some() && first.dropped_indexes.is_empty(), "premise");
+        b.apply_snapshot_page(a.node_id(), &mut progress, &first).unwrap();
+        assert!(b.get_collection("shop", "orders").unwrap().index("by_x").is_some(), "restored");
+
+        a.drop_index("shop", "orders", "by_x").unwrap();
+        let second = a.snapshot_page(first.next.clone(), None).unwrap();
+        assert_eq!(second.dropped_indexes.len(), 1, "the second page carries the drop");
+        b.apply_snapshot_page(a.node_id(), &mut progress, &second).unwrap();
+
+        assert!(progress.is_complete());
+        assert!(
+            b.get_collection("shop", "orders").unwrap().index("by_x").is_none(),
+            "the drop that landed mid-transfer is applied"
+        );
+    }
+
+    #[test]
+    fn an_index_recreated_after_the_pages_drop_is_created_by_the_entry_that_follows() {
+        // The first page carries the drop and no definition (the sender had none then).
+        // The sender recreates the index before the snapshot completes: its definition is
+        // not on any page, and the entry is above the grant, so it arrives by entries and
+        // is newer than the tombstone this snapshot recorded.
+        let (a, _da, b, _db) = both_hold_an_index();
+        a.drop_index("shop", "orders", "by_x").unwrap();
+        age_out(&a);
+        let (c, _dc) = engine();
+        let mut progress = SnapshotProgress::whole_database();
+        let page = a.snapshot_page(None, None).unwrap();
+        assert!(!page.dropped_indexes.is_empty(), "premise");
+        c.apply_snapshot_page(a.node_id(), &mut progress, &page).unwrap();
+        assert!(c.get_collection("shop", "orders").unwrap().index("by_x").is_none());
+
+        a.create_index("shop", "orders", vec![field("x")], false, Some("by_x".into())).unwrap();
+        let recreate = a
+            .entries_for_peer(Hlc::ZERO, 100, crate::WalkScope::Request)
+            .unwrap()
+            .entries
+            .into_iter()
+            .filter(|e| e.kind == OpKind::CreateIndex)
+            .next_back()
+            .unwrap();
+        c.apply_batch(std::slice::from_ref(&recreate)).unwrap();
+
+        assert!(
+            c.get_collection("shop", "orders").unwrap().index("by_x").is_some(),
+            "a create newer than the recorded drop stands"
+        );
+        let _ = b;
+    }
+
+    #[test]
+    fn a_dropped_and_recreated_index_stands_whichever_order_the_page_is_applied_in() {
+        // The outcome, pinned for both orders and both kinds of recreation, so that it
+        // does not depend on the order the page's drops and definitions are applied in:
+        // the recreated index merges its stamp forward (`create_index_inner`) and a drop
+        // older than the index standing spares it (`drop_index_inner`).
+        for changed in [false, true] {
+            for drops_first in [true, false] {
+                let (a, _da, b, _db) = both_hold_an_index();
+                a.drop_index("shop", "orders", "by_x").unwrap();
+                let on = if changed { "y" } else { "x" };
+                a.create_index("shop", "orders", vec![field(on)], false, Some("by_x".into()))
+                    .unwrap();
+                let wanted = a.get_collection("shop", "orders").unwrap().index("by_x").cloned();
+                let page = a.snapshot_page(None, None).unwrap();
+
+                let definitions = |b: &Engine| {
+                    for state in &page.collections {
+                        b.restore_collection(state).unwrap();
+                    }
+                };
+                if drops_first {
+                    b.apply_carried_index_drops(&page, None).unwrap();
+                    definitions(&b);
+                } else {
+                    definitions(&b);
+                    b.apply_carried_index_drops(&page, None).unwrap();
+                }
+
+                let held = b.get_collection("shop", "orders").unwrap();
+                let held = held.index("by_x").cloned();
+                assert_eq!(
+                    held.as_ref().map(|i| (&i.fields, i.created)),
+                    wanted.as_ref().map(|i| (&i.fields, i.created)),
+                    "changed={changed} drops_first={drops_first}: the recreated index stands"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn an_index_with_no_creation_stamp_reads_as_older_than_a_pages_drop() {
+        // ADR-132: an index that carries no stamp cannot arbitrate, and the drop applies.
+        let (a, _da, b, _db) = both_hold_an_index();
+        let mut meta = b.get_collection("shop", "orders").unwrap();
+        for index in &mut meta.indexes {
+            index.created = None;
+        }
+        let txn = b.begin_write(crate::engine::WriterHolder::Ddl).unwrap();
+        Engine::put_collection_meta(&txn, &meta).unwrap();
+        txn.commit().unwrap();
+        a.drop_index("shop", "orders", "by_x").unwrap();
+        age_out(&a);
+
+        transfer(&b, &a);
+
+        assert!(b.get_collection("shop", "orders").unwrap().index("by_x").is_none());
+    }
+
+    #[test]
+    fn a_collection_dropped_while_its_index_is_dropped_by_a_page_still_records_the_drop() {
+        // The collection goes between the page's reading of it and the writer taking the
+        // drop. The index went with it, and the drop is recorded all the same, for the
+        // reason the replicated `DropIndex` arm records its own: a replay of the create,
+        // after the collection has itself been recreated, must find it.
+        use crate::sync::race_hooks;
+        let (a, _da, b, _db) = both_hold_an_index();
+        let id = a.get_collection("shop", "orders").unwrap().id;
+        a.drop_index("shop", "orders", "by_x").unwrap();
+        let page = a.snapshot_page(None, None).unwrap();
+        let b = std::sync::Arc::new(b);
+        let dropping = std::sync::Arc::clone(&b);
+
+        let (applied, dropped) = race_hooks::race(
+            race_hooks::Race::IndexDrop,
+            move || dropping.drop_collection("shop", "orders"),
+            || b.apply_carried_index_drops(&page, None),
+        );
+
+        applied.expect("the page applies though the collection went");
+        assert!(dropped.unwrap());
+        assert!(b.get_collection("shop", "orders").is_err());
+        assert!(
+            b.index_dropped_at(id, kimmy_core::IndexMeta::derive_id("by_x")).unwrap().is_some(),
+            "and the drop is recorded"
+        );
+        race_hooks::assert_absorbed(race_hooks::Race::IndexDrop);
+    }
+
+    #[test]
     fn a_drop_already_held_is_not_applied_again_on_the_next_page() {
         // The list rides every page; the second costs no writer and changes nothing.
         let (a, _da, b, _db) = both_hold_an_index();
