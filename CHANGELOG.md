@@ -10,6 +10,30 @@ Versioning follows the pre-1.0 policy in
 [docs/compatibility.md](docs/compatibility.md): a `0.MINOR` bump may carry
 breaking changes and says so here; a `0.x.PATCH` bump never does.
 
+## Unreleased
+
+### Changed
+
+- **A `kimmyd` stopped while a `dns:` or `k8s:` seed is being looked up no longer
+  waits for the lookup** (it held the stop for up to the 22 s budget when the name
+  server did not answer). These seeds now resolve with the library `dns-srv:`
+  already uses, one resolver per lookup, so `/etc/hosts` and `/etc/resolv.conf` are
+  read each time and nothing is cached between discovery ticks, as with
+  `getaddrinfo`. What differs, so that a seed that resolved still does:
+  `resolv.conf` is honoured for its nameservers, `search`/`domain` and `options
+  ndots/timeout/attempts/edns0`; **a missing `resolv.conf`, or none with a
+  nameserver, is now an error** (it was a resolver on `127.0.0.1`); `nsswitch.conf`
+  is not read (the static musl build and so the container never read it; a glibc or
+  macOS build loses `mdns`/`sssd`/scoped resolvers); and a seed is given the time `resolv.conf`'s `timeout` and `attempts` allow for the
+  names it tries (at least **15 s**) and is then reported and tried again at the next
+  tick, where it used to wait on the resolver's own timeouts. Seeds are resolved
+  together, so several that do not answer cost one bound in all. No rollback boundary and no configuration
+  change. The webhook and embedding-provider lookups still use `getaddrinfo`.
+  ADR-223; amends ADR-202.
+- New test switch `KIMMY_TEST_DNS_SERVER=<ip>:<port>` (`docs/testing.md`,
+  `docs/operations.md`): it reaches `dns:` and `k8s:` seeds, not `dns-srv:`. Never set
+  it in a deployment; it logs a `WARN` at start.
+
 ## 0.45.0 - 2026-10-06
 
 This is a minor release with no breaking change and no rollback boundary: no

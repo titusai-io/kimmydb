@@ -22178,6 +22178,10 @@ about 4 s, and a refused port fails at once); and a stop between lookups does no
 wait at all. Resolving addresses with the resolver the SRV lookup already uses would
 end the wait, and is not part of this change.
 
+> **Amended by [ADR-223](#adr-223--dns-and-k8s-seeds-resolve-with-the-resolver-dns-srv-uses-built-fresh-for-each-lookup-and-a-stop-does-not-wait-for-one).**
+> A `dns:` or `k8s:` lookup is no longer `getaddrinfo` on the blocking pool, and a
+> stop no longer waits for one. The paragraph above describes 0.45.0 and earlier.
+
 Tests on virtual time: over 100 s with a resolver that never answers, the first
 tick, the four retries and the tick at a minute, one call to the resolver and no
 completed resolution; a resolver that answers at 5 s is used by a tick within
@@ -25764,3 +25768,99 @@ sides; the independent part applied once for six inputs; a later `$match` and an
 split `$match`, and of a nested loop with nothing to join on. Mutation rows, each
 failing a named test, in the order of the code review that asked for them.
 
+## ADR-223 — `dns:` and `k8s:` seeds resolve with the resolver `dns-srv:` uses, built fresh for each lookup, and a stop does not wait for one
+
+**Decision.** `SeedSource::resolve` resolves a `dns:` or `k8s:` seed with
+`hickory-resolver`'s `lookup_ip`, in a resolver **built for that lookup and dropped
+with it**, inside a bound its resolver configuration gives it (at least 15 s), and pairs
+every address with the seed's port.
+`peers::resolve` resolves the seeds **concurrently**, so the bounds overlap and do
+not add. `dns-srv:` is unchanged, and so are the egress lookups of webhook
+deliveries and embedding providers (`kimmy-egress`), which are still `getaddrinfo`.
+
+**Why.** ADR-202 moved the resolution out of the discovery loop and said what it
+could not move: a `dns:` lookup was `getaddrinfo` on the blocking pool, which
+cannot be cancelled, and the runtime waits for its blocking pool at the stop. A
+resolver that drops queries therefore held a stop for the whole 22 s budget,
+whatever aborted the task that was waiting for it. A hickory lookup is a future:
+the loop's guard aborts the task and the lookup ends with it, sockets included.
+
+**What it changes against `getaddrinfo`, and what it does not.**
+
+| | `getaddrinfo` | now |
+|---|---|---|
+| `/etc/hosts`, `/etc/resolv.conf` | read on each call | read on each lookup (the library reads them when a resolver is built, so one is built per lookup) |
+| Cache | none | none: nothing is kept between lookups, negative answers included |
+| `search` / `ndots` | search list first below `ndots` dots, a final dot is absolute | the same rule and the same tip |
+| `options` | musl and glibc read their own set | `ndots`, `timeout`, `attempts`, `edns0` |
+| `nsswitch.conf` | glibc obeys it, musl never reads it | never read; no change on the static musl release build |
+| No `resolv.conf` or no nameserver | a resolver on `127.0.0.1` | an error, named on the `could not resolve seed` line |
+| Time | musl: about `timeout` × `attempts`; glibc: `timeout` × `attempts` × nameservers | `timeout` × `attempts` per name, names one after another: bounded at that product over the names tried, and at least 15 s |
+| A name that does not exist | an error | an error (unlike `dns-srv:`, where it is an empty set): a mistyped seed stays visible |
+| A stop in flight | held, up to the 22 s budget | not held |
+
+**No cache is the load-bearing line.** The discovery loop asks again after 250 ms,
+500 ms, … while a cluster starts (ADR-202), and a Service answers "no such name"
+with a TTL (30 s on CoreDNS) until its first pod registers. The library keeps
+negative answers for their TTL, so one resolver kept across ticks answers every
+early retry from the first "no". A test proves it with the library itself: one
+resolver, a name that does not exist and then does, and the second ask still fails;
+the code under test, a resolver per lookup, sees the name. `dns-srv:` keeps its one
+resolver for the process and so has that behaviour, and reads `/etc/hosts` and
+`/etc/resolv.conf` once. That is not part of this record.
+
+**The bound.** A seed is given the time its resolver configuration allows, and at least
+15 s (`SEED_LOOKUP_FLOOR`). The library spends `timeout` × `attempts` on each name, one
+after another: the name and each search domain (and the `domain`, if `resolv.conf` has
+one), or the name alone if it ends in a dot. The bound is that product over the names
+tried, plus a second so that the library's own timeout is what ends a name nobody
+resolves, and the bound is what ends a lookup that stalls. A fixed 15 s would have
+failed, every tick, a name the configuration says takes longer (a Kubernetes short name
+under `ndots:5` and four search domains, on a slow name server), where `getaddrinfo`
+eventually answered it; with a fresh resolver per tick that name would never resolve.
+The floor is half the discovery interval and longer than one dead name server takes to
+give up on one name (5 s × 2). The loop starts no second resolution while one is in
+flight, so without a bound a resolver that drops queries could keep one lookup, and so
+discovery, going as long as the search list took. It is still bounded, by `resolv.conf`,
+and a stop does not wait for it: the abort drops the future. With the seeds resolved
+together, N seeds that nobody answers take one bound and not N. Nothing waits on the
+resolution at the start or for readiness: a seed given as a name is resolved by the
+discovery loop and not at the start (ADR-202), and the catching-up wait is
+`catch_up_wait_secs` whatever the resolution does. The comparison with the old call is
+not "unbounded": on the static musl build a hung seed's `getaddrinfo` lasted about
+`timeout` × `attempts`, on glibc `timeout` × `attempts` × the name servers. What
+differs is that the bound now follows the same configuration, the seeds run
+concurrently, and a stop no longer waits.
+
+**Both families, asked for by name.** The lookup strategy is set to ask for A and
+AAAA together and not left to the library's default; a name that holds only an A record
+is an answer, and one that does not exist is an error.
+
+**A test switch, `KIMMY_TEST_DNS_SERVER=<ip>:<port>`**, makes `dns:` and `k8s:`
+seeds (not `dns-srv:`, whose resolver is the process's own) resolve against one name
+server from the start and not against `resolv.conf`, which cannot name a port. It follows `KIMMY_TEST_REFUSE_DIAL`: read
+by `kimmyd` at the start, a value that is not an address refuses the start, and
+every start where it is set logs a `WARN` naming it. It is in the shipped binary,
+like the others, so that a stop is timed against the process that ships.
+
+**Not decided here.** The `dns-srv:` resolver's cache and its one read of the two
+files; the egress lookups, which still hold a stop and are bounded as
+`operations.md` says.
+
+**Tests.** Against a UDP name server of the test's own: a name resolves to every
+address it holds, both families, each with the seed's port; a name that does not
+exist is an error and not an empty set; a server that never answers is given up on
+at its bound; the bound follows the configuration (a short name under a long search
+list, on a server that answers only the last name, is answered where a fixed bound would
+have failed it, with that fixed bound as the control); a name that holds only an A record
+resolves to it; a dropped lookup lets its runtime end at once; a name is looked up
+afresh each time (with the control above); a short name goes through the search
+list and a name with a final dot is asked alone; a numeric host is returned as it
+is; the switch points the seed source at the server. `peers`: an unresolvable seed
+does not lose the others, against a server of the test's own, and two seeds that
+nobody answers take one bound and not two, on a paused clock. `lifecycle.rs`: a
+real `kimmyd` whose seed's name server reads queries and answers none, signalled
+once a query has arrived, stops in under four seconds and exits 0 (a blocking
+thread held for the stop turns it red: 11.9 s). Mutations: the seeds resolved one
+after another, the bound removed, and the resolver kept across lookups each fail
+their test.

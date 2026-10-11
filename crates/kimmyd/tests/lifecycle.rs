@@ -2785,3 +2785,75 @@ async fn a_replay_floor_that_cannot_be_written_fails_the_start() {
     next.signal("TERM");
     assert!(next.wait_exit().success());
 }
+
+// ---------------------------------------------------------------------------
+// A `dns:` seed is resolved by a lookup a stop can drop (H1)
+// ---------------------------------------------------------------------------
+
+/// A `dns:` seed whose name server reads every query and answers none holds
+/// nothing up: the lookup is a future the stop drops, where a `getaddrinfo` on
+/// the blocking pool held the runtime until it returned, up to the stop's 22 s.
+///
+/// The stop is sent once the server has read a query, so the lookup is in
+/// flight, and its resolver is still waiting on the first 5 s of the 2 attempts
+/// it makes. The bound on the stop is well under that wait.
+#[tokio::test]
+async fn a_dns_seed_nobody_answers_does_not_hold_the_stop() {
+    let dir = tempfile::tempdir().unwrap();
+    let server = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+    server.set_read_timeout(Some(Duration::from_millis(100))).unwrap();
+    let at = server.local_addr().unwrap();
+    let asked = Arc::new(AtomicUsize::new(0));
+    let done = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let reader = {
+        let (asked, done) = (Arc::clone(&asked), Arc::clone(&done));
+        std::thread::spawn(move || {
+            let mut buf = [0u8; 1024];
+            while !done.load(Ordering::SeqCst) {
+                if server.recv_from(&mut buf).is_ok() {
+                    asked.fetch_add(1, Ordering::SeqCst);
+                }
+            }
+        })
+    };
+
+    let tail = format!(
+        r#"
+[cluster]
+enabled = true
+bind = "127.0.0.1:{cluster}"
+seeds = ["dns:hung.test"]
+cluster_secret = "a-lifecycle-harness-cluster-secret"
+sync_interval_secs = 1
+discovery_interval_secs = 2
+catch_up_wait_secs = 3600
+"#,
+        cluster = ports::choose()
+    );
+    let mut run = Run::spawn_full(
+        dir.path(),
+        "hung-dns",
+        0,
+        &[("KIMMY_TEST_DNS_SERVER", &at.to_string())],
+        "",
+        None,
+        false,
+        &tail,
+    );
+    until_bound(&run).await;
+    let deadline = Instant::now() + PATIENCE;
+    while asked.load(Ordering::SeqCst) == 0 {
+        assert!(Instant::now() < deadline, "no query reached the name server; log: {}", run.log());
+        tokio::time::sleep(POLL).await;
+    }
+
+    let (status, took) = stop(&mut run);
+    done.store(true, Ordering::SeqCst);
+    reader.join().unwrap();
+
+    assert!(status.success(), "{status:?}: {}", run.log());
+    assert!(took < Duration::from_secs(4), "a lookup held the stop for {took:?}: {}", run.log());
+    let log = run.log();
+    assert!(log.contains("KIMMY_TEST_DNS_SERVER"), "the switch announces itself: {log}");
+    assert!(marker(dir.path()).unwrap().contains("exit = \"shutdown\""));
+}

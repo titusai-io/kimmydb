@@ -782,8 +782,8 @@ pub async fn replicate(engine: Arc<Engine>, config: ReplicationConfig) {
     let mut tick_is_early_retry = false;
     let mut discoveries: u64 = 0;
     // The seeds are resolved beside the loop, never inside it: a resolver that
-    // hangs (DNS that does not answer) holds a blocking-pool thread (`dns:`,
-    // `k8s:`) or a task (`dns-srv:`) for its own timeout, and awaited in the
+    // hangs (DNS that does not answer) holds a task for its own timeout (at
+    // the bound its resolver configuration gives it, 15 s at least, for `dns:` and `k8s:`), and awaited in the
     // loop's own arm it held every sync tick with it. One at a
     // time, so a hung one is not stacked on by the next; the peers last resolved
     // are kept until a resolution completes. A resolution is a task the loop owns:
@@ -1757,12 +1757,27 @@ fn advance_probe_on<E>(
 /// Resolve every seed source, dropping this node's own address.
 async fn resolve(seeds: &[SeedSource], local: SocketAddr) -> BTreeSet<SocketAddr> {
     let mut out = BTreeSet::new();
-    for seed in seeds {
-        match seed.resolve().await {
+    // All at once, so the seeds share their time and do not add it: a bound on
+    // each seed (`SEED_LOOKUP_FLOOR` or more) is a bound on the whole when no seed waits
+    // for another.
+    // Dropped with this future, which aborts the lookups still going: a stop
+    // does not wait for one.
+    let mut lookups = tokio::task::JoinSet::new();
+    for (i, seed) in seeds.iter().cloned().enumerate() {
+        // UNSUPERVISED: one lookup of one seed; a panic in it loses that seed's answer for this resolution, which the join below reports, and the next tick asks again
+        lookups.spawn(async move { (i, seed.resolve().await) });
+    }
+    while let Some(joined) = lookups.join_next().await {
+        let Ok((i, answer)) = joined else {
+            // A lookup that panicked answers for nobody; the others still do.
+            warn!("a seed lookup ended without an answer");
+            continue;
+        };
+        match answer {
             Ok(addrs) => out.extend(addrs),
             // A name that does not resolve yet is what a cluster looks like
             // while it is starting. Logged, not fatal.
-            Err(e) => warn!(seed = %seed.describe(), error = %e, "could not resolve seed"),
+            Err(e) => warn!(seed = %seeds[i].describe(), error = %e, "could not resolve seed"),
         }
     }
 
@@ -2621,9 +2636,46 @@ mod tests {
         assert_eq!(peers, BTreeSet::from([other]), "a node must not sync with itself");
     }
 
+    /// A name server on loopback that reads every query and answers none, or,
+    /// when `answer_nxdomain`, answers every one NXDOMAIN. Set as the process's
+    /// test name server for as long as the returned guard lives.
+    async fn test_name_server(
+        answer_nxdomain: bool,
+    ) -> (tokio::sync::MutexGuard<'static, ()>, tokio::task::JoinHandle<()>) {
+        use hickory_resolver::proto::op::{Message, ResponseCode};
+        let only = crate::discovery::TEST_DNS_LOCK.lock().await;
+        let socket = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        crate::discovery::set_test_dns_server(Some(socket.local_addr().unwrap()));
+        let task = tokio::spawn(async move {
+            let mut buf = vec![0u8; 1024];
+            while let Ok((len, from)) = socket.recv_from(&mut buf).await {
+                if !answer_nxdomain {
+                    continue;
+                }
+                let Ok(request) = Message::from_vec(&buf[..len]) else {
+                    continue;
+                };
+                let mut response = Message::response(request.id, request.op_code);
+                if let Some(query) = request.queries.first() {
+                    response.add_query(query.clone());
+                }
+                response.metadata.response_code = ResponseCode::NXDomain;
+                response.metadata.recursion_available = true;
+                response.metadata.recursion_desired = request.metadata.recursion_desired;
+                if let Ok(bytes) = response.to_vec() {
+                    let _ = socket.send_to(&bytes, from).await;
+                }
+            }
+        });
+        (only, task)
+    }
+
     #[tokio::test]
     async fn an_unresolvable_seed_does_not_lose_the_others() {
         // One bad DNS name must not blind a node to every peer it can reach.
+        // Against a name server of the test's own, so the host's resolver is
+        // not what decides how long a name that does not exist takes to fail.
+        let (_only, server) = test_name_server(true).await;
         let good: SocketAddr = "127.0.0.1:7901".parse().unwrap();
         let seeds = vec![
             SeedSource::Dns { name: "no-such-host.invalid".into(), port: 7900 },
@@ -2631,8 +2683,39 @@ mod tests {
         ];
 
         let peers = resolve(&seeds, "127.0.0.1:7900".parse().unwrap()).await;
+        crate::discovery::set_test_dns_server(None);
+        server.abort();
 
         assert!(peers.contains(&good));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn seeds_nobody_answers_share_one_bound_and_do_not_add_up() {
+        // Two `dns:` seeds at a resolver that drops every query. Resolved one
+        // after the other they would take the bound twice, and a discovery tick
+        // would wait that long for peers it was never going to find. The clock is
+        // the runtime's, paused: it moves when nothing else can.
+        let (_only, server) = test_name_server(false).await;
+        let good: SocketAddr = "127.0.0.1:7901".parse().unwrap();
+        let seeds = vec![
+            SeedSource::Dns { name: "a.hung.test".into(), port: 7900 },
+            SeedSource::Kubernetes { name: "b.hung.test".into(), port: 7900 },
+            SeedSource::Static(vec![good]),
+        ];
+
+        let started = tokio::time::Instant::now();
+        let peers = resolve(&seeds, "127.0.0.1:7900".parse().unwrap()).await;
+        let took = started.elapsed();
+        crate::discovery::set_test_dns_server(None);
+        server.abort();
+
+        let bound = crate::discovery::SEED_LOOKUP_FLOOR;
+        assert_eq!(peers, BTreeSet::from([good]), "the seed that answers is not lost");
+        assert!(took >= bound, "each hung seed waited out its bound: {took:?}");
+        assert!(
+            took < bound * 3 / 2,
+            "and the two waited together, not one after the other: {took:?}"
+        );
     }
 
     #[tokio::test]
