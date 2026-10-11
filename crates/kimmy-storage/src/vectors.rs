@@ -88,6 +88,13 @@ pub(crate) enum Configured {
 }
 
 impl Configured {
+    /// Whether this change is a snapshot page's **dated** one: a winner by stamp, from a
+    /// sender whose own coverage names it (ADR-163, ADR-226), so the history behind it
+    /// is the sender's and cannot be replayed here.
+    fn is_a_dated_page(self) -> bool {
+        matches!(self, Self::FromSnapshot(Some(_)))
+    }
+
     /// The stamp of the change this applies, when it comes with one from another
     /// member: what the standing state is judged against (ADR-226). A local change
     /// mints its own, under the writer.
@@ -178,9 +185,21 @@ impl crate::Engine {
             // client computed them — so a changed width there still requires an
             // explicit drop, or search would quietly serve from a shrinking
             // remnant of the old width while nothing replaces it.
+            //
+            // **Not for a dated page** (ADR-227). The sender cannot have made this change
+            // in place either: it turned the configuration off between the two, and the
+            // entries that say so are exactly what a page stands in for. Applied here as
+            // that history reads: the configuration off and on again, one change, in this
+            // transaction, so the dimension changes with nothing to drop and no window in
+            // which the collection is without one. The stored vectors are left as they
+            // are, as for an entry's off (`drop_vectors` is never a peer's to decide), and
+            // the new width skips them. Judged below the history check and the
+            // last-writer-wins guard, so a page that loses changes nothing, and for a
+            // dated page only: one with no stamp is not a winner and never overrides.
             if let Some(existing) = &meta.vector
                 && existing.dim != config.dim
                 && !config.provider.embeds_server_side()
+                && !by.is_a_dated_page()
             {
                 return Err(StorageError::Core(CoreError::InvalidQuery(format!(
                     "vector dimension cannot change from {} to {} in place for client-supplied \

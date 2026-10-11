@@ -1496,7 +1496,12 @@ impl Engine {
 
         let mut refused = 0usize;
         for index in &state.indexes {
-            let existing = self.get_collection(&state.db, &state.name)?;
+            // Gone since the check above: a concurrent local drop, as for the index
+            // creation below (`Ddl::Gone`), and not a failure of the page.
+            let Some(existing) = Self::unless_gone(self.get_collection(&state.db, &state.name))?
+            else {
+                break;
+            };
             let created = self.create_index_inner(
                 &state.db,
                 &state.name,
@@ -1560,7 +1565,7 @@ impl Engine {
             }
         }
 
-        self.restore_vector_state(state, versions, &earlier)?;
+        refused += self.restore_vector_state(state, versions, &earlier)?;
         Ok(refused)
     }
 
@@ -1583,23 +1588,29 @@ impl Engine {
         state: &CollectionState,
         versions: &VersionVector,
         history: &dyn Fn(&CollectionMeta) -> bool,
-    ) -> Result<()> {
-        let existing = self.get_collection(&state.db, &state.name)?;
+    ) -> Result<usize> {
+        let Some(existing) = Self::unless_gone(self.get_collection(&state.db, &state.name))? else {
+            // Dropped here since the definitions began: nothing to put it on.
+            return Ok(0);
+        };
         let Some(stamp) = state.vector_changed else {
             // Undated: the old rule, and only where nothing dated stands here.
             if let Some(config) = &state.vector
                 && existing.vector_changed.is_none()
                 && existing.vector.as_ref() != Some(config)
             {
-                self.configure_vectors_inner(
-                    &state.db,
-                    &state.name,
-                    config.clone(),
-                    crate::vectors::Configured::FromSnapshot(None),
-                    history,
-                )?;
+                return self.settled_vector_step(
+                    state,
+                    self.configure_vectors_inner(
+                        &state.db,
+                        &state.name,
+                        config.clone(),
+                        crate::vectors::Configured::FromSnapshot(None),
+                        history,
+                    ),
+                );
             }
-            return Ok(());
+            return Ok(0);
         };
         if stamp.hlc > versions.get(stamp.node) {
             warn!(
@@ -1610,7 +1621,7 @@ impl Engine {
                 "a snapshot page changed a vector configuration at a stamp its sender's own \
                  coverage does not name; ignored"
             );
-            return Ok(());
+            return Ok(0);
         }
         // The clock observes a stamp the sender's coverage names whether or not it is
         // newer than ours: it is covered, so safe, and the judgement of which change
@@ -1619,16 +1630,69 @@ impl Engine {
         self.witness(&stamp);
         let by = crate::vectors::Configured::FromSnapshot(Some(stamp));
         match &state.vector {
-            Some(config) => {
-                self.configure_vectors_inner(&state.db, &state.name, config.clone(), by, history)?;
-            }
+            Some(config) => self.settled_vector_step(
+                state,
+                self.configure_vectors_inner(&state.db, &state.name, config.clone(), by, history),
+            ),
             // Never `drop_vectors`: the stored vectors are not this page's to
             // discard, as for an entry from elsewhere.
-            None => {
-                self.disable_vectors_inner(&state.db, &state.name, false, by, history)?;
+            None => self.settled_vector_step(
+                state,
+                self.disable_vectors_inner(&state.db, &state.name, false, by, history),
+            ),
+        }
+    }
+
+    /// `None` for a collection that is gone, the error otherwise. Not `settle`: a
+    /// collection waiting on the drop purger is not gone, and a page reading it fails and
+    /// retries rather than skipping what it cannot place (unreachable for a read today).
+    fn unless_gone<T>(read: Result<T>) -> Result<Option<T>> {
+        match read {
+            Ok(value) => Ok(Some(value)),
+            Err(crate::StorageError::Core(kimmy_core::Error::CollectionNotFound { .. })) => {
+                Ok(None)
+            }
+            Err(e) => Err(e),
+        }
+    }
+
+    /// What a page's vector step came to, settled as the entries path settles the same
+    /// change (ADR-227): a refusal is skipped, logged and counted, not raised.
+    ///
+    /// Raised, it failed the page, and a page that fails the same way every round is a
+    /// member stuck catching up with the marker set, refusing requests, until its sender
+    /// changes the configuration back or the store is wiped. Skipped, the page lands and
+    /// grants its coverage; the one configuration this node cannot hold differs from its
+    /// peers', which is what `kimmy_sync_ddl_refused_total` counts, as for an index the
+    /// page carried that this node cannot build. A collection gone since the page's
+    /// definitions began is a concurrent local drop and has nowhere to put it.
+    fn settled_vector_step<T>(&self, state: &CollectionState, applied: Result<T>) -> Result<usize> {
+        match crate::sync::settle(applied)? {
+            crate::sync::Ddl::Applied(_) => Ok(0),
+            crate::sync::Ddl::Gone => Ok(0),
+            // Unreachable today: a configuration applied from a page creates no shadow (it
+            // is its own collection on the page), so nothing in it waits on a purge. Were
+            // that ever to change, the safe answer is to fail the page and retry it once
+            // the purger has finished, as for a creation (`restore_collection`): skipped,
+            // the page would grant its coverage with the definition never applied and no
+            // entry left to bring it.
+            crate::sync::Ddl::PurgePending(_) => Err(crate::StorageError::CollectionPurging {
+                db: state.db.clone(),
+                name: state.name.clone(),
+                id: CollectionId::derive(&state.db, &state.name),
+            }),
+            crate::sync::Ddl::Refused(reason) => {
+                warn!(
+                    db = %state.db,
+                    collection = %state.name,
+                    reason = %reason,
+                    "skipped a vector configuration in a snapshot this node cannot apply; the \
+                     configuration stands on its peers and the divergence is counted in \
+                     kimmy_sync_ddl_refused_total"
+                );
+                Ok(1)
             }
         }
-        Ok(())
     }
 
     /// The shadows of the vector configurations `page` restored or found
@@ -6815,6 +6879,207 @@ mod tests {
         transfer(&b, &a);
 
         assert!(!vector_state(&b).0);
+    }
+
+    /// `vector_config()` at another width.
+    fn vector_config_of(dim: usize) -> kimmy_core::VectorConfig {
+        kimmy_core::VectorConfig { dim, ..vector_config() }
+    }
+
+    /// `a` turned it off and on again at width 16; `b` still holds width 8 with a stored
+    /// vector of that width. The oplog is aged out, so `b` can only take the page.
+    fn a_width_changed_through_an_off() -> (Engine, tempfile::TempDir, Engine, tempfile::TempDir) {
+        let (a, da, b, db) = both_hold_a_configuration();
+        let shadow = b.get_collection("shop", "orders.__vectors").unwrap();
+        b.put_vectors(
+            &shadow,
+            &kimmy_core::DocId::Int64(1),
+            &[kimmy_core::VectorRecord {
+                source: kimmy_core::DocId::Int64(1),
+                chunk: 0,
+                source_hlc: Hlc::new(1, 0),
+                vector: vec![0.5; 8],
+                text: "eight".into(),
+                config: None,
+            }],
+        )
+        .unwrap();
+        assert!(a.disable_vectors("shop", "orders", false).unwrap());
+        a.configure_vectors("shop", "orders", vector_config_of(16)).unwrap();
+        age_the_oplog_out(&a);
+        (a, da, b, db)
+    }
+
+    fn stored_widths(engine: &Engine) -> Vec<usize> {
+        let shadow = engine.get_collection("shop", "orders.__vectors").unwrap();
+        engine
+            .get_vectors(&shadow, &kimmy_core::DocId::Int64(1))
+            .unwrap()
+            .iter()
+            .map(|r| r.vector.len())
+            .collect()
+    }
+
+    #[test]
+    fn a_snapshot_takes_a_width_the_sender_changed_through_an_off() {
+        // The sender cannot change a client-supplied width in place, so it turned the
+        // configuration off between the two. A member that did not see the off refused
+        // the page's width for ever.
+        let (a, _da, b, _db) = a_width_changed_through_an_off();
+        let want = a.get_collection("shop", "orders").unwrap();
+        assert_eq!(want.vector.as_ref().map(|v| v.dim), Some(16), "premise");
+
+        let mut progress = SnapshotProgress::whole_database();
+        let page = a.snapshot_page(None, None).unwrap();
+        let outcome = b.apply_snapshot_page(a.node_id(), &mut progress, &page).unwrap();
+
+        let held = b.get_collection("shop", "orders").unwrap();
+        assert_eq!(held.vector, want.vector, "the page's configuration");
+        assert_eq!(held.vector_changed, want.vector_changed, "at the sender's stamp");
+        assert_eq!(outcome.ddl_refused, 0, "applied, not refused");
+        assert_eq!(stored_widths(&b), vec![8], "the stored vectors are kept, as for an off");
+    }
+
+    #[test]
+    fn a_page_losing_on_its_stamp_changes_nothing_whatever_its_width() {
+        // Judged below the last-writer-wins guard: a page that loses must not turn
+        // anything off, and must not change the width on its way to losing.
+        let (a, _da, b, _db) = both_hold_a_configuration();
+        a.disable_vectors("shop", "orders", false).unwrap();
+        a.configure_vectors("shop", "orders", vector_config_of(16)).unwrap();
+        age_the_oplog_out(&a);
+        std::thread::sleep(std::time::Duration::from_millis(5));
+        b.configure_vectors("shop", "orders", vector_config()).unwrap();
+        let before = b.get_collection("shop", "orders").unwrap();
+        assert!(before.vector_changed > a.get_collection("shop", "orders").unwrap().vector_changed);
+
+        transfer(&b, &a);
+
+        assert_eq!(b.get_collection("shop", "orders").unwrap(), before);
+    }
+
+    #[test]
+    fn a_page_without_a_stamp_never_changes_a_width() {
+        // Not a winner by anything, so not given the exemption: it is refused, counted,
+        // and the page still lands.
+        let (a, _da, b, _db) = a_width_changed_through_an_off();
+        unstamp(&b, "shop", "orders");
+        let before = b.get_collection("shop", "orders").unwrap();
+        let mut page = a.snapshot_page(None, None).unwrap();
+        for state in &mut page.collections {
+            state.vector_changed = None;
+        }
+        let mut progress = SnapshotProgress::whole_database();
+
+        let outcome = b.apply_snapshot_page(a.node_id(), &mut progress, &page).unwrap();
+
+        assert_eq!(b.get_collection("shop", "orders").unwrap(), before);
+        assert_eq!(outcome.ddl_refused, 1, "counted");
+    }
+
+    #[test]
+    fn a_page_naming_a_width_change_its_coverage_does_not_name_changes_nothing() {
+        // The exemption sits after the coverage gate (ADR-163): a stamp the sender's own
+        // vector does not name is ignored whole, and nothing is turned off on the way.
+        let (a, _da, b, _db) = a_width_changed_through_an_off();
+        let before = b.get_collection("shop", "orders").unwrap();
+        let mut page = a.snapshot_page(None, None).unwrap();
+        let stamp = page.collections.iter().find_map(|c| c.vector_changed).unwrap();
+        page.versions.insert(stamp.node, stamp.hlc.predecessor());
+        let mut progress = SnapshotProgress::whole_database();
+
+        let outcome = b.apply_snapshot_page(a.node_id(), &mut progress, &page).unwrap();
+
+        assert_eq!(b.get_collection("shop", "orders").unwrap(), before);
+        assert_eq!(outcome.ddl_refused, 0, "ignored, not refused");
+    }
+
+    #[test]
+    fn a_vector_configuration_this_node_cannot_hold_is_skipped_and_the_page_lands() {
+        // Any refusal the entries path settles, the page settles: raised, it failed the
+        // page every round and left the member catching up with the marker set.
+        let (a, _da, b, _db) = both_hold_a_configuration();
+        let mut page = a.snapshot_page(None, None).unwrap();
+        let held = b.get_collection("shop", "orders").unwrap();
+        let newer = Stamp::new(
+            held.vector_changed.unwrap().hlc.successor(),
+            held.vector_changed.unwrap().node,
+        );
+        for state in &mut page.collections {
+            if state.name == "orders" {
+                state.vector = Some(kimmy_core::VectorConfig { fields: vec![], ..vector_config() });
+                state.vector_changed = Some(newer);
+            }
+        }
+        page.versions.insert(newer.node, newer.hlc);
+        let mut progress = SnapshotProgress::whole_database();
+
+        let outcome = b.apply_snapshot_page(a.node_id(), &mut progress, &page).unwrap();
+
+        assert_eq!(outcome.ddl_refused, 1);
+        assert_eq!(b.get_collection("shop", "orders").unwrap().vector, held.vector);
+    }
+
+    #[test]
+    fn a_refused_page_records_no_stamp_so_a_later_valid_page_applies() {
+        // The refusal is not the change: a stamp recorded for it would make the
+        // last-writer-wins guard turn away the same or a later configuration, and the
+        // member would stay diverged with only the counter to show it.
+        let (a, _da, b, _db) = both_hold_a_configuration();
+        let held = b.get_collection("shop", "orders").unwrap();
+        let first = held.vector_changed.unwrap();
+        let second = Stamp::new(first.hlc.successor(), first.node);
+        let third = Stamp::new(second.hlc.successor(), first.node);
+        let page_at = |stamp: Stamp, config: kimmy_core::VectorConfig| {
+            let mut page = a.snapshot_page(None, None).unwrap();
+            page.collections.retain(|state| state.name == "orders");
+            for state in &mut page.collections {
+                state.vector = Some(config.clone());
+                state.vector_changed = Some(stamp);
+            }
+            page.versions.insert(stamp.node, stamp.hlc);
+            page
+        };
+
+        let refused =
+            page_at(second, kimmy_core::VectorConfig { fields: vec![], ..vector_config() });
+        let outcome = b
+            .apply_snapshot_page(a.node_id(), &mut SnapshotProgress::whole_database(), &refused)
+            .unwrap();
+        assert_eq!(outcome.ddl_refused, 1, "premise: refused");
+        assert_eq!(vector_state(&b), (true, Some(first)), "and no stamp recorded for it");
+
+        // The same stamp with a valid configuration, then a newer one: both apply.
+        let valid = page_at(second, vector_config_of(8));
+        b.apply_snapshot_page(a.node_id(), &mut SnapshotProgress::whole_database(), &valid)
+            .unwrap();
+        assert_eq!(vector_state(&b), (true, Some(second)));
+        let newer = page_at(third, vector_config_of(16));
+        let outcome = b
+            .apply_snapshot_page(a.node_id(), &mut SnapshotProgress::whole_database(), &newer)
+            .unwrap();
+        assert_eq!(outcome.ddl_refused, 0);
+        assert_eq!(vector_state(&b), (true, Some(third)));
+        assert_eq!(b.get_collection("shop", "orders").unwrap().vector.unwrap().dim, 16);
+    }
+
+    #[test]
+    fn a_collection_dropped_while_the_page_applies_does_not_fail_it() {
+        let (a, _da, b, _db) = both_hold_a_configuration();
+        a.disable_vectors("shop", "orders", false).unwrap();
+        let mut page = a.snapshot_page(None, None).unwrap();
+        page.collections.retain(|state| state.name == "orders");
+        let b = std::sync::Arc::new(b);
+        let dropping = std::sync::Arc::clone(&b);
+
+        let (applied, dropped) = crate::sync::race_hooks::race(
+            crate::sync::race_hooks::Race::RestoreDefinitions,
+            move || dropping.drop_collection("shop", "orders"),
+            || b.apply_snapshot_page(a.node_id(), &mut SnapshotProgress::whole_database(), &page),
+        );
+
+        dropped.expect("the drop applies");
+        applied.expect("and the page, which has nowhere to put its definition, still lands");
     }
 }
 

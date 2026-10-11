@@ -6326,6 +6326,75 @@ async fn a_snapshot_carries_a_vector_configuration_turned_off_to_the_member_taki
     assert!(held.vector.is_none(), "and the configuration it turned off: {:?}", held.vector);
 }
 
+/// A member holding a client-supplied width of 8 that the origin turned off and on again
+/// at 16, with the origin's oplog aged out so the member can only take its snapshot. Run
+/// in the member's own loop with the catching-up marker, which a snapshot sets when it
+/// starts and clears when it completes.
+///
+/// Before 0.46 the page's width was refused ("cannot change in place") in every round: the
+/// snapshot never completed, the marker stayed, and the member refused requests until the
+/// origin changed back or its store was wiped.
+#[tokio::test]
+async fn a_member_whose_snapshot_changes_a_client_supplied_width_completes_it_in_its_loop() {
+    use kimmy_cluster::{ReplicationConfig, SeedSource};
+    let (a, m, ca) = origin_and_a_member_that_holds_it(|engine, _| {
+        engine.configure_vectors("shop", "orders", vector_config()).unwrap();
+    })
+    .await;
+    let shadow = m.engine.get_collection("shop", "orders.__vectors").unwrap();
+    m.engine
+        .put_vectors(
+            &shadow,
+            &kimmy_core::DocId::Int64(1),
+            &[kimmy_core::VectorRecord {
+                source: kimmy_core::DocId::Int64(1),
+                chunk: 0,
+                source_hlc: kimmy_core::Hlc::new(1, 0),
+                vector: vec![0.5; 8],
+                text: "eight".into(),
+                config: None,
+            }],
+        )
+        .unwrap();
+    assert!(a.engine.disable_vectors("shop", "orders", false).unwrap());
+    a.engine
+        .configure_vectors(
+            "shop",
+            "orders",
+            kimmy_core::VectorConfig { dim: 16, ..vector_config() },
+        )
+        .unwrap();
+    a.engine.insert(&ca, doc! { "_id": 2, "x": 2 }).unwrap();
+    age_out_fully(&a.engine);
+
+    let marker_dir = tempfile::tempdir().unwrap();
+    let catch_up = marker_in(&marker_dir);
+    let mut config =
+        ReplicationConfig::new(vec![SeedSource::Static(vec![a.addr])], SECRET.into(), m.addr);
+    config.sync_interval = Duration::from_millis(300);
+    config.discovery_interval = Duration::from_millis(100);
+    config.catch_up = Some(Arc::clone(&catch_up));
+    let looping = tokio::spawn(kimmy_cluster::replicate(Arc::clone(&m.engine), config));
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+    let mut width = None;
+    while tokio::time::Instant::now() < deadline {
+        width = m.engine.get_collection("shop", "orders").unwrap().vector.map(|v| v.dim);
+        if width == Some(16) && catch_up.reason().is_none() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    looping.abort();
+
+    assert_eq!(width, Some(16), "the page's width");
+    assert_eq!(catch_up.reason(), None, "the snapshot completed and the marker cleared");
+    assert_eq!(documents_of(&m.engine, "shop", "orders"), 2, "m took the snapshot");
+    let shadow = m.engine.get_collection("shop", "orders.__vectors").unwrap();
+    let kept = m.engine.get_vectors(&shadow, &kimmy_core::DocId::Int64(1)).unwrap();
+    assert_eq!(kept.len(), 1, "the width-8 record is kept");
+    assert_eq!(kept[0].vector.len(), 8);
+}
+
 #[tokio::test]
 async fn a_vector_configuration_turned_off_reaches_a_member_through_two_snapshot_hops() {
     // `a` turns the configuration off; `p` snapshots from `a`; `q` snapshots from `p`;

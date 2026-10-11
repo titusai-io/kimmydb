@@ -26179,3 +26179,84 @@ at one `Hlc` converge in both orders, by entries and by page; a restart mints no
 snapshot applied, resumes the clock from the version vectors as well as the oplog, and a restart part-way
 through a snapshot still mints above the standing stamp. `kimmy-cluster`:
 the relay through real rounds and the member's own loop, the direct snapshot, two snapshot hops.
+
+## ADR-227 — A snapshot page's vector step is settled as an entry's is, and a dated page may change a client-supplied width through the off the sender made
+
+**Decision.**
+
+- **A dated page may change the width of a client-supplied (`byo`) configuration.** The sender
+  cannot have changed it in place either: `configure_vectors` refuses "dimension cannot change from
+  8 to 16 in place for client-supplied vectors", so the sender turned the configuration off between
+  the two. The entries that say so are exactly what a page stands in for, and the page carries only
+  the end state. A member that held the width-8 configuration refused the width-16 page in **every
+  round**: the page apply failed, the snapshot never completed, the catching-up marker (reason
+  `Snapshot`) stayed set, and the member refused requests until the origin changed the width back or
+  the store was wiped. Seen in the member's own loop with the marker: six failed rounds in eight
+  seconds, then the same for ever. The entries path accepts the same history (the intermediate off
+  applies, then the configuration).
+- **How it is applied.** The off and the configuration are one change to the collection's
+  definition, written in the one write transaction the configuration already makes: the stored
+  configuration is replaced, so no window exists in which the collection has none, and a failure
+  rolls both back. That is the implied off (`drop_vectors = false`, no stamp of its own) followed by
+  the page's configuration at the page's stamp, collapsed, because an off applied from elsewhere
+  writes nothing else: it **buries no shadow**, **reports no disable**, and **publishes nothing** to
+  change streams or webhooks beyond what the entries path does for the same history (it publishes the
+  same: nothing, for an entry from elsewhere). The stored width-8 records are **kept**, as for any
+  off from a peer (only a local `drop_vectors` deletes data); the new width skips them in both
+  search paths (`kimmy-vector`'s `a_graph_built_for_one_width_is_not_served_for_another`), and the
+  sender's own shadow is in the same state.
+- **Ordering.** It is judged **after** the history check, the last-writer-wins guard (ADR-226) and,
+  in `restore_vector_state`, the sender-coverage gate (ADR-163), all of which return before the
+  width is looked at. A page that loses, is older than the definition it was cut from, or names a
+  stamp the sender's own vector does not, changes nothing and turns nothing off. And **only a dated
+  page** is given it: one with no stamp is not a winner by anything, and keeps the refusal.
+- **A refusal the page's vector step meets is skipped, logged and counted**, as the entries path
+  settles the same change (`sync::settle`), and as the page's index step already did. It was raised
+  with `?`, so any refusal — an invalid configuration for this build, or the width above on an
+  undated page — failed the whole page the same way every round. Now the page lands, the member
+  logs a warning naming the database, collection and reason, and
+  `kimmy_sync_ddl_refused_total` counts it: the one configuration this node cannot hold differs from
+  its peers', which is a divergence to read, not a member to wedge. **A refused page records no stamp**: `vector_changed` is written only
+  with the configuration it describes, in the transaction that applies it, so the standing stamp is
+  what it was. The last-writer-wins guard therefore does not turn away a later page (or the same
+  stamp) carrying a configuration this node can hold; the member stays diverged only until one arrives.
+  The member's clock does observe the stamp (the sender's coverage names it, so it is safe). A collection dropped here while
+  the page applied is `Gone` and is skipped; a `PurgePending` there fails the page and retries (unreachable
+  today, since a page's configuration creates no shadow, and the safe default if it ever is: a skip would grant
+  the page's coverage with the definition never applied), in the vector step and at the start of each index
+  (it failed the page before, and was retried; it is no longer a failure).
+
+**The sweep.** Every refusal a page apply can hit, and whether the entries path accepts the same
+history:
+
+| Where | Refusal | Entries path | Now |
+|---|---|---|---|
+| `configure_vectors_inner` | width of a `byo` configuration changes | accepts (the off intervenes) | **fixed**: dated page applies it |
+| same | provider kind changes `byo`↔server-side | server-side target: always accepted; `byo` target with another width: the width above | fixed by the same rule |
+| same | metric changes | accepted (no refusal exists) | unchanged |
+| same | server-side embedding width changes | accepted (the worker re-embeds) | unchanged |
+| same | `config.validate()` (unknown to this build, empty fields, bad endpoint) | `Refused`, counted, round succeeds | **fixed**: `Refused`, counted, page lands |
+| same | configuring a shadow collection | `InvalidName`, **not** a refusal class: fails the round | unchanged; cannot occur, a shadow carries no configuration |
+| same, `disable_vectors_inner` | collection not found | `Gone` | **fixed**: skipped |
+| `restore_collection` | creation waits on the drop purger | `PurgePending`, batch stops and retries | unchanged and correct: the page fails and is retried, because skipping would leave the collection missing with its coverage granted |
+| `restore_collection` | index creation refused | `Refused`, counted | already settled (ADR-123) |
+| `apply_carried_index_drops` | `drop_index_inner` errors other than a vanished collection | `Refused`, counted | unchanged: it validates only the name of an index the sender holds; no other refusal is known |
+
+**Remaining, and named.** Two origins that change one `byo` collection **concurrently** — one
+width-8 at a stamp the receiver holds, the other turning off at a stamp below it and configuring
+width 16 above it — are refused by an entry from the second origin (its off loses on the stamp, then
+the configuration meets the width), counted and skipped, as before; the same history in a page is
+applied, because a page is a winner by stamp. A cluster that does that needs the origin to drop and
+reconfigure. It cannot wedge a member: the entries path settles it.
+
+**Wire and disk.** None. No rollback boundary: 0.45 on the page's receiving side refuses as it did.
+
+**Tests.** `kimmy-storage`: a snapshot takes a width the sender changed through an off (stamp
+recorded, nothing refused, the width-8 record kept); a page that loses on its stamp changes nothing
+whatever its width; a page naming a stamp its coverage does not name changes nothing; a page with no
+stamp never changes a width and is counted; a configuration this node cannot hold is skipped and the
+page lands, a refused page records no stamp and a later valid page applies; a collection dropped while the page applies does not fail it. `kimmy-cluster`: the
+member's own loop with the marker completes the snapshot and clears it. Mutation rows: the
+exemption, the exemption for an undated page, the exemption for any change, the last-writer-wins
+guard, the coverage gate, the refusal raised again, the refusal not counted, the vanished collection
+failing the page, and the loop test with the exemption removed.

@@ -36,6 +36,18 @@ breaking changes and says so here; a `0.x.PATCH` bump never does.
 
 ### Fixed
 
+- **A member could be stuck catching up indefinitely when a snapshot page changed the width
+  of a client-supplied vector configuration, and now it is not.** A member holding a `byo`
+  configuration of one width, whose peer turned it off and configured another (the only way to
+  change it), refused the snapshot page in every round: the snapshot never completed, the
+  catching-up marker stayed set, and the member refused requests until the origin changed the
+  width back or the member's store was wiped. A page's dated configuration now applies as the
+  off-then-on it stands for, in one transaction, keeping the stored vectors (which the new
+  width skips); any other configuration a page carries that this build cannot hold is now
+  skipped, logged and counted in `kimmy_sync_ddl_refused_total` like an index it cannot
+  build, instead of failing the page. ADR-227. No rollback boundary: a 0.45 receiver still
+  refuses the page.
+
 - **A snapshot now carries the indexes the sender has dropped.** A member that took a
   snapshot (or a scoped repair) from a member that had dropped an index kept the index,
   so a unique index the cluster had dropped went on refusing inserts on that one member,
