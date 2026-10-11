@@ -18576,6 +18576,13 @@ rather than watches one function.
 
 ## ADR-180 — A snapshot restore appends the entry behind each index definition it restores, and that entry is the definition as every member stores it
 
+> **Amended by [ADR-224](#adr-224--a-member-does-not-serve-a-window-across-history-it-holds-only-as-a-snapshots-state).**
+> A member that caught up by snapshot now refuses a peer whose window would begin below
+> the history it holds only as state, so the re-logged entry this record appends is no
+> longer what a peer behind the grant is served: that peer is told `BeyondHorizon` and
+> asks elsewhere or takes the snapshot, which carries the definition. The entry is
+> still appended and still correct; it serves a peer at or above the grant.
+
 **Decision.** When a snapshot page restores an index definition that carries
 its creation stamp, the receiver **rebuilds the `CreateIndex` entry the origin
 logged for it and appends it**, at the **origin's own stamp**, in the
@@ -25864,3 +25871,136 @@ once a query has arrived, stops in under four seconds and exits 0 (a blocking
 thread held for the stop turns it red: 11.9 s). Mutations: the seeds resolved one
 after another, the bound removed, and the resolver kept across lookups each fail
 their test.
+
+## ADR-224 — A member does not serve a window across history it holds only as a snapshot's state
+
+**Decision.** A member that completes a whole-database snapshot records, per origin,
+the highest stamp the grant raised its servable vector over and holds **no entries
+for** (`state_held:<node id>` rows in `META`, written in the transaction that applies
+the grant). The horizon check treats that record as it treats what retention
+collected: a requester whose window would begin below it, at an origin where the
+member is ahead of it, is answered `BeyondHorizon`. A requester that sends no vector
+is judged by `from` against the highest of them. The check is the one every serve site
+goes through (a pull, a replay's serve, a schema change's confirmation push).
+
+**Why.** ADR-169 defines the servable vector as "this node can serve a contiguous
+window containing this". A whole-database snapshot raises it over a span the oplog
+holds only the documents of: ADR-167 re-logs a document it holds, ADR-180 an index
+definition, and nothing else is there. A collection drop, a vector configuration, an
+index drop, a delete the member never held: all state, no entry. The horizon check
+(`lacks_collected`) is computed from what retention *collected*, so it could not see
+a span that was never held, and a peer behind the grant was served the documents
+without the changes beside them, witnessed past them, and never asked again. Nothing
+errored and nothing was counted (found 2026-09-17; swept 2026-09-20 and again in
+0.46.0 through real rounds and the member's own loop: vector configuration on and
+off, collection drop, an index drop and a delete the member never held fail on main;
+an empty collection's creation is healed by the loop's existence check).
+
+**What this closes and what it does not.** It closes the kinds a snapshot can *say*:
+a vector configuration turned on, a collection drop, a collection creation. The
+refused peer takes the snapshot, which carries them. It does not close the kinds a
+page cannot say yet (an index drop, a vector configuration turned off, a delete a
+member never held): a snapshot, the origin's included, does not convey them either.
+Those are their own records.
+
+**Where it lives: `META`, and no new table.** `OPLOG_COLLECTED` was tried first, as a
+one-line change to the grant. It closed the three kinds and broke change-stream resume
+(`a_token_for_a_write_a_snapshot_superseded_resumes_without_a_gap`): resume, rewind and
+webhook delivery read `collected` as "retention removed this" and would refuse
+tokens a snapshot never invalidated. A table of its own would be a new backup tag, and
+`restore` refuses a tag it does not know, so every 0.46 backup would stop restoring on
+0.45. `META` rows are carried by a backup and restored whatever their key, and a build
+that does not know them never reads them, as `vector_rescan:<collection>` already
+shows. It cannot be re-derived at open as `OPLOG_COLLECTED` can, so a restore must
+keep it, and does. **No `SCHEMA_VERSION` bump, no rollback boundary, no wire change.**
+
+**The record is one maximum per origin, so it is conservative.** A requester behind
+the member's own prefix of the origin is refused too, though the prefix could be served.
+Holes taken before 0.46.0, or on 0.45.0 after a rollback, are not known; the only safe
+seed ("everything is a hole") would send every member behind a peer to a snapshot in
+the roll. Documented in `operations.md`.
+
+**A refused member does not snapshot at once.** `BeyondHorizon` meant a whole-database
+snapshot from that peer, at once. For a hole that is wrong more often than for
+retention: a member that is merely behind a peer's grant is usually servable by entries
+by the origin or another peer, and a rolling restart makes exactly that shape (n1
+snapshots from n2 while n3 is down; n3 returns below n1's hole). So on an ordinary
+pull (not a repair, not a snapshot already resuming) the first `BeyondHorizon` in a tick
+is **set aside**: no snapshot, no divergence check, no position, no catching-up mark,
+and the peer is not counted as reached (a reached peer is one that answered the pull).
+The tick goes on with its other contacts; if none is left, up to two live peers that
+were not chosen and are not backing off are added. The set-aside peer is asked again
+**after** everything else, a truncated contact still draining included. It serves, and
+there is no snapshot; or it answers `BeyondHorizon` again, and the snapshot is taken.
+A second refusal in the same tick, or in any later one, is a snapshot at once. A peer
+not asked again because the tick's budget ran out is carried to the next tick and
+contacted first. So the snapshot is at most **one tick late**, whatever the other
+contacts did. With no other contact to wait for and no extra peer, there is no
+set-aside. A bare `sync_once` has no tick and snapshots at once. The catching-up mark
+(ADR-202) is therefore written when the snapshot starts and not at the first refusal;
+this is intended. Retention refusals take the same path, so a member some peer can
+serve by entries gets entries instead of a snapshot, and one past every peer's horizon
+snapshots in the same tick.
+
+**The server says which refusal it was.** The wire carries no reason, and gets none. The refusing
+member counts `kimmy_sync_horizon_state_held_total` and logs at `WARN`, no more than once a minute
+per requesting member, that it refused across a hole and not retention. It does so at **every
+site that refuses**: the listener's pull, the replay it serves a restored member (`serve_replay`),
+and the confirmation push of a schema change; each answers the same `BeyondHorizon` (or leaves the
+member to anti-entropy), and only this side knows which kind it was. The asking side's messages
+(`replay_own_origin`, the push's `unreached`) are neutral.
+
+**A deferral nobody settled expires.** A peer is set aside in a tick and owed a second ask in that
+tick or the next. An entry older than that is stale, ignored, and removed: the contact failed, or the
+peer fell out of the tick's choice, and a later refusal is a new episode, set aside again if there is
+someone to ask first. Before the expiry a stale entry turned an unrelated refusal, many ticks on, into
+a snapshot at once. A window answer, or a member that is level with the peer, settles it at once.
+
+**The request with no vector.** `held: None` is sent by this build's `Repair::Replay`
+and by a requester older than ADR-097. Both ask for every origin's entries from
+`from`, so refusing when `from` is below the highest hole is conservative for them
+(its cost is a snapshot) and is the rule retention's coarse horizon applies to the
+same request.
+
+**Alternatives.**
+- *Raise `OPLOG_COLLECTED`.* Above.
+- *A table and a backup tag.* Above.
+- *Cap the window's coverage at the contiguous prefix* and serve the rest: avoids the
+  snapshot for a lagging member, but changes what an exhausted window's vector means
+  on every pull (ADR-148, ADR-169). Not taken.
+- *Re-log everything the page carries* (ADR-180's way): needs a stamp the page does not
+  carry for most kinds, and for a delete the `_id` no member keeps, so a new entry shape
+  an older peer cannot decode.
+
+**Tests.** `kimmy-storage`: a whole-database snapshot records the hole and a requester
+below it is refused as the hole's and not retention's, at or above it served, and the
+scalar rule; a node that never took one serves as before; retention's answer wins when
+both apply; the hole is only what the grant raised over (a snapshot over what entries
+already gave records none) and is conservative, said in the test; an unfinished snapshot
+and a scoped repair record none; it survives a restart and a backup's restore.
+`kimmy-cluster`, through real rounds and the member's own loop: a vector configuration
+turned on, a collection drop and an empty collection's creation reach a member behind a
+snapshot-caught-up peer (red on main), with their controls; a member refused for a hole is
+served by the origin and takes **no** snapshot (the peer was asked first and counted the
+refusal); a member past every peer's horizon snapshots in the same tick; a member with one
+peer snapshots at once; a refusing peer is asked again after the other contacts, in the
+same tick (the interval is a minute); a set-aside peer is snapshotted within two ticks
+though the other contact never answers, and is contacted first in the next tick though
+one contact a tick would rotate away from it, counted in ticks and not seconds; a deferral
+a window answer or a level member settled is not remembered, and one nobody settled expires; a
+repair is not set aside; a snapshot already resuming is not set aside; the set-aside round does
+nothing but say so and counts as reaching nobody; a hole is refused through two snapshot hops; a
+restored member's replay refused for a hole is not answered, is counted as the hole's, and is
+given up on after the wait; the replay a member serves a restored one, and a schema change's
+confirmation push, are counted as the hole's when they are refused for one. The mutations,
+nineteen, each fails a test: no set-aside; a refusal always set aside; a set-aside peer never asked
+again; never carried; a window answer, and a level member, not settling the deferral; a stale
+deferral never expiring; a repair set aside; a snapshot already resuming set aside; the round
+counted as reached; the set-aside allowed with nobody to wait for; a refused replay, push and pull
+not counted; the hole not recorded; recorded when nothing was raised over; the verdict or the
+scalar rule ignoring the hole; the pull arm serving a hole.
+
+**The rollback check.** A backup taken on this build with a recorded hole was restored by
+a 0.45.0 `kimmyd restore` (the record is a `META` row and the restore copies it), and the
+store started, answered `/readyz` and stopped clean; a store this build wrote with the row
+was opened by 0.45.0 the same way (`kimmy.format` unchanged: schema 4, redb 4.3).

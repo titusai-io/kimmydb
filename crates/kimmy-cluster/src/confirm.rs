@@ -645,14 +645,22 @@ impl Confirmer {
         let Some(from) = held.behind(&mine) else {
             return PushResult::NothingSent { their_node, unreached: None };
         };
-        match self.engine.can_serve_peer_holding(&held) {
-            Ok(true) => {}
-            Ok(false) => {
+        match self.engine.serve_verdict(&held) {
+            Ok(kimmy_storage::ServeVerdict::Serve) => {}
+            Ok(verdict) => {
+                // A hole is counted and said here as the listener does for a pull
+                // (ADR-224): the member is left for anti-entropy either way, and only
+                // this side knows it was not retention.
+                if verdict == kimmy_storage::ServeVerdict::StateHeld {
+                    self.engine.note_state_held_refusal();
+                    crate::transport::say_state_held_refusal(&self.engine, their_node);
+                }
                 return PushResult::NothingSent {
                     their_node,
                     unreached: Some(
-                        "the member is below this node's retention horizon; anti-entropy will \
-                         hand it a snapshot"
+                        "the member is below what this node can serve (its retention horizon, or \
+                         history it holds only as a snapshot's state); anti-entropy will hand it a \
+                         snapshot or serve it by entries from another member"
                             .into(),
                     ),
                 };

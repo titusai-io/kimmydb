@@ -108,6 +108,10 @@ pub struct Engine {
     /// page's result: a page can fail after its definitions committed, and a
     /// count carried on a result that is never returned would be lost.
     ddl_relogged: std::sync::atomic::AtomicU64,
+    /// Windows this node refused a peer because they would have crossed history it
+    /// holds only as a snapshot's state (ADR-224), since start. Counted by the
+    /// listener when it answers, not by the check, which push and replay also ask.
+    state_held_refusals: std::sync::atomic::AtomicU64,
     /// Durable write transactions committed, since start.
     ///
     /// redb has a single writer and every commit is an fsync, so the number of
@@ -1384,6 +1388,7 @@ impl Engine {
             unkeyed_writes: std::sync::atomic::AtomicU64::new(0),
             undecidable_writes: std::sync::atomic::AtomicU64::new(0),
             ddl_relogged: std::sync::atomic::AtomicU64::new(0),
+            state_held_refusals: std::sync::atomic::AtomicU64::new(0),
             commits: std::sync::atomic::AtomicU64::new(0),
             multi_chunk_docs: std::sync::atomic::AtomicUsize::new(
                 crate::modify::DEFAULT_MULTI_CHUNK_DOCS,
@@ -1962,6 +1967,19 @@ impl Engine {
     /// oplog since start, so that it can serve them onward (ADR-180).
     pub fn ddl_relogged(&self) -> u64 {
         self.ddl_relogged.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// How many windows this node has refused a peer since start because they
+    /// would have crossed history it holds only as the state a snapshot gave it
+    /// (ADR-224). A refusal for retention is not counted here.
+    pub fn state_held_refusals(&self) -> u64 {
+        self.state_held_refusals.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Count one refusal [`Self::state_held_refusals`] counts: the listener's, when
+    /// it answers a pull `BeyondHorizon` for a hole.
+    pub fn note_state_held_refusal(&self) {
+        self.state_held_refusals.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     }
 
     /// How many durable write transactions have committed since start.
@@ -2760,6 +2778,58 @@ impl Engine {
         Ok(())
     }
 
+    /// Per origin, the highest stamp a whole-database snapshot granted this node
+    /// over history it holds as state and has no oplog entries for (ADR-224).
+    ///
+    /// A peer asking for a window that begins below one of these, at that origin,
+    /// cannot be served a contiguous one: the entries between are not here. One
+    /// maximum per origin, so it is conservative: a peer behind this node's own
+    /// prefix of the origin is refused too, though the prefix could be served.
+    /// Empty on a node that never took a whole-database snapshot, and for a
+    /// snapshot taken by a build before 0.46.0, which did not record it.
+    pub fn state_held(&self) -> Result<kimmy_core::VersionVector> {
+        let txn = self.db.begin_read()?;
+        let meta = txn.open_table(tables::META)?;
+        let mut out = kimmy_core::VersionVector::new();
+        for row in meta.range(tables::META_STATE_HELD_PREFIX..tables::META_STATE_HELD_END)? {
+            let (key, value) = row?;
+            let node = key
+                .value()
+                .strip_prefix(tables::META_STATE_HELD_PREFIX)
+                .and_then(|node| node.parse::<NodeId>().ok())
+                .ok_or_else(|| StorageError::Corrupt("a state_held key is not a node id".into()))?;
+            out.insert(node, decode_hlc(value.value())?);
+        }
+        Ok(out)
+    }
+
+    /// Record that a grant to `stamp` raises this node's servable vector over
+    /// history it holds no entries for, if it does: the grant is above the
+    /// servable vector now, in the caller's transaction. Only ever raises.
+    fn record_state_held_in_txn(txn: &redb::WriteTransaction, stamp: &Stamp) -> Result<bool> {
+        let servable = {
+            let versions = txn.open_table(tables::OPLOG_VERSIONS)?;
+            let current = versions.get(stamp.node.to_bytes().as_slice())?;
+            match current {
+                Some(current) => decode_hlc(current.value())?,
+                None => Hlc::ZERO,
+            }
+        };
+        if stamp.hlc <= servable {
+            return Ok(false);
+        }
+        let key = format!("{}{}", tables::META_STATE_HELD_PREFIX, stamp.node);
+        let mut meta = txn.open_table(tables::META)?;
+        let higher = match meta.get(key.as_str())? {
+            Some(held) => stamp.hlc > decode_hlc(held.value())?,
+            None => true,
+        };
+        if higher {
+            meta.insert(key.as_str(), stamp.hlc.to_bytes().as_slice())?;
+        }
+        Ok(higher)
+    }
+
     /// Record coverage granted by a snapshot.
     ///
     /// Merged rather than replaced, so writes this node made that the sender
@@ -2791,6 +2861,10 @@ impl Engine {
         let mut raised = false;
         for (node, hlc) in granted.iter() {
             let stamp = Stamp::new(hlc, node);
+            // What this raises the servable vector over, and has no entries for,
+            // is a hole in what this node can serve (ADR-224): recorded before
+            // the raise, in the same transaction, from the vector as it stood.
+            raised |= Self::record_state_held_in_txn(txn, &stamp)?;
             raised |= raise_version(txn, tables::OPLOG_VERSIONS, &stamp)?;
             raised |= raise_version(txn, tables::OPLOG_WITNESSED, &stamp)?;
         }

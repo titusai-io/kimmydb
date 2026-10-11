@@ -134,6 +134,30 @@ impl PeerHealth {
         chosen
     }
 
+    /// Up to `n` live peers that are not backing off and not in `excluded`,
+    /// without moving the rotation: the ones a tick could add to its contacts when
+    /// one of them has set aside its snapshot (ADR-224). Which of them comes first
+    /// follows the rotation, so the extras differ from tick to tick as the chosen do.
+    pub fn extras(
+        &self,
+        peers: &BTreeSet<SocketAddr>,
+        excluded: &BTreeSet<SocketAddr>,
+        now: Instant,
+        n: usize,
+    ) -> Vec<SocketAddr> {
+        let ready: Vec<SocketAddr> = peers
+            .iter()
+            .copied()
+            .filter(|peer| !excluded.contains(peer))
+            .filter(|peer| self.state.get(peer).is_none_or(|s| s.next_attempt <= now))
+            .collect();
+        if ready.is_empty() {
+            return Vec::new();
+        }
+        let start = self.cursor % ready.len();
+        (0..n.min(ready.len())).map(|i| ready[(start + i) % ready.len()]).collect()
+    }
+
     /// Record a round that worked.
     pub fn succeeded(&mut self, peer: SocketAddr) {
         self.state.remove(&peer);

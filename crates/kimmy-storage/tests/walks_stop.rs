@@ -92,6 +92,10 @@ const BOUNDED_READS: &[(&str, &str)] = &[
     ),
     ("divergence::next_probe", "an in-memory set's range, not a table"),
     (
+        "engine::Engine::state_held",
+        "the metadata keys of one prefix: one row per origin a snapshot raised the servable vector over, a few in a cluster, read per pull served",
+    ),
+    (
         "vectors::Engine::vector_rescans",
         "the metadata keys of one prefix: one row per collection that owes a scan, read at a start",
     ),

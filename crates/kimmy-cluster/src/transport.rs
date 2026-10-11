@@ -492,6 +492,38 @@ fn dial_refused(check: impl Fn(&DialRefusal) -> bool) -> bool {
     TEST_REFUSE_DIAL.read().is_ok_and(|refused| refused.iter().any(check))
 }
 
+/// Say, at `WARN` and no more than once a minute per requesting member, that a window was
+/// refused because this node holds the history only as a snapshot's state (ADR-224).
+///
+/// The peer is told `BeyondHorizon`, which for retention reads as "storage
+/// retention should be the same on every member". That is not the reason here, and
+/// only this side knows which it is.
+pub(crate) fn say_state_held_refusal(engine: &Engine, peer: NodeId) {
+    static LAST: std::sync::Mutex<Vec<(NodeId, Instant)>> = std::sync::Mutex::new(Vec::new());
+    let now = Instant::now();
+    let due = {
+        let mut last = LAST.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        last.retain(|(_, at)| now.duration_since(*at) < Duration::from_secs(60));
+        match last.iter().any(|(node, _)| *node == peer) {
+            true => false,
+            false => {
+                last.push((peer, now));
+                true
+            }
+        }
+    };
+    if due {
+        let held = engine.state_held().map(|held| format!("{held:?}")).unwrap_or_default();
+        warn!(
+            %peer,
+            state_held = %held,
+            "refused a peer a window across history this member holds only as the state a \
+             snapshot gave it (not retention); the peer is told BeyondHorizon and will ask \
+             another member or take a snapshot"
+        );
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 pub async fn serve_with(
     engine: Arc<Engine>,
@@ -900,12 +932,22 @@ where
                 // is not a gap if everything under it is the peer's own
                 // coverage — and by the threshold alone for a peer that did
                 // not (ADR-097).
-                let servable = match &held {
-                    Some(held) => engine.can_serve_peer_holding(held),
-                    None => engine.can_serve_from_oplog(from),
+                //
+                // Two reasons a window is unservable, one answer on the wire: retention
+                // removed an entry the peer lacks, or this node never held it because a
+                // whole-database snapshot gave it the state (ADR-224). The second is
+                // counted and said here, where the reason is known, because the peer
+                // cannot tell.
+                let verdict = match &held {
+                    Some(held) => engine.serve_verdict(held),
+                    None => engine.serve_verdict_from(from),
                 }
                 .map_err(|e| ProtocolError::Local(e.to_string()))?;
-                if !servable {
+                if verdict != kimmy_storage::ServeVerdict::Serve {
+                    if verdict == kimmy_storage::ServeVerdict::StateHeld {
+                        engine.note_state_held_refusal();
+                        say_state_held_refusal(engine, peer);
+                    }
                     write_frame(&mut stream, &Message::BeyondHorizon {}).await?;
                     continue;
                 }
@@ -1465,17 +1507,19 @@ where
                 match catch_up.replay_beyond_horizon(their_node, std::time::Instant::now()) {
                     crate::catchup::Horizon::First => warn!(
                         %peer,
-                        "the peer has collected the oplog this member's replay asks from, so it \
-                         cannot say what it holds of this member's own origin; the replay stays \
-                         owed and asks again next round"
+                        "the peer cannot serve the oplog this member's replay asks from (it was \
+                         collected, or the peer holds that history only as a snapshot's state), \
+                         so it cannot say what it holds of this member's own origin; the replay \
+                         stays owed and asks again next round"
                     ),
                     crate::catchup::Horizon::Again => {}
                     crate::catchup::Horizon::GaveUp => warn!(
                         %peer,
                         "the peer has answered this member's replay with a horizon for the whole \
-                         catch-up wait; the replay stops asking it (the members may keep the oplog \
-                         for different times: storage.oplog_retention_secs should be the same on \
-                         every member)"
+                         catch-up wait; the replay stops asking it (either the members keep the \
+                         oplog for different times, so storage.oplog_retention_secs should be the \
+                         same on every member, or the peer holds that history only as the state a \
+                         snapshot gave it: its own log says which)"
                     ),
                 }
                 return Ok(());
@@ -1831,10 +1875,17 @@ where
             held.insert(node, kimmy_core::Hlc::MAX);
         }
         held.insert(their_node, from);
-        let servable = engine
-            .can_serve_peer_holding(&held)
-            .map_err(|e| from_storage(e, ProtocolError::Local))?;
-        let (entries, exhausted, horizon, scanned_to) = if !servable {
+        let verdict =
+            engine.serve_verdict(&held).map_err(|e| from_storage(e, ProtocolError::Local))?;
+        if verdict == kimmy_storage::ServeVerdict::StateHeld {
+            // As the listener does for a pull (ADR-224): counted and said here, because
+            // the peer is told a horizon and cannot tell which kind.
+            engine.note_state_held_refusal();
+            say_state_held_refusal(engine, their_node);
+        }
+        let (entries, exhausted, horizon, scanned_to) = if verdict
+            != kimmy_storage::ServeVerdict::Serve
+        {
             (Vec::new(), false, true, from)
         } else {
             if ours.get(their_node) <= from {
@@ -2103,6 +2154,7 @@ where
         // A whole-database snapshot left to resume with this peer is moot:
         // the position says there is nothing below the horizon to pull.
         stalls.snapshot_forgotten(their_node, None);
+        stalls.horizon_resolved(their_node);
         let position = stalls.position(their_node, processed, &mine, &theirs, probe.as_ref());
         let gate = divergence_probe_for(probe, position);
         let findings = ask_divergence(engine, stream, gate.probe).await?;
@@ -2193,6 +2245,12 @@ where
         };
         write_frame(stream, &retry).await?;
         answer = read_frame(stream).await?;
+    }
+
+    // Answered with a window (or with nothing to give because this member is
+    // level): whatever was set aside for this peer is settled (ADR-224).
+    if !matches!(answer, Message::BeyondHorizon {}) {
+        stalls.horizon_resolved(their_node);
     }
 
     // Whether this round's own pull reached the peer's true tail — the
@@ -2468,6 +2526,30 @@ where
                 Some((collection, Repair::Snapshot)) => Some(collection),
                 _ => None,
             };
+            // An ordinary pull refused by a peer is set aside once rather than
+            // answered with a whole-database snapshot at once (ADR-224): the
+            // peer may only hold a hole, and another member may serve this one by
+            // entries. Not a repair (its snapshot is the point), and not a pull
+            // already resuming a snapshot (it is part-way through one).
+            if repair.is_none()
+                && !stalls.snapshot_resumes(their_node, None)
+                && stalls.horizon_decision(their_node) == HorizonDecision::Defer
+            {
+                info!(
+                    %peer,
+                    "the peer cannot serve this member a window; its snapshot waits for the \
+                     tick's other contacts to serve it first"
+                );
+                // Nothing else of the round happened: no pull, no divergence
+                // check, no position, and the peer is not counted as reached for
+                // the catching-up marker: what this contact read of it is dropped.
+                stalls.reached_candidates.clear();
+                return Ok(SyncOutcome {
+                    peer: Some(their_node),
+                    horizon_deferred: true,
+                    ..SyncOutcome::default()
+                });
+            }
             if repair.is_none() && !stalls.snapshot_resumes(their_node, None) {
                 warn!(%peer, "behind the peer's retention horizon; falling back to a snapshot");
             }
@@ -2844,6 +2926,26 @@ pub struct PeerStalls {
     /// its apply still reports what the apply refused, declined and skipped
     /// (ADR-177).
     applied: AppliedCounts,
+    /// Peers whose `BeyondHorizon` this member set aside rather than answer with a
+    /// snapshot, and the tick each was set aside in (ADR-224). A peer is here from
+    /// the moment it is set aside until a round with it is answered with a window.
+    horizon_deferred: HashMap<NodeId, u64>,
+    /// The tick the loop is in, for [`Self::horizon_decision`]. `0` for a bare
+    /// `sync_once`, which has no tick.
+    deferral_tick: u64,
+    /// Whether the contact about to run may be set aside: the loop says so when
+    /// another contact is waiting in the tick or a peer can be added to it.
+    /// `false` for a bare `sync_once`, which snapshots at once.
+    deferral_open: bool,
+}
+
+/// What a round does when its peer answers `BeyondHorizon` to an ordinary pull.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum HorizonDecision {
+    /// Take the whole-database snapshot from this peer now.
+    Snapshot,
+    /// Set the peer aside; the tick's other contacts get this member first.
+    Defer,
 }
 
 /// The counts a committed apply produced that a round's report carries.
@@ -3079,6 +3181,59 @@ impl PeerStalls {
     ) {
         self.local_facts = facts;
         self.local_gen = generation;
+    }
+
+    /// The tick the replication loop is in, so that [`Self::horizon_decision`] can
+    /// tell a peer set aside in this tick from one set aside in an earlier one.
+    pub fn begin_tick(&mut self, tick: u64) {
+        self.deferral_tick = tick;
+    }
+
+    /// Whether the contact about to run may have its `BeyondHorizon` set aside
+    /// (ADR-224). The loop says yes when another contact is waiting in the tick, or
+    /// a live peer that is not backing off can be added to it; with nobody else to
+    /// try, a snapshot now is what a single-peer cluster does and what this must be.
+    pub fn allow_horizon_deferral(&mut self, open: bool) {
+        self.deferral_open = open;
+    }
+
+    /// What to do with a `BeyondHorizon` from `node` to an ordinary pull.
+    ///
+    /// **Bounded.** A peer is set aside once, then asked again after the tick's
+    /// other contacts; if it answers `BeyondHorizon` again, in that tick or the next,
+    /// the snapshot is taken. So the snapshot is at most one tick late, whatever the
+    /// other contacts did, and a peer set aside in a tick that ended before the second
+    /// ask is snapshotted on its next contact. An entry older than that is stale and
+    /// ignored.
+    fn horizon_decision(&mut self, node: NodeId) -> HorizonDecision {
+        // A peer set aside in this tick or the one before is still owed its second ask.
+        // One set aside longer ago was never settled (the contact failed, or the peer
+        // fell out of the tick's choice): that episode is over, and this refusal is a
+        // new one, set aside again if there is someone to ask first. Without the
+        // expiry a failed contact left a stale entry that turned a later, unrelated
+        // refusal into a snapshot at once.
+        let standing = self.horizon_deferred.get(&node).copied();
+        let live = standing.is_some_and(|set| self.deferral_tick <= set.saturating_add(1));
+        match (live, self.deferral_open) {
+            (true, _) => {
+                self.horizon_deferred.remove(&node);
+                HorizonDecision::Snapshot
+            }
+            (false, true) => {
+                self.horizon_deferred.insert(node, self.deferral_tick);
+                HorizonDecision::Defer
+            }
+            (false, false) => {
+                self.horizon_deferred.remove(&node);
+                HorizonDecision::Snapshot
+            }
+        }
+    }
+
+    /// A round with `node` was answered with a window: whatever was set aside for
+    /// it is settled.
+    fn horizon_resolved(&mut self, node: NodeId) {
+        self.horizon_deferred.remove(&node);
     }
 
     /// Hand the rounds the catching-up marker.

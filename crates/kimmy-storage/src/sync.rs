@@ -271,6 +271,12 @@ pub struct SyncOutcome {
     /// batch had stopped at a collection this node lacks. Set only by
     /// `kimmy-cluster`'s `sync_once`, like `exhausted`.
     pub repairing: bool,
+    /// The peer answered `BeyondHorizon` and this round did **not** take a
+    /// snapshot from it: it was set aside so the tick's other contacts could serve
+    /// this member first (ADR-224). Nothing else in the outcome is meaningful: the
+    /// round did not pull, did not check for divergence and did not reach the
+    /// peer for the catching-up marker. Set only by `kimmy-cluster`'s `sync_once`.
+    pub horizon_deferred: bool,
     /// How long applying this batch waited for the single writer, over
     /// every time it took it (ADR-175): each run's transaction, each schema
     /// change it recorded, and the shared flush a coalesced commit waits on.
