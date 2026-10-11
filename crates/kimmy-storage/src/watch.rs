@@ -409,6 +409,14 @@ impl Engine {
                 }) {
                     return Err(expired());
                 }
+                // And a span this member holds only as the state a snapshot gave it
+                // (ADR-224): the events inside it, a delete of a document it never held
+                // among them, are not here to send, and nothing says the client was sent
+                // them. Only what the client's own vector covers is safe.
+                if self.state_held()?.iter().any(|(origin, hlc)| hlc > issued.delivered.get(origin))
+                {
+                    return Err(expired());
+                }
                 Ok(Opened {
                     start: self.first_arrival_beyond(&issued.delivered, walked)?,
                     delivered: issued.delivered.clone(),
@@ -417,6 +425,12 @@ impl Engine {
             }
             None => {
                 let start = match held {
+                    // Held here, but a token naming an entry a member holds says nothing
+                    // about the events above it that this member lacks: retention may have
+                    // collected some (an old entry that arrived late can be held, with the
+                    // collected range above it), and a snapshot's hole holds none. Both are
+                    // refused for a held token as for one not held.
+                    Some(_) if self.stamp_beyond_the_horizon(&stamp)? => return Err(expired()),
                     Some(seq) => seq + 1,
                     None if self.stamp_collected(&stamp)? => return Err(expired()),
                     None => self.first_arrival_stamped_after(0, stamp, walked)?,
@@ -498,16 +512,56 @@ impl Engine {
         }
     }
 
-    /// Whether retention has collected past `stamp`: it is older than the
-    /// oldest entry the oplog retains.
+    /// Whether `stamp` is older than what this member can resume from: it is
+    /// older than the oldest entry the oplog retains, **or** retention has
+    /// collected an entry above it.
+    ///
+    /// The second test is the recorded horizon, per origin, capped at what this
+    /// member witnessed of the origin (the record is seeded from the coarse
+    /// horizon on a database an earlier build collected from, which can put a
+    /// quiet origin above anything it wrote; the vector-token branch of
+    /// `resume_point` caps it the same way). The first test alone is the oplog's
+    /// *first key*, and an entry stamped before everything retention collected
+    /// can arrive late (a delete of a document this member never held, by
+    /// entries) and become it, which lowers the bar: a token inside the
+    /// collected range then read as "not collected" and resumed with the
+    /// events retention removed skipped, silently. The record is raised in the
+    /// transaction that removes the entries and only moves forward, so a late
+    /// arrival cannot lower it (ADR-173's addendum).
     fn stamp_collected(&self, stamp: &Stamp) -> Result<bool> {
-        let txn = self.db().begin_read()?;
-        let oplog = txn.open_table(tables::OPLOG)?;
-        Ok(match oplog.first()? {
-            Some((oldest, _)) => *stamp < codec::decode_oplog_key(oldest.value())?,
-            // An empty log cannot have collected anything.
-            None => false,
-        })
+        let below_the_oldest = {
+            let txn = self.db().begin_read()?;
+            let oplog = txn.open_table(tables::OPLOG)?;
+            match oplog.first()? {
+                Some((oldest, _)) => *stamp < codec::decode_oplog_key(oldest.value())?,
+                // An empty log cannot have collected anything.
+                None => false,
+            }
+        };
+        if below_the_oldest {
+            return Ok(true);
+        }
+        self.stamp_beyond_the_horizon(stamp)
+    }
+
+    /// Whether this member lacks events above `stamp` that retention collected or that it
+    /// holds only as a snapshot's state: for some origin, the recorded collected stamp
+    /// (capped at what was witnessed of the origin) or the hole is above it. Equal is not
+    /// above: the client has seen that event.
+    fn stamp_beyond_the_horizon(&self, stamp: &Stamp) -> Result<bool> {
+        let witnessed = self.witnessed_vector()?;
+        if self
+            .oplog_collected()?
+            .iter()
+            .any(|(origin, hlc)| Stamp::new(hlc.min(witnessed.get(origin)), origin) > *stamp)
+        {
+            return Ok(true);
+        }
+        // A span held only as a snapshot's state is as unservable as one retention took:
+        // the oplog's first key can sit below it (the snapshot's documents are entries at
+        // their own old stamps), and the events inside it, a delete of a document this
+        // member never held among them, are not here to send.
+        Ok(self.state_held()?.iter().any(|(origin, hlc)| Stamp::new(hlc, origin) > *stamp))
     }
 
     /// The first arrival position whose entry is stamped at or after `at`.
@@ -2563,9 +2617,13 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn a_token_for_a_write_a_snapshot_superseded_resumes_without_a_gap() {
-        let (a, coll, _da) = setup();
+    /// `a` wrote `x` (the write the token names), then, while the client was away,
+    /// replaced it and wrote `z`; `b` is built from `a`'s snapshot, which carries `x` as
+    /// it is now and never the version the token names. Returns `a`, `b`, the token
+    /// `a` issued at `x`, and the collection.
+    async fn a_member_built_from_a_snapshot_of_a_write_after_the_token()
+    -> (Engine, Engine, ResumeToken, CollectionMeta, tempfile::TempDir, tempfile::TempDir) {
+        let (a, coll, da) = setup();
         let dir = tempfile::tempdir().unwrap();
         let b = Engine::open(&dir.path().join("kimmy.redb")).unwrap();
 
@@ -2574,8 +2632,6 @@ mod tests {
         let (_, token) = next_change(&a, &mut on_a).await;
         drop(on_a);
 
-        // Written while the client is away. B is built from A's snapshot, which
-        // carries x as it is now and never the version the token names.
         a.replace(
             &coll,
             &kimmy_core::DocId::String("x".into()),
@@ -2589,17 +2645,56 @@ mod tests {
             let page = a.snapshot_page(progress.after().cloned(), progress.scope()).unwrap();
             b.apply_snapshot_page(a.node_id(), &mut progress, &page).unwrap();
         }
+        (a, b, token, coll, da, dir)
+    }
 
-        let mut on_b = b
+    #[tokio::test]
+    async fn a_token_below_a_span_a_snapshot_gave_a_member_as_state_is_refused() {
+        // Was `..._resumes_without_a_gap`: the client got the current version of every
+        // document above its token. That is convergence of versions, not delivery of
+        // events: a delete of a document the member never held, and every intermediate
+        // version, are not here to send, and nothing says the client was sent them
+        // (ADR-173's addendum, ADR-224). The client re-lists.
+        let (_a, b, token, _coll, _da, _dir) =
+            a_member_built_from_a_snapshot_of_a_write_after_the_token().await;
+        assert!(!b.state_held().unwrap().is_empty(), "premise: b holds the span as state");
+
+        let refused = b.watch(
+            WatchScope::Cluster,
+            WatchOptions { resume_after: Some(token), ..Default::default() },
+        );
+
+        assert!(
+            matches!(
+                refused.err(),
+                Some(StorageError::Core(kimmy_core::Error::ResumeTokenExpired))
+            ),
+            "a token below the span must be refused"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_token_whose_vector_covers_the_span_resumes_on_the_member_built_from_the_snapshot() {
+        // The same member, a client that had already read everything the snapshot
+        // summarised: its vector covers the hole, so nothing the member holds only as
+        // state lies above it. It resumes and receives what follows.
+        let (a, b, _stale, coll, _da, _dir) =
+            a_member_built_from_a_snapshot_of_a_write_after_the_token().await;
+        let covering =
+            ResumeToken::issued(newest_stamp(&a), a.node_id(), a.version_vector().unwrap());
+        let cb = b.get_collection("app", "docs").unwrap();
+        assert_eq!(cb.id, coll.id, "premise: the same collection");
+        b.insert(&cb, doc! { "_id": "after" }).unwrap();
+
+        let mut stream = b
             .watch(
                 WatchScope::Collection(coll.id),
-                WatchOptions { resume_after: Some(token), ..Default::default() },
+                WatchOptions { resume_after: Some(covering), ..Default::default() },
             )
-            .expect("the token resumes on B");
-        let delivered = changes_until(&b, &mut on_b, &["x", "z"]).await;
-        assert_eq!(ids(&delivered), vec!["x", "z"]);
-        let x = delivered[0].document().unwrap().unwrap();
-        assert_eq!(x.get_i32("v").unwrap(), 2, "the version the client missed");
+            .expect("the token resumes on b");
+        let delivered = changes_until(&b, &mut stream, &["after"]).await;
+
+        assert_eq!(ids(&delivered), vec!["after"]);
     }
 
     #[tokio::test]
@@ -2661,6 +2756,390 @@ mod tests {
             .expect("the token resumes");
         let delivered = changes_until(&engine, &mut stream, &["after"]).await;
         assert_eq!(ids(&delivered), vec!["after"]);
+    }
+
+    fn first_retained_stamp(engine: &Engine) -> Stamp {
+        let txn = engine.db().begin_read().unwrap();
+        let oplog = txn.open_table(tables::OPLOG).unwrap();
+        let (key, _) = oplog.first().unwrap().expect("a non-empty oplog");
+        codec::decode_oplog_key(key.value()).unwrap()
+    }
+
+    #[tokio::test]
+    async fn a_single_stamp_token_inside_what_retention_collected_is_refused_after_an_old_entry_arrives()
+     {
+        // Retention has collected entries up to S1. An entry stamped before them then
+        // arrives (a delete of a document this member never held, by entries) and
+        // becomes the oplog's first, so "older than the oldest retained entry" no longer
+        // says where retention reached. A token inside what retention collected, above the old entry, names a span
+        // whose events retention removed: it must be refused, not resumed with a silent
+        // gap.
+        let (engine, coll, _dir) = setup();
+        let mut written = Vec::new();
+        for i in 0..3i64 {
+            engine.insert(&coll, doc! { "_id": i }).unwrap();
+            written.push(newest_stamp(&engine));
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        engine
+            .collect_garbage_at(
+                crate::engine::physical_now_ms() + 1_000_000_000,
+                crate::gc::RetentionPolicy::new(0, u64::MAX),
+            )
+            .unwrap();
+        // Retention keeps the origin's newest entry and collected the first write.
+        assert_eq!(first_retained_stamp(&engine), written[2], "premise");
+        let between = written[0];
+        let refused = |engine: &Engine| {
+            matches!(
+                engine
+                    .watch(
+                        WatchScope::Cluster,
+                        WatchOptions {
+                            resume_after: Some(ResumeToken::from_stamp(between)),
+                            ..Default::default()
+                        },
+                    )
+                    .err(),
+                Some(StorageError::Core(kimmy_core::Error::ResumeTokenExpired))
+            )
+        };
+        assert!(refused(&engine), "premise: refused while the first retained entry is above it");
+
+        let old = OplogEntry {
+            stamp: Stamp::new(Hlc::new(1_000, 0), NodeId::from_bytes([7; 16])),
+            kind: OpKind::Delete,
+            collection: coll.id,
+            doc_id: Some(kimmy_core::DocId::Int64(99)),
+            body: None,
+        };
+        engine.apply_batch(std::slice::from_ref(&old)).unwrap();
+        assert_eq!(first_retained_stamp(&engine), old.stamp, "premise: the old entry leads");
+
+        assert!(
+            refused(&engine),
+            "still refused: retention reached past it, whatever leads the log"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_single_stamp_token_above_everything_collected_still_resumes_after_an_old_entry_arrives()
+     {
+        // The recorded horizon only adds refusals where retention reached: a token above
+        // every collected stamp lost nothing and resumes, whatever leads the log.
+        let (engine, coll, _dir) = setup();
+        for i in 0..3i64 {
+            engine.insert(&coll, doc! { "_id": i }).unwrap();
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        engine
+            .collect_garbage_at(
+                crate::engine::physical_now_ms() + 1_000_000_000,
+                crate::gc::RetentionPolicy::new(0, u64::MAX),
+            )
+            .unwrap();
+        let newest = first_retained_stamp(&engine);
+        let above_the_collected = Stamp::new(newest.hlc.predecessor(), engine.node_id());
+        let old = OplogEntry {
+            stamp: Stamp::new(Hlc::new(1_000, 0), NodeId::from_bytes([7; 16])),
+            kind: OpKind::Delete,
+            collection: coll.id,
+            doc_id: Some(kimmy_core::DocId::Int64(99)),
+            body: None,
+        };
+        engine.apply_batch(std::slice::from_ref(&old)).unwrap();
+        assert_eq!(first_retained_stamp(&engine), old.stamp, "premise: the old entry leads");
+
+        assert!(
+            engine
+                .watch(
+                    WatchScope::Cluster,
+                    WatchOptions {
+                        resume_after: Some(ResumeToken::from_stamp(above_the_collected)),
+                        ..Default::default()
+                    },
+                )
+                .is_ok(),
+            "nothing above this token was collected"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_collected_record_above_what_was_witnessed_of_its_origin_refuses_nothing() {
+        // The record is seeded from the coarse horizon on a database an earlier build
+        // collected from, which can put an origin this member never saw above anything
+        // it wrote. Nothing of it above what was witnessed can have been collected.
+        let (engine, coll, _dir) = setup();
+        engine.insert(&coll, doc! { "_id": 1i64 }).unwrap();
+        let held = newest_stamp(&engine);
+        let stranger = Stamp::new(Hlc::new(u64::MAX / 2, 0), NodeId::from_bytes([9; 16]));
+        let txn = engine.begin_write(crate::engine::WriterHolder::Replication).unwrap();
+        crate::engine::raise_version(&txn, tables::OPLOG_COLLECTED, &stranger).unwrap();
+        txn.commit().unwrap();
+
+        let token = Stamp::new(held.hlc.predecessor(), held.node);
+        assert!(
+            engine
+                .watch(
+                    WatchScope::Cluster,
+                    WatchOptions {
+                        resume_after: Some(ResumeToken::from_stamp(token)),
+                        ..Default::default()
+                    },
+                )
+                .is_ok()
+        );
+    }
+
+    /// `a` wrote `old`, `y`, then deleted `y`, then wrote `z`; the client's tokens name
+    /// the insert of `y`. `a`'s oplog is intact when `keep_a_oplog`, else aged out and
+    /// `p` took `a`'s snapshot (so it holds the span as state and has no entry for the
+    /// delete of `y`). Returns the member the client resumes on, the bare and the
+    /// vector token at `y`.
+    fn a_client_that_saw_y_and_a_member_to_resume_on(
+        keep_a_oplog: bool,
+    ) -> (Engine, ResumeToken, ResumeToken, Stamp, tempfile::TempDir, tempfile::TempDir) {
+        let (a, coll, da) = setup();
+        a.insert(&coll, doc! { "_id": "old" }).unwrap();
+        a.insert(&coll, doc! { "_id": "y" }).unwrap();
+        let at_y = newest_stamp(&a);
+        let issued = ResumeToken::issued(at_y, a.node_id(), a.version_vector().unwrap());
+        assert!(a.delete(&coll, &kimmy_core::DocId::String("y".into())).unwrap());
+        a.insert(&coll, doc! { "_id": "z" }).unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        if keep_a_oplog {
+            return (a, ResumeToken::from_stamp(at_y), issued, at_y, da, dir);
+        }
+        a.collect_garbage_at(
+            crate::engine::physical_now_ms() + 1_000_000_000,
+            crate::gc::RetentionPolicy::new(0, u64::MAX),
+        )
+        .unwrap();
+        let p = Engine::open(&dir.path().join("kimmy.redb")).unwrap();
+        let mut progress = crate::SnapshotProgress::whole_database();
+        while !progress.is_complete() {
+            let page = a.snapshot_page(progress.after().cloned(), progress.scope()).unwrap();
+            p.apply_snapshot_page(a.node_id(), &mut progress, &page).unwrap();
+        }
+        assert!(!p.state_held().unwrap().is_empty(), "premise: p holds a hole");
+        (p, ResumeToken::from_stamp(at_y), issued, at_y, da, dir)
+    }
+
+    /// The document entries delivered to a client resuming with `token`, in a short window.
+    async fn resumed_with(engine: &Engine, token: ResumeToken) -> Result<Vec<String>> {
+        let mut stream = engine.watch(
+            WatchScope::Cluster,
+            WatchOptions { resume_after: Some(token), ..Default::default() },
+        )?;
+        let mut seen = Vec::new();
+        while let Ok(Some(event)) =
+            tokio::time::timeout(std::time::Duration::from_millis(400), stream.next(engine)).await
+        {
+            if let ChangeEvent::Change { entry, .. } = event
+                && entry.kind.is_document()
+            {
+                seen.push(format!("{:?}:{:?}", entry.kind, entry.doc_id));
+            }
+        }
+        Ok(seen)
+    }
+
+    fn is_expired<T: std::fmt::Debug>(outcome: &Result<T>) -> bool {
+        matches!(outcome, Err(StorageError::Core(kimmy_core::Error::ResumeTokenExpired)))
+    }
+
+    #[tokio::test]
+    async fn a_bare_stamp_token_inside_a_state_held_hole_is_refused() {
+        let (p, token, _issued, _at_y, _da, _dir) =
+            a_client_that_saw_y_and_a_member_to_resume_on(false);
+        let outcome = resumed_with(&p, token).await;
+        assert!(is_expired(&outcome), "a token inside a hole must be refused, got {outcome:?}");
+    }
+
+    #[tokio::test]
+    async fn a_vector_token_inside_a_state_held_hole_is_refused() {
+        let (p, _bare, issued, _at_y, _da, _dir) =
+            a_client_that_saw_y_and_a_member_to_resume_on(false);
+        let outcome = resumed_with(&p, issued).await;
+        assert!(is_expired(&outcome), "a token inside a hole must be refused, got {outcome:?}");
+    }
+
+    #[tokio::test]
+    async fn the_same_tokens_resume_on_the_member_whose_oplog_is_intact_and_get_the_delete() {
+        // The control: on `a`, with the delete an entry above both tokens, nothing is
+        // withheld, which is what the refusal above protects.
+        let (a, bare, issued, _at_y, _da, _dir) =
+            a_client_that_saw_y_and_a_member_to_resume_on(true);
+        for (name, token) in [("bare", bare), ("vector", issued)] {
+            let delivered = resumed_with(&a, token).await.unwrap_or_else(|e| panic!("{name}: {e}"));
+            assert!(
+                delivered.iter().any(|d| d.starts_with("Delete:") && d.contains("\"y\"")),
+                "{name}: the delete of y is delivered: {delivered:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn a_token_above_every_hole_stamp_still_resumes_on_a_member_that_holds_one() {
+        let (p, _bare, _issued, _at_y, _da, _dir) =
+            a_client_that_saw_y_and_a_member_to_resume_on(false);
+        let top = p.state_held().unwrap();
+        let (origin, hlc) = top.iter().next().expect("a hole");
+        let above = Stamp::new(hlc.successor(), origin);
+        let delivered = resumed_with(&p, ResumeToken::from_stamp(above)).await;
+        assert!(delivered.is_ok(), "nothing above this token is held only as state: {delivered:?}");
+    }
+
+    #[tokio::test]
+    async fn a_held_bare_token_inside_a_state_held_hole_is_refused() {
+        // The reviewer's probe: the token names an entry the member HOLDS (a live
+        // document the snapshot carried), with a delete of another document above it that
+        // the member never held.
+        let (a, coll, _da) = setup();
+        a.insert(&coll, doc! { "_id": "y" }).unwrap();
+        a.insert(&coll, doc! { "_id": "w" }).unwrap();
+        let at_w = newest_stamp(&a);
+        assert!(a.delete(&coll, &kimmy_core::DocId::String("y".into())).unwrap());
+        a.insert(&coll, doc! { "_id": "z" }).unwrap();
+        a.collect_garbage_at(
+            crate::engine::physical_now_ms() + 1_000_000_000,
+            crate::gc::RetentionPolicy::new(0, u64::MAX),
+        )
+        .unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let p = Engine::open(&dir.path().join("kimmy.redb")).unwrap();
+        let mut progress = crate::SnapshotProgress::whole_database();
+        while !progress.is_complete() {
+            let page = a.snapshot_page(progress.after().cloned(), progress.scope()).unwrap();
+            p.apply_snapshot_page(a.node_id(), &mut progress, &page).unwrap();
+        }
+        assert!(p.arrival_of(&at_w).unwrap().is_some(), "premise: p holds the entry at w");
+        assert!(!p.state_held().unwrap().is_empty(), "premise: and a hole above it");
+
+        let outcome = resumed_with(&p, ResumeToken::from_stamp(at_w)).await;
+
+        assert!(is_expired(&outcome), "a held token below a hole must be refused: {outcome:?}");
+    }
+
+    #[tokio::test]
+    async fn a_held_late_entry_with_collected_events_above_it_is_refused() {
+        let (engine, coll, _dir) = setup();
+        let mut written = Vec::new();
+        for i in 0..3i64 {
+            engine.insert(&coll, doc! { "_id": i }).unwrap();
+            written.push(newest_stamp(&engine));
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        engine
+            .collect_garbage_at(
+                crate::engine::physical_now_ms() + 1_000_000_000,
+                crate::gc::RetentionPolicy::new(0, u64::MAX),
+            )
+            .unwrap();
+        let late = OplogEntry {
+            stamp: Stamp::new(Hlc::new(1_000, 0), NodeId::from_bytes([7; 16])),
+            kind: OpKind::Delete,
+            collection: coll.id,
+            doc_id: Some(kimmy_core::DocId::Int64(99)),
+            body: None,
+        };
+        engine.apply_batch(std::slice::from_ref(&late)).unwrap();
+        assert!(engine.arrival_of(&late.stamp).unwrap().is_some(), "premise: held");
+        assert!(written[1] > late.stamp, "premise: collected events lie above it");
+
+        let outcome = resumed_with(&engine, ResumeToken::from_stamp(late.stamp)).await;
+
+        assert!(is_expired(&outcome), "a held token below collected events must be refused");
+    }
+
+    #[tokio::test]
+    async fn an_ordinary_held_bare_token_still_resumes() {
+        // No hole, and nothing collected above it: with nothing collected at all, and
+        // after a collection whose horizon lies below the token.
+        let (engine, coll, _dir) = setup();
+        let mut written = Vec::new();
+        for i in 0..3i64 {
+            engine.insert(&coll, doc! { "_id": i }).unwrap();
+            written.push(newest_stamp(&engine));
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        assert!(
+            resumed_with(&engine, ResumeToken::from_stamp(written[0])).await.is_ok(),
+            "nothing collected"
+        );
+        engine
+            .collect_garbage_at(
+                crate::engine::physical_now_ms() + 1_000_000_000,
+                crate::gc::RetentionPolicy::new(0, u64::MAX),
+            )
+            .unwrap();
+        assert!(engine.arrival_of(&written[2]).unwrap().is_some(), "premise: the newest is kept");
+        assert!(
+            resumed_with(&engine, ResumeToken::from_stamp(written[2])).await.is_ok(),
+            "the horizon lies below the token"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_token_exactly_at_the_collected_horizon_resumes() {
+        // The client has seen the event the horizon stamp names, so nothing it lacks was
+        // collected. A late old entry leads the oplog so the first key does not decide.
+        let (engine, coll, _dir) = setup();
+        let mut written = Vec::new();
+        for i in 0..3i64 {
+            engine.insert(&coll, doc! { "_id": i }).unwrap();
+            written.push(newest_stamp(&engine));
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        engine
+            .collect_garbage_at(
+                crate::engine::physical_now_ms() + 1_000_000_000,
+                crate::gc::RetentionPolicy::new(0, u64::MAX),
+            )
+            .unwrap();
+        let late = OplogEntry {
+            stamp: Stamp::new(Hlc::new(1_000, 0), NodeId::from_bytes([7; 16])),
+            kind: OpKind::Delete,
+            collection: coll.id,
+            doc_id: Some(kimmy_core::DocId::Int64(99)),
+            body: None,
+        };
+        engine.apply_batch(std::slice::from_ref(&late)).unwrap();
+        let horizon = engine.oplog_collected().unwrap().get(engine.node_id());
+        assert_eq!(horizon, written[1].hlc, "premise: retention reached the second write");
+
+        let outcome = resumed_with(&engine, ResumeToken::from_stamp(written[1])).await;
+
+        assert!(outcome.is_ok(), "a token at the horizon stamp resumes: {outcome:?}");
+    }
+
+    #[tokio::test]
+    async fn a_token_exactly_at_the_top_of_a_hole_resumes() {
+        // The last event of the span is a delete the member never held, and the client's
+        // token names it: it has seen everything the member holds only as state.
+        let (a, coll, _da) = setup();
+        a.insert(&coll, doc! { "_id": "old" }).unwrap();
+        a.insert(&coll, doc! { "_id": "y" }).unwrap();
+        assert!(a.delete(&coll, &kimmy_core::DocId::String("y".into())).unwrap());
+        let top = newest_stamp(&a);
+        a.collect_garbage_at(
+            crate::engine::physical_now_ms() + 1_000_000_000,
+            crate::gc::RetentionPolicy::new(0, u64::MAX),
+        )
+        .unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let p = Engine::open(&dir.path().join("kimmy.redb")).unwrap();
+        let mut progress = crate::SnapshotProgress::whole_database();
+        while !progress.is_complete() {
+            let page = a.snapshot_page(progress.after().cloned(), progress.scope()).unwrap();
+            p.apply_snapshot_page(a.node_id(), &mut progress, &page).unwrap();
+        }
+        assert_eq!(p.state_held().unwrap().get(a.node_id()), top.hlc, "premise: top of the hole");
+        assert!(p.arrival_of(&top).unwrap().is_none(), "premise: not held");
+
+        let outcome = resumed_with(&p, ResumeToken::from_stamp(top)).await;
+
+        assert!(outcome.is_ok(), "a token at the hole's top resumes: {outcome:?}");
     }
 
     #[tokio::test]

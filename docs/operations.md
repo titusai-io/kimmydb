@@ -952,6 +952,14 @@ refusing member logs the first to each peer in a minute at `WARN`
 snapshot gave it`), which tells it from a retention refusal, whose wire answer is the
 same.
 
+**Change streams across a hole** ([ADR-173](decisions.md)'s addendum). A member that holds a hole
+cannot send the events inside it: a delete of a document it never held, and every intermediate version,
+are not there. A client resuming on it with a token **below** the hole's top (bare or vector) gets
+`ResumeTokenExpired` (`410`, code `resume_token_expired`) and must re-list, as for history a member no
+longer holds. A client whose token covers the hole resumes as before. The record is one maximum per
+origin, so the refusal is conservative; it costs a client one re-list, after a member rejoins by
+snapshot.
+
 - **A snapshot carries the index drops too** ([ADR-225](decisions.md)): its page lists the
   sender's index-drop tombstones (one per index dropped within tombstone retention), the
   receiver judges each as a replicated drop (an index created after it is left alone), records
