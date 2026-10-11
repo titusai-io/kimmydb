@@ -930,6 +930,45 @@ A member that creates its store in a cluster it has seeds for (a new pod, a volu
 
 **A limit: a rollback without `kimmyd restore` is protected only by the replay's proof.** A volume or disk-snapshot revert, or a copy of an old data directory, writes no marker. The member is marked `restored` only when a member that holds the lost writes answers the replay; while that member is reachable over SWIM and not over the cluster port, the rolled-back member serves and does owner work without them, with a `WARN` every ten minutes that its replay is still owed. **Restore with `kimmyd restore`, never by rolling back a volume.**
 
+### A member that took a snapshot, and what it will not serve
+
+A member that catches up by a **whole-database snapshot** (it was below its peers'
+retention horizon, or it joined with nothing) holds the sender's state, and its
+version vector then claims coverage of the sender's history. It holds the
+documents as entries, but it holds no entries for the schema changes, drops and
+deletes inside that span: they are in the state, not in its oplog. A peer that
+pulled from it could be served the documents and not the changes beside them, and
+would then witness past them and never be served them again ([ADR-224](decisions.md)).
+
+So the member **records a hole**: per origin, the highest stamp a snapshot raised its
+servable vector over. A peer whose window would begin below a hole is answered
+`BeyondHorizon`, as for retention. That peer asks its other contacts first, in the
+same tick (up to two more peers than it would have chosen), and takes the snapshot
+from the refusing member only if none of them can serve it, or the others do not
+answer within the tick; the wait is at most one tick. With no other peer to ask it
+snapshots at once. `kimmy_sync_horizon_state_held_total` counts the refusals, and the
+refusing member logs the first to each peer in a minute at `WARN`
+(`refused a peer a window across history this member holds only as the state a
+snapshot gave it`), which tells it from a retention refusal, whose wire answer is the
+same.
+
+- **One maximum per origin, so it is conservative.** A requester behind the member's
+  own prefix of an origin is refused too, though the prefix could be served; it asks
+  elsewhere or snapshots.
+- **It is kept in the store's `META` table** (`state_held:<node id>`), so a backup
+  carries it and `kimmyd restore` keeps it: it cannot be derived again. Nothing else
+  changed on disk: no table, no backup tag, no schema version. A build before
+  0.46.0 restores such a backup and does not read the rows.
+- **A hole a snapshot took before 0.46.0 is not known**, and neither is one taken
+  while a member ran 0.45.0 after running 0.46.0 (**rolling back to 0.45.0 and
+  forward again reopens the holes taken in between**). There is no safe seed: marking
+  everything a hole would send every member behind a peer to a snapshot during the
+  roll. A member known to have taken a snapshot on an older build can be rebuilt from
+  a peer (wipe its data directory and let it catch up).
+- **A restored member** whose peers all hold a hole at its own origin cannot be told
+  what they hold of it: its replay stays owed and gives up after the catching-up wait
+  (the log says which kind of refusal it was).
+
 ### A member that yields a class of work
 
 Expiry, webhook delivery and embedding are each owned by one member at a time,
@@ -1145,6 +1184,7 @@ the series; every series the endpoint exposes has a row.
 | `kimmy_ddl_confirm_pushes_total` | Windows pushed to members to confirm schema changes ([ADR-191](decisions.md)). At most one is in flight per member, and each carries everything queued for it, so in a burst this rises far slower than `kimmy_ddl_confirmations_total`: the ratio between them is the coalescing. About 1 when creates arrive one at a time |
 | `kimmy_replay_total{via,result}` | Pages of the restored-member replay ([ADR-212](decisions.md)'s addendum). `via`: `inbound` (a peer served them on a connection it opened) or `outbound` (this member asked on one it dialled). `result`: `served` (this member sent a page to a peer that asked), `applied` (a page carrying this member's own entries; an empty one is not counted), `refused` (a page that was not what was asked for), `ack_timeout` (the acknowledgement did not come, so the contact ended and the ordinary pull and push happen at the next one), `stalled` (a page named a collection this member lacks or is purging, and was not applied: a rising `stalled` means that collection is on its way by an ordinary round with another member, and it clears itself once it arrives; a count that keeps rising with no collection arriving is a member that can reach none that holds it). Always rendered, all zero on a member that was never restored. A restored member that rises on `outbound` and never on `inbound` is one its peers cannot dial |
 | `kimmy_sync_ddl_relogged_total` | Schema changes a snapshot restore appended to this node's oplog so that it can serve them onward ([ADR-180](decisions.md)). **Not an error: a rising value is the restore doing its job.** It reads 0 on a member that has never caught up by snapshot, and rises by one for each index definition a snapshot restores where this node did not already hold the entry behind it. A member that caught up by snapshot, past its peers' retention, and then served a third member is exactly what it makes visible — before it, such a member served windows that left those index definitions out, and nothing counted that |
+| `kimmy_sync_horizon_state_held_total` | Pulls this member refused because the window would have crossed history it holds only as the state a snapshot gave it ([ADR-224](decisions.md)), not because retention removed it. The member asking is told `BeyondHorizon`, asks another member first, and takes a snapshot only if none can serve it. Not an error: 0 on a member that never caught up by a whole-database snapshot, and a few after one while members that are behind its grant ask it first. A count that keeps rising means members are repeatedly behind the same member's grant: look at why they are |
 | `kimmy_sync_divergent_collections` | Collections a periodic cross-member check currently finds disagreeing with a peer, confirmed on two checks running: held there and not here, or held by both with a different document count. 0 on a converged cluster. **Alert on this above 0**: it is the one series in this table that moves for a divergence the other three cannot — no round fails, the lag gauge reads 0, nothing is refused. **Its 0 is only as good as the series below**: a 0 while the check is not running means *not checked*, not *not divergent*, so alert on the pair, not on this alone. **And it is only as fresh as `kimmy_sync_divergence_check_age_seconds` says**: the check runs inside the anti-entropy loop, so a 0 beside an age above its threshold is *unknown*, not clean — and a 0 beside an age that reads the same on every scrape is a loop that is not completing ticks, which freezes the age with it: measured on a three-member cluster, one member read 0 while some 30,000 documents behind, its round waiting on the single writer ([ADR-145](decisions.md)). See [below](#the-divergence-check) for what it compares, how often, and what it cannot catch ([ADR-133](decisions.md)) |
 | `kimmy_sync_divergence_checks_total{outcome}` | Contacts with a peer in which the check above **`ran`**, and rounds that did not run it (**`skipped`**): the round completed but the pull was truncated by the batch cap and could not be trusted, or the round failed. This is what tells a quiet cluster from a blind one. **Alert on `ran` not increasing** while `kimmy_cluster_members` is above 0 — the gauge above is then holding a value nothing has re-examined — and treat any sustained `skipped` rate as the gauge being *unknown* rather than clean, **including while `ran` is also rising**, which is the partly-blind case the alert cannot catch because neither series is labelled by peer. A round that failed is in `kimmy_sync_failures_total` *and* in `skipped` ([ADR-145](decisions.md)), so `ran` + `skipped` is every contact the node attempted, one per peer per tick however many pulls it made. See [below](#the-divergence-check) for the four readings ([ADR-135](decisions.md)) |
 | `kimmy_sync_divergence_count_probes_total{outcome}` | Checked contacts in which the count half of the check — the half that catches a run of missing documents in a collection every member holds by name — **`compared`** the probed collection's count against the peer's, and checked contacts in which it was **`deferred`** because one member is behind the other and still catching up: the peer has not *processed* everything this node has ([ADR-146](decisions.md)), or this node, when it read its count, had not processed everything the peer can serve ([ADR-168](decisions.md)). **Against a member that keeps writing — one document a round is enough — `deferred` rises and `compared` stays flat for as long as the writes go on**: the count half does not compare against it then, by design; the existence half still does. `deferred` rising on a busy cluster is ordinary, and on a converged idle cluster it should not rise at all; **`compared` flat while `ran` rises** is a count half that has not looked at anything, and the gauge's 0 then says nothing about document counts. A peer that is behind but whose position has not moved for 3 consecutive checked contacts is compared regardless, so a member whose replication has stopped is not deferred for as long as it stays stopped ([ADR-145](decisions.md)) |
@@ -2221,8 +2261,8 @@ one keystroke between recovering and corrupting a cluster's identity space.
 
 Documents, collection and index metadata, secondary index entries, the oplog and
 its arrival index, tombstones for deleted documents, dropped collections and
-dropped indexes, the **servable** version vector, the user store, and the node
-id.
+dropped indexes, the **servable** version vector, the user store, the node
+id, and the holes a snapshot left ([a member that took a snapshot](#a-member-that-took-a-snapshot-and-what-it-will-not-serve), which are `META` rows).
 
 **Not everything the node holds.** Three tables are deliberately left out
 because each is node-local and re-derived when the database is opened: the

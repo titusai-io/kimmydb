@@ -748,6 +748,13 @@ pub async fn replicate(engine: Arc<Engine>, config: ReplicationConfig) {
     // its next pull. Cleared by that tick's own selection, not appended to,
     // so a peer that stops advancing simply falls out of it.
     let mut carry_forward: BTreeSet<SocketAddr> = BTreeSet::new();
+    // Peers whose `BeyondHorizon` a tick set aside and did not get to ask again
+    // before its budget ran out (ADR-224): contacted first in the next tick, where
+    // a second refusal is a snapshot. The set-aside is bounded to one tick that
+    // way, whatever the other contacts did.
+    let mut carry_deferred: BTreeSet<SocketAddr> = BTreeSet::new();
+    // The sync tick being run, for the rounds' set-aside judgement.
+    let mut sync_ticks: u64 = 0;
     // Whether the tick about to run was scheduled by a reset (immediately
     // after a draining tick) rather than by the ticker's own interval. Read
     // and cleared at the top of the sync arm; set at the bottom of the
@@ -894,6 +901,8 @@ pub async fn replicate(engine: Arc<Engine>, config: ReplicationConfig) {
                 // line that says afterwards how long it was and that it was
                 // this loop.
                 let tick_started = Instant::now();
+                sync_ticks += 1;
+                stalls.begin_tick(sync_ticks);
                 // This member's own block goes on every request of the tick
                 // (ADR-201): the loop reads it once, from the cache, and a
                 // peer that answers has read it.
@@ -1016,9 +1025,14 @@ pub async fn replicate(engine: Arc<Engine>, config: ReplicationConfig) {
                 // a cluster with more draining peers than `fanout` still
                 // contacts at most `fanout` this tick; `select_excluding`
                 // fills only what is left.
-                let carried: BTreeSet<SocketAddr> =
+                let mut carried: BTreeSet<SocketAddr> =
                     carry_forward.iter().copied().filter(|peer| peers.contains(peer)).collect();
                 carry_forward.clear();
+                // Peers whose snapshot a tick set aside and could not ask about again
+                // come first, with the draining ones: they take fanout's slots, and
+                // their next refusal is a snapshot (ADR-224).
+                carried.extend(carry_deferred.iter().copied().filter(|peer| peers.contains(peer)));
+                carry_deferred.clear();
                 let mut chosen: Vec<SocketAddr> = carried.iter().copied().collect();
                 chosen.extend(health.select_excluding(
                     &peers,
@@ -1034,8 +1048,15 @@ pub async fn replicate(engine: Arc<Engine>, config: ReplicationConfig) {
                 // draining one to exhaustion: a member behind on two origins
                 // advances on both, and one deep backlog does not spend the
                 // whole budget.
+                // Every peer this tick has contacted or queued, so a peer added when a
+                // snapshot is set aside is one that was not already going to be asked.
+                let mut tried: BTreeSet<SocketAddr> = chosen.iter().copied().collect();
                 let mut draining: VecDeque<Contact> =
                     chosen.into_iter().map(Contact::new).collect();
+                // Contacts whose `BeyondHorizon` was set aside (ADR-224), asked again
+                // when everything else in the tick has finished, a truncated contact
+                // still draining included.
+                let mut set_aside: Vec<Contact> = Vec::new();
                 // The peers this tick reached by a *successful* round, with what
                 // their vectors and blocks showed: what the catching-up marker is
                 // judged on (ADR-202).
@@ -1049,8 +1070,30 @@ pub async fn replicate(engine: Arc<Engine>, config: ReplicationConfig) {
                 // next tick, which a reset then schedules immediately rather
                 // than after a full interval.
                 let mut resume_next_tick: BTreeSet<SocketAddr> = BTreeSet::new();
-                while let Some(mut contact) = draining.pop_front() {
+                loop {
+                    let mut contact = match draining.pop_front() {
+                        Some(contact) => contact,
+                        None => match set_aside.pop() {
+                            // Asked again only with time left in the tick; one that
+                            // would run past it waits for the next, where it is
+                            // contacted first and a second refusal is a snapshot.
+                            Some(contact) if Instant::now() < deadline => contact,
+                            Some(contact) => {
+                                carry_deferred.insert(contact.peer);
+                                carry_deferred.extend(set_aside.drain(..).map(|c| c.peer));
+                                break;
+                            }
+                            None => break,
+                        },
+                    };
                     let peer = contact.peer;
+                    // May this contact's `BeyondHorizon` be set aside? Only if someone
+                    // else can serve this member first: another contact waits in the
+                    // tick, or a live peer that is not backing off can be added. With
+                    // nobody, the snapshot is taken at once, as in a cluster of two.
+                    let can_defer = !draining.is_empty()
+                        || !health.extras(&peers, &tried, Instant::now(), 1).is_empty();
+                    stalls.allow_horizon_deferral(can_defer);
                     // Sequential rather than concurrent: a round is cheap when
                     // converged, and syncing with every peer at once would make
                     // a large cluster stampede one node that fell behind.
@@ -1114,6 +1157,20 @@ pub async fn replicate(engine: Arc<Engine>, config: ReplicationConfig) {
                     report.entries_skipped_purge_pending += applied.purge_pending;
                     tick_reached.extend(stalls.take_reached_after(&pulled));
                     match pulled {
+                        Ok(outcome) if outcome.horizon_deferred => {
+                            // The peer answered, so it is up. Nothing else of a pull's
+                            // accounting applies: no pull, no check, no lag, no
+                            // position. Asked again after the tick's other contacts,
+                            // and they are added if there are none left.
+                            health.succeeded(peer);
+                            if draining.is_empty() {
+                                for extra in health.extras(&peers, &tried, Instant::now(), 2) {
+                                    tried.insert(extra);
+                                    draining.push_back(Contact::new(extra));
+                                }
+                            }
+                            set_aside.push(contact);
+                        }
                         Ok(mut outcome) => {
                             contact.pulled(&outcome, took);
                             health.succeeded(peer);

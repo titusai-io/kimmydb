@@ -1536,7 +1536,27 @@ impl Engine {
     /// oldest entry is just the first write ever made, and a peer asking from
     /// before it would be sent a full snapshot for no reason.
     pub fn can_serve_from_oplog(&self, from: Hlc) -> Result<bool> {
-        Ok(from >= self.oplog_collected_through()?)
+        Ok(self.serve_verdict_from(from)? == ServeVerdict::Serve)
+    }
+
+    /// [`Self::can_serve_from_oplog`], saying which kind of history is missing when
+    /// it is not `Serve`: collected (retention), or held only as a snapshot's state.
+    ///
+    /// A request that names a threshold and nothing of what the peer holds (a
+    /// `Repair::Replay`, or a requester older than ADR-097) asks for **every origin's
+    /// entries from `from`**, so a hole whose top is above `from` at any origin
+    /// holds some of what it asks for: refusing below the highest is conservative
+    /// (its cost is a snapshot), and it is the same rule retention's coarse horizon
+    /// applies to that request.
+    pub fn serve_verdict_from(&self, from: Hlc) -> Result<ServeVerdict> {
+        if from < self.oplog_collected_through()? {
+            return Ok(ServeVerdict::Collected);
+        }
+        let highest = self.state_held()?.iter().map(|(_, hlc)| hlc).max();
+        Ok(match highest {
+            Some(highest) if from < highest => ServeVerdict::StateHeld,
+            _ => ServeVerdict::Serve,
+        })
     }
 
     /// Whether a peer that has processed `held` can be served from the oplog.
@@ -1555,10 +1575,45 @@ impl Engine {
     /// around it — and the coarse horizon can only answer with a snapshot,
     /// for a gap that holds exactly one servable entry (ADR-097).
     pub fn can_serve_peer_holding(&self, held: &VersionVector) -> Result<bool> {
+        Ok(self.serve_verdict(held)? == ServeVerdict::Serve)
+    }
+
+    /// [`Self::can_serve_peer_holding`], saying which kind of history the peer lacks
+    /// when it cannot be served.
+    ///
+    /// **Two ways a window can be unservable**, and both are the same answer on the
+    /// wire (`BeyondHorizon`): retention removed an entry the peer lacks
+    /// (`collected`), or this node never held it, because a whole-database snapshot
+    /// gave it the state and raised its servable vector over the entries (ADR-224,
+    /// `state_held`). The second is the gap ADR-169's definition of the servable
+    /// vector leaves if it is read as a promise: "this node can serve a contiguous
+    /// window containing this". `Collected` is judged first, so a peer that lacks
+    /// both is told what retention would have told it before.
+    pub fn serve_verdict(&self, held: &VersionVector) -> Result<ServeVerdict> {
         let mine = self.version_vector()?;
         let collected = self.oplog_collected()?;
-        Ok(!crate::sync::lacks_collected(held, &mine, &collected))
+        if crate::sync::lacks_collected(held, &mine, &collected) {
+            return Ok(ServeVerdict::Collected);
+        }
+        let state_held = self.state_held()?;
+        if crate::sync::lacks_collected(held, &mine, &state_held) {
+            return Ok(ServeVerdict::StateHeld);
+        }
+        Ok(ServeVerdict::Serve)
     }
+}
+
+/// Whether a node can serve a peer an incremental window, and if not, why.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ServeVerdict {
+    /// Every entry the peer lacks is here to serve.
+    Serve,
+    /// Retention removed an entry the peer lacks.
+    Collected,
+    /// An entry the peer lacks was never here: a whole-database snapshot gave this
+    /// node the state it describes and raised its servable vector over it
+    /// (ADR-224).
+    StateHeld,
 }
 
 #[cfg(test)]
@@ -5475,6 +5530,221 @@ mod tests {
             c.get(&cc, &DocId::Int64(2)).unwrap().is_some(),
             "the known gap: C keeps the document -- if this now fails, the gap closed; update the plan"
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // The history a snapshot gave a node as state and no entries for (ADR-224)
+    // -----------------------------------------------------------------------
+
+    /// `a` with `n` documents in `shop.orders`, its oplog aged out entirely so that
+    /// whoever joins can only have it by snapshot.
+    fn aged_origin(n: i64) -> (Engine, tempfile::TempDir) {
+        let (a, dir) = engine();
+        let ca = a.create_collection("shop", "orders").unwrap();
+        for i in 0..n {
+            a.insert(&ca, doc! { "_id": i }).unwrap();
+        }
+        a.collect_garbage_at(
+            crate::engine::physical_now_ms() + 1_000_000_000,
+            crate::gc::RetentionPolicy::new(0, u64::MAX),
+        )
+        .unwrap();
+        (a, dir)
+    }
+
+    #[test]
+    fn a_whole_database_snapshot_records_the_hole_it_raises_the_servable_vector_over() {
+        let (a, _da) = aged_origin(5);
+        let (p, _dp) = engine();
+        assert!(p.state_held().unwrap().is_empty(), "nothing before a snapshot");
+
+        transfer(&p, &a);
+
+        let held = p.state_held().unwrap();
+        assert_eq!(held.get(a.node_id()), a.version_vector().unwrap().get(a.node_id()));
+        // A requester that holds nothing of `a` is behind the hole: refused, and the
+        // refusal is the hole's and not retention's, which collected nothing here.
+        let nothing = kimmy_core::VersionVector::new();
+        assert_eq!(p.serve_verdict(&nothing).unwrap(), ServeVerdict::StateHeld);
+        assert!(!p.can_serve_peer_holding(&nothing).unwrap());
+        // One that holds all of it is served, and so is one past it.
+        let all = a.version_vector().unwrap();
+        assert_eq!(p.serve_verdict(&all).unwrap(), ServeVerdict::Serve);
+        // And so is a requester with a pull of nothing to ask for (`held: None`) from
+        // the top, while one asking from below it is refused (the scalar rule).
+        let top = held.get(a.node_id());
+        assert_eq!(p.serve_verdict_from(top).unwrap(), ServeVerdict::Serve);
+        assert_eq!(p.serve_verdict_from(Hlc::ZERO).unwrap(), ServeVerdict::StateHeld);
+    }
+
+    #[test]
+    fn a_node_that_never_took_a_snapshot_has_no_hole_and_serves_as_before() {
+        let (a, _da) = engine();
+        let ca = a.create_collection("shop", "orders").unwrap();
+        a.insert(&ca, doc! { "_id": 1 }).unwrap();
+        assert!(a.state_held().unwrap().is_empty());
+        assert_eq!(
+            a.serve_verdict(&kimmy_core::VersionVector::new()).unwrap(),
+            ServeVerdict::Serve,
+            "an origin serves everything it has"
+        );
+    }
+
+    #[test]
+    fn a_hole_is_retention_when_both_apply_and_only_the_holes_when_retention_did_not() {
+        // `p` collected its own oplog as well: a requester below both is told what
+        // retention would have told it before the hole existed.
+        let (a, _da) = aged_origin(3);
+        let (p, _dp) = engine();
+        transfer(&p, &a);
+        let cp = p.get_collection("shop", "orders").unwrap();
+        p.insert(&cp, doc! { "_id": 100 }).unwrap();
+        p.collect_garbage_at(
+            crate::engine::physical_now_ms() + 2_000_000_000,
+            crate::gc::RetentionPolicy::new(0, u64::MAX),
+        )
+        .unwrap();
+        let nothing = kimmy_core::VersionVector::new();
+        assert_eq!(p.serve_verdict(&nothing).unwrap(), ServeVerdict::Collected);
+    }
+
+    #[test]
+    fn the_hole_is_only_what_the_grant_raised_over() {
+        // `b` already holds a prefix of `a`'s entries, in position. The snapshot grants
+        // more; the hole's top is the grant, and a requester at or above it is served.
+        let (a, _da) = engine();
+        let ca = a.create_collection("shop", "orders").unwrap();
+        a.insert(&ca, doc! { "_id": 0 }).unwrap();
+        let (b, _db) = engine();
+        let prefix = a.entries_for_peer(Hlc::ZERO, 100, crate::WalkScope::Request).unwrap().entries;
+        b.apply_batch(&prefix).unwrap();
+        assert!(b.state_held().unwrap().is_empty(), "entries are not a snapshot");
+        for i in 1..6i64 {
+            a.insert(&ca, doc! { "_id": i }).unwrap();
+        }
+        a.collect_garbage_at(
+            crate::engine::physical_now_ms() + 1_000_000_000,
+            crate::gc::RetentionPolicy::new(0, u64::MAX),
+        )
+        .unwrap();
+
+        transfer(&b, &a);
+
+        let top = a.version_vector().unwrap();
+        assert_eq!(b.state_held().unwrap().get(a.node_id()), top.get(a.node_id()));
+        assert_eq!(b.serve_verdict(&top).unwrap(), ServeVerdict::Serve);
+        // Conservative, said plainly: one maximum per origin, so a requester that
+        // holds `b`'s own prefix of the origin is refused as well.
+        let at_prefix = b.version_vector().unwrap();
+        let mut inside = kimmy_core::VersionVector::new();
+        inside.insert(a.node_id(), prefix.last().unwrap().stamp.hlc);
+        assert_eq!(b.serve_verdict(&inside).unwrap(), ServeVerdict::StateHeld);
+        let _ = at_prefix;
+    }
+
+    #[test]
+    fn a_snapshot_that_did_not_complete_records_no_hole() {
+        // The grant rides the last page's transaction. Pages before it have granted
+        // nothing, so there is nothing to have raised the servable vector over.
+        let (a, _da) = aged_origin(SNAPSHOT_PAGE as i64 + 10);
+        let (b, _db) = engine();
+        let mut progress = SnapshotProgress::whole_database();
+        let first = a.snapshot_page(None, None).unwrap();
+        assert!(first.next.is_some(), "the fixture needs a second page");
+        b.apply_snapshot_page(a.node_id(), &mut progress, &first).unwrap();
+        assert!(!progress.is_complete());
+        assert!(b.state_held().unwrap().is_empty(), "no grant yet, no hole");
+        assert_eq!(
+            b.serve_verdict(&kimmy_core::VersionVector::new()).unwrap(),
+            ServeVerdict::Serve,
+            "and nothing is refused on a snapshot's account"
+        );
+    }
+
+    #[test]
+    fn a_scoped_repair_records_no_hole() {
+        // A repair of one collection grants no coverage (ADR-152), so the servable
+        // vector is not raised and there is nothing to record.
+        let (a, _da) = aged_origin(5);
+        let (b, _db) = engine();
+        let id = a.get_collection("shop", "orders").unwrap().id;
+        let mut progress = SnapshotProgress::of_collection(id);
+        transfer_under(&b, &a, &mut progress);
+        assert!(b.state_held().unwrap().is_empty());
+    }
+
+    #[test]
+    fn the_hole_survives_a_restart() {
+        let (a, _da) = aged_origin(5);
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("kimmy.redb");
+        let before = {
+            let b = Engine::open(&path).unwrap();
+            transfer(&b, &a);
+            b.state_held().unwrap()
+        };
+        assert!(!before.is_empty());
+        let reopened = Engine::open(&path).unwrap();
+        assert_eq!(reopened.state_held().unwrap(), before);
+        assert_eq!(
+            reopened.serve_verdict(&kimmy_core::VersionVector::new()).unwrap(),
+            ServeVerdict::StateHeld
+        );
+    }
+
+    #[test]
+    fn a_backup_restored_keeps_the_hole_because_it_cannot_be_derived_again() {
+        // `OPLOG_COLLECTED` is re-derived at open and so is not backed up. The hole is
+        // not: nothing in the restored store says which stamps it holds no entries for.
+        // It rides in META, which a backup carries.
+        let (a, _da) = aged_origin(5);
+        let (b, _db) = engine();
+        transfer(&b, &a);
+        let held = b.state_held().unwrap();
+        assert!(!held.is_empty());
+
+        let mut buf = Vec::new();
+        b.backup_to(&mut buf, crate::WalkScope::Request).unwrap();
+        let dest = tempfile::tempdir().unwrap();
+        let path = dest.path().join("restored.redb");
+        crate::backup::restore(&path, &mut buf.as_slice()).unwrap();
+
+        let restored = Engine::open(&path).unwrap();
+        assert_eq!(restored.state_held().unwrap(), held, "the hole came back with the backup");
+        assert_eq!(
+            restored.serve_verdict(&kimmy_core::VersionVector::new()).unwrap(),
+            ServeVerdict::StateHeld,
+            "and the restored member refuses the same requester"
+        );
+    }
+
+    #[test]
+    fn a_snapshot_over_what_entries_already_gave_records_no_hole() {
+        // The servable vector was already at the grant: nothing was raised over.
+        let (a, _da) = engine();
+        let ca = a.create_collection("shop", "orders").unwrap();
+        for i in 0..4i64 {
+            a.insert(&ca, doc! { "_id": i }).unwrap();
+        }
+        let (b, _db) = engine();
+        let all = a.entries_for_peer(Hlc::ZERO, 100, crate::WalkScope::Request).unwrap().entries;
+        b.apply_batch(&all).unwrap();
+        assert!(b.version_vector().unwrap().covers(&a.version_vector().unwrap()), "premise");
+
+        transfer(&b, &a);
+
+        assert!(b.state_held().unwrap().is_empty(), "{:?}", b.state_held().unwrap());
+    }
+
+    #[test]
+    fn a_second_snapshot_records_only_what_it_raised_over() {
+        // The hole only moves up, and a grant that raises nothing records nothing.
+        let (a, _da) = aged_origin(3);
+        let (b, _db) = engine();
+        transfer(&b, &a);
+        let first = b.state_held().unwrap();
+        transfer(&b, &a);
+        assert_eq!(b.state_held().unwrap(), first, "the same grant raises nothing");
     }
 }
 

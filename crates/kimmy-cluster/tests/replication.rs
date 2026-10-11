@@ -5802,6 +5802,793 @@ async fn an_index_relays_through_two_snapshot_hops() {
     assert_eq!(entry.stamp.node, a.engine.node_id(), "at a's stamp, not p's");
 }
 
+// ---------------------------------------------------------------------------
+// The rest of ADR-180's sweep: every other change a whole-database snapshot
+// grants as state, relayed through the member that took the snapshot.
+//
+// The topology is the index case's. `m` holds a prefix of `a`'s history and
+// is behind one change; `a` then writes a trailing document into a
+// collection `m` holds, so `p`'s window to `m` is not empty; `a`'s oplog is
+// aged out entirely, so `p` joining afresh can only catch up by snapshot; `m`
+// then talks to `p` alone, in four bare rounds (`Pull::Rounds`) and again in
+// the member's own replication loop (`Pull::Loop`), which adds the divergence
+// check and its repairs. A control for each shows the same change reaching
+// `m` by entries, so a red here is the snapshot hop and not the harness.
+//
+// On main: vector configuration on and off, an index drop, a collection drop
+// and a document delete fail both ways. An empty collection's creation fails
+// the bare rounds only; the loop heals it. The settled definition (ADR-132)
+// and a delete through a member that held the document pass: ADR-180 and
+// ADR-167 cover them.
+// ---------------------------------------------------------------------------
+
+/// `a` with `shop.orders` and document 1, `m` having pulled all of it, and
+/// `setup` run on `a` before `m` pulls (what `m` is to hold already).
+async fn origin_and_a_member_that_holds_it(
+    setup: impl FnOnce(&Engine, &kimmy_storage::CollectionMeta),
+) -> (Node, Node, kimmy_storage::CollectionMeta) {
+    let a = node().await;
+    let ca = a.engine.create_collection("shop", "orders").unwrap();
+    a.engine.insert(&ca, doc! { "_id": 1, "x": 1 }).unwrap();
+    setup(&a.engine, &ca);
+    let m = node().await;
+    sync_once(&m.engine, a.addr, SECRET, None).await.unwrap();
+    (a, m, ca)
+}
+
+/// How `m` pulls from `p`: four bare rounds, or the member's own replication
+/// loop (discovery, the divergence check, repairs) for a dozen rounds.
+#[derive(Clone, Copy)]
+enum Pull {
+    Rounds,
+    Loop,
+}
+
+/// Have `p` take `a`'s state by snapshot (`age_out` first, so it can only be
+/// that) or by entries. Returns `p`.
+async fn p_catches_up_from(a: &Node, by_snapshot: bool) -> Node {
+    if by_snapshot {
+        age_out_fully(&a.engine);
+    }
+    let p = node().await;
+    sync_once(&p.engine, a.addr, SECRET, None).await.unwrap();
+    p
+}
+
+/// Let `m` pull from `p` alone.
+async fn m_pulls_from(m: &Node, p: &Node, how: Pull) {
+    match how {
+        Pull::Rounds => {
+            for _ in 0..4 {
+                sync_once(&m.engine, p.addr, SECRET, None).await.unwrap();
+            }
+        }
+        Pull::Loop => {
+            use kimmy_cluster::{ReplicationConfig, RoundReport, SeedSource, replicate};
+            let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<RoundReport>();
+            let mut config = ReplicationConfig::new(
+                vec![SeedSource::Static(vec![p.addr])],
+                SECRET.into(),
+                m.addr,
+            );
+            config.sync_interval = Duration::from_millis(50);
+            config.discovery_interval = Duration::from_millis(50);
+            config.on_round = Some(Arc::new(move |report| {
+                let _ = tx.send(report);
+            }));
+            let looping = tokio::spawn(replicate(Arc::clone(&m.engine), config));
+            let (mut repairs, mut divergent) = (0, 0);
+            for _ in 0..24 {
+                let report = tokio::time::timeout(Duration::from_secs(20), rx.recv())
+                    .await
+                    .expect("the loop reports")
+                    .expect("the loop keeps reporting");
+                repairs += report.repair_rounds;
+                divergent = divergent.max(report.divergent_collections);
+            }
+            looping.abort();
+            eprintln!(
+                "loop: repair rounds {repairs}, most collections divergent at once {divergent}"
+            );
+        }
+    }
+}
+
+fn documents_of(engine: &Engine, db: &str, name: &str) -> i64 {
+    let held = engine.get_collection(db, name).unwrap();
+    engine.count(&held, kimmy_storage::WalkScope::Request).unwrap() as i64
+}
+
+// -- CreateCollection --------------------------------------------------------
+
+async fn a_collection_created_after_m_pulled(
+    by_snapshot: bool,
+    with_document: bool,
+    how: Pull,
+) -> (Node, Node) {
+    let (a, m, ca) = origin_and_a_member_that_holds_it(|_, _| {}).await;
+    let audit = a.engine.create_collection("shop", "audit").unwrap();
+    if with_document {
+        a.engine.insert(&audit, doc! { "_id": "a" }).unwrap();
+    }
+    a.engine.insert(&ca, doc! { "_id": 2, "x": 2 }).unwrap();
+    let p = p_catches_up_from(&a, by_snapshot).await;
+    m_pulls_from(&m, &p, how).await;
+    (a, m)
+}
+
+/// Red on main for a bare round, which is the skip. The member's own loop
+/// heals it (existence half of the divergence check, then a scoped snapshot),
+/// which `..._in_the_loop` pins green: a lag, not a permanent gap.
+#[tokio::test]
+async fn relay_an_empty_collection_created_after_m_pulled() {
+    let (_a, m) = a_collection_created_after_m_pulled(true, false, Pull::Rounds).await;
+    assert_eq!(documents_of(&m.engine, "shop", "orders"), 2, "m took p's window");
+    assert!(
+        m.engine.get_collection("shop", "audit").is_ok(),
+        "m learned the collection it was relayed past"
+    );
+}
+
+#[tokio::test]
+async fn control_relay_an_empty_collection_without_the_snapshot_hop() {
+    let (_a, m) = a_collection_created_after_m_pulled(false, false, Pull::Rounds).await;
+    assert!(m.engine.get_collection("shop", "audit").is_ok(), "control");
+}
+
+// -- ConfigureVectors (on) ---------------------------------------------------
+
+async fn vectors_configured_after_m_pulled(by_snapshot: bool, how: Pull) -> (Node, Node) {
+    let (a, m, ca) = origin_and_a_member_that_holds_it(|_, _| {}).await;
+    a.engine.configure_vectors("shop", "orders", vector_config()).unwrap();
+    a.engine.insert(&ca, doc! { "_id": 2, "x": 2 }).unwrap();
+    let p = p_catches_up_from(&a, by_snapshot).await;
+    m_pulls_from(&m, &p, how).await;
+    (a, m)
+}
+
+#[tokio::test]
+async fn relay_a_vector_configuration_turned_on_after_m_pulled() {
+    let (_a, m) = vectors_configured_after_m_pulled(true, Pull::Rounds).await;
+    assert_eq!(documents_of(&m.engine, "shop", "orders"), 2, "m took p's window");
+    let held = m.engine.get_collection("shop", "orders").unwrap();
+    assert!(held.vector.is_some(), "and the configuration in it: {:?}", held.vector);
+}
+
+#[tokio::test]
+async fn control_relay_a_vector_configuration_without_the_snapshot_hop() {
+    let (_a, m) = vectors_configured_after_m_pulled(false, Pull::Rounds).await;
+    let held = m.engine.get_collection("shop", "orders").unwrap();
+    assert!(held.vector.is_some(), "control: {:?}", held.vector);
+}
+
+// -- ConfigureVectors (off) --------------------------------------------------
+
+async fn vectors_disabled_after_m_pulled(by_snapshot: bool, how: Pull) -> (Node, Node) {
+    let (a, m, ca) = origin_and_a_member_that_holds_it(|engine, _| {
+        engine.configure_vectors("shop", "orders", vector_config()).unwrap();
+    })
+    .await;
+    assert!(
+        m.engine.get_collection("shop", "orders").unwrap().vector.is_some(),
+        "premise: m holds the configuration"
+    );
+    a.engine.disable_vectors("shop", "orders", false).unwrap();
+    a.engine.insert(&ca, doc! { "_id": 2, "x": 2 }).unwrap();
+    let p = p_catches_up_from(&a, by_snapshot).await;
+    m_pulls_from(&m, &p, how).await;
+    (a, m)
+}
+
+#[tokio::test]
+async fn control_relay_a_vector_configuration_turned_off_without_the_snapshot_hop() {
+    let (_a, m) = vectors_disabled_after_m_pulled(false, Pull::Rounds).await;
+    let held = m.engine.get_collection("shop", "orders").unwrap();
+    assert!(held.vector.is_none(), "control: {:?}", held.vector);
+}
+
+// -- DropIndex ---------------------------------------------------------------
+
+async fn index_dropped_after_m_pulled(by_snapshot: bool, how: Pull) -> (Node, Node) {
+    let (a, m, ca) = origin_and_a_member_that_holds_it(|engine, _| {
+        engine.create_index("shop", "orders", vec![field("x")], true, Some("by_x".into())).unwrap();
+    })
+    .await;
+    assert!(
+        m.engine.get_collection("shop", "orders").unwrap().index("by_x").is_some(),
+        "premise: m holds the index"
+    );
+    assert!(a.engine.drop_index("shop", "orders", "by_x").unwrap());
+    a.engine.insert(&ca, doc! { "_id": 2, "x": 2 }).unwrap();
+    let p = p_catches_up_from(&a, by_snapshot).await;
+    m_pulls_from(&m, &p, how).await;
+    (a, m)
+}
+
+#[tokio::test]
+async fn control_relay_an_index_drop_without_the_snapshot_hop() {
+    let (_a, m) = index_dropped_after_m_pulled(false, Pull::Rounds).await;
+    let held = m.engine.get_collection("shop", "orders").unwrap();
+    assert!(held.index("by_x").is_none(), "control: {:?}", held.indexes);
+}
+
+// -- DropCollection ----------------------------------------------------------
+
+async fn collection_dropped_after_m_pulled(by_snapshot: bool, how: Pull) -> (Node, Node) {
+    let a = node().await;
+    let doomed = a.engine.create_collection("shop", "doomed").unwrap();
+    a.engine.insert(&doomed, doc! { "_id": 1 }).unwrap();
+    let kept = a.engine.create_collection("shop", "orders").unwrap();
+    a.engine.insert(&kept, doc! { "_id": 1 }).unwrap();
+    let m = node().await;
+    sync_once(&m.engine, a.addr, SECRET, None).await.unwrap();
+    assert!(m.engine.get_collection("shop", "doomed").is_ok(), "premise: m holds it");
+
+    assert!(a.engine.drop_collection("shop", "doomed").unwrap());
+    a.engine.insert(&kept, doc! { "_id": 2 }).unwrap();
+    let p = p_catches_up_from(&a, by_snapshot).await;
+    m_pulls_from(&m, &p, how).await;
+    (a, m)
+}
+
+#[tokio::test]
+async fn relay_a_collection_dropped_after_m_pulled() {
+    let (_a, m) = collection_dropped_after_m_pulled(true, Pull::Rounds).await;
+    assert_eq!(documents_of(&m.engine, "shop", "orders"), 2, "m took p's window");
+    assert!(m.engine.get_collection("shop", "doomed").is_err(), "and the drop it was relayed past");
+}
+
+#[tokio::test]
+async fn control_relay_a_collection_drop_without_the_snapshot_hop() {
+    let (_a, m) = collection_dropped_after_m_pulled(false, Pull::Rounds).await;
+    assert!(m.engine.get_collection("shop", "doomed").is_err(), "control");
+}
+
+// -- Document delete ---------------------------------------------------------
+
+async fn document_deleted_after_m_pulled(
+    by_snapshot: bool,
+    p_held_it: bool,
+    how: Pull,
+) -> (Node, Node) {
+    let (a, m, ca) = origin_and_a_member_that_holds_it(|engine, ca| {
+        engine.insert(ca, doc! { "_id": 2, "x": 2 }).unwrap();
+    })
+    .await;
+    // `p` that held the document before the delete is ADR-167's case.
+    let held_before = node().await;
+    if p_held_it {
+        sync_once(&held_before.engine, a.addr, SECRET, None).await.unwrap();
+    }
+    assert!(a.engine.delete(&ca, &DocId::Int64(2)).unwrap());
+    a.engine.insert(&ca, doc! { "_id": 3, "x": 3 }).unwrap();
+    if by_snapshot {
+        age_out_fully(&a.engine);
+    }
+    let p = if p_held_it { held_before } else { node().await };
+    sync_once(&p.engine, a.addr, SECRET, None).await.unwrap();
+    m_pulls_from(&m, &p, how).await;
+    (a, m)
+}
+
+#[tokio::test]
+async fn control_relay_a_delete_without_the_snapshot_hop() {
+    let (_a, m) = document_deleted_after_m_pulled(false, false, Pull::Rounds).await;
+    let held = m.engine.get_collection("shop", "orders").unwrap();
+    assert!(m.engine.get(&held, &DocId::Int64(2)).unwrap().is_none(), "control");
+}
+
+#[tokio::test]
+async fn lookalike_relay_a_delete_through_a_member_that_held_the_document() {
+    // ADR-167: `p` held the document, so its restore builds the Delete entry.
+    // Passes on main.
+    let (_a, m) = document_deleted_after_m_pulled(true, true, Pull::Rounds).await;
+    let held = m.engine.get_collection("shop", "orders").unwrap();
+    assert!(m.engine.get(&held, &DocId::Int64(2)).unwrap().is_none());
+}
+
+// -- Settling rival index definitions (ADR-132) ------------------------------
+
+async fn rival_definitions_settled_by_the_restore(by_snapshot: bool, how: Pull) -> (Node, Node) {
+    let (a, m, ca) = origin_and_a_member_that_holds_it(|_, _| {}).await;
+    // `p` holds the collection, and its own `by_x` over y, made before a's
+    // over x -- the later stamp wins when p restores a's.
+    let p = node().await;
+    sync_once(&p.engine, a.addr, SECRET, None).await.unwrap();
+    p.engine.create_index("shop", "orders", vec![field("y")], false, Some("by_x".into())).unwrap();
+    a.engine.create_index("shop", "orders", vec![field("x")], false, Some("by_x".into())).unwrap();
+    a.engine.insert(&ca, doc! { "_id": 2, "x": 2 }).unwrap();
+    if by_snapshot {
+        age_out_fully(&a.engine);
+    }
+    sync_once(&p.engine, a.addr, SECRET, None).await.unwrap();
+    let winner = a.engine.get_collection("shop", "orders").unwrap().index("by_x").unwrap().clone();
+    assert_eq!(
+        p.engine.get_collection("shop", "orders").unwrap().index("by_x").unwrap().fields,
+        winner.fields,
+        "premise: p settled on a's definition"
+    );
+    m_pulls_from(&m, &p, how).await;
+    (a, m)
+}
+
+#[tokio::test]
+async fn relay_a_definition_settled_by_the_restore() {
+    let (a, m) = rival_definitions_settled_by_the_restore(true, Pull::Rounds).await;
+    let winner = a.engine.get_collection("shop", "orders").unwrap().index("by_x").unwrap().clone();
+    let held = m.engine.get_collection("shop", "orders").unwrap();
+    assert_eq!(
+        held.index("by_x").map(|i| i.fields.clone()),
+        Some(winner.fields),
+        "{:?}",
+        held.indexes
+    );
+}
+
+#[tokio::test]
+async fn control_relay_a_settled_definition_without_the_snapshot_hop() {
+    let (a, m) = rival_definitions_settled_by_the_restore(false, Pull::Rounds).await;
+    let winner = a.engine.get_collection("shop", "orders").unwrap().index("by_x").unwrap().clone();
+    let held = m.engine.get_collection("shop", "orders").unwrap();
+    assert_eq!(held.index("by_x").map(|i| i.fields.clone()), Some(winner.fields), "control");
+}
+
+// -- The same, through the member's own replication loop -----------------
+// The loop adds discovery, the divergence check (existence and count) and the
+// repairs they plan, which a bare round does not.
+
+#[tokio::test]
+async fn relay_an_empty_collection_created_after_m_pulled_in_the_loop() {
+    let (_a, m) = a_collection_created_after_m_pulled(true, false, Pull::Loop).await;
+    assert_eq!(documents_of(&m.engine, "shop", "orders"), 2, "m took p's window");
+    assert!(
+        m.engine.get_collection("shop", "audit").is_ok(),
+        "m learned the collection it was relayed past"
+    );
+}
+
+#[tokio::test]
+async fn lookalike_relay_a_collection_holding_a_document_heals_on_the_unknown_collection_stop_in_the_loop()
+ {
+    // The variant the finding calls covered: the window's document names a
+    // collection `m` lacks, the batch stops there and a scoped snapshot
+    // restores the definition. Passes on main.
+    let (_a, m) = a_collection_created_after_m_pulled(true, true, Pull::Loop).await;
+    assert!(m.engine.get_collection("shop", "audit").is_ok(), "healed through the stop");
+}
+
+#[tokio::test]
+async fn relay_a_vector_configuration_turned_on_after_m_pulled_in_the_loop() {
+    let (_a, m) = vectors_configured_after_m_pulled(true, Pull::Loop).await;
+    assert_eq!(documents_of(&m.engine, "shop", "orders"), 2, "m took p's window");
+    let held = m.engine.get_collection("shop", "orders").unwrap();
+    assert!(held.vector.is_some(), "and the configuration in it: {:?}", held.vector);
+}
+
+#[tokio::test]
+async fn relay_a_collection_dropped_after_m_pulled_in_the_loop() {
+    let (_a, m) = collection_dropped_after_m_pulled(true, Pull::Loop).await;
+    assert_eq!(documents_of(&m.engine, "shop", "orders"), 2, "m took p's window");
+    assert!(m.engine.get_collection("shop", "doomed").is_err(), "and the drop it was relayed past");
+}
+
+#[tokio::test]
+async fn lookalike_relay_a_delete_through_a_member_that_held_the_document_in_the_loop() {
+    // ADR-167: `p` held the document, so its restore builds the Delete entry.
+    // Passes on main.
+    let (_a, m) = document_deleted_after_m_pulled(true, true, Pull::Loop).await;
+    let held = m.engine.get_collection("shop", "orders").unwrap();
+    assert!(m.engine.get(&held, &DocId::Int64(2)).unwrap().is_none());
+}
+
+#[tokio::test]
+async fn relay_a_definition_settled_by_the_restore_in_the_loop() {
+    let (a, m) = rival_definitions_settled_by_the_restore(true, Pull::Loop).await;
+    let winner = a.engine.get_collection("shop", "orders").unwrap().index("by_x").unwrap().clone();
+    let held = m.engine.get_collection("shop", "orders").unwrap();
+    assert_eq!(
+        held.index("by_x").map(|i| i.fields.clone()),
+        Some(winner.fields),
+        "{:?}",
+        held.indexes
+    );
+}
+
+// ---------------------------------------------------------------------------
+// ADR-224: a member refused for a hole asks the others first, snapshots only
+// when none can serve it, and is bounded in how long it waits to.
+// ---------------------------------------------------------------------------
+
+/// Run `m`'s replication loop against `seeds` (with `fanout`) until `done` holds of
+/// `m`, or `within` passes. Returns whether it held.
+async fn m_replicates_until(
+    m: &Node,
+    seeds: Vec<std::net::SocketAddr>,
+    fanout: usize,
+    within: Duration,
+    done: impl Fn(&Engine) -> bool,
+) -> bool {
+    m_replicates_every(m, seeds, fanout, Duration::from_millis(300), within, done).await
+}
+
+/// [`m_replicates_until`], with a tick every `interval`.
+async fn m_replicates_every(
+    m: &Node,
+    seeds: Vec<std::net::SocketAddr>,
+    fanout: usize,
+    interval: Duration,
+    within: Duration,
+    done: impl Fn(&Engine) -> bool,
+) -> bool {
+    use kimmy_cluster::{ReplicationConfig, SeedSource, replicate};
+    let mut config = ReplicationConfig::new(vec![SeedSource::Static(seeds)], SECRET.into(), m.addr);
+    config.sync_interval = interval;
+    config.discovery_interval = Duration::from_millis(100);
+    config.fanout = fanout;
+    let looping = tokio::spawn(replicate(Arc::clone(&m.engine), config));
+    let deadline = tokio::time::Instant::now() + within;
+    let mut held = false;
+    while tokio::time::Instant::now() < deadline {
+        if done(&m.engine) {
+            held = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    looping.abort();
+    held
+}
+
+/// `a`, an origin whose oldest entry retention has collected and whose newer ones
+/// it still holds; `m`, which holds that oldest entry's document; and `p`, which
+/// joined afresh and so took a snapshot from `a`, and holds a hole.
+///
+/// So `a` can serve `m` by entries (`m` is not below `a`'s horizon) and `p` cannot
+/// (`p` is below `a`'s horizon, and so is below its own hole to anyone who asks it
+/// from `m`'s position). `p`'s address is below `a`'s, so a one-contact tick that
+/// selects in address order asks `p` first.
+async fn an_origin_that_can_serve_m_and_a_member_with_a_hole() -> (Node, Node, Node) {
+    // Two fresh nodes until `p`'s address is the lower, so that a tick selecting in
+    // address order asks `p` first (ports rise on some systems and are random on
+    // others; a node is only a bound port and an empty store).
+    let (p, a) = loop {
+        let p = node().await;
+        let a = node().await;
+        if p.addr < a.addr {
+            break (p, a);
+        }
+    };
+    let ca = a.engine.create_collection("shop", "orders").unwrap();
+    a.engine.insert(&ca, doc! { "_id": 1 }).unwrap();
+    let m = node().await;
+    sync_once(&m.engine, a.addr, SECRET, None).await.unwrap();
+    let first = m.engine.version_vector().unwrap().get(a.engine.node_id());
+
+    tokio::time::sleep(Duration::from_millis(30)).await;
+    a.engine.insert(&ca, doc! { "_id": 2 }).unwrap();
+    a.engine.insert(&ca, doc! { "_id": 3 }).unwrap();
+    // Retention takes the first write and nothing newer: `m` holds it, `a` can still
+    // serve everything `m` lacks, and a member holding nothing cannot be served.
+    a.engine
+        .collect_garbage_at(first.wall_ms + 1, kimmy_storage::RetentionPolicy::new(0, u64::MAX))
+        .unwrap();
+
+    sync_once(&p.engine, a.addr, SECRET, None).await.unwrap();
+    assert!(
+        !p.engine.state_held().unwrap().is_empty(),
+        "premise: p took a snapshot, so it holds a hole"
+    );
+    a.engine.insert(&ca, doc! { "_id": 4 }).unwrap();
+    assert!(
+        a.engine.can_serve_peer_holding(&m.engine.version_vector().unwrap()).unwrap(),
+        "premise: a can serve m by entries"
+    );
+    assert!(
+        !p.engine.can_serve_peer_holding(&m.engine.version_vector().unwrap()).unwrap(),
+        "premise: p cannot, for its hole and not for retention"
+    );
+    (a, m, p)
+}
+
+#[tokio::test]
+async fn a_member_refused_for_a_hole_is_served_by_the_origin_and_takes_no_snapshot() {
+    // The rolling-restart shape: a member comes back below another's hole while the
+    // origin can serve it. With one contact a tick, `p` is asked first. Before the
+    // set-aside that is a whole-database snapshot from `p`; now `a` serves `m`, `p`
+    // is asked again, serves it nothing it lacks, and no snapshot is taken.
+    let (a, m, p) = an_origin_that_can_serve_m_and_a_member_with_a_hole().await;
+    let caught_up = m_replicates_until(&m, vec![p.addr, a.addr], 1, Duration::from_secs(20), |m| {
+        m.get_collection("shop", "orders")
+            .and_then(|c| m.count(&c, kimmy_storage::WalkScope::Request))
+            .is_ok_and(|n| n == 4)
+    })
+    .await;
+    assert!(caught_up, "m caught up");
+    assert!(
+        m.engine.state_held().unwrap().is_empty(),
+        "by entries from the origin: m took no whole-database snapshot, which would have \
+         left it a hole of its own"
+    );
+    assert!(
+        p.engine.state_held_refusals() >= 1,
+        "and p was asked first and refused it for its hole: the case the set-aside is for"
+    );
+}
+
+#[tokio::test]
+async fn a_round_that_sets_a_refusal_aside_does_nothing_but_say_so() {
+    // The round with no tick of its own (a bare `sync_once` has deferral shut) takes the
+    // snapshot at once. With deferral open it answers that it set the peer aside, and
+    // that is all it did: no snapshot, no divergence check, the peer not reached.
+    let (_a, m, p) = an_origin_that_can_serve_m_and_a_member_with_a_hole().await;
+    let mut stalls = kimmy_cluster::transport::PeerStalls::new();
+    stalls.begin_tick(1);
+    stalls.allow_horizon_deferral(true);
+    let outcome =
+        kimmy_cluster::transport::sync_once_with(&m.engine, p.addr, SECRET, None, &mut stalls)
+            .await
+            .unwrap();
+    assert!(outcome.horizon_deferred, "{outcome:?}");
+    assert!(!outcome.exhausted && outcome.divergent.is_none() && !outcome.repairing, "{outcome:?}");
+    assert!(m.engine.state_held().unwrap().is_empty(), "no snapshot yet");
+    assert!(
+        stalls.take_reached_after(&Ok::<(), ()>(())).is_empty(),
+        "the peer is not a contact reached for the catching-up marker"
+    );
+
+    // Asked again in the same tick, it is a snapshot at once: a second refusal.
+    let again =
+        kimmy_cluster::transport::sync_once_with(&m.engine, p.addr, SECRET, None, &mut stalls)
+            .await
+            .unwrap();
+    assert!(!again.horizon_deferred);
+    assert!(!m.engine.state_held().unwrap().is_empty(), "the snapshot was taken");
+}
+
+#[tokio::test]
+async fn a_peer_set_aside_in_an_earlier_tick_is_snapshotted_at_its_next_refusal() {
+    let (_a, m, p) = an_origin_that_can_serve_m_and_a_member_with_a_hole().await;
+    let mut stalls = kimmy_cluster::transport::PeerStalls::new();
+    stalls.begin_tick(1);
+    stalls.allow_horizon_deferral(true);
+    let first =
+        kimmy_cluster::transport::sync_once_with(&m.engine, p.addr, SECRET, None, &mut stalls)
+            .await
+            .unwrap();
+    assert!(first.horizon_deferred);
+
+    // The next tick: deferral is open again (other contacts exist) and the peer is
+    // still refusing. The bound is one tick: it is not set aside twice.
+    stalls.begin_tick(2);
+    stalls.allow_horizon_deferral(true);
+    let second =
+        kimmy_cluster::transport::sync_once_with(&m.engine, p.addr, SECRET, None, &mut stalls)
+            .await
+            .unwrap();
+    assert!(!second.horizon_deferred);
+    assert!(!m.engine.state_held().unwrap().is_empty(), "snapshotted unconditionally");
+}
+
+#[tokio::test]
+async fn a_member_past_every_peers_horizon_still_snapshots() {
+    // Nothing can serve `m` by entries: it holds nothing, `a` has collected, and `p`
+    // holds a hole. Set aside once, then the snapshot -- in the same tick.
+    let (a, _m, p) = an_origin_that_can_serve_m_and_a_member_with_a_hole().await;
+    age_out_fully(&a.engine);
+    let fresh = node().await;
+    let caught_up =
+        m_replicates_until(&fresh, vec![p.addr, a.addr], 1, Duration::from_secs(20), |m| {
+            !m.state_held().unwrap().is_empty()
+        })
+        .await;
+    assert!(caught_up, "a member nobody can serve by entries takes the snapshot");
+    let c = fresh.engine.get_collection("shop", "orders").unwrap();
+    assert_eq!(fresh.engine.count(&c, kimmy_storage::WalkScope::Request).unwrap(), 4);
+}
+
+#[tokio::test]
+async fn a_refusing_peer_is_asked_again_after_the_other_contacts_in_the_same_tick() {
+    // `x` is as far along as `m` and can serve it nothing, so asking it first does not
+    // help; `p` is asked again once `x` has had its turn, still refuses, and the
+    // snapshot is taken in that tick. The interval is a minute, so a second tick is
+    // not what does it: a set-aside that waited for the next tick would still be waiting.
+    let (_a, m, p) = an_origin_that_can_serve_m_and_a_member_with_a_hole().await;
+    let x = loop {
+        let x = node().await;
+        if x.addr > p.addr {
+            break x;
+        }
+    };
+    sync_once(&x.engine, m.addr, SECRET, None).await.unwrap();
+    let caught_up = m_replicates_every(
+        &m,
+        vec![p.addr, x.addr],
+        1,
+        Duration::from_secs(60),
+        Duration::from_secs(10),
+        |m| !m.state_held().unwrap().is_empty(),
+    )
+    .await;
+    assert!(caught_up, "snapshotted within the first tick, after x had its turn");
+}
+
+#[tokio::test]
+async fn a_repair_snapshot_is_never_set_aside() {
+    // A repair asked for the snapshot of one collection: that is what it is for.
+    let (_a, m, p) = an_origin_that_can_serve_m_and_a_member_with_a_hole().await;
+    let id = m.engine.get_collection("shop", "orders").unwrap().id;
+    let mut stalls = kimmy_cluster::transport::PeerStalls::new();
+    stalls.begin_tick(1);
+    stalls.allow_horizon_deferral(true);
+    assert!(stalls.plan_repair(p.engine.node_id(), id, kimmy_cluster::transport::Repair::Snapshot));
+
+    let outcome =
+        kimmy_cluster::transport::sync_once_with(&m.engine, p.addr, SECRET, None, &mut stalls)
+            .await
+            .unwrap();
+
+    assert!(!outcome.horizon_deferred, "{outcome:?}");
+    assert_eq!(documents_of(&m.engine, "shop", "orders"), 3, "the collection came from p");
+    assert!(m.engine.state_held().unwrap().is_empty(), "a scoped snapshot grants nothing");
+}
+
+#[tokio::test]
+async fn a_new_refusal_after_a_settled_one_is_set_aside_again() {
+    // The first episode: refused, set aside, then answered by a window. The second,
+    // later: `p` snapshots again and `m` falls behind its new hole. Whatever was
+    // remembered of the first must not make the second a snapshot at once.
+    let (a, m, p) = an_origin_that_can_serve_m_and_a_member_with_a_hole().await;
+    let mut stalls = kimmy_cluster::transport::PeerStalls::new();
+    stalls.begin_tick(1);
+    stalls.allow_horizon_deferral(true);
+    let first =
+        kimmy_cluster::transport::sync_once_with(&m.engine, p.addr, SECRET, None, &mut stalls)
+            .await
+            .unwrap();
+    assert!(first.horizon_deferred);
+    // The origin serves `m`, and `p` is answered with a window (nothing to give).
+    sync_once(&m.engine, a.addr, SECRET, None).await.unwrap();
+    stalls.begin_tick(2);
+    let settled =
+        kimmy_cluster::transport::sync_once_with(&m.engine, p.addr, SECRET, None, &mut stalls)
+            .await
+            .unwrap();
+    assert!(!settled.horizon_deferred && m.engine.state_held().unwrap().is_empty());
+
+    // `a` writes, ages out, and `p` takes another snapshot: a new hole over writes `m`
+    // lacks. Then `a` writes once more so that `p`'s window is not empty.
+    let ca = a.engine.get_collection("shop", "orders").unwrap();
+    a.engine.insert(&ca, doc! { "_id": 5 }).unwrap();
+    age_out_fully(&a.engine);
+    sync_once(&p.engine, a.addr, SECRET, None).await.unwrap();
+    a.engine.insert(&ca, doc! { "_id": 6 }).unwrap();
+    sync_once(&p.engine, a.addr, SECRET, None).await.unwrap();
+
+    stalls.begin_tick(3);
+    stalls.allow_horizon_deferral(true);
+    let second =
+        kimmy_cluster::transport::sync_once_with(&m.engine, p.addr, SECRET, None, &mut stalls)
+            .await
+            .unwrap();
+    assert!(second.horizon_deferred, "a new episode is set aside again: {second:?}");
+    assert!(m.engine.state_held().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn a_member_with_one_peer_snapshots_at_once() {
+    // Nobody to ask first: the set-aside would only delay it.
+    let (_a, _m, p) = an_origin_that_can_serve_m_and_a_member_with_a_hole().await;
+    let fresh = node().await;
+    let started = tokio::time::Instant::now();
+    let caught_up = m_replicates_until(&fresh, vec![p.addr], 1, Duration::from_secs(20), |m| {
+        !m.state_held().unwrap().is_empty()
+    })
+    .await;
+    assert!(caught_up);
+    assert!(started.elapsed() < Duration::from_secs(5), "{:?}", started.elapsed());
+}
+
+#[tokio::test]
+async fn a_peer_set_aside_is_snapshotted_within_two_ticks_whatever_the_others_do() {
+    // The other contact answers the TCP connect and nothing after it, so every tick
+    // spends its whole budget on it before the set-aside peer can be asked again.
+    // The bound: the peer is carried to the next tick -- contacted first, though one
+    // contact a tick would otherwise rotate to the silent one -- where its second
+    // refusal is a snapshot. Within two ticks of the first refusal, not "when the
+    // other recovers" and not when the rotation comes round to it.
+    let (_a, _m, p) = an_origin_that_can_serve_m_and_a_member_with_a_hole().await;
+    let silent = loop {
+        let silent = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        if silent.local_addr().unwrap() > p.addr {
+            break silent;
+        }
+    };
+    let silent_at = silent.local_addr().unwrap();
+    let fresh = node().await;
+    let started = tokio::time::Instant::now();
+    let caught_up =
+        m_replicates_until(&fresh, vec![p.addr, silent_at], 1, Duration::from_secs(40), |m| {
+            !m.state_held().unwrap().is_empty()
+        })
+        .await;
+    assert!(caught_up, "the snapshot happened though the other contact never answered");
+    // One tick on the silent contact's 5 s, then the carried peer first: not a
+    // second 5 s on the silent contact, which is where the rotation would go.
+    assert!(started.elapsed() < Duration::from_secs(9), "{:?}", started.elapsed());
+    drop(silent);
+}
+
+#[tokio::test]
+async fn a_peer_set_aside_when_the_tick_runs_out_is_contacted_first_in_the_next() {
+    // The other contact is slow but answers, so it is not backed off, and with one
+    // contact a tick the rotation would go to it again. The carried peer takes the
+    // slot instead: the other contact is dialled once before the snapshot, not twice.
+    let (_a, _m, p) = an_origin_that_can_serve_m_and_a_member_with_a_hole().await;
+    let x = node().await;
+    let dialled = Arc::new(AtomicUsize::new(0));
+    let relay = loop {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        if listener.local_addr().unwrap() > p.addr {
+            break listener;
+        }
+    };
+    let relay_at = relay.local_addr().unwrap();
+    let target = x.addr;
+    tokio::spawn({
+        let dialled = Arc::clone(&dialled);
+        async move {
+            while let Ok((mut client, _)) = relay.accept().await {
+                dialled.fetch_add(1, Ordering::SeqCst);
+                tokio::spawn(async move {
+                    tokio::time::sleep(Duration::from_millis(700)).await;
+                    let Ok(mut server) = TcpStream::connect(target).await else { return };
+                    let _ = tokio::io::copy_bidirectional(&mut client, &mut server).await;
+                });
+            }
+        }
+    });
+    let fresh = node().await;
+    let caught_up =
+        m_replicates_until(&fresh, vec![p.addr, relay_at], 1, Duration::from_secs(30), |m| {
+            !m.state_held().unwrap().is_empty()
+        })
+        .await;
+    assert!(caught_up);
+    assert_eq!(
+        dialled.load(Ordering::SeqCst),
+        1,
+        "the slow contact had its one turn, and the carried peer had the next tick"
+    );
+}
+
+#[tokio::test]
+async fn a_hole_is_refused_through_two_snapshot_hops() {
+    // `a` drops the collection; `p` snapshots from `a`; `q` snapshots from `p`; `m`,
+    // which holds the collection and is behind, talks to `q` alone. `q`'s hole
+    // includes `p`'s, so it is refused, takes `q`'s snapshot, and loses the collection.
+    let a = node().await;
+    let doomed = a.engine.create_collection("shop", "doomed").unwrap();
+    a.engine.insert(&doomed, doc! { "_id": 1 }).unwrap();
+    let kept = a.engine.create_collection("shop", "orders").unwrap();
+    a.engine.insert(&kept, doc! { "_id": 1 }).unwrap();
+    let m = node().await;
+    sync_once(&m.engine, a.addr, SECRET, None).await.unwrap();
+    assert!(m.engine.get_collection("shop", "doomed").is_ok(), "premise");
+
+    assert!(a.engine.drop_collection("shop", "doomed").unwrap());
+    a.engine.insert(&kept, doc! { "_id": 2 }).unwrap();
+    age_out_fully(&a.engine);
+    let p = node().await;
+    sync_once(&p.engine, a.addr, SECRET, None).await.unwrap();
+    age_out_fully(&p.engine);
+    let q = node().await;
+    sync_once(&q.engine, p.addr, SECRET, None).await.unwrap();
+    assert!(!q.engine.state_held().unwrap().is_empty(), "premise: q holds a hole");
+
+    sync_once(&m.engine, q.addr, SECRET, None).await.unwrap();
+    assert!(m.engine.get_collection("shop", "doomed").is_err(), "m took q's snapshot");
+}
+
 // -----------------------------------------------------------------------
 // A large collection drop does not stop a member's replication (ADR-189)
 
@@ -7543,6 +8330,63 @@ async fn a_peer_that_answers_a_horizon_for_the_whole_wait_is_given_up_on() {
         None,
         "and the floor goes"
     );
+}
+
+/// A peer that took a snapshot of everything the lost-tail scenario's peer held, so
+/// that it holds the restored member's own origin as state and no entries (ADR-224).
+async fn a_peer_with_a_hole_at_the_restored_members_origin(scenario: &LostTail) -> Node {
+    age_out_fully(&scenario.peer.engine);
+    let hole = node().await;
+    sync_once(&hole.engine, scenario.peer.addr, SECRET, None).await.unwrap();
+    assert_eq!(
+        hole.engine.state_held().unwrap().get(scenario.restored.engine.node_id()),
+        scenario.peer.engine.version_vector().unwrap().get(scenario.restored.engine.node_id()),
+        "premise: its hole reaches the restored member's newest write"
+    );
+    hole
+}
+
+/// The replay asks a peer for this member's own origin from the floor. A peer whose
+/// hole lies over that span cannot say what it holds of it, and answers
+/// `BeyondHorizon` as it would for retention: the replay is not answered, it is asked
+/// again, and the refusing side counts it as the hole's (the asking side cannot tell).
+#[tokio::test]
+async fn a_replay_the_peer_refuses_for_a_hole_is_not_answered_and_is_counted_as_one() {
+    let scenario = lost_tail(2, 3, true).await;
+    let hole = a_peer_with_a_hole_at_the_restored_members_origin(&scenario).await;
+    let marker_dir = tempfile::tempdir().unwrap();
+    let catch_up = marker_in(&marker_dir);
+    catch_up.arm_replay(scenario.restored.engine.own_position_at_open(), None).unwrap();
+    for _ in 0..2 {
+        round_with(&scenario.restored, &hole, &catch_up).await;
+        assert!(
+            !catch_up.replay_answered(hole.engine.node_id()),
+            "a refusal is not an answer to the replay"
+        );
+    }
+    assert!(
+        hole.engine.state_held_refusals() >= 2,
+        "and the peer says it was its hole: {}",
+        hole.engine.state_held_refusals()
+    );
+}
+
+/// A peer that refuses the replay for a hole for the whole wait is given up on, as
+/// one that does for retention is: the replay terminates.
+#[tokio::test]
+async fn a_peer_that_refuses_the_replay_for_a_hole_for_the_whole_wait_is_given_up_on() {
+    let scenario = lost_tail(2, 3, true).await;
+    let hole = a_peer_with_a_hole_at_the_restored_members_origin(&scenario).await;
+    let marker_dir = tempfile::tempdir().unwrap();
+    let catch_up =
+        kimmy_cluster::catchup::CatchUp::open(marker_dir.path(), Duration::from_millis(300));
+    catch_up.arm_replay(scenario.restored.engine.own_position_at_open(), None).unwrap();
+    let peer = hole.engine.node_id();
+    round_with(&scenario.restored, &hole, &catch_up).await;
+    assert!(!catch_up.replay_answered(peer), "not yet: one refusal is not the wait");
+    tokio::time::sleep(Duration::from_millis(400)).await;
+    round_with(&scenario.restored, &hole, &catch_up).await;
+    assert!(catch_up.replay_answered(peer), "a refusal for the whole wait is given up on");
 }
 
 /// A floor an earlier start left, older than every peer's oplog, is clamped to

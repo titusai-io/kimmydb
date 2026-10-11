@@ -1554,6 +1554,13 @@ impl TelemetryGuard {
         );
         observe!(
             u64_observable_counter,
+            "kimmy.sync.horizon_state_held",
+            "{pull}",
+            "Pulls refused because the window would have crossed history held only as a snapshot's state.",
+            sync_horizon_state_held
+        );
+        observe!(
+            u64_observable_counter,
             "kimmy.tls.reloads.ok",
             "{reload}",
             "Certificate reloads that succeeded.",

@@ -651,8 +651,9 @@ impl Confirmer {
                 return PushResult::NothingSent {
                     their_node,
                     unreached: Some(
-                        "the member is below this node's retention horizon; anti-entropy will \
-                         hand it a snapshot"
+                        "the member is below what this node can serve (its retention horizon, or \
+                         history it holds only as a snapshot's state); anti-entropy will hand it a \
+                         snapshot or serve it by entries from another member"
                             .into(),
                     ),
                 };

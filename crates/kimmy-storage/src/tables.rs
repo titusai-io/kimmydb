@@ -281,6 +281,19 @@ pub const META_FORMAT_VERSION: &str = "format_version";
 /// written by an older build still round-trips rather than losing a key.
 pub const META_NEXT_COLLECTION_ID: &str = "next_collection_id";
 
+/// One row per origin, `state_held:<node id>`: the highest stamp a whole-database
+/// snapshot granted this node over history it holds as state and has no entries
+/// for (ADR-224).
+///
+/// In `META`, one row per origin, and not a table of its own, so that a backup
+/// carries it and a build that does not know it restores the backup and never
+/// reads the rows (`backup.rs` refuses a table tag it does not know, and
+/// `META` rows are copied whatever their key). It cannot be re-derived at open,
+/// as `OPLOG_COLLECTED` can, so a restore has to keep it.
+pub const META_STATE_HELD_PREFIX: &str = "state_held:";
+/// The first key after the `state_held:` rows (`;` follows `:`).
+pub const META_STATE_HELD_END: &str = "state_held;";
+
 /// The highest `Hlc` retention has removed from the oplog.
 ///
 /// The replication horizon, recorded rather than inferred. The oldest *retained*

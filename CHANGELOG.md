@@ -34,6 +34,28 @@ breaking changes and says so here; a `0.x.PATCH` bump never does.
   `docs/operations.md`): it reaches `dns:` and `k8s:` seeds, not `dns-srv:`. Never set
   it in a deployment; it logs a `WARN` at start.
 
+### Fixed
+
+- **A member that caught up by a whole-database snapshot no longer serves a peer a
+  window across history it holds only as state.** It held the sender's documents as
+  entries and its schema changes, drops and deletes as state only, yet advertised
+  the whole span, so a peer behind that span was served the documents without the
+  changes beside them, witnessed past them, and never asked again. Seen on a real
+  cluster loop, silently, for a vector configuration turned on or off, a collection
+  drop, an index drop and a delete the member never held. Now the member records
+  what its snapshot raised its servable vector over, and answers a peer whose window
+  would begin below it `BeyondHorizon`, which the peer meets by asking its other
+  contacts first and taking the snapshot only if none can serve it (at most one tick
+  late; at once with no other peer). This closes a vector configuration turned on, a
+  collection drop and a collection creation. **It does not yet close an index drop, a
+  vector configuration turned off, or a delete the member never held**: a snapshot
+  does not carry them, from any sender. New `kimmy_sync_horizon_state_held_total`.
+  ADR-224; amends ADR-180. No rollback boundary and no wire change: the record is
+  `META` rows (`state_held:<node id>`), which a backup carries, which a restore keeps,
+  and which 0.45.0 restores and never reads. **A snapshot taken before this release, or
+  on 0.45.0 after rolling back, leaves no record**; rebuild such a member from a peer
+  if it matters.
+
 ## 0.45.0 - 2026-10-06
 
 This is a minor release with no breaking change and no rollback boundary: no

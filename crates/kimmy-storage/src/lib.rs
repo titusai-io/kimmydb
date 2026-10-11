@@ -86,8 +86,8 @@ pub use open_progress::{
 };
 pub use purge::PurgeCounters;
 pub use snapshot::{
-    CollectionState, SNAPSHOT_PAGE, SnapshotApplied, SnapshotCursor, SnapshotDoc, SnapshotPage,
-    SnapshotProgress, SnapshotTombstone,
+    CollectionState, SNAPSHOT_PAGE, ServeVerdict, SnapshotApplied, SnapshotCursor, SnapshotDoc,
+    SnapshotPage, SnapshotProgress, SnapshotTombstone,
 };
 pub use sync::{
     EntryWait, MarkedRange, PeerWindow, PullTiming, SyncOutcome, UnknownCollection, WindowEnd,

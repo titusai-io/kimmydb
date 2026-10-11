@@ -105,6 +105,10 @@ pub struct StorageReadings {
     /// here: the engine counts each once its commit lands, which a round's
     /// report, returned only when the whole page succeeds, could not.
     pub sync_ddl_relogged: u64,
+    /// Windows refused a peer because they would have crossed history this node
+    /// holds only as the state a snapshot gave it (`Engine::state_held_refusals`,
+    /// ADR-224). A reading, for the reason `sync_ddl_relogged` is.
+    pub sync_horizon_state_held: u64,
     /// How long writes waited for the single writer, the writes that gave
     /// up waiting inside their budget, and the longest any one transaction
     /// held it (ADR-151). The wait is the part of a write's latency that
@@ -423,6 +427,8 @@ pub struct MetricsSnapshot {
     /// Schema changes a snapshot restore re-logged so that this node can
     /// serve them onward (ADR-180). One of the engine's readings.
     pub sync_ddl_relogged: u64,
+    /// Windows refused a peer for a hole (ADR-224). One of the engine's readings.
+    pub sync_horizon_state_held: u64,
     /// Collections the cross-member divergence check currently has confirmed
     /// (ADR-133): held by a peer and not here, or held by both with
     /// disagreeing document counts, seen on two ticks running. Moves for a
@@ -1301,6 +1307,7 @@ impl Metrics {
                 self.get(&self.sync_serve_failures[slot])
             }),
             sync_ddl_relogged: readings.sync_ddl_relogged,
+            sync_horizon_state_held: readings.sync_horizon_state_held,
             sync_divergent_collections: self.get(&self.sync_divergent_collections),
             sync_divergence_checks: self.get(&self.sync_divergence_checks),
             sync_divergence_skips: self.get(&self.sync_divergence_skips),
@@ -1667,6 +1674,9 @@ impl Metrics {
              # HELP kimmy_sync_ddl_relogged_total Schema changes a snapshot restore appended to this node's oplog so that it can serve them onward. Not an error: 0 on a member that never caught up by snapshot, and one per index definition a snapshot restored where it did not already hold the entry.\n\
              # TYPE kimmy_sync_ddl_relogged_total counter\n\
              kimmy_sync_ddl_relogged_total {sync_ddl_relogged}\n\
+             # HELP kimmy_sync_horizon_state_held_total Pulls this node refused because the window would have crossed history it holds only as the state a snapshot gave it, not because retention removed it (ADR-224). The member asking is told BeyondHorizon; it asks another member first and takes a snapshot only if none can serve it. Not an error: 0 on a member that never caught up by a whole-database snapshot, and a few after one while members behind its grant ask it first.\n\
+             # TYPE kimmy_sync_horizon_state_held_total counter\n\
+             kimmy_sync_horizon_state_held_total {sync_horizon_state_held}\n\
              # HELP kimmy_sync_divergent_collections Collections a periodic cross-member check currently finds disagreeing with a peer - held there and not here, or held by both with a different document count - confirmed on two checks running. 0 on a converged cluster. Moves for a divergence that leaves every other sync series reading healthy, because nothing about it fails a round.\n\
              # TYPE kimmy_sync_divergent_collections gauge\n\
              kimmy_sync_divergent_collections {sync_divergent}\n\
@@ -1807,6 +1817,7 @@ impl Metrics {
             sync_ddl_held_push = self.get(&self.sync_ddl_held_push),
             ddl_confirm_pushes = self.get(&self.ddl_confirm_pushes),
             sync_ddl_relogged = readings.sync_ddl_relogged,
+            sync_horizon_state_held = readings.sync_horizon_state_held,
             sync_divergent = self.get(&self.sync_divergent_collections),
             sync_div_ran = self.get(&self.sync_divergence_checks),
             sync_div_skipped = self.get(&self.sync_divergence_skips),
@@ -2711,6 +2722,7 @@ mod tests {
             // this one match the wrong line.
             index_undecidable: 37,
             sync_ddl_relogged: 91,
+            sync_horizon_state_held: 92,
             webhook_active: 15,
             webhook_invalidated: 16,
             webhook_unreadable: 38,
@@ -3344,6 +3356,9 @@ kimmy_replay_total{via=\"outbound\",result=\"stalled\"} 174
 # HELP kimmy_sync_ddl_relogged_total Schema changes a snapshot restore appended to this node's oplog so that it can serve them onward. Not an error: 0 on a member that never caught up by snapshot, and one per index definition a snapshot restored where it did not already hold the entry.
 # TYPE kimmy_sync_ddl_relogged_total counter
 kimmy_sync_ddl_relogged_total 91
+# HELP kimmy_sync_horizon_state_held_total Pulls this node refused because the window would have crossed history it holds only as the state a snapshot gave it, not because retention removed it (ADR-224). The member asking is told BeyondHorizon; it asks another member first and takes a snapshot only if none can serve it. Not an error: 0 on a member that never caught up by a whole-database snapshot, and a few after one while members behind its grant ask it first.
+# TYPE kimmy_sync_horizon_state_held_total counter
+kimmy_sync_horizon_state_held_total 92
 # HELP kimmy_sync_divergent_collections Collections a periodic cross-member check currently finds disagreeing with a peer - held there and not here, or held by both with a different document count - confirmed on two checks running. 0 on a converged cluster. Moves for a divergence that leaves every other sync series reading healthy, because nothing about it fails a round.
 # TYPE kimmy_sync_divergent_collections gauge
 kimmy_sync_divergent_collections 5
@@ -3907,6 +3922,7 @@ kimmy_storage_cache_reads_total{result=\"miss\"} 9104
             }
         }
         expect(&format!("kimmy_sync_ddl_relogged_total {}\n", s.sync_ddl_relogged));
+        expect(&format!("kimmy_sync_horizon_state_held_total {}\n", s.sync_horizon_state_held));
         expect(&format!("kimmy_sync_divergent_collections {}\n", s.sync_divergent_collections));
         expect(&format!(
             "kimmy_sync_divergence_checks_total{{outcome=\"ran\"}} {}\n",
@@ -4254,7 +4270,8 @@ kimmy_storage_cache_reads_total{result=\"miss\"} 9104
         // since ADR-184, one retry counter per supervised task; since
         // ADR-185, one for documents an index holds because its partial
         // filter could not decide them; and since ADR-195, one for sync
-        // ticks a reset scheduled.
+        // ticks a reset scheduled; and since ADR-224, one for pulls refused for a
+        // hole a snapshot left.
         assert_eq!(
             samples,
             108 + 6
@@ -4326,7 +4343,9 @@ kimmy_storage_cache_reads_total{result=\"miss\"} 9104
                 + 4
                 // And the writer's wedge flag and the age of the hold it judges
                 // (ADR-220).
-                + 2,
+                + 2
+                // Pulls refused for a hole a snapshot left (ADR-224).
+                + 1,
             "expected one sample per series: {out}"
         );
     }
