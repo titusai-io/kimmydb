@@ -1362,7 +1362,7 @@ impl Engine {
         );
 
         let node_id = Self::load_or_create_node_id(&db)?;
-        let resumed = Self::last_oplog_hlc(&db)?;
+        let resumed = Self::resume_hlc(&db)?;
 
         if resumed != Hlc::ZERO {
             debug!(hlc = %resumed, "resumed logical clock from the oplog tail");
@@ -3396,6 +3396,28 @@ impl Engine {
         Ok(())
     }
 
+    /// Where the logical clock resumes: the highest stamp this store has seen, which is
+    /// the oplog's tail **or** a stamp a version vector names.
+    ///
+    /// The oplog alone is not enough. A completed snapshot raises both vectors over
+    /// everything its sender covered (ADR-152), stamps of changes it applied as state
+    /// (a vector configuration's, ADR-226) among them, and those have no entry here;
+    /// the clock had folded them in while the process ran (`witness`), and a restart
+    /// that resumed from the oplog tail alone would mint the next change below one
+    /// already standing.
+    fn resume_hlc(db: &Database) -> Result<Hlc> {
+        let tail = Self::last_oplog_hlc(db)?;
+        let named = [tables::OPLOG_VERSIONS, tables::OPLOG_WITNESSED]
+            .into_iter()
+            .map(|table| Self::read_versions(db, table))
+            .collect::<Result<Vec<_>>>()?
+            .into_iter()
+            .flat_map(|versions| versions.iter().map(|(_, hlc)| hlc).collect::<Vec<_>>())
+            .max()
+            .unwrap_or(Hlc::ZERO);
+        Ok(tail.max(named))
+    }
+
     /// The highest stamp in the oplog, used to resume the logical clock.
     ///
     /// Without this, a restart would mint stamps below ones already written,
@@ -3430,6 +3452,22 @@ impl Engine {
         let txn = self.db().begin_read()?;
         let oplog = txn.open_table(tables::OPLOG)?;
         Ok(oplog.get(key.as_slice())?.is_some())
+    }
+
+    /// A stamp for a change this member makes now, **above** `floor` whatever the clock
+    /// says: the standing stamp of the thing it changes. A restart that lost a stamp
+    /// the clock had folded in, or a clock set back, would otherwise mint a change
+    /// below the one it replaces, and a stamp that moves backwards is a change a
+    /// later, older one can overwrite (ADR-226).
+    pub(crate) fn next_stamp_above(&self, floor: Option<Stamp>) -> Stamp {
+        let stamp = self.next_stamp();
+        match floor {
+            Some(floor) if stamp <= floor => {
+                self.witness(&floor);
+                self.next_stamp()
+            }
+            _ => stamp,
+        }
     }
 
     /// Move the local clock past `stamp`, so that a write made from here on is

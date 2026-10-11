@@ -80,9 +80,24 @@ pub(crate) enum Configured {
     /// later than the shadow's drop outlived the drop, and the shadow it
     /// created replicated back to the members that had dropped it.
     FromEntry(kimmy_core::Stamp),
-    /// A snapshot page's definition. The shadow is its own collection on the
-    /// page, restored at its own stamp, and is not created here.
-    FromSnapshot,
+    /// A snapshot page's definition, with the stamp of the change it describes
+    /// (`CollectionState::vector_changed`): `None` from a sender that did not stamp
+    /// it. The shadow is its own collection on the page, restored at its own stamp,
+    /// and is not created here.
+    FromSnapshot(Option<kimmy_core::Stamp>),
+}
+
+impl Configured {
+    /// The stamp of the change this applies, when it comes with one from another
+    /// member: what the standing state is judged against (ADR-226). A local change
+    /// mints its own, under the writer.
+    fn stamp(self) -> Option<kimmy_core::Stamp> {
+        match self {
+            Self::Locally => None,
+            Self::FromEntry(stamp) => Some(stamp),
+            Self::FromSnapshot(stamp) => stamp,
+        }
+    }
 }
 
 impl crate::Engine {
@@ -142,6 +157,14 @@ impl crate::Engine {
             if history(&meta) {
                 #[cfg(test)]
                 crate::sync::race_hooks::absorbed(crate::sync::race_hooks::Race::VectorHistory);
+                return Ok(meta);
+            }
+            // Last writer wins, on the stamp (ADR-226): a change at or below the one
+            // standing here is the same change arriving again, or an older one
+            // arriving late, and is not applied. An unstamped standing state reads as
+            // older than any stamped change.
+            if by.stamp().is_some_and(|incoming| meta.vector_changed.is_some_and(|c| c >= incoming))
+            {
                 return Ok(meta);
             }
 
@@ -212,7 +235,7 @@ impl crate::Engine {
                     &|dropped| stamp < dropped,
                     || stamp,
                 )),
-                Configured::FromSnapshot => None,
+                Configured::FromSnapshot(_) => None,
             };
             let shadow_entry = match created {
                 Some(Ok(crate::engine::InTxn::Created(_, entry))) => entry,
@@ -244,11 +267,21 @@ impl crate::Engine {
                 );
                 continue;
             }
+            // The stamp of this change: minted here, after the shadow's, for a local
+            // one, and the entry's own for a peer's. A page from a sender that did not
+            // stamp it leaves the standing stamp alone.
+            let stamp = match by {
+                Configured::Locally => Some(self.next_stamp_above(meta.vector_changed)),
+                other => other.stamp(),
+            };
+            if stamp.is_some() {
+                meta.vector_changed = stamp;
+            }
             crate::Engine::put_collection_meta(&txn, &meta)?;
 
             let logged = if log {
                 let entry = crate::engine::ddl_entry(
-                    self.next_stamp(),
+                    stamp.expect("a local change mints its stamp"),
                     kimmy_core::OpKind::ConfigureVectors,
                     meta.id,
                     &kimmy_core::VectorSet {
@@ -299,7 +332,10 @@ impl crate::Engine {
         collection: &str,
         drop_vectors: bool,
     ) -> Result<VectorsOff> {
-        let off = self.disable_vectors_inner(db, collection, drop_vectors, true, &|_| false)?;
+        let off =
+            self.disable_vectors_inner(db, collection, drop_vectors, Configured::Locally, &|_| {
+                false
+            })?;
         if off.disabled || !drop_vectors {
             return Ok(off);
         }
@@ -351,9 +387,10 @@ impl crate::Engine {
         db: &str,
         collection: &str,
         drop_vectors: bool,
-        log: bool,
+        by: Configured,
         history: &dyn Fn(&CollectionMeta) -> bool,
     ) -> Result<VectorsOff> {
+        let log = matches!(by, Configured::Locally);
         // **A loop, not a self-call.** Every retry passes the same arguments, so
         // a lost race is a `continue`. It was a self-call, which made an
         // unbounded retry a stack overflow — and a bound low enough to protect
@@ -371,7 +408,20 @@ impl crate::Engine {
             if history(&meta) {
                 return Ok(VectorsOff { disabled: false, dropped_vectors: false });
             }
-            if meta.vector.is_none() {
+            // Last writer wins, on the stamp (ADR-226), as for a configuration.
+            if by.stamp().is_some_and(|incoming| meta.vector_changed.is_some_and(|c| c >= incoming))
+            {
+                return Ok(VectorsOff { disabled: false, dropped_vectors: false });
+            }
+            // Already off. A **local** call is still a change: it is stamped and logged,
+            // so the stamp is in this member's servable vector and a snapshot page
+            // carrying it passes the receiver's coverage gate (ADR-163, ADR-226); a
+            // retried disable therefore writes where it used to write nothing. A
+            // peer's, or a page's, only records the stamp. Neither buries a shadow
+            // (the caller drops a leftover one itself) or reports a configuration
+            // turned off.
+            let already_off = meta.vector.is_none();
+            if already_off && by.stamp().is_none() && !log {
                 return Ok(VectorsOff { disabled: false, dropped_vectors: false });
             }
 
@@ -385,11 +435,18 @@ impl crate::Engine {
                 crate::sync::race_hooks::absorbed(crate::sync::race_hooks::Race::VectorRemoval);
                 continue;
             }
+            let stamp = match by {
+                Configured::Locally => Some(self.next_stamp_above(meta.vector_changed)),
+                other => other.stamp(),
+            };
+            if stamp.is_some() {
+                meta.vector_changed = stamp;
+            }
             crate::Engine::put_collection_meta(&txn, &meta)?;
 
             let logged = if log {
                 let entry = crate::engine::ddl_entry(
-                    self.next_stamp(),
+                    stamp.expect("a local change mints its stamp"),
                     kimmy_core::OpKind::ConfigureVectors,
                     meta.id,
                     &kimmy_core::VectorSet {
@@ -409,7 +466,7 @@ impl crate::Engine {
             // commit used to follow this one, and a failure between the two
             // answered an error for a configuration change that had landed
             // (ADR-192).
-            let shadow = if drop_vectors {
+            let shadow = if drop_vectors && !already_off {
                 let burial =
                     self.bury_in_txn(&txn, db, &vector_meta::shadow_name(collection), None);
                 match burial {
@@ -429,6 +486,9 @@ impl crate::Engine {
             let dropped_vectors = shadow.is_some();
             if let Some(burial) = shadow {
                 self.finish_burial(db, &vector_meta::shadow_name(collection), burial);
+            }
+            if already_off {
+                return Ok(VectorsOff { disabled: false, dropped_vectors: false });
             }
             info!(db, collection, drop_vectors, "disabled auto-embedding");
             return Ok(VectorsOff { disabled: true, dropped_vectors });
@@ -1250,9 +1310,18 @@ mod tests {
         }
         assert_eq!(kinds, vec![OpKind::ConfigureVectors, OpKind::DropCollection]);
 
+        // A resend says it did nothing -- the configuration was already off -- and it
+        // is a change all the same (ADR-226): stamped and logged, one commit, so the
+        // stamp is in this member's servable vector and a page carrying it passes the
+        // receiver's coverage gate. It used to commit nothing.
         let resend = engine.disable_vectors_reporting("app", "docs", true).unwrap();
         assert_eq!(resend, VectorsOff { disabled: false, dropped_vectors: false });
-        assert_eq!(engine.commits() - before, 1, "a resend commits nothing");
+        assert_eq!(engine.commits() - before, 2, "a resend is stamped and logged: one commit");
+        let mut kinds = Vec::new();
+        while let Ok(entry) = rx.try_recv() {
+            kinds.push(entry.kind);
+        }
+        assert_eq!(kinds, vec![OpKind::ConfigureVectors], "and its entry replicates");
     }
 
     #[test]

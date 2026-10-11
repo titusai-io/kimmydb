@@ -959,6 +959,15 @@ same.
   dropped: a unique index went on refusing inserts, a TTL index on expiring documents. An older
   sender writes nothing and an older receiver ignores the list, so a mixed cluster keeps the old
   behaviour until every member has rolled.
+- **A snapshot carries a vector configuration turned off too** ([ADR-226](decisions.md)): a
+  collection's vector state carries the stamp of its latest change, a page says when it was
+  turned off, and the receiver applies the later of its own and the page's. The entries path is
+  last-writer-wins on the same stamp, and a `disable` of a configuration already off is stamped
+  and logged (a retried disable writes and replicates). State written before this release is
+  unstamped and counts as older than any stamped change, so a change made on a 0.45 build after
+  the origin turned the configuration off is lost when a page arrives; so is, after rolling back to
+  0.45 and forward again, a change made on 0.45 to a page stamped older than it in real time but
+  newer than the member's last stamped change (0.45 leaves the collection unstamped).
 - **One maximum per origin, so it is conservative.** A requester behind the member's
   own prefix of an origin is refused too, though the prefix could be served; it asks
   elsewhere or snapshots.

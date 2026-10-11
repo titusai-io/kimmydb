@@ -6291,6 +6291,75 @@ async fn an_index_drop_reaches_a_member_through_two_snapshot_hops() {
 }
 
 // ---------------------------------------------------------------------------
+// ADR-226: a snapshot carries a vector configuration turned off, to the member
+// taking it and, through a member that took it, to the next.
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn relay_a_vector_configuration_turned_off_after_m_pulled() {
+    let (_a, m) = vectors_disabled_after_m_pulled(true, Pull::Rounds).await;
+    assert_eq!(documents_of(&m.engine, "shop", "orders"), 2, "m took p's window");
+    let held = m.engine.get_collection("shop", "orders").unwrap();
+    assert!(held.vector.is_none(), "and the configuration it was relayed past: {:?}", held.vector);
+}
+
+#[tokio::test]
+async fn relay_a_vector_configuration_turned_off_after_m_pulled_in_the_loop() {
+    let (_a, m) = vectors_disabled_after_m_pulled(true, Pull::Loop).await;
+    assert_eq!(documents_of(&m.engine, "shop", "orders"), 2, "m took p's window");
+    let held = m.engine.get_collection("shop", "orders").unwrap();
+    assert!(held.vector.is_none(), "and the configuration it was relayed past: {:?}", held.vector);
+}
+
+#[tokio::test]
+async fn a_snapshot_carries_a_vector_configuration_turned_off_to_the_member_taking_it() {
+    let (a, m, ca) = origin_and_a_member_that_holds_it(|engine, _| {
+        engine.configure_vectors("shop", "orders", vector_config()).unwrap();
+    })
+    .await;
+    a.engine.disable_vectors("shop", "orders", false).unwrap();
+    a.engine.insert(&ca, doc! { "_id": 2, "x": 2 }).unwrap();
+    m_takes_the_origins_snapshot(&a, &m).await;
+
+    assert_eq!(documents_of(&m.engine, "shop", "orders"), 2, "m took the snapshot");
+    let held = m.engine.get_collection("shop", "orders").unwrap();
+    assert!(held.vector.is_none(), "and the configuration it turned off: {:?}", held.vector);
+}
+
+#[tokio::test]
+async fn a_vector_configuration_turned_off_reaches_a_member_through_two_snapshot_hops() {
+    // `a` turns the configuration off; `p` snapshots from `a`; `q` snapshots from `p`;
+    // `m`, which holds the configuration and is behind, talks to `q` ALONE (with the
+    // origin in reach it would be served by entries and the test would pass for the
+    // wrong reason). `q` holds a hole (ADR-224), refuses `m`, and `q`'s page carries
+    // the off with the stamp it took from `p`'s, which took it from `a`'s.
+    let (a, m, ca) = origin_and_a_member_that_holds_it(|engine, _| {
+        engine.configure_vectors("shop", "orders", vector_config()).unwrap();
+    })
+    .await;
+    assert!(m.engine.get_collection("shop", "orders").unwrap().vector.is_some(), "premise");
+    a.engine.disable_vectors("shop", "orders", false).unwrap();
+    a.engine.insert(&ca, doc! { "_id": 2, "x": 2 }).unwrap();
+    age_out_fully(&a.engine);
+    let p = node().await;
+    sync_once(&p.engine, a.addr, SECRET, None).await.unwrap();
+    age_out_fully(&p.engine);
+    let q = node().await;
+    sync_once(&q.engine, p.addr, SECRET, None).await.unwrap();
+    assert!(q.engine.get_collection("shop", "orders").unwrap().vector.is_none());
+
+    sync_once(&m.engine, q.addr, SECRET, None).await.unwrap();
+
+    let held = m.engine.get_collection("shop", "orders").unwrap();
+    assert!(held.vector.is_none(), "m took q's snapshot: {:?}", held.vector);
+    assert_eq!(
+        held.vector_changed,
+        a.engine.get_collection("shop", "orders").unwrap().vector_changed,
+        "at the origin's stamp"
+    );
+}
+
+// ---------------------------------------------------------------------------
 // ADR-224: a member refused for a hole asks the others first, snapshots only
 // when none can serve it, and is bounded in how long it waits to.
 // ---------------------------------------------------------------------------

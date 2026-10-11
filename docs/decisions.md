@@ -26101,3 +26101,81 @@ an error, and its tombstone not recorded. **Two survive, argued equivalent:** th
 before drops), above; and `stamp <= created` for `stamp < created` in the incarnation guard, because
 the two stamps are never equal (a stamp is unique per write).
 
+## ADR-226 — A vector configuration carries the stamp of its latest change, and a snapshot page says when it was turned off
+
+**Decision.** `CollectionMeta` gains `vector_changed: Option<Stamp>`, the stamp of the latest
+change to `vector`: a configuration, a change of it, or turning it off. `CollectionState`, the
+definition a snapshot page carries, gains the same field. Both are `#[serde(default)]`, and the
+stamp is **not** inside `VectorConfig`, which refuses unknown fields.
+
+- **A local change mints its stamp under the writer** and uses it for the entry it logs, so the
+  stamp is in this member's servable vector. **A disable of a configuration already off is a
+  change too**: it is stamped and logged (a `ConfigureVectors` entry with no configuration), one
+  commit, so the stamp passes a receiver's coverage gate (ADR-163) when a page carries it. A
+  retried disable therefore writes where it used to write nothing; it still answers that it
+  turned nothing off, and a `drop_vectors` retry still drops a leftover shadow.
+- **The entries path is last-writer-wins on the stamp.** A `ConfigureVectors` entry whose stamp
+  is at or below the standing `vector_changed` is not applied: it is the same change again, or an
+  older one arriving late. It used to follow arrival order, so a re-served window could flip a
+  configuration back; two concurrent changes from two members now converge on the later stamp.
+  An unstamped standing state reads as older than any stamped change.
+- **A page's definition is applied by its stamp.** A dated page whose stamp the sender's own
+  coverage names (ADR-163) and that is newer than the standing change sets the configuration or
+  **turns it off**, records the stamp, and moves this member's clock past it, so a later local
+  change cannot mint one below it. A turned-off configuration never discards the stored vectors
+  (as for an entry from elsewhere). An **undated** page (a sender from before the stamp) **never
+  overrides a stamped local value**: it can only add a configuration to a collection whose vector
+  state was last written unstamped, as it always did, and it can never turn one off.
+
+**Why.** `CollectionState.vector` was a presence: the page could say "configured" and not "turned
+off". A member holding a configuration the sender had turned off kept it, and on a whole-database
+snapshot that is permanent for the reason ADR-162 gives for collections: the grant covers the
+entry that turned it off. The member went on embedding documents, refusing chunk writes and
+answering vector search from a configuration the cluster had agreed was gone. Nothing detected
+it: the existence check hides a shadow whose parent is present. Swept 2026-10-10 through real
+rounds and the member's own loop: silent; and not carried by a snapshot from the origin itself.
+
+**What this closes, and what it needs.** A snapshot taken **directly** from the member that turned
+it off, or from any member that took the page, carries the off. A **relay** needs ADR-224 as well:
+the member taking the page applies the off with no entry behind it, so what it serves a third member
+by entries lacks it, and ADR-224 is what makes it refuse that member until it takes the snapshot.
+Tested at one hop and two, with the observer talking to one peer only.
+
+**Accepted and documented.** An unstamped local state counts as older than any stamped page, so
+state written before this release converges. A 0.45-era local change made *after* the origin's off
+is therefore lost when a page arrives: the page is dated and the local value is not. The same
+reading names the **rollback-and-forward** case: a vector change made while on 0.45 leaves the
+collection unstamped (0.45 rewrites the metadata without the field), so after rolling forward again it
+reads as older than any stamped change, and a page stamped older than that change in real time, but
+newer than the member's last stamped one, replaces it. The two directions of the comparison are
+tested.
+
+**The tie is the whole stamp, and a stamp only moves forward.** Two origins can make changes at one
+`Hlc`; the node id breaks the tie (`Stamp` orders by both), so every member picks the same winner
+whichever change reached it first. Entries and pages are tested in both orders with two origins at one
+`Hlc`; judging by the `Hlc` alone makes the answer depend on the order. A local change is stamped
+**above the one it replaces** whatever the clock says (`next_stamp_above`), and the clock itself
+resumes at the highest stamp the store has seen: the oplog's tail **or** a stamp a version vector names.
+A completed snapshot raises the vectors over stamps it applied as state (a vector change's among them)
+that have no entry here; resuming from the oplog tail alone would lose what the clock had folded in and
+mint the next change below one already standing, and a partial snapshot, which has granted no vector
+yet, can leave a stamp in the definition that only the clamp protects.
+
+**Wire and disk.** Additive, defaulted fields: an older sender writes none and an older receiver
+ignores the key, so a mixed pair keeps the previous behaviour until both have rolled. A build
+rewriting `CollectionMeta` without knowing the field drops the stamp, which is harmless (the state
+reads as unstamped, older than any change). No table, no backup tag, no schema version.
+
+**Tests.** `kimmy-storage`: a page carries the stamp of the latest change, and the sender's coverage
+names it; a snapshot turns the configuration off at the sender's stamp, and the member serves it
+onward; unstamped local state reads as older than a stamped off; a stamped local configuration newer
+than the page's off stays; an undated page never overrides a stamped local value in either direction,
+and still adds a configuration to unstamped state; a stamp the sender's coverage does not name is
+ignored; applying a stamp moves the local clock past it; an entry is last-writer-wins on its stamp
+(an earlier configuration delivered after the later off does not undo it); a disable of a
+configuration already off is stamped and logged, and a page from a sender whose configuration was
+never on still turns a receiver's off; a state without the stamp reads as unstamped; two origins' changes
+at one `Hlc` converge in both orders, by entries and by page; a restart mints no change below one a completed
+snapshot applied, resumes the clock from the version vectors as well as the oplog, and a restart part-way
+through a snapshot still mints above the standing stamp. `kimmy-cluster`:
+the relay through real rounds and the member's own loop, the direct snapshot, two snapshot hops.

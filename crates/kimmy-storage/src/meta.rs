@@ -39,6 +39,21 @@ pub struct CollectionMeta {
     /// Auto-embedding configuration, when enabled for this collection.
     #[serde(default)]
     pub vector: Option<VectorConfig>,
+    /// The stamp of the latest change to `vector`: a configuration, a change of it,
+    /// or turning it off (ADR-226). `None` on a collection whose vector state was
+    /// last written by a build that did not stamp it, which reads as older than any
+    /// stamped change.
+    ///
+    /// It makes "off" a dated fact. A snapshot page carries `vector` as a presence
+    /// only, so a configuration turned off could not be told from one never turned
+    /// on, and a member that held the configuration kept it; with a stamp on both
+    /// sides, the later change wins and a page can say "off at s". The same stamp
+    /// makes the entries path last-writer-wins, which arrival order was not.
+    ///
+    /// Not inside `VectorConfig`, which refuses unknown fields: a build that does not
+    /// know this reads a `CollectionMeta` carrying it and ignores it.
+    #[serde(default)]
+    pub vector_changed: Option<kimmy_core::Stamp>,
     /// The stamp below which an entry targets a **previous incarnation** of
     /// this collection — set on every creation since ADR-081.
     ///
@@ -72,6 +87,7 @@ impl CollectionMeta {
             indexes: Vec::new(),
             index_id_counter: 0,
             vector: None,
+            vector_changed: None,
             incarnation_floor,
         }
     }
