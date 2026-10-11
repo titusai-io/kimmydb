@@ -952,6 +952,13 @@ refusing member logs the first to each peer in a minute at `WARN`
 snapshot gave it`), which tells it from a retention refusal, whose wire answer is the
 same.
 
+- **A snapshot carries the index drops too** ([ADR-225](decisions.md)): its page lists the
+  sender's index-drop tombstones (one per index dropped within tombstone retention), the
+  receiver judges each as a replicated drop (an index created after it is left alone), records
+  it, and serves it onward. Before, a member that took a snapshot kept an index the sender had
+  dropped: a unique index went on refusing inserts, a TTL index on expiring documents. An older
+  sender writes nothing and an older receiver ignores the list, so a mixed cluster keeps the old
+  behaviour until every member has rolled.
 - **One maximum per origin, so it is conservative.** A requester behind the member's
   own prefix of an origin is refused too, though the prefix could be served; it asks
   elsewhere or snapshots.

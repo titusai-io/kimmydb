@@ -1617,6 +1617,7 @@ mod tests {
                 key: vec![4, 5],
                 stamp: stamp(600),
             }],
+            dropped_indexes: vec![(CollectionId(7), 2_032_551_883, stamp(550))],
         };
 
         let mut written = Vec::new();
@@ -1624,7 +1625,9 @@ mod tests {
         let body = bson::deserialize_from_slice::<bson::Document>(&written[4..]).unwrap();
         let sent = body.get_document("Snapshot").unwrap().clone();
         assert!(
-            sent.contains_key("dropped_collections") && sent.contains_key("deleted_documents"),
+            sent.contains_key("dropped_collections")
+                && sent.contains_key("deleted_documents")
+                && sent.contains_key("dropped_indexes"),
             "the frame must carry both fields for this to test anything: {sent}"
         );
 
@@ -1634,6 +1637,24 @@ mod tests {
         assert_eq!(older.next, page.next);
         assert_eq!(older.versions, versions);
         assert_eq!(older.dropped, None);
+
+        // The other direction (ADR-225): a sender that predates `dropped_indexes` writes
+        // none, and the page reads with an empty list and everything else as sent.
+        let mut before_indexes = sent.clone();
+        before_indexes.remove("dropped_indexes");
+        let frame = {
+            let bytes = bson::serialize_to_vec(&bson::doc! { "Snapshot": before_indexes }).unwrap();
+            let mut buffer = (bytes.len() as u32).to_be_bytes().to_vec();
+            buffer.extend_from_slice(&bytes);
+            buffer
+        };
+        let mut without = page.clone();
+        without.dropped_indexes = Vec::new();
+        assert_eq!(
+            read_frame(&mut frame.as_slice()).await.unwrap(),
+            Message::Snapshot(Box::new(without)),
+            "a sender that predates the index drops writes none, and the page still reads"
+        );
 
         let mut future = sent;
         future.insert("somethingNewer", true);
