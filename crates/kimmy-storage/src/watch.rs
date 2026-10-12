@@ -3867,6 +3867,26 @@ mod tests {
                 engine.creation_arrival(late.id, late.created, &mut Walked::default()).unwrap();
             creation.expect("the creation is in the log")
         };
+        // Entries stamped at the same instant by another node, sorting before
+        // the creation's own: another collection's creation, and a document of
+        // this one. The creation is the entry that creates this collection.
+        let neighbour = NodeId::from_bytes([0; 16]);
+        let stamp = Stamp::new(late.created, neighbour);
+        let other = crate::engine::ddl_entry(
+            stamp,
+            OpKind::CreateCollection,
+            CollectionId::derive("app", "z"),
+            &kimmy_core::CollectionRef::new("app", "z"),
+        )
+        .unwrap();
+        let document = kimmy_core::OplogEntry {
+            stamp: Stamp::new(late.created, NodeId::from_bytes([1; 16])),
+            kind: OpKind::Insert,
+            collection: late.id,
+            doc_id: Some(kimmy_core::DocId::Int64(2)),
+            body: Some(bson::serialize_to_vec(&doc! { "_id": 2 }).unwrap()),
+        };
+        engine.apply_batch(&[other, document]).unwrap();
         // The drop's entry arrives after the collection's own, as it does on a
         // member that learned of a database's drop late.
         std::thread::sleep(std::time::Duration::from_millis(5));
@@ -3892,6 +3912,37 @@ mod tests {
             "the survivor's entries before the sentinel are kept"
         );
         assert_eq!(resolved.incarnation_floor, Some((late.id, sentinel)));
+    }
+
+    /// A tail open takes no history, and the clamp does not move it back to the
+    /// life's first entry: the drop's entry held, and not.
+    #[test]
+    fn a_tail_open_on_a_recreated_collection_is_not_moved_back() {
+        let (engine, _coll, _dir) = setup();
+        let x = engine.create_collection("app", "x").unwrap();
+        assert!(engine.drop_collection("app", "x").unwrap());
+        engine.purge_dropped_collection(x.id).unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(5));
+        let x = engine.create_collection("app", "x").unwrap();
+        engine.insert(&x, doc! { "_id": "new" }).unwrap();
+        let tail = engine.next_arrival_seq().unwrap();
+        let mut walked = Walked::default();
+        let options = WatchOptions::default();
+        let held = engine.resolve_start(&WatchScope::Collection(x.id), &options, &mut walked);
+        assert_eq!(held.unwrap().start, tail, "with the drop's entry held");
+
+        // The same where only the tombstone is held, as after a snapshot.
+        let y = CollectionId::derive("app", "y");
+        let dropped_at =
+            Stamp::new(Hlc::new(crate::physical_now_ms(), 0), NodeId::from_bytes([7; 16]));
+        engine.record_collection_drop(y, dropped_at).unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(5));
+        let y = engine.create_collection("app", "y").unwrap();
+        engine.insert(&y, doc! { "_id": 1 }).unwrap();
+        let tail = engine.next_arrival_seq().unwrap();
+        let mut walked = Walked::default();
+        let bare = engine.resolve_start(&WatchScope::Collection(y.id), &options, &mut walked);
+        assert_eq!(bare.unwrap().start, tail, "with only the tombstone held");
     }
 
     /// Where this member holds no creation entry for the collection (a snapshot
