@@ -1635,21 +1635,34 @@ async fn start_and_serve(
         // timer (a task running on into a runtime that is going away panics).
         Some(TestStop::FailStart(hold)) => {
             let engine = Arc::clone(&engine);
+            // Both are running before the start fails, said by each from inside
+            // its storage step: a task spawned and not yet polled when the
+            // failure is announced is aborted without having run, and a start
+            // that failed with neither running closed the store with nothing
+            // left to wait for, on a runner slow to start its tasks.
+            let (holding, held) = tokio::sync::oneshot::channel();
             // UNSUPERVISED: a test switch whose panic is the point of it.
             tokio::spawn(async move {
                 kimmy_storage::blocking(move || {
                     let _held = engine;
+                    let _ = holding.send(());
                     std::thread::sleep(hold);
                     panic!("a task panicked holding the engine (KIMMY_TEST_STOP=fail_start)");
                 })
             });
+            let (inside, in_a_step) = tokio::sync::oneshot::channel();
             // Under the retention collector's name, which is the task this
             // stands in for (a name outside `kimmy_task::TASKS` is refused by the
             // guard that keeps its metric labels honest).
-            kimmy_task::supervise("retention_collector", shutdown.clone(), async {
-                kimmy_storage::blocking(|| std::thread::sleep(Duration::from_millis(300)));
+            kimmy_task::supervise("retention_collector", shutdown.clone(), async move {
+                kimmy_storage::blocking(move || {
+                    let _ = inside.send(());
+                    std::thread::sleep(Duration::from_millis(300));
+                });
                 tokio::time::sleep(Duration::from_secs(60)).await;
             });
+            let _ = held.await;
+            let _ = in_a_step.await;
             return Err(anyhow::anyhow!(
                 "the start failed on purpose (KIMMY_TEST_STOP=fail_start)"
             ));
