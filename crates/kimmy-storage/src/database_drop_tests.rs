@@ -405,7 +405,7 @@ fn drop_database_entry(db: &str, at: Stamp) -> kimmy_core::OplogEntry {
     .unwrap()
 }
 
-/// Review M2. Three members and a fourth that refused the creation: a
+/// Three members and a fourth that refused the creation: a
 /// collection created after the drop, on a member that had not heard of it,
 /// refuses a straggler of the life before it exactly as the member that
 /// refused the creation first and accepted the new one later does.
@@ -442,7 +442,7 @@ fn a_survivor_of_the_sweep_refuses_a_pre_drop_straggler_like_every_other_member(
     assert!(!has(&y, "d1"), "the survivor took a straggler of the life before it");
 }
 
-/// Reviews m1 and F5: a creation and a drop stamped with the same `Hlc` agree
+/// A creation and a drop stamped with the same `Hlc` agree
 /// on every member whichever arrives first, whichever node sorts higher.
 #[test]
 fn a_create_and_a_database_drop_with_equal_hlc_agree_in_both_arrival_orders() {
@@ -535,7 +535,7 @@ fn a_member_that_took_the_drop_as_a_plain_collection_drop_buries_under_it_on_rec
     assert!(!e.database_exists("shop").unwrap());
 }
 
-/// Review M1: the page that recorded the tombstone is retried after a sweep
+/// The page that recorded the tombstone is retried after a sweep
 /// that failed; it carries nothing new, and must still bury.
 #[test]
 fn a_retried_page_still_buries_under_a_tombstone_an_earlier_attempt_recorded() {
@@ -821,7 +821,7 @@ async fn a_collection_stream_ends_on_a_lagged_notice_channel_when_the_collection
     assert!(dropped(next(&mut stream, &c).await));
 }
 
-/// Review N6: a sweep of more collections than the channel holds is one notice.
+/// A sweep of more collections than the channel holds is one notice.
 #[test]
 fn a_sweep_of_more_collections_than_the_buffer_holds_does_not_lag_a_subscriber() {
     let (a, _da) = engine();
@@ -1298,7 +1298,7 @@ async fn a_stream_of_a_survivor_passes_over_entries_of_the_life_before_that_arri
 
 /// A survivor that took the other life's creation before it learned of the drop
 /// has no creation entry left to be refused when the documents arrive after it:
-/// the tombstone the sweep gave it is what refuses them (review M2).
+/// the tombstone the sweep gave it is what refuses them.
 #[test]
 fn a_survivor_refuses_a_straggler_that_arrives_after_the_drop_though_its_creation_arrived_before() {
     let (z, _dz) = engine();
