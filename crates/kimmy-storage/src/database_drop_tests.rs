@@ -686,19 +686,33 @@ fn a_clean_database_drop_with_documents_buries_without_a_warning() {
     );
 }
 
-/// A document deleted after the drop is not a lost write.
+/// A document deleted after the drop is not a lost write: its record is a
+/// tombstone, stamped after the drop, beside a live document that predates it.
 #[test]
 fn a_document_deleted_after_the_drop_is_not_a_lost_write() {
-    let (a, b, _da, _db, _late) = the_field_sequence();
+    let (a, _da) = engine();
+    let (b, _db) = engine();
     let (c, _dc) = engine();
+    a.create_collection("shop", "orders").unwrap();
+    sync(&a, &b);
+    let late = b.create_collection("shop", "late").unwrap();
+    b.insert(&late, doc! { "_id": "keep" }).unwrap();
+    b.insert(&late, doc! { "_id": "gone" }).unwrap();
+    later();
+    assert!(a.drop_database("shop").unwrap());
     pull(&c, &b);
     let held = c.get_collection("shop", "late").unwrap();
     later();
-    // A deletion stamped after the drop leaves a tombstone record, not a live one.
-    c.delete(&held, &kimmy_core::DocId::String("x".into())).unwrap();
+    c.delete(&held, &kimmy_core::DocId::String("gone".into())).unwrap();
+    assert_eq!(
+        c.count(&held, crate::WalkScope::Request).unwrap(),
+        1,
+        "premise: one live document is left"
+    );
     let logs = crate::log_capture::logs_of(|| {
         pull(&c, &a);
     });
+    assert!(!holds(&c, "shop", "late"), "premise: the sweep buried it");
     assert!(
         !logs.lines().any(|line| line.contains("WARN") && line.contains("buried a collection")),
         "a deletion after the drop was reported as a lost write: {logs}"
