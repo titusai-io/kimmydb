@@ -10,6 +10,20 @@ Versioning follows the pre-1.0 policy in
 [docs/compatibility.md](docs/compatibility.md): a `0.MINOR` bump may carry
 breaking changes and says so here; a `0.x.PATCH` bump never does.
 
+## Unreleased
+
+### Fixed
+
+- **A database drop warned for every collection it buried that held documents.** The sweep that
+  buries what a database's drop covers logged `a database drop buried a collection that holds
+  documents` at `WARN` for any collection with a live document, so an ordinary clean drop warned on
+  every replica, once per collection. It now warns only when a document was written after the drop
+  (`a database drop buried a collection that holds documents written after the drop`, with
+  `written_after_the_drop`): a write a member that had not yet received the drop answered `200` and
+  that the drop then took. A collection whose documents all predate the drop is buried without a
+  warning. The look at the documents reads the fixed-width header of at most a thousand records and
+  copies nothing.
+
 ## 0.47.0 - 2026-10-12
 
 This release makes a dropped database stay dropped. `DELETE /v1/db/{db}` used to drop the

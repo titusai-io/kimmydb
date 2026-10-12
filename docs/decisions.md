@@ -26442,8 +26442,11 @@ within `tombstone_retention_secs` of any database drop made during it.
   the drop that the member had not received, with its documents. It used to leave it, and the database came
   back with it in it.
 - A write acknowledged into such a collection on a member that has not applied the drop (a 0.46.0 member in a
-  roll; a member that has not received it) is lost with it. The sweep logs the collection, its live documents
-  and how many of the first thousand were written after the drop.
+  roll; a member that has not received it) is lost with it. The sweep warns, once for the collection, when one of its first thousand documents is live and
+  stamped after the drop, with how many are (`written_after_the_drop`); a collection whose documents all
+  predate the drop, which is every ordinary drop, is buried without a warning. The look reads the fixed-width
+  header of each record and copies nothing: 23 µs for a thousand records in a release build, against a
+  single-document commit of 4 ms.
 - **Resurrection is impossible except** for a creation concurrent with the drop within clock skew,
   replication lag or the drop's burial duration (the dropper's burials are stamped after the tombstone, so a
   same-named collection created in between is spared by the sweep and buried by the entry), and for a member

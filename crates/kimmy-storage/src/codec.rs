@@ -193,6 +193,17 @@ pub fn doc_record_is_live(mut input: &[u8]) -> Result<bool> {
     Ok(take(&mut input, 1)?[0] == 0)
 }
 
+/// The stamp of an encoded document record and whether it is live, read from
+/// its fixed-width header with no copy of the body.
+///
+/// For a walk that asks only whether any record was written after a point, as
+/// [`doc_record_is_live`] is for one that only counts.
+pub fn doc_record_header(mut input: &[u8]) -> Result<(Stamp, bool)> {
+    check_version(&mut input)?;
+    let stamp = take_stamp(&mut input)?;
+    Ok((stamp, take(&mut input, 1)?[0] == 0))
+}
+
 // ---------------------------------------------------------------------------
 // OplogEntry
 // ---------------------------------------------------------------------------

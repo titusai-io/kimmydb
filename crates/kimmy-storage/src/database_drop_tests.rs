@@ -639,8 +639,11 @@ fn a_failed_sweep_is_not_memoised() {
     assert_eq!(c.bury_under_database_tombstones().unwrap().spared, 1, "the retry walked");
 }
 
+/// A document written into the collection after the drop was stamped, on a
+/// member that had not yet received the drop, is a write acknowledged to a
+/// client and then lost: the sweep says so, with how many.
 #[test]
-fn a_burial_that_loses_documents_logs_their_number() {
+fn a_burial_that_loses_a_write_made_after_the_drop_logs_how_many() {
     let (a, b, _da, _db, _late) = the_field_sequence();
     let (c, _dc) = engine();
     pull(&c, &b);
@@ -651,9 +654,55 @@ fn a_burial_that_loses_documents_logs_their_number() {
     let logs = crate::log_capture::logs_of(|| {
         pull(&c, &a);
     });
-    assert!(logs.contains("a database drop buried a collection that holds documents"), "{logs}");
+    assert!(
+        logs.contains("buried a collection that holds documents written after the drop"),
+        "{logs}"
+    );
     assert!(logs.contains("written_after_the_drop=1"), "{logs}");
-    assert!(logs.contains("documents=2"), "{logs}");
+}
+
+/// An ordinary clean drop of a collection that holds documents warns of nothing:
+/// every document it holds was written before the drop, which is what the drop
+/// is for, and the burial is already logged.
+#[test]
+fn a_clean_database_drop_with_documents_buries_without_a_warning() {
+    let (a, b, _da, _db, late) = the_field_sequence();
+    let (c, _dc) = engine();
+    pull(&c, &b);
+    let held = c.get_collection("shop", "late").unwrap();
+    assert_eq!(
+        c.count(&held, crate::WalkScope::Request).unwrap(),
+        1,
+        "premise: it holds a document"
+    );
+    let logs = crate::log_capture::logs_of(|| {
+        pull(&c, &a);
+    });
+    assert!(!holds(&c, "shop", "late"), "premise: the sweep buried it");
+    assert!(c.collection_dropped_at(late).unwrap().is_some());
+    assert!(
+        !logs.lines().any(|line| line.contains("WARN") && line.contains("buried a collection")),
+        "a clean drop warned: {logs}"
+    );
+}
+
+/// A document deleted after the drop is not a lost write.
+#[test]
+fn a_document_deleted_after_the_drop_is_not_a_lost_write() {
+    let (a, b, _da, _db, _late) = the_field_sequence();
+    let (c, _dc) = engine();
+    pull(&c, &b);
+    let held = c.get_collection("shop", "late").unwrap();
+    later();
+    // A deletion stamped after the drop leaves a tombstone record, not a live one.
+    c.delete(&held, &kimmy_core::DocId::String("x".into())).unwrap();
+    let logs = crate::log_capture::logs_of(|| {
+        pull(&c, &a);
+    });
+    assert!(
+        !logs.lines().any(|line| line.contains("WARN") && line.contains("buried a collection")),
+        "a deletion after the drop was reported as a lost write: {logs}"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -1775,4 +1824,36 @@ fn a_drop_appended_by_another_path_while_it_applies_still_leaves_its_tombstones(
     applied.unwrap();
     assert!(e.oplog_entry(&drop.stamp).unwrap().is_some());
     assert_eq!(e.collection_dropped_at(ghost).unwrap(), Some(drop.stamp), "the tombstone was lost");
+}
+
+/// One measurement, not a guard: what the burial's look for writes made after the
+/// drop costs. It reads the fixed-width header of at most a thousand records of
+/// the collection and copies nothing.
+/// `cargo test --release -p kimmy-storage --lib the_look_for_writes_after_the_drop -- --ignored --nocapture`
+#[test]
+#[ignore = "a measurement"]
+fn the_look_for_writes_after_the_drop_costs_a_fraction_of_a_commit() {
+    let (e, _d) = engine();
+    let coll = e.create_collection("shop", "docs").unwrap();
+    let docs = (0..5_000).map(|i| doc! { "_id": i, "pad": "x".repeat(200) }).collect();
+    e.insert_many(&coll, docs).unwrap();
+    let meta = e.get_collection("shop", "docs").unwrap();
+    let dropped =
+        Stamp::new(Hlc::new(crate::physical_now_ms() + 1_000, 0), NodeId::from_bytes([7; 16]));
+    let runs = 200;
+    let began = std::time::Instant::now();
+    let mut checked = 0;
+    for _ in 0..runs {
+        checked = e.documents_written_after(&meta, dropped).unwrap().checked;
+    }
+    let per = began.elapsed() / runs;
+    // A commit, for scale.
+    let began = std::time::Instant::now();
+    for i in 0..50 {
+        e.insert(&meta, doc! { "_id": 10_000 + i }).unwrap();
+    }
+    eprintln!(
+        "MEASURE the look read {checked} records in {per:?}; a single-document commit took {:?}",
+        began.elapsed() / 50
+    );
 }
