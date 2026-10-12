@@ -26459,11 +26459,52 @@ walk of the collections of a database with a tombstone only when its tombstone o
 reconcile runs once at a start. The page sweep runs on every page with a list of drops, which the memo makes a
 point read.
 
-**Tests.** See `database_drop_tests.rs`, `watch.rs`, `kimmy-api/tests/api.rs`, `kimmyd/tests/lifecycle.rs`,
-`kimmy-cluster/tests/replication.rs` and the three-process case in `kimmyd/tests/cluster.rs`. Nine are red on
-0.46.0: the field sequence on two and three members, an older creation on a member that never held anything,
-a recreate floored at the drop, the tombstone ahead of the first burial, a page and a snapshot definition
-under the tombstone, a restored member, and the shadow defect. Four controls hold on both sides: a collection
-created after the drop stands and replicates, a newer life is not taken by a late drop, a drop of a database
-the member does not hold writes nothing, and the entry is an ordinary `DropCollection` (written to run
-unchanged on 0.46.0).
+**Tests.** `kimmy-storage/src/database_drop_tests.rs` (the engine's side, 49 tests), `watch.rs`'s recreate
+tests, `kimmy-api/tests/api.rs`, `kimmyd/tests/lifecycle.rs` (a start buries before it serves),
+`kimmy-cluster/tests/replication.rs` (the field sequence over real transport; a member behind a
+snapshot-caught-up peer takes the drop from the page, by rounds and in the member's own loop) and a
+three-process case in `kimmyd/tests/cluster.rs`. **Fourteen are red on 0.46.0**, run on a clean tree of that
+release: the field sequence on two and three members and over transport, an older creation on a member that
+never held anything, a recreate floored at the drop, the tombstone ahead of the first burial, a page and a
+snapshot definition under the tombstone, a restored member, the relay behind a snapshot, a vector cache that
+keeps the graph of a collection the sweep buried, and the shadow defect. Controls hold on both sides: a
+collection created after the drop stands and replicates, a newer life is not taken by a late drop, a drop of
+a database the member does not hold writes nothing, and the entry is an ordinary `DropCollection`.
+
+**Mutation run: 46 rows, 44 killed.** Each row is one textual change to the committed tree, run under `bash`
+with a timeout, with the test that kills it named: the head not written or written after the burials; the
+database rule ignored at each of its sites (the creation under the writer, the entry's early check, the
+entry's recorded refusal, the snapshot definition's recorded refusal); the refusal recording the collection
+but not its shadow; the sweep not run on the entry, run before the record, not run after a page, or run only
+when the page recorded something new; the survivor not recorded; `<` for `<=` in the sweep and in the refusal;
+the sweep's predicate inverted; the floor from the collection tombstone only; the coverage gate removed; the
+reserved name accepted; the head given another kind; the stamp minted before the writer; `Continuing::Yes`
+dropped after the head; the empty-`dropped` partial answer; a head failure reported as partial; the notice
+not sent, ignored by the stream, its lag unhandled by the stream and by the vector cache; the stream
+subscribing after its start resolves; the clamp's stamp branch kept for a survivor, its floor dropped, and
+its position branch removed (two tests, one for each case that still reaches it); the memo ignoring the
+generation or written before the sweep succeeds; the reconcile ignoring a stop, the readiness phase;
+a notice per collection. The first run killed 39; four rows survived tests that were too weak (a retried page
+with new tombstones to record, a lagged channel that kept the naming notice, a refusal whose shadow had its
+own creation entry, a survivor whose straggler's creation arrived after the drop) and one mutation did not
+compile; the tests were made to discriminate and the rows run again.
+**Two survive, argued equivalent.** (1) `restore_collection`'s early check of the database rule: without it
+the definition goes on to `create_collection_inner`, which refuses it under the writer by the same
+comparison and records the same two tombstones, so the outcome is identical and the early check only avoids
+that work. (2) `page_waits_on_a_purge` skipping a definition the database rule refuses: a burial always
+records the collection's own tombstone at a stamp at or above its `created`, and the existing check on it
+already skips the definition, so the database rule can only matter for a collection with no tombstone, which
+has no rows to wait on.
+
+**Measured.** A stream opened with no token on a survivor reads the arrival index from its start to the
+first entry stamped after the tombstone: 16.8 ms over 500,000 older entries in a release build, the same rows
+its own replay reads. The start's reconcile of a store with 2,500 collections shows as
+`phase: reconciling` on `/readyz` and a stop during it exits 0 in 0.03 s; the next start finishes what is left.
+**Rollback gate** (release builds of 0.46.0 and of this change, three nodes on one host): 0.47.0 to 0.46.0 to
+0.47.0 with sentinel rows in the stores, replication flowing at every step, no member logging a malformed
+frame, and `check-store` clean with both binaries on every store; a database drop made on a 0.47.0 member
+while one member is on 0.46.0 and holds a collection the dropper never received (the 0.46.0 member keeps
+serving it, accepts a write into it, and the cluster does not stall; on its restart on 0.47.0 it buries it
+before serving and every member lists the database gone); a member left on 0.46.0 past the retention (the
+collection and the database come back on every member, as documented); and a backup taken on each build
+restored with the other, `check-store` clean, opened by both.
