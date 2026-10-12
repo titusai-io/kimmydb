@@ -26480,34 +26480,37 @@ keeps the graph of a collection the sweep buried, and the shadow defect. Control
 collection created after the drop stands and replicates, a newer life is not taken by a late drop, a drop of
 a database the member does not hold writes nothing, and the entry is an ordinary `DropCollection`.
 
-**Mutation run: 46 rows, 44 killed.** Each row is one textual change to the committed tree, run under `bash`
+**Mutation run: 57 rows, all killed.** Each row is one textual change to the committed tree, run under `bash`
 with a timeout, with the test that kills it named: the head not written or written after the burials; the
 database rule ignored at each of its sites (the creation under the writer, the entry's early check, the
-entry's recorded refusal, the snapshot definition's recorded refusal); the refusal recording the collection
-but not its shadow; the sweep not run on the entry, run before the record, not run after a page, or run only
-when the page recorded something new; the survivor not recorded; `<` for `<=` in the sweep and in the refusal;
-the sweep's predicate inverted; the floor from the collection tombstone only; the coverage gate removed; the
-reserved name accepted; the head given another kind; the stamp minted before the writer; `Continuing::Yes`
-dropped after the head; the empty-`dropped` partial answer; a head failure reported as partial; the notice
-not sent, ignored by the stream, its lag unhandled by the stream and by the vector cache; the stream
-subscribing after its start resolves; the clamp's stamp branch kept for a survivor, its floor dropped, and
-its position branch removed (two tests, one for each case that still reaches it); the memo ignoring the
-generation or written before the sweep succeeds; the reconcile ignoring a stop, the readiness phase;
-a notice per collection. The first run killed 39; four rows survived tests that were too weak (a retried page
-with new tombstones to record, a lagged channel that kept the naming notice, a refusal whose shadow had its
-own creation entry, a survivor whose straggler's creation arrived after the drop) and one mutation did not
-compile; the tests were made to discriminate and the rows run again.
-**Two survive, argued equivalent.** (1) `restore_collection`'s early check of the database rule: without it
-the definition goes on to `create_collection_inner`, which refuses it under the writer by the same
-comparison and records the same two tombstones, so the outcome is identical and the early check only avoids
-that work. (2) `page_waits_on_a_purge` skipping a definition the database rule refuses: a burial always
-records the collection's own tombstone at a stamp at or above its `created`, and the existing check on it
-already skips the definition, so the database rule can only matter for a collection with no tombstone, which
-has no rows to wait on.
+entry's recorded refusal, the snapshot definition's early check and recorded refusal, the page's wait for a
+purge); the refusal recording the collection but not its shadow, or reading a creation with no stamp as newer,
+or taking the writer to record what is held; the sweep not run on the entry, run before the record, not run
+after a page, or run only when the page recorded something new; the survivor not recorded; `<` for `<=` in
+the sweep and in the refusal; the sweep's predicate inverted; the floor from the collection tombstone only;
+the coverage gate removed; the reserved name accepted; the head given another kind; the stamp minted before
+the writer; `Continuing::Yes` dropped after the head and before the row's removal; the empty-`dropped`
+partial answer; a head failure reported as partial; the notice not sent, ignored by the stream, its lag
+unhandled by the stream and by the vector cache; the stream subscribing after its start resolves; the clamp's
+stamp branch kept for a survivor, applied to an absent collection, its floor dropped, and its position
+branch removed; the memo ignoring the generation, written before the sweep succeeds, or kept for a database
+or a tombstone that has gone; the sweep without a stop checkpoint between burials or before its second walk;
+the reconcile ignoring a stop or not saying so on the probe; the tombstones of a replicated drop not written
+with the append, or not recorded for an entry already held; a notice per collection; the readiness phase
+missing from the OpenAPI document. The first run killed 39 of 46; four rows survived tests that were too
+weak and one mutation did not compile, and an independent pass found two more rows, the page's wait for a
+purge and the snapshot definition's early check, whose outcome is the same with or without the guard and
+whose cost is not (a page that waits on the purge of an older life of a name it then refuses; a refused
+definition that takes and aborts the writer before it records). Each has a test of its own now, as do the
+guards that pass found green.
 
 **Measured.** A stream opened with no token on a survivor reads the arrival index from its start to the
 first entry stamped after the tombstone: 16.8 ms over 500,000 older entries in a release build, the same rows
-its own replay reads. The start's reconcile of a store with 2,500 collections shows as
+its own replay reads. A member that receives the drop of a database of 3,000 collections of ten documents
+converges as fast as it did on 0.46.0: a later write on the dropping member reached it 11.6, 12.7 and 13.2 s
+after the drop returned (median 12.7 s), against 13.3, 13.8 and 23.3 s on 0.46.0 (median 13.8 s), three runs
+each, release builds, two nodes on one host; before the tombstones were written in the commit that appends the
+entry it was 34.4, 34.4 and 35.4 s. The start's reconcile of a store with 2,500 collections shows as
 `phase: reconciling` on `/readyz` and a stop during it exits 0 in 0.03 s; the next start finishes what is left.
 **Rollback gate** (release builds of 0.46.0 and of this change, three nodes on one host): 0.47.0 to 0.46.0 to
 0.47.0 with sentinel rows in the stores, replication flowing at every step, no member logging a malformed
