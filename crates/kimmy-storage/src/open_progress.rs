@@ -44,6 +44,20 @@ pub enum OpenPhase {
 }
 
 impl OpenPhase {
+    /// Every phase a probe reports, `Idle` (no open running) left out. A test
+    /// holds this to the numbering and to the phases the OpenAPI document lists.
+    pub const fn reported() -> [OpenPhase; 7] {
+        [
+            Self::Repairing,
+            Self::Opening,
+            Self::Migrating,
+            Self::Verifying,
+            Self::Counting,
+            Self::Starting,
+            Self::Reconciling,
+        ]
+    }
+
     pub const fn label(self) -> &'static str {
         match self {
             Self::Idle => "idle",
@@ -163,6 +177,28 @@ pub(crate) mod tests {
     use bson::doc;
 
     use crate::Engine;
+
+    /// A phase added to the numbering and not to [`OpenPhase::reported`] is one
+    /// the OpenAPI test never looks for.
+    #[test]
+    fn every_phase_the_numbering_knows_is_reported() {
+        use super::OpenPhase;
+        let reported = OpenPhase::reported();
+        for n in 0..=u8::MAX {
+            let phase = OpenPhase::from_u8(n);
+            if phase != OpenPhase::Idle {
+                assert!(
+                    reported.contains(&phase),
+                    "phase {n} ({}) is not in `reported`",
+                    phase.label()
+                );
+                assert_eq!(phase as u8, n);
+            }
+        }
+        for phase in reported {
+            assert_eq!(OpenPhase::from_u8(phase as u8), phase);
+        }
+    }
 
     thread_local! {
         /// A stop asked for on this thread only. The real request is one flag for

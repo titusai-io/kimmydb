@@ -297,7 +297,8 @@ impl Engine {
                 false => Err(expired()),
             };
         }
-        // A collection whose life began after the tombstone (ADR-229). The
+        // A collection whose life began at or after the tombstone (ADR-229; a
+        // creation at the tombstone's own `Hlc` is stamped above it by the node). The
         // tombstone does not say when the drop reached this member, and the
         // life's own entries may have arrived before it did: a collection that
         // survived a database's drop learned of the drop late, and a position
@@ -311,7 +312,7 @@ impl Engine {
         // of the live life is stamped above the tombstone and every one of the
         // life before is refused by it.
         if let Some(live) = self.collection_by_id(id)?
-            && live.created > dropped_at.hlc
+            && live.created >= dropped_at.hlc
         {
             return match &options.resume_after {
                 Some(token) if token.to_stamp() <= dropped_at => Err(expired()),
@@ -322,14 +323,14 @@ impl Engine {
                 )),
             };
         }
-        // From here the incarnation is bounded by where the drop's entry arrived,
-        // which is exact only if every entry of the live life arrived after it.
-        // Two cases still reach this, and each has a test that fails if the
-        // branch is removed: the collection is **absent** (dropped and not
-        // recreated: `a_stream_of_a_dropped_collection_starts_after_its_drop`),
-        // and its creation was stamped at the tombstone's own `Hlc`, which the
-        // stamp-based branch above cannot place (`a_creation_stamped_at_the_drops_hlc_...`).
-        // Every other live collection with a tombstone began after it (ADR-229).
+        // From here the collection is absent (dropped and not recreated here) or,
+        // for the moment a burial is under way, older than its tombstone, and the
+        // incarnation is bounded by where the drop's entry arrived: the
+        // stream starts just after it. An entry of the life before that is
+        // stamped after the drop (a write on a member whose clock ran ahead)
+        // and arrived before it is still the life before's, which only the
+        // position says. Every live collection with a tombstone began at or
+        // after it (ADR-229), and was placed by its stamp above.
         let Some(drop_seq) = self.arrival_of(&dropped_at)? else {
             // The drop is not in the log, so its position is not known. The
             // tombstone's stamp still bounds the incarnation: a token at or

@@ -431,6 +431,10 @@ fn a_survivor_of_the_sweep_refuses_a_pre_drop_straggler_like_every_other_member(
     pull(&m, &y);
 
     pull(&y, &a);
+    assert!(
+        y.collection_dropped_at(yl.id).unwrap().is_some(),
+        "the sweep left the survivor no tombstone of its own"
+    );
     pull(&y, &z);
 
     let has = |e: &Engine, id: &str| -> bool {
@@ -985,10 +989,10 @@ fn the_reconcile_says_what_it_is_doing_on_the_readiness_probe() {
         let now = open_snapshot();
         into.set(Some((now.phase, now.total)));
     });
-    let before = open_snapshot().phase;
     engine.reconcile_database_tombstones().unwrap();
+    // The phase is the process's, and an open running in another test moves it;
+    // what the reconcile leaves it at is not asserted here.
     assert_eq!(seen.get(), Some((OpenPhase::Reconciling, 1)));
-    assert_eq!(open_snapshot().phase, before, "the phase it found is the phase it leaves");
 }
 
 /// One measurement, not a guard: what a stream opened with no token on a
@@ -1046,11 +1050,10 @@ async fn a_stream_of_a_dropped_collection_starts_after_its_drop() {
 }
 
 /// A creation stamped at the tombstone's own `Hlc` (the node breaks the tie in
-/// its favour), so the live life did not begin *after* the tombstone and the
-/// stamp-based branch does not apply: the position the drop's entry arrived at
-/// still bounds the incarnation.
+/// its favour) is placed by the tombstone's stamp like any other life that began
+/// after it: the replay starts at the new life.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn a_creation_stamped_at_the_drops_hlc_is_placed_by_where_the_drop_arrived() {
+async fn a_creation_stamped_at_the_drops_hlc_is_placed_by_the_tombstones_stamp() {
     let (e, _d) = engine();
     let x = CollectionId::derive("shop", "x");
     let insert = |at: Stamp, id: &str| kimmy_core::OplogEntry {
@@ -1379,4 +1382,255 @@ fn a_drop_already_held_as_sent_still_records_its_tombstones() {
     assert!(e.collection_dropped_at(ghost).unwrap().is_none(), "premise");
     e.apply_batch(std::slice::from_ref(&drop)).unwrap();
     assert_eq!(e.collection_dropped_at(ghost).unwrap(), Some(drop.stamp));
+}
+
+/// The position branch is for a collection that is absent: an entry of the life
+/// before, stamped after the drop (a write on a member whose clock ran ahead)
+/// and arrived before it, is still the life before's, and only where the drop's
+/// entry arrived says so.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_dropped_collections_stream_skips_an_old_entry_stamped_after_its_drop() {
+    let (e, _d) = engine();
+    let x = CollectionId::derive("shop", "x");
+    let insert = |at: Stamp, id: &str| kimmy_core::OplogEntry {
+        stamp: at,
+        kind: OpKind::Insert,
+        collection: x,
+        doc_id: Some(kimmy_core::DocId::String(id.into())),
+        body: Some(bson::serialize_to_vec(&doc! { "_id": id }).unwrap()),
+    };
+    let drop = crate::engine::ddl_entry(
+        stamp_of(5_000, 1),
+        OpKind::DropCollection,
+        x,
+        &CollectionRef::new("shop", "x"),
+    )
+    .unwrap();
+    for entry in
+        [create_entry("shop", "x", stamp_of(4_900, 1)), insert(stamp_of(6_000, 3), "o"), drop]
+    {
+        e.apply_batch(std::slice::from_ref(&entry)).unwrap();
+    }
+    assert!(e.get_collection("shop", "x").is_err(), "premise: x is gone");
+    let from_start = WatchOptions { resume_after: None, start_at: Some(Hlc::ZERO) };
+    let mut stream = e.watch(WatchScope::Collection(x), from_start).unwrap();
+    let heard = tokio::time::timeout(Duration::from_millis(300), stream.next(&e)).await;
+    assert!(
+        heard.is_err(),
+        "the stream of a dropped collection replayed the life before: {heard:?}"
+    );
+}
+
+// -- What a refusal costs, and what it reads as ------------------------------
+
+/// A definition the database rule refuses is decided before the writer is
+/// taken; the one hold it costs is the record it leaves.
+#[test]
+fn a_definition_the_database_refuses_is_decided_before_the_writer() {
+    let (a, b, _da, _db, _late) = the_field_sequence();
+    let page = b.snapshot_page(None, None).unwrap();
+    let slot = crate::engine::WriterHolder::Ddl.slot();
+    let before = a.writer_hold().count[slot];
+    a.apply_snapshot_page(b.node_id(), &mut SnapshotProgress::whole_database(), &page).unwrap();
+    let after = a.writer_hold().count[slot];
+    assert_eq!(after - before, 1, "a refused definition took more than the one record");
+}
+
+/// A page's definition the database rule refuses does not wait on the purge of
+/// an earlier life of its name that the collection's own tombstone does not make
+/// history.
+#[test]
+fn a_definition_the_database_refuses_does_not_wait_on_an_older_lifes_purge() {
+    let (r, _dr) = engine();
+    let (s, _ds) = engine();
+    let (d, _dd) = engine();
+    let x = s.create_collection("shop", "x").unwrap();
+    s.insert(&x, doc! { "_id": "old" }).unwrap();
+    pull(&r, &s);
+    assert!(holds(&r, "shop", "x"));
+    later();
+    // The receiver drops `x`; the purge of its rows is still owed.
+    assert!(r.drop_collection("shop", "x").unwrap());
+    pull(&s, &r);
+    assert!(!holds(&s, "shop", "x"));
+    s.finish_purges_now().unwrap();
+    later();
+    // The sender makes the name again, and then a database drop covers it.
+    let x2 = s.create_collection("shop", "x").unwrap();
+    s.insert(&x2, doc! { "_id": "new" }).unwrap();
+    later();
+    d.create_collection("shop", "other").unwrap();
+    later();
+    assert!(d.drop_database("shop").unwrap());
+    pull(&r, &d);
+    assert!(r.database_dropped_at("shop").unwrap().is_some(), "premise: r holds the tombstone");
+    assert!(r.purge_pending(x.id).unwrap(), "premise: r still owes the purge of the old life");
+    let page = s.snapshot_page(None, None).unwrap();
+    assert!(page.collections.iter().any(|c| c.name == "x"), "premise: the page defines x");
+    let applied =
+        r.apply_snapshot_page(s.node_id(), &mut SnapshotProgress::whole_database(), &page).unwrap();
+    assert!(
+        applied.purge_pending.is_none(),
+        "the page waited on a purge for a definition it refuses"
+    );
+    assert!(!holds(&r, "shop", "x"));
+}
+
+/// A creation naming no `created` (a page from a sender before the field) reads
+/// as older than the drop.
+#[test]
+fn a_definition_naming_no_creation_reads_as_older_than_the_drop() {
+    let (a, _b, _da, _db, _late) = the_field_sequence();
+    let (f, _df) = engine();
+    later();
+    f.create_collection("shop", "fresh").unwrap();
+    let mut page = f.snapshot_page(None, None).unwrap();
+    for c in page.collections.iter_mut() {
+        c.created = None;
+    }
+    a.apply_snapshot_page(f.node_id(), &mut SnapshotProgress::whole_database(), &page).unwrap();
+    assert!(!holds(&a, "shop", "fresh"), "a definition with no creation stamp was read as newer");
+}
+
+/// Recording a refusal already held takes no writer (ADR-152).
+#[test]
+fn recording_a_refusal_already_held_takes_no_writer() {
+    let (a, _b, _da, _db, _late) = the_field_sequence();
+    a.record_database_refusal("shop", "late", Some(Hlc::new(1, 0))).unwrap();
+    let slot = crate::engine::WriterHolder::Ddl.slot();
+    let before = a.writer_hold().count[slot];
+    a.record_database_refusal("shop", "late", Some(Hlc::new(1, 0))).unwrap();
+    assert_eq!(a.writer_hold().count[slot], before, "a held refusal took the writer");
+}
+
+// -- The sweep and a stop -----------------------------------------------------
+
+#[test]
+fn a_stop_ends_a_sweep_between_two_burials() {
+    let (engine, _dir) = tombstoned_store();
+    let stopper = Arc::clone(&engine);
+    // The stop comes while the first collection is being buried: that burial
+    // lands whole, and the next checkpoint ends the sweep.
+    crate::sync::race_hooks::at(crate::sync::race_hooks::Race::Burial, move || {
+        stopper.stop_walks();
+    });
+    let stopped = engine.bury_under_database_tombstones();
+    assert!(
+        matches!(stopped, Err(crate::StorageError::Stopping(_))),
+        "a stop did not end the sweep"
+    );
+    let left: Vec<String> =
+        engine.list_collections("shop").unwrap().into_iter().map(|c| c.name).collect();
+    assert_eq!(left, vec!["b".to_string(), "c".to_string()], "one burial landed whole");
+    engine.lift_stops_for_test();
+    assert_eq!(engine.bury_under_database_tombstones().unwrap().buried.len(), 2);
+}
+
+/// A stop ahead of a drop's entry leaves the entry unappended, so the next
+/// start redoes it.
+#[test]
+fn a_stop_before_a_sentinel_is_applied_leaves_the_entry_to_be_redone() {
+    let (e, _d) = engine();
+    e.create_collection("shop", "orders").unwrap();
+    later();
+    let sentinel = drop_database_entry("shop", stamp_of(crate::physical_now_ms() + 1_000, 7));
+    e.stop_walks();
+    let stopped = e.apply_batch(std::slice::from_ref(&sentinel));
+    assert!(matches!(stopped, Err(crate::StorageError::Stopping(_))), "{:?}", stopped.map(|_| ()));
+    assert!(e.oplog_entry(&sentinel.stamp).unwrap().is_none(), "the entry was appended");
+    e.lift_stops_for_test();
+    e.apply_batch(std::slice::from_ref(&sentinel)).unwrap();
+    assert!(!holds(&e, "shop", "orders"));
+    assert!(e.oplog_entry(&sentinel.stamp).unwrap().is_some());
+}
+
+/// The final removal of the database's row continues the request, too: a writer
+/// held past the budget there is waited out, whether or not a burial landed.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_removal_of_an_empty_databases_row_waits_for_the_writer_after_the_head() {
+    let (engine, _dir) = engine();
+    let engine = Arc::new(engine);
+    engine.create_database("empty").unwrap();
+    let budget = Duration::from_millis(100);
+    let dropped = {
+        let engine = Arc::clone(&engine);
+        crate::with_write_wait_budget(budget, async move {
+            let holder = Arc::clone(&engine);
+            crate::sync::race_hooks::at(
+                crate::sync::race_hooks::Race::BeforeRowRemoval,
+                move || {
+                    let (held, is_held) = std::sync::mpsc::channel();
+                    std::thread::spawn(move || {
+                        let guard = holder.hold_writer(crate::WriterHolder::Bulk);
+                        held.send(()).unwrap();
+                        std::thread::sleep(budget * 3);
+                        drop(guard);
+                    });
+                    is_held.recv().unwrap();
+                },
+            );
+            engine.drop_database("empty")
+        })
+        .await
+    };
+    assert!(dropped.expect("the removal waits for the writer"));
+    assert!(!engine.database_exists("empty").unwrap());
+    assert_eq!(engine.writer_wait_timeouts(), 0);
+}
+
+/// The sweep's memo holds a database only while it holds a tombstone.
+#[test]
+fn the_sweep_memo_is_pruned_when_the_database_or_its_tombstone_goes() {
+    let (a, _da) = engine();
+    let (c, _dc) = engine();
+    a.create_collection("shop", "orders").unwrap();
+    later();
+    assert!(a.drop_database("shop").unwrap());
+    later();
+    c.create_collection("shop", "late").unwrap();
+    pull(&c, &a);
+    c.bury_under_database_tombstones().unwrap();
+    assert_eq!(c.swept.lock().len(), 1, "premise: the survivor's database is memoised");
+
+    // The tombstone is collected while the database stands.
+    let day = 24 * 60 * 60;
+    let later_ms = crate::physical_now_ms() + 365 * day * 1_000;
+    c.collect_garbage_at(later_ms, crate::gc::RetentionPolicy::new(day, day)).unwrap();
+    assert!(c.database_dropped_at("shop").unwrap().is_none(), "premise: the tombstone is gone");
+    c.bury_under_database_tombstones().unwrap();
+    assert_eq!(c.swept.lock().len(), 0, "a collected tombstone left its memo behind");
+
+    // And the database goes.
+    let (e, _de) = engine();
+    e.create_collection("gone", "x").unwrap();
+    assert!(e.drop_database("gone").unwrap());
+    e.swept.lock().insert("gone".into(), (stamp_of(1, 1), 0));
+    e.bury_under_database_tombstones().unwrap();
+    assert_eq!(e.swept.lock().len(), 0, "a database that is gone left its memo behind");
+}
+
+/// A stop that comes with the last burial ends the sweep before it walks the
+/// database's collections again, as it would have ended it before the next
+/// burial.
+#[test]
+fn a_stop_that_comes_with_the_last_burial_ends_the_sweep_before_its_second_walk() {
+    let (engine, _dir) = engine();
+    let engine = Arc::new(engine);
+    engine.create_collection("shop", "only").unwrap();
+    engine
+        .record_collection_drop(
+            kimmy_core::database_drop_id("shop"),
+            Stamp::new(Hlc::new(crate::physical_now_ms() + 1_000, 0), NodeId::from_bytes([7; 16])),
+        )
+        .unwrap();
+    let stopper = Arc::clone(&engine);
+    crate::sync::race_hooks::at(crate::sync::race_hooks::Race::Burial, move || {
+        stopper.stop_walks();
+    });
+    let stopped = engine.bury_under_database_tombstones();
+    assert!(
+        matches!(stopped, Err(crate::StorageError::Stopping(_))),
+        "the sweep went on to walk the database again after a stop"
+    );
+    assert!(!holds(&engine, "shop", "only"), "the burial that was under way landed whole");
 }

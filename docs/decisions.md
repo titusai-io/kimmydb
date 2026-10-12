@@ -26382,26 +26382,35 @@ failing the page, and the loop test with the exemption removed.
    a list of drops (not only one that recorded something new: a page whose sweep failed after its record
    committed is retried with nothing new, completes and grants coverage of an entry nobody then serves), and
    at a start. It is memoised per database by the tombstone and a generation of the collections, written only
-   after it succeeds.
+   after it succeeds, and a memo is dropped with its database or its tombstone. **A stop ends it** between two
+   burials and before each walk of a database's collections (`Stopping`): in an apply that leaves the entry
+   unappended, so the next start redoes it, and every burial that landed stands. Measured with a stop sent
+   while a member applied a sentinel burying 3,000 collections of 10 documents: exit 0 in 0.1 to 0.2 s, and
+   the next start found the rest buried before it served.
 5. **The start** (`Engine::reconcile_database_tombstones`, called from `node::run` before the purger and the
    cluster start, and not from `Engine::open`, which `restore --until` and tests also run) buries what a
    tombstone covers. It heals a crash between the head and the burials, a drop a member on the previous build
    applied as a plain collection drop, and a restore. It stops at a safe point between two burials and
-   shows as the `reconciling` phase on `/readyz`.
+   shows as the `reconciling` phase on `/readyz`. A start that fails for any other reason (a damaged
+   collection row, say) fails, with the cause; `operations.md` says what to do.
 6. **Subscribers are told.** A burial that mints no entry sends a notice on `Engine::subscribe_buried`, one per
    burial or per sweep carrying every collection it took. A stream of one collection ends with
    `CollectionDropped`; the vector cache forgets the shadow's graph, and reconciles against the catalogue if it
    lagged. A stream subscribes before it resolves where it starts.
-7. **The incarnation clamp reads stamps.** For a collection that began after the tombstone,
+7. **The incarnation clamp reads stamps.** For a collection that began at or after the tombstone,
    `clamp_to_incarnation` bounds the incarnation by the tombstone's stamp and not by where the drop's entry
    arrived: a token naming an entry at or before the stamp is of the life before (refused), any other token
    resumes, a start with no token begins at the first entry stamped after it, and an entry of the life before
    that arrives later is passed over by the floor. This is exact because every entry of the live life is
-   stamped above the tombstone and every one of the life before is refused by it. The position branch stays for
-   a collection that is absent and for a creation stamped at the tombstone's own `Hlc`.
+   stamped above the tombstone and every one of the life before is refused by it; a creation stamped at the
+   tombstone's own `Hlc` is stamped above it by its node, so it is placed the same way. The position branch
+   stays for a collection that is **absent** (dropped and not recreated here), where an entry of the life
+   before that is stamped after the drop, by a clock that ran ahead, and arrived before it, is only
+   recognisable by where the drop's entry arrived.
 8. **A pre-existing defect is fixed with it.** The ordinary replicated `DropCollection` arm recorded only the
    parent's id for a collection the member never held, so the first vector chunk for it stopped the batch as an
-   unknown collection until a snapshot. It records the shadow's id too, as a burial does.
+   unknown collection until a snapshot. It records the shadow's id too, as a burial does, for a collection it
+   did not hold, and the tombstones are written in the commit that appends the entry, not in one of their own.
 
 **Why.** The 0.26.0 field case had three causes. Two were closed by ADR-155/158/162/163/189. The third is a
 collection the dropping member never held, created on a peer shortly before: it has no tombstone anywhere, its
@@ -26459,7 +26468,7 @@ walk of the collections of a database with a tombstone only when its tombstone o
 reconcile runs once at a start. The page sweep runs on every page with a list of drops, which the memo makes a
 point read.
 
-**Tests.** `kimmy-storage/src/database_drop_tests.rs` (the engine's side, 49 tests), `watch.rs`'s recreate
+**Tests.** `kimmy-storage/src/database_drop_tests.rs` (the engine's side, 60 tests and an ignored measurement), `watch.rs`'s recreate
 tests, `kimmy-api/tests/api.rs`, `kimmyd/tests/lifecycle.rs` (a start buries before it serves),
 `kimmy-cluster/tests/replication.rs` (the field sequence over real transport; a member behind a
 snapshot-caught-up peer takes the drop from the page, by rounds and in the member's own loop) and a

@@ -429,7 +429,11 @@ the open is doing is on `/readyz`: `phase` is one of `repairing`, `opening`,
 `migrating` (`done` of `total` indexes), `verifying` (`done` of `total` oplog
 rows), `counting`, `starting` and `reconciling` (`done` of `total` databases whose
 drop the node is burying before it serves, [ADR-229](decisions.md); absent when
-there is none), with `phase_age_seconds`. The open's cost is
+there is none), with `phase_age_seconds`. **A start that cannot bury what a
+database's drop covers for any reason but a stop (a damaged collection row, say) fails**, logging
+`burying what a database's drop covers` with the cause, and the next start fails the same way: run
+[`kimmyd check-store`](#checking-a-store) on the stopped member, and if the store is damaged, wipe its data
+directory and let it catch up from its peers ([A member that is catching up](#a-member-that-is-catching-up)). The open's cost is
 unchanged: the walk of the retained oplog is about 46 s per 10 million entries
 with the store in the page cache and far more cold, and the schema migration
 adds 8 us per document per partial index; a node logs a line for each phase

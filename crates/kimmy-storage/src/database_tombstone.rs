@@ -215,8 +215,14 @@ impl Engine {
     /// Idempotent, and cheap when nothing has changed: a database swept at the
     /// same tombstone and the same collections generation is not walked again.
     /// The memo is written only after a sweep succeeds.
+    ///
+    /// Ended by the node's stop between two burials, and before each walk of a
+    /// database's collections (`Err(Stopping)`): inside an apply that leaves the
+    /// entry unappended, so the next start redoes it, and every burial that did
+    /// land stands. Without that a stop waited on one commit per collection of
+    /// the database, up to the drain's deadline.
     pub fn bury_under_database_tombstones(&self) -> Result<Swept> {
-        self.sweep(&|| Ok(()))
+        self.sweep(&|| self.check_walk(crate::WalkScope::Background))
     }
 
     /// [`Self::bury_under_database_tombstones`] at a start, before the node
@@ -243,6 +249,7 @@ impl Engine {
             if open_stop_requested() {
                 return Err(StorageError::Stopping(crate::StopReason::Shutdown));
             }
+            self.check_walk(crate::WalkScope::Background)?;
             crate::open_progress::set_open_done(done.get().min(owed));
             done.set(done.get() + 1);
             Ok(())
@@ -276,10 +283,21 @@ impl Engine {
         swept: &mut Swept,
         notice: &mut Vec<BuriedCollection>,
     ) -> Result<()> {
-        for database in self.list_databases()? {
+        let databases = self.list_databases()?;
+        // The memo holds a database only while it holds a tombstone: one whose
+        // database has gone, or whose tombstone retention has collected, is
+        // dropped, so it is bounded by the tombstones held and not by every
+        // database name that ever had one.
+        {
+            let present: std::collections::HashSet<&str> =
+                databases.iter().map(|d| d.name.as_str()).collect();
+            self.swept.lock().retain(|db, _| present.contains(db.as_str()));
+        }
+        for database in databases {
             checkpoint()?;
             let db = database.name;
             let Some(dropped) = self.database_dropped_at(&db)? else {
+                self.swept.lock().remove(&db);
                 continue;
             };
             // Read before the walk: the walk's own commits move it, so the next
@@ -291,12 +309,14 @@ impl Engine {
             // Non-shadows first, so a parent takes its shadow in its own
             // burial; what is left of the shadows afterwards has no parent to
             // take it (ADR-138), or belongs to a collection that stands.
+            checkpoint()?;
             for collection in self.list_collections(&db)? {
                 if !vector_meta::is_shadow(&collection.name) {
                     checkpoint()?;
                     self.sweep_collection(&db, &collection, dropped, swept, notice)?;
                 }
             }
+            checkpoint()?;
             for collection in self.list_collections(&db)? {
                 if vector_meta::is_shadow(&collection.name) {
                     checkpoint()?;
