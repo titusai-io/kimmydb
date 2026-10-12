@@ -14338,12 +14338,38 @@ async fn a_database_drop_stopped_between_burials_says_which_collections_went() {
     let engine = &server.state.engine;
     engine.create_collection("shop", "returns").unwrap();
     let stopper = Arc::clone(engine);
-    engine.before_next_continuing_write(move || stopper.set_stopping());
+    let rearm = Arc::clone(engine);
+    // The drop's tombstone is its first commit (ADR-229), so the first
+    // continuing write is the first burial. Let that land and stop the next.
+    engine.before_next_continuing_write(move || {
+        rearm.before_next_continuing_write(move || stopper.set_stopping());
+    });
     let res = server.delete("/v1/db/shop", None).await;
     assert_eq!(res.status, 500, "{:?}", res.body);
     assert_eq!(res.body["error"], "partially_applied", "{:?}", res.body);
     assert_eq!(res.body["applied"]["dropped"], json!(["orders"]), "{:?}", res.body);
     assert_eq!(res.body["cause"]["code"], "stopping", "{:?}", res.body);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_database_drop_stopped_after_its_tombstone_says_so_though_nothing_is_buried() {
+    // The drop's first commit is the database's tombstone (ADR-229): a stop
+    // that lands before the first burial leaves the drop recorded, replicating,
+    // and the answer says a commit landed, with nothing yet in `dropped`.
+    let server = three_chunk_server().await;
+    let engine = &server.state.engine;
+    engine.create_collection("shop", "returns").unwrap();
+    let stopper = Arc::clone(engine);
+    engine.before_next_continuing_write(move || stopper.set_stopping());
+    let res = server.delete("/v1/db/shop", None).await;
+    assert_eq!(res.status, 500, "{:?}", res.body);
+    assert_eq!(res.body["error"], "partially_applied", "{:?}", res.body);
+    assert_eq!(res.body["applied"]["dropped"], json!([]), "{:?}", res.body);
+    assert_eq!(res.body["cause"]["code"], "stopping", "{:?}", res.body);
+    assert!(
+        engine.database_dropped_at("shop").unwrap().is_some(),
+        "and the tombstone is there for the next start to finish"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
