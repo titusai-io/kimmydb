@@ -413,16 +413,6 @@ fn every_error_code_is_in_the_http_reference_with_the_retry_class_the_server_use
     }
 }
 
-// ---------------------------------------------------------------------------
-// The compatibility policy
-// ---------------------------------------------------------------------------
-
-/// The major version is in the path, and everything agrees about what it is.
-///
-/// `docs/compatibility.md` promises that `/v1` does not break and that the path
-/// carries the major version. This is the part of that promise a test can hold:
-/// the route prefixes, the version the server reports, and the specification's
-/// own `info.version` cannot drift apart.
 /// The `/readyz` 503 body lists a closed set of `phase` values. A phase the
 /// server can report and the document does not list is one a strict client
 /// rejects.
@@ -442,6 +432,16 @@ fn every_open_phase_the_server_reports_is_in_the_readyz_enum() {
     assert_eq!(listed, reported, "the OpenAPI document and the server disagree about the phases");
 }
 
+// ---------------------------------------------------------------------------
+// The compatibility policy
+// ---------------------------------------------------------------------------
+
+/// The major version is in the path, and everything agrees about what it is.
+///
+/// `docs/compatibility.md` promises that `/v1` does not break and that the path
+/// carries the major version. This is the part of that promise a test can hold:
+/// the route prefixes, the version the server reports, and the specification's
+/// own `info.version` cannot drift apart.
 #[test]
 fn every_versioned_route_carries_the_protocol_major() {
     // The unversioned routes, and why each one is allowed to be: an

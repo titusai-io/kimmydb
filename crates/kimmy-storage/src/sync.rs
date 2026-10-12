@@ -2237,26 +2237,26 @@ impl Engine {
                 // The originating stamp, not a local one: the tombstone has to
                 // sort before any recreation that legitimately followed the
                 // drop, or the name becomes unusable on this node forever.
+                let shadow_name = kimmy_core::vector_meta::shadow_name(&target.name);
+                let is_shadow = kimmy_core::vector_meta::is_shadow(&target.name);
+                let shadow_held =
+                    !is_shadow && self.get_collection(&target.db, &shadow_name).is_ok();
                 let buried =
                     self.drop_collection_inner(&target.db, &target.name, Some(entry.stamp))?;
                 // Recorded even when the collection was already gone: the
                 // tombstone is what stops a *later* replay from recreating it,
                 // and a node that never had the collection still needs it.
                 //
-                // And the shadow's, for a collection this node did not hold
-                // (a burial records both ids when it buries one): a collection
-                // never held, with vectors, has chunks that are judged by the
-                // shadow's id, and with no tombstone for it the first of them
-                // stopped the batch until a snapshot. In one commit with the
-                // parent's, and none at all when a burial has already written
-                // them, so a drop of a collection that is held, or that a
-                // database's sweep has already buried, costs what it did.
+                // And the shadow's, unless a burial has just written it (a burial
+                // records both ids when the shadow exists to be buried): a
+                // collection that is held without its shadow, or never held,
+                // has vector chunks arriving from another origin that are
+                // judged by the shadow's id, and with no tombstone for it the
+                // first of them stopped the batch until a snapshot. In one
+                // commit with the parent's, and none when it is held already.
                 let mut ids = vec![entry.collection];
-                if !buried && !kimmy_core::vector_meta::is_shadow(&target.name) {
-                    ids.push(CollectionId::derive(
-                        &target.db,
-                        &kimmy_core::vector_meta::shadow_name(&target.name),
-                    ));
+                if !is_shadow && !(buried && shadow_held) {
+                    ids.push(CollectionId::derive(&target.db, &shadow_name));
                 }
                 // Written with the entry's append, in its commit, and not in
                 // one of their own: the same tombstones at the same stamp, one

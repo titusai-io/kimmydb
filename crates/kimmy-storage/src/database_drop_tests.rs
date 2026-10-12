@@ -1634,3 +1634,145 @@ fn a_stop_that_comes_with_the_last_burial_ends_the_sweep_before_its_second_walk(
     );
     assert!(!holds(&engine, "shop", "only"), "the burial that was under way landed whole");
 }
+
+// -- A collection held without its shadow ------------------------------------
+
+/// A member holds a collection but not yet its vector configuration, which
+/// arrives from another origin after the drop: burying the parent writes no
+/// shadow tombstone, because there is no shadow to bury, and the shadow's first
+/// chunk must still be history and not a stop.
+#[test]
+fn a_held_collection_without_its_shadow_still_leaves_the_shadows_tombstone() {
+    let (b, _db) = engine();
+    let (d, _dd) = engine();
+    let (a, _da) = engine();
+    b.create_collection("shop", "orders").unwrap();
+    pull(&a, &b);
+    assert!(holds(&a, "shop", "orders"));
+    b.configure_vectors("shop", "orders", vector_config()).unwrap();
+    let shadow = b.vector_collection("shop", "orders").unwrap().unwrap();
+    let source = kimmy_core::DocId::Int64(1);
+    b.put_vectors(
+        &shadow,
+        &source,
+        &[kimmy_core::VectorRecord {
+            source: source.clone(),
+            chunk: 0,
+            source_hlc: Hlc::new(1, 0),
+            vector: vec![1.0, 0.0, 0.0, 0.0],
+            text: "t".into(),
+            config: None,
+        }],
+    )
+    .unwrap();
+    pull(&d, &b);
+    later();
+    assert!(d.drop_collection("shop", "orders").unwrap());
+    let drops: Vec<_> = d
+        .entries_for_peer(Hlc::ZERO, BATCH, crate::WalkScope::Background)
+        .unwrap()
+        .entries
+        .into_iter()
+        .filter(|e| e.kind == OpKind::DropCollection)
+        .collect();
+    a.apply_batch(&drops).unwrap();
+    let history =
+        b.entries_for_peer(Hlc::ZERO, BATCH, crate::WalkScope::Background).unwrap().entries;
+    let outcome = a.apply_batch(&history).unwrap();
+    assert_eq!(outcome.unknown_collection, 0, "stalled: {:?}", outcome.unknown);
+    assert!(!holds(&a, "shop", "orders"));
+    assert!(
+        !holds(&a, "shop", &kimmy_core::vector_meta::shadow_name("orders")),
+        "the shadow was created over the drop"
+    );
+}
+
+// -- The stop checkpoint before each shadow burial ---------------------------
+
+/// What is left after the parents are buried is orphan shadows; a stop that
+/// comes with the first ends the sweep before the second.
+#[test]
+fn a_stop_ends_a_sweep_between_two_shadow_burials() {
+    let (engine, _dir) = engine();
+    let engine = Arc::new(engine);
+    for parent in ["x", "y"] {
+        engine
+            .create_system_collection("shop", &kimmy_core::vector_meta::shadow_name(parent))
+            .unwrap();
+    }
+    engine
+        .record_collection_drop(
+            kimmy_core::database_drop_id("shop"),
+            Stamp::new(Hlc::new(crate::physical_now_ms() + 1_000, 0), NodeId::from_bytes([7; 16])),
+        )
+        .unwrap();
+    let stopper = Arc::clone(&engine);
+    crate::sync::race_hooks::at(crate::sync::race_hooks::Race::Burial, move || {
+        stopper.stop_walks();
+    });
+    let stopped = engine.bury_under_database_tombstones();
+    assert!(
+        matches!(stopped, Err(crate::StorageError::Stopping(_))),
+        "a stop did not end the sweep"
+    );
+    assert_eq!(
+        engine.list_collections("shop").unwrap().len(),
+        1,
+        "one shadow's burial landed whole and the next did not begin"
+    );
+}
+
+// -- The tombstones owed with an append -------------------------------------
+
+/// A drop already held, delivered again, takes no writer to record what is held.
+#[test]
+fn a_drop_already_held_records_nothing_and_takes_no_writer() {
+    let (e, _d) = engine();
+    let drop = crate::engine::ddl_entry(
+        stamp_of(5_000, 3),
+        OpKind::DropCollection,
+        CollectionId::derive("shop", "ghost"),
+        &CollectionRef::new("shop", "ghost"),
+    )
+    .unwrap();
+    e.apply_batch(std::slice::from_ref(&drop)).unwrap();
+    let slot = crate::engine::WriterHolder::Ddl.slot();
+    let before = e.writer_hold().count[slot];
+    e.apply_batch(std::slice::from_ref(&drop)).unwrap();
+    assert_eq!(
+        e.writer_hold().count[slot],
+        before,
+        "a held drop took the writer to record nothing"
+    );
+}
+
+/// The entry is appended by another path between the check and the writer: the
+/// tombstones it owed are recorded all the same.
+#[test]
+fn a_drop_appended_by_another_path_while_it_applies_still_leaves_its_tombstones() {
+    let (e, _d) = engine();
+    let e = Arc::new(e);
+    let ghost = CollectionId::derive("shop", "ghost");
+    let drop = crate::engine::ddl_entry(
+        stamp_of(5_000, 3),
+        OpKind::DropCollection,
+        ghost,
+        &CollectionRef::new("shop", "ghost"),
+    )
+    .unwrap();
+    let competing = Arc::clone(&e);
+    let appended = drop.clone();
+    let (applied, ()) = crate::sync::race_hooks::race(
+        crate::sync::race_hooks::Race::DdlAppend,
+        move || {
+            // The entry alone, with none of the tombstones it owes.
+            let txn = competing.begin_write(crate::WriterHolder::Replication).unwrap();
+            crate::engine::append_oplog(&txn, &appended).unwrap();
+            txn.commit().unwrap();
+        },
+        || e.apply_batch(std::slice::from_ref(&drop)),
+    );
+    applied.unwrap();
+    assert!(e.oplog_entry(&drop.stamp).unwrap().is_some());
+    assert_eq!(e.collection_dropped_at(ghost).unwrap(), Some(drop.stamp), "the tombstone was lost");
+}

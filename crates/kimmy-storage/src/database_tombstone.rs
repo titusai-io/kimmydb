@@ -309,7 +309,6 @@ impl Engine {
             // Non-shadows first, so a parent takes its shadow in its own
             // burial; what is left of the shadows afterwards has no parent to
             // take it (ADR-138), or belongs to a collection that stands.
-            checkpoint()?;
             for collection in self.list_collections(&db)? {
                 if !vector_meta::is_shadow(&collection.name) {
                     checkpoint()?;
