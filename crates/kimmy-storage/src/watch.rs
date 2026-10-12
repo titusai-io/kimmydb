@@ -3801,9 +3801,6 @@ mod tests {
         assert!(!quiet.contains("find where it starts"), "{quiet}");
     }
 
-    /// Where a stream resumed from another member's token starts: the race
-    /// between the walk and the seek against today's walk, over stores built
-    /// by every writer of the oplog, the arrival index and the vectors.
     // -- Where a tokenless open on a collection with a tombstone starts --
 
     /// The start a stream opened at the beginning of history resolves to, and
@@ -4027,6 +4024,9 @@ mod tests {
         );
     }
 
+    /// Where a stream resumed from another member's token starts: the race
+    /// between the walk and the seek against today's walk, over stores built
+    /// by every writer of the oplog, the arrival index and the vectors.
     mod first_arrival {
         use proptest::prelude::*;
         use redb::ReadableTableMetadata;
