@@ -22,7 +22,7 @@ breaking changes and says so here; a `0.x.PATCH` bump never does.
   `written_after_the_drop`): a write a member that had not yet received the drop answered `200` and
   that the drop then took. A collection whose documents all predate the drop is buried without a
   warning. The look at the documents reads the fixed-width header of at most a thousand records and
-  copies nothing.
+  copies nothing, so the warning sees the first thousand documents of the collection by id.
 - **A change stream opened at the start on a recreated collection read the whole retained log.**
   Finding where the collection's current life begins walked the arrival index from its start to the
   first entry stamped after the collection's drop, once per stream: on a log of 1.8 million entries

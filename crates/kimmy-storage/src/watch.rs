@@ -306,11 +306,13 @@ impl Engine {
         // member issued for them. So the incarnation is bounded by the
         // tombstone's **stamp** alone, as it is for a drop this member never
         // held: a token naming an entry at or before it is of the life before
-        // (refused), anything else resumes, a start with no token begins at the
-        // first entry stamped after it, and an entry of the life before that
-        // arrives later is passed over by the floor. Exact because every entry
-        // of the live life is stamped above the tombstone and every one of the
-        // life before is refused by it.
+        // (refused), anything else resumes, and an entry of the life before that
+        // arrives later is passed over by the floor. A start with no token
+        // begins just after the drop's entry for a recreate, and at the first
+        // entry stamped after the tombstone only where no position says (the
+        // fallbacks below). Exact because every entry of the live life is
+        // stamped above the tombstone and every one of the life before is
+        // refused by it.
         if let Some(live) = self.collection_by_id(id)?
             && live.created >= dropped_at.hlc
         {

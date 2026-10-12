@@ -127,6 +127,8 @@ fn now_ms() -> u64 {
 
 /// Enter `phase`, with no count.
 pub fn set_open_phase(phase: OpenPhase) {
+    #[cfg(test)]
+    tests::THIS_THREAD_PHASE.with(|seen| seen.set(Some((phase, 0))));
     DONE.store(0, Relaxed);
     TOTAL.store(0, Relaxed);
     SINCE_MS.store(now_ms(), Relaxed);
@@ -136,6 +138,8 @@ pub fn set_open_phase(phase: OpenPhase) {
 /// Enter `phase` with a total to count towards.
 pub(crate) fn set_open_phase_of(phase: OpenPhase, total: u64) {
     set_open_phase(phase);
+    #[cfg(test)]
+    tests::THIS_THREAD_PHASE.with(|seen| seen.set(Some((phase, total))));
     TOTAL.store(total, Relaxed);
 }
 
@@ -201,6 +205,11 @@ pub(crate) mod tests {
     }
 
     thread_local! {
+        /// The phase and total this thread last entered. The real state is one
+        /// set of atomics for the process, and an open running in another test
+        /// moves it, so a test that asks what its own open is doing reads this.
+        pub(crate) static THIS_THREAD_PHASE: Cell<Option<(super::OpenPhase, u64)>> =
+            const { Cell::new(None) };
         /// A stop asked for on this thread only. The real request is one flag for
         /// the process, and a test that raised it would stop every open running
         /// beside it in the same test binary.

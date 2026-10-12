@@ -1088,17 +1088,17 @@ fn the_reconcile_stops_at_a_safe_point_when_a_stop_is_asked() {
 
 #[test]
 fn the_reconcile_says_what_it_is_doing_on_the_readiness_probe() {
-    use crate::open_progress::{OpenPhase, open_snapshot};
+    use crate::open_progress::{OpenPhase, tests::THIS_THREAD_PHASE};
     let (engine, _dir) = tombstoned_store();
     let seen = std::rc::Rc::new(std::cell::Cell::new(None));
     let into = std::rc::Rc::clone(&seen);
+    THIS_THREAD_PHASE.with(|phase| phase.set(None));
     crate::sync::race_hooks::at(crate::sync::race_hooks::Race::Burial, move || {
-        let now = open_snapshot();
-        into.set(Some((now.phase, now.total)));
+        // This thread's own record of the phase: the probe's is the process's,
+        // and an open running in another test moves it.
+        into.set(THIS_THREAD_PHASE.with(std::cell::Cell::get));
     });
     engine.reconcile_database_tombstones().unwrap();
-    // The phase is the process's, and an open running in another test moves it;
-    // what the reconcile leaves it at is not asserted here.
     assert_eq!(seen.get(), Some((OpenPhase::Reconciling, 1)));
 }
 
@@ -1882,6 +1882,48 @@ fn a_drop_appended_by_another_path_while_it_applies_still_leaves_its_tombstones(
     applied.unwrap();
     assert!(e.oplog_entry(&drop.stamp).unwrap().is_some());
     assert_eq!(e.collection_dropped_at(ghost).unwrap(), Some(drop.stamp), "the tombstone was lost");
+}
+
+/// The look for writes after the drop reads the first `WARN_SAMPLE` documents of
+/// a collection and no more, however many it holds: its cost is bounded, and
+/// `walks_stop` lists it as a bounded read on that ground.
+#[test]
+fn the_look_for_writes_after_the_drop_reads_a_bounded_sample() {
+    let (e, _d) = engine();
+    let orders = e.create_collection("shop", "orders").unwrap();
+    let docs = (0..1_200).map(|i| doc! { "_id": i }).collect();
+    e.insert_many(&orders, docs).unwrap();
+    let before_all = Stamp::new(Hlc::ZERO, NodeId::from_bytes([7; 16]));
+    let found = e.documents_written_after(&orders, before_all).unwrap();
+    assert_eq!(found.checked, 1_000, "the look read more than its sample");
+    assert_eq!(found.after, 1_000, "every document it read was written after the drop");
+
+    let few = e.create_collection("shop", "few").unwrap();
+    e.insert_many(&few, (0..3).map(|i| doc! { "_id": i }).collect()).unwrap();
+    let found = e.documents_written_after(&few, before_all).unwrap();
+    assert_eq!((found.checked, found.after), (3, 3), "a small collection is read whole");
+}
+
+/// A document stamped at exactly the drop's `Hlc` (by another node) was written
+/// at the drop, not after it: it is not a write the drop took.
+#[test]
+fn a_document_stamped_at_the_drops_hlc_is_not_a_write_after_it() {
+    let (e, _d) = engine();
+    let orders = e.create_collection("shop", "orders").unwrap();
+    e.insert(&orders, doc! { "_id": 1 }).unwrap();
+    let written = e
+        .entries_for_peer(Hlc::ZERO, BATCH, crate::WalkScope::Background)
+        .unwrap()
+        .entries
+        .into_iter()
+        .find(|entry| entry.kind == OpKind::Insert)
+        .expect("the insert")
+        .stamp;
+    let at_the_drop = Stamp::new(written.hlc, NodeId::from_bytes([9; 16]));
+    let found = e.documents_written_after(&orders, at_the_drop).unwrap();
+    assert_eq!((found.checked, found.after), (1, 0), "a write at the drop counted as after it");
+    let before_the_write = Stamp::new(Hlc::new(written.hlc.wall_ms - 1, 0), written.node);
+    assert_eq!(e.documents_written_after(&orders, before_the_write).unwrap().after, 1);
 }
 
 /// One measurement, not a guard: what the burial's look for writes made after the

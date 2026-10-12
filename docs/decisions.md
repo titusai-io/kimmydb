@@ -26413,9 +26413,9 @@ failing the page, and the loop test with the exemption removed.
    position, found by two point lookups: just after the drop's entry, where 0.46.0 began it, with the floor
    kept. A recreate is a collection whose creation entry arrived after the drop's. One that arrived before it
    is a survivor of a database's drop, and what of its life arrived before the sentinel is only recognisable
-   by stamp (a creation applied before the document that follows it is no guarantee: an entry of an earlier
-   build was appended in a second commit, after the creation's, and a document applied between them arrived
-   before it), so it is placed by the walk, as it was in 0.47.0. So is a collection this member holds no
+   by stamp (the position of a creation's entry is no guarantee: a replicated creation is committed and its
+   entry appended in a second commit, as it is on every build, and a document from another peer applied
+   between the two arrives before the entry), so it is placed by the walk, as it was in 0.47.0. So is a collection this member holds no
    creation entry for (retention took it, or a snapshot brought the collection), and one whose drop's entry
    is not held. The walk's cost lands only on those, and only while the tombstone lives.
    **Measured on a release build, 1.8 million entries, the creation last:** the open examined 1,800,006 rows
