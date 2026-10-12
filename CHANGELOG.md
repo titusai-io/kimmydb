@@ -10,7 +10,15 @@ Versioning follows the pre-1.0 policy in
 [docs/compatibility.md](docs/compatibility.md): a `0.MINOR` bump may carry
 breaking changes and says so here; a `0.x.PATCH` bump never does.
 
-## Unreleased
+## 0.47.1 - 2026-10-12
+
+This release fixes two things in the database-drop tombstone of 0.47.0: a `WARN` on every clean
+drop, and a change stream opened at the start of a recreated collection that read the whole
+retained log. **Roll the members one at a time. This release is not a rollback boundary:** no
+configuration key, table, `kimmy.format` schema (still 4), redb version, backup tag, snapshot field
+or entry kind changed, and 0.47.0 opens a store 0.47.1 has run on, so a member rolls back by
+starting it on 0.47.0. Nothing here changes what a client is sent except that the second fix
+answers the opens it used to answer too late.
 
 ### Fixed
 

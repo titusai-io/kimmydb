@@ -2477,7 +2477,7 @@ to the release, and no more than that: it sits beside the archive, and whoever
 could replace one could replace both.
 
 ```bash
-V=0.47.0; A=kimmyd-x86_64-unknown-linux-musl.tar.xz
+V=0.47.1; A=kimmyd-x86_64-unknown-linux-musl.tar.xz
 curl -LO "https://github.com/titusai-io/kimmydb/releases/download/v$V/$A"
 curl -LO "https://github.com/titusai-io/kimmydb/releases/download/v$V/$A.sha256"
 shasum -a 256 -c "$A.sha256"
@@ -2497,7 +2497,7 @@ signing key, because there is none to copy. `gh` performs the check:
 gh attestation verify kimmyd-x86_64-unknown-linux-musl.tar.xz -R titusai-io/kimmydb
 
 # The container image, by tag or by digest
-gh attestation verify oci://ghcr.io/titusai-io/kimmydb:0.47.0 -R titusai-io/kimmydb
+gh attestation verify oci://ghcr.io/titusai-io/kimmydb:0.47.1 -R titusai-io/kimmydb
 ```
 
 A successful verification prints the workflow that produced the artifact and
@@ -2605,6 +2605,8 @@ ignored by 0.42.0, so a manifest that sets it needs no edit. A member on the
 defaults rolls back untouched.
 
 **Rolling back from 0.47.0 to 0.46.0 needs no store work and no edit to the configuration, and a roll or a rollback must finish within `storage.tombstone_retention_secs` of any database drop made during it.** No table, `kimmy.format` schema (still 4), redb version, backup tag, snapshot field, entry kind or configuration key changed. A database's drop is a row of the dropped-collections table under a reserved collection name, and an ordinary `DropCollection` entry that names it ([ADR-229](decisions.md)); 0.46.0 reads, applies, stores and serves both as the drop of a collection it never held, which a 0.46.0 member was shown to do on the 0.46.0 build before the change. A backup taken on 0.47.0 restores on 0.46.0, and the reverse. **What a member on 0.46.0 does not do is act on it:** it drops the collections the dropper held and *keeps* a collection the dropper never held, and keeps serving it, acknowledged writes included, until it restarts on 0.47.0, which buries it (and the writes). A member that stays on 0.46.0 longer than the tombstone's retention after a database drop never has the tombstone to act on; the other members, which have also collected theirs, then see the collection as an existence divergence and anti-entropy brings it back, and with it the database. Finish a roll or a rollback inside the retention window, and do not drop databases in the middle of one if you can wait. While the cluster is mixed, a database drop issued on a 0.46.0 member records no tombstone and behaves as it did.
+
+**Rolling back from 0.47.1 to 0.47.0 needs nothing:** the store, the wire and the configuration are the same, and the release changes only a log level and where a change stream starts.
 
 **Rolling back from 0.46.0 to 0.45.0 needs no store work and no edit to the configuration.** No table, `kimmy.format` schema (still 4), redb version or configuration key changed. The store gains `META` rows (`state_held:<node id>`, [ADR-224](decisions.md)), which a backup carries and 0.45.0 restores and never reads; a store holding them, and a backup holding them (with a bare tombstone, [ADR-228](decisions.md)), was started on a 0.45.0 build, answered `/readyz` and stopped clean, and 0.45.0's own `kimmyd restore` of such a backup did the same. The wire gained optional fields (`vector_changed` on a collection's state in a snapshot page, [ADR-226](decisions.md)) and one list (`dropped_indexes`, [ADR-225](decisions.md)), both of which 0.45.0 skips, so a mixed cluster keeps the old behaviour for them until every member has rolled. **What reopens on rolling back and forward:** *holes* — a snapshot taken while a member ran 0.45.0 records none, so that member serves across the span it holds only as state until it is rebuilt from a peer; and *unstamped vector changes* — a 0.45.0 build that rewrites a collection's metadata drops the vector stamp, so a vector change made on 0.45.0 reads as older than any stamped change when 0.46.0 returns ([ADR-226](decisions.md)). The tombstones recorded for documents a member never held are ordinary tombstones, collected at tombstone retention. `dns:` and `k8s:` seeds resolve through `getaddrinfo` again on 0.45.0 (no `resolv.conf` requirement), and `KIMMY_TEST_DNS_SERVER` is ignored there. Resume tokens are not changed on the wire; 0.45.0 does not refuse a token inside a hole. Nothing is stored for the new counter.
 
