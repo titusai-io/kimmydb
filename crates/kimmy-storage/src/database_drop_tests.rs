@@ -969,6 +969,51 @@ async fn a_tokenless_stream_on_a_survivor_keeps_the_entries_that_arrived_before_
     );
 }
 
+/// A collection created here from a peer's entry, and a document of the peer's
+/// for it applied while the creation was being recorded, is in the replay of a
+/// stream opened at the creation: the stream begins at the creation's entry,
+/// so the entry cannot arrive after the document.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_document_applied_while_a_replicated_creation_is_recorded_is_not_skipped_by_a_replay() {
+    let (a, _da) = engine();
+    a.create_collection("shop", "orders").unwrap();
+    later();
+    assert!(a.drop_database("shop").unwrap());
+    later();
+    let (p, _dp) = engine();
+    let late = p.create_collection("shop", "late").unwrap();
+    p.insert(&late, doc! { "_id": 1 }).unwrap();
+    let theirs =
+        p.entries_for_peer(Hlc::ZERO, BATCH, crate::WalkScope::Background).unwrap().entries;
+    let create = theirs.iter().find(|e| e.kind == OpKind::CreateCollection).unwrap().clone();
+    let insert = theirs.iter().find(|e| e.kind == OpKind::Insert).unwrap().clone();
+
+    let (c, _dc) = engine();
+    let c = Arc::new(c);
+    let competing = Arc::clone(&c);
+    let arriving = insert.clone();
+    crate::sync::race_hooks::at(crate::sync::race_hooks::Race::DdlAppend, move || {
+        competing.apply_batch(std::slice::from_ref(&arriving)).unwrap();
+    });
+    c.apply_batch(std::slice::from_ref(&create)).unwrap();
+    // Reached only where the creation's entry is appended after the creation
+    // commits, and the document arrives between the two. Where the entry is in
+    // the creation's commit there is no such moment, and the document comes now.
+    crate::sync::race_hooks::reach(crate::sync::race_hooks::Race::DdlAppend);
+    pull(&c, &a);
+    assert!(holds(&c, "shop", "late"), "premise: the collection survives the sentinel");
+    assert!(c.collection_dropped_at(late.id).unwrap().is_some(), "premise: it holds the tombstone");
+
+    let from_start = WatchOptions { resume_after: None, start_at: Some(Hlc::ZERO) };
+    let mut stream = c.watch(WatchScope::Collection(late.id), from_start).unwrap();
+    let first = next_document(&mut stream, &c).await;
+    assert_eq!(
+        first.doc_id,
+        Some(kimmy_core::DocId::Int64(1)),
+        "a replay skipped a document that arrived while the creation was recorded"
+    );
+}
+
 /// Control: on a collection dropped and recreated on this member, a token of
 /// the life before is still refused, and a replay starts at the new life.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

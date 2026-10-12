@@ -4119,6 +4119,24 @@ impl Engine {
         origin: Option<Hlc>,
         history: &dyn Fn(Stamp) -> bool,
     ) -> Result<Option<CollectionMeta>> {
+        self.create_collection_with_entry(db, name, log, origin, history, None)
+    }
+
+    /// [`Self::create_collection_inner`], also appending `entry` (the
+    /// replicated creation that carried it) in the commit that creates the
+    /// collection. Appended later, a document another peer sent for the
+    /// collection could be applied between the two commits and arrive before
+    /// the entry that creates the collection, and a stream opened at the
+    /// creation's position would skip it.
+    pub(crate) fn create_collection_with_entry(
+        &self,
+        db: &str,
+        name: &str,
+        log: bool,
+        origin: Option<Hlc>,
+        history: &dyn Fn(Stamp) -> bool,
+        entry: Option<&OplogEntry>,
+    ) -> Result<Option<CollectionMeta>> {
         // A creation over a dropped life's rows is refused inside the
         // transaction, below: see `create_collection_in_txn` (ADR-189).
 
@@ -4140,7 +4158,14 @@ impl Engine {
         let mint = || self.next_stamp();
         match self.create_collection_in_txn(&txn, db, name, log, origin, history, mint) {
             Ok(InTxn::Created(meta, logged)) => {
+                if let Some(entry) = entry {
+                    append_oplog(&txn, entry)?;
+                }
                 txn.commit()?;
+                if let Some(entry) = entry {
+                    self.witness(&entry.stamp);
+                    self.publish(vec![entry.clone()]);
+                }
                 if let Some(entry) = logged {
                     self.publish(vec![entry]);
                 }

@@ -317,10 +317,32 @@ impl Engine {
             return match &options.resume_after {
                 Some(token) if token.to_stamp() <= dropped_at => Err(expired()),
                 Some(_) => Ok((start, Some((id, dropped_at)))),
-                None => Ok((
-                    self.first_arrival_stamped_after(start, dropped_at, walked)?,
-                    Some((id, dropped_at)),
-                )),
+                // Found by position where this member holds the entries that
+                // say it, and not by the stamp walk, which reads the retained
+                // log from the start to the first entry above the tombstone
+                // (round 0500: 1.8 M rows, 62 s). The life begins at its own
+                // creation entry, every entry of it arrived after that, and the
+                // floor passes over any of the life before that arrives later.
+                // A creation that arrived after the drop's entry (a recreate)
+                // starts just after the drop's, where 0.46.0 began; one that
+                // arrived before it (a survivor of a database's drop) starts at
+                // the creation, so its entries before the sentinel are kept.
+                // Without the creation entry (retention took it, or a snapshot
+                // brought the collection) nothing says where the life began but
+                // the stamps.
+                None => {
+                    let begin = match (
+                        self.arrival_of(&dropped_at)?,
+                        self.creation_arrival(id, live.created, walked)?,
+                    ) {
+                        (Some(drop_seq), Some(created_at)) => {
+                            start.max((drop_seq + 1).min(created_at))
+                        }
+                        (None, Some(created_at)) => start.max(created_at),
+                        (_, None) => self.first_arrival_stamped_after(start, dropped_at, walked)?,
+                    };
+                    Ok((begin, Some((id, dropped_at))))
+                }
             };
         }
         // From here the collection is absent (dropped and not recreated here) or,
@@ -360,6 +382,36 @@ impl Engine {
         let txn = self.db().begin_read()?;
         let by_stamp = txn.open_table(tables::OPLOG_ARRIVAL_SEQ)?;
         Ok(by_stamp.get(codec::oplog_key(stamp).as_slice())?.map(|seq| seq.value()))
+    }
+
+    /// The arrival position of the entry that created collection `id` at
+    /// `created`, if this node holds it: a seek over the keys of that `Hlc`,
+    /// whatever node stamped it, so it reads the entries of one instant and not
+    /// the log. `None` where retention took the entry or a snapshot brought the
+    /// collection without it.
+    fn creation_arrival(
+        &self,
+        id: CollectionId,
+        created: Hlc,
+        walked: &mut Walked,
+    ) -> Result<Option<u64>> {
+        let txn = self.db().begin_read()?;
+        let by_stamp = txn.open_table(tables::OPLOG_ARRIVAL_SEQ)?;
+        let oplog = txn.open_table(tables::OPLOG)?;
+        let low = codec::oplog_key_lower_bound(created);
+        let mut high = low;
+        high[kimmy_core::HLC_ENCODED_LEN..].fill(0xff);
+        walked.walks += 1;
+        for row in by_stamp.range(low.as_slice()..=high.as_slice())? {
+            let (key, seq) = row?;
+            walked.rows += 1;
+            let Some(entry) = oplog.get(key.value())? else { continue };
+            let (kind, collection) = codec::decode_oplog_kind_and_collection(entry.value())?;
+            if kind == OpKind::CreateCollection && collection == id {
+                return Ok(Some(seq.value()));
+            }
+        }
+        Ok(None)
     }
 
     /// The first arrival position at or after `from` whose entry is stamped
@@ -3754,6 +3806,121 @@ mod tests {
     /// Where a stream resumed from another member's token starts: the race
     /// between the walk and the seek against today's walk, over stores built
     /// by every writer of the oplog, the arrival index and the vectors.
+    // -- Where a tokenless open on a collection with a tombstone starts --
+
+    /// The start a stream opened at the beginning of history resolves to, and
+    /// what the resolve read to find it.
+    fn open_from_start(engine: &Engine, id: CollectionId) -> (Resolved, Walked) {
+        let mut walked = Walked::default();
+        let options = WatchOptions { resume_after: None, start_at: Some(Hlc::ZERO) };
+        let resolved =
+            engine.resolve_start(&WatchScope::Collection(id), &options, &mut walked).unwrap();
+        (resolved, walked)
+    }
+
+    /// An oplog of `rows` entries, all older than whatever is written next.
+    fn an_old_oplog(engine: &Engine, rows: usize) {
+        let bulk = engine.create_collection("app", "bulk").unwrap();
+        for chunk in 0..(rows / 1_000) {
+            let docs = (0..1_000).map(|i| doc! { "_id": format!("d{chunk}-{i}") }).collect();
+            engine.insert_many(&bulk, docs).unwrap();
+        }
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+
+    /// Round 0500: a stream opened with no token on a recreated collection read
+    /// the arrival index from its start to the first entry above the tombstone,
+    /// 1.8 M rows and 62 s on a real log. What it reads is a few rows, however
+    /// long the log: the life begins just after the drop's entry.
+    #[test]
+    fn a_tokenless_open_on_a_recreated_collection_does_not_walk_the_log() {
+        let (engine, _coll, _dir) = setup();
+        an_old_oplog(&engine, 4_000);
+        let x = engine.create_collection("app", "x").unwrap();
+        engine.insert(&x, doc! { "_id": "old" }).unwrap();
+        assert!(engine.drop_collection("app", "x").unwrap());
+        engine.purge_dropped_collection(x.id).unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(5));
+        let x = engine.create_collection("app", "x").unwrap();
+        engine.insert(&x, doc! { "_id": "new" }).unwrap();
+
+        let (resolved, walked) = open_from_start(&engine, x.id);
+        assert!(walked.rows <= 4, "the open read {} rows of a 4,000-entry log", walked.rows);
+        let dropped_at = engine.collection_dropped_at(x.id).unwrap().expect("tombstone");
+        let drop_seq = engine.arrival_of(&dropped_at).unwrap().expect("the drop is in the log");
+        assert_eq!(resolved.start, drop_seq + 1, "a recreate begins where 0.46.0 began it");
+        assert_eq!(resolved.incarnation_floor, Some((x.id, dropped_at)), "the floor is kept");
+    }
+
+    /// A collection that arrived before the tombstone's entry did (a survivor of
+    /// a database's drop) begins at its creation, whatever precedes the drop.
+    #[test]
+    fn a_tokenless_open_on_a_survivor_starts_at_its_creation() {
+        let (engine, _coll, _dir) = setup();
+        an_old_oplog(&engine, 4_000);
+        let sentinel =
+            Stamp::new(Hlc::new(crate::physical_now_ms(), 0), NodeId::from_bytes([7; 16]));
+        let late = engine.create_collection("app", "late").unwrap();
+        engine.insert(&late, doc! { "_id": 1 }).unwrap();
+        let created_at = {
+            let creation =
+                engine.creation_arrival(late.id, late.created, &mut Walked::default()).unwrap();
+            creation.expect("the creation is in the log")
+        };
+        // The drop's entry arrives after the collection's own, as it does on a
+        // member that learned of a database's drop late.
+        std::thread::sleep(std::time::Duration::from_millis(5));
+        let sentinel = Stamp::new(Hlc::new(late.created.wall_ms - 1, 0), sentinel.node);
+        engine.record_collection_drop(late.id, sentinel).unwrap();
+        let drop = crate::engine::ddl_entry(
+            sentinel,
+            OpKind::DropCollection,
+            kimmy_core::database_drop_id("app"),
+            &kimmy_core::CollectionRef::new("app", kimmy_core::DATABASE_DROP_NAME),
+        )
+        .unwrap();
+        let txn = engine.begin_write(crate::WriterHolder::Replication).unwrap();
+        crate::engine::append_oplog(&txn, &drop).unwrap();
+        txn.commit().unwrap();
+        let drop_seq = engine.arrival_of(&sentinel).unwrap().expect("the sentinel is in the log");
+        assert!(created_at < drop_seq, "premise: the creation arrived before the drop");
+
+        let (resolved, walked) = open_from_start(&engine, late.id);
+        assert!(walked.rows <= 4, "the open read {} rows of a 4,000-entry log", walked.rows);
+        assert_eq!(
+            resolved.start, created_at,
+            "the survivor's entries before the sentinel are kept"
+        );
+        assert_eq!(resolved.incarnation_floor, Some((late.id, sentinel)));
+    }
+
+    /// Where this member holds no creation entry for the collection (a snapshot
+    /// brought it, or retention took the entry) nothing says where the life
+    /// began but the stamps, and the open is placed by them as on 0.46.0.
+    #[test]
+    fn a_tokenless_open_on_a_collection_with_no_creation_entry_is_placed_by_stamps() {
+        let (engine, _coll, _dir) = setup();
+        an_old_oplog(&engine, 4_000);
+        let dropped_at =
+            Stamp::new(Hlc::new(crate::physical_now_ms(), 0), NodeId::from_bytes([7; 16]));
+        let id = CollectionId::derive("app", "y");
+        engine.record_collection_drop(id, dropped_at).unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(5));
+        let created = Hlc::new(crate::physical_now_ms(), 0);
+        engine
+            .create_collection_inner("app", "y", false, Some(created), &|_| false)
+            .unwrap()
+            .expect("created");
+        engine.insert(&engine.get_collection("app", "y").unwrap(), doc! { "_id": 1 }).unwrap();
+
+        let (resolved, walked) = open_from_start(&engine, id);
+        assert!(walked.rows >= 4_000, "the stamps were not walked: {} rows", walked.rows);
+        let first_after =
+            engine.first_arrival_stamped_after(0, dropped_at, &mut Walked::default()).unwrap();
+        assert_eq!(resolved.start, first_after);
+        assert_eq!(resolved.incarnation_floor, Some((id, dropped_at)));
+    }
+
     mod first_arrival {
         use proptest::prelude::*;
         use redb::ReadableTableMetadata;
