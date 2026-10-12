@@ -639,8 +639,11 @@ fn a_failed_sweep_is_not_memoised() {
     assert_eq!(c.bury_under_database_tombstones().unwrap().spared, 1, "the retry walked");
 }
 
+/// A document written into the collection after the drop was stamped, on a
+/// member that had not yet received the drop, is a write acknowledged to a
+/// client and then lost: the sweep says so, with how many.
 #[test]
-fn a_burial_that_loses_documents_logs_their_number() {
+fn a_burial_that_loses_a_write_made_after_the_drop_logs_how_many() {
     let (a, b, _da, _db, _late) = the_field_sequence();
     let (c, _dc) = engine();
     pull(&c, &b);
@@ -651,9 +654,69 @@ fn a_burial_that_loses_documents_logs_their_number() {
     let logs = crate::log_capture::logs_of(|| {
         pull(&c, &a);
     });
-    assert!(logs.contains("a database drop buried a collection that holds documents"), "{logs}");
+    assert!(
+        logs.contains("buried a collection that holds documents written after the drop"),
+        "{logs}"
+    );
     assert!(logs.contains("written_after_the_drop=1"), "{logs}");
-    assert!(logs.contains("documents=2"), "{logs}");
+}
+
+/// An ordinary clean drop of a collection that holds documents warns of nothing:
+/// every document it holds was written before the drop, which is what the drop
+/// is for, and the burial is already logged.
+#[test]
+fn a_clean_database_drop_with_documents_buries_without_a_warning() {
+    let (a, b, _da, _db, late) = the_field_sequence();
+    let (c, _dc) = engine();
+    pull(&c, &b);
+    let held = c.get_collection("shop", "late").unwrap();
+    assert_eq!(
+        c.count(&held, crate::WalkScope::Request).unwrap(),
+        1,
+        "premise: it holds a document"
+    );
+    let logs = crate::log_capture::logs_of(|| {
+        pull(&c, &a);
+    });
+    assert!(!holds(&c, "shop", "late"), "premise: the sweep buried it");
+    assert!(c.collection_dropped_at(late).unwrap().is_some());
+    assert!(
+        !logs.lines().any(|line| line.contains("WARN") && line.contains("buried a collection")),
+        "a clean drop warned: {logs}"
+    );
+}
+
+/// A document deleted after the drop is not a lost write: its record is a
+/// tombstone, stamped after the drop, beside a live document that predates it.
+#[test]
+fn a_document_deleted_after_the_drop_is_not_a_lost_write() {
+    let (a, _da) = engine();
+    let (b, _db) = engine();
+    let (c, _dc) = engine();
+    a.create_collection("shop", "orders").unwrap();
+    sync(&a, &b);
+    let late = b.create_collection("shop", "late").unwrap();
+    b.insert(&late, doc! { "_id": "keep" }).unwrap();
+    b.insert(&late, doc! { "_id": "gone" }).unwrap();
+    later();
+    assert!(a.drop_database("shop").unwrap());
+    pull(&c, &b);
+    let held = c.get_collection("shop", "late").unwrap();
+    later();
+    c.delete(&held, &kimmy_core::DocId::String("gone".into())).unwrap();
+    assert_eq!(
+        c.count(&held, crate::WalkScope::Request).unwrap(),
+        1,
+        "premise: one live document is left"
+    );
+    let logs = crate::log_capture::logs_of(|| {
+        pull(&c, &a);
+    });
+    assert!(!holds(&c, "shop", "late"), "premise: the sweep buried it");
+    assert!(
+        !logs.lines().any(|line| line.contains("WARN") && line.contains("buried a collection")),
+        "a deletion after the drop was reported as a lost write: {logs}"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -906,6 +969,50 @@ async fn a_tokenless_stream_on_a_survivor_keeps_the_entries_that_arrived_before_
     );
 }
 
+/// A collection created here from a peer's entry, and a document of the peer's
+/// for it applied between the creation's commit and its entry's, is in the
+/// replay of a stream opened with no token once the sentinel has arrived: the
+/// document arrived before the creation's entry, and only the stamps place it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_document_applied_while_a_replicated_creation_is_recorded_is_not_skipped_by_a_replay() {
+    let (a, _da) = engine();
+    a.create_collection("shop", "orders").unwrap();
+    later();
+    assert!(a.drop_database("shop").unwrap());
+    later();
+    let (p, _dp) = engine();
+    let late = p.create_collection("shop", "late").unwrap();
+    p.insert(&late, doc! { "_id": 1 }).unwrap();
+    let theirs =
+        p.entries_for_peer(Hlc::ZERO, BATCH, crate::WalkScope::Background).unwrap().entries;
+    let create = theirs.iter().find(|e| e.kind == OpKind::CreateCollection).unwrap().clone();
+    let insert = theirs.iter().find(|e| e.kind == OpKind::Insert).unwrap().clone();
+
+    let (c, _dc) = engine();
+    let c = Arc::new(c);
+    let competing = Arc::clone(&c);
+    let arriving = insert.clone();
+    crate::sync::race_hooks::at(crate::sync::race_hooks::Race::DdlAppend, move || {
+        competing.apply_batch(std::slice::from_ref(&arriving)).unwrap();
+    });
+    c.apply_batch(std::slice::from_ref(&create)).unwrap();
+    // Reached when the creation's entry is appended after the creation commits:
+    // the document arrives between the two. The hook is drained either way.
+    crate::sync::race_hooks::reach(crate::sync::race_hooks::Race::DdlAppend);
+    pull(&c, &a);
+    assert!(holds(&c, "shop", "late"), "premise: the collection survives the sentinel");
+    assert!(c.collection_dropped_at(late.id).unwrap().is_some(), "premise: it holds the tombstone");
+
+    let from_start = WatchOptions { resume_after: None, start_at: Some(Hlc::ZERO) };
+    let mut stream = c.watch(WatchScope::Collection(late.id), from_start).unwrap();
+    let first = next_document(&mut stream, &c).await;
+    assert_eq!(
+        first.doc_id,
+        Some(kimmy_core::DocId::Int64(1)),
+        "a replay skipped a document that arrived while the creation was recorded"
+    );
+}
+
 /// Control: on a collection dropped and recreated on this member, a token of
 /// the life before is still refused, and a replay starts at the new life.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -981,17 +1088,17 @@ fn the_reconcile_stops_at_a_safe_point_when_a_stop_is_asked() {
 
 #[test]
 fn the_reconcile_says_what_it_is_doing_on_the_readiness_probe() {
-    use crate::open_progress::{OpenPhase, open_snapshot};
+    use crate::open_progress::{OpenPhase, tests::THIS_THREAD_PHASE};
     let (engine, _dir) = tombstoned_store();
     let seen = std::rc::Rc::new(std::cell::Cell::new(None));
     let into = std::rc::Rc::clone(&seen);
+    THIS_THREAD_PHASE.with(|phase| phase.set(None));
     crate::sync::race_hooks::at(crate::sync::race_hooks::Race::Burial, move || {
-        let now = open_snapshot();
-        into.set(Some((now.phase, now.total)));
+        // This thread's own record of the phase: the probe's is the process's,
+        // and an open running in another test moves it.
+        into.set(THIS_THREAD_PHASE.with(std::cell::Cell::get));
     });
     engine.reconcile_database_tombstones().unwrap();
-    // The phase is the process's, and an open running in another test moves it;
-    // what the reconcile leaves it at is not asserted here.
     assert_eq!(seen.get(), Some((OpenPhase::Reconciling, 1)));
 }
 
@@ -1775,4 +1882,78 @@ fn a_drop_appended_by_another_path_while_it_applies_still_leaves_its_tombstones(
     applied.unwrap();
     assert!(e.oplog_entry(&drop.stamp).unwrap().is_some());
     assert_eq!(e.collection_dropped_at(ghost).unwrap(), Some(drop.stamp), "the tombstone was lost");
+}
+
+/// The look for writes after the drop reads the first `WARN_SAMPLE` documents of
+/// a collection and no more, however many it holds: its cost is bounded, and
+/// `walks_stop` lists it as a bounded read on that ground.
+#[test]
+fn the_look_for_writes_after_the_drop_reads_a_bounded_sample() {
+    let (e, _d) = engine();
+    let orders = e.create_collection("shop", "orders").unwrap();
+    let docs = (0..1_200).map(|i| doc! { "_id": i }).collect();
+    e.insert_many(&orders, docs).unwrap();
+    let before_all = Stamp::new(Hlc::ZERO, NodeId::from_bytes([7; 16]));
+    let found = e.documents_written_after(&orders, before_all).unwrap();
+    assert_eq!(found.checked, 1_000, "the look read more than its sample");
+    assert_eq!(found.after, 1_000, "every document it read was written after the drop");
+
+    let few = e.create_collection("shop", "few").unwrap();
+    e.insert_many(&few, (0..3).map(|i| doc! { "_id": i }).collect()).unwrap();
+    let found = e.documents_written_after(&few, before_all).unwrap();
+    assert_eq!((found.checked, found.after), (3, 3), "a small collection is read whole");
+}
+
+/// A document stamped at exactly the drop's `Hlc` (by another node) was written
+/// at the drop, not after it: it is not a write the drop took.
+#[test]
+fn a_document_stamped_at_the_drops_hlc_is_not_a_write_after_it() {
+    let (e, _d) = engine();
+    let orders = e.create_collection("shop", "orders").unwrap();
+    e.insert(&orders, doc! { "_id": 1 }).unwrap();
+    let written = e
+        .entries_for_peer(Hlc::ZERO, BATCH, crate::WalkScope::Background)
+        .unwrap()
+        .entries
+        .into_iter()
+        .find(|entry| entry.kind == OpKind::Insert)
+        .expect("the insert")
+        .stamp;
+    let at_the_drop = Stamp::new(written.hlc, NodeId::from_bytes([9; 16]));
+    let found = e.documents_written_after(&orders, at_the_drop).unwrap();
+    assert_eq!((found.checked, found.after), (1, 0), "a write at the drop counted as after it");
+    let before_the_write = Stamp::new(Hlc::new(written.hlc.wall_ms - 1, 0), written.node);
+    assert_eq!(e.documents_written_after(&orders, before_the_write).unwrap().after, 1);
+}
+
+/// One measurement, not a guard: what the burial's look for writes made after the
+/// drop costs. It reads the fixed-width header of at most a thousand records of
+/// the collection and copies nothing.
+/// `cargo test --release -p kimmy-storage --lib the_look_for_writes_after_the_drop -- --ignored --nocapture`
+#[test]
+#[ignore = "a measurement"]
+fn the_look_for_writes_after_the_drop_costs_a_fraction_of_a_commit() {
+    let (e, _d) = engine();
+    let coll = e.create_collection("shop", "docs").unwrap();
+    let docs = (0..5_000).map(|i| doc! { "_id": i, "pad": "x".repeat(200) }).collect();
+    e.insert_many(&coll, docs).unwrap();
+    let meta = e.get_collection("shop", "docs").unwrap();
+    let dropped =
+        Stamp::new(Hlc::new(crate::physical_now_ms() + 1_000, 0), NodeId::from_bytes([7; 16]));
+    let runs = 200;
+    let began = std::time::Instant::now();
+    let mut checked = 0;
+    for _ in 0..runs {
+        checked = e.documents_written_after(&meta, dropped).unwrap().checked;
+    }
+    let per = began.elapsed() / runs;
+    // A commit, for scale.
+    let began = std::time::Instant::now();
+    for i in 0..50 {
+        e.insert(&meta, doc! { "_id": 10_000 + i }).unwrap();
+    }
+    eprintln!(
+        "MEASURE the look read {checked} records in {per:?}; a single-document commit took {:?}",
+        began.elapsed() / 50
+    );
 }

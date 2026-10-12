@@ -26400,13 +26400,26 @@ failing the page, and the loop test with the exemption removed.
 7. **The incarnation clamp reads stamps.** For a collection that began at or after the tombstone,
    `clamp_to_incarnation` bounds the incarnation by the tombstone's stamp and not by where the drop's entry
    arrived: a token naming an entry at or before the stamp is of the life before (refused), any other token
-   resumes, a start with no token begins at the first entry stamped after it, and an entry of the life before
-   that arrives later is passed over by the floor. This is exact because every entry of the live life is
-   stamped above the tombstone and every one of the life before is refused by it; a creation stamped at the
-   tombstone's own `Hlc` is stamped above it by its node, so it is placed the same way. The position branch
-   stays for a collection that is **absent** (dropped and not recreated here), where an entry of the life
-   before that is stamped after the drop, by a clock that ran ahead, and arrived before it, is only
-   recognisable by where the drop's entry arrived.
+   resumes, and an entry of the life before that arrives later is passed over by the floor. This is exact
+   because every entry of the live life is stamped above the tombstone and every one of the life before is
+   refused by it; a creation stamped at the tombstone's own `Hlc` is stamped above it by its node, so it is
+   placed the same way. The position branch stays for a collection that is **absent** (dropped and not
+   recreated here), where an entry of the life before that is stamped after the drop, by a clock that ran
+   ahead, and arrived before it, is only recognisable by where the drop's entry arrived.
+
+   *Amended in 0.47.1.* A start with no token did not begin at the first entry stamped after the tombstone:
+   finding that entry walked the arrival index from its start, and on a log of 1.8 million entries that was
+   62 seconds and the same count of rows, for every replay of a recreated collection. A recreate now begins by
+   position, found by two point lookups: just after the drop's entry, where 0.46.0 began it, with the floor
+   kept. A recreate is a collection whose creation entry arrived after the drop's. One that arrived before it
+   is a survivor of a database's drop, and what of its life arrived before the sentinel is only recognisable
+   by stamp (the position of a creation's entry is no guarantee: a replicated creation is committed and its
+   entry appended in a second commit, as it is on every build, and a document from another peer applied
+   between the two arrives before the entry), so it is placed by the walk, as it was in 0.47.0. So is a collection this member holds no
+   creation entry for (retention took it, or a snapshot brought the collection), and one whose drop's entry
+   is not held. The walk's cost lands only on those, and only while the tombstone lives.
+   **Measured on a release build, 1.8 million entries, the creation last:** the open examined 1,800,006 rows
+   in 72 ms on a warm cache before, and examines 2 rows in 26 microseconds after.
 8. **A pre-existing defect is fixed with it.** The ordinary replicated `DropCollection` arm recorded only the
    parent's id for a collection the member never held, so the first vector chunk for it stopped the batch as an
    unknown collection until a snapshot. It records the shadow's id too, as a burial does, for a collection it
@@ -26442,8 +26455,11 @@ within `tombstone_retention_secs` of any database drop made during it.
   the drop that the member had not received, with its documents. It used to leave it, and the database came
   back with it in it.
 - A write acknowledged into such a collection on a member that has not applied the drop (a 0.46.0 member in a
-  roll; a member that has not received it) is lost with it. The sweep logs the collection, its live documents
-  and how many of the first thousand were written after the drop.
+  roll; a member that has not received it) is lost with it. The sweep warns, once for the collection, when one of its first thousand documents is live and
+  stamped after the drop, with how many are (`written_after_the_drop`); a collection whose documents all
+  predate the drop, which is every ordinary drop, is buried without a warning. The look reads the fixed-width
+  header of each record and copies nothing: 23 µs for a thousand records in a release build, against a
+  single-document commit of 4 ms.
 - **Resurrection is impossible except** for a creation concurrent with the drop within clock skew,
   replication lag or the drop's burial duration (the dropper's burials are stamped after the tombstone, so a
   same-named collection created in between is spared by the sweep and buried by the entry), and for a member
@@ -26506,7 +26522,8 @@ guards that pass found green.
 
 **Measured.** A stream opened with no token on a survivor reads the arrival index from its start to the
 first entry stamped after the tombstone: 16.8 ms over 500,000 older entries in a release build, the same rows
-its own replay reads. A member that receives the drop of a database of 3,000 collections of ten documents
+its own replay reads (as built in 0.47.0; the walk was a minute on a real log's cold pages, and 0.47.1 replaces
+it, item 7). A member that receives the drop of a database of 3,000 collections of ten documents
 converges as fast as it did on 0.46.0: a later write on the dropping member reached it 11.6, 12.7 and 13.2 s
 after the drop returned (median 12.7 s), against 13.3, 13.8 and 23.3 s on 0.46.0 (median 13.8 s), three runs
 each, release builds, two nodes on one host; before the tombstones were written in the commit that appends the

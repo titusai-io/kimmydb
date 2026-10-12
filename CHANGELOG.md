@@ -10,6 +10,30 @@ Versioning follows the pre-1.0 policy in
 [docs/compatibility.md](docs/compatibility.md): a `0.MINOR` bump may carry
 breaking changes and says so here; a `0.x.PATCH` bump never does.
 
+## Unreleased
+
+### Fixed
+
+- **A database drop warned for every collection it buried that held documents.** The sweep that
+  buries what a database's drop covers logged `a database drop buried a collection that holds
+  documents` at `WARN` for any collection with a live document, so an ordinary clean drop warned on
+  every replica, once per collection. It now warns only when a document was written after the drop
+  (`a database drop buried a collection that holds documents written after the drop`, with
+  `written_after_the_drop`): a write a member that had not yet received the drop answered `200` and
+  that the drop then took. A collection whose documents all predate the drop is buried without a
+  warning. The look at the documents reads the fixed-width header of at most a thousand records and
+  copies nothing, so the warning sees the first thousand documents of the collection by id.
+- **A change stream opened at the start on a recreated collection read the whole retained log.**
+  Finding where the collection's current life begins walked the arrival index from its start to the
+  first entry stamped after the collection's drop, once per stream: on a log of 1.8 million entries
+  that was 1.8 million rows and a minute, and a `GET .../watch?from_start=true` on a recreated
+  collection answered no events within a client's timeout while the node logged `a change stream took
+  over 10 s to find where it starts`. The start of a recreated collection is now found just after its
+  drop's entry and reads a few rows however long the log. The events delivered are the same, and a
+  resume token issued before a database's drop still resumes. A collection that survived a database's
+  drop (created here before the drop reached this member), and one this member holds no creation or
+  drop entry for, are placed by the walk as before.
+
 ## 0.47.0 - 2026-10-12
 
 This release makes a dropped database stay dropped. `DELETE /v1/db/{db}` used to drop the

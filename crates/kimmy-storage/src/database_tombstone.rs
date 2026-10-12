@@ -27,7 +27,7 @@ use kimmy_core::{
     vector_meta,
 };
 use redb::{ReadableDatabase, ReadableTable};
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 
 use crate::codec;
 use crate::engine::{Continuing, Engine, WriterHolder, append_oplog, ddl_entry};
@@ -61,6 +61,15 @@ impl Buried {
     pub fn names(&self, id: CollectionId) -> bool {
         self.collections.iter().any(|c| c.ids.contains(&id))
     }
+}
+
+/// What reading a collection's first documents found.
+#[derive(Debug, Default)]
+pub(crate) struct WrittenAfter {
+    /// Documents read.
+    pub(crate) checked: usize,
+    /// Of those, the live ones stamped after the drop.
+    pub(crate) after: usize,
 }
 
 /// What a sweep did.
@@ -336,7 +345,7 @@ impl Engine {
         notice: &mut Vec<BuriedCollection>,
     ) -> Result<()> {
         if collection.created <= dropped.hlc {
-            let held = self.documents_a_drop_loses(collection, dropped)?;
+            let written_after = self.documents_written_after(collection, dropped)?;
             let buried = self.bury_collection_as(
                 db,
                 &collection.name,
@@ -344,18 +353,23 @@ impl Engine {
                 Continuing::No,
                 Notify::Collect(notice),
             )?;
-            if buried.is_some()
-                && let Some((live, checked, after)) = held
-            {
-                warn!(
-                    db,
-                    collection = %collection.name,
-                    documents = live,
-                    checked,
-                    written_after_the_drop = after,
-                    "a database drop buried a collection that holds documents; the writes \
-                     stamped after the drop were acknowledged to clients"
-                );
+            if buried.is_some() {
+                // Only a write stamped after the drop is news: the collection's
+                // earlier documents are what the drop is for, and the burial is
+                // already logged. A write after it was answered `200` by a member
+                // that had not yet received the drop.
+                if written_after.after > 0 {
+                    warn!(
+                        db,
+                        collection = %collection.name,
+                        written_after_the_drop = written_after.after,
+                        checked = written_after.checked,
+                        "a database drop buried a collection that holds documents written after \
+                         the drop; those writes were acknowledged to clients"
+                    );
+                } else {
+                    debug!(db, collection = %collection.name, "a database drop buried a collection");
+                }
             }
         } else {
             self.record_tombstones_at(db, &collection.name, dropped)?;
@@ -372,30 +386,31 @@ impl Engine {
         self.record_collection_drop(id, at)
     }
 
-    /// For a collection about to be buried: its live documents, how many of its
-    /// first [`WARN_SAMPLE`] were read, and how many of those were written after
-    /// the drop. `None` when it holds none.
-    fn documents_a_drop_loses(
+    /// For a collection about to be buried: how many of its first [`WARN_SAMPLE`]
+    /// documents were read, and how many of those are live and were written
+    /// after the drop.
+    ///
+    /// Each record is judged by its fixed-width header alone, with no copy of
+    /// the body, and nothing is read for an empty collection.
+    pub(crate) fn documents_written_after(
         &self,
         collection: &CollectionMeta,
         dropped: Stamp,
-    ) -> Result<Option<(u64, usize, usize)>> {
+    ) -> Result<WrittenAfter> {
         let txn = self.db().begin_read()?;
-        let live = crate::live_count::live_count(&txn, collection.id)?;
-        if live == 0 {
-            return Ok(None);
+        if crate::live_count::live_count(&txn, collection.id)? == 0 {
+            return Ok(WrittenAfter::default());
         }
         let docs = txn.open_table(tables::DOCS)?;
-        let mut checked = 0usize;
-        let mut after = 0usize;
+        let mut found = WrittenAfter::default();
         for row in docs.range(crate::engine::doc_range(collection.id))?.take(WARN_SAMPLE) {
             let (_, value) = row?;
-            let record = codec::decode_doc_record(value.value())?;
-            checked += 1;
-            if !record.deleted && record.stamp.hlc > dropped.hlc {
-                after += 1;
+            let (stamp, live) = codec::doc_record_header(value.value())?;
+            found.checked += 1;
+            if live && stamp.hlc > dropped.hlc {
+                found.after += 1;
             }
         }
-        Ok(Some((live, checked, after)))
+        Ok(found)
     }
 }
