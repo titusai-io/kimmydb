@@ -26409,17 +26409,15 @@ failing the page, and the loop test with the exemption removed.
 
    *Amended in 0.47.1.* A start with no token did not begin at the first entry stamped after the tombstone:
    finding that entry walked the arrival index from its start, and on a log of 1.8 million entries that was
-   62 seconds and the same count of rows, for every replay of a recreated collection. It begins by position,
-   found by seeks: at the later of the start requested and the earlier of **the position after the drop's
-   entry** and **the collection's own creation entry**, with the floor kept. A recreate arrives after the
-   drop, so it begins where 0.46.0 began it; a survivor of a database's drop arrived before the sentinel, so
-   it begins at its creation and keeps the entries that arrived before the sentinel. A collection this member
-   holds no creation entry for (retention took it, or a snapshot brought the collection) is placed by the
-   stamps as before, and so is one whose drop is held but whose creation is not. For the position to be exact
-   the creation's entry must arrive no later than anything else of the life, so a replicated creation is now
-   appended in the commit that creates the collection, as a drop's tombstones are in the commit of its
-   entry. A collection created by a replicated creation on an earlier build had its entry appended in a
-   second commit, and a document from another peer applied between the two arrived before it.
+   62 seconds and the same count of rows, for every replay of a recreated collection. A recreate now begins by
+   position, found by two point lookups: just after the drop's entry, where 0.46.0 began it, with the floor
+   kept. A recreate is a collection whose creation entry arrived after the drop's. One that arrived before it
+   is a survivor of a database's drop, and what of its life arrived before the sentinel is only recognisable
+   by stamp (a creation applied before the document that follows it is no guarantee: an entry of an earlier
+   build was appended in a second commit, after the creation's, and a document applied between them arrived
+   before it), so it is placed by the walk, as it was in 0.47.0. So is a collection this member holds no
+   creation entry for (retention took it, or a snapshot brought the collection), and one whose drop's entry
+   is not held. The walk's cost lands only on those, and only while the tombstone lives.
    **Measured on a release build, 1.8 million entries, the creation last:** the open examined 1,800,006 rows
    in 72 ms on a warm cache before, and examines 2 rows in 26 microseconds after.
 8. **A pre-existing defect is fixed with it.** The ordinary replicated `DropCollection` arm recorded only the

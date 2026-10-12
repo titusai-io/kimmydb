@@ -28,11 +28,11 @@ breaking changes and says so here; a `0.x.PATCH` bump never does.
   first entry stamped after the collection's drop, once per stream: on a log of 1.8 million entries
   that was 1.8 million rows and a minute, and a `GET .../watch?from_start=true` on a recreated
   collection answered no events within a client's timeout while the node logged `a change stream took
-  over 10 s to find where it starts`. The start is now found by a seek, at the collection's creation
-  entry or just after its drop's entry, and reads a few rows however long the log. The events
-  delivered are the same, and a resume token issued before a database's drop still resumes. A
-  collection created here by a peer's `CreateCollection` has that entry recorded in the commit that
-  creates it, so a document from another peer cannot arrive before it.
+  over 10 s to find where it starts`. The start of a recreated collection is now found just after its
+  drop's entry and reads a few rows however long the log. The events delivered are the same, and a
+  resume token issued before a database's drop still resumes. A collection that survived a database's
+  drop (created here before the drop reached this member), and one this member holds no creation or
+  drop entry for, are placed by the walk as before.
 
 ## 0.47.0 - 2026-10-12
 

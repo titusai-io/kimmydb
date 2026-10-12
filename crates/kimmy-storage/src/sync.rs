@@ -2073,8 +2073,6 @@ impl Engine {
 
         // Tombstones the entry's own append writes in its commit (the drop arm's).
         let mut recorded_with_the_append: Vec<(CollectionId, Stamp)> = Vec::new();
-        // A creation's entry is appended in the commit that creates the collection.
-        let mut appended_with_the_creation = false;
         match entry.kind {
             OpKind::CreateCollection => {
                 let target: kimmy_core::CollectionRef = bson::deserialize_from_slice(body)?;
@@ -2125,17 +2123,14 @@ impl Engine {
                         race_hooks::reach(race_hooks::Race::ReplicatedCreate);
                         // The tombstone rule above, judged again under the
                         // writer: a drop can land between that check and here.
-                        match self.create_collection_with_entry(
+                        match self.create_collection_inner(
                             &target.db,
                             &target.name,
                             false,
                             Some(entry.stamp.hlc),
                             &|dropped_at| entry.stamp < dropped_at,
-                            Some(entry),
                         ) {
                             Ok(Some(_)) => {
-                                // The entry went in with the collection.
-                                appended_with_the_creation = true;
                                 debug!(db = %target.db, collection = %target.name, "created a replicated collection");
                             }
                             Ok(None) => {
@@ -2515,9 +2510,6 @@ impl Engine {
         // identity intact, and is what advances the version vector for its
         // origin node — while minting a local entry instead would send the
         // change back to the peer, which would apply it and mint another.
-        if appended_with_the_creation {
-            return Ok(DdlOutcome::Applied);
-        }
         self.append_replicated_ddl_recording(entry, &recorded_with_the_append)
     }
 

@@ -317,29 +317,27 @@ impl Engine {
             return match &options.resume_after {
                 Some(token) if token.to_stamp() <= dropped_at => Err(expired()),
                 Some(_) => Ok((start, Some((id, dropped_at)))),
-                // Found by position where this member holds the entries that
-                // say it, and not by the stamp walk, which reads the retained
+                // A creation that arrived after the drop's entry is a recreate,
+                // and the life begins just after that entry, where 0.46.0 began
+                // it: two point lookups, where the stamp walk reads the retained
                 // log from the start to the first entry above the tombstone
-                // (round 0500: 1.8 M rows, 62 s). The life begins at its own
-                // creation entry, every entry of it arrived after that, and the
-                // floor passes over any of the life before that arrives later.
-                // A creation that arrived after the drop's entry (a recreate)
-                // starts just after the drop's, where 0.46.0 began; one that
-                // arrived before it (a survivor of a database's drop) starts at
-                // the creation, so its entries before the sentinel are kept.
-                // Without the creation entry (retention took it, or a snapshot
-                // brought the collection) nothing says where the life began but
-                // the stamps.
+                // (round 0500: 1.8 M rows, 62 s). One that arrived before it is
+                // a survivor of a database's drop, and what of its life arrived
+                // before the sentinel is only recognisable by stamp, so it is
+                // placed by the walk. So is a collection with no creation entry
+                // here (retention took it, or a snapshot brought the collection)
+                // and one whose drop's entry is not held.
                 None => {
-                    let begin = match (
-                        self.arrival_of(&dropped_at)?,
-                        self.creation_arrival(id, live.created, walked)?,
-                    ) {
-                        (Some(drop_seq), Some(created_at)) => {
-                            start.max((drop_seq + 1).min(created_at))
-                        }
-                        (None, Some(created_at)) => start.max(created_at),
-                        (_, None) => self.first_arrival_stamped_after(start, dropped_at, walked)?,
+                    let recreated = match self.arrival_of(&dropped_at)? {
+                        Some(drop_seq) => match self.creation_arrival(id, live.created, walked)? {
+                            Some(created_at) if created_at > drop_seq => Some(drop_seq + 1),
+                            _ => None,
+                        },
+                        None => None,
+                    };
+                    let begin = match recreated {
+                        Some(after_the_drop) => start.max(after_the_drop),
+                        None => self.first_arrival_stamped_after(start, dropped_at, walked)?,
                     };
                     Ok((begin, Some((id, dropped_at))))
                 }
@@ -3853,44 +3851,24 @@ mod tests {
     }
 
     /// A collection that arrived before the tombstone's entry did (a survivor of
-    /// a database's drop) begins at its creation, whatever precedes the drop.
+    /// a database's drop) is placed by the stamps: what of its life arrived
+    /// before the sentinel is only recognisable by them, and the position after
+    /// the sentinel would skip it.
     #[test]
-    fn a_tokenless_open_on_a_survivor_starts_at_its_creation() {
+    fn a_tokenless_open_on_a_survivor_is_placed_by_stamps() {
         let (engine, _coll, _dir) = setup();
         an_old_oplog(&engine, 4_000);
-        let sentinel =
-            Stamp::new(Hlc::new(crate::physical_now_ms(), 0), NodeId::from_bytes([7; 16]));
         let late = engine.create_collection("app", "late").unwrap();
         engine.insert(&late, doc! { "_id": 1 }).unwrap();
-        let created_at = {
-            let creation =
-                engine.creation_arrival(late.id, late.created, &mut Walked::default()).unwrap();
-            creation.expect("the creation is in the log")
-        };
-        // Entries stamped at the same instant by another node, sorting before
-        // the creation's own: another collection's creation, and a document of
-        // this one. The creation is the entry that creates this collection.
-        let neighbour = NodeId::from_bytes([0; 16]);
-        let stamp = Stamp::new(late.created, neighbour);
-        let other = crate::engine::ddl_entry(
-            stamp,
-            OpKind::CreateCollection,
-            CollectionId::derive("app", "z"),
-            &kimmy_core::CollectionRef::new("app", "z"),
-        )
-        .unwrap();
-        let document = kimmy_core::OplogEntry {
-            stamp: Stamp::new(late.created, NodeId::from_bytes([1; 16])),
-            kind: OpKind::Insert,
-            collection: late.id,
-            doc_id: Some(kimmy_core::DocId::Int64(2)),
-            body: Some(bson::serialize_to_vec(&doc! { "_id": 2 }).unwrap()),
-        };
-        engine.apply_batch(&[other, document]).unwrap();
+        let created_at = engine
+            .creation_arrival(late.id, late.created, &mut Walked::default())
+            .unwrap()
+            .expect("the creation is in the log");
         // The drop's entry arrives after the collection's own, as it does on a
         // member that learned of a database's drop late.
         std::thread::sleep(std::time::Duration::from_millis(5));
-        let sentinel = Stamp::new(Hlc::new(late.created.wall_ms - 1, 0), sentinel.node);
+        let sentinel =
+            Stamp::new(Hlc::new(late.created.wall_ms - 1, 0), NodeId::from_bytes([7; 16]));
         engine.record_collection_drop(late.id, sentinel).unwrap();
         let drop = crate::engine::ddl_entry(
             sentinel,
@@ -3899,14 +3877,34 @@ mod tests {
             &kimmy_core::CollectionRef::new("app", kimmy_core::DATABASE_DROP_NAME),
         )
         .unwrap();
+        // And entries stamped at the creation's instant by another node, sorting
+        // before its own, arrive after it: another collection's creation, and
+        // an entry of this collection that is no creation. Neither is the
+        // creation, and taking one would put it after the sentinel.
+        let neighbour = |node: u8| Stamp::new(late.created, NodeId::from_bytes([node; 16]));
+        let other = crate::engine::ddl_entry(
+            neighbour(0),
+            OpKind::CreateCollection,
+            CollectionId::derive("app", "z"),
+            &kimmy_core::CollectionRef::new("app", "z"),
+        )
+        .unwrap();
+        let document = kimmy_core::OplogEntry {
+            stamp: neighbour(1),
+            kind: OpKind::Insert,
+            collection: late.id,
+            doc_id: Some(kimmy_core::DocId::Int64(2)),
+            body: Some(bson::serialize_to_vec(&doc! { "_id": 2 }).unwrap()),
+        };
         let txn = engine.begin_write(crate::WriterHolder::Replication).unwrap();
         crate::engine::append_oplog(&txn, &drop).unwrap();
         txn.commit().unwrap();
+        engine.apply_batch(&[other, document]).unwrap();
         let drop_seq = engine.arrival_of(&sentinel).unwrap().expect("the sentinel is in the log");
         assert!(created_at < drop_seq, "premise: the creation arrived before the drop");
 
         let (resolved, walked) = open_from_start(&engine, late.id);
-        assert!(walked.rows <= 4, "the open read {} rows of a 4,000-entry log", walked.rows);
+        assert!(walked.rows >= 4_000, "the stamps were not walked: {} rows", walked.rows);
         assert_eq!(
             resolved.start, created_at,
             "the survivor's entries before the sentinel are kept"
@@ -3946,30 +3944,42 @@ mod tests {
     }
 
     /// Where this member holds no creation entry for the collection (a snapshot
-    /// brought it, or retention took the entry) nothing says where the life
-    /// began but the stamps, and the open is placed by them as on 0.46.0.
+    /// brought it, or retention took the entry), or holds the tombstone without
+    /// the drop's entry, nothing says where the life began but the stamps, and
+    /// the open is placed by them as on 0.46.0.
     #[test]
-    fn a_tokenless_open_on_a_collection_with_no_creation_entry_is_placed_by_stamps() {
+    fn a_tokenless_open_without_the_entries_that_place_it_is_placed_by_stamps() {
         let (engine, _coll, _dir) = setup();
         an_old_oplog(&engine, 4_000);
         let dropped_at =
             Stamp::new(Hlc::new(crate::physical_now_ms(), 0), NodeId::from_bytes([7; 16]));
-        let id = CollectionId::derive("app", "y");
-        engine.record_collection_drop(id, dropped_at).unwrap();
+        let y = CollectionId::derive("app", "y");
+        let z = CollectionId::derive("app", "z");
+        engine.record_collection_drop(y, dropped_at).unwrap();
+        engine.record_collection_drop(z, dropped_at).unwrap();
         std::thread::sleep(std::time::Duration::from_millis(5));
+        // No creation entry: made without logging, as a snapshot makes one.
         let created = Hlc::new(crate::physical_now_ms(), 0);
         engine
             .create_collection_inner("app", "y", false, Some(created), &|_| false)
             .unwrap()
             .expect("created");
         engine.insert(&engine.get_collection("app", "y").unwrap(), doc! { "_id": 1 }).unwrap();
-
-        let (resolved, walked) = open_from_start(&engine, id);
-        assert!(walked.rows >= 4_000, "the stamps were not walked: {} rows", walked.rows);
+        // A creation entry, and no drop's entry.
+        engine.create_collection("app", "z").unwrap();
         let first_after =
             engine.first_arrival_stamped_after(0, dropped_at, &mut Walked::default()).unwrap();
-        assert_eq!(resolved.start, first_after);
-        assert_eq!(resolved.incarnation_floor, Some((id, dropped_at)));
+
+        for (id, held) in [(y, "no creation entry"), (z, "no drop entry")] {
+            let (resolved, walked) = open_from_start(&engine, id);
+            assert!(
+                walked.rows >= 4_000,
+                "{held}: the stamps were not walked: {} rows",
+                walked.rows
+            );
+            assert_eq!(resolved.start, first_after, "{held}");
+            assert_eq!(resolved.incarnation_floor, Some((id, dropped_at)), "{held}");
+        }
     }
 
     /// One measurement, not a guard: what a stream opened with no token costs on
