@@ -10,7 +10,13 @@ Versioning follows the pre-1.0 policy in
 [docs/compatibility.md](docs/compatibility.md): a `0.MINOR` bump may carry
 breaking changes and says so here; a `0.x.PATCH` bump never does.
 
-## Unreleased
+## 0.47.2 - 2026-10-12
+
+This release fixes `kimmy_process_resident_peak_bytes`, which could fall between two scrapes of a
+running node. **Roll the members one at a time. This release is not a rollback boundary:** no
+configuration key, table, `kimmy.format` schema (still 4), redb version, backup tag, snapshot field
+or entry kind changed, and 0.47.1 opens a store 0.47.2 has run on, so a member rolls back by
+starting it on 0.47.1.
 
 ### Fixed
 
