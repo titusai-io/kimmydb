@@ -139,10 +139,16 @@ impl Engine {
         if !vector_meta::is_shadow(name) {
             ids.push(CollectionId::derive(db, &vector_meta::shadow_name(name)));
         }
+        self.record_ids_at(&ids, at)
+    }
+
+    /// Tombstones for `ids` at `at`, in one commit, for those that hold none that
+    /// new. Read first: nothing newer to write takes no writer.
+    pub(crate) fn record_ids_at(&self, ids: &[CollectionId], at: Stamp) -> Result<()> {
         let mut batch = Vec::new();
         for id in ids {
-            if self.collection_dropped_at(id)?.is_none_or(|held| held < at) {
-                batch.push((id, at));
+            if self.collection_dropped_at(*id)?.is_none_or(|held| held < at) {
+                batch.push((*id, at));
             }
         }
         self.record_collection_drops(&batch)

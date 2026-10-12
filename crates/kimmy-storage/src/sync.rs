@@ -2235,24 +2235,28 @@ impl Engine {
                 // The originating stamp, not a local one: the tombstone has to
                 // sort before any recreation that legitimately followed the
                 // drop, or the name becomes unusable on this node forever.
-                self.drop_collection_inner(&target.db, &target.name, Some(entry.stamp))?;
+                let buried =
+                    self.drop_collection_inner(&target.db, &target.name, Some(entry.stamp))?;
                 // Recorded even when the collection was already gone: the
                 // tombstone is what stops a *later* replay from recreating it,
                 // and a node that never had the collection still needs it.
-                self.record_collection_drop(entry.collection, entry.stamp)?;
-                // And the shadow's, as a burial records both: a collection this
-                // node never held, with vectors, has chunks that are judged by
-                // the shadow's id, and with no tombstone for it the first of
-                // them stopped the batch until a snapshot.
-                if !kimmy_core::vector_meta::is_shadow(&target.name) {
-                    self.record_collection_drop(
-                        CollectionId::derive(
-                            &target.db,
-                            &kimmy_core::vector_meta::shadow_name(&target.name),
-                        ),
-                        entry.stamp,
-                    )?;
+                //
+                // And the shadow's, for a collection this node did not hold
+                // (a burial records both ids when it buries one): a collection
+                // never held, with vectors, has chunks that are judged by the
+                // shadow's id, and with no tombstone for it the first of them
+                // stopped the batch until a snapshot. In one commit with the
+                // parent's, and none at all when a burial has already written
+                // them, so a drop of a collection that is held, or that a
+                // database's sweep has already buried, costs what it did.
+                let mut ids = vec![entry.collection];
+                if !buried && !kimmy_core::vector_meta::is_shadow(&target.name) {
+                    ids.push(CollectionId::derive(
+                        &target.db,
+                        &kimmy_core::vector_meta::shadow_name(&target.name),
+                    ));
                 }
+                self.record_ids_at(&ids, entry.stamp)?;
             }
             OpKind::CreateIndex => {
                 let target: kimmy_core::IndexCreate = bson::deserialize_from_slice(body)?;
