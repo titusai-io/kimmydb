@@ -87,6 +87,10 @@ const BOUNDED_READS: &[(&str, &str)] = &[
         "at most a thousand rows of one collection about to be buried, read once for its warning",
     ),
     (
+        "watch::Engine::creation_arrival",
+        "the entries stamped at one instant, one per node that stamped there: a seek, not a walk",
+    ),
+    (
         "divergence::Engine::collection_tombstones",
         "the dropped-collection registry: one row per drop",
     ),
