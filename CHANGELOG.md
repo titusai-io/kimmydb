@@ -10,6 +10,17 @@ Versioning follows the pre-1.0 policy in
 [docs/compatibility.md](docs/compatibility.md): a `0.MINOR` bump may carry
 breaking changes and says so here; a `0.x.PATCH` bump never does.
 
+## Unreleased
+
+### Fixed
+
+- **`kimmy_process_resident_peak_bytes` fell between two scrapes of a running node.** The gauge was
+  read from `VmHWM`, which the kernel reports as the larger of its high-water mark and the current
+  resident size and updates lazily, so a node whose resident size had just been its maximum could read
+  lower a few seconds later (249360384, then 248778752, with no restart). Every reading of `VmHWM`
+  and `VmRSS` is now folded into a running maximum for the process, so the gauge never falls within
+  one process life, as the documentation says, and is never below `kimmy_process_resident_bytes`.
+
 ## 0.47.1 - 2026-10-12
 
 This release fixes two things in the database-drop tombstone of 0.47.0: a `WARN` on every clean

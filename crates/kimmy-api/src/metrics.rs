@@ -248,6 +248,9 @@ pub fn progress_slot(writer: &str) -> usize {
         .unwrap_or_else(|| panic!("{writer} is not a progress writer"))
 }
 
+/// The most resident memory any reading of this process has seen, in bytes.
+static PEAK_SEEN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 /// The process's resident memory, read from the kernel.
 ///
 /// `VmRSS` and `VmHWM` from `/proc/self/status`, which is what the project's
@@ -264,29 +267,44 @@ pub fn progress_slot(writer: &str) -> usize {
 pub struct ProcessMemory {
     /// Bytes resident right now (`VmRSS`).
     pub resident_bytes: u64,
-    /// The most bytes that were resident at any moment of this process's
-    /// life (`VmHWM`). What a container limit was hit *by*, after the fact,
-    /// when the current figure has already come back down.
+    /// The most bytes seen resident at any moment of this process's life
+    /// (`VmHWM`, and every `VmRSS` read, whichever is larger). What a container
+    /// limit was hit *by*, after the fact, when the current figure has already
+    /// come back down. Never falls, and is never below `resident_bytes`.
     pub peak_resident_bytes: u64,
 }
 
 impl ProcessMemory {
-    /// Read the kernel's figures for this process, fresh.
+    /// Read the kernel's figures for this process, fresh, with the peak made
+    /// the most this process has *seen*.
     ///
     /// One small file read; `/proc` is not a disk, so this costs what a
     /// scrape can afford. A file that cannot be read reads as zeros, which
     /// is what the HELP text promises for a platform without it.
+    ///
+    /// **The kernel's `VmHWM` can fall.** It reports the larger of its
+    /// high-water mark and the current resident size, and updates the mark
+    /// lazily (not on every drop of the resident size, whose counters are
+    /// batched per CPU), so a process whose resident size was its maximum can
+    /// read lower a moment later. Every reading, of both fields, is therefore
+    /// folded into a process-wide running maximum ([`Self::fold`]).
     pub fn read() -> Self {
         #[cfg(target_os = "linux")]
-        {
-            std::fs::read_to_string("/proc/self/status")
-                .map(|s| Self::parse(&s))
-                .unwrap_or_default()
-        }
+        let raw = std::fs::read_to_string("/proc/self/status")
+            .map(|s| Self::parse(&s))
+            .unwrap_or_default();
         #[cfg(not(target_os = "linux"))]
-        {
-            Self::default()
-        }
+        let raw = Self::default();
+        Self::fold(raw, &PEAK_SEEN)
+    }
+
+    /// `raw` with its peak raised to the most `seen` has recorded, and `seen`
+    /// raised to the larger of the two readings: so the peak never falls, and
+    /// is never below the current figure.
+    fn fold(raw: Self, seen: &std::sync::atomic::AtomicU64) -> Self {
+        let candidate = raw.resident_bytes.max(raw.peak_resident_bytes);
+        let peak = seen.fetch_max(candidate, std::sync::atomic::Ordering::Relaxed).max(candidate);
+        Self { resident_bytes: raw.resident_bytes, peak_resident_bytes: peak }
     }
 
     /// Pull the two fields out of the text of `/proc/self/status`.
@@ -4838,6 +4856,51 @@ kimmy_storage_cache_reads_total{result=\"miss\"} 9104
         assert_eq!(ProcessMemory::parse(""), ProcessMemory::default());
     }
 
+    /// The kernel's `VmHWM` read lower than an earlier reading's `VmRSS` on a
+    /// real node (round 0500: 249360384 then 248778752, ten seconds apart, no
+    /// restart). The gauge is the most this process has seen.
+    #[test]
+    fn a_peak_the_kernel_reports_lower_than_one_already_seen_does_not_make_the_gauge_fall() {
+        use std::sync::atomic::AtomicU64;
+        let seen = AtomicU64::new(0);
+        let status =
+            |rss_kb: u64, hwm_kb: u64| format!("VmHWM:\t {hwm_kb} kB\nVmRSS:\t {rss_kb} kB\n");
+        let first_kb = 249_360_384 / 1024;
+        let second_kb = 248_778_752 / 1024;
+        let first = ProcessMemory::fold(ProcessMemory::parse(&status(first_kb, first_kb)), &seen);
+        let raw = ProcessMemory::parse(&status(second_kb, second_kb));
+        assert!(
+            raw.peak_resident_bytes < first.peak_resident_bytes,
+            "premise: the kernel's peak fell"
+        );
+        let second = ProcessMemory::fold(raw, &seen);
+        assert_eq!(second.peak_resident_bytes, 249_360_384, "the gauge fell with the kernel's");
+        assert_eq!(second.resident_bytes, 248_778_752, "the current figure is the kernel's");
+    }
+
+    /// The peak is never below the current figure, whatever the kernel's mark
+    /// says: the mark is updated lazily, and the current size can pass it.
+    #[test]
+    fn the_peak_is_never_below_the_current_figure() {
+        use std::sync::atomic::AtomicU64;
+        let seen = AtomicU64::new(0);
+        let raw = ProcessMemory::parse("VmHWM:\t 100 kB\nVmRSS:\t 300 kB\n");
+        let m = ProcessMemory::fold(raw, &seen);
+        assert_eq!(m.peak_resident_bytes, 300 * 1024);
+        assert!(m.peak_resident_bytes >= m.resident_bytes);
+        // A mark above the current size is the peak.
+        let high = AtomicU64::new(0);
+        let m =
+            ProcessMemory::fold(ProcessMemory::parse("VmHWM:\t 700 kB\nVmRSS:\t 200 kB\n"), &high);
+        assert_eq!(m.peak_resident_bytes, 700 * 1024);
+        // And a kernel that prints no mark at all.
+        let m = ProcessMemory::fold(ProcessMemory::parse("VmRSS:\t 500 kB\n"), &seen);
+        assert_eq!(m.peak_resident_bytes, 500 * 1024);
+        // Nothing seen stays zero: a platform without /proc.
+        let none = AtomicU64::new(0);
+        assert_eq!(ProcessMemory::fold(ProcessMemory::default(), &none), ProcessMemory::default());
+    }
+
     #[cfg(target_os = "linux")]
     #[test]
     fn the_live_reading_is_non_zero_on_linux_and_the_peak_is_at_least_the_current() {
@@ -4846,5 +4909,10 @@ kimmy_storage_cache_reads_total{result=\"miss\"} 9104
         let m = ProcessMemory::read();
         assert!(m.resident_bytes > 0, "{m:?}");
         assert!(m.peak_resident_bytes >= m.resident_bytes, "{m:?}");
+        // And it does not fall between readings, as the process's own lives.
+        let again = ProcessMemory::read();
+        assert!(again.peak_resident_bytes >= m.peak_resident_bytes, "{m:?} then {again:?}");
+        // Recorded in the process-wide maximum the next reading is folded into.
+        assert!(PEAK_SEEN.load(std::sync::atomic::Ordering::Relaxed) >= again.peak_resident_bytes);
     }
 }
