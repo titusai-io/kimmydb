@@ -26468,7 +26468,7 @@ walk of the collections of a database with a tombstone only when its tombstone o
 reconcile runs once at a start. The page sweep runs on every page with a list of drops, which the memo makes a
 point read.
 
-**Tests.** `kimmy-storage/src/database_drop_tests.rs` (the engine's side, 60 tests and an ignored measurement), `watch.rs`'s recreate
+**Tests.** `kimmy-storage/src/database_drop_tests.rs` (the engine's side, 64 tests and an ignored measurement), `watch.rs`'s recreate
 tests, `kimmy-api/tests/api.rs`, `kimmyd/tests/lifecycle.rs` (a start buries before it serves),
 `kimmy-cluster/tests/replication.rs` (the field sequence over real transport; a member behind a
 snapshot-caught-up peer takes the drop from the page, by rounds and in the member's own loop) and a
@@ -26480,7 +26480,7 @@ keeps the graph of a collection the sweep buried, and the shadow defect. Control
 collection created after the drop stands and replicates, a newer life is not taken by a late drop, a drop of
 a database the member does not hold writes nothing, and the entry is an ordinary `DropCollection`.
 
-**Mutation run: 57 rows, all killed.** Each row is one textual change to the committed tree, run under `bash`
+**Mutation run: 61 rows, all killed.** Each row is one textual change to the committed tree, run under `bash`
 with a timeout, with the test that kills it named: the head not written or written after the burials; the
 database rule ignored at each of its sites (the creation under the writer, the entry's early check, the
 entry's recorded refusal, the snapshot definition's early check and recorded refusal, the page's wait for a
@@ -26494,7 +26494,7 @@ partial answer; a head failure reported as partial; the notice not sent, ignored
 unhandled by the stream and by the vector cache; the stream subscribing after its start resolves; the clamp's
 stamp branch kept for a survivor, applied to an absent collection, its floor dropped, and its position
 branch removed; the memo ignoring the generation, written before the sweep succeeds, or kept for a database
-or a tombstone that has gone; the sweep without a stop checkpoint between burials or before its second walk;
+or a tombstone that has gone; the sweep without a stop checkpoint before a burial, a shadow's burial or its second walk; a held collection without its shadow leaving no shadow tombstone;
 the reconcile ignoring a stop or not saying so on the probe; the tombstones of a replicated drop not written
 with the append, or not recorded for an entry already held; a notice per collection; the readiness phase
 missing from the OpenAPI document. The first run killed 39 of 46; four rows survived tests that were too
