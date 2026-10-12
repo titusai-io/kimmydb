@@ -413,6 +413,25 @@ fn every_error_code_is_in_the_http_reference_with_the_retry_class_the_server_use
     }
 }
 
+/// The `/readyz` 503 body lists a closed set of `phase` values. A phase the
+/// server can report and the document does not list is one a strict client
+/// rejects.
+#[test]
+fn every_open_phase_the_server_reports_is_in_the_readyz_enum() {
+    let listed: BTreeSet<String> = spec()["paths"]["/readyz"]["get"]["responses"]["503"]["content"]
+        ["application/json"]["schema"]["allOf"][1]["properties"]["phase"]["enum"]
+        .as_array()
+        .expect("the readyz phase enum")
+        .iter()
+        .map(|v| v.as_str().expect("a phase name").to_string())
+        .collect();
+    let reported: BTreeSet<String> = kimmy_storage::OpenPhase::reported()
+        .iter()
+        .map(|phase| phase.label().to_string())
+        .collect();
+    assert_eq!(listed, reported, "the OpenAPI document and the server disagree about the phases");
+}
+
 // ---------------------------------------------------------------------------
 // The compatibility policy
 // ---------------------------------------------------------------------------

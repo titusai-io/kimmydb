@@ -13177,6 +13177,79 @@ async fn a_replicated_drop_forgets_the_index_on_the_member_that_applies_it() {
 }
 
 #[tokio::test]
+async fn a_database_drop_that_buries_a_collection_the_dropper_never_held_forgets_its_index() {
+    // The case a database's tombstone adds (ADR-229): the issuer never held
+    // `docs`, so no entry of its own names it, and the member holding the
+    // graph is told by the sweep that buries the collection and by nothing
+    // else. Without the notice the graph and its snapshot stay for the life of
+    // the process.
+    let issuer = Server::start().await;
+    let applier = Server::start().await;
+    let issuer_token = issuer.root().await;
+    let applier_token = applier.root().await;
+
+    let res = issuer
+        .post("/v1/db/shop/collections", Some(&issuer_token), json!({ "name": "seed" }))
+        .await;
+    assert_eq!(res.status, 200, "{:?}", res.body);
+    replicate(&issuer, &applier);
+    configure_vectors(&applier, &applier_token, "shop", "docs").await;
+    let shadow = build_graph(&applier, "shop", "docs");
+    assert_eq!(applier.state.vectors.len(), 1);
+    assert!(snapshot_of(&applier, shadow).is_dir());
+    let consumer = tokio::spawn(kimmy_api::vectors::invalidator(&applier.state));
+
+    tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    let res = issuer.delete("/v1/db/shop", Some(&issuer_token)).await;
+    assert_eq!(res.body, json!({ "dropped": true }));
+    replicate(&issuer, &applier);
+    assert!(
+        applier.state.engine.get_collection("shop", "docs").is_err(),
+        "the sweep should have buried a collection created before the drop"
+    );
+
+    assert!(
+        wait_until(|| applier.state.vectors.is_empty()).await,
+        "the applying member kept a graph for a collection the database's drop buried"
+    );
+    assert!(!snapshot_of(&applier, shadow).exists(), "and kept its snapshot on disk");
+    consumer.abort();
+}
+
+#[tokio::test]
+async fn a_vector_cache_that_lags_behind_burial_notices_reconciles_against_the_catalogue() {
+    // The notices of collections buried with no entry (ADR-229) come in one per
+    // sweep, but a consumer can still be behind them. It cannot say which
+    // collections went, so it reconciles against what the node holds, as it does
+    // for the entries it misses, at the cost of a rebuild and never a wrong answer.
+    let server = Server::start().await;
+    let token = server.root().await;
+    configure_vectors(&server, &token, "shop", "docs").await;
+    let shadow = build_graph(&server, "shop", "docs");
+    assert_eq!(server.state.vectors.len(), 1);
+    // Gone from the catalogue before the consumer exists, so no entry it will see
+    // names it, and nothing has forgotten the graph.
+    assert!(server.state.engine.drop_collection("shop", "docs").unwrap());
+    assert_eq!(server.state.vectors.len(), 1, "premise: the graph outlived its collection");
+    let consumer = tokio::spawn(kimmy_api::vectors::invalidator(&server.state));
+    tokio::task::yield_now().await;
+
+    for i in 0..2_000u64 {
+        server.state.engine.send_buried_for_test(vec![kimmy_storage::BuriedCollection {
+            db: "other".into(),
+            name: format!("c{i}"),
+            ids: vec![kimmy_core::CollectionId(1_000_000 + i)],
+        }]);
+    }
+    assert!(
+        wait_until(|| server.state.vectors.is_empty()).await,
+        "a consumer that lagged behind the notices kept a graph for a collection that is gone"
+    );
+    assert!(!snapshot_of(&server, shadow).exists());
+    consumer.abort();
+}
+
+#[tokio::test]
 async fn a_replicated_drop_that_names_the_shadow_itself_forgets_its_index() {
     // The other shape a drop entry takes: the shadow's own, minted when the
     // vectors are discarded without their parent. The consumer derives the id
@@ -14265,12 +14338,38 @@ async fn a_database_drop_stopped_between_burials_says_which_collections_went() {
     let engine = &server.state.engine;
     engine.create_collection("shop", "returns").unwrap();
     let stopper = Arc::clone(engine);
-    engine.before_next_continuing_write(move || stopper.set_stopping());
+    let rearm = Arc::clone(engine);
+    // The drop's tombstone is its first commit (ADR-229), so the first
+    // continuing write is the first burial. Let that land and stop the next.
+    engine.before_next_continuing_write(move || {
+        rearm.before_next_continuing_write(move || stopper.set_stopping());
+    });
     let res = server.delete("/v1/db/shop", None).await;
     assert_eq!(res.status, 500, "{:?}", res.body);
     assert_eq!(res.body["error"], "partially_applied", "{:?}", res.body);
     assert_eq!(res.body["applied"]["dropped"], json!(["orders"]), "{:?}", res.body);
     assert_eq!(res.body["cause"]["code"], "stopping", "{:?}", res.body);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_database_drop_stopped_after_its_tombstone_says_so_though_nothing_is_buried() {
+    // The drop's first commit is the database's tombstone (ADR-229): a stop
+    // that lands before the first burial leaves the drop recorded, replicating,
+    // and the answer says a commit landed, with nothing yet in `dropped`.
+    let server = three_chunk_server().await;
+    let engine = &server.state.engine;
+    engine.create_collection("shop", "returns").unwrap();
+    let stopper = Arc::clone(engine);
+    engine.before_next_continuing_write(move || stopper.set_stopping());
+    let res = server.delete("/v1/db/shop", None).await;
+    assert_eq!(res.status, 500, "{:?}", res.body);
+    assert_eq!(res.body["error"], "partially_applied", "{:?}", res.body);
+    assert_eq!(res.body["applied"]["dropped"], json!([]), "{:?}", res.body);
+    assert_eq!(res.body["cause"]["code"], "stopping", "{:?}", res.body);
+    assert!(
+        engine.database_dropped_at("shop").unwrap().is_some(),
+        "and the tombstone is there for the next start to finish"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

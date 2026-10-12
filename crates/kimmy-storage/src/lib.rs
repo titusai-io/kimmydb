@@ -15,6 +15,7 @@ pub mod backup;
 pub mod check;
 pub mod class_step;
 pub mod codec;
+mod database_tombstone;
 pub mod divergence;
 pub mod docs;
 pub mod engine;
@@ -55,8 +56,12 @@ pub mod writer_hold;
 mod key_walk_tests;
 
 #[cfg(test)]
+mod database_drop_tests;
+
+#[cfg(test)]
 mod log_capture;
 
+pub use database_tombstone::{Buried, BuriedCollection, Swept};
 pub use divergence::{
     DivergenceTracker, Findings as DivergenceFindings, LocalState as DivergenceLocalState,
     PeerAnswer as DivergencePeerAnswer, compare as compare_divergence, next_probe,

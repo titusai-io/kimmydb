@@ -27,7 +27,9 @@ pub mod version;
 pub use cmp::{canonical_cmp, holds_decimal128};
 pub use conflict::UniqueViolationDetail;
 pub use cursor::Cursor;
-pub use ddl::{CollectionRef, IndexCreate, IndexDrop, VectorSet};
+pub use ddl::{
+    CollectionRef, DATABASE_DROP_NAME, IndexCreate, IndexDrop, VectorSet, database_drop_id,
+};
 pub use error::{Error, Result};
 pub use hlc::{HLC_ENCODED_LEN, Hlc, HlcClock, Stamp};
 pub use ids::{CollectionId, DocId, NodeId};

@@ -439,7 +439,10 @@ fields beside the usual three:
   (`matched` includes their documents, `modified` and `commits` do not).
   **`in_doubt`** is the number of documents written in a chunk whose commit's
   outcome is unknown: they may be there. A database drop
-  answers `{"dropped": [names…], "in_doubt": name-or-null}`.
+  answers `{"dropped": [names…], "in_doubt": name-or-null}`. Its first commit is
+  the database's tombstone (ADR-229), so `dropped` can be **empty** while a commit
+  landed: the drop is recorded and replicates, and what this member still holds
+  is buried by the next drop attempt or the next start.
 - **`cause`** is the code and message the failure would have been answered
   with on its own — `bad_request` for an operator a later document cannot
   take, or for a filter whose `$expr` cannot be evaluated against a later
@@ -529,9 +532,11 @@ curl -XDELETE localhost:7878/v1/db/shop -H "$A"           # every collection in 
 Databases are created implicitly by their first collection and removed
 implicitly with their last: dropping the last collection takes the database
 out of listings on every member, because the drop replicates and the
-decision is made where it is applied. `DELETE /v1/db/{db}` drops each
-collection in turn (`ddl` over the database); system databases (`__…`) are
-refused.
+decision is made where it is applied. `DELETE /v1/db/{db}` records the
+database's drop first, as a tombstone of its own that replicates, and then
+drops each collection the member holds in turn (`ddl` over the database);
+system databases (`__…`) are refused, and a database this member does not hold
+answers `{"dropped": false}` and records nothing.
 
 **Creating a name again soon after dropping it can be refused, for a while.**
 A drop answers before what the collection held is removed (below), and a
@@ -544,16 +549,36 @@ the dropped collection was. Enabling vectors on a collection whose previous
 vectors were dropped with `drop_vectors=true` is refused the same way until
 they are removed ([ADR-189](decisions.md)).
 
-**Issue a database drop once, on one member, and let it replicate.** It drops
-the collections that member holds **at the moment it is applied**, and that is
-the whole of what replicates. Sending the same `DELETE` to every member is not
-belt and braces — it is a race each peer can lose: a collection still in flight
-to that peer arrives after its local drop and recreates the database there. A
-vector-enabled collection is the easy way to see it, because the owning member
-builds the shadow collection locally and it replicates a moment behind, leaving
-a peer holding a database whose only contents are a shadow whose base
-collection is gone. Drop on one member and confirm the drop on the others (a
-drop is not instant — see [Operations](operations.md)); do not drop on each.
+**A database drop is cluster-wide, and it reaches collections the member
+answering it does not hold.** The drop is stamped. On every member, every
+collection of the database created at or before that stamp is dropped, with its
+documents, **including one created on another member that this member had not
+received**, and no collection created at or before it can be created. A
+collection created after it stands. (Before 0.47.0 a drop covered only the
+collections the member held when it was applied, and a collection it had not
+received brought the database back, on every member, with that collection in
+it. [ADR-229](decisions.md).)
+
+**Issue a database drop once, on one member, and let it replicate.** Sending
+the same `DELETE` to every member is no safer: each is a drop of its own, and a
+vector-enabled collection's shadow, which the owning member builds locally and
+which replicates a moment behind, can still reach a peer between its drop of the
+parent and its drop of the database. Drop on one member and confirm the drop on
+the others (a drop is not instant — see [Operations](operations.md)); do not
+drop on each.
+
+**After a database drop, recreate it on the same member, or wait until every
+member lists it gone** (`GET /v1/databases` on each) before creating it anywhere
+else. A creation is judged by the stamp it was made at, and a member that has
+not yet received the drop may stamp a creation before it, when its clock is
+behind the dropping member's. Such a creation is dropped with the database, with
+the documents written into it afterwards, and the writes are answered `200`.
+The window is the replication lag, the clock skew between the members and the
+time the drop takes to bury its collections; it closes once the creating member
+has received the drop. **A write acknowledged into a collection on a member
+that has not yet applied a database drop is lost with it.** The same holds for
+a member that is behind longer than `storage.tombstone_retention_secs`, which
+can bring the database back.
 
 **A drop is not atomic in one transaction, and it is atomic to a reader.**
 The collection's definition and its tombstone go in the drop's first commit and

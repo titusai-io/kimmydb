@@ -2857,3 +2857,74 @@ catch_up_wait_secs = 3600
     assert!(log.contains("KIMMY_TEST_DNS_SERVER"), "the switch announces itself: {log}");
     assert!(marker(dir.path()).unwrap().contains("exit = \"shutdown\""));
 }
+
+// ---------------------------------------------------------------------------
+// A database's drop, applied before the node serves (ADR-229)
+// ---------------------------------------------------------------------------
+
+/// A store holding the tombstone of a database's drop over collections the
+/// drop covers: what a member that applied the drop as a plain collection drop
+/// leaves, on the previous build. The start buries them before it serves.
+#[tokio::test]
+async fn a_start_buries_what_a_database_drop_covers_before_it_serves() {
+    let dir = tempfile::tempdir().unwrap();
+    let client = reqwest::Client::new();
+
+    let mut first = Run::spawn(dir.path(), "first");
+    first.wait_ready(&client).await;
+    let token = root_token(&first, &client).await;
+    for name in ["orders", "late"] {
+        let made = client
+            .post(format!("{}/v1/db/shop/collections", base(&first)))
+            .bearer_auth(&token)
+            .json(&serde_json::json!({ "name": name }))
+            .send()
+            .await
+            .unwrap();
+        assert!(made.status().is_success());
+    }
+    first.signal("TERM");
+    assert!(first.wait_exit().success());
+
+    // The tombstone alone.
+    {
+        let engine =
+            kimmy_storage::Engine::open(&dir.path().join("data").join("kimmy.redb")).unwrap();
+        let at = kimmy_core::Stamp::new(
+            kimmy_core::Hlc::new(kimmy_storage::physical_now_ms() + 1_000, 0),
+            kimmy_core::NodeId::from_bytes([7; 16]),
+        );
+        // Recorded the way a member that predates the rule records it, and not
+        // applied, so the collections are still here when the store closes.
+        let id = kimmy_core::database_drop_id("shop");
+        engine.record_database_tombstone_for_test(id, at).unwrap();
+        let held = engine.get_collection("shop", "late");
+        assert!(
+            held.is_ok(),
+            "premise: nothing has acted on it: {held:?} {:?}",
+            engine.list_collections("shop")
+        );
+    }
+
+    let mut second = Run::spawn(dir.path(), "second");
+    second.wait_ready(&client).await;
+    let token = root_token(&second, &client).await;
+    let listed: serde_json::Value = client
+        .get(format!("{}/v1/databases", base(&second)))
+        .bearer_auth(&token)
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let names = listed["databases"].as_array().cloned().unwrap_or_default();
+    assert!(
+        !names.iter().any(|d| d["name"] == "shop" || d == "shop"),
+        "the start left the database standing: {listed}"
+    );
+    let log = second.log();
+    assert!(log.contains("buried what a database's drop covers before serving"), "{log}");
+    second.signal("TERM");
+    assert!(second.wait_exit().success());
+}

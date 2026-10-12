@@ -36,6 +36,21 @@ impl CollectionRef {
     }
 }
 
+/// The reserved collection name a database's drop is filed under (ADR-229).
+///
+/// A database drop is recorded as the tombstone of a collection with this name
+/// in the database, and replicates as an ordinary `DropCollection` entry that
+/// names it, so a build that predates the rule decodes, applies, stores and
+/// serves it as the drop of a collection it never held. `validate_name` refuses
+/// every `__` name, so no client can create a collection that it could stand
+/// for.
+pub const DATABASE_DROP_NAME: &str = "__dropped_database";
+
+/// The id the tombstone of `db`'s drop is filed under.
+pub fn database_drop_id(db: &str) -> crate::CollectionId {
+    crate::CollectionId::derive(db, DATABASE_DROP_NAME)
+}
+
 /// An index being created on a collection.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct IndexCreate {

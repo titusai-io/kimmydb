@@ -206,7 +206,7 @@ Five kinds carry schema changes between nodes:
 | Kind | Body |
 |---|---|
 | `CreateCollection` | `{ db, name }` |
-| `DropCollection` | `{ db, name }` |
+| `DropCollection` | `{ db, name }`; with `name` = `__dropped_database`, the drop of the database `db` (ADR-229) |
 | `CreateIndex` | the full `IndexMeta`, including its derived id and its creation stamp |
 | `DropIndex` | `{ db, collection, index }` |
 | `ConfigureVectors` | `{ db, collection, config }` — `config: null` disables |
@@ -224,6 +224,14 @@ and is settled by the creation stamp below.
 **Applying one must not log a new entry.** The originating entry is appended as
 received; minting a local one would send the change back to the peer, which
 would apply it and mint another, trading the same change forever.
+
+**A database's drop is a `DropCollection` entry that names the reserved
+collection `__dropped_database`** (`validate_name` refuses every `__` name, so
+no client can create it). Its tombstone is the row `collections_dropped` holds
+for that name's id, and it means: every collection of `db` created at or before
+its stamp is dropped, and none can be created at or before it. A build that
+predates the rule applies the entry as the drop of a collection it never held
+and serves it onward (ADR-229).
 
 **A drop outlives its entry.** `DropCollection` and `DropIndex` each leave a
 tombstone — `collections_dropped` and `indexes_dropped`, see

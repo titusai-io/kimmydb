@@ -68,6 +68,19 @@ pub struct Engine {
     /// must never be held across a redb commit.
     clock: Mutex<HlcClock>,
     events: broadcast::Sender<Arc<OplogEntry>>,
+    /// Collections buried without an entry of their own, one notice per burial
+    /// or per sweep (ADR-229): what ends a collection-scope change stream and
+    /// makes the vector cache forget a graph when no `DropCollection` entry
+    /// will say so.
+    pub(crate) buried: broadcast::Sender<Arc<crate::database_tombstone::Buried>>,
+    /// The last `(tombstone, generation)` each database was swept at, so a
+    /// page or a redelivered entry that changes nothing costs no walk of its
+    /// collections (ADR-229). Written only after a sweep succeeds.
+    pub(crate) swept: Mutex<std::collections::HashMap<String, (Stamp, u64)>>,
+    /// Bumped by every commit that can change which collections a database
+    /// holds: a schema change that writes metadata alone, a creation or a
+    /// burial. The sweep's memo is valid only at the generation it was made at.
+    pub(crate) collections_generation: std::sync::atomic::AtomicU64,
     /// Bumped whenever a collection's vectors change.
     ///
     /// An in-memory vector index is built from a snapshot and cannot see later
@@ -477,7 +490,7 @@ pub(crate) struct Burial {
 /// Whether a write transaction continues a request that has already
 /// committed one (ADR-192).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum Continuing {
+pub(crate) enum Continuing {
     No,
     Yes,
 }
@@ -892,6 +905,7 @@ impl WriteTxn<'_> {
         let engine = self.engine;
         let coalesced = self.coalesced;
         let is_write = self.holder == WriterHolder::Write;
+        let changes_collections = self.holder == WriterHolder::Ddl;
         // The fsync (or the wait at the barrier) is the blocking part; see
         // [`blocking`] for why it must not happen on an async worker.
         blocking(move || {
@@ -910,6 +924,9 @@ impl WriteTxn<'_> {
                 });
             }
             engine.commits.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            if changes_collections {
+                engine.collections_generation.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            }
             // A commit by a class task is a local success and a beat (ADR-213).
             crate::class_step::commit_ok();
             // The ticket is taken **before** the writer is let go: a flush
@@ -1382,6 +1399,9 @@ impl Engine {
             repairs_at_open,
             clock: Mutex::new(HlcClock::resuming_from(resumed)),
             events,
+            buried: broadcast::channel(EVENT_BUFFER).0,
+            swept: Mutex::new(Default::default()),
+            collections_generation: std::sync::atomic::AtomicU64::new(0),
             vector_generations: Mutex::new(Default::default()),
             path: path.to_path_buf(),
             unique_violations: std::sync::atomic::AtomicU64::new(0),
@@ -2044,6 +2064,19 @@ impl Engine {
     /// oplog replay to deliver a gap-free sequence.
     pub fn subscribe(&self) -> broadcast::Receiver<Arc<OplogEntry>> {
         self.events.subscribe()
+    }
+
+    /// Notices of collections buried without an entry of their own (ADR-229):
+    /// a sweep under a database's tombstone, a snapshot page's drop, a
+    /// replicated drop. One notice per burial, or per sweep, naming every
+    /// collection it buried.
+    ///
+    /// Subscribe **before** checking that a collection exists, as for
+    /// [`Self::subscribe`]: a notice sent between the check and the
+    /// subscription is lost, and the stream or cache waiting on it is left
+    /// holding a collection that is gone.
+    pub fn subscribe_buried(&self) -> broadcast::Receiver<Arc<crate::database_tombstone::Buried>> {
+        self.buried.subscribe()
     }
 
     fn load_or_create_node_id(db: &Database) -> Result<NodeId> {
@@ -3895,24 +3928,42 @@ impl Engine {
         // Answer "did it exist" up front: dropping the last collection removes
         // the row, so the removal below finds nothing on the common path.
         let existed = self.database_exists(name)?;
+        // The drop's tombstone goes first, in a commit of its own (ADR-229): from
+        // it nothing can recreate the database here, whatever a peer sends while
+        // the burials below run, and it replicates to the members that never
+        // held a collection this one does. It is the request's first commit, so
+        // what follows continues it (ADR-192).
+        let head_landed = if existed {
+            self.record_database_drop(name)?;
+            true
+        } else {
+            false
+        };
         // A drop of several collections is several commits. Once one has
         // landed the request is part done, and it keeps going (ADR-192): the
         // later burials wait for the writer with no budget, and a failure
         // after the first is answered with what was dropped.
         let mut dropped: Vec<String> = Vec::new();
         let bury = |dropped: &mut Vec<String>, collection: &str| -> Result<()> {
-            let continuing = if dropped.is_empty() { Continuing::No } else { Continuing::Yes };
+            let continuing =
+                if dropped.is_empty() && !head_landed { Continuing::No } else { Continuing::Yes };
             #[cfg(test)]
-            if continuing == Continuing::Yes {
+            if !dropped.is_empty() {
                 crate::sync::race_hooks::reach(crate::sync::race_hooks::Race::BetweenBurials);
             }
-            match self.bury_collection_as(name, collection, None, continuing) {
+            match self.bury_collection_as(
+                name,
+                collection,
+                None,
+                continuing,
+                crate::database_tombstone::Notify::Each,
+            ) {
                 Ok(Some(_)) => {
                     dropped.push(collection.to_string());
                     Ok(())
                 }
                 Ok(None) => Ok(()),
-                Err(e) => Err(Self::partly_dropped(dropped, Some(collection), e)),
+                Err(e) => Err(Self::partly_dropped(dropped, head_landed, Some(collection), e)),
             }
         };
         for collection in &self.list_collections(name)? {
@@ -3932,8 +3983,9 @@ impl Engine {
         // named; `drop_collection_inner` takes a shadow name directly and
         // mints its own `DropCollection` entry for it, which is how a peer
         // holding the same orphan learns to drop its copy.
-        let orphans =
-            self.list_collections(name).map_err(|e| Self::partly_dropped(&dropped, None, e))?;
+        let orphans = self
+            .list_collections(name)
+            .map_err(|e| Self::partly_dropped(&dropped, head_landed, None, e))?;
         for orphan in orphans {
             bury(&mut dropped, &orphan.name)?;
         }
@@ -3944,7 +3996,8 @@ impl Engine {
         // burial made the row again, implicitly, and removing it would orphan
         // that collection. Usually the last burial already removed it, and
         // this commits nothing.
-        let continuing = if dropped.is_empty() { Continuing::No } else { Continuing::Yes };
+        let continuing =
+            if dropped.is_empty() && !head_landed { Continuing::No } else { Continuing::Yes };
         #[cfg(test)]
         crate::sync::race_hooks::reach(crate::sync::race_hooks::Race::BeforeRowRemoval);
         let remove_row = || -> Result<()> {
@@ -3959,7 +4012,7 @@ impl Engine {
             };
             if removed { txn.commit() } else { Ok(txn.abort()?) }
         };
-        remove_row().map_err(|e| Self::partly_dropped(&dropped, None, e))?;
+        remove_row().map_err(|e| Self::partly_dropped(&dropped, head_landed, None, e))?;
         Ok(existed)
     }
 
@@ -3967,8 +4020,16 @@ impl Engine {
     /// committed, and after it what was dropped (ADR-192). `failing` is the
     /// collection whose burial failed; if its commit's outcome is unknown, it
     /// is in doubt.
-    fn partly_dropped(dropped: &[String], failing: Option<&str>, e: StorageError) -> StorageError {
-        if dropped.is_empty() {
+    fn partly_dropped(
+        dropped: &[String],
+        head_landed: bool,
+        failing: Option<&str>,
+        e: StorageError,
+    ) -> StorageError {
+        // The tombstone's commit counts: after it the request has changed the
+        // cluster whether or not a collection has been buried yet (ADR-229), and
+        // an answer of "nothing happened" would be false.
+        if dropped.is_empty() && !head_landed {
             return e;
         }
         let in_doubt = match (&e, failing) {
@@ -4143,7 +4204,20 @@ impl Engine {
             if dropped.is_some_and(history) {
                 return Ok(InTxn::History);
             }
-            let incarnation_floor = dropped.map(|stamp| stamp.hlc);
+            // The database's drop is a tombstone of its own (ADR-229): a
+            // creation from elsewhere that the database's drop covers is
+            // history, by one comparison of the origin's `Hlc` against the
+            // drop's, on every route. A local creation always mints after
+            // what this node has seen, so it stands; a creation naming no
+            // `created` (a page from a sender before the field) reads as older.
+            if !log && self.database_refusal(db, origin)?.is_some() {
+                return Ok(InTxn::History);
+            }
+            let incarnation_floor = [dropped, self.database_dropped_at(db)?]
+                .into_iter()
+                .flatten()
+                .max()
+                .map(|stamp| stamp.hlc);
 
             // A vector shadow from elsewhere whose parent this node has buried
             // since the shadow was created is a life that drop ended, though
@@ -4386,18 +4460,25 @@ impl Engine {
         name: &str,
         replicated: Option<Stamp>,
     ) -> Result<Option<Vec<CollectionId>>> {
-        self.bury_collection_as(db, name, replicated, Continuing::No)
+        self.bury_collection_as(
+            db,
+            name,
+            replicated,
+            Continuing::No,
+            crate::database_tombstone::Notify::Each,
+        )
     }
 
     /// [`Self::bury_collection`], taking the writer as a request that has
     /// `continuing` from an earlier commit (ADR-192): a database drop's
     /// burials after its first.
-    fn bury_collection_as(
+    pub(crate) fn bury_collection_as(
         &self,
         db: &str,
         name: &str,
         replicated: Option<Stamp>,
         continuing: Continuing,
+        notify: crate::database_tombstone::Notify<'_>,
     ) -> Result<Option<Vec<CollectionId>>> {
         // Nothing to bury, answered without taking the writer. Only that: what
         // is buried is read again under the writer below.
@@ -4445,7 +4526,15 @@ impl Engine {
             return Ok(None);
         };
         txn.commit()?;
-        Ok(Some(self.finish_burial(db, name, burial)))
+        // A burial that minted no entry has told nobody (ADR-229): a replicated
+        // drop is announced by the entry its caller appends, but a sweep's, a
+        // snapshot's and a database tombstone's are not.
+        let unlogged = burial.logged.is_none();
+        let ids = self.finish_burial(db, name, burial);
+        if unlogged {
+            notify.buried(self, db, name, &ids);
+        }
+        Ok(Some(ids))
     }
 
     /// The burial itself, inside a transaction that holds the writer: the

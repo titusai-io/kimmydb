@@ -144,6 +144,14 @@ impl Engine {
         // Step 1: subscribe *before* reading the oplog. Reversing these two
         // lines reintroduces the gap this whole module exists to avoid.
         let rx = self.subscribe();
+        // And the notices of collections buried without an entry (ADR-229), for
+        // a stream of one collection: the sweep under a database's tombstone, a
+        // snapshot page's drop. Before the resolve below for the same reason as
+        // the line above: one sent between the two is lost.
+        let buried = match &scope {
+            WatchScope::Collection(id) => Some((*id, self.subscribe_buried())),
+            _ => None,
+        };
 
         // Step 2: find where the stream starts. A resume on a member that did
         // not issue the token walks the arrival index, and with a large oplog
@@ -160,6 +168,7 @@ impl Engine {
 
         Ok(ChangeStream {
             rx,
+            buried,
             scope,
             next_replay_from: Some(start),
             resume_floor: start,
@@ -288,6 +297,40 @@ impl Engine {
                 false => Err(expired()),
             };
         }
+        // A collection whose life began at or after the tombstone (ADR-229; a
+        // creation at the tombstone's own `Hlc` is stamped above it by the node). The
+        // tombstone does not say when the drop reached this member, and the
+        // life's own entries may have arrived before it did: a collection that
+        // survived a database's drop learned of the drop late, and a position
+        // taken from the drop's entry would skip them, or refuse a token this
+        // member issued for them. So the incarnation is bounded by the
+        // tombstone's **stamp** alone, as it is for a drop this member never
+        // held: a token naming an entry at or before it is of the life before
+        // (refused), anything else resumes, a start with no token begins at the
+        // first entry stamped after it, and an entry of the life before that
+        // arrives later is passed over by the floor. Exact because every entry
+        // of the live life is stamped above the tombstone and every one of the
+        // life before is refused by it.
+        if let Some(live) = self.collection_by_id(id)?
+            && live.created >= dropped_at.hlc
+        {
+            return match &options.resume_after {
+                Some(token) if token.to_stamp() <= dropped_at => Err(expired()),
+                Some(_) => Ok((start, Some((id, dropped_at)))),
+                None => Ok((
+                    self.first_arrival_stamped_after(start, dropped_at, walked)?,
+                    Some((id, dropped_at)),
+                )),
+            };
+        }
+        // From here the collection is absent (dropped and not recreated here) or,
+        // for the moment a burial is under way, older than its tombstone, and the
+        // incarnation is bounded by where the drop's entry arrived: the
+        // stream starts just after it. An entry of the life before that is
+        // stamped after the drop (a write on a member whose clock ran ahead)
+        // and arrived before it is still the life before's, which only the
+        // position says. Every live collection with a tombstone began at or
+        // after it (ADR-229), and was placed by its stamp above.
         let Some(drop_seq) = self.arrival_of(&dropped_at)? else {
             // The drop is not in the log, so its position is not known. The
             // tombstone's stamp still bounds the incarnation: a token at or
@@ -1290,9 +1333,21 @@ fn report_resolve(
     }
 }
 
+/// What ended a stream's wait.
+enum Woken {
+    Entry(std::result::Result<Arc<OplogEntry>, broadcast::error::RecvError>),
+    Buried(
+        std::result::Result<Arc<crate::database_tombstone::Buried>, broadcast::error::RecvError>,
+    ),
+}
+
 /// A gap-free stream of changes.
 pub struct ChangeStream {
     rx: broadcast::Receiver<Arc<OplogEntry>>,
+    /// For a stream of one collection: the notices of collections buried with no
+    /// entry to say so (ADR-229). A notice naming the collection ends the stream
+    /// as the entry of a drop would.
+    buried: Option<(CollectionId, broadcast::Receiver<Arc<crate::database_tombstone::Buried>>)>,
     scope: WatchScope,
     /// Arrival position the next replay batch starts at, or `None` once replay
     /// is exhausted.
@@ -1444,16 +1499,52 @@ impl ChangeStream {
 
             // Phase 4: nothing new on disk. Wait to be told to look again.
             self.next_replay_from.get_or_insert(from);
-            match self.rx.recv().await {
+            let woken = match &mut self.buried {
+                Some((_, buried)) => tokio::select! {
+                    woken = self.rx.recv() => Woken::Entry(woken),
+                    notice = buried.recv() => Woken::Buried(notice),
+                },
+                None => Woken::Entry(self.rx.recv().await),
+            };
+            match woken {
                 // The payload is deliberately ignored; see the note above.
-                Ok(_) => {}
-                Err(broadcast::error::RecvError::Lagged(skipped)) => {
+                Woken::Entry(Ok(_)) => {}
+                Woken::Entry(Err(broadcast::error::RecvError::Lagged(skipped))) => {
                     debug!(skipped, "wake-up channel lagged; re-reading from the arrival index");
                 }
-                Err(broadcast::error::RecvError::Closed) => {
+                Woken::Entry(Err(broadcast::error::RecvError::Closed)) => {
                     self.finished = true;
                     return None;
                 }
+                // A collection buried with no entry (ADR-229). Ended here as the
+                // entry of a drop ends it in `accept`, and for the same reason:
+                // everything the client has is of a collection that is gone.
+                Woken::Buried(Ok(notice)) => {
+                    if self.buried.as_ref().is_some_and(|(id, _)| notice.names(*id)) {
+                        self.finished = true;
+                        return Some(ChangeEvent::Invalidate {
+                            reason: InvalidateReason::CollectionDropped,
+                        });
+                    }
+                }
+                // Missed notices: which collections they named is unknown, so
+                // the collection is looked for instead of trusted.
+                Woken::Buried(Err(broadcast::error::RecvError::Lagged(_))) => {
+                    let id = self.buried.as_ref().map(|(id, _)| *id);
+                    let gone = match id {
+                        Some(id) => crate::engine::blocking(|| engine.collection_by_id(id))
+                            .map(|found| found.is_none())
+                            .unwrap_or(false),
+                        None => false,
+                    };
+                    if gone {
+                        self.finished = true;
+                        return Some(ChangeEvent::Invalidate {
+                            reason: InvalidateReason::CollectionDropped,
+                        });
+                    }
+                }
+                Woken::Buried(Err(broadcast::error::RecvError::Closed)) => self.buried = None,
             }
         }
     }
