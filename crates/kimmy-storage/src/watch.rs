@@ -3972,6 +3972,51 @@ mod tests {
         assert_eq!(resolved.incarnation_floor, Some((id, dropped_at)));
     }
 
+    /// One measurement, not a guard: what a stream opened with no token costs on
+    /// a collection dropped and recreated after a long log, whose creation is
+    /// the last entry (the worst case for a walk from the start), on a store
+    /// just reopened so the engine's own cache is cold.
+    /// `KIMMY_MEASURE_ROWS=1800000 cargo test --release -p kimmy-storage --lib the_open_of_a_recreated_collection -- --ignored --nocapture`
+    #[test]
+    #[ignore = "a measurement"]
+    fn the_open_of_a_recreated_collection_after_a_long_log_costs_one_seek() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("kimmy.redb");
+        let rows: usize = std::env::var("KIMMY_MEASURE_ROWS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(500_000);
+        let x = {
+            let engine = Engine::open(&path).unwrap();
+            let bulk = engine.create_collection("other", "bulk").unwrap();
+            let started = std::time::Instant::now();
+            for chunk in 0..(rows / 10_000) {
+                let docs = (0..10_000).map(|i| doc! { "_id": format!("d{chunk}-{i}") }).collect();
+                engine.insert_many(&bulk, docs).unwrap();
+            }
+            eprintln!("MEASURE wrote {rows} entries in {:?}", started.elapsed());
+            std::thread::sleep(std::time::Duration::from_millis(5));
+            let x = engine.create_collection("shop", "x").unwrap();
+            engine.insert(&x, doc! { "_id": "old" }).unwrap();
+            assert!(engine.drop_collection("shop", "x").unwrap());
+            engine.purge_dropped_collection(x.id).unwrap();
+            std::thread::sleep(std::time::Duration::from_millis(5));
+            let x = engine.create_collection("shop", "x").unwrap();
+            engine.insert(&x, doc! { "_id": "new" }).unwrap();
+            x
+        };
+        let engine = Engine::open(&path).unwrap();
+        let began = std::time::Instant::now();
+        let (resolved, walked) = open_from_start(&engine, x.id);
+        eprintln!(
+            "MEASURE open after {rows} entries: {:?}, rows_examined={}, walks={}, start={}",
+            began.elapsed(),
+            walked.rows,
+            walked.walks,
+            resolved.start
+        );
+    }
+
     mod first_arrival {
         use proptest::prelude::*;
         use redb::ReadableTableMetadata;
