@@ -23,6 +23,16 @@ breaking changes and says so here; a `0.x.PATCH` bump never does.
   that the drop then took. A collection whose documents all predate the drop is buried without a
   warning. The look at the documents reads the fixed-width header of at most a thousand records and
   copies nothing.
+- **A change stream opened at the start on a recreated collection read the whole retained log.**
+  Finding where the collection's current life begins walked the arrival index from its start to the
+  first entry stamped after the collection's drop, once per stream: on a log of 1.8 million entries
+  that was 1.8 million rows and a minute, and a `GET .../watch?from_start=true` on a recreated
+  collection answered no events within a client's timeout while the node logged `a change stream took
+  over 10 s to find where it starts`. The start is now found by a seek, at the collection's creation
+  entry or just after its drop's entry, and reads a few rows however long the log. The events
+  delivered are the same, and a resume token issued before a database's drop still resumes. A
+  collection created here by a peer's `CreateCollection` has that entry recorded in the commit that
+  creates it, so a document from another peer cannot arrive before it.
 
 ## 0.47.0 - 2026-10-12
 

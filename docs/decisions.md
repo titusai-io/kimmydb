@@ -26400,13 +26400,28 @@ failing the page, and the loop test with the exemption removed.
 7. **The incarnation clamp reads stamps.** For a collection that began at or after the tombstone,
    `clamp_to_incarnation` bounds the incarnation by the tombstone's stamp and not by where the drop's entry
    arrived: a token naming an entry at or before the stamp is of the life before (refused), any other token
-   resumes, a start with no token begins at the first entry stamped after it, and an entry of the life before
-   that arrives later is passed over by the floor. This is exact because every entry of the live life is
-   stamped above the tombstone and every one of the life before is refused by it; a creation stamped at the
-   tombstone's own `Hlc` is stamped above it by its node, so it is placed the same way. The position branch
-   stays for a collection that is **absent** (dropped and not recreated here), where an entry of the life
-   before that is stamped after the drop, by a clock that ran ahead, and arrived before it, is only
-   recognisable by where the drop's entry arrived.
+   resumes, and an entry of the life before that arrives later is passed over by the floor. This is exact
+   because every entry of the live life is stamped above the tombstone and every one of the life before is
+   refused by it; a creation stamped at the tombstone's own `Hlc` is stamped above it by its node, so it is
+   placed the same way. The position branch stays for a collection that is **absent** (dropped and not
+   recreated here), where an entry of the life before that is stamped after the drop, by a clock that ran
+   ahead, and arrived before it, is only recognisable by where the drop's entry arrived.
+
+   *Amended in 0.47.1.* A start with no token did not begin at the first entry stamped after the tombstone:
+   finding that entry walked the arrival index from its start, and on a log of 1.8 million entries that was
+   62 seconds and the same count of rows, for every replay of a recreated collection. It begins by position,
+   found by seeks: at the later of the start requested and the earlier of **the position after the drop's
+   entry** and **the collection's own creation entry**, with the floor kept. A recreate arrives after the
+   drop, so it begins where 0.46.0 began it; a survivor of a database's drop arrived before the sentinel, so
+   it begins at its creation and keeps the entries that arrived before the sentinel. A collection this member
+   holds no creation entry for (retention took it, or a snapshot brought the collection) is placed by the
+   stamps as before, and so is one whose drop is held but whose creation is not. For the position to be exact
+   the creation's entry must arrive no later than anything else of the life, so a replicated creation is now
+   appended in the commit that creates the collection, as a drop's tombstones are in the commit of its
+   entry. A collection created by a replicated creation on an earlier build had its entry appended in a
+   second commit, and a document from another peer applied between the two arrived before it.
+   **Measured on a release build, 1.8 million entries, the creation last:** the open examined 1,800,006 rows
+   in 72 ms on a warm cache before, and examines 2 rows in 26 microseconds after.
 8. **A pre-existing defect is fixed with it.** The ordinary replicated `DropCollection` arm recorded only the
    parent's id for a collection the member never held, so the first vector chunk for it stopped the batch as an
    unknown collection until a snapshot. It records the shadow's id too, as a burial does, for a collection it
@@ -26509,7 +26524,8 @@ guards that pass found green.
 
 **Measured.** A stream opened with no token on a survivor reads the arrival index from its start to the
 first entry stamped after the tombstone: 16.8 ms over 500,000 older entries in a release build, the same rows
-its own replay reads. A member that receives the drop of a database of 3,000 collections of ten documents
+its own replay reads (as built in 0.47.0; the walk was a minute on a real log's cold pages, and 0.47.1 replaces
+it, item 7). A member that receives the drop of a database of 3,000 collections of ten documents
 converges as fast as it did on 0.46.0: a later write on the dropping member reached it 11.6, 12.7 and 13.2 s
 after the drop returned (median 12.7 s), against 13.3, 13.8 and 23.3 s on 0.46.0 (median 13.8 s), three runs
 each, release builds, two nodes on one host; before the tombstones were written in the commit that appends the
