@@ -2071,6 +2071,8 @@ impl Engine {
             return Ok(DdlOutcome::Applied);
         };
 
+        // Tombstones the entry's own append writes in its commit (the drop arm's).
+        let mut recorded_with_the_append: Vec<(CollectionId, Stamp)> = Vec::new();
         match entry.kind {
             OpKind::CreateCollection => {
                 let target: kimmy_core::CollectionRef = bson::deserialize_from_slice(body)?;
@@ -2256,7 +2258,12 @@ impl Engine {
                         &kimmy_core::vector_meta::shadow_name(&target.name),
                     ));
                 }
-                self.record_ids_at(&ids, entry.stamp)?;
+                // Written with the entry's append, in its commit, and not in
+                // one of their own: the same tombstones at the same stamp, one
+                // fsync less per drop. A database's sweep has usually buried
+                // the collection already, and then this is all the work a
+                // per-collection drop entry costs.
+                recorded_with_the_append = ids.into_iter().map(|id| (id, entry.stamp)).collect();
             }
             OpKind::CreateIndex => {
                 let target: kimmy_core::IndexCreate = bson::deserialize_from_slice(body)?;
@@ -2503,7 +2510,7 @@ impl Engine {
         // identity intact, and is what advances the version vector for its
         // origin node — while minting a local entry instead would send the
         // change back to the peer, which would apply it and mint another.
-        self.append_replicated_ddl(entry)
+        self.append_replicated_ddl_recording(entry, &recorded_with_the_append)
     }
 
     /// Append a replicated schema change's originating entry, unless this
@@ -2551,6 +2558,25 @@ impl Engine {
     /// and cost nothing, and the publish covers an arrival whose first apply
     /// committed and then failed before it woke the streams.
     fn append_replicated_ddl(&self, entry: &OplogEntry) -> Result<DdlOutcome> {
+        self.append_replicated_ddl_recording(entry, &[])
+    }
+
+    /// [`Self::append_replicated_ddl`], also writing `tombstones` (each only if
+    /// newer than the one held) in the commit that appends the entry: a drop's
+    /// tombstones and its entry are one commit rather than two. Written either
+    /// way: when the entry is already held as sent, they are recorded on their
+    /// own, which takes no writer if they are held too.
+    fn append_replicated_ddl_recording(
+        &self,
+        entry: &OplogEntry,
+        tombstones: &[(CollectionId, Stamp)],
+    ) -> Result<DdlOutcome> {
+        let mut owed = Vec::new();
+        for (id, stamp) in tombstones {
+            if self.collection_dropped_at(*id)?.is_none_or(|held| held < *stamp) {
+                owed.push((*id, *stamp));
+            }
+        }
         let key = crate::codec::oplog_key(&entry.stamp);
         let sent = crate::codec::encode_oplog_entry(entry);
         let held = {
@@ -2558,6 +2584,7 @@ impl Engine {
             held_as_sent(&txn.open_table(crate::tables::OPLOG)?, &key, &sent)?
         };
         let outcome = if held {
+            self.record_collection_drops(&owed)?;
             DdlOutcome::Held
         } else {
             #[cfg(test)]
@@ -2567,8 +2594,22 @@ impl Engine {
                 txn.abort()?;
                 #[cfg(test)]
                 race_hooks::absorbed(race_hooks::Race::DdlAppend);
+                self.record_collection_drops(&owed)?;
                 DdlOutcome::Held
             } else {
+                if !owed.is_empty() {
+                    use redb::ReadableTable;
+                    let mut dropped = txn.open_table(crate::tables::COLLECTIONS_DROPPED)?;
+                    for (id, stamp) in &owed {
+                        let newer = match dropped.get(id.0)? {
+                            Some(held) => *stamp > crate::codec::decode_oplog_key(held.value())?,
+                            None => true,
+                        };
+                        if newer {
+                            dropped.insert(id.0, crate::codec::oplog_key(stamp).as_slice())?;
+                        }
+                    }
+                }
                 crate::engine::append_oplog(&txn, entry)?;
                 txn.commit()?;
                 DdlOutcome::Applied

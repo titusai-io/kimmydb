@@ -1327,3 +1327,56 @@ fn a_survivor_refuses_a_straggler_that_arrives_after_the_drop_though_its_creatio
     );
     assert!(y.get(&meta, &kimmy_core::DocId::String("mine".into())).unwrap().is_some());
 }
+
+/// A replicated drop's tombstones and its entry are one commit.
+#[test]
+fn a_replicated_drop_records_its_tombstones_in_the_commit_that_appends_its_entry() {
+    let (e, _d) = engine();
+    let drop = crate::engine::ddl_entry(
+        stamp_of(5_000, 3),
+        OpKind::DropCollection,
+        CollectionId::derive("shop", "ghost"),
+        &CollectionRef::new("shop", "ghost"),
+    )
+    .unwrap();
+    let before = e.commits();
+    e.apply_batch(std::slice::from_ref(&drop)).unwrap();
+    let spent = e.commits() - before;
+    let ghost = CollectionId::derive("shop", "ghost");
+    let shadow = CollectionId::derive("shop", &kimmy_core::vector_meta::shadow_name("ghost"));
+    // Both tombstones, for a collection this member never held...
+    assert_eq!(e.collection_dropped_at(ghost).unwrap(), Some(drop.stamp));
+    assert_eq!(e.collection_dropped_at(shadow).unwrap(), Some(drop.stamp));
+    // ...and the entry, in the one commit (the batch's own bookkeeping is the other).
+    assert!(e.oplog_entry(&drop.stamp).unwrap().is_some());
+    assert_eq!(spent, 2, "the tombstones and the entry took {spent} commits");
+    // Delivered again, it costs the batch's bookkeeping and nothing of its own.
+    let before = e.commits();
+    e.apply_batch(std::slice::from_ref(&drop)).unwrap();
+    assert!(e.commits() - before <= 1, "a drop already held cost {} commits", e.commits() - before);
+}
+
+/// An entry already held as sent still leaves its tombstones: a store that holds
+/// the entry and lost, or never had, the tombstones (a restore, an older build)
+/// gets them back when the entry is delivered again.
+#[test]
+fn a_drop_already_held_as_sent_still_records_its_tombstones() {
+    let (e, _d) = engine();
+    let ghost = CollectionId::derive("shop", "ghost");
+    let drop = crate::engine::ddl_entry(
+        stamp_of(5_000, 3),
+        OpKind::DropCollection,
+        ghost,
+        &CollectionRef::new("shop", "ghost"),
+    )
+    .unwrap();
+    e.apply_batch(std::slice::from_ref(&drop)).unwrap();
+    {
+        let txn = e.begin_write(crate::WriterHolder::Ddl).unwrap();
+        txn.open_table(crate::tables::COLLECTIONS_DROPPED).unwrap().remove(ghost.0).unwrap();
+        txn.commit().unwrap();
+    }
+    assert!(e.collection_dropped_at(ghost).unwrap().is_none(), "premise");
+    e.apply_batch(std::slice::from_ref(&drop)).unwrap();
+    assert_eq!(e.collection_dropped_at(ghost).unwrap(), Some(drop.stamp));
+}
