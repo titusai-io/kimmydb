@@ -10,7 +10,7 @@ Versioning follows the pre-1.0 policy in
 [docs/compatibility.md](docs/compatibility.md): a `0.MINOR` bump may carry
 breaking changes and says so here; a `0.x.PATCH` bump never does.
 
-## Unreleased
+## 0.48.0 - 2026-10-13
 
 **Read before upgrading: the divergence gauge can now read above 0 where it read 0, and pages an existing alert.** 0.48.0 adds the **cut digest**, a third comparison between members. It finds a document updated on one member and not on the other, which leaves every document count equal and which no earlier check saw. It is **detect only**: a confirmed finding moves `kimmy_sync_digest_divergent_collections` and `kimmy_sync_divergent_collections`, logs a `WARN`, and plans no repair. Roll the members one at a time. Nothing here is Breaking: the wire gains optional fields that a build before it ignores, two derived tables are added that a build before it ignores, and no `kimmy.format` schema (still 4), redb version, backup tag, snapshot field or entry kind changed, so a member rolls back by starting 0.47.2 on its store.
 
@@ -18,7 +18,11 @@ breaking changes and says so here; a `0.x.PATCH` bump never does.
 
 ### Added
 
-- **The cut digest.** One row per collection, kept in the transaction of every write: the XOR of a hash of each live record's `(_id, stamp)`, the highest record stamp per origin, and the highest stamp of a tombstone no oplog entry stands behind. Two members compare it at a cut, the highest stamp per origin both have processed; what either holds above the cut is left out of both, so a write one member has and the other has not yet received is never a finding. Finding the uncovered keys of a busy collection is one scan of the oplog above the cut, bounded to 200 ms and 8 MiB per request, one probe answered at a time per member. Before a mismatch is reported the member verifies its own row against a walk of the collection and corrects it if it drifted (`kimmy_sync_digest_drift_total`, an `ERROR`). New series: `kimmy_sync_digest_divergent_collections`, `kimmy_sync_divergence_digest_probes_total{outcome,reason}` and `kimmy_sync_digest_drift_total`, with the same series in the OTLP export. What to do with a finding, including when the API cannot tell which member is behind and neither should be wiped, is in `docs/operations.md`, "The cut digest".
+- **The cut digest.** One row per collection, kept in the transaction of every write: the XOR of a hash of each live record's `(_id, stamp)`, the highest record stamp per origin, and the highest stamp of a tombstone no oplog entry stands behind. Two members compare it at a cut, the highest stamp per origin both have processed; what either holds above the cut is left out of both, so a write one member has and the other has not yet received is never a finding. Finding the uncovered keys of a busy collection is one scan of the oplog above the cut, bounded to 200 ms and 8 MiB per request, one probe answered at a time per member. Before a mismatch is reported the member verifies its own row against a walk of the collection and corrects it if it drifted (`kimmy_sync_digest_drift_total`, an `ERROR`). A collection is not compared, and the reason is counted, when a write landed between the plan and the comparison, when the scan spent its budget, or when either side holds a drop tombstone for its id (`deferred{reason="incarnation"}`, until the tombstone ages out). New series: `kimmy_sync_digest_divergent_collections`, `kimmy_sync_divergence_digest_probes_total{outcome,reason}` and `kimmy_sync_digest_drift_total`, with the same series in the OTLP export. What to do with a finding, including when the API cannot tell which member is behind and neither should be wiped, is in `docs/operations.md`, "The cut digest".
+
+### Changed
+
+- **`kimmy_process_resident_peak_bytes`'s `HELP` text says what the gauge is**: the most this process has seen, not a reading that can fall.
 
 ### Fixed
 

@@ -2502,7 +2502,7 @@ to the release, and no more than that: it sits beside the archive, and whoever
 could replace one could replace both.
 
 ```bash
-V=0.47.2; A=kimmyd-x86_64-unknown-linux-musl.tar.xz
+V=0.48.0; A=kimmyd-x86_64-unknown-linux-musl.tar.xz
 curl -LO "https://github.com/titusai-io/kimmydb/releases/download/v$V/$A"
 curl -LO "https://github.com/titusai-io/kimmydb/releases/download/v$V/$A.sha256"
 shasum -a 256 -c "$A.sha256"
@@ -2522,7 +2522,7 @@ signing key, because there is none to copy. `gh` performs the check:
 gh attestation verify kimmyd-x86_64-unknown-linux-musl.tar.xz -R titusai-io/kimmydb
 
 # The container image, by tag or by digest
-gh attestation verify oci://ghcr.io/titusai-io/kimmydb:0.47.2 -R titusai-io/kimmydb
+gh attestation verify oci://ghcr.io/titusai-io/kimmydb:0.48.0 -R titusai-io/kimmydb
 ```
 
 A successful verification prints the workflow that produced the artifact and
@@ -2632,6 +2632,8 @@ defaults rolls back untouched.
 **Rolling back from 0.47.0 to 0.46.0 needs no store work and no edit to the configuration, and a roll or a rollback must finish within `storage.tombstone_retention_secs` of any database drop made during it.** No table, `kimmy.format` schema (still 4), redb version, backup tag, snapshot field, entry kind or configuration key changed. A database's drop is a row of the dropped-collections table under a reserved collection name, and an ordinary `DropCollection` entry that names it ([ADR-229](decisions.md)); 0.46.0 reads, applies, stores and serves both as the drop of a collection it never held, which a 0.46.0 member was shown to do on the 0.46.0 build before the change. A backup taken on 0.47.0 restores on 0.46.0, and the reverse. **What a member on 0.46.0 does not do is act on it:** it drops the collections the dropper held and *keeps* a collection the dropper never held, and keeps serving it, acknowledged writes included, until it restarts on 0.47.0, which buries it (and the writes). A member that stays on 0.46.0 longer than the tombstone's retention after a database drop never has the tombstone to act on; the other members, which have also collected theirs, then see the collection as an existence divergence and anti-entropy brings it back, and with it the database. Finish a roll or a rollback inside the retention window, and do not drop databases in the middle of one if you can wait. While the cluster is mixed, a database drop issued on a 0.46.0 member records no tombstone and behaves as it did.
 
 **Rolling back from 0.47.1 to 0.47.0 needs nothing:** the store, the wire and the configuration are the same, and the release changes only a log level and where a change stream starts.
+
+**Rolling back from 0.48.0 to 0.47.2 needs no store work and no edit to the configuration.** No `kimmy.format` schema (still 4), redb version, backup tag, snapshot field or entry kind changed. The store gains two derived tables, `live_digests` and `live_digests_through`, which 0.47.2 ignores, and the two divergence messages gain optional fields it ignores. **A member rolled back right after a stopped first walk rebuilds its live counts once** (the walk deletes the counts' mark with its first rewritten rows, so the older build sees it missing), and nothing else. Rolling forward again walks the documents once more, as the first start did. The digest runs only between two 0.48.0 members; an older member answers none, which a 0.48.0 member counts as `unanswered`.
 
 **Rolling back from 0.47.2 to 0.47.1 needs nothing:** the store, the wire and the configuration are the same, and the release changes only how one gauge is read.
 
