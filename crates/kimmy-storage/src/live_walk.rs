@@ -718,6 +718,15 @@ mod tests {
 
     #[test]
     fn a_stopped_walk_then_an_older_build_that_completed_its_open_restarts_from_zero() {
+        for forced in [true, false] {
+            a_stopped_walk_then_an_older_build(forced);
+        }
+    }
+
+    /// `forced`: the start decided the rebuild, so it deletes the stale cursor
+    /// as its first write; not forced, the walk's own resume rule must refuse
+    /// a cursor with a mark beside it.
+    fn a_stopped_walk_then_an_older_build(forced: bool) {
         // Rollback-gate row 3, at the store: stop a forced walk mid-chunk, an
         // older build starts to ready (its open rebuilt the counts and wrote
         // their mark; it knows nothing of the digests), stops, and this build
@@ -760,11 +769,11 @@ mod tests {
         }
         assert_eq!(marks_present(&path), (true, false));
         test_hooks::chunked_by(4, || {
-            let engine = Engine::open_with(
-                &path,
-                &OpenOptions::new().force_rebuild("the previous run cannot be shown"),
-            )
-            .unwrap();
+            let options = match forced {
+                true => OpenOptions::new().force_rebuild("the previous run cannot be shown"),
+                false => OpenOptions::new(),
+            };
+            let engine = Engine::open_with(&path, &options).unwrap();
             let (resumed, _, _) = test_hooks::last().unwrap();
             assert!(!resumed, "the cursor was resumed over rows an older build may have changed");
             assert_counts_exact(&engine, "a walk restarted after an older build");

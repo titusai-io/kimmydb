@@ -1021,14 +1021,16 @@ mod tests {
         // vectors at its last stamp for ever (a reseeded member's old id).
         let old = NodeId::generate();
         for e in [&a, &b] {
+            // In the collection that goes busy below: the frozen origin is in
+            // its row, covered, and must not pull the scan's start back.
             let entry = kimmy_core::OplogEntry {
                 stamp: old_stamp(old),
                 kind: kimmy_core::OpKind::Insert,
-                collection: items.id,
+                collection: orders.id,
                 doc_id: Some(DocId::Int64(7_000)),
                 body: Some(bson::serialize_to_vec(&doc! { "_id": 7000i64 }).unwrap()),
             };
-            e.apply_remote(&items, &entry).unwrap();
+            e.apply_remote(&orders, &entry).unwrap();
         }
         // A crowd of covered entries, then one new write above the cut.
         for i in 0..400i64 {
