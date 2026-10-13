@@ -2556,6 +2556,7 @@ dependencies = [
  "criterion",
  "kimmy-core",
  "kimmy-query",
+ "kimmy-storage",
  "libc",
  "parking_lot",
  "proptest",

@@ -63,6 +63,8 @@ mod database_drop_tests;
 
 #[cfg(test)]
 mod log_capture;
+#[cfg(feature = "test-hooks")]
+pub use live_walk::stop_open_after_rows_for_test;
 
 pub use database_tombstone::{Buried, BuriedCollection, Swept};
 pub use digest_probe::{

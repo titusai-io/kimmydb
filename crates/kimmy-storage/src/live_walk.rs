@@ -443,9 +443,25 @@ pub(crate) fn run(db: &Database, forced: Option<&'static str>) -> Result<Option<
     Ok(Some(rebuilt))
 }
 
+#[cfg(feature = "test-hooks")]
+thread_local! {
+    static STOP_OPEN_AFTER_ROWS: std::cell::Cell<u64> = const { std::cell::Cell::new(u64::MAX) };
+}
+
+/// Report a stop to this thread's open once its rebuild has processed this many
+/// rows in all (a test hook, for the tests that run the library as shipped).
+#[cfg(feature = "test-hooks")]
+pub fn stop_open_after_rows_for_test(rows: u64) {
+    STOP_OPEN_AFTER_ROWS.with(|c| c.set(rows));
+}
+
 fn stop_requested(rows_so_far: u64) -> bool {
     #[cfg(test)]
     if test_hooks::stop_after(rows_so_far) {
+        return true;
+    }
+    #[cfg(feature = "test-hooks")]
+    if rows_so_far >= STOP_OPEN_AFTER_ROWS.with(std::cell::Cell::get) {
         return true;
     }
     let _ = rows_so_far;
