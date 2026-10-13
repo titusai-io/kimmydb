@@ -68,14 +68,21 @@ jobs:
           shared-key: fuzz
           save-if: ${{ github.ref == 'refs/heads/main' }}
 
+      # The target is named, not left to `cargo fuzz`: its default is the triple
+      # the `cargo-fuzz` binary itself was built for, and the installer's
+      # prebuilt binary is static musl, where the address sanitizer refuses to
+      # build at all ("sanitizer is incompatible with statically linked libc").
       - name: Build
-        run: cargo fuzz build
+        run: |
+          host="$(rustc -vV | sed -n 's/^host: //p')"
+          echo "host=$host" >> "$GITHUB_ENV"
+          cargo fuzz build --target "$host"
 
       - name: Collect the binaries
         run: |
           mkdir -p fuzz-bin
           for target in $(cargo fuzz list); do
-            cp "fuzz/target/$(rustc -vV | sed -n 's/^host: //p')/release/$target" fuzz-bin/
+            cp "fuzz/target/$host/release/$target" fuzz-bin/
           done
           ls -l fuzz-bin
 
