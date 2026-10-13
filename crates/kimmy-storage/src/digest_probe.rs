@@ -771,6 +771,22 @@ impl Engine {
         self.digest_fail_in.store(calls, Ordering::SeqCst);
     }
 
+    /// Make this node's kept digest row of `collection` disagree with its
+    /// records, by XOR of `by` into it (a test hook: the drift the self-check
+    /// exists to find).
+    #[cfg(any(test, feature = "test-hooks"))]
+    pub fn corrupt_digest_row_for_test(&self, collection: CollectionId, by: u128) -> Result<()> {
+        let txn = self.db().begin_write()?;
+        {
+            let mut rows = txn.open_table(tables::LIVE_DIGESTS)?;
+            let mut row = live_digest::kept_row(&rows, collection.0)?.unwrap_or_default();
+            row.digest ^= by;
+            rows.insert(collection.0, row.encode().as_slice())?;
+        }
+        txn.commit()?;
+        Ok(())
+    }
+
     #[cfg(any(test, feature = "test-hooks"))]
     fn fail_digest_probe_if_armed(&self) -> Result<()> {
         let armed = self.digest_fail_in.load(Ordering::SeqCst);

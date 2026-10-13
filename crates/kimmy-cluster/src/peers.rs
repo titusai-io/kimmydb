@@ -1928,9 +1928,9 @@ fn fold_digest_round(
                                 maxw = %maxw,
                                 "the cut digest of a collection differs from this peer's on two \
                                  consecutive comparisons, with what each side had not yet \
-                                 processed set aside; detect only, no repair is planned. Compare \
-                                 (id, stamp) of the collection on both members before wiping either \
-                                 (operations.md, The divergence check)"
+                                 processed set aside; detect only, no repair is planned. The API \
+                                 cannot always say which member is behind: read (operations.md, The \
+                                 cut digest) before wiping either member"
                             );
                         }
                     }
@@ -3590,5 +3590,285 @@ mod tests {
         judge_catch_up_at(&catch_up, &engine, &PeerStalls::new(), None, &reached, None, after);
         assert!(!catch_up.replay_armed(), "and not past it");
         assert_eq!(crate::catchup::replay_floor_on_disk(marker_dir.path()), None);
+    }
+}
+
+/// The fold of a contact's cut-digest round, through the same function the loop
+/// calls, with a real engine behind the self-check.
+#[cfg(test)]
+mod digest_fold_tests {
+    use std::cell::RefCell;
+    use std::io::Write;
+    use std::sync::Once;
+
+    use bson::doc;
+    use kimmy_core::CollectionId;
+    use kimmy_storage::{
+        Defer, DigestAnswered, DigestOutcome, DigestRound, DigestVerdict, DivergenceTracker,
+    };
+
+    use super::*;
+
+    thread_local! {
+        static CAPTURE: RefCell<Option<Vec<u8>>> = const { RefCell::new(None) };
+    }
+
+    struct Sink;
+
+    impl Write for Sink {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            CAPTURE.with(|c| {
+                if let Some(out) = c.borrow_mut().as_mut() {
+                    out.extend_from_slice(buf);
+                }
+            });
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// What `body` logs on this thread: one global subscriber, so a callsite
+    /// first hit by another test thread is not cached as unwanted.
+    fn logs_of(body: impl FnOnce()) -> String {
+        static ONCE: Once = Once::new();
+        ONCE.call_once(|| {
+            let subscriber =
+                tracing_subscriber::fmt().with_writer(|| Sink).with_ansi(false).finish();
+            tracing::subscriber::set_global_default(subscriber).expect("one global subscriber");
+        });
+        CAPTURE.with(|c| *c.borrow_mut() = Some(Vec::new()));
+        body();
+        CAPTURE.with(|c| String::from_utf8(c.borrow_mut().take().unwrap_or_default()).unwrap())
+    }
+
+    struct Fixture {
+        engine: Engine,
+        collection: CollectionId,
+        tracker: DivergenceTracker,
+        state: DigestState,
+        report: RoundReport,
+        node: NodeId,
+        peer: SocketAddr,
+        _dir: tempfile::TempDir,
+    }
+
+    fn fixture() -> Fixture {
+        let dir = tempfile::tempdir().unwrap();
+        let engine = Engine::open(&dir.path().join("kimmy.redb")).unwrap();
+        let coll = engine.create_collection("shop", "orders").unwrap();
+        for i in 0..5i64 {
+            engine.insert(&coll, doc! { "_id": i }).unwrap();
+        }
+        Fixture {
+            engine,
+            collection: coll.id,
+            tracker: DivergenceTracker::default(),
+            state: DigestState::default(),
+            report: RoundReport::default(),
+            node: NodeId::from_bytes([3; 16]),
+            peer: "127.0.0.1:9".parse().unwrap(),
+            _dir: dir,
+        }
+    }
+
+    impl Fixture {
+        fn fold(&mut self, round: DigestRound) -> String {
+            let Fixture { engine, tracker, state, report, node, peer, .. } = self;
+            logs_of(|| fold_digest_round(engine, tracker, state, *node, *peer, round, report))
+        }
+
+        fn mismatch(&self) -> DigestRound {
+            let mut round = DigestRound::new(DigestAnswered::Answered);
+            round.verdicts.push(DigestVerdict {
+                collection: self.collection,
+                outcome: DigestOutcome::Compared { equal: false, mine: 1, theirs: 2 },
+            });
+            round
+        }
+
+        fn equal(&self) -> DigestRound {
+            let mut round = DigestRound::new(DigestAnswered::Answered);
+            round.verdicts.push(DigestVerdict {
+                collection: self.collection,
+                outcome: DigestOutcome::Compared { equal: true, mine: 1, theirs: 1 },
+            });
+            round
+        }
+    }
+
+    fn warns(logs: &str) -> usize {
+        logs.matches("the cut digest of a collection differs").count()
+    }
+
+    /// A mismatch seen on two compared contacts is a finding: both gauges move,
+    /// one WARN says so, and nothing is planned from it.
+    #[test]
+    fn a_confirmed_digest_finding_moves_both_gauges_warns_once_and_plans_nothing() {
+        let mut f = fixture();
+        let first = f.fold(f.mismatch());
+        assert_eq!(warns(&first), 0, "one mismatch is not yet a finding: {first}");
+        assert_eq!(f.tracker.digest_confirmed_count(), 0);
+        let second = f.fold(f.mismatch());
+        assert_eq!(warns(&second), 1, "{second}");
+        assert!(second.contains("WARN"), "{second}");
+        assert_eq!(f.tracker.digest_confirmed_count(), 1);
+        assert_eq!(f.tracker.confirmed_count(), 1, "the gauge both halves feed");
+        assert!(f.tracker.confirmed_against(f.node).is_empty(), "a repair would be planned");
+        assert_eq!(f.report.digest_compared, 2);
+        // Still confirmed, a minute later: not logged again.
+        let third = f.fold(f.mismatch());
+        assert_eq!(warns(&third), 0, "the same finding is logged once per ten minutes: {third}");
+        assert_eq!(f.tracker.digest_confirmed_count(), 1);
+    }
+
+    /// The same finding is logged again when ten minutes have passed.
+    #[test]
+    fn a_finding_that_stays_is_logged_again_after_ten_minutes() {
+        let mut f = fixture();
+        f.fold(f.mismatch());
+        assert_eq!(warns(&f.fold(f.mismatch())), 1);
+        let key = (f.node, f.collection);
+        let long_ago = Instant::now() - DIGEST_WARN_EVERY - Duration::from_secs(1);
+        f.state.warned.insert(key, long_ago);
+        assert_eq!(warns(&f.fold(f.mismatch())), 1, "due again");
+        assert_eq!(warns(&f.fold(f.mismatch())), 0, "and then quiet");
+    }
+
+    /// An equal comparison clears the finding.
+    #[test]
+    fn an_equal_comparison_clears_a_finding() {
+        let mut f = fixture();
+        f.fold(f.mismatch());
+        f.fold(f.mismatch());
+        assert_eq!(f.tracker.digest_confirmed_count(), 1);
+        f.fold(f.equal());
+        assert_eq!(f.tracker.digest_confirmed_count(), 0);
+        assert_eq!(f.tracker.confirmed_count(), 0);
+    }
+
+    /// A mismatch is reported only after this node's own row is verified: a
+    /// drifted row is corrected, counted, logged as an error, and observed as
+    /// nothing, so it can neither confirm nor clear a finding.
+    #[test]
+    fn a_mismatch_over_a_drifted_row_is_corrected_and_not_observed() {
+        let mut f = fixture();
+        f.engine.corrupt_digest_row_for_test(f.collection, 0xabc).unwrap();
+        let logs = f.fold(f.mismatch());
+        assert_eq!(warns(&logs), 0);
+        assert!(logs.contains("ERROR") && logs.contains("has been corrected"), "{logs}");
+        assert_eq!(f.report.digest_deferred[Defer::Corrected.index()], 1);
+        assert_eq!(f.report.digest_compared, 0, "not a comparison");
+        assert_eq!(f.engine.digest_drift_total(), 1);
+        // Observed as nothing: a second mismatch is the first, not the second.
+        f.fold(f.mismatch());
+        assert_eq!(f.tracker.digest_confirmed_count(), 0, "the corrected comparison was observed");
+        // And an equal result in between did not reset a finding it had no
+        // part in: confirm, then corrupt, then see a mismatch.
+        f.fold(f.mismatch());
+        assert_eq!(f.tracker.digest_confirmed_count(), 1);
+        f.engine.corrupt_digest_row_for_test(f.collection, 0xdef).unwrap();
+        f.state.verified.clear();
+        f.fold(f.mismatch());
+        assert_eq!(f.tracker.digest_confirmed_count(), 1, "a corrected comparison cleared it");
+    }
+
+    /// A verified row is not walked again while it is unchanged and the memo
+    /// has not expired, and is when the memo has.
+    #[test]
+    fn a_verified_row_is_not_walked_again_inside_the_memo() {
+        let mut f = fixture();
+        f.fold(f.mismatch());
+        assert!(f.state.verified.contains_key(&f.collection));
+        // Drift introduced behind the memo goes unseen until it expires.
+        f.engine.corrupt_digest_row_for_test(f.collection, 0x1).unwrap();
+        f.state.verified.clear();
+        f.fold(f.mismatch());
+        assert_eq!(f.report.digest_deferred[Defer::Corrected.index()], 1);
+        f.state.verified.insert(
+            f.collection,
+            (u128::MAX, BTreeMap::new(), Instant::now() - SELF_CHECK_MEMO - Duration::from_secs(1)),
+        );
+        f.fold(f.mismatch());
+        assert_eq!(
+            f.state.verified.get(&f.collection).map(|(d, _, _)| *d != u128::MAX),
+            Some(true)
+        );
+    }
+
+    /// Every reason lands in its own slot of the report, once per collection.
+    #[test]
+    fn each_deferral_is_counted_under_its_own_reason() {
+        let mut f = fixture();
+        for reason in Defer::ALL {
+            let mut round = DigestRound::new(DigestAnswered::Answered);
+            round.verdicts.push(DigestVerdict {
+                collection: f.collection,
+                outcome: DigestOutcome::Deferred(reason),
+            });
+            f.fold(round);
+        }
+        assert_eq!(f.report.digest_deferred, [1; Defer::ALL.len()]);
+        assert_eq!(f.report.digest_compared, 0);
+    }
+
+    /// What a contact came to for all its collections is counted per
+    /// collection it planned over, and a collection the plan deferred is not
+    /// counted again when the answer has a verdict for it.
+    #[test]
+    fn a_round_that_came_to_nothing_is_counted_per_collection() {
+        let mut f = fixture();
+        let mut busy = DigestRound::new(DigestAnswered::Busy);
+        busy.held = 4;
+        f.fold(busy);
+        let mut failed = DigestRound::new(DigestAnswered::Failed);
+        failed.held = 3;
+        f.fold(failed);
+        assert_eq!(f.report.digest_deferred[Defer::Busy.index()], 4);
+        assert_eq!(f.report.digest_deferred[Defer::Error.index()], 3);
+        f.fold(DigestRound::new(DigestAnswered::Unanswered));
+        f.fold(DigestRound::new(DigestAnswered::Probed));
+        f.fold(DigestRound::new(DigestAnswered::Probed));
+        assert_eq!((f.report.digest_unanswered, f.report.digest_probed), (1, 2));
+        let mut malformed = DigestRound::new(DigestAnswered::Answered);
+        malformed.malformed = 2;
+        f.fold(malformed);
+        assert_eq!(f.report.digest_deferred[Defer::Malformed.index()], 2);
+
+        let other = CollectionId(99);
+        let mut planned = DigestRound::new(DigestAnswered::Answered);
+        planned.plan_deferred = vec![(f.collection, Defer::BareTombstone), (other, Defer::Horizon)];
+        planned.verdicts.push(DigestVerdict {
+            collection: f.collection,
+            outcome: DigestOutcome::Deferred(Defer::BareTombstone),
+        });
+        f.fold(planned);
+        assert_eq!(f.report.digest_deferred[Defer::BareTombstone.index()], 1, "counted twice");
+        assert_eq!(f.report.digest_deferred[Defer::Horizon.index()], 1, "the plan's own was lost");
+    }
+
+    /// The state kept between ticks forgets a collection the node no longer
+    /// holds, and what has outlived its use.
+    #[test]
+    fn the_digest_state_forgets_what_is_gone_or_stale() {
+        let mut f = fixture();
+        let gone = CollectionId(7);
+        let key = (f.node, f.collection);
+        f.state.verified.insert(f.collection, (1, BTreeMap::new(), Instant::now()));
+        f.state.verified.insert(gone, (1, BTreeMap::new(), Instant::now()));
+        f.state.warned.insert(key, Instant::now());
+        f.state.warned.insert((f.node, gone), Instant::now());
+        f.state.prune(&BTreeSet::from([f.collection]));
+        assert!(f.state.verified.contains_key(&f.collection));
+        assert!(!f.state.verified.contains_key(&gone));
+        assert!(f.state.warned.contains_key(&key));
+        assert!(!f.state.warned.contains_key(&(f.node, gone)));
+        f.state
+            .verified
+            .insert(f.collection, (1, BTreeMap::new(), Instant::now() - SELF_CHECK_MEMO * 2));
+        f.state.prune(&BTreeSet::from([f.collection]));
+        assert!(f.state.verified.is_empty(), "an expired memo is dropped");
     }
 }

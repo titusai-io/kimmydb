@@ -49,4 +49,5 @@ kimmy-storage = { workspace = true, features = ["test-hooks"] }
 proptest.workspace = true
 tempfile.workspace = true
 serde_json.workspace = true
+tracing-subscriber.workspace = true
 tokio = { workspace = true, features = ["full", "test-util"] }
