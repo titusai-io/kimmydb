@@ -20,7 +20,7 @@
 //! that matters: a `DOCS` value carries its body, and on the largest store
 //! measured the heaviest 50,000-row chunk was 128.8 MiB against 17 MiB on
 //! average, so a row cap alone is seven times off. At the cold rate measured
-//! on mars's disks (about 10 MB/s) a 64 MiB chunk is some seconds, so what
+//! on a spinning disk (about 10 MB/s) a 64 MiB chunk is some seconds, so what
 //! keeps a stop inside the stop budget is the check every [`STOP_EVERY`] rows
 //! inside the chunk, not the chunk size.
 //!

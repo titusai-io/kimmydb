@@ -26632,7 +26632,7 @@ for data from round 0510.
 collection costs a scan of the oplog tail; the duty cycle is bounded by the budget and the one-at-a-time rule
 (four members, the placeholders: up to seven scans of 200 ms per 5 s interval, 28% of one blocking thread,
 and only when every collection is busy). The first start of 0.48.0 and the start after a crash or kill of
-0.48.x walk `DOCS` once, as the live counts' walk always did, now in chunks. Cold, on mars's disks, the tester
+0.48.x walk `DOCS` once, as the live counts' walk always did, now in chunks. Cold, on a spinning disk, the tester
 measured about 10 MB/s over a 688 MB `OPLOG`, 26–28,000 rows/s; the heaviest 50,000-row chunk was 128.8 MiB
 against 17 MiB on average, so the chunk is cut on bytes and the stop is looked for every 256 rows (about 10 ms
 cold), which is what keeps a stop inside the stop budget, not the chunk size. Cold, the 200 ms of a tail scan

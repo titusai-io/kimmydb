@@ -47,7 +47,7 @@ use crate::tables;
 use crate::walk::{WalkScope, open_walk_table};
 
 /// The wall time one scan of the oplog may take, a placeholder set from the
-/// cold measurements: cold, on mars's disks, this binds first (about 2 MB); a
+/// cold measurements: cold, on a spinning disk, this binds first (about 2 MB); a
 /// recent tail is normally in the page cache and 8 MiB takes milliseconds.
 pub const SCAN_WALL: Duration = Duration::from_millis(200);
 
