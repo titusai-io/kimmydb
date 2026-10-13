@@ -161,6 +161,40 @@ const OWNERSHIP_SETTLE: Duration = Duration::from_secs(30);
 /// same way on every deployment.
 const POSITION_WAIT: Duration = Duration::from_secs(1);
 
+/// The deferral tick the loop waits on: [`DEFERRAL_TICK`], except that a test
+/// can raise it on its own thread so that only the loop's other deadlines can
+/// explain something happening soon.
+fn deferral_tick() -> Duration {
+    #[cfg(test)]
+    if let Some(tick) = test_hooks::TICK.with(|t| t.get()) {
+        return tick;
+    }
+    DEFERRAL_TICK
+}
+
+/// [`POSITION_WAIT`], with the same test-only override as [`deferral_tick`].
+fn position_wait() -> Duration {
+    #[cfg(test)]
+    if let Some(wait) = test_hooks::POSITION.with(|t| t.get()) {
+        return wait;
+    }
+    POSITION_WAIT
+}
+
+/// Per-thread overrides for the loop's timed waits. A `#[tokio::test]` runs
+/// the worker's task on the test's own thread, so a thread-local reaches it
+/// and cannot leak into a test running beside it.
+#[cfg(test)]
+mod test_hooks {
+    use std::cell::Cell;
+    use std::time::Duration;
+
+    thread_local! {
+        pub(super) static TICK: Cell<Option<Duration>> = const { Cell::new(None) };
+        pub(super) static POSITION: Cell<Option<Duration>> = const { Cell::new(None) };
+    }
+}
+
 /// The most documents held for a later re-check.
 ///
 /// Bounded because this is memory a burst of remote writes can grow. On
@@ -395,7 +429,7 @@ impl Pending {
     /// flush a batch deadline triggers writes the position too.
     fn deadline(&self, wait: Duration) -> Option<Instant> {
         let batch = self.opened.map(|opened| opened + wait);
-        let position = self.held_since.map(|since| since + POSITION_WAIT);
+        let position = self.held_since.map(|since| since + position_wait());
         match (batch, position) {
             (Some(batch), Some(position)) => Some(batch.min(position)),
             (batch, position) => batch.or(position),
@@ -1009,9 +1043,9 @@ impl EmbeddingWorker {
             // Woken at the ownership tick as well, so a quiet stream still asks
             // who owns what on schedule; in a build it is the deferral tick.
             let tick = if self.am_owner.is_some() {
-                DEFERRAL_TICK.min(self.ownership_tick)
+                deferral_tick().min(self.ownership_tick)
             } else {
-                DEFERRAL_TICK
+                deferral_tick()
             };
             let wait = pending
                 .deadline(self.batching.max_wait)
@@ -3913,6 +3947,25 @@ pub(crate) mod tests {
         panic!("the worker never recorded a position past {from:?}");
     }
 
+    /// [`position_advances_past`] with a time limit in place of its poll count;
+    /// whether the position moved in time.
+    async fn position_advances_past_for(
+        engine: &Engine,
+        from: Option<kimmy_core::ResumeToken>,
+        limit: Duration,
+    ) -> bool {
+        let deadline = Instant::now() + limit;
+        while Instant::now() < deadline {
+            if let Some(now) = engine.consumer_position(CONSUMER).unwrap()
+                && Some(now) != from
+            {
+                return true;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        false
+    }
+
     /// Wait for the worker's recorded position to reach exactly `stamp`, or
     /// give up. The way to know the worker has nothing left to write for a
     /// burst: its position covers the burst's last entry.
@@ -4011,17 +4064,29 @@ pub(crate) mod tests {
     async fn a_lone_skipped_entrys_position_is_recorded_within_the_position_wait() {
         let (engine, coll, settled, _dir) = setup_skipping_worker().await;
 
+        // The deferral tick is raised far past the bound below, for this
+        // thread only, so nothing but the position's own deadline can record
+        // the position in time: not the tick, and there is no next write. The
+        // bound is then a ceiling no loaded runner reaches, rather than a
+        // measurement of how fast this one is.
+        let tick = Duration::from_secs(120);
+        let bound = Duration::from_secs(60);
+        test_hooks::TICK.with(|t| t.set(Some(tick)));
+
+        // Whatever the loop is already waiting on was computed before the
+        // override; the insert below wakes it, and the wait it then takes is
+        // computed again with the raised tick.
         let started = Instant::now();
         engine.insert(&coll, doc! { "n": 1i64 }).unwrap();
-        position_advances_past(&engine, settled).await;
+        let landed = position_advances_past_for(&engine, settled, bound).await;
+        test_hooks::TICK.with(|t| t.set(None));
         let took = started.elapsed();
 
-        // Generous — the test is that it lands on the position's own
-        // schedule, not the five-second deferral tick or the next write.
         assert!(
-            took < POSITION_WAIT * 3,
-            "a lone skipped entry's position took {took:?} to land; it should have been \
-             written within about {POSITION_WAIT:?}"
+            landed,
+            "a lone skipped entry's position had not landed after {took:?}; with the \
+             {tick:?} deferral tick out of the way it should have been written on its own \
+             schedule, within about {POSITION_WAIT:?}"
         );
         assert_eq!(
             engine.consumer_position(CONSUMER).unwrap().map(|t| t.to_stamp()),
@@ -4121,6 +4186,9 @@ pub(crate) mod tests {
             ..Default::default()
         });
         position_at_latest(&engine);
+        // The position wait is raised far past the bound below, so only the
+        // batch wait can explain the document landing in time.
+        test_hooks::POSITION.with(|t| t.set(Some(Duration::from_secs(120))));
         tokio::spawn(async move { worker.run().await });
 
         // The burst: entries the worker holds a position for and nothing else.
@@ -4132,11 +4200,12 @@ pub(crate) mod tests {
         engine.insert(&coll, doc! { "_id": 0i64, "title": "behind the burst" }).unwrap();
         vectors_land(&engine, 1).await;
         let took = started.elapsed();
+        test_hooks::POSITION.with(|t| t.set(None));
 
         assert!(
-            took < POSITION_WAIT,
+            took < Duration::from_secs(60),
             "the document behind the burst waited {took:?} for its vectors; the batch wait \
-             should have sent it long before the held position's {POSITION_WAIT:?}"
+             should have sent it long before the held position's 120s"
         );
         assert_eq!(fake.sizes(), vec![1]);
     }
@@ -4753,16 +4822,20 @@ pub(crate) mod tests {
             ..Default::default()
         });
         position_at_latest(&engine);
+        // The tick is raised far past the bound below, so only the batch
+        // timer can explain the document landing in time.
+        test_hooks::TICK.with(|t| t.set(Some(Duration::from_secs(120))));
         tokio::spawn(async move { worker.run().await });
 
         let started = Instant::now();
         engine.insert(&coll, doc! { "_id": 0i64, "title": "alone" }).unwrap();
         vectors_land(&engine, 1).await;
         let took = started.elapsed();
+        test_hooks::TICK.with(|t| t.set(None));
         assert!(
-            took < DEFERRAL_TICK / 2,
+            took < Duration::from_secs(60),
             "a lone document waited {took:?}; the batch timer should have sent it long before \
-             the {DEFERRAL_TICK:?} tick"
+             the 120s tick"
         );
         assert_eq!(fake.sizes(), vec![1]);
     }
