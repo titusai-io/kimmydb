@@ -1297,6 +1297,8 @@ impl Engine {
             let _ = txn.open_table(tables::OPLOG_HELD)?;
             let _ = txn.open_table(tables::LIVE_COUNTS)?;
             let _ = txn.open_table(tables::LIVE_COUNTS_THROUGH)?;
+            let _ = txn.open_table(tables::LIVE_DIGESTS)?;
+            let _ = txn.open_table(tables::LIVE_DIGESTS_THROUGH)?;
             // Created with the others, so reading the record never meets a
             // missing table (`crate::verified`).
             let _ = txn.open_table(tables::VECTOR_VERIFIED)?;
@@ -4300,6 +4302,10 @@ impl Engine {
             let meta =
                 CollectionMeta::new(id, db, name, origin.unwrap_or(stamp.hlc), incarnation_floor);
             collections.insert((db, name), serde_json::to_vec(&meta)?.as_slice())?;
+            // A name dropped and created again derives the same id: the new
+            // incarnation starts with no digest row, so the old one's highest
+            // stamps do not make it look busy (B3 design 2.1).
+            crate::live_digest::reset(txn, id)?;
             (meta, stamp)
         };
 

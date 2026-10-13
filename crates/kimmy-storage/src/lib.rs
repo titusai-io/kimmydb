@@ -30,6 +30,7 @@ pub mod health;
 pub mod hold_meter;
 pub mod index;
 mod live_count;
+pub mod live_digest;
 pub mod meta;
 pub mod migrate;
 pub mod modify;

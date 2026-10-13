@@ -123,6 +123,9 @@ pub(crate) struct Pending {
     /// overwrites this, so what is stored is the last one, which is the state
     /// the transaction ends in.
     mark: Option<Vec<u8>>,
+    /// Per collection, what the digest row owes (B3 half 1): written by
+    /// [`crate::live_digest::flush`] in the same commit, beside the counts.
+    digests: BTreeMap<u64, crate::live_digest::Delta>,
 }
 
 impl Pending {
@@ -147,6 +150,41 @@ impl Pending {
         *self.deltas.entry(collection).or_default() += delta;
     }
 
+    /// One write to `key` of `collection`: the record that was there and the
+    /// one now, each as its stamp and whether it is live.
+    #[cfg(not(kimmy_bench_no_live_counts))]
+    fn wrote(
+        &mut self,
+        collection: u64,
+        key: &[u8],
+        before: Option<(kimmy_core::Stamp, bool)>,
+        after: Option<(kimmy_core::Stamp, bool)>,
+    ) {
+        self.digests.entry(collection).or_default().wrote(key, before, after);
+    }
+
+    /// The control's no-op (`--cfg kimmy_bench_no_live_counts`).
+    #[cfg(kimmy_bench_no_live_counts)]
+    fn wrote(
+        &mut self,
+        _collection: u64,
+        _key: &[u8],
+        _before: Option<(kimmy_core::Stamp, bool)>,
+        _after: Option<(kimmy_core::Stamp, bool)>,
+    ) {
+    }
+
+    /// The write just recorded for `collection` was a tombstone no oplog entry
+    /// stands behind (ADR-228).
+    #[cfg(not(kimmy_bench_no_live_counts))]
+    fn bare(&mut self, collection: u64, stamp: &kimmy_core::Stamp) {
+        self.digests.entry(collection).or_default().bare(stamp);
+    }
+
+    /// The control's no-op (`--cfg kimmy_bench_no_live_counts`).
+    #[cfg(kimmy_bench_no_live_counts)]
+    fn bare(&mut self, _collection: u64, _stamp: &kimmy_core::Stamp) {}
+
     /// Record where an append left the store, for [`flush`] to write once.
     #[cfg(not(kimmy_bench_no_live_counts))]
     pub(crate) fn appended(&mut self, mark: Vec<u8>) {
@@ -167,12 +205,29 @@ pub(crate) fn put_record(
     key: &[u8],
     record: &[u8],
 ) -> Result<()> {
-    let was_live = match docs.insert((collection, key), record)? {
-        Some(previous) => codec::doc_record_is_live(previous.value())?,
-        None => false,
+    let before = match docs.insert((collection, key), record)? {
+        Some(previous) => Some(codec::doc_record_header(previous.value())?),
+        None => None,
     };
-    let is_live = codec::doc_record_is_live(record)?;
-    txn.live_counts().lock().moved(collection, was_live, is_live);
+    let after = codec::doc_record_header(record)?;
+    let mut pending = txn.live_counts().lock();
+    pending.moved(collection, before.is_some_and(|(_, live)| live), after.1);
+    pending.wrote(collection, key, before, Some(after));
+    Ok(())
+}
+
+/// [`put_record`] for a tombstone written with no oplog entry behind it
+/// (ADR-228): the digest row's `bare_max` rises with it.
+pub(crate) fn put_bare_tombstone(
+    txn: &WriteTxn<'_>,
+    docs: &mut Docs<'_>,
+    collection: u64,
+    key: &[u8],
+    record: &[u8],
+) -> Result<()> {
+    put_record(txn, docs, collection, key, record)?;
+    let (stamp, _) = codec::doc_record_header(record)?;
+    txn.live_counts().lock().bare(collection, &stamp);
     Ok(())
 }
 
@@ -184,11 +239,13 @@ pub(crate) fn remove_record(
     collection: u64,
     key: &[u8],
 ) -> Result<bool> {
-    let was_live = match docs.remove((collection, key))? {
-        Some(previous) => codec::doc_record_is_live(previous.value())?,
+    let before = match docs.remove((collection, key))? {
+        Some(previous) => codec::doc_record_header(previous.value())?,
         None => return Ok(false),
     };
-    txn.live_counts().lock().moved(collection, was_live, false);
+    let mut pending = txn.live_counts().lock();
+    pending.moved(collection, before.1, false);
+    pending.wrote(collection, key, Some(before), None);
     Ok(true)
 }
 
@@ -231,10 +288,12 @@ pub(crate) fn flush(txn: &WriteTransaction, pending: &Pending) -> Result<()> {
             }
         }
     }
+    crate::live_digest::flush(txn, &pending.digests)?;
     if let Some(mark) = &pending.mark {
         // Already read, by the last append, from the tables it had open. This
         // writes the one row and opens nothing else.
         mark_through(txn, mark)?;
+        crate::live_digest::mark_through(txn, mark)?;
     }
     Ok(())
 }
@@ -315,15 +374,20 @@ pub(crate) fn carry_mark(txn: &WriteTxn<'_>, before: &[u8], after: &[u8]) -> Res
     if current {
         table.insert(THROUGH, after)?;
     }
+    drop(table);
+    // The digest rows' own mark, under the same rule: a mark that did not
+    // match says a build that does not keep them wrote since, and moving it
+    // forward would hide that from the next open.
+    crate::live_digest::carry_mark(txn, before, after)?;
     Ok(())
 }
 
-/// Rebuild every count from the records' headers, unless the mark says the
-/// counts were kept through the arrival index's current end.
+/// Rebuild every count and every digest row from the records' headers, unless
+/// both marks say they were kept through the arrival index's current end.
 ///
-/// One transaction, and a walk of the whole of `DOCS`, paid only when the mark
-/// is missing or behind: the first start of a build that keeps the count, a
-/// restore, or a start after an older build wrote.
+/// One transaction, and one walk of the whole of `DOCS` for both, paid only
+/// when either mark is missing or behind: the first start of a build that
+/// keeps them, a restore, or a start after an older build wrote.
 ///
 /// In `txn`, which the caller commits: `Engine::open`, which owns the database
 /// before there is an engine to count a commit against. `None` when nothing
@@ -331,20 +395,34 @@ pub(crate) fn carry_mark(txn: &WriteTxn<'_>, before: &[u8], after: &[u8]) -> Res
 pub(crate) fn rebuild_if_stale(txn: &WriteTransaction) -> Result<Option<Rebuilt>> {
     let mark = mark_of(&txn.open_table(tables::OPLOG_ARRIVAL)?, &txn.open_table(tables::OPLOG)?)?;
     let through = open_through(txn)?.get(THROUGH)?.map(|m| m.value().to_vec());
-    if through.as_deref() == Some(mark.as_slice()) {
+    let digests_current =
+        crate::live_digest::mark_matches(&txn.open_table(tables::LIVE_DIGESTS_THROUGH)?, &mark)?;
+    if through.as_deref() == Some(mark.as_slice()) && digests_current {
         return Ok(None);
     }
 
     let mut counts: BTreeMap<u64, u64> = BTreeMap::new();
+    let mut digests: BTreeMap<u64, crate::live_digest::DigestRow> = BTreeMap::new();
     let mut records = 0usize;
     {
         let docs = txn.open_table(tables::DOCS)?;
         for row in docs.iter()? {
             let (key, value) = row?;
             records += 1;
-            match codec::doc_record_is_live(value.value()) {
-                Ok(true) => *counts.entry(key.value().0).or_default() += 1,
-                Ok(false) => {}
+            match codec::doc_record_header(value.value()) {
+                Ok((stamp, live)) => {
+                    let (collection, doc_key) = key.value();
+                    if live {
+                        *counts.entry(collection).or_default() += 1;
+                    }
+                    crate::live_digest::fold_walked(
+                        &mut digests,
+                        collection,
+                        doc_key,
+                        &stamp,
+                        live,
+                    );
+                }
                 // Not counted, as no reader can return it either; refusing to
                 // open over one unreadable record would be worse than a count
                 // one short.
@@ -359,7 +437,15 @@ pub(crate) fn rebuild_if_stale(txn: &WriteTransaction) -> Result<Option<Rebuilt>
             table.insert(*id, *n)?;
         }
     }
+    {
+        let mut table = txn.open_table(tables::LIVE_DIGESTS)?;
+        table.retain(|_, _| false)?;
+        for (id, row) in &digests {
+            table.insert(*id, row.encode().as_slice())?;
+        }
+    }
     mark_through(txn, &mark)?;
+    crate::live_digest::mark_through(txn, &mark)?;
     Ok(Some(Rebuilt {
         collections: counts.len(),
         records,
@@ -417,6 +503,55 @@ mod tests {
             }
         }
         assert_eq!(kept, walked, "the kept counts disagree with the records after {after}");
+        drop(txn);
+        assert_digests_exact(engine, after);
+    }
+
+    /// Every kept digest row equals a walk of the records' headers: the same
+    /// digest. The highest stamps are only ever raised, so the kept `maxw` is
+    /// never below the walk's, and the kept `bare_max` never exceeds what the
+    /// walk would set (a rebuilt row sets it to the highest tombstone stamp per
+    /// origin, the most it can be).
+    fn assert_digests_exact(engine: &Engine, after: &str) {
+        let db = engine.db();
+        let txn = db.begin_read().unwrap();
+        let mut walked: BTreeMap<u64, crate::live_digest::DigestRow> = BTreeMap::new();
+        for row in txn.open_table(tables::DOCS).unwrap().iter().unwrap() {
+            let (key, value) = row.unwrap();
+            let (collection, doc_key) = key.value();
+            let (stamp, live) = codec::doc_record_header(value.value()).unwrap();
+            crate::live_digest::fold_walked(&mut walked, collection, doc_key, &stamp, live);
+        }
+        let rows = txn.open_table(tables::LIVE_DIGESTS).unwrap();
+        let mut kept: BTreeMap<u64, crate::live_digest::DigestRow> = BTreeMap::new();
+        for row in rows.iter().unwrap() {
+            let (id, raw) = row.unwrap();
+            kept.insert(id.value(), crate::live_digest::DigestRow::decode(raw.value()).unwrap());
+        }
+        for (id, walk) in &walked {
+            let row =
+                kept.get(id).unwrap_or_else(|| panic!("no digest row for {id} after {after}"));
+            assert_eq!(row.digest, walk.digest, "digest of {id} after {after}");
+            // Never lowered, so a kept `maxw` may stand above the walk's (a
+            // replaced record's origin keeps its stamp), never below it.
+            for (node, hlc) in &walk.maxw {
+                assert!(
+                    row.maxw.get(node).is_some_and(|k| k >= hlc),
+                    "maxw of {id} is below the walk's for {node:?} after {after}"
+                );
+            }
+            for (node, hlc) in &row.bare_max {
+                assert!(
+                    walk.bare_max.get(node).is_some_and(|w| w >= hlc),
+                    "bare_max of {id} exceeds the walk's after {after}"
+                );
+            }
+        }
+        for (id, row) in &kept {
+            if !walked.contains_key(id) {
+                assert_eq!(row.digest, 0, "digest of the emptied {id} after {after}");
+            }
+        }
     }
 
     fn engine() -> (Engine, CollectionMeta, tempfile::TempDir) {
@@ -832,6 +967,210 @@ mod tests {
         assert_eq!(engine.count_by_id(coll_id).unwrap(), Some(0));
     }
 
+    #[test]
+    fn a_bare_tombstone_raises_bare_max_and_a_live_write_does_not() {
+        let (engine, coll, _dir) = engine();
+        engine.insert(&coll, doc! { "_id": "live" }).unwrap();
+        let kept = |engine: &Engine| {
+            let db = engine.db();
+            let txn = db.begin_read().unwrap();
+            let rows = txn.open_table(tables::LIVE_DIGESTS).unwrap();
+            crate::live_digest::kept_row(&rows, coll.id.0).unwrap().expect("a row")
+        };
+        assert!(kept(&engine).bare_max.is_empty(), "a live write is no bare tombstone");
+
+        // A tombstone with no entry behind it, as a snapshot page leaves one.
+        let stamp = Stamp::new(Hlc::new(crate::physical_now_ms() + 50_000, 0), NodeId::generate());
+        let key = crate::docs::doc_key(&id("gone")).unwrap();
+        {
+            let txn = engine.begin_write(crate::engine::WriterHolder::Write).unwrap();
+            let mut docs = txn.open_table(tables::DOCS).unwrap();
+            put_bare_tombstone(
+                &txn,
+                &mut docs,
+                coll.id.0,
+                &key,
+                &codec::encode_doc_record(&kimmy_core::DocRecord::tombstone(stamp)),
+            )
+            .unwrap();
+            drop(docs);
+            txn.commit().unwrap();
+        }
+        let row = kept(&engine);
+        assert_eq!(row.bare_max.get(&stamp.node), Some(&stamp.hlc));
+        assert_eq!(
+            row.maxw.get(&stamp.node),
+            Some(&stamp.hlc),
+            "a tombstone's stamp is a record stamp"
+        );
+        assert_digests_exact(&engine, "a bare tombstone");
+
+        // Removing a tombstone (retention) does not lower either.
+        let later = Stamp::new(Hlc::new(stamp.hlc.wall_ms + 1, 0), stamp.node);
+        {
+            let txn = engine.begin_write(crate::engine::WriterHolder::Write).unwrap();
+            let mut docs = txn.open_table(tables::DOCS).unwrap();
+            put_record(
+                &txn,
+                &mut docs,
+                coll.id.0,
+                &key,
+                &codec::encode_doc_record(&kimmy_core::DocRecord::tombstone(later)),
+            )
+            .unwrap();
+            assert!(remove_record(&txn, &mut docs, coll.id.0, &key).unwrap());
+            drop(docs);
+            txn.commit().unwrap();
+        }
+        let row = kept(&engine);
+        assert_eq!(row.maxw.get(&stamp.node), Some(&later.hlc), "maxw never falls");
+    }
+
+    #[test]
+    fn a_collection_created_again_under_the_same_id_starts_with_no_digest_row() {
+        let (engine, coll, _dir) = engine();
+        engine.insert(&coll, doc! { "_id": "a" }).unwrap();
+        engine.delete(&coll, &id("a")).unwrap();
+        let row_of = |engine: &Engine| {
+            let db = engine.db();
+            let txn = db.begin_read().unwrap();
+            let rows = txn.open_table(tables::LIVE_DIGESTS).unwrap();
+            crate::live_digest::kept_row(&rows, coll.id.0).unwrap()
+        };
+        assert!(row_of(&engine).is_some_and(|r| !r.maxw.is_empty()));
+        // Dropped, its records removed, and created again under the same name.
+        engine.drop_collection("app", "docs").unwrap();
+        engine.purge_dropped_collection(coll.id).unwrap();
+        let again = engine.create_collection("app", "docs").unwrap();
+        assert_eq!(again.id, coll.id, "the id derives from the name");
+        assert_eq!(row_of(&engine), None, "the old incarnation's stamps are gone");
+    }
+
+    #[test]
+    fn a_stale_digest_mark_alone_rebuilds_both_and_a_matching_pair_does_not_walk() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("kimmy.redb");
+        let (coll_id, truth) = {
+            let engine = Engine::open(&path).unwrap();
+            let coll = engine.create_collection("app", "docs").unwrap();
+            engine.insert(&coll, doc! { "_id": "one" }).unwrap();
+            engine.insert(&coll, doc! { "_id": "two" }).unwrap();
+            let db = engine.db();
+            let txn = db.begin_read().unwrap();
+            let rows = txn.open_table(tables::LIVE_DIGESTS).unwrap();
+            let truth = crate::live_digest::kept_row(&rows, coll.id.0).unwrap().unwrap();
+            (coll.id, truth)
+        };
+        // Both marks match: a row altered behind them survives the start,
+        // which could not be if the start had walked.
+        {
+            let engine = Engine::open(&path).unwrap();
+            let db = engine.db();
+            let txn = db.begin_write().unwrap();
+            let mut forged = truth.clone();
+            forged.digest ^= 0xdead;
+            txn.open_table(tables::LIVE_DIGESTS)
+                .unwrap()
+                .insert(coll_id.0, forged.encode().as_slice())
+                .unwrap();
+            txn.commit().unwrap();
+        }
+        {
+            let engine = Engine::open(&path).unwrap();
+            let db = engine.db();
+            let txn = db.begin_read().unwrap();
+            let rows = txn.open_table(tables::LIVE_DIGESTS).unwrap();
+            let kept = crate::live_digest::kept_row(&rows, coll_id.0).unwrap().unwrap();
+            assert_eq!(
+                kept.digest,
+                truth.digest ^ 0xdead,
+                "a start with both marks matching walked"
+            );
+        }
+        // The digest mark alone missing: the counts are exact, and a walk
+        // happens all the same, for the digests.
+        {
+            let engine = Engine::open(&path).unwrap();
+            let db = engine.db();
+            let txn = db.begin_write().unwrap();
+            txn.open_table(tables::LIVE_DIGESTS_THROUGH)
+                .unwrap()
+                .remove(crate::live_digest::THROUGH)
+                .unwrap()
+                .expect("premise: a mark");
+            txn.commit().unwrap();
+        }
+        let engine = Engine::open(&path).unwrap();
+        assert_counts_exact(&engine, "an open with only the digest mark missing");
+        let db = engine.db();
+        let txn = db.begin_read().unwrap();
+        let rows = txn.open_table(tables::LIVE_DIGESTS).unwrap();
+        assert_eq!(crate::live_digest::kept_row(&rows, coll_id.0).unwrap().unwrap(), truth);
+    }
+
+    #[test]
+    fn a_digest_mark_from_another_format_is_not_trusted() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("kimmy.redb");
+        {
+            let engine = Engine::open(&path).unwrap();
+            let coll = engine.create_collection("app", "docs").unwrap();
+            engine.insert(&coll, doc! { "_id": "one" }).unwrap();
+            let db = engine.db();
+            let txn = db.begin_write().unwrap();
+            let mut through = txn.open_table(tables::LIVE_DIGESTS_THROUGH).unwrap();
+            let mut mark = through
+                .get(crate::live_digest::THROUGH)
+                .unwrap()
+                .map(|m| m.value().to_vec())
+                .expect("premise: a mark");
+            mark[0] = crate::live_digest::FORMAT + 1;
+            through.insert(crate::live_digest::THROUGH, mark.as_slice()).unwrap();
+            drop(through);
+            txn.open_table(tables::LIVE_DIGESTS).unwrap().retain(|_, _| false).unwrap();
+            txn.commit().unwrap();
+        }
+        let engine = Engine::open(&path).unwrap();
+        assert_digests_exact(&engine, "an open under a mark of another digest format");
+    }
+
+    #[test]
+    fn retention_and_a_rewind_carry_the_digest_mark_with_the_counts() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("kimmy.redb");
+        let (coll_id, forged) = {
+            let engine = Engine::open(&path).unwrap();
+            let coll = engine.create_collection("app", "docs").unwrap();
+            engine.insert(&coll, doc! { "_id": "kept" }).unwrap();
+            let until = engine.version_vector().unwrap().iter().map(|(_, h)| h).max().unwrap();
+            std::thread::sleep(std::time::Duration::from_millis(5));
+            engine.insert(&coll, doc! { "_id": "undone" }).unwrap();
+            engine.rewind_to(until).unwrap();
+            assert_digests_exact(&engine, "a rewind");
+            // A row altered behind the marks survives a start only if the
+            // start did not walk, which is only so if the rewind carried the
+            // digest mark as it carried the counts'.
+            let db = engine.db();
+            let txn = db.begin_write().unwrap();
+            let mut rows = txn.open_table(tables::LIVE_DIGESTS).unwrap();
+            let mut row = crate::live_digest::kept_row(&rows, coll.id.0).unwrap().unwrap();
+            row.digest ^= 0xbeef;
+            rows.insert(coll.id.0, row.encode().as_slice()).unwrap();
+            drop(rows);
+            txn.commit().unwrap();
+            (coll.id, row)
+        };
+        let engine = Engine::open(&path).unwrap();
+        let db = engine.db();
+        let txn = db.begin_read().unwrap();
+        let rows = txn.open_table(tables::LIVE_DIGESTS).unwrap();
+        assert_eq!(
+            crate::live_digest::kept_row(&rows, coll_id.0).unwrap().unwrap(),
+            forged,
+            "the start after a rewind walked the store to rebuild digests that were exact"
+        );
+    }
+
     /// Every `DOCS` row, key and value, as bytes.
     fn docs_rows(path: &std::path::Path) -> Vec<(u64, Vec<u8>, Vec<u8>)> {
         let db = redb::Database::open(path).unwrap();
@@ -978,10 +1317,32 @@ mod tests {
                 continue;
             }
             let body = std::fs::read_to_string(&path).unwrap();
+            // Whatever name the table is opened under: `let mut <name> =
+            // ...open_table(...tables::DOCS)`, so a write through a variable
+            // not called `docs` is caught as well (B3 design 2.2).
+            let mut names = vec!["docs".to_string()];
+            for line in body.lines() {
+                if line.contains("open_table")
+                    && line.contains("tables::DOCS")
+                    && let Some(rest) = line.trim_start().strip_prefix("let mut ")
+                    && let Some(name) = rest.split([' ', ':']).next()
+                    && !names.iter().any(|n| n == name)
+                {
+                    names.push(name.to_string());
+                }
+            }
             for (n, line) in body.lines().enumerate() {
                 // `docs.retain` matches `retain_in` too. The rest are every
                 // other method redb's `Table` offers that removes or replaces a
                 // row.
+                if names.iter().any(|name| {
+                    [".insert(", ".remove(", ".retain", ".pop_", ".drain", ".extract"]
+                        .iter()
+                        .any(|w| line.contains(&format!("{name}{w}")))
+                }) {
+                    offenders.push(format!("{name}:{}: {}", n + 1, line.trim()));
+                    continue;
+                }
                 if [
                     "docs.insert(",
                     "docs.remove(",
@@ -1001,6 +1362,23 @@ mod tests {
             offenders.is_empty(),
             "these write DOCS without moving the live count, which then drifts:\n  {}",
             offenders.join("\n  ")
+        );
+    }
+
+    /// A name dropped and created again derives the same id, so creating a
+    /// collection resets its digest row (B3 design 2.1): the hook is a line in
+    /// the creation path, and a refactor that drops it is caught here.
+    #[test]
+    fn creating_a_collection_resets_its_digest_row_in_the_creation_path() {
+        let src = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/engine.rs");
+        let body = std::fs::read_to_string(src).unwrap();
+        let insert = body
+            .find("collections.insert((db, name), serde_json::to_vec(&meta)?.as_slice())?;")
+            .expect("the creation path inserts the collection's row");
+        let after = &body[insert..insert + 600];
+        assert!(
+            after.contains("crate::live_digest::reset(txn, id)?;"),
+            "the creation path must reset the digest row right after it inserts the collection"
         );
     }
 

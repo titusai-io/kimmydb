@@ -1192,7 +1192,7 @@ impl Engine {
     ) -> Result<()> {
         let record = kimmy_core::DocRecord::tombstone(tombstone.stamp);
         let mut docs = txn.open_table(tables::DOCS)?;
-        crate::live_count::put_record(
+        crate::live_count::put_bare_tombstone(
             txn,
             &mut docs,
             collection.id.0,

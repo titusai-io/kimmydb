@@ -50,6 +50,29 @@ pub const LIVE_COUNTS: TableDefinition<u64, u64> = TableDefinition::new("live_co
 pub const LIVE_COUNTS_THROUGH: TableDefinition<&str, &[u8]> =
     TableDefinition::new("live_counts_through");
 
+/// `collection id -> the collection's cut-digest row` (B3, half 1): the XOR of
+/// `xxh3_128(key || stamp)` over its live records, and the highest record stamp
+/// per origin (`maxw`) and the highest bare-tombstone stamp per origin
+/// (`bare_max`). See [`crate::live_digest`].
+///
+/// Kept beside [`LIVE_COUNTS`], through the same chokepoint and in the same
+/// transaction as every write to [`DOCS`]. Node-local and absent from a backup;
+/// `Engine::open` rebuilds it, in the same walk as the counts, when
+/// [`LIVE_DIGESTS_THROUGH`] says it may be stale.
+pub const LIVE_DIGESTS: TableDefinition<u64, &[u8]> = TableDefinition::new("live_digests");
+
+/// The digest rows' own mark and the open walk's cursor (B3 design 2.1, 5).
+///
+/// `"arrival" -> [digest format] || where the digests are kept through`, the
+/// same bytes as [`LIVE_COUNTS_THROUGH`] holds under the same key, behind a
+/// format number: a build that changes what is hashed moves the mark. Its own,
+/// because a shared mark would let a build that keeps the counts and not the
+/// digests (0.47.2) keep it current. `"walk" -> the open walk's cursor`,
+/// kept here because this table, like [`LIVE_DIGESTS`], is derived and absent
+/// from a backup: a cursor must never outlive the records it was taken over.
+pub const LIVE_DIGESTS_THROUGH: TableDefinition<&str, &[u8]> =
+    TableDefinition::new("live_digests_through");
+
 /// `(collection_id, index_id, encoded key, encoded _id)`.
 pub type IndexKey<'a> = (u64, u32, &'a [u8], &'a [u8]);
 
