@@ -832,6 +832,89 @@ mod tests {
         assert_eq!(engine.count_by_id(coll_id).unwrap(), Some(0));
     }
 
+    /// Every `DOCS` row, key and value, as bytes.
+    fn docs_rows(path: &std::path::Path) -> Vec<(u64, Vec<u8>, Vec<u8>)> {
+        let db = redb::Database::open(path).unwrap();
+        let txn = db.begin_read().unwrap();
+        txn.open_table(tables::DOCS)
+            .unwrap()
+            .iter()
+            .unwrap()
+            .map(|row| {
+                let (key, value) = row.unwrap();
+                let (collection, doc_key) = key.value();
+                (collection, doc_key.to_vec(), value.value().to_vec())
+            })
+            .collect()
+    }
+
+    /// B3 design 8.9: the resume rule rests on an open never changing a
+    /// document record before it commits the counts mark, so that a missing
+    /// counts mark means no earlier build has served since a walk began.
+    /// The premise is read from the code (`DOCS` has one open-time writer,
+    /// `move_documents`, and only on a schema-1 store) and kept true here: an
+    /// open of a schema-current store that finds the mark missing, the counts
+    /// wrong, the arrival index's stamp half short and the vector unverified
+    /// repairs every one of them, leaves each `DOCS` row byte for byte as it
+    /// found it, and commits the mark.
+    #[test]
+    fn an_open_that_finds_every_derived_table_stale_leaves_the_records_alone_and_commits_the_mark()
+    {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("kimmy.redb");
+        let (orders, notes) = {
+            let engine = Engine::open(&path).unwrap();
+            let orders = engine.create_collection("app", "orders").unwrap();
+            let notes = engine.create_collection("app", "notes").unwrap();
+            for i in 0..6i64 {
+                engine.insert(&orders, doc! { "_id": i, "n": i }).unwrap();
+            }
+            engine.insert(&notes, doc! { "_id": "a" }).unwrap();
+            engine.delete(&orders, &DocId::Int64(2)).unwrap();
+            engine.delete(&orders, &DocId::Int64(5)).unwrap();
+            // What a first start of a build that keeps the counts finds, and
+            // what the open's other repairs find: the mark gone, a count
+            // wrong, one row of the arrival index's stamp half lost, the
+            // vector's verification record gone.
+            let db = engine.db();
+            let txn = db.begin_write().unwrap();
+            txn.open_table(tables::LIVE_COUNTS).unwrap().insert(orders.id.0, 1_000).unwrap();
+            txn.open_table(tables::LIVE_COUNTS_THROUGH).unwrap().remove(THROUGH).unwrap();
+            {
+                let mut by_stamp = txn.open_table(tables::OPLOG_ARRIVAL_SEQ).unwrap();
+                let first = by_stamp.first().unwrap().map(|(k, _)| k.value().to_vec()).unwrap();
+                by_stamp.remove(first.as_slice()).unwrap();
+            }
+            {
+                let mut verified = txn.open_table(tables::VECTOR_VERIFIED).unwrap();
+                verified.retain(|_, _| false).unwrap();
+            }
+            txn.commit().unwrap();
+            (orders.id, notes.id)
+        };
+        let before = docs_rows(&path);
+        assert!(!before.is_empty());
+
+        let engine = crate::verified::test_support::forcing(|| Engine::open(&path).unwrap());
+        assert_counts_exact(&engine, "an open that found every derived table stale");
+        assert_eq!(engine.count_by_id(orders).unwrap(), Some(4));
+        assert_eq!(engine.count_by_id(notes).unwrap(), Some(1));
+        let db = engine.db();
+        let txn = db.begin_read().unwrap();
+        assert!(
+            counts_are_current(&txn).unwrap(),
+            "the open committed the counts mark before it returned"
+        );
+        drop(txn);
+        drop(engine);
+
+        assert_eq!(
+            docs_rows(&path),
+            before,
+            "an open changed a document record ahead of the counts mark"
+        );
+    }
+
     #[test]
     fn a_clean_start_trusts_the_counts_and_does_not_walk() {
         // The mark is what spares an ordinary start the walk. Proven the only
