@@ -1091,6 +1091,34 @@ pub(crate) mod definition_hooks {
     }
 }
 
+/// What an open is asked beyond a path: a builder, so that the opens that need
+/// nothing extra (a hundred test call sites among them) are untouched.
+#[derive(Clone, Debug, Default)]
+pub struct OpenOptions {
+    cache_bytes: Option<usize>,
+    force_rebuild: Option<&'static str>,
+}
+
+impl OpenOptions {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// A bound on redb's page cache, as [`Engine::open_with_cache`] takes.
+    pub fn cache_bytes(mut self, bytes: usize) -> Self {
+        self.cache_bytes = Some(bytes);
+        self
+    }
+
+    /// Rebuild the live counts and the digests whatever their marks say,
+    /// because the start cannot show the previous run left them current. The
+    /// reason is logged with the rebuild.
+    pub fn force_rebuild(mut self, why: &'static str) -> Self {
+        self.force_rebuild = Some(why);
+        self
+    }
+}
+
 impl Engine {
     /// Open or create the database at `path`.
     ///
@@ -1126,11 +1154,30 @@ impl Engine {
         Self::open_cleared(path, cache_bytes, cleared)
     }
 
+    /// Open as [`Self::open_with_cache`] does, with what else the caller asks
+    /// of this open (B3 design 2.1).
+    pub fn open_with(path: &Path, options: &OpenOptions) -> Result<Self> {
+        let cleared =
+            crate::format::check_before_open_with(path, &crate::format::BuildVersions::ours())?;
+        Self::open_cleared_forced(path, options.cache_bytes, cleared, options.force_rebuild)
+    }
+
     /// The read-write open, which only a [`crate::format::Cleared`] reaches.
     pub(crate) fn open_cleared(
         path: &Path,
         cache_bytes: Option<usize>,
         cleared: crate::format::Cleared,
+    ) -> Result<Self> {
+        Self::open_cleared_forced(path, cache_bytes, cleared, None)
+    }
+
+    /// [`Self::open_cleared`], with the live counts and the digests rebuilt
+    /// whatever their marks say if `force_rebuild` names a reason.
+    pub(crate) fn open_cleared_forced(
+        path: &Path,
+        cache_bytes: Option<usize>,
+        cleared: crate::format::Cleared,
+        force_rebuild: Option<&'static str>,
     ) -> Result<Self> {
         // Through a backend that meters what it is asked for, so a hold can
         // say how much of it was the disk (ADR-176). Opened exactly as
@@ -1299,6 +1346,12 @@ impl Engine {
             let _ = txn.open_table(tables::LIVE_COUNTS_THROUGH)?;
             let _ = txn.open_table(tables::LIVE_DIGESTS)?;
             let _ = txn.open_table(tables::LIVE_DIGESTS_THROUGH)?;
+            // The first write of a start that decided the rebuild is forced:
+            // from here the store says "rebuild required" whatever any exit
+            // marker says (B3 design 2.1, layer 2).
+            if force_rebuild.is_some() {
+                crate::live_walk::force_marks_deleted(&txn)?;
+            }
             // Created with the others, so reading the record never meets a
             // missing table (`crate::verified`).
             let _ = txn.open_table(tables::VECTOR_VERIFIED)?;
@@ -1343,29 +1396,9 @@ impl Engine {
         }
         // After the arrival index, whose end the counts' mark is compared
         // against: a repaired index appends positions, and the counts are
-        // rebuilt with it (ADR-174).
-        {
-            let started = std::time::Instant::now();
-            crate::open_progress::set_open_phase(crate::open_progress::OpenPhase::Counting);
-            let txn = db.begin_write()?;
-            match crate::live_count::rebuild_if_stale(&txn)? {
-                Some(rebuilt) => {
-                    txn.commit()?;
-                    // Before the node serves anything: this function has not
-                    // returned. On a large store with a cold page cache the
-                    // walk runs at the disk's speed.
-                    info!(
-                        collections = rebuilt.collections,
-                        records = rebuilt.records,
-                        elapsed_ms = started.elapsed().as_millis() as u64,
-                        previous_mark = ?rebuilt.previous_mark,
-                        arrival = rebuilt.arrival,
-                        "rebuilt the live document counts before serving"
-                    );
-                }
-                None => txn.abort()?,
-            }
-        }
+        // rebuilt with it (ADR-174). One walk rebuilds the counts and the
+        // digests, in chunks that commit and honour a stop (B3).
+        crate::live_walk::run(&db, force_rebuild)?;
 
         // Nothing but a cfg set by hand stands between the benchmark control
         // and a person, which is not enough. Such a build keeps no live

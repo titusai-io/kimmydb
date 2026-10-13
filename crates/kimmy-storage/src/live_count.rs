@@ -25,7 +25,7 @@
 //! record still takes the count back with it.
 //!
 //! **Rebuilt when it may be stale.** `Engine::open` walks every record's header
-//! and rewrites the table unless [`tables::LIVE_COUNTS_THROUGH`] still matches
+//! (`live_walk`, which rebuilds the digests with it) and rewrites the table unless [`tables::LIVE_COUNTS_THROUGH`] still matches
 //! the store: the arrival index's next position and the oplog's newest key
 //! ([`mark_of`]). The mark is written by any transaction that appended, at its
 //! commit, by a build that keeps the count, and carried forward by a rewind and
@@ -38,7 +38,6 @@ use std::cell::Cell;
 use std::collections::BTreeMap;
 
 use redb::{ReadableTable, Table, WriteTransaction};
-use tracing::warn;
 
 use crate::codec;
 use crate::engine::WriteTxn;
@@ -258,7 +257,7 @@ pub(crate) fn remove_record(
 ///
 /// Called by `WriteTxn::commit` and nowhere else. The three commits that run
 /// before an engine exists (`Engine::open`, the migration, a restore) write
-/// through `rebuild_if_stale` or not at all.
+/// through `live_walk` or not at all.
 pub(crate) fn flush(txn: &WriteTransaction, pending: &Pending) -> Result<()> {
     // The control writes nothing at all (`--cfg kimmy_bench_no_live_counts`).
     if cfg!(kimmy_bench_no_live_counts) {
@@ -326,7 +325,7 @@ pub(crate) fn mark_of(
 }
 
 /// Whether the kept counts match the store, read without writing: the test
-/// [`rebuild_if_stale`] makes before it walks.
+/// [`crate::live_walk::run`] makes before it walks.
 ///
 /// For a reader that runs before `Engine::open` has rebuilt them — the schema
 /// 4 migration's announcement (ADR-183) — and must not trust a table a restore
@@ -382,107 +381,25 @@ pub(crate) fn carry_mark(txn: &WriteTxn<'_>, before: &[u8], after: &[u8]) -> Res
     Ok(())
 }
 
-/// Rebuild every count and every digest row from the records' headers, unless
-/// both marks say they were kept through the arrival index's current end.
-///
-/// One transaction, and one walk of the whole of `DOCS` for both, paid only
-/// when either mark is missing or behind: the first start of a build that
-/// keeps them, a restore, or a start after an older build wrote.
-///
-/// In `txn`, which the caller commits: `Engine::open`, which owns the database
-/// before there is an engine to count a commit against. `None` when nothing
-/// was stale and nothing was written.
-pub(crate) fn rebuild_if_stale(txn: &WriteTransaction) -> Result<Option<Rebuilt>> {
-    let mark = mark_of(&txn.open_table(tables::OPLOG_ARRIVAL)?, &txn.open_table(tables::OPLOG)?)?;
-    let through = open_through(txn)?.get(THROUGH)?.map(|m| m.value().to_vec());
-    let digests_current =
-        crate::live_digest::mark_matches(&txn.open_table(tables::LIVE_DIGESTS_THROUGH)?, &mark)?;
-    if through.as_deref() == Some(mark.as_slice()) && digests_current {
-        return Ok(None);
-    }
-
-    let mut counts: BTreeMap<u64, u64> = BTreeMap::new();
-    let mut digests: BTreeMap<u64, crate::live_digest::DigestRow> = BTreeMap::new();
-    let mut records = 0usize;
-    {
-        let docs = txn.open_table(tables::DOCS)?;
-        for row in docs.iter()? {
-            let (key, value) = row?;
-            records += 1;
-            match codec::doc_record_header(value.value()) {
-                Ok((stamp, live)) => {
-                    let (collection, doc_key) = key.value();
-                    if live {
-                        *counts.entry(collection).or_default() += 1;
-                    }
-                    crate::live_digest::fold_walked(
-                        &mut digests,
-                        collection,
-                        doc_key,
-                        &stamp,
-                        live,
-                    );
-                }
-                // Not counted, as no reader can return it either; refusing to
-                // open over one unreadable record would be worse than a count
-                // one short.
-                Err(e) => warn!(error = %e, "unreadable document record not counted"),
-            }
-        }
-    }
-    {
-        let mut table = open_counts(txn)?;
-        table.retain(|_, _| false)?;
-        for (id, n) in &counts {
-            table.insert(*id, *n)?;
-        }
-    }
-    {
-        let mut table = txn.open_table(tables::LIVE_DIGESTS)?;
-        table.retain(|_, _| false)?;
-        for (id, row) in &digests {
-            table.insert(*id, row.encode().as_slice())?;
-        }
-    }
-    mark_through(txn, &mark)?;
-    crate::live_digest::mark_through(txn, &mark)?;
-    Ok(Some(Rebuilt {
-        collections: counts.len(),
-        records,
-        previous_mark: through.map(|m| decode_arrival(&m)),
-        arrival: decode_arrival(&mark),
-    }))
-}
-
 /// The arrival position a mark records, for the log.
-fn decode_arrival(mark: &[u8]) -> u64 {
+pub(crate) fn decode_arrival(mark: &[u8]) -> u64 {
     mark.get(..8).and_then(|b| b.try_into().ok()).map_or(0, u64::from_be_bytes)
 }
 
-/// What a rebuild did, for the line `Engine::open` logs once it commits.
-#[derive(Debug)]
-pub(crate) struct Rebuilt {
-    pub collections: usize,
-    pub records: usize,
-    pub previous_mark: Option<u64>,
-    pub arrival: u64,
-}
-
+/// Checks the tests of this module and of `live_walk` share.
 #[cfg(test)]
-mod tests {
-    use std::cmp::Ordering;
+pub(crate) mod test_support {
+    use std::collections::BTreeMap;
 
-    use bson::{Document, doc};
-    use kimmy_core::{DocId, Hlc, NodeId, OpKind, OplogEntry, Stamp};
-    use redb::ReadableDatabase;
+    use redb::{ReadableDatabase, ReadableTable};
 
-    use super::*;
-    use crate::meta::CollectionMeta;
-    use crate::{Candidates, Engine, ModifySpec};
+    use crate::Engine;
+    use crate::codec;
+    use crate::tables;
 
     /// Every kept count equals a walk of the records' headers, and no count is
     /// kept for a collection with no live record.
-    fn assert_counts_exact(engine: &Engine, after: &str) {
+    pub(crate) fn assert_counts_exact(engine: &Engine, after: &str) {
         let db = engine.db();
         let txn = db.begin_read().unwrap();
         let kept: BTreeMap<u64, u64> = txn
@@ -512,7 +429,7 @@ mod tests {
     /// never below the walk's, and the kept `bare_max` never exceeds what the
     /// walk would set (a rebuilt row sets it to the highest tombstone stamp per
     /// origin, the most it can be).
-    fn assert_digests_exact(engine: &Engine, after: &str) {
+    pub(crate) fn assert_digests_exact(engine: &Engine, after: &str) {
         let db = engine.db();
         let txn = db.begin_read().unwrap();
         let mut walked: BTreeMap<u64, crate::live_digest::DigestRow> = BTreeMap::new();
@@ -553,6 +470,20 @@ mod tests {
             }
         }
     }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::cmp::Ordering;
+
+    use bson::{Document, doc};
+    use kimmy_core::{DocId, Hlc, NodeId, OpKind, OplogEntry, Stamp};
+    use redb::ReadableDatabase;
+
+    use super::test_support::{assert_counts_exact, assert_digests_exact};
+    use super::*;
+    use crate::meta::CollectionMeta;
+    use crate::{Candidates, Engine, ModifySpec};
 
     fn engine() -> (Engine, CollectionMeta, tempfile::TempDir) {
         let dir = tempfile::tempdir().unwrap();

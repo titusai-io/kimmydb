@@ -803,7 +803,18 @@ async fn start_and_serve(
             }
         }
     }
-    let engine = match Engine::open_with_cache(&path, Some(config.storage.cache_bytes as usize)) {
+    // The live counts and the digests are rebuilt, whatever their marks say,
+    // unless the previous run is shown to have kept them current (B3 design
+    // 2.1): the marker cannot be trusted alone, so this only asks the open to
+    // delete the marks as its very first write, and the store carries the
+    // decision from there.
+    let mut options =
+        kimmy_storage::OpenOptions::new().cache_bytes(config.storage.cache_bytes as usize);
+    if lifecycle::digest_rebuild_forced(&previous) {
+        options =
+            options.force_rebuild("the previous run cannot be shown to have kept the digests");
+    }
+    let engine = match Engine::open_with(&path, &options) {
         Ok(engine) => {
             opened.store(true, std::sync::atomic::Ordering::SeqCst);
             let engine = Arc::new(engine);

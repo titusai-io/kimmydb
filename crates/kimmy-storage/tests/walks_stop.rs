@@ -227,7 +227,12 @@ const BOUNDED_READS: &[(&str, &str)] = &[
          build's own for a superseded definition's clear, which stops with the build",
     ),
     ("index::partial_filters_holding_an_array", "at open, a migration's check of the registry"),
-    ("live_count::rebuild_if_stale", "at open, before the node serves or has a stop to answer"),
+    (
+        "live_walk::run",
+        "at open, before the node serves: chunked, each chunk committed, and it looks for the \
+         stop itself every 256 rows and at each chunk boundary, ending at the cursor it \
+         committed (B3 design 5)",
+    ),
     ("migrate::derive_collection_ids", "a migration, at open, before the node serves"),
     ("migrate::derive_index_ids", "a migration, at open, before the node serves"),
     ("migrate::move_documents", "a migration, at open, before the node serves"),
