@@ -1548,10 +1548,7 @@ mod tests {
             engine.drop_collection("shop", "orders").unwrap();
             engine.finish_purges_now().unwrap();
         });
-        assert_eq!(
-            a.verify_digest_row(orders.id, ScanBudget::default()).unwrap(),
-            SelfCheck::Busy
-        );
+        assert_eq!(a.verify_digest_row(orders.id, ScanBudget::default()).unwrap(), SelfCheck::Busy);
         assert_eq!(a.digest_row(orders.id).unwrap(), None);
         assert_eq!(a.digest_drift_total(), 0);
     }

@@ -1045,6 +1045,98 @@ mod tests {
         assert_eq!(crate::live_digest::kept_row(&rows, coll_id.0).unwrap().unwrap(), truth);
     }
 
+    fn marks_of(engine: &Engine) -> (Option<Vec<u8>>, Option<Vec<u8>>) {
+        let db = engine.db();
+        let txn = db.begin_read().unwrap();
+        let counts = txn
+            .open_table(tables::LIVE_COUNTS_THROUGH)
+            .unwrap()
+            .get(THROUGH)
+            .unwrap()
+            .map(|m| m.value().to_vec());
+        let digests = txn
+            .open_table(tables::LIVE_DIGESTS_THROUGH)
+            .unwrap()
+            .get(crate::live_digest::THROUGH)
+            .unwrap()
+            .map(|m| m.value().to_vec());
+        (counts, digests)
+    }
+
+    /// The format number is part of the mark: the digest mark is the number,
+    /// then exactly the counts' mark.
+    #[test]
+    fn the_digest_mark_is_the_format_number_then_the_counts_mark() {
+        let (engine, coll, _dir) = engine();
+        engine.insert(&coll, doc! { "_id": "one" }).unwrap();
+        let (counts, digests) = marks_of(&engine);
+        let (counts, digests) = (counts.expect("a counts mark"), digests.expect("a digest mark"));
+        assert_eq!(digests[0], crate::live_digest::FORMAT);
+        assert_eq!(&digests[1..], counts.as_slice());
+    }
+
+    /// `carry_mark` moves the digest mark only if it matched `before`: one
+    /// that did not says a build that does not keep the digests wrote since,
+    /// and moving it forward would hide that from the next open.
+    #[test]
+    fn the_digest_mark_is_carried_only_if_it_matched_before() {
+        let (engine, coll, _dir) = engine();
+        engine.insert(&coll, doc! { "_id": "one" }).unwrap();
+        let (before, _) = marks_of(&engine);
+        let before = before.unwrap();
+        let carry = |engine: &Engine| {
+            let txn = engine.begin_write(crate::engine::WriterHolder::Rewind).unwrap();
+            carry_mark(&txn, &before, b"after").unwrap();
+            txn.commit().unwrap();
+        };
+        let set_digest_mark = |engine: &Engine, mark: Option<&[u8]>| {
+            let db = engine.db();
+            let txn = db.begin_write().unwrap();
+            {
+                let mut through = txn.open_table(tables::LIVE_DIGESTS_THROUGH).unwrap();
+                match mark {
+                    Some(mark) => {
+                        through.insert(crate::live_digest::THROUGH, mark).unwrap();
+                    }
+                    None => {
+                        through.remove(crate::live_digest::THROUGH).unwrap();
+                    }
+                }
+            }
+            txn.commit().unwrap();
+        };
+
+        // A digest mark that is not the counts' mark: left alone.
+        let forged = crate::live_digest::mark_bytes(b"written behind our back");
+        set_digest_mark(&engine, Some(&forged));
+        carry(&engine);
+        assert_eq!(marks_of(&engine).1, Some(forged), "a mark that did not match moved");
+        // Absent: stays absent.
+        set_digest_mark(&engine, None);
+        let (counts_now, _) = marks_of(&engine);
+        assert_eq!(counts_now.as_deref(), Some(&b"after"[..]), "the counts mark carried");
+        // Matching: moves.
+        let (engine, coll, _dir) = self::engine();
+        engine.insert(&coll, doc! { "_id": "one" }).unwrap();
+        let (before_2, matching) = marks_of(&engine);
+        assert_eq!(matching, Some(crate::live_digest::mark_bytes(&before_2.clone().unwrap())));
+        {
+            let txn = engine.begin_write(crate::engine::WriterHolder::Rewind).unwrap();
+            carry_mark(&txn, &before_2.unwrap(), b"after").unwrap();
+            txn.commit().unwrap();
+        }
+        assert_eq!(marks_of(&engine).1, Some(crate::live_digest::mark_bytes(b"after")));
+        // And absent stays absent, on a mark that was absent from the start.
+        set_digest_mark(&engine, None);
+        let (counts_before, _) = marks_of(&engine);
+        {
+            let txn = engine.begin_write(crate::engine::WriterHolder::Rewind).unwrap();
+            carry_mark(&txn, &counts_before.unwrap(), b"later").unwrap();
+            txn.commit().unwrap();
+        }
+        assert_eq!(marks_of(&engine).1, None, "a missing digest mark was made");
+    }
+
     #[test]
     fn a_digest_mark_from_another_format_is_not_trusted() {
         let dir = tempfile::tempdir().unwrap();

@@ -26614,16 +26614,22 @@ restored with the other, `check-store` clean, opened by both.
    old `rebuild_if_stale` ignored a stop and ran in one transaction, so a SIGTERM during a long `counting`
    phase became a SIGKILL after the stop budget; that standing defect is fixed here.
 7. **Whether the start forces the rebuild** is read from the previous run's marker and made durable in the
-   store. The rebuild is forced unless the previous run is shown to have been a build that keeps the digests
-   (`DIGEST_KEEPING_FROM`, a numeric `major.minor.patch` compare; `0.9.0` is older than `0.48.0`). The marker
-   alone could not carry it: a start that ended before serving writes a marker naming itself, which laundered
-   the verdict it inherited, and `Earlier` is flat. `Earlier::of` reports exactly what it always did (ADR-190's
-   "repeated refusals must not bury the last run that ran"), and a separate optional field,
-   `unproven_since_served`, carries whether the stretch since the last run that served is unproven (an unclean
-   or unreadable end, or an older build that ran before `settle`, whose collector, purger and cluster tasks are
-   spawned before it and can change `DOCS`) through every run that never served. A 0.47.2 reader ignores the
-   field, and an older writer drops it but names its own older version at the top. The store's side of the
-   decision is item 6.
+   store, and **the decision persists until a fused rebuild completes**. The rebuild is forced unless the
+   previous run is shown to have left the rows current: the marker's own build is older than
+   `DIGEST_KEEPING_FROM` (a numeric `major.minor.patch` compare; `0.9.0` is older than `0.48.0`), or the marker
+   carries `unproven_since_served`, or there is no marker to read (a killed run, an unreadable marker). A run
+   that decided to force writes `unproven_since_served` (`unclean`, `unreadable` or `older build <version>`)
+   into its exit marker **unless its fused rebuild completed**, and a run that settled writes none: the marker
+   an exit writes is a function of what the start inherited, whether its rebuild completed, and whether it
+   served; the decision is a function of the marker. `Earlier::of` is unchanged, so the announce line reports
+   what it always did (ADR-190's "repeated refusals must not bury the last run that ran"), and the field is
+   a top-level key of the marker that a 0.47.2 reader ignores (an older writer drops it, and names its own
+   older version, which forces the rebuild). A start that decided to force and was stopped before its walk
+   began, or part way through it, forces again; one stopped after the walk completed and before `settle` does
+   not, since the completing commit wrote both marks. A model test runs every sequence of up to four runs from
+   the ten ways a run of 0.47.2 or 0.48 can end through the real marker code and checks that the next start
+   forces exactly when an older build ran or a run was killed since the last completed fused rebuild. The
+   store's side of the decision is item 6.
 
 **Why.** The count half cannot see a document updated on one member and never on the other. Walking a
 collection to compare by content costs every page on every contact, as the count's walk once did (ADR-174), so
@@ -26642,7 +26648,7 @@ for data from round 0510.
 collection costs a scan of the oplog tail; the duty cycle is bounded by the budget and the one-at-a-time rule
 (four members, the placeholders: up to nine scans of 200 ms per 5 s interval, 36% of one blocking thread,
 and only when every collection is busy). The first start of 0.48.0 and the start after a crash or kill of
-0.48.x walk `DOCS` once, as the live counts' walk always did, now in chunks. Cold, on a spinning disk, the tester
+0.48.x walk `DOCS` once, as the live counts' walk always did, now in chunks. A forced walk that is stopped before it completes is resumed by the next start from its cursor, and one that was killed restarts from zero, so on a cold store a stop-and-start pays part of the walk twice, and a kill pays all of it again; a walk that completed and was stopped before `settle` is not repeated. Cold, on a spinning disk, the tester
 measured about 10 MB/s over a 688 MB `OPLOG`, 26–28,000 rows/s; the heaviest 50,000-row chunk was 128.8 MiB
 against 17 MiB on average, so the chunk is cut on bytes and the stop is looked for every 256 rows (about 10 ms
 cold), which is what keeps a stop inside the stop budget, not the chunk size. Cold, the 200 ms of a tail scan

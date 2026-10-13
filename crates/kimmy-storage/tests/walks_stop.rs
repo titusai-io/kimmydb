@@ -108,7 +108,7 @@ const BOUNDED_READS: &[(&str, &str)] = &[
         "the index-drop registry: one row per index dropped within tombstone retention, collected on the same window as the oplog",
     ),
     (
-        "engine::Engine::state_held",
+        "engine::Engine::state_held_in",
         "the metadata keys of one prefix: one row per origin a snapshot raised the servable vector over, a few in a cluster, read per pull served",
     ),
     (
@@ -128,7 +128,7 @@ const BOUNDED_READS: &[(&str, &str)] = &[
         "inside a write scope, which holds the single writer: close_writes bounds it (ADR-192)",
     ),
     (
-        "engine::Engine::all_collections",
+        "engine::Engine::all_collections_in",
         "the collection registry: one row per collection, however many documents",
     ),
     (

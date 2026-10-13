@@ -5887,6 +5887,27 @@ mod tests {
         (a, da, b, db, cb, entries)
     }
 
+    /// A delete a snapshot page carries is recorded through
+    /// `put_bare_tombstone`, so the digest row knows no oplog entry stands
+    /// behind it: `bare_max` holds its stamp, and the row equals a walk.
+    #[test]
+    fn a_carried_delete_raises_the_bare_maximum_of_the_digest_row() {
+        let (a, _da, b, _db, cb, entries) = a_member_holding_a_bare_tombstone();
+        let delete = entries.iter().find(|e| e.kind == OpKind::Delete).unwrap();
+        let row = b.digest_row(cb.id).unwrap().expect("a row");
+        assert_eq!(
+            row.bare_max.get(&delete.stamp.node),
+            Some(&delete.stamp.hlc),
+            "the bare tombstone is not in bare_max: {row:?}"
+        );
+        crate::live_count::test_support::assert_digests_exact(&b, "a carried delete");
+        // The entry arriving later makes it a tombstone with an entry behind
+        // it; bare_max, which never falls, still holds the stamp.
+        b.apply_batch(&entries).unwrap();
+        crate::live_count::test_support::assert_digests_exact(&b, "the entry that came for it");
+        drop(a);
+    }
+
     fn index_entries(engine: &Engine) -> usize {
         let txn = engine.db().begin_read().unwrap();
         txn.open_table(tables::INDEX_ENTRIES).unwrap().iter().unwrap().count()

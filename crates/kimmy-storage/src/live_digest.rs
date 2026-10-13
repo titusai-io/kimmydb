@@ -195,7 +195,9 @@ impl Delta {
 
     fn moves_nothing(&self) -> bool {
         !self.forget_row
-            && self.xor == 0 && self.raised.maxw.is_empty() && self.raised.bare_max.is_empty()
+            && self.xor == 0
+            && self.raised.maxw.is_empty()
+            && self.raised.bare_max.is_empty()
     }
 }
 

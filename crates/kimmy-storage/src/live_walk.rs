@@ -59,6 +59,19 @@ pub(crate) const CHUNK_ROWS: u64 = 50_000;
 /// The stop is looked for every this many rows inside a chunk.
 pub(crate) const STOP_EVERY: u64 = 256;
 
+/// The stop is also looked for after this many bytes of rows since the last
+/// look, so a run of large records (the heaviest 50,000-row chunk measured was
+/// 128.8 MiB) cannot hold a stop up for 256 of them.
+pub(crate) const STOP_EVERY_BYTES: u64 = 8 * 1024 * 1024;
+
+// The production values are what the stop budget was measured against; a
+// change to one is a change to that measurement, and the integration test in
+// `tests/live_walk_stop.rs` runs with them.
+const _: () = assert!(CHUNK_BYTES == 64 * 1024 * 1024);
+const _: () = assert!(CHUNK_ROWS == 50_000);
+const _: () = assert!(STOP_EVERY == 256);
+const _: () = assert!(STOP_EVERY_BYTES == 8 * 1024 * 1024);
+
 /// What a walk did, for the line it logs.
 pub(crate) struct Rebuilt {
     pub collections: usize,
@@ -82,6 +95,16 @@ pub(crate) struct Cursor {
     pub after: Option<(u64, Vec<u8>)>,
     pub rows: u64,
     pub bytes: u64,
+    /// Distinct collections passed so far: DOCS is in collection order, so
+    /// they are the changes of collection along the walk, which a resumed
+    /// walk carries on from.
+    pub collections: u64,
+}
+
+/// The build a cursor was taken by: the version and the commit, so two builds
+/// of one version number do not share a walk.
+fn build_id() -> String {
+    format!("{}+{}", kimmy_core::build::VERSION, kimmy_core::build::COMMIT)
 }
 
 impl Cursor {
@@ -105,6 +128,7 @@ impl Cursor {
         }
         out.extend_from_slice(&self.rows.to_be_bytes());
         out.extend_from_slice(&self.bytes.to_be_bytes());
+        out.extend_from_slice(&self.collections.to_be_bytes());
         out
     }
 
@@ -138,6 +162,7 @@ impl Cursor {
         };
         let rows = u64::from_be_bytes(take(&mut input, 8)?.try_into().ok()?);
         let bytes = u64::from_be_bytes(take(&mut input, 8)?.try_into().ok()?);
+        let collections = u64::from_be_bytes(take(&mut input, 8)?.try_into().ok()?);
         input.is_empty().then_some(Self {
             build,
             schema,
@@ -146,14 +171,13 @@ impl Cursor {
             after,
             rows,
             bytes,
+            collections,
         })
     }
 
     /// Whether this build may resume what the cursor describes.
     fn is_ours(&self, schema: u8) -> bool {
-        self.build == kimmy_core::build::VERSION
-            && self.schema == schema
-            && self.format == live_digest::FORMAT
+        self.build == build_id() && self.schema == schema && self.format == live_digest::FORMAT
     }
 }
 
@@ -209,6 +233,9 @@ pub(crate) fn run(db: &Database, forced: Option<&'static str>) -> Result<Option<
         )
     };
 
+    // As the open always has: the phase is `counting` from here, and a store
+    // with nothing stale leaves it at once.
+    crate::open_progress::set_open_phase_of(crate::open_progress::OpenPhase::Counting, total);
     if counts_current && digests_current && forced.is_none() {
         // Nothing stale. A cursor left beside two current marks is a leftover
         // (the completing commit deletes it), and is removed so that it can
@@ -235,22 +262,22 @@ pub(crate) fn run(db: &Database, forced: Option<&'static str>) -> Result<Option<
         (false, None) => "a mark was missing or behind",
     };
 
-    crate::open_progress::set_open_phase_of(crate::open_progress::OpenPhase::Counting, total);
     let mut cursor = match resumed_from {
         Some(cursor) => Cursor { stopped_cleanly: false, ..cursor },
         None => Cursor {
-            build: kimmy_core::build::VERSION.to_string(),
+            build: build_id(),
             schema,
             format: live_digest::FORMAT,
             stopped_cleanly: false,
             after: None,
             rows: 0,
             bytes: 0,
+            collections: 0,
         },
     };
     crate::open_progress::set_open_done(cursor.rows);
     let mut chunks = 0u32;
-    let mut touched = std::collections::BTreeSet::new();
+    let mut last_collection = cursor.after.as_ref().map(|(collection, _)| *collection);
 
     loop {
         let txn = db.begin_write()?;
@@ -267,6 +294,7 @@ pub(crate) fn run(db: &Database, forced: Option<&'static str>) -> Result<Option<
         let mut counts: BTreeMap<u64, u64> = BTreeMap::new();
         let mut digests: BTreeMap<u64, DigestRow> = BTreeMap::new();
         let (mut chunk_rows, mut chunk_bytes) = (0u64, 0u64);
+        let mut since_look = 0u64;
         let mut last = cursor.after.clone();
         let mut finished = true;
         let mut stopped = false;
@@ -280,16 +308,25 @@ pub(crate) fn run(db: &Database, forced: Option<&'static str>) -> Result<Option<
                 None => docs.range::<(u64, &[u8])>(..)?,
             };
             for row in range {
-                if chunk_rows % stop_every() == 0 && stop_requested(cursor.rows + chunk_rows) {
-                    stopped = true;
-                    finished = false;
-                    break;
+                if chunk_rows % stop_every() == 0 || since_look >= stop_every_bytes() {
+                    since_look = 0;
+                    if stop_requested(cursor.rows + chunk_rows) {
+                        stopped = true;
+                        finished = false;
+                        break;
+                    }
                 }
                 let (key, value) = row?;
                 let (collection, doc_key) = key.value();
                 let value = value.value();
                 chunk_rows += 1;
-                chunk_bytes += (doc_key.len() + value.len()) as u64;
+                let row_bytes = (doc_key.len() + value.len()) as u64;
+                chunk_bytes += row_bytes;
+                since_look += row_bytes;
+                if last_collection != Some(collection) {
+                    last_collection = Some(collection);
+                    cursor.collections += 1;
+                }
                 match codec::doc_record_header(value) {
                     Ok((stamp, live)) => {
                         if live {
@@ -336,8 +373,6 @@ pub(crate) fn run(db: &Database, forced: Option<&'static str>) -> Result<Option<
                 table.insert(*id, row.encode().as_slice())?;
             }
         }
-        touched.extend(counts.keys().chain(digests.keys()).copied());
-
         cursor.after = last;
         cursor.rows += chunk_rows;
         cursor.bytes += chunk_bytes;
@@ -360,6 +395,16 @@ pub(crate) fn run(db: &Database, forced: Option<&'static str>) -> Result<Option<
         crate::open_progress::set_open_done(cursor.rows);
 
         if stopped {
+            info!(
+                records = cursor.rows,
+                bytes = cursor.bytes,
+                chunks,
+                collections = cursor.collections,
+                elapsed_ms = started.elapsed().as_millis() as u64,
+                resumed,
+                why,
+                "stopped the rebuild of the live document counts; the next start resumes it"
+            );
             return Err(StorageError::Stopping(StopReason::Shutdown));
         }
         if finished {
@@ -372,7 +417,7 @@ pub(crate) fn run(db: &Database, forced: Option<&'static str>) -> Result<Option<
     }
 
     let rebuilt = Rebuilt {
-        collections: touched.len(),
+        collections: cursor.collections as usize,
         records: cursor.rows,
         bytes: cursor.bytes,
         chunks,
@@ -411,9 +456,19 @@ fn stop_requested(rows_so_far: u64) -> bool {
 /// be placed at an exact row; [`STOP_EVERY`] otherwise.
 fn stop_every() -> u64 {
     #[cfg(test)]
-    return 1;
+    return test_hooks::STOP_ROWS.with(std::cell::Cell::get).unwrap_or(1);
     #[cfg(not(test))]
     STOP_EVERY
+}
+
+/// How many bytes of rows between looks for the stop: [`STOP_EVERY_BYTES`]
+/// except where a test places it.
+fn stop_every_bytes() -> u64 {
+    #[cfg(test)]
+    if let Some(bytes) = test_hooks::STOP_BYTES.with(std::cell::Cell::get) {
+        return bytes;
+    }
+    STOP_EVERY_BYTES
 }
 
 fn chunk_bytes_limit() -> u64 {
@@ -440,6 +495,11 @@ pub(crate) mod test_hooks {
         /// Commit a chunk at this many rows, on this thread.
         pub(crate) static CHUNK_ROWS: Cell<Option<u64>> = const { Cell::new(None) };
         pub(crate) static CHUNK_BYTES: Cell<Option<u64>> = const { Cell::new(None) };
+        /// Look for the stop every this many rows and no oftener (the rows
+        /// trigger otherwise looks at every row under test), on this thread.
+        pub(crate) static STOP_ROWS: Cell<Option<u64>> = const { Cell::new(None) };
+        /// Look for the stop after this many bytes of rows, on this thread.
+        pub(crate) static STOP_BYTES: Cell<Option<u64>> = const { Cell::new(None) };
         /// Report a stop once this many rows have been processed in all, on
         /// this thread.
         static STOP_AFTER_ROWS: Cell<Option<u64>> = const { Cell::new(None) };
@@ -451,6 +511,8 @@ pub(crate) mod test_hooks {
         static FAIL_BEFORE_THE_WALK: Cell<bool> = const { Cell::new(false) };
         /// What the last walk on this thread did: `(resumed, chunks, records)`.
         static LAST: Cell<Option<(bool, u32, u64)>> = const { Cell::new(None) };
+        /// How many collections the last walk on this thread reported.
+        static LAST_COLLECTIONS: Cell<Option<usize>> = const { Cell::new(None) };
     }
 
     pub(crate) fn fail_before_the_walk() {
@@ -463,6 +525,12 @@ pub(crate) mod test_hooks {
 
     pub(crate) fn record(rebuilt: &super::Rebuilt) {
         LAST.with(|c| c.set(Some((rebuilt.resumed, rebuilt.chunks, rebuilt.records))));
+        LAST_COLLECTIONS.with(|c| c.set(Some(rebuilt.collections)));
+    }
+
+    /// The collections the last walk on this thread reported, taken.
+    pub(crate) fn last_collections() -> Option<usize> {
+        LAST_COLLECTIONS.with(Cell::take)
     }
 
     /// `(resumed, chunks, records)` of the last walk on this thread, taken.
@@ -608,6 +676,64 @@ mod tests {
         assert_eq!(cursor_of(&path), None);
     }
 
+    /// A walk that stopped part way and was resumed reports every collection
+    /// it passed once, the ones before the stop and the ones after, and a
+    /// collection split across the stop is not counted twice.
+    #[test]
+    fn a_resumed_walk_reports_every_collection_once() {
+        let (_dir, path) = a_store();
+        lose_the_marks(&path);
+        test_hooks::chunked_by(4, || {
+            test_hooks::stop_after_rows(6);
+            assert!(stopped(Engine::open(&path)));
+            test_hooks::clear_stop();
+        });
+        assert_eq!(
+            cursor_of(&path).unwrap().collections,
+            1,
+            "the stop is inside the first: 7 rows"
+        );
+        test_hooks::chunked_by(4, || {
+            let _engine = Engine::open(&path).unwrap();
+            assert_eq!(test_hooks::last_collections(), Some(COLLECTIONS.len()));
+        });
+    }
+
+    /// The stop is looked for after a number of bytes as well as a number of
+    /// rows: with the rows trigger out of reach, a stop asked for lands within
+    /// the bytes window and not at the chunk's end.
+    #[test]
+    fn a_stop_is_looked_for_by_bytes_as_well_as_by_rows() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("kimmy.redb");
+        {
+            let engine = Engine::open(&path).unwrap();
+            let coll = engine.create_collection("app", "big").unwrap();
+            let body = "x".repeat(1024);
+            engine
+                .insert_many(
+                    &coll,
+                    (0..600i64).map(|i| doc! { "_id": i, "body": body.as_str() }).collect(),
+                )
+                .unwrap();
+        }
+        lose_the_marks(&path);
+        test_hooks::STOP_ROWS.with(|c| c.set(Some(1_000_000)));
+        test_hooks::STOP_BYTES.with(|c| c.set(Some(16 * 1024)));
+        test_hooks::stop_after_rows(100);
+        assert!(stopped(Engine::open(&path)));
+        test_hooks::STOP_ROWS.with(|c| c.set(None));
+        test_hooks::STOP_BYTES.with(|c| c.set(None));
+        test_hooks::clear_stop();
+        let cursor = cursor_of(&path).expect("a cursor");
+        assert!(cursor.stopped_cleanly);
+        assert!(
+            (100..100 + 40).contains(&cursor.rows),
+            "the stop landed at row {}, not within the bytes window after row 100",
+            cursor.rows
+        );
+    }
+
     #[test]
     fn a_crash_mid_walk_restarts_from_zero() {
         let (_dir, path) = a_store();
@@ -686,7 +812,7 @@ mod tests {
 
     #[test]
     fn a_cursor_from_another_build_schema_or_format_is_discarded() {
-        for tamper in ["build", "schema", "format"] {
+        for tamper in ["build", "commit", "schema", "format"] {
             let (_dir, path) = a_store();
             lose_the_marks(&path);
             test_hooks::chunked_by(4, || {
@@ -698,6 +824,10 @@ mod tests {
                 let mut cursor = cursor_of(&path).unwrap();
                 match tamper {
                     "build" => cursor.build = "0.0.1".into(),
+                    // The same version number, another commit.
+                    "commit" => {
+                        cursor.build = format!("{}+another-commit", kimmy_core::build::VERSION)
+                    }
                     "schema" => cursor.schema = cursor.schema.wrapping_add(1),
                     _ => cursor.format = cursor.format.wrapping_add(1),
                 }
@@ -880,6 +1010,7 @@ mod tests {
             after: Some((7, b"key".to_vec())),
             rows: 12,
             bytes: 3_400,
+            collections: 3,
         };
         assert_eq!(Cursor::decode(&cursor.encode()), Some(cursor.clone()));
         let none = Cursor { after: None, ..cursor.clone() };
