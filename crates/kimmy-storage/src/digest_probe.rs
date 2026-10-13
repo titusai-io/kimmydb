@@ -776,7 +776,7 @@ impl Engine {
     /// exists to find).
     #[cfg(any(test, feature = "test-hooks"))]
     pub fn corrupt_digest_row_for_test(&self, collection: CollectionId, by: u128) -> Result<()> {
-        let txn = self.db().begin_write()?;
+        let txn = self.begin_write(crate::engine::WriterHolder::Write)?;
         {
             let mut rows = txn.open_table(tables::LIVE_DIGESTS)?;
             let mut row = live_digest::kept_row(&rows, collection.0)?.unwrap_or_default();
