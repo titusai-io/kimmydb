@@ -9245,4 +9245,67 @@ mod partial_windows_never_skip {
             prop_assert!(result.is_ok(), "{}", result.unwrap_err());
         }
     }
+
+    /// B3, the mixed roll over the wire: a peer that answers a digest request
+    /// with no digests is `Unanswered` and never compared; one that says it is
+    /// already answering one is `Busy`, which is not the same thing; and a peer
+    /// not yet known to answer digests is asked with the cut alone.
+    #[tokio::test]
+    async fn a_peer_that_answers_no_digest_is_unanswered_and_a_busy_one_is_busy() {
+        use kimmy_storage::DigestAnswered::{Busy, Unanswered};
+        for (busy, expected) in [(false, Unanswered), (true, Busy)] {
+            let dir = tempfile::tempdir().unwrap();
+            let engine = Engine::open(&dir.path().join("kimmy.redb")).unwrap();
+            let (ours, mut peer_end) = tokio::io::duplex(MAX_FRAME);
+            let peer = tokio::spawn(async move {
+                let Ok(Message::AskVersions { .. }) = read_frame(&mut peer_end).await else {
+                    return;
+                };
+                let vectors = Message::Vectors {
+                    servable: VersionVector::new(),
+                    witnessed: VersionVector::new(),
+                    facts: None,
+                    facts_gen: None,
+                    echo: None,
+                    replay_from: None,
+                };
+                write_frame(&mut peer_end, &vectors).await.unwrap();
+                let Ok(Message::AskDivergence { digest, .. }) = read_frame(&mut peer_end).await
+                else {
+                    return;
+                };
+                assert!(digest.is_some(), "the request carries the cut");
+                let answer = Message::Divergence {
+                    collections: Vec::new(),
+                    probe_count: None,
+                    incarnations: Vec::new(),
+                    digests: None,
+                    digest_busy: busy,
+                };
+                write_frame(&mut peer_end, &answer).await.unwrap();
+            });
+            let mut stalls = PeerStalls::new();
+            let addr: SocketAddr = "127.0.0.1:1".parse().unwrap();
+            let outcome = sync_over_within(
+                &engine,
+                ours,
+                addr,
+                kimmy_core::NodeId::from_bytes([9; 16]),
+                None,
+                &mut stalls,
+                Duration::from_secs(5),
+            )
+            .await
+            .expect("the round");
+            peer.await.unwrap();
+            let round = outcome.digest.expect("asked");
+            assert_eq!(round.answered, expected);
+            assert!(round.verdicts.is_empty(), "never compared");
+            assert_eq!(
+                stalls.digest_capable.contains(&kimmy_core::NodeId::from_bytes([9; 16])),
+                busy,
+                "a peer that said it was busy answers digests; one that sent none does not"
+            );
+        }
+    }
 }

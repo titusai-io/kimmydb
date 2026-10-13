@@ -1786,6 +1786,163 @@ mod tests {
         );
     }
 
+    /// B3: the cut digest crosses the version line in both directions, for the
+    /// request and for the answer.
+    #[tokio::test]
+    async fn the_digest_fields_cross_a_version_boundary_in_both_directions() {
+        let frame = |body: bson::Document| {
+            let bytes = bson::serialize_to_vec(&body).unwrap();
+            let mut buffer = Vec::new();
+            buffer.extend_from_slice(&(bytes.len() as u32).to_be_bytes());
+            buffer.extend_from_slice(&bytes);
+            buffer
+        };
+        let ask = kimmy_storage::DigestAsk {
+            cut: [(NodeId::generate(), Hlc::new(5, 1))].into_iter().collect(),
+            uncovered: vec![kimmy_storage::Uncovered {
+                collection: CollectionId(u64::MAX),
+                keys: vec![serde_bytes::ByteBuf::from(vec![1, 2])],
+            }],
+            busy: Some(CollectionId(3)),
+        };
+
+        // A request from a build before the digest: no field, and the answering
+        // build reads it as no digest asked.
+        let old_request = frame(bson::doc! { "AskDivergence": { "probe": 7i64 } });
+        assert_eq!(
+            read_frame(&mut old_request.as_slice()).await.unwrap(),
+            Message::AskDivergence { probe: Some(CollectionId(7)), digest: None }
+        );
+
+        // And the request this build sends with nothing to ask is exactly that
+        // frame to an older responder: the digest field is not on the wire.
+        let mut written = Vec::new();
+        write_frame(
+            &mut written,
+            &Message::AskDivergence { probe: Some(CollectionId(7)), digest: None },
+        )
+        .await
+        .unwrap();
+        let body = bson::deserialize_from_slice::<bson::Document>(&written[4..]).unwrap();
+        assert_eq!(body, bson::doc! { "AskDivergence": { "probe": 7i64 } });
+
+        // A request that carries one round-trips, and an older responder, which
+        // reads only `probe`, ignores the rest of it (derived struct variants
+        // without `deny_unknown_fields`).
+        let asked = Message::AskDivergence { probe: None, digest: Some(ask.clone()) };
+        let mut written = Vec::new();
+        write_frame(&mut written, &asked).await.unwrap();
+        assert_eq!(read_frame(&mut written.as_slice()).await.unwrap(), asked);
+        #[derive(serde::Deserialize, Debug)]
+        enum Old {
+            AskDivergence { probe: Option<CollectionId> },
+        }
+        let old: Old = bson::deserialize_from_slice(&written[4..]).expect("an older reader");
+        assert!(matches!(old, Old::AskDivergence { probe: None }), "{old:?}");
+
+        // An answer from a build before the digest: no field, read as none.
+        let old_answer =
+            frame(bson::doc! { "Divergence": { "collections": [1i64], "probe_count": 7i64 } });
+        let Message::Divergence { digests, digest_busy, .. } =
+            read_frame(&mut old_answer.as_slice()).await.unwrap()
+        else {
+            panic!("a Divergence")
+        };
+        assert_eq!((digests, digest_busy), (None, false), "unanswered, not busy");
+
+        // The busy marker is its own thing, not a missing field.
+        let busy = frame(bson::doc! { "Divergence": {
+        "collections": [1i64], "probe_count": 7i64, "digest_busy": true } });
+        let Message::Divergence { digests, digest_busy, .. } =
+            read_frame(&mut busy.as_slice()).await.unwrap()
+        else {
+            panic!("a Divergence")
+        };
+        assert_eq!((digests, digest_busy), (None, true));
+
+        // An answer with digests round-trips.
+        let reply = kimmy_storage::DigestReply {
+            entries: vec![kimmy_storage::DigestEntry {
+                collection: CollectionId(u64::MAX),
+                digest: serde_bytes::ByteBuf::from(vec![7; 16]),
+                applied: 2,
+                uncovered: vec![serde_bytes::ByteBuf::from(vec![9])],
+                deferred: None,
+            }],
+        };
+        let answered = Message::Divergence {
+            collections: vec![CollectionId(1)],
+            probe_count: Some(7),
+            incarnations: Vec::new(),
+            digests: Some(reply.clone()),
+            digest_busy: false,
+        };
+        let mut written = Vec::new();
+        write_frame(&mut written, &answered).await.unwrap();
+        assert_eq!(read_frame(&mut written.as_slice()).await.unwrap(), answered);
+        // Read by an older requester, the extra field is ignored.
+        #[derive(serde::Deserialize, Debug)]
+        enum OldAnswer {
+            Divergence { collections: Vec<CollectionId>, probe_count: Option<u64> },
+        }
+        let old: OldAnswer = bson::deserialize_from_slice(&written[4..]).expect("an older reader");
+        assert!(matches!(old, OldAnswer::Divergence { probe_count: Some(7), .. }), "{old:?}");
+    }
+
+    /// B3 (N11): a new field of another shape costs the field and never the
+    /// frame, and one bad entry costs the entry.
+    #[tokio::test]
+    async fn a_digest_field_of_another_shape_costs_the_field_and_not_the_frame() {
+        let frame = |body: bson::Document| {
+            let bytes = bson::serialize_to_vec(&body).unwrap();
+            let mut buffer = Vec::new();
+            buffer.extend_from_slice(&(bytes.len() as u32).to_be_bytes());
+            buffer.extend_from_slice(&bytes);
+            buffer
+        };
+        let garbled_request =
+            frame(bson::doc! { "AskDivergence": { "probe": 7i64, "digest": "not a request" } });
+        assert_eq!(
+            read_frame(&mut garbled_request.as_slice()).await.unwrap(),
+            Message::AskDivergence { probe: Some(CollectionId(7)), digest: None },
+            "a request of another shape is no request, and the probe is still read"
+        );
+        let garbled_answer = frame(bson::doc! { "Divergence": {
+        "collections": [1i64], "probe_count": 7i64, "digests": [1, 2, 3] } });
+        let Message::Divergence { collections, probe_count, digests, .. } =
+            read_frame(&mut garbled_answer.as_slice()).await.unwrap()
+        else {
+            panic!("a Divergence")
+        };
+        assert_eq!((collections, probe_count, digests), (vec![CollectionId(1)], Some(7), None));
+
+        // One entry with a reason this build does not know, beside a good one.
+        let good = bson::serialize_to_bson(&kimmy_storage::DigestEntry {
+            collection: CollectionId(5),
+            digest: serde_bytes::ByteBuf::from(vec![1; 16]),
+            applied: 0,
+            uncovered: Vec::new(),
+            deferred: None,
+        })
+        .unwrap();
+        let unknown_reason = bson::bson!({
+            "collection": 6i64,
+            "digest": bson::Binary { subtype: bson::spec::BinarySubtype::Generic, bytes: vec![0; 16] },
+            "applied": 0,
+            "deferred": "a_reason_from_a_later_build",
+        });
+        let mixed = frame(bson::doc! { "Divergence": {
+        "collections": [5i64, 6i64], "probe_count": null,
+        "digests": { "entries": [unknown_reason, good] } } });
+        let Message::Divergence { digests, .. } = read_frame(&mut mixed.as_slice()).await.unwrap()
+        else {
+            panic!("a Divergence")
+        };
+        let entries = digests.expect("the answer still stands").entries;
+        assert_eq!(entries.len(), 1, "the entry with a reason this build does not know is dropped");
+        assert_eq!(entries[0].collection, CollectionId(5));
+    }
+
     #[tokio::test]
     async fn a_closed_stream_is_reported_as_closed_not_as_corruption() {
         // A peer going away is ordinary; it must not look like an attack.

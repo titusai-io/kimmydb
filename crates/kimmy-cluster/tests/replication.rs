@@ -9467,3 +9467,100 @@ async fn control_the_same_database_drop_without_the_snapshot_hop() {
     assert!(m.engine.get_collection("shop", "late").is_err(), "control");
     assert!(!m.engine.database_exists("shop").unwrap());
 }
+
+// ---------------------------------------------------------------------------
+// B3: the cut digest between two live nodes
+// ---------------------------------------------------------------------------
+
+/// One probe through a `PeerStalls` that persists, as the loop's does: the first
+/// contact with a peer sends the cut alone, to learn whether it answers digests,
+/// and every contact after it asks in full.
+async fn probe_twice(into: &Node, from: &Node) -> kimmy_storage::DigestRound {
+    let mut stalls = PeerStalls::new();
+    let first = sync_once_with(&into.engine, from.addr, SECRET, None, &mut stalls)
+        .await
+        .expect("the first contact");
+    let first = first.digest.expect("the check ran, so the digest was asked");
+    assert_eq!(
+        first.answered,
+        kimmy_storage::DigestAnswered::Probed,
+        "a peer not yet known to answer digests is asked with the cut alone"
+    );
+    assert!(first.verdicts.is_empty());
+    let second = sync_once_with(&into.engine, from.addr, SECRET, None, &mut stalls)
+        .await
+        .expect("the second contact");
+    second.digest.expect("asked in full")
+}
+
+fn compared(round: &kimmy_storage::DigestRound, id: kimmy_core::CollectionId) -> Option<bool> {
+    round.verdicts.iter().find(|v| v.collection == id).and_then(|v| match v.outcome {
+        kimmy_storage::DigestOutcome::Compared { equal, .. } => Some(equal),
+        kimmy_storage::DigestOutcome::Deferred(_) => None,
+    })
+}
+
+#[tokio::test]
+async fn converged_nodes_compare_equal_by_digest_after_the_first_contact() {
+    let a = node().await;
+    let b = node().await;
+    let ca = a.engine.create_collection("shop", "orders").unwrap();
+    for i in 0..5i64 {
+        a.engine.insert(&ca, doc! { "_id": i }).unwrap();
+    }
+    sync(&a, &b).await;
+    sync(&a, &b).await;
+
+    let round = probe_twice(&b, &a).await;
+    assert_eq!(round.answered, kimmy_storage::DigestAnswered::Answered);
+    assert_eq!(compared(&round, ca.id), Some(true), "{round:?}");
+}
+
+#[tokio::test]
+async fn the_digest_finds_a_lost_update_that_the_count_cannot_see() {
+    let a = node().await;
+    let b = node().await;
+    let ca = a.engine.create_collection("shop", "orders").unwrap();
+    for i in 0..5i64 {
+        a.engine.insert(&ca, doc! { "_id": i, "v": 0 }).unwrap();
+    }
+    sync(&a, &b).await;
+    sync(&a, &b).await;
+
+    // A updates a document; B is made to believe it has witnessed the update
+    // without ever applying it: the same count, the same vectors, one stale
+    // document.
+    a.engine.replace(&ca, &DocId::Int64(2), doc! { "_id": 2i64, "v": 1 }, false).unwrap();
+    let theirs = a.engine.version_vector().unwrap();
+    b.engine.apply_peer_batch(&theirs, &[], Hlc::ZERO, true).unwrap();
+    assert_eq!(a.engine.count_by_id(ca.id).unwrap(), b.engine.count_by_id(ca.id).unwrap());
+
+    let round = probe_twice(&b, &a).await;
+    assert_eq!(compared(&round, ca.id), Some(false), "{round:?}");
+}
+
+#[tokio::test]
+async fn a_write_the_peer_has_not_seen_is_no_finding() {
+    let a = node().await;
+    let b = node().await;
+    let ca = a.engine.create_collection("shop", "orders").unwrap();
+    for i in 0..5i64 {
+        a.engine.insert(&ca, doc! { "_id": i, "v": 0 }).unwrap();
+    }
+    sync(&a, &b).await;
+    sync(&a, &b).await;
+    // A takes writes B has not pulled: a new document and an update of one B
+    // holds. Neither is a divergence, and neither may be reported as one.
+    a.engine.insert(&ca, doc! { "_id": 100i64 }).unwrap();
+    a.engine.replace(&ca, &DocId::Int64(1), doc! { "_id": 1i64, "v": 9 }, false).unwrap();
+
+    // A probes B, which has not pulled them: the witnessed vectors say so and
+    // the cut leaves both writes out of both digests.
+    let round = probe_twice(&a, &b).await;
+    assert_eq!(
+        compared(&round, ca.id),
+        Some(true),
+        "a write the peer had not processed is set aside on both sides and the rest agrees: \
+         {round:?}"
+    );
+}
