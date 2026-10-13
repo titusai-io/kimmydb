@@ -1577,7 +1577,7 @@ impl Metrics {
              # HELP kimmy_process_resident_bytes Resident memory of this process as the kernel reports it (VmRSS in /proc/self/status) - the figure a container memory limit is enforced against. Holds storage.cache_bytes, the HNSW graphs, and whatever heap the allocator keeps for reuse after a burst, which is why it does not follow the two byte gauges above down. 0 where /proc is not available.\n\
              # TYPE kimmy_process_resident_bytes gauge\n\
              kimmy_process_resident_bytes {resident}\n\
-             # HELP kimmy_process_resident_peak_bytes The most resident memory this process has had at any moment since it started (VmHWM) - what a container limit was reached by, readable after the current figure has come back down. 0 where /proc is not available.\n\
+             # HELP kimmy_process_resident_peak_bytes The most resident memory this process has had at any moment since it started, as this process has seen it (the kernel's VmHWM, and every VmRSS read, whichever is larger) - what a container limit was reached by, readable after the current figure has come back down. 0 where /proc is not available.\n\
              # TYPE kimmy_process_resident_peak_bytes gauge\n\
              kimmy_process_resident_peak_bytes {resident_peak}\n\
              # HELP kimmy_up Always 1; presence indicates the node is serving.\n\
@@ -3211,7 +3211,7 @@ kimmy_vector_index_cache_bytes 48
 # HELP kimmy_process_resident_bytes Resident memory of this process as the kernel reports it (VmRSS in /proc/self/status) - the figure a container memory limit is enforced against. Holds storage.cache_bytes, the HNSW graphs, and whatever heap the allocator keeps for reuse after a burst, which is why it does not follow the two byte gauges above down. 0 where /proc is not available.
 # TYPE kimmy_process_resident_bytes gauge
 kimmy_process_resident_bytes 49
-# HELP kimmy_process_resident_peak_bytes The most resident memory this process has had at any moment since it started (VmHWM) - what a container limit was reached by, readable after the current figure has come back down. 0 where /proc is not available.
+# HELP kimmy_process_resident_peak_bytes The most resident memory this process has had at any moment since it started, as this process has seen it (the kernel's VmHWM, and every VmRSS read, whichever is larger) - what a container limit was reached by, readable after the current figure has come back down. 0 where /proc is not available.
 # TYPE kimmy_process_resident_peak_bytes gauge
 kimmy_process_resident_peak_bytes 50
 # HELP kimmy_up Always 1; presence indicates the node is serving.
