@@ -7593,7 +7593,6 @@ mod tests {
         let mut stalls = PeerStalls::new();
         let addr: SocketAddr = "127.0.0.1:1".parse().unwrap();
         let delay = Duration::from_millis(400);
-        let floor = Duration::from_millis(350);
         test_hooks::BEFORE_APPLY_TAKES.with(|t| t.set(delay));
 
         let started = Instant::now();
@@ -7615,8 +7614,17 @@ mod tests {
         round.expect("the peer answered at once");
         let pull = stalls.take_pull().expect("a window was pulled");
         assert!(took >= delay, "the injected delay must have actually happened: {took:?}");
-        assert!(pull.apply < floor, "not this batch's own work: {pull:?}");
-        assert!(pull.wait < floor, "not a wait for the writer either: {pull:?}");
+        // No absolute ceiling on `apply` or `wait`: the commit is a real
+        // fsync'd write and takes whatever the disk takes. The delay and the
+        // closure are disjoint stretches of the round, so if the delay stayed
+        // out of both phases they fit in `took` side by side, whatever the
+        // disk did. Charged to either, the delay is counted twice and the
+        // sum overshoots `took` by about `delay`.
+        assert!(
+            took >= delay + pull.apply + pull.wait,
+            "the delay is neither this batch's own work nor a wait for the writer: {pull:?} \
+             in {took:?}"
+        );
     }
 
     /// ADR-177: what an apply refused is counted when it commits, not only
