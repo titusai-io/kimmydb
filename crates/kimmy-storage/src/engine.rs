@@ -4900,6 +4900,7 @@ impl Engine {
         let txn = txn?;
         #[cfg(any(test, feature = "test-hooks"))]
         self.purges.holding_gate.pass()?;
+        let mut row_to_forget = false;
         let removed = {
             // A collection standing under this id means the name was created
             // again since the drop — the id is derived from the name, so a
@@ -4953,12 +4954,19 @@ impl Engine {
                     }
                     removed += keys.len();
                 }
+                // The ranges are exhausted: the digest row of a collection
+                // that is gone goes with this commit (a row of zeros and the
+                // highest stamps of a life that has ended).
+                if removed < DROP_PURGE_CHUNK {
+                    txn.live_counts().lock().forget_digest(id.0);
+                    row_to_forget = txn.open_table(tables::LIVE_DIGESTS)?.get(id.0)?.is_some();
+                }
                 removed
             }
         };
         // Nothing removed, nothing to commit: the collection came back, or a
         // concurrent purge of the same id got there first.
-        if removed == 0 {
+        if removed == 0 && !row_to_forget {
             txn.abort()?;
         } else {
             txn.commit()?;

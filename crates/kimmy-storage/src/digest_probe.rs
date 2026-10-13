@@ -809,6 +809,8 @@ impl Engine {
             let txn = self.db().begin_read()?;
             let rows = txn.open_table(tables::LIVE_DIGESTS)?;
             let kept = live_digest::kept_row(&rows, collection.0)?.unwrap_or_default();
+            #[cfg(test)]
+            test_hooks::after_the_row(self);
             match self.walk_headers(&txn, collection, budget)? {
                 Some(walked) => (kept, walked),
                 None => return Ok(SelfCheck::Busy),
@@ -826,6 +828,15 @@ impl Engine {
         let fix = kept.digest ^ walked.digest;
         let txn = self.begin_write(crate::engine::WriterHolder::Write)?;
         {
+            // The collection may have been dropped since the snapshot: its
+            // row is gone with the purge, and a correction must not make one.
+            let collections = txn.open_table(tables::COLLECTIONS)?;
+            if !crate::engine::collection_stands_under(&collections, collection)? {
+                drop(collections);
+                txn.abort()?;
+                return Ok(SelfCheck::Busy);
+            }
+            drop(collections);
             let mut rows = txn.open_table(tables::LIVE_DIGESTS)?;
             let mut now = live_digest::kept_row(&rows, collection.0)?.unwrap_or_default();
             now.digest ^= fix;
@@ -897,6 +908,20 @@ pub(crate) mod test_hooks {
         /// Run between a self-check's snapshot and its correction, on this
         /// thread: where a concurrent commit lands in the field.
         static AFTER_THE_SNAPSHOT: RefCell<Option<Hook>> = const { RefCell::new(None) };
+        /// Run between the self-check's read of the row and its walk of the
+        /// records, on this thread: where a commit lands that a check using
+        /// two snapshots would see in the walk and not in the row.
+        static AFTER_THE_ROW: RefCell<Option<Hook>> = const { RefCell::new(None) };
+    }
+
+    pub(crate) fn between_the_row_and_the_walk(f: impl FnOnce(&Engine) + 'static) {
+        AFTER_THE_ROW.with(|hook| *hook.borrow_mut() = Some(Box::new(f)));
+    }
+
+    pub(super) fn after_the_row(engine: &Engine) {
+        if let Some(hook) = AFTER_THE_ROW.with(|hook| hook.borrow_mut().take()) {
+            hook(engine);
+        }
     }
 
     pub(crate) fn between_the_snapshot_and_the_correction(f: impl FnOnce(&Engine) + 'static) {
@@ -1364,6 +1389,7 @@ mod tests {
             assert_eq!(a.digest_drift_total(), 0);
         }
         assert!(step >= 3, "the purge ran in chunks");
+        assert_eq!(a.digest_row(orders.id).unwrap(), None, "the purge took the old row with it");
         let again = a.create_collection("shop", "orders").unwrap();
         assert_eq!(a.digest_row(again.id).unwrap(), None, "the new life starts with no row");
         // The same keys as the old life, written after it has gone.
@@ -1477,6 +1503,57 @@ mod tests {
             SelfCheck::Exact,
             "the correction lost what the concurrent commit added"
         );
+    }
+
+    /// The row and the walk are one snapshot: a commit between the read of the
+    /// row and the walk is in neither, and a sound row is not called drifted.
+    #[test]
+    fn the_self_checks_row_and_walk_are_one_snapshot() {
+        let (a, _b, orders, _items, _dirs) = converged();
+        let id = orders.clone();
+        test_hooks::between_the_row_and_the_walk(move |engine| {
+            engine.insert(&id, doc! { "_id": 700i64 }).unwrap();
+        });
+        assert_eq!(
+            a.verify_digest_row(orders.id, ScanBudget::default()).unwrap(),
+            SelfCheck::Exact,
+            "the walk saw a commit the row read did not"
+        );
+        assert_eq!(a.digest_drift_total(), 0);
+        // And the next check, which sees both, agrees.
+        assert_eq!(
+            a.verify_digest_row(orders.id, ScanBudget::default()).unwrap(),
+            SelfCheck::Exact
+        );
+    }
+
+    /// A collection dropped between the snapshot and the correction gets no
+    /// row back from the correction.
+    #[test]
+    fn a_correction_does_not_make_a_row_for_a_collection_dropped_since() {
+        let (a, _b, orders, _items, _dirs) = converged();
+        {
+            let truth = a.digest_row(orders.id).unwrap().unwrap();
+            let db = a.db();
+            let txn = db.begin_write().unwrap();
+            let mut forged = truth;
+            forged.digest ^= 0x77;
+            txn.open_table(tables::LIVE_DIGESTS)
+                .unwrap()
+                .insert(orders.id.0, forged.encode().as_slice())
+                .unwrap();
+            txn.commit().unwrap();
+        }
+        test_hooks::between_the_snapshot_and_the_correction(|engine| {
+            engine.drop_collection("shop", "orders").unwrap();
+            engine.finish_purges_now().unwrap();
+        });
+        assert_eq!(
+            a.verify_digest_row(orders.id, ScanBudget::default()).unwrap(),
+            SelfCheck::Busy
+        );
+        assert_eq!(a.digest_row(orders.id).unwrap(), None);
+        assert_eq!(a.digest_drift_total(), 0);
     }
 
     #[test]

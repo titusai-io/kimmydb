@@ -184,6 +184,12 @@ impl Pending {
     #[cfg(kimmy_bench_no_live_counts)]
     fn bare(&mut self, _collection: u64, _stamp: &kimmy_core::Stamp) {}
 
+    /// The last chunk of a drop purge of `collection`: its digest row goes
+    /// with the flush: the ranges are exhausted, so no record is left under it.
+    pub(crate) fn forget_digest(&mut self, collection: u64) {
+        self.digests.entry(collection).or_default().forget_row();
+    }
+
     /// Record where an append left the store, for [`flush`] to write once.
     #[cfg(not(kimmy_bench_no_live_counts))]
     pub(crate) fn appended(&mut self, mark: Vec<u8>) {

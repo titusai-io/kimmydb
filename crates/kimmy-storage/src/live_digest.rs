@@ -159,6 +159,9 @@ pub(crate) struct Delta {
     xor: u128,
     /// The highest record stamps this transaction wrote.
     raised: DigestRow,
+    /// The row is deleted at the flush: the last chunk of a drop purge, after
+    /// which no record stands under the id.
+    forget_row: bool,
 }
 
 impl Delta {
@@ -185,8 +188,14 @@ impl Delta {
         self.raised.raise_bare(stamp);
     }
 
+    /// Delete the row at the flush.
+    pub(crate) fn forget_row(&mut self) {
+        self.forget_row = true;
+    }
+
     fn moves_nothing(&self) -> bool {
-        self.xor == 0 && self.raised.maxw.is_empty() && self.raised.bare_max.is_empty()
+        !self.forget_row
+            && self.xor == 0 && self.raised.maxw.is_empty() && self.raised.bare_max.is_empty()
     }
 }
 
@@ -219,6 +228,12 @@ pub(crate) fn flush(
         let mut row = current.clone().unwrap_or_default();
         row.digest ^= delta.xor;
         row.raise_from(&delta.raised);
+        if delta.forget_row {
+            if current.is_some() {
+                rows.remove(*collection)?;
+            }
+            continue;
+        }
         if current.as_ref() != Some(&row) {
             rows.insert(*collection, row.encode().as_slice())?;
         }
