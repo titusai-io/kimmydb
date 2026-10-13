@@ -213,6 +213,11 @@ pub struct SyncOutcome {
     /// from one that runs and agrees. Set only by `kimmy-cluster`'s
     /// `sync_once`, like the two fields above.
     pub count_probe_deferred: bool,
+    /// What the cut digest probe of this contact came to (B3): `None` when it
+    /// was not asked (the round ended before the check, or the peer's witnessed
+    /// vector was not read). Set only by `kimmy-cluster`'s `sync_once`, beside
+    /// `divergent`.
+    pub digest: Option<crate::digest_probe::DigestRound>,
     /// Whether an immediate second pull from the same peer would carry more
     /// (ADR-157): the peer said its scan stopped at the batch limit rather
     /// than at the end of its oplog, and this node took the whole window it

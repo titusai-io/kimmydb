@@ -91,6 +91,23 @@ fn lenient_hlc<'de, D: serde::Deserializer<'de>>(deserializer: D) -> Result<Opti
     Ok(raw.and_then(|raw| bson::deserialize_from_bson::<Hlc>(raw).ok()))
 }
 
+/// A digest request, read leniently (B3): one that does not decode is none, so a
+/// field of another shape costs the field and never the frame.
+fn lenient_digest_ask<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<Option<kimmy_storage::DigestAsk>, D::Error> {
+    let raw = Option::<bson::Bson>::deserialize(deserializer)?;
+    Ok(raw.and_then(|raw| bson::deserialize_from_bson(raw).ok()))
+}
+
+/// A digest answer, read leniently, as the request is.
+fn lenient_digest_reply<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<Option<kimmy_storage::DigestReply>, D::Error> {
+    let raw = Option::<bson::Bson>::deserialize(deserializer)?;
+    Ok(raw.and_then(|raw| bson::deserialize_from_bson(raw).ok()))
+}
+
 /// An echo, read leniently: one that does not decode is none, which reads as a
 /// peer that does not echo.
 fn lenient_echo<'de, D: serde::Deserializer<'de>>(
@@ -377,7 +394,21 @@ pub enum Message {
     /// document count for — rotated by the caller so no round pays for more
     /// than one collection's scan — and is `None` when the requester holds
     /// none at all.
-    AskDivergence { probe: Option<CollectionId> },
+    ///
+    /// `digest` (B3) asks the cut digest as well: the cut, and the keys the
+    /// requester excludes. Optional on the wire and read leniently, so an
+    /// answering peer that predates it ignores it, and a field of another
+    /// shape costs the field and never the frame. Absent on a requester that
+    /// predates it or has nothing to ask.
+    AskDivergence {
+        probe: Option<CollectionId>,
+        #[serde(
+            default,
+            skip_serializing_if = "Option::is_none",
+            deserialize_with = "lenient_digest_ask"
+        )]
+        digest: Option<kimmy_storage::DigestAsk>,
+    },
     /// The answer: every collection id this node currently holds, across
     /// every database, and the live document count of `probe` if this node
     /// holds it too.
@@ -406,6 +437,22 @@ pub enum Message {
         probe_count: Option<u64>,
         #[serde(default)]
         incarnations: Vec<(CollectionId, Hlc)>,
+        /// The cut digest of every collection quiet at the requester's cut,
+        /// and of the one busy collection it named (B3). `None` from a peer
+        /// that predates it, which a requester counts as unanswered and never
+        /// compares; absent from the frame when there is nothing to say, so
+        /// the answer to an older requester is byte for byte what it was.
+        #[serde(
+            default,
+            skip_serializing_if = "Option::is_none",
+            deserialize_with = "lenient_digest_reply"
+        )]
+        digests: Option<kimmy_storage::DigestReply>,
+        /// The peer was already answering a digest probe and answered this one
+        /// without digests: distinct from `None`, which is what a peer that
+        /// predates the digest sends.
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        digest_busy: bool,
     },
     /// "What have you processed?"
     ///
@@ -877,8 +924,8 @@ mod tests {
             },
             Message::Hello { node: NodeId::generate(), nonce: vec![1, 2, 3] },
             Message::Confirm { proof: vec![9, 9] },
-            Message::AskDivergence { probe: Some(CollectionId(42)) },
-            Message::AskDivergence { probe: None },
+            Message::AskDivergence { probe: Some(CollectionId(42)), digest: None },
+            Message::AskDivergence { probe: None, digest: None },
             Message::AskSnapshot { after: None, collection: None },
             // The unencodable half of the id space, and a cursor: the shape
             // every scoped repair of such a collection sends.
@@ -900,11 +947,15 @@ mod tests {
                     (CollectionId(1), Hlc::new(3, 1)),
                     (CollectionId(u64::MAX), Hlc::new(4, 0)),
                 ],
+                digests: None,
+                digest_busy: false,
             },
             Message::Divergence {
                 collections: Vec::new(),
                 probe_count: None,
                 incarnations: Vec::new(),
+                digests: None,
+                digest_busy: false,
             },
             Message::AskWitnessed {},
             Message::Witnessed(populated_vector()),
@@ -1692,6 +1743,8 @@ mod tests {
             collections,
             probe_count: Some(7),
             incarnations: Vec::new(),
+            digests: None,
+            digest_busy: false,
         };
 
         let old_answer =
@@ -1718,6 +1771,8 @@ mod tests {
             collections: vec![CollectionId(1)],
             probe_count: Some(7),
             incarnations: vec![(CollectionId(1), Hlc::new(9, 2))],
+            digests: None,
+            digest_busy: false,
         };
         write_frame(&mut written, &held).await.unwrap();
         let body = bson::deserialize_from_slice::<bson::Document>(&written[4..]).unwrap();

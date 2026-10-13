@@ -65,6 +65,11 @@ mod database_drop_tests;
 mod log_capture;
 
 pub use database_tombstone::{Buried, BuriedCollection, Swept};
+pub use digest_probe::{
+    ANSWER_KEY_BYTES, ASK_KEY_BYTES, Defer, DigestAnswered, DigestAsk, DigestEntry, DigestOutcome,
+    DigestPlan, DigestReply, DigestRound, DigestVerdict, SCAN_BYTES, SCAN_WALL, ScanBudget,
+    SelfCheck, Uncovered,
+};
 pub use divergence::{
     DivergenceTracker, Findings as DivergenceFindings, LocalState as DivergenceLocalState,
     PeerAnswer as DivergencePeerAnswer, compare as compare_divergence, next_probe,

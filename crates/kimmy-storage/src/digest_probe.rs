@@ -103,6 +103,36 @@ pub enum Defer {
 }
 
 impl Defer {
+    /// Every reason, in the order [`Self::index`] numbers them.
+    pub const ALL: [Defer; 10] = [
+        Self::BareTombstone,
+        Self::Horizon,
+        Self::DatabaseTombstone,
+        Self::BurialPending,
+        Self::Moved,
+        Self::UncoveredCap,
+        Self::Budget,
+        Self::Busy,
+        Self::Incarnation,
+        Self::SelfCheckBusy,
+    ];
+
+    /// This reason's place in [`Self::ALL`], for a counter per reason.
+    pub const fn index(self) -> usize {
+        match self {
+            Self::BareTombstone => 0,
+            Self::Horizon => 1,
+            Self::DatabaseTombstone => 2,
+            Self::BurialPending => 3,
+            Self::Moved => 4,
+            Self::UncoveredCap => 5,
+            Self::Budget => 6,
+            Self::Busy => 7,
+            Self::Incarnation => 8,
+            Self::SelfCheckBusy => 9,
+        }
+    }
+
     /// The label of `kimmy_sync_divergence_digest_probes_total{reason}`.
     pub const fn label(self) -> &'static str {
         match self {
@@ -132,11 +162,20 @@ pub struct Uncovered {
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DigestAsk {
     pub cut: VersionVector,
+    #[serde(default, deserialize_with = "lenient_uncovered")]
     pub uncovered: Vec<Uncovered>,
     /// The busy collection this contact's rotation names: the peer answers
     /// every collection that is quiet on its side, and this one if it is busy.
     #[serde(default)]
     pub busy: Option<CollectionId>,
+}
+
+/// The request's uncovered lists, read one at a time as the entries are.
+fn lenient_uncovered<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> std::result::Result<Vec<Uncovered>, D::Error> {
+    let raw = Vec::<bson::Bson>::deserialize(deserializer)?;
+    Ok(raw.into_iter().filter_map(|entry| bson::deserialize_from_bson(entry).ok()).collect())
 }
 
 /// One collection's digest, as the peer computed it.
@@ -160,14 +199,52 @@ pub struct DigestEntry {
 /// The peer's answer.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DigestReply {
+    #[serde(default, deserialize_with = "lenient_entries")]
     pub entries: Vec<DigestEntry>,
+}
+
+/// Entries read one at a time: one that does not decode (a reason this build
+/// does not know, a digest of the wrong shape) is dropped and the rest are
+/// kept, so a new field costs the entry and never the frame.
+fn lenient_entries<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> std::result::Result<Vec<DigestEntry>, D::Error> {
+    let raw = Vec::<bson::Bson>::deserialize(deserializer)?;
+    Ok(raw.into_iter().filter_map(|entry| bson::deserialize_from_bson(entry).ok()).collect())
+}
+
+/// How the peer took a digest request.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DigestAnswered {
+    /// With digests.
+    Answered,
+    /// Already answering a probe: distinct from not answering at all.
+    Busy,
+    /// With none: a peer that predates the digest, or one that failed to
+    /// compute it. Never compared.
+    Unanswered,
+    /// Asked with the cut alone, to learn whether the peer answers digests
+    /// before paying for this side's scan (a peer that has not yet answered
+    /// one); nothing is compared this contact.
+    Probed,
+}
+
+/// What a contact's digest probe came to, for the caller to count.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DigestRound {
+    pub answered: DigestAnswered,
+    /// Per collection: compared (equal or not) or deferred, with the reason.
+    pub verdicts: Vec<DigestVerdict>,
+    /// Collections this side could not ask about, with the reason.
+    pub plan_deferred: Vec<(CollectionId, Defer)>,
 }
 
 /// What one collection came to.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum DigestOutcome {
-    /// Compared: whether the digests are equal.
-    Compared { equal: bool },
+    /// Compared: whether the digests are equal, and both digests (with the
+    /// excluded keys taken out of each), for the log line a finding gets.
+    Compared { equal: bool, mine: u128, theirs: u128 },
     /// Not compared, and why.
     Deferred(Defer),
 }
@@ -377,8 +454,16 @@ impl Engine {
                 out.push(defer(Defer::UncoveredCap));
                 continue;
             };
-            let equal = entry.digest.as_slice() == mine.to_be_bytes().as_slice();
-            out.push(DigestVerdict { collection: id, outcome: DigestOutcome::Compared { equal } });
+            let theirs = <[u8; 16]>::try_from(entry.digest.as_slice()).map(u128::from_be_bytes);
+            let Ok(theirs) = theirs else {
+                // A digest of the wrong width is no digest.
+                out.push(defer(Defer::UncoveredCap));
+                continue;
+            };
+            out.push(DigestVerdict {
+                collection: id,
+                outcome: DigestOutcome::Compared { equal: theirs == mine, mine, theirs },
+            });
         }
         Ok(out)
     }
@@ -699,6 +784,14 @@ mod tests {
         verdicts.iter().find(|v| v.collection == id).map(|v| v.outcome)
     }
 
+    /// Whether the collection was compared, and found equal.
+    fn compared(verdicts: &[DigestVerdict], id: CollectionId) -> Option<bool> {
+        match outcome_of(verdicts, id) {
+            Some(DigestOutcome::Compared { equal, .. }) => Some(equal),
+            _ => None,
+        }
+    }
+
     /// Two members holding `shop.orders` and `shop.items`, converged.
     fn converged()
     -> (Engine, Engine, crate::CollectionMeta, crate::CollectionMeta, [tempfile::TempDir; 2]) {
@@ -720,16 +813,20 @@ mod tests {
     }
 
     #[test]
+    fn every_reason_has_its_own_place_and_label() {
+        for (n, reason) in Defer::ALL.into_iter().enumerate() {
+            assert_eq!(reason.index(), n);
+            assert_eq!(Defer::ALL.iter().filter(|r| r.label() == reason.label()).count(), 1);
+        }
+    }
+
+    #[test]
     fn converged_members_compare_equal_in_both_directions() {
         let (a, b, orders, items, _dirs) = converged();
         for (x, y) in [(&a, &b), (&b, &a)] {
             let verdicts = exchange(x, y, None);
             for id in [orders.id, items.id] {
-                assert_eq!(
-                    outcome_of(&verdicts, id),
-                    Some(DigestOutcome::Compared { equal: true }),
-                    "{verdicts:?}"
-                );
+                assert_eq!(compared(&verdicts, id), Some(true), "{verdicts:?}");
             }
         }
     }
@@ -757,13 +854,10 @@ mod tests {
             txn.commit().unwrap();
         }
         let verdicts = exchange(&a, &b, None);
+        assert_eq!(compared(&verdicts, orders.id), Some(false));
         assert_eq!(
-            outcome_of(&verdicts, orders.id),
-            Some(DigestOutcome::Compared { equal: false })
-        );
-        assert_eq!(
-            outcome_of(&verdicts, items.id),
-            Some(DigestOutcome::Compared { equal: true }),
+            compared(&verdicts, items.id),
+            Some(true),
             "an unrelated collection still agrees"
         );
     }
@@ -777,18 +871,10 @@ mod tests {
         // B is quiet in the collection and holds the old version of key 4
         // (N4): it subtracts it, since A excluded it.
         let verdicts = exchange(&a, &b, None);
-        assert_eq!(
-            outcome_of(&verdicts, orders.id),
-            Some(DigestOutcome::Compared { equal: true }),
-            "{verdicts:?}"
-        );
+        assert_eq!(compared(&verdicts, orders.id), Some(true), "{verdicts:?}");
         // And the other way: the requester quiet, the peer busy.
         let verdicts = exchange(&b, &a, Some(orders.id));
-        assert_eq!(
-            outcome_of(&verdicts, orders.id),
-            Some(DigestOutcome::Compared { equal: true }),
-            "{verdicts:?}"
-        );
+        assert_eq!(compared(&verdicts, orders.id), Some(true), "{verdicts:?}");
     }
 
     #[test]
@@ -799,8 +885,8 @@ mod tests {
         b.replace(&orders, &DocId::Int64(5), doc! { "_id": 5i64, "n": 2 }, false).unwrap();
         let verdicts = exchange(&a, &b, Some(orders.id));
         assert_eq!(
-            outcome_of(&verdicts, orders.id),
-            Some(DigestOutcome::Compared { equal: true }),
+            compared(&verdicts, orders.id),
+            Some(true),
             "a key subtracted twice would add its term back and mismatch: {verdicts:?}"
         );
     }
@@ -834,8 +920,8 @@ mod tests {
         let verdicts = a.digest_compare(&plan, &reply, &incarnations(&b), budget).unwrap();
         assert_eq!(outcome_of(&verdicts, orders.id), Some(DigestOutcome::Deferred(Defer::Moved)));
         assert_eq!(
-            outcome_of(&verdicts, items.id),
-            Some(DigestOutcome::Compared { equal: true }),
+            compared(&verdicts, items.id),
+            Some(true),
             "a collection nothing was written to is still compared"
         );
     }
@@ -917,8 +1003,8 @@ mod tests {
         let reply = b.digest_answer(&plan.ask, tight).unwrap().unwrap();
         let verdicts = a.digest_compare(&plan, &reply, &incarnations(&b), tight).unwrap();
         assert_eq!(
-            outcome_of(&verdicts, orders.id),
-            Some(DigestOutcome::Compared { equal: true }),
+            compared(&verdicts, orders.id),
+            Some(true),
             "the frozen origin dragged the scan's start back: {verdicts:?}"
         );
         // And with nothing to spend the same scan defers.

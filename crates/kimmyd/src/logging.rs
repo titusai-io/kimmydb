@@ -1643,6 +1643,111 @@ impl TelemetryGuard {
         );
         observe!(
             u64_observable_gauge,
+            "kimmy.sync.digest_divergent_collections",
+            "{collection}",
+            "Collections the cut digest currently has confirmed as divergent from a peer; also counted in kimmy.sync.divergent_collections.",
+            sync_digest_divergent_collections
+        );
+        observe!(
+            u64_observable_counter,
+            "kimmy.sync.divergence_digest_probes.compared",
+            "{collection}",
+            "Collections the cut digest compared against a peer's, with what either side had not yet processed set aside.",
+            sync_digest_compared
+        );
+        observe!(
+            u64_observable_counter,
+            "kimmy.sync.divergence_digest_probes.unanswered",
+            "{contact}",
+            "Checked peer contacts whose peer returned no cut digest.",
+            sync_digest_unanswered
+        );
+        observe!(
+            u64_observable_counter,
+            "kimmy.sync.divergence_digest_probes.probed",
+            "{contact}",
+            "Peer contacts asked with the cut alone, to learn whether the peer answers cut digests.",
+            sync_digest_probed
+        );
+        observe!(
+            u64_observable_counter,
+            "kimmy.sync.divergence_digest_probes.deferred.bare_tombstone",
+            "{collection}",
+            "Collections the cut digest did not compare, for this reason (bare_tombstone).",
+            |s| s.sync_digest_deferred[kimmy_storage::Defer::BareTombstone.index()]
+        );
+        observe!(
+            u64_observable_counter,
+            "kimmy.sync.divergence_digest_probes.deferred.horizon",
+            "{collection}",
+            "Collections the cut digest did not compare, for this reason (horizon).",
+            |s| s.sync_digest_deferred[kimmy_storage::Defer::Horizon.index()]
+        );
+        observe!(
+            u64_observable_counter,
+            "kimmy.sync.divergence_digest_probes.deferred.database_tombstone",
+            "{collection}",
+            "Collections the cut digest did not compare, for this reason (database_tombstone).",
+            |s| s.sync_digest_deferred[kimmy_storage::Defer::DatabaseTombstone.index()]
+        );
+        observe!(
+            u64_observable_counter,
+            "kimmy.sync.divergence_digest_probes.deferred.burial_pending",
+            "{collection}",
+            "Collections the cut digest did not compare, for this reason (burial_pending).",
+            |s| s.sync_digest_deferred[kimmy_storage::Defer::BurialPending.index()]
+        );
+        observe!(
+            u64_observable_counter,
+            "kimmy.sync.divergence_digest_probes.deferred.moved",
+            "{collection}",
+            "Collections the cut digest did not compare, for this reason (moved).",
+            |s| s.sync_digest_deferred[kimmy_storage::Defer::Moved.index()]
+        );
+        observe!(
+            u64_observable_counter,
+            "kimmy.sync.divergence_digest_probes.deferred.uncovered_cap",
+            "{collection}",
+            "Collections the cut digest did not compare, for this reason (uncovered_cap).",
+            |s| s.sync_digest_deferred[kimmy_storage::Defer::UncoveredCap.index()]
+        );
+        observe!(
+            u64_observable_counter,
+            "kimmy.sync.divergence_digest_probes.deferred.budget",
+            "{collection}",
+            "Collections the cut digest did not compare, for this reason (budget).",
+            |s| s.sync_digest_deferred[kimmy_storage::Defer::Budget.index()]
+        );
+        observe!(
+            u64_observable_counter,
+            "kimmy.sync.divergence_digest_probes.deferred.busy",
+            "{collection}",
+            "Collections the cut digest did not compare, for this reason (busy).",
+            |s| s.sync_digest_deferred[kimmy_storage::Defer::Busy.index()]
+        );
+        observe!(
+            u64_observable_counter,
+            "kimmy.sync.divergence_digest_probes.deferred.incarnation",
+            "{collection}",
+            "Collections the cut digest did not compare, for this reason (incarnation).",
+            |s| s.sync_digest_deferred[kimmy_storage::Defer::Incarnation.index()]
+        );
+        observe!(
+            u64_observable_counter,
+            "kimmy.sync.divergence_digest_probes.deferred.self_check_busy",
+            "{collection}",
+            "Collections the cut digest did not compare, for this reason (self_check_busy).",
+            |s| s.sync_digest_deferred[kimmy_storage::Defer::SelfCheckBusy.index()]
+        );
+        observe!(
+            u64_observable_counter,
+            "kimmy.sync.digest_drift",
+            "{row}",
+            "Kept digest rows a self-check found disagreeing with their records and corrected.",
+            sync_digest_drift
+        );
+        observe!(
+            u64_observable_gauge,
             "kimmy.sync.divergence_check_age",
             "s",
             "Seconds since the last peer contact in which the cross-member divergence check ran, computed at export; since the process started before the first, and 0 on a node without clustering.",

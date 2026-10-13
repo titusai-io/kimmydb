@@ -466,6 +466,18 @@ pub struct MetricsSnapshot {
     /// looked at anything.
     pub sync_divergence_count_compared: u64,
     pub sync_divergence_count_deferred: u64,
+    /// Collections the cut digest currently has confirmed (B3): also counted
+    /// in `sync_divergent_collections`, which this attributes.
+    pub sync_digest_divergent_collections: u64,
+    /// Collections the cut digest compared, equal or not; checked contacts
+    /// whose peer answered no digest; and contacts asked with the cut alone.
+    pub sync_digest_compared: u64,
+    pub sync_digest_unanswered: u64,
+    pub sync_digest_probed: u64,
+    /// Collections not compared, by reason (`kimmy_storage::Defer::ALL`).
+    pub sync_digest_deferred: [u64; kimmy_storage::Defer::ALL.len()],
+    /// Kept digest rows a self-check found drifted and corrected.
+    pub sync_digest_drift: u64,
     /// Seconds since the last contact whose round ran the check, computed
     /// when this snapshot was taken from the instant the loop last
     /// reported; since the process started before the first (ADR-145,
@@ -580,6 +592,13 @@ pub struct Metrics {
     /// above and for the same reason.
     sync_divergence_count_compared: AtomicU64,
     sync_divergence_count_deferred: AtomicU64,
+    /// The cut digest's (B3): a level, and counters, on the same terms.
+    sync_digest_divergent_collections: AtomicU64,
+    sync_digest_compared: AtomicU64,
+    sync_digest_unanswered: AtomicU64,
+    sync_digest_probed: AtomicU64,
+    sync_digest_deferred: [AtomicU64; kimmy_storage::Defer::ALL.len()],
+    sync_digest_drift: AtomicU64,
     /// When the loop last ran the check against any peer, as the loop
     /// reported it at its last tick; `None` before the first check
     /// (ADR-145, ADR-154). What `kimmy_sync_divergence_check_age_seconds`
@@ -696,6 +715,12 @@ impl Default for Metrics {
             sync_divergence_skips: AtomicU64::new(0),
             sync_divergence_count_compared: AtomicU64::new(0),
             sync_divergence_count_deferred: AtomicU64::new(0),
+            sync_digest_divergent_collections: AtomicU64::new(0),
+            sync_digest_compared: AtomicU64::new(0),
+            sync_digest_unanswered: AtomicU64::new(0),
+            sync_digest_probed: AtomicU64::new(0),
+            sync_digest_deferred: std::array::from_fn(|_| AtomicU64::new(0)),
+            sync_digest_drift: AtomicU64::new(0),
             sync_divergence_last_check: parking_lot::Mutex::new(None),
             sync_entries_skipped_unknown_collection: AtomicU64::new(0),
             sync_entries_skipped_beyond_advertised: AtomicU64::new(0),
@@ -924,6 +949,16 @@ impl Metrics {
             .fetch_add(round.divergence_count_compared as u64, Ordering::Relaxed);
         self.sync_divergence_count_deferred
             .fetch_add(round.divergence_count_deferred as u64, Ordering::Relaxed);
+        self.sync_digest_divergent_collections
+            .store(round.digest_divergent_collections as u64, Ordering::Relaxed);
+        self.sync_digest_compared.fetch_add(round.digest_compared as u64, Ordering::Relaxed);
+        self.sync_digest_unanswered.fetch_add(round.digest_unanswered as u64, Ordering::Relaxed);
+        self.sync_digest_probed.fetch_add(round.digest_probed as u64, Ordering::Relaxed);
+        for (slot, n) in self.sync_digest_deferred.iter().zip(round.digest_deferred) {
+            slot.fetch_add(n as u64, Ordering::Relaxed);
+        }
+        // A total the loop reads from the engine, so a level this stores.
+        self.sync_digest_drift.store(round.digest_drift_total, Ordering::Relaxed);
         *self.sync_divergence_last_check.lock() = round.divergence_last_check;
         *self.replication_progress.lock() = round.last_completed_round;
         self.record_entries_skipped(
@@ -1331,6 +1366,14 @@ impl Metrics {
             sync_divergence_skips: self.get(&self.sync_divergence_skips),
             sync_divergence_count_compared: self.get(&self.sync_divergence_count_compared),
             sync_divergence_count_deferred: self.get(&self.sync_divergence_count_deferred),
+            sync_digest_divergent_collections: self.get(&self.sync_digest_divergent_collections),
+            sync_digest_compared: self.get(&self.sync_digest_compared),
+            sync_digest_unanswered: self.get(&self.sync_digest_unanswered),
+            sync_digest_probed: self.get(&self.sync_digest_probed),
+            sync_digest_deferred: std::array::from_fn(|slot| {
+                self.get(&self.sync_digest_deferred[slot])
+            }),
+            sync_digest_drift: self.get(&self.sync_digest_drift),
             sync_divergence_check_age_secs: self.sync_divergence_check_age_secs_at(now),
             sync_entries_skipped_unknown_collection: self
                 .get(&self.sync_entries_skipped_unknown_collection),
@@ -1706,6 +1749,18 @@ impl Metrics {
              # TYPE kimmy_sync_divergence_count_probes_total counter\n\
              kimmy_sync_divergence_count_probes_total{{outcome=\"compared\"}} {sync_div_compared}\n\
              kimmy_sync_divergence_count_probes_total{{outcome=\"deferred\"}} {sync_div_deferred}\n\
+             # HELP kimmy_sync_digest_divergent_collections Collections the cut digest currently finds disagreeing with a peer: the two members hold different (id, stamp) sets for them once what each had not yet processed is set aside, seen on two compared checks running. Also counted in kimmy_sync_divergent_collections, which this attributes. Detect only: nothing is repaired from it. Compare (id, stamp) of the collection on both members before wiping either (operations.md, The divergence check).\n\
+             # TYPE kimmy_sync_digest_divergent_collections gauge\n\
+             kimmy_sync_digest_divergent_collections {sync_digest_divergent}\n\
+             # HELP kimmy_sync_divergence_digest_probes_total Collections the cut digest looked at, by outcome. compared: both sides' digests were taken at one cut, with the keys either side had not yet processed set aside, and compared; the gauge reading 0 means the members agree only while this rises. unanswered: a checked contact whose peer returned no digest (a build before it). probed: a contact asked with the cut alone, to learn whether the peer answers digests. deferred, by reason: not compared, and none is silent. bare_tombstone: a tombstone no oplog entry stands behind sits above the cut on either side. horizon: the oplog above the cut cannot be read in full here. database_tombstone and burial_pending: a database drop or a purge is owed. moved: a write landed between the plan and the comparison. uncovered_cap: more uncovered keys than a request or an answer carries. budget: the scan spent its wall time or its bytes (expected when the tail is cold). busy: the peer was already answering a digest probe. incarnation: the two sides hold the collection at different incarnations. self_check_busy: a self-check was running or over its budget. Deferrals are reported, not graded; compared must be above 0 for each live pair.\n\
+             # TYPE kimmy_sync_divergence_digest_probes_total counter\n\
+             kimmy_sync_divergence_digest_probes_total{{outcome=\"compared\"}} {sync_digest_compared}\n\
+             kimmy_sync_divergence_digest_probes_total{{outcome=\"unanswered\"}} {sync_digest_unanswered}\n\
+             kimmy_sync_divergence_digest_probes_total{{outcome=\"probed\"}} {sync_digest_probed}\n\
+             {sync_digest_deferred_lines}\
+             # HELP kimmy_sync_digest_drift_total Kept digest rows a self-check found disagreeing with the records they summarise, and corrected, since the process started. A healthy node reads 0; a rising value is a bug in the digest's maintenance and is logged at ERROR.\n\
+             # TYPE kimmy_sync_digest_drift_total counter\n\
+             kimmy_sync_digest_drift_total {sync_digest_drift}\n\
              # HELP kimmy_sync_divergence_check_age_seconds Seconds since the last contact, with any peer, in which the cross-member divergence check ran, computed when this page is read. Before the first such contact, seconds since the process started, never 0; 0 on a node without clustering, so alert on it only where kimmy_task_progress_age_seconds has a replication row. Above a few multiples of cluster.sync_interval_secs, kimmy_sync_divergent_collections is holding a value nothing has re-examined, whether the rounds are failing or the loop itself is stuck - look at kimmy_sync_failures_total, kimmy_sync_peers_backing_off and kimmy_write_lock_wait_seconds.\n\
              # TYPE kimmy_sync_divergence_check_age_seconds gauge\n\
              kimmy_sync_divergence_check_age_seconds {sync_div_age}\n\
@@ -1841,6 +1896,21 @@ impl Metrics {
             sync_div_skipped = self.get(&self.sync_divergence_skips),
             sync_div_compared = self.get(&self.sync_divergence_count_compared),
             sync_div_deferred = self.get(&self.sync_divergence_count_deferred),
+            sync_digest_divergent = self.get(&self.sync_digest_divergent_collections),
+            sync_digest_compared = self.get(&self.sync_digest_compared),
+            sync_digest_unanswered = self.get(&self.sync_digest_unanswered),
+            sync_digest_probed = self.get(&self.sync_digest_probed),
+            sync_digest_deferred_lines = kimmy_storage::Defer::ALL
+                .iter()
+                .map(|reason| {
+                    format!(
+                        "kimmy_sync_divergence_digest_probes_total{{outcome=\"deferred\",reason=\"{}\"}} {}\n",
+                        reason.label(),
+                        self.get(&self.sync_digest_deferred[reason.index()])
+                    )
+                })
+                .collect::<String>(),
+            sync_digest_drift = self.get(&self.sync_digest_drift),
             sync_div_age = self.sync_divergence_check_age_secs_at(now),
             sync_skipped_unknown = self.get(&self.sync_entries_skipped_unknown_collection),
             sync_skipped_beyond = self.get(&self.sync_entries_skipped_beyond_advertised),
@@ -2545,6 +2615,12 @@ mod tests {
             divergence_skips: 33,
             divergence_count_compared: 61,
             divergence_count_deferred: 64,
+            digest_compared: 111,
+            digest_unanswered: 112,
+            digest_probed: 113,
+            digest_deferred: [121, 122, 123, 124, 125, 126, 127, 128, 129, 130],
+            digest_divergent_collections: 15,
+            digest_drift_total: 16,
             divergence_last_check: Some(now - Duration::from_secs(70)),
             last_completed_round: Some(now - Duration::from_secs(80)),
             entries_skipped_unknown_collection: 72,
@@ -2570,6 +2646,12 @@ mod tests {
             divergence_skips: 1,
             divergence_count_compared: 2,
             divergence_count_deferred: 3,
+            digest_compared: 2,
+            digest_unanswered: 3,
+            digest_probed: 4,
+            digest_deferred: [1, 2, 3, 4, 5, 6, 7, 8, 9, 10],
+            digest_divergent_collections: 7,
+            digest_drift_total: 9,
             divergence_last_check: Some(now - Duration::from_secs(71)),
             last_completed_round: Some(now - Duration::from_secs(81)),
             entries_skipped_unknown_collection: 1,
@@ -3388,6 +3470,27 @@ kimmy_sync_divergence_checks_total{outcome=\"skipped\"} 34
 # TYPE kimmy_sync_divergence_count_probes_total counter
 kimmy_sync_divergence_count_probes_total{outcome=\"compared\"} 63
 kimmy_sync_divergence_count_probes_total{outcome=\"deferred\"} 67
+# HELP kimmy_sync_digest_divergent_collections Collections the cut digest currently finds disagreeing with a peer: the two members hold different (id, stamp) sets for them once what each had not yet processed is set aside, seen on two compared checks running. Also counted in kimmy_sync_divergent_collections, which this attributes. Detect only: nothing is repaired from it. Compare (id, stamp) of the collection on both members before wiping either (operations.md, The divergence check).
+# TYPE kimmy_sync_digest_divergent_collections gauge
+kimmy_sync_digest_divergent_collections 7
+# HELP kimmy_sync_divergence_digest_probes_total Collections the cut digest looked at, by outcome. compared: both sides' digests were taken at one cut, with the keys either side had not yet processed set aside, and compared; the gauge reading 0 means the members agree only while this rises. unanswered: a checked contact whose peer returned no digest (a build before it). probed: a contact asked with the cut alone, to learn whether the peer answers digests. deferred, by reason: not compared, and none is silent. bare_tombstone: a tombstone no oplog entry stands behind sits above the cut on either side. horizon: the oplog above the cut cannot be read in full here. database_tombstone and burial_pending: a database drop or a purge is owed. moved: a write landed between the plan and the comparison. uncovered_cap: more uncovered keys than a request or an answer carries. budget: the scan spent its wall time or its bytes (expected when the tail is cold). busy: the peer was already answering a digest probe. incarnation: the two sides hold the collection at different incarnations. self_check_busy: a self-check was running or over its budget. Deferrals are reported, not graded; compared must be above 0 for each live pair.
+# TYPE kimmy_sync_divergence_digest_probes_total counter
+kimmy_sync_divergence_digest_probes_total{outcome=\"compared\"} 113
+kimmy_sync_divergence_digest_probes_total{outcome=\"unanswered\"} 115
+kimmy_sync_divergence_digest_probes_total{outcome=\"probed\"} 117
+kimmy_sync_divergence_digest_probes_total{outcome=\"deferred\",reason=\"bare_tombstone\"} 122
+kimmy_sync_divergence_digest_probes_total{outcome=\"deferred\",reason=\"horizon\"} 124
+kimmy_sync_divergence_digest_probes_total{outcome=\"deferred\",reason=\"database_tombstone\"} 126
+kimmy_sync_divergence_digest_probes_total{outcome=\"deferred\",reason=\"burial_pending\"} 128
+kimmy_sync_divergence_digest_probes_total{outcome=\"deferred\",reason=\"moved\"} 130
+kimmy_sync_divergence_digest_probes_total{outcome=\"deferred\",reason=\"uncovered_cap\"} 132
+kimmy_sync_divergence_digest_probes_total{outcome=\"deferred\",reason=\"budget\"} 134
+kimmy_sync_divergence_digest_probes_total{outcome=\"deferred\",reason=\"busy\"} 136
+kimmy_sync_divergence_digest_probes_total{outcome=\"deferred\",reason=\"incarnation\"} 138
+kimmy_sync_divergence_digest_probes_total{outcome=\"deferred\",reason=\"self_check_busy\"} 140
+# HELP kimmy_sync_digest_drift_total Kept digest rows a self-check found disagreeing with the records they summarise, and corrected, since the process started. A healthy node reads 0; a rising value is a bug in the digest's maintenance and is logged at ERROR.
+# TYPE kimmy_sync_digest_drift_total counter
+kimmy_sync_digest_drift_total 9
 # HELP kimmy_sync_divergence_check_age_seconds Seconds since the last contact, with any peer, in which the cross-member divergence check ran, computed when this page is read. Before the first such contact, seconds since the process started, never 0; 0 on a node without clustering, so alert on it only where kimmy_task_progress_age_seconds has a replication row. Above a few multiples of cluster.sync_interval_secs, kimmy_sync_divergent_collections is holding a value nothing has re-examined, whether the rounds are failing or the loop itself is stuck - look at kimmy_sync_failures_total, kimmy_sync_peers_backing_off and kimmy_write_lock_wait_seconds.
 # TYPE kimmy_sync_divergence_check_age_seconds gauge
 kimmy_sync_divergence_check_age_seconds 71
@@ -3959,6 +4062,30 @@ kimmy_storage_cache_reads_total{result=\"miss\"} 9104
             s.sync_divergence_count_deferred
         ));
         expect(&format!(
+            "kimmy_sync_digest_divergent_collections {}\n",
+            s.sync_digest_divergent_collections
+        ));
+        expect(&format!(
+            "kimmy_sync_divergence_digest_probes_total{{outcome=\"compared\"}} {}\n",
+            s.sync_digest_compared
+        ));
+        expect(&format!(
+            "kimmy_sync_divergence_digest_probes_total{{outcome=\"unanswered\"}} {}\n",
+            s.sync_digest_unanswered
+        ));
+        expect(&format!(
+            "kimmy_sync_divergence_digest_probes_total{{outcome=\"probed\"}} {}\n",
+            s.sync_digest_probed
+        ));
+        for reason in kimmy_storage::Defer::ALL {
+            expect(&format!(
+                "kimmy_sync_divergence_digest_probes_total{{outcome=\"deferred\",reason=\"{}\"}} {}\n",
+                reason.label(),
+                s.sync_digest_deferred[reason.index()]
+            ));
+        }
+        expect(&format!("kimmy_sync_digest_drift_total {}\n", s.sync_digest_drift));
+        expect(&format!(
             "kimmy_sync_divergence_check_age_seconds {}\n",
             s.sync_divergence_check_age_secs
         ));
@@ -4292,7 +4419,7 @@ kimmy_storage_cache_reads_total{result=\"miss\"} 9104
         // hole a snapshot left.
         assert_eq!(
             samples,
-            108 + 6
+            108 + 6 + 15
                 + 3 * 19
                 + 14
                 + 10 * kimmy_storage::WriterHolder::COUNT
@@ -4532,6 +4659,12 @@ kimmy_storage_cache_reads_total{result=\"miss\"} 9104
             divergence_skips: 0,
             divergence_count_compared: 2,
             divergence_count_deferred: 1,
+            digest_compared: 0,
+            digest_unanswered: 0,
+            digest_probed: 0,
+            digest_deferred: [0; 10],
+            digest_divergent_collections: 0,
+            digest_drift_total: 0,
             divergence_last_check: Some(now - Duration::from_secs(30)),
             last_completed_round: None,
             entries_skipped_unknown_collection: 0,
@@ -4557,6 +4690,12 @@ kimmy_storage_cache_reads_total{result=\"miss\"} 9104
             divergence_skips: 5,
             divergence_count_compared: 0,
             divergence_count_deferred: 4,
+            digest_compared: 0,
+            digest_unanswered: 0,
+            digest_probed: 0,
+            digest_deferred: [0; 10],
+            digest_divergent_collections: 0,
+            digest_drift_total: 0,
             divergence_last_check: Some(now - Duration::from_secs(8)),
             last_completed_round: None,
             entries_skipped_unknown_collection: 0,
@@ -4773,6 +4912,12 @@ kimmy_storage_cache_reads_total{result=\"miss\"} 9104
             divergence_skips: 0,
             divergence_count_compared: 0,
             divergence_count_deferred: 0,
+            digest_compared: 0,
+            digest_unanswered: 0,
+            digest_probed: 0,
+            digest_deferred: [0; 10],
+            digest_divergent_collections: 0,
+            digest_drift_total: 0,
             divergence_last_check: at,
             last_completed_round: None,
             entries_skipped_unknown_collection: 0,

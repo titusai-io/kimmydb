@@ -7,7 +7,7 @@ use std::time::{Duration, Instant};
 
 use kimmy_core::NodeId;
 use kimmy_storage::Engine;
-use tracing::{Instrument, debug, info, warn};
+use tracing::{Instrument, debug, error, info, warn};
 
 use crate::discovery::SeedSource;
 use crate::health::{DEFAULT_FANOUT, PeerHealth};
@@ -143,6 +143,27 @@ pub struct RoundReport {
     /// `divergence_checks` rise is a count half that has not looked at
     /// anything.
     pub divergence_count_deferred: usize,
+    /// Collections the cut digest compared in this tick (B3), equal or not.
+    /// A counter, summed over the checked contacts; flat while
+    /// `divergence_checks` rises is a digest that has looked at nothing, which
+    /// a gauge reading 0 cannot say.
+    pub digest_compared: usize,
+    /// Checked contacts whose peer answered no digest: one that predates it,
+    /// or that failed to compute it. Never compared.
+    pub digest_unanswered: usize,
+    /// Contacts asked with the cut alone, to learn whether the peer answers a
+    /// digest before this node pays for its own scan.
+    pub digest_probed: usize,
+    /// Collections not compared in this tick, by reason (`Defer::ALL` order):
+    /// none of them silent.
+    pub digest_deferred: [usize; kimmy_storage::Defer::ALL.len()],
+    /// Collections the cut digest currently has confirmed against some peer
+    /// (B3). A level. Also counted in `divergent_collections`; this says which
+    /// half moved it.
+    pub digest_divergent_collections: usize,
+    /// Kept digest rows a self-check found disagreeing with their records and
+    /// corrected, since the process started. A level; zero on a healthy node.
+    pub digest_drift_total: u64,
     /// When the check last ran against any peer — the instant of the last
     /// contact whose round ran it; `None` before the first such contact
     /// (ADR-145, ADR-154). Carried on every tick, checked or not, so it is
@@ -698,6 +719,9 @@ pub async fn replicate(engine: Arc<Engine>, config: ReplicationConfig) {
     // `health` and `stale_peers` below, it is a fact about this process's
     // ticks, not about the data.
     let mut divergence = kimmy_storage::DivergenceTracker::new();
+    // What the cut digest remembers between ticks (B3): which collections a
+    // self-check verified and when, and when a finding was last logged.
+    let mut digest_state = DigestState::default();
     // Where each peer last stood behind this node, and for how long
     // (ADR-145): what lets the count half tell a peer that is catching up
     // from one that has stopped. Owned here for the same reason as the
@@ -1305,6 +1329,20 @@ pub async fn replicate(engine: Arc<Engine>, config: ReplicationConfig) {
                                     let findings =
                                         kimmy_storage::DivergenceFindings { existence, count };
                                     divergence.observe(node, findings);
+                                    // The cut digest of the same contact (B3):
+                                    // folded into the tracker's own set, which
+                                    // no repair is planned from.
+                                    if let Some(round) = outcome.digest.take() {
+                                        fold_digest_round(
+                                            &engine,
+                                            &mut divergence,
+                                            &mut digest_state,
+                                            node,
+                                            peer,
+                                            round,
+                                            &mut report,
+                                        );
+                                    }
                                     // Detection to repair (ADR-148): what
                                     // the check has confirmed against this
                                     // peer is asked for on the next round
@@ -1499,6 +1537,8 @@ pub async fn replicate(engine: Arc<Engine>, config: ReplicationConfig) {
                 // on whether a caller wired up `on_round`, only `observe`
                 // above does, and that already ran per peer contacted.
                 report.divergent_collections = divergence.confirmed_count();
+                report.digest_divergent_collections = divergence.digest_confirmed_count();
+                report.digest_drift_total = engine.digest_drift_total();
                 // And when that reading was last re-examined (ADR-145): the
                 // tracker keeps its last value through any number of ticks
                 // in which no check ran, and this is what lets the reader
@@ -1783,6 +1823,160 @@ impl LastCheck {
     #[cfg(test)]
     fn age(&self, now: Instant) -> Option<Duration> {
         self.at().map(|at| now.saturating_duration_since(at))
+    }
+}
+
+/// How long a verified digest row is not walked again while it has not moved.
+const SELF_CHECK_MEMO: Duration = Duration::from_secs(600);
+
+/// How often a finding that stays confirmed is logged again.
+const DIGEST_WARN_EVERY: Duration = Duration::from_secs(600);
+
+/// What the loop remembers for the cut digest between ticks.
+#[derive(Default)]
+struct DigestState {
+    /// A collection's kept row as the last self-check verified it, and when:
+    /// not walked again while it is unchanged and the memo has not expired. The
+    /// memo cannot see a later record change that leaves the row alone, which
+    /// is the persistent-drift case the check exists for, so it expires.
+    verified: std::collections::HashMap<
+        kimmy_core::CollectionId,
+        (u128, BTreeMap<NodeId, kimmy_core::Hlc>, Instant),
+    >,
+    /// When each confirmed `(peer, collection)` was last logged.
+    warned: std::collections::HashMap<(NodeId, kimmy_core::CollectionId), Instant>,
+}
+
+/// Fold one contact's cut-digest round into the tracker and the report (B3).
+///
+/// **A mismatch is verified before it is reported.** The requester checks its
+/// own kept row against a walk of that one collection (one read transaction for
+/// both, a correction by XOR delta in a short write, a budget, one at a time):
+/// a row that drifted from its records would otherwise report a finding for
+/// ever. If it had drifted, the row is corrected, an ERROR is logged, the drift
+/// counted, and nothing is reported for this comparison; the next contact
+/// compares again. The peer's own drift is found by the peer's own check.
+fn fold_digest_round(
+    engine: &Engine,
+    tracker: &mut kimmy_storage::DivergenceTracker,
+    state: &mut DigestState,
+    node: NodeId,
+    peer: SocketAddr,
+    round: kimmy_storage::DigestRound,
+    report: &mut RoundReport,
+) {
+    use kimmy_storage::{Defer, DigestAnswered, DigestOutcome, SelfCheck};
+    match round.answered {
+        DigestAnswered::Unanswered => report.digest_unanswered += 1,
+        DigestAnswered::Probed => report.digest_probed += 1,
+        DigestAnswered::Busy => report.digest_deferred[Defer::Busy.index()] += 1,
+        DigestAnswered::Answered => {}
+    }
+    let mut answered_for = std::collections::HashSet::new();
+    for verdict in &round.verdicts {
+        answered_for.insert(verdict.collection);
+        match verdict.outcome {
+            DigestOutcome::Deferred(reason) => report.digest_deferred[reason.index()] += 1,
+            DigestOutcome::Compared { equal: true, .. } => {
+                report.digest_compared += 1;
+                tracker.observe_digest(node, verdict.collection, false);
+            }
+            DigestOutcome::Compared { equal: false, mine, theirs } => {
+                match verify_row(engine, state, verdict.collection) {
+                    SelfCheck::Exact => {
+                        report.digest_compared += 1;
+                        let newly = tracker.observe_digest(node, verdict.collection, true);
+                        let confirmed = tracker.is_digest_confirmed(node, verdict.collection);
+                        let key = (node, verdict.collection);
+                        let due = state
+                            .warned
+                            .get(&key)
+                            .is_none_or(|at| at.elapsed() >= DIGEST_WARN_EVERY);
+                        if confirmed && (newly || due) {
+                            state.warned.insert(key, Instant::now());
+                            let maxw = engine
+                                .digest_row(verdict.collection)
+                                .ok()
+                                .flatten()
+                                .map(|row| format!("{:?}", row.maxw))
+                                .unwrap_or_default();
+                            warn!(
+                                %peer,
+                                node = %node,
+                                collection = %verdict.collection,
+                                mine = format!("{mine:032x}"),
+                                theirs = format!("{theirs:032x}"),
+                                maxw = %maxw,
+                                "the cut digest of a collection differs from this peer's on two \
+                                 consecutive comparisons, with what each side had not yet \
+                                 processed set aside; detect only, no repair is planned. Compare \
+                                 (id, stamp) of the collection on both members before wiping either \
+                                 (operations.md, The divergence check)"
+                            );
+                        }
+                    }
+                    SelfCheck::Corrected => {
+                        // Reported as nothing: the row, not the cluster, was
+                        // wrong, and it is right now.
+                        state.verified.remove(&verdict.collection);
+                        error!(
+                            %peer,
+                            collection = %verdict.collection,
+                            "this node's kept digest of a collection disagreed with its records \
+                             and has been corrected; no divergence is reported for this comparison"
+                        );
+                    }
+                    SelfCheck::Busy => {
+                        report.digest_deferred[Defer::SelfCheckBusy.index()] += 1;
+                    }
+                }
+            }
+        }
+    }
+    for (collection, reason) in round.plan_deferred {
+        if !answered_for.contains(&collection) {
+            report.digest_deferred[reason.index()] += 1;
+        }
+    }
+}
+
+/// Verify a collection's kept digest row, unless it was verified unchanged
+/// within the memo's life. Anything but a verdict is "busy": a storage error is
+/// logged and defers the comparison rather than reporting on a row nobody could
+/// check.
+fn verify_row(
+    engine: &Engine,
+    state: &mut DigestState,
+    collection: kimmy_core::CollectionId,
+) -> kimmy_storage::SelfCheck {
+    use kimmy_storage::SelfCheck;
+    let row = match kimmy_storage::blocking(|| engine.digest_row(collection)) {
+        Ok(Some(row)) => row,
+        Ok(None) => return SelfCheck::Exact,
+        Err(e) => {
+            warn!(error = %e, %collection, "could not read this node's digest row to verify it");
+            return SelfCheck::Busy;
+        }
+    };
+    if let Some((digest, maxw, at)) = state.verified.get(&collection)
+        && *digest == row.digest
+        && *maxw == row.maxw
+        && at.elapsed() < SELF_CHECK_MEMO
+    {
+        return SelfCheck::Exact;
+    }
+    match kimmy_storage::blocking(|| {
+        engine.verify_digest_row(collection, kimmy_storage::ScanBudget::default())
+    }) {
+        Ok(SelfCheck::Exact) => {
+            state.verified.insert(collection, (row.digest, row.maxw, Instant::now()));
+            SelfCheck::Exact
+        }
+        Ok(other) => other,
+        Err(e) => {
+            warn!(error = %e, %collection, "could not verify this node's digest row");
+            SelfCheck::Busy
+        }
     }
 }
 
