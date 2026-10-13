@@ -16,6 +16,7 @@ pub mod check;
 pub mod class_step;
 pub mod codec;
 mod database_tombstone;
+pub mod digest_probe;
 pub mod divergence;
 pub mod docs;
 pub mod engine;

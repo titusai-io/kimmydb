@@ -61,6 +61,10 @@ const STOP_AWARE_WALKS: &[&str] = &[
     "index::has_entries_at",
     "index::holders_of",
     "index::scan_table",
+    // The digest probe's read of the oplog above a cut, and the self-check's
+    // walk of one collection's headers (B3).
+    "digest_probe::Engine::scan_uncovered",
+    "digest_probe::Engine::walk_headers",
     // A snapshot page served to a peer, which passes over what a drop left.
     "snapshot::Engine::snapshot_documents",
     // The marks a pull names to its peer.

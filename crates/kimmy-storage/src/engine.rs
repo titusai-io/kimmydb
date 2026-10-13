@@ -125,6 +125,12 @@ pub struct Engine {
     /// holds only as a snapshot's state (ADR-224), since start. Counted by the
     /// listener when it answers, not by the check, which push and replay also ask.
     state_held_refusals: std::sync::atomic::AtomicU64,
+    /// A digest probe is being answered: one at a time (B3 design 2.6).
+    pub(crate) digest_probe_busy: std::sync::atomic::AtomicBool,
+    /// A digest self-check is running: one at a time (B3 design 2.7).
+    pub(crate) digest_check_busy: std::sync::atomic::AtomicBool,
+    /// Kept digest rows a self-check found disagreeing with their records.
+    pub(crate) digest_drift: std::sync::atomic::AtomicU64,
     /// Durable write transactions committed, since start.
     ///
     /// redb has a single writer and every commit is an fsync, so the number of
@@ -1444,6 +1450,9 @@ impl Engine {
             undecidable_writes: std::sync::atomic::AtomicU64::new(0),
             ddl_relogged: std::sync::atomic::AtomicU64::new(0),
             state_held_refusals: std::sync::atomic::AtomicU64::new(0),
+            digest_probe_busy: std::sync::atomic::AtomicBool::new(false),
+            digest_check_busy: std::sync::atomic::AtomicBool::new(false),
+            digest_drift: std::sync::atomic::AtomicU64::new(0),
             commits: std::sync::atomic::AtomicU64::new(0),
             multi_chunk_docs: std::sync::atomic::AtomicUsize::new(
                 crate::modify::DEFAULT_MULTI_CHUNK_DOCS,

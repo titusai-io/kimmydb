@@ -92,6 +92,19 @@ impl VersionVector {
         }
     }
 
+    /// The highest position both vectors have reached, per origin: the cut at
+    /// which two members can be compared (B3). An origin only one of them has
+    /// heard of is at zero in the other, so it is absent here.
+    pub fn meet(&self, other: &VersionVector) -> VersionVector {
+        self.0
+            .iter()
+            .filter_map(|(node, hlc)| {
+                let low = (*hlc).min(other.get(*node));
+                (low > Hlc::ZERO).then_some((*node, low))
+            })
+            .collect()
+    }
+
     /// Whether this vector covers everything `theirs` reports.
     pub fn covers(&self, theirs: &VersionVector) -> bool {
         self.behind(theirs).is_none()
@@ -124,6 +137,23 @@ mod tests {
         v.observe(Stamp::new(Hlc::new(10, 0), n));
         v.observe(Stamp::new(Hlc::new(5, 0), n));
         assert_eq!(v.get(n), Hlc::new(10, 0), "an older stamp must not lower the mark");
+    }
+
+    #[test]
+    fn the_meet_is_the_lower_position_per_origin_and_drops_an_origin_one_side_lacks() {
+        let (a, b, c) = (node(), node(), node());
+        let mut mine = VersionVector::new();
+        mine.insert(a, Hlc::new(10, 0));
+        mine.insert(b, Hlc::new(4, 0));
+        mine.insert(c, Hlc::new(9, 0));
+        let mut theirs = VersionVector::new();
+        theirs.insert(a, Hlc::new(7, 0));
+        theirs.insert(b, Hlc::new(8, 0));
+        let cut = mine.meet(&theirs);
+        assert_eq!(cut.get(a), Hlc::new(7, 0));
+        assert_eq!(cut.get(b), Hlc::new(4, 0));
+        assert_eq!(cut.get(c), Hlc::ZERO, "an origin the other side lacks is at zero");
+        assert_eq!(cut, theirs.meet(&mine), "symmetric");
     }
 
     #[test]
