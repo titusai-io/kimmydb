@@ -648,6 +648,42 @@ mod tests {
         }
     }
 
+    /// The first commit of a walk that started on one stale mark deletes the
+    /// other too: the first start of a build that keeps the digests finds the
+    /// counts' mark matching (the last build kept it) and the digest mark
+    /// missing, and rewrites the counts under it otherwise (B3 design 5, N2).
+    #[test]
+    fn a_walk_started_by_one_stale_mark_deletes_the_other_with_its_first_chunk() {
+        for (which, remove) in [("the digest mark", "digest"), ("the counts mark", "counts")] {
+            let (_dir, path) = a_store();
+            {
+                let db = Database::open(&path).unwrap();
+                let txn = db.begin_write().unwrap();
+                if remove == "digest" {
+                    txn.open_table(tables::LIVE_DIGESTS_THROUGH)
+                        .unwrap()
+                        .remove(live_digest::THROUGH)
+                        .unwrap();
+                } else {
+                    txn.open_table(tables::LIVE_COUNTS_THROUGH).unwrap().remove(THROUGH).unwrap();
+                }
+                txn.commit().unwrap();
+            }
+            let (counts, digests) = marks_present(&path);
+            assert_eq!((counts, digests), (remove == "digest", remove == "counts"), "premise");
+            test_hooks::chunked_by(4, || {
+                test_hooks::fail_after_chunks(1);
+                assert!(Engine::open(&path).is_err());
+            });
+            assert_eq!(
+                marks_present(&path),
+                (false, false),
+                "with only {which} missing, a walk that stopped after its first chunk left a \
+                 mark beside rewritten rows"
+            );
+        }
+    }
+
     #[test]
     fn a_cursor_from_another_build_schema_or_format_is_discarded() {
         for tamper in ["build", "schema", "format"] {
