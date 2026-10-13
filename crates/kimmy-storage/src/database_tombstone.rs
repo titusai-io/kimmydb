@@ -373,6 +373,9 @@ impl Engine {
             }
         } else {
             self.record_tombstones_at(db, &collection.name, dropped)?;
+            // A survivor is a life created after the drop; what it took in of
+            // the life before, before it learned of the drop, goes (ADR-231).
+            self.sweep_late_drop(db, &collection.name, dropped)?;
             swept.spared += 1;
         }
         Ok(())

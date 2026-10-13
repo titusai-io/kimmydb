@@ -30,6 +30,7 @@ pub mod gc;
 pub mod health;
 pub mod hold_meter;
 pub mod index;
+mod late_drop;
 mod live_count;
 pub mod live_digest;
 mod live_walk;

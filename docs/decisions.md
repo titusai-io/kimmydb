@@ -13112,6 +13112,11 @@ exactly as `sync::apply_ddl`'s `DropCollection` arm applies one. Because it is
 the same call and not a second reading of the same rule, the two routes reach
 the same answer for every state, the `created == floor` tie included.
 
+*Amended by ADR-231:* the **ignore** branch, on both routes, now also removes from the newer life
+what it took in of the life the drop ended and sets that life's floor at the drop; the sentence below
+that says the tombstone and the floor already say as much as is needed is true of what arrives *after*
+them, and not of what arrived before.
+
 One asymmetry between them survives, and is named here so it is not later
 rediscovered as a defect: on the **ignore** branch the entries path records the
 tombstone anyway and the snapshot path does not. Both reach that branch through
@@ -26467,12 +26472,12 @@ within `tombstone_retention_secs` of any database drop made during it.
   another" is exposed to the first: the whole new database can be buried. **Recreate it on the same member, or
   wait until every member lists it gone.**
 
-**Residuals.** A survivor that merged documents of an earlier life of its name **before it learned of the
-drop** keeps them: two members creating the same name independently is convergence, and a tombstone refuses
-what comes after it and does not unwrite what came before. The survivor's count then differs from a member
-that refused the creation, and the divergence check reports it. It needs a creation concurrent with the drop
-and documents from the other life, and is the same race the Breaking note above describes. Streams pass over
-those documents by the floor. **Inherited:** a far-future stamp from a mis-clocked member (`HlcClock::observe` has no drift clamp,
+**Residuals.** ~~A survivor that merged documents of an earlier life of its name before it learned of the
+drop keeps them: a tombstone refuses what comes after it and does not unwrite what came before.~~
+**Reversed by [ADR-231](#adr-231--a-drop-that-reaches-a-newer-life-sets-its-floor-at-the-drop-and-removes-what-that-life-took-in-of-the-one-before)**:
+the survivor's sweep now removes them, and sets its floor at the drop. (Until then the survivor's count
+differed from a member that refused the creation, and the divergence check reported it for good.)
+Streams pass over those documents by the floor. **Inherited:** a far-future stamp from a mis-clocked member (`HlcClock::observe` has no drift clamp,
 ADR-163) would bury and block the database as it does a collection. A pre-drop straggler **document** stamped
 exactly at the tombstone's `Hlc` with a node above the dropper's is judged by the floor on a member that
 refused and recreated, and by the stamp on one that did not; it needs a same-`Hlc` tie and exists today for
@@ -26710,3 +26715,82 @@ rolled-back-and-forward member (the forced rebuild logs rows, bytes, chunks, ela
 stopped walk followed by a 0.47.2 start, exact counts at the end; **stop a forced walk mid-chunk, start 0.47.2
 to ready, stop it, start 0.48: the walk restarts from zero, with the reason logged, and does not resume**;
 a backup restored across the builds; a mixed pair.
+
+---
+
+## ADR-231 — A drop that reaches a newer life sets its floor at the drop and removes what that life took in of the one before
+
+> **Extends [ADR-081](#adr-081--a-recreated-collection-floors-its-previous-incarnations-at-the-drop)**
+> (the incarnation floor) to the drop that arrives *after* the life it would have floored, and **reverses the
+> residual of [ADR-229](#adr-229--a-database-drop-is-a-tombstone-filed-under-a-reserved-collection-name-and-every-member-buries-what-it-covers)**
+> ("does not unwrite what came before"). Ruled by Chris, 2026-10-13. It changes no table, schema, wire field,
+> backup tag or entry kind, so it is not a rollback boundary; it rides 0.49.0.
+
+**The defect.** A collection's id derives from its name, so a drop made on one member and a creation of the
+name made on another, before the drop replicated, are concurrent. Entries reach the second member in stamp
+order, so a document the first wrote before the drop arrives **before** the drop is known and is applied into
+the second member's own life, which has no tombstone and no floor. The drop then arrives, is judged aimed at a
+previous incarnation (`aims_at_a_previous_incarnation`: it predates the life standing) and is ignored, with
+its tombstone recorded. A drop is a wholesale purge and mints no per-document deletes, so nothing removes the
+document. The member that made the drop had removed it with the drop. Reproduced: A creates `shop.orders`,
+inserts document 1 and drops it; B, which saw none of it, creates the name afterwards and inserts document 2.
+After every exchange A holds document 2 and B holds documents 1 and 2, the existence half sees nothing, the
+count half sees 1 against 2, the divergence gauge stays at 1 on both, and the count half's repair re-serves the
+collection from its creation about every five seconds for ever and changes nothing (five rounds on each
+member in 28 s through two real `replicate` loops). A client that drops through one member and recreates
+through another before replication catches up meets it, which a round-robin front makes ordinary.
+
+**Decision.**
+
+1. **The rule.** A collection **owes a sweep** for a drop stamped `D` when `D < created` (its life began after
+   the drop) and its `incarnation_floor` is below `D` (or absent). The sweep replaces every live record of the
+   collection stamped at or before `D.hlc` with a tombstone at `D`, with no oplog entry behind it (the
+   bare-tombstone path of ADR-228: the count, the digest's `bare_max` and the index entries move in the same
+   transaction), then **takes the floor up to `D.hlc`**. A record at or before the drop in a life created
+   after it can only be a straggler of the life before: every write the member mints is above its `created`,
+   and the creation was stamped by a clock that had witnessed what it replicated. The sweep runs on every
+   member that learns of the drop and writes nothing to the oplog, so every member reaches the same state
+   without a new message. The collection's vector shadow is swept the same way.
+2. **Where it runs.** The ignore branch of the replicated `DropCollection` arm, after the tombstone is
+   recorded (a record that arrives while it runs is refused as history); the ignore branch of a snapshot's
+   drop (`restore_collection_drop`); the survivors of a database drop (ADR-229's sweep, which has already given
+   each survivor a tombstone at the drop's stamp); and a start (`reconcile_late_drops`, before the purger and
+   the cluster, as the database reconcile is), which also heals a store left with stragglers by a build before
+   this one.
+3. **The floor is the marker.** It is written last, in a commit of its own, so a sweep a stop cut short owes
+   again and the next call or start finishes it, and a store with nothing owed pays one pass over the
+   collection list at a start. A sweep of a collection with no stragglers is a read of its records and a floor.
+4. **Chunked and stop-aware.** A thousand records examined per write transaction (holder `Drop`), the stop
+   looked for between two. In an apply, a stop leaves the entry unappended and the next start redoes it, as
+   ADR-229's sweep does.
+5. **Streams are not sent deletes.** There is no entry to send; a stream that saw the straggler's insert passes
+   over it by the floor, as it passes over the documents of a life before (ADR-229, item 7).
+
+**Why this and not the alternatives.** *Refuse a write stamped at or below a held tombstone* exists already
+(`is_history`, ADR-155) and cannot help: the document arrives before the drop, so there is no tombstone to
+refuse it. *Document the limit*, as ADR-229 did for databases, leaves the divergence and the repair loop.
+*Emit a delete per document at the drop* costs the dropping member a log entry per document of a collection
+it is destroying. *Treat the two creations as one life* destroys the second member's own later writes.
+
+**Cost and exposure.** A walk of the collection's headers once per collection that owes (at most once per
+drop, then the floor stops it), under the writer a chunk at a time. At the first start after upgrade, one
+pass over every collection that holds a tombstone and was created after it, within the tombstone retention
+(24 hours by default). **Mixed roll with 0.48.0:** a member without the rule keeps its stragglers, so the
+divergence persists between old and new members until the roll completes; the start reconcile heals the
+upgraded member, and a member that is still divergent after the roll is healed by its own start.
+**Residuals.** (1) A straggler stamped at the drop's own `Hlc` by a node above the dropper's, arriving
+behind the cursor of a multi-chunk sweep that is still running, is refused by neither the tombstone (strict)
+nor the floor (set last) and stays: the same tie ADR-229 already names for databases. (2) **A write to the life the drop
+destroyed, stamped after the drop**: a member D that still holds the old life and writes Z after the drop's
+stamp, then receives the drop, loses Z with the rest of that life, while members whose lives are newer keep Z
+(stamped after the drop). That is a different divergence, from the whole-life semantics of a drop, and is
+recorded as its own finding; this rule does not change it. (3) A far-future stamp cannot trigger the sweep:
+it runs only when the drop is *below* `created`.
+
+**Tests.** `late_drop.rs`: the reproducer converges and the floor stands at the drop; the newer life's own
+documents stay and a second sweep finds nothing; a database drop's survivor loses what it took in; the
+reconcile heals a store built with the stragglers and is done once; a sweep of more than a chunk stops between
+chunks, leaves the floor unset and finishes on the next call; a record at the drop's own `Hlc` goes and one
+after it stays; a member holding the old life (above). `snapshot.rs`: a page's late drop sweeps. `replication.rs`:
+through two real loops the members agree, the gauge returns to 0 and the repair ends. The node's source check
+that a start sweeps before the purger and the cluster.

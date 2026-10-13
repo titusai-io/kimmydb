@@ -580,6 +580,20 @@ that has not yet applied a database drop is lost with it.** The same holds for
 a member that is behind longer than `storage.tombstone_retention_secs`, which
 can bring the database back.
 
+**Dropping a collection on one member and creating the same name through
+another before the drop has replicated converges since 0.49.0**
+([ADR-231](decisions.md)). The two are concurrent, and the member that made the
+second life applied the first life's documents before it learned of the drop.
+When the drop reaches it, it removes every document stamped at or before the drop
+from its own life and keeps the ones the life itself wrote, so all members hold
+the same documents. In 0.48.x the members stayed different for good (counts that
+differ, `kimmy_sync_divergent_collections` above 0, and a repair that re-ran every
+few seconds and changed nothing). The advice for databases above still stands as
+the way to avoid the window altogether. **One case is not covered:** a write made
+through a member that still holds the *first* life, after the drop's stamp and
+before that member has applied the drop, is lost with that life on that member
+and kept on the members whose lives are newer.
+
 **A drop is not atomic in one transaction, and it is atomic to a reader.**
 The collection's definition and its tombstone go in the drop's first commit and
 everything it held is removed after that, a thousand rows per commit, so the
