@@ -26583,9 +26583,18 @@ restored with the other, `check-store` clean, opened by both.
    `busy`, `incarnation`, `self_check_busy`, `error` (this side failed to plan or compare; the contact and its
    other halves go on without the digest), `malformed` (an entry of the answer did not decode) and `corrected`
    (the mismatch was this side's own row, corrected). **`incarnation` means a side holds a drop tombstone for
-   the collection's id**, the requester's own read in its transaction and the peer's reported in its entry as
-   the other deferrals are: a name dropped and created again derives the same id, and whether the other side
-   holds the same life is not something a digest can tell. It does *not* compare the two members' `created`:
+   the collection's id that the cut does not yet cover, or the standing collection is not newer than the
+   drop** (amended after round 0510; `database_tombstone` is the same rule for a database drop), the
+   requester's own read in its transaction and the peer's reported in its entry as the other deferrals are:
+   a name dropped and created again derives the same id, and a member the cut stands for that has not
+   applied the drop may still hold the life it ended, whose records are covered where the new life's are
+   not, so the digests would differ with nothing lost. Once both members have witnessed past the drop
+   (`T.hlc <= cut[T.node]`) the old life is gone from both, or the entry was lost, which is what the digest
+   is for; and a collection whose `created` is after the drop is a new life. 0.48.0 deferred for as long as
+   either side *held* the tombstone, which is the retention (24 hours by default): 81% of the digest
+   outcomes of round 0510 were such deferrals, and a recreated collection was not compared for that long.
+   A member that missed the drop for longer than the retention is the horizon's, as before
+   (`tombstone_retention_secs >= oplog_retention_secs`). It does *not* compare the two members' `created`:
    a collection created on two members at once keeps a different `created` on each for good (a replicated
    create of an existing collection is `Exists`), and the system collections of every cluster are such, so
    comparing them deferred two thirds of every probe. The creation of the name again is refused while the
@@ -26644,7 +26653,7 @@ deferral. A cheaper proof that a crash left the rows current was ruled out: an a
 so a crash or kill forces the walk. Localization of a mismatch to a key range (+~300 lines) and a repair wait
 for data from round 0510.
 
-**Cost.** Two `xxh3_128` per record write and one row per transaction per collection written. A busy
+**Cost.** Two `xxh3_128` per record write and one row per transaction per collection written. Round 0510 measured the bytes: **+7.9 KiB per commit on a single insert (+8.2%) and +8.1 KiB on a bulk of 100 (+4.1%)**, about two 4 KiB pages (the row's leaf and the path redb copies above it), with CPU, commits and fsyncs flat. The row is in a table of its own because rollback safety requires it (0.47.2 ignores an unknown table, and must never find a digest inside a page it writes), which is why it cannot share the count row's page. A busy
 collection costs a scan of the oplog tail; the duty cycle is bounded by the budget and the one-at-a-time rule
 (four members, the placeholders: up to nine scans of 200 ms per 5 s interval, 36% of one blocking thread,
 and only when every collection is busy). The first start of 0.48.0 and the start after a crash or kill of

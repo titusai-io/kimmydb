@@ -10,6 +10,12 @@ Versioning follows the pre-1.0 policy in
 [docs/compatibility.md](docs/compatibility.md): a `0.MINOR` bump may carry
 breaking changes and says so here; a `0.x.PATCH` bump never does.
 
+## Unreleased
+
+### Fixed
+
+- **The cut digest compared a recreated collection or database only after the drop's tombstone was collected.** A drop's tombstone is kept for `storage.tombstone_retention_secs` (24 hours by default), and 0.48.0 deferred a collection as `incarnation` (or `database_tombstone`) for as long as either member held one, so on a cluster that drops and recreates collections most digest outcomes were deferrals and those collections were not compared (round 0510: 81% of outcomes). It now defers only while the drop is above the cut two members share, or while the standing collection is not newer than the drop. No false finding came of the old rule; this restores coverage.
+
 ## 0.48.0 - 2026-10-13
 
 **Read before upgrading: the divergence gauge can now read above 0 where it read 0, and pages an existing alert.** 0.48.0 adds the **cut digest**, a third comparison between members. It finds a document updated on one member and not on the other, which leaves every document count equal and which no earlier check saw. It is **detect only**: a confirmed finding moves `kimmy_sync_digest_divergent_collections` and `kimmy_sync_divergent_collections`, logs a `WARN`, and plans no repair. Roll the members one at a time. Nothing here is Breaking: the wire gains optional fields that a build before it ignores, two derived tables are added that a build before it ignores, and no `kimmy.format` schema (still 4), redb version, backup tag, snapshot field or entry kind changed, so a member rolls back by starting 0.47.2 on its store.
