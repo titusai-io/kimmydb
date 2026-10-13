@@ -212,6 +212,7 @@ mod tests {
                     at_ms: None,
                     cause: None,
                     last_write_secs_ago: None,
+                    unproven_since_served: None,
                 }),
             }),
             PreviousEnd::Unclean { before: Some("task_died".into()) }
@@ -253,6 +254,7 @@ mod tests {
             at_ms: None,
             cause: None,
             last_write_secs_ago: None,
+            unproven_since_served: None,
         };
         for exit in every_exit() {
             let direct = previous_end(&PreviousRun::Ended(marker(exit)));
@@ -289,6 +291,7 @@ mod tests {
             at_ms: None,
             cause: None,
             last_write_secs_ago: None,
+            unproven_since_served: None,
         });
         assert_eq!(previous_end(&PreviousRun::Ended(failed)), PreviousEnd::StorageFailed);
         let mut bare = marker(Exit::Error);
