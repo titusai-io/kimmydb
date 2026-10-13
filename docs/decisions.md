@@ -26594,7 +26594,9 @@ restored with the other, `check-store` clean, opened by both.
    either side *held* the tombstone, which is the retention (24 hours by default): 81% of the digest
    outcomes of round 0510 were such deferrals, and a recreated collection was not compared for that long.
    A member that missed the drop for longer than the retention is the horizon's, as before
-   (`tombstone_retention_secs >= oplog_retention_secs`). It does *not* compare the two members' `created`:
+   (`tombstone_retention_secs >= oplog_retention_secs`); but `horizon` defers busy collections only, so a
+   *quiet* collection whose drop a member missed beyond the retention is compared, and a difference there is
+   a true finding. It never compares one member's `created` with the other's:
    a collection created on two members at once keeps a different `created` on each for good (a replicated
    create of an existing collection is `Exists`), and the system collections of every cluster are such, so
    comparing them deferred two thirds of every probe. The creation of the name again is refused while the

@@ -1465,6 +1465,70 @@ mod tests {
         }
     }
 
+    /// The boundaries of the covered-drop rule, at the collection tombstone's
+    /// own site (the database tombstone's are pinned below): a drop whose
+    /// `hlc` equals the standing collection's `created` is not newer than it,
+    /// and one the standing life predates, covered or not, defers; a drop whose
+    /// `hlc` equals the cut's component for its origin is covered, and one
+    /// above it is not.
+    #[test]
+    fn the_collection_tombstones_boundaries_are_pinned() {
+        let (a, b, orders, _items, _dirs) = converged();
+        // A drop stamped exactly at the creation of the life standing: the
+        // life is not newer than the drop.
+        let tie = Stamp::new(orders.created, a.node_id());
+        a.record_collection_drop(orders.id, tie).unwrap();
+        let verdicts = exchange(&a, &b, None);
+        assert_eq!(
+            outcome_of(&verdicts, orders.id),
+            Some(DigestOutcome::Deferred(Defer::Incarnation)),
+            "created equal to the drop: {verdicts:?}"
+        );
+        // A drop after the creation, covered by the cut: the life predates it.
+        let (c, d, orders, _items, _dirs2) = converged();
+        let after = c.next_stamp();
+        c.insert(&orders, doc! { "_id": 700i64 }).unwrap();
+        sync(&c, &d);
+        c.record_collection_drop(orders.id, after).unwrap();
+        let verdicts = exchange(&c, &d, None);
+        assert_eq!(
+            outcome_of(&verdicts, orders.id),
+            Some(DigestOutcome::Deferred(Defer::Incarnation)),
+            "a covered drop the standing life predates: {verdicts:?}"
+        );
+
+        // A drop at exactly the cut's component for its origin, over a life
+        // created after it: covered, so compared. One above it: not.
+        let (e, f, _orders, items, _dirs3) = converged();
+        let origin = NodeId::generate();
+        let at = Hlc::new(crate::physical_now_ms() - 5_000, 0);
+        for node in [&e, &f] {
+            let entry = kimmy_core::OplogEntry {
+                stamp: Stamp::new(at, origin),
+                kind: kimmy_core::OpKind::Insert,
+                collection: items.id,
+                doc_id: Some(DocId::Int64(8_000)),
+                body: Some(bson::serialize_to_vec(&doc! { "_id": 8000i64 }).unwrap()),
+            };
+            node.apply_remote(&items, &entry).unwrap();
+        }
+        let fresh = e.create_collection("shop", "fresh").unwrap();
+        e.insert(&fresh, doc! { "_id": 1i64 }).unwrap();
+        sync(&e, &f);
+        assert!(fresh.created > at, "premise: the life is newer than the drop");
+        e.record_collection_drop(fresh.id, Stamp::new(at, origin)).unwrap();
+        let verdicts = exchange(&e, &f, None);
+        assert_eq!(compared(&verdicts, fresh.id), Some(true), "a drop at the cut: {verdicts:?}");
+        e.record_collection_drop(fresh.id, Stamp::new(Hlc::new(at.wall_ms + 1, 0), origin))
+            .unwrap();
+        let verdicts = exchange(&e, &f, None);
+        assert_eq!(
+            outcome_of(&verdicts, fresh.id),
+            Some(DigestOutcome::Deferred(Defer::Incarnation)),
+            "a drop one above the cut: {verdicts:?}"
+        );
+    }
+
     /// A database tombstone defers a collection that was standing when the drop
     /// was made (its sweep has not buried it here yet), and one the cut does not
     /// cover; a collection created after a covered drop compares.
