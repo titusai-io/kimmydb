@@ -816,6 +816,10 @@ async fn start_and_serve(
     }
     let engine = match Engine::open_with(&path, &options) {
         Ok(engine) => {
+            // The open returns only after a forced rebuild has run to its end
+            // (a stop ends it with `Stopping`): from here an exit of this run
+            // no longer passes the decision to force on.
+            lifecycle::rebuilt(&config.storage.data_dir);
             opened.store(true, std::sync::atomic::Ordering::SeqCst);
             let engine = Arc::new(engine);
             // Kept for `run` from the moment the store is open, so that whatever

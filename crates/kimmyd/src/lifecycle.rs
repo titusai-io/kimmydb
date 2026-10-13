@@ -146,6 +146,17 @@ pub struct LastExit {
     /// before the field ignores.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub previous: Option<Earlier>,
+    /// Why the digest rows cannot be shown to be current, written by a run
+    /// that ended before its fused rebuild completed, after a start that
+    /// decided to force it (B3 design 2.1): `unclean`, `unreadable`, or
+    /// `older build <version>`. Absent on every other marker, so the next
+    /// start's decision is a function of this marker alone: forced if the
+    /// marker's own version is older than [`DIGEST_KEEPING_FROM`] or this is
+    /// present. Kept apart from `previous`, which the announce line reads. A
+    /// build before the field ignores it, and an older writer drops it, but
+    /// its own marker names its older version, which forces the rebuild.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub unproven_since_served: Option<String>,
 }
 
 /// A verdict on an earlier run, carried through a start that failed.
@@ -163,41 +174,12 @@ pub struct Earlier {
     /// last written.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_write_secs_ago: Option<u64>,
-    /// Why the digest rows cannot be trusted since the last run that served,
-    /// for the digest decision only (B3 design 2.1): `unclean`, `unreadable`,
-    /// or `older build <version>`. Carried forward through every run that
-    /// never served and ended by the first run that does; absent otherwise.
-    /// Kept apart from `exit` and `version` so that what the announce line
-    /// reports (the last run that actually ran) is unchanged. A build before
-    /// the field ignores it, and an older writer drops it, but its own marker
-    /// names its older version at the top, which forces the rebuild anyway.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub unproven_since_served: Option<String>,
 }
 
 impl Earlier {
     fn of(last: &LastExit) -> Self {
-        // What the digest decision needs, kept apart from what the announce
-        // line reports. `previous` is present on a marker exactly when the run
-        // ended before `settle`; such a run passes the question on, and a
-        // build that does not keep the digests may have changed `DOCS` before
-        // it stopped (its collector, purger and cluster tasks are spawned
-        // before `settle`), so it adds its own version to it.
-        let unproven = last.previous.as_ref().and_then(|prev| {
-            prev.unproven_since_served.clone().or_else(|| {
-                (!keeps_digests(&last.version)).then(|| format!("older build {}", last.version))
-            })
-        });
-        let mut earlier = Self::announced(last);
-        earlier.unproven_since_served = unproven;
-        earlier
-    }
-
-    /// The verdict the announce line reports, exactly as before the digest
-    /// decision: a failed start that carried something passes on what it
-    /// carried, so repeated refusals do not bury the last run that actually
-    /// ran.
-    fn announced(last: &LastExit) -> Self {
+        // A failed start that carried something passes on what it carried:
+        // repeated refusals must not bury the last run that actually ran.
         if last.failed_start
             && let Some(earlier) = &last.previous
         {
@@ -209,7 +191,6 @@ impl Earlier {
             at_ms: Some(last.at_ms),
             cause: last.cause.clone(),
             last_write_secs_ago: None,
-            unproven_since_served: None,
         }
     }
 }
@@ -241,27 +222,31 @@ pub fn keeps_digests(version: &str) -> bool {
     }
 }
 
-/// Whether the open must rebuild the live counts and the digests whatever
-/// their marks say, because the previous run cannot be shown to have left
-/// them current (B3 design 2.1).
+/// Why the open must rebuild the live counts and the digests whatever their
+/// marks say, or `None` if the previous run left them current (B3 design 2.1).
 ///
-/// Forced unless the previous run was a build that keeps the digests **and**
-/// nothing since the last run that served is unproven: a marker whose own
-/// version is older forces; so does a run that ended before serving and
-/// carries a verdict naming an unclean or unreadable end, an older build, or no
-/// version at all. `FirstStart` has no store to rebuild: the marks decide.
-pub fn digest_rebuild_forced(previous: &PreviousRun) -> bool {
+/// **The decision to force persists until a fused rebuild completes**, and is
+/// a function of the previous run's marker alone: forced if the marker's own
+/// build is older than [`DIGEST_KEEPING_FROM`] (it may have changed `DOCS`
+/// without keeping the rows, and it may have done so before it settled), if
+/// the marker carries `unproven_since_served` (a run that decided to force and
+/// ended before its rebuild completed wrote it, see [`record`]), or if there is
+/// no marker to read: a killed run or one that left an unreadable marker.
+/// `FirstStart` has no store to rebuild: the marks decide.
+pub fn digest_rebuild_reason(previous: &PreviousRun) -> Option<String> {
     match previous {
-        PreviousRun::FirstStart => false,
-        PreviousRun::Unclean { .. } | PreviousRun::Unreadable { .. } => true,
-        PreviousRun::Ended(last) => {
-            !keeps_digests(&last.version)
-                || last.previous.as_ref().is_some_and(|carried| {
-                    carried.unproven_since_served.is_some()
-                        || !carried.version.as_deref().is_some_and(keeps_digests)
-                })
-        }
+        PreviousRun::FirstStart => None,
+        PreviousRun::Unclean { .. } => Some("unclean".to_string()),
+        PreviousRun::Unreadable { .. } => Some("unreadable".to_string()),
+        PreviousRun::Ended(last) => last.unproven_since_served.clone().or_else(|| {
+            (!keeps_digests(&last.version)).then(|| format!("older build {}", last.version))
+        }),
     }
+}
+
+/// [`digest_rebuild_reason`] as the question the open asks.
+pub fn digest_rebuild_forced(previous: &PreviousRun) -> bool {
+    digest_rebuild_reason(previous).is_some()
 }
 
 impl LastExit {
@@ -279,6 +264,7 @@ impl LastExit {
             cause: None,
             failed_start: false,
             previous: None,
+            unproven_since_served: None,
         }
     }
 }
@@ -314,10 +300,21 @@ fn record(data_dir: &Path, mut last: LastExit) {
     let exit = last.exit;
     if let Some(inherited) = inherited().remove(data_dir) {
         last.failed_start = exit == Exit::Error;
-        last.previous = inherited;
+        last.previous = inherited.carried;
+        last.unproven_since_served = inherited.unproven;
     }
     if write_marker(data_dir, last, exit) {
         let _ = std::fs::remove_file(data_dir.join(PREVIOUS_FILE));
+    }
+}
+
+/// This start's fused rebuild has completed: the digest rows are current, so an
+/// exit of this run no longer passes the decision to force on, whether or not
+/// the run goes on to serve. Called by the node once the engine is open, which
+/// returns only after a forced rebuild has run to its end.
+pub fn rebuilt(data_dir: &Path) {
+    if let Some(inherited) = inherited().get_mut(data_dir) {
+        inherited.unproven = None;
     }
 }
 
@@ -506,14 +503,23 @@ fn set_aside() -> std::sync::MutexGuard<'static, std::collections::HashSet<std::
     SET_ASIDE.get_or_init(Default::default).lock().expect("never held across a panic")
 }
 
+/// What a start inherited, until it is serving.
+struct Inherited {
+    /// The verdict on the run before it, for the announce line (`None` for a
+    /// first start).
+    carried: Option<Earlier>,
+    /// The reason the start decided to force the rebuild, until the rebuild
+    /// completes ([`rebuilt`]); what an exit before then writes into its marker.
+    unproven: Option<String>,
+}
+
 /// The verdict each data directory's start inherited, until it is serving:
-/// `None` for one that carries nothing (a first start), absent once settled or
-/// never read. Keyed by directory, which a process has one of; the key keeps
+/// absent once settled or never read. Keyed by directory, which a process has one of; the key keeps
 /// tests that share a process apart.
 fn inherited()
--> std::sync::MutexGuard<'static, std::collections::HashMap<std::path::PathBuf, Option<Earlier>>> {
+-> std::sync::MutexGuard<'static, std::collections::HashMap<std::path::PathBuf, Inherited>> {
     static INHERITED: std::sync::OnceLock<
-        std::sync::Mutex<std::collections::HashMap<std::path::PathBuf, Option<Earlier>>>,
+        std::sync::Mutex<std::collections::HashMap<std::path::PathBuf, Inherited>>,
     > = std::sync::OnceLock::new();
     INHERITED.get_or_init(Default::default).lock().expect("never held across a panic")
 }
@@ -616,6 +622,12 @@ fn sync(file: &std::io::Result<std::fs::File>) -> std::io::Result<()> {
     if tests::SYNC_FAILS.with(std::cell::Cell::get) {
         return Err(std::io::Error::other("an injected sync failure"));
     }
+    // A test that writes tens of thousands of markers in a process that is
+    // never killed has nothing to lose to a power cut.
+    #[cfg(test)]
+    if tests::SYNC_SKIPPED.with(std::cell::Cell::get) {
+        return Ok(());
+    }
     match file {
         Ok(file) => file.sync_all(),
         Err(e) => Err(std::io::Error::new(e.kind(), e.to_string())),
@@ -686,7 +698,6 @@ pub fn previous_run(data_dir: &Path, database: &Path) -> PreviousRun {
             at_ms: None,
             cause: Some(error.clone()),
             last_write_secs_ago: None,
-            unproven_since_served: Some("unreadable".to_string()),
         }),
         PreviousRun::Ended(last) => Some(Earlier::of(last)),
         PreviousRun::Unclean { last_write_secs_ago, .. } => Some(Earlier {
@@ -695,10 +706,10 @@ pub fn previous_run(data_dir: &Path, database: &Path) -> PreviousRun {
             at_ms: None,
             cause: None,
             last_write_secs_ago: *last_write_secs_ago,
-            unproven_since_served: Some("unclean".to_string()),
         }),
     };
-    inherited().insert(data_dir.to_path_buf(), carried);
+    let unproven = digest_rebuild_reason(&verdict);
+    inherited().insert(data_dir.to_path_buf(), Inherited { carried, unproven });
     verdict
 }
 
@@ -899,6 +910,8 @@ mod tests {
     thread_local! {
         /// Makes every `sync` in this thread fail, as a full or failing disk does.
         pub(super) static SYNC_FAILS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+        /// Makes every `sync` in this thread a no-op, for the model test.
+        pub(super) static SYNC_SKIPPED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     }
 
     /// The review's M1: a sync that fails does not lose the marker. The rename
@@ -1004,7 +1017,6 @@ mod tests {
             at_ms: None,
             cause: None,
             last_write_secs_ago: None,
-            unproven_since_served: None,
         };
         let failed_start = |previous: Option<Earlier>| {
             let mut last = LastExit::now(Exit::Error);
@@ -1203,6 +1215,12 @@ mod tests {
         last
     }
 
+    /// A marker that carries the decision to force.
+    fn unproven(mut last: LastExit, why: &str) -> LastExit {
+        last.unproven_since_served = Some(why.to_string());
+        last
+    }
+
     fn earlier(exit: &str, version: Option<&str>) -> Earlier {
         Earlier {
             exit: exit.to_string(),
@@ -1210,13 +1228,7 @@ mod tests {
             at_ms: None,
             cause: None,
             last_write_secs_ago: None,
-            unproven_since_served: None,
         }
-    }
-
-    fn unproven(mut earlier: Earlier, why: &str) -> Earlier {
-        earlier.unproven_since_served = Some(why.to_string());
-        earlier
     }
 
     const ALL_EXITS: [Exit; 6] = [
@@ -1281,50 +1293,21 @@ mod tests {
                 true,
             ),
             (
-                "a start stopped before serving that inherited a killed run",
+                "a start stopped before its rebuild completed, that inherited a killed run",
+                PreviousRun::Ended(unproven(
+                    marker(Exit::Shutdown, "0.48.0", Some(earlier("unclean", None))),
+                    "unclean",
+                )),
+                true,
+            ),
+            (
+                "a start stopped before serving whose rebuild completed, after a killed run",
                 PreviousRun::Ended(marker(
                     Exit::Shutdown,
                     "0.48.0",
                     Some(earlier("unclean", None)),
                 )),
-                true,
-            ),
-            (
-                "a start stopped before serving that inherited an unreadable marker",
-                PreviousRun::Ended(marker(
-                    Exit::Shutdown,
-                    "0.48.0",
-                    Some(earlier("unreadable", None)),
-                )),
-                true,
-            ),
-            (
-                "a start stopped before serving that inherited an older build's stop",
-                PreviousRun::Ended(marker(
-                    Exit::Shutdown,
-                    "0.48.0",
-                    Some(earlier("shutdown", Some("0.47.2"))),
-                )),
-                true,
-            ),
-            (
-                "a start stopped before serving that inherited a verdict with no version",
-                PreviousRun::Ended(marker(
-                    Exit::Shutdown,
-                    "0.48.0",
-                    Some(earlier("shutdown", None)),
-                )),
-                true,
-            ),
-            (
-                "a digest-keeping run stopped before serving, that carries a clean stop of a \
-                 digest-keeping build but an unproven stretch behind it",
-                PreviousRun::Ended(marker(
-                    Exit::Shutdown,
-                    "0.48.0",
-                    Some(unproven(earlier("shutdown", Some("0.48.0")), "unclean")),
-                )),
-                true,
+                false,
             ),
             (
                 "an older build stopped before serving, after a digest-keeping build's stop",
@@ -1335,133 +1318,82 @@ mod tests {
                 )),
                 true,
             ),
-            (
-                "a start stopped before serving that inherited a digest-keeping build's stop",
-                PreviousRun::Ended(marker(
-                    Exit::Shutdown,
-                    "0.48.0",
-                    Some(earlier("shutdown", Some("0.48.0"))),
-                )),
-                false,
-            ),
         ];
         for (what, previous, forced) in cases {
             assert_eq!(digest_rebuild_forced(&previous), forced, "{what}: {previous:?}");
         }
     }
 
-    /// N1: every exit kind a start can make before it serves, carrying a
-    /// killed run it inherited, must still force the rebuild; the marker's own
-    /// version is the aborted start's, and says nothing about the stores.
+    /// Every exit kind a start can make before its rebuild completes, having
+    /// decided to force it, writes the decision into the marker: the marker's
+    /// own version is the aborted start's, and says nothing about the stores.
     #[test]
-    fn no_exit_kind_launders_an_inherited_unclean_verdict() {
-        for exit in ALL_EXITS {
-            let previous = PreviousRun::Ended(marker(
-                exit,
-                "0.48.0",
-                Some(unproven(earlier("unclean", None), "unclean")),
-            ));
-            assert!(digest_rebuild_forced(&previous), "{exit:?}");
-        }
-        // And the same exits after a start that served: their own version
-        // decides, and a digest-keeping one is trusted.
-        for exit in ALL_EXITS {
-            let previous = PreviousRun::Ended(marker(exit, "0.48.0", None));
-            assert!(!digest_rebuild_forced(&previous), "{exit:?} after serving");
-        }
-    }
-
-    /// H1 and the manager's gap, at `Earlier::of`: what the announce line
-    /// reports is exactly what it was (a failed start passes on what it
-    /// carried; any other run is described by itself), and the digest
-    /// decision's question is carried beside it: every run that never served
-    /// passes on whether the stretch since the last run that served is
-    /// unproven, and a build that does not keep the digests adds itself.
-    #[test]
-    fn earlier_of_reports_what_it_always_did_and_carries_the_unproven_stretch_beside_it() {
-        let inherited = unproven(earlier("unclean", None), "unclean");
-        for exit in ALL_EXITS {
-            // A digest-keeping run that never served.
-            let mut last = marker(exit, "0.48.0", Some(inherited.clone()));
-            last.failed_start = exit == Exit::Error;
-            let carried = Earlier::of(&last);
-            if last.failed_start {
-                assert_eq!(carried.exit, "unclean", "{exit:?}: the announce passes it on");
-            } else {
-                assert_eq!(carried.exit, exit.name(), "{exit:?}: described by itself");
-                assert_eq!(carried.version.as_deref(), Some("0.48.0"), "{exit:?}");
-            }
-            assert_eq!(
-                carried.unproven_since_served.as_deref(),
-                Some("unclean"),
-                "{exit:?} before serving, digest-keeping: the unclean end is still unproven"
-            );
-
-            // A run that served carries nothing.
-            let served = marker(exit, "0.48.0", None);
-            let described = Earlier::of(&served);
-            assert_eq!(described.exit, exit.name(), "{exit:?} after serving");
-            assert_eq!(described.version.as_deref(), Some("0.48.0"), "{exit:?} after serving");
-            assert_eq!(described.unproven_since_served, None, "{exit:?} after serving");
-
-            // An older build that ended before serving adds itself, whatever
-            // it inherited, and keeps what it inherited.
-            let clean = earlier("shutdown", Some("0.48.0"));
-            let mut older = marker(exit, "0.47.2", Some(clean.clone()));
-            older.failed_start = exit == Exit::Error;
-            let carried = Earlier::of(&older);
-            assert_eq!(
-                carried.unproven_since_served.as_deref(),
-                Some("older build 0.47.2"),
-                "{exit:?} before serving, older build"
-            );
-            let mut older = marker(exit, "0.47.2", Some(inherited.clone()));
-            older.failed_start = exit == Exit::Error;
-            assert_eq!(
-                Earlier::of(&older).unproven_since_served.as_deref(),
-                Some("unclean"),
-                "{exit:?}: an older run adds nothing over what was already unproven"
-            );
-        }
-    }
-
-    /// The manager's gap: an older build's run can change `DOCS` before it
-    /// settles (its collector, purger and cluster tasks are spawned first), so
-    /// it must not be transparent to a digest-keeping build after it.
-    /// (e) 0.48 serves and stops; 0.47.2 starts, and is stopped before it
-    /// settles; 0.48 starts, forced, and is stopped before its first commit;
-    /// the next 0.48 start must still be forced.
-    #[test]
-    fn a_non_serving_run_of_an_older_build_is_not_laundered_by_the_run_after_it() {
+    fn no_exit_kind_launders_a_decision_to_force() {
         let (dir, db) = dir_with_database();
-        record(dir.path(), marker(Exit::Shutdown, "0.48.0", None));
+        for exit in ALL_EXITS {
+            // A killed run: no marker, a database.
+            let _ = std::fs::remove_file(dir.path().join(LAST_EXIT_FILE));
+            let previous = previous_run(dir.path(), &db);
+            assert!(digest_rebuild_forced(&previous), "{exit:?}");
+            record(dir.path(), marker(exit, "0.48.0", None));
+            let body = std::fs::read_to_string(dir.path().join(LAST_EXIT_FILE)).unwrap();
+            let written: LastExit = toml::from_str(&body).unwrap();
+            assert_eq!(written.unproven_since_served.as_deref(), Some("unclean"), "{exit:?}");
+            assert!(digest_rebuild_forced(&PreviousRun::Ended(written)), "{exit:?}");
+        }
+        // The same exits once the rebuild has completed, served or not: the
+        // run's own version decides, and a digest-keeping one is trusted.
+        for (settled, exit) in ALL_EXITS.into_iter().flat_map(|e| [(false, e), (true, e)]) {
+            let _ = std::fs::remove_file(dir.path().join(LAST_EXIT_FILE));
+            let _ = previous_run(dir.path(), &db);
+            rebuilt(dir.path());
+            if settled {
+                settle(dir.path());
+            }
+            record(dir.path(), marker(exit, "0.48.0", None));
+            let body = std::fs::read_to_string(dir.path().join(LAST_EXIT_FILE)).unwrap();
+            let written: LastExit = toml::from_str(&body).unwrap();
+            assert_eq!(written.unproven_since_served, None, "{exit:?} settled={settled}");
+            assert!(!digest_rebuild_forced(&PreviousRun::Ended(written)), "{exit:?}");
+        }
+    }
 
-        let after_048 = previous_run(dir.path(), &db);
-        assert!(!digest_rebuild_forced(&after_048), "{after_048:?}");
-        // The older build, stopped before `settle`.
-        record(dir.path(), marker(Exit::Shutdown, "0.47.2", None));
+    /// The oracle for the announce line: `Earlier::of` as it stands on main,
+    /// copied.
+    fn main_earlier_of(last: &LastExit) -> Earlier {
+        if last.failed_start
+            && let Some(earlier) = &last.previous
+        {
+            return earlier.clone();
+        }
+        Earlier {
+            exit: last.exit.name().to_string(),
+            version: Some(last.version.clone()),
+            at_ms: Some(last.at_ms),
+            cause: last.cause.clone(),
+            last_write_secs_ago: None,
+        }
+    }
 
-        let after_047 = previous_run(dir.path(), &db);
-        assert!(digest_rebuild_forced(&after_047), "{after_047:?}");
-        // 0.48, forced, stopped before its first commit.
-        record(dir.path(), marker(Exit::Shutdown, "0.48.0", None));
-
-        let next = previous_run(dir.path(), &db);
-        assert!(
-            digest_rebuild_forced(&next),
-            "the older build's run is still the verdict: {next:?}"
-        );
-        let PreviousRun::Ended(last) = &next else { panic!("{next:?}") };
-        let carried = last.previous.as_ref().expect("carried");
-        assert_eq!(carried.version.as_deref(), Some("0.47.2"));
-        assert_eq!(carried.unproven_since_served.as_deref(), Some("older build 0.47.2"));
+    /// What the announce line reports is exactly what it was.
+    #[test]
+    fn earlier_of_reports_what_it_always_did() {
+        for exit in ALL_EXITS {
+            for failed_start in [false, true] {
+                for previous in [None, Some(earlier("unclean", None))] {
+                    let mut last = marker(exit, "0.48.0", previous);
+                    last.failed_start = failed_start;
+                    assert_eq!(Earlier::of(&last), main_earlier_of(&last), "{last:?}");
+                }
+            }
+        }
     }
 
     /// 0.47.2 reads a marker that carries the digest decision's field: serde
     /// ignores a key it does not know, and `lifecycle.rs` has no
     /// `deny_unknown_fields`. The struct definitions are 0.47.2's, copied.
     #[test]
-    fn a_marker_carrying_the_unproven_stretch_is_read_by_the_0_47_2_definition() {
+    fn a_marker_carrying_the_decision_is_read_by_the_0_47_2_definition() {
         use serde::Deserialize;
 
         #[derive(Debug, Deserialize)]
@@ -1485,10 +1417,9 @@ mod tests {
             previous: Option<Earlier047>,
         }
 
-        let body = toml::to_string(&marker(
-            Exit::Shutdown,
-            "0.48.0",
-            Some(unproven(earlier("shutdown", Some("0.48.0")), "unclean")),
+        let body = toml::to_string(&unproven(
+            marker(Exit::Shutdown, "0.48.0", Some(earlier("shutdown", Some("0.47.2")))),
+            "older build 0.47.2",
         ))
         .unwrap();
         assert!(body.contains("unproven_since_served"), "the premise: {body}");
@@ -1498,13 +1429,13 @@ mod tests {
         assert!(!read.failed_start);
         let carried = read.previous.expect("the carried verdict");
         assert_eq!(carried.exit, "shutdown");
-        assert_eq!(carried.version.as_deref(), Some("0.48.0"));
+        assert_eq!(carried.version.as_deref(), Some("0.47.2"));
 
         // And the other way: a marker 0.47.2 wrote, which has no such key,
         // reads here as no unproven stretch, with its own version at the top.
         let old = "exit = \"shutdown\"\npid = 1\nversion = \"0.47.2\"\ncommit = \"x\"\nat_ms = 1\n\n[previous]\nexit = \"unclean\"\n";
         let read: LastExit = toml::from_str(old).unwrap();
-        assert_eq!(read.previous.as_ref().and_then(|p| p.unproven_since_served.clone()), None);
+        assert_eq!(read.unproven_since_served, None);
         assert!(digest_rebuild_forced(&PreviousRun::Ended(read)), "its own version forces");
     }
 
@@ -1551,18 +1482,203 @@ mod tests {
         for start in ["first", "second"] {
             let previous = previous_run(dir.path(), &db);
             assert!(digest_rebuild_forced(&previous), "the {start} start reads {previous:?}");
-            // Stopped during the open, before `settle`: a cooperative exit
-            // by a digest-keeping build.
+            // Stopped during the open, before `settle` and before the
+            // rebuild completed: a cooperative exit by a digest-keeping build.
             record(dir.path(), marker(Exit::Shutdown, "0.48.0", None));
         }
         let third = previous_run(dir.path(), &db);
         assert!(digest_rebuild_forced(&third), "the third start reads {third:?}");
         let PreviousRun::Ended(last) = &third else { panic!("{third:?}") };
-        assert_eq!(
-            last.previous.as_ref().and_then(|p| p.unproven_since_served.as_deref()),
-            Some("unclean"),
-            "the killed run is still unproven: {last:?}"
-        );
+        assert_eq!(last.unproven_since_served.as_deref(), Some("unclean"), "{last:?}");
+    }
+
+    /// How a run of either build can end, as far as the marker is concerned.
+    #[derive(Clone, Copy, Debug)]
+    enum Run {
+        /// 0.47.2: serves, then stops clean.
+        OldServesAndStops,
+        /// 0.47.2: stopped before `settle`.
+        OldStoppedBeforeSettle,
+        /// 0.47.2: a failed start.
+        OldFailsToStart,
+        /// 0.47.2: killed after serving.
+        OldCrashAfterServing,
+        /// 0.48: killed, anywhere before it serves.
+        NewCrash,
+        /// 0.48: stopped before the open's first commit.
+        NewStopBeforeTinyCommit,
+        /// 0.48: stopped in the middle of the fused walk.
+        NewStopMidWalk,
+        /// 0.48: the walk finished, stopped before `settle`.
+        NewStopAfterWalkBeforeSettle,
+        /// 0.48: serves, then stops clean.
+        NewServesAndStops,
+        /// 0.48: killed after serving.
+        NewCrashAfterServing,
+    }
+
+    const RUNS: [Run; 10] = [
+        Run::OldServesAndStops,
+        Run::OldStoppedBeforeSettle,
+        Run::OldFailsToStart,
+        Run::OldCrashAfterServing,
+        Run::NewCrash,
+        Run::NewStopBeforeTinyCommit,
+        Run::NewStopMidWalk,
+        Run::NewStopAfterWalkBeforeSettle,
+        Run::NewServesAndStops,
+        Run::NewCrashAfterServing,
+    ];
+
+    /// A copy of a data directory's three files, for the next run to start in.
+    fn copy_dir(from: &Path) -> tempfile::TempDir {
+        let to = tempfile::tempdir().unwrap();
+        for name in ["kimmy.redb", LAST_EXIT_FILE, PREVIOUS_FILE] {
+            if from.join(name).exists() {
+                std::fs::copy(from.join(name), to.path().join(name)).unwrap();
+            }
+        }
+        to
+    }
+
+    /// One run, from its start to its end, through the real code; what the
+    /// next start will read is left in `dir`. `Err` is the model's mismatch.
+    fn run_once(dir: &Path, run: Run, dirty: bool) -> Result<(), String> {
+        let db = dir.join("kimmy.redb");
+        let previous = previous_run(dir, &db);
+        let forced = digest_rebuild_forced(&previous);
+        if forced != dirty {
+            return Err(format!(
+                "forced={forced} but an older build or a crash since the last completed rebuild is {dirty}: {previous:?}"
+            ));
+        }
+        // The announce line reads the marker through `Earlier::of`.
+        let expected = match &previous {
+            PreviousRun::Ended(last) => {
+                let (ours, main) = (Earlier::of(last), main_earlier_of(last));
+                if ours != main {
+                    return Err(format!("the announce differs from main's: {ours:?} vs {main:?}"));
+                }
+                Some(main)
+            }
+            _ => None,
+        };
+        let forget = || {
+            // The process is gone: nothing it held in memory survives.
+            inherited().remove(dir);
+            set_aside().remove(dir);
+        };
+        let old = |exit: Exit, settled: bool| {
+            // 0.47.2's `record`: the verdict it inherited, if it has not
+            // settled; no knowledge of the new field.
+            let carried = inherited().remove(dir);
+            let mut last = marker(exit, "0.47.2", None);
+            if !settled && let Some(carried) = carried {
+                last.failed_start = exit == Exit::Error;
+                last.previous = carried.carried;
+            }
+            assert!(write_marker(dir, last, exit));
+            let _ = std::fs::remove_file(dir.join(PREVIOUS_FILE));
+        };
+        match run {
+            Run::OldServesAndStops => old(Exit::Shutdown, true),
+            Run::OldStoppedBeforeSettle => old(Exit::Shutdown, false),
+            Run::OldFailsToStart => old(Exit::Error, false),
+            Run::OldCrashAfterServing => {
+                forget();
+                let _ = std::fs::remove_file(dir.join(PREVIOUS_FILE));
+            }
+            Run::NewCrash => forget(),
+            Run::NewStopBeforeTinyCommit | Run::NewStopMidWalk => {
+                record(dir, marker(Exit::Shutdown, "0.48.0", None));
+            }
+            Run::NewStopAfterWalkBeforeSettle => {
+                rebuilt(dir);
+                record(dir, marker(Exit::Shutdown, "0.48.0", None));
+            }
+            Run::NewServesAndStops => {
+                rebuilt(dir);
+                settle(dir);
+                record(dir, marker(Exit::Shutdown, "0.48.0", None));
+            }
+            Run::NewCrashAfterServing => {
+                rebuilt(dir);
+                settle(dir);
+                forget();
+            }
+        }
+        // A run that ended before it served carried what it read, as main's
+        // `record` does.
+        if let (Run::NewStopBeforeTinyCommit | Run::NewStopMidWalk, Some(expected)) =
+            (run, expected)
+        {
+            let body = std::fs::read_to_string(dir.join(LAST_EXIT_FILE)).unwrap();
+            let written: LastExit = toml::from_str(&body).unwrap();
+            if written.previous.as_ref() != Some(&expected) {
+                return Err(format!(
+                    "the marker carries {:?}, main's would carry {expected:?}",
+                    written.previous
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    /// Whether the digest rows can be shown current, by what happened: an
+    /// older build ran or a run was killed since the last completed fused
+    /// rebuild. The model, with no code of the lifecycle in it.
+    fn dirty_after(run: Run, dirty: bool) -> bool {
+        match run {
+            Run::OldServesAndStops
+            | Run::OldStoppedBeforeSettle
+            | Run::OldFailsToStart
+            | Run::OldCrashAfterServing
+            | Run::NewCrash
+            | Run::NewCrashAfterServing => true,
+            // Not forced, there was nothing to complete; forced, it did not.
+            Run::NewStopBeforeTinyCommit | Run::NewStopMidWalk => dirty,
+            Run::NewStopAfterWalkBeforeSettle | Run::NewServesAndStops => false,
+        }
+    }
+
+    fn walk_sequences(dir: &Path, dirty: bool, depth: usize, count: &mut usize) {
+        // The start after the last run of the sequence.
+        let leaf = copy_dir(dir);
+        let previous = previous_run(leaf.path(), &leaf.path().join("kimmy.redb"));
+        inherited().remove(leaf.path());
+        set_aside().remove(leaf.path());
+        assert_eq!(digest_rebuild_forced(&previous), dirty, "{previous:?}");
+        *count += 1;
+        if depth == 4 {
+            return;
+        }
+        for run in RUNS {
+            let child = copy_dir(dir);
+            if let Err(why) = run_once(child.path(), run, dirty) {
+                panic!("{run:?} after depth {depth}: {why}");
+            }
+            walk_sequences(child.path(), dirty_after(run, dirty), depth + 1, count);
+            inherited().remove(child.path());
+            set_aside().remove(child.path());
+        }
+    }
+
+    /// Every sequence of up to four runs from the ten ways a run can end:
+    /// the start decides forced exactly when an older build ran or a run was
+    /// killed since the last completed fused rebuild, and the announce line is
+    /// main's. The decision is a pure function of the marker, and the marker
+    /// an exit writes a pure function of what the start inherited, whether
+    /// its rebuild completed, and whether it served.
+    #[test]
+    fn every_sequence_of_runs_forces_the_rebuild_exactly_until_a_fused_rebuild_completes() {
+        SYNC_SKIPPED.with(|f| f.set(true));
+        let (dir, _db) = dir_with_database();
+        // The state before the first run: a digest-keeping build stopped clean.
+        assert!(write_marker(dir.path(), marker(Exit::Shutdown, "0.48.0", None), Exit::Shutdown));
+        let mut count = 0;
+        walk_sequences(dir.path(), false, 0, &mut count);
+        assert_eq!(count, 11_111, "every sequence was visited");
+        SYNC_SKIPPED.with(|f| f.set(false));
     }
 
     /// The marker is written whole or not at all: nothing temporary is left.
