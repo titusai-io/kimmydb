@@ -1966,7 +1966,7 @@ fn verify_row(
         return SelfCheck::Exact;
     }
     match kimmy_storage::blocking(|| {
-        engine.verify_digest_row(collection, kimmy_storage::ScanBudget::default())
+        engine.verify_digest_row(collection, kimmy_storage::ScanBudget::self_check())
     }) {
         Ok(SelfCheck::Exact) => {
             state.verified.insert(collection, (row.digest, row.maxw, Instant::now()));

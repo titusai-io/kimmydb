@@ -62,11 +62,26 @@ pub const ASK_KEY_BYTES: usize = 256 * 1024;
 /// keys, and of its own uncovered keys it will send back.
 pub const ANSWER_KEY_BYTES: usize = 1024 * 1024;
 
+/// The wall time a self-check's walk of one collection's headers may take.
+/// Longer than a scan of the oplog's tail, because it reads a whole collection;
+/// bounded all the same, because the loop that runs it awaits it.
+pub const SELF_CHECK_WALL: Duration = Duration::from_secs(2);
+
+/// The bytes a self-check's walk may read.
+pub const SELF_CHECK_BYTES: u64 = 128 * 1024 * 1024;
+
 /// What one scan may spend.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ScanBudget {
     pub wall: Duration,
     pub bytes: u64,
+}
+
+impl ScanBudget {
+    /// What a self-check's walk of a collection may spend.
+    pub const fn self_check() -> Self {
+        Self { wall: SELF_CHECK_WALL, bytes: SELF_CHECK_BYTES }
+    }
 }
 
 impl Default for ScanBudget {
@@ -1079,7 +1094,8 @@ mod tests {
         assert_eq!(a.digest_drift_total(), 0);
         let truth = a.digest_row(orders.id).unwrap().unwrap();
         {
-            let txn = a.db().begin_write().unwrap();
+            let db = a.db();
+            let txn = db.begin_write().unwrap();
             let mut forged = truth.clone();
             forged.digest ^= 0xabcd;
             txn.open_table(tables::LIVE_DIGESTS)
@@ -1144,7 +1160,8 @@ mod tests {
         // write's own term survives.
         {
             let truth = a.digest_row(orders.id).unwrap().unwrap();
-            let txn = a.db().begin_write().unwrap();
+            let db = a.db();
+            let txn = db.begin_write().unwrap();
             let mut forged = truth;
             forged.digest ^= 0x5555;
             txn.open_table(tables::LIVE_DIGESTS)

@@ -826,13 +826,22 @@ mod tests {
             assert!(stopped(Engine::open(&path)));
             test_hooks::clear_stop();
         });
-        // Forced, both marks absent, a usable cursor: resumed.
+        // Forced, both marks absent, a usable cursor: resumed, not restarted.
         test_hooks::chunked_by(4, || {
-            test_hooks::stop_after_rows(10);
-            assert!(stopped(Engine::open_with(&path, &OpenOptions::new().force_rebuild("a test"))));
+            let engine =
+                Engine::open_with(&path, &OpenOptions::new().force_rebuild("a test")).unwrap();
+            let (resumed, _, records) = test_hooks::last().expect("a walk ran");
+            assert!(resumed, "the forced start discarded a cursor its own build left");
+            assert_eq!(records, 7 + 8 + 9);
+            assert_counts_exact(&engine, "a forced resume");
+        });
+        // The same again, stopped part-way, for the cursor beside a mark below.
+        lose_the_marks(&path);
+        test_hooks::chunked_by(4, || {
+            test_hooks::stop_after_rows(6);
+            assert!(stopped(Engine::open(&path)));
             test_hooks::clear_stop();
         });
-        assert_eq!(cursor_of(&path).unwrap().rows, 10, "the forced start resumed, not restarted");
         // A cursor beside a mark is stale: the forced start deletes it.
         {
             let db = Database::open(&path).unwrap();

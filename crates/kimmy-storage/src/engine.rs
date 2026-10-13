@@ -5867,10 +5867,11 @@ mod tests {
         // Where a commit happens before or outside an open `Engine`, and so
         // cannot be counted by one. Each is a whole-file exemption because each
         // file's entire job is one of these.
-        const NO_ENGINE_YET: [&str; 3] = [
-            "migrate.rs", // runs on the raw database during `Engine::open`
-            "backup.rs",  // restores into a fresh file that no engine has opened
-            "engine.rs",  // `Engine::open` itself, plus the chokepoint
+        const NO_ENGINE_YET: [&str; 4] = [
+            "migrate.rs",   // runs on the raw database during `Engine::open`
+            "live_walk.rs", // the open's rebuild of the counts and digests, in chunks
+            "backup.rs",    // restores into a fresh file that no engine has opened
+            "engine.rs",    // `Engine::open` itself, plus the chokepoint
         ];
 
         let src = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
