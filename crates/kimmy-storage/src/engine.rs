@@ -131,9 +131,10 @@ pub struct Engine {
     pub(crate) digest_check_busy: std::sync::atomic::AtomicBool,
     /// Kept digest rows a self-check found disagreeing with their records.
     pub(crate) digest_drift: std::sync::atomic::AtomicU64,
-    /// Fail the next digest plan or comparison with a storage error, for the
-    /// test that a digest-only fault must not fail the contact (B3).
-    pub(crate) digest_fail_next: std::sync::atomic::AtomicBool,
+    /// Fail the digest plan or comparison that is this many calls away (1 is the
+    /// next) with a storage error, for the test that a digest-only fault must
+    /// not fail the contact (B3).
+    pub(crate) digest_fail_in: std::sync::atomic::AtomicU32,
     /// Durable write transactions committed, since start.
     ///
     /// redb has a single writer and every commit is an fsync, so the number of
@@ -1456,7 +1457,7 @@ impl Engine {
             digest_probe_busy: std::sync::atomic::AtomicBool::new(false),
             digest_check_busy: std::sync::atomic::AtomicBool::new(false),
             digest_drift: std::sync::atomic::AtomicU64::new(0),
-            digest_fail_next: std::sync::atomic::AtomicBool::new(false),
+            digest_fail_in: std::sync::atomic::AtomicU32::new(0),
             commits: std::sync::atomic::AtomicU64::new(0),
             multi_chunk_docs: std::sync::atomic::AtomicUsize::new(
                 crate::modify::DEFAULT_MULTI_CHUNK_DOCS,

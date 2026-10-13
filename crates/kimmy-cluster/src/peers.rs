@@ -986,6 +986,9 @@ pub async fn replicate(engine: Arc<Engine>, config: ReplicationConfig) {
                 // pulled out on its own so it is a function with a test
                 // rather than a branch inside this loop.
                 let mine_collections = engine.all_collection_ids();
+                if let Ok(held) = &mine_collections {
+                    digest_state.prune(held);
+                }
                 if let Err(e) = &mine_collections {
                     warn!(error = %e, "divergence check: could not list this node's own \
                           collections; skipping this tick's probe rotation");
@@ -1847,6 +1850,16 @@ struct DigestState {
     warned: std::collections::HashMap<(NodeId, kimmy_core::CollectionId), Instant>,
 }
 
+impl DigestState {
+    /// Forget what is about a collection this node no longer holds, and what
+    /// has outlived its use: a drop-and-recreate would otherwise inherit a
+    /// warning's timer, and the maps would only grow.
+    fn prune(&mut self, held: &BTreeSet<kimmy_core::CollectionId>) {
+        self.verified.retain(|id, (_, _, at)| held.contains(id) && at.elapsed() < SELF_CHECK_MEMO);
+        self.warned.retain(|(_, id), at| held.contains(id) && at.elapsed() < DIGEST_WARN_EVERY * 6);
+    }
+}
+
 /// Fold one contact's cut-digest round into the tracker and the report (B3).
 ///
 /// **A mismatch is verified before it is reported.** The requester checks its
@@ -1866,12 +1879,18 @@ fn fold_digest_round(
     report: &mut RoundReport,
 ) {
     use kimmy_storage::{Defer, DigestAnswered, DigestOutcome, SelfCheck};
+    // Per collection where the design says per collection: a contact that came
+    // to nothing for all of them (a busy peer, this side's failure) is counted
+    // against each of the collections it planned over.
     match round.answered {
         DigestAnswered::Unanswered => report.digest_unanswered += 1,
         DigestAnswered::Probed => report.digest_probed += 1,
-        DigestAnswered::Busy => report.digest_deferred[Defer::Busy.index()] += 1,
+        DigestAnswered::Busy => report.digest_deferred[Defer::Busy.index()] += round.held.max(1),
+        DigestAnswered::Failed => report.digest_deferred[Defer::Error.index()] += round.held.max(1),
         DigestAnswered::Answered => {}
     }
+    // Entries of the peer's answer that did not decode, dropped.
+    report.digest_deferred[Defer::Malformed.index()] += round.malformed;
     let mut answered_for = std::collections::HashSet::new();
     for verdict in &round.verdicts {
         answered_for.insert(verdict.collection);
@@ -1919,6 +1938,7 @@ fn fold_digest_round(
                         // Reported as nothing: the row, not the cluster, was
                         // wrong, and it is right now.
                         state.verified.remove(&verdict.collection);
+                        report.digest_deferred[Defer::Corrected.index()] += 1;
                         error!(
                             %peer,
                             collection = %verdict.collection,

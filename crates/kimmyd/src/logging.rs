@@ -1692,13 +1692,6 @@ impl TelemetryGuard {
         );
         observe!(
             u64_observable_counter,
-            "kimmy.sync.divergence_digest_probes.deferred.burial_pending",
-            "{collection}",
-            "Collections the cut digest did not compare, for this reason (burial_pending).",
-            |s| s.sync_digest_deferred[kimmy_storage::Defer::BurialPending.index()]
-        );
-        observe!(
-            u64_observable_counter,
             "kimmy.sync.divergence_digest_probes.deferred.moved",
             "{collection}",
             "Collections the cut digest did not compare, for this reason (moved).",
@@ -1738,6 +1731,27 @@ impl TelemetryGuard {
             "{collection}",
             "Collections the cut digest did not compare, for this reason (self_check_busy).",
             |s| s.sync_digest_deferred[kimmy_storage::Defer::SelfCheckBusy.index()]
+        );
+        observe!(
+            u64_observable_counter,
+            "kimmy.sync.divergence_digest_probes.deferred.error",
+            "{collection}",
+            "Collections the cut digest did not compare, for this reason (error).",
+            |s| s.sync_digest_deferred[kimmy_storage::Defer::Error.index()]
+        );
+        observe!(
+            u64_observable_counter,
+            "kimmy.sync.divergence_digest_probes.deferred.malformed",
+            "{collection}",
+            "Collections the cut digest did not compare, for this reason (malformed).",
+            |s| s.sync_digest_deferred[kimmy_storage::Defer::Malformed.index()]
+        );
+        observe!(
+            u64_observable_counter,
+            "kimmy.sync.divergence_digest_probes.deferred.corrected",
+            "{collection}",
+            "Collections the cut digest did not compare, for this reason (corrected).",
+            |s| s.sync_digest_deferred[kimmy_storage::Defer::Corrected.index()]
         );
         observe!(
             u64_observable_counter,

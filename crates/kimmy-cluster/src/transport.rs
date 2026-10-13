@@ -3209,7 +3209,7 @@ impl PeerStalls {
     /// Remember that `peer` answers digests, once it has: only to such a peer
     /// does this node pay for its own scan before asking (B3).
     fn note_digest(&mut self, peer: NodeId, round: Option<&kimmy_storage::DigestRound>) {
-        use kimmy_storage::DigestAnswered::{Answered, Busy, Probed, Unanswered};
+        use kimmy_storage::DigestAnswered::{Answered, Busy, Failed, Probed, Unanswered};
         match round.map(|r| r.answered) {
             Some(Answered | Busy | Probed) => {
                 self.digest_capable.insert(peer);
@@ -3220,7 +3220,8 @@ impl PeerStalls {
             Some(Unanswered) => {
                 self.digest_capable.remove(&peer);
             }
-            None => {}
+            // This side's own failure says nothing of the peer.
+            Some(Failed) | None => {}
         }
     }
 
@@ -4004,24 +4005,38 @@ where
     // so a peer that predates the digest is not made to wait on a scan it will
     // ignore.
     let budget = kimmy_storage::ScanBudget::default();
+    // A fault of the digest's own (a record the scan cannot decode, a row that
+    // cannot be read) costs the digest and never the contact: the existence and
+    // count findings of this round, and the pull already applied, must not be
+    // lost to it. Only a stop is fatal.
+    let mut failed = false;
     let plan = match &digest {
-        Some(ctx) if ctx.capable => Some(
-            kimmy_storage::blocking(|| engine.digest_plan(ctx.theirs_witnessed, ctx.busy, budget))
-                .map_err(|e| from_storage(e, ProtocolError::Malformed))?,
-        ),
+        Some(ctx) if ctx.capable => {
+            let planned = degrade_digest(
+                "plan",
+                kimmy_storage::blocking(|| {
+                    engine.digest_plan(ctx.theirs_witnessed, ctx.busy, budget)
+                }),
+            )?;
+            failed = planned.is_none();
+            planned
+        }
         _ => None,
     };
     let ask = match (&plan, &digest) {
+        _ if failed => None,
         (Some(plan), _) => Some(plan.ask.clone()),
-        (None, Some(ctx)) => {
-            let mine =
-                engine.witnessed_vector().map_err(|e| ProtocolError::Malformed(e.to_string()))?;
-            Some(kimmy_storage::DigestAsk {
+        (None, Some(ctx)) => match degrade_digest("plan", engine.witnessed_vector())? {
+            Some(mine) => Some(kimmy_storage::DigestAsk {
                 cut: mine.meet(ctx.theirs_witnessed),
                 uncovered: Vec::new(),
                 busy: ctx.busy,
-            })
-        }
+            }),
+            None => {
+                failed = true;
+                None
+            }
+        },
         (None, None) => None,
     };
 
@@ -4048,41 +4063,50 @@ where
         };
 
     // `T2`: every predicate again and the comparison, against the fresh state.
+    use kimmy_storage::{DigestAnswered, DigestRound};
+    let held = plan.as_ref().map_or(1, |p| p.collections().max(1));
     let round = match digest {
         None => None,
+        Some(_) if failed => {
+            let mut round = DigestRound::new(DigestAnswered::Failed);
+            round.held = 1;
+            Some(round)
+        }
         Some(_) => Some(match (digests, digest_busy) {
             (Some(reply), _) => match plan {
                 Some(plan) => {
                     let theirs: BTreeMap<CollectionId, Hlc> =
                         peer_incarnations.iter().copied().collect();
-                    let verdicts = kimmy_storage::blocking(|| {
-                        engine.digest_compare(&plan, &reply, &theirs, budget)
-                    })
-                    .map_err(|e| from_storage(e, ProtocolError::Malformed))?;
-                    kimmy_storage::DigestRound {
-                        answered: kimmy_storage::DigestAnswered::Answered,
-                        verdicts,
-                        plan_deferred: plan.deferred().collect(),
+                    match degrade_digest(
+                        "comparison",
+                        kimmy_storage::blocking(|| {
+                            engine.digest_compare(&plan, &reply, &theirs, budget)
+                        }),
+                    )? {
+                        Some(verdicts) => DigestRound {
+                            answered: DigestAnswered::Answered,
+                            verdicts,
+                            plan_deferred: plan.deferred().collect(),
+                            held,
+                            malformed: reply.malformed as usize,
+                        },
+                        None => {
+                            let mut round = DigestRound::new(DigestAnswered::Failed);
+                            round.held = held;
+                            round
+                        }
                     }
                 }
                 // Asked with the cut alone: nothing to compare yet, and the
                 // peer is known to answer from now on.
-                None => kimmy_storage::DigestRound {
-                    answered: kimmy_storage::DigestAnswered::Probed,
-                    verdicts: Vec::new(),
-                    plan_deferred: Vec::new(),
-                },
+                None => DigestRound::new(DigestAnswered::Probed),
             },
-            (None, true) => kimmy_storage::DigestRound {
-                answered: kimmy_storage::DigestAnswered::Busy,
-                verdicts: Vec::new(),
-                plan_deferred: Vec::new(),
-            },
-            (None, false) => kimmy_storage::DigestRound {
-                answered: kimmy_storage::DigestAnswered::Unanswered,
-                verdicts: Vec::new(),
-                plan_deferred: Vec::new(),
-            },
+            (None, true) => {
+                let mut round = DigestRound::new(DigestAnswered::Busy);
+                round.held = held;
+                round
+            }
+            (None, false) => DigestRound::new(DigestAnswered::Unanswered),
         }),
     };
 
@@ -4097,6 +4121,42 @@ where
         incarnations: peer_incarnations.into_iter().collect(),
     };
     Ok((kimmy_storage::compare_divergence(&mine, &peer), round))
+}
+
+/// A storage error of the digest's own: a stop is fatal to the contact, as
+/// anything is that must end it; anything else is logged (at most once a
+/// minute, since a persistent fault recurs every contact) and costs only the
+/// digest, which the caller counts as `deferred{reason="error"}`.
+fn degrade_digest<T>(
+    what: &str,
+    result: std::result::Result<T, kimmy_storage::StorageError>,
+) -> Result<Option<T>, ProtocolError> {
+    static LAST_WARNED_SECS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    match result {
+        Ok(value) => Ok(Some(value)),
+        Err(e @ kimmy_storage::StorageError::Stopping(_)) => {
+            Err(from_storage(e, ProtocolError::Malformed))
+        }
+        Err(e) => {
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0, |d| d.as_secs());
+            let last = LAST_WARNED_SECS.load(std::sync::atomic::Ordering::Relaxed);
+            if now.saturating_sub(last) >= 60
+                && LAST_WARNED_SECS
+                    .compare_exchange(
+                        last,
+                        now,
+                        std::sync::atomic::Ordering::Relaxed,
+                        std::sync::atomic::Ordering::Relaxed,
+                    )
+                    .is_ok()
+            {
+                warn!(error = %e, step = what, "the cut digest failed on this side; the contact goes on without it");
+            }
+            Ok(None)
+        }
+    }
 }
 
 /// What the digest probe of one contact needs beyond the count probe's (B3).
@@ -9319,6 +9379,115 @@ mod partial_windows_never_skip {
                 busy,
                 "a peer that said it was busy answers digests; one that sent none does not"
             );
+        }
+    }
+
+    /// What the first `AskDivergence` of a round carried, read by a fake peer
+    /// that then answers it as a build before the digest would.
+    async fn the_request_of_a_round(
+        engine: &Engine,
+        theirs: VersionVector,
+        window: Vec<OplogEntry>,
+        probe: Option<DivergenceProbe>,
+        stalls: &mut PeerStalls,
+    ) -> Option<kimmy_storage::DigestAsk> {
+        let (ours, mut peer_end) = tokio::io::duplex(MAX_FRAME);
+        let peer = tokio::spawn(async move {
+            let Ok(Message::AskVersions { .. }) = read_frame(&mut peer_end).await else {
+                return None;
+            };
+            let vectors = Message::Vectors {
+                servable: theirs.clone(),
+                witnessed: theirs,
+                facts: None,
+                facts_gen: None,
+                echo: None,
+                replay_from: None,
+            };
+            write_frame(&mut peer_end, &vectors).await.unwrap();
+            if !window.is_empty() {
+                let Ok(Message::AskEntries { .. }) = read_frame(&mut peer_end).await else {
+                    return None;
+                };
+                let scanned_to = window.last().unwrap().stamp.hlc;
+                let entries = Message::Entries {
+                    entries: window,
+                    scanned_to,
+                    exhausted: true,
+                    passed_through: None,
+                };
+                write_frame(&mut peer_end, &entries).await.unwrap();
+            }
+            let Ok(Message::AskDivergence { digest, .. }) = read_frame(&mut peer_end).await else {
+                return None;
+            };
+            let answer = Message::Divergence {
+                collections: Vec::new(),
+                probe_count: None,
+                incarnations: Vec::new(),
+                digests: None,
+                digest_busy: false,
+            };
+            write_frame(&mut peer_end, &answer).await.unwrap();
+            digest
+        });
+        let addr: SocketAddr = "127.0.0.1:1".parse().unwrap();
+        sync_over_within(
+            engine,
+            ours,
+            addr,
+            kimmy_core::NodeId::from_bytes([9; 16]),
+            probe,
+            stalls,
+            Duration::from_secs(5),
+        )
+        .await
+        .expect("the round");
+        peer.await.unwrap()
+    }
+
+    /// F3 (N10) and F4 (M7b): the request names the busy collection the rotation
+    /// chose, and carries the digest, at both places a round asks: when there is
+    /// nothing to pull, and when a pull reached the peer's tail. The count probe
+    /// is not in play at the second (no probe is named), so the digest rides
+    /// without it.
+    #[tokio::test]
+    async fn the_request_names_the_busy_collection_and_is_made_without_a_count_probe() {
+        let named = kimmy_core::CollectionId(77);
+        let origin = kimmy_core::NodeId::from_bytes([3; 16]);
+        let me = kimmy_core::NodeId::from_bytes([9; 16]);
+        let probe = || Some(DivergenceProbe { id: named, mine_count: None, mine_at: None });
+        for pulled in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let engine = Engine::open(&dir.path().join("kimmy.redb")).unwrap();
+            let orders = engine.create_collection("shop", "orders").unwrap();
+            let mut theirs = VersionVector::new();
+            let window = if pulled {
+                theirs.insert(origin, Hlc::new(4_000, 0));
+                vec![OplogEntry {
+                    stamp: kimmy_core::Stamp::new(Hlc::new(4_000, 0), origin),
+                    kind: kimmy_core::OpKind::Insert,
+                    collection: orders.id,
+                    doc_id: Some(kimmy_core::DocId::Int64(1)),
+                    body: Some(bson::serialize_to_vec(&bson::doc! { "_id": 1 }).unwrap()),
+                }]
+            } else {
+                Vec::new()
+            };
+            let mut stalls = PeerStalls::new();
+            stalls.digest_capable.insert(me);
+            let ask = the_request_of_a_round(
+                &engine,
+                theirs,
+                window,
+                if pulled { None } else { probe() },
+                &mut stalls,
+            )
+            .await
+            .unwrap_or_else(|| panic!("the request carried a digest (pulled: {pulled})"));
+            if !pulled {
+                assert_eq!(ask.busy, Some(named), "the rotation's collection is named");
+            }
         }
     }
 }

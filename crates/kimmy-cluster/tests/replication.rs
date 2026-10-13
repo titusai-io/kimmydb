@@ -9564,3 +9564,126 @@ async fn a_write_the_peer_has_not_seen_is_no_finding() {
          {round:?}"
     );
 }
+
+/// F1: a fault of the digest's own on the requester costs the digest and never
+/// the contact. The existence and count findings of the round are reported, the
+/// pull already applied is not lost to a failed round, and the failure is
+/// counted (`deferred{reason="error"}`).
+#[tokio::test]
+async fn a_digest_fault_on_the_requester_costs_the_digest_and_not_the_contact() {
+    use kimmy_cluster::transport::sync_once_with;
+    for calls in [1u32, 2] {
+        let a = node().await;
+        let b = node().await;
+        let ca = a.engine.create_collection("shop", "orders").unwrap();
+        for i in 0..4i64 {
+            a.engine.insert(&ca, doc! { "_id": i }).unwrap();
+        }
+        sync(&a, &b).await;
+        sync(&a, &b).await;
+        let probe = |engine: &Engine| {
+            Some(DivergenceProbe {
+                id: ca.id,
+                mine_count: engine.count_by_id(ca.id).unwrap(),
+                mine_at: None,
+            })
+        };
+        let mut stalls = PeerStalls::new();
+        // The first contact only learns that the peer answers digests.
+        sync_once_with(&b.engine, a.addr, SECRET, probe(&b.engine), &mut stalls).await.unwrap();
+        // The plan (calls 1) or the comparison (calls 2) fails.
+        b.engine.fail_digest_probe_in_for_test(calls);
+        let outcome = sync_once_with(&b.engine, a.addr, SECRET, probe(&b.engine), &mut stalls)
+            .await
+            .expect("a digest-only fault must not fail the contact");
+        assert_eq!(outcome.divergent, Some(BTreeSet::new()), "the existence half ran: {outcome:?}");
+        assert_eq!(outcome.count_probe, Some((ca.id, false)), "the count half ran: {outcome:?}");
+        let round = outcome.digest.expect("the round says what happened");
+        assert_eq!(round.answered, kimmy_storage::DigestAnswered::Failed, "calls {calls}");
+        assert!(round.held >= 1);
+        // And the next contact compares again.
+        let next =
+            sync_once_with(&b.engine, a.addr, SECRET, probe(&b.engine), &mut stalls).await.unwrap();
+        assert_eq!(next.digest.unwrap().answered, kimmy_storage::DigestAnswered::Answered);
+    }
+}
+
+/// The round reads the peer's write before the digest is asked, so this shows
+/// only that a named collection compares end to end; that the name reaches the
+/// peer is the transport test's (`the_request_names_the_busy_collection_...`).
+#[tokio::test]
+async fn the_collection_the_rotation_names_is_compared_when_it_is_busy_on_the_peer() {
+    use kimmy_cluster::transport::sync_once_with;
+    let a = node().await;
+    let b = node().await;
+    let ca = a.engine.create_collection("shop", "orders").unwrap();
+    for i in 0..4i64 {
+        a.engine.insert(&ca, doc! { "_id": i }).unwrap();
+    }
+    sync(&a, &b).await;
+    sync(&a, &b).await;
+    // B takes a write A has not seen: busy on B, quiet on A.
+    b.engine
+        .insert(&b.engine.get_collection("shop", "orders").unwrap(), doc! { "_id": 99i64 })
+        .unwrap();
+    let probe = Some(DivergenceProbe { id: ca.id, mine_count: None, mine_at: None });
+    let mut stalls = PeerStalls::new();
+    sync_once_with(&a.engine, b.addr, SECRET, probe.clone(), &mut stalls).await.unwrap();
+    let outcome = sync_once_with(&a.engine, b.addr, SECRET, probe, &mut stalls).await.unwrap();
+    let round = outcome.digest.expect("asked in full");
+    assert_eq!(
+        compared(&round, ca.id),
+        Some(true),
+        "named by the rotation, busy on the peer, and compared: {round:?}"
+    );
+}
+
+/// F3 (M5): a responder already answering a digest probe says so, end to end,
+/// and the requester reads `Busy`, not `Unanswered`.
+#[tokio::test]
+async fn a_responder_already_answering_says_busy_and_not_nothing() {
+    use kimmy_cluster::transport::sync_once_with;
+    let a = node().await;
+    let b = node().await;
+    let ca = a.engine.create_collection("shop", "orders").unwrap();
+    a.engine.insert(&ca, doc! { "_id": 1i64 }).unwrap();
+    sync(&a, &b).await;
+    sync(&a, &b).await;
+    let mut stalls = PeerStalls::new();
+    sync_once_with(&b.engine, a.addr, SECRET, None, &mut stalls).await.unwrap();
+    let held = a.engine.hold_digest_probe_for_test();
+    let outcome = sync_once_with(&b.engine, a.addr, SECRET, None, &mut stalls).await.unwrap();
+    let round = outcome.digest.expect("asked");
+    assert_eq!(round.answered, kimmy_storage::DigestAnswered::Busy, "{round:?}");
+    assert!(round.verdicts.is_empty());
+    drop(held);
+    let outcome = sync_once_with(&b.engine, a.addr, SECRET, None, &mut stalls).await.unwrap();
+    assert_eq!(outcome.digest.unwrap().answered, kimmy_storage::DigestAnswered::Answered);
+}
+
+/// F4: the digest is asked whether or not the count probe is gated. A peer
+/// that is behind this node and still advancing defers the count half; the
+/// digest goes on.
+#[tokio::test]
+async fn the_digest_is_asked_when_the_count_half_is_gated() {
+    use kimmy_cluster::transport::sync_once_with;
+    let a = node().await;
+    let b = node().await;
+    let ca = a.engine.create_collection("shop", "orders").unwrap();
+    a.engine.insert(&ca, doc! { "_id": 1i64 }).unwrap();
+    sync(&a, &b).await;
+    sync(&a, &b).await;
+    // B writes; A, the peer, has not pulled it: A is behind B and not frozen.
+    b.engine
+        .insert(&b.engine.get_collection("shop", "orders").unwrap(), doc! { "_id": 2i64 })
+        .unwrap();
+    let probe = Some(DivergenceProbe {
+        id: ca.id,
+        mine_count: b.engine.count_by_id(ca.id).unwrap(),
+        mine_at: Some(b.engine.witnessed_vector().unwrap()),
+    });
+    let mut stalls = PeerStalls::new();
+    let outcome = sync_once_with(&b.engine, a.addr, SECRET, probe, &mut stalls).await.unwrap();
+    assert!(outcome.count_probe_deferred, "the premise: the count half was gated: {outcome:?}");
+    assert!(outcome.digest.is_some(), "the digest is asked all the same: {outcome:?}");
+}

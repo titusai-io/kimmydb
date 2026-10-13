@@ -1862,6 +1862,7 @@ mod tests {
 
         // An answer with digests round-trips.
         let reply = kimmy_storage::DigestReply {
+            malformed: 0,
             entries: vec![kimmy_storage::DigestEntry {
                 collection: CollectionId(u64::MAX),
                 digest: serde_bytes::ByteBuf::from(vec![7; 16]),
@@ -1938,9 +1939,29 @@ mod tests {
         else {
             panic!("a Divergence")
         };
-        let entries = digests.expect("the answer still stands").entries;
-        assert_eq!(entries.len(), 1, "the entry with a reason this build does not know is dropped");
-        assert_eq!(entries[0].collection, CollectionId(5));
+        let reply = digests.expect("the answer still stands");
+        assert_eq!(
+            reply.entries.len(),
+            1,
+            "the entry with a reason this build does not know is dropped"
+        );
+        assert_eq!(reply.entries[0].collection, CollectionId(5));
+        assert_eq!(reply.malformed, 1, "and counted, so that it is not silent");
+
+        // The request's uncovered lists are read the same way (N6d).
+        let good = bson::serialize_to_bson(&kimmy_storage::Uncovered {
+            collection: CollectionId(5),
+            keys: vec![serde_bytes::ByteBuf::from(vec![1])],
+        })
+        .unwrap();
+        let ask = frame(bson::doc! { "AskDivergence": { "probe": null, "digest": {
+        "cut": {}, "uncovered": [ "not an entry", good ] } } });
+        let Message::AskDivergence { digest, .. } = read_frame(&mut ask.as_slice()).await.unwrap()
+        else {
+            panic!("an AskDivergence")
+        };
+        let uncovered = digest.expect("the request stands").uncovered;
+        assert_eq!(uncovered.len(), 1, "the bad list is dropped and the good one kept");
     }
 
     #[tokio::test]

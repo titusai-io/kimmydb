@@ -1738,7 +1738,7 @@ impl Metrics {
              # HELP kimmy_sync_horizon_state_held_total Pulls this node refused because the window would have crossed history it holds only as the state a snapshot gave it, not because retention removed it (ADR-224). The member asking is told BeyondHorizon; it asks another member first and takes a snapshot only if none can serve it. Not an error: 0 on a member that never caught up by a whole-database snapshot, and a few after one while members behind its grant ask it first.\n\
              # TYPE kimmy_sync_horizon_state_held_total counter\n\
              kimmy_sync_horizon_state_held_total {sync_horizon_state_held}\n\
-             # HELP kimmy_sync_divergent_collections Collections a periodic cross-member check currently finds disagreeing with a peer - held there and not here, or held by both with a different document count - confirmed on two checks running. 0 on a converged cluster. Moves for a divergence that leaves every other sync series reading healthy, because nothing about it fails a round.\n\
+             # HELP kimmy_sync_divergent_collections Collections a periodic cross-member check currently finds disagreeing with a peer - held there and not here, held by both with a different document count, or (0.48.0) held by both with a different set of (id, stamp) pairs, which kimmy_sync_digest_divergent_collections attributes and which nothing repairs - confirmed on two checks running. 0 on a converged cluster. Moves for a divergence that leaves every other sync series reading healthy, because nothing about it fails a round.\n\
              # TYPE kimmy_sync_divergent_collections gauge\n\
              kimmy_sync_divergent_collections {sync_divergent}\n\
              # HELP kimmy_sync_divergence_checks_total Contacts with a peer in which the cross-member divergence check above ran, and rounds that did not run it - completed with the pull truncated by the batch cap, or failed. kimmy_sync_divergent_collections reading 0 is evidence that the peers agree only while ran is rising; ran flat while skipped rises means nothing looked, which a bare 0 cannot say. A round that failed is counted in kimmy_sync_failures_total and here as skipped, so ran plus skipped is every round attempted.\n\
@@ -1752,7 +1752,7 @@ impl Metrics {
              # HELP kimmy_sync_digest_divergent_collections Collections the cut digest currently finds disagreeing with a peer: the two members hold different (id, stamp) sets for them once what each had not yet processed is set aside, seen on two compared checks running. Also counted in kimmy_sync_divergent_collections, which this attributes. Detect only: nothing is repaired from it. Compare (id, stamp) of the collection on both members before wiping either (operations.md, The divergence check).\n\
              # TYPE kimmy_sync_digest_divergent_collections gauge\n\
              kimmy_sync_digest_divergent_collections {sync_digest_divergent}\n\
-             # HELP kimmy_sync_divergence_digest_probes_total Collections the cut digest looked at, by outcome. compared: both sides' digests were taken at one cut, with the keys either side had not yet processed set aside, and compared; the gauge reading 0 means the members agree only while this rises. unanswered: a checked contact whose peer returned no digest (a build before it). probed: a contact asked with the cut alone, to learn whether the peer answers digests. deferred, by reason: not compared, and none is silent. bare_tombstone: a tombstone no oplog entry stands behind sits above the cut on either side. horizon: the oplog above the cut cannot be read in full here. database_tombstone and burial_pending: a database drop or a purge is owed. moved: a write landed between the plan and the comparison. uncovered_cap: more uncovered keys than a request or an answer carries. budget: the scan spent its wall time or its bytes (expected when the tail is cold). busy: the peer was already answering a digest probe. incarnation: the two sides hold the collection at different incarnations. self_check_busy: a self-check was running or over its budget. Deferrals are reported, not graded; compared must be above 0 for each live pair.\n\
+             # HELP kimmy_sync_divergence_digest_probes_total Collections the cut digest looked at, by outcome. compared: both sides' digests were taken at one cut, with the keys either side had not yet processed set aside, and compared; the gauge reading 0 means the members agree only while this rises. unanswered: a checked contact whose peer returned no digest (a build before it). probed: a contact asked with the cut alone, to learn whether the peer answers digests. deferred, by reason: not compared, and none is silent. bare_tombstone: a tombstone no oplog entry stands behind sits above the cut on either side. horizon: the oplog above the cut cannot be read in full here. database_tombstone: a database drop is recorded for the collection's database. moved: a write landed between the plan and the comparison. uncovered_cap: more uncovered keys than a request or an answer carries. budget: the scan or the point reads that subtract uncovered keys spent their wall time or their bytes (expected when the tail is cold). busy: the peer was already answering a digest probe, counted once for each collection planned. incarnation: the two sides hold the collection at different incarnations. self_check_busy: a self-check was running or over its budget. error: this side failed to plan or to compare, and the contact went on without the digest. malformed: an entry of the peer's answer did not decode and was dropped. corrected: a mismatch was this node's own row drifting from its records, corrected and not reported. A collection busy on the peer that the contact's rotation does not name is not answered and not counted; the rotation names it another contact. Deferrals are reported, not graded; compared must be above 0 for each live pair.\n\
              # TYPE kimmy_sync_divergence_digest_probes_total counter\n\
              kimmy_sync_divergence_digest_probes_total{{outcome=\"compared\"}} {sync_digest_compared}\n\
              kimmy_sync_divergence_digest_probes_total{{outcome=\"unanswered\"}} {sync_digest_unanswered}\n\
@@ -2618,7 +2618,7 @@ mod tests {
             digest_compared: 111,
             digest_unanswered: 112,
             digest_probed: 113,
-            digest_deferred: [121, 122, 123, 124, 125, 126, 127, 128, 129, 130],
+            digest_deferred: [121, 122, 123, 124, 125, 126, 127, 128, 129, 130, 131, 132],
             digest_divergent_collections: 15,
             digest_drift_total: 16,
             divergence_last_check: Some(now - Duration::from_secs(70)),
@@ -2649,7 +2649,7 @@ mod tests {
             digest_compared: 2,
             digest_unanswered: 3,
             digest_probed: 4,
-            digest_deferred: [1, 2, 3, 4, 5, 6, 7, 8, 9, 10],
+            digest_deferred: [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12],
             digest_divergent_collections: 7,
             digest_drift_total: 9,
             divergence_last_check: Some(now - Duration::from_secs(71)),
@@ -3459,7 +3459,7 @@ kimmy_sync_ddl_relogged_total 91
 # HELP kimmy_sync_horizon_state_held_total Pulls this node refused because the window would have crossed history it holds only as the state a snapshot gave it, not because retention removed it (ADR-224). The member asking is told BeyondHorizon; it asks another member first and takes a snapshot only if none can serve it. Not an error: 0 on a member that never caught up by a whole-database snapshot, and a few after one while members behind its grant ask it first.
 # TYPE kimmy_sync_horizon_state_held_total counter
 kimmy_sync_horizon_state_held_total 92
-# HELP kimmy_sync_divergent_collections Collections a periodic cross-member check currently finds disagreeing with a peer - held there and not here, or held by both with a different document count - confirmed on two checks running. 0 on a converged cluster. Moves for a divergence that leaves every other sync series reading healthy, because nothing about it fails a round.
+# HELP kimmy_sync_divergent_collections Collections a periodic cross-member check currently finds disagreeing with a peer - held there and not here, held by both with a different document count, or (0.48.0) held by both with a different set of (id, stamp) pairs, which kimmy_sync_digest_divergent_collections attributes and which nothing repairs - confirmed on two checks running. 0 on a converged cluster. Moves for a divergence that leaves every other sync series reading healthy, because nothing about it fails a round.
 # TYPE kimmy_sync_divergent_collections gauge
 kimmy_sync_divergent_collections 5
 # HELP kimmy_sync_divergence_checks_total Contacts with a peer in which the cross-member divergence check above ran, and rounds that did not run it - completed with the pull truncated by the batch cap, or failed. kimmy_sync_divergent_collections reading 0 is evidence that the peers agree only while ran is rising; ran flat while skipped rises means nothing looked, which a bare 0 cannot say. A round that failed is counted in kimmy_sync_failures_total and here as skipped, so ran plus skipped is every round attempted.
@@ -3473,7 +3473,7 @@ kimmy_sync_divergence_count_probes_total{outcome=\"deferred\"} 67
 # HELP kimmy_sync_digest_divergent_collections Collections the cut digest currently finds disagreeing with a peer: the two members hold different (id, stamp) sets for them once what each had not yet processed is set aside, seen on two compared checks running. Also counted in kimmy_sync_divergent_collections, which this attributes. Detect only: nothing is repaired from it. Compare (id, stamp) of the collection on both members before wiping either (operations.md, The divergence check).
 # TYPE kimmy_sync_digest_divergent_collections gauge
 kimmy_sync_digest_divergent_collections 7
-# HELP kimmy_sync_divergence_digest_probes_total Collections the cut digest looked at, by outcome. compared: both sides' digests were taken at one cut, with the keys either side had not yet processed set aside, and compared; the gauge reading 0 means the members agree only while this rises. unanswered: a checked contact whose peer returned no digest (a build before it). probed: a contact asked with the cut alone, to learn whether the peer answers digests. deferred, by reason: not compared, and none is silent. bare_tombstone: a tombstone no oplog entry stands behind sits above the cut on either side. horizon: the oplog above the cut cannot be read in full here. database_tombstone and burial_pending: a database drop or a purge is owed. moved: a write landed between the plan and the comparison. uncovered_cap: more uncovered keys than a request or an answer carries. budget: the scan spent its wall time or its bytes (expected when the tail is cold). busy: the peer was already answering a digest probe. incarnation: the two sides hold the collection at different incarnations. self_check_busy: a self-check was running or over its budget. Deferrals are reported, not graded; compared must be above 0 for each live pair.
+# HELP kimmy_sync_divergence_digest_probes_total Collections the cut digest looked at, by outcome. compared: both sides' digests were taken at one cut, with the keys either side had not yet processed set aside, and compared; the gauge reading 0 means the members agree only while this rises. unanswered: a checked contact whose peer returned no digest (a build before it). probed: a contact asked with the cut alone, to learn whether the peer answers digests. deferred, by reason: not compared, and none is silent. bare_tombstone: a tombstone no oplog entry stands behind sits above the cut on either side. horizon: the oplog above the cut cannot be read in full here. database_tombstone: a database drop is recorded for the collection's database. moved: a write landed between the plan and the comparison. uncovered_cap: more uncovered keys than a request or an answer carries. budget: the scan or the point reads that subtract uncovered keys spent their wall time or their bytes (expected when the tail is cold). busy: the peer was already answering a digest probe, counted once for each collection planned. incarnation: the two sides hold the collection at different incarnations. self_check_busy: a self-check was running or over its budget. error: this side failed to plan or to compare, and the contact went on without the digest. malformed: an entry of the peer's answer did not decode and was dropped. corrected: a mismatch was this node's own row drifting from its records, corrected and not reported. A collection busy on the peer that the contact's rotation does not name is not answered and not counted; the rotation names it another contact. Deferrals are reported, not graded; compared must be above 0 for each live pair.
 # TYPE kimmy_sync_divergence_digest_probes_total counter
 kimmy_sync_divergence_digest_probes_total{outcome=\"compared\"} 113
 kimmy_sync_divergence_digest_probes_total{outcome=\"unanswered\"} 115
@@ -3481,13 +3481,15 @@ kimmy_sync_divergence_digest_probes_total{outcome=\"probed\"} 117
 kimmy_sync_divergence_digest_probes_total{outcome=\"deferred\",reason=\"bare_tombstone\"} 122
 kimmy_sync_divergence_digest_probes_total{outcome=\"deferred\",reason=\"horizon\"} 124
 kimmy_sync_divergence_digest_probes_total{outcome=\"deferred\",reason=\"database_tombstone\"} 126
-kimmy_sync_divergence_digest_probes_total{outcome=\"deferred\",reason=\"burial_pending\"} 128
-kimmy_sync_divergence_digest_probes_total{outcome=\"deferred\",reason=\"moved\"} 130
-kimmy_sync_divergence_digest_probes_total{outcome=\"deferred\",reason=\"uncovered_cap\"} 132
-kimmy_sync_divergence_digest_probes_total{outcome=\"deferred\",reason=\"budget\"} 134
-kimmy_sync_divergence_digest_probes_total{outcome=\"deferred\",reason=\"busy\"} 136
-kimmy_sync_divergence_digest_probes_total{outcome=\"deferred\",reason=\"incarnation\"} 138
-kimmy_sync_divergence_digest_probes_total{outcome=\"deferred\",reason=\"self_check_busy\"} 140
+kimmy_sync_divergence_digest_probes_total{outcome=\"deferred\",reason=\"moved\"} 128
+kimmy_sync_divergence_digest_probes_total{outcome=\"deferred\",reason=\"uncovered_cap\"} 130
+kimmy_sync_divergence_digest_probes_total{outcome=\"deferred\",reason=\"budget\"} 132
+kimmy_sync_divergence_digest_probes_total{outcome=\"deferred\",reason=\"busy\"} 134
+kimmy_sync_divergence_digest_probes_total{outcome=\"deferred\",reason=\"incarnation\"} 136
+kimmy_sync_divergence_digest_probes_total{outcome=\"deferred\",reason=\"self_check_busy\"} 138
+kimmy_sync_divergence_digest_probes_total{outcome=\"deferred\",reason=\"error\"} 140
+kimmy_sync_divergence_digest_probes_total{outcome=\"deferred\",reason=\"malformed\"} 142
+kimmy_sync_divergence_digest_probes_total{outcome=\"deferred\",reason=\"corrected\"} 144
 # HELP kimmy_sync_digest_drift_total Kept digest rows a self-check found disagreeing with the records they summarise, and corrected, since the process started. A healthy node reads 0; a rising value is a bug in the digest's maintenance and is logged at ERROR.
 # TYPE kimmy_sync_digest_drift_total counter
 kimmy_sync_digest_drift_total 9
@@ -4419,7 +4421,7 @@ kimmy_storage_cache_reads_total{result=\"miss\"} 9104
         // hole a snapshot left.
         assert_eq!(
             samples,
-            108 + 6 + 15
+            108 + 6 + 17
                 + 3 * 19
                 + 14
                 + 10 * kimmy_storage::WriterHolder::COUNT
@@ -4662,7 +4664,7 @@ kimmy_storage_cache_reads_total{result=\"miss\"} 9104
             digest_compared: 0,
             digest_unanswered: 0,
             digest_probed: 0,
-            digest_deferred: [0; 10],
+            digest_deferred: [0; 12],
             digest_divergent_collections: 0,
             digest_drift_total: 0,
             divergence_last_check: Some(now - Duration::from_secs(30)),
@@ -4693,7 +4695,7 @@ kimmy_storage_cache_reads_total{result=\"miss\"} 9104
             digest_compared: 0,
             digest_unanswered: 0,
             digest_probed: 0,
-            digest_deferred: [0; 10],
+            digest_deferred: [0; 12],
             digest_divergent_collections: 0,
             digest_drift_total: 0,
             divergence_last_check: Some(now - Duration::from_secs(8)),
@@ -4915,7 +4917,7 @@ kimmy_storage_cache_reads_total{result=\"miss\"} 9104
             digest_compared: 0,
             digest_unanswered: 0,
             digest_probed: 0,
-            digest_deferred: [0; 10],
+            digest_deferred: [0; 12],
             digest_divergent_collections: 0,
             digest_drift_total: 0,
             divergence_last_check: at,

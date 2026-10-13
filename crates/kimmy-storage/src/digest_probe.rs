@@ -762,18 +762,24 @@ impl Engine {
         Ok(Some(found))
     }
 
-    /// Make the next digest plan or comparison fail with a storage error that
-    /// is not a stop (a test hook: a digest-only fault).
+    /// Make the digest plan or comparison that is `calls` away fail with a
+    /// storage error that is not a stop (a test hook: a digest-only fault).
+    /// `1` is the next call: the plan; `2` is the comparison after it.
     #[cfg(any(test, feature = "test-hooks"))]
-    pub fn fail_next_digest_probe_for_test(&self) {
-        self.digest_fail_next.store(true, Ordering::SeqCst);
+    pub fn fail_digest_probe_in_for_test(&self, calls: u32) {
+        self.digest_fail_in.store(calls, Ordering::SeqCst);
     }
 
     #[cfg(any(test, feature = "test-hooks"))]
     fn fail_digest_probe_if_armed(&self) -> Result<()> {
-        match self.digest_fail_next.swap(false, Ordering::SeqCst) {
-            true => Err(crate::StorageError::Corrupt("a digest fault injected by a test".into())),
-            false => Ok(()),
+        let armed = self.digest_fail_in.load(Ordering::SeqCst);
+        if armed == 0 {
+            return Ok(());
+        }
+        self.digest_fail_in.store(armed - 1, Ordering::SeqCst);
+        match armed {
+            1 => Err(crate::StorageError::Corrupt("a digest fault injected by a test".into())),
+            _ => Ok(()),
         }
     }
 
@@ -1504,7 +1510,7 @@ mod tests {
     #[test]
     fn a_digest_failure_hook_fails_one_plan_and_one_comparison() {
         let (a, b, _orders, _items, _dirs) = converged();
-        a.fail_next_digest_probe_for_test();
+        a.fail_digest_probe_in_for_test(1);
         assert!(
             a.digest_plan(&b.witnessed_vector().unwrap(), None, ScanBudget::default()).is_err()
         );
