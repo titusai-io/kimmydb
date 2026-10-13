@@ -2980,3 +2980,47 @@ async fn a_start_rebuilds_the_digests_when_the_previous_run_cannot_be_shown_to_h
     assert!(line.contains("records="), "{line}");
     assert!(line.contains("chunks="), "{line}");
 }
+
+/// The decision to rebuild persists until a rebuild completes (B3 review): after
+/// a clean stop of an older build, two starts stopped during the open must leave
+/// the third start rebuilding, as the first of them did. A marker of 0.47.2 is
+/// written by hand; the starts are real processes. (The model test in
+/// `lifecycle.rs` covers a stop before the open's first write, which a real
+/// start cannot be stopped at; here the stop lands at the rebuild's first look.)
+#[tokio::test]
+async fn two_starts_stopped_before_the_rebuild_leave_the_third_forced() {
+    const REBUILT: &str = "rebuilt the live document counts before serving";
+    const FORCED: &str = "the previous run cannot be shown to have kept the digests";
+
+    let dir = tempfile::tempdir().unwrap();
+    let client = reqwest::Client::new();
+    let mut first = Run::spawn(dir.path(), "first");
+    first.wait_ready(&client).await;
+    let (status, _) = stop(&mut first);
+    assert!(status.success(), "{status:?}");
+
+    // What 0.47.2 leaves after serving and stopping clean.
+    let path = dir.path().join("data").join(LAST_EXIT_FILE);
+    let body = std::fs::read_to_string(&path).unwrap();
+    let version =
+        body.lines().find(|l| l.starts_with("version = ")).expect("a version").to_string();
+    std::fs::write(&path, body.replace(&version, "version = \"0.47.2\"")).unwrap();
+
+    for name in ["stopped-once", "stopped-twice"] {
+        let mut run = Run::spawn_with(dir.path(), name, &[("KIMMY_TEST_OPEN_DELAY_SECS", "40")]);
+        let _ = wait_bound(&run).await;
+        run.signal("TERM");
+        let status = run.wait_exit();
+        assert!(status.success(), "{name}: {status:?}: {}", run.log());
+        assert!(run.log().contains("stopping without serving"), "{name}: {}", run.log());
+    }
+
+    let log = next_start_log(dir.path(), "third", &client).await;
+    let line = log
+        .lines()
+        .find(|l| l.contains(REBUILT))
+        .unwrap_or_else(|| panic!("the third start must rebuild:\n{log}"));
+    // Stopped at their first look, the two starts left a cursor, which the
+    // third resumes; a rebuild either way, by the decision or by the store.
+    assert!(line.contains(FORCED) || line.contains("resumed a walk this build stopped"), "{line}");
+}
