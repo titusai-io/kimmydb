@@ -8295,6 +8295,72 @@ mod tests {
         assert!(matches!(answer, Err(ProtocolError::Closed)), "{answer:?}");
     }
 
+    /// A responder whose digest answer meets the node's stop ends the contact at
+    /// once and quietly: no error, no half answer, and not the warning-and-answer-
+    /// without-digests that any other fault of the digest gets. A stopping node
+    /// that went on to write a frame would hold the stop up for a peer's read.
+    #[tokio::test]
+    async fn a_digest_answer_that_meets_the_stop_ends_the_contact_quietly() {
+        const SECRET: &str = "a-digest-stop-secret";
+        const BINDING: &[u8] = b"a-digest-stop-binding";
+        let dir = tempfile::tempdir().unwrap();
+        let engine = Engine::open(&dir.path().join("kimmy.redb")).unwrap();
+        let orders = engine.create_collection("shop", "orders").unwrap();
+        engine.insert(&orders, bson::doc! { "_id": 1 }).unwrap();
+        let other_dir = tempfile::tempdir().unwrap();
+        let other = Engine::open(&other_dir.path().join("kimmy.redb")).unwrap();
+        // One key of the requester's, which the answer subtracts by a point read:
+        // the read looks for the stop.
+        let ask = kimmy_storage::DigestAsk {
+            cut: engine.witnessed_vector().unwrap(),
+            uncovered: vec![kimmy_storage::Uncovered {
+                collection: orders.id,
+                keys: vec![serde_bytes::ByteBuf::from(vec![1u8])],
+            }],
+            busy: None,
+        };
+        for stopping in [false, true] {
+            let (mut ours, theirs) = tokio::io::duplex(MAX_FRAME);
+            let serving =
+                serve_peer(&engine, theirs, SECRET, BINDING, None, ServeBudgets::serving(), None);
+            let (other, ask) = (&other, &ask);
+            // Moved in, so the stream closes when the answer is read and a
+            // responder that did answer sees the end of the contact.
+            let asking = async move {
+                open_handshake(other, &mut ours, SECRET, BINDING).await.unwrap();
+                write_frame(
+                    &mut ours,
+                    &Message::AskDivergence { probe: None, digest: Some(ask.clone()) },
+                )
+                .await
+                .unwrap();
+                read_frame(&mut ours).await
+            };
+            if stopping {
+                engine.stop_walks();
+            }
+            let (served, answer) = tokio::time::timeout(Duration::from_secs(10), async {
+                tokio::join!(serving, asking)
+            })
+            .await
+            .expect("the contact ended");
+            if stopping {
+                assert!(served.is_ok(), "the stop is not an error: {served:?}");
+                assert!(
+                    matches!(answer, Err(ProtocolError::Closed)),
+                    "a stopping responder wrote an answer: {answer:?}"
+                );
+            } else {
+                // The requester left after the answer: the end of an ordinary contact.
+                assert!(matches!(served, Ok(()) | Err(ProtocolError::Closed)), "{served:?}");
+                assert!(
+                    matches!(answer, Ok(Message::Divergence { digests: Some(_), .. })),
+                    "premise: the same request is answered with digests: {answer:?}"
+                );
+            }
+        }
+    }
+
     /// A snapshot that has applied no page holds nothing, and neither does one
     /// that is complete but has not yet been dropped from the map (applying the
     /// last page marks it complete before steps that can still fail): only an
