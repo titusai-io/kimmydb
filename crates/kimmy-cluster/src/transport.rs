@@ -9453,10 +9453,16 @@ mod partial_windows_never_skip {
         let origin = kimmy_core::NodeId::from_bytes([3; 16]);
         let me = kimmy_core::NodeId::from_bytes([9; 16]);
         let probe = || Some(DivergenceProbe { id: named, mine_count: None, mine_at: None });
-        for pulled in [false, true] {
+        for (pulled, capable) in [(false, true), (true, true), (false, false), (true, false)] {
             let dir = tempfile::tempdir().unwrap();
             let engine = Engine::open(&dir.path().join("kimmy.redb")).unwrap();
             let orders = engine.create_collection("shop", "orders").unwrap();
+            // Writes of this node's own that the peer's vector does not cover:
+            // the collection is busy at the cut, so a full plan carries their
+            // keys and a request made with the cut alone carries none.
+            for i in 10..12i64 {
+                engine.insert(&orders, bson::doc! { "_id": i }).unwrap();
+            }
             let mut theirs = VersionVector::new();
             let window = if pulled {
                 theirs.insert(origin, Hlc::new(4_000, 0));
@@ -9471,7 +9477,9 @@ mod partial_windows_never_skip {
                 Vec::new()
             };
             let mut stalls = PeerStalls::new();
-            stalls.digest_capable.insert(me);
+            if capable {
+                stalls.digest_capable.insert(me);
+            }
             let ask = the_request_of_a_round(
                 &engine,
                 theirs,
@@ -9484,6 +9492,12 @@ mod partial_windows_never_skip {
             if !pulled {
                 assert_eq!(ask.busy, Some(named), "the rotation's collection is named");
             }
+            assert_eq!(
+                !ask.uncovered.is_empty(),
+                capable,
+                "a peer known to answer is asked with the plan, any other with the cut alone \
+                 (pulled: {pulled}, capable: {capable})"
+            );
         }
     }
 }

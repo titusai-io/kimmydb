@@ -3383,6 +3383,22 @@ async fn shutdown_signal() {
 
 #[cfg(test)]
 mod tests {
+    /// The open that returns says the rebuild completed, so an exit of this
+    /// run before `settle` stops passing the decision to force on (the marker
+    /// an exit writes is a function of whether the rebuild completed, B3 review
+    /// A F1). A source check: a real start cannot be stopped between the open
+    /// and `settle`, where the difference shows.
+    #[test]
+    fn the_open_that_returns_says_the_rebuild_completed() {
+        let source = include_str!("node.rs");
+        let open = source.find("Engine::open_with(&path, &options)").expect("the open");
+        let arm = &source[open..open + 400];
+        assert!(arm.contains("Ok(engine) => {"), "{arm}");
+        assert!(
+            arm.contains("lifecycle::rebuilt(&config.storage.data_dir);"),
+            "the open's Ok arm must call lifecycle::rebuilt: {arm}"
+        );
+    }
 
     /// **The stop freezes the yield evaluator first** (ADR-213, B9): at the stop's
     /// first signal, before `shutdown` is announced to the supervised tasks. A task
