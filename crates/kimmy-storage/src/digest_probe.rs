@@ -666,10 +666,8 @@ impl Engine {
                 live_digest::fold_walked(&mut walked, collection.0, doc_key, &stamp, live);
             }
         }
-        Ok(Some(match walked.remove(&collection.0) {
-            Some(found) => found,
-            None => DigestRow::default(),
-        }))
+        // not a row: the walk's own map, read after the walk
+        Ok(Some(walked.remove(&collection.0).unwrap_or_default()))
     }
 
     /// How many times a self-check found a kept digest row that disagreed with
@@ -692,11 +690,13 @@ pub(crate) mod test_hooks {
 
     use crate::Engine;
 
+    /// What runs between a self-check's snapshot and its correction.
+    type Hook = Box<dyn FnOnce(&Engine)>;
+
     thread_local! {
         /// Run between a self-check's snapshot and its correction, on this
         /// thread: where a concurrent commit lands in the field.
-        static AFTER_THE_SNAPSHOT: RefCell<Option<Box<dyn FnOnce(&Engine)>>> =
-            const { RefCell::new(None) };
+        static AFTER_THE_SNAPSHOT: RefCell<Option<Hook>> = const { RefCell::new(None) };
     }
 
     pub(crate) fn between_the_snapshot_and_the_correction(f: impl FnOnce(&Engine) + 'static) {
