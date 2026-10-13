@@ -1912,12 +1912,22 @@ impl Engine {
     /// window containing this". `Collected` is judged first, so a peer that lacks
     /// both is told what retention would have told it before.
     pub fn serve_verdict(&self, held: &VersionVector) -> Result<ServeVerdict> {
-        let mine = self.version_vector()?;
-        let collected = self.oplog_collected()?;
+        let txn = self.db().begin_read()?;
+        Self::serve_verdict_in(&txn, held)
+    }
+
+    /// [`Self::serve_verdict`] in a read transaction the caller holds, so that a
+    /// reader which also reads rows and keys reads this beside them (B3).
+    pub(crate) fn serve_verdict_in(
+        txn: &redb::ReadTransaction,
+        held: &VersionVector,
+    ) -> Result<ServeVerdict> {
+        let mine = Self::read_versions_in(txn, crate::tables::OPLOG_VERSIONS)?;
+        let collected = Self::read_versions_in(txn, crate::tables::OPLOG_COLLECTED)?;
         if crate::sync::lacks_collected(held, &mine, &collected) {
             return Ok(ServeVerdict::Collected);
         }
-        let state_held = self.state_held()?;
+        let state_held = Self::state_held_in(txn)?;
         if crate::sync::lacks_collected(held, &mine, &state_held) {
             return Ok(ServeVerdict::StateHeld);
         }

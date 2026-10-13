@@ -131,6 +131,9 @@ pub struct Engine {
     pub(crate) digest_check_busy: std::sync::atomic::AtomicBool,
     /// Kept digest rows a self-check found disagreeing with their records.
     pub(crate) digest_drift: std::sync::atomic::AtomicU64,
+    /// Fail the next digest plan or comparison with a storage error, for the
+    /// test that a digest-only fault must not fail the contact (B3).
+    pub(crate) digest_fail_next: std::sync::atomic::AtomicBool,
     /// Durable write transactions committed, since start.
     ///
     /// redb has a single writer and every commit is an fsync, so the number of
@@ -1453,6 +1456,7 @@ impl Engine {
             digest_probe_busy: std::sync::atomic::AtomicBool::new(false),
             digest_check_busy: std::sync::atomic::AtomicBool::new(false),
             digest_drift: std::sync::atomic::AtomicU64::new(0),
+            digest_fail_next: std::sync::atomic::AtomicBool::new(false),
             commits: std::sync::atomic::AtomicU64::new(0),
             multi_chunk_docs: std::sync::atomic::AtomicUsize::new(
                 crate::modify::DEFAULT_MULTI_CHUNK_DOCS,
@@ -2699,6 +2703,14 @@ impl Engine {
     /// to survive.
     pub fn collection_dropped_at(&self, id: CollectionId) -> Result<Option<Stamp>> {
         let txn = self.db.begin_read()?;
+        Self::collection_dropped_at_in(&txn, id)
+    }
+
+    /// [`Self::collection_dropped_at`] in a read transaction the caller holds.
+    pub(crate) fn collection_dropped_at_in(
+        txn: &redb::ReadTransaction,
+        id: CollectionId,
+    ) -> Result<Option<Stamp>> {
         let dropped = txn.open_table(tables::COLLECTIONS_DROPPED)?;
         match dropped.get(id.0)? {
             Some(raw) => Ok(Some(codec::decode_oplog_key(raw.value())?)),
@@ -2898,6 +2910,11 @@ impl Engine {
     /// snapshot taken by a build before 0.46.0, which did not record it.
     pub fn state_held(&self) -> Result<kimmy_core::VersionVector> {
         let txn = self.db.begin_read()?;
+        Self::state_held_in(&txn)
+    }
+
+    /// [`Self::state_held`] in a read transaction the caller holds.
+    pub(crate) fn state_held_in(txn: &redb::ReadTransaction) -> Result<kimmy_core::VersionVector> {
         let meta = txn.open_table(tables::META)?;
         let mut out = kimmy_core::VersionVector::new();
         for row in meta.range(tables::META_STATE_HELD_PREFIX..tables::META_STATE_HELD_END)? {
@@ -4421,6 +4438,11 @@ impl Engine {
     /// collections are empty or full.
     pub fn all_collections(&self) -> Result<Vec<CollectionMeta>> {
         let txn = self.db.begin_read()?;
+        Self::all_collections_in(&txn)
+    }
+
+    /// [`Self::all_collections`] in a read transaction the caller holds.
+    pub(crate) fn all_collections_in(txn: &redb::ReadTransaction) -> Result<Vec<CollectionMeta>> {
         let collections = txn.open_table(tables::COLLECTIONS)?;
         let mut out = Vec::new();
         for entry in collections.iter()? {
@@ -4436,7 +4458,16 @@ impl Engine {
     /// [`Self::live_collections`], differ by this one argument and nothing
     /// else.
     pub(crate) fn collections(&self, paired_shadows: PairedShadows) -> Result<Vec<CollectionMeta>> {
-        let mut all = self.all_collections()?;
+        let txn = self.db.begin_read()?;
+        Self::collections_in(&txn, paired_shadows)
+    }
+
+    /// [`Self::collections`] in a read transaction the caller holds.
+    pub(crate) fn collections_in(
+        txn: &redb::ReadTransaction,
+        paired_shadows: PairedShadows,
+    ) -> Result<Vec<CollectionMeta>> {
+        let mut all = Self::all_collections_in(txn)?;
         if paired_shadows == PairedShadows::Hidden {
             // The parent is looked for by name within the same database, which
             // is where the shadow's own name is derived from.

@@ -70,23 +70,65 @@ pub const SELF_CHECK_WALL: Duration = Duration::from_secs(2);
 /// The bytes a self-check's walk may read.
 pub const SELF_CHECK_BYTES: u64 = 128 * 1024 * 1024;
 
-/// What one scan may spend.
+/// What a point read of a record is charged against the byte budget: a page.
+/// A random read pulls a page whatever the record's size, and cold on a
+/// spinning disk it is the cost that matters, so the subtraction of a request's
+/// uncovered keys is bounded by the same budget as the scan, not by key bytes
+/// alone.
+pub const POINT_READ_COST: u64 = 4096;
+
+/// What one probe may spend: the scan of the oplog and the point reads that
+/// subtract uncovered keys draw on the **same** wall time and bytes, and the
+/// caps on the keys a request or an answer may carry.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ScanBudget {
     pub wall: Duration,
     pub bytes: u64,
+    /// The bytes of uncovered keys a request may carry.
+    pub ask_keys: usize,
+    /// The bytes of key a peer will point-read, and of its own it will send.
+    pub answer_keys: usize,
 }
 
 impl ScanBudget {
     /// What a self-check's walk of a collection may spend.
     pub const fn self_check() -> Self {
-        Self { wall: SELF_CHECK_WALL, bytes: SELF_CHECK_BYTES }
+        Self {
+            wall: SELF_CHECK_WALL,
+            bytes: SELF_CHECK_BYTES,
+            ask_keys: ASK_KEY_BYTES,
+            answer_keys: ANSWER_KEY_BYTES,
+        }
     }
 }
 
 impl Default for ScanBudget {
     fn default() -> Self {
-        Self { wall: SCAN_WALL, bytes: SCAN_BYTES }
+        Self {
+            wall: SCAN_WALL,
+            bytes: SCAN_BYTES,
+            ask_keys: ASK_KEY_BYTES,
+            answer_keys: ANSWER_KEY_BYTES,
+        }
+    }
+}
+
+/// What a probe has spent of its [`ScanBudget`] so far.
+struct Spend {
+    started: Instant,
+    bytes: u64,
+    budget: ScanBudget,
+}
+
+impl Spend {
+    fn new(budget: ScanBudget) -> Self {
+        Self { started: Instant::now(), bytes: 0, budget }
+    }
+
+    /// Charge `bytes`; whether the budget still holds.
+    fn charge(&mut self, bytes: u64) -> bool {
+        self.bytes += bytes;
+        self.bytes <= self.budget.bytes && self.started.elapsed() <= self.budget.wall
     }
 }
 
@@ -101,8 +143,6 @@ pub enum Defer {
     Horizon,
     /// Either side holds a tombstone for the collection's database.
     DatabaseTombstone,
-    /// A purge of the collection's rows is owed.
-    BurialPending,
     /// A write landed between the plan and the comparison.
     Moved,
     /// More uncovered keys than the request or the answer may carry.
@@ -113,23 +153,34 @@ pub enum Defer {
     Busy,
     /// The two sides hold the collection at different incarnations.
     Incarnation,
-    /// A self-check was already running.
+    /// A self-check was already running, or over its budget.
     SelfCheckBusy,
+    /// This side failed to plan or to compare (a storage error that was not a
+    /// stop): the contact and its other halves went on without the digest.
+    Error,
+    /// An entry of the peer's answer did not decode (a reason or a shape from
+    /// a later build), and was dropped; the rest were kept.
+    Malformed,
+    /// A mismatch was found to be this side's own row drifting from its
+    /// records, corrected, and not reported.
+    Corrected,
 }
 
 impl Defer {
     /// Every reason, in the order [`Self::index`] numbers them.
-    pub const ALL: [Defer; 10] = [
+    pub const ALL: [Defer; 12] = [
         Self::BareTombstone,
         Self::Horizon,
         Self::DatabaseTombstone,
-        Self::BurialPending,
         Self::Moved,
         Self::UncoveredCap,
         Self::Budget,
         Self::Busy,
         Self::Incarnation,
         Self::SelfCheckBusy,
+        Self::Error,
+        Self::Malformed,
+        Self::Corrected,
     ];
 
     /// This reason's place in [`Self::ALL`], for a counter per reason.
@@ -138,13 +189,15 @@ impl Defer {
             Self::BareTombstone => 0,
             Self::Horizon => 1,
             Self::DatabaseTombstone => 2,
-            Self::BurialPending => 3,
-            Self::Moved => 4,
-            Self::UncoveredCap => 5,
-            Self::Budget => 6,
-            Self::Busy => 7,
-            Self::Incarnation => 8,
-            Self::SelfCheckBusy => 9,
+            Self::Moved => 3,
+            Self::UncoveredCap => 4,
+            Self::Budget => 5,
+            Self::Busy => 6,
+            Self::Incarnation => 7,
+            Self::SelfCheckBusy => 8,
+            Self::Error => 9,
+            Self::Malformed => 10,
+            Self::Corrected => 11,
         }
     }
 
@@ -154,13 +207,15 @@ impl Defer {
             Self::BareTombstone => "bare_tombstone",
             Self::Horizon => "horizon",
             Self::DatabaseTombstone => "database_tombstone",
-            Self::BurialPending => "burial_pending",
             Self::Moved => "moved",
             Self::UncoveredCap => "uncovered_cap",
             Self::Budget => "budget",
             Self::Busy => "busy",
             Self::Incarnation => "incarnation",
             Self::SelfCheckBusy => "self_check_busy",
+            Self::Error => "error",
+            Self::Malformed => "malformed",
+            Self::Corrected => "corrected",
         }
     }
 }
@@ -212,20 +267,34 @@ pub struct DigestEntry {
 }
 
 /// The peer's answer.
-#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize)]
 pub struct DigestReply {
-    #[serde(default, deserialize_with = "lenient_entries")]
     pub entries: Vec<DigestEntry>,
+    /// Entries that did not decode (a reason or a shape from a later build) and
+    /// were dropped: read, never written, so that the caller can count them.
+    #[serde(skip)]
+    pub malformed: u32,
 }
 
-/// Entries read one at a time: one that does not decode (a reason this build
-/// does not know, a digest of the wrong shape) is dropped and the rest are
-/// kept, so a new field costs the entry and never the frame.
-fn lenient_entries<'de, D: serde::Deserializer<'de>>(
-    deserializer: D,
-) -> std::result::Result<Vec<DigestEntry>, D::Error> {
-    let raw = Vec::<bson::Bson>::deserialize(deserializer)?;
-    Ok(raw.into_iter().filter_map(|entry| bson::deserialize_from_bson(entry).ok()).collect())
+/// Entries are read one at a time: one that does not decode is dropped and
+/// counted, and the rest are kept, so a new field costs the entry and never
+/// the frame.
+impl<'de> Deserialize<'de> for DigestReply {
+    fn deserialize<D: serde::Deserializer<'de>>(
+        deserializer: D,
+    ) -> std::result::Result<Self, D::Error> {
+        #[derive(Deserialize)]
+        struct Raw {
+            #[serde(default)]
+            entries: Vec<bson::Bson>,
+        }
+        let raw = Raw::deserialize(deserializer)?;
+        let total = raw.entries.len();
+        let entries: Vec<DigestEntry> =
+            raw.entries.into_iter().filter_map(|e| bson::deserialize_from_bson(e).ok()).collect();
+        let malformed = (total - entries.len()) as u32;
+        Ok(Self { entries, malformed })
+    }
 }
 
 /// How the peer took a digest request.
@@ -242,6 +311,9 @@ pub enum DigestAnswered {
     /// before paying for this side's scan (a peer that has not yet answered
     /// one); nothing is compared this contact.
     Probed,
+    /// This side failed to plan or to compare, with an error that was not a
+    /// stop: the contact went on without the digest.
+    Failed,
 }
 
 /// What a contact's digest probe came to, for the caller to count.
@@ -252,6 +324,19 @@ pub struct DigestRound {
     pub verdicts: Vec<DigestVerdict>,
     /// Collections this side could not ask about, with the reason.
     pub plan_deferred: Vec<(CollectionId, Defer)>,
+    /// How many collections this side planned over: what a contact that came
+    /// to nothing for all of them (a busy peer, a failure) is counted against,
+    /// per collection and not per contact.
+    pub held: usize,
+    /// Entries of the peer's answer that did not decode and were dropped.
+    pub malformed: usize,
+}
+
+impl DigestRound {
+    /// A round that came to `answered` and nothing else.
+    pub fn new(answered: DigestAnswered) -> Self {
+        Self { answered, verdicts: Vec::new(), plan_deferred: Vec::new(), held: 0, malformed: 0 }
+    }
 }
 
 /// What one collection came to.
@@ -293,6 +378,11 @@ pub struct DigestPlan {
 }
 
 impl DigestPlan {
+    /// How many collections the plan covers.
+    pub fn collections(&self) -> usize {
+        self.facets.len()
+    }
+
     /// Collections this side could not even ask about, and why: counted
     /// whether or not the peer answers.
     pub fn deferred(&self) -> impl Iterator<Item = (CollectionId, Defer)> + '_ {
@@ -307,6 +397,15 @@ enum ScanFor {
     Only(Option<CollectionId>),
 }
 
+/// What subtracting a set of keys from a row came to.
+enum Excluded {
+    Digest(u128),
+    /// More key bytes than the request or the answer may carry.
+    OverCap,
+    /// The probe's wall time or bytes were spent.
+    OverBudget,
+}
+
 impl Engine {
     /// The requester's `T1`: the cut against `peer_witnessed`, and this side's
     /// view of every collection at it.
@@ -319,10 +418,13 @@ impl Engine {
         busy: Option<CollectionId>,
         budget: ScanBudget,
     ) -> Result<DigestPlan> {
+        #[cfg(any(test, feature = "test-hooks"))]
+        self.fail_digest_probe_if_armed()?;
+        let mut spend = Spend::new(budget);
         let txn = self.db().begin_read()?;
         let witnessed = Self::read_versions_in(&txn, tables::OPLOG_WITNESSED)?;
         let cut = witnessed.meet(peer_witnessed);
-        let mut facets = self.assess(&txn, &cut, ScanFor::All, budget)?;
+        let mut facets = self.assess(&txn, &cut, ScanFor::All, &mut spend)?;
 
         let mut uncovered = Vec::new();
         let mut bytes = 0usize;
@@ -331,7 +433,7 @@ impl Engine {
                 continue;
             }
             let size: usize = facet.uncovered.iter().map(Vec::len).sum();
-            if bytes + size > ASK_KEY_BYTES {
+            if bytes + size > budget.ask_keys {
                 facet.deferred = Some(Defer::UncoveredCap);
                 continue;
             }
@@ -356,8 +458,9 @@ impl Engine {
         budget: ScanBudget,
     ) -> Result<Option<DigestReply>> {
         let Some(_guard) = Flag::take(&self.digest_probe_busy) else { return Ok(None) };
+        let mut spend = Spend::new(budget);
         let txn = self.db().begin_read()?;
-        let facets = self.assess(&txn, &ask.cut, ScanFor::Only(ask.busy), budget)?;
+        let facets = self.assess(&txn, &ask.cut, ScanFor::Only(ask.busy), &mut spend)?;
         let theirs: BTreeMap<CollectionId, BTreeSet<Vec<u8>>> = ask
             .uncovered
             .iter()
@@ -383,30 +486,32 @@ impl Engine {
             };
             if entry.deferred.is_none() {
                 let own: usize = facet.uncovered.iter().map(Vec::len).sum();
-                if own > ANSWER_KEY_BYTES {
+                if own > budget.answer_keys {
                     entry.deferred = Some(Defer::UncoveredCap);
                 } else {
                     let union: BTreeSet<&Vec<u8>> = theirs.iter().chain(&facet.uncovered).collect();
-                    match excluded_digest(
+                    match self.excluded_digest(
                         &docs,
                         *id,
                         &facet.row,
                         union,
+                        &mut spend,
                         &mut read,
-                        ANSWER_KEY_BYTES,
+                        budget.answer_keys,
                     )? {
-                        Some(digest) => {
+                        Excluded::Digest(digest) => {
                             entry.digest = ByteBuf::from(digest.to_be_bytes().to_vec());
                             entry.uncovered =
                                 facet.uncovered.iter().cloned().map(ByteBuf::from).collect();
                         }
-                        None => entry.deferred = Some(Defer::UncoveredCap),
+                        Excluded::OverCap => entry.deferred = Some(Defer::UncoveredCap),
+                        Excluded::OverBudget => entry.deferred = Some(Defer::Budget),
                     }
                 }
             }
             entries.push(entry);
         }
-        Ok(Some(DigestReply { entries }))
+        Ok(Some(DigestReply { entries, malformed: 0 }))
     }
 
     /// The requester's `T2`: every predicate again, the uncovered set again
@@ -421,8 +526,11 @@ impl Engine {
         peer_incarnations: &BTreeMap<CollectionId, Hlc>,
         budget: ScanBudget,
     ) -> Result<Vec<DigestVerdict>> {
+        #[cfg(any(test, feature = "test-hooks"))]
+        self.fail_digest_probe_if_armed()?;
+        let mut spend = Spend::new(budget);
         let txn = self.db().begin_read()?;
-        let now = self.assess(&txn, &plan.cut, ScanFor::All, budget)?;
+        let now = self.assess(&txn, &plan.cut, ScanFor::All, &mut spend)?;
         let docs = txn.open_table(tables::DOCS)?;
         let mut read = 0usize;
         let mut out = Vec::new();
@@ -464,15 +572,29 @@ impl Engine {
             }
             let theirs: BTreeSet<Vec<u8>> = entry.uncovered.iter().map(|k| k.to_vec()).collect();
             let union: BTreeSet<&Vec<u8>> = then.uncovered.iter().chain(&theirs).collect();
-            let Some(mine) = excluded_digest(&docs, id, &fresh.row, union, &mut read, usize::MAX)?
-            else {
-                out.push(defer(Defer::UncoveredCap));
-                continue;
+            let mine = match self.excluded_digest(
+                &docs,
+                id,
+                &fresh.row,
+                union,
+                &mut spend,
+                &mut read,
+                budget.ask_keys.saturating_add(budget.answer_keys),
+            )? {
+                Excluded::Digest(mine) => mine,
+                Excluded::OverCap => {
+                    out.push(defer(Defer::UncoveredCap));
+                    continue;
+                }
+                Excluded::OverBudget => {
+                    out.push(defer(Defer::Budget));
+                    continue;
+                }
             };
             let theirs = <[u8; 16]>::try_from(entry.digest.as_slice()).map(u128::from_be_bytes);
             let Ok(theirs) = theirs else {
                 // A digest of the wrong width is no digest.
-                out.push(defer(Defer::UncoveredCap));
+                out.push(defer(Defer::Malformed));
                 continue;
             };
             out.push(DigestVerdict {
@@ -483,17 +605,52 @@ impl Engine {
         Ok(out)
     }
 
-    /// Every collection held (shadows hidden) as this side sees it at `cut`.
+    /// `row.digest` with the live records of `keys` taken out, by point reads
+    /// of `DOCS`. Each read is charged to the probe's budget as a page and
+    /// the stop is looked for before it, so thousands of cold random reads can
+    /// neither run past the budget nor hold a stop up.
+    #[allow(clippy::too_many_arguments)]
+    fn excluded_digest<'k>(
+        &self,
+        docs: &impl ReadableTable<(u64, &'static [u8]), &'static [u8]>,
+        collection: CollectionId,
+        row: &DigestRow,
+        keys: impl IntoIterator<Item = &'k Vec<u8>>,
+        spend: &mut Spend,
+        read: &mut usize,
+        cap: usize,
+    ) -> Result<Excluded> {
+        let mut digest = row.digest;
+        for key in keys {
+            self.check_walk(WalkScope::Background)?;
+            *read += key.len();
+            if *read > cap {
+                return Ok(Excluded::OverCap);
+            }
+            if !spend.charge(POINT_READ_COST) {
+                return Ok(Excluded::OverBudget);
+            }
+            if let Some(record) = docs.get((collection.0, key.as_slice()))? {
+                let (stamp, live) = codec::doc_record_header(record.value())?;
+                if live {
+                    digest ^= live_digest::term(key, &stamp);
+                }
+            }
+        }
+        Ok(Excluded::Digest(digest))
+    }
+
+    /// Every collection held (shadows hidden) as this side sees it at `cut`,
+    /// the rows and every predicate read in `txn`, beside each other.
     fn assess(
         &self,
         txn: &redb::ReadTransaction,
         cut: &VersionVector,
         scan_for: ScanFor,
-        budget: ScanBudget,
+        spend: &mut Spend,
     ) -> Result<BTreeMap<CollectionId, Facet>> {
-        let metas = self.collections(PairedShadows::Hidden)?;
+        let metas = Self::collections_in(txn, PairedShadows::Hidden)?;
         let rows = txn.open_table(tables::LIVE_DIGESTS)?;
-        let owed: BTreeSet<CollectionId> = self.owed_purges()?.into_iter().collect();
         let mut tombstoned: BTreeMap<String, bool> = BTreeMap::new();
         let mut facets = BTreeMap::new();
         for meta in &metas {
@@ -504,14 +661,16 @@ impl Engine {
             } else if match tombstoned.get(&meta.db) {
                 Some(known) => *known,
                 None => {
-                    let held = self.database_dropped_at(&meta.db)?.is_some();
+                    let held = Self::collection_dropped_at_in(
+                        txn,
+                        kimmy_core::database_drop_id(&meta.db),
+                    )?
+                    .is_some();
                     tombstoned.insert(meta.db.clone(), held);
                     held
                 }
             } {
                 Some(Defer::DatabaseTombstone)
-            } else if owed.contains(&meta.id) {
-                Some(Defer::BurialPending)
             } else {
                 None
             };
@@ -535,7 +694,7 @@ impl Engine {
         if busy.is_empty() {
             return Ok(facets);
         }
-        if self.serve_verdict(cut)? != crate::snapshot::ServeVerdict::Serve {
+        if Self::serve_verdict_in(txn, cut)? != crate::snapshot::ServeVerdict::Serve {
             for id in &busy {
                 facets.get_mut(id).expect("a busy collection").deferred = Some(Defer::Horizon);
             }
@@ -550,7 +709,7 @@ impl Engine {
             .map(|(node, _)| cut.get(*node))
             .min()
             .unwrap_or(Hlc::ZERO);
-        match self.scan_uncovered(txn, cut, &busy, from, budget)? {
+        match self.scan_uncovered(txn, cut, &busy, from, spend)? {
             Some(found) => {
                 for (id, keys) in found {
                     facets.get_mut(&id).expect("a busy collection").uncovered = keys;
@@ -575,18 +734,15 @@ impl Engine {
         cut: &VersionVector,
         busy: &BTreeSet<CollectionId>,
         from: Hlc,
-        budget: ScanBudget,
+        spend: &mut Spend,
     ) -> Result<Option<BTreeMap<CollectionId, BTreeSet<Vec<u8>>>>> {
-        let started = Instant::now();
         let oplog = open_walk_table(txn, tables::OPLOG, self.walk(WalkScope::Background))?;
         let start = codec::oplog_key_lower_bound(from);
         let mut found: BTreeMap<CollectionId, BTreeSet<Vec<u8>>> = BTreeMap::new();
-        let mut bytes = 0u64;
         for row in oplog.range::<&[u8]>(start.as_slice()..)? {
             let (key, value) = row?;
             let (key, value) = (key.value(), value.value());
-            bytes += (key.len() + value.len()) as u64;
-            if bytes > budget.bytes || started.elapsed() > budget.wall {
+            if !spend.charge((key.len() + value.len()) as u64) {
                 return Ok(None);
             }
             let stamp = codec::decode_oplog_key(key)?;
@@ -604,6 +760,28 @@ impl Engine {
             }
         }
         Ok(Some(found))
+    }
+
+    /// Make the next digest plan or comparison fail with a storage error that
+    /// is not a stop (a test hook: a digest-only fault).
+    #[cfg(any(test, feature = "test-hooks"))]
+    pub fn fail_next_digest_probe_for_test(&self) {
+        self.digest_fail_next.store(true, Ordering::SeqCst);
+    }
+
+    #[cfg(any(test, feature = "test-hooks"))]
+    fn fail_digest_probe_if_armed(&self) -> Result<()> {
+        match self.digest_fail_next.swap(false, Ordering::SeqCst) {
+            true => Err(crate::StorageError::Corrupt("a digest fault injected by a test".into())),
+            false => Ok(()),
+        }
+    }
+
+    /// Hold the one-probe-at-a-time flag, so that a peer's digest request is
+    /// answered `busy` (a test hook). Released when the guard drops.
+    #[cfg(any(test, feature = "test-hooks"))]
+    pub fn hold_digest_probe_for_test(&self) -> impl Drop + '_ {
+        Flag::take(&self.digest_probe_busy).expect("no digest probe is being answered")
     }
 
     /// Check a collection's kept digest row against its records, and correct it
@@ -734,32 +912,6 @@ pub enum SelfCheck {
     Corrected,
     /// Not run to the end: over its budget, or another check was running.
     Busy,
-}
-
-/// `row.digest` with the live records of `keys` taken out, by point reads of
-/// `DOCS`. `None` if reading them would pass `cap` bytes of key.
-fn excluded_digest<'k>(
-    docs: &impl ReadableTable<(u64, &'static [u8]), &'static [u8]>,
-    collection: CollectionId,
-    row: &DigestRow,
-    keys: impl IntoIterator<Item = &'k Vec<u8>>,
-    read: &mut usize,
-    cap: usize,
-) -> Result<Option<u128>> {
-    let mut digest = row.digest;
-    for key in keys {
-        *read += key.len();
-        if *read > cap {
-            return Ok(None);
-        }
-        if let Some(record) = docs.get((collection.0, key.as_slice()))? {
-            let (stamp, live) = codec::doc_record_header(record.value())?;
-            if live {
-                digest ^= live_digest::term(key, &stamp);
-            }
-        }
-    }
-    Ok(Some(digest))
 }
 
 /// A flag held while a thing runs, so a second caller is told so.
@@ -1041,7 +1193,8 @@ mod tests {
         // A scan from the frozen origin's stamp would read the whole crowd and
         // spend this budget; from the busy collection's own cut it reads one
         // entry.
-        let tight = ScanBudget { wall: Duration::from_secs(60), bytes: 4 * 1024 };
+        let tight =
+            ScanBudget { wall: Duration::from_secs(60), bytes: 8 * 1024, ..ScanBudget::default() };
         let plan = a.digest_plan(&b.witnessed_vector().unwrap(), None, tight).unwrap();
         let reply = b.digest_answer(&plan.ask, tight).unwrap().unwrap();
         let verdicts = a.digest_compare(&plan, &reply, &incarnations(&b), tight).unwrap();
@@ -1051,7 +1204,7 @@ mod tests {
             "the frozen origin dragged the scan's start back: {verdicts:?}"
         );
         // And with nothing to spend the same scan defers.
-        let none = ScanBudget { wall: Duration::from_secs(60), bytes: 0 };
+        let none = ScanBudget { wall: Duration::from_secs(60), bytes: 0, ..ScanBudget::default() };
         let plan = a.digest_plan(&b.witnessed_vector().unwrap(), None, none).unwrap();
         assert!(
             plan.deferred().any(|(id, d)| id == orders.id && d == Defer::Budget),
@@ -1121,7 +1274,7 @@ mod tests {
     #[test]
     fn the_self_check_over_its_budget_or_while_another_runs_is_busy() {
         let (a, _b, orders, _items, _dirs) = converged();
-        let none = ScanBudget { wall: Duration::from_secs(60), bytes: 0 };
+        let none = ScanBudget { wall: Duration::from_secs(60), bytes: 0, ..ScanBudget::default() };
         assert_eq!(a.verify_digest_row(orders.id, none).unwrap(), SelfCheck::Busy);
         let held = Flag::take(&a.digest_check_busy).expect("free");
         assert_eq!(a.verify_digest_row(orders.id, ScanBudget::default()).unwrap(), SelfCheck::Busy);
@@ -1142,6 +1295,7 @@ mod tests {
             bson::deserialize_from_slice(&bson::serialize_to_vec(&ask).unwrap()).unwrap();
         assert_eq!(back, ask);
         let reply = DigestReply {
+            malformed: 0,
             entries: vec![DigestEntry {
                 collection: CollectionId(9),
                 digest: ByteBuf::from(vec![0u8; 16]),
@@ -1239,5 +1393,121 @@ mod tests {
             "{:?}",
             plan.deferred().collect::<Vec<_>>()
         );
+    }
+    /// F8: the point reads that subtract a request's uncovered keys draw on the
+    /// same budget as the scan, a page each, so a hot collection against a lagging
+    /// peer cannot run past it.
+    #[test]
+    fn a_budget_spent_inside_the_subtraction_defers_and_stops_there() {
+        let (a, b, orders, _items, _dirs) = converged();
+        for i in 0..60i64 {
+            a.insert(&orders, doc! { "_id": 1_000 + i }).unwrap();
+        }
+        // Enough for the scan of the tail, not for sixty pages of point reads.
+        let budget = ScanBudget { bytes: 100 * 1024, ..ScanBudget::default() };
+        let plan = a.digest_plan(&b.witnessed_vector().unwrap(), None, budget).unwrap();
+        assert!(
+            plan.deferred().next().is_none(),
+            "the scan itself fits: {:?}",
+            plan.ask.uncovered.len()
+        );
+        let reply = b.digest_answer(&plan.ask, budget).unwrap().unwrap();
+        let entry = reply.entries.iter().find(|e| e.collection == orders.id).expect("answered");
+        assert_eq!(entry.deferred, Some(Defer::Budget), "the peer stopped at its budget");
+        // And the requester's own subtraction at T2, against an answer that fits.
+        let roomy = b.digest_answer(&plan.ask, ScanBudget::default()).unwrap().unwrap();
+        let verdicts = a.digest_compare(&plan, &roomy, &incarnations(&b), budget).unwrap();
+        assert_eq!(
+            outcome_of(&verdicts, orders.id),
+            Some(DigestOutcome::Deferred(Defer::Budget)),
+            "{verdicts:?}"
+        );
+        assert_eq!(
+            compared(&exchange(&a, &b, None), orders.id),
+            Some(true),
+            "with the default budget the same collection compares"
+        );
+    }
+
+    /// F5 (M8): a database tombstone that lands between the plan and the
+    /// comparison is caught by the comparison's own re-evaluation.
+    #[test]
+    fn a_database_tombstone_between_the_plan_and_the_comparison_defers_the_collection() {
+        let (a, b, orders, _items, _dirs) = converged();
+        let budget = ScanBudget::default();
+        let plan = a.digest_plan(&b.witnessed_vector().unwrap(), None, budget).unwrap();
+        let reply = b.digest_answer(&plan.ask, budget).unwrap().unwrap();
+        a.record_database_tombstone_for_test(
+            kimmy_core::database_drop_id("shop"),
+            Stamp::new(Hlc::new(crate::physical_now_ms() + 1_000, 0), a.node_id()),
+        )
+        .unwrap();
+        let verdicts = a.digest_compare(&plan, &reply, &incarnations(&b), budget).unwrap();
+        assert_eq!(
+            outcome_of(&verdicts, orders.id),
+            Some(DigestOutcome::Deferred(Defer::DatabaseTombstone)),
+            "{verdicts:?}"
+        );
+    }
+
+    /// F5 (N13): the comparison reads this side's row as it is now. A key
+    /// already uncovered at the plan, written again after it, is still excluded,
+    /// and its old term must not be left in the row it subtracts from.
+    #[test]
+    fn a_key_written_again_after_the_plan_is_still_set_aside() {
+        let (a, b, orders, _items, _dirs) = converged();
+        a.insert(&orders, doc! { "_id": 100i64, "v": 1 }).unwrap();
+        let budget = ScanBudget::default();
+        let plan = a.digest_plan(&b.witnessed_vector().unwrap(), None, budget).unwrap();
+        let reply = b.digest_answer(&plan.ask, budget).unwrap().unwrap();
+        a.replace(&orders, &DocId::Int64(100), doc! { "_id": 100i64, "v": 2 }, false).unwrap();
+        let verdicts = a.digest_compare(&plan, &reply, &incarnations(&b), budget).unwrap();
+        assert_eq!(compared(&verdicts, orders.id), Some(true), "{verdicts:?}");
+    }
+
+    /// N7 and N8: the caps on the keys a request carries and an answer reads.
+    #[test]
+    fn a_request_or_an_answer_over_its_key_cap_defers_the_collection() {
+        let (a, b, orders, _items, _dirs) = converged();
+        for i in 0..5i64 {
+            a.insert(&orders, doc! { "_id": 100 + i }).unwrap();
+        }
+        // The request's cap.
+        let small_ask = ScanBudget { ask_keys: 4, ..ScanBudget::default() };
+        let plan = a.digest_plan(&b.witnessed_vector().unwrap(), None, small_ask).unwrap();
+        assert!(
+            plan.deferred().any(|(id, d)| id == orders.id && d == Defer::UncoveredCap),
+            "{:?}",
+            plan.deferred().collect::<Vec<_>>()
+        );
+        assert!(plan.ask.uncovered.is_empty(), "nothing over the cap is sent");
+        // The answer's cap on the keys it subtracts, and on its own.
+        let plan =
+            a.digest_plan(&b.witnessed_vector().unwrap(), None, ScanBudget::default()).unwrap();
+        let small_answer = ScanBudget { answer_keys: 4, ..ScanBudget::default() };
+        let reply = b.digest_answer(&plan.ask, small_answer).unwrap().unwrap();
+        let entry = reply.entries.iter().find(|e| e.collection == orders.id).unwrap();
+        assert_eq!(entry.deferred, Some(Defer::UncoveredCap), "the keys it was asked to subtract");
+        // Its own uncovered keys, over the cap: B busy and named.
+        let (c, d, notes, _more, _dirs2) = converged();
+        for i in 0..5i64 {
+            d.insert(&notes, doc! { "_id": 200 + i }).unwrap();
+        }
+        let plan = c
+            .digest_plan(&d.witnessed_vector().unwrap(), Some(notes.id), ScanBudget::default())
+            .unwrap();
+        let reply = d.digest_answer(&plan.ask, small_answer).unwrap().unwrap();
+        let entry = reply.entries.iter().find(|e| e.collection == notes.id).unwrap();
+        assert_eq!(entry.deferred, Some(Defer::UncoveredCap), "its own keys over the cap");
+    }
+
+    #[test]
+    fn a_digest_failure_hook_fails_one_plan_and_one_comparison() {
+        let (a, b, _orders, _items, _dirs) = converged();
+        a.fail_next_digest_probe_for_test();
+        assert!(
+            a.digest_plan(&b.witnessed_vector().unwrap(), None, ScanBudget::default()).is_err()
+        );
+        assert!(a.digest_plan(&b.witnessed_vector().unwrap(), None, ScanBudget::default()).is_ok());
     }
 }
