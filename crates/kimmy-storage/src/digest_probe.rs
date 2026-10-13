@@ -1419,6 +1419,13 @@ mod tests {
     /// tombstone's retention nor invents the difference: once the drop is
     /// covered it compares, and says what the counts say. The existence half
     /// sees nothing, since both hold the collection.
+    ///
+    /// The difference itself is a replication bug, recorded as the finding
+    /// `kimmydb-a-collection-dropped-on-one-member-and-created-again-on-another-
+    /// before-the-drop-replicates-leaves-the-members-different-for-good-and-the-
+    /// repair-loops`; the digest's part is to report it as true, which is what
+    /// this pins. The fix makes the two members agree and this test's last two
+    /// assertions say so then.
     #[test]
     fn a_concurrent_create_later_than_a_drop_is_compared_and_the_difference_is_real() {
         let (a, _da) = engine();
