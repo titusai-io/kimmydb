@@ -4075,13 +4075,9 @@ where
         Some(_) => Some(match (digests, digest_busy) {
             (Some(reply), _) => match plan {
                 Some(plan) => {
-                    let theirs: BTreeMap<CollectionId, Hlc> =
-                        peer_incarnations.iter().copied().collect();
                     match degrade_digest(
                         "comparison",
-                        kimmy_storage::blocking(|| {
-                            engine.digest_compare(&plan, &reply, &theirs, budget)
-                        }),
+                        kimmy_storage::blocking(|| engine.digest_compare(&plan, &reply, budget)),
                     )? {
                         Some(verdicts) => DigestRound {
                             answered: DigestAnswered::Answered,

@@ -26577,9 +26577,19 @@ restored with the other, `check-store` clean, opened by both.
    and the requester compares (`digest_compare`: every deferral predicate again, the uncovered set again with
    the same cut, and a write that landed in between defers the collection as `moved`). The answer states how
    many of the requester's keys it processed, and the requester refuses a digest taken over another set.
-   Every non-comparison has a reason, counted: `bare_tombstone`, `horizon` (the oplog above the cut cannot be
-   read in full here: retention removed it or a snapshot gave the state without the entries), `database_tombstone`,
-   `burial_pending`, `moved`, `uncovered_cap`, `budget`, `busy`, `incarnation`, `self_check_busy`.
+   Every non-comparison has a reason, counted per collection: `bare_tombstone`, `horizon` (the oplog above the
+   cut cannot be read in full here: retention removed it or a snapshot gave the state without the entries),
+   `database_tombstone`, `moved`, `uncovered_cap`, `budget` (the scan and the point reads share one budget),
+   `busy`, `incarnation`, `self_check_busy`, `error` (this side failed to plan or compare; the contact and its
+   other halves go on without the digest), `malformed` (an entry of the answer did not decode) and `corrected`
+   (the mismatch was this side's own row, corrected). **`incarnation` means a side holds a drop tombstone for
+   the collection's id**, the requester's own read in its transaction and the peer's reported in its entry as
+   the other deferrals are: a name dropped and created again derives the same id, and whether the other side
+   holds the same life is not something a digest can tell. It does *not* compare the two members' `created`:
+   a collection created on two members at once keeps a different `created` on each for good (a replicated
+   create of an existing collection is `Exists`), and the system collections of every cluster are such, so
+   comparing them deferred two thirds of every probe. The creation of the name again is refused while the
+   burial's purge is owed (ADR-189), so the purge's removals never meet the new row, which a creation resets.
 4. **On the wire**, optional fields on the two existing messages: `AskDivergence.digest` and
    `Divergence.digests` / `digest_busy`, read leniently (a field of another shape costs the field, and one bad
    entry costs the entry), absent from the frame when there is nothing to say, so an answer to an older
@@ -26630,7 +26640,7 @@ for data from round 0510.
 
 **Cost.** Two `xxh3_128` per record write and one row per transaction per collection written. A busy
 collection costs a scan of the oplog tail; the duty cycle is bounded by the budget and the one-at-a-time rule
-(four members, the placeholders: up to seven scans of 200 ms per 5 s interval, 28% of one blocking thread,
+(four members, the placeholders: up to nine scans of 200 ms per 5 s interval, 36% of one blocking thread,
 and only when every collection is busy). The first start of 0.48.0 and the start after a crash or kill of
 0.48.x walk `DOCS` once, as the live counts' walk always did, now in chunks. Cold, on a spinning disk, the tester
 measured about 10 MB/s over a 688 MB `OPLOG`, 26–28,000 rows/s; the heaviest 50,000-row chunk was 128.8 MiB
@@ -26645,7 +26655,8 @@ cooperative stop resumes, a crash restarts, a kill at every chunk commit, a curs
 format, a walk started by one stale mark, a stopped walk then an older build that completed its open, a forced
 start), `digest_probe.rs` (converged members, a lost update, a write the peer has not seen, a key in both
 sets, a write between the plan and the comparison, a bare tombstone on either side, the horizon, a frozen
-origin, one probe at a time, the incarnation, the self-check and its delta under a concurrent commit),
+origin, one probe at a time, a collection created on both members at once, a drop and a creation of the name
+again deferred by whichever side holds the tombstone, a creation over an owed purge, the self-check and its delta under a concurrent commit),
 `divergence.rs` (a digest finding plans nothing and the gauge reads one), `protocol.rs` (the fields cross the
 version line both ways; a field or an entry of another shape costs itself, not the frame), `transport.rs` (an
 unanswered and a busy peer), `kimmy-cluster/tests/replication.rs` (two live nodes: converged, a lost update the

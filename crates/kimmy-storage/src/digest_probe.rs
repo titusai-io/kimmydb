@@ -151,7 +151,9 @@ pub enum Defer {
     Budget,
     /// The peer was already answering a digest probe.
     Busy,
-    /// The two sides hold the collection at different incarnations.
+    /// Either side holds a drop tombstone for the collection's id: it may be
+    /// at another life than the other side's, which the digests cannot tell
+    /// from a difference.
     Incarnation,
     /// A self-check was already running, or over its budget.
     SelfCheckBusy,
@@ -516,14 +518,10 @@ impl Engine {
 
     /// The requester's `T2`: every predicate again, the uncovered set again
     /// with the same cut, and the comparison.
-    ///
-    /// `peer_incarnations` is what the peer reported as each collection's
-    /// `created`: a collection held at another incarnation is not compared.
     pub fn digest_compare(
         &self,
         plan: &DigestPlan,
         reply: &DigestReply,
-        peer_incarnations: &BTreeMap<CollectionId, Hlc>,
         budget: ScanBudget,
     ) -> Result<Vec<DigestVerdict>> {
         #[cfg(any(test, feature = "test-hooks"))]
@@ -545,10 +543,6 @@ impl Engine {
                 |d: Defer| DigestVerdict { collection: id, outcome: DigestOutcome::Deferred(d) };
             if let Some(d) = entry.deferred {
                 out.push(defer(d));
-                continue;
-            }
-            if peer_incarnations.get(&id).is_some_and(|created| *created != then.created) {
-                out.push(defer(Defer::Incarnation));
                 continue;
             }
             if let Some(d) = then.deferred.or(fresh.deferred) {
@@ -658,6 +652,13 @@ impl Engine {
             let quiet = row.maxw.iter().all(|(node, hlc)| *hlc <= cut.get(*node));
             let deferred = if row.bare_max.iter().any(|(node, hlc)| *hlc > cut.get(*node)) {
                 Some(Defer::BareTombstone)
+            } else if Self::collection_dropped_at_in(txn, meta.id)?.is_some() {
+                // A tombstone for this id means an earlier life of it ended
+                // on this side. Whether the other side holds the same life is
+                // not something the digest can tell, and `created` differs
+                // per member for good on a concurrent create, so it is not
+                // asked: the side that holds the tombstone defers.
+                Some(Defer::Incarnation)
             } else if match tombstoned.get(&meta.db) {
                 Some(known) => *known,
                 None => {
@@ -967,16 +968,12 @@ mod tests {
         pull(b, a);
     }
 
-    fn incarnations(e: &Engine) -> BTreeMap<CollectionId, Hlc> {
-        e.collection_incarnations().unwrap()
-    }
-
     /// A requester `a` probing `b`, all the way through.
     fn exchange(a: &Engine, b: &Engine, busy: Option<CollectionId>) -> Vec<DigestVerdict> {
         let budget = ScanBudget::default();
         let plan = a.digest_plan(&b.witnessed_vector().unwrap(), busy, budget).unwrap();
         let reply = b.digest_answer(&plan.ask, budget).unwrap().expect("answered");
-        a.digest_compare(&plan, &reply, &incarnations(b), budget).unwrap()
+        a.digest_compare(&plan, &reply, budget).unwrap()
     }
 
     fn outcome_of(verdicts: &[DigestVerdict], id: CollectionId) -> Option<DigestOutcome> {
@@ -1100,7 +1097,7 @@ mod tests {
         let mut bare = plan.ask.clone();
         bare.uncovered.clear();
         let reply = b.digest_answer(&bare, budget).unwrap().unwrap();
-        let verdicts = a.digest_compare(&plan, &reply, &incarnations(&b), budget).unwrap();
+        let verdicts = a.digest_compare(&plan, &reply, budget).unwrap();
         assert_eq!(
             outcome_of(&verdicts, orders.id),
             Some(DigestOutcome::Deferred(Defer::UncoveredCap)),
@@ -1116,7 +1113,7 @@ mod tests {
         let reply = b.digest_answer(&plan.ask, budget).unwrap().unwrap();
         // After the plan: a new key in a quiet collection.
         a.insert(&orders, doc! { "_id": 200i64 }).unwrap();
-        let verdicts = a.digest_compare(&plan, &reply, &incarnations(&b), budget).unwrap();
+        let verdicts = a.digest_compare(&plan, &reply, budget).unwrap();
         assert_eq!(outcome_of(&verdicts, orders.id), Some(DigestOutcome::Deferred(Defer::Moved)));
         assert_eq!(
             compared(&verdicts, items.id),
@@ -1133,7 +1130,7 @@ mod tests {
         let plan = a.digest_plan(&b.witnessed_vector().unwrap(), None, budget).unwrap();
         let reply = b.digest_answer(&plan.ask, budget).unwrap().unwrap();
         a.insert(&orders, doc! { "_id": 101i64 }).unwrap();
-        let verdicts = a.digest_compare(&plan, &reply, &incarnations(&b), budget).unwrap();
+        let verdicts = a.digest_compare(&plan, &reply, budget).unwrap();
         assert_eq!(outcome_of(&verdicts, orders.id), Some(DigestOutcome::Deferred(Defer::Moved)));
     }
 
@@ -1203,7 +1200,7 @@ mod tests {
             ScanBudget { wall: Duration::from_secs(60), bytes: 8 * 1024, ..ScanBudget::default() };
         let plan = a.digest_plan(&b.witnessed_vector().unwrap(), None, tight).unwrap();
         let reply = b.digest_answer(&plan.ask, tight).unwrap().unwrap();
-        let verdicts = a.digest_compare(&plan, &reply, &incarnations(&b), tight).unwrap();
+        let verdicts = a.digest_compare(&plan, &reply, tight).unwrap();
         assert_eq!(
             compared(&verdicts, orders.id),
             Some(true),
@@ -1230,19 +1227,153 @@ mod tests {
         assert!(b.digest_answer(&plan.ask, ScanBudget::default()).unwrap().is_some());
     }
 
+    /// A collection both members created on their own, before either heard of
+    /// the other's, has a different `created` on each for good (a replicated
+    /// create of an existing collection is `Exists`). The digest compares it
+    /// all the same, and finds nothing once the writes have crossed.
     #[test]
-    fn a_collection_at_another_incarnation_is_not_compared() {
-        let (a, b, orders, _items, _dirs) = converged();
-        let budget = ScanBudget::default();
-        let plan = a.digest_plan(&b.witnessed_vector().unwrap(), None, budget).unwrap();
-        let reply = b.digest_answer(&plan.ask, budget).unwrap().unwrap();
-        let mut theirs = incarnations(&b);
-        theirs.insert(orders.id, Hlc::new(5, 0));
-        let verdicts = a.digest_compare(&plan, &reply, &theirs, budget).unwrap();
+    fn a_collection_both_members_created_at_once_is_compared_and_agrees() {
+        let (a, _da) = engine();
+        let (b, _db) = engine();
+        let on_a = a.create_collection("shop", "orders").unwrap();
+        let on_b = b.create_collection("shop", "orders").unwrap();
+        assert_ne!(on_a.created, on_b.created, "the premise: two creations, two stamps");
+        for i in 0..5i64 {
+            a.insert(&on_a, doc! { "_id": i }).unwrap();
+            b.insert(&on_b, doc! { "_id": 10 + i }).unwrap();
+        }
+        sync(&a, &b);
+        sync(&a, &b);
+        assert_eq!(a.collection_incarnations().unwrap().len(), 1 + system_collections(&a));
+        for (x, y) in [(&a, &b), (&b, &a)] {
+            let verdicts = exchange(x, y, None);
+            for id in x.all_collection_ids().unwrap() {
+                assert_eq!(compared(&verdicts, id), Some(true), "{id:?}: {verdicts:?}");
+            }
+        }
+    }
+
+    fn system_collections(e: &Engine) -> usize {
+        e.collection_incarnations().unwrap().len() - 1
+    }
+
+    /// The write that was stamped before the other member's own `created`
+    /// still replicates to it: neither member refuses it as below its own
+    /// incarnation, so both hold the document and the digests agree.
+    #[test]
+    fn a_write_stamped_before_the_other_members_own_create_reaches_it() {
+        let (a, _da) = engine();
+        let (b, _db) = engine();
+        let on_a = a.create_collection("shop", "orders").unwrap();
+        a.insert(&on_a, doc! { "_id": 1i64, "from": "a" }).unwrap();
+        // Later than the insert above on A's clock, and on its own.
+        let on_b = b.create_collection("shop", "orders").unwrap();
+        assert!(on_b.created > on_a.created);
+        b.insert(&on_b, doc! { "_id": 2i64, "from": "b" }).unwrap();
+        sync(&a, &b);
+        sync(&a, &b);
+        for (who, e) in [("a", &a), ("b", &b)] {
+            let coll = e.collection_by_id(on_a.id).unwrap().unwrap();
+            for id in [1i64, 2] {
+                assert!(
+                    e.get(&coll, &DocId::Int64(id)).unwrap().is_some(),
+                    "{who} does not hold document {id}"
+                );
+            }
+        }
+        for (x, y) in [(&a, &b), (&b, &a)] {
+            let verdicts = exchange(x, y, None);
+            assert_eq!(compared(&verdicts, on_a.id), Some(true), "{verdicts:?}");
+        }
+    }
+
+    /// A dropped and created again collection is deferred by whichever side
+    /// holds the tombstone for its id, whichever side asks.
+    #[test]
+    fn a_collection_dropped_and_created_again_is_deferred_by_the_side_that_holds_the_tombstone() {
+        let (a, b, orders, items, _dirs) = converged();
+        a.drop_collection("shop", "orders").unwrap();
+        a.finish_purges_now().unwrap();
+        let again = a.create_collection("shop", "orders").unwrap();
+        assert_eq!(again.id, orders.id, "the same name derives the same id");
+        a.insert(&again, doc! { "_id": 0i64, "n": 7 }).unwrap();
+        // B has heard of none of it. A holds the tombstone.
+        let verdicts = exchange(&a, &b, None);
         assert_eq!(
             outcome_of(&verdicts, orders.id),
-            Some(DigestOutcome::Deferred(Defer::Incarnation))
+            Some(DigestOutcome::Deferred(Defer::Incarnation)),
+            "the requester holds the tombstone: {verdicts:?}"
         );
+        assert_eq!(compared(&verdicts, items.id), Some(true), "an untouched collection compares");
+        // The collection is busy on A (it was written after B's cut), so B
+        // names it, and A answers with the deferral and not a digest.
+        let verdicts = exchange(&b, &a, Some(orders.id));
+        assert_eq!(
+            outcome_of(&verdicts, orders.id),
+            Some(DigestOutcome::Deferred(Defer::Incarnation)),
+            "the peer holds the tombstone: {verdicts:?}"
+        );
+        assert_eq!(compared(&verdicts, items.id), Some(true));
+        // Once the drop has reached B it holds the tombstone too, and, its
+        // purge done, the new life.
+        sync(&a, &b);
+        b.finish_purges_now().unwrap();
+        sync(&a, &b);
+        assert!(b.collection_tombstones().unwrap().contains_key(&orders.id));
+        for (x, y) in [(&a, &b), (&b, &a)] {
+            let verdicts = exchange(x, y, Some(orders.id));
+            assert_eq!(
+                outcome_of(&verdicts, orders.id),
+                Some(DigestOutcome::Deferred(Defer::Incarnation)),
+                "both hold it: {verdicts:?}"
+            );
+        }
+    }
+
+    /// A drop whose purge is still owed holds the id: the creation of the
+    /// name again is refused until the last row of the old life has gone, so
+    /// the purge's removals can never take a record of the new life out of
+    /// the new row. The digest equals the walk after the drop, after every
+    /// chunk and after the creation, and the self-check finds no drift.
+    #[test]
+    fn a_creation_over_an_owed_purge_waits_and_the_purge_never_touches_the_new_row() {
+        use crate::engine::DROP_PURGE_CHUNK;
+        use crate::live_count::test_support::assert_digests_exact;
+        let (a, _dir) = engine();
+        let orders = a.create_collection("shop", "orders").unwrap();
+        let rows = DROP_PURGE_CHUNK * 2 + 7;
+        a.insert_many(&orders, (0..rows).map(|i| doc! { "_id": i as i64, "life": 1 }).collect())
+            .unwrap();
+        assert_digests_exact(&a, "the first life");
+        a.drop_collection("shop", "orders").unwrap();
+        assert_digests_exact(&a, "the drop");
+        let mut step = 0;
+        while a.rows_under(orders.id).unwrap() > 0 {
+            // The new life cannot start over rows the old one still holds.
+            assert!(
+                matches!(
+                    a.create_collection("shop", "orders"),
+                    Err(crate::StorageError::CollectionPurging { .. })
+                ),
+                "a creation over an owed purge must be refused (chunk {step})"
+            );
+            assert!(a.collection_by_id(orders.id).unwrap().is_none());
+            assert!(a.purge_chunk(orders.id).unwrap() > 0);
+            step += 1;
+            assert_digests_exact(&a, &format!("purge chunk {step}"));
+            assert_eq!(a.digest_drift_total(), 0);
+        }
+        assert!(step >= 3, "the purge ran in chunks");
+        let again = a.create_collection("shop", "orders").unwrap();
+        assert_eq!(a.digest_row(again.id).unwrap(), None, "the new life starts with no row");
+        // The same keys as the old life, written after it has gone.
+        a.insert_many(&again, (0..40i64).map(|i| doc! { "_id": i, "life": 2 }).collect()).unwrap();
+        assert_digests_exact(&a, "the second life");
+        assert_eq!(a.verify_digest_row(again.id, ScanBudget::default()).unwrap(), SelfCheck::Exact);
+        assert_eq!(a.digest_drift_total(), 0);
+        // And a purge asked for after the creation removes nothing of it.
+        assert_eq!(a.purge_chunk(again.id).unwrap(), 0);
+        assert_digests_exact(&a, "a purge chunk over the standing collection");
     }
 
     #[test]
@@ -1422,7 +1553,7 @@ mod tests {
         assert_eq!(entry.deferred, Some(Defer::Budget), "the peer stopped at its budget");
         // And the requester's own subtraction at T2, against an answer that fits.
         let roomy = b.digest_answer(&plan.ask, ScanBudget::default()).unwrap().unwrap();
-        let verdicts = a.digest_compare(&plan, &roomy, &incarnations(&b), budget).unwrap();
+        let verdicts = a.digest_compare(&plan, &roomy, budget).unwrap();
         assert_eq!(
             outcome_of(&verdicts, orders.id),
             Some(DigestOutcome::Deferred(Defer::Budget)),
@@ -1448,7 +1579,7 @@ mod tests {
             Stamp::new(Hlc::new(crate::physical_now_ms() + 1_000, 0), a.node_id()),
         )
         .unwrap();
-        let verdicts = a.digest_compare(&plan, &reply, &incarnations(&b), budget).unwrap();
+        let verdicts = a.digest_compare(&plan, &reply, budget).unwrap();
         assert_eq!(
             outcome_of(&verdicts, orders.id),
             Some(DigestOutcome::Deferred(Defer::DatabaseTombstone)),
@@ -1467,7 +1598,7 @@ mod tests {
         let plan = a.digest_plan(&b.witnessed_vector().unwrap(), None, budget).unwrap();
         let reply = b.digest_answer(&plan.ask, budget).unwrap().unwrap();
         a.replace(&orders, &DocId::Int64(100), doc! { "_id": 100i64, "v": 2 }, false).unwrap();
-        let verdicts = a.digest_compare(&plan, &reply, &incarnations(&b), budget).unwrap();
+        let verdicts = a.digest_compare(&plan, &reply, budget).unwrap();
         assert_eq!(compared(&verdicts, orders.id), Some(true), "{verdicts:?}");
     }
 
