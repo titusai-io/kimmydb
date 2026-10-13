@@ -1066,6 +1066,29 @@ mod tests {
     }
 
     #[test]
+    fn an_unreadable_digest_row_does_not_fail_a_write_and_is_started_afresh() {
+        let (engine, coll, _dir) = engine();
+        engine.insert(&coll, doc! { "_id": "one" }).unwrap();
+        {
+            let db = engine.db();
+            let txn = db.begin_write().unwrap();
+            txn.open_table(tables::LIVE_DIGESTS)
+                .unwrap()
+                .insert(coll.id.0, &[9u8, 9, 9][..])
+                .unwrap();
+            txn.commit().unwrap();
+        }
+        engine.insert(&coll, doc! { "_id": "two" }).expect("a derived row must not refuse a write");
+        let db = engine.db();
+        let txn = db.begin_read().unwrap();
+        let rows = txn.open_table(tables::LIVE_DIGESTS).unwrap();
+        assert!(
+            crate::live_digest::kept_row(&rows, coll.id.0).unwrap().is_some(),
+            "the row was replaced by one that reads"
+        );
+    }
+
+    #[test]
     fn retention_carries_both_marks_when_it_moves_the_arrival_end() {
         // Retention removes the oplog row an entry arrived last as when its stamp
         // is old and a later one of its origin stands, so the arrival index's end

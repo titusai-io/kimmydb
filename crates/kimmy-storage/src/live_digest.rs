@@ -202,8 +202,18 @@ pub(crate) fn flush(
     }
     let mut rows = txn.open_table(tables::LIVE_DIGESTS)?;
     for (collection, delta) in deltas {
+        // A row that cannot be read is started afresh and said so, as a count
+        // that is wrong is saturated rather than failing the write: refusing a
+        // write for a derived value would turn a wrong number into lost
+        // availability, and the self-check finds and corrects the drift.
         let current = match rows.get(*collection)? {
-            Some(raw) => Some(DigestRow::decode(raw.value())?),
+            Some(raw) => match DigestRow::decode(raw.value()) {
+                Ok(row) => Some(row),
+                Err(e) => {
+                    tracing::warn!(error = %e, "an unreadable digest row was replaced");
+                    None
+                }
+            },
             None => None,
         };
         let mut row = current.clone().unwrap_or_default();

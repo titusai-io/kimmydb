@@ -3209,9 +3209,18 @@ impl PeerStalls {
     /// Remember that `peer` answers digests, once it has: only to such a peer
     /// does this node pay for its own scan before asking (B3).
     fn note_digest(&mut self, peer: NodeId, round: Option<&kimmy_storage::DigestRound>) {
-        use kimmy_storage::DigestAnswered::{Answered, Busy, Probed};
-        if round.is_some_and(|r| matches!(r.answered, Answered | Busy | Probed)) {
-            self.digest_capable.insert(peer);
+        use kimmy_storage::DigestAnswered::{Answered, Busy, Probed, Unanswered};
+        match round.map(|r| r.answered) {
+            Some(Answered | Busy | Probed) => {
+                self.digest_capable.insert(peer);
+            }
+            // A peer that answered before and sends none now has been rolled
+            // back: it is asked with the cut alone again, not made to wait on
+            // a scan it will ignore.
+            Some(Unanswered) => {
+                self.digest_capable.remove(&peer);
+            }
+            None => {}
         }
     }
 
@@ -9285,6 +9294,10 @@ mod partial_windows_never_skip {
                 write_frame(&mut peer_end, &answer).await.unwrap();
             });
             let mut stalls = PeerStalls::new();
+            if !busy {
+                // A peer that answered digests before and now sends none.
+                stalls.digest_capable.insert(kimmy_core::NodeId::from_bytes([9; 16]));
+            }
             let addr: SocketAddr = "127.0.0.1:1".parse().unwrap();
             let outcome = sync_over_within(
                 &engine,
