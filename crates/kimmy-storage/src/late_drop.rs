@@ -397,6 +397,109 @@ mod tests {
         );
     }
 
+    /// The rule's two clauses: a life owes a sweep only when it began after the
+    /// drop and its floor is below it.
+    #[test]
+    fn a_life_owes_a_sweep_only_if_it_began_after_the_drop_and_its_floor_is_below_it() {
+        let meta = |created: u64, floor: Option<u64>| {
+            let mut meta = CollectionMeta::new(
+                CollectionId::derive("shop", "orders"),
+                "shop",
+                "orders",
+                Hlc::new(created, 0),
+                floor.map(|f| Hlc::new(f, 0)),
+            );
+            meta.incarnation_floor = floor.map(|f| Hlc::new(f, 0));
+            meta
+        };
+        let drop_at = Hlc::new(100, 0);
+        assert!(owes_a_sweep(&meta(200, None), drop_at), "newer, no floor");
+        assert!(owes_a_sweep(&meta(200, Some(50)), drop_at), "newer, floor below");
+        assert!(!owes_a_sweep(&meta(200, Some(100)), drop_at), "floor at the drop: done");
+        assert!(!owes_a_sweep(&meta(200, Some(150)), drop_at), "floor above the drop");
+        assert!(!owes_a_sweep(&meta(100, None), drop_at), "created at the drop is not newer");
+        assert!(!owes_a_sweep(&meta(50, None), drop_at), "older: the drop is aimed at it");
+    }
+
+    /// The vector shadow of a collection is swept with it.
+    #[test]
+    fn the_vector_shadow_is_swept_with_its_collection() {
+        let (b, _db) = engine();
+        let parent = b.create_collection("shop", "orders").unwrap();
+        b.configure_vectors(
+            "shop",
+            "orders",
+            kimmy_core::VectorConfig {
+                fields: vec!["text".into()],
+                provider: kimmy_core::ProviderConfig::Byo {},
+                dim: 4,
+                metric: Default::default(),
+                document_prefix: None,
+                query_prefix: None,
+                chunk: Default::default(),
+            },
+        )
+        .unwrap();
+        let shadow =
+            b.get_collection("shop", &kimmy_core::vector_meta::shadow_name("orders")).unwrap();
+        let node = NodeId::from_bytes([7; 16]);
+        let dropped = Stamp::new(Hlc::new(parent.created.wall_ms - 10, 0), node);
+        let straggler = Stamp::new(Hlc::new(parent.created.wall_ms - 20, 0), node);
+        {
+            let key = crate::docs::doc_key(&DocId::Int64(1)).unwrap();
+            let body = bson::serialize_to_vec(&doc! { "_id": 1i64 }).unwrap();
+            let txn = b.begin_write(WriterHolder::Replication).unwrap();
+            let mut docs = txn.open_table(tables::DOCS).unwrap();
+            crate::live_count::put_record(
+                &txn,
+                &mut docs,
+                shadow.id.0,
+                &key,
+                &codec::encode_doc_record(&kimmy_core::DocRecord::live(straggler, body)),
+            )
+            .unwrap();
+            drop(docs);
+            txn.commit().unwrap();
+        }
+        assert_eq!(b.count_by_id(shadow.id).unwrap(), Some(1), "premise");
+        b.sweep_after_an_ignored_drop(&parent, dropped).unwrap();
+        assert_eq!(b.count_by_id(shadow.id).unwrap(), Some(0));
+        for name in ["orders", shadow.name.as_str()] {
+            assert_eq!(
+                b.get_collection("shop", name).unwrap().incarnation_floor,
+                Some(dropped.hlc),
+                "{name}"
+            );
+        }
+        assert_counts_exact(&b, "a shadow swept");
+    }
+
+    /// A database drop that reaches a survivor by the database's tombstone alone
+    /// (no drop entry for the collection ever comes: the dropper never held it):
+    /// the sweep of survivors removes what it took in of the life before.
+    #[test]
+    fn a_database_tombstone_alone_removes_what_a_survivor_took_in_of_the_life_before() {
+        let (a, _da) = engine();
+        let (b, _db) = engine();
+        let (c, _dc) = engine();
+        // C holds a life of `shop.orders` that A never receives.
+        let on_c = c.create_collection("shop", "orders").unwrap();
+        c.insert(&on_c, doc! { "_id": 9i64, "from": "c" }).unwrap();
+        // A drops the database (it holds another collection of it).
+        a.create_collection("shop", "items").unwrap();
+        a.drop_database("shop").unwrap();
+        a.finish_purges_now().unwrap();
+        let on_b = b.create_collection("shop", "orders").unwrap();
+        b.insert(&on_b, doc! { "_id": 2i64, "from": "b" }).unwrap();
+        // C's life reaches B before the drop does.
+        pull(&b, &c);
+        assert_eq!(docs_of(&b, "shop", "orders", &[2, 9]), vec![2, 9], "premise");
+        pull(&b, &a);
+        b.finish_purges_now().unwrap();
+        assert_eq!(docs_of(&b, "shop", "orders", &[2, 9]), vec![2], "the survivor lost document 9");
+        assert_counts_exact(&b, "a survivor swept");
+    }
+
     /// A database drop: a collection created after it stands, and what it took
     /// in of the life before, before it learned of the drop, goes.
     #[test]
