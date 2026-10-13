@@ -2040,6 +2040,13 @@ impl Engine {
         self.state_held_refusals.load(std::sync::atomic::Ordering::Relaxed)
     }
 
+    /// Where this store lives, for a test that closes the engine and opens it
+    /// again.
+    #[cfg(test)]
+    pub(crate) fn db_path_for_test(&self) -> std::path::PathBuf {
+        self.path.clone()
+    }
+
     /// Count one refusal [`Self::state_held_refusals`] counts: the listener's, when
     /// it answers a pull `BeyondHorizon` for a hole.
     pub fn note_state_held_refusal(&self) {

@@ -1066,6 +1066,79 @@ mod tests {
     }
 
     #[test]
+    fn retention_carries_both_marks_when_it_moves_the_arrival_end() {
+        // Retention removes the oplog row an entry arrived last as when its stamp
+        // is old and a later one of its origin stands, so the arrival index's end
+        // moves and the mark has to move with it, for both tables (B3 design 2.2).
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("kimmy.redb");
+        let (coll_id, forged_digest) = {
+            let engine = Engine::open(&path).unwrap();
+            let coll = engine.create_collection("app", "docs").unwrap();
+            engine.insert(&coll, doc! { "_id": "kept" }).unwrap();
+            let origin = NodeId::generate();
+            let entry = |wall_ms: u64, name: &str| OplogEntry {
+                stamp: Stamp::new(Hlc::new(wall_ms, 0), origin),
+                kind: OpKind::Insert,
+                collection: coll.id,
+                doc_id: Some(DocId::String(name.into())),
+                body: Some(bson::serialize_to_vec(&doc! { "_id": name }).unwrap()),
+            };
+            // The newer arrives first, so the older arrives last, and is what
+            // retention removes (the newer is its origin's newest, and stays).
+            engine.apply_remote(&coll, &entry(2, "newer")).unwrap();
+            engine.apply_remote(&coll, &entry(1, "older")).unwrap();
+            let before = {
+                let db = engine.db();
+                let txn = db.begin_read().unwrap();
+                mark_of(
+                    &txn.open_table(tables::OPLOG_ARRIVAL).unwrap(),
+                    &txn.open_table(tables::OPLOG).unwrap(),
+                )
+                .unwrap()
+            };
+            std::thread::sleep(std::time::Duration::from_millis(5));
+            engine.collect_garbage(crate::RetentionPolicy::new(0, 3_600)).unwrap();
+            let after = {
+                let db = engine.db();
+                let txn = db.begin_read().unwrap();
+                mark_of(
+                    &txn.open_table(tables::OPLOG_ARRIVAL).unwrap(),
+                    &txn.open_table(tables::OPLOG).unwrap(),
+                )
+                .unwrap()
+            };
+            assert_ne!(before, after, "the premise: retention moved the arrival end");
+            assert_digests_exact(&engine, "retention");
+            // Forge a count and a digest behind the marks.
+            let db = engine.db();
+            let txn = db.begin_write().unwrap();
+            txn.open_table(tables::LIVE_COUNTS).unwrap().insert(coll.id.0, 77).unwrap();
+            let mut rows = txn.open_table(tables::LIVE_DIGESTS).unwrap();
+            let mut row = crate::live_digest::kept_row(&rows, coll.id.0).unwrap().unwrap();
+            row.digest ^= 0x1234;
+            rows.insert(coll.id.0, row.encode().as_slice()).unwrap();
+            drop(rows);
+            txn.commit().unwrap();
+            (coll.id, row)
+        };
+        let engine = Engine::open(&path).unwrap();
+        assert_eq!(
+            engine.count_by_id(coll_id).unwrap(),
+            Some(77),
+            "the counts' mark was carried, so the start did not walk"
+        );
+        let db = engine.db();
+        let txn = db.begin_read().unwrap();
+        let rows = txn.open_table(tables::LIVE_DIGESTS).unwrap();
+        assert_eq!(
+            crate::live_digest::kept_row(&rows, coll_id.0).unwrap().unwrap(),
+            forged_digest,
+            "the digest mark was carried too"
+        );
+    }
+
+    #[test]
     fn retention_and_a_rewind_carry_the_digest_mark_with_the_counts() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("kimmy.redb");

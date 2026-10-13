@@ -619,6 +619,8 @@ impl Engine {
         if !drifted {
             return Ok(SelfCheck::Exact);
         }
+        #[cfg(test)]
+        test_hooks::after_the_snapshot(self);
         // `row_now ^ fix`, with `fix = row_at_snapshot ^ walk`: a delta, so
         // what other commits did since the snapshot is kept.
         let fix = kept.digest ^ walked.digest;
@@ -684,6 +686,30 @@ impl Engine {
     }
 }
 
+#[cfg(test)]
+pub(crate) mod test_hooks {
+    use std::cell::RefCell;
+
+    use crate::Engine;
+
+    thread_local! {
+        /// Run between a self-check's snapshot and its correction, on this
+        /// thread: where a concurrent commit lands in the field.
+        static AFTER_THE_SNAPSHOT: RefCell<Option<Box<dyn FnOnce(&Engine)>>> =
+            const { RefCell::new(None) };
+    }
+
+    pub(crate) fn between_the_snapshot_and_the_correction(f: impl FnOnce(&Engine) + 'static) {
+        AFTER_THE_SNAPSHOT.with(|hook| *hook.borrow_mut() = Some(Box::new(f)));
+    }
+
+    pub(super) fn after_the_snapshot(engine: &Engine) {
+        if let Some(hook) = AFTER_THE_SNAPSHOT.with(|hook| hook.borrow_mut().take()) {
+            hook(engine);
+        }
+    }
+}
+
 /// What a self-check found.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SelfCheck {
@@ -697,11 +723,11 @@ pub enum SelfCheck {
 
 /// `row.digest` with the live records of `keys` taken out, by point reads of
 /// `DOCS`. `None` if reading them would pass `cap` bytes of key.
-fn excluded_digest(
+fn excluded_digest<'k>(
     docs: &impl ReadableTable<(u64, &'static [u8]), &'static [u8]>,
     collection: CollectionId,
     row: &DigestRow,
-    keys: BTreeSet<&Vec<u8>>,
+    keys: impl IntoIterator<Item = &'k Vec<u8>>,
     read: &mut usize,
     cap: usize,
 ) -> Result<Option<u128>> {
@@ -1109,5 +1135,90 @@ mod tests {
         let back: DigestReply =
             bson::deserialize_from_slice(&bson::serialize_to_vec(&reply).unwrap()).unwrap();
         assert_eq!(back, reply);
+    }
+    #[test]
+    fn the_self_check_keeps_what_a_commit_did_between_its_snapshot_and_its_correction() {
+        let (a, _b, orders, _items, _dirs) = converged();
+        // A forged row, and a write that lands after the check has read its
+        // state and before it corrects: the correction is a delta, so the
+        // write's own term survives.
+        {
+            let truth = a.digest_row(orders.id).unwrap().unwrap();
+            let txn = a.db().begin_write().unwrap();
+            let mut forged = truth;
+            forged.digest ^= 0x5555;
+            txn.open_table(tables::LIVE_DIGESTS)
+                .unwrap()
+                .insert(orders.id.0, forged.encode().as_slice())
+                .unwrap();
+            txn.commit().unwrap();
+        }
+        let id = orders.clone();
+        test_hooks::between_the_snapshot_and_the_correction(move |engine| {
+            engine.insert(&id, doc! { "_id": 500i64 }).unwrap();
+        });
+        assert_eq!(
+            a.verify_digest_row(orders.id, ScanBudget::default()).unwrap(),
+            SelfCheck::Corrected
+        );
+        // Whatever the walk says now, including the write that landed between.
+        assert_eq!(
+            a.verify_digest_row(orders.id, ScanBudget::default()).unwrap(),
+            SelfCheck::Exact,
+            "the correction lost what the concurrent commit added"
+        );
+    }
+
+    #[test]
+    fn a_rebuilt_row_defers_on_a_tombstone_where_a_maintained_one_compares() {
+        let (a, b, orders, _items, _dirs) = converged();
+        // A deletes a document B has not yet received: its tombstone is above
+        // the cut. Maintained, the row knows an entry stands behind it.
+        a.delete(&orders, &DocId::Int64(4)).unwrap();
+        let verdicts = exchange(&a, &b, Some(orders.id));
+        assert_eq!(
+            compared(&verdicts, orders.id),
+            Some(true),
+            "a maintained row compares: the delete is uncovered and set aside: {verdicts:?}"
+        );
+        // Rebuilt from the headers, the row cannot tell whether an entry
+        // stands behind a tombstone, so it defers while one is above the cut.
+        let path = a.db_path_for_test();
+        drop(a);
+        {
+            let db = redb::Database::open(&path).unwrap();
+            let txn = db.begin_write().unwrap();
+            txn.open_table(tables::LIVE_DIGESTS_THROUGH)
+                .unwrap()
+                .remove(live_digest::THROUGH)
+                .unwrap();
+            txn.commit().unwrap();
+        }
+        let a = Engine::open(&path).unwrap();
+        let verdicts = exchange(&a, &b, Some(orders.id));
+        assert_eq!(
+            outcome_of(&verdicts, orders.id),
+            Some(DigestOutcome::Deferred(Defer::BareTombstone)),
+            "{verdicts:?}"
+        );
+    }
+
+    #[test]
+    fn a_cut_below_what_retention_removed_defers_the_busy_collection_on_the_horizon() {
+        let (a, b, orders, _items, _dirs) = converged();
+        // A writes what B has not seen, and retention then removes the oplog
+        // above the cut: the uncovered keys can no longer be read.
+        a.insert(&orders, doc! { "_id": 100i64 }).unwrap();
+        // Retention keeps the newest entry of an origin, so there is a later one.
+        a.insert(&orders, doc! { "_id": 101i64 }).unwrap();
+        std::thread::sleep(Duration::from_millis(5));
+        a.collect_garbage(crate::RetentionPolicy::new(0, 3_600)).unwrap();
+        let plan =
+            a.digest_plan(&b.witnessed_vector().unwrap(), None, ScanBudget::default()).unwrap();
+        assert!(
+            plan.deferred().any(|(id, d)| id == orders.id && d == Defer::Horizon),
+            "{:?}",
+            plan.deferred().collect::<Vec<_>>()
+        );
     }
 }
