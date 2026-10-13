@@ -2928,3 +2928,55 @@ async fn a_start_buries_what_a_database_drop_covers_before_it_serves() {
     second.signal("TERM");
     assert!(second.wait_exit().success());
 }
+
+/// B3 design 2.1: whether a start rebuilds the live counts and the digests,
+/// whatever their marks say, follows from what the previous run was.
+///
+/// A run is trusted to have kept the digests only if a build at or above the
+/// first one that keeps them wrote its marker. This build is whichever it is,
+/// so the test asks what it should expect of itself: a development build below
+/// that version rebuilds after every start (its own marker reads as older),
+/// and a release at or above it rebuilds after a kill and not after a clean
+/// stop. Either way a kill is unclean, and the start after it rebuilds.
+#[tokio::test]
+async fn a_start_rebuilds_the_digests_when_the_previous_run_cannot_be_shown_to_have_kept_them() {
+    let keeps_digests = {
+        let mut parts = env!("CARGO_PKG_VERSION").split(['.', '-', '+']);
+        let mut next = || parts.next().and_then(|p| p.parse::<u64>().ok()).unwrap_or(0);
+        (next(), next(), next()) >= (0, 48, 0)
+    };
+    const REBUILT: &str = "rebuilt the live document counts before serving";
+    const FORCED: &str = "the previous run cannot be shown to have kept the digests";
+
+    let dir = tempfile::tempdir().unwrap();
+    let client = reqwest::Client::new();
+
+    let mut first = Run::spawn(dir.path(), "first");
+    first.wait_ready(&client).await;
+    let (status, _) = stop(&mut first);
+    assert!(status.success(), "{status:?}");
+
+    // After a clean stop of the build that wrote it.
+    let log = next_start_log(dir.path(), "after-a-clean-stop", &client).await;
+    let walked = log.lines().find(|l| l.contains(REBUILT));
+    if keeps_digests {
+        assert!(walked.is_none(), "a clean stop of a build that keeps them is trusted: {log}");
+    } else {
+        let line = walked.unwrap_or_else(|| panic!("no rebuild:\n{log}"));
+        assert!(line.contains(FORCED), "{line}");
+    }
+
+    // After a kill, whatever the build.
+    let mut killed = Run::spawn(dir.path(), "killed");
+    killed.wait_ready(&client).await;
+    killed.signal("KILL");
+    let _ = killed.wait_exit();
+    let log = next_start_log(dir.path(), "after-a-kill", &client).await;
+    let line = log
+        .lines()
+        .find(|l| l.contains(REBUILT))
+        .unwrap_or_else(|| panic!("a start after a kill must rebuild:\n{log}"));
+    assert!(line.contains(FORCED), "{line}");
+    assert!(line.contains("records="), "{line}");
+    assert!(line.contains("chunks="), "{line}");
+}
