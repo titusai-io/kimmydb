@@ -2,7 +2,9 @@
 //! ships with: the stop looked for every 256 rows, the chunk cut at 50,000
 //! rows or 64 MiB. The unit tests of `live_walk` look at every row and cut a
 //! chunk at a handful of rows, so they cannot tell these from other values;
-//! this runs the library as shipped, with only the stop placed by a hook.
+//! this runs the library as shipped, with only the stop placed by a hook. It
+//! lives in `kimmyd`'s tests because those build the storage crate with
+//! `test-hooks`, as every test that needs a hook does.
 
 use std::cell::RefCell;
 use std::io::Write;

@@ -55,10 +55,6 @@ tokio = { workspace = true, features = ["full", "test-util"] }
 # Dev-only: a test reads what `Engine::open` logs, since a line an operator
 # is told to act on is behaviour, not decoration.
 tracing-subscriber.workspace = true
-# Dev-only, on itself: the tests in `tests/` run the library as shipped, and
-# turn on its test hooks to place a stop or read a count, which `cfg(test)` does
-# only for the unit tests.
-kimmy-storage = { path = ".", features = ["test-hooks"] }
 
 [[bench]]
 name = "write_path"

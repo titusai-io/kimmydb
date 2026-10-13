@@ -65,8 +65,9 @@ pub(crate) const STOP_EVERY: u64 = 256;
 pub(crate) const STOP_EVERY_BYTES: u64 = 8 * 1024 * 1024;
 
 // The production values are what the stop budget was measured against; a
-// change to one is a change to that measurement, and the integration test in
-// `tests/live_walk_stop.rs` runs with them.
+// change to one is a change to that measurement, and the integration tests
+// (`tests/live_walk_stop.rs`, and `live_walk_production.rs` in `kimmyd`'s tests,
+// which has the test hooks) run with them.
 const _: () = assert!(CHUNK_BYTES == 64 * 1024 * 1024);
 const _: () = assert!(CHUNK_ROWS == 50_000);
 const _: () = assert!(STOP_EVERY == 256);
