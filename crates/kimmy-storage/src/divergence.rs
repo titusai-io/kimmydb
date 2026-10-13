@@ -406,6 +406,19 @@ pub struct DivergenceTracker {
     /// Collections confirmed divergent by count against each peer: found
     /// mismatched on that pair's two most recent consecutive probes.
     count_confirmed: HashMap<NodeId, BTreeSet<CollectionId>>,
+    /// `(peer, collection)` pairs whose most recent *compared* cut digest
+    /// mismatched (B3): the count half's rhythm, for the same reason, since a
+    /// collection is compared only on the contacts it is quiet or named.
+    ///
+    /// **Kept apart from everything a repair is planned from.** 0.48.0 detects
+    /// only: a digest finding feeds [`Self::confirmed_count`] and
+    /// [`Self::digest_confirmed_count`], the gauges, and never
+    /// [`Self::confirmed_against`] or [`Self::retain_repaired`]'s input, which
+    /// would plan a replay of the collection's whole history from its creation
+    /// against a detector whose false-finding rate is what the round measures.
+    digest_pending: std::collections::HashSet<(NodeId, CollectionId)>,
+    /// Collections confirmed divergent by digest against each peer.
+    digest_confirmed: HashMap<NodeId, BTreeSet<CollectionId>>,
 }
 
 impl DivergenceTracker {
@@ -437,6 +450,11 @@ impl DivergenceTracker {
             confirmed.retain(|id| mine.contains(id));
         }
         self.count_confirmed.retain(|_, confirmed| !confirmed.is_empty());
+        self.digest_pending.retain(|(_, id)| mine.contains(id));
+        for confirmed in self.digest_confirmed.values_mut() {
+            confirmed.retain(|id| mine.contains(id));
+        }
+        self.digest_confirmed.retain(|_, confirmed| !confirmed.is_empty());
 
         self.cursor = next_probe(mine, self.cursor);
         self.cursor
@@ -490,10 +508,50 @@ impl DivergenceTracker {
         }
     }
 
+    /// Fold in one collection's digest comparison against `peer`, and say
+    /// whether this one **newly confirmed** a finding (two consecutive compared
+    /// mismatches of that pair), for the one WARN a finding gets. A compared
+    /// match clears it. A collection not compared this contact leaves the
+    /// state where its last comparison left it, as silence about a peer is not
+    /// evidence it has reconciled.
+    pub fn observe_digest(&mut self, peer: NodeId, id: CollectionId, mismatched: bool) -> bool {
+        let key = (peer, id);
+        if mismatched {
+            let confirmed = self.digest_pending.contains(&key);
+            self.digest_pending.insert(key);
+            if confirmed {
+                return self.digest_confirmed.entry(peer).or_default().insert(id);
+            }
+        } else {
+            self.digest_pending.remove(&key);
+            if let Some(set) = self.digest_confirmed.get_mut(&peer) {
+                set.remove(&id);
+                if set.is_empty() {
+                    self.digest_confirmed.remove(&peer);
+                }
+            }
+        }
+        false
+    }
+
+    /// Whether `id` is confirmed divergent by the cut digest against `peer`.
+    pub fn is_digest_confirmed(&self, peer: NodeId, id: CollectionId) -> bool {
+        self.digest_confirmed.get(&peer).is_some_and(|set| set.contains(&id))
+    }
+
+    /// Distinct collections confirmed divergent by the cut digest against at
+    /// least one peer: what `kimmy_sync_digest_divergent_collections` reports,
+    /// so an operator can tell which half moved the gauge.
+    pub fn digest_confirmed_count(&self) -> usize {
+        self.digest_confirmed.values().flatten().collect::<BTreeSet<_>>().len()
+    }
+
     /// Collections confirmed divergent against `peer` by either half of
     /// the check, as of its last folded-in contact — what a repair against
     /// that peer is planned from (ADR-148). Empty for a peer with nothing
     /// confirmed, or never checked.
+    ///
+    /// **Not the digest's findings** (B3): see the field they live in.
     pub fn confirmed_against(&self, peer: NodeId) -> BTreeSet<CollectionId> {
         let mut out = self.confirmed.get(&peer).cloned().unwrap_or_default();
         if let Some(by_count) = self.count_confirmed.get(&peer) {
@@ -512,6 +570,7 @@ impl DivergenceTracker {
             .values()
             .flatten()
             .chain(self.count_confirmed.values().flatten())
+            .chain(self.digest_confirmed.values().flatten())
             .collect::<BTreeSet<_>>()
             .len()
     }
@@ -535,6 +594,54 @@ mod tests {
                 .unwrap();
         }
         (engine, dir)
+    }
+
+    #[test]
+    fn a_digest_finding_confirms_on_two_compared_mismatches_and_clears_on_a_match() {
+        let mut tracker = DivergenceTracker::new();
+        let (p, c) = (peer(1), CollectionId(7));
+        assert!(!tracker.observe_digest(p, c, true), "one mismatch is not a finding");
+        assert_eq!(tracker.digest_confirmed_count(), 0);
+        assert!(tracker.observe_digest(p, c, true), "the second confirms, once");
+        assert!(!tracker.observe_digest(p, c, true), "and is not newly confirmed again");
+        assert_eq!(tracker.digest_confirmed_count(), 1);
+        assert!(!tracker.observe_digest(p, c, false));
+        assert_eq!(tracker.digest_confirmed_count(), 0, "a compared match clears it");
+        assert!(!tracker.observe_digest(p, c, true), "and it must be confirmed afresh");
+    }
+
+    /// B3 design 2.7 (N5): a digest finding is on the gauges and never in what
+    /// a repair is planned from. The mutation row adds the digest set to
+    /// `confirmed_against`, and this test must fail.
+    #[test]
+    fn a_digest_finding_plans_nothing_and_the_gauge_reads_one() {
+        let mut tracker = DivergenceTracker::new();
+        let (p, c) = (peer(1), CollectionId(7));
+        tracker.observe_digest(p, c, true);
+        tracker.observe_digest(p, c, true);
+        assert!(tracker.confirmed_against(p).is_empty(), "a repair would be planned from this");
+        assert_eq!(tracker.confirmed_count(), 1, "the gauge");
+        assert_eq!(tracker.digest_confirmed_count(), 1, "the attribution gauge");
+        // The same collection also confirmed by count counts once on the
+        // gauge and is planned from by the count half alone.
+        tracker.observe(p, Findings { existence: BTreeSet::new(), count: Some((c, true)) });
+        tracker.observe(p, Findings { existence: BTreeSet::new(), count: Some((c, true)) });
+        assert_eq!(tracker.confirmed_count(), 1);
+        assert_eq!(tracker.confirmed_against(p), BTreeSet::from([c]));
+    }
+
+    #[test]
+    fn a_dropped_collection_is_swept_from_the_digest_state_too() {
+        let mut tracker = DivergenceTracker::new();
+        let (p, c) = (peer(1), CollectionId(7));
+        tracker.observe_digest(p, c, true);
+        tracker.observe_digest(p, c, true);
+        assert_eq!(tracker.digest_confirmed_count(), 1);
+        tracker.advance_probe(&BTreeSet::from([CollectionId(8)]));
+        assert_eq!(tracker.digest_confirmed_count(), 0);
+        assert_eq!(tracker.confirmed_count(), 0);
+        // And a recreated one starts unpended.
+        assert!(!tracker.observe_digest(p, c, true), "the stale pending mismatch is gone");
     }
 
     #[test]

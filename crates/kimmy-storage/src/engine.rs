@@ -125,6 +125,16 @@ pub struct Engine {
     /// holds only as a snapshot's state (ADR-224), since start. Counted by the
     /// listener when it answers, not by the check, which push and replay also ask.
     state_held_refusals: std::sync::atomic::AtomicU64,
+    /// A digest probe is being answered: one at a time (B3 design 2.6).
+    pub(crate) digest_probe_busy: std::sync::atomic::AtomicBool,
+    /// A digest self-check is running: one at a time (B3 design 2.7).
+    pub(crate) digest_check_busy: std::sync::atomic::AtomicBool,
+    /// Kept digest rows a self-check found disagreeing with their records.
+    pub(crate) digest_drift: std::sync::atomic::AtomicU64,
+    /// Fail the digest plan or comparison that is this many calls away (1 is the
+    /// next) with a storage error, for the test that a digest-only fault must
+    /// not fail the contact (B3).
+    pub(crate) digest_fail_in: std::sync::atomic::AtomicU32,
     /// Durable write transactions committed, since start.
     ///
     /// redb has a single writer and every commit is an fsync, so the number of
@@ -1091,6 +1101,34 @@ pub(crate) mod definition_hooks {
     }
 }
 
+/// What an open is asked beyond a path: a builder, so that the opens that need
+/// nothing extra (a hundred test call sites among them) are untouched.
+#[derive(Clone, Debug, Default)]
+pub struct OpenOptions {
+    cache_bytes: Option<usize>,
+    force_rebuild: Option<&'static str>,
+}
+
+impl OpenOptions {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// A bound on redb's page cache, as [`Engine::open_with_cache`] takes.
+    pub fn cache_bytes(mut self, bytes: usize) -> Self {
+        self.cache_bytes = Some(bytes);
+        self
+    }
+
+    /// Rebuild the live counts and the digests whatever their marks say,
+    /// because the start cannot show the previous run left them current. The
+    /// reason is logged with the rebuild.
+    pub fn force_rebuild(mut self, why: &'static str) -> Self {
+        self.force_rebuild = Some(why);
+        self
+    }
+}
+
 impl Engine {
     /// Open or create the database at `path`.
     ///
@@ -1126,11 +1164,30 @@ impl Engine {
         Self::open_cleared(path, cache_bytes, cleared)
     }
 
+    /// Open as [`Self::open_with_cache`] does, with what else the caller asks
+    /// of this open (B3 design 2.1).
+    pub fn open_with(path: &Path, options: &OpenOptions) -> Result<Self> {
+        let cleared =
+            crate::format::check_before_open_with(path, &crate::format::BuildVersions::ours())?;
+        Self::open_cleared_forced(path, options.cache_bytes, cleared, options.force_rebuild)
+    }
+
     /// The read-write open, which only a [`crate::format::Cleared`] reaches.
     pub(crate) fn open_cleared(
         path: &Path,
         cache_bytes: Option<usize>,
         cleared: crate::format::Cleared,
+    ) -> Result<Self> {
+        Self::open_cleared_forced(path, cache_bytes, cleared, None)
+    }
+
+    /// [`Self::open_cleared`], with the live counts and the digests rebuilt
+    /// whatever their marks say if `force_rebuild` names a reason.
+    pub(crate) fn open_cleared_forced(
+        path: &Path,
+        cache_bytes: Option<usize>,
+        cleared: crate::format::Cleared,
+        force_rebuild: Option<&'static str>,
     ) -> Result<Self> {
         // Through a backend that meters what it is asked for, so a hold can
         // say how much of it was the disk (ADR-176). Opened exactly as
@@ -1297,6 +1354,14 @@ impl Engine {
             let _ = txn.open_table(tables::OPLOG_HELD)?;
             let _ = txn.open_table(tables::LIVE_COUNTS)?;
             let _ = txn.open_table(tables::LIVE_COUNTS_THROUGH)?;
+            let _ = txn.open_table(tables::LIVE_DIGESTS)?;
+            let _ = txn.open_table(tables::LIVE_DIGESTS_THROUGH)?;
+            // The first write of a start that decided the rebuild is forced:
+            // from here the store says "rebuild required" whatever any exit
+            // marker says (B3 design 2.1, layer 2).
+            if force_rebuild.is_some() {
+                crate::live_walk::force_marks_deleted(&txn)?;
+            }
             // Created with the others, so reading the record never meets a
             // missing table (`crate::verified`).
             let _ = txn.open_table(tables::VECTOR_VERIFIED)?;
@@ -1341,29 +1406,9 @@ impl Engine {
         }
         // After the arrival index, whose end the counts' mark is compared
         // against: a repaired index appends positions, and the counts are
-        // rebuilt with it (ADR-174).
-        {
-            let started = std::time::Instant::now();
-            crate::open_progress::set_open_phase(crate::open_progress::OpenPhase::Counting);
-            let txn = db.begin_write()?;
-            match crate::live_count::rebuild_if_stale(&txn)? {
-                Some(rebuilt) => {
-                    txn.commit()?;
-                    // Before the node serves anything: this function has not
-                    // returned. On a large store with a cold page cache the
-                    // walk runs at the disk's speed.
-                    info!(
-                        collections = rebuilt.collections,
-                        records = rebuilt.records,
-                        elapsed_ms = started.elapsed().as_millis() as u64,
-                        previous_mark = ?rebuilt.previous_mark,
-                        arrival = rebuilt.arrival,
-                        "rebuilt the live document counts before serving"
-                    );
-                }
-                None => txn.abort()?,
-            }
-        }
+        // rebuilt with it (ADR-174). One walk rebuilds the counts and the
+        // digests, in chunks that commit and honour a stop (B3).
+        crate::live_walk::run(&db, force_rebuild)?;
 
         // Nothing but a cfg set by hand stands between the benchmark control
         // and a person, which is not enough. Such a build keeps no live
@@ -1409,6 +1454,10 @@ impl Engine {
             undecidable_writes: std::sync::atomic::AtomicU64::new(0),
             ddl_relogged: std::sync::atomic::AtomicU64::new(0),
             state_held_refusals: std::sync::atomic::AtomicU64::new(0),
+            digest_probe_busy: std::sync::atomic::AtomicBool::new(false),
+            digest_check_busy: std::sync::atomic::AtomicBool::new(false),
+            digest_drift: std::sync::atomic::AtomicU64::new(0),
+            digest_fail_in: std::sync::atomic::AtomicU32::new(0),
             commits: std::sync::atomic::AtomicU64::new(0),
             multi_chunk_docs: std::sync::atomic::AtomicUsize::new(
                 crate::modify::DEFAULT_MULTI_CHUNK_DOCS,
@@ -1994,6 +2043,13 @@ impl Engine {
     /// (ADR-224). A refusal for retention is not counted here.
     pub fn state_held_refusals(&self) -> u64 {
         self.state_held_refusals.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Where this store lives, for a test that closes the engine and opens it
+    /// again.
+    #[cfg(test)]
+    pub(crate) fn db_path_for_test(&self) -> std::path::PathBuf {
+        self.path.clone()
     }
 
     /// Count one refusal [`Self::state_held_refusals`] counts: the listener's, when
@@ -2648,6 +2704,14 @@ impl Engine {
     /// to survive.
     pub fn collection_dropped_at(&self, id: CollectionId) -> Result<Option<Stamp>> {
         let txn = self.db.begin_read()?;
+        Self::collection_dropped_at_in(&txn, id)
+    }
+
+    /// [`Self::collection_dropped_at`] in a read transaction the caller holds.
+    pub(crate) fn collection_dropped_at_in(
+        txn: &redb::ReadTransaction,
+        id: CollectionId,
+    ) -> Result<Option<Stamp>> {
         let dropped = txn.open_table(tables::COLLECTIONS_DROPPED)?;
         match dropped.get(id.0)? {
             Some(raw) => Ok(Some(codec::decode_oplog_key(raw.value())?)),
@@ -2847,6 +2911,11 @@ impl Engine {
     /// snapshot taken by a build before 0.46.0, which did not record it.
     pub fn state_held(&self) -> Result<kimmy_core::VersionVector> {
         let txn = self.db.begin_read()?;
+        Self::state_held_in(&txn)
+    }
+
+    /// [`Self::state_held`] in a read transaction the caller holds.
+    pub(crate) fn state_held_in(txn: &redb::ReadTransaction) -> Result<kimmy_core::VersionVector> {
         let meta = txn.open_table(tables::META)?;
         let mut out = kimmy_core::VersionVector::new();
         for row in meta.range(tables::META_STATE_HELD_PREFIX..tables::META_STATE_HELD_END)? {
@@ -4300,6 +4369,10 @@ impl Engine {
             let meta =
                 CollectionMeta::new(id, db, name, origin.unwrap_or(stamp.hlc), incarnation_floor);
             collections.insert((db, name), serde_json::to_vec(&meta)?.as_slice())?;
+            // A name dropped and created again derives the same id: the new
+            // incarnation starts with no digest row, so the old one's highest
+            // stamps do not make it look busy (B3 design 2.1).
+            crate::live_digest::reset(txn, id)?;
             (meta, stamp)
         };
 
@@ -4366,6 +4439,11 @@ impl Engine {
     /// collections are empty or full.
     pub fn all_collections(&self) -> Result<Vec<CollectionMeta>> {
         let txn = self.db.begin_read()?;
+        Self::all_collections_in(&txn)
+    }
+
+    /// [`Self::all_collections`] in a read transaction the caller holds.
+    pub(crate) fn all_collections_in(txn: &redb::ReadTransaction) -> Result<Vec<CollectionMeta>> {
         let collections = txn.open_table(tables::COLLECTIONS)?;
         let mut out = Vec::new();
         for entry in collections.iter()? {
@@ -4381,7 +4459,16 @@ impl Engine {
     /// [`Self::live_collections`], differ by this one argument and nothing
     /// else.
     pub(crate) fn collections(&self, paired_shadows: PairedShadows) -> Result<Vec<CollectionMeta>> {
-        let mut all = self.all_collections()?;
+        let txn = self.db.begin_read()?;
+        Self::collections_in(&txn, paired_shadows)
+    }
+
+    /// [`Self::collections`] in a read transaction the caller holds.
+    pub(crate) fn collections_in(
+        txn: &redb::ReadTransaction,
+        paired_shadows: PairedShadows,
+    ) -> Result<Vec<CollectionMeta>> {
+        let mut all = Self::all_collections_in(txn)?;
         if paired_shadows == PairedShadows::Hidden {
             // The parent is looked for by name within the same database, which
             // is where the shadow's own name is derived from.
@@ -4813,6 +4900,7 @@ impl Engine {
         let txn = txn?;
         #[cfg(any(test, feature = "test-hooks"))]
         self.purges.holding_gate.pass()?;
+        let mut row_to_forget = false;
         let removed = {
             // A collection standing under this id means the name was created
             // again since the drop — the id is derived from the name, so a
@@ -4866,12 +4954,19 @@ impl Engine {
                     }
                     removed += keys.len();
                 }
+                // The ranges are exhausted: the digest row of a collection
+                // that is gone goes with this commit (a row of zeros and the
+                // highest stamps of a life that has ended).
+                if removed < DROP_PURGE_CHUNK {
+                    txn.live_counts().lock().forget_digest(id.0);
+                    row_to_forget = txn.open_table(tables::LIVE_DIGESTS)?.get(id.0)?.is_some();
+                }
                 removed
             }
         };
         // Nothing removed, nothing to commit: the collection came back, or a
         // concurrent purge of the same id got there first.
-        if removed == 0 {
+        if removed == 0 && !row_to_forget {
             txn.abort()?;
         } else {
             txn.commit()?;
@@ -5812,10 +5907,11 @@ mod tests {
         // Where a commit happens before or outside an open `Engine`, and so
         // cannot be counted by one. Each is a whole-file exemption because each
         // file's entire job is one of these.
-        const NO_ENGINE_YET: [&str; 3] = [
-            "migrate.rs", // runs on the raw database during `Engine::open`
-            "backup.rs",  // restores into a fresh file that no engine has opened
-            "engine.rs",  // `Engine::open` itself, plus the chokepoint
+        const NO_ENGINE_YET: [&str; 4] = [
+            "migrate.rs",   // runs on the raw database during `Engine::open`
+            "live_walk.rs", // the open's rebuild of the counts and digests, in chunks
+            "backup.rs",    // restores into a fresh file that no engine has opened
+            "engine.rs",    // `Engine::open` itself, plus the chokepoint
         ];
 
         let src = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");

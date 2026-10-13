@@ -803,8 +803,23 @@ async fn start_and_serve(
             }
         }
     }
-    let engine = match Engine::open_with_cache(&path, Some(config.storage.cache_bytes as usize)) {
+    // The live counts and the digests are rebuilt, whatever their marks say,
+    // unless the previous run is shown to have kept them current (B3 design
+    // 2.1): the marker cannot be trusted alone, so this only asks the open to
+    // delete the marks as its very first write, and the store carries the
+    // decision from there.
+    let mut options =
+        kimmy_storage::OpenOptions::new().cache_bytes(config.storage.cache_bytes as usize);
+    if lifecycle::digest_rebuild_forced(&previous) {
+        options =
+            options.force_rebuild("the previous run cannot be shown to have kept the digests");
+    }
+    let engine = match Engine::open_with(&path, &options) {
         Ok(engine) => {
+            // The open returns only after a forced rebuild has run to its end
+            // (a stop ends it with `Stopping`): from here an exit of this run
+            // no longer passes the decision to force on.
+            lifecycle::rebuilt(&config.storage.data_dir);
             opened.store(true, std::sync::atomic::Ordering::SeqCst);
             let engine = Arc::new(engine);
             // Kept for `run` from the moment the store is open, so that whatever
@@ -3368,6 +3383,22 @@ async fn shutdown_signal() {
 
 #[cfg(test)]
 mod tests {
+    /// The open that returns says the rebuild completed, so an exit of this
+    /// run before `settle` stops passing the decision to force on (the marker
+    /// an exit writes is a function of whether the rebuild completed, B3 review
+    /// A F1). A source check: a real start cannot be stopped between the open
+    /// and `settle`, where the difference shows.
+    #[test]
+    fn the_open_that_returns_says_the_rebuild_completed() {
+        let source = include_str!("node.rs");
+        let open = source.find("Engine::open_with(&path, &options)").expect("the open");
+        let arm = &source[open..open + 400];
+        assert!(arm.contains("Ok(engine) => {"), "{arm}");
+        assert!(
+            arm.contains("lifecycle::rebuilt(&config.storage.data_dir);"),
+            "the open's Ok arm must call lifecycle::rebuilt: {arm}"
+        );
+    }
 
     /// **The stop freezes the yield evaluator first** (ADR-213, B9): at the stop's
     /// first signal, before `shutdown` is announced to the supervised tasks. A task

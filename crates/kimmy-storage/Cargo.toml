@@ -38,6 +38,9 @@ parking_lot.workspace = true
 arc-swap.workspace = true
 libc.workspace = true
 tokio = { workspace = true, features = ["sync", "rt", "time", "macros"] }
+# The cut digest's term, XXH3-128 (B3 half 1); the `redb_damage` example and the
+# tests also recompute a damaged commit slot's checksum with it.
+xxhash-rust = { version = "0.8", default-features = false, features = ["xxh3"] }
 
 [dev-dependencies]
 criterion.workspace = true
@@ -47,9 +50,6 @@ kimmy-query.workspace = true
 proptest.workspace = true
 # Dev-only: a refused store is proved unchanged by its digest.
 sha2 = "0.11"
-# Dev-only: the `redb_damage` example and the tests recompute a damaged commit
-# slot's checksum, redb's XXH3-128, which redb does not export.
-xxhash-rust = { version = "0.8", default-features = false, features = ["xxh3"] }
 tempfile.workspace = true
 tokio = { workspace = true, features = ["full", "test-util"] }
 # Dev-only: a test reads what `Engine::open` logs, since a line an operator

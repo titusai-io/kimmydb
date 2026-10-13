@@ -61,6 +61,10 @@ const STOP_AWARE_WALKS: &[&str] = &[
     "index::has_entries_at",
     "index::holders_of",
     "index::scan_table",
+    // The digest probe's read of the oplog above a cut, and the self-check's
+    // walk of one collection's headers (B3).
+    "digest_probe::Engine::scan_uncovered",
+    "digest_probe::Engine::walk_headers",
     // A snapshot page served to a peer, which passes over what a drop left.
     "snapshot::Engine::snapshot_documents",
     // The marks a pull names to its peer.
@@ -104,7 +108,7 @@ const BOUNDED_READS: &[(&str, &str)] = &[
         "the index-drop registry: one row per index dropped within tombstone retention, collected on the same window as the oplog",
     ),
     (
-        "engine::Engine::state_held",
+        "engine::Engine::state_held_in",
         "the metadata keys of one prefix: one row per origin a snapshot raised the servable vector over, a few in a cluster, read per pull served",
     ),
     (
@@ -124,7 +128,7 @@ const BOUNDED_READS: &[(&str, &str)] = &[
         "inside a write scope, which holds the single writer: close_writes bounds it (ADR-192)",
     ),
     (
-        "engine::Engine::all_collections",
+        "engine::Engine::all_collections_in",
         "the collection registry: one row per collection, however many documents",
     ),
     (
@@ -227,7 +231,12 @@ const BOUNDED_READS: &[(&str, &str)] = &[
          build's own for a superseded definition's clear, which stops with the build",
     ),
     ("index::partial_filters_holding_an_array", "at open, a migration's check of the registry"),
-    ("live_count::rebuild_if_stale", "at open, before the node serves or has a stop to answer"),
+    (
+        "live_walk::run",
+        "at open, before the node serves: chunked, each chunk committed, and it looks for the \
+         stop itself every 256 rows and at each chunk boundary, ending at the cursor it \
+         committed (B3 design 5)",
+    ),
     ("migrate::derive_collection_ids", "a migration, at open, before the node serves"),
     ("migrate::derive_index_ids", "a migration, at open, before the node serves"),
     ("migrate::move_documents", "a migration, at open, before the node serves"),

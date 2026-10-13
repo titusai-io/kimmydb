@@ -26537,3 +26537,165 @@ serving it, accepts a write into it, and the cluster does not stall; on its rest
 before serving and every member lists the database gone); a member left on 0.46.0 past the retention (the
 collection and the database come back on every member, as documented); and a backup taken on each build
 restored with the other, `check-store` clean, opened by both.
+
+---
+
+## ADR-230 — The cut digest: a kept XOR per collection, compared at the cut two members have both processed, finds the lost update the count cannot see
+
+> **Closes the blind spot [ADR-133](#adr-133--a-periodic-cross-member-check-makes-a-divergence-no-counter-can-express-visible-without-repairing-it) states**
+> ("a document present in equal numbers on every member but with different content"), as a **detector only**.
+> **Read before upgrading, not Breaking** in the sense of `compatibility.md`: the divergence gauge can read
+> above 0 where it read 0, and pages an existing alert. The design is the wiki page *KimmyDB 0.48.0 Design:
+> Divergence Detection, the Cut Digest and the Definition Digest Brought Up to Main (Item B3)*, which went
+> through two independent reviews, a delta review of its third version and a check of its fourth; the
+> definition digest (half 2) follows in 0.49.0.
+
+**Decision.**
+
+1. **A row per collection, kept in the transaction of the write** (`LIVE_DIGESTS`; its own mark and the open
+   walk's cursor in `LIVE_DIGESTS_THROUGH`; both derived, node-local, absent from a backup). The row is the XOR
+   of `xxh3_128(key || stamp)` over the collection's *live* records (a tombstone contributes nothing, so two
+   members that collected one at different times still agree); `maxw`, the highest record stamp per origin,
+   live or tombstone, which never falls; and `bare_max`, the highest stamp per origin of a tombstone no oplog
+   entry stands behind (ADR-228). It moves through the same two functions as the live count (ADR-174),
+   `put_record` and `remove_record`, gathered in `Pending` and written once per transaction by `flush`; the
+   source guard now catches a write to `DOCS` through any variable name. The mark is the counts' bytes behind a
+   **digest format number**, written and carried with it by `carry_mark` at both callers; a creation resets the
+   row, because a name dropped and created again derives the same id.
+2. **Two members are compared at a cut**: `V = min(W_A, W_B)`, the highest stamp per origin both have
+   witnessed. Anything stamped at or below `V` was processed by both before the exchange began; anything above
+   is *uncovered* and left out of both digests. **A comparison is valid only if both sides excluded the same
+   keys.** A collection with nothing stamped above the cut is *quiet*, and its digest is its row, one read; a
+   busy one costs one scan of the oplog above the cut, started at the lowest cut among **the origins that can
+   hold an uncovered record of a busy collection** (an origin that wrote once long ago and is in every vector
+   at its last stamp would otherwise drag every scan back to the oldest row), bounded to **200 ms and 8 MiB**
+   per request, one probe answered at a time per member (`busy`, distinct from not answering).
+3. **Three steps, and nothing held across the network.** The requester plans (`digest_plan`: the cut and its
+   uncovered keys, which it sends), the peer answers (`digest_answer`: its own uncovered keys, and its digest
+   with the union of both excluded; for a collection quiet on the peer where the requester has uncovered keys,
+   it subtracts each key's term by point reads, over a *set*, since a key subtracted twice would be added back),
+   and the requester compares (`digest_compare`: every deferral predicate again, the uncovered set again with
+   the same cut, and a write that landed in between defers the collection as `moved`). The answer states how
+   many of the requester's keys it processed, and the requester refuses a digest taken over another set.
+   Every non-comparison has a reason, counted per collection: `bare_tombstone`, `horizon` (the oplog above the
+   cut cannot be read in full here: retention removed it or a snapshot gave the state without the entries),
+   `database_tombstone`, `moved`, `uncovered_cap`, `budget` (the scan and the point reads share one budget),
+   `busy`, `incarnation`, `self_check_busy`, `error` (this side failed to plan or compare; the contact and its
+   other halves go on without the digest), `malformed` (an entry of the answer did not decode) and `corrected`
+   (the mismatch was this side's own row, corrected). **`incarnation` means a side holds a drop tombstone for
+   the collection's id**, the requester's own read in its transaction and the peer's reported in its entry as
+   the other deferrals are: a name dropped and created again derives the same id, and whether the other side
+   holds the same life is not something a digest can tell. It does *not* compare the two members' `created`:
+   a collection created on two members at once keeps a different `created` on each for good (a replicated
+   create of an existing collection is `Exists`), and the system collections of every cluster are such, so
+   comparing them deferred two thirds of every probe. The creation of the name again is refused while the
+   burial's purge is owed (ADR-189), so the purge's removals never meet the new row, which a creation resets.
+4. **On the wire**, optional fields on the two existing messages: `AskDivergence.digest` and
+   `Divergence.digests` / `digest_busy`, read leniently (a field of another shape costs the field, and one bad
+   entry costs the entry), absent from the frame when there is nothing to say, so an answer to an older
+   requester is byte for byte what it was. A peer that has not yet answered a digest is asked with the cut
+   alone, so it is not made to wait on a scan it will ignore; one that never answers is `unanswered` and never
+   compared. The digest is asked whether or not the count probe is gated.
+5. **Detect only.** A digest finding is confirmed on two *compared* mismatches of the same `(peer,
+   collection)` in `DivergenceTracker`, in a set **kept apart from what a repair is planned from**:
+   `confirmed_against` and `retain_repaired` never see it (read as the count half's would be, it plans a replay
+   of the collection's whole history from its creation). It moves `kimmy_sync_divergent_collections` and
+   `kimmy_sync_digest_divergent_collections`, logs one `WARN` per finding (again at most every ten minutes
+   while it stays), and plans nothing. **Before a mismatch is reported the requester verifies its own row**
+   against a walk of that one collection, in one read transaction with the row, under a budget, one at a
+   time, correcting a drifted row by an XOR delta in a short write transaction (the writer is never held for
+   the walk): `kimmy_sync_digest_drift_total`, an `ERROR`, and nothing reported for that comparison.
+6. **The open walks `DOCS` once for both tables, in chunks** (`live_walk`): each chunk commits when it reaches
+   64 MiB or 50,000 rows, looks for the stop every 256 rows inside the chunk, and leaves a cursor. **The first
+   commit of a walk deletes both marks**, with its first rewritten rows, so no commit ever holds a rewritten
+   row beside a mark. A start that decided the rebuild is forced deletes them as the open's very first write.
+   A cooperative stop resumes; a crash or kill restarts from zero (ruled). The cursor resumes only if both
+   marks are absent, it records this build, schema and digest format, and it was left by a clean stop. The
+   old `rebuild_if_stale` ignored a stop and ran in one transaction, so a SIGTERM during a long `counting`
+   phase became a SIGKILL after the stop budget; that standing defect is fixed here.
+7. **Whether the start forces the rebuild** is read from the previous run's marker and made durable in the
+   store, and **the decision persists until a fused rebuild completes**. The rebuild is forced unless the
+   previous run is shown to have left the rows current: the marker's own build is older than
+   `DIGEST_KEEPING_FROM` (a numeric `major.minor.patch` compare; `0.9.0` is older than `0.48.0`), or the marker
+   carries `unproven_since_served`, or there is no marker to read (a killed run, an unreadable marker). A run
+   that decided to force writes `unproven_since_served` (`unclean`, `unreadable` or `older build <version>`)
+   into its exit marker **unless its fused rebuild completed**, and a run that settled writes none: the marker
+   an exit writes is a function of what the start inherited, whether its rebuild completed, and whether it
+   served; the decision is a function of the marker. `Earlier::of` is unchanged, so the announce line reports
+   what it always did (ADR-190's "repeated refusals must not bury the last run that ran"), and the field is
+   a top-level key of the marker that a 0.47.2 reader ignores (an older writer drops it, and names its own
+   older version, which forces the rebuild). A start that decided to force and was stopped before its walk
+   began, or part way through it, forces again; one stopped after the walk completed and before `settle` does
+   not, since the completing commit wrote both marks. A model test runs every sequence of up to four runs from
+   the ten ways a run of 0.47.2 or 0.48 can end through the real marker code and checks that the next start
+   forces exactly when an older build ran or a run was killed since the last completed fused rebuild. The
+   store's side of the decision is item 6.
+
+**Why.** The count half cannot see a document updated on one member and never on the other. Walking a
+collection to compare by content costs every page on every contact, as the count's walk once did (ADR-174), so
+the comparison is kept the way the count is: a row moved in the write's own transaction, a per-collection XOR
+that composes. The cut is what makes it exact under writes: nothing is compared that either member has not
+processed.
+
+**Alternatives.** A tree over stamp space (Merkle) was rejected: a write moves a path of nodes, not one row.
+Holding a read transaction across the exchange was rejected: it has no per-row stop check and lives to the
+contact's deadline against a stalled peer; recompute-and-defer holds nothing and its price is a counted
+deferral. A cheaper proof that a crash left the rows current was ruled out: an absent marker proves nothing,
+so a crash or kill forces the walk. Localization of a mismatch to a key range (+~300 lines) and a repair wait
+for data from round 0510.
+
+**Cost.** Two `xxh3_128` per record write and one row per transaction per collection written. A busy
+collection costs a scan of the oplog tail; the duty cycle is bounded by the budget and the one-at-a-time rule
+(four members, the placeholders: up to nine scans of 200 ms per 5 s interval, 36% of one blocking thread,
+and only when every collection is busy). The first start of 0.48.0 and the start after a crash or kill of
+0.48.x walk `DOCS` once, as the live counts' walk always did, now in chunks. A forced walk that is stopped before it completes is resumed by the next start from its cursor, and one that was killed restarts from zero, so on a cold store a stop-and-start pays part of the walk twice, and a kill pays all of it again; a walk that completed and was stopped before `settle` is not repeated. Cold, on a spinning disk, the tester
+measured about 10 MB/s over a 688 MB `OPLOG`, 26–28,000 rows/s; the heaviest 50,000-row chunk was 128.8 MiB
+against 17 MiB on average, so the chunk is cut on bytes and the stop is looked for every 256 rows (about 10 ms
+cold), which is what keeps a stop inside the stop budget, not the chunk size. Cold, the 200 ms of a tail scan
+binds first (about 2 MB); a recent tail is normally in the page cache, where 8 MiB takes milliseconds.
+
+**Tests.** `kimmy-storage/src/live_digest.rs` (the row, the term, the delta), `live_count.rs` (the digest
+equals a walk of the headers after every kind of write the count's tests make, bare tombstones, creation reset,
+marks, the carry through a rewind and through retention, an unreadable row), `live_walk.rs` (chunks, a
+cooperative stop resumes, a crash restarts, a kill at every chunk commit, a cursor of another build, schema or
+format, a walk started by one stale mark, a stopped walk then an older build that completed its open, a forced
+start), `digest_probe.rs` (converged members, a lost update, a write the peer has not seen, a key in both
+sets, a write between the plan and the comparison, a bare tombstone on either side, the horizon, a frozen
+origin, one probe at a time, a collection created on both members at once, a drop and a creation of the name
+again deferred by whichever side holds the tombstone, a creation over an owed purge, the self-check and its delta under a concurrent commit),
+`divergence.rs` (a digest finding plans nothing and the gauge reads one), `protocol.rs` (the fields cross the
+version line both ways; a field or an entry of another shape costs itself, not the frame), `transport.rs` (an
+unanswered and a busy peer), `kimmy-cluster/tests/replication.rs` (two live nodes: converged, a lost update the
+count cannot see, a write the peer has not seen), `kimmyd/src/lifecycle.rs` (every laundering shape of the
+previous run's marker, an older build's non-serving run, a 0.47.2 reader of the marker) and
+`kimmyd/tests/lifecycle.rs` (a real process: the rebuild a clean stop and a kill each produce). The stop
+policing (`walks_stop.rs`, `walk.rs`) lists the scan and the self-check's walk as stop-aware at every row, and
+the open walk as a bounded read that looks for the stop itself.
+
+**Mutation run: 36 rows, all killed.** Each row is one textual change to the committed tree, run in a second
+worktree under a timeout with the test that kills it named: the term ignoring the node; a replaced record's
+old term kept; `maxw` able to fall; a bare tombstone not raising `bare_max`; the digest mark not written, not
+carried, or not behind the format number; a creation not resetting the row; the first chunk keeping either
+mark; the completing commit keeping the cursor; a resume without the clean-stop flag, with a mark present, or
+over another build's cursor; a forced start not deleting the marks first, or deleting a usable cursor; the walk
+ignoring a stop or the row cap; the comparison not re-evaluating, not checking the applied count, with a quiet
+collection defined strictly below the cut, without the horizon, answering more than one probe at once, with
+the scan's start taken over every origin, with the excluded keys a list and not a set; the self-check setting
+the row and not applying a delta; the digest set planning a repair, confirming on one mismatch, or left out of
+the gauge; a field of another shape failing the frame; the plan never made, or a peer never known to answer
+digests; versions compared as text; the unproven stretch not carried, or not read by the decision; the node
+never asking for the forced rebuild. The first run killed 30: six survived or did not apply, five tests were
+too weak and one anchor had moved, and each now has a test of its own (a walk started by one stale mark, a
+cursor beside a mark with the start not forced, a forced start that resumes, a frozen origin that wrote to the
+busy collection).
+
+**Measured.** `benches/write_path.rs`, release, this host (M-series Mac, redb with fsync), against `origin/main`
+back to back: a 1,000-document batch 19.33 ms → 19.75 ms (+2.2%, intervals overlapping); a single insert 4.00
+ms → 4.00 ms (fsync-bound); `bulk_new` 9.54 → 9.86 ms. The CI release test that an open finding the version
+vector verified reads a fixed amount passes. Cold figures are the tester's (above); the real `DOCS` figure of
+the fused walk is the `rebuilt the live document counts` line of the release-build rollback gate, recorded
+there and not graded. **Rollback gate** (release builds, three nodes): 0.48.0 to 0.47.2 to 0.48.0 with a
+rolled-back-and-forward member (the forced rebuild logs rows, bytes, chunks, elapsed and why; no finding); a
+stopped walk followed by a 0.47.2 start, exact counts at the end; **stop a forced walk mid-chunk, start 0.47.2
+to ready, stop it, start 0.48: the walk restarts from zero, with the reason logged, and does not resume**;
+a backup restored across the builds; a mixed pair.

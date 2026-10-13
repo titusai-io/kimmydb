@@ -183,6 +183,7 @@ mod tests {
             cause: None,
             failed_start: false,
             previous: None,
+            unproven_since_served: None,
         }
     }
 

@@ -686,6 +686,17 @@ mod tests {
             }),
             // covers: docs::Engine::for_each_record_after
             ("for_each_doc", |e, c| e.for_each_doc(c, WalkScope::Background, |_, _| Ok(true))),
+            // covers: digest_probe::Engine::scan_uncovered
+            ("digest_plan", |e, _| {
+                // A peer that has witnessed nothing: every collection is busy
+                // at the empty cut, so the scan reads the oplog.
+                e.digest_plan(&Default::default(), None, crate::digest_probe::ScanBudget::default())
+                    .map(drop)
+            }),
+            // covers: digest_probe::Engine::walk_headers
+            ("verify_digest_row", |e, c| {
+                e.verify_digest_row(c.id, crate::digest_probe::ScanBudget::default()).map(drop)
+            }),
         ];
         let request: &[(&str, Walk)] = &[
             // covers: backup::Engine::backup_to

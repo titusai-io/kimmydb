@@ -1042,7 +1042,7 @@ where
                 };
                 write_frame(&mut stream, &Message::Snapshot(Box::new(page))).await?;
             }
-            Message::AskDivergence { probe } => {
+            Message::AskDivergence { probe, digest } => {
                 // Metadata only, whatever `probe` is — see
                 // `Engine::all_collection_ids`. One walk answers both halves
                 // of what this node holds: the ids, and the incarnation each
@@ -1060,12 +1060,34 @@ where
                         .map_err(|e| ProtocolError::Local(e.to_string()))?,
                     None => None,
                 };
+                // The cut digest (B3), if the requester asked for it: a
+                // failure of it must never fail the count half, so anything
+                // but a stop is a reason to answer without digests.
+                let (digests, digest_busy) = match digest {
+                    Some(ask) => match kimmy_storage::blocking(|| {
+                        engine.digest_answer(&ask, kimmy_storage::ScanBudget::default())
+                    }) {
+                        Ok(Some(reply)) => (Some(reply), false),
+                        Ok(None) => (None, true),
+                        Err(kimmy_storage::StorageError::Stopping(reason)) => {
+                            debug!(%reason, "stopped answering a peer's digest probe: this node is shutting down");
+                            return Ok(());
+                        }
+                        Err(e) => {
+                            warn!(error = %e, "could not answer a peer's digest probe; answering without it");
+                            (None, false)
+                        }
+                    },
+                    None => (None, false),
+                };
                 write_frame(
                     &mut stream,
                     &Message::Divergence {
                         collections: held.keys().copied().collect(),
                         probe_count,
                         incarnations: held.into_iter().collect(),
+                        digests,
+                        digest_busy,
                     },
                 )
                 .await?;
@@ -2156,14 +2178,22 @@ where
         stalls.snapshot_forgotten(their_node, None);
         stalls.horizon_resolved(their_node);
         let position = stalls.position(their_node, processed, &mine, &theirs, probe.as_ref());
+        let busy = probe.as_ref().map(|p| p.id);
         let gate = divergence_probe_for(probe, position);
-        let findings = ask_divergence(engine, stream, gate.probe).await?;
+        let context = their_witnessed.as_ref().map(|theirs_witnessed| DigestContext {
+            theirs_witnessed,
+            busy,
+            capable: stalls.digest_capable.contains(&their_node),
+        });
+        let (findings, digest) = ask_divergence(engine, stream, gate.probe, context).await?;
+        stalls.note_digest(their_node, digest.as_ref());
         return Ok(SyncOutcome {
             peer: Some(their_node),
             behind_ms: behind_beyond_horizon(engine, &theirs, &mine)?,
             divergent: Some(findings.existence),
             count_probe: findings.count,
             count_probe_deferred: gate.deferred,
+            digest,
             exhausted: true,
             ..SyncOutcome::default()
         });
@@ -2632,11 +2662,19 @@ where
     // which a continuous trickle of new writes can starve indefinitely.
     if window_exhausted {
         let position = stalls.position(their_node, processed, &mine, &theirs, probe.as_ref());
+        let busy = probe.as_ref().map(|p| p.id);
         let gate = divergence_probe_for(probe, position);
-        let findings = ask_divergence(engine, stream, gate.probe).await?;
+        let context = their_witnessed.as_ref().map(|theirs_witnessed| DigestContext {
+            theirs_witnessed,
+            busy,
+            capable: stalls.digest_capable.contains(&their_node),
+        });
+        let (findings, digest) = ask_divergence(engine, stream, gate.probe, context).await?;
+        stalls.note_digest(their_node, digest.as_ref());
         outcome.divergent = Some(findings.existence);
         outcome.count_probe = findings.count;
         outcome.count_probe_deferred = gate.deferred;
+        outcome.digest = digest;
     }
     // The other direction is a different question: how far the peer
     // trails this node, in history it can no longer be served. A peer
@@ -2881,6 +2919,10 @@ pub struct PeerStalls {
     /// before ADR-146 — so the gate is judged on their servable one, and
     /// the log says so once rather than every round.
     without_witnessed: HashSet<NodeId>,
+    /// Peers that have answered a digest request with digests (B3): only to
+    /// these does this node pay for its own scan before asking, so a peer that
+    /// predates the digest is not made to wait on one it will ignore.
+    digest_capable: HashSet<NodeId>,
     repairs: HashMap<NodeId, Repairs>,
     /// Snapshot pulls left to resume, one per peer (ADR-152): where the next
     /// page begins and what the completed snapshot grants, carried across
@@ -3162,6 +3204,25 @@ struct Stall {
 impl PeerStalls {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Remember that `peer` answers digests, once it has: only to such a peer
+    /// does this node pay for its own scan before asking (B3).
+    fn note_digest(&mut self, peer: NodeId, round: Option<&kimmy_storage::DigestRound>) {
+        use kimmy_storage::DigestAnswered::{Answered, Busy, Failed, Probed, Unanswered};
+        match round.map(|r| r.answered) {
+            Some(Answered | Busy | Probed) => {
+                self.digest_capable.insert(peer);
+            }
+            // A peer that answered before and sends none now has been rolled
+            // back: it is asked with the cut alone again, not made to wait on
+            // a scan it will ignore.
+            Some(Unanswered) => {
+                self.digest_capable.remove(&peer);
+            }
+            // This side's own failure says nothing of the peer.
+            Some(Failed) | None => {}
+        }
     }
 
     /// The timing of the window the last round applied, if one was applied
@@ -3919,7 +3980,8 @@ async fn ask_divergence<S>(
     engine: &Engine,
     stream: &mut S,
     probe: Option<DivergenceProbe>,
-) -> Result<kimmy_storage::DivergenceFindings, ProtocolError>
+    digest: Option<DigestContext<'_>>,
+) -> Result<(kimmy_storage::DivergenceFindings, Option<kimmy_storage::DigestRound>), ProtocolError>
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
@@ -3937,15 +3999,111 @@ where
     let mine_dropped =
         engine.collection_tombstones().map_err(|e| ProtocolError::Malformed(e.to_string()))?;
 
-    write_frame(stream, &Message::AskDivergence { probe: probe.as_ref().map(|p| p.id) }).await?;
-    let (peer_collections, probe_count, peer_incarnations) = match read_frame(stream).await? {
-        Message::Divergence { collections, probe_count, incarnations } => {
-            (collections, probe_count, incarnations)
+    // The cut digest's `T1` (B3 design 2.4), before the request goes out and
+    // with nothing held across the exchange. Planned in full only for a peer
+    // that has answered a digest before; to any other the cut alone is sent,
+    // so a peer that predates the digest is not made to wait on a scan it will
+    // ignore.
+    let budget = kimmy_storage::ScanBudget::default();
+    // A fault of the digest's own (a record the scan cannot decode, a row that
+    // cannot be read) costs the digest and never the contact: the existence and
+    // count findings of this round, and the pull already applied, must not be
+    // lost to it. Only a stop is fatal.
+    let mut failed = false;
+    let plan = match &digest {
+        Some(ctx) if ctx.capable => {
+            let planned = degrade_digest(
+                "plan",
+                kimmy_storage::blocking(|| {
+                    engine.digest_plan(ctx.theirs_witnessed, ctx.busy, budget)
+                }),
+            )?;
+            failed = planned.is_none();
+            planned
         }
-        Message::Fault(reason) => return Err(ProtocolError::Fault(reason)),
-        other => {
-            return Err(ProtocolError::Malformed(format!("expected Divergence, got {other:?}")));
+        _ => None,
+    };
+    let ask = match (&plan, &digest) {
+        _ if failed => None,
+        (Some(plan), _) => Some(plan.ask.clone()),
+        (None, Some(ctx)) => match degrade_digest("plan", engine.witnessed_vector())? {
+            Some(mine) => Some(kimmy_storage::DigestAsk {
+                cut: mine.meet(ctx.theirs_witnessed),
+                uncovered: Vec::new(),
+                busy: ctx.busy,
+            }),
+            None => {
+                failed = true;
+                None
+            }
+        },
+        (None, None) => None,
+    };
+
+    write_frame(
+        stream,
+        &Message::AskDivergence { probe: probe.as_ref().map(|p| p.id), digest: ask },
+    )
+    .await?;
+    let (peer_collections, probe_count, peer_incarnations, digests, digest_busy) =
+        match read_frame(stream).await? {
+            Message::Divergence {
+                collections,
+                probe_count,
+                incarnations,
+                digests,
+                digest_busy,
+            } => (collections, probe_count, incarnations, digests, digest_busy),
+            Message::Fault(reason) => return Err(ProtocolError::Fault(reason)),
+            other => {
+                return Err(ProtocolError::Malformed(format!(
+                    "expected Divergence, got {other:?}"
+                )));
+            }
+        };
+
+    // `T2`: every predicate again and the comparison, against the fresh state.
+    use kimmy_storage::{DigestAnswered, DigestRound};
+    let held = plan.as_ref().map_or(1, |p| p.collections().max(1));
+    let round = match digest {
+        None => None,
+        Some(_) if failed => {
+            let mut round = DigestRound::new(DigestAnswered::Failed);
+            round.held = 1;
+            Some(round)
         }
+        Some(_) => Some(match (digests, digest_busy) {
+            (Some(reply), _) => match plan {
+                Some(plan) => {
+                    match degrade_digest(
+                        "comparison",
+                        kimmy_storage::blocking(|| engine.digest_compare(&plan, &reply, budget)),
+                    )? {
+                        Some(verdicts) => DigestRound {
+                            answered: DigestAnswered::Answered,
+                            verdicts,
+                            plan_deferred: plan.deferred().collect(),
+                            held,
+                            malformed: reply.malformed as usize,
+                        },
+                        None => {
+                            let mut round = DigestRound::new(DigestAnswered::Failed);
+                            round.held = held;
+                            round
+                        }
+                    }
+                }
+                // Asked with the cut alone: nothing to compare yet, and the
+                // peer is known to answer from now on.
+                None => DigestRound::new(DigestAnswered::Probed),
+            },
+            (None, true) => {
+                let mut round = DigestRound::new(DigestAnswered::Busy);
+                round.held = held;
+                round
+            }
+            (None, false) => DigestRound::new(DigestAnswered::Unanswered),
+        }),
     };
 
     let mine = kimmy_storage::DivergenceLocalState {
@@ -3958,7 +4116,53 @@ where
         probe_count,
         incarnations: peer_incarnations.into_iter().collect(),
     };
-    Ok(kimmy_storage::compare_divergence(&mine, &peer))
+    Ok((kimmy_storage::compare_divergence(&mine, &peer), round))
+}
+
+/// A storage error of the digest's own: a stop is fatal to the contact, as
+/// anything is that must end it; anything else is logged (at most once a
+/// minute, since a persistent fault recurs every contact) and costs only the
+/// digest, which the caller counts as `deferred{reason="error"}`.
+fn degrade_digest<T>(
+    what: &str,
+    result: std::result::Result<T, kimmy_storage::StorageError>,
+) -> Result<Option<T>, ProtocolError> {
+    static LAST_WARNED_SECS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    match result {
+        Ok(value) => Ok(Some(value)),
+        Err(e @ kimmy_storage::StorageError::Stopping(_)) => {
+            Err(from_storage(e, ProtocolError::Malformed))
+        }
+        Err(e) => {
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0, |d| d.as_secs());
+            let last = LAST_WARNED_SECS.load(std::sync::atomic::Ordering::Relaxed);
+            if now.saturating_sub(last) >= 60
+                && LAST_WARNED_SECS
+                    .compare_exchange(
+                        last,
+                        now,
+                        std::sync::atomic::Ordering::Relaxed,
+                        std::sync::atomic::Ordering::Relaxed,
+                    )
+                    .is_ok()
+            {
+                warn!(error = %e, step = what, "the cut digest failed on this side; the contact goes on without it");
+            }
+            Ok(None)
+        }
+    }
+}
+
+/// What the digest probe of one contact needs beyond the count probe's (B3).
+struct DigestContext<'a> {
+    /// The peer's witnessed vector, which the cut is taken against.
+    theirs_witnessed: &'a VersionVector,
+    /// The busy collection this contact's rotation names.
+    busy: Option<CollectionId>,
+    /// Whether the peer has answered a digest before.
+    capable: bool,
 }
 
 /// What one round's snapshot pull came to (ADR-152).
@@ -5448,6 +5652,8 @@ mod tests {
                 collections: Vec::new(),
                 probe_count: Some(1),
                 incarnations: Vec::new(),
+                digests: None,
+                digest_busy: false,
             };
             write_frame(&mut stream, &divergence).await.unwrap();
         }
@@ -5831,6 +6037,8 @@ mod tests {
                 collections: Vec::new(),
                 probe_count: None,
                 incarnations: Vec::new(),
+                digests: None,
+                digest_busy: false,
             };
             write_frame(&mut stream, &answer).await.unwrap();
         }
@@ -6024,6 +6232,8 @@ mod tests {
                     collections: Vec::new(),
                     probe_count: None,
                     incarnations: Vec::new(),
+                    digests: None,
+                    digest_busy: false,
                 };
                 write_frame(&mut stream, &divergence).await.unwrap();
             }
@@ -6202,6 +6412,8 @@ mod tests {
                     collections: Vec::new(),
                     probe_count: None,
                     incarnations: Vec::new(),
+                    digests: None,
+                    digest_busy: false,
                 };
                 write_frame(&mut stream, &divergence).await.unwrap();
             }
@@ -6476,6 +6688,8 @@ mod tests {
                     collections: Vec::new(),
                     probe_count: None,
                     incarnations: Vec::new(),
+                    digests: None,
+                    digest_busy: false,
                 };
                 write_frame(&mut stream, &divergence).await.unwrap();
             }
@@ -6705,6 +6919,8 @@ mod tests {
                 ],
                 probe_count: None,
                 incarnations,
+                digests: None,
+                digest_busy: false,
             };
             write_frame(&mut stream, &divergence).await.unwrap();
             assert!(matches!(read_frame(&mut stream).await, Err(ProtocolError::Closed)));
@@ -7535,6 +7751,8 @@ mod tests {
             collections: Vec::new(),
             probe_count: None,
             incarnations: Vec::new(),
+            digests: None,
+            digest_busy: false,
         };
         let _ = write_frame(&mut stream, &answer).await;
     }
@@ -7797,6 +8015,8 @@ mod tests {
                     collections: Vec::new(),
                     probe_count: None,
                     incarnations: Vec::new(),
+                    digests: None,
+                    digest_busy: false,
                 };
                 let _ = write_frame(&mut peer_end, &answer).await;
             }
@@ -8073,6 +8293,72 @@ mod tests {
                 .expect("the listener ended the contact");
         assert!(served.is_ok(), "{served:?}");
         assert!(matches!(answer, Err(ProtocolError::Closed)), "{answer:?}");
+    }
+
+    /// A responder whose digest answer meets the node's stop ends the contact at
+    /// once and quietly: no error, no half answer, and not the warning-and-answer-
+    /// without-digests that any other fault of the digest gets. A stopping node
+    /// that went on to write a frame would hold the stop up for a peer's read.
+    #[tokio::test]
+    async fn a_digest_answer_that_meets_the_stop_ends_the_contact_quietly() {
+        const SECRET: &str = "a-digest-stop-secret";
+        const BINDING: &[u8] = b"a-digest-stop-binding";
+        let dir = tempfile::tempdir().unwrap();
+        let engine = Engine::open(&dir.path().join("kimmy.redb")).unwrap();
+        let orders = engine.create_collection("shop", "orders").unwrap();
+        engine.insert(&orders, bson::doc! { "_id": 1 }).unwrap();
+        let other_dir = tempfile::tempdir().unwrap();
+        let other = Engine::open(&other_dir.path().join("kimmy.redb")).unwrap();
+        // One key of the requester's, which the answer subtracts by a point read:
+        // the read looks for the stop.
+        let ask = kimmy_storage::DigestAsk {
+            cut: engine.witnessed_vector().unwrap(),
+            uncovered: vec![kimmy_storage::Uncovered {
+                collection: orders.id,
+                keys: vec![serde_bytes::ByteBuf::from(vec![1u8])],
+            }],
+            busy: None,
+        };
+        for stopping in [false, true] {
+            let (mut ours, theirs) = tokio::io::duplex(MAX_FRAME);
+            let serving =
+                serve_peer(&engine, theirs, SECRET, BINDING, None, ServeBudgets::serving(), None);
+            let (other, ask) = (&other, &ask);
+            // Moved in, so the stream closes when the answer is read and a
+            // responder that did answer sees the end of the contact.
+            let asking = async move {
+                open_handshake(other, &mut ours, SECRET, BINDING).await.unwrap();
+                write_frame(
+                    &mut ours,
+                    &Message::AskDivergence { probe: None, digest: Some(ask.clone()) },
+                )
+                .await
+                .unwrap();
+                read_frame(&mut ours).await
+            };
+            if stopping {
+                engine.stop_walks();
+            }
+            let (served, answer) = tokio::time::timeout(Duration::from_secs(10), async {
+                tokio::join!(serving, asking)
+            })
+            .await
+            .expect("the contact ended");
+            if stopping {
+                assert!(served.is_ok(), "the stop is not an error: {served:?}");
+                assert!(
+                    matches!(answer, Err(ProtocolError::Closed)),
+                    "a stopping responder wrote an answer: {answer:?}"
+                );
+            } else {
+                // The requester left after the answer: the end of an ordinary contact.
+                assert!(matches!(served, Ok(()) | Err(ProtocolError::Closed)), "{served:?}");
+                assert!(
+                    matches!(answer, Ok(Message::Divergence { digests: Some(_), .. })),
+                    "premise: the same request is answered with digests: {answer:?}"
+                );
+            }
+        }
     }
 
     /// A snapshot that has applied no page holds nothing, and neither does one
@@ -9088,6 +9374,196 @@ mod partial_windows_never_skip {
             let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
             let result = runtime.block_on(run(case));
             prop_assert!(result.is_ok(), "{}", result.unwrap_err());
+        }
+    }
+
+    /// B3, the mixed roll over the wire: a peer that answers a digest request
+    /// with no digests is `Unanswered` and never compared; one that says it is
+    /// already answering one is `Busy`, which is not the same thing; and a peer
+    /// not yet known to answer digests is asked with the cut alone.
+    #[tokio::test]
+    async fn a_peer_that_answers_no_digest_is_unanswered_and_a_busy_one_is_busy() {
+        use kimmy_storage::DigestAnswered::{Busy, Unanswered};
+        for (busy, expected) in [(false, Unanswered), (true, Busy)] {
+            let dir = tempfile::tempdir().unwrap();
+            let engine = Engine::open(&dir.path().join("kimmy.redb")).unwrap();
+            let (ours, mut peer_end) = tokio::io::duplex(MAX_FRAME);
+            let peer = tokio::spawn(async move {
+                let Ok(Message::AskVersions { .. }) = read_frame(&mut peer_end).await else {
+                    return;
+                };
+                let vectors = Message::Vectors {
+                    servable: VersionVector::new(),
+                    witnessed: VersionVector::new(),
+                    facts: None,
+                    facts_gen: None,
+                    echo: None,
+                    replay_from: None,
+                };
+                write_frame(&mut peer_end, &vectors).await.unwrap();
+                let Ok(Message::AskDivergence { digest, .. }) = read_frame(&mut peer_end).await
+                else {
+                    return;
+                };
+                assert!(digest.is_some(), "the request carries the cut");
+                let answer = Message::Divergence {
+                    collections: Vec::new(),
+                    probe_count: None,
+                    incarnations: Vec::new(),
+                    digests: None,
+                    digest_busy: busy,
+                };
+                write_frame(&mut peer_end, &answer).await.unwrap();
+            });
+            let mut stalls = PeerStalls::new();
+            if !busy {
+                // A peer that answered digests before and now sends none.
+                stalls.digest_capable.insert(kimmy_core::NodeId::from_bytes([9; 16]));
+            }
+            let addr: SocketAddr = "127.0.0.1:1".parse().unwrap();
+            let outcome = sync_over_within(
+                &engine,
+                ours,
+                addr,
+                kimmy_core::NodeId::from_bytes([9; 16]),
+                None,
+                &mut stalls,
+                Duration::from_secs(5),
+            )
+            .await
+            .expect("the round");
+            peer.await.unwrap();
+            let round = outcome.digest.expect("asked");
+            assert_eq!(round.answered, expected);
+            assert!(round.verdicts.is_empty(), "never compared");
+            assert_eq!(
+                stalls.digest_capable.contains(&kimmy_core::NodeId::from_bytes([9; 16])),
+                busy,
+                "a peer that said it was busy answers digests; one that sent none does not"
+            );
+        }
+    }
+
+    /// What the first `AskDivergence` of a round carried, read by a fake peer
+    /// that then answers it as a build before the digest would.
+    async fn the_request_of_a_round(
+        engine: &Engine,
+        theirs: VersionVector,
+        window: Vec<OplogEntry>,
+        probe: Option<DivergenceProbe>,
+        stalls: &mut PeerStalls,
+    ) -> Option<kimmy_storage::DigestAsk> {
+        let (ours, mut peer_end) = tokio::io::duplex(MAX_FRAME);
+        let peer = tokio::spawn(async move {
+            let Ok(Message::AskVersions { .. }) = read_frame(&mut peer_end).await else {
+                return None;
+            };
+            let vectors = Message::Vectors {
+                servable: theirs.clone(),
+                witnessed: theirs,
+                facts: None,
+                facts_gen: None,
+                echo: None,
+                replay_from: None,
+            };
+            write_frame(&mut peer_end, &vectors).await.unwrap();
+            if !window.is_empty() {
+                let Ok(Message::AskEntries { .. }) = read_frame(&mut peer_end).await else {
+                    return None;
+                };
+                let scanned_to = window.last().unwrap().stamp.hlc;
+                let entries = Message::Entries {
+                    entries: window,
+                    scanned_to,
+                    exhausted: true,
+                    passed_through: None,
+                };
+                write_frame(&mut peer_end, &entries).await.unwrap();
+            }
+            let Ok(Message::AskDivergence { digest, .. }) = read_frame(&mut peer_end).await else {
+                return None;
+            };
+            let answer = Message::Divergence {
+                collections: Vec::new(),
+                probe_count: None,
+                incarnations: Vec::new(),
+                digests: None,
+                digest_busy: false,
+            };
+            write_frame(&mut peer_end, &answer).await.unwrap();
+            digest
+        });
+        let addr: SocketAddr = "127.0.0.1:1".parse().unwrap();
+        sync_over_within(
+            engine,
+            ours,
+            addr,
+            kimmy_core::NodeId::from_bytes([9; 16]),
+            probe,
+            stalls,
+            Duration::from_secs(5),
+        )
+        .await
+        .expect("the round");
+        peer.await.unwrap()
+    }
+
+    /// F3 (N10) and F4 (M7b): the request names the busy collection the rotation
+    /// chose, and carries the digest, at both places a round asks: when there is
+    /// nothing to pull, and when a pull reached the peer's tail. The count probe
+    /// is not in play at the second (no probe is named), so the digest rides
+    /// without it.
+    #[tokio::test]
+    async fn the_request_names_the_busy_collection_and_is_made_without_a_count_probe() {
+        let named = kimmy_core::CollectionId(77);
+        let origin = kimmy_core::NodeId::from_bytes([3; 16]);
+        let me = kimmy_core::NodeId::from_bytes([9; 16]);
+        let probe = || Some(DivergenceProbe { id: named, mine_count: None, mine_at: None });
+        for (pulled, capable) in [(false, true), (true, true), (false, false), (true, false)] {
+            let dir = tempfile::tempdir().unwrap();
+            let engine = Engine::open(&dir.path().join("kimmy.redb")).unwrap();
+            let orders = engine.create_collection("shop", "orders").unwrap();
+            // Writes of this node's own that the peer's vector does not cover:
+            // the collection is busy at the cut, so a full plan carries their
+            // keys and a request made with the cut alone carries none.
+            for i in 10..12i64 {
+                engine.insert(&orders, bson::doc! { "_id": i }).unwrap();
+            }
+            let mut theirs = VersionVector::new();
+            let window = if pulled {
+                theirs.insert(origin, Hlc::new(4_000, 0));
+                vec![OplogEntry {
+                    stamp: kimmy_core::Stamp::new(Hlc::new(4_000, 0), origin),
+                    kind: kimmy_core::OpKind::Insert,
+                    collection: orders.id,
+                    doc_id: Some(kimmy_core::DocId::Int64(1)),
+                    body: Some(bson::serialize_to_vec(&bson::doc! { "_id": 1 }).unwrap()),
+                }]
+            } else {
+                Vec::new()
+            };
+            let mut stalls = PeerStalls::new();
+            if capable {
+                stalls.digest_capable.insert(me);
+            }
+            let ask = the_request_of_a_round(
+                &engine,
+                theirs,
+                window,
+                if pulled { None } else { probe() },
+                &mut stalls,
+            )
+            .await
+            .unwrap_or_else(|| panic!("the request carried a digest (pulled: {pulled})"));
+            if !pulled {
+                assert_eq!(ask.busy, Some(named), "the rotation's collection is named");
+            }
+            assert_eq!(
+                !ask.uncovered.is_empty(),
+                capable,
+                "a peer known to answer is asked with the plan, any other with the cut alone \
+                 (pulled: {pulled}, capable: {capable})"
+            );
         }
     }
 }

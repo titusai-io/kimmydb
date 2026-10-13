@@ -1192,7 +1192,7 @@ impl Engine {
     ) -> Result<()> {
         let record = kimmy_core::DocRecord::tombstone(tombstone.stamp);
         let mut docs = txn.open_table(tables::DOCS)?;
-        crate::live_count::put_record(
+        crate::live_count::put_bare_tombstone(
             txn,
             &mut docs,
             collection.id.0,
@@ -1912,12 +1912,22 @@ impl Engine {
     /// window containing this". `Collected` is judged first, so a peer that lacks
     /// both is told what retention would have told it before.
     pub fn serve_verdict(&self, held: &VersionVector) -> Result<ServeVerdict> {
-        let mine = self.version_vector()?;
-        let collected = self.oplog_collected()?;
+        let txn = self.db().begin_read()?;
+        Self::serve_verdict_in(&txn, held)
+    }
+
+    /// [`Self::serve_verdict`] in a read transaction the caller holds, so that a
+    /// reader which also reads rows and keys reads this beside them (B3).
+    pub(crate) fn serve_verdict_in(
+        txn: &redb::ReadTransaction,
+        held: &VersionVector,
+    ) -> Result<ServeVerdict> {
+        let mine = Self::read_versions_in(txn, crate::tables::OPLOG_VERSIONS)?;
+        let collected = Self::read_versions_in(txn, crate::tables::OPLOG_COLLECTED)?;
         if crate::sync::lacks_collected(held, &mine, &collected) {
             return Ok(ServeVerdict::Collected);
         }
-        let state_held = self.state_held()?;
+        let state_held = Self::state_held_in(txn)?;
         if crate::sync::lacks_collected(held, &mine, &state_held) {
             return Ok(ServeVerdict::StateHeld);
         }
@@ -5875,6 +5885,27 @@ mod tests {
         assert!(holds_tombstone(&b, &cb, &DocId::Int64(2)), "premise: the bare tombstone");
         assert_eq!(deletes_in_oplog(&b, &DocId::Int64(2)), 0, "premise: and no entry");
         (a, da, b, db, cb, entries)
+    }
+
+    /// A delete a snapshot page carries is recorded through
+    /// `put_bare_tombstone`, so the digest row knows no oplog entry stands
+    /// behind it: `bare_max` holds its stamp, and the row equals a walk.
+    #[test]
+    fn a_carried_delete_raises_the_bare_maximum_of_the_digest_row() {
+        let (a, _da, b, _db, cb, entries) = a_member_holding_a_bare_tombstone();
+        let delete = entries.iter().find(|e| e.kind == OpKind::Delete).unwrap();
+        let row = b.digest_row(cb.id).unwrap().expect("a row");
+        assert_eq!(
+            row.bare_max.get(&delete.stamp.node),
+            Some(&delete.stamp.hlc),
+            "the bare tombstone is not in bare_max: {row:?}"
+        );
+        crate::live_count::test_support::assert_digests_exact(&b, "a carried delete");
+        // The entry arriving later makes it a tombstone with an entry behind
+        // it; bare_max, which never falls, still holds the stamp.
+        b.apply_batch(&entries).unwrap();
+        crate::live_count::test_support::assert_digests_exact(&b, "the entry that came for it");
+        drop(a);
     }
 
     fn index_entries(engine: &Engine) -> usize {

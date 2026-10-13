@@ -16,6 +16,7 @@ pub mod check;
 pub mod class_step;
 pub mod codec;
 mod database_tombstone;
+pub mod digest_probe;
 pub mod divergence;
 pub mod docs;
 pub mod engine;
@@ -30,6 +31,8 @@ pub mod health;
 pub mod hold_meter;
 pub mod index;
 mod live_count;
+pub mod live_digest;
+mod live_walk;
 pub mod meta;
 pub mod migrate;
 pub mod modify;
@@ -60,8 +63,15 @@ mod database_drop_tests;
 
 #[cfg(test)]
 mod log_capture;
+#[cfg(feature = "test-hooks")]
+pub use live_walk::stop_open_after_rows_for_test;
 
 pub use database_tombstone::{Buried, BuriedCollection, Swept};
+pub use digest_probe::{
+    ANSWER_KEY_BYTES, ASK_KEY_BYTES, Defer, DigestAnswered, DigestAsk, DigestEntry, DigestOutcome,
+    DigestPlan, DigestReply, DigestRound, DigestVerdict, SCAN_BYTES, SCAN_WALL, ScanBudget,
+    SelfCheck, Uncovered,
+};
 pub use divergence::{
     DivergenceTracker, Findings as DivergenceFindings, LocalState as DivergenceLocalState,
     PeerAnswer as DivergencePeerAnswer, compare as compare_divergence, next_probe,
@@ -69,9 +79,9 @@ pub use divergence::{
 pub use docs::{BulkInsertError, ID_FIELD, WriteOutcome, WriteScope};
 pub use engine::physical_now_ms;
 pub use engine::{
-    CacheReading, DurabilityClass, Engine, NotClosed, RepairsAtOpen, WRITER_HOLD_BUCKETS_US,
-    WRITER_HOLD_WARN, WRITER_WAIT_BUCKETS_US, WriterHoldSnapshot, WriterHolder, WriterWaitSnapshot,
-    blocking, metered_writer_wait, with_write_wait_budget,
+    CacheReading, DurabilityClass, Engine, NotClosed, OpenOptions, RepairsAtOpen,
+    WRITER_HOLD_BUCKETS_US, WRITER_HOLD_WARN, WRITER_WAIT_BUCKETS_US, WriterHoldSnapshot,
+    WriterHolder, WriterWaitSnapshot, blocking, metered_writer_wait, with_write_wait_budget,
 };
 pub use error::{Applied, RefusedKind, Result, StopReason, StorageError};
 pub use expiry::{ExpiryOutcome, MAX_EXPIRED_PER_PASS, ttl_indexes};
