@@ -1074,6 +1074,28 @@ fn decode_vector(doc: bson::Document) -> Result<VectorRecord> {
         .map_err(|e| StorageError::Corrupt(format!("decoding vector record: {e}")))
 }
 
+/// Whether the vector chunk record `raw` belongs to a document of `parent` that
+/// is no longer live there. A record that cannot be read as a chunk, or whose
+/// source is not found to be gone, is not judged orphaned: only a source known
+/// to be absent or deleted removes a chunk.
+pub(crate) fn chunk_has_no_live_parent(
+    docs: &impl ReadableTable<(u64, &'static [u8]), &'static [u8]>,
+    parent: CollectionId,
+    raw: &[u8],
+) -> bool {
+    let Ok(Some(document)) = crate::codec::decode_doc_record(raw).and_then(|r| Ok(r.document()?))
+    else {
+        return false;
+    };
+    let Ok(record) = decode_vector(document) else { return false };
+    let Ok(key) = crate::docs::doc_key(&record.source) else { return false };
+    match docs.get((parent.0, key.as_slice())) {
+        Ok(Some(row)) => crate::codec::doc_record_header(row.value()).is_ok_and(|(_, live)| !live),
+        Ok(None) => true,
+        Err(_) => false,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use kimmy_core::{OpKind, ProviderConfig, vector_meta};

@@ -330,6 +330,16 @@ impl Engine {
                 // here (retention took it, or a snapshot brought the collection)
                 // and one whose drop's entry is not held.
                 None => {
+                    // A life a collection's drop re-dated to keep what was written
+                    // after it has no creation entry. The sweep that finished it
+                    // recorded where the first entry it kept arrived, with the
+                    // `created` that marks it, and a start reads that. Where it
+                    // is missing (a sweep still running, no kept entry still
+                    // held) the walk below places the stream, as it does for a
+                    // collection a snapshot brought.
+                    if let Some(first) = live.redated_first_arrival(live.created) {
+                        return Ok((start.max(first), Some((id, dropped_at))));
+                    }
                     let recreated = match self.arrival_of(&dropped_at)? {
                         Some(drop_seq) => match self.creation_arrival(id, live.created, walked)? {
                             Some(created_at) if created_at > drop_seq => Some(drop_seq + 1),

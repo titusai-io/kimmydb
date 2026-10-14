@@ -425,18 +425,6 @@ pub struct SnapshotProgress {
     complete: bool,
 }
 
-/// How a collection tombstone a snapshot carries reached the receiver, which
-/// decides whether the drop it records may keep the writes stamped after it.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum CarriedDrop {
-    /// The one collection a scoped repair is about (`page.dropped`): an explicit
-    /// drop of that collection, which keeps what was written after it.
-    OfOneCollection,
-    /// An entry of a whole-database page's list: the database's own tombstone
-    /// and its collections' are in it together, so it buries whole (ADR-229).
-    OfTheWholeList,
-}
-
 impl SnapshotProgress {
     /// A whole-database snapshot, not yet started: what a member below a
     /// peer's retention horizon pulls.
@@ -811,7 +799,7 @@ impl Engine {
             return Ok(SnapshotApplied { purge_pending: Some(id), ..Default::default() });
         }
         if let (Some(dropped), Some(id)) = (page.dropped, progress.scope) {
-            self.restore_collection_drop(id, dropped, CarriedDrop::OfOneCollection)?;
+            self.restore_collection_drop(id, dropped)?;
         }
         // The whole-database route's own denials, through the same predicate
         // the scoped one uses -- `restore_collection_drop` asks
@@ -1282,6 +1270,28 @@ impl Engine {
         let held: std::collections::HashMap<CollectionId, Stamp> =
             self.collections_dropped()?.into_iter().collect();
 
+        // The database tombstones first, whatever order the list is in: a
+        // collection's drop met before its database's own tombstone is recorded
+        // would otherwise be judged without it (ADR-229's guard reads it). Held
+        // to the sender's coverage like every pair below.
+        let databases: std::collections::HashSet<String> = self
+            .collections(crate::engine::PairedShadows::Included)?
+            .into_iter()
+            .map(|meta| meta.db)
+            .collect();
+        let database_drops: Vec<(CollectionId, Stamp)> = databases
+            .iter()
+            .filter_map(|db| {
+                let id = kimmy_core::database_drop_id(db);
+                page.dropped_collections.iter().find(|(carried, _)| *carried == id).copied()
+            })
+            .filter(|(_, dropped)| dropped.hlc <= page.versions.get(dropped.node))
+            .filter(|(id, dropped)| held.get(id).is_none_or(|existing| dropped > existing))
+            .collect();
+        self.record_collection_drops(&database_drops)?;
+        let held: std::collections::HashMap<CollectionId, Stamp> =
+            self.collections_dropped()?.into_iter().collect();
+
         let mut to_record = Vec::new();
         for (id, dropped) in &page.dropped_collections {
             // A peer may only deny what its own coverage names (ADR-163).
@@ -1296,7 +1306,7 @@ impl Engine {
                 continue;
             }
             if live.contains(id) {
-                self.restore_collection_drop(*id, *dropped, CarriedDrop::OfTheWholeList)?;
+                self.restore_collection_drop(*id, *dropped)?;
                 continue;
             }
             // The receiver never held this collection, which ADR-162 notes is
@@ -1412,15 +1422,7 @@ impl Engine {
     /// ended is ignored outright, tombstone and all: the sender is simply
     /// behind, and a tombstone below the incarnation standing here says
     /// nothing that incarnation's own floor does not.
-    ///
-    /// Whether a write stamped after the drop is kept (ADR-231, extended) is the
-    /// caller's to say, in `how`: see [`CarriedDrop`].
-    fn restore_collection_drop(
-        &self,
-        id: CollectionId,
-        dropped: Stamp,
-        how: CarriedDrop,
-    ) -> Result<()> {
+    fn restore_collection_drop(&self, id: CollectionId, dropped: Stamp) -> Result<()> {
         if let Some(current) = self.collection_by_id(id)? {
             if crate::sync::aims_at_a_previous_incarnation(&current, dropped.hlc) {
                 debug!(collection = %id, "a snapshot carried a drop of a life of this collection that has already ended; ignored");
@@ -1435,25 +1437,10 @@ impl Engine {
             // it at a time; the tombstone is recorded before the first of
             // them, so this node stops serving and re-seeding that copy at the
             // drop's first commit rather than at its last.
+            //
             // Writes stamped after the drop are kept, as when it arrives as an
-            // entry (ADR-231, extended), but only for a drop the sender made of
-            // this one collection. A database's drop is never a drop that keeps
-            // (ADR-229), and a whole-database page cannot tell it from one: the
-            // database's tombstone and the tombstones of its collections come in
-            // the one list, in any order, and a collection met before the
-            // database's own tombstone is recorded would be kept. So the list
-            // never keeps, and the one-collection route does not when this
-            // member already holds the database's tombstone, whatever its stamp:
-            // a database drop buries each collection with a drop of its own, at
-            // a stamp above the database's.
-            if how == CarriedDrop::OfOneCollection
-                && self.database_dropped_at(&current.db)?.is_none()
-                && self.keep_later_writes(&current, dropped, &|| {
-                    self.check_walk(crate::WalkScope::Background)
-                })?
-            {
-                return self.record_collection_drop(id, dropped);
-            }
+            // entry (ADR-231, extended), unless the database's own drop covers
+            // the life (ADR-229): one guard, judged in the burying transaction.
             warn!(
                 db = %current.db,
                 collection = %current.name,
@@ -1461,7 +1448,14 @@ impl Engine {
                 "the peer has dropped the collection this snapshot was to repair, and the copy \
                  held here is of the incarnation it dropped; dropping it too"
             );
-            self.drop_collection_inner(&current.db, &current.name, Some(dropped))?;
+            if matches!(
+                self.drop_keeping_later_writes(&current.db, &current.name, dropped, &|| {
+                    self.check_walk(crate::WalkScope::Background)
+                })?,
+                crate::late_drop::Dropped::Kept
+            ) {
+                return self.record_collection_drop(id, dropped);
+            }
         } else {
             // `debug`, not `warn`. On the scoped route this is one line for the
             // one collection the pull is about. On the whole-database route
