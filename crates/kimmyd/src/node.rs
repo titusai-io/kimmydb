@@ -1290,6 +1290,21 @@ async fn start_and_serve(
         }
     }
 
+    // What a newer life of a collection took in of the life before a drop that
+    // reached it late is removed before it serves (ADR-231): a store left with
+    // such stragglers, or a sweep a stop cut short. The floor each sweep sets
+    // says it was done, so a store with nothing owed passes through.
+    match kimmy_storage::blocking(|| engine.reconcile_late_drops()) {
+        Ok(_) => {}
+        Err(kimmy_storage::StorageError::Stopping(_)) => {
+            info!("a stop was asked for while late drops were swept; stopping without serving");
+            return Ok(ended_before_serving(serving, Some(engine), Arc::clone(&stop.by)).await);
+        }
+        Err(e) => {
+            return Err(anyhow::Error::new(e).context("sweeping what a late drop left behind"));
+        }
+    }
+
     let gc_handle = spawn_collector(Arc::clone(&engine), &config, shutdown.clone());
     state.metrics.set_purge_counters(engine.purge_counters());
     let purger_handle = spawn_drop_purger(Arc::clone(&engine), shutdown.clone());

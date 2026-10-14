@@ -124,6 +124,10 @@ const BOUNDED_READS: &[(&str, &str)] = &[
         "one row: the first arrival position at or above a target, for the serve walk's bench",
     ),
     (
+        "late_drop::Engine::remove_stragglers",
+        "at most one chunk of a thousand rows of one collection, inside the write that removes them; the stop is looked for between two chunks (ADR-231)",
+    ),
+    (
         "docs::WriteScope::for_each_doc",
         "inside a write scope, which holds the single writer: close_writes bounds it (ADR-192)",
     ),

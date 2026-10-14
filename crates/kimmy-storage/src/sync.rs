@@ -2231,6 +2231,9 @@ impl Engine {
                             // moves backwards), so a straggling pre-drop write
                             // is superseded here as it would be anywhere else.
                             self.record_collection_drop(entry.collection, entry.stamp)?;
+                            // And what the life standing here took in of the one
+                            // that drop ended, before the drop was known (ADR-231).
+                            self.sweep_after_an_ignored_drop(&current, entry.stamp)?;
                             return Ok(DdlOutcome::Applied);
                         }
                     }

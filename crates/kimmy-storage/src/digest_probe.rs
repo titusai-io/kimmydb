@@ -1413,21 +1413,12 @@ mod tests {
     /// A concurrent create on B, later than A's drop (A creates, A drops, B
     /// independently creates; B's clock is the later): after the exchange both
     /// hold one collection, created at B's stamp, and the drop is held by both
-    /// as a tombstone below that incarnation. The drop took A's document at A
-    /// and was ignored at B, which still holds it, so the members really differ
-    /// (the count probe sees 1 against 2). The digest neither defers for the
-    /// tombstone's retention nor invents the difference: once the drop is
-    /// covered it compares, and says what the counts say. The existence half
-    /// sees nothing, since both hold the collection.
-    ///
-    /// The difference itself is a replication bug, recorded as the finding
-    /// `kimmydb-a-collection-dropped-on-one-member-and-created-again-on-another-
-    /// before-the-drop-replicates-leaves-the-members-different-for-good-and-the-
-    /// repair-loops`; the digest's part is to report it as true, which is what
-    /// this pins. The fix makes the two members agree and this test's last two
-    /// assertions say so then.
+    /// as a tombstone below that incarnation. A's document was applied into B's
+    /// newer life before B learned of the drop; the late-drop sweep (ADR-231)
+    /// removes it, so the members agree. The digest does not defer for the
+    /// tombstone's retention, and compares equal.
     #[test]
-    fn a_concurrent_create_later_than_a_drop_is_compared_and_the_difference_is_real() {
+    fn a_concurrent_create_later_than_a_drop_converges_and_is_compared() {
         let (a, _da) = engine();
         let (b, _db) = engine();
         let on_a = a.create_collection("shop", "orders").unwrap();
@@ -1443,25 +1434,22 @@ mod tests {
             b.finish_purges_now().unwrap();
         }
         let id = on_a.id;
-        // Both hold the one collection, at B's incarnation, and the drop.
         for e in [&a, &b] {
             assert_eq!(e.collection_by_id(id).unwrap().unwrap().created, on_b.created);
             assert!(e.collection_tombstones().unwrap().contains_key(&id));
         }
         assert_eq!(a.all_collection_ids().unwrap(), b.all_collection_ids().unwrap());
-        // What each holds: B's document at both; A's, which A's drop took, at B.
         let held = |e: &Engine, n: i64| {
             let c = e.collection_by_id(id).unwrap().unwrap();
             e.get(&c, &DocId::Int64(n)).unwrap().is_some()
         };
         assert!(held(&a, 2) && held(&b, 2));
-        assert!(!held(&a, 1) && held(&b, 1), "the members differ by the dropped document");
+        assert!(!held(&a, 1) && !held(&b, 1), "the drop took document 1 on both");
         assert_eq!(a.count_by_id(id).unwrap(), Some(1));
-        assert_eq!(b.count_by_id(id).unwrap(), Some(2));
-        // The digest: not deferred, and unequal, in both directions.
+        assert_eq!(b.count_by_id(id).unwrap(), Some(1));
         for (x, y) in [(&a, &b), (&b, &a)] {
             let verdicts = exchange(x, y, Some(id));
-            assert_eq!(compared(&verdicts, id), Some(false), "{verdicts:?}");
+            assert_eq!(compared(&verdicts, id), Some(true), "{verdicts:?}");
         }
     }
 

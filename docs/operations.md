@@ -428,8 +428,11 @@ container after about 30 seconds of failed liveness checks, now finishes. What
 the open is doing is on `/readyz`: `phase` is one of `repairing`, `opening`,
 `migrating` (`done` of `total` indexes), `verifying` (`done` of `total` oplog
 rows), `counting`, `starting` and `reconciling` (`done` of `total` databases whose
-drop the node is burying before it serves, [ADR-229](decisions.md); absent when
-there is none), with `phase_age_seconds`. **A start that cannot bury what a
+drop the node is burying before it serves, [ADR-229](decisions.md), or collections it is sweeping of what a
+drop that reached them late left behind, [ADR-231](decisions.md); absent when
+there is none), with `phase_age_seconds`. **That sweep finds its work through the drop tombstones the
+member holds, so it heals what is within `storage.tombstone_retention_secs` of a drop and not a store that
+stayed divergent for longer.** **A start that cannot bury what a
 database's drop covers for any reason but a stop (a damaged collection row, say) fails**, logging
 `burying what a database's drop covers` with the cause, and the next start fails the same way: run
 [`kimmyd check-store`](#checking-a-store) on the stopped member, and if the store is damaged, wipe its data

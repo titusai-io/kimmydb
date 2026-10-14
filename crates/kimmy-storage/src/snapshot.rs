@@ -1404,7 +1404,9 @@ impl Engine {
         if let Some(current) = self.collection_by_id(id)? {
             if crate::sync::aims_at_a_previous_incarnation(&current, dropped.hlc) {
                 debug!(collection = %id, "a snapshot carried a drop of a life of this collection that has already ended; ignored");
-                return Ok(());
+                // The life standing here may hold what the one before put in it
+                // (ADR-231).
+                return self.sweep_after_an_ignored_drop(&current, dropped);
             }
             // What is removed is a partial copy of a life that has ended
             // everywhere else, which on a collection a repair was part-way
@@ -3450,6 +3452,42 @@ mod tests {
             b.count(&cb, crate::WalkScope::Request).unwrap(),
             1,
             "the newer incarnation and its documents stand"
+        );
+    }
+
+    /// The same drop, carried by a snapshot page to a member whose newer life
+    /// had already taken in a document of the one the drop ended: the page's
+    /// drop is ignored for the collection and the document goes (ADR-231), as it
+    /// does when the drop arrives as an entry.
+    #[test]
+    fn a_snapshot_carrying_a_late_drop_removes_what_the_newer_life_took_in_of_the_one_before() {
+        let (a, _da) = engine();
+        let (b, _db) = engine();
+        let ca = a.create_collection("shop", "orders").unwrap();
+        a.insert(&ca, doc! { "_id": 7 }).unwrap();
+        let before = a.read_oplog_from(Hlc::ZERO, 10_000, crate::WalkScope::Background).unwrap();
+        a.drop_collection("shop", "orders").unwrap();
+        let dropped = a.collection_dropped_at(ca.id).unwrap().expect("a tombstone");
+
+        a_moment();
+        let cb = b.create_collection("shop", "orders").unwrap();
+        b.insert(&cb, doc! { "_id": 1 }).unwrap();
+        // The document of A's life reaches B before the drop does.
+        let insert: Vec<_> = before.iter().filter(|e| e.kind == OpKind::Insert).cloned().collect();
+        b.apply_batch(&insert).unwrap();
+        assert_eq!(b.count(&cb, crate::WalkScope::Request).unwrap(), 2, "premise");
+        assert!(cb.created > dropped.hlc);
+
+        let page = a.snapshot_page(None, Some(ca.id)).unwrap();
+        b.apply_snapshot_page(a.node_id(), &mut SnapshotProgress::of_collection(ca.id), &page)
+            .unwrap();
+
+        assert_eq!(b.get_collection("shop", "orders").unwrap().created, cb.created);
+        assert_eq!(b.count(&cb, crate::WalkScope::Request).unwrap(), 1, "document 7 goes");
+        assert!(b.get(&cb, &DocId::Int64(7)).unwrap().is_none());
+        assert_eq!(
+            b.get_collection("shop", "orders").unwrap().incarnation_floor,
+            Some(dropped.hlc)
         );
     }
 

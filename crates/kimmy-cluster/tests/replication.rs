@@ -9687,3 +9687,75 @@ async fn the_digest_is_asked_when_the_count_half_is_gated() {
     assert!(outcome.count_probe_deferred, "the premise: the count half was gated: {outcome:?}");
     assert!(outcome.digest.is_some(), "the digest is asked all the same: {outcome:?}");
 }
+
+/// A collection dropped on one member and created again on another before the
+/// drop replicated (the finding behind ADR-231): through the real loop on both,
+/// the members end with the same documents, the divergence gauge returns to 0,
+/// and the count half's repair stops. Before the late-drop sweep the counts
+/// stayed 1 and 2 for good, both gauges stayed at 1, and `repair_rounds` rose
+/// about every five seconds without converging anything.
+#[tokio::test]
+async fn a_drop_and_a_concurrent_create_converge_through_the_loop_and_the_repair_ends() {
+    use kimmy_cluster::{ReplicationConfig, RoundReport, SeedSource, replicate};
+
+    let a = node().await;
+    let b = node().await;
+    let on_a = a.engine.create_collection("shop", "orders").unwrap();
+    a.engine.insert(&on_a, doc! { "_id": 1i64, "from": "a" }).unwrap();
+    assert!(a.engine.drop_collection("shop", "orders").unwrap());
+    a.engine.finish_purges_now().unwrap();
+    let on_b = b.engine.create_collection("shop", "orders").unwrap();
+    b.engine.insert(&on_b, doc! { "_id": 2i64, "from": "b" }).unwrap();
+
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<(bool, RoundReport)>();
+    let mut loops = Vec::new();
+    for (is_b, me, other) in [(false, &a, &b), (true, &b, &a)] {
+        let mut config = ReplicationConfig::new(
+            vec![SeedSource::Static(vec![other.addr])],
+            SECRET.into(),
+            me.addr,
+        );
+        config.sync_interval = Duration::from_millis(100);
+        config.discovery_interval = Duration::from_millis(100);
+        let tx = tx.clone();
+        config.on_round = Some(Arc::new(move |report| {
+            let _ = tx.send((is_b, report));
+        }));
+        loops.push(tokio::spawn(replicate(Arc::clone(&me.engine), config)));
+    }
+
+    // The members agree, and both loops have read it: the gauge at 0 on each,
+    // with the counts equal.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+    let mut gauge = [usize::MAX; 2];
+    let mut checks = [0usize; 2];
+    loop {
+        let (is_b, report) = tokio::time::timeout_at(deadline, rx.recv())
+            .await
+            .expect("the members did not converge")
+            .expect("the loops keep reporting");
+        gauge[usize::from(is_b)] = report.divergent_collections;
+        checks[usize::from(is_b)] += report.divergence_checks;
+        let (ca, cb) =
+            (a.engine.count_by_id(on_a.id).unwrap(), b.engine.count_by_id(on_a.id).unwrap());
+        if ca == cb && gauge == [0, 0] && checks.iter().all(|c| *c >= 3) {
+            assert_eq!(ca, Some(1), "document 2 only");
+            break;
+        }
+    }
+    // And the repair has ended: no repair round in the next stretch.
+    let quiet_until = tokio::time::Instant::now() + Duration::from_secs(8);
+    let mut repairs = 0usize;
+    while tokio::time::Instant::now() < quiet_until {
+        if let Ok(Some((_, report))) =
+            tokio::time::timeout(Duration::from_millis(500), rx.recv()).await
+        {
+            repairs += report.repair_rounds;
+            assert_eq!(report.divergent_collections, 0, "{report:?}");
+        }
+    }
+    assert_eq!(repairs, 0, "the repair kept running after the members agreed");
+    for l in loops {
+        l.abort();
+    }
+}
