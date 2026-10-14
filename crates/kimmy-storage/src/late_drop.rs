@@ -1636,7 +1636,9 @@ mod tests {
         let (a, b, _da, _db, _dropped) = a_drop_and_a_later_life();
         b.create_index("shop", "orders", by_from(), false, Some("old_style".into())).unwrap();
         edit_meta(&b, |meta| meta.indexes[0].created = None);
-        quiesce(&[&a, &b]);
+        // Only B takes A's entries: nothing of B's reaches A and comes back to
+        // teach the index a stamp before the drop arrives.
+        pull(&b, &a);
         let standing = b.get_collection("shop", "orders").unwrap();
         assert_eq!(standing.indexes.len(), 1, "swept: {:?}", standing.indexes);
         assert_eq!(docs_of(&b, "shop", "orders", &[1, 2]), vec![2]);
@@ -1648,7 +1650,7 @@ mod tests {
         let (a, b, _da, _db, _dropped) = a_drop_and_a_later_life();
         b.configure_vectors("shop", "orders", byo_config()).unwrap();
         edit_meta(&b, |meta| meta.vector_changed = None);
-        quiesce(&[&a, &b]);
+        pull(&b, &a);
         let standing = b.get_collection("shop", "orders").unwrap();
         assert!(standing.vector.is_some(), "the unstamped configuration was turned off");
         assert_eq!(docs_of(&b, "shop", "orders", &[1, 2]), vec![2]);
