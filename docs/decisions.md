@@ -26926,3 +26926,107 @@ a recreation, and with the write reaching a member before or after the recreatio
 1. **An identical local create over an inherited index is a new creation.** A's `create_index X` of the life before can reach B, whose life began later, before B's own client creates `X`. The create found the definition standing, answered that it exists and minted nothing, and the sweep then removed `X` (its stamp is before the drop). A local create of an identical definition over one whose stamp is below the collection's `created` now takes a fresh stamp under the writer and replicates a `CreateIndex`; a member holding the definition raises its stamp to the incoming newer one (the merge-forward of ADR-132, which already existed), and a member that lacks it builds it. The answer is unchanged (`http-api.md`: idempotent when the definition is identical). An identical create over an index stamped at or above `created` is still a pure no-op, so a client that creates its indexes on every boot mints no entry. A local `configure_vectors` always took a fresh stamp and replicated, so the same sequence was safe for a vector configuration; a test pins it.
 2. **The digest does not compare a life that owes the sweep.** A collection with `created` above a drop and a floor below it (`owes_a_sweep`) still holds what the life before put in it, however far the cut is past the drop; it is deferred as `incarnation` until its floor is at the drop (cut digest, half 2).
 3. **The exceptions and the boundary are tested.** An index with no `created` and a vector configuration with no `vector_changed` are left by the sweep; a definition tied at the drop's `Hlc` from a node above the dropper's is selected and its drop declined, with the tombstone recorded; a newer life's index with the old one's derived id is never offered to the drop of the index.
+
+## ADR-232 — The definition digest: a hash of what a collection's indexes and vector configuration say, compared at the cut two members share, finds the schema drift no count and no document digest can see
+
+> **Closes the second blind spot of [ADR-133](#adr-133--a-periodic-cross-member-check-makes-a-divergence-no-counter-can-express-visible-without-repairing-it)
+> and [ADR-230](#adr-230--the-cut-digest-a-kept-xor-per-collection-compared-at-the-cut-two-members-have-both-processed-finds-the-lost-update-the-count-cannot-see)**:
+> two members that hold the same documents and say different things about them (a member without the TTL
+> index, two members keeping different partial filters). A **detector only**: nothing is repaired. **Read
+> before upgrading, not Breaking** in the sense of `compatibility.md`: a new gauge, and the existing divergence
+> gauge, can read above 0 where they read 0. Half 2 of the design that produced ADR-230 (the wiki page
+> *KimmyDB 0.48.0 Design: Divergence Detection, the Cut Digest and the Definition Digest Brought Up to Main
+> (Item B3)*, §3).
+
+**Decision.**
+
+1. **What is hashed is what `IndexMeta::differences` compares, plus the name** (ADR-132: the engine's own
+   judgement of "the same definition"): `fields` (ordered), `unique`, `enforcement`, `expire_after_secs`, and the
+   partial filter as `stored_filter::compared` renders it (canonical Extended JSON with the top level sorted,
+   so a conjunction written in another order is one definition, and `NaN` is equal to itself because a string
+   is). A vector configuration is hashed by what it says (every field of `VectorConfig`, `ProviderConfig` and
+   `ChunkConfig`) and **not by `vector_changed`**: a configuration made before 0.46 has no stamp on its origin
+   and a replica that applied the same entry stores one, and nothing would ever heal that. Each type is
+   destructured exhaustively, with no `..` and no wildcard on an enum, so a new field is a compile error and
+   someone must decide whether it is compared; `id`, `multikey` and `created` are discarded by name. Every
+   string is length-prefixed and every option tagged, so no two definitions frame alike; the format is
+   `FORMAT = 1` and a change to what is hashed or how it is framed bumps it. A collection's digest is one hash
+   over its list of `(name, hash)`, indexes sorted by `(derived id, name)` (the id is a 32-bit hash, and two
+   names can share one) and the vector configuration last under the reserved name `__vector`. The hash of each
+   shape is **pinned to the byte** by a test, and the rendering of every filter type the language accepts is
+   pinned too, because `bson`'s output is an input to the hash.
+2. **Nothing is kept.** No row, no table, no walk at open, no write-path change: the digest of a collection is
+   computed from its metadata in the read transaction of the probe. The kept state is the refusal hints (4),
+   the tracker's sets and the per-peer `detail` set, each pruned with the collections held.
+3. **One exchange, at the cut the cut digest already uses.** Every definition change carries a stamp (an
+   index's `created`, an `INDEXES_DROPPED` stamp, `vector_changed`); a collection with a stamp **above the cut**
+   (judged against the cut's component for the stamp's own origin) is in motion and is deferred, and at or
+   below the cut nothing can change what is hashed without a stamp above it. So the responder answers every
+   collection from one read transaction against the request's cut, and the requester computes its own digests
+   after the answer arrives, in one read transaction against the same cut. `AskDivergence` gains
+   `definitions: Option<DefinitionAsk { cut, detail }>` and `Divergence` gains `definitions:
+   Option<DefinitionReply>`, both optional and read leniently (a field of another shape costs the field and
+   never the frame; an entry that does not decode is dropped and counted `malformed`). The ask is made on every
+   checked contact, whether or not the count probe is gated; a request whose two cuts differ is answered
+   without definitions; **`definitions` is present in the answer iff the request carried it**; and each half
+   degrades alone (a fault in one costs that half and never the other or the contact).
+   *A deviation from the design page, v4.8:* the request does not carry the requester's own refused pairs
+   (`DefinitionAsk.refused`). The requester judges its own hints locally, in its own pinned transaction, and
+   the responder's pairs travel in the answer, so the field only repeated what both sides already hold; the
+   explanation is unchanged.
+4. **Every predicate is read through the one transaction a side opens**, never a fresh one: the
+   `INDEXES_DROPPED` range read, the collection metadata, the hints, the collection and database drop
+   tombstones, and the serve verdict. A predicate read at another moment can disagree with the digest it
+   vouches for. Each is the subject of a test that lands a commit after the transaction opened.
+5. **Why a collection is not compared, counted per collection under
+   `kimmy_sync_divergence_definition_probes_total{outcome="deferred",reason}`**, with its own enum
+   (`DefinitionDefer`) and not the cut digest's (growing that one would put reasons on its series that cannot
+   occur there): `incarnation` and `database_tombstone` (the shared rule `drop_defers`: the drop is above the
+   cut or the standing life is not newer than it, and a life that still owes ADR-231's sweep defers in both
+   halves), `definition_above_cut`, `horizon`, `error`, `malformed`. **`horizon` applies to every collection on
+   both sides**: retention collects a dropped index's tombstone, and with it the stamp that would have deferred
+   the collection, so when the cut is below what the oplog can serve no collection can be judged. A stamp
+   above the cut from an origin that never advances (a node that left the cluster) is **named** after 60
+   contacts on which the cut at its origin did not move, in one rate-limited WARN, so it is never silent.
+6. **A refusal is remembered as a hint, never a mask.** A refusal used to be a counter and a log line, and
+   nothing recorded which definition was refused. A `META` row `ddl_refused:<collection id>:<kind>:<name>`
+   holds the stamp of the refused entry, the build, and the **hash of the refused definition** (`kind` is
+   `index`, `vector` or `drop`, the opposite shape, where this member holds an index a peer dropped and could
+   not drop). It is written at the five places a refusal is counted, in a transaction of its own, and a write
+   that fails fails the batch (the entry is not witnessed and is served again). It is **re-derived at use**: a
+   hint explains a difference only while the other side's hash for the name is the one the hint stored (or,
+   for a `drop`, while this side still holds the hash it stored and the other lacks the name) and the hint's
+   stamp is above the standing life's floor; the responder applies the floor clause before it puts a pair on
+   the wire. So a build that can now apply the definition, a rollback, a restore and a recreated collection
+   cannot leave a stale row masking anything. A difference every name of which is covered is **`explained`**,
+   an outcome of its own, never `compared`, and does not move the gauge. The rows are cleared with the
+   collection (and its shadow) at its burial and with the index at its drop.
+7. **Findings.** A finding is two consecutive *compared* mismatches of a `(peer, collection)`; the tracker's
+   fourth kind feeds the gauges (`kimmy_sync_definition_divergent_collections`, and the existing
+   `kimmy_sync_divergent_collections`) and **never `confirmed_against`**, so no repair is planned from it. One
+   WARN per finding, names the differing definitions when the detail was asked for, at most 20 per peer per
+   tick and then one summary line, each logged again no sooner than ten minutes. The WARN and
+   `operations.md` tell the operator what the API can show and what it cannot: **the finding is about
+   metadata and the remedy is not** (recreating a TTL index at a shorter value deletes documents on every
+   member), and a refusal older than the member's last start leaves no counter trace and no hint.
+
+**What it cannot see.** An index or vector configuration with no stamp (created before stamps were minted)
+cannot defer a collection and cannot hide one, and ADR-231's sweep leaves it: expect it as an unexplained
+finding. A refusal from before 0.49.0 has no hint, so it reads as `unexplained`; that is the case on file
+(a member without the TTL index) and is meant to be found.
+
+**Cost, measured** (release build, 1,000 collections of three indexes each, one with a partial filter, in-process, no
+network): **the answer 9.9 ms and the comparison 7.8 ms** per contact per peer. The
+work is O(collections × indexes) of canonical JSON on each side, from metadata already decoded.
+
+**Mixed roll.** The fields are optional on both messages: a 0.48.0 member ignores the request and is counted
+`unanswered` once per contact, and is never compared. Nothing is written that an older build reads, and the
+`META` rows are unknown keys to it. Not a rollback boundary.
+
+**Verified by** a property test that the digests of two definitions under one name are equal iff `differences`
+is empty (independent pairs, and a definition against itself with one part changed); the pinned hashes; a
+test per deferral reason at each boundary of the covered rule (`<` against `<=` on the cut and on `created`);
+the pinned-transaction tests; the wire in both directions across a version boundary; the loop path through real
+members; and a mutation table (one row per validity clause of the hint, per deferral, per predicate read in a
+pinned transaction, per framing term of the hash, and for the WARN cap and the stuck count), every row of which
+is killed or argued equivalent in the pull request.

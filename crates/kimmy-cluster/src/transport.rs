@@ -2140,8 +2140,8 @@ where
     let mine = engine.witnessed_vector().map_err(|e| ProtocolError::Malformed(e.to_string()))?;
 
     // A repair planned against this peer (ADR-148) asks from below
-    // this node's position — from the divergent collection's creation,
-    // or for the peer's snapshot — where the position alone would say
+    // this node's position — from the earlier of the divergent collection's
+    // creation and its incarnation floor, or for the peer's snapshot — where the position alone would say
     // there is nothing to pull. A replay is judged against the peer's
     // horizon by the threshold it asks from rather than by the vector
     // it holds, so a floor below what the peer retains becomes the
