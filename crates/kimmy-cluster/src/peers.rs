@@ -164,6 +164,24 @@ pub struct RoundReport {
     /// Kept digest rows a self-check found disagreeing with their records and
     /// corrected, since the process started. A level; zero on a healthy node.
     pub digest_drift_total: u64,
+    /// Collections whose definition digest (B3 half 2) was compared in this tick,
+    /// equal or not. A counter, summed over the checked contacts; **not** the
+    /// ones a refusal hint explained, which are `definition_explained`.
+    pub definition_compared: usize,
+    /// Collections whose definitions differed and a valid refusal hint covered
+    /// every differing name: counted as their own outcome, never as compared, so
+    /// an operator can see refusals masking collections.
+    pub definition_explained: usize,
+    /// Checked contacts whose peer answered no definition digest: one that
+    /// predates it, or failed to compute it, or saw two different cuts.
+    pub definition_unanswered: usize,
+    /// Collections whose definitions were not compared in this tick, by reason
+    /// (`DefinitionDefer::ALL` order): none of them silent.
+    pub definition_deferred: [usize; kimmy_storage::DefinitionDefer::ALL.len()],
+    /// Collections the definition digest currently has confirmed against some
+    /// peer (B3 half 2). A level. Also counted in `divergent_collections`; this
+    /// says which half moved it.
+    pub definition_divergent_collections: usize,
     /// When the check last ran against any peer — the instant of the last
     /// contact whose round ran it; `None` before the first such contact
     /// (ADR-145, ADR-154). Carried on every tick, checked or not, so it is
@@ -722,6 +740,7 @@ pub async fn replicate(engine: Arc<Engine>, config: ReplicationConfig) {
     // What the cut digest remembers between ticks (B3): which collections a
     // self-check verified and when, and when a finding was last logged.
     let mut digest_state = DigestState::default();
+    let mut definition_state = DefinitionState::default();
     // Where each peer last stood behind this node, and for how long
     // (ADR-145): what lets the count half tell a peer that is catching up
     // from one that has stopped. Owned here for the same reason as the
@@ -988,6 +1007,12 @@ pub async fn replicate(engine: Arc<Engine>, config: ReplicationConfig) {
                 let mine_collections = engine.all_collection_ids();
                 if let Ok(held) = &mine_collections {
                     digest_state.prune(held);
+                    definition_state.begin_tick();
+                    definition_state.prune(held);
+                    stalls.retain_definition_detail(
+                        config.members.as_ref().map(|members| members.node_ids()).as_ref(),
+                        held,
+                    );
                 }
                 if let Err(e) = &mine_collections {
                     warn!(error = %e, "divergence check: could not list this node's own \
@@ -1346,6 +1371,24 @@ pub async fn replicate(engine: Arc<Engine>, config: ReplicationConfig) {
                                             &mut report,
                                         );
                                     }
+                                    // The definition digest of the same contact
+                                    // (B3 half 2): its own fold, in its own `if`,
+                                    // so that a digest round that was busy,
+                                    // unanswered or failed does not take it with
+                                    // it. Into the tracker's fourth set, which no
+                                    // repair is planned from.
+                                    if let Some(round) = outcome.definitions.take() {
+                                        fold_definition_round(
+                                            &engine,
+                                            &mut divergence,
+                                            &mut definition_state,
+                                            &mut stalls,
+                                            node,
+                                            peer,
+                                            round,
+                                            &mut report,
+                                        );
+                                    }
                                     // Detection to repair (ADR-148): what
                                     // the check has confirmed against this
                                     // peer is asked for on the next round
@@ -1554,6 +1597,7 @@ pub async fn replicate(engine: Arc<Engine>, config: ReplicationConfig) {
                 // above does, and that already ran per peer contacted.
                 report.divergent_collections = divergence.confirmed_count();
                 report.digest_divergent_collections = divergence.digest_confirmed_count();
+                report.definition_divergent_collections = divergence.definition_confirmed_count();
                 report.digest_drift_total = engine.digest_drift_total();
                 // And when that reading was last re-examined (ADR-145): the
                 // tracker keeps its last value through any number of ticks
@@ -1971,6 +2015,73 @@ fn fold_digest_round(
             report.digest_deferred[reason.index()] += 1;
         }
     }
+}
+
+/// How long a definition finding is not logged again for the same
+/// `(peer, collection)` once it has been.
+const DEFINITION_WARN_EVERY: Duration = Duration::from_secs(600);
+
+/// The most definition-finding WARNs one peer's contacts raise in one tick: a
+/// fleet with the same legacy refusal on many collections confirms them all on
+/// the second contact after a start, and a hundred lines would bury the rest.
+/// The rest are named in one summary line and WARN at their next due time.
+const DEFINITION_WARNS_PER_PEER_PER_TICK: usize = 20;
+
+/// Consecutive definition-deferred contacts, with the cut not advancing at the
+/// stamp's origin, after which the stamp is named (h2-N4).
+const DEFINITION_STUCK_AFTER: u32 = 60;
+
+/// What the loop remembers for the definition digest between ticks.
+#[derive(Default)]
+struct DefinitionState {
+    /// When each confirmed `(peer, collection)` was last logged. A key space of
+    /// its own: a definition and a digest finding on one collection must not
+    /// suppress each other.
+    warned: std::collections::HashMap<(NodeId, kimmy_core::CollectionId), Instant>,
+    /// Consecutive `definition_above_cut` contacts per `(peer, collection)` on
+    /// which the cut at the stamp's origin did not advance: the origin, the
+    /// cut's component last seen, and the count.
+    stuck: std::collections::HashMap<
+        (NodeId, kimmy_core::CollectionId),
+        (NodeId, kimmy_core::Hlc, u32),
+    >,
+    /// When a stuck stamp was last named.
+    stuck_warned: std::collections::HashMap<(NodeId, kimmy_core::CollectionId), Instant>,
+    /// WARNs raised against each peer in this tick.
+    warned_this_tick: std::collections::HashMap<NodeId, usize>,
+}
+
+impl DefinitionState {
+    /// A new tick: the per-peer WARN budget starts over.
+    fn begin_tick(&mut self) {
+        self.warned_this_tick.clear();
+    }
+
+    /// Forget what is about a collection this node no longer holds, and what has
+    /// outlived its use, so the maps do not grow.
+    fn prune(&mut self, held: &BTreeSet<kimmy_core::CollectionId>) {
+        self.warned
+            .retain(|(_, id), at| held.contains(id) && at.elapsed() < DEFINITION_WARN_EVERY * 6);
+        self.stuck.retain(|(_, id), _| held.contains(id));
+        self.stuck_warned
+            .retain(|(_, id), at| held.contains(id) && at.elapsed() < DEFINITION_WARN_EVERY * 6);
+    }
+}
+
+/// Fold one contact's definition-digest round into the tracker, the detail set
+/// and the report (B3 half 2). Independent of the cut digest's fold: neither
+/// waits on the other.
+#[allow(clippy::too_many_arguments)]
+fn fold_definition_round(
+    _engine: &Engine,
+    _tracker: &mut kimmy_storage::DivergenceTracker,
+    _state: &mut DefinitionState,
+    _stalls: &mut PeerStalls,
+    _node: NodeId,
+    _peer: SocketAddr,
+    _round: kimmy_storage::DefinitionRound,
+    _report: &mut RoundReport,
+) {
 }
 
 /// Verify a collection's kept digest row, unless it was verified unchanged
@@ -3606,21 +3717,14 @@ mod tests {
     }
 }
 
-/// The fold of a contact's cut-digest round, through the same function the loop
-/// calls, with a real engine behind the self-check.
+/// What a test of a fold logs on its thread: one global subscriber for the
+/// module's tests, so a callsite first hit by another test thread is not cached
+/// as unwanted.
 #[cfg(test)]
-mod digest_fold_tests {
+mod fold_logs {
     use std::cell::RefCell;
     use std::io::Write;
     use std::sync::Once;
-
-    use bson::doc;
-    use kimmy_core::CollectionId;
-    use kimmy_storage::{
-        Defer, DigestAnswered, DigestOutcome, DigestRound, DigestVerdict, DivergenceTracker,
-    };
-
-    use super::*;
 
     thread_local! {
         static CAPTURE: RefCell<Option<Vec<u8>>> = const { RefCell::new(None) };
@@ -3645,7 +3749,7 @@ mod digest_fold_tests {
 
     /// What `body` logs on this thread: one global subscriber, so a callsite
     /// first hit by another test thread is not cached as unwanted.
-    fn logs_of(body: impl FnOnce()) -> String {
+    pub(super) fn logs_of(body: impl FnOnce()) -> String {
         static ONCE: Once = Once::new();
         ONCE.call_once(|| {
             let subscriber =
@@ -3656,6 +3760,20 @@ mod digest_fold_tests {
         body();
         CAPTURE.with(|c| String::from_utf8(c.borrow_mut().take().unwrap_or_default()).unwrap())
     }
+}
+
+/// The fold of a contact's cut-digest round, through the same function the loop
+/// calls, with a real engine behind the self-check.
+#[cfg(test)]
+mod digest_fold_tests {
+    use bson::doc;
+    use kimmy_core::CollectionId;
+    use kimmy_storage::{
+        Defer, DigestAnswered, DigestOutcome, DigestRound, DigestVerdict, DivergenceTracker,
+    };
+
+    use super::fold_logs::logs_of;
+    use super::*;
 
     struct Fixture {
         engine: Engine,
@@ -3883,5 +4001,318 @@ mod digest_fold_tests {
             .insert(f.collection, (1, BTreeMap::new(), Instant::now() - SELF_CHECK_MEMO * 2));
         f.state.prune(&BTreeSet::from([f.collection]));
         assert!(f.state.verified.is_empty(), "an expired memo is dropped");
+    }
+}
+
+/// The fold of a contact's definition-digest round (B3 half 2), through the same
+/// function the loop calls.
+#[cfg(test)]
+mod definition_fold_tests {
+    use bson::doc;
+    use kimmy_core::{CollectionId, Hlc};
+    use kimmy_storage::{
+        DefinitionAnswered, DefinitionDefer, DefinitionOutcome, DefinitionRound, DefinitionVerdict,
+        DivergenceTracker,
+    };
+
+    use super::fold_logs::logs_of;
+    use super::*;
+
+    struct Fixture {
+        engine: Engine,
+        collection: CollectionId,
+        tracker: DivergenceTracker,
+        state: DefinitionState,
+        stalls: PeerStalls,
+        report: RoundReport,
+        node: NodeId,
+        peer: SocketAddr,
+        _dir: tempfile::TempDir,
+    }
+
+    fn fixture() -> Fixture {
+        let dir = tempfile::tempdir().unwrap();
+        let engine = Engine::open(&dir.path().join("kimmy.redb")).unwrap();
+        let coll = engine.create_collection("shop", "orders").unwrap();
+        engine.insert(&coll, doc! { "_id": 1 }).unwrap();
+        Fixture {
+            engine,
+            collection: coll.id,
+            tracker: DivergenceTracker::default(),
+            state: DefinitionState::default(),
+            stalls: PeerStalls::new(),
+            report: RoundReport::default(),
+            node: NodeId::from_bytes([3; 16]),
+            peer: "127.0.0.1:9".parse().unwrap(),
+            _dir: dir,
+        }
+    }
+
+    impl Fixture {
+        fn fold(&mut self, round: DefinitionRound) -> String {
+            let Fixture { engine, tracker, state, stalls, report, node, peer, .. } = self;
+            logs_of(|| {
+                fold_definition_round(engine, tracker, state, stalls, *node, *peer, round, report)
+            })
+        }
+
+        fn mismatch(&self, names: &[&str]) -> DefinitionRound {
+            self.round_of(DefinitionOutcome::Compared {
+                equal: false,
+                mine: 1,
+                theirs: 2,
+                differing: names.iter().map(|n| (*n).to_string()).collect(),
+            })
+        }
+
+        fn equal(&self) -> DefinitionRound {
+            self.round_of(DefinitionOutcome::Compared {
+                equal: true,
+                mine: 1,
+                theirs: 1,
+                differing: Vec::new(),
+            })
+        }
+
+        fn explained(&self, names: &[&str]) -> DefinitionRound {
+            self.round_of(DefinitionOutcome::Explained {
+                differing: names.iter().map(|n| (*n).to_string()).collect(),
+            })
+        }
+
+        fn round_of(&self, outcome: DefinitionOutcome) -> DefinitionRound {
+            let mut round = DefinitionRound::new(DefinitionAnswered::Answered);
+            round.held = 1;
+            round.verdicts.push(DefinitionVerdict {
+                collection: self.collection,
+                outcome,
+                above: None,
+            });
+            round
+        }
+    }
+
+    fn warns(logs: &str) -> usize {
+        logs.matches("the definitions of a collection differ").count()
+    }
+
+    /// Two compared mismatches are a finding: both gauges move, one WARN names
+    /// the index of the latest contact, and nothing is planned from it.
+    #[test]
+    fn a_confirmed_definition_finding_moves_both_gauges_warns_once_and_plans_nothing() {
+        let mut f = fixture();
+        let first = f.fold(f.mismatch(&[]));
+        assert_eq!(warns(&first), 0, "one mismatch is not yet a finding: {first}");
+        assert_eq!(f.tracker.definition_confirmed_count(), 0);
+        let second = f.fold(f.mismatch(&["ttl"]));
+        assert_eq!(warns(&second), 1, "{second}");
+        assert!(second.contains("WARN") && second.contains("ttl"), "names the index: {second}");
+        assert!(
+            second.contains("GET /v1/db/shop/coll/orders/indexes"),
+            "points at the comparison: {second}"
+        );
+        assert!(
+            !second.contains("kimmy_sync_ddl_refused_total"),
+            "not at a counter a pre-upgrade refusal never moved: {second}"
+        );
+        assert_eq!(f.tracker.definition_confirmed_count(), 1);
+        assert_eq!(f.tracker.confirmed_count(), 1, "the gauge both halves feed");
+        assert!(f.tracker.confirmed_against(f.node).is_empty(), "no repair is planned from it");
+        assert_eq!(f.report.definition_compared, 2);
+    }
+
+    /// An explained mismatch is its own outcome, never `compared`; it clears the
+    /// pending mismatch, and keeps the collection in the detail set, because its
+    /// digest still differs.
+    #[test]
+    fn an_explained_mismatch_is_counted_as_explained_clears_pending_and_keeps_the_detail() {
+        let mut f = fixture();
+        f.fold(f.mismatch(&[]));
+        assert!(
+            f.stalls.definition_detail(&f.node).contains(&f.collection),
+            "asks for the detail next"
+        );
+        let logs = f.fold(f.explained(&["ttl"]));
+        assert_eq!(warns(&logs), 0);
+        assert_eq!(f.report.definition_explained, 1);
+        assert_eq!(f.report.definition_compared, 1, "only the first was a comparison");
+        assert!(f.stalls.definition_detail(&f.node).contains(&f.collection), "still differs");
+        // And the pending mismatch is gone: the next mismatch is a first again.
+        let logs = f.fold(f.mismatch(&["ttl"]));
+        assert_eq!(warns(&logs), 0, "{logs}");
+        assert_eq!(f.tracker.definition_confirmed_count(), 0);
+    }
+
+    #[test]
+    fn a_match_clears_the_finding_and_the_detail() {
+        let mut f = fixture();
+        f.fold(f.mismatch(&[]));
+        f.fold(f.mismatch(&["ttl"]));
+        assert_eq!(f.tracker.definition_confirmed_count(), 1);
+        f.fold(f.equal());
+        assert_eq!(f.tracker.definition_confirmed_count(), 0);
+        assert!(f.stalls.definition_detail(&f.node).is_empty());
+    }
+
+    /// h2-N1: a fleet with the same legacy refusal on many collections confirms
+    /// them all at once. At most twenty lines per peer per tick, then one summary
+    /// line with the count and the first few names; the rest at their next due
+    /// time.
+    #[test]
+    fn a_hundred_findings_against_one_peer_in_a_tick_give_twenty_lines_and_one_summary() {
+        let mut f = fixture();
+        let many: Vec<CollectionId> = (1000..1100u64).map(CollectionId).collect();
+        let round = |outcome: &dyn Fn() -> DefinitionOutcome| {
+            let mut round = DefinitionRound::new(DefinitionAnswered::Answered);
+            round.held = many.len();
+            for id in &many {
+                round.verdicts.push(DefinitionVerdict {
+                    collection: *id,
+                    outcome: outcome(),
+                    above: None,
+                });
+            }
+            round
+        };
+        let mismatch = || DefinitionOutcome::Compared {
+            equal: false,
+            mine: 1,
+            theirs: 2,
+            differing: vec!["ttl".into()],
+        };
+        f.state.begin_tick();
+        f.fold(round(&mismatch));
+        f.state.begin_tick();
+        let logs = f.fold(round(&mismatch));
+        assert_eq!(warns(&logs), 20, "{logs}");
+        assert_eq!(logs.matches("more definition findings").count(), 1, "one summary: {logs}");
+        assert!(logs.contains("80 more"), "the count of what was held back: {logs}");
+        // The next tick gives the rest, still within the budget: none of them
+        // was logged yet, so none is waiting out the rate limit.
+        f.state.begin_tick();
+        let logs = f.fold(round(&mismatch));
+        assert_eq!(warns(&logs), 20, "the next twenty: {logs}");
+        assert_eq!(f.tracker.definition_confirmed_count(), 100);
+    }
+
+    /// A definition and a digest finding on one collection must not suppress each
+    /// other: the WARN key spaces are separate.
+    #[test]
+    fn a_definition_warn_and_a_digest_warn_on_one_collection_do_not_suppress_each_other() {
+        let mut f = fixture();
+        let mut digest_state = DigestState::default();
+        let mut definition_logs = String::new();
+        let mut digest_logs = String::new();
+        for _ in 0..2 {
+            let mut digest =
+                kimmy_storage::DigestRound::new(kimmy_storage::DigestAnswered::Answered);
+            digest.verdicts.push(kimmy_storage::DigestVerdict {
+                collection: f.collection,
+                outcome: kimmy_storage::DigestOutcome::Compared {
+                    equal: false,
+                    mine: 1,
+                    theirs: 2,
+                },
+            });
+            let Fixture { engine, tracker, report, node, peer, .. } = &mut f;
+            digest_logs.push_str(&logs_of(|| {
+                fold_digest_round(engine, tracker, &mut digest_state, *node, *peer, digest, report)
+            }));
+            definition_logs.push_str(&f.fold(f.mismatch(&["ttl"])));
+        }
+        assert_eq!(digest_logs.matches("the cut digest of a collection differs").count(), 1);
+        assert_eq!(warns(&definition_logs), 1, "{definition_logs}");
+    }
+
+    /// A confirmed finding is logged again only when it is due, not on every
+    /// contact; and the map forgets a collection that is gone.
+    #[test]
+    fn a_confirmed_finding_is_logged_once_per_interval_and_the_map_forgets_what_is_gone() {
+        let mut f = fixture();
+        f.fold(f.mismatch(&[]));
+        assert_eq!(warns(&f.fold(f.mismatch(&["ttl"]))), 1);
+        assert_eq!(warns(&f.fold(f.mismatch(&["ttl"]))), 0, "not again within the interval");
+        f.state.warned.values_mut().for_each(|at| {
+            *at = Instant::now() - DEFINITION_WARN_EVERY - Duration::from_secs(1);
+        });
+        assert_eq!(warns(&f.fold(f.mismatch(&["ttl"]))), 1, "due again");
+        f.state.prune(&BTreeSet::new());
+        assert!(f.state.warned.is_empty(), "forgotten with the collection");
+    }
+
+    #[test]
+    fn a_round_that_came_to_nothing_is_counted_for_every_collection_it_planned_over() {
+        let mut f = fixture();
+        let mut round = DefinitionRound::new(DefinitionAnswered::Failed);
+        round.held = 4;
+        f.fold(round);
+        assert_eq!(f.report.definition_deferred[DefinitionDefer::Error.index()], 4);
+        f.fold(DefinitionRound::new(DefinitionAnswered::Unanswered));
+        assert_eq!(f.report.definition_unanswered, 1);
+        let mut round = DefinitionRound::new(DefinitionAnswered::Answered);
+        round.malformed = 2;
+        f.fold(round);
+        assert_eq!(f.report.definition_deferred[DefinitionDefer::Malformed.index()], 2);
+        let mut round = f.mismatch(&[]);
+        round.verdicts[0].outcome = DefinitionOutcome::Deferred(DefinitionDefer::Horizon);
+        f.fold(round);
+        assert_eq!(f.report.definition_deferred[DefinitionDefer::Horizon.index()], 1);
+        assert_eq!(f.report.definition_compared, 0, "none of them a comparison");
+    }
+
+    fn above(origin: NodeId, cut_at: u64) -> DefinitionRound {
+        let mut round = DefinitionRound::new(DefinitionAnswered::Answered);
+        round.held = 1;
+        round.verdicts.push(DefinitionVerdict {
+            collection: CollectionId(1),
+            outcome: DefinitionOutcome::Deferred(DefinitionDefer::DefinitionAboveCut),
+            above: Some((origin, Hlc::new(cut_at, 0))),
+        });
+        round
+    }
+
+    /// h2-N4: a stamp the cut can never cover is named after sixty contacts on
+    /// which the cut at its origin did not advance; a peer that is only lagging
+    /// (the cut advances every few contacts) never reaches it.
+    #[test]
+    fn a_frozen_stamp_is_named_after_sixty_contacts_and_a_lagging_peer_never_is() {
+        let mut f = fixture();
+        let origin = NodeId::from_bytes([9; 16]);
+        let mut logs = String::new();
+        for _ in 0..59 {
+            logs.push_str(&f.fold(above(origin, 500)));
+        }
+        assert!(!logs.contains("has not advanced"), "not before sixty: {logs}");
+        logs.push_str(&f.fold(above(origin, 500)));
+        assert_eq!(logs.matches("has not advanced").count(), 1, "{logs}");
+        assert!(logs.contains(&format!("{origin}")), "names the origin: {logs}");
+        // And not again straight away.
+        assert_eq!(f.fold(above(origin, 500)).matches("has not advanced").count(), 0);
+
+        let mut lagging = fixture();
+        let mut logs = String::new();
+        for i in 0..100u64 {
+            // The cut at the origin advances every fifth contact.
+            logs.push_str(&lagging.fold(above(origin, 500 + i / 5)));
+        }
+        assert!(!logs.contains("has not advanced"), "a lagging peer: {logs}");
+    }
+
+    #[test]
+    fn a_stuck_count_ends_when_the_collection_is_compared_again() {
+        let mut f = fixture();
+        let origin = NodeId::from_bytes([9; 16]);
+        for _ in 0..59 {
+            f.fold(above(origin, 500));
+        }
+        // Compared once: the stamp is covered, the count starts over.
+        let mut round = f.equal();
+        round.verdicts[0].collection = CollectionId(1);
+        f.fold(round);
+        let mut logs = String::new();
+        for _ in 0..59 {
+            logs.push_str(&f.fold(above(origin, 500)));
+        }
+        assert!(!logs.contains("has not advanced"), "{logs}");
     }
 }
