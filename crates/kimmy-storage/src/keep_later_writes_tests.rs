@@ -796,3 +796,33 @@ fn a_chunk_whose_document_is_not_here_stays_if_made_after_the_drop_and_goes_if_n
     assert_eq!(d.get_vectors(&shadow, &DocId::Int64(8)).unwrap().len(), 1, "may still arrive");
     assert_counts_exact(&d, "undecided chunks");
 }
+
+/// The same by a snapshot page, which carries the drop with no oplog entry for a
+/// stream to end on: the first commit's notice is the only thing that tells it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_stream_open_on_the_collection_ends_when_a_snapshot_carries_the_drop() {
+    use crate::{ChangeEvent, InvalidateReason, WatchOptions, WatchScope};
+
+    let (a, d, _da, _dd, id) = a_and_d_holding_the_old_life();
+    assert!(a.drop_collection("shop", "orders").unwrap());
+    a.finish_purges_now().unwrap();
+    later();
+    let on_d = d.get_collection("shop", "orders").unwrap();
+    d.insert(&on_d, doc! { "_id": 3i64 }).unwrap();
+    let mut stream = d.watch(WatchScope::Collection(id), WatchOptions::default()).unwrap();
+    let page = a.snapshot_page(None, Some(id)).unwrap();
+    assert!(page.dropped.is_some(), "premise: the page carries the drop and no entry");
+    let before = hooks::survivors_paths();
+    d.apply_snapshot_page(a.node_id(), &mut SnapshotProgress::of_collection(id), &page).unwrap();
+    assert_eq!(hooks::survivors_paths(), before + 1, "premise: the survivors path");
+    let heard = tokio::time::timeout(Duration::from_millis(1_000), stream.next(&d))
+        .await
+        .expect("the stream hears the drop");
+    assert!(
+        matches!(
+            heard,
+            Some(ChangeEvent::Invalidate { reason: InvalidateReason::CollectionDropped })
+        ),
+        "{heard:?}"
+    );
+}
