@@ -1311,9 +1311,6 @@ impl Engine {
             .filter(|(_, dropped)| dropped.hlc <= page.versions.get(dropped.node))
             .filter(|(id, dropped)| held.get(id).is_none_or(|existing| dropped > existing))
             .collect();
-        for (_, dropped) in &database_drops {
-            self.witness(dropped);
-        }
         self.record_collection_drops(&database_drops)?;
         let held: std::collections::HashMap<CollectionId, Stamp> =
             self.collections_dropped()?.into_iter().collect();
@@ -1555,13 +1552,10 @@ impl Engine {
         state: &CollectionState,
         versions: &VersionVector,
     ) -> Result<usize> {
-        // The creation and each index's, before any of them is stored: the clock must be past what this node is about to
-        // hold, or its next local write is stamped below the incarnation it serves.
+        // The creation, before it is stored: the clock must be past the incarnation this
+        // node is about to serve, or its next local write is stamped below it.
         if let Some(created) = state.created {
             self.witness_covered_hlc(created, versions);
-        }
-        for stamp in state.indexes.iter().filter_map(|index| index.created) {
-            self.witness_covered(&stamp, versions);
         }
         if self.get_collection(&state.db, &state.name).is_err() {
             // A snapshot must not recreate a life this node has buried. The

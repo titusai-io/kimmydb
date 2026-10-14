@@ -222,6 +222,23 @@ fn a_scoped_pages_drop_moves_the_clock() {
 }
 
 #[test]
+fn a_scoped_drop_or_a_creation_the_senders_coverage_does_not_name_moves_nothing() {
+    let (a, _da) = engine();
+    let (b, _db) = engine();
+    let orders = a.create_collection("shop", "orders").unwrap();
+    transfer(&b, &a);
+    let far = Hlc::new(crate::physical_now_ms() + 86_400_000, 0);
+    let mut page = a.snapshot_page(None, Some(orders.id)).unwrap();
+    page.dropped = Some(Stamp::new(far, a.node_id()));
+    for state in &mut page.collections {
+        state.created = Some(far);
+    }
+    b.apply_snapshot_page(a.node_id(), &mut SnapshotProgress::of_collection(orders.id), &page)
+        .unwrap();
+    assert!(b.clock_last() < far, "the clock followed a time nothing vouched for");
+}
+
+#[test]
 fn a_stamp_the_senders_coverage_does_not_name_moves_nothing() {
     // ADR-163: the stamp comes off the wire. A drop the page carries that its own
     // `versions` do not name is ignored and must not drag the clock to it.
