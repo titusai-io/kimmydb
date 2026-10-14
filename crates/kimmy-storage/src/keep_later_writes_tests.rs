@@ -546,3 +546,33 @@ fn a_life_re_dated_before_the_databases_drop_is_known_does_not_outlive_it() {
         }
     }
 }
+
+// -- m-1: an interrupted drop still appends its entry -------------------------
+
+/// A drop interrupted after its first commit is delivered again, finds the life
+/// re-dated above it and is "ignored" as aimed at a life already over; the sweep
+/// continues, and the entry is appended all the same, so this member holds the
+/// drop to serve onward.
+#[test]
+fn a_drop_interrupted_after_its_first_commit_and_delivered_again_appends_its_entry() {
+    let (a, d, _da, _dd, _id) = a_and_d_holding_the_old_life();
+    assert!(a.drop_collection("shop", "orders").unwrap());
+    later();
+    let on_d = d.get_collection("shop", "orders").unwrap();
+    d.insert(&on_d, doc! { "_id": 3i64 }).unwrap();
+    let start = d.version_vector().unwrap().behind(&a.version_vector().unwrap()).unwrap();
+    let entries = a.entries_for_peer(start, BATCH, WalkScope::Background).unwrap().entries;
+    let drop = entries.iter().find(|e| e.kind == kimmy_core::OpKind::DropCollection).unwrap();
+    let interrupted = d.drop_keeping_later_writes("shop", "orders", drop.stamp, &|| {
+        Err(crate::StorageError::Stopping(crate::StopReason::Shutdown))
+    });
+    assert!(matches!(interrupted, Err(crate::StorageError::Stopping(_))));
+    assert!(d.oplog_entry(&drop.stamp).unwrap().is_none(), "premise: not appended yet");
+
+    d.apply_batch(&entries).unwrap();
+    assert!(d.oplog_entry(&drop.stamp).unwrap().is_some(), "the entry is held to serve onward");
+    let standing = d.get_collection("shop", "orders").unwrap();
+    assert_eq!(standing.incarnation_floor, Some(drop.stamp.hlc), "and the sweep finished");
+    assert_eq!(docs_of(&d, "orders", &[1, 3]), vec![3]);
+    assert_counts_exact(&d, "a redelivered interrupted drop");
+}
