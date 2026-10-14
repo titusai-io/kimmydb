@@ -2135,6 +2135,26 @@ mod tests {
         assert!(matches!(old, OldAnswer::Divergence { probe_count: Some(7), .. }), "{old:?}");
     }
 
+    /// The answer's format number crosses the wire, and an answer without one (a
+    /// build that predates it) reads as format 0, which is never this build's, so
+    /// it is deferred and never compared.
+    #[test]
+    fn the_definition_answers_format_crosses_the_wire_and_its_absence_reads_as_zero() {
+        let sent = kimmy_storage::DefinitionReply {
+            format: kimmy_storage::definition_digest::FORMAT,
+            entries: Vec::new(),
+            malformed: 0,
+        };
+        let doc = bson::serialize_to_bson(&sent).unwrap();
+        assert!(doc.as_document().unwrap().contains_key("format"), "{doc}");
+        let read: kimmy_storage::DefinitionReply = bson::deserialize_from_bson(doc).unwrap();
+        assert_eq!(read.format, kimmy_storage::definition_digest::FORMAT);
+        let without = bson::bson!({ "entries": [] });
+        let read: kimmy_storage::DefinitionReply = bson::deserialize_from_bson(without).unwrap();
+        assert_eq!(read.format, 0);
+        assert_ne!(read.format, kimmy_storage::definition_digest::FORMAT);
+    }
+
     /// B3 half 2: a definition field of another shape costs the field and never
     /// the frame, and one bad entry costs the entry, counted.
     #[tokio::test]

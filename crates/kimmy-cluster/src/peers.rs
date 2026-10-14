@@ -1008,11 +1008,9 @@ pub async fn replicate(engine: Arc<Engine>, config: ReplicationConfig) {
                 if let Ok(held) = &mine_collections {
                     digest_state.prune(held);
                     definition_state.begin_tick();
-                    definition_state.prune(held);
-                    stalls.retain_definition_detail(
-                        config.members.as_ref().map(|members| members.node_ids()).as_ref(),
-                        held,
-                    );
+                    let members = config.members.as_ref().map(|members| members.node_ids());
+                    definition_state.prune(held, members.as_ref());
+                    stalls.retain_definition_detail(members.as_ref(), held);
                 }
                 if let Err(e) = &mine_collections {
                     warn!(error = %e, "divergence check: could not list this node's own \
@@ -2059,12 +2057,21 @@ impl DefinitionState {
 
     /// Forget what is about a collection this node no longer holds, and what has
     /// outlived its use, so the maps do not grow.
-    fn prune(&mut self, held: &BTreeSet<kimmy_core::CollectionId>) {
+    /// `peers` is the members the node still has (`None` when it has no list):
+    /// what is about a peer that left goes too.
+    fn prune(
+        &mut self,
+        held: &BTreeSet<kimmy_core::CollectionId>,
+        peers: Option<&BTreeSet<NodeId>>,
+    ) {
+        let kept = |node: &NodeId, id: &kimmy_core::CollectionId| {
+            held.contains(id) && peers.is_none_or(|peers| peers.contains(node))
+        };
         self.warned
-            .retain(|(_, id), at| held.contains(id) && at.elapsed() < DEFINITION_WARN_EVERY * 6);
-        self.stuck.retain(|(_, id), _| held.contains(id));
+            .retain(|(node, id), at| kept(node, id) && at.elapsed() < DEFINITION_WARN_EVERY * 6);
+        self.stuck.retain(|(node, id), _| kept(node, id));
         self.stuck_warned
-            .retain(|(_, id), at| held.contains(id) && at.elapsed() < DEFINITION_WARN_EVERY * 6);
+            .retain(|(node, id), at| kept(node, id) && at.elapsed() < DEFINITION_WARN_EVERY * 6);
     }
 }
 
@@ -4383,7 +4390,7 @@ mod definition_fold_tests {
             *at = Instant::now() - DEFINITION_WARN_EVERY - Duration::from_secs(1);
         });
         assert_eq!(warns(&f.fold(f.mismatch(&["ttl"]))), 1, "due again");
-        f.state.prune(&BTreeSet::new());
+        f.state.prune(&BTreeSet::new(), None);
         assert!(f.state.warned.is_empty(), "forgotten with the collection");
     }
 
@@ -4461,5 +4468,45 @@ mod definition_fold_tests {
             logs.push_str(&f.fold(above(origin, 500)));
         }
         assert!(!logs.contains("has not advanced"), "{logs}");
+    }
+
+    /// A stamp from another origin starts the count over: a frozen stamp of X
+    /// followed by one of Y whose cut is lower does not inherit X's count.
+    #[test]
+    fn a_changed_origin_restarts_the_stuck_count() {
+        let mut f = fixture();
+        let (x, y) = (NodeId::from_bytes([9; 16]), NodeId::from_bytes([8; 16]));
+        for _ in 0..59 {
+            f.fold(above(x, 500));
+        }
+        let mut logs = f.fold(above(y, 400));
+        for _ in 0..58 {
+            logs.push_str(&f.fold(above(y, 400)));
+        }
+        assert!(!logs.contains("has not advanced"), "Y has counted 59 contacts: {logs}");
+        logs.push_str(&f.fold(above(y, 400)));
+        assert_eq!(logs.matches("has not advanced").count(), 1, "Y's own sixtieth: {logs}");
+        assert!(logs.contains(&format!("{y}")), "{logs}");
+    }
+
+    /// What is about a collection this node no longer holds, or a peer that left,
+    /// goes from the stuck-stamp map as from the others.
+    #[test]
+    fn the_stuck_map_is_pruned_by_collection_and_by_peer() {
+        let mut f = fixture();
+        let origin = NodeId::from_bytes([9; 16]);
+        f.fold(above(origin, 500));
+        let held = BTreeSet::from([CollectionId(1)]);
+        let members = BTreeSet::from([f.node]);
+        f.state.prune(&held, Some(&members));
+        assert_eq!(f.state.stuck.len(), 1, "held, and its peer is a member");
+        f.state.prune(&BTreeSet::new(), Some(&members));
+        assert!(f.state.stuck.is_empty(), "the collection is gone");
+        f.fold(above(origin, 500));
+        f.state.prune(&held, Some(&BTreeSet::from([NodeId::from_bytes([77; 16])])));
+        assert!(f.state.stuck.is_empty(), "the peer left");
+        f.fold(above(origin, 500));
+        f.state.prune(&held, None);
+        assert_eq!(f.state.stuck.len(), 1, "no member list: nothing to judge peers by");
     }
 }

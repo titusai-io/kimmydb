@@ -8618,6 +8618,25 @@ mod tests {
         matches!(request, Message::AskDivergence { digest: Some(_), .. })
     }
 
+    /// The per-peer detail set is pruned with the collections held and with the
+    /// members the node still has; a node with no member list prunes by
+    /// collection alone.
+    #[test]
+    fn the_definition_detail_is_pruned_by_collection_and_by_peer() {
+        let mut stalls = PeerStalls::new();
+        let (p1, p2) = (NodeId::from_bytes([1; 16]), NodeId::from_bytes([2; 16]));
+        let (c1, c2, c3) = (CollectionId(1), CollectionId(2), CollectionId(3));
+        stalls.set_definition_detail(p1, [c1, c2, c3].into_iter().collect());
+        stalls.set_definition_detail(p2, [c1].into_iter().collect());
+        stalls.retain_definition_detail(Some(&BTreeSet::from([p1])), &BTreeSet::from([c1, c2]));
+        assert_eq!(stalls.definition_detail(&p1), vec![c1, c2], "c3 is gone from p1");
+        assert!(stalls.definition_detail(&p2).is_empty(), "p2 left");
+        stalls.set_definition_detail(p2, [c1, c2].into_iter().collect());
+        stalls.retain_definition_detail(None, &BTreeSet::from([c2]));
+        assert_eq!(stalls.definition_detail(&p1), vec![c2]);
+        assert_eq!(stalls.definition_detail(&p2), vec![c2], "no member list: by collection alone");
+    }
+
     /// B3 half 2, the requester's side over the wire: asked of every peer at
     /// every checked contact, at the digest's own cut; a peer that answers none
     /// is `Unanswered` and never compared; the answer of a peer whose digest
