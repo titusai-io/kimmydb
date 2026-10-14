@@ -425,6 +425,18 @@ pub struct SnapshotProgress {
     complete: bool,
 }
 
+/// How a collection tombstone a snapshot carries reached the receiver, which
+/// decides whether the drop it records may keep the writes stamped after it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CarriedDrop {
+    /// The one collection a scoped repair is about (`page.dropped`): an explicit
+    /// drop of that collection, which keeps what was written after it.
+    OfOneCollection,
+    /// An entry of a whole-database page's list: the database's own tombstone
+    /// and its collections' are in it together, so it buries whole (ADR-229).
+    OfTheWholeList,
+}
+
 impl SnapshotProgress {
     /// A whole-database snapshot, not yet started: what a member below a
     /// peer's retention horizon pulls.
@@ -799,7 +811,7 @@ impl Engine {
             return Ok(SnapshotApplied { purge_pending: Some(id), ..Default::default() });
         }
         if let (Some(dropped), Some(id)) = (page.dropped, progress.scope) {
-            self.restore_collection_drop(id, dropped)?;
+            self.restore_collection_drop(id, dropped, CarriedDrop::OfOneCollection)?;
         }
         // The whole-database route's own denials, through the same predicate
         // the scoped one uses -- `restore_collection_drop` asks
@@ -1284,7 +1296,7 @@ impl Engine {
                 continue;
             }
             if live.contains(id) {
-                self.restore_collection_drop(*id, *dropped)?;
+                self.restore_collection_drop(*id, *dropped, CarriedDrop::OfTheWholeList)?;
                 continue;
             }
             // The receiver never held this collection, which ADR-162 notes is
@@ -1400,7 +1412,15 @@ impl Engine {
     /// ended is ignored outright, tombstone and all: the sender is simply
     /// behind, and a tombstone below the incarnation standing here says
     /// nothing that incarnation's own floor does not.
-    fn restore_collection_drop(&self, id: CollectionId, dropped: Stamp) -> Result<()> {
+    ///
+    /// Whether a write stamped after the drop is kept (ADR-231, extended) is the
+    /// caller's to say, in `how`: see [`CarriedDrop`].
+    fn restore_collection_drop(
+        &self,
+        id: CollectionId,
+        dropped: Stamp,
+        how: CarriedDrop,
+    ) -> Result<()> {
         if let Some(current) = self.collection_by_id(id)? {
             if crate::sync::aims_at_a_previous_incarnation(&current, dropped.hlc) {
                 debug!(collection = %id, "a snapshot carried a drop of a life of this collection that has already ended; ignored");
@@ -1416,10 +1436,22 @@ impl Engine {
             // them, so this node stops serving and re-seeding that copy at the
             // drop's first commit rather than at its last.
             // Writes stamped after the drop are kept, as when it arrives as an
-            // entry (ADR-231, extended).
-            if self.keep_later_writes(&current, dropped, &|| {
-                self.check_walk(crate::WalkScope::Background)
-            })? {
+            // entry (ADR-231, extended), but only for a drop the sender made of
+            // this one collection. A database's drop is never a drop that keeps
+            // (ADR-229), and a whole-database page cannot tell it from one: the
+            // database's tombstone and the tombstones of its collections come in
+            // the one list, in any order, and a collection met before the
+            // database's own tombstone is recorded would be kept. So the list
+            // never keeps, and the one-collection route does not when this
+            // member already holds the database's tombstone, whatever its stamp:
+            // a database drop buries each collection with a drop of its own, at
+            // a stamp above the database's.
+            if how == CarriedDrop::OfOneCollection
+                && self.database_dropped_at(&current.db)?.is_none()
+                && self.keep_later_writes(&current, dropped, &|| {
+                    self.check_walk(crate::WalkScope::Background)
+                })?
+            {
                 return self.record_collection_drop(id, dropped);
             }
             warn!(

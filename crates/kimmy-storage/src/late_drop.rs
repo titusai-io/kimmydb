@@ -699,6 +699,94 @@ mod tests {
         assert_counts_exact(&d, "a database drop");
     }
 
+    /// D-3. A whole-database snapshot page carries the database's drop, and the
+    /// collection tombstones a database drop writes, at the database drop's own
+    /// stamp. The snapshot route cannot tell those from explicit collection
+    /// drops, and a database survivor never keeps a write (ADR-229): the
+    /// collection is buried whole, as the entry route buries it.
+    #[test]
+    fn a_whole_database_page_buries_a_collection_holding_a_later_write() {
+        let (a, _da) = engine();
+        let (d, _dd) = engine();
+        let on_a = a.create_collection("shop", "orders").unwrap();
+        a.insert(&on_a, doc! { "_id": 1i64 }).unwrap();
+        a.create_collection("shop", "items").unwrap();
+        sync(&a, &d);
+        a.drop_database("shop").unwrap();
+        a.finish_purges_now().unwrap();
+        let on_d = d.get_collection("shop", "orders").unwrap();
+        d.insert(&on_d, doc! { "_id": 3i64 }).unwrap();
+        let page = a.snapshot_page(None, None).unwrap();
+        assert!(
+            page.dropped_collections.iter().any(|(id, _)| *id == on_a.id),
+            "premise: the page carries the collection's tombstone"
+        );
+        d.apply_snapshot_page(a.node_id(), &mut crate::SnapshotProgress::whole_database(), &page)
+            .unwrap();
+        d.finish_purges_now().unwrap();
+        assert!(d.get_collection("shop", "orders").is_err(), "buried with the database");
+        assert!(d.get_collection("shop", "items").is_err());
+        assert_counts_exact(&d, "a database drop by page");
+    }
+
+    /// D-3, the scoped route with the database's tombstone held: the collection
+    /// was buried by the database's drop, with a drop of its own above the
+    /// database's stamp, and that does not keep a later write.
+    #[test]
+    fn a_scoped_page_at_the_databases_own_stamp_buries_a_collection_holding_a_later_write() {
+        let (a, _da) = engine();
+        let (d, _dd) = engine();
+        let on_a = a.create_collection("shop", "orders").unwrap();
+        a.insert(&on_a, doc! { "_id": 1i64 }).unwrap();
+        a.create_collection("shop", "items").unwrap();
+        sync(&a, &d);
+        a.drop_database("shop").unwrap();
+        a.finish_purges_now().unwrap();
+        let on_d = d.get_collection("shop", "orders").unwrap();
+        d.insert(&on_d, doc! { "_id": 3i64 }).unwrap();
+        // D learns of the database's drop first (its tombstone), then the scoped
+        // repair of `orders` carries the collection's tombstone at the same stamp.
+        let db_drop = a.database_dropped_at("shop").unwrap().unwrap();
+        d.record_database_tombstone_for_test(kimmy_core::database_drop_id("shop"), db_drop)
+            .unwrap();
+        let page = a.snapshot_page(None, Some(on_a.id)).unwrap();
+        assert!(page.dropped.is_some_and(|at| at >= db_drop), "premise: the page carries the drop");
+        d.apply_snapshot_page(
+            a.node_id(),
+            &mut crate::SnapshotProgress::of_collection(on_a.id),
+            &page,
+        )
+        .unwrap();
+        d.finish_purges_now().unwrap();
+        assert!(d.get_collection("shop", "orders").is_err(), "buried with the database");
+    }
+
+    /// D-3, the other side: the scoped repair of a collection the sender dropped
+    /// by a drop of its own, in a database that stands, keeps what the receiver
+    /// wrote after it, as the entry route does.
+    #[test]
+    fn a_scoped_page_of_an_explicit_collection_drop_keeps_a_later_write() {
+        let (a, _da) = engine();
+        let (d, _dd) = engine();
+        let on_a = a.create_collection("shop", "orders").unwrap();
+        a.insert(&on_a, doc! { "_id": 1i64 }).unwrap();
+        sync(&a, &d);
+        assert!(a.drop_collection("shop", "orders").unwrap());
+        a.finish_purges_now().unwrap();
+        let on_d = d.get_collection("shop", "orders").unwrap();
+        d.insert(&on_d, doc! { "_id": 3i64 }).unwrap();
+        let page = a.snapshot_page(None, Some(on_a.id)).unwrap();
+        assert!(page.dropped.is_some(), "premise: the page carries the drop");
+        d.apply_snapshot_page(
+            a.node_id(),
+            &mut crate::SnapshotProgress::of_collection(on_a.id),
+            &page,
+        )
+        .unwrap();
+        assert_eq!(docs_of(&d, "shop", "orders", &[1, 3]), vec![3]);
+        assert_counts_exact(&d, "a scoped page that kept");
+    }
+
     /// A stop between two chunks of the survivors path leaves the collection
     /// as it was but for the chunks that landed, un-re-dated, and the drop
     /// applied again finishes it.
