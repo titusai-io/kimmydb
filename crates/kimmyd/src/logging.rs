@@ -2683,6 +2683,53 @@ mod tests {
     }
 
     #[test]
+    fn each_deferral_instrument_reads_the_slot_of_its_own_reason() {
+        // The instruments of `..._probes{outcome="deferred",reason}`, for the
+        // cut digest and for the definition digest, each read one slot of an
+        // array by an index written beside the name. A wrong index publishes one
+        // reason under another's name and passes the coverage test, which reads
+        // names only, so each call is held here to the slot of the reason in its
+        // own name, for every reason of both lists.
+        let source = include_str!("logging.rs");
+        let source = &source[..source.find("#[cfg(test)]").expect("a test-only item")];
+        fn camel(label: &str) -> String {
+            label
+                .split('_')
+                .map(|word| {
+                    let (first, rest) = word.split_at(1);
+                    format!("{}{rest}", first.to_uppercase())
+                })
+                .collect()
+        }
+        let call_of = |name: &str| -> String {
+            let name = format!("\"{name}\"");
+            assert_eq!(source.matches(&name).count(), 1, "{name}: one instrument");
+            let at = source.find(&name).unwrap();
+            let call = &source[at..at + source[at..].find(");").expect("the call ends")];
+            call.split_whitespace().collect()
+        };
+        for reason in kimmy_storage::Defer::ALL {
+            let name = format!("kimmy.sync.divergence_digest_probes.deferred.{}", reason.label());
+            let call = call_of(&name);
+            let slot = format!(
+                "|s|s.sync_digest_deferred[kimmy_storage::Defer::{}.index()]",
+                camel(reason.label())
+            );
+            assert!(call.ends_with(&slot), "{name} does not read the slot of its reason: {call}");
+        }
+        for reason in kimmy_storage::DefinitionDefer::ALL {
+            let name =
+                format!("kimmy.sync.divergence_definition_probes.deferred.{}", reason.label());
+            let call = call_of(&name);
+            let slot = format!(
+                "|s|s.sync_definition_deferred[kimmy_storage::DefinitionDefer::{}.index()]",
+                camel(reason.label())
+            );
+            assert!(call.ends_with(&slot), "{name} does not read the slot of its reason: {call}");
+        }
+    }
+
+    #[test]
     fn each_catching_up_instrument_reads_the_slot_of_its_own_state() {
         // The five instruments of `kimmy_catching_up{reason}` each read one slot
         // of the one-hot reading. Which slot is written beside the name, so a

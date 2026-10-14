@@ -1269,3 +1269,210 @@ fn the_cost_of_a_definition_probe_over_a_thousand_collections() {
     assert_eq!(verdicts.len(), 1_000);
     eprintln!("1,000 collections x 3 indexes: answer {answered:?}, compare {compared:?}");
 }
+
+// -- Lives, snapshots and the representation of a filter --------------------------
+
+fn purge_all(members: &[&Engine], ids: &[CollectionId]) {
+    for member in members {
+        for id in ids {
+            let _ = member.purge_dropped_collection(*id);
+        }
+    }
+}
+
+/// Compared and equal from both members' side, which is what "nothing to
+/// report" is: a deferral or a mismatch here is a defect of the check.
+fn equal_both_ways(a: &Engine, b: &Engine, id: CollectionId, what: &str) {
+    for (x, y) in [(a, b), (b, a)] {
+        let verdicts = exchange(x, y, &[id]);
+        assert_eq!(compared(&verdicts, id), Some(true), "{what}: {:?}", outcome_of(&verdicts, id));
+    }
+}
+
+/// A collection (or its database) dropped and made again, a replacement with an
+/// index, once everything has settled: the members agree, and a loss afterwards
+/// is still found, so the check has not been blinded by the new life.
+fn recreated_life_is_compared(dropping: impl Fn(&Engine), dropped_on_b: bool, what: &str) {
+    let (a, b, orders, items, _dirs) = converged();
+    let first = if dropped_on_b { &b } else { &a };
+    dropping(first);
+    purge_all(&[first], &[orders, items]);
+    sync(&a, &b);
+    purge_all(&[&a, &b], &[orders, items]);
+    later();
+    let reborn = a.create_collection("shop", "orders").unwrap();
+    a.create_index("shop", "orders", fields("x"), false, Some("x".into())).unwrap();
+    a.insert(&reborn, doc! { "_id": 2 }).unwrap();
+    for _ in 0..2 {
+        sync(&a, &b);
+    }
+    purge_all(&[&a, &b], &[orders, items]);
+    sync(&a, &b);
+    equal_both_ways(&a, &b, orders, what);
+    edit(&b, "orders", |meta| meta.indexes.clear());
+    for (x, y) in [(&a, &b), (&b, &a)] {
+        let verdicts = exchange(x, y, &[orders]);
+        assert_eq!(compared(&verdicts, orders), Some(false), "{what}, a real loss: {verdicts:?}");
+    }
+}
+
+#[test]
+fn members_agree_after_a_collection_is_dropped_and_made_again_and_a_real_loss_is_found() {
+    recreated_life_is_compared(
+        |e| {
+            e.drop_collection("shop", "orders").unwrap();
+        },
+        false,
+        "local",
+    );
+    recreated_life_is_compared(
+        |e| {
+            e.drop_collection("shop", "orders").unwrap();
+        },
+        true,
+        "on the peer",
+    );
+}
+
+#[test]
+fn members_agree_after_a_database_is_dropped_and_made_again_and_a_real_loss_is_found() {
+    recreated_life_is_compared(
+        |e| {
+            e.drop_database("shop").unwrap();
+        },
+        false,
+        "database",
+    );
+}
+
+fn transfer(into: &Engine, from: &Engine, mut progress: crate::SnapshotProgress) {
+    let mut waited = false;
+    while !progress.is_complete() {
+        let page = from.snapshot_page(progress.after().cloned(), progress.scope()).unwrap();
+        let outcome = into.apply_snapshot_page(from.node_id(), &mut progress, &page).unwrap();
+        if outcome.purge_pending.is_some() {
+            assert!(!waited, "a purge that never finishes");
+            waited = true;
+            into.finish_purges_now().unwrap();
+            continue;
+        }
+        waited = false;
+    }
+}
+
+/// A snapshot is a route a definition arrives by, and the digest is read from
+/// what it stored: a member brought up to date by a whole-database snapshot
+/// holds what the source holds, including a drop the source recorded, and a
+/// scoped snapshot of one collection puts back an index it lost.
+#[test]
+fn a_whole_database_snapshot_and_a_scoped_one_leave_the_members_agreeing() {
+    let (a, da) = engine();
+    let (b, db) = engine();
+    let _dirs = (da, db);
+    let orders = a.create_collection("shop", "orders").unwrap();
+    a.insert(&orders, doc! { "_id": 1 }).unwrap();
+    a.create_index("shop", "orders", fields("x"), false, Some("x".into())).unwrap();
+    a.create_index("shop", "orders", fields("y"), false, Some("y".into())).unwrap();
+    a.configure_vectors("shop", "orders", byo()).unwrap();
+    // The stale rejoiner holds an index the source made and then dropped.
+    b.create_collection("shop", "orders").unwrap();
+    b.create_index("shop", "orders", fields("w"), false, Some("w".into())).unwrap();
+    sync(&b, &a);
+    later();
+    a.create_index("shop", "orders", fields("w"), false, Some("w".into())).unwrap();
+    later();
+    a.drop_index("shop", "orders", "w").unwrap();
+    a.drop_index("shop", "orders", "y").unwrap();
+    transfer(&b, &a, crate::SnapshotProgress::whole_database());
+    for _ in 0..2 {
+        sync(&a, &b);
+        later();
+    }
+    equal_both_ways(&a, &b, orders.id, "after the whole-database snapshot");
+    // A silent loss, then the scoped snapshot of the collection.
+    edit(&b, "orders", |meta| meta.indexes.retain(|i| i.name != "x"));
+    let verdicts = exchange(&a, &b, &[orders.id]);
+    assert_eq!(compared(&verdicts, orders.id), Some(false), "premise: the loss is found");
+    transfer(&b, &a, crate::SnapshotProgress::of_collection(orders.id));
+    equal_both_ways(&a, &b, orders.id, "after the scoped snapshot");
+}
+
+fn filters() -> Vec<(&'static str, bson::Document)> {
+    let when = bson::DateTime::from_millis(1_700_000_000_000);
+    vec![
+        ("long", doc! { "k": { "$gt": 5_i64 } }),
+        ("date", doc! { "k": { "$gte": when } }),
+        ("nan", doc! { "k": { "$gt": f64::NAN } }),
+        ("negzero", doc! { "k": { "$gt": -0.0_f64 } }),
+        ("oid", doc! { "k": { "$gt": bson::oid::ObjectId::new() } }),
+        ("exists", doc! { "k": "str", "j": true, "a": { "$exists": true } }),
+        ("maxlong", doc! { "k": { "$gt": i64::MAX } }),
+        ("huge", doc! { "k": { "$gt": 1e300_f64 } }),
+        ("int", doc! { "k": { "$gt": 5_i32 } }),
+        ("double", doc! { "k": { "$gt": 5.0_f64 } }),
+        ("timestamp", doc! { "k": { "$gt": bson::Timestamp { time: 1, increment: 2 } } }),
+    ]
+}
+
+fn create_filtered(e: &Engine) {
+    for (name, filter) in filters() {
+        e.create_index_with(
+            "shop",
+            "orders",
+            fields(name),
+            false,
+            kimmy_core::Enforcement::Local,
+            Some(name.into()),
+            None,
+            Some(filter),
+        )
+        .unwrap_or_else(|err| panic!("{name}: {err}"));
+    }
+}
+
+/// The hash of an index is the same wherever it is computed, for every kind of
+/// value a partial filter can carry: replicated, snapshotted whole and snapshotted
+/// by collection. A filter whose hash moved on one route would be reported as a
+/// divergence between members that agree.
+#[test]
+fn filters_of_every_value_kind_hash_the_same_on_every_route() {
+    let (a, b, orders, _items, _dirs) = converged();
+    create_filtered(&a);
+    sync(&a, &b);
+    sync(&a, &b);
+    equal_both_ways(&a, &b, orders, "replicated");
+    let (whole, _dw) = engine();
+    transfer(&whole, &a, crate::SnapshotProgress::whole_database());
+    equal_both_ways(&a, &whole, orders, "whole-database snapshot");
+    let (scoped, _ds) = engine();
+    scoped.create_collection("shop", "orders").unwrap();
+    transfer(&scoped, &a, crate::SnapshotProgress::of_collection(orders));
+    // The scoped snapshot carries no entries, so the receiver's cut does not yet
+    // cover what it stored and the collection is deferred, not compared: what
+    // matters is that every stored hash is the source's and nothing is reported.
+    for (name, _) in filters() {
+        assert_eq!(hash_of(&scoped, "orders", name), hash_of(&a, "orders", name), "{name}");
+    }
+    for (x, y) in [(&a, &scoped), (&scoped, &a)] {
+        let verdicts = exchange(x, y, &[orders]);
+        assert_ne!(compared(&verdicts, orders), Some(false), "scoped snapshot: {verdicts:?}");
+    }
+}
+
+/// What a peer's entry carries hashes to what the receiver stores from it.
+#[test]
+fn the_incoming_hash_of_a_filtered_index_is_the_stored_hash() {
+    let (a, _b, _orders, _items, _dirs) = converged();
+    create_filtered(&a);
+    let entries = a.entries_for_peer(Hlc::ZERO, BATCH, WalkScope::Background).unwrap().entries;
+    let stored = a.get_collection("shop", "orders").unwrap();
+    let mut checked = 0;
+    for entry in entries.iter().filter(|e| e.kind == kimmy_core::OpKind::CreateIndex) {
+        let body: kimmy_core::IndexCreate =
+            bson::deserialize_from_slice(entry.body.as_ref().unwrap()).unwrap();
+        let held = stored.index(&body.index.name).unwrap();
+        assert_eq!(index_hash(&body.index), index_hash(held), "{}", held.name);
+        checked += 1;
+    }
+    assert_eq!(checked, filters().len());
+}

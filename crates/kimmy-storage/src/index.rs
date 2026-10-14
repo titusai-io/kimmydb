@@ -1784,6 +1784,10 @@ impl crate::Engine {
                 )
             };
 
+            // A drop is the end of the name's story, so it clears the name's hints
+            // of every kind whether or not the index was here: a hint about a
+            // definition no member keeps has nothing left to explain.
+            let hint_key = crate::definition_digest::DefinitionKey::index(name);
             let Some(index) = meta.index(name).cloned() else {
                 // Not here, but the drop still happened: the tombstone and the
                 // entry go in one transaction, as they do below, so there is no
@@ -1799,11 +1803,13 @@ impl crate::Engine {
                 }
                 if let Some(stamp) = replicated {
                     crate::Engine::record_index_drop_in_txn(&txn, meta.id, index_id, stamp)?;
+                    crate::Engine::clear_refusal_hints_for_in(&txn, meta.id, &hint_key)?;
                     txn.commit()?;
                     return Ok(Dropped { stamp: Some(stamp), removed: false, declined: None });
                 }
                 let stamp = self.next_stamp();
                 crate::Engine::record_index_drop_in_txn(&txn, meta.id, index_id, stamp)?;
+                crate::Engine::clear_refusal_hints_for_in(&txn, meta.id, &hint_key)?;
                 let entry = drop_entry(stamp)?;
                 crate::engine::append_oplog(&txn, &entry)?;
                 txn.commit()?;
@@ -1869,11 +1875,7 @@ impl crate::Engine {
             // index is gone with no record that it was dropped.
             crate::Engine::record_index_drop_in_txn(&txn, meta.id, index_id, stamp)?;
             // A hint about an index that is gone here has nothing left to explain.
-            crate::Engine::clear_refusal_hints_for_in(
-                &txn,
-                meta.id,
-                &crate::definition_digest::DefinitionKey::index(name),
-            )?;
+            crate::Engine::clear_refusal_hints_for_in(&txn, meta.id, &hint_key)?;
 
             let logged = if log {
                 let entry = drop_entry(stamp)?;

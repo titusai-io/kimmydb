@@ -532,6 +532,40 @@ fn dropping_an_index_clears_its_hints_of_every_kind() {
     assert_eq!(held_names(&b, orders.id), vec![(HintKind::Index, "keep".to_string())]);
 }
 
+/// The drop of an index this member does not hold records a tombstone and nothing
+/// else of the index, but it is still the drop of the name: the name's hints of
+/// every kind go with it, on the local path and on the replicated one, and no
+/// other name's do.
+#[test]
+fn dropping_an_index_this_member_does_not_hold_clears_its_hints_of_every_kind() {
+    // Local: a client's drop of a name this member never held.
+    let (b, _db) = engine();
+    let orders = b.create_collection("shop", "orders").unwrap();
+    both_shapes(&b, orders.id, HintKind::Index, &["ghost", "keep"]);
+    both_shapes(&b, orders.id, HintKind::DropIndex, &["ghost"]);
+    assert!(!b.drop_index("shop", "orders", "ghost").unwrap(), "premise: not held");
+    assert_eq!(held_names(&b, orders.id), vec![(HintKind::Index, "keep".to_string())]);
+
+    // Replicated: a peer's drop entry, the create it ends never having arrived.
+    let (a, _da) = engine();
+    let (c, _dc) = engine();
+    a.create_collection("shop", "orders").unwrap();
+    c.create_collection("shop", "orders").unwrap();
+    let id = CollectionId::derive("shop", "orders");
+    a.create_index("shop", "orders", field("x"), false, Some("x".into())).unwrap();
+    later();
+    a.drop_index("shop", "orders", "x").unwrap();
+    both_shapes(&c, id, HintKind::Index, &["x", "keep"]);
+    both_shapes(&c, id, HintKind::DropIndex, &["x"]);
+    let start = c.version_vector().unwrap().behind(&a.version_vector().unwrap()).unwrap();
+    let entries = a.entries_for_peer(start, 1024, WalkScope::Background).unwrap().entries;
+    let drops: Vec<_> = entries.into_iter().filter(|e| e.kind == OpKind::DropIndex).collect();
+    assert_eq!(drops.len(), 1);
+    c.apply_batch(&drops).unwrap();
+    assert!(c.get_collection("shop", "orders").unwrap().index("x").is_none(), "premise");
+    assert_eq!(held_names(&c, id), vec![(HintKind::Index, "keep".to_string())]);
+}
+
 /// A create of the definition here (a client's, a peer's entry, a snapshot's) is
 /// the fix of the refusal: its hints, of either shape, go in the transaction that
 /// stores it, and an index of another name keeps its own.

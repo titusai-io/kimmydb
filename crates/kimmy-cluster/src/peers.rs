@@ -4514,16 +4514,98 @@ mod definition_fold_tests {
     /// state and the per-peer detail set by them and by the members it still
     /// has. A textual guard, as the repo keeps for a place a contact must call
     /// something: a refactor that drops either call leaves both maps growing with
-    /// every peer removed and every collection dropped.
+    /// every peer removed and every collection dropped. The text is read without
+    /// its comments, and each call must stand directly in the tick's
+    /// `if let Ok(held)` block, not in a branch inside it that may never run.
     #[test]
     fn the_tick_prunes_the_definition_state_and_the_detail_set() {
         let source = include_str!("peers.rs");
         let production = source.split("\n#[cfg(test)]").next().unwrap();
+        let code = tick_calls_guard::without_comments(production);
+        let block = tick_calls_guard::block_after(&code, "if let Ok(held) = &mine_collections {");
+        let direct = tick_calls_guard::at_depth_one(&block);
         for call in [
             "definition_state.prune(held, members.as_ref())",
             "stalls.retain_definition_detail(members.as_ref(), held)",
         ] {
-            assert_eq!(production.matches(call).count(), 1, "{call}");
+            assert_eq!(code.matches(call).count(), 1, "{call}: once in the code");
+            assert_eq!(direct.matches(call).count(), 1, "{call}: directly in the held block");
+        }
+    }
+
+    /// The text handling of the guard above, with a test of its own so the guard
+    /// is known to see what it claims to.
+    mod tick_calls_guard {
+        /// Line comments and block comments removed, so a call that is only
+        /// written in one is not counted.
+        pub(super) fn without_comments(source: &str) -> String {
+            let mut out = String::new();
+            let mut rest = source;
+            while !rest.is_empty() {
+                if let Some(tail) = rest.strip_prefix("//") {
+                    rest = tail.find('\n').map_or("", |n| &tail[n..]);
+                } else if let Some(tail) = rest.strip_prefix("/*") {
+                    rest = tail.find("*/").map_or("", |n| &tail[n + 2..]);
+                } else {
+                    let c = rest.chars().next().unwrap();
+                    out.push(c);
+                    rest = &rest[c.len_utf8()..];
+                }
+            }
+            out
+        }
+
+        /// The text between the braces of the block `opening` ends with.
+        pub(super) fn block_after(code: &str, opening: &str) -> String {
+            assert_eq!(code.matches(opening).count(), 1, "{opening}: the one block");
+            let start = code.find(opening).unwrap() + opening.len();
+            let mut depth = 1usize;
+            for (at, c) in code[start..].char_indices() {
+                match c {
+                    '{' => depth += 1,
+                    '}' => {
+                        depth -= 1;
+                        if depth == 0 {
+                            return code[start..start + at].to_string();
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            panic!("{opening}: the block does not close");
+        }
+
+        /// A block's own statements: whatever sits inside a nested brace pair
+        /// (a branch, a loop, a closure) is left out.
+        pub(super) fn at_depth_one(block: &str) -> String {
+            let mut depth = 0usize;
+            let mut out = String::new();
+            for c in block.chars() {
+                match c {
+                    '{' => depth += 1,
+                    '}' => depth -= 1,
+                    _ if depth == 0 => out.push(c),
+                    _ => {}
+                }
+            }
+            out
+        }
+
+        #[test]
+        fn a_call_in_a_comment_or_under_a_branch_is_not_a_call() {
+            let call = "definition_state.prune(held)";
+            let commented =
+                format!("if let Ok(held) = &x {{\n // {call};\n /* {call} */ other();\n}}");
+            let code = without_comments(&commented);
+            let block = block_after(&code, "if let Ok(held) = &x {");
+            assert_eq!(at_depth_one(&block).matches(call).count(), 0, "commented out");
+            let branched = format!("if let Ok(held) = &x {{\n if false {{ {call}; }}\n}}");
+            let code = without_comments(&branched);
+            let block = block_after(&code, "if let Ok(held) = &x {");
+            assert_eq!(at_depth_one(&block).matches(call).count(), 0, "under a branch");
+            let live = format!("if let Ok(held) = &x {{\n {call};\n}}");
+            let block = block_after(&without_comments(&live), "if let Ok(held) = &x {");
+            assert_eq!(at_depth_one(&block).matches(call).count(), 1, "a live call is seen");
         }
     }
 }
