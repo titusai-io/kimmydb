@@ -1759,10 +1759,22 @@ mod tests {
         );
         // B's client creates it: told it exists.
         let before_stamp = inherited.indexes[0].created;
+        let mut live = b.subscribe();
         let answered = b.create_index("shop", "orders", by_from(), false, Some("by_from".into()));
         assert_eq!(answered.unwrap().name, "by_from");
         let after = b.get_collection("shop", "orders").unwrap();
         assert!(after.indexes[0].created > before_stamp, "re-stamped under B's writer");
+        // The new creation reaches the live tail (change streams and the like) as
+        // any creation does, and not only the oplog.
+        let mut published = Vec::new();
+        while let Ok(entry) = live.try_recv() {
+            published.push((entry.kind, entry.stamp));
+        }
+        assert_eq!(
+            published,
+            vec![(kimmy_core::OpKind::CreateIndex, after.indexes[0].created.unwrap())],
+            "one CreateIndex, at the new stamp"
+        );
         // And the drop arrives.
         b.apply_batch(rest).unwrap();
         quiesce(&[&a, &b, &c]);
@@ -1779,6 +1791,48 @@ mod tests {
             }
         }
         assert_eq!(docs_of(&b, "shop", "orders", &[1, 2]), vec![2]);
+    }
+
+    /// f-2, the other half of its guard: it is a *local* create that re-stamps.
+    /// A replicated identical create over the same inherited definition, from a
+    /// member that made it later, only merges the stamp forward: this member mints
+    /// nothing and appends the arriving entry, or every receiver would answer a
+    /// peer's entry with one of its own, and those with another, for ever.
+    #[test]
+    fn a_replicated_identical_create_over_an_inherited_index_mints_nothing() {
+        let (a, da) = engine();
+        let (b, db) = engine();
+        let (c, dc) = engine();
+        let _dirs = (da, db, dc);
+        a.create_collection("shop", "orders").unwrap();
+        a.create_index("shop", "orders", by_from(), false, Some("by_from".into())).unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(5));
+        // B's life began after A's index was stamped, and takes it as it is.
+        b.create_collection("shop", "orders").unwrap();
+        let start = b.version_vector().unwrap().behind(&a.version_vector().unwrap()).unwrap();
+        let entries = a.entries_for_peer(start, BATCH, WalkScope::Background).unwrap().entries;
+        let index_entry =
+            entries.iter().find(|e| e.kind == kimmy_core::OpKind::CreateIndex).unwrap();
+        b.apply_batch(std::slice::from_ref(index_entry)).unwrap();
+        let held = b.get_collection("shop", "orders").unwrap();
+        assert!(held.indexes[0].created.unwrap().hlc < held.created, "premise: inherited");
+        // C made the same index later still.
+        std::thread::sleep(std::time::Duration::from_millis(5));
+        c.create_collection("shop", "orders").unwrap();
+        let newer = c
+            .create_index("shop", "orders", by_from(), false, Some("by_from".into()))
+            .unwrap()
+            .created
+            .unwrap();
+        assert!(newer.hlc > held.indexes[0].created.unwrap().hlc, "premise: later");
+        let start = b.version_vector().unwrap().behind(&c.version_vector().unwrap()).unwrap();
+        let from_c = c.entries_for_peer(start, BATCH, WalkScope::Background).unwrap().entries;
+        let own = |e: &Engine| e.version_vector().unwrap().get(e.node_id());
+        let before = own(&b);
+        b.apply_batch(&from_c).unwrap();
+        assert_eq!(own(&b), before, "B minted an entry of its own for a peer's creation");
+        let merged = b.get_collection("shop", "orders").unwrap();
+        assert_eq!(merged.indexes[0].created, Some(newer), "the stamp merges forward");
     }
 
     /// f-2, narrowly: an identical create over an index stamped at or above the

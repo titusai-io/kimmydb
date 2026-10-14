@@ -1226,6 +1226,14 @@ impl crate::Engine {
                             crate::engine::append_oplog(&txn, &entry)?;
                             txn.commit()?;
                             self.publish(vec![entry]);
+                            tracing::info!(
+                                db,
+                                collection,
+                                index = %restamped.name,
+                                unique = restamped.unique,
+                                "created index again: it was inherited from before this life of the \
+                                 collection and would have gone with the drop of that life"
+                            );
                             return Ok((IndexCreated::Standing(existing), Vec::new()));
                         }
                         let merged = match (origin, existing.created, index.created) {

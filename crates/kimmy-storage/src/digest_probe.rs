@@ -1460,12 +1460,6 @@ mod tests {
         }
     }
 
-    /// The boundaries of the covered-drop rule, at the collection tombstone's
-    /// own site (the database tombstone's are pinned below): a drop whose
-    /// `hlc` equals the standing collection's `created` is not newer than it,
-    /// and one the standing life predates, covered or not, defers; a drop whose
-    /// `hlc` equals the cut's component for its origin is covered, and one
-    /// above it is not.
     /// h2-N5. A covered drop does not make a life comparable while the life owes
     /// ADR-231's sweep for it: created above the drop and floored below it, it
     /// still holds what the life before put in it. The floor at the drop (the
@@ -1515,6 +1509,12 @@ mod tests {
         }
     }
 
+    /// The boundaries of the covered-drop rule, at the collection tombstone's
+    /// own site (the database tombstone's are pinned below): a drop whose
+    /// `hlc` equals the standing collection's `created` is not newer than it,
+    /// and one the standing life predates, covered or not, defers; a drop whose
+    /// `hlc` equals the cut's component for its origin is covered, and one
+    /// above it is not.
     #[test]
     fn the_collection_tombstones_boundaries_are_pinned() {
         let (a, b, orders, _items, _dirs) = converged();
@@ -1567,6 +1567,10 @@ mod tests {
         let verdicts = exchange(&e, &f, None);
         assert_eq!(compared(&verdicts, fresh.id), Some(true), "a drop at the cut: {verdicts:?}");
         e.record_collection_drop(fresh.id, Stamp::new(Hlc::new(at.wall_ms + 1, 0), origin))
+            .unwrap();
+        // Swept too, so that what defers it is the cut and not the sweep it owes
+        // (h2-N5 has its own test): the drop is one above the cut component.
+        e.sweep_late_drop("shop", "fresh", Stamp::new(Hlc::new(at.wall_ms + 1, 0), origin))
             .unwrap();
         let verdicts = exchange(&e, &f, None);
         assert_eq!(
