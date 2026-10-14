@@ -1,0 +1,7 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc 482d9c6915c9d18e0d96d16cceccb516bf20df3fa43ccf040d614d03f268ea49 # shrinks to a = IndexMeta { id: 4245442695, name: "x", fields: [IndexField { path: "a", descending: false }], unique: false, enforcement: Local, multikey: false, expire_after_secs: None, partial_filter: None, created: None }, b = IndexMeta { id: 4245442695, name: "x", fields: [IndexField { path: "a", descending: false }], unique: false, enforcement: Local, multikey: false, expire_after_secs: None, partial_filter: Some(Document({})), created: None }

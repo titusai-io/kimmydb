@@ -10051,3 +10051,212 @@ async fn three_members_after_a_drop(first: Option<char>) {
         l.abort();
     }
 }
+
+// -- The definition digest, through the real exchange (B3 half 2) ------------------------
+
+/// Two converged nodes holding `shop.orders` with the index `by_a`, and the
+/// collection's id.
+async fn two_nodes_with_an_index() -> (Node, Node, kimmy_core::CollectionId) {
+    let a = node().await;
+    let b = node().await;
+    let orders = a.engine.create_collection("shop", "orders").unwrap();
+    a.engine
+        .create_index("shop", "orders", vec![kimmy_core::IndexField::ascending("a")], false, None)
+        .unwrap();
+    a.engine.insert(&orders, doc! { "_id": 1 }).unwrap();
+    sync(&a, &b).await;
+    sync(&a, &b).await;
+    (a, b, orders.id)
+}
+
+fn definition_outcome(
+    outcome: &kimmy_storage::SyncOutcome,
+    id: kimmy_core::CollectionId,
+) -> Option<kimmy_storage::DefinitionOutcome> {
+    outcome
+        .definitions
+        .as_ref()?
+        .verdicts
+        .iter()
+        .find(|v| v.collection == id)
+        .map(|v| v.outcome.clone())
+}
+
+/// Every checked contact asks for the definition digest, and two members that
+/// hold the same definitions compare equal.
+#[tokio::test]
+async fn a_checked_contact_compares_the_definitions_of_converged_members() {
+    use kimmy_cluster::{PeerStalls, sync_once_with};
+    let (a, b, orders) = two_nodes_with_an_index().await;
+    let mut stalls = PeerStalls::new();
+    let outcome = sync_once_with(&a.engine, b.addr, SECRET, None, &mut stalls).await.unwrap();
+    let round = outcome.definitions.as_ref().expect("the contact asked");
+    assert_eq!(round.answered, kimmy_storage::DefinitionAnswered::Answered);
+    assert!(
+        matches!(
+            definition_outcome(&outcome, orders),
+            Some(kimmy_storage::DefinitionOutcome::Compared { equal: true, .. })
+        ),
+        "{:?}",
+        round.verdicts
+    );
+}
+
+/// A difference the replication did not make is a mismatch, and the next contact,
+/// asked for the detail, names the index; a refusal hint on the member that
+/// lacks it explains it, as its own outcome.
+#[tokio::test]
+async fn a_covered_difference_is_found_named_and_explained_by_a_hint() {
+    use kimmy_cluster::{PeerStalls, sync_once_with};
+    let (a, b, orders) = two_nodes_with_an_index().await;
+    b.engine.lose_an_index_silently_for_test("shop", "orders", "a_1").unwrap();
+    let mut stalls = PeerStalls::new();
+    let outcome = sync_once_with(&a.engine, b.addr, SECRET, None, &mut stalls).await.unwrap();
+    match definition_outcome(&outcome, orders) {
+        Some(kimmy_storage::DefinitionOutcome::Compared { equal: false, differing, .. }) => {
+            assert!(differing.is_empty(), "asked for no detail the first time: {differing:?}");
+        }
+        other => panic!("expected a mismatch, got {other:?}"),
+    }
+    stalls.set_definition_detail(b.engine.node_id(), [orders].into_iter().collect());
+    let outcome = sync_once_with(&a.engine, b.addr, SECRET, None, &mut stalls).await.unwrap();
+    match definition_outcome(&outcome, orders) {
+        Some(kimmy_storage::DefinitionOutcome::Compared { equal: false, differing, .. }) => {
+            assert_eq!(differing, vec![kimmy_storage::DefinitionKey::index("a_1")]);
+        }
+        other => panic!("expected a mismatch with its name, got {other:?}"),
+    }
+    // B refused it, and says so: A (the requester) reads B's raw pair and judges
+    // it against both lists.
+    let held = a.engine.get_collection("shop", "orders").unwrap();
+    let index = held.index("a_1").unwrap();
+    let stamp = index.created.unwrap();
+    let hash = kimmy_storage::definition_digest::index_hash(index);
+    b.engine
+        .record_refusal_hint(&kimmy_storage::RefusalHint::new(
+            orders,
+            kimmy_storage::HintKind::Index,
+            "a_1",
+            stamp,
+            hash,
+        ))
+        .unwrap();
+    let outcome = sync_once_with(&a.engine, b.addr, SECRET, None, &mut stalls).await.unwrap();
+    assert!(
+        matches!(
+            definition_outcome(&outcome, orders),
+            Some(kimmy_storage::DefinitionOutcome::Explained { .. })
+        ),
+        "{:?}",
+        outcome.definitions
+    );
+}
+
+/// The two halves are independent over the wire: a fault of the definition
+/// probe on this side costs it and not the cut digest or the contact; a fault of
+/// the digest's costs it and not the definitions.
+#[tokio::test]
+async fn a_fault_of_one_half_costs_that_half_and_not_the_other_nor_the_contact() {
+    use kimmy_cluster::{PeerStalls, sync_once_with};
+    use kimmy_storage::{DefinitionAnswered, DigestAnswered};
+    let (a, b, orders) = two_nodes_with_an_index().await;
+    let mut stalls = PeerStalls::new();
+    // Teach the requester that the peer answers digests, so the digest is planned.
+    sync_once_with(&a.engine, b.addr, SECRET, None, &mut stalls).await.unwrap();
+
+    a.engine.fail_definition_probe_in_for_test(1);
+    let outcome = sync_once_with(&a.engine, b.addr, SECRET, None, &mut stalls).await.unwrap();
+    assert_eq!(outcome.definitions.as_ref().unwrap().answered, DefinitionAnswered::Failed);
+    assert_eq!(outcome.digest.as_ref().unwrap().answered, DigestAnswered::Answered);
+    assert!(outcome.divergent.is_some(), "the contact's own findings stand");
+
+    a.engine.fail_digest_probe_in_for_test(1);
+    let outcome = sync_once_with(&a.engine, b.addr, SECRET, None, &mut stalls).await.unwrap();
+    assert_eq!(outcome.digest.as_ref().unwrap().answered, DigestAnswered::Failed);
+    assert_eq!(outcome.definitions.as_ref().unwrap().answered, DefinitionAnswered::Answered);
+    assert!(
+        matches!(
+            definition_outcome(&outcome, orders),
+            Some(kimmy_storage::DefinitionOutcome::Compared { equal: true, .. })
+        ),
+        "the definitions were still compared: {:?}",
+        outcome.definitions
+    );
+}
+
+/// Through the real loops: a definition difference the replication did not make
+/// is a finding on both gauges, found on two consecutive compared contacts, and
+/// plans no repair (detect only).
+#[tokio::test]
+async fn the_loop_confirms_a_definition_finding_on_both_gauges_and_repairs_nothing() {
+    use kimmy_cluster::{ReplicationConfig, RoundReport, SeedSource, replicate};
+    let (a, b, _orders) = two_nodes_with_an_index().await;
+    b.engine.lose_an_index_silently_for_test("shop", "orders", "a_1").unwrap();
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<(usize, RoundReport)>();
+    let nodes = [&a, &b];
+    let mut loops = Vec::new();
+    for (i, me) in nodes.iter().enumerate() {
+        let seeds: Vec<_> =
+            nodes.iter().enumerate().filter(|(j, _)| *j != i).map(|(_, n)| n.addr).collect();
+        let mut config =
+            ReplicationConfig::new(vec![SeedSource::Static(seeds)], SECRET.into(), me.addr);
+        config.sync_interval = Duration::from_millis(100);
+        config.discovery_interval = Duration::from_millis(100);
+        let tx = tx.clone();
+        config.on_round = Some(Arc::new(move |report| {
+            let _ = tx.send((i, report));
+        }));
+        loops.push(tokio::spawn(replicate(Arc::clone(&me.engine), config)));
+    }
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+    let mut found = [false; 2];
+    let mut repairs = 0usize;
+    loop {
+        let heard = tokio::time::timeout_at(deadline, rx.recv()).await;
+        let Ok(Some((i, report))) = heard else {
+            panic!("no definition finding by the deadline: {found:?}");
+        };
+        repairs += report.repair_rounds;
+        if report.definition_divergent_collections == 1 && report.divergent_collections == 1 {
+            found[i] = true;
+        }
+        if found == [true, true] {
+            break;
+        }
+    }
+    assert_eq!(repairs, 0, "a definition finding plans nothing");
+    for l in loops {
+        l.abort();
+    }
+}
+
+/// A fault of the definition probe on the **responder** costs the answer's
+/// definitions and nothing else: the requester reads a peer that did not answer
+/// them, the digest's half answers, the contact stands, and the next contact
+/// compares again.
+#[tokio::test]
+async fn a_fault_answering_the_definitions_costs_the_definitions_and_not_the_contact() {
+    use kimmy_cluster::{PeerStalls, sync_once_with};
+    use kimmy_storage::{DefinitionAnswered, DigestAnswered};
+    let (a, b, orders) = two_nodes_with_an_index().await;
+    let mut stalls = PeerStalls::new();
+    sync_once_with(&a.engine, b.addr, SECRET, None, &mut stalls).await.unwrap();
+
+    b.engine.fail_definition_probe_in_for_test(1);
+    let outcome = sync_once_with(&a.engine, b.addr, SECRET, None, &mut stalls)
+        .await
+        .expect("a fault answering definitions must not fail the contact");
+    assert_eq!(outcome.definitions.as_ref().unwrap().answered, DefinitionAnswered::Unanswered);
+    assert_eq!(outcome.digest.as_ref().unwrap().answered, DigestAnswered::Answered);
+    assert!(outcome.divergent.is_some(), "the contact's own findings stand");
+
+    let outcome = sync_once_with(&a.engine, b.addr, SECRET, None, &mut stalls).await.unwrap();
+    assert!(
+        matches!(
+            definition_outcome(&outcome, orders),
+            Some(kimmy_storage::DefinitionOutcome::Compared { equal: true, .. })
+        ),
+        "the next contact compares: {:?}",
+        outcome.definitions
+    );
+}

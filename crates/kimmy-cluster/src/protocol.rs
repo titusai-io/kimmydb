@@ -108,6 +108,22 @@ fn lenient_digest_reply<'de, D: serde::Deserializer<'de>>(
     Ok(raw.and_then(|raw| bson::deserialize_from_bson(raw).ok()))
 }
 
+/// A definition request, read leniently (B3 half 2), as the digest's is.
+fn lenient_definition_ask<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<Option<kimmy_storage::DefinitionAsk>, D::Error> {
+    let raw = Option::<bson::Bson>::deserialize(deserializer)?;
+    Ok(raw.and_then(|raw| bson::deserialize_from_bson(raw).ok()))
+}
+
+/// A definition answer, read leniently, as the request is.
+fn lenient_definition_reply<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<Option<kimmy_storage::DefinitionReply>, D::Error> {
+    let raw = Option::<bson::Bson>::deserialize(deserializer)?;
+    Ok(raw.and_then(|raw| bson::deserialize_from_bson(raw).ok()))
+}
+
 /// An echo, read leniently: one that does not decode is none, which reads as a
 /// peer that does not echo.
 fn lenient_echo<'de, D: serde::Deserializer<'de>>(
@@ -408,6 +424,17 @@ pub enum Message {
             deserialize_with = "lenient_digest_ask"
         )]
         digest: Option<kimmy_storage::DigestAsk>,
+        /// The definition digest (B3 half 2) asked as well: the same cut the
+        /// digest carries, and the collections whose per-index detail the
+        /// requester wants. Optional on the wire and read leniently, so an
+        /// answering peer that predates it ignores it, and a field of another
+        /// shape costs the field and never the frame.
+        #[serde(
+            default,
+            skip_serializing_if = "Option::is_none",
+            deserialize_with = "lenient_definition_ask"
+        )]
+        definitions: Option<kimmy_storage::DefinitionAsk>,
     },
     /// The answer: every collection id this node currently holds, across
     /// every database, and the live document count of `probe` if this node
@@ -453,6 +480,16 @@ pub enum Message {
         /// predates the digest sends.
         #[serde(default, skip_serializing_if = "std::ops::Not::not")]
         digest_busy: bool,
+        /// The definition digests (B3 half 2): **present iff the request carried
+        /// `definitions`** (possibly with no entries), absent otherwise, so an
+        /// answer to an older requester is byte for byte what it was and an
+        /// empty answer is never read as a peer that predates the digest.
+        #[serde(
+            default,
+            skip_serializing_if = "Option::is_none",
+            deserialize_with = "lenient_definition_reply"
+        )]
+        definitions: Option<kimmy_storage::DefinitionReply>,
     },
     /// "What have you processed?"
     ///
@@ -924,8 +961,12 @@ mod tests {
             },
             Message::Hello { node: NodeId::generate(), nonce: vec![1, 2, 3] },
             Message::Confirm { proof: vec![9, 9] },
-            Message::AskDivergence { probe: Some(CollectionId(42)), digest: None },
-            Message::AskDivergence { probe: None, digest: None },
+            Message::AskDivergence {
+                probe: Some(CollectionId(42)),
+                digest: None,
+                definitions: None,
+            },
+            Message::AskDivergence { probe: None, digest: None, definitions: None },
             Message::AskSnapshot { after: None, collection: None },
             // The unencodable half of the id space, and a cursor: the shape
             // every scoped repair of such a collection sends.
@@ -949,6 +990,7 @@ mod tests {
                 ],
                 digests: None,
                 digest_busy: false,
+                definitions: None,
             },
             Message::Divergence {
                 collections: Vec::new(),
@@ -956,6 +998,7 @@ mod tests {
                 incarnations: Vec::new(),
                 digests: None,
                 digest_busy: false,
+                definitions: None,
             },
             Message::AskWitnessed {},
             Message::Witnessed(populated_vector()),
@@ -1803,6 +1846,7 @@ mod tests {
             incarnations: Vec::new(),
             digests: None,
             digest_busy: false,
+            definitions: None,
         };
 
         let old_answer =
@@ -1831,6 +1875,7 @@ mod tests {
             incarnations: vec![(CollectionId(1), Hlc::new(9, 2))],
             digests: None,
             digest_busy: false,
+            definitions: None,
         };
         write_frame(&mut written, &held).await.unwrap();
         let body = bson::deserialize_from_slice::<bson::Document>(&written[4..]).unwrap();
@@ -1869,7 +1914,11 @@ mod tests {
         let old_request = frame(bson::doc! { "AskDivergence": { "probe": 7i64 } });
         assert_eq!(
             read_frame(&mut old_request.as_slice()).await.unwrap(),
-            Message::AskDivergence { probe: Some(CollectionId(7)), digest: None }
+            Message::AskDivergence {
+                probe: Some(CollectionId(7)),
+                digest: None,
+                definitions: None
+            }
         );
 
         // And the request this build sends with nothing to ask is exactly that
@@ -1877,7 +1926,11 @@ mod tests {
         let mut written = Vec::new();
         write_frame(
             &mut written,
-            &Message::AskDivergence { probe: Some(CollectionId(7)), digest: None },
+            &Message::AskDivergence {
+                probe: Some(CollectionId(7)),
+                digest: None,
+                definitions: None,
+            },
         )
         .await
         .unwrap();
@@ -1887,7 +1940,8 @@ mod tests {
         // A request that carries one round-trips, and an older responder, which
         // reads only `probe`, ignores the rest of it (derived struct variants
         // without `deny_unknown_fields`).
-        let asked = Message::AskDivergence { probe: None, digest: Some(ask.clone()) };
+        let asked =
+            Message::AskDivergence { probe: None, digest: Some(ask.clone()), definitions: None };
         let mut written = Vec::new();
         write_frame(&mut written, &asked).await.unwrap();
         assert_eq!(read_frame(&mut written.as_slice()).await.unwrap(), asked);
@@ -1935,6 +1989,7 @@ mod tests {
             incarnations: Vec::new(),
             digests: Some(reply.clone()),
             digest_busy: false,
+            definitions: None,
         };
         let mut written = Vec::new();
         write_frame(&mut written, &answered).await.unwrap();
@@ -1946,6 +2001,219 @@ mod tests {
         }
         let old: OldAnswer = bson::deserialize_from_slice(&written[4..]).expect("an older reader");
         assert!(matches!(old, OldAnswer::Divergence { probe_count: Some(7), .. }), "{old:?}");
+    }
+
+    /// B3 half 2: the definition digest crosses the version line in both
+    /// directions, for the request and for the answer. The answer's field is
+    /// present iff the request carried one, so an answer to an older requester is
+    /// byte for byte what it was, and an empty answer is never read as a build
+    /// that predates the field.
+    #[tokio::test]
+    async fn the_definition_fields_cross_a_version_boundary_in_both_directions() {
+        let frame = |body: bson::Document| {
+            let bytes = bson::serialize_to_vec(&body).unwrap();
+            let mut buffer = Vec::new();
+            buffer.extend_from_slice(&(bytes.len() as u32).to_be_bytes());
+            buffer.extend_from_slice(&bytes);
+            buffer
+        };
+        // A request from a build before the field reads as none asked.
+        let old_request = frame(bson::doc! { "AskDivergence": { "probe": 7i64 } });
+        assert_eq!(
+            read_frame(&mut old_request.as_slice()).await.unwrap(),
+            Message::AskDivergence {
+                probe: Some(CollectionId(7)),
+                digest: None,
+                definitions: None
+            }
+        );
+        // A request that carries one round-trips, and an older responder, which
+        // reads only `probe`, ignores it.
+        let ask = kimmy_storage::DefinitionAsk::new(
+            VersionVector::new(),
+            [CollectionId(3), CollectionId(1)],
+        );
+        let asked = Message::AskDivergence {
+            probe: Some(CollectionId(7)),
+            digest: None,
+            definitions: Some(ask.clone()),
+        };
+        let mut written = Vec::new();
+        write_frame(&mut written, &asked).await.unwrap();
+        assert_eq!(read_frame(&mut written.as_slice()).await.unwrap(), asked);
+        #[derive(serde::Deserialize, Debug)]
+        enum Old {
+            AskDivergence { probe: Option<CollectionId> },
+        }
+        let old: Old = bson::deserialize_from_slice(&written[4..]).expect("an older reader");
+        assert!(matches!(old, Old::AskDivergence { probe: Some(CollectionId(7)) }), "{old:?}");
+        // And when it is not asked, the key is not on the wire at all.
+        let mut written = Vec::new();
+        write_frame(
+            &mut written,
+            &Message::AskDivergence { probe: None, digest: None, definitions: None },
+        )
+        .await
+        .unwrap();
+        let body = bson::deserialize_from_slice::<bson::Document>(&written[4..]).unwrap();
+        assert!(!body.get_document("AskDivergence").unwrap().contains_key("definitions"));
+
+        // An answer with none, to a requester that asked for none: no key.
+        let mut written = Vec::new();
+        let plain = Message::Divergence {
+            collections: vec![CollectionId(1)],
+            probe_count: Some(7),
+            incarnations: Vec::new(),
+            digests: None,
+            digest_busy: false,
+            definitions: None,
+        };
+        write_frame(&mut written, &plain).await.unwrap();
+        let body = bson::deserialize_from_slice::<bson::Document>(&written[4..]).unwrap();
+        assert!(!body.get_document("Divergence").unwrap().contains_key("definitions"));
+        // An answer from a build before the field: no key, read as none.
+        let Message::Divergence { definitions, .. } =
+            read_frame(&mut written.as_slice()).await.unwrap()
+        else {
+            panic!("a Divergence")
+        };
+        assert_eq!(definitions, None, "a peer that predates it");
+        // An answer that is present and empty is present, not absent.
+        let empty = Message::Divergence {
+            collections: Vec::new(),
+            probe_count: None,
+            incarnations: Vec::new(),
+            digests: None,
+            digest_busy: false,
+            definitions: Some(kimmy_storage::DefinitionReply::default()),
+        };
+        let mut written = Vec::new();
+        write_frame(&mut written, &empty).await.unwrap();
+        let Message::Divergence { definitions, .. } =
+            read_frame(&mut written.as_slice()).await.unwrap()
+        else {
+            panic!("a Divergence")
+        };
+        assert_eq!(definitions, Some(kimmy_storage::DefinitionReply::default()));
+        // An answer with entries round-trips, and an older requester ignores it.
+        let reply = kimmy_storage::DefinitionReply {
+            format: kimmy_storage::definition_digest::FORMAT,
+            malformed: 0,
+            entries: vec![kimmy_storage::DefinitionEntry {
+                collection: CollectionId(u64::MAX),
+                digest: serde_bytes::ByteBuf::from(vec![7; 16]),
+                deferred: None,
+                above: None,
+                definitions: vec![kimmy_storage::WireDefinition {
+                    kind: kimmy_storage::DefinitionKind::Index,
+                    name: "x".into(),
+                    hash: serde_bytes::ByteBuf::from(vec![1; 16]),
+                }],
+                refused: vec![kimmy_storage::WireRefusal {
+                    hint: kimmy_storage::HintKind::DropIndex,
+                    name: "y".into(),
+                    hash: serde_bytes::ByteBuf::from(vec![2; 16]),
+                }],
+            }],
+        };
+        let answered = Message::Divergence {
+            collections: vec![CollectionId(1)],
+            probe_count: Some(7),
+            incarnations: Vec::new(),
+            digests: None,
+            digest_busy: false,
+            definitions: Some(reply),
+        };
+        let mut written = Vec::new();
+        write_frame(&mut written, &answered).await.unwrap();
+        assert_eq!(read_frame(&mut written.as_slice()).await.unwrap(), answered);
+        #[derive(serde::Deserialize, Debug)]
+        enum OldAnswer {
+            Divergence { collections: Vec<CollectionId>, probe_count: Option<u64> },
+        }
+        let old: OldAnswer = bson::deserialize_from_slice(&written[4..]).expect("an older reader");
+        assert!(matches!(old, OldAnswer::Divergence { probe_count: Some(7), .. }), "{old:?}");
+    }
+
+    /// The answer's format number crosses the wire, and an answer without one (a
+    /// build that predates it) reads as format 0, which is never this build's, so
+    /// it is deferred and never compared.
+    #[test]
+    fn the_definition_answers_format_crosses_the_wire_and_its_absence_reads_as_zero() {
+        let sent = kimmy_storage::DefinitionReply {
+            format: kimmy_storage::definition_digest::FORMAT,
+            entries: Vec::new(),
+            malformed: 0,
+        };
+        let doc = bson::serialize_to_bson(&sent).unwrap();
+        assert!(doc.as_document().unwrap().contains_key("format"), "{doc}");
+        let read: kimmy_storage::DefinitionReply = bson::deserialize_from_bson(doc).unwrap();
+        assert_eq!(read.format, kimmy_storage::definition_digest::FORMAT);
+        let without = bson::bson!({ "entries": [] });
+        let read: kimmy_storage::DefinitionReply = bson::deserialize_from_bson(without).unwrap();
+        assert_eq!(read.format, 0);
+        assert_ne!(read.format, kimmy_storage::definition_digest::FORMAT);
+    }
+
+    /// B3 half 2: a definition field of another shape costs the field and never
+    /// the frame, and one bad entry costs the entry, counted.
+    #[tokio::test]
+    async fn a_definition_field_of_another_shape_costs_the_field_and_not_the_frame() {
+        let frame = |body: bson::Document| {
+            let bytes = bson::serialize_to_vec(&body).unwrap();
+            let mut buffer = Vec::new();
+            buffer.extend_from_slice(&(bytes.len() as u32).to_be_bytes());
+            buffer.extend_from_slice(&bytes);
+            buffer
+        };
+        let garbled_request = frame(
+            bson::doc! { "AskDivergence": { "probe": 7i64, "definitions": "not a request" } },
+        );
+        assert_eq!(
+            read_frame(&mut garbled_request.as_slice()).await.unwrap(),
+            Message::AskDivergence {
+                probe: Some(CollectionId(7)),
+                digest: None,
+                definitions: None
+            },
+        );
+        let garbled_answer = frame(bson::doc! { "Divergence": {
+        "collections": [1i64], "probe_count": 7i64, "definitions": [1, 2, 3] } });
+        let Message::Divergence { collections, probe_count, definitions, .. } =
+            read_frame(&mut garbled_answer.as_slice()).await.unwrap()
+        else {
+            panic!("a Divergence")
+        };
+        assert_eq!((collections, probe_count, definitions), (vec![CollectionId(1)], Some(7), None));
+
+        // One entry with a reason this build does not know, one that is not an
+        // entry at all, beside a good one.
+        let good = bson::serialize_to_bson(&kimmy_storage::DefinitionEntry {
+            collection: CollectionId(5),
+            digest: serde_bytes::ByteBuf::from(vec![1; 16]),
+            deferred: None,
+            above: None,
+            definitions: Vec::new(),
+            refused: Vec::new(),
+        })
+        .unwrap();
+        let unknown_reason = bson::bson!({
+            "collection": 6i64,
+            "digest": bson::Binary { subtype: bson::spec::BinarySubtype::Generic, bytes: vec![0; 16] },
+            "deferred": "a_reason_from_a_later_build",
+        });
+        let mixed = frame(bson::doc! { "Divergence": {
+        "collections": [1i64],
+        "definitions": { "entries": [unknown_reason, good, "garbage"] } } });
+        let Message::Divergence { definitions, .. } =
+            read_frame(&mut mixed.as_slice()).await.unwrap()
+        else {
+            panic!("a Divergence")
+        };
+        let reply = definitions.expect("the answer still stands");
+        assert_eq!(reply.entries.len(), 1);
+        assert_eq!(reply.entries[0].collection, CollectionId(5));
+        assert_eq!(reply.malformed, 2, "the two that did not decode are counted");
     }
 
     /// B3 (N11): a new field of another shape costs the field and never the
@@ -1963,7 +2231,11 @@ mod tests {
             frame(bson::doc! { "AskDivergence": { "probe": 7i64, "digest": "not a request" } });
         assert_eq!(
             read_frame(&mut garbled_request.as_slice()).await.unwrap(),
-            Message::AskDivergence { probe: Some(CollectionId(7)), digest: None },
+            Message::AskDivergence {
+                probe: Some(CollectionId(7)),
+                digest: None,
+                definitions: None
+            },
             "a request of another shape is no request, and the probe is still read"
         );
         let garbled_answer = frame(bson::doc! { "Divergence": {

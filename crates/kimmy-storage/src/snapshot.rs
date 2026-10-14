@@ -1710,6 +1710,15 @@ impl Engine {
                          definition stands on its peers and the divergence is counted in \
                          kimmy_sync_ddl_refused_total"
                     );
+                    // Remembered for the definition digest, when the page says
+                    // when the definition was made (a floor needs a stamp).
+                    if let Some(stamp) = index.created {
+                        self.note_refused_index(
+                            CollectionId::derive(&state.db, &state.name),
+                            index,
+                            stamp,
+                        )?;
+                    }
                 }
             }
         }
@@ -1839,6 +1848,9 @@ impl Engine {
                      configuration stands on its peers and the divergence is counted in \
                      kimmy_sync_ddl_refused_total"
                 );
+                if let Some(stamp) = state.vector_changed {
+                    self.note_refused_vector(&state.db, &state.name, state.vector.as_ref(), stamp)?;
+                }
                 Ok(1)
             }
         }
@@ -6852,10 +6864,11 @@ mod tests {
     }
 
     #[test]
-    fn a_page_whose_only_outcome_is_a_refusal_counts_it_in_memory_only() {
+    fn a_page_whose_only_outcome_is_a_refusal_commits_the_hint_and_nothing_else() {
         // `ddl_refused` is the page's answer to its caller, which adds it to a process
-        // counter (`kimmy_sync_ddl_refused_total`); nothing is persisted for it, so there
-        // is nothing for the page to commit.
+        // counter (`kimmy_sync_ddl_refused_total`). The page itself has nothing to
+        // commit; the one commit is the refusal hint, in a transaction of its own
+        // (B3 half 2), which the definition digest explains a difference by.
         let (a, _da, b, _db) = both_hold_a_configuration();
         let id = a.get_collection("shop", "orders").unwrap().id;
         let mut page = a.snapshot_page(None, Some(id)).unwrap();
@@ -6877,7 +6890,18 @@ mod tests {
             .unwrap();
 
         assert_eq!(outcome.ddl_refused, 1);
-        assert_eq!(b.commits(), before, "and nothing is committed for it");
+        assert_eq!(b.commits(), before + 1, "the hint is the only commit");
+        let hints = b.refusal_hints(id).unwrap();
+        assert_eq!(hints.len(), 1, "and it is the refusal's hint");
+        assert_eq!(hints[0].stamp, newer);
+
+        // The same page met again (a permanent refusal is re-met on every repair or
+        // catch-up round): the hint is the same, so nothing is committed.
+        let outcome = b
+            .apply_snapshot_page(a.node_id(), &mut SnapshotProgress::of_collection(id), &page)
+            .unwrap();
+        assert_eq!(outcome.ddl_refused, 1);
+        assert_eq!(b.commits(), before + 1, "an identical repeat commits nothing");
     }
 
     #[test]

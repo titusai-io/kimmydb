@@ -135,6 +135,10 @@ pub struct Engine {
     /// next) with a storage error, for the test that a digest-only fault must
     /// not fail the contact (B3).
     pub(crate) digest_fail_in: std::sync::atomic::AtomicU32,
+    /// Fail the definition probe after this many calls (a test hook; 0 is off).
+    pub(crate) definition_fail_in: std::sync::atomic::AtomicU32,
+    /// Fail the next refusal-hint write (a test hook).
+    pub(crate) hint_write_fails: std::sync::atomic::AtomicBool,
     /// Durable write transactions committed, since start.
     ///
     /// redb has a single writer and every commit is an fsync, so the number of
@@ -1458,6 +1462,8 @@ impl Engine {
             digest_check_busy: std::sync::atomic::AtomicBool::new(false),
             digest_drift: std::sync::atomic::AtomicU64::new(0),
             digest_fail_in: std::sync::atomic::AtomicU32::new(0),
+            definition_fail_in: std::sync::atomic::AtomicU32::new(0),
+            hint_write_fails: std::sync::atomic::AtomicBool::new(false),
             commits: std::sync::atomic::AtomicU64::new(0),
             multi_chunk_docs: std::sync::atomic::AtomicUsize::new(
                 crate::modify::DEFAULT_MULTI_CHUNK_DOCS,
@@ -4746,6 +4752,14 @@ impl Engine {
         if database_emptied {
             let mut dbs = txn.open_table(tables::DATABASES)?;
             dbs.remove(db)?;
+        }
+        // The refusal hints of a collection that is gone, with it and its shadow
+        // (B3 half 2). A hint is never trusted without being re-derived, so this
+        // is hygiene and not correctness; at the burial and not the purge's end,
+        // because a purge of an empty collection ends without a chunk.
+        Self::clear_refusal_hints_in(txn, meta.id)?;
+        if let Some(shadow) = &shadow {
+            Self::clear_refusal_hints_in(txn, shadow.id)?;
         }
         let buried = {
             // Same transaction as the definition, so there is no instant in

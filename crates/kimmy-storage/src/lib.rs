@@ -16,6 +16,8 @@ pub mod check;
 pub mod class_step;
 pub mod codec;
 mod database_tombstone;
+pub mod definition_digest;
+pub mod definition_probe;
 pub mod digest_probe;
 pub mod divergence;
 pub mod docs;
@@ -39,6 +41,7 @@ pub mod migrate;
 pub mod modify;
 pub mod open_progress;
 pub mod purge;
+pub mod refusal_hint;
 pub mod rewind;
 pub mod snapshot;
 mod store_lock;
@@ -66,11 +69,25 @@ mod database_drop_tests;
 mod keep_later_writes_tests;
 
 #[cfg(test)]
+mod definition_digest_tests;
+
+#[cfg(test)]
+mod definition_probe_tests;
+
+#[cfg(test)]
+mod refusal_hint_tests;
+
+#[cfg(test)]
 mod log_capture;
 #[cfg(feature = "test-hooks")]
 pub use live_walk::stop_open_after_rows_for_test;
 
 pub use database_tombstone::{Buried, BuriedCollection, Swept};
+pub use definition_digest::{DefinitionKey, DefinitionKind};
+pub use definition_probe::{
+    DefinitionAnswered, DefinitionAsk, DefinitionDefer, DefinitionEntry, DefinitionOutcome,
+    DefinitionReply, DefinitionRound, DefinitionVerdict, WireDefinition, WireRefusal,
+};
 pub use digest_probe::{
     ANSWER_KEY_BYTES, ASK_KEY_BYTES, Defer, DigestAnswered, DigestAsk, DigestEntry, DigestOutcome,
     DigestPlan, DigestReply, DigestRound, DigestVerdict, SCAN_BYTES, SCAN_WALL, ScanBudget,
@@ -104,6 +121,7 @@ pub use open_progress::{
     set_test_open_step_pause,
 };
 pub use purge::PurgeCounters;
+pub use refusal_hint::{HintKind, RefusalHint};
 pub use snapshot::{
     CollectionState, SNAPSHOT_PAGE, ServeVerdict, SnapshotApplied, SnapshotCursor, SnapshotDoc,
     SnapshotPage, SnapshotProgress, SnapshotTombstone,

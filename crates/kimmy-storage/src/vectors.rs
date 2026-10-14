@@ -297,6 +297,13 @@ impl crate::Engine {
                 meta.vector_changed = stamp;
             }
             crate::Engine::put_collection_meta(&txn, &meta)?;
+            // The configuration changed here (set or turned off): a refusal of it
+            // is mended, and must not explain a later loss.
+            crate::Engine::clear_refusal_hints_for_in(
+                &txn,
+                meta.id,
+                &crate::definition_digest::DefinitionKey::vector(),
+            )?;
 
             let logged = if log {
                 let entry = crate::engine::ddl_entry(
@@ -462,6 +469,13 @@ impl crate::Engine {
                 meta.vector_changed = stamp;
             }
             crate::Engine::put_collection_meta(&txn, &meta)?;
+            // The configuration changed here (set or turned off): a refusal of it
+            // is mended, and must not explain a later loss.
+            crate::Engine::clear_refusal_hints_for_in(
+                &txn,
+                meta.id,
+                &crate::definition_digest::DefinitionKey::vector(),
+            )?;
 
             let logged = if log {
                 let entry = crate::engine::ddl_entry(

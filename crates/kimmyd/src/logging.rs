@@ -1762,6 +1762,85 @@ impl TelemetryGuard {
         );
         observe!(
             u64_observable_gauge,
+            "kimmy.sync.definition_divergent_collections",
+            "{collection}",
+            "Collections the definition digest currently has confirmed as divergent from a peer (different index or vector definitions); also counted in kimmy.sync.divergent_collections.",
+            sync_definition_divergent_collections
+        );
+        observe!(
+            u64_observable_counter,
+            "kimmy.sync.divergence_definition_probes.compared",
+            "{collection}",
+            "Collections whose definition digest was compared against a peer's.",
+            sync_definition_compared
+        );
+        observe!(
+            u64_observable_counter,
+            "kimmy.sync.divergence_definition_probes.explained",
+            "{collection}",
+            "Collections whose definitions differed and a valid refusal hint covered every differing definition; never counted as compared.",
+            sync_definition_explained
+        );
+        observe!(
+            u64_observable_counter,
+            "kimmy.sync.divergence_definition_probes.unanswered",
+            "{contact}",
+            "Checked peer contacts whose peer returned no definition digest.",
+            sync_definition_unanswered
+        );
+        observe!(
+            u64_observable_counter,
+            "kimmy.sync.divergence_definition_probes.deferred.incarnation",
+            "{collection}",
+            "Collections whose definition digest was not compared, for this reason (incarnation).",
+            |s| s.sync_definition_deferred[kimmy_storage::DefinitionDefer::Incarnation.index()]
+        );
+        observe!(
+            u64_observable_counter,
+            "kimmy.sync.divergence_definition_probes.deferred.database_tombstone",
+            "{collection}",
+            "Collections whose definition digest was not compared, for this reason (database_tombstone).",
+            |s| s.sync_definition_deferred
+                [kimmy_storage::DefinitionDefer::DatabaseTombstone.index()]
+        );
+        observe!(
+            u64_observable_counter,
+            "kimmy.sync.divergence_definition_probes.deferred.definition_above_cut",
+            "{collection}",
+            "Collections whose definition digest was not compared, for this reason (definition_above_cut).",
+            |s| s.sync_definition_deferred
+                [kimmy_storage::DefinitionDefer::DefinitionAboveCut.index()]
+        );
+        observe!(
+            u64_observable_counter,
+            "kimmy.sync.divergence_definition_probes.deferred.horizon",
+            "{collection}",
+            "Collections whose definition digest was not compared, for this reason (horizon).",
+            |s| s.sync_definition_deferred[kimmy_storage::DefinitionDefer::Horizon.index()]
+        );
+        observe!(
+            u64_observable_counter,
+            "kimmy.sync.divergence_definition_probes.deferred.error",
+            "{collection}",
+            "Collections whose definition digest was not compared, for this reason (error).",
+            |s| s.sync_definition_deferred[kimmy_storage::DefinitionDefer::Error.index()]
+        );
+        observe!(
+            u64_observable_counter,
+            "kimmy.sync.divergence_definition_probes.deferred.malformed",
+            "{collection}",
+            "Collections whose definition digest was not compared, for this reason (malformed).",
+            |s| s.sync_definition_deferred[kimmy_storage::DefinitionDefer::Malformed.index()]
+        );
+        observe!(
+            u64_observable_counter,
+            "kimmy.sync.divergence_definition_probes.deferred.format",
+            "{collection}",
+            "Collections whose definition digest was not compared, for this reason (format).",
+            |s| s.sync_definition_deferred[kimmy_storage::DefinitionDefer::Format.index()]
+        );
+        observe!(
+            u64_observable_gauge,
             "kimmy.sync.divergence_check_age",
             "s",
             "Seconds since the last peer contact in which the cross-member divergence check ran, computed at export; since the process started before the first, and 0 on a node without clustering.",
@@ -2601,6 +2680,53 @@ mod tests {
              published as something it is not:\n  {}",
             shared.join("\n  ")
         );
+    }
+
+    #[test]
+    fn each_deferral_instrument_reads_the_slot_of_its_own_reason() {
+        // The instruments of `..._probes{outcome="deferred",reason}`, for the
+        // cut digest and for the definition digest, each read one slot of an
+        // array by an index written beside the name. A wrong index publishes one
+        // reason under another's name and passes the coverage test, which reads
+        // names only, so each call is held here to the slot of the reason in its
+        // own name, for every reason of both lists.
+        let source = include_str!("logging.rs");
+        let source = &source[..source.find("#[cfg(test)]").expect("a test-only item")];
+        fn camel(label: &str) -> String {
+            label
+                .split('_')
+                .map(|word| {
+                    let (first, rest) = word.split_at(1);
+                    format!("{}{rest}", first.to_uppercase())
+                })
+                .collect()
+        }
+        let call_of = |name: &str| -> String {
+            let name = format!("\"{name}\"");
+            assert_eq!(source.matches(&name).count(), 1, "{name}: one instrument");
+            let at = source.find(&name).unwrap();
+            let call = &source[at..at + source[at..].find(");").expect("the call ends")];
+            call.split_whitespace().collect()
+        };
+        for reason in kimmy_storage::Defer::ALL {
+            let name = format!("kimmy.sync.divergence_digest_probes.deferred.{}", reason.label());
+            let call = call_of(&name);
+            let slot = format!(
+                "|s|s.sync_digest_deferred[kimmy_storage::Defer::{}.index()]",
+                camel(reason.label())
+            );
+            assert!(call.ends_with(&slot), "{name} does not read the slot of its reason: {call}");
+        }
+        for reason in kimmy_storage::DefinitionDefer::ALL {
+            let name =
+                format!("kimmy.sync.divergence_definition_probes.deferred.{}", reason.label());
+            let call = call_of(&name);
+            let slot = format!(
+                "|s|s.sync_definition_deferred[kimmy_storage::DefinitionDefer::{}.index()]",
+                camel(reason.label())
+            );
+            assert!(call.ends_with(&slot), "{name} does not read the slot of its reason: {call}");
+        }
     }
 
     #[test]

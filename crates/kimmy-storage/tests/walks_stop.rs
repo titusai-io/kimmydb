@@ -124,6 +124,18 @@ const BOUNDED_READS: &[(&str, &str)] = &[
         "one row: the first arrival position at or above a target, for the serve walk's bench",
     ),
     (
+        "definition_probe::Engine::definition_above_cut",
+        "the dropped-index tombstones of one collection: one row per index dropped within retention, read in the probe's one transaction; a definition probe has no per-key loop to budget (B3 half 2)",
+    ),
+    (
+        "refusal_hint::Engine::refusal_hints_in",
+        "the refusal hints of one collection: one row per definition this member refused, a handful at the most (B3 half 2)",
+    ),
+    (
+        "refusal_hint::Engine::clear_refusal_hints_in",
+        "the refusal hints of one collection, inside the write that buries it: the same handful",
+    ),
+    (
         "late_drop::Engine::remove_stragglers",
         "at most one chunk of a thousand rows of one collection, inside the write that removes them; the stop is looked for between two chunks (ADR-231)",
     ),
