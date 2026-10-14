@@ -408,6 +408,72 @@ fn a_commit_after_the_transaction_opened_is_seen_by_no_predicate_on_the_requeste
     assert_eq!(compared(&verdicts, orders), Some(true), "{verdicts:?}");
 }
 
+/// The drop tombstone is read through the same transaction: one recorded after it
+/// opened defers nothing in this answer.
+#[test]
+fn a_tombstone_recorded_after_the_transaction_opened_is_seen_by_no_predicate() {
+    let (a, b, orders, _dirs) = converged_with_index("by_a");
+    let b = std::sync::Arc::new(b);
+    let writer = std::sync::Arc::clone(&b);
+    test_hooks::after_the_transaction(move |_| {
+        let future = Stamp::new(Hlc::new(crate::physical_now_ms() + 60_000, 0), writer.node_id());
+        writer.record_collection_drop(orders, future).unwrap();
+    });
+    let ask = DefinitionAsk::new(cut_of(&a, &b), []);
+    let reply = b.definition_answer(&ask).unwrap();
+    let verdicts = a.definition_compare(&ask, &reply).unwrap();
+    assert_eq!(compared(&verdicts, orders), Some(true), "{verdicts:?}");
+}
+
+/// A refusal hint recorded after the transaction opened explains nothing in this
+/// comparison: the hints are read through the pinned transaction too.
+#[test]
+fn a_hint_recorded_after_the_transaction_opened_explains_nothing() {
+    let (a, b, orders, _dirs) = converged_with_index("ttl");
+    let hash = hash_of(&a, "orders", "ttl");
+    let stamp = a.get_collection("shop", "orders").unwrap().indexes[0].created.unwrap();
+    edit(&a, "orders", |meta| meta.indexes.clear());
+    let a = std::sync::Arc::new(a);
+    let ask = DefinitionAsk::new(cut_of(&a, &b), [orders]);
+    let reply = b.definition_answer(&ask).unwrap();
+    // The hook fires in the requester's comparison, after its transaction opened.
+    let writer = std::sync::Arc::clone(&a);
+    test_hooks::after_the_transaction(move |_| {
+        writer
+            .record_refusal_hint(&RefusalHint::new(orders, HintKind::Index, "ttl", stamp, hash))
+            .unwrap();
+    });
+    let verdicts = a.definition_compare(&ask, &reply).unwrap();
+    assert_eq!(
+        compared(&verdicts, orders),
+        Some(false),
+        "the hint was not there yet: {verdicts:?}"
+    );
+}
+
+/// The serve verdict (the horizon) is read through the pinned transaction: a
+/// retention pass that lands after it opened does not turn this answer into a
+/// deferral.
+#[test]
+fn a_retention_pass_after_the_transaction_opened_does_not_move_the_horizon() {
+    let (a, b, orders, _items, _dirs) = converged();
+    let a = std::sync::Arc::new(a);
+    let on_a = a.get_collection("shop", "orders").unwrap();
+    a.insert(&on_a, doc! { "_id": 100 }).unwrap();
+    a.insert(&on_a, doc! { "_id": 101 }).unwrap();
+    later();
+    let collector = std::sync::Arc::clone(&a);
+    test_hooks::after_the_transaction(move |_| {
+        collector.collect_garbage(crate::RetentionPolicy::new(0, 3_600)).unwrap();
+    });
+    // B asks A at B's cut, which A has entries above: the answer reads A at the
+    // snapshot, before the collection.
+    let ask = DefinitionAsk::new(cut_of(&b, &a), []);
+    let reply = a.definition_answer(&ask).unwrap();
+    let entry = reply.entries.iter().find(|e| e.collection == orders).unwrap();
+    assert_eq!(entry.deferred, None, "the snapshot was not collected: {entry:?}");
+}
+
 // -- The answer's own faults --------------------------------------------------------------
 
 #[test]
