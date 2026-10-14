@@ -10229,3 +10229,34 @@ async fn the_loop_confirms_a_definition_finding_on_both_gauges_and_repairs_nothi
         l.abort();
     }
 }
+
+/// A fault of the definition probe on the **responder** costs the answer's
+/// definitions and nothing else: the requester reads a peer that did not answer
+/// them, the digest's half answers, the contact stands, and the next contact
+/// compares again.
+#[tokio::test]
+async fn a_fault_answering_the_definitions_costs_the_definitions_and_not_the_contact() {
+    use kimmy_cluster::{PeerStalls, sync_once_with};
+    use kimmy_storage::{DefinitionAnswered, DigestAnswered};
+    let (a, b, orders) = two_nodes_with_an_index().await;
+    let mut stalls = PeerStalls::new();
+    sync_once_with(&a.engine, b.addr, SECRET, None, &mut stalls).await.unwrap();
+
+    b.engine.fail_definition_probe_in_for_test(1);
+    let outcome = sync_once_with(&a.engine, b.addr, SECRET, None, &mut stalls)
+        .await
+        .expect("a fault answering definitions must not fail the contact");
+    assert_eq!(outcome.definitions.as_ref().unwrap().answered, DefinitionAnswered::Unanswered);
+    assert_eq!(outcome.digest.as_ref().unwrap().answered, DigestAnswered::Answered);
+    assert!(outcome.divergent.is_some(), "the contact's own findings stand");
+
+    let outcome = sync_once_with(&a.engine, b.addr, SECRET, None, &mut stalls).await.unwrap();
+    assert!(
+        matches!(
+            definition_outcome(&outcome, orders),
+            Some(kimmy_storage::DefinitionOutcome::Compared { equal: true, .. })
+        ),
+        "the next contact compares: {:?}",
+        outcome.definitions
+    );
+}
