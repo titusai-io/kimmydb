@@ -354,3 +354,95 @@ fn a_definition_stamped_exactly_at_the_tombstone_is_restored_as_the_entries_rout
     transfer_under(&b, &a, SnapshotProgress::of_collection(orders.id));
     assert!(holds_x(&b));
 }
+
+// -- An index with no creation stamp ------------------------------------------------------
+
+#[test]
+fn an_unstamped_definition_is_not_rebuilt_over_the_receivers_tombstone() {
+    // A sender that predates the stamp. Building it over the tombstone is the
+    // defect; a real recreation arrives by the entries route with a stamp.
+    let (a, b, id, _dirs) = b_dropped_what_a_still_serves(false, None);
+    let mut page = a.snapshot_page(None, Some(id)).unwrap();
+    for state in &mut page.collections {
+        for index in &mut state.indexes {
+            index.created = None;
+        }
+    }
+    b.apply_snapshot_page(a.node_id(), &mut SnapshotProgress::of_collection(id), &page).unwrap();
+    assert!(!holds_x(&b), "an unstamped definition was rebuilt over a tombstone");
+}
+
+#[test]
+fn an_unstamped_definition_with_no_tombstone_is_restored_as_before() {
+    let (a, _da) = engine();
+    let (b, _db) = engine();
+    let orders = a.create_collection("shop", "orders").unwrap();
+    a.create_index("shop", "orders", field("x"), false, Some("x".into())).unwrap();
+    let creation: Vec<_> = a
+        .entries_for_peer(Hlc::ZERO, 10_000, WalkScope::Background)
+        .unwrap()
+        .entries
+        .into_iter()
+        .filter(|e| e.kind == kimmy_core::OpKind::CreateCollection)
+        .collect();
+    b.apply_batch(&creation).unwrap();
+    let mut page = a.snapshot_page(None, Some(orders.id)).unwrap();
+    for state in &mut page.collections {
+        for index in &mut state.indexes {
+            index.created = None;
+        }
+    }
+    b.apply_snapshot_page(a.node_id(), &mut SnapshotProgress::of_collection(orders.id), &page)
+        .unwrap();
+    assert!(holds_x(&b));
+}
+
+// -- A restart after a restore ------------------------------------------------------------
+
+/// The same store, closed and opened again: what a restart is.
+fn restarted(e: Engine, dir: &tempfile::TempDir) -> Engine {
+    drop(e);
+    Engine::open(&dir.path().join("kimmy.redb")).unwrap()
+}
+
+#[test]
+fn the_clock_resumes_past_a_collection_tombstone_a_scoped_restore_recorded() {
+    // A scoped snapshot grants no coverage, so the vectors that would name the
+    // sender's drop stamp are not raised; the tombstone has no oplog entry here.
+    // Only the metadata at open can carry the clock past it.
+    let (a, _da, _) = engine_an_hour_ahead();
+    let (b, db) = engine();
+    let first = a.create_collection("shop", "orders").unwrap();
+    pull(&b, &a);
+    a.drop_collection("shop", "orders").unwrap();
+    let dropped = a.collection_dropped_at(first.id).unwrap().unwrap();
+    transfer_under(&b, &a, SnapshotProgress::of_collection(first.id));
+    assert!(b.collection_dropped_at(first.id).unwrap().is_some(), "premise");
+    let b = restarted(b, &db);
+    assert_clock_moved_past(&b, dropped.hlc, "after a restart, the scoped restore's drop");
+}
+
+#[test]
+fn the_clock_resumes_past_an_index_tombstone_a_scoped_restore_recorded() {
+    let (a, _da, _) = engine_an_hour_ahead();
+    let (b, db) = engine();
+    let orders = a.create_collection("shop", "orders").unwrap();
+    a.create_index("shop", "orders", field("x"), false, Some("x".into())).unwrap();
+    pull(&b, &a);
+    let held = a.get_collection("shop", "orders").unwrap().index("x").unwrap().created.unwrap();
+    for i in 0..8 {
+        a.insert(&orders, doc! { "_id": i }).unwrap();
+    }
+    a.drop_index("shop", "orders", "x").unwrap();
+    let dropped = a
+        .indexes_dropped(Some(orders.id))
+        .unwrap()
+        .into_iter()
+        .map(|(_, _, stamp)| stamp)
+        .max()
+        .unwrap();
+    assert!(dropped.hlc > held.hlc);
+    transfer_under(&b, &a, SnapshotProgress::of_collection(orders.id));
+    let b = restarted(b, &db);
+    assert_clock_moved_past(&b, dropped.hlc, "after a restart, the scoped restore's index drop");
+}

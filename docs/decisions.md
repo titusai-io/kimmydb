@@ -27061,18 +27061,33 @@ is killed, argued equivalent, or listed as unreachable in the pull request.
    folds each such stamp into the clock **once the sender's own coverage names it** (ADR-163: the stamp comes off
    the wire, and a clock moved to an arbitrary one would mint far-future stamps for ever): the creation (an `Hlc`
    with no origin, so *any* origin's coverage reaching it), each carried collection drop and index drop, and a
-   scoped page's `dropped`. A stamp the coverage does not name is ignored as before and moves nothing.
-2. **An index's creation needs no new call.** The index build already moves the clock (a restored index passes
-   through the same build as a replicated one), so the restore does not add a second witness; a mutation row that
-   removed it survived, and the code was deleted.
-3. **The page's index loop honours the receiver's own index tombstone.** The replicated `CreateIndex` judges
+   scoped page's `dropped`. A stamp the coverage does not name is ignored as before and moves nothing. The
+   creation is **stored whether or not the coverage names it but witnessed only when it does**, the deliberate
+   ADR-163 trade of a gated witness over an ungated store: a page whose sender itself restored the collection by a
+   scoped snapshot can carry a `created` its own vector does not name, and that one is left unwitnessed. The
+   whole-database page's database drops are witnessed before they are recorded, so no write minted between the
+   two sits below a database tombstone this node already holds.
+2. **An index's creation needs no new call.** A restored index appends its entry through `relog_restored`, and
+   `relogged()` witnesses the entry's stamp after the commit, when the entry is newly appended (if it was already
+   in the oplog the stamp was witnessed when it arrived). A mutation row that removed a separate witness survived,
+   so none was added.
+3. **A restart keeps what a restore folded in.** The clock lives in memory; the vectors that would name a restored
+   stamp are raised only when a whole-database snapshot completes, and a scoped one grants none, so a restart soon
+   after a scoped restore from a skewed sender resumed the clock below a floor or tombstone this member holds. At
+   open the clock now also resumes past the highest stamp the stored metadata carries (`Engine::metadata_high_water`):
+   each collection's `created`, incarnation floor, vector-change stamp and indexes' creation stamps, and the
+   collection and index drop tombstones. O(collections + tombstones), read once beside the oplog tail.
+4. **The page's index loop honours the receiver's own index tombstone.** The replicated `CreateIndex` judges
    `stamp < dropped_at` against the receiver's tombstone, under the writer; the page's loop passed a history
    predicate that ignored it, so a member that had dropped an index rebuilt it from a peer that had not heard of
    the drop (a snapshot from a count-half repair or a catch-up), and kept it for good once the peer applied the
    drop. A unique index then refused inserts the rest of the cluster accepted, and a TTL index expired documents
    the others kept. The predicate is now the entries route's: a definition made before the receiver's drop is
-   history; one made after it (the strict `<`, the same as there) is restored; one with no stamp cannot be judged
-   and is restored as it was.
+   history; one made after it (the strict `<`, the same as there) is restored. A definition with **no stamp** (a
+   sender that predates the stamp) is history over a tombstone too, as `earlier` and the collection's own creation
+   rule read an unstamped life: the entries route cannot meet the case (it judges an unstamped payload by the
+   entry's stamp, and a page has none), building it is the defect, and a real recreation arrives by the entries
+   route with a stamp. With no tombstone it is restored as it was.
 
 **Not changed, and why.** The entries route needs no change: `apply_ddl` witnesses every entry it applies, and the
 arms that return before that line (a creation, a drop or an index drop older than something this node already
@@ -27082,11 +27097,17 @@ stamp from the drop's, which is now witnessed on both routes.
 **Consequence for an existing test.** `a_carried_delete_below_a_restored_floor_is_history_under_clock_skew` reached
 the state "a live document below the restored floor" by writing one on a receiver whose clock had not followed the
 floor, which is the defect. The state is now built by hand (a record below the floor), and the test keeps its point:
-the floor, not the out-stamp check, turns the carried delete away.
+the collection's tombstone or its floor, not the out-stamp check, turns the carried delete away. A second test pins the
+floor alone (a delete in the tombstone's millisecond from a node sorting above it, so only the `Hlc` floor, not strict,
+accounts for it).
 
 **Tests.** `snapshot_stamp_tests.rs`: a receiver mints above the floor it restored; the sender keeps the receiver's
 acknowledged write; the clock follows a creation, a carried drop of a collection the receiver never held and of one
 it holds, a carried index drop, a scoped page's drop; a stamp the coverage does not name (on both routes) moves
-nothing; a whole-database and a scoped page do not rebuild a dropped index, nor a unique or a TTL one; a definition
-made after the drop is restored; one stamped exactly at the tombstone is restored. Mutation rows: each witness
-removed, each coverage gate removed, the tombstone check removed, `<` to `<=`.
+nothing; a restart after a scoped restore resumes the clock past the collection tombstone and past the index
+tombstone; a whole-database and a scoped page do not rebuild a dropped index, nor a unique or a TTL one, nor an
+unstamped one; an unstamped one with no tombstone is restored; a definition made after the drop is restored; one
+stamped exactly at the tombstone is restored. Mutation rows: each witness removed, each coverage gate removed, the
+metadata scan at open removed, the tombstone check removed, `<` to `<=`, and the unstamped clause removed. The
+witness of the database drops before they are recorded closes a microsecond window no test can observe and is
+listed as such.

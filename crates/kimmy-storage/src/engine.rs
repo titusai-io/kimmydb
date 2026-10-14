@@ -3523,7 +3523,55 @@ impl Engine {
             .flat_map(|versions| versions.iter().map(|(_, hlc)| hlc).collect::<Vec<_>>())
             .max()
             .unwrap_or(Hlc::ZERO);
-        Ok(tail.max(named))
+        Ok(tail.max(named).max(Self::metadata_high_water(db)?))
+    }
+
+    /// The highest stamp the stored metadata carries: each collection's `created`,
+    /// incarnation floor, vector-change stamp and indexes' creation stamps, and the
+    /// collection and index drop tombstones.
+    ///
+    /// A snapshot restores these with its sender's stamps and folds them into the
+    /// clock as it goes, but they have no entry in this oplog, and the vectors that
+    /// would name them are raised only when a whole-database snapshot completes. A
+    /// scoped restore grants none, so a restart soon after one would resume the
+    /// clock below a floor or a tombstone this member holds, and its next write would
+    /// be judged history by every peer (ADR-233). O(collections + tombstones), read
+    /// once at open beside the oplog tail.
+    fn metadata_high_water(db: &Database) -> Result<Hlc> {
+        let txn = db.begin_read()?;
+        let mut high = Hlc::ZERO;
+        if let Ok(collections) = txn.open_table(tables::COLLECTIONS) {
+            for row in collections.iter()? {
+                let (_, value) = row?;
+                // An unreadable row is not this function's to refuse the open for.
+                let Ok(meta) = serde_json::from_slice::<CollectionMeta>(value.value()) else {
+                    continue;
+                };
+                high = high.max(meta.created);
+                high = high.max(meta.incarnation_floor.unwrap_or(Hlc::ZERO));
+                high = high.max(meta.vector_changed.map_or(Hlc::ZERO, |stamp| stamp.hlc));
+                for index in &meta.indexes {
+                    high = high.max(index.created.map_or(Hlc::ZERO, |stamp| stamp.hlc));
+                }
+            }
+        }
+        if let Ok(dropped) = txn.open_table(tables::COLLECTIONS_DROPPED) {
+            for row in dropped.iter()? {
+                let (_, value) = row?;
+                if let Ok(stamp) = codec::decode_oplog_key(value.value()) {
+                    high = high.max(stamp.hlc);
+                }
+            }
+        }
+        if let Ok(dropped) = txn.open_table(tables::INDEXES_DROPPED) {
+            for row in dropped.iter()? {
+                let (_, value) = row?;
+                if let Ok(stamp) = codec::decode_oplog_key(value.value()) {
+                    high = high.max(stamp.hlc);
+                }
+            }
+        }
+        Ok(high)
     }
 
     /// The highest stamp in the oplog, used to resume the logical clock.

@@ -1085,7 +1085,8 @@ impl Engine {
     ///    document below its own floor can still be held (a store written
     ///    before the restore moved the clock past the floor, as it now does), and
     ///    a delete of it from a peer can out-stamp it while sitting below the
-    ///    floor. The delete out-stamps the document; only this turns it away, as
+    ///    floor. The delete out-stamps the document; this turns it away (the
+    ///    collection's tombstone or its floor, whichever the stamp sits below), as
     ///    the entries route does.
     /// 3. **Does this node hold a live document the tombstone strictly
     ///    out-stamps?** Then it is deleted through the ordinary replicated-delete
@@ -1310,6 +1311,11 @@ impl Engine {
             .filter(|(_, dropped)| dropped.hlc <= page.versions.get(dropped.node))
             .filter(|(id, dropped)| held.get(id).is_none_or(|existing| dropped > existing))
             .collect();
+        // Before they are recorded, so no write minted in between sits below a
+        // database's tombstone this node already holds.
+        for (_, dropped) in &database_drops {
+            self.witness(dropped);
+        }
         self.record_collection_drops(&database_drops)?;
         let held: std::collections::HashMap<CollectionId, Stamp> =
             self.collections_dropped()?.into_iter().collect();
@@ -1512,8 +1518,8 @@ impl Engine {
     ///
     /// What a snapshot restores with the sender's stamp is state this node then
     /// holds and serves: a collection's creation and drop tombstone, the floor it
-    /// restores from them, an index's drop (an index's creation moves the clock in
-    /// its own build). Every other stamp this
+    /// restores from them, an index's drop (an index's creation moves the clock when
+    /// its restored entry is appended, `relogged`). Every other stamp this
     /// node accepts moves its clock (`apply_remote_in_txn`, `apply_ddl`), and a
     /// restore that did not left a receiver whose clock ran behind its sender's
     /// minting a write below the floor it had just restored, which every peer then
@@ -1717,16 +1723,19 @@ impl Engine {
                 },
                 //
                 // And judged against this node's own tombstone for the index, as the
-                // replicated `CreateIndex` is (`sync::apply_index`): a definition made
-                // before this node dropped the index is history here, though the
-                // sender, which has not heard of the drop, still serves it. `dropped`
-                // is read where the build is decided, under the writer. A definition
-                // with no stamp cannot be judged and is restored as it was.
+                // replicated `CreateIndex` is (`sync.rs`): a definition made before this
+                // node dropped the index is history here, though the sender, which has
+                // not heard of the drop, still serves it. `dropped` is read where the
+                // build is decided, under the writer. A definition with no stamp (a
+                // sender that predates the stamp) is history over a tombstone, as
+                // `earlier` and the collection's own creation rule read an unstamped
+                // life: building it is the defect, a real recreation arrives by the
+                // entries route with a stamp, and with no tombstone it is restored as
+                // it was.
                 &|standing, dropped| {
                     earlier(standing)
-                        || index
-                            .created
-                            .is_some_and(|created| dropped.is_some_and(|at| created < at))
+                        || dropped
+                            .is_some_and(|at| index.created.is_none_or(|created| created < at))
                 },
             );
             match crate::sync::settle(created)? {
@@ -5315,8 +5324,9 @@ mod tests {
         // a live document below the floor, as a store that was written before the
         // floor was restored (or by a build before the clock rule) can hold, and a
         // delete of it from a peer, stamped above the document and below the floor.
-        // The delete out-stamps the document; only the floor turns it away, which
-        // is what the entries route does with it too.
+        // The delete out-stamps the document; the collection's tombstone or its
+        // floor turns it away, which is what the entries route does with it too.
+        // (The floor alone is pinned by the test after this one.)
         let (a, _da) = engine();
         let (b, _db) = engine();
         let (c, _dc) = engine();
@@ -5367,6 +5377,64 @@ mod tests {
         assert!(
             b.get(&cb, &DocId::Int64(1)).unwrap().is_some(),
             "a delete below the standing life's floor is history, though it out-stamps"
+        );
+    }
+
+    #[test]
+    fn a_carried_delete_at_the_floor_is_history_though_it_outranks_the_tombstone() {
+        // The floor half of `is_history` for a delete, with the tombstone half unable
+        // to account for it (as the document test above does for a document): the
+        // delete is stamped in the same millisecond as the drop by a node sorting
+        // above the one that stamped it, so it sorts after the tombstone as a `Stamp`
+        // and only the floor, an `Hlc` and not strict, turns it away. A document
+        // below it that the delete out-stamps is held, as a store written before the
+        // restore moved the clock can hold one.
+        let (b, _db) = engine();
+        let (low, high) = tied_nodes();
+        let tie = Hlc::new(1, 0);
+        let id = CollectionId::derive("shop", "orders");
+        b.record_collection_drop(id, Stamp::new(tie, low)).unwrap();
+        let cb = b.create_collection("shop", "orders").unwrap();
+        assert_eq!(cb.incarnation_floor, Some(tie));
+        let delete = Stamp::new(tie, high);
+        assert!(delete > Stamp::new(tie, low), "the tombstone cannot turn it away");
+        {
+            let txn = b.begin_write(crate::engine::WriterHolder::Write).unwrap();
+            let mut docs = txn.open_table(tables::DOCS).unwrap();
+            let body = bson::serialize_to_vec(&doc! { "_id": 1i64 }).unwrap();
+            let record = kimmy_core::DocRecord::live(Stamp::new(Hlc::new(0, 5), low), body);
+            crate::live_count::put_record(
+                &txn,
+                &mut docs,
+                id.0,
+                &crate::docs::doc_key(&DocId::Int64(1)).unwrap(),
+                &codec::encode_doc_record(&record),
+            )
+            .unwrap();
+            drop(docs);
+            txn.commit().unwrap();
+        }
+        let mut versions = VersionVector::new();
+        versions.insert(high, tie);
+        let page = SnapshotPage {
+            collections: Vec::new(),
+            documents: Vec::new(),
+            next: None,
+            versions,
+            dropped: None,
+            dropped_collections: Vec::new(),
+            deleted_documents: vec![SnapshotTombstone {
+                collection: id,
+                key: crate::docs::doc_key(&DocId::Int64(1)).unwrap(),
+                stamp: delete,
+            }],
+            dropped_indexes: Vec::new(),
+        };
+        b.apply_snapshot_page(no_sender(), &mut SnapshotProgress::of_collection(id), &page)
+            .unwrap();
+        assert!(
+            b.get(&cb, &DocId::Int64(1)).unwrap().is_some(),
+            "a delete at the floor is history, though it sorts above the tombstone"
         );
     }
 
