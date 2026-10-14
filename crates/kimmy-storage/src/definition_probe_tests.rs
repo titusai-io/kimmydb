@@ -913,6 +913,283 @@ fn a_database_tombstone_recorded_after_the_transaction_opened_is_seen_by_no_pred
     }
 }
 
+// -- Review of the hint layer: kinds on the wire, keys by kind, a hint is mended --------
+
+/// An `Index`-kind hint on the member that *now holds* the definition is stale:
+/// the responder sends no pair for it, so a real loss on the requester is a
+/// finding and not "explained".
+#[test]
+fn a_stale_refusal_on_the_member_that_holds_the_definition_explains_no_loss() {
+    let (a, b, orders, _dirs) = converged_with_index("ttl");
+    let hash = hash_of(&b, "orders", "ttl");
+    let stamp = b.get_collection("shop", "orders").unwrap().indexes[0].created.unwrap();
+    // B once refused it (the hint), and holds it now.
+    b.record_refusal_hint(&RefusalHint::new(orders, HintKind::Index, "ttl", stamp, hash)).unwrap();
+    // A has lost the same definition for an unrelated reason.
+    edit(&a, "orders", |meta| meta.indexes.clear());
+    let ask = DefinitionAsk::new(cut_of(&a, &b), [orders]);
+    let reply = b.definition_answer(&ask).unwrap();
+    let entry = reply.entries.iter().find(|e| e.collection == orders).unwrap();
+    assert!(entry.refused.is_empty(), "no pair for a refusal B has since mended: {entry:?}");
+    let verdicts = exchange(&a, &b, &[orders]);
+    assert_eq!(compared(&verdicts, orders), Some(false), "a finding: {verdicts:?}");
+}
+
+/// The opposite shape on the responder: a held-drop pair is sent only while the
+/// responder holds exactly the hash it stored.
+#[test]
+fn a_held_drop_pair_is_sent_only_while_the_responder_holds_what_it_stored() {
+    let (a, b, orders, _dirs) = converged_with_index("held");
+    let hash = hash_of(&b, "orders", "held");
+    let stamp = b.get_collection("shop", "orders").unwrap().indexes[0].created.unwrap();
+    b.record_refusal_hint(&RefusalHint::new(orders, HintKind::DropIndex, "held", stamp, hash))
+        .unwrap();
+    let ask = DefinitionAsk::new(cut_of(&a, &b), [orders]);
+    let sent = |b: &Engine| {
+        let reply = b.definition_answer(&ask).unwrap();
+        reply.entries.iter().find(|e| e.collection == orders).unwrap().refused.clone()
+    };
+    let pairs = sent(&b);
+    assert_eq!(pairs.len(), 1, "it holds what it stored: {pairs:?}");
+    assert_eq!((pairs[0].hint, pairs[0].name.as_str()), (HintKind::DropIndex, "held"));
+    edit(&b, "orders", |meta| meta.indexes[0].unique = true);
+    assert!(sent(&b).is_empty(), "it holds another definition now");
+    edit(&b, "orders", |meta| meta.indexes.clear());
+    assert!(sent(&b).is_empty(), "it holds nothing now");
+}
+
+/// A refused vector configuration is explained, on the requester's own hint and
+/// on the responder's pair, and is read by its own kind (not as a drop).
+#[test]
+fn a_refused_vector_configuration_is_explained_from_either_side() {
+    let (a, b, orders, _items, _dirs) = converged();
+    a.configure_vectors("shop", "orders", byo()).unwrap();
+    sync(&a, &b);
+    let held = b.get_collection("shop", "orders").unwrap();
+    let stamp = held.vector_changed.unwrap();
+    let hash = crate::definition_digest::vector_hash(held.vector.as_ref().unwrap());
+    // A refused it (it lacks it and says so): A's own hint, A the requester.
+    edit(&a, "orders", |meta| meta.vector = None);
+    a.record_refusal_hint(&RefusalHint::new(orders, HintKind::Vector, "", stamp, hash)).unwrap();
+    let verdicts = exchange(&a, &b, &[orders]);
+    assert_eq!(
+        outcome_of(&verdicts, orders),
+        Some(DefinitionOutcome::Explained { differing: vec![DefinitionKey::vector()] }),
+        "the requester's own: {verdicts:?}"
+    );
+    // The same from the responder's side: B is asked, and A's pair travels.
+    let verdicts = exchange(&b, &a, &[orders]);
+    assert!(
+        matches!(outcome_of(&verdicts, orders), Some(DefinitionOutcome::Explained { .. })),
+        "the responder's pair: {verdicts:?}"
+    );
+}
+
+/// The turning-off of a vector configuration this member holds and could not
+/// apply is explained on its own kind, and a hint of the wrong kind is not it.
+#[test]
+fn a_refused_turn_off_of_the_vector_configuration_is_explained_by_its_own_kind() {
+    let (a, b, orders, _items, _dirs) = converged();
+    a.configure_vectors("shop", "orders", byo()).unwrap();
+    sync(&a, &b);
+    let held = a.get_collection("shop", "orders").unwrap();
+    let stamp = held.vector_changed.unwrap();
+    let hash = crate::definition_digest::vector_hash(held.vector.as_ref().unwrap());
+    // B turned it off; A holds it and could not.
+    edit(&b, "orders", |meta| meta.vector = None);
+    a.record_refusal_hint(&RefusalHint::new(orders, HintKind::DropVector, "", stamp, hash))
+        .unwrap();
+    let verdicts = exchange(&a, &b, &[orders]);
+    assert!(
+        matches!(outcome_of(&verdicts, orders), Some(DefinitionOutcome::Explained { .. })),
+        "{verdicts:?}"
+    );
+    // The same row of the refused-definition kind is another shape: nothing here
+    // is a definition B refused, so it explains nothing.
+    let txn = a.begin_write(crate::WriterHolder::Ddl).unwrap();
+    Engine::clear_refusal_hints_for_in(&txn, orders, &DefinitionKey::vector()).unwrap();
+    txn.commit().unwrap();
+    a.record_refusal_hint(&RefusalHint::new(orders, HintKind::Vector, "", stamp, hash)).unwrap();
+    let verdicts = exchange(&a, &b, &[orders]);
+    assert_eq!(compared(&verdicts, orders), Some(false), "wrong kind: {verdicts:?}");
+}
+
+/// An index can be named `__vector`: it is not the vector configuration, in the
+/// list, in the digest, in what differs, and in which hint covers it.
+#[test]
+fn an_index_named_like_the_old_reserved_name_is_not_the_vector_configuration() {
+    let (a, b, orders, _items, _dirs) = converged();
+    a.configure_vectors("shop", "orders", byo()).unwrap();
+    sync(&a, &b);
+    a.create_index("shop", "orders", fields("zz"), false, Some("__vector".into())).unwrap();
+    sync(&a, &b);
+    let list = definition_list(&a.get_collection("shop", "orders").unwrap());
+    assert_eq!(
+        list.iter().map(|(key, _)| key.clone()).collect::<Vec<_>>(),
+        vec![DefinitionKey::index("__vector"), DefinitionKey::vector()],
+        "two entries, each its own"
+    );
+    // A loses the index: what differs is the index, not the configuration.
+    edit(&a, "orders", |meta| meta.indexes.clear());
+    let verdicts = exchange(&a, &b, &[orders]);
+    match outcome_of(&verdicts, orders) {
+        Some(DefinitionOutcome::Compared { equal: false, differing, .. }) => {
+            assert_eq!(differing, vec![DefinitionKey::index("__vector")]);
+        }
+        other => panic!("{other:?}"),
+    }
+    // A hint about the vector configuration does not cover the index.
+    let held = b.get_collection("shop", "orders").unwrap();
+    let hash = crate::definition_digest::vector_hash(held.vector.as_ref().unwrap());
+    a.record_refusal_hint(&RefusalHint::new(
+        orders,
+        HintKind::Vector,
+        "__vector",
+        held.vector_changed.unwrap(),
+        hash,
+    ))
+    .unwrap();
+    let verdicts = exchange(&a, &b, &[orders]);
+    assert_eq!(compared(&verdicts, orders), Some(false), "{verdicts:?}");
+}
+
+/// A refusal mended here does not outlive the fix: the hint explained the
+/// difference, the operator created the definition on the member that lacked it
+/// (the `operations.md` TTL sequence), and a later loss of the same definition is
+/// a finding again.
+#[test]
+fn a_hint_does_not_outlive_the_fix_and_a_later_loss_is_a_finding() {
+    let (a, b, orders, _dirs) = a_refused_what_b_holds();
+    let verdicts = exchange(&a, &b, &[orders]);
+    assert!(
+        matches!(outcome_of(&verdicts, orders), Some(DefinitionOutcome::Explained { .. })),
+        "premise: refused and explained: {verdicts:?}"
+    );
+    let held = b.get_collection("shop", "orders").unwrap().indexes[0].clone();
+    // The operator creates it on the member that lacks it.
+    a.create_index_with(
+        "shop",
+        "orders",
+        held.fields.clone(),
+        held.unique,
+        held.enforcement,
+        Some(held.name.clone()),
+        held.expire_after_secs,
+        held.partial_filter.clone(),
+    )
+    .unwrap();
+    sync(&a, &b);
+    let verdicts = exchange(&a, &b, &[orders]);
+    assert_eq!(compared(&verdicts, orders), Some(true), "fixed: {verdicts:?}");
+    assert!(a.refusal_hints(orders).unwrap().is_empty(), "the mended refusal is forgotten");
+    edit(&a, "orders", |meta| meta.indexes.clear());
+    let verdicts = exchange(&a, &b, &[orders]);
+    assert_eq!(compared(&verdicts, orders), Some(false), "lost again: {verdicts:?}");
+    // And two compared mismatches running confirm it (the tracker's rule).
+    let verdicts = exchange(&a, &b, &[orders]);
+    assert_eq!(compared(&verdicts, orders), Some(false), "{verdicts:?}");
+}
+
+/// A digest of another format is never compared, on any collection: the answer
+/// says its format, and a different one (or none) defers with its own reason.
+#[test]
+fn an_answer_of_another_format_defers_every_collection() {
+    let (a, b, orders, items, _dirs) = converged();
+    let ask = DefinitionAsk::new(cut_of(&a, &b), []);
+    let reply = b.definition_answer(&ask).unwrap();
+    assert_eq!(reply.format, crate::definition_digest::FORMAT, "the responder says its format");
+    let verdicts = a.definition_compare(&ask, &reply).unwrap();
+    assert_eq!(compared(&verdicts, orders), Some(true), "the same format compares");
+    for other in [crate::definition_digest::FORMAT + 1, 0] {
+        let mut reply = reply.clone();
+        reply.format = other;
+        let verdicts = a.definition_compare(&ask, &reply).unwrap();
+        for id in [orders, items] {
+            assert_eq!(
+                deferred(&verdicts, id),
+                Some(DefinitionDefer::Format),
+                "format {other}: {verdicts:?}"
+            );
+        }
+    }
+}
+
+/// A hint row this build cannot read (a kind from a later build, the store rolled
+/// back) is skipped: the answer, the comparison and the next refusal's write all
+/// go on, and a hint written under the same key replaces it.
+#[test]
+fn an_unreadable_hint_row_costs_that_row_and_nothing_else() {
+    let (a, b, orders, _dirs) = a_refused_what_b_holds();
+    let put = |e: &Engine, key: String, value: Vec<u8>| {
+        let txn = e.begin_write(crate::WriterHolder::Ddl).unwrap();
+        {
+            let mut meta = txn.open_table(crate::tables::META).unwrap();
+            meta.insert(key.as_str(), value.as_slice()).unwrap();
+        }
+        txn.commit().unwrap();
+    };
+    for e in [&a, &b] {
+        put(e, format!("ddl_refused:{}:future:x", orders.0), vec![1, 2, 3]);
+        put(e, format!("ddl_refused:{}:index:short", orders.0), vec![1]);
+    }
+    // The readable hint still explains; the answer and the comparison go on.
+    let verdicts = exchange(&a, &b, &[orders]);
+    assert!(
+        matches!(outcome_of(&verdicts, orders), Some(DefinitionOutcome::Explained { .. })),
+        "{verdicts:?}"
+    );
+    assert_eq!(a.refusal_hints(orders).unwrap().len(), 1, "only the readable one");
+    // A refusal's write is not failed by the rows beside it.
+    let hash = hash_of(&b, "orders", "ttl");
+    let stamp = b.get_collection("shop", "orders").unwrap().indexes[0].created.unwrap();
+    a.record_refusal_hint(&RefusalHint::new(orders, HintKind::Index, "other", stamp, hash))
+        .unwrap();
+    // And a hint under the unreadable row's own key replaces it.
+    put(&a, format!("ddl_refused:{}:index:mine", orders.0), vec![9]);
+    a.record_refusal_hint(&RefusalHint::new(orders, HintKind::Index, "mine", stamp, hash)).unwrap();
+    let names: Vec<_> = a.refusal_hints(orders).unwrap().into_iter().map(|h| h.name).collect();
+    assert_eq!(names, vec!["mine".to_string(), "other".to_string(), "ttl".to_string()]);
+}
+
+/// Every dropped-index row of a collection is judged against the cut, not the first
+/// one the range reads.
+#[test]
+fn every_dropped_index_row_is_judged_against_the_cut() {
+    for order in [["p", "q"], ["q", "p"]] {
+        let (a, b, orders, _items, _dirs) = converged();
+        for name in ["p", "q"] {
+            a.create_index("shop", "orders", fields(name), false, Some(name.into())).unwrap();
+        }
+        sync(&a, &b);
+        later();
+        a.drop_index("shop", "orders", order[0]).unwrap();
+        later();
+        a.drop_index("shop", "orders", order[1]).unwrap();
+        sync(&a, &b);
+        let stamps: Vec<Stamp> = {
+            use redb::ReadableDatabase;
+            let txn = a.db().begin_read().unwrap();
+            let table = txn.open_table(crate::tables::INDEXES_DROPPED).unwrap();
+            table
+                .range((orders.0, 0)..=(orders.0, u32::MAX))
+                .unwrap()
+                .map(|row| crate::codec::decode_oplog_key(row.unwrap().1.value()).unwrap())
+                .collect()
+        };
+        assert_eq!(stamps.len(), 2, "premise");
+        // The cut covers the earlier drop and not the later one.
+        let earliest = stamps.iter().map(|stamp| stamp.hlc).min().unwrap();
+        let mut cut = VersionVector::new();
+        cut.insert(a.node_id(), earliest);
+        let verdicts = exchange_at(&a, &b, cut, &[]);
+        assert_eq!(
+            deferred(&verdicts, orders),
+            Some(DefinitionDefer::DefinitionAboveCut),
+            "order {order:?}: {verdicts:?}"
+        );
+    }
+}
+
 /// A stamp is judged against the cut at its own origin. A cut that is far ahead
 /// for one origin and has seen nothing of another does not cover the other's
 /// stamp.

@@ -506,3 +506,119 @@ fn a_re_delivered_refused_entry_rewrites_no_hint() {
     assert_eq!(b.refusal_hints(on_a.id).unwrap(), hints, "the row is as it was");
     assert_eq!((b.commits() - start) / 2 + 1, first, "a repeat costs the hint's commit less");
 }
+
+// -- A hint is mended with the definition it was about ---------------------------------
+
+fn both_shapes(e: &Engine, id: CollectionId, kind: HintKind, names: &[&str]) {
+    let stamp = Stamp::new(kimmy_core::Hlc::new(900, 0), kimmy_core::NodeId::from_bytes([5; 16]));
+    for name in names {
+        e.record_refusal_hint(&crate::RefusalHint::new(id, kind, *name, stamp, 7)).unwrap();
+    }
+}
+
+fn held_names(e: &Engine, id: CollectionId) -> Vec<(HintKind, String)> {
+    e.refusal_hints(id).unwrap().into_iter().map(|h| (h.kind, h.name)).collect()
+}
+
+/// The drop of an index clears its hints of every kind, and no other index's.
+#[test]
+fn dropping_an_index_clears_its_hints_of_every_kind() {
+    let (b, _db) = engine();
+    let orders = b.create_collection("shop", "orders").unwrap();
+    b.create_index("shop", "orders", field("a"), false, Some("a_1".into())).unwrap();
+    both_shapes(&b, orders.id, HintKind::Index, &["a_1", "keep"]);
+    both_shapes(&b, orders.id, HintKind::DropIndex, &["a_1"]);
+    assert!(b.drop_index("shop", "orders", "a_1").unwrap());
+    assert_eq!(held_names(&b, orders.id), vec![(HintKind::Index, "keep".to_string())]);
+}
+
+/// A create of the definition here (a client's, a peer's entry, a snapshot's) is
+/// the fix of the refusal: its hints, of either shape, go in the transaction that
+/// stores it, and an index of another name keeps its own.
+#[test]
+fn creating_a_definition_clears_its_hints_by_every_route() {
+    // A client's create.
+    let (b, _db) = engine();
+    let orders = b.create_collection("shop", "orders").unwrap();
+    both_shapes(&b, orders.id, HintKind::Index, &["x", "other"]);
+    both_shapes(&b, orders.id, HintKind::DropIndex, &["x"]);
+    b.create_index("shop", "orders", field("x"), false, Some("x".into())).unwrap();
+    assert_eq!(held_names(&b, orders.id), vec![(HintKind::Index, "other".to_string())]);
+
+    // A peer's entry.
+    let (a, _da) = engine();
+    let (b, _db) = engine();
+    a.create_collection("shop", "orders").unwrap();
+    b.create_collection("shop", "orders").unwrap();
+    both_shapes(&b, CollectionId::derive("shop", "orders"), HintKind::Index, &["y", "other"]);
+    later();
+    a.create_index("shop", "orders", field("y"), false, Some("y".into())).unwrap();
+    pull(&b, &a);
+    assert_eq!(
+        held_names(&b, CollectionId::derive("shop", "orders")),
+        vec![(HintKind::Index, "other".to_string())]
+    );
+
+    // A snapshot's.
+    let (a, _da) = engine();
+    let (b, _db) = engine();
+    a.create_collection("shop", "orders").unwrap();
+    a.create_index("shop", "orders", field("z"), false, Some("z".into())).unwrap();
+    b.create_collection("shop", "orders").unwrap();
+    both_shapes(&b, CollectionId::derive("shop", "orders"), HintKind::Index, &["z", "other"]);
+    let page = a.snapshot_page(None, None).unwrap();
+    b.apply_snapshot_page(a.node_id(), &mut SnapshotProgress::whole_database(), &page).unwrap();
+    assert!(b.get_collection("shop", "orders").unwrap().index("z").is_some(), "premise");
+    assert_eq!(
+        held_names(&b, CollectionId::derive("shop", "orders")),
+        vec![(HintKind::Index, "other".to_string())]
+    );
+}
+
+/// The vector configuration is its own definition: setting it, or turning it off,
+/// clears the hints of both shapes about it, and an index of any name keeps its own.
+#[test]
+fn setting_or_turning_off_the_vector_configuration_clears_its_hints() {
+    let (b, _db) = engine();
+    let orders = b.create_collection("shop", "orders").unwrap();
+    for turn_off in [false, true] {
+        both_shapes(&b, orders.id, HintKind::Vector, &[""]);
+        both_shapes(&b, orders.id, HintKind::DropVector, &[""]);
+        both_shapes(&b, orders.id, HintKind::Index, &["__vector"]);
+        if turn_off {
+            b.disable_vectors("shop", "orders", false).unwrap();
+        } else {
+            b.configure_vectors("shop", "orders", crate::definition_probe_tests::byo()).unwrap();
+        }
+        assert_eq!(
+            held_names(&b, orders.id),
+            vec![(HintKind::Index, "__vector".to_string())],
+            "turn_off {turn_off}"
+        );
+        let txn = b.begin_write(crate::WriterHolder::Ddl).unwrap();
+        Engine::clear_refusal_hints_for_in(&txn, orders.id, &DefinitionKey::index("__vector"))
+            .unwrap();
+        txn.commit().unwrap();
+    }
+}
+
+/// A row the build cannot read is no error to read the rest, nor to clear.
+#[test]
+fn an_unreadable_row_is_skipped_by_the_read_and_removed_by_the_collections_clear() {
+    let (b, _db) = engine();
+    let orders = b.create_collection("shop", "orders").unwrap();
+    both_shapes(&b, orders.id, HintKind::Index, &["x"]);
+    {
+        let txn = b.begin_write(crate::WriterHolder::Ddl).unwrap();
+        {
+            let mut meta = txn.open_table(crate::tables::META).unwrap();
+            let key = format!("ddl_refused:{}:future:x", orders.id.0);
+            meta.insert(key.as_str(), [1u8, 2, 3].as_slice()).unwrap();
+        }
+        txn.commit().unwrap();
+    }
+    assert_eq!(held_names(&b, orders.id), vec![(HintKind::Index, "x".to_string())]);
+    let txn = b.begin_write(crate::WriterHolder::Ddl).unwrap();
+    assert_eq!(Engine::clear_refusal_hints_in(&txn, orders.id).unwrap(), 2, "both rows go");
+    txn.commit().unwrap();
+}

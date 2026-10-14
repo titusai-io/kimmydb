@@ -600,3 +600,26 @@ const PINNED: &[(&str, &str)] = &[
     ("collection digest, two indexes and a vector", "568dbcf3cd44a4ec9a9215a5a11c9de9"),
     ("collection digest, nothing", "97abaa003ead56bbffb0d7276c8766a7"),
 ];
+
+/// An index may be named anything, so the vector configuration is not told by a
+/// name: an index called `__vector` and the configuration are two entries, framed
+/// apart, and a collection holding only one is not the collection holding only
+/// the other.
+#[test]
+fn an_index_named_like_the_old_reserved_name_does_not_alias_the_configuration() {
+    let with_index = collection(vec![index("__vector", &[("a", false)])], None);
+    let with_config = collection(vec![], Some(config(4)));
+    assert_ne!(definition_digest(&with_index), definition_digest(&with_config));
+    let both = collection(vec![index("__vector", &[("a", false)])], Some(config(4)));
+    assert_eq!(
+        definition_list(&both).into_iter().map(|(key, _)| key).collect::<Vec<_>>(),
+        vec![DefinitionKey::index("__vector"), DefinitionKey::vector()]
+    );
+    // The same hash under the two kinds frames differently.
+    let hash = index_hash(&index("__vector", &[("a", false)]));
+    assert_ne!(
+        crate::definition_digest::digest_of_list(&[(DefinitionKey::index(""), hash)]),
+        crate::definition_digest::digest_of_list(&[(DefinitionKey::vector(), hash)]),
+        "an index with an empty name is not the configuration"
+    );
+}
