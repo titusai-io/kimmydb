@@ -193,9 +193,9 @@ impl crate::Engine {
             // configuration off between the two, and the entries that say so are what a
             // page stands in for, and are what an entry that arrives without them (the off
             // lost on its stamp to a change made here, or not yet applied) presupposes.
-            // Applied here as that history reads: the configuration off and on again, one change, in this
-            // transaction, so the dimension changes with nothing to drop and no window in
-            // which the collection is without one. The stored vectors are left as they
+            // Applied here as that history reads: the configuration off and on again,
+            // one change, in this transaction, so the dimension changes with nothing
+            // to drop and no window in which the collection is without one. The stored vectors are left as they
             // are, as for an entry's off (`drop_vectors` is never a peer's to decide), and
             // the new width skips them. Judged below the history check and the
             // last-writer-wins guard, so a change that loses changes nothing, and for a

@@ -27127,7 +27127,10 @@ here, or have not arrived yet. ADR-227 gave a dated **page** the exemption; this
 the last-writer-wins guard (ADR-226), so an entry that loses changes nothing whatever its width. The change is
 applied as ADR-227 applies a page's: the configuration off and on again as one change in the one transaction, the
 stored vectors of the old width kept (a peer's change never deletes data), the new width skipping them in both
-search paths, nothing published beyond what the entries path publishes for the same history. A **local**
+search paths, nothing published beyond what the entries path publishes for the same history. **The old-width rows
+stay in the collection's shadow as dead weight** until an explicit `drop_vectors` (a local request) discards them;
+if the width is later set back to the old one by a dated change they become visible again, possibly stale against
+their documents, exactly as after a dated page's change. A **local**
 configuration is refused as it always was, and so is an undated page.
 
 **Why.** The entries path and a page now end in the same state for the same history, which is the property this
@@ -27137,6 +27140,14 @@ that held the width-8 configuration at width 8 through entries and at width 16 t
 
 **Tests.** `vector_width_tests.rs`: the entries route and a page end in the same width (red before); the entry is
 applied and not refused, at the origin's stamp (red before); the stored vectors of the old width are kept; an entry
-that loses on its stamp changes nothing; a local change of width is still refused. Mutation rows: the entry
-exemption removed, the exemption extended to a local change, an undated page exempted (killed by the existing
-ADR-227 test), the last-writer-wins guard removed, the width check removed for every origin.
+that loses on its stamp changes nothing; an entry of an older life (at or below the incarnation floor) with another
+width changes nothing; a local change of width is still refused. Mutation rows: the entry exemption removed, the
+exemption extended to a local change, an undated page exempted (killed by the existing ADR-227 test), the
+last-writer-wins guard removed, the history check removed, the width check removed for every origin, and the
+exempt branch burying the old-width rows.
+
+**Mixed roll.** A 0.49.0 member refuses the entry as it did, counts it in `kimmy_sync_ddl_refused_total`, leaves a
+refusal hint and skips it, and stays at the old width; the definition digest shows the divergence. It is not wedged.
+A refused entry is witnessed and, as reasoned from the sync path (not tested), is not served to it again after the upgrade, so that member stays diverged until the
+next vector change from any member reaches it, or a snapshot page does (the page route has applied the change since
+ADR-227).

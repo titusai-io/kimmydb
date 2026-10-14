@@ -152,3 +152,39 @@ fn a_local_change_of_width_is_still_refused() {
     assert!(err.to_string().contains("dimension cannot change"), "{err}");
     assert_eq!(width(&a), Some(8));
 }
+
+#[test]
+fn an_entry_of_an_older_life_with_another_width_changes_nothing() {
+    // The exemption sits below the history check: an entry at or below the standing
+    // life's incarnation floor is the previous life's and is not applied, whatever
+    // its width. The standing configuration is left unstamped so only the history
+    // check, not the last-writer-wins guard, can turn the entry away.
+    let (b, _db) = engine();
+    let low = kimmy_core::NodeId::from_bytes([1; 16]);
+    let id = kimmy_core::CollectionId::derive("shop", "orders");
+    b.record_collection_drop(id, kimmy_core::Stamp::new(Hlc::new(1_000, 0), low)).unwrap();
+    b.create_collection("shop", "orders").unwrap();
+    b.configure_vectors("shop", "orders", byo(8)).unwrap();
+    {
+        let mut meta = b.get_collection("shop", "orders").unwrap();
+        assert_eq!(meta.incarnation_floor, Some(Hlc::new(1_000, 0)), "premise");
+        meta.vector_changed = None;
+        let txn = b.begin_write(crate::WriterHolder::Ddl).unwrap();
+        Engine::put_collection_meta(&txn, &meta).unwrap();
+        txn.commit().unwrap();
+    }
+    let entry = crate::engine::ddl_entry(
+        kimmy_core::Stamp::new(Hlc::new(500, 0), low),
+        kimmy_core::OpKind::ConfigureVectors,
+        id,
+        &kimmy_core::VectorSet {
+            db: "shop".into(),
+            collection: "orders".into(),
+            config: Some(byo(16)),
+        },
+    )
+    .unwrap();
+    let outcome = b.apply_batch(std::slice::from_ref(&entry)).unwrap();
+    assert_eq!(width(&b), Some(8), "an older life's change was applied");
+    assert_eq!(outcome.ddl_refused, 0, "history is skipped, not refused");
+}
