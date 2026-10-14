@@ -26855,13 +26855,24 @@ the other side of the life. The decision and the two commits:
    snapshot, a whole-database page): this is ADR-229, unchanged. A life created **after** it (a database dropped
    and made again) keeps like any other. The test is made in the burying transaction. Because a database drop
    buries each of its collections with a drop of its own, at a stamp above the database's, the guard cannot be
-   an equality of stamps; and because the database's tombstone and its collections' come in the one list of a
-   whole-database page, in any order, `apply_carried_drops` records the database tombstones first. If the
-   database's tombstone arrives **after** a collection's drop kept a write, the marker remembers the `created`
-   the life had before the drop re-dated it, and the database's sweep buries it if that was at or before the
-   tombstone. On the entry path the database's drop always precedes its own collections' drops from the same
-   origin (they are stamped above it and an origin's entries arrive in order), so the tombstone is held when
-   they apply; the marker is what makes the other orders agree.
+   an equality of stamps, and it cannot be "a database tombstone exists" (that would bury later writes in every
+   collection of a recreated database). On a whole-database page the database's tombstone and its collections'
+   come in the one list, in any order, so `apply_carried_drops` records the database tombstones first, which
+   also means no life is re-dated only to be buried. On the entry route an origin's `DropDatabase` is stamped
+   below, and arrives before, its own collections' drops.
+   **The marker closes the other orders.** A life re-dated by a collection's drop is dated just above that drop,
+   which can be above the database's tombstone `S` (a database's drop is followed by a drop of each collection)
+   although the life began before it. The marker therefore remembers the `created` the life had before
+   (`redated.from`), and: (a) the database's sweep buries a re-dated life if `from` is at or before `S`, whichever
+   of the two drops this member learned of first; (b) the marker **travels with the definition**
+   (`CollectionState::redated_from`, additive and optional on the wire), so a member that holds `S` refuses
+   the definition at install as it would refuse the original creation, and a member that learns `S` afterwards
+   buries what it installed; a build that does not know the field ignores it and judges `created`, as before.
+   There is no wire field on the scoped page for the database's tombstone: a sender that has dropped the
+   collection cannot say which database it was in (a collection id is a hash of the database and the name).
+   **Mixed roll with 0.48.x:** a 0.48.x peer never reads the marker, so during the roll a re-dated life can
+   spread to it past a database tombstone it holds, and it keeps the write there; once every member runs the
+   rule the sequence converges. That is a roll-only gap, not a standing one.
 6. **Streams (D-5).** A re-dated life has no creation entry, so `creation_arrival` finds nothing and a stream
    opened with no token fell back to the walk of the arrival index that cost 62 s on a 1.8 M-row log (round
    0500). The sweep records, in the metadata written by its last commit, the lowest arrival position among the
@@ -26887,7 +26898,9 @@ it rewrites loses its marker, which costs a stream open the walk.
 **Tests.** `keep_later_writes_tests.rs`: the fast path walks nothing; an absent digest row, an index stamped after
 the drop and a write landing before the writer is taken all take the survivors path and lose nothing; a life left
 with nothing is buried in the last commit and purged; a database dropped and made again does not stop a
-collection drop keeping; a database tombstone that arrives after a kept life buries it; a whole-database page
+collection drop keeping; a database tombstone that arrives after a kept life buries it; a life re-dated above the database's drop does
+not outlive it, whether the peer holds the tombstone before or after it installs the definition, or M learns it
+last; an interrupted drop delivered again appends its entry; a whole-database page
 keeps an explicit collection drop and buries a database's, in either order of its list; the shadow follows its
 parent (a late chunk of a swept parent goes, a survivor's stays, an emptied life takes its shadow, a shadow's turn
 sweeps its parent first); a peer holding the older life is not replaced by a re-dated one in the window; `maxw`
