@@ -83,9 +83,10 @@ mod log_capture;
 pub use live_walk::stop_open_after_rows_for_test;
 
 pub use database_tombstone::{Buried, BuriedCollection, Swept};
+pub use definition_digest::{DefinitionKey, DefinitionKind};
 pub use definition_probe::{
     DefinitionAnswered, DefinitionAsk, DefinitionDefer, DefinitionEntry, DefinitionOutcome,
-    DefinitionReply, DefinitionRound, DefinitionVerdict,
+    DefinitionReply, DefinitionRound, DefinitionVerdict, WireDefinition, WireRefusal,
 };
 pub use digest_probe::{
     ANSWER_KEY_BYTES, ASK_KEY_BYTES, Defer, DigestAnswered, DigestAsk, DigestEntry, DigestOutcome,

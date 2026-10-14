@@ -7,7 +7,7 @@ use bson::doc;
 use kimmy_core::{CollectionId, Hlc, IndexField, NodeId, Stamp, VersionVector};
 use serde_bytes::ByteBuf;
 
-use crate::definition_digest::{VECTOR_NAME, definition_list, index_hash};
+use crate::definition_digest::{DefinitionKey, definition_list, index_hash};
 use crate::definition_probe::{
     DefinitionAsk, DefinitionDefer, DefinitionEntry, DefinitionOutcome, DefinitionVerdict,
     test_hooks,
@@ -145,7 +145,7 @@ fn a_covered_difference_is_a_mismatch_that_names_nothing_until_the_detail_is_ask
     let verdicts = exchange(&a, &b, &[orders]);
     match outcome_of(&verdicts, orders) {
         Some(DefinitionOutcome::Compared { equal: false, differing, .. }) => {
-            assert_eq!(differing, vec!["by_a".to_string()]);
+            assert_eq!(differing, vec![DefinitionKey::index("by_a")]);
         }
         other => panic!("expected a mismatch with its name, got {other:?}"),
     }
@@ -158,7 +158,7 @@ fn a_difference_in_one_part_of_one_definition_names_that_definition() {
     let verdicts = exchange(&a, &b, &[orders]);
     match outcome_of(&verdicts, orders) {
         Some(DefinitionOutcome::Compared { equal: false, differing, .. }) => {
-            assert_eq!(differing, vec!["ttl".to_string()]);
+            assert_eq!(differing, vec![DefinitionKey::index("ttl")]);
         }
         other => panic!("{other:?}"),
     }
@@ -173,7 +173,7 @@ fn a_vector_configuration_one_side_lacks_is_named_by_its_reserved_name() {
     let verdicts = exchange(&a, &b, &[orders]);
     match outcome_of(&verdicts, orders) {
         Some(DefinitionOutcome::Compared { equal: false, differing, .. }) => {
-            assert_eq!(differing, vec![VECTOR_NAME.to_string()]);
+            assert_eq!(differing, vec![DefinitionKey::vector()]);
         }
         other => panic!("{other:?}"),
     }
@@ -553,7 +553,7 @@ fn an_entry_the_peer_deferred_is_deferred_here_with_the_peers_reason() {
         digest: ByteBuf::from(vec![0; 16]),
         deferred: Some(DefinitionDefer::DefinitionAboveCut),
         above: None,
-        indexes: Vec::new(),
+        definitions: Vec::new(),
         refused: Vec::new(),
     }];
     let verdicts = a.definition_compare(&ask, &reply).unwrap();
@@ -587,7 +587,7 @@ fn a_mismatch_the_requesters_own_refusal_explains_is_explained_and_not_compared(
     let verdicts = exchange(&a, &b, &[orders]);
     assert_eq!(
         outcome_of(&verdicts, orders),
-        Some(DefinitionOutcome::Explained { differing: vec!["ttl".into()] }),
+        Some(DefinitionOutcome::Explained { differing: vec![DefinitionKey::index("ttl")] }),
         "{verdicts:?}"
     );
 }
@@ -604,7 +604,7 @@ fn a_mismatch_the_responders_refusal_explains_is_explained_too() {
     let verdicts = exchange(&a, &b, &[orders]);
     assert_eq!(
         outcome_of(&verdicts, orders),
-        Some(DefinitionOutcome::Explained { differing: vec!["ttl".into()] }),
+        Some(DefinitionOutcome::Explained { differing: vec![DefinitionKey::index("ttl")] }),
         "{verdicts:?}"
     );
 }
@@ -618,7 +618,7 @@ fn a_hint_never_masks_an_unrelated_difference_on_the_same_collection() {
     let verdicts = exchange(&a, &b, &[orders]);
     match outcome_of(&verdicts, orders) {
         Some(DefinitionOutcome::Compared { equal: false, differing, .. }) => {
-            assert_eq!(differing, vec!["other".to_string(), "ttl".to_string()]);
+            assert_eq!(differing, vec![DefinitionKey::index("other"), DefinitionKey::index("ttl")]);
         }
         other => panic!("one hint explains one name, not both: {other:?}"),
     }
@@ -681,7 +681,7 @@ fn the_responder_applies_the_floor_clause_before_it_sends_a_pair() {
     assert!(entry.refused.is_empty(), "at the floor: not sent");
     let reply_not_asked = b.definition_answer(&DefinitionAsk::new(cut_of(&a, &b), [])).unwrap();
     assert!(
-        reply_not_asked.entries.iter().all(|e| e.refused.is_empty() && e.indexes.is_empty()),
+        reply_not_asked.entries.iter().all(|e| e.refused.is_empty() && e.definitions.is_empty()),
         "detail only for the collections asked for"
     );
 }
@@ -696,11 +696,12 @@ fn a_refused_drop_is_explained_on_the_side_that_holds_the_index() {
     let stamp = a.get_collection("shop", "orders").unwrap().indexes[0].created.unwrap();
     // B dropped it (it lacks it); A holds it and refused the drop.
     edit(&b, "orders", |meta| meta.indexes.clear());
-    a.record_refusal_hint(&RefusalHint::new(orders, HintKind::Drop, "held", stamp, hash)).unwrap();
+    a.record_refusal_hint(&RefusalHint::new(orders, HintKind::DropIndex, "held", stamp, hash))
+        .unwrap();
     let verdicts = exchange(&a, &b, &[orders]);
     assert_eq!(
         outcome_of(&verdicts, orders),
-        Some(DefinitionOutcome::Explained { differing: vec!["held".into()] }),
+        Some(DefinitionOutcome::Explained { differing: vec![DefinitionKey::index("held")] }),
         "{verdicts:?}"
     );
     // The held index is replaced by a different definition: the hint is about
@@ -772,11 +773,14 @@ fn a_definition_lists_hashes_are_what_the_answer_carries_for_the_detail() {
     let reply = b.definition_answer(&ask).unwrap();
     let entry = reply.entries.iter().find(|e| e.collection == orders).unwrap();
     let list = definition_list(&b.get_collection("shop", "orders").unwrap());
-    let carried: Vec<(String, u128)> = entry
-        .indexes
+    let carried: Vec<(DefinitionKey, u128)> = entry
+        .definitions
         .iter()
-        .map(|(name, hash)| {
-            (name.clone(), u128::from_be_bytes(hash.as_slice().try_into().expect("16 bytes")))
+        .map(|d| {
+            (
+                DefinitionKey { kind: d.kind, name: d.name.clone() },
+                u128::from_be_bytes(d.hash.as_slice().try_into().expect("16 bytes")),
+            )
         })
         .collect();
     assert_eq!(carried, list);
@@ -791,7 +795,8 @@ fn a_refused_drop_does_not_explain_a_name_the_peer_holds_in_another_form() {
     let (a, b, orders, _dirs) = converged_with_index("held");
     let hash = hash_of(&a, "orders", "held");
     let stamp = a.get_collection("shop", "orders").unwrap().indexes[0].created.unwrap();
-    a.record_refusal_hint(&RefusalHint::new(orders, HintKind::Drop, "held", stamp, hash)).unwrap();
+    a.record_refusal_hint(&RefusalHint::new(orders, HintKind::DropIndex, "held", stamp, hash))
+        .unwrap();
     edit(&b, "orders", |meta| meta.indexes[0].unique = true);
     let verdicts = exchange(&a, &b, &[orders]);
     assert_eq!(compared(&verdicts, orders), Some(false), "{verdicts:?}");
@@ -805,7 +810,8 @@ fn a_pair_for_a_held_index_does_not_explain_a_name_the_requester_holds_in_anothe
     let (a, b, orders, _dirs) = converged_with_index("held");
     let hash = hash_of(&b, "orders", "held");
     let stamp = b.get_collection("shop", "orders").unwrap().indexes[0].created.unwrap();
-    b.record_refusal_hint(&RefusalHint::new(orders, HintKind::Drop, "held", stamp, hash)).unwrap();
+    b.record_refusal_hint(&RefusalHint::new(orders, HintKind::DropIndex, "held", stamp, hash))
+        .unwrap();
     // Control: A lacks the name, which the pair explains.
     let held = a.get_collection("shop", "orders").unwrap().indexes[0].clone();
     edit(&a, "orders", |meta| meta.indexes.clear());
@@ -943,7 +949,7 @@ fn a_deferred_collection_carries_no_detail() {
     let reply = b.definition_answer(&ask).unwrap();
     let entry = reply.entries.iter().find(|e| e.collection == orders).unwrap();
     assert_eq!(entry.deferred, Some(DefinitionDefer::Incarnation));
-    assert!(entry.indexes.is_empty() && entry.refused.is_empty(), "{entry:?}");
+    assert!(entry.definitions.is_empty() && entry.refused.is_empty(), "{entry:?}");
 }
 
 // -- The cost ------------------------------------------------------------------------

@@ -2097,14 +2097,23 @@ mod tests {
         assert_eq!(definitions, Some(kimmy_storage::DefinitionReply::default()));
         // An answer with entries round-trips, and an older requester ignores it.
         let reply = kimmy_storage::DefinitionReply {
+            format: kimmy_storage::definition_digest::FORMAT,
             malformed: 0,
             entries: vec![kimmy_storage::DefinitionEntry {
                 collection: CollectionId(u64::MAX),
                 digest: serde_bytes::ByteBuf::from(vec![7; 16]),
                 deferred: None,
                 above: None,
-                indexes: vec![("x".into(), serde_bytes::ByteBuf::from(vec![1; 16]))],
-                refused: vec![("y".into(), serde_bytes::ByteBuf::from(vec![2; 16]))],
+                definitions: vec![kimmy_storage::WireDefinition {
+                    kind: kimmy_storage::DefinitionKind::Index,
+                    name: "x".into(),
+                    hash: serde_bytes::ByteBuf::from(vec![1; 16]),
+                }],
+                refused: vec![kimmy_storage::WireRefusal {
+                    hint: kimmy_storage::HintKind::DropIndex,
+                    name: "y".into(),
+                    hash: serde_bytes::ByteBuf::from(vec![2; 16]),
+                }],
             }],
         };
         let answered = Message::Divergence {
@@ -2164,7 +2173,7 @@ mod tests {
             digest: serde_bytes::ByteBuf::from(vec![1; 16]),
             deferred: None,
             above: None,
-            indexes: Vec::new(),
+            definitions: Vec::new(),
             refused: Vec::new(),
         })
         .unwrap();

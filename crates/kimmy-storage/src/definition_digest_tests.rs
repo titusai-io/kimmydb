@@ -10,7 +10,7 @@ use kimmy_core::{
 use proptest::prelude::*;
 
 use crate::definition_digest::{
-    VECTOR_NAME, definition_digest, definition_list, index_hash, vector_hash,
+    DefinitionKey, definition_digest, definition_list, index_hash, vector_hash,
 };
 use crate::meta::CollectionMeta;
 
@@ -316,10 +316,11 @@ fn the_list_is_ordered_by_derived_id_then_name_and_the_vector_comes_last() {
         Some(config(4)),
     );
     let list = definition_list(&meta);
-    let names: Vec<&str> = list.iter().map(|(name, _)| name.as_str()).collect();
+    let keys: Vec<&DefinitionKey> = list.iter().map(|(key, _)| key).collect();
     let mut by_id = ["zeta", "alpha"];
     by_id.sort_by_key(|name| (IndexMeta::derive_id(name), *name));
-    assert_eq!(names, vec![by_id[0], by_id[1], VECTOR_NAME]);
+    let (first, second) = (DefinitionKey::index(by_id[0]), DefinitionKey::index(by_id[1]));
+    assert_eq!(keys, vec![&first, &second, &DefinitionKey::vector()]);
     // And each entry carries the hash of the definition under that name.
     assert_eq!(list[2].1, vector_hash(&config(4)));
 }
@@ -583,19 +584,19 @@ fn the_hash_of_a_definition_is_pinned() {
 }
 
 const PINNED: &[(&str, &str)] = &[
-    ("index, one ascending field", "5f25b9d4394c4cba08fe83bc0d9429f2"),
-    ("index, every part", "1d48112e1c1af1eec43c7e67839d1b06"),
-    ("vector, byo", "0f2efdd023aaef8abac84381ba73e1dc"),
-    ("vector, euclidean", "3984d435edcc9b0619d67973494530b4"),
-    ("vector, prefixes and tokens", "ab61cc2f6808cdbd1bfbaf6014604a83"),
-    ("vector, openai bare", "d7066f188398acc05d70a2084ccbe2a2"),
-    ("vector, openai full", "7e8cc2fb8bfe01c48698444c41789181"),
-    ("vector, ollama", "2f71ed8f93b6dcfd488b584f3cdfbd31"),
-    ("vector, custom http", "893d3a8fe58e32ee103bb8d3ea006c57"),
-    ("vector, cohere", "1aa9c5280f2f9296927134f13c18eabf"),
-    ("vector, gemini", "f35be752ab54d5de9fe6c7668468fb1c"),
-    ("vector, local", "6378081419d90e4f9cdeee7a3dfe3cdc"),
-    ("vector, profile", "cf61791578c5245637ef9a897f0efe0a"),
-    ("collection digest, two indexes and a vector", "322f3f2b3876e1535ea250485010131c"),
-    ("collection digest, nothing", "15ee0f80ffcf8fe7f57f0559e56a5427"),
+    ("index, one ascending field", "6b17b6a32909a39fa9507e29f28d81ff"),
+    ("index, every part", "941ef9752b07086ce5c515d6d5397c68"),
+    ("vector, byo", "4805202f3b82b1f992d4ea795f6efee2"),
+    ("vector, euclidean", "17c73213c716aa6281aec555317635ba"),
+    ("vector, prefixes and tokens", "42c315cfa4e9643f4c92553864b245d0"),
+    ("vector, openai bare", "f6a6f003f7d8e1cb1d8ed7d1f05d0563"),
+    ("vector, openai full", "a10fe6686620cc5100baa9a627f779ec"),
+    ("vector, ollama", "1c960c13ffa82267abf7d909dd3f3bb8"),
+    ("vector, custom http", "82d9ace0d0ac6d25245e4a51961c37ad"),
+    ("vector, cohere", "1cbcf1cd0aa7d93920737975a6132d81"),
+    ("vector, gemini", "17e4ddbe15641b7bb64bbb5c8144aefe"),
+    ("vector, local", "badab7edd56b9fb6a3714192bfc9e4ce"),
+    ("vector, profile", "e3a444fa911037d5b4f74fda21a9a441"),
+    ("collection digest, two indexes and a vector", "568dbcf3cd44a4ec9a9215a5a11c9de9"),
+    ("collection digest, nothing", "97abaa003ead56bbffb0d7276c8766a7"),
 ];

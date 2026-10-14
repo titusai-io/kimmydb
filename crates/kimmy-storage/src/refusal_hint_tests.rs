@@ -5,7 +5,7 @@
 use bson::{doc, spec::BinarySubtype};
 use kimmy_core::{CollectionId, IndexField, OpKind, Stamp, VectorConfig};
 
-use crate::definition_digest::{VECTOR_NAME, index_hash, vector_hash};
+use crate::definition_digest::{DefinitionKey, index_hash, vector_hash};
 use crate::refusal_hint::HintKind;
 use crate::{Engine, SnapshotProgress, WalkScope};
 
@@ -146,7 +146,7 @@ fn a_replicated_vector_configuration_refused_leaves_a_hint_under_the_reserved_na
     assert_eq!(outcome.ddl_refused, 1, "premise: refused: {outcome:?}");
     let hints = b.refusal_hints(on_a.id).unwrap();
     assert_eq!(hints.len(), 1, "{hints:?}");
-    assert_eq!((hints[0].kind, hints[0].name.as_str()), (HintKind::Vector, VECTOR_NAME));
+    assert_eq!((hints[0].kind, hints[0].name.as_str()), (HintKind::Vector, ""));
     assert_eq!(hints[0].hash, vector_hash(&local_config()));
     assert_eq!(hints[0].stamp, stamp);
 }
@@ -169,15 +169,18 @@ fn a_refused_drop_of_an_index_this_member_holds_leaves_a_drop_hint_with_the_held
     assert_eq!(hints.len(), 1, "{hints:?}");
     assert_eq!(
         (hints[0].kind, hints[0].name.as_str(), hints[0].hash),
-        (HintKind::Drop, "held", held)
+        (HintKind::DropIndex, "held", held)
     );
     // And a refused turning-off of a configuration this member holds is the
     // same shape, under the reserved name.
     b.configure_vectors("shop", "orders", crate::definition_probe_tests::byo()).unwrap();
     b.note_refused_vector("shop", "orders", None, stamp).unwrap();
     let hints = b.refusal_hints(CollectionId::derive("shop", "orders")).unwrap();
-    let vector = hints.iter().find(|h| h.name == VECTOR_NAME).expect("a vector hint");
-    assert_eq!(vector.kind, HintKind::Drop);
+    let vector = hints
+        .iter()
+        .find(|h| h.kind.definition() == crate::definition_digest::DefinitionKind::Vector)
+        .expect("a vector hint");
+    assert_eq!(vector.kind, HintKind::DropVector);
     assert_eq!(vector.hash, vector_hash(&crate::definition_probe_tests::byo()));
 }
 
@@ -234,7 +237,7 @@ fn a_snapshot_vector_configuration_refused_leaves_a_hint() {
         b.apply_snapshot_page(a.node_id(), &mut SnapshotProgress::whole_database(), &page).unwrap();
     assert_eq!(outcome.ddl_refused, 1, "premise: refused: {outcome:?}");
     let hints = b.refusal_hints(CollectionId::derive("shop", "orders")).unwrap();
-    let hint = hints.iter().find(|h| h.name == VECTOR_NAME).expect("a vector hint");
+    let hint = hints.iter().find(|h| h.key() == DefinitionKey::vector()).expect("a vector hint");
     assert_eq!(
         (hint.kind, hint.hash, hint.stamp),
         (HintKind::Vector, vector_hash(&local_config()), stamp)

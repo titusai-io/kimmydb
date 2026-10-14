@@ -1807,7 +1807,7 @@ impl Metrics {
              # HELP kimmy_sync_definition_divergent_collections Collections the definition digest currently finds disagreeing with a peer: the two members hold different index or vector definitions for them, seen on two compared checks running. Also counted in kimmy_sync_divergent_collections, which this attributes. Detect only: nothing is repaired from it. Read the indexes of the collection on both members (GET /v1/db/{{db}}/coll/{{coll}}/indexes) and compare the definition the WARN names, including expireAfterSeconds and unique, before recreating anything (operations.md, The definition digest).\n\
              # TYPE kimmy_sync_definition_divergent_collections gauge\n\
              kimmy_sync_definition_divergent_collections {sync_definition_divergent}\n\
-             # HELP kimmy_sync_divergence_definition_probes_total Collections the definition digest looked at, by outcome. compared: both sides' digests of the collection's index and vector definitions were taken at one cut and compared; the gauge reading 0 means the members agree only while this rises. explained: the digests differed and a valid refusal hint on one side covers every differing definition, a refusal this node or the peer counted in kimmy_sync_ddl_refused_total, so the difference is known; never counted as compared. unanswered: a checked contact whose peer returned no definition digest (a build before it). deferred, by reason: not compared, and none is silent. incarnation: this side or the peer holds a drop tombstone for the collection that the cut does not yet cover, or the collection is not newer than the drop. database_tombstone: the same for the collection's database. definition_above_cut: an index or vector configuration of the collection was made or dropped above the cut, so it is in motion. horizon: the cut is below what retention removed, so no collection can be judged on either side. error: this side failed to compute or to compare, and the contact went on without it. malformed: an entry of the peer's answer did not decode, or carried a digest of the wrong width. Deferrals are reported, not graded; compared must be above 0 for each live pair.\n\
+             # HELP kimmy_sync_divergence_definition_probes_total Collections the definition digest looked at, by outcome. compared: both sides' digests of the collection's index and vector definitions were taken at one cut and compared; the gauge reading 0 means the members agree only while this rises. explained: the digests differed and a valid refusal hint on one side covers every differing definition, a refusal this member or the peer remembers (the hint outlives a restart; kimmy_sync_ddl_refused_total does not), so the difference is known; never counted as compared; read GET /v1/db/{{db}}/coll/{{coll}}/indexes on both members to see it. unanswered: a checked contact whose peer returned no definition digest (a build before it). deferred, by reason: not compared, and none is silent. incarnation: this side or the peer holds a drop tombstone for the collection that the cut does not yet cover, or the collection is not newer than the drop. database_tombstone: the same for the collection's database. definition_above_cut: an index or vector configuration of the collection was made or dropped above the cut, so it is in motion. horizon: the cut is below what retention removed, so no collection can be judged on either side. error: this side failed to compute or to compare, and the contact went on without it. malformed: an entry of the peer's answer did not decode, or carried a digest of the wrong width. format: the peer's answer is of another format of the digest (a roll across a change of what is hashed), so no collection is compared with it until both run the same. Deferrals are reported, not graded; compared must be above 0 for each live pair.\n\
              # TYPE kimmy_sync_divergence_definition_probes_total counter\n\
              kimmy_sync_divergence_definition_probes_total{{outcome=\"compared\"}} {sync_definition_compared}\n\
              kimmy_sync_divergence_definition_probes_total{{outcome=\"explained\"}} {sync_definition_explained}\n\
@@ -2690,7 +2690,7 @@ mod tests {
             definition_compared: 141,
             definition_explained: 142,
             definition_unanswered: 143,
-            definition_deferred: [151, 152, 153, 154, 155, 156],
+            definition_deferred: [151, 152, 153, 154, 155, 156, 157],
             definition_divergent_collections: 17,
             divergence_last_check: Some(now - Duration::from_secs(70)),
             last_completed_round: Some(now - Duration::from_secs(80)),
@@ -2726,7 +2726,7 @@ mod tests {
             definition_compared: 2,
             definition_explained: 3,
             definition_unanswered: 4,
-            definition_deferred: [1, 2, 3, 4, 5, 6],
+            definition_deferred: [1, 2, 3, 4, 5, 6, 7],
             definition_divergent_collections: 5,
             divergence_last_check: Some(now - Duration::from_secs(71)),
             last_completed_round: Some(now - Duration::from_secs(81)),
@@ -3572,7 +3572,7 @@ kimmy_sync_digest_drift_total 9
 # HELP kimmy_sync_definition_divergent_collections Collections the definition digest currently finds disagreeing with a peer: the two members hold different index or vector definitions for them, seen on two compared checks running. Also counted in kimmy_sync_divergent_collections, which this attributes. Detect only: nothing is repaired from it. Read the indexes of the collection on both members (GET /v1/db/{db}/coll/{coll}/indexes) and compare the definition the WARN names, including expireAfterSeconds and unique, before recreating anything (operations.md, The definition digest).
 # TYPE kimmy_sync_definition_divergent_collections gauge
 kimmy_sync_definition_divergent_collections 5
-# HELP kimmy_sync_divergence_definition_probes_total Collections the definition digest looked at, by outcome. compared: both sides' digests of the collection's index and vector definitions were taken at one cut and compared; the gauge reading 0 means the members agree only while this rises. explained: the digests differed and a valid refusal hint on one side covers every differing definition, a refusal this node or the peer counted in kimmy_sync_ddl_refused_total, so the difference is known; never counted as compared. unanswered: a checked contact whose peer returned no definition digest (a build before it). deferred, by reason: not compared, and none is silent. incarnation: this side or the peer holds a drop tombstone for the collection that the cut does not yet cover, or the collection is not newer than the drop. database_tombstone: the same for the collection's database. definition_above_cut: an index or vector configuration of the collection was made or dropped above the cut, so it is in motion. horizon: the cut is below what retention removed, so no collection can be judged on either side. error: this side failed to compute or to compare, and the contact went on without it. malformed: an entry of the peer's answer did not decode, or carried a digest of the wrong width. Deferrals are reported, not graded; compared must be above 0 for each live pair.
+# HELP kimmy_sync_divergence_definition_probes_total Collections the definition digest looked at, by outcome. compared: both sides' digests of the collection's index and vector definitions were taken at one cut and compared; the gauge reading 0 means the members agree only while this rises. explained: the digests differed and a valid refusal hint on one side covers every differing definition, a refusal this member or the peer remembers (the hint outlives a restart; kimmy_sync_ddl_refused_total does not), so the difference is known; never counted as compared; read GET /v1/db/{db}/coll/{coll}/indexes on both members to see it. unanswered: a checked contact whose peer returned no definition digest (a build before it). deferred, by reason: not compared, and none is silent. incarnation: this side or the peer holds a drop tombstone for the collection that the cut does not yet cover, or the collection is not newer than the drop. database_tombstone: the same for the collection's database. definition_above_cut: an index or vector configuration of the collection was made or dropped above the cut, so it is in motion. horizon: the cut is below what retention removed, so no collection can be judged on either side. error: this side failed to compute or to compare, and the contact went on without it. malformed: an entry of the peer's answer did not decode, or carried a digest of the wrong width. format: the peer's answer is of another format of the digest (a roll across a change of what is hashed), so no collection is compared with it until both run the same. Deferrals are reported, not graded; compared must be above 0 for each live pair.
 # TYPE kimmy_sync_divergence_definition_probes_total counter
 kimmy_sync_divergence_definition_probes_total{outcome=\"compared\"} 143
 kimmy_sync_divergence_definition_probes_total{outcome=\"explained\"} 145
@@ -4765,7 +4765,7 @@ kimmy_storage_cache_reads_total{result=\"miss\"} 9104
             definition_compared: 0,
             definition_explained: 0,
             definition_unanswered: 0,
-            definition_deferred: [0; 6],
+            definition_deferred: [0; 7],
             definition_divergent_collections: 0,
             divergence_last_check: Some(now - Duration::from_secs(30)),
             last_completed_round: None,
@@ -4801,7 +4801,7 @@ kimmy_storage_cache_reads_total{result=\"miss\"} 9104
             definition_compared: 0,
             definition_explained: 0,
             definition_unanswered: 0,
-            definition_deferred: [0; 6],
+            definition_deferred: [0; 7],
             definition_divergent_collections: 0,
             divergence_last_check: Some(now - Duration::from_secs(8)),
             last_completed_round: None,
@@ -5028,7 +5028,7 @@ kimmy_storage_cache_reads_total{result=\"miss\"} 9104
             definition_compared: 0,
             definition_explained: 0,
             definition_unanswered: 0,
-            definition_deferred: [0; 6],
+            definition_deferred: [0; 7],
             definition_divergent_collections: 0,
             divergence_last_check: at,
             last_completed_round: None,

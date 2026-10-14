@@ -17,6 +17,13 @@
 //! restore and a recreated collection therefore cannot leave a stale row
 //! masking anything.
 //!
+//! **Kinds.** A hint is of one of four kinds: a refused index, a refused vector
+//! configuration, and the two opposite shapes (a peer's drop of an index, or a
+//! turning-off of the vector configuration, that this member holds and could not
+//! apply). The kind says which definition it is about, so an index named like
+//! anything cannot be mistaken for the configuration, and which shape its
+//! validity takes.
+//!
 //! `META` and not a table of its own, so a backup carries it (`META` rows are
 //! copied whatever their key) and a build that does not know it never reads the
 //! rows.
@@ -25,34 +32,52 @@ use kimmy_core::{CollectionId, Stamp};
 use redb::{ReadTransaction, ReadableDatabase, ReadableTable, WriteTransaction};
 
 use crate::codec;
-use crate::definition_digest::DefinitionHash;
+use crate::definition_digest::{DefinitionHash, DefinitionKey, DefinitionKind};
 use crate::engine::{Engine, WriterHolder};
-use crate::error::{Result, StorageError};
+use crate::error::Result;
 use crate::tables;
 
 /// The key prefix of a collection's hints is `ddl_refused:<id>:`.
 const PREFIX: &str = "ddl_refused:";
 
-/// What was refused.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+/// What was refused, and in which shape.
+#[derive(
+    Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, serde::Serialize, serde::Deserialize,
+)]
+#[serde(rename_all = "snake_case")]
 pub enum HintKind {
     /// An index definition this member could not apply.
     Index,
-    /// A vector configuration this member could not apply. Its name is
-    /// [`crate::definition_digest::VECTOR_NAME`].
+    /// A vector configuration this member could not apply.
     Vector,
     /// A peer's drop of an index this member holds and could not apply: the
     /// opposite shape, where this member is the one still holding the
     /// definition.
-    Drop,
+    DropIndex,
+    /// The same for a peer's turning off of the vector configuration.
+    DropVector,
 }
 
 impl HintKind {
+    /// Which kind of definition this is about.
+    pub fn definition(self) -> DefinitionKind {
+        match self {
+            Self::Index | Self::DropIndex => DefinitionKind::Index,
+            Self::Vector | Self::DropVector => DefinitionKind::Vector,
+        }
+    }
+
+    /// Whether this is the opposite shape: this member holds what a peer dropped.
+    pub fn is_drop(self) -> bool {
+        matches!(self, Self::DropIndex | Self::DropVector)
+    }
+
     fn as_str(self) -> &'static str {
         match self {
             Self::Index => "index",
             Self::Vector => "vector",
-            Self::Drop => "drop",
+            Self::DropIndex => "drop_index",
+            Self::DropVector => "drop_vector",
         }
     }
 
@@ -60,7 +85,8 @@ impl HintKind {
         match text {
             "index" => Some(Self::Index),
             "vector" => Some(Self::Vector),
-            "drop" => Some(Self::Drop),
+            "drop_index" => Some(Self::DropIndex),
+            "drop_vector" => Some(Self::DropVector),
             _ => None,
         }
     }
@@ -71,7 +97,7 @@ impl HintKind {
 pub struct RefusalHint {
     pub collection: CollectionId,
     pub kind: HintKind,
-    /// The index name, or [`crate::definition_digest::VECTOR_NAME`].
+    /// The index's name; empty for the vector configuration.
     pub name: String,
     /// The stamp of the entry that was refused.
     pub stamp: Stamp,
@@ -90,19 +116,21 @@ impl RefusalHint {
         stamp: Stamp,
         hash: DefinitionHash,
     ) -> Self {
-        Self {
-            collection,
-            kind,
-            name: name.into(),
-            stamp,
-            version: env!("CARGO_PKG_VERSION").to_string(),
-            hash,
-        }
+        let name = match kind.definition() {
+            DefinitionKind::Index => name.into(),
+            DefinitionKind::Vector => String::new(),
+        };
+        Self { collection, kind, name, stamp, version: env!("CARGO_PKG_VERSION").to_string(), hash }
     }
 
-    /// The `META` key: the id in decimal, the kind, then the name, which may
-    /// contain `:` and so is parsed last.
-    fn key(&self) -> String {
+    /// The definition this hint is about.
+    pub fn key(&self) -> DefinitionKey {
+        DefinitionKey { kind: self.kind.definition(), name: self.name.clone() }
+    }
+
+    /// The `META` key: the id in decimal, the kind, then the name (empty for a
+    /// vector configuration), which may contain `:` and so is parsed last.
+    fn row_key(&self) -> String {
         format!("{PREFIX}{}:{}:{}", self.collection.0, self.kind.as_str(), self.name)
     }
 
@@ -130,6 +158,25 @@ impl RefusalHint {
     }
 }
 
+/// At most one warning per ten minutes for a hint row that cannot be read.
+fn warn_of_an_unreadable_hint(key: &str) {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static LAST: AtomicU64 = AtomicU64::new(0);
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(1, |since| since.as_secs().max(1));
+    let last = LAST.load(Ordering::Relaxed);
+    if (last == 0 || now.saturating_sub(last) >= 600)
+        && LAST.compare_exchange(last, now, Ordering::Relaxed, Ordering::Relaxed).is_ok()
+    {
+        tracing::warn!(
+            key,
+            "a refusal hint row could not be read and is ignored: it explains nothing, and a \
+             hint written under the same key replaces it"
+        );
+    }
+}
+
 /// The range of a collection's hint keys: `ddl_refused:<id>:` up to the first
 /// key after it (`;` follows `:`).
 fn range_of(collection: CollectionId) -> (String, String) {
@@ -147,7 +194,9 @@ impl Engine {
     pub fn record_refusal_hint(&self, hint: &RefusalHint) -> Result<()> {
         #[cfg(any(test, feature = "test-hooks"))]
         if self.hint_write_fails.swap(false, std::sync::atomic::Ordering::SeqCst) {
-            return Err(StorageError::Corrupt("a hint write failure injected by a test".into()));
+            return Err(crate::StorageError::Corrupt(
+                "a hint write failure injected by a test".into(),
+            ));
         }
         // A refusal met again (a permanent one is re-met on every repair or
         // catch-up round) finds the same row already there: nothing is committed,
@@ -180,7 +229,7 @@ impl Engine {
         txn: &WriteTransaction,
         hint: &RefusalHint,
     ) -> Result<bool> {
-        let key = hint.key();
+        let key = hint.row_key();
         let mut meta = txn.open_table(tables::META)?;
         if let Some(held) = meta.get(key.as_str())?
             && let Some(existing) = RefusalHint::decode(hint.collection, &key, held.value())
@@ -193,6 +242,13 @@ impl Engine {
     }
 
     /// The hints held for `collection`, in a read transaction the caller holds.
+    ///
+    /// A row this build cannot decode (a kind a later build wrote and the store
+    /// was rolled back past, or damage) is **skipped and warned about**, never an
+    /// error: a hint is only ever a reason to explain a difference, so losing one
+    /// costs an explanation, where failing here would fail every definition
+    /// answer and every comparison on this member, and the replication batch
+    /// whose refusal wants to write a hint.
     pub(crate) fn refusal_hints_in(
         txn: &ReadTransaction,
         collection: CollectionId,
@@ -204,12 +260,7 @@ impl Engine {
             let (key, value) = row?;
             match RefusalHint::decode(collection, key.value(), value.value()) {
                 Some(hint) => out.push(hint),
-                None => {
-                    return Err(StorageError::Corrupt(format!(
-                        "a refusal hint row does not decode: {}",
-                        key.value()
-                    )));
-                }
+                None => warn_of_an_unreadable_hint(key.value()),
             }
         }
         Ok(out)
@@ -277,18 +328,12 @@ impl Engine {
         let (kind, hash) = match config {
             Some(config) => (HintKind::Vector, crate::definition_digest::vector_hash(config)),
             None => match self.get_collection(db, name).ok().and_then(|meta| meta.vector) {
-                Some(held) => (HintKind::Drop, crate::definition_digest::vector_hash(&held)),
+                Some(held) => (HintKind::DropVector, crate::definition_digest::vector_hash(&held)),
                 // Nothing held, so nothing to explain.
                 None => return Ok(()),
             },
         };
-        self.record_refusal_hint(&RefusalHint::new(
-            collection,
-            kind,
-            crate::definition_digest::VECTOR_NAME,
-            stamp,
-            hash,
-        ))
+        self.record_refusal_hint(&RefusalHint::new(collection, kind, "", stamp, hash))
     }
 
     /// The same for a peer's drop of an index this member holds and could not
@@ -307,25 +352,31 @@ impl Engine {
         };
         self.record_refusal_hint(&RefusalHint::new(
             CollectionId::derive(db, collection),
-            HintKind::Drop,
+            HintKind::DropIndex,
             index,
             stamp,
             crate::definition_digest::index_hash(&held),
         ))
     }
 
-    /// Remove the hints of `collection` that are about the definition `name`,
-    /// whatever their kind, in the caller's transaction: an index dropped here is
-    /// no longer one this member refused or holds under a refusal.
-    pub(crate) fn clear_refusal_hints_named_in(
+    /// Remove the hints of `collection` about one definition, of both shapes, in
+    /// the caller's transaction. A definition this member now holds, has applied
+    /// again or has dropped is no longer one it refused or holds under a refusal,
+    /// and a row that outlived the change would explain a later, different loss
+    /// of the same definition as the refusal that is long since mended.
+    pub(crate) fn clear_refusal_hints_for_in(
         txn: &WriteTransaction,
         collection: CollectionId,
-        name: &str,
+        definition: &DefinitionKey,
     ) -> Result<usize> {
         let mut meta = txn.open_table(tables::META)?;
         let mut cleared = 0usize;
-        for kind in [HintKind::Index, HintKind::Vector, HintKind::Drop] {
-            let key = format!("{PREFIX}{}:{}:{}", collection.0, kind.as_str(), name);
+        let kinds = match definition.kind {
+            DefinitionKind::Index => [HintKind::Index, HintKind::DropIndex],
+            DefinitionKind::Vector => [HintKind::Vector, HintKind::DropVector],
+        };
+        for kind in kinds {
+            let key = format!("{PREFIX}{}:{}:{}", collection.0, kind.as_str(), definition.name);
             if meta.remove(key.as_str())?.is_some() {
                 cleared += 1;
             }

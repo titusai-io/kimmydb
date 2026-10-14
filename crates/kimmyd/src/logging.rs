@@ -1833,6 +1833,13 @@ impl TelemetryGuard {
             |s| s.sync_definition_deferred[kimmy_storage::DefinitionDefer::Malformed.index()]
         );
         observe!(
+            u64_observable_counter,
+            "kimmy.sync.divergence_definition_probes.deferred.format",
+            "{collection}",
+            "Collections whose definition digest was not compared, for this reason (format).",
+            |s| s.sync_definition_deferred[kimmy_storage::DefinitionDefer::Format.index()]
+        );
+        observe!(
             u64_observable_gauge,
             "kimmy.sync.divergence_check_age",
             "s",

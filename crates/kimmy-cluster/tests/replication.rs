@@ -10122,7 +10122,7 @@ async fn a_covered_difference_is_found_named_and_explained_by_a_hint() {
     let outcome = sync_once_with(&a.engine, b.addr, SECRET, None, &mut stalls).await.unwrap();
     match definition_outcome(&outcome, orders) {
         Some(kimmy_storage::DefinitionOutcome::Compared { equal: false, differing, .. }) => {
-            assert_eq!(differing, vec!["a_1".to_string()]);
+            assert_eq!(differing, vec![kimmy_storage::DefinitionKey::index("a_1")]);
         }
         other => panic!("expected a mismatch with its name, got {other:?}"),
     }

@@ -17,6 +17,12 @@
 //! missing filter and the string `"null"` never hash alike. A hash of a
 //! concatenation would let two different definitions collide by construction.
 //!
+//! **Entries are keyed by kind.** The list is of `(kind, name)`, and the vector
+//! configuration is not an index with a special name: an index may be named
+//! anything (including `__vector`), so a name alone cannot say which of the two
+//! an entry is. Each entry is framed with its kind, ordered by it, and keyed by
+//! it in every map that compares two lists.
+//!
 //! **The library's output is part of the input.** The partial filter is hashed
 //! as the string `compared()` returns (canonical Extended JSON, top-level keys
 //! sorted), which is `bson`'s rendering. A change in how `bson` renders a
@@ -35,11 +41,50 @@ use crate::meta::CollectionMeta;
 /// The definition digest's format: what is hashed and how it is framed. A
 /// change to either bumps it, so a digest from a build under another format is
 /// never equal to this one's by accident.
-pub const FORMAT: u8 = 1;
+pub const FORMAT: u8 = 2;
 
-/// The name a collection's vector configuration goes by in a list of
-/// definitions. The `__` prefix is reserved, so no index can have it.
-pub const VECTOR_NAME: &str = "__vector";
+/// What a definition is. Not a name's business: an index can be named anything.
+#[derive(
+    Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, serde::Serialize, serde::Deserialize,
+)]
+#[serde(rename_all = "snake_case")]
+pub enum DefinitionKind {
+    Index,
+    Vector,
+}
+
+/// One definition of a collection: an index by its name, or its vector
+/// configuration (the collection has one, so it needs no name).
+#[derive(
+    Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, serde::Serialize, serde::Deserialize,
+)]
+pub struct DefinitionKey {
+    pub kind: DefinitionKind,
+    /// The index's name; empty for the vector configuration.
+    #[serde(default)]
+    pub name: String,
+}
+
+impl DefinitionKey {
+    pub fn index(name: impl Into<String>) -> Self {
+        Self { kind: DefinitionKind::Index, name: name.into() }
+    }
+
+    pub fn vector() -> Self {
+        Self { kind: DefinitionKind::Vector, name: String::new() }
+    }
+}
+
+impl std::fmt::Display for DefinitionKey {
+    /// For an operator: the index's name, or the words for the configuration
+    /// (a log line, never parsed).
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self.kind {
+            DefinitionKind::Index => write!(f, "index {}", self.name),
+            DefinitionKind::Vector => write!(f, "the vector configuration"),
+        }
+    }
+}
 
 /// A definition's hash, 16 bytes.
 pub type DefinitionHash = u128;
@@ -227,24 +272,25 @@ pub fn vector_hash(config: &VectorConfig) -> DefinitionHash {
     frame.finish()
 }
 
-/// The collection's definitions as `(name, hash)`, indexes sorted by
-/// `(derived id, name)` and the vector configuration, if any, last under
-/// [`VECTOR_NAME`].
+/// The collection's definitions as `(key, hash)`, indexes sorted by
+/// `(derived id, name)` and the vector configuration, if any, last.
 ///
 /// Sorted by the id and then the name because the id is a 32-bit hash of the
 /// name and two names can share one; a tie would otherwise order
 /// nondeterministically.
-pub fn definition_list(meta: &CollectionMeta) -> Vec<(String, DefinitionHash)> {
+pub fn definition_list(meta: &CollectionMeta) -> Vec<(DefinitionKey, DefinitionHash)> {
     let mut indexes: Vec<&IndexMeta> = meta.indexes.iter().collect();
     indexes.sort_by(|a, b| {
         IndexMeta::derive_id(&a.name)
             .cmp(&IndexMeta::derive_id(&b.name))
             .then_with(|| a.name.cmp(&b.name))
     });
-    let mut list: Vec<(String, DefinitionHash)> =
-        indexes.into_iter().map(|index| (index.name.clone(), index_hash(index))).collect();
+    let mut list: Vec<(DefinitionKey, DefinitionHash)> = indexes
+        .into_iter()
+        .map(|index| (DefinitionKey::index(index.name.clone()), index_hash(index)))
+        .collect();
     if let Some(config) = &meta.vector {
-        list.push((VECTOR_NAME.to_string(), vector_hash(config)));
+        list.push((DefinitionKey::vector(), vector_hash(config)));
     }
     list
 }
@@ -256,11 +302,19 @@ pub fn definition_digest(meta: &CollectionMeta) -> DefinitionHash {
 
 /// The digest of a list of definitions, as [`definition_digest`] hashes it: a
 /// requester that holds a peer's list can recompute the peer's digest from it.
-pub fn digest_of_list(list: &[(String, DefinitionHash)]) -> DefinitionHash {
+pub fn digest_of_list(list: &[(DefinitionKey, DefinitionHash)]) -> DefinitionHash {
     let mut frame = Frame::new(LIST);
     frame.u64(list.len() as u64);
-    for (name, hash) in list {
-        frame.str(name);
+    for (key, hash) in list {
+        // The kind first, so an index named like anything cannot frame as the
+        // vector configuration.
+        match key.kind {
+            DefinitionKind::Index => {
+                frame.tag(0);
+                frame.str(&key.name);
+            }
+            DefinitionKind::Vector => frame.tag(1),
+        }
         frame.0.extend_from_slice(&hash.to_be_bytes());
     }
     frame.finish()

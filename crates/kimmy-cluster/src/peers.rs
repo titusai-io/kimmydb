@@ -2154,7 +2154,7 @@ fn fold_definition_round(
                         collection = %id,
                         mine = format!("{mine:032x}"),
                         theirs = format!("{theirs:032x}"),
-                        differing = ?differing,
+                        differing = ?differing.iter().map(ToString::to_string).collect::<Vec<_>>(),
                         "the definitions of a collection differ from this peer's on two \
                          consecutive comparisons; detect only, no repair is planned. Read \
                          GET /v1/db/{db}/coll/{name}/indexes on both members and compare the \
@@ -4208,7 +4208,7 @@ mod definition_fold_tests {
                 equal: false,
                 mine: 1,
                 theirs: 2,
-                differing: names.iter().map(|n| (*n).to_string()).collect(),
+                differing: names.iter().map(|n| kimmy_storage::DefinitionKey::index(*n)).collect(),
             })
         }
 
@@ -4223,7 +4223,7 @@ mod definition_fold_tests {
 
         fn explained(&self, names: &[&str]) -> DefinitionRound {
             self.round_of(DefinitionOutcome::Explained {
-                differing: names.iter().map(|n| (*n).to_string()).collect(),
+                differing: names.iter().map(|n| kimmy_storage::DefinitionKey::index(*n)).collect(),
             })
         }
 
@@ -4325,7 +4325,7 @@ mod definition_fold_tests {
             equal: false,
             mine: 1,
             theirs: 2,
-            differing: vec!["ttl".into()],
+            differing: vec![kimmy_storage::DefinitionKey::index("ttl")],
         };
         f.state.begin_tick();
         f.fold(round(&mismatch));

@@ -1217,6 +1217,11 @@ impl crate::Engine {
                                 .expect("the index was found on this meta a moment ago")
                                 .created = Some(minted);
                             crate::Engine::put_collection_meta(&txn, &meta)?;
+                            crate::Engine::clear_refusal_hints_for_in(
+                                &txn,
+                                meta.id,
+                                &crate::definition_digest::DefinitionKey::index(&restamped.name),
+                            )?;
                             let entry = crate::engine::ddl_entry(
                                 minted,
                                 kimmy_core::OpKind::CreateIndex,
@@ -1335,6 +1340,12 @@ impl crate::Engine {
                             return Ok((IndexCreated::Older, Vec::new()));
                         }
                         crate::Engine::put_collection_meta(&txn, &meta)?;
+                        // This member now holds the definition: a refusal of it is mended.
+                        crate::Engine::clear_refusal_hints_for_in(
+                            &txn,
+                            meta.id,
+                            &crate::definition_digest::DefinitionKey::index(&settled.name),
+                        )?;
                         // A restored definition's entry, with the stamp it settles
                         // on, in the stamp's own commit (ADR-180).
                         let relogged = match origin {
@@ -1585,6 +1596,13 @@ impl crate::Engine {
 
             meta.indexes.push(index.clone());
             crate::Engine::put_collection_meta(&txn, &meta)?;
+            // This member now holds the definition: a refusal of it is mended,
+            // and must not explain a later loss of it.
+            crate::Engine::clear_refusal_hints_for_in(
+                &txn,
+                meta.id,
+                &crate::definition_digest::DefinitionKey::index(&index.name),
+            )?;
 
             let logged = match origin {
                 CreateOrigin::Local => {
@@ -1851,7 +1869,11 @@ impl crate::Engine {
             // index is gone with no record that it was dropped.
             crate::Engine::record_index_drop_in_txn(&txn, meta.id, index_id, stamp)?;
             // A hint about an index that is gone here has nothing left to explain.
-            crate::Engine::clear_refusal_hints_named_in(&txn, meta.id, name)?;
+            crate::Engine::clear_refusal_hints_for_in(
+                &txn,
+                meta.id,
+                &crate::definition_digest::DefinitionKey::index(name),
+            )?;
 
             let logged = if log {
                 let entry = drop_entry(stamp)?;
