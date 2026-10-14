@@ -27191,7 +27191,7 @@ converged; the difference was only whether a tombstone survived.
    made after the floor stays, in the collection re-dated above the drop, ADR-231 extended) and the tombstone
    recorded, so the floor the receiver ends with is the sender's and stragglers of the ended life stay history. The
    page carries the floor as a time and not the origin of the drop, so the stamp is the floor and the **sender's
-   node**; the real tombstone, if it ever arrives, is the same or a later stamp and replaces it. The order is the one
+   node**. `record_collection_drop` keeps the greater stamp, and stamps order by `(hlc, node)`: a real drop with a later hlc replaces the synthetic tombstone, and one with an **equal hlc** replaces it only when its node sorts higher; otherwise the synthetic one stays. That is harmless, because every comparison of a drop against a life reads the hlc alone. The order is the one
    a carried drop has: the standing life first, then the definitions of the new one.
 5. **Both snapshot routes.** The check is in `restore_collection`, which the whole-database and the scoped route both
    call.
@@ -27205,19 +27205,19 @@ ends the old life and keeps what was written after the drop (tested with two ori
 drop later). A drop withheld for good would mean the member is beyond the horizon, and then it takes a
 whole-database snapshot, which is this route.
 
-**Left open, for the owner's ruling.** Two members that create one name independently with no drop between them
-(ADR-155 case 3) each keep their own `created` for good; no winner is chosen and nothing is buried. It is not data
-loss (the collection id is derived from the name, so the documents merge), but anything comparing `created` (the
-incarnation deferrals of the digests) sees two. A deterministic settling (both members adopt the older `created`)
-would need the same kind of evidence and is a design decision, not part of this change.
+**Decided (owner, 2026-10-14).** Two members that create one name independently with no drop between them (ADR-155
+case 3) each keep their own `created` for good, **by design**: no winner is chosen and nothing is buried. It is not data
+loss (the collection id is derived from the name, so the documents merge), and `created` is a per-member date that no rule
+reads as a lower bound for another member's life. A settling (both members adopt the older `created`) was tried and
+rejected: it lost data when a drop lay between the two creations (a database drop removed the later creation and its
+document on one member and not on the other), and a redesign with remembered sibling creations was found to need a rule
+on every drop-tombstone writer and a stored-metadata change. What is checked instead is that all members end in the same
+observable state (collections, documents by id and stamp, indexes, tombstones, floors) on every delivery order, with
+`created` excluded; that test is a separate change.
 
 **Tests.** `life_supersession_tests.rs`: the aged-out case on the whole-database and the scoped route; the floor the
 receiver ends with; a write after the drop kept; with the tombstone held it still converges; **no floor** buries
 nothing; **a floor the coverage does not name** buries nothing; **two members that create one name with no drop** bury
 nothing; a life made after the drop the receiver knows buries nothing; a standing life newer than the arriving one is
-not buried; **a re-dated life is not mistaken for a newer one**; and the entries route with two origins. Protocol: a
-state without the field decodes to none and none is not written. Mutation rows: the floor required, `floor >= standing.created`, `floor < created`, the lineage comparison, the
-coverage gate, the burial itself. The clause `created > standing.created` has no row: it is implied by the other two
-(`standing.created <= floor < created`), so removing it or weakening it to `>=` changes no outcome, and the surviving
-mutant is equivalent. It stays in the predicate because it states the intent (a sender that is behind never buries a
-life it has not caught up to) where a reader looks for it.
+not buried; **a re-dated life is not mistaken for a newer one**; **a database drop's floor buries the previous life**; **an index of the new life survives the burial and both members hold the same index and definition digest**; **a failure between the burial and the restore leaves the burial alone, the page's progress unmoved, and the retry heals it**; and the entries route with two origins. Protocol: a
+state without the field decodes to none and none is not written. Mutation rows (a harness that is not in the tree; the rows are named here as the record): the floor required, `floor >= standing.created` removed and weakened to `>`, `floor < created` removed and weakened to `<=`, the lineage comparison removed, the standing lineage ignoring the re-dating marker, the coverage gate, the burial itself (not called; always-false and always-true predicate; replaced by a drop that keeps nothing; stamped at `created` instead of the floor), the kept/buried log split in both directions, and the floor serialized when unset. All killed. **Three mutants survive and are equivalent**, each implied by the other two clauses `standing.created <= floor < created`: (1) `created > standing.created` removed, (2) the same clause weakened to `>=`, and (3) a missing floor defaulting to `created` (then `floor < created` is false, so the predicate is false as before). The newer-life clause stays in the predicate because it states the intent (a sender that is behind never buries a life it has not caught up to) where a reader looks for it.

@@ -136,6 +136,13 @@ fn a_write_the_receiver_made_after_the_drop_is_kept() {
     assert!(!has(&b, 1), "the previous life's document is still here");
     assert!(has(&b, 9), "a write stamped after the drop was buried with the life");
     assert!(has(&b, 2));
+    // And where it ends: the ADR-231 shape, pinned. The life is re-dated above the drop
+    // (the receiver keeps its own write), with the sender's floor, not at the sender's
+    // `created`.
+    let held = b.get_collection("shop", "orders").unwrap();
+    let sender = a.get_collection("shop", "orders").unwrap();
+    assert!(held.is_redated(), "a life that kept a write after the drop is re-dated");
+    assert_eq!(held.incarnation_floor, sender.incarnation_floor, "the sender's floor");
 }
 
 #[test]
@@ -285,6 +292,7 @@ fn a_life_re_dated_by_the_drop_is_not_mistaken_for_a_newer_one() {
     // What the page brings is the sender's content (its sweep deleted the document the
     // drop ended, and that delete travels), not a replacement of the life.
     assert!(has(&p, 3), "the page's write after the drop did not land");
+    assert!(!has(&p, 1), "the document the drop ended is still here");
 }
 
 // -- The entries route ---------------------------------------------------------------------
@@ -420,4 +428,112 @@ mod predicate {
         // And re-dated from a different beginning than the standing one's.
         assert!(ends(&standing(100), Some(h(401)), Some(h(350)), Some(h(400))));
     }
+}
+
+// -- What the burial leaves, and what survives it ------------------------------------------
+
+#[test]
+fn a_database_drop_floor_buries_the_previous_life_too() {
+    // The sender's floor is the greater of the collection's and the database's drop
+    // tombstone; with both aged out, the page still carries it.
+    let (a, _da) = engine();
+    let (b, _db) = engine();
+    let first = a.create_collection("shop", "orders").unwrap();
+    a.insert(&first, doc! { "_id": 1 }).unwrap();
+    transfer(&b, &a);
+    assert!(has(&b, 1), "premise");
+    later();
+    a.drop_database("shop").unwrap();
+    a.finish_purges_now().unwrap();
+    later();
+    let second = a.create_collection("shop", "orders").unwrap();
+    a.insert(&second, doc! { "_id": 2 }).unwrap();
+    let floor = a.get_collection("shop", "orders").unwrap().incarnation_floor;
+    assert!(floor.is_some(), "premise: the new life has a floor");
+    forget_the_tombstone(&a);
+    let txn = a.begin_write(crate::WriterHolder::Ddl).unwrap();
+    txn.open_table(crate::tables::COLLECTIONS_DROPPED)
+        .unwrap()
+        .remove(kimmy_core::database_drop_id("shop").0)
+        .unwrap();
+    txn.commit().unwrap();
+    transfer(&b, &a);
+    assert_holds_the_senders_life(&a, &b, "database drop");
+    assert_eq!(b.get_collection("shop", "orders").unwrap().incarnation_floor, floor);
+}
+
+#[test]
+fn an_index_survives_the_burial_and_both_members_agree_on_it() {
+    // ADR-233: the receiver's own index tombstone is honoured, and the sender's index
+    // of the new life, made after the drop, is restored with its own stamp.
+    let (a, _da) = engine();
+    let (b, _db) = engine();
+    let first = a.create_collection("shop", "orders").unwrap();
+    a.insert(&first, doc! { "_id": 1, "k": 1 }).unwrap();
+    a.create_index(
+        "shop",
+        "orders",
+        vec![crate::IndexField::ascending("k")],
+        false,
+        Some("ik".into()),
+    )
+    .unwrap();
+    transfer(&b, &a);
+    assert_eq!(b.list_indexes("shop", "orders").unwrap().len(), 1, "premise");
+    later();
+    a.drop_collection("shop", "orders").unwrap();
+    a.finish_purges_now().unwrap();
+    later();
+    let second = a.create_collection("shop", "orders").unwrap();
+    a.insert(&second, doc! { "_id": 2, "k": 2 }).unwrap();
+    a.create_index(
+        "shop",
+        "orders",
+        vec![crate::IndexField::ascending("k")],
+        false,
+        Some("ik".into()),
+    )
+    .unwrap();
+    forget_the_tombstone(&a);
+    transfer(&b, &a);
+    let by_a: Vec<_> = a
+        .list_indexes("shop", "orders")
+        .unwrap()
+        .iter()
+        .map(|i| (i.name.clone(), i.created))
+        .collect();
+    let by_b: Vec<_> = b
+        .list_indexes("shop", "orders")
+        .unwrap()
+        .iter()
+        .map(|i| (i.name.clone(), i.created))
+        .collect();
+    assert_eq!(by_a, by_b, "the members hold different indexes");
+    assert_eq!(by_a.len(), 1);
+    assert_eq!(
+        crate::definition_digest::definition_digest(&a.get_collection("shop", "orders").unwrap()),
+        crate::definition_digest::definition_digest(&b.get_collection("shop", "orders").unwrap()),
+        "the definition digests differ"
+    );
+}
+
+#[test]
+fn a_failure_between_the_burial_and_the_restore_leaves_nothing_that_does_not_heal() {
+    // The burial is its own transaction and the restore follows. What a failure between
+    // them leaves is the burial alone: the standing life ended, the tombstone at the
+    // floor, the page's progress not advanced. Modelled by running the burial and
+    // stopping, then retrying the whole page.
+    let (a, b, _dirs) = receiver_holds_the_previous_life();
+    forget_the_tombstone(&a);
+    let page = a.snapshot_page(None, Some(orders_id())).unwrap();
+    let state = &page.collections[0];
+    let floor = state.incarnation_floor.expect("premise: the page carries the floor");
+    b.bury_the_life_this_one_followed(state, &page.versions, a.node_id()).unwrap();
+    assert!(b.get_collection("shop", "orders").is_err(), "the burial left a life standing");
+    let tombstone = b.collection_dropped_at(orders_id()).unwrap().expect("a tombstone");
+    assert_eq!(tombstone.hlc, floor, "the tombstone is at the floor");
+    // The retry: the whole page again, from the progress that never advanced.
+    transfer_under(&b, &a, SnapshotProgress::of_collection(orders_id()));
+    assert_holds_the_senders_life(&a, &b, "the retry");
+    assert_eq!(b.get_collection("shop", "orders").unwrap().incarnation_floor.unwrap(), floor);
 }

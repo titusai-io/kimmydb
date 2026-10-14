@@ -1570,7 +1570,7 @@ impl Engine {
     /// the drop; the real tombstone, if it ever arrives, is the same or a later stamp
     /// and replaces it. With no floor on the page, nothing is buried: two members that
     /// create one name with no drop between them are not a life ended.
-    fn bury_the_life_this_one_followed(
+    pub(crate) fn bury_the_life_this_one_followed(
         &self,
         state: &CollectionState,
         versions: &VersionVector,
