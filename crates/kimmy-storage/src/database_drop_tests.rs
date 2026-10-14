@@ -1494,7 +1494,10 @@ fn a_drop_already_held_as_sent_still_records_its_tombstones() {
 /// The position branch is for a collection that is absent: an entry of the life
 /// before, stamped after the drop (a write on a member whose clock ran ahead)
 /// and arrived before it, is still the life before's, and only where the drop's
-/// entry arrived says so.
+/// entry arrived says so. Driven by a **database's** drop, which buries a
+/// collection with what was written into it afterwards (ADR-229) and so leaves
+/// it absent; a collection's own drop keeps such a write and the collection with
+/// it (ADR-231, extended), and has its own test beside the sweep.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_dropped_collections_stream_skips_an_old_entry_stamped_after_its_drop() {
     let (e, _d) = engine();
@@ -1506,19 +1509,15 @@ async fn a_dropped_collections_stream_skips_an_old_entry_stamped_after_its_drop(
         doc_id: Some(kimmy_core::DocId::String(id.into())),
         body: Some(bson::serialize_to_vec(&doc! { "_id": id }).unwrap()),
     };
-    let drop = crate::engine::ddl_entry(
-        stamp_of(5_000, 1),
-        OpKind::DropCollection,
-        x,
-        &CollectionRef::new("shop", "x"),
-    )
-    .unwrap();
-    for entry in
-        [create_entry("shop", "x", stamp_of(4_900, 1)), insert(stamp_of(6_000, 3), "o"), drop]
-    {
+    for entry in [
+        create_entry("shop", "x", stamp_of(4_900, 1)),
+        insert(stamp_of(6_000, 3), "o"),
+        drop_database_entry("shop", stamp_of(5_000, 1)),
+    ] {
         e.apply_batch(std::slice::from_ref(&entry)).unwrap();
     }
     assert!(e.get_collection("shop", "x").is_err(), "premise: x is gone");
+    assert!(e.collection_dropped_at(x).unwrap().is_some(), "premise: x holds a tombstone");
     let from_start = WatchOptions { resume_after: None, start_at: Some(Hlc::ZERO) };
     let mut stream = e.watch(WatchScope::Collection(x), from_start).unwrap();
     let heard = tokio::time::timeout(Duration::from_millis(300), stream.next(&e)).await;
