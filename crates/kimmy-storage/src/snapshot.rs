@@ -1082,12 +1082,11 @@ impl Engine {
     /// 2. **Is it history here?** The predicate the page's documents answer, so
     ///    a delete aimed at a buried life of the collection is not applied to
     ///    the life standing here. Not redundant with the next question: a
-    ///    restored collection's floor is the sender's stamp, and nothing on the
-    ///    snapshot route moves this node's clock up to it, so under clock skew
-    ///    a document written here into the standing life can carry a stamp
-    ///    below its own floor -- and so can a delete of it from a peer that is
-    ///    behind the same way. The delete out-stamps the document; only this
-    ///    turns it away, as the entries route does.
+    ///    document below its own floor can still be held (a store written
+    ///    before the restore moved the clock past the floor, as it now does), and
+    ///    a delete of it from a peer can out-stamp it while sitting below the
+    ///    floor. The delete out-stamps the document; only this turns it away, as
+    ///    the entries route does.
     /// 3. **Does this node hold a live document the tombstone strictly
     ///    out-stamps?** Then it is deleted through the ordinary replicated-delete
     ///    path — `apply_remote_in_txn` under `Position::Hold` — which maintains
@@ -5307,14 +5306,16 @@ mod tests {
     }
 
     #[test]
-    fn a_carried_delete_below_a_restored_floor_is_history_under_clock_skew() {
+    fn a_carried_delete_below_a_restored_floor_is_history() {
         // `is_history` for a delete, and why it is not redundant with the
-        // out-stamp check. A runs an hour ahead and drops and recreates the
-        // collection, so the floor B and C restore is A's stamp -- and nothing
-        // on the snapshot route moves their clocks up to it. B then writes a
-        // document into the standing life below that floor, and C, behind the
-        // same way, writes and deletes one at the same id a moment later. C's
-        // delete out-stamps B's document; only the floor turns it away, which
+        // out-stamp check. The floor B restores is A's stamp, and since the
+        // restore moves B's clock past it, no document B writes afterwards can sit
+        // below it (it did, when nothing on this route moved the clock, and this
+        // test reached the state by writing one). The state is built by hand now:
+        // a live document below the floor, as a store that was written before the
+        // floor was restored (or by a build before the clock rule) can hold, and a
+        // delete of it from a peer, stamped above the document and below the floor.
+        // The delete out-stamps the document; only the floor turns it away, which
         // is what the entries route does with it too.
         let (a, _da) = engine();
         let (b, _db) = engine();
@@ -5333,13 +5334,34 @@ mod tests {
         let cc = c.get_collection("shop", "orders").unwrap();
         let floor = cb.incarnation_floor.expect("the fixture must restore a floor");
 
-        b.insert(&cb, doc! { "_id": 1 }).unwrap();
-        std::thread::sleep(std::time::Duration::from_millis(5));
+        let below = crate::physical_now_ms();
+        let document = Stamp::new(Hlc::new(below, 0), c.node_id());
+        let delete = Stamp::new(Hlc::new(below + 1, 0), c.node_id());
+        assert!(delete.hlc < floor, "premise: both sit below the floor");
+        {
+            let txn = b.begin_write(crate::engine::WriterHolder::Write).unwrap();
+            let mut docs = txn.open_table(tables::DOCS).unwrap();
+            let body = bson::serialize_to_vec(&doc! { "_id": 1i64 }).unwrap();
+            let record = kimmy_core::DocRecord::live(document, body);
+            crate::live_count::put_record(
+                &txn,
+                &mut docs,
+                cb.id.0,
+                &crate::docs::doc_key(&DocId::Int64(1)).unwrap(),
+                &codec::encode_doc_record(&record),
+            )
+            .unwrap();
+            drop(docs);
+            txn.commit().unwrap();
+        }
+        assert!(b.get(&cb, &DocId::Int64(1)).unwrap().is_some(), "premise: B holds it");
+
+        // C's page, with the delete C made restamped to sit below the floor. C's
+        // coverage names it: it is below C's own newest stamp.
         c.insert(&cc, doc! { "_id": 1 }).unwrap();
         assert!(c.delete(&cc, &DocId::Int64(1)).unwrap());
-        let page = c.snapshot_page(None, None).unwrap();
-        let carried = page.deleted_documents.first().expect("C's page carries the delete").stamp;
-        assert!(carried.hlc < floor, "the delete must sit below the floor: {carried:?} {floor:?}");
+        let mut page = c.snapshot_page(None, None).unwrap();
+        page.deleted_documents.first_mut().expect("C's page carries the delete").stamp = delete;
 
         b.apply_snapshot_page(c.node_id(), &mut SnapshotProgress::whole_database(), &page).unwrap();
         assert!(

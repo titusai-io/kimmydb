@@ -27042,3 +27042,51 @@ the pinned-transaction tests; the wire in both directions across a version bound
 members; and a mutation table (one row per validity clause of the hint, per deferral, per predicate read in a
 pinned transaction, per framing term of the hash, and for the WARN cap and the stuck count), every row of which
 is killed, argued equivalent, or listed as unreachable in the pull request.
+
+## ADR-233 — A snapshot page moves the clock past what it restores, and honours the receiver's own index tombstone
+
+> **Amends [ADR-155](#adr-155--a-collection-this-node-dropped-is-not-a-divergence-and-a-snapshot-does-not-bring-it-back),
+> ADR-162 and ADR-225** (the snapshot route's restore of a creation, a drop and an index). Receiver-local: no wire field,
+> table, entry kind or schema changed, and it is not a rollback boundary. Two defects of the same family, one
+> rule: *a snapshot is judged against what stands on this node, with the same predicates the entries route uses.*
+
+**Decision.**
+
+1. **The clock follows what a page restores.** A page stores state with its sender's stamps: a collection's
+   `created`, the drop tombstones it carries (and so the incarnation floor this node restores from them) and an
+   index's drop. Every other stamp this node accepts moves its clock (`apply_remote_in_txn`, `apply_ddl`); these
+   did not. A receiver whose clock ran behind its sender's restored a floor and then stamped its next write below
+   it, and every other member judged that write history (`is_history`) and dropped it, with nothing refused or
+   counted: the client was told the write succeeded and only the member that took it held it. The restore now
+   folds each such stamp into the clock **once the sender's own coverage names it** (ADR-163: the stamp comes off
+   the wire, and a clock moved to an arbitrary one would mint far-future stamps for ever): the creation (an `Hlc`
+   with no origin, so *any* origin's coverage reaching it), each carried collection drop and index drop, and a
+   scoped page's `dropped`. A stamp the coverage does not name is ignored as before and moves nothing.
+2. **An index's creation needs no new call.** The index build already moves the clock (a restored index passes
+   through the same build as a replicated one), so the restore does not add a second witness; a mutation row that
+   removed it survived, and the code was deleted.
+3. **The page's index loop honours the receiver's own index tombstone.** The replicated `CreateIndex` judges
+   `stamp < dropped_at` against the receiver's tombstone, under the writer; the page's loop passed a history
+   predicate that ignored it, so a member that had dropped an index rebuilt it from a peer that had not heard of
+   the drop (a snapshot from a count-half repair or a catch-up), and kept it for good once the peer applied the
+   drop. A unique index then refused inserts the rest of the cluster accepted, and a TTL index expired documents
+   the others kept. The predicate is now the entries route's: a definition made before the receiver's drop is
+   history; one made after it (the strict `<`, the same as there) is restored; one with no stamp cannot be judged
+   and is restored as it was.
+
+**Not changed, and why.** The entries route needs no change: `apply_ddl` witnesses every entry it applies, and the
+arms that return before that line (a creation, a drop or an index drop older than something this node already
+holds) store a stamp below one this node's clock has already passed. A late-drop sweep and a re-dating derive their
+stamp from the drop's, which is now witnessed on both routes.
+
+**Consequence for an existing test.** `a_carried_delete_below_a_restored_floor_is_history_under_clock_skew` reached
+the state "a live document below the restored floor" by writing one on a receiver whose clock had not followed the
+floor, which is the defect. The state is now built by hand (a record below the floor), and the test keeps its point:
+the floor, not the out-stamp check, turns the carried delete away.
+
+**Tests.** `snapshot_stamp_tests.rs`: a receiver mints above the floor it restored; the sender keeps the receiver's
+acknowledged write; the clock follows a creation, a carried drop of a collection the receiver never held and of one
+it holds, a carried index drop, a scoped page's drop; a stamp the coverage does not name (on both routes) moves
+nothing; a whole-database and a scoped page do not rebuild a dropped index, nor a unique or a TTL one; a definition
+made after the drop is restored; one stamped exactly at the tombstone is restored. Mutation rows: each witness
+removed, each coverage gate removed, the tombstone check removed, `<` to `<=`.
