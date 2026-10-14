@@ -16,6 +16,7 @@ pub mod check;
 pub mod class_step;
 pub mod codec;
 mod database_tombstone;
+pub mod definition_digest;
 pub mod digest_probe;
 pub mod divergence;
 pub mod docs;
@@ -64,6 +65,9 @@ mod database_drop_tests;
 
 #[cfg(test)]
 mod keep_later_writes_tests;
+
+#[cfg(test)]
+mod definition_digest_tests;
 
 #[cfg(test)]
 mod log_capture;
