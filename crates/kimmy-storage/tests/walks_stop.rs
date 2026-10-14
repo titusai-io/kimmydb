@@ -104,6 +104,10 @@ const BOUNDED_READS: &[(&str, &str)] = &[
     ),
     ("divergence::next_probe", "an in-memory set's range, not a table"),
     (
+        "engine::Engine::metadata_high_water",
+        "the collection registry and the two drop registries, read once at open before anything serves: one row per collection and per tombstone, no documents",
+    ),
+    (
         "engine::Engine::indexes_dropped",
         "the index-drop registry: one row per index dropped within tombstone retention, collected on the same window as the oplog",
     ),
