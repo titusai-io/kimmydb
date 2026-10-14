@@ -1513,7 +1513,8 @@ impl Engine {
     ///
     /// What a snapshot restores with the sender's stamp is state this node then
     /// holds and serves: a collection's creation and drop tombstone, the floor it
-    /// restores from them, an index's creation and drop. Every other stamp this
+    /// restores from them, an index's drop (an index's creation moves the clock in
+    /// its own build). Every other stamp this
     /// node accepts moves its clock (`apply_remote_in_txn`, `apply_ddl`), and a
     /// restore that did not left a receiver whose clock ran behind its sender's
     /// minting a write below the floor it had just restored, which every peer then

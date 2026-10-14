@@ -10,6 +10,13 @@ Versioning follows the pre-1.0 policy in
 [docs/compatibility.md](docs/compatibility.md): a `0.MINOR` bump may carry
 breaking changes and says so here; a `0.x.PATCH` bump never does.
 
+## Unreleased
+
+### Fixed
+
+- **A member that took a snapshot could write below the floor it had restored, and every peer then dropped the write.** A snapshot stored a collection's creation, its drop tombstones (and the floor restored from them) and an index's drop without moving the receiver's clock, so a receiver whose clock ran behind its sender's stamped its next write below the floor, and every other member judged it history and dropped it, with nothing refused or counted: the client was told the write succeeded and only the member that took it held it. The receiver's clock now moves past what a page restores, once the sender's own coverage names it. Receiver-local, no wire, table or entry change, and not a rollback boundary.
+- **A member that dropped an index could rebuild it from a peer's snapshot page.** The page's index loop did not consult the receiver's own index tombstone, as a replicated `CreateIndex` does, so a snapshot (a repair or a catch-up) from a peer that had not yet heard of the drop brought the index back on one member, for good once the peer applied the drop: a unique index then refused inserts the rest of the cluster accepted, and a TTL index expired documents the others kept. A definition made before the receiver's drop is now history on that route too; one made after it is still restored. Receiver-local, no wire or table change.
+
 ## 0.49.0 - 2026-10-14
 
 **Read before upgrading, two things.**
