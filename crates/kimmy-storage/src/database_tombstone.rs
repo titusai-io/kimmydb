@@ -321,14 +321,14 @@ impl Engine {
             for collection in self.list_collections(&db)? {
                 if !vector_meta::is_shadow(&collection.name) {
                     checkpoint()?;
-                    self.sweep_collection(&db, &collection, dropped, swept, notice)?;
+                    self.sweep_collection(&db, &collection, dropped, swept, notice, checkpoint)?;
                 }
             }
             checkpoint()?;
             for collection in self.list_collections(&db)? {
                 if vector_meta::is_shadow(&collection.name) {
                     checkpoint()?;
-                    self.sweep_collection(&db, &collection, dropped, swept, notice)?;
+                    self.sweep_collection(&db, &collection, dropped, swept, notice, checkpoint)?;
                 }
             }
             self.swept.lock().insert(db, (dropped, generation));
@@ -343,6 +343,7 @@ impl Engine {
         dropped: Stamp,
         swept: &mut Swept,
         notice: &mut Vec<BuriedCollection>,
+        checkpoint: &dyn Fn() -> Result<()>,
     ) -> Result<()> {
         if collection.created <= dropped.hlc {
             let written_after = self.documents_written_after(collection, dropped)?;
@@ -375,7 +376,7 @@ impl Engine {
             self.record_tombstones_at(db, &collection.name, dropped)?;
             // A survivor is a life created after the drop; what it took in of
             // the life before, before it learned of the drop, goes (ADR-231).
-            self.sweep_late_drop(db, &collection.name, dropped)?;
+            self.sweep_late_drop_until(db, &collection.name, dropped, checkpoint)?;
             swept.spared += 1;
         }
         Ok(())
