@@ -315,6 +315,46 @@ impl Engine {
         Ok(facets)
     }
 
+    /// Make the definition probe fail with a storage error on its `calls`-th call
+    /// from now (a test hook: a fault of this half's own, which must cost this
+    /// half and never the other, nor the contact).
+    #[cfg(any(test, feature = "test-hooks"))]
+    pub fn fail_definition_probe_in_for_test(&self, calls: u32) {
+        self.definition_fail_in.store(calls, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    #[cfg(any(test, feature = "test-hooks"))]
+    fn fail_definition_probe_if_armed(&self) -> Result<()> {
+        use std::sync::atomic::Ordering;
+        let armed = self.definition_fail_in.load(Ordering::SeqCst);
+        if armed == 0 {
+            return Ok(());
+        }
+        self.definition_fail_in.store(armed - 1, Ordering::SeqCst);
+        match armed {
+            1 => Err(crate::StorageError::Corrupt("a definition fault injected by a test".into())),
+            _ => Ok(()),
+        }
+    }
+
+    /// Remove the index `name` from `db.collection`'s stored definition with no
+    /// stamp and no entry (a test hook: the divergence replication would not
+    /// have made, which the definition digest exists to find).
+    #[cfg(any(test, feature = "test-hooks"))]
+    pub fn lose_an_index_silently_for_test(
+        &self,
+        db: &str,
+        collection: &str,
+        name: &str,
+    ) -> Result<()> {
+        let mut meta = self.get_collection(db, collection)?;
+        meta.indexes.retain(|index| index.name != name);
+        let txn = self.begin_write(crate::engine::WriterHolder::Ddl)?;
+        Self::put_collection_meta(&txn, &meta)?;
+        txn.commit()?;
+        Ok(())
+    }
+
     /// The origin of a definition of `meta` stamped above the cut, if there is
     /// one: an index created, a vector configuration changed, or an index dropped.
     /// Each stamp is judged against the cut's component for its own origin, so the
@@ -349,6 +389,8 @@ impl Engine {
     /// the request's cut, read in **one** read transaction, with the detail of
     /// the collections the request names.
     pub fn definition_answer(&self, ask: &DefinitionAsk) -> Result<DefinitionReply> {
+        #[cfg(any(test, feature = "test-hooks"))]
+        self.fail_definition_probe_if_armed()?;
         let txn = self.db().begin_read()?;
         #[cfg(test)]
         test_hooks::run_after_the_transaction(self);
@@ -387,6 +429,8 @@ impl Engine {
         ask: &DefinitionAsk,
         reply: &DefinitionReply,
     ) -> Result<Vec<DefinitionVerdict>> {
+        #[cfg(any(test, feature = "test-hooks"))]
+        self.fail_definition_probe_if_armed()?;
         let txn = self.db().begin_read()?;
         #[cfg(test)]
         test_hooks::run_after_the_transaction(self);

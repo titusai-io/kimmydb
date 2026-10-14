@@ -8519,6 +8519,179 @@ mod tests {
         }
     }
 
+    /// B3 half 2: what a responder says to a divergence request, by raw frames.
+    /// The definitions are present iff the request carried them; the digest's
+    /// busy flag does not gate them; and a request whose two cuts differ is
+    /// answered without them, at neither.
+    #[tokio::test]
+    async fn the_responder_answers_definitions_iff_asked_and_whatever_the_digest_says() {
+        const SECRET: &str = "a-definition-answer-secret";
+        const BINDING: &[u8] = b"a-definition-answer-binding";
+        let dir = tempfile::tempdir().unwrap();
+        let engine = Engine::open(&dir.path().join("kimmy.redb")).unwrap();
+        let orders = engine.create_collection("shop", "orders").unwrap();
+        engine
+            .create_index(
+                "shop",
+                "orders",
+                vec![kimmy_core::IndexField::ascending("a")],
+                false,
+                None,
+            )
+            .unwrap();
+        engine.insert(&orders, bson::doc! { "_id": 1 }).unwrap();
+        let other_dir = tempfile::tempdir().unwrap();
+        let other = Engine::open(&other_dir.path().join("kimmy.redb")).unwrap();
+        let cut = engine.witnessed_vector().unwrap();
+        let digest = || kimmy_storage::DigestAsk { cut: cut.clone(), ..Default::default() };
+        let definitions = |cut: &VersionVector| kimmy_storage::DefinitionAsk::new(cut.clone(), []);
+        let mut other_cut = cut.clone();
+        other_cut.insert(kimmy_core::NodeId::from_bytes([42; 16]), kimmy_core::Hlc::new(1, 0));
+        let cases: Vec<(&str, Message, bool)> = vec![
+            (
+                "not asked",
+                Message::AskDivergence { probe: None, digest: Some(digest()), definitions: None },
+                false,
+            ),
+            (
+                "asked, digest asked at the same cut",
+                Message::AskDivergence {
+                    probe: None,
+                    digest: Some(digest()),
+                    definitions: Some(definitions(&cut)),
+                },
+                true,
+            ),
+            (
+                "asked with no digest at all",
+                Message::AskDivergence {
+                    probe: None,
+                    digest: None,
+                    definitions: Some(definitions(&cut)),
+                },
+                true,
+            ),
+            (
+                "asked at another cut than the digest's",
+                Message::AskDivergence {
+                    probe: None,
+                    digest: Some(digest()),
+                    definitions: Some(definitions(&other_cut)),
+                },
+                false,
+            ),
+        ];
+        for (what, request, expect_definitions) in cases {
+            let busy = engine.hold_digest_probe_for_test();
+            let (mut ours, theirs) = tokio::io::duplex(MAX_FRAME);
+            let serving =
+                serve_peer(&engine, theirs, SECRET, BINDING, None, ServeBudgets::serving(), None);
+            let (other, request) = (&other, &request);
+            let asking = async move {
+                open_handshake(other, &mut ours, SECRET, BINDING).await.unwrap();
+                write_frame(&mut ours, request).await.unwrap();
+                read_frame(&mut ours).await
+            };
+            let (served, answer) = tokio::time::timeout(Duration::from_secs(10), async {
+                tokio::join!(serving, asking)
+            })
+            .await
+            .expect("the contact ended");
+            drop(busy);
+            assert!(matches!(served, Ok(()) | Err(ProtocolError::Closed)), "{what}: {served:?}");
+            let Ok(Message::Divergence { definitions, digest_busy, .. }) = answer else {
+                panic!("{what}: {answer:?}");
+            };
+            assert_eq!(definitions.is_some(), expect_definitions, "{what}");
+            // The digest's busy flag is the digest's: the definitions came
+            // whether or not the digest could be answered.
+            if request_has_digest(request) {
+                assert!(digest_busy, "{what}: the digest was held busy");
+            }
+            if let Some(reply) = definitions {
+                assert!(reply.entries.iter().any(|e| e.collection == orders.id), "{what}");
+            }
+        }
+    }
+
+    fn request_has_digest(request: &Message) -> bool {
+        matches!(request, Message::AskDivergence { digest: Some(_), .. })
+    }
+
+    /// B3 half 2, the requester's side over the wire: asked of every peer at
+    /// every checked contact, at the digest's own cut; a peer that answers none
+    /// is `Unanswered` and never compared; the answer of a peer whose digest
+    /// said busy is compared all the same.
+    #[tokio::test]
+    async fn a_peer_that_answers_no_definitions_is_unanswered_and_every_contact_asks_at_the_digests_cut()
+     {
+        use kimmy_storage::DefinitionAnswered::Unanswered;
+        let dir = tempfile::tempdir().unwrap();
+        let engine = Engine::open(&dir.path().join("kimmy.redb")).unwrap();
+        engine.create_collection("shop", "orders").unwrap();
+        for capable in [false, true] {
+            let (ours, mut peer_end) = tokio::io::duplex(MAX_FRAME);
+            let peer = tokio::spawn(async move {
+                let Ok(Message::AskVersions { .. }) = read_frame(&mut peer_end).await else {
+                    return None;
+                };
+                let vectors = Message::Vectors {
+                    servable: VersionVector::new(),
+                    witnessed: VersionVector::new(),
+                    facts: None,
+                    facts_gen: None,
+                    echo: None,
+                    replay_from: None,
+                };
+                write_frame(&mut peer_end, &vectors).await.unwrap();
+                let Ok(Message::AskDivergence { digest, definitions, .. }) =
+                    read_frame(&mut peer_end).await
+                else {
+                    return None;
+                };
+                let answer = Message::Divergence {
+                    collections: Vec::new(),
+                    probe_count: None,
+                    incarnations: Vec::new(),
+                    digests: None,
+                    digest_busy: false,
+                    definitions: None,
+                };
+                write_frame(&mut peer_end, &answer).await.unwrap();
+                Some((digest, definitions))
+            });
+            let mut stalls = PeerStalls::new();
+            let them = kimmy_core::NodeId::from_bytes([9; 16]);
+            if capable {
+                stalls.digest_capable.insert(them);
+            }
+            stalls.set_definition_detail(them, [CollectionId(5)].into_iter().collect());
+            let addr: SocketAddr = "127.0.0.1:1".parse().unwrap();
+            let outcome = sync_over_within(
+                &engine,
+                ours,
+                addr,
+                them,
+                None,
+                &mut stalls,
+                Duration::from_secs(5),
+            )
+            .await
+            .expect("the round");
+            let (digest, definitions) = peer.await.unwrap().expect("a request was made");
+            let definitions = definitions.expect("every contact asks, capable or not");
+            assert_eq!(
+                digest.expect("the digest is asked too").cut,
+                definitions.cut,
+                "one cut for both halves"
+            );
+            assert_eq!(definitions.detail, vec![CollectionId(5)], "the detail set is asked for");
+            let round = outcome.definitions.expect("asked");
+            assert_eq!(round.answered, Unanswered);
+            assert!(round.verdicts.is_empty(), "never compared");
+        }
+    }
+
     /// A snapshot that has applied no page holds nothing, and neither does one
     /// that is complete but has not yet been dropped from the map (applying the
     /// last page marks it complete before steps that can still fail): only an

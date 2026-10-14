@@ -135,6 +135,8 @@ pub struct Engine {
     /// next) with a storage error, for the test that a digest-only fault must
     /// not fail the contact (B3).
     pub(crate) digest_fail_in: std::sync::atomic::AtomicU32,
+    /// Fail the definition probe after this many calls (a test hook; 0 is off).
+    pub(crate) definition_fail_in: std::sync::atomic::AtomicU32,
     /// Durable write transactions committed, since start.
     ///
     /// redb has a single writer and every commit is an fsync, so the number of
@@ -1458,6 +1460,7 @@ impl Engine {
             digest_check_busy: std::sync::atomic::AtomicBool::new(false),
             digest_drift: std::sync::atomic::AtomicU64::new(0),
             digest_fail_in: std::sync::atomic::AtomicU32::new(0),
+            definition_fail_in: std::sync::atomic::AtomicU32::new(0),
             commits: std::sync::atomic::AtomicU64::new(0),
             multi_chunk_docs: std::sync::atomic::AtomicUsize::new(
                 crate::modify::DEFAULT_MULTI_CHUNK_DOCS,
