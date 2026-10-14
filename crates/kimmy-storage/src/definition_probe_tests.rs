@@ -1457,6 +1457,19 @@ fn filters_of_every_value_kind_hash_the_same_on_every_route() {
         let verdicts = exchange(x, y, &[orders]);
         assert_ne!(compared(&verdicts, orders), Some(false), "scoped snapshot: {verdicts:?}");
     }
+    assert_eq!(
+        deferred(&exchange(&a, &scoped, &[orders]), orders),
+        Some(DefinitionDefer::DefinitionAboveCut),
+        "premise: a scoped snapshot grants no coverage"
+    );
+    // The deferral is transient: ordinary replication carries the receiver's
+    // vector past the stamps, and the collection is then compared and equal.
+    let orders_meta = a.get_collection("shop", "orders").unwrap();
+    later();
+    a.insert(&orders_meta, doc! { "_id": 99 }).unwrap();
+    sync(&a, &scoped);
+    sync(&a, &scoped);
+    equal_both_ways(&a, &scoped, orders, "after replication has caught the receiver up");
 }
 
 /// What a peer's entry carries hashes to what the receiver stores from it.
