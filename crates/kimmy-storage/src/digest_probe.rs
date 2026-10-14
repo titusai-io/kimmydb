@@ -666,19 +666,18 @@ impl Engine {
         let mut facets = BTreeMap::new();
         for meta in &metas {
             let row = live_digest::kept_row(&rows, meta.id.0)?.unwrap_or_default();
+            let dropped = Self::collection_dropped_at_in(txn, meta.id)?;
             let quiet = row.maxw.iter().all(|(node, hlc)| *hlc <= cut.get(*node));
             let deferred = if row.bare_max.iter().any(|(node, hlc)| *hlc > cut.get(*node)) {
                 Some(Defer::BareTombstone)
-            } else if {
-                let dropped = Self::collection_dropped_at_in(txn, meta.id)?;
-                drop_defers(dropped, meta.created, cut)
-                    // A life that owes ADR-231's sweep for this drop (created above
-                    // it, floor below it) still holds what the life before put in it,
-                    // however far the cut is past the drop: the drop is covered and
-                    // the stragglers are not yet gone. Its digest is not one a peer
-                    // that has swept can equal.
-                    || dropped.is_some_and(|at| crate::late_drop::owes_a_sweep(meta, at.hlc))
-            } {
+            } else if drop_defers(dropped, meta.created, cut)
+                // A life that owes ADR-231's sweep for this drop (created above
+                // it, floor below it) still holds what the life before put in it,
+                // however far the cut is past the drop: the drop is covered and
+                // the stragglers are not yet gone. Its digest is not one a peer
+                // that has swept can equal.
+                || dropped.is_some_and(|at| crate::late_drop::owes_a_sweep(meta, at.hlc))
+            {
                 Some(Defer::Incarnation)
             } else if drop_defers(
                 match tombstoned.get(&meta.db) {
