@@ -1639,6 +1639,64 @@ mod tests {
     /// and a page carrying a field newer than this build must still decode
     /// here. The older-sender half is `kimmy-storage`'s
     /// `a_page_that_predates_the_field_denies_nothing_and_breaks_nothing`.
+    /// ADR-231 (extended): the definition of a re-dated life names the creation it
+    /// was re-dated from. A receiver that predates the field reads the page and
+    /// ignores it; a page from a sender that predates it reads with none.
+    #[tokio::test]
+    async fn a_definition_names_the_creation_it_was_re_dated_from_across_a_version_boundary() {
+        /// `CollectionState` as a receiver before the field declares it.
+        #[derive(Debug, Deserialize)]
+        struct StateBeforeRedated {
+            db: String,
+            name: String,
+            created: Option<Hlc>,
+        }
+
+        let state = kimmy_storage::CollectionState {
+            db: "shop".into(),
+            name: "orders".into(),
+            indexes: Vec::new(),
+            vector: None,
+            created: Some(Hlc::new(900, 0)),
+            vector_changed: None,
+            redated_from: Some(Hlc::new(100, 0)),
+        };
+        let mut written = Vec::new();
+        write_frame(
+            &mut written,
+            &Message::Snapshot(Box::new(SnapshotPage {
+                collections: vec![state.clone()],
+                documents: Vec::new(),
+                next: None,
+                versions: VersionVector::new(),
+                dropped: None,
+                dropped_collections: Vec::new(),
+                deleted_documents: Vec::new(),
+                dropped_indexes: Vec::new(),
+            })),
+        )
+        .await
+        .unwrap();
+        let body = bson::deserialize_from_slice::<bson::Document>(&written[4..]).unwrap();
+        let sent = body.get_document("Snapshot").unwrap().clone();
+        let carried = sent.get_array("collections").unwrap()[0].as_document().unwrap().clone();
+        assert!(carried.contains_key("redated_from"), "the frame must carry the field: {carried}");
+        let older: StateBeforeRedated = bson::deserialize_from_document(carried.clone())
+            .expect("a receiver that predates the field must still read the definition");
+        assert_eq!((older.db.as_str(), older.name.as_str()), ("shop", "orders"));
+        assert_eq!(older.created, Some(Hlc::new(900, 0)));
+
+        // The other direction: a sender that predates it writes none, and it reads as none.
+        let mut before = carried;
+        before.remove("redated_from");
+        let read: kimmy_storage::CollectionState = bson::deserialize_from_document(before).unwrap();
+        assert_eq!(read.redated_from, None);
+        // And an ordinary definition does not carry it at all.
+        let plain = kimmy_storage::CollectionState { redated_from: None, ..state };
+        let doc = bson::serialize_to_document(&plain).unwrap();
+        assert!(!doc.contains_key("redated_from"), "absent when unset: {doc}");
+    }
+
     #[tokio::test]
     async fn snapshot_page_crosses_a_version_boundary_to_an_older_receiver() {
         /// `SnapshotPage` as a receiver before ADR-162 and ADR-167 declares it.

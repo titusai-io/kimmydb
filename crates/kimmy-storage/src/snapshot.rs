@@ -181,10 +181,31 @@ pub struct CollectionState {
     /// overrides a stamped local value.
     #[serde(default)]
     pub vector_changed: Option<Stamp>,
+    /// For a life a collection's drop re-dated to keep what was written after it
+    /// (`CollectionMeta::redated`, ADR-231 extended): the `created` the life had
+    /// before. `created` above is then the re-date, just after the drop, and
+    /// says nothing about when the life began, which is what a database's drop is
+    /// judged against (ADR-229). A receiver holding the database's tombstone
+    /// refuses the definition if this is at or before it, as it would the
+    /// original creation; without that, a life re-dated before its member
+    /// learned of the database's drop would spread past the tombstone that
+    /// covers it. Optional on the wire: a sender that predates it writes none, a
+    /// receiver that predates it ignores it and judges `created`, as before.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub redated_from: Option<Hlc>,
+}
+
+impl CollectionState {
+    /// The creation a database's drop judges this life by: where it began, not
+    /// where a collection's drop re-dated it to.
+    pub(crate) fn created_for_the_database(&self) -> Option<Hlc> {
+        self.redated_from.or(self.created)
+    }
 }
 
 impl From<CollectionMeta> for CollectionState {
     fn from(meta: CollectionMeta) -> Self {
+        let redated_from = meta.is_redated().then(|| meta.redated.map(|r| r.from)).flatten();
         CollectionState {
             db: meta.db,
             name: meta.name,
@@ -192,6 +213,7 @@ impl From<CollectionMeta> for CollectionState {
             vector: meta.vector,
             created: Some(meta.created),
             vector_changed: meta.vector_changed,
+            redated_from,
         }
     }
 }
@@ -735,7 +757,7 @@ impl Engine {
                 continue;
             }
             // Nor one the drop of its database makes history (ADR-229).
-            if self.database_refusal(&state.db, state.created)?.is_some() {
+            if self.database_refusal(&state.db, state.created_for_the_database())?.is_some() {
                 continue;
             }
             if self.purge_pending(id)? {
@@ -1527,8 +1549,12 @@ impl Engine {
             // write after the page's vector) are history here, not a stop that
             // lasts until a snapshot, and snapshot coverage would hide the
             // creation that would have recorded it.
-            if self.database_refusal(&state.db, state.created)?.is_some() {
-                self.record_database_refusal(&state.db, &state.name, state.created)?;
+            if self.database_refusal(&state.db, state.created_for_the_database())?.is_some() {
+                self.record_database_refusal(
+                    &state.db,
+                    &state.name,
+                    state.created_for_the_database(),
+                )?;
                 debug!(
                     db = %state.db,
                     collection = %state.name,
@@ -1560,12 +1586,23 @@ impl Engine {
                 state.created,
                 &history,
             ) {
-                Ok(Some(_)) => {}
+                Ok(Some(_)) => {
+                    // A re-dated life arrives with the creation it was re-dated
+                    // from, so that a database's drop this node learns of after
+                    // this page buries it as it buries the sender's.
+                    if let (Some(from), Some(created)) = (state.redated_from, state.created) {
+                        self.mark_restored_life_redated(&state.db, &state.name, from, created)?;
+                    }
+                }
                 Ok(None) => {
                     #[cfg(test)]
                     crate::sync::race_hooks::absorbed(crate::sync::race_hooks::Race::Restore);
                     // A database's drop that landed since the check above.
-                    self.record_database_refusal(&state.db, &state.name, state.created)?;
+                    self.record_database_refusal(
+                        &state.db,
+                        &state.name,
+                        state.created_for_the_database(),
+                    )?;
                     return Ok(0);
                 }
                 // Checked outside the writer, so the name can be created in

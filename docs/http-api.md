@@ -594,15 +594,35 @@ from the newer life the same way. A member that stayed divergent past
 `storage.tombstone_retention_secs` is not healed by the start's sweep, which
 finds its work through the tombstones a member holds.
 
-**One case is still open, and divergent, and decided but not yet fixed:** a write
-made through a member that still holds the *first* life, after the drop's stamp
-and before that member has applied the drop, is lost with that life on that
-member and kept on the members whose lives are newer; the members then stay
-different (counts that differ, `kimmy_sync_divergent_collections` above 0, a
-repair that re-runs and changes nothing). The decision is that a drop will keep
-the writes stamped after it, so all members end with the write; the change is in
-progress (finding `kimmydb-a-write-made-after-a-drops-stamp-into-the-life-the-drop-destroys-is-lost-on-the-member-that-applies-the-drop-and-kept-on-the-members-whose-lives-are-newer`). Until it ships, do not write into a collection
-through a member that has not yet received its drop.
+**A write made after a collection's drop is kept, and the collection can come
+back (since 0.49.0, [ADR-231](decisions.md)).** A write stamped after the
+drop's stamp, made through a member that still holds the collection and has not
+yet applied the drop, is kept: when the member applies the drop it removes what
+is stamped at or before it and keeps the later writes, and every member ends
+with the same documents. In 0.48.x the member lost the write with the
+collection while the members whose collections were newer kept it, and the
+members stayed different. Two things follow, and both are intended:
+
+- **A collection can reappear after its drop.** If nobody created the name
+  again, the member that kept the write holds a collection the others dropped,
+  and the others take it back, so it ends on every member holding only the
+  writes stamped after the drop. A client that drops a collection and then
+  writes to it through another member before that member has applied the drop
+  can bring it back. Do not write into a collection through a member that has
+  not yet received its drop; confirm the drop on the members first.
+- **Clock skew can cause it.** "After" is decided by the stamp, not by real
+  time. A write made *earlier* in real time by a member whose clock runs
+  *ahead* of the dropping member's is stamped after the drop and counts as
+  "after" if it reaches a member that has not applied the drop.
+
+A **database** drop is unchanged: a collection created at or before it is
+buried with the database and what was written into it afterwards, as above. While
+a member removes what the drop covers (a thousand records per commit, bounded
+by the chunk) a read of the collection still shows documents stamped before the
+drop and counts them; the change streams open on the collection end when the
+drop reaches it, and a stream opened afterwards without a resume token may
+begin at a document's latest version rather than at the insert that created
+it.
 
 **A drop is not atomic in one transaction, and it is atomic to a reader.**
 The collection's definition and its tombstone go in the drop's first commit and

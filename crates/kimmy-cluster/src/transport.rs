@@ -6306,6 +6306,7 @@ mod tests {
                 // document it carries, as a real sender's would be.
                 created: Some(Hlc::ZERO),
                 vector_changed: None,
+                redated_from: None,
             }]
         } else {
             Vec::new()

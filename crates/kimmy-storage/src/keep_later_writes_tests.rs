@@ -169,7 +169,7 @@ fn a_write_landing_before_the_burial_takes_the_writer_is_kept() {
     later();
     let competing = Arc::clone(&d);
     let before = hooks::survivors_paths();
-    let ((), acknowledged) = race_hooks::race(
+    let ((), ()) = race_hooks::race(
         race_hooks::Race::Burial,
         move || {
             let on_d = competing.get_collection("shop", "orders").unwrap();
@@ -179,7 +179,6 @@ fn a_write_landing_before_the_burial_takes_the_writer_is_kept() {
             d.apply_batch(&entries).unwrap();
         },
     );
-    let _ = acknowledged;
     assert_eq!(hooks::survivors_paths(), before + 1, "the write was seen under the writer");
     assert_eq!(docs_of(&d, "orders", &[1, 4]), vec![4]);
     assert_counts_exact(&d, "a write racing the burial");
@@ -484,4 +483,66 @@ fn a_peer_holding_the_older_life_is_not_replaced_by_one_in_the_owed_window() {
     assert_eq!(after.created, before.created, "p's life was replaced");
     assert!(docs_of(&p, "orders", &[1]) == vec![1], "p's older life lost its documents");
     assert_counts_exact(&p, "the older life through the window");
+}
+
+// -- A re-dated life must not outlive the database's drop that covers it --------
+
+/// M keeps a write through a collection's drop before it has heard of the
+/// database's drop `S`, and a peer repairs the collection from M. Whether the
+/// peer holds `S` already (it refuses the definition) or learns it after (it
+/// buries what it installed), and whether M learns it last, the write is gone
+/// everywhere, the collection is absent everywhere (ADR-229), and nothing loops.
+#[test]
+fn a_life_re_dated_before_the_databases_drop_is_known_does_not_outlive_it() {
+    for peer_holds_the_database_drop_first in [true, false] {
+        let (a, m, _da, _dm, id) = a_and_d_holding_the_old_life();
+        a.create_collection("shop", "items").unwrap();
+        sync(&a, &m);
+        assert!(a.drop_collection("shop", "orders").unwrap());
+        later();
+        let on_m = m.get_collection("shop", "orders").unwrap();
+        m.insert(&on_m, doc! { "_id": 3i64 }).unwrap();
+        // M takes the collection's drop alone: the database's is not yet known to it.
+        let start = m.version_vector().unwrap().behind(&a.version_vector().unwrap()).unwrap();
+        let entries = a.entries_for_peer(start, BATCH, WalkScope::Background).unwrap().entries;
+        m.apply_batch(&entries).unwrap();
+        let kept = m.get_collection("shop", "orders").unwrap();
+        assert!(kept.is_redated(), "premise: M kept the write");
+        later();
+        a.drop_database("shop").unwrap();
+        a.finish_purges_now().unwrap();
+
+        // P learns of the database's drop by a whole-database page.
+        let (p, _dp) = engine();
+        if peer_holds_the_database_drop_first {
+            let page = a.snapshot_page(None, None).unwrap();
+            p.apply_snapshot_page(a.node_id(), &mut SnapshotProgress::whole_database(), &page)
+                .unwrap();
+            assert!(p.database_dropped_at("shop").unwrap().is_some(), "premise: P holds S");
+        }
+        // P repairs the collection from M.
+        let page = m.snapshot_page(None, Some(id)).unwrap();
+        assert_eq!(
+            page.collections.first().and_then(|c| c.redated_from),
+            Some(kept.redated.unwrap().from),
+            "the definition says it was re-dated"
+        );
+        p.apply_snapshot_page(m.node_id(), &mut SnapshotProgress::of_collection(id), &page)
+            .unwrap();
+        if peer_holds_the_database_drop_first {
+            assert!(!holds(&p, "orders"), "refused at install: it began before S");
+        } else {
+            assert!(holds(&p, "orders"), "premise: P had nothing to refuse it with");
+            let page = a.snapshot_page(None, None).unwrap();
+            p.apply_snapshot_page(a.node_id(), &mut SnapshotProgress::whole_database(), &page)
+                .unwrap();
+        }
+        // And M learns of it last.
+        quiesce(&[&a, &m, &p]);
+        for (who, e) in [("a", &a), ("m", &m), ("p", &p)] {
+            assert!(!holds(e, "orders"), "{who}, peer first: {peer_holds_the_database_drop_first}");
+            assert!(!holds(e, "items"), "{who}");
+            assert_counts_exact(e, who);
+        }
+    }
 }

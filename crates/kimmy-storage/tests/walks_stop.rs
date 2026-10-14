@@ -136,7 +136,7 @@ const BOUNDED_READS: &[(&str, &str)] = &[
         "the collection registry: one row per collection, however many documents",
     ),
     (
-        "engine::Engine::bury_in_txn",
+        "engine::Engine::bury_standing_in_txn",
         "the registry, and one row: whether a database has a collection left",
     ),
     ("engine::Engine::clear_stamp_half", "at open, before the node serves or has a stop to answer"),

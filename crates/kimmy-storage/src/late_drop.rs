@@ -563,6 +563,28 @@ impl Engine {
         )
     }
 
+    /// A life restored from a page that says it was re-dated from `from`
+    /// carries the marker, with no first arrival (this node's log is its own).
+    /// Only if the life standing under the name is the one restored.
+    pub(crate) fn mark_restored_life_redated(
+        &self,
+        db: &str,
+        name: &str,
+        from: Hlc,
+        created: Hlc,
+    ) -> Result<()> {
+        let txn = self.begin_write_as(WriterHolder::Ddl, crate::engine::Continuing::No)?;
+        let standing = read_collection(&txn, db, name)?.filter(|meta| meta.created == created);
+        let Some(mut standing) = standing else {
+            txn.abort()?;
+            return Ok(());
+        };
+        standing.redated = Some(crate::meta::Redated { from, created, first_arrival: None });
+        Engine::put_collection_meta(&txn, &standing)?;
+        txn.commit()?;
+        Ok(())
+    }
+
     /// A database's tombstone `dropped` covers the re-dated life `standing` if
     /// the life was created at or before it before the drop re-dated it: it is
     /// buried with the database, the writes it kept with it (ADR-229). In its
