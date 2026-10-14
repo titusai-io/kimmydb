@@ -6894,6 +6894,14 @@ mod tests {
         let hints = b.refusal_hints(id).unwrap();
         assert_eq!(hints.len(), 1, "and it is the refusal's hint");
         assert_eq!(hints[0].stamp, newer);
+
+        // The same page met again (a permanent refusal is re-met on every repair or
+        // catch-up round): the hint is the same, so nothing is committed.
+        let outcome = b
+            .apply_snapshot_page(a.node_id(), &mut SnapshotProgress::of_collection(id), &page)
+            .unwrap();
+        assert_eq!(outcome.ddl_refused, 1);
+        assert_eq!(b.commits(), before + 1, "an identical repeat commits nothing");
     }
 
     #[test]

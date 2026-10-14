@@ -406,3 +406,100 @@ fn the_burial_clears_the_hints_of_the_collections_shadow() {
     assert!(b.refusal_hints(orders.id).unwrap().is_empty());
     assert!(b.refusal_hints(shadow).unwrap().is_empty(), "the shadow's went with it");
 }
+
+// -- An identical hint is not a commit (ADR-125: no commit trickle) --------------------
+
+/// A refusal that is met again on every round (a permanent one, re-met on each
+/// repair or catch-up page) must not commit and fsync an identical row each time.
+#[test]
+fn an_identical_hint_is_no_commit_and_a_different_one_is() {
+    let (b, _db) = engine();
+    let orders = b.create_collection("shop", "orders").unwrap();
+    let node = kimmy_core::NodeId::from_bytes([5; 16]);
+    let at = |wall: u64| Stamp::new(kimmy_core::Hlc::new(wall, 0), node);
+    let hint = |wall: u64, hash: u128| {
+        crate::RefusalHint::new(orders.id, HintKind::Index, "x", at(wall), hash)
+    };
+    let before = b.commits();
+    b.record_refusal_hint(&hint(900, 1)).unwrap();
+    assert_eq!(b.commits(), before + 1, "the first one commits");
+    b.record_refusal_hint(&hint(900, 1)).unwrap();
+    assert_eq!(b.commits(), before + 1, "an identical repeat commits nothing");
+    b.record_refusal_hint(&hint(900, 2)).unwrap();
+    assert_eq!(b.commits(), before + 2, "another hash is written");
+    b.record_refusal_hint(&hint(1_000, 2)).unwrap();
+    assert_eq!(b.commits(), before + 3, "a newer stamp is written");
+    let mut other_build = hint(1_000, 2);
+    other_build.version = "0.0.0-other".into();
+    b.record_refusal_hint(&other_build).unwrap();
+    assert_eq!(b.commits(), before + 4, "another build is written");
+}
+
+/// The three writers the refusal sites call: each commits once and not again for
+/// the same refusal.
+#[test]
+fn a_refusal_met_again_commits_its_hint_once_at_every_writer() {
+    let (b, _db) = engine();
+    b.create_collection("shop", "orders").unwrap();
+    b.create_index("shop", "orders", field("held"), false, Some("held".into())).unwrap();
+    b.configure_vectors("shop", "orders", crate::definition_probe_tests::byo()).unwrap();
+    let stamp = Stamp::new(kimmy_core::Hlc::new(900, 0), kimmy_core::NodeId::from_bytes([5; 16]));
+    let index = b.get_collection("shop", "orders").unwrap().index("held").unwrap().clone();
+    let id = CollectionId::derive("shop", "orders");
+    type Note = Box<dyn Fn(&Engine) -> crate::Result<()>>;
+    let notes: Vec<(&str, Note)> = vec![
+        ("an index", Box::new(move |e| e.note_refused_index(id, &index, stamp))),
+        ("a vector configuration", {
+            let config = local_config();
+            Box::new(move |e| e.note_refused_vector("shop", "orders", Some(&config), stamp))
+        }),
+        (
+            "a vector turning-off",
+            Box::new(move |e| e.note_refused_vector("shop", "orders", None, stamp)),
+        ),
+        (
+            "an index drop",
+            Box::new(move |e| e.note_refused_index_drop("shop", "orders", "held", stamp)),
+        ),
+    ];
+    for (what, note) in notes {
+        let before = b.commits();
+        note(&b).unwrap();
+        assert_eq!(b.commits(), before + 1, "{what}: the first commits");
+        note(&b).unwrap();
+        note(&b).unwrap();
+        assert_eq!(b.commits(), before + 1, "{what}: a repeat commits nothing");
+    }
+}
+
+/// A replicated refused entry delivered again leaves its hint as it was and
+/// commits no hint: the first delivery costs the hint's commit more than the next.
+#[test]
+fn a_re_delivered_refused_entry_rewrites_no_hint() {
+    let (a, _da) = engine();
+    let (b, _db) = engine();
+    let on_a = a.create_collection("shop", "orders").unwrap();
+    b.create_collection("shop", "orders").unwrap();
+    later();
+    let entry = crate::engine::ddl_entry(
+        a.next_stamp(),
+        OpKind::ConfigureVectors,
+        on_a.id,
+        &kimmy_core::VectorSet {
+            db: "shop".into(),
+            collection: "orders".into(),
+            config: Some(local_config()),
+        },
+    )
+    .unwrap();
+    let start = b.commits();
+    assert_eq!(b.apply_batch(std::slice::from_ref(&entry)).unwrap().ddl_refused, 1);
+    let first = b.commits() - start;
+    let hints = b.refusal_hints(on_a.id).unwrap();
+    let start = b.commits();
+    for _ in 0..2 {
+        assert_eq!(b.apply_batch(std::slice::from_ref(&entry)).unwrap().ddl_refused, 1);
+    }
+    assert_eq!(b.refusal_hints(on_a.id).unwrap(), hints, "the row is as it was");
+    assert_eq!((b.commits() - start) / 2 + 1, first, "a repeat costs the hint's commit less");
+}

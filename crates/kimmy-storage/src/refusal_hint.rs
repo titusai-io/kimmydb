@@ -138,8 +138,9 @@ fn range_of(collection: CollectionId) -> (String, String) {
 
 impl Engine {
     /// Remember a refusal, in a transaction of its own. A newer stamp replaces
-    /// an older one for the same `(collection, kind, name)`, and an older never
-    /// replaces a newer.
+    /// an older one for the same `(collection, kind, name)`, an older never
+    /// replaces a newer, and a hint identical to the one held (stamp, build and
+    /// hash) is no write at all.
     ///
     /// A failure is the caller's to treat as the batch's: the entry is not
     /// witnessed and is served again, never swallowed.
@@ -147,6 +148,14 @@ impl Engine {
         #[cfg(any(test, feature = "test-hooks"))]
         if self.hint_write_fails.swap(false, std::sync::atomic::Ordering::SeqCst) {
             return Err(StorageError::Corrupt("a hint write failure injected by a test".into()));
+        }
+        // A refusal met again (a permanent one is re-met on every repair or
+        // catch-up round) finds the same row already there: nothing is committed,
+        // and the writer is not taken, so a refusal is not a commit trickle
+        // (ADR-125). Two writers that both miss it write the same row twice,
+        // which is harmless.
+        if self.refusal_hints(hint.collection)?.contains(hint) {
+            return Ok(());
         }
         let txn = self.begin_write(WriterHolder::Ddl)?;
         let wrote = Self::record_refusal_hint_in(&txn, hint)?;
