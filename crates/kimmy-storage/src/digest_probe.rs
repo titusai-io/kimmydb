@@ -666,10 +666,17 @@ impl Engine {
         let mut facets = BTreeMap::new();
         for meta in &metas {
             let row = live_digest::kept_row(&rows, meta.id.0)?.unwrap_or_default();
+            let dropped = Self::collection_dropped_at_in(txn, meta.id)?;
             let quiet = row.maxw.iter().all(|(node, hlc)| *hlc <= cut.get(*node));
             let deferred = if row.bare_max.iter().any(|(node, hlc)| *hlc > cut.get(*node)) {
                 Some(Defer::BareTombstone)
-            } else if drop_defers(Self::collection_dropped_at_in(txn, meta.id)?, meta.created, cut)
+            } else if drop_defers(dropped, meta.created, cut)
+                // A life that owes ADR-231's sweep for this drop (created above
+                // it, floor below it) still holds what the life before put in it,
+                // however far the cut is past the drop: the drop is covered and
+                // the stragglers are not yet gone. Its digest is not one a peer
+                // that has swept can equal.
+                || dropped.is_some_and(|at| crate::late_drop::owes_a_sweep(meta, at.hlc))
             {
                 Some(Defer::Incarnation)
             } else if drop_defers(
@@ -1453,6 +1460,55 @@ mod tests {
         }
     }
 
+    /// h2-N5. A covered drop does not make a life comparable while the life owes
+    /// ADR-231's sweep for it: created above the drop and floored below it, it
+    /// still holds what the life before put in it. The floor at the drop (the
+    /// sweep done) makes it comparable again; a floor one below does not.
+    #[test]
+    fn a_covered_drop_defers_a_life_that_owes_the_sweep_until_its_floor_is_at_the_drop() {
+        let (e, f, _orders, items, _dirs) = converged();
+        let origin = NodeId::generate();
+        let at = Hlc::new(crate::physical_now_ms() - 5_000, 0);
+        for node in [&e, &f] {
+            let entry = kimmy_core::OplogEntry {
+                stamp: Stamp::new(at, origin),
+                kind: kimmy_core::OpKind::Insert,
+                collection: items.id,
+                doc_id: Some(DocId::Int64(8_000)),
+                body: Some(bson::serialize_to_vec(&doc! { "_id": 8000i64 }).unwrap()),
+            };
+            node.apply_remote(&items, &entry).unwrap();
+        }
+        let fresh = e.create_collection("shop", "fresh").unwrap();
+        e.insert(&fresh, doc! { "_id": 1i64 }).unwrap();
+        sync(&e, &f);
+        assert!(fresh.created > at, "premise: the life is newer than the drop");
+        e.record_collection_drop(fresh.id, Stamp::new(at, origin)).unwrap();
+        let floored = |floor: Option<Hlc>| {
+            let mut meta = e.get_collection("shop", "fresh").unwrap();
+            meta.incarnation_floor = floor;
+            let txn = e.begin_write(crate::WriterHolder::Ddl).unwrap();
+            Engine::put_collection_meta(&txn, &meta).unwrap();
+            txn.commit().unwrap();
+        };
+        // The cut covers the drop, and the life owes its sweep: not compared.
+        for owing in [None, Some(Hlc::new(at.wall_ms - 1, 0))] {
+            floored(owing);
+            let verdicts = exchange(&e, &f, None);
+            assert_eq!(
+                outcome_of(&verdicts, fresh.id),
+                Some(DigestOutcome::Deferred(Defer::Incarnation)),
+                "floor {owing:?}: {verdicts:?}"
+            );
+        }
+        // The sweep done: the floor at the drop, and above it.
+        for done in [at, Hlc::new(at.wall_ms + 1, 0)] {
+            floored(Some(done));
+            let verdicts = exchange(&e, &f, None);
+            assert_eq!(compared(&verdicts, fresh.id), Some(true), "floor {done:?}: {verdicts:?}");
+        }
+    }
+
     /// The boundaries of the covered-drop rule, at the collection tombstone's
     /// own site (the database tombstone's are pinned below): a drop whose
     /// `hlc` equals the standing collection's `created` is not newer than it,
@@ -1505,9 +1561,16 @@ mod tests {
         sync(&e, &f);
         assert!(fresh.created > at, "premise: the life is newer than the drop");
         e.record_collection_drop(fresh.id, Stamp::new(at, origin)).unwrap();
+        // The drop arrived after the life, so the life owes ADR-231's sweep; done
+        // here, as an apply does it, before the drop is judged covered.
+        e.sweep_late_drop("shop", "fresh", Stamp::new(at, origin)).unwrap();
         let verdicts = exchange(&e, &f, None);
         assert_eq!(compared(&verdicts, fresh.id), Some(true), "a drop at the cut: {verdicts:?}");
         e.record_collection_drop(fresh.id, Stamp::new(Hlc::new(at.wall_ms + 1, 0), origin))
+            .unwrap();
+        // Swept too, so that what defers it is the cut and not the sweep it owes
+        // (h2-N5 has its own test): the drop is one above the cut component.
+        e.sweep_late_drop("shop", "fresh", Stamp::new(Hlc::new(at.wall_ms + 1, 0), origin))
             .unwrap();
         let verdicts = exchange(&e, &f, None);
         assert_eq!(
