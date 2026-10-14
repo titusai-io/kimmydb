@@ -144,6 +144,10 @@ impl Engine {
     /// A failure is the caller's to treat as the batch's: the entry is not
     /// witnessed and is served again, never swallowed.
     pub fn record_refusal_hint(&self, hint: &RefusalHint) -> Result<()> {
+        #[cfg(any(test, feature = "test-hooks"))]
+        if self.hint_write_fails.swap(false, std::sync::atomic::Ordering::SeqCst) {
+            return Err(StorageError::Corrupt("a hint write failure injected by a test".into()));
+        }
         let txn = self.begin_write(WriterHolder::Ddl)?;
         let wrote = Self::record_refusal_hint_in(&txn, hint)?;
         if wrote {
@@ -152,6 +156,13 @@ impl Engine {
             txn.abort()?;
         }
         Ok(())
+    }
+
+    /// Make the next [`Self::record_refusal_hint`] fail (a test hook: a refusal
+    /// that cannot be remembered must fail the batch and be served again).
+    #[cfg(any(test, feature = "test-hooks"))]
+    pub fn fail_next_hint_write_for_test(&self) {
+        self.hint_write_fails.store(true, std::sync::atomic::Ordering::SeqCst);
     }
 
     /// [`Self::record_refusal_hint`] in a transaction the caller holds.
@@ -218,5 +229,98 @@ impl Engine {
             meta.remove(key.as_str())?;
         }
         Ok(keys.len())
+    }
+}
+
+impl Engine {
+    /// Remember that this member refused to apply an index definition a peer
+    /// sent (a replicated `CreateIndex` or a snapshot's index it cannot build).
+    /// The hash is of the definition as the peer sent it, which is what the
+    /// peer's own stored index hashes to: both are `as_stored` before they are
+    /// serialized, and the JSON round trip of the stored form keeps every type.
+    pub(crate) fn note_refused_index(
+        &self,
+        collection: CollectionId,
+        index: &kimmy_core::IndexMeta,
+        stamp: Stamp,
+    ) -> Result<()> {
+        self.record_refusal_hint(&RefusalHint::new(
+            collection,
+            HintKind::Index,
+            index.name.clone(),
+            stamp,
+            crate::definition_digest::index_hash(index),
+        ))
+    }
+
+    /// The same for a vector configuration this member refused. `config` is the
+    /// configuration refused; for a refused **turning off** it is `None`, and the
+    /// hint is of the opposite shape: this member holds a configuration the peer
+    /// turned off and could not turn off here.
+    pub(crate) fn note_refused_vector(
+        &self,
+        db: &str,
+        name: &str,
+        config: Option<&kimmy_core::VectorConfig>,
+        stamp: Stamp,
+    ) -> Result<()> {
+        let collection = CollectionId::derive(db, name);
+        let (kind, hash) = match config {
+            Some(config) => (HintKind::Vector, crate::definition_digest::vector_hash(config)),
+            None => match self.get_collection(db, name).ok().and_then(|meta| meta.vector) {
+                Some(held) => (HintKind::Drop, crate::definition_digest::vector_hash(&held)),
+                // Nothing held, so nothing to explain.
+                None => return Ok(()),
+            },
+        };
+        self.record_refusal_hint(&RefusalHint::new(
+            collection,
+            kind,
+            crate::definition_digest::VECTOR_NAME,
+            stamp,
+            hash,
+        ))
+    }
+
+    /// The same for a peer's drop of an index this member holds and could not
+    /// drop: the opposite shape, and the hash is of the index this member holds.
+    pub(crate) fn note_refused_index_drop(
+        &self,
+        db: &str,
+        collection: &str,
+        index: &str,
+        stamp: Stamp,
+    ) -> Result<()> {
+        let Some(held) =
+            self.get_collection(db, collection).ok().and_then(|meta| meta.index(index).cloned())
+        else {
+            return Ok(());
+        };
+        self.record_refusal_hint(&RefusalHint::new(
+            CollectionId::derive(db, collection),
+            HintKind::Drop,
+            index,
+            stamp,
+            crate::definition_digest::index_hash(&held),
+        ))
+    }
+
+    /// Remove the hints of `collection` that are about the definition `name`,
+    /// whatever their kind, in the caller's transaction: an index dropped here is
+    /// no longer one this member refused or holds under a refusal.
+    pub(crate) fn clear_refusal_hints_named_in(
+        txn: &WriteTransaction,
+        collection: CollectionId,
+        name: &str,
+    ) -> Result<usize> {
+        let mut meta = txn.open_table(tables::META)?;
+        let mut cleared = 0usize;
+        for kind in [HintKind::Index, HintKind::Vector, HintKind::Drop] {
+            let key = format!("{PREFIX}{}:{}:{}", collection.0, kind.as_str(), name);
+            if meta.remove(key.as_str())?.is_some() {
+                cleared += 1;
+            }
+        }
+        Ok(cleared)
     }
 }

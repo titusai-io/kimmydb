@@ -2336,6 +2336,11 @@ impl Engine {
                              definition stands on its peers and the divergence is counted \
                              in kimmy_sync_ddl_refused_total"
                         );
+                        // Remembered, so that the definition digest can say the
+                        // difference is this refusal (a hint, never a mask). A
+                        // failure here fails the batch: the entry is then not
+                        // witnessed and is served again, never swallowed.
+                        self.note_refused_index(entry.collection, &target.index, entry.stamp)?;
                         return Ok(DdlOutcome::Refused);
                     }
                     Ddl::PurgePending(name) => return Ok(DdlOutcome::PurgePending(name)),
@@ -2481,6 +2486,14 @@ impl Engine {
                             reason = %reason,
                             "skipped a replicated index drop this node could not apply"
                         );
+                        // The opposite shape: this member holds an index the peer
+                        // dropped and could not drop.
+                        self.note_refused_index_drop(
+                            &target.db,
+                            &target.collection,
+                            &target.index,
+                            entry.stamp,
+                        )?;
                         return Ok(DdlOutcome::Refused);
                     }
                     Ddl::PurgePending(name) => return Ok(DdlOutcome::PurgePending(name)),
@@ -2488,6 +2501,7 @@ impl Engine {
             }
             OpKind::ConfigureVectors => {
                 let target: kimmy_core::VectorSet = bson::deserialize_from_slice(body)?;
+                let refused_config = target.config.clone();
                 let applied = match target.config {
                     Some(config) => settle(self.configure_vectors_inner(
                         &target.db,
@@ -2525,6 +2539,12 @@ impl Engine {
                             "skipped a replicated vector configuration this node cannot apply; \
                              the divergence is counted in kimmy_sync_ddl_refused_total"
                         );
+                        self.note_refused_vector(
+                            &target.db,
+                            &target.collection,
+                            refused_config.as_ref(),
+                            entry.stamp,
+                        )?;
                         return Ok(DdlOutcome::Refused);
                     }
                     Ddl::PurgePending(name) => return Ok(DdlOutcome::PurgePending(name)),

@@ -1850,6 +1850,8 @@ impl crate::Engine {
             // Same transaction as the removal, so there is no instant in which the
             // index is gone with no record that it was dropped.
             crate::Engine::record_index_drop_in_txn(&txn, meta.id, index_id, stamp)?;
+            // A hint about an index that is gone here has nothing left to explain.
+            crate::Engine::clear_refusal_hints_named_in(&txn, meta.id, name)?;
 
             let logged = if log {
                 let entry = drop_entry(stamp)?;

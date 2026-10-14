@@ -1710,6 +1710,15 @@ impl Engine {
                          definition stands on its peers and the divergence is counted in \
                          kimmy_sync_ddl_refused_total"
                     );
+                    // Remembered for the definition digest, when the page says
+                    // when the definition was made (a floor needs a stamp).
+                    if let Some(stamp) = index.created {
+                        self.note_refused_index(
+                            CollectionId::derive(&state.db, &state.name),
+                            index,
+                            stamp,
+                        )?;
+                    }
                 }
             }
         }
@@ -1839,6 +1848,9 @@ impl Engine {
                      configuration stands on its peers and the divergence is counted in \
                      kimmy_sync_ddl_refused_total"
                 );
+                if let Some(stamp) = state.vector_changed {
+                    self.note_refused_vector(&state.db, &state.name, state.vector.as_ref(), stamp)?;
+                }
                 Ok(1)
             }
         }
