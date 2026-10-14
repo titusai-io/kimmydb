@@ -4509,4 +4509,21 @@ mod definition_fold_tests {
         f.state.prune(&held, None);
         assert_eq!(f.state.stuck.len(), 1, "no member list: nothing to judge peers by");
     }
+
+    /// The tick that lists the collections this node holds prunes the definition
+    /// state and the per-peer detail set by them and by the members it still
+    /// has. A textual guard, as the repo keeps for a place a contact must call
+    /// something: a refactor that drops either call leaves both maps growing with
+    /// every peer removed and every collection dropped.
+    #[test]
+    fn the_tick_prunes_the_definition_state_and_the_detail_set() {
+        let source = include_str!("peers.rs");
+        let production = source.split("\n#[cfg(test)]").next().unwrap();
+        for call in [
+            "definition_state.prune(held, members.as_ref())",
+            "stalls.retain_definition_detail(members.as_ref(), held)",
+        ] {
+            assert_eq!(production.matches(call).count(), 1, "{call}");
+        }
+    }
 }
