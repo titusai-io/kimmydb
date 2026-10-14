@@ -282,9 +282,15 @@ impl Engine {
             let mut above = None;
             let list = definition_list(meta);
             let digest = crate::definition_digest::digest_of_list(&list);
+            let dropped = Self::collection_dropped_at_in(txn, meta.id)?;
             let deferred = if horizon {
                 Some(DefinitionDefer::Horizon)
-            } else if drop_defers(Self::collection_dropped_at_in(txn, meta.id)?, meta.created, cut)
+            } else if drop_defers(dropped, meta.created, cut)
+                // A life that owes ADR-231's sweep for this drop (created above
+                // it, floor below it) still holds what the life before put in
+                // it, however far the cut is past the drop: the same rule as the
+                // cut digest's, so the two halves never disagree about it.
+                || dropped.is_some_and(|at| crate::late_drop::owes_a_sweep(meta, at.hlc))
             {
                 Some(DefinitionDefer::Incarnation)
             } else if drop_defers(

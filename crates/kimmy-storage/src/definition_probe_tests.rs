@@ -343,12 +343,18 @@ fn a_covered_drop_over_a_newer_life_does_not_defer() {
     let created = a.get_collection("shop", "orders").unwrap().created;
     let before = Stamp::new(Hlc::new(created.wall_ms - 1, 0), a.node_id());
     a.record_collection_drop(orders, before).unwrap();
+    // The drop arrived after the life, so the life owes ADR-231's sweep; done here,
+    // as an apply does it, before the drop is judged covered (the state a member
+    // leaves standing is swept; the one that owes it has its own test).
+    a.sweep_late_drop("shop", "orders", before).unwrap();
     // The cut covers a drop stamped before everything either wrote.
     let verdicts = exchange(&a, &b, &[]);
     assert_eq!(compared(&verdicts, orders), Some(true), "{verdicts:?}");
     // One above the cut: not covered.
     let future = Stamp::new(Hlc::new(crate::physical_now_ms() + 60_000, 0), a.node_id());
     a.record_collection_drop(orders, future).unwrap();
+    // Swept too, so that what defers it is the cut and not the sweep it owes.
+    a.sweep_late_drop("shop", "orders", future).unwrap();
     let verdicts = exchange(&a, &b, &[]);
     assert_eq!(deferred(&verdicts, orders), Some(DefinitionDefer::Incarnation), "{verdicts:?}");
 }
