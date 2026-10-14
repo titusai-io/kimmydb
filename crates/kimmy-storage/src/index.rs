@@ -1175,6 +1175,59 @@ impl crate::Engine {
                         // The originating entry is appended onward as it always
                         // was, so every member computes the same maximum whatever
                         // order the creations reach it in.
+                        // **An identical definition inherited from a life before this
+                        // one's creation is re-stamped by a local create.** The
+                        // definition arrived with the old life's entries, stamped
+                        // before this life began, so ADR-231's sweep will take it when
+                        // the old life's drop arrives, and the client who has just been
+                        // told the index exists would be left without it. A local create
+                        // of the identical definition over one stamped below the
+                        // collection's `created` is therefore a new creation: it takes a
+                        // fresh stamp under the writer and replicates a `CreateIndex`,
+                        // which the members holding the definition raise their stamp to
+                        // (the arm below) and the others build. The answer is the same
+                        // as ever (idempotent when the definition is identical); an
+                        // identical create over one stamped at or above `created` stays
+                        // the pure no-op it is, so a client that creates on every boot
+                        // mints nothing.
+                        if matches!(origin, CreateOrigin::Local)
+                            && existing.created.is_some_and(|held| held.hlc < meta.created)
+                        {
+                            let txn = self.begin_write(WriterHolder::Ddl)?;
+                            if !crate::Engine::definition_is(&txn, &read)? {
+                                txn.abort()?;
+                                #[cfg(test)]
+                                crate::sync::race_hooks::absorbed(
+                                    crate::sync::race_hooks::Race::IndexCreation,
+                                );
+                                // The retry's arguments, which this attempt rebuilt from what it
+                                // read. A loop rather than a self-call, so they are assigned
+                                // rather than passed.
+                                fields = index.fields;
+                                requested_name = Some(index.name);
+                                partial_filter = index.partial_filter;
+                                continue;
+                            }
+                            let minted = self.next_stamp();
+                            let mut restamped = existing.clone();
+                            restamped.created = Some(minted);
+                            meta.indexes
+                                .iter_mut()
+                                .find(|i| i.name == restamped.name)
+                                .expect("the index was found on this meta a moment ago")
+                                .created = Some(minted);
+                            crate::Engine::put_collection_meta(&txn, &meta)?;
+                            let entry = crate::engine::ddl_entry(
+                                minted,
+                                kimmy_core::OpKind::CreateIndex,
+                                meta.id,
+                                &logged_definition(db, collection, &restamped),
+                            )?;
+                            crate::engine::append_oplog(&txn, &entry)?;
+                            txn.commit()?;
+                            self.publish(vec![entry]);
+                            return Ok((IndexCreated::Standing(existing), Vec::new()));
+                        }
                         let merged = match (origin, existing.created, index.created) {
                             // A local create mints a fresh stamp and returns here
                             // without logging, so adopting it would be a decision

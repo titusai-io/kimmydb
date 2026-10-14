@@ -1585,4 +1585,241 @@ mod tests {
         assert_eq!(b.sweep_late_drop("shop", "orders", dropped).unwrap(), 1);
         assert_eq!(docs_of(&b, "shop", "orders", &[1, 2]), vec![2]);
     }
+
+    // -- #185 follow-ups: the exceptions, the boundary, the layers ---------------
+
+    fn by_from() -> Vec<kimmy_core::IndexField> {
+        vec![kimmy_core::IndexField { path: "from".into(), descending: false }]
+    }
+
+    fn byo_config() -> kimmy_core::VectorConfig {
+        kimmy_core::VectorConfig {
+            fields: vec!["text".into()],
+            provider: kimmy_core::ProviderConfig::Byo {},
+            dim: 4,
+            metric: Default::default(),
+            document_prefix: None,
+            query_prefix: None,
+            chunk: Default::default(),
+        }
+    }
+
+    /// Rewrite the stored definition of `shop.orders` on `e`.
+    fn edit_meta(e: &Engine, edit: impl FnOnce(&mut CollectionMeta)) {
+        let mut meta = e.get_collection("shop", "orders").unwrap();
+        edit(&mut meta);
+        let txn = e.begin_write(WriterHolder::Ddl).unwrap();
+        Engine::put_collection_meta(&txn, &meta).unwrap();
+        txn.commit().unwrap();
+    }
+
+    /// A drops `shop.orders`; B makes the name afterwards. Returns B's id for the
+    /// collection and A's drop.
+    fn a_drop_and_a_later_life() -> (Engine, Engine, tempfile::TempDir, tempfile::TempDir, Stamp) {
+        let (a, da) = engine();
+        let (b, db) = engine();
+        let on_a = a.create_collection("shop", "orders").unwrap();
+        a.insert(&on_a, doc! { "_id": 1i64 }).unwrap();
+        assert!(a.drop_collection("shop", "orders").unwrap());
+        a.finish_purges_now().unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(5));
+        let on_b = b.create_collection("shop", "orders").unwrap();
+        b.insert(&on_b, doc! { "_id": 2i64 }).unwrap();
+        let dropped = a.collection_dropped_at(on_a.id).unwrap().unwrap();
+        (a, b, da, db, dropped)
+    }
+
+    /// f-1. An index with no `created` stamp (one made before the stamp existed)
+    /// cannot be told from the newer life's, and the sweep leaves it.
+    #[test]
+    fn an_index_with_no_created_stamp_is_left_by_the_sweep() {
+        let (a, b, _da, _db, _dropped) = a_drop_and_a_later_life();
+        b.create_index("shop", "orders", by_from(), false, Some("old_style".into())).unwrap();
+        edit_meta(&b, |meta| meta.indexes[0].created = None);
+        quiesce(&[&a, &b]);
+        let standing = b.get_collection("shop", "orders").unwrap();
+        assert_eq!(standing.indexes.len(), 1, "swept: {:?}", standing.indexes);
+        assert_eq!(docs_of(&b, "shop", "orders", &[1, 2]), vec![2]);
+    }
+
+    /// f-1. The same for a vector configuration with no `vector_changed`.
+    #[test]
+    fn a_vector_configuration_with_no_vector_changed_is_left_by_the_sweep() {
+        let (a, b, _da, _db, _dropped) = a_drop_and_a_later_life();
+        b.configure_vectors("shop", "orders", byo_config()).unwrap();
+        edit_meta(&b, |meta| meta.vector_changed = None);
+        quiesce(&[&a, &b]);
+        let standing = b.get_collection("shop", "orders").unwrap();
+        assert!(standing.vector.is_some(), "the unstamped configuration was turned off");
+        assert_eq!(docs_of(&b, "shop", "orders", &[1, 2]), vec![2]);
+    }
+
+    /// f-1. A definition tied at the drop (the same `Hlc`, from a node above the
+    /// dropper's) is selected by the sweep and declined by the drop of the index,
+    /// which keeps it and records the tombstone: the tie is on the selected side
+    /// of the boundary and the definition stands.
+    #[test]
+    fn a_definition_tied_at_the_drop_is_kept_and_its_drop_is_declined() {
+        let (a, b, _da, _db, dropped) = a_drop_and_a_later_life();
+        b.create_index("shop", "orders", by_from(), false, Some("tied".into())).unwrap();
+        let above = Stamp::new(dropped.hlc, NodeId::from_bytes([0xff; 16]));
+        assert!(above > dropped, "premise: the tie sorts above the dropper's");
+        edit_meta(&b, |meta| meta.indexes[0].created = Some(above));
+        let id = b.get_collection("shop", "orders").unwrap().id;
+        quiesce(&[&a, &b]);
+        let standing = b.get_collection("shop", "orders").unwrap();
+        assert_eq!(standing.indexes.len(), 1, "the tie was swept");
+        assert_eq!(
+            b.index_dropped_at(id, kimmy_core::IndexMeta::derive_id("tied")).unwrap(),
+            Some(dropped),
+            "the tie is selected and its drop declined, with the tombstone recorded"
+        );
+    }
+
+    /// f-1. A newer life's index with the same derived id as the old one's (same
+    /// name) survives, and the sweep does not even ask to drop it: no tombstone is
+    /// recorded for it, so the outer filter is what holds and not only the guard
+    /// inside the drop.
+    #[test]
+    fn a_newer_lifes_index_with_the_old_ones_derived_id_survives_untouched() {
+        let (a, b, _da, _db, dropped) = a_drop_and_a_later_life();
+        // The old life had `by_from` too, from A, stamped before its drop.
+        let on_a_id = CollectionId::derive("shop", "orders");
+        let old = kimmy_core::IndexCreate {
+            db: "shop".into(),
+            collection: "orders".into(),
+            index: kimmy_core::IndexMeta {
+                id: kimmy_core::IndexMeta::derive_id("by_from"),
+                name: "by_from".into(),
+                fields: by_from(),
+                unique: false,
+                enforcement: Default::default(),
+                multikey: false,
+                expire_after_secs: None,
+                partial_filter: None,
+                created: Some(Stamp::new(Hlc::new(dropped.hlc.wall_ms - 1, 0), a.node_id())),
+            },
+        };
+        std::thread::sleep(std::time::Duration::from_millis(5));
+        let theirs = b.create_index("shop", "orders", by_from(), false, Some("by_from".into()));
+        let mine = theirs.unwrap().created.unwrap();
+        assert!(mine.hlc > dropped.hlc, "premise: B's index is newer than the drop");
+        // A's older definition arrives at B and loses to B's own.
+        let entry = crate::engine::ddl_entry(
+            old.index.created.unwrap(),
+            kimmy_core::OpKind::CreateIndex,
+            on_a_id,
+            &old,
+        )
+        .unwrap();
+        b.apply_batch(std::slice::from_ref(&entry)).unwrap();
+        quiesce(&[&a, &b]);
+        let standing = b.get_collection("shop", "orders").unwrap();
+        assert_eq!(standing.indexes.len(), 1);
+        assert_eq!(standing.indexes[0].created, Some(mine));
+        assert_eq!(
+            b.index_dropped_at(on_a_id, kimmy_core::IndexMeta::derive_id("by_from")).unwrap(),
+            None,
+            "the newer index was never offered to the drop of the index"
+        );
+    }
+
+    /// f-2. A's index `X` of the life before reaches B before B's own
+    /// `create_index X`; B's create is told the index exists, and the old life's
+    /// drop then used to sweep it, leaving B's client without the index. The create
+    /// is now a new creation, stamped under the writer and replicated, so the sweep
+    /// leaves it and every member holds the index.
+    #[test]
+    fn an_identical_create_over_an_inherited_index_survives_the_sweep_on_every_member() {
+        let (a, da) = engine();
+        let (b, db) = engine();
+        let (c, dc) = engine();
+        let _dirs = (da, db, dc);
+        let on_a = a.create_collection("shop", "orders").unwrap();
+        a.create_index("shop", "orders", by_from(), false, Some("by_from".into())).unwrap();
+        a.insert(&on_a, doc! { "_id": 1i64, "from": "a" }).unwrap();
+        assert!(a.drop_collection("shop", "orders").unwrap());
+        a.finish_purges_now().unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(5));
+        let on_b = b.create_collection("shop", "orders").unwrap();
+        b.insert(&on_b, doc! { "_id": 2i64, "from": "b" }).unwrap();
+        // B takes A's entries up to the drop: the index of the life before comes in.
+        let start = b.version_vector().unwrap().behind(&a.version_vector().unwrap()).unwrap();
+        let entries = a.entries_for_peer(start, BATCH, WalkScope::Background).unwrap().entries;
+        let drop_at = entries.iter().position(|e| e.kind == kimmy_core::OpKind::DropCollection);
+        let (before, rest) = entries.split_at(drop_at.expect("the drop is in the window"));
+        b.apply_batch(before).unwrap();
+        let inherited = b.get_collection("shop", "orders").unwrap();
+        assert_eq!(inherited.indexes.len(), 1, "premise: the old index arrived");
+        assert!(
+            inherited.indexes[0].created.unwrap().hlc < inherited.created,
+            "premise: stamped before B's life"
+        );
+        // B's client creates it: told it exists.
+        let before_stamp = inherited.indexes[0].created;
+        let answered = b.create_index("shop", "orders", by_from(), false, Some("by_from".into()));
+        assert_eq!(answered.unwrap().name, "by_from");
+        let after = b.get_collection("shop", "orders").unwrap();
+        assert!(after.indexes[0].created > before_stamp, "re-stamped under B's writer");
+        // And the drop arrives.
+        b.apply_batch(rest).unwrap();
+        quiesce(&[&a, &b, &c]);
+        for (who, e) in [("a", &a), ("b", &b), ("c", &c)] {
+            match e.get_collection("shop", "orders") {
+                Ok(held) => {
+                    assert!(
+                        held.index("by_from").is_some(),
+                        "{who} lost the index: {:?}",
+                        held.indexes
+                    )
+                }
+                Err(_) => assert_eq!(who, "never"),
+            }
+        }
+        assert_eq!(docs_of(&b, "shop", "orders", &[1, 2]), vec![2]);
+    }
+
+    /// f-2, narrowly: an identical create over an index stamped at or above the
+    /// collection's `created` stays the no-op it is. A client that creates on every
+    /// boot mints no definition entry and moves no stamp.
+    #[test]
+    fn an_identical_create_over_an_index_of_this_life_mints_nothing() {
+        let (b, _db) = engine();
+        b.create_collection("shop", "orders").unwrap();
+        let first = b.create_index("shop", "orders", by_from(), false, Some("by_from".into()));
+        let first = first.unwrap();
+        let vector = b.version_vector().unwrap();
+        for _ in 0..3 {
+            let again = b.create_index("shop", "orders", by_from(), false, Some("by_from".into()));
+            assert_eq!(again.unwrap().created, first.created);
+        }
+        assert_eq!(b.version_vector().unwrap(), vector, "an entry was minted");
+    }
+
+    /// f-2 for the vector configuration: a local `configure_vectors` is never a
+    /// no-op (it takes a fresh stamp and replicates), so the same sequence is safe
+    /// already. Pinned, so it stays so.
+    #[test]
+    fn an_identical_vector_configuration_made_after_inheriting_it_survives_the_sweep() {
+        let (a, da) = engine();
+        let (b, db) = engine();
+        let _dirs = (da, db);
+        a.create_collection("shop", "orders").unwrap();
+        a.configure_vectors("shop", "orders", byo_config()).unwrap();
+        assert!(a.drop_collection("shop", "orders").unwrap());
+        a.finish_purges_now().unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(5));
+        b.create_collection("shop", "orders").unwrap();
+        let start = b.version_vector().unwrap().behind(&a.version_vector().unwrap()).unwrap();
+        let entries = a.entries_for_peer(start, BATCH, WalkScope::Background).unwrap().entries;
+        let drop_at =
+            entries.iter().position(|e| e.kind == kimmy_core::OpKind::DropCollection).unwrap();
+        let (before, rest) = entries.split_at(drop_at);
+        b.apply_batch(before).unwrap();
+        assert!(b.get_collection("shop", "orders").unwrap().vector.is_some(), "premise: inherited");
+        b.configure_vectors("shop", "orders", byo_config()).unwrap();
+        b.apply_batch(rest).unwrap();
+        quiesce(&[&a, &b]);
+        assert!(b.get_collection("shop", "orders").unwrap().vector.is_some());
+    }
 }
