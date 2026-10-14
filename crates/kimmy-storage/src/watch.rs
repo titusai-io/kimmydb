@@ -3864,6 +3864,15 @@ mod tests {
     /// keeps is re-dated above the drop (ADR-231, extended) and has no creation
     /// entry. Returns the drop's tombstone.
     fn a_kept_life_on(engine: &Engine) -> (CollectionId, Stamp, tempfile::TempDir) {
+        a_kept_life_with(engine, false)
+    }
+
+    /// [`a_kept_life_on`], where `e` also writes and deletes `t` after the drop
+    /// and before `o`, so the first entry the life keeps is a delete.
+    fn a_kept_life_with(
+        engine: &Engine,
+        deletes_first: bool,
+    ) -> (CollectionId, Stamp, tempfile::TempDir) {
         let dir = tempfile::tempdir().unwrap();
         let a = Engine::open(&dir.path().join("a.redb")).unwrap();
         let pull = |into: &Engine, from: &Engine| {
@@ -3880,6 +3889,10 @@ mod tests {
         assert!(a.drop_collection("app", "x").unwrap());
         std::thread::sleep(std::time::Duration::from_millis(5));
         let on_e = engine.get_collection("app", "x").unwrap();
+        if deletes_first {
+            engine.insert(&on_e, doc! { "_id": "t" }).unwrap();
+            assert!(engine.delete(&on_e, &kimmy_core::DocId::String("t".into())).unwrap());
+        }
         engine.insert(&on_e, doc! { "_id": "o" }).unwrap();
         pull(engine, &a);
         let dropped = engine.collection_dropped_at(on_a.id).unwrap().expect("the drop is held");
@@ -3920,6 +3933,25 @@ mod tests {
         let more =
             tokio::time::timeout(std::time::Duration::from_millis(300), stream.next(&engine)).await;
         assert!(more.is_err(), "nothing of the life before is heard: {more:?}");
+    }
+
+    /// A delete stamped after the drop is something the life kept: a stream that
+    /// began after it would show a document the life no longer has.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn the_first_entry_a_kept_life_keeps_may_be_a_delete() {
+        let (engine, _coll, _dir) = setup();
+        let (id, _dropped, _a_dir) = a_kept_life_with(&engine, true);
+        let kept = engine.get_collection("app", "x").unwrap();
+        let first = kept.redated_first_arrival(kept.created).expect("recorded");
+        let (resolved, _walked) = open_from_start(&engine, id);
+        assert_eq!(resolved.start, first);
+        let from_start = WatchOptions { resume_after: None, start_at: Some(Hlc::ZERO) };
+        let mut stream = engine.watch(WatchScope::Collection(id), from_start).unwrap();
+        let heard = tokio::time::timeout(std::time::Duration::from_millis(500), stream.next(&engine))
+            .await
+            .expect("the life's first entry is heard");
+        let Some(ChangeEvent::Change { entry, .. }) = heard else { panic!("heard {heard:?}") };
+        assert_eq!(entry.kind, OpKind::Delete, "the stream begins at the delete of `t`");
     }
 
     /// A marker left for another `created` (the life was re-dated again, or
