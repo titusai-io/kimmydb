@@ -9759,3 +9759,155 @@ async fn a_drop_and_a_concurrent_create_converge_through_the_loop_and_the_repair
         l.abort();
     }
 }
+
+/// A drop keeps the writes stamped after it (ADR-231, extended), through the
+/// real loops. Case one: nobody recreated the name. D took a write after A's
+/// drop; D keeps its collection with it, A has nothing to put it in, the
+/// existence half sees a collection D holds and A lacks (dated above A's
+/// tombstone, so a recreation), and the repair brings it back: both end with
+/// the collection and the write, the gauge returns to 0 and the repair stops.
+#[tokio::test]
+async fn a_write_after_a_drop_brings_the_collection_back_on_every_member_and_the_repair_ends() {
+    use kimmy_cluster::{ReplicationConfig, RoundReport, SeedSource, replicate};
+
+    let a = node().await;
+    let d = node().await;
+    let on_a = a.engine.create_collection("shop", "orders").unwrap();
+    a.engine.insert(&on_a, doc! { "_id": 1i64 }).unwrap();
+    sync(&a, &d).await;
+    assert!(a.engine.drop_collection("shop", "orders").unwrap());
+    a.engine.finish_purges_now().unwrap();
+    let on_d = d.engine.get_collection("shop", "orders").unwrap();
+    d.engine.insert(&on_d, doc! { "_id": 3i64 }).unwrap();
+
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<(bool, RoundReport)>();
+    let mut loops = Vec::new();
+    for (is_d, me, other) in [(false, &a, &d), (true, &d, &a)] {
+        loops.push(tokio::spawn({
+            let engine = Arc::clone(&me.engine);
+            async move {
+                let _ = engine.run_drop_purger().await;
+            }
+        }));
+        let mut config = ReplicationConfig::new(
+            vec![SeedSource::Static(vec![other.addr])],
+            SECRET.into(),
+            me.addr,
+        );
+        config.sync_interval = Duration::from_millis(100);
+        config.discovery_interval = Duration::from_millis(100);
+        let tx = tx.clone();
+        config.on_round = Some(Arc::new(move |report| {
+            let _ = tx.send((is_d, report));
+        }));
+        loops.push(tokio::spawn(replicate(Arc::clone(&me.engine), config)));
+    }
+
+    let held = |n: &Node| -> Vec<i64> {
+        let Ok(c) = n.engine.get_collection("shop", "orders") else { return vec![] };
+        (1..=3)
+            .filter(|k| n.engine.get(&c, &kimmy_core::DocId::Int64(*k)).unwrap().is_some())
+            .collect()
+    };
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
+    let mut gauge = [usize::MAX; 2];
+    loop {
+        let (is_d, report) = tokio::time::timeout_at(deadline, rx.recv())
+            .await
+            .expect("the members did not converge")
+            .expect("the loops keep reporting");
+        gauge[usize::from(is_d)] = report.divergent_collections;
+        if held(&a) == vec![3] && held(&d) == vec![3] && gauge == [0, 0] {
+            break;
+        }
+    }
+    let quiet_until = tokio::time::Instant::now() + Duration::from_secs(8);
+    let mut repairs = 0usize;
+    while tokio::time::Instant::now() < quiet_until {
+        if let Ok(Some((_, report))) =
+            tokio::time::timeout(Duration::from_millis(500), rx.recv()).await
+        {
+            repairs += report.repair_rounds;
+            assert_eq!(report.divergent_collections, 0, "{report:?}");
+        }
+    }
+    assert_eq!(repairs, 0, "the repair kept running after the members agreed");
+    for l in loops {
+        l.abort();
+    }
+}
+
+/// Case two, the original: three members, three loops, the drop made on A, the
+/// name created again on B, a write after the drop through D. All three end
+/// with documents 2 and 3, the gauge returns to 0 and the repair ends.
+#[tokio::test]
+async fn a_drop_a_recreation_and_a_write_after_the_drop_converge_on_three_members() {
+    use kimmy_cluster::{ReplicationConfig, RoundReport, SeedSource, replicate};
+
+    let a = node().await;
+    let b = node().await;
+    let d = node().await;
+    let on_a = a.engine.create_collection("shop", "orders").unwrap();
+    a.engine.insert(&on_a, doc! { "_id": 1i64 }).unwrap();
+    sync(&a, &d).await;
+    assert!(a.engine.drop_collection("shop", "orders").unwrap());
+    a.engine.finish_purges_now().unwrap();
+    let on_d = d.engine.get_collection("shop", "orders").unwrap();
+    d.engine.insert(&on_d, doc! { "_id": 3i64 }).unwrap();
+    let on_b = b.engine.create_collection("shop", "orders").unwrap();
+    b.engine.insert(&on_b, doc! { "_id": 2i64 }).unwrap();
+
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<(usize, RoundReport)>();
+    let nodes = [&a, &b, &d];
+    let mut loops = Vec::new();
+    for (i, me) in nodes.iter().enumerate() {
+        loops.push(tokio::spawn({
+            let engine = Arc::clone(&me.engine);
+            async move {
+                let _ = engine.run_drop_purger().await;
+            }
+        }));
+        let seeds: Vec<_> =
+            nodes.iter().enumerate().filter(|(j, _)| *j != i).map(|(_, n)| n.addr).collect();
+        let mut config =
+            ReplicationConfig::new(vec![SeedSource::Static(seeds)], SECRET.into(), me.addr);
+        config.sync_interval = Duration::from_millis(100);
+        config.discovery_interval = Duration::from_millis(100);
+        let tx = tx.clone();
+        config.on_round = Some(Arc::new(move |report| {
+            let _ = tx.send((i, report));
+        }));
+        loops.push(tokio::spawn(replicate(Arc::clone(&me.engine), config)));
+    }
+    let held = |n: &Node| -> Vec<i64> {
+        let Ok(c) = n.engine.get_collection("shop", "orders") else { return vec![] };
+        (1..=3)
+            .filter(|k| n.engine.get(&c, &kimmy_core::DocId::Int64(*k)).unwrap().is_some())
+            .collect()
+    };
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
+    let mut gauge = [usize::MAX; 3];
+    loop {
+        let (i, report) = tokio::time::timeout_at(deadline, rx.recv())
+            .await
+            .expect("the members did not converge")
+            .expect("the loops keep reporting");
+        gauge[i] = report.divergent_collections;
+        if nodes.iter().all(|n| held(n) == vec![2, 3]) && gauge == [0, 0, 0] {
+            break;
+        }
+    }
+    let quiet_until = tokio::time::Instant::now() + Duration::from_secs(8);
+    let mut repairs = 0usize;
+    while tokio::time::Instant::now() < quiet_until {
+        if let Ok(Some((_, report))) =
+            tokio::time::timeout(Duration::from_millis(500), rx.recv()).await
+        {
+            repairs += report.repair_rounds;
+        }
+    }
+    assert_eq!(repairs, 0, "the repair kept running after the members agreed");
+    for l in loops {
+        l.abort();
+    }
+}

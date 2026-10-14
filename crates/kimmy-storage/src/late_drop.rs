@@ -285,6 +285,16 @@ impl Engine {
         Ok(Chunk { removed: found.len(), skipped, last, exhausted })
     }
 
+    /// (Stub for the red run.)
+    pub(crate) fn keep_later_writes(
+        &self,
+        _current: &CollectionMeta,
+        _dropped: Stamp,
+        _stop: StopCheck<'_>,
+    ) -> Result<bool> {
+        Ok(false)
+    }
+
     /// A drop was judged aimed at a life of `current` that has already ended
     /// ([`crate::sync::aims_at_a_previous_incarnation`]): sweep what the newer
     /// life holds of the one before, in the collection and in its vector shadow.
@@ -485,15 +495,13 @@ mod tests {
         );
     }
 
-    /// A member D that still holds the old life writes Z after the drop, then
-    /// receives it. The drop destroys the life it was aimed at, Z with it, as it
-    /// always has; A and B, whose lives are newer, keep Z (it is stamped after
-    /// the drop), so D lacks a document the others hold. That is a different
-    /// divergence from this rule's (a write to a life the drop destroyed, kept
-    /// elsewhere) and is recorded as its own finding; what this test pins is
-    /// that the document of the life before is gone from all three.
+    /// A member D that still holds the old life writes Z after the drop's stamp,
+    /// then receives the drop. The drop removes what is stamped at or before it
+    /// and keeps Z (ADR-231, extended): D keeps its collection, re-dated to just
+    /// after the drop, with Z; and A and B, whose lives are newer, keep Z too.
+    /// Everyone ends with {2, 3}; document 1 is gone from all three.
     #[test]
-    fn a_member_still_holding_the_old_life_does_not_keep_the_document_of_it_after_the_drop() {
+    fn a_drop_keeps_the_write_stamped_after_it_on_the_member_that_took_it() {
         let (a, _da) = engine();
         let (b, _db) = engine();
         let (d, _dd) = engine();
@@ -508,16 +516,129 @@ mod tests {
         b.insert(&on_b, doc! { "_id": 2i64 }).unwrap();
         quiesce(&[&a, &b, &d]);
         for (who, e) in [("a", &a), ("b", &b), ("d", &d)] {
-            assert!(
-                !docs_of(e, "shop", "orders", &[1, 2, 3]).contains(&1),
-                "{who} kept document 1"
-            );
+            assert_eq!(docs_of(e, "shop", "orders", &[1, 2, 3]), vec![2, 3], "{who}");
+            assert_counts_exact(e, who);
         }
-        assert_eq!(
-            docs_of(&a, "shop", "orders", &[1, 2, 3]),
-            docs_of(&b, "shop", "orders", &[1, 2, 3]),
-            "A and B agree"
-        );
+    }
+
+    /// Nobody recreated the name: D keeps document 3 in a collection the drop
+    /// removed on A, re-dated above the drop and floored at it. A has no
+    /// collection to put the write in, so the write waits there as history; the
+    /// existence repair (the loop test) brings the collection back.
+    #[test]
+    fn a_drop_that_meets_a_later_write_keeps_the_collection_re_dated_above_the_drop() {
+        let (a, _da) = engine();
+        let (d, _dd) = engine();
+        let on_a = a.create_collection("shop", "orders").unwrap();
+        a.insert(&on_a, doc! { "_id": 1i64 }).unwrap();
+        sync(&a, &d);
+        assert!(a.drop_collection("shop", "orders").unwrap());
+        a.finish_purges_now().unwrap();
+        let on_d = d.get_collection("shop", "orders").unwrap();
+        d.insert(&on_d, doc! { "_id": 3i64 }).unwrap();
+        quiesce(&[&a, &d]);
+        let dropped = a.collection_dropped_at(on_a.id).unwrap().unwrap();
+        let kept = d.get_collection("shop", "orders").unwrap();
+        assert_eq!(docs_of(&d, "shop", "orders", &[1, 3]), vec![3]);
+        assert!(kept.created > dropped.hlc, "re-dated above the drop: {:?}", kept.created);
+        assert_eq!(kept.incarnation_floor, Some(dropped.hlc));
+        assert!(a.get_collection("shop", "orders").is_err(), "A has nothing to put it in");
+    }
+
+    /// A replicated drop that meets nothing stamped after it buries the
+    /// collection and purges it as it always did: no collection, no rows, no
+    /// floor, counts exact.
+    #[test]
+    fn a_replicated_drop_that_meets_nothing_later_buries_as_before() {
+        let (a, _da) = engine();
+        let (d, _dd) = engine();
+        let on_a = a.create_collection("shop", "orders").unwrap();
+        a.insert(&on_a, doc! { "_id": 1i64 }).unwrap();
+        sync(&a, &d);
+        assert!(a.drop_collection("shop", "orders").unwrap());
+        quiesce(&[&a, &d]);
+        assert!(d.get_collection("shop", "orders").is_err());
+        assert_eq!(d.rows_under(on_a.id).unwrap(), 0);
+        assert_counts_exact(&d, "a buried collection");
+    }
+
+    /// A database drop is not changed: a collection that holds a write stamped
+    /// after it is buried with it, as ADR-229 documents.
+    #[test]
+    fn a_database_drop_still_buries_a_collection_holding_a_later_write() {
+        let (a, _da) = engine();
+        let (d, _dd) = engine();
+        let on_a = a.create_collection("shop", "orders").unwrap();
+        a.insert(&on_a, doc! { "_id": 1i64 }).unwrap();
+        a.create_collection("shop", "items").unwrap();
+        sync(&a, &d);
+        a.drop_database("shop").unwrap();
+        a.finish_purges_now().unwrap();
+        let on_d = d.get_collection("shop", "orders").unwrap();
+        d.insert(&on_d, doc! { "_id": 3i64 }).unwrap();
+        quiesce(&[&a, &d]);
+        assert!(d.get_collection("shop", "orders").is_err(), "buried with the database");
+        assert!(d.get_collection("shop", "items").is_err());
+        assert_counts_exact(&d, "a database drop");
+    }
+
+    /// A stop between two chunks of the survivors path leaves the collection
+    /// as it was but for the chunks that landed, un-re-dated, and the drop
+    /// applied again finishes it.
+    #[test]
+    fn the_survivors_path_stops_between_chunks_and_the_drop_applied_again_finishes() {
+        let n = SWEEP_CHUNK * 2 + 17;
+        let (b, _dir, id, dropped) = a_store_holding_stragglers(n, 0);
+        // The collection holds a record stamped after the drop, and its life
+        // began before it: the life the drop is aimed at.
+        let mut meta = b.get_collection("shop", "orders").unwrap();
+        meta.created = Hlc::new(dropped.hlc.wall_ms - 100, 0);
+        {
+            let txn = b.begin_write(WriterHolder::Ddl).unwrap();
+            Engine::put_collection_meta(&txn, &meta).unwrap();
+            txn.commit().unwrap();
+        }
+        let later = Stamp::new(Hlc::new(dropped.hlc.wall_ms + 5, 0), dropped.node);
+        {
+            let key = crate::docs::doc_key(&DocId::Int64(1_000_000)).unwrap();
+            let body = bson::serialize_to_vec(&doc! { "_id": 1_000_000i64 }).unwrap();
+            let txn = b.begin_write(WriterHolder::Replication).unwrap();
+            let mut docs = txn.open_table(tables::DOCS).unwrap();
+            crate::live_count::put_record(
+                &txn,
+                &mut docs,
+                id.0,
+                &key,
+                &codec::encode_doc_record(&kimmy_core::DocRecord::live(later, body)),
+            )
+            .unwrap();
+            drop(docs);
+            txn.commit().unwrap();
+        }
+        let meta = b.get_collection("shop", "orders").unwrap();
+        let asked = std::cell::Cell::new(0);
+        let one_chunk = || {
+            asked.set(asked.get() + 1);
+            if asked.get() > 1 {
+                Err(crate::StorageError::Stopping(crate::StopReason::Shutdown))
+            } else {
+                Ok(())
+            }
+        };
+        assert!(matches!(
+            b.keep_later_writes(&meta, dropped, &one_chunk),
+            Err(crate::StorageError::Stopping(_))
+        ));
+        let standing = b.get_collection("shop", "orders").unwrap();
+        assert_eq!(standing.created, meta.created, "not re-dated yet");
+        assert_eq!(b.count_by_id(id).unwrap(), Some((n - SWEEP_CHUNK + 1) as u64));
+
+        assert!(b.keep_later_writes(&meta, dropped, &|| Ok(())).unwrap(), "something survived");
+        let standing = b.get_collection("shop", "orders").unwrap();
+        assert!(standing.created > dropped.hlc);
+        assert_eq!(standing.incarnation_floor, Some(dropped.hlc));
+        assert_eq!(b.count_by_id(id).unwrap(), Some(1));
+        assert_counts_exact(&b, "the survivors path");
     }
 
     /// The rule's two clauses: a life owes a sweep only when it began after the
