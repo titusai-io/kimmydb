@@ -2234,7 +2234,16 @@ impl Engine {
                             // And what the life standing here took in of the one
                             // that drop ended, before the drop was known (ADR-231).
                             self.sweep_after_an_ignored_drop(&current, entry.stamp)?;
-                            return Ok(DdlOutcome::Applied);
+                            // The life this very drop re-dated (ADR-231, extended)
+                            // is "ignored" only because an interrupted apply
+                            // redelivers the drop to it: the entry was not
+                            // appended then, and is now, below, so this member
+                            // holds it to serve onward.
+                            if !(current.is_redated()
+                                && current.created == entry.stamp.hlc.successor())
+                            {
+                                return Ok(DdlOutcome::Applied);
+                            }
                         }
                     }
                     Err(crate::StorageError::Core(kimmy_core::Error::CollectionNotFound {
@@ -2249,8 +2258,16 @@ impl Engine {
                 let is_shadow = kimmy_core::vector_meta::is_shadow(&target.name);
                 let shadow_held =
                     !is_shadow && self.get_collection(&target.db, &shadow_name).is_ok();
-                let buried =
-                    self.drop_collection_inner(&target.db, &target.name, Some(entry.stamp))?;
+                // A life with writes stamped after the drop keeps them (ADR-231,
+                // extended): it is re-dated, not buried. Nothing stamped after
+                // it, which is nearly every drop, is the burial it always was.
+                // Decided in the transaction that buries.
+                let buried = matches!(
+                    self.drop_keeping_later_writes(&target.db, &target.name, entry.stamp, &|| {
+                        self.check_walk(crate::WalkScope::Background)
+                    },)?,
+                    crate::late_drop::Dropped::Buried(true)
+                );
                 // Recorded even when the collection was already gone: the
                 // tombstone is what stops a *later* replay from recreating it,
                 // and a node that never had the collection still needs it.

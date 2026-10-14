@@ -26792,15 +26792,8 @@ divergence persists between old and new members until the roll completes; the st
 upgraded member, and a member that is still divergent after the roll is healed by its own start.
 **Residuals.** (1) A straggler stamped at the drop's own `Hlc` by a node above the dropper's, arriving
 behind the cursor of a multi-chunk sweep that is still running, is refused by neither the tombstone (strict)
-nor the floor (set in the last chunk) and stays: the same tie ADR-229 already names for databases. (2) **A defect this rule does not close, decided
-and in progress (Chris, 2026-10-13: a drop keeps the writes stamped after it):** a member D that still holds the old life and writes Z after the drop's stamp, then
-receives the drop, loses Z with the rest of that life, while members whose lives are newer keep Z (stamped
-after the drop). The members **stay different**: through three real loops the divergence gauge stays at 1 on
-all three and the count half's repair re-runs (6, 6 and 12 rounds in 32 s on A, B and D) without changing
-anything, A and B holding {2, 3} and D {2}. It is a different mechanism from this rule's. Recorded as the
-finding `kimmydb-a-write-made-after-a-drops-stamp-into-the-life-the-drop-destroys-is-lost-on-the-member-that-applies-the-drop-and-kept-on-the-members-whose-lives-are-newer`; it is not an accepted limit, and its fix (the member applying a drop to its own older
-life removes only the records and definitions stamped at or before the drop, with the floor at the drop) is a
-separate change. (3) A far-future stamp cannot trigger the sweep:
+nor the floor (set in the last chunk) and stays: the same tie ADR-229 already names for databases. (2) A write made through a member that still holds the old life, after the drop's stamp, is a different mechanism
+from this rule's, and is closed by the extension below. (3) A far-future stamp cannot trigger the sweep:
 it runs only when the drop is *below* `created`.
 
 **Tests.** `late_drop.rs`: the reproducer converges and the floor stands at the drop; the newer life's own
@@ -26813,3 +26806,117 @@ configuration are swept and a newer life's index stays; a record at the drop's o
 stays; a member holding the old life, whose own document of the life before is gone from all three. `snapshot.rs`: a page's late drop sweeps. `replication.rs`:
 through two real loops the members agree, the gauge returns to 0 and the repair ends. A real start serves a store holding
 the stragglers without them and logs the sweep.
+
+### Extension (Chris, 2026-10-13): a drop keeps the writes stamped after it
+
+> Ruled by Chris, 2026-10-13: (1) a collection can **reappear** after its drop, because a write stamped after
+> the drop reached a member that had not seen it, and (2) this is for **collection** drops only: a database's
+> drop stays exactly as ADR-229 documents it. No required wire field, table, schema, backup tag or entry kind
+> changed. Two optional fields are added that a build without them ignores: `redated` on the collection's stored
+> metadata and `redated_from` on a snapshot page's collection definition (an additive optional field). Not a
+> rollback boundary; it rides 0.49.0.
+
+**The defect.** A member D that still holds the life the drop is aimed at, and writes Z after the drop's stamp,
+used to destroy the whole life when it received the drop: Z went with it, while the members whose lives are newer
+kept Z (stamped after the drop). The members stayed different, and the count half's repair re-ran for ever.
+
+**The rule.** A replicated drop `D` that reaches a life with `created <= D` removes the records and definitions
+stamped at or before `D` and **keeps the later ones**, with the floor at `D`. It is the time-cutoff rule above, on
+the other side of the life. The decision and the two commits:
+
+1. **Decided in the transaction that buries (D-2).** The collection is read under the writer, and the fast path
+   is taken only if **all** hold: its kept digest row is present (an absent row is *unknown*, not "nothing above"),
+   every origin's highest record stamp (`maxw`, which counts tombstones and is never lowered) is at or below `D`,
+   and no index or vector configuration is stamped after `D`. The fast path is the burial it always was: the
+   collection and its shadow are buried in that transaction and purged (ADR-158, ADR-189), nothing is read. A
+   local drop mints its stamp above everything the member holds and is not a replicated drop: it never reads the
+   predicate. A stale `maxw` can only send a drop to the survivors path, which is slower and not wrong. `maxw` is
+   raised by every route a record reaches a collection by (a local write, a replicated entry, a snapshot page,
+   a sweep's tombstone): `maxw_is_raised_by_every_way_a_record_reaches_a_collection`.
+2. **The first commit (D-1)**, in the same transaction, records the tombstone of the collection and of its shadow
+   and **re-dates both**: `created = D.successor()`, with a marker (`CollectionMeta::redated`: the `created` it
+   belongs to, the `created` before, and later the arrival of the first entry kept). The life is now what this ADR
+   calls a newer life that owes a sweep, so a stop, a crash or a redelivery of the drop is resumed by what
+   already resumes that: the start's reconcile and `sweep_after_an_ignored_drop` (a redelivered drop meets
+   `D < created` and is ignored, and the ignore branch continues the same sweep and, for the life this very drop
+   re-dated, appends the entry it did not append the first time). Open streams on the collection end at the
+   first commit, as at a burial.
+3. **The sweep** is the one above (definitions at or before `D`, then records at or before `D`, chunked and
+   stop-aware). A **shadow** is swept after its parent, whichever order a start reaches them in, and a shadow
+   row is kept only while the document it embeds is live in the parent: the embedding worker already refuses
+   to store a vector for a parent that is deleted or absent (`document_stamp` in its writer scope), and this is
+   the same test for what it wrote before the sweep.
+4. **The last commit** takes the floor at `D`, records the arrival position of the first entry the life kept
+   (see 6), and, if the sweep left no live record and no definition stamped after `D`, **buries the life and its
+   shadow in that commit** (not a shadow whose parent stands with a vector configuration). The burial does not
+   go through the incarnation rule that would turn the same drop away from a life dated above it
+   (`bury_redated_in_txn`).
+5. **The database's guard, one rule on every route (D-3).** A life created **at or before** its database's
+   tombstone is buried with the database, whichever route the collection's drop came by (an entry, a scoped
+   snapshot, a whole-database page): this is ADR-229, unchanged. A life created **after** it (a database dropped
+   and made again) keeps like any other. The test is made in the burying transaction. Because a database drop
+   buries each of its collections with a drop of its own, at a stamp above the database's, the guard cannot be
+   an equality of stamps, and it cannot be "a database tombstone exists" (that would bury later writes in every
+   collection of a recreated database). On a whole-database page the database's tombstone and its collections'
+   come in the one list, in any order, so `apply_carried_drops` records the database tombstones first, which
+   also means no life is re-dated only to be buried. On the entry route an origin's `DropDatabase` is stamped
+   below, and arrives before, its own collections' drops.
+   **The marker closes the other orders.** A life re-dated by a collection's drop is dated just above that drop,
+   which can be above the database's tombstone `S` (a database's drop is followed by a drop of each collection)
+   although the life began before it. The marker therefore remembers the `created` the life had before
+   (`redated.from`), and: (a) the database's sweep buries a re-dated life if `from` is at or before `S`, whichever
+   of the two drops this member learned of first; (b) the marker **travels with the definition**
+   (`CollectionState::redated_from`, additive and optional on the wire), so a member that holds `S` refuses
+   the definition at install as it would refuse the original creation, and a member that learns `S` afterwards
+   buries what it installed; a build that does not know the field ignores it and judges `created`, as before.
+   There is no wire field on the scoped page for the database's tombstone: a sender that has dropped the
+   collection cannot say which database it was in (a collection id is a hash of the database and the name).
+   **Mixed roll with 0.48.x:** a 0.48.x peer never reads the marker, so during the roll a re-dated life can
+   spread to it past a database tombstone it holds, and it keeps the write there; once every member runs the
+   rule the sequence converges. That is a roll-only gap, not a standing one.
+6. **Streams (D-5).** A re-dated life has no creation entry, so `creation_arrival` finds nothing and a stream
+   opened with no token fell back to the walk of the arrival index that cost 62 s on a 1.8 M-row log (round
+   0500). The sweep records, in the metadata written by its last commit, the lowest arrival position among the
+   entries of the records it kept, **tombstones stamped after `D` included**; a stream with no token begins
+   there (two point lookups for a stream open), and is read only when the marker's `created` is the life's own.
+   Where it is missing (a stream opened between the two commits, or no kept entry still held) the walk places the
+   stream, as it does for a collection a snapshot brought. A stream may therefore begin at a document's
+   *latest* version and not at its insert, because the position is found by the record's current stamp.
+
+7. **The count half's repair replays from the floor.** A write kept through the drop (stamped after it) can sort
+   *before* the creation of a life another member made after the drop (D writes at 640, B creates at 717). A member
+   that heard D's write before it had the collection sets it aside as history, since the collection is absent and a
+   tombstone is held, and then takes B's creation: it holds the collection without the write, the counts differ, and
+   the repair replayed the peer's oplog **from the life's creation**, which is after the write, so the write was never
+   served again and the repair ran on for ever (found by a CI run of the three-member loop test that took that
+   order; reproduced locally under 16-way parallel load, 4 runs in 320, with `a: holds [2]; b, d: holds [2, 3]`). The
+   replay now starts at `min(floor, created)`: where the standing life's valid history begins. Everything at or below
+   the floor is refused as history on the way, so nothing of the life before returns.
+
+**What it changes.** A collection can reappear after its drop. When nobody recreated the name, D keeps the
+collection with Z and A has none: the existence half reads D's collection, dated above A's tombstone, as a
+recreation, the scoped snapshot repair brings it back to A with Z, and every member ends with the collection
+holding the write (measured through three real loops: the repair ends). **Clock skew can cause it**: a write
+made earlier in real time by a member whose clock runs ahead is stamped after the drop and counts as "after".
+During the sweep (the owed window) a reader sees the documents stamped before the drop, and the count includes
+them, until the last chunk lands; this is bounded by the chunk size and is the exposure of the sweep above.
+
+**Mixed roll with 0.48.x.** Receiver-local. A member without the rule discards its later writes; one with it
+keeps them. During the roll the divergence persists between old and new members, and a write an old member has
+already destroyed cannot be recovered. A rolled-back build ignores the new metadata field, and a re-dated life
+it rewrites loses its marker, which costs a stream open the walk.
+
+**Tests.** `keep_later_writes_tests.rs`: the fast path walks nothing; an absent digest row, an index stamped after
+the drop and a write landing before the writer is taken all take the survivors path and lose nothing; a life left
+with nothing is buried in the last commit and purged; a database dropped and made again does not stop a
+collection drop keeping; a database tombstone that arrives after a kept life buries it; a life re-dated above the database's drop does
+not outlive it, whether the peer holds the tombstone before or after it installs the definition, or M learns it
+last; an interrupted drop delivered again appends its entry; a whole-database page
+keeps an explicit collection drop and buries a database's, in either order of its list; the shadow follows its
+parent (a late chunk of a swept parent goes, a survivor's stays, an emptied life takes its shadow, a shadow's turn
+sweeps its parent first); a peer holding the older life is not replaced by a re-dated one in the window; `maxw`
+at every chokepoint. `late_drop.rs`: the reproducer converges to {2, 3}, the collection comes back re-dated,
+a stop between the two commits is finished by the start. `watch.rs`: a stream with no token on a kept life reads
+a few rows of a 4,000-entry log and hears the write kept and nothing of the life before; a marker of another
+`created` is ignored. `replication.rs`: through real loops the members agree and the repair ends, with and without
+a recreation, and with the write reaching a member before or after the recreation (the order that needed the replay from the floor).

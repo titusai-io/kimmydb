@@ -28,7 +28,7 @@
 //! ([`Engine::reconcile_late_drops`]), which also heals a store that holds the
 //! stragglers of a drop applied before this rule existed.
 
-use kimmy_core::{Hlc, Stamp};
+use kimmy_core::{CollectionId, Hlc, Stamp};
 use redb::ReadableTable;
 use tracing::{debug, info, warn};
 
@@ -55,6 +55,12 @@ pub(crate) mod hooks {
     use std::cell::Cell;
 
     thread_local! {
+        /// How many drops on this thread took the survivors path.
+        static SURVIVORS_PATHS: Cell<usize> = const { Cell::new(0) };
+        /// Run once after the next chunk commits on this thread: where a write
+        /// lands in the middle of a sweep.
+        static AFTER_A_CHUNK: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
+            const { std::cell::RefCell::new(None) };
         /// Ask the open to stop (as a SIGTERM at a start does) once this many
         /// chunks have committed on this thread.
         static STOP_THE_OPEN_AFTER: Cell<Option<usize>> = const { Cell::new(None) };
@@ -64,7 +70,23 @@ pub(crate) mod hooks {
         STOP_THE_OPEN_AFTER.with(|c| c.set(Some(chunks)));
     }
 
+    pub(super) fn took_the_survivors_path() {
+        SURVIVORS_PATHS.with(|c| c.set(c.get() + 1));
+    }
+
+    /// Drops that took the survivors path on this thread so far.
+    pub(crate) fn survivors_paths() -> usize {
+        SURVIVORS_PATHS.with(|c| c.get())
+    }
+
+    pub(crate) fn run_after_the_next_chunk(f: impl FnOnce() + 'static) {
+        AFTER_A_CHUNK.with(|c| *c.borrow_mut() = Some(Box::new(f)));
+    }
+
     pub(super) fn after_a_chunk() {
+        if let Some(f) = AFTER_A_CHUNK.with(|c| c.borrow_mut().take()) {
+            f();
+        }
         STOP_THE_OPEN_AFTER.with(|c| match c.get() {
             Some(1) => {
                 c.set(None);
@@ -76,12 +98,23 @@ pub(crate) mod hooks {
     }
 }
 
+/// How a sweep ended: what it removed, and whether the collection stands. A
+/// re-dated life that the sweep leaves with nothing live, and no definition
+/// stamped after the drop, is buried by the sweep in its last commit.
+struct SweepEnd {
+    removed: usize,
+    survived: bool,
+}
+
 /// What one chunk of a sweep did.
 struct Chunk {
     removed: usize,
     skipped: usize,
     last: Option<Vec<u8>>,
     exhausted: bool,
+    /// The lowest arrival position among the entries of the records this chunk
+    /// kept (stamped after the drop), for a re-dated life.
+    first_arrival: Option<u64>,
 }
 
 /// Whether a collection standing here owes a sweep for a drop stamped
@@ -112,6 +145,10 @@ impl Engine {
     /// (a SIGTERM at a start sets only that one). A stop ends it with
     /// `Stopping`; the chunks that landed stand and the next call finds the
     /// rest, the floor being unset.
+    ///
+    /// A life that a drop re-dated (see [`Self::drop_keeping_later_writes`])
+    /// and that the sweep leaves with nothing is buried in the commit of its
+    /// last chunk.
     pub(crate) fn sweep_late_drop_until(
         &self,
         db: &str,
@@ -119,10 +156,31 @@ impl Engine {
         dropped: Stamp,
         stop: StopCheck<'_>,
     ) -> Result<usize> {
+        Ok(self.sweep_until(db, name, dropped, stop)?.removed)
+    }
+
+    fn sweep_until(
+        &self,
+        db: &str,
+        name: &str,
+        dropped: Stamp,
+        stop: StopCheck<'_>,
+    ) -> Result<SweepEnd> {
+        // A shadow is decided by its parent: the parent is swept first, and
+        // buries the shadow with itself if it is left with nothing. Whatever
+        // order a start, a replay or a drop's own path reaches them in.
+        if let Some(parent) = kimmy_core::vector_meta::base_name(name)
+            && let Ok(standing) = self.get_collection(db, parent)
+            && owes_a_sweep(&standing, dropped.hlc)
+        {
+            self.sweep_until(db, parent, dropped, stop)?;
+        }
+        let mut survived = true;
         let mut removed = 0usize;
         let mut skipped = 0usize;
         let mut after: Option<Vec<u8>> = None;
         let mut started = false;
+        let mut first_arrival: Option<u64> = None;
         loop {
             stop()?;
             if !started {
@@ -133,11 +191,11 @@ impl Engine {
             let txn = self.begin_write(WriterHolder::Drop)?;
             let Some(mut standing) = read_collection(&txn, db, name)? else {
                 txn.abort()?;
-                return Ok(removed);
+                return Ok(SweepEnd { removed, survived: false });
             };
             if !owes_a_sweep(&standing, dropped.hlc) {
                 txn.abort()?;
-                return Ok(removed);
+                return Ok(SweepEnd { removed, survived: true });
             }
             if !started {
                 started = true;
@@ -152,17 +210,59 @@ impl Engine {
             let chunk = self.remove_stragglers(&txn, &standing, dropped, after)?;
             removed += chunk.removed;
             skipped += chunk.skipped;
+            first_arrival = match (first_arrival, chunk.first_arrival) {
+                (Some(a), Some(b)) => Some(a.min(b)),
+                (a, b) => a.or(b),
+            };
+            let mut buried = None;
             if chunk.exhausted {
                 // The floor, in the commit of the last chunk: it says the
                 // sweep is done, and there is no instant at which the records
                 // are gone and a straggler at the drop's own `Hlc` is refused
                 // by neither the tombstone (strict) nor the floor.
-                standing.incarnation_floor = Some(dropped.hlc);
-                Engine::put_collection_meta(&txn, &standing)?;
+                //
+                // A life a drop re-dated that holds nothing live after the
+                // sweep, and no definition stamped after the drop, has nothing
+                // the drop kept: it is buried, in this commit, with its shadow.
+                let live = txn
+                    .open_table(tables::LIVE_COUNTS)?
+                    .get(standing.id.0)?
+                    .map_or(0, |count| count.value())
+                    .saturating_sub(chunk.removed as u64);
+                let redated = standing.is_redated();
+                // A shadow is the parent's: while the parent stands with a vector
+                // configuration the shadow stands too, empty if need be.
+                let configured_parent = match kimmy_core::vector_meta::base_name(&standing.name) {
+                    Some(base) => {
+                        read_collection(&txn, db, base)?.is_some_and(|p| p.vector.is_some())
+                    }
+                    None => false,
+                };
+                if redated
+                    && live == 0
+                    && !configured_parent
+                    && !holds_a_definition_stamped_after(&standing, dropped.hlc)
+                {
+                    survived = false;
+                    buried = Some(self.bury_redated_in_txn(&txn, &standing, dropped)?);
+                } else {
+                    if redated && let Some(marker) = standing.redated.as_mut() {
+                        marker.first_arrival = match (first_arrival, marker.arrivals_from) {
+                            (Some(seen), Some(seed)) => Some(seen.min(seed)),
+                            (seen, seed) => seen.or(seed),
+                        };
+                    }
+                    standing.incarnation_floor = Some(dropped.hlc);
+                    Engine::put_collection_meta(&txn, &standing)?;
+                }
             }
             txn.commit()?;
             #[cfg(test)]
             hooks::after_a_chunk();
+            if let Some(burial) = buried {
+                let ids = self.finish_burial(db, name, burial);
+                crate::database_tombstone::Notify::Each.buried(self, db, name, &ids);
+            }
             if kimmy_core::vector_meta::is_shadow(&standing.name) && chunk.removed > 0 {
                 self.bump_vector_generation(standing.id);
             }
@@ -188,7 +288,7 @@ impl Engine {
                 "removed what a collection held of the life before a drop that reached it late"
             );
         }
-        Ok(removed)
+        Ok(SweepEnd { removed, survived })
     }
 
     /// The definitions a newer life took in of the one before: the indexes
@@ -246,6 +346,22 @@ impl Engine {
         let (mut examined, mut bytes, mut skipped) = (0usize, 0usize, 0usize);
         let mut last = after.clone();
         let mut exhausted = true;
+        let mut first_arrival: Option<u64> = None;
+        // A shadow row is kept only while its parent record is live: a chunk the
+        // embedding worker stamped after the drop for a parent that was swept
+        // must not keep the shadow (and with it a parentless row) alive. The
+        // worker already refuses a swept parent in its own writer scope
+        // (`document_stamp`); this is the same test for what it wrote before.
+        let parent = kimmy_core::vector_meta::base_name(&standing.name)
+            .map(|base| CollectionId::derive(&standing.db, base));
+        // The entries of what the life keeps, by arrival, for a re-dated one: the
+        // stream that opens without a token begins there and not at a walk of
+        // the log. Tombstones stamped after the drop count: a stream that missed
+        // a delete would show a document the life no longer has.
+        let arrivals = match standing.is_redated() {
+            true => Some(txn.open_table(tables::OPLOG_ARRIVAL_SEQ)?),
+            false => None,
+        };
         {
             let docs = txn.open_table(tables::DOCS)?;
             for row in docs.range(doc_range_after(standing.id, after.as_deref()))? {
@@ -261,7 +377,26 @@ impl Engine {
                     skipped += 1;
                     continue;
                 };
-                if live && stamp.hlc <= dropped.hlc {
+                if stamp.hlc > dropped.hlc
+                    && let Some(arrivals) = &arrivals
+                    && let Some(seq) = arrivals.get(codec::oplog_key(&stamp).as_slice())?
+                {
+                    let seq = seq.value();
+                    first_arrival = Some(first_arrival.map_or(seq, |first| first.min(seq)));
+                }
+                if !live {
+                    continue;
+                }
+                let orphaned = stamp.hlc > dropped.hlc
+                    && parent.is_some_and(|parent| {
+                        crate::vectors::chunk_has_no_live_parent(
+                            &docs,
+                            parent,
+                            dropped.hlc,
+                            value.value(),
+                        )
+                    });
+                if stamp.hlc <= dropped.hlc || orphaned {
                     let document = codec::decode_doc_record(value.value())
                         .and_then(|record| Ok(record.document()?))
                         .unwrap_or_else(|e| {
@@ -282,7 +417,200 @@ impl Engine {
             // A removal has no document to key and so no violation to report.
             crate::index::maintain_remote(self, txn, standing, previous.as_ref(), None, key)?;
         }
-        Ok(Chunk { removed: found.len(), skipped, last, exhausted })
+        Ok(Chunk { removed: found.len(), skipped, last, exhausted, first_arrival })
+    }
+
+    /// A replicated drop of the collection `db.name` has reached a member whose
+    /// life began at or before it (ADR-231, extended; ruled by Chris,
+    /// 2026-10-13): **keep what is stamped after the drop**.
+    ///
+    /// Only an explicit *collection* drop takes this path. A database's drop
+    /// does not (ADR-229): a life **created at or before the database's own
+    /// tombstone** is buried with what was written into it afterwards, whichever
+    /// route the collection's drop came by, and a life created after it (a
+    /// database dropped and made again) keeps like any other. That one rule is
+    /// the guard on every path, and it is judged inside the transaction below.
+    /// A database tombstone that arrives later finds a re-dated life by
+    /// [`Redated::from`](crate::meta::Redated::from) and buries it the same way.
+    ///
+    /// **One write transaction decides** (D-2), the same that buries on the fast
+    /// path, so a write stamped after the drop cannot land between the decision
+    /// and the burial and be lost though acknowledged:
+    ///
+    /// - *Fast path.* The collection's kept digest row is present, every
+    ///   origin's highest stamp (`maxw`, which includes tombstones and is never
+    ///   lowered) is at or below the drop, and no definition (index, vector
+    ///   configuration) is stamped after it. Buried and purged as ever
+    ///   (ADR-158, ADR-189), nothing read. An absent row is *unknown*, not
+    ///   "nothing above" (the walk of an empty collection is cheap). A stale
+    ///   `maxw` errs toward the survivors path and is never wrong.
+    /// - *Survivors path.* The first commit, in that transaction, records the
+    ///   tombstones of the collection and its shadow and **re-dates both** to
+    ///   just after the drop (D-1). The life is now what ADR-231 calls a newer
+    ///   life that owes a sweep, so a stop, a crash or a redelivery of the drop
+    ///   is resumed by what already resumes that: the start's reconcile and
+    ///   `sweep_after_an_ignored_drop`. The sweep ([`Self::sweep_until`]) takes the
+    ///   floor in its last commit, and buries a life left with nothing in the
+    ///   same commit.
+    ///
+    /// Open streams on the collection end at the first commit, as at a burial.
+    pub(crate) fn drop_keeping_later_writes(
+        &self,
+        db: &str,
+        name: &str,
+        dropped: Stamp,
+        stop: StopCheck<'_>,
+    ) -> Result<Dropped> {
+        let shadow_name = kimmy_core::vector_meta::shadow_name(name);
+        if kimmy_core::vector_meta::is_shadow(name) {
+            return Ok(Dropped::Buried(self.drop_collection_inner(db, name, Some(dropped))?));
+        }
+        // Nothing to bury, answered without taking the writer. Only that: what is
+        // buried is read again under the writer below.
+        match self.get_collection(db, name) {
+            Ok(_) => {}
+            Err(crate::StorageError::Core(kimmy_core::Error::CollectionNotFound { .. })) => {
+                return Ok(Dropped::Buried(false));
+            }
+            Err(e) => return Err(e),
+        }
+        #[cfg(test)]
+        crate::sync::race_hooks::reach(crate::sync::race_hooks::Race::Burial);
+        let txn = self.begin_write_as(WriterHolder::Ddl, crate::engine::Continuing::No)?;
+        let standing = read_collection(&txn, db, name)?
+            .filter(|meta| !crate::sync::aims_at_a_previous_incarnation(meta, dropped.hlc));
+        let Some(mut meta) = standing else {
+            // Buried, or buried and recreated, before the drop took the writer:
+            // nothing of what stands now is this drop's to bury.
+            txn.abort()?;
+            #[cfg(test)]
+            crate::sync::race_hooks::absorbed(crate::sync::race_hooks::Race::Burial);
+            return Ok(Dropped::Buried(false));
+        };
+        let mut shadow = read_collection(&txn, db, &shadow_name)?;
+        let covered =
+            database_tombstone_in(&txn, db)?.is_some_and(|stamp| meta.created <= stamp.hlc);
+        if covered || self.nothing_is_stamped_after(&txn, &meta, dropped.hlc)? {
+            let burial = self.bury_standing_in_txn(&txn, db, name, meta, shadow, Some(dropped))?;
+            txn.commit()?;
+            let ids = self.finish_burial(db, name, burial);
+            crate::database_tombstone::Notify::Each.buried(self, db, name, &ids);
+            return Ok(Dropped::Buried(true));
+        }
+        let ids: Vec<CollectionId> =
+            [Some(meta.id), shadow.as_ref().map(|s| s.id)].into_iter().flatten().collect();
+        {
+            let mut tombstones = txn.open_table(tables::COLLECTIONS_DROPPED)?;
+            for id in &ids {
+                let newer = match tombstones.get(id.0)? {
+                    Some(existing) => dropped > codec::decode_oplog_key(existing.value())?,
+                    None => true,
+                };
+                if newer {
+                    tombstones.insert(id.0, codec::oplog_key(&dropped).as_slice())?;
+                }
+            }
+        }
+        // Nothing written after this commit has its entry below this position,
+        // whatever range of the collection the sweep has already passed.
+        let next = next_arrival_in(&txn)?;
+        redate(&mut meta, dropped.hlc);
+        if let Some(marker) = meta.redated.as_mut() {
+            marker.arrivals_from = Some(next);
+        }
+        Engine::put_collection_meta(&txn, &meta)?;
+        if let Some(shadow) = shadow.as_mut() {
+            redate(shadow, dropped.hlc);
+            Engine::put_collection_meta(&txn, shadow)?;
+        }
+        txn.commit()?;
+        #[cfg(test)]
+        hooks::took_the_survivors_path();
+        crate::database_tombstone::Notify::Each.buried(self, db, name, &ids);
+        let end = self.sweep_until(db, name, dropped, stop)?;
+        if end.survived && self.get_collection(db, &shadow_name).is_ok() {
+            self.sweep_until(db, &shadow_name, dropped, stop)?;
+        }
+        info!(
+            db,
+            collection = name,
+            stamp = ?dropped,
+            kept = end.survived,
+            "a drop reached a collection holding writes stamped after it; kept them"
+        );
+        Ok(if end.survived { Dropped::Kept } else { Dropped::Buried(true) })
+    }
+
+    /// Whether a collection holds nothing stamped after `dropped`, read through
+    /// the transaction that would bury it.
+    fn nothing_is_stamped_after(
+        &self,
+        txn: &crate::engine::WriteTxn<'_>,
+        meta: &CollectionMeta,
+        dropped: Hlc,
+    ) -> Result<bool> {
+        if holds_a_definition_stamped_after(meta, dropped) {
+            return Ok(false);
+        }
+        let rows = txn.open_table(tables::LIVE_DIGESTS)?;
+        let Some(row) = crate::live_digest::kept_row(&rows, meta.id.0)? else {
+            return Ok(false);
+        };
+        Ok(row.maxw.values().all(|stamp| *stamp <= dropped))
+    }
+
+    /// Bury a re-dated life that the drop which re-dated it, or a database's
+    /// drop that has reached it since, leaves nothing of: the collection and its
+    /// shadow, in the caller's transaction. The incarnation rule that turns a
+    /// drop away from a life created above it is the very thing being undone,
+    /// so this is a mode of its own and not `bury_in_txn`.
+    pub(crate) fn bury_redated_in_txn(
+        &self,
+        txn: &crate::engine::WriteTxn<'_>,
+        standing: &CollectionMeta,
+        dropped: Stamp,
+    ) -> Result<crate::engine::Burial> {
+        let shadow = match kimmy_core::vector_meta::is_shadow(&standing.name) {
+            true => None,
+            false => read_collection(
+                txn,
+                &standing.db,
+                &kimmy_core::vector_meta::shadow_name(&standing.name),
+            )?,
+        };
+        self.bury_standing_in_txn(
+            txn,
+            &standing.db,
+            &standing.name,
+            standing.clone(),
+            shadow,
+            Some(dropped),
+        )
+    }
+
+    /// A database's tombstone `dropped` covers the re-dated life `standing` if
+    /// the life was created at or before it before the drop re-dated it: it is
+    /// buried with the database, the writes it kept with it (ADR-229). In its
+    /// own transaction; `None` where the life was already buried or recreated.
+    pub(crate) fn bury_redated_under_database(
+        &self,
+        db: &str,
+        name: &str,
+        dropped: Stamp,
+    ) -> Result<Option<Vec<CollectionId>>> {
+        let txn = self.begin_write_as(WriterHolder::Ddl, crate::engine::Continuing::No)?;
+        let Some(standing) = read_collection(&txn, db, name)? else {
+            txn.abort()?;
+            return Ok(None);
+        };
+        if !standing.redated.is_some_and(|r| r.created == standing.created && r.from <= dropped.hlc)
+        {
+            txn.abort()?;
+            return Ok(None);
+        }
+        let burial = self.bury_redated_in_txn(&txn, &standing, dropped)?;
+        txn.commit()?;
+        Ok(Some(self.finish_burial(db, name, burial)))
     }
 
     /// A drop was judged aimed at a life of `current` that has already ended
@@ -355,6 +683,53 @@ impl Engine {
             "swept what newer lives held of the lives before their drops, before serving"
         );
         Ok(removed)
+    }
+}
+
+/// The arrival position the next entry appended to this node's log will take.
+fn next_arrival_in(txn: &redb::WriteTransaction) -> Result<u64> {
+    let arrival = txn.open_table(tables::OPLOG_ARRIVAL)?;
+    Ok(arrival.last()?.map_or(0, |(seq, _)| seq.value() + 1))
+}
+
+/// What a replicated collection drop did to the collection.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Dropped {
+    /// Buried (`true`), or nothing of the drop's to bury (`false`).
+    Buried(bool),
+    /// Writes stamped after the drop stand: the life was re-dated and swept.
+    Kept,
+}
+
+/// Move a life that a drop met writes after to just above the drop, remembering
+/// where it was and that it was re-dated. A second drop over a life already
+/// re-dated keeps the first `from`: it is the creation a database's drop is
+/// judged against.
+fn redate(meta: &mut CollectionMeta, dropped: Hlc) {
+    let from = meta.redated.filter(|r| r.created == meta.created).map_or(meta.created, |r| r.from);
+    meta.created = dropped.successor();
+    meta.redated = Some(crate::meta::Redated {
+        from,
+        created: meta.created,
+        first_arrival: None,
+        arrivals_from: None,
+    });
+}
+
+/// Whether a definition of `standing` is stamped after `dropped`: an index, or
+/// a vector configuration. One with no stamp counts as not after, the rule the
+/// sweep applies to it.
+fn holds_a_definition_stamped_after(standing: &CollectionMeta, dropped: Hlc) -> bool {
+    standing.indexes.iter().any(|index| index.created.is_some_and(|c| c.hlc > dropped))
+        || standing.vector_changed.is_some_and(|changed| changed.hlc > dropped)
+}
+
+/// The tombstone of `db`'s drop as `txn` sees it.
+fn database_tombstone_in(txn: &redb::WriteTransaction, db: &str) -> Result<Option<Stamp>> {
+    let tombstones = txn.open_table(tables::COLLECTIONS_DROPPED)?;
+    match tombstones.get(kimmy_core::database_drop_id(db).0)? {
+        Some(raw) => Ok(Some(codec::decode_oplog_key(raw.value())?)),
+        None => Ok(None),
     }
 }
 
@@ -485,15 +860,13 @@ mod tests {
         );
     }
 
-    /// A member D that still holds the old life writes Z after the drop, then
-    /// receives it. The drop destroys the life it was aimed at, Z with it, as it
-    /// always has; A and B, whose lives are newer, keep Z (it is stamped after
-    /// the drop), so D lacks a document the others hold. That is a different
-    /// divergence from this rule's (a write to a life the drop destroyed, kept
-    /// elsewhere) and is recorded as its own finding; what this test pins is
-    /// that the document of the life before is gone from all three.
+    /// A member D that still holds the old life writes Z after the drop's stamp,
+    /// then receives the drop. The drop removes what is stamped at or before it
+    /// and keeps Z (ADR-231, extended): D keeps its collection, re-dated to just
+    /// after the drop, with Z; and A and B, whose lives are newer, keep Z too.
+    /// Everyone ends with {2, 3}; document 1 is gone from all three.
     #[test]
-    fn a_member_still_holding_the_old_life_does_not_keep_the_document_of_it_after_the_drop() {
+    fn a_drop_keeps_the_write_stamped_after_it_on_the_member_that_took_it() {
         let (a, _da) = engine();
         let (b, _db) = engine();
         let (d, _dd) = engine();
@@ -508,16 +881,245 @@ mod tests {
         b.insert(&on_b, doc! { "_id": 2i64 }).unwrap();
         quiesce(&[&a, &b, &d]);
         for (who, e) in [("a", &a), ("b", &b), ("d", &d)] {
-            assert!(
-                !docs_of(e, "shop", "orders", &[1, 2, 3]).contains(&1),
-                "{who} kept document 1"
-            );
+            assert_eq!(docs_of(e, "shop", "orders", &[1, 2, 3]), vec![2, 3], "{who}");
+            assert_counts_exact(e, who);
         }
-        assert_eq!(
-            docs_of(&a, "shop", "orders", &[1, 2, 3]),
-            docs_of(&b, "shop", "orders", &[1, 2, 3]),
-            "A and B agree"
+    }
+
+    /// Nobody recreated the name: D keeps document 3 in a collection the drop
+    /// removed on A, re-dated above the drop and floored at it. A has no
+    /// collection to put the write in, so the write waits there as history; the
+    /// existence repair (the loop test) brings the collection back.
+    #[test]
+    fn a_drop_that_meets_a_later_write_keeps_the_collection_re_dated_above_the_drop() {
+        let (a, _da) = engine();
+        let (d, _dd) = engine();
+        let on_a = a.create_collection("shop", "orders").unwrap();
+        a.insert(&on_a, doc! { "_id": 1i64 }).unwrap();
+        sync(&a, &d);
+        assert!(a.drop_collection("shop", "orders").unwrap());
+        a.finish_purges_now().unwrap();
+        let on_d = d.get_collection("shop", "orders").unwrap();
+        d.insert(&on_d, doc! { "_id": 3i64 }).unwrap();
+        quiesce(&[&a, &d]);
+        let dropped = a.collection_dropped_at(on_a.id).unwrap().unwrap();
+        let kept = d.get_collection("shop", "orders").unwrap();
+        assert_eq!(docs_of(&d, "shop", "orders", &[1, 3]), vec![3]);
+        assert!(kept.created > dropped.hlc, "re-dated above the drop: {:?}", kept.created);
+        assert_eq!(kept.incarnation_floor, Some(dropped.hlc));
+        assert!(a.get_collection("shop", "orders").is_err(), "A has nothing to put it in");
+    }
+
+    /// A replicated drop that meets nothing stamped after it buries the
+    /// collection and purges it as it always did: no collection, no rows, no
+    /// floor, counts exact.
+    #[test]
+    fn a_replicated_drop_that_meets_nothing_later_buries_as_before() {
+        let (a, _da) = engine();
+        let (d, _dd) = engine();
+        let on_a = a.create_collection("shop", "orders").unwrap();
+        a.insert(&on_a, doc! { "_id": 1i64 }).unwrap();
+        sync(&a, &d);
+        assert!(a.drop_collection("shop", "orders").unwrap());
+        quiesce(&[&a, &d]);
+        assert!(d.get_collection("shop", "orders").is_err());
+        assert_eq!(d.rows_under(on_a.id).unwrap(), 0);
+        assert_counts_exact(&d, "a buried collection");
+    }
+
+    /// A database drop is not changed: a collection that holds a write stamped
+    /// after it is buried with it, as ADR-229 documents.
+    #[test]
+    fn a_database_drop_still_buries_a_collection_holding_a_later_write() {
+        let (a, _da) = engine();
+        let (d, _dd) = engine();
+        let on_a = a.create_collection("shop", "orders").unwrap();
+        a.insert(&on_a, doc! { "_id": 1i64 }).unwrap();
+        a.create_collection("shop", "items").unwrap();
+        sync(&a, &d);
+        a.drop_database("shop").unwrap();
+        a.finish_purges_now().unwrap();
+        let on_d = d.get_collection("shop", "orders").unwrap();
+        d.insert(&on_d, doc! { "_id": 3i64 }).unwrap();
+        quiesce(&[&a, &d]);
+        assert!(d.get_collection("shop", "orders").is_err(), "buried with the database");
+        assert!(d.get_collection("shop", "items").is_err());
+        assert_counts_exact(&d, "a database drop");
+    }
+
+    /// D-3. A whole-database snapshot page carries the database's drop, and the
+    /// collection tombstones a database drop writes, at the database drop's own
+    /// stamp. The snapshot route cannot tell those from explicit collection
+    /// drops, and a database survivor never keeps a write (ADR-229): the
+    /// collection is buried whole, as the entry route buries it.
+    #[test]
+    fn a_whole_database_page_buries_a_collection_holding_a_later_write() {
+        let (a, _da) = engine();
+        let (d, _dd) = engine();
+        let on_a = a.create_collection("shop", "orders").unwrap();
+        a.insert(&on_a, doc! { "_id": 1i64 }).unwrap();
+        a.create_collection("shop", "items").unwrap();
+        sync(&a, &d);
+        a.drop_database("shop").unwrap();
+        a.finish_purges_now().unwrap();
+        let on_d = d.get_collection("shop", "orders").unwrap();
+        d.insert(&on_d, doc! { "_id": 3i64 }).unwrap();
+        let page = a.snapshot_page(None, None).unwrap();
+        assert!(
+            page.dropped_collections.iter().any(|(id, _)| *id == on_a.id),
+            "premise: the page carries the collection's tombstone"
         );
+        d.apply_snapshot_page(a.node_id(), &mut crate::SnapshotProgress::whole_database(), &page)
+            .unwrap();
+        d.finish_purges_now().unwrap();
+        assert!(d.get_collection("shop", "orders").is_err(), "buried with the database");
+        assert!(d.get_collection("shop", "items").is_err());
+        assert_counts_exact(&d, "a database drop by page");
+    }
+
+    /// D-3, the scoped route with the database's tombstone held: the collection
+    /// was buried by the database's drop, with a drop of its own above the
+    /// database's stamp, and that does not keep a later write.
+    #[test]
+    fn a_scoped_page_at_the_databases_own_stamp_buries_a_collection_holding_a_later_write() {
+        let (a, _da) = engine();
+        let (d, _dd) = engine();
+        let on_a = a.create_collection("shop", "orders").unwrap();
+        a.insert(&on_a, doc! { "_id": 1i64 }).unwrap();
+        a.create_collection("shop", "items").unwrap();
+        sync(&a, &d);
+        a.drop_database("shop").unwrap();
+        a.finish_purges_now().unwrap();
+        let on_d = d.get_collection("shop", "orders").unwrap();
+        d.insert(&on_d, doc! { "_id": 3i64 }).unwrap();
+        // D learns of the database's drop first (its tombstone), then the scoped
+        // repair of `orders` carries the collection's tombstone at the same stamp.
+        let db_drop = a.database_dropped_at("shop").unwrap().unwrap();
+        d.record_database_tombstone_for_test(kimmy_core::database_drop_id("shop"), db_drop)
+            .unwrap();
+        let page = a.snapshot_page(None, Some(on_a.id)).unwrap();
+        assert!(page.dropped.is_some_and(|at| at >= db_drop), "premise: the page carries the drop");
+        d.apply_snapshot_page(
+            a.node_id(),
+            &mut crate::SnapshotProgress::of_collection(on_a.id),
+            &page,
+        )
+        .unwrap();
+        d.finish_purges_now().unwrap();
+        assert!(d.get_collection("shop", "orders").is_err(), "buried with the database");
+    }
+
+    /// D-3, the other side: the scoped repair of a collection the sender dropped
+    /// by a drop of its own, in a database that stands, keeps what the receiver
+    /// wrote after it, as the entry route does.
+    #[test]
+    fn a_scoped_page_of_an_explicit_collection_drop_keeps_a_later_write() {
+        let (a, _da) = engine();
+        let (d, _dd) = engine();
+        let on_a = a.create_collection("shop", "orders").unwrap();
+        a.insert(&on_a, doc! { "_id": 1i64 }).unwrap();
+        sync(&a, &d);
+        assert!(a.drop_collection("shop", "orders").unwrap());
+        a.finish_purges_now().unwrap();
+        let on_d = d.get_collection("shop", "orders").unwrap();
+        d.insert(&on_d, doc! { "_id": 3i64 }).unwrap();
+        let page = a.snapshot_page(None, Some(on_a.id)).unwrap();
+        assert!(page.dropped.is_some(), "premise: the page carries the drop");
+        d.apply_snapshot_page(
+            a.node_id(),
+            &mut crate::SnapshotProgress::of_collection(on_a.id),
+            &page,
+        )
+        .unwrap();
+        assert_eq!(docs_of(&d, "shop", "orders", &[1, 3]), vec![3]);
+        assert_counts_exact(&d, "a scoped page that kept");
+    }
+
+    /// A stop between two chunks of the survivors path leaves the collection
+    /// re-dated by the first commit, its floor not taken, and the start's
+    /// reconcile finishes it (D-1).
+    #[test]
+    fn the_survivors_path_stops_between_chunks_and_the_drop_applied_again_finishes() {
+        let n = SWEEP_CHUNK * 2 + 17;
+        let (b, _dir, id, dropped) = a_store_holding_stragglers(n, 0);
+        // The collection holds a record stamped after the drop, and its life
+        // began before it: the life the drop is aimed at.
+        let mut meta = b.get_collection("shop", "orders").unwrap();
+        meta.created = Hlc::new(dropped.hlc.wall_ms - 100, 0);
+        {
+            let txn = b.begin_write(WriterHolder::Ddl).unwrap();
+            Engine::put_collection_meta(&txn, &meta).unwrap();
+            txn.commit().unwrap();
+        }
+        let later = Stamp::new(Hlc::new(dropped.hlc.wall_ms + 5, 0), dropped.node);
+        {
+            let key = crate::docs::doc_key(&DocId::Int64(1_000_000)).unwrap();
+            let body = bson::serialize_to_vec(&doc! { "_id": 1_000_000i64 }).unwrap();
+            let txn = b.begin_write(WriterHolder::Replication).unwrap();
+            let mut docs = txn.open_table(tables::DOCS).unwrap();
+            crate::live_count::put_record(
+                &txn,
+                &mut docs,
+                id.0,
+                &key,
+                &codec::encode_doc_record(&kimmy_core::DocRecord::live(later, body)),
+            )
+            .unwrap();
+            drop(docs);
+            txn.commit().unwrap();
+        }
+        let asked = std::cell::Cell::new(0);
+        let one_chunk = || {
+            asked.set(asked.get() + 1);
+            if asked.get() > 1 {
+                Err(crate::StorageError::Stopping(crate::StopReason::Shutdown))
+            } else {
+                Ok(())
+            }
+        };
+        assert!(matches!(
+            b.drop_keeping_later_writes("shop", "orders", dropped, &one_chunk),
+            Err(crate::StorageError::Stopping(_))
+        ));
+        // D-1: re-dated by the first commit, so the sweep is owed and a start
+        // finds it; the floor, which says it is done, is not taken yet.
+        let standing = b.get_collection("shop", "orders").unwrap();
+        assert!(standing.created > dropped.hlc, "re-dated by the first commit");
+        assert!(standing.is_redated());
+        assert_eq!(standing.incarnation_floor, None);
+        assert!(owes_a_sweep(&standing, dropped.hlc));
+        assert_eq!(b.collection_dropped_at(id).unwrap(), Some(dropped));
+        assert_eq!(b.count_by_id(id).unwrap(), Some((n - SWEEP_CHUNK + 1) as u64));
+
+        assert!(b.reconcile_late_drops().unwrap() > 0, "the start finds it owed");
+        let standing = b.get_collection("shop", "orders").unwrap();
+        assert!(standing.created > dropped.hlc);
+        assert_eq!(standing.incarnation_floor, Some(dropped.hlc));
+        assert_eq!(b.count_by_id(id).unwrap(), Some(1));
+        assert_counts_exact(&b, "the survivors path");
+    }
+
+    /// A second drop over a life already re-dated keeps the first `from`: it is
+    /// the creation a database's drop is judged by. A marker left for another
+    /// `created` (the life was made again since) starts over.
+    #[test]
+    fn a_second_re_date_keeps_the_first_creation() {
+        let mut meta = CollectionMeta::new(
+            CollectionId::derive("shop", "orders"),
+            "shop",
+            "orders",
+            Hlc::new(10, 0),
+            None,
+        );
+        redate(&mut meta, Hlc::new(100, 0));
+        assert_eq!(meta.created, Hlc::new(100, 0).successor());
+        assert_eq!(meta.redated.map(|r| r.from), Some(Hlc::new(10, 0)));
+        redate(&mut meta, Hlc::new(200, 0));
+        assert_eq!(meta.created, Hlc::new(200, 0).successor());
+        assert_eq!(meta.redated.map(|r| r.from), Some(Hlc::new(10, 0)), "the first, not the last");
+        meta.created = Hlc::new(300, 0);
+        redate(&mut meta, Hlc::new(400, 0));
+        assert_eq!(meta.redated.map(|r| r.from), Some(Hlc::new(300, 0)), "a new life starts over");
     }
 
     /// The rule's two clauses: a life owes a sweep only when it began after the

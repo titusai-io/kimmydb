@@ -372,6 +372,22 @@ impl Engine {
                     debug!(db, collection = %collection.name, "a database drop buried a collection");
                 }
             }
+        } else if collection
+            .redated
+            .is_some_and(|r| r.created == collection.created && r.from <= dropped.hlc)
+        {
+            // A life a collection's drop re-dated to keep what was written after
+            // it, and which was created at or before this database's drop: the
+            // database's drop buries it, writes and all (ADR-229), whichever of
+            // the two drops this member learned of first.
+            if let Some(ids) = self.bury_redated_under_database(db, &collection.name, dropped)? {
+                notice.push(BuriedCollection {
+                    db: db.to_string(),
+                    name: collection.name.clone(),
+                    ids,
+                });
+                debug!(db, collection = %collection.name, "a database drop buried a collection a collection drop had kept");
+            }
         } else {
             self.record_tombstones_at(db, &collection.name, dropped)?;
             // A survivor is a life created after the drop; what it took in of

@@ -181,10 +181,31 @@ pub struct CollectionState {
     /// overrides a stamped local value.
     #[serde(default)]
     pub vector_changed: Option<Stamp>,
+    /// For a life a collection's drop re-dated to keep what was written after it
+    /// (`CollectionMeta::redated`, ADR-231 extended): the `created` the life had
+    /// before. `created` above is then the re-date, just after the drop, and
+    /// says nothing about when the life began, which is what a database's drop is
+    /// judged against (ADR-229). A receiver holding the database's tombstone
+    /// refuses the definition if this is at or before it, as it would the
+    /// original creation; without that, a life re-dated before its member
+    /// learned of the database's drop would spread past the tombstone that
+    /// covers it. Optional on the wire: a sender that predates it writes none, a
+    /// receiver that predates it ignores it and judges `created`, as before.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub redated_from: Option<Hlc>,
+}
+
+impl CollectionState {
+    /// The creation a database's drop judges this life by: where it began, not
+    /// where a collection's drop re-dated it to.
+    pub(crate) fn created_for_the_database(&self) -> Option<Hlc> {
+        self.redated_from.or(self.created)
+    }
 }
 
 impl From<CollectionMeta> for CollectionState {
     fn from(meta: CollectionMeta) -> Self {
+        let redated_from = meta.is_redated().then(|| meta.redated.map(|r| r.from)).flatten();
         CollectionState {
             db: meta.db,
             name: meta.name,
@@ -192,6 +213,7 @@ impl From<CollectionMeta> for CollectionState {
             vector: meta.vector,
             created: Some(meta.created),
             vector_changed: meta.vector_changed,
+            redated_from,
         }
     }
 }
@@ -735,7 +757,7 @@ impl Engine {
                 continue;
             }
             // Nor one the drop of its database makes history (ADR-229).
-            if self.database_refusal(&state.db, state.created)?.is_some() {
+            if self.database_refusal(&state.db, state.created_for_the_database())?.is_some() {
                 continue;
             }
             if self.purge_pending(id)? {
@@ -1270,6 +1292,28 @@ impl Engine {
         let held: std::collections::HashMap<CollectionId, Stamp> =
             self.collections_dropped()?.into_iter().collect();
 
+        // The database tombstones first, whatever order the list is in: a
+        // collection's drop met before its database's own tombstone is recorded
+        // would otherwise be judged without it (ADR-229's guard reads it). Held
+        // to the sender's coverage like every pair below.
+        let databases: std::collections::HashSet<String> = self
+            .collections(crate::engine::PairedShadows::Included)?
+            .into_iter()
+            .map(|meta| meta.db)
+            .collect();
+        let database_drops: Vec<(CollectionId, Stamp)> = databases
+            .iter()
+            .filter_map(|db| {
+                let id = kimmy_core::database_drop_id(db);
+                page.dropped_collections.iter().find(|(carried, _)| *carried == id).copied()
+            })
+            .filter(|(_, dropped)| dropped.hlc <= page.versions.get(dropped.node))
+            .filter(|(id, dropped)| held.get(id).is_none_or(|existing| dropped > existing))
+            .collect();
+        self.record_collection_drops(&database_drops)?;
+        let held: std::collections::HashMap<CollectionId, Stamp> =
+            self.collections_dropped()?.into_iter().collect();
+
         let mut to_record = Vec::new();
         for (id, dropped) in &page.dropped_collections {
             // A peer may only deny what its own coverage names (ADR-163).
@@ -1415,14 +1459,28 @@ impl Engine {
             // it at a time; the tombstone is recorded before the first of
             // them, so this node stops serving and re-seeding that copy at the
             // drop's first commit rather than at its last.
-            warn!(
-                db = %current.db,
-                collection = %current.name,
-                stamp = ?dropped,
-                "the peer has dropped the collection this snapshot was to repair, and the copy \
-                 held here is of the incarnation it dropped; dropping it too"
-            );
-            self.drop_collection_inner(&current.db, &current.name, Some(dropped))?;
+            //
+            // Writes stamped after the drop are kept, as when it arrives as an
+            // entry (ADR-231, extended), unless the database's own drop covers
+            // the life (ADR-229): one guard, judged in the burying transaction.
+            match self.drop_keeping_later_writes(&current.db, &current.name, dropped, &|| {
+                self.check_walk(crate::WalkScope::Background)
+            })? {
+                crate::late_drop::Dropped::Kept => {
+                    return self.record_collection_drop(id, dropped);
+                }
+                crate::late_drop::Dropped::Buried(buried) => {
+                    if buried {
+                        warn!(
+                            db = %current.db,
+                            collection = %current.name,
+                            stamp = ?dropped,
+                            "the peer has dropped the collection this snapshot was to repair, and \
+                             the copy held here is of the incarnation it dropped; dropped it too"
+                        );
+                    }
+                }
+            }
         } else {
             // `debug`, not `warn`. On the scoped route this is one line for the
             // one collection the pull is about. On the whole-database route
@@ -1494,8 +1552,12 @@ impl Engine {
             // write after the page's vector) are history here, not a stop that
             // lasts until a snapshot, and snapshot coverage would hide the
             // creation that would have recorded it.
-            if self.database_refusal(&state.db, state.created)?.is_some() {
-                self.record_database_refusal(&state.db, &state.name, state.created)?;
+            if self.database_refusal(&state.db, state.created_for_the_database())?.is_some() {
+                self.record_database_refusal(
+                    &state.db,
+                    &state.name,
+                    state.created_for_the_database(),
+                )?;
                 debug!(
                     db = %state.db,
                     collection = %state.name,
@@ -1520,19 +1582,29 @@ impl Engine {
             // The tombstone rule above, judged again under the writer.
             let history =
                 |dropped: Stamp| state.created.is_none_or(|created| created <= dropped.hlc);
-            match self.create_collection_inner(
+            // A re-dated life arrives with the creation it was re-dated from, and
+            // is created with it in the one transaction, so that a database's
+            // drop this node learns of after this page buries it as it buries
+            // the sender's, and no stop leaves it standing without the marker.
+            let redated_from = state.redated_from.filter(|_| state.created.is_some());
+            match self.create_collection_marked(
                 &state.db,
                 &state.name,
                 false,
                 state.created,
                 &history,
+                redated_from,
             ) {
                 Ok(Some(_)) => {}
                 Ok(None) => {
                     #[cfg(test)]
                     crate::sync::race_hooks::absorbed(crate::sync::race_hooks::Race::Restore);
                     // A database's drop that landed since the check above.
-                    self.record_database_refusal(&state.db, &state.name, state.created)?;
+                    self.record_database_refusal(
+                        &state.db,
+                        &state.name,
+                        state.created_for_the_database(),
+                    )?;
                     return Ok(0);
                 }
                 // Checked outside the writer, so the name can be created in

@@ -162,6 +162,47 @@ async fn sync(a: &Node, b: &Node) {
     sync_once(&b.engine, a.addr, SECRET, None).await.expect("b should pull from a");
 }
 
+/// What each member of a loop test holds and where it stands, for the panic of
+/// one that timed out: a test that only says "did not converge" cannot say
+/// whether the members disagree, agree on the wrong thing, or stopped talking.
+fn describe_loop(
+    members: &[(&str, &Node)],
+    id: kimmy_core::CollectionId,
+    gauge: &[usize],
+    last: &[Option<kimmy_cluster::RoundReport>],
+    repairs: &[usize],
+) -> String {
+    let mut out = String::new();
+    for (i, (name, node)) in members.iter().enumerate() {
+        let engine = &node.engine;
+        let meta = engine.get_collection("shop", "orders").ok();
+        let held: Vec<i64> = meta
+            .as_ref()
+            .map(|c| {
+                (1..=9)
+                    .filter(|k| engine.get(c, &kimmy_core::DocId::Int64(*k)).unwrap().is_some())
+                    .collect()
+            })
+            .unwrap_or_default();
+        out.push_str(&format!(
+            "  {name}: holds {held:?}; collection {}; tombstone {:?}; gauge {}; repair rounds {}; \
+             last round {:?}\n",
+            match &meta {
+                Some(c) => format!(
+                    "created {:?}, floor {:?}, re-dated {:?}",
+                    c.created, c.incarnation_floor, c.redated
+                ),
+                None => "absent".to_string(),
+            },
+            engine.collection_dropped_at(id).ok().flatten(),
+            gauge.get(i).copied().unwrap_or(usize::MAX),
+            repairs.get(i).copied().unwrap_or(0),
+            last.get(i).and_then(|r| r.as_ref()),
+        ));
+    }
+    out
+}
+
 #[tokio::test]
 async fn two_nodes_converge_over_the_network() {
     let a = node().await;
@@ -9704,7 +9745,11 @@ async fn a_drop_and_a_concurrent_create_converge_through_the_loop_and_the_repair
     a.engine.insert(&on_a, doc! { "_id": 1i64, "from": "a" }).unwrap();
     assert!(a.engine.drop_collection("shop", "orders").unwrap());
     a.engine.finish_purges_now().unwrap();
+    // The second life begins after the drop by stamp, which is the premise.
+    std::thread::sleep(Duration::from_millis(5));
     let on_b = b.engine.create_collection("shop", "orders").unwrap();
+    let dropped = a.engine.collection_dropped_at(on_a.id).unwrap().expect("the drop is held");
+    assert!(on_b.created > dropped.hlc, "premise: the creation is after the drop");
     b.engine.insert(&on_b, doc! { "_id": 2i64, "from": "b" }).unwrap();
 
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<(bool, RoundReport)>();
@@ -9729,19 +9774,34 @@ async fn a_drop_and_a_concurrent_create_converge_through_the_loop_and_the_repair
     let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
     let mut gauge = [usize::MAX; 2];
     let mut checks = [0usize; 2];
+    let mut last = [None; 2];
+    let mut repaired = [0usize; 2];
+    let members = [("a", &a), ("b", &b)];
     loop {
-        let (is_b, report) = tokio::time::timeout_at(deadline, rx.recv())
-            .await
-            .expect("the members did not converge")
-            .expect("the loops keep reporting");
-        gauge[usize::from(is_b)] = report.divergent_collections;
-        checks[usize::from(is_b)] += report.divergence_checks;
+        let (is_b, report) = match tokio::time::timeout_at(deadline, rx.recv()).await {
+            Ok(Some(heard)) => heard,
+            Ok(None) => panic!("the loops stopped reporting"),
+            Err(_) => panic!(
+                "the members did not converge:\n{}",
+                describe_loop(&members, on_a.id, &gauge, &last, &repaired)
+            ),
+        };
+        let i = usize::from(is_b);
+        gauge[i] = report.divergent_collections;
+        checks[i] += report.divergence_checks;
+        repaired[i] += report.repair_rounds;
+        last[i] = Some(report);
         let (ca, cb) =
             (a.engine.count_by_id(on_a.id).unwrap(), b.engine.count_by_id(on_a.id).unwrap());
         if ca == cb && gauge == [0, 0] && checks.iter().all(|c| *c >= 3) {
             assert_eq!(ca, Some(1), "document 2 only");
             break;
         }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the members did not converge, though the loops kept reporting:\n{}",
+            describe_loop(&members, on_a.id, &gauge, &last, &repaired)
+        );
     }
     // And the repair has ended: no repair round in the next stretch.
     let quiet_until = tokio::time::Instant::now() + Duration::from_secs(8);
@@ -9752,6 +9812,238 @@ async fn a_drop_and_a_concurrent_create_converge_through_the_loop_and_the_repair
         {
             repairs += report.repair_rounds;
             assert_eq!(report.divergent_collections, 0, "{report:?}");
+        }
+    }
+    assert_eq!(repairs, 0, "the repair kept running after the members agreed");
+    for l in loops {
+        l.abort();
+    }
+}
+
+/// A drop keeps the writes stamped after it (ADR-231, extended), through the
+/// real loops. Case one: nobody recreated the name. D took a write after A's
+/// drop; D keeps its collection with it, A has nothing to put it in, the
+/// existence half sees a collection D holds and A lacks (dated above A's
+/// tombstone, so a recreation), and the repair brings it back: both end with
+/// the collection and the write, the gauge returns to 0 and the repair stops.
+#[tokio::test]
+async fn a_write_after_a_drop_brings_the_collection_back_on_every_member_and_the_repair_ends() {
+    use kimmy_cluster::{ReplicationConfig, RoundReport, SeedSource, replicate};
+
+    let a = node().await;
+    let d = node().await;
+    let on_a = a.engine.create_collection("shop", "orders").unwrap();
+    a.engine.insert(&on_a, doc! { "_id": 1i64 }).unwrap();
+    sync(&a, &d).await;
+    assert!(a.engine.drop_collection("shop", "orders").unwrap());
+    a.engine.finish_purges_now().unwrap();
+    // After the drop by stamp, which is the premise of the test: a write at or
+    // before the drop's `Hlc` is swept, correctly, and nothing would come back.
+    std::thread::sleep(Duration::from_millis(5));
+    let dropped = a.engine.collection_dropped_at(on_a.id).unwrap().expect("the drop is held");
+    let on_d = d.engine.get_collection("shop", "orders").unwrap();
+    let (_, written) = d.engine.insert_stamped(&on_d, doc! { "_id": 3i64 }).unwrap();
+    assert!(
+        written.hlc > dropped.hlc,
+        "premise: the write {written:?} is after the drop {dropped:?}"
+    );
+
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<(bool, RoundReport)>();
+    let mut loops = Vec::new();
+    for (is_d, me, other) in [(false, &a, &d), (true, &d, &a)] {
+        loops.push(tokio::spawn({
+            let engine = Arc::clone(&me.engine);
+            async move {
+                let _ = engine.run_drop_purger().await;
+            }
+        }));
+        let mut config = ReplicationConfig::new(
+            vec![SeedSource::Static(vec![other.addr])],
+            SECRET.into(),
+            me.addr,
+        );
+        config.sync_interval = Duration::from_millis(100);
+        config.discovery_interval = Duration::from_millis(100);
+        let tx = tx.clone();
+        config.on_round = Some(Arc::new(move |report| {
+            let _ = tx.send((is_d, report));
+        }));
+        loops.push(tokio::spawn(replicate(Arc::clone(&me.engine), config)));
+    }
+
+    let held = |n: &Node| -> Vec<i64> {
+        let Ok(c) = n.engine.get_collection("shop", "orders") else { return vec![] };
+        (1..=3)
+            .filter(|k| n.engine.get(&c, &kimmy_core::DocId::Int64(*k)).unwrap().is_some())
+            .collect()
+    };
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
+    let mut gauge = [usize::MAX; 2];
+    let mut last = [None; 2];
+    let mut repaired = [0usize; 2];
+    let members = [("a", &a), ("d", &d)];
+    loop {
+        let (is_d, report) = match tokio::time::timeout_at(deadline, rx.recv()).await {
+            Ok(Some(heard)) => heard,
+            Ok(None) => panic!("the loops stopped reporting"),
+            Err(_) => panic!(
+                "the members did not converge:\n{}",
+                describe_loop(&members, on_a.id, &gauge, &last, &repaired)
+            ),
+        };
+        let i = usize::from(is_d);
+        gauge[i] = report.divergent_collections;
+        repaired[i] += report.repair_rounds;
+        last[i] = Some(report);
+        if held(&a) == vec![3] && held(&d) == vec![3] && gauge == [0, 0] {
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the members did not converge, though the loops kept reporting:\n{}",
+            describe_loop(&members, on_a.id, &gauge, &last, &repaired)
+        );
+    }
+    let quiet_until = tokio::time::Instant::now() + Duration::from_secs(8);
+    let mut repairs = 0usize;
+    while tokio::time::Instant::now() < quiet_until {
+        if let Ok(Some((_, report))) =
+            tokio::time::timeout(Duration::from_millis(500), rx.recv()).await
+        {
+            repairs += report.repair_rounds;
+            assert_eq!(report.divergent_collections, 0, "{report:?}");
+        }
+    }
+    assert_eq!(repairs, 0, "the repair kept running after the members agreed");
+    for l in loops {
+        l.abort();
+    }
+}
+
+/// Case two, the original: three members, three loops, the drop made on A, the
+/// name created again on B, a write after the drop through D. All three end
+/// with documents 2 and 3, the gauge returns to 0 and the repair ends.
+#[tokio::test]
+async fn a_drop_a_recreation_and_a_write_after_the_drop_converge_on_three_members() {
+    three_members_after_a_drop(None).await;
+}
+
+/// The same, with A hearing of D's write *before* B's creation: the write
+/// reaches a member that holds the drop's tombstone and not yet the collection,
+/// and is set aside there. The members must still converge, because the count
+/// half's repair replays from where the live life's valid history begins (the
+/// floor) and not from the life's creation, which is after the write. Found by
+/// a CI run that took the other order: A held {2}, B and D {2, 3}, and the
+/// repair ran on for ever.
+#[tokio::test]
+async fn a_write_after_a_drop_that_reaches_a_member_before_the_recreation_is_still_repaired() {
+    three_members_after_a_drop(Some('d')).await;
+}
+
+/// And with the recreation first, the order the first test usually takes.
+#[tokio::test]
+async fn a_recreation_that_reaches_a_member_before_the_write_after_the_drop_converges_too() {
+    three_members_after_a_drop(Some('b')).await;
+}
+
+/// The three-member case. `first` says which of D's write and B's creation A
+/// hears first, before any loop runs; `None` leaves it to the loops.
+async fn three_members_after_a_drop(first: Option<char>) {
+    use kimmy_cluster::{ReplicationConfig, RoundReport, SeedSource, replicate};
+
+    let a = node().await;
+    let b = node().await;
+    let d = node().await;
+    let on_a = a.engine.create_collection("shop", "orders").unwrap();
+    a.engine.insert(&on_a, doc! { "_id": 1i64 }).unwrap();
+    sync(&a, &d).await;
+    assert!(a.engine.drop_collection("shop", "orders").unwrap());
+    a.engine.finish_purges_now().unwrap();
+    // The write and the creation are *after* the drop by stamp, which is the
+    // premise of the whole test: a write at or before the drop's `Hlc` is
+    // swept, correctly, and the members would end with {2}. Two members that
+    // mint within one millisecond can tie, so wait, and say so if it did.
+    std::thread::sleep(Duration::from_millis(5));
+    let dropped = a.engine.collection_dropped_at(on_a.id).unwrap().expect("the drop is held");
+    let on_d = d.engine.get_collection("shop", "orders").unwrap();
+    let (_, written) = d.engine.insert_stamped(&on_d, doc! { "_id": 3i64 }).unwrap();
+    assert!(
+        written.hlc > dropped.hlc,
+        "premise: the write {written:?} is after the drop {dropped:?}"
+    );
+    let on_b = b.engine.create_collection("shop", "orders").unwrap();
+    assert!(on_b.created > dropped.hlc, "premise: the creation is after the drop");
+    b.engine.insert(&on_b, doc! { "_id": 2i64 }).unwrap();
+    let order: &[&Node] = match first {
+        Some('d') => &[&d, &b],
+        Some('b') => &[&b, &d],
+        _ => &[],
+    };
+    for peer in order {
+        sync_once(&a.engine, peer.addr, SECRET, None).await.expect("a should pull");
+    }
+
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<(usize, RoundReport)>();
+    let nodes = [&a, &b, &d];
+    let mut loops = Vec::new();
+    for (i, me) in nodes.iter().enumerate() {
+        loops.push(tokio::spawn({
+            let engine = Arc::clone(&me.engine);
+            async move {
+                let _ = engine.run_drop_purger().await;
+            }
+        }));
+        let seeds: Vec<_> =
+            nodes.iter().enumerate().filter(|(j, _)| *j != i).map(|(_, n)| n.addr).collect();
+        let mut config =
+            ReplicationConfig::new(vec![SeedSource::Static(seeds)], SECRET.into(), me.addr);
+        config.sync_interval = Duration::from_millis(100);
+        config.discovery_interval = Duration::from_millis(100);
+        let tx = tx.clone();
+        config.on_round = Some(Arc::new(move |report| {
+            let _ = tx.send((i, report));
+        }));
+        loops.push(tokio::spawn(replicate(Arc::clone(&me.engine), config)));
+    }
+    let held = |n: &Node| -> Vec<i64> {
+        let Ok(c) = n.engine.get_collection("shop", "orders") else { return vec![] };
+        (1..=3)
+            .filter(|k| n.engine.get(&c, &kimmy_core::DocId::Int64(*k)).unwrap().is_some())
+            .collect()
+    };
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
+    let mut gauge = [usize::MAX; 3];
+    let mut last = [None; 3];
+    let mut repaired = [0usize; 3];
+    let members = [("a", &a), ("b", &b), ("d", &d)];
+    loop {
+        let (i, report) = match tokio::time::timeout_at(deadline, rx.recv()).await {
+            Ok(Some(heard)) => heard,
+            Ok(None) => panic!("the loops stopped reporting"),
+            Err(_) => panic!(
+                "the members did not converge:\n{}",
+                describe_loop(&members, on_a.id, &gauge, &last, &repaired)
+            ),
+        };
+        gauge[i] = report.divergent_collections;
+        repaired[i] += report.repair_rounds;
+        last[i] = Some(report);
+        if nodes.iter().all(|n| held(n) == vec![2, 3]) && gauge == [0, 0, 0] {
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the members did not converge, though the loops kept reporting:\n{}",
+            describe_loop(&members, on_a.id, &gauge, &last, &repaired)
+        );
+    }
+    let quiet_until = tokio::time::Instant::now() + Duration::from_secs(8);
+    let mut repairs = 0usize;
+    while tokio::time::Instant::now() < quiet_until {
+        if let Ok(Some((_, report))) =
+            tokio::time::timeout(Duration::from_millis(500), rx.recv()).await
+        {
+            repairs += report.repair_rounds;
         }
     }
     assert_eq!(repairs, 0, "the repair kept running after the members agreed");

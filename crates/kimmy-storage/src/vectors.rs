@@ -1074,6 +1074,39 @@ fn decode_vector(doc: bson::Document) -> Result<VectorRecord> {
         .map_err(|e| StorageError::Corrupt(format!("decoding vector record: {e}")))
 }
 
+/// Whether the vector chunk record `raw` belongs to a document of `parent` that
+/// cannot be live there after a drop stamped `dropped`.
+///
+/// - The document is **there and deleted**: yes.
+/// - The document is **there and live**: no.
+/// - The document is **not here**: undecided, and the answer is the version of
+///   the document the chunk was made from (`source_hlc`). One at or before the
+///   drop is history in this life, so it can never arrive live and the chunk
+///   goes; one after it is a document that may be on its way from another
+///   origin (the chunk from a member that embedded it, the document from one
+///   whose link is slower), so the chunk stays and the document, if it comes,
+///   finds it.
+///
+/// A record that cannot be read as a chunk is not judged orphaned.
+pub(crate) fn chunk_has_no_live_parent(
+    docs: &impl ReadableTable<(u64, &'static [u8]), &'static [u8]>,
+    parent: CollectionId,
+    dropped: Hlc,
+    raw: &[u8],
+) -> bool {
+    let Ok(Some(document)) = crate::codec::decode_doc_record(raw).and_then(|r| Ok(r.document()?))
+    else {
+        return false;
+    };
+    let Ok(record) = decode_vector(document) else { return false };
+    let Ok(key) = crate::docs::doc_key(&record.source) else { return false };
+    match docs.get((parent.0, key.as_slice())) {
+        Ok(Some(row)) => crate::codec::doc_record_header(row.value()).is_ok_and(|(_, live)| !live),
+        Ok(None) => record.source_hlc <= dropped,
+        Err(_) => false,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use kimmy_core::{OpKind, ProviderConfig, vector_meta};

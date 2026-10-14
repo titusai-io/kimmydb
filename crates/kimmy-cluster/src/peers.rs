@@ -1357,7 +1357,20 @@ pub async fn replicate(engine: Arc<Engine>, config: ReplicationConfig) {
                                     let confirmed = divergence.confirmed_against(node);
                                     for collection in &confirmed {
                                         let repair = match engine.collection_by_id(*collection) {
-                                            Ok(Some(meta)) => Repair::Replay { from: meta.created },
+                                            // From where the standing life's valid history
+                                            // begins, which is its incarnation floor and not
+                                            // its creation: a write stamped after the drop
+                                            // that preceded this life (a member that kept it
+                                            // through the drop, ADR-231 extended) is part of
+                                            // the life and sorts before the creation. A replay
+                                            // from the creation would never serve it.
+                                            Ok(Some(meta)) => Repair::Replay {
+                                                from: meta
+                                                    .incarnation_floor
+                                                    .map_or(meta.created, |floor| {
+                                                        floor.min(meta.created)
+                                                    }),
+                                            },
                                             _ => Repair::Snapshot,
                                         };
                                         if stalls.plan_repair(node, *collection, repair) {

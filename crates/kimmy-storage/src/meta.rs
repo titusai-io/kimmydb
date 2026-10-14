@@ -69,9 +69,56 @@ pub struct CollectionMeta {
     /// legitimate catch-up.
     #[serde(default)]
     pub incarnation_floor: Option<Hlc>,
+    /// Set when a replicated drop met writes stamped after it and the life was
+    /// **re-dated** instead of buried: `created` was moved to just after the
+    /// drop (ADR-231, extended). Holds that `created` and, once the sweep is
+    /// done, the arrival position of the first entry the life kept.
+    ///
+    /// Valid only while its `created` is the meta's own: any later change of
+    /// `created` leaves a value that no longer matches, and it is ignored.
+    /// Additive like `vector_changed`: a build that does not know it ignores it
+    /// and, rewriting the meta, drops it, which costs a stream open the walk it
+    /// made before.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub redated: Option<Redated>,
+}
+
+/// See [`CollectionMeta::redated`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Redated {
+    /// The `created` the life had before the first drop re-dated it: what a
+    /// database's drop that arrives later is judged against (ADR-229), since a
+    /// life created at or before it is buried with it, writes and all.
+    pub from: Hlc,
+    /// The `created` this marker belongs to.
+    pub created: Hlc,
+    /// The lowest arrival position among the entries the life kept, once the
+    /// sweep has taken it. `None` while the sweep runs, and when no kept
+    /// entry is still held.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub first_arrival: Option<u64>,
+    /// The arrival position the next entry took when the life was re-dated:
+    /// nothing written after the first commit sits below it, so the sweep, which
+    /// reads the records that are there when it passes them, takes the lower of
+    /// this and what it saw. A record that lands in a range already passed
+    /// still has its entry at or above this.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub arrivals_from: Option<u64>,
 }
 
 impl CollectionMeta {
+    /// Whether this life was re-dated by a drop that met writes stamped after
+    /// it, and has not been re-created since.
+    pub fn is_redated(&self) -> bool {
+        self.redated.is_some_and(|r| r.created == self.created)
+    }
+
+    /// The arrival position of the first entry a re-dated life kept, if the
+    /// marker belongs to this `created` and the sweep recorded one.
+    pub fn redated_first_arrival(&self, created: Hlc) -> Option<u64> {
+        self.redated.filter(|r| r.created == created && self.created == created)?.first_arrival
+    }
+
     pub fn new(
         id: CollectionId,
         db: impl Into<String>,
@@ -89,6 +136,7 @@ impl CollectionMeta {
             vector: None,
             vector_changed: None,
             incarnation_floor,
+            redated: None,
         }
     }
 
@@ -118,6 +166,32 @@ mod tests {
             Hlc::new(10, 0),
             Some(Hlc::new(10, 0)),
         )
+    }
+
+    /// A marker is read only for the `created` it was written with: a stale one
+    /// (the life was re-created, or re-dated again, since) reads as absent, and
+    /// a meta written without the field reads as never re-dated.
+    #[test]
+    fn a_redated_marker_is_read_only_for_its_own_created() {
+        let mut m = meta();
+        assert!(!m.is_redated());
+        m.created = Hlc::new(20, 0);
+        m.redated = Some(Redated {
+            from: Hlc::new(10, 0),
+            created: Hlc::new(20, 0),
+            first_arrival: Some(7),
+            arrivals_from: None,
+        });
+        assert!(m.is_redated());
+        assert_eq!(m.redated_first_arrival(Hlc::new(20, 0)), Some(7));
+        assert_eq!(m.redated_first_arrival(Hlc::new(21, 0)), None, "another created");
+        m.created = Hlc::new(30, 0);
+        assert!(!m.is_redated(), "re-dated again since");
+        assert_eq!(m.redated_first_arrival(Hlc::new(30, 0)), None);
+        let text = serde_json::to_string(&meta()).unwrap();
+        assert!(!text.contains("redated"), "absent when unset: {text}");
+        let stale: CollectionMeta = serde_json::from_str(&text).unwrap();
+        assert_eq!(stale.redated, None);
     }
 
     #[test]

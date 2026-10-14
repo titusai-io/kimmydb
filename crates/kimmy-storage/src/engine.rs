@@ -3637,7 +3637,11 @@ impl Engine {
         self.begin_write_as(holder, Continuing::Yes)
     }
 
-    fn begin_write_as(&self, holder: WriterHolder, continuing: Continuing) -> Result<WriteTxn<'_>> {
+    pub(crate) fn begin_write_as(
+        &self,
+        holder: WriterHolder,
+        continuing: Continuing,
+    ) -> Result<WriteTxn<'_>> {
         #[cfg(any(test, feature = "test-hooks"))]
         if continuing == Continuing::Yes {
             let hook = self.continuing_hook.lock().take();
@@ -4188,6 +4192,23 @@ impl Engine {
         origin: Option<Hlc>,
         history: &dyn Fn(Stamp) -> bool,
     ) -> Result<Option<CollectionMeta>> {
+        self.create_collection_marked(db, name, log, origin, history, None)
+    }
+
+    /// [`Self::create_collection_inner`] for a life a collection's drop re-dated
+    /// elsewhere (ADR-231, extended): `redated_from` is the `created` it had
+    /// before, written with the creation in the one transaction, so a stop
+    /// cannot leave the life standing without the marker a database's drop
+    /// judges it by.
+    pub(crate) fn create_collection_marked(
+        &self,
+        db: &str,
+        name: &str,
+        log: bool,
+        origin: Option<Hlc>,
+        history: &dyn Fn(Stamp) -> bool,
+        redated_from: Option<Hlc>,
+    ) -> Result<Option<CollectionMeta>> {
         // A creation over a dropped life's rows is refused inside the
         // transaction, below: see `create_collection_in_txn` (ADR-189).
 
@@ -4208,7 +4229,16 @@ impl Engine {
         // and a replicated shadow takes its configuration entry's stamp.
         let mint = || self.next_stamp();
         match self.create_collection_in_txn(&txn, db, name, log, origin, history, mint) {
-            Ok(InTxn::Created(meta, logged)) => {
+            Ok(InTxn::Created(mut meta, logged)) => {
+                if let Some(from) = redated_from {
+                    meta.redated = Some(crate::meta::Redated {
+                        from,
+                        created: meta.created,
+                        first_arrival: None,
+                        arrivals_from: None,
+                    });
+                    Self::put_collection_meta(&txn, &meta)?;
+                }
                 txn.commit()?;
                 if let Some(entry) = logged {
                     self.publish(vec![entry]);
@@ -4641,7 +4671,6 @@ impl Engine {
         name: &str,
         replicated: Option<Stamp>,
     ) -> Result<Option<Burial>> {
-        let log = replicated.is_none();
         // What is buried is what stands under the name **now**, read under the
         // writer, and not what the read above found. Between the two, another
         // burial of the name can land, or a burial and a recreation with
@@ -4680,6 +4709,24 @@ impl Engine {
         let Some((meta, shadow)) = standing else {
             return Ok(None);
         };
+        self.bury_standing_in_txn(txn, db, name, meta, shadow, replicated).map(Some)
+    }
+
+    /// [`Self::bury_in_txn`] for a collection (and its shadow) the caller has
+    /// already read under the writer and judged the drop's to bury: the part
+    /// after that judgement. A life re-dated above its drop is buried through
+    /// here when the sweep leaves it empty, since the incarnation rule would
+    /// turn the same drop away from it.
+    pub(crate) fn bury_standing_in_txn(
+        &self,
+        txn: &WriteTxn<'_>,
+        db: &str,
+        name: &str,
+        meta: CollectionMeta,
+        shadow: Option<CollectionMeta>,
+        replicated: Option<Stamp>,
+    ) -> Result<Burial> {
+        let log = replicated.is_none();
         // Under the writer, as `create_collection_inner` mints (ADR-148).
         let stamp = replicated.unwrap_or_else(|| self.next_stamp());
         let database_emptied = {
@@ -4735,7 +4782,7 @@ impl Engine {
         } else {
             None
         };
-        Ok(Some(Burial { shadow: shadow.map(|s| s.name), buried, logged }))
+        Ok(Burial { shadow: shadow.map(|s| s.name), buried, logged })
     }
 
     /// What follows a burial's commit: its entry published, expiry cursors
