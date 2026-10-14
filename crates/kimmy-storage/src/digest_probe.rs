@@ -399,6 +399,23 @@ enum ScanFor {
     Only(Option<CollectionId>),
 }
 
+/// Whether a drop tombstone defers a collection at this cut (B3 coverage fix).
+///
+/// A drop leaves its tombstone for the retention, long after both members have
+/// applied it and the name has been created again, so holding one is not a
+/// reason to defer for ever. What the guard is for is a member that may still
+/// hold the life the drop ended: the digests of the two lives differ though
+/// nothing is lost. That is so exactly while **the drop is above the cut**
+/// (a member the cut stands for may not have applied it), or **the standing
+/// life is not newer than the drop** (a database drop's sweep has not yet
+/// buried it here). Once both have witnessed past the drop, the old life is
+/// gone from both, or the entry was lost, which the digest exists to report.
+/// A drop older than the retention is no longer held: that case is the
+/// horizon's (`tombstone_retention_secs >= oplog_retention_secs`).
+fn drop_defers(tombstone: Option<Stamp>, created: Hlc, cut: &VersionVector) -> bool {
+    tombstone.is_some_and(|at| at.hlc > cut.get(at.node) || created <= at.hlc)
+}
+
 /// What subtracting a set of keys from a row came to.
 enum Excluded {
     Digest(u128),
@@ -645,32 +662,31 @@ impl Engine {
     ) -> Result<BTreeMap<CollectionId, Facet>> {
         let metas = Self::collections_in(txn, PairedShadows::Hidden)?;
         let rows = txn.open_table(tables::LIVE_DIGESTS)?;
-        let mut tombstoned: BTreeMap<String, bool> = BTreeMap::new();
+        let mut tombstoned: BTreeMap<String, Option<Stamp>> = BTreeMap::new();
         let mut facets = BTreeMap::new();
         for meta in &metas {
             let row = live_digest::kept_row(&rows, meta.id.0)?.unwrap_or_default();
             let quiet = row.maxw.iter().all(|(node, hlc)| *hlc <= cut.get(*node));
             let deferred = if row.bare_max.iter().any(|(node, hlc)| *hlc > cut.get(*node)) {
                 Some(Defer::BareTombstone)
-            } else if Self::collection_dropped_at_in(txn, meta.id)?.is_some() {
-                // A tombstone for this id means an earlier life of it ended
-                // on this side. Whether the other side holds the same life is
-                // not something the digest can tell, and `created` differs
-                // per member for good on a concurrent create, so it is not
-                // asked: the side that holds the tombstone defers.
+            } else if drop_defers(Self::collection_dropped_at_in(txn, meta.id)?, meta.created, cut)
+            {
                 Some(Defer::Incarnation)
-            } else if match tombstoned.get(&meta.db) {
-                Some(known) => *known,
-                None => {
-                    let held = Self::collection_dropped_at_in(
-                        txn,
-                        kimmy_core::database_drop_id(&meta.db),
-                    )?
-                    .is_some();
-                    tombstoned.insert(meta.db.clone(), held);
-                    held
-                }
-            } {
+            } else if drop_defers(
+                match tombstoned.get(&meta.db) {
+                    Some(known) => *known,
+                    None => {
+                        let held = Self::collection_dropped_at_in(
+                            txn,
+                            kimmy_core::database_drop_id(&meta.db),
+                        )?;
+                        tombstoned.insert(meta.db.clone(), held);
+                        held
+                    }
+                },
+                meta.created,
+                cut,
+            ) {
                 Some(Defer::DatabaseTombstone)
             } else {
                 None
@@ -1329,9 +1345,13 @@ mod tests {
     }
 
     /// A dropped and created again collection is deferred by whichever side
-    /// holds the tombstone for its id, whichever side asks.
+    /// holds the tombstone for its id, whichever side asks, **while the drop is
+    /// above the cut**; once both members have witnessed past it the tombstone
+    /// (which stays for the retention) no longer defers, and the new life is
+    /// compared.
     #[test]
-    fn a_collection_dropped_and_created_again_is_deferred_by_the_side_that_holds_the_tombstone() {
+    fn a_collection_dropped_and_created_again_is_deferred_until_the_drop_is_covered_and_then_compared()
+     {
         let (a, b, orders, items, _dirs) = converged();
         a.drop_collection("shop", "orders").unwrap();
         a.finish_purges_now().unwrap();
@@ -1361,14 +1381,195 @@ mod tests {
         b.finish_purges_now().unwrap();
         sync(&a, &b);
         assert!(b.collection_tombstones().unwrap().contains_key(&orders.id));
+        assert!(a.collection_tombstones().unwrap().contains_key(&orders.id));
         for (x, y) in [(&a, &b), (&b, &a)] {
             let verdicts = exchange(x, y, Some(orders.id));
             assert_eq!(
-                outcome_of(&verdicts, orders.id),
-                Some(DigestOutcome::Deferred(Defer::Incarnation)),
-                "both hold it: {verdicts:?}"
+                compared(&verdicts, orders.id),
+                Some(true),
+                "both hold the tombstone and have witnessed past the drop: {verdicts:?}"
             );
         }
+    }
+
+    /// The same, with a member that has witnessed the drop but not the creation
+    /// that followed: it holds no collection under the id (the drop buried it),
+    /// so there is nothing to compare or to defer, and nothing is reported.
+    #[test]
+    fn a_member_that_has_the_drop_and_not_the_recreation_has_nothing_to_compare() {
+        let (a, b, orders, items, _dirs) = converged();
+        a.drop_collection("shop", "orders").unwrap();
+        a.finish_purges_now().unwrap();
+        // The drop reaches B before the creation exists.
+        sync(&a, &b);
+        b.finish_purges_now().unwrap();
+        let again = a.create_collection("shop", "orders").unwrap();
+        a.insert(&again, doc! { "_id": 0i64 }).unwrap();
+        let verdicts = exchange(&a, &b, Some(orders.id));
+        assert_eq!(outcome_of(&verdicts, orders.id), None, "{verdicts:?}");
+        assert_eq!(compared(&verdicts, items.id), Some(true));
+    }
+
+    /// A concurrent create on B, later than A's drop (A creates, A drops, B
+    /// independently creates; B's clock is the later): after the exchange both
+    /// hold one collection, created at B's stamp, and the drop is held by both
+    /// as a tombstone below that incarnation. The drop took A's document at A
+    /// and was ignored at B, which still holds it, so the members really differ
+    /// (the count probe sees 1 against 2). The digest neither defers for the
+    /// tombstone's retention nor invents the difference: once the drop is
+    /// covered it compares, and says what the counts say. The existence half
+    /// sees nothing, since both hold the collection.
+    ///
+    /// The difference itself is a replication bug, recorded as the finding
+    /// `kimmydb-a-collection-dropped-on-one-member-and-created-again-on-another-
+    /// before-the-drop-replicates-leaves-the-members-different-for-good-and-the-
+    /// repair-loops`; the digest's part is to report it as true, which is what
+    /// this pins. The fix makes the two members agree and this test's last two
+    /// assertions say so then.
+    #[test]
+    fn a_concurrent_create_later_than_a_drop_is_compared_and_the_difference_is_real() {
+        let (a, _da) = engine();
+        let (b, _db) = engine();
+        let on_a = a.create_collection("shop", "orders").unwrap();
+        a.insert(&on_a, doc! { "_id": 1i64, "from": "a" }).unwrap();
+        assert!(a.drop_collection("shop", "orders").unwrap());
+        a.finish_purges_now().unwrap();
+        let on_b = b.create_collection("shop", "orders").unwrap();
+        assert!(on_b.created > on_a.created, "premise: B's create is the later");
+        b.insert(&on_b, doc! { "_id": 2i64, "from": "b" }).unwrap();
+        for _ in 0..3 {
+            sync(&a, &b);
+            a.finish_purges_now().unwrap();
+            b.finish_purges_now().unwrap();
+        }
+        let id = on_a.id;
+        // Both hold the one collection, at B's incarnation, and the drop.
+        for e in [&a, &b] {
+            assert_eq!(e.collection_by_id(id).unwrap().unwrap().created, on_b.created);
+            assert!(e.collection_tombstones().unwrap().contains_key(&id));
+        }
+        assert_eq!(a.all_collection_ids().unwrap(), b.all_collection_ids().unwrap());
+        // What each holds: B's document at both; A's, which A's drop took, at B.
+        let held = |e: &Engine, n: i64| {
+            let c = e.collection_by_id(id).unwrap().unwrap();
+            e.get(&c, &DocId::Int64(n)).unwrap().is_some()
+        };
+        assert!(held(&a, 2) && held(&b, 2));
+        assert!(!held(&a, 1) && held(&b, 1), "the members differ by the dropped document");
+        assert_eq!(a.count_by_id(id).unwrap(), Some(1));
+        assert_eq!(b.count_by_id(id).unwrap(), Some(2));
+        // The digest: not deferred, and unequal, in both directions.
+        for (x, y) in [(&a, &b), (&b, &a)] {
+            let verdicts = exchange(x, y, Some(id));
+            assert_eq!(compared(&verdicts, id), Some(false), "{verdicts:?}");
+        }
+    }
+
+    /// The boundaries of the covered-drop rule, at the collection tombstone's
+    /// own site (the database tombstone's are pinned below): a drop whose
+    /// `hlc` equals the standing collection's `created` is not newer than it,
+    /// and one the standing life predates, covered or not, defers; a drop whose
+    /// `hlc` equals the cut's component for its origin is covered, and one
+    /// above it is not.
+    #[test]
+    fn the_collection_tombstones_boundaries_are_pinned() {
+        let (a, b, orders, _items, _dirs) = converged();
+        // A drop stamped exactly at the creation of the life standing: the
+        // life is not newer than the drop.
+        let tie = Stamp::new(orders.created, a.node_id());
+        a.record_collection_drop(orders.id, tie).unwrap();
+        let verdicts = exchange(&a, &b, None);
+        assert_eq!(
+            outcome_of(&verdicts, orders.id),
+            Some(DigestOutcome::Deferred(Defer::Incarnation)),
+            "created equal to the drop: {verdicts:?}"
+        );
+        // A drop after the creation, covered by the cut: the life predates it.
+        let (c, d, orders, _items, _dirs2) = converged();
+        let after = c.next_stamp();
+        c.insert(&orders, doc! { "_id": 700i64 }).unwrap();
+        sync(&c, &d);
+        c.record_collection_drop(orders.id, after).unwrap();
+        let verdicts = exchange(&c, &d, None);
+        assert_eq!(
+            outcome_of(&verdicts, orders.id),
+            Some(DigestOutcome::Deferred(Defer::Incarnation)),
+            "a covered drop the standing life predates: {verdicts:?}"
+        );
+
+        // A drop at exactly the cut's component for its origin, over a life
+        // created after it: covered, so compared. One above it: not.
+        let (e, f, _orders, items, _dirs3) = converged();
+        let origin = NodeId::generate();
+        let at = Hlc::new(crate::physical_now_ms() - 5_000, 0);
+        for node in [&e, &f] {
+            let entry = kimmy_core::OplogEntry {
+                stamp: Stamp::new(at, origin),
+                kind: kimmy_core::OpKind::Insert,
+                collection: items.id,
+                doc_id: Some(DocId::Int64(8_000)),
+                body: Some(bson::serialize_to_vec(&doc! { "_id": 8000i64 }).unwrap()),
+            };
+            node.apply_remote(&items, &entry).unwrap();
+        }
+        let fresh = e.create_collection("shop", "fresh").unwrap();
+        e.insert(&fresh, doc! { "_id": 1i64 }).unwrap();
+        sync(&e, &f);
+        assert!(fresh.created > at, "premise: the life is newer than the drop");
+        e.record_collection_drop(fresh.id, Stamp::new(at, origin)).unwrap();
+        let verdicts = exchange(&e, &f, None);
+        assert_eq!(compared(&verdicts, fresh.id), Some(true), "a drop at the cut: {verdicts:?}");
+        e.record_collection_drop(fresh.id, Stamp::new(Hlc::new(at.wall_ms + 1, 0), origin))
+            .unwrap();
+        let verdicts = exchange(&e, &f, None);
+        assert_eq!(
+            outcome_of(&verdicts, fresh.id),
+            Some(DigestOutcome::Deferred(Defer::Incarnation)),
+            "a drop one above the cut: {verdicts:?}"
+        );
+    }
+
+    /// A database tombstone defers a collection that was standing when the drop
+    /// was made (its sweep has not buried it here yet), and one the cut does not
+    /// cover; a collection created after a covered drop compares.
+    #[test]
+    fn a_database_tombstone_defers_an_older_life_or_an_uncovered_drop_and_not_a_newer_one() {
+        let (a, b, orders, items, _dirs) = converged();
+        let db_drop = kimmy_core::database_drop_id("shop");
+        let late = a.create_collection("shop", "late").unwrap();
+        a.insert(&late, doc! { "_id": 1i64 }).unwrap();
+        a.insert(&orders, doc! { "_id": 90i64 }).unwrap();
+        sync(&a, &b);
+        // The drop lands on A alone and above everything B has witnessed: the
+        // cut does not cover it, so every collection of the database defers.
+        let future = Stamp::new(Hlc::new(crate::physical_now_ms() + 60_000, 0), a.node_id());
+        a.record_database_tombstone_for_test(db_drop, future).unwrap();
+        let verdicts = exchange(&a, &b, None);
+        for id in [orders.id, items.id, late.id] {
+            assert_eq!(
+                outcome_of(&verdicts, id),
+                Some(DigestOutcome::Deferred(Defer::DatabaseTombstone)),
+                "an uncovered drop: {verdicts:?}"
+            );
+        }
+        // A covered drop, stamped before everything both have since written
+        // and after `orders` and `items` were created: `orders` and `items` were created
+        // before it and still stand, so they defer; `late` was created after.
+        let (c, d, orders, items, _dirs2) = converged();
+        let at_c = c.next_stamp();
+        let late = c.create_collection("shop", "late").unwrap();
+        c.insert(&late, doc! { "_id": 1i64 }).unwrap();
+        sync(&c, &d);
+        c.record_database_tombstone_for_test(db_drop, at_c).unwrap();
+        let verdicts = exchange(&c, &d, None);
+        for id in [orders.id, items.id] {
+            assert_eq!(
+                outcome_of(&verdicts, id),
+                Some(DigestOutcome::Deferred(Defer::DatabaseTombstone)),
+                "created before the drop: {verdicts:?}"
+            );
+        }
+        assert_eq!(compared(&verdicts, late.id), Some(true), "created after it: {verdicts:?}");
     }
 
     /// A drop whose purge is still owed holds the id: the creation of the
