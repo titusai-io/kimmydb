@@ -320,3 +320,89 @@ fn a_hint_is_a_meta_row_and_so_a_backup_carries_it() {
     let restored = Engine::open(&target).unwrap();
     assert_eq!(restored.refusal_hints(orders.id).unwrap().len(), 1);
 }
+
+/// The same for an index refusal: the replicated `CreateIndex` is not witnessed
+/// when its hint cannot be written, and is served again.
+#[test]
+fn an_index_refusal_whose_hint_cannot_be_written_fails_the_batch_too() {
+    let (a, _da) = engine();
+    let (b, _db) = engine();
+    a.create_collection("shop", "orders").unwrap();
+    b.create_collection("shop", "orders").unwrap();
+    b.create_index("shop", "orders", field("email"), false, Some("by_email".into())).unwrap();
+    let mut meta = b.get_collection("shop", "orders").unwrap();
+    meta.indexes[0].created = None;
+    {
+        let txn = b.begin_write(crate::WriterHolder::Ddl).unwrap();
+        Engine::put_collection_meta(&txn, &meta).unwrap();
+        txn.commit().unwrap();
+    }
+    later();
+    a.create_index("shop", "orders", field("email"), true, Some("by_email".into())).unwrap();
+    let start = b.version_vector().unwrap().behind(&a.version_vector().unwrap()).unwrap();
+    let entries = a.entries_for_peer(start, 1024, WalkScope::Background).unwrap().entries;
+    let id = CollectionId::derive("shop", "orders");
+    b.fail_next_hint_write_for_test();
+    let result = b.apply_batch(&entries);
+    assert!(result.is_err(), "the batch fails: {result:?}");
+    assert!(b.refusal_hints(id).unwrap().is_empty(), "and nothing was recorded");
+    let outcome = b.apply_batch(&entries).unwrap();
+    assert_eq!(outcome.ddl_refused, 1, "{outcome:?}");
+    assert_eq!(b.refusal_hints(id).unwrap().len(), 1);
+}
+
+/// A newer refusal replaces an older one for the same name, and an older never
+/// replaces a newer.
+#[test]
+fn an_older_refusal_never_replaces_a_newer_one() {
+    let (b, _db) = engine();
+    let orders = b.create_collection("shop", "orders").unwrap();
+    let node = kimmy_core::NodeId::from_bytes([5; 16]);
+    let at = |wall: u64| Stamp::new(kimmy_core::Hlc::new(wall, 0), node);
+    let hint = |wall: u64, hash: u128| {
+        crate::RefusalHint::new(orders.id, HintKind::Index, "x", at(wall), hash)
+    };
+    b.record_refusal_hint(&hint(900, 2)).unwrap();
+    b.record_refusal_hint(&hint(800, 1)).unwrap();
+    let held = b.refusal_hints(orders.id).unwrap();
+    assert_eq!((held[0].stamp, held[0].hash), (at(900), 2), "the older one was refused");
+    b.record_refusal_hint(&hint(1_000, 3)).unwrap();
+    let held = b.refusal_hints(orders.id).unwrap();
+    assert_eq!((held.len(), held[0].stamp, held[0].hash), (1, at(1_000), 3));
+}
+
+/// A collection's hints are the keys under its own id and no other: an id that
+/// begins another's digits is not in its range, and clearing one leaves the other.
+#[test]
+fn a_collections_hint_range_does_not_reach_a_neighbour_whose_id_begins_the_same() {
+    let (b, _db) = engine();
+    let stamp = Stamp::new(kimmy_core::Hlc::new(900, 0), kimmy_core::NodeId::from_bytes([5; 16]));
+    let (short, long) = (CollectionId(1), CollectionId(10));
+    for id in [short, long] {
+        b.record_refusal_hint(&crate::RefusalHint::new(id, HintKind::Index, "x", stamp, 1))
+            .unwrap();
+    }
+    assert_eq!(b.refusal_hints(short).unwrap().len(), 1, "only its own");
+    let txn = b.begin_write(crate::WriterHolder::Ddl).unwrap();
+    assert_eq!(Engine::clear_refusal_hints_in(&txn, short).unwrap(), 1);
+    txn.commit().unwrap();
+    assert_eq!(b.refusal_hints(long).unwrap().len(), 1, "the neighbour's stays");
+}
+
+/// The burial of a collection with a vector configuration clears the hints of its
+/// shadow as well: the shadow is a collection of its own with its own id.
+#[test]
+fn the_burial_clears_the_hints_of_the_collections_shadow() {
+    let (b, _db) = engine();
+    let orders = b.create_collection("shop", "orders").unwrap();
+    b.configure_vectors("shop", "orders", crate::definition_probe_tests::byo()).unwrap();
+    let shadow = CollectionId::derive("shop", &kimmy_core::vector_meta::shadow_name("orders"));
+    let stamp = Stamp::new(kimmy_core::Hlc::new(900, 0), kimmy_core::NodeId::from_bytes([5; 16]));
+    b.record_refusal_hint(&crate::RefusalHint::new(shadow, HintKind::Index, "x", stamp, 1))
+        .unwrap();
+    assert_eq!(b.refusal_hints(shadow).unwrap().len(), 1, "premise");
+    assert!(b.drop_collection("shop", "orders").unwrap());
+    b.finish_purges_now().unwrap();
+    assert!(b.refusal_hints(orders.id).unwrap().is_empty());
+    assert!(b.refusal_hints(shadow).unwrap().is_empty(), "the shadow's went with it");
+}

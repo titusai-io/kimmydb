@@ -134,6 +134,50 @@ proptest! {
     }
 }
 
+/// One change to a definition and the engine's own judgement of it. The
+/// independent pairs above almost never differ in only one part, so a part left
+/// out of the hash could go unseen for thousands of cases; here every pair is a
+/// definition and the same definition with one part changed.
+fn one_change() -> impl Strategy<Value = (IndexMeta, IndexMeta)> {
+    (definitions(), 0usize..7).prop_map(|(a, which)| {
+        let mut b = a.clone();
+        match which {
+            0 => b.unique = !b.unique,
+            1 => {
+                b.enforcement = match b.enforcement {
+                    Enforcement::Local => Enforcement::Coordinated,
+                    Enforcement::Coordinated => Enforcement::Local,
+                }
+            }
+            2 => b.fields[0].descending = !b.fields[0].descending,
+            3 => {
+                b.expire_after_secs = match b.expire_after_secs {
+                    None => Some(60),
+                    Some(_) => None,
+                }
+            }
+            4 => b.fields.reverse(),
+            5 => b.fields[0].path.push('z'),
+            _ => b.multikey = !b.multikey,
+        }
+        (a, b)
+    })
+}
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(2_000))]
+
+    #[test]
+    fn one_change_is_seen_by_the_hash_iff_the_engine_sees_it(pair in one_change()) {
+        let (a, b) = pair;
+        prop_assert_eq!(
+            a.differences(&b).is_empty(),
+            index_hash(&a) == index_hash(&b),
+            "{:?} against {:?}", a, b
+        );
+    }
+}
+
 /// The framing is injective on the pairs the property test is most likely to
 /// miss: strings that split differently, an option that is `None` against one
 /// that holds zero, and a missing filter against an empty one.
@@ -389,3 +433,169 @@ fn a_relaxed_stored_filter_and_its_canonical_rewrite_hash_alike() {
     assert_eq!(from_relaxed.indexes[0].partial_filter, from_canonical.indexes[0].partial_filter);
     assert_eq!(definition_digest(&from_relaxed), definition_digest(&from_canonical));
 }
+
+/// Strings in a list split differently: framed by length, so they do not hash alike.
+#[test]
+fn a_vector_configurations_fields_are_framed_by_length() {
+    let mut one = config(4);
+    one.fields = vec!["ab".into(), "c".into()];
+    let mut other = config(4);
+    other.fields = vec!["a".into(), "bc".into()];
+    assert_ne!(vector_hash(&one), vector_hash(&other));
+}
+
+/// The metric, the order of an index's fields and its direction are each part
+/// of the hash.
+#[test]
+fn a_metric_and_a_direction_are_part_of_the_hash() {
+    let mut euclid = config(4);
+    euclid.metric = Metric::Euclidean;
+    let mut dot = config(4);
+    dot.metric = Metric::Dot;
+    let hashes = [vector_hash(&config(4)), vector_hash(&euclid), vector_hash(&dot)];
+    assert_eq!(hashes.iter().collect::<std::collections::BTreeSet<_>>().len(), 3);
+    assert_ne!(
+        index_hash(&index("x", &[("a", false)])),
+        index_hash(&index("x", &[("a", true)])),
+        "ascending against descending"
+    );
+}
+
+/// Two names can share a derived id (a 32-bit hash). The list orders them by
+/// name, so the order the indexes were created in does not change the digest.
+#[test]
+fn two_names_sharing_a_derived_id_are_ordered_by_name_in_the_list() {
+    let mut seen: std::collections::HashMap<u32, String> = std::collections::HashMap::new();
+    let (first, second) = (0u32..)
+        .find_map(|n| {
+            let name = format!("n{n}");
+            seen.insert(IndexMeta::derive_id(&name), name.clone()).map(|earlier| (earlier, name))
+        })
+        .unwrap();
+    assert_eq!(IndexMeta::derive_id(&first), IndexMeta::derive_id(&second));
+    let a = collection(vec![index(&first, &[("a", false)]), index(&second, &[("b", false)])], None);
+    let b = collection(vec![index(&second, &[("b", false)]), index(&first, &[("a", false)])], None);
+    assert_eq!(definition_list(&a), definition_list(&b));
+    assert_eq!(definition_digest(&a), definition_digest(&b));
+}
+
+/// What is hashed and how it is framed is pinned to the byte: a change to either
+/// changes one of these and bumps `FORMAT` on purpose, so that two builds under
+/// different formats are never equal by accident.
+#[test]
+fn the_hash_of_a_definition_is_pinned() {
+    let full = {
+        let mut i = index("full", &[("a", true), ("bc", false)]);
+        i.unique = true;
+        i.enforcement = Enforcement::Coordinated;
+        i.expire_after_secs = Some(60);
+        i.partial_filter = Some(doc! { "n": { "$gte": 5_i64 } });
+        i
+    };
+    let with_provider = |provider: ProviderConfig| {
+        let mut c = config(4);
+        c.provider = provider;
+        c
+    };
+    let mut euclid = config(4);
+    euclid.metric = Metric::Euclidean;
+    let mut prefixed = config(4);
+    prefixed.document_prefix = Some("doc: ".into());
+    prefixed.query_prefix = Some("q: ".into());
+    prefixed.chunk.max_tokens = Some(512);
+    let rows: Vec<(&str, u128)> = vec![
+        ("index, one ascending field", index_hash(&index("x", &[("a", false)]))),
+        ("index, every part", index_hash(&full)),
+        ("vector, byo", vector_hash(&config(4))),
+        ("vector, euclidean", vector_hash(&euclid)),
+        ("vector, prefixes and tokens", vector_hash(&prefixed)),
+        (
+            "vector, openai bare",
+            vector_hash(&with_provider(ProviderConfig::OpenAi {
+                model: "m".into(),
+                endpoint: None,
+                api_key_env: "K".into(),
+                dimensions: None,
+            })),
+        ),
+        (
+            "vector, openai full",
+            vector_hash(&with_provider(ProviderConfig::OpenAi {
+                model: "m".into(),
+                endpoint: Some("http://e".into()),
+                api_key_env: "K".into(),
+                dimensions: Some(3),
+            })),
+        ),
+        (
+            "vector, ollama",
+            vector_hash(&with_provider(ProviderConfig::Ollama {
+                model: "m".into(),
+                endpoint: "http://e".into(),
+            })),
+        ),
+        (
+            "vector, custom http",
+            vector_hash(&with_provider(ProviderConfig::CustomHttp {
+                endpoint: "http://e".into(),
+                api_key_env: Some("K".into()),
+            })),
+        ),
+        (
+            "vector, cohere",
+            vector_hash(&with_provider(ProviderConfig::Cohere {
+                model: "m".into(),
+                endpoint: None,
+                api_key_env: "K".into(),
+            })),
+        ),
+        (
+            "vector, gemini",
+            vector_hash(&with_provider(ProviderConfig::Gemini {
+                model: "m".into(),
+                endpoint: None,
+                api_key_env: "K".into(),
+            })),
+        ),
+        ("vector, local", vector_hash(&with_provider(ProviderConfig::Local { model: "m".into() }))),
+        (
+            "vector, profile",
+            vector_hash(&with_provider(ProviderConfig::Profile { name: "p".into() })),
+        ),
+        (
+            "collection digest, two indexes and a vector",
+            definition_digest(&collection(
+                vec![index("x", &[("a", false)]), full.clone()],
+                Some(config(4)),
+            )),
+        ),
+        ("collection digest, nothing", definition_digest(&collection(vec![], None))),
+    ];
+    let seen: std::collections::BTreeSet<_> = rows.iter().map(|(_, h)| *h).collect();
+    assert_eq!(seen.len(), rows.len(), "every row is its own hash");
+    let pinned: Vec<(&str, &str)> = PINNED.to_vec();
+    let got: Vec<String> = rows.iter().map(|(_, h)| format!("{h:032x}")).collect();
+    for (((label, _), hash), (pinned_label, pinned_hash)) in rows.iter().zip(&got).zip(&pinned) {
+        assert_eq!(label, pinned_label);
+        assert_eq!(hash, pinned_hash, "{label}: the hash changed; bump FORMAT on purpose");
+    }
+    assert_eq!(rows.len(), pinned.len());
+}
+
+const PINNED: &[(&str, &str)] = &[
+    ("index, one ascending field", "5f25b9d4394c4cba08fe83bc0d9429f2"),
+    ("index, every part", "1d48112e1c1af1eec43c7e67839d1b06"),
+    ("vector, byo", "0f2efdd023aaef8abac84381ba73e1dc"),
+    ("vector, euclidean", "3984d435edcc9b0619d67973494530b4"),
+    ("vector, prefixes and tokens", "ab61cc2f6808cdbd1bfbaf6014604a83"),
+    ("vector, openai bare", "d7066f188398acc05d70a2084ccbe2a2"),
+    ("vector, openai full", "7e8cc2fb8bfe01c48698444c41789181"),
+    ("vector, ollama", "2f71ed8f93b6dcfd488b584f3cdfbd31"),
+    ("vector, custom http", "893d3a8fe58e32ee103bb8d3ea006c57"),
+    ("vector, cohere", "1aa9c5280f2f9296927134f13c18eabf"),
+    ("vector, gemini", "f35be752ab54d5de9fe6c7668468fb1c"),
+    ("vector, local", "6378081419d90e4f9cdeee7a3dfe3cdc"),
+    ("vector, profile", "cf61791578c5245637ef9a897f0efe0a"),
+    ("collection digest, two indexes and a vector", "322f3f2b3876e1535ea250485010131c"),
+    ("collection digest, nothing", "15ee0f80ffcf8fe7f57f0559e56a5427"),
+];
