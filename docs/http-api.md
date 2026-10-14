@@ -589,13 +589,19 @@ from its own life and keeps the ones the life itself wrote, so all members hold
 the same documents. In 0.48.x the members stayed different for good (counts that
 differ, `kimmy_sync_divergent_collections` above 0, and a repair that re-ran every
 few seconds and changed nothing). The advice for databases above still stands as
-the way to avoid the window altogether. **One case is still open, and divergent:** a write made through a member that
-still holds the *first* life, after the drop's stamp and before that member has
-applied the drop, is lost with that life on that member and kept on the members
-whose lives are newer; the members then stay different (counts that differ,
-`kimmy_sync_divergent_collections` above 0, a repair that re-runs and changes
-nothing). It is a known defect awaiting a decision, not behaviour to rely on
-(finding `kimmydb-a-write-made-after-a-drops-stamp-into-the-life-the-drop-destroys-is-lost-on-the-member-that-applies-the-drop-and-kept-on-the-members-whose-lives-are-newer`); the way to avoid it is not to write into a collection
+the way to avoid the window altogether. The indexes and the vector configuration the first life had made are removed
+from the newer life the same way. A member that stayed divergent past
+`storage.tombstone_retention_secs` is not healed by the start's sweep, which
+finds its work through the tombstones a member holds.
+
+**One case is still open, and divergent, and decided but not yet fixed:** a write
+made through a member that still holds the *first* life, after the drop's stamp
+and before that member has applied the drop, is lost with that life on that
+member and kept on the members whose lives are newer; the members then stay
+different (counts that differ, `kimmy_sync_divergent_collections` above 0, a
+repair that re-runs and changes nothing). The decision is that a drop will keep
+the writes stamped after it, so all members end with the write; the change is in
+progress (finding `kimmydb-a-write-made-after-a-drops-stamp-into-the-life-the-drop-destroys-is-lost-on-the-member-that-applies-the-drop-and-kept-on-the-members-whose-lives-are-newer`). Until it ships, do not write into a collection
 through a member that has not yet received its drop.
 
 **A drop is not atomic in one transaction, and it is atomic to a reader.**

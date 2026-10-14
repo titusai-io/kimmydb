@@ -875,8 +875,13 @@ mod tests {
             .unwrap();
             // A row whose header is garbage.
             let key = crate::docs::doc_key(&DocId::Int64(101)).unwrap();
-            docs.insert((id.0, key.as_slice()), b"x".as_slice()).unwrap();
             drop(docs);
+            // Written outside the counted path on purpose: a row that is not a
+            // record at all.
+            txn.open_table(tables::DOCS)
+                .unwrap()
+                .insert((id.0, key.as_slice()), b"x".as_slice())
+                .unwrap();
             txn.commit().unwrap();
         }
         let removed = b.sweep_late_drop("shop", "orders", dropped).unwrap();

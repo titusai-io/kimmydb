@@ -3024,3 +3024,58 @@ async fn two_starts_stopped_before_the_rebuild_leave_the_third_forced() {
     // third resumes; a rebuild either way, by the decision or by the store.
     assert!(line.contains(FORCED) || line.contains("resumed a walk this build stopped"), "{line}");
 }
+
+/// A start sweeps what a late drop left in a newer life before it serves
+/// (ADR-231): a store holding a document of the life before a drop this member
+/// holds, in a life created after it, serves without that document, and says so.
+/// At the level of a real start, not of the order of its calls.
+#[tokio::test]
+async fn a_start_serves_a_store_that_holds_the_stragglers_of_a_late_drop_without_them() {
+    let dir = tempfile::tempdir().unwrap();
+    let client = reqwest::Client::new();
+    let mut first = Run::spawn(dir.path(), "first");
+    first.wait_ready(&client).await;
+    first.signal("TERM");
+    assert!(first.wait_exit().success());
+
+    {
+        let engine =
+            kimmy_storage::Engine::open(&dir.path().join("data").join("kimmy.redb")).unwrap();
+        let on_b = engine.create_collection("shop", "orders").unwrap();
+        engine.insert(&on_b, bson::doc! { "_id": 2i64, "from": "b" }).unwrap();
+        let node = kimmy_core::NodeId::from_bytes([7; 16]);
+        let at = |ms: u64| kimmy_core::Stamp::new(kimmy_core::Hlc::new(ms, 0), node);
+        let straggler = kimmy_core::OplogEntry {
+            stamp: at(on_b.created.wall_ms - 20),
+            kind: kimmy_core::OpKind::Insert,
+            collection: on_b.id,
+            doc_id: Some(kimmy_core::DocId::Int64(1)),
+            body: Some(bson::serialize_to_vec(&bson::doc! { "_id": 1i64, "from": "a" }).unwrap()),
+        };
+        assert!(engine.apply_remote(&on_b, &straggler).unwrap());
+        // The drop this member holds, below its life: recorded as a member
+        // that predates the sweep recorded it, and not acted on.
+        engine.record_database_tombstone_for_test(on_b.id, at(on_b.created.wall_ms - 10)).unwrap();
+        let held = engine.get(&on_b, &kimmy_core::DocId::Int64(1)).unwrap();
+        assert!(held.is_some(), "premise: the straggler is in the newer life");
+    }
+
+    let mut second = Run::spawn(dir.path(), "second");
+    second.wait_ready(&client).await;
+    let token = root_token(&second, &client).await;
+    let status = |id: i64| {
+        let client = client.clone();
+        let url = format!("{}/v1/db/shop/coll/orders/docs/{id}", base(&second));
+        let token = token.clone();
+        async move { client.get(url).bearer_auth(&token).send().await.unwrap().status() }
+    };
+    assert_eq!(status(1).await, 404, "the straggler of the life before is served");
+    assert_eq!(status(2).await, 200, "the newer life's own document is missing");
+    let log = second.log();
+    assert!(
+        log.contains("swept what newer lives held of the lives before their drops, before serving"),
+        "{log}"
+    );
+    second.signal("TERM");
+    assert!(second.wait_exit().success());
+}

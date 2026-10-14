@@ -26750,18 +26750,29 @@ through another before replication catches up meets it, which a round-robin fron
    after it can only be a straggler of the life before: every write the member mints is above its `created`,
    and the creation was stamped by a clock that had witnessed what it replicated. The sweep runs on every
    member that learns of the drop and writes nothing to the oplog, so every member reaches the same state
-   without a new message. The collection's vector shadow is swept the same way.
+   without a new message. The collection's vector shadow is swept the same way. **The definitions the life
+   before brought are swept first**, by the replicated drop of each at the drop's stamp: every index whose
+   `created` is at or before the drop (its entries go with it, and its drop is recorded so that a create
+   re-delivered later is history), and a vector configuration changed at or before it (turned off at the
+   drop; the shadow's records are swept as its own collection). The same argument holds: a definition in a
+   life created after the drop, stamped at or before it, can only be the old life's. **The exception:** an
+   index with no `created` stamp (made before the stamp existed) is left, since it cannot be told from the
+   newer life's, and a vector configuration with no `vector_changed` likewise.
 2. **Where it runs.** The ignore branch of the replicated `DropCollection` arm, after the tombstone is
    recorded (a record that arrives while it runs is refused as history); the ignore branch of a snapshot's
    drop (`restore_collection_drop`); the survivors of a database drop (ADR-229's sweep, which has already given
    each survivor a tombstone at the drop's stamp); and a start (`reconcile_late_drops`, before the purger and
    the cluster, as the database reconcile is), which also heals a store left with stragglers by a build before
    this one.
-3. **The floor is the marker.** It is written last, in a commit of its own, so a sweep a stop cut short owes
-   again and the next call or start finishes it, and a store with nothing owed pays one pass over the
+3. **The floor is the marker.** It is written in the commit of the last chunk, so a sweep a stop cut short owes
+   again and the next call or start finishes it, and there is no instant at which the records are gone and the
+   floor is not, and a store with nothing owed pays one pass over the
    collection list at a start. A sweep of a collection with no stragglers is a read of its records and a floor.
-4. **Chunked and stop-aware.** A thousand records examined per write transaction (holder `Drop`), the stop
-   looked for between two. In an apply, a stop leaves the entry unappended and the next start redoes it, as
+4. **Chunked and stop-aware.** A thousand records or eight mebibytes examined per write transaction (holder
+   `Drop`), the stop looked for before each: an apply asks the engine's stop, **a start the open's** (a SIGTERM
+   at a start sets only that one, so a sweep of one large collection ends between two chunks and not after the
+   whole of it). A record whose header does not decode is left and counted, with one warning; one whose body
+   does not decode is removed without its index entries; neither fails the sweep or the start. In an apply, a stop leaves the entry unappended and the next start redoes it, as
    ADR-229's sweep does.
 5. **Streams are not sent deletes.** There is no entry to send; a stream that saw the straggler's insert passes
    over it by the floor, as it passes over the documents of a life before (ADR-229, item 7).
@@ -26775,24 +26786,30 @@ it is destroying. *Treat the two creations as one life* destroys the second memb
 **Cost and exposure.** A walk of the collection's headers once per collection that owes (at most once per
 drop, then the floor stops it), under the writer a chunk at a time. At the first start after upgrade, one
 pass over every collection that holds a tombstone and was created after it, within the tombstone retention
-(24 hours by default). **Mixed roll with 0.48.0:** a member without the rule keeps its stragglers, so the
+(24 hours by default). **The heal is bounded by that retention:** the reconcile finds work through the
+tombstones a member holds, so a store that stayed divergent past the retention is not healed by it. **Mixed roll with 0.48.0:** a member without the rule keeps its stragglers, so the
 divergence persists between old and new members until the roll completes; the start reconcile heals the
 upgraded member, and a member that is still divergent after the roll is healed by its own start.
 **Residuals.** (1) A straggler stamped at the drop's own `Hlc` by a node above the dropper's, arriving
 behind the cursor of a multi-chunk sweep that is still running, is refused by neither the tombstone (strict)
-nor the floor (set last) and stays: the same tie ADR-229 already names for databases. (2) **An open defect this rule does not close,
-pending Chris's decision:** a member D that still holds the old life and writes Z after the drop's stamp, then
+nor the floor (set in the last chunk) and stays: the same tie ADR-229 already names for databases. (2) **A defect this rule does not close, decided
+and in progress (Chris, 2026-10-13: a drop keeps the writes stamped after it):** a member D that still holds the old life and writes Z after the drop's stamp, then
 receives the drop, loses Z with the rest of that life, while members whose lives are newer keep Z (stamped
 after the drop). The members **stay different**: through three real loops the divergence gauge stays at 1 on
 all three and the count half's repair re-runs (6, 6 and 12 rounds in 32 s on A, B and D) without changing
-anything, A and B holding {2, 3} and D {2}. It is a different mechanism from this rule's, and any rule for it
-changes documented behaviour. Recorded as the finding `kimmydb-a-write-made-after-a-drops-stamp-into-the-life-the-drop-destroys-is-lost-on-the-member-that-applies-the-drop-and-kept-on-the-members-whose-lives-are-newer`; it is not an accepted limit. (3) A far-future stamp cannot trigger the sweep:
+anything, A and B holding {2, 3} and D {2}. It is a different mechanism from this rule's. Recorded as the
+finding `kimmydb-a-write-made-after-a-drops-stamp-into-the-life-the-drop-destroys-is-lost-on-the-member-that-applies-the-drop-and-kept-on-the-members-whose-lives-are-newer`; it is not an accepted limit, and its fix (the member applying a drop to its own older
+life removes only the records and definitions stamped at or before the drop, with the floor at the drop) is a
+separate change. (3) A far-future stamp cannot trigger the sweep:
 it runs only when the drop is *below* `created`.
 
 **Tests.** `late_drop.rs`: the reproducer converges and the floor stands at the drop; the newer life's own
 documents stay and a second sweep finds nothing; a database drop's survivor loses what it took in; the
 reconcile heals a store built with the stragglers and is done once; a sweep of more than a chunk stops between
-chunks, leaves the floor unset and finishes on the next call; a record at the drop's own `Hlc` goes and one
-after it stays; a member holding the old life (above). `snapshot.rs`: a page's late drop sweeps. `replication.rs`:
-through two real loops the members agree, the gauge returns to 0 and the repair ends. The node's source check
-that a start sweeps before the purger and the cluster.
+chunks, leaves the floor unset and finishes on the next call, and so does a stop at a start (the open's flag)
+in the middle of one large collection; a chunk is bounded by bytes too; the index entries of a swept document
+go with it; a record that does not decode does not stop the sweep; the life before's indexes and vector
+configuration are swept and a newer life's index stays; a record at the drop's own `Hlc` goes and one after it
+stays; a member holding the old life, whose own document of the life before is gone from all three. `snapshot.rs`: a page's late drop sweeps. `replication.rs`:
+through two real loops the members agree, the gauge returns to 0 and the repair ends. A real start serves a store holding
+the stragglers without them and logs the sweep.

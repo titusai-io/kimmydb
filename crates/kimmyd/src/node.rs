@@ -3398,18 +3398,6 @@ async fn shutdown_signal() {
 
 #[cfg(test)]
 mod tests {
-    /// A start sweeps what a late drop left behind, before it serves (ADR-231).
-    /// A source check, as the one below it is: the store's own tests drive the
-    /// reconcile, and what they cannot see is that a start calls it.
-    #[test]
-    fn a_start_sweeps_the_late_drops_before_it_serves() {
-        let source = include_str!("node.rs");
-        let call = source.find("engine.reconcile_late_drops()").expect("the reconcile is called");
-        let purger = source.find("spawn_drop_purger(Arc::clone(&engine)").expect("the purger");
-        let cluster = source.find("let cluster = spawn_cluster(").expect("the cluster");
-        assert!(call < purger && call < cluster, "it must run before the purger and the cluster");
-    }
-
     /// The open that returns says the rebuild completed, so an exit of this
     /// run before `settle` stops passing the decision to force on (the marker
     /// an exit writes is a function of whether the rebuild completed, B3 review
