@@ -55,6 +55,8 @@ pub(crate) mod hooks {
     use std::cell::Cell;
 
     thread_local! {
+        /// How many drops on this thread took the survivors path.
+        static SURVIVORS_PATHS: Cell<usize> = const { Cell::new(0) };
         /// Ask the open to stop (as a SIGTERM at a start does) once this many
         /// chunks have committed on this thread.
         static STOP_THE_OPEN_AFTER: Cell<Option<usize>> = const { Cell::new(None) };
@@ -62,6 +64,15 @@ pub(crate) mod hooks {
 
     pub(crate) fn stop_the_open_after_chunks(chunks: usize) {
         STOP_THE_OPEN_AFTER.with(|c| c.set(Some(chunks)));
+    }
+
+    pub(super) fn took_the_survivors_path() {
+        SURVIVORS_PATHS.with(|c| c.set(c.get() + 1));
+    }
+
+    /// Drops that took the survivors path on this thread so far.
+    pub(crate) fn survivors_paths() -> usize {
+        SURVIVORS_PATHS.with(|c| c.get())
     }
 
     pub(super) fn after_a_chunk() {
@@ -208,7 +219,18 @@ impl Engine {
                     .map_or(0, |count| count.value())
                     .saturating_sub(chunk.removed as u64);
                 let redated = standing.is_redated();
-                if redated && live == 0 && !holds_a_definition_stamped_after(&standing, dropped.hlc)
+                // A shadow is the parent's: while the parent stands with a vector
+                // configuration the shadow stands too, empty if need be.
+                let configured_parent = match kimmy_core::vector_meta::base_name(&standing.name) {
+                    Some(base) => {
+                        read_collection(&txn, db, base)?.is_some_and(|p| p.vector.is_some())
+                    }
+                    None => false,
+                };
+                if redated
+                    && live == 0
+                    && !configured_parent
+                    && !holds_a_definition_stamped_after(&standing, dropped.hlc)
                 {
                     survived = false;
                     buried = Some(self.bury_redated_in_txn(&txn, &standing, dropped)?);
@@ -477,6 +499,8 @@ impl Engine {
             Engine::put_collection_meta(&txn, shadow)?;
         }
         txn.commit()?;
+        #[cfg(test)]
+        hooks::took_the_survivors_path();
         crate::database_tombstone::Notify::Each.buried(self, db, name, &ids);
         let end = self.sweep_until(db, name, dropped, stop)?;
         if end.survived && self.get_collection(db, &shadow_name).is_ok() {

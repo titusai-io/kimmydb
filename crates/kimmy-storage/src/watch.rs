@@ -3859,6 +3859,94 @@ mod tests {
         assert_eq!(resolved.incarnation_floor, Some((x.id, dropped_at)), "the floor is kept");
     }
 
+    /// A member `a` creates `app.x` with a document and drops it; `e`, which had
+    /// the life, writes `o` after the drop and then takes the drop: the life it
+    /// keeps is re-dated above the drop (ADR-231, extended) and has no creation
+    /// entry. Returns the drop's tombstone.
+    fn a_kept_life_on(engine: &Engine) -> (CollectionId, Stamp, tempfile::TempDir) {
+        let dir = tempfile::tempdir().unwrap();
+        let a = Engine::open(&dir.path().join("a.redb")).unwrap();
+        let pull = |into: &Engine, from: &Engine| {
+            let mine = into.version_vector().unwrap();
+            if let Some(start) = mine.behind(&from.version_vector().unwrap()) {
+                let entries =
+                    from.entries_for_peer(start, 4_096, crate::WalkScope::Background).unwrap();
+                into.apply_batch(&entries.entries).unwrap();
+            }
+        };
+        let on_a = a.create_collection("app", "x").unwrap();
+        a.insert(&on_a, doc! { "_id": "old" }).unwrap();
+        pull(engine, &a);
+        assert!(a.drop_collection("app", "x").unwrap());
+        std::thread::sleep(std::time::Duration::from_millis(5));
+        let on_e = engine.get_collection("app", "x").unwrap();
+        engine.insert(&on_e, doc! { "_id": "o" }).unwrap();
+        pull(engine, &a);
+        let dropped = engine.collection_dropped_at(on_a.id).unwrap().expect("the drop is held");
+        (on_a.id, dropped, dir)
+    }
+
+    /// D-5. A life a collection's drop kept has no creation entry, and a stream
+    /// opened with no token on it is placed by the arrival the sweep recorded:
+    /// a few rows however long the log, and it hears the write kept and nothing
+    /// of the life before.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_tokenless_open_on_a_kept_life_does_not_walk_the_log_and_hears_only_what_was_kept() {
+        let (engine, _coll, _dir) = setup();
+        an_old_oplog(&engine, 4_000);
+        let (id, dropped, _a_dir) = a_kept_life_on(&engine);
+        let kept = engine.get_collection("app", "x").unwrap();
+        assert!(kept.is_redated(), "premise: re-dated");
+        assert!(kept.created > dropped.hlc);
+        let first =
+            kept.redated_first_arrival(kept.created).expect("the sweep recorded an arrival");
+
+        let (resolved, walked) = open_from_start(&engine, id);
+        assert!(walked.rows <= 4, "the open read {} rows of a 4,000-entry log", walked.rows);
+        assert_eq!(resolved.start, first);
+        assert_eq!(resolved.incarnation_floor, Some((id, dropped)));
+
+        let from_start = WatchOptions { resume_after: None, start_at: Some(Hlc::ZERO) };
+        let mut stream = engine.watch(WatchScope::Collection(id), from_start).unwrap();
+        let heard =
+            tokio::time::timeout(std::time::Duration::from_millis(500), stream.next(&engine))
+                .await
+                .expect("the write kept is heard");
+        let Some(ChangeEvent::Change { entry, .. }) = heard else {
+            panic!("expected the kept write, heard {heard:?}")
+        };
+        assert_eq!(entry.kind, OpKind::Insert);
+        assert_eq!(entry.doc_id, Some(kimmy_core::DocId::String("o".into())));
+        let more =
+            tokio::time::timeout(std::time::Duration::from_millis(300), stream.next(&engine)).await;
+        assert!(more.is_err(), "nothing of the life before is heard: {more:?}");
+    }
+
+    /// A marker left for another `created` (the life was re-dated again, or
+    /// re-created, since) is not read: the open falls back to the walk and still
+    /// places the stream.
+    #[test]
+    fn a_marker_of_another_created_is_ignored_by_a_tokenless_open() {
+        let (engine, _coll, _dir) = setup();
+        let (id, dropped, _a_dir) = a_kept_life_on(&engine);
+        let mut kept = engine.get_collection("app", "x").unwrap();
+        let recorded = kept.redated.expect("premise").first_arrival.expect("premise");
+        kept.redated = kept.redated.map(|r| crate::meta::Redated {
+            created: Hlc::new(r.created.wall_ms + 1, 0),
+            first_arrival: Some(recorded + 1_000_000),
+            ..r
+        });
+        {
+            let txn = engine.begin_write(crate::WriterHolder::Ddl).unwrap();
+            Engine::put_collection_meta(&txn, &kept).unwrap();
+            txn.commit().unwrap();
+        }
+        let (resolved, walked) = open_from_start(&engine, id);
+        assert!(resolved.start < recorded + 1_000_000, "the stale position was used");
+        assert!(walked.walks > 0, "placed by the walk instead");
+        assert_eq!(resolved.incarnation_floor, Some((id, dropped)));
+    }
+
     /// A collection that arrived before the tombstone's entry did (a survivor of
     /// a database's drop) is placed by the stamps: what of its life arrived
     /// before the sentinel is only recognisable by them, and the position after
