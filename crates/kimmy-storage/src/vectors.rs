@@ -88,11 +88,13 @@ pub(crate) enum Configured {
 }
 
 impl Configured {
-    /// Whether this change is a snapshot page's **dated** one: a winner by stamp, from a
-    /// sender whose own coverage names it (ADR-163, ADR-226), so the history behind it
-    /// is the sender's and cannot be replayed here.
-    fn is_a_dated_page(self) -> bool {
-        matches!(self, Self::FromSnapshot(Some(_)))
+    /// Whether this change comes **dated from another member**: a snapshot page's
+    /// (a winner by stamp, from a sender whose own coverage names it, ADR-163,
+    /// ADR-226) or a replicated entry's, so the history behind it is the origin's
+    /// and cannot be replayed here. Never a local change, which mints its own stamp
+    /// and is a client's request to be refused or not on this member's state.
+    fn is_dated_from_elsewhere(self) -> bool {
+        matches!(self, Self::FromSnapshot(Some(_)) | Self::FromEntry(_))
     }
 
     /// The stamp of the change this applies, when it comes with one from another
@@ -186,20 +188,23 @@ impl crate::Engine {
             // explicit drop, or search would quietly serve from a shrinking
             // remnant of the old width while nothing replaces it.
             //
-            // **Not for a dated page** (ADR-227). The sender cannot have made this change
-            // in place either: it turned the configuration off between the two, and the
-            // entries that say so are exactly what a page stands in for. Applied here as
-            // that history reads: the configuration off and on again, one change, in this
+            // **Not for a dated change from elsewhere** (ADR-227): a page's, or an entry's.
+            // The origin cannot have made this change in place either: it turned the
+            // configuration off between the two, and the entries that say so are what a
+            // page stands in for, and are what an entry that arrives without them (the off
+            // lost on its stamp to a change made here, or not yet applied) presupposes.
+            // Applied here as that history reads: the configuration off and on again, one change, in this
             // transaction, so the dimension changes with nothing to drop and no window in
             // which the collection is without one. The stored vectors are left as they
             // are, as for an entry's off (`drop_vectors` is never a peer's to decide), and
             // the new width skips them. Judged below the history check and the
-            // last-writer-wins guard, so a page that loses changes nothing, and for a
-            // dated page only: one with no stamp is not a winner and never overrides.
+            // last-writer-wins guard, so a change that loses changes nothing, and for a
+            // dated one only: a page with no stamp is not a winner and never overrides,
+            // and a local change is refused as it always was.
             if let Some(existing) = &meta.vector
                 && existing.dim != config.dim
                 && !config.provider.embeds_server_side()
-                && !by.is_a_dated_page()
+                && !by.is_dated_from_elsewhere()
             {
                 return Err(StorageError::Core(CoreError::InvalidQuery(format!(
                     "vector dimension cannot change from {} to {} in place for client-supplied \

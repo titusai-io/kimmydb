@@ -81,6 +81,9 @@ mod refusal_hint_tests;
 mod snapshot_stamp_tests;
 
 #[cfg(test)]
+mod vector_width_tests;
+
+#[cfg(test)]
 mod log_capture;
 #[cfg(feature = "test-hooks")]
 pub use live_walk::stop_open_after_rows_for_test;
