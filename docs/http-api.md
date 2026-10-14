@@ -622,7 +622,8 @@ by the chunk) a read of the collection still shows documents stamped before the
 drop and counts them; the change streams open on the collection end when the
 drop reaches it, and a stream opened afterwards without a resume token may
 begin at a document's latest version rather than at the insert that created
-it.
+it, and may not hear a definition (an index created, say) that arrived before the
+first document the life kept.
 
 **A drop is not atomic in one transaction, and it is atomic to a reader.**
 The collection's definition and its tombstone go in the drop's first commit and

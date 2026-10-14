@@ -97,6 +97,13 @@ pub struct Redated {
     /// entry is still held.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub first_arrival: Option<u64>,
+    /// The arrival position the next entry took when the life was re-dated:
+    /// nothing written after the first commit sits below it, so the sweep, which
+    /// reads the records that are there when it passes them, takes the lower of
+    /// this and what it saw. A record that lands in a range already passed
+    /// still has its entry at or above this.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub arrivals_from: Option<u64>,
 }
 
 impl CollectionMeta {
@@ -173,6 +180,7 @@ mod tests {
             from: Hlc::new(10, 0),
             created: Hlc::new(20, 0),
             first_arrival: Some(7),
+            arrivals_from: None,
         });
         assert!(m.is_redated());
         assert_eq!(m.redated_first_arrival(Hlc::new(20, 0)), Some(7));

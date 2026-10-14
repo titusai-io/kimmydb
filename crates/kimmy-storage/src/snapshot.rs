@@ -1582,21 +1582,20 @@ impl Engine {
             // The tombstone rule above, judged again under the writer.
             let history =
                 |dropped: Stamp| state.created.is_none_or(|created| created <= dropped.hlc);
-            match self.create_collection_inner(
+            // A re-dated life arrives with the creation it was re-dated from, and
+            // is created with it in the one transaction, so that a database's
+            // drop this node learns of after this page buries it as it buries
+            // the sender's, and no stop leaves it standing without the marker.
+            let redated_from = state.redated_from.filter(|_| state.created.is_some());
+            match self.create_collection_marked(
                 &state.db,
                 &state.name,
                 false,
                 state.created,
                 &history,
+                redated_from,
             ) {
-                Ok(Some(_)) => {
-                    // A re-dated life arrives with the creation it was re-dated
-                    // from, so that a database's drop this node learns of after
-                    // this page buries it as it buries the sender's.
-                    if let (Some(from), Some(created)) = (state.redated_from, state.created) {
-                        self.mark_restored_life_redated(&state.db, &state.name, from, created)?;
-                    }
-                }
+                Ok(Some(_)) => {}
                 Ok(None) => {
                     #[cfg(test)]
                     crate::sync::race_hooks::absorbed(crate::sync::race_hooks::Race::Restore);

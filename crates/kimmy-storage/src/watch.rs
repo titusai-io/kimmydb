@@ -388,7 +388,7 @@ impl Engine {
     }
 
     /// The arrival position of the entry stamped `stamp`, if this node holds it.
-    fn arrival_of(&self, stamp: &Stamp) -> Result<Option<u64>> {
+    pub(crate) fn arrival_of(&self, stamp: &Stamp) -> Result<Option<u64>> {
         let txn = self.db().begin_read()?;
         let by_stamp = txn.open_table(tables::OPLOG_ARRIVAL_SEQ)?;
         Ok(by_stamp.get(codec::oplog_key(stamp).as_slice())?.map(|seq| seq.value()))

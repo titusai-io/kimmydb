@@ -606,3 +606,193 @@ fn a_drop_interrupted_after_its_first_commit_and_delivered_again_appends_its_ent
     assert_eq!(docs_of(&d, "orders", &[1, 3]), vec![3]);
     assert_counts_exact(&d, "a redelivered interrupted drop");
 }
+
+// -- Review fixes -------------------------------------------------------------
+
+/// m-2. A stream open on the collection ends at the first commit, as at a
+/// burial: a client that saw the documents of the life before must be told they
+/// are going, and the collection standing does not say so.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_stream_open_on_the_collection_ends_when_the_drop_reaches_the_survivors_path() {
+    use crate::{ChangeEvent, InvalidateReason, WatchOptions, WatchScope};
+
+    let (a, d, _da, _dd, id) = a_and_d_holding_the_old_life();
+    assert!(a.drop_collection("shop", "orders").unwrap());
+    later();
+    let on_d = d.get_collection("shop", "orders").unwrap();
+    d.insert(&on_d, doc! { "_id": 3i64 }).unwrap();
+    let mut stream = d.watch(WatchScope::Collection(id), WatchOptions::default()).unwrap();
+    let before = hooks::survivors_paths();
+    let start = d.version_vector().unwrap().behind(&a.version_vector().unwrap()).unwrap();
+    let entries = a.entries_for_peer(start, BATCH, WalkScope::Background).unwrap().entries;
+    d.apply_batch(&entries).unwrap();
+    assert_eq!(hooks::survivors_paths(), before + 1, "premise: the survivors path");
+    let heard = tokio::time::timeout(Duration::from_millis(1_000), stream.next(&d))
+        .await
+        .expect("the stream hears the drop");
+    assert!(
+        matches!(
+            heard,
+            Some(ChangeEvent::Invalidate { reason: InvalidateReason::CollectionDropped })
+        ),
+        "{heard:?}"
+    );
+}
+
+/// n3. A write that lands in a range of the collection the sweep has already
+/// passed, between two chunks, has its entry at or above the position the first
+/// commit read; the minimum the sweep records cannot sit above it. Here the only
+/// kept record the sweep sees is stamped after that write.
+#[test]
+fn a_write_landing_behind_the_sweeps_cursor_is_not_below_the_recorded_first_arrival() {
+    let (a, d, _da, _dd, id) = a_and_d_holding_the_old_life();
+    // More than a chunk of the life before, so the sweep takes two.
+    let on_a = a.get_collection("shop", "orders").unwrap();
+    let docs: Vec<_> = (1_000..2_400i64).map(|i| doc! { "_id": i }).collect();
+    a.insert_many(&on_a, docs).unwrap();
+    sync(&a, &d);
+    assert!(a.drop_collection("shop", "orders").unwrap());
+    later();
+    // The only thing the life keeps at the first commit is a definition.
+    d.create_index("shop", "orders", vec![IndexField::ascending("k")], false, Some("k_1".into()))
+        .unwrap();
+    let on_d = d.get_collection("shop", "orders").unwrap();
+    // After the first chunk: W lands in the range already passed, then K in the
+    // range ahead. K's entry arrives after W's.
+    let landing = Arc::new(d);
+    let writer = Arc::clone(&landing);
+    let (w_stamp, k_stamp) = {
+        let cell = std::rc::Rc::new(std::cell::RefCell::new(None));
+        let into = std::rc::Rc::clone(&cell);
+        let on_d = on_d.clone();
+        hooks::run_after_the_next_chunk(move || {
+            let (_, w) = writer.insert_stamped(&on_d, doc! { "_id": 0i64 }).unwrap();
+            let (_, k) = writer.insert_stamped(&on_d, doc! { "_id": 99_999i64 }).unwrap();
+            *into.borrow_mut() = Some((w, k));
+        });
+        let start = landing.version_vector().unwrap().behind(&a.version_vector().unwrap()).unwrap();
+        let entries = a.entries_for_peer(start, BATCH, WalkScope::Background).unwrap().entries;
+        landing.apply_batch(&entries).unwrap();
+        cell.take().expect("the sweep ran more than one chunk")
+    };
+    let kept = landing.get_collection("shop", "orders").unwrap();
+    assert!(kept.is_redated(), "premise");
+    let first = kept.redated_first_arrival(kept.created).expect("recorded");
+    let arrival_of = |at: kimmy_core::Stamp| landing.arrival_of(&at).unwrap().unwrap();
+    assert!(arrival_of(w_stamp) < arrival_of(k_stamp), "premise: W arrived before K");
+    assert!(
+        first <= arrival_of(w_stamp),
+        "first arrival {first} is above the entry of the write that landed behind the cursor"
+    );
+    let _ = id;
+}
+
+/// n4. Installing a re-dated definition from a page costs no commit more than
+/// installing an ordinary one: the marker is written with the creation, so a
+/// stop cannot leave the life standing without it.
+#[test]
+fn a_re_dated_definition_is_installed_with_its_marker_in_the_one_commit() {
+    let (a, m, _da, _dm, id) = a_and_d_holding_the_old_life();
+    assert!(a.drop_collection("shop", "orders").unwrap());
+    later();
+    let on_m = m.get_collection("shop", "orders").unwrap();
+    m.insert(&on_m, doc! { "_id": 3i64 }).unwrap();
+    let start = m.version_vector().unwrap().behind(&a.version_vector().unwrap()).unwrap();
+    let entries = a.entries_for_peer(start, BATCH, WalkScope::Background).unwrap().entries;
+    m.apply_batch(&entries).unwrap();
+    let kept = m.get_collection("shop", "orders").unwrap();
+    assert!(kept.is_redated(), "premise");
+
+    let ordinary = |e: &Engine| {
+        let page = e.snapshot_page(None, Some(CollectionId::derive("shop", "other"))).unwrap();
+        (e.commits(), page)
+    };
+    let (p, _dp) = engine();
+    let (q, _dq) = engine();
+    let plain = q.create_collection("shop", "other").unwrap();
+    q.insert(&plain, doc! { "_id": 1i64 }).unwrap();
+    let (_, plain_page) = ordinary(&q);
+    let redated_page = m.snapshot_page(None, Some(id)).unwrap();
+    assert!(redated_page.collections[0].redated_from.is_some(), "premise: the page says so");
+    assert!(plain_page.collections[0].redated_from.is_none(), "premise");
+
+    let (r, _dr) = engine();
+    let before = r.commits();
+    r.apply_snapshot_page(
+        q.node_id(),
+        &mut SnapshotProgress::of_collection(CollectionId::derive("shop", "other")),
+        &plain_page,
+    )
+    .unwrap();
+    let ordinary_cost = r.commits() - before;
+    let before = p.commits();
+    p.apply_snapshot_page(m.node_id(), &mut SnapshotProgress::of_collection(id), &redated_page)
+        .unwrap();
+    let marked_cost = p.commits() - before;
+    assert_eq!(marked_cost, ordinary_cost, "the marker took a commit of its own");
+    let installed = p.get_collection("shop", "orders").unwrap();
+    assert_eq!(installed.redated.map(|r| r.from), kept.redated.map(|r| r.from));
+    assert!(installed.is_redated());
+}
+
+/// m-1/B: a vector configuration made after the drop is a write after it: the
+/// collection stands with its configuration and its shadow even with no document
+/// stamped after the drop.
+#[test]
+fn a_vector_configuration_made_after_the_drop_keeps_the_collection_and_its_shadow() {
+    let (a, m, _da, _dm) = a_and_d_holding_a_vector_collection();
+    assert!(a.drop_collection("shop", "orders").unwrap());
+    later();
+    m.configure_vectors("shop", "orders", byo_config()).unwrap();
+    let before = hooks::survivors_paths();
+    quiesce(&[&a, &m]);
+    assert_eq!(
+        hooks::survivors_paths(),
+        before + 1,
+        "a configuration after the drop is not buried"
+    );
+    assert!(m.get_collection("shop", "orders").unwrap().vector.is_some());
+    assert!(holds(&m, &kimmy_core::vector_meta::shadow_name("orders")), "and its shadow");
+    assert_eq!(docs_of(&m, "orders", &[1]), Vec::<i64>::new());
+    assert_counts_exact(&m, "a configuration kept");
+}
+
+/// B: a kept parent whose vector configuration stands keeps its shadow when the
+/// sweep leaves it empty.
+#[test]
+fn the_shadow_of_a_configured_parent_stands_empty() {
+    let (a, m, _da, _dm) = a_and_d_holding_a_vector_collection();
+    assert!(a.drop_collection("shop", "orders").unwrap());
+    later();
+    m.configure_vectors("shop", "orders", byo_config()).unwrap();
+    let on_m = m.get_collection("shop", "orders").unwrap();
+    m.insert(&on_m, doc! { "_id": 5i64 }).unwrap();
+    quiesce(&[&a, &m]);
+    assert!(m.get_collection("shop", "orders").unwrap().vector.is_some());
+    assert!(holds(&m, &kimmy_core::vector_meta::shadow_name("orders")));
+    assert_counts_exact(&m, "an empty shadow of a configured parent");
+}
+
+/// A chunk whose document is not here is undecided: one made from a version
+/// after the drop may be on its way from another origin and stays; one made from
+/// a version at or before the drop can never arrive live in this life and goes.
+#[test]
+fn a_chunk_whose_document_is_not_here_stays_if_made_after_the_drop_and_goes_if_not() {
+    let (a, d, _da, _dd) = a_and_d_holding_a_vector_collection();
+    assert!(a.drop_collection("shop", "orders").unwrap());
+    later();
+    let on_d = d.get_collection("shop", "orders").unwrap();
+    // Something after the drop, so the survivors path is taken.
+    d.insert(&on_d, doc! { "_id": 9i64 }).unwrap();
+    let shadow = d.get_collection("shop", &kimmy_core::vector_meta::shadow_name("orders")).unwrap();
+    let after_the_drop = d.version_vector().unwrap().get(d.node_id());
+    // Documents 7 and 8 are not in the parent here. 7's chunk was made from a
+    // version before the drop, 8's from one after it.
+    d.put_vectors(&shadow, &DocId::Int64(7), &[chunk_of(7, on_d.created)]).unwrap();
+    d.put_vectors(&shadow, &DocId::Int64(8), &[chunk_of(8, after_the_drop)]).unwrap();
+    quiesce(&[&a, &d]);
+    let shadow = d.get_collection("shop", &kimmy_core::vector_meta::shadow_name("orders")).unwrap();
+    assert!(d.get_vectors(&shadow, &DocId::Int64(7)).unwrap().is_empty(), "history never arrives");
+    assert_eq!(d.get_vectors(&shadow, &DocId::Int64(8)).unwrap().len(), 1, "may still arrive");
+    assert_counts_exact(&d, "undecided chunks");
+}

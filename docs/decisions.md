@@ -26811,9 +26811,10 @@ the stragglers without them and logs the sweep.
 
 > Ruled by Chris, 2026-10-13: (1) a collection can **reappear** after its drop, because a write stamped after
 > the drop reached a member that had not seen it, and (2) this is for **collection** drops only: a database's
-> drop stays exactly as ADR-229 documents it. No table, schema, wire field, backup tag or entry kind changed
-> (the one new field is on the collection's stored metadata and is ignored by a build that does not know it),
-> so it is not a rollback boundary; it rides 0.49.0.
+> drop stays exactly as ADR-229 documents it. No required wire field, table, schema, backup tag or entry kind
+> changed. Two optional fields are added that a build without them ignores: `redated` on the collection's stored
+> metadata and `redated_from` on a snapshot page's collection definition (an additive optional field). Not a
+> rollback boundary; it rides 0.49.0.
 
 **The defect.** A member D that still holds the life the drop is aimed at, and writes Z after the drop's stamp,
 used to destroy the whole life when it received the drop: Z went with it, while the members whose lives are newer

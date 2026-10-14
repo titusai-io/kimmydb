@@ -57,6 +57,10 @@ pub(crate) mod hooks {
     thread_local! {
         /// How many drops on this thread took the survivors path.
         static SURVIVORS_PATHS: Cell<usize> = const { Cell::new(0) };
+        /// Run once after the next chunk commits on this thread: where a write
+        /// lands in the middle of a sweep.
+        static AFTER_A_CHUNK: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
+            const { std::cell::RefCell::new(None) };
         /// Ask the open to stop (as a SIGTERM at a start does) once this many
         /// chunks have committed on this thread.
         static STOP_THE_OPEN_AFTER: Cell<Option<usize>> = const { Cell::new(None) };
@@ -75,7 +79,14 @@ pub(crate) mod hooks {
         SURVIVORS_PATHS.with(|c| c.get())
     }
 
+    pub(crate) fn run_after_the_next_chunk(f: impl FnOnce() + 'static) {
+        AFTER_A_CHUNK.with(|c| *c.borrow_mut() = Some(Box::new(f)));
+    }
+
     pub(super) fn after_a_chunk() {
+        if let Some(f) = AFTER_A_CHUNK.with(|c| c.borrow_mut().take()) {
+            f();
+        }
         STOP_THE_OPEN_AFTER.with(|c| match c.get() {
             Some(1) => {
                 c.set(None);
@@ -236,7 +247,10 @@ impl Engine {
                     buried = Some(self.bury_redated_in_txn(&txn, &standing, dropped)?);
                 } else {
                     if redated && let Some(marker) = standing.redated.as_mut() {
-                        marker.first_arrival = first_arrival;
+                        marker.first_arrival = match (first_arrival, marker.arrivals_from) {
+                            (Some(seen), Some(seed)) => Some(seen.min(seed)),
+                            (seen, seed) => seen.or(seed),
+                        };
                     }
                     standing.incarnation_floor = Some(dropped.hlc);
                     Engine::put_collection_meta(&txn, &standing)?;
@@ -375,7 +389,12 @@ impl Engine {
                 }
                 let orphaned = stamp.hlc > dropped.hlc
                     && parent.is_some_and(|parent| {
-                        crate::vectors::chunk_has_no_live_parent(&docs, parent, value.value())
+                        crate::vectors::chunk_has_no_live_parent(
+                            &docs,
+                            parent,
+                            dropped.hlc,
+                            value.value(),
+                        )
                     });
                 if stamp.hlc <= dropped.hlc || orphaned {
                     let document = codec::decode_doc_record(value.value())
@@ -492,7 +511,13 @@ impl Engine {
                 }
             }
         }
+        // Nothing written after this commit has its entry below this position,
+        // whatever range of the collection the sweep has already passed.
+        let next = next_arrival_in(&txn)?;
         redate(&mut meta, dropped.hlc);
+        if let Some(marker) = meta.redated.as_mut() {
+            marker.arrivals_from = Some(next);
+        }
         Engine::put_collection_meta(&txn, &meta)?;
         if let Some(shadow) = shadow.as_mut() {
             redate(shadow, dropped.hlc);
@@ -561,28 +586,6 @@ impl Engine {
             shadow,
             Some(dropped),
         )
-    }
-
-    /// A life restored from a page that says it was re-dated from `from`
-    /// carries the marker, with no first arrival (this node's log is its own).
-    /// Only if the life standing under the name is the one restored.
-    pub(crate) fn mark_restored_life_redated(
-        &self,
-        db: &str,
-        name: &str,
-        from: Hlc,
-        created: Hlc,
-    ) -> Result<()> {
-        let txn = self.begin_write_as(WriterHolder::Ddl, crate::engine::Continuing::No)?;
-        let standing = read_collection(&txn, db, name)?.filter(|meta| meta.created == created);
-        let Some(mut standing) = standing else {
-            txn.abort()?;
-            return Ok(());
-        };
-        standing.redated = Some(crate::meta::Redated { from, created, first_arrival: None });
-        Engine::put_collection_meta(&txn, &standing)?;
-        txn.commit()?;
-        Ok(())
     }
 
     /// A database's tombstone `dropped` covers the re-dated life `standing` if
@@ -683,6 +686,12 @@ impl Engine {
     }
 }
 
+/// The arrival position the next entry appended to this node's log will take.
+fn next_arrival_in(txn: &redb::WriteTransaction) -> Result<u64> {
+    let arrival = txn.open_table(tables::OPLOG_ARRIVAL)?;
+    Ok(arrival.last()?.map_or(0, |(seq, _)| seq.value() + 1))
+}
+
 /// What a replicated collection drop did to the collection.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Dropped {
@@ -699,7 +708,12 @@ pub(crate) enum Dropped {
 fn redate(meta: &mut CollectionMeta, dropped: Hlc) {
     let from = meta.redated.filter(|r| r.created == meta.created).map_or(meta.created, |r| r.from);
     meta.created = dropped.successor();
-    meta.redated = Some(crate::meta::Redated { from, created: meta.created, first_arrival: None });
+    meta.redated = Some(crate::meta::Redated {
+        from,
+        created: meta.created,
+        first_arrival: None,
+        arrivals_from: None,
+    });
 }
 
 /// Whether a definition of `standing` is stamped after `dropped`: an index, or
@@ -1083,6 +1097,29 @@ mod tests {
         assert_eq!(standing.incarnation_floor, Some(dropped.hlc));
         assert_eq!(b.count_by_id(id).unwrap(), Some(1));
         assert_counts_exact(&b, "the survivors path");
+    }
+
+    /// A second drop over a life already re-dated keeps the first `from`: it is
+    /// the creation a database's drop is judged by. A marker left for another
+    /// `created` (the life was made again since) starts over.
+    #[test]
+    fn a_second_re_date_keeps_the_first_creation() {
+        let mut meta = CollectionMeta::new(
+            CollectionId::derive("shop", "orders"),
+            "shop",
+            "orders",
+            Hlc::new(10, 0),
+            None,
+        );
+        redate(&mut meta, Hlc::new(100, 0));
+        assert_eq!(meta.created, Hlc::new(100, 0).successor());
+        assert_eq!(meta.redated.map(|r| r.from), Some(Hlc::new(10, 0)));
+        redate(&mut meta, Hlc::new(200, 0));
+        assert_eq!(meta.created, Hlc::new(200, 0).successor());
+        assert_eq!(meta.redated.map(|r| r.from), Some(Hlc::new(10, 0)), "the first, not the last");
+        meta.created = Hlc::new(300, 0);
+        redate(&mut meta, Hlc::new(400, 0));
+        assert_eq!(meta.redated.map(|r| r.from), Some(Hlc::new(300, 0)), "a new life starts over");
     }
 
     /// The rule's two clauses: a life owes a sweep only when it began after the

@@ -4192,6 +4192,23 @@ impl Engine {
         origin: Option<Hlc>,
         history: &dyn Fn(Stamp) -> bool,
     ) -> Result<Option<CollectionMeta>> {
+        self.create_collection_marked(db, name, log, origin, history, None)
+    }
+
+    /// [`Self::create_collection_inner`] for a life a collection's drop re-dated
+    /// elsewhere (ADR-231, extended): `redated_from` is the `created` it had
+    /// before, written with the creation in the one transaction, so a stop
+    /// cannot leave the life standing without the marker a database's drop
+    /// judges it by.
+    pub(crate) fn create_collection_marked(
+        &self,
+        db: &str,
+        name: &str,
+        log: bool,
+        origin: Option<Hlc>,
+        history: &dyn Fn(Stamp) -> bool,
+        redated_from: Option<Hlc>,
+    ) -> Result<Option<CollectionMeta>> {
         // A creation over a dropped life's rows is refused inside the
         // transaction, below: see `create_collection_in_txn` (ADR-189).
 
@@ -4212,7 +4229,16 @@ impl Engine {
         // and a replicated shadow takes its configuration entry's stamp.
         let mint = || self.next_stamp();
         match self.create_collection_in_txn(&txn, db, name, log, origin, history, mint) {
-            Ok(InTxn::Created(meta, logged)) => {
+            Ok(InTxn::Created(mut meta, logged)) => {
+                if let Some(from) = redated_from {
+                    meta.redated = Some(crate::meta::Redated {
+                        from,
+                        created: meta.created,
+                        first_arrival: None,
+                        arrivals_from: None,
+                    });
+                    Self::put_collection_meta(&txn, &meta)?;
+                }
                 txn.commit()?;
                 if let Some(entry) = logged {
                     self.publish(vec![entry]);
