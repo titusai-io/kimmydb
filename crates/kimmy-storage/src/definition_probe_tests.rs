@@ -369,6 +369,55 @@ fn a_database_tombstone_defers_its_collections_by_the_same_rule() {
     }
 }
 
+/// A life that owes ADR-231's sweep for a covered drop (created above the drop,
+/// floor below it) still holds what the life before put in it: the definition
+/// digest defers it as the cut digest does, until the floor is at the drop.
+#[test]
+fn a_covered_drop_defers_a_life_that_owes_the_sweep_until_its_floor_is_at_the_drop() {
+    let (e, f, _orders, items, _dirs) = converged();
+    let origin = NodeId::generate();
+    let at = Hlc::new(crate::physical_now_ms() - 5_000, 0);
+    for node in [&e, &f] {
+        let entry = kimmy_core::OplogEntry {
+            stamp: Stamp::new(at, origin),
+            kind: kimmy_core::OpKind::Insert,
+            collection: items,
+            doc_id: Some(kimmy_core::DocId::Int64(8_000)),
+            body: Some(bson::serialize_to_vec(&doc! { "_id": 8000i64 }).unwrap()),
+        };
+        let meta = node.get_collection("shop", "items").unwrap();
+        node.apply_remote(&meta, &entry).unwrap();
+    }
+    let fresh = e.create_collection("shop", "fresh").unwrap();
+    e.insert(&fresh, doc! { "_id": 1i64 }).unwrap();
+    sync(&e, &f);
+    assert!(fresh.created > at, "premise: the life is newer than the drop");
+    e.record_collection_drop(fresh.id, Stamp::new(at, origin)).unwrap();
+    let floored = |floor: Option<Hlc>| {
+        let mut meta = e.get_collection("shop", "fresh").unwrap();
+        meta.incarnation_floor = floor;
+        let txn = e.begin_write(crate::WriterHolder::Ddl).unwrap();
+        Engine::put_collection_meta(&txn, &meta).unwrap();
+        txn.commit().unwrap();
+    };
+    // The cut covers the drop, and the life owes its sweep: not compared.
+    for owing in [None, Some(Hlc::new(at.wall_ms - 1, 0))] {
+        floored(owing);
+        let verdicts = exchange(&e, &f, &[]);
+        assert_eq!(
+            deferred(&verdicts, fresh.id),
+            Some(DefinitionDefer::Incarnation),
+            "floor {owing:?}: {verdicts:?}"
+        );
+    }
+    // The sweep done: the floor at the drop, and above it.
+    for done in [at, Hlc::new(at.wall_ms + 1, 0)] {
+        floored(Some(done));
+        let verdicts = exchange(&e, &f, &[]);
+        assert_eq!(compared(&verdicts, fresh.id), Some(true), "floor {done:?}: {verdicts:?}");
+    }
+}
+
 // -- The single pinned transaction ------------------------------------------------------
 
 /// Every predicate is read through the one transaction a side opens. A commit
