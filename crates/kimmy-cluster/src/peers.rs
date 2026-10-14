@@ -2071,17 +2071,164 @@ impl DefinitionState {
 /// Fold one contact's definition-digest round into the tracker, the detail set
 /// and the report (B3 half 2). Independent of the cut digest's fold: neither
 /// waits on the other.
+///
+/// - A **compared** mismatch is observed; two consecutive confirm a finding,
+///   logged once and then at most once an interval, and at most
+///   [`DEFINITION_WARNS_PER_PEER_PER_TICK`] a tick against one peer, the rest
+///   named in a summary line and logged when next due.
+/// - An **explained** mismatch (a valid refusal hint covers every differing
+///   name) is its own outcome and never `compared`; it clears the pending
+///   mismatch.
+/// - The collections whose digest still differs are kept as the **detail set**,
+///   so the next contact asks for their per-index lists; it persists across
+///   explained contacts and ends when the digests match.
+/// - Everything that is not a comparison is counted, per collection, by reason.
 #[allow(clippy::too_many_arguments)]
 fn fold_definition_round(
-    _engine: &Engine,
-    _tracker: &mut kimmy_storage::DivergenceTracker,
-    _state: &mut DefinitionState,
-    _stalls: &mut PeerStalls,
-    _node: NodeId,
-    _peer: SocketAddr,
-    _round: kimmy_storage::DefinitionRound,
-    _report: &mut RoundReport,
+    engine: &Engine,
+    tracker: &mut kimmy_storage::DivergenceTracker,
+    state: &mut DefinitionState,
+    stalls: &mut PeerStalls,
+    node: NodeId,
+    peer: SocketAddr,
+    round: kimmy_storage::DefinitionRound,
+    report: &mut RoundReport,
 ) {
+    use kimmy_storage::{DefinitionAnswered, DefinitionDefer, DefinitionOutcome};
+    match round.answered {
+        DefinitionAnswered::Unanswered => report.definition_unanswered += 1,
+        DefinitionAnswered::Failed => {
+            report.definition_deferred[DefinitionDefer::Error.index()] += round.held.max(1);
+        }
+        DefinitionAnswered::Answered => {}
+    }
+    // Entries of the peer's answer that did not decode, dropped.
+    report.definition_deferred[DefinitionDefer::Malformed.index()] += round.malformed;
+    let mut detail: BTreeSet<kimmy_core::CollectionId> =
+        stalls.definition_detail(&node).into_iter().collect();
+    let mut held_back: Vec<kimmy_core::CollectionId> = Vec::new();
+    for verdict in &round.verdicts {
+        let id = verdict.collection;
+        let key = (node, id);
+        match &verdict.outcome {
+            DefinitionOutcome::Deferred(reason) => {
+                report.definition_deferred[reason.index()] += 1;
+                match (reason, verdict.above) {
+                    (DefinitionDefer::DefinitionAboveCut, Some((origin, cut_at))) => {
+                        note_stuck_stamp(state, node, peer, id, origin, cut_at);
+                    }
+                    _ => {
+                        state.stuck.remove(&key);
+                    }
+                }
+            }
+            DefinitionOutcome::Compared { equal: true, .. } => {
+                state.stuck.remove(&key);
+                report.definition_compared += 1;
+                tracker.observe_definition(node, id, false);
+                detail.remove(&id);
+            }
+            DefinitionOutcome::Compared { equal: false, mine, theirs, differing } => {
+                state.stuck.remove(&key);
+                report.definition_compared += 1;
+                let newly = tracker.observe_definition(node, id, true);
+                detail.insert(id);
+                let confirmed = tracker.is_definition_confirmed(node, id);
+                let due =
+                    state.warned.get(&key).is_none_or(|at| at.elapsed() >= DEFINITION_WARN_EVERY);
+                if confirmed && (newly || due) {
+                    let used = state.warned_this_tick.entry(node).or_default();
+                    if *used >= DEFINITION_WARNS_PER_PEER_PER_TICK {
+                        held_back.push(id);
+                        continue;
+                    }
+                    *used += 1;
+                    state.warned.insert(key, Instant::now());
+                    let (db, name) = match engine.collection_by_id(id) {
+                        Ok(Some(meta)) => (meta.db, meta.name),
+                        _ => ("<db>".to_string(), id.to_string()),
+                    };
+                    warn!(
+                        %peer,
+                        node = %node,
+                        collection = %id,
+                        mine = format!("{mine:032x}"),
+                        theirs = format!("{theirs:032x}"),
+                        differing = ?differing,
+                        "the definitions of a collection differ from this peer's on two \
+                         consecutive comparisons; detect only, no repair is planned. Read \
+                         GET /v1/db/{db}/coll/{name}/indexes on both members and compare the \
+                         definition the finding names (read `expireAfterSeconds` and `unique` \
+                         before recreating anything: a shorter TTL deletes documents). A \
+                         refusal older than this member's last start leaves no counter trace, \
+                         and the refusal hints that would explain one exist only from 0.49.0"
+                    );
+                }
+            }
+            DefinitionOutcome::Explained { .. } => {
+                state.stuck.remove(&key);
+                report.definition_explained += 1;
+                tracker.observe_definition(node, id, false);
+                detail.insert(id);
+            }
+        }
+    }
+    stalls.set_definition_detail(node, detail);
+    if !held_back.is_empty() {
+        let first: Vec<String> = held_back.iter().take(5).map(ToString::to_string).collect();
+        warn!(
+            %peer,
+            node = %node,
+            held_back = held_back.len(),
+            first = ?first,
+            "{} more definition findings against this peer were not logged this tick; each is \
+             logged at the next contact it is due",
+            held_back.len()
+        );
+    }
+}
+
+/// Count one more contact on which a collection's definition stamp was above the
+/// cut, and name the stamp once it has not advanced for
+/// [`DEFINITION_STUCK_AFTER`] of them (h2-N4). A stamp from an origin one member
+/// can no longer witness (a decommissioned node's last create reached one
+/// member) is above the cut for ever; a peer that is only lagging has its cut
+/// advance at the origin every few contacts, which starts the count over.
+fn note_stuck_stamp(
+    state: &mut DefinitionState,
+    node: NodeId,
+    peer: SocketAddr,
+    id: kimmy_core::CollectionId,
+    origin: NodeId,
+    cut_at: kimmy_core::Hlc,
+) {
+    let key = (node, id);
+    let count = match state.stuck.get_mut(&key) {
+        Some((held_origin, last, count)) if *held_origin == origin && cut_at <= *last => {
+            *count = count.saturating_add(1);
+            *count
+        }
+        _ => {
+            state.stuck.insert(key, (origin, cut_at, 1));
+            1
+        }
+    };
+    if count >= DEFINITION_STUCK_AFTER
+        && state.stuck_warned.get(&key).is_none_or(|at| at.elapsed() >= DEFINITION_WARN_EVERY)
+    {
+        state.stuck_warned.insert(key, Instant::now());
+        warn!(
+            %peer,
+            node = %node,
+            collection = %id,
+            origin = %origin,
+            cut_at = ?cut_at,
+            contacts = count,
+            "a definition of a collection is stamped above the cut and the cut at its origin has \
+             not advanced for {count} contacts, so its definition digest is never compared with \
+             this peer: the stamp may come from a node this cluster can no longer hear from"
+        );
+    }
 }
 
 /// Verify a collection's kept digest row, unless it was verified unchanged
