@@ -502,9 +502,10 @@ impl Engine {
     ///
     /// Judged by the requester on both sides' lists. A hint is valid only while
     /// the definitions are as it says (a hint, never a mask):
-    /// - *this side's own* refusal of the peer's definition: this side lacks the
-    ///   name or holds another definition under it, and the peer's hash for the
-    ///   name is the one the hint stored;
+    /// - *this side's own* refusal of the peer's definition: the peer's hash for the
+    ///   name is the one the hint stored (that this side lacks the name or holds
+    ///   another definition under it is the difference itself, and only a name
+    ///   that differs is ever covered);
     /// - *this side's own* refusal of the peer's **drop**: this side still holds
     ///   the index with the hash the hint stored, and the peer lacks it;
     /// - *the peer's* refusal, as a raw `(name, hash)` pair that already passed
@@ -536,10 +537,10 @@ impl Engine {
                 continue;
             }
             let valid = match hint.kind {
-                HintKind::Index | HintKind::Vector => {
-                    mine.get(&hint.name) != Some(&hint.hash)
-                        && theirs.get(&hint.name) == Some(&hint.hash)
-                }
+                // This side lacks the name or holds another definition under it
+                // is the difference itself: only a name in `differing` can be
+                // covered, so that clause is not repeated here.
+                HintKind::Index | HintKind::Vector => theirs.get(&hint.name) == Some(&hint.hash),
                 HintKind::Drop => {
                     mine.get(&hint.name) == Some(&hint.hash) && !theirs.contains_key(&hint.name)
                 }
@@ -550,7 +551,7 @@ impl Engine {
         }
         for (name, hash) in &entry.refused {
             let Some(hash) = hash_of(hash.as_slice()) else { continue };
-            let refused_mine = mine.get(name) == Some(&hash) && theirs.get(name) != Some(&hash);
+            let refused_mine = mine.get(name) == Some(&hash);
             let holds_what_i_dropped = theirs.get(name) == Some(&hash) && !mine.contains_key(name);
             if refused_mine || holds_what_i_dropped {
                 covered.insert(name.clone());

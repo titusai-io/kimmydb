@@ -727,6 +727,148 @@ fn a_definition_lists_hashes_are_what_the_answer_carries_for_the_detail() {
     assert_eq!(carried, list);
 }
 
+// -- Clauses the first mutation run found unpinned ------------------------------------
+
+/// A drop hint covers a name the peer *lacks*. A peer that holds the name in
+/// another form is a different difference, and the hint masks nothing.
+#[test]
+fn a_refused_drop_does_not_explain_a_name_the_peer_holds_in_another_form() {
+    let (a, b, orders, _dirs) = converged_with_index("held");
+    let hash = hash_of(&a, "orders", "held");
+    let stamp = a.get_collection("shop", "orders").unwrap().indexes[0].created.unwrap();
+    a.record_refusal_hint(&RefusalHint::new(orders, HintKind::Drop, "held", stamp, hash)).unwrap();
+    edit(&b, "orders", |meta| meta.indexes[0].unique = true);
+    let verdicts = exchange(&a, &b, &[orders]);
+    assert_eq!(compared(&verdicts, orders), Some(false), "{verdicts:?}");
+}
+
+/// The responder's pair says "I hold this hash and could not drop it". It
+/// explains a name the requester lacks, and not one the requester holds in
+/// another form.
+#[test]
+fn a_pair_for_a_held_index_does_not_explain_a_name_the_requester_holds_in_another_form() {
+    let (a, b, orders, _dirs) = converged_with_index("held");
+    let hash = hash_of(&b, "orders", "held");
+    let stamp = b.get_collection("shop", "orders").unwrap().indexes[0].created.unwrap();
+    b.record_refusal_hint(&RefusalHint::new(orders, HintKind::Drop, "held", stamp, hash)).unwrap();
+    // Control: A lacks the name, which the pair explains.
+    let held = a.get_collection("shop", "orders").unwrap().indexes[0].clone();
+    edit(&a, "orders", |meta| meta.indexes.clear());
+    let verdicts = exchange(&a, &b, &[orders]);
+    assert!(
+        matches!(outcome_of(&verdicts, orders), Some(DefinitionOutcome::Explained { .. })),
+        "control: {verdicts:?}"
+    );
+    // A holds the name, in another form.
+    edit(&a, "orders", |meta| {
+        let mut other = held.clone();
+        other.unique = true;
+        meta.indexes.push(other);
+    });
+    let verdicts = exchange(&a, &b, &[orders]);
+    assert_eq!(compared(&verdicts, orders), Some(false), "{verdicts:?}");
+}
+
+/// The responder's pair says "I refused this hash". It explains a requester that
+/// holds exactly that hash, and not one that holds another definition under the name.
+#[test]
+fn a_pair_for_a_refused_definition_does_not_explain_another_definition_under_the_name() {
+    let (a, b, orders, _dirs) = converged_with_index("ttl");
+    let hash = hash_of(&a, "orders", "ttl");
+    let stamp = a.get_collection("shop", "orders").unwrap().indexes[0].created.unwrap();
+    edit(&b, "orders", |meta| meta.indexes.clear());
+    b.record_refusal_hint(&RefusalHint::new(orders, HintKind::Index, "ttl", stamp, hash)).unwrap();
+    edit(&a, "orders", |meta| meta.indexes[0].expire_after_secs = Some(30));
+    let verdicts = exchange(&a, &b, &[orders]);
+    assert_eq!(compared(&verdicts, orders), Some(false), "{verdicts:?}");
+}
+
+/// A digest that differs while both lists are the same is a peer that is not
+/// consistent with itself: a mismatch nothing explains, never an explanation
+/// of nothing.
+#[test]
+fn a_differing_digest_over_equal_lists_is_not_explained() {
+    let (a, b, orders, _dirs) = converged_with_index("ttl");
+    let ask = DefinitionAsk::new(cut_of(&a, &b), [orders]);
+    let mut reply = b.definition_answer(&ask).unwrap();
+    for entry in &mut reply.entries {
+        if entry.collection == orders {
+            let mut bytes = entry.digest.to_vec();
+            bytes[0] ^= 1;
+            entry.digest = ByteBuf::from(bytes);
+        }
+    }
+    let verdicts = a.definition_compare(&ask, &reply).unwrap();
+    match outcome_of(&verdicts, orders) {
+        Some(DefinitionOutcome::Compared { equal: false, differing, .. }) => {
+            assert!(differing.is_empty(), "{differing:?}");
+        }
+        other => panic!("nothing differs by name, so nothing is explained: {other:?}"),
+    }
+}
+
+/// The responder reads the hints through its pinned transaction: one recorded
+/// after it opened is not in the pairs of this answer.
+#[test]
+fn a_hint_recorded_after_the_responders_transaction_opened_is_not_in_its_pairs() {
+    let (a, b, orders, _dirs) = converged_with_index("ttl");
+    let hash = hash_of(&a, "orders", "ttl");
+    let stamp = a.get_collection("shop", "orders").unwrap().indexes[0].created.unwrap();
+    edit(&b, "orders", |meta| meta.indexes.clear());
+    let b = std::sync::Arc::new(b);
+    let writer = std::sync::Arc::clone(&b);
+    test_hooks::after_the_transaction(move |_| {
+        writer
+            .record_refusal_hint(&RefusalHint::new(orders, HintKind::Index, "ttl", stamp, hash))
+            .unwrap();
+    });
+    let ask = DefinitionAsk::new(cut_of(&a, &b), [orders]);
+    let reply = b.definition_answer(&ask).unwrap();
+    let entry = reply.entries.iter().find(|e| e.collection == orders).unwrap();
+    assert!(entry.refused.is_empty(), "the hint was not there yet: {entry:?}");
+    // And it is there for the next answer.
+    let reply = b.definition_answer(&ask).unwrap();
+    let entry = reply.entries.iter().find(|e| e.collection == orders).unwrap();
+    assert_eq!(entry.refused.len(), 1);
+}
+
+/// The database's drop tombstone is read through the pinned transaction too.
+#[test]
+fn a_database_tombstone_recorded_after_the_transaction_opened_is_seen_by_no_predicate() {
+    let (a, b, orders, items, _dirs) = converged();
+    let b = std::sync::Arc::new(b);
+    let writer = std::sync::Arc::clone(&b);
+    test_hooks::after_the_transaction(move |_| {
+        let future = Stamp::new(Hlc::new(crate::physical_now_ms() + 60_000, 0), writer.node_id());
+        writer
+            .record_database_tombstone_for_test(kimmy_core::database_drop_id("shop"), future)
+            .unwrap();
+    });
+    let ask = DefinitionAsk::new(cut_of(&a, &b), []);
+    let reply = b.definition_answer(&ask).unwrap();
+    let verdicts = a.definition_compare(&ask, &reply).unwrap();
+    for id in [orders, items] {
+        assert_eq!(compared(&verdicts, id), Some(true), "{verdicts:?}");
+    }
+}
+
+/// A collection the responder cannot compare carries no detail: nothing to
+/// explain, and nothing to spend the frame on.
+#[test]
+fn a_deferred_collection_carries_no_detail() {
+    let (a, b, orders, _dirs) = converged_with_index("ttl");
+    let hash = hash_of(&a, "orders", "ttl");
+    let stamp = a.get_collection("shop", "orders").unwrap().indexes[0].created.unwrap();
+    b.record_refusal_hint(&RefusalHint::new(orders, HintKind::Index, "ttl", stamp, hash)).unwrap();
+    let future = Stamp::new(Hlc::new(crate::physical_now_ms() + 60_000, 0), b.node_id());
+    b.record_collection_drop(orders, future).unwrap();
+    let ask = DefinitionAsk::new(cut_of(&a, &b), [orders]);
+    let reply = b.definition_answer(&ask).unwrap();
+    let entry = reply.entries.iter().find(|e| e.collection == orders).unwrap();
+    assert_eq!(entry.deferred, Some(DefinitionDefer::Incarnation));
+    assert!(entry.indexes.is_empty() && entry.refused.is_empty(), "{entry:?}");
+}
+
 // -- The cost ------------------------------------------------------------------------
 
 /// The figure the ADR records: what one answer and one comparison cost over
