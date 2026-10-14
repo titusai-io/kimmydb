@@ -113,6 +113,9 @@ fn the_stored_vectors_of_the_old_width_are_kept_as_for_an_off() {
     )
     .unwrap();
     pull(&b, &a);
+    // A burial of the shadow is purged in the background; finish it, so a regression
+    // that starts deleting the old-width rows cannot hide behind the purger.
+    b.finish_purges_now().unwrap();
     let kept: Vec<usize> = b
         .get_vectors(&shadow, &kimmy_core::DocId::Int64(1))
         .unwrap()
