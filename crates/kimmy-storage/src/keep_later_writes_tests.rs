@@ -86,11 +86,11 @@ fn byo_config() -> kimmy_core::VectorConfig {
     }
 }
 
-fn chunk_of(source: i64) -> VectorRecord {
+fn chunk_of(source: i64, at: Hlc) -> VectorRecord {
     VectorRecord {
         source: DocId::Int64(source),
         chunk: 0,
-        source_hlc: Hlc::ZERO,
+        source_hlc: at,
         vector: vec![0.1, 0.2, 0.3, 0.4],
         text: "t".into(),
         config: None,
@@ -314,29 +314,35 @@ fn a_and_d_holding_a_vector_collection() -> (Engine, Engine, tempfile::TempDir, 
     a.insert(&on_a, doc! { "_id": 1i64 }).unwrap();
     let shadow_a =
         a.get_collection("shop", &kimmy_core::vector_meta::shadow_name("orders")).unwrap();
-    a.put_vectors(&shadow_a, &DocId::Int64(1), &[chunk_of(1)]).unwrap();
+    a.put_vectors(&shadow_a, &DocId::Int64(1), &[chunk_of(1, on_a.created)]).unwrap();
     sync(&a, &d);
     assert!(holds(&d, &kimmy_core::vector_meta::shadow_name("orders")), "premise");
     (a, d, da, dd)
 }
 
-/// A chunk the embedding worker wrote after the drop for a document the sweep
-/// removes does not keep the shadow alive; the chunk of a document that
-/// survives does stay.
+/// A chunk is kept only while the document it embeds is live. A document of the
+/// life before goes with its chunk (by stamp), and a chunk stamped after the drop
+/// for a document that was deleted after it (the worker removes chunks later) is
+/// no reason for the shadow to keep a row with no parent; the chunk of a
+/// document that survives stays.
 #[test]
-fn a_late_chunk_of_a_swept_parent_is_removed_and_a_survivors_chunk_stays() {
+fn a_chunk_without_a_live_parent_is_removed_and_a_survivors_chunk_stays() {
     let (a, d, _da, _dd) = a_and_d_holding_a_vector_collection();
     assert!(a.drop_collection("shop", "orders").unwrap());
     later();
     let on_d = d.get_collection("shop", "orders").unwrap();
-    d.insert(&on_d, doc! { "_id": 5i64 }).unwrap();
+    let (_, kept) = d.insert_stamped(&on_d, doc! { "_id": 5i64 }).unwrap();
+    let (_, gone) = d.insert_stamped(&on_d, doc! { "_id": 6i64 }).unwrap();
     let shadow = d.get_collection("shop", &kimmy_core::vector_meta::shadow_name("orders")).unwrap();
-    d.put_vectors(&shadow, &DocId::Int64(1), &[chunk_of(1)]).unwrap();
-    d.put_vectors(&shadow, &DocId::Int64(5), &[chunk_of(5)]).unwrap();
+    d.put_vectors(&shadow, &DocId::Int64(5), &[chunk_of(5, kept.hlc)]).unwrap();
+    d.put_vectors(&shadow, &DocId::Int64(6), &[chunk_of(6, gone.hlc)]).unwrap();
+    assert!(d.delete(&on_d, &DocId::Int64(6)).unwrap());
+    assert_eq!(d.get_vectors(&shadow, &DocId::Int64(6)).unwrap().len(), 1, "premise: orphaned");
     quiesce(&[&a, &d]);
-    assert_eq!(docs_of(&d, "orders", &[1, 5]), vec![5]);
+    assert_eq!(docs_of(&d, "orders", &[1, 5, 6]), vec![5]);
     let shadow = d.get_collection("shop", &kimmy_core::vector_meta::shadow_name("orders")).unwrap();
-    assert!(d.get_vectors(&shadow, &DocId::Int64(1)).unwrap().is_empty(), "a parentless chunk");
+    assert!(d.get_vectors(&shadow, &DocId::Int64(1)).unwrap().is_empty(), "the life before's");
+    assert!(d.get_vectors(&shadow, &DocId::Int64(6)).unwrap().is_empty(), "a parentless chunk");
     assert_eq!(d.get_vectors(&shadow, &DocId::Int64(5)).unwrap().len(), 1);
     assert_counts_exact(&d, "a shadow that follows its parent");
 }
@@ -366,7 +372,7 @@ fn a_start_sweeps_the_parent_before_its_shadow() {
     let on_d = d.get_collection("shop", "orders").unwrap();
     d.insert(&on_d, doc! { "_id": 5i64 }).unwrap();
     let shadow = d.get_collection("shop", &kimmy_core::vector_meta::shadow_name("orders")).unwrap();
-    d.put_vectors(&shadow, &DocId::Int64(5), &[chunk_of(5)]).unwrap();
+    d.put_vectors(&shadow, &DocId::Int64(5), &[chunk_of(5, Hlc::ZERO)]).unwrap();
     // Stop after the first commit of the survivors path: both lives are re-dated
     // and owe a sweep; nothing is swept yet.
     let asked = std::cell::Cell::new(0);
@@ -487,32 +493,48 @@ fn a_peer_holding_the_older_life_is_not_replaced_by_one_in_the_owed_window() {
 
 // -- A re-dated life must not outlive the database's drop that covers it --------
 
-/// M keeps a write through a collection's drop before it has heard of the
-/// database's drop `S`, and a peer repairs the collection from M. Whether the
-/// peer holds `S` already (it refuses the definition) or learns it after (it
-/// buries what it installed), and whether M learns it last, the write is gone
-/// everywhere, the collection is absent everywhere (ADR-229), and nothing loops.
+/// A database's drop `S` is followed by a drop of each of its collections, at
+/// stamps above `S`. M, which is told of the collection's drop and not of `S`
+/// (it was behind and caught up by a page), keeps a write and dates the life
+/// just above that drop, so above `S`: its `created` no longer says the life
+/// began before `S`. A peer repairs the collection from M, and learns `S` before
+/// or after. Either way, and whichever order M learns `S` in, the write is gone
+/// everywhere and the collection is absent everywhere (ADR-229).
 #[test]
-fn a_life_re_dated_before_the_databases_drop_is_known_does_not_outlive_it() {
+fn a_life_re_dated_above_the_databases_drop_does_not_outlive_it() {
     for peer_holds_the_database_drop_first in [true, false] {
         let (a, m, _da, _dm, id) = a_and_d_holding_the_old_life();
         a.create_collection("shop", "items").unwrap();
         sync(&a, &m);
-        assert!(a.drop_collection("shop", "orders").unwrap());
+        later();
+        let before = a.version_vector().unwrap();
+        a.drop_database("shop").unwrap();
+        a.finish_purges_now().unwrap();
+        let from = m.version_vector().unwrap().behind(&a.version_vector().unwrap()).unwrap();
+        let entries = a.entries_for_peer(from, BATCH, WalkScope::Background).unwrap().entries;
+        let _ = before;
+        let database_drop = entries
+            .iter()
+            .find(|e| e.collection == kimmy_core::database_drop_id("shop"))
+            .unwrap()
+            .clone();
+        let collection_drop = entries
+            .iter()
+            .find(|e| e.kind == kimmy_core::OpKind::DropCollection && e.collection == id)
+            .unwrap()
+            .clone();
+        assert!(collection_drop.stamp > database_drop.stamp, "premise: a drop above S");
         later();
         let on_m = m.get_collection("shop", "orders").unwrap();
         m.insert(&on_m, doc! { "_id": 3i64 }).unwrap();
-        // M takes the collection's drop alone: the database's is not yet known to it.
-        let start = m.version_vector().unwrap().behind(&a.version_vector().unwrap()).unwrap();
-        let entries = a.entries_for_peer(start, BATCH, WalkScope::Background).unwrap().entries;
-        m.apply_batch(&entries).unwrap();
+        // M is told of the collection's drop and not of S.
+        m.apply_batch(std::slice::from_ref(&collection_drop)).unwrap();
         let kept = m.get_collection("shop", "orders").unwrap();
         assert!(kept.is_redated(), "premise: M kept the write");
-        later();
-        a.drop_database("shop").unwrap();
-        a.finish_purges_now().unwrap();
+        assert!(kept.created > database_drop.stamp.hlc, "premise: dated above S");
+        assert!(kept.redated.unwrap().from <= database_drop.stamp.hlc, "premise: began before S");
 
-        // P learns of the database's drop by a whole-database page.
+        // P learns of the database's drop by a whole-database page, or not yet.
         let (p, _dp) = engine();
         if peer_holds_the_database_drop_first {
             let page = a.snapshot_page(None, None).unwrap();
@@ -525,7 +547,7 @@ fn a_life_re_dated_before_the_databases_drop_is_known_does_not_outlive_it() {
         assert_eq!(
             page.collections.first().and_then(|c| c.redated_from),
             Some(kept.redated.unwrap().from),
-            "the definition says it was re-dated"
+            "the definition says where the life began"
         );
         p.apply_snapshot_page(m.node_id(), &mut SnapshotProgress::of_collection(id), &page)
             .unwrap();
@@ -533,12 +555,13 @@ fn a_life_re_dated_before_the_databases_drop_is_known_does_not_outlive_it() {
             assert!(!holds(&p, "orders"), "refused at install: it began before S");
         } else {
             assert!(holds(&p, "orders"), "premise: P had nothing to refuse it with");
-            let page = a.snapshot_page(None, None).unwrap();
-            p.apply_snapshot_page(a.node_id(), &mut SnapshotProgress::whole_database(), &page)
-                .unwrap();
+            p.apply_batch(std::slice::from_ref(&database_drop)).unwrap();
+            assert!(!holds(&p, "orders"), "buried by S when it arrives, from where it began");
         }
-        // And M learns of it last.
-        quiesce(&[&a, &m, &p]);
+        // And M learns of S last.
+        m.apply_batch(std::slice::from_ref(&database_drop)).unwrap();
+        m.finish_purges_now().unwrap();
+        p.finish_purges_now().unwrap();
         for (who, e) in [("a", &a), ("m", &m), ("p", &p)] {
             assert!(!holds(e, "orders"), "{who}, peer first: {peer_holds_the_database_drop_first}");
             assert!(!holds(e, "items"), "{who}");
