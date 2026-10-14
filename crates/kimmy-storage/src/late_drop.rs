@@ -1732,6 +1732,40 @@ mod tests {
     /// is now a new creation, stamped under the writer and replicated, so the sweep
     /// leaves it and every member holds the index.
     #[test]
+    fn the_restamp_of_an_inherited_index_clears_the_refusal_that_named_it() {
+        let (a, da) = engine();
+        let (b, db) = engine();
+        let _dirs = (da, db);
+        let on_a = a.create_collection("shop", "orders").unwrap();
+        a.create_index("shop", "orders", by_from(), false, Some("by_from".into())).unwrap();
+        a.insert(&on_a, doc! { "_id": 1i64, "from": "a" }).unwrap();
+        assert!(a.drop_collection("shop", "orders").unwrap());
+        a.finish_purges_now().unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(5));
+        let on_b = b.create_collection("shop", "orders").unwrap();
+        b.insert(&on_b, doc! { "_id": 2i64, "from": "b" }).unwrap();
+        let start = b.version_vector().unwrap().behind(&a.version_vector().unwrap()).unwrap();
+        let entries = a.entries_for_peer(start, BATCH, WalkScope::Background).unwrap().entries;
+        let drop_at = entries.iter().position(|e| e.kind == kimmy_core::OpKind::DropCollection);
+        b.apply_batch(&entries[..drop_at.expect("the drop is in the window")]).unwrap();
+        let held = b.get_collection("shop", "orders").unwrap();
+        assert!(held.indexes[0].created.unwrap().hlc < held.created, "premise: inherited");
+        // A refusal of this definition is remembered here.
+        let stamp = held.indexes[0].created.unwrap();
+        b.record_refusal_hint(&crate::RefusalHint::new(
+            on_b.id,
+            crate::HintKind::Index,
+            "by_from",
+            stamp,
+            crate::definition_digest::index_hash(&held.indexes[0]),
+        ))
+        .unwrap();
+        // B's client creates it again: a new creation, and the refusal is mended.
+        b.create_index("shop", "orders", by_from(), false, Some("by_from".into())).unwrap();
+        assert!(b.refusal_hints(on_b.id).unwrap().is_empty(), "the re-stamp mended it");
+    }
+
+    #[test]
     fn an_identical_create_over_an_inherited_index_survives_the_sweep_on_every_member() {
         let (a, da) = engine();
         let (b, db) = engine();

@@ -622,3 +622,24 @@ fn an_unreadable_row_is_skipped_by_the_read_and_removed_by_the_collections_clear
     assert_eq!(Engine::clear_refusal_hints_in(&txn, orders.id).unwrap(), 2, "both rows go");
     txn.commit().unwrap();
 }
+
+/// A definition the member holds identically, whose stamp is raised to a peer's
+/// newer one (the merge-forward of a concurrent identical create), is settled
+/// here: its hints go with the stamp.
+#[test]
+fn settling_an_identical_definition_on_a_newer_stamp_clears_its_hints() {
+    let (a, _da) = engine();
+    let (b, _db) = engine();
+    a.create_collection("shop", "orders").unwrap();
+    b.create_collection("shop", "orders").unwrap();
+    let id = CollectionId::derive("shop", "orders");
+    b.create_index("shop", "orders", field("x"), false, Some("x".into())).unwrap();
+    later();
+    a.create_index("shop", "orders", field("x"), false, Some("x".into())).unwrap();
+    both_shapes(&b, id, HintKind::Index, &["x", "other"]);
+    let before = b.get_collection("shop", "orders").unwrap().index("x").unwrap().created;
+    pull(&b, &a);
+    let after = b.get_collection("shop", "orders").unwrap().index("x").unwrap().created;
+    assert!(after > before, "premise: the stamp was raised to the newer");
+    assert_eq!(held_names(&b, id), vec![(HintKind::Index, "other".to_string())]);
+}
