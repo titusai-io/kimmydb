@@ -26995,7 +26995,7 @@ a recreation, and with the write reaching a member before or after the recreatio
    not drop). It is written at the five places a refusal is counted, in a transaction of its own, and a write
    that fails fails the batch (the entry is not witnessed and is served again); a row identical to the one held
    (stamp, build, hash) is not written again, so a permanent refusal met on every round is not a commit
-   trickle ([ADR-125](#adr-125)). It is **re-derived at use**: a
+   trickle (ADR-125). It is **re-derived at use**: a
    hint explains a difference only while the other side's hash for the name is the one the hint stored (or,
    for a `drop`, while this side still holds the hash it stored and the other lacks the name) and the hint's
    stamp is above the standing life's floor; the responder applies the floor clause before it puts a pair on
