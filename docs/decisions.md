@@ -26780,11 +26780,13 @@ divergence persists between old and new members until the roll completes; the st
 upgraded member, and a member that is still divergent after the roll is healed by its own start.
 **Residuals.** (1) A straggler stamped at the drop's own `Hlc` by a node above the dropper's, arriving
 behind the cursor of a multi-chunk sweep that is still running, is refused by neither the tombstone (strict)
-nor the floor (set last) and stays: the same tie ADR-229 already names for databases. (2) **A write to the life the drop
-destroyed, stamped after the drop**: a member D that still holds the old life and writes Z after the drop's
-stamp, then receives the drop, loses Z with the rest of that life, while members whose lives are newer keep Z
-(stamped after the drop). That is a different divergence, from the whole-life semantics of a drop, and is
-recorded as its own finding; this rule does not change it. (3) A far-future stamp cannot trigger the sweep:
+nor the floor (set last) and stays: the same tie ADR-229 already names for databases. (2) **An open defect this rule does not close,
+pending Chris's decision:** a member D that still holds the old life and writes Z after the drop's stamp, then
+receives the drop, loses Z with the rest of that life, while members whose lives are newer keep Z (stamped
+after the drop). The members **stay different**: through three real loops the divergence gauge stays at 1 on
+all three and the count half's repair re-runs (6, 6 and 12 rounds in 32 s on A, B and D) without changing
+anything, A and B holding {2, 3} and D {2}. It is a different mechanism from this rule's, and any rule for it
+changes documented behaviour. Recorded as the finding `kimmydb-a-write-made-after-a-drops-stamp-into-the-life-the-drop-destroys-is-lost-on-the-member-that-applies-the-drop-and-kept-on-the-members-whose-lives-are-newer`; it is not an accepted limit. (3) A far-future stamp cannot trigger the sweep:
 it runs only when the drop is *below* `created`.
 
 **Tests.** `late_drop.rs`: the reproducer converges and the floor stands at the drop; the newer life's own
