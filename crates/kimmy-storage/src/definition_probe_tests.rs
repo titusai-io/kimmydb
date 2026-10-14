@@ -1166,16 +1166,14 @@ fn every_dropped_index_row_is_judged_against_the_cut() {
         later();
         a.drop_index("shop", "orders", order[1]).unwrap();
         sync(&a, &b);
-        let stamps: Vec<Stamp> = {
-            use redb::ReadableDatabase;
-            let txn = a.db().begin_read().unwrap();
-            let table = txn.open_table(crate::tables::INDEXES_DROPPED).unwrap();
-            table
-                .range((orders.0, 0)..=(orders.0, u32::MAX))
-                .unwrap()
-                .map(|row| crate::codec::decode_oplog_key(row.unwrap().1.value()).unwrap())
-                .collect()
-        };
+        let stamps: Vec<Stamp> = ["p", "q"]
+            .into_iter()
+            .map(|name| {
+                a.index_dropped_at(orders, kimmy_core::IndexMeta::derive_id(name))
+                    .unwrap()
+                    .expect("the drop's tombstone is held")
+            })
+            .collect();
         assert_eq!(stamps.len(), 2, "premise");
         // The cut covers the earlier drop and not the later one.
         let earliest = stamps.iter().map(|stamp| stamp.hlc).min().unwrap();
