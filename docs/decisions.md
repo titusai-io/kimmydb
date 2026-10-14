@@ -26950,9 +26950,12 @@ a recreation, and with the write reaching a member before or after the recreatio
    destructured exhaustively, with no `..` and no wildcard on an enum, so a new field is a compile error and
    someone must decide whether it is compared; `id`, `multikey` and `created` are discarded by name. Every
    string is length-prefixed and every option tagged, so no two definitions frame alike; the format is
-   `FORMAT = 1` and a change to what is hashed or how it is framed bumps it. A collection's digest is one hash
+   `FORMAT = 2` and a change to what is hashed or how it is framed bumps it. A collection's digest is one hash
    over its list of `(name, hash)`, indexes sorted by `(derived id, name)` (the id is a 32-bit hash, and two
-   names can share one) and the vector configuration last under the reserved name `__vector`. The hash of each
+   names can share one) and the vector configuration last. **Every entry is keyed by its kind**, an index by
+   its name or the configuration, and not by a name alone: an index may be named anything (`__vector`
+   included, and refusing a name that was accepted before would be Breaking), so the list frames, orders and
+   compares each entry with its kind, and an index called `__vector` can never alias the configuration. The hash of each
    shape is **pinned to the byte** by a test, and the rendering of every filter type the language accepts is
    pinned too, because `bson`'s output is an input to the hash.
 2. **Nothing is kept.** No row, no table, no walk at open, no write-path change: the digest of a collection is
@@ -26965,7 +26968,9 @@ a recreation, and with the write reaching a member before or after the recreatio
    collection from one read transaction against the request's cut, and the requester computes its own digests
    after the answer arrives, in one read transaction against the same cut. `AskDivergence` gains
    `definitions: Option<DefinitionAsk { cut, detail }>` and `Divergence` gains `definitions:
-   Option<DefinitionReply>`, both optional and read leniently (a field of another shape costs the field and
+   Option<DefinitionReply>` (which carries the digest's **format** beside its entries: a format other than this
+   build's, or none, defers every collection as `format`, so a later change of what is hashed cannot make a
+   false finding of every collection during a roll), both optional and read leniently (a field of another shape costs the field and
    never the frame; an entry that does not decode is dropped and counted `malformed`). The ask is made on every
    checked contact, whether or not the count probe is gated; a request whose two cuts differ is answered
    without definitions; **`definitions` is present in the answer iff the request carried it**; and each half
@@ -26983,7 +26988,7 @@ a recreation, and with the write reaching a member before or after the recreatio
    (`DefinitionDefer`) and not the cut digest's (growing that one would put reasons on its series that cannot
    occur there): `incarnation` and `database_tombstone` (the shared rule `drop_defers`: the drop is above the
    cut or the standing life is not newer than it, and a life that still owes ADR-231's sweep defers in both
-   halves), `definition_above_cut`, `horizon`, `error`, `malformed`. **`horizon` applies to every collection on
+   halves), `definition_above_cut`, `horizon`, `error`, `malformed`, `format`. **`horizon` applies to every collection on
    both sides**: retention collects a dropped index's tombstone, and with it the stamp that would have deferred
    the collection, so when the cut is below what the oplog can serve no collection can be judged. A stamp
    above the cut from an origin that never advances (a node that left the cluster) is **named** after 60
@@ -26991,18 +26996,23 @@ a recreation, and with the write reaching a member before or after the recreatio
 6. **A refusal is remembered as a hint, never a mask.** A refusal used to be a counter and a log line, and
    nothing recorded which definition was refused. A `META` row `ddl_refused:<collection id>:<kind>:<name>`
    holds the stamp of the refused entry, the build, and the **hash of the refused definition** (`kind` is
-   `index`, `vector` or `drop`, the opposite shape, where this member holds an index a peer dropped and could
-   not drop). It is written at the five places a refusal is counted, in a transaction of its own, and a write
+   `index`, `vector`, `drop_index` or `drop_vector`, the last two the opposite shape, where this member holds a
+   definition a peer dropped and could not drop; a vector kind has an empty name). It is written at the five places a refusal is counted, in a transaction of its own, and a write
    that fails fails the batch (the entry is not witnessed and is served again); a row identical to the one held
    (stamp, build, hash) is not written again, so a permanent refusal met on every round is not a commit
-   trickle (ADR-125). It is **re-derived at use**: a
+   trickle (ADR-125). The kind travels with each pair the responder sends, which carries only a pair valid
+   on its own side (a refusal while it lacks the definition or holds another hash; a held drop while it holds
+   exactly the hash it stored), and the requester applies that kind's shape. A row this build cannot read is
+   skipped and warned about, never an error. It is **re-derived at use**: a
    hint explains a difference only while the other side's hash for the name is the one the hint stored (or,
    for a `drop`, while this side still holds the hash it stored and the other lacks the name) and the hint's
    stamp is above the standing life's floor; the responder applies the floor clause before it puts a pair on
    the wire. So a build that can now apply the definition, a rollback, a restore and a recreated collection
    cannot leave a stale row masking anything. A difference every name of which is covered is **`explained`**,
-   an outcome of its own, never `compared`, and does not move the gauge. The rows are cleared with the
-   collection (and its shadow) at its burial and with the index at its drop.
+   an outcome of its own, never `compared`, and does not move the gauge. The rows of a definition are cleared in the
+   transaction that stores it here (a client's create, a peer's entry, a snapshot, a vector configuration set
+   or turned off) and at its drop, of both shapes, so a refusal that was mended cannot explain a later loss;
+   and those of a collection (and its shadow) at its burial.
 7. **Findings.** A finding is two consecutive *compared* mismatches of a `(peer, collection)`; the tracker's
    fourth kind feeds the gauges (`kimmy_sync_definition_divergent_collections`, and the existing
    `kimmy_sync_divergent_collections`) and **never `confirmed_against`**, so no repair is planned from it. One
@@ -27031,4 +27041,4 @@ test per deferral reason at each boundary of the covered rule (`<` against `<=` 
 the pinned-transaction tests; the wire in both directions across a version boundary; the loop path through real
 members; and a mutation table (one row per validity clause of the hint, per deferral, per predicate read in a
 pinned transaction, per framing term of the hash, and for the WARN cap and the stuck count), every row of which
-is killed or argued equivalent in the pull request.
+is killed, argued equivalent, or listed as unreachable in the pull request.
