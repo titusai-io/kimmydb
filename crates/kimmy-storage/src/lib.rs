@@ -17,6 +17,7 @@ pub mod class_step;
 pub mod codec;
 mod database_tombstone;
 pub mod definition_digest;
+pub mod definition_probe;
 pub mod digest_probe;
 pub mod divergence;
 pub mod docs;
@@ -40,6 +41,7 @@ pub mod migrate;
 pub mod modify;
 pub mod open_progress;
 pub mod purge;
+pub mod refusal_hint;
 pub mod rewind;
 pub mod snapshot;
 mod store_lock;
@@ -68,6 +70,9 @@ mod keep_later_writes_tests;
 
 #[cfg(test)]
 mod definition_digest_tests;
+
+#[cfg(test)]
+mod definition_probe_tests;
 
 #[cfg(test)]
 mod log_capture;
