@@ -297,8 +297,15 @@ fn a_whole_page_carrying_a_database_drop_buries_whichever_order_its_list_is_in()
         if reversed {
             page.dropped_collections.reverse();
         }
+        let before = hooks::survivors_paths();
         d.apply_snapshot_page(a.node_id(), &mut SnapshotProgress::whole_database(), &page).unwrap();
         d.finish_purges_now().unwrap();
+        assert_eq!(
+            hooks::survivors_paths(),
+            before,
+            "the database's tombstone is recorded first, so no life is re-dated only to be \
+             buried (reversed: {reversed})"
+        );
         assert!(!holds(&d, "orders"), "reversed: {reversed}");
         assert!(!holds(&d, "items"), "reversed: {reversed}");
     }

@@ -3947,9 +3947,10 @@ mod tests {
         assert_eq!(resolved.start, first);
         let from_start = WatchOptions { resume_after: None, start_at: Some(Hlc::ZERO) };
         let mut stream = engine.watch(WatchScope::Collection(id), from_start).unwrap();
-        let heard = tokio::time::timeout(std::time::Duration::from_millis(500), stream.next(&engine))
-            .await
-            .expect("the life's first entry is heard");
+        let heard =
+            tokio::time::timeout(std::time::Duration::from_millis(500), stream.next(&engine))
+                .await
+                .expect("the life's first entry is heard");
         let Some(ChangeEvent::Change { entry, .. }) = heard else { panic!("heard {heard:?}") };
         assert_eq!(entry.kind, OpKind::Delete, "the stream begins at the delete of `t`");
     }
