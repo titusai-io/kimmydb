@@ -2249,8 +2249,17 @@ impl Engine {
                 let is_shadow = kimmy_core::vector_meta::is_shadow(&target.name);
                 let shadow_held =
                     !is_shadow && self.get_collection(&target.db, &shadow_name).is_ok();
-                let buried =
-                    self.drop_collection_inner(&target.db, &target.name, Some(entry.stamp))?;
+                // A life with writes stamped after the drop keeps them (ADR-231,
+                // extended): it is re-dated, not buried. Nothing stamped after
+                // it, which is nearly every drop, is the burial it always was.
+                let kept = match self.get_collection(&target.db, &target.name) {
+                    Ok(current) => self.keep_later_writes(&current, entry.stamp, &|| {
+                        self.check_walk(crate::WalkScope::Background)
+                    })?,
+                    Err(_) => false,
+                };
+                let buried = !kept
+                    && self.drop_collection_inner(&target.db, &target.name, Some(entry.stamp))?;
                 // Recorded even when the collection was already gone: the
                 // tombstone is what stops a *later* replay from recreating it,
                 // and a node that never had the collection still needs it.

@@ -1415,6 +1415,13 @@ impl Engine {
             // it at a time; the tombstone is recorded before the first of
             // them, so this node stops serving and re-seeding that copy at the
             // drop's first commit rather than at its last.
+            // Writes stamped after the drop are kept, as when it arrives as an
+            // entry (ADR-231, extended).
+            if self.keep_later_writes(&current, dropped, &|| {
+                self.check_walk(crate::WalkScope::Background)
+            })? {
+                return self.record_collection_drop(id, dropped);
+            }
             warn!(
                 db = %current.db,
                 collection = %current.name,
