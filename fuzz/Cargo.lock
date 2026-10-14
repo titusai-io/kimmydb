@@ -1650,7 +1650,7 @@ dependencies = [
 
 [[package]]
 name = "kimmy-api"
-version = "0.47.2"
+version = "0.48.0"
 dependencies = [
  "axum",
  "base64 0.23.1",
@@ -1685,7 +1685,7 @@ dependencies = [
 
 [[package]]
 name = "kimmy-auth"
-version = "0.47.2"
+version = "0.48.0"
 dependencies = [
  "argon2",
  "bson",
@@ -1701,7 +1701,7 @@ dependencies = [
 
 [[package]]
 name = "kimmy-cluster"
-version = "0.47.2"
+version = "0.48.0"
 dependencies = [
  "arc-swap",
  "bson",
@@ -1729,7 +1729,7 @@ dependencies = [
 
 [[package]]
 name = "kimmy-core"
-version = "0.47.2"
+version = "0.48.0"
 dependencies = [
  "base64 0.23.1",
  "bson",
@@ -1742,7 +1742,7 @@ dependencies = [
 
 [[package]]
 name = "kimmy-egress"
-version = "0.47.2"
+version = "0.48.0"
 dependencies = [
  "reqwest",
  "tokio",
@@ -1758,7 +1758,7 @@ dependencies = [
 
 [[package]]
 name = "kimmy-fuzz-harness"
-version = "0.47.2"
+version = "0.48.0"
 dependencies = [
  "arbitrary",
  "base64 0.23.1",
@@ -1773,7 +1773,7 @@ dependencies = [
 
 [[package]]
 name = "kimmy-query"
-version = "0.47.2"
+version = "0.48.0"
 dependencies = [
  "bson",
  "kimmy-core",
@@ -1786,7 +1786,7 @@ dependencies = [
 
 [[package]]
 name = "kimmy-storage"
-version = "0.47.2"
+version = "0.48.0"
 dependencies = [
  "arc-swap",
  "bson",
@@ -1802,11 +1802,12 @@ dependencies = [
  "toml",
  "tracing",
  "uuid",
+ "xxhash-rust",
 ]
 
 [[package]]
 name = "kimmy-task"
-version = "0.47.2"
+version = "0.48.0"
 dependencies = [
  "libc",
  "tokio",
@@ -1815,7 +1816,7 @@ dependencies = [
 
 [[package]]
 name = "kimmy-vector"
-version = "0.47.2"
+version = "0.48.0"
 dependencies = [
  "async-trait",
  "bson",
@@ -2686,9 +2687,9 @@ dependencies = [
 
 [[package]]
 name = "rustls"
-version = "0.23.45"
+version = "0.23.46"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "0d41d731c7d2f962d1ccc364cec258de3c0e93b38c2fb3ba97ac74513048d634"
+checksum = "48e13bd8c0e9365c43cfa5c9e8f9ad49d3c8444926c9aac819e0e4dc503c8fdf"
 dependencies = [
  "once_cell",
  "ring",
@@ -3887,6 +3888,12 @@ dependencies = [
  "thiserror 2.0.20",
  "time",
 ]
+
+[[package]]
+name = "xxhash-rust"
+version = "0.8.19"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "550a2b930b62486a393c52d5c3b84bff264b28aa437ed64694d31e93b1757af7"
 
 [[package]]
 name = "yasna"
