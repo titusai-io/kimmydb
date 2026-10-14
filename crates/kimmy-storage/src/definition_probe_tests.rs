@@ -431,6 +431,7 @@ fn an_entry_the_peer_deferred_is_deferred_here_with_the_peers_reason() {
         collection: orders,
         digest: ByteBuf::from(vec![0; 16]),
         deferred: Some(DefinitionDefer::DefinitionAboveCut),
+        above: None,
         indexes: Vec::new(),
         refused: Vec::new(),
     }];

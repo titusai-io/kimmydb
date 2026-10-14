@@ -80,6 +80,10 @@ mod log_capture;
 pub use live_walk::stop_open_after_rows_for_test;
 
 pub use database_tombstone::{Buried, BuriedCollection, Swept};
+pub use definition_probe::{
+    DefinitionAnswered, DefinitionAsk, DefinitionDefer, DefinitionEntry, DefinitionOutcome,
+    DefinitionReply, DefinitionRound, DefinitionVerdict,
+};
 pub use digest_probe::{
     ANSWER_KEY_BYTES, ASK_KEY_BYTES, Defer, DigestAnswered, DigestAsk, DigestEntry, DigestOutcome,
     DigestPlan, DigestReply, DigestRound, DigestVerdict, SCAN_BYTES, SCAN_WALL, ScanBudget,
@@ -113,6 +117,7 @@ pub use open_progress::{
     set_test_open_step_pause,
 };
 pub use purge::PurgeCounters;
+pub use refusal_hint::{HintKind, RefusalHint};
 pub use snapshot::{
     CollectionState, SNAPSHOT_PAGE, ServeVerdict, SnapshotApplied, SnapshotCursor, SnapshotDoc,
     SnapshotPage, SnapshotProgress, SnapshotTombstone,

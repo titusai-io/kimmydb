@@ -26,7 +26,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use kimmy_core::{CollectionId, Hlc, Stamp, VersionVector};
+use kimmy_core::{CollectionId, Hlc, NodeId, Stamp, VersionVector};
 use redb::{ReadableDatabase, ReadableTable};
 use serde::{Deserialize, Serialize};
 use serde_bytes::ByteBuf;
@@ -133,6 +133,11 @@ pub struct DefinitionEntry {
     /// Set instead of a digest when the peer cannot compare this collection.
     #[serde(default)]
     pub deferred: Option<DefinitionDefer>,
+    /// For a collection deferred as [`DefinitionDefer::DefinitionAboveCut`]: the
+    /// origin of a stamp above the cut, so the requester can tell a stamp that
+    /// is only in motion from one the cut can never cover (h2-N4).
+    #[serde(default)]
+    pub above: Option<NodeId>,
     /// For a collection named in the request's `detail`: the peer's definitions
     /// as `(name, 16-byte hash)`.
     #[serde(default)]
@@ -208,6 +213,12 @@ pub enum DefinitionOutcome {
 pub struct DefinitionVerdict {
     pub collection: CollectionId,
     pub outcome: DefinitionOutcome,
+    /// For a collection deferred as [`DefinitionDefer::DefinitionAboveCut`]: the
+    /// origin of a stamp above the cut, and the cut's component for it. A stamp
+    /// whose origin's component does not advance contact after contact is one
+    /// the cut cannot cover (a decommissioned node's last create), which the
+    /// caller names after a while (h2-N4).
+    pub above: Option<(NodeId, Hlc)>,
 }
 
 /// What a contact's definition probe came to, for the caller to count.
@@ -236,6 +247,8 @@ struct Facet {
     /// The definitions as `(name, hash)`.
     list: Vec<(String, DefinitionHash)>,
     deferred: Option<DefinitionDefer>,
+    /// The origin of a definition stamp above the cut, when that is why.
+    above: Option<NodeId>,
     /// The standing life's incarnation floor, which a refusal hint must be above.
     floor: Option<Hlc>,
 }
@@ -266,6 +279,7 @@ impl Engine {
         let mut tombstoned: BTreeMap<String, Option<Stamp>> = BTreeMap::new();
         let mut facets = BTreeMap::new();
         for meta in &metas {
+            let mut above = None;
             let list = definition_list(meta);
             let digest = crate::definition_digest::digest_of_list(&list);
             let deferred = if horizon {
@@ -289,39 +303,46 @@ impl Engine {
                 cut,
             ) {
                 Some(DefinitionDefer::DatabaseTombstone)
-            } else if Self::definition_above_cut(&dropped_indexes, meta, cut)? {
-                Some(DefinitionDefer::DefinitionAboveCut)
             } else {
-                None
+                above = Self::definition_above_cut(&dropped_indexes, meta, cut)?;
+                above.map(|_| DefinitionDefer::DefinitionAboveCut)
             };
-            facets.insert(meta.id, Facet { digest, list, deferred, floor: meta.incarnation_floor });
+            facets.insert(
+                meta.id,
+                Facet { digest, list, deferred, above, floor: meta.incarnation_floor },
+            );
         }
         Ok(facets)
     }
 
-    /// Whether a definition of `meta` is stamped above the cut: an index created,
-    /// a vector configuration changed, or an index dropped. Each stamp is judged
-    /// against the cut's component for its own origin, so the greatest of them is
-    /// not enough: one origin's stamp can be covered while another's is not. An
-    /// index or configuration with no stamp cannot defer.
+    /// The origin of a definition of `meta` stamped above the cut, if there is
+    /// one: an index created, a vector configuration changed, or an index dropped.
+    /// Each stamp is judged against the cut's component for its own origin, so the
+    /// greatest of them is not enough: one origin's stamp can be covered while
+    /// another's is not. An index or configuration with no stamp cannot defer.
     fn definition_above_cut(
         dropped_indexes: &impl ReadableTable<(u64, u32), &'static [u8]>,
         meta: &CollectionMeta,
         cut: &VersionVector,
-    ) -> Result<bool> {
+    ) -> Result<Option<NodeId>> {
         let above = |stamp: &Stamp| stamp.hlc > cut.get(stamp.node);
-        if meta.indexes.iter().filter_map(|i| i.created.as_ref()).any(above)
-            || meta.vector_changed.as_ref().is_some_and(above)
+        if let Some(stamp) = meta
+            .indexes
+            .iter()
+            .filter_map(|i| i.created.as_ref())
+            .chain(meta.vector_changed.as_ref())
+            .find(|stamp| above(stamp))
         {
-            return Ok(true);
+            return Ok(Some(stamp.node));
         }
         for row in dropped_indexes.range((meta.id.0, 0)..=(meta.id.0, u32::MAX))? {
             let (_, raw) = row?;
-            if above(&codec::decode_oplog_key(raw.value())?) {
-                return Ok(true);
+            let stamp = codec::decode_oplog_key(raw.value())?;
+            if above(&stamp) {
+                return Ok(Some(stamp.node));
             }
         }
-        Ok(false)
+        Ok(None)
     }
 
     /// The responder's side: the digest of every collection's definitions at
@@ -339,6 +360,7 @@ impl Engine {
                 collection: *id,
                 digest: bytes_of(facet.digest),
                 deferred: facet.deferred,
+                above: facet.above,
                 indexes: Vec::new(),
                 refused: Vec::new(),
             };
@@ -378,9 +400,20 @@ impl Engine {
                 // half's business.
                 continue;
             };
-            let verdict = |outcome| DefinitionVerdict { collection: id, outcome };
+            let verdict = |outcome| DefinitionVerdict { collection: id, outcome, above: None };
             if let Some(reason) = entry.deferred.or(here.deferred) {
-                out.push(verdict(DefinitionOutcome::Deferred(reason)));
+                // A stamp above the cut, on whichever side: its origin, and the
+                // cut's component for it, so the caller can tell a stamp in
+                // motion from one the cut cannot cover.
+                let origin = match reason {
+                    DefinitionDefer::DefinitionAboveCut => here.above.or(entry.above),
+                    _ => None,
+                };
+                out.push(DefinitionVerdict {
+                    collection: id,
+                    outcome: DefinitionOutcome::Deferred(reason),
+                    above: origin.map(|node| (node, ask.cut.get(node))),
+                });
                 continue;
             }
             let Some(theirs) = hash_of(entry.digest.as_slice()) else {

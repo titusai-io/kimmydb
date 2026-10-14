@@ -1042,7 +1042,7 @@ where
                 };
                 write_frame(&mut stream, &Message::Snapshot(Box::new(page))).await?;
             }
-            Message::AskDivergence { probe, digest } => {
+            Message::AskDivergence { probe, digest, definitions } => {
                 // Metadata only, whatever `probe` is — see
                 // `Engine::all_collection_ids`. One walk answers both halves
                 // of what this node holds: the ids, and the incarnation each
@@ -1063,6 +1063,7 @@ where
                 // The cut digest (B3), if the requester asked for it: a
                 // failure of it must never fail the count half, so anything
                 // but a stop is a reason to answer without digests.
+                let digest_cut = digest.as_ref().map(|ask| ask.cut.clone());
                 let (digests, digest_busy) = match digest {
                     Some(ask) => match kimmy_storage::blocking(|| {
                         engine.digest_answer(&ask, kimmy_storage::ScanBudget::default())
@@ -1080,6 +1081,37 @@ where
                     },
                     None => (None, false),
                 };
+                // The definition digest (B3 half 2), if the requester asked for
+                // it. Computed outside the cut digest's answer and with its own
+                // degrade: a fault of one half must not remove the other, and the
+                // digest's busy flag does not gate it (answering is one metadata
+                // read in one transaction, with no scan to be busy about). Present
+                // iff asked, so an answer to an older requester is what it was.
+                //
+                // The request carries the cut the digest's carries, built once; a
+                // request whose two cuts differ was judged at two cuts and is
+                // answered without definitions rather than at either.
+                let definitions = match definitions {
+                    Some(ask) if digest_cut.as_ref().is_some_and(|cut| *cut != ask.cut) => {
+                        warn!(
+                            "a peer's divergence request carried two different cuts; \
+                             answering without definitions"
+                        );
+                        None
+                    }
+                    Some(ask) => match kimmy_storage::blocking(|| engine.definition_answer(&ask)) {
+                        Ok(reply) => Some(reply),
+                        Err(kimmy_storage::StorageError::Stopping(reason)) => {
+                            debug!(%reason, "stopped answering a peer's definition probe: this node is shutting down");
+                            return Ok(());
+                        }
+                        Err(e) => {
+                            warn!(error = %e, "could not answer a peer's definition probe; answering without it");
+                            None
+                        }
+                    },
+                    None => None,
+                };
                 write_frame(
                     &mut stream,
                     &Message::Divergence {
@@ -1088,6 +1120,7 @@ where
                         incarnations: held.into_iter().collect(),
                         digests,
                         digest_busy,
+                        definitions,
                     },
                 )
                 .await?;
@@ -2184,8 +2217,10 @@ where
             theirs_witnessed,
             busy,
             capable: stalls.digest_capable.contains(&their_node),
+            detail: stalls.definition_detail(&their_node),
         });
-        let (findings, digest) = ask_divergence(engine, stream, gate.probe, context).await?;
+        let (findings, digest, definitions) =
+            ask_divergence(engine, stream, gate.probe, context).await?;
         stalls.note_digest(their_node, digest.as_ref());
         return Ok(SyncOutcome {
             peer: Some(their_node),
@@ -2194,6 +2229,7 @@ where
             count_probe: findings.count,
             count_probe_deferred: gate.deferred,
             digest,
+            definitions,
             exhausted: true,
             ..SyncOutcome::default()
         });
@@ -2668,13 +2704,16 @@ where
             theirs_witnessed,
             busy,
             capable: stalls.digest_capable.contains(&their_node),
+            detail: stalls.definition_detail(&their_node),
         });
-        let (findings, digest) = ask_divergence(engine, stream, gate.probe, context).await?;
+        let (findings, digest, definitions) =
+            ask_divergence(engine, stream, gate.probe, context).await?;
         stalls.note_digest(their_node, digest.as_ref());
         outcome.divergent = Some(findings.existence);
         outcome.count_probe = findings.count;
         outcome.count_probe_deferred = gate.deferred;
         outcome.digest = digest;
+        outcome.definitions = definitions;
     }
     // The other direction is a different question: how far the peer
     // trails this node, in history it can no longer be served. A peer
@@ -2923,6 +2962,11 @@ pub struct PeerStalls {
     /// these does this node pay for its own scan before asking, so a peer that
     /// predates the digest is not made to wait on one it will ignore.
     digest_capable: HashSet<NodeId>,
+    /// The collections whose definition digest differed from each peer's at the
+    /// last contact, so the next asks for their per-index detail (B3 half 2).
+    /// Written by the loop after its fold, and pruned with the collection set
+    /// and the members, so it cannot grow with what is gone.
+    definition_detail: HashMap<NodeId, BTreeSet<CollectionId>>,
     repairs: HashMap<NodeId, Repairs>,
     /// Snapshot pulls left to resume, one per peer (ADR-152): where the next
     /// page begins and what the completed snapshot grants, carried across
@@ -3204,6 +3248,39 @@ struct Stall {
 impl PeerStalls {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// The collections to ask `peer` for the definition detail of, at the next
+    /// contact.
+    pub fn definition_detail(&self, peer: &NodeId) -> Vec<CollectionId> {
+        self.definition_detail
+            .get(peer)
+            .map(|set| set.iter().copied().collect())
+            .unwrap_or_default()
+    }
+
+    /// Set the collections to ask `peer` for the definition detail of; an empty
+    /// set forgets the peer.
+    pub fn set_definition_detail(&mut self, peer: NodeId, detail: BTreeSet<CollectionId>) {
+        if detail.is_empty() {
+            self.definition_detail.remove(&peer);
+        } else {
+            self.definition_detail.insert(peer, detail);
+        }
+    }
+
+    /// Forget the detail of a collection this node no longer holds and of a
+    /// peer that is no longer a member (`peers` is `None` when the members are
+    /// not known, and only the collections are pruned).
+    pub fn retain_definition_detail(
+        &mut self,
+        peers: Option<&BTreeSet<NodeId>>,
+        held: &BTreeSet<CollectionId>,
+    ) {
+        self.definition_detail.retain(|peer, set| {
+            set.retain(|id| held.contains(id));
+            peers.is_none_or(|peers| peers.contains(peer)) && !set.is_empty()
+        });
     }
 
     /// Remember that `peer` answers digests, once it has: only to such a peer
@@ -3981,7 +4058,14 @@ async fn ask_divergence<S>(
     stream: &mut S,
     probe: Option<DivergenceProbe>,
     digest: Option<DigestContext<'_>>,
-) -> Result<(kimmy_storage::DivergenceFindings, Option<kimmy_storage::DigestRound>), ProtocolError>
+) -> Result<
+    (
+        kimmy_storage::DivergenceFindings,
+        Option<kimmy_storage::DigestRound>,
+        Option<kimmy_storage::DefinitionRound>,
+    ),
+    ProtocolError,
+>
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
@@ -4040,12 +4124,37 @@ where
         (None, None) => None,
     };
 
+    // The definition digest (B3 half 2), asked of every peer on every checked
+    // contact: it costs a few bytes and no scan, so there is no capability to
+    // learn. A peer that predates it ignores the field and is counted
+    // `unanswered`, which is the whole signal. At **the same cut** as the cut
+    // digest's request: the digest's plan when there is one, else the cut the
+    // cut-only request carries, else one read now; built once, so the two halves
+    // are judged at one cut.
+    let mut definitions_failed = false;
+    let definition_ask = match &digest {
+        Some(ctx) => {
+            let cut = match &ask {
+                Some(ask) => Some(ask.cut.clone()),
+                None => degrade_digest("plan", engine.witnessed_vector())?
+                    .map(|mine| mine.meet(ctx.theirs_witnessed)),
+            };
+            definitions_failed = cut.is_none();
+            cut.map(|cut| kimmy_storage::DefinitionAsk::new(cut, ctx.detail.iter().copied()))
+        }
+        None => None,
+    };
+
     write_frame(
         stream,
-        &Message::AskDivergence { probe: probe.as_ref().map(|p| p.id), digest: ask },
+        &Message::AskDivergence {
+            probe: probe.as_ref().map(|p| p.id),
+            digest: ask,
+            definitions: definition_ask.clone(),
+        },
     )
     .await?;
-    let (peer_collections, probe_count, peer_incarnations, digests, digest_busy) =
+    let (peer_collections, probe_count, peer_incarnations, digests, digest_busy, definitions) =
         match read_frame(stream).await? {
             Message::Divergence {
                 collections,
@@ -4053,7 +4162,8 @@ where
                 incarnations,
                 digests,
                 digest_busy,
-            } => (collections, probe_count, incarnations, digests, digest_busy),
+                definitions,
+            } => (collections, probe_count, incarnations, digests, digest_busy, definitions),
             Message::Fault(reason) => return Err(ProtocolError::Fault(reason)),
             other => {
                 return Err(ProtocolError::Malformed(format!(
@@ -4106,6 +4216,38 @@ where
         }),
     };
 
+    // The definition digest's `T2`, its own comparison with its own degrade: a
+    // fault of the digest's must not remove it, nor the reverse.
+    use kimmy_storage::{DefinitionAnswered, DefinitionRound};
+    let held_collections = mine_collections.len().max(1);
+    let definition_round = match (&definition_ask, definitions_failed) {
+        (None, true) => {
+            let mut round = DefinitionRound::new(DefinitionAnswered::Failed);
+            round.held = held_collections;
+            Some(round)
+        }
+        (None, false) => None,
+        (Some(ask), _) => Some(match definitions {
+            Some(reply) => match degrade_digest(
+                "definition comparison",
+                kimmy_storage::blocking(|| engine.definition_compare(ask, &reply)),
+            )? {
+                Some(verdicts) => DefinitionRound {
+                    answered: DefinitionAnswered::Answered,
+                    verdicts,
+                    held: held_collections,
+                    malformed: reply.malformed as usize,
+                },
+                None => {
+                    let mut round = DefinitionRound::new(DefinitionAnswered::Failed);
+                    round.held = held_collections;
+                    round
+                }
+            },
+            None => DefinitionRound::new(DefinitionAnswered::Unanswered),
+        }),
+    };
+
     let mine = kimmy_storage::DivergenceLocalState {
         collections: mine_collections,
         probe: probe.map(|p| (p.id, p.mine_count)),
@@ -4116,7 +4258,7 @@ where
         probe_count,
         incarnations: peer_incarnations.into_iter().collect(),
     };
-    Ok((kimmy_storage::compare_divergence(&mine, &peer), round))
+    Ok((kimmy_storage::compare_divergence(&mine, &peer), round, definition_round))
 }
 
 /// A storage error of the digest's own: a stop is fatal to the contact, as
@@ -4148,7 +4290,7 @@ fn degrade_digest<T>(
                     )
                     .is_ok()
             {
-                warn!(error = %e, step = what, "the cut digest failed on this side; the contact goes on without it");
+                warn!(error = %e, step = what, "a divergence digest failed on this side; the contact goes on without it");
             }
             Ok(None)
         }
@@ -4163,6 +4305,9 @@ struct DigestContext<'a> {
     busy: Option<CollectionId>,
     /// Whether the peer has answered a digest before.
     capable: bool,
+    /// The collections whose per-index detail the definition probe asks for:
+    /// those whose definition digest differed at the last contact with this peer.
+    detail: Vec<CollectionId>,
 }
 
 /// What one round's snapshot pull came to (ADR-152).
@@ -5654,6 +5799,7 @@ mod tests {
                 incarnations: Vec::new(),
                 digests: None,
                 digest_busy: false,
+                definitions: None,
             };
             write_frame(&mut stream, &divergence).await.unwrap();
         }
@@ -6039,6 +6185,7 @@ mod tests {
                 incarnations: Vec::new(),
                 digests: None,
                 digest_busy: false,
+                definitions: None,
             };
             write_frame(&mut stream, &answer).await.unwrap();
         }
@@ -6234,6 +6381,7 @@ mod tests {
                     incarnations: Vec::new(),
                     digests: None,
                     digest_busy: false,
+                    definitions: None,
                 };
                 write_frame(&mut stream, &divergence).await.unwrap();
             }
@@ -6415,6 +6563,7 @@ mod tests {
                     incarnations: Vec::new(),
                     digests: None,
                     digest_busy: false,
+                    definitions: None,
                 };
                 write_frame(&mut stream, &divergence).await.unwrap();
             }
@@ -6691,6 +6840,7 @@ mod tests {
                     incarnations: Vec::new(),
                     digests: None,
                     digest_busy: false,
+                    definitions: None,
                 };
                 write_frame(&mut stream, &divergence).await.unwrap();
             }
@@ -6922,6 +7072,7 @@ mod tests {
                 incarnations,
                 digests: None,
                 digest_busy: false,
+                definitions: None,
             };
             write_frame(&mut stream, &divergence).await.unwrap();
             assert!(matches!(read_frame(&mut stream).await, Err(ProtocolError::Closed)));
@@ -7754,6 +7905,7 @@ mod tests {
             incarnations: Vec::new(),
             digests: None,
             digest_busy: false,
+            definitions: None,
         };
         let _ = write_frame(&mut stream, &answer).await;
     }
@@ -8018,6 +8170,7 @@ mod tests {
                     incarnations: Vec::new(),
                     digests: None,
                     digest_busy: false,
+                    definitions: None,
                 };
                 let _ = write_frame(&mut peer_end, &answer).await;
             }
@@ -8331,7 +8484,11 @@ mod tests {
                 open_handshake(other, &mut ours, SECRET, BINDING).await.unwrap();
                 write_frame(
                     &mut ours,
-                    &Message::AskDivergence { probe: None, digest: Some(ask.clone()) },
+                    &Message::AskDivergence {
+                        probe: None,
+                        digest: Some(ask.clone()),
+                        definitions: None,
+                    },
                 )
                 .await
                 .unwrap();
@@ -9413,6 +9570,7 @@ mod partial_windows_never_skip {
                     incarnations: Vec::new(),
                     digests: None,
                     digest_busy: busy,
+                    definitions: None,
                 };
                 write_frame(&mut peer_end, &answer).await.unwrap();
             });
@@ -9490,6 +9648,7 @@ mod partial_windows_never_skip {
                 incarnations: Vec::new(),
                 digests: None,
                 digest_busy: false,
+                definitions: None,
             };
             write_frame(&mut peer_end, &answer).await.unwrap();
             digest

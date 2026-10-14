@@ -419,6 +419,13 @@ pub struct DivergenceTracker {
     digest_pending: std::collections::HashSet<(NodeId, CollectionId)>,
     /// Collections confirmed divergent by digest against each peer.
     digest_confirmed: HashMap<NodeId, BTreeSet<CollectionId>>,
+    /// `(peer, collection)` pairs whose most recent *compared* definition digest
+    /// mismatched (B3 half 2), and the collections confirmed on two consecutive
+    /// compared mismatches. The digest's rhythm, and **kept apart from
+    /// everything a repair is planned from** for the same reason: they feed the
+    /// gauges and never [`Self::confirmed_against`].
+    definition_pending: std::collections::HashSet<(NodeId, CollectionId)>,
+    definition_confirmed: HashMap<NodeId, BTreeSet<CollectionId>>,
 }
 
 impl DivergenceTracker {
@@ -455,6 +462,11 @@ impl DivergenceTracker {
             confirmed.retain(|id| mine.contains(id));
         }
         self.digest_confirmed.retain(|_, confirmed| !confirmed.is_empty());
+        self.definition_pending.retain(|(_, id)| mine.contains(id));
+        for confirmed in self.definition_confirmed.values_mut() {
+            confirmed.retain(|id| mine.contains(id));
+        }
+        self.definition_confirmed.retain(|_, confirmed| !confirmed.is_empty());
 
         self.cursor = next_probe(mine, self.cursor);
         self.cursor
@@ -546,12 +558,53 @@ impl DivergenceTracker {
         self.digest_confirmed.values().flatten().collect::<BTreeSet<_>>().len()
     }
 
+    /// Fold in one collection's definition comparison against `peer`, and say
+    /// whether this one **newly confirmed** a finding (two consecutive compared
+    /// mismatches of that pair: an index X mismatching at one contact and Y at
+    /// the next confirms), for the one WARN a finding gets. A compared match, and
+    /// an *explained* mismatch, clear it (the caller says `mismatched = false`
+    /// for both); a collection not compared this contact leaves the state where
+    /// its last comparison left it.
+    pub fn observe_definition(&mut self, peer: NodeId, id: CollectionId, mismatched: bool) -> bool {
+        let key = (peer, id);
+        if mismatched {
+            let confirmed = self.definition_pending.contains(&key);
+            self.definition_pending.insert(key);
+            if confirmed {
+                return self.definition_confirmed.entry(peer).or_default().insert(id);
+            }
+        } else {
+            self.definition_pending.remove(&key);
+            if let Some(set) = self.definition_confirmed.get_mut(&peer) {
+                set.remove(&id);
+                if set.is_empty() {
+                    self.definition_confirmed.remove(&peer);
+                }
+            }
+        }
+        false
+    }
+
+    /// Whether `id` is confirmed divergent by the definition digest against
+    /// `peer`.
+    pub fn is_definition_confirmed(&self, peer: NodeId, id: CollectionId) -> bool {
+        self.definition_confirmed.get(&peer).is_some_and(|set| set.contains(&id))
+    }
+
+    /// Distinct collections confirmed divergent by the definition digest
+    /// against at least one peer: what
+    /// `kimmy_sync_definition_divergent_collections` reports.
+    pub fn definition_confirmed_count(&self) -> usize {
+        self.definition_confirmed.values().flatten().collect::<BTreeSet<_>>().len()
+    }
+
     /// Collections confirmed divergent against `peer` by either half of
     /// the check, as of its last folded-in contact — what a repair against
     /// that peer is planned from (ADR-148). Empty for a peer with nothing
     /// confirmed, or never checked.
     ///
-    /// **Not the digest's findings** (B3): see the field they live in.
+    /// **Not the digest's findings, nor the definition digest's** (B3): see the
+    /// fields they live in.
     pub fn confirmed_against(&self, peer: NodeId) -> BTreeSet<CollectionId> {
         let mut out = self.confirmed.get(&peer).cloned().unwrap_or_default();
         if let Some(by_count) = self.count_confirmed.get(&peer) {
@@ -571,6 +624,7 @@ impl DivergenceTracker {
             .flatten()
             .chain(self.count_confirmed.values().flatten())
             .chain(self.digest_confirmed.values().flatten())
+            .chain(self.definition_confirmed.values().flatten())
             .collect::<BTreeSet<_>>()
             .len()
     }
@@ -608,6 +662,64 @@ mod tests {
         assert!(!tracker.observe_digest(p, c, false));
         assert_eq!(tracker.digest_confirmed_count(), 0, "a compared match clears it");
         assert!(!tracker.observe_digest(p, c, true), "and it must be confirmed afresh");
+    }
+
+    #[test]
+    fn a_definition_finding_confirms_on_two_compared_mismatches_and_clears_on_a_match_or_an_explanation()
+     {
+        let mut tracker = DivergenceTracker::new();
+        let (p, c) = (NodeId::generate(), CollectionId(7));
+        assert!(!tracker.observe_definition(p, c, true), "one mismatch is not a finding");
+        assert_eq!(tracker.definition_confirmed_count(), 0);
+        assert!(tracker.observe_definition(p, c, true), "the second confirms, once");
+        assert!(!tracker.observe_definition(p, c, true), "and is not newly confirmed again");
+        assert_eq!(tracker.definition_confirmed_count(), 1);
+        assert!(tracker.is_definition_confirmed(p, c));
+        // A compared match and an explained mismatch both come as `false`.
+        assert!(!tracker.observe_definition(p, c, false));
+        assert_eq!(tracker.definition_confirmed_count(), 0, "cleared");
+        assert!(!tracker.observe_definition(p, c, true), "and confirmed afresh");
+    }
+
+    /// A definition finding is on the gauges and never in what a repair is
+    /// planned from. Mutation row: add the definition set to `confirmed_against`.
+    #[test]
+    fn a_definition_finding_plans_nothing_and_the_gauge_reads_one() {
+        let mut tracker = DivergenceTracker::new();
+        let (p, c) = (NodeId::generate(), CollectionId(7));
+        tracker.observe_definition(p, c, true);
+        tracker.observe_definition(p, c, true);
+        assert!(tracker.confirmed_against(p).is_empty(), "no repair is planned from it");
+        assert_eq!(tracker.confirmed_count(), 1, "the gauge reads it");
+        assert_eq!(tracker.definition_confirmed_count(), 1, "the attribution gauge");
+        assert_eq!(tracker.digest_confirmed_count(), 0, "and it is not the digest's");
+    }
+
+    /// One collection under two kinds is one collection on the gauge.
+    #[test]
+    fn a_collection_confirmed_by_two_kinds_counts_once() {
+        let mut tracker = DivergenceTracker::new();
+        let (p, q, c) = (NodeId::generate(), NodeId::generate(), CollectionId(7));
+        for _ in 0..2 {
+            tracker.observe_digest(p, c, true);
+            tracker.observe_definition(q, c, true);
+        }
+        assert_eq!(tracker.digest_confirmed_count(), 1);
+        assert_eq!(tracker.definition_confirmed_count(), 1);
+        assert_eq!(tracker.confirmed_count(), 1, "one collection, however many kinds");
+    }
+
+    #[test]
+    fn a_dropped_collection_is_swept_from_the_definition_state_and_does_not_leave_a_pending_mismatch()
+     {
+        let mut tracker = DivergenceTracker::new();
+        let (p, c) = (NodeId::generate(), CollectionId(7));
+        tracker.observe_definition(p, c, true);
+        tracker.observe_definition(p, c, true);
+        assert_eq!(tracker.definition_confirmed_count(), 1);
+        tracker.advance_probe(&BTreeSet::new());
+        assert_eq!(tracker.definition_confirmed_count(), 0, "gone with the collection");
+        assert!(!tracker.observe_definition(p, c, true), "a recreated one starts afresh");
     }
 
     /// B3 design 2.7 (N5): a digest finding is on the gauges and never in what
