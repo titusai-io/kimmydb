@@ -9925,6 +9925,30 @@ async fn a_write_after_a_drop_brings_the_collection_back_on_every_member_and_the
 /// with documents 2 and 3, the gauge returns to 0 and the repair ends.
 #[tokio::test]
 async fn a_drop_a_recreation_and_a_write_after_the_drop_converge_on_three_members() {
+    three_members_after_a_drop(None).await;
+}
+
+/// The same, with A hearing of D's write *before* B's creation: the write
+/// reaches a member that holds the drop's tombstone and not yet the collection,
+/// and is set aside there. The members must still converge, because the count
+/// half's repair replays from where the live life's valid history begins (the
+/// floor) and not from the life's creation, which is after the write. Found by
+/// a CI run that took the other order: A held {2}, B and D {2, 3}, and the
+/// repair ran on for ever.
+#[tokio::test]
+async fn a_write_after_a_drop_that_reaches_a_member_before_the_recreation_is_still_repaired() {
+    three_members_after_a_drop(Some('d')).await;
+}
+
+/// And with the recreation first, the order the first test usually takes.
+#[tokio::test]
+async fn a_recreation_that_reaches_a_member_before_the_write_after_the_drop_converges_too() {
+    three_members_after_a_drop(Some('b')).await;
+}
+
+/// The three-member case. `first` says which of D's write and B's creation A
+/// hears first, before any loop runs; `None` leaves it to the loops.
+async fn three_members_after_a_drop(first: Option<char>) {
     use kimmy_cluster::{ReplicationConfig, RoundReport, SeedSource, replicate};
 
     let a = node().await;
@@ -9950,6 +9974,14 @@ async fn a_drop_a_recreation_and_a_write_after_the_drop_converge_on_three_member
     let on_b = b.engine.create_collection("shop", "orders").unwrap();
     assert!(on_b.created > dropped.hlc, "premise: the creation is after the drop");
     b.engine.insert(&on_b, doc! { "_id": 2i64 }).unwrap();
+    let order: &[&Node] = match first {
+        Some('d') => &[&d, &b],
+        Some('b') => &[&b, &d],
+        _ => &[],
+    };
+    for peer in order {
+        sync_once(&a.engine, peer.addr, SECRET, None).await.expect("a should pull");
+    }
 
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<(usize, RoundReport)>();
     let nodes = [&a, &b, &d];
