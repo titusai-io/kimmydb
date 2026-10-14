@@ -1635,6 +1635,45 @@ pub(crate) fn aims_at_a_previous_incarnation(current: &CollectionMeta, dropped: 
     predates_create || at_or_before_floor
 }
 
+/// Whether a life arriving from elsewhere began after a drop that ended the one
+/// standing here (ADR-235), so the standing one is over everywhere else and a member
+/// still holding it holds a life that has ended. The create-side counterpart of
+/// [`aims_at_a_previous_incarnation`], which judges a drop against what stands here.
+///
+/// All of these hold:
+/// - **a floor** (`floor` is the sender's incarnation floor, the drop it was created
+///   after): with none there is no evidence of a drop, and two members that create one
+///   name independently are not a life ended;
+/// - **the arriving life is newer** than the standing one (`created`), so a sender that
+///   is behind never buries a life it has not caught up to;
+/// - **the drop was at or after the standing life's creation** (`floor >= standing.created`)
+///   and before the arriving creation (`floor < created`): a floor below it is a drop the
+///   standing life was made after, which this member already knows by its own floor;
+/// - **it is not the same life re-dated** (ADR-231, extended): a life a drop re-dated to
+///   keep what was written after it (`redated_from` on the arriving side, the re-dating
+///   marker on the standing one) began where it always did, so both sides' beginnings
+///   are compared, and equal ones are one life continuing.
+pub(crate) fn arriving_life_ends_the_standing_one(
+    standing: &CollectionMeta,
+    created: Option<Hlc>,
+    redated_from: Option<Hlc>,
+    floor: Option<Hlc>,
+) -> bool {
+    let (Some(created), Some(floor)) = (created, floor) else {
+        return false;
+    };
+    let standing_began = if standing.is_redated() {
+        standing.redated.map_or(standing.created, |marker| marker.from)
+    } else {
+        standing.created
+    };
+    let arriving_began = redated_from.unwrap_or(created);
+    created > standing.created
+        && floor >= standing.created
+        && floor < created
+        && arriving_began != standing_began
+}
+
 /// Collection metadata as resolved during one batch.
 ///
 /// Valid until the next schema change, which is the only thing *in this

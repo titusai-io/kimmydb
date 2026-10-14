@@ -193,6 +193,16 @@ pub struct CollectionState {
     /// receiver that predates it ignores it and judges `created`, as before.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub redated_from: Option<Hlc>,
+    /// The sender's incarnation floor for this life (`CollectionMeta::incarnation_floor`):
+    /// the drop it was created after. The one fact on a page that tells a life made
+    /// after a drop from a life made by another member at the same time with no drop
+    /// between, which `created` alone cannot: with the drop's tombstone aged out on the
+    /// sender, the receiver holding the life before had nothing to learn the first from
+    /// (ADR-235). Optional on the wire: a sender that predates it writes none, a receiver
+    /// that predates it ignores it, and a page without one is read as no evidence, so
+    /// nothing is buried.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub incarnation_floor: Option<Hlc>,
 }
 
 impl CollectionState {
@@ -214,8 +224,15 @@ impl From<CollectionMeta> for CollectionState {
             created: Some(meta.created),
             vector_changed: meta.vector_changed,
             redated_from,
+            incarnation_floor: meta.incarnation_floor,
         }
     }
+}
+
+/// Whether a time that carries no origin is named by a page's `versions`: some origin's
+/// coverage reaches it (ADR-163).
+fn hlc_is_named(hlc: Hlc, versions: &VersionVector) -> bool {
+    versions.iter().any(|(_, covered)| hlc <= covered)
 }
 
 /// One document, as it currently stands.
@@ -853,7 +870,7 @@ impl Engine {
         self.apply_carried_index_drops(page, progress.scope)?;
         let mut ddl_refused = 0usize;
         for state in &page.collections {
-            match self.restore_collection(state, &page.versions) {
+            match self.restore_collection(state, &page.versions, peer) {
                 Ok(refused) => ddl_refused += refused,
                 // The page's own drops just buried a life of this name, and
                 // its rows are the purger's now. What the page committed so
@@ -1534,9 +1551,61 @@ impl Engine {
     /// create of some origin the sender has processed, so it is named if any
     /// origin's coverage reaches it.
     fn witness_covered_hlc(&self, hlc: Hlc, versions: &kimmy_core::VersionVector) {
-        if versions.iter().any(|(_, covered)| hlc <= covered) {
+        if hlc_is_named(hlc, versions) {
             self.witness_hlc(hlc);
         }
+    }
+
+    /// A page's life began after a drop that ended the one standing here, and no
+    /// tombstone for that drop reached this node (it aged out on the sender, or was
+    /// not carried): end the standing life as that drop would (ADR-235).
+    ///
+    /// The evidence is the sender's incarnation floor, judged by
+    /// [`crate::sync::arriving_life_ends_the_standing_one`] against what stands here,
+    /// and named by the sender's own coverage like every stamp off the wire (ADR-163).
+    /// The drop is applied through the one path a carried drop takes
+    /// (`restore_collection_drop`: the late-drop sweep that keeps what was written
+    /// after the drop, the tombstone recorded), at a stamp made of the floor and the
+    /// sender's node, because a page carries the floor as a time and not the origin of
+    /// the drop; the real tombstone, if it ever arrives, is the same or a later stamp
+    /// and replaces it. With no floor on the page, nothing is buried: two members that
+    /// create one name with no drop between them are not a life ended.
+    fn bury_the_life_this_one_followed(
+        &self,
+        state: &CollectionState,
+        versions: &VersionVector,
+        from: NodeId,
+    ) -> Result<()> {
+        let Some(floor) = state.incarnation_floor.filter(|floor| hlc_is_named(*floor, versions))
+        else {
+            return Ok(());
+        };
+        let Ok(standing) = self.get_collection(&state.db, &state.name) else {
+            return Ok(());
+        };
+        if !crate::sync::arriving_life_ends_the_standing_one(
+            &standing,
+            state.created,
+            state.redated_from,
+            Some(floor),
+        ) {
+            return Ok(());
+        }
+        warn!(
+            db = %state.db,
+            collection = %state.name,
+            standing_created = ?standing.created,
+            arriving_created = ?state.created,
+            floor = ?floor,
+            "a snapshot's life of this collection began after a drop that ended the one \
+             standing here, and no tombstone for it arrived; ending the standing life as \
+             that drop would, keeping what was written after it"
+        );
+        self.witness_hlc(floor);
+        self.restore_collection_drop(
+            CollectionId::derive(&state.db, &state.name),
+            Stamp::new(floor, from),
+        )
     }
 
     /// Recreate a collection and its indexes from a snapshot.
@@ -1557,12 +1626,14 @@ impl Engine {
         &self,
         state: &CollectionState,
         versions: &VersionVector,
+        from: NodeId,
     ) -> Result<usize> {
         // The creation, before it is stored: the clock must be past the incarnation this
         // node is about to serve, or its next local write is stamped below it.
         if let Some(created) = state.created {
             self.witness_covered_hlc(created, versions);
         }
+        self.bury_the_life_this_one_followed(state, versions, from)?;
         if self.get_collection(&state.db, &state.name).is_err() {
             // A snapshot must not recreate a life this node has buried. The
             // page is current state on its sender, not an instruction: a peer
@@ -7260,7 +7331,7 @@ mod tests {
 
                 let definitions = |b: &Engine| {
                     for state in &page.collections {
-                        b.restore_collection(state, &page.versions).unwrap();
+                        b.restore_collection(state, &page.versions, a.node_id()).unwrap();
                     }
                 };
                 if drops_first {
