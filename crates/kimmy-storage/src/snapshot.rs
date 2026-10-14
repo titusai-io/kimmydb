@@ -1463,20 +1463,23 @@ impl Engine {
             // Writes stamped after the drop are kept, as when it arrives as an
             // entry (ADR-231, extended), unless the database's own drop covers
             // the life (ADR-229): one guard, judged in the burying transaction.
-            warn!(
-                db = %current.db,
-                collection = %current.name,
-                stamp = ?dropped,
-                "the peer has dropped the collection this snapshot was to repair, and the copy \
-                 held here is of the incarnation it dropped; dropping it too"
-            );
-            if matches!(
-                self.drop_keeping_later_writes(&current.db, &current.name, dropped, &|| {
-                    self.check_walk(crate::WalkScope::Background)
-                })?,
-                crate::late_drop::Dropped::Kept
-            ) {
-                return self.record_collection_drop(id, dropped);
+            match self.drop_keeping_later_writes(&current.db, &current.name, dropped, &|| {
+                self.check_walk(crate::WalkScope::Background)
+            })? {
+                crate::late_drop::Dropped::Kept => {
+                    return self.record_collection_drop(id, dropped);
+                }
+                crate::late_drop::Dropped::Buried(buried) => {
+                    if buried {
+                        warn!(
+                            db = %current.db,
+                            collection = %current.name,
+                            stamp = ?dropped,
+                            "the peer has dropped the collection this snapshot was to repair, and \
+                             the copy held here is of the incarnation it dropped; dropped it too"
+                        );
+                    }
+                }
             }
         } else {
             // `debug`, not `warn`. On the scoped route this is one line for the
