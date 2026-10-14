@@ -478,6 +478,18 @@ pub struct MetricsSnapshot {
     pub sync_digest_deferred: [u64; kimmy_storage::Defer::ALL.len()],
     /// Kept digest rows a self-check found drifted and corrected.
     pub sync_digest_drift: u64,
+    /// Collections the definition digest currently has confirmed (B3 half 2):
+    /// also counted in `sync_divergent_collections`, which this attributes.
+    pub sync_definition_divergent_collections: u64,
+    /// Collections whose definitions were compared (equal or not), whose
+    /// differences a refusal hint explained, and checked contacts whose peer
+    /// answered no definition digest.
+    pub sync_definition_compared: u64,
+    pub sync_definition_explained: u64,
+    pub sync_definition_unanswered: u64,
+    /// Collections whose definitions were not compared, by reason
+    /// (`kimmy_storage::DefinitionDefer::ALL`).
+    pub sync_definition_deferred: [u64; kimmy_storage::DefinitionDefer::ALL.len()],
     /// Seconds since the last contact whose round ran the check, computed
     /// when this snapshot was taken from the instant the loop last
     /// reported; since the process started before the first (ADR-145,
@@ -599,6 +611,13 @@ pub struct Metrics {
     sync_digest_probed: AtomicU64,
     sync_digest_deferred: [AtomicU64; kimmy_storage::Defer::ALL.len()],
     sync_digest_drift: AtomicU64,
+    /// The definition digest's (B3 half 2): a level, and counters, on the same
+    /// terms.
+    sync_definition_divergent_collections: AtomicU64,
+    sync_definition_compared: AtomicU64,
+    sync_definition_explained: AtomicU64,
+    sync_definition_unanswered: AtomicU64,
+    sync_definition_deferred: [AtomicU64; kimmy_storage::DefinitionDefer::ALL.len()],
     /// When the loop last ran the check against any peer, as the loop
     /// reported it at its last tick; `None` before the first check
     /// (ADR-145, ADR-154). What `kimmy_sync_divergence_check_age_seconds`
@@ -721,6 +740,11 @@ impl Default for Metrics {
             sync_digest_probed: AtomicU64::new(0),
             sync_digest_deferred: std::array::from_fn(|_| AtomicU64::new(0)),
             sync_digest_drift: AtomicU64::new(0),
+            sync_definition_divergent_collections: AtomicU64::new(0),
+            sync_definition_compared: AtomicU64::new(0),
+            sync_definition_explained: AtomicU64::new(0),
+            sync_definition_unanswered: AtomicU64::new(0),
+            sync_definition_deferred: std::array::from_fn(|_| AtomicU64::new(0)),
             sync_divergence_last_check: parking_lot::Mutex::new(None),
             sync_entries_skipped_unknown_collection: AtomicU64::new(0),
             sync_entries_skipped_beyond_advertised: AtomicU64::new(0),
@@ -959,6 +983,17 @@ impl Metrics {
         }
         // A total the loop reads from the engine, so a level this stores.
         self.sync_digest_drift.store(round.digest_drift_total, Ordering::Relaxed);
+        self.sync_definition_divergent_collections
+            .store(round.definition_divergent_collections as u64, Ordering::Relaxed);
+        self.sync_definition_compared
+            .fetch_add(round.definition_compared as u64, Ordering::Relaxed);
+        self.sync_definition_explained
+            .fetch_add(round.definition_explained as u64, Ordering::Relaxed);
+        self.sync_definition_unanswered
+            .fetch_add(round.definition_unanswered as u64, Ordering::Relaxed);
+        for (slot, n) in self.sync_definition_deferred.iter().zip(round.definition_deferred) {
+            slot.fetch_add(n as u64, Ordering::Relaxed);
+        }
         *self.sync_divergence_last_check.lock() = round.divergence_last_check;
         *self.replication_progress.lock() = round.last_completed_round;
         self.record_entries_skipped(
@@ -1374,6 +1409,14 @@ impl Metrics {
                 self.get(&self.sync_digest_deferred[slot])
             }),
             sync_digest_drift: self.get(&self.sync_digest_drift),
+            sync_definition_divergent_collections: self
+                .get(&self.sync_definition_divergent_collections),
+            sync_definition_compared: self.get(&self.sync_definition_compared),
+            sync_definition_explained: self.get(&self.sync_definition_explained),
+            sync_definition_unanswered: self.get(&self.sync_definition_unanswered),
+            sync_definition_deferred: std::array::from_fn(|slot| {
+                self.get(&self.sync_definition_deferred[slot])
+            }),
             sync_divergence_check_age_secs: self.sync_divergence_check_age_secs_at(now),
             sync_entries_skipped_unknown_collection: self
                 .get(&self.sync_entries_skipped_unknown_collection),
@@ -1738,7 +1781,7 @@ impl Metrics {
              # HELP kimmy_sync_horizon_state_held_total Pulls this node refused because the window would have crossed history it holds only as the state a snapshot gave it, not because retention removed it (ADR-224). The member asking is told BeyondHorizon; it asks another member first and takes a snapshot only if none can serve it. Not an error: 0 on a member that never caught up by a whole-database snapshot, and a few after one while members behind its grant ask it first.\n\
              # TYPE kimmy_sync_horizon_state_held_total counter\n\
              kimmy_sync_horizon_state_held_total {sync_horizon_state_held}\n\
-             # HELP kimmy_sync_divergent_collections Collections a periodic cross-member check currently finds disagreeing with a peer - held there and not here, held by both with a different document count, or (0.48.0) held by both with a different set of (id, stamp) pairs, which kimmy_sync_digest_divergent_collections attributes and which nothing repairs - confirmed on two checks running. 0 on a converged cluster. Moves for a divergence that leaves every other sync series reading healthy, because nothing about it fails a round.\n\
+             # HELP kimmy_sync_divergent_collections Collections a periodic cross-member check currently finds disagreeing with a peer - held there and not here, held by both with a different document count, or (0.48.0) held by both with a different set of (id, stamp) pairs, which kimmy_sync_digest_divergent_collections attributes, or (0.49.0) held by both with different index or vector definitions, which kimmy_sync_definition_divergent_collections attributes; nothing repairs either - confirmed on two checks running. 0 on a converged cluster. Moves for a divergence that leaves every other sync series reading healthy, because nothing about it fails a round.\n\
              # TYPE kimmy_sync_divergent_collections gauge\n\
              kimmy_sync_divergent_collections {sync_divergent}\n\
              # HELP kimmy_sync_divergence_checks_total Contacts with a peer in which the cross-member divergence check above ran, and rounds that did not run it - completed with the pull truncated by the batch cap, or failed. kimmy_sync_divergent_collections reading 0 is evidence that the peers agree only while ran is rising; ran flat while skipped rises means nothing looked, which a bare 0 cannot say. A round that failed is counted in kimmy_sync_failures_total and here as skipped, so ran plus skipped is every round attempted.\n\
@@ -1761,6 +1804,15 @@ impl Metrics {
              # HELP kimmy_sync_digest_drift_total Kept digest rows a self-check found disagreeing with the records they summarise, and corrected, since the process started. A healthy node reads 0; a rising value is a bug in the digest's maintenance and is logged at ERROR.\n\
              # TYPE kimmy_sync_digest_drift_total counter\n\
              kimmy_sync_digest_drift_total {sync_digest_drift}\n\
+             # HELP kimmy_sync_definition_divergent_collections Collections the definition digest currently finds disagreeing with a peer: the two members hold different index or vector definitions for them, seen on two compared checks running. Also counted in kimmy_sync_divergent_collections, which this attributes. Detect only: nothing is repaired from it. Read the indexes of the collection on both members (GET /v1/db/{{db}}/coll/{{coll}}/indexes) and compare the definition the WARN names, including expireAfterSeconds and unique, before recreating anything (operations.md, The definition digest).\n\
+             # TYPE kimmy_sync_definition_divergent_collections gauge\n\
+             kimmy_sync_definition_divergent_collections {sync_definition_divergent}\n\
+             # HELP kimmy_sync_divergence_definition_probes_total Collections the definition digest looked at, by outcome. compared: both sides' digests of the collection's index and vector definitions were taken at one cut and compared; the gauge reading 0 means the members agree only while this rises. explained: the digests differed and a valid refusal hint on one side covers every differing definition, a refusal this node or the peer counted in kimmy_sync_ddl_refused_total, so the difference is known; never counted as compared. unanswered: a checked contact whose peer returned no definition digest (a build before it). deferred, by reason: not compared, and none is silent. incarnation: this side or the peer holds a drop tombstone for the collection that the cut does not yet cover, or the collection is not newer than the drop. database_tombstone: the same for the collection's database. definition_above_cut: an index or vector configuration of the collection was made or dropped above the cut, so it is in motion. horizon: the cut is below what retention removed, so no collection can be judged on either side. error: this side failed to compute or to compare, and the contact went on without it. malformed: an entry of the peer's answer did not decode, or carried a digest of the wrong width. Deferrals are reported, not graded; compared must be above 0 for each live pair.\n\
+             # TYPE kimmy_sync_divergence_definition_probes_total counter\n\
+             kimmy_sync_divergence_definition_probes_total{{outcome=\"compared\"}} {sync_definition_compared}\n\
+             kimmy_sync_divergence_definition_probes_total{{outcome=\"explained\"}} {sync_definition_explained}\n\
+             kimmy_sync_divergence_definition_probes_total{{outcome=\"unanswered\"}} {sync_definition_unanswered}\n\
+             {sync_definition_deferred_lines}\
              # HELP kimmy_sync_divergence_check_age_seconds Seconds since the last contact, with any peer, in which the cross-member divergence check ran, computed when this page is read. Before the first such contact, seconds since the process started, never 0; 0 on a node without clustering, so alert on it only where kimmy_task_progress_age_seconds has a replication row. Above a few multiples of cluster.sync_interval_secs, kimmy_sync_divergent_collections is holding a value nothing has re-examined, whether the rounds are failing or the loop itself is stuck - look at kimmy_sync_failures_total, kimmy_sync_peers_backing_off and kimmy_write_lock_wait_seconds.\n\
              # TYPE kimmy_sync_divergence_check_age_seconds gauge\n\
              kimmy_sync_divergence_check_age_seconds {sync_div_age}\n\
@@ -1911,6 +1963,20 @@ impl Metrics {
                 })
                 .collect::<String>(),
             sync_digest_drift = self.get(&self.sync_digest_drift),
+            sync_definition_divergent = self.get(&self.sync_definition_divergent_collections),
+            sync_definition_compared = self.get(&self.sync_definition_compared),
+            sync_definition_explained = self.get(&self.sync_definition_explained),
+            sync_definition_unanswered = self.get(&self.sync_definition_unanswered),
+            sync_definition_deferred_lines = kimmy_storage::DefinitionDefer::ALL
+                .iter()
+                .map(|reason| {
+                    format!(
+                        "kimmy_sync_divergence_definition_probes_total{{outcome=\"deferred\",reason=\"{}\"}} {}\n",
+                        reason.label(),
+                        self.get(&self.sync_definition_deferred[reason.index()])
+                    )
+                })
+                .collect::<String>(),
             sync_div_age = self.sync_divergence_check_age_secs_at(now),
             sync_skipped_unknown = self.get(&self.sync_entries_skipped_unknown_collection),
             sync_skipped_beyond = self.get(&self.sync_entries_skipped_beyond_advertised),
@@ -2621,6 +2687,11 @@ mod tests {
             digest_deferred: [121, 122, 123, 124, 125, 126, 127, 128, 129, 130, 131, 132],
             digest_divergent_collections: 15,
             digest_drift_total: 16,
+            definition_compared: 141,
+            definition_explained: 142,
+            definition_unanswered: 143,
+            definition_deferred: [151, 152, 153, 154, 155, 156],
+            definition_divergent_collections: 17,
             divergence_last_check: Some(now - Duration::from_secs(70)),
             last_completed_round: Some(now - Duration::from_secs(80)),
             entries_skipped_unknown_collection: 72,
@@ -2652,6 +2723,11 @@ mod tests {
             digest_deferred: [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12],
             digest_divergent_collections: 7,
             digest_drift_total: 9,
+            definition_compared: 2,
+            definition_explained: 3,
+            definition_unanswered: 4,
+            definition_deferred: [1, 2, 3, 4, 5, 6],
+            definition_divergent_collections: 5,
             divergence_last_check: Some(now - Duration::from_secs(71)),
             last_completed_round: Some(now - Duration::from_secs(81)),
             entries_skipped_unknown_collection: 1,
@@ -3459,7 +3535,7 @@ kimmy_sync_ddl_relogged_total 91
 # HELP kimmy_sync_horizon_state_held_total Pulls this node refused because the window would have crossed history it holds only as the state a snapshot gave it, not because retention removed it (ADR-224). The member asking is told BeyondHorizon; it asks another member first and takes a snapshot only if none can serve it. Not an error: 0 on a member that never caught up by a whole-database snapshot, and a few after one while members behind its grant ask it first.
 # TYPE kimmy_sync_horizon_state_held_total counter
 kimmy_sync_horizon_state_held_total 92
-# HELP kimmy_sync_divergent_collections Collections a periodic cross-member check currently finds disagreeing with a peer - held there and not here, held by both with a different document count, or (0.48.0) held by both with a different set of (id, stamp) pairs, which kimmy_sync_digest_divergent_collections attributes and which nothing repairs - confirmed on two checks running. 0 on a converged cluster. Moves for a divergence that leaves every other sync series reading healthy, because nothing about it fails a round.
+# HELP kimmy_sync_divergent_collections Collections a periodic cross-member check currently finds disagreeing with a peer - held there and not here, held by both with a different document count, or (0.48.0) held by both with a different set of (id, stamp) pairs, which kimmy_sync_digest_divergent_collections attributes, or (0.49.0) held by both with different index or vector definitions, which kimmy_sync_definition_divergent_collections attributes; nothing repairs either - confirmed on two checks running. 0 on a converged cluster. Moves for a divergence that leaves every other sync series reading healthy, because nothing about it fails a round.
 # TYPE kimmy_sync_divergent_collections gauge
 kimmy_sync_divergent_collections 5
 # HELP kimmy_sync_divergence_checks_total Contacts with a peer in which the cross-member divergence check above ran, and rounds that did not run it - completed with the pull truncated by the batch cap, or failed. kimmy_sync_divergent_collections reading 0 is evidence that the peers agree only while ran is rising; ran flat while skipped rises means nothing looked, which a bare 0 cannot say. A round that failed is counted in kimmy_sync_failures_total and here as skipped, so ran plus skipped is every round attempted.
@@ -3493,6 +3569,20 @@ kimmy_sync_divergence_digest_probes_total{outcome=\"deferred\",reason=\"correcte
 # HELP kimmy_sync_digest_drift_total Kept digest rows a self-check found disagreeing with the records they summarise, and corrected, since the process started. A healthy node reads 0; a rising value is a bug in the digest's maintenance and is logged at ERROR.
 # TYPE kimmy_sync_digest_drift_total counter
 kimmy_sync_digest_drift_total 9
+# HELP kimmy_sync_definition_divergent_collections Collections the definition digest currently finds disagreeing with a peer: the two members hold different index or vector definitions for them, seen on two compared checks running. Also counted in kimmy_sync_divergent_collections, which this attributes. Detect only: nothing is repaired from it. Read the indexes of the collection on both members (GET /v1/db/{db}/coll/{coll}/indexes) and compare the definition the WARN names, including expireAfterSeconds and unique, before recreating anything (operations.md, The definition digest).
+# TYPE kimmy_sync_definition_divergent_collections gauge
+kimmy_sync_definition_divergent_collections 5
+# HELP kimmy_sync_divergence_definition_probes_total Collections the definition digest looked at, by outcome. compared: both sides' digests of the collection's index and vector definitions were taken at one cut and compared; the gauge reading 0 means the members agree only while this rises. explained: the digests differed and a valid refusal hint on one side covers every differing definition, a refusal this node or the peer counted in kimmy_sync_ddl_refused_total, so the difference is known; never counted as compared. unanswered: a checked contact whose peer returned no definition digest (a build before it). deferred, by reason: not compared, and none is silent. incarnation: this side or the peer holds a drop tombstone for the collection that the cut does not yet cover, or the collection is not newer than the drop. database_tombstone: the same for the collection's database. definition_above_cut: an index or vector configuration of the collection was made or dropped above the cut, so it is in motion. horizon: the cut is below what retention removed, so no collection can be judged on either side. error: this side failed to compute or to compare, and the contact went on without it. malformed: an entry of the peer's answer did not decode, or carried a digest of the wrong width. Deferrals are reported, not graded; compared must be above 0 for each live pair.
+# TYPE kimmy_sync_divergence_definition_probes_total counter
+kimmy_sync_divergence_definition_probes_total{outcome=\"compared\"} 143
+kimmy_sync_divergence_definition_probes_total{outcome=\"explained\"} 145
+kimmy_sync_divergence_definition_probes_total{outcome=\"unanswered\"} 147
+kimmy_sync_divergence_definition_probes_total{outcome=\"deferred\",reason=\"incarnation\"} 152
+kimmy_sync_divergence_definition_probes_total{outcome=\"deferred\",reason=\"database_tombstone\"} 154
+kimmy_sync_divergence_definition_probes_total{outcome=\"deferred\",reason=\"definition_above_cut\"} 156
+kimmy_sync_divergence_definition_probes_total{outcome=\"deferred\",reason=\"horizon\"} 158
+kimmy_sync_divergence_definition_probes_total{outcome=\"deferred\",reason=\"error\"} 160
+kimmy_sync_divergence_definition_probes_total{outcome=\"deferred\",reason=\"malformed\"} 162
 # HELP kimmy_sync_divergence_check_age_seconds Seconds since the last contact, with any peer, in which the cross-member divergence check ran, computed when this page is read. Before the first such contact, seconds since the process started, never 0; 0 on a node without clustering, so alert on it only where kimmy_task_progress_age_seconds has a replication row. Above a few multiples of cluster.sync_interval_secs, kimmy_sync_divergent_collections is holding a value nothing has re-examined, whether the rounds are failing or the loop itself is stuck - look at kimmy_sync_failures_total, kimmy_sync_peers_backing_off and kimmy_write_lock_wait_seconds.
 # TYPE kimmy_sync_divergence_check_age_seconds gauge
 kimmy_sync_divergence_check_age_seconds 71
@@ -4492,7 +4582,12 @@ kimmy_storage_cache_reads_total{result=\"miss\"} 9104
                 // (ADR-220).
                 + 2
                 // Pulls refused for a hole a snapshot left (ADR-224).
-                + 1,
+                + 1
+                // The definition digest (B3 half 2): its gauge, three outcomes
+                // and one line per deferral reason.
+                + 1
+                + 3
+                + kimmy_storage::DefinitionDefer::ALL.len(),
             "expected one sample per series: {out}"
         );
     }
@@ -4667,6 +4762,11 @@ kimmy_storage_cache_reads_total{result=\"miss\"} 9104
             digest_deferred: [0; 12],
             digest_divergent_collections: 0,
             digest_drift_total: 0,
+            definition_compared: 0,
+            definition_explained: 0,
+            definition_unanswered: 0,
+            definition_deferred: [0; 6],
+            definition_divergent_collections: 0,
             divergence_last_check: Some(now - Duration::from_secs(30)),
             last_completed_round: None,
             entries_skipped_unknown_collection: 0,
@@ -4698,6 +4798,11 @@ kimmy_storage_cache_reads_total{result=\"miss\"} 9104
             digest_deferred: [0; 12],
             digest_divergent_collections: 0,
             digest_drift_total: 0,
+            definition_compared: 0,
+            definition_explained: 0,
+            definition_unanswered: 0,
+            definition_deferred: [0; 6],
+            definition_divergent_collections: 0,
             divergence_last_check: Some(now - Duration::from_secs(8)),
             last_completed_round: None,
             entries_skipped_unknown_collection: 0,
@@ -4920,6 +5025,11 @@ kimmy_storage_cache_reads_total{result=\"miss\"} 9104
             digest_deferred: [0; 12],
             digest_divergent_collections: 0,
             digest_drift_total: 0,
+            definition_compared: 0,
+            definition_explained: 0,
+            definition_unanswered: 0,
+            definition_deferred: [0; 6],
+            definition_divergent_collections: 0,
             divergence_last_check: at,
             last_completed_round: None,
             entries_skipped_unknown_collection: 0,
