@@ -412,7 +412,7 @@ enum ScanFor {
 /// gone from both, or the entry was lost, which the digest exists to report.
 /// A drop older than the retention is no longer held: that case is the
 /// horizon's (`tombstone_retention_secs >= oplog_retention_secs`).
-fn drop_defers(tombstone: Option<Stamp>, created: Hlc, cut: &VersionVector) -> bool {
+pub(crate) fn drop_defers(tombstone: Option<Stamp>, created: Hlc, cut: &VersionVector) -> bool {
     tombstone.is_some_and(|at| at.hlc > cut.get(at.node) || created <= at.hlc)
 }
 

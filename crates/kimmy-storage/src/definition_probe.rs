@@ -24,14 +24,22 @@
 //! hint ([`crate::refusal_hint`]) on one side covers every differing name, and is
 //! counted as such, never as a comparison.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 
-use kimmy_core::{CollectionId, VersionVector};
+use kimmy_core::{CollectionId, Hlc, Stamp, VersionVector};
+use redb::{ReadableDatabase, ReadableTable};
 use serde::{Deserialize, Serialize};
 use serde_bytes::ByteBuf;
 
-use crate::engine::Engine;
+use crate::codec;
+use crate::definition_digest::{DefinitionHash, definition_list};
+use crate::digest_probe::drop_defers;
+use crate::engine::{Engine, PairedShadows};
 use crate::error::Result;
+use crate::meta::CollectionMeta;
+use crate::refusal_hint::HintKind;
+use crate::snapshot::ServeVerdict;
+use crate::tables;
 
 /// Why a collection's definitions were not compared, counted by the caller
 /// under this label. Its own enum and its own series, not half 1's [`Defer`]
@@ -221,22 +229,258 @@ impl DefinitionRound {
     }
 }
 
+/// A collection as one side sees it at a cut.
+struct Facet {
+    /// This side's digest of the collection's definitions.
+    digest: DefinitionHash,
+    /// The definitions as `(name, hash)`.
+    list: Vec<(String, DefinitionHash)>,
+    deferred: Option<DefinitionDefer>,
+    /// The standing life's incarnation floor, which a refusal hint must be above.
+    floor: Option<Hlc>,
+}
+
+/// A 16-byte hash from the wire, if it is one.
+fn hash_of(bytes: &[u8]) -> Option<DefinitionHash> {
+    <[u8; 16]>::try_from(bytes).ok().map(u128::from_be_bytes)
+}
+
+fn bytes_of(hash: DefinitionHash) -> ByteBuf {
+    ByteBuf::from(hash.to_be_bytes().to_vec())
+}
+
 impl Engine {
+    /// Every collection held (shadows hidden) as this side sees it at `cut`,
+    /// the digest and every predicate read through `txn` and no other.
+    fn assess_definitions(
+        &self,
+        txn: &redb::ReadTransaction,
+        cut: &VersionVector,
+    ) -> Result<BTreeMap<CollectionId, Facet>> {
+        let metas = Self::collections_in(txn, PairedShadows::Hidden)?;
+        // Retention can collect the tombstone of a dropped index, and the
+        // collection's definition stamp falls with it: when the cut is below
+        // what retention removed, no collection can be judged, on either side.
+        let horizon = Self::serve_verdict_in(txn, cut)? != ServeVerdict::Serve;
+        let dropped_indexes = txn.open_table(tables::INDEXES_DROPPED)?;
+        let mut tombstoned: BTreeMap<String, Option<Stamp>> = BTreeMap::new();
+        let mut facets = BTreeMap::new();
+        for meta in &metas {
+            let list = definition_list(meta);
+            let digest = crate::definition_digest::digest_of_list(&list);
+            let deferred = if horizon {
+                Some(DefinitionDefer::Horizon)
+            } else if drop_defers(Self::collection_dropped_at_in(txn, meta.id)?, meta.created, cut)
+            {
+                Some(DefinitionDefer::Incarnation)
+            } else if drop_defers(
+                match tombstoned.get(&meta.db) {
+                    Some(known) => *known,
+                    None => {
+                        let held = Self::collection_dropped_at_in(
+                            txn,
+                            kimmy_core::database_drop_id(&meta.db),
+                        )?;
+                        tombstoned.insert(meta.db.clone(), held);
+                        held
+                    }
+                },
+                meta.created,
+                cut,
+            ) {
+                Some(DefinitionDefer::DatabaseTombstone)
+            } else if Self::definition_above_cut(&dropped_indexes, meta, cut)? {
+                Some(DefinitionDefer::DefinitionAboveCut)
+            } else {
+                None
+            };
+            facets.insert(meta.id, Facet { digest, list, deferred, floor: meta.incarnation_floor });
+        }
+        Ok(facets)
+    }
+
+    /// Whether a definition of `meta` is stamped above the cut: an index created,
+    /// a vector configuration changed, or an index dropped. Each stamp is judged
+    /// against the cut's component for its own origin, so the greatest of them is
+    /// not enough: one origin's stamp can be covered while another's is not. An
+    /// index or configuration with no stamp cannot defer.
+    fn definition_above_cut(
+        dropped_indexes: &impl ReadableTable<(u64, u32), &'static [u8]>,
+        meta: &CollectionMeta,
+        cut: &VersionVector,
+    ) -> Result<bool> {
+        let above = |stamp: &Stamp| stamp.hlc > cut.get(stamp.node);
+        if meta.indexes.iter().filter_map(|i| i.created.as_ref()).any(above)
+            || meta.vector_changed.as_ref().is_some_and(above)
+        {
+            return Ok(true);
+        }
+        for row in dropped_indexes.range((meta.id.0, 0)..=(meta.id.0, u32::MAX))? {
+            let (_, raw) = row?;
+            if above(&codec::decode_oplog_key(raw.value())?) {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
     /// The responder's side: the digest of every collection's definitions at
     /// the request's cut, read in **one** read transaction, with the detail of
     /// the collections the request names.
-    pub fn definition_answer(&self, _ask: &DefinitionAsk) -> Result<DefinitionReply> {
-        Ok(DefinitionReply::default())
+    pub fn definition_answer(&self, ask: &DefinitionAsk) -> Result<DefinitionReply> {
+        let txn = self.db().begin_read()?;
+        #[cfg(test)]
+        test_hooks::run_after_the_transaction(self);
+        let facets = self.assess_definitions(&txn, &ask.cut)?;
+        let detail: BTreeSet<CollectionId> = ask.detail.iter().copied().collect();
+        let mut entries = Vec::new();
+        for (id, facet) in &facets {
+            let mut entry = DefinitionEntry {
+                collection: *id,
+                digest: bytes_of(facet.digest),
+                deferred: facet.deferred,
+                indexes: Vec::new(),
+                refused: Vec::new(),
+            };
+            if facet.deferred.is_none() && detail.contains(id) {
+                entry.indexes =
+                    facet.list.iter().map(|(name, hash)| (name.clone(), bytes_of(*hash))).collect();
+                // The requester cannot evaluate this side's floor, so the floor
+                // clause is applied here, before a pair is put on the wire.
+                entry.refused = Self::refusal_hints_in(&txn, *id)?
+                    .into_iter()
+                    .filter(|hint| facet.floor.is_none_or(|floor| hint.stamp.hlc > floor))
+                    .map(|hint| (hint.name, bytes_of(hint.hash)))
+                    .collect();
+            }
+            entries.push(entry);
+        }
+        Ok(DefinitionReply { entries, malformed: 0 })
     }
 
     /// The requester's side, after the answer arrived: this side's digests at
     /// the same cut in **one** read transaction, and the comparison.
     pub fn definition_compare(
         &self,
-        _ask: &DefinitionAsk,
-        _reply: &DefinitionReply,
+        ask: &DefinitionAsk,
+        reply: &DefinitionReply,
     ) -> Result<Vec<DefinitionVerdict>> {
-        Ok(Vec::new())
+        let txn = self.db().begin_read()?;
+        #[cfg(test)]
+        test_hooks::run_after_the_transaction(self);
+        let mine = self.assess_definitions(&txn, &ask.cut)?;
+        let detail: BTreeSet<CollectionId> = ask.detail.iter().copied().collect();
+        let mut out = Vec::new();
+        for entry in &reply.entries {
+            let id = entry.collection;
+            let Some(here) = mine.get(&id) else {
+                // The peer holds it and this side does not: the existence
+                // half's business.
+                continue;
+            };
+            let verdict = |outcome| DefinitionVerdict { collection: id, outcome };
+            if let Some(reason) = entry.deferred.or(here.deferred) {
+                out.push(verdict(DefinitionOutcome::Deferred(reason)));
+                continue;
+            }
+            let Some(theirs) = hash_of(entry.digest.as_slice()) else {
+                // A digest of the wrong width is no digest.
+                out.push(verdict(DefinitionOutcome::Deferred(DefinitionDefer::Malformed)));
+                continue;
+            };
+            if theirs == here.digest {
+                out.push(verdict(DefinitionOutcome::Compared {
+                    equal: true,
+                    mine: here.digest,
+                    theirs,
+                    differing: Vec::new(),
+                }));
+                continue;
+            }
+            let detailed = detail.contains(&id).then(|| self.explain(&txn, id, here, entry));
+            let outcome = match detailed {
+                Some(Ok(Some((differing, true)))) => DefinitionOutcome::Explained { differing },
+                Some(Ok(Some((differing, false)))) => DefinitionOutcome::Compared {
+                    equal: false,
+                    mine: here.digest,
+                    theirs,
+                    differing,
+                },
+                Some(Err(e)) => return Err(e),
+                Some(Ok(None)) | None => DefinitionOutcome::Compared {
+                    equal: false,
+                    mine: here.digest,
+                    theirs,
+                    differing: Vec::new(),
+                },
+            };
+            out.push(verdict(outcome));
+        }
+        Ok(out)
+    }
+
+    /// The names whose definitions differ between this side and the peer's, and
+    /// whether valid refusal hints cover every one of them. `None` when the peer
+    /// sent no detail (an answer from a build that does not, or a malformed list).
+    ///
+    /// Judged by the requester on both sides' lists. A hint is valid only while
+    /// the definitions are as it says (a hint, never a mask):
+    /// - *this side's own* refusal of the peer's definition: this side lacks the
+    ///   name or holds another definition under it, and the peer's hash for the
+    ///   name is the one the hint stored;
+    /// - *this side's own* refusal of the peer's **drop**: this side still holds
+    ///   the index with the hash the hint stored, and the peer lacks it;
+    /// - *the peer's* refusal, as a raw `(name, hash)` pair that already passed
+    ///   the peer's floor clause: the same two shapes read from the other side.
+    ///
+    /// This side's own hints must also be above the standing life's floor.
+    fn explain(
+        &self,
+        txn: &redb::ReadTransaction,
+        id: CollectionId,
+        here: &Facet,
+        entry: &DefinitionEntry,
+    ) -> Result<Option<(Vec<String>, bool)>> {
+        let mut theirs: BTreeMap<String, DefinitionHash> = BTreeMap::new();
+        for (name, hash) in &entry.indexes {
+            let Some(hash) = hash_of(hash.as_slice()) else { return Ok(None) };
+            theirs.insert(name.clone(), hash);
+        }
+        let mine: BTreeMap<String, DefinitionHash> = here.list.iter().cloned().collect();
+        let differing: BTreeSet<String> = mine
+            .keys()
+            .chain(theirs.keys())
+            .filter(|name| mine.get(*name) != theirs.get(*name))
+            .cloned()
+            .collect();
+        let mut covered: BTreeSet<String> = BTreeSet::new();
+        for hint in Self::refusal_hints_in(txn, id)? {
+            if here.floor.is_some_and(|floor| hint.stamp.hlc <= floor) {
+                continue;
+            }
+            let valid = match hint.kind {
+                HintKind::Index | HintKind::Vector => {
+                    mine.get(&hint.name) != Some(&hint.hash)
+                        && theirs.get(&hint.name) == Some(&hint.hash)
+                }
+                HintKind::Drop => {
+                    mine.get(&hint.name) == Some(&hint.hash) && !theirs.contains_key(&hint.name)
+                }
+            };
+            if valid {
+                covered.insert(hint.name);
+            }
+        }
+        for (name, hash) in &entry.refused {
+            let Some(hash) = hash_of(hash.as_slice()) else { continue };
+            let refused_mine = mine.get(name) == Some(&hash) && theirs.get(name) != Some(&hash);
+            let holds_what_i_dropped = theirs.get(name) == Some(&hash) && !mine.contains_key(name);
+            if refused_mine || holds_what_i_dropped {
+                covered.insert(name.clone());
+            }
+        }
+        let explained = !differing.is_empty() && differing.is_subset(&covered);
+        Ok(Some((differing.into_iter().collect(), explained)))
     }
 }
 
@@ -260,7 +504,6 @@ pub(crate) mod test_hooks {
         AFTER_THE_TRANSACTION.with(|h| *h.borrow_mut() = Some(Box::new(hook)));
     }
 
-    #[allow(dead_code)]
     pub(super) fn run_after_the_transaction(engine: &Engine) {
         if let Some(hook) = AFTER_THE_TRANSACTION.with(|h| h.borrow_mut().take()) {
             hook(engine);

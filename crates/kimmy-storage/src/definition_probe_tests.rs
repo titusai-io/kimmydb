@@ -9,7 +9,8 @@ use serde_bytes::ByteBuf;
 
 use crate::definition_digest::{VECTOR_NAME, definition_list, index_hash};
 use crate::definition_probe::{
-    DefinitionAsk, DefinitionDefer, DefinitionEntry, DefinitionOutcome, DefinitionVerdict, test_hooks,
+    DefinitionAsk, DefinitionDefer, DefinitionEntry, DefinitionOutcome, DefinitionVerdict,
+    test_hooks,
 };
 use crate::meta::CollectionMeta;
 use crate::refusal_hint::{HintKind, RefusalHint};
