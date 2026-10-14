@@ -3606,6 +3606,12 @@ impl Engine {
         self.clock.lock().witness(stamp.hlc);
     }
 
+    /// [`Self::witness`] for a time that arrives without its origin (a
+    /// collection's `created` on a snapshot page).
+    pub(crate) fn witness_hlc(&self, hlc: kimmy_core::Hlc) {
+        self.clock.lock().witness(hlc);
+    }
+
     pub(crate) fn db(&self) -> &Database {
         &self.db
     }

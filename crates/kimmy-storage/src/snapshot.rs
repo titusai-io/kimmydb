@@ -821,6 +821,7 @@ impl Engine {
             return Ok(SnapshotApplied { purge_pending: Some(id), ..Default::default() });
         }
         if let (Some(dropped), Some(id)) = (page.dropped, progress.scope) {
+            self.witness_covered(&dropped, &page.versions);
             self.restore_collection_drop(id, dropped)?;
         }
         // The whole-database route's own denials, through the same predicate
@@ -1310,6 +1311,9 @@ impl Engine {
             .filter(|(_, dropped)| dropped.hlc <= page.versions.get(dropped.node))
             .filter(|(id, dropped)| held.get(id).is_none_or(|existing| dropped > existing))
             .collect();
+        for (_, dropped) in &database_drops {
+            self.witness(dropped);
+        }
         self.record_collection_drops(&database_drops)?;
         let held: std::collections::HashMap<CollectionId, Stamp> =
             self.collections_dropped()?.into_iter().collect();
@@ -1327,6 +1331,9 @@ impl Engine {
                 );
                 continue;
             }
+            // Named by the sender's coverage, so safe to fold into the clock: the
+            // floor this node restores from the tombstone is this stamp.
+            self.witness(dropped);
             if live.contains(id) {
                 self.restore_collection_drop(*id, *dropped)?;
                 continue;
@@ -1395,6 +1402,7 @@ impl Engine {
                 );
                 continue;
             }
+            self.witness(dropped);
             if held.get(&(*collection, *index_id)).is_some_and(|seen| seen >= dropped) {
                 continue;
             }
@@ -1502,6 +1510,32 @@ impl Engine {
         self.record_collection_drop(id, dropped)
     }
 
+    /// Move this node's clock past a stamp a page carries, **once the sender's own
+    /// coverage names it** (ADR-163: the stamp comes off the wire, and a clock
+    /// moved to an arbitrary one would mint far-future stamps for ever).
+    ///
+    /// What a snapshot restores with the sender's stamp is state this node then
+    /// holds and serves: a collection's creation and drop tombstone, the floor it
+    /// restores from them, an index's creation and drop. Every other stamp this
+    /// node accepts moves its clock (`apply_remote_in_txn`, `apply_ddl`), and a
+    /// restore that did not left a receiver whose clock ran behind its sender's
+    /// minting a write below the floor it had just restored, which every peer then
+    /// judged history and dropped, silently.
+    fn witness_covered(&self, stamp: &Stamp, versions: &kimmy_core::VersionVector) {
+        if stamp.hlc <= versions.get(stamp.node) {
+            self.witness(stamp);
+        }
+    }
+
+    /// [`Self::witness_covered`] for a time that carries no origin. It is the
+    /// create of some origin the sender has processed, so it is named if any
+    /// origin's coverage reaches it.
+    fn witness_covered_hlc(&self, hlc: Hlc, versions: &kimmy_core::VersionVector) {
+        if versions.iter().any(|(_, covered)| hlc <= covered) {
+            self.witness_hlc(hlc);
+        }
+    }
+
     /// Recreate a collection and its indexes from a snapshot.
     ///
     /// Returns how many of its index definitions this node refused. A
@@ -1521,6 +1555,14 @@ impl Engine {
         state: &CollectionState,
         versions: &VersionVector,
     ) -> Result<usize> {
+        // The creation and each index's, before any of them is stored: the clock must be past what this node is about to
+        // hold, or its next local write is stamped below the incarnation it serves.
+        if let Some(created) = state.created {
+            self.witness_covered_hlc(created, versions);
+        }
+        for stamp in state.indexes.iter().filter_map(|index| index.created) {
+            self.witness_covered(&stamp, versions);
+        }
         if self.get_collection(&state.db, &state.name).is_err() {
             // A snapshot must not recreate a life this node has buried. The
             // page is current state on its sender, not an instruction: a peer
@@ -1679,7 +1721,19 @@ impl Engine {
                     Some(created) => crate::index::CreateOrigin::Restored(created),
                     None => crate::index::CreateOrigin::Replicated { created: None, logged: None },
                 },
-                &|standing, _| earlier(standing),
+                //
+                // And judged against this node's own tombstone for the index, as the
+                // replicated `CreateIndex` is (`sync::apply_index`): a definition made
+                // before this node dropped the index is history here, though the
+                // sender, which has not heard of the drop, still serves it. `dropped`
+                // is read where the build is decided, under the writer. A definition
+                // with no stamp cannot be judged and is restored as it was.
+                &|standing, dropped| {
+                    earlier(standing)
+                        || index
+                            .created
+                            .is_some_and(|created| dropped.is_some_and(|at| created < at))
+                },
             );
             match crate::sync::settle(created)? {
                 crate::sync::Ddl::Applied((_, violations)) => {
