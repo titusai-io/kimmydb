@@ -10,7 +10,19 @@ Versioning follows the pre-1.0 policy in
 [docs/compatibility.md](docs/compatibility.md): a `0.MINOR` bump may carry
 breaking changes and says so here; a `0.x.PATCH` bump never does.
 
-## Unreleased
+## 0.49.0 - 2026-10-14
+
+**Read before upgrading, two things.**
+
+**(a) A collection can now reappear after its drop.** A drop that reaches a member holding writes stamped after it now keeps those writes (ADR-231, extended), where 0.48.x discarded them with the collection and left the members different for good. So when a write stamped after a collection's drop reaches a member that had not heard of the drop, the collection comes back on every member holding **only** the writes stamped after the drop. This is for **collection** drops only: a database's drop still buries a collection created at or before it together with the writes made into it afterwards (ADR-229). **Clock skew can cause it**: a write made earlier in real time by a member whose clock runs ahead counts as "after". The way to avoid it is unchanged: confirm a drop on the members before writing through another one. See `docs/http-api.md`, "A write made after a collection's drop is kept".
+
+**(b) The divergence gauge can read above 0 where it read 0, with a `WARN`.** 0.49.0 adds the **definition digest**, a fourth comparison between members, of what a collection's indexes and vector configuration say. A finding moves the new `kimmy_sync_definition_divergent_collections` and is **also counted in `kimmy_sync_divergent_collections`**, so an alert on the existing gauge can fire where it did not. It is detect-only. **Before acting on a finding, read `docs/operations.md`, "The definition digest": recreating a TTL index at a shorter value deletes the documents older than it on every member, and recreating a unique index files violations for the duplicates that exist.** The first round can show one true positive, an index or vector configuration with no creation stamp that a late drop's sweep leaves (documented there).
+
+**Rolling and rolling back.** Member-at-a-time is safe, and 0.49.0 is **not a rollback boundary**: no `kimmy.format` schema (still 4), `I_EPOCH`, table, backup tag or entry kind changed.
+- A 0.48.x member ignores the definition request and is counted `unanswered`, so definitions are compared between two 0.49.0 members only.
+- The two optional fields this release adds, `redated` (in a collection's stored metadata) and `redated_from` (on a snapshot page's collection definition), are ignored by 0.48.x. **Rolling back to 0.48.x is safe for the stored data.** The refusal hints are `META` rows 0.48.x never reads.
+- **During a roll, old and new members still diverge in the case above** (a drop meeting later writes): the 0.48.x member discards them as it did, and a write an old member has already destroyed is not recovered.
+- Two things 0.48.0 cannot do for a store 0.49.0 has worked on. It has **no start-time `reconcile_late_drops`**, so a crash in the middle of a late-drop sweep followed by a 0.48.0 start serves a half-swept life until 0.49.0 runs again. And it does not know where a re-dated life's first kept entry arrived (a 0.48.0 that rewrites the metadata drops the marker), so a change stream opened **without** a resume token on such a collection reads the retained log from the start to find it, the walk round 0500 measured at 62 s on a 1.8-million-row log.
 
 ### Added
 
