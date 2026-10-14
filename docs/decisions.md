@@ -26315,12 +26315,12 @@ history:
 | `restore_collection` | index creation refused | `Refused`, counted | already settled (ADR-123) |
 | `apply_carried_index_drops` | `drop_index_inner` errors other than a vanished collection | `Refused`, counted | unchanged: it validates only the name of an index the sender holds; no other refusal is known |
 
-**Remaining, and named.** Two origins that change one `byo` collection **concurrently** — one
-width-8 at a stamp the receiver holds, the other turning off at a stamp below it and configuring
-width 16 above it — are refused by an entry from the second origin (its off loses on the stamp, then
-the configuration meets the width), counted and skipped, as before; the same history in a page is
-applied, because a page is a winner by stamp. A cluster that does that needs the origin to drop and
-reconfigure. It cannot wedge a member: the entries path settles it.
+**Remaining, and named (closed by ADR-234).** Two origins that change one `byo` collection **concurrently**
+(one width-8 at a stamp the receiver holds, the other turning off at a stamp below it and configuring width 16
+above it) were refused by an entry from the second origin (its off loses on the stamp, then the configuration
+meets the width), counted and skipped, while the same history in a page was applied, because a page is a winner by
+stamp: one history, two end states, and the members stayed different until the origin changed the width again.
+ADR-234 gives a dated entry the same exemption a dated page has.
 
 **Wire and disk.** None. No rollback boundary: 0.45 on the page's receiving side refuses as it did.
 
@@ -27111,3 +27111,43 @@ stamped exactly at the tombstone is restored. Mutation rows: each witness remove
 metadata scan at open removed, the tombstone check removed, `<` to `<=`, and the unstamped clause removed. The
 witness of the database drops before they are recorded closes a microsecond window no test can observe and is
 listed as such.
+
+## ADR-234 — A dated, winning `ConfigureVectors` entry from another member applies the implied off, as a dated page does (ADR-227)
+
+> **Amends [ADR-227](#adr-227--a-snapshot-pages-vector-step-is-settled-as-an-entrys-is-and-a-dated-page-may-change-a-client-supplied-width-through-the-off-the-sender-made)**:
+> its "Remaining" paragraph. Receiver-local: no wire field, table, entry kind or schema changed, and not a rollback
+> boundary (0.49.0 refuses the entry, counts it and skips it, as it did).
+
+**Decision.** The refusal "vector dimension cannot change from {a} to {b} in place for client-supplied vectors"
+exists because a *client* asked this member to change a width it holds vectors for. A dated change from another
+member is not that request: its origin cannot have made the change in place either, so an off stands between the
+two, and the entries that say so are either already applied here, or were lost on their stamp to a change made
+here, or have not arrived yet. ADR-227 gave a dated **page** the exemption; this gives a dated **entry** the same
+(`Configured::FromEntry`, which always carries its stamp), judged where the page's is: below the history check and
+the last-writer-wins guard (ADR-226), so an entry that loses changes nothing whatever its width. The change is
+applied as ADR-227 applies a page's: the configuration off and on again as one change in the one transaction, the
+stored vectors of the old width kept (a peer's change never deletes data), the new width skipping them in both
+search paths, nothing published beyond what the entries path publishes for the same history. **The old-width rows
+stay in the collection's shadow as dead weight** until an explicit `drop_vectors` (a local request) discards them;
+if the width is later set back to the old one by a dated change they become visible again, possibly stale against
+their documents, exactly as after a dated page's change. A **local**
+configuration is refused as it always was, and so is an undated page.
+
+**Why.** The entries path and a page now end in the same state for the same history, which is the property this
+family of ADRs exists to keep. Before, two origins that changed one byo collection concurrently left the member
+that held the width-8 configuration at width 8 through entries and at width 16 through a page, and a divergence
+(now reported by the definition digest) that only the origin changing the width again could end.
+
+**Tests.** `vector_width_tests.rs`: the entries route and a page end in the same width (red before); the entry is
+applied and not refused, at the origin's stamp (red before); the stored vectors of the old width are kept; an entry
+that loses on its stamp changes nothing; an entry of an older life (at or below the incarnation floor) with another
+width changes nothing; a local change of width is still refused. Mutation rows: the entry exemption removed, the
+exemption extended to a local change, an undated page exempted (killed by the existing ADR-227 test), the
+last-writer-wins guard removed, the history check removed, the width check removed for every origin, and the
+exempt branch burying the old-width rows.
+
+**Mixed roll.** A 0.49.0 member refuses the entry as it did, counts it in `kimmy_sync_ddl_refused_total`, leaves a
+refusal hint and skips it, and stays at the old width; the definition digest shows the divergence. It is not wedged.
+A refused entry is witnessed and, as reasoned from the sync path (not tested), is not served to it again after the upgrade, so that member stays diverged until the
+next vector change from any member reaches it, or a snapshot page does (the page route has applied the change since
+ADR-227).
