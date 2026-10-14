@@ -726,3 +726,46 @@ fn a_definition_lists_hashes_are_what_the_answer_carries_for_the_detail() {
         .collect();
     assert_eq!(carried, list);
 }
+
+// -- The cost ------------------------------------------------------------------------
+
+/// The figure the ADR records: what one answer and one comparison cost over
+/// 1,000 collections of three indexes each (one with a partial filter), in a
+/// release build. Run by hand: `cargo test -p kimmy-storage --release --lib
+/// the_cost_of_a_definition_probe -- --ignored --nocapture`.
+#[test]
+#[ignore = "a measurement, not a test"]
+fn the_cost_of_a_definition_probe_over_a_thousand_collections() {
+    let (a, _da) = engine();
+    let (b, _db) = engine();
+    for i in 0..1_000 {
+        let name = format!("c{i}");
+        a.create_collection("shop", &name).unwrap();
+        a.create_index("shop", &name, fields("a"), false, Some("a_1".into())).unwrap();
+        a.create_index("shop", &name, fields("b"), true, Some("b_1".into())).unwrap();
+        a.create_index_with(
+            "shop",
+            &name,
+            fields("n"),
+            false,
+            kimmy_core::Enforcement::Local,
+            Some("filtered".into()),
+            None,
+            Some(doc! { "n": { "$gte": 5_i64 }, "k": { "a": 1, "b": "x" } }),
+        )
+        .unwrap();
+    }
+    // A thousand collections are four thousand entries: more than one batch.
+    for _ in 0..8 {
+        sync(&a, &b);
+    }
+    let ask = DefinitionAsk::new(cut_of(&a, &b), []);
+    let started = std::time::Instant::now();
+    let reply = b.definition_answer(&ask).unwrap();
+    let answered = started.elapsed();
+    let started = std::time::Instant::now();
+    let verdicts = a.definition_compare(&ask, &reply).unwrap();
+    let compared = started.elapsed();
+    assert_eq!(verdicts.len(), 1_000);
+    eprintln!("1,000 collections x 3 indexes: answer {answered:?}, compare {compared:?}");
+}
