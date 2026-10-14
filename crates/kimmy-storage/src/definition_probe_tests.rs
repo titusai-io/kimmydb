@@ -852,6 +852,28 @@ fn a_database_tombstone_recorded_after_the_transaction_opened_is_seen_by_no_pred
     }
 }
 
+/// A stamp is judged against the cut at its own origin. A cut that is far ahead
+/// for one origin and has seen nothing of another does not cover the other's
+/// stamp.
+#[test]
+fn a_stamp_is_judged_against_the_cut_at_its_own_origin() {
+    let (a, b, orders, _items, _dirs) = converged();
+    b.create_index("shop", "orders", fields("by_b"), false, Some("by_b".into())).unwrap();
+    sync(&a, &b);
+    let mut cut = VersionVector::new();
+    cut.insert(a.node_id(), Hlc::new(crate::physical_now_ms() + 60_000, 0));
+    let verdicts = exchange_at(&a, &b, cut.clone(), &[]);
+    assert_eq!(
+        deferred(&verdicts, orders),
+        Some(DefinitionDefer::DefinitionAboveCut),
+        "B's stamp is above the cut at B: {verdicts:?}"
+    );
+    // And covered once the cut has B's own component.
+    cut.insert(b.node_id(), Hlc::new(crate::physical_now_ms() + 60_000, 0));
+    let verdicts = exchange_at(&a, &b, cut, &[]);
+    assert_eq!(compared(&verdicts, orders), Some(true), "{verdicts:?}");
+}
+
 /// A collection the responder cannot compare carries no detail: nothing to
 /// explain, and nothing to spend the frame on.
 #[test]
