@@ -273,7 +273,7 @@ fn the_list_is_ordered_by_derived_id_then_name_and_the_vector_comes_last() {
     );
     let list = definition_list(&meta);
     let names: Vec<&str> = list.iter().map(|(name, _)| name.as_str()).collect();
-    let mut by_id = vec!["zeta", "alpha"];
+    let mut by_id = ["zeta", "alpha"];
     by_id.sort_by_key(|name| (IndexMeta::derive_id(name), *name));
     assert_eq!(names, vec![by_id[0], by_id[1], VECTOR_NAME]);
     // And each entry carries the hash of the definition under that name.
