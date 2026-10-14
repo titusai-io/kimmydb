@@ -3583,6 +3583,7 @@ kimmy_sync_divergence_definition_probes_total{outcome=\"deferred\",reason=\"defi
 kimmy_sync_divergence_definition_probes_total{outcome=\"deferred\",reason=\"horizon\"} 158
 kimmy_sync_divergence_definition_probes_total{outcome=\"deferred\",reason=\"error\"} 160
 kimmy_sync_divergence_definition_probes_total{outcome=\"deferred\",reason=\"malformed\"} 162
+kimmy_sync_divergence_definition_probes_total{outcome=\"deferred\",reason=\"format\"} 164
 # HELP kimmy_sync_divergence_check_age_seconds Seconds since the last contact, with any peer, in which the cross-member divergence check ran, computed when this page is read. Before the first such contact, seconds since the process started, never 0; 0 on a node without clustering, so alert on it only where kimmy_task_progress_age_seconds has a replication row. Above a few multiples of cluster.sync_interval_secs, kimmy_sync_divergent_collections is holding a value nothing has re-examined, whether the rounds are failing or the loop itself is stuck - look at kimmy_sync_failures_total, kimmy_sync_peers_backing_off and kimmy_write_lock_wait_seconds.
 # TYPE kimmy_sync_divergence_check_age_seconds gauge
 kimmy_sync_divergence_check_age_seconds 71
