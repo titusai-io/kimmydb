@@ -26883,6 +26883,16 @@ the other side of the life. The decision and the two commits:
    stream, as it does for a collection a snapshot brought. A stream may therefore begin at a document's
    *latest* version and not at its insert, because the position is found by the record's current stamp.
 
+7. **The count half's repair replays from the floor.** A write kept through the drop (stamped after it) can sort
+   *before* the creation of a life another member made after the drop (D writes at 640, B creates at 717). A member
+   that heard D's write before it had the collection sets it aside as history, since the collection is absent and a
+   tombstone is held, and then takes B's creation: it holds the collection without the write, the counts differ, and
+   the repair replayed the peer's oplog **from the life's creation**, which is after the write, so the write was never
+   served again and the repair ran on for ever (found by a CI run of the three-member loop test that took that
+   order; reproduced locally under 16-way parallel load, 4 runs in 320, with `a: holds [2]; b, d: holds [2, 3]`). The
+   replay now starts at `min(floor, created)`: where the standing life's valid history begins. Everything at or below
+   the floor is refused as history on the way, so nothing of the life before returns.
+
 **What it changes.** A collection can reappear after its drop. When nobody recreated the name, D keeps the
 collection with Z and A has none: the existence half reads D's collection, dated above A's tombstone, as a
 recreation, the scoped snapshot repair brings it back to A with Z, and every member ends with the collection
@@ -26909,4 +26919,4 @@ at every chokepoint. `late_drop.rs`: the reproducer converges to {2, 3}, the col
 a stop between the two commits is finished by the start. `watch.rs`: a stream with no token on a kept life reads
 a few rows of a 4,000-entry log and hears the write kept and nothing of the life before; a marker of another
 `created` is ignored. `replication.rs`: through real loops the members agree and the repair ends, with and without
-a recreation.
+a recreation, and with the write reaching a member before or after the recreation (the order that needed the replay from the floor).
