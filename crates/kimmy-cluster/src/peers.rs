@@ -1051,9 +1051,7 @@ pub async fn replicate(engine: Arc<Engine>, config: ReplicationConfig) {
                         log_repair_verdict(key.peer, key.collection, verdict);
                     }
                     stalls.retain_ledger(held, members.as_ref());
-                    if let Some(members) = &members {
-                        divergence.retain_members(members);
-                    }
+                    divergence.retain_members(members.as_ref());
                 }
                 if let Err(e) = &mine_collections {
                     warn!(error = %e, "divergence check: could not list this node's own \
@@ -4834,9 +4832,39 @@ mod definition_fold_tests {
         for call in [
             "definition_state.prune(held, members.as_ref())",
             "stalls.retain_definition_detail(members.as_ref(), held)",
+            "stalls.retain_ledger(held, members.as_ref())",
+            "divergence.retain_members(members.as_ref())",
+            "stalls.expire_repairs()",
         ] {
             assert_eq!(code.matches(call).count(), 1, "{call}: once in the code");
             assert_eq!(direct.matches(call).count(), 1, "{call}: directly in the held block");
+        }
+    }
+
+    /// The tick plans a document repair from each confirmed digest finding and a definition
+    /// repair from each confirmed definition finding, and forgets the cooldown of a finding
+    /// that cleared: a refactor that drops any of the four leaves a finding no repair is
+    /// ever planned from, or a cooldown that never clears. Textual, like the guard above.
+    #[test]
+    fn the_tick_plans_and_forgets_both_repairs() {
+        let source = include_str!("peers.rs");
+        let production = source.split("\n#[cfg(test)]").next().unwrap();
+        let code = tick_calls_guard::without_comments(production);
+        for call in [
+            "plan_digest_repairs(\n",
+            "plan_definition_repairs(\n",
+            "stalls.retain_digest(node, &digest_confirmed)",
+            "stalls.retain_definition(node, &definition_confirmed)",
+            "divergence.digest_confirmed_against(node)",
+            "divergence.definition_confirmed_against(node)",
+        ] {
+            let compact: String = code.split_whitespace().collect();
+            let want: String = call.split_whitespace().collect();
+            let defined = compact.matches(&format!("fn{want}")).count();
+            assert!(
+                compact.matches(&want).count() > defined,
+                "{call}: not called by the tick (only defined)"
+            );
         }
     }
 

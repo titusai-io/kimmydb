@@ -477,7 +477,10 @@ impl DivergenceTracker {
     /// so a member that was removed kept its confirmed findings for the life of
     /// the process: they held the gauges up, and a ledger entry keyed by the
     /// same peer could never be told the finding was gone.
-    pub fn retain_members(&mut self, members: &BTreeSet<NodeId>) {
+    pub fn retain_members(&mut self, members: Option<&BTreeSet<NodeId>>) {
+        let Some(members) = members else {
+            return;
+        };
         self.pending.retain(|peer, _| members.contains(peer));
         self.confirmed.retain(|peer, _| members.contains(peer));
         self.count_pending.retain(|(peer, _)| members.contains(peer));
@@ -694,7 +697,7 @@ mod tests {
         }
         assert_eq!(tracker.digest_confirmed_count(), 2);
         assert_eq!(tracker.definition_confirmed_count(), 2);
-        tracker.retain_members(&BTreeSet::from([kept]));
+        tracker.retain_members(Some(&BTreeSet::from([kept])));
         assert_eq!(tracker.digest_confirmed_count(), 1);
         assert_eq!(tracker.definition_confirmed_count(), 1);
         assert!(tracker.digest_confirmed_against(gone).is_empty());
