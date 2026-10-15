@@ -85,6 +85,14 @@ pub(crate) enum Configured {
     /// it. The shadow is its own collection on the page, restored at its own stamp,
     /// and is not created here.
     FromSnapshot(Option<kimmy_core::Stamp>),
+    /// A late-drop sweep turning off a configuration of the life before (ADR-231),
+    /// at the stamp given: the drop's, or the change's own where that sorts above the
+    /// drop's in the drop's own `Hlc` (ADR-236: a tie is the drop's). Judged by
+    /// last-writer-wins strictly: a configuration at that stamp is turned off (the drop's
+    /// stamp alone would read as older than such a change and keep it on this member
+    /// alone), and one changed above it since the sweep read it is kept. Only ever turns
+    /// a configuration off.
+    Swept(kimmy_core::Stamp),
 }
 
 impl Configured {
@@ -103,7 +111,7 @@ impl Configured {
     fn stamp(self) -> Option<kimmy_core::Stamp> {
         match self {
             Self::Locally => None,
-            Self::FromEntry(stamp) => Some(stamp),
+            Self::FromEntry(stamp) | Self::Swept(stamp) => Some(stamp),
             Self::FromSnapshot(stamp) => stamp,
         }
     }
@@ -121,7 +129,7 @@ impl crate::Engine {
         collection: &str,
         config: VectorConfig,
     ) -> Result<CollectionMeta> {
-        self.configure_vectors_inner(db, collection, config, Configured::Locally, &|_| false)
+        self.configure_vectors_inner(db, collection, config, Configured::Locally, &|_| Ok(false))
     }
 
     /// `log = false` when applying a replicated configuration. See
@@ -132,7 +140,7 @@ impl crate::Engine {
         collection: &str,
         config: VectorConfig,
         by: Configured,
-        history: &dyn Fn(&CollectionMeta) -> bool,
+        history: &dyn Fn(&CollectionMeta) -> Result<bool>,
     ) -> Result<CollectionMeta> {
         // **A loop, not a self-call.** Every retry passes the same arguments, so
         // a lost race is a `continue`. It was a self-call, which made an
@@ -156,18 +164,21 @@ impl crate::Engine {
 
             let mut meta = self.get_collection(db, collection)?;
             let read = meta.clone();
-            #[cfg(test)]
-            crate::sync::race_hooks::reach(crate::sync::race_hooks::Race::VectorConfiguration);
             // A configuration of a life of the collection that has since been
             // dropped and recreated here is history, and is not applied to the
             // life that stands. Judged on the definition read here, which the
-            // writer's `definition_is` below holds unchanged, and before the shadow
-            // is created, so history mints no shadow either.
-            if history(&meta) {
+            // writer's `definition_is` below holds unchanged, with the drop
+            // tombstones held as it is judged (`definition_of_an_ended_life`), and
+            // before the shadow is created, so history mints no shadow either. A
+            // drop that lands after the judgement changes the definition (a burial,
+            // a re-dating) or records a tombstone its own sweep then judges.
+            if history(&meta)? {
                 #[cfg(test)]
                 crate::sync::race_hooks::absorbed(crate::sync::race_hooks::Race::VectorHistory);
                 return Ok(meta);
             }
+            #[cfg(test)]
+            crate::sync::race_hooks::reach(crate::sync::race_hooks::Race::VectorConfiguration);
             // Last writer wins, on the stamp (ADR-226): a change at or below the one
             // standing here is the same change arriving again, or an older one
             // arriving late, and is not applied. An unstamped standing state reads as
@@ -256,10 +267,11 @@ impl crate::Engine {
                     &shadow,
                     false,
                     Some(stamp.hlc),
-                    &|dropped| stamp < dropped,
+                    &|dropped| crate::sync::creation_is_history(stamp.hlc, dropped.hlc),
                     || stamp,
                 )),
-                Configured::FromSnapshot(_) => None,
+                // A sweep only turns a configuration off, and never configures.
+                Configured::FromSnapshot(_) | Configured::Swept(_) => None,
             };
             let shadow_entry = match created {
                 Some(Ok(crate::engine::InTxn::Created(_, entry))) => entry,
@@ -365,7 +377,7 @@ impl crate::Engine {
     ) -> Result<VectorsOff> {
         let off =
             self.disable_vectors_inner(db, collection, drop_vectors, Configured::Locally, &|_| {
-                false
+                Ok(false)
             })?;
         if off.disabled || !drop_vectors {
             return Ok(off);
@@ -419,7 +431,7 @@ impl crate::Engine {
         collection: &str,
         drop_vectors: bool,
         by: Configured,
-        history: &dyn Fn(&CollectionMeta) -> bool,
+        history: &dyn Fn(&CollectionMeta) -> Result<bool>,
     ) -> Result<VectorsOff> {
         let log = matches!(by, Configured::Locally);
         // **A loop, not a self-call.** Every retry passes the same arguments, so
@@ -432,16 +444,25 @@ impl crate::Engine {
         for _ in 0..crate::Engine::MAX_DEFINITION_RETRIES {
             let mut meta = self.get_collection(db, collection)?;
             let read = meta.clone();
-            #[cfg(test)]
-            crate::sync::race_hooks::reach(crate::sync::race_hooks::Race::VectorRemoval);
             // As `configure_vectors_inner`: turning vectors off for a life that
             // has since been dropped and recreated here is history.
-            if history(&meta) {
+            if history(&meta)? {
                 return Ok(VectorsOff { disabled: false, dropped_vectors: false });
             }
-            // Last writer wins, on the stamp (ADR-226), as for a configuration.
-            if by.stamp().is_some_and(|incoming| meta.vector_changed.is_some_and(|c| c >= incoming))
-            {
+            #[cfg(test)]
+            crate::sync::race_hooks::reach(crate::sync::race_hooks::Race::VectorRemoval);
+            // Last writer wins, on the stamp (ADR-226), as for a configuration. A sweep's
+            // turning off a configuration of the life before is judged strictly: the
+            // configuration at the swept stamp itself (a change in the drop's own `Hlc`,
+            // passed at its own stamp) is the drop's and goes, and one changed above it
+            // since the sweep read it (a client's, or a replicated change stamped after
+            // the drop, landing before the sweep takes the writer) is the newer life's
+            // and stays, as it does on every other member.
+            let swept = matches!(by, Configured::Swept(_));
+            if by.stamp().is_some_and(|incoming| {
+                meta.vector_changed
+                    .is_some_and(|c| if swept { c > incoming } else { c >= incoming })
+            }) {
                 return Ok(VectorsOff { disabled: false, dropped_vectors: false });
             }
             // Already off. A **local** call is still a change: it is stamped and logged,

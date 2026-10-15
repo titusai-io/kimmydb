@@ -86,9 +86,11 @@ pub struct CollectionMeta {
 /// See [`CollectionMeta::redated`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Redated {
-    /// The `created` the life had before the first drop re-dated it: what a
-    /// database's drop that arrives later is judged against (ADR-229), since a
-    /// life created at or before it is buried with it, writes and all.
+    /// The `created` the life had before the first drop re-dated it: where the
+    /// life began, which ADR-235's burial compares to tell one life continuing
+    /// from a newer one. (0.49.0 also judged a database's drop against it and
+    /// buried the life, writes and all; ADR-236 judges `created`, as every drop
+    /// does.)
     pub from: Hlc,
     /// The `created` this marker belongs to.
     pub created: Hlc,

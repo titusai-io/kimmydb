@@ -115,6 +115,8 @@ struct Chunk {
     /// The lowest arrival position among the entries of the records this chunk
     /// kept (stamped after the drop), for a re-dated life.
     first_arrival: Option<u64>,
+    /// Whether this chunk left a record stamped after the drop, a tombstone included.
+    kept: bool,
 }
 
 /// Whether a collection standing here owes a sweep for a drop stamped
@@ -181,6 +183,7 @@ impl Engine {
         let mut after: Option<Vec<u8>> = None;
         let mut started = false;
         let mut first_arrival: Option<u64> = None;
+        let mut kept_after = false;
         loop {
             stop()?;
             if !started {
@@ -210,6 +213,7 @@ impl Engine {
             let chunk = self.remove_stragglers(&txn, &standing, dropped, after)?;
             removed += chunk.removed;
             skipped += chunk.skipped;
+            kept_after |= chunk.kept;
             first_arrival = match (first_arrival, chunk.first_arrival) {
                 (Some(a), Some(b)) => Some(a.min(b)),
                 (a, b) => a.or(b),
@@ -221,9 +225,22 @@ impl Engine {
                 // are gone and a straggler at the drop's own `Hlc` is refused
                 // by neither the tombstone (strict) nor the floor.
                 //
-                // A life a drop re-dated that holds nothing live after the
-                // sweep, and no definition stamped after the drop, has nothing
-                // the drop kept: it is buried, in this commit, with its shadow.
+                // A life a drop re-dated that holds nothing stamped after the
+                // drop, live or a tombstone, and no definition stamped after it,
+                // has nothing the drop kept: it is buried, in this commit, with
+                // its shadow. A delete made after the drop is a write after it
+                // (ADR-236), and is kept as a live write is: buried, the purge
+                // removed it, and a page from a member that had not heard it
+                // wrote the document back. Read from the records this sweep
+                // walked, and from the digest row, which counts tombstones and is
+                // never lowered, for one that landed in a range already walked. A
+                // shadow's rows are its parent's vectors, judged by its parent.
+                let stamped_after = !kimmy_core::vector_meta::is_shadow(&standing.name)
+                    && (kept_after || {
+                        let rows = txn.open_table(tables::LIVE_DIGESTS)?;
+                        crate::live_digest::kept_row(&rows, standing.id.0)?
+                            .is_some_and(|row| row.maxw.values().any(|maxw| *maxw > dropped.hlc))
+                    });
                 let live = txn
                     .open_table(tables::LIVE_COUNTS)?
                     .get(standing.id.0)?
@@ -240,6 +257,7 @@ impl Engine {
                 };
                 if redated
                     && live == 0
+                    && !stamped_after
                     && !configured_parent
                     && !holds_a_definition_stamped_after(&standing, dropped.hlc)
                 {
@@ -303,20 +321,52 @@ impl Engine {
         if !owes_a_sweep(&standing, dropped.hlc) {
             return Ok(());
         }
+        // The clock passes the floor this sweep takes, before anything is swept (ADR-236
+        // item 6), as it passes the floor a life takes at install. The drop can be one this
+        // member recorded without witnessing it (a scoped page's `dropped` its sender's
+        // coverage did not name, ADR-163), and a write minted below the floor was history
+        // on every other member and kept on this one. Passed first, a write that lands
+        // while the sweep runs is above the floor, and one minted before is a straggler
+        // the chunks still ahead remove.
+        self.witness_hlc(dropped.hlc);
+        // What to sweep is read once the clock has passed the drop, under the writer: a
+        // definition minted below the drop before the witness holds the writer until it
+        // commits, and a read before it missed it.
+        let standing = {
+            let txn = self.begin_write(WriterHolder::Drop)?;
+            let standing = read_collection(&txn, db, name)?;
+            txn.abort()?;
+            match standing {
+                Some(standing) if owes_a_sweep(&standing, dropped.hlc) => standing,
+                _ => return Ok(()),
+            }
+        };
         for index in &standing.indexes {
-            if index.created.is_some_and(|created| created.hlc <= dropped.hlc) {
-                self.drop_index_inner(db, name, &index.name, Some(dropped))?;
+            // A definition in the drop's own `Hlc` is the drop's, from whichever node
+            // (ADR-236): the keep and the burial read it so (`hlc > dropped` is
+            // after), and so do the other members' floors (`below_floor`). The
+            // index's own stamp is passed where it sorts above the drop's, or the
+            // replicated drop's incarnation rule declines it, as it would a real
+            // `DropIndex` older than the index, and this member alone keeps it.
+            if let Some(created) = index.created.filter(|created| created.hlc <= dropped.hlc) {
+                self.drop_index_inner(db, name, &index.name, Some(dropped.max(created)))?;
             }
         }
+        // As for an index, a change in the drop's own `Hlc` is the drop's, whatever its node
+        // (ADR-236), and is turned off at its own stamp where that sorts above the drop's:
+        // at the drop's, last-writer-wins would keep it here alone. Judged strictly
+        // (`Configured::Swept`), so a configuration changed above that stamp before the
+        // disable takes the writer is the newer life's and stays.
         if standing.vector.is_some()
-            && standing.vector_changed.is_some_and(|changed| changed.hlc <= dropped.hlc)
+            && let Some(changed) =
+                standing.vector_changed.filter(|changed| changed.hlc <= dropped.hlc)
         {
             self.disable_vectors_inner(
                 db,
                 name,
                 false,
-                crate::vectors::Configured::FromEntry(dropped),
-                &|_| false,
+                crate::vectors::Configured::Swept(dropped.max(changed)),
+                &|_| Ok(false),
             )?;
         }
         Ok(())
@@ -347,6 +397,7 @@ impl Engine {
         let mut last = after.clone();
         let mut exhausted = true;
         let mut first_arrival: Option<u64> = None;
+        let mut kept = false;
         // A shadow row is kept only while its parent record is live: a chunk the
         // embedding worker stamped after the drop for a parent that was swept
         // must not keep the shadow (and with it a parentless row) alive. The
@@ -385,6 +436,8 @@ impl Engine {
                     first_arrival = Some(first_arrival.map_or(seq, |first| first.min(seq)));
                 }
                 if !live {
+                    // A delete after the drop is a write after it (ADR-236): it stays.
+                    kept |= stamp.hlc > dropped.hlc;
                     continue;
                 }
                 let orphaned = stamp.hlc > dropped.hlc
@@ -396,6 +449,7 @@ impl Engine {
                             value.value(),
                         )
                     });
+                kept |= stamp.hlc > dropped.hlc && !orphaned;
                 if stamp.hlc <= dropped.hlc || orphaned {
                     let document = codec::decode_doc_record(value.value())
                         .and_then(|record| Ok(record.document()?))
@@ -417,21 +471,20 @@ impl Engine {
             // A removal has no document to key and so no violation to report.
             crate::index::maintain_remote(self, txn, standing, previous.as_ref(), None, key)?;
         }
-        Ok(Chunk { removed: found.len(), skipped, last, exhausted, first_arrival })
+        Ok(Chunk { removed: found.len(), skipped, last, exhausted, first_arrival, kept })
     }
 
     /// A replicated drop of the collection `db.name` has reached a member whose
     /// life began at or before it (ADR-231, extended; ruled by Chris,
     /// 2026-10-13): **keep what is stamped after the drop**.
     ///
-    /// Only an explicit *collection* drop takes this path. A database's drop
-    /// does not (ADR-229): a life **created at or before the database's own
-    /// tombstone** is buried with what was written into it afterwards, whichever
-    /// route the collection's drop came by, and a life created after it (a
-    /// database dropped and made again) keeps like any other. That one rule is
-    /// the guard on every path, and it is judged inside the transaction below.
-    /// A database tombstone that arrives later finds a re-dated life by
-    /// [`Redated::from`](crate::meta::Redated::from) and buries it the same way.
+    /// A collection's drop takes this path on every route (an entry, a scoped
+    /// page, a whole page's carried drop), and so does a database's drop for
+    /// every life its tombstone covers (ADR-236, amending ADR-229's "writes and
+    /// all"; ruled by Chris, 2026-10-14): `dropped` is then the database's
+    /// tombstone, and the life is judged by its `created` like any other. A
+    /// member that held a newer life of the name always kept such a write by
+    /// its stamp; the member holding the covered life now does too.
     ///
     /// **One write transaction decides** (D-2), the same that buries on the fast
     /// path, so a write stamped after the drop cannot land between the decision
@@ -460,6 +513,7 @@ impl Engine {
         name: &str,
         dropped: Stamp,
         stop: StopCheck<'_>,
+        notify: crate::database_tombstone::Notify<'_>,
     ) -> Result<Dropped> {
         let shadow_name = kimmy_core::vector_meta::shadow_name(name);
         if kimmy_core::vector_meta::is_shadow(name) {
@@ -488,13 +542,11 @@ impl Engine {
             return Ok(Dropped::Buried(false));
         };
         let mut shadow = read_collection(&txn, db, &shadow_name)?;
-        let covered =
-            database_tombstone_in(&txn, db)?.is_some_and(|stamp| meta.created <= stamp.hlc);
-        if covered || self.nothing_is_stamped_after(&txn, &meta, dropped.hlc)? {
+        if self.nothing_is_stamped_after(&txn, &meta, dropped.hlc)? {
             let burial = self.bury_standing_in_txn(&txn, db, name, meta, shadow, Some(dropped))?;
             txn.commit()?;
             let ids = self.finish_burial(db, name, burial);
-            crate::database_tombstone::Notify::Each.buried(self, db, name, &ids);
+            notify.buried(self, db, name, &ids);
             return Ok(Dropped::Buried(true));
         }
         let ids: Vec<CollectionId> =
@@ -526,7 +578,7 @@ impl Engine {
         txn.commit()?;
         #[cfg(test)]
         hooks::took_the_survivors_path();
-        crate::database_tombstone::Notify::Each.buried(self, db, name, &ids);
+        notify.buried(self, db, name, &ids);
         let end = self.sweep_until(db, name, dropped, stop)?;
         if end.survived && self.get_collection(db, &shadow_name).is_ok() {
             self.sweep_until(db, &shadow_name, dropped, stop)?;
@@ -570,7 +622,13 @@ impl Engine {
         }
         let rows = txn.open_table(tables::LIVE_DIGESTS)?;
         let Some(row) = crate::live_digest::kept_row(&rows, meta.id.0)? else {
-            return Ok(false);
+            // No row is *unknown*, unless the collection holds no record at all,
+            // which a seek says: a life created and never written (the digest
+            // row is made by the first write) has nothing to keep. Without this a
+            // database's drop took every such collection through the survivors
+            // path, three commits and a notice of its own each (ADR-236).
+            let docs = txn.open_table(tables::DOCS)?;
+            return Ok(docs.range(crate::engine::doc_range(meta.id))?.next().is_none());
         };
         Ok(row.maxw.values().all(|stamp| *stamp <= dropped))
     }
@@ -604,29 +662,25 @@ impl Engine {
         )
     }
 
-    /// A database's tombstone `dropped` covers the re-dated life `standing` if
-    /// the life was created at or before it before the drop re-dated it: it is
-    /// buried with the database, the writes it kept with it (ADR-229). In its
-    /// own transaction; `None` where the life was already buried or recreated.
-    pub(crate) fn bury_redated_under_database(
-        &self,
-        db: &str,
-        name: &str,
-        dropped: Stamp,
-    ) -> Result<Option<Vec<CollectionId>>> {
-        let txn = self.begin_write_as(WriterHolder::Ddl, crate::engine::Continuing::No)?;
-        let Some(standing) = read_collection(&txn, db, name)? else {
-            txn.abort()?;
-            return Ok(None);
-        };
-        if !standing.redated.is_some_and(|r| r.created == standing.created && r.from <= dropped.hlc)
-        {
-            txn.abort()?;
-            return Ok(None);
-        }
-        let burial = self.bury_redated_in_txn(&txn, &standing, dropped)?;
-        txn.commit()?;
-        Ok(Some(self.finish_burial(db, name, burial)))
+    /// Where the count half's repair replays a peer's oplog from for the life
+    /// `standing` (ADR-231 item 7, ADR-236): the lowest of its incarnation floor,
+    /// its `created`, and the tombstone this member holds for its id.
+    ///
+    /// The floor is where the life's valid history begins, and it can sort before
+    /// `created` (a write kept through a drop, then a creation elsewhere). The
+    /// tombstone is the second line behind relaying an ignored drop: a member
+    /// whose own late `created` sits above a drop it holds could otherwise ask
+    /// for nothing at or below that drop, and a straggler of the life it ended,
+    /// set aside or taken in, is judged again by the replay. Everything at or
+    /// below the floor or the tombstone is refused as history on the way, so
+    /// starting lower costs entries read and returns nothing of a life before.
+    pub fn count_repair_replay_from(&self, standing: &CollectionMeta) -> Result<Hlc> {
+        let tombstone = self.collection_dropped_at(standing.id)?.map(|stamp| stamp.hlc);
+        Ok([Some(standing.created), standing.incarnation_floor, tombstone]
+            .into_iter()
+            .flatten()
+            .min()
+            .unwrap_or(standing.created))
     }
 
     /// A drop was judged aimed at a life of `current` that has already ended
@@ -738,15 +792,6 @@ fn redate(meta: &mut CollectionMeta, dropped: Hlc) {
 fn holds_a_definition_stamped_after(standing: &CollectionMeta, dropped: Hlc) -> bool {
     standing.indexes.iter().any(|index| index.created.is_some_and(|c| c.hlc > dropped))
         || standing.vector_changed.is_some_and(|changed| changed.hlc > dropped)
-}
-
-/// The tombstone of `db`'s drop as `txn` sees it.
-fn database_tombstone_in(txn: &redb::WriteTransaction, db: &str) -> Result<Option<Stamp>> {
-    let tombstones = txn.open_table(tables::COLLECTIONS_DROPPED)?;
-    match tombstones.get(kimmy_core::database_drop_id(db).0)? {
-        Some(raw) => Ok(Some(codec::decode_oplog_key(raw.value())?)),
-        None => Ok(None),
-    }
 }
 
 /// The collection `db.name` as `txn` sees it.
@@ -943,10 +988,13 @@ mod tests {
         assert_counts_exact(&d, "a buried collection");
     }
 
-    /// A database drop is not changed: a collection that holds a write stamped
-    /// after it is buried with it, as ADR-229 documents.
+    /// A database drop keeps a write stamped after it as a collection's drop does
+    /// (ADR-236, amending ADR-229's "writes and all"): the life is re-dated above
+    /// the drop of it the dropper minted, the write stands, what was written
+    /// before is gone, and the counts are exact. A collection with nothing after
+    /// the drop is buried as before.
     #[test]
-    fn a_database_drop_still_buries_a_collection_holding_a_later_write() {
+    fn a_database_drop_keeps_a_collection_holding_a_later_write() {
         let (a, _da) = engine();
         let (d, _dd) = engine();
         let on_a = a.create_collection("shop", "orders").unwrap();
@@ -955,21 +1003,23 @@ mod tests {
         sync(&a, &d);
         a.drop_database("shop").unwrap();
         a.finish_purges_now().unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(5));
         let on_d = d.get_collection("shop", "orders").unwrap();
         d.insert(&on_d, doc! { "_id": 3i64 }).unwrap();
         quiesce(&[&a, &d]);
-        assert!(d.get_collection("shop", "orders").is_err(), "buried with the database");
-        assert!(d.get_collection("shop", "items").is_err());
+        let kept = d.get_collection("shop", "orders").expect("kept with the later write");
+        let dropped = a.collection_dropped_at(on_a.id).unwrap().unwrap();
+        assert!(kept.is_redated() && kept.created > dropped.hlc, "{kept:?}");
+        assert_eq!(docs_of(&d, "shop", "orders", &[1, 3]), vec![3]);
+        assert!(d.get_collection("shop", "items").is_err(), "nothing after: buried");
         assert_counts_exact(&d, "a database drop");
     }
 
-    /// D-3. A whole-database snapshot page carries the database's drop, and the
-    /// collection tombstones a database drop writes, at the database drop's own
-    /// stamp. The snapshot route cannot tell those from explicit collection
-    /// drops, and a database survivor never keeps a write (ADR-229): the
-    /// collection is buried whole, as the entry route buries it.
+    /// The same by a whole-database snapshot page, which carries the database's
+    /// drop and the collection tombstones the dropper wrote: both keep the later
+    /// write, as the entry route does.
     #[test]
-    fn a_whole_database_page_buries_a_collection_holding_a_later_write() {
+    fn a_whole_database_page_keeps_a_collection_holding_a_later_write() {
         let (a, _da) = engine();
         let (d, _dd) = engine();
         let on_a = a.create_collection("shop", "orders").unwrap();
@@ -978,6 +1028,7 @@ mod tests {
         sync(&a, &d);
         a.drop_database("shop").unwrap();
         a.finish_purges_now().unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(5));
         let on_d = d.get_collection("shop", "orders").unwrap();
         d.insert(&on_d, doc! { "_id": 3i64 }).unwrap();
         let page = a.snapshot_page(None, None).unwrap();
@@ -988,16 +1039,16 @@ mod tests {
         d.apply_snapshot_page(a.node_id(), &mut crate::SnapshotProgress::whole_database(), &page)
             .unwrap();
         d.finish_purges_now().unwrap();
-        assert!(d.get_collection("shop", "orders").is_err(), "buried with the database");
+        assert_eq!(docs_of(&d, "shop", "orders", &[1, 3]), vec![3], "kept, by page");
         assert!(d.get_collection("shop", "items").is_err());
         assert_counts_exact(&d, "a database drop by page");
     }
 
-    /// D-3, the scoped route with the database's tombstone held: the collection
-    /// was buried by the database's drop, with a drop of its own above the
-    /// database's stamp, and that does not keep a later write.
+    /// The scoped route with the database's tombstone held: the collection's own
+    /// drop, which the dropper minted above the database's stamp, keeps the later
+    /// write too.
     #[test]
-    fn a_scoped_page_at_the_databases_own_stamp_buries_a_collection_holding_a_later_write() {
+    fn a_scoped_page_at_the_databases_own_stamp_keeps_a_collection_holding_a_later_write() {
         let (a, _da) = engine();
         let (d, _dd) = engine();
         let on_a = a.create_collection("shop", "orders").unwrap();
@@ -1006,6 +1057,7 @@ mod tests {
         sync(&a, &d);
         a.drop_database("shop").unwrap();
         a.finish_purges_now().unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(5));
         let on_d = d.get_collection("shop", "orders").unwrap();
         d.insert(&on_d, doc! { "_id": 3i64 }).unwrap();
         // D learns of the database's drop first (its tombstone), then the scoped
@@ -1022,7 +1074,10 @@ mod tests {
         )
         .unwrap();
         d.finish_purges_now().unwrap();
-        assert!(d.get_collection("shop", "orders").is_err(), "buried with the database");
+        assert_eq!(docs_of(&d, "shop", "orders", &[1, 3]), vec![3], "kept, by a scoped page");
+        // And the database's own sweep, which the tombstone held asks for, keeps it.
+        d.bury_under_database_tombstones().unwrap();
+        assert_eq!(docs_of(&d, "shop", "orders", &[1, 3]), vec![3], "and by the sweep");
     }
 
     /// D-3, the other side: the scoped repair of a collection the sender dropped
@@ -1094,7 +1149,13 @@ mod tests {
             }
         };
         assert!(matches!(
-            b.drop_keeping_later_writes("shop", "orders", dropped, &one_chunk),
+            b.drop_keeping_later_writes(
+                "shop",
+                "orders",
+                dropped,
+                &one_chunk,
+                crate::database_tombstone::Notify::Each
+            ),
             Err(crate::StorageError::Stopping(_))
         ));
         // D-1: re-dated by the first commit, so the sweep is owed and a start
@@ -1672,26 +1733,48 @@ mod tests {
         assert_eq!(docs_of(&b, "shop", "orders", &[1, 2]), vec![2]);
     }
 
-    /// f-1. A definition tied at the drop (the same `Hlc`, from a node above the
-    /// dropper's) is selected by the sweep and declined by the drop of the index,
-    /// which keeps it and records the tombstone: the tie is on the selected side
-    /// of the boundary and the definition stands.
+    /// f-1, as ADR-236 rules it. A definition tied at the drop (the same `Hlc`, from a
+    /// node above the dropper's) is the drop's: the sweep selects it, and its drop is
+    /// not declined, as the members that judge the same definition by their floor
+    /// (`below_floor`, `Hlc`, not strict) refuse it. The index's tombstone is recorded at
+    /// the index's own stamp, the one that sorts above the drop's. (It was declined and
+    /// kept, so the sweeping member held an index every other member refused.)
     #[test]
-    fn a_definition_tied_at_the_drop_is_kept_and_its_drop_is_declined() {
+    fn a_definition_tied_at_the_drop_is_swept_as_the_drops() {
         let (a, b, _da, _db, dropped) = a_drop_and_a_later_life();
         b.create_index("shop", "orders", by_from(), false, Some("tied".into())).unwrap();
         let above = Stamp::new(dropped.hlc, NodeId::from_bytes([0xff; 16]));
         assert!(above > dropped, "premise: the tie sorts above the dropper's");
         edit_meta(&b, |meta| meta.indexes[0].created = Some(above));
         let id = b.get_collection("shop", "orders").unwrap().id;
-        quiesce(&[&a, &b]);
+        pull(&b, &a);
         let standing = b.get_collection("shop", "orders").unwrap();
-        assert_eq!(standing.indexes.len(), 1, "the tie was swept");
+        assert!(standing.indexes.is_empty(), "the tie was kept: {:?}", standing.indexes);
         assert_eq!(
             b.index_dropped_at(id, kimmy_core::IndexMeta::derive_id("tied")).unwrap(),
-            Some(dropped),
-            "the tie is selected and its drop declined, with the tombstone recorded"
+            Some(above),
+            "the tie's drop is recorded at the index's own stamp"
         );
+    }
+
+    /// The same for a vector configuration changed in the drop's own `Hlc` by a node above
+    /// the dropper's (ADR-236): the sweep selects it as the drop's and turns it off, though
+    /// last-writer-wins would read the drop's stamp as older than the change. The change's
+    /// stamp stays the one recorded, as the index's drop is recorded at the index's own.
+    /// (It was turned off at the drop's stamp, which lost to the change: this member alone
+    /// kept a configuration every other member refused by its floor.)
+    #[test]
+    fn a_vector_configuration_tied_at_the_drop_is_turned_off_as_the_drops() {
+        let (a, b, _da, _db, dropped) = a_drop_and_a_later_life();
+        b.configure_vectors("shop", "orders", byo_config()).unwrap();
+        let above = Stamp::new(dropped.hlc, NodeId::from_bytes([0xff; 16]));
+        assert!(above > dropped, "premise: the tie sorts above the dropper's");
+        edit_meta(&b, |meta| meta.vector_changed = Some(above));
+        pull(&b, &a);
+        let standing = b.get_collection("shop", "orders").unwrap();
+        assert!(standing.vector.is_none(), "the tie was kept: {:?}", standing.vector);
+        assert_eq!(standing.vector_changed, Some(above), "turned off at the change's own stamp");
+        assert_eq!(standing.incarnation_floor, Some(dropped.hlc), "and the sweep finished");
     }
 
     /// f-1. A newer life's index with the same derived id as the old one's (same
@@ -1927,5 +2010,186 @@ mod tests {
         b.apply_batch(rest).unwrap();
         quiesce(&[&a, &b]);
         assert!(b.get_collection("shop", "orders").unwrap().vector.is_some());
+    }
+
+    /// The count half's replay starts no higher than the tombstone this member holds
+    /// for the id (ADR-236), nor than the floor, nor than `created`: a member whose own
+    /// creation is above a drop it holds and has not yet floored the life at (a sweep
+    /// owed, or a store from before the sweep) still asks for that drop's history.
+    #[test]
+    fn the_count_repairs_replay_starts_at_the_lowest_of_floor_created_and_tombstone() {
+        let (e, _d) = engine();
+        let orders = e.create_collection("shop", "orders").unwrap();
+        assert_eq!(e.count_repair_replay_from(&orders).unwrap(), orders.created, "nothing lower");
+
+        let below = Hlc::new(orders.created.wall_ms.saturating_sub(10), 0);
+        e.record_collection_drop(orders.id, Stamp::new(below, NodeId::from_bytes([7; 16])))
+            .unwrap();
+        assert_eq!(e.count_repair_replay_from(&orders).unwrap(), below, "the tombstone, owed");
+
+        let mut floored = orders.clone();
+        floored.incarnation_floor = Some(Hlc::new(below.wall_ms.saturating_sub(5), 0));
+        assert_eq!(
+            e.count_repair_replay_from(&floored).unwrap(),
+            floored.incarnation_floor.unwrap(),
+            "the floor, where it is the lowest"
+        );
+    }
+
+    /// A configuration made while the sweep turns off a tied one (ADR-236 item 2). The sweep
+    /// reads the standing configuration without the writer, then turns it off as `Swept`,
+    /// and its retry loop reads the definition again. A configuration a client makes in
+    /// between, stamped after the drop, is the newer life's: it stays, as it does on every
+    /// other member. (`Swept` skipped last-writer-wins, and turned it off at the older swept
+    /// stamp: this member alone lost a definition the drop keeps.)
+    #[test]
+    fn a_configuration_made_while_the_sweep_turns_off_a_tied_one_is_kept() {
+        let (a, b, _da, _db, dropped) = a_drop_and_a_later_life();
+        let b = std::sync::Arc::new(b);
+        b.configure_vectors("shop", "orders", byo_config()).unwrap();
+        let above = Stamp::new(dropped.hlc, NodeId::from_bytes([0xff; 16]));
+        edit_meta(&b, |meta| meta.vector_changed = Some(above));
+        let competing = std::sync::Arc::clone(&b);
+        let ((), made) = crate::sync::race_hooks::race(
+            crate::sync::race_hooks::Race::VectorRemoval,
+            move || {
+                let mut config = byo_config();
+                config.fields = vec!["body".into()];
+                competing.configure_vectors("shop", "orders", config).unwrap()
+            },
+            || pull(&b, &a),
+        );
+        let made = made.vector_changed.expect("a local configuration is stamped");
+        assert!(made.hlc > dropped.hlc, "premise: the client's configuration is after the drop");
+        let standing = b.get_collection("shop", "orders").unwrap();
+        assert!(
+            standing.vector.is_some(),
+            "a configuration stamped after the drop was turned off by the sweep: changed {:?}, \
+             made {made:?}",
+            standing.vector_changed
+        );
+        quiesce(&[&a, &b]);
+        assert_eq!(
+            a.get_collection("shop", "orders").unwrap().vector.is_some(),
+            b.get_collection("shop", "orders").unwrap().vector.is_some(),
+            "the members agree"
+        );
+    }
+
+    /// The clock passes the floor a sweep takes, as it passes the one taken at install
+    /// (ADR-236 item 6). A scoped page's `dropped` that its sender's coverage does not name
+    /// is recorded and swept without a witness (ADR-163), and the sweep takes the floor up
+    /// to it. D installs A's newer life from B (whose coverage names neither the creation
+    /// nor its floor), then takes A's drop of the life before from C (which recorded it
+    /// from a page and holds no entry of A's): D's floor is the drop. With its clock left
+    /// below it, D's acknowledged write was history on A, B and C and kept on D for good
+    /// (the drop's entry, when it comes, owes no sweep).
+    #[test]
+    fn a_floor_a_sweep_takes_from_an_unwitnessed_drop_is_passed_by_the_clock() {
+        let (a, _da) = engine();
+        let (b, _db) = engine();
+        let (c, _dc) = engine();
+        let (d, _dd) = engine();
+        let base = crate::engine::physical_now_ms() + 3_600_000;
+        let at = |e: &Engine, t: u64| {
+            e.advance_clock_past(&Stamp::new(Hlc::new(base + t, 0), e.node_id()));
+        };
+        let scoped = |into: &Engine, from: &Engine, id| {
+            let mut progress = crate::SnapshotProgress::of_collection(id);
+            while !progress.is_complete() {
+                let page = from.snapshot_page(progress.after().cloned(), progress.scope()).unwrap();
+                into.apply_snapshot_page(from.node_id(), &mut progress, &page).unwrap();
+            }
+        };
+        at(&a, 100);
+        let first = a.create_collection("shop", "orders").unwrap();
+        at(&a, 150);
+        assert!(a.drop_collection("shop", "orders").unwrap());
+        a.finish_purges_now().unwrap();
+        let dropped = a.collection_dropped_at(first.id).unwrap().unwrap();
+        scoped(&c, &a, first.id);
+        assert_eq!(c.collection_dropped_at(first.id).unwrap(), Some(dropped), "premise");
+        at(&a, 300);
+        a.create_collection("shop", "orders").unwrap();
+        scoped(&b, &a, first.id);
+        scoped(&d, &b, first.id);
+        scoped(&d, &c, first.id);
+        let on_d = d.get_collection("shop", "orders").unwrap();
+        assert_eq!(on_d.incarnation_floor, Some(dropped.hlc), "premise: the sweep took the floor");
+        d.insert(&on_d, doc! { "_id": 1i64 }).unwrap();
+        quiesce(&[&a, &b, &c, &d]);
+        let held: Vec<Vec<i64>> =
+            [&a, &b, &c, &d].iter().map(|e| docs_of(e, "shop", "orders", &[1])).collect();
+        assert!(
+            held.iter().all(|h| *h == held[0]),
+            "A, B, C, D hold orders/1: {held:?}; D's clock {:?} trails its floor {:?}",
+            d.clock_last(),
+            dropped.hlc
+        );
+    }
+
+    /// The definitions a sweep removes are read once it has passed the clock, under the
+    /// writer (ADR-236 item 6). A local index minted under a clock that trails the drop (a drop
+    /// recorded unwitnessed, the precondition of the sweep's witness), after the tombstone and
+    /// before the witness, and committed after a read taken before it, was not swept: it stood
+    /// at or below the floor on this member alone, and every other member refused its entry
+    /// as the ended life's (`definition_of_an_ended_life`). A record minted in the same window
+    /// is a straggler the chunks remove; a definition is removed only if the read sees it.
+    #[test]
+    fn a_local_index_minted_below_the_drop_while_the_sweep_reads_is_swept() {
+        let (d, _dd) = engine();
+        let orders = d.create_collection("shop", "orders").unwrap();
+        // Enough documents that the index build holds the writer while the sweep reads.
+        let docs: Vec<bson::Document> = (0..50_000i64).map(|i| doc! { "_id": i, "k": i }).collect();
+        d.insert_many(&orders, docs).unwrap();
+        let base = crate::engine::physical_now_ms() + 3_600_000;
+        let dropped = Stamp::new(Hlc::new(base + 150, 0), NodeId::from_bytes([0x01; 16]));
+        // A newer life whose creation this member stored without witnessing it: `created`
+        // above the drop, no floor, and the clock below both.
+        edit_meta(&d, |meta| {
+            meta.created = Hlc::new(base + 300, 0);
+            meta.incarnation_floor = None;
+        });
+        assert!(d.clock_last() < dropped.hlc, "premise: the clock trails the drop");
+        d.record_collection_drop(orders.id, dropped).unwrap();
+        let current = d.get_collection("shop", "orders").unwrap();
+        let d = std::sync::Arc::new(d);
+        let before = d.clock_last();
+        let building = std::sync::Arc::clone(&d);
+        let build = std::thread::spawn(move || {
+            building
+                .create_index(
+                    "shop",
+                    "orders",
+                    vec![kimmy_core::IndexField::ascending("k")],
+                    false,
+                    None,
+                )
+                .unwrap()
+        });
+        // The build has minted its stamp under the writer and is filling the index.
+        while d.clock_last() == before {
+            std::thread::yield_now();
+        }
+        d.sweep_after_an_ignored_drop(&current, dropped).unwrap();
+        let made = build.join().unwrap().created.expect("a local index is stamped");
+        assert!(made.hlc < dropped.hlc, "premise: minted below the drop: {made:?}");
+        let standing = d.get_collection("shop", "orders").unwrap();
+        assert_eq!(standing.incarnation_floor, Some(dropped.hlc), "premise: the sweep ran");
+        let ended: Vec<_> = standing
+            .indexes
+            .iter()
+            .filter(|index| {
+                index.created.is_some_and(|created| {
+                    d.definition_of_an_ended_life(&standing, created).unwrap()
+                })
+            })
+            .map(|index| (index.name.clone(), index.created))
+            .collect();
+        assert!(
+            ended.is_empty(),
+            "an index of the ended life (at or below the floor) stands after the sweep, on \
+             this member alone: {ended:?}"
+        );
     }
 }

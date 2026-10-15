@@ -88,6 +88,13 @@ pub struct Engine {
     /// count misses the case where one document is deleted and another added.
     /// A counter is exact and free.
     vector_generations: Mutex<std::collections::HashMap<CollectionId, u64>>,
+    /// For a collection absent here, the coverage of the scoped pages that left it
+    /// absent from a sender holding no life of it (ADR-236 item 4). A definition that
+    /// coverage names is one its sender processed and holds no life for: history here,
+    /// as it is there, whoever serves it (`Engine::answered_by_a_page`). Kept in memory:
+    /// after a restart a stop at such a definition asks for the page again, once.
+    pub(crate) answered_absent:
+        Mutex<std::collections::HashMap<CollectionId, kimmy_core::VersionVector>>,
     /// Where the database file lives, kept so that size can be reported
     /// without the caller having to remember what it opened.
     path: std::path::PathBuf,
@@ -1452,6 +1459,7 @@ impl Engine {
             swept: Mutex::new(Default::default()),
             collections_generation: std::sync::atomic::AtomicU64::new(0),
             vector_generations: Mutex::new(Default::default()),
+            answered_absent: Mutex::new(Default::default()),
             path: path.to_path_buf(),
             unique_violations: std::sync::atomic::AtomicU64::new(0),
             unkeyed_writes: std::sync::atomic::AtomicU64::new(0),
@@ -4391,11 +4399,9 @@ impl Engine {
             if !log && self.database_refusal(db, origin)?.is_some() {
                 return Ok(InTxn::History);
             }
-            let incarnation_floor = [dropped, self.database_dropped_at(db)?]
-                .into_iter()
-                .flatten()
-                .max()
-                .map(|stamp| stamp.hlc);
+            let database_dropped = self.database_dropped_at(db)?;
+            let incarnation_floor =
+                [dropped, database_dropped].into_iter().flatten().max().map(|stamp| stamp.hlc);
 
             // A vector shadow from elsewhere whose parent this node has buried
             // since the shadow was created is a life that drop ended, though
@@ -4467,8 +4473,22 @@ impl Engine {
             }
 
             // Every check that ends the creation without a write is behind us:
-            // the stamp is minted here, once, for the write that follows.
-            let stamp = mint();
+            // the stamp is minted here, once, for the write that follows. It is minted
+            // **above the floor the life takes**, on every route (ADR-236), as a local
+            // drop is minted above the life it buries: a tombstone this member
+            // recorded without witnessing it (a scoped page's drop its sender's
+            // coverage did not name) can stand above the clock. A local creation below
+            // its own floor is history on every other member, its writes with it; and
+            // a life installed from elsewhere (a page, an entry) over a floor the clock
+            // trails took this member's next write into it below the floor, history on
+            // every other member too. So the clock passes the floor at install, as
+            // ADR-233's witnesses and its restart rule pass it.
+            let stamp = match (mint(), incarnation_floor) {
+                (stamp, Some(floor)) if stamp.hlc <= floor => {
+                    self.next_stamp_above(Some(Stamp::new(floor, self.node_id)))
+                }
+                (stamp, _) => stamp,
+            };
 
             // `created` is the stamp of the create that produced this
             // incarnation *at its origin* — for a replicated create, the
@@ -4482,6 +4502,28 @@ impl Engine {
             // incarnation starts with no digest row, so the old one's highest
             // stamps do not make it look busy (B3 design 2.1).
             crate::live_digest::reset(txn, id)?;
+            // A life created over its database's tombstone takes a tombstone of its
+            // own at the database's drop, with its shadow's, which is what the
+            // database's sweep gives every life it leaves standing (ADR-229 item 4).
+            // One rule for the table, whichever this member had first, the creation
+            // or the drop (ADR-236): the floor above refuses the same things, but the
+            // tombstone is what the existence half reads and a whole page carries.
+            if let Some(at) = database_dropped {
+                let mut tombstones = txn.open_table(tables::COLLECTIONS_DROPPED)?;
+                let mut ids = vec![id];
+                if !vector_meta::is_shadow(name) {
+                    ids.push(CollectionId::derive(db, &vector_meta::shadow_name(name)));
+                }
+                for id in ids {
+                    let newer = match tombstones.get(id.0)? {
+                        Some(held) => at > codec::decode_oplog_key(held.value())?,
+                        None => true,
+                    };
+                    if newer {
+                        tombstones.insert(id.0, codec::oplog_key(&at).as_slice())?;
+                    }
+                }
+            }
             (meta, stamp)
         };
 
@@ -4806,8 +4848,18 @@ impl Engine {
         replicated: Option<Stamp>,
     ) -> Result<Burial> {
         let log = replicated.is_none();
-        // Under the writer, as `create_collection_inner` mints (ADR-148).
-        let stamp = replicated.unwrap_or_else(|| self.next_stamp());
+        // Under the writer, as `create_collection_inner` mints (ADR-148), and a
+        // local drop **above the life it buries**, whatever the clock says
+        // (ADR-236), as a change to a stamped thing is minted above its stamp
+        // (ADR-226). A creation a page stored without witnessing it (the sender's
+        // coverage did not name it, ADR-233's trade) can stand above this
+        // member's clock; a drop minted below it is judged, on every member that
+        // holds the life, as aimed at a life that ended before this one, and the
+        // life comes back here by entries over the acknowledged drop.
+        let stamp = match replicated {
+            Some(stamp) => stamp,
+            None => self.next_stamp_above(Some(Stamp::new(meta.created, self.node_id))),
+        };
         let database_emptied = {
             let mut collections = txn.open_table(tables::COLLECTIONS)?;
             collections.remove((db, name))?;

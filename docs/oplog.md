@@ -436,7 +436,25 @@ collection dropped here is not one that may still arrive, so an entry addressed
 to it — including a peer's ordinary write made before it heard the drop — is
 superseded, witnessed and carried past rather than stopping anything. That is
 ADR-123's case: re-delivering it unchanged can never succeed
-([ADR-148](decisions.md)).
+([ADR-148](decisions.md)). A document is brought back where it belongs by the
+count half's replay. **A definition stamped after the tombstone is the one
+exception** (an index creation or a vector configuration, [ADR-236](decisions.md)):
+it belongs to a life of the name this node has not had yet, a newer one whose
+creation sorts after it or the one the drop kept elsewhere, and nothing replays a
+definition, so it stops the batch as a collection with no record does and the
+scoped snapshot brings the life with it. An index's drop stays history: its
+tombstone is recorded, which is all of it the later life needs. **The stop lasts
+one scoped snapshot when its sender holds no life of the collection**: a member
+that buried the life (nothing stamped after the drop still stood) or a 0.49.x
+member that buried it with its database still serves the definition, and a
+snapshot that holds no life and leaves the collection absent here makes every
+definition its sender's coverage names history, whoever serves it: its first page,
+or a page cut after its sender buried the life, which carries the drop.
+
+**A drop this node ignores is held and served onward like one it applies**
+([ADR-236](decisions.md)), and so is a creation its database's drop refuses: the
+vector this node serves names the origin past them, so withholding them left the
+next member never served them by anyone.
 
 **A stamp is minted only under the writer, so `oplog_versions` never names a
 stamp the committed oplog does not hold for the local origin.** Every local
@@ -477,7 +495,13 @@ receiver's vectors as they land: a snapshot is state in key order, not history
 in stamp order, and a document the sender wrote behind the cursor while the
 snapshot ran is not in it — its entry is above the first page's vector, so the
 next round pulls it from the oplog, where the last page's vector would have
-covered it and left a hole. A repair ([ADR-148](decisions.md)) pulls a snapshot
+covered it and left a hole. **Short of a refused life's later definitions**
+([ADR-236](decisions.md)): a page carrying a life the receiver refuses (created at
+or before its drop, from a sender that has not heard the drop) does not grant the
+entry of an index creation or vector configuration of that life stamped after the
+drop, which the drop keeps; the receiver is served it again, stops at it as above,
+and takes it with the life. Granted, it reached no member that keeps the life
+through this one. A repair ([ADR-148](decisions.md)) pulls a snapshot
 of the **one collection** it was planned for, which grants no coverage — the
 position the member already holds carries the rest — and, when the sender has
 since dropped the collection, carries the drop instead so the entries the

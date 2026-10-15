@@ -976,7 +976,7 @@ impl crate::Engine {
             expire_after_secs,
             partial_filter,
             CreateOrigin::Local,
-            &|_, _| false,
+            &|_, _| Ok(false),
         )?;
         debug_assert!(
             violations.is_empty(),
@@ -1045,7 +1045,7 @@ impl crate::Engine {
         expire_after_secs: Option<i64>,
         mut partial_filter: Option<bson::Document>,
         origin: CreateOrigin<'_>,
-        history: &dyn Fn(&crate::CollectionMeta, Option<Stamp>) -> bool,
+        history: &dyn Fn(&crate::CollectionMeta, Option<Stamp>) -> Result<bool>,
     ) -> Result<(IndexCreated, Vec<UniqueViolation>)> {
         // **A loop, not a self-call.** Every retry passes the same arguments, so
         // a lost race is a `continue`. It was a self-call, which made an
@@ -1284,7 +1284,7 @@ impl crate::Engine {
                                     partial_filter = index.partial_filter;
                                     continue;
                                 }
-                                if history(&read, self.index_dropped_at(meta.id, id)?) {
+                                if history(&read, self.index_dropped_at(meta.id, id)?)? {
                                     txn.abort()?;
                                     return Ok((IndexCreated::Older, Vec::new()));
                                 }
@@ -1335,7 +1335,7 @@ impl crate::Engine {
                             partial_filter = index.partial_filter;
                             continue;
                         }
-                        if history(&read, self.index_dropped_at(meta.id, id)?) {
+                        if history(&read, self.index_dropped_at(meta.id, id)?)? {
                             txn.abort()?;
                             return Ok((IndexCreated::Older, Vec::new()));
                         }
@@ -1445,7 +1445,7 @@ impl crate::Engine {
                 partial_filter = index.partial_filter;
                 continue;
             }
-            if history(&read, self.index_dropped_at(meta.id, id)?) {
+            if history(&read, self.index_dropped_at(meta.id, id)?)? {
                 txn.abort()?;
                 #[cfg(test)]
                 crate::sync::race_hooks::absorbed(crate::sync::race_hooks::Race::IndexHistory);
@@ -2954,7 +2954,7 @@ mod tests {
             None,
             None,
             origin,
-            &|_, _| false,
+            &|_, _| Ok(false),
         )
     }
 

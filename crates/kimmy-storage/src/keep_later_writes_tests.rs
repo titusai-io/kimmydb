@@ -6,7 +6,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use bson::doc;
-use kimmy_core::{CollectionId, DocId, Hlc, IndexField, VectorRecord};
+use kimmy_core::{CollectionId, DocId, Hlc, IndexField, Stamp, VectorRecord};
 
 use crate::late_drop::hooks;
 use crate::live_count::test_support::assert_counts_exact;
@@ -186,14 +186,15 @@ fn a_write_landing_before_the_burial_takes_the_writer_is_kept() {
 
 // -- D-1 / M-1: the two commits ----------------------------------------------
 
-/// A life the sweep leaves with nothing live (the write after the drop was
-/// itself deleted) is buried in the last commit and purged: the incarnation
-/// rule that would turn the same drop away from a life re-dated above it does
-/// not stand in the way.
+/// A life the sweep leaves holding, after the drop, only a delete (the write after
+/// the drop was itself deleted) keeps the delete as it would a live write (ADR-236,
+/// F16): it is re-dated, floored at the drop, and holds the tombstone. (It was buried
+/// in the last commit and purged, the delete with it.)
 #[test]
-fn a_life_left_with_nothing_by_the_sweep_is_buried_and_purged() {
+fn a_life_holding_only_a_delete_after_the_drop_keeps_it() {
     let (a, d, _da, _dd, id) = a_and_d_holding_the_old_life();
     assert!(a.drop_collection("shop", "orders").unwrap());
+    let dropped = a.collection_dropped_at(id).unwrap().expect("the drop's tombstone");
     later();
     let on_d = d.get_collection("shop", "orders").unwrap();
     d.insert(&on_d, doc! { "_id": 3i64 }).unwrap();
@@ -201,10 +202,134 @@ fn a_life_left_with_nothing_by_the_sweep_is_buried_and_purged() {
     let before = hooks::survivors_paths();
     quiesce(&[&a, &d]);
     assert_eq!(hooks::survivors_paths(), before + 1, "a tombstone stamped after the drop counts");
+    let kept = d.get_collection("shop", "orders").expect("kept with the delete");
+    assert!(kept.is_redated() && kept.created > dropped.hlc, "{kept:?}");
+    assert_eq!(kept.incarnation_floor, Some(dropped.hlc));
+    assert_eq!(docs_of(&d, "orders", &[1, 3]), Vec::<i64>::new());
+    // The delete's tombstone, and the sweep's bare tombstone at the drop for 1.
+    assert_eq!(d.rows_under(id).unwrap(), 2, "the delete's tombstone stands");
+    assert_counts_exact(&d, "a life that kept a delete");
+}
+
+/// Without a digest row, the records the sweep walks say it: a delete stamped after the
+/// drop keeps the life (ADR-236, F16).
+#[test]
+fn a_life_without_a_digest_row_keeps_a_delete_after_the_drop_by_its_records() {
+    let (a, d, _da, _dd, id) = a_and_d_holding_the_old_life();
+    assert!(a.drop_collection("shop", "orders").unwrap());
+    later();
+    let on_d = d.get_collection("shop", "orders").unwrap();
+    d.insert(&on_d, doc! { "_id": 3i64 }).unwrap();
+    assert!(d.delete(&on_d, &DocId::Int64(3)).unwrap());
+    forget_the_digest_row(&d, id);
+    quiesce(&[&a, &d]);
+    let kept = d.get_collection("shop", "orders").expect("kept with the delete");
+    assert!(kept.is_redated(), "{kept:?}");
+}
+
+/// And a delete after the drop that lands in a range the sweep has already walked, between
+/// two of its chunks, is read from the digest row the delete raised: the life is kept.
+#[test]
+fn a_delete_after_the_drop_landing_behind_the_sweeps_cursor_keeps_the_life() {
+    let (a, d, _da, _dd, id) = a_and_d_holding_the_old_life();
+    let on_a = a.get_collection("shop", "orders").unwrap();
+    let docs: Vec<_> = (1_000..2_400i64).map(|i| doc! { "_id": i }).collect();
+    a.insert_many(&on_a, docs).unwrap();
+    quiesce(&[&a, &d]);
+    assert!(a.drop_collection("shop", "orders").unwrap());
+    // Unknown, so the drop takes the survivors path with nothing after it yet.
+    forget_the_digest_row(&d, id);
+    let before = hooks::survivors_paths();
+    later();
+    let d = Arc::new(d);
+    let on_d = Arc::clone(&d);
+    hooks::run_after_the_next_chunk(move || {
+        let coll = on_d.get_collection("shop", "orders").unwrap();
+        on_d.insert(&coll, doc! { "_id": 2i64 }).unwrap();
+        assert!(on_d.delete(&coll, &DocId::Int64(2)).unwrap());
+    });
+    let start = d.version_vector().unwrap().behind(&a.version_vector().unwrap()).unwrap();
+    let window = a.entries_for_peer(start, BATCH, WalkScope::Background).unwrap().entries;
+    d.apply_batch(&window).unwrap();
+    assert_eq!(hooks::survivors_paths(), before + 1, "premise: the survivors path");
+    let kept = d.get_collection("shop", "orders").expect("kept with the delete behind the cursor");
+    assert!(kept.is_redated(), "{kept:?}");
+}
+
+/// A life the sweep leaves with nothing stamped after the drop at all is buried in the
+/// last commit and purged: the incarnation rule that would turn the same drop away from
+/// a life re-dated above it does not stand in the way. Reached when the drop took the
+/// survivors path for want of a digest row (an absent row is unknown).
+#[test]
+fn a_life_left_with_nothing_by_the_sweep_is_buried_and_purged() {
+    let (a, d, _da, _dd, id) = a_and_d_holding_the_old_life();
+    assert!(a.drop_collection("shop", "orders").unwrap());
+    forget_the_digest_row(&d, id);
+    let before = hooks::survivors_paths();
+    quiesce(&[&a, &d]);
+    assert_eq!(hooks::survivors_paths(), before + 1, "premise: the survivors path");
     assert!(!holds(&d, "orders"), "buried by the last commit");
     assert_eq!(d.rows_under(id).unwrap(), 0, "and purged");
     assert!(d.collection_dropped_at(id).unwrap().is_some());
     assert_counts_exact(&d, "an emptied life");
+}
+
+fn forget_the_digest_row(e: &Engine, id: CollectionId) {
+    let txn = e.begin_write(crate::WriterHolder::Ddl).unwrap();
+    txn.open_table(tables::LIVE_DIGESTS).unwrap().remove(id.0).unwrap();
+    txn.commit().unwrap();
+    assert!(e.digest_row(id).unwrap().is_none(), "premise");
+}
+
+/// F16 (ADR-236; the young-stamp model test's YS1). A delete made after the drop is a write
+/// after it: a life that holds, after the drop, only that delete keeps it, re-dated, and is
+/// not buried and purged with it. Buried, the delete was gone, the member took a newer life
+/// of the name holding no record of the document, and the count repair's scoped page from a
+/// member that had not yet heard the delete wrote the document back.
+#[test]
+fn a_delete_made_after_the_drop_is_kept_and_a_scoped_repair_does_not_write_the_document_back() {
+    let (a, _da) = engine();
+    let (b, _db) = engine();
+    let (c, _dc) = engine();
+    let id = c.create_collection("shop", "orders").unwrap().id;
+    pull(&a, &c);
+    pull(&b, &c);
+    later();
+    assert!(b.drop_collection("shop", "orders").unwrap());
+    b.finish_purges_now().unwrap();
+    let dropped = b.collection_dropped_at(id).unwrap().expect("the drop's tombstone");
+    later();
+    b.create_collection("shop", "orders").unwrap();
+    later();
+    // C, not having heard of the drop, writes; A takes it and deletes it.
+    let on_c = c.get_collection("shop", "orders").unwrap();
+    c.insert(&on_c, doc! { "_id": 1i64 }).unwrap();
+    pull(&a, &c);
+    later();
+    let on_a = a.get_collection("shop", "orders").unwrap();
+    assert!(a.delete(&on_a, &DocId::Int64(1)).unwrap());
+    // The drop reaches A, and B's life after it (which waits for a purge, if any).
+    pull(&a, &b);
+    a.finish_purges_now().unwrap();
+    pull(&a, &b);
+    assert!(holds(&a, "orders"), "premise: A holds a life of the name");
+    // The count repair's scoped page of the collection, from C, which still holds the
+    // document live.
+    assert_eq!(docs_of(&c, "orders", &[1]), vec![1], "premise: C has not heard the delete");
+    let mut progress = SnapshotProgress::of_collection(id);
+    while !progress.is_complete() {
+        let page = c.snapshot_page(progress.after().cloned(), progress.scope()).unwrap();
+        if a.apply_snapshot_page(c.node_id(), &mut progress, &page).unwrap().purge_pending.is_some()
+        {
+            a.finish_purges_now().unwrap();
+        }
+    }
+    assert_eq!(docs_of(&a, "orders", &[1]), Vec::<i64>::new(), "the deleted document came back");
+    let kept = a.get_collection("shop", "orders").unwrap();
+    assert!(kept.is_redated() && kept.created > dropped.hlc, "the life was not kept: {kept:?}");
+    assert_eq!(kept.incarnation_floor, Some(dropped.hlc));
+    assert_eq!(a.rows_under(id).unwrap(), 1, "the delete's tombstone stands");
+    assert_counts_exact(&a, "a life that kept a delete");
 }
 
 /// The log line says what happened. The survivors path is taken whenever a
@@ -225,19 +350,48 @@ fn the_survivors_path_logs_kept_only_when_something_survived() {
 
 #[test]
 fn the_survivors_path_logs_buried_when_the_sweep_left_nothing() {
-    let (a, d, _da, _dd, _id) = a_and_d_holding_the_old_life();
+    let (a, d, _da, _dd, id) = a_and_d_holding_the_old_life();
     assert!(a.drop_collection("shop", "orders").unwrap());
-    later();
-    let on_d = d.get_collection("shop", "orders").unwrap();
-    d.insert(&on_d, doc! { "_id": 3i64 }).unwrap();
-    assert!(d.delete(&on_d, &DocId::Int64(3)).unwrap());
+    forget_the_digest_row(&d, id);
     let logs = crate::log_capture::logs_of(|| quiesce(&[&a, &d]));
     assert!(!holds(&d, "orders"), "premise: buried by the last commit");
     assert!(logs.contains("the collection was buried"), "{logs}");
     assert!(!logs.contains("kept them"), "a collection buried whole was reported as kept: {logs}");
 }
 
-// -- D-3 / M-2 / M-4: the database's guard ----------------------------------
+// -- A database's drop keeps as a collection's does (ADR-236) ---------------
+
+/// The database's drop reaches the life it covers: what was written into it
+/// after the drop stands, re-dated, and what was written before goes. The
+/// member that never held the life takes it from the one that kept it, as the
+/// existence half's scoped repair brings it (ADR-231, extended).
+#[test]
+fn a_database_drop_keeps_a_write_stamped_after_it_in_the_life_it_covers() {
+    let (a, d, _da, _dd, id) = a_and_d_holding_the_old_life();
+    a.create_collection("shop", "items").unwrap();
+    sync(&a, &d);
+    a.drop_database("shop").unwrap();
+    a.finish_purges_now().unwrap();
+    later();
+    let on_d = d.get_collection("shop", "orders").unwrap();
+    d.insert(&on_d, doc! { "_id": 3i64 }).unwrap();
+    let before = hooks::survivors_paths();
+    quiesce(&[&a, &d]);
+    assert!(hooks::survivors_paths() > before, "premise: the survivors path");
+    let kept = d.get_collection("shop", "orders").expect("the covered life keeps the write");
+    let database_drop = a.database_dropped_at("shop").unwrap().unwrap();
+    assert!(kept.is_redated() && kept.created > database_drop.hlc, "{kept:?}");
+    assert_eq!(docs_of(&d, "orders", &[1, 3]), vec![3]);
+    assert!(!holds(&d, "items"), "nothing after: buried");
+    assert_counts_exact(&d, "a database drop that kept");
+    // The repair the existence half plans brings the kept life to the dropper.
+    assert!(!holds(&a, "orders"), "premise: A has nothing to put it in");
+    let page = d.snapshot_page(None, Some(id)).unwrap();
+    a.apply_snapshot_page(d.node_id(), &mut SnapshotProgress::of_collection(id), &page).unwrap();
+    assert_eq!(docs_of(&a, "orders", &[1, 3]), vec![3], "the dropper takes the kept write");
+}
+
+// -- D-3 / M-2 / M-4: the database's guard, as ADR-236 leaves it -------------
 
 /// A database that was dropped and made again has a tombstone, and a
 /// collection created after it is not covered by it: that collection's own
@@ -263,11 +417,12 @@ fn a_collection_in_a_database_made_again_keeps_a_write_after_its_own_drop() {
     assert_eq!(docs_of(&d, "orders", &[1, 3]), vec![3], "a database tombstone is not the guard");
 }
 
-/// The database's tombstone arrives after the collection's drop kept a write:
-/// the life was created at or before the database's drop, so the database
-/// buries it with the write (ADR-229), whichever of the two came first.
+/// The database's tombstone arrives after the collection's drop kept a write
+/// made before the database's drop: the database's drop, judged by the kept
+/// life's `created` like any drop (ADR-236), removes that write, and the life,
+/// left with nothing, is buried.
 #[test]
-fn a_database_tombstone_that_comes_after_a_kept_life_buries_it() {
+fn a_database_tombstone_that_comes_after_a_kept_life_removes_a_write_made_before_it() {
     let (a, d, _da, _dd, _id) = a_and_d_holding_the_old_life();
     a.create_collection("shop", "items").unwrap();
     sync(&a, &d);
@@ -283,6 +438,193 @@ fn a_database_tombstone_that_comes_after_a_kept_life_buries_it() {
     assert!(!holds(&d, "orders"), "the database's drop buried what the collection's kept");
     assert!(!holds(&d, "items"));
     assert_counts_exact(&d, "a database drop after a kept life");
+}
+
+/// A whole page of the life the receiver's floor says has ended brings the definitions
+/// that life made after the drop, an index and a vector configuration, into the life
+/// standing here (ADR-236): the drop keeps them, and the sender's life will once it hears
+/// the drop. Refused with the life, as they were, the receiver took the coverage of their
+/// entries and never held them.
+#[test]
+fn a_whole_page_brings_the_definitions_its_drop_keeps_into_the_newer_life() {
+    let (a, d, _da, _dd, _id) = a_and_d_holding_the_old_life();
+    assert!(a.drop_collection("shop", "orders").unwrap());
+    a.finish_purges_now().unwrap();
+    later();
+    d.create_index("shop", "orders", vec![IndexField::ascending("k")], false, Some("by_k".into()))
+        .unwrap();
+    d.configure_vectors("shop", "orders", byo_config()).unwrap();
+    later();
+    let newer = a.create_collection("shop", "orders").unwrap();
+    assert!(newer.incarnation_floor.is_some(), "premise: floored at the drop");
+    let page = d.snapshot_page(None, None).unwrap();
+    a.apply_snapshot_page(d.node_id(), &mut SnapshotProgress::whole_database(), &page).unwrap();
+    let standing = a.get_collection("shop", "orders").unwrap();
+    assert_eq!(standing.created, newer.created, "premise: the newer life stands");
+    assert!(standing.index("by_k").is_some(), "the index was refused: {:?}", standing.indexes);
+    assert!(standing.vector.is_some(), "the vector configuration was refused");
+    assert_eq!(
+        docs_of(&a, "orders", &[1]),
+        Vec::<i64>::new(),
+        "the life before's document stays out"
+    );
+}
+
+/// F15 (ADR-236). A drop that reaches a life created before it, holding a write after it,
+/// re-dates the life, sweeps the definitions of the life before, then its records a chunk
+/// at a time, and takes the floor in the last chunk. A `CreateIndex` of the life before
+/// that arrives between two chunks (a re-served window, a count-half replay) was judged by
+/// the floor alone, which was not there yet: built, and kept once the floor landed over it,
+/// an index every other member refused. It is judged by the drop's tombstone too.
+fn a_life_kept_by_a_drop_with_the_old_lifes_index_arriving_between_two_chunks(
+    arrives: impl FnOnce(&Engine, &[kimmy_core::OplogEntry], &Engine) + 'static,
+) -> (Engine, Engine, Engine, Stamp, [tempfile::TempDir; 3]) {
+    let (a, da) = engine();
+    let (d, dd) = engine();
+    let (x, dx) = engine();
+    let on_a = a.create_collection("shop", "orders").unwrap();
+    a.insert(&on_a, doc! { "_id": 1i64 }).unwrap();
+    pull(&d, &a);
+    later();
+    a.create_index("shop", "orders", vec![IndexField::ascending("v")], false, Some("old_i".into()))
+        .unwrap();
+    later();
+    // More than a chunk of the life before, so the sweep takes two.
+    let docs: Vec<_> = (1_000..2_400i64).map(|i| doc! { "_id": i }).collect();
+    a.insert_many(&on_a, docs).unwrap();
+    pull(&x, &a);
+    let entries = a.entries_for_peer(Hlc::ZERO, 10_000, WalkScope::Background).unwrap().entries;
+    let create: Vec<_> =
+        entries.iter().filter(|e| e.kind == kimmy_core::OpKind::CreateIndex).cloned().collect();
+    let rest: Vec<_> =
+        entries.iter().filter(|e| e.kind != kimmy_core::OpKind::CreateIndex).cloned().collect();
+    // D holds the life before without its index.
+    d.apply_batch(&rest).unwrap();
+    later();
+    assert!(a.drop_collection("shop", "orders").unwrap());
+    let dropped = a.collection_dropped_at(on_a.id).unwrap().expect("the drop's tombstone");
+    later();
+    // D makes an index after the drop, so the drop keeps its life.
+    d.create_index("shop", "orders", vec![IndexField::ascending("k")], false, Some("k_1".into()))
+        .unwrap();
+    let d = Arc::new(d);
+    let x = Arc::new(x);
+    let (on_d, from_x) = (Arc::clone(&d), Arc::clone(&x));
+    hooks::run_after_the_next_chunk(move || arrives(&on_d, &create, &from_x));
+    let start = d.version_vector().unwrap().behind(&a.version_vector().unwrap()).unwrap();
+    let window = a.entries_for_peer(start, 10_000, WalkScope::Background).unwrap().entries;
+    d.apply_batch(&window).unwrap();
+    let d = Arc::try_unwrap(d).ok().expect("the hook ran and let go");
+    let x = Arc::try_unwrap(x).ok().expect("the hook ran and let go");
+    (a, d, x, dropped, [da, dd, dx])
+}
+
+fn indexes_of_the_life_before(e: &Engine, dropped: Stamp) -> Vec<String> {
+    let kept = e.get_collection("shop", "orders").unwrap();
+    assert_eq!(kept.incarnation_floor, Some(dropped.hlc), "premise: the sweep finished");
+    kept.indexes
+        .iter()
+        .filter(|i| i.created.is_some_and(|c| c.hlc <= dropped.hlc))
+        .map(|i| i.name.clone())
+        .collect()
+}
+
+#[test]
+fn a_replicated_index_of_the_life_before_between_two_sweep_chunks_is_history() {
+    let (_a, d, _x, dropped, _dirs) =
+        a_life_kept_by_a_drop_with_the_old_lifes_index_arriving_between_two_chunks(
+            |d, create, _| {
+                d.apply_batch(create).unwrap();
+            },
+        );
+    assert_eq!(indexes_of_the_life_before(&d, dropped), Vec::<String>::new());
+    let names: Vec<_> =
+        d.get_collection("shop", "orders").unwrap().indexes.into_iter().map(|i| i.name).collect();
+    assert_eq!(names, vec!["k_1".to_string()], "the life's own index stands");
+}
+
+/// The same by a page: X, still holding the life before with its index, serves D a whole
+/// page between two chunks of D's sweep.
+#[test]
+fn a_pages_index_of_the_life_before_between_two_sweep_chunks_is_history() {
+    let (_a, d, _x, dropped, _dirs) =
+        a_life_kept_by_a_drop_with_the_old_lifes_index_arriving_between_two_chunks(|d, _, x| {
+            let page = x.snapshot_page(None, None).unwrap();
+            assert!(
+                page.collections.iter().any(|c| c.indexes.iter().any(|i| i.name == "old_i")),
+                "premise: the page carries the index"
+            );
+            let mut progress = SnapshotProgress::whole_database();
+            d.apply_snapshot_page(x.node_id(), &mut progress, &page).unwrap();
+        });
+    assert_eq!(indexes_of_the_life_before(&d, dropped), Vec::<String>::new());
+}
+
+/// A definition in the drop's own `Hlc`, from a node above the dropper's, arriving in the
+/// same window, is the drop's too (ADR-236: a tie is the drop's).
+#[test]
+fn a_replicated_index_in_the_drops_hlc_between_two_sweep_chunks_is_history() {
+    let (_a, d, _x, dropped, _dirs) =
+        a_life_kept_by_a_drop_with_the_old_lifes_index_arriving_between_two_chunks(
+            |d, create, _| {
+                let held = d.collection_dropped_at(CollectionId::derive("shop", "orders"));
+                let dropped = held.unwrap().expect("the tombstone is recorded first");
+                let mut tied = create[0].clone();
+                tied.stamp = Stamp::new(dropped.hlc, kimmy_core::NodeId::from_bytes([0xff; 16]));
+                d.apply_batch(std::slice::from_ref(&tied)).unwrap();
+            },
+        );
+    assert_eq!(indexes_of_the_life_before(&d, dropped), Vec::<String>::new());
+    let names: Vec<_> =
+        d.get_collection("shop", "orders").unwrap().indexes.into_iter().map(|i| i.name).collect();
+    assert_eq!(names, vec!["k_1".to_string()], "only the life's own index stands");
+}
+
+/// The same window for a vector configuration of the life before: judged by the drop's
+/// tombstone, not by the floor alone (ADR-236).
+#[test]
+fn a_replicated_vector_configuration_of_the_life_before_between_two_sweep_chunks_is_history() {
+    let (a, _da) = engine();
+    let (d, _dd) = engine();
+    let on_a = a.create_collection("shop", "orders").unwrap();
+    a.insert(&on_a, doc! { "_id": 1i64 }).unwrap();
+    pull(&d, &a);
+    later();
+    a.configure_vectors("shop", "orders", byo_config()).unwrap();
+    later();
+    let docs: Vec<_> = (1_000..2_400i64).map(|i| doc! { "_id": i }).collect();
+    a.insert_many(&on_a, docs).unwrap();
+    let entries = a.entries_for_peer(Hlc::ZERO, 10_000, WalkScope::Background).unwrap().entries;
+    let configure: Vec<_> = entries
+        .iter()
+        .filter(|e| e.kind == kimmy_core::OpKind::ConfigureVectors)
+        .cloned()
+        .collect();
+    assert_eq!(configure.len(), 1, "premise");
+    let rest: Vec<_> = entries
+        .iter()
+        .filter(|e| e.kind != kimmy_core::OpKind::ConfigureVectors)
+        .cloned()
+        .collect();
+    d.apply_batch(&rest).unwrap();
+    assert!(d.get_collection("shop", "orders").unwrap().vector.is_none(), "premise: withheld");
+    later();
+    assert!(a.drop_collection("shop", "orders").unwrap());
+    let dropped = a.collection_dropped_at(on_a.id).unwrap().expect("the drop's tombstone");
+    later();
+    d.create_index("shop", "orders", vec![IndexField::ascending("k")], false, Some("k_1".into()))
+        .unwrap();
+    let d = Arc::new(d);
+    let on_d = Arc::clone(&d);
+    hooks::run_after_the_next_chunk(move || {
+        on_d.apply_batch(&configure).unwrap();
+    });
+    let start = d.version_vector().unwrap().behind(&a.version_vector().unwrap()).unwrap();
+    let window = a.entries_for_peer(start, 10_000, WalkScope::Background).unwrap().entries;
+    d.apply_batch(&window).unwrap();
+    let kept = d.get_collection("shop", "orders").unwrap();
+    assert_eq!(kept.incarnation_floor, Some(dropped.hlc), "premise: the sweep finished");
+    assert!(kept.vector.is_none(), "the life before's configuration: {:?}", kept.vector_changed);
 }
 
 /// An explicit collection drop that reaches a member in a whole-database page
@@ -311,9 +653,10 @@ fn a_whole_page_carrying_an_explicit_collection_drop_keeps_a_later_write() {
 }
 
 /// And a database's drop in the same page, listed before or after its
-/// collections, buries them whole.
+/// collections, keeps the later write too (ADR-236), and buries the collection
+/// that holds nothing after it.
 #[test]
-fn a_whole_page_carrying_a_database_drop_buries_whichever_order_its_list_is_in() {
+fn a_whole_page_carrying_a_database_drop_keeps_a_later_write_whichever_order_its_list_is_in() {
     for reversed in [false, true] {
         let (a, d, _da, _dd, _id) = a_and_d_holding_the_old_life();
         a.create_collection("shop", "items").unwrap();
@@ -332,12 +675,12 @@ fn a_whole_page_carrying_a_database_drop_buries_whichever_order_its_list_is_in()
         d.finish_purges_now().unwrap();
         assert_eq!(
             hooks::survivors_paths(),
-            before,
-            "the database's tombstone is recorded first, so no life is re-dated only to be \
-             buried (reversed: {reversed})"
+            before + 1,
+            "one life re-dated, the one with the later write (reversed: {reversed})"
         );
-        assert!(!holds(&d, "orders"), "reversed: {reversed}");
+        assert_eq!(docs_of(&d, "orders", &[1, 3]), vec![3], "reversed: {reversed}");
         assert!(!holds(&d, "items"), "reversed: {reversed}");
+        assert_counts_exact(&d, "a whole page carrying a database drop");
     }
 }
 
@@ -384,15 +727,34 @@ fn a_chunk_without_a_live_parent_is_removed_and_a_survivors_chunk_stays() {
     assert_counts_exact(&d, "a shadow that follows its parent");
 }
 
+/// A shadow's rows are its parent's vectors, so a shadow is judged by its parent and not by
+/// its own tombstones (ADR-236, F16): the parent keeps a write after the drop, its
+/// configuration from before the drop is turned off, and the shadow, holding only a
+/// removed chunk stamped after the drop, goes.
+#[test]
+fn a_shadow_whose_parent_lost_its_configuration_goes_whatever_tombstones_it_holds() {
+    let (a, d, _da, _dd) = a_and_d_holding_a_vector_collection();
+    assert!(a.drop_collection("shop", "orders").unwrap());
+    later();
+    let on_d = d.get_collection("shop", "orders").unwrap();
+    let (_, kept) = d.insert_stamped(&on_d, doc! { "_id": 5i64 }).unwrap();
+    let shadow = d.get_collection("shop", &kimmy_core::vector_meta::shadow_name("orders")).unwrap();
+    d.put_vectors(&shadow, &DocId::Int64(5), &[chunk_of(5, kept.hlc)]).unwrap();
+    assert!(d.delete_vectors(&shadow, &DocId::Int64(5)).unwrap() > 0, "premise: a chunk removed");
+    quiesce(&[&a, &d]);
+    let parent = d.get_collection("shop", "orders").expect("the parent keeps its write");
+    assert!(parent.vector.is_none(), "premise: its configuration was of the life before");
+    assert_eq!(docs_of(&d, "orders", &[1, 5]), vec![5]);
+    assert!(!holds(&d, &kimmy_core::vector_meta::shadow_name("orders")), "the shadow was kept");
+    assert_counts_exact(&d, "a shadow judged by its parent");
+}
+
 /// A life left with nothing is buried with its shadow, in the one commit.
 #[test]
 fn an_emptied_life_is_buried_with_its_shadow() {
     let (a, d, _da, _dd) = a_and_d_holding_a_vector_collection();
     assert!(a.drop_collection("shop", "orders").unwrap());
-    later();
-    let on_d = d.get_collection("shop", "orders").unwrap();
-    d.insert(&on_d, doc! { "_id": 5i64 }).unwrap();
-    assert!(d.delete(&on_d, &DocId::Int64(5)).unwrap());
+    forget_the_digest_row(&d, d.get_collection("shop", "orders").unwrap().id);
     quiesce(&[&a, &d]);
     assert!(!holds(&d, "orders"));
     assert!(!holds(&d, &kimmy_core::vector_meta::shadow_name("orders")), "the shadow went too");
@@ -418,10 +780,16 @@ fn a_start_sweeps_the_parent_before_its_shadow() {
         let entries = a.entries_for_peer(start, BATCH, WalkScope::Background).unwrap().entries;
         entries.iter().find(|e| e.kind == kimmy_core::OpKind::DropCollection).unwrap().stamp
     };
-    let result = d.drop_keeping_later_writes("shop", "orders", dropped, &|| {
-        asked.set(asked.get() + 1);
-        Err(crate::StorageError::Stopping(crate::StopReason::Shutdown))
-    });
+    let result = d.drop_keeping_later_writes(
+        "shop",
+        "orders",
+        dropped,
+        &|| {
+            asked.set(asked.get() + 1);
+            Err(crate::StorageError::Stopping(crate::StopReason::Shutdown))
+        },
+        crate::database_tombstone::Notify::Each,
+    );
     assert!(matches!(result, Err(crate::StorageError::Stopping(_))));
     for name in ["orders", shadow.name.as_str()] {
         let standing = d.get_collection("shop", name).unwrap();
@@ -511,9 +879,13 @@ fn a_peer_holding_the_older_life_is_not_replaced_by_one_in_the_owed_window() {
     let entries = a.entries_for_peer(start, BATCH, WalkScope::Background).unwrap().entries;
     let dropped =
         entries.iter().find(|e| e.kind == kimmy_core::OpKind::DropCollection).unwrap().stamp;
-    let stopped = d.drop_keeping_later_writes("shop", "orders", dropped, &|| {
-        Err(crate::StorageError::Stopping(crate::StopReason::Shutdown))
-    });
+    let stopped = d.drop_keeping_later_writes(
+        "shop",
+        "orders",
+        dropped,
+        &|| Err(crate::StorageError::Stopping(crate::StopReason::Shutdown)),
+        crate::database_tombstone::Notify::Each,
+    );
     assert!(matches!(stopped, Err(crate::StorageError::Stopping(_))));
     let window = d.get_collection("shop", "orders").unwrap();
     assert!(window.created > dropped.hlc && window.incarnation_floor.is_none(), "premise");
@@ -533,12 +905,14 @@ fn a_peer_holding_the_older_life_is_not_replaced_by_one_in_the_owed_window() {
 /// A database's drop `S` is followed by a drop of each of its collections, at
 /// stamps above `S`. M, which is told of the collection's drop and not of `S`
 /// (it was behind and caught up by a page), keeps a write and dates the life
-/// just above that drop, so above `S`: its `created` no longer says the life
-/// began before `S`. A peer repairs the collection from M, and learns `S` before
-/// or after. Either way, and whichever order M learns `S` in, the write is gone
-/// everywhere and the collection is absent everywhere (ADR-229).
+/// just above that drop, so above `S`. A peer repairs the collection from M, and
+/// learns `S` before or after. Either way, and whichever order M learns `S` in,
+/// the write stands on every member (ADR-236): the life holds nothing stamped at
+/// or before its `created`, which is above `S`, so `S` has nothing of it to
+/// remove. (0.49.0 judged it by where it began, `redated.from`, and buried it,
+/// the write with it, ADR-231 D-3.)
 #[test]
-fn a_life_re_dated_above_the_databases_drop_does_not_outlive_it() {
+fn a_life_re_dated_above_the_databases_drop_keeps_its_write_on_every_member() {
     for peer_holds_the_database_drop_first in [true, false] {
         let (a, m, _da, _dm, id) = a_and_d_holding_the_old_life();
         a.create_collection("shop", "items").unwrap();
@@ -588,19 +962,22 @@ fn a_life_re_dated_above_the_databases_drop_does_not_outlive_it() {
         );
         p.apply_snapshot_page(m.node_id(), &mut SnapshotProgress::of_collection(id), &page)
             .unwrap();
-        if peer_holds_the_database_drop_first {
-            assert!(!holds(&p, "orders"), "refused at install: it began before S");
-        } else {
-            assert!(holds(&p, "orders"), "premise: P had nothing to refuse it with");
+        assert_eq!(docs_of(&p, "orders", &[1, 3]), vec![3], "installed with the write");
+        if !peer_holds_the_database_drop_first {
             p.apply_batch(std::slice::from_ref(&database_drop)).unwrap();
-            assert!(!holds(&p, "orders"), "buried by S when it arrives, from where it began");
+            assert_eq!(docs_of(&p, "orders", &[1, 3]), vec![3], "and S, after, keeps it");
         }
         // And M learns of S last.
         m.apply_batch(std::slice::from_ref(&database_drop)).unwrap();
         m.finish_purges_now().unwrap();
         p.finish_purges_now().unwrap();
+        // A, which dropped it, takes it from M as the existence half's repair would.
+        let page = m.snapshot_page(None, Some(id)).unwrap();
+        a.apply_snapshot_page(m.node_id(), &mut SnapshotProgress::of_collection(id), &page)
+            .unwrap();
         for (who, e) in [("a", &a), ("m", &m), ("p", &p)] {
-            assert!(!holds(e, "orders"), "{who}, peer first: {peer_holds_the_database_drop_first}");
+            let peer_first = peer_holds_the_database_drop_first;
+            assert_eq!(docs_of(e, "orders", &[1, 3]), vec![3], "{who}, peer first: {peer_first}");
             assert!(!holds(e, "items"), "{who}");
             assert_counts_exact(e, who);
         }
@@ -623,9 +1000,13 @@ fn a_drop_interrupted_after_its_first_commit_and_delivered_again_appends_its_ent
     let start = d.version_vector().unwrap().behind(&a.version_vector().unwrap()).unwrap();
     let entries = a.entries_for_peer(start, BATCH, WalkScope::Background).unwrap().entries;
     let drop = entries.iter().find(|e| e.kind == kimmy_core::OpKind::DropCollection).unwrap();
-    let interrupted = d.drop_keeping_later_writes("shop", "orders", drop.stamp, &|| {
-        Err(crate::StorageError::Stopping(crate::StopReason::Shutdown))
-    });
+    let interrupted = d.drop_keeping_later_writes(
+        "shop",
+        "orders",
+        drop.stamp,
+        &|| Err(crate::StorageError::Stopping(crate::StopReason::Shutdown)),
+        crate::database_tombstone::Notify::Each,
+    );
     assert!(matches!(interrupted, Err(crate::StorageError::Stopping(_))));
     assert!(d.oplog_entry(&drop.stamp).unwrap().is_none(), "premise: not appended yet");
 
@@ -854,5 +1235,69 @@ async fn a_stream_open_on_the_collection_ends_when_a_snapshot_carries_the_drop()
             Some(ChangeEvent::Invalidate { reason: InvalidateReason::CollectionDropped })
         ),
         "{heard:?}"
+    );
+}
+
+/// A floor burial no carried tombstone names is stamped
+/// `Stamp(floor, zero node)` (F19). The tombstone is recorded before the survivors path
+/// sweeps, so a straggler that arrives between two chunks is judged against it, and
+/// `is_history` compares the whole `Stamp` strictly: a record in the drop's own `Hlc` from
+/// any real node sorts above the zero node and is applied behind the sweep's cursor. The
+/// floor then lands over it, and it stands on this member alone; every member holding the
+/// real tombstone and the floor refuses it. The real stamp refused one from a node below
+/// it, as this one is (the lowest non-zero node).
+#[test]
+fn a_straggler_in_the_floor_s_own_hlc_is_refused_while_a_floor_burial_sweeps() {
+    let (a, d, _da, _dd, id) = a_and_d_holding_the_old_life();
+    let on_a = a.get_collection("shop", "orders").unwrap();
+    let docs: Vec<_> = (1_000..2_400i64).map(|i| doc! { "_id": i }).collect();
+    a.insert_many(&on_a, docs).unwrap();
+    quiesce(&[&a, &d]);
+    later();
+    assert!(a.drop_collection("shop", "orders").unwrap());
+    a.finish_purges_now().unwrap();
+    let dropped = a.collection_dropped_at(id).unwrap().expect("A's tombstone");
+    later();
+    a.create_collection("shop", "orders").unwrap();
+    // D, which has not heard the drop, writes into the old life after it: the survivors path.
+    let on_d = d.get_collection("shop", "orders").unwrap();
+    d.insert(&on_d, doc! { "_id": 3i64 }).unwrap();
+    // A straggler of the old life in the drop's own `Hlc`, from the lowest real node.
+    let (x, _dx) = engine();
+    let on_x = x.create_collection("shop", "orders").unwrap();
+    x.insert(&on_x, doc! { "_id": 1_000i64, "straggler": true }).unwrap();
+    let mut straggler = x
+        .entries_for_peer(Hlc::ZERO, BATCH, WalkScope::Background)
+        .unwrap()
+        .entries
+        .into_iter()
+        .find(|e| e.kind.is_document())
+        .expect("the straggler's entry");
+    let mut low = [0u8; 16];
+    low[15] = 1;
+    straggler.stamp = Stamp::new(dropped.hlc, kimmy_core::NodeId::from_bytes(low));
+    assert!(straggler.stamp < dropped, "premise: the real tombstone refuses it");
+    let d = Arc::new(d);
+    let on_d = Arc::clone(&d);
+    hooks::run_after_the_next_chunk(move || {
+        on_d.apply_batch(&[straggler]).unwrap();
+    });
+    let before = hooks::survivors_paths();
+    // A's scoped page: its life's floor ends D's life, with no tombstone on the page.
+    let mut progress = SnapshotProgress::of_collection(id);
+    while !progress.is_complete() {
+        let page = a.snapshot_page(progress.after().cloned(), progress.scope()).unwrap();
+        d.apply_snapshot_page(a.node_id(), &mut progress, &page).unwrap();
+    }
+    assert_eq!(hooks::survivors_paths(), before + 1, "premise: the survivors path");
+    let kept = d.get_collection("shop", "orders").expect("kept with the write after the drop");
+    assert_eq!(kept.incarnation_floor, Some(dropped.hlc), "premise: the sweep ran");
+    assert_eq!(docs_of(&d, "orders", &[3]), vec![3], "premise: the write after the drop");
+    assert_eq!(
+        docs_of(&d, "orders", &[1_000]),
+        Vec::<i64>::new(),
+        "a record in the floor's own Hlc stands below the floor on this member alone; D's \
+         tombstone is {:?}",
+        d.collection_dropped_at(id).unwrap()
     );
 }

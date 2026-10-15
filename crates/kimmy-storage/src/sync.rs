@@ -1573,7 +1573,7 @@ impl Engine {
         stamp: Stamp,
     ) -> Result<bool> {
         if let Some(dropped_at) = self.memo_dropped_at(memo, id)?
-            && stamp < dropped_at
+            && stamp.hlc <= dropped_at.hlc
         {
             return Ok(true);
         }
@@ -1599,6 +1599,84 @@ pub(crate) fn below_floor(standing: &CollectionMeta, stamp: Stamp) -> bool {
     standing.incarnation_floor.is_some_and(|floor| stamp.hlc <= floor)
 }
 
+impl Engine {
+    /// Whether a definition change stamped `stamp` (an index's creation, a vector
+    /// configuration) belongs to a life of `standing`'s collection that a drop has
+    /// ended: at or below its floor ([`below_floor`]), **or at or before the drop
+    /// tombstone of the collection, or of its database, that this node holds** (`Hlc`,
+    /// not strict: a tie is the drop's, ADR-236).
+    ///
+    /// **The one rule a definition is judged by on every route**: the replicated
+    /// `CreateIndex` and `ConfigureVectors` arms and a snapshot page's restore call it,
+    /// under the writer where they decide, and a definition repair should call it too.
+    /// The floor alone has a window: a drop that reaches a life created before it, or a
+    /// newer life that took in the one before's definitions, records the tombstone
+    /// first, sweeps the old life's definitions, then its records a chunk at a time, and
+    /// takes the floor in the last chunk. A definition of the ended life that arrived
+    /// between two chunks (a re-served window, a count-half replay, a page) was judged
+    /// live, built, and kept once the floor landed over it: a definition every other
+    /// member refused, for good. The tombstone closes the window and changes nothing
+    /// outside it: every life standing here began after the tombstones it holds (a drop
+    /// aimed at it re-dates or buries it), so every definition it legitimately carries is
+    /// stamped above them.
+    pub(crate) fn definition_of_an_ended_life(
+        &self,
+        standing: &CollectionMeta,
+        stamp: Stamp,
+    ) -> Result<bool> {
+        if below_floor(standing, stamp) {
+            return Ok(true);
+        }
+        let drops =
+            [self.collection_dropped_at(standing.id)?, self.database_dropped_at(&standing.db)?];
+        Ok(drops.into_iter().flatten().any(|dropped| stamp.hlc <= dropped.hlc))
+    }
+}
+
+/// Whether a definition change for a collection this node does not hold, under a
+/// drop's tombstone `dropped` (the later of the collection's and its database's,
+/// `Engine::drop_a_definition_is_judged_by`), belongs to a life of the name this node
+/// has not had yet: a `CreateIndex` or `ConfigureVectors` **stamped after the drop** (`Hlc`,
+/// the creation rule's side of the tie, ADR-236). It is of a newer life whose
+/// creation sorts after it in this node's window, or of the life the drop reached
+/// elsewhere and that kept what was written after it (ADR-231, extended); taken as
+/// history it was witnessed and never served again, and nothing replays a
+/// definition, so the index never reached this member. It stops the batch, as a
+/// collection with no record does.
+///
+/// A `DropIndex` is not one: the arm that meets the absent collection records the
+/// index's tombstone, which is all of the drop a later life needs (a restored or
+/// replicated creation of the index made before it is history), and a sender that
+/// holds the drop and no collection would answer the scoped page with the same
+/// tombstone for ever. A definition at or before the drop is of the life it ended,
+/// as everywhere else.
+pub(crate) fn defines_a_later_life(entry: &OplogEntry, dropped: Stamp) -> bool {
+    matches!(entry.kind, OpKind::CreateIndex | OpKind::ConfigureVectors)
+        && entry.stamp.hlc > dropped.hlc
+}
+
+/// Whether a collection's creation, stamped `created` at its origin, belongs to
+/// a life a drop stamped `dropped` ended: `created <= dropped`, on `Hlc` and not
+/// strict, so **a tie in one `Hlc` is the drop's** (ADR-236).
+///
+/// The one comparison of a creation against a collection drop, on every route:
+/// the replicated `CreateCollection` arm (before the writer and under it), a
+/// snapshot page's definition (`restore_collection`), a vector shadow created by
+/// a replicated configuration, and, as its complement, the drop's own rule
+/// ([`aims_at_a_previous_incarnation`]'s first clause). They used to disagree at
+/// a tie: the entry compared `Stamp`s strictly, so a creation minted in the
+/// drop's millisecond by a node sorting above the dropper's survived it on a
+/// member that had the drop first, while the creating member, getting the drop
+/// second, buried its life (`Hlc`, the drop not older than the creation), and a
+/// page refused it (`Hlc`, not strict). The tie is a creation concurrent with
+/// the drop within one millisecond; it goes to the drop everywhere, the
+/// database's rule (ADR-229 item 3) already reads it so, and the alternative,
+/// the creation's whole `Stamp` on the stored metadata and on the page, would
+/// need a field on both.
+pub(crate) fn creation_is_history(created: Hlc, dropped: Hlc) -> bool {
+    created <= dropped
+}
+
 /// Whether a drop stamped `dropped` is aimed at a life of `current` that has
 /// already ended, rather than at the collection standing here now.
 ///
@@ -1619,18 +1697,21 @@ pub(crate) fn below_floor(standing: &CollectionMeta, stamp: Stamp) -> bool {
 /// Two clauses, and both are needed:
 ///
 /// - It **predates the create** that produced this incarnation, origin stamps
-///   on both sides.
+///   on both sides: the complement of [`creation_is_history`], so a drop in the
+///   creation's own `Hlc` is aimed at it, as the creation would be history
+///   behind the drop had it arrived second.
 /// - It is **at or before that incarnation's floor**, which is the drop it was
 ///   created after. Not redundant with the first, because `created` and the
-///   floor can be the same `Hlc`: `apply_ddl`'s creation rule compares `Stamp`
-///   strictly, so a create minted at `(H, node)` by a node sorting above the
-///   node that stamped a drop at `(H, other)` is not history and is applied —
-///   with `created = H` from the origin and `floor = H` from the surviving
-///   tombstone. The drop that produced that floor then arrives again, as
-///   overlapping ranges and re-planned repairs both deliver it, and only this
-///   clause turns it away.
+///   floor can be the same `Hlc` in a store written before ADR-236: the
+///   creation rule compared `Stamp` strictly then, so a create minted at
+///   `(H, node)` by a node sorting above the node that stamped a drop at
+///   `(H, other)` was applied with `created = H` from the origin and
+///   `floor = H` from the surviving tombstone. The drop that produced that
+///   floor then arrives again, as overlapping ranges and re-planned repairs
+///   both deliver it, and only this clause turns it away. It is also the
+///   clause a life re-dated above a drop is turned away by (ADR-231).
 pub(crate) fn aims_at_a_previous_incarnation(current: &CollectionMeta, dropped: Hlc) -> bool {
-    let predates_create = dropped < current.created;
+    let predates_create = !creation_is_history(current.created, dropped);
     let at_or_before_floor = current.incarnation_floor.is_some_and(|floor| dropped <= floor);
     predates_create || at_or_before_floor
 }
@@ -1962,6 +2043,57 @@ impl Engine {
 }
 
 impl Engine {
+    /// The drop a definition change for a collection this node does not hold is
+    /// judged against (`defines_a_later_life`): the later of the collection's own
+    /// tombstone and its database's, since no life of the name can begin at or
+    /// before a database tombstone (ADR-229) and the database's drop takes what a
+    /// covered life made at or before it (ADR-236). With the collection's alone, a
+    /// definition between the two stopped the batch for a life that can never
+    /// come, and a sender that buried the collection itself answered the scoped
+    /// page with the same lower tombstone for ever. `None` when the collection's
+    /// own tombstone is absent: a collection this node has no record of.
+    fn drop_a_definition_is_judged_by(&self, entry: &OplogEntry) -> Result<Option<Stamp>> {
+        #[derive(serde::Deserialize)]
+        struct Names {
+            db: String,
+        }
+        let Some(own) = self.collection_dropped_at(entry.collection)? else {
+            return Ok(None);
+        };
+        let database = match entry.body.as_deref().map(bson::deserialize_from_slice::<Names>) {
+            Some(Ok(names)) => self.database_dropped_at(&names.db)?,
+            _ => None,
+        };
+        Ok(Some(database.map_or(own, |database| database.max(own))))
+    }
+
+    /// Whether a scoped page has answered a stop at this definition of a collection
+    /// absent here (`defines_a_later_life`): its sender held no life of the collection,
+    /// the page left the collection absent here, and the sender's coverage names the
+    /// definition (ADR-236 item 4). The sender processed the definition and holds no
+    /// life it belongs to, so it is history there, and here, whichever member serves
+    /// it. A member that buried the life because nothing stamped after the drop still
+    /// stood (an index created and dropped again before the drop arrived), or a 0.49.x
+    /// member that buried a life its database's drop covered, definitions and all,
+    /// still serves the entry; without this the stop asked for the same tombstone on
+    /// every round, and nothing past the entry, in any collection, reached this member
+    /// by entries. A sender that holds a life this member refuses (older than the drop
+    /// here) leaves the stop standing: it keeps that life, re-dated, once it hears the
+    /// drop, and its page then brings it.
+    pub(crate) fn answered_by_a_page(&self, entry: &OplogEntry) -> bool {
+        self.answered_absent
+            .lock()
+            .get(&entry.collection)
+            .is_some_and(|coverage| entry.stamp.hlc <= coverage.get(entry.stamp.node))
+    }
+
+    /// Record that a scoped page of `id` from a sender holding no life of it left the
+    /// collection absent here, through the sender's `coverage` (`answered_by_a_page`).
+    /// The pages add up: each names definitions its own sender processed.
+    pub(crate) fn record_answered_absent(&self, id: CollectionId, coverage: &VersionVector) {
+        self.answered_absent.lock().entry(id).or_default().merge(coverage);
+    }
+
     /// Process one replicated entry. Witnessing is the caller's job, so that
     /// no branch here can forget it.
     ///
@@ -1999,17 +2131,26 @@ impl Engine {
                     return Err(e);
                 }
                 DdlOutcome::UnknownCollection(name) => {
-                    // A tombstone **at all** makes this history, whichever
-                    // way the stamps fall (ADR-148). The collection was
-                    // destroyed here; a change addressed to the incarnation
-                    // that is gone cannot be applied by waiting, so it is
+                    // A tombstone makes this history when the change is not
+                    // stamped after it (ADR-148): addressed to the incarnation
+                    // that is gone, it cannot be applied by waiting, so it is
                     // ADR-123's case exactly — witnessed, counted, and not
-                    // re-served. Only a collection this node has *no*
-                    // record of is one that may still arrive.
-                    if self.collection_dropped_at(entry.collection)?.is_some() {
-                        outcome.superseded += 1;
-                    } else {
-                        return Ok(Step::Unknown(Some(name)));
+                    // re-served. A collection this node has *no* record of
+                    // may still arrive, and so may the life a definition
+                    // stamped after the drop belongs to (`defines_a_later_life`):
+                    // both stop the batch, and the scoped page (ADR-148) brings
+                    // the life with its definitions. Until a page has answered
+                    // it: a sender whose page held no life of the collection and
+                    // whose coverage names the definition has none to bring, and
+                    // the definition is history (`answered_by_a_page`).
+                    match self.drop_a_definition_is_judged_by(entry)? {
+                        Some(dropped)
+                            if !defines_a_later_life(entry, dropped)
+                                || self.answered_by_a_page(entry) =>
+                        {
+                            outcome.superseded += 1;
+                        }
+                        _ => return Ok(Step::Unknown(Some(name))),
                     }
                 }
                 DdlOutcome::Refused => run.refused.push(entry.stamp),
@@ -2137,9 +2278,10 @@ impl Engine {
 
                 // A creation older than the drop that removed it is history,
                 // not an instruction. Without this a peer partitioned across
-                // the drop would recreate the collection on rejoining.
+                // the drop would recreate the collection on rejoining. A tie on
+                // the `Hlc` is the drop's (`creation_is_history`, ADR-236).
                 if let Some(dropped_at) = self.collection_dropped_at(entry.collection)?
-                    && entry.stamp < dropped_at
+                    && creation_is_history(entry.stamp.hlc, dropped_at.hlc)
                 {
                     debug!(
                         db = %target.db,
@@ -2158,7 +2300,21 @@ impl Engine {
                         collection = %target.name,
                         "ignored a creation older than the drop of its database"
                     );
-                    return Ok(DdlOutcome::Applied);
+                    // And held and served onward, as an ignored drop is (ADR-236)
+                    // and as the refusal under the writer below already was: the
+                    // collection's tombstone is the database's drop expanded on
+                    // meeting the creation, so a member that never meets it
+                    // records none, and withheld here it was never met past this
+                    // member, whose vector names the creation's origin past it.
+                    // A receiver holding the database's tombstone refuses it the
+                    // same way. One that does not yet may create the collection;
+                    // it buries it when the database's drop reaches it, which this
+                    // member serves after the creation if it holds the drop's
+                    // entry. A member that took the drop by a page holds only the
+                    // tombstone and serves no entry for it (pages never relay a
+                    // drop, as before), and the creator serves the creation
+                    // anyway: this relay adds a route, not that gap.
+                    return self.append_replicated_ddl(entry);
                 }
 
                 match self.get_collection(&target.db, &target.name) {
@@ -2175,7 +2331,7 @@ impl Engine {
                             &target.name,
                             false,
                             Some(entry.stamp.hlc),
-                            &|dropped_at| entry.stamp < dropped_at,
+                            &|dropped_at| creation_is_history(entry.stamp.hlc, dropped_at.hlc),
                         ) {
                             Ok(Some(_)) => {
                                 debug!(db = %target.db, collection = %target.name, "created a replicated collection");
@@ -2239,10 +2395,7 @@ impl Engine {
                 // reads the tombstone. It runs again on every redelivery, which
                 // costs nothing when it has already been done.
                 if target.name == kimmy_core::DATABASE_DROP_NAME {
-                    self.record_collection_drop(
-                        kimmy_core::database_drop_id(&target.db),
-                        entry.stamp,
-                    )?;
+                    self.record_database_tombstone(&target.db, entry.stamp)?;
                     self.bury_under_database_tombstones()?;
                     // Held and served onward like every drop: the members that
                     // learn of it from this one learn it from the entry.
@@ -2279,12 +2432,22 @@ impl Engine {
                             // The life this very drop re-dated (ADR-231, extended)
                             // is "ignored" only because an interrupted apply
                             // redelivers the drop to it: the entry was not
-                            // appended then, and is now, below, so this member
-                            // holds it to serve onward.
+                            // appended then, and is now, below, with the
+                            // tombstones a first apply records.
                             if !(current.is_redated()
                                 && current.created == entry.stamp.hlc.successor())
                             {
-                                return Ok(DdlOutcome::Applied);
+                                // And held and served onward like an applied drop
+                                // (ADR-236). Withheld, this member went on to
+                                // append the dropper's later entries, so the
+                                // vector it serves named the drop's origin past
+                                // the drop: a peer that pulled it took that
+                                // vector and was never served the drop by
+                                // anyone, and kept the life the drop ended.
+                                // Every receiver judges the entry for itself
+                                // (`aims_at_a_previous_incarnation`, the sweep),
+                                // so relaying it is harmless.
+                                return self.append_replicated_ddl(entry);
                             }
                         }
                     }
@@ -2305,9 +2468,13 @@ impl Engine {
                 // it, which is nearly every drop, is the burial it always was.
                 // Decided in the transaction that buries.
                 let buried = matches!(
-                    self.drop_keeping_later_writes(&target.db, &target.name, entry.stamp, &|| {
-                        self.check_walk(crate::WalkScope::Background)
-                    },)?,
+                    self.drop_keeping_later_writes(
+                        &target.db,
+                        &target.name,
+                        entry.stamp,
+                        &|| self.check_walk(crate::WalkScope::Background),
+                        crate::database_tombstone::Notify::Each,
+                    )?,
                     crate::late_drop::Dropped::Buried(true)
                 );
                 // Recorded even when the collection was already gone: the
@@ -2351,8 +2518,9 @@ impl Engine {
                     // `CreateCollection` older than its drop is above — this
                     // node does not re-serve onward an entry it has decided
                     // is history. The drop's own entry, which is appended
-                    // when applied, is what carries the ordering to a third
-                    // member; nothing is lost by withholding the create.
+                    // whether it was applied or ignored (ADR-236), is what
+                    // carries the ordering to a third member; nothing is lost
+                    // by withholding the create.
                     Ddl::Applied(RemoteIndex::History) => return Ok(DdlOutcome::Applied),
                     Ddl::Gone => {
                         return Ok(DdlOutcome::UnknownCollection(format!(
@@ -2547,7 +2715,7 @@ impl Engine {
                         &target.collection,
                         config,
                         crate::vectors::Configured::FromEntry(entry.stamp),
-                        &|standing| below_floor(standing, entry.stamp),
+                        &|standing| self.definition_of_an_ended_life(standing, entry.stamp),
                     ))?
                     .map(|_| ()),
                     // Never `drop_vectors`: discarding a peer's stored
@@ -2558,7 +2726,7 @@ impl Engine {
                         &target.collection,
                         false,
                         crate::vectors::Configured::FromEntry(entry.stamp),
-                        &|standing| below_floor(standing, entry.stamp),
+                        &|standing| self.definition_of_an_ended_life(standing, entry.stamp),
                     ))?
                     .map(|_| ()),
                 };
@@ -2755,7 +2923,7 @@ impl Engine {
         // stands is history too: a burial writes the collection's tombstone,
         // not the index's, so the index tombstone alone let a dropped life's
         // index onto the recreation.
-        if below_floor(&meta, stamp) {
+        if self.definition_of_an_ended_life(&meta, stamp)? {
             debug!(
                 db = %target.db,
                 collection = %target.collection,
@@ -2799,7 +2967,8 @@ impl Engine {
             target.index.partial_filter.clone(),
             crate::index::CreateOrigin::Replicated { created: Some(created), logged: Some(entry) },
             &|standing, dropped| {
-                below_floor(standing, stamp) || dropped.is_some_and(|dropped_at| stamp < dropped_at)
+                Ok(self.definition_of_an_ended_life(standing, stamp)?
+                    || dropped.is_some_and(|dropped_at| stamp < dropped_at))
             },
         )?;
         match created {
@@ -4379,7 +4548,7 @@ mod tests {
                 None,
                 None,
                 crate::index::CreateOrigin::Replicated { created: Some(entry.stamp), logged: None },
-                &|_, _| false,
+                &|_, _| Ok(false),
             )
             .unwrap();
         assert_eq!(held_bytes(engine, &entry.stamp), None, "premise: no entry");
@@ -5670,7 +5839,7 @@ mod tests {
                     None,
                     nan(),
                     origin,
-                    &|_, _| false,
+                    &|_, _| Ok(false),
                 )
                 .unwrap();
             match created {
@@ -7636,18 +7805,23 @@ mod tests {
     }
     /// The DDL twin of
     /// `a_write_into_a_collection_dropped_here_is_history_however_the_stamps_fall`,
-    /// and the case the stamp comparison strands: a schema change stamped
-    /// **after** a local drop. A creates an index on a collection B has
-    /// just dropped, so the `CreateIndex` is newer than B's tombstone. The
-    /// collection is gone here and is not coming back on its own, so the
-    /// change is history — superseded, witnessed, carried past — and what
-    /// follows it in the window lands.
+    /// and where the two part (ADR-236): a schema change stamped **after** a local
+    /// drop. A creates an index on a collection B has just dropped, so the
+    /// `CreateIndex` is newer than B's tombstone. A document in that position is
+    /// history here, and the count half's replay brings it back where it belongs;
+    /// nothing replays a definition, so a definition stamped after the drop stops
+    /// the batch, as a collection B has no record of does, until the life it
+    /// belongs to arrives. Here that is once A learns the drop: A's life keeps
+    /// what was stamped after it (ADR-231, extended), re-dated above the drop with
+    /// the index, and B takes it by the scoped page the stop asks for (ADR-148),
+    /// and then what followed the definition in the window.
     ///
-    /// Under the comparison this replaced, the entry was neither older than
-    /// the drop nor placeable, so it stopped the batch on every round for
-    /// ever: ADR-123's wedge, reached through the rule written to avoid it.
+    /// Taken as history, as it was before, the definition was witnessed and never
+    /// served again: A held the index and B the same collection without it, for
+    /// good. The stop is not ADR-123's wedge: it lasts until the member that made
+    /// the definition hears the drop, which it pulls from the member that made it.
     #[test]
-    fn a_schema_change_stamped_after_a_local_drop_is_history_and_does_not_stop_the_batch() {
+    fn a_schema_change_stamped_after_a_local_drop_stops_the_batch_until_its_life_arrives() {
         let (a, _da) = engine();
         let (b, _db) = engine();
         a.create_collection("shop", "orders").unwrap();
@@ -7656,30 +7830,429 @@ mod tests {
         b.drop_collection("shop", "orders").unwrap();
 
         // A has not heard the drop, so its index creation is stamped after
-        // B's tombstone; the write behind it is what a stop would strand.
+        // B's tombstone; the write behind it is what the stop holds back.
         std::thread::sleep(std::time::Duration::from_millis(2));
         let field = crate::meta::IndexField { path: "n".into(), descending: false };
         a.create_index("shop", "orders", vec![field], false, None).unwrap();
         a.insert(&other, doc! { "_id": "behind-it" }).unwrap();
 
         let outcome = round(&b, &a, BATCH);
-        assert_eq!(
-            outcome.unknown_collection, 0,
-            "a tombstone makes the change history, whichever way the stamps fall: {outcome:?}"
+        assert_eq!(outcome.unknown_collection, 1, "a later life's definition stops: {outcome:?}");
+        assert_eq!(outcome.applied, 0, "and what is behind it waits: {outcome:?}");
+        let stopped = outcome.unknown.expect("the stop names the collection");
+        assert_eq!(stopped.id, CollectionId::derive("shop", "orders"));
+        assert!(
+            !b.witnessed_vector().unwrap().covers(&a.version_vector().unwrap()),
+            "nothing past the stop is claimed"
         );
-        assert_eq!(outcome.superseded, 1, "{outcome:?}");
-        assert_eq!(outcome.applied, 1, "and the entry behind it landed: {outcome:?}");
+
+        // A hears the drop and keeps its life, with the index stamped after it.
+        round(&a, &b, BATCH);
+        let kept = a.get_collection("shop", "orders").expect("the life keeps its later index");
+        assert!(kept.is_redated(), "re-dated above the drop: {kept:?}");
+        assert_eq!(kept.indexes.len(), 1, "with the index");
+
+        // B's stop is answered with the scoped page, and the window then lands.
+        let mut progress = crate::SnapshotProgress::of_collection(stopped.id);
+        while !progress.is_complete() {
+            let page = a.snapshot_page(progress.after().cloned(), progress.scope()).unwrap();
+            b.apply_snapshot_page(a.node_id(), &mut progress, &page).unwrap();
+        }
+        let outcome = round(&b, &a, BATCH);
+        assert_eq!(outcome.unknown_collection, 0, "{outcome:?}");
+        let on_b = b.get_collection("shop", "orders").expect("the life arrived");
         assert_eq!(
-            ids_on(&b, "shop", "other"),
-            ids_on(&a, "shop", "other"),
-            "nothing behind the dropped collection's schema change was stranded"
+            on_b.indexes.iter().map(|i| &i.name).collect::<Vec<_>>(),
+            kept.indexes.iter().map(|i| &i.name).collect::<Vec<_>>(),
+            "with its index"
         );
+        assert_eq!(ids_on(&b, "shop", "other"), ids_on(&a, "shop", "other"), "nothing stranded");
         assert!(
             b.witnessed_vector().unwrap().covers(&a.version_vector().unwrap()),
             "and the round converged rather than re-serving the same window for ever"
         );
-        assert!(b.get_collection("shop", "orders").is_err(), "the drop stands");
         assert_eq!(round(&b, &a, BATCH), SyncOutcome::default(), "and stays converged");
+    }
+
+    /// The bound on that stop (ADR-236 item 4), the side it leaves standing: a page from
+    /// a sender that still holds the life the drop here ended (it has not heard the
+    /// drop) carries that life, which B refuses, and the definition is not taken as
+    /// history; the stop stands until A hears the drop and keeps the life, re-dated
+    /// with the index, and A's page then brings it. Taken as history on the first
+    /// page, B would never hold the life A keeps: a re-dated life has no creation entry.
+    #[test]
+    fn a_page_carrying_a_life_this_member_refuses_leaves_the_later_life_stop_standing() {
+        let (a, _da) = engine();
+        let (b, _db) = engine();
+        let orders = a.create_collection("shop", "orders").unwrap();
+        // Enough for a second page, which carries no definition.
+        let docs = (0..crate::SNAPSHOT_PAGE as i64 + 8).map(|i| doc! { "_id": i }).collect();
+        a.insert_many(&orders, docs).unwrap();
+        let other = a.create_collection("shop", "other").unwrap();
+        round(&b, &a, 4 * BATCH);
+        b.drop_collection("shop", "orders").unwrap();
+        b.finish_purges_now().unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(2));
+        let field = crate::meta::IndexField { path: "n".into(), descending: false };
+        a.create_index("shop", "orders", vec![field], false, None).unwrap();
+        a.insert(&other, doc! { "_id": "behind-it" }).unwrap();
+        let scoped = |b: &Engine, a: &Engine, id| {
+            let mut progress = crate::SnapshotProgress::of_collection(id);
+            while !progress.is_complete() {
+                let page = a.snapshot_page(progress.after().cloned(), progress.scope()).unwrap();
+                b.apply_snapshot_page(a.node_id(), &mut progress, &page).unwrap();
+            }
+        };
+
+        // Answered before A has heard the drop: the page carries A's life, B refuses it.
+        let stopped = round(&b, &a, BATCH).unknown.expect("a later life's definition stops");
+        scoped(&b, &a, stopped.id);
+        assert!(b.get_collection("shop", "orders").is_err(), "premise: B refused A's life");
+        let outcome = round(&b, &a, BATCH);
+        assert_eq!(outcome.unknown_collection, 1, "the stop stands: {outcome:?}");
+
+        // A hears the drop and keeps the life; its page brings it.
+        round(&a, &b, BATCH);
+        assert!(a.get_collection("shop", "orders").unwrap().is_redated(), "premise: kept");
+        scoped(&b, &a, stopped.id);
+        let outcome = round(&b, &a, BATCH);
+        assert_eq!(outcome.unknown_collection, 0, "{outcome:?}");
+        assert_eq!(
+            b.get_collection("shop", "orders").expect("the life arrived").indexes.len(),
+            1,
+            "with its index"
+        );
+        assert_eq!(ids_on(&b, "shop", "other"), ids_on(&a, "shop", "other"), "nothing stranded");
+        assert!(b.witnessed_vector().unwrap().covers(&a.version_vector().unwrap()));
+    }
+
+    /// The answer a page holding no life gives is bounded by its sender's coverage: a
+    /// definition made after that page (here, by a member that has not heard the drop and
+    /// then keeps its life, re-dated with the index) still stops the batch, and that
+    /// member's page brings the life. Taken as history because some page once answered,
+    /// it left B without the life A keeps.
+    #[test]
+    fn a_later_definition_the_answering_pages_coverage_does_not_name_still_stops() {
+        let (a, _da) = engine();
+        let (b, _db) = engine();
+        let (c, _dc) = engine();
+        a.create_collection("shop", "orders").unwrap();
+        let other = a.create_collection("shop", "other").unwrap();
+        round(&b, &a, BATCH);
+        round(&c, &a, BATCH);
+        b.drop_collection("shop", "orders").unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(2));
+        let field = |p: &str| crate::meta::IndexField { path: p.into(), descending: false };
+        let scoped = |into: &Engine, from: &Engine, id| {
+            let mut progress = crate::SnapshotProgress::of_collection(id);
+            while !progress.is_complete() {
+                let page = from.snapshot_page(progress.after().cloned(), progress.scope()).unwrap();
+                into.apply_snapshot_page(from.node_id(), &mut progress, &page).unwrap();
+            }
+        };
+
+        // C makes an index and drops it before it hears the drop, then buries its life.
+        let index = c.create_index("shop", "orders", vec![field("n")], false, None).unwrap();
+        c.drop_index("shop", "orders", &index.name).unwrap();
+        round(&c, &b, BATCH);
+        assert!(c.get_collection("shop", "orders").is_err(), "premise: C buried the life");
+        // B stops at C's index; C's page holds no life and answers it.
+        let stopped = round(&b, &c, BATCH).unknown.expect("premise: a later-life stop");
+        scoped(&b, &c, stopped.id);
+        assert_eq!(round(&b, &c, BATCH).unknown_collection, 0, "premise: answered");
+
+        // A, which has not heard the drop either, makes an index and then keeps its life.
+        std::thread::sleep(std::time::Duration::from_millis(2));
+        a.create_index("shop", "orders", vec![field("m")], false, None).unwrap();
+        a.insert(&other, doc! { "_id": "behind-it" }).unwrap();
+        round(&a, &b, BATCH);
+        assert!(a.get_collection("shop", "orders").unwrap().is_redated(), "premise: kept");
+        let outcome = round(&b, &a, BATCH);
+        assert_eq!(outcome.unknown_collection, 1, "A's index is not C's page's: {outcome:?}");
+        scoped(&b, &a, stopped.id);
+        round(&b, &a, BATCH);
+        let on_b = b.get_collection("shop", "orders").expect("A's life arrived");
+        assert_eq!(on_b.indexes.len(), 1, "with A's index");
+        assert_eq!(ids_on(&b, "shop", "other"), ids_on(&a, "shop", "other"), "nothing stranded");
+    }
+
+    /// The answer is read from a resumed page too, when the page carries the collection's
+    /// drop (ADR-236 item 4): a scoped pull cut short after its first page, which carried a
+    /// life B refused, and resumed after A buried that life (its index made and dropped
+    /// again after the drop, nothing of it left after the drop), is answered by the pages
+    /// that follow, whose sender lacked the collection and read its vector first. Read from
+    /// the first page only, the pull completed with no answer and the stop stood until a
+    /// fresh pull after the repair cooldown.
+    #[test]
+    fn a_resumed_page_carrying_the_drop_answers_the_later_life_stop() {
+        let (a, _da) = engine();
+        let (b, _db) = engine();
+        let orders = a.create_collection("shop", "orders").unwrap();
+        // Enough for a second page.
+        let docs = (0..crate::SNAPSHOT_PAGE as i64 + 8).map(|i| doc! { "_id": i }).collect();
+        a.insert_many(&orders, docs).unwrap();
+        let other = a.create_collection("shop", "other").unwrap();
+        round(&b, &a, 4 * BATCH);
+        b.drop_collection("shop", "orders").unwrap();
+        b.finish_purges_now().unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(2));
+        let field = crate::meta::IndexField { path: "n".into(), descending: false };
+        let index = a.create_index("shop", "orders", vec![field], false, None).unwrap();
+        a.drop_index("shop", "orders", &index.name).unwrap();
+        a.insert(&other, doc! { "_id": "behind-it" }).unwrap();
+
+        let stopped = round(&b, &a, BATCH).unknown.expect("a later life's definition stops");
+        // The pull's first page only: it carries A's life, which B refuses.
+        let mut progress = crate::SnapshotProgress::of_collection(stopped.id);
+        let page = a.snapshot_page(None, progress.scope()).unwrap();
+        b.apply_snapshot_page(a.node_id(), &mut progress, &page).unwrap();
+        assert!(!progress.is_complete(), "premise: the pull is cut short after one page");
+        assert!(b.get_collection("shop", "orders").is_err(), "premise: B refused A's life");
+        // A hears the drop and buries the life, which holds nothing after it.
+        round(&a, &b, BATCH);
+        assert!(a.get_collection("shop", "orders").is_err(), "premise: A buried the life");
+        // The pull resumes, and its pages carry the drop.
+        while !progress.is_complete() {
+            let page = a.snapshot_page(progress.after().cloned(), progress.scope()).unwrap();
+            assert!(page.dropped.is_some(), "premise: a resumed page carries the drop");
+            b.apply_snapshot_page(a.node_id(), &mut progress, &page).unwrap();
+        }
+        let outcome = round(&b, &a, BATCH);
+        assert_eq!(outcome.unknown_collection, 0, "the resumed pages answered it: {outcome:?}");
+        assert_eq!(ids_on(&b, "shop", "other"), ids_on(&a, "shop", "other"), "nothing stranded");
+        assert!(b.witnessed_vector().unwrap().covers(&a.version_vector().unwrap()));
+    }
+
+    /// A drop of an index on a collection this node dropped, stamped after the drop,
+    /// does not stop the batch (ADR-236): the index's tombstone is recorded, which is
+    /// all of it a later life needs, and a sender holding the drop and no collection
+    /// would answer a scoped page with the same tombstone for ever.
+    #[test]
+    fn an_index_drop_stamped_after_a_local_drop_is_history_and_records_its_tombstone() {
+        let (a, _da) = engine();
+        let (b, _db) = engine();
+        a.create_collection("shop", "orders").unwrap();
+        let field = crate::meta::IndexField { path: "n".into(), descending: false };
+        let index = a.create_index("shop", "orders", vec![field], false, None).unwrap();
+        let other = a.create_collection("shop", "other").unwrap();
+        round(&b, &a, BATCH);
+        b.drop_collection("shop", "orders").unwrap();
+
+        std::thread::sleep(std::time::Duration::from_millis(2));
+        a.drop_index("shop", "orders", &index.name).unwrap();
+        a.insert(&other, doc! { "_id": "behind-it" }).unwrap();
+
+        let outcome = round(&b, &a, BATCH);
+        assert_eq!(outcome.unknown_collection, 0, "{outcome:?}");
+        assert_eq!(outcome.applied, 1, "the entry behind it landed: {outcome:?}");
+        let orders = CollectionId::derive("shop", "orders");
+        let index_id = kimmy_core::IndexMeta::derive_id(&index.name);
+        assert!(b.index_dropped_at(orders, index_id).unwrap().is_some(), "its tombstone is held");
+        assert!(b.witnessed_vector().unwrap().covers(&a.version_vector().unwrap()));
+    }
+
+    /// The tie is the drop's under the writer too (ADR-236): a drop in the creation's own
+    /// `Hlc`, from a node below the creator's, that lands between the creation's check and
+    /// its writer makes the creation history.
+    #[test]
+    fn a_drop_in_the_creations_own_hlc_that_lands_while_it_applies_makes_it_history() {
+        let (a, _da) = engine();
+        let (b, _db) = engine();
+        let b = Arc::new(b);
+        a.create_collection("shop", "orders").unwrap();
+        let (_, window) = window_for(&b, &a);
+        let create = window
+            .entries
+            .iter()
+            .find(|e| e.kind == OpKind::CreateCollection)
+            .cloned()
+            .expect("the creation's entry");
+        let below = Stamp::new(create.stamp.hlc, kimmy_core::NodeId::from_bytes([0; 16]));
+        assert!(below < create.stamp, "premise: the drop sorts below the creation");
+        let landing = Arc::clone(&b);
+        let id = create.collection;
+        let (applied, ()) = race_hooks::race(
+            race_hooks::Race::ReplicatedCreate,
+            move || landing.record_collection_drop(id, below).unwrap(),
+            || b.apply_batch(std::slice::from_ref(&create)),
+        );
+        applied.unwrap();
+        assert!(b.get_collection("shop", "orders").is_err(), "a creation in the drop's Hlc stood");
+        race_hooks::assert_absorbed(race_hooks::Race::ReplicatedCreate);
+    }
+
+    /// A creation in a held drop's own `Hlc` is refused before the writer, as one older
+    /// than the drop is (ADR-236): nothing taken, nothing appended.
+    #[test]
+    fn a_creation_in_a_held_drops_own_hlc_is_refused_before_the_writer() {
+        let (a, _da) = engine();
+        let (b, _db) = engine();
+        a.create_collection("shop", "orders").unwrap();
+        let (_, window) = window_for(&b, &a);
+        let create = window
+            .entries
+            .iter()
+            .find(|e| e.kind == OpKind::CreateCollection)
+            .cloned()
+            .expect("the creation's entry");
+        let below = Stamp::new(create.stamp.hlc, kimmy_core::NodeId::from_bytes([0; 16]));
+        b.record_collection_drop(create.collection, below).unwrap();
+        b.apply_batch(std::slice::from_ref(&create)).unwrap();
+        assert!(b.get_collection("shop", "orders").is_err(), "a creation in the drop's Hlc stood");
+        assert!(b.oplog_entry(&create.stamp).unwrap().is_none(), "judged under the writer");
+    }
+
+    /// A vector shadow is a collection: a peer's configuration in the shadow's drop's own
+    /// `Hlc`, from a node above the dropper's, makes no shadow (ADR-236), as a creation in
+    /// a drop's `Hlc` is history everywhere; the configuration itself still applies.
+    #[test]
+    fn a_configuration_in_its_shadows_drop_hlc_makes_no_shadow() {
+        let (b, _db) = engine();
+        let orders = b.create_collection("shop", "orders").unwrap();
+        b.configure_vectors("shop", "orders", vector_config()).unwrap();
+        b.disable_vectors("shop", "orders", true).unwrap();
+        b.finish_purges_now().unwrap();
+        let shadow = kimmy_core::vector_meta::shadow_name("orders");
+        let dropped = b
+            .collection_dropped_at(CollectionId::derive("shop", &shadow))
+            .unwrap()
+            .expect("the shadow's drop");
+        let tied = Stamp::new(dropped.hlc, kimmy_core::NodeId::from_bytes([0xff; 16]));
+        let entry = crate::engine::ddl_entry(
+            tied,
+            OpKind::ConfigureVectors,
+            orders.id,
+            &kimmy_core::VectorSet {
+                db: "shop".into(),
+                collection: "orders".into(),
+                config: Some(vector_config()),
+            },
+        )
+        .unwrap();
+        b.apply_batch(std::slice::from_ref(&entry)).unwrap();
+        assert!(b.get_collection("shop", "orders").unwrap().vector.is_some(), "premise: applied");
+        assert!(b.get_collection("shop", &shadow).is_err(), "a shadow made in its drop's Hlc");
+    }
+
+    /// The definition rule is judged again under the writer (ADR-236): a database's drop
+    /// recorded between the early check and the writer makes an index of a life it covers
+    /// history, before its sweep reaches the collection.
+    #[test]
+    fn a_database_drop_recorded_while_an_index_creation_applies_makes_it_history() {
+        let (a, _da) = engine();
+        let (b, _db) = engine();
+        let b = Arc::new(b);
+        a.create_collection("shop", "orders").unwrap();
+        round(&b, &a, BATCH);
+        a.create_index("shop", "orders", vec![field("n")], false, Some("by_n".into())).unwrap();
+        let (_, window) = window_for(&b, &a);
+        let index = window
+            .entries
+            .iter()
+            .find(|e| e.kind == OpKind::CreateIndex)
+            .cloned()
+            .expect("the index's entry");
+        let covering = Stamp::new(
+            Hlc::new(index.stamp.hlc.wall_ms + 1, 0),
+            kimmy_core::NodeId::from_bytes([7; 16]),
+        );
+        let landing = Arc::clone(&b);
+        let (applied, ()) = race_hooks::race(
+            race_hooks::Race::ReplicatedIndexCreate,
+            move || {
+                landing
+                    .record_database_tombstone_for_test(
+                        kimmy_core::database_drop_id("shop"),
+                        covering,
+                    )
+                    .unwrap()
+            },
+            || b.apply_batch(std::slice::from_ref(&index)),
+        );
+        applied.unwrap();
+        let orders = b.get_collection("shop", "orders").unwrap();
+        assert!(orders.index("by_n").is_none(), "an index the database's drop covers was built");
+        race_hooks::assert_absorbed(race_hooks::Race::IndexHistory);
+    }
+
+    /// And decided before the writer where it can be (ADR-236): a definition at or before
+    /// a tombstone this node holds, in the window before the drop's sweep takes the floor,
+    /// takes no writer.
+    #[test]
+    fn a_definition_at_or_before_a_held_tombstone_is_decided_before_the_writer() {
+        let (a, _da) = engine();
+        let (b, _db) = engine();
+        a.create_collection("shop", "orders").unwrap();
+        round(&b, &a, BATCH);
+        a.create_index("shop", "orders", vec![field("n")], false, Some("by_n".into())).unwrap();
+        let (_, window) = window_for(&b, &a);
+        let index = window
+            .entries
+            .iter()
+            .find(|e| e.kind == OpKind::CreateIndex)
+            .cloned()
+            .expect("the index's entry");
+        // The state a drop's sweep leaves between its tombstone and its floor.
+        let at = Stamp::new(
+            Hlc::new(index.stamp.hlc.wall_ms + 1, 0),
+            kimmy_core::NodeId::from_bytes([7; 16]),
+        );
+        b.record_collection_drop(index.collection, at).unwrap();
+        let holds = |e: &Engine| {
+            let count = e.writer_hold().count;
+            [crate::engine::WriterHolder::Ddl, crate::engine::WriterHolder::IndexBuild]
+                .map(|holder| count[holder.slot()])
+        };
+        let before = holds(&b);
+        b.apply_batch(std::slice::from_ref(&index)).unwrap();
+        assert!(b.get_collection("shop", "orders").unwrap().index("by_n").is_none());
+        assert_eq!(holds(&b), before, "a definition of an ended life took the writer");
+    }
+
+    /// A definition in the drop's own `Hlc`, from a node above the dropper's, is of the
+    /// life the drop ended (ADR-236: a tie is the drop's), so it is history for a
+    /// collection this node dropped and does not stop the batch: no later life can carry
+    /// it, and stopped at it the batch would wait for one for ever.
+    #[test]
+    fn a_definition_in_the_drops_own_hlc_is_history_and_does_not_stop_the_batch() {
+        let (a, _da) = engine();
+        let (b, _db) = engine();
+        a.create_collection("shop", "orders").unwrap();
+        round(&b, &a, BATCH);
+        b.drop_collection("shop", "orders").unwrap();
+        let orders = CollectionId::derive("shop", "orders");
+        let dropped = b.collection_dropped_at(orders).unwrap().expect("the drop's tombstone");
+        let field = crate::meta::IndexField { path: "n".into(), descending: false };
+        a.create_index("shop", "orders", vec![field], false, None).unwrap();
+        let (_, window) = window_for(&b, &a);
+        let mut index = window
+            .entries
+            .iter()
+            .find(|e| e.kind == OpKind::CreateIndex)
+            .cloned()
+            .expect("the index's entry");
+        index.stamp = Stamp::new(dropped.hlc, kimmy_core::NodeId::from_bytes([0xff; 16]));
+        assert!(index.stamp > dropped, "premise: the tie sorts above the drop");
+        let outcome = b.apply_batch(std::slice::from_ref(&index)).unwrap();
+        assert_eq!(outcome.unknown_collection, 0, "a tie stopped the batch: {outcome:?}");
+        assert_eq!(outcome.superseded, 1, "{outcome:?}");
+    }
+
+    /// A vector configuration stamped after a local drop is a definition of a later life
+    /// too (ADR-236), and stops the batch as an index creation does.
+    #[test]
+    fn a_vector_configuration_stamped_after_a_local_drop_stops_the_batch() {
+        let (a, _da) = engine();
+        let (b, _db) = engine();
+        a.create_collection("shop", "orders").unwrap();
+        round(&b, &a, BATCH);
+        b.drop_collection("shop", "orders").unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(2));
+        a.configure_vectors("shop", "orders", vector_config()).unwrap();
+        let outcome = round(&b, &a, BATCH);
+        assert_eq!(outcome.unknown_collection, 1, "{outcome:?}");
+        let stopped = outcome.unknown.expect("the stop names the collection");
+        assert_eq!(stopped.id, CollectionId::derive("shop", "orders"), "{stopped:?}");
     }
 
     /// What a peer serves `into`'s position from `from`: the window, and the
@@ -7960,7 +8533,7 @@ mod tests {
                     None,
                     None,
                     crate::index::CreateOrigin::Replicated { created: Some(later), logged: None },
-                    &|_, _| false,
+                    &|_, _| Ok(false),
                 )
             },
         );

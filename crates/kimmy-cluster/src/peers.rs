@@ -1352,9 +1352,14 @@ pub async fn replicate(engine: Arc<Engine>, config: ReplicationConfig) {
                                     } else if outcome.count_probe_deferred {
                                         report.divergence_count_deferred += 1;
                                     }
-                                    let findings =
-                                        kimmy_storage::DivergenceFindings { existence, count };
-                                    divergence.observe(node, findings);
+                                    fold_check(
+                                        &mut divergence,
+                                        node,
+                                        existence,
+                                        count,
+                                        outcome.count_probe_deferred,
+                                        probe.as_ref(),
+                                    );
                                     // The cut digest of the same contact (B3):
                                     // folded into the tracker's own set, which
                                     // no repair is planned from.
@@ -1395,37 +1400,13 @@ pub async fn replicate(engine: Arc<Engine>, config: ReplicationConfig) {
                                     // history from its creation, or the
                                     // peer's snapshot for a collection this
                                     // node does not hold at all.
-                                    let confirmed = divergence.confirmed_against(node);
-                                    for collection in &confirmed {
-                                        let repair = match engine.collection_by_id(*collection) {
-                                            // From where the standing life's valid history
-                                            // begins, which is its incarnation floor and not
-                                            // its creation: a write stamped after the drop
-                                            // that preceded this life (a member that kept it
-                                            // through the drop, ADR-231 extended) is part of
-                                            // the life and sorts before the creation. A replay
-                                            // from the creation would never serve it.
-                                            Ok(Some(meta)) => Repair::Replay {
-                                                from: meta
-                                                    .incarnation_floor
-                                                    .map_or(meta.created, |floor| {
-                                                        floor.min(meta.created)
-                                                    }),
-                                            },
-                                            _ => Repair::Snapshot,
-                                        };
-                                        if stalls.plan_repair(node, *collection, repair) {
-                                            warn!(
-                                                %peer,
-                                                node = %node,
-                                                collection = %collection,
-                                                ?repair,
-                                                "divergence confirmed; planned a repair from \
-                                                 this peer on the next round with it"
-                                            );
-                                        }
-                                    }
-                                    stalls.retain_repaired(node, &confirmed);
+                                    plan_count_repairs(
+                                        &engine,
+                                        &divergence,
+                                        &mut stalls,
+                                        node,
+                                        peer,
+                                    );
                                 } else {
                                     report.divergence_skips += 1;
                                 }
@@ -2412,8 +2393,106 @@ fn judge_catch_up_at(
     }
 }
 
+/// Fold one checked contact with `node` into the tracker (ADR-133): the existence half and
+/// the count probe it compared, or, when the gate deferred the tick's `probe` (ADR-168), that
+/// it compared nothing, which suspends a count finding of that collection until a compared
+/// probe renews or clears it.
+fn fold_check(
+    divergence: &mut kimmy_storage::DivergenceTracker,
+    node: NodeId,
+    existence: BTreeSet<kimmy_core::CollectionId>,
+    count: Option<(kimmy_core::CollectionId, bool)>,
+    deferred: bool,
+    probe: Option<&DivergenceProbe>,
+) {
+    divergence.observe(node, kimmy_storage::DivergenceFindings { existence, count });
+    if deferred && let Some(probe) = probe {
+        divergence.observe_count_deferred(node, probe.id);
+    }
+}
+
+/// Plan the repairs what the check has confirmed against `node` asks for (ADR-148), and
+/// return how many were planned. One per collection, on the next round with the peer; a
+/// collection repaired against it waits out the cooldown unless the finding clears first.
+///
+/// A count finding whose latest probe the gate deferred plans nothing
+/// (`DivergenceTracker::observe_count_deferred`) and keeps the cooldown of the repair it
+/// planned before, so a finding that cannot be compared against a peer that trails this
+/// member and moves is not repaired again every cooldown on old evidence.
+fn plan_count_repairs(
+    engine: &Engine,
+    divergence: &kimmy_storage::DivergenceTracker,
+    stalls: &mut PeerStalls,
+    node: NodeId,
+    peer: SocketAddr,
+) -> usize {
+    let confirmed = divergence.confirmed_against(node);
+    let mut planned = 0;
+    for collection in &confirmed {
+        let repair = repair_for(engine, *collection);
+        if stalls.plan_repair(node, *collection, repair) {
+            planned += 1;
+            warn!(
+                %peer,
+                node = %node,
+                collection = %collection,
+                ?repair,
+                "divergence confirmed; planned a repair from this peer on the next round with it"
+            );
+        }
+    }
+    stalls.retain_repaired(node, &divergence.reported_against(node));
+    planned
+}
+
+/// The repair a confirmed divergence of `collection` plans (ADR-148): a replay of the
+/// peer's oplog for a collection this member holds, a snapshot for one it does not.
+///
+/// The replay starts where the standing life's valid history begins, which is its
+/// incarnation floor and not its creation: a write stamped after the drop that preceded
+/// this life (a member that kept it through the drop, ADR-231 extended) is part of the
+/// life and sorts before the creation, and a replay from the creation would never serve
+/// it. And no higher than the tombstone held for the id (ADR-236), so a drop this member
+/// holds below a late `created` of its own is replayed past too
+/// (`Engine::count_repair_replay_from`).
+fn repair_for(engine: &Engine, collection: kimmy_core::CollectionId) -> Repair {
+    match engine.collection_by_id(collection) {
+        Ok(Some(meta)) => match engine.count_repair_replay_from(&meta) {
+            Ok(from) => Repair::Replay { from },
+            Err(_) => Repair::Snapshot,
+        },
+        _ => Repair::Snapshot,
+    }
+}
+
+// The gate directly above the module, where the source audits look for it.
+#[path = "count_finding_tests.rs"]
+#[cfg(test)]
+mod count_finding_tests;
+
 #[cfg(test)]
 mod tests {
+    /// A confirmed count divergence replays from the lowest of the life's floor, its
+    /// `created` and the tombstone held for its id; a collection not held is a snapshot.
+    #[test]
+    fn a_count_repair_replays_from_the_tombstone_below_a_late_creation() {
+        use kimmy_core::{CollectionId, Hlc, NodeId, Stamp};
+        let dir = tempfile::tempdir().unwrap();
+        let engine = Engine::open(&dir.path().join("kimmy.redb")).unwrap();
+        let orders = engine.create_collection("shop", "orders").unwrap();
+        assert_eq!(super::repair_for(&engine, orders.id), Repair::Replay { from: orders.created });
+        let below = Hlc::new(orders.created.wall_ms - 10, 0);
+        engine
+            .record_database_tombstone_for_test(
+                orders.id,
+                Stamp::new(below, NodeId::from_bytes([7; 16])),
+            )
+            .unwrap();
+        assert_eq!(super::repair_for(&engine, orders.id), Repair::Replay { from: below });
+        let absent = CollectionId::derive("shop", "absent");
+        assert_eq!(super::repair_for(&engine, absent), Repair::Snapshot);
+    }
+
     /// The lag gauge's source (ADR-175's addendum): what a peer advertised,
     /// against what this node has witnessed now. It grows with the clock
     /// while the entries are missing, whatever became of the rounds that read
