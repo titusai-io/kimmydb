@@ -860,8 +860,9 @@ fn a_clean_database_drop_with_documents_buries_without_a_warning() {
     );
 }
 
-/// A document deleted after the drop is not a lost write: its record is a
-/// tombstone, stamped after the drop, beside a live document that predates it.
+/// A document deleted after the drop is not a lost write, and the delete is a write
+/// after the drop (ADR-236, F16): the collection keeps its tombstone, re-dated above the
+/// drop, and loses the document that predates the drop. Nothing warns.
 #[test]
 fn a_document_deleted_after_the_drop_is_not_a_lost_write() {
     let (a, _da) = engine();
@@ -886,7 +887,15 @@ fn a_document_deleted_after_the_drop_is_not_a_lost_write() {
     let logs = crate::log_capture::logs_of(|| {
         pull(&c, &a);
     });
-    assert!(!holds(&c, "shop", "late"), "premise: the sweep buried it");
+    let kept = c.get_collection("shop", "late").expect("kept with the delete");
+    assert!(kept.is_redated(), "{kept:?}");
+    assert_eq!(
+        c.count(&kept, crate::WalkScope::Request).unwrap(),
+        0,
+        "the one before the drop went"
+    );
+    // The delete's tombstone, and the sweep's bare tombstone at the drop for "keep".
+    assert_eq!(c.rows_under(kept.id).unwrap(), 2, "the delete's tombstone stands");
     assert!(
         !logs.lines().any(|line| line.contains("WARN") && line.contains("buried a collection")),
         "a deletion after the drop was reported as a lost write: {logs}"

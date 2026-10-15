@@ -115,6 +115,8 @@ struct Chunk {
     /// The lowest arrival position among the entries of the records this chunk
     /// kept (stamped after the drop), for a re-dated life.
     first_arrival: Option<u64>,
+    /// Whether this chunk left a record stamped after the drop, a tombstone included.
+    kept: bool,
 }
 
 /// Whether a collection standing here owes a sweep for a drop stamped
@@ -181,6 +183,7 @@ impl Engine {
         let mut after: Option<Vec<u8>> = None;
         let mut started = false;
         let mut first_arrival: Option<u64> = None;
+        let mut kept_after = false;
         loop {
             stop()?;
             if !started {
@@ -210,6 +213,7 @@ impl Engine {
             let chunk = self.remove_stragglers(&txn, &standing, dropped, after)?;
             removed += chunk.removed;
             skipped += chunk.skipped;
+            kept_after |= chunk.kept;
             first_arrival = match (first_arrival, chunk.first_arrival) {
                 (Some(a), Some(b)) => Some(a.min(b)),
                 (a, b) => a.or(b),
@@ -221,9 +225,22 @@ impl Engine {
                 // are gone and a straggler at the drop's own `Hlc` is refused
                 // by neither the tombstone (strict) nor the floor.
                 //
-                // A life a drop re-dated that holds nothing live after the
-                // sweep, and no definition stamped after the drop, has nothing
-                // the drop kept: it is buried, in this commit, with its shadow.
+                // A life a drop re-dated that holds nothing stamped after the
+                // drop, live or a tombstone, and no definition stamped after it,
+                // has nothing the drop kept: it is buried, in this commit, with
+                // its shadow. A delete made after the drop is a write after it
+                // (ADR-236), and is kept as a live write is: buried, the purge
+                // removed it, and a page from a member that had not heard it
+                // wrote the document back. Read from the records this sweep
+                // walked, and from the digest row, which counts tombstones and is
+                // never lowered, for one that landed in a range already walked. A
+                // shadow's rows are its parent's vectors, judged by its parent.
+                let stamped_after = !kimmy_core::vector_meta::is_shadow(&standing.name)
+                    && (kept_after || {
+                        let rows = txn.open_table(tables::LIVE_DIGESTS)?;
+                        crate::live_digest::kept_row(&rows, standing.id.0)?
+                            .is_some_and(|row| row.maxw.values().any(|maxw| *maxw > dropped.hlc))
+                    });
                 let live = txn
                     .open_table(tables::LIVE_COUNTS)?
                     .get(standing.id.0)?
@@ -240,6 +257,7 @@ impl Engine {
                 };
                 if redated
                     && live == 0
+                    && !stamped_after
                     && !configured_parent
                     && !holds_a_definition_stamped_after(&standing, dropped.hlc)
                 {
@@ -357,6 +375,7 @@ impl Engine {
         let mut last = after.clone();
         let mut exhausted = true;
         let mut first_arrival: Option<u64> = None;
+        let mut kept = false;
         // A shadow row is kept only while its parent record is live: a chunk the
         // embedding worker stamped after the drop for a parent that was swept
         // must not keep the shadow (and with it a parentless row) alive. The
@@ -395,6 +414,8 @@ impl Engine {
                     first_arrival = Some(first_arrival.map_or(seq, |first| first.min(seq)));
                 }
                 if !live {
+                    // A delete after the drop is a write after it (ADR-236): it stays.
+                    kept |= stamp.hlc > dropped.hlc;
                     continue;
                 }
                 let orphaned = stamp.hlc > dropped.hlc
@@ -406,6 +427,7 @@ impl Engine {
                             value.value(),
                         )
                     });
+                kept |= stamp.hlc > dropped.hlc && !orphaned;
                 if stamp.hlc <= dropped.hlc || orphaned {
                     let document = codec::decode_doc_record(value.value())
                         .and_then(|record| Ok(record.document()?))
@@ -427,7 +449,7 @@ impl Engine {
             // A removal has no document to key and so no violation to report.
             crate::index::maintain_remote(self, txn, standing, previous.as_ref(), None, key)?;
         }
-        Ok(Chunk { removed: found.len(), skipped, last, exhausted, first_arrival })
+        Ok(Chunk { removed: found.len(), skipped, last, exhausted, first_arrival, kept })
     }
 
     /// A replicated drop of the collection `db.name` has reached a member whose

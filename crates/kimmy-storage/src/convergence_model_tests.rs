@@ -394,6 +394,9 @@ struct Recorded {
     created: BTreeMap<&'static str, Hlc>,
     redated_from: BTreeMap<&'static str, Hlc>,
     index_created: BTreeMap<String, Option<Stamp>>,
+    /// The stamp of the record each held collection keeps for each document id, a
+    /// tombstone's included: what the no-lost-delete check reads.
+    records: BTreeMap<(&'static str, i64), Stamp>,
 }
 
 fn name_of(id: CollectionId) -> Option<String> {
@@ -449,6 +452,9 @@ pub(crate) enum Category {
     /// signature a sweep groups by; any other subsumed difference is `TombstoneSubsumed`.
     KnownSubsumed,
     LostWrite,
+    /// A member holds a collection without a record of a delete in it that the ghost
+    /// says must stand there (the mirror of `LostWrite`).
+    LostDelete,
     /// A page left its receiver's clock behind a stamp it restored that the sender's
     /// coverage names (ADR-233 item 1: a collection's `created`, a carried collection or
     /// index drop, a scoped page's `dropped`). The receiver's next local stamp could then
@@ -1232,6 +1238,21 @@ impl Cluster {
             })
             .map_err(|e| err("for_each_record_after", e))?;
             recorded.created.insert(name, meta.created);
+            {
+                use redb::ReadableDatabase;
+                let txn = e.db().begin_read().map_err(|e| err("begin_read", e))?;
+                let docs = txn.open_table(tables::DOCS).map_err(|e| err("open DOCS", e))?;
+                for d in 1..=3i64 {
+                    let key = crate::docs::doc_key(&DocId::Int64(d)).map_err(|e| err("key", e))?;
+                    if let Some(raw) =
+                        docs.get((meta.id.0, key.as_slice())).map_err(|e| err("get", e))?
+                    {
+                        let (stamp, _) = crate::codec::doc_record_header(raw.value())
+                            .map_err(|e| err("header", e))?;
+                        recorded.records.insert((name, d), stamp);
+                    }
+                }
+            }
             if meta.is_redated()
                 && let Some(marker) = meta.redated
             {
@@ -1439,6 +1460,39 @@ impl Cluster {
             let slot = latest.entry((*c, *d)).or_insert((*stamp, None));
             if *stamp > slot.0 {
                 *slot = (*stamp, None);
+            }
+        }
+        // No lost delete, the same way: a document whose latest event is a delete stamped
+        // after every drop that applies to it (a delete after a drop is a write after it,
+        // ADR-231 and ADR-236) is held as a record at or above that delete by every member
+        // that holds its collection, unless retention collected it (below the cutoff).
+        for ((c, d), (stamp, winner)) in &latest {
+            if winner.is_some() || below_cutoff(stamp) {
+                continue;
+            }
+            let after_every_drop =
+                self.ghost.drops.iter().filter(|(dc, _)| dc == c).all(|(_, s)| stamp.hlc > s.hlc);
+            let after_every_db_drop = self.ghost.db_drops.iter().all(|s| stamp.hlc > s.hlc);
+            if !(after_every_drop && after_every_db_drop) {
+                continue;
+            }
+            for (m, (observed, recorded)) in states.iter().enumerate() {
+                if !observed.collections.contains_key(NAMES[*c]) {
+                    continue;
+                }
+                let held = recorded.records.get(&(NAMES[*c], *d));
+                if held.is_none_or(|held| held < stamp) {
+                    fail(
+                        Category::LostDelete,
+                        format!(
+                            "{} holds {} without its delete of {d} at {}; its record is {:?}",
+                            LETTERS[m],
+                            NAMES[*c],
+                            self.stamp(*stamp),
+                            held.map(|s| self.stamp(*s))
+                        ),
+                    );
+                }
             }
         }
         for ((c, d), (_, winner)) in latest {
@@ -2330,7 +2384,8 @@ fn census_takes(name: &str, pre: &[Op], variants: &[(&str, Vec<Op>)], expect: Ex
 #[ignore = "the vacuity census; see the convergence model test report"]
 fn vacuity_census() {
     CENSUS.with(|c| *c.borrow_mut() = Some(Vec::new()));
-    let named: [fn(); 32] = [
+    let named: [fn(); 33] = [
+        finding_f16_a_delete_made_after_a_drop_is_kept_as_a_write_after_it_is,
         known_residual_two_drops_of_one_database_the_first_dropper_held_the_collection,
         finding_f14_an_expansion_of_a_database_drop_stayed_at_the_drop_it_was_made_under,
         finding_f12_a_page_refused_a_definition_its_drop_keeps,
@@ -2664,6 +2719,23 @@ fn finding_f14_an_expansion_of_a_database_drop_stayed_at_the_drop_it_was_made_un
         "B.create(orders)@130; C<-B scoped(orders); B.dropdb@210; C.dropdb@210; \
          A.create(items)@210",
         &[(ORDERS, None), (ITEMS, None)],
+    );
+}
+
+/// F16 (the young-stamp model test's YS1, ruled 2026-10-15). A drop reached a member whose
+/// life held, after the drop, only a delete it had made: the sweep's last commit buried the
+/// life as left with nothing live, and the purge removed the delete, a write after the drop.
+/// The member then took a newer life of the name and held no record of the delete, so a
+/// scoped page from a member not yet past it wrote the document back. A delete after the
+/// drop is kept as a live write is: the life is re-dated and keeps the tombstone.
+#[test]
+fn finding_f16_a_delete_made_after_a_drop_is_kept_as_a_write_after_it_is() {
+    finding(
+        "F16",
+        "C.create(orders)@100; A<-C entries; B<-C entries; B.drop(orders)@142; \
+         B.create(orders)@145; C.write(orders/1)@148; A<-C entries; A.delete(orders/1)@154; \
+         A<-B entries",
+        &[(ORDERS, Some(&[]))],
     );
 }
 

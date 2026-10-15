@@ -186,14 +186,15 @@ fn a_write_landing_before_the_burial_takes_the_writer_is_kept() {
 
 // -- D-1 / M-1: the two commits ----------------------------------------------
 
-/// A life the sweep leaves with nothing live (the write after the drop was
-/// itself deleted) is buried in the last commit and purged: the incarnation
-/// rule that would turn the same drop away from a life re-dated above it does
-/// not stand in the way.
+/// A life the sweep leaves holding, after the drop, only a delete (the write after
+/// the drop was itself deleted) keeps the delete as it would a live write (ADR-236,
+/// F16): it is re-dated, floored at the drop, and holds the tombstone. (It was buried
+/// in the last commit and purged, the delete with it.)
 #[test]
-fn a_life_left_with_nothing_by_the_sweep_is_buried_and_purged() {
+fn a_life_holding_only_a_delete_after_the_drop_keeps_it() {
     let (a, d, _da, _dd, id) = a_and_d_holding_the_old_life();
     assert!(a.drop_collection("shop", "orders").unwrap());
+    let dropped = a.collection_dropped_at(id).unwrap().expect("the drop's tombstone");
     later();
     let on_d = d.get_collection("shop", "orders").unwrap();
     d.insert(&on_d, doc! { "_id": 3i64 }).unwrap();
@@ -201,10 +202,134 @@ fn a_life_left_with_nothing_by_the_sweep_is_buried_and_purged() {
     let before = hooks::survivors_paths();
     quiesce(&[&a, &d]);
     assert_eq!(hooks::survivors_paths(), before + 1, "a tombstone stamped after the drop counts");
+    let kept = d.get_collection("shop", "orders").expect("kept with the delete");
+    assert!(kept.is_redated() && kept.created > dropped.hlc, "{kept:?}");
+    assert_eq!(kept.incarnation_floor, Some(dropped.hlc));
+    assert_eq!(docs_of(&d, "orders", &[1, 3]), Vec::<i64>::new());
+    // The delete's tombstone, and the sweep's bare tombstone at the drop for 1.
+    assert_eq!(d.rows_under(id).unwrap(), 2, "the delete's tombstone stands");
+    assert_counts_exact(&d, "a life that kept a delete");
+}
+
+/// Without a digest row, the records the sweep walks say it: a delete stamped after the
+/// drop keeps the life (ADR-236, F16).
+#[test]
+fn a_life_without_a_digest_row_keeps_a_delete_after_the_drop_by_its_records() {
+    let (a, d, _da, _dd, id) = a_and_d_holding_the_old_life();
+    assert!(a.drop_collection("shop", "orders").unwrap());
+    later();
+    let on_d = d.get_collection("shop", "orders").unwrap();
+    d.insert(&on_d, doc! { "_id": 3i64 }).unwrap();
+    assert!(d.delete(&on_d, &DocId::Int64(3)).unwrap());
+    forget_the_digest_row(&d, id);
+    quiesce(&[&a, &d]);
+    let kept = d.get_collection("shop", "orders").expect("kept with the delete");
+    assert!(kept.is_redated(), "{kept:?}");
+}
+
+/// And a delete after the drop that lands in a range the sweep has already walked, between
+/// two of its chunks, is read from the digest row the delete raised: the life is kept.
+#[test]
+fn a_delete_after_the_drop_landing_behind_the_sweeps_cursor_keeps_the_life() {
+    let (a, d, _da, _dd, id) = a_and_d_holding_the_old_life();
+    let on_a = a.get_collection("shop", "orders").unwrap();
+    let docs: Vec<_> = (1_000..2_400i64).map(|i| doc! { "_id": i }).collect();
+    a.insert_many(&on_a, docs).unwrap();
+    quiesce(&[&a, &d]);
+    assert!(a.drop_collection("shop", "orders").unwrap());
+    // Unknown, so the drop takes the survivors path with nothing after it yet.
+    forget_the_digest_row(&d, id);
+    let before = hooks::survivors_paths();
+    later();
+    let d = Arc::new(d);
+    let on_d = Arc::clone(&d);
+    hooks::run_after_the_next_chunk(move || {
+        let coll = on_d.get_collection("shop", "orders").unwrap();
+        on_d.insert(&coll, doc! { "_id": 2i64 }).unwrap();
+        assert!(on_d.delete(&coll, &DocId::Int64(2)).unwrap());
+    });
+    let start = d.version_vector().unwrap().behind(&a.version_vector().unwrap()).unwrap();
+    let window = a.entries_for_peer(start, BATCH, WalkScope::Background).unwrap().entries;
+    d.apply_batch(&window).unwrap();
+    assert_eq!(hooks::survivors_paths(), before + 1, "premise: the survivors path");
+    let kept = d.get_collection("shop", "orders").expect("kept with the delete behind the cursor");
+    assert!(kept.is_redated(), "{kept:?}");
+}
+
+/// A life the sweep leaves with nothing stamped after the drop at all is buried in the
+/// last commit and purged: the incarnation rule that would turn the same drop away from
+/// a life re-dated above it does not stand in the way. Reached when the drop took the
+/// survivors path for want of a digest row (an absent row is unknown).
+#[test]
+fn a_life_left_with_nothing_by_the_sweep_is_buried_and_purged() {
+    let (a, d, _da, _dd, id) = a_and_d_holding_the_old_life();
+    assert!(a.drop_collection("shop", "orders").unwrap());
+    forget_the_digest_row(&d, id);
+    let before = hooks::survivors_paths();
+    quiesce(&[&a, &d]);
+    assert_eq!(hooks::survivors_paths(), before + 1, "premise: the survivors path");
     assert!(!holds(&d, "orders"), "buried by the last commit");
     assert_eq!(d.rows_under(id).unwrap(), 0, "and purged");
     assert!(d.collection_dropped_at(id).unwrap().is_some());
     assert_counts_exact(&d, "an emptied life");
+}
+
+fn forget_the_digest_row(e: &Engine, id: CollectionId) {
+    let txn = e.begin_write(crate::WriterHolder::Ddl).unwrap();
+    txn.open_table(tables::LIVE_DIGESTS).unwrap().remove(id.0).unwrap();
+    txn.commit().unwrap();
+    assert!(e.digest_row(id).unwrap().is_none(), "premise");
+}
+
+/// F16 (ADR-236; the young-stamp model test's YS1). A delete made after the drop is a write
+/// after it: a life that holds, after the drop, only that delete keeps it, re-dated, and is
+/// not buried and purged with it. Buried, the delete was gone, the member took a newer life
+/// of the name holding no record of the document, and the count repair's scoped page from a
+/// member that had not yet heard the delete wrote the document back.
+#[test]
+fn a_delete_made_after_the_drop_is_kept_and_a_scoped_repair_does_not_write_the_document_back() {
+    let (a, _da) = engine();
+    let (b, _db) = engine();
+    let (c, _dc) = engine();
+    let id = c.create_collection("shop", "orders").unwrap().id;
+    pull(&a, &c);
+    pull(&b, &c);
+    later();
+    assert!(b.drop_collection("shop", "orders").unwrap());
+    b.finish_purges_now().unwrap();
+    let dropped = b.collection_dropped_at(id).unwrap().expect("the drop's tombstone");
+    later();
+    b.create_collection("shop", "orders").unwrap();
+    later();
+    // C, not having heard of the drop, writes; A takes it and deletes it.
+    let on_c = c.get_collection("shop", "orders").unwrap();
+    c.insert(&on_c, doc! { "_id": 1i64 }).unwrap();
+    pull(&a, &c);
+    later();
+    let on_a = a.get_collection("shop", "orders").unwrap();
+    assert!(a.delete(&on_a, &DocId::Int64(1)).unwrap());
+    // The drop reaches A, and B's life after it (which waits for a purge, if any).
+    pull(&a, &b);
+    a.finish_purges_now().unwrap();
+    pull(&a, &b);
+    assert!(holds(&a, "orders"), "premise: A holds a life of the name");
+    // The count repair's scoped page of the collection, from C, which still holds the
+    // document live.
+    assert_eq!(docs_of(&c, "orders", &[1]), vec![1], "premise: C has not heard the delete");
+    let mut progress = SnapshotProgress::of_collection(id);
+    while !progress.is_complete() {
+        let page = c.snapshot_page(progress.after().cloned(), progress.scope()).unwrap();
+        if a.apply_snapshot_page(c.node_id(), &mut progress, &page).unwrap().purge_pending.is_some()
+        {
+            a.finish_purges_now().unwrap();
+        }
+    }
+    assert_eq!(docs_of(&a, "orders", &[1]), Vec::<i64>::new(), "the deleted document came back");
+    let kept = a.get_collection("shop", "orders").unwrap();
+    assert!(kept.is_redated() && kept.created > dropped.hlc, "the life was not kept: {kept:?}");
+    assert_eq!(kept.incarnation_floor, Some(dropped.hlc));
+    assert_eq!(a.rows_under(id).unwrap(), 1, "the delete's tombstone stands");
+    assert_counts_exact(&a, "a life that kept a delete");
 }
 
 /// The log line says what happened. The survivors path is taken whenever a
@@ -225,12 +350,9 @@ fn the_survivors_path_logs_kept_only_when_something_survived() {
 
 #[test]
 fn the_survivors_path_logs_buried_when_the_sweep_left_nothing() {
-    let (a, d, _da, _dd, _id) = a_and_d_holding_the_old_life();
+    let (a, d, _da, _dd, id) = a_and_d_holding_the_old_life();
     assert!(a.drop_collection("shop", "orders").unwrap());
-    later();
-    let on_d = d.get_collection("shop", "orders").unwrap();
-    d.insert(&on_d, doc! { "_id": 3i64 }).unwrap();
-    assert!(d.delete(&on_d, &DocId::Int64(3)).unwrap());
+    forget_the_digest_row(&d, id);
     let logs = crate::log_capture::logs_of(|| quiesce(&[&a, &d]));
     assert!(!holds(&d, "orders"), "premise: buried by the last commit");
     assert!(logs.contains("the collection was buried"), "{logs}");
@@ -610,10 +732,7 @@ fn a_chunk_without_a_live_parent_is_removed_and_a_survivors_chunk_stays() {
 fn an_emptied_life_is_buried_with_its_shadow() {
     let (a, d, _da, _dd) = a_and_d_holding_a_vector_collection();
     assert!(a.drop_collection("shop", "orders").unwrap());
-    later();
-    let on_d = d.get_collection("shop", "orders").unwrap();
-    d.insert(&on_d, doc! { "_id": 5i64 }).unwrap();
-    assert!(d.delete(&on_d, &DocId::Int64(5)).unwrap());
+    forget_the_digest_row(&d, d.get_collection("shop", "orders").unwrap().id);
     quiesce(&[&a, &d]);
     assert!(!holds(&d, "orders"));
     assert!(!holds(&d, &kimmy_core::vector_meta::shadow_name("orders")), "the shadow went too");
