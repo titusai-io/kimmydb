@@ -5189,5 +5189,4 @@ mod definition_fold_tests {
 // The real-loop storms of the repair build's third review (a child of `peers`, so it can call
 // the tick's private functions).
 #[cfg(test)]
-#[path = "revc_storm_tests.rs"]
 mod revc_storm_tests;
