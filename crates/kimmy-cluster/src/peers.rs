@@ -1397,25 +1397,7 @@ pub async fn replicate(engine: Arc<Engine>, config: ReplicationConfig) {
                                     // node does not hold at all.
                                     let confirmed = divergence.confirmed_against(node);
                                     for collection in &confirmed {
-                                        let repair = match engine.collection_by_id(*collection) {
-                                            // From where the standing life's valid history
-                                            // begins, which is its incarnation floor and not
-                                            // its creation: a write stamped after the drop
-                                            // that preceded this life (a member that kept it
-                                            // through the drop, ADR-231 extended) is part of
-                                            // the life and sorts before the creation. A replay
-                                            // from the creation would never serve it. And no
-                                            // higher than the tombstone held for the id
-                                            // (ADR-236), so a drop this member holds below a
-                                            // late `created` of its own is replayed past too.
-                                            Ok(Some(meta)) => {
-                                                match engine.count_repair_replay_from(&meta) {
-                                                    Ok(from) => Repair::Replay { from },
-                                                    Err(_) => Repair::Snapshot,
-                                                }
-                                            }
-                                            _ => Repair::Snapshot,
-                                        };
+                                        let repair = repair_for(&engine, *collection);
                                         if stalls.plan_repair(node, *collection, repair) {
                                             warn!(
                                                 %peer,
@@ -2414,8 +2396,49 @@ fn judge_catch_up_at(
     }
 }
 
+/// The repair a confirmed divergence of `collection` plans (ADR-148): a replay of the
+/// peer's oplog for a collection this member holds, a snapshot for one it does not.
+///
+/// The replay starts where the standing life's valid history begins, which is its
+/// incarnation floor and not its creation: a write stamped after the drop that preceded
+/// this life (a member that kept it through the drop, ADR-231 extended) is part of the
+/// life and sorts before the creation, and a replay from the creation would never serve
+/// it. And no higher than the tombstone held for the id (ADR-236), so a drop this member
+/// holds below a late `created` of its own is replayed past too
+/// (`Engine::count_repair_replay_from`).
+fn repair_for(engine: &Engine, collection: kimmy_core::CollectionId) -> Repair {
+    match engine.collection_by_id(collection) {
+        Ok(Some(meta)) => match engine.count_repair_replay_from(&meta) {
+            Ok(from) => Repair::Replay { from },
+            Err(_) => Repair::Snapshot,
+        },
+        _ => Repair::Snapshot,
+    }
+}
+
 #[cfg(test)]
 mod tests {
+    /// A confirmed count divergence replays from the lowest of the life's floor, its
+    /// `created` and the tombstone held for its id; a collection not held is a snapshot.
+    #[test]
+    fn a_count_repair_replays_from_the_tombstone_below_a_late_creation() {
+        use kimmy_core::{CollectionId, Hlc, NodeId, Stamp};
+        let dir = tempfile::tempdir().unwrap();
+        let engine = Engine::open(&dir.path().join("kimmy.redb")).unwrap();
+        let orders = engine.create_collection("shop", "orders").unwrap();
+        assert_eq!(super::repair_for(&engine, orders.id), Repair::Replay { from: orders.created });
+        let below = Hlc::new(orders.created.wall_ms - 10, 0);
+        engine
+            .record_database_tombstone_for_test(
+                orders.id,
+                Stamp::new(below, NodeId::from_bytes([7; 16])),
+            )
+            .unwrap();
+        assert_eq!(super::repair_for(&engine, orders.id), Repair::Replay { from: below });
+        let absent = CollectionId::derive("shop", "absent");
+        assert_eq!(super::repair_for(&engine, absent), Repair::Snapshot);
+    }
+
     /// The lag gauge's source (ADR-175's addendum): what a peer advertised,
     /// against what this node has witnessed now. It grows with the clock
     /// while the entries are missing, whatever became of the rounds that read
