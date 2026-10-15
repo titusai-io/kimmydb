@@ -4469,10 +4469,11 @@ mod digest_fold_tests {
 
     /// The count finding the gate suspended (its latest probe deferred, ADR-168) keeps
     /// `kimmy_sync_divergent_collections` lit for as long as this member takes writes; a
-    /// cut digest of the same peer and collection that compares equal clears it, through
-    /// the fold the loop runs, and plans nothing.
+    /// cut digest of the same peer and collection that compares equal quiets it, through
+    /// the fold the loop runs: the gauge clears, nothing is planned, and the cooldown of
+    /// its repair is still held.
     #[test]
-    fn a_compared_equal_digest_round_clears_the_suspended_count_finding() {
+    fn a_compared_equal_digest_round_quiets_the_suspended_count_finding() {
         let mut f = fixture();
         let (node, id) = (f.node, f.collection);
         let mismatched = kimmy_storage::DivergenceFindings {
@@ -4494,8 +4495,12 @@ mod digest_fold_tests {
 
         f.fold(f.equal());
         assert_eq!(f.tracker.confirmed_count(), 0, "the gauge is no longer lit");
-        assert!(f.tracker.reported_against(node).is_empty());
         assert!(f.tracker.confirmed_against(node).is_empty());
+        assert_eq!(
+            f.tracker.reported_against(node),
+            BTreeSet::from([id]),
+            "the cooldown of its repair is kept"
+        );
     }
 
     /// The cut an exact mismatch was compared at is kept for the repair its finding plans,
