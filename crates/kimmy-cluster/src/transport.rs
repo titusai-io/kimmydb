@@ -7460,6 +7460,7 @@ mod tests {
                 created: Some(Hlc::ZERO),
                 vector_changed: None,
                 redated_from: None,
+                incarnation_floor: None,
             }]
         } else {
             Vec::new()
