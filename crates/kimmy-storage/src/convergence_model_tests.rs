@@ -459,8 +459,8 @@ pub(crate) enum Category {
     /// Once quiet, a member has not taken everything a peer holds: its witnessed vector
     /// does not cover the peer's version vector. Replication from that peer is stuck at
     /// an entry it cannot take, so nothing the peer writes after it arrives by entries,
-    /// whether or not the state shows it yet (the review of 4a0cb5f3 found F7's stop
-    /// doing this with every member's state equal).
+    /// whether or not the state shows it yet (F7's stop once did this with every
+    /// member's state equal).
     Wedged,
 }
 
@@ -2137,7 +2137,7 @@ fn row_three_creators_with_a_drop_between() {
     );
 }
 
-/// ADR-231's re-dated life beside a concurrent create (review v3 M2): C holds A's life
+/// ADR-231's re-dated life beside a concurrent create: C holds A's life
 /// and writes after A's drop without having seen it; B creates the name after the drop.
 /// C learns the create first in one variant and the drop first in the other.
 #[test]
@@ -2181,7 +2181,7 @@ fn row_a_re_dated_life_and_a_concurrent_create() {
     row("re-dated + concurrent create", &pre, &variants, &[(ORDERS, Some(&[2, 5]))]);
 }
 
-/// PR #193 review A, minor 1: a re-dated sender whose tombstone aged out. B keeps a
+/// A re-dated sender whose tombstone aged out. B keeps a
 /// write made after A's drop, so its life is re-dated; A and B both age out (the
 /// operator rule broken, ADR-235's own premise); C still holds the life before, with a
 /// straggler of its own stamped before the drop, and takes a scoped page from B.
@@ -2252,11 +2252,11 @@ fn row_two_second_lives_one_without_the_drop() {
     );
 }
 
-/// Review v3 M1 without the siblings: B holds its own life (162) and took a cut window
+/// B holds its own life (162) and took a cut window
 /// of A's that ends after A's create and write (so not the drop); C applied A's whole
 /// window (the tombstone, no collection) and takes B's whole-database page.
 #[test]
-fn row_review_m1_a_cut_window_then_a_whole_page_to_a_member_holding_the_drop() {
+fn row_a_cut_window_then_a_whole_page_to_a_member_holding_the_drop() {
     let pre = [
         create(A, ORDERS, 136),
         write(A, ORDERS, 1, 140),
@@ -2272,14 +2272,14 @@ fn row_review_m1_a_cut_window_then_a_whole_page_to_a_member_holding_the_drop() {
         ("then pages", deliver(whole, FORWARD)),
         ("nothing more", vec![]),
     ];
-    row("review M1", &pre, &variants, &[(ORDERS, Some(&[2]))]);
+    row("cut window then whole page", &pre, &variants, &[(ORDERS, Some(&[2]))]);
 }
 
-/// Review v3 m3 without the siblings: a creation a page restores and its receiver's
+/// A creation a page restores and its receiver's
 /// clock does not follow (the sender's own coverage does not name it), then a local
 /// drop on the receiver.
 #[test]
-fn row_review_m3_a_local_drop_below_an_unwitnessed_creation() {
+fn row_a_local_drop_below_an_unwitnessed_creation() {
     let pre = [
         create(A, ORDERS, 300),
         write(A, ORDERS, 1, 301),
@@ -2289,7 +2289,7 @@ fn row_review_m3_a_local_drop_below_an_unwitnessed_creation() {
     ];
     let variants =
         vec![("then entries", deliver(pull, FORWARD)), ("then pages", deliver(whole, FORWARD))];
-    row("review m3", &pre, &variants, &[(ORDERS, None)]);
+    row("local drop below an unwitnessed creation", &pre, &variants, &[(ORDERS, None)]);
 }
 
 /// The ADR-235 case itself, through the model: the receiver holds life 1, the sender
@@ -2309,7 +2309,7 @@ fn row_the_adr_235_case_with_the_tombstone_aged_out() {
     row_on("ADR-235", &pre, &variants, &[(ORDERS, Some(&[2]))], &[Route::Pages]);
 }
 
-/// PR #193 review B, pre-existing signature 1: a write made after a drop by a member that
+/// A write made after a drop by a member that
 /// had not heard of it reaches an entries-only third member in the same window as the
 /// drop and before the recreation, finds the collection absent under a tombstone, and is
 /// set aside as history (`judge_document`); the recreation then lands without it. Pure
@@ -2325,7 +2325,7 @@ fn row_pr193b_a_write_after_a_drop_set_aside_before_the_recreation() {
     row("pr193b signature 1", &pre, &[("as found", vec![])], &[(ORDERS, Some(&[5, 7]))]);
 }
 
-/// PR #193 review B, pre-existing signature 2: a member pulls a drop and the
+/// A member pulls a drop and the
 /// recreation in one window, then a bystander's entries, before its purger has run. The
 /// window ends before the creation (ADR-189), nothing past it is witnessed, and the next
 /// round brings the creation: the collection is late, not lost.
@@ -2440,8 +2440,8 @@ fn vacuity_census() {
         row_a_re_dated_sender_whose_tombstone_aged_out,
         row_two_second_lives_after_one_drop,
         row_two_second_lives_one_without_the_drop,
-        row_review_m1_a_cut_window_then_a_whole_page_to_a_member_holding_the_drop,
-        row_review_m3_a_local_drop_below_an_unwitnessed_creation,
+        row_a_cut_window_then_a_whole_page_to_a_member_holding_the_drop,
+        row_a_local_drop_below_an_unwitnessed_creation,
         row_the_adr_235_case_with_the_tombstone_aged_out,
         finding_f1_an_ignored_drop_from_a_page_records_no_tombstone,
         finding_f3_a_drop_and_a_creation_in_one_hlc,
@@ -2716,8 +2716,7 @@ fn row_a_later_life_stop_past_retention_clears_once_every_member_collects() {
 
 /// F9. The tombstone ADR-235 records for the drop a page's floor stands for is stamped
 /// with the page's sender, not the drop's maker; when the real drop never arrives (its
-/// coverage came with a page), the two members name one drop by two stamps (PR #193
-/// review A, minor 2).
+/// coverage came with a page), the two members name one drop by two stamps.
 #[test]
 fn finding_f9_a_burial_from_a_page_names_the_sender_as_the_drops_maker() {
     finding(
