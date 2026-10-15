@@ -665,3 +665,27 @@ fn an_idle_relay_that_took_the_life_by_a_scoped_snapshot_holds_the_floor_but_can
     transfer(&o, &r);
     assert!(has(&o, 1), "a floor nothing vouched for buried a life");
 }
+
+#[test]
+fn the_pages_floor_never_lowers_the_floor_the_receivers_own_tombstone_gave() {
+    // R dropped its copy of the life itself, after S's drop and before S recreated: its own
+    // tombstone is the greater floor, and the page's lower one must not replace it.
+    let (s, _ds) = engine();
+    let (r, _dr) = engine();
+    let first = s.create_collection("shop", "orders").unwrap();
+    s.insert(&first, doc! { "_id": 1 }).unwrap();
+    transfer(&r, &s);
+    later();
+    s.drop_collection("shop", "orders").unwrap();
+    s.finish_purges_now().unwrap();
+    later();
+    r.drop_collection("shop", "orders").unwrap();
+    r.finish_purges_now().unwrap();
+    let own = r.collection_dropped_at(orders_id()).unwrap().expect("R's tombstone").hlc;
+    later();
+    s.create_collection("shop", "orders").unwrap();
+    let theirs = created_floor(&s).expect("the page carries a floor");
+    assert!(theirs < own, "premise: the page's floor is the lower one");
+    transfer_under(&r, &s, SnapshotProgress::of_collection(orders_id()));
+    assert_eq!(created_floor(&r), Some(own), "the page's lower floor replaced R's own");
+}
