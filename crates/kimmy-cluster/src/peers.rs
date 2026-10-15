@@ -598,6 +598,9 @@ pub struct ReplicationConfig {
     /// `cluster.repair_max_documents`: a collection with more live documents than this is
     /// not repaired by a document repair (counted `too_large`).
     pub repair_max_documents: u64,
+    /// `cluster.repair_max_index_documents`: a collection with more live documents than this
+    /// is not given a repaired index (counted `too_large` in the definition series).
+    pub repair_max_index_documents: u64,
 }
 
 /// Each peer's last advertised vector, kept for the replication lag gauge,
@@ -691,6 +694,7 @@ impl ReplicationConfig {
             resolver: None,
             divergence_repair: true,
             repair_max_documents: 2_000_000,
+            repair_max_index_documents: 250_000,
         }
     }
 }
@@ -767,6 +771,7 @@ pub async fn replicate(engine: Arc<Engine>, config: ReplicationConfig) {
     // What the loop guard of the document repair judges time by: the time since here.
     let loop_started = Instant::now();
     digest_state.repair_planned = config.divergence_repair;
+    definition_state.repair_planned = config.divergence_repair;
     // Addresses that answered the handshake with this node's own id (ADR-202),
     // and when: left out of the peers, and never a failed round, until
     // `config.self_recheck` has passed, when they are dialled once more, quietly
@@ -1474,6 +1479,19 @@ pub async fn replicate(engine: Arc<Engine>, config: ReplicationConfig) {
                                         &digest_confirmed,
                                     );
                                     stalls.retain_digest(node, &digest_confirmed);
+                                    // And the definition digest's: a plain index this
+                                    // member lacks is built from the peer's first page.
+                                    let definition_confirmed =
+                                        divergence.definition_confirmed_against(node);
+                                    plan_definition_repairs(
+                                        &engine,
+                                        &config,
+                                        &mut stalls,
+                                        node,
+                                        peer,
+                                        &definition_confirmed,
+                                    );
+                                    stalls.retain_definition(node, &definition_confirmed);
                                 } else {
                                     report.divergence_skips += 1;
                                 }
@@ -2106,6 +2124,68 @@ fn fold_digest_round(
     }
 }
 
+/// This member's own `CatchUp` marker and the peer's `catching_up` fact: a repair compares
+/// rows (or definitions) against a peer, and either side mid-catch-up would be repaired from
+/// or to a state that is about to change (review B m9; a restored member is marked catching
+/// up). An index built over a collection still arriving is rebuilt by every following page.
+fn either_side_is_catching_up(config: &ReplicationConfig, node: NodeId) -> bool {
+    config.catch_up.as_ref().is_some_and(|catch_up| catch_up.is_set())
+        || config.members.as_ref().is_some_and(|members| {
+            members.peer_states().get(&node) == Some(&crate::facts::PeerState::IneligibleCatchingUp)
+        })
+}
+
+/// Plan a definition repair for each definition finding confirmed against `node`: the
+/// switch, the catching-up gates and the size gate, then the planner's own.
+fn plan_definition_repairs(
+    engine: &Engine,
+    config: &ReplicationConfig,
+    stalls: &mut PeerStalls,
+    node: NodeId,
+    peer: SocketAddr,
+    confirmed: &BTreeSet<kimmy_core::CollectionId>,
+) {
+    use crate::transport::{DigestPlan, DigestRepairOutcome};
+    let catching_up = either_side_is_catching_up(config, node);
+    for collection in confirmed {
+        let finding = stalls.definition_finding_confirmed(node, *collection);
+        if finding.newly_stopped {
+            error!(
+                %peer,
+                node = %node,
+                collection = %collection,
+                "a divergence recurs after repair; repair of this collection is stopped"
+            );
+        }
+        if !config.divergence_repair {
+            stalls.definition_repair_refused(DigestRepairOutcome::Disabled);
+            continue;
+        }
+        if catching_up {
+            continue;
+        }
+        // The requester's own count (the sender's is no concern of this build), the kept O(1)
+        // figure. The apply reads it again immediately before the build: the collection can
+        // grow between here and there.
+        let live = engine.count_by_id(*collection).ok().flatten().unwrap_or(0);
+        if live > config.repair_max_index_documents {
+            stalls.definition_repair_refused(DigestRepairOutcome::TooLarge);
+            continue;
+        }
+        if stalls.plan_definition_repair(node, *collection, config.repair_max_index_documents)
+            == DigestPlan::Planned
+        {
+            warn!(
+                %peer,
+                node = %node,
+                collection = %collection,
+                "divergence confirmed; planned a definition repair from this peer on the next \
+                 round with it"
+            );
+        }
+    }
+}
+
 /// Plan a document repair for each digest finding confirmed against `node`, or count why
 /// not (repair design sections 3 and 5): the switch, the catching-up gates, the size gate,
 /// then the planner's own (a count repair, a whole-database pull, the loop guard).
@@ -2119,13 +2199,7 @@ fn plan_digest_repairs(
     confirmed: &BTreeSet<kimmy_core::CollectionId>,
 ) {
     use crate::transport::{DigestPlan, DigestRepairOutcome};
-    // This member's own marker and the peer's `catching_up` fact: a repair compares rows
-    // against a peer, and either side mid-catch-up would be repaired from or to a state
-    // that is about to change (review B m9; a restored member is marked catching up).
-    let catching_up = config.catch_up.as_ref().is_some_and(|catch_up| catch_up.is_set())
-        || config.members.as_ref().is_some_and(|members| {
-            members.peer_states().get(&node) == Some(&crate::facts::PeerState::IneligibleCatchingUp)
-        });
+    let catching_up = either_side_is_catching_up(config, node);
     for collection in confirmed {
         let finding = stalls.digest_finding_confirmed(node, *collection);
         if finding.newly_stopped {
@@ -2220,6 +2294,9 @@ struct DefinitionState {
     stuck_warned: std::collections::HashMap<(NodeId, kimmy_core::CollectionId), Instant>,
     /// WARNs raised against each peer in this tick.
     warned_this_tick: std::collections::HashMap<NodeId, usize>,
+    /// Whether a confirmed finding plans a definition repair (`cluster.divergence_repair`),
+    /// which is what the finding's WARN says.
+    repair_planned: bool,
 }
 
 impl DefinitionState {
@@ -2307,10 +2384,20 @@ fn fold_definition_round(
                 report.definition_compared += 1;
                 tracker.observe_definition(node, id, false);
                 detail.remove(&id);
+                // The first compared definition digest after a repair's end judges it.
+                if let Some(v) = stalls.judge_definition_repair(node, id, Judged::Effective, false)
+                {
+                    log_repair_verdict(node, id, v);
+                }
             }
             DefinitionOutcome::Compared { equal: false, mine, theirs, differing } => {
                 state.stuck.remove(&key);
                 report.definition_compared += 1;
+                if let Some(v) =
+                    stalls.judge_definition_repair(node, id, Judged::Ineffective, false)
+                {
+                    log_repair_verdict(node, id, v);
+                }
                 let newly = tracker.observe_definition(node, id, true);
                 detail.insert(id);
                 let confirmed = tracker.is_definition_confirmed(node, id);
@@ -2328,21 +2415,40 @@ fn fold_definition_round(
                         Ok(Some(meta)) => (meta.db, meta.name),
                         _ => ("<db>".to_string(), id.to_string()),
                     };
-                    warn!(
-                        %peer,
-                        node = %node,
-                        collection = %id,
-                        mine = format!("{mine:032x}"),
-                        theirs = format!("{theirs:032x}"),
-                        differing = ?differing.iter().map(ToString::to_string).collect::<Vec<_>>(),
-                        "the definitions of a collection differ from this peer's on two \
-                         consecutive comparisons; detect only, no repair is planned. Read \
-                         GET /v1/db/{db}/coll/{name}/indexes on both members and compare the \
-                         definition the finding names (read `expireAfterSeconds` and `unique` \
-                         before recreating anything: a shorter TTL deletes documents). A \
-                         refusal older than this member's last start leaves no counter trace, \
-                         and the refusal hints that would explain one exist only from 0.49.0"
-                    );
+                    if state.repair_planned {
+                        warn!(
+                            %peer,
+                            node = %node,
+                            collection = %id,
+                            mine = format!("{mine:032x}"),
+                            theirs = format!("{theirs:032x}"),
+                            differing = ?differing.iter().map(ToString::to_string).collect::<Vec<_>>(),
+                            "a confirmed definition divergence; a definition repair is planned. The \
+                             definitions of a collection differ from this peer's on two \
+                             consecutive comparisons. The repair builds one plain index this \
+                             member lacks and the peer holds; a unique or TTL index, a rival under \
+                             one name, and an index the peer dropped stay findings. Read \
+                             GET /v1/db/{db}/coll/{name}/indexes on both members and compare the \
+                             definition the finding names (read `expireAfterSeconds` and `unique` \
+                             before recreating anything: a shorter TTL deletes documents)"
+                        );
+                    } else {
+                        warn!(
+                            %peer,
+                            node = %node,
+                            collection = %id,
+                            mine = format!("{mine:032x}"),
+                            theirs = format!("{theirs:032x}"),
+                            differing = ?differing.iter().map(ToString::to_string).collect::<Vec<_>>(),
+                            "the definitions of a collection differ from this peer's on two \
+                             consecutive comparisons; detect only, no repair is planned. Read \
+                             GET /v1/db/{db}/coll/{name}/indexes on both members and compare the \
+                             definition the finding names (read `expireAfterSeconds` and `unique` \
+                             before recreating anything: a shorter TTL deletes documents). A \
+                             refusal older than this member's last start leaves no counter trace, \
+                             and the refusal hints that would explain one exist only from 0.49.0"
+                        );
+                    }
                 }
             }
             DefinitionOutcome::Explained { .. } => {
@@ -2350,6 +2456,12 @@ fn fold_definition_round(
                 report.definition_explained += 1;
                 tracker.observe_definition(node, id, false);
                 detail.insert(id);
+                // Explained by a refusal hint: this build refused what the repair built, so
+                // the repair is not effective. The finding un-confirms and the planner stops.
+                if let Some(v) = stalls.judge_definition_repair(node, id, Judged::Ineffective, true)
+                {
+                    log_repair_verdict(node, id, v);
+                }
             }
         }
     }

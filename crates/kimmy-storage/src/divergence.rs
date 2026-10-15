@@ -618,6 +618,10 @@ impl DivergenceTracker {
     /// Distinct collections confirmed divergent by the definition digest
     /// against at least one peer: what
     /// `kimmy_sync_definition_divergent_collections` reports.
+    pub fn definition_confirmed_against(&self, peer: NodeId) -> BTreeSet<CollectionId> {
+        self.definition_confirmed.get(&peer).cloned().unwrap_or_default()
+    }
+
     pub fn definition_confirmed_count(&self) -> usize {
         self.definition_confirmed.values().flatten().collect::<BTreeSet<_>>().len()
     }

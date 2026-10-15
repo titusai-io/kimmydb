@@ -488,6 +488,12 @@ pub struct MetricsSnapshot {
     pub sync_digest_repair_stopped_collections: u64,
     /// 1 when `cluster.divergence_repair` is on.
     pub sync_divergence_repair_enabled: u64,
+    /// Definition repairs by outcome (`DigestRepairOutcome::DEFINITION` are the labels used),
+    /// the loop guard's judgements of them (`DefinitionJudgement::ALL`) and what their pages
+    /// did with indexes (`kimmy_storage::DEFINITION_RESULTS`).
+    pub sync_definition_repairs: [u64; kimmy_cluster::DigestRepairOutcome::ALL.len()],
+    pub sync_definition_repair_judgements: [u64; kimmy_cluster::DefinitionJudgement::ALL.len()],
+    pub sync_definition_repair_indexes: [u64; kimmy_storage::DEFINITION_RESULTS.len()],
     /// Collections the definition digest currently has confirmed (B3 half 2):
     /// also counted in `sync_divergent_collections`, which this attributes.
     pub sync_definition_divergent_collections: u64,
@@ -626,6 +632,9 @@ pub struct Metrics {
     sync_digest_repair_rows: [AtomicU64; kimmy_cluster::RowResult::ALL.len()],
     sync_digest_repair_stopped_collections: AtomicU64,
     sync_divergence_repair_enabled: AtomicU64,
+    sync_definition_repairs: [AtomicU64; kimmy_cluster::DigestRepairOutcome::ALL.len()],
+    sync_definition_repair_judgements: [AtomicU64; kimmy_cluster::DefinitionJudgement::ALL.len()],
+    sync_definition_repair_indexes: [AtomicU64; kimmy_storage::DEFINITION_RESULTS.len()],
     /// The definition digest's (B3 half 2): a level, and counters, on the same
     /// terms.
     sync_definition_divergent_collections: AtomicU64,
@@ -760,6 +769,9 @@ impl Default for Metrics {
             sync_digest_repair_rows: std::array::from_fn(|_| AtomicU64::new(0)),
             sync_digest_repair_stopped_collections: AtomicU64::new(0),
             sync_divergence_repair_enabled: AtomicU64::new(0),
+            sync_definition_repairs: std::array::from_fn(|_| AtomicU64::new(0)),
+            sync_definition_repair_judgements: std::array::from_fn(|_| AtomicU64::new(0)),
+            sync_definition_repair_indexes: std::array::from_fn(|_| AtomicU64::new(0)),
             sync_definition_divergent_collections: AtomicU64::new(0),
             sync_definition_compared: AtomicU64::new(0),
             sync_definition_explained: AtomicU64::new(0),
@@ -1018,6 +1030,19 @@ impl Metrics {
             .store(round.digest_repair_stopped as u64, Ordering::Relaxed);
         self.sync_divergence_repair_enabled
             .store(u64::from(round.repair_enabled), Ordering::Relaxed);
+        for (slot, n) in self.sync_definition_repairs.iter().zip(round.repair.definition_repairs) {
+            slot.fetch_add(n as u64, Ordering::Relaxed);
+        }
+        for (slot, n) in
+            self.sync_definition_repair_judgements.iter().zip(round.repair.definition_judgements)
+        {
+            slot.fetch_add(n as u64, Ordering::Relaxed);
+        }
+        for (slot, n) in
+            self.sync_definition_repair_indexes.iter().zip(round.repair.definition_indexes)
+        {
+            slot.fetch_add(n as u64, Ordering::Relaxed);
+        }
         self.sync_definition_divergent_collections
             .store(round.definition_divergent_collections as u64, Ordering::Relaxed);
         self.sync_definition_compared
@@ -1456,6 +1481,15 @@ impl Metrics {
             sync_digest_repair_stopped_collections: self
                 .get(&self.sync_digest_repair_stopped_collections),
             sync_divergence_repair_enabled: self.get(&self.sync_divergence_repair_enabled),
+            sync_definition_repairs: std::array::from_fn(|slot| {
+                self.get(&self.sync_definition_repairs[slot])
+            }),
+            sync_definition_repair_judgements: std::array::from_fn(|slot| {
+                self.get(&self.sync_definition_repair_judgements[slot])
+            }),
+            sync_definition_repair_indexes: std::array::from_fn(|slot| {
+                self.get(&self.sync_definition_repair_indexes[slot])
+            }),
             sync_definition_divergent_collections: self
                 .get(&self.sync_definition_divergent_collections),
             sync_definition_compared: self.get(&self.sync_definition_compared),
@@ -1866,6 +1900,15 @@ impl Metrics {
              # HELP kimmy_sync_divergence_repair_enabled 1 when cluster.divergence_repair is on, 0 when this member only detects.\n\
              # TYPE kimmy_sync_divergence_repair_enabled gauge\n\
              kimmy_sync_divergence_repair_enabled {sync_divergence_repair_enabled}\n\
+             # HELP kimmy_sync_definition_repairs_total Definition repairs of a confirmed definition finding, by outcome: the end of a repair, or the gate that refused to plan one. applied: the repair pulled the first page of the peer's snapshot of the collection and applied it; whether it worked is judged at the next compared definition digest (kimmy_sync_definition_repair_judgements_total), and what it did with each index is in kimmy_sync_definition_repair_indexes_total. too_large: the collection holds more live documents than cluster.repair_max_index_documents. abandoned: three rounds in a row applied nothing. transient: a peer error, a stop, a drop, a whole-database pull taking the peer over, or a cancellation. disabled: cluster.divergence_repair is off.\n\
+             # TYPE kimmy_sync_definition_repairs_total counter\n\
+             {sync_definition_repairs_lines}\
+             # HELP kimmy_sync_definition_repair_judgements_total What the loop guard made of a definition repair, at the first compared definition digest after it ended. effective: the digests matched. ineffective: they differed. explained: this build refused a definition the repair applied, so a refusal hint covers the difference; not effective, and the finding stops being repaired. unjudged: no compared definition digest arrived within the deadline.\n\
+             # TYPE kimmy_sync_definition_repair_judgements_total counter\n\
+             {sync_definition_repair_judgements_lines}\
+             # HELP kimmy_sync_definition_repair_indexes_total What a definition repair did with the indexes of the page it applied, by result. built: a plain index this member lacked was built. refused: this build cannot apply the definition (also counted in kimmy_sync_ddl_refused_total). rival: the name is held here under a different definition. unique, ttl: not built, because building a unique index can refuse documents and a TTL index deletes them. history: the index belongs to a life this member buried. tombstoned: this member dropped the index after it was made. ambiguous: the index is at or below the collected-through horizon, so a drop this member made may have been collected. gone: the collection is gone here. too_large: the collection holds more live documents than cluster.repair_max_index_documents.\n\
+             # TYPE kimmy_sync_definition_repair_indexes_total counter\n\
+             {sync_definition_repair_indexes_lines}\
              # HELP kimmy_sync_definition_divergent_collections Collections the definition digest currently finds disagreeing with a peer: the two members hold different index or vector definitions for them, seen on two compared checks running. Also counted in kimmy_sync_divergent_collections, which this attributes. Detect only: nothing is repaired from it. Read the indexes of the collection on both members (GET /v1/db/{{db}}/coll/{{coll}}/indexes) and compare the definition the WARN names, including expireAfterSeconds and unique, before recreating anything (operations.md, The definition digest).\n\
              # TYPE kimmy_sync_definition_divergent_collections gauge\n\
              kimmy_sync_definition_divergent_collections {sync_definition_divergent}\n\
@@ -2057,6 +2100,36 @@ impl Metrics {
                 .collect::<String>(),
             sync_digest_repair_stopped = self.get(&self.sync_digest_repair_stopped_collections),
             sync_divergence_repair_enabled = self.get(&self.sync_divergence_repair_enabled),
+            sync_definition_repairs_lines = kimmy_cluster::DigestRepairOutcome::DEFINITION
+                .iter()
+                .map(|outcome| {
+                    format!(
+                        "kimmy_sync_definition_repairs_total{{outcome=\"{}\"}} {}\n",
+                        outcome.label(),
+                        self.get(&self.sync_definition_repairs[outcome.index()])
+                    )
+                })
+                .collect::<String>(),
+            sync_definition_repair_judgements_lines = kimmy_cluster::DefinitionJudgement::ALL
+                .iter()
+                .map(|result| {
+                    format!(
+                        "kimmy_sync_definition_repair_judgements_total{{result=\"{}\"}} {}\n",
+                        result.label(),
+                        self.get(&self.sync_definition_repair_judgements[result.index()])
+                    )
+                })
+                .collect::<String>(),
+            sync_definition_repair_indexes_lines = kimmy_storage::DEFINITION_RESULTS
+                .iter()
+                .enumerate()
+                .map(|(slot, label)| {
+                    format!(
+                        "kimmy_sync_definition_repair_indexes_total{{result=\"{label}\"}} {}\n",
+                        self.get(&self.sync_definition_repair_indexes[slot])
+                    )
+                })
+                .collect::<String>(),
             sync_definition_divergent = self.get(&self.sync_definition_divergent_collections),
             sync_definition_compared = self.get(&self.sync_definition_compared),
             sync_definition_explained = self.get(&self.sync_definition_explained),
@@ -2785,6 +2858,9 @@ mod tests {
                 digest_repairs: [201, 202, 203, 204, 205, 206],
                 digest_judgements: [211, 212, 213, 214],
                 digest_rows: [221, 222, 223, 224, 225],
+                definition_repairs: [231, 232, 233, 234, 235, 236],
+                definition_judgements: [241, 242, 243, 244],
+                definition_indexes: [251, 252, 253, 254, 255, 256, 257, 258, 259, 260],
             },
             digest_repair_stopped: 31,
             repair_enabled: false,
@@ -2828,6 +2904,9 @@ mod tests {
                 digest_repairs: [1, 2, 3, 4, 5, 6],
                 digest_judgements: [11, 12, 13, 14],
                 digest_rows: [21, 22, 23, 24, 25],
+                definition_repairs: [31, 32, 33, 34, 35, 36],
+                definition_judgements: [41, 42, 43, 44],
+                definition_indexes: [51, 52, 53, 54, 55, 56, 57, 58, 59, 60],
             },
             digest_repair_stopped: 32,
             repair_enabled: true,
@@ -3704,6 +3783,31 @@ kimmy_sync_digest_repair_stopped_collections 32
 # HELP kimmy_sync_divergence_repair_enabled 1 when cluster.divergence_repair is on, 0 when this member only detects.
 # TYPE kimmy_sync_divergence_repair_enabled gauge
 kimmy_sync_divergence_repair_enabled 1
+# HELP kimmy_sync_definition_repairs_total Definition repairs of a confirmed definition finding, by outcome: the end of a repair, or the gate that refused to plan one. applied: the repair pulled the first page of the peer's snapshot of the collection and applied it; whether it worked is judged at the next compared definition digest (kimmy_sync_definition_repair_judgements_total), and what it did with each index is in kimmy_sync_definition_repair_indexes_total. too_large: the collection holds more live documents than cluster.repair_max_index_documents. abandoned: three rounds in a row applied nothing. transient: a peer error, a stop, a drop, a whole-database pull taking the peer over, or a cancellation. disabled: cluster.divergence_repair is off.
+# TYPE kimmy_sync_definition_repairs_total counter
+kimmy_sync_definition_repairs_total{outcome=\"applied\"} 262
+kimmy_sync_definition_repairs_total{outcome=\"too_large\"} 264
+kimmy_sync_definition_repairs_total{outcome=\"abandoned\"} 266
+kimmy_sync_definition_repairs_total{outcome=\"transient\"} 268
+kimmy_sync_definition_repairs_total{outcome=\"disabled\"} 272
+# HELP kimmy_sync_definition_repair_judgements_total What the loop guard made of a definition repair, at the first compared definition digest after it ended. effective: the digests matched. ineffective: they differed. explained: this build refused a definition the repair applied, so a refusal hint covers the difference; not effective, and the finding stops being repaired. unjudged: no compared definition digest arrived within the deadline.
+# TYPE kimmy_sync_definition_repair_judgements_total counter
+kimmy_sync_definition_repair_judgements_total{result=\"effective\"} 282
+kimmy_sync_definition_repair_judgements_total{result=\"ineffective\"} 284
+kimmy_sync_definition_repair_judgements_total{result=\"explained\"} 286
+kimmy_sync_definition_repair_judgements_total{result=\"unjudged\"} 288
+# HELP kimmy_sync_definition_repair_indexes_total What a definition repair did with the indexes of the page it applied, by result. built: a plain index this member lacked was built. refused: this build cannot apply the definition (also counted in kimmy_sync_ddl_refused_total). rival: the name is held here under a different definition. unique, ttl: not built, because building a unique index can refuse documents and a TTL index deletes them. history: the index belongs to a life this member buried. tombstoned: this member dropped the index after it was made. ambiguous: the index is at or below the collected-through horizon, so a drop this member made may have been collected. gone: the collection is gone here. too_large: the collection holds more live documents than cluster.repair_max_index_documents.
+# TYPE kimmy_sync_definition_repair_indexes_total counter
+kimmy_sync_definition_repair_indexes_total{result=\"built\"} 302
+kimmy_sync_definition_repair_indexes_total{result=\"refused\"} 304
+kimmy_sync_definition_repair_indexes_total{result=\"rival\"} 306
+kimmy_sync_definition_repair_indexes_total{result=\"unique\"} 308
+kimmy_sync_definition_repair_indexes_total{result=\"ttl\"} 310
+kimmy_sync_definition_repair_indexes_total{result=\"history\"} 312
+kimmy_sync_definition_repair_indexes_total{result=\"tombstoned\"} 314
+kimmy_sync_definition_repair_indexes_total{result=\"ambiguous\"} 316
+kimmy_sync_definition_repair_indexes_total{result=\"gone\"} 318
+kimmy_sync_definition_repair_indexes_total{result=\"too_large\"} 320
 # HELP kimmy_sync_definition_divergent_collections Collections the definition digest currently finds disagreeing with a peer: the two members hold different index or vector definitions for them, seen on two compared checks running. Also counted in kimmy_sync_divergent_collections, which this attributes. Detect only: nothing is repaired from it. Read the indexes of the collection on both members (GET /v1/db/{db}/coll/{coll}/indexes) and compare the definition the WARN names, including expireAfterSeconds and unique, before recreating anything (operations.md, The definition digest).
 # TYPE kimmy_sync_definition_divergent_collections gauge
 kimmy_sync_definition_divergent_collections 5
@@ -4342,6 +4446,26 @@ kimmy_storage_cache_reads_total{result=\"miss\"} 9104
             "kimmy_sync_divergence_repair_enabled {}\n",
             s.sync_divergence_repair_enabled
         ));
+        for outcome in kimmy_cluster::DigestRepairOutcome::DEFINITION {
+            expect(&format!(
+                "kimmy_sync_definition_repairs_total{{outcome=\"{}\"}} {}\n",
+                outcome.label(),
+                s.sync_definition_repairs[outcome.index()]
+            ));
+        }
+        for result in kimmy_cluster::DefinitionJudgement::ALL {
+            expect(&format!(
+                "kimmy_sync_definition_repair_judgements_total{{result=\"{}\"}} {}\n",
+                result.label(),
+                s.sync_definition_repair_judgements[result.index()]
+            ));
+        }
+        for (slot, label) in kimmy_storage::DEFINITION_RESULTS.iter().enumerate() {
+            expect(&format!(
+                "kimmy_sync_definition_repair_indexes_total{{result=\"{label}\"}} {}\n",
+                s.sync_definition_repair_indexes[slot]
+            ));
+        }
         expect(&format!(
             "kimmy_sync_divergence_check_age_seconds {}\n",
             s.sync_divergence_check_age_secs
@@ -4759,7 +4883,11 @@ kimmy_storage_cache_reads_total{result=\"miss\"} 9104
                 + kimmy_cluster::Judgement::ALL.len()
                 + kimmy_cluster::RowResult::ALL.len()
                 + 1
-                + 1,
+                + 1
+                // And the definition repair's: outcomes, judgements and index results.
+                + kimmy_cluster::DigestRepairOutcome::DEFINITION.len()
+                + kimmy_cluster::DefinitionJudgement::ALL.len()
+                + kimmy_storage::DEFINITION_RESULTS.len(),
             "expected one sample per series: {out}"
         );
     }

@@ -2192,7 +2192,7 @@ where
         (behind, Some((_, Repair::Replay { from: floor }))) => {
             Some(behind.map_or(floor, |behind| behind.min(floor)))
         }
-        (behind, Some((_, Repair::Snapshot | Repair::Converge))) => {
+        (behind, Some((_, Repair::Snapshot | Repair::Converge | Repair::Definitions))) => {
             Some(behind.unwrap_or(Hlc::ZERO))
         }
         (_, None) => entries_threshold(&mine, &theirs, &marked),
@@ -2262,7 +2262,10 @@ where
     // window: a snapshot is not asked for here, and its pages are not a pull.
     let asked = std::time::Instant::now();
     let mut answer = match repair {
-        Some((collection, snapshot @ (Repair::Snapshot | Repair::Converge))) => {
+        Some((
+            collection,
+            snapshot @ (Repair::Snapshot | Repair::Converge | Repair::Definitions),
+        )) => {
             if stalls.snapshot_resumes(their_node, Some(collection), snapshot.policy()) {
                 info!(
                     %peer,
@@ -2276,6 +2279,14 @@ where
                     collection = %collection,
                     "repairing: pulling the peer's snapshot of a collection this node holds a \
                      confirmed digest divergence in, to apply rows over rows it already holds"
+                );
+            } else if snapshot == Repair::Definitions {
+                warn!(
+                    %peer,
+                    collection = %collection,
+                    "repairing: pulling the first page of the peer's snapshot of a collection \
+                     this node holds a confirmed definition divergence in, to build an index it \
+                     lacks"
                 );
             } else {
                 warn!(
@@ -2601,7 +2612,9 @@ where
         // round with this peer goes on from there.
         Message::BeyondHorizon {} => {
             let scope = match repair {
-                Some((collection, Repair::Snapshot | Repair::Converge)) => Some(collection),
+                Some((collection, Repair::Snapshot | Repair::Converge | Repair::Definitions)) => {
+                    Some(collection)
+                }
                 _ => None,
             };
             let policy = repair.map_or(kimmy_storage::SnapshotPolicy::All, |(_, r)| r.policy());
@@ -3205,6 +3218,11 @@ pub enum Repair {
     /// finding. It restores no definition, drops nothing, plans no shadow
     /// repair, and never persists, resumes or forgets a stored cursor.
     Converge,
+    /// Pull the first page of the peer's scoped snapshot of the collection under
+    /// [`kimmy_storage::SnapshotPolicy::Definitions`]: of it, build at most one plain
+    /// index this member lacks. The repair of a confirmed definition finding. The pull
+    /// ends after its one page; no document is applied.
+    Definitions,
 }
 
 /// What a repair is for, which keys the planner: the count half's repairs and the
@@ -3216,6 +3234,19 @@ pub enum RepairKind {
     Count,
     /// A confirmed cut-digest finding: a `Converge` pull.
     Digest,
+    /// A confirmed definition finding: a `Definitions` pull.
+    Definition,
+}
+
+impl RepairKind {
+    /// The loop guard's kind for a repair that has one (the count half has none).
+    fn ledger(self) -> Option<LedgerKind> {
+        match self {
+            RepairKind::Count => None,
+            RepairKind::Digest => Some(LedgerKind::Digest),
+            RepairKind::Definition => Some(LedgerKind::Definition),
+        }
+    }
 }
 
 impl Repair {
@@ -3224,6 +3255,7 @@ impl Repair {
         match self {
             Repair::Replay { .. } | Repair::Snapshot => RepairKind::Count,
             Repair::Converge => RepairKind::Digest,
+            Repair::Definitions => RepairKind::Definition,
         }
     }
 
@@ -3231,6 +3263,7 @@ impl Repair {
     fn policy(self) -> kimmy_storage::SnapshotPolicy {
         match self {
             Repair::Converge => kimmy_storage::SnapshotPolicy::Converge,
+            Repair::Definitions => kimmy_storage::SnapshotPolicy::Definitions,
             Repair::Replay { .. } | Repair::Snapshot => kimmy_storage::SnapshotPolicy::All,
         }
     }
@@ -3265,6 +3298,11 @@ impl DigestRepairOutcome {
         Self::SkippedCountRepair,
         Self::Disabled,
     ];
+
+    /// The outcomes of a definition repair: the document repair's, without the one about a
+    /// count repair of the collection.
+    pub const DEFINITION: [Self; 5] =
+        [Self::Applied, Self::TooLarge, Self::Abandoned, Self::Transient, Self::Disabled];
 
     pub const fn label(self) -> &'static str {
         match self {
@@ -3353,6 +3391,12 @@ pub struct RepairCounts {
     pub digest_repairs: [usize; DigestRepairOutcome::ALL.len()],
     pub digest_judgements: [usize; Judgement::ALL.len()],
     pub digest_rows: [usize; RowResult::ALL.len()],
+    /// The definition repair's ends and plan gates (`DigestRepairOutcome`, with
+    /// `skipped_count_repair` never used).
+    pub definition_repairs: [usize; DigestRepairOutcome::ALL.len()],
+    pub definition_judgements: [usize; DefinitionJudgement::ALL.len()],
+    /// What the repair's pages did with their indexes (`kimmy_storage::DEFINITION_RESULTS`).
+    pub definition_indexes: [usize; kimmy_storage::DEFINITION_RESULTS.len()],
 }
 
 impl RepairCounts {
@@ -3366,6 +3410,46 @@ impl RepairCounts {
         for (a, b) in self.digest_rows.iter_mut().zip(other.digest_rows) {
             *a += b;
         }
+        for (a, b) in self.definition_repairs.iter_mut().zip(other.definition_repairs) {
+            *a += b;
+        }
+        for (a, b) in self.definition_judgements.iter_mut().zip(other.definition_judgements) {
+            *a += b;
+        }
+        for (a, b) in self.definition_indexes.iter_mut().zip(other.definition_indexes) {
+            *a += b;
+        }
+    }
+}
+
+/// What the loop guard made of a definition repair at its compared definition digest: the
+/// `result` label of `kimmy_sync_definition_repair_judgements_total`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DefinitionJudgement {
+    Effective,
+    Ineffective,
+    /// The comparison came back explained by a refusal hint: the repair was refused by this
+    /// build. Not effective; the finding un-confirms and the planner stops.
+    Explained,
+    /// No compared definition digest arrived within the deadline.
+    Unjudged,
+}
+
+impl DefinitionJudgement {
+    pub const ALL: [Self; 4] =
+        [Self::Effective, Self::Ineffective, Self::Explained, Self::Unjudged];
+
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Effective => "effective",
+            Self::Ineffective => "ineffective",
+            Self::Explained => "explained",
+            Self::Unjudged => "unjudged",
+        }
+    }
+
+    pub const fn index(self) -> usize {
+        self as usize
     }
 }
 
@@ -3382,6 +3466,8 @@ pub struct Tally {
     /// the repair.
     pub applied_at_cut: usize,
     pub created_at_cut: usize,
+    /// For a definition repair: the indexes it built (R3's progress for the kind).
+    pub built: usize,
 }
 
 impl Tally {
@@ -3417,6 +3503,10 @@ struct Repairs {
     /// active: what its pages' rows are counted against for progress.
     cuts: BTreeMap<CollectionId, VersionVector>,
     active_cut: VersionVector,
+    /// The size gate of each queued definition repair, and of the one active
+    /// (`cluster.repair_max_index_documents`).
+    limits: BTreeMap<CollectionId, u64>,
+    active_limit: u64,
     /// The repair in progress, and the collection it is for.
     active: Option<(CollectionId, Repair)>,
     /// Consecutive rounds the repair in progress has been handed out for
@@ -3855,16 +3945,14 @@ impl PeerStalls {
         // A digest repair is not planned beside a count repair of the collection, queued,
         // active or cooling: the replay lands what a digest repair would for the ids it
         // holds. (A count repair is not refused beside a digest one.)
-        if kind == RepairKind::Digest {
-            if self.count_repair_pending(peer, collection) {
-                return false;
-            }
-            // And not for a peer with a whole-database pull pending: the in-memory
-            // progress holds one entry per peer, and the two would reset each other
-            // every round.
-            if self.whole_database_pending(peer) {
-                return false;
-            }
+        if kind == RepairKind::Digest && self.count_repair_pending(peer, collection) {
+            return false;
+        }
+        // And not for a peer with a whole-database pull pending: the in-memory
+        // progress holds one entry per peer, and the two would reset each other
+        // every round.
+        if kind != RepairKind::Count && self.whole_database_pending(peer) {
+            return false;
         }
         let repairs = self.repairs.entry(peer).or_default();
         if repairs.done.contains_key(&(collection, kind))
@@ -3959,6 +4047,80 @@ impl PeerStalls {
         DigestPlan::Planned
     }
 
+    /// Plan a definition repair of `collection` against `peer` for a confirmed definition
+    /// finding, or say why not. Independent of a count repair for the collection (it changes
+    /// no document); not for a peer with a whole-database pull pending; held by the loop
+    /// guard. `limit` is `cluster.repair_max_index_documents`.
+    pub fn plan_definition_repair(
+        &mut self,
+        peer: NodeId,
+        collection: CollectionId,
+        limit: u64,
+    ) -> DigestPlan {
+        if self.whole_database_pending(peer) {
+            return DigestPlan::WholeDatabasePending;
+        }
+        let key = LedgerKey { peer, collection, kind: LedgerKind::Definition };
+        match self.ledger.may_plan(key, self.repair_clock) {
+            MayPlan::Yes => {}
+            held => return DigestPlan::Held(held),
+        }
+        if !self.plan_repair(peer, collection, Repair::Definitions) {
+            return DigestPlan::Duplicate;
+        }
+        self.ledger.started(key, self.repair_clock);
+        if let Some(repairs) = self.repairs.get_mut(&peer) {
+            repairs.limits.insert(collection, limit);
+        }
+        DigestPlan::Planned
+    }
+
+    /// A definition plan gate refused a repair (`too_large`, `disabled`).
+    pub fn definition_repair_refused(&mut self, why: DigestRepairOutcome) {
+        self.repair_counts.definition_repairs[why.index()] += 1;
+    }
+
+    /// A definition finding against `peer` for `collection` is confirmed, as at every contact
+    /// it stands (R4).
+    pub fn definition_finding_confirmed(
+        &mut self,
+        peer: NodeId,
+        collection: CollectionId,
+    ) -> Confirmed {
+        let key = LedgerKey { peer, collection, kind: LedgerKind::Definition };
+        self.ledger.confirmed(key, self.repair_clock)
+    }
+
+    /// The first compared definition digest after a repair's end said `judged`; `explained`
+    /// when the comparison was explained by a refusal hint (not effective).
+    pub fn judge_definition_repair(
+        &mut self,
+        peer: NodeId,
+        collection: CollectionId,
+        judged: Judged,
+        explained: bool,
+    ) -> Option<Verdict> {
+        let key = LedgerKey { peer, collection, kind: LedgerKind::Definition };
+        let verdict = self.ledger.judge(key, self.repair_clock, judged)?;
+        let result = match (judged, explained) {
+            (_, true) => DefinitionJudgement::Explained,
+            (Judged::Effective, false) => DefinitionJudgement::Effective,
+            (Judged::Ineffective, false) => DefinitionJudgement::Ineffective,
+        };
+        self.repair_counts.definition_judgements[result.index()] += 1;
+        Some(verdict)
+    }
+
+    /// Forget definition repairs done against `peer` for collections the definition digest
+    /// no longer reports against it.
+    pub fn retain_definition(&mut self, peer: NodeId, still_reported: &BTreeSet<CollectionId>) {
+        if let Some(repairs) = self.repairs.get_mut(&peer) {
+            repairs.done.retain(|(collection, kind), _| {
+                *kind != RepairKind::Definition || still_reported.contains(collection)
+            });
+        }
+    }
+
     /// A plan gate refused a document repair: counted where it is refused, not at a pull's
     /// end (`too_large`, `disabled`).
     pub fn digest_repair_refused(&mut self, why: DigestRepairOutcome) {
@@ -3987,8 +4149,14 @@ impl PeerStalls {
     pub fn expire_repairs(&mut self) -> Vec<(LedgerKey, Verdict)> {
         let expired = self.ledger.expire(self.repair_clock);
         for (key, _) in &expired {
-            if key.kind == LedgerKind::Digest {
-                self.repair_counts.digest_judgements[Judgement::Unjudged.index()] += 1;
+            match key.kind {
+                LedgerKind::Digest => {
+                    self.repair_counts.digest_judgements[Judgement::Unjudged.index()] += 1;
+                }
+                LedgerKind::Definition => {
+                    self.repair_counts.definition_judgements
+                        [DefinitionJudgement::Unjudged.index()] += 1;
+                }
             }
         }
         expired
@@ -4013,9 +4181,41 @@ impl PeerStalls {
         end: End,
         outcome: DigestRepairOutcome,
     ) {
-        self.repair_counts.digest_repairs[outcome.index()] += 1;
-        let key = LedgerKey { peer, collection, kind: LedgerKind::Digest };
+        self.repair_ended_as(peer, collection, RepairKind::Digest, end, outcome);
+    }
+
+    /// A repair with a ledger entry ended as `end`, counted in its kind's series.
+    fn repair_ended_as(
+        &mut self,
+        peer: NodeId,
+        collection: CollectionId,
+        kind: RepairKind,
+        end: End,
+        outcome: DigestRepairOutcome,
+    ) {
+        let Some(ledger_kind) = kind.ledger() else {
+            return;
+        };
+        match ledger_kind {
+            LedgerKind::Digest => self.repair_counts.digest_repairs[outcome.index()] += 1,
+            LedgerKind::Definition => {
+                self.repair_counts.definition_repairs[outcome.index()] += 1;
+            }
+        }
+        let key = LedgerKey { peer, collection, kind: ledger_kind };
         self.ledger.ended(key, self.repair_clock, end);
+    }
+
+    /// A definition repair's page applied: the indexes it built and skipped are counted, and
+    /// a build is the repair's progress.
+    fn definitions_page_applied(&mut self, peer: NodeId, applied: &kimmy_storage::SnapshotApplied) {
+        let counts = applied.definitions.counts();
+        for (slot, n) in self.repair_counts.definition_indexes.iter_mut().zip(counts) {
+            *slot += n;
+        }
+        if let Some(repairs) = self.repairs.get_mut(&peer) {
+            repairs.tally.built += applied.definitions.built;
+        }
     }
 
     /// A document repair's page applied: what it wrote is added to the repair's tally and
@@ -4029,6 +4229,7 @@ impl PeerStalls {
             superseded: applied.superseded,
             applied_at_cut: applied.applied_at_cut,
             created_at_cut: applied.created_at_cut,
+            built: 0,
         };
         let rows = &mut self.repair_counts.digest_rows;
         rows[RowResult::Applied.index()] += page.applied;
@@ -4055,8 +4256,8 @@ impl PeerStalls {
     /// [`REPAIR_ATTEMPTS`] rounds that did not advance it.
     pub fn repair_due(&mut self, peer: NodeId) -> Option<(CollectionId, Repair)> {
         let repairs = self.repairs.get_mut(&peer)?;
-        // Document repairs this call ends, for the loop guard.
-        let mut ended: Vec<CollectionId> = Vec::new();
+        // Repairs with a ledger entry that this call ends, for the loop guard.
+        let mut ended: Vec<(CollectionId, RepairKind)> = Vec::new();
         // Once per contact, not once per pull: a draining tick asks this
         // several times, and the cooldown below is a constant argued in
         // minutes (ADR-157). The stall accounting under it stays per pull,
@@ -4091,8 +4292,8 @@ impl PeerStalls {
                      divergence check reports the collection again or the cooldown passes"
                 );
                 repairs.done.insert((collection, abandoned.kind()), 0);
-                if abandoned.kind() == RepairKind::Digest {
-                    ended.push(collection);
+                if abandoned.kind() != RepairKind::Count {
+                    ended.push((collection, abandoned.kind()));
                 }
                 repairs.stalled = 0;
                 repairs.advanced = false;
@@ -4115,7 +4316,7 @@ impl PeerStalls {
                 .queued
                 .keys()
                 .copied()
-                .find(|(_, kind)| !(whole_pending && *kind == RepairKind::Digest));
+                .find(|(_, kind)| !(whole_pending && *kind != RepairKind::Count));
             repairs.active =
                 next.and_then(|key| repairs.queued.remove(&key).map(|repair| (key.0, repair)));
             repairs.stalled = 0;
@@ -4127,12 +4328,19 @@ impl PeerStalls {
                 }
                 _ => VersionVector::default(),
             };
+            repairs.active_limit = match repairs.active {
+                Some((collection, Repair::Definitions)) => {
+                    repairs.limits.remove(&collection).unwrap_or(0)
+                }
+                _ => 0,
+            };
         }
         let active = repairs.active;
-        for collection in ended {
-            self.digest_ended(
+        for (collection, kind) in ended {
+            self.repair_ended_as(
                 peer,
                 collection,
+                kind,
                 End::Transient(Transient::Abandoned),
                 DigestRepairOutcome::Abandoned,
             );
@@ -4163,9 +4371,13 @@ impl PeerStalls {
         policy: kimmy_storage::SnapshotPolicy,
     ) -> &mut SnapshotProgress {
         let cut = self.repairs.get(&peer).map(|r| r.active_cut.clone()).unwrap_or_default();
+        let limit = self.repairs.get(&peer).map_or(0, |r| r.active_limit);
         let fresh = || match (scope, policy) {
             (Some(id), kimmy_storage::SnapshotPolicy::Converge) => {
                 SnapshotProgress::of_collection_converging(id, cut.clone())
+            }
+            (Some(id), kimmy_storage::SnapshotPolicy::Definitions) => {
+                SnapshotProgress::of_collection_definitions(id, limit)
             }
             (Some(id), _) => SnapshotProgress::of_collection(id),
             (None, _) => SnapshotProgress::whole_database(),
@@ -4184,7 +4396,10 @@ impl PeerStalls {
     /// exactly as a replay's does when its window moves (ADR-152).
     fn snapshot_advanced(&mut self, peer: NodeId) {
         if let Some(repairs) = self.repairs.get_mut(&peer)
-            && matches!(repairs.active, Some((_, Repair::Snapshot | Repair::Converge)))
+            && matches!(
+                repairs.active,
+                Some((_, Repair::Snapshot | Repair::Converge | Repair::Definitions))
+            )
         {
             repairs.advanced = true;
         }
@@ -4227,32 +4442,36 @@ impl PeerStalls {
         // get a round and reset the whole-database cursor to page one, so with k queued
         // the catch-up would restart k times. They are re-planned when the finding is
         // reported again, after the pull.
-        let mut ended: Vec<CollectionId> = repairs
+        let mut ended: Vec<(CollectionId, RepairKind)> = repairs
             .queued
             .keys()
-            .filter(|(_, kind)| *kind == RepairKind::Digest)
-            .map(|(collection, _)| *collection)
+            .filter(|(_, kind)| *kind != RepairKind::Count)
+            .map(|(collection, kind)| (*collection, *kind))
             .collect();
-        repairs.queued.retain(|(_, kind), _| *kind != RepairKind::Digest);
+        repairs.queued.retain(|(_, kind), _| *kind == RepairKind::Count);
         repairs.cuts.clear();
-        if let Some((collection, Repair::Converge)) = repairs.active {
+        repairs.limits.clear();
+        if let Some((collection, active @ (Repair::Converge | Repair::Definitions))) =
+            repairs.active
+        {
             repairs.active = None;
-            repairs.done.insert((collection, RepairKind::Digest), 0);
+            repairs.done.insert((collection, active.kind()), 0);
             repairs.stalled = 0;
             repairs.advanced = false;
-            ended.push(collection);
+            ended.push((collection, active.kind()));
             warn!(
                 node = %peer,
                 collection = %collection,
-                "a whole-database pull from this peer takes over; the converge repair against it \
-                 is abandoned until the divergence check reports the collection again or the \
+                "a whole-database pull from this peer takes over; the repair against it is \
+                 abandoned until the divergence check reports the collection again or the \
                  cooldown passes"
             );
         }
-        for collection in ended {
-            self.digest_ended(
+        for (collection, kind) in ended {
+            self.repair_ended_as(
                 peer,
                 collection,
+                kind,
                 End::Transient(Transient::WholeDatabaseTookOver),
                 DigestRepairOutcome::Transient,
             );
@@ -4274,28 +4493,30 @@ impl PeerStalls {
     /// returning how many. One under way finishes as it would: its page has
     /// already been judged.
     fn repairs_cancelled(&mut self, collection: CollectionId) -> usize {
-        let mut cancelled_digest = Vec::new();
+        let mut cancelled: Vec<(NodeId, RepairKind)> = Vec::new();
         let total = self
             .repairs
             .iter_mut()
             .map(|(peer, repairs)| {
-                [RepairKind::Count, RepairKind::Digest]
+                [RepairKind::Count, RepairKind::Digest, RepairKind::Definition]
                     .into_iter()
                     .filter(|kind| {
                         let removed = repairs.queued.remove(&(collection, *kind)).is_some();
-                        if removed && *kind == RepairKind::Digest {
+                        if removed && *kind != RepairKind::Count {
                             repairs.cuts.remove(&collection);
-                            cancelled_digest.push(*peer);
+                            repairs.limits.remove(&collection);
+                            cancelled.push((*peer, *kind));
                         }
                         removed
                     })
                     .count()
             })
             .sum();
-        for peer in cancelled_digest {
-            self.digest_ended(
+        for (peer, kind) in cancelled {
+            self.repair_ended_as(
                 peer,
                 collection,
+                kind,
                 End::Transient(Transient::Cancelled),
                 DigestRepairOutcome::Transient,
             );
@@ -4325,23 +4546,26 @@ impl PeerStalls {
             // The page that finished it must not be read as advancing the
             // next repair planned for this peer.
             repairs.advanced = false;
-            if finished.kind() == RepairKind::Digest {
-                ledger_end = Some((collection, repairs.tally));
+            if finished.kind() != RepairKind::Count {
+                ledger_end = Some((collection, finished.kind(), repairs.tally));
             }
             repairs.tally = Tally::default();
             if self.snapshots.get(&peer).is_some_and(|p| p.scope() == Some(collection)) {
                 self.snapshots.remove(&peer);
             }
         }
-        if let Some((collection, tally)) = ledger_end {
+        if let Some((collection, kind, tally)) = ledger_end {
             let (end, outcome) = match transient {
                 Some(why) => (End::Transient(why), DigestRepairOutcome::Transient),
-                None => (
-                    End::Finished { progress: tally.made_progress() },
-                    DigestRepairOutcome::Applied,
-                ),
+                None => {
+                    let progress = match kind {
+                        RepairKind::Definition => tally.built > 0,
+                        _ => tally.made_progress(),
+                    };
+                    (End::Finished { progress }, DigestRepairOutcome::Applied)
+                }
             };
-            self.digest_ended(peer, collection, end, outcome);
+            self.repair_ended_as(peer, collection, kind, end, outcome);
         }
     }
 
@@ -5014,8 +5238,12 @@ where
             pages += 1;
         }
         let applied = applied.map_err(|e| from_storage(e, ProtocolError::Malformed))?;
-        if policy == kimmy_storage::SnapshotPolicy::Converge {
-            stalls.converge_page_applied(node, &applied);
+        match policy {
+            kimmy_storage::SnapshotPolicy::Converge => stalls.converge_page_applied(node, &applied),
+            kimmy_storage::SnapshotPolicy::Definitions => {
+                stalls.definitions_page_applied(node, &applied);
+            }
+            kimmy_storage::SnapshotPolicy::All => {}
         }
         // A Converge page from a sender that no longer holds the collection applied
         // nothing and moved nothing: the pull ends here, abandoned.

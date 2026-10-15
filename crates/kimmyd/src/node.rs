@@ -2800,6 +2800,7 @@ async fn spawn_cluster(
                 lag_vectors: Some(lag_vectors),
                 divergence_repair: config.cluster.divergence_repair,
                 repair_max_documents: config.cluster.repair_max_documents,
+                repair_max_index_documents: config.cluster.repair_max_index_documents,
             },
         ),
     );

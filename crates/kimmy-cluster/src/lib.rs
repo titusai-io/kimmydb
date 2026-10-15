@@ -50,8 +50,8 @@ pub use peers::{
     RoundHook, RoundReport, SELF_RECHECK, replicate,
 };
 pub use transport::{
-    AcceptErrorHook, AcceptListener, DigestRepairOutcome, FROZEN_CONTACTS, Judgement, PeerPosition,
-    PeerStalls, PushHook, REPAIR_ATTEMPTS, REPAIR_COOLDOWN_ROUNDS, Repair, RepairCounts,
-    ReplayCounters, ReplayResult, RowResult, ServeFailHook, ServeFailure,
+    AcceptErrorHook, AcceptListener, DefinitionJudgement, DigestRepairOutcome, FROZEN_CONTACTS,
+    Judgement, PeerPosition, PeerStalls, PushHook, REPAIR_ATTEMPTS, REPAIR_COOLDOWN_ROUNDS, Repair,
+    RepairCounts, ReplayCounters, ReplayResult, RowResult, ServeFailHook, ServeFailure,
     accept_error_is_the_listeners, replay_counters, serve, serve_with, sync_once, sync_once_with,
 };
