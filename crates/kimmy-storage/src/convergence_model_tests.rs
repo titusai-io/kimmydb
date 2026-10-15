@@ -354,9 +354,6 @@ struct Ghost {
     /// included.
     drops: Vec<(usize, Stamp)>,
     db_drops: Vec<Stamp>,
-    /// Of `drops`, those a database's drop minted for a collection its dropper held (its
-    /// own burial of it, an entry of its own stamp).
-    db_drop_burials: Vec<(usize, Stamp)>,
 }
 
 impl Ghost {
@@ -394,9 +391,6 @@ struct Recorded {
     created: BTreeMap<&'static str, Hlc>,
     redated_from: BTreeMap<&'static str, Hlc>,
     index_created: BTreeMap<String, Option<Stamp>>,
-    /// The stamp of the record each held collection keeps for each document id, a
-    /// tombstone's included: what the no-lost-delete check reads.
-    records: BTreeMap<(&'static str, i64), Stamp>,
 }
 
 fn name_of(id: CollectionId) -> Option<String> {
@@ -442,18 +436,19 @@ pub(crate) enum Category {
     /// is what the existence half reads), kept out of the signature a sweep groups
     /// by, so it does not hide the differences that decide something.
     TombstoneSubsumed,
-    /// The one subsumed difference ADR-236 accepts as by design (its residual 1): after two
-    /// drops of one database, one member holds a collection's tombstone at the first drop's
-    /// own burial of it (an entry of its dropper's stamp, which is not an expansion of the
-    /// database's drop, so the raise does not move it) and another at the second drop's
-    /// expansion (met the creation only under the second). Both lack the collection under
-    /// a database tombstone at or above both, so nothing either decides differs. Classified
-    /// by its exact shape from the ghost, pinned by a named test, and kept out of the
-    /// signature a sweep groups by; any other subsumed difference is `TombstoneSubsumed`.
+    /// The one subsumed difference ADR-236 accepts as by design (its residual 1): one member
+    /// holds a collection's tombstone at a drop of the collection itself (an explicit drop,
+    /// or a database drop's own burial of it, an entry of its dropper's stamp, which is not
+    /// an expansion of a database's drop, so the raise does not move it) and another at a
+    /// later database drop's expansion (it met the collection's creation only under that
+    /// drop). Both lack the collection under a database tombstone at or above both, so
+    /// nothing either decides differs. Classified by that exact shape from the ghost, pinned
+    /// by named tests, and kept out of the signature a sweep groups by; any other subsumed
+    /// difference is `TombstoneSubsumed`.
     KnownSubsumed,
     LostWrite,
-    /// A member holds a collection without a record of a delete in it that the ghost
-    /// says must stand there (the mirror of `LostWrite`).
+    /// A member holds a document live that a delete the ghost says must stand removed
+    /// (the mirror of `LostWrite`): a delete lost and the document written back.
     LostDelete,
     /// A page left its receiver's clock behind a stamp it restored that the sender's
     /// coverage names (ADR-233 item 1: a collection's `created`, a carried collection or
@@ -772,9 +767,6 @@ impl Cluster {
                 } else if let Some(c) = NAMES.iter().position(|n| CollectionId::derive(DB, n) == id)
                 {
                     self.ghost.drops.push((c, stamp));
-                    if matches!(op.step, Step::DropDb { .. }) {
-                        self.ghost.db_drop_burials.push((c, stamp));
-                    }
                 }
             }
         }
@@ -1238,21 +1230,6 @@ impl Cluster {
             })
             .map_err(|e| err("for_each_record_after", e))?;
             recorded.created.insert(name, meta.created);
-            {
-                use redb::ReadableDatabase;
-                let txn = e.db().begin_read().map_err(|e| err("begin_read", e))?;
-                let docs = txn.open_table(tables::DOCS).map_err(|e| err("open DOCS", e))?;
-                for d in 1..=3i64 {
-                    let key = crate::docs::doc_key(&DocId::Int64(d)).map_err(|e| err("key", e))?;
-                    if let Some(raw) =
-                        docs.get((meta.id.0, key.as_slice())).map_err(|e| err("get", e))?
-                    {
-                        let (stamp, _) = crate::codec::doc_record_header(raw.value())
-                            .map_err(|e| err("header", e))?;
-                        recorded.records.insert((name, d), stamp);
-                    }
-                }
-            }
             if meta.is_redated()
                 && let Some(marker) = meta.redated
             {
@@ -1423,13 +1400,13 @@ impl Cluster {
                     Some(c) => c.floor.is_some_and(|floor| floor >= newest.hlc),
                     None => o.tombstones.get("#database").is_some_and(|db| db.hlc >= newest.hlc),
                 };
-                // ADR-236's residual 1, by its exact shape: one side is a database drop's
-                // own burial of the collection, the other a later database drop's stamp.
+                // ADR-236's residual 1, by its exact shape: one side is a drop of the
+                // collection itself (explicit, or a database drop's own burial of it), the
+                // other a later database drop's stamp.
                 let known = |x: &Stamp, y: &Stamp| {
                     let c = NAMES.iter().position(|n| n == key);
-                    let burial = |s: &Stamp| {
-                        self.ghost.db_drop_burials.iter().any(|(bc, b)| Some(*bc) == c && b == s)
-                    };
+                    let burial =
+                        |s: &Stamp| self.ghost.drops.iter().any(|(bc, b)| Some(*bc) == c && b == s);
                     let expansion = |s: &Stamp| self.ghost.db_drops.contains(s);
                     (burial(x) && expansion(y) && y > x) || (burial(y) && expansion(x) && x > y)
                 };
@@ -1464,8 +1441,10 @@ impl Cluster {
         }
         // No lost delete, the same way: a document whose latest event is a delete stamped
         // after every drop that applies to it (a delete after a drop is a write after it,
-        // ADR-231 and ADR-236) is held as a record at or above that delete by every member
-        // that holds its collection, unless retention collected it (below the cutoff).
+        // ADR-231 and ADR-236) is live on no member with a stamp below the delete, unless
+        // retention collected the delete (below the cutoff). A member may hold the
+        // collection without the delete's tombstone record: a relay that took the life by a
+        // scoped page cannot vouch for the delete, and its page does not carry it (ADR-163).
         for ((c, d), (stamp, winner)) in &latest {
             if winner.is_some() || below_cutoff(stamp) {
                 continue;
@@ -1476,20 +1455,21 @@ impl Cluster {
             if !(after_every_drop && after_every_db_drop) {
                 continue;
             }
-            for (m, (observed, recorded)) in states.iter().enumerate() {
-                if !observed.collections.contains_key(NAMES[*c]) {
-                    continue;
-                }
-                let held = recorded.records.get(&(NAMES[*c], *d));
-                if held.is_none_or(|held| held < stamp) {
+            for (m, (observed, _)) in states.iter().enumerate() {
+                let held = observed
+                    .collections
+                    .get(NAMES[*c])
+                    .and_then(|coll| coll.documents.get(d))
+                    .map(|(s, _)| *s);
+                if let Some(held) = held.filter(|held| held < stamp) {
                     fail(
                         Category::LostDelete,
                         format!(
-                            "{} holds {} without its delete of {d} at {}; its record is {:?}",
+                            "{} holds {}/{d} at {}, which a delete at {} removed",
                             LETTERS[m],
                             NAMES[*c],
-                            self.stamp(*stamp),
-                            held.map(|s| self.stamp(*s))
+                            self.stamp(held),
+                            self.stamp(*stamp)
                         ),
                     );
                 }
@@ -2384,7 +2364,8 @@ fn census_takes(name: &str, pre: &[Op], variants: &[(&str, Vec<Op>)], expect: Ex
 #[ignore = "the vacuity census; see the convergence model test report"]
 fn vacuity_census() {
     CENSUS.with(|c| *c.borrow_mut() = Some(Vec::new()));
-    let named: [fn(); 33] = [
+    let named: [fn(); 34] = [
+        known_residual_a_collections_own_drop_and_a_later_database_drop,
         finding_f16_a_delete_made_after_a_drop_is_kept_as_a_write_after_it_is,
         known_residual_two_drops_of_one_database_the_first_dropper_held_the_collection,
         finding_f14_an_expansion_of_a_database_drop_stayed_at_the_drop_it_was_made_under,
@@ -2757,6 +2738,30 @@ fn known_residual_two_drops_of_one_database_the_first_dropper_held_the_collectio
         .map(|o| (o.route, o.failures.iter().map(|f| (f.category, f.detail.clone())).collect()))
         .collect();
     let known = vec![(Category::KnownSubsumed, "A/B items: t130.2A vs t190.1B".to_string())];
+    assert_eq!(
+        found,
+        vec![(Route::Entries, known.clone()), (Route::Repaired, known), (Route::Pages, vec![])],
+        "{}",
+        render(&ops, &outcomes)
+    );
+}
+
+/// ADR-236's residual 1 in its other shape, pinned the same way: the collection's own drop
+/// (A drops `orders`, t150.1A) against a later database drop's expansion (C drops the
+/// database, never having held `orders`, and meets its creation only under that drop,
+/// t200.1C).
+#[test]
+fn known_residual_a_collections_own_drop_and_a_later_database_drop() {
+    let ops = parse("A.create(orders)@100; C.create(items)@160; A.drop(orders)@150; C.dropdb@200");
+    if census_takes("known residual, own drop", &ops, &[("as found", vec![])], &[]) {
+        return;
+    }
+    let outcomes = check(&ops);
+    let found: Vec<(Route, Vec<(Category, String)>)> = outcomes
+        .iter()
+        .map(|o| (o.route, o.failures.iter().map(|f| (f.category, f.detail.clone())).collect()))
+        .collect();
+    let known = vec![(Category::KnownSubsumed, "A/C orders: t150.1A vs t200.1C".to_string())];
     assert_eq!(
         found,
         vec![(Route::Entries, known.clone()), (Route::Repaired, known), (Route::Pages, vec![])],
