@@ -1959,6 +1959,7 @@ impl Engine {
     ///   stamped local value: it can only add a configuration to a collection whose
     ///   vector state was last written unstamped, as it always did, and it can never
     ///   turn one off.
+    ///
     /// `earlier` judges an undated page by the life it names (see `restore_collection`);
     /// a dated one is judged by its stamp against the floor, as the entries route
     /// judges a `ConfigureVectors` (ADR-236).
