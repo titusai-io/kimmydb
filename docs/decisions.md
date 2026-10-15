@@ -27826,11 +27826,20 @@ test, a separate change.
 id it holds nothing for; it still applies newer rows over held rows. A 0.49.0 member repairs nothing, and the finding
 persists until it is upgraded. A member with the switch off is a peer whose side nobody repairs.
 
+**Closes ADR-236's residual (4).** A write stamped after a drop, of a life a member holding the drop refused on a whole
+page, that a member keeping the life was granted past (every count agrees; only the cut digest sees the `(id, stamp)`
+sets differ) is the lost update this ADR's document repair exists for: the keeping member pulls the collection under
+`Converge`, the sender's row is strictly newer than the one held, and it is written. The model test
+`residual_4_is_closed_by_the_document_repair` settles the schedule of the pinned row
+(`known_residual_a_later_write_a_refused_life_s_whole_page_granted_past`) and then runs that pull: the member holds the
+write, the other two are untouched, the three digests agree, and a second pull writes nothing, so the finding does not
+return. With `cluster.divergence_repair` off the residual stays a finding, as in ADR-236.
+
 **Tests.** `converge_tests.rs` (the policy's table, each row leaving everything else untouched; the cut counts),
 `tombstone_horizon_tests.rs` (each collector raises it; the reset on every path; restore; adoption raises and never lowers),
 `definition_repair_tests.rs` (every clause of the table and the races under the writer), `repair_ledger_tests.rs` (every
 rule and a model test against a replay of each pair's history), `digest_repair_tests.rs` (the planner with the guard),
-and four end-to-end tests through the real loop (a lost update repaired and judged effective, a lost plain index built, a
+`residual_4_is_closed_by_the_document_repair` (the model's schedule, then the repair), and four end-to-end tests through the real loop (a lost update repaired and judged effective, a lost plain index built, a
 unique index never built, the switch off, the size gate). Mutation rows (in bash, each killed unless named): every clause
 of the policy table, the young-stamp comparison and its absent-horizon fail-closed, each collector's horizon write, the
 reset, the adoption's `set` for `max`, the cut counts, the ledger's rules (16 rows), and the definition table (22
