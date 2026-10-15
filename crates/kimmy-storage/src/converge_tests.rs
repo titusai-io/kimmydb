@@ -766,10 +766,12 @@ fn a_converge_page_for_a_collection_this_member_lacks_creates_nothing() {
     assert_eq!((created, left), (0, 1));
 }
 
-/// Gap (design 2.3 item 4): a newer tombstone over an older held tombstone writes nothing
-/// under Converge (the `All` route records a bare tombstone over it).
+/// A newer tombstone over an older held tombstone replaces it under Converge (repair review C
+/// m2; the design's "gap" is closed): no document is brought back, no row is written, and a live
+/// row stamped between the two deletes that arrives later loses to the newer stamp. The page
+/// commits for it.
 #[test]
-fn a_newer_tombstone_over_a_held_older_tombstone_writes_nothing() {
+fn a_newer_tombstone_over_a_held_older_tombstone_replaces_it() {
     let (a, _da) = engine();
     let (b, _db) = engine();
     let ca = a.create_collection("shop", "orders").unwrap();
@@ -796,9 +798,16 @@ fn a_newer_tombstone_over_a_held_older_tombstone_writes_nothing() {
         SnapshotProgress::of_collection_converging(orders(), kimmy_core::VersionVector::new());
     let page = a.snapshot_page(None, Some(orders())).unwrap();
     let done = b.apply_snapshot_page(a.node_id(), &mut progress, &page).unwrap();
-    assert_eq!(raw(&b), before, "the held tombstone was rewritten");
-    assert_eq!(b.commits(), commits, "a page that wrote nothing committed");
-    assert_eq!((done.applied, done.left, done.left_tombstone), (0, 0, 0));
+    assert_ne!(raw(&b), before, "the held older tombstone was kept");
+    assert!(b.commits() > commits, "a page that replaced a tombstone did not commit");
+    assert_eq!((done.applied, done.left, done.left_tombstone), (1, 0, 0));
+    assert_eq!(value(&b, 1), None, "a tombstone brought a document back");
+    // The replaced stamp is A's, so a live row between the two deletes now loses.
+    let stamp_of = |e: &Engine| {
+        let raw = raw(e).unwrap();
+        crate::codec::decode_doc_record(&raw).unwrap().stamp
+    };
+    assert_eq!(stamp_of(&b), stamp_of(&a));
 }
 
 #[test]

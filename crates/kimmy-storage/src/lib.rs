@@ -78,6 +78,11 @@ mod definition_repair_tests;
 #[cfg(test)]
 mod tombstone_horizon_tests;
 
+// The break-the-guard tests of the repair build's third review: the never-resurrect schedules
+// and the random-history oracle.
+#[cfg(test)]
+mod revc_break_tests;
+
 #[cfg(test)]
 mod keep_later_writes_tests;
 

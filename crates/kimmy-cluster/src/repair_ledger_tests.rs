@@ -62,8 +62,6 @@ fn a_transient_end_changes_nothing_and_does_not_hold_planning() {
         Transient::PeerError,
         Transient::Stopped,
         Transient::PurgePending,
-        Transient::Abandoned,
-        Transient::Dropped,
         Transient::WholeDatabaseTookOver,
         Transient::Gone,
     ] {
@@ -75,6 +73,40 @@ fn a_transient_end_changes_nothing_and_does_not_hold_planning() {
         assert_eq!(after.unjudged_run, 0, "{t:?} neither counts nor resets");
         assert_eq!(l.may_plan(k, at), MayPlan::Yes, "{t:?} returns the phase to idle");
         l.started(k, at);
+    }
+}
+
+/// An abandoned repair and a `dropped` page are failures that repeat by themselves (review C
+/// M3): each climbs a level, so a peer whose Converge rounds always fail is repaired on the
+/// back-off schedule and not every cooldown.
+#[test]
+fn an_abandon_or_a_dropped_page_climbs_every_time_until_a_result_resets_it() {
+    for why in [Transient::Abandoned, Transient::Dropped] {
+        let mut l = ledger();
+        let k = key(1, 1);
+        let mut now = mins(0);
+        for (i, back) in BACKOFF.iter().enumerate() {
+            assert_eq!(l.may_plan(k, now), MayPlan::Yes, "{why:?} at {now:?}");
+            l.started(k, now);
+            let v = l.ended(k, now, End::Transient(why));
+            assert_eq!(
+                v,
+                Some(Verdict::TransientClimb { level: i as u8 + 1, not_before: now + *back })
+            );
+            now += *back;
+        }
+        // At the cap it stays at the cap.
+        l.started(k, now);
+        assert!(matches!(
+            l.ended(k, now, End::Transient(why)),
+            Some(Verdict::TransientClimb { level: MAX_LEVEL, .. })
+        ));
+        // A judged repair resets the level.
+        now += BACKOFF[4];
+        run(&mut l, k, now, false);
+        l.judge(k, now, Judged::Effective);
+        assert_eq!(l.entries[&k].level, 0);
+        assert_eq!(l.entries[&k].transient_run, 0);
     }
 }
 

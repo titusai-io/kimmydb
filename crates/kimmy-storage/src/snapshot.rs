@@ -1381,7 +1381,7 @@ impl Engine {
                 }
             }
             let documents_applied = pending.len();
-            self.apply_carried_document_deletes(
+            let replaced = self.apply_carried_document_deletes(
                 &txn,
                 &mut memo,
                 page,
@@ -1391,13 +1391,13 @@ impl Engine {
             )?;
             applied_at_cut +=
                 pending[documents_applied..].iter().filter(|p| at_cut(p.entry.stamp)).count();
-            if pending.is_empty() {
+            if pending.is_empty() && replaced == 0 {
                 txn.abort()?;
             } else {
                 txn.commit()?;
             }
             let (count, error) = self.report_pending(pending);
-            applied = count - created;
+            applied = count - created + replaced;
             failed = error;
         }
         *progress = progress.advanced(page, applied + created);
@@ -1608,11 +1608,13 @@ impl Engine {
             }
             let Some(document) = current.document()? else {
                 // A tombstone here, at an older stamp: the newer delete is the one to
-                // carry (ADR-228); `Converge` carries nothing.
-                if converge.is_none() {
-                    self.record_bare_tombstone(txn, &collection, tombstone)?;
-                    recorded += 1;
-                }
+                // carry (ADR-228). `Converge` carries it too (repair review C m2): the
+                // stamp is the sender's, named by its own coverage, and the replaced
+                // tombstone is a delete of the same document, so nothing is brought back
+                // and no row is written; without it a live row stamped between the two
+                // deletes, taken later from a third member, would show until a later repair.
+                self.record_bare_tombstone(txn, &collection, tombstone)?;
+                recorded += 1;
                 continue;
             };
             let id = match document.get(crate::ID_FIELD) {

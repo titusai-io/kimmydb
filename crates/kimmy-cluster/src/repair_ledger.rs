@@ -118,6 +118,16 @@ pub enum Transient {
     Cancelled,
 }
 
+impl Transient {
+    /// Whether this end is a failure that repeats on its own, so that every one of them
+    /// climbs a level: a repair abandoned after rounds that landed nothing, or a peer that
+    /// answers `dropped`. The others (a peer error, a stop, a takeover) are the ordinary
+    /// weather of a cluster and climb only on the third in a row.
+    fn repeats(self) -> bool {
+        matches!(self, Self::Abandoned | Self::Dropped)
+    }
+}
+
 /// How a repair ended.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum End {
@@ -298,11 +308,12 @@ impl RepairLedger {
             return None;
         }
         match end {
-            End::Transient(_) => {
+            End::Transient(why) => {
                 entry.phase = Phase::Idle;
                 entry.transient_run += 1;
-                // A failure that repeats for ever backs off: the third in a row climbs.
-                if entry.transient_run.is_multiple_of(TRANSIENT_CLIMB_EVERY) {
+                // A failure that repeats for ever backs off: every abandon or `dropped`
+                // climbs, and the third in a row of any other kind.
+                if why.repeats() || entry.transient_run.is_multiple_of(TRANSIENT_CLIMB_EVERY) {
                     entry.level = (entry.level + 1).min(MAX_LEVEL);
                     entry.not_before = now + BACKOFF[usize::from(entry.level) - 1];
                     return Some(Verdict::TransientClimb {

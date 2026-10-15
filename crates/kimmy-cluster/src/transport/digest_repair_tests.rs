@@ -225,8 +225,14 @@ fn a_repair_whose_sender_dropped_the_collection_is_transient_not_applied() {
     let counts = stalls.take_repair_counts();
     assert_eq!(counts.digest_repairs[DigestRepairOutcome::Transient.index()], 1);
     assert_eq!(counts.digest_repairs[DigestRepairOutcome::Applied.index()], 0);
-    // Not awaiting a probe: the ledger would let it plan again once the cooldown passes.
+    // Not awaiting a probe, but a `dropped` page is a failure that repeats by itself (review
+    // C M3): it climbs to level 1, so the ledger lets it plan again after the first back-off.
     stalls.retain_digest(p, &BTreeSet::new());
+    assert!(matches!(
+        stalls.plan_digest_repair(p, C, VersionVector::default()),
+        DigestPlan::Held(MayPlan::BackOff(_))
+    ));
+    stalls.set_repair_clock(mins(8), mins(5));
     assert_eq!(stalls.plan_digest_repair(p, C, VersionVector::default()), DigestPlan::Planned);
 }
 
@@ -243,11 +249,17 @@ fn a_repair_that_advances_nothing_for_the_attempts_is_abandoned_and_counted() {
     let counts = stalls.take_repair_counts();
     assert_eq!(counts.digest_repairs[DigestRepairOutcome::Abandoned.index()], 1);
     assert!(!stalls.repairing(p));
+    // An abandon repeats by itself (review C M3): it climbs a level, to the first back-off.
     stalls.retain_digest(p, &BTreeSet::new());
+    assert!(matches!(
+        stalls.plan_digest_repair(p, C, VersionVector::default()),
+        DigestPlan::Held(MayPlan::BackOff(_))
+    ));
+    stalls.set_repair_clock(mins(8), mins(5));
     assert_eq!(
         stalls.plan_digest_repair(p, C, VersionVector::default()),
         DigestPlan::Planned,
-        "R1: level unchanged"
+        "after the back-off"
     );
 }
 
