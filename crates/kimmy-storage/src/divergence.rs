@@ -551,6 +551,14 @@ impl DivergenceTracker {
         self.digest_confirmed.get(&peer).is_some_and(|set| set.contains(&id))
     }
 
+    /// Collections the cut digest has confirmed divergent against `peer`: what the
+    /// document repair is planned from. **Only the planner reads this.**
+    /// [`Self::confirmed_against`] never holds a digest finding (B3), so the count
+    /// half's repair, its cooldown and its `retain_repaired` never see one.
+    pub fn digest_confirmed_against(&self, peer: NodeId) -> BTreeSet<CollectionId> {
+        self.digest_confirmed.get(&peer).cloned().unwrap_or_default()
+    }
+
     /// Distinct collections confirmed divergent by the cut digest against at
     /// least one peer: what `kimmy_sync_digest_divergent_collections` reports,
     /// so an operator can tell which half moved the gauge.
@@ -693,6 +701,21 @@ mod tests {
         assert_eq!(tracker.confirmed_count(), 1, "the gauge reads it");
         assert_eq!(tracker.definition_confirmed_count(), 1, "the attribution gauge");
         assert_eq!(tracker.digest_confirmed_count(), 0, "and it is not the digest's");
+    }
+
+    /// The planner's own reader for the digest: it holds the digest's findings and the
+    /// count half's reader still does not.
+    #[test]
+    fn a_digest_finding_is_read_by_its_own_reader_and_not_by_the_count_halfs() {
+        let mut tracker = DivergenceTracker::new();
+        let (p, q, c) = (NodeId::generate(), NodeId::generate(), CollectionId(7));
+        tracker.observe_digest(p, c, true);
+        tracker.observe_digest(p, c, true);
+        assert_eq!(tracker.digest_confirmed_against(p), BTreeSet::from([c]));
+        assert!(tracker.digest_confirmed_against(q).is_empty(), "another peer's is its own");
+        assert!(tracker.confirmed_against(p).is_empty(), "never the count half's reader");
+        tracker.observe_digest(p, c, false);
+        assert!(tracker.digest_confirmed_against(p).is_empty(), "a compared match clears it");
     }
 
     /// One collection under two kinds is one collection on the gauge.

@@ -532,6 +532,15 @@ impl SnapshotProgress {
         next
     }
 
+    /// A progress that has applied a page and not finished, for another crate's
+    /// tests of what the planner does with one. Under `cfg(test)` and the
+    /// `test-hooks` feature, absent from every build that ships.
+    #[cfg(any(test, feature = "test-hooks"))]
+    pub fn test_mark_paged(&mut self) {
+        self.pages = 1;
+        self.complete = false;
+    }
+
     /// The collection the snapshot is scoped to, if any.
     pub fn scope(&self) -> Option<CollectionId> {
         self.scope
