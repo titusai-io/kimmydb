@@ -1763,6 +1763,13 @@ impl TelemetryGuard {
         );
         observe!(
             u64_observable_gauge,
+            "kimmy.gc.tombstone_horizon",
+            "s",
+            "The collected-through horizon, as a Unix time in seconds: the cutoff of the last retention pass that removed a tombstone, or this build's reset at open.",
+            gc_tombstone_horizon_seconds
+        );
+        observe!(
+            u64_observable_gauge,
             "kimmy.sync.divergence_repair_enabled",
             "1",
             "1 when cluster.divergence_repair is on, 0 when this member only detects.",

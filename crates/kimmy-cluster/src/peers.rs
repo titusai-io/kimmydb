@@ -168,6 +168,10 @@ pub struct RoundReport {
     pub digest_repair_stopped: usize,
     /// Whether `cluster.divergence_repair` is on. A level, for a gauge.
     pub repair_enabled: bool,
+    /// The collected-through horizon's wall time, in seconds since the epoch: the cutoff of
+    /// the last retention pass that collected a tombstone, or this build's reset at open. A
+    /// level, for a gauge; 0 when the store has none (a read that failed).
+    pub tombstone_horizon_secs: u64,
     /// Kept digest rows a self-check found disagreeing with their records and
     /// corrected, since the process started. A level; zero on a healthy node.
     pub digest_drift_total: u64,
@@ -1664,6 +1668,11 @@ pub async fn replicate(engine: Arc<Engine>, config: ReplicationConfig) {
                 report.repair.add(&stalls.take_repair_counts());
                 report.digest_repair_stopped = stalls.stopped_collections();
                 report.repair_enabled = config.divergence_repair;
+                report.tombstone_horizon_secs = engine
+                    .tombstone_horizon()
+                    .ok()
+                    .flatten()
+                    .map_or(0, |horizon| horizon.wall_ms / 1_000);
                 report.definition_divergent_collections = divergence.definition_confirmed_count();
                 report.digest_drift_total = engine.digest_drift_total();
                 // And when that reading was last re-examined (ADR-145): the

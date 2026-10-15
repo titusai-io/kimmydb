@@ -488,6 +488,8 @@ pub struct MetricsSnapshot {
     pub sync_digest_repair_stopped_collections: u64,
     /// 1 when `cluster.divergence_repair` is on.
     pub sync_divergence_repair_enabled: u64,
+    /// The collected-through horizon, seconds since the epoch. A level.
+    pub gc_tombstone_horizon_seconds: u64,
     /// Definition repairs by outcome (`DigestRepairOutcome::DEFINITION` are the labels used),
     /// the loop guard's judgements of them (`DefinitionJudgement::ALL`) and what their pages
     /// did with indexes (`kimmy_storage::DEFINITION_RESULTS`).
@@ -632,6 +634,7 @@ pub struct Metrics {
     sync_digest_repair_rows: [AtomicU64; kimmy_cluster::RowResult::ALL.len()],
     sync_digest_repair_stopped_collections: AtomicU64,
     sync_divergence_repair_enabled: AtomicU64,
+    gc_tombstone_horizon_seconds: AtomicU64,
     sync_definition_repairs: [AtomicU64; kimmy_cluster::DigestRepairOutcome::ALL.len()],
     sync_definition_repair_judgements: [AtomicU64; kimmy_cluster::DefinitionJudgement::ALL.len()],
     sync_definition_repair_indexes: [AtomicU64; kimmy_storage::DEFINITION_RESULTS.len()],
@@ -769,6 +772,7 @@ impl Default for Metrics {
             sync_digest_repair_rows: std::array::from_fn(|_| AtomicU64::new(0)),
             sync_digest_repair_stopped_collections: AtomicU64::new(0),
             sync_divergence_repair_enabled: AtomicU64::new(0),
+            gc_tombstone_horizon_seconds: AtomicU64::new(0),
             sync_definition_repairs: std::array::from_fn(|_| AtomicU64::new(0)),
             sync_definition_repair_judgements: std::array::from_fn(|_| AtomicU64::new(0)),
             sync_definition_repair_indexes: std::array::from_fn(|_| AtomicU64::new(0)),
@@ -1030,6 +1034,7 @@ impl Metrics {
             .store(round.digest_repair_stopped as u64, Ordering::Relaxed);
         self.sync_divergence_repair_enabled
             .store(u64::from(round.repair_enabled), Ordering::Relaxed);
+        self.gc_tombstone_horizon_seconds.store(round.tombstone_horizon_secs, Ordering::Relaxed);
         for (slot, n) in self.sync_definition_repairs.iter().zip(round.repair.definition_repairs) {
             slot.fetch_add(n as u64, Ordering::Relaxed);
         }
@@ -1481,6 +1486,7 @@ impl Metrics {
             sync_digest_repair_stopped_collections: self
                 .get(&self.sync_digest_repair_stopped_collections),
             sync_divergence_repair_enabled: self.get(&self.sync_divergence_repair_enabled),
+            gc_tombstone_horizon_seconds: self.get(&self.gc_tombstone_horizon_seconds),
             sync_definition_repairs: std::array::from_fn(|slot| {
                 self.get(&self.sync_definition_repairs[slot])
             }),
@@ -1900,6 +1906,9 @@ impl Metrics {
              # HELP kimmy_sync_divergence_repair_enabled 1 when cluster.divergence_repair is on, 0 when this member only detects.\n\
              # TYPE kimmy_sync_divergence_repair_enabled gauge\n\
              kimmy_sync_divergence_repair_enabled {sync_divergence_repair_enabled}\n\
+             # HELP kimmy_gc_tombstone_horizon_seconds The collected-through horizon, as a Unix time in seconds: the cutoff of the last retention pass that removed a tombstone, or this build's reset at open (a start after an upgrade, a rollback or a restore resets it to the start time). It moves only when a pass removes something, so a member that collects nothing holds it indefinitely; it is not now minus retention. A document repair writes a row only when the row is newer than the larger of this member's horizon and the sender's. A fast clock pins it ahead until real time passes it.\n\
+             # TYPE kimmy_gc_tombstone_horizon_seconds gauge\n\
+             kimmy_gc_tombstone_horizon_seconds {gc_tombstone_horizon}\n\
              # HELP kimmy_sync_definition_repairs_total Definition repairs of a confirmed definition finding, by outcome: the end of a repair, or the gate that refused to plan one. applied: the repair pulled the first page of the peer's snapshot of the collection and applied it; whether it worked is judged at the next compared definition digest (kimmy_sync_definition_repair_judgements_total), and what it did with each index is in kimmy_sync_definition_repair_indexes_total. too_large: the collection holds more live documents than cluster.repair_max_index_documents. abandoned: three rounds in a row applied nothing. transient: a peer error, a stop, a drop, a whole-database pull taking the peer over, or a cancellation. disabled: cluster.divergence_repair is off.\n\
              # TYPE kimmy_sync_definition_repairs_total counter\n\
              {sync_definition_repairs_lines}\
@@ -2100,6 +2109,7 @@ impl Metrics {
                 .collect::<String>(),
             sync_digest_repair_stopped = self.get(&self.sync_digest_repair_stopped_collections),
             sync_divergence_repair_enabled = self.get(&self.sync_divergence_repair_enabled),
+            gc_tombstone_horizon = self.get(&self.gc_tombstone_horizon_seconds),
             sync_definition_repairs_lines = kimmy_cluster::DigestRepairOutcome::DEFINITION
                 .iter()
                 .map(|outcome| {
@@ -2864,6 +2874,7 @@ mod tests {
             },
             digest_repair_stopped: 31,
             repair_enabled: false,
+            tombstone_horizon_secs: 1_700_000_001,
             definition_compared: 141,
             definition_explained: 142,
             definition_unanswered: 143,
@@ -2910,6 +2921,7 @@ mod tests {
             },
             digest_repair_stopped: 32,
             repair_enabled: true,
+            tombstone_horizon_secs: 1_700_000_002,
             definition_compared: 2,
             definition_explained: 3,
             definition_unanswered: 4,
@@ -3783,6 +3795,9 @@ kimmy_sync_digest_repair_stopped_collections 32
 # HELP kimmy_sync_divergence_repair_enabled 1 when cluster.divergence_repair is on, 0 when this member only detects.
 # TYPE kimmy_sync_divergence_repair_enabled gauge
 kimmy_sync_divergence_repair_enabled 1
+# HELP kimmy_gc_tombstone_horizon_seconds The collected-through horizon, as a Unix time in seconds: the cutoff of the last retention pass that removed a tombstone, or this build's reset at open (a start after an upgrade, a rollback or a restore resets it to the start time). It moves only when a pass removes something, so a member that collects nothing holds it indefinitely; it is not now minus retention. A document repair writes a row only when the row is newer than the larger of this member's horizon and the sender's. A fast clock pins it ahead until real time passes it.
+# TYPE kimmy_gc_tombstone_horizon_seconds gauge
+kimmy_gc_tombstone_horizon_seconds 1700000002
 # HELP kimmy_sync_definition_repairs_total Definition repairs of a confirmed definition finding, by outcome: the end of a repair, or the gate that refused to plan one. applied: the repair pulled the first page of the peer's snapshot of the collection and applied it; whether it worked is judged at the next compared definition digest (kimmy_sync_definition_repair_judgements_total), and what it did with each index is in kimmy_sync_definition_repair_indexes_total. too_large: the collection holds more live documents than cluster.repair_max_index_documents. abandoned: three rounds in a row applied nothing. transient: a peer error, a stop, a drop, a whole-database pull taking the peer over, or a cancellation. disabled: cluster.divergence_repair is off.
 # TYPE kimmy_sync_definition_repairs_total counter
 kimmy_sync_definition_repairs_total{outcome=\"applied\"} 262
@@ -4446,6 +4461,7 @@ kimmy_storage_cache_reads_total{result=\"miss\"} 9104
             "kimmy_sync_divergence_repair_enabled {}\n",
             s.sync_divergence_repair_enabled
         ));
+        expect(&format!("kimmy_gc_tombstone_horizon_seconds {}\n", s.gc_tombstone_horizon_seconds));
         for outcome in kimmy_cluster::DigestRepairOutcome::DEFINITION {
             expect(&format!(
                 "kimmy_sync_definition_repairs_total{{outcome=\"{}\"}} {}\n",
@@ -4884,6 +4900,8 @@ kimmy_storage_cache_reads_total{result=\"miss\"} 9104
                 + kimmy_cluster::RowResult::ALL.len()
                 + 1
                 + 1
+                // The collected-through horizon.
+                + 1
                 // And the definition repair's: outcomes, judgements and index results.
                 + kimmy_cluster::DigestRepairOutcome::DEFINITION.len()
                 + kimmy_cluster::DefinitionJudgement::ALL.len()
@@ -5065,6 +5083,7 @@ kimmy_storage_cache_reads_total{result=\"miss\"} 9104
             repair: kimmy_cluster::RepairCounts::default(),
             digest_repair_stopped: 0,
             repair_enabled: false,
+            tombstone_horizon_secs: 0,
             definition_compared: 0,
             definition_explained: 0,
             definition_unanswered: 0,
@@ -5104,6 +5123,7 @@ kimmy_storage_cache_reads_total{result=\"miss\"} 9104
             repair: kimmy_cluster::RepairCounts::default(),
             digest_repair_stopped: 0,
             repair_enabled: false,
+            tombstone_horizon_secs: 0,
             definition_compared: 0,
             definition_explained: 0,
             definition_unanswered: 0,
@@ -5334,6 +5354,7 @@ kimmy_storage_cache_reads_total{result=\"miss\"} 9104
             repair: kimmy_cluster::RepairCounts::default(),
             digest_repair_stopped: 0,
             repair_enabled: false,
+            tombstone_horizon_secs: 0,
             definition_compared: 0,
             definition_explained: 0,
             definition_unanswered: 0,
