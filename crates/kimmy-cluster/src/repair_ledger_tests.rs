@@ -58,13 +58,7 @@ fn a_transient_end_changes_nothing_and_does_not_hold_planning() {
     assert_eq!(before.level, 2);
     let at = before.not_before + mins(1);
     l.started(k, at);
-    for t in [
-        Transient::PeerError,
-        Transient::Stopped,
-        Transient::PurgePending,
-        Transient::WholeDatabaseTookOver,
-        Transient::Gone,
-    ] {
+    for t in [Transient::WholeDatabaseTookOver, Transient::Cancelled, Transient::Gone] {
         l.entries.get_mut(&k).unwrap().transient_run = 0;
         l.ended(k, at, End::Transient(t));
         let after = l.entries[&k];
@@ -215,7 +209,7 @@ fn a_judged_outcome_resets_the_unjudged_run_and_a_transient_end_does_not() {
     assert_eq!(l.entries[&k].unjudged_run, 1);
     // A transient end between neither increments nor resets.
     l.started(k, mins(31));
-    l.ended(k, mins(31), End::Transient(Transient::PeerError));
+    l.ended(k, mins(31), End::Transient(Transient::WholeDatabaseTookOver));
     assert_eq!(l.entries[&k].unjudged_run, 1);
     // The next unjudged one is the second: it climbs.
     run(&mut l, k, mins(32), false);
@@ -600,7 +594,7 @@ mod model {
                     last_end.insert(k, now);
                     match kind {
                         EndKind::Transient => {
-                            l.ended(k, now, End::Transient(Transient::PeerError));
+                            l.ended(k, now, End::Transient(Transient::WholeDatabaseTookOver));
                             h.outcomes.push(Outcome::Transient { ended: now });
                         }
                         EndKind::Plain | EndKind::Progress => {
@@ -763,7 +757,7 @@ fn the_third_transient_end_in_a_row_climbs_one_level_and_a_result_in_between_res
     let transient = |l: &mut RepairLedger, t: &mut Duration| -> Option<Verdict> {
         assert_eq!(l.may_plan(k, *t), MayPlan::Yes, "at {t:?}");
         l.started(k, *t);
-        l.ended(k, *t, End::Transient(Transient::PeerError))
+        l.ended(k, *t, End::Transient(Transient::WholeDatabaseTookOver))
     };
     assert_eq!(transient(&mut l, &mut t), None);
     t += mins(6);

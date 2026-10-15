@@ -11,9 +11,12 @@
 //! One entry per `(peer, collection, kind)`. The rules, numbered as the design
 //! numbers them:
 //!
-//! * **R1** a transient end changes nothing but the planner's cooldown, until three of them
-//!   follow one another for one key: that climbs one level, so a failure that repeats for
-//!   ever backs off instead of costing a pull at every cooldown;
+//! * **R1** a transient end changes nothing but the planner's cooldown, **except** that an
+//!   abandon (three rounds that landed nothing, which is also how a peer error or a stop
+//!   reaches the ledger) and a `dropped` page climb one level every time, and the third end
+//!   in a row of any other kind for one key (a whole-database takeover, a cancellation
+//!   while queued, a definition page that does not carry the collection) climbs one, so a
+//!   failure that repeats for ever backs off instead of costing a pull at every cooldown;
 //! * **R2** a repair is judged at the first *compared* probe after its end, and
 //!   only there; one never judged by its deadline counts as transient, but every
 //!   second consecutive such end climbs one step;
@@ -107,9 +110,6 @@ impl Params {
 /// Why a repair ended without a result to judge (R1).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Transient {
-    PeerError,
-    Stopped,
-    PurgePending,
     Abandoned,
     Dropped,
     WholeDatabaseTookOver,
@@ -121,8 +121,11 @@ pub enum Transient {
 impl Transient {
     /// Whether this end is a failure that repeats on its own, so that every one of them
     /// climbs a level: a repair abandoned after rounds that landed nothing, or a peer that
-    /// answers `dropped`. The others (a peer error, a stop, a takeover) are the ordinary
-    /// weather of a cluster and climb only on the third in a row.
+    /// answers `dropped`. The others (a whole-database takeover, a cancellation while
+    /// queued, a definition page without the collection) are the ordinary weather of a
+    /// cluster and climb only on the third in a row. A peer error or a stop is none of
+    /// these: it ends a round, not the repair, and reaches the ledger as an abandon once
+    /// three rounds in a row landed nothing.
     fn repeats(self) -> bool {
         matches!(self, Self::Abandoned | Self::Dropped)
     }

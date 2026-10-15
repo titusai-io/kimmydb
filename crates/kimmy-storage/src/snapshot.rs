@@ -1175,6 +1175,7 @@ impl Engine {
                 &mut pending,
                 &mut superseded,
                 None,
+                None,
             )?;
 
             // Only a *completed* snapshot grants coverage: adopting it
@@ -1417,6 +1418,7 @@ impl Engine {
                 }
             }
             let documents_applied = pending.len();
+            let mut replaced_at_cut = 0usize;
             let replaced = self.apply_carried_document_deletes(
                 &txn,
                 &mut memo,
@@ -1424,9 +1426,10 @@ impl Engine {
                 &mut pending,
                 &mut superseded,
                 Some(&mut left_tombstone),
+                Some((&at_cut, &mut replaced_at_cut)),
             )?;
-            applied_at_cut +=
-                pending[documents_applied..].iter().filter(|p| at_cut(p.entry.stamp)).count();
+            applied_at_cut += replaced_at_cut
+                + pending[documents_applied..].iter().filter(|p| at_cut(p.entry.stamp)).count();
             if pending.is_empty() && replaced == 0 {
                 txn.abort()?;
             } else {
@@ -1586,12 +1589,14 @@ impl Engine {
         pending: &mut Vec<Pending>,
         superseded: &mut usize,
         converge: Option<&mut usize>,
+        replaced_at_cut: Option<(&dyn Fn(Stamp) -> bool, &mut usize)>,
     ) -> Result<usize> {
         // Under `Converge` (`converge` carries the count of rows left) a tombstone
         // is applied only over a live document it out-stamps: where this node holds
         // nothing, or only a tombstone, nothing is written, and the bare tombstone
         // of ADR-228 is never recorded.
         let mut converge = converge;
+        let mut replaced_at_cut = replaced_at_cut;
         let mut recorded = 0usize;
         for tombstone in &page.deleted_documents {
             if tombstone.stamp.hlc > page.versions.get(tombstone.stamp.node) {
@@ -1651,6 +1656,10 @@ impl Engine {
                 // deletes, taken later from a third member, would show until a later repair.
                 self.record_bare_tombstone(txn, &collection, tombstone)?;
                 recorded += 1;
+                // A replaced tombstone at the finding's cut is progress, as a row is.
+                if let Some((at_cut, n)) = replaced_at_cut.as_mut() {
+                    **n += usize::from(at_cut(tombstone.stamp));
+                }
                 continue;
             };
             let id = match document.get(crate::ID_FIELD) {

@@ -810,6 +810,35 @@ fn a_newer_tombstone_over_a_held_older_tombstone_replaces_it() {
     assert_eq!(stamp_of(&b), stamp_of(&a));
 }
 
+/// A newer tombstone that replaces an older held one is the repair's progress when the
+/// stamp is at or below the finding's cut, as a written row is; above the cut it is the tail
+/// ordinary replication brings as well and counts for nothing.
+#[test]
+fn a_tombstone_replaced_at_the_findings_cut_counts_as_progress() {
+    let setup = || {
+        let (a, da) = engine();
+        let (b, db) = engine();
+        let ca = a.create_collection("shop", "orders").unwrap();
+        pull(&b, &a);
+        a.insert(&ca, doc! { "_id": 1, "v": 1 }).unwrap();
+        pull(&b, &a);
+        later();
+        let cb = b.get_collection("shop", "orders").unwrap();
+        b.delete(&cb, &DocId::Int64(1)).unwrap();
+        later();
+        a.delete(&ca, &DocId::Int64(1)).unwrap();
+        (a, b, da, db)
+    };
+    let (a, b, _da, _db) = setup();
+    let done = converge_at(&b, &a, a.version_vector().unwrap());
+    assert_eq!(done.applied, 1, "premise: the newer tombstone replaced the older one");
+    assert_eq!(done.applied_at_cut, 1, "and it is progress at the cut");
+    let (a, b, _da, _db) = setup();
+    let done = converge_at(&b, &a, kimmy_core::VersionVector::new());
+    assert_eq!(done.applied, 1, "premise");
+    assert_eq!(done.applied_at_cut, 0, "above the cut it is the tail");
+}
+
 #[test]
 fn a_tombstone_for_a_collection_this_member_lacks_is_counted_left_tombstone() {
     let (a, _da) = engine();
