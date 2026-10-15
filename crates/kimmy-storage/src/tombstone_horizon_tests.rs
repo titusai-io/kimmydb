@@ -1,0 +1,272 @@
+//! The collected-through horizon (design v3.4, section 13.1): the cutoff of the last
+//! retention pass that collected something, kept in `META`, monotone, raised in each
+//! removing transaction of every tombstone collector, reset on a start the evidence
+//! cannot vouch for, and offered on the pages a member serves.
+
+use bson::doc;
+use kimmy_core::Hlc;
+
+use crate::gc::RetentionPolicy;
+use crate::{Engine, WalkScope};
+
+fn engine() -> (Engine, tempfile::TempDir) {
+    let dir = tempfile::tempdir().unwrap();
+    (Engine::open(&dir.path().join("kimmy.redb")).unwrap(), dir)
+}
+
+fn policy() -> RetentionPolicy {
+    RetentionPolicy::new(60, 60)
+}
+
+fn later_than_the_retention() -> u64 {
+    crate::physical_now_ms() + 10 * 60 * 1_000
+}
+
+fn cutoff_of(now_ms: u64) -> Hlc {
+    Hlc::new(now_ms - 60 * 1_000, 0)
+}
+
+#[test]
+fn a_fresh_store_starts_with_a_horizon_at_its_start() {
+    let before = crate::physical_now_ms();
+    let (engine, _dir) = engine();
+    let horizon = engine.tombstone_horizon().unwrap().expect("a fresh store has a horizon");
+    assert!(horizon.wall_ms >= before, "{horizon:?} is before the start {before}");
+}
+
+#[test]
+fn a_pass_that_removes_a_document_tombstone_raises_the_horizon_to_its_cutoff() {
+    let (engine, _dir) = engine();
+    let meta = engine.create_collection("shop", "orders").unwrap();
+    engine.insert(&meta, doc! { "_id": 1 }).unwrap();
+    engine.delete(&meta, &kimmy_core::DocId::Int64(1)).unwrap();
+    let now = later_than_the_retention();
+    engine.collect_garbage_at(now, policy()).unwrap();
+    assert_eq!(engine.tombstone_horizon().unwrap(), Some(cutoff_of(now)));
+}
+
+#[test]
+fn a_pass_that_removes_a_collection_tombstone_raises_the_horizon() {
+    let (engine, _dir) = engine();
+    engine.create_collection("shop", "orders").unwrap();
+    engine.drop_collection("shop", "orders").unwrap();
+    engine.finish_purges_now().unwrap();
+    let start = engine.tombstone_horizon().unwrap().unwrap();
+    let now = later_than_the_retention();
+    let outcome = engine.collect_garbage_at(now, policy()).unwrap();
+    assert!(outcome.tombstones_removed >= 1, "premise: a tombstone was collected");
+    assert_eq!(engine.tombstone_horizon().unwrap(), Some(cutoff_of(now)));
+    assert!(cutoff_of(now) > start);
+}
+
+#[test]
+fn a_pass_that_removes_a_database_tombstone_raises_the_horizon() {
+    let (engine, _dir) = engine();
+    engine.create_collection("shop", "orders").unwrap();
+    engine.drop_database("shop").unwrap();
+    engine.finish_purges_now().unwrap();
+    let now = later_than_the_retention();
+    engine.collect_garbage_at(now, policy()).unwrap();
+    assert_eq!(engine.tombstone_horizon().unwrap(), Some(cutoff_of(now)));
+}
+
+#[test]
+fn a_pass_that_removes_an_index_tombstone_raises_the_horizon() {
+    let (engine, _dir) = engine();
+    engine.create_collection("shop", "orders").unwrap();
+    engine
+        .create_index(
+            "shop",
+            "orders",
+            vec![crate::IndexField::ascending("k")],
+            false,
+            Some("ik".into()),
+        )
+        .unwrap();
+    engine.drop_index("shop", "orders", "ik").unwrap();
+    let now = later_than_the_retention();
+    let outcome = engine.collect_garbage_at(now, policy()).unwrap();
+    assert!(outcome.tombstones_removed >= 1, "premise: the index tombstone was collected");
+    assert_eq!(engine.tombstone_horizon().unwrap(), Some(cutoff_of(now)));
+}
+
+#[test]
+fn a_pass_that_removes_nothing_does_not_move_the_horizon() {
+    let (engine, _dir) = engine();
+    let meta = engine.create_collection("shop", "orders").unwrap();
+    engine.insert(&meta, doc! { "_id": 1 }).unwrap();
+    let before = engine.tombstone_horizon().unwrap();
+    engine.collect_garbage_at(later_than_the_retention(), policy()).unwrap();
+    assert_eq!(engine.tombstone_horizon().unwrap(), before, "a no-op pass moved the horizon");
+}
+
+#[test]
+fn the_horizon_never_goes_down() {
+    let (engine, _dir) = engine();
+    let meta = engine.create_collection("shop", "orders").unwrap();
+    engine.insert(&meta, doc! { "_id": 1 }).unwrap();
+    engine.delete(&meta, &kimmy_core::DocId::Int64(1)).unwrap();
+    let late = later_than_the_retention() + 3_600_000;
+    engine.collect_garbage_at(late, policy()).unwrap();
+    let high = engine.tombstone_horizon().unwrap().unwrap();
+    // A second tombstone, collected by a pass with an earlier `now`.
+    engine.insert(&meta, doc! { "_id": 2 }).unwrap();
+    engine.delete(&meta, &kimmy_core::DocId::Int64(2)).unwrap();
+    engine.collect_garbage_at(later_than_the_retention(), policy()).unwrap();
+    assert_eq!(engine.tombstone_horizon().unwrap(), Some(high), "the horizon was lowered");
+}
+
+/// Every write transaction in `gc.rs` that removes from `DOCS`, `COLLECTIONS_DROPPED` or
+/// `INDEXES_DROPPED` raises the horizon in that same transaction: a collector added later
+/// that does not is a hole in section 13.3's own-side argument.
+#[test]
+fn every_tombstone_collector_raises_the_horizon_in_its_removing_transaction() {
+    let source = include_str!("gc.rs");
+    let product = source.split("#[cfg(test)]").next().unwrap();
+    let mut checked = 0;
+    for function in product.split("\n    fn ") {
+        let removes = function.contains("begin_write(WriterHolder::Retention)")
+            && (function.contains("tables::DOCS")
+                || function.contains("COLLECTIONS_DROPPED")
+                || function.contains("INDEXES_DROPPED"));
+        if removes {
+            checked += 1;
+            assert!(
+                function.contains("raise_tombstone_horizon_in_txn"),
+                "a tombstone collector does not raise the horizon: {}",
+                function.lines().next().unwrap_or("")
+            );
+        }
+    }
+    assert_eq!(checked, 3, "the three collectors: documents, collections and databases, indexes");
+}
+
+#[test]
+fn a_served_page_carries_the_horizon() {
+    let (engine, _dir) = engine();
+    let meta = engine.create_collection("shop", "orders").unwrap();
+    engine.insert(&meta, doc! { "_id": 1 }).unwrap();
+    let page = engine
+        .snapshot_page(None, Some(kimmy_core::CollectionId::derive("shop", "orders")))
+        .unwrap();
+    assert_eq!(page.tombstone_horizon, engine.tombstone_horizon().unwrap());
+    assert!(page.tombstone_horizon.is_some());
+    let _ = WalkScope::Request;
+}
+
+// -- The reset at open (design 13.1) ----------------------------------------------------
+
+fn path_of(dir: &tempfile::TempDir) -> std::path::PathBuf {
+    dir.path().join("kimmy.redb")
+}
+
+/// Raise the stored horizon far above any start time, as a long-running member's would
+/// be, and close the engine.
+fn with_a_high_horizon(path: &std::path::Path) -> Hlc {
+    let engine = Engine::open(path).unwrap();
+    let meta = engine.create_collection("shop", "orders").unwrap();
+    engine.insert(&meta, doc! { "_id": 1 }).unwrap();
+    engine.delete(&meta, &kimmy_core::DocId::Int64(1)).unwrap();
+    let now = crate::physical_now_ms() + 60 * 60 * 1_000;
+    engine.collect_garbage_at(now, policy()).unwrap();
+    let high = engine.tombstone_horizon().unwrap().unwrap();
+    assert!(high.wall_ms > crate::physical_now_ms() + 30 * 60 * 1_000, "premise: far ahead");
+    high
+}
+
+#[test]
+fn a_restart_by_the_same_build_keeps_the_horizon() {
+    let dir = tempfile::tempdir().unwrap();
+    let high = with_a_high_horizon(&path_of(&dir));
+    let engine = Engine::open(&path_of(&dir)).unwrap();
+    assert_eq!(engine.tombstone_horizon().unwrap(), Some(high));
+}
+
+#[test]
+fn a_start_after_another_build_wrote_the_store_resets_to_the_start_but_never_lowers() {
+    let dir = tempfile::tempdir().unwrap();
+    let high = with_a_high_horizon(&path_of(&dir));
+    // The prior sidecar says another build wrote the store.
+    let mut sidecar = crate::format::read_sidecar(&path_of(&dir)).expect("a sidecar");
+    sidecar.written_by = "0.48.0".into();
+    crate::format::write_sidecar(&path_of(&dir), &sidecar).unwrap();
+    let start = crate::physical_now_ms();
+    let engine = Engine::open(&path_of(&dir)).unwrap();
+    let horizon = engine.tombstone_horizon().unwrap().unwrap();
+    assert!(horizon >= high, "the reset lowered the horizon: {horizon:?} < {high:?}");
+    assert!(horizon.wall_ms >= start);
+}
+
+#[test]
+fn a_foreign_build_that_collected_leaves_the_start_time_when_the_stored_value_is_lower() {
+    let dir = tempfile::tempdir().unwrap();
+    {
+        let engine = Engine::open(&path_of(&dir)).unwrap();
+        engine.create_collection("shop", "orders").unwrap();
+    }
+    let low = {
+        // Write a stale low value, as a build that did not maintain the key would leave.
+        let engine = Engine::open(&path_of(&dir)).unwrap();
+        engine.test_set_tombstone_horizon(Hlc::new(1_000, 0)).unwrap();
+        Hlc::new(1_000, 0)
+    };
+    let mut sidecar = crate::format::read_sidecar(&path_of(&dir)).expect("a sidecar");
+    sidecar.written_by = "0.48.0".into();
+    crate::format::write_sidecar(&path_of(&dir), &sidecar).unwrap();
+    let start = crate::physical_now_ms();
+    let engine = Engine::open(&path_of(&dir)).unwrap();
+    let horizon = engine.tombstone_horizon().unwrap().unwrap();
+    assert!(horizon > low && horizon.wall_ms >= start, "{horizon:?}");
+}
+
+#[test]
+fn an_absent_key_on_a_store_that_is_not_fresh_is_the_start_time() {
+    let dir = tempfile::tempdir().unwrap();
+    {
+        let engine = Engine::open(&path_of(&dir)).unwrap();
+        engine.create_collection("shop", "orders").unwrap();
+        engine.test_remove_tombstone_horizon().unwrap();
+    }
+    let start = crate::physical_now_ms();
+    let engine = Engine::open(&path_of(&dir)).unwrap();
+    let horizon = engine.tombstone_horizon().unwrap().expect("an absent key is never read as zero");
+    assert!(horizon.wall_ms >= start);
+}
+
+#[test]
+fn a_restore_drops_the_horizon_of_the_backup() {
+    let dir = tempfile::tempdir().unwrap();
+    let high = with_a_high_horizon(&path_of(&dir));
+    let mut backup = Vec::new();
+    {
+        let engine = Engine::open(&path_of(&dir)).unwrap();
+        assert_eq!(engine.tombstone_horizon().unwrap(), Some(high));
+        engine.backup_to(&mut backup, WalkScope::Request).unwrap();
+    }
+    let target = tempfile::tempdir().unwrap();
+    let start = crate::physical_now_ms();
+    crate::backup::restore(&path_of(&target), &mut backup.as_slice()).unwrap();
+    let engine = Engine::open(&path_of(&target)).unwrap();
+    let horizon = engine.tombstone_horizon().unwrap().unwrap();
+    assert!(horizon < high, "the backup's horizon came back: {horizon:?}");
+    assert!(horizon.wall_ms >= start, "and the restored store did not reset to its own time");
+}
+
+#[test]
+fn the_sidecar_written_before_the_open_keeps_the_prior_build_until_the_reset_lands() {
+    // A kill anywhere between the pre-open sidecar write and the reset commit must leave
+    // the evidence in place for the next start.
+    let dir = tempfile::tempdir().unwrap();
+    {
+        let engine = Engine::open(&path_of(&dir)).unwrap();
+        engine.create_collection("shop", "orders").unwrap();
+    }
+    let mut sidecar = crate::format::read_sidecar(&path_of(&dir)).expect("a sidecar");
+    sidecar.written_by = "0.48.0".into();
+    sidecar.redb_version = "0.1".into();
+    crate::format::write_sidecar(&path_of(&dir), &sidecar).unwrap();
+    let cleared = crate::format::check_before_open(&path_of(&dir)).unwrap();
+    let before_open = cleared.sidecar_before_open().expect("the redb fields are brought up");
+    assert_eq!(before_open.written_by, "0.48.0", "the pre-open write named this build");
+    assert!(cleared.horizon_is_untrusted());
+}

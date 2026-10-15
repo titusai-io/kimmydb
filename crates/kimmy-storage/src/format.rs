@@ -123,6 +123,10 @@ pub fn sidecar_path(database: &Path) -> PathBuf {
     database.with_extension("format")
 }
 
+/// What `written_by` says in a sidecar written before the open for a store that had none:
+/// no build is called this, so a start that finds it resets the tombstone horizon.
+const UNKNOWN_BUILD: &str = "unknown";
+
 /// What was read before the open, and what it said.
 #[derive(Debug)]
 enum Prior {
@@ -743,10 +747,30 @@ impl Cleared {
             Prior::Sidecar(sidecar) => sidecar.schema,
             Prior::CleanNoSidecar { schema } => schema.unwrap_or(0),
         };
-        let wanted = self.stamp(schema);
+        // **`written_by` keeps the prior value** until the open's first commit has landed
+        // (`reconcile_after_open` names this build): it is the evidence the tombstone
+        // horizon's reset is decided from, and a kill between this write and that commit
+        // must leave it for the next start. A store with no prior sidecar is written as
+        // `unknown`, which no build is, so the next start also resets.
+        let mut wanted = self.stamp(schema);
+        wanted.written_by = match &self.prior {
+            Prior::Sidecar(sidecar) => sidecar.written_by.clone(),
+            _ => UNKNOWN_BUILD.to_string(),
+        };
         match &self.prior {
             Prior::Sidecar(sidecar) if *sidecar == wanted => None,
             _ => Some(wanted),
+        }
+    }
+
+    /// Whether the tombstone horizon this store carries cannot be trusted: it was last
+    /// written by another build (whose retention passes may have collected tombstones
+    /// without raising it), or by none that left a sidecar. Decided from the **prior**
+    /// sidecar, read before the open overwrites it (design 13.1).
+    pub(crate) fn horizon_is_untrusted(&self) -> bool {
+        match &self.prior {
+            Prior::Sidecar(sidecar) => sidecar.written_by != self.build.written_by,
+            Prior::Fresh | Prior::CleanNoSidecar { .. } | Prior::DirtyNoSidecar => true,
         }
     }
 

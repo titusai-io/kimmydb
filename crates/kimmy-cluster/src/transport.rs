@@ -3850,6 +3850,11 @@ impl PeerStalls {
         let Some(repairs) = self.repairs.get_mut(&peer) else {
             return;
         };
+        // Queued digest repairs go too: a queued repair `repair_due` promotes would
+        // get a round and reset the whole-database cursor to page one, so with k queued
+        // the catch-up would restart k times. They are re-planned when the finding is
+        // reported again, after the pull.
+        repairs.queued.retain(|(_, kind), _| *kind != RepairKind::Digest);
         if let Some((collection, Repair::Converge)) = repairs.active {
             repairs.active = None;
             repairs.done.insert((collection, RepairKind::Digest), 0);
@@ -6639,6 +6644,7 @@ mod tests {
             dropped: None,
             dropped_collections: Vec::new(),
             dropped_indexes: Vec::new(),
+            tombstone_horizon: None,
             deleted_documents: Vec::new(),
         }
     }
@@ -7550,8 +7556,12 @@ mod tests {
         assert_eq!(stalls.repair_due(peer), Some((collection, Repair::Converge)));
 
         // A pull that starts while a Converge repair is active abandons it.
+        assert!(stalls.plan_repair(peer, CollectionId(8), Repair::Converge));
         stalls.whole_database_takes_over(peer);
-        assert!(!stalls.repairing(peer), "the active Converge repair survived the takeover");
+        assert!(
+            !stalls.repairing(peer),
+            "the active or a queued Converge repair survived the takeover"
+        );
         assert!(
             !stalls.plan_repair(peer, collection, Repair::Converge),
             "and it takes the cooldown"

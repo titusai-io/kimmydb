@@ -1372,6 +1372,14 @@ impl Engine {
             // The violations table, with the others so a read never meets it
             // missing (ADR-200).
             let _ = txn.open_table(tables::UNIQUE_VIOLATIONS)?;
+            // The tombstone horizon's reset, in this commit and before the sidecar is
+            // brought to this build (design 13.1): a store the evidence cannot vouch
+            // for, or with no key, starts at this start's time, never lower than it was.
+            crate::tombstone_horizon::reset_at_open(
+                &txn,
+                cleared.horizon_is_untrusted(),
+                kimmy_core::Hlc::new(physical_now_ms(), 0),
+            )?;
         }
         txn.commit()?;
 

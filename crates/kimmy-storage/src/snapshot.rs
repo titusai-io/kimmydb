@@ -320,6 +320,16 @@ pub struct SnapshotApplied {
     /// tombstone) this node held nothing for, which the policy does not write.
     /// Always 0 under `All`.
     pub left: usize,
+    /// Under [`SnapshotPolicy::Converge`]: the **tombstone** rows of the page this node
+    /// held nothing for. They are digest-invisible (the digest folds live records only),
+    /// travel by key with no `_id`, and cannot be named, so they are counted apart from
+    /// `left` and never raise the operator warning. Always 0 under `All`.
+    pub left_tombstone: usize,
+    /// Under [`SnapshotPolicy::Converge`]: the live rows this node held nothing for and
+    /// wrote because they are **young** (newer than every tombstone cutoff either member
+    /// of the pair has applied, design section 13): the lost inserts the pull closed.
+    /// Not counted in `applied`. Always 0 under `All`.
+    pub created: usize,
     /// Under [`SnapshotPolicy::Converge`]: the page said the sender no longer
     /// holds the collection (`SnapshotPage::dropped`). Nothing was applied and
     /// the progress did not move; the repair is abandoned, not applied.
@@ -447,6 +457,18 @@ pub struct SnapshotPage {
     /// the new definition and the old drop, and the new one stands.
     #[serde(default)]
     pub dropped_indexes: Vec<(CollectionId, u32, Stamp)>,
+    /// The sender's collected-through horizon: the highest tombstone cutoff its
+    /// retention passes have applied, read **in or after the walk this page's rows came
+    /// from** so it is never older than the documents it vouches for (design v3.4,
+    /// section 13.1). The young-stamp rule of a `Converge` pull compares a row's stamp
+    /// with the larger of this and the receiver's own.
+    ///
+    /// **An `Option`, never an `Hlc` defaulting to zero.** Absent from a sender that
+    /// predates it: the receiver's rule is then off for that pull, and every row it
+    /// holds nothing for is `left`. Optional on the wire, so an older receiver ignores
+    /// it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tombstone_horizon: Option<Hlc>,
 }
 
 /// Where a snapshot pull stands on the receiver.
@@ -633,6 +655,9 @@ impl Engine {
         let dropped_indexes = self.indexes_dropped(scope)?;
 
         let (documents, deleted_documents, next) = self.snapshot_documents(after, scope)?;
+        // After the walk: monotone, so a value read later is at least what the rows
+        // above were collected under (design 13.1, "where it is read").
+        let tombstone_horizon = self.tombstone_horizon()?;
         Ok(SnapshotPage {
             collections,
             documents,
@@ -642,6 +667,7 @@ impl Engine {
             dropped_collections,
             deleted_documents,
             dropped_indexes,
+            tombstone_horizon,
         })
     }
 
@@ -1109,6 +1135,8 @@ impl Engine {
                 shadows_missing,
                 shadows_orphaned,
                 left: 0,
+                left_tombstone: 0,
+                created: 0,
                 sender_dropped: false,
                 purge_pending: None,
             }),
@@ -1150,10 +1178,28 @@ impl Engine {
         let mut applied = 0usize;
         let mut superseded = 0usize;
         let mut left = 0usize;
+        let mut left_tombstone = 0usize;
+        let mut created = 0usize;
         let mut failed = None;
         if !page.documents.is_empty() || !page.deleted_documents.is_empty() {
             let mut memo = Memo::default();
             let txn = self.begin_write(WriterHolder::Repair)?;
+            // The young-stamp rule's two horizons (design section 13.2). The receiver's own
+            // is read **in this write transaction**, beside the "no row" read below, so a
+            // collection that commits between a plan and this page cannot leave the page
+            // judging with a horizon that has not moved while the tombstone is gone. The
+            // sender's rides on the page; absent (a sender that predates it) turns the rule
+            // off for the pull. An absent own key fails closed too.
+            let young_above =
+                match (crate::tombstone_horizon::read_in_txn(&txn)?, page.tombstone_horizon) {
+                    (Some(own), Some(sender)) => Some(own.max(sender)),
+                    _ => None,
+                };
+            // Per collection, once: whether it owes ADR-231's sweep. Judged under this
+            // transaction, next to the row write, because the sweep is chunked with the
+            // writer released between chunks and the floor is set last.
+            let mut owing: std::collections::HashMap<CollectionId, bool> =
+                std::collections::HashMap::new();
             let mut pending = Vec::new();
             for document in &page.documents {
                 let collection = self.memo_collection(&mut memo, document.collection)?;
@@ -1177,9 +1223,25 @@ impl Engine {
                     let docs = txn.open_table(tables::DOCS)?;
                     docs.get((collection.id.0, key.as_slice()))?.is_some()
                 };
+                let mut young = false;
                 if !held {
-                    left += 1;
-                    continue;
+                    // A row this member holds nothing for: never arrived, or deleted and
+                    // the tombstone collected. Written only if young, and only into a
+                    // life that owes no sweep; otherwise left (F2).
+                    let owes = match owing.get(&collection.id) {
+                        Some(owes) => *owes,
+                        None => {
+                            let owes = self.owes_a_sweep_in_txn(&txn, &collection)?;
+                            owing.insert(collection.id, owes);
+                            owes
+                        }
+                    };
+                    let is_young = young_above.is_some_and(|above| document.stamp.hlc > above);
+                    if !is_young || owes {
+                        left += 1;
+                        continue;
+                    }
+                    young = true;
                 }
                 let entry = OplogEntry {
                     stamp: document.stamp,
@@ -1191,6 +1253,9 @@ impl Engine {
                 if let RemoteApplied::Applied { id, violations, .. } =
                     self.apply_remote_in_txn(&txn, &collection, &entry, Position::Hold)?
                 {
+                    if young {
+                        created += 1;
+                    }
                     pending.push(Pending { collection, entry, id, violations });
                 }
             }
@@ -1200,7 +1265,7 @@ impl Engine {
                 page,
                 &mut pending,
                 &mut superseded,
-                Some(&mut left),
+                Some(&mut left_tombstone),
             )?;
             if pending.is_empty() {
                 txn.abort()?;
@@ -1208,10 +1273,10 @@ impl Engine {
                 txn.commit()?;
             }
             let (count, error) = self.report_pending(pending);
-            applied = count;
+            applied = count - created;
             failed = error;
         }
-        *progress = progress.advanced(page, applied);
+        *progress = progress.advanced(page, applied + created);
         if progress.complete {
             info!(
                 collection = ?progress.scope,
@@ -1222,8 +1287,36 @@ impl Engine {
         }
         match failed {
             Some(e) => Err(e),
-            None => Ok(SnapshotApplied { applied, superseded, left, ..Default::default() }),
+            None => Ok(SnapshotApplied {
+                applied,
+                superseded,
+                left,
+                left_tombstone,
+                created,
+                ..Default::default()
+            }),
         }
+    }
+
+    /// Whether `collection` owes ADR-231's sweep for either tombstone that could end the
+    /// life before it: its own and its database's, read through the caller's write
+    /// transaction. (The digests use [`owes_a_sweep`] for the collection's alone; the
+    /// repair is the stricter reader.)
+    fn owes_a_sweep_in_txn(
+        &self,
+        txn: &crate::engine::WriteTxn<'_>,
+        collection: &CollectionMeta,
+    ) -> Result<bool> {
+        let dropped = txn.open_table(tables::COLLECTIONS_DROPPED)?;
+        for id in [collection.id, kimmy_core::database_drop_id(&collection.db)] {
+            if let Some(raw) = dropped.get(id.0)? {
+                let stamp = codec::decode_oplog_key(raw.value())?;
+                if crate::late_drop::owes_a_sweep(collection, stamp.hlc) {
+                    return Ok(true);
+                }
+            }
+        }
+        Ok(false)
     }
 
     /// What had to wait for the commit, for every applied document whether or
@@ -3996,6 +4089,7 @@ mod tests {
             dropped_collections: Vec::new(),
             deleted_documents: Vec::new(),
             dropped_indexes: Vec::new(),
+            tombstone_horizon: None,
         };
         b.apply_snapshot_page(no_sender(), &mut SnapshotProgress::of_collection(current.id), &page)
             .unwrap();
@@ -4057,6 +4151,7 @@ mod tests {
             dropped_collections: Vec::new(),
             deleted_documents: Vec::new(),
             dropped_indexes: Vec::new(),
+            tombstone_horizon: None,
         };
         let outcome = b
             .apply_snapshot_page(no_sender(), &mut SnapshotProgress::of_collection(id), &page)
@@ -4543,6 +4638,7 @@ mod tests {
             dropped_collections: Vec::new(),
             deleted_documents: Vec::new(),
             dropped_indexes: Vec::new(),
+            tombstone_horizon: None,
         };
         let _ = own;
         b.apply_snapshot_page(a.node_id(), &mut SnapshotProgress::whole_database(), &page).unwrap();
@@ -5623,6 +5719,7 @@ mod tests {
                 stamp: delete,
             }],
             dropped_indexes: Vec::new(),
+            tombstone_horizon: None,
         };
         b.apply_snapshot_page(no_sender(), &mut SnapshotProgress::of_collection(id), &page)
             .unwrap();

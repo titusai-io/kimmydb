@@ -920,6 +920,26 @@ pub struct ClusterConfig {
     /// after scaling down holds an all-fresh cold start back until it is corrected
     /// or the marker is deleted.
     pub expected_members: Option<usize>,
+    /// Whether this member repairs what the divergence check finds: the document
+    /// repair of a confirmed cut-digest finding and the definition repair of a
+    /// confirmed definition finding. The detectors run either way.
+    ///
+    /// `true` by default. `false` makes the member behave as 0.49.0 does (detect
+    /// only): each skipped plan is counted `disabled`. It does not touch the count
+    /// half's repair, which has no switch. Read at start; a change takes a restart.
+    ///
+    /// **A rollback effect.** `ClusterConfig` refuses unknown keys, so a 0.49.0 binary
+    /// refuses to start on a config that names this key, at any value.
+    pub divergence_repair: bool,
+    /// The most live documents a collection may hold for the document repair to pull
+    /// it (a `Converge` pull is O(collection)): above it the repair is counted
+    /// `too_large` and left to the operator. Greater than zero.
+    pub repair_max_documents: u64,
+    /// The most live documents a collection may hold for the definition repair to
+    /// build an index in it: the build holds the single writer for its whole length
+    /// (ADR-220 does not judge an index build), so this bounds the hold, and it is
+    /// lower than `repair_max_documents` for that reason. Greater than zero.
+    pub repair_max_index_documents: u64,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -1292,6 +1312,9 @@ impl Default for ClusterConfig {
             catch_up_wait_secs: 120,
             expected_members: None,
             ddl_confirm_timeout_secs: 10,
+            divergence_repair: true,
+            repair_max_documents: 2_000_000,
+            repair_max_index_documents: 250_000,
         }
     }
 }
@@ -1505,6 +1528,20 @@ impl Config {
             anyhow::bail!(
                 "cluster.fanout must be greater than zero; a node that contacts no peers per \
                  round would serve replication but never pull anything itself"
+            );
+        }
+        if self.cluster.enabled && self.cluster.repair_max_documents == 0 {
+            anyhow::bail!(
+                "cluster.repair_max_documents must be greater than zero; a gate that admits no \
+                 collection would turn the document repair off without saying so (set \
+                 cluster.divergence_repair = false for that)"
+            );
+        }
+        if self.cluster.enabled && self.cluster.repair_max_index_documents == 0 {
+            anyhow::bail!(
+                "cluster.repair_max_index_documents must be greater than zero; a gate that admits \
+                 no collection would turn the definition repair off without saying so (set \
+                 cluster.divergence_repair = false for that)"
             );
         }
         if self.cluster.enabled && self.cluster.discovery_interval_secs == 0 {
@@ -2550,6 +2587,46 @@ api_key_env = "KIMMY_PROVIDER_HOSTED"
         cfg.cluster.fanout = 0;
         let err = cfg.validate().unwrap_err().to_string();
         assert!(err.contains("fanout"), "unhelpful error: {err}");
+    }
+
+    /// The repair switch and its two size gates (design v3.4, section 5): defaulted, parsed,
+    /// refused at zero when clustering is on, and a typo refused by name.
+    #[test]
+    fn the_repair_keys_default_parse_and_refuse_zero() {
+        let cfg = Config::default();
+        assert!(cfg.cluster.divergence_repair, "on by default");
+        assert_eq!(cfg.cluster.repair_max_documents, 2_000_000);
+        assert_eq!(cfg.cluster.repair_max_index_documents, 250_000);
+
+        let parsed: Config = toml::from_str(
+            "[cluster]\ndivergence_repair = false\nrepair_max_documents = 10\n\
+             repair_max_index_documents = 5\n",
+        )
+        .unwrap();
+        assert!(!parsed.cluster.divergence_repair);
+        assert_eq!(parsed.cluster.repair_max_documents, 10);
+        assert_eq!(parsed.cluster.repair_max_index_documents, 5);
+
+        // A typo is refused with the key named (`deny_unknown_fields`).
+        let err = toml::from_str::<Config>("[cluster]\ndivergence_repiar = true\n")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("divergence_repiar"), "unhelpful error: {err}");
+
+        // Zero is refused, with the key named, where the other cluster keys are: when
+        // clustering is on.
+        let mut cfg = valid();
+        cfg.cluster.enabled = true;
+        cfg.cluster.seeds = vec!["dns:seeds.internal".parse().unwrap()];
+        cfg.cluster.cluster_secret = Some("shared".into());
+        cfg.validate().unwrap();
+        cfg.cluster.repair_max_documents = 0;
+        let err = cfg.validate().unwrap_err().to_string();
+        assert!(err.contains("repair_max_documents"), "unhelpful error: {err}");
+        cfg.cluster.repair_max_documents = 1;
+        cfg.cluster.repair_max_index_documents = 0;
+        let err = cfg.validate().unwrap_err().to_string();
+        assert!(err.contains("repair_max_index_documents"), "unhelpful error: {err}");
     }
 
     #[test]

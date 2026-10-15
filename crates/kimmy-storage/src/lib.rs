@@ -47,6 +47,7 @@ pub mod snapshot;
 mod store_lock;
 pub mod sync;
 pub mod tables;
+mod tombstone_horizon;
 pub mod vectors;
 pub mod verified;
 pub mod violations_table;
@@ -67,6 +68,9 @@ mod database_drop_tests;
 
 #[cfg(test)]
 mod converge_tests;
+
+#[cfg(test)]
+mod tombstone_horizon_tests;
 
 #[cfg(test)]
 mod keep_later_writes_tests;

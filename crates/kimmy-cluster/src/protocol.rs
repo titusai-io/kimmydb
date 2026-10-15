@@ -1716,6 +1716,7 @@ mod tests {
                 dropped_collections: Vec::new(),
                 deleted_documents: Vec::new(),
                 dropped_indexes: Vec::new(),
+                tombstone_horizon: None,
             })),
         )
         .await
@@ -1770,6 +1771,7 @@ mod tests {
                 stamp: stamp(600),
             }],
             dropped_indexes: vec![(CollectionId(7), 2_032_551_883, stamp(550))],
+            tombstone_horizon: None,
         };
 
         let mut written = Vec::new();
