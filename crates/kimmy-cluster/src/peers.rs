@@ -2142,6 +2142,36 @@ fn either_side_is_catching_up(config: &ReplicationConfig, node: NodeId) -> bool 
         })
 }
 
+/// Why a confirmed finding is not planned a repair before the planner is asked (repair design
+/// sections 3 and 5): the order is the switch, the catching-up gates, then the size gate.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum RepairGate {
+    /// `cluster.divergence_repair` is off: counted `disabled`.
+    Disabled,
+    /// This member or the peer is catching up: not counted.
+    CatchingUp,
+    /// The collection holds more live documents than the gate: counted `too_large`.
+    TooLarge,
+    Open,
+}
+
+fn repair_gate(
+    config: &ReplicationConfig,
+    catching_up: bool,
+    live_documents: u64,
+    limit: u64,
+) -> RepairGate {
+    if !config.divergence_repair {
+        RepairGate::Disabled
+    } else if catching_up {
+        RepairGate::CatchingUp
+    } else if live_documents > limit {
+        RepairGate::TooLarge
+    } else {
+        RepairGate::Open
+    }
+}
+
 /// Plan a definition repair for each definition finding confirmed against `node`: the
 /// switch, the catching-up gates and the size gate, then the planner's own.
 fn plan_definition_repairs(
@@ -2164,20 +2194,21 @@ fn plan_definition_repairs(
                 "a divergence recurs after repair; repair of this collection is stopped"
             );
         }
-        if !config.divergence_repair {
-            stalls.definition_repair_refused(DigestRepairOutcome::Disabled);
-            continue;
-        }
-        if catching_up {
-            continue;
-        }
         // The requester's own count (the sender's is no concern of this build), the kept O(1)
         // figure. The apply reads it again immediately before the build: the collection can
         // grow between here and there.
         let live = engine.count_by_id(*collection).ok().flatten().unwrap_or(0);
-        if live > config.repair_max_index_documents {
-            stalls.definition_repair_refused(DigestRepairOutcome::TooLarge);
-            continue;
+        match repair_gate(config, catching_up, live, config.repair_max_index_documents) {
+            RepairGate::Disabled => {
+                stalls.definition_repair_refused(DigestRepairOutcome::Disabled);
+                continue;
+            }
+            RepairGate::TooLarge => {
+                stalls.definition_repair_refused(DigestRepairOutcome::TooLarge);
+                continue;
+            }
+            RepairGate::CatchingUp => continue,
+            RepairGate::Open => {}
         }
         if stalls.plan_definition_repair(node, *collection, config.repair_max_index_documents)
             == DigestPlan::Planned
@@ -2217,17 +2248,18 @@ fn plan_digest_repairs(
                 "a divergence recurs after repair; repair of this collection is stopped"
             );
         }
-        if !config.divergence_repair {
-            stalls.digest_repair_refused(DigestRepairOutcome::Disabled);
-            continue;
-        }
-        if catching_up {
-            continue;
-        }
         let live = engine.count_by_id(*collection).ok().flatten().unwrap_or(0);
-        if live > config.repair_max_documents {
-            stalls.digest_repair_refused(DigestRepairOutcome::TooLarge);
-            continue;
+        match repair_gate(config, catching_up, live, config.repair_max_documents) {
+            RepairGate::Disabled => {
+                stalls.digest_repair_refused(DigestRepairOutcome::Disabled);
+                continue;
+            }
+            RepairGate::TooLarge => {
+                stalls.digest_repair_refused(DigestRepairOutcome::TooLarge);
+                continue;
+            }
+            RepairGate::CatchingUp => continue,
+            RepairGate::Open => {}
         }
         let cut = state.cuts.get(&(node, *collection)).cloned().unwrap_or_default();
         if stalls.plan_digest_repair(node, *collection, cut) == DigestPlan::Planned {
@@ -4839,6 +4871,49 @@ mod definition_fold_tests {
             assert_eq!(code.matches(call).count(), 1, "{call}: once in the code");
             assert_eq!(direct.matches(call).count(), 1, "{call}: directly in the held block");
         }
+    }
+
+    /// A repair is not planned while this member or the peer is catching up: either marker
+    /// alone gates it, and a peer that is not catching up does not.
+    #[test]
+    fn either_side_catching_up_gates_a_repair() {
+        use crate::facts::Facts;
+        let peer = NodeId::from_bytes([5; 16]);
+        let dir = tempfile::tempdir().unwrap();
+        let catch_up = crate::catchup::CatchUp::open(dir.path(), Duration::from_secs(120));
+        let members = Members::default();
+        members.insert_for_test("127.0.0.1:9".parse().unwrap(), peer);
+        let mut config =
+            ReplicationConfig::new(Vec::new(), "secret".into(), "127.0.0.1:1".parse().unwrap());
+        config.catch_up = Some(Arc::clone(&catch_up));
+        config.members = Some(members.clone());
+        let hear = |catching_up: bool| {
+            members.record_peer_facts_for_test(
+                peer,
+                Facts { boot: vec![1; 16], catching_up, ..Facts::default() },
+                Duration::ZERO,
+            );
+        };
+        hear(false);
+        assert!(!either_side_is_catching_up(&config, peer), "neither side is");
+        hear(true);
+        assert!(either_side_is_catching_up(&config, peer), "the peer says it is");
+        hear(false);
+        catch_up.mark(crate::facts::CatchUpReason::Snapshot).unwrap();
+        assert!(either_side_is_catching_up(&config, peer), "this member's marker is set");
+    }
+
+    /// The gates before the planner, in order: the switch wins over everything, then a side
+    /// catching up, then the size, at the boundary.
+    #[test]
+    fn the_gates_before_the_planner_are_in_order_and_the_size_gate_is_at_the_boundary() {
+        let mut config =
+            ReplicationConfig::new(Vec::new(), "secret".into(), "127.0.0.1:1".parse().unwrap());
+        assert_eq!(repair_gate(&config, false, 10, 10), RepairGate::Open, "at the gate");
+        assert_eq!(repair_gate(&config, false, 11, 10), RepairGate::TooLarge);
+        assert_eq!(repair_gate(&config, true, 11, 10), RepairGate::CatchingUp, "before size");
+        config.divergence_repair = false;
+        assert_eq!(repair_gate(&config, true, 11, 10), RepairGate::Disabled, "before all");
     }
 
     /// The tick plans a document repair from each confirmed digest finding and a definition

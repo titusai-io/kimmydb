@@ -10451,3 +10451,33 @@ async fn a_lost_unique_index_stays_a_finding_and_is_never_repaired() {
     assert_eq!(last.definition_divergent_collections, 1, "the finding stands");
     let _ = totals;
 }
+
+#[tokio::test]
+async fn a_member_that_is_catching_up_plans_no_repair() {
+    use kimmy_cluster::DigestRepairOutcome;
+    let (a, b, _ca) = a_and_b_with_a_lost_update().await;
+    let dir = tempfile::tempdir().unwrap();
+    let catch_up = kimmy_cluster::catchup::CatchUp::open(dir.path(), Duration::from_secs(120));
+    catch_up.mark(kimmy_cluster::facts::CatchUpReason::Snapshot).unwrap();
+    let seen = std::cell::Cell::new(0u32);
+    let (totals, last) = repair_loop(
+        &a,
+        &b,
+        |config| {
+            config.catch_up = Some(Arc::clone(&catch_up));
+            // The marker clears only against this many members; two are reached.
+            config.expected_members = Some(3);
+        },
+        |report, _| {
+            // Wait until the finding has been confirmed and stood for a few more ticks.
+            if report.digest_divergent_collections == 1 {
+                seen.set(seen.get() + 1);
+            }
+            seen.get() >= 8
+        },
+    )
+    .await;
+    assert_eq!(version_of(&b, 2), 0, "a repair ran while this member was catching up");
+    assert_eq!(totals.digest_repairs[DigestRepairOutcome::Applied.index()], 0, "{totals:?}");
+    assert_eq!(last.digest_divergent_collections, 1);
+}
