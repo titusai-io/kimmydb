@@ -794,3 +794,25 @@ fn an_index_made_before_the_collections_tombstone_is_history() {
 fn an_index_made_before_the_databases_tombstone_is_history() {
     an_index_before_a_tombstone_is_history(kimmy_core::database_drop_id("shop"));
 }
+
+/// A tombstone recorded between the check and the build (a late-drop sweep's first step, or a
+/// drop landing meanwhile) is judged again under the writer.
+#[test]
+fn a_tombstone_recorded_between_the_check_and_the_build_makes_the_index_history() {
+    let (a, b, _d) = pair();
+    later();
+    index(&a, "v", "by_v");
+    let b = std::rc::Rc::new(b);
+    let competing = std::rc::Rc::clone(&b);
+    let (done, ()) = crate::sync::race_hooks::race(
+        crate::sync::race_hooks::Race::DefinitionRepair,
+        move || {
+            later();
+            let at = kimmy_core::Stamp::new(Hlc::new(crate::physical_now_ms(), 0), a_node());
+            competing.record_collection_drop(orders(), at).unwrap();
+        },
+        || repair(&b, &a, BIG),
+    );
+    assert_eq!(done.definitions, DefinitionRestore { history: 1, ..Default::default() });
+    assert!(names(&b).is_empty(), "an index made before a tombstone was built");
+}
