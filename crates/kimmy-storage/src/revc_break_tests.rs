@@ -1414,9 +1414,13 @@ fn random_history(seed: u64, steps: usize) -> Seen {
     seen
 }
 
-#[test]
-fn revc_random_histories_never_let_a_repair_create_a_ghost() {
-    let seeds: u64 = std::env::var("REVC_SEEDS").ok().and_then(|v| v.parse().ok()).unwrap_or(40);
+/// The oracle over `default_seeds` random histories (`REVC_SEEDS` overrides). Forty seeds take
+/// about 150 s here and about 540 s on a CI runner, which is the nextest limit's neighbourhood
+/// (`.config/nextest.toml`: ten minutes), so the suite runs a dozen (about 45 s here) and the
+/// full count is the `#[ignore]`d test below.
+fn random_histories_never_let_a_repair_create_a_ghost(default_seeds: u64) {
+    let seeds: u64 =
+        std::env::var("REVC_SEEDS").ok().and_then(|v| v.parse().ok()).unwrap_or(default_seeds);
     let steps: usize = std::env::var("REVC_STEPS").ok().and_then(|v| v.parse().ok()).unwrap_or(250);
     let mut total = Seen::default();
     for seed in 1..=seeds {
@@ -1456,4 +1460,16 @@ fn revc_random_histories_never_let_a_repair_create_a_ghost() {
         total.violations.len(),
         total.violations.first()
     );
+}
+
+#[test]
+fn revc_random_histories_never_let_a_repair_create_a_ghost() {
+    random_histories_never_let_a_repair_create_a_ghost(12);
+}
+
+/// The same oracle over forty histories, the count the review ran.
+#[test]
+#[ignore = "about 150 s here, 540 s on a CI runner; run with --ignored"]
+fn revc_random_histories_full_count_never_let_a_repair_create_a_ghost() {
+    random_histories_never_let_a_repair_create_a_ghost(40);
 }
