@@ -2587,11 +2587,14 @@ where
         // (ADR-152). A pull that does not finish inside the round leaves
         // its pages applied and its cursor with `stalls`, and the next
         // round with this peer goes on from there.
+        //
+        // A count repair's replay the peer cannot serve (it holds that history
+        // only as a snapshot's state, ADR-224, or the collection's creation has
+        // left its oplog) falls back to that collection's snapshot too
+        // (ADR-236): pulled as the whole database, every repeat of it was a
+        // whole-database pull that marked this member catching up.
         Message::BeyondHorizon {} => {
-            let scope = match repair {
-                Some((collection, Repair::Snapshot)) => Some(collection),
-                _ => None,
-            };
+            let scope = repair.map(|(collection, _)| collection);
             // An ordinary pull refused by a peer is set aside once rather than
             // answered with a whole-database snapshot at once (ADR-224): the
             // peer may only hold a hole, and another member may serve this one by
@@ -3697,8 +3700,12 @@ impl PeerStalls {
     /// serves, if it serves one, advanced, and its stall run starts again —
     /// exactly as a replay's does when its window moves (ADR-152).
     fn snapshot_advanced(&mut self, peer: NodeId) {
+        let scope = self.snapshots.get(&peer).and_then(SnapshotProgress::scope);
         if let Some(repairs) = self.repairs.get_mut(&peer)
-            && matches!(repairs.active, Some((_, Repair::Snapshot)))
+            && let Some((collection, repair)) = repairs.active
+            // Its own snapshot, or the snapshot of its collection a refused replay
+            // fell back to.
+            && (repair == Repair::Snapshot || scope == Some(collection))
         {
             repairs.advanced = true;
         }
@@ -6314,6 +6321,171 @@ mod tests {
         peer.await.unwrap();
         assert_eq!(outcome.purge_pending, 0, "{outcome:?}");
         assert!(engine.get_collection("shop", "gone").is_ok(), "the creation applied");
+    }
+
+    /// A count repair is a replay of the collection's history (ADR-148). A peer that
+    /// cannot serve it (it holds that history only as a snapshot's state, ADR-224, or the
+    /// collection's creation has left its oplog) answers `BeyondHorizon`, and the repair
+    /// falls back to the peer's snapshot of **that collection**, as a repair's snapshot is
+    /// scoped (ADR-152): it used to pull the whole database, and to mark this member
+    /// catching up, which it is not, for a repair of one collection.
+    #[tokio::test]
+    async fn a_refused_count_replay_pulls_the_collections_snapshot_and_marks_nothing() {
+        use tokio::io::DuplexStream;
+
+        let dir = tempfile::tempdir().unwrap();
+        let engine = Engine::open(&dir.path().join("kimmy.redb")).unwrap();
+        let orders = engine.create_collection("shop", "orders").unwrap();
+        let origin = node(3);
+        let theirs = vector(&[(origin, 9_000)]);
+
+        async fn fake_peer(
+            mut stream: DuplexStream,
+            theirs: VersionVector,
+            orders: CollectionId,
+            page: SnapshotPage,
+        ) {
+            match read_frame(&mut stream).await.unwrap() {
+                Message::AskVersions { witnessed: true, .. } => {}
+                other => panic!("expected AskVersions, got {other:?}"),
+            }
+            let answer = Message::Vectors {
+                servable: theirs.clone(),
+                witnessed: theirs,
+                facts: None,
+                facts_gen: None,
+                echo: None,
+                replay_from: None,
+            };
+            write_frame(&mut stream, &answer).await.unwrap();
+            match read_frame(&mut stream).await.unwrap() {
+                Message::AskEntries { .. } => {}
+                other => panic!("expected AskEntries, got {other:?}"),
+            }
+            write_frame(&mut stream, &Message::BeyondHorizon {}).await.unwrap();
+            match read_frame(&mut stream).await.unwrap() {
+                Message::AskSnapshot { after: None, collection } => {
+                    assert_eq!(collection, Some(orders), "the repair's own collection")
+                }
+                other => panic!("expected AskSnapshot, got {other:?}"),
+            }
+            write_frame(&mut stream, &Message::Snapshot(Box::new(page))).await.unwrap();
+            if let Ok(Message::AskDivergence { .. }) = read_frame(&mut stream).await {
+                let divergence = Message::Divergence {
+                    collections: Vec::new(),
+                    probe_count: None,
+                    incarnations: Vec::new(),
+                    digests: None,
+                    digest_busy: false,
+                    definitions: None,
+                };
+                let _ = write_frame(&mut stream, &divergence).await;
+            }
+        }
+
+        let marker_dir = tempfile::tempdir().unwrap();
+        let catch_up = crate::catchup::CatchUp::open(marker_dir.path(), Duration::from_secs(120));
+        assert!(catch_up.marker().is_none(), "premise: not catching up");
+        let addr: SocketAddr = "127.0.0.1:1".parse().unwrap();
+        let mut stalls = PeerStalls::new();
+        stalls.set_catch_up(Some(Arc::clone(&catch_up)));
+        assert!(stalls.plan_repair(
+            node(9),
+            orders.id,
+            Repair::Replay { from: Hlc::new(1_000, 0) }
+        ));
+
+        let (ours, peer_end) = tokio::io::duplex(MAX_FRAME);
+        let page = snapshot_page(origin, &[2_000], None, theirs.clone(), true);
+        let peer = tokio::spawn(fake_peer(peer_end, theirs, orders.id, page));
+        let outcome = sync_over(&engine, ours, addr, node(9), None, &mut stalls).await.unwrap();
+        peer.await.unwrap();
+        assert!(outcome.repairing, "{outcome:?}");
+        assert!(catch_up.marker().is_none(), "a repair of one collection marks nothing");
+        assert!(!stalls.repairing(node(9)), "the snapshot finished the repair");
+    }
+
+    /// And that snapshot, cut short a page a round, advances the repair it serves, so
+    /// the repair is not abandoned after `REPAIR_ATTEMPTS` rounds that each landed a page
+    /// of it: it resumes from its cursor until it completes.
+    #[tokio::test]
+    async fn a_refused_count_replays_snapshot_resumes_until_it_completes() {
+        use tokio::io::DuplexStream;
+
+        let dir = tempfile::tempdir().unwrap();
+        let engine = Engine::open(&dir.path().join("kimmy.redb")).unwrap();
+        let orders = engine.create_collection("shop", "orders").unwrap();
+        let origin = node(3);
+        let theirs = vector(&[(origin, 9_000)]);
+
+        async fn fake_peer(
+            mut stream: DuplexStream,
+            theirs: VersionVector,
+            orders: CollectionId,
+            expect_after: Option<kimmy_storage::SnapshotCursor>,
+            page: SnapshotPage,
+        ) {
+            let _ = read_frame(&mut stream).await.unwrap();
+            let answer = Message::Vectors {
+                servable: theirs.clone(),
+                witnessed: theirs,
+                facts: None,
+                facts_gen: None,
+                echo: None,
+                replay_from: None,
+            };
+            write_frame(&mut stream, &answer).await.unwrap();
+            match read_frame(&mut stream).await.unwrap() {
+                Message::AskEntries { .. } => {}
+                other => panic!("expected AskEntries, got {other:?}"),
+            }
+            write_frame(&mut stream, &Message::BeyondHorizon {}).await.unwrap();
+            match read_frame(&mut stream).await.unwrap() {
+                Message::AskSnapshot { after, collection } => {
+                    assert_eq!(collection, Some(orders), "the repair's own collection");
+                    assert_eq!(after, expect_after, "resumed from its cursor");
+                }
+                other => panic!("expected AskSnapshot, got {other:?}"),
+            }
+            write_frame(&mut stream, &Message::Snapshot(Box::new(page))).await.unwrap();
+            if let Ok(Message::AskDivergence { .. }) = read_frame(&mut stream).await {
+                let divergence = Message::Divergence {
+                    collections: Vec::new(),
+                    probe_count: None,
+                    incarnations: Vec::new(),
+                    digests: None,
+                    digest_busy: false,
+                    definitions: None,
+                };
+                let _ = write_frame(&mut stream, &divergence).await;
+            }
+        }
+
+        let addr: SocketAddr = "127.0.0.1:1".parse().unwrap();
+        let mut stalls = PeerStalls::new();
+        assert!(stalls.plan_repair(
+            node(9),
+            orders.id,
+            Repair::Replay { from: Hlc::new(1_000, 0) }
+        ));
+        let pages = u64::from(REPAIR_ATTEMPTS) + 1;
+        let mut after = None;
+        for n in 0..pages {
+            let wall = 1_000 * (n + 1);
+            let next = (n + 1 < pages).then(|| cursor(wall));
+            let page = snapshot_page(origin, &[wall], next.clone(), theirs.clone(), n == 0);
+            let (mut ours, peer_end) = tokio::io::duplex(MAX_FRAME);
+            let peer =
+                tokio::spawn(fake_peer(peer_end, theirs.clone(), orders.id, after.clone(), page));
+            let clock = RoundClock::default();
+            sync_round(&engine, &mut ours, addr, node(9), None, &mut stalls, spent(), &clock)
+                .await
+                .unwrap();
+            drop(ours);
+            peer.await.unwrap();
+            after = next;
+        }
+        assert!(!stalls.repairing(node(9)), "the snapshot completed and finished the repair");
     }
 
     #[tokio::test]
