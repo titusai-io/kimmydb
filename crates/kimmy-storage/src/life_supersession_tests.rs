@@ -10,7 +10,7 @@
 //! not a life ended.
 
 use bson::doc;
-use kimmy_core::{CollectionId, DocId, Hlc, OpKind};
+use kimmy_core::{CollectionId, DocId, Hlc, OpKind, Stamp};
 
 use crate::{Engine, SnapshotProgress, WalkScope};
 
@@ -574,6 +574,49 @@ fn a_burial_from_a_whole_page_takes_the_stamp_of_the_tombstone_it_carries() {
         b.collection_dropped_at(orders_id()).unwrap(),
         Some(dropped),
         "the burial named the drop by its maker's stamp"
+    );
+}
+
+/// The carried tombstone names the burial only when it is the drop the floor stands for
+/// (the floor's own `Hlc`): one of another drop, which the page carries for the same id,
+/// leaves the burial at the floor with the sender's node.
+#[test]
+fn a_burial_from_a_whole_page_ignores_a_carried_tombstone_of_another_drop() {
+    let (a, _da) = engine();
+    let (b, _db) = engine();
+    let (c, _dc) = engine();
+    let first = a.create_collection("shop", "orders").unwrap();
+    a.insert(&first, doc! { "_id": 1 }).unwrap();
+    transfer(&b, &a);
+    later();
+    a.drop_collection("shop", "orders").unwrap();
+    a.finish_purges_now().unwrap();
+    let dropped = a.collection_dropped_at(orders_id()).unwrap().expect("the drop's tombstone");
+    transfer_under(&c, &a, SnapshotProgress::of_collection(orders_id()));
+    later();
+    a.create_collection("shop", "orders").unwrap();
+    transfer_under(&c, &a, SnapshotProgress::of_collection(orders_id()));
+    let on_c = c.get_collection("shop", "orders").unwrap();
+    c.insert(&on_c, doc! { "_id": 2 }).unwrap();
+    let mut page = c.snapshot_page(None, None).unwrap();
+    assert!(page.next.is_none(), "premise: one page");
+    let other = Stamp::new(Hlc::new(dropped.hlc.wall_ms + 1, 0), a.node_id());
+    for (id, stamp) in page.dropped_collections.iter_mut() {
+        if *id == orders_id() {
+            *stamp = other;
+        }
+    }
+    let mut progress = SnapshotProgress::whole_database();
+    if b.apply_snapshot_page(c.node_id(), &mut progress, &page).unwrap().purge_pending.is_some() {
+        // The burial's rows are the purger's before the new life can stand.
+        b.finish_purges_now().unwrap();
+        b.apply_snapshot_page(c.node_id(), &mut progress, &page).unwrap();
+    }
+    assert!(!has(&b, 1) && has(&b, 2), "the life before ended and the new one stands");
+    assert_eq!(
+        b.collection_dropped_at(orders_id()).unwrap(),
+        Some(Stamp::new(dropped.hlc, c.node_id())),
+        "the burial took a tombstone of another drop"
     );
 }
 

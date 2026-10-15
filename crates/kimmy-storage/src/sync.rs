@@ -7832,6 +7832,36 @@ mod tests {
         assert!(b.witnessed_vector().unwrap().covers(&a.version_vector().unwrap()));
     }
 
+    /// The tie is the drop's under the writer too (ADR-236): a drop in the creation's own
+    /// `Hlc`, from a node below the creator's, that lands between the creation's check and
+    /// its writer makes the creation history.
+    #[test]
+    fn a_drop_in_the_creations_own_hlc_that_lands_while_it_applies_makes_it_history() {
+        let (a, _da) = engine();
+        let (b, _db) = engine();
+        let b = Arc::new(b);
+        a.create_collection("shop", "orders").unwrap();
+        let (_, window) = window_for(&b, &a);
+        let create = window
+            .entries
+            .iter()
+            .find(|e| e.kind == OpKind::CreateCollection)
+            .cloned()
+            .expect("the creation's entry");
+        let below = Stamp::new(create.stamp.hlc, kimmy_core::NodeId::from_bytes([0; 16]));
+        assert!(below < create.stamp, "premise: the drop sorts below the creation");
+        let landing = Arc::clone(&b);
+        let id = create.collection;
+        let (applied, ()) = race_hooks::race(
+            race_hooks::Race::ReplicatedCreate,
+            move || landing.record_collection_drop(id, below).unwrap(),
+            || b.apply_batch(std::slice::from_ref(&create)),
+        );
+        applied.unwrap();
+        assert!(b.get_collection("shop", "orders").is_err(), "a creation in the drop's Hlc stood");
+        race_hooks::assert_absorbed(race_hooks::Race::ReplicatedCreate);
+    }
+
     /// A definition in the drop's own `Hlc`, from a node above the dropper's, is of the
     /// life the drop ended (ADR-236: a tie is the drop's), so it is history for a
     /// collection this node dropped and does not stop the batch: no later life can carry

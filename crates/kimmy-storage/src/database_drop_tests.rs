@@ -176,6 +176,40 @@ fn a_life_created_over_its_databases_tombstone_takes_its_own_and_its_shadows() {
     }
 }
 
+/// A local creation is minted above the floor it takes, the boundary included (ADR-236):
+/// a clock whose next tick is the floor's own `Hlc` (a tombstone recorded without moving
+/// the clock, as a scoped page's unvouched drop is) mints above it, so no other member
+/// takes the creation for one in the drop's own `Hlc`, which is the drop's.
+#[test]
+fn a_local_creation_whose_next_tick_is_its_floors_hlc_is_minted_above_it() {
+    let (e, _d) = engine();
+    let ahead = crate::physical_now_ms() + 3_600_000;
+    let floor = Stamp::new(Hlc::new(ahead, 1), NodeId::from_bytes([7; 16]));
+    e.record_collection_drop(CollectionId::derive("shop", "orders"), floor).unwrap();
+    e.witness_processed(&Stamp::new(Hlc::new(ahead, 0), NodeId::from_bytes([7; 16]))).unwrap();
+    let created = e.create_collection("shop", "orders").unwrap();
+    assert_eq!(created.incarnation_floor, Some(floor.hlc), "premise: floored at the tombstone");
+    assert!(created.created > floor.hlc, "minted at or below its floor: {:?}", created.created);
+}
+
+/// A sweep that keeps a covered life's later writes says so (ADR-236): counted in
+/// `kept`, and among the collections whose streams it ends.
+#[test]
+fn a_database_sweep_counts_a_life_it_kept() {
+    let (e, _d) = engine();
+    let orders = e.create_collection("shop", "orders").unwrap();
+    e.insert(&orders, doc! { "_id": "before" }).unwrap();
+    later();
+    let dropped = Stamp::new(Hlc::new(crate::physical_now_ms(), 0), NodeId::from_bytes([7; 16]));
+    later();
+    e.insert(&orders, doc! { "_id": "after" }).unwrap();
+    e.record_database_tombstone_for_test(kimmy_core::database_drop_id("shop"), dropped).unwrap();
+    let swept = e.bury_under_database_tombstones().unwrap();
+    assert_eq!((swept.kept, swept.spared, swept.buried.len()), (1, 0, 1), "{swept:?}");
+    let kept = e.get_collection("shop", "orders").unwrap();
+    assert!(kept.is_redated() && kept.created > dropped.hlc, "{kept:?}");
+}
+
 /// Control: a collection created after the drop stands and replicates. The
 /// pair with the two tests above is what tells the fix from "refuse every
 /// collection of a database that was ever dropped".

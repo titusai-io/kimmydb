@@ -318,6 +318,36 @@ fn a_database_tombstone_that_comes_after_a_kept_life_removes_a_write_made_before
     assert_counts_exact(&d, "a database drop after a kept life");
 }
 
+/// A whole page of the life the receiver's floor says has ended brings the definitions
+/// that life made after the drop, an index and a vector configuration, into the life
+/// standing here (ADR-236): the drop keeps them, and the sender's life will once it hears
+/// the drop. Refused with the life, as they were, the receiver took the coverage of their
+/// entries and never held them.
+#[test]
+fn a_whole_page_brings_the_definitions_its_drop_keeps_into_the_newer_life() {
+    let (a, d, _da, _dd, _id) = a_and_d_holding_the_old_life();
+    assert!(a.drop_collection("shop", "orders").unwrap());
+    a.finish_purges_now().unwrap();
+    later();
+    d.create_index("shop", "orders", vec![IndexField::ascending("k")], false, Some("by_k".into()))
+        .unwrap();
+    d.configure_vectors("shop", "orders", byo_config()).unwrap();
+    later();
+    let newer = a.create_collection("shop", "orders").unwrap();
+    assert!(newer.incarnation_floor.is_some(), "premise: floored at the drop");
+    let page = d.snapshot_page(None, None).unwrap();
+    a.apply_snapshot_page(d.node_id(), &mut SnapshotProgress::whole_database(), &page).unwrap();
+    let standing = a.get_collection("shop", "orders").unwrap();
+    assert_eq!(standing.created, newer.created, "premise: the newer life stands");
+    assert!(standing.index("by_k").is_some(), "the index was refused: {:?}", standing.indexes);
+    assert!(standing.vector.is_some(), "the vector configuration was refused");
+    assert_eq!(
+        docs_of(&a, "orders", &[1]),
+        Vec::<i64>::new(),
+        "the life before's document stays out"
+    );
+}
+
 /// An explicit collection drop that reaches a member in a whole-database page
 /// keeps a write stamped after it, as the entry would, in whichever order the
 /// page lists its tombstones.
