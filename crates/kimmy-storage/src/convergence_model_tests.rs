@@ -524,6 +524,10 @@ struct Cluster {
     /// The highest cutoff any member collected garbage at.
     gc_cutoff: Option<Hlc>,
     aged_out: bool,
+    /// The latest time an age-out collected at: retention has passed for the stamps below
+    /// it, and at quiescence every member collects at it, as each one's own retention pass
+    /// would once that time is past.
+    aged_out_at: Option<u64>,
     step: usize,
     /// Set by `PurgerOff`: purges run only at `Purge` steps until quiescence.
     defer_purges: bool,
@@ -557,6 +561,7 @@ impl Cluster {
             fallbacks: 0,
             gc_cutoff: None,
             aged_out: false,
+            aged_out_at: None,
             step: 0,
             defer_purges: false,
             clock_behind: Vec::new(),
@@ -1027,6 +1032,9 @@ impl Cluster {
             self.gc_cutoff = Some(at);
         }
         self.aged_out |= aged_out;
+        if aged_out && self.aged_out_at.is_none_or(|held| held < cutoff + 1_000) {
+            self.aged_out_at = Some(cutoff + 1_000);
+        }
         let s = format!(
             "{} collected below {} ({} entries, {} tombstones)",
             LETTERS[m],
@@ -1062,6 +1070,26 @@ impl Cluster {
         // The purger catches up.
         self.defer_purges = false;
         self.finish_purges()?;
+        // Retention is a matter of time, not of the member: an age-out says a member's
+        // retention passed what it held, and by quiescence every member's own pass has
+        // collected at that time too, its tombstones included (ADR-236 item 4). The age-out
+        // step keeps its one-member meaning for the state the schedule runs on.
+        if let Some(now) = self.aged_out_at {
+            for (m, letter) in LETTERS.iter().enumerate() {
+                let out = self
+                    .e(m)
+                    .collect_garbage_at(now, RetentionPolicy::new(1, 1))
+                    .map_err(|e| err("collect_garbage", e))?;
+                if !out.is_empty() {
+                    let s = format!(
+                        "{letter} collected at quiescence ({} entries, {} tombstones)",
+                        out.oplog_removed, out.tombstones_removed
+                    );
+                    self.note(s);
+                }
+            }
+            self.finish_purges()?;
+        }
         for _ in 0..QUIESCE_ROUNDS {
             let before = self.fingerprint()?;
             for to in 0..3 {
@@ -2640,6 +2668,50 @@ fn row_a_relay_without_the_floor_after_the_drop_aged_out() {
         &[(ORDERS, Some(&[2]))],
         &[Route::Pages],
     );
+}
+
+/// A later-life stop past retention (ADR-236 item 4): B collects C's drop of `orders` before A
+/// hears it and grants A the coverage of it, so A, holding the life with an index made after
+/// the drop, never hears the drop, and C stops at the index on every pull while it holds the
+/// drop's tombstone. C's own retention pass collects that tombstone at the same age, and the
+/// stop then clears: the index's life arrives with the scoped page, as for a collection C has
+/// no record of. Generated AgedOut seed 6883 as found, and a shape that reaches the stop by
+/// entries alone; both converge on every route once every member has collected.
+#[test]
+fn row_a_later_life_stop_past_retention_clears_once_every_member_collects() {
+    let variants = [
+        (
+            "seed 6883",
+            parse(
+                "purger off; A.create(orders)@90; C.create(orders)@120; \
+                 B.dropindex(orders,j_1)@110; C.drop(orders)@140; B.create(orders)@130; \
+                 B<-C entries; A.index(orders,k_1:asc)@150; C.gc; B.ageout; B.ageout; \
+                 B<-A entries",
+            ),
+        ),
+        (
+            "by entries alone",
+            parse(
+                "A.create(orders)@90; C.create(orders)@120; B.create(orders)@130; \
+                 C<-B entries; C.drop(orders)@140; B<-C entries; A.index(orders,k_1:asc)@150; \
+                 B.ageout; B<-A entries; A<-B whole",
+            ),
+        ),
+    ];
+    if census_takes("a stop past retention", &[], &variants, &[(ORDERS, Some(&[]))]) {
+        return;
+    }
+    for (variant, ops) in &variants {
+        let mut outcomes = check(ops);
+        for outcome in &mut outcomes {
+            expected_end(ops, outcome, &[(ORDERS, Some(&[]))]);
+        }
+        assert!(
+            outcomes.iter().all(|o| o.failures.is_empty()),
+            "{variant}: every route converges, the pure entries one included\n{}",
+            render(ops, &outcomes)
+        );
+    }
 }
 
 /// F9. The tombstone ADR-235 records for the drop a page's floor stands for is stamped
