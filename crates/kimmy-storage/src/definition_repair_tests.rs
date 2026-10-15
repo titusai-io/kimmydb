@@ -354,6 +354,7 @@ fn an_index_this_build_cannot_apply_is_refused_counted_and_leaves_a_hint() {
         }
     });
     assert_eq!(done.definitions, DefinitionRestore { refused: 1, ..Default::default() });
+    assert_eq!(done.ddl_refused, 1, "counted in kimmy_sync_ddl_refused_total");
     assert!(names(&b).is_empty());
     // And the refusal is remembered, so the next comparison is explained and not a finding.
     assert_eq!(b.refusal_hints(orders()).unwrap().len(), 1, "no refusal hint was written");

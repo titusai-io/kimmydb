@@ -395,6 +395,28 @@ fn run_definition_to_the_end(stalls: &mut PeerStalls, peer: NodeId, built: usize
     stalls.repair_finished(peer);
 }
 
+/// A definition page that did not carry the collection ends the repair as transient, not as a
+/// judged end that would climb the back-off.
+#[test]
+fn a_definition_page_that_names_no_such_collection_is_a_transient_end() {
+    let mut stalls = stalls_at(mins(1));
+    let p = node(1);
+    assert_eq!(stalls.plan_definition_repair(p, C, 1_000), DigestPlan::Planned);
+    assert_eq!(due(&mut stalls, p), Some((C, Repair::Definitions)));
+    let applied = kimmy_storage::SnapshotApplied {
+        definitions: kimmy_storage::DefinitionRestore { gone: 1, ..Default::default() },
+        ..Default::default()
+    };
+    stalls.definitions_page_applied(p, &applied);
+    stalls.repair_finished(p);
+    let counts = stalls.take_repair_counts();
+    assert_eq!(counts.definition_repairs[DigestRepairOutcome::Transient.index()], 1);
+    assert_eq!(counts.definition_repairs[DigestRepairOutcome::Applied.index()], 0);
+    // Nothing to judge: it plans again at once.
+    stalls.retain_definition(p, &BTreeSet::new());
+    assert_eq!(stalls.plan_definition_repair(p, C, 1_000), DigestPlan::Planned);
+}
+
 #[test]
 fn a_definition_repair_is_independent_of_a_count_repair_of_the_collection() {
     let mut stalls = stalls_at(mins(1));

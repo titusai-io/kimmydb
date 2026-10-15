@@ -545,3 +545,36 @@ fn a_member_is_removed_only_after_the_grace_and_the_tracker_follows() {
     );
     assert_eq!(stalls.retain_ledger(&held, None), None, "no member list, nothing judged");
 }
+
+/// A plan gate counts a standing finding once, not at every contact it stands; the count
+/// starts again when the finding has gone.
+#[test]
+fn a_refused_plan_is_counted_once_per_standing_finding() {
+    let mut stalls = PeerStalls::new();
+    let (p, c) = (node(1), CollectionId(3));
+    for _ in 0..5 {
+        stalls.digest_repair_refused(p, c, DigestRepairOutcome::TooLarge);
+        stalls.definition_repair_refused(p, c, DigestRepairOutcome::Disabled);
+    }
+    stalls.digest_repair_refused(p, c, DigestRepairOutcome::Disabled);
+    let counts = stalls.take_repair_counts();
+    assert_eq!(counts.digest_repairs[DigestRepairOutcome::TooLarge.index()], 1);
+    assert_eq!(counts.digest_repairs[DigestRepairOutcome::Disabled.index()], 1, "its own label");
+    assert_eq!(counts.definition_repairs[DigestRepairOutcome::Disabled.index()], 1);
+    // The finding clears and comes back: refused (and counted) again.
+    stalls.retain_digest(p, &BTreeSet::new());
+    stalls.digest_repair_refused(p, c, DigestRepairOutcome::TooLarge);
+    stalls.digest_repair_refused(p, c, DigestRepairOutcome::TooLarge);
+    assert_eq!(
+        stalls.take_repair_counts().digest_repairs[DigestRepairOutcome::TooLarge.index()],
+        1
+    );
+    // And a count repair's skip is counted the same way.
+    assert!(stalls.plan_repair(p, c, Repair::Snapshot));
+    for _ in 0..3 {
+        stalls.plan_digest_repair(p, c, VersionVector::default());
+    }
+    let skipped =
+        stalls.take_repair_counts().digest_repairs[DigestRepairOutcome::SkippedCountRepair.index()];
+    assert_eq!(skipped, 1);
+}

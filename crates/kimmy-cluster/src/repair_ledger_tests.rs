@@ -728,7 +728,7 @@ fn the_third_transient_end_in_a_row_climbs_one_level_and_a_result_in_between_res
     let mut l = ledger();
     let k = key(1, 1);
     let mut t = mins(0);
-    let mut transient = |l: &mut RepairLedger, t: &mut Duration| -> Option<Verdict> {
+    let transient = |l: &mut RepairLedger, t: &mut Duration| -> Option<Verdict> {
         assert_eq!(l.may_plan(k, *t), MayPlan::Yes, "at {t:?}");
         l.started(k, *t);
         l.ended(k, *t, End::Transient(Transient::PeerError))

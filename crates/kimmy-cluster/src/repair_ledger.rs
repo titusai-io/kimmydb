@@ -34,7 +34,7 @@ use kimmy_core::{CollectionId, NodeId};
 
 /// Which finding a repair answers. The count half has its own cooldown and no
 /// ledger entry.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum LedgerKind {
     /// A confirmed cut-digest finding: a `Converge` pull.
     Digest,

@@ -142,7 +142,9 @@ impl crate::Engine {
             None => DefinitionRestore { gone: 1, ..Default::default() },
         };
         progress.finish_after_one_page();
-        Ok(SnapshotApplied { definitions, ..Default::default() })
+        // A definition this build cannot apply is counted where a refusal reached through the
+        // oplog or a whole-database page is (ADR-123).
+        Ok(SnapshotApplied { ddl_refused: definitions.refused, definitions, ..Default::default() })
     }
 
     /// Build at most one plain index `state` carries and this member lacks, if every

@@ -238,7 +238,7 @@ pub struct RoundReport {
     /// place until the purge is done; nothing is missing, so no repair is
     /// planned.
     pub entries_skipped_purge_pending: usize,
-    /// Pulls in this tick spent repairing against a peer (ADR-148):
+    /// Pulls in this tick spent on a *count* repair against a peer (ADR-148):
     /// re-serving its oplog from below this node's position, or pulling its
     /// snapshot, because the check confirmed a divergence against it or a
     /// batch stopped at a collection this node lacks. A counter. Rising is
@@ -1032,6 +1032,13 @@ pub async fn replicate(engine: Arc<Engine>, config: ReplicationConfig) {
                 // rule out. `advance_probe_on` is where that decision lives,
                 // pulled out on its own so it is a function with a test
                 // rather than a branch inside this loop.
+                // The loop guard's clock and its unjudged deadlines do not wait on the
+                // listing: a storage hiccup there must not hold a repair in `awaiting`
+                // past its deadline.
+                stalls.set_repair_time(tick_started.saturating_duration_since(loop_started));
+                for (key, verdict) in stalls.expire_repairs() {
+                    log_repair_verdict(key.peer, key.collection, verdict);
+                }
                 let mine_collections = engine.all_collection_ids();
                 if let Ok(held) = &mine_collections {
                     digest_state.prune(held);
@@ -1047,11 +1054,8 @@ pub async fn replicate(engine: Arc<Engine>, config: ReplicationConfig) {
                         tick_started.saturating_duration_since(loop_started),
                         config.sync_interval * u32::try_from(held.len().max(1)).unwrap_or(u32::MAX),
                     );
-                    for (key, verdict) in stalls.expire_repairs() {
-                        log_repair_verdict(key.peer, key.collection, verdict);
-                    }
                     let known = stalls.retain_ledger(held, members.as_ref());
-                    divergence.retain_members(known.as_ref());
+                    retain_tracker_members(&mut divergence, known.as_ref(), config.divergence_repair);
                 }
                 if let Err(e) = &mine_collections {
                     warn!(error = %e, "divergence check: could not list this node's own \
@@ -1265,7 +1269,7 @@ pub async fn replicate(engine: Arc<Engine>, config: ReplicationConfig) {
                         Ok(mut outcome) => {
                             contact.pulled(&outcome, took);
                             health.succeeded(peer);
-                            report.repair_rounds += usize::from(outcome.repairing);
+                            report.repair_rounds += usize::from(outcome.count_repair);
                             // More of the peer's oplog behind the cap, and
                             // budget left to go and get it: this contact is
                             // not over, so nothing below runs for it yet.
@@ -1998,6 +2002,24 @@ impl DigestState {
     }
 }
 
+/// R7 for the divergence tracker: forget the confirmed and pending findings of a member that
+/// was removed (`known` is the live members and those within the grace, see
+/// [`PeerStalls::retain_ledger`]).
+///
+/// Only with the repair switched on. The findings of a removed member held the 0.49 gauges up
+/// for the life of the process, and the loop guard needs them gone to judge a standing
+/// finding; with `cluster.divergence_repair = false` nothing is repaired, and the gauges stay
+/// exactly what 0.49 reported.
+fn retain_tracker_members(
+    tracker: &mut kimmy_storage::DivergenceTracker,
+    known: Option<&BTreeSet<NodeId>>,
+    repair_enabled: bool,
+) {
+    if repair_enabled {
+        tracker.retain_members(known);
+    }
+}
+
 /// Fold one contact's cut-digest round into the tracker and the report (B3).
 ///
 /// **A mismatch is verified before it is reported.** The requester checks its
@@ -2201,14 +2223,14 @@ fn plan_definition_repairs(
         // The requester's own count (the sender's is no concern of this build), the kept O(1)
         // figure. The apply reads it again immediately before the build: the collection can
         // grow between here and there.
-        let live = engine.count_by_id(*collection).ok().flatten().unwrap_or(0);
+        let live = live_documents(engine, *collection);
         match repair_gate(config, catching_up, live, config.repair_max_index_documents) {
             RepairGate::Disabled => {
-                stalls.definition_repair_refused(DigestRepairOutcome::Disabled);
+                stalls.definition_repair_refused(node, *collection, DigestRepairOutcome::Disabled);
                 continue;
             }
             RepairGate::TooLarge => {
-                stalls.definition_repair_refused(DigestRepairOutcome::TooLarge);
+                stalls.definition_repair_refused(node, *collection, DigestRepairOutcome::TooLarge);
                 continue;
             }
             RepairGate::CatchingUp => continue,
@@ -2225,6 +2247,17 @@ fn plan_definition_repairs(
                  round with it"
             );
         }
+    }
+}
+
+/// The live documents this member holds in `collection`, for the repair size gates. A count
+/// that cannot be read is as large as can be, so the gate refuses rather than lets a repair
+/// through that it could not size; a collection this member does not hold has none.
+fn live_documents(engine: &Engine, collection: kimmy_core::CollectionId) -> u64 {
+    match engine.count_by_id(collection) {
+        Ok(Some(live)) => live,
+        Ok(None) => 0,
+        Err(_) => u64::MAX,
     }
 }
 
@@ -2256,14 +2289,14 @@ fn plan_digest_repairs(
                 "a divergence recurs after repair; repair of this collection is stopped"
             );
         }
-        let live = engine.count_by_id(*collection).ok().flatten().unwrap_or(0);
+        let live = live_documents(engine, *collection);
         match repair_gate(config, catching_up, live, config.repair_max_documents) {
             RepairGate::Disabled => {
-                stalls.digest_repair_refused(DigestRepairOutcome::Disabled);
+                stalls.digest_repair_refused(node, *collection, DigestRepairOutcome::Disabled);
                 continue;
             }
             RepairGate::TooLarge => {
-                stalls.digest_repair_refused(DigestRepairOutcome::TooLarge);
+                stalls.digest_repair_refused(node, *collection, DigestRepairOutcome::TooLarge);
                 continue;
             }
             RepairGate::CatchingUp => continue,
@@ -2271,6 +2304,12 @@ fn plan_digest_repairs(
         }
         let cut = state.cuts.get(&(node, *collection)).cloned().unwrap_or_default();
         if stalls.plan_digest_repair(node, *collection, cut) == DigestPlan::Planned {
+            // Walk the collection's size now and the gate's more, and no further.
+            stalls.bound_converge(
+                node,
+                *collection,
+                live.saturating_add(config.repair_max_documents),
+            );
             warn!(
                 %peer,
                 node = %node,
@@ -4936,11 +4975,49 @@ mod definition_fold_tests {
             "definition_state.prune(held, members.as_ref())",
             "stalls.retain_definition_detail(members.as_ref(), held)",
             "stalls.retain_ledger(held, members.as_ref())",
-            "divergence.retain_members(known.as_ref())",
-            "stalls.expire_repairs()",
+            "retain_tracker_members(&mut divergence, known.as_ref(), config.divergence_repair)",
         ] {
             assert_eq!(code.matches(call).count(), 1, "{call}: once in the code");
             assert_eq!(direct.matches(call).count(), 1, "{call}: directly in the held block");
+        }
+        // The clock and the deadlines are read before the listing, so a failed listing
+        // does not skip them.
+        for call in ["stalls.set_repair_time(", "stalls.expire_repairs()"] {
+            assert_eq!(code.matches(call).count(), 1, "{call}: once in the code");
+            assert_eq!(block.matches(call).count(), 0, "{call}: not inside the held block");
+            let before = code.find("let mine_collections = engine.all_collection_ids()").unwrap();
+            assert!(code.find(call).unwrap() < before, "{call}: before the listing");
+        }
+    }
+
+    /// R7's grace and the switch: a peer down for less than the grace loses no finding (and
+    /// no ledger entry); one removed beyond it loses both; with the repair switched off the
+    /// tracker is not pruned at all, so the gauges are 0.49's.
+    #[test]
+    fn a_member_down_inside_the_grace_keeps_its_findings_and_the_switch_off_keeps_049s_gauges() {
+        for enabled in [true, false] {
+            let mut stalls = PeerStalls::new();
+            let mut tracker = kimmy_storage::DivergenceTracker::new();
+            let (p, q) = (NodeId::from_bytes([1; 16]), NodeId::from_bytes([2; 16]));
+            let (cp, cq) = (kimmy_core::CollectionId(7), kimmy_core::CollectionId(8));
+            let held = BTreeSet::from([cp, cq]);
+            for (peer, c) in [(p, cp), (q, cq)] {
+                tracker.observe_digest(peer, c, true);
+                tracker.observe_digest(peer, c, true);
+            }
+            assert_eq!(tracker.digest_confirmed_count(), 2);
+            stalls.set_repair_clock(Duration::ZERO, Duration::from_secs(5));
+            stalls.retain_ledger(&held, Some(&BTreeSet::from([p, q])));
+            // `p` is down for eleven hours.
+            stalls.set_repair_clock(Duration::from_secs(11 * 3600), Duration::from_secs(5));
+            let known = stalls.retain_ledger(&held, Some(&BTreeSet::from([q])));
+            retain_tracker_members(&mut tracker, known.as_ref(), enabled);
+            assert_eq!(tracker.digest_confirmed_count(), 2, "down inside the grace loses nothing");
+            // And removed for good: gone with the repair on, kept as 0.49 kept it with it off.
+            stalls.set_repair_clock(Duration::from_secs(13 * 3600), Duration::from_secs(5));
+            let known = stalls.retain_ledger(&held, Some(&BTreeSet::from([q])));
+            retain_tracker_members(&mut tracker, known.as_ref(), enabled);
+            assert_eq!(tracker.digest_confirmed_count(), if enabled { 1 } else { 2 });
         }
     }
 

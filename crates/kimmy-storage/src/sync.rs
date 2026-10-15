@@ -279,6 +279,11 @@ pub struct SyncOutcome {
     /// batch had stopped at a collection this node lacks. Set only by
     /// `kimmy-cluster`'s `sync_once`, like `exhausted`.
     pub repairing: bool,
+    /// Whether the repair this round was spent on is a *count* repair (a replay or a
+    /// whole-database or scoped snapshot, ADR-148), the half `kimmy_sync_repair_rounds_total`
+    /// counts. A document or definition repair (`Converge`, `Definitions`) sets `repairing`
+    /// and not this: they have their own series. Set only by `kimmy-cluster`'s `sync_once`.
+    pub count_repair: bool,
     /// The peer answered `BeyondHorizon` and this round did **not** take a
     /// snapshot from it: it was set aside so the tick's other contacts could serve
     /// this member first (ADR-224). Nothing else in the outcome is meaningful: the
