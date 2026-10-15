@@ -354,6 +354,9 @@ struct Ghost {
     /// included.
     drops: Vec<(usize, Stamp)>,
     db_drops: Vec<Stamp>,
+    /// Of `drops`, those a database's drop minted for a collection its dropper held (its
+    /// own burial of it, an entry of its own stamp).
+    db_drop_burials: Vec<(usize, Stamp)>,
 }
 
 impl Ghost {
@@ -436,6 +439,15 @@ pub(crate) enum Category {
     /// is what the existence half reads), kept out of the signature a sweep groups
     /// by, so it does not hide the differences that decide something.
     TombstoneSubsumed,
+    /// The one subsumed difference ADR-236 accepts as by design (its residual 1): after two
+    /// drops of one database, one member holds a collection's tombstone at the first drop's
+    /// own burial of it (an entry of its dropper's stamp, which is not an expansion of the
+    /// database's drop, so the raise does not move it) and another at the second drop's
+    /// expansion (met the creation only under the second). Both lack the collection under
+    /// a database tombstone at or above both, so nothing either decides differs. Classified
+    /// by its exact shape from the ghost, pinned by a named test, and kept out of the
+    /// signature a sweep groups by; any other subsumed difference is `TombstoneSubsumed`.
+    KnownSubsumed,
     LostWrite,
     /// A page left its receiver's clock behind a stamp it restored that the sender's
     /// coverage names (ADR-233 item 1: a collection's `created`, a carried collection or
@@ -482,7 +494,14 @@ impl RouteOutcome {
         self.failures
             .iter()
             .map(|f| f.category)
-            .filter(|c| *c != Category::DocsAfterAgeOut && *c != Category::TombstoneSubsumed)
+            .filter(|c| {
+                !matches!(
+                    c,
+                    Category::DocsAfterAgeOut
+                        | Category::TombstoneSubsumed
+                        | Category::KnownSubsumed
+                )
+            })
             .collect()
     }
 }
@@ -747,6 +766,9 @@ impl Cluster {
                 } else if let Some(c) = NAMES.iter().position(|n| CollectionId::derive(DB, n) == id)
                 {
                     self.ghost.drops.push((c, stamp));
+                    if matches!(op.step, Step::DropDb { .. }) {
+                        self.ghost.db_drop_burials.push((c, stamp));
+                    }
                 }
             }
         }
@@ -1380,9 +1402,22 @@ impl Cluster {
                     Some(c) => c.floor.is_some_and(|floor| floor >= newest.hlc),
                     None => o.tombstones.get("#database").is_some_and(|db| db.hlc >= newest.hlc),
                 };
+                // ADR-236's residual 1, by its exact shape: one side is a database drop's
+                // own burial of the collection, the other a later database drop's stamp.
+                let known = |x: &Stamp, y: &Stamp| {
+                    let c = NAMES.iter().position(|n| n == key);
+                    let burial = |s: &Stamp| {
+                        self.ghost.db_drop_burials.iter().any(|(bc, b)| Some(*bc) == c && b == s)
+                    };
+                    let expansion = |s: &Stamp| self.ghost.db_drops.contains(s);
+                    (burial(x) && expansion(y) && y > x) || (burial(y) && expansion(x) && x > y)
+                };
                 let category = match (ta, tb) {
                     (Some(x), Some(y)) if x.hlc == y.hlc => Category::TombstoneNode,
                     _ if key == "#database" => Category::DbTombstone,
+                    (Some(x), Some(y)) if subsumed(a) && subsumed(b) && known(x, y) => {
+                        Category::KnownSubsumed
+                    }
                     _ if subsumed(a) && subsumed(b) => Category::TombstoneSubsumed,
                     _ => Category::CollTombstone,
                 };
@@ -1475,7 +1510,9 @@ fn settle(cluster: &mut Cluster, route: Route) -> RouteOutcome {
                     let converged = found.iter().all(|f| {
                         matches!(
                             f.category,
-                            Category::TombstoneSubsumed | Category::DocsAfterAgeOut
+                            Category::TombstoneSubsumed
+                                | Category::KnownSubsumed
+                                | Category::DocsAfterAgeOut
                         )
                     });
                     failures.extend(found);
@@ -2293,7 +2330,8 @@ fn census_takes(name: &str, pre: &[Op], variants: &[(&str, Vec<Op>)], expect: Ex
 #[ignore = "the vacuity census; see the convergence model test report"]
 fn vacuity_census() {
     CENSUS.with(|c| *c.borrow_mut() = Some(Vec::new()));
-    let named: [fn(); 31] = [
+    let named: [fn(); 32] = [
+        known_residual_two_drops_of_one_database_the_first_dropper_held_the_collection,
         finding_f14_an_expansion_of_a_database_drop_stayed_at_the_drop_it_was_made_under,
         finding_f12_a_page_refused_a_definition_its_drop_keeps,
         finding_f13_an_index_in_the_drops_hlc_was_kept_by_the_member_that_swept_it,
@@ -2629,6 +2667,32 @@ fn finding_f14_an_expansion_of_a_database_drop_stayed_at_the_drop_it_was_made_un
     );
 }
 
+/// ADR-236's residual 1, accepted as by design (ruled 2026-10-15), pinned by its exact shape
+/// so that a change in it shows. A drops the database while holding `items`, and buries it with
+/// an entry of its own stamp (t130.2A). B drops the database later, never having held `items`,
+/// and meets its creation only under its own drop, so it records the second drop's expansion
+/// (t190.1B). The entries routes end with the two stamps; that decides nothing, since both
+/// members lack `items` under the database's tombstone t190.1B. Pages carry both and converge.
+#[test]
+fn known_residual_two_drops_of_one_database_the_first_dropper_held_the_collection() {
+    let ops = parse("B.create(orders)@90; A.create(items)@110; A.dropdb@130; B.dropdb@190");
+    if census_takes("known residual", &ops, &[("as found", vec![])], &[]) {
+        return;
+    }
+    let outcomes = check(&ops);
+    let found: Vec<(Route, Vec<(Category, String)>)> = outcomes
+        .iter()
+        .map(|o| (o.route, o.failures.iter().map(|f| (f.category, f.detail.clone())).collect()))
+        .collect();
+    let known = vec![(Category::KnownSubsumed, "A/B items: t130.2A vs t190.1B".to_string())];
+    assert_eq!(
+        found,
+        vec![(Route::Entries, known.clone()), (Route::Repaired, known), (Route::Pages, vec![])],
+        "{}",
+        render(&ops, &outcomes)
+    );
+}
+
 // -- Generated schedules -------------------------------------------------------------------
 
 fn env_u64(name: &str, default: u64) -> u64 {
@@ -2667,6 +2731,7 @@ fn sweep(label: &str, schedules: impl Iterator<Item = (String, Vec<Op>)>) {
     let mut fallbacks = 0usize;
     let mut aged = 0usize;
     let mut subsumed: BTreeMap<Route, usize> = BTreeMap::new();
+    let mut known: BTreeMap<Route, usize> = BTreeMap::new();
     let mut by_design: BTreeMap<(Route, Vec<Category>), usize> = BTreeMap::new();
     let mut subsumed_example: Option<(Route, String, Vec<Op>)> = None;
     let schedules: Vec<(String, Vec<Op>)> = schedules.collect();
@@ -2698,6 +2763,11 @@ fn sweep(label: &str, schedules: impl Iterator<Item = (String, Vec<Op>)>) {
             created_differs +=
                 usize::from(outcome.route == Route::Pages && outcome.created_differs);
             fallbacks += usize::from(outcome.route == Route::Entries && outcome.fallbacks > 0);
+            if outcome.route != Route::Entries
+                && outcome.failures.iter().any(|f| f.category == Category::KnownSubsumed)
+            {
+                *known.entry(outcome.route).or_default() += 1;
+            }
             if outcome.route != Route::Entries
                 && outcome.failures.iter().any(|f| f.category == Category::TombstoneSubsumed)
             {
@@ -2732,7 +2802,8 @@ fn sweep(label: &str, schedules: impl Iterator<Item = (String, Vec<Op>)>) {
          with the repair loop, and by pages, in {elapsed:?}; {} failing groups; `created` \
          differed at the end (pages route) in {created_differs}; the pure entries route needed a \
          page in {fallbacks}; pure entries left divergence the repair loop then converged in: \
-         {needed_repair:?}; a subsumed tombstone difference in {subsumed:?}; a divergence \
+         {needed_repair:?}; a subsumed tombstone difference in {subsumed:?}; the known \
+         subsumed difference ADR-236 accepts (its residual 1) in {known:?}; a divergence \
          that needs a collection step (gone without it: past retention, by design under \
          ADR-085) in {by_design:?}",
         groups.len()
