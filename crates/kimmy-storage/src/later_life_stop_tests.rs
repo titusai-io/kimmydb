@@ -1,4 +1,5 @@
-//! Review of `convergence-fixes` (4a0cb5f3): tests that pin the findings.
+//! The later-life stop a page holding no life answers (F7), and a relayed drop of an earlier
+//! life in a collection stream (F4).
 
 use std::collections::BTreeSet;
 use std::time::Duration;
@@ -77,7 +78,7 @@ fn field() -> Vec<IndexField> {
 /// scoped page, gets the same tombstone back, and stops again on every round: nothing
 /// past the index in that peer's window, in any collection, reaches it by entries.
 #[test]
-fn review_f7_an_index_created_and_dropped_after_a_drop_wedges_the_window() {
+fn finding_f7_an_index_created_and_dropped_after_a_drop_wedges_the_window() {
     let (a, _da) = engine();
     let (c, _dc) = engine();
     a.create_collection("shop", "orders").unwrap();
@@ -106,7 +107,7 @@ fn review_f7_an_index_created_and_dropped_after_a_drop_wedges_the_window() {
 /// makes (`bury_collection_as` at the drop's stamp). A 0.50.0 member that lacks the
 /// collection stops at the index on every round, as above.
 #[test]
-fn review_f7_a_049_burial_of_a_later_definition_wedges_a_050_puller() {
+fn finding_f7_a_049_burial_of_a_later_definition_wedges_a_050_puller() {
     let (s, _ds) = engine(); // stands for a 0.49.x member
     let (r, _dr) = engine(); // 0.50.0
     s.create_collection("shop", "orders").unwrap();
@@ -145,7 +146,7 @@ fn review_f7_a_049_burial_of_a_later_definition_wedges_a_050_puller() {
 /// `Invalidate{CollectionDropped}` for a collection that stands, holding its documents.
 /// Before ADR-236 the ignored drop was neither appended nor published.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn review_f4_a_relayed_ignored_drop_ends_a_stream_on_the_live_collection() {
+async fn finding_f4_a_relayed_ignored_drop_ends_a_stream_on_the_live_collection() {
     let (c, _dc) = engine();
     let (m, _dm) = engine();
     c.create_collection("shop", "orders").unwrap();

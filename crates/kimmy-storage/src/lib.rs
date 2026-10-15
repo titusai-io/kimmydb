@@ -90,7 +90,7 @@ mod life_supersession_tests;
 mod convergence_model_tests;
 
 #[cfg(test)]
-mod review_cfr_tests;
+mod later_life_stop_tests;
 
 #[cfg(test)]
 mod log_capture;

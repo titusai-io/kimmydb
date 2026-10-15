@@ -2385,10 +2385,10 @@ fn census_takes(name: &str, pre: &[Op], variants: &[(&str, Vec<Op>)], expect: Ex
 fn vacuity_census() {
     CENSUS.with(|c| *c.borrow_mut() = Some(Vec::new()));
     let named: [fn(); 38] = [
-        review_cfr_an_index_created_and_dropped_after_a_drop_wedges_the_window,
-        review_cfr_a_write_into_a_life_a_page_installed_over_an_unwitnessed_floor,
-        review_cfr_seed_13739_wedges_without_a_visible_difference,
-        review_cfr_seed_13739_without_the_write,
+        finding_f7_an_index_created_and_dropped_after_a_drop_wedges_the_window,
+        finding_f10_a_write_into_a_life_a_page_installed_over_an_unwitnessed_floor,
+        finding_f7_seed_13739_wedges_without_a_visible_difference,
+        finding_f7_seed_13739_without_the_write,
         known_residual_a_collections_own_drop_and_a_later_database_drop,
         finding_f16_a_delete_made_after_a_drop_is_kept_as_a_write_after_it_is,
         known_residual_two_drops_of_one_database_the_first_dropper_held_the_collection,
@@ -3138,16 +3138,16 @@ fn the_enumeration_counts() {
     );
 }
 
-/// Review of 4a0cb5f3 (F7's stop). An index created after a concurrent drop and
+/// F7's stop. An index created after a concurrent drop and
 /// dropped again before the drop arrives: the creating member buries the life (nothing
 /// is stamped after the drop) and still serves the `CreateIndex`; every member that
 /// lacks the collection stopped at it on every round, and A's later write in another
 /// collection never reached them by entries or by the repair. The scoped page that holds
 /// no life now answers the stop (ADR-236 item 4).
 #[test]
-fn review_cfr_an_index_created_and_dropped_after_a_drop_wedges_the_window() {
+fn finding_f7_an_index_created_and_dropped_after_a_drop_wedges_the_window() {
     finding(
-        "review F7 wedge",
+        "F7 wedge",
         "A.create(items)@100; A.create(orders)@110; C<-A entries; C.drop(orders)@150; \
          A.index(orders,k_1:asc)@200; A.dropindex(orders,k_1)@210; A<-C entries; \
          A.write(items/1)@220",
@@ -3155,31 +3155,31 @@ fn review_cfr_an_index_created_and_dropped_after_a_drop_wedges_the_window() {
     );
 }
 
-/// Review of 4a0cb5f3 (F10/F11's class, item 6). A life a page installs over a floor its
+/// F10/F11's class (ADR-236 item 6). A life a page installs over a floor its
 /// clock trails: the floor (the drop's tombstone, recorded from a relay's scoped page) and
 /// the creation are both stamps the senders' coverage does not name, so neither moves
 /// C's clock, and C's write into the life is minted below the floor. Every other member
 /// takes it as history; C keeps it. Item 6 mints a local creation and a local drop above
 /// what they change, not a write.
 #[test]
-fn review_cfr_a_write_into_a_life_a_page_installed_over_an_unwitnessed_floor() {
+fn finding_f10_a_write_into_a_life_a_page_installed_over_an_unwitnessed_floor() {
     finding(
-        "review item 6 write",
+        "item 6 write",
         "A.create(orders)@300; A.drop(orders)@310; B<-A scoped(orders); C<-B scoped(orders); \
          A.create(orders)@320; B<-A scoped(orders); C<-B scoped(orders); C.write(orders/1)@205",
         &[(ORDERS, Some(&[1]))],
     );
 }
 
-/// Review of 4a0cb5f3 (F7's stop), the generator's own shape (seed 13739, minimised): no
+/// F7's stop, the generator's own shape (seed 13739, minimised): no
 /// delivery in the schedule at all. B's life is buried by A's drop at quiescence with
 /// nothing stamped after it (the index was dropped), and A and C stop at B's
 /// `CreateIndex` for good. Visible only to the `Wedged` check or a later write;
-/// `review_cfr_seed_13739_without_the_write` is the shape with no write.
+/// `finding_f7_seed_13739_without_the_write` is the shape with no write.
 #[test]
-fn review_cfr_seed_13739_without_the_write() {
+fn finding_f7_seed_13739_without_the_write() {
     finding(
-        "review F7 seed 13739, no write",
+        "F7 seed 13739, no write",
         "B.create(orders)@120; A.create(orders)@130; A.drop(orders)@140; \
          B.index(orders,k_1:desc)@160; B.dropindex(orders,k_1)@170",
         &[(ORDERS, None)],
@@ -3187,9 +3187,9 @@ fn review_cfr_seed_13739_without_the_write() {
 }
 
 #[test]
-fn review_cfr_seed_13739_wedges_without_a_visible_difference() {
+fn finding_f7_seed_13739_wedges_without_a_visible_difference() {
     finding(
-        "review F7 seed 13739",
+        "F7 seed 13739",
         "B.create(items)@110; B.create(orders)@120; A.create(orders)@130; A.drop(orders)@140; \
          B.index(orders,k_1:desc)@160; B.dropindex(orders,k_1)@170; B.write(items/1)@180",
         &[(ORDERS, None), (ITEMS, Some(&[1]))],

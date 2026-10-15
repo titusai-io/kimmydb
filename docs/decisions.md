@@ -27525,9 +27525,10 @@ off at its own stamp (`late_drop`). F16's: the count repair's scoped page does n
 delete made after the drop; a life holding only such a delete keeps it, re-dated; without a digest row the walk's
 records say it; a delete landing behind the sweep's cursor is read from the digest row; and a shadow is judged by its
 parent, not by its own tombstones (`keep_later_writes_tests`). The tests that pinned the emptied-life burial now reach
-it by a life that holds nothing after the drop (an absent digest row). The review's (`review_cfr_tests`: the later-life
-stop that a page holding no life answers, after this build's burial and after 0.49.x's; a relayed ignored drop does not
-end a stream on the live collection) and its three model rows (`review_cfr_*`), with seed 13739's shape without its
+it by a life that holds nothing after the drop (an absent digest row). The review's (`later_life_stop_tests`: the
+later-life stop that a page holding no life answers, after this build's burial and after 0.49.x's; a relayed ignored
+drop does not end a stream on the live collection) and its model rows (`finding_f7_an_index_created_and_dropped_*`,
+`finding_f10_a_write_into_a_life_*` and `finding_f7_seed_13739_*`), with seed 13739's shape without its
 write, which only `Wedged` sees; `sync` (a page carrying a life this member refuses leaves the stop standing, its second
 page too); `watch` (a stream that delivered the earlier life's change, one resumed from its token, and one at a drop in
 its life's own `Hlc` still end). F17's: `count_finding_tests` (over real rounds, a finding no probe compared since its
