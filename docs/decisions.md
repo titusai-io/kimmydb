@@ -27151,3 +27151,101 @@ refusal hint and skips it, and stays at the old width; the definition digest sho
 A refused entry is witnessed and, as reasoned from the sync path (not tested), is not served to it again after the upgrade, so that member stays diverged until the
 next vector change from any member reaches it, or a snapshot page does (the page route has applied the change since
 ADR-227).
+
+## ADR-236 — The divergence check repairs what it finds: documents by value over rows held, one plain index by name, and a loop guard that judges every repair
+
+> **Amends [ADR-230](#adr-230--the-cut-digest-a-kept-xor-per-collection-compared-at-the-cut-two-members-have-both-processed-finds-the-lost-update-the-count-cannot-see)
+> and [ADR-232](#adr-232--the-definition-digest-a-hash-of-what-a-collections-indexes-and-vector-configuration-say-compared-at-the-cut-two-members-share-finds-the-schema-drift-no-count-and-no-document-digest-can-see)**,
+> whose findings were detect-only. Adds three `cluster.*` keys and nine series, a persisted metadata key
+> (`gc:tombstone_horizon`), one optional field on the snapshot page (`tombstone_horizon`), and the `lab-hooks` cargo feature.
+> Not a rollback boundary: a 0.49.0 binary ignores the key and the field. A config that names the new `cluster.*` keys
+> is refused by 0.49.0 (`ClusterConfig` denies unknown keys), so remove them before rolling back. (The number is fixed at merge.)
+
+**The case.** 0.48.0 and 0.49.0 find a document updated on one member and not on the other, and an index one member
+lacks, and then do nothing. The first finding in a lab round was a real divergence nothing closed. The repair must
+close the cases it can prove safe, leave the rest to the operator in words, and never run for ever or hide a bug.
+
+**Decision.**
+
+1. **The document repair** is a scoped snapshot of the one collection under `SnapshotPolicy::Converge`, **documents
+   only, applied over rows this member already holds**. A row is written only if strictly newer than the row held (live
+   or tombstone); a delete only over a live document it out-stamps; an id this member holds **nothing for** is `left`
+   and logged, unless it is **young** (point 3), when it is written and counted `created`. No definition is restored,
+   nothing is dropped, no vector state is touched, no bare tombstone is recorded, no cursor is stored, no coverage is
+   granted. The cursor of a Converge pull is in memory only, keyed by scope and policy.
+2. **Planned from the digest finding, not the count finding.** `confirmed_against` (the count half) never sees a digest
+   or definition finding and `retain_repaired` never clears one (tests and mutation rows pin it); the digest and the
+   definition series have `digest_confirmed_against`, `definition_confirmed_against`, `retain_digest` and
+   `retain_definition`. The planner is keyed `(collection, kind)` with `kind` in `Count`, `Digest`, `Definition`. A
+   digest repair is not planned beside a count repair of the collection (the replay lands what it would;
+   `skipped_count_repair`), nor for a peer with a whole-database pull pending (the in-memory progress holds one entry per
+   peer), nor while this member or the peer is catching up, and a whole-database pull that starts for the peer abandons
+   its active and queued repairs as transient.
+3. **The young-stamp rule rests on a persisted collected-through horizon.** A lost insert (an insert this member never
+   received) and a deleted document whose tombstone was collected look the same to a member that holds nothing for the
+   id. A row is written only if its stamp is **newer than every tombstone cutoff either member of the pair has
+   applied**: `created > max(own_horizon, sender_horizon)`. The horizon is the cutoff of the last retention pass that
+   collected something, **raised inside each removing transaction of all three collectors** (document tombstones,
+   collection and database tombstones, index tombstones; a source guard fails the build if one does not), monotone
+   (`max(stored, cutoff)`), and read **inside the page's own write transaction**, so a pass that commits between plan
+   and page cannot leave the page judging with a horizon that has not moved while the tombstone is gone. It is kept in
+   `META`, **reset at open to `max(stored, start)` whenever the prior sidecar was written by another build or none**
+   (every upgrade and rollback; a build that did not maintain the key may have collected without raising it), by a
+   restore, and for an absent key (never read as zero). The sender sends its horizon on every page it serves, read in or
+   after the walk the page's rows came from; **absent from a sender that predates it, the rule is off for the pull**. A
+   completed whole-database snapshot adopts `max(own, the page's)` in the completing page's transaction. Soundness is
+   pairwise (the convergence model test, a separate change, checks it against the union of both members' ghost
+   histories); a third member's collected delete is the ADR-085 window. **Cost, stated:** after every upgrade there is a young-repair dead time, and a restore's
+   too.
+4. **The definition repair** is the first page only of a scoped snapshot under `SnapshotPolicy::Definitions`, documents
+   ignored, building **at most one plain index this member lacks by name and a peer holds**. Per index, in order: held by
+   name under another definition is `rival`; `unique` and `ttl` are left (building the first can refuse documents, the
+   second deletes them); no stamp, or at or below the standing life's incarnation floor, is `history`; a local index
+   tombstone made after the index is `tombstoned`; **at or below the horizon is `ambiguous`** (the index analogue of the
+   rule above: `INDEXES_DROPPED` is collected on the same window, and a plain index this member dropped and a peer missed
+   the drop of would otherwise be rebuilt); and the survivors are chosen **before the writer is taken**, so an older
+   ambiguous index cannot spend the repair's one build. The decision is judged again under the writer by the creation's
+   own closure (floor, tombstone, **name held now**, horizon), so a drop or a rival that landed since wins. It never
+   removes an index and never supersedes a held one. Gated by `cluster.repair_max_index_documents` on this member's own
+   count, read again immediately before the build. A refused definition (ADR-123) is classified as the ordinary route
+   classifies it: counted, hinted, and the next comparison is `explained`.
+5. **The loop guard** (a pure state machine, `repair_ledger.rs`, one entry per `(peer, collection, kind)`, in memory;
+   a restart forgets it). **R1** a transient end (a peer error, a stop, a drop, a whole-database takeover, a
+   cancellation) changes nothing but the cooldown. **R2** a repair is judged at the first *compared* probe after its end
+   and only there; an unjudged deadline (three rotation periods, at least 30 minutes) counts as transient, but every
+   second consecutive unjudged end is one ineffective step. **R3** an ineffective repair backs off 5 min, 15 min, 45 min,
+   2 h 15 min, 6 h (cap 5); a repair that made **progress lowers the level to 1**, and progress is **a row at or below the
+   finding's cut** (the digest probe's `min(W_A, W_B)` at the finding's last exact mismatch, carried with the plan to
+   `apply_snapshot_page`) for the document kind and a built index for the definition kind. Rows above the cut are what
+   ordinary replication also brings under live writes; counting them lowers the level on nearly every repair and a
+   standing ambiguous id would never climb to the cap. **R4** more than three clear-and-recur episodes in a rolling
+   hour, per collection and deduplicated across peers within three rotation periods, stop the collection for six
+   hours or until it has been clear for an hour. **R5** only a confirmed, un-stopped, un-backed-off finding plans, and
+   not while a repair is in flight or awaiting its probe. **R7** the ledger and the tracker (by member as well as by
+   collection) are pruned in the tick's `if let Ok(held)` block, guarded textually.
+6. **`cluster.divergence_repair`** (`true`) switches both repairs; `false` detects only, as 0.49.0, and counts each
+   skipped plan `disabled`. `cluster.repair_max_documents` (2,000,000) and `cluster.repair_max_index_documents`
+   (250,000) are refused at zero. Read at start.
+7. **The lab hook** `KIMMY_TEST_DROP_APPLY` (the `lab-hooks` feature; absent from every shipped build) loses one
+   replicated entry, witnessed and not written, so the lab can make the divergences these repairs close. The grammar is
+   made unambiguous or refused.
+
+**What stays a finding for the operator**, each with its reason in `operations.md`: a row this member holds nothing for
+and that is not young (`left`); a rival, unique, TTL, vector, dropped-here, buried-life or ambiguous index; a collection
+over a size gate; a collection the loop guard has stopped. **Decided (owner, 2026-10-14):** the older-`created` settle of
+two concurrent creates is **not** built (it lost data across a drop); what is checked instead is a convergence model
+test, a separate change.
+
+**Mixed roll.** A 0.49.0 sender sends no horizon, so a member repairing from it admits nothing young and `left`s every
+id it holds nothing for; it still applies newer rows over held rows. A 0.49.0 member repairs nothing, and the finding
+persists until it is upgraded. A member with the switch off is a peer whose side nobody repairs.
+
+**Tests.** `converge_tests.rs` (the policy's table, each row leaving everything else untouched; the cut counts),
+`tombstone_horizon_tests.rs` (each collector raises it; the reset on every path; restore; adoption raises and never lowers),
+`definition_repair_tests.rs` (every clause of the table and the races under the writer), `repair_ledger_tests.rs` (every
+rule and a model test against a replay of each pair's history), `digest_repair_tests.rs` (the planner with the guard),
+and four end-to-end tests through the real loop (a lost update repaired and judged effective, a lost plain index built, a
+unique index never built, the switch off, the size gate). Mutation rows (in bash, each killed unless named): every clause
+of the policy table, the young-stamp comparison and its absent-horizon fail-closed, each collector's horizon write, the
+reset, the adoption's `set` for `max`, the cut counts, the ledger's rules (16 rows), and the definition table (22
+rows). Equivalent mutants are named in the test files that pin the clause.
