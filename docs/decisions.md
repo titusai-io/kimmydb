@@ -27395,7 +27395,15 @@ stamps (its YS1), and F17 from a storm test of the count half (a loop that repla
    entry over a floor the clock trailed (a scoped page's drop recorded from a relay whose coverage did not name it,
    then a creation that coverage did not name either) took the member's next write into it below the floor: history
    on every other member, kept on this one, on every route. `create_collection_in_txn` mints above the floor on every
-   route now, which moves the clock past it, as ADR-233's burial witness and its restart rule already pass it.
+   route now, which moves the clock past it, as ADR-233's burial witness and its restart rule already pass it. **And
+   at a sweep (from the review of the second cut).** A late-drop sweep takes the floor up to the drop it sweeps for,
+   and the drop can be one this member recorded without witnessing it: a scoped page's drop its sender's coverage did
+   not name, ignored by a newer life that a relay had installed with no floor (neither its creation nor its floor
+   named). The member's next write landed below that floor, history on every other member and kept on this one, and
+   the drop's own entry, arriving later, owed no sweep to undo it. **The clock now passes every floor this member
+   takes:** at install (the creation's mint), from a page (`restore_collection` witnesses a floor it adopts), and at
+   a sweep (`sweep_late_definitions` witnesses the drop before anything is swept, so a write landing while the sweep
+   runs is above the floor, and one minted before it is a straggler the chunks ahead remove).
 7. **A burial from a page is named by the drop (F9).** ADR-235's burial, and the present-life sweep its last commit
    added, take the stamp of the tombstone a whole page carries for the drop when it is the drop the floor stands
    for (the floor's own `Hlc`); a whole page applies its carried drops first, so this is the tombstone its sender
@@ -27472,7 +27480,7 @@ the writes it kept**, while 0.50.0 members keep them; the members differ until t
 points a 0.49.x member keeps its old behaviour and the members can differ as before until the roll completes: it does
 not relay an ignored drop or a refused creation, applies a creation tied with a drop, takes a later-life definition
 as history, refuses a page's later definition with its life, keeps a tied index its sweep selects, mints a local
-drop or creation at its clock, and installs a life over a floor its clock trails without passing it; and, holding a
+drop or creation at its clock, and installs a life over a floor its clock trails, or sweeps up to one, without passing it; and, holding a
 life whose only write after a drop is a delete, it buries the life and purges the delete when the drop arrives (F16).
 Two of these outlast the roll. **A tie a 0.49.x member applied stays where it was applied:** the life it kept (a
 creation in the drop's own millisecond) is not undone by the upgrade, because the existence half plans a repair
@@ -27496,7 +27504,7 @@ of their exact failures on each route
 (`known_residual_two_drops_of_one_database_the_first_dropper_held_the_collection`,
 `known_residual_a_collections_own_drop_and_a_later_database_drop`), so a change in it shows; any other subsumed
 difference is still reported. (2) As before, a far-future stamp: item 6's mints, and the clock passing a floor at
-install, move the clock to a stored stamp the coverage did not vouch for, the trade ADR-226 already makes and
+install and at a sweep, move the clock to a stored stamp the coverage did not vouch for, the trade ADR-226 already makes and
 ADR-233's restart rule makes at the next start. (3) A vector configuration is judged before
 its writer, on the definition the writer's check then holds unchanged; a drop of an older life whose tombstone lands
 in that instant changes no definition, and its own sweep, which runs after its tombstone, turns the configuration

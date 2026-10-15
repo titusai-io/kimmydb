@@ -321,6 +321,14 @@ impl Engine {
         if !owes_a_sweep(&standing, dropped.hlc) {
             return Ok(());
         }
+        // The clock passes the floor this sweep takes, before anything is swept (ADR-236
+        // item 6), as it passes the floor a life takes at install. The drop can be one this
+        // member recorded without witnessing it (a scoped page's `dropped` its sender's
+        // coverage did not name, ADR-163), and a write minted below the floor was history
+        // on every other member and kept on this one. Passed first, a write that lands
+        // while the sweep runs is above the floor, and one minted before is a straggler
+        // the chunks still ahead remove.
+        self.witness_hlc(dropped.hlc);
         for index in &standing.indexes {
             // A definition in the drop's own `Hlc` is the drop's, from whichever node
             // (ADR-236): the keep and the burial read it so (`hlc > dropped` is
@@ -2053,6 +2061,58 @@ mod tests {
             a.get_collection("shop", "orders").unwrap().vector.is_some(),
             b.get_collection("shop", "orders").unwrap().vector.is_some(),
             "the members agree"
+        );
+    }
+
+    /// The clock passes the floor a sweep takes, as it passes the one taken at install
+    /// (ADR-236 item 6). A scoped page's `dropped` that its sender's coverage does not name
+    /// is recorded and swept without a witness (ADR-163), and the sweep takes the floor up
+    /// to it. D installs A's newer life from B (whose coverage names neither the creation
+    /// nor its floor), then takes A's drop of the life before from C (which recorded it
+    /// from a page and holds no entry of A's): D's floor is the drop. With its clock left
+    /// below it, D's acknowledged write was history on A, B and C and kept on D for good
+    /// (the drop's entry, when it comes, owes no sweep).
+    #[test]
+    fn a_floor_a_sweep_takes_from_an_unwitnessed_drop_is_passed_by_the_clock() {
+        let (a, _da) = engine();
+        let (b, _db) = engine();
+        let (c, _dc) = engine();
+        let (d, _dd) = engine();
+        let base = crate::engine::physical_now_ms() + 3_600_000;
+        let at = |e: &Engine, t: u64| {
+            e.advance_clock_past(&Stamp::new(Hlc::new(base + t, 0), e.node_id()));
+        };
+        let scoped = |into: &Engine, from: &Engine, id| {
+            let mut progress = crate::SnapshotProgress::of_collection(id);
+            while !progress.is_complete() {
+                let page = from.snapshot_page(progress.after().cloned(), progress.scope()).unwrap();
+                into.apply_snapshot_page(from.node_id(), &mut progress, &page).unwrap();
+            }
+        };
+        at(&a, 100);
+        let first = a.create_collection("shop", "orders").unwrap();
+        at(&a, 150);
+        assert!(a.drop_collection("shop", "orders").unwrap());
+        a.finish_purges_now().unwrap();
+        let dropped = a.collection_dropped_at(first.id).unwrap().unwrap();
+        scoped(&c, &a, first.id);
+        assert_eq!(c.collection_dropped_at(first.id).unwrap(), Some(dropped), "premise");
+        at(&a, 300);
+        a.create_collection("shop", "orders").unwrap();
+        scoped(&b, &a, first.id);
+        scoped(&d, &b, first.id);
+        scoped(&d, &c, first.id);
+        let on_d = d.get_collection("shop", "orders").unwrap();
+        assert_eq!(on_d.incarnation_floor, Some(dropped.hlc), "premise: the sweep took the floor");
+        d.insert(&on_d, doc! { "_id": 1i64 }).unwrap();
+        quiesce(&[&a, &b, &c, &d]);
+        let held: Vec<Vec<i64>> =
+            [&a, &b, &c, &d].iter().map(|e| docs_of(e, "shop", "orders", &[1])).collect();
+        assert!(
+            held.iter().all(|h| *h == held[0]),
+            "A, B, C, D hold orders/1: {held:?}; D's clock {:?} trails its floor {:?}",
+            d.clock_last(),
+            dropped.hlc
         );
     }
 }

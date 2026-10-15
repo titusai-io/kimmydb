@@ -1641,8 +1641,10 @@ impl Engine {
         // the sweep, whichever life the page carries. It writes no tombstone, so nothing
         // synthetic rides this member's pages.
         //
-        // The clock needs no witness here: the floor is below the standing life's `created`,
-        // which this member's clock has passed since it stored it.
+        // The clock needs no witness here: the sweep passes it over the floor it takes, as
+        // every sweep does (ADR-236 item 6). The standing life's `created` does not: a life
+        // installed from a page whose coverage did not name its creation is stored above
+        // the clock.
         //
         // Both this sweep and the burial below are stamped as the drop: by the tombstone
         // the page carries for it when there is one (ADR-236), so the records and index
