@@ -2384,8 +2384,9 @@ fn census_takes(name: &str, pre: &[Op], variants: &[(&str, Vec<Op>)], expect: Ex
 #[ignore = "the vacuity census; see the convergence model test report"]
 fn vacuity_census() {
     CENSUS.with(|c| *c.borrow_mut() = Some(Vec::new()));
-    let named: [fn(); 37] = [
+    let named: [fn(); 38] = [
         review_cfr_an_index_created_and_dropped_after_a_drop_wedges_the_window,
+        review_cfr_a_write_into_a_life_a_page_installed_over_an_unwitnessed_floor,
         review_cfr_seed_13739_wedges_without_a_visible_difference,
         review_cfr_seed_13739_without_the_write,
         known_residual_a_collections_own_drop_and_a_later_database_drop,
@@ -3151,6 +3152,22 @@ fn review_cfr_an_index_created_and_dropped_after_a_drop_wedges_the_window() {
          A.index(orders,k_1:asc)@200; A.dropindex(orders,k_1)@210; A<-C entries; \
          A.write(items/1)@220",
         &[(ORDERS, None), (ITEMS, Some(&[1]))],
+    );
+}
+
+/// Review of 4a0cb5f3 (F10/F11's class, item 6). A life a page installs over a floor its
+/// clock trails: the floor (the drop's tombstone, recorded from a relay's scoped page) and
+/// the creation are both stamps the senders' coverage does not name, so neither moves
+/// C's clock, and C's write into the life is minted below the floor. Every other member
+/// takes it as history; C keeps it. Item 6 mints a local creation and a local drop above
+/// what they change, not a write.
+#[test]
+fn review_cfr_a_write_into_a_life_a_page_installed_over_an_unwitnessed_floor() {
+    finding(
+        "review item 6 write",
+        "A.create(orders)@300; A.drop(orders)@310; B<-A scoped(orders); C<-B scoped(orders); \
+         A.create(orders)@320; B<-A scoped(orders); C<-B scoped(orders); C.write(orders/1)@205",
+        &[(ORDERS, Some(&[1]))],
     );
 }
 

@@ -4473,15 +4473,18 @@ impl Engine {
             }
 
             // Every check that ends the creation without a write is behind us:
-            // the stamp is minted here, once, for the write that follows. A local
-            // creation is minted **above the floor it takes** (ADR-236), as a local
+            // the stamp is minted here, once, for the write that follows. It is minted
+            // **above the floor the life takes**, on every route (ADR-236), as a local
             // drop is minted above the life it buries: a tombstone this member
             // recorded without witnessing it (a scoped page's drop its sender's
-            // coverage did not name) can stand above the clock, and a life created
-            // below its own floor is history on every other member, its writes
-            // with it.
+            // coverage did not name) can stand above the clock. A local creation below
+            // its own floor is history on every other member, its writes with it; and
+            // a life installed from elsewhere (a page, an entry) over a floor the clock
+            // trails took this member's next write into it below the floor, history on
+            // every other member too. So the clock passes the floor at install, as
+            // ADR-233's witnesses and its restart rule pass it.
             let stamp = match (mint(), incarnation_floor) {
-                (stamp, Some(floor)) if log && stamp.hlc <= floor => {
+                (stamp, Some(floor)) if stamp.hlc <= floor => {
                     self.next_stamp_above(Some(Stamp::new(floor, self.node_id)))
                 }
                 (stamp, _) => stamp,
