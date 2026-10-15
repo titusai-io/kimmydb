@@ -102,6 +102,8 @@ pub enum Transient {
     Dropped,
     WholeDatabaseTookOver,
     Gone,
+    /// Cancelled while queued, before it started.
+    Cancelled,
 }
 
 /// How a repair ended.
@@ -206,7 +208,25 @@ pub struct RepairLedger {
     collections: BTreeMap<CollectionId, CollectionState>,
 }
 
+impl Default for RepairLedger {
+    /// A five-minute rotation, until the caller says what the tick's is
+    /// ([`RepairLedger::set_rotation`]).
+    fn default() -> Self {
+        Self::new(Params { rotation: Duration::from_secs(300) })
+    }
+}
+
 impl RepairLedger {
+    pub fn set_rotation(&mut self, rotation: Duration) {
+        self.params.rotation = rotation;
+    }
+
+    /// How many collections are stopped for recurring at `now` (the gauge).
+    pub fn stopped_collections(&mut self, now: Duration) -> usize {
+        let ids: Vec<_> = self.collections.keys().copied().collect();
+        ids.into_iter().filter(|id| self.is_stopped(*id, now)).count()
+    }
+
     pub fn new(params: Params) -> Self {
         RepairLedger {
             params,
@@ -373,13 +393,13 @@ impl RepairLedger {
         self.collections.get(&collection).is_some_and(|c| c.stopped_until.is_some())
     }
 
-    /// R7: drop everything about a peer that is no longer a member and a
-    /// collection that is no longer held. A repair still in flight for a key
+    /// R7: drop everything about a peer that is no longer a member (`members` is `None`
+    /// when the node has no list) and a collection that is no longer held. A repair still in flight for a key
     /// that is dropped is dropped with it.
-    pub fn retain(&mut self, held: &BTreeSet<CollectionId>, members: &BTreeSet<NodeId>) {
-        self.entries.retain(|key, _| held.contains(&key.collection) && members.contains(&key.peer));
-        self.armed
-            .retain(|(peer, collection), _| held.contains(collection) && members.contains(peer));
+    pub fn retain(&mut self, held: &BTreeSet<CollectionId>, members: Option<&BTreeSet<NodeId>>) {
+        let member = |peer: &NodeId| members.is_none_or(|members| members.contains(peer));
+        self.entries.retain(|key, _| held.contains(&key.collection) && member(&key.peer));
+        self.armed.retain(|(peer, collection), _| held.contains(collection) && member(peer));
         self.collections.retain(|collection, _| held.contains(collection));
     }
 

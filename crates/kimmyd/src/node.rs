@@ -2798,6 +2798,8 @@ async fn spawn_cluster(
                 // Nothing pushed: the gauge is computed from these when read.
                 on_lag: None,
                 lag_vectors: Some(lag_vectors),
+                divergence_repair: config.cluster.divergence_repair,
+                repair_max_documents: config.cluster.repair_max_documents,
             },
         ),
     );

@@ -472,6 +472,22 @@ impl DivergenceTracker {
         self.cursor
     }
 
+    /// Forget every finding, pending or confirmed, against a peer that is not in
+    /// `members` (repair design R7). `advance_probe` sweeps by collection only,
+    /// so a member that was removed kept its confirmed findings for the life of
+    /// the process: they held the gauges up, and a ledger entry keyed by the
+    /// same peer could never be told the finding was gone.
+    pub fn retain_members(&mut self, members: &BTreeSet<NodeId>) {
+        self.pending.retain(|peer, _| members.contains(peer));
+        self.confirmed.retain(|peer, _| members.contains(peer));
+        self.count_pending.retain(|(peer, _)| members.contains(peer));
+        self.count_confirmed.retain(|peer, _| members.contains(peer));
+        self.digest_pending.retain(|(peer, _)| members.contains(peer));
+        self.digest_confirmed.retain(|peer, _| members.contains(peer));
+        self.definition_pending.retain(|(peer, _)| members.contains(peer));
+        self.definition_confirmed.retain(|peer, _| members.contains(peer));
+    }
+
     /// Fold in what one contact with `peer` found — [`compare`]'s result.
     /// Call this once per peer the check actually ran against this tick; a
     /// peer not contacted, or contacted but not checked (the round had a
@@ -656,6 +672,33 @@ mod tests {
                 .unwrap();
         }
         (engine, dir)
+    }
+
+    /// R7: a removed member's findings, of every kind, go with it, so no gauge is held
+    /// up by a peer that is gone and no repair is planned against one.
+    #[test]
+    fn a_removed_members_findings_are_forgotten_of_every_kind() {
+        let mut tracker = DivergenceTracker::new();
+        let (gone, kept) = (peer(1), peer(2));
+        // The gauges count collections, not pairs: one collection per peer.
+        let (c, other) = (CollectionId(7), CollectionId(8));
+        for (p, id) in [(gone, c), (kept, other)] {
+            tracker.observe_digest(p, id, true);
+            tracker.observe_digest(p, id, true);
+            tracker.observe_definition(p, id, true);
+            tracker.observe_definition(p, id, true);
+        }
+        assert_eq!(tracker.digest_confirmed_count(), 2);
+        assert_eq!(tracker.definition_confirmed_count(), 2);
+        tracker.retain_members(&BTreeSet::from([kept]));
+        assert_eq!(tracker.digest_confirmed_count(), 1);
+        assert_eq!(tracker.definition_confirmed_count(), 1);
+        assert!(tracker.digest_confirmed_against(gone).is_empty());
+        assert!(!tracker.is_digest_confirmed(gone, c));
+        assert!(!tracker.is_definition_confirmed(gone, c));
+        // And the pending half went too: one mismatch more does not confirm.
+        assert!(!tracker.observe_digest(gone, c, true));
+        assert!(tracker.is_digest_confirmed(kept, other));
     }
 
     #[test]

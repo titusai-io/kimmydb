@@ -12,6 +12,7 @@ use tracing::{Instrument, debug, error, info, warn};
 use crate::discovery::SeedSource;
 use crate::health::{DEFAULT_FANOUT, PeerHealth};
 use crate::membership::Members;
+use crate::repair_ledger::Judged;
 use crate::transport::{DivergenceProbe, PeerStalls, Repair, sync_once_with};
 
 /// How often to run a round against every known peer.
@@ -161,6 +162,12 @@ pub struct RoundReport {
     /// (B3). A level. Also counted in `divergent_collections`; this says which
     /// half moved it.
     pub digest_divergent_collections: usize,
+    /// What the document repair counted in this tick (repair design section 15.2).
+    pub repair: crate::transport::RepairCounts,
+    /// Collections the loop guard has stopped for recurring. A level.
+    pub digest_repair_stopped: usize,
+    /// Whether `cluster.divergence_repair` is on. A level, for a gauge.
+    pub repair_enabled: bool,
     /// Kept digest rows a self-check found disagreeing with their records and
     /// corrected, since the process started. A level; zero on a healthy node.
     pub digest_drift_total: u64,
@@ -584,6 +591,13 @@ pub struct ReplicationConfig {
     /// for a test that needs a resolver that hangs, fails or counts its calls.
     /// `None` is every real node.
     pub resolver: Option<Resolver>,
+    /// `cluster.divergence_repair`: whether a confirmed digest finding plans a document
+    /// repair. Off, the detectors keep running and nothing is planned (each skipped plan is
+    /// counted `disabled`).
+    pub divergence_repair: bool,
+    /// `cluster.repair_max_documents`: a collection with more live documents than this is
+    /// not repaired by a document repair (counted `too_large`).
+    pub repair_max_documents: u64,
 }
 
 /// Each peer's last advertised vector, kept for the replication lag gauge,
@@ -675,6 +689,8 @@ impl ReplicationConfig {
             expected_members: None,
             self_recheck: SELF_RECHECK,
             resolver: None,
+            divergence_repair: true,
+            repair_max_documents: 2_000_000,
         }
     }
 }
@@ -748,6 +764,9 @@ pub async fn replicate(engine: Arc<Engine>, config: ReplicationConfig) {
     // peer's vector exists.
     let mut stalls = PeerStalls::new();
     stalls.set_catch_up(config.catch_up.clone());
+    // What the loop guard of the document repair judges time by: the time since here.
+    let loop_started = Instant::now();
+    digest_state.repair_planned = config.divergence_repair;
     // Addresses that answered the handshake with this node's own id (ADR-202),
     // and when: left out of the peers, and never a failed round, until
     // `config.self_recheck` has passed, when they are dialled once more, quietly
@@ -1011,6 +1030,21 @@ pub async fn replicate(engine: Arc<Engine>, config: ReplicationConfig) {
                     let members = config.members.as_ref().map(|members| members.node_ids());
                     definition_state.prune(held, members.as_ref());
                     stalls.retain_definition_detail(members.as_ref(), held);
+                    // The loop guard of the document repair: its clock and rotation
+                    // (one collection per contact, so a rotation is one tick per held
+                    // collection), the repairs whose deadline passed unjudged, and
+                    // everything about a collection or member that is gone (R7).
+                    stalls.set_repair_clock(
+                        tick_started.saturating_duration_since(loop_started),
+                        config.sync_interval * u32::try_from(held.len().max(1)).unwrap_or(u32::MAX),
+                    );
+                    for (key, verdict) in stalls.expire_repairs() {
+                        log_repair_verdict(key.peer, key.collection, verdict);
+                    }
+                    stalls.retain_ledger(held, members.as_ref());
+                    if let Some(members) = &members {
+                        divergence.retain_members(members);
+                    }
                 }
                 if let Err(e) = &mine_collections {
                     warn!(error = %e, "divergence check: could not list this node's own \
@@ -1363,6 +1397,7 @@ pub async fn replicate(engine: Arc<Engine>, config: ReplicationConfig) {
                                             &engine,
                                             &mut divergence,
                                             &mut digest_state,
+                                            &mut stalls,
                                             node,
                                             peer,
                                             round,
@@ -1426,6 +1461,19 @@ pub async fn replicate(engine: Arc<Engine>, config: ReplicationConfig) {
                                         }
                                     }
                                     stalls.retain_repaired(node, &confirmed);
+                                    // The cut digest's findings plan a document repair
+                                    // (repair design section 3).
+                                    let digest_confirmed = divergence.digest_confirmed_against(node);
+                                    plan_digest_repairs(
+                                        &engine,
+                                        &config,
+                                        &mut stalls,
+                                        node,
+                                        peer,
+                                        &digest_confirmed,
+                                        &mut report,
+                                    );
+                                    stalls.retain_digest(node, &digest_confirmed);
                                 } else {
                                     report.divergence_skips += 1;
                                 }
@@ -1595,6 +1643,9 @@ pub async fn replicate(engine: Arc<Engine>, config: ReplicationConfig) {
                 // above does, and that already ran per peer contacted.
                 report.divergent_collections = divergence.confirmed_count();
                 report.digest_divergent_collections = divergence.digest_confirmed_count();
+                report.repair.add(&stalls.take_repair_counts());
+                report.digest_repair_stopped = stalls.stopped_collections();
+                report.repair_enabled = config.divergence_repair;
                 report.definition_divergent_collections = divergence.definition_confirmed_count();
                 report.digest_drift_total = engine.digest_drift_total();
                 // And when that reading was last re-examined (ADR-145): the
@@ -1903,6 +1954,9 @@ struct DigestState {
     >,
     /// When each confirmed `(peer, collection)` was last logged.
     warned: std::collections::HashMap<(NodeId, kimmy_core::CollectionId), Instant>,
+    /// Whether a confirmed finding plans a document repair (`cluster.divergence_repair`),
+    /// which is what the finding's WARN says.
+    repair_planned: bool,
 }
 
 impl DigestState {
@@ -1928,6 +1982,7 @@ fn fold_digest_round(
     engine: &Engine,
     tracker: &mut kimmy_storage::DivergenceTracker,
     state: &mut DigestState,
+    stalls: &mut PeerStalls,
     node: NodeId,
     peer: SocketAddr,
     round: kimmy_storage::DigestRound,
@@ -1954,11 +2009,24 @@ fn fold_digest_round(
             DigestOutcome::Compared { equal: true, .. } => {
                 report.digest_compared += 1;
                 tracker.observe_digest(node, verdict.collection, false);
+                // The first compared probe after a repair's end judges it (R2).
+                if let Some(v) =
+                    stalls.judge_digest_repair(node, verdict.collection, Judged::Effective)
+                {
+                    log_repair_verdict(node, verdict.collection, v);
+                }
             }
             DigestOutcome::Compared { equal: false, mine, theirs } => {
                 match verify_row(engine, state, verdict.collection) {
                     SelfCheck::Exact => {
                         report.digest_compared += 1;
+                        if let Some(v) = stalls.judge_digest_repair(
+                            node,
+                            verdict.collection,
+                            Judged::Ineffective,
+                        ) {
+                            log_repair_verdict(node, verdict.collection, v);
+                        }
                         let newly = tracker.observe_digest(node, verdict.collection, true);
                         let confirmed = tracker.is_digest_confirmed(node, verdict.collection);
                         let key = (node, verdict.collection);
@@ -1974,19 +2042,36 @@ fn fold_digest_round(
                                 .flatten()
                                 .map(|row| format!("{:?}", row.maxw))
                                 .unwrap_or_default();
-                            warn!(
-                                %peer,
-                                node = %node,
-                                collection = %verdict.collection,
-                                mine = format!("{mine:032x}"),
-                                theirs = format!("{theirs:032x}"),
-                                maxw = %maxw,
-                                "the cut digest of a collection differs from this peer's on two \
-                                 consecutive comparisons, with what each side had not yet \
-                                 processed set aside; detect only, no repair is planned. The API \
-                                 cannot always say which member is behind: read (operations.md, The \
-                                 cut digest) before wiping either member"
-                            );
+                            if state.repair_planned {
+                                warn!(
+                                    %peer,
+                                    node = %node,
+                                    collection = %verdict.collection,
+                                    mine = format!("{mine:032x}"),
+                                    theirs = format!("{theirs:032x}"),
+                                    maxw = %maxw,
+                                    "a confirmed digest divergence; a document repair is planned. \
+                                     The cut digest of a collection differs from this peer's on \
+                                     two consecutive comparisons, with what each side had not yet \
+                                     processed set aside. The API cannot always say which member \
+                                     is behind: read (operations.md, The cut digest) before wiping \
+                                     either member"
+                                );
+                            } else {
+                                warn!(
+                                    %peer,
+                                    node = %node,
+                                    collection = %verdict.collection,
+                                    mine = format!("{mine:032x}"),
+                                    theirs = format!("{theirs:032x}"),
+                                    maxw = %maxw,
+                                    "the cut digest of a collection differs from this peer's on \
+                                     two consecutive comparisons, with what each side had not yet \
+                                     processed set aside; detect only, no repair is planned. The \
+                                     API cannot always say which member is behind: read \
+                                     (operations.md, The cut digest) before wiping either member"
+                                );
+                            }
                         }
                     }
                     SelfCheck::Corrected => {
@@ -2012,6 +2097,88 @@ fn fold_digest_round(
         if !answered_for.contains(&collection) {
             report.digest_deferred[reason.index()] += 1;
         }
+    }
+}
+
+/// Plan a document repair for each digest finding confirmed against `node`, or count why
+/// not (repair design sections 3 and 5): the switch, the catching-up gates, the size gate,
+/// then the planner's own (a count repair, a whole-database pull, the loop guard).
+fn plan_digest_repairs(
+    engine: &Engine,
+    config: &ReplicationConfig,
+    stalls: &mut PeerStalls,
+    node: NodeId,
+    peer: SocketAddr,
+    confirmed: &BTreeSet<kimmy_core::CollectionId>,
+    report: &mut RoundReport,
+) {
+    use crate::transport::{DigestPlan, DigestRepairOutcome};
+    // This member's own marker and the peer's `catching_up` fact: a repair compares rows
+    // against a peer, and either side mid-catch-up would be repaired from or to a state
+    // that is about to change (review B m9; a restored member is marked catching up).
+    let catching_up = config.catch_up.as_ref().is_some_and(|catch_up| catch_up.is_set())
+        || config.members.as_ref().is_some_and(|members| {
+            members.peer_states().get(&node) == Some(&crate::facts::PeerState::IneligibleCatchingUp)
+        });
+    for collection in confirmed {
+        let finding = stalls.digest_finding_confirmed(node, *collection);
+        if finding.newly_stopped {
+            error!(
+                %peer,
+                node = %node,
+                collection = %collection,
+                "a divergence recurs after repair; repair of this collection is stopped"
+            );
+        }
+        if !config.divergence_repair {
+            stalls.digest_repair_refused(DigestRepairOutcome::Disabled);
+            continue;
+        }
+        if catching_up {
+            continue;
+        }
+        let live = engine.count_by_id(*collection).ok().flatten().unwrap_or(0);
+        if live > config.repair_max_documents {
+            stalls.digest_repair_refused(DigestRepairOutcome::TooLarge);
+            continue;
+        }
+        if stalls.plan_digest_repair(node, *collection) == DigestPlan::Planned {
+            warn!(
+                %peer,
+                node = %node,
+                collection = %collection,
+                "divergence confirmed; planned a document repair from this peer on the next \
+                 round with it"
+            );
+        }
+        let _ = report;
+    }
+}
+
+/// Log what the loop guard made of a repair at its judgement (repair design section 15.2).
+fn log_repair_verdict(
+    peer: NodeId,
+    collection: kimmy_core::CollectionId,
+    verdict: crate::repair_ledger::Verdict,
+) {
+    use crate::repair_ledger::Verdict;
+    match verdict {
+        Verdict::Ineffective { level, not_before }
+        | Verdict::UnjudgedClimb { level, not_before } => {
+            // Once, on entering level 2.
+            if level == 2 {
+                warn!(
+                    node = %peer,
+                    collection = %collection,
+                    level,
+                    not_before_secs = not_before.as_secs(),
+                    "a divergence repair did not clear the finding; backing off"
+                );
+            } else {
+                debug!(node = %peer, collection = %collection, level, "a divergence repair did not clear the finding");
+            }
+        }
+        Verdict::Effective | Verdict::Transient => {}
     }
 }
 
@@ -3934,6 +4101,7 @@ mod digest_fold_tests {
         collection: CollectionId,
         tracker: DivergenceTracker,
         state: DigestState,
+        stalls: PeerStalls,
         report: RoundReport,
         node: NodeId,
         peer: SocketAddr,
@@ -3952,6 +4120,7 @@ mod digest_fold_tests {
             collection: coll.id,
             tracker: DivergenceTracker::default(),
             state: DigestState::default(),
+            stalls: PeerStalls::new(),
             report: RoundReport::default(),
             node: NodeId::from_bytes([3; 16]),
             peer: "127.0.0.1:9".parse().unwrap(),
@@ -3961,8 +4130,10 @@ mod digest_fold_tests {
 
     impl Fixture {
         fn fold(&mut self, round: DigestRound) -> String {
-            let Fixture { engine, tracker, state, report, node, peer, .. } = self;
-            logs_of(|| fold_digest_round(engine, tracker, state, *node, *peer, round, report))
+            let Fixture { engine, tracker, state, stalls, report, node, peer, .. } = self;
+            logs_of(|| {
+                fold_digest_round(engine, tracker, state, stalls, *node, *peer, round, report)
+            })
         }
 
         fn mismatch(&self) -> DigestRound {
@@ -4368,9 +4539,18 @@ mod definition_fold_tests {
                     theirs: 2,
                 },
             });
-            let Fixture { engine, tracker, report, node, peer, .. } = &mut f;
+            let Fixture { engine, tracker, stalls, report, node, peer, .. } = &mut f;
             digest_logs.push_str(&logs_of(|| {
-                fold_digest_round(engine, tracker, &mut digest_state, *node, *peer, digest, report)
+                fold_digest_round(
+                    engine,
+                    tracker,
+                    &mut digest_state,
+                    stalls,
+                    *node,
+                    *peer,
+                    digest,
+                    report,
+                )
             }));
             definition_logs.push_str(&f.fold(f.mismatch(&["ttl"])));
         }

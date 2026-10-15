@@ -41,6 +41,9 @@ use crate::protocol::{
     MAX_BATCH, MAX_FRAME, Message, ProtocolError, nonce, proof_is_valid, prove, read_frame,
     write_frame,
 };
+use crate::repair_ledger::{
+    Confirmed, End, Judged, Key as LedgerKey, LedgerKind, MayPlan, RepairLedger, Transient, Verdict,
+};
 
 /// How much of a frame the entries themselves may occupy.
 ///
@@ -2669,7 +2672,7 @@ where
             if let Some((collection, _)) = repair
                 && pulled.sender_dropped
             {
-                stalls.repair_finished(their_node);
+                stalls.repair_ended_transient(their_node, Transient::Dropped);
                 warn!(
                     %peer,
                     collection = %collection,
@@ -2999,6 +3002,14 @@ pub struct PeerStalls {
     /// and the members, so it cannot grow with what is gone.
     definition_detail: HashMap<NodeId, BTreeSet<CollectionId>>,
     repairs: HashMap<NodeId, Repairs>,
+    /// The loop guard of the document repair (repair design section 4): what stops a
+    /// repair that changes nothing from running for ever. In memory only (R6).
+    ledger: RepairLedger,
+    /// The time the ledger judges by, as a duration since the loop started, set by the
+    /// loop at the start of each tick ([`Self::set_repair_clock`]).
+    repair_clock: Duration,
+    /// What the document repair counted since the loop last took it.
+    repair_counts: RepairCounts,
     /// Snapshot pulls left to resume, one per peer (ADR-152): where the next
     /// page begins and what the completed snapshot grants, carried across
     /// rounds so a snapshot that does not fit one round goes on from its
@@ -3225,9 +3236,176 @@ impl Repair {
     }
 }
 
+/// How a document repair ended, or was refused before it started: the `outcome` label
+/// of `kimmy_sync_digest_repairs_total`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DigestRepairOutcome {
+    /// The pull ran to its end.
+    Applied,
+    /// A plan gate: the collection holds more live documents than
+    /// `cluster.repair_max_documents`.
+    TooLarge,
+    /// `REPAIR_ATTEMPTS` rounds applied nothing.
+    Abandoned,
+    /// A peer error, a stop, a drop, a whole-database pull taking the peer over,
+    /// a cancellation (the loop guard's R1).
+    Transient,
+    /// A count repair of the collection is queued, active or cooling.
+    SkippedCountRepair,
+    /// A plan gate: `cluster.divergence_repair` is off.
+    Disabled,
+}
+
+impl DigestRepairOutcome {
+    pub const ALL: [Self; 6] = [
+        Self::Applied,
+        Self::TooLarge,
+        Self::Abandoned,
+        Self::Transient,
+        Self::SkippedCountRepair,
+        Self::Disabled,
+    ];
+
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Applied => "applied",
+            Self::TooLarge => "too_large",
+            Self::Abandoned => "abandoned",
+            Self::Transient => "transient",
+            Self::SkippedCountRepair => "skipped_count_repair",
+            Self::Disabled => "disabled",
+        }
+    }
+
+    pub const fn index(self) -> usize {
+        self as usize
+    }
+}
+
+/// What the loop guard made of a repair at its compared probe: the `result` label of
+/// `kimmy_sync_digest_repair_judgements_total`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Judgement {
+    Effective,
+    Ineffective,
+    /// The deadline passed with no compared probe.
+    Unjudged,
+    /// The collection was stopped for recurring.
+    Recurring,
+}
+
+impl Judgement {
+    pub const ALL: [Self; 4] =
+        [Self::Effective, Self::Ineffective, Self::Unjudged, Self::Recurring];
+
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Effective => "effective",
+            Self::Ineffective => "ineffective",
+            Self::Unjudged => "unjudged",
+            Self::Recurring => "recurring",
+        }
+    }
+
+    pub const fn index(self) -> usize {
+        self as usize
+    }
+}
+
+/// What a document repair's pages did, by row: the `result` label of
+/// `kimmy_sync_digest_repair_rows_total`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RowResult {
+    Applied,
+    /// Young lost inserts written.
+    Created,
+    /// Live rows this member held nothing for and the policy did not write.
+    Left,
+    /// Tombstone rows this member held nothing for.
+    LeftTombstone,
+    /// Rows that addressed a life this member has buried.
+    Superseded,
+}
+
+impl RowResult {
+    pub const ALL: [Self; 5] =
+        [Self::Applied, Self::Created, Self::Left, Self::LeftTombstone, Self::Superseded];
+
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Applied => "applied",
+            Self::Created => "created",
+            Self::Left => "left",
+            Self::LeftTombstone => "left_tombstone",
+            Self::Superseded => "superseded",
+        }
+    }
+
+    pub const fn index(self) -> usize {
+        self as usize
+    }
+}
+
+/// The document repair's counters since the loop last took them
+/// ([`PeerStalls::take_repair_counts`]).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct RepairCounts {
+    pub digest_repairs: [usize; DigestRepairOutcome::ALL.len()],
+    pub digest_judgements: [usize; Judgement::ALL.len()],
+    pub digest_rows: [usize; RowResult::ALL.len()],
+}
+
+impl RepairCounts {
+    pub fn add(&mut self, other: &RepairCounts) {
+        for (a, b) in self.digest_repairs.iter_mut().zip(other.digest_repairs) {
+            *a += b;
+        }
+        for (a, b) in self.digest_judgements.iter_mut().zip(other.digest_judgements) {
+            *a += b;
+        }
+        for (a, b) in self.digest_rows.iter_mut().zip(other.digest_rows) {
+            *a += b;
+        }
+    }
+}
+
+/// What the repair under way has written so far, for the line that reports its end and
+/// for the loop guard's idea of progress.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Tally {
+    pub applied: usize,
+    pub created: usize,
+    pub left: usize,
+    pub left_tombstone: usize,
+    pub superseded: usize,
+}
+
+impl Tally {
+    /// R3's progress for a document repair: it wrote a row.
+    fn made_progress(&self) -> bool {
+        self.applied + self.created > 0
+    }
+}
+
+/// Why a document repair was not planned (the planner's answer to a confirmed finding).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DigestPlan {
+    Planned,
+    /// Queued, active, or cooling already.
+    Duplicate,
+    /// A count repair of the collection is queued, active or cooling.
+    SkippedCountRepair,
+    /// A whole-database pull is pending for the peer.
+    WholeDatabasePending,
+    /// The loop guard said no.
+    Held(MayPlan),
+}
+
 /// The repairs planned against one peer.
 #[derive(Debug, Default)]
 struct Repairs {
+    /// What the active repair has written (a document repair).
+    tally: Tally,
     /// The repair in progress, and the collection it is for.
     active: Option<(CollectionId, Repair)>,
     /// Consecutive rounds the repair in progress has been handed out for
@@ -3666,23 +3844,14 @@ impl PeerStalls {
         // A digest repair is not planned beside a count repair of the collection, queued,
         // active or cooling: the replay lands what a digest repair would for the ids it
         // holds. (A count repair is not refused beside a digest one.)
-        let counted = self.repairs.get(&peer).is_some_and(|repairs| {
-            repairs.done.contains_key(&(collection, RepairKind::Count))
-                || repairs.queued.contains_key(&(collection, RepairKind::Count))
-                || repairs
-                    .active
-                    .is_some_and(|(id, r)| id == collection && r.kind() == RepairKind::Count)
-        });
         if kind == RepairKind::Digest {
-            if counted {
+            if self.count_repair_pending(peer, collection) {
                 return false;
             }
             // And not for a peer with a whole-database pull pending: the in-memory
             // progress holds one entry per peer, and the two would reset each other
             // every round.
-            if self.snapshots.get(&peer).is_some_and(|progress| {
-                progress.scope().is_none() && !progress.is_complete() && progress.pages() > 0
-            }) {
+            if self.whole_database_pending(peer) {
                 return false;
             }
         }
@@ -3697,6 +3866,165 @@ impl PeerStalls {
         true
     }
 
+    /// Whether a count repair of `collection` is queued, active or cooling against `peer`.
+    fn count_repair_pending(&self, peer: NodeId, collection: CollectionId) -> bool {
+        self.repairs.get(&peer).is_some_and(|repairs| {
+            repairs.done.contains_key(&(collection, RepairKind::Count))
+                || repairs.queued.contains_key(&(collection, RepairKind::Count))
+                || repairs
+                    .active
+                    .is_some_and(|(id, r)| id == collection && r.kind() == RepairKind::Count)
+        })
+    }
+
+    /// Whether a whole-database pull is pending for `peer`: begun, with a page applied,
+    /// and not complete. (`snapshot_pending` is across all peers.)
+    fn whole_database_pending(&self, peer: NodeId) -> bool {
+        self.snapshots.get(&peer).is_some_and(|progress| {
+            progress.scope().is_none() && !progress.is_complete() && progress.pages() > 0
+        })
+    }
+
+    /// The loop guard's time and the rotation it is judged by, set at the start of each
+    /// tick: `now` since the loop started, and how long the count rotation takes to name
+    /// every collection once (the deadline of R2 and the de-duplication of R4 read it).
+    pub fn set_repair_clock(&mut self, now: Duration, rotation: Duration) {
+        self.repair_clock = now;
+        self.ledger.set_rotation(rotation);
+    }
+
+    /// What the document repair counted since this was last called.
+    pub fn take_repair_counts(&mut self) -> RepairCounts {
+        std::mem::take(&mut self.repair_counts)
+    }
+
+    /// Collections the loop guard has stopped for recurring (a gauge).
+    pub fn stopped_collections(&mut self) -> usize {
+        self.ledger.stopped_collections(self.repair_clock)
+    }
+
+    /// A digest finding against `peer` for `collection` is confirmed, as it is at every
+    /// contact it stands: the first one after a repair cleared it is an episode (R4).
+    pub fn digest_finding_confirmed(
+        &mut self,
+        peer: NodeId,
+        collection: CollectionId,
+    ) -> Confirmed {
+        let key = LedgerKey { peer, collection, kind: LedgerKind::Digest };
+        let confirmed = self.ledger.confirmed(key, self.repair_clock);
+        if confirmed.newly_stopped {
+            self.repair_counts.digest_judgements[Judgement::Recurring.index()] += 1;
+        }
+        confirmed
+    }
+
+    /// Plan a document repair of `collection` against `peer` for a confirmed digest
+    /// finding, or say why not (R5 and the planner's gates).
+    pub fn plan_digest_repair(&mut self, peer: NodeId, collection: CollectionId) -> DigestPlan {
+        if self.count_repair_pending(peer, collection) {
+            self.repair_counts.digest_repairs[DigestRepairOutcome::SkippedCountRepair.index()] += 1;
+            return DigestPlan::SkippedCountRepair;
+        }
+        if self.whole_database_pending(peer) {
+            return DigestPlan::WholeDatabasePending;
+        }
+        let key = LedgerKey { peer, collection, kind: LedgerKind::Digest };
+        match self.ledger.may_plan(key, self.repair_clock) {
+            MayPlan::Yes => {}
+            held => return DigestPlan::Held(held),
+        }
+        if !self.plan_repair(peer, collection, Repair::Converge) {
+            return DigestPlan::Duplicate;
+        }
+        self.ledger.started(key, self.repair_clock);
+        DigestPlan::Planned
+    }
+
+    /// A plan gate refused a document repair: counted where it is refused, not at a pull's
+    /// end (`too_large`, `disabled`).
+    pub fn digest_repair_refused(&mut self, why: DigestRepairOutcome) {
+        self.repair_counts.digest_repairs[why.index()] += 1;
+    }
+
+    /// The first compared probe of the digest after a repair's end said `judged` (R2).
+    pub fn judge_digest_repair(
+        &mut self,
+        peer: NodeId,
+        collection: CollectionId,
+        judged: Judged,
+    ) -> Option<Verdict> {
+        let key = LedgerKey { peer, collection, kind: LedgerKind::Digest };
+        let verdict = self.ledger.judge(key, self.repair_clock, judged)?;
+        let result = match judged {
+            Judged::Effective => Judgement::Effective,
+            Judged::Ineffective => Judgement::Ineffective,
+        };
+        self.repair_counts.digest_judgements[result.index()] += 1;
+        Some(verdict)
+    }
+
+    /// End the repairs whose deadline passed with no compared probe (R2). Returns the
+    /// keys and what became of each, for the loop's log.
+    pub fn expire_repairs(&mut self) -> Vec<(LedgerKey, Verdict)> {
+        let expired = self.ledger.expire(self.repair_clock);
+        for (key, _) in &expired {
+            if key.kind == LedgerKind::Digest {
+                self.repair_counts.digest_judgements[Judgement::Unjudged.index()] += 1;
+            }
+        }
+        expired
+    }
+
+    /// R7: forget the ledger's entries for collections no longer held and peers no longer
+    /// members.
+    pub fn retain_ledger(
+        &mut self,
+        held: &BTreeSet<CollectionId>,
+        members: Option<&BTreeSet<NodeId>>,
+    ) {
+        self.ledger.retain(held, members);
+    }
+
+    /// The document repair against `peer` for `collection` ended as `end`, counted as
+    /// `outcome`.
+    fn digest_ended(
+        &mut self,
+        peer: NodeId,
+        collection: CollectionId,
+        end: End,
+        outcome: DigestRepairOutcome,
+    ) {
+        self.repair_counts.digest_repairs[outcome.index()] += 1;
+        let key = LedgerKey { peer, collection, kind: LedgerKind::Digest };
+        self.ledger.ended(key, self.repair_clock, end);
+    }
+
+    /// A document repair's page applied: what it wrote is added to the repair's tally and
+    /// to the row counters.
+    fn converge_page_applied(&mut self, peer: NodeId, applied: &kimmy_storage::SnapshotApplied) {
+        let page = Tally {
+            applied: applied.applied,
+            created: applied.created,
+            left: applied.left,
+            left_tombstone: applied.left_tombstone,
+            superseded: applied.superseded,
+        };
+        let rows = &mut self.repair_counts.digest_rows;
+        rows[RowResult::Applied.index()] += page.applied;
+        rows[RowResult::Created.index()] += page.created;
+        rows[RowResult::Left.index()] += page.left;
+        rows[RowResult::LeftTombstone.index()] += page.left_tombstone;
+        rows[RowResult::Superseded.index()] += page.superseded;
+        if let Some(repairs) = self.repairs.get_mut(&peer) {
+            let tally = &mut repairs.tally;
+            tally.applied += page.applied;
+            tally.created += page.created;
+            tally.left += page.left;
+            tally.left_tombstone += page.left_tombstone;
+            tally.superseded += page.superseded;
+        }
+    }
+
     /// The repair the round with `peer` now opening runs, if any: the one
     /// under way, or the next planned. Also counts the round against every
     /// repair done for this peer, for the cooldown, and against the repair
@@ -3704,6 +4032,8 @@ impl PeerStalls {
     /// [`REPAIR_ATTEMPTS`] rounds that did not advance it.
     pub fn repair_due(&mut self, peer: NodeId) -> Option<(CollectionId, Repair)> {
         let repairs = self.repairs.get_mut(&peer)?;
+        // Document repairs this call ends, for the loop guard.
+        let mut ended: Vec<CollectionId> = Vec::new();
         // Once per contact, not once per pull: a draining tick asks this
         // several times, and the cooldown below is a constant argued in
         // minutes (ADR-157). The stall accounting under it stays per pull,
@@ -3738,6 +4068,9 @@ impl PeerStalls {
                      divergence check reports the collection again or the cooldown passes"
                 );
                 repairs.done.insert((collection, abandoned.kind()), 0);
+                if abandoned.kind() == RepairKind::Digest {
+                    ended.push(collection);
+                }
                 repairs.stalled = 0;
                 repairs.advanced = false;
                 // Whatever of its snapshot was pulled is kept — the pages
@@ -3764,8 +4097,18 @@ impl PeerStalls {
                 next.and_then(|key| repairs.queued.remove(&key).map(|repair| (key.0, repair)));
             repairs.stalled = 0;
             repairs.advanced = false;
+            repairs.tally = Tally::default();
         }
-        repairs.active
+        let active = repairs.active;
+        for collection in ended {
+            self.digest_ended(
+                peer,
+                collection,
+                End::Transient(Transient::Abandoned),
+                DigestRepairOutcome::Abandoned,
+            );
+        }
+        active
     }
 
     /// Whether a snapshot pull scoped to `scope` was left to resume with
@@ -3854,18 +4197,33 @@ impl PeerStalls {
         // get a round and reset the whole-database cursor to page one, so with k queued
         // the catch-up would restart k times. They are re-planned when the finding is
         // reported again, after the pull.
+        let mut ended: Vec<CollectionId> = repairs
+            .queued
+            .keys()
+            .filter(|(_, kind)| *kind == RepairKind::Digest)
+            .map(|(collection, _)| *collection)
+            .collect();
         repairs.queued.retain(|(_, kind), _| *kind != RepairKind::Digest);
         if let Some((collection, Repair::Converge)) = repairs.active {
             repairs.active = None;
             repairs.done.insert((collection, RepairKind::Digest), 0);
             repairs.stalled = 0;
             repairs.advanced = false;
+            ended.push(collection);
             warn!(
                 node = %peer,
                 collection = %collection,
                 "a whole-database pull from this peer takes over; the converge repair against it \
                  is abandoned until the divergence check reports the collection again or the \
                  cooldown passes"
+            );
+        }
+        for collection in ended {
+            self.digest_ended(
+                peer,
+                collection,
+                End::Transient(Transient::WholeDatabaseTookOver),
+                DigestRepairOutcome::Transient,
             );
         }
     }
@@ -3885,19 +4243,48 @@ impl PeerStalls {
     /// returning how many. One under way finishes as it would: its page has
     /// already been judged.
     fn repairs_cancelled(&mut self, collection: CollectionId) -> usize {
-        self.repairs
-            .values_mut()
-            .map(|repairs| {
+        let mut cancelled_digest = Vec::new();
+        let total = self
+            .repairs
+            .iter_mut()
+            .map(|(peer, repairs)| {
                 [RepairKind::Count, RepairKind::Digest]
                     .into_iter()
-                    .filter(|kind| repairs.queued.remove(&(collection, *kind)).is_some())
+                    .filter(|kind| {
+                        let removed = repairs.queued.remove(&(collection, *kind)).is_some();
+                        if removed && *kind == RepairKind::Digest {
+                            cancelled_digest.push(*peer);
+                        }
+                        removed
+                    })
                     .count()
             })
-            .sum()
+            .sum();
+        for peer in cancelled_digest {
+            self.digest_ended(
+                peer,
+                collection,
+                End::Transient(Transient::Cancelled),
+                DigestRepairOutcome::Transient,
+            );
+        }
+        total
     }
 
     /// The repair under way against `peer` is done.
     fn repair_finished(&mut self, peer: NodeId) {
+        self.repair_ended(peer, None);
+    }
+
+    /// The repair under way against `peer` ended without a result to judge: `why` is
+    /// the loop guard's R1 reason. For a document repair only; the count half has no
+    /// ledger.
+    fn repair_ended_transient(&mut self, peer: NodeId, why: Transient) {
+        self.repair_ended(peer, Some(why));
+    }
+
+    fn repair_ended(&mut self, peer: NodeId, transient: Option<Transient>) {
+        let mut ledger_end = None;
         if let Some(repairs) = self.repairs.get_mut(&peer)
             && let Some((collection, finished)) = repairs.active.take()
         {
@@ -3906,9 +4293,23 @@ impl PeerStalls {
             // The page that finished it must not be read as advancing the
             // next repair planned for this peer.
             repairs.advanced = false;
+            if finished.kind() == RepairKind::Digest {
+                ledger_end = Some((collection, repairs.tally));
+            }
+            repairs.tally = Tally::default();
             if self.snapshots.get(&peer).is_some_and(|p| p.scope() == Some(collection)) {
                 self.snapshots.remove(&peer);
             }
+        }
+        if let Some((collection, tally)) = ledger_end {
+            let (end, outcome) = match transient {
+                Some(why) => (End::Transient(why), DigestRepairOutcome::Transient),
+                None => (
+                    End::Finished { progress: tally.made_progress() },
+                    DigestRepairOutcome::Applied,
+                ),
+            };
+            self.digest_ended(peer, collection, end, outcome);
         }
     }
 
@@ -4580,6 +4981,9 @@ where
             pages += 1;
         }
         let applied = applied.map_err(|e| from_storage(e, ProtocolError::Malformed))?;
+        if policy == kimmy_storage::SnapshotPolicy::Converge {
+            stalls.converge_page_applied(node, &applied);
+        }
         // A Converge page from a sender that no longer holds the collection applied
         // nothing and moved nothing: the pull ends here, abandoned.
         if applied.sender_dropped {
@@ -4905,6 +5309,9 @@ mod yield_tests;
 
 #[cfg(test)]
 mod replay_tests;
+
+#[cfg(test)]
+mod digest_repair_tests;
 
 #[cfg(test)]
 mod tests {

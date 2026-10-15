@@ -360,13 +360,13 @@ fn retain_drops_removed_peers_and_dropped_collections_and_their_repairs() {
     run(&mut l, key(3, 1), mins(0), false); // still in flight, then pruned
     let held: BTreeSet<_> = [CollectionId(1)].into();
     let members: BTreeSet<_> = [node(1), node(3)].into();
-    l.retain(&held, &members);
+    l.retain(&held, Some(&members));
     assert_eq!(l.entries.keys().copied().collect::<Vec<_>>(), vec![keep, key(3, 1)]);
     assert_eq!(l.armed.len(), 1);
     assert!(l.collections.is_empty() || l.collections.keys().all(|c| held.contains(c)));
     // A dropped collection's stop goes with it.
     let members: BTreeSet<_> = [node(1)].into();
-    l.retain(&BTreeSet::new(), &members);
+    l.retain(&BTreeSet::new(), Some(&members));
     assert!(l.is_empty());
 }
 
@@ -589,7 +589,7 @@ mod model {
                     let held: BTreeSet<_> = (1..=2).map(CollectionId).collect();
                     let members: BTreeSet<_> =
                         (1..=3u128).filter(|n| *n != gone_peer).map(node).collect();
-                    l.retain(&held, &members);
+                    l.retain(&held, Some(&members));
                     hist.retain(|k, _| k.peer != node(gone_peer));
                     last_end.retain(|k, _| k.peer != node(gone_peer));
                     // No entry survives its peer.
