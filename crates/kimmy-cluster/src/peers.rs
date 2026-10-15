@@ -2465,8 +2465,9 @@ fn repair_for(engine: &Engine, collection: kimmy_core::CollectionId) -> Repair {
     }
 }
 
-#[cfg(test)]
+// The gate directly above the module, where the source audits look for it.
 #[path = "count_finding_tests.rs"]
+#[cfg(test)]
 mod count_finding_tests;
 
 #[cfg(test)]
