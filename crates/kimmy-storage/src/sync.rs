@@ -7884,10 +7884,14 @@ mod tests {
     fn a_page_carrying_a_life_this_member_refuses_leaves_the_later_life_stop_standing() {
         let (a, _da) = engine();
         let (b, _db) = engine();
-        a.create_collection("shop", "orders").unwrap();
+        let orders = a.create_collection("shop", "orders").unwrap();
+        // Enough for a second page, which carries no definition.
+        let docs = (0..crate::SNAPSHOT_PAGE as i64 + 8).map(|i| doc! { "_id": i }).collect();
+        a.insert_many(&orders, docs).unwrap();
         let other = a.create_collection("shop", "other").unwrap();
-        round(&b, &a, BATCH);
+        round(&b, &a, 4 * BATCH);
         b.drop_collection("shop", "orders").unwrap();
+        b.finish_purges_now().unwrap();
         std::thread::sleep(std::time::Duration::from_millis(2));
         let field = crate::meta::IndexField { path: "n".into(), descending: false };
         a.create_index("shop", "orders", vec![field], false, None).unwrap();

@@ -2076,6 +2076,47 @@ mod tests {
         );
     }
 
+    /// And a stream resumed from a token of the earlier life, whose next entry is that
+    /// life's drop, ends there: the token is history of the life the drop ended.
+    #[tokio::test]
+    async fn a_stream_resumed_from_the_earlier_lifes_last_change_still_ends_at_its_drop() {
+        let (engine, coll, _dir) = setup();
+        let mut first = engine
+            .watch(
+                WatchScope::Collection(coll.id),
+                WatchOptions { start_at: Some(Hlc::ZERO), ..Default::default() },
+            )
+            .unwrap();
+        engine.insert(&coll, doc! { "_id": 1i64 }).unwrap();
+        assert_eq!(doc_ids(&take(&engine, &mut first, 1).await), vec![1], "premise");
+        let token = first.resume_token().expect("a delivered event yields a token");
+        engine.drop_collection("app", "docs").unwrap();
+        engine.finish_purges_now().unwrap();
+        let recreated = engine.create_collection("app", "docs").unwrap();
+        engine.insert(&recreated, doc! { "_id": 99i64 }).unwrap();
+        let txn = engine.begin_write(crate::WriterHolder::Ddl).unwrap();
+        txn.open_table(crate::tables::COLLECTIONS_DROPPED).unwrap().remove(coll.id.0).unwrap();
+        txn.commit().unwrap();
+
+        let mut stream = engine
+            .watch(
+                WatchScope::Collection(recreated.id),
+                WatchOptions { resume_after: Some(token), ..Default::default() },
+            )
+            .unwrap();
+        let event = tokio::time::timeout(std::time::Duration::from_secs(5), stream.next(&engine))
+            .await
+            .expect("the stream answered")
+            .expect("an event");
+        assert!(
+            matches!(
+                event,
+                ChangeEvent::Invalidate { reason: InvalidateReason::CollectionDropped }
+            ),
+            "a stream resumed inside the earlier life ends at its drop: {event:?}"
+        );
+    }
+
     /// A drop in the standing life's own `Hlc` ends it (the tie is the drop's, ADR-236),
     /// so it is not one the stream passes over.
     #[tokio::test]
