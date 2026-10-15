@@ -106,6 +106,25 @@ fn a_database_drop_buries_what_a_peer_holds_that_was_created_before_it() {
     }
 }
 
+/// A creation the database's drop refuses is held and served onward (ADR-236), as
+/// an ignored collection drop is: the collection's tombstone is the database's drop
+/// expanded on meeting the creation, and a member that pulls only the relay never met
+/// it, while the relay's vector named the creation's origin past it. The two ended
+/// with different tombstone tables.
+#[test]
+fn a_creation_the_database_refuses_is_relayed_and_its_tombstone_follows() {
+    let (a, b, _da, _db, late) = the_field_sequence();
+    let (c, _dc) = engine();
+    pull(&a, &b);
+    assert!(!holds(&a, "shop", "late"), "premise: A refused it");
+    let expanded = a.collection_dropped_at(late).unwrap();
+    assert!(expanded.is_some(), "premise: A expanded the database's drop");
+    pull(&c, &a);
+    assert!(!holds(&c, "shop", "late"));
+    assert_eq!(c.collection_dropped_at(late).unwrap(), expanded, "the tombstone did not follow");
+    assert_eq!(pull(&c, &a), SyncOutcome::default(), "and nothing is left to serve");
+}
+
 /// Control: a collection created after the drop stands and replicates. The
 /// pair with the two tests above is what tells the fix from "refuse every
 /// collection of a database that was ever dropped".
@@ -138,8 +157,9 @@ fn a_create_older_than_a_database_drop_is_history_and_its_documents_are_supersed
         "the refusal must leave the collection's own tombstone, or its documents stop the batch"
     );
     assert_eq!(outcome.unknown_collection, 0, "{:?}", outcome.unknown);
-    // A creation judged history is not served onward, as one older than the
-    // collection's own tombstone is not.
+    // A creation the database's drop refuses is held and served onward (ADR-236):
+    // a member that meets it only through this one records the collection's
+    // tombstone from it, as this one did.
     let created = b
         .entries_for_peer(Hlc::ZERO, BATCH, crate::WalkScope::Background)
         .unwrap()
@@ -147,7 +167,7 @@ fn a_create_older_than_a_database_drop_is_history_and_its_documents_are_supersed
         .into_iter()
         .find(|e| e.kind == OpKind::CreateCollection && e.collection == late)
         .expect("b holds the creation");
-    assert!(c.oplog_entry(&created.stamp).unwrap().is_none(), "a refused creation was kept");
+    assert!(c.oplog_entry(&created.stamp).unwrap().is_some(), "a refused creation was withheld");
 
     // And more of the old life, after the create was refused, is history, not a stop.
     let bl = b.get_collection("shop", "late").unwrap();

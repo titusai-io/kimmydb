@@ -2208,7 +2208,16 @@ impl Engine {
                         collection = %target.name,
                         "ignored a creation older than the drop of its database"
                     );
-                    return Ok(DdlOutcome::Applied);
+                    // And held and served onward, as an ignored drop is (ADR-236)
+                    // and as the refusal under the writer below already was: the
+                    // collection's tombstone is the database's drop expanded on
+                    // meeting the creation, so a member that never meets it
+                    // records none, and withheld here it was never met past this
+                    // member, whose vector names the creation's origin past it.
+                    // A receiver holding the database's tombstone refuses it the
+                    // same way; one that does not yet takes the drop after it in
+                    // the same window, from the same member.
+                    return self.append_replicated_ddl(entry);
                 }
 
                 match self.get_collection(&target.db, &target.name) {
