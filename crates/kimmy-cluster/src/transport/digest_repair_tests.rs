@@ -548,8 +548,7 @@ fn logged(run: impl FnOnce()) -> Vec<String> {
         let _recording = tracing::subscriber::set_default(lines);
         run();
     }
-    let lines = seen.lock().unwrap().clone();
-    lines
+    seen.lock().unwrap().clone()
 }
 
 #[test]

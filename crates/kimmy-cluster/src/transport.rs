@@ -8352,19 +8352,27 @@ mod tests {
         let collection = CollectionId(7);
         let mut stalls = PeerStalls::new();
         assert!(stalls.plan_repair(peer, collection, Repair::Converge));
+        // The next Converge round, as the loop makes contacts: a Converge round and an
+        // ordinary one alternate (repair design section 2.6), so a round is at most two
+        // contacts away.
+        let next = |stalls: &mut PeerStalls| {
+            for _ in 0..2 {
+                stalls.tick_opened();
+                if let Some(due) = stalls.repair_due(peer) {
+                    return Some(due);
+                }
+            }
+            None
+        };
         for round in 0..REPAIR_ATTEMPTS * 2 {
-            assert_eq!(
-                stalls.repair_due(peer),
-                Some((collection, Repair::Converge)),
-                "round {round}"
-            );
+            assert_eq!(next(&mut stalls), Some((collection, Repair::Converge)), "round {round}");
             stalls.snapshot_advanced(peer);
         }
         assert!(stalls.repairing(peer), "a Converge repair landing pages is never abandoned");
         for empty in 1..=REPAIR_ATTEMPTS {
-            assert!(stalls.repair_due(peer).is_some(), "empty round {empty}");
+            assert!(next(&mut stalls).is_some(), "empty round {empty}");
         }
-        assert_eq!(stalls.repair_due(peer), None, "abandoned after three that landed nothing");
+        assert_eq!(next(&mut stalls), None, "abandoned after three that landed nothing");
         assert!(!stalls.plan_repair(peer, collection, Repair::Converge), "and cooling down");
     }
 
