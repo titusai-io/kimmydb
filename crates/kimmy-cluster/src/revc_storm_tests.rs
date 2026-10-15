@@ -14,6 +14,11 @@
 //! A holds `x`, B holds `y`, C holds `x`; each member witnessed the other's insert without
 //! applying it, the counts are equal, and every member's horizon is above both stamps
 //! (a sentinel tombstone collected after them), so neither id is young.
+//!
+//! The six storms are `#[ignore]`d (each is 4 to 11 minutes in a debug build and they must
+//! not run concurrently): `cargo test -p kimmy-cluster --lib revc_storm -- --ignored
+//! --test-threads=1`. Knobs: `REVC_HOURS`, `REVC_LOG=<path>`, `REVC_REPAIR_OFF`. The planner-only
+//! test (`revc_a_peer_whose_converge_rounds_always_fail_...`) is in the ordinary suite.
 
 use std::collections::BTreeMap;
 use std::net::SocketAddr;
@@ -589,6 +594,7 @@ fn assert_bounded(label: &str, storm: &Storm, hours: u64) {
 /// The baseline: the crossing pair, live writes with deletes on another collection, 8
 /// simulated hours.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "an 8-simulated-hour storm of the real loop, 4 to 11 minutes; run with --ignored --test-threads=1"]
 async fn revc_storm_the_crossing_pair_backs_off_by_the_schedule() {
     let knobs = Knobs::default();
     let storm = storm(knobs).await;
@@ -598,6 +604,7 @@ async fn revc_storm_the_crossing_pair_backs_off_by_the_schedule() {
 
 /// Live writes on the pair's own collection (lab row 5's variant b).
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "an 8-simulated-hour storm of the real loop, 4 to 11 minutes; run with --ignored --test-threads=1"]
 async fn revc_storm_writes_on_the_pairs_collection_back_off_by_the_schedule() {
     let knobs = Knobs { same_writes: 10, other_writes: 0, ..Knobs::default() };
     let storm = storm(knobs).await;
@@ -607,6 +614,7 @@ async fn revc_storm_writes_on_the_pairs_collection_back_off_by_the_schedule() {
 
 /// C leaves A's and B's live sets for one tick every two minutes (a SWIM down and up).
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "an 8-simulated-hour storm of the real loop, 4 to 11 minutes; run with --ignored --test-threads=1"]
 async fn revc_storm_a_flapping_member_keeps_the_back_off() {
     let knobs = Knobs { flap_every: Some(24), ..Knobs::default() };
     let storm = storm(knobs).await;
@@ -616,6 +624,7 @@ async fn revc_storm_a_flapping_member_keeps_the_back_off() {
 
 /// B drops and recreates the pair's collection an hour in.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "an 8-simulated-hour storm of the real loop, 4 to 11 minutes; run with --ignored --test-threads=1"]
 async fn revc_storm_a_drop_and_recreate_mid_storm_stays_bounded() {
     let knobs = Knobs { drop_recreate_at: Some(720), ..Knobs::default() };
     let storm = storm(knobs).await;
@@ -634,6 +643,7 @@ async fn revc_storm_a_drop_and_recreate_mid_storm_stays_bounded() {
 /// documents: every Converge pull B makes from C fails on the page that reaches it, after
 /// pulling the pages before it. C's digest still answers, so B's finding against C stands.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "an 8-simulated-hour storm of the real loop, 4 to 11 minutes; run with --ignored --test-threads=1"]
 async fn revc_storm_a_sender_whose_pages_fail_keeps_the_back_off() {
     let knobs = Knobs { corrupt_c_after: Some(3_000), ..Knobs::default() };
     let storm = storm(knobs).await;
@@ -644,6 +654,7 @@ async fn revc_storm_a_sender_whose_pages_fail_keeps_the_back_off() {
 /// B is away from A for ten minutes while A writes and collects its oplog: B's next pull from
 /// A is a whole-database pull, competing with B's document repair against A.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "an 8-simulated-hour storm of the real loop, 4 to 11 minutes; run with --ignored --test-threads=1"]
 async fn revc_storm_a_whole_database_pull_competing_for_the_peer_stays_bounded() {
     let knobs = Knobs { whole_db_at: Some((600, 120)), ..Knobs::default() };
     let storm = storm(knobs).await;
