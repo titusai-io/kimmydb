@@ -131,6 +131,20 @@ fn every_burial_raises_the_horizon_to_the_highest_stamp_the_life_held() {
     assert!(function.contains("kept_row"), "and reads the life's highest stamp from the kept row");
 }
 
+/// A local drop mints its stamp above everything the life held and so raises nothing: the
+/// burial's raise is for a life holding a record above the drop only.
+#[test]
+fn a_local_drop_raises_no_horizon() {
+    let (engine, _dir) = engine();
+    let meta = engine.create_collection("shop", "orders").unwrap();
+    engine.insert(&meta, doc! { "_id": 1 }).unwrap();
+    engine.insert(&meta, doc! { "_id": 2 }).unwrap();
+    engine.delete(&meta, &kimmy_core::DocId::Int64(2)).unwrap();
+    let before = engine.tombstone_horizon().unwrap();
+    assert!(engine.drop_collection("shop", "orders").unwrap());
+    assert_eq!(engine.tombstone_horizon().unwrap(), before, "a local drop raised the horizon");
+}
+
 /// Every write transaction in `gc.rs` that removes from `DOCS`, `COLLECTIONS_DROPPED` or
 /// `INDEXES_DROPPED` raises the horizon in that same transaction: a collector added later
 /// that does not is a hole in section 13.3's own-side argument.
