@@ -249,6 +249,23 @@ const BOUNDED_READS: &[(&str, &str)] = &[
         "test code emptying the table of a store it wrote itself",
     ),
     (
+        "revc_break_tests::definitions",
+        "test code reading a store of a few dozen rows it wrote itself",
+    ),
+    ("revc_break_tests::rows_of", "test code reading a store of a few dozen rows it wrote itself"),
+    (
+        "young_stamp_model_tests::held_events",
+        "test code reading a store of a few dozen rows it wrote itself",
+    ),
+    (
+        "young_stamp_model_tests::old_release_collects",
+        "test code reading a store of a few dozen rows it wrote itself",
+    ),
+    (
+        "young_stamp_model_tests::rows",
+        "test code reading a store of a few dozen rows it wrote itself",
+    ),
+    (
         "index::clear_index_entries",
         "walks the walk table its caller opened, so its caller's WalkStop decides: in_write \
          for a drop, a rebuild or a migration, which close_writes bounds (ADR-192), and the \

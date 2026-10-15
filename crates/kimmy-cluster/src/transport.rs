@@ -4704,9 +4704,10 @@ impl PeerStalls {
         let scope = self.snapshots.get(&peer).and_then(SnapshotProgress::scope);
         if let Some(repairs) = self.repairs.get_mut(&peer)
             && let Some((collection, repair)) = repairs.active
-            // Its own snapshot, or the snapshot of its collection a refused replay
-            // fell back to.
-            && (repair == Repair::Snapshot || scope == Some(collection))
+            // Its own snapshot (a Snapshot or a Converge repair, whatever progress is
+            // held), or the snapshot of its collection a refused replay fell back to.
+            && (matches!(repair, Repair::Snapshot | Repair::Converge)
+                || scope == Some(collection))
         {
             repairs.advanced = true;
         }
