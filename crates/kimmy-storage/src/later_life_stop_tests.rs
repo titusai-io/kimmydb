@@ -234,6 +234,66 @@ fn finding_f18_a_whole_page_grants_no_later_vector_configuration_of_a_life_it_re
     );
 }
 
+/// F18's boundary: what the drop ended is granted. A definition of the refused life stamped
+/// at or before the later of the collection's tombstone and its database's is the ended
+/// life's, history by entries too, and the page grants its entry: here, an index made after
+/// the collection's drop and before its database's.
+#[test]
+fn a_whole_page_grants_a_refused_lifes_definition_its_databases_later_drop_ended() {
+    let (a, _da) = engine();
+    let (b, _db) = engine();
+    a.create_collection("shop", "orders").unwrap();
+    a.create_collection("shop", "other").unwrap();
+    whole(&b, &a);
+    std::thread::sleep(Duration::from_millis(2));
+    assert!(a.drop_collection("shop", "orders").unwrap());
+    std::thread::sleep(Duration::from_millis(2));
+    let made = b.create_index("shop", "orders", field(), false, None).unwrap().created.unwrap();
+    std::thread::sleep(Duration::from_millis(2));
+    assert!(a.drop_database("shop").unwrap());
+    a.finish_purges_now().unwrap();
+
+    whole(&a, &b);
+    assert!(a.get_collection("shop", "orders").is_err(), "premise: A refused B's life");
+    assert!(
+        a.witnessed_vector().unwrap().get(made.node) >= made.hlc,
+        "the page withheld a definition the database's drop ended"
+    );
+    assert!(a.witnessed_vector().unwrap().covers(&b.version_vector().unwrap()));
+}
+
+/// And a definition in the drop's own `Hlc`, from a node that sorts above the dropper's: the
+/// tie is the drop's (ADR-236 item 2), so the page grants it.
+#[test]
+fn a_whole_page_grants_a_refused_lifes_definition_in_the_drops_own_hlc() {
+    let (a, _da) = engine();
+    let (b, _db) = engine();
+    a.create_collection("shop", "orders").unwrap();
+    whole(&b, &a);
+    std::thread::sleep(Duration::from_millis(2));
+    assert!(a.drop_collection("shop", "orders").unwrap());
+    a.finish_purges_now().unwrap();
+    let dropped = a.collection_dropped_at(CollectionId::derive("shop", "orders")).unwrap().unwrap();
+    std::thread::sleep(Duration::from_millis(2));
+    b.create_index("shop", "orders", field(), false, None).unwrap();
+    // The index's stamp moved into the drop's own `Hlc`, as a member whose clock tied with
+    // the dropper's would have made it.
+    let mut meta = b.get_collection("shop", "orders").unwrap();
+    let tied = kimmy_core::Stamp::new(dropped.hlc, b.node_id());
+    meta.indexes[0].created = Some(tied);
+    let txn = b.begin_write(crate::WriterHolder::Ddl).unwrap();
+    Engine::put_collection_meta(&txn, &meta).unwrap();
+    txn.commit().unwrap();
+    assert!(b.version_vector().unwrap().get(b.node_id()) > tied.hlc, "premise: named, and below");
+
+    whole(&a, &b);
+    assert!(a.get_collection("shop", "orders").is_err(), "premise: A refused B's life");
+    assert!(
+        a.witnessed_vector().unwrap().covers(&b.version_vector().unwrap()),
+        "the page withheld a definition in the drop's own Hlc"
+    );
+}
+
 /// F4. A drop this member ignores (its own life is newer) is now appended and published,
 /// and a collection stream open on the live collection takes it as the collection's drop:
 /// `Invalidate{CollectionDropped}` for a collection that stands, holding its documents.
