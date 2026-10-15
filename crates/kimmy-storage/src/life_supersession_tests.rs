@@ -632,14 +632,35 @@ fn a_floor_the_coverage_does_not_name_is_not_adopted_on_a_fresh_create() {
     a.finish_purges_now().unwrap();
     later();
     a.create_collection("shop", "orders").unwrap();
-    let far = Hlc::new(crate::physical_now_ms() + 86_400_000, 0);
+    let real = created_floor(&a).expect("premise: the life has a floor");
+    // The page's coverage does not name the floor (an empty vector): not believed.
+    let mut page = a.snapshot_page(None, Some(orders_id())).unwrap();
+    page.versions = kimmy_core::VersionVector::new();
+    r.apply_snapshot_page(a.node_id(), &mut SnapshotProgress::of_collection(orders_id()), &page)
+        .unwrap();
+    assert_ne!(created_floor(&r), Some(real), "a floor nothing vouched for was adopted");
+}
+
+#[test]
+fn a_floor_at_or_above_the_life_it_belongs_to_is_not_adopted() {
+    let (a, _da) = engine();
+    let (r, _dr) = engine();
+    let first = a.create_collection("shop", "orders").unwrap();
+    a.insert(&first, doc! { "_id": 1 }).unwrap();
+    later();
+    a.drop_collection("shop", "orders").unwrap();
+    a.finish_purges_now().unwrap();
+    later();
+    a.create_collection("shop", "orders").unwrap();
+    // A floor equal to the life's own creation, named by the coverage: a floor is a drop
+    // the life was made after, so it is below `created`.
     let mut page = a.snapshot_page(None, Some(orders_id())).unwrap();
     for state in &mut page.collections {
-        state.incarnation_floor = Some(far);
+        state.incarnation_floor = state.created;
     }
     r.apply_snapshot_page(a.node_id(), &mut SnapshotProgress::of_collection(orders_id()), &page)
         .unwrap();
-    assert_ne!(created_floor(&r), Some(far), "a floor nothing vouched for was adopted");
+    assert_eq!(created_floor(&r), None, "a floor not below its life was adopted");
 }
 
 #[test]
