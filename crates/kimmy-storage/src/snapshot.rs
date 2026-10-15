@@ -894,9 +894,13 @@ impl Engine {
         // it absent here: the answer to a stop at a definition stamped after the drop, for
         // every definition the sender's coverage names (`Engine::answered_by_a_page`,
         // ADR-236 item 4). On the first page, the one that carries the definition when
-        // the sender holds one.
+        // the sender holds one, and on any page that carries the collection's drop: its
+        // sender lacked the collection when it cut that page, and read its vector first.
+        // A pull cut short while the sender held a life, and resumed after it buried it,
+        // is answered so. Not on every page: a resumed page from a sender that holds a
+        // life carries no definition either.
         if let Some(id) = progress.scope
-            && progress.pages == 0
+            && (progress.pages == 0 || page.dropped.is_some())
             && page.collections.is_empty()
             && self.collection_by_id(id)?.is_none()
         {

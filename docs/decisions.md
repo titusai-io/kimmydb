@@ -27360,7 +27360,11 @@ stamps (its YS1), and F17 from a storm test of the count half (a loop that repla
    before the drop here, from a sender that has not heard the drop) leaves the stop standing: that sender keeps the
    life, re-dated, once it hears the drop, and its page then brings it; taken as history on the first page, the
    member would never hold that life, which has no creation entry. After a restart a stop asks for the page once
-   more.
+   more. The answer is read from the page that carries the life when the sender holds one (the first) and from any
+   page that carries the collection's drop: its sender lacked the collection when it cut that page and read its
+   vector first, so a pull cut short while the sender held the life, and resumed after the sender buried it, is
+   answered by the pages that follow (from the review of the second cut; it waited for a fresh pull after the repair
+   cooldown). Not from every page: a resumed page from a sender that holds a life carries no definition either.
    **A page judges each definition by its stamp too (F12):** `restore_collection` refused every definition of a life
    the receiver's floor said had ended, though one made after the drop is what the drop keeps; it granted the
    coverage of the definition's entry all the same, and the receiver never held it. Each index, and a dated vector

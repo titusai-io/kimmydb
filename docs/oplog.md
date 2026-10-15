@@ -448,7 +448,8 @@ one scoped snapshot when its sender holds no life of the collection**: a member
 that buried the life (nothing stamped after the drop still stood) or a 0.49.x
 member that buried it with its database still serves the definition, and a
 snapshot that holds no life and leaves the collection absent here makes every
-definition its sender's coverage names history, whoever serves it.
+definition its sender's coverage names history, whoever serves it: its first page,
+or a page cut after its sender buried the life, which carries the drop.
 
 **A drop this node ignores is held and served onward like one it applies**
 ([ADR-236](decisions.md)), and so is a creation its database's drop refuses: the

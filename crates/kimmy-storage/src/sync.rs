@@ -7976,6 +7976,53 @@ mod tests {
         assert_eq!(ids_on(&b, "shop", "other"), ids_on(&a, "shop", "other"), "nothing stranded");
     }
 
+    /// The answer is read from a resumed page too, when the page carries the collection's
+    /// drop (ADR-236 item 4): a scoped pull cut short after its first page, which carried a
+    /// life B refused, and resumed after A buried that life (its index made and dropped
+    /// again after the drop, nothing of it left after the drop), is answered by the pages
+    /// that follow, whose sender lacked the collection and read its vector first. Read from
+    /// the first page only, the pull completed with no answer and the stop stood until a
+    /// fresh pull after the repair cooldown.
+    #[test]
+    fn a_resumed_page_carrying_the_drop_answers_the_later_life_stop() {
+        let (a, _da) = engine();
+        let (b, _db) = engine();
+        let orders = a.create_collection("shop", "orders").unwrap();
+        // Enough for a second page.
+        let docs = (0..crate::SNAPSHOT_PAGE as i64 + 8).map(|i| doc! { "_id": i }).collect();
+        a.insert_many(&orders, docs).unwrap();
+        let other = a.create_collection("shop", "other").unwrap();
+        round(&b, &a, 4 * BATCH);
+        b.drop_collection("shop", "orders").unwrap();
+        b.finish_purges_now().unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(2));
+        let field = crate::meta::IndexField { path: "n".into(), descending: false };
+        let index = a.create_index("shop", "orders", vec![field], false, None).unwrap();
+        a.drop_index("shop", "orders", &index.name).unwrap();
+        a.insert(&other, doc! { "_id": "behind-it" }).unwrap();
+
+        let stopped = round(&b, &a, BATCH).unknown.expect("a later life's definition stops");
+        // The pull's first page only: it carries A's life, which B refuses.
+        let mut progress = crate::SnapshotProgress::of_collection(stopped.id);
+        let page = a.snapshot_page(None, progress.scope()).unwrap();
+        b.apply_snapshot_page(a.node_id(), &mut progress, &page).unwrap();
+        assert!(!progress.is_complete(), "premise: the pull is cut short after one page");
+        assert!(b.get_collection("shop", "orders").is_err(), "premise: B refused A's life");
+        // A hears the drop and buries the life, which holds nothing after it.
+        round(&a, &b, BATCH);
+        assert!(a.get_collection("shop", "orders").is_err(), "premise: A buried the life");
+        // The pull resumes, and its pages carry the drop.
+        while !progress.is_complete() {
+            let page = a.snapshot_page(progress.after().cloned(), progress.scope()).unwrap();
+            assert!(page.dropped.is_some(), "premise: a resumed page carries the drop");
+            b.apply_snapshot_page(a.node_id(), &mut progress, &page).unwrap();
+        }
+        let outcome = round(&b, &a, BATCH);
+        assert_eq!(outcome.unknown_collection, 0, "the resumed pages answered it: {outcome:?}");
+        assert_eq!(ids_on(&b, "shop", "other"), ids_on(&a, "shop", "other"), "nothing stranded");
+        assert!(b.witnessed_vector().unwrap().covers(&a.version_vector().unwrap()));
+    }
+
     /// A drop of an index on a collection this node dropped, stamped after the drop,
     /// does not stop the batch (ADR-236): the index's tombstone is recorded, which is
     /// all of it a later life needs, and a sender holding the drop and no collection
