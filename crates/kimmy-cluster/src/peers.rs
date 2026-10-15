@@ -1352,9 +1352,14 @@ pub async fn replicate(engine: Arc<Engine>, config: ReplicationConfig) {
                                     } else if outcome.count_probe_deferred {
                                         report.divergence_count_deferred += 1;
                                     }
-                                    let findings =
-                                        kimmy_storage::DivergenceFindings { existence, count };
-                                    divergence.observe(node, findings);
+                                    fold_check(
+                                        &mut divergence,
+                                        node,
+                                        existence,
+                                        count,
+                                        outcome.count_probe_deferred,
+                                        probe.as_ref(),
+                                    );
                                     // The cut digest of the same contact (B3):
                                     // folded into the tracker's own set, which
                                     // no repair is planned from.
@@ -1395,21 +1400,13 @@ pub async fn replicate(engine: Arc<Engine>, config: ReplicationConfig) {
                                     // history from its creation, or the
                                     // peer's snapshot for a collection this
                                     // node does not hold at all.
-                                    let confirmed = divergence.confirmed_against(node);
-                                    for collection in &confirmed {
-                                        let repair = repair_for(&engine, *collection);
-                                        if stalls.plan_repair(node, *collection, repair) {
-                                            warn!(
-                                                %peer,
-                                                node = %node,
-                                                collection = %collection,
-                                                ?repair,
-                                                "divergence confirmed; planned a repair from \
-                                                 this peer on the next round with it"
-                                            );
-                                        }
-                                    }
-                                    stalls.retain_repaired(node, &confirmed);
+                                    plan_count_repairs(
+                                        &engine,
+                                        &divergence,
+                                        &mut stalls,
+                                        node,
+                                        peer,
+                                    );
                                 } else {
                                     report.divergence_skips += 1;
                                 }
@@ -2396,6 +2393,58 @@ fn judge_catch_up_at(
     }
 }
 
+/// Fold one checked contact with `node` into the tracker (ADR-133): the existence half and
+/// the count probe it compared, or, when the gate deferred the tick's `probe` (ADR-168), that
+/// it compared nothing, which suspends a count finding of that collection until a compared
+/// probe renews or clears it.
+fn fold_check(
+    divergence: &mut kimmy_storage::DivergenceTracker,
+    node: NodeId,
+    existence: BTreeSet<kimmy_core::CollectionId>,
+    count: Option<(kimmy_core::CollectionId, bool)>,
+    deferred: bool,
+    probe: Option<&DivergenceProbe>,
+) {
+    divergence.observe(node, kimmy_storage::DivergenceFindings { existence, count });
+    if deferred && let Some(probe) = probe {
+        divergence.observe_count_deferred(node, probe.id);
+    }
+}
+
+/// Plan the repairs what the check has confirmed against `node` asks for (ADR-148), and
+/// return how many were planned. One per collection, on the next round with the peer; a
+/// collection repaired against it waits out the cooldown unless the finding clears first.
+///
+/// A count finding whose latest probe the gate deferred plans nothing
+/// (`DivergenceTracker::observe_count_deferred`) and keeps the cooldown of the repair it
+/// planned before, so a finding that cannot be compared against a peer that trails this
+/// member and moves is not repaired again every cooldown on old evidence.
+fn plan_count_repairs(
+    engine: &Engine,
+    divergence: &kimmy_storage::DivergenceTracker,
+    stalls: &mut PeerStalls,
+    node: NodeId,
+    peer: SocketAddr,
+) -> usize {
+    let confirmed = divergence.confirmed_against(node);
+    let mut planned = 0;
+    for collection in &confirmed {
+        let repair = repair_for(engine, *collection);
+        if stalls.plan_repair(node, *collection, repair) {
+            planned += 1;
+            warn!(
+                %peer,
+                node = %node,
+                collection = %collection,
+                ?repair,
+                "divergence confirmed; planned a repair from this peer on the next round with it"
+            );
+        }
+    }
+    stalls.retain_repaired(node, &divergence.reported_against(node));
+    planned
+}
+
 /// The repair a confirmed divergence of `collection` plans (ADR-148): a replay of the
 /// peer's oplog for a collection this member holds, a snapshot for one it does not.
 ///
@@ -2415,6 +2464,10 @@ fn repair_for(engine: &Engine, collection: kimmy_core::CollectionId) -> Repair {
         _ => Repair::Snapshot,
     }
 }
+
+#[cfg(test)]
+#[path = "count_finding_tests.rs"]
+mod count_finding_tests;
 
 #[cfg(test)]
 mod tests {
