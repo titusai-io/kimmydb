@@ -2796,6 +2796,58 @@ fn known_residual_a_collections_own_drop_and_a_later_database_drop() {
     );
 }
 
+/// ADR-236's residual 4, accepted (the divergence repair restores it), pinned by its exact
+/// failures. C writes `orders/2` into its life after A's database drop (t150.1C), B takes that
+/// life by a whole page and writes the document again (t160.1B). A, holding the drop, refuses
+/// B's life on a whole page and takes the write as history, as it would by entries (ADR-148),
+/// with the coverage of its entry; C, which keeps the life with its own older version, takes A's
+/// whole page and is granted past B's write. Every count agrees, so neither half of the check
+/// plans a repair; the cut digest sees the stamps differ. Nothing blocks: no route is wedged or
+/// still moving, and the pages route converges.
+#[test]
+fn known_residual_a_later_write_a_refused_life_s_whole_page_granted_past() {
+    let ops = parse(
+        "A.create(orders)@100; C.create(orders)@110; A.dropdb@130; C.write(orders/2)@150; \
+         B<-C whole; B.write(orders/2)@160",
+    );
+    if census_takes(
+        "known residual, a later write granted past",
+        &ops,
+        &[("as found", vec![])],
+        &[],
+    ) {
+        return;
+    }
+    let outcomes = check(&ops);
+    let found: Vec<(Route, Vec<(Category, String)>)> = outcomes
+        .iter()
+        .map(|o| (o.route, o.failures.iter().map(|f| (f.category, f.detail.clone())).collect()))
+        .collect();
+    let stale = (
+        Category::LostWrite,
+        "C lacks orders/2 written by B at t160.1B (step 5); holds Some(\"t150.1C\")".to_string(),
+    );
+    let entries = vec![
+        (Category::Databases, r#"A/B: {} vs {"shop"}"#.to_string()),
+        (Category::Collections, r#"A/B: {} vs {"orders"}"#.to_string()),
+        (Category::Databases, r#"A/C: {} vs {"shop"}"#.to_string()),
+        (Category::Collections, r#"A/C: {} vs {"orders"}"#.to_string()),
+        (
+            Category::LostWrite,
+            "A lacks orders/2 written by B at t160.1B (step 5); holds None".to_string(),
+        ),
+        stale.clone(),
+    ];
+    let repaired =
+        vec![(Category::Docs, r#"A/C orders: ["2@t160.1B"] vs ["2@t150.1C"]"#.to_string()), stale];
+    assert_eq!(
+        found,
+        vec![(Route::Entries, entries), (Route::Repaired, repaired), (Route::Pages, vec![])],
+        "{}",
+        render(&ops, &outcomes)
+    );
+}
+
 // -- Generated schedules -------------------------------------------------------------------
 
 fn env_u64(name: &str, default: u64) -> u64 {

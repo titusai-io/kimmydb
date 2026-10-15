@@ -27526,7 +27526,16 @@ passing a floor at install and at a sweep, move the clock to a stored stamp the 
 ADR-226 already makes and ADR-233's restart rule makes at the next start. (3) A vector configuration is judged before
 its writer, on the definition the writer's check then holds unchanged; a drop of an older life whose tombstone lands
 in that instant changes no definition, and its own sweep, which runs after its tombstone, turns the configuration
-off.
+off. (4) **A write of a refused life, stamped after the drop, granted past (accepted, 2026-10-15; found by the review
+of the second cut).** A member holding the drop that refuses a life on a whole page (created at or
+before the drop, from a sender that has not heard it) takes the life's documents as history, a write stamped after
+the drop included, as the entries route does (ADR-148), and the page grants the coverage of their entries. A member
+that keeps the life with an older version of the same document, and takes the first member's whole page, is granted
+past the write and keeps its own version. Every count agrees, so neither half of the check plans a repair. F18's
+withholding does not reach it: a write so withheld is served again and taken as history again. The cut digest
+detects it (`kimmy_sync_digest_divergent_collections`, the `(id, stamp)` sets differ), and the divergence repair
+restores the document. Pinned by `known_residual_a_later_write_a_refused_life_s_whole_page_granted_past`, with its
+exact failures on each route; the generated runs have not reached it.
 
 **Tests.** The model's rows and findings (`finding_f1` to `finding_f16`, the two clock rows, the pinned residual,
 every required row), its no-lost-delete check (F16's mirror of the no-lost-write one: no member holds live a document a
@@ -27567,7 +27576,8 @@ marks nothing; that snapshot, cut short a page a round, resumes until it complet
 cut: `late_drop` (a configuration made while the sweep turns off a tied one is kept; the clock passes a floor a sweep
 takes from an unwitnessed drop, over four members); F18's model rows (`finding_f18_*`, by a database's drop and by a
 collection's) and `later_life_stop_tests` (a whole page grants no later index, and no later vector configuration, of a
-life it refuses); `sync` (a resumed page carrying the drop answers the stop); and residual 1's tie row.
+life it refuses); `sync` (a resumed page carrying the drop answers the stop); residual 1's tie row; and residual 4's
+row.
 
 **Mutation run: 85 rows, 82 killed, 3 equivalent.** A harness that is not in the tree (the rows are named here as the
 record), each row one textual change to the committed tree run under `bash` with a 900 s timeout, reset by `git
