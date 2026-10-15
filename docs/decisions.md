@@ -27497,8 +27497,9 @@ the writes it kept**, while 0.50.0 members keep them; the members differ until t
 points a 0.49.x member keeps its old behaviour and the members can differ as before until the roll completes: it does
 not relay an ignored drop or a refused creation, applies a creation tied with a drop, takes a later-life definition
 as history, refuses a page's later definition with its life, keeps a tied index its sweep selects, mints a local
-drop or creation at its clock, and installs a life over a floor its clock trails, or sweeps up to one, without passing it; and, holding a
-life whose only write after a drop is a delete, it buries the life and purges the delete when the drop arrives (F16).
+drop or creation at its clock, and installs a life over a floor its clock trails, or sweeps up to one, without
+passing it; and, holding a life whose only write after a drop is a delete, it buries the life and purges the delete
+when the drop arrives (F16).
 Two of these outlast the roll. **A tie a 0.49.x member applied stays where it was applied:** the life it kept (a
 creation in the drop's own millisecond) is not undone by the upgrade, because the existence half plans a repair
 only for a peer's `created` strictly above the tombstone, and a write into it stays history on the members that
@@ -27562,9 +27563,13 @@ page too); `watch` (a stream that delivered the earlier life's change, one resum
 its life's own `Hlc` still end). F17's: `count_finding_tests` (over real rounds, a finding no probe compared since its
 repair is not repaired again and clears at the first compared probe; one the probes keep renewing is still repaired
 once per cooldown), the tracker's unit test, and `transport` (a refused count replay pulls the collection's snapshot and
-marks nothing; that snapshot, cut short a page a round, resumes until it completes).
+marks nothing; that snapshot, cut short a page a round, resumes until it completes). From the review of the second
+cut: `late_drop` (a configuration made while the sweep turns off a tied one is kept; the clock passes a floor a sweep
+takes from an unwitnessed drop, over four members); F18's model rows (`finding_f18_*`, by a database's drop and by a
+collection's) and `later_life_stop_tests` (a whole page grants no later index, and no later vector configuration, of a
+life it refuses); `sync` (a resumed page carrying the drop answers the stop); and residual 1's tie row.
 
-**Mutation run: 75 rows, 72 killed, 3 equivalent.** A harness that is not in the tree (the rows are named here as the
+**Mutation run: 85 rows, 82 killed, 3 equivalent.** A harness that is not in the tree (the rows are named here as the
 record), each row one textual change to the committed tree run under `bash` with a 900 s timeout, reset by `git
 checkout`, and checked to have applied once and run at least one test: the page's ignore branch recording no
 tombstone; the creation over a database tombstone recording none, or not its shadow's, or lowering a newer one; the
@@ -27586,9 +27591,15 @@ the four of F16's burial; a stream's pass over a relayed drop removed, made to p
 delivery or by the token, and lowered by a relayed creation; and F17's five (no suspension, repairs retained by the
 findings that plan rather than those reported, the planning set keeping suspended findings, a compared probe leaving
 the suspension, the fold ignoring a deferral) and its two for the scope (a refused replay pulling the whole database, its
-scoped snapshot not advancing the replay). The first runs left alive twelve that are not equivalent: tests too weak,
-and in one case a filter that matched no test; each has a test of its own now, and the run above is of every row on the
-final tree. **The three that survive are equivalent:** `aims_at_a_previous_incarnation`'s first clause written back as
+scoped snapshot not advancing the replay). From the review of the second cut: the sweep's `Swept` disable not judged
+by last-writer-wins at all; the sweep not passing the clock over its floor; the stop's answer not read from a resumed
+page that carries the drop; and F18's seven (a refused life's later definitions granted, its vector configuration
+granted, its definitions withheld whatever their stamp, a tie withheld, judged by the collection's tombstone alone, the
+grant stopping at the definition rather than short of it, and a standing life's later definitions withheld too). The
+first runs left alive twelve that are not equivalent: tests too weak, and in one case a filter that matched no test;
+each has a test of its own now. The run above is of every row on the tree of the first review's fold-in; the second's
+added ten rows, re-pointed four to the code they now name, and re-ran every row on code it changed (34), all killed but
+the equivalent third below. **The three that survive are equivalent:** `aims_at_a_previous_incarnation`'s first clause written back as
 `dropped < created` (it is `!creation_is_history(created, dropped)` by definition); a page's purge wait judged by
 `redated_from` (a definition it no longer waits for reaches `create_collection_marked`, whose `CollectionPurging` makes
 the page wait all the same, as ADR-229 found for the guard beside it); and the stop's answer recorded from a page that
@@ -27597,13 +27608,13 @@ its sender processed holding no life of it: a stop at one is then answered the s
 by a life whose later drop sweeps it).
 
 **Measured (the model, debug build, 18 threads, engine stores on a RAM disk, the `Wedged` check on).** The named rows
-and findings, 39 tests, pass in 0.8 s. Generated, without age-out: 20,000 schedules, 60,000 route runs, 157 s, **no
-failing group**; with age-out: 10,000 schedules (2,356 with an age-out), 78 s, no failing group, and every failure that
+and findings, 42 tests, pass. Generated, without age-out: seeds 0 to 49,999, 150,000 route runs, 318 s, **no failing
+group**; with age-out: seeds 0 to 24,999 (5,934 with an age-out), 170 s, no failing group, and every failure that
 needs its age-out step classified past retention, by design under ADR-085. Exhaustive to depth 6: 114,199 schedules,
-342,597 route runs, 869 s, no failing group and no tombstone difference. What is left is residual (1): a subsumed
-tombstone difference in 23 of the 20,000 and 8 of the 10,000 generated schedules, on the repaired entries route only.
-Before these changes the same runs had 9 findings, and a subsumed tombstone difference in 1,028 of the 20,000
-schedules' page runs alone. **The writer's share (release build, one member).** Item 5's raise reads the collection
+342,597 route runs, 754 s, no failing group and no tombstone difference. What is left is residual (1): a subsumed
+tombstone difference in 49 of the 50,000 and 21 of the 25,000 generated schedules, on the repaired entries route only.
+Before these changes the first 20,000 schedules had 9 findings, and a subsumed tombstone difference in 1,028 of their
+page runs alone; the first runs covered seeds below 20,000 and 10,000, and F18 lay at seed 48,093. **The writer's share (release build, one member).** Item 5's raise reads the collection
 tombstone table under the writer, only when a database's tombstone is raised over an earlier one: 0.7 ms at 10,000
 tombstones, 4.5 ms at 100,000 and 50 ms at 1,000,000, with the commit about as much again; the table holds what
 `storage.tombstone_retention_secs` keeps. Item 1's sweep of a covered life that holds a write after the drop, a chunk of
