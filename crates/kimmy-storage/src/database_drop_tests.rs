@@ -158,6 +158,24 @@ fn a_definition_below_the_databases_tombstone_is_history_for_an_absent_collectio
     assert_eq!(outcome.superseded, 1, "{outcome:?}");
 }
 
+/// A life created over its database's tombstone takes a tombstone of its own at the
+/// database's drop, and so does its vector shadow's id (ADR-236), as the database's
+/// sweep gives a life it leaves standing: the same table on the member that created it
+/// and on one that applied the creation after the drop.
+#[test]
+fn a_life_created_over_its_databases_tombstone_takes_its_own_and_its_shadows() {
+    let (a, b, _da, _db, _late) = the_field_sequence();
+    later();
+    let fresh = a.create_collection("shop", "fresh").unwrap();
+    let dropped = a.database_dropped_at("shop").unwrap().expect("the database's tombstone");
+    let shadow = CollectionId::derive("shop", &kimmy_core::vector_meta::shadow_name("fresh"));
+    pull(&b, &a);
+    for (who, e) in [("the creator", &a), ("a member that applied it", &b)] {
+        assert_eq!(e.collection_dropped_at(fresh.id).unwrap(), Some(dropped), "{who}");
+        assert_eq!(e.collection_dropped_at(shadow).unwrap(), Some(dropped), "{who}: the shadow");
+    }
+}
+
 /// Control: a collection created after the drop stands and replicates. The
 /// pair with the two tests above is what tells the fix from "refuse every
 /// collection of a database that was ever dropped".

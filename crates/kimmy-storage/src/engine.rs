@@ -4497,7 +4497,7 @@ impl Engine {
             // One rule for the table, whichever this member had first, the creation
             // or the drop (ADR-236): the floor above refuses the same things, but the
             // tombstone is what the existence half reads and a whole page carries.
-            if let Some(at) = database_dropped.filter(|at| dropped.is_none_or(|own| own < *at)) {
+            if let Some(at) = database_dropped {
                 let mut tombstones = txn.open_table(tables::COLLECTIONS_DROPPED)?;
                 let mut ids = vec![id];
                 if !vector_meta::is_shadow(name) {
@@ -4847,10 +4847,7 @@ impl Engine {
         // life comes back here by entries over the acknowledged drop.
         let stamp = match replicated {
             Some(stamp) => stamp,
-            None => {
-                let created = shadow.as_ref().map_or(meta.created, |s| s.created.max(meta.created));
-                self.next_stamp_above(Some(Stamp::new(created, self.node_id)))
-            }
+            None => self.next_stamp_above(Some(Stamp::new(meta.created, self.node_id))),
         };
         let database_emptied = {
             let mut collections = txn.open_table(tables::COLLECTIONS)?;
