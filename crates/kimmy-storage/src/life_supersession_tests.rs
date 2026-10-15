@@ -528,7 +528,7 @@ fn a_failure_between_the_burial_and_the_restore_leaves_nothing_that_does_not_hea
     let page = a.snapshot_page(None, Some(orders_id())).unwrap();
     let state = &page.collections[0];
     let floor = state.incarnation_floor.expect("premise: the page carries the floor");
-    b.bury_the_life_this_one_followed(state, &page.versions, a.node_id(), None).unwrap();
+    b.bury_the_life_this_one_followed(state, &page.versions, None).unwrap();
     assert!(b.get_collection("shop", "orders").is_err(), "the burial left a life standing");
     let tombstone = b.collection_dropped_at(orders_id()).unwrap().expect("a tombstone");
     assert_eq!(tombstone.hlc, floor, "the tombstone is at the floor");
@@ -579,7 +579,7 @@ fn a_burial_from_a_whole_page_takes_the_stamp_of_the_tombstone_it_carries() {
 
 /// The carried tombstone names the burial only when it is the drop the floor stands for
 /// (the floor's own `Hlc`): one of another drop, which the page carries for the same id,
-/// leaves the burial at the floor with the sender's node.
+/// leaves the burial at the floor with the zero node, below any real drop in that `Hlc`.
 #[test]
 fn a_burial_from_a_whole_page_ignores_a_carried_tombstone_of_another_drop() {
     let (a, _da) = engine();
@@ -615,7 +615,7 @@ fn a_burial_from_a_whole_page_ignores_a_carried_tombstone_of_another_drop() {
     assert!(!has(&b, 1) && has(&b, 2), "the life before ended and the new one stands");
     assert_eq!(
         b.collection_dropped_at(orders_id()).unwrap(),
-        Some(Stamp::new(dropped.hlc, c.node_id())),
+        Some(Stamp::new(dropped.hlc, kimmy_core::NodeId::from_bytes([0; 16]))),
         "the burial took a tombstone of another drop"
     );
 }

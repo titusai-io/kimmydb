@@ -876,7 +876,7 @@ impl Engine {
                     page.dropped_collections.iter().find(|(c, _)| *c == id).map(|(_, s)| *s)
                 }
             };
-            match self.restore_collection(state, &page.versions, peer, carried) {
+            match self.restore_collection(state, &page.versions, carried) {
                 Ok(refused) => {
                     ddl_refused += refused;
                     if progress.scope.is_none() {
@@ -1661,18 +1661,18 @@ impl Engine {
     /// as a drop (ADR-163), but the floor is named, and the floor is the drop's time.
     /// **Otherwise** (a scoped page, which carries no tombstone for a collection its
     /// sender holds, or a sender whose tombstone aged out) the stamp is the floor and the
-    /// sender's node, because the page carries the floor as a time and not the origin of
-    /// the drop. `record_collection_drop` keeps the greater stamp, so the real tombstone
-    /// replaces it when it arrives and sorts above it (a later `Hlc`, or the same one from
-    /// a node above the sender's); one that sorts below leaves the synthetic stamp, which
-    /// is harmless, because every comparison of a drop against a life reads the `Hlc`.
+    /// **zero node**, because the page carries the floor as a time and not the origin of
+    /// the drop. `record_collection_drop` keeps the greater stamp, so the real tombstone,
+    /// in the same `Hlc` from any node or in a later one, replaces it when it arrives. With
+    /// the sender's node it could sort above the real tombstone of its own `Hlc` and stay
+    /// there for good, naming as the dropper a member that dropped nothing, and pages
+    /// carried it to every member (generated seed 86387, F19).
     /// With no floor on the page, nothing is buried: two members that create one name
     /// with no drop between them are not a life ended.
     pub(crate) fn bury_the_life_this_one_followed(
         &self,
         state: &CollectionState,
         versions: &VersionVector,
-        from: NodeId,
         carried: Option<Stamp>,
     ) -> Result<()> {
         let Some(floor) = state.incarnation_floor.filter(|floor| hlc_is_named(*floor, versions))
@@ -1702,15 +1702,15 @@ impl Engine {
         // Both this sweep and the burial below are stamped as the drop: by the tombstone
         // the page carries for it when there is one (ADR-236), so the records and index
         // drops the sweep writes carry the stamp the drop's maker and every member that
-        // applied the drop gave them. Without it the stamp takes the sender's node, which
-        // is never exposed on a tie today: a write whose Hlc equals the drop's is history
-        // by the floor rule whatever its node (`is_history` compares `stamp.hlc <= floor`,
-        // documented as intended for same-millisecond ties). If that rule ever becomes
-        // node-aware, that stamp would bury a write later than the real drop whenever
-        // `from` sorts above the dropper, and the choice must be revisited with it.
+        // applied the drop gave them. Without it the stamp is the floor with the zero node,
+        // which sorts below the real drop's in the same `Hlc`, so the real tombstone
+        // replaces it wherever it arrives (F19). A write whose `Hlc` equals the drop's is
+        // history by the floor rule whatever its node (`is_history` compares
+        // `stamp.hlc <= floor`); were that rule ever node-aware, the zero node is the side
+        // that never buries a write the real drop keeps.
         let stamp = carried
             .filter(|dropped| dropped.hlc == floor)
-            .unwrap_or_else(|| Stamp::new(floor, from));
+            .unwrap_or_else(|| Stamp::new(floor, NodeId::from_bytes([0; 16])));
         if crate::late_drop::owes_a_sweep(&standing, floor) {
             return self.sweep_after_an_ignored_drop(&standing, stamp);
         }
@@ -1754,7 +1754,6 @@ impl Engine {
         &self,
         state: &CollectionState,
         versions: &VersionVector,
-        from: NodeId,
         carried: Option<Stamp>,
     ) -> Result<usize> {
         // The creation, before it is stored: the clock must be past the incarnation this
@@ -1762,7 +1761,7 @@ impl Engine {
         if let Some(created) = state.created {
             self.witness_covered_hlc(created, versions);
         }
-        self.bury_the_life_this_one_followed(state, versions, from, carried)?;
+        self.bury_the_life_this_one_followed(state, versions, carried)?;
         if self.get_collection(&state.db, &state.name).is_err() {
             // A snapshot must not recreate a life this node has buried. The
             // page is current state on its sender, not an instruction: a peer
@@ -7558,7 +7557,7 @@ mod tests {
 
                 let definitions = |b: &Engine| {
                     for state in &page.collections {
-                        b.restore_collection(state, &page.versions, a.node_id(), None).unwrap();
+                        b.restore_collection(state, &page.versions, None).unwrap();
                     }
                 };
                 if drops_first {

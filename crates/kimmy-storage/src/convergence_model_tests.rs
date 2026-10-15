@@ -3399,3 +3399,22 @@ fn known_residual_a_collections_own_drop_and_a_later_database_drop_in_one_hlc() 
         render(&ops, &outcomes)
     );
 }
+
+/// F19 (generated Full seed 86387, minimised). A's database drop buries A's own life of
+/// `orders` at t160.2A; C takes A's whole page and creates `orders` over that tombstone
+/// (created t160.3, floor t160.2). B, holding its own life (t130.1), takes C's scoped page:
+/// the page's floor ends B's life (ADR-235), and with no tombstone on a scoped page the burial
+/// was stamped `Stamp(floor, C)` = t160.2C (ADR-236 item 7), which sorts above the real
+/// tombstone t160.2A by node, so the real one never replaced it: B held `orders@t160.2C` for
+/// good, A and C `orders@t160.2A` (`TombstoneNode` on Entries and Repaired), and pages carried
+/// the synthetic stamp to everyone. The burial is stamped with the zero node now, below any
+/// real drop in its `Hlc`, which replaces it.
+#[test]
+fn finding_f19_seed_86387_a_floor_burial_stamp_tied_the_real_tombstone_by_node() {
+    finding(
+        "F19 seed 86387",
+        "A.create(orders)@130; B.create(orders)@130; A.dropdb@160; C<-A whole; \
+         C.create(orders)@150; B<-C scoped(orders)",
+        &[(ORDERS, Some(&[]))],
+    );
+}

@@ -27450,9 +27450,12 @@ stamps (its YS1), and F17 from a storm test of the count half (a loop that repla
    added, take the stamp of the tombstone a whole page carries for the drop when it is the drop the floor stands
    for (the floor's own `Hlc`); a whole page applies its carried drops first, so this is the tombstone its sender
    holds and cannot vouch for. Otherwise (a scoped page, which carries no tombstone for a collection its sender holds;
-   a tombstone aged out) the stamp stays `Stamp(floor, sender)`: `record_collection_drop` keeps the greater, the real
-   tombstone replaces it when it sorts above, and every comparison of a drop against a life reads the `Hlc`, so the
-   difference decides nothing.
+   a tombstone aged out) the stamp is the floor with the zero node, `Stamp(floor, 0)`: `record_collection_drop` keeps
+   the greater, so the real tombstone, in the same `Hlc` or a later one, always replaces it. It was the floor with the
+   sender's node, which could sort above the real drop of its own `Hlc` and stay there on the member it buried, while
+   the others held the real one, and pages carried it to every member, naming as the dropper a member that dropped
+   nothing (F19, generated seed 86387, from the review of the second fold-in). Every comparison of a drop against a
+   life reads the `Hlc`, so neither stamp decided anything, but the model reported the tie as a failing group.
 8. **The model checks ADR-233 item 1 where it arises.** Removing either clock witness (a page's `created`, a carried
    drop) left the model's census unchanged: in every schedule something else moved the receiver's clock first, and a
    trailing clock reaches other members only through a later step that mints, which a stamp-based ghost reads as
