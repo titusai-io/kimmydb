@@ -1560,14 +1560,15 @@ impl Engine {
     /// business, because the entries path must tell "gone for good" from "not
     /// arrived yet" and the snapshot path counts them differently.
     ///
-    /// The two comparisons are deliberately not the same shape:
+    /// Both comparisons are by `Hlc` and *not* strict: a tie goes to the drop
+    /// (ADR-236), as every comparison of a stamp against a drop does.
     ///
-    /// - Against the **tombstone**, `Stamp` and strict. A drop the sender has
-    ///   not heard about yet must not be undone by the writes it is still
-    ///   replaying. Checked by id, because a node that dropped the collection
-    ///   can no longer resolve that id to a name.
-    /// - Against the **incarnation floor**, `Hlc` and *not* strict. A
-    ///   recreated collection derives the same id as its predecessor
+    /// - Against the **tombstone**: a drop the sender has not heard about yet
+    ///   must not be undone by the writes it is still replaying. Checked by
+    ///   id, because a node that dropped the collection can no longer resolve
+    ///   that id to a name.
+    /// - Against the **incarnation floor**: a recreated collection derives the
+    ///   same id as its predecessor
     ///   (`CollectionId::derive`), so an entry from the previous incarnation
     ///   resolves here rather than missing. Its creation recorded the
     ///   preceding drop's stamp as the floor; anything at or below it is the

@@ -5227,43 +5227,61 @@ mod definition_fold_tests {
     /// The storms run the loop's tick (`peers/revc_storm_tests.rs`), and after the count half
     /// moved into `fold_check` and `plan_count_repairs` and the tracker's pruning into
     /// `retain_tracker_members` they stopped doing so without any test failing, so they said
-    /// nothing of those. Textual, like the guards above: the storm tick must call each of the
-    /// functions the loop's tick calls for the count half, the tracker and the ledger, and none
-    /// of the pre-merge inline forms.
+    /// nothing of those. Textual, like the guards above: the storm tick must **call** each of
+    /// the functions the loop's tick calls for the count half, the tracker and the ledger (a
+    /// call site, not the function's own definition, which the loop's text holds too), none of
+    /// the pre-merge inline forms, and the count check, the digest fold and the count planner in
+    /// that order: the planner reads what the digest fold did to the finding (a compared-equal
+    /// digest quiets a suspended one), so a tick that plans first never exercises it.
     #[test]
     fn the_storm_tick_calls_what_the_loops_tick_calls() {
         let production = include_str!("peers.rs").split("\n#[cfg(test)]").next().unwrap();
-        let loop_code = tick_calls_guard::without_comments(production);
-        let storm_code =
-            tick_calls_guard::without_comments(include_str!("peers/revc_storm_tests.rs"));
-        let compact = |text: &str| -> String { text.split_whitespace().collect() };
-        let (in_loop, in_storm) = (compact(&loop_code), compact(&storm_code));
+        let loop_code = tick_calls_guard::compact(&tick_calls_guard::without_comments(production));
+        let storm_code = tick_calls_guard::compact(&tick_calls_guard::without_comments(
+            include_str!("peers/revc_storm_tests.rs"),
+        ));
         for call in [
-            "fold_check(",
-            "plan_count_repairs(",
-            "retain_tracker_members(",
-            "fold_digest_round(",
-            "fold_definition_round(",
-            "plan_digest_repairs(",
-            "plan_definition_repairs(",
-            "advance_probe_on(",
-            "stalls.retain_ledger(",
-            "stalls.retain_digest(",
-            "stalls.retain_definition(",
-            "stalls.set_repair_time(",
-            "stalls.set_repair_clock(",
-            "stalls.expire_repairs()",
+            "fold_check",
+            "plan_count_repairs",
+            "retain_tracker_members",
+            "fold_digest_round",
+            "fold_definition_round",
+            "plan_digest_repairs",
+            "plan_definition_repairs",
+            "advance_probe_on",
+            ".retain_ledger",
+            ".retain_digest",
+            ".retain_definition",
+            ".set_repair_time",
+            ".set_repair_clock",
+            ".expire_repairs",
         ] {
             assert!(
-                in_loop.contains(call),
+                !tick_calls_guard::call_sites(&loop_code, call).is_empty(),
                 "{call}: the loop no longer calls it; update the guard"
             );
-            assert!(in_storm.contains(call), "{call}: the storm tick does not call it");
+            assert!(
+                !tick_calls_guard::call_sites(&storm_code, call).is_empty(),
+                "{call}: the storm tick does not call it"
+            );
         }
         for form in ["divergence.observe(", "divergence.retain_members(", ".retain_repaired("] {
             assert!(
-                !in_storm.contains(form),
+                !storm_code.contains(form),
                 "{form}: an inline form of what the loop reaches through its functions"
+            );
+        }
+        for (what, code) in [("loop", &loop_code), ("storm", &storm_code)] {
+            let first = |call| {
+                *tick_calls_guard::call_sites(code, call)
+                    .first()
+                    .unwrap_or_else(|| panic!("{what}: no call site of {call}"))
+            };
+            assert!(
+                first("fold_check") < first("fold_digest_round")
+                    && first("fold_digest_round") < first("plan_count_repairs"),
+                "{what}: the count check, the digest fold and the count planner must run in \
+                 that order"
             );
         }
     }
@@ -5271,6 +5289,33 @@ mod definition_fold_tests {
     /// The text handling of the guard above, with a test of its own so the guard
     /// is known to see what it claims to.
     mod tick_calls_guard {
+        /// The text with every whitespace character removed, so a call split over lines
+        /// matches however rustfmt wrapped it.
+        pub(super) fn compact(text: &str) -> String {
+            text.split_whitespace().collect()
+        }
+
+        /// Where `name` is called in compacted text: its occurrences followed by `(`, not
+        /// preceded by `fn` (its own definition) or by an identifier character (a longer name);
+        /// a method is named with its dot (`.retain_ledger`).
+        pub(super) fn call_sites(compact: &str, name: &str) -> Vec<usize> {
+            let needle = format!("{name}(");
+            compact
+                .match_indices(&needle)
+                .map(|(at, _)| at)
+                .filter(|&at| {
+                    // A method (`.name`) has its receiver glued to it in compacted text.
+                    if name.starts_with('.') {
+                        return true;
+                    }
+                    let before = &compact[..at];
+                    let ident =
+                        before.chars().next_back().is_some_and(|c| c.is_alphanumeric() || c == '_');
+                    !before.ends_with("fn") && !ident
+                })
+                .collect()
+        }
+
         /// Line comments and block comments removed, so a call that is only
         /// written in one is not counted.
         pub(super) fn without_comments(source: &str) -> String {
@@ -5341,6 +5386,17 @@ mod definition_fold_tests {
             let live = format!("if let Ok(held) = &x {{\n {call};\n}}");
             let block = block_after(&without_comments(&live), "if let Ok(held) = &x {");
             assert_eq!(at_depth_one(&block).matches(call).count(), 1, "a live call is seen");
+        }
+
+        #[test]
+        fn a_definition_or_a_longer_name_is_not_a_call_site() {
+            let text = compact(
+                "fn fold_check(a: A) {}\n fn plan(b: B) { refold_check(b); stalls\n .retain_ledger(x); \
+                 fold_check(\n c); }",
+            );
+            assert_eq!(call_sites(&text, "fold_check").len(), 1, "only the call, over two lines");
+            assert_eq!(call_sites(&text, ".retain_ledger").len(), 1, "a method named by its dot");
+            assert!(call_sites(&text, "plan_count_repairs").is_empty());
         }
     }
 }

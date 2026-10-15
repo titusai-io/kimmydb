@@ -27835,6 +27835,11 @@ test, a separate change.
 **Mixed roll.** A 0.49.0 sender sends no horizon, so a member repairing from it admits nothing young and `left`s every
 id it holds nothing for; it still applies newer rows over held rows. A 0.49.0 member repairs nothing, and the finding
 persists until it is upgraded. A member with the switch off is a peer whose side nobody repairs.
+**Rolling from 0.49.x, a row in a drop's own millisecond.** A member that still holds a row stamped in the very
+`Hlc` of a drop (kept under 0.49's `Stamp`-strict comparison, where a tie went to the row, and swept on the members
+that judge by `Hlc`, where a tie goes to the drop, ADR-236) leaves a cut-digest finding this build's repair does not
+close: the member judging by `Hlc` refuses the row as history, so the repair ends ineffective and backs off to the
+six-hour cap. It needs a write in the drop's own millisecond.
 
 **Closes ADR-236's residual (4).** A write stamped after a drop, of a life a member holding the drop refused on a whole
 page, that a member keeping the life was granted past (every count agrees; only the cut digest sees the `(id, stamp)`
