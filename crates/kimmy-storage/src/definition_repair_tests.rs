@@ -555,3 +555,21 @@ fn a_rival_older_than_the_pages_definition_is_not_superseded() {
     let held = b.get_collection("shop", "orders").unwrap();
     assert_eq!(held.indexes[0].fields, vec![IndexField::ascending("z")], "the rival was replaced");
 }
+
+/// An index of the life this member buried does not spend the repair's one build either.
+#[test]
+fn a_buried_lifes_index_does_not_spend_the_repairs_one_build() {
+    let (a, b, _d) = pair();
+    later();
+    index(&a, "v", "old");
+    later();
+    assert!(b.drop_collection("shop", "orders").unwrap());
+    b.finish_purges_now().unwrap();
+    later();
+    b.create_collection("shop", "orders").unwrap();
+    later();
+    index(&a, "w", "new");
+    let done = repair(&b, &a, BIG);
+    assert_eq!((done.definitions.history, done.definitions.built), (1, 1));
+    assert_eq!(names(&b), vec!["new".to_string()]);
+}
