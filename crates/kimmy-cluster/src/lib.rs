@@ -26,6 +26,7 @@ pub mod health;
 pub mod membership;
 pub mod peers;
 pub mod protocol;
+pub mod repair_ledger;
 pub mod tls;
 pub mod transport;
 pub mod yielding;
