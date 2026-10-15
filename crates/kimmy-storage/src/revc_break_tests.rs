@@ -836,7 +836,9 @@ fn vector_config(dim: usize) -> kimmy_core::VectorConfig {
 
 /// Everything about definitions this member holds, as bytes: every collection's metadata,
 /// the collection and database tombstones, and the index tombstones.
-fn definitions(e: &Engine) -> (Vec<u8>, Vec<(u64, Vec<u8>)>, Vec<((u64, u32), Vec<u8>)>) {
+type Definitions = (Vec<u8>, Vec<(u64, Vec<u8>)>, Vec<((u64, u32), Vec<u8>)>);
+
+fn definitions(e: &Engine) -> Definitions {
     use redb::{ReadableDatabase, ReadableTable};
     let txn = e.db().begin_read().unwrap();
     let mut metas = Vec::new();

@@ -444,7 +444,7 @@ async fn storm(knobs: Knobs) -> Storm {
         for _ in 0..knobs.other_writes {
             written += 1;
             a.insert(&live, doc! { "_id": format!("w{written}") }).unwrap();
-            if written % 2 == 0 {
+            if written.is_multiple_of(2) {
                 a.delete(&live, &DocId::String(format!("w{}", written - 1))).unwrap();
             }
         }
@@ -454,7 +454,7 @@ async fn storm(knobs: Knobs) -> Storm {
             for _ in 0..knobs.same_writes {
                 written += 1;
                 a.insert(&on, doc! { "_id": format!("o{written}") }).unwrap();
-                if written % 2 == 0 {
+                if written.is_multiple_of(2) {
                     a.delete(&on, &DocId::String(format!("o{}", written - 1))).unwrap();
                 }
             }
@@ -501,8 +501,8 @@ async fn storm(knobs: Knobs) -> Storm {
         }
         if flapping {
             let (addr, node) = (ms[2].addr, ms[2].node);
-            for i in 0..2 {
-                ms[i].config.members.as_ref().unwrap().insert_for_test(addr, node);
+            for m in &ms[..2] {
+                m.config.members.as_ref().unwrap().insert_for_test(addr, node);
             }
         }
         out.ticks += 1;
