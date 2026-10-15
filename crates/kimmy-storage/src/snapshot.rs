@@ -1289,8 +1289,10 @@ impl Engine {
     /// - so `dropped.hlc <= held[id].hlc < current.created`, which is exactly
     ///   `aims_at_a_previous_incarnation`'s `predates_create` — the drop would
     ///   have been **ignored** by the branch that was skipped;
-    /// - and `record_collection_drop` would have left the higher tombstone
-    ///   standing, since `dropped <= existing` writes nothing.
+    /// - and that branch's `record_collection_drop` would have left the higher
+    ///   tombstone standing, since `dropped <= existing` writes nothing, and its
+    ///   sweep is owed only by a life whose floor is below `dropped`, which a
+    ///   life created over the higher tombstone is not.
     ///
     /// Both halves are no-ops, so the skip loses nothing.
     ///
@@ -1468,13 +1470,19 @@ impl Engine {
     /// exists to stop, since this node would go on advertising a collection
     /// the cluster has agreed is deleted, and the peers that applied the drop
     /// would pull it back from here. A drop aimed at a life that has already
-    /// ended is ignored outright, tombstone and all: the sender is simply
-    /// behind, and a tombstone below the incarnation standing here says
-    /// nothing that incarnation's own floor does not.
+    /// ended is ignored, but its tombstone is recorded, as the replicated
+    /// `DropCollection` arm records it (ADR-236): the floor already refuses
+    /// what the tombstone would, but the tombstone is what the existence half
+    /// reads (`collection_tombstones`) and what every whole-database page this
+    /// node serves carries on, so a member that took the drop this way and one
+    /// that took it as an entry end with the same table.
     fn restore_collection_drop(&self, id: CollectionId, dropped: Stamp) -> Result<()> {
         if let Some(current) = self.collection_by_id(id)? {
             if crate::sync::aims_at_a_previous_incarnation(&current, dropped.hlc) {
-                debug!(collection = %id, "a snapshot carried a drop of a life of this collection that has already ended; ignored");
+                debug!(collection = %id, "a snapshot carried a drop of a life of this collection that has already ended; ignored, its tombstone recorded");
+                // Recorded first, as the entries arm does, so a straggler that
+                // arrives while the sweep runs is refused as history.
+                self.record_collection_drop(id, dropped)?;
                 // The life standing here may hold what the one before put in it
                 // (ADR-231).
                 return self.sweep_after_an_ignored_drop(&current, dropped);
