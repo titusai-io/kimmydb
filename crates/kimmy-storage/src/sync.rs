@@ -2897,6 +2897,9 @@ pub(crate) mod race_hooks {
         /// Turning vectors off found them already off and has not yet taken
         /// the writer to drop the shadow a partial disable left.
         LeftoverShadow,
+        /// A definition repair chose the index it will build, and has not yet taken
+        /// the writer to build it.
+        DefinitionRepair,
     }
 
     type Hook = Box<dyn FnOnce()>;

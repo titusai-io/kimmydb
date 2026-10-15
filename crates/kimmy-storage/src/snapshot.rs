@@ -140,6 +140,12 @@ pub enum SnapshotPolicy {
     /// or plan a shadow repair through this route. Never persists, resumes or
     /// forgets a stored cursor; grants nothing.
     Converge,
+    /// **The first page only, and of it only the plain indexes this member lacks**
+    /// (repair design section 12): the definition repair builds at most one plain index
+    /// by name that a peer holds and this member lacks, if every clause of the table
+    /// admits it. Documents, drops and the vector state are ignored. Never persists,
+    /// resumes or forgets a stored cursor; grants nothing.
+    Definitions,
 }
 
 /// Where a snapshot left off, so it can resume rather than restart.
@@ -336,6 +342,9 @@ pub struct SnapshotApplied {
     /// `created_at_cut`, and not the rest, which under live writes are tail rows the
     /// ordinary route also brings. Always 0 under `All`.
     pub applied_at_cut: usize,
+    /// Under [`SnapshotPolicy::Definitions`]: what the page's indexes came to. All zero
+    /// under every other policy.
+    pub definitions: crate::definition_repair::DefinitionRestore,
     /// Under [`SnapshotPolicy::Converge`]: of `created`, those at or below the cut.
     pub created_at_cut: usize,
     /// Under [`SnapshotPolicy::Converge`]: the page said the sender no longer
@@ -502,6 +511,10 @@ pub struct SnapshotProgress {
     /// are the progress of a repair. Never stored; empty for every other pull.
     #[serde(skip)]
     cut: VersionVector,
+    /// Under [`SnapshotPolicy::Definitions`]: the most live documents the collection may
+    /// hold for an index to be built (`cluster.repair_max_index_documents`). Never stored.
+    #[serde(skip)]
+    max_index_documents: u64,
     /// The one collection the snapshot is of, or `None` for the whole
     /// database.
     scope: Option<CollectionId>,
@@ -540,10 +553,34 @@ impl SnapshotProgress {
         SnapshotProgress { policy: SnapshotPolicy::Converge, cut, ..Self::new(Some(id)) }
     }
 
+    /// A scoped snapshot under [`SnapshotPolicy::Definitions`], not yet started: what the
+    /// definition repair pulls. One page, never persisted, grants nothing.
+    pub fn of_collection_definitions(id: CollectionId, max_index_documents: u64) -> Self {
+        SnapshotProgress {
+            policy: SnapshotPolicy::Definitions,
+            max_index_documents,
+            ..Self::new(Some(id))
+        }
+    }
+
+    /// The gate on the live documents of a collection that is given an index.
+    pub fn max_index_documents(&self) -> u64 {
+        self.max_index_documents
+    }
+
+    /// A pull that applies one page and ends: the page is counted and the pull is complete,
+    /// whatever `next` it carried.
+    pub(crate) fn finish_after_one_page(&mut self) {
+        self.pages += 1;
+        self.after = None;
+        self.complete = true;
+    }
+
     fn new(scope: Option<CollectionId>) -> Self {
         SnapshotProgress {
             policy: SnapshotPolicy::All,
             cut: VersionVector::default(),
+            max_index_documents: 0,
             scope,
             after: None,
             granted: None,
@@ -897,6 +934,9 @@ impl Engine {
         if progress.policy == SnapshotPolicy::Converge {
             return self.apply_converge_page(progress, page);
         }
+        if progress.policy == SnapshotPolicy::Definitions {
+            return self.apply_definitions_page(progress, page);
+        }
         // Definitions first, through the DDL path with transactions of its
         // own — the reason a replicated run ends at a schema change
         // (ADR-119) — so every document below has a collection to land in.
@@ -1159,6 +1199,7 @@ impl Engine {
                 left_tombstone: 0,
                 created: 0,
                 applied_at_cut: 0,
+                definitions: Default::default(),
                 created_at_cut: 0,
                 sender_dropped: false,
                 purge_pending: None,
@@ -2183,7 +2224,7 @@ impl Engine {
     /// `None` for a collection that is gone, the error otherwise. Not `settle`: a
     /// collection waiting on the drop purger is not gone, and a page reading it fails and
     /// retries rather than skipping what it cannot place (unreachable for a read today).
-    fn unless_gone<T>(read: Result<T>) -> Result<Option<T>> {
+    pub(crate) fn unless_gone<T>(read: Result<T>) -> Result<Option<T>> {
         match read {
             Ok(value) => Ok(Some(value)),
             Err(crate::StorageError::Core(kimmy_core::Error::CollectionNotFound { .. })) => {

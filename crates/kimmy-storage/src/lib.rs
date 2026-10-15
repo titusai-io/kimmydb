@@ -18,6 +18,7 @@ pub mod codec;
 mod database_tombstone;
 pub mod definition_digest;
 pub mod definition_probe;
+mod definition_repair;
 pub mod digest_probe;
 pub mod divergence;
 pub mod docs;
@@ -70,6 +71,9 @@ mod database_drop_tests;
 mod converge_tests;
 
 #[cfg(test)]
+mod definition_repair_tests;
+
+#[cfg(test)]
 mod tombstone_horizon_tests;
 
 #[cfg(test)]
@@ -101,6 +105,7 @@ pub use definition_probe::{
     DefinitionAnswered, DefinitionAsk, DefinitionDefer, DefinitionEntry, DefinitionOutcome,
     DefinitionReply, DefinitionRound, DefinitionVerdict, WireDefinition, WireRefusal,
 };
+pub use definition_repair::{DEFINITION_RESULTS, DefinitionRestore};
 pub use digest_probe::{
     ANSWER_KEY_BYTES, ASK_KEY_BYTES, Defer, DigestAnswered, DigestAsk, DigestEntry, DigestOutcome,
     DigestPlan, DigestReply, DigestRound, DigestVerdict, SCAN_BYTES, SCAN_WALL, ScanBudget,
