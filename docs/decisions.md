@@ -27620,7 +27620,7 @@ row. From the review of the second fold-in: `late_drop` (a local index minted be
 swept), F19's model row (`finding_f19_seed_86387_*`), the re-pointed burial pin in `life_supersession_tests`, and the
 row for a later-life stop past retention that clears once every member collects.
 
-**Mutation run: 85 rows, 82 killed, 3 equivalent.** A harness that is not in the tree (the rows are named here as the
+**Mutation run: 87 rows, 84 killed, 3 equivalent.** A harness that is not in the tree (the rows are named here as the
 record), each row one textual change to the committed tree run under `bash` with a 900 s timeout, reset by `git
 checkout`, and checked to have applied once and run at least one test: the page's ignore branch recording no
 tombstone; the creation over a database tombstone recording none, or not its shadow's, or lowering a newer one; the
@@ -27650,7 +27650,9 @@ grant stopping at the definition rather than short of it, and a standing life's 
 first runs left alive twelve that are not equivalent: tests too weak, and in one case a filter that matched no test;
 each has a test of its own now. The run above is of every row on the tree of the first review's fold-in; the second's
 added ten rows, re-pointed four to the code they now name, and re-ran every row on code it changed (34), all killed but
-the equivalent third below. **The three that survive are equivalent:** `aims_at_a_previous_incarnation`'s first clause written back as
+the equivalent third below. The review of that fold-in added two (the sweep's definitions read before its witness;
+F19's burial stamped with a node above any), re-pointed three of F9's to the zero node, and re-ran the rows on the
+changed code (22), all killed. **The three that survive are equivalent:** `aims_at_a_previous_incarnation`'s first clause written back as
 `dropped < created` (it is `!creation_is_history(created, dropped)` by definition); a page's purge wait judged by
 `redated_from` (a definition it no longer waits for reaches `create_collection_marked`, whose `CollectionPurging` makes
 the page wait all the same, as ADR-229 found for the guard beside it); and the stop's answer recorded from a page that
@@ -27659,11 +27661,14 @@ its sender processed holding no life of it: a stop at one is then answered the s
 by a life whose later drop sweeps it).
 
 **Measured (the model, debug build, 18 threads, engine stores on a RAM disk, the `Wedged` check on).** The named rows
-and findings, 42 tests, pass. Generated, without age-out: seeds 0 to 49,999, 150,000 route runs, 318 s, **no failing
-group**; with age-out: seeds 0 to 24,999 (5,934 with an age-out), 170 s, no failing group, and every failure that
-needs its age-out step classified past retention, by design under ADR-085. Exhaustive to depth 6: 114,199 schedules,
-342,597 route runs, 754 s, no failing group and no tombstone difference. What is left is residual (1): a subsumed
-tombstone difference in 49 of the 50,000 and 21 of the 25,000 generated schedules, on the repaired entries route only.
+and findings, 45 tests, pass. Generated, without age-out: seeds 0 to 89,999, 270,000 route runs, 575 s, **no failing
+group**; with age-out: seeds 0 to 44,999 (10,642 with an age-out), 294 s, no failing group, and every failure that
+needs its age-out step classified past retention, by design under ADR-085 (after an age-out every member collects at
+its time once the schedule is quiet, as their own retention passes would; item 4). No route run in either is
+`Wedged`. Exhaustive to depth 6: 114,199 schedules, 342,597 route runs, 734 s, no failing group and no tombstone
+difference. What is left is residual (1): a subsumed tombstone difference in 102 of the 90,000 and 39 of the 45,000
+generated schedules, on the repaired entries route only, and one other subsumed difference after an age-out (AgedOut
+seed 41124).
 Before these changes the first 20,000 schedules had 9 findings, and a subsumed tombstone difference in 1,028 of their
 page runs alone; the first runs covered seeds below 20,000 and 10,000, and F18 lay at seed 48,093. **The writer's share (release build, one member).** Item 5's raise reads the collection
 tombstone table under the writer, only when a database's tombstone is raised over an earlier one: 0.7 ms at 10,000
