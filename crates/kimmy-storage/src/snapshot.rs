@@ -1122,6 +1122,11 @@ impl Engine {
             let mut wrote = !pending.is_empty() || recorded > 0;
             if let Some(granted) = &grant {
                 wrote |= Engine::absorb_version_vector_in_txn(&txn, granted)?;
+                // And the sender's forgetting with it: a member that was behind forgets
+                // what the sender has forgotten, and serves on with that horizon.
+                if let Some(sender) = page.tombstone_horizon {
+                    wrote |= crate::tombstone_horizon::adopt_in_txn(&txn, sender)?;
+                }
             }
             // Where the pull has got to, in the page's own transaction so a
             // snapshot still costs no commit of bookkeeping (ADR-152's rule,

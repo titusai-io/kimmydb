@@ -62,6 +62,18 @@ pub(crate) fn set_at_least_in_txn(txn: &WriteTxn<'_>, at: Hlc) -> Result<()> {
     Ok(())
 }
 
+/// A completed whole-database snapshot adopts its sender's forgetting: `max(own, sender)`,
+/// written in the completing page's transaction beside the coverage grant. Returns whether
+/// it raised the stored value, so the caller commits a page that wrote nothing else. It
+/// cannot lower the horizon or admit anything; its effect is on a member that was behind.
+pub(crate) fn adopt_in_txn(txn: &WriteTxn<'_>, sender: Hlc) -> Result<bool> {
+    let raises = read_in_txn(txn)?.is_none_or(|own| sender > own);
+    if raises {
+        set_at_least_in_txn(txn, sender)?;
+    }
+    Ok(raises)
+}
+
 /// The reset at open, on the raw transaction of the ensure-tables commit: `untrusted` (the
 /// prior sidecar was another build's or none) or an absent key stores
 /// `max(stored, start)`; otherwise the stored value stands. Never lowers a stored value, and

@@ -270,3 +270,79 @@ fn the_sidecar_written_before_the_open_keeps_the_prior_build_until_the_reset_lan
     assert_eq!(before_open.written_by, "0.48.0", "the pre-open write named this build");
     assert!(cleared.horizon_is_untrusted());
 }
+
+// -- A completed whole-database snapshot adopts its sender's forgetting ------------------------
+
+fn whole_database_pull(into: &Engine, from: &Engine, shape: impl Fn(&mut crate::SnapshotPage)) {
+    let mut progress = crate::SnapshotProgress::whole_database();
+    while !progress.is_complete() {
+        let mut page = from.snapshot_page(progress.after().cloned(), None).unwrap();
+        shape(&mut page);
+        into.apply_snapshot_page(from.node_id(), &mut progress, &page).unwrap();
+    }
+}
+
+#[test]
+fn a_completed_whole_database_snapshot_raises_the_receivers_horizon_to_the_senders() {
+    let (a, _da) = engine();
+    let (b, _db) = engine();
+    a.create_collection("shop", "orders").unwrap();
+    let sender = Hlc::new(crate::physical_now_ms() + 3_600_000, 0);
+    let before = b.tombstone_horizon().unwrap().unwrap();
+    assert!(before < sender, "premise");
+    whole_database_pull(&b, &a, |page| page.tombstone_horizon = Some(sender));
+    assert_eq!(b.tombstone_horizon().unwrap(), Some(sender));
+}
+
+#[test]
+fn adoption_never_lowers_the_receivers_horizon() {
+    let (a, _da) = engine();
+    let (b, _db) = engine();
+    a.create_collection("shop", "orders").unwrap();
+    let own = b.tombstone_horizon().unwrap().unwrap();
+    // A sender whose horizon is below the receiver's (just reset, or a shorter retention).
+    whole_database_pull(&b, &a, |page| page.tombstone_horizon = Some(Hlc::new(1, 0)));
+    assert_eq!(b.tombstone_horizon().unwrap(), Some(own));
+}
+
+#[test]
+fn a_page_that_is_not_the_last_adopts_nothing() {
+    let (a, _da) = engine();
+    let (b, _db) = engine();
+    let meta = a.create_collection("shop", "orders").unwrap();
+    for i in 0..(crate::snapshot::SNAPSHOT_PAGE as i64 + 5) {
+        a.insert(&meta, doc! { "_id": i }).unwrap();
+    }
+    let sender = Hlc::new(crate::physical_now_ms() + 3_600_000, 0);
+    let own = b.tombstone_horizon().unwrap().unwrap();
+    let mut progress = crate::SnapshotProgress::whole_database();
+    let mut page = a.snapshot_page(None, None).unwrap();
+    assert!(page.next.is_some(), "premise: more than one page");
+    page.tombstone_horizon = Some(sender);
+    b.apply_snapshot_page(a.node_id(), &mut progress, &page).unwrap();
+    assert_eq!(b.tombstone_horizon().unwrap(), Some(own), "adopted before the grant");
+    // The last page adopts.
+    while !progress.is_complete() {
+        let mut page = a.snapshot_page(progress.after().cloned(), None).unwrap();
+        page.tombstone_horizon = Some(sender);
+        b.apply_snapshot_page(a.node_id(), &mut progress, &page).unwrap();
+    }
+    assert_eq!(b.tombstone_horizon().unwrap(), Some(sender));
+}
+
+#[test]
+fn a_page_without_a_horizon_and_a_scoped_snapshot_adopt_nothing() {
+    let (a, _da) = engine();
+    let (b, _db) = engine();
+    a.create_collection("shop", "orders").unwrap();
+    let own = b.tombstone_horizon().unwrap().unwrap();
+    whole_database_pull(&b, &a, |page| page.tombstone_horizon = None);
+    assert_eq!(b.tombstone_horizon().unwrap(), Some(own));
+    let sender = Hlc::new(crate::physical_now_ms() + 3_600_000, 0);
+    let id = kimmy_core::CollectionId::derive("shop", "orders");
+    let mut progress = crate::SnapshotProgress::of_collection(id);
+    let mut page = a.snapshot_page(None, Some(id)).unwrap();
+    page.tombstone_horizon = Some(sender);
+    b.apply_snapshot_page(a.node_id(), &mut progress, &page).unwrap();
+    assert_eq!(b.tombstone_horizon().unwrap(), Some(own), "a scoped snapshot grants nothing");
+}
