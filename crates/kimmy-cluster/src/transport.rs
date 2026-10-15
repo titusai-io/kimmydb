@@ -3378,12 +3378,19 @@ pub struct Tally {
     pub left: usize,
     pub left_tombstone: usize,
     pub superseded: usize,
+    /// Of `applied` and `created`, the rows at or below the cut of the finding that planned
+    /// the repair.
+    pub applied_at_cut: usize,
+    pub created_at_cut: usize,
 }
 
 impl Tally {
-    /// R3's progress for a document repair: it wrote a row.
+    /// R3's progress for a document repair: it wrote a row **at or below the cut of the
+    /// finding**. Under live writes almost every pull also applies tail rows above the cut,
+    /// which ordinary replication brings as well; counting those would lower the level on
+    /// nearly every repair and a standing ambiguous id would never climb to the cap.
     fn made_progress(&self) -> bool {
-        self.applied + self.created > 0
+        self.applied_at_cut + self.created_at_cut > 0
     }
 }
 
@@ -3406,6 +3413,10 @@ pub enum DigestPlan {
 struct Repairs {
     /// What the active repair has written (a document repair).
     tally: Tally,
+    /// The cut of the finding each queued document repair was planned for, and of the one
+    /// active: what its pages' rows are counted against for progress.
+    cuts: BTreeMap<CollectionId, VersionVector>,
+    active_cut: VersionVector,
     /// The repair in progress, and the collection it is for.
     active: Option<(CollectionId, Repair)>,
     /// Consecutive rounds the repair in progress has been handed out for
@@ -3920,7 +3931,12 @@ impl PeerStalls {
 
     /// Plan a document repair of `collection` against `peer` for a confirmed digest
     /// finding, or say why not (R5 and the planner's gates).
-    pub fn plan_digest_repair(&mut self, peer: NodeId, collection: CollectionId) -> DigestPlan {
+    pub fn plan_digest_repair(
+        &mut self,
+        peer: NodeId,
+        collection: CollectionId,
+        cut: VersionVector,
+    ) -> DigestPlan {
         if self.count_repair_pending(peer, collection) {
             self.repair_counts.digest_repairs[DigestRepairOutcome::SkippedCountRepair.index()] += 1;
             return DigestPlan::SkippedCountRepair;
@@ -3937,6 +3953,9 @@ impl PeerStalls {
             return DigestPlan::Duplicate;
         }
         self.ledger.started(key, self.repair_clock);
+        if let Some(repairs) = self.repairs.get_mut(&peer) {
+            repairs.cuts.insert(collection, cut);
+        }
         DigestPlan::Planned
     }
 
@@ -4008,6 +4027,8 @@ impl PeerStalls {
             left: applied.left,
             left_tombstone: applied.left_tombstone,
             superseded: applied.superseded,
+            applied_at_cut: applied.applied_at_cut,
+            created_at_cut: applied.created_at_cut,
         };
         let rows = &mut self.repair_counts.digest_rows;
         rows[RowResult::Applied.index()] += page.applied;
@@ -4022,6 +4043,8 @@ impl PeerStalls {
             tally.left += page.left;
             tally.left_tombstone += page.left_tombstone;
             tally.superseded += page.superseded;
+            tally.applied_at_cut += page.applied_at_cut;
+            tally.created_at_cut += page.created_at_cut;
         }
     }
 
@@ -4098,6 +4121,12 @@ impl PeerStalls {
             repairs.stalled = 0;
             repairs.advanced = false;
             repairs.tally = Tally::default();
+            repairs.active_cut = match repairs.active {
+                Some((collection, Repair::Converge)) => {
+                    repairs.cuts.remove(&collection).unwrap_or_default()
+                }
+                _ => VersionVector::default(),
+            };
         }
         let active = repairs.active;
         for collection in ended {
@@ -4133,9 +4162,10 @@ impl PeerStalls {
         scope: Option<CollectionId>,
         policy: kimmy_storage::SnapshotPolicy,
     ) -> &mut SnapshotProgress {
+        let cut = self.repairs.get(&peer).map(|r| r.active_cut.clone()).unwrap_or_default();
         let fresh = || match (scope, policy) {
             (Some(id), kimmy_storage::SnapshotPolicy::Converge) => {
-                SnapshotProgress::of_collection_converging(id)
+                SnapshotProgress::of_collection_converging(id, cut.clone())
             }
             (Some(id), _) => SnapshotProgress::of_collection(id),
             (None, _) => SnapshotProgress::whole_database(),
@@ -4204,6 +4234,7 @@ impl PeerStalls {
             .map(|(collection, _)| *collection)
             .collect();
         repairs.queued.retain(|(_, kind), _| *kind != RepairKind::Digest);
+        repairs.cuts.clear();
         if let Some((collection, Repair::Converge)) = repairs.active {
             repairs.active = None;
             repairs.done.insert((collection, RepairKind::Digest), 0);
@@ -4253,6 +4284,7 @@ impl PeerStalls {
                     .filter(|kind| {
                         let removed = repairs.queued.remove(&(collection, *kind)).is_some();
                         if removed && *kind == RepairKind::Digest {
+                            repairs.cuts.remove(&collection);
                             cancelled_digest.push(*peer);
                         }
                         removed
@@ -4755,6 +4787,7 @@ where
                             plan_deferred: plan.deferred().collect(),
                             held,
                             malformed: reply.malformed as usize,
+                            cut: plan.cut.clone(),
                         },
                         None => {
                             let mut round = DigestRound::new(DigestAnswered::Failed);

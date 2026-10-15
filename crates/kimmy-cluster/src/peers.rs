@@ -1468,6 +1468,7 @@ pub async fn replicate(engine: Arc<Engine>, config: ReplicationConfig) {
                                         &engine,
                                         &config,
                                         &mut stalls,
+                                        &digest_state,
                                         node,
                                         peer,
                                         &digest_confirmed,
@@ -1957,6 +1958,9 @@ struct DigestState {
     /// Whether a confirmed finding plans a document repair (`cluster.divergence_repair`),
     /// which is what the finding's WARN says.
     repair_planned: bool,
+    /// The cut each `(peer, collection)`'s last exact mismatch was compared at: what a
+    /// document repair planned from the finding counts its progress against (R3).
+    cuts: std::collections::HashMap<(NodeId, kimmy_core::CollectionId), kimmy_core::VersionVector>,
 }
 
 impl DigestState {
@@ -1966,6 +1970,7 @@ impl DigestState {
     fn prune(&mut self, held: &BTreeSet<kimmy_core::CollectionId>) {
         self.verified.retain(|id, (_, _, at)| held.contains(id) && at.elapsed() < SELF_CHECK_MEMO);
         self.warned.retain(|(_, id), at| held.contains(id) && at.elapsed() < DIGEST_WARN_EVERY * 6);
+        self.cuts.retain(|(_, id), _| held.contains(id));
     }
 }
 
@@ -2027,6 +2032,7 @@ fn fold_digest_round(
                         ) {
                             log_repair_verdict(node, verdict.collection, v);
                         }
+                        state.cuts.insert((node, verdict.collection), round.cut.clone());
                         let newly = tracker.observe_digest(node, verdict.collection, true);
                         let confirmed = tracker.is_digest_confirmed(node, verdict.collection);
                         let key = (node, verdict.collection);
@@ -2107,6 +2113,7 @@ fn plan_digest_repairs(
     engine: &Engine,
     config: &ReplicationConfig,
     stalls: &mut PeerStalls,
+    state: &DigestState,
     node: NodeId,
     peer: SocketAddr,
     confirmed: &BTreeSet<kimmy_core::CollectionId>,
@@ -2142,7 +2149,8 @@ fn plan_digest_repairs(
             stalls.digest_repair_refused(DigestRepairOutcome::TooLarge);
             continue;
         }
-        if stalls.plan_digest_repair(node, *collection) == DigestPlan::Planned {
+        let cut = state.cuts.get(&(node, *collection)).cloned().unwrap_or_default();
+        if stalls.plan_digest_repair(node, *collection, cut) == DigestPlan::Planned {
             warn!(
                 %peer,
                 node = %node,

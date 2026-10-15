@@ -4,7 +4,7 @@
 
 use std::time::Duration;
 
-use kimmy_core::{CollectionId, NodeId};
+use kimmy_core::{CollectionId, NodeId, VersionVector};
 use kimmy_storage::SnapshotProgress;
 
 use super::*;
@@ -27,7 +27,7 @@ fn stalls_at(now: Duration) -> PeerStalls {
 
 /// Plan, promote to active, and end as finished: a repair that ran to its end.
 fn run_to_the_end(stalls: &mut PeerStalls, peer: NodeId) {
-    assert_eq!(stalls.plan_digest_repair(peer, C), DigestPlan::Planned);
+    assert_eq!(stalls.plan_digest_repair(peer, C, VersionVector::default()), DigestPlan::Planned);
     assert_eq!(stalls.repair_due(peer), Some((C, Repair::Converge)));
     stalls.repair_finished(peer);
 }
@@ -36,12 +36,23 @@ fn run_to_the_end(stalls: &mut PeerStalls, peer: NodeId) {
 fn a_confirmed_finding_plans_one_converge_repair_and_the_ledger_holds_the_rest() {
     let mut stalls = stalls_at(mins(1));
     let p = node(1);
-    assert_eq!(stalls.plan_digest_repair(p, C), DigestPlan::Planned);
-    assert_eq!(stalls.plan_digest_repair(p, C), DigestPlan::Held(MayPlan::Busy), "queued");
+    assert_eq!(stalls.plan_digest_repair(p, C, VersionVector::default()), DigestPlan::Planned);
+    assert_eq!(
+        stalls.plan_digest_repair(p, C, VersionVector::default()),
+        DigestPlan::Held(MayPlan::Busy),
+        "queued"
+    );
     assert_eq!(stalls.repair_due(p), Some((C, Repair::Converge)));
-    assert_eq!(stalls.plan_digest_repair(p, C), DigestPlan::Held(MayPlan::Busy), "active");
+    assert_eq!(
+        stalls.plan_digest_repair(p, C, VersionVector::default()),
+        DigestPlan::Held(MayPlan::Busy),
+        "active"
+    );
     // Another peer's repair of the same collection is its own.
-    assert_eq!(stalls.plan_digest_repair(node(2), C), DigestPlan::Planned);
+    assert_eq!(
+        stalls.plan_digest_repair(node(2), C, VersionVector::default()),
+        DigestPlan::Planned
+    );
 }
 
 #[test]
@@ -49,7 +60,10 @@ fn a_count_repair_of_the_collection_wins_and_is_counted() {
     let mut stalls = stalls_at(mins(1));
     let p = node(1);
     assert!(stalls.plan_repair(p, C, Repair::Snapshot));
-    assert_eq!(stalls.plan_digest_repair(p, C), DigestPlan::SkippedCountRepair);
+    assert_eq!(
+        stalls.plan_digest_repair(p, C, VersionVector::default()),
+        DigestPlan::SkippedCountRepair
+    );
     let counts = stalls.take_repair_counts();
     assert_eq!(counts.digest_repairs[DigestRepairOutcome::SkippedCountRepair.index()], 1);
     // The ledger was not asked to hold anything.
@@ -63,9 +77,15 @@ fn a_whole_database_pull_pending_for_the_peer_holds_the_repair() {
     let mut progress = SnapshotProgress::whole_database();
     progress.test_mark_paged();
     stalls.snapshots.insert(p, progress);
-    assert_eq!(stalls.plan_digest_repair(p, C), DigestPlan::WholeDatabasePending);
+    assert_eq!(
+        stalls.plan_digest_repair(p, C, VersionVector::default()),
+        DigestPlan::WholeDatabasePending
+    );
     // Another peer is not held by it.
-    assert_eq!(stalls.plan_digest_repair(node(2), C), DigestPlan::Planned);
+    assert_eq!(
+        stalls.plan_digest_repair(node(2), C, VersionVector::default()),
+        DigestPlan::Planned
+    );
 }
 
 #[test]
@@ -74,7 +94,10 @@ fn an_ineffective_repair_backs_off_by_the_table_and_a_judged_match_resets_it() {
     let p = node(1);
     run_to_the_end(&mut stalls, p);
     // Awaiting its probe: held.
-    assert_eq!(stalls.plan_digest_repair(p, C), DigestPlan::Held(MayPlan::Busy));
+    assert_eq!(
+        stalls.plan_digest_repair(p, C, VersionVector::default()),
+        DigestPlan::Held(MayPlan::Busy)
+    );
     let verdict = stalls.judge_digest_repair(p, C, Judged::Ineffective).unwrap();
     assert_eq!(
         verdict,
@@ -82,7 +105,10 @@ fn an_ineffective_repair_backs_off_by_the_table_and_a_judged_match_resets_it() {
     );
     // The cooldown the planner keeps clears when the finding stops being reported.
     stalls.retain_digest(p, &BTreeSet::new());
-    assert!(matches!(stalls.plan_digest_repair(p, C), DigestPlan::Held(MayPlan::BackOff(_))));
+    assert!(matches!(
+        stalls.plan_digest_repair(p, C, VersionVector::default()),
+        DigestPlan::Held(MayPlan::BackOff(_))
+    ));
     stalls.set_repair_clock(mins(7), mins(5));
     run_to_the_end(&mut stalls, p);
     assert!(matches!(
@@ -90,7 +116,11 @@ fn an_ineffective_repair_backs_off_by_the_table_and_a_judged_match_resets_it() {
         Some(Verdict::Effective)
     ));
     stalls.retain_digest(p, &BTreeSet::new());
-    assert_eq!(stalls.plan_digest_repair(p, C), DigestPlan::Planned, "level back to 0");
+    assert_eq!(
+        stalls.plan_digest_repair(p, C, VersionVector::default()),
+        DigestPlan::Planned,
+        "level back to 0"
+    );
     let counts = stalls.take_repair_counts();
     assert_eq!(counts.digest_repairs[DigestRepairOutcome::Applied.index()], 2);
     assert_eq!(counts.digest_judgements[Judgement::Ineffective.index()], 1);
@@ -112,9 +142,10 @@ fn a_repair_that_wrote_a_row_lowers_the_level_and_one_that_wrote_none_does_not()
     // The third wrote a row.
     stalls.set_repair_clock(mins(100), mins(5));
     stalls.retain_digest(p, &BTreeSet::new());
-    assert_eq!(stalls.plan_digest_repair(p, C), DigestPlan::Planned);
+    assert_eq!(stalls.plan_digest_repair(p, C, VersionVector::default()), DigestPlan::Planned);
     stalls.repair_due(p);
-    let applied = kimmy_storage::SnapshotApplied { applied: 3, ..Default::default() };
+    let applied =
+        kimmy_storage::SnapshotApplied { applied: 3, applied_at_cut: 3, ..Default::default() };
     stalls.converge_page_applied(p, &applied);
     stalls.repair_finished(p);
     let v = stalls.judge_digest_repair(p, C, Judged::Ineffective).unwrap();
@@ -127,7 +158,7 @@ fn a_repair_that_wrote_a_row_lowers_the_level_and_one_that_wrote_none_does_not()
 fn the_tally_is_the_active_repairs_own_and_starts_over_with_the_next() {
     let mut stalls = stalls_at(mins(1));
     let p = node(1);
-    assert_eq!(stalls.plan_digest_repair(p, C), DigestPlan::Planned);
+    assert_eq!(stalls.plan_digest_repair(p, C, VersionVector::default()), DigestPlan::Planned);
     stalls.repair_due(p);
     let page = kimmy_storage::SnapshotApplied { created: 2, left: 1, ..Default::default() };
     stalls.converge_page_applied(p, &page);
@@ -143,7 +174,7 @@ fn a_whole_database_pull_taking_over_ends_a_queued_and_an_active_repair_as_trans
     let mut stalls = stalls_at(mins(1));
     let p = node(1);
     let other = CollectionId(8);
-    assert_eq!(stalls.plan_digest_repair(p, C), DigestPlan::Planned);
+    assert_eq!(stalls.plan_digest_repair(p, C, VersionVector::default()), DigestPlan::Planned);
     stalls.repair_due(p); // C is active
     assert!(stalls.plan_repair(p, other, Repair::Converge)); // `other` queued
     stalls
@@ -154,28 +185,28 @@ fn a_whole_database_pull_taking_over_ends_a_queued_and_an_active_repair_as_trans
     assert_eq!(counts.digest_repairs[DigestRepairOutcome::Transient.index()], 2);
     // R1: the ledger is idle for both, at level 0, and planning is not held by it.
     stalls.retain_digest(p, &BTreeSet::new());
-    assert_eq!(stalls.plan_digest_repair(p, C), DigestPlan::Planned);
-    assert_eq!(stalls.plan_digest_repair(p, other), DigestPlan::Planned);
+    assert_eq!(stalls.plan_digest_repair(p, C, VersionVector::default()), DigestPlan::Planned);
+    assert_eq!(stalls.plan_digest_repair(p, other, VersionVector::default()), DigestPlan::Planned);
 }
 
 #[test]
 fn a_repair_cancelled_while_queued_is_transient_and_holds_nothing() {
     let mut stalls = stalls_at(mins(1));
     let p = node(1);
-    assert_eq!(stalls.plan_digest_repair(p, C), DigestPlan::Planned);
+    assert_eq!(stalls.plan_digest_repair(p, C, VersionVector::default()), DigestPlan::Planned);
     assert_eq!(stalls.repairs_cancelled(C), 1);
     assert_eq!(
         stalls.take_repair_counts().digest_repairs[DigestRepairOutcome::Transient.index()],
         1
     );
-    assert_eq!(stalls.plan_digest_repair(p, C), DigestPlan::Planned);
+    assert_eq!(stalls.plan_digest_repair(p, C, VersionVector::default()), DigestPlan::Planned);
 }
 
 #[test]
 fn a_repair_whose_sender_dropped_the_collection_is_transient_not_applied() {
     let mut stalls = stalls_at(mins(1));
     let p = node(1);
-    assert_eq!(stalls.plan_digest_repair(p, C), DigestPlan::Planned);
+    assert_eq!(stalls.plan_digest_repair(p, C, VersionVector::default()), DigestPlan::Planned);
     stalls.repair_due(p);
     stalls.repair_ended_transient(p, Transient::Dropped);
     let counts = stalls.take_repair_counts();
@@ -183,14 +214,14 @@ fn a_repair_whose_sender_dropped_the_collection_is_transient_not_applied() {
     assert_eq!(counts.digest_repairs[DigestRepairOutcome::Applied.index()], 0);
     // Not awaiting a probe: the ledger would let it plan again once the cooldown passes.
     stalls.retain_digest(p, &BTreeSet::new());
-    assert_eq!(stalls.plan_digest_repair(p, C), DigestPlan::Planned);
+    assert_eq!(stalls.plan_digest_repair(p, C, VersionVector::default()), DigestPlan::Planned);
 }
 
 #[test]
 fn a_repair_that_advances_nothing_for_the_attempts_is_abandoned_and_counted() {
     let mut stalls = stalls_at(mins(1));
     let p = node(1);
-    assert_eq!(stalls.plan_digest_repair(p, C), DigestPlan::Planned);
+    assert_eq!(stalls.plan_digest_repair(p, C, VersionVector::default()), DigestPlan::Planned);
     for _ in 0..=REPAIR_ATTEMPTS {
         stalls.repair_due(p);
     }
@@ -198,7 +229,11 @@ fn a_repair_that_advances_nothing_for_the_attempts_is_abandoned_and_counted() {
     assert_eq!(counts.digest_repairs[DigestRepairOutcome::Abandoned.index()], 1);
     assert!(!stalls.repairing(p));
     stalls.retain_digest(p, &BTreeSet::new());
-    assert_eq!(stalls.plan_digest_repair(p, C), DigestPlan::Planned, "R1: level unchanged");
+    assert_eq!(
+        stalls.plan_digest_repair(p, C, VersionVector::default()),
+        DigestPlan::Planned,
+        "R1: level unchanged"
+    );
 }
 
 #[test]
@@ -228,7 +263,10 @@ fn recurring_episodes_stop_the_collection_and_the_stop_is_counted_and_gauged() {
     assert!(stopped);
     assert_eq!(stalls.stopped_collections(), 1);
     stalls.retain_digest(p, &BTreeSet::new());
-    assert!(matches!(stalls.plan_digest_repair(p, C), DigestPlan::Held(MayPlan::Stopped(_))));
+    assert!(matches!(
+        stalls.plan_digest_repair(p, C, VersionVector::default()),
+        DigestPlan::Held(MayPlan::Stopped(_))
+    ));
     assert_eq!(stalls.take_repair_counts().digest_judgements[Judgement::Recurring.index()], 1);
 }
 
@@ -243,4 +281,66 @@ fn the_ledger_is_pruned_with_the_members_and_the_collections() {
     assert_eq!(stalls.ledger.len(), 1);
     stalls.retain_ledger(&BTreeSet::new(), None);
     assert!(stalls.ledger.is_empty());
+}
+
+/// The loop R3 exists to stop. A collection under live writes: every Converge pull applies
+/// tail rows above the finding's cut, which ordinary replication would also deliver, and a
+/// standing ambiguous id never clears. That counts as no progress, so the level climbs to
+/// the cap and the repair runs about four times a day, not about every quarter hour.
+#[test]
+fn a_written_collection_with_a_standing_ambiguous_id_climbs_to_the_cap() {
+    let mut stalls = stalls_at(mins(0));
+    let p = node(1);
+    let mut now = mins(0);
+    let mut levels = Vec::new();
+    for _ in 0..7 {
+        stalls.set_repair_clock(now, mins(5));
+        stalls.retain_digest(p, &BTreeSet::new());
+        assert_eq!(stalls.plan_digest_repair(p, C, VersionVector::default()), DigestPlan::Planned);
+        stalls.repair_due(p);
+        // Five tail rows applied, none at or below the cut.
+        let page = kimmy_storage::SnapshotApplied { applied: 5, ..Default::default() };
+        stalls.converge_page_applied(p, &page);
+        stalls.repair_finished(p);
+        let Verdict::Ineffective { level, not_before } =
+            stalls.judge_digest_repair(p, C, Judged::Ineffective).unwrap()
+        else {
+            panic!("not ineffective");
+        };
+        levels.push(level);
+        now = not_before;
+    }
+    assert_eq!(levels, [1, 2, 3, 4, 5, 5, 5]);
+}
+
+/// And the same collection when a pull does write a row at the cut: real progress lowers the
+/// level to 1, so a new genuine divergence waits minutes and not six hours.
+#[test]
+fn a_row_at_the_cut_is_progress_and_lowers_the_level() {
+    let mut stalls = stalls_at(mins(0));
+    let p = node(1);
+    let mut now = mins(0);
+    for _ in 0..3 {
+        stalls.set_repair_clock(now, mins(5));
+        stalls.retain_digest(p, &BTreeSet::new());
+        stalls.plan_digest_repair(p, C, VersionVector::default());
+        stalls.repair_due(p);
+        stalls.repair_finished(p);
+        let Some(Verdict::Ineffective { not_before, .. }) =
+            stalls.judge_digest_repair(p, C, Judged::Ineffective)
+        else {
+            panic!("not ineffective");
+        };
+        now = not_before;
+    }
+    stalls.set_repair_clock(now, mins(5));
+    stalls.retain_digest(p, &BTreeSet::new());
+    stalls.plan_digest_repair(p, C, VersionVector::default());
+    stalls.repair_due(p);
+    let page =
+        kimmy_storage::SnapshotApplied { applied: 5, applied_at_cut: 1, ..Default::default() };
+    stalls.converge_page_applied(p, &page);
+    stalls.repair_finished(p);
+    let v = stalls.judge_digest_repair(p, C, Judged::Ineffective).unwrap();
+    assert!(matches!(v, Verdict::Ineffective { level: 1, .. }), "{v:?}");
 }

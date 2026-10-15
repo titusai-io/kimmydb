@@ -1650,6 +1650,126 @@ impl TelemetryGuard {
         );
         observe!(
             u64_observable_counter,
+            "kimmy.sync.digest_repairs.applied",
+            "{repair}",
+            "Document repairs of a confirmed cut-digest finding, for this outcome (applied: a repair ran to its end).",
+            |s| s.sync_digest_repairs[kimmy_cluster::DigestRepairOutcome::Applied.index()]
+        );
+        observe!(
+            u64_observable_counter,
+            "kimmy.sync.digest_repairs.too_large",
+            "{repair}",
+            "Document repairs of a confirmed cut-digest finding, for this outcome (too_large: the collection was too large for the gate).",
+            |s| s.sync_digest_repairs[kimmy_cluster::DigestRepairOutcome::TooLarge.index()]
+        );
+        observe!(
+            u64_observable_counter,
+            "kimmy.sync.digest_repairs.abandoned",
+            "{repair}",
+            "Document repairs of a confirmed cut-digest finding, for this outcome (abandoned: three rounds applied nothing).",
+            |s| s.sync_digest_repairs[kimmy_cluster::DigestRepairOutcome::Abandoned.index()]
+        );
+        observe!(
+            u64_observable_counter,
+            "kimmy.sync.digest_repairs.transient",
+            "{repair}",
+            "Document repairs of a confirmed cut-digest finding, for this outcome (transient: it ended without a result to judge).",
+            |s| s.sync_digest_repairs[kimmy_cluster::DigestRepairOutcome::Transient.index()]
+        );
+        observe!(
+            u64_observable_counter,
+            "kimmy.sync.digest_repairs.skipped_count_repair",
+            "{repair}",
+            "Document repairs of a confirmed cut-digest finding, for this outcome (skipped_count_repair: a count repair of the collection stands).",
+            |s| s.sync_digest_repairs
+                [kimmy_cluster::DigestRepairOutcome::SkippedCountRepair.index()]
+        );
+        observe!(
+            u64_observable_counter,
+            "kimmy.sync.digest_repairs.disabled",
+            "{repair}",
+            "Document repairs of a confirmed cut-digest finding, for this outcome (disabled: cluster.divergence_repair is off).",
+            |s| s.sync_digest_repairs[kimmy_cluster::DigestRepairOutcome::Disabled.index()]
+        );
+        observe!(
+            u64_observable_counter,
+            "kimmy.sync.digest_repair_judgements.effective",
+            "{repair}",
+            "What the loop guard made of a document repair, for this result (effective: the digests matched).",
+            |s| s.sync_digest_repair_judgements[kimmy_cluster::Judgement::Effective.index()]
+        );
+        observe!(
+            u64_observable_counter,
+            "kimmy.sync.digest_repair_judgements.ineffective",
+            "{repair}",
+            "What the loop guard made of a document repair, for this result (ineffective: they differed).",
+            |s| s.sync_digest_repair_judgements[kimmy_cluster::Judgement::Ineffective.index()]
+        );
+        observe!(
+            u64_observable_counter,
+            "kimmy.sync.digest_repair_judgements.unjudged",
+            "{repair}",
+            "What the loop guard made of a document repair, for this result (unjudged: no compared digest in time).",
+            |s| s.sync_digest_repair_judgements[kimmy_cluster::Judgement::Unjudged.index()]
+        );
+        observe!(
+            u64_observable_counter,
+            "kimmy.sync.digest_repair_judgements.recurring",
+            "{repair}",
+            "What the loop guard made of a document repair, for this result (recurring: the collection was stopped).",
+            |s| s.sync_digest_repair_judgements[kimmy_cluster::Judgement::Recurring.index()]
+        );
+        observe!(
+            u64_observable_counter,
+            "kimmy.sync.digest_repair_rows.applied",
+            "{row}",
+            "Rows of the pages a document repair pulled, for this result (applied).",
+            |s| s.sync_digest_repair_rows[kimmy_cluster::RowResult::Applied.index()]
+        );
+        observe!(
+            u64_observable_counter,
+            "kimmy.sync.digest_repair_rows.created",
+            "{row}",
+            "Rows of the pages a document repair pulled, for this result (created).",
+            |s| s.sync_digest_repair_rows[kimmy_cluster::RowResult::Created.index()]
+        );
+        observe!(
+            u64_observable_counter,
+            "kimmy.sync.digest_repair_rows.left",
+            "{row}",
+            "Rows of the pages a document repair pulled, for this result (left).",
+            |s| s.sync_digest_repair_rows[kimmy_cluster::RowResult::Left.index()]
+        );
+        observe!(
+            u64_observable_counter,
+            "kimmy.sync.digest_repair_rows.left_tombstone",
+            "{row}",
+            "Rows of the pages a document repair pulled, for this result (left_tombstone).",
+            |s| s.sync_digest_repair_rows[kimmy_cluster::RowResult::LeftTombstone.index()]
+        );
+        observe!(
+            u64_observable_counter,
+            "kimmy.sync.digest_repair_rows.superseded",
+            "{row}",
+            "Rows of the pages a document repair pulled, for this result (superseded).",
+            |s| s.sync_digest_repair_rows[kimmy_cluster::RowResult::Superseded.index()]
+        );
+        observe!(
+            u64_observable_gauge,
+            "kimmy.sync.digest_repair_stopped_collections",
+            "{collection}",
+            "Collections whose document repair the loop guard has stopped for recurring.",
+            sync_digest_repair_stopped_collections
+        );
+        observe!(
+            u64_observable_gauge,
+            "kimmy.sync.divergence_repair_enabled",
+            "1",
+            "1 when cluster.divergence_repair is on, 0 when this member only detects.",
+            sync_divergence_repair_enabled
+        );
+        observe!(
+            u64_observable_counter,
             "kimmy.sync.divergence_digest_probes.compared",
             "{collection}",
             "Collections the cut digest compared against a peer's, with what either side had not yet processed set aside.",
@@ -2716,6 +2836,33 @@ mod tests {
                 camel(reason.label())
             );
             assert!(call.ends_with(&slot), "{name} does not read the slot of its reason: {call}");
+        }
+        for outcome in kimmy_cluster::DigestRepairOutcome::ALL {
+            let name = format!("kimmy.sync.digest_repairs.{}", outcome.label());
+            let call = call_of(&name);
+            let slot = format!(
+                "|s|s.sync_digest_repairs[kimmy_cluster::DigestRepairOutcome::{}.index()]",
+                camel(outcome.label())
+            );
+            assert!(call.ends_with(&slot), "{name} does not read the slot of its outcome: {call}");
+        }
+        for result in kimmy_cluster::Judgement::ALL {
+            let name = format!("kimmy.sync.digest_repair_judgements.{}", result.label());
+            let call = call_of(&name);
+            let slot = format!(
+                "|s|s.sync_digest_repair_judgements[kimmy_cluster::Judgement::{}.index()]",
+                camel(result.label())
+            );
+            assert!(call.ends_with(&slot), "{name} does not read the slot of its result: {call}");
+        }
+        for result in kimmy_cluster::RowResult::ALL {
+            let name = format!("kimmy.sync.digest_repair_rows.{}", result.label());
+            let call = call_of(&name);
+            let slot = format!(
+                "|s|s.sync_digest_repair_rows[kimmy_cluster::RowResult::{}.index()]",
+                camel(result.label())
+            );
+            assert!(call.ends_with(&slot), "{name} does not read the slot of its result: {call}");
         }
         for reason in kimmy_storage::DefinitionDefer::ALL {
             let name =

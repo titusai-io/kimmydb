@@ -478,6 +478,16 @@ pub struct MetricsSnapshot {
     pub sync_digest_deferred: [u64; kimmy_storage::Defer::ALL.len()],
     /// Kept digest rows a self-check found drifted and corrected.
     pub sync_digest_drift: u64,
+    /// Document repairs by outcome (`kimmy_cluster::DigestRepairOutcome::ALL`).
+    pub sync_digest_repairs: [u64; kimmy_cluster::DigestRepairOutcome::ALL.len()],
+    /// The loop guard's judgements (`kimmy_cluster::Judgement::ALL`).
+    pub sync_digest_repair_judgements: [u64; kimmy_cluster::Judgement::ALL.len()],
+    /// Rows of the repair's pages (`kimmy_cluster::RowResult::ALL`).
+    pub sync_digest_repair_rows: [u64; kimmy_cluster::RowResult::ALL.len()],
+    /// Collections whose document repair is stopped for recurring. A level.
+    pub sync_digest_repair_stopped_collections: u64,
+    /// 1 when `cluster.divergence_repair` is on.
+    pub sync_divergence_repair_enabled: u64,
     /// Collections the definition digest currently has confirmed (B3 half 2):
     /// also counted in `sync_divergent_collections`, which this attributes.
     pub sync_definition_divergent_collections: u64,
@@ -611,6 +621,11 @@ pub struct Metrics {
     sync_digest_probed: AtomicU64,
     sync_digest_deferred: [AtomicU64; kimmy_storage::Defer::ALL.len()],
     sync_digest_drift: AtomicU64,
+    sync_digest_repairs: [AtomicU64; kimmy_cluster::DigestRepairOutcome::ALL.len()],
+    sync_digest_repair_judgements: [AtomicU64; kimmy_cluster::Judgement::ALL.len()],
+    sync_digest_repair_rows: [AtomicU64; kimmy_cluster::RowResult::ALL.len()],
+    sync_digest_repair_stopped_collections: AtomicU64,
+    sync_divergence_repair_enabled: AtomicU64,
     /// The definition digest's (B3 half 2): a level, and counters, on the same
     /// terms.
     sync_definition_divergent_collections: AtomicU64,
@@ -740,6 +755,11 @@ impl Default for Metrics {
             sync_digest_probed: AtomicU64::new(0),
             sync_digest_deferred: std::array::from_fn(|_| AtomicU64::new(0)),
             sync_digest_drift: AtomicU64::new(0),
+            sync_digest_repairs: std::array::from_fn(|_| AtomicU64::new(0)),
+            sync_digest_repair_judgements: std::array::from_fn(|_| AtomicU64::new(0)),
+            sync_digest_repair_rows: std::array::from_fn(|_| AtomicU64::new(0)),
+            sync_digest_repair_stopped_collections: AtomicU64::new(0),
+            sync_divergence_repair_enabled: AtomicU64::new(0),
             sync_definition_divergent_collections: AtomicU64::new(0),
             sync_definition_compared: AtomicU64::new(0),
             sync_definition_explained: AtomicU64::new(0),
@@ -983,6 +1003,21 @@ impl Metrics {
         }
         // A total the loop reads from the engine, so a level this stores.
         self.sync_digest_drift.store(round.digest_drift_total, Ordering::Relaxed);
+        for (slot, n) in self.sync_digest_repairs.iter().zip(round.repair.digest_repairs) {
+            slot.fetch_add(n as u64, Ordering::Relaxed);
+        }
+        for (slot, n) in
+            self.sync_digest_repair_judgements.iter().zip(round.repair.digest_judgements)
+        {
+            slot.fetch_add(n as u64, Ordering::Relaxed);
+        }
+        for (slot, n) in self.sync_digest_repair_rows.iter().zip(round.repair.digest_rows) {
+            slot.fetch_add(n as u64, Ordering::Relaxed);
+        }
+        self.sync_digest_repair_stopped_collections
+            .store(round.digest_repair_stopped as u64, Ordering::Relaxed);
+        self.sync_divergence_repair_enabled
+            .store(u64::from(round.repair_enabled), Ordering::Relaxed);
         self.sync_definition_divergent_collections
             .store(round.definition_divergent_collections as u64, Ordering::Relaxed);
         self.sync_definition_compared
@@ -1409,6 +1444,18 @@ impl Metrics {
                 self.get(&self.sync_digest_deferred[slot])
             }),
             sync_digest_drift: self.get(&self.sync_digest_drift),
+            sync_digest_repairs: std::array::from_fn(|slot| {
+                self.get(&self.sync_digest_repairs[slot])
+            }),
+            sync_digest_repair_judgements: std::array::from_fn(|slot| {
+                self.get(&self.sync_digest_repair_judgements[slot])
+            }),
+            sync_digest_repair_rows: std::array::from_fn(|slot| {
+                self.get(&self.sync_digest_repair_rows[slot])
+            }),
+            sync_digest_repair_stopped_collections: self
+                .get(&self.sync_digest_repair_stopped_collections),
+            sync_divergence_repair_enabled: self.get(&self.sync_divergence_repair_enabled),
             sync_definition_divergent_collections: self
                 .get(&self.sync_definition_divergent_collections),
             sync_definition_compared: self.get(&self.sync_definition_compared),
@@ -1804,6 +1851,21 @@ impl Metrics {
              # HELP kimmy_sync_digest_drift_total Kept digest rows a self-check found disagreeing with the records they summarise, and corrected, since the process started. A healthy node reads 0; a rising value is a bug in the digest's maintenance and is logged at ERROR.\n\
              # TYPE kimmy_sync_digest_drift_total counter\n\
              kimmy_sync_digest_drift_total {sync_digest_drift}\n\
+             # HELP kimmy_sync_digest_repairs_total Document repairs of a confirmed cut-digest finding, by outcome: the end of a repair, or the gate that refused to plan one. applied: a repair ran to its end; whether it worked is judged at the next compared digest and counted in kimmy_sync_digest_repair_judgements_total. too_large: the collection holds more live documents than cluster.repair_max_documents and is left to the operator. abandoned: three rounds in a row applied nothing. transient: a peer error, a stop, a drop, a whole-database pull taking the peer over, or a cancellation; changes nothing but the cooldown. skipped_count_repair: a count repair of the collection is queued, active or cooling. disabled: cluster.divergence_repair is off.\n\
+             # TYPE kimmy_sync_digest_repairs_total counter\n\
+             {sync_digest_repairs_lines}\
+             # HELP kimmy_sync_digest_repair_judgements_total What the loop guard made of a document repair, at the first compared digest after it ended. effective: the digests matched. ineffective: they differed, and the repair backs off (5 min, 15 min, 45 min, 2 h 15 min, 6 h). unjudged: no compared digest arrived within the deadline. recurring: the finding cleared and recurred more than three times in an hour and the collection was stopped; see the ERROR log.\n\
+             # TYPE kimmy_sync_digest_repair_judgements_total counter\n\
+             {sync_digest_repair_judgements_lines}\
+             # HELP kimmy_sync_digest_repair_rows_total Rows of the pages a document repair pulled, by result. applied: rows that won last-writer-wins and were written. created: young lost inserts written. left: live rows this member held nothing for and the repair did not write (the operator rule in operations.md decides). left_tombstone: tombstone rows this member held nothing for. superseded: rows that addressed a life this member has buried.\n\
+             # TYPE kimmy_sync_digest_repair_rows_total counter\n\
+             {sync_digest_repair_rows_lines}\
+             # HELP kimmy_sync_digest_repair_stopped_collections Collections whose document repair the loop guard has stopped for recurring (more than three clear-and-recur episodes in an hour). A stop lasts six hours or until the collection has had no confirmed finding for an hour.\n\
+             # TYPE kimmy_sync_digest_repair_stopped_collections gauge\n\
+             kimmy_sync_digest_repair_stopped_collections {sync_digest_repair_stopped}\n\
+             # HELP kimmy_sync_divergence_repair_enabled 1 when cluster.divergence_repair is on, 0 when this member only detects.\n\
+             # TYPE kimmy_sync_divergence_repair_enabled gauge\n\
+             kimmy_sync_divergence_repair_enabled {sync_divergence_repair_enabled}\n\
              # HELP kimmy_sync_definition_divergent_collections Collections the definition digest currently finds disagreeing with a peer: the two members hold different index or vector definitions for them, seen on two compared checks running. Also counted in kimmy_sync_divergent_collections, which this attributes. Detect only: nothing is repaired from it. Read the indexes of the collection on both members (GET /v1/db/{{db}}/coll/{{coll}}/indexes) and compare the definition the WARN names, including expireAfterSeconds and unique, before recreating anything (operations.md, The definition digest).\n\
              # TYPE kimmy_sync_definition_divergent_collections gauge\n\
              kimmy_sync_definition_divergent_collections {sync_definition_divergent}\n\
@@ -1963,6 +2025,38 @@ impl Metrics {
                 })
                 .collect::<String>(),
             sync_digest_drift = self.get(&self.sync_digest_drift),
+            sync_digest_repairs_lines = kimmy_cluster::DigestRepairOutcome::ALL
+                .iter()
+                .map(|outcome| {
+                    format!(
+                        "kimmy_sync_digest_repairs_total{{outcome=\"{}\"}} {}\n",
+                        outcome.label(),
+                        self.get(&self.sync_digest_repairs[outcome.index()])
+                    )
+                })
+                .collect::<String>(),
+            sync_digest_repair_judgements_lines = kimmy_cluster::Judgement::ALL
+                .iter()
+                .map(|result| {
+                    format!(
+                        "kimmy_sync_digest_repair_judgements_total{{result=\"{}\"}} {}\n",
+                        result.label(),
+                        self.get(&self.sync_digest_repair_judgements[result.index()])
+                    )
+                })
+                .collect::<String>(),
+            sync_digest_repair_rows_lines = kimmy_cluster::RowResult::ALL
+                .iter()
+                .map(|result| {
+                    format!(
+                        "kimmy_sync_digest_repair_rows_total{{result=\"{}\"}} {}\n",
+                        result.label(),
+                        self.get(&self.sync_digest_repair_rows[result.index()])
+                    )
+                })
+                .collect::<String>(),
+            sync_digest_repair_stopped = self.get(&self.sync_digest_repair_stopped_collections),
+            sync_divergence_repair_enabled = self.get(&self.sync_divergence_repair_enabled),
             sync_definition_divergent = self.get(&self.sync_definition_divergent_collections),
             sync_definition_compared = self.get(&self.sync_definition_compared),
             sync_definition_explained = self.get(&self.sync_definition_explained),
@@ -2687,6 +2781,13 @@ mod tests {
             digest_deferred: [121, 122, 123, 124, 125, 126, 127, 128, 129, 130, 131, 132],
             digest_divergent_collections: 15,
             digest_drift_total: 16,
+            repair: kimmy_cluster::RepairCounts {
+                digest_repairs: [201, 202, 203, 204, 205, 206],
+                digest_judgements: [211, 212, 213, 214],
+                digest_rows: [221, 222, 223, 224, 225],
+            },
+            digest_repair_stopped: 31,
+            repair_enabled: false,
             definition_compared: 141,
             definition_explained: 142,
             definition_unanswered: 143,
@@ -2723,6 +2824,13 @@ mod tests {
             digest_deferred: [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12],
             digest_divergent_collections: 7,
             digest_drift_total: 9,
+            repair: kimmy_cluster::RepairCounts {
+                digest_repairs: [1, 2, 3, 4, 5, 6],
+                digest_judgements: [11, 12, 13, 14],
+                digest_rows: [21, 22, 23, 24, 25],
+            },
+            digest_repair_stopped: 32,
+            repair_enabled: true,
             definition_compared: 2,
             definition_explained: 3,
             definition_unanswered: 4,
@@ -3569,6 +3677,33 @@ kimmy_sync_divergence_digest_probes_total{outcome=\"deferred\",reason=\"correcte
 # HELP kimmy_sync_digest_drift_total Kept digest rows a self-check found disagreeing with the records they summarise, and corrected, since the process started. A healthy node reads 0; a rising value is a bug in the digest's maintenance and is logged at ERROR.
 # TYPE kimmy_sync_digest_drift_total counter
 kimmy_sync_digest_drift_total 9
+# HELP kimmy_sync_digest_repairs_total Document repairs of a confirmed cut-digest finding, by outcome: the end of a repair, or the gate that refused to plan one. applied: a repair ran to its end; whether it worked is judged at the next compared digest and counted in kimmy_sync_digest_repair_judgements_total. too_large: the collection holds more live documents than cluster.repair_max_documents and is left to the operator. abandoned: three rounds in a row applied nothing. transient: a peer error, a stop, a drop, a whole-database pull taking the peer over, or a cancellation; changes nothing but the cooldown. skipped_count_repair: a count repair of the collection is queued, active or cooling. disabled: cluster.divergence_repair is off.
+# TYPE kimmy_sync_digest_repairs_total counter
+kimmy_sync_digest_repairs_total{outcome=\"applied\"} 202
+kimmy_sync_digest_repairs_total{outcome=\"too_large\"} 204
+kimmy_sync_digest_repairs_total{outcome=\"abandoned\"} 206
+kimmy_sync_digest_repairs_total{outcome=\"transient\"} 208
+kimmy_sync_digest_repairs_total{outcome=\"skipped_count_repair\"} 210
+kimmy_sync_digest_repairs_total{outcome=\"disabled\"} 212
+# HELP kimmy_sync_digest_repair_judgements_total What the loop guard made of a document repair, at the first compared digest after it ended. effective: the digests matched. ineffective: they differed, and the repair backs off (5 min, 15 min, 45 min, 2 h 15 min, 6 h). unjudged: no compared digest arrived within the deadline. recurring: the finding cleared and recurred more than three times in an hour and the collection was stopped; see the ERROR log.
+# TYPE kimmy_sync_digest_repair_judgements_total counter
+kimmy_sync_digest_repair_judgements_total{result=\"effective\"} 222
+kimmy_sync_digest_repair_judgements_total{result=\"ineffective\"} 224
+kimmy_sync_digest_repair_judgements_total{result=\"unjudged\"} 226
+kimmy_sync_digest_repair_judgements_total{result=\"recurring\"} 228
+# HELP kimmy_sync_digest_repair_rows_total Rows of the pages a document repair pulled, by result. applied: rows that won last-writer-wins and were written. created: young lost inserts written. left: live rows this member held nothing for and the repair did not write (the operator rule in operations.md decides). left_tombstone: tombstone rows this member held nothing for. superseded: rows that addressed a life this member has buried.
+# TYPE kimmy_sync_digest_repair_rows_total counter
+kimmy_sync_digest_repair_rows_total{result=\"applied\"} 242
+kimmy_sync_digest_repair_rows_total{result=\"created\"} 244
+kimmy_sync_digest_repair_rows_total{result=\"left\"} 246
+kimmy_sync_digest_repair_rows_total{result=\"left_tombstone\"} 248
+kimmy_sync_digest_repair_rows_total{result=\"superseded\"} 250
+# HELP kimmy_sync_digest_repair_stopped_collections Collections whose document repair the loop guard has stopped for recurring (more than three clear-and-recur episodes in an hour). A stop lasts six hours or until the collection has had no confirmed finding for an hour.
+# TYPE kimmy_sync_digest_repair_stopped_collections gauge
+kimmy_sync_digest_repair_stopped_collections 32
+# HELP kimmy_sync_divergence_repair_enabled 1 when cluster.divergence_repair is on, 0 when this member only detects.
+# TYPE kimmy_sync_divergence_repair_enabled gauge
+kimmy_sync_divergence_repair_enabled 1
 # HELP kimmy_sync_definition_divergent_collections Collections the definition digest currently finds disagreeing with a peer: the two members hold different index or vector definitions for them, seen on two compared checks running. Also counted in kimmy_sync_divergent_collections, which this attributes. Detect only: nothing is repaired from it. Read the indexes of the collection on both members (GET /v1/db/{db}/coll/{coll}/indexes) and compare the definition the WARN names, including expireAfterSeconds and unique, before recreating anything (operations.md, The definition digest).
 # TYPE kimmy_sync_definition_divergent_collections gauge
 kimmy_sync_definition_divergent_collections 5
@@ -4178,6 +4313,35 @@ kimmy_storage_cache_reads_total{result=\"miss\"} 9104
             ));
         }
         expect(&format!("kimmy_sync_digest_drift_total {}\n", s.sync_digest_drift));
+        for outcome in kimmy_cluster::DigestRepairOutcome::ALL {
+            expect(&format!(
+                "kimmy_sync_digest_repairs_total{{outcome=\"{}\"}} {}\n",
+                outcome.label(),
+                s.sync_digest_repairs[outcome.index()]
+            ));
+        }
+        for result in kimmy_cluster::Judgement::ALL {
+            expect(&format!(
+                "kimmy_sync_digest_repair_judgements_total{{result=\"{}\"}} {}\n",
+                result.label(),
+                s.sync_digest_repair_judgements[result.index()]
+            ));
+        }
+        for result in kimmy_cluster::RowResult::ALL {
+            expect(&format!(
+                "kimmy_sync_digest_repair_rows_total{{result=\"{}\"}} {}\n",
+                result.label(),
+                s.sync_digest_repair_rows[result.index()]
+            ));
+        }
+        expect(&format!(
+            "kimmy_sync_digest_repair_stopped_collections {}\n",
+            s.sync_digest_repair_stopped_collections
+        ));
+        expect(&format!(
+            "kimmy_sync_divergence_repair_enabled {}\n",
+            s.sync_divergence_repair_enabled
+        ));
         expect(&format!(
             "kimmy_sync_divergence_check_age_seconds {}\n",
             s.sync_divergence_check_age_secs
@@ -4588,7 +4752,14 @@ kimmy_storage_cache_reads_total{result=\"miss\"} 9104
                 // and one line per deferral reason.
                 + 1
                 + 3
-                + kimmy_storage::DefinitionDefer::ALL.len(),
+                + kimmy_storage::DefinitionDefer::ALL.len()
+                // The document repair (repair design section 15.2): its outcomes,
+                // judgements and rows, the stopped gauge and the switch.
+                + kimmy_cluster::DigestRepairOutcome::ALL.len()
+                + kimmy_cluster::Judgement::ALL.len()
+                + kimmy_cluster::RowResult::ALL.len()
+                + 1
+                + 1,
             "expected one sample per series: {out}"
         );
     }
@@ -4763,6 +4934,9 @@ kimmy_storage_cache_reads_total{result=\"miss\"} 9104
             digest_deferred: [0; 12],
             digest_divergent_collections: 0,
             digest_drift_total: 0,
+            repair: kimmy_cluster::RepairCounts::default(),
+            digest_repair_stopped: 0,
+            repair_enabled: false,
             definition_compared: 0,
             definition_explained: 0,
             definition_unanswered: 0,
@@ -4799,6 +4973,9 @@ kimmy_storage_cache_reads_total{result=\"miss\"} 9104
             digest_deferred: [0; 12],
             digest_divergent_collections: 0,
             digest_drift_total: 0,
+            repair: kimmy_cluster::RepairCounts::default(),
+            digest_repair_stopped: 0,
+            repair_enabled: false,
             definition_compared: 0,
             definition_explained: 0,
             definition_unanswered: 0,
@@ -5026,6 +5203,9 @@ kimmy_storage_cache_reads_total{result=\"miss\"} 9104
             digest_deferred: [0; 12],
             digest_divergent_collections: 0,
             digest_drift_total: 0,
+            repair: kimmy_cluster::RepairCounts::default(),
+            digest_repair_stopped: 0,
+            repair_enabled: false,
             definition_compared: 0,
             definition_explained: 0,
             definition_unanswered: 0,

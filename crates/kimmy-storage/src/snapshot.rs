@@ -330,6 +330,14 @@ pub struct SnapshotApplied {
     /// of the pair has applied, design section 13): the lost inserts the pull closed.
     /// Not counted in `applied`. Always 0 under `All`.
     pub created: usize,
+    /// Under [`SnapshotPolicy::Converge`]: of `applied`, the rows (documents and deletes)
+    /// stamped **at or below the cut of the finding that planned the pull**: the ones
+    /// ordinary replication would not have delivered. A repair's progress is these and
+    /// `created_at_cut`, and not the rest, which under live writes are tail rows the
+    /// ordinary route also brings. Always 0 under `All`.
+    pub applied_at_cut: usize,
+    /// Under [`SnapshotPolicy::Converge`]: of `created`, those at or below the cut.
+    pub created_at_cut: usize,
     /// Under [`SnapshotPolicy::Converge`]: the page said the sender no longer
     /// holds the collection (`SnapshotPage::dropped`). Nothing was applied and
     /// the progress did not move; the repair is abandoned, not applied.
@@ -487,6 +495,13 @@ pub struct SnapshotProgress {
     /// restores definitions.
     #[serde(skip)]
     policy: SnapshotPolicy,
+    /// Under [`SnapshotPolicy::Converge`]: the cut of the finding that planned the pull
+    /// (`min` of the two members' witnessed vectors when the digest was compared). A row
+    /// stamped at or below it is one ordinary replication should have delivered already;
+    /// the pull counts those apart ([`SnapshotApplied::applied_at_cut`]), because they
+    /// are the progress of a repair. Never stored; empty for every other pull.
+    #[serde(skip)]
+    cut: VersionVector,
     /// The one collection the snapshot is of, or `None` for the whole
     /// database.
     scope: Option<CollectionId>,
@@ -521,13 +536,14 @@ impl SnapshotProgress {
     /// A scoped snapshot under [`SnapshotPolicy::Converge`], not yet started:
     /// what the document repair of a confirmed digest finding pulls. It is
     /// never persisted, resumed or forgotten, and grants nothing.
-    pub fn of_collection_converging(id: CollectionId) -> Self {
-        SnapshotProgress { policy: SnapshotPolicy::Converge, ..Self::new(Some(id)) }
+    pub fn of_collection_converging(id: CollectionId, cut: VersionVector) -> Self {
+        SnapshotProgress { policy: SnapshotPolicy::Converge, cut, ..Self::new(Some(id)) }
     }
 
     fn new(scope: Option<CollectionId>) -> Self {
         SnapshotProgress {
             policy: SnapshotPolicy::All,
+            cut: VersionVector::default(),
             scope,
             after: None,
             granted: None,
@@ -1137,6 +1153,8 @@ impl Engine {
                 left: 0,
                 left_tombstone: 0,
                 created: 0,
+                applied_at_cut: 0,
+                created_at_cut: 0,
                 sender_dropped: false,
                 purge_pending: None,
             }),
@@ -1180,7 +1198,11 @@ impl Engine {
         let mut left = 0usize;
         let mut left_tombstone = 0usize;
         let mut created = 0usize;
+        let mut applied_at_cut = 0usize;
+        let mut created_at_cut = 0usize;
         let mut failed = None;
+        // At or below the cut of the finding that planned the pull.
+        let at_cut = |stamp: Stamp| stamp.hlc <= progress.cut.get(stamp.node);
         if !page.documents.is_empty() || !page.deleted_documents.is_empty() {
             let mut memo = Memo::default();
             let txn = self.begin_write(WriterHolder::Repair)?;
@@ -1255,10 +1277,14 @@ impl Engine {
                 {
                     if young {
                         created += 1;
+                        created_at_cut += usize::from(at_cut(document.stamp));
+                    } else {
+                        applied_at_cut += usize::from(at_cut(document.stamp));
                     }
                     pending.push(Pending { collection, entry, id, violations });
                 }
             }
+            let documents_applied = pending.len();
             self.apply_carried_document_deletes(
                 &txn,
                 &mut memo,
@@ -1267,6 +1293,8 @@ impl Engine {
                 &mut superseded,
                 Some(&mut left_tombstone),
             )?;
+            applied_at_cut +=
+                pending[documents_applied..].iter().filter(|p| at_cut(p.entry.stamp)).count();
             if pending.is_empty() {
                 txn.abort()?;
             } else {
@@ -1293,6 +1321,8 @@ impl Engine {
                 left,
                 left_tombstone,
                 created,
+                applied_at_cut,
+                created_at_cut,
                 ..Default::default()
             }),
         }

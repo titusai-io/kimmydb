@@ -332,12 +332,23 @@ pub struct DigestRound {
     pub held: usize,
     /// Entries of the peer's answer that did not decode and were dropped.
     pub malformed: usize,
+    /// The cut the collections were compared at: `min(W_A, W_B)`. Empty for a round that
+    /// compared nothing. A document repair counts progress only for rows at or below the
+    /// cut of the finding that planned it (repair design section 4, R3).
+    pub cut: VersionVector,
 }
 
 impl DigestRound {
     /// A round that came to `answered` and nothing else.
     pub fn new(answered: DigestAnswered) -> Self {
-        Self { answered, verdicts: Vec::new(), plan_deferred: Vec::new(), held: 0, malformed: 0 }
+        Self {
+            answered,
+            verdicts: Vec::new(),
+            plan_deferred: Vec::new(),
+            held: 0,
+            malformed: 0,
+            cut: VersionVector::default(),
+        }
     }
 }
 

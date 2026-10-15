@@ -56,7 +56,8 @@ fn held_row(e: &Engine, id: i64) -> bool {
 /// Apply the sender's whole scoped snapshot to `into` under `Converge`, page by page,
 /// returning the sum of what every page reported.
 fn converge(into: &Engine, from: &Engine) -> SnapshotApplied {
-    let mut progress = SnapshotProgress::of_collection_converging(orders());
+    let mut progress =
+        SnapshotProgress::of_collection_converging(orders(), kimmy_core::VersionVector::new());
     assert_eq!(progress.policy(), SnapshotPolicy::Converge);
     let mut total = SnapshotApplied::default();
     while !progress.is_complete() {
@@ -79,7 +80,8 @@ fn converge(into: &Engine, from: &Engine) -> SnapshotApplied {
 /// [`converge`] with the sender's horizon stripped from every page: the young-stamp rule is
 /// off for the pull, as it is against a sender that predates the field.
 fn converge_without_a_horizon(into: &Engine, from: &Engine) -> SnapshotApplied {
-    let mut progress = SnapshotProgress::of_collection_converging(orders());
+    let mut progress =
+        SnapshotProgress::of_collection_converging(orders(), kimmy_core::VersionVector::new());
     let mut total = SnapshotApplied::default();
     while !progress.is_complete() {
         let mut page = from.snapshot_page(progress.after().cloned(), progress.scope()).unwrap();
@@ -195,7 +197,8 @@ fn a_tombstone_the_senders_coverage_does_not_name_is_ignored() {
     a.delete(&coll(&a), &DocId::Int64(1)).unwrap();
     let mut page = a.snapshot_page(None, Some(orders())).unwrap();
     page.versions = kimmy_core::VersionVector::new();
-    let mut progress = SnapshotProgress::of_collection_converging(orders());
+    let mut progress =
+        SnapshotProgress::of_collection_converging(orders(), kimmy_core::VersionVector::new());
     let done = b.apply_snapshot_page(a.node_id(), &mut progress, &page).unwrap();
     assert_eq!(value(&b, 1), Some(1), "an unvouched delete was applied");
     assert_eq!(done.applied, 0);
@@ -274,7 +277,8 @@ fn the_pages_carried_index_drops_are_not_applied() {
     a.drop_index("shop", "orders", "ik").unwrap();
     let page = a.snapshot_page(None, Some(orders())).unwrap();
     assert!(!page.dropped_indexes.is_empty(), "premise: the page carries the drop");
-    let mut progress = SnapshotProgress::of_collection_converging(orders());
+    let mut progress =
+        SnapshotProgress::of_collection_converging(orders(), kimmy_core::VersionVector::new());
     b.apply_snapshot_page(a.node_id(), &mut progress, &page).unwrap();
     assert_eq!(b.list_indexes("shop", "orders").unwrap().len(), 1, "a carried drop was applied");
 }
@@ -288,7 +292,8 @@ fn a_page_that_says_the_sender_dropped_the_collection_applies_nothing() {
     a.replace(&coll(&a), &DocId::Int64(1), doc! { "_id": 1, "v": 2 }, false).unwrap();
     let mut page = a.snapshot_page(None, Some(orders())).unwrap();
     page.dropped = Some(Stamp::new(Hlc::new(1, 0), a.node_id()));
-    let mut progress = SnapshotProgress::of_collection_converging(orders());
+    let mut progress =
+        SnapshotProgress::of_collection_converging(orders(), kimmy_core::VersionVector::new());
     let done = b.apply_snapshot_page(a.node_id(), &mut progress, &page).unwrap();
     assert!(done.sender_dropped);
     assert_eq!(done.applied, 0);
@@ -321,7 +326,8 @@ fn a_converge_pull_persists_no_cursor() {
     for i in 0..(crate::SNAPSHOT_PAGE as i64 + 40) {
         a.replace(&ca, &DocId::Int64(1000 + i), doc! { "_id": 1000 + i, "v": 2 }, false).unwrap();
     }
-    let mut progress = SnapshotProgress::of_collection_converging(orders());
+    let mut progress =
+        SnapshotProgress::of_collection_converging(orders(), kimmy_core::VersionVector::new());
     let page = a.snapshot_page(None, Some(orders())).unwrap();
     assert!(page.next.is_some(), "premise: more than one page");
     let done = b.apply_snapshot_page(a.node_id(), &mut progress, &page).unwrap();
@@ -474,4 +480,90 @@ fn a_created_row_maintains_the_indexes_like_any_replicated_row() {
     )
     .unwrap();
     assert_eq!(entries.len(), 1, "the index does not hold the created row");
+}
+
+// -- Progress is counted against the cut of the finding (repair design section 4, R3) -----
+
+/// [`converge`] under the cut of a finding, returning what the pages counted at it.
+fn converge_at(into: &Engine, from: &Engine, cut: kimmy_core::VersionVector) -> SnapshotApplied {
+    let mut progress = SnapshotProgress::of_collection_converging(orders(), cut);
+    let mut total = SnapshotApplied::default();
+    while !progress.is_complete() {
+        let page = from.snapshot_page(progress.after().cloned(), progress.scope()).unwrap();
+        let done = into.apply_snapshot_page(from.node_id(), &mut progress, &page).unwrap();
+        total.applied += done.applied;
+        total.created += done.created;
+        total.applied_at_cut += done.applied_at_cut;
+        total.created_at_cut += done.created_at_cut;
+    }
+    total
+}
+
+/// Under live writes a pull applies the tail above the finding's cut together with what the
+/// finding was about. Only the rows at or below the cut are the repair's progress: the tail
+/// is what ordinary replication brings as well.
+#[test]
+fn only_rows_at_or_below_the_findings_cut_count_as_progress() {
+    let (a, b, _d) = pair();
+    let ca = coll(&a);
+    a.insert(&ca, doc! { "_id": 1, "v": 1 }).unwrap();
+    a.insert(&ca, doc! { "_id": 2, "v": 1 }).unwrap();
+    pull(&b, &a);
+    later();
+    a.replace(&ca, &DocId::Int64(1), doc! { "_id": 1, "v": 2 }, false).unwrap();
+    let cut = a.witnessed_vector().unwrap();
+    later();
+    // The tail: written after the finding's cut, while the repair is planned.
+    a.replace(&ca, &DocId::Int64(2), doc! { "_id": 2, "v": 2 }, false).unwrap();
+    let done = converge_at(&b, &a, cut);
+    assert_eq!((value(&b, 1), value(&b, 2)), (Some(2), Some(2)));
+    assert_eq!(done.applied, 2, "both rows were applied");
+    assert_eq!(done.applied_at_cut, 1, "one of them is at or below the cut");
+}
+
+#[test]
+fn a_pull_that_applies_only_the_tail_made_no_progress() {
+    let (a, b, _d) = pair();
+    let ca = coll(&a);
+    a.insert(&ca, doc! { "_id": 1, "v": 1 }).unwrap();
+    pull(&b, &a);
+    let cut = a.witnessed_vector().unwrap();
+    later();
+    a.replace(&ca, &DocId::Int64(1), doc! { "_id": 1, "v": 2 }, false).unwrap();
+    let done = converge_at(&b, &a, cut);
+    assert_eq!(done.applied, 1);
+    assert_eq!((done.applied_at_cut, done.created_at_cut), (0, 0));
+}
+
+#[test]
+fn a_delete_at_or_below_the_cut_counts_and_one_above_it_does_not() {
+    let (a, b, _d) = pair();
+    let ca = coll(&a);
+    a.insert(&ca, doc! { "_id": 1, "v": 1 }).unwrap();
+    a.insert(&ca, doc! { "_id": 2, "v": 1 }).unwrap();
+    pull(&b, &a);
+    later();
+    a.delete(&ca, &DocId::Int64(1)).unwrap();
+    let cut = a.witnessed_vector().unwrap();
+    later();
+    a.delete(&ca, &DocId::Int64(2)).unwrap();
+    let done = converge_at(&b, &a, cut);
+    assert!(!held_row(&b, 1) || value(&b, 1).is_none());
+    assert_eq!(done.applied, 2);
+    assert_eq!(done.applied_at_cut, 1);
+}
+
+/// The young lost inserts (design section 13) are counted at the cut the same way.
+#[test]
+fn a_young_lost_insert_at_the_cut_counts_apart_from_one_above_it() {
+    let (a, b, _d) = pair();
+    let ca = coll(&a);
+    a.insert(&ca, doc! { "_id": 1, "v": 1 }).unwrap();
+    let cut = a.witnessed_vector().unwrap();
+    later();
+    a.insert(&ca, doc! { "_id": 2, "v": 1 }).unwrap();
+    // Neither row ever reached b: both are lost inserts, young against b's horizon.
+    let done = converge_at(&b, &a, cut);
+    assert_eq!(done.created, 2);
+    assert_eq!(done.created_at_cut, 1);
 }
