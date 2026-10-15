@@ -329,6 +329,18 @@ impl Engine {
         // while the sweep runs is above the floor, and one minted before is a straggler
         // the chunks still ahead remove.
         self.witness_hlc(dropped.hlc);
+        // What to sweep is read once the clock has passed the drop, under the writer: a
+        // definition minted below the drop before the witness holds the writer until it
+        // commits, and a read before it missed it.
+        let standing = {
+            let txn = self.begin_write(WriterHolder::Drop)?;
+            let standing = read_collection(&txn, db, name)?;
+            txn.abort()?;
+            match standing {
+                Some(standing) if owes_a_sweep(&standing, dropped.hlc) => standing,
+                _ => return Ok(()),
+            }
+        };
         for index in &standing.indexes {
             // A definition in the drop's own `Hlc` is the drop's, from whichever node
             // (ADR-236): the keep and the burial read it so (`hlc > dropped` is
@@ -2113,6 +2125,71 @@ mod tests {
             "A, B, C, D hold orders/1: {held:?}; D's clock {:?} trails its floor {:?}",
             d.clock_last(),
             dropped.hlc
+        );
+    }
+
+    /// The definitions a sweep removes are read once it has passed the clock, under the
+    /// writer (ADR-236 item 6). A local index minted under a clock that trails the drop (a drop
+    /// recorded unwitnessed, the precondition of the sweep's witness), after the tombstone and
+    /// before the witness, and committed after a read taken before it, was not swept: it stood
+    /// at or below the floor on this member alone, and every other member refused its entry
+    /// as the ended life's (`definition_of_an_ended_life`). A record minted in the same window
+    /// is a straggler the chunks remove; a definition is removed only if the read sees it.
+    #[test]
+    fn a_local_index_minted_below_the_drop_while_the_sweep_reads_is_swept() {
+        let (d, _dd) = engine();
+        let orders = d.create_collection("shop", "orders").unwrap();
+        // Enough documents that the index build holds the writer while the sweep reads.
+        let docs: Vec<bson::Document> = (0..50_000i64).map(|i| doc! { "_id": i, "k": i }).collect();
+        d.insert_many(&orders, docs).unwrap();
+        let base = crate::engine::physical_now_ms() + 3_600_000;
+        let dropped = Stamp::new(Hlc::new(base + 150, 0), NodeId::from_bytes([0x01; 16]));
+        // A newer life whose creation this member stored without witnessing it: `created`
+        // above the drop, no floor, and the clock below both.
+        edit_meta(&d, |meta| {
+            meta.created = Hlc::new(base + 300, 0);
+            meta.incarnation_floor = None;
+        });
+        assert!(d.clock_last() < dropped.hlc, "premise: the clock trails the drop");
+        d.record_collection_drop(orders.id, dropped).unwrap();
+        let current = d.get_collection("shop", "orders").unwrap();
+        let d = std::sync::Arc::new(d);
+        let before = d.clock_last();
+        let building = std::sync::Arc::clone(&d);
+        let build = std::thread::spawn(move || {
+            building
+                .create_index(
+                    "shop",
+                    "orders",
+                    vec![kimmy_core::IndexField::ascending("k")],
+                    false,
+                    None,
+                )
+                .unwrap()
+        });
+        // The build has minted its stamp under the writer and is filling the index.
+        while d.clock_last() == before {
+            std::thread::yield_now();
+        }
+        d.sweep_after_an_ignored_drop(&current, dropped).unwrap();
+        let made = build.join().unwrap().created.expect("a local index is stamped");
+        assert!(made.hlc < dropped.hlc, "premise: minted below the drop: {made:?}");
+        let standing = d.get_collection("shop", "orders").unwrap();
+        assert_eq!(standing.incarnation_floor, Some(dropped.hlc), "premise: the sweep ran");
+        let ended: Vec<_> = standing
+            .indexes
+            .iter()
+            .filter(|index| {
+                index.created.is_some_and(|created| {
+                    d.definition_of_an_ended_life(&standing, created).unwrap()
+                })
+            })
+            .map(|index| (index.name.clone(), index.created))
+            .collect();
+        assert!(
+            ended.is_empty(),
+            "an index of the ended life (at or below the floor) stands after the sweep, on \
+             this member alone: {ended:?}"
         );
     }
 }

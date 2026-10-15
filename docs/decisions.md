@@ -27441,7 +27441,11 @@ stamps (its YS1), and F17 from a storm test of the count half (a loop that repla
    the drop's own entry, arriving later, owed no sweep to undo it. **The clock now passes every floor this member
    takes:** at install (the creation's mint), from a page (`restore_collection` witnesses a floor it adopts), and at
    a sweep (`sweep_late_definitions` witnesses the drop before anything is swept, so a write landing while the sweep
-   runs is above the floor, and one minted before it is a straggler the chunks ahead remove).
+   runs is above the floor, and one minted before it is a straggler the chunks ahead remove). The definitions it
+   removes are read after that witness, under the writer (from the review of the second fold-in): a local index or
+   vector configuration minted below the drop before the witness holds the writer until it commits, and a read taken
+   before the witness, without the writer, missed one that committed after it, which then stood at or below the floor
+   on this member alone while every other member refused its entry.
 7. **A burial from a page is named by the drop (F9).** ADR-235's burial, and the present-life sweep its last commit
    added, take the stamp of the tombstone a whole page carries for the drop when it is the drop the floor stands
    for (the floor's own `Hlc`); a whole page applies its carried drops first, so this is the tombstone its sender
