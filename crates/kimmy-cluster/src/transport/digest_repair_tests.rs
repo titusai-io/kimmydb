@@ -25,10 +25,23 @@ fn stalls_at(now: Duration) -> PeerStalls {
     stalls
 }
 
+/// The next contact that hands the peer a repair: a Converge or Definitions repair rests the
+/// contact after it (repair design section 2.6), and these tests are about the loop guard, not
+/// the alternation, so they take as many contacts as it needs.
+fn due(stalls: &mut PeerStalls, peer: NodeId) -> Option<(CollectionId, Repair)> {
+    for _ in 0..3 {
+        stalls.tick_opened();
+        if let Some(due) = stalls.repair_due(peer) {
+            return Some(due);
+        }
+    }
+    None
+}
+
 /// Plan, promote to active, and end as finished: a repair that ran to its end.
 fn run_to_the_end(stalls: &mut PeerStalls, peer: NodeId) {
     assert_eq!(stalls.plan_digest_repair(peer, C, VersionVector::default()), DigestPlan::Planned);
-    assert_eq!(stalls.repair_due(peer), Some((C, Repair::Converge)));
+    assert_eq!(due(stalls, peer), Some((C, Repair::Converge)));
     stalls.repair_finished(peer);
 }
 
@@ -42,7 +55,7 @@ fn a_confirmed_finding_plans_one_converge_repair_and_the_ledger_holds_the_rest()
         DigestPlan::Held(MayPlan::Busy),
         "queued"
     );
-    assert_eq!(stalls.repair_due(p), Some((C, Repair::Converge)));
+    assert_eq!(due(&mut stalls, p), Some((C, Repair::Converge)));
     assert_eq!(
         stalls.plan_digest_repair(p, C, VersionVector::default()),
         DigestPlan::Held(MayPlan::Busy),
@@ -143,7 +156,7 @@ fn a_repair_that_wrote_a_row_lowers_the_level_and_one_that_wrote_none_does_not()
     stalls.set_repair_clock(mins(100), mins(5));
     stalls.retain_digest(p, &BTreeSet::new());
     assert_eq!(stalls.plan_digest_repair(p, C, VersionVector::default()), DigestPlan::Planned);
-    stalls.repair_due(p);
+    due(&mut stalls, p);
     let applied =
         kimmy_storage::SnapshotApplied { applied: 3, applied_at_cut: 3, ..Default::default() };
     stalls.converge_page_applied(p, &applied);
@@ -159,7 +172,7 @@ fn the_tally_is_the_active_repairs_own_and_starts_over_with_the_next() {
     let mut stalls = stalls_at(mins(1));
     let p = node(1);
     assert_eq!(stalls.plan_digest_repair(p, C, VersionVector::default()), DigestPlan::Planned);
-    stalls.repair_due(p);
+    due(&mut stalls, p);
     let page = kimmy_storage::SnapshotApplied { created: 2, left: 1, ..Default::default() };
     stalls.converge_page_applied(p, &page);
     assert_eq!(stalls.repairs[&p].tally.created, 2);
@@ -175,7 +188,7 @@ fn a_whole_database_pull_taking_over_ends_a_queued_and_an_active_repair_as_trans
     let p = node(1);
     let other = CollectionId(8);
     assert_eq!(stalls.plan_digest_repair(p, C, VersionVector::default()), DigestPlan::Planned);
-    stalls.repair_due(p); // C is active
+    due(&mut stalls, p); // C is active
     assert!(stalls.plan_repair(p, other, Repair::Converge)); // `other` queued
     stalls
         .ledger
@@ -207,7 +220,7 @@ fn a_repair_whose_sender_dropped_the_collection_is_transient_not_applied() {
     let mut stalls = stalls_at(mins(1));
     let p = node(1);
     assert_eq!(stalls.plan_digest_repair(p, C, VersionVector::default()), DigestPlan::Planned);
-    stalls.repair_due(p);
+    due(&mut stalls, p);
     stalls.repair_ended_transient(p, Transient::Dropped);
     let counts = stalls.take_repair_counts();
     assert_eq!(counts.digest_repairs[DigestRepairOutcome::Transient.index()], 1);
@@ -299,7 +312,7 @@ fn a_written_collection_with_a_standing_ambiguous_id_climbs_to_the_cap() {
         stalls.set_repair_clock(now, mins(5));
         stalls.retain_digest(p, &BTreeSet::new());
         assert_eq!(stalls.plan_digest_repair(p, C, VersionVector::default()), DigestPlan::Planned);
-        stalls.repair_due(p);
+        due(&mut stalls, p);
         // Five tail rows applied, none at or below the cut.
         let page = kimmy_storage::SnapshotApplied { applied: 5, ..Default::default() };
         stalls.converge_page_applied(p, &page);
@@ -326,7 +339,7 @@ fn a_row_at_the_cut_is_progress_and_lowers_the_level() {
         stalls.set_repair_clock(now, mins(5));
         stalls.retain_digest(p, &BTreeSet::new());
         stalls.plan_digest_repair(p, C, VersionVector::default());
-        stalls.repair_due(p);
+        due(&mut stalls, p);
         stalls.repair_finished(p);
         let Some(Verdict::Ineffective { not_before, .. }) =
             stalls.judge_digest_repair(p, C, Judged::Ineffective)
@@ -338,7 +351,7 @@ fn a_row_at_the_cut_is_progress_and_lowers_the_level() {
     stalls.set_repair_clock(now, mins(5));
     stalls.retain_digest(p, &BTreeSet::new());
     stalls.plan_digest_repair(p, C, VersionVector::default());
-    stalls.repair_due(p);
+    due(&mut stalls, p);
     let page =
         kimmy_storage::SnapshotApplied { applied: 5, applied_at_cut: 1, ..Default::default() };
     stalls.converge_page_applied(p, &page);
@@ -356,14 +369,14 @@ fn the_findings_cut_reaches_the_pull_of_its_own_repair() {
     let mut cut = VersionVector::new();
     cut.insert(node(9), kimmy_core::Hlc::new(5_000, 0));
     assert_eq!(stalls.plan_digest_repair(p, C, cut.clone()), DigestPlan::Planned);
-    assert_eq!(stalls.repair_due(p), Some((C, Repair::Converge)));
+    assert_eq!(due(&mut stalls, p), Some((C, Repair::Converge)));
     let progress = stalls.snapshot_progress(p, Some(C), kimmy_storage::SnapshotPolicy::Converge);
     assert_eq!(progress.cut(), &cut);
     stalls.repair_finished(p);
     // The next repair of another collection, planned for another cut.
     let other = CollectionId(8);
     assert_eq!(stalls.plan_digest_repair(p, other, VersionVector::default()), DigestPlan::Planned);
-    assert_eq!(stalls.repair_due(p), Some((other, Repair::Converge)));
+    assert_eq!(due(&mut stalls, p), Some((other, Repair::Converge)));
     let progress =
         stalls.snapshot_progress(p, Some(other), kimmy_storage::SnapshotPolicy::Converge);
     assert_eq!(progress.cut(), &VersionVector::default());
@@ -373,7 +386,7 @@ fn the_findings_cut_reaches_the_pull_of_its_own_repair() {
 
 fn run_definition_to_the_end(stalls: &mut PeerStalls, peer: NodeId, built: usize) {
     assert_eq!(stalls.plan_definition_repair(peer, C, 1_000), DigestPlan::Planned);
-    assert_eq!(stalls.repair_due(peer), Some((C, Repair::Definitions)));
+    assert_eq!(due(stalls, peer), Some((C, Repair::Definitions)));
     let applied = kimmy_storage::SnapshotApplied {
         definitions: kimmy_storage::DefinitionRestore { built, ..Default::default() },
         ..Default::default()
@@ -444,7 +457,7 @@ fn the_pages_index_results_are_counted_by_result() {
     let mut stalls = stalls_at(mins(1));
     let p = node(1);
     assert_eq!(stalls.plan_definition_repair(p, C, 10), DigestPlan::Planned);
-    stalls.repair_due(p);
+    due(&mut stalls, p);
     let applied = kimmy_storage::SnapshotApplied {
         definitions: kimmy_storage::DefinitionRestore {
             built: 1,
@@ -468,7 +481,7 @@ fn a_whole_database_pull_taking_over_ends_a_definition_repair_as_transient() {
     let mut stalls = stalls_at(mins(1));
     let p = node(1);
     assert_eq!(stalls.plan_definition_repair(p, C, 10), DigestPlan::Planned);
-    stalls.repair_due(p);
+    due(&mut stalls, p);
     // And one still queued.
     assert_eq!(stalls.plan_definition_repair(p, CollectionId(8), 10), DigestPlan::Planned);
     stalls.whole_database_takes_over(p);
@@ -483,7 +496,7 @@ fn the_size_gate_reaches_the_pull_of_its_own_repair() {
     let mut stalls = stalls_at(mins(1));
     let p = node(1);
     assert_eq!(stalls.plan_definition_repair(p, C, 4_321), DigestPlan::Planned);
-    assert_eq!(stalls.repair_due(p), Some((C, Repair::Definitions)));
+    assert_eq!(due(&mut stalls, p), Some((C, Repair::Definitions)));
     let progress = stalls.snapshot_progress(p, Some(C), kimmy_storage::SnapshotPolicy::Definitions);
     assert_eq!(progress.max_index_documents(), 4_321);
 }
@@ -559,7 +572,7 @@ fn a_document_repair_that_left_rows_says_so_and_names_the_first_ids() {
         let mut stalls = stalls_at(mins(1));
         let p = node(1);
         assert_eq!(stalls.plan_digest_repair(p, C, VersionVector::default()), DigestPlan::Planned);
-        stalls.repair_due(p);
+        due(&mut stalls, p);
         let page = kimmy_storage::SnapshotApplied {
             applied: 2,
             applied_at_cut: 2,
@@ -586,7 +599,7 @@ fn a_document_repair_that_left_nothing_raises_no_warning() {
         let mut stalls = stalls_at(mins(1));
         let p = node(1);
         stalls.plan_digest_repair(p, C, VersionVector::default());
-        stalls.repair_due(p);
+        due(&mut stalls, p);
         stalls.repair_finished(p);
     });
     assert!(lines.iter().any(|l| l.contains("a divergence repair ended")));
@@ -599,7 +612,7 @@ fn a_definition_repair_ends_with_what_it_built_and_what_it_skipped_in_one_line()
         let mut stalls = stalls_at(mins(1));
         let p = node(1);
         stalls.plan_definition_repair(p, C, 10);
-        stalls.repair_due(p);
+        due(&mut stalls, p);
         let page = kimmy_storage::SnapshotApplied {
             definitions: kimmy_storage::DefinitionRestore {
                 built: 1,
@@ -623,7 +636,7 @@ fn a_transient_end_is_reported_as_transient() {
         let mut stalls = stalls_at(mins(1));
         let p = node(1);
         stalls.plan_digest_repair(p, C, VersionVector::default());
-        stalls.repair_due(p);
+        due(&mut stalls, p);
         stalls.repair_ended_transient(p, Transient::Dropped);
     });
     let ended = lines.iter().find(|l| l.contains("a divergence repair ended")).unwrap();
@@ -727,8 +740,9 @@ fn a_definition_repair_that_advances_nothing_is_abandoned_and_counted_in_its_own
     let mut stalls = stalls_at(mins(1));
     let p = node(1);
     assert_eq!(stalls.plan_definition_repair(p, C, 10), DigestPlan::Planned);
-    for _ in 0..=REPAIR_ATTEMPTS {
-        stalls.repair_due(p);
+    // Every second contact hands the repair out (the others rest).
+    for _ in 0..2 * (REPAIR_ATTEMPTS + 1) {
+        contact(&mut stalls, p);
     }
     let counts = stalls.take_repair_counts();
     assert_eq!(counts.definition_repairs[DigestRepairOutcome::Abandoned.index()], 1);

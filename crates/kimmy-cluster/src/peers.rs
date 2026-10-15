@@ -1050,8 +1050,8 @@ pub async fn replicate(engine: Arc<Engine>, config: ReplicationConfig) {
                     for (key, verdict) in stalls.expire_repairs() {
                         log_repair_verdict(key.peer, key.collection, verdict);
                     }
-                    stalls.retain_ledger(held, members.as_ref());
-                    divergence.retain_members(members.as_ref());
+                    let known = stalls.retain_ledger(held, members.as_ref());
+                    divergence.retain_members(known.as_ref());
                 }
                 if let Err(e) = &mine_collections {
                     warn!(error = %e, "divergence check: could not list this node's own \
@@ -2191,6 +2191,10 @@ fn plan_definition_repairs(
                 %peer,
                 node = %node,
                 collection = %collection,
+                kind = "definition",
+                episodes = finding.episodes,
+                window_secs = crate::repair_ledger::EPISODE_WINDOW.as_secs(),
+                stopped_for_secs = crate::repair_ledger::STOP_FOR.as_secs(),
                 "a divergence recurs after repair; repair of this collection is stopped"
             );
         }
@@ -2245,6 +2249,10 @@ fn plan_digest_repairs(
                 %peer,
                 node = %node,
                 collection = %collection,
+                kind = "digest",
+                episodes = finding.episodes,
+                window_secs = crate::repair_ledger::EPISODE_WINDOW.as_secs(),
+                stopped_for_secs = crate::repair_ledger::STOP_FOR.as_secs(),
                 "a divergence recurs after repair; repair of this collection is stopped"
             );
         }
@@ -2297,7 +2305,7 @@ fn log_repair_verdict(
                 debug!(node = %peer, collection = %collection, level, "a divergence repair did not clear the finding");
             }
         }
-        Verdict::Effective | Verdict::Transient => {}
+        Verdict::TransientClimb { .. } | Verdict::Effective | Verdict::Transient => {}
     }
 }
 
@@ -4928,7 +4936,7 @@ mod definition_fold_tests {
             "definition_state.prune(held, members.as_ref())",
             "stalls.retain_definition_detail(members.as_ref(), held)",
             "stalls.retain_ledger(held, members.as_ref())",
-            "divergence.retain_members(members.as_ref())",
+            "divergence.retain_members(known.as_ref())",
             "stalls.expire_repairs()",
         ] {
             assert_eq!(code.matches(call).count(), 1, "{call}: once in the code");

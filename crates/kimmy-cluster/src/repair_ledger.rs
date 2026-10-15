@@ -11,14 +11,17 @@
 //! One entry per `(peer, collection, kind)`. The rules, numbered as the design
 //! numbers them:
 //!
-//! * **R1** a transient end changes nothing but the planner's cooldown;
+//! * **R1** a transient end changes nothing but the planner's cooldown, until three of them
+//!   follow one another for one key: that climbs one level, so a failure that repeats for
+//!   ever backs off instead of costing a pull at every cooldown;
 //! * **R2** a repair is judged at the first *compared* probe after its end, and
 //!   only there; one never judged by its deadline counts as transient, but every
 //!   second consecutive such end climbs one step;
 //! * **R3** an ineffective repair backs off, 5 min, 15 min, 45 min, 2 h 15 min,
 //!   6 h, and one that made progress lowers the level to 1;
 //! * **R4** more than three episodes of clear-and-recur in a rolling hour stop
-//!   the collection, and the stop expires;
+//!   the collection (per kind), and the stop expires; only episodes of *different peers*
+//!   within the window count as one;
 //! * **R5** only a confirmed, un-stopped, un-backed-off finding plans, and not
 //!   while a repair is in flight or awaiting its probe;
 //! * **R7** [`RepairLedger::retain`] prunes by the held collections and the
@@ -82,13 +85,22 @@ pub struct Params {
     pub rotation: Duration,
 }
 
+/// The longest the de-duplication window of R4 is, whatever the member's collection count: the
+/// window is three rotation periods, and a rotation is a tick per held collection, so on a
+/// member with many collections three rotations would be longer than the rolling hour the
+/// episodes are counted in.
+pub const MAX_DEDUPE: Duration = Duration::from_secs(15 * 60);
+
+/// Consecutive transient ends of one key after which it climbs one level (R1).
+pub const TRANSIENT_CLIMB_EVERY: u32 = 3;
+
 impl Params {
     fn deadline(self) -> Duration {
         (self.rotation * 3).max(MIN_PROBE_DEADLINE)
     }
 
     fn dedupe(self) -> Duration {
-        self.rotation * 3
+        (self.rotation * 3).min(MAX_DEDUPE)
     }
 }
 
@@ -146,6 +158,11 @@ pub enum Verdict {
     },
     /// Ended transiently, or never judged by its deadline and not climbing.
     Transient,
+    /// A third transient end in a row for one key.
+    TransientClimb {
+        level: u8,
+        not_before: Duration,
+    },
     /// Never judged by its deadline, and this was the second in a row.
     UnjudgedClimb {
         level: u8,
@@ -161,6 +178,8 @@ pub struct Confirmed {
     pub episode: bool,
     /// This episode took the collection over the limit: it is now stopped.
     pub newly_stopped: bool,
+    /// How many episodes the rolling hour holds, this one included.
+    pub episodes: usize,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -177,18 +196,26 @@ struct Entry {
     phase: Phase,
     /// Consecutive repairs that ended unjudged (R2).
     unjudged_run: u32,
+    /// Consecutive repairs that ended transient (R1).
+    transient_run: u32,
 }
 
 impl Entry {
     fn new() -> Self {
-        Entry { level: 0, not_before: Duration::ZERO, phase: Phase::Idle, unjudged_run: 0 }
+        Entry {
+            level: 0,
+            not_before: Duration::ZERO,
+            phase: Phase::Idle,
+            unjudged_run: 0,
+            transient_run: 0,
+        }
     }
 }
 
 #[derive(Clone, Debug, Default)]
 struct CollectionState {
-    /// Counted episodes, oldest first.
-    episodes: Vec<Duration>,
+    /// Counted episodes, oldest first, with the peer each was of.
+    episodes: Vec<(Duration, NodeId)>,
     /// Until when the collection is stopped.
     stopped_until: Option<Duration>,
     /// The last time a finding against the collection was confirmed.
@@ -202,10 +229,12 @@ struct CollectionState {
 pub struct RepairLedger {
     params: Params,
     entries: BTreeMap<Key, Entry>,
-    /// A `(peer, collection)` whose repair cleared the finding, so the next
-    /// confirmation of it is a recurrence (R4). The value is when it cleared.
-    armed: BTreeMap<(NodeId, CollectionId), Duration>,
-    collections: BTreeMap<CollectionId, CollectionState>,
+    /// A `(peer, collection, kind)` whose repair cleared the finding, so the next
+    /// confirmation of it is a recurrence (R4). The value is when it cleared. Keyed by kind: a
+    /// digest repair that cleared its finding is no episode of a definition finding that stands.
+    armed: BTreeMap<Key, Duration>,
+    /// R4's state, per collection and kind.
+    collections: BTreeMap<(CollectionId, LedgerKind), CollectionState>,
 }
 
 impl Default for RepairLedger {
@@ -221,10 +250,11 @@ impl RepairLedger {
         self.params.rotation = rotation;
     }
 
-    /// How many collections are stopped for recurring at `now` (the gauge).
-    pub fn stopped_collections(&mut self, now: Duration) -> usize {
-        let ids: Vec<_> = self.collections.keys().copied().collect();
-        ids.into_iter().filter(|id| self.is_stopped(*id, now)).count()
+    /// How many collections are stopped for recurring at `now`, for one kind (the gauge).
+    pub fn stopped_collections(&mut self, kind: LedgerKind, now: Duration) -> usize {
+        let ids: Vec<_> =
+            self.collections.keys().filter(|(_, k)| *k == kind).map(|(id, _)| *id).collect();
+        ids.into_iter().filter(|id| self.is_stopped(*id, kind, now)).count()
     }
 
     pub fn new(params: Params) -> Self {
@@ -238,8 +268,10 @@ impl RepairLedger {
 
     /// R5: whether a repair for `key` may be planned at `now`.
     pub fn may_plan(&mut self, key: Key, now: Duration) -> MayPlan {
-        self.rearm(key.collection, now);
-        if let Some(until) = self.collections.get(&key.collection).and_then(|c| c.stopped_until) {
+        self.rearm(key.collection, key.kind, now);
+        if let Some(until) =
+            self.collections.get(&(key.collection, key.kind)).and_then(|c| c.stopped_until)
+        {
             return MayPlan::Stopped(until);
         }
         match self.entries.get(&key) {
@@ -259,20 +291,32 @@ impl RepairLedger {
 
     /// The repair for `key` ended (R1, R2, R3). Only a repair that was started
     /// ends; anything else is ignored, so a late event cannot invent state.
-    pub fn ended(&mut self, key: Key, now: Duration, end: End) {
+    pub fn ended(&mut self, key: Key, now: Duration, end: End) -> Option<Verdict> {
         let deadline = self.params.deadline();
-        let Some(entry) = self.entries.get_mut(&key) else {
-            return;
-        };
+        let entry = self.entries.get_mut(&key)?;
         if entry.phase != Phase::InFlight {
-            return;
+            return None;
         }
-        entry.phase = match end {
-            End::Transient(_) => Phase::Idle,
-            End::Finished { progress } => {
-                Phase::Awaiting { ended_at: now, deadline: now + deadline, progress }
+        match end {
+            End::Transient(_) => {
+                entry.phase = Phase::Idle;
+                entry.transient_run += 1;
+                // A failure that repeats for ever backs off: the third in a row climbs.
+                if entry.transient_run.is_multiple_of(TRANSIENT_CLIMB_EVERY) {
+                    entry.level = (entry.level + 1).min(MAX_LEVEL);
+                    entry.not_before = now + BACKOFF[usize::from(entry.level) - 1];
+                    return Some(Verdict::TransientClimb {
+                        level: entry.level,
+                        not_before: entry.not_before,
+                    });
+                }
             }
-        };
+            End::Finished { progress } => {
+                entry.transient_run = 0;
+                entry.phase = Phase::Awaiting { ended_at: now, deadline: now + deadline, progress };
+            }
+        }
+        None
     }
 
     /// R2: the first compared probe after the end of `key`'s repair said
@@ -284,11 +328,12 @@ impl RepairLedger {
         };
         entry.phase = Phase::Idle;
         entry.unjudged_run = 0;
+        entry.transient_run = 0;
         Some(match judged {
             Judged::Effective => {
                 entry.level = 0;
                 entry.not_before = Duration::ZERO;
-                self.armed.insert((key.peer, key.collection), now);
+                self.armed.insert(key, now);
                 Verdict::Effective
             }
             Judged::Ineffective => {
@@ -297,19 +342,6 @@ impl RepairLedger {
                 Verdict::Ineffective { level: entry.level, not_before: entry.not_before }
             }
         })
-    }
-
-    /// A clear of `key`'s finding arrived. Within the deadline of a repair that
-    /// is still awaiting its probe, the repair is recorded retroactively as
-    /// effective (R2, R4); otherwise nothing.
-    pub fn cleared(&mut self, key: Key, now: Duration) -> Option<Verdict> {
-        let entry = self.entries.get(&key)?;
-        match entry.phase {
-            Phase::Awaiting { deadline, .. } if now <= deadline => {
-                self.judge(key, now, Judged::Effective)
-            }
-            _ => None,
-        }
     }
 
     /// R2: end every repair whose deadline has passed unjudged. Returns the
@@ -347,30 +379,38 @@ impl RepairLedger {
     /// it is an episode (R4).
     pub fn confirmed(&mut self, key: Key, now: Duration) -> Confirmed {
         let dedupe = self.params.dedupe();
-        let state = self.collections.entry(key.collection).or_default();
+        let state = self.collections.entry((key.collection, key.kind)).or_default();
         state.last_confirmed = Some(now);
-        if self.armed.remove(&(key.peer, key.collection)).is_none() {
-            return Confirmed::default();
+        state.episodes.retain(|(at, _)| now.saturating_sub(*at) < EPISODE_WINDOW);
+        let held = state.episodes.len();
+        if self.armed.remove(&key).is_none() {
+            return Confirmed { episodes: held, ..Confirmed::default() };
         }
-        // Different peers' episodes within the de-duplication window are one.
-        if state.episodes.last().is_some_and(|last| now.saturating_sub(*last) < dedupe) {
-            return Confirmed { episode: false, newly_stopped: false };
+        // An episode of a different peer, counted within the de-duplication window, is the
+        // same episode: a partition that heals on five members yields one effective repair per
+        // peer, and that is one recurrence. The same peer's recurrence always counts: it is a
+        // loop, and a member with many collections (a long rotation) must still stop it.
+        let same_event = state
+            .episodes
+            .iter()
+            .any(|(at, peer)| *peer != key.peer && now.saturating_sub(*at) < dedupe);
+        if same_event {
+            return Confirmed { episode: false, newly_stopped: false, episodes: held };
         }
-        state.episodes.retain(|at| now.saturating_sub(*at) < EPISODE_WINDOW);
-        state.episodes.push(now);
+        state.episodes.push((now, key.peer));
         let mut newly_stopped = false;
         if state.episodes.len() > MAX_EPISODES && state.stopped_until.is_none() {
             state.stopped_until = Some(now + STOP_FOR);
             state.stopped_at = Some(now);
             newly_stopped = true;
         }
-        Confirmed { episode: true, newly_stopped }
+        Confirmed { episode: true, newly_stopped, episodes: state.episodes.len() }
     }
 
     /// R4: a stopped collection re-arms after [`STOP_FOR`], or once no finding
     /// against it has been confirmed for [`STOP_CLEAR_FOR`], whichever is first.
-    fn rearm(&mut self, collection: CollectionId, now: Duration) {
-        let Some(state) = self.collections.get_mut(&collection) else {
+    fn rearm(&mut self, collection: CollectionId, kind: LedgerKind, now: Duration) {
+        let Some(state) = self.collections.get_mut(&(collection, kind)) else {
             return;
         };
         let Some(until) = state.stopped_until else {
@@ -388,9 +428,14 @@ impl RepairLedger {
     }
 
     /// Whether the collection is stopped at `now`.
-    pub fn is_stopped(&mut self, collection: CollectionId, now: Duration) -> bool {
-        self.rearm(collection, now);
-        self.collections.get(&collection).is_some_and(|c| c.stopped_until.is_some())
+    pub fn is_stopped(
+        &mut self,
+        collection: CollectionId,
+        kind: LedgerKind,
+        now: Duration,
+    ) -> bool {
+        self.rearm(collection, kind, now);
+        self.collections.get(&(collection, kind)).is_some_and(|c| c.stopped_until.is_some())
     }
 
     /// R7: drop everything about a peer that is no longer a member (`members` is `None`
@@ -399,19 +444,11 @@ impl RepairLedger {
     pub fn retain(&mut self, held: &BTreeSet<CollectionId>, members: Option<&BTreeSet<NodeId>>) {
         let member = |peer: &NodeId| members.is_none_or(|members| members.contains(peer));
         self.entries.retain(|key, _| held.contains(&key.collection) && member(&key.peer));
-        self.armed.retain(|(peer, collection), _| held.contains(collection) && member(peer));
-        self.collections.retain(|collection, _| held.contains(collection));
-    }
-
-    /// The number of entries per level, for the gauge (§15.2).
-    pub fn levels(&self, kind: LedgerKind) -> [usize; MAX_LEVEL as usize + 1] {
-        let mut out = [0; MAX_LEVEL as usize + 1];
-        for (key, entry) in &self.entries {
-            if key.kind == kind {
-                out[usize::from(entry.level)] += 1;
-            }
-        }
-        out
+        self.armed.retain(|key, _| held.contains(&key.collection) && member(&key.peer));
+        self.collections.retain(|(collection, _), state| {
+            state.episodes.retain(|(_, peer)| member(peer));
+            held.contains(collection)
+        });
     }
 
     /// Entries held, for the prune test.

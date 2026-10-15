@@ -3038,6 +3038,10 @@ pub struct PeerStalls {
     /// The time the ledger judges by, as a duration since the loop started, set by the
     /// loop at the start of each tick ([`Self::set_repair_clock`]).
     repair_clock: Duration,
+    /// When each member was last in the live member list, as `repair_clock`: a member the
+    /// live list lacks for less than [`MEMBER_GRACE`] is a member that is down, not removed
+    /// (R7), and its loop-guard state stays.
+    members_seen: BTreeMap<NodeId, Duration>,
     /// What the document repair counted since the loop last took it.
     repair_counts: RepairCounts,
     /// Peers that have sent a repair page with no tombstone horizon (a build before it), said
@@ -3258,6 +3262,17 @@ pub enum RepairKind {
     Definition,
 }
 
+impl Repairs {
+    /// Take what the active repair accumulated, leaving the next repair a clean slate.
+    fn take_end_data(&mut self) -> EndData {
+        EndData {
+            tally: std::mem::take(&mut self.tally),
+            left_ids: std::mem::take(&mut self.left_ids),
+            definitions: std::mem::take(&mut self.definitions),
+        }
+    }
+}
+
 impl RepairKind {
     /// The loop guard's kind for a repair that has one (the count half has none).
     fn ledger(self) -> Option<LedgerKind> {
@@ -3448,17 +3463,15 @@ fn log_repair_end(
     peer: NodeId,
     collection: CollectionId,
     kind: RepairKind,
-    transient: Option<Transient>,
-    tally: &Tally,
-    left_ids: &[kimmy_core::DocId],
-    definitions: &kimmy_storage::DefinitionRestore,
+    outcome: DigestRepairOutcome,
+    data: &EndData,
 ) {
-    let outcome = if transient.is_some() { "transient" } else { "applied" };
+    let (tally, left_ids, definitions) = (&data.tally, &data.left_ids, &data.definitions);
+    let outcome = outcome.label();
     match kind {
         RepairKind::Digest => {
             let first_ids: Vec<String> = left_ids.iter().map(ToString::to_string).collect();
             info!(
-                node = %peer,
                 peer = %peer,
                 collection = %collection,
                 kind = "digest",
@@ -3473,7 +3486,7 @@ fn log_repair_end(
             );
             if tally.left > 0 {
                 warn!(
-                    node = %peer,
+                    peer = %peer,
                     collection = %collection,
                     left = tally.left,
                     first_ids = ?first_ids,
@@ -3492,7 +3505,6 @@ fn log_repair_end(
                 + definitions.gone
                 + definitions.too_large;
             info!(
-                node = %peer,
                 peer = %peer,
                 collection = %collection,
                 kind = "definition",
@@ -3569,6 +3581,15 @@ impl Tally {
     fn made_progress(&self) -> bool {
         self.applied_at_cut + self.created_at_cut > 0
     }
+}
+
+/// What the repair under way accumulated, taken when it ends so the line that reports its end
+/// is its own and the next repair against the peer starts clean.
+#[derive(Debug, Default)]
+struct EndData {
+    tally: Tally,
+    left_ids: Vec<kimmy_core::DocId>,
+    definitions: kimmy_storage::DefinitionRestore,
 }
 
 /// Why a document repair was not planned (the planner's answer to a confirmed finding).
@@ -3678,6 +3699,11 @@ fn converge_round_pages() -> usize {
     }
     CONVERGE_ROUND_PAGES
 }
+
+/// How long a member may be absent from the live member list before the loop guard forgets it
+/// (R7). Long enough for a restart, a partition or a maintenance window; a removed member's
+/// state is a few bytes and goes after it.
+pub const MEMBER_GRACE: Duration = Duration::from_secs(12 * 3600);
 
 /// Rounds a repair may be handed out for without advancing before it is
 /// abandoned and takes the cooldown (ADR-148).
@@ -4123,7 +4149,7 @@ impl PeerStalls {
 
     /// Collections the loop guard has stopped for recurring (a gauge).
     pub fn stopped_collections(&mut self) -> usize {
-        self.ledger.stopped_collections(self.repair_clock)
+        self.ledger.stopped_collections(LedgerKind::Digest, self.repair_clock)
     }
 
     /// Whether this is the first repair page `peer` has sent with no tombstone horizon.
@@ -4291,14 +4317,31 @@ impl PeerStalls {
         expired
     }
 
-    /// R7: forget the ledger's entries for collections no longer held and peers no longer
-    /// members.
+    /// R7: forget the loop guard's state for collections no longer held and for members that
+    /// were removed. `live` is the cluster's live member list, which SWIM shrinks the moment
+    /// a member is marked down (a restart, a six-second cut); a member is removed only when
+    /// it has been absent from it for [`MEMBER_GRACE`], so a peer that is down for a tick
+    /// keeps its level, back-off and arm. Returns the members to keep (the live ones and the
+    /// ones in grace) for the tracker's pruning, or `None` when there is no member list.
     pub fn retain_ledger(
         &mut self,
         held: &BTreeSet<CollectionId>,
-        members: Option<&BTreeSet<NodeId>>,
-    ) {
-        self.ledger.retain(held, members);
+        live: Option<&BTreeSet<NodeId>>,
+    ) -> Option<BTreeSet<NodeId>> {
+        let known = live.map(|live| {
+            let now = self.repair_clock;
+            for peer in live {
+                self.members_seen.insert(*peer, now);
+            }
+            self.members_seen.retain(|_, seen| now.saturating_sub(*seen) < MEMBER_GRACE);
+            self.members_seen.keys().copied().collect::<BTreeSet<NodeId>>()
+        });
+        self.ledger.retain(held, known.as_ref());
+        if let Some(known) = &known {
+            self.no_horizon_said.retain(|peer| known.contains(peer));
+            self.repairs.retain(|peer, _| known.contains(peer));
+        }
+        known
     }
 
     /// The document repair against `peer` for `collection` ended as `end`, counted as
@@ -4310,7 +4353,14 @@ impl PeerStalls {
         end: End,
         outcome: DigestRepairOutcome,
     ) {
-        self.repair_ended_as(peer, collection, RepairKind::Digest, end, outcome);
+        self.repair_ended_as(
+            peer,
+            collection,
+            RepairKind::Digest,
+            end,
+            outcome,
+            EndData::default(),
+        );
     }
 
     /// A repair with a ledger entry ended as `end`, counted in its kind's series.
@@ -4321,10 +4371,12 @@ impl PeerStalls {
         kind: RepairKind,
         end: End,
         outcome: DigestRepairOutcome,
+        data: EndData,
     ) {
         let Some(ledger_kind) = kind.ledger() else {
             return;
         };
+        log_repair_end(peer, collection, kind, outcome, &data);
         match ledger_kind {
             LedgerKind::Digest => self.repair_counts.digest_repairs[outcome.index()] += 1,
             LedgerKind::Definition => {
@@ -4332,7 +4384,17 @@ impl PeerStalls {
             }
         }
         let key = LedgerKey { peer, collection, kind: ledger_kind };
-        self.ledger.ended(key, self.repair_clock, end);
+        if let Some(Verdict::TransientClimb { level, not_before }) =
+            self.ledger.ended(key, self.repair_clock, end)
+        {
+            warn!(
+                peer = %peer,
+                collection = %collection,
+                level,
+                not_before_secs = not_before.as_secs(),
+                "a divergence repair has ended without a result three times running; backing off"
+            );
+        }
     }
 
     /// A definition repair's page applied: the indexes it built and skipped are counted, and
@@ -4392,7 +4454,9 @@ impl PeerStalls {
     pub fn repair_due(&mut self, peer: NodeId) -> Option<(CollectionId, Repair)> {
         let repairs = self.repairs.get_mut(&peer)?;
         // Repairs with a ledger entry that this call ends, for the loop guard.
-        let mut ended: Vec<(CollectionId, RepairKind)> = Vec::new();
+        let mut ended: Vec<(CollectionId, RepairKind, EndData)> = Vec::new();
+        // Queued Converge repairs a count repair of their collection made redundant.
+        let mut redundant: Vec<CollectionId> = Vec::new();
         // Once per contact, not once per pull: a draining tick asks this
         // several times, and the cooldown below is a constant argued in
         // minutes (ADR-157). The stall accounting under it stays per pull,
@@ -4407,12 +4471,13 @@ impl PeerStalls {
             repairs.handed = false;
             repairs.resting = std::mem::take(&mut repairs.rest_next);
         }
-        // A Converge repair under way waits out the contact after its pull, and a second pull
-        // in the contact that had one is an ordinary pull. Nothing is counted as stalled: the
-        // repair was not handed out.
-        if matches!(repairs.active, Some((_, Repair::Converge)))
-            && (repairs.resting || repairs.handed)
-        {
+        // The alternation is per peer, not per repair (repair design section 2.6): after any
+        // Converge or Definitions pull to this peer the next contact is an ordinary one,
+        // whichever repair comes next, and a second pull of the contact that had one is
+        // ordinary too. Nothing is counted as stalled: the repair was not handed out. (A
+        // count repair is not alternated; ADR-148.)
+        let ordinary = repairs.resting || repairs.handed;
+        if ordinary && matches!(repairs.active, Some((_, Repair::Converge | Repair::Definitions))) {
             return None;
         }
         // A repair handed out on the previous round and neither advanced
@@ -4440,7 +4505,7 @@ impl PeerStalls {
                 );
                 repairs.done.insert((collection, abandoned.kind()), 0);
                 if abandoned.kind() != RepairKind::Count {
-                    ended.push((collection, abandoned.kind()));
+                    ended.push((collection, abandoned.kind(), repairs.take_end_data()));
                 }
                 repairs.stalled = 0;
                 repairs.advanced = false;
@@ -4459,16 +4524,35 @@ impl PeerStalls {
             let whole_pending = self.snapshots.get(&peer).is_some_and(|progress| {
                 progress.scope().is_none() && !progress.is_complete() && progress.pages() > 0
             });
-            let next = repairs
-                .queued
-                .keys()
-                .copied()
-                .find(|(_, kind)| !(whole_pending && *kind != RepairKind::Count));
+            let keys: Vec<_> = repairs.queued.keys().copied().collect();
+            let mut next = None;
+            for (collection, kind) in keys {
+                // A document or definition repair waits for the whole-database pull, and for
+                // the contact that is ordinary.
+                if kind != RepairKind::Count && (whole_pending || ordinary) {
+                    continue;
+                }
+                // The count gate again, at promotion: a Converge queued before a count repair
+                // of the same collection was planned would run beside it, for nothing.
+                if kind == RepairKind::Digest
+                    && (repairs.done.contains_key(&(collection, RepairKind::Count))
+                        || repairs.queued.contains_key(&(collection, RepairKind::Count)))
+                {
+                    repairs.queued.remove(&(collection, kind));
+                    repairs.cuts.remove(&collection);
+                    redundant.push(collection);
+                    continue;
+                }
+                next = Some((collection, kind));
+                break;
+            }
             repairs.active =
                 next.and_then(|key| repairs.queued.remove(&key).map(|repair| (key.0, repair)));
             repairs.stalled = 0;
             repairs.advanced = false;
             repairs.tally = Tally::default();
+            repairs.left_ids.clear();
+            repairs.definitions = Default::default();
             repairs.active_cut = match repairs.active {
                 Some((collection, Repair::Converge)) => {
                     repairs.cuts.remove(&collection).unwrap_or_default()
@@ -4483,18 +4567,29 @@ impl PeerStalls {
             };
         }
         let active = repairs.active;
-        if matches!(active, Some((_, Repair::Converge))) {
+        if matches!(active, Some((_, Repair::Converge | Repair::Definitions))) {
             // Handed out: this contact has had its pull and the next one rests.
             repairs.handed = true;
             repairs.rest_next = true;
         }
-        for (collection, kind) in ended {
+        for (collection, kind, data) in ended {
             self.repair_ended_as(
                 peer,
                 collection,
                 kind,
                 End::Transient(Transient::Abandoned),
                 DigestRepairOutcome::Abandoned,
+                data,
+            );
+        }
+        for collection in redundant {
+            self.repair_ended_as(
+                peer,
+                collection,
+                RepairKind::Digest,
+                End::Transient(Transient::Cancelled),
+                DigestRepairOutcome::SkippedCountRepair,
+                EndData::default(),
             );
         }
         active
@@ -4591,11 +4686,11 @@ impl PeerStalls {
         // get a round and reset the whole-database cursor to page one, so with k queued
         // the catch-up would restart k times. They are re-planned when the finding is
         // reported again, after the pull.
-        let mut ended: Vec<(CollectionId, RepairKind)> = repairs
+        let mut ended: Vec<(CollectionId, RepairKind, EndData)> = repairs
             .queued
             .keys()
             .filter(|(_, kind)| *kind != RepairKind::Count)
-            .map(|(collection, kind)| (*collection, *kind))
+            .map(|(collection, kind)| (*collection, *kind, EndData::default()))
             .collect();
         repairs.queued.retain(|(_, kind), _| *kind == RepairKind::Count);
         repairs.cuts.clear();
@@ -4607,7 +4702,7 @@ impl PeerStalls {
             repairs.done.insert((collection, active.kind()), 0);
             repairs.stalled = 0;
             repairs.advanced = false;
-            ended.push((collection, active.kind()));
+            ended.push((collection, active.kind(), repairs.take_end_data()));
             warn!(
                 node = %peer,
                 collection = %collection,
@@ -4616,13 +4711,14 @@ impl PeerStalls {
                  cooldown passes"
             );
         }
-        for (collection, kind) in ended {
+        for (collection, kind, data) in ended {
             self.repair_ended_as(
                 peer,
                 collection,
                 kind,
                 End::Transient(Transient::WholeDatabaseTookOver),
                 DigestRepairOutcome::Transient,
+                data,
             );
         }
     }
@@ -4668,6 +4764,7 @@ impl PeerStalls {
                 kind,
                 End::Transient(Transient::Cancelled),
                 DigestRepairOutcome::Transient,
+                EndData::default(),
             );
         }
         total
@@ -4696,36 +4793,26 @@ impl PeerStalls {
             // next repair planned for this peer.
             repairs.advanced = false;
             if finished.kind() != RepairKind::Count {
-                ledger_end = Some((collection, finished.kind(), repairs.tally));
-                log_repair_end(
-                    peer,
-                    collection,
-                    finished.kind(),
-                    transient,
-                    &repairs.tally,
-                    &repairs.left_ids,
-                    &repairs.definitions,
-                );
+                ledger_end = Some((collection, finished.kind(), repairs.take_end_data()));
+            } else {
+                repairs.take_end_data();
             }
-            repairs.tally = Tally::default();
-            repairs.left_ids.clear();
-            repairs.definitions = Default::default();
             if self.snapshots.get(&peer).is_some_and(|p| p.scope() == Some(collection)) {
                 self.snapshots.remove(&peer);
             }
         }
-        if let Some((collection, kind, tally)) = ledger_end {
+        if let Some((collection, kind, data)) = ledger_end {
             let (end, outcome) = match transient {
                 Some(why) => (End::Transient(why), DigestRepairOutcome::Transient),
                 None => {
                     let progress = match kind {
-                        RepairKind::Definition => tally.built > 0,
-                        _ => tally.made_progress(),
+                        RepairKind::Definition => data.tally.built > 0,
+                        _ => data.tally.made_progress(),
                     };
                     (End::Finished { progress }, DigestRepairOutcome::Applied)
                 }
             };
-            self.repair_ended_as(peer, collection, kind, end, outcome);
+            self.repair_ended_as(peer, collection, kind, end, outcome, data);
         }
     }
 
@@ -5797,6 +5884,9 @@ mod replay_tests;
 
 #[cfg(test)]
 mod digest_repair_tests;
+
+#[cfg(test)]
+mod repair_review_tests;
 
 #[cfg(test)]
 mod tests {

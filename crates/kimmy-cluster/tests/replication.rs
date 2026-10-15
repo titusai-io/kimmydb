@@ -10481,3 +10481,55 @@ async fn a_member_that_is_catching_up_plans_no_repair() {
     assert_eq!(totals.digest_repairs[DigestRepairOutcome::Applied.index()], 0, "{totals:?}");
     assert_eq!(last.digest_divergent_collections, 1);
 }
+
+// ---------------------------------------------------------------------------
+// kimmy_sync_repair_rounds_total is narrowed to the count half (design v3.5 sections 7
+// item 3 and 15.2): a repair of the other two kinds must not move it.
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn a_document_repair_does_not_move_the_count_halfs_repair_rounds() {
+    use kimmy_cluster::{DigestRepairOutcome, Judgement};
+    let (a, b, _ca) = a_and_b_with_a_lost_update().await;
+    let rounds = std::cell::Cell::new(0usize);
+    let (totals, _) = repair_loop(
+        &a,
+        &b,
+        |_| {},
+        |report, totals| {
+            rounds.set(rounds.get() + report.repair_rounds);
+            totals.digest_judgements[Judgement::Effective.index()] >= 1
+        },
+    )
+    .await;
+    assert!(totals.digest_repairs[DigestRepairOutcome::Applied.index()] >= 1, "{totals:?}");
+    assert_eq!(
+        rounds.get(),
+        0,
+        "kimmy_sync_repair_rounds_total counted {} rounds of a document repair",
+        rounds.get()
+    );
+}
+
+#[tokio::test]
+async fn a_definition_repair_does_not_move_the_count_halfs_repair_rounds() {
+    use kimmy_cluster::DefinitionJudgement;
+    let (a, b) = a_and_b_with_a_lost_index().await;
+    let rounds = std::cell::Cell::new(0usize);
+    let _ = repair_loop(
+        &a,
+        &b,
+        |_| {},
+        |report, totals| {
+            rounds.set(rounds.get() + report.repair_rounds);
+            totals.definition_judgements[DefinitionJudgement::Effective.index()] >= 1
+        },
+    )
+    .await;
+    assert_eq!(
+        rounds.get(),
+        0,
+        "kimmy_sync_repair_rounds_total counted {} rounds of a definition repair",
+        rounds.get()
+    );
+}

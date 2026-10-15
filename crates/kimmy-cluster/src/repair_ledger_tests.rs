@@ -67,6 +67,7 @@ fn a_transient_end_changes_nothing_and_does_not_hold_planning() {
         Transient::WholeDatabaseTookOver,
         Transient::Gone,
     ] {
+        l.entries.get_mut(&k).unwrap().transient_run = 0;
         l.ended(k, at, End::Transient(t));
         let after = l.entries[&k];
         assert_eq!(after.level, 2, "{t:?} leaves the level");
@@ -230,17 +231,18 @@ fn the_deadline_is_three_rotation_periods_or_thirty_minutes_whichever_is_longer(
 }
 
 #[test]
-fn a_clear_within_the_deadline_is_recorded_as_effective_and_after_it_is_nothing() {
+fn a_match_within_the_deadline_is_effective_and_arms_the_pair_and_after_it_is_nothing() {
     let mut l = ledger();
     let k = key(1, 1);
     run(&mut l, k, mins(0), false);
-    assert_eq!(l.cleared(k, mins(20)), Some(Verdict::Effective));
+    assert_eq!(l.judge(k, mins(20), Judged::Effective), Some(Verdict::Effective));
     assert_eq!(l.may_plan(k, mins(20)), MayPlan::Yes);
     // It armed the pair: the next confirmation is an episode.
     assert!(l.confirmed(k, mins(25)).episode);
-    // Past the deadline the repair is unjudged, and a clear is nothing.
+    // Past the deadline the repair is unjudged, and a late match judges nothing.
     run(&mut l, k, mins(40), false);
-    assert_eq!(l.cleared(k, mins(80)), None);
+    l.expire(mins(80));
+    assert_eq!(l.judge(k, mins(80), Judged::Effective), None);
 }
 
 #[test]
@@ -274,7 +276,7 @@ fn episodes_of_different_peers_for_one_collection_are_one() {
         }
     }
     assert_eq!(counted, 1);
-    assert!(!l.is_stopped(CollectionId(7), mins(10)));
+    assert!(!l.is_stopped(CollectionId(7), LedgerKind::Digest, mins(10)));
 }
 
 fn recur(l: &mut RepairLedger, peer: u128, collection: u64, at: Duration) -> Confirmed {
@@ -310,10 +312,14 @@ fn more_than_three_episodes_in_an_hour_stop_the_collection_and_the_stop_expires(
         t += mins(30);
         l.confirmed(k, t);
         if t < stopped_at + mins(6 * 60 - 1) {
-            assert!(l.is_stopped(CollectionId(3), t), "still stopped at +{:?}", t - stopped_at);
+            assert!(
+                l.is_stopped(CollectionId(3), LedgerKind::Digest, t),
+                "still stopped at +{:?}",
+                t - stopped_at
+            );
         }
     }
-    assert!(!l.is_stopped(CollectionId(3), stopped_at + STOP_FOR));
+    assert!(!l.is_stopped(CollectionId(3), LedgerKind::Digest, stopped_at + STOP_FOR));
     assert_eq!(l.may_plan(k, stopped_at + STOP_FOR), MayPlan::Yes);
 }
 
@@ -328,8 +334,11 @@ fn a_stopped_collection_is_rearmed_by_an_hour_without_a_confirmed_finding() {
         }
     }
     let stopped_at = stopped_at.unwrap();
-    assert!(l.is_stopped(CollectionId(3), stopped_at + mins(59)));
-    assert!(!l.is_stopped(CollectionId(3), stopped_at + mins(61)), "an hour clear re-arms");
+    assert!(l.is_stopped(CollectionId(3), LedgerKind::Digest, stopped_at + mins(59)));
+    assert!(
+        !l.is_stopped(CollectionId(3), LedgerKind::Digest, stopped_at + mins(61)),
+        "an hour clear re-arms"
+    );
     // Re-armed with its episodes forgotten, and a recurrence stops it again.
     let mut again = false;
     for i in 0..4u64 {
@@ -346,7 +355,7 @@ fn three_episodes_in_an_hour_do_not_stop_and_old_episodes_fall_out_of_the_window
     }
     // A fourth an hour after the first: the first has left the window.
     assert!(!recur(&mut l, 1, 3, mins(61)).newly_stopped);
-    assert!(!l.is_stopped(CollectionId(3), mins(62)));
+    assert!(!l.is_stopped(CollectionId(3), LedgerKind::Digest, mins(62)));
 }
 
 #[test]
@@ -363,7 +372,7 @@ fn retain_drops_removed_peers_and_dropped_collections_and_their_repairs() {
     l.retain(&held, Some(&members));
     assert_eq!(l.entries.keys().copied().collect::<Vec<_>>(), vec![keep, key(3, 1)]);
     assert_eq!(l.armed.len(), 1);
-    assert!(l.collections.is_empty() || l.collections.keys().all(|c| held.contains(c)));
+    assert!(l.collections.is_empty() || l.collections.keys().all(|(c, _)| held.contains(c)));
     // A dropped collection's stop goes with it.
     let members: BTreeSet<_> = [node(1)].into();
     l.retain(&BTreeSet::new(), Some(&members));
@@ -376,7 +385,6 @@ fn a_late_event_for_a_pair_that_never_started_invents_no_state() {
     let k = key(1, 1);
     l.ended(k, mins(1), End::Finished { progress: true });
     assert_eq!(l.judge(k, mins(2), Judged::Ineffective), None);
-    assert_eq!(l.cleared(k, mins(3)), None);
     assert!(l.expire(mins(99)).is_empty());
     assert!(l.is_empty());
 }
@@ -401,8 +409,6 @@ mod model {
         Contact,
         /// The finding for pair `p` is confirmed.
         Confirm(u8),
-        /// The finding for pair `p` clears.
-        Clear(u8),
         /// Peer `p` is removed, or collection `c` dropped (R7).
         Prune(u8),
         /// A restart: everything forgotten (R6).
@@ -425,7 +431,6 @@ mod model {
             4 => (0u8..6, any::<bool>()).prop_map(|(p, m)| Ev::Probe(p, m)),
             2 => Just(Ev::Contact),
             3 => (0u8..6).prop_map(Ev::Confirm),
-            2 => (0u8..6).prop_map(Ev::Clear),
             1 => (0u8..6).prop_map(Ev::Prune),
             1 => Just(Ev::Restart),
         ]
@@ -451,8 +456,19 @@ mod model {
     #[derive(Clone, Copy)]
     enum Outcome {
         Effective,
-        Ineffective { progress: bool, ended: Duration },
-        Unjudged { progress: bool, ended: Duration, deadline: Duration },
+        Ineffective {
+            progress: bool,
+            ended: Duration,
+        },
+        Unjudged {
+            progress: bool,
+            ended: Duration,
+            deadline: Duration,
+        },
+        /// A repair that ended without a result (R1).
+        Transient {
+            ended: Duration,
+        },
     }
 
     impl Hist {
@@ -461,19 +477,31 @@ mod model {
             let mut level = 0u8;
             let mut not_before = Duration::ZERO;
             let mut run = 0u32;
+            let mut transient = 0u32;
             for o in &self.outcomes {
                 match *o {
                     Outcome::Effective => {
                         level = 0;
                         not_before = Duration::ZERO;
                         run = 0;
+                        transient = 0;
                     }
                     Outcome::Ineffective { progress, ended } => {
                         level = if progress { 1 } else { (level + 1).min(5) };
                         not_before = ended + BACKOFF[usize::from(level) - 1];
                         run = 0;
+                        transient = 0;
+                    }
+                    Outcome::Transient { ended } => {
+                        // The third in a row climbs one level (R1).
+                        transient += 1;
+                        if transient % 3 == 0 {
+                            level = (level + 1).min(5);
+                            not_before = ended + BACKOFF[usize::from(level) - 1];
+                        }
                     }
                     Outcome::Unjudged { progress, ended, deadline } => {
+                        transient = 0;
                         run += 1;
                         if progress {
                             level = level.min(1);
@@ -518,7 +546,7 @@ mod model {
                     let may = l.may_plan(k, now);
                     // The reference says when planning is allowed.
                     let (_, not_before) = h.state(now);
-                    let stopped = l.is_stopped(k.collection, now);
+                    let stopped = l.is_stopped(k.collection, LedgerKind::Digest, now);
                     let expected_yes =
                         !h.in_flight && h.awaiting.is_none() && now >= not_before && !stopped;
                     assert_eq!(may == MayPlan::Yes, expected_yes, "may_plan at {now:?}: {may:?}");
@@ -541,6 +569,7 @@ mod model {
                     match kind {
                         EndKind::Transient => {
                             l.ended(k, now, End::Transient(Transient::PeerError));
+                            h.outcomes.push(Outcome::Transient { ended: now });
                         }
                         EndKind::Plain | EndKind::Progress => {
                             let progress = matches!(kind, EndKind::Progress);
@@ -569,20 +598,6 @@ mod model {
                 Ev::Contact => {}
                 Ev::Confirm(p) => {
                     l.confirmed(pair(p), now);
-                }
-                Ev::Clear(p) => {
-                    let k = pair(p);
-                    let got = l.cleared(k, now);
-                    let h = hist.entry(k).or_default();
-                    if let Some((_, deadline, _)) = h.awaiting
-                        && now <= deadline
-                    {
-                        assert!(got.is_some());
-                        h.awaiting = None;
-                        h.outcomes.push(Outcome::Effective);
-                    } else {
-                        assert!(got.is_none());
-                    }
                 }
                 Ev::Prune(p) => {
                     let gone_peer = u128::from(p % 3) + 1;
@@ -635,4 +650,115 @@ mod model {
             run_model(events);
         }
     }
+}
+
+// -- R4 and R1 after review (revB) ---------------------------------------------------------------
+
+/// A one-peer loop is stopped however long the member's rotation is: the same peer's
+/// recurrence always counts, and the window that merges *different* peers' episodes is
+/// capped, so a member with many collections is not blind to a loop.
+#[test]
+fn a_one_peer_loop_on_a_member_with_many_collections_is_stopped() {
+    let mut l = RepairLedger::new(Params { rotation: Duration::from_secs(5 * 100) });
+    let k = key(1, 3);
+    let mut stopped_at = None;
+    let mut t = mins(0);
+    while t < mins(120) && stopped_at.is_none() {
+        run(&mut l, k, t, true);
+        l.judge(k, t + Duration::from_secs(10), Judged::Effective);
+        if l.confirmed(k, t + mins(2)).newly_stopped {
+            stopped_at = Some(t);
+        }
+        t += mins(3);
+    }
+    let stopped_at = stopped_at.expect("never stopped");
+    assert!(stopped_at < mins(30), "stopped only at {stopped_at:?}");
+}
+
+#[test]
+fn only_episodes_of_different_peers_within_the_window_are_one_and_the_window_is_capped() {
+    let mut l = RepairLedger::new(Params { rotation: mins(60) });
+    // Two peers heal together: one episode, however long the rotation.
+    for peer in [1u128, 2] {
+        let k = key(peer, 7);
+        run(&mut l, k, mins(0), false);
+        l.judge(k, mins(1), Judged::Effective);
+    }
+    assert!(l.confirmed(key(1, 7), mins(2)).episode);
+    assert!(!l.confirmed(key(2, 7), mins(3)).episode, "another peer's, inside the window");
+    // The same two peers recurring an hour later are two episodes, not merged by a three-hour
+    // rotation window: the window is capped at a quarter of an hour.
+    for peer in [1u128, 2] {
+        let k = key(peer, 7);
+        run(&mut l, k, mins(60), false);
+        l.judge(k, mins(61), Judged::Effective);
+    }
+    assert!(l.confirmed(key(1, 7), mins(62)).episode);
+    assert!(l.confirmed(key(2, 7), mins(100)).episode, "outside the capped window");
+}
+
+/// The arm and the stop belong to a kind: a digest repair that cleared its finding is no
+/// episode of a definition finding that stands, and a stopped digest repair does not stop
+/// the definition repair.
+#[test]
+fn the_arm_and_the_stop_are_per_kind() {
+    let mut l = ledger();
+    let digest = key(1, 3);
+    let definition = Key { kind: LedgerKind::Definition, ..digest };
+    run(&mut l, digest, mins(0), true);
+    l.judge(digest, mins(1), Judged::Effective);
+    assert!(!l.confirmed(definition, mins(1)).episode, "a digest repair armed a definition key");
+    assert!(l.confirmed(digest, mins(2)).episode);
+    // Stop the digest kind; the definition kind still plans.
+    for i in 0..3u64 {
+        let t = mins(20 + i * 16);
+        run(&mut l, digest, t, true);
+        l.judge(digest, t, Judged::Effective);
+        l.confirmed(digest, t + mins(1));
+    }
+    assert!(l.is_stopped(CollectionId(3), LedgerKind::Digest, mins(90)));
+    assert!(!l.is_stopped(CollectionId(3), LedgerKind::Definition, mins(90)));
+    assert_eq!(l.may_plan(definition, mins(90)), MayPlan::Yes);
+    assert_eq!(l.stopped_collections(LedgerKind::Digest, mins(90)), 1);
+    assert_eq!(l.stopped_collections(LedgerKind::Definition, mins(90)), 0);
+}
+
+#[test]
+fn the_third_transient_end_in_a_row_climbs_one_level_and_a_result_in_between_resets_the_run() {
+    let mut l = ledger();
+    let k = key(1, 1);
+    let mut t = mins(0);
+    let mut transient = |l: &mut RepairLedger, t: &mut Duration| -> Option<Verdict> {
+        assert_eq!(l.may_plan(k, *t), MayPlan::Yes, "at {t:?}");
+        l.started(k, *t);
+        l.ended(k, *t, End::Transient(Transient::PeerError))
+    };
+    assert_eq!(transient(&mut l, &mut t), None);
+    t += mins(6);
+    assert_eq!(transient(&mut l, &mut t), None);
+    t += mins(6);
+    let climbed = transient(&mut l, &mut t);
+    assert_eq!(
+        climbed,
+        Some(Verdict::TransientClimb { level: 1, not_before: t + BACKOFF[0] }),
+        "the third in a row"
+    );
+    // Held for the back-off, then three more climb again.
+    assert!(matches!(l.may_plan(k, t + mins(1)), MayPlan::BackOff(_)));
+    t += BACKOFF[0];
+    for _ in 0..2 {
+        assert_eq!(transient(&mut l, &mut t), None);
+        t += mins(6);
+    }
+    assert!(matches!(transient(&mut l, &mut t), Some(Verdict::TransientClimb { level: 2, .. })));
+    // A repair that ran to its end and was judged resets the run: two more do not climb.
+    t += BACKOFF[1];
+    run(&mut l, k, t, true);
+    l.judge(k, t, Judged::Effective);
+    t += mins(6);
+    for _ in 0..2 {
+        assert_eq!(transient(&mut l, &mut t), None);
+        t += mins(6);
+    }
+    assert_eq!(l.entries[&k].level, 0);
 }
