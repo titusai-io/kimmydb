@@ -87,6 +87,14 @@ const STOP_AWARE_WALKS: &[&str] = &[
 /// `(file::function, why it cannot hold a stop up)`.
 const BOUNDED_READS: &[(&str, &str)] = &[
     (
+        "database_tombstone::Engine::record_database_tombstone_in",
+        "the dropped-collection registry, one row per drop, read once when a database's tombstone is raised (ADR-236)",
+    ),
+    (
+        "late_drop::Engine::nothing_is_stamped_after",
+        "one seek: whether a collection with no digest row holds any record at all (ADR-236)",
+    ),
+    (
         "watch::Engine::creation_arrival",
         "the entries stamped at one instant, one per node that stamped there: a seek, not a walk",
     ),
