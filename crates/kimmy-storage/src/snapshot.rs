@@ -2634,6 +2634,53 @@ mod tests {
         crate::sync::race_hooks::assert_absorbed(crate::sync::race_hooks::Race::VectorHistory);
     }
 
+    /// And by the drop's tombstone, not by the floor alone (ADR-236): a tombstone at or
+    /// above the page's configuration that lands after the page was judged, as a drop's
+    /// first commit leaves it before its sweep takes the floor, makes the configuration
+    /// history when it is applied.
+    #[test]
+    fn a_tombstone_that_lands_before_a_pages_vector_configuration_applies_makes_it_history() {
+        let (a, _da) = engine();
+        let (b, _db) = engine();
+        let b = std::sync::Arc::new(b);
+        a.create_collection("shop", "orders").unwrap();
+        let theirs = a.version_vector().unwrap();
+        let created = a.entries_for_peer(Hlc::ZERO, 1_024, crate::WalkScope::Background).unwrap();
+        b.apply_peer_batch(&theirs, &created.entries, created.scanned_to, created.exhausted)
+            .unwrap();
+        a.configure_vectors(
+            "shop",
+            "orders",
+            VectorConfig {
+                fields: vec!["text".into()],
+                provider: kimmy_core::ProviderConfig::Byo {},
+                dim: 4,
+                metric: Default::default(),
+                document_prefix: None,
+                query_prefix: None,
+                chunk: Default::default(),
+            },
+        )
+        .unwrap();
+        let mut page = a.snapshot_page(None, None).unwrap();
+        page.collections.retain(|state| state.name == "orders");
+        let changed = page.collections[0].vector_changed.expect("premise: a dated page");
+        let orders = CollectionId::derive("shop", "orders");
+        let above = Stamp::new(
+            Hlc::new(changed.hlc.wall_ms + 1, 0),
+            kimmy_core::NodeId::from_bytes([7; 16]),
+        );
+        let landing = std::sync::Arc::clone(&b);
+        let (restored, ()) = crate::sync::race_hooks::race(
+            crate::sync::race_hooks::Race::RestoreDefinitions,
+            move || landing.record_collection_drop(orders, above).unwrap(),
+            || b.apply_snapshot_page(a.node_id(), &mut SnapshotProgress::whole_database(), &page),
+        );
+        restored.expect("the page applies");
+        let held = b.get_collection("shop", "orders").unwrap();
+        assert!(held.vector.is_none(), "a configuration of an ended life: {:?}", held.vector);
+    }
+
     #[test]
     fn a_pages_vector_configuration_makes_no_shadow_the_shadow_has_its_own_page() {
         // A page's configuration used to mint the shadow here, at this
