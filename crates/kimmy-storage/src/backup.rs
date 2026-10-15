@@ -375,6 +375,13 @@ pub fn restore_with(
                     // this one, which this build's redb writes; it is recorded
                     // below as this build's (ADR-190).
                     T_META if key.as_slice() == crate::format::META_REDB_VERSION.as_bytes() => {}
+                    // And the tombstone horizon of the source: the restoring build writes
+                    // the sidecar, so a stale key would look current. The restored store
+                    // starts with none, which the first open reads as its own start time
+                    // (design 13.1). The restored identity has forgotten every delete it
+                    // applied after the backup, and nothing else covers one no peer holds.
+                    T_META
+                        if key.as_slice() == crate::tables::META_TOMBSTONE_HORIZON.as_bytes() => {}
                     T_META => {
                         meta.insert(as_str(&key)?, value.as_slice())?;
                     }

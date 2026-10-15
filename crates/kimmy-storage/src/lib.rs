@@ -18,6 +18,7 @@ pub mod codec;
 mod database_tombstone;
 pub mod definition_digest;
 pub mod definition_probe;
+mod definition_repair;
 pub mod digest_probe;
 pub mod divergence;
 pub mod docs;
@@ -32,6 +33,8 @@ pub mod gc;
 pub mod health;
 pub mod hold_meter;
 pub mod index;
+#[cfg(feature = "lab-hooks")]
+pub mod lab_hooks;
 mod late_drop;
 mod live_count;
 pub mod live_digest;
@@ -47,6 +50,7 @@ pub mod snapshot;
 mod store_lock;
 pub mod sync;
 pub mod tables;
+mod tombstone_horizon;
 pub mod vectors;
 pub mod verified;
 pub mod violations_table;
@@ -64,6 +68,20 @@ mod key_walk_tests;
 
 #[cfg(test)]
 mod database_drop_tests;
+
+#[cfg(test)]
+mod converge_tests;
+
+#[cfg(test)]
+mod definition_repair_tests;
+
+#[cfg(test)]
+mod tombstone_horizon_tests;
+
+// The break-the-guard tests of the repair build's third review: the never-resurrect schedules
+// and the random-history oracle.
+#[cfg(test)]
+mod revc_break_tests;
 
 #[cfg(test)]
 mod keep_later_writes_tests;
@@ -93,6 +111,9 @@ mod convergence_model_tests;
 mod later_life_stop_tests;
 
 #[cfg(test)]
+mod young_stamp_model_tests;
+
+#[cfg(test)]
 mod log_capture;
 #[cfg(feature = "test-hooks")]
 pub use live_walk::stop_open_after_rows_for_test;
@@ -103,6 +124,7 @@ pub use definition_probe::{
     DefinitionAnswered, DefinitionAsk, DefinitionDefer, DefinitionEntry, DefinitionOutcome,
     DefinitionReply, DefinitionRound, DefinitionVerdict, WireDefinition, WireRefusal,
 };
+pub use definition_repair::{DEFINITION_RESULTS, DefinitionRestore};
 pub use digest_probe::{
     ANSWER_KEY_BYTES, ASK_KEY_BYTES, Defer, DigestAnswered, DigestAsk, DigestEntry, DigestOutcome,
     DigestPlan, DigestReply, DigestRound, DigestVerdict, SCAN_BYTES, SCAN_WALL, ScanBudget,
@@ -138,8 +160,8 @@ pub use open_progress::{
 pub use purge::PurgeCounters;
 pub use refusal_hint::{HintKind, RefusalHint};
 pub use snapshot::{
-    CollectionState, SNAPSHOT_PAGE, ServeVerdict, SnapshotApplied, SnapshotCursor, SnapshotDoc,
-    SnapshotPage, SnapshotProgress, SnapshotTombstone,
+    CollectionState, LEFT_IDS_NAMED, SNAPSHOT_PAGE, ServeVerdict, SnapshotApplied, SnapshotCursor,
+    SnapshotDoc, SnapshotPage, SnapshotPolicy, SnapshotProgress, SnapshotTombstone,
 };
 pub use sync::{
     EntryWait, MarkedRange, PeerWindow, PullTiming, SyncOutcome, UnknownCollection, WindowEnd,

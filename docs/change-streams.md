@@ -360,9 +360,13 @@ over for the life of the resumed stream, including writes that reach the member
 later.
 
 **The one case it cannot see.** A divergence repair appends entries the member's
-witnessed vector already claimed ([ADR-148](decisions.md)), and a token issued
-after that claim passes over them wherever it resumes. A repair follows a
+witnessed vector already claimed ([ADR-148](decisions.md), and since 0.50.0 the
+document repair of a cut-digest finding, [ADR-237](decisions.md)), and a token
+issued after that claim passes over them wherever it resumes. A repair follows a
 divergence the check has already reported (`kimmy_sync_divergent_collections`).
+A row a repair writes is published as a `replace`, whether it is a newer version
+of a document the member held or a young lost insert (a snapshot page builds
+every document as a replace).
 
 **How long a resume takes to answer.** On the member that issued the token,
 finding the start is one lookup. On any other member, two searches race and the

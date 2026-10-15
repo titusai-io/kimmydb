@@ -27678,3 +27678,186 @@ a thousand records a commit: 17 ms for 10,000 records, 172 ms for 100,000 and 51
 record) on the entry route, and the same at start (`reconcile_database_tombstones`), as a collection's own drop with a
 later write already costs.
 
+## ADR-237 — The divergence check repairs what it finds: documents by value over rows held, one plain index by name, and a loop guard that judges every repair
+
+> **Amends [ADR-230](#adr-230--the-cut-digest-a-kept-xor-per-collection-compared-at-the-cut-two-members-have-both-processed-finds-the-lost-update-the-count-cannot-see)
+> and [ADR-232](#adr-232--the-definition-digest-a-hash-of-what-a-collections-indexes-and-vector-configuration-say-compared-at-the-cut-two-members-share-finds-the-schema-drift-no-count-and-no-document-digest-can-see)**,
+> whose findings were detect-only. Adds three `cluster.*` keys and nine series, a persisted metadata key
+> (`gc:tombstone_horizon`), one optional field on the snapshot page (`tombstone_horizon`), and the `lab-hooks` cargo feature.
+> Not a rollback boundary: a 0.49.0 binary ignores the key and the field. A config that names the new `cluster.*` keys
+> is refused by 0.49.0 (`ClusterConfig` denies unknown keys), so remove them before rolling back. (The number is fixed at merge.)
+
+**The case.** 0.48.0 and 0.49.0 find a document updated on one member and not on the other, and an index one member
+lacks, and then do nothing. The first finding in a lab round was a real divergence nothing closed. The repair must
+close the cases it can prove safe, leave the rest to the operator in words, and never run for ever or hide a bug.
+
+**Decision.**
+
+1. **The document repair** is a scoped snapshot of the one collection under `SnapshotPolicy::Converge`, **documents
+   only, applied over rows this member already holds**. A row is written only if strictly newer than the row held (live
+   or tombstone); a delete only over a live document it out-stamps; an id this member holds **nothing for** is `left`
+   and logged, unless it is **young** (point 3), when it is written and counted `created`. No definition is restored,
+   nothing is dropped, no vector state is touched, no cursor is stored, no coverage is granted, and the one tombstone
+   it records is a **strictly newer delete over a tombstone it already holds** (the stamp is named by the sender's own
+   coverage, ADR-163; no document is brought back and no row written; without it a live row stamped between the two
+   deletes, taken later from a third member, would show until a later repair); a bare tombstone where nothing is held
+   is never recorded (ADR-228's reason stands). **A delete learned by repair is not relayed by that member's next
+   repair**: its coverage of the origin does not name the stamp (ADR-163 is kept, since relaying would grant coverage of
+   history the member did not receive), so a member that lost the delete is healed by a repair from the original
+   deleter, and with the origin gone the finding between the two stands for the operator. Nothing is resurrected either way. The cursor of a Converge pull is in memory only, keyed by scope and policy.
+2. **Planned from the digest finding, not the count finding.** `confirmed_against` (the count half) never sees a digest
+   or definition finding and `retain_repaired` never clears one (tests and mutation rows pin it); the digest and the
+   definition series have `digest_confirmed_against`, `definition_confirmed_against`, `retain_digest` and
+   `retain_definition`. The planner is keyed `(collection, kind)` with `kind` in `Count`, `Digest`, `Definition`. A
+   digest repair is not planned beside a count repair of the collection (the replay lands what it would;
+   `skipped_count_repair`), nor for a peer with a whole-database pull pending (the in-memory progress holds one entry per
+   peer), nor while this member or the peer is catching up, and a whole-database pull that starts for the peer abandons
+   its active and queued repairs as transient. **The catching-up marker F18 can leave standing (ADR-236: a page that
+   withholds a later definition of a life it refuses) holds both repairs too**, on that member and on every peer
+   repairing from it, for as long as the marker stands: within retention it clears once the stop clears, past it it
+   lasts for good (the F7/B1 wedge), and so does the hold. **One way only runs the other way: a compared-equal cut digest quiets a
+   suspended count finding.** A count finding whose latest probe the gate deferred is *suspended* (ADR-236): confirmed
+   for the gauge, planning nothing. While this member takes writes a peer that trails it and moves defers every probe,
+   so the finding, and `kimmy_sync_divergent_collections` with it, would stand for as long as the writes go on after
+   the two hold the same documents (in the storm of the review, the gauge read 2 for the rest of the run, with the
+   digests of both collections comparing equal on every contact). `DivergenceTracker::observe_digest(.., equal)` now
+   **quiets** a suspended finding of the **same peer and collection**: it leaves the confirmed set and the gauge and
+   plans nothing, but stays *reported* (`reported_against`), so `retain_repaired` keeps the cooldown of the repair it
+   planned, and a peer that stops and moves in turn is still repaired at most once per `REPAIR_COOLDOWN_ROUNDS`
+   contacts (ADR-236 item 10); clearing the finding outright forgot the cooldown and repaired such a peer at every stop
+   (26 repairs in 130 contacts, review rrD M1). The next compared count probe decides the pair: a match clears it, a
+   mismatch confirms it again. Nothing else is quieted: not a finding the count probe itself last compared (that probe is
+   its own evidence), not another pair, not a digest the contact did not compare (silence is not reconciliation), and
+   never a plan: a digest mismatch confirms no count finding and a digest finding plans a digest repair only. The
+   separation this point states is kept; the digest only takes a finding off the gauge.
+3. **The young-stamp rule rests on a persisted collected-through horizon.** A lost insert (an insert this member never
+   received) and a deleted document whose tombstone was collected look the same to a member that holds nothing for the
+   id. A row is written only if its stamp is **newer than every tombstone cutoff either member of the pair has
+   applied**: `created > max(own_horizon, sender_horizon)`. The horizon is the cutoff of the last retention pass that
+   collected something, **raised inside each removing transaction of all three collectors** (document tombstones,
+   collection and database tombstones, index tombstones; a source guard fails the build if one does not), monotone
+   (`max(stored, cutoff)`), and read **inside the page's own write transaction**, so a pass that commits between plan
+   and page cannot leave the page judging with a horizon that has not moved while the tombstone is gone. It is kept in
+   `META`, **reset at open to `max(stored, start)` whenever the prior sidecar was written by another build or none**
+   (every upgrade and rollback; a build that did not maintain the key may have collected without raising it), by a
+   restore, and for an absent key (never read as zero). The sender sends its horizon on every page it serves, read in or
+   after the walk the page's rows came from; **absent from a sender that predates it, the rule is off for the pull**. A
+   completed whole-database snapshot adopts `max(own, the page's)` in the completing page's transaction. Soundness is
+   pairwise (the convergence model test, a separate change, checks it against the union of both members' ghost
+   histories); a third member's collected delete is the ADR-085 window. **Two more removals are covered.** (a) The
+   **burial** of a life (the sweep's end for a re-dated life, its covered fast path, a database drop's burial, an
+   ordinary drop) removes every record of the life in the purge that follows, and the life can hold a tombstone stamped
+   *after* the drop, which no floor covers (a delete of a write made after the drop): `bury_standing_in_txn` raises
+   the horizon to the highest stamp the life held, in the burial's commit, when that is above the drop (a local drop
+   mints above the life's creation and this member's clock, so for a life it witnessed it raises nothing; a row a page
+   stored without witnessing it (ADR-233's trade) can stand above that mint, and the raise then fires, which is the
+   conservative outcome); a source guard pins it. Found by the young-stamp model test (YS1). The
+   count repair's scoped page writes the same row back, which is ADR-231's question for the convergence work, not this
+   change's. (b) **A restore's reset covers deletes stamped at or below the restore's own wall clock, not "every
+   delete it applied after the backup"** (YS2): a member whose HLC leads its wall clock because a fast peer's clock
+   reached it can have deleted above the reset. This is a stated limit and no mechanism is added: the repair loses
+   nothing the restore had not already lost (a plain pull brings the row back from the restored vector), and a
+   restored member is marked catching up, which holds both repairs until the catch-up has delivered the row by
+   entries. **Cost, stated:** after every upgrade there is a young-repair dead time, and a restore's too.
+4. **The definition repair** is the first page only of a scoped snapshot under `SnapshotPolicy::Definitions`, documents
+   ignored, building **at most one plain index this member lacks by name and a peer holds**. Per index, in order: held by
+   name under another definition is `rival`; `unique` and `ttl` are left (building the first can refuse documents, the
+   second deletes them); no stamp, or at or below the standing life's incarnation floor, is `history`; a local index
+   tombstone made after the index is `tombstoned`; **at or below the horizon is `ambiguous`** (the index analogue of the
+   rule above: `INDEXES_DROPPED` is collected on the same window, and a plain index this member dropped and a peer missed
+   the drop of would otherwise be rebuilt); and the survivors are chosen **before the writer is taken**, so an older
+   ambiguous index cannot spend the repair's one build. The decision is judged again under the writer by the creation's
+   own closure (floor, tombstone, **name held now**, horizon), so a drop or a rival that landed since wins. It never
+   removes an index and never supersedes a held one. Gated by `cluster.repair_max_index_documents` on this member's own
+   count, read again immediately before the build. A refused definition (ADR-123) is classified as the ordinary route
+   classifies it: counted, hinted, and the next comparison is `explained`.
+5. **The loop guard** (a pure state machine, `repair_ledger.rs`, one entry per `(peer, collection, kind)`, in memory;
+   a restart forgets it). **R1** a transient end (a `dropped` page, an abandon, a whole-database takeover, a
+   cancellation while queued, a definition page that does not carry the collection) changes nothing but the cooldown, **except that
+   every abandon (three rounds that landed nothing) and every `dropped` page climbs one level, and the third consecutive
+   transient end of any other kind for one `(peer, collection, kind)` climbs one** (a failure that repeats by itself,
+   such as a page that always faults, is not allowed to retry at the cooldown for ever; a peer whose Converge rounds
+   always fail is repaired on the back-off schedule, about eight times a day; a repair that
+   ran to its end and was judged resets the run). **Accepted deviation from the design's R1, which has a
+   transient end change nothing but the cooldown:** an abandon or a `dropped` page climbs a level **every time**, other
+   transient causes (a whole-database takeover, a cancellation while queued, a definition page without the
+   collection) only on the **third in a row**. A peer error or a stop is none of them: it ends a round, not the repair,
+   and reaches the ledger as an abandon after three rounds in a row that landed nothing, which climbs at once. An abandon is already three rounds that landed nothing, and a `dropped`
+   page is the sender answering that it holds a drop of the collection: repeating either at the cooldown
+   is the loop the guard exists to end, and a transient cause that is rare by itself (one stop in a restart) must not
+   climb. The cost is that a sender whose pages are *sometimes* dropped is repaired on the back-off schedule (5 min, 15
+   min, 45 min, 2 h 15 min, 6 h) from the first of them; a repair that ran to its end and was judged resets the run. **R2** a repair is judged at the first *compared* probe after its end
+   and only there; an unjudged deadline (three rotation periods, at least 30 minutes) counts as transient, but every
+   second consecutive unjudged end is one ineffective step. **R3** an ineffective repair backs off 5 min, 15 min, 45 min,
+   2 h 15 min, 6 h (cap 5); a repair that made **progress lowers the level to 1**, and progress is **a row, or a tombstone replacing an older
+   held one (review C m2), at or below the finding's cut** (the digest probe's `min(W_A, W_B)` at the finding's last exact mismatch, carried with the plan to
+   `apply_snapshot_page`) for the document kind and a built index for the definition kind. Rows above the cut are what
+   ordinary replication also brings under live writes; counting them lowers the level on nearly every repair and a
+   standing ambiguous id would never climb to the cap. **R4** more than three clear-and-recur episodes in a rolling
+   hour, **per collection and kind**, stop that kind of repair of the collection for six hours or until it has been clear
+   for an hour. An episode counts when a repair that cleared the finding is followed by the finding standing again; the
+   arm belongs to the kind, so a digest repair that cleared its finding is no recurrence of a definition finding that
+   stands. Episodes are deduplicated **only across different peers** (a partition that heals on five members is one
+   event, not five), within a window of three rotation periods **capped at 15 minutes**: the same peer's recurrence
+   always counts, so a member with many collections (a long rotation) still stops a one-peer loop. **R5** only a
+   confirmed, un-stopped, un-backed-off finding plans, and not while a repair is in flight or awaiting its probe. A plan
+   gate that refuses (`disabled`, `too_large`, `skipped_count_repair`) is counted **once per standing finding**, not at
+   every contact it stands. **R7** the ledger, the tracker and the planner's per-peer state are pruned in the tick's
+   `if let Ok(held)` block, guarded textually: by collection when it is no longer held, and by member **only after the
+   member has been absent from the live member list for 12 hours** (`MEMBER_GRACE`). The cluster has no configured
+   member set with node ids (`cluster.seeds` are addresses and SWIM discovers the rest), and SWIM removes a member from
+   the live list the moment it marks it down, so a peer down for a restart or a six-second cut would otherwise lose its
+   level, back-off and arm and be repaired again at level 0 on its return. The tracker is pruned by member only with the
+   repair switched on, so with `cluster.divergence_repair = false` the gauges are exactly 0.49.0's. The loop guard's
+   clock and its unjudged deadlines are read before the collections are listed, so a failed listing does not skip them.
+5a. **A repair does not starve ordinary replication, and does not chase a tail.** A `Converge` or `Definitions` pull
+   alternates **per peer**: after any such pull to a peer the next contact with it is an ordinary one, whichever repair
+   is next, and a second pull in the contact that had one is ordinary too (`[repair, ordinary, repair, ordinary]`). A
+   count repair is not alternated (ADR-148). A `Converge` round is capped at 20 pages or 10 seconds, whichever comes
+   first, and resumes two contacts later from its in-memory cursor. A `Converge` repair is also bounded in pages by
+   **this member's live count of the collection when it was planned plus `cluster.repair_max_documents`** (512 records
+   a page): reaching the bound ends it as finished and the loop guard judges it, so a collection under inserts faster
+   than the pull walks cannot hold the peer in a repair for ever. The `Definitions` build runs off the async worker
+   (`kimmy_storage::blocking`), and the size gates fail closed when the count cannot be read.
+6. **`cluster.divergence_repair`** (`true`) switches both repairs; `false` detects only, as 0.49.0, and counts each
+   finding's plan `disabled` (once per standing finding). `cluster.repair_max_documents` (2,000,000) and `cluster.repair_max_index_documents`
+   (250,000) are refused at zero. Read at start.
+7. **The lab hook** `KIMMY_TEST_DROP_APPLY` (the `lab-hooks` feature; absent from every shipped build) loses one
+   replicated entry, witnessed and not written, so the lab can make the divergences these repairs close. The grammar is
+   made unambiguous or refused. The kind words are `insert`, `replace`, `delete`,
+   `create_index` and `drop_index`; there is no `update`, because no write records an `Update` entry (every change to a
+   document is a `Replace`), and a value naming it is refused with a reason that says to use `replace`.
+
+**What stays a finding for the operator**, each with its reason in `operations.md`: a row this member holds nothing for
+and that is not young (`left`); a rival, unique, TTL, vector, dropped-here, buried-life or ambiguous index; a collection
+over a size gate; a collection the loop guard has stopped. **Decided (owner, 2026-10-14):** the older-`created` settle of
+two concurrent creates is **not** built (it lost data across a drop); what is checked instead is a convergence model
+test, a separate change.
+
+**Mixed roll.** A 0.49.0 sender sends no horizon, so a member repairing from it admits nothing young and `left`s every
+id it holds nothing for; it still applies newer rows over held rows. A 0.49.0 member repairs nothing, and the finding
+persists until it is upgraded. A member with the switch off is a peer whose side nobody repairs.
+**Rolling from 0.49.x, a row in a drop's own millisecond.** A member that still holds a row stamped in the very
+`Hlc` of a drop (kept under 0.49's `Stamp`-strict comparison, where a tie went to the row, and swept on the members
+that judge by `Hlc`, where a tie goes to the drop, ADR-236) leaves a cut-digest finding this build's repair does not
+close: the member judging by `Hlc` refuses the row as history, so the repair ends ineffective and backs off to the
+six-hour cap. It needs a write in the drop's own millisecond.
+
+**Closes ADR-236's residual (4).** A write stamped after a drop, of a life a member holding the drop refused on a whole
+page, that a member keeping the life was granted past (every count agrees; only the cut digest sees the `(id, stamp)`
+sets differ) is the lost update this ADR's document repair exists for: the keeping member pulls the collection under
+`Converge`, the sender's row is strictly newer than the one held, and it is written. The model test
+`residual_4_is_closed_by_the_document_repair` settles the schedule of the pinned row
+(`known_residual_a_later_write_a_refused_life_s_whole_page_granted_past`) and then runs that pull: the member holds the
+write, the other two are untouched, the three digests agree, and a second pull writes nothing, so the finding does not
+return. With `cluster.divergence_repair` off the residual stays a finding, as in ADR-236.
+
+**Tests.** `converge_tests.rs` (the policy's table, each row leaving everything else untouched; the cut counts),
+`tombstone_horizon_tests.rs` (each collector raises it; the reset on every path; restore; adoption raises and never lowers),
+`definition_repair_tests.rs` (every clause of the table and the races under the writer), `repair_ledger_tests.rs` (every
+rule and a model test against a replay of each pair's history), `digest_repair_tests.rs` (the planner with the guard),
+`residual_4_is_closed_by_the_document_repair` (the model's schedule, then the repair), and four end-to-end tests through the real loop (a lost update repaired and judged effective, a lost plain index built, a
+unique index never built, the switch off, the size gate). Mutation rows (in bash, each killed unless named): every clause
+of the policy table, the young-stamp comparison and its absent-horizon fail-closed, each collector's horizon write, the
+reset, the adoption's `set` for `max`, the cut counts, the ledger's rules (16 rows), and the definition table (22
+rows). Equivalent mutants are named in the test files that pin the clause.

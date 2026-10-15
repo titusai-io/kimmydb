@@ -355,6 +355,15 @@ jobs:
           KIMMY_TEST_NODE_LOGS: ${{ runner.temp }}/node-logs
         run: cargo test -p kimmyd --test cluster -- --ignored --test-threads=1
 
+      # The divergence repair on real processes. A member that loses one replicated entry
+      # exists only in the `lab-hooks` build of kimmyd (`KIMMY_TEST_DROP_APPLY`), which no
+      # shipped artifact is: the build job below checks the release binary carries none of
+      # it. The tests are compiled only with the feature, so the step above never sees them.
+      - name: Cluster harness, the repair cases (lab-hooks build)
+        env:
+          KIMMY_TEST_NODE_LOGS: ${{ runner.temp }}/node-logs
+        run: cargo test -p kimmyd --features lab-hooks --test cluster -- --ignored --test-threads=1 lab_hook_
+
       # Every node of a failed cluster test, as the nodes logged it: which
       # peer refused what, and any panic in a connection task. Without it a
       # red harness can only be rerun, not read.
@@ -541,6 +550,13 @@ jobs:
         env:
           RUSTFLAGS: -Ctarget-feature=+crt-static -Clink-self-contained=yes
         run: cargo build --profile dist --target x86_64-unknown-linux-musl --workspace
+
+      # The lab's loss of one replicated entry (`KIMMY_TEST_DROP_APPLY`, the `lab-hooks`
+      # feature) is not in what ships: not its switch, not its log lines.
+      - name: The shipped server carries no lab hook
+        run: |
+          hooks=$(strings target/x86_64-unknown-linux-musl/dist/kimmyd | grep -c DROP_APPLY || true)
+          test "$hooks" = 0 || { echo "the release binary names DROP_APPLY $hooks times"; exit 1; }
 
       # One file, so the artifact unpacks as `kimmyd` alone.
       - uses: actions/upload-artifact@v7

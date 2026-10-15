@@ -577,6 +577,23 @@ catch_up_wait_secs = 120
 # Also `KIMMY_CLUSTER_EXPECTED_MEMBERS`.
 # expected_members = 3
 
+# Whether this member repairs what the divergence check finds (the document repair
+# of a confirmed cut-digest finding, the definition repair of a confirmed definition
+# finding). The detectors run either way. `false` makes the member detect only, as
+# 0.49.0 does. Does not touch the count half's repair.
+#
+# NAMING THIS KEY (or either of the two below) AT ANY VALUE MAKES A 0.49.0 BINARY
+# REFUSE TO START ON THIS FILE: remove them before rolling back.
+# divergence_repair = true
+
+# The most live documents a collection may hold for the document repair to pull it.
+# Above it the repair is counted `too_large` and left to the operator. Greater than zero.
+# repair_max_documents = 2000000
+
+# The most live documents a collection may hold for the definition repair to build an
+# index in it. The build holds the single writer for its whole length. Greater than zero.
+# repair_max_index_documents = 250000
+
 [webhooks]
 # Hosts a webhook may target beyond the public internet.
 #

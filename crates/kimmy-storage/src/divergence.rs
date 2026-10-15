@@ -421,6 +421,13 @@ pub struct DivergenceTracker {
     /// replay that landed nothing or, from a peer holding its history only as a
     /// snapshot's state (ADR-224), a whole-database snapshot.
     count_suspended: std::collections::HashSet<(NodeId, CollectionId)>,
+    /// Suspended count findings a compared-equal cut digest of the same pair **quieted**
+    /// ([`Self::observe_digest`]): no longer confirmed, so neither counted by the gauge nor
+    /// planned from, but still *reported* ([`Self::reported_against`]), so the cooldown of
+    /// the repair they planned stands. Forgetting it with the finding would let a peer that
+    /// stops and moves in turn be repaired at every stop. A compared count probe decides the
+    /// key: a match clears it, a mismatch returns it to confirmed.
+    count_quieted: std::collections::HashSet<(NodeId, CollectionId)>,
     /// `(peer, collection)` pairs whose most recent *compared* cut digest
     /// mismatched (B3): the count half's rhythm, for the same reason, since a
     /// collection is compared only on the contacts it is quiet or named.
@@ -469,6 +476,7 @@ impl DivergenceTracker {
     pub fn advance_probe(&mut self, mine: &BTreeSet<CollectionId>) -> Option<CollectionId> {
         self.count_pending.retain(|(_, id)| mine.contains(id));
         self.count_suspended.retain(|(_, id)| mine.contains(id));
+        self.count_quieted.retain(|(_, id)| mine.contains(id));
         for confirmed in self.count_confirmed.values_mut() {
             confirmed.retain(|id| mine.contains(id));
         }
@@ -486,6 +494,27 @@ impl DivergenceTracker {
 
         self.cursor = next_probe(mine, self.cursor);
         self.cursor
+    }
+
+    /// Forget every finding, pending or confirmed, against a peer that is not in
+    /// `members` (repair design R7). `advance_probe` sweeps by collection only,
+    /// so a member that was removed kept its confirmed findings for the life of
+    /// the process: they held the gauges up, and a ledger entry keyed by the
+    /// same peer could never be told the finding was gone.
+    pub fn retain_members(&mut self, members: Option<&BTreeSet<NodeId>>) {
+        let Some(members) = members else {
+            return;
+        };
+        self.pending.retain(|peer, _| members.contains(peer));
+        self.confirmed.retain(|peer, _| members.contains(peer));
+        self.count_pending.retain(|(peer, _)| members.contains(peer));
+        self.count_confirmed.retain(|peer, _| members.contains(peer));
+        self.count_suspended.retain(|(peer, _)| members.contains(peer));
+        self.count_quieted.retain(|(peer, _)| members.contains(peer));
+        self.digest_pending.retain(|(peer, _)| members.contains(peer));
+        self.digest_confirmed.retain(|peer, _| members.contains(peer));
+        self.definition_pending.retain(|(peer, _)| members.contains(peer));
+        self.definition_confirmed.retain(|peer, _| members.contains(peer));
     }
 
     /// Fold in what one contact with `peer` found — [`compare`]'s result.
@@ -521,6 +550,7 @@ impl DivergenceTracker {
             let key = (peer, id);
             // Compared: renewed or cleared below, either way no longer suspended.
             self.count_suspended.remove(&key);
+            self.count_quieted.remove(&key);
             if mismatched {
                 if self.count_pending.contains(&key) {
                     self.count_confirmed.entry(peer).or_default().insert(id);
@@ -555,8 +585,28 @@ impl DivergenceTracker {
     /// match clears it. A collection not compared this contact leaves the
     /// state where its last comparison left it, as silence about a peer is not
     /// evidence it has reconciled.
+    ///
+    /// **A compared match also quiets a suspended count finding of the same pair**
+    /// ([`Self::observe_count_deferred`]): the two members hold the same rows at the cut,
+    /// and a deferred count probe, which a peer that trails this member and moves gets on
+    /// every contact while this member takes writes, would otherwise leave the finding, and
+    /// the gauge it lights, standing for as long as the writes go on. The finding leaves the
+    /// confirmed set and the gauge but stays *reported* ([`Self::reported_against`]), so the
+    /// cooldown of the repair it planned stands; the next compared count probe clears it (a
+    /// match) or confirms it again (a mismatch). It quiets only a finding no compared count
+    /// probe has renewed since, never plans a repair, and a mismatch of the digest never
+    /// confirms a count finding.
     pub fn observe_digest(&mut self, peer: NodeId, id: CollectionId, mismatched: bool) -> bool {
         let key = (peer, id);
+        if !mismatched && self.count_suspended.remove(&key) {
+            self.count_quieted.insert(key);
+            if let Some(set) = self.count_confirmed.get_mut(&peer) {
+                set.remove(&id);
+                if set.is_empty() {
+                    self.count_confirmed.remove(&peer);
+                }
+            }
+        }
         if mismatched {
             let confirmed = self.digest_pending.contains(&key);
             self.digest_pending.insert(key);
@@ -578,6 +628,14 @@ impl DivergenceTracker {
     /// Whether `id` is confirmed divergent by the cut digest against `peer`.
     pub fn is_digest_confirmed(&self, peer: NodeId, id: CollectionId) -> bool {
         self.digest_confirmed.get(&peer).is_some_and(|set| set.contains(&id))
+    }
+
+    /// Collections the cut digest has confirmed divergent against `peer`: what the
+    /// document repair is planned from. **Only the planner reads this.**
+    /// [`Self::confirmed_against`] never holds a digest finding (B3), so the count
+    /// half's repair, its cooldown and its `retain_repaired` never see one.
+    pub fn digest_confirmed_against(&self, peer: NodeId) -> BTreeSet<CollectionId> {
+        self.digest_confirmed.get(&peer).cloned().unwrap_or_default()
     }
 
     /// Distinct collections confirmed divergent by the cut digest against at
@@ -623,6 +681,10 @@ impl DivergenceTracker {
     /// Distinct collections confirmed divergent by the definition digest
     /// against at least one peer: what
     /// `kimmy_sync_definition_divergent_collections` reports.
+    pub fn definition_confirmed_against(&self, peer: NodeId) -> BTreeSet<CollectionId> {
+        self.definition_confirmed.get(&peer).cloned().unwrap_or_default()
+    }
+
     pub fn definition_confirmed_count(&self) -> usize {
         self.definition_confirmed.values().flatten().collect::<BTreeSet<_>>().len()
     }
@@ -648,17 +710,19 @@ impl DivergenceTracker {
         out
     }
 
-    /// Every collection the check still reports against `peer`, suspended count
-    /// findings included: what the repairs done against it are kept for
-    /// (`PeerStalls::retain_repaired`). A suspended finding a compared probe renews
-    /// waits out the cooldown of the repair it planned before; forgetting that repair
-    /// at the suspension would let a peer that stops and moves in turn be repaired
-    /// every time it stops.
+    /// Every collection the check still reports against `peer`, suspended and quieted
+    /// count findings included: what the repairs done against it are kept for
+    /// (`PeerStalls::retain_repaired`). A suspended finding a compared probe renews, and a
+    /// quieted one it confirms again, waits out the cooldown of the repair it planned
+    /// before; forgetting that repair at the suspension, or when a cut digest quiets the
+    /// finding, would let a peer that stops and moves in turn be repaired every time it
+    /// stops.
     pub fn reported_against(&self, peer: NodeId) -> BTreeSet<CollectionId> {
         let mut out = self.confirmed.get(&peer).cloned().unwrap_or_default();
         if let Some(by_count) = self.count_confirmed.get(&peer) {
             out.extend(by_count.iter().copied());
         }
+        out.extend(self.count_quieted.iter().filter(|(p, _)| *p == peer).map(|(_, id)| *id));
         out
     }
 
@@ -697,6 +761,33 @@ mod tests {
                 .unwrap();
         }
         (engine, dir)
+    }
+
+    /// R7: a removed member's findings, of every kind, go with it, so no gauge is held
+    /// up by a peer that is gone and no repair is planned against one.
+    #[test]
+    fn a_removed_members_findings_are_forgotten_of_every_kind() {
+        let mut tracker = DivergenceTracker::new();
+        let (gone, kept) = (peer(1), peer(2));
+        // The gauges count collections, not pairs: one collection per peer.
+        let (c, other) = (CollectionId(7), CollectionId(8));
+        for (p, id) in [(gone, c), (kept, other)] {
+            tracker.observe_digest(p, id, true);
+            tracker.observe_digest(p, id, true);
+            tracker.observe_definition(p, id, true);
+            tracker.observe_definition(p, id, true);
+        }
+        assert_eq!(tracker.digest_confirmed_count(), 2);
+        assert_eq!(tracker.definition_confirmed_count(), 2);
+        tracker.retain_members(Some(&BTreeSet::from([kept])));
+        assert_eq!(tracker.digest_confirmed_count(), 1);
+        assert_eq!(tracker.definition_confirmed_count(), 1);
+        assert!(tracker.digest_confirmed_against(gone).is_empty());
+        assert!(!tracker.is_digest_confirmed(gone, c));
+        assert!(!tracker.is_definition_confirmed(gone, c));
+        // And the pending half went too: one mismatch more does not confirm.
+        assert!(!tracker.observe_digest(gone, c, true));
+        assert!(tracker.is_digest_confirmed(kept, other));
     }
 
     #[test]
@@ -742,6 +833,21 @@ mod tests {
         assert_eq!(tracker.confirmed_count(), 1, "the gauge reads it");
         assert_eq!(tracker.definition_confirmed_count(), 1, "the attribution gauge");
         assert_eq!(tracker.digest_confirmed_count(), 0, "and it is not the digest's");
+    }
+
+    /// The planner's own reader for the digest: it holds the digest's findings and the
+    /// count half's reader still does not.
+    #[test]
+    fn a_digest_finding_is_read_by_its_own_reader_and_not_by_the_count_halfs() {
+        let mut tracker = DivergenceTracker::new();
+        let (p, q, c) = (NodeId::generate(), NodeId::generate(), CollectionId(7));
+        tracker.observe_digest(p, c, true);
+        tracker.observe_digest(p, c, true);
+        assert_eq!(tracker.digest_confirmed_against(p), BTreeSet::from([c]));
+        assert!(tracker.digest_confirmed_against(q).is_empty(), "another peer's is its own");
+        assert!(tracker.confirmed_against(p).is_empty(), "never the count half's reader");
+        tracker.observe_digest(p, c, false);
+        assert!(tracker.digest_confirmed_against(p).is_empty(), "a compared match clears it");
     }
 
     /// One collection under two kinds is one collection on the gauge.
@@ -1474,6 +1580,82 @@ mod tests {
         );
         tracker.observe(p, mismatched);
         assert_eq!(tracker.confirmed_against(p), set(&[7]));
+    }
+
+    /// A compared-equal cut digest of the same peer and collection **quiets** a suspended
+    /// count finding: the two hold the same rows at the cut, so the gauge the finding keeps
+    /// lit is stale (a deferred probe re-examined nothing, and a peer that trails this member
+    /// and moves defers it for as long as this member takes writes). The finding leaves the
+    /// gauge and plans nothing, but stays *reported*, so the cooldown of its repair stands;
+    /// the next compared count probe clears it (a match) or confirms it again (a mismatch).
+    /// Only a suspended finding, only that pair, and only a compared match: a finding the
+    /// count probe itself last compared is its own evidence, and the digest never plans a
+    /// count repair.
+    #[test]
+    fn a_compared_equal_digest_quiets_a_suspended_count_finding_and_keeps_its_cooldown() {
+        let mut tracker = DivergenceTracker::new();
+        let (p, q, c, d) = (peer(1), peer(2), id(7), id(8));
+        let mismatched = Findings { existence: set(&[]), count: Some((c, true)) };
+        let matched = Findings { existence: set(&[]), count: Some((c, false)) };
+        let suspend = |tracker: &mut DivergenceTracker, p: NodeId, c: CollectionId| {
+            tracker.observe(p, Findings { existence: set(&[]), count: Some((c, true)) });
+            tracker.observe(p, Findings { existence: set(&[]), count: Some((c, true)) });
+            tracker.observe_count_deferred(p, c);
+        };
+        suspend(&mut tracker, p, c);
+        assert_eq!(tracker.confirmed_count(), 1);
+        assert!(tracker.confirmed_against(p).is_empty(), "suspended");
+
+        // Not a match, not the pair: nothing is quieted.
+        tracker.observe_digest(p, c, true);
+        tracker.observe_digest(p, d, false);
+        tracker.observe_digest(q, c, false);
+        assert_eq!(tracker.confirmed_count(), 1, "a mismatch or another pair quiets nothing");
+
+        tracker.observe_digest(p, c, false);
+        assert_eq!(tracker.confirmed_count(), 0, "the gauge is no longer lit");
+        assert!(tracker.confirmed_against(p).is_empty(), "and nothing is planned");
+        assert_eq!(tracker.reported_against(p), set(&[7]), "but the cooldown of its repair stands");
+        assert!(tracker.reported_against(q).is_empty(), "only that peer's");
+
+        // A compared mismatch returns it to confirmed, under the same cooldown.
+        tracker.observe(p, mismatched.clone());
+        assert_eq!(tracker.confirmed_against(p), set(&[7]), "renewed by one compared mismatch");
+        assert_eq!(tracker.confirmed_count(), 1);
+
+        // A finding the count probe itself last compared is not suspended: a digest that
+        // compares equal quiets nothing of it.
+        tracker.observe_digest(p, c, false);
+        assert_eq!(tracker.confirmed_against(p), set(&[7]), "its own evidence stands");
+
+        // Suspended afresh and quieted the same way, a compared match clears it for good.
+        tracker.observe_count_deferred(p, c);
+        tracker.observe_digest(p, c, false);
+        assert_eq!(tracker.confirmed_count(), 0);
+        assert_eq!(tracker.reported_against(p), set(&[7]));
+        tracker.observe(p, matched);
+        assert!(tracker.reported_against(p).is_empty(), "a compared match clears it");
+        assert_eq!(tracker.confirmed_count(), 0);
+    }
+
+    /// Departed members take their suspended and quieted findings with them
+    /// (`retain_members`), and a dropped collection takes its own (`advance_probe`).
+    #[test]
+    fn suspended_and_quieted_findings_are_pruned_with_their_member_and_collection() {
+        let mut tracker = DivergenceTracker::new();
+        let (p, q, c) = (peer(1), peer(2), id(7));
+        for who in [p, q] {
+            tracker.observe(who, Findings { existence: set(&[]), count: Some((c, true)) });
+            tracker.observe(who, Findings { existence: set(&[]), count: Some((c, true)) });
+            tracker.observe_count_deferred(who, c);
+        }
+        tracker.observe_digest(p, c, false);
+        tracker.retain_members(Some(&[q].into_iter().collect()));
+        assert!(tracker.reported_against(p).is_empty(), "a departed member's quieted finding");
+        assert!(tracker.count_suspended.iter().all(|(who, _)| *who == q));
+        assert!(tracker.count_quieted.is_empty());
+        tracker.advance_probe(&BTreeSet::new());
+        assert!(tracker.count_suspended.is_empty(), "a dropped collection's suspended finding");
     }
 
     /// The realistic trigger for this defect: the gauge fires, an operator

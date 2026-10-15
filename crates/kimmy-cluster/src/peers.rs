@@ -12,6 +12,7 @@ use tracing::{Instrument, debug, error, info, warn};
 use crate::discovery::SeedSource;
 use crate::health::{DEFAULT_FANOUT, PeerHealth};
 use crate::membership::Members;
+use crate::repair_ledger::Judged;
 use crate::transport::{DivergenceProbe, PeerStalls, Repair, sync_once_with};
 
 /// How often to run a round against every known peer.
@@ -161,6 +162,16 @@ pub struct RoundReport {
     /// (B3). A level. Also counted in `divergent_collections`; this says which
     /// half moved it.
     pub digest_divergent_collections: usize,
+    /// What the document repair counted in this tick (repair design section 15.2).
+    pub repair: crate::transport::RepairCounts,
+    /// Collections the loop guard has stopped for recurring. A level.
+    pub digest_repair_stopped: usize,
+    /// Whether `cluster.divergence_repair` is on. A level, for a gauge.
+    pub repair_enabled: bool,
+    /// The collected-through horizon's wall time, in seconds since the epoch: the cutoff of
+    /// the last retention pass that collected a tombstone, or this build's reset at open. A
+    /// level, for a gauge; 0 when the store has none (a read that failed).
+    pub tombstone_horizon_secs: u64,
     /// Kept digest rows a self-check found disagreeing with their records and
     /// corrected, since the process started. A level; zero on a healthy node.
     pub digest_drift_total: u64,
@@ -227,7 +238,7 @@ pub struct RoundReport {
     /// place until the purge is done; nothing is missing, so no repair is
     /// planned.
     pub entries_skipped_purge_pending: usize,
-    /// Pulls in this tick spent repairing against a peer (ADR-148):
+    /// Pulls in this tick spent on a *count* repair against a peer (ADR-148):
     /// re-serving its oplog from below this node's position, or pulling its
     /// snapshot, because the check confirmed a divergence against it or a
     /// batch stopped at a collection this node lacks. A counter. Rising is
@@ -584,6 +595,16 @@ pub struct ReplicationConfig {
     /// for a test that needs a resolver that hangs, fails or counts its calls.
     /// `None` is every real node.
     pub resolver: Option<Resolver>,
+    /// `cluster.divergence_repair`: whether a confirmed digest finding plans a document
+    /// repair. Off, the detectors keep running and nothing is planned (each skipped plan is
+    /// counted `disabled`).
+    pub divergence_repair: bool,
+    /// `cluster.repair_max_documents`: a collection with more live documents than this is
+    /// not repaired by a document repair (counted `too_large`).
+    pub repair_max_documents: u64,
+    /// `cluster.repair_max_index_documents`: a collection with more live documents than this
+    /// is not given a repaired index (counted `too_large` in the definition series).
+    pub repair_max_index_documents: u64,
 }
 
 /// Each peer's last advertised vector, kept for the replication lag gauge,
@@ -675,6 +696,9 @@ impl ReplicationConfig {
             expected_members: None,
             self_recheck: SELF_RECHECK,
             resolver: None,
+            divergence_repair: true,
+            repair_max_documents: 2_000_000,
+            repair_max_index_documents: 250_000,
         }
     }
 }
@@ -748,6 +772,10 @@ pub async fn replicate(engine: Arc<Engine>, config: ReplicationConfig) {
     // peer's vector exists.
     let mut stalls = PeerStalls::new();
     stalls.set_catch_up(config.catch_up.clone());
+    // What the loop guard of the document repair judges time by: the time since here.
+    let loop_started = Instant::now();
+    digest_state.repair_planned = config.divergence_repair;
+    definition_state.repair_planned = config.divergence_repair;
     // Addresses that answered the handshake with this node's own id (ADR-202),
     // and when: left out of the peers, and never a failed round, until
     // `config.self_recheck` has passed, when they are dialled once more, quietly
@@ -1004,6 +1032,13 @@ pub async fn replicate(engine: Arc<Engine>, config: ReplicationConfig) {
                 // rule out. `advance_probe_on` is where that decision lives,
                 // pulled out on its own so it is a function with a test
                 // rather than a branch inside this loop.
+                // The loop guard's clock and its unjudged deadlines do not wait on the
+                // listing: a storage hiccup there must not hold a repair in `awaiting`
+                // past its deadline.
+                stalls.set_repair_time(tick_started.saturating_duration_since(loop_started));
+                for (key, verdict) in stalls.expire_repairs() {
+                    log_repair_verdict(key.peer, key.collection, verdict);
+                }
                 let mine_collections = engine.all_collection_ids();
                 if let Ok(held) = &mine_collections {
                     digest_state.prune(held);
@@ -1011,6 +1046,16 @@ pub async fn replicate(engine: Arc<Engine>, config: ReplicationConfig) {
                     let members = config.members.as_ref().map(|members| members.node_ids());
                     definition_state.prune(held, members.as_ref());
                     stalls.retain_definition_detail(members.as_ref(), held);
+                    // The loop guard of the document repair: its clock and rotation
+                    // (one collection per contact, so a rotation is one tick per held
+                    // collection), the repairs whose deadline passed unjudged, and
+                    // everything about a collection or member that is gone (R7).
+                    stalls.set_repair_clock(
+                        tick_started.saturating_duration_since(loop_started),
+                        config.sync_interval * u32::try_from(held.len().max(1)).unwrap_or(u32::MAX),
+                    );
+                    let known = stalls.retain_ledger(held, members.as_ref());
+                    retain_tracker_members(&mut divergence, known.as_ref(), config.divergence_repair);
                 }
                 if let Err(e) = &mine_collections {
                     warn!(error = %e, "divergence check: could not list this node's own \
@@ -1224,7 +1269,7 @@ pub async fn replicate(engine: Arc<Engine>, config: ReplicationConfig) {
                         Ok(mut outcome) => {
                             contact.pulled(&outcome, took);
                             health.succeeded(peer);
-                            report.repair_rounds += usize::from(outcome.repairing);
+                            report.repair_rounds += usize::from(outcome.count_repair);
                             // More of the peer's oplog behind the cap, and
                             // budget left to go and get it: this contact is
                             // not over, so nothing below runs for it yet.
@@ -1368,6 +1413,7 @@ pub async fn replicate(engine: Arc<Engine>, config: ReplicationConfig) {
                                             &engine,
                                             &mut divergence,
                                             &mut digest_state,
+                                            &mut stalls,
                                             node,
                                             peer,
                                             round,
@@ -1407,6 +1453,32 @@ pub async fn replicate(engine: Arc<Engine>, config: ReplicationConfig) {
                                         node,
                                         peer,
                                     );
+                                    // The cut digest's findings plan a document repair
+                                    // (repair design section 3).
+                                    let digest_confirmed = divergence.digest_confirmed_against(node);
+                                    plan_digest_repairs(
+                                        &engine,
+                                        &config,
+                                        &mut stalls,
+                                        &digest_state,
+                                        node,
+                                        peer,
+                                        &digest_confirmed,
+                                    );
+                                    stalls.retain_digest(node, &digest_confirmed);
+                                    // And the definition digest's: a plain index this
+                                    // member lacks is built from the peer's first page.
+                                    let definition_confirmed =
+                                        divergence.definition_confirmed_against(node);
+                                    plan_definition_repairs(
+                                        &engine,
+                                        &config,
+                                        &mut stalls,
+                                        node,
+                                        peer,
+                                        &definition_confirmed,
+                                    );
+                                    stalls.retain_definition(node, &definition_confirmed);
                                 } else {
                                     report.divergence_skips += 1;
                                 }
@@ -1576,6 +1648,14 @@ pub async fn replicate(engine: Arc<Engine>, config: ReplicationConfig) {
                 // above does, and that already ran per peer contacted.
                 report.divergent_collections = divergence.confirmed_count();
                 report.digest_divergent_collections = divergence.digest_confirmed_count();
+                report.repair.add(&stalls.take_repair_counts());
+                report.digest_repair_stopped = stalls.stopped_collections();
+                report.repair_enabled = config.divergence_repair;
+                report.tombstone_horizon_secs = engine
+                    .tombstone_horizon()
+                    .ok()
+                    .flatten()
+                    .map_or(0, |horizon| horizon.wall_ms / 1_000);
                 report.definition_divergent_collections = divergence.definition_confirmed_count();
                 report.digest_drift_total = engine.digest_drift_total();
                 // And when that reading was last re-examined (ADR-145): the
@@ -1884,6 +1964,12 @@ struct DigestState {
     >,
     /// When each confirmed `(peer, collection)` was last logged.
     warned: std::collections::HashMap<(NodeId, kimmy_core::CollectionId), Instant>,
+    /// Whether a confirmed finding plans a document repair (`cluster.divergence_repair`),
+    /// which is what the finding's WARN says.
+    repair_planned: bool,
+    /// The cut each `(peer, collection)`'s last exact mismatch was compared at: what a
+    /// document repair planned from the finding counts its progress against (R3).
+    cuts: std::collections::HashMap<(NodeId, kimmy_core::CollectionId), kimmy_core::VersionVector>,
 }
 
 impl DigestState {
@@ -1893,6 +1979,25 @@ impl DigestState {
     fn prune(&mut self, held: &BTreeSet<kimmy_core::CollectionId>) {
         self.verified.retain(|id, (_, _, at)| held.contains(id) && at.elapsed() < SELF_CHECK_MEMO);
         self.warned.retain(|(_, id), at| held.contains(id) && at.elapsed() < DIGEST_WARN_EVERY * 6);
+        self.cuts.retain(|(_, id), _| held.contains(id));
+    }
+}
+
+/// R7 for the divergence tracker: forget the confirmed and pending findings of a member that
+/// was removed (`known` is the live members and those within the grace, see
+/// [`PeerStalls::retain_ledger`]).
+///
+/// Only with the repair switched on. The findings of a removed member held the 0.49 gauges up
+/// for the life of the process, and the loop guard needs them gone to judge a standing
+/// finding; with `cluster.divergence_repair = false` nothing is repaired, and the gauges stay
+/// exactly what 0.49 reported.
+fn retain_tracker_members(
+    tracker: &mut kimmy_storage::DivergenceTracker,
+    known: Option<&BTreeSet<NodeId>>,
+    repair_enabled: bool,
+) {
+    if repair_enabled {
+        tracker.retain_members(known);
     }
 }
 
@@ -1905,10 +2010,12 @@ impl DigestState {
 /// ever. If it had drifted, the row is corrected, an ERROR is logged, the drift
 /// counted, and nothing is reported for this comparison; the next contact
 /// compares again. The peer's own drift is found by the peer's own check.
+#[allow(clippy::too_many_arguments)]
 fn fold_digest_round(
     engine: &Engine,
     tracker: &mut kimmy_storage::DivergenceTracker,
     state: &mut DigestState,
+    stalls: &mut PeerStalls,
     node: NodeId,
     peer: SocketAddr,
     round: kimmy_storage::DigestRound,
@@ -1935,11 +2042,25 @@ fn fold_digest_round(
             DigestOutcome::Compared { equal: true, .. } => {
                 report.digest_compared += 1;
                 tracker.observe_digest(node, verdict.collection, false);
+                // The first compared probe after a repair's end judges it (R2).
+                if let Some(v) =
+                    stalls.judge_digest_repair(node, verdict.collection, Judged::Effective)
+                {
+                    log_repair_verdict(node, verdict.collection, v);
+                }
             }
             DigestOutcome::Compared { equal: false, mine, theirs } => {
                 match verify_row(engine, state, verdict.collection) {
                     SelfCheck::Exact => {
                         report.digest_compared += 1;
+                        if let Some(v) = stalls.judge_digest_repair(
+                            node,
+                            verdict.collection,
+                            Judged::Ineffective,
+                        ) {
+                            log_repair_verdict(node, verdict.collection, v);
+                        }
+                        state.cuts.insert((node, verdict.collection), round.cut.clone());
                         let newly = tracker.observe_digest(node, verdict.collection, true);
                         let confirmed = tracker.is_digest_confirmed(node, verdict.collection);
                         let key = (node, verdict.collection);
@@ -1955,19 +2076,36 @@ fn fold_digest_round(
                                 .flatten()
                                 .map(|row| format!("{:?}", row.maxw))
                                 .unwrap_or_default();
-                            warn!(
-                                %peer,
-                                node = %node,
-                                collection = %verdict.collection,
-                                mine = format!("{mine:032x}"),
-                                theirs = format!("{theirs:032x}"),
-                                maxw = %maxw,
-                                "the cut digest of a collection differs from this peer's on two \
-                                 consecutive comparisons, with what each side had not yet \
-                                 processed set aside; detect only, no repair is planned. The API \
-                                 cannot always say which member is behind: read (operations.md, The \
-                                 cut digest) before wiping either member"
-                            );
+                            if state.repair_planned {
+                                warn!(
+                                    %peer,
+                                    node = %node,
+                                    collection = %verdict.collection,
+                                    mine = format!("{mine:032x}"),
+                                    theirs = format!("{theirs:032x}"),
+                                    maxw = %maxw,
+                                    "a confirmed digest divergence; a document repair is planned. \
+                                     The cut digest of a collection differs from this peer's on \
+                                     two consecutive comparisons, with what each side had not yet \
+                                     processed set aside. The API cannot always say which member \
+                                     is behind: read (operations.md, The cut digest) before wiping \
+                                     either member"
+                                );
+                            } else {
+                                warn!(
+                                    %peer,
+                                    node = %node,
+                                    collection = %verdict.collection,
+                                    mine = format!("{mine:032x}"),
+                                    theirs = format!("{theirs:032x}"),
+                                    maxw = %maxw,
+                                    "the cut digest of a collection differs from this peer's on \
+                                     two consecutive comparisons, with what each side had not yet \
+                                     processed set aside; detect only, no repair is planned. The \
+                                     API cannot always say which member is behind: read \
+                                     (operations.md, The cut digest) before wiping either member"
+                                );
+                            }
                         }
                     }
                     SelfCheck::Corrected => {
@@ -1993,6 +2131,205 @@ fn fold_digest_round(
         if !answered_for.contains(&collection) {
             report.digest_deferred[reason.index()] += 1;
         }
+    }
+}
+
+/// This member's own `CatchUp` marker and the peer's `catching_up` fact: a repair compares
+/// rows (or definitions) against a peer, and either side mid-catch-up would be repaired from
+/// or to a state that is about to change (review B m9; a restored member is marked catching
+/// up). An index built over a collection still arriving is rebuilt by every following page.
+fn either_side_is_catching_up(config: &ReplicationConfig, node: NodeId) -> bool {
+    config.catch_up.as_ref().is_some_and(|catch_up| catch_up.is_set())
+        || config.members.as_ref().is_some_and(|members| {
+            members.peer_states().get(&node) == Some(&crate::facts::PeerState::IneligibleCatchingUp)
+        })
+}
+
+/// Why a confirmed finding is not planned a repair before the planner is asked (repair design
+/// sections 3 and 5): the order is the switch, the catching-up gates, then the size gate.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum RepairGate {
+    /// `cluster.divergence_repair` is off: counted `disabled`.
+    Disabled,
+    /// This member or the peer is catching up: not counted.
+    CatchingUp,
+    /// The collection holds more live documents than the gate: counted `too_large`.
+    TooLarge,
+    Open,
+}
+
+fn repair_gate(
+    config: &ReplicationConfig,
+    catching_up: bool,
+    live_documents: u64,
+    limit: u64,
+) -> RepairGate {
+    if !config.divergence_repair {
+        RepairGate::Disabled
+    } else if catching_up {
+        RepairGate::CatchingUp
+    } else if live_documents > limit {
+        RepairGate::TooLarge
+    } else {
+        RepairGate::Open
+    }
+}
+
+/// Plan a definition repair for each definition finding confirmed against `node`: the
+/// switch, the catching-up gates and the size gate, then the planner's own.
+fn plan_definition_repairs(
+    engine: &Engine,
+    config: &ReplicationConfig,
+    stalls: &mut PeerStalls,
+    node: NodeId,
+    peer: SocketAddr,
+    confirmed: &BTreeSet<kimmy_core::CollectionId>,
+) {
+    use crate::transport::{DigestPlan, DigestRepairOutcome};
+    let catching_up = either_side_is_catching_up(config, node);
+    for collection in confirmed {
+        let finding = stalls.definition_finding_confirmed(node, *collection);
+        if finding.newly_stopped {
+            error!(
+                %peer,
+                node = %node,
+                collection = %collection,
+                kind = "definition",
+                episodes = finding.episodes,
+                window_secs = crate::repair_ledger::EPISODE_WINDOW.as_secs(),
+                stopped_for_secs = crate::repair_ledger::STOP_FOR.as_secs(),
+                "a divergence recurs after repair; repair of this collection is stopped"
+            );
+        }
+        // The requester's own count (the sender's is no concern of this build), the kept O(1)
+        // figure. The apply reads it again immediately before the build: the collection can
+        // grow between here and there.
+        let live = live_documents(engine, *collection);
+        match repair_gate(config, catching_up, live, config.repair_max_index_documents) {
+            RepairGate::Disabled => {
+                stalls.definition_repair_refused(node, *collection, DigestRepairOutcome::Disabled);
+                continue;
+            }
+            RepairGate::TooLarge => {
+                stalls.definition_repair_refused(node, *collection, DigestRepairOutcome::TooLarge);
+                continue;
+            }
+            RepairGate::CatchingUp => continue,
+            RepairGate::Open => {}
+        }
+        if stalls.plan_definition_repair(node, *collection, config.repair_max_index_documents)
+            == DigestPlan::Planned
+        {
+            warn!(
+                %peer,
+                node = %node,
+                collection = %collection,
+                "divergence confirmed; planned a definition repair from this peer on the next \
+                 round with it"
+            );
+        }
+    }
+}
+
+/// The live documents this member holds in `collection`, for the repair size gates. A count
+/// that cannot be read is as large as can be, so the gate refuses rather than lets a repair
+/// through that it could not size; a collection this member does not hold has none.
+fn live_documents(engine: &Engine, collection: kimmy_core::CollectionId) -> u64 {
+    gate_count(engine.count_by_id(collection))
+}
+
+fn gate_count<E>(read: Result<Option<u64>, E>) -> u64 {
+    match read {
+        Ok(Some(live)) => live,
+        Ok(None) => 0,
+        Err(_) => u64::MAX,
+    }
+}
+
+/// Plan a document repair for each digest finding confirmed against `node`, or count why
+/// not (repair design sections 3 and 5): the switch, the catching-up gates, the size gate,
+/// then the planner's own (a count repair, a whole-database pull, the loop guard).
+fn plan_digest_repairs(
+    engine: &Engine,
+    config: &ReplicationConfig,
+    stalls: &mut PeerStalls,
+    state: &DigestState,
+    node: NodeId,
+    peer: SocketAddr,
+    confirmed: &BTreeSet<kimmy_core::CollectionId>,
+) {
+    use crate::transport::{DigestPlan, DigestRepairOutcome};
+    let catching_up = either_side_is_catching_up(config, node);
+    for collection in confirmed {
+        let finding = stalls.digest_finding_confirmed(node, *collection);
+        if finding.newly_stopped {
+            error!(
+                %peer,
+                node = %node,
+                collection = %collection,
+                kind = "digest",
+                episodes = finding.episodes,
+                window_secs = crate::repair_ledger::EPISODE_WINDOW.as_secs(),
+                stopped_for_secs = crate::repair_ledger::STOP_FOR.as_secs(),
+                "a divergence recurs after repair; repair of this collection is stopped"
+            );
+        }
+        let live = live_documents(engine, *collection);
+        match repair_gate(config, catching_up, live, config.repair_max_documents) {
+            RepairGate::Disabled => {
+                stalls.digest_repair_refused(node, *collection, DigestRepairOutcome::Disabled);
+                continue;
+            }
+            RepairGate::TooLarge => {
+                stalls.digest_repair_refused(node, *collection, DigestRepairOutcome::TooLarge);
+                continue;
+            }
+            RepairGate::CatchingUp => continue,
+            RepairGate::Open => {}
+        }
+        let cut = state.cuts.get(&(node, *collection)).cloned().unwrap_or_default();
+        if stalls.plan_digest_repair(node, *collection, cut) == DigestPlan::Planned {
+            // Walk the collection's size now and the gate's more, and no further.
+            stalls.bound_converge(
+                node,
+                *collection,
+                live.saturating_add(config.repair_max_documents),
+            );
+            warn!(
+                %peer,
+                node = %node,
+                collection = %collection,
+                "divergence confirmed; planned a document repair from this peer on the next \
+                 round with it"
+            );
+        }
+    }
+}
+
+/// Log what the loop guard made of a repair at its judgement (repair design section 15.2).
+fn log_repair_verdict(
+    peer: NodeId,
+    collection: kimmy_core::CollectionId,
+    verdict: crate::repair_ledger::Verdict,
+) {
+    use crate::repair_ledger::Verdict;
+    match verdict {
+        Verdict::Ineffective { level, not_before }
+        | Verdict::UnjudgedClimb { level, not_before } => {
+            // Once, on entering level 2.
+            if level == 2 {
+                warn!(
+                    node = %peer,
+                    collection = %collection,
+                    level,
+                    not_before_secs = not_before.as_secs(),
+                    "a divergence repair did not clear the finding; backing off"
+                );
+            } else {
+                debug!(node = %peer, collection = %collection, level, "a divergence repair did not clear the finding");
+            }
+        }
+        Verdict::TransientClimb { .. } | Verdict::Effective | Verdict::Transient => {}
     }
 }
 
@@ -2028,6 +2365,9 @@ struct DefinitionState {
     stuck_warned: std::collections::HashMap<(NodeId, kimmy_core::CollectionId), Instant>,
     /// WARNs raised against each peer in this tick.
     warned_this_tick: std::collections::HashMap<NodeId, usize>,
+    /// Whether a confirmed finding plans a definition repair (`cluster.divergence_repair`),
+    /// which is what the finding's WARN says.
+    repair_planned: bool,
 }
 
 impl DefinitionState {
@@ -2115,10 +2455,20 @@ fn fold_definition_round(
                 report.definition_compared += 1;
                 tracker.observe_definition(node, id, false);
                 detail.remove(&id);
+                // The first compared definition digest after a repair's end judges it.
+                if let Some(v) = stalls.judge_definition_repair(node, id, Judged::Effective, false)
+                {
+                    log_repair_verdict(node, id, v);
+                }
             }
             DefinitionOutcome::Compared { equal: false, mine, theirs, differing } => {
                 state.stuck.remove(&key);
                 report.definition_compared += 1;
+                if let Some(v) =
+                    stalls.judge_definition_repair(node, id, Judged::Ineffective, false)
+                {
+                    log_repair_verdict(node, id, v);
+                }
                 let newly = tracker.observe_definition(node, id, true);
                 detail.insert(id);
                 let confirmed = tracker.is_definition_confirmed(node, id);
@@ -2136,21 +2486,40 @@ fn fold_definition_round(
                         Ok(Some(meta)) => (meta.db, meta.name),
                         _ => ("<db>".to_string(), id.to_string()),
                     };
-                    warn!(
-                        %peer,
-                        node = %node,
-                        collection = %id,
-                        mine = format!("{mine:032x}"),
-                        theirs = format!("{theirs:032x}"),
-                        differing = ?differing.iter().map(ToString::to_string).collect::<Vec<_>>(),
-                        "the definitions of a collection differ from this peer's on two \
-                         consecutive comparisons; detect only, no repair is planned. Read \
-                         GET /v1/db/{db}/coll/{name}/indexes on both members and compare the \
-                         definition the finding names (read `expireAfterSeconds` and `unique` \
-                         before recreating anything: a shorter TTL deletes documents). A \
-                         refusal older than this member's last start leaves no counter trace, \
-                         and the refusal hints that would explain one exist only from 0.49.0"
-                    );
+                    if state.repair_planned {
+                        warn!(
+                            %peer,
+                            node = %node,
+                            collection = %id,
+                            mine = format!("{mine:032x}"),
+                            theirs = format!("{theirs:032x}"),
+                            differing = ?differing.iter().map(ToString::to_string).collect::<Vec<_>>(),
+                            "a confirmed definition divergence; a definition repair is planned. The \
+                             definitions of a collection differ from this peer's on two \
+                             consecutive comparisons. The repair builds one plain index this \
+                             member lacks and the peer holds; a unique or TTL index, a rival under \
+                             one name, and an index the peer dropped stay findings. Read \
+                             GET /v1/db/{db}/coll/{name}/indexes on both members and compare the \
+                             definition the finding names (read `expireAfterSeconds` and `unique` \
+                             before recreating anything: a shorter TTL deletes documents)"
+                        );
+                    } else {
+                        warn!(
+                            %peer,
+                            node = %node,
+                            collection = %id,
+                            mine = format!("{mine:032x}"),
+                            theirs = format!("{theirs:032x}"),
+                            differing = ?differing.iter().map(ToString::to_string).collect::<Vec<_>>(),
+                            "the definitions of a collection differ from this peer's on two \
+                             consecutive comparisons; detect only, no repair is planned. Read \
+                             GET /v1/db/{db}/coll/{name}/indexes on both members and compare the \
+                             definition the finding names (read `expireAfterSeconds` and `unique` \
+                             before recreating anything: a shorter TTL deletes documents). A \
+                             refusal older than this member's last start leaves no counter trace, \
+                             and the refusal hints that would explain one exist only from 0.49.0"
+                        );
+                    }
                 }
             }
             DefinitionOutcome::Explained { .. } => {
@@ -2158,6 +2527,12 @@ fn fold_definition_round(
                 report.definition_explained += 1;
                 tracker.observe_definition(node, id, false);
                 detail.insert(id);
+                // Explained by a refusal hint: this build refused what the repair built, so
+                // the repair is not effective. The finding un-confirms and the planner stops.
+                if let Some(v) = stalls.judge_definition_repair(node, id, Judged::Ineffective, true)
+                {
+                    log_repair_verdict(node, id, v);
+                }
             }
         }
     }
@@ -4013,6 +4388,7 @@ mod digest_fold_tests {
         collection: CollectionId,
         tracker: DivergenceTracker,
         state: DigestState,
+        stalls: PeerStalls,
         report: RoundReport,
         node: NodeId,
         peer: SocketAddr,
@@ -4031,6 +4407,7 @@ mod digest_fold_tests {
             collection: coll.id,
             tracker: DivergenceTracker::default(),
             state: DigestState::default(),
+            stalls: PeerStalls::new(),
             report: RoundReport::default(),
             node: NodeId::from_bytes([3; 16]),
             peer: "127.0.0.1:9".parse().unwrap(),
@@ -4040,8 +4417,10 @@ mod digest_fold_tests {
 
     impl Fixture {
         fn fold(&mut self, round: DigestRound) -> String {
-            let Fixture { engine, tracker, state, report, node, peer, .. } = self;
-            logs_of(|| fold_digest_round(engine, tracker, state, *node, *peer, round, report))
+            let Fixture { engine, tracker, state, stalls, report, node, peer, .. } = self;
+            logs_of(|| {
+                fold_digest_round(engine, tracker, state, stalls, *node, *peer, round, report)
+            })
         }
 
         fn mismatch(&self) -> DigestRound {
@@ -4086,6 +4465,105 @@ mod digest_fold_tests {
         let third = f.fold(f.mismatch());
         assert_eq!(warns(&third), 0, "the same finding is logged once per ten minutes: {third}");
         assert_eq!(f.tracker.digest_confirmed_count(), 1);
+    }
+
+    /// The count finding the gate suspended (its latest probe deferred, ADR-168) keeps
+    /// `kimmy_sync_divergent_collections` lit for as long as this member takes writes; a
+    /// cut digest of the same peer and collection that compares equal quiets it, through
+    /// the fold the loop runs: the gauge clears, nothing is planned, and the cooldown of
+    /// its repair is still held.
+    #[test]
+    fn a_compared_equal_digest_round_quiets_the_suspended_count_finding() {
+        let mut f = fixture();
+        let (node, id) = (f.node, f.collection);
+        let mismatched = kimmy_storage::DivergenceFindings {
+            existence: BTreeSet::new(),
+            count: Some((id, true)),
+        };
+        f.tracker.observe(node, mismatched.clone());
+        f.tracker.observe(node, mismatched);
+        f.tracker.observe_count_deferred(node, id);
+        assert_eq!(f.tracker.confirmed_count(), 1, "premise: suspended, and still lit");
+        assert!(f.tracker.confirmed_against(node).is_empty(), "premise: plans nothing");
+
+        // A digest the contact did not compare leaves it.
+        f.fold(DigestRound::new(DigestAnswered::Busy));
+        assert_eq!(f.tracker.confirmed_count(), 1, "silence is not reconciliation");
+        // A mismatch of the digest is not the count finding's evidence either way.
+        f.fold(f.mismatch());
+        assert_eq!(f.tracker.confirmed_count(), 1);
+
+        f.fold(f.equal());
+        assert_eq!(f.tracker.confirmed_count(), 0, "the gauge is no longer lit");
+        assert!(f.tracker.confirmed_against(node).is_empty());
+        assert_eq!(
+            f.tracker.reported_against(node),
+            BTreeSet::from([id]),
+            "the cooldown of its repair is kept"
+        );
+    }
+
+    /// The cut an exact mismatch was compared at is kept for the repair its finding plans,
+    /// whose progress is counted against it (repair design section 4, R3).
+    #[test]
+    fn the_cut_of_an_exact_mismatch_is_kept_for_the_repair_it_plans() {
+        let mut f = fixture();
+        let mut cut = kimmy_core::VersionVector::new();
+        cut.insert(NodeId::from_bytes([9; 16]), kimmy_core::Hlc::new(1_000, 0));
+        let mut round = f.mismatch();
+        round.cut = cut.clone();
+        f.fold(round);
+        assert_eq!(f.state.cuts.get(&(f.node, f.collection)), Some(&cut));
+    }
+
+    /// With the switch on, the finding says a repair is planned; the old text stays when off.
+    #[test]
+    fn the_finding_says_a_repair_is_planned_exactly_when_the_switch_is_on() {
+        let mut f = fixture();
+        f.state.repair_planned = true;
+        f.fold(f.mismatch());
+        let on = f.fold(f.mismatch());
+        assert!(on.contains("a document repair is planned"), "{on}");
+        assert!(!on.contains("detect only"), "{on}");
+        let mut f = fixture();
+        f.fold(f.mismatch());
+        let off = f.fold(f.mismatch());
+        assert!(off.contains("detect only, no repair is planned"), "{off}");
+    }
+
+    /// The first compared digest after a repair's end judges it: a match is effective, a
+    /// mismatch is not, and a deferred comparison judges nothing.
+    #[test]
+    fn the_first_compared_digest_after_a_repair_judges_it() {
+        use crate::transport::DigestPlan;
+        let finished = |f: &mut Fixture| {
+            f.stalls.set_repair_clock(Duration::from_secs(60), Duration::from_secs(300));
+            let plan = f.stalls.plan_digest_repair(
+                f.node,
+                f.collection,
+                kimmy_core::VersionVector::default(),
+            );
+            assert_eq!(plan, DigestPlan::Planned);
+            f.stalls.repair_due(f.node);
+            f.stalls.repair_finished(f.node);
+        };
+        let mut f = fixture();
+        finished(&mut f);
+        let mut deferred = DigestRound::new(DigestAnswered::Answered);
+        deferred.verdicts.push(DigestVerdict {
+            collection: f.collection,
+            outcome: DigestOutcome::Deferred(Defer::Moved),
+        });
+        f.fold(deferred);
+        assert_eq!(f.stalls.take_repair_counts().digest_judgements, [0; 4], "a deferral judged");
+        f.fold(f.equal());
+        let counts = f.stalls.take_repair_counts();
+        assert_eq!(counts.digest_judgements[crate::transport::Judgement::Effective.index()], 1);
+        let mut g = fixture();
+        finished(&mut g);
+        g.fold(g.mismatch());
+        let counts = g.stalls.take_repair_counts();
+        assert_eq!(counts.digest_judgements[crate::transport::Judgement::Ineffective.index()], 1);
     }
 
     /// The same finding is logged again when ten minutes have passed.
@@ -4447,9 +4925,18 @@ mod definition_fold_tests {
                     theirs: 2,
                 },
             });
-            let Fixture { engine, tracker, report, node, peer, .. } = &mut f;
+            let Fixture { engine, tracker, stalls, report, node, peer, .. } = &mut f;
             digest_logs.push_str(&logs_of(|| {
-                fold_digest_round(engine, tracker, &mut digest_state, *node, *peer, digest, report)
+                fold_digest_round(
+                    engine,
+                    tracker,
+                    &mut digest_state,
+                    stalls,
+                    *node,
+                    *peer,
+                    digest,
+                    report,
+                )
             }));
             definition_logs.push_str(&f.fold(f.mismatch(&["ttl"])));
         }
@@ -4606,15 +5093,229 @@ mod definition_fold_tests {
         for call in [
             "definition_state.prune(held, members.as_ref())",
             "stalls.retain_definition_detail(members.as_ref(), held)",
+            "stalls.retain_ledger(held, members.as_ref())",
+            "retain_tracker_members(&mut divergence, known.as_ref(), config.divergence_repair)",
         ] {
             assert_eq!(code.matches(call).count(), 1, "{call}: once in the code");
             assert_eq!(direct.matches(call).count(), 1, "{call}: directly in the held block");
+        }
+        // The clock and the deadlines are read before the listing, so a failed listing
+        // does not skip them.
+        for call in ["stalls.set_repair_time(", "stalls.expire_repairs()"] {
+            assert_eq!(code.matches(call).count(), 1, "{call}: once in the code");
+            assert_eq!(block.matches(call).count(), 0, "{call}: not inside the held block");
+            let before = code.find("let mine_collections = engine.all_collection_ids()").unwrap();
+            assert!(code.find(call).unwrap() < before, "{call}: before the listing");
+        }
+    }
+
+    /// R7's grace and the switch: a peer down for less than the grace loses no finding (and
+    /// no ledger entry); one removed beyond it loses both; with the repair switched off the
+    /// tracker is not pruned at all, so the gauges are 0.49's.
+    #[test]
+    fn a_member_down_inside_the_grace_keeps_its_findings_and_the_switch_off_keeps_049s_gauges() {
+        for enabled in [true, false] {
+            let mut stalls = PeerStalls::new();
+            let mut tracker = kimmy_storage::DivergenceTracker::new();
+            let (p, q) = (NodeId::from_bytes([1; 16]), NodeId::from_bytes([2; 16]));
+            let (cp, cq) = (kimmy_core::CollectionId(7), kimmy_core::CollectionId(8));
+            let held = BTreeSet::from([cp, cq]);
+            for (peer, c) in [(p, cp), (q, cq)] {
+                tracker.observe_digest(peer, c, true);
+                tracker.observe_digest(peer, c, true);
+            }
+            assert_eq!(tracker.digest_confirmed_count(), 2);
+            stalls.set_repair_clock(Duration::ZERO, Duration::from_secs(5));
+            stalls.retain_ledger(&held, Some(&BTreeSet::from([p, q])));
+            // `p` is down for eleven hours.
+            stalls.set_repair_clock(Duration::from_secs(11 * 3600), Duration::from_secs(5));
+            let known = stalls.retain_ledger(&held, Some(&BTreeSet::from([q])));
+            retain_tracker_members(&mut tracker, known.as_ref(), enabled);
+            assert_eq!(tracker.digest_confirmed_count(), 2, "down inside the grace loses nothing");
+            // And removed for good: gone with the repair on, kept as 0.49 kept it with it off.
+            stalls.set_repair_clock(Duration::from_secs(13 * 3600), Duration::from_secs(5));
+            let known = stalls.retain_ledger(&held, Some(&BTreeSet::from([q])));
+            retain_tracker_members(&mut tracker, known.as_ref(), enabled);
+            assert_eq!(tracker.digest_confirmed_count(), if enabled { 1 } else { 2 });
+        }
+    }
+
+    /// A repair is not planned while this member or the peer is catching up: either marker
+    /// alone gates it, and a peer that is not catching up does not.
+    #[test]
+    fn either_side_catching_up_gates_a_repair() {
+        use crate::facts::Facts;
+        let peer = NodeId::from_bytes([5; 16]);
+        let dir = tempfile::tempdir().unwrap();
+        let catch_up = crate::catchup::CatchUp::open(dir.path(), Duration::from_secs(120));
+        let members = Members::default();
+        members.insert_for_test("127.0.0.1:9".parse().unwrap(), peer);
+        let mut config =
+            ReplicationConfig::new(Vec::new(), "secret".into(), "127.0.0.1:1".parse().unwrap());
+        config.catch_up = Some(Arc::clone(&catch_up));
+        config.members = Some(members.clone());
+        let hear = |catching_up: bool| {
+            members.record_peer_facts_for_test(
+                peer,
+                Facts { boot: vec![1; 16], catching_up, ..Facts::default() },
+                Duration::ZERO,
+            );
+        };
+        hear(false);
+        assert!(!either_side_is_catching_up(&config, peer), "neither side is");
+        hear(true);
+        assert!(either_side_is_catching_up(&config, peer), "the peer says it is");
+        hear(false);
+        catch_up.mark(crate::facts::CatchUpReason::Snapshot).unwrap();
+        assert!(either_side_is_catching_up(&config, peer), "this member's marker is set");
+    }
+
+    /// A count that cannot be read refuses the repair rather than letting it through.
+    #[test]
+    fn a_size_gate_count_that_cannot_be_read_is_as_large_as_can_be() {
+        assert_eq!(gate_count::<()>(Ok(Some(7))), 7);
+        assert_eq!(gate_count::<()>(Ok(None)), 0, "a collection this member does not hold");
+        assert_eq!(gate_count(Err(())), u64::MAX);
+        let config =
+            ReplicationConfig::new(Vec::new(), "secret".into(), "127.0.0.1:1".parse().unwrap());
+        assert_eq!(
+            repair_gate(&config, false, gate_count(Err(())), config.repair_max_documents),
+            RepairGate::TooLarge
+        );
+    }
+
+    /// The gates before the planner, in order: the switch wins over everything, then a side
+    /// catching up, then the size, at the boundary.
+    #[test]
+    fn the_gates_before_the_planner_are_in_order_and_the_size_gate_is_at_the_boundary() {
+        let mut config =
+            ReplicationConfig::new(Vec::new(), "secret".into(), "127.0.0.1:1".parse().unwrap());
+        assert_eq!(repair_gate(&config, false, 10, 10), RepairGate::Open, "at the gate");
+        assert_eq!(repair_gate(&config, false, 11, 10), RepairGate::TooLarge);
+        assert_eq!(repair_gate(&config, true, 11, 10), RepairGate::CatchingUp, "before size");
+        config.divergence_repair = false;
+        assert_eq!(repair_gate(&config, true, 11, 10), RepairGate::Disabled, "before all");
+    }
+
+    /// The tick plans a document repair from each confirmed digest finding and a definition
+    /// repair from each confirmed definition finding, and forgets the cooldown of a finding
+    /// that cleared: a refactor that drops any of the four leaves a finding no repair is
+    /// ever planned from, or a cooldown that never clears. Textual, like the guard above.
+    #[test]
+    fn the_tick_plans_and_forgets_both_repairs() {
+        let source = include_str!("peers.rs");
+        let production = source.split("\n#[cfg(test)]").next().unwrap();
+        let code = tick_calls_guard::without_comments(production);
+        for call in [
+            "plan_digest_repairs(\n",
+            "plan_definition_repairs(\n",
+            "stalls.retain_digest(node, &digest_confirmed)",
+            "stalls.retain_definition(node, &definition_confirmed)",
+            "divergence.digest_confirmed_against(node)",
+            "divergence.definition_confirmed_against(node)",
+        ] {
+            let compact: String = code.split_whitespace().collect();
+            let want: String = call.split_whitespace().collect();
+            let defined = compact.matches(&format!("fn{want}")).count();
+            assert!(
+                compact.matches(&want).count() > defined,
+                "{call}: not called by the tick (only defined)"
+            );
+        }
+    }
+
+    /// The storms run the loop's tick (`peers/revc_storm_tests.rs`), and after the count half
+    /// moved into `fold_check` and `plan_count_repairs` and the tracker's pruning into
+    /// `retain_tracker_members` they stopped doing so without any test failing, so they said
+    /// nothing of those. Textual, like the guards above: the storm tick must **call** each of
+    /// the functions the loop's tick calls for the count half, the tracker and the ledger (a
+    /// call site, not the function's own definition, which the loop's text holds too), none of
+    /// the pre-merge inline forms, and the count check, the digest fold and the count planner in
+    /// that order: the planner reads what the digest fold did to the finding (a compared-equal
+    /// digest quiets a suspended one), so a tick that plans first never exercises it.
+    #[test]
+    fn the_storm_tick_calls_what_the_loops_tick_calls() {
+        let production = include_str!("peers.rs").split("\n#[cfg(test)]").next().unwrap();
+        let loop_code = tick_calls_guard::compact(&tick_calls_guard::without_comments(production));
+        let storm_code = tick_calls_guard::compact(&tick_calls_guard::without_comments(
+            include_str!("peers/revc_storm_tests.rs"),
+        ));
+        for call in [
+            "fold_check",
+            "plan_count_repairs",
+            "retain_tracker_members",
+            "fold_digest_round",
+            "fold_definition_round",
+            "plan_digest_repairs",
+            "plan_definition_repairs",
+            "advance_probe_on",
+            ".retain_ledger",
+            ".retain_digest",
+            ".retain_definition",
+            ".set_repair_time",
+            ".set_repair_clock",
+            ".expire_repairs",
+        ] {
+            assert!(
+                !tick_calls_guard::call_sites(&loop_code, call).is_empty(),
+                "{call}: the loop no longer calls it; update the guard"
+            );
+            assert!(
+                !tick_calls_guard::call_sites(&storm_code, call).is_empty(),
+                "{call}: the storm tick does not call it"
+            );
+        }
+        for form in ["divergence.observe(", "divergence.retain_members(", ".retain_repaired("] {
+            assert!(
+                !storm_code.contains(form),
+                "{form}: an inline form of what the loop reaches through its functions"
+            );
+        }
+        for (what, code) in [("loop", &loop_code), ("storm", &storm_code)] {
+            let first = |call| {
+                *tick_calls_guard::call_sites(code, call)
+                    .first()
+                    .unwrap_or_else(|| panic!("{what}: no call site of {call}"))
+            };
+            assert!(
+                first("fold_check") < first("fold_digest_round")
+                    && first("fold_digest_round") < first("plan_count_repairs"),
+                "{what}: the count check, the digest fold and the count planner must run in \
+                 that order"
+            );
         }
     }
 
     /// The text handling of the guard above, with a test of its own so the guard
     /// is known to see what it claims to.
     mod tick_calls_guard {
+        /// The text with every whitespace character removed, so a call split over lines
+        /// matches however rustfmt wrapped it.
+        pub(super) fn compact(text: &str) -> String {
+            text.split_whitespace().collect()
+        }
+
+        /// Where `name` is called in compacted text: its occurrences followed by `(`, not
+        /// preceded by `fn` (its own definition) or by an identifier character (a longer name);
+        /// a method is named with its dot (`.retain_ledger`).
+        pub(super) fn call_sites(compact: &str, name: &str) -> Vec<usize> {
+            let needle = format!("{name}(");
+            compact
+                .match_indices(&needle)
+                .map(|(at, _)| at)
+                .filter(|&at| {
+                    // A method (`.name`) has its receiver glued to it in compacted text.
+                    if name.starts_with('.') {
+                        return true;
+                    }
+                    let before = &compact[..at];
+                    let ident =
+                        before.chars().next_back().is_some_and(|c| c.is_alphanumeric() || c == '_');
+                    !before.ends_with("fn") && !ident
+                })
+                .collect()
+        }
+
         /// Line comments and block comments removed, so a call that is only
         /// written in one is not counted.
         pub(super) fn without_comments(source: &str) -> String {
@@ -4686,5 +5387,21 @@ mod definition_fold_tests {
             let block = block_after(&without_comments(&live), "if let Ok(held) = &x {");
             assert_eq!(at_depth_one(&block).matches(call).count(), 1, "a live call is seen");
         }
+
+        #[test]
+        fn a_definition_or_a_longer_name_is_not_a_call_site() {
+            let text = compact(
+                "fn fold_check(a: A) {}\n fn plan(b: B) { refold_check(b); stalls\n .retain_ledger(x); \
+                 fold_check(\n c); }",
+            );
+            assert_eq!(call_sites(&text, "fold_check").len(), 1, "only the call, over two lines");
+            assert_eq!(call_sites(&text, ".retain_ledger").len(), 1, "a method named by its dot");
+            assert!(call_sites(&text, "plan_count_repairs").is_empty());
+        }
     }
 }
+
+// The real-loop storms of the repair build's third review (a child of `peers`, so it can call
+// the tick's private functions).
+#[cfg(test)]
+mod revc_storm_tests;

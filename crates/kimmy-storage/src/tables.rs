@@ -329,6 +329,12 @@ pub const META_STATE_HELD_END: &str = "state_held;";
 /// that origin was collected. [`OPLOG_COLLECTED`] is the same fact per origin.
 pub const META_OPLOG_COLLECTED_THROUGH: &str = "oplog_collected_through";
 
+/// `META`: the highest tombstone cutoff a retention pass has applied, the stamp below
+/// which this member may have collected a tombstone (`crate::tombstone_horizon`). Raised
+/// in the transaction of every pass that removes a tombstone, and only there; reset to the
+/// start time by a start the evidence cannot vouch for.
+pub const META_TOMBSTONE_HORIZON: &str = "gc:tombstone_horizon";
+
 /// Every point-in-time rewind this database has taken: its target, and per
 /// origin the newest stamp it discarded (`Engine::rewinds`).
 ///

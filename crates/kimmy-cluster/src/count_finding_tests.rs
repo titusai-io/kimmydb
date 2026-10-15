@@ -217,3 +217,156 @@ async fn a_count_finding_renewed_between_deferrals_is_still_repaired_once_per_co
     );
     assert_eq!(a.divergence.confirmed_count(), 1, "and the finding stands");
 }
+
+/// One tick of A's loop with the cut digest folded in, in `replicate`'s order: the count
+/// check (`fold_check`), then the cut digest (`fold_digest_round`, where F17 part 3 clears a
+/// suspended count finding), then the count planner (`plan_count_repairs`).
+async fn tick_with_digest(side: &mut Side, digest: &mut DigestState) -> usize {
+    side.tick += 1;
+    let engine = Arc::clone(&side.engine);
+    let held = engine.all_collection_ids().unwrap();
+    digest.prune(&held);
+    let probe = advance_probe_on(&mut side.divergence, Ok::<_, ()>(held)).map(|id| {
+        let (vector, mine_count) = engine.count_probe_reading(id).unwrap();
+        DivergenceProbe { id, mine_count, mine_at: Some(vector) }
+    });
+    side.stalls.begin_tick(side.tick);
+    side.stalls.set_members(Some(side.members.clone()));
+    side.stalls.tick_opened();
+    let mut planned = 0;
+    for (addr, _) in side.members.entries() {
+        side.stalls.allow_horizon_deferral(false);
+        for _ in 0..8 {
+            let mut outcome =
+                sync_once_with(&engine, addr, SECRET, probe.clone(), &mut side.stalls)
+                    .await
+                    .unwrap();
+            if outcome.truncated {
+                continue;
+            }
+            if let Some(node) = outcome.peer
+                && let Some(existence) = outcome.divergent.take()
+            {
+                let count = outcome.count_probe.take();
+                side.compared += usize::from(count.is_some());
+                side.deferred += usize::from(outcome.count_probe_deferred);
+                fold_check(
+                    &mut side.divergence,
+                    node,
+                    existence,
+                    count,
+                    outcome.count_probe_deferred,
+                    probe.as_ref(),
+                );
+                if let Some(round) = outcome.digest.take() {
+                    let mut report = RoundReport::default();
+                    fold_digest_round(
+                        &engine,
+                        &mut side.divergence,
+                        digest,
+                        &mut side.stalls,
+                        node,
+                        addr,
+                        round,
+                        &mut report,
+                    );
+                }
+                planned +=
+                    plan_count_repairs(&engine, &side.divergence, &mut side.stalls, node, addr);
+            }
+            break;
+        }
+    }
+    planned
+}
+
+/// A peer that stops and moves in turn, B, trailing A only by A's latest write. Each time B
+/// stands still for `FROZEN_CONTACTS` contacts A compares B's count, which is one short, and the
+/// finding is confirmed and repaired; while B moves the probe is deferred and the finding
+/// suspended, keeping its cooldown (ADR-236 item 10: "so a peer that stops and moves in turn is
+/// not repaired every time it stops"). The cut digest of the same contact compares equal (A's
+/// newest write is above the cut, so both sides set it aside) and quiets the suspended finding:
+/// off the gauge, planning nothing, but still reported, so `retain_repaired` keeps the cooldown.
+/// Expected: one repair per cooldown, as `a_count_finding_renewed_between_deferrals_...` pins
+/// for a real difference.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_compared_equal_digest_keeps_the_count_cooldown_of_a_peer_that_stops_and_moves() {
+    let (mut a, mut b) = (side().await, side().await);
+    a.members.insert_for_test(b.addr, b.node);
+    b.members.insert_for_test(a.addr, a.node);
+    let live = a.engine.create_collection("shop", "live").unwrap();
+    pull(&b.engine, &a.engine);
+    let mut digest = DigestState::default();
+    let mut planned = 0;
+    let mut contacts = 0;
+    let mut i = 0i64;
+    while contacts < 2 * REPAIR_COOLDOWN_ROUNDS + 10 {
+        // B moves: it takes A's writes so far, and A writes again, so B trails A by one.
+        a.engine.insert(&live, doc! { "_id": i }).unwrap();
+        tick(&mut b).await;
+        a.engine.insert(&live, doc! { "_id": -1 - i }).unwrap();
+        i += 1;
+        for _ in 0..FROZEN_CONTACTS + 2 {
+            planned += tick_with_digest(&mut a, &mut digest).await;
+            contacts += 1;
+        }
+    }
+    assert!(
+        a.deferred > 0 && a.compared > 0,
+        "premise: deferred {} compared {}",
+        a.deferred,
+        a.compared
+    );
+    tick(&mut b).await;
+    assert_eq!(live_count(&a), live_count(&b), "premise: B only trailed; it holds what A holds");
+    assert!(
+        planned <= 3,
+        "{planned} count repairs in {contacts} contacts against a peer that only trails: the \
+         compared-equal digest cleared the suspended finding and with it the cooldown, so every \
+         stop of the peer was repaired (expected one per cooldown of {REPAIR_COOLDOWN_ROUNDS})"
+    );
+}
+
+/// A quieted finding is not held off for good. B stops and moves in turn,
+/// trailing A only, until A's finding is quieted (off the gauge, still reported); then B
+/// witnesses an insert of A's without applying it (a real difference) and stands still for
+/// good. A must confirm the finding again and repair it within a cooldown, and the gauge must
+/// light.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_quieted_finding_is_repaired_again_once_the_peer_stands_with_a_real_difference() {
+    let (mut a, mut b) = (side().await, side().await);
+    a.members.insert_for_test(b.addr, b.node);
+    b.members.insert_for_test(a.addr, a.node);
+    let live = a.engine.create_collection("shop", "live").unwrap();
+    let id = kimmy_core::CollectionId::derive("shop", "live");
+    pull(&b.engine, &a.engine);
+    let mut digest = DigestState::default();
+    let mut i = 0i64;
+    for _ in 0..4 {
+        a.engine.insert(&live, doc! { "_id": i }).unwrap();
+        tick(&mut b).await;
+        a.engine.insert(&live, doc! { "_id": -1 - i }).unwrap();
+        i += 1;
+        for _ in 0..FROZEN_CONTACTS + 2 {
+            tick_with_digest(&mut a, &mut digest).await;
+        }
+    }
+    // One more move, and one contact: the probe is deferred and the digest quiets the finding.
+    a.engine.insert(&live, doc! { "_id": i }).unwrap();
+    tick(&mut b).await;
+    a.engine.insert(&live, doc! { "_id": -1 - i }).unwrap();
+    tick_with_digest(&mut a, &mut digest).await;
+    assert_eq!(a.divergence.confirmed_count(), 0, "premise: quieted, off the gauge");
+    assert!(a.divergence.reported_against(b.node).contains(&id), "premise: still reported");
+
+    // A real difference: B witnesses z and never applies it, and stands still from now on.
+    a.engine.insert(&live, doc! { "_id": "z" }).unwrap();
+    b.engine.absorb_witnessed(&a.engine.witnessed_vector().unwrap()).unwrap();
+    let mut planned = 0;
+    for _ in 0..REPAIR_COOLDOWN_ROUNDS + FROZEN_CONTACTS + 5 {
+        planned += tick_with_digest(&mut a, &mut digest).await;
+    }
+    assert!(a.divergence.confirmed_against(b.node).contains(&id), "confirmed again");
+    assert!(a.divergence.confirmed_count() >= 1, "the gauge is lit");
+    assert!(planned >= 1, "repaired again within a cooldown, not held off: {planned}");
+}

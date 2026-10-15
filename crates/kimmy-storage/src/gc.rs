@@ -442,6 +442,9 @@ impl Engine {
                 }
             }
         }
+        // The horizon, in the transaction that removes: one commit, no window in which a
+        // tombstone is gone and the horizon has not moved (design 13.1).
+        crate::tombstone_horizon::raise_tombstone_horizon_in_txn(&txn, cutoff)?;
         txn.commit()?;
         Ok(removed)
     }
@@ -498,6 +501,7 @@ impl Engine {
                 }
             }
         }
+        crate::tombstone_horizon::raise_tombstone_horizon_in_txn(&txn, cutoff)?;
         txn.commit()?;
         Ok(removed)
     }
@@ -546,6 +550,7 @@ impl Engine {
                 }
             }
         }
+        crate::tombstone_horizon::raise_tombstone_horizon_in_txn(&txn, cutoff)?;
         txn.commit()?;
         Ok(removed)
     }
