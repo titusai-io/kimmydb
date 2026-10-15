@@ -1798,29 +1798,50 @@ impl Engine {
 
         // A page can name a life of the collection this node has seen dropped
         // and recreated since: a peer behind on the drop still serves the old
-        // life. Its definitions are that life's, and restored into the one
-        // standing here they gave it an index, or a vector configuration, its
-        // peers never had. Judged here to answer cheaply, and again under the
-        // writer by each definition it would restore.
+        // life. A definition that life made at or before the drop is that life's,
+        // and restored into the one standing here it gave it an index, or a vector
+        // configuration, its peers never had. One made **after** the drop is not:
+        // the drop keeps it (ADR-231, extended), and the sender's life keeps it
+        // once it hears the drop. So each definition is judged by its own stamp
+        // against the floor here, as the entries route judges it (`below_floor`),
+        // under the writer (ADR-236); judged by the life, as it was, a member that
+        // took this page took the sender's coverage of the definition with it and
+        // never held it. Only a definition with no stamp is judged by the life.
         let earlier = |standing: &CollectionMeta| {
             standing
                 .incarnation_floor
                 .is_some_and(|floor| state.created.is_none_or(|created| created <= floor))
         };
-        if earlier(&self.get_collection(&state.db, &state.name)?) {
-            debug!(
-                db = %state.db,
-                collection = %state.name,
-                "a snapshot page named a life of the collection dropped since; its definitions \
-                 are not restored into the one that stands"
-            );
-            return Ok(0);
-        }
+        let of_the_life_before = |standing: &CollectionMeta, created: Option<Stamp>| match created {
+            Some(created) => crate::sync::below_floor(standing, created),
+            None => earlier(standing),
+        };
+        // Judged here to answer cheaply, neither restored nor refused, and again under
+        // the writer by each definition it does restore.
+        let standing = self.get_collection(&state.db, &state.name)?;
+        let indexes: Vec<&kimmy_core::IndexMeta> = state
+            .indexes
+            .iter()
+            .filter(|index| {
+                let before = of_the_life_before(&standing, index.created);
+                if before {
+                    debug!(
+                        db = %state.db,
+                        collection = %state.name,
+                        index = %index.name,
+                        "a snapshot page named an index of a life of the collection dropped \
+                         since; not restored into the one that stands"
+                    );
+                }
+                !before
+            })
+            .collect();
+        let vectors_of_the_life_before = of_the_life_before(&standing, state.vector_changed);
         #[cfg(test)]
         crate::sync::race_hooks::reach(crate::sync::race_hooks::Race::RestoreDefinitions);
 
         let mut refused = 0usize;
-        for index in &state.indexes {
+        for index in indexes {
             // Gone since the check above: a concurrent local drop, as for the index
             // creation below (`Ddl::Gone`), and not a failure of the page.
             let Some(existing) = Self::unless_gone(self.get_collection(&state.db, &state.name))?
@@ -1867,7 +1888,7 @@ impl Engine {
                 // entries route with a stamp, and with no tombstone it is restored as
                 // it was.
                 &|standing, dropped| {
-                    earlier(standing)
+                    of_the_life_before(standing, index.created)
                         || dropped
                             .is_some_and(|at| index.created.is_none_or(|created| created < at))
                 },
@@ -1914,7 +1935,9 @@ impl Engine {
             }
         }
 
-        refused += self.restore_vector_state(state, versions, &earlier)?;
+        if !vectors_of_the_life_before {
+            refused += self.restore_vector_state(state, versions, &earlier)?;
+        }
         Ok(refused)
     }
 
@@ -1932,11 +1955,14 @@ impl Engine {
     ///   stamped local value: it can only add a configuration to a collection whose
     ///   vector state was last written unstamped, as it always did, and it can never
     ///   turn one off.
+    /// `earlier` judges an undated page by the life it names (see `restore_collection`);
+    /// a dated one is judged by its stamp against the floor, as the entries route
+    /// judges a `ConfigureVectors` (ADR-236).
     fn restore_vector_state(
         &self,
         state: &CollectionState,
         versions: &VersionVector,
-        history: &dyn Fn(&CollectionMeta) -> bool,
+        earlier: &dyn Fn(&CollectionMeta) -> bool,
     ) -> Result<usize> {
         let Some(existing) = Self::unless_gone(self.get_collection(&state.db, &state.name))? else {
             // Dropped here since the definitions began: nothing to put it on.
@@ -1955,7 +1981,7 @@ impl Engine {
                         &state.name,
                         config.clone(),
                         crate::vectors::Configured::FromSnapshot(None),
-                        history,
+                        earlier,
                     ),
                 );
             }
@@ -1977,6 +2003,8 @@ impl Engine {
         // wins is made once, under the writer, in `configure_vectors_inner` and
         // `disable_vectors_inner` (last writer wins, on the stamp).
         self.witness(&stamp);
+        let history = |standing: &CollectionMeta| crate::sync::below_floor(standing, stamp);
+        let history: &dyn Fn(&CollectionMeta) -> bool = &history;
         let by = crate::vectors::Configured::FromSnapshot(Some(stamp));
         match &state.vector {
             Some(config) => self.settled_vector_step(

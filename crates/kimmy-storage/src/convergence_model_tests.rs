@@ -2293,7 +2293,8 @@ fn census_takes(name: &str, pre: &[Op], variants: &[(&str, Vec<Op>)], expect: Ex
 #[ignore = "the vacuity census; see the convergence model test report"]
 fn vacuity_census() {
     CENSUS.with(|c| *c.borrow_mut() = Some(Vec::new()));
-    let named: [fn(); 28] = [
+    let named: [fn(); 29] = [
+        finding_f12_a_page_refused_a_definition_its_drop_keeps,
         finding_f11_a_local_creation_below_the_floor_it_takes_is_history_everywhere,
         row_a_page_moves_the_clock_past_the_creation_it_vouches_for,
         row_a_page_moves_the_clock_past_the_drop_it_vouches_for,
@@ -2578,6 +2579,22 @@ fn finding_f11_a_local_creation_below_the_floor_it_takes_is_history_everywhere()
         "A.create(orders)@300; A.drop(orders)@310; B<-A scoped(orders); C<-B scoped(orders); \
          C.create(orders)@200; C.write(orders/1)@205",
         &[(ORDERS, Some(&[1]))],
+    );
+}
+
+/// F12 (found by the generated run once the first findings were fixed). A whole page of a
+/// life the receiver's floor says has ended carried an index stamped after that drop, which
+/// the drop keeps (ADR-231, extended): the page refused every definition of the life
+/// wholesale, and granted the coverage of the index's entry with it, so the receiver never
+/// held the index its sender kept. A page now judges each definition by its stamp against
+/// the floor, as the entries route does.
+#[test]
+fn finding_f12_a_page_refused_a_definition_its_drop_keeps() {
+    finding(
+        "F12",
+        "A.create(orders)@110; C<-A whole; B<-A entries; A.drop(orders)@140; \
+         C.drop(orders)@130; B.index(orders,k_1:desc)@170; B<-C whole; A.create(orders)@210",
+        &[(ORDERS, Some(&[]))],
     );
 }
 
