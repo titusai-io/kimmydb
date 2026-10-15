@@ -2635,6 +2635,9 @@ where
             // holds, and until it has arrived the member is stale: it says so
             // (ADR-202). Only a scope of `None` marks: a repair's snapshot of one
             // collection is the ordinary machinery on a member that is current.
+            if scope.is_none() {
+                stalls.whole_database_takes_over(their_node);
+            }
             if scope.is_none()
                 && let Some(catch_up) = &stalls.catch_up
                 && let Err(e) = catch_up.mark(crate::facts::CatchUpReason::Snapshot)
@@ -3746,8 +3749,19 @@ impl PeerStalls {
             }
         }
         if repairs.active.is_none() {
+            // A document (Converge) repair waits while a whole-database pull is pending
+            // for this peer: the in-memory progress holds one entry per peer, and the two
+            // would reset each other every round.
+            let whole_pending = self.snapshots.get(&peer).is_some_and(|progress| {
+                progress.scope().is_none() && !progress.is_complete() && progress.pages() > 0
+            });
+            let next = repairs
+                .queued
+                .keys()
+                .copied()
+                .find(|(_, kind)| !(whole_pending && *kind == RepairKind::Digest));
             repairs.active =
-                repairs.queued.pop_first().map(|((collection, _), repair)| (collection, repair));
+                next.and_then(|key| repairs.queued.remove(&key).map(|repair| (key.0, repair)));
             repairs.stalled = 0;
             repairs.advanced = false;
         }
@@ -3825,6 +3839,29 @@ impl PeerStalls {
     fn snapshot_forgotten(&mut self, peer: NodeId, scope: Option<CollectionId>) {
         if self.snapshots.get(&peer).is_some_and(|p| p.scope() == scope) {
             self.snapshots.remove(&peer);
+        }
+    }
+
+    /// A whole-database pull is about to start for `peer`: an active `Converge` repair
+    /// against it is abandoned as transient (it changes nothing but takes the cooldown),
+    /// so the two never reset each other's in-memory progress round after round (the
+    /// gate at planning cannot see a pull that starts after the repair was planned).
+    fn whole_database_takes_over(&mut self, peer: NodeId) {
+        let Some(repairs) = self.repairs.get_mut(&peer) else {
+            return;
+        };
+        if let Some((collection, Repair::Converge)) = repairs.active {
+            repairs.active = None;
+            repairs.done.insert((collection, RepairKind::Digest), 0);
+            repairs.stalled = 0;
+            repairs.advanced = false;
+            warn!(
+                node = %peer,
+                collection = %collection,
+                "a whole-database pull from this peer takes over; the converge repair against it \
+                 is abandoned until the divergence check reports the collection again or the \
+                 cooldown passes"
+            );
         }
     }
 
@@ -7488,6 +7525,45 @@ mod tests {
         }
         assert_eq!(stalls.repair_due(peer), None, "abandoned after three that landed nothing");
         assert!(!stalls.plan_repair(peer, collection, Repair::Converge), "and cooling down");
+    }
+
+    /// A Converge repair waits while a whole-database pull is pending for its peer, and
+    /// a whole-database pull that starts after it was planned abandons an active one.
+    #[test]
+    fn a_whole_database_pull_and_a_converge_repair_never_reset_each_other() {
+        let (peer, other) = (node(1), node(2));
+        let collection = CollectionId(7);
+        let mut stalls = PeerStalls::new();
+        assert!(stalls.plan_repair(peer, collection, Repair::Converge));
+        // A whole-database pull becomes pending for the peer after the repair was queued.
+        let mut progress = kimmy_storage::SnapshotProgress::whole_database();
+        progress.test_mark_paged();
+        stalls.snapshots.insert(peer, progress);
+        assert_eq!(
+            stalls.repair_due(peer),
+            None,
+            "a Converge repair was handed out beside the pull"
+        );
+        assert!(stalls.repairing(peer), "and it is kept, queued");
+        // The pull ends; the repair is handed out.
+        stalls.snapshots.remove(&peer);
+        assert_eq!(stalls.repair_due(peer), Some((collection, Repair::Converge)));
+
+        // A pull that starts while a Converge repair is active abandons it.
+        stalls.whole_database_takes_over(peer);
+        assert!(!stalls.repairing(peer), "the active Converge repair survived the takeover");
+        assert!(
+            !stalls.plan_repair(peer, collection, Repair::Converge),
+            "and it takes the cooldown"
+        );
+        // Another peer's repair and a count repair are untouched.
+        assert!(stalls.plan_repair(other, collection, Repair::Snapshot));
+        assert!(stalls.repair_due(other).is_some());
+        stalls.whole_database_takes_over(other);
+        assert!(
+            stalls.repairing(other),
+            "a count repair is not the whole-database pull's to abandon"
+        );
     }
 
     /// A repair of the same collection queued against another peer is cancelled
