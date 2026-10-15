@@ -7947,6 +7947,81 @@ mod tests {
         assert!(b.get_collection("shop", &shadow).is_err(), "a shadow made in its drop's Hlc");
     }
 
+    /// The definition rule is judged again under the writer (ADR-236): a database's drop
+    /// recorded between the early check and the writer makes an index of a life it covers
+    /// history, before its sweep reaches the collection.
+    #[test]
+    fn a_database_drop_recorded_while_an_index_creation_applies_makes_it_history() {
+        let (a, _da) = engine();
+        let (b, _db) = engine();
+        let b = Arc::new(b);
+        a.create_collection("shop", "orders").unwrap();
+        round(&b, &a, BATCH);
+        a.create_index("shop", "orders", vec![field("n")], false, Some("by_n".into())).unwrap();
+        let (_, window) = window_for(&b, &a);
+        let index = window
+            .entries
+            .iter()
+            .find(|e| e.kind == OpKind::CreateIndex)
+            .cloned()
+            .expect("the index's entry");
+        let covering = Stamp::new(
+            Hlc::new(index.stamp.hlc.wall_ms + 1, 0),
+            kimmy_core::NodeId::from_bytes([7; 16]),
+        );
+        let landing = Arc::clone(&b);
+        let (applied, ()) = race_hooks::race(
+            race_hooks::Race::ReplicatedIndexCreate,
+            move || {
+                landing
+                    .record_database_tombstone_for_test(
+                        kimmy_core::database_drop_id("shop"),
+                        covering,
+                    )
+                    .unwrap()
+            },
+            || b.apply_batch(std::slice::from_ref(&index)),
+        );
+        applied.unwrap();
+        let orders = b.get_collection("shop", "orders").unwrap();
+        assert!(orders.index("by_n").is_none(), "an index the database's drop covers was built");
+        race_hooks::assert_absorbed(race_hooks::Race::IndexHistory);
+    }
+
+    /// And decided before the writer where it can be (ADR-236): a definition at or before
+    /// a tombstone this node holds, in the window before the drop's sweep takes the floor,
+    /// takes no writer.
+    #[test]
+    fn a_definition_at_or_before_a_held_tombstone_is_decided_before_the_writer() {
+        let (a, _da) = engine();
+        let (b, _db) = engine();
+        a.create_collection("shop", "orders").unwrap();
+        round(&b, &a, BATCH);
+        a.create_index("shop", "orders", vec![field("n")], false, Some("by_n".into())).unwrap();
+        let (_, window) = window_for(&b, &a);
+        let index = window
+            .entries
+            .iter()
+            .find(|e| e.kind == OpKind::CreateIndex)
+            .cloned()
+            .expect("the index's entry");
+        // The state a drop's sweep leaves between its tombstone and its floor.
+        let at = Stamp::new(
+            Hlc::new(index.stamp.hlc.wall_ms + 1, 0),
+            kimmy_core::NodeId::from_bytes([7; 16]),
+        );
+        b.record_collection_drop(index.collection, at).unwrap();
+        let holds = |e: &Engine| {
+            let count = e.writer_hold().count;
+            [crate::engine::WriterHolder::Ddl, crate::engine::WriterHolder::IndexBuild]
+                .map(|holder| count[holder.slot()])
+        };
+        let before = holds(&b);
+        b.apply_batch(std::slice::from_ref(&index)).unwrap();
+        assert!(b.get_collection("shop", "orders").unwrap().index("by_n").is_none());
+        assert_eq!(holds(&b), before, "a definition of an ended life took the writer");
+    }
+
     /// A definition in the drop's own `Hlc`, from a node above the dropper's, is of the
     /// life the drop ended (ADR-236: a tie is the drop's), so it is history for a
     /// collection this node dropped and does not stop the batch: no later life can carry
