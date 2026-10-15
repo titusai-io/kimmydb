@@ -4391,11 +4391,9 @@ impl Engine {
             if !log && self.database_refusal(db, origin)?.is_some() {
                 return Ok(InTxn::History);
             }
-            let incarnation_floor = [dropped, self.database_dropped_at(db)?]
-                .into_iter()
-                .flatten()
-                .max()
-                .map(|stamp| stamp.hlc);
+            let database_dropped = self.database_dropped_at(db)?;
+            let incarnation_floor =
+                [dropped, database_dropped].into_iter().flatten().max().map(|stamp| stamp.hlc);
 
             // A vector shadow from elsewhere whose parent this node has buried
             // since the shadow was created is a life that drop ended, though
@@ -4482,6 +4480,28 @@ impl Engine {
             // incarnation starts with no digest row, so the old one's highest
             // stamps do not make it look busy (B3 design 2.1).
             crate::live_digest::reset(txn, id)?;
+            // A life created over its database's tombstone takes a tombstone of its
+            // own at the database's drop, with its shadow's, which is what the
+            // database's sweep gives every life it leaves standing (ADR-229 item 4).
+            // One rule for the table, whichever this member had first, the creation
+            // or the drop (ADR-236): the floor above refuses the same things, but the
+            // tombstone is what the existence half reads and a whole page carries.
+            if let Some(at) = database_dropped.filter(|at| dropped.is_none_or(|own| own < *at)) {
+                let mut tombstones = txn.open_table(tables::COLLECTIONS_DROPPED)?;
+                let mut ids = vec![id];
+                if !vector_meta::is_shadow(name) {
+                    ids.push(CollectionId::derive(db, &vector_meta::shadow_name(name)));
+                }
+                for id in ids {
+                    let newer = match tombstones.get(id.0)? {
+                        Some(held) => at > codec::decode_oplog_key(held.value())?,
+                        None => true,
+                    };
+                    if newer {
+                        tombstones.insert(id.0, codec::oplog_key(&at).as_slice())?;
+                    }
+                }
+            }
             (meta, stamp)
         };
 
