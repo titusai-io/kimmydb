@@ -366,3 +366,141 @@ fn the_findings_cut_reaches_the_pull_of_its_own_repair() {
         stalls.snapshot_progress(p, Some(other), kimmy_storage::SnapshotPolicy::Converge);
     assert_eq!(progress.cut(), &VersionVector::default());
 }
+
+// -- The definition repair (repair design section 12) -----------------------------------
+
+fn run_definition_to_the_end(stalls: &mut PeerStalls, peer: NodeId, built: usize) {
+    assert_eq!(stalls.plan_definition_repair(peer, C, 1_000), DigestPlan::Planned);
+    assert_eq!(stalls.repair_due(peer), Some((C, Repair::Definitions)));
+    let applied = kimmy_storage::SnapshotApplied {
+        definitions: kimmy_storage::DefinitionRestore { built, ..Default::default() },
+        ..Default::default()
+    };
+    stalls.definitions_page_applied(peer, &applied);
+    stalls.repair_finished(peer);
+}
+
+#[test]
+fn a_definition_repair_is_independent_of_a_count_repair_of_the_collection() {
+    let mut stalls = stalls_at(mins(1));
+    let p = node(1);
+    assert!(stalls.plan_repair(p, C, Repair::Snapshot));
+    assert_eq!(stalls.plan_definition_repair(p, C, 10), DigestPlan::Planned);
+    // And a digest repair beside a definition one is the digest's own.
+    assert_eq!(
+        stalls.plan_digest_repair(node(2), C, VersionVector::default()),
+        DigestPlan::Planned
+    );
+}
+
+#[test]
+fn a_whole_database_pull_pending_for_the_peer_holds_a_definition_repair() {
+    let mut stalls = stalls_at(mins(1));
+    let p = node(1);
+    let mut progress = SnapshotProgress::whole_database();
+    progress.test_mark_paged();
+    stalls.snapshots.insert(p, progress);
+    assert_eq!(stalls.plan_definition_repair(p, C, 10), DigestPlan::WholeDatabasePending);
+}
+
+#[test]
+fn a_definition_repair_that_built_an_index_lowers_the_level_and_one_that_built_none_does_not() {
+    let mut stalls = stalls_at(mins(0));
+    let p = node(1);
+    let mut now = mins(0);
+    for expected in [1u8, 2] {
+        stalls.set_repair_clock(now, mins(5));
+        stalls.retain_definition(p, &BTreeSet::new());
+        run_definition_to_the_end(&mut stalls, p, 0);
+        let v = stalls.judge_definition_repair(p, C, Judged::Ineffective, false).unwrap();
+        let Verdict::Ineffective { level, not_before } = v else { panic!("{v:?}") };
+        assert_eq!(level, expected);
+        now = not_before;
+    }
+    stalls.set_repair_clock(now, mins(5));
+    stalls.retain_definition(p, &BTreeSet::new());
+    run_definition_to_the_end(&mut stalls, p, 1);
+    let v = stalls.judge_definition_repair(p, C, Judged::Ineffective, false).unwrap();
+    assert!(matches!(v, Verdict::Ineffective { level: 1, .. }), "{v:?}");
+}
+
+#[test]
+fn an_explained_comparison_is_not_effective_and_is_counted_apart() {
+    let mut stalls = stalls_at(mins(1));
+    let p = node(1);
+    run_definition_to_the_end(&mut stalls, p, 0);
+    let v = stalls.judge_definition_repair(p, C, Judged::Ineffective, true).unwrap();
+    assert!(matches!(v, Verdict::Ineffective { .. }));
+    let counts = stalls.take_repair_counts();
+    assert_eq!(counts.definition_judgements[DefinitionJudgement::Explained.index()], 1);
+    assert_eq!(counts.definition_judgements[DefinitionJudgement::Effective.index()], 0);
+    assert_eq!(counts.definition_repairs[DigestRepairOutcome::Applied.index()], 1);
+}
+
+#[test]
+fn the_pages_index_results_are_counted_by_result() {
+    let mut stalls = stalls_at(mins(1));
+    let p = node(1);
+    assert_eq!(stalls.plan_definition_repair(p, C, 10), DigestPlan::Planned);
+    stalls.repair_due(p);
+    let applied = kimmy_storage::SnapshotApplied {
+        definitions: kimmy_storage::DefinitionRestore {
+            built: 1,
+            unique: 2,
+            ambiguous: 3,
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    stalls.definitions_page_applied(p, &applied);
+    let counts = stalls.take_repair_counts();
+    let at = |label: &str| {
+        counts.definition_indexes
+            [kimmy_storage::DEFINITION_RESULTS.iter().position(|l| *l == label).unwrap()]
+    };
+    assert_eq!((at("built"), at("unique"), at("ambiguous"), at("ttl")), (1, 2, 3, 0));
+}
+
+#[test]
+fn a_whole_database_pull_taking_over_ends_a_definition_repair_as_transient() {
+    let mut stalls = stalls_at(mins(1));
+    let p = node(1);
+    assert_eq!(stalls.plan_definition_repair(p, C, 10), DigestPlan::Planned);
+    stalls.repair_due(p);
+    stalls.whole_database_takes_over(p);
+    let counts = stalls.take_repair_counts();
+    assert_eq!(counts.definition_repairs[DigestRepairOutcome::Transient.index()], 1);
+    stalls.retain_definition(p, &BTreeSet::new());
+    assert_eq!(stalls.plan_definition_repair(p, C, 10), DigestPlan::Planned);
+}
+
+#[test]
+fn the_size_gate_reaches_the_pull_of_its_own_repair() {
+    let mut stalls = stalls_at(mins(1));
+    let p = node(1);
+    assert_eq!(stalls.plan_definition_repair(p, C, 4_321), DigestPlan::Planned);
+    assert_eq!(stalls.repair_due(p), Some((C, Repair::Definitions)));
+    let progress = stalls.snapshot_progress(p, Some(C), kimmy_storage::SnapshotPolicy::Definitions);
+    assert_eq!(progress.max_index_documents(), 4_321);
+}
+
+#[test]
+fn a_definition_repair_not_judged_by_its_deadline_is_counted_unjudged() {
+    let mut stalls = stalls_at(mins(1));
+    let p = node(1);
+    run_definition_to_the_end(&mut stalls, p, 1);
+    stalls.set_repair_clock(mins(40), mins(5));
+    assert_eq!(stalls.expire_repairs().len(), 1);
+    let counts = stalls.take_repair_counts();
+    assert_eq!(counts.definition_judgements[DefinitionJudgement::Unjudged.index()], 1);
+    assert_eq!(counts.digest_judgements[Judgement::Unjudged.index()], 0);
+}
+
+#[test]
+fn a_definition_and_a_digest_repair_of_one_pair_have_ledgers_of_their_own() {
+    let mut stalls = stalls_at(mins(1));
+    let p = node(1);
+    run_definition_to_the_end(&mut stalls, p, 0);
+    // Awaiting the definition probe: the digest repair is not held by it.
+    assert_eq!(stalls.plan_digest_repair(p, C, VersionVector::default()), DigestPlan::Planned);
+}
