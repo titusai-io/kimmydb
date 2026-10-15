@@ -872,7 +872,17 @@ impl Engine {
         self.apply_carried_index_drops(page, progress.scope)?;
         let mut ddl_refused = 0usize;
         for state in &page.collections {
-            match self.restore_collection(state, &page.versions, peer) {
+            // The sender's tombstone for this id, which a whole page carries
+            // (ADR-162): the burial of a life the arriving one followed is named
+            // by it when it is the drop the floor stands for (ADR-236).
+            let carried = match progress.scope {
+                Some(_) => None,
+                None => {
+                    let id = CollectionId::derive(&state.db, &state.name);
+                    page.dropped_collections.iter().find(|(c, _)| *c == id).map(|(_, s)| *s)
+                }
+            };
+            match self.restore_collection(state, &page.versions, peer, carried) {
                 Ok(refused) => ddl_refused += refused,
                 // The page's own drops just buried a life of this name, and
                 // its rows are the purger's now. What the page committed so
@@ -1575,16 +1585,28 @@ impl Engine {
     /// and named by the sender's own coverage like every stamp off the wire (ADR-163).
     /// The drop is applied through the one path a carried drop takes
     /// (`restore_collection_drop`: the late-drop sweep that keeps what was written
-    /// after the drop, the tombstone recorded), at a stamp made of the floor and the
-    /// sender's node, because a page carries the floor as a time and not the origin of
-    /// the drop; the real tombstone, if it ever arrives, is the same or a later stamp
-    /// and replaces it. With no floor on the page, nothing is buried: two members that
-    /// create one name with no drop between them are not a life ended.
+    /// after the drop, the tombstone recorded), **at the drop's own stamp when the page
+    /// carries its tombstone** (`carried`, a whole page's tombstone for this id, at the
+    /// floor's `Hlc`; ADR-236), so the receiver names the drop as its maker and every
+    /// other member do. A whole page applies its carried drops before its definitions,
+    /// so this is the case of a tombstone its sender holds and its coverage does not
+    /// name (the sender took the drop by a scoped page): the carried pair is not applied
+    /// as a drop (ADR-163), but the floor is named, and the floor is the drop's time.
+    /// **Otherwise** (a scoped page, which carries no tombstone for a collection its
+    /// sender holds, or a sender whose tombstone aged out) the stamp is the floor and the
+    /// sender's node, because the page carries the floor as a time and not the origin of
+    /// the drop. `record_collection_drop` keeps the greater stamp, so the real tombstone
+    /// replaces it when it arrives and sorts above it (a later `Hlc`, or the same one from
+    /// a node above the sender's); one that sorts below leaves the synthetic stamp, which
+    /// is harmless, because every comparison of a drop against a life reads the `Hlc`.
+    /// With no floor on the page, nothing is buried: two members that create one name
+    /// with no drop between them are not a life ended.
     pub(crate) fn bury_the_life_this_one_followed(
         &self,
         state: &CollectionState,
         versions: &VersionVector,
         from: NodeId,
+        carried: Option<Stamp>,
     ) -> Result<()> {
         let Some(floor) = state.incarnation_floor.filter(|floor| hlc_is_named(*floor, versions))
         else {
@@ -1629,16 +1651,16 @@ impl Engine {
              that drop would, keeping what was written after it"
         );
         self.witness_hlc(floor);
-        // The burial stamp takes the sender's node, which is never exposed on a tie today:
-        // a write whose Hlc equals the drop's is history by the floor rule whatever its
-        // node (`is_history` compares `stamp.hlc <= floor`, documented as intended for
-        // same-millisecond ties). If that rule ever becomes node-aware, this stamp would
-        // bury a write later than the real drop whenever `from` sorts above the dropper,
-        // and this choice must be revisited with it.
-        self.restore_collection_drop(
-            CollectionId::derive(&state.db, &state.name),
-            Stamp::new(floor, from),
-        )
+        // Without the carried tombstone the stamp takes the sender's node, which is never
+        // exposed on a tie today: a write whose Hlc equals the drop's is history by the
+        // floor rule whatever its node (`is_history` compares `stamp.hlc <= floor`,
+        // documented as intended for same-millisecond ties). If that rule ever becomes
+        // node-aware, that stamp would bury a write later than the real drop whenever
+        // `from` sorts above the dropper, and the choice must be revisited with it.
+        let stamp = carried
+            .filter(|dropped| dropped.hlc == floor)
+            .unwrap_or_else(|| Stamp::new(floor, from));
+        self.restore_collection_drop(CollectionId::derive(&state.db, &state.name), stamp)
     }
 
     /// Recreate a collection and its indexes from a snapshot.
@@ -1660,13 +1682,14 @@ impl Engine {
         state: &CollectionState,
         versions: &VersionVector,
         from: NodeId,
+        carried: Option<Stamp>,
     ) -> Result<usize> {
         // The creation, before it is stored: the clock must be past the incarnation this
         // node is about to serve, or its next local write is stamped below it.
         if let Some(created) = state.created {
             self.witness_covered_hlc(created, versions);
         }
-        self.bury_the_life_this_one_followed(state, versions, from)?;
+        self.bury_the_life_this_one_followed(state, versions, from, carried)?;
         if self.get_collection(&state.db, &state.name).is_err() {
             // A snapshot must not recreate a life this node has buried. The
             // page is current state on its sender, not an instruction: a peer
@@ -7392,7 +7415,7 @@ mod tests {
 
                 let definitions = |b: &Engine| {
                     for state in &page.collections {
-                        b.restore_collection(state, &page.versions, a.node_id()).unwrap();
+                        b.restore_collection(state, &page.versions, a.node_id(), None).unwrap();
                     }
                 };
                 if drops_first {

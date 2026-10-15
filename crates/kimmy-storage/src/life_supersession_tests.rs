@@ -528,7 +528,7 @@ fn a_failure_between_the_burial_and_the_restore_leaves_nothing_that_does_not_hea
     let page = a.snapshot_page(None, Some(orders_id())).unwrap();
     let state = &page.collections[0];
     let floor = state.incarnation_floor.expect("premise: the page carries the floor");
-    b.bury_the_life_this_one_followed(state, &page.versions, a.node_id()).unwrap();
+    b.bury_the_life_this_one_followed(state, &page.versions, a.node_id(), None).unwrap();
     assert!(b.get_collection("shop", "orders").is_err(), "the burial left a life standing");
     let tombstone = b.collection_dropped_at(orders_id()).unwrap().expect("a tombstone");
     assert_eq!(tombstone.hlc, floor, "the tombstone is at the floor");
@@ -536,6 +536,45 @@ fn a_failure_between_the_burial_and_the_restore_leaves_nothing_that_does_not_hea
     transfer_under(&b, &a, SnapshotProgress::of_collection(orders_id()));
     assert_holds_the_senders_life(&a, &b, "the retry");
     assert_eq!(b.get_collection("shop", "orders").unwrap().incarnation_floor.unwrap(), floor);
+}
+
+/// The burial takes the drop's own stamp from the page's tombstone when the page carries
+/// one (ADR-236), so the receiver and the drop's maker name one drop by one stamp. C took
+/// A's drop by a scoped page (its tombstone, and no coverage of A) and A's new life by
+/// another, then wrote into it; B, holding the life before, takes C's whole page. The
+/// carried pair is not one C's coverage names, so it is not applied as a drop (ADR-163);
+/// the floor is named by C's own write, and the burial it drives was stamped with C's
+/// node, a tombstone of the drop that no member which made or applied it holds.
+#[test]
+fn a_burial_from_a_whole_page_takes_the_stamp_of_the_tombstone_it_carries() {
+    let (a, _da) = engine();
+    let (b, _db) = engine();
+    let (c, _dc) = engine();
+    let first = a.create_collection("shop", "orders").unwrap();
+    a.insert(&first, doc! { "_id": 1 }).unwrap();
+    transfer(&b, &a);
+    later();
+    a.drop_collection("shop", "orders").unwrap();
+    a.finish_purges_now().unwrap();
+    let dropped = a.collection_dropped_at(orders_id()).unwrap().expect("the drop's tombstone");
+    transfer_under(&c, &a, SnapshotProgress::of_collection(orders_id()));
+    assert_eq!(c.collection_dropped_at(orders_id()).unwrap(), Some(dropped), "premise");
+    later();
+    a.create_collection("shop", "orders").unwrap();
+    transfer_under(&c, &a, SnapshotProgress::of_collection(orders_id()));
+    let on_c = c.get_collection("shop", "orders").unwrap();
+    assert_eq!(on_c.incarnation_floor, Some(dropped.hlc), "premise: the floor came with it");
+    c.insert(&on_c, doc! { "_id": 2 }).unwrap();
+    let page = c.snapshot_page(None, None).unwrap();
+    assert!(page.versions.get(a.node_id()) < dropped.hlc, "premise: C cannot vouch for A's drop");
+
+    transfer(&b, &c);
+    assert!(!has(&b, 1) && has(&b, 2), "the life before ended and the new one stands");
+    assert_eq!(
+        b.collection_dropped_at(orders_id()).unwrap(),
+        Some(dropped),
+        "the burial named the drop by its maker's stamp"
+    );
 }
 
 // -- A relay passes the floor on (PR #193, break-the-guard review) -------------------------
