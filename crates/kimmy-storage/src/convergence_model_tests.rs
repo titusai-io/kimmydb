@@ -449,7 +449,7 @@ pub(crate) enum Route {
     Entries,
     /// The same cluster after `Entries`, with the divergence check's repairs
     /// added (the existence half's scoped page, the count half's replay from
-    /// `min(floor, created)`): the entries route as the loop runs it.
+    /// `min(floor, created, tombstone)`): the entries route as the loop runs it.
     Repaired,
     /// Whole-database pages only.
     Pages,
@@ -1019,7 +1019,8 @@ impl Cluster {
     /// The divergence check every contact makes, and the repair it plans
     /// (`peers.rs`): a collection the peer holds that this member does not, past
     /// this member's tombstone, is pulled as a scoped page; a collection whose live
-    /// count differs is replayed from the peer's oplog from `min(floor, created)`, or
+    /// count differs is replayed from the peer's oplog from `min(floor, created,
+    /// tombstone)` (`Engine::count_repair_replay_from`), or
     /// pulled as a scoped page when the peer cannot serve from there. One check is
     /// enough here: the cluster is level, so the second check would confirm it.
     fn repair_round(&mut self) -> Res<()> {
@@ -1065,9 +1066,11 @@ impl Cluster {
                 for (id, meta) in counts {
                     match meta {
                         Some(meta) => {
-                            let from = meta
-                                .incarnation_floor
-                                .map_or(meta.created, |floor| floor.min(meta.created));
+                            // Where `peers.rs` plans it from.
+                            let from = self
+                                .e(me)
+                                .count_repair_replay_from(&meta)
+                                .map_err(|e| err("count_repair_replay_from", e))?;
                             self.note(format!(
                                 "repair: {}'s count of {} differs from {}'s, a replay from {}",
                                 my_letter,

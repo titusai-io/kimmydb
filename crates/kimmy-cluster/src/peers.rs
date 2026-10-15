@@ -1404,14 +1404,16 @@ pub async fn replicate(engine: Arc<Engine>, config: ReplicationConfig) {
                                             // that preceded this life (a member that kept it
                                             // through the drop, ADR-231 extended) is part of
                                             // the life and sorts before the creation. A replay
-                                            // from the creation would never serve it.
-                                            Ok(Some(meta)) => Repair::Replay {
-                                                from: meta
-                                                    .incarnation_floor
-                                                    .map_or(meta.created, |floor| {
-                                                        floor.min(meta.created)
-                                                    }),
-                                            },
+                                            // from the creation would never serve it. And no
+                                            // higher than the tombstone held for the id
+                                            // (ADR-236), so a drop this member holds below a
+                                            // late `created` of its own is replayed past too.
+                                            Ok(Some(meta)) => {
+                                                match engine.count_repair_replay_from(&meta) {
+                                                    Ok(from) => Repair::Replay { from },
+                                                    Err(_) => Repair::Snapshot,
+                                                }
+                                            }
                                             _ => Repair::Snapshot,
                                         };
                                         if stalls.plan_repair(node, *collection, repair) {

@@ -629,6 +629,27 @@ impl Engine {
         Ok(Some(self.finish_burial(db, name, burial)))
     }
 
+    /// Where the count half's repair replays a peer's oplog from for the life
+    /// `standing` (ADR-231 item 7, ADR-236): the lowest of its incarnation floor,
+    /// its `created`, and the tombstone this member holds for its id.
+    ///
+    /// The floor is where the life's valid history begins, and it can sort before
+    /// `created` (a write kept through a drop, then a creation elsewhere). The
+    /// tombstone is the second line behind relaying an ignored drop: a member
+    /// whose own late `created` sits above a drop it holds could otherwise ask
+    /// for nothing at or below that drop, and a straggler of the life it ended,
+    /// set aside or taken in, is judged again by the replay. Everything at or
+    /// below the floor or the tombstone is refused as history on the way, so
+    /// starting lower costs entries read and returns nothing of a life before.
+    pub fn count_repair_replay_from(&self, standing: &CollectionMeta) -> Result<Hlc> {
+        let tombstone = self.collection_dropped_at(standing.id)?.map(|stamp| stamp.hlc);
+        Ok([Some(standing.created), standing.incarnation_floor, tombstone]
+            .into_iter()
+            .flatten()
+            .min()
+            .unwrap_or(standing.created))
+    }
+
     /// A drop was judged aimed at a life of `current` that has already ended
     /// ([`crate::sync::aims_at_a_previous_incarnation`]): sweep what the newer
     /// life holds of the one before, in the collection and in its vector shadow.
@@ -1927,5 +1948,29 @@ mod tests {
         b.apply_batch(rest).unwrap();
         quiesce(&[&a, &b]);
         assert!(b.get_collection("shop", "orders").unwrap().vector.is_some());
+    }
+
+    /// The count half's replay starts no higher than the tombstone this member holds
+    /// for the id (ADR-236), nor than the floor, nor than `created`: a member whose own
+    /// creation is above a drop it holds and has not yet floored the life at (a sweep
+    /// owed, or a store from before the sweep) still asks for that drop's history.
+    #[test]
+    fn the_count_repairs_replay_starts_at_the_lowest_of_floor_created_and_tombstone() {
+        let (e, _d) = engine();
+        let orders = e.create_collection("shop", "orders").unwrap();
+        assert_eq!(e.count_repair_replay_from(&orders).unwrap(), orders.created, "nothing lower");
+
+        let below = Hlc::new(orders.created.wall_ms.saturating_sub(10), 0);
+        e.record_collection_drop(orders.id, Stamp::new(below, NodeId::from_bytes([7; 16])))
+            .unwrap();
+        assert_eq!(e.count_repair_replay_from(&orders).unwrap(), below, "the tombstone, owed");
+
+        let mut floored = orders.clone();
+        floored.incarnation_floor = Some(Hlc::new(below.wall_ms.saturating_sub(5), 0));
+        assert_eq!(
+            e.count_repair_replay_from(&floored).unwrap(),
+            floored.incarnation_floor.unwrap(),
+            "the floor, where it is the lowest"
+        );
     }
 }

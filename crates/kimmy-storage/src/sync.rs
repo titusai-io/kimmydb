@@ -2305,12 +2305,22 @@ impl Engine {
                             // The life this very drop re-dated (ADR-231, extended)
                             // is "ignored" only because an interrupted apply
                             // redelivers the drop to it: the entry was not
-                            // appended then, and is now, below, so this member
-                            // holds it to serve onward.
+                            // appended then, and is now, below, with the
+                            // tombstones a first apply records.
                             if !(current.is_redated()
                                 && current.created == entry.stamp.hlc.successor())
                             {
-                                return Ok(DdlOutcome::Applied);
+                                // And held and served onward like an applied drop
+                                // (ADR-236). Withheld, this member went on to
+                                // append the dropper's later entries, so the
+                                // vector it serves named the drop's origin past
+                                // the drop: a peer that pulled it took that
+                                // vector and was never served the drop by
+                                // anyone, and kept the life the drop ended.
+                                // Every receiver judges the entry for itself
+                                // (`aims_at_a_previous_incarnation`, the sweep),
+                                // so relaying it is harmless.
+                                return self.append_replicated_ddl(entry);
                             }
                         }
                     }
@@ -2377,8 +2387,9 @@ impl Engine {
                     // `CreateCollection` older than its drop is above — this
                     // node does not re-serve onward an entry it has decided
                     // is history. The drop's own entry, which is appended
-                    // when applied, is what carries the ordering to a third
-                    // member; nothing is lost by withholding the create.
+                    // whether it was applied or ignored (ADR-236), is what
+                    // carries the ordering to a third member; nothing is lost
+                    // by withholding the create.
                     Ddl::Applied(RemoteIndex::History) => return Ok(DdlOutcome::Applied),
                     Ddl::Gone => {
                         return Ok(DdlOutcome::UnknownCollection(format!(
