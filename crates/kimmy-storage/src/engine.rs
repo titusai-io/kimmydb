@@ -4260,6 +4260,7 @@ impl Engine {
     /// before, written with the creation in the one transaction, so a stop
     /// cannot leave the life standing without the marker a database's drop
     /// judges it by.
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn create_collection_marked(
         &self,
         db: &str,
