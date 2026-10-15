@@ -574,8 +574,25 @@ impl DivergenceTracker {
     /// match clears it. A collection not compared this contact leaves the
     /// state where its last comparison left it, as silence about a peer is not
     /// evidence it has reconciled.
+    ///
+    /// **A compared match also clears a suspended count finding of the same pair**
+    /// ([`Self::observe_count_deferred`]): the two members hold the same rows at the cut,
+    /// and a deferred count probe, which a peer that trails this member and moves gets on
+    /// every contact while this member takes writes, would otherwise leave the finding, and
+    /// the gauge it lights, standing for as long as the writes go on. It clears only a
+    /// finding no compared count probe has renewed since, never plans a repair, and a
+    /// mismatch of the digest never confirms a count finding.
     pub fn observe_digest(&mut self, peer: NodeId, id: CollectionId, mismatched: bool) -> bool {
         let key = (peer, id);
+        if !mismatched && self.count_suspended.remove(&key) {
+            self.count_pending.remove(&key);
+            if let Some(set) = self.count_confirmed.get_mut(&peer) {
+                set.remove(&id);
+                if set.is_empty() {
+                    self.count_confirmed.remove(&peer);
+                }
+            }
+        }
         if mismatched {
             let confirmed = self.digest_pending.contains(&key);
             self.digest_pending.insert(key);
@@ -1547,6 +1564,60 @@ mod tests {
         );
         tracker.observe(p, mismatched);
         assert_eq!(tracker.confirmed_against(p), set(&[7]));
+    }
+
+    /// A compared-equal cut digest of the same peer and collection clears a **suspended**
+    /// count finding: the two hold the same rows at the cut, so the gauge the finding keeps
+    /// lit is stale (a deferred probe re-examined nothing, and a peer that trails this member
+    /// and moves defers it for as long as this member takes writes). Only a suspended finding,
+    /// only that pair, and only a compared match: a finding the count probe itself last
+    /// compared is its own evidence, and the digest never plans a count repair.
+    #[test]
+    fn a_compared_equal_digest_clears_a_suspended_count_finding() {
+        let mut tracker = DivergenceTracker::new();
+        let (p, q, c, d) = (peer(1), peer(2), id(7), id(8));
+        let mismatched = Findings { existence: set(&[]), count: Some((c, true)) };
+        let suspend = |tracker: &mut DivergenceTracker, p: NodeId, c: CollectionId| {
+            tracker.observe(p, Findings { existence: set(&[]), count: Some((c, true)) });
+            tracker.observe(p, Findings { existence: set(&[]), count: Some((c, true)) });
+            tracker.observe_count_deferred(p, c);
+        };
+        suspend(&mut tracker, p, c);
+        assert_eq!(tracker.confirmed_count(), 1);
+        assert!(tracker.confirmed_against(p).is_empty(), "suspended");
+
+        // Not a match, not the pair: nothing clears.
+        tracker.observe_digest(p, c, true);
+        tracker.observe_digest(p, d, false);
+        tracker.observe_digest(q, c, false);
+        assert_eq!(
+            tracker.reported_against(p),
+            set(&[7]),
+            "a mismatch or another pair clears nothing"
+        );
+
+        tracker.observe_digest(p, c, false);
+        assert_eq!(tracker.confirmed_count(), 0, "the gauge is no longer lit");
+        assert!(tracker.reported_against(p).is_empty());
+        assert!(tracker.confirmed_against(p).is_empty());
+
+        // Gone for good: one compared mismatch only starts a finding again.
+        tracker.observe(p, mismatched.clone());
+        assert!(tracker.confirmed_against(p).is_empty(), "one mismatch confirms nothing");
+        tracker.observe(p, mismatched.clone());
+        assert_eq!(tracker.confirmed_against(p), set(&[7]));
+
+        // A finding the count probe itself last compared is not suspended: a digest that
+        // compares equal clears nothing of it.
+        tracker.observe_digest(p, c, false);
+        assert_eq!(tracker.confirmed_against(p), set(&[7]), "its own evidence stands");
+        assert_eq!(tracker.confirmed_count(), 1);
+
+        // Renewed after the clear it is suspended afresh and cleared the same way.
+        tracker.observe_count_deferred(p, c);
+        assert!(tracker.confirmed_against(p).is_empty());
+        tracker.observe_digest(p, c, false);
+        assert_eq!(tracker.confirmed_count(), 0);
     }
 
     /// The realistic trigger for this defect: the gauge fires, an operator

@@ -4467,6 +4467,37 @@ mod digest_fold_tests {
         assert_eq!(f.tracker.digest_confirmed_count(), 1);
     }
 
+    /// The count finding the gate suspended (its latest probe deferred, ADR-168) keeps
+    /// `kimmy_sync_divergent_collections` lit for as long as this member takes writes; a
+    /// cut digest of the same peer and collection that compares equal clears it, through
+    /// the fold the loop runs, and plans nothing.
+    #[test]
+    fn a_compared_equal_digest_round_clears_the_suspended_count_finding() {
+        let mut f = fixture();
+        let (node, id) = (f.node, f.collection);
+        let mismatched = kimmy_storage::DivergenceFindings {
+            existence: BTreeSet::new(),
+            count: Some((id, true)),
+        };
+        f.tracker.observe(node, mismatched.clone());
+        f.tracker.observe(node, mismatched);
+        f.tracker.observe_count_deferred(node, id);
+        assert_eq!(f.tracker.confirmed_count(), 1, "premise: suspended, and still lit");
+        assert!(f.tracker.confirmed_against(node).is_empty(), "premise: plans nothing");
+
+        // A digest the contact did not compare leaves it.
+        f.fold(DigestRound::new(DigestAnswered::Busy));
+        assert_eq!(f.tracker.confirmed_count(), 1, "silence is not reconciliation");
+        // A mismatch of the digest is not the count finding's evidence either way.
+        f.fold(f.mismatch());
+        assert_eq!(f.tracker.confirmed_count(), 1);
+
+        f.fold(f.equal());
+        assert_eq!(f.tracker.confirmed_count(), 0, "the gauge is no longer lit");
+        assert!(f.tracker.reported_against(node).is_empty());
+        assert!(f.tracker.confirmed_against(node).is_empty());
+    }
+
     /// The cut an exact mismatch was compared at is kept for the repair its finding plans,
     /// whose progress is counted against it (repair design section 4, R3).
     #[test]

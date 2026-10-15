@@ -27712,7 +27712,17 @@ close the cases it can prove safe, leave the rest to the operator in words, and 
    digest repair is not planned beside a count repair of the collection (the replay lands what it would;
    `skipped_count_repair`), nor for a peer with a whole-database pull pending (the in-memory progress holds one entry per
    peer), nor while this member or the peer is catching up, and a whole-database pull that starts for the peer abandons
-   its active and queued repairs as transient.
+   its active and queued repairs as transient. **One way only runs the other way: a compared-equal cut digest clears a
+   suspended count finding.** A count finding whose latest probe the gate deferred is *suspended* (ADR-236): confirmed
+   for the gauge, planning nothing. While this member takes writes a peer that trails it and moves defers every probe,
+   so the finding, and `kimmy_sync_divergent_collections` with it, would stand for as long as the writes go on after
+   the two hold the same documents (in the storm of the review, the gauge read 2 for the rest of the run, with the
+   digests of both collections comparing equal on every contact). `DivergenceTracker::observe_digest(.., equal)` now
+   clears a suspended finding of the **same peer and collection**: it leaves the confirmed set, the pending mark and the
+   suspension. Nothing else: not a finding the count probe itself last compared (that probe is its own evidence and
+   only a compared count probe clears it), not another pair, not a digest the contact did not compare (silence is not
+   reconciliation), and never a plan: a digest mismatch confirms no count finding and a digest finding plans a digest
+   repair only. The separation this point states is kept; the digest only takes a finding down.
 3. **The young-stamp rule rests on a persisted collected-through horizon.** A lost insert (an insert this member never
    received) and a deleted document whose tombstone was collected look the same to a member that holds nothing for the
    id. A row is written only if its stamp is **newer than every tombstone cutoff either member of the pair has
@@ -27759,7 +27769,14 @@ close the cases it can prove safe, leave the rest to the operator in words, and 
    transient end of any other kind for one `(peer, collection, kind)` climbs one** (a failure that repeats by itself,
    such as a page that always faults, is not allowed to retry at the cooldown for ever; a peer whose Converge rounds
    always fail is repaired on the back-off schedule, about eight times a day; a repair that
-   ran to its end and was judged resets the run). **R2** a repair is judged at the first *compared* probe after its end
+   ran to its end and was judged resets the run). **Accepted deviation from the design's R1, which has a
+   transient end change nothing but the cooldown:** an abandon or a `dropped` page climbs a level **every time**, other
+   transient causes (a peer error, a stop, a whole-database takeover, a cancellation, a definition page without the
+   collection) only on the **third in a row**. An abandon is already three rounds that landed nothing, and a `dropped`
+   page is the sender answering that it holds a drop of the collection: repeating either at the cooldown
+   is the loop the guard exists to end, and a transient cause that is rare by itself (one stop in a restart) must not
+   climb. The cost is that a sender whose pages are *sometimes* dropped is repaired on the back-off schedule (5 min, 15
+   min, 45 min, 2 h 15 min, 6 h) from the first of them; a repair that ran to its end and was judged resets the run. **R2** a repair is judged at the first *compared* probe after its end
    and only there; an unjudged deadline (three rotation periods, at least 30 minutes) counts as transient, but every
    second consecutive unjudged end is one ineffective step. **R3** an ineffective repair backs off 5 min, 15 min, 45 min,
    2 h 15 min, 6 h (cap 5); a repair that made **progress lowers the level to 1**, and progress is **a row at or below the
