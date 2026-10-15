@@ -1600,8 +1600,9 @@ pub(crate) fn below_floor(standing: &CollectionMeta, stamp: Stamp) -> bool {
 }
 
 /// Whether a definition change for a collection this node does not hold, under a
-/// drop's tombstone `dropped`, belongs to a life of the name this node has not had
-/// yet: a `CreateIndex` or `ConfigureVectors` **stamped after the drop** (`Hlc`,
+/// drop's tombstone `dropped` (the later of the collection's and its database's,
+/// `Engine::drop_a_definition_is_judged_by`), belongs to a life of the name this node
+/// has not had yet: a `CreateIndex` or `ConfigureVectors` **stamped after the drop** (`Hlc`,
 /// the creation rule's side of the tie, ADR-236). It is of a newer life whose
 /// creation sorts after it in this node's window, or of the life the drop reached
 /// elsewhere and that kept what was written after it (ADR-231, extended); taken as
@@ -2008,6 +2009,30 @@ impl Engine {
 }
 
 impl Engine {
+    /// The drop a definition change for a collection this node does not hold is
+    /// judged against (`defines_a_later_life`): the later of the collection's own
+    /// tombstone and its database's, since no life of the name can begin at or
+    /// before a database tombstone (ADR-229) and the database's drop takes what a
+    /// covered life made at or before it (ADR-236). With the collection's alone, a
+    /// definition between the two stopped the batch for a life that can never
+    /// come, and a sender that buried the collection itself answered the scoped
+    /// page with the same lower tombstone for ever. `None` when the collection's
+    /// own tombstone is absent: a collection this node has no record of.
+    fn drop_a_definition_is_judged_by(&self, entry: &OplogEntry) -> Result<Option<Stamp>> {
+        #[derive(serde::Deserialize)]
+        struct Names {
+            db: String,
+        }
+        let Some(own) = self.collection_dropped_at(entry.collection)? else {
+            return Ok(None);
+        };
+        let database = match entry.body.as_deref().map(bson::deserialize_from_slice::<Names>) {
+            Some(Ok(names)) => self.database_dropped_at(&names.db)?,
+            _ => None,
+        };
+        Ok(Some(database.map_or(own, |database| database.max(own))))
+    }
+
     /// Process one replicated entry. Witnessing is the caller's job, so that
     /// no branch here can forget it.
     ///
@@ -2054,7 +2079,7 @@ impl Engine {
                     // stamped after the drop belongs to (`defines_a_later_life`):
                     // both stop the batch, and the scoped page (ADR-148) brings
                     // the life with its definitions.
-                    match self.collection_dropped_at(entry.collection)? {
+                    match self.drop_a_definition_is_judged_by(entry)? {
                         Some(dropped) if !defines_a_later_life(entry, dropped) => {
                             outcome.superseded += 1;
                         }
@@ -7805,6 +7830,52 @@ mod tests {
         let index_id = kimmy_core::IndexMeta::derive_id(&index.name);
         assert!(b.index_dropped_at(orders, index_id).unwrap().is_some(), "its tombstone is held");
         assert!(b.witnessed_vector().unwrap().covers(&a.version_vector().unwrap()));
+    }
+
+    /// A definition in the drop's own `Hlc`, from a node above the dropper's, is of the
+    /// life the drop ended (ADR-236: a tie is the drop's), so it is history for a
+    /// collection this node dropped and does not stop the batch: no later life can carry
+    /// it, and stopped at it the batch would wait for one for ever.
+    #[test]
+    fn a_definition_in_the_drops_own_hlc_is_history_and_does_not_stop_the_batch() {
+        let (a, _da) = engine();
+        let (b, _db) = engine();
+        a.create_collection("shop", "orders").unwrap();
+        round(&b, &a, BATCH);
+        b.drop_collection("shop", "orders").unwrap();
+        let orders = CollectionId::derive("shop", "orders");
+        let dropped = b.collection_dropped_at(orders).unwrap().expect("the drop's tombstone");
+        let field = crate::meta::IndexField { path: "n".into(), descending: false };
+        a.create_index("shop", "orders", vec![field], false, None).unwrap();
+        let (_, window) = window_for(&b, &a);
+        let mut index = window
+            .entries
+            .iter()
+            .find(|e| e.kind == OpKind::CreateIndex)
+            .cloned()
+            .expect("the index's entry");
+        index.stamp = Stamp::new(dropped.hlc, kimmy_core::NodeId::from_bytes([0xff; 16]));
+        assert!(index.stamp > dropped, "premise: the tie sorts above the drop");
+        let outcome = b.apply_batch(std::slice::from_ref(&index)).unwrap();
+        assert_eq!(outcome.unknown_collection, 0, "a tie stopped the batch: {outcome:?}");
+        assert_eq!(outcome.superseded, 1, "{outcome:?}");
+    }
+
+    /// A vector configuration stamped after a local drop is a definition of a later life
+    /// too (ADR-236), and stops the batch as an index creation does.
+    #[test]
+    fn a_vector_configuration_stamped_after_a_local_drop_stops_the_batch() {
+        let (a, _da) = engine();
+        let (b, _db) = engine();
+        a.create_collection("shop", "orders").unwrap();
+        round(&b, &a, BATCH);
+        b.drop_collection("shop", "orders").unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(2));
+        a.configure_vectors("shop", "orders", vector_config()).unwrap();
+        let outcome = round(&b, &a, BATCH);
+        assert_eq!(outcome.unknown_collection, 1, "{outcome:?}");
+        let stopped = outcome.unknown.expect("the stop names the collection");
+        assert_eq!(stopped.id, CollectionId::derive("shop", "orders"), "{stopped:?}");
     }
 
     /// What a peer serves `into`'s position from `from`: the window, and the

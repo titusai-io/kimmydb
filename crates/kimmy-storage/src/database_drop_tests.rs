@@ -125,6 +125,39 @@ fn a_creation_the_database_refuses_is_relayed_and_its_tombstone_follows() {
     assert_eq!(pull(&c, &a), SyncOutcome::default(), "and nothing is left to serve");
 }
 
+/// A definition for a collection this member does not hold, stamped after the
+/// collection's own tombstone and at or before its database's, is history and does
+/// not stop the batch (ADR-236): no life of the name can begin at or before the
+/// database's drop, and the drop takes what a life it covers made before it. Judged
+/// against the collection's tombstone alone it stopped the batch for a life that can
+/// never come.
+#[test]
+fn a_definition_below_the_databases_tombstone_is_history_for_an_absent_collection() {
+    let (a, _da) = engine();
+    let (e, _de) = engine();
+    a.create_collection("shop", "orders").unwrap();
+    let field = vec![kimmy_core::IndexField::ascending("k")];
+    a.create_index("shop", "orders", field, false, Some("by_k".into())).unwrap();
+    let created = a
+        .entries_for_peer(Hlc::ZERO, BATCH, crate::WalkScope::Background)
+        .unwrap()
+        .entries
+        .into_iter()
+        .find(|entry| entry.kind == OpKind::CreateIndex)
+        .expect("the index's entry");
+    let orders = CollectionId::derive("shop", "orders");
+    let at = |wall: u64| Stamp::new(Hlc::new(wall, 0), NodeId::from_bytes([7; 16]));
+    e.record_collection_drop(orders, at(created.stamp.hlc.wall_ms - 1)).unwrap();
+    e.record_database_tombstone_for_test(
+        kimmy_core::database_drop_id("shop"),
+        at(created.stamp.hlc.wall_ms + 1),
+    )
+    .unwrap();
+    let outcome = e.apply_batch(std::slice::from_ref(&created)).unwrap();
+    assert_eq!(outcome.unknown_collection, 0, "{:?}", outcome.unknown);
+    assert_eq!(outcome.superseded, 1, "{outcome:?}");
+}
+
 /// Control: a collection created after the drop stands and replicates. The
 /// pair with the two tests above is what tells the fix from "refuse every
 /// collection of a database that was ever dropped".
