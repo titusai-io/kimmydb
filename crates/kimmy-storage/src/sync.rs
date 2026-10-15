@@ -1573,7 +1573,7 @@ impl Engine {
         stamp: Stamp,
     ) -> Result<bool> {
         if let Some(dropped_at) = self.memo_dropped_at(memo, id)?
-            && stamp < dropped_at
+            && stamp.hlc <= dropped_at.hlc
         {
             return Ok(true);
         }

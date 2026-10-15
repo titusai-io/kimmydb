@@ -1237,3 +1237,67 @@ async fn a_stream_open_on_the_collection_ends_when_a_snapshot_carries_the_drop()
         "{heard:?}"
     );
 }
+
+/// A floor burial no carried tombstone names is stamped
+/// `Stamp(floor, zero node)` (F19). The tombstone is recorded before the survivors path
+/// sweeps, so a straggler that arrives between two chunks is judged against it, and
+/// `is_history` compares the whole `Stamp` strictly: a record in the drop's own `Hlc` from
+/// any real node sorts above the zero node and is applied behind the sweep's cursor. The
+/// floor then lands over it, and it stands on this member alone; every member holding the
+/// real tombstone and the floor refuses it. The real stamp refused one from a node below
+/// it, as this one is (the lowest non-zero node).
+#[test]
+fn a_straggler_in_the_floor_s_own_hlc_is_refused_while_a_floor_burial_sweeps() {
+    let (a, d, _da, _dd, id) = a_and_d_holding_the_old_life();
+    let on_a = a.get_collection("shop", "orders").unwrap();
+    let docs: Vec<_> = (1_000..2_400i64).map(|i| doc! { "_id": i }).collect();
+    a.insert_many(&on_a, docs).unwrap();
+    quiesce(&[&a, &d]);
+    later();
+    assert!(a.drop_collection("shop", "orders").unwrap());
+    a.finish_purges_now().unwrap();
+    let dropped = a.collection_dropped_at(id).unwrap().expect("A's tombstone");
+    later();
+    a.create_collection("shop", "orders").unwrap();
+    // D, which has not heard the drop, writes into the old life after it: the survivors path.
+    let on_d = d.get_collection("shop", "orders").unwrap();
+    d.insert(&on_d, doc! { "_id": 3i64 }).unwrap();
+    // A straggler of the old life in the drop's own `Hlc`, from the lowest real node.
+    let (x, _dx) = engine();
+    let on_x = x.create_collection("shop", "orders").unwrap();
+    x.insert(&on_x, doc! { "_id": 1_000i64, "straggler": true }).unwrap();
+    let mut straggler = x
+        .entries_for_peer(Hlc::ZERO, BATCH, WalkScope::Background)
+        .unwrap()
+        .entries
+        .into_iter()
+        .find(|e| e.kind.is_document())
+        .expect("the straggler's entry");
+    let mut low = [0u8; 16];
+    low[15] = 1;
+    straggler.stamp = Stamp::new(dropped.hlc, kimmy_core::NodeId::from_bytes(low));
+    assert!(straggler.stamp < dropped, "premise: the real tombstone refuses it");
+    let d = Arc::new(d);
+    let on_d = Arc::clone(&d);
+    hooks::run_after_the_next_chunk(move || {
+        on_d.apply_batch(&[straggler]).unwrap();
+    });
+    let before = hooks::survivors_paths();
+    // A's scoped page: its life's floor ends D's life, with no tombstone on the page.
+    let mut progress = SnapshotProgress::of_collection(id);
+    while !progress.is_complete() {
+        let page = a.snapshot_page(progress.after().cloned(), progress.scope()).unwrap();
+        d.apply_snapshot_page(a.node_id(), &mut progress, &page).unwrap();
+    }
+    assert_eq!(hooks::survivors_paths(), before + 1, "premise: the survivors path");
+    let kept = d.get_collection("shop", "orders").expect("kept with the write after the drop");
+    assert_eq!(kept.incarnation_floor, Some(dropped.hlc), "premise: the sweep ran");
+    assert_eq!(docs_of(&d, "orders", &[3]), vec![3], "premise: the write after the drop");
+    assert_eq!(
+        docs_of(&d, "orders", &[1_000]),
+        Vec::<i64>::new(),
+        "a record in the floor's own Hlc stands below the floor on this member alone; D's \
+         tombstone is {:?}",
+        d.collection_dropped_at(id).unwrap()
+    );
+}
