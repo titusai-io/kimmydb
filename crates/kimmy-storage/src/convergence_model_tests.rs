@@ -2293,8 +2293,9 @@ fn census_takes(name: &str, pre: &[Op], variants: &[(&str, Vec<Op>)], expect: Ex
 #[ignore = "the vacuity census; see the convergence model test report"]
 fn vacuity_census() {
     CENSUS.with(|c| *c.borrow_mut() = Some(Vec::new()));
-    let named: [fn(); 29] = [
+    let named: [fn(); 30] = [
         finding_f12_a_page_refused_a_definition_its_drop_keeps,
+        finding_f13_an_index_in_the_drops_hlc_was_kept_by_the_member_that_swept_it,
         finding_f11_a_local_creation_below_the_floor_it_takes_is_history_everywhere,
         row_a_page_moves_the_clock_past_the_creation_it_vouches_for,
         row_a_page_moves_the_clock_past_the_drop_it_vouches_for,
@@ -2594,6 +2595,20 @@ fn finding_f12_a_page_refused_a_definition_its_drop_keeps() {
         "F12",
         "A.create(orders)@110; C<-A whole; B<-A entries; A.drop(orders)@140; \
          C.drop(orders)@130; B.index(orders,k_1:desc)@170; B<-C whole; A.create(orders)@210",
+        &[(ORDERS, Some(&[]))],
+    );
+}
+
+/// F13 (found by the generated run). An index created in a drop's own `Hlc` by a node
+/// above the dropper's: the member holding it swept it as the drop's (`Hlc`, not strict)
+/// and then declined to drop it (the replicated `DropIndex`'s `Stamp` rule), while every
+/// other member refused it by its floor. A tie is the drop's on every path.
+#[test]
+fn finding_f13_an_index_in_the_drops_hlc_was_kept_by_the_member_that_swept_it() {
+    finding(
+        "F13",
+        "C.create(orders)@120; A.create(orders)@110; B<-A whole; C.index(orders,k_1:asc)@170; \
+         B.drop(orders)@170; A.index(orders,j_1:asc)@180; C<-A whole",
         &[(ORDERS, Some(&[]))],
     );
 }

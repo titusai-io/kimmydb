@@ -304,8 +304,14 @@ impl Engine {
             return Ok(());
         }
         for index in &standing.indexes {
-            if index.created.is_some_and(|created| created.hlc <= dropped.hlc) {
-                self.drop_index_inner(db, name, &index.name, Some(dropped))?;
+            // A definition in the drop's own `Hlc` is the drop's, from whichever node
+            // (ADR-236): the keep and the burial read it so (`hlc > dropped` is
+            // after), and so do the other members' floors (`below_floor`). The
+            // index's own stamp is passed where it sorts above the drop's, or the
+            // replicated drop's incarnation rule declines it, as it would a real
+            // `DropIndex` older than the index, and this member alone keeps it.
+            if let Some(created) = index.created.filter(|created| created.hlc <= dropped.hlc) {
+                self.drop_index_inner(db, name, &index.name, Some(dropped.max(created)))?;
             }
         }
         if standing.vector.is_some()
@@ -1679,25 +1685,27 @@ mod tests {
         assert_eq!(docs_of(&b, "shop", "orders", &[1, 2]), vec![2]);
     }
 
-    /// f-1. A definition tied at the drop (the same `Hlc`, from a node above the
-    /// dropper's) is selected by the sweep and declined by the drop of the index,
-    /// which keeps it and records the tombstone: the tie is on the selected side
-    /// of the boundary and the definition stands.
+    /// f-1, as ADR-236 rules it. A definition tied at the drop (the same `Hlc`, from a
+    /// node above the dropper's) is the drop's: the sweep selects it, and its drop is
+    /// not declined, as the members that judge the same definition by their floor
+    /// (`below_floor`, `Hlc`, not strict) refuse it. The index's tombstone is recorded at
+    /// the index's own stamp, the one that sorts above the drop's. (It was declined and
+    /// kept, so the sweeping member held an index every other member refused.)
     #[test]
-    fn a_definition_tied_at_the_drop_is_kept_and_its_drop_is_declined() {
+    fn a_definition_tied_at_the_drop_is_swept_as_the_drops() {
         let (a, b, _da, _db, dropped) = a_drop_and_a_later_life();
         b.create_index("shop", "orders", by_from(), false, Some("tied".into())).unwrap();
         let above = Stamp::new(dropped.hlc, NodeId::from_bytes([0xff; 16]));
         assert!(above > dropped, "premise: the tie sorts above the dropper's");
         edit_meta(&b, |meta| meta.indexes[0].created = Some(above));
         let id = b.get_collection("shop", "orders").unwrap().id;
-        quiesce(&[&a, &b]);
+        pull(&b, &a);
         let standing = b.get_collection("shop", "orders").unwrap();
-        assert_eq!(standing.indexes.len(), 1, "the tie was swept");
+        assert!(standing.indexes.is_empty(), "the tie was kept: {:?}", standing.indexes);
         assert_eq!(
             b.index_dropped_at(id, kimmy_core::IndexMeta::derive_id("tied")).unwrap(),
-            Some(dropped),
-            "the tie is selected and its drop declined, with the tombstone recorded"
+            Some(above),
+            "the tie's drop is recorded at the index's own stamp"
         );
     }
 
