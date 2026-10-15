@@ -504,3 +504,125 @@ fn a_definition_and_a_digest_repair_of_one_pair_have_ledgers_of_their_own() {
     // Awaiting the definition probe: the digest repair is not held by it.
     assert_eq!(stalls.plan_digest_repair(p, C, VersionVector::default()), DigestPlan::Planned);
 }
+
+// -- The lines that report a repair's end (repair design section 15.2) -------------------
+
+/// A subscriber that keeps each event as `LEVEL message {field=value ...}`.
+#[derive(Clone, Default)]
+struct Lines(Arc<std::sync::Mutex<Vec<String>>>);
+
+impl tracing::Subscriber for Lines {
+    fn enabled(&self, _: &tracing::Metadata<'_>) -> bool {
+        true
+    }
+    fn new_span(&self, _: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+        tracing::span::Id::from_u64(1)
+    }
+    fn record(&self, _: &tracing::span::Id, _: &tracing::span::Record<'_>) {}
+    fn record_follows_from(&self, _: &tracing::span::Id, _: &tracing::span::Id) {}
+    fn event(&self, event: &tracing::Event<'_>) {
+        struct Fields(String);
+        impl tracing::field::Visit for Fields {
+            fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+                if field.name() == "message" {
+                    self.0 = format!("{value:?} {}", self.0);
+                } else {
+                    self.0.push_str(&format!("{}={value:?} ", field.name()));
+                }
+            }
+        }
+        let mut fields = Fields(String::new());
+        event.record(&mut fields);
+        self.0.lock().unwrap().push(format!("{} {}", event.metadata().level(), fields.0));
+    }
+    fn enter(&self, _: &tracing::span::Id) {}
+    fn exit(&self, _: &tracing::span::Id) {}
+}
+
+fn logged(run: impl FnOnce()) -> Vec<String> {
+    let lines = Lines::default();
+    let seen = Arc::clone(&lines.0);
+    {
+        let _recording = tracing::subscriber::set_default(lines);
+        run();
+    }
+    let lines = seen.lock().unwrap().clone();
+    lines
+}
+
+#[test]
+fn a_document_repair_that_left_rows_says_so_and_names_the_first_ids() {
+    let lines = logged(|| {
+        let mut stalls = stalls_at(mins(1));
+        let p = node(1);
+        assert_eq!(stalls.plan_digest_repair(p, C, VersionVector::default()), DigestPlan::Planned);
+        stalls.repair_due(p);
+        let page = kimmy_storage::SnapshotApplied {
+            applied: 2,
+            applied_at_cut: 2,
+            left: 3,
+            left_ids: vec![kimmy_core::DocId::Int64(7), kimmy_core::DocId::Int64(9)],
+            ..Default::default()
+        };
+        stalls.converge_page_applied(p, &page);
+        stalls.repair_finished(p);
+    });
+    let ended = lines.iter().find(|l| l.contains("a divergence repair ended")).unwrap();
+    assert!(ended.starts_with("INFO "), "{ended}");
+    for want in ["kind=\"digest\"", "outcome=\"applied\"", "applied=2", "left=3", "\"7\"", "\"9\""]
+    {
+        assert!(ended.contains(want), "{want}: {ended}");
+    }
+    let warn = lines.iter().find(|l| l.contains("it will not write")).expect("the WARN");
+    assert!(warn.starts_with("WARN ") && warn.contains("left=3") && warn.contains("operations.md"));
+}
+
+#[test]
+fn a_document_repair_that_left_nothing_raises_no_warning() {
+    let lines = logged(|| {
+        let mut stalls = stalls_at(mins(1));
+        let p = node(1);
+        stalls.plan_digest_repair(p, C, VersionVector::default());
+        stalls.repair_due(p);
+        stalls.repair_finished(p);
+    });
+    assert!(lines.iter().any(|l| l.contains("a divergence repair ended")));
+    assert!(!lines.iter().any(|l| l.starts_with("WARN ") && l.contains("will not write")));
+}
+
+#[test]
+fn a_definition_repair_ends_with_what_it_built_and_what_it_skipped_in_one_line() {
+    let lines = logged(|| {
+        let mut stalls = stalls_at(mins(1));
+        let p = node(1);
+        stalls.plan_definition_repair(p, C, 10);
+        stalls.repair_due(p);
+        let page = kimmy_storage::SnapshotApplied {
+            definitions: kimmy_storage::DefinitionRestore {
+                built: 1,
+                unique: 1,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        stalls.definitions_page_applied(p, &page);
+        stalls.repair_finished(p);
+    });
+    let ended = lines.iter().find(|l| l.contains("a divergence repair ended")).unwrap();
+    for want in ["kind=\"definition\"", "built=1", "unique=1", "skipped=1"] {
+        assert!(ended.contains(want), "{want}: {ended}");
+    }
+}
+
+#[test]
+fn a_transient_end_is_reported_as_transient() {
+    let lines = logged(|| {
+        let mut stalls = stalls_at(mins(1));
+        let p = node(1);
+        stalls.plan_digest_repair(p, C, VersionVector::default());
+        stalls.repair_due(p);
+        stalls.repair_ended_transient(p, Transient::Dropped);
+    });
+    let ended = lines.iter().find(|l| l.contains("a divergence repair ended")).unwrap();
+    assert!(ended.contains("outcome=\"transient\""), "{ended}");
+}

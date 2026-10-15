@@ -3023,6 +3023,9 @@ pub struct PeerStalls {
     repair_clock: Duration,
     /// What the document repair counted since the loop last took it.
     repair_counts: RepairCounts,
+    /// Peers that have sent a repair page with no tombstone horizon (a build before it), said
+    /// once each: from such a peer nothing is young.
+    no_horizon_said: HashSet<NodeId>,
     /// Snapshot pulls left to resume, one per peer (ADR-152): where the next
     /// page begins and what the completed snapshot grants, carried across
     /// rounds so a snapshot that does not fit one round goes on from its
@@ -3422,6 +3425,77 @@ impl RepairCounts {
     }
 }
 
+/// The INFO line that reports a repair's end, and the WARN for rows a document repair left
+/// (repair design section 15.2). Fields are structured; the texts are fixed.
+fn log_repair_end(
+    peer: NodeId,
+    collection: CollectionId,
+    kind: RepairKind,
+    transient: Option<Transient>,
+    tally: &Tally,
+    left_ids: &[kimmy_core::DocId],
+    definitions: &kimmy_storage::DefinitionRestore,
+) {
+    let outcome = if transient.is_some() { "transient" } else { "applied" };
+    match kind {
+        RepairKind::Digest => {
+            let first_ids: Vec<String> = left_ids.iter().map(ToString::to_string).collect();
+            info!(
+                node = %peer,
+                peer = %peer,
+                collection = %collection,
+                kind = "digest",
+                outcome,
+                applied = tally.applied,
+                created = tally.created,
+                left = tally.left,
+                left_tombstone = tally.left_tombstone,
+                superseded = tally.superseded,
+                first_ids = ?first_ids,
+                "a divergence repair ended"
+            );
+            if tally.left > 0 {
+                warn!(
+                    node = %peer,
+                    collection = %collection,
+                    left = tally.left,
+                    first_ids = ?first_ids,
+                    "a divergence repair left rows it will not write; the operator rule in \
+                     operations.md decides"
+                );
+            }
+        }
+        RepairKind::Definition => {
+            let skipped = definitions.rival
+                + definitions.unique
+                + definitions.ttl
+                + definitions.history
+                + definitions.tombstoned
+                + definitions.ambiguous
+                + definitions.gone
+                + definitions.too_large;
+            info!(
+                node = %peer,
+                peer = %peer,
+                collection = %collection,
+                kind = "definition",
+                outcome,
+                built = definitions.built,
+                refused = definitions.refused,
+                skipped,
+                rival = definitions.rival,
+                unique = definitions.unique,
+                ttl = definitions.ttl,
+                history = definitions.history,
+                tombstoned = definitions.tombstoned,
+                ambiguous = definitions.ambiguous,
+                "a divergence repair ended"
+            );
+        }
+        RepairKind::Count => {}
+    }
+}
+
 /// What the loop guard made of a definition repair at its compared definition digest: the
 /// `result` label of `kimmy_sync_definition_repair_judgements_total`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -3503,6 +3577,10 @@ struct Repairs {
     /// active: what its pages' rows are counted against for progress.
     cuts: BTreeMap<CollectionId, VersionVector>,
     active_cut: VersionVector,
+    /// The ids of the first live rows the active document repair left, and what the active
+    /// definition repair did with its page's indexes, for the line that reports its end.
+    left_ids: Vec<kimmy_core::DocId>,
+    definitions: kimmy_storage::DefinitionRestore,
     /// The size gate of each queued definition repair, and of the one active
     /// (`cluster.repair_max_index_documents`).
     limits: BTreeMap<CollectionId, u64>,
@@ -4215,6 +4293,7 @@ impl PeerStalls {
         }
         if let Some(repairs) = self.repairs.get_mut(&peer) {
             repairs.tally.built += applied.definitions.built;
+            repairs.definitions = applied.definitions;
         }
     }
 
@@ -4238,6 +4317,11 @@ impl PeerStalls {
         rows[RowResult::LeftTombstone.index()] += page.left_tombstone;
         rows[RowResult::Superseded.index()] += page.superseded;
         if let Some(repairs) = self.repairs.get_mut(&peer) {
+            for id in &applied.left_ids {
+                if repairs.left_ids.len() < kimmy_storage::LEFT_IDS_NAMED {
+                    repairs.left_ids.push(id.clone());
+                }
+            }
             let tally = &mut repairs.tally;
             tally.applied += page.applied;
             tally.created += page.created;
@@ -4548,8 +4632,19 @@ impl PeerStalls {
             repairs.advanced = false;
             if finished.kind() != RepairKind::Count {
                 ledger_end = Some((collection, finished.kind(), repairs.tally));
+                log_repair_end(
+                    peer,
+                    collection,
+                    finished.kind(),
+                    transient,
+                    &repairs.tally,
+                    &repairs.left_ids,
+                    &repairs.definitions,
+                );
             }
             repairs.tally = Tally::default();
+            repairs.left_ids.clear();
+            repairs.definitions = Default::default();
             if self.snapshots.get(&peer).is_some_and(|p| p.scope() == Some(collection)) {
                 self.snapshots.remove(&peer);
             }
@@ -5220,6 +5315,16 @@ where
             );
         }
 
+        if policy == kimmy_storage::SnapshotPolicy::Converge
+            && page.tombstone_horizon.is_none()
+            && stalls.no_horizon_said.insert(node)
+        {
+            info!(
+                %peer,
+                node = %node,
+                "this peer sent no tombstone horizon: young rows are not admitted from it"
+            );
+        }
         // Applied, and the progress moved, before anything else is awaited:
         // this is the point a cancelled round resumes from.
         let progress = stalls.snapshot_progress(node, scope, policy);

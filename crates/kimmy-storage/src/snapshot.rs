@@ -114,6 +114,9 @@ use crate::sync::{Memo, Pending};
 use crate::tables;
 use crate::walk::{WalkScope, open_walk_table};
 
+/// How many of the live rows a document repair left are named in its log line.
+pub const LEFT_IDS_NAMED: usize = 10;
+
 /// Documents per page.
 ///
 /// Bounded so a large collection crosses the wire in several frames rather than
@@ -326,6 +329,9 @@ pub struct SnapshotApplied {
     /// tombstone) this node held nothing for, which the policy does not write.
     /// Always 0 under `All`.
     pub left: usize,
+    /// Under [`SnapshotPolicy::Converge`]: the ids of the first ten live rows this page left,
+    /// for the line that tells the operator which rows the rule is about.
+    pub left_ids: Vec<DocId>,
     /// Under [`SnapshotPolicy::Converge`]: the **tombstone** rows of the page this node
     /// held nothing for. They are digest-invisible (the digest folds live records only),
     /// travel by key with no `_id`, and cannot be named, so they are counted apart from
@@ -1201,6 +1207,7 @@ impl Engine {
                 shadows_missing,
                 shadows_orphaned,
                 left: 0,
+                left_ids: Vec::new(),
                 left_tombstone: 0,
                 created: 0,
                 applied_at_cut: 0,
@@ -1247,6 +1254,7 @@ impl Engine {
         let mut applied = 0usize;
         let mut superseded = 0usize;
         let mut left = 0usize;
+        let mut left_ids: Vec<DocId> = Vec::new();
         let mut left_tombstone = 0usize;
         let mut created = 0usize;
         let mut applied_at_cut = 0usize;
@@ -1289,6 +1297,9 @@ impl Engine {
                 // creates none. A tombstone for it is history and counted above.
                 let Some(collection) = collection else {
                     left += 1;
+                    if left_ids.len() < LEFT_IDS_NAMED {
+                        left_ids.push(document.id.clone());
+                    }
                     continue;
                 };
                 let key = crate::docs::doc_key(&document.id)?;
@@ -1312,6 +1323,9 @@ impl Engine {
                     let is_young = young_above.is_some_and(|above| document.stamp.hlc > above);
                     if !is_young || owes {
                         left += 1;
+                        if left_ids.len() < LEFT_IDS_NAMED {
+                            left_ids.push(document.id.clone());
+                        }
                         continue;
                     }
                     young = true;
@@ -1370,6 +1384,7 @@ impl Engine {
                 applied,
                 superseded,
                 left,
+                left_ids,
                 left_tombstone,
                 created,
                 applied_at_cut,
