@@ -443,7 +443,12 @@ it belongs to a life of the name this node has not had yet, a newer one whose
 creation sorts after it or the one the drop kept elsewhere, and nothing replays a
 definition, so it stops the batch as a collection with no record does and the
 scoped snapshot brings the life with it. An index's drop stays history: its
-tombstone is recorded, which is all of it the later life needs.
+tombstone is recorded, which is all of it the later life needs. **The stop lasts
+one scoped snapshot when its sender holds no life of the collection**: a member
+that buried the life (nothing stamped after the drop still stood) or a 0.49.x
+member that buried it with its database still serves the definition, and a
+snapshot that holds no life and leaves the collection absent here makes every
+definition its sender's coverage names history, whoever serves it.
 
 **A drop this node ignores is held and served onward like one it applies**
 ([ADR-236](decisions.md)), and so is a creation its database's drop refuses: the

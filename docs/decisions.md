@@ -27275,7 +27275,8 @@ state without the field decodes to none and none is not written. Mutation rows (
 > **[ADR-233](#adr-233--a-snapshot-page-moves-the-clock-past-what-it-restores-and-honours-the-receivers-own-index-tombstone)**
 > (what a member mints after a restore that did not move its clock) and
 > **[ADR-235](#adr-235--a-snapshot-page-whose-life-began-after-a-drop-ends-the-life-standing-here-that-the-drop-ended-when-no-tombstone-arrives-to-say-so)**
-> (the burial's stamp). Item 1 ruled by Chris, 2026-10-14. **Breaking** (item 1) in the sense of `compatibility.md`: what
+> (the burial's stamp), **ADR-133** (what plans a count repair) and **ADR-152** (the snapshot a refused count replay
+> falls back to). Item 1 ruled by Chris, 2026-10-14. **Breaking** (item 1) in the sense of `compatibility.md`: what
 > `DELETE /v1/db/{db}` does to a write made after it changes. No table, schema, wire field, backup tag or entry kind changed.
 
 **How these were found.** A convergence model test (`kimmy-storage/src/convergence_model_tests.rs`): three
@@ -27524,38 +27525,60 @@ off at its own stamp (`late_drop`). F16's: the count repair's scoped page does n
 delete made after the drop; a life holding only such a delete keeps it, re-dated; without a digest row the walk's
 records say it; a delete landing behind the sweep's cursor is read from the digest row; and a shadow is judged by its
 parent, not by its own tombstones (`keep_later_writes_tests`). The tests that pinned the emptied-life burial now reach
-it by a life that holds nothing after the drop (an absent digest row).
+it by a life that holds nothing after the drop (an absent digest row). The review's (`review_cfr_tests`: the later-life
+stop that a page holding no life answers, after this build's burial and after 0.49.x's; a relayed ignored drop does not
+end a stream on the live collection) and its three model rows (`review_cfr_*`), with seed 13739's shape without its
+write, which only `Wedged` sees; `sync` (a page carrying a life this member refuses leaves the stop standing, its second
+page too); `watch` (a stream that delivered the earlier life's change, one resumed from its token, and one at a drop in
+its life's own `Hlc` still end). F17's: `count_finding_tests` (over real rounds, a finding no probe compared since its
+repair is not repaired again and clears at the first compared probe; one the probes keep renewing is still repaired
+once per cooldown), the tracker's unit test, and `transport` (a refused count replay pulls the collection's snapshot and
+marks nothing; that snapshot, cut short a page a round, resumes until it completes).
 
-**Mutation run: 50 rows, 47 killed, 3 equivalent.** A harness that is not in the tree (the rows are named here as the
+**Mutation run: 75 rows, 72 killed, 3 equivalent.** A harness that is not in the tree (the rows are named here as the
 record), each row one textual change to the committed tree run under `bash` with a 900 s timeout, reset by `git
 checkout`, and checked to have applied once and run at least one test: the page's ignore branch recording no
 tombstone; the creation over a database tombstone recording none, or not its shadow's, or lowering a newer one; the
 entry route's tie check before the writer and under it back to `Stamp <`, the predicate made strict, the vector
-shadow's creation back to `Stamp <`; a local drop and a local creation minted at the clock, the creation's boundary
-`<=` made `<`; the ignored drop and the database-refused creation not appended; the replay origin without the
-tombstone or the floor, and `peers` planning it from `created`; the later-life stop removed, made to stop a tie, to
-stop a `DropIndex`, not to stop a `ConfigureVectors`, and judged without the database's tombstone; the burial and the
+shadow's creation back to `Stamp <`; a local drop minted at the clock; a creation minted at the clock, its boundary
+`<=` made `<`, and the floor passed only for a local creation (the review's M3, which the first run graded equivalent:
+the review's row kills it); the ignored drop and the database-refused creation not appended; the replay origin without
+the tombstone or the floor, and `peers` planning it from `created`; the later-life stop removed, made to stop a tie, to
+stop a `DropIndex`, not to stop a `ConfigureVectors`, and judged without the database's tombstone; the stop's answer
+removed, given by a page carrying a life, by a later page, and without the coverage check; the burial and the
 present-life sweep ignoring the carried tombstone, taking one of another drop, or receiving none; the covered life
 buried writes and all, the D-3 guard restored, the sweep's notices one per collection, the never-written collection
 sent down the survivors path, `kept` not counted, a page's definition judged by `redated_from`; a page's index and
-dated vector configuration judged by the life (before the writer and under it); the tie's drop declined; the
-expansions not raised, raised with every tombstone below the previous, and not raised on the entry route or on a page;
-and the definition rule without the tombstones, without the database's, strict at the tie, by the floor alone before
-the writer, under it, on a page, for a page's vector configuration and for a replicated one. The first runs left ten
-alive that are not equivalent (six of the first 42 rows and four of F15's eight): tests too weak, and in one case a
-filter that matched no test; each has a test of its own now, and the run above is of every row on the final tree. **The three that survive
-are equivalent:** `aims_at_a_previous_incarnation`'s first clause written back as `dropped < created` (it is
-`!creation_is_history(created, dropped)` by definition); a replicated creation minted above its floor too (its stamp
-names nothing replicated, `created` is the origin's, and only the local database row's informational `created` and the
-local clock move); and a page's purge wait judged by `redated_from` (a definition it no longer waits for reaches
-`create_collection_marked`, whose `CollectionPurging` makes the page wait all the same, as ADR-229 found for the
-guard beside it).
+dated vector configuration judged by the life (before the writer and under it); the tie's drop declined, and the four
+of the vector tie's sweep; the expansions not raised, raised with every tombstone below the previous, and not raised on
+the entry route or on a page; the definition rule without the tombstones, without the database's, strict at the tie,
+by the floor alone before the writer, under it, on a page, for a page's vector configuration and for a replicated one;
+the four of F16's burial; a stream's pass over a relayed drop removed, made to pass a tie, its bound not lowered by a
+delivery or by the token, and lowered by a relayed creation; and F17's five (no suspension, repairs retained by the
+findings that plan rather than those reported, the planning set keeping suspended findings, a compared probe leaving
+the suspension, the fold ignoring a deferral) and its two for the scope (a refused replay pulling the whole database, its
+scoped snapshot not advancing the replay). The first runs left alive twelve that are not equivalent: tests too weak,
+and in one case a filter that matched no test; each has a test of its own now, and the run above is of every row on the
+final tree. **The three that survive are equivalent:** `aims_at_a_previous_incarnation`'s first clause written back as
+`dropped < created` (it is `!creation_is_history(created, dropped)` by definition); a page's purge wait judged by
+`redated_from` (a definition it no longer waits for reaches `create_collection_marked`, whose `CollectionPurging` makes
+the page wait all the same, as ADR-229 found for the guard beside it); and the stop's answer recorded from a page that
+leaves the collection standing here (the record is read only once a later drop leaves it absent, and names definitions
+its sender processed holding no life of it: a stop at one is then answered the same way at quiescence, as history, or
+by a life whose later drop sweeps it).
 
-**Measured (the model, debug build, 18 threads, engine stores on a RAM disk).** The named rows and findings, 32 tests,
-pass in 0.7 s. Generated, without age-out: 20,000 schedules, 60,000 route runs, 160 s, **no failing group**; with
-age-out: 10,000 schedules (2,356 with an age-out), 77 s, no failing group, and every failure that needs its age-out
-step classified past retention, by design under ADR-085. Exhaustive to depth 6: 114,199 schedules, 342,597 route runs,
-853 s, no failing group and no tombstone difference. What is left is residual (1): a subsumed tombstone difference in
-23 of the 20,000 and 8 of the 10,000 generated schedules, on the repaired entries route only. Before these changes the
-same runs had 9 findings, and a subsumed tombstone difference in 1,028 of the 20,000 schedules' page runs alone.
+**Measured (the model, debug build, 18 threads, engine stores on a RAM disk, the `Wedged` check on).** The named rows
+and findings, 39 tests, pass in 0.8 s. Generated, without age-out: 20,000 schedules, 60,000 route runs, 157 s, **no
+failing group**; with age-out: 10,000 schedules (2,356 with an age-out), 78 s, no failing group, and every failure that
+needs its age-out step classified past retention, by design under ADR-085. Exhaustive to depth 6: 114,199 schedules,
+342,597 route runs, 869 s, no failing group and no tombstone difference. What is left is residual (1): a subsumed
+tombstone difference in 23 of the 20,000 and 8 of the 10,000 generated schedules, on the repaired entries route only.
+Before these changes the same runs had 9 findings, and a subsumed tombstone difference in 1,028 of the 20,000
+schedules' page runs alone. **The writer's share (release build, one member).** Item 5's raise reads the collection
+tombstone table under the writer, only when a database's tombstone is raised over an earlier one: 0.7 ms at 10,000
+tombstones, 4.5 ms at 100,000 and 50 ms at 1,000,000, with the commit about as much again; the table holds what
+`storage.tombstone_retention_secs` keeps. Item 1's sweep of a covered life that holds a write after the drop, a chunk of
+a thousand records a commit: 17 ms for 10,000 records, 172 ms for 100,000 and 516 ms for 300,000 (about 1.7 µs a
+record) on the entry route, and the same at start (`reconcile_database_tombstones`), as a collection's own drop with a
+later write already costs.
 
