@@ -1583,6 +1583,23 @@ impl Engine {
         let Ok(standing) = self.get_collection(&state.db, &state.name) else {
             return Ok(());
         };
+        // The life standing here began after the drop the page names and its floor is
+        // below it (or it has none): the sweep that drop owes it (ADR-231), as when its
+        // tombstone arrives. This is how a life taken without the floor (from a relay that
+        // could not vouch for it, from a 0.49.0 sender, or by a copy made before the floor
+        // was carried) comes to hold it: a member that took the life from such a source and
+        // is then granted coverage past the drop is never served the drop again, and
+        // without the floor its own pages would grant that coverage on without burying the
+        // life before. Disjoint from the burial below (`floor < standing.created` here,
+        // `>=` there), it needs no lineage condition: any life created after the floor owes
+        // the sweep, whichever life the page carries. It writes no tombstone, so nothing
+        // synthetic rides this member's pages.
+        //
+        // The clock needs no witness here: the floor is below the standing life's `created`,
+        // which this member's clock has passed since it stored it.
+        if crate::late_drop::owes_a_sweep(&standing, floor) {
+            return self.sweep_after_an_ignored_drop(&standing, Stamp::new(floor, from));
+        }
         if !crate::sync::arriving_life_ends_the_standing_one(
             &standing,
             state.created,
@@ -1706,6 +1723,14 @@ impl Engine {
             // drop this node learns of after this page buries it as it buries
             // the sender's, and no stop leaves it standing without the marker.
             let redated_from = state.redated_from.filter(|_| state.created.is_some());
+            // The floor the page carries and its coverage names. The clock passes it as it
+            // passes the floor a burial restores (ADR-233): the page may name the floor and
+            // not the life's creation, and a clock left behind would mint writes at or below
+            // the floor this member is about to hold.
+            let adopted = state.incarnation_floor.filter(|floor| hlc_is_named(*floor, versions));
+            if let Some(floor) = adopted {
+                self.witness_hlc(floor);
+            }
             match self.create_collection_marked(
                 &state.db,
                 &state.name,
@@ -1713,7 +1738,7 @@ impl Engine {
                 state.created,
                 &history,
                 redated_from,
-                state.incarnation_floor.filter(|floor| hlc_is_named(*floor, versions)),
+                adopted,
             ) {
                 Ok(Some(_)) => {}
                 Ok(None) => {

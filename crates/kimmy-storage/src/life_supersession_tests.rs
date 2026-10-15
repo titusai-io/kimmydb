@@ -595,8 +595,22 @@ fn relay(
         ))
     } else if created_floor(&r) != floor_s {
         Err(format!("R's floor {:?} is not S's {floor_s:?}", created_floor(&r)))
+    } else if !has(&o, 2) {
+        Err("O did not take life 1's document 2".into())
     } else {
-        Ok(())
+        // O ends holding the sender's life: its creation and its floor.
+        let (held, want) = (
+            o.get_collection("shop", "orders").unwrap(),
+            s.get_collection("shop", "orders").unwrap(),
+        );
+        if held.created != want.created || held.incarnation_floor != want.incarnation_floor {
+            Err(format!(
+                "O ends with created {:?} and floor {:?}, S with {:?} and {:?}",
+                held.created, held.incarnation_floor, want.created, want.incarnation_floor
+            ))
+        } else {
+            Ok(())
+        }
     }
 }
 
@@ -638,7 +652,11 @@ fn a_floor_the_coverage_does_not_name_is_not_adopted_on_a_fresh_create() {
     page.versions = kimmy_core::VersionVector::new();
     r.apply_snapshot_page(a.node_id(), &mut SnapshotProgress::of_collection(orders_id()), &page)
         .unwrap();
-    assert_ne!(created_floor(&r), Some(real), "a floor nothing vouched for was adopted");
+    assert_eq!(
+        created_floor(&r),
+        None,
+        "a floor nothing vouched for was adopted (the real one: {real:?})"
+    );
 }
 
 #[test]
@@ -709,4 +727,337 @@ fn the_pages_floor_never_lowers_the_floor_the_receivers_own_tombstone_gave() {
     assert!(theirs < own, "premise: the page's floor is the lower one");
     transfer_under(&r, &s, SnapshotProgress::of_collection(orders_id()));
     assert_eq!(created_floor(&r), Some(own), "the page's lower floor replaced R's own");
+}
+
+// -- Part 3 (review D): a vouched floor reaches the life standing here -----------------------
+
+fn scoped(into: &Engine, from: &Engine) {
+    transfer_under(into, from, SnapshotProgress::of_collection(orders_id()));
+}
+
+fn named(hlc: Hlc, versions: &kimmy_core::VersionVector) -> bool {
+    versions.iter().any(|(_, covered)| hlc <= covered)
+}
+
+/// An ordinary pull: the requester's witnessed vector as `held`, as a real pull sends it.
+fn pull_from_position(into: &Engine, from: &Engine) {
+    let held = into.witnessed_vector().unwrap();
+    let entries = from
+        .entries_for_peer_holding(Hlc::ZERO, 10_000, Some(&held), WalkScope::Background)
+        .unwrap()
+        .entries;
+    into.apply_batch(&entries).unwrap();
+    into.finish_purges_now().unwrap();
+}
+
+/// S drops life 0 and makes life 1, with document 2; O holds life 0, with document 1.
+/// `forget` ages S's tombstone out (the premise of ADR-235).
+fn o_holds_life_0(forget: bool) -> (Engine, Engine, [tempfile::TempDir; 2]) {
+    let (s, d_s) = engine();
+    let (o, d_o) = engine();
+    let first = s.create_collection("shop", "orders").unwrap();
+    s.insert(&first, doc! { "_id": 1 }).unwrap();
+    transfer(&o, &s);
+    assert!(has(&o, 1), "premise");
+    later();
+    assert!(s.drop_collection("shop", "orders").unwrap());
+    s.finish_purges_now().unwrap();
+    later();
+    let second = s.create_collection("shop", "orders").unwrap();
+    s.insert(&second, doc! { "_id": 2 }).unwrap();
+    if forget {
+        forget_the_tombstone(&s);
+    }
+    (s, o, [d_s, d_o])
+}
+
+/// X takes the life from an idle relay (a scoped snapshot grants nothing, so the floor is
+/// not vouched and X adopts none), then takes S's whole-database snapshot. The life stands
+/// on X already, so nothing adopted the floor (`restore_collection` adopts only on a fresh
+/// create), and X was granted S's coverage past the drop: it was never served the drop
+/// again, and its own pages then granted a member holding life 0 that coverage without
+/// burying it. A vouched page now gives the life standing here the floor, through the
+/// sweep ADR-231 owes it.
+#[test]
+fn a_member_holding_the_new_life_without_the_floor_takes_it_from_a_vouched_page() {
+    let (s, o, _dirs) = o_holds_life_0(true);
+    let (r, _dr) = engine();
+    let (x, _dx) = engine();
+    scoped(&r, &s);
+    scoped(&x, &r);
+    assert_eq!(created_floor(&x), None, "premise: R's page could not vouch");
+    transfer(&x, &s);
+    assert_eq!(created_floor(&x), created_floor(&s), "X did not take the vouched floor");
+    // O, still on life 0, takes X's whole-database snapshot.
+    transfer(&o, &x);
+    o.finish_purges_now().unwrap();
+    assert!(!has(&o, 1), "O merged life 0 through X");
+    assert!(has(&o, 2));
+    // And not by luck of the order: O's own pull from S finds nothing left to do.
+    pull_from_position(&o, &s);
+    assert_holds_the_senders_life(&s, &o, "after the pull");
+}
+
+/// The same with life 1 reusing life 0's ids, so the counts agree and the count half never
+/// fires: what O would keep of life 0 is its index, which only the definition digest sees,
+/// and that plans no repair.
+#[test]
+fn with_equal_counts_life_0s_index_does_not_survive_on_the_member_that_took_the_life_floorless() {
+    let (s, _ds) = engine();
+    let (o, _do) = engine();
+    let (r, _dr) = engine();
+    let (x, _dx) = engine();
+    let first = s.create_collection("shop", "orders").unwrap();
+    s.insert(&first, doc! { "_id": 1, "v": 0 }).unwrap();
+    s.create_index(
+        "shop",
+        "orders",
+        vec![crate::IndexField::ascending("v")],
+        true,
+        Some("old".into()),
+    )
+    .unwrap();
+    transfer(&o, &s);
+    later();
+    s.drop_collection("shop", "orders").unwrap();
+    s.finish_purges_now().unwrap();
+    later();
+    let second = s.create_collection("shop", "orders").unwrap();
+    s.insert(&second, doc! { "_id": 1, "v": 1 }).unwrap();
+    forget_the_tombstone(&s);
+    scoped(&r, &s);
+    scoped(&x, &r);
+    transfer(&x, &s);
+    transfer(&o, &x);
+    o.finish_purges_now().unwrap();
+    pull_from_position(&o, &s);
+    let names = |e: &Engine| -> Vec<String> {
+        e.list_indexes("shop", "orders").unwrap().into_iter().map(|i| i.name).collect()
+    };
+    assert_eq!(names(&o), names(&s), "life 0's index survived on O");
+    let (co, cs) =
+        (o.get_collection("shop", "orders").unwrap(), s.get_collection("shop", "orders").unwrap());
+    assert_eq!(
+        crate::definition_digest::definition_digest(&co),
+        crate::definition_digest::definition_digest(&cs),
+        "the definition digests differ"
+    );
+}
+
+/// The sweep ADR-231 owes removes a straggler of the life before (a write stamped before the
+/// drop), and keeps what the life itself wrote.
+#[test]
+fn the_sweep_a_vouched_floor_owes_removes_a_straggler_and_keeps_the_lifes_own_writes() {
+    let (s, o, _dirs) = o_holds_life_0(true);
+    let (r, _dr) = engine();
+    let (x, _dx) = engine();
+    scoped(&r, &s);
+    scoped(&x, &r);
+    // A straggler of life 0 (document 1, stamped before the drop) from O, which holds it.
+    scoped(&x, &o);
+    assert!(has(&x, 1), "premise: X took a straggler");
+    later();
+    let cx = x.get_collection("shop", "orders").unwrap();
+    x.insert(&cx, doc! { "_id": 9 }).unwrap();
+    transfer(&x, &s);
+    assert!(!has(&x, 1), "the straggler stayed");
+    assert!(has(&x, 2) && has(&x, 9), "a write of the life went");
+    assert_eq!(created_floor(&x), created_floor(&s));
+}
+
+/// A life that already took the floor owes no sweep: a second vouched page of it removes
+/// nothing, including the write the life made after the drop. The branch is disjoint from
+/// the burial and a no-op where the floor stands at the drop.
+#[test]
+fn a_vouched_page_for_a_life_that_already_holds_the_floor_sweeps_nothing() {
+    let (s, _o, _dirs) = o_holds_life_0(true);
+    let (x, _dx) = engine();
+    transfer(&x, &s);
+    assert_eq!(created_floor(&x), created_floor(&s));
+    later();
+    let cx = x.get_collection("shop", "orders").unwrap();
+    x.insert(&cx, doc! { "_id": 9 }).unwrap();
+    transfer(&x, &s);
+    scoped(&x, &s);
+    assert!(has(&x, 2) && has(&x, 9), "a life's own writes were swept");
+}
+
+/// A re-dated life (ADR-231 extended) holds the drop as its floor already: a second page of
+/// it sweeps nothing.
+#[test]
+fn a_re_dated_life_takes_its_own_page_again_and_loses_nothing() {
+    let (a, _da) = engine();
+    let (m, _dm) = engine();
+    let on_a = a.create_collection("shop", "orders").unwrap();
+    a.insert(&on_a, doc! { "_id": 1 }).unwrap();
+    pull(&m, &a);
+    assert!(a.drop_collection("shop", "orders").unwrap());
+    later();
+    let on_m = m.get_collection("shop", "orders").unwrap();
+    m.insert(&on_m, doc! { "_id": 3 }).unwrap();
+    pull(&m, &a);
+    assert!(m.get_collection("shop", "orders").unwrap().is_redated(), "premise");
+    let (p, _dp) = engine();
+    let page = m.snapshot_page(None, Some(orders_id())).unwrap();
+    p.apply_snapshot_page(m.node_id(), &mut SnapshotProgress::of_collection(orders_id()), &page)
+        .unwrap();
+    assert!(has(&p, 3), "premise");
+    let again = m.snapshot_page(None, Some(orders_id())).unwrap();
+    p.apply_snapshot_page(m.node_id(), &mut SnapshotProgress::of_collection(orders_id()), &again)
+        .unwrap();
+    assert!(has(&p, 3), "a re-dated life's write after the drop was swept");
+}
+
+/// A mutant the first tests did not kill: adopting the page's floor only when the receiver
+/// has none of its own. R's own tombstone of an EARLIER drop gives it a lower floor than the
+/// page's, and its pages would then carry a floor below O's life 0.
+#[test]
+fn the_pages_higher_floor_replaces_a_lower_one_the_receivers_own_tombstone_gave() {
+    let (s, _ds) = engine();
+    let (r, _dr) = engine();
+    let (o, _do) = engine();
+    // R's own earlier life of the name, dropped first: R's tombstone is the lower one.
+    let mine = r.create_collection("shop", "orders").unwrap();
+    r.insert(&mine, doc! { "_id": 7 }).unwrap();
+    later();
+    r.drop_collection("shop", "orders").unwrap();
+    r.finish_purges_now().unwrap();
+    let own = r.collection_dropped_at(orders_id()).unwrap().unwrap().hlc;
+    later();
+    let first = s.create_collection("shop", "orders").unwrap();
+    s.insert(&first, doc! { "_id": 1 }).unwrap();
+    transfer(&o, &s);
+    later();
+    s.drop_collection("shop", "orders").unwrap();
+    s.finish_purges_now().unwrap();
+    later();
+    let second = s.create_collection("shop", "orders").unwrap();
+    s.insert(&second, doc! { "_id": 2 }).unwrap();
+    let theirs = created_floor(&s).unwrap();
+    assert!(own < theirs, "premise");
+    scoped(&r, &s);
+    assert_eq!(created_floor(&r), Some(theirs), "R kept its own lower floor");
+    // And it matters one hop on: R busy, O on life 0.
+    later();
+    let hb = r.create_collection("shop", "heartbeat").unwrap();
+    r.insert(&hb, doc! { "_id": 1 }).unwrap();
+    transfer(&o, &r);
+    o.finish_purges_now().unwrap();
+    assert!(!has(&o, 1), "O merged two lives through R's lower floor");
+}
+
+// The idle relay's limit heals (ADR-163's strict gate costs a round of anti-entropy). An
+// unvouched floor is never granted, so O is still owed the drop.
+
+/// R's page granted O nothing of S, so O's next ordinary pull from S delivers the
+/// `DropCollection` entry (while retained), and the keep-later-writes drop ends life 0 on O.
+#[test]
+fn the_limit_heals_on_os_next_ordinary_pull_from_the_dropper() {
+    for second_scoped in [false, true] {
+        for forget in [false, true] {
+            let (s, o, _dirs) = o_holds_life_0(forget);
+            let (r, _dr) = engine();
+            scoped(&r, &s);
+            if second_scoped {
+                scoped(&o, &r)
+            } else {
+                transfer(&o, &r)
+            }
+            assert!(has(&o, 1), "premise: the limit");
+            assert!(
+                o.witnessed_vector().unwrap().get(s.node_id()) < created_floor(&s).unwrap(),
+                "R's page granted O coverage of S past the drop"
+            );
+            pull_from_position(&o, &s);
+            assert!(!has(&o, 1), "second scoped={second_scoped} forget={forget}: life 0 survives");
+            assert!(has(&o, 2), "second scoped={second_scoped} forget={forget}: life 1 lost");
+            assert_eq!(created_floor(&o), created_floor(&s), "scoped={second_scoped} {forget}");
+        }
+    }
+}
+
+/// With the drop entry aged out (the ADR-235 premise), O is beyond S's horizon and takes S's
+/// whole-database snapshot, whose coverage names the floor: the burial runs.
+#[test]
+fn the_limit_heals_on_the_dropper_s_whole_database_snapshot() {
+    let (s, o, _dirs) = o_holds_life_0(true);
+    let (r, _dr) = engine();
+    scoped(&r, &s);
+    transfer(&o, &r);
+    assert!(has(&o, 1), "premise: the limit");
+    transfer(&o, &s);
+    o.finish_purges_now().unwrap();
+    assert!(!has(&o, 1));
+    assert!(has(&o, 2));
+}
+
+/// The realistic first hop: a fresh member catching up by a whole-database snapshot, idle.
+/// Its grant names the floor, so it vouches for it whether or not it is busy.
+#[test]
+fn an_idle_relay_that_took_the_life_by_a_whole_database_snapshot_vouches() {
+    let mut bad = Vec::new();
+    for second in [false, true] {
+        for forget in [false, true] {
+            if let Err(e) = relay(false, second, forget, false) {
+                bad.push(format!("second hop scoped={second}, forget on S={forget}: {e}"));
+            }
+        }
+    }
+    assert!(bad.is_empty(), "relay failures:\n{}", bad.join("\n"));
+}
+
+/// A whole-database pull in progress grants nothing until its last page, so a relay part-way
+/// through one is in the same state as the idle scoped one; once it completes, it vouches.
+#[test]
+fn a_relay_part_way_through_a_whole_database_pull_cannot_vouch_either() {
+    let (s, o, _dirs) = o_holds_life_0(true);
+    let coll = s.get_collection("shop", "orders").unwrap();
+    for i in 10..(10 + crate::snapshot::SNAPSHOT_PAGE as i64 + 50) {
+        s.insert(&coll, doc! { "_id": i }).unwrap();
+    }
+    let (r, _dr) = engine();
+    let mut progress = SnapshotProgress::whole_database();
+    let page = s.snapshot_page(None, None).unwrap();
+    assert!(page.next.is_some(), "premise: more than one page");
+    r.apply_snapshot_page(s.node_id(), &mut progress, &page).unwrap();
+    assert_eq!(created_floor(&r), created_floor(&s), "R adopted the floor from the first page");
+    assert!(!named(created_floor(&r).unwrap(), &r.version_vector().unwrap()), "no grant yet");
+    transfer(&o, &r);
+    o.finish_purges_now().unwrap();
+    assert!(has(&o, 1), "a relay mid-pull vouched");
+    // R completes: the grant names the floor, and R's next page buries.
+    while !progress.is_complete() {
+        let page = s.snapshot_page(progress.after().cloned(), None).unwrap();
+        r.apply_snapshot_page(s.node_id(), &mut progress, &page).unwrap();
+    }
+    transfer(&o, &r);
+    o.finish_purges_now().unwrap();
+    assert!(!has(&o, 1), "the completed relay still cannot vouch");
+}
+
+/// The clock passes a floor the member adopts, as it passes the floor a burial restores
+/// (ADR-233): the page's coverage may name the floor and not the life's creation, and a
+/// member whose clock is behind would otherwise mint writes at or below its own floor.
+#[test]
+fn the_clock_passes_an_adopted_floor() {
+    let (a, _da) = engine();
+    let (r, _dr) = engine();
+    a.create_collection("shop", "orders").unwrap();
+    // A floor an hour ahead of this machine's clock, named by the page's coverage, with the
+    // life created above it and not named.
+    let ahead = Hlc::new(kimmy_storage_now_ms() + 3_600_000, 0);
+    let mut page = a.snapshot_page(None, Some(orders_id())).unwrap();
+    for state in &mut page.collections {
+        state.incarnation_floor = Some(ahead);
+        state.created = Some(ahead.successor());
+    }
+    page.versions.insert(a.node_id(), ahead);
+    r.apply_snapshot_page(a.node_id(), &mut SnapshotProgress::of_collection(orders_id()), &page)
+        .unwrap();
+    assert_eq!(created_floor(&r), Some(ahead), "premise: the floor was adopted");
+    assert!(r.next_stamp().hlc > ahead, "the clock stayed behind the adopted floor");
+}
+
+fn kimmy_storage_now_ms() -> u64 {
+    crate::physical_now_ms()
 }
