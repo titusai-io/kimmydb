@@ -1627,8 +1627,21 @@ impl Engine {
         //
         // The clock needs no witness here: the floor is below the standing life's `created`,
         // which this member's clock has passed since it stored it.
+        //
+        // Both this sweep and the burial below are stamped as the drop: by the tombstone
+        // the page carries for it when there is one (ADR-236), so the records and index
+        // drops the sweep writes carry the stamp the drop's maker and every member that
+        // applied the drop gave them. Without it the stamp takes the sender's node, which
+        // is never exposed on a tie today: a write whose Hlc equals the drop's is history
+        // by the floor rule whatever its node (`is_history` compares `stamp.hlc <= floor`,
+        // documented as intended for same-millisecond ties). If that rule ever becomes
+        // node-aware, that stamp would bury a write later than the real drop whenever
+        // `from` sorts above the dropper, and the choice must be revisited with it.
+        let stamp = carried
+            .filter(|dropped| dropped.hlc == floor)
+            .unwrap_or_else(|| Stamp::new(floor, from));
         if crate::late_drop::owes_a_sweep(&standing, floor) {
-            return self.sweep_after_an_ignored_drop(&standing, Stamp::new(floor, from));
+            return self.sweep_after_an_ignored_drop(&standing, stamp);
         }
         if !crate::sync::arriving_life_ends_the_standing_one(
             &standing,
@@ -1649,15 +1662,6 @@ impl Engine {
              that drop would, keeping what was written after it"
         );
         self.witness_hlc(floor);
-        // Without the carried tombstone the stamp takes the sender's node, which is never
-        // exposed on a tie today: a write whose Hlc equals the drop's is history by the
-        // floor rule whatever its node (`is_history` compares `stamp.hlc <= floor`,
-        // documented as intended for same-millisecond ties). If that rule ever becomes
-        // node-aware, that stamp would bury a write later than the real drop whenever
-        // `from` sorts above the dropper, and the choice must be revisited with it.
-        let stamp = carried
-            .filter(|dropped| dropped.hlc == floor)
-            .unwrap_or_else(|| Stamp::new(floor, from));
         self.restore_collection_drop(CollectionId::derive(&state.db, &state.name), stamp)
     }
 

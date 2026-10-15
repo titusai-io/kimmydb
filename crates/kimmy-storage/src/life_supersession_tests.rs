@@ -577,6 +577,54 @@ fn a_burial_from_a_whole_page_takes_the_stamp_of_the_tombstone_it_carries() {
     );
 }
 
+/// The present-life sweep a page's floor drives (a standing life created after the drop,
+/// its floor below it) is stamped as the burial is: by the tombstone the page carries for
+/// the drop when there is one (ADR-236). B made its own life after A's drop and took in
+/// A's index of the life before; C, which took A's drop and A's next life by scoped pages,
+/// serves B a whole page that carries A's tombstone without vouching for it. The index
+/// drop the sweep records is A's stamp, as it is on every member that applied the drop.
+#[test]
+fn the_present_life_sweep_from_a_page_takes_the_stamp_of_the_tombstone_it_carries() {
+    let (a, _da) = engine();
+    let (b, _db) = engine();
+    let (c, _dc) = engine();
+    a.create_collection("shop", "orders").unwrap();
+    let field = vec![kimmy_core::IndexField::ascending("k")];
+    let index = a.create_index("shop", "orders", field, false, Some("by_k".into())).unwrap();
+    let before_the_drop =
+        a.entries_for_peer(Hlc::ZERO, 10_000, WalkScope::Background).unwrap().entries;
+    later();
+    a.drop_collection("shop", "orders").unwrap();
+    a.finish_purges_now().unwrap();
+    let dropped = a.collection_dropped_at(orders_id()).unwrap().expect("the drop's tombstone");
+    later();
+    b.create_collection("shop", "orders").unwrap();
+    b.apply_batch(&before_the_drop).unwrap();
+    let standing = b.get_collection("shop", "orders").unwrap();
+    assert!(standing.index("by_k").is_some(), "premise: B took in the life before's index");
+    assert!(crate::late_drop::owes_a_sweep(&standing, dropped.hlc), "premise: it owes the sweep");
+
+    transfer_under(&c, &a, SnapshotProgress::of_collection(orders_id()));
+    later();
+    a.create_collection("shop", "orders").unwrap();
+    transfer_under(&c, &a, SnapshotProgress::of_collection(orders_id()));
+    let on_c = c.get_collection("shop", "orders").unwrap();
+    c.insert(&on_c, doc! { "_id": 2 }).unwrap();
+    let page = c.snapshot_page(None, None).unwrap();
+    assert!(page.versions.get(a.node_id()) < dropped.hlc, "premise: C cannot vouch for A's drop");
+
+    transfer(&b, &c);
+    let on_b = b.get_collection("shop", "orders").unwrap();
+    assert!(on_b.index("by_k").is_none(), "the sweep removed the life before's index");
+    assert_eq!(on_b.incarnation_floor, Some(dropped.hlc), "and took the floor");
+    let index_id = kimmy_core::IndexMeta::derive_id(&index.name);
+    assert_eq!(
+        b.index_dropped_at(orders_id(), index_id).unwrap(),
+        Some(dropped),
+        "the sweep named the drop by its maker's stamp"
+    );
+}
+
 // -- A relay passes the floor on (PR #193, break-the-guard review) -------------------------
 
 /// S drops and recreates; R, which holds nothing, takes S's page (whole or scoped, S's
