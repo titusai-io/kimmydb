@@ -27286,8 +27286,8 @@ settled three ways (entries, entries with the divergence check's repairs, pages)
 databases, collections, documents with their stamps, index definitions, floors and tombstones, and lose no write a
 history kept by the test says survives. Its first report named nine findings (F1 to F10, F2 withdrawn, F8 fixed by
 ADR-235's last commit); fixing them exposed four more (F11 to F14), and the ADR-233 vacuity gap below. F15 came from a
-review of the repair design (a calibration test that showed the window), and F16 from a second model test, of young
-stamps (its YS1).
+review of the repair design (a calibration test that showed the window), F16 from a second model test, of young
+stamps (its YS1), and F17 from a storm test of the count half (a loop that replanned one repair for hours).
 
 **Decision.**
 
@@ -27419,6 +27419,26 @@ stamps (its YS1).
    sites read the same evidence already: the fast path is taken only when the digest row puts every record at or below
    the drop, and a database's drop goes through the same path (item 1). Amends ADR-231's extension item 4 ("if the
    sweep left no live record").
+10. **A count finding plans a repair only while its latest probe compared (F17; ruled by Chris, 2026-10-15).** A count
+   finding is confirmed by two compared probes that mismatch and cleared only by one that matches (ADR-133); the gate
+   defers the probe on every contact with a peer that trails this member and moves (ADR-168), which is every contact
+   while this member takes writes. A finding confirmed while the peer stood still therefore outlived the difference it
+   reported once the peer moved again and took what it lacked, and the loop planned the same repair from it every
+   `REPAIR_COOLDOWN_ROUNDS` contacts for as long as the writes went on: in a three-member storm, 56 repairs in two
+   simulated hours and 340 in eight, with every member holding the same documents from minute 61. A deferred probe
+   now **suspends** the finding (`DivergenceTracker::observe_count_deferred`): it stays confirmed, so the gauge still
+   counts it (a deferral re-examined nothing), it plans nothing (`confirmed_against` leaves it out), and it keeps the
+   cooldown of its last repair (`reported_against`, which `retain_repaired` reads), so a peer that stops and moves in
+   turn is not repaired every time it stops. A compared probe renews it (a mismatch) or clears it (a match). The
+   existence half is re-examined in full on every contact and is unchanged. **And a refused count replay is scoped to
+   its collection.** A count repair is a replay of the collection's history; a peer that cannot serve it (it holds that
+   history only as a snapshot's state, ADR-224, or the creation has left its oplog) answers `BeyondHorizon`, and the
+   repair fell back to a whole-database snapshot, which also marked the repairing member catching up (ADR-202): in the
+   storm, 48 of the 56 repairs were whole-database pulls of 21 to 34 pages that applied nothing. It now pulls the
+   peer's snapshot of that one collection, as a repair's snapshot is scoped (ADR-152), marks nothing, and each page of
+   it advances the repair, so one cut short a page a round resumes until it completes. Tracker memory and the round's
+   choice of scope only: nothing on disk or on the wire. Letting a compared-equal cut digest clear a suspended count
+   finding, so the gauge clears while writes go on, is left to the repair work.
 
 **Why not the alternatives.** *Make the newer life refuse an entry of a covered life* (F6's other option) needs a
 life identity on the entry, which entries do not carry. *Store the creation's whole `Stamp`* (F3's) needs a field on
