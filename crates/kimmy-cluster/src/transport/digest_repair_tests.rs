@@ -222,8 +222,10 @@ fn a_repair_that_advances_nothing_for_the_attempts_is_abandoned_and_counted() {
     let mut stalls = stalls_at(mins(1));
     let p = node(1);
     assert_eq!(stalls.plan_digest_repair(p, C, VersionVector::default()), DigestPlan::Planned);
-    for _ in 0..=REPAIR_ATTEMPTS {
-        stalls.repair_due(p);
+    // Contacts as the loop makes them: the Converge pull and an ordinary one alternate, and
+    // only a Converge round that landed nothing counts.
+    for _ in 0..(2 * REPAIR_ATTEMPTS + 2) {
+        contact(&mut stalls, p);
     }
     let counts = stalls.take_repair_counts();
     assert_eq!(counts.digest_repairs[DigestRepairOutcome::Abandoned.index()], 1);
@@ -625,4 +627,83 @@ fn a_transient_end_is_reported_as_transient() {
     });
     let ended = lines.iter().find(|l| l.contains("a divergence repair ended")).unwrap();
     assert!(ended.contains("outcome=\"transient\""), "{ended}");
+}
+
+// -- A Converge round is bounded and alternates with an ordinary one (design section 2.6) ----
+
+/// One contact with the peer: the loop's `tick_opened`, then the pull's `repair_due`.
+fn contact(stalls: &mut PeerStalls, peer: NodeId) -> Option<(CollectionId, Repair)> {
+    stalls.tick_opened();
+    stalls.repair_due(peer)
+}
+
+#[test]
+fn a_converge_repair_is_handed_out_every_second_contact_and_never_twice_in_one() {
+    let mut stalls = stalls_at(mins(1));
+    let p = node(1);
+    assert_eq!(stalls.plan_digest_repair(p, C, VersionVector::default()), DigestPlan::Planned);
+    stalls.tick_opened();
+    assert_eq!(stalls.repair_due(p), Some((C, Repair::Converge)), "the first contact");
+    // A draining tick pulls again at the same peer: that pull is an ordinary one.
+    assert_eq!(stalls.repair_due(p), None, "a second pull of the contact");
+    assert_eq!(stalls.repair_due(p), None);
+    assert_eq!(contact(&mut stalls, p), None, "the contact after a Converge pull is ordinary");
+    assert_eq!(stalls.repair_due(p), None);
+    assert_eq!(contact(&mut stalls, p), Some((C, Repair::Converge)), "and then it resumes");
+    assert!(stalls.repairing(p), "the repair is still under way throughout");
+}
+
+#[test]
+fn alternation_does_not_count_a_resting_contact_as_a_stalled_round() {
+    let mut stalls = stalls_at(mins(1));
+    let p = node(1);
+    stalls.plan_digest_repair(p, C, VersionVector::default());
+    // Twenty contacts of a repair that advances every Converge round: never abandoned.
+    for _ in 0..20 {
+        if contact(&mut stalls, p).is_some() {
+            stalls.snapshot_advanced(p);
+        }
+    }
+    assert!(stalls.repairing(p), "a repair that advances was abandoned");
+    assert_eq!(
+        stalls.take_repair_counts().digest_repairs[DigestRepairOutcome::Abandoned.index()],
+        0
+    );
+}
+
+#[test]
+fn three_converge_rounds_that_land_nothing_abandon_the_repair_and_one_failed_round_does_not() {
+    let mut stalls = stalls_at(mins(1));
+    let p = node(1);
+    stalls.plan_digest_repair(p, C, VersionVector::default());
+    let mut handed = 0;
+    let mut contacts = 0;
+    while stalls.repairing(p) && contacts < 40 {
+        contacts += 1;
+        // Advance on the first Converge round, then land nothing.
+        if contact(&mut stalls, p).is_some() {
+            handed += 1;
+            if handed == 1 {
+                stalls.snapshot_advanced(p);
+            }
+        }
+    }
+    assert!(!stalls.repairing(p), "never abandoned");
+    // One that advanced, then REPAIR_ATTEMPTS that did not (the abandon fires when the next is
+    // asked for), so the repair was handed out REPAIR_ATTEMPTS + 1 times at most.
+    assert!((REPAIR_ATTEMPTS..=REPAIR_ATTEMPTS + 2).contains(&handed), "handed {handed} times");
+    assert_eq!(
+        stalls.take_repair_counts().digest_repairs[DigestRepairOutcome::Abandoned.index()],
+        1
+    );
+}
+
+#[test]
+fn a_count_repair_is_not_alternated() {
+    let mut stalls = stalls_at(mins(1));
+    let p = node(1);
+    assert!(stalls.plan_repair(p, C, Repair::Snapshot));
+    assert_eq!(contact(&mut stalls, p), Some((C, Repair::Snapshot)));
+    assert_eq!(stalls.repair_due(p), Some((C, Repair::Snapshot)), "a second pull of the contact");
+    assert_eq!(contact(&mut stalls, p), Some((C, Repair::Snapshot)), "and the next contact");
 }

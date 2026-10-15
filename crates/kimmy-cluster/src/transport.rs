@@ -3581,6 +3581,14 @@ struct Repairs {
     /// definition repair did with its page's indexes, for the line that reports its end.
     left_ids: Vec<kimmy_core::DocId>,
     definitions: kimmy_storage::DefinitionRestore,
+    /// A Converge repair is handed out once per contact and the contact after it is an
+    /// ordinary one, so a repair of a large collection cannot starve this peer's ordinary
+    /// replication (repair design section 2.6). `handed` is set once the contact has had its
+    /// Converge pull, `rest_next` makes the next contact the ordinary one, and `resting` is
+    /// that contact.
+    handed: bool,
+    rest_next: bool,
+    resting: bool,
     /// The size gate of each queued definition repair, and of the one active
     /// (`cluster.repair_max_index_documents`).
     limits: BTreeMap<CollectionId, u64>,
@@ -3632,6 +3640,27 @@ struct Repairs {
 /// refuses, say — does not cost a replay every round, short enough that a
 /// hole reopened after a repair is not left for the life of the process.
 pub const REPAIR_COOLDOWN_ROUNDS: u32 = 60;
+
+/// The most pages one Converge round pulls, and the longest it runs: a repair of a large
+/// collection is O(collection), and its round must not starve the peer's ordinary replication
+/// (repair design section 2.6). At 512 documents a page, 20 pages is about 10,000 documents. The
+/// round after it is an ordinary one, and the repair resumes in memory on the round after that.
+pub const CONVERGE_ROUND_PAGES: usize = 20;
+pub const CONVERGE_ROUND_TIME: Duration = Duration::from_secs(10);
+
+#[cfg(test)]
+thread_local! {
+    /// A test's own page cap for a Converge round, on the thread its round runs on.
+    static TEST_CONVERGE_ROUND_PAGES: std::cell::Cell<Option<usize>> = const { std::cell::Cell::new(None) };
+}
+
+fn converge_round_pages() -> usize {
+    #[cfg(test)]
+    if let Some(cap) = TEST_CONVERGE_ROUND_PAGES.with(std::cell::Cell::get) {
+        return cap;
+    }
+    CONVERGE_ROUND_PAGES
+}
 
 /// Rounds a repair may be handed out for without advancing before it is
 /// abandoned and takes the cooldown (ADR-148).
@@ -4351,6 +4380,18 @@ impl PeerStalls {
                 *contacts += 1;
                 *contacts < REPAIR_COOLDOWN_ROUNDS
             });
+            // A new contact: its Converge pull is not yet handed out, and it is the resting
+            // one if the last had a Converge pull.
+            repairs.handed = false;
+            repairs.resting = std::mem::take(&mut repairs.rest_next);
+        }
+        // A Converge repair under way waits out the contact after its pull, and a second pull
+        // in the contact that had one is an ordinary pull. Nothing is counted as stalled: the
+        // repair was not handed out.
+        if matches!(repairs.active, Some((_, Repair::Converge)))
+            && (repairs.resting || repairs.handed)
+        {
+            return None;
         }
         // A repair handed out on the previous round and neither advanced
         // nor finished since: the round failed, or the snapshot landed no
@@ -4420,6 +4461,11 @@ impl PeerStalls {
             };
         }
         let active = repairs.active;
+        if matches!(active, Some((_, Repair::Converge))) {
+            // Handed out: this contact has had its pull and the next one rests.
+            repairs.handed = true;
+            repairs.rest_next = true;
+        }
         for (collection, kind) in ended {
             self.repair_ended_as(
                 peer,
@@ -5274,6 +5320,7 @@ where
     S: AsyncRead + AsyncWrite + Unpin,
 {
     let mut outcome = SyncOutcome::default();
+    let round_started = std::time::Instant::now();
     let mut pages = 0usize;
     // Documents the pages carried that were history here (`is_history`), or
     // whose collection this node holds a tombstone for. Kept for the log
@@ -5422,6 +5469,21 @@ where
                 "caught up from a snapshot"
             );
             return Ok(SnapshotPulled { outcome, complete: true, sender_dropped: false });
+        }
+        // A Converge round is bounded by time as well as by pages (repair design section
+        // 2.6): the round after it is an ordinary one.
+        if policy == kimmy_storage::SnapshotPolicy::Converge
+            && (pages >= converge_round_pages() || round_started.elapsed() >= CONVERGE_ROUND_TIME)
+        {
+            info!(
+                %peer,
+                pages,
+                documents = outcome.applied,
+                cursor = cursor.as_deref().unwrap_or("-"),
+                "a converge repair's round is spent; the next round with this peer is an \
+                 ordinary one, and the repair resumes on the round after"
+            );
+            return Ok(SnapshotPulled { outcome, complete: false, sender_dropped: false });
         }
         // The page budget stays wall time, apply included (ADR-152): it is what
         // bounds how long one round with this peer holds the tick's sequential
@@ -8413,7 +8475,10 @@ mod tests {
 
         let mut stalls = PeerStalls::new();
         assert!(stalls.plan_repair(a.node_id(), orders.id, Repair::Converge));
-        for _ in 0..6 {
+        for _ in 0..8 {
+            // One contact each, as the loop makes them: the Converge pull and an ordinary one
+            // alternate.
+            stalls.tick_opened();
             sync_once_with(&b, addr, SECRET, None, &mut stalls).await.unwrap();
             if !stalls.repairing(a.node_id()) {
                 break;
@@ -8440,6 +8505,75 @@ mod tests {
             "nothing is left to resume"
         );
         assert!(b.snapshots_to_resume().unwrap().is_empty(), "a cursor was recorded");
+    }
+
+    /// A Converge round is bounded by pages, and the round after it is an ordinary one
+    /// (repair design section 2.6): a repair of a collection of three pages with a cap of one
+    /// page a round takes five contacts and finishes, and in between the peer is pulled
+    /// ordinarily.
+    #[tokio::test]
+    async fn a_converge_round_is_capped_and_alternates_with_an_ordinary_round() {
+        const SECRET: &str = "a-converge-cap-secret";
+        let a_dir = tempfile::tempdir().unwrap();
+        let a = Arc::new(Engine::open(&a_dir.path().join("kimmy.redb")).unwrap());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(serve(Arc::clone(&a), listener, SECRET.into()));
+        let orders = a.create_collection("shop", "orders").unwrap();
+        let docs = 2 * kimmy_storage::SNAPSHOT_PAGE as i64 + 6;
+        let first: Vec<_> = (0..docs).map(|i| bson::doc! { "_id": i, "v": 1 }).collect();
+        a.insert_many(&orders, first).unwrap();
+        let b_dir = tempfile::tempdir().unwrap();
+        let b = Engine::open(&b_dir.path().join("kimmy.redb")).unwrap();
+        let mut ordinary = PeerStalls::new();
+        for _ in 0..6 {
+            ordinary.tick_opened();
+            sync_once_with(&b, addr, SECRET, None, &mut ordinary).await.unwrap();
+        }
+        std::thread::sleep(Duration::from_millis(5));
+        for i in 0..docs {
+            a.replace(
+                &orders,
+                &kimmy_core::DocId::Int64(i),
+                bson::doc! { "_id": i, "v": 2 },
+                false,
+            )
+            .unwrap();
+        }
+        b.absorb_witnessed(&a.witnessed_vector().unwrap()).unwrap();
+        let meta = b.get_collection("shop", "orders").unwrap();
+        let stale = || {
+            (0..docs)
+                .filter(|i| {
+                    b.get(&meta, &kimmy_core::DocId::Int64(*i)).unwrap().unwrap().get_i32("v").ok()
+                        == Some(1)
+                })
+                .count()
+        };
+        assert_eq!(stale() as i64, docs, "premise: B holds every stale version");
+
+        TEST_CONVERGE_ROUND_PAGES.with(|cap| cap.set(Some(1)));
+        let mut stalls = PeerStalls::new();
+        assert!(stalls.plan_repair(a.node_id(), orders.id, Repair::Converge));
+        let mut rounds = Vec::new();
+        for _ in 0..8 {
+            stalls.tick_opened();
+            let outcome = sync_once_with(&b, addr, SECRET, None, &mut stalls).await.unwrap();
+            rounds.push((outcome.repairing, stale()));
+            if !stalls.repairing(a.node_id()) {
+                break;
+            }
+        }
+        TEST_CONVERGE_ROUND_PAGES.with(|cap| cap.set(None));
+        assert!(!stalls.repairing(a.node_id()), "the repair finished: {rounds:?}");
+        assert_eq!(stale(), 0, "every row was repaired");
+        // Strict alternation: a Converge round (repairing), an ordinary one (not), and so on,
+        // the last Converge round being the one that finished.
+        let repairing: Vec<bool> = rounds.iter().map(|(r, _)| *r).collect();
+        assert_eq!(repairing, [true, false, true, false, true], "{rounds:?}");
+        // One page a Converge round: the stale count falls by about a page each.
+        assert!(rounds[0].1 as i64 >= docs - kimmy_storage::SNAPSHOT_PAGE as i64, "{rounds:?}");
+        assert_eq!(rounds[0].1, rounds[1].1, "the ordinary round repaired nothing: {rounds:?}");
     }
 
     /// The cooldown: a repair done for a collection is not planned again
