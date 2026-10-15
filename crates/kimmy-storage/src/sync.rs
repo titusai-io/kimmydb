@@ -1298,6 +1298,13 @@ impl Engine {
             // stamp is recorded for an entry that was not applied. See
             // ADR-054. The one entry not taken — a collection this node
             // lacks — is not observed, and the batch ends at it.
+            // The lab's loss of one replicated entry: witnessed, not written (repair design
+            // section 15.1). Not compiled into any build that ships.
+            #[cfg(feature = "lab-hooks")]
+            if crate::lab_hooks::drops(entry) {
+                witnessed.observe(entry.stamp);
+                continue;
+            }
             match self.apply_one(entry, position, run, &mut memo, outcome)? {
                 Step::Taken => witnessed.observe(entry.stamp),
                 Step::Unknown(name) => {

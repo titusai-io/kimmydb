@@ -33,6 +33,8 @@ pub mod gc;
 pub mod health;
 pub mod hold_meter;
 pub mod index;
+#[cfg(feature = "lab-hooks")]
+pub mod lab_hooks;
 mod late_drop;
 mod live_count;
 pub mod live_digest;

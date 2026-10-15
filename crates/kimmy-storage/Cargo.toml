@@ -22,6 +22,10 @@ cache-metrics = ["redb/cache_metrics"]
 # transport's push tests enable it as a dev-dependency. Never enabled by a
 # build that ships.
 test-hooks = []
+# The lab's loss of one replicated entry (`KIMMY_TEST_DROP_APPLY`, repair design section 15):
+# a Dockerfile build argument of `kimmyd`'s `lab-hooks`. Never in a release artifact; the
+# release check is that `strings kimmyd | grep -c DROP_APPLY` reads 0.
+lab-hooks = []
 
 [dependencies]
 kimmy-core.workspace = true

@@ -814,6 +814,10 @@ async fn start_and_serve(
         options =
             options.force_rebuild("the previous run cannot be shown to have kept the digests");
     }
+    // The lab's loss of one replicated entry, armed from the environment (a build with the
+    // `lab-hooks` feature only).
+    #[cfg(feature = "lab-hooks")]
+    kimmy_storage::lab_hooks::arm_from_env();
     let engine = match Engine::open_with(&path, &options) {
         Ok(engine) => {
             // The open returns only after a forced rebuild has run to its end

@@ -18,6 +18,9 @@ path = "src/main.rs"
 # and off in the release artifacts: range reads served from the cache pay for
 # it, up to 17% of throughput at 64 concurrent clients (docs/operations.md).
 storage-cache-metrics = ["kimmy-api/storage-cache-metrics"]
+# The lab's loss of one replicated entry (`KIMMY_TEST_DROP_APPLY`): a Dockerfile build argument.
+# Never in a release artifact (`strings kimmyd | grep -c DROP_APPLY` reads 0).
+lab-hooks = ["kimmy-storage/lab-hooks"]
 
 [dependencies]
 kimmy-core.workspace = true
