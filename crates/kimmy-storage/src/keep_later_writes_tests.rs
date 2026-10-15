@@ -727,6 +727,28 @@ fn a_chunk_without_a_live_parent_is_removed_and_a_survivors_chunk_stays() {
     assert_counts_exact(&d, "a shadow that follows its parent");
 }
 
+/// A shadow's rows are its parent's vectors, so a shadow is judged by its parent and not by
+/// its own tombstones (ADR-236, F16): the parent keeps a write after the drop, its
+/// configuration from before the drop is turned off, and the shadow, holding only a
+/// removed chunk stamped after the drop, goes.
+#[test]
+fn a_shadow_whose_parent_lost_its_configuration_goes_whatever_tombstones_it_holds() {
+    let (a, d, _da, _dd) = a_and_d_holding_a_vector_collection();
+    assert!(a.drop_collection("shop", "orders").unwrap());
+    later();
+    let on_d = d.get_collection("shop", "orders").unwrap();
+    let (_, kept) = d.insert_stamped(&on_d, doc! { "_id": 5i64 }).unwrap();
+    let shadow = d.get_collection("shop", &kimmy_core::vector_meta::shadow_name("orders")).unwrap();
+    d.put_vectors(&shadow, &DocId::Int64(5), &[chunk_of(5, kept.hlc)]).unwrap();
+    assert!(d.delete_vectors(&shadow, &DocId::Int64(5)).unwrap() > 0, "premise: a chunk removed");
+    quiesce(&[&a, &d]);
+    let parent = d.get_collection("shop", "orders").expect("the parent keeps its write");
+    assert!(parent.vector.is_none(), "premise: its configuration was of the life before");
+    assert_eq!(docs_of(&d, "orders", &[1, 5]), vec![5]);
+    assert!(!holds(&d, &kimmy_core::vector_meta::shadow_name("orders")), "the shadow was kept");
+    assert_counts_exact(&d, "a shadow judged by its parent");
+}
+
 /// A life left with nothing is buried with its shadow, in the one commit.
 #[test]
 fn an_emptied_life_is_buried_with_its_shadow() {
