@@ -2133,6 +2133,11 @@ mod tests {
         .unwrap();
         engine.apply_batch(std::slice::from_ref(&drop)).unwrap();
         assert!(engine.get_collection("app", "docs").is_err(), "premise: the tie is the drop's");
+        // And a life after it, before the stream reads: the drop must end the stream
+        // there, not pass it over into the next life's changes.
+        engine.finish_purges_now().unwrap();
+        let next = engine.create_collection("app", "docs").unwrap();
+        engine.insert(&next, doc! { "_id": 7i64 }).unwrap();
         let event = tokio::time::timeout(std::time::Duration::from_secs(5), stream.next(&engine))
             .await
             .expect("the stream answered")

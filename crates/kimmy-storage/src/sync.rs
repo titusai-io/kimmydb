@@ -7926,6 +7926,56 @@ mod tests {
         assert!(b.witnessed_vector().unwrap().covers(&a.version_vector().unwrap()));
     }
 
+    /// The answer a page holding no life gives is bounded by its sender's coverage: a
+    /// definition made after that page (here, by a member that has not heard the drop and
+    /// then keeps its life, re-dated with the index) still stops the batch, and that
+    /// member's page brings the life. Taken as history because some page once answered,
+    /// it left B without the life A keeps.
+    #[test]
+    fn a_later_definition_the_answering_pages_coverage_does_not_name_still_stops() {
+        let (a, _da) = engine();
+        let (b, _db) = engine();
+        let (c, _dc) = engine();
+        a.create_collection("shop", "orders").unwrap();
+        let other = a.create_collection("shop", "other").unwrap();
+        round(&b, &a, BATCH);
+        round(&c, &a, BATCH);
+        b.drop_collection("shop", "orders").unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(2));
+        let field = |p: &str| crate::meta::IndexField { path: p.into(), descending: false };
+        let scoped = |into: &Engine, from: &Engine, id| {
+            let mut progress = crate::SnapshotProgress::of_collection(id);
+            while !progress.is_complete() {
+                let page = from.snapshot_page(progress.after().cloned(), progress.scope()).unwrap();
+                into.apply_snapshot_page(from.node_id(), &mut progress, &page).unwrap();
+            }
+        };
+
+        // C makes an index and drops it before it hears the drop, then buries its life.
+        let index = c.create_index("shop", "orders", vec![field("n")], false, None).unwrap();
+        c.drop_index("shop", "orders", &index.name).unwrap();
+        round(&c, &b, BATCH);
+        assert!(c.get_collection("shop", "orders").is_err(), "premise: C buried the life");
+        // B stops at C's index; C's page holds no life and answers it.
+        let stopped = round(&b, &c, BATCH).unknown.expect("premise: a later-life stop");
+        scoped(&b, &c, stopped.id);
+        assert_eq!(round(&b, &c, BATCH).unknown_collection, 0, "premise: answered");
+
+        // A, which has not heard the drop either, makes an index and then keeps its life.
+        std::thread::sleep(std::time::Duration::from_millis(2));
+        a.create_index("shop", "orders", vec![field("m")], false, None).unwrap();
+        a.insert(&other, doc! { "_id": "behind-it" }).unwrap();
+        round(&a, &b, BATCH);
+        assert!(a.get_collection("shop", "orders").unwrap().is_redated(), "premise: kept");
+        let outcome = round(&b, &a, BATCH);
+        assert_eq!(outcome.unknown_collection, 1, "A's index is not C's page's: {outcome:?}");
+        scoped(&b, &a, stopped.id);
+        round(&b, &a, BATCH);
+        let on_b = b.get_collection("shop", "orders").expect("A's life arrived");
+        assert_eq!(on_b.indexes.len(), 1, "with A's index");
+        assert_eq!(ids_on(&b, "shop", "other"), ids_on(&a, "shop", "other"), "nothing stranded");
+    }
+
     /// A drop of an index on a collection this node dropped, stamped after the drop,
     /// does not stop the batch (ADR-236): the index's tombstone is recorded, which is
     /// all of it a later life needs, and a sender holding the drop and no collection
