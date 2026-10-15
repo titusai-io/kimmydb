@@ -210,6 +210,31 @@ fn a_database_sweep_counts_a_life_it_kept() {
     assert!(kept.is_redated() && kept.created > dropped.hlc, "{kept:?}");
 }
 
+/// A collection's tombstone that expanded a database's drop follows the database's
+/// tombstone when a later drop of the database supersedes it (ADR-236), so members that
+/// met the collection under different drops of its database hold one tombstone for it. A
+/// collection's own drop, at a stamp of its own, does not move.
+#[test]
+fn an_expansion_of_a_database_drop_follows_a_later_drop_of_the_database() {
+    let (a, b, _da, _db, late) = the_field_sequence();
+    pull(&a, &b);
+    let first = a.database_dropped_at("shop").unwrap().expect("the first drop");
+    assert_eq!(a.collection_dropped_at(late).unwrap(), Some(first), "premise: expanded at it");
+    let orders = CollectionId::derive("shop", "orders");
+    let own = a.collection_dropped_at(orders).unwrap().expect("the dropper's own burial");
+    assert_ne!(own, first, "premise: a stamp of its own");
+    later();
+    let second = stamp_of(crate::physical_now_ms() + 1_000, 7);
+    a.apply_batch(&[drop_database_entry("shop", second)]).unwrap();
+    assert_eq!(a.database_dropped_at("shop").unwrap(), Some(second));
+    assert_eq!(a.collection_dropped_at(late).unwrap(), Some(second), "the expansion stayed behind");
+    assert_eq!(
+        a.collection_dropped_at(orders).unwrap(),
+        Some(own),
+        "a collection's own drop moved"
+    );
+}
+
 /// Control: a collection created after the drop stands and replicates. The
 /// pair with the two tests above is what tells the fix from "refuse every
 /// collection of a database that was ever dropped".

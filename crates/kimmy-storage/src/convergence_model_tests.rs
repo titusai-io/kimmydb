@@ -2293,7 +2293,8 @@ fn census_takes(name: &str, pre: &[Op], variants: &[(&str, Vec<Op>)], expect: Ex
 #[ignore = "the vacuity census; see the convergence model test report"]
 fn vacuity_census() {
     CENSUS.with(|c| *c.borrow_mut() = Some(Vec::new()));
-    let named: [fn(); 30] = [
+    let named: [fn(); 31] = [
+        finding_f14_an_expansion_of_a_database_drop_stayed_at_the_drop_it_was_made_under,
         finding_f12_a_page_refused_a_definition_its_drop_keeps,
         finding_f13_an_index_in_the_drops_hlc_was_kept_by_the_member_that_swept_it,
         finding_f11_a_local_creation_below_the_floor_it_takes_is_history_everywhere,
@@ -2610,6 +2611,21 @@ fn finding_f13_an_index_in_the_drops_hlc_was_kept_by_the_member_that_swept_it() 
         "C.create(orders)@120; A.create(orders)@110; B<-A whole; C.index(orders,k_1:asc)@170; \
          B.drop(orders)@170; A.index(orders,j_1:asc)@180; C<-A whole",
         &[(ORDERS, Some(&[]))],
+    );
+}
+
+/// F14 (found by the generated run). Two members drop one database in the same
+/// millisecond and a third had created a collection of it: each member gave the collection
+/// a tombstone at whichever of the two drops it held when it met the collection (the
+/// creation refused, or the life buried by the sweep), and kept it when the other, higher
+/// one arrived. An expansion follows the database's tombstone up.
+#[test]
+fn finding_f14_an_expansion_of_a_database_drop_stayed_at_the_drop_it_was_made_under() {
+    finding(
+        "F14",
+        "B.create(orders)@130; C<-B scoped(orders); B.dropdb@210; C.dropdb@210; \
+         A.create(items)@210",
+        &[(ORDERS, None), (ITEMS, None)],
     );
 }
 

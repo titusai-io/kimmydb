@@ -1340,7 +1340,11 @@ impl Engine {
         for (_, dropped) in &database_drops {
             self.witness(dropped);
         }
-        self.record_collection_drops(&database_drops)?;
+        // Each with its expansions (ADR-236): one commit per database, and a page
+        // carries a database's drop rarely.
+        for (id, dropped) in &database_drops {
+            self.record_database_tombstone_by_id(*id, *dropped)?;
+        }
         let held: std::collections::HashMap<CollectionId, Stamp> =
             self.collections_dropped()?.into_iter().collect();
 

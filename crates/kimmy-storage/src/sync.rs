@@ -2323,10 +2323,7 @@ impl Engine {
                 // reads the tombstone. It runs again on every redelivery, which
                 // costs nothing when it has already been done.
                 if target.name == kimmy_core::DATABASE_DROP_NAME {
-                    self.record_collection_drop(
-                        kimmy_core::database_drop_id(&target.db),
-                        entry.stamp,
-                    )?;
+                    self.record_database_tombstone(&target.db, entry.stamp)?;
                     self.bury_under_database_tombstones()?;
                     // Held and served onward like every drop: the members that
                     // learn of it from this one learn it from the entry.

@@ -136,6 +136,68 @@ impl Engine {
         self.record_tombstones_at(db, name, dropped)
     }
 
+    /// Record `db`'s tombstone at `stamp` where none that new is held, and move
+    /// every collection tombstone that is the previous one's expansion with it, in
+    /// one commit (ADR-236).
+    ///
+    /// A database's drop expands into the tombstones of the collections it
+    /// reaches, at its own stamp: a creation it refuses, a life its sweep buries
+    /// whole, a life it spares. Which drop of the database a member held when it
+    /// met a collection decided the stamp, so after two drops of one database
+    /// (at different times, or in one millisecond on two members) the members
+    /// held one collection's tombstone at two stamps for good. A tombstone at the
+    /// previous drop's exact stamp is that drop's expansion and nothing else (a
+    /// collection's own drop is a stamp of its own); it follows the database's
+    /// tombstone up, as an expansion under the later drop would have been made.
+    pub(crate) fn record_database_tombstone(&self, db: &str, stamp: Stamp) -> Result<()> {
+        self.record_database_tombstone_by_id(database_drop_id(db), stamp)
+    }
+
+    /// [`Self::record_database_tombstone`] for the id a database's tombstone is filed
+    /// under.
+    pub(crate) fn record_database_tombstone_by_id(
+        &self,
+        id: CollectionId,
+        stamp: Stamp,
+    ) -> Result<()> {
+        if self.collection_dropped_at(id)?.is_some_and(|held| held >= stamp) {
+            return Ok(());
+        }
+        let txn = self.begin_write(WriterHolder::Ddl)?;
+        Self::record_database_tombstone_in(&txn, id, stamp)?;
+        txn.commit()?;
+        Ok(())
+    }
+
+    /// [`Self::record_database_tombstone`] in the caller's transaction.
+    pub(crate) fn record_database_tombstone_in(
+        txn: &redb::WriteTransaction,
+        id: CollectionId,
+        stamp: Stamp,
+    ) -> Result<()> {
+        let mut dropped = txn.open_table(tables::COLLECTIONS_DROPPED)?;
+        let previous = match dropped.get(id.0)? {
+            Some(held) => Some(codec::decode_oplog_key(held.value())?),
+            None => None,
+        };
+        if previous.is_some_and(|held| held >= stamp) {
+            return Ok(());
+        }
+        let mut expansions = Vec::new();
+        if let Some(previous) = previous {
+            for row in dropped.iter()? {
+                let (key, value) = row?;
+                if key.value() != id.0 && codec::decode_oplog_key(value.value())? == previous {
+                    expansions.push(key.value());
+                }
+            }
+        }
+        for collection in expansions.into_iter().chain([id.0]) {
+            dropped.insert(collection, codec::oplog_key(&stamp).as_slice())?;
+        }
+        Ok(())
+    }
+
     /// Tombstones for `db.name` and its shadow at `at`, where none that new is
     /// held. Read first: a page that is already held must cost no writer.
     fn record_tombstones_at(&self, db: &str, name: &str, at: Stamp) -> Result<()> {
@@ -180,16 +242,7 @@ impl Engine {
         let txn = self.begin_write(WriterHolder::Ddl)?;
         let stamp = self.next_stamp();
         let id = database_drop_id(db);
-        {
-            let mut dropped = txn.open_table(tables::COLLECTIONS_DROPPED)?;
-            let newer = match dropped.get(id.0)? {
-                Some(held) => stamp > codec::decode_oplog_key(held.value())?,
-                None => true,
-            };
-            if newer {
-                dropped.insert(id.0, codec::oplog_key(&stamp).as_slice())?;
-            }
-        }
+        Self::record_database_tombstone_in(&txn, id, stamp)?;
         let entry = ddl_entry(
             stamp,
             OpKind::DropCollection,
