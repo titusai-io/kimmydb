@@ -207,6 +207,36 @@ fn a_life_left_with_nothing_by_the_sweep_is_buried_and_purged() {
     assert_counts_exact(&d, "an emptied life");
 }
 
+/// The log line says what happened. The survivors path is taken whenever a
+/// collection might hold something stamped after the drop, and the sweep often
+/// finds nothing, so "kept them" must not be logged for a collection buried whole.
+#[test]
+fn the_survivors_path_logs_kept_only_when_something_survived() {
+    let (a, d, _da, _dd, _id) = a_and_d_holding_the_old_life();
+    assert!(a.drop_collection("shop", "orders").unwrap());
+    later();
+    let on_d = d.get_collection("shop", "orders").unwrap();
+    d.insert(&on_d, doc! { "_id": 3i64 }).unwrap();
+    let logs = crate::log_capture::logs_of(|| quiesce(&[&a, &d]));
+    assert!(holds(&d, "orders"), "premise: a live write after the drop survived");
+    assert!(logs.contains("kept them"), "{logs}");
+    assert!(!logs.contains("the collection was buried"), "{logs}");
+}
+
+#[test]
+fn the_survivors_path_logs_buried_when_the_sweep_left_nothing() {
+    let (a, d, _da, _dd, _id) = a_and_d_holding_the_old_life();
+    assert!(a.drop_collection("shop", "orders").unwrap());
+    later();
+    let on_d = d.get_collection("shop", "orders").unwrap();
+    d.insert(&on_d, doc! { "_id": 3i64 }).unwrap();
+    assert!(d.delete(&on_d, &DocId::Int64(3)).unwrap());
+    let logs = crate::log_capture::logs_of(|| quiesce(&[&a, &d]));
+    assert!(!holds(&d, "orders"), "premise: buried by the last commit");
+    assert!(logs.contains("the collection was buried"), "{logs}");
+    assert!(!logs.contains("kept them"), "a collection buried whole was reported as kept: {logs}");
+}
+
 // -- D-3 / M-2 / M-4: the database's guard ----------------------------------
 
 /// A database that was dropped and made again has a tombstone, and a

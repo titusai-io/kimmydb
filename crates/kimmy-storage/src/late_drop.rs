@@ -531,13 +531,29 @@ impl Engine {
         if end.survived && self.get_collection(db, &shadow_name).is_ok() {
             self.sweep_until(db, &shadow_name, dropped, stop)?;
         }
-        info!(
-            db,
-            collection = name,
-            stamp = ?dropped,
-            kept = end.survived,
-            "a drop reached a collection holding writes stamped after it; kept them"
-        );
+        // Two lines, because the survivors path is taken whenever the collection might
+        // hold something stamped after the drop (its digest row is above it, or absent),
+        // and the sweep often finds nothing: a tombstone or an overwritten row raises
+        // that high-water mark and leaves no live write behind. Saying "kept them" then
+        // told an operator a write had survived when the collection was buried whole.
+        if end.survived {
+            info!(
+                db,
+                collection = name,
+                stamp = ?dropped,
+                kept = true,
+                "a drop reached a collection holding writes stamped after it; kept them"
+            );
+        } else {
+            info!(
+                db,
+                collection = name,
+                stamp = ?dropped,
+                kept = false,
+                "a drop reached a collection that might hold writes stamped after it; the \
+                 sweep found none that survived, and the collection was buried"
+            );
+        }
         Ok(if end.survived { Dropped::Kept } else { Dropped::Buried(true) })
     }
 

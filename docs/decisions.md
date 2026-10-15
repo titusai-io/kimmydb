@@ -27151,3 +27151,105 @@ refusal hint and skips it, and stays at the old width; the definition digest sho
 A refused entry is witnessed and, as reasoned from the sync path (not tested), is not served to it again after the upgrade, so that member stays diverged until the
 next vector change from any member reaches it, or a snapshot page does (the page route has applied the change since
 ADR-227).
+
+## ADR-235 — A snapshot page whose life began after a drop ends the life standing here that the drop ended, when no tombstone arrives to say so
+
+> **Amends [ADR-155](#adr-155--a-collection-this-node-dropped-is-not-a-divergence-and-a-snapshot-does-not-bring-it-back)
+> and ADR-162**, closing the second residual ADR-155 states ("a snapshot does not reconcile a differing
+> incarnation ... it ends holding one collection made of two lives"). Adds **one optional field to the snapshot
+> page's collection definition** (`CollectionState::incarnation_floor`): additive, an older receiver ignores it, a
+> page without it is read as no evidence. Not Breaking and not a rollback boundary (0.49.0 reads such a page as it
+> did, and keeps the life that ended).
+
+**The case.** The sender dropped life 1 and made life 2; this member holds life 1; the sender's drop tombstone has
+aged out (`storage.tombstone_retention_secs`, which ADR-123 requires to exceed the longest partition an operator
+intends to survive, so a cluster honouring it does not reach this). A snapshot of life 2 carries nothing about the
+drop, and `restore_collection` found the name present and did nothing: the receiver kept life 1 and applied life 2's
+documents into it, one collection made of two lives, permanently, because a completed whole-database snapshot grants
+coverage and the `DropCollection` entry is never served to it either. With the tombstone carried (ADR-162) it
+converged; the difference was only whether a tombstone survived.
+
+**Decision.**
+
+1. **The evidence is the sender's incarnation floor.** A second life of a name exists because a drop ended the
+   first; that drop is what gives the new life its floor. `CollectionState` now carries it. `created` alone cannot
+   do this: it is the same shape for a life made after a drop and for two members that created one name with no drop
+   between them (ADR-155 case 3), which must never be buried.
+2. **One predicate, `sync::arriving_life_ends_the_standing_one`**, the create-side counterpart of
+   `aims_at_a_previous_incarnation`, judged against what stands on this node. All of these hold: the page carries a
+   floor; the arriving life is newer than the standing one (`created`), so a sender that is behind never buries a
+   life it has not caught up to; the drop was at or after the standing life's creation and before the arriving
+   creation (`standing.created <= floor < created`), so a floor the standing life was made after is a drop this
+   member already knows by its own floor; and it is **not the same life re-dated** (ADR-231, extended): a life a drop
+   re-dated to keep what was written after it began where it always did, so the beginnings of both sides
+   (`redated_from` on the arriving side, the re-dating marker on the standing one) are compared and equal ones are
+   one life continuing, which the drop reaches by its own route.
+3. **The floor is named by the sender's own coverage** (ADR-163) before it is believed: it comes off the wire and
+   drives a destructive sweep. A floor the page's `versions` do not reach is ignored.
+4. **The burial is the drop's, not a new one.** The standing life is ended through `restore_collection_drop`, the path
+   a carried drop takes: the late-drop sweep that **keeps what was written after the drop** (a write the receiver
+   made after the floor stays, in the collection re-dated above the drop, ADR-231 extended) and the tombstone
+   recorded, so the floor the receiver ends with is the sender's and stragglers of the ended life stay history. The
+   page carries the floor as a time and not the origin of the drop, so the stamp is the floor and the **sender's
+   node**. `record_collection_drop` keeps the greater stamp, and stamps order by `(hlc, node)`: a real drop with a later hlc replaces the synthetic tombstone, and one with an **equal hlc** replaces it only when its node sorts higher; otherwise the synthetic one stays. That is harmless, because every comparison of a drop against a life reads the hlc alone. The order is the one
+   a carried drop has: the standing life first, then the definitions of the new one.
+5. **A member that takes the life by snapshot carries the floor on, and a life that stands without it takes it
+   from a vouched page.** The burial is only half of it. A member that creates the life **fresh** from a page (no
+   standing life to bury) adopts the page's floor with the creation, in the same transaction, when the sender's
+   coverage names it and it is below the life it belongs to (the greater of the receiver's own tombstone's floor and
+   the page's), and its clock passes the floor as it passes a burial's (ADR-233). Without it a relay (S dropped and
+   recreated; R, empty, takes S's page; O, holding the old life, takes R's page) ended with R floorless and O with one
+   collection made of two lives: the burial's evidence died at the first hop.
+   **A life already standing here without the floor** (taken from a relay that could not vouch for it, from a 0.49.0
+   sender, or by a snapshot copy made before the floor was carried) takes it from the next vouched page that carries
+   it: when the floor is below the standing life's `created` and above its own floor (or it has none), ADR-231's
+   sweep runs at the floor (`late_drop::owes_a_sweep`, `sweep_after_an_ignored_drop`), keeping what the life wrote
+   after the drop and removing the stragglers of the life before, and the floor is raised. The branch is disjoint
+   from the burial (`floor < standing.created` there, `>=` here), needs no lineage condition (any life created after
+   the floor owes the sweep, whichever life the page carries, as when the tombstone arrives), writes no tombstone,
+   and trusts nothing more than the burial does (the same coverage gate). Without it such a member, granted coverage
+   of the sender past the drop by a whole-database snapshot, was never served the drop again, held the new life
+   floorless for good, and **its own pages then granted a member holding the life before that coverage without
+   burying it**, so with equal counts (the count half never fires) the old life's index survived for good, seen only
+   by the definition digest, which plans no repair.
+   **The stated limit, and how it heals.** An *idle relay* is a member whose servable vector names no stamp of any
+   origin at or above the floor: a member that took the life by a scoped snapshot, or is part-way through a
+   whole-database pull, and has neither started nor applied anything since the drop (a kimmyd start stamps the root
+   user and the topology record under the member's own origin, ADR-202, which names every earlier floor, so a member
+   that has started after the drop is not idle). It holds the floor and **cannot vouch for it** (ADR-163), so a member
+   holding the life before buries nothing on its page. Its page grants that member no coverage of the drop either, so
+   that member is **still owed the drop** and takes it on its next contact with any member that covers it: the entry
+   while it is retained, ended by the keep-later-writes drop, or that member's whole-database snapshot, which buries.
+   That is ADR-163's own argument, "the strict gate costs a round of anti-entropy", and it is pinned by tests (both
+   routes). All three ways of closing the limit were weighed and refused as unsound under ADR-163: a floor carrying
+   its vouching origin (stricter, and it would stop the busy relay vouching), a relay vouching for a floor it
+   adopted (a bare assertion off the wire), and a relay's coverage including the sender's stamps it took by a scoped
+   snapshot (its servable vector promises a contiguous window per origin).
+6. **Both snapshot routes.** The check is in `restore_collection`, which the whole-database and the scoped route both
+   call.
+
+**The entries route is not changed, and why.** `apply_ddl`'s `CreateCollection` arm also does nothing when the name is
+held. A create entry carries no floor, so it has no evidence either; adding an optional floor to the entry body is
+possible and was weighed. It is not needed: for an entry to meet a standing life it cannot tell from a newer one, the
+drop entry of the other origin must be absent while the create is present, and the window a member pulls by is
+contiguous per origin and ordered, so the drop reaches it later **within the window**, where the sweep of ADR-231
+ends the old life and keeps what was written after the drop (tested with two origins: the create arrives first, the
+drop later). A drop withheld for good would mean the member is beyond the horizon, and then it takes a
+whole-database snapshot, which is this route.
+
+**Decided (owner, 2026-10-14).** Two members that create one name independently with no drop between them (ADR-155
+case 3) each keep their own `created` for good, **by design**: no winner is chosen and nothing is buried. It is not data
+loss (the collection id is derived from the name, so the documents merge), and `created` is a per-member date that no rule
+reads as a lower bound for another member's life. A settling (both members adopt the older `created`) was tried and
+rejected: it lost data when a drop lay between the two creations (a database drop removed the later creation and its
+document on one member and not on the other), and a redesign with remembered sibling creations was found to need a rule
+on every drop-tombstone writer and a stored-metadata change. What is checked instead is that all members end in the same
+observable state (collections, documents by id and stamp, indexes, tombstones, floors) on every delivery order, with
+`created` excluded; that test is a separate change.
+
+**Tests.** `life_supersession_tests.rs`: the aged-out case on the whole-database and the scoped route; the floor the
+receiver ends with; a write after the drop kept; with the tombstone held it still converges; **no floor** buries
+nothing; **a floor the coverage does not name** buries nothing; **two members that create one name with no drop** bury
+nothing; a life made after the drop the receiver knows buries nothing; a standing life newer than the arriving one is
+not buried; **a re-dated life is not mistaken for a newer one**; **a database drop's floor buries the previous life**; **an index of the new life survives the burial and both members hold the same index and definition digest**; **a failure between the burial and the restore leaves the burial alone, the page's progress unmoved, and the retry heals it**; and the entries route with two origins; **a relay passes the floor on** (eight variants of first and second hop, scoped or whole, the sender's tombstone held or forgotten, the relay busy, each ending with the sender's life, creation and floor, and the idle whole-database first hop, which vouches); **a floor the coverage does not name is not adopted** and **a floor not below its life is not adopted**; **the page's floor never lowers the receiver's own and replaces a lower one the receiver's own earlier tombstone gave**; **the idle-relay limit and both ways it heals** (the next ordinary pull, and the dropper's whole-database snapshot), **and the relay part-way through a whole-database pull**; **a life standing without the floor takes it from a vouched page** (the member that took the life from an idle relay and then the sender's whole-database snapshot; with equal counts life 0's index does not survive; the sweep removes a straggler and keeps the life's own writes; a life that already holds the floor, and a re-dated one, sweep nothing); and **the clock passes an adopted floor**. Protocol: a
+state without the field decodes to none and none is not written. Mutation rows (a harness that is not in the tree; the rows are named here as the record): the floor required, `floor >= standing.created` removed and weakened to `>`, `floor < created` removed and weakened to `<=`, the lineage comparison removed, the standing lineage ignoring the re-dating marker, the coverage gate, the burial itself (not called; always-false and always-true predicate; replaced by a drop that keeps nothing; stamped at `created` instead of the floor), the kept/buried log split in both directions, and the floor serialized when unset. All killed; and for the adoption and the sweep of points 5: the floor not passed to the creation, the coverage filter removed, `floor < created` removed, the receiver's own floor replaced by the page's whatever it is, **the floor adopted only when the receiver has none** (it survived the first tests and is killed by the earlier-tombstone test), the adopted floor not stored, the sweep branch removed, its condition inverted, and the clock not passed over an adopted floor. **Five mutants survive and are equivalent**: `own < floor` weakened to `own <= floor` in the adoption (an equal floor changes nothing); the sweep branch's `return` removed (the burial predicate that follows is false by the disjointness, `floor < standing.created`); and the three below. **The earlier three survive and are equivalent**, each implied by the other two clauses `standing.created <= floor < created`: (1) `created > standing.created` removed, (2) the same clause weakened to `>=`, and (3) a missing floor defaulting to `created` (then `floor < created` is false, so the predicate is false as before). The newer-life clause stays in the predicate because it states the intent (a sender that is behind never buries a life it has not caught up to) where a reader looks for it.

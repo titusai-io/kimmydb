@@ -1695,6 +1695,10 @@ mod tests {
             created: Option<Hlc>,
         }
 
+        fn carried_has_the_floor(state: &kimmy_storage::CollectionState) -> bool {
+            bson::serialize_to_document(state).unwrap().contains_key("incarnation_floor")
+        }
+
         let state = kimmy_storage::CollectionState {
             db: "shop".into(),
             name: "orders".into(),
@@ -1703,6 +1707,7 @@ mod tests {
             created: Some(Hlc::new(900, 0)),
             vector_changed: None,
             redated_from: Some(Hlc::new(100, 0)),
+            incarnation_floor: Some(Hlc::new(200, 0)),
         };
         let mut written = Vec::new();
         write_frame(
@@ -1735,9 +1740,24 @@ mod tests {
         let read: kimmy_storage::CollectionState = bson::deserialize_from_document(before).unwrap();
         assert_eq!(read.redated_from, None);
         // And an ordinary definition does not carry it at all.
-        let plain = kimmy_storage::CollectionState { redated_from: None, ..state };
+        let plain = kimmy_storage::CollectionState {
+            redated_from: None,
+            incarnation_floor: None,
+            ..state.clone()
+        };
         let doc = bson::serialize_to_document(&plain).unwrap();
         assert!(!doc.contains_key("redated_from"), "absent when unset: {doc}");
+        assert!(!doc.contains_key("incarnation_floor"), "absent when unset: {doc}");
+
+        // The sender's incarnation floor (ADR-235): carried, read by an older receiver
+        // without trouble (it declares no such field), and none from a sender that
+        // predates it.
+        assert!(carried_has_the_floor(&state), "the frame must carry the floor");
+        let mut without = bson::serialize_to_document(&state).unwrap();
+        without.remove("incarnation_floor");
+        let read: kimmy_storage::CollectionState =
+            bson::deserialize_from_document(without).unwrap();
+        assert_eq!(read.incarnation_floor, None);
     }
 
     #[tokio::test]
