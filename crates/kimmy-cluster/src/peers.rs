@@ -4337,6 +4337,69 @@ mod digest_fold_tests {
         assert_eq!(f.tracker.digest_confirmed_count(), 1);
     }
 
+    /// The cut an exact mismatch was compared at is kept for the repair its finding plans,
+    /// whose progress is counted against it (repair design section 4, R3).
+    #[test]
+    fn the_cut_of_an_exact_mismatch_is_kept_for_the_repair_it_plans() {
+        let mut f = fixture();
+        let mut cut = kimmy_core::VersionVector::new();
+        cut.insert(NodeId::from_bytes([9; 16]), kimmy_core::Hlc::new(1_000, 0));
+        let mut round = f.mismatch();
+        round.cut = cut.clone();
+        f.fold(round);
+        assert_eq!(f.state.cuts.get(&(f.node, f.collection)), Some(&cut));
+    }
+
+    /// With the switch on, the finding says a repair is planned; the old text stays when off.
+    #[test]
+    fn the_finding_says_a_repair_is_planned_exactly_when_the_switch_is_on() {
+        let mut f = fixture();
+        f.state.repair_planned = true;
+        f.fold(f.mismatch());
+        let on = f.fold(f.mismatch());
+        assert!(on.contains("a document repair is planned"), "{on}");
+        assert!(!on.contains("detect only"), "{on}");
+        let mut f = fixture();
+        f.fold(f.mismatch());
+        let off = f.fold(f.mismatch());
+        assert!(off.contains("detect only, no repair is planned"), "{off}");
+    }
+
+    /// The first compared digest after a repair's end judges it: a match is effective, a
+    /// mismatch is not, and a deferred comparison judges nothing.
+    #[test]
+    fn the_first_compared_digest_after_a_repair_judges_it() {
+        use crate::transport::DigestPlan;
+        let finished = |f: &mut Fixture| {
+            f.stalls.set_repair_clock(Duration::from_secs(60), Duration::from_secs(300));
+            let plan = f.stalls.plan_digest_repair(
+                f.node,
+                f.collection,
+                kimmy_core::VersionVector::default(),
+            );
+            assert_eq!(plan, DigestPlan::Planned);
+            f.stalls.repair_due(f.node);
+            f.stalls.repair_finished(f.node);
+        };
+        let mut f = fixture();
+        finished(&mut f);
+        let mut deferred = DigestRound::new(DigestAnswered::Answered);
+        deferred.verdicts.push(DigestVerdict {
+            collection: f.collection,
+            outcome: DigestOutcome::Deferred(Defer::Moved),
+        });
+        f.fold(deferred);
+        assert_eq!(f.stalls.take_repair_counts().digest_judgements, [0; 4], "a deferral judged");
+        f.fold(f.equal());
+        let counts = f.stalls.take_repair_counts();
+        assert_eq!(counts.digest_judgements[crate::transport::Judgement::Effective.index()], 1);
+        let mut g = fixture();
+        finished(&mut g);
+        g.fold(g.mismatch());
+        let counts = g.stalls.take_repair_counts();
+        assert_eq!(counts.digest_judgements[crate::transport::Judgement::Ineffective.index()], 1);
+    }
+
     /// The same finding is logged again when ten minutes have passed.
     #[test]
     fn a_finding_that_stays_is_logged_again_after_ten_minutes() {

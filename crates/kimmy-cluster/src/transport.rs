@@ -4109,6 +4109,11 @@ impl PeerStalls {
         self.ledger.stopped_collections(self.repair_clock)
     }
 
+    /// Whether this is the first repair page `peer` has sent with no tombstone horizon.
+    fn first_without_horizon(&mut self, peer: NodeId) -> bool {
+        self.no_horizon_said.insert(peer)
+    }
+
     /// A digest finding against `peer` for `collection` is confirmed, as it is at every
     /// contact it stands: the first one after a repair cleared it is an episode (R4).
     pub fn digest_finding_confirmed(
@@ -4526,10 +4531,7 @@ impl PeerStalls {
     /// exactly as a replay's does when its window moves (ADR-152).
     fn snapshot_advanced(&mut self, peer: NodeId) {
         if let Some(repairs) = self.repairs.get_mut(&peer)
-            && matches!(
-                repairs.active,
-                Some((_, Repair::Snapshot | Repair::Converge | Repair::Definitions))
-            )
+            && matches!(repairs.active, Some((_, Repair::Snapshot | Repair::Converge)))
         {
             repairs.advanced = true;
         }
@@ -4655,7 +4657,7 @@ impl PeerStalls {
     }
 
     /// The repair under way against `peer` is done.
-    fn repair_finished(&mut self, peer: NodeId) {
+    pub(crate) fn repair_finished(&mut self, peer: NodeId) {
         self.repair_ended(peer, None);
     }
 
@@ -5364,7 +5366,7 @@ where
 
         if policy == kimmy_storage::SnapshotPolicy::Converge
             && page.tombstone_horizon.is_none()
-            && stalls.no_horizon_said.insert(node)
+            && stalls.first_without_horizon(node)
         {
             info!(
                 %peer,

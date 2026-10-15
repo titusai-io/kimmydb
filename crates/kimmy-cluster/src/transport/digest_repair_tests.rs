@@ -469,9 +469,11 @@ fn a_whole_database_pull_taking_over_ends_a_definition_repair_as_transient() {
     let p = node(1);
     assert_eq!(stalls.plan_definition_repair(p, C, 10), DigestPlan::Planned);
     stalls.repair_due(p);
+    // And one still queued.
+    assert_eq!(stalls.plan_definition_repair(p, CollectionId(8), 10), DigestPlan::Planned);
     stalls.whole_database_takes_over(p);
     let counts = stalls.take_repair_counts();
-    assert_eq!(counts.definition_repairs[DigestRepairOutcome::Transient.index()], 1);
+    assert_eq!(counts.definition_repairs[DigestRepairOutcome::Transient.index()], 2);
     stalls.retain_definition(p, &BTreeSet::new());
     assert_eq!(stalls.plan_definition_repair(p, C, 10), DigestPlan::Planned);
 }
@@ -705,4 +707,39 @@ fn a_count_repair_is_not_alternated() {
     assert_eq!(contact(&mut stalls, p), Some((C, Repair::Snapshot)));
     assert_eq!(stalls.repair_due(p), Some((C, Repair::Snapshot)), "a second pull of the contact");
     assert_eq!(contact(&mut stalls, p), Some((C, Repair::Snapshot)), "and the next contact");
+}
+
+#[test]
+fn a_definition_repair_cancelled_while_queued_is_transient() {
+    let mut stalls = stalls_at(mins(1));
+    let p = node(1);
+    assert_eq!(stalls.plan_definition_repair(p, C, 10), DigestPlan::Planned);
+    assert_eq!(stalls.repairs_cancelled(C), 1);
+    let counts = stalls.take_repair_counts();
+    assert_eq!(counts.definition_repairs[DigestRepairOutcome::Transient.index()], 1);
+    assert_eq!(counts.digest_repairs[DigestRepairOutcome::Transient.index()], 0);
+    stalls.retain_definition(p, &BTreeSet::new());
+    assert_eq!(stalls.plan_definition_repair(p, C, 10), DigestPlan::Planned);
+}
+
+#[test]
+fn a_definition_repair_that_advances_nothing_is_abandoned_and_counted_in_its_own_series() {
+    let mut stalls = stalls_at(mins(1));
+    let p = node(1);
+    assert_eq!(stalls.plan_definition_repair(p, C, 10), DigestPlan::Planned);
+    for _ in 0..=REPAIR_ATTEMPTS {
+        stalls.repair_due(p);
+    }
+    let counts = stalls.take_repair_counts();
+    assert_eq!(counts.definition_repairs[DigestRepairOutcome::Abandoned.index()], 1);
+    assert_eq!(counts.digest_repairs[DigestRepairOutcome::Abandoned.index()], 0);
+    assert!(!stalls.repairing(p));
+}
+
+#[test]
+fn a_peer_is_told_once_that_it_sends_no_horizon() {
+    let mut stalls = stalls_at(mins(1));
+    assert!(stalls.first_without_horizon(node(1)));
+    assert!(!stalls.first_without_horizon(node(1)), "said once");
+    assert!(stalls.first_without_horizon(node(2)), "per peer");
 }
