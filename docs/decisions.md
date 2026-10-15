@@ -27193,7 +27193,17 @@ converged; the difference was only whether a tombstone survived.
    page carries the floor as a time and not the origin of the drop, so the stamp is the floor and the **sender's
    node**. `record_collection_drop` keeps the greater stamp, and stamps order by `(hlc, node)`: a real drop with a later hlc replaces the synthetic tombstone, and one with an **equal hlc** replaces it only when its node sorts higher; otherwise the synthetic one stays. That is harmless, because every comparison of a drop against a life reads the hlc alone. The order is the one
    a carried drop has: the standing life first, then the definitions of the new one.
-5. **Both snapshot routes.** The check is in `restore_collection`, which the whole-database and the scoped route both
+5. **A member that takes the life by snapshot carries the floor on.** The burial is only half of it: a member that
+   creates the life **fresh** from a page (no standing life to bury) adopts the page's floor with the creation, in the
+   same transaction, when the sender's coverage names it and it is below the life it belongs to (the greater of the
+   receiver's own tombstone's floor and the page's). Without it a relay (S dropped and recreated; R, empty, takes S's
+   page; O, holding the old life, takes R's page) ended with R floorless and O with one collection made of two lives:
+   the burial's evidence died at the first hop. **The stated limit:** R's page names the floor only if R's own
+   coverage reaches it (ADR-163); a scoped snapshot grants no coverage, so an *idle* relay that took the life that way
+   holds the floor and cannot vouch for it, and O buries nothing until R's coverage reaches it. A member in a live
+   cluster has stamps of its own after the floor, so the limit is a state of an empty member, and it is pinned by a
+   test.
+6. **Both snapshot routes.** The check is in `restore_collection`, which the whole-database and the scoped route both
    call.
 
 **The entries route is not changed, and why.** `apply_ddl`'s `CreateCollection` arm also does nothing when the name is

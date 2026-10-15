@@ -537,3 +537,131 @@ fn a_failure_between_the_burial_and_the_restore_leaves_nothing_that_does_not_hea
     assert_holds_the_senders_life(&a, &b, "the retry");
     assert_eq!(b.get_collection("shop", "orders").unwrap().incarnation_floor.unwrap(), floor);
 }
+
+// -- A relay passes the floor on (PR #193, break-the-guard review) -------------------------
+
+/// S drops and recreates; R, which holds nothing, takes S's page (whole or scoped, S's
+/// tombstone held or forgotten); O, which holds the old life, then takes R's page. The
+/// floor must reach O through R, so O's old life ends at it: before, `restore_collection`
+/// created the life through `create_collection_marked`, which took the floor only from R's
+/// own tombstone, so R ended with none and O ended with one collection made of two lives.
+fn relay(
+    first_hop_scoped: bool,
+    second_hop_scoped: bool,
+    forget_on_s: bool,
+    r_is_busy: bool,
+) -> Result<(), String> {
+    let (s, _ds) = engine();
+    let (r, _dr) = engine();
+    let (o, _do) = engine();
+    let first = s.create_collection("shop", "orders").unwrap();
+    s.insert(&first, doc! { "_id": 1 }).unwrap();
+    transfer(&o, &s);
+    assert!(has(&o, 1), "premise");
+    later();
+    assert!(s.drop_collection("shop", "orders").unwrap());
+    s.finish_purges_now().unwrap();
+    later();
+    let second = s.create_collection("shop", "orders").unwrap();
+    s.insert(&second, doc! { "_id": 2 }).unwrap();
+    if forget_on_s {
+        forget_the_tombstone(&s);
+    }
+    let hop = |into: &Engine, from: &Engine, scoped: bool| {
+        if scoped {
+            transfer_under(into, from, SnapshotProgress::of_collection(orders_id()));
+        } else {
+            transfer(into, from);
+        }
+    };
+    hop(&r, &s, first_hop_scoped);
+    if r_is_busy {
+        // A member in a live cluster has stamps of its own after the floor (any write of
+        // its own, or entries of any origin), which is what lets its coverage name the
+        // floor it passes on. A scoped snapshot grants no coverage, so an idle relay that
+        // took the life that way has none to vouch with (see the test below).
+        later();
+        let other = r.create_collection("shop", "heartbeat").unwrap();
+        r.insert(&other, doc! { "_id": 1 }).unwrap();
+    }
+    let floor_s = created_floor(&s);
+    let floor_r = created_floor(&r);
+    hop(&o, &r, second_hop_scoped);
+    o.finish_purges_now().unwrap();
+    if has(&o, 1) {
+        Err(format!(
+            "floor on S {floor_s:?}, on R {floor_r:?}: O holds life 0's document 1 beside life \
+             1's document 2"
+        ))
+    } else if created_floor(&r) != floor_s {
+        Err(format!("R's floor {:?} is not S's {floor_s:?}", created_floor(&r)))
+    } else {
+        Ok(())
+    }
+}
+
+fn created_floor(e: &Engine) -> Option<Hlc> {
+    e.get_collection("shop", "orders").unwrap().incarnation_floor
+}
+
+#[test]
+fn a_member_that_took_the_life_by_snapshot_passes_the_floor_on() {
+    let mut bad = Vec::new();
+    for first in [false, true] {
+        for second in [false, true] {
+            for forget in [false, true] {
+                if let Err(e) = relay(first, second, forget, true) {
+                    bad.push(format!(
+                        "first hop scoped={first}, second hop scoped={second}, forget on S={forget}: {e}"
+                    ));
+                }
+            }
+        }
+    }
+    assert!(bad.is_empty(), "relay failures:\n{}", bad.join("\n"));
+}
+
+#[test]
+fn a_floor_the_coverage_does_not_name_is_not_adopted_on_a_fresh_create() {
+    let (a, _da) = engine();
+    let (r, _dr) = engine();
+    let first = a.create_collection("shop", "orders").unwrap();
+    a.insert(&first, doc! { "_id": 1 }).unwrap();
+    later();
+    a.drop_collection("shop", "orders").unwrap();
+    a.finish_purges_now().unwrap();
+    later();
+    a.create_collection("shop", "orders").unwrap();
+    let far = Hlc::new(crate::physical_now_ms() + 86_400_000, 0);
+    let mut page = a.snapshot_page(None, Some(orders_id())).unwrap();
+    for state in &mut page.collections {
+        state.incarnation_floor = Some(far);
+    }
+    r.apply_snapshot_page(a.node_id(), &mut SnapshotProgress::of_collection(orders_id()), &page)
+        .unwrap();
+    assert_ne!(created_floor(&r), Some(far), "a floor nothing vouched for was adopted");
+}
+
+#[test]
+fn an_idle_relay_that_took_the_life_by_a_scoped_snapshot_holds_the_floor_but_cannot_vouch_for_it() {
+    // The stated limit of the relay: R adopted S's floor (it carries it), but a scoped
+    // snapshot grants no coverage and R has written nothing, so its pages name no stamp at
+    // or above the floor and O does not believe it (ADR-163). Nothing is buried on a
+    // floor nothing vouches for; the floor is believed once R's coverage reaches it.
+    let (s, _ds) = engine();
+    let (r, _dr) = engine();
+    let (o, _do) = engine();
+    let first = s.create_collection("shop", "orders").unwrap();
+    s.insert(&first, doc! { "_id": 1 }).unwrap();
+    transfer(&o, &s);
+    later();
+    s.drop_collection("shop", "orders").unwrap();
+    s.finish_purges_now().unwrap();
+    later();
+    let second = s.create_collection("shop", "orders").unwrap();
+    s.insert(&second, doc! { "_id": 2 }).unwrap();
+    transfer_under(&r, &s, SnapshotProgress::of_collection(orders_id()));
+    assert_eq!(created_floor(&r), created_floor(&s), "R carries the floor");
+    transfer(&o, &r);
+    assert!(has(&o, 1), "a floor nothing vouched for buried a life");
+}

@@ -4252,7 +4252,7 @@ impl Engine {
         origin: Option<Hlc>,
         history: &dyn Fn(Stamp) -> bool,
     ) -> Result<Option<CollectionMeta>> {
-        self.create_collection_marked(db, name, log, origin, history, None)
+        self.create_collection_marked(db, name, log, origin, history, None, None)
     }
 
     /// [`Self::create_collection_inner`] for a life a collection's drop re-dated
@@ -4268,6 +4268,7 @@ impl Engine {
         origin: Option<Hlc>,
         history: &dyn Fn(Stamp) -> bool,
         redated_from: Option<Hlc>,
+        sender_floor: Option<Hlc>,
     ) -> Result<Option<CollectionMeta>> {
         // A creation over a dropped life's rows is refused inside the
         // transaction, below: see `create_collection_in_txn` (ADR-189).
@@ -4290,6 +4291,7 @@ impl Engine {
         let mint = || self.next_stamp();
         match self.create_collection_in_txn(&txn, db, name, log, origin, history, mint) {
             Ok(InTxn::Created(mut meta, logged)) => {
+                let mut changed = false;
                 if let Some(from) = redated_from {
                     meta.redated = Some(crate::meta::Redated {
                         from,
@@ -4297,6 +4299,22 @@ impl Engine {
                         first_arrival: None,
                         arrivals_from: None,
                     });
+                    changed = true;
+                }
+                // The floor a snapshot page names, adopted with the creation, so a member
+                // that takes the life by snapshot can pass the evidence on: its own pages
+                // then bury the life before this one elsewhere (ADR-235). The floor is the
+                // greater of the receiver's own tombstone's (`create_collection_in_txn`
+                // took it) and the page's, and only a floor below the life it belongs to.
+                // The caller has held the floor to what the sender's coverage names.
+                if let Some(floor) = sender_floor
+                    && floor < meta.created
+                    && meta.incarnation_floor.is_none_or(|own| own < floor)
+                {
+                    meta.incarnation_floor = Some(floor);
+                    changed = true;
+                }
+                if changed {
                     Self::put_collection_meta(&txn, &meta)?;
                 }
                 txn.commit()?;

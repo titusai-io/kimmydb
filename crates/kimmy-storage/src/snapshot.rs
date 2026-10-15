@@ -1602,6 +1602,12 @@ impl Engine {
              that drop would, keeping what was written after it"
         );
         self.witness_hlc(floor);
+        // The burial stamp takes the sender's node, which is never exposed on a tie today:
+        // a write whose Hlc equals the drop's is history by the floor rule whatever its
+        // node (`is_history` compares `stamp.hlc <= floor`, documented as intended for
+        // same-millisecond ties). If that rule ever becomes node-aware, this stamp would
+        // bury a write later than the real drop whenever `from` sorts above the dropper,
+        // and this choice must be revisited with it.
         self.restore_collection_drop(
             CollectionId::derive(&state.db, &state.name),
             Stamp::new(floor, from),
@@ -1707,6 +1713,7 @@ impl Engine {
                 state.created,
                 &history,
                 redated_from,
+                state.incarnation_floor.filter(|floor| hlc_is_named(*floor, versions)),
             ) {
                 Ok(Some(_)) => {}
                 Ok(None) => {
