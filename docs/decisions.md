@@ -27824,7 +27824,9 @@ close the cases it can prove safe, leave the rest to the operator in words, and 
    (250,000) are refused at zero. Read at start.
 7. **The lab hook** `KIMMY_TEST_DROP_APPLY` (the `lab-hooks` feature; absent from every shipped build) loses one
    replicated entry, witnessed and not written, so the lab can make the divergences these repairs close. The grammar is
-   made unambiguous or refused.
+   made unambiguous or refused. The kind words are `insert`, `replace`, `delete`,
+   `create_index` and `drop_index`; there is no `update`, because no write records an `Update` entry (every change to a
+   document is a `Replace`), and a value naming it is refused with a reason that says to use `replace`.
 
 **What stays a finding for the operator**, each with its reason in `operations.md`: a row this member holds nothing for
 and that is not young (`left`); a rival, unique, TTL, vector, dropped-here, buried-life or ambiguous index; a collection

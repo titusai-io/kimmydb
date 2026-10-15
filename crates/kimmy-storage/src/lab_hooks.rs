@@ -9,13 +9,17 @@
 //! The n-th (1-based) *counted* entry applied to that collection by the replicated path since
 //! this process started is **witnessed but not written**: the vector covers it and nothing
 //! re-serves it, the same state a refused entry leaves. What counts is the entries of the kind
-//! named, and only those; with no kind, any document entry (`insert`, `update`, `replace`,
-//! `delete`). A `CreateCollection`, `DropCollection` or `ConfigureVectors` entry never counts.
-//! One loss per list entry per process start.
+//! named, and only those; with no kind, any document entry (`insert`, `replace`, `delete`).
+//! A `CreateCollection`, `DropCollection` or `ConfigureVectors` entry never counts. One loss
+//! per list entry per process start.
+//!
+//! **There is no `update` kind.** No write records an `Update` entry: every change to a
+//! document is a `Replace`, so a hook armed with `:update` could never fire. Such a value is
+//! refused (it arms nothing) and its reason says to use `replace`.
 //!
 //! The grammar is made unambiguous or refused: `.`, `:` and `,` are legal in names, so
 //! entries are separated at `,`; within an entry the trailing `:<kind>` is recognised only
-//! when it is one of the six kind words, then `:<n>` is the trailing digits; what is left is
+//! when it is one of the five kind words, then `:<n>` is the trailing digits; what is left is
 //! `<db>.<coll>`, split at the first `.`. A value that does not parse unambiguously, or names
 //! a database containing `.`, `:` or `,`, arms nothing.
 
@@ -25,10 +29,9 @@ use std::sync::{Mutex, OnceLock};
 use kimmy_core::{CollectionId, OpKind, OplogEntry, Stamp};
 use tracing::warn;
 
-/// The six kind words.
-const KINDS: [(&str, OpKind); 6] = [
+/// The five kind words. `update` is not one: no write records an `Update` entry.
+const KINDS: [(&str, OpKind); 5] = [
     ("insert", OpKind::Insert),
-    ("update", OpKind::Update),
     ("replace", OpKind::Replace),
     ("delete", OpKind::Delete),
     ("create_index", OpKind::CreateIndex),
@@ -56,6 +59,13 @@ static ARMED: OnceLock<Vec<Armed>> = OnceLock::new();
 fn parse_entry(entry: &str) -> Result<Armed, String> {
     let mut rest = entry;
     let mut kind = None;
+    if let Some((_, "update")) = rest.rsplit_once(':') {
+        return Err(
+            "no write records an `update` entry (every change to a document is a `replace`): \
+             use `replace`"
+                .into(),
+        );
+    }
     if let Some((head, tail)) = rest.rsplit_once(':')
         && let Some((_, k)) = KINDS.iter().find(|(word, _)| *word == tail)
     {
@@ -146,10 +156,7 @@ pub(crate) fn drops(entry: &OplogEntry, would_write: impl Fn() -> bool) -> bool 
         }
         let counts = match hook.kind {
             Some(kind) => entry.kind == kind,
-            None => matches!(
-                entry.kind,
-                OpKind::Insert | OpKind::Update | OpKind::Replace | OpKind::Delete
-            ),
+            None => matches!(entry.kind, OpKind::Insert | OpKind::Replace | OpKind::Delete),
         };
         if !counts || !would_write() {
             continue;
@@ -239,9 +246,20 @@ mod tests {
             "sh:op.orders:1",
             "shop.orders:1,",
             "shop.orders:1:nonsense",
+            "shop.orders:1:update",
         ] {
             assert!(parse(bad).is_err(), "{bad:?} parsed");
         }
+    }
+
+    /// No write records an `Update` entry, so a hook armed with `:update` could never fire; it
+    /// is refused, and the reason says what to use.
+    #[test]
+    fn an_update_kind_arms_nothing_and_says_to_use_replace() {
+        let why = parse("db.coll:1:update").expect_err("`:update` armed a hook");
+        assert!(why.contains("`replace`") && why.contains("update"), "{why}");
+        assert!(parse("db.coll:1:update,shop.orders:1").is_err(), "one bad entry arms nothing");
+        assert_eq!(ok("db.coll:1:replace")[0].kind, Some(OpKind::Replace));
     }
 
     #[test]
