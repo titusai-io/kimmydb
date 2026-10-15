@@ -1472,7 +1472,6 @@ pub async fn replicate(engine: Arc<Engine>, config: ReplicationConfig) {
                                         node,
                                         peer,
                                         &digest_confirmed,
-                                        &mut report,
                                     );
                                     stalls.retain_digest(node, &digest_confirmed);
                                 } else {
@@ -1983,6 +1982,7 @@ impl DigestState {
 /// ever. If it had drifted, the row is corrected, an ERROR is logged, the drift
 /// counted, and nothing is reported for this comparison; the next contact
 /// compares again. The peer's own drift is found by the peer's own check.
+#[allow(clippy::too_many_arguments)]
 fn fold_digest_round(
     engine: &Engine,
     tracker: &mut kimmy_storage::DivergenceTracker,
@@ -2117,7 +2117,6 @@ fn plan_digest_repairs(
     node: NodeId,
     peer: SocketAddr,
     confirmed: &BTreeSet<kimmy_core::CollectionId>,
-    report: &mut RoundReport,
 ) {
     use crate::transport::{DigestPlan, DigestRepairOutcome};
     // This member's own marker and the peer's `catching_up` fact: a repair compares rows
@@ -2159,7 +2158,6 @@ fn plan_digest_repairs(
                  round with it"
             );
         }
-        let _ = report;
     }
 }
 

@@ -579,6 +579,11 @@ impl SnapshotProgress {
         self.complete = false;
     }
 
+    /// Under `Converge`, the cut of the finding that planned the pull; empty otherwise.
+    pub fn cut(&self) -> &VersionVector {
+        &self.cut
+    }
+
     /// The collection the snapshot is scoped to, if any.
     pub fn scope(&self) -> Option<CollectionId> {
         self.scope

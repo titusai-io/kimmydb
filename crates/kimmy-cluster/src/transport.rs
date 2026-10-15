@@ -8031,8 +8031,10 @@ mod tests {
 
     /// A Converge repair against a real `serve`: one collection's scoped snapshot, applied
     /// as rows over rows the requester already holds. The newer row lands; a row the
-    /// requester holds nothing for does not; the sender's index is not created; nothing
-    /// is granted; and nothing is left to resume or recorded.
+    /// requester holds nothing for lands only because it is young (stamped after every
+    /// tombstone cutoff either member has applied: neither has collected anything here, so
+    /// the rule admits it, and the storage tests pin the old-row case); the sender's index
+    /// is not created; nothing is granted; and nothing is left to resume or recorded.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_converge_repair_applies_newer_rows_over_held_rows_and_nothing_else() {
         const SECRET: &str = "a-converge-repair-secret";
@@ -8090,7 +8092,7 @@ mod tests {
             b.get(&meta, &kimmy_core::DocId::Int64(id)).unwrap().map(|d| d.get_i32("v").unwrap())
         };
         assert_eq!(version(1), Some(2), "the newer row over the held one");
-        assert_eq!(version(2), None, "a row this member holds nothing for was written");
+        assert_eq!(version(2), Some(7), "a young lost insert is written by the rule of section 13");
         assert!(
             b.list_indexes("shop", "orders").unwrap().is_empty(),
             "the sender's index was created by a document repair"

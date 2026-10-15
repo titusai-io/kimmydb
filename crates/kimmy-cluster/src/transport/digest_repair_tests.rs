@@ -344,3 +344,25 @@ fn a_row_at_the_cut_is_progress_and_lowers_the_level() {
     let v = stalls.judge_digest_repair(p, C, Judged::Ineffective).unwrap();
     assert!(matches!(v, Verdict::Ineffective { level: 1, .. }), "{v:?}");
 }
+
+/// The cut of the finding that planned a repair reaches the pull that applies its pages, and
+/// is the next repair's own, not the last one's.
+#[test]
+fn the_findings_cut_reaches_the_pull_of_its_own_repair() {
+    let mut stalls = stalls_at(mins(1));
+    let p = node(1);
+    let mut cut = VersionVector::new();
+    cut.insert(node(9), kimmy_core::Hlc::new(5_000, 0));
+    assert_eq!(stalls.plan_digest_repair(p, C, cut.clone()), DigestPlan::Planned);
+    assert_eq!(stalls.repair_due(p), Some((C, Repair::Converge)));
+    let progress = stalls.snapshot_progress(p, Some(C), kimmy_storage::SnapshotPolicy::Converge);
+    assert_eq!(progress.cut(), &cut);
+    stalls.repair_finished(p);
+    // The next repair of another collection, planned for another cut.
+    let other = CollectionId(8);
+    assert_eq!(stalls.plan_digest_repair(p, other, VersionVector::default()), DigestPlan::Planned);
+    assert_eq!(stalls.repair_due(p), Some((other, Repair::Converge)));
+    let progress =
+        stalls.snapshot_progress(p, Some(other), kimmy_storage::SnapshotPolicy::Converge);
+    assert_eq!(progress.cut(), &VersionVector::default());
+}

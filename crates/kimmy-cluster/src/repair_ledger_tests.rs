@@ -478,7 +478,7 @@ mod model {
                         if progress {
                             level = level.min(1);
                         }
-                        if run % 2 == 0 {
+                        if run.is_multiple_of(2) {
                             level = (level + 1).min(5);
                             not_before = (ended + BACKOFF[usize::from(level) - 1]).max(deadline);
                         }
