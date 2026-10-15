@@ -87,10 +87,6 @@ const STOP_AWARE_WALKS: &[&str] = &[
 /// `(file::function, why it cannot hold a stop up)`.
 const BOUNDED_READS: &[(&str, &str)] = &[
     (
-        "database_tombstone::Engine::documents_written_after",
-        "at most a thousand rows of one collection about to be buried, read once for its warning",
-    ),
-    (
         "watch::Engine::creation_arrival",
         "the entries stamped at one instant, one per node that stamped there: a seek, not a walk",
     ),

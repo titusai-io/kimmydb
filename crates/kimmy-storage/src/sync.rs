@@ -2365,9 +2365,13 @@ impl Engine {
                 // it, which is nearly every drop, is the burial it always was.
                 // Decided in the transaction that buries.
                 let buried = matches!(
-                    self.drop_keeping_later_writes(&target.db, &target.name, entry.stamp, &|| {
-                        self.check_walk(crate::WalkScope::Background)
-                    },)?,
+                    self.drop_keeping_later_writes(
+                        &target.db,
+                        &target.name,
+                        entry.stamp,
+                        &|| self.check_walk(crate::WalkScope::Background),
+                        crate::database_tombstone::Notify::Each,
+                    )?,
                     crate::late_drop::Dropped::Buried(true)
                 );
                 // Recorded even when the collection was already gone: the

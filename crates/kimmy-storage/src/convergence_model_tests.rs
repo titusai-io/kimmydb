@@ -38,10 +38,11 @@
 //! anywhere they are not compared, since each member collects on its own). `created`
 //! (and the re-dating marker, and an index's creation stamp) is **recorded and not
 //! asserted**: that is the decision under test. And **no lost write**: computed from a
-//! ghost history the test keeps (the stamps minted, the drops, which database drops
-//! the writer had seen), not from the engine, a document whose latest event is a
-//! write stamped after every drop that applies to it must be on every member with that
-//! stamp.
+//! ghost history the test keeps (the stamps minted, the collection and database
+//! drops), not from the engine, a document whose latest event is a write stamped
+//! after every drop that applies to it (its collection's, and every database drop,
+//! whether or not the writer had heard of it: ADR-236) must be on every member with
+//! that stamp.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Write as _;
@@ -340,8 +341,6 @@ struct GhostWrite {
     d: i64,
     stamp: Stamp,
     by: usize,
-    /// The highest database drop the writer held when it wrote.
-    knew_db_drop: Option<Hlc>,
     step: usize,
 }
 
@@ -355,9 +354,6 @@ struct Ghost {
     /// included.
     drops: Vec<(usize, Stamp)>,
     db_drops: Vec<Stamp>,
-    /// The highest database drop each member has been seen to hold (monotone: a
-    /// member that collects the tombstone has still seen it).
-    knows_db_drop: [Option<Hlc>; 3],
 }
 
 impl Ghost {
@@ -585,16 +581,6 @@ impl Cluster {
             if !self.defer_purges {
                 self.finish_purges()?;
             }
-            for m in 0..3 {
-                let held = self
-                    .e(m)
-                    .database_dropped_at(DB)
-                    .map_err(|e| err("database_dropped_at", e))?
-                    .map(|s| s.hlc);
-                if held > self.ghost.knows_db_drop[m] {
-                    self.ghost.knows_db_drop[m] = held;
-                }
-            }
         }
         Ok(())
     }
@@ -645,13 +631,11 @@ impl Cluster {
                     .replace(&coll, &DocId::Int64(i64::from(d)), body, true)
                     .map_err(|e| err("replace", e))?;
                 let stamp = out.stamp.ok_or("a write that wrote nothing")?;
-                let knew = self.ghost.knows_db_drop[m];
                 self.ghost.writes.push(GhostWrite {
                     c: c as usize,
                     d: i64::from(d),
                     stamp,
                     by: m,
-                    knew_db_drop: knew,
                     step: self.step,
                 });
                 let s = format!("wrote {}/{d} at {}", NAMES[c as usize], self.stamp(stamp));
@@ -1367,10 +1351,9 @@ impl Cluster {
                 .iter()
                 .filter(|(dc, _)| *dc == c)
                 .all(|(_, s)| w.stamp.hlc > s.hlc);
-            let after_every_db_drop =
-                self.ghost.db_drops.iter().all(|s| {
-                    w.stamp.hlc > s.hlc && w.knew_db_drop.is_some_and(|known| known >= s.hlc)
-                });
+            // A database's drop keeps what is stamped after it as a collection's does
+            // (ADR-236), whether or not the writer had heard of it.
+            let after_every_db_drop = self.ghost.db_drops.iter().all(|s| w.stamp.hlc > s.hlc);
             if !(after_every_drop && after_every_db_drop) {
                 continue;
             }

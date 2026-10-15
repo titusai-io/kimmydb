@@ -424,14 +424,13 @@ impl Engine {
     /// life began at or before it (ADR-231, extended; ruled by Chris,
     /// 2026-10-13): **keep what is stamped after the drop**.
     ///
-    /// Only an explicit *collection* drop takes this path. A database's drop
-    /// does not (ADR-229): a life **created at or before the database's own
-    /// tombstone** is buried with what was written into it afterwards, whichever
-    /// route the collection's drop came by, and a life created after it (a
-    /// database dropped and made again) keeps like any other. That one rule is
-    /// the guard on every path, and it is judged inside the transaction below.
-    /// A database tombstone that arrives later finds a re-dated life by
-    /// [`Redated::from`](crate::meta::Redated::from) and buries it the same way.
+    /// A collection's drop takes this path on every route (an entry, a scoped
+    /// page, a whole page's carried drop), and so does a database's drop for
+    /// every life its tombstone covers (ADR-236, amending ADR-229's "writes and
+    /// all"; ruled by Chris, 2026-10-14): `dropped` is then the database's
+    /// tombstone, and the life is judged by its `created` like any other. A
+    /// member that held a newer life of the name always kept such a write by
+    /// its stamp; the member holding the covered life now does too.
     ///
     /// **One write transaction decides** (D-2), the same that buries on the fast
     /// path, so a write stamped after the drop cannot land between the decision
@@ -460,6 +459,7 @@ impl Engine {
         name: &str,
         dropped: Stamp,
         stop: StopCheck<'_>,
+        notify: crate::database_tombstone::Notify<'_>,
     ) -> Result<Dropped> {
         let shadow_name = kimmy_core::vector_meta::shadow_name(name);
         if kimmy_core::vector_meta::is_shadow(name) {
@@ -488,13 +488,11 @@ impl Engine {
             return Ok(Dropped::Buried(false));
         };
         let mut shadow = read_collection(&txn, db, &shadow_name)?;
-        let covered =
-            database_tombstone_in(&txn, db)?.is_some_and(|stamp| meta.created <= stamp.hlc);
-        if covered || self.nothing_is_stamped_after(&txn, &meta, dropped.hlc)? {
+        if self.nothing_is_stamped_after(&txn, &meta, dropped.hlc)? {
             let burial = self.bury_standing_in_txn(&txn, db, name, meta, shadow, Some(dropped))?;
             txn.commit()?;
             let ids = self.finish_burial(db, name, burial);
-            crate::database_tombstone::Notify::Each.buried(self, db, name, &ids);
+            notify.buried(self, db, name, &ids);
             return Ok(Dropped::Buried(true));
         }
         let ids: Vec<CollectionId> =
@@ -526,7 +524,7 @@ impl Engine {
         txn.commit()?;
         #[cfg(test)]
         hooks::took_the_survivors_path();
-        crate::database_tombstone::Notify::Each.buried(self, db, name, &ids);
+        notify.buried(self, db, name, &ids);
         let end = self.sweep_until(db, name, dropped, stop)?;
         if end.survived && self.get_collection(db, &shadow_name).is_ok() {
             self.sweep_until(db, &shadow_name, dropped, stop)?;
@@ -570,7 +568,13 @@ impl Engine {
         }
         let rows = txn.open_table(tables::LIVE_DIGESTS)?;
         let Some(row) = crate::live_digest::kept_row(&rows, meta.id.0)? else {
-            return Ok(false);
+            // No row is *unknown*, unless the collection holds no record at all,
+            // which a seek says: a life created and never written (the digest
+            // row is made by the first write) has nothing to keep. Without this a
+            // database's drop took every such collection through the survivors
+            // path, three commits and a notice of its own each (ADR-236).
+            let docs = txn.open_table(tables::DOCS)?;
+            return Ok(docs.range(crate::engine::doc_range(meta.id))?.next().is_none());
         };
         Ok(row.maxw.values().all(|stamp| *stamp <= dropped))
     }
@@ -602,31 +606,6 @@ impl Engine {
             shadow,
             Some(dropped),
         )
-    }
-
-    /// A database's tombstone `dropped` covers the re-dated life `standing` if
-    /// the life was created at or before it before the drop re-dated it: it is
-    /// buried with the database, the writes it kept with it (ADR-229). In its
-    /// own transaction; `None` where the life was already buried or recreated.
-    pub(crate) fn bury_redated_under_database(
-        &self,
-        db: &str,
-        name: &str,
-        dropped: Stamp,
-    ) -> Result<Option<Vec<CollectionId>>> {
-        let txn = self.begin_write_as(WriterHolder::Ddl, crate::engine::Continuing::No)?;
-        let Some(standing) = read_collection(&txn, db, name)? else {
-            txn.abort()?;
-            return Ok(None);
-        };
-        if !standing.redated.is_some_and(|r| r.created == standing.created && r.from <= dropped.hlc)
-        {
-            txn.abort()?;
-            return Ok(None);
-        }
-        let burial = self.bury_redated_in_txn(&txn, &standing, dropped)?;
-        txn.commit()?;
-        Ok(Some(self.finish_burial(db, name, burial)))
     }
 
     /// Where the count half's repair replays a peer's oplog from for the life
@@ -759,15 +738,6 @@ fn redate(meta: &mut CollectionMeta, dropped: Hlc) {
 fn holds_a_definition_stamped_after(standing: &CollectionMeta, dropped: Hlc) -> bool {
     standing.indexes.iter().any(|index| index.created.is_some_and(|c| c.hlc > dropped))
         || standing.vector_changed.is_some_and(|changed| changed.hlc > dropped)
-}
-
-/// The tombstone of `db`'s drop as `txn` sees it.
-fn database_tombstone_in(txn: &redb::WriteTransaction, db: &str) -> Result<Option<Stamp>> {
-    let tombstones = txn.open_table(tables::COLLECTIONS_DROPPED)?;
-    match tombstones.get(kimmy_core::database_drop_id(db).0)? {
-        Some(raw) => Ok(Some(codec::decode_oplog_key(raw.value())?)),
-        None => Ok(None),
-    }
 }
 
 /// The collection `db.name` as `txn` sees it.
@@ -964,10 +934,13 @@ mod tests {
         assert_counts_exact(&d, "a buried collection");
     }
 
-    /// A database drop is not changed: a collection that holds a write stamped
-    /// after it is buried with it, as ADR-229 documents.
+    /// A database drop keeps a write stamped after it as a collection's drop does
+    /// (ADR-236, amending ADR-229's "writes and all"): the life is re-dated above
+    /// the drop of it the dropper minted, the write stands, what was written
+    /// before is gone, and the counts are exact. A collection with nothing after
+    /// the drop is buried as before.
     #[test]
-    fn a_database_drop_still_buries_a_collection_holding_a_later_write() {
+    fn a_database_drop_keeps_a_collection_holding_a_later_write() {
         let (a, _da) = engine();
         let (d, _dd) = engine();
         let on_a = a.create_collection("shop", "orders").unwrap();
@@ -976,21 +949,23 @@ mod tests {
         sync(&a, &d);
         a.drop_database("shop").unwrap();
         a.finish_purges_now().unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(5));
         let on_d = d.get_collection("shop", "orders").unwrap();
         d.insert(&on_d, doc! { "_id": 3i64 }).unwrap();
         quiesce(&[&a, &d]);
-        assert!(d.get_collection("shop", "orders").is_err(), "buried with the database");
-        assert!(d.get_collection("shop", "items").is_err());
+        let kept = d.get_collection("shop", "orders").expect("kept with the later write");
+        let dropped = a.collection_dropped_at(on_a.id).unwrap().unwrap();
+        assert!(kept.is_redated() && kept.created > dropped.hlc, "{kept:?}");
+        assert_eq!(docs_of(&d, "shop", "orders", &[1, 3]), vec![3]);
+        assert!(d.get_collection("shop", "items").is_err(), "nothing after: buried");
         assert_counts_exact(&d, "a database drop");
     }
 
-    /// D-3. A whole-database snapshot page carries the database's drop, and the
-    /// collection tombstones a database drop writes, at the database drop's own
-    /// stamp. The snapshot route cannot tell those from explicit collection
-    /// drops, and a database survivor never keeps a write (ADR-229): the
-    /// collection is buried whole, as the entry route buries it.
+    /// The same by a whole-database snapshot page, which carries the database's
+    /// drop and the collection tombstones the dropper wrote: both keep the later
+    /// write, as the entry route does.
     #[test]
-    fn a_whole_database_page_buries_a_collection_holding_a_later_write() {
+    fn a_whole_database_page_keeps_a_collection_holding_a_later_write() {
         let (a, _da) = engine();
         let (d, _dd) = engine();
         let on_a = a.create_collection("shop", "orders").unwrap();
@@ -999,6 +974,7 @@ mod tests {
         sync(&a, &d);
         a.drop_database("shop").unwrap();
         a.finish_purges_now().unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(5));
         let on_d = d.get_collection("shop", "orders").unwrap();
         d.insert(&on_d, doc! { "_id": 3i64 }).unwrap();
         let page = a.snapshot_page(None, None).unwrap();
@@ -1009,16 +985,16 @@ mod tests {
         d.apply_snapshot_page(a.node_id(), &mut crate::SnapshotProgress::whole_database(), &page)
             .unwrap();
         d.finish_purges_now().unwrap();
-        assert!(d.get_collection("shop", "orders").is_err(), "buried with the database");
+        assert_eq!(docs_of(&d, "shop", "orders", &[1, 3]), vec![3], "kept, by page");
         assert!(d.get_collection("shop", "items").is_err());
         assert_counts_exact(&d, "a database drop by page");
     }
 
-    /// D-3, the scoped route with the database's tombstone held: the collection
-    /// was buried by the database's drop, with a drop of its own above the
-    /// database's stamp, and that does not keep a later write.
+    /// The scoped route with the database's tombstone held: the collection's own
+    /// drop, which the dropper minted above the database's stamp, keeps the later
+    /// write too.
     #[test]
-    fn a_scoped_page_at_the_databases_own_stamp_buries_a_collection_holding_a_later_write() {
+    fn a_scoped_page_at_the_databases_own_stamp_keeps_a_collection_holding_a_later_write() {
         let (a, _da) = engine();
         let (d, _dd) = engine();
         let on_a = a.create_collection("shop", "orders").unwrap();
@@ -1027,6 +1003,7 @@ mod tests {
         sync(&a, &d);
         a.drop_database("shop").unwrap();
         a.finish_purges_now().unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(5));
         let on_d = d.get_collection("shop", "orders").unwrap();
         d.insert(&on_d, doc! { "_id": 3i64 }).unwrap();
         // D learns of the database's drop first (its tombstone), then the scoped
@@ -1043,7 +1020,10 @@ mod tests {
         )
         .unwrap();
         d.finish_purges_now().unwrap();
-        assert!(d.get_collection("shop", "orders").is_err(), "buried with the database");
+        assert_eq!(docs_of(&d, "shop", "orders", &[1, 3]), vec![3], "kept, by a scoped page");
+        // And the database's own sweep, which the tombstone held asks for, keeps it.
+        d.bury_under_database_tombstones().unwrap();
+        assert_eq!(docs_of(&d, "shop", "orders", &[1, 3]), vec![3], "and by the sweep");
     }
 
     /// D-3, the other side: the scoped repair of a collection the sender dropped
@@ -1115,7 +1095,13 @@ mod tests {
             }
         };
         assert!(matches!(
-            b.drop_keeping_later_writes("shop", "orders", dropped, &one_chunk),
+            b.drop_keeping_later_writes(
+                "shop",
+                "orders",
+                dropped,
+                &one_chunk,
+                crate::database_tombstone::Notify::Each
+            ),
             Err(crate::StorageError::Stopping(_))
         ));
         // D-1: re-dated by the first commit, so the sweep is owed and a start

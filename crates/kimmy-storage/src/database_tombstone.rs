@@ -14,10 +14,14 @@
 //! stores and serves the entry as the drop of a collection it never held.
 //!
 //! One rule, one comparison, on every route: with a database tombstone at `S`,
-//! a collection whose creation was stamped at or before `S.hlc` is buried, and
-//! one that is not stands and is given a tombstone of its own at `S`, so that a
-//! straggler of the life before it is refused the same way on every member
-//! whether or not that member refused the creation itself.
+//! a collection whose creation was stamped at or before `S.hlc` is dropped as a
+//! collection's drop at `S` drops it, which buries it unless something in it is
+//! stamped after `S`, and then keeps that, re-dated just above `S` (ADR-236,
+//! amending ADR-229's "writes and all"); one that is not stands and is given a
+//! tombstone of its own at `S`, so that a straggler of the life before it is
+//! refused the same way on every member whether or not that member refused the
+//! creation itself. A creation stamped at or before `S` that arrives after it
+//! is refused.
 
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
@@ -26,18 +30,14 @@ use kimmy_core::{
     CollectionId, CollectionRef, DATABASE_DROP_NAME, Hlc, OpKind, Stamp, database_drop_id,
     vector_meta,
 };
-use redb::{ReadableDatabase, ReadableTable};
-use tracing::{debug, info, warn};
+use redb::ReadableTable;
+use tracing::{debug, info};
 
 use crate::codec;
-use crate::engine::{Continuing, Engine, WriterHolder, append_oplog, ddl_entry};
+use crate::engine::{Engine, WriterHolder, append_oplog, ddl_entry};
 use crate::error::{Result, StorageError};
 use crate::meta::CollectionMeta;
 use crate::tables;
-
-/// How many of a buried collection's documents are read to say how many of them
-/// were written after the drop.
-const WARN_SAMPLE: usize = 1_000;
 
 /// A collection buried without an entry of its own, and every id that went
 /// with it (its vector shadow's included).
@@ -63,22 +63,17 @@ impl Buried {
     }
 }
 
-/// What reading a collection's first documents found.
-#[derive(Debug, Default)]
-pub(crate) struct WrittenAfter {
-    /// Documents read.
-    pub(crate) checked: usize,
-    /// Of those, the live ones stamped after the drop.
-    pub(crate) after: usize,
-}
-
 /// What a sweep did.
 #[derive(Debug, Default, PartialEq, Eq)]
 pub struct Swept {
-    /// The collections it buried.
+    /// The collections it buried, and the ones it re-dated to keep what was
+    /// written after the drop (their streams end as at a burial).
     pub buried: Vec<BuriedCollection>,
     /// The collections it left standing, each given a tombstone of its own.
     pub spared: usize,
+    /// Of the collections the drop covers, those that held something stamped
+    /// after it and were re-dated just above it, keeping it (ADR-236).
+    pub kept: usize,
 }
 
 /// Where a burial that minted no entry announces itself.
@@ -213,9 +208,12 @@ impl Engine {
     ///
     /// For each held collection of such a database, with the drop at `S`:
     ///
-    /// - `created <= S.hlc`: **buried**, through the replicated path (the
-    ///   drop's stamp, no new entry, chunked and handed to the purger as every
-    ///   burial is);
+    /// - `created <= S.hlc`: **dropped as a replicated collection drop at `S`
+    ///   is** (ADR-236): buried, through the replicated path (the drop's stamp,
+    ///   no new entry, chunked and handed to the purger as every burial is),
+    ///   unless it holds a record or a definition stamped after `S`, which it
+    ///   keeps, re-dated just above `S` with its floor at `S` (ADR-231,
+    ///   extended);
     /// - otherwise: **spared, and given its own tombstone at `S`**, with its
     ///   shadow's. Floors are not carried between members, so without this a
     ///   survivor accepted a straggler of the life before it that another
@@ -267,9 +265,11 @@ impl Engine {
         let swept = swept?;
         if !swept.buried.is_empty() || swept.spared > 0 {
             info!(
-                buried = swept.buried.len(),
+                buried = swept.buried.len() - swept.kept,
+                kept = swept.kept,
                 spared = swept.spared,
-                "buried what a database's drop covers before serving"
+                "buried what a database's drop covers before serving, keeping what was written \
+                 after it"
             );
         }
         Ok(swept)
@@ -346,47 +346,31 @@ impl Engine {
         checkpoint: &dyn Fn() -> Result<()>,
     ) -> Result<()> {
         if collection.created <= dropped.hlc {
-            let written_after = self.documents_written_after(collection, dropped)?;
-            let buried = self.bury_collection_as(
+            // A life the database's drop covers is dropped as a collection's drop
+            // at the same stamp drops it (ADR-236, amending ADR-229's "writes and
+            // all"): buried when nothing in it is stamped after the drop, which is
+            // every ordinary drop, and otherwise re-dated just above it, keeping
+            // what was written after it (ADR-231, extended), its tombstone and its
+            // shadow's recorded at the drop. One rule wherever such a write is
+            // judged: a member holding a newer life of the name keeps it by its
+            // stamp, and the count half's replay and a page bring it to the rest.
+            // A life re-dated by a collection's drop is judged by its `created`
+            // like any other, so what it kept is kept here too.
+            match self.drop_keeping_later_writes(
                 db,
                 &collection.name,
-                Some(dropped),
-                Continuing::No,
+                dropped,
+                checkpoint,
                 Notify::Collect(notice),
-            )?;
-            if buried.is_some() {
-                // Only a write stamped after the drop is news: the collection's
-                // earlier documents are what the drop is for, and the burial is
-                // already logged. A write after it was answered `200` by a member
-                // that had not yet received the drop.
-                if written_after.after > 0 {
-                    warn!(
-                        db,
-                        collection = %collection.name,
-                        written_after_the_drop = written_after.after,
-                        checked = written_after.checked,
-                        "a database drop buried a collection that holds documents written after \
-                         the drop; those writes were acknowledged to clients"
-                    );
-                } else {
+            )? {
+                crate::late_drop::Dropped::Kept => {
+                    swept.kept += 1;
+                    debug!(db, collection = %collection.name, "a database drop kept what a collection held stamped after it");
+                }
+                crate::late_drop::Dropped::Buried(true) => {
                     debug!(db, collection = %collection.name, "a database drop buried a collection");
                 }
-            }
-        } else if collection
-            .redated
-            .is_some_and(|r| r.created == collection.created && r.from <= dropped.hlc)
-        {
-            // A life a collection's drop re-dated to keep what was written after
-            // it, and which was created at or before this database's drop: the
-            // database's drop buries it, writes and all (ADR-229), whichever of
-            // the two drops this member learned of first.
-            if let Some(ids) = self.bury_redated_under_database(db, &collection.name, dropped)? {
-                notice.push(BuriedCollection {
-                    db: db.to_string(),
-                    name: collection.name.clone(),
-                    ids,
-                });
-                debug!(db, collection = %collection.name, "a database drop buried a collection a collection drop had kept");
+                crate::late_drop::Dropped::Buried(false) => {}
             }
         } else {
             self.record_tombstones_at(db, &collection.name, dropped)?;
@@ -404,33 +388,5 @@ impl Engine {
     #[cfg(any(test, feature = "test-hooks"))]
     pub fn record_database_tombstone_for_test(&self, id: CollectionId, at: Stamp) -> Result<()> {
         self.record_collection_drop(id, at)
-    }
-
-    /// For a collection about to be buried: how many of its first [`WARN_SAMPLE`]
-    /// documents were read, and how many of those are live and were written
-    /// after the drop.
-    ///
-    /// Each record is judged by its fixed-width header alone, with no copy of
-    /// the body, and nothing is read for an empty collection.
-    pub(crate) fn documents_written_after(
-        &self,
-        collection: &CollectionMeta,
-        dropped: Stamp,
-    ) -> Result<WrittenAfter> {
-        let txn = self.db().begin_read()?;
-        if crate::live_count::live_count(&txn, collection.id)? == 0 {
-            return Ok(WrittenAfter::default());
-        }
-        let docs = txn.open_table(tables::DOCS)?;
-        let mut found = WrittenAfter::default();
-        for row in docs.range(crate::engine::doc_range(collection.id))?.take(WARN_SAMPLE) {
-            let (_, value) = row?;
-            let (stamp, live) = codec::doc_record_header(value.value())?;
-            found.checked += 1;
-            if live && stamp.hlc > dropped.hlc {
-                found.after += 1;
-            }
-        }
-        Ok(found)
     }
 }

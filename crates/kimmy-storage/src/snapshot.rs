@@ -181,16 +181,17 @@ pub struct CollectionState {
     /// overrides a stamped local value.
     #[serde(default)]
     pub vector_changed: Option<Stamp>,
-    /// For a life a collection's drop re-dated to keep what was written after it
+    /// For a life a drop re-dated to keep what was written after it
     /// (`CollectionMeta::redated`, ADR-231 extended): the `created` the life had
-    /// before. `created` above is then the re-date, just after the drop, and
-    /// says nothing about when the life began, which is what a database's drop is
-    /// judged against (ADR-229). A receiver holding the database's tombstone
-    /// refuses the definition if this is at or before it, as it would the
-    /// original creation; without that, a life re-dated before its member
-    /// learned of the database's drop would spread past the tombstone that
-    /// covers it. Optional on the wire: a sender that predates it writes none, a
-    /// receiver that predates it ignores it and judges `created`, as before.
+    /// before. `created` above is then the re-date, just after the drop. It is
+    /// where the life began, which ADR-235's burial compares to tell one life
+    /// continuing from a newer one, and the receiver stores it as the marker. A
+    /// database's drop judges the definition by `created`, as every drop does
+    /// (ADR-236): the life holds nothing stamped at or before its re-dating drop,
+    /// so nothing it carries is older than `created`. Optional on the wire: a
+    /// sender that predates it writes none, and a receiver that predates it
+    /// ignores it. (0.49.0 refused the definition under a database tombstone at
+    /// or after this, ADR-231 D-3's guard that ADR-236 removes.)
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub redated_from: Option<Hlc>,
     /// The sender's incarnation floor for this life (`CollectionMeta::incarnation_floor`):
@@ -203,14 +204,6 @@ pub struct CollectionState {
     /// nothing is buried.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub incarnation_floor: Option<Hlc>,
-}
-
-impl CollectionState {
-    /// The creation a database's drop judges this life by: where it began, not
-    /// where a collection's drop re-dated it to.
-    pub(crate) fn created_for_the_database(&self) -> Option<Hlc> {
-        self.redated_from.or(self.created)
-    }
 }
 
 impl From<CollectionMeta> for CollectionState {
@@ -776,7 +769,7 @@ impl Engine {
                 continue;
             }
             // Nor one the drop of its database makes history (ADR-229).
-            if self.database_refusal(&state.db, state.created_for_the_database())?.is_some() {
+            if self.database_refusal(&state.db, state.created)?.is_some() {
                 continue;
             }
             if self.purge_pending(id)? {
@@ -1508,11 +1501,16 @@ impl Engine {
             // drop's first commit rather than at its last.
             //
             // Writes stamped after the drop are kept, as when it arrives as an
-            // entry (ADR-231, extended), unless the database's own drop covers
-            // the life (ADR-229): one guard, judged in the burying transaction.
-            match self.drop_keeping_later_writes(&current.db, &current.name, dropped, &|| {
-                self.check_walk(crate::WalkScope::Background)
-            })? {
+            // entry (ADR-231, extended), whether or not the database's own drop
+            // covers the life (ADR-236): one rule, judged in the burying
+            // transaction.
+            match self.drop_keeping_later_writes(
+                &current.db,
+                &current.name,
+                dropped,
+                &|| self.check_walk(crate::WalkScope::Background),
+                crate::database_tombstone::Notify::Each,
+            )? {
                 crate::late_drop::Dropped::Kept => {
                     return self.record_collection_drop(id, dropped);
                 }
@@ -1723,12 +1721,8 @@ impl Engine {
             // write after the page's vector) are history here, not a stop that
             // lasts until a snapshot, and snapshot coverage would hide the
             // creation that would have recorded it.
-            if self.database_refusal(&state.db, state.created_for_the_database())?.is_some() {
-                self.record_database_refusal(
-                    &state.db,
-                    &state.name,
-                    state.created_for_the_database(),
-                )?;
+            if self.database_refusal(&state.db, state.created)?.is_some() {
+                self.record_database_refusal(&state.db, &state.name, state.created)?;
                 debug!(
                     db = %state.db,
                     collection = %state.name,
@@ -1757,9 +1751,8 @@ impl Engine {
                     .is_none_or(|created| crate::sync::creation_is_history(created, dropped.hlc))
             };
             // A re-dated life arrives with the creation it was re-dated from, and
-            // is created with it in the one transaction, so that a database's
-            // drop this node learns of after this page buries it as it buries
-            // the sender's, and no stop leaves it standing without the marker.
+            // is created with it in the one transaction, so that no stop leaves it
+            // standing without the marker ADR-235's lineage comparison reads.
             let redated_from = state.redated_from.filter(|_| state.created.is_some());
             // The floor the page carries and its coverage names. The clock passes it as it
             // passes the floor a burial restores (ADR-233): the page may name the floor and
@@ -1783,11 +1776,7 @@ impl Engine {
                     #[cfg(test)]
                     crate::sync::race_hooks::absorbed(crate::sync::race_hooks::Race::Restore);
                     // A database's drop that landed since the check above.
-                    self.record_database_refusal(
-                        &state.db,
-                        &state.name,
-                        state.created_for_the_database(),
-                    )?;
+                    self.record_database_refusal(&state.db, &state.name, state.created)?;
                     return Ok(0);
                 }
                 // Checked outside the writer, so the name can be created in

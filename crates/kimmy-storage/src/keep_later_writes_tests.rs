@@ -237,7 +237,39 @@ fn the_survivors_path_logs_buried_when_the_sweep_left_nothing() {
     assert!(!logs.contains("kept them"), "a collection buried whole was reported as kept: {logs}");
 }
 
-// -- D-3 / M-2 / M-4: the database's guard ----------------------------------
+// -- A database's drop keeps as a collection's does (ADR-236) ---------------
+
+/// The database's drop reaches the life it covers: what was written into it
+/// after the drop stands, re-dated, and what was written before goes. The
+/// member that never held the life takes it from the one that kept it, as the
+/// existence half's scoped repair brings it (ADR-231, extended).
+#[test]
+fn a_database_drop_keeps_a_write_stamped_after_it_in_the_life_it_covers() {
+    let (a, d, _da, _dd, id) = a_and_d_holding_the_old_life();
+    a.create_collection("shop", "items").unwrap();
+    sync(&a, &d);
+    a.drop_database("shop").unwrap();
+    a.finish_purges_now().unwrap();
+    later();
+    let on_d = d.get_collection("shop", "orders").unwrap();
+    d.insert(&on_d, doc! { "_id": 3i64 }).unwrap();
+    let before = hooks::survivors_paths();
+    quiesce(&[&a, &d]);
+    assert!(hooks::survivors_paths() > before, "premise: the survivors path");
+    let kept = d.get_collection("shop", "orders").expect("the covered life keeps the write");
+    let database_drop = a.database_dropped_at("shop").unwrap().unwrap();
+    assert!(kept.is_redated() && kept.created > database_drop.hlc, "{kept:?}");
+    assert_eq!(docs_of(&d, "orders", &[1, 3]), vec![3]);
+    assert!(!holds(&d, "items"), "nothing after: buried");
+    assert_counts_exact(&d, "a database drop that kept");
+    // The repair the existence half plans brings the kept life to the dropper.
+    assert!(!holds(&a, "orders"), "premise: A has nothing to put it in");
+    let page = d.snapshot_page(None, Some(id)).unwrap();
+    a.apply_snapshot_page(d.node_id(), &mut SnapshotProgress::of_collection(id), &page).unwrap();
+    assert_eq!(docs_of(&a, "orders", &[1, 3]), vec![3], "the dropper takes the kept write");
+}
+
+// -- D-3 / M-2 / M-4: the database's guard, as ADR-236 leaves it -------------
 
 /// A database that was dropped and made again has a tombstone, and a
 /// collection created after it is not covered by it: that collection's own
@@ -263,11 +295,12 @@ fn a_collection_in_a_database_made_again_keeps_a_write_after_its_own_drop() {
     assert_eq!(docs_of(&d, "orders", &[1, 3]), vec![3], "a database tombstone is not the guard");
 }
 
-/// The database's tombstone arrives after the collection's drop kept a write:
-/// the life was created at or before the database's drop, so the database
-/// buries it with the write (ADR-229), whichever of the two came first.
+/// The database's tombstone arrives after the collection's drop kept a write
+/// made before the database's drop: the database's drop, judged by the kept
+/// life's `created` like any drop (ADR-236), removes that write, and the life,
+/// left with nothing, is buried.
 #[test]
-fn a_database_tombstone_that_comes_after_a_kept_life_buries_it() {
+fn a_database_tombstone_that_comes_after_a_kept_life_removes_a_write_made_before_it() {
     let (a, d, _da, _dd, _id) = a_and_d_holding_the_old_life();
     a.create_collection("shop", "items").unwrap();
     sync(&a, &d);
@@ -311,9 +344,10 @@ fn a_whole_page_carrying_an_explicit_collection_drop_keeps_a_later_write() {
 }
 
 /// And a database's drop in the same page, listed before or after its
-/// collections, buries them whole.
+/// collections, keeps the later write too (ADR-236), and buries the collection
+/// that holds nothing after it.
 #[test]
-fn a_whole_page_carrying_a_database_drop_buries_whichever_order_its_list_is_in() {
+fn a_whole_page_carrying_a_database_drop_keeps_a_later_write_whichever_order_its_list_is_in() {
     for reversed in [false, true] {
         let (a, d, _da, _dd, _id) = a_and_d_holding_the_old_life();
         a.create_collection("shop", "items").unwrap();
@@ -332,12 +366,12 @@ fn a_whole_page_carrying_a_database_drop_buries_whichever_order_its_list_is_in()
         d.finish_purges_now().unwrap();
         assert_eq!(
             hooks::survivors_paths(),
-            before,
-            "the database's tombstone is recorded first, so no life is re-dated only to be \
-             buried (reversed: {reversed})"
+            before + 1,
+            "one life re-dated, the one with the later write (reversed: {reversed})"
         );
-        assert!(!holds(&d, "orders"), "reversed: {reversed}");
+        assert_eq!(docs_of(&d, "orders", &[1, 3]), vec![3], "reversed: {reversed}");
         assert!(!holds(&d, "items"), "reversed: {reversed}");
+        assert_counts_exact(&d, "a whole page carrying a database drop");
     }
 }
 
@@ -418,10 +452,16 @@ fn a_start_sweeps_the_parent_before_its_shadow() {
         let entries = a.entries_for_peer(start, BATCH, WalkScope::Background).unwrap().entries;
         entries.iter().find(|e| e.kind == kimmy_core::OpKind::DropCollection).unwrap().stamp
     };
-    let result = d.drop_keeping_later_writes("shop", "orders", dropped, &|| {
-        asked.set(asked.get() + 1);
-        Err(crate::StorageError::Stopping(crate::StopReason::Shutdown))
-    });
+    let result = d.drop_keeping_later_writes(
+        "shop",
+        "orders",
+        dropped,
+        &|| {
+            asked.set(asked.get() + 1);
+            Err(crate::StorageError::Stopping(crate::StopReason::Shutdown))
+        },
+        crate::database_tombstone::Notify::Each,
+    );
     assert!(matches!(result, Err(crate::StorageError::Stopping(_))));
     for name in ["orders", shadow.name.as_str()] {
         let standing = d.get_collection("shop", name).unwrap();
@@ -511,9 +551,13 @@ fn a_peer_holding_the_older_life_is_not_replaced_by_one_in_the_owed_window() {
     let entries = a.entries_for_peer(start, BATCH, WalkScope::Background).unwrap().entries;
     let dropped =
         entries.iter().find(|e| e.kind == kimmy_core::OpKind::DropCollection).unwrap().stamp;
-    let stopped = d.drop_keeping_later_writes("shop", "orders", dropped, &|| {
-        Err(crate::StorageError::Stopping(crate::StopReason::Shutdown))
-    });
+    let stopped = d.drop_keeping_later_writes(
+        "shop",
+        "orders",
+        dropped,
+        &|| Err(crate::StorageError::Stopping(crate::StopReason::Shutdown)),
+        crate::database_tombstone::Notify::Each,
+    );
     assert!(matches!(stopped, Err(crate::StorageError::Stopping(_))));
     let window = d.get_collection("shop", "orders").unwrap();
     assert!(window.created > dropped.hlc && window.incarnation_floor.is_none(), "premise");
@@ -533,12 +577,14 @@ fn a_peer_holding_the_older_life_is_not_replaced_by_one_in_the_owed_window() {
 /// A database's drop `S` is followed by a drop of each of its collections, at
 /// stamps above `S`. M, which is told of the collection's drop and not of `S`
 /// (it was behind and caught up by a page), keeps a write and dates the life
-/// just above that drop, so above `S`: its `created` no longer says the life
-/// began before `S`. A peer repairs the collection from M, and learns `S` before
-/// or after. Either way, and whichever order M learns `S` in, the write is gone
-/// everywhere and the collection is absent everywhere (ADR-229).
+/// just above that drop, so above `S`. A peer repairs the collection from M, and
+/// learns `S` before or after. Either way, and whichever order M learns `S` in,
+/// the write stands on every member (ADR-236): the life holds nothing stamped at
+/// or before its `created`, which is above `S`, so `S` has nothing of it to
+/// remove. (0.49.0 judged it by where it began, `redated.from`, and buried it,
+/// the write with it, ADR-231 D-3.)
 #[test]
-fn a_life_re_dated_above_the_databases_drop_does_not_outlive_it() {
+fn a_life_re_dated_above_the_databases_drop_keeps_its_write_on_every_member() {
     for peer_holds_the_database_drop_first in [true, false] {
         let (a, m, _da, _dm, id) = a_and_d_holding_the_old_life();
         a.create_collection("shop", "items").unwrap();
@@ -588,19 +634,22 @@ fn a_life_re_dated_above_the_databases_drop_does_not_outlive_it() {
         );
         p.apply_snapshot_page(m.node_id(), &mut SnapshotProgress::of_collection(id), &page)
             .unwrap();
-        if peer_holds_the_database_drop_first {
-            assert!(!holds(&p, "orders"), "refused at install: it began before S");
-        } else {
-            assert!(holds(&p, "orders"), "premise: P had nothing to refuse it with");
+        assert_eq!(docs_of(&p, "orders", &[1, 3]), vec![3], "installed with the write");
+        if !peer_holds_the_database_drop_first {
             p.apply_batch(std::slice::from_ref(&database_drop)).unwrap();
-            assert!(!holds(&p, "orders"), "buried by S when it arrives, from where it began");
+            assert_eq!(docs_of(&p, "orders", &[1, 3]), vec![3], "and S, after, keeps it");
         }
         // And M learns of S last.
         m.apply_batch(std::slice::from_ref(&database_drop)).unwrap();
         m.finish_purges_now().unwrap();
         p.finish_purges_now().unwrap();
+        // A, which dropped it, takes it from M as the existence half's repair would.
+        let page = m.snapshot_page(None, Some(id)).unwrap();
+        a.apply_snapshot_page(m.node_id(), &mut SnapshotProgress::of_collection(id), &page)
+            .unwrap();
         for (who, e) in [("a", &a), ("m", &m), ("p", &p)] {
-            assert!(!holds(e, "orders"), "{who}, peer first: {peer_holds_the_database_drop_first}");
+            let peer_first = peer_holds_the_database_drop_first;
+            assert_eq!(docs_of(e, "orders", &[1, 3]), vec![3], "{who}, peer first: {peer_first}");
             assert!(!holds(e, "items"), "{who}");
             assert_counts_exact(e, who);
         }
@@ -623,9 +672,13 @@ fn a_drop_interrupted_after_its_first_commit_and_delivered_again_appends_its_ent
     let start = d.version_vector().unwrap().behind(&a.version_vector().unwrap()).unwrap();
     let entries = a.entries_for_peer(start, BATCH, WalkScope::Background).unwrap().entries;
     let drop = entries.iter().find(|e| e.kind == kimmy_core::OpKind::DropCollection).unwrap();
-    let interrupted = d.drop_keeping_later_writes("shop", "orders", drop.stamp, &|| {
-        Err(crate::StorageError::Stopping(crate::StopReason::Shutdown))
-    });
+    let interrupted = d.drop_keeping_later_writes(
+        "shop",
+        "orders",
+        drop.stamp,
+        &|| Err(crate::StorageError::Stopping(crate::StopReason::Shutdown)),
+        crate::database_tombstone::Notify::Each,
+    );
     assert!(matches!(interrupted, Err(crate::StorageError::Stopping(_))));
     assert!(d.oplog_entry(&drop.stamp).unwrap().is_none(), "premise: not appended yet");
 
