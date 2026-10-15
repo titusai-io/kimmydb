@@ -370,6 +370,12 @@ pub struct SnapshotApplied {
     pub definitions: crate::definition_repair::DefinitionRestore,
     /// Under [`SnapshotPolicy::Converge`]: of `created`, those at or below the cut.
     pub created_at_cut: usize,
+    /// Under [`SnapshotPolicy::Converge`] and [`SnapshotPolicy::Definitions`]: the first page's
+    /// life of the collection began after a drop that ended the life standing here
+    /// (`sync::arriving_life_ends_the_standing_one`, with the sender's floor named by its own
+    /// coverage): its rows and its indexes belong to a life this member has not buried yet.
+    /// Nothing was applied and the pull ends; the count kind's snapshot buries it (ADR-235).
+    pub history: bool,
     /// Under [`SnapshotPolicy::Converge`]: the page said the sender no longer
     /// holds the collection (`SnapshotPage::dropped`). Nothing was applied and
     /// the progress did not move; the repair is abandoned, not applied.
@@ -1230,6 +1236,7 @@ impl Engine {
                 applied_at_cut: 0,
                 definitions: Default::default(),
                 created_at_cut: 0,
+                history: false,
                 sender_dropped: false,
                 purge_pending: None,
             }),
@@ -1267,6 +1274,11 @@ impl Engine {
         debug_assert!(progress.scope.is_some(), "a Converge pull is always scoped");
         if page.dropped.is_some() {
             return Ok(SnapshotApplied { sender_dropped: true, ..Default::default() });
+        }
+        if progress.pages == 0
+            && self.first_page_is_a_life_this_member_has_not_buried(progress, page)?
+        {
+            return Ok(SnapshotApplied { history: true, ..Default::default() });
         }
         let mut applied = 0usize;
         let mut superseded = 0usize;
@@ -1409,6 +1421,43 @@ impl Engine {
                 ..Default::default()
             }),
         }
+    }
+
+    /// Whether the first page of a scoped repair pull carries the successor of the life
+    /// standing here: its floor (named by the sender's own coverage, ADR-163) is a drop that
+    /// ended the standing life, so the page's rows and indexes belong to a life this member
+    /// has not buried. A `Converge` pull would write them into the ended life and a
+    /// `Definitions` pull would build its indexes there; both end instead, and the count
+    /// kind's scoped snapshot buries through ADR-235's route.
+    pub(crate) fn first_page_is_a_life_this_member_has_not_buried(
+        &self,
+        progress: &SnapshotProgress,
+        page: &SnapshotPage,
+    ) -> Result<bool> {
+        let Some(scope) = progress.scope else {
+            return Ok(false);
+        };
+        let Some(state) = page
+            .collections
+            .iter()
+            .find(|state| CollectionId::derive(&state.db, &state.name) == scope)
+        else {
+            return Ok(false);
+        };
+        let Some(floor) =
+            state.incarnation_floor.filter(|floor| hlc_is_named(*floor, &page.versions))
+        else {
+            return Ok(false);
+        };
+        let Some(standing) = Self::unless_gone(self.get_collection(&state.db, &state.name))? else {
+            return Ok(false);
+        };
+        Ok(crate::sync::arriving_life_ends_the_standing_one(
+            &standing,
+            state.created,
+            state.redated_from,
+            Some(floor),
+        ))
     }
 
     /// Whether `collection` owes ADR-231's sweep for either tombstone that could end the

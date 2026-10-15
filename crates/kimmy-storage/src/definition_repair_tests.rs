@@ -573,3 +573,28 @@ fn a_buried_lifes_index_does_not_spend_the_repairs_one_build() {
     assert_eq!((done.definitions.history, done.definitions.built), (1, 1));
     assert_eq!(names(&b), vec!["new".to_string()]);
 }
+
+/// S dropped life 0 and made life 1 with an index; O holds life 0 (its tombstone aged out).
+#[test]
+fn an_index_of_the_life_after_a_drop_that_ended_the_standing_life_is_not_built_into_it() {
+    let (s, ds) = engine();
+    let (o, d_o) = engine();
+    let _keep = (ds, d_o);
+    s.create_collection("shop", "orders").unwrap();
+    pull(&o, &s);
+    later();
+    assert!(s.drop_collection("shop", "orders").unwrap());
+    s.finish_purges_now().unwrap();
+    later();
+    s.create_collection("shop", "orders").unwrap();
+    later();
+    index(&s, "v", "by_v");
+    let txn = s.begin_write(crate::WriterHolder::Ddl).unwrap();
+    txn.open_table(crate::tables::COLLECTIONS_DROPPED).unwrap().remove(orders().0).unwrap();
+    txn.commit().unwrap();
+    o.absorb_witnessed(&s.witnessed_vector().unwrap()).unwrap();
+    let done = repair(&o, &s, BIG);
+    assert!(done.history, "the page's life was not recognised as the successor");
+    assert_eq!(done.definitions, DefinitionRestore { history: 1, ..Default::default() });
+    assert!(names(&o).is_empty(), "life 1's index was built into life 0");
+}

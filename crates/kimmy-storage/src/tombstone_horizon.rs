@@ -105,6 +105,18 @@ impl Engine {
     }
 }
 
+#[cfg(any(test, feature = "test-hooks"))]
+impl Engine {
+    /// Forget the drop tombstone of a collection, as one that aged out leaves the sender
+    /// (the premise of ADR-235), for another crate's tests.
+    pub fn forget_collection_drop_for_test(&self, id: kimmy_core::CollectionId) -> Result<()> {
+        let txn = self.begin_write(crate::engine::WriterHolder::Ddl)?;
+        txn.open_table(tables::COLLECTIONS_DROPPED)?.remove(id.0)?;
+        txn.commit()?;
+        Ok(())
+    }
+}
+
 #[cfg(test)]
 impl Engine {
     /// Overwrite the stored horizon, as a build that did not maintain it would leave it.

@@ -2694,6 +2694,23 @@ where
                      passes"
                 );
             }
+            // The first page carries the successor of the life standing here (ADR-235): the
+            // repair ends as a judged end, and the count kind's snapshot of the collection,
+            // which buries through ADR-235's route and has its own cooldown, is planned.
+            if let Some((collection, _)) = repair
+                && pulled.history
+            {
+                stalls.repair_finished(their_node);
+                let planned = stalls.plan_repair(their_node, collection, Repair::Snapshot);
+                warn!(
+                    %peer,
+                    collection = %collection,
+                    planned,
+                    "a repair found the peer's life of the collection began after a drop that \
+                     ended the one standing here; nothing was applied, and a snapshot of the \
+                     collection is planned to end the standing life"
+                );
+            }
             Ok(pulled.outcome)
         }
         other => Err(ProtocolError::Malformed(format!("expected Entries, got {other:?}"))),
@@ -5282,6 +5299,10 @@ struct SnapshotPulled {
     /// A `Converge` page said the sender no longer holds the collection
     /// (`SnapshotPage::dropped`): nothing was applied, the repair is over.
     sender_dropped: bool,
+    /// The first page of a `Converge` or `Definitions` pull carries the successor of the
+    /// life standing here (ADR-235): nothing was applied, the repair is over, and the count
+    /// kind's snapshot buries.
+    history: bool,
 }
 
 /// Whether a page answering a snapshot scoped to `id` carries anything of
@@ -5402,7 +5423,21 @@ where
         // A Converge page from a sender that no longer holds the collection applied
         // nothing and moved nothing: the pull ends here, abandoned.
         if applied.sender_dropped {
-            return Ok(SnapshotPulled { outcome, complete: false, sender_dropped: true });
+            return Ok(SnapshotPulled {
+                outcome,
+                complete: false,
+                sender_dropped: true,
+                history: false,
+            });
+        }
+        if applied.history {
+            stalls.definitions_page_applied(node, &applied);
+            return Ok(SnapshotPulled {
+                outcome,
+                complete: false,
+                sender_dropped: false,
+                history: true,
+            });
         }
         // A page that would create a collection whose earlier life this node
         // is still purging applied nothing and moved nothing (ADR-189). The
@@ -5420,7 +5455,12 @@ where
                  collection of that name held; the snapshot resumes from that page on a later \
                  round"
             );
-            return Ok(SnapshotPulled { outcome, complete: false, sender_dropped: false });
+            return Ok(SnapshotPulled {
+                outcome,
+                complete: false,
+                sender_dropped: false,
+                history: false,
+            });
         }
         outcome.applied += applied.applied;
         // Counted where a refusal reached through the oplog is, so the
@@ -5470,7 +5510,12 @@ where
                 resumed,
                 "caught up from a snapshot"
             );
-            return Ok(SnapshotPulled { outcome, complete: true, sender_dropped: false });
+            return Ok(SnapshotPulled {
+                outcome,
+                complete: true,
+                sender_dropped: false,
+                history: false,
+            });
         }
         // A Converge round is bounded by time as well as by pages (repair design section
         // 2.6): the round after it is an ordinary one.
@@ -5485,7 +5530,12 @@ where
                 "a converge repair's round is spent; the next round with this peer is an \
                  ordinary one, and the repair resumes on the round after"
             );
-            return Ok(SnapshotPulled { outcome, complete: false, sender_dropped: false });
+            return Ok(SnapshotPulled {
+                outcome,
+                complete: false,
+                sender_dropped: false,
+                history: false,
+            });
         }
         // The page budget stays wall time, apply included (ADR-152): it is what
         // bounds how long one round with this peer holds the tick's sequential
@@ -5504,7 +5554,12 @@ where
                 "snapshot left to resume on the next round with this peer: the round's \
                  budget is spent"
             );
-            return Ok(SnapshotPulled { outcome, complete: false, sender_dropped: false });
+            return Ok(SnapshotPulled {
+                outcome,
+                complete: false,
+                sender_dropped: false,
+                history: false,
+            });
         }
     }
 }
@@ -8516,6 +8571,62 @@ mod tests {
             "nothing is left to resume"
         );
         assert!(b.snapshots_to_resume().unwrap().is_empty(), "a cursor was recorded");
+    }
+
+    /// A repair whose first page carries the successor of the life standing here writes
+    /// nothing into the ended life, ends, and plans the count kind's scoped snapshot, which
+    /// buries it (ADR-235): after the second round this member holds the sender's life.
+    #[tokio::test]
+    async fn a_repair_of_a_life_the_sender_made_after_a_drop_ends_and_plans_the_snapshot_that_buries()
+     {
+        const SECRET: &str = "a-history-repair-secret";
+        for repair in [Repair::Converge, Repair::Definitions] {
+            let a_dir = tempfile::tempdir().unwrap();
+            let a = Arc::new(Engine::open(&a_dir.path().join("kimmy.redb")).unwrap());
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = listener.local_addr().unwrap();
+            tokio::spawn(serve(Arc::clone(&a), listener, SECRET.into()));
+            let first = a.create_collection("shop", "orders").unwrap();
+            a.insert(&first, bson::doc! { "_id": 1 }).unwrap();
+            let b_dir = tempfile::tempdir().unwrap();
+            let b = Engine::open(&b_dir.path().join("kimmy.redb")).unwrap();
+            let mut ordinary = PeerStalls::new();
+            for _ in 0..3 {
+                ordinary.tick_opened();
+                sync_once_with(&b, addr, SECRET, None, &mut ordinary).await.unwrap();
+            }
+            let held = |e: &Engine, id: i64| {
+                let meta = e.get_collection("shop", "orders").unwrap();
+                e.get(&meta, &kimmy_core::DocId::Int64(id)).unwrap().is_some()
+            };
+            assert!(held(&b, 1), "premise: B holds life 0");
+            std::thread::sleep(Duration::from_millis(5));
+            assert!(a.drop_collection("shop", "orders").unwrap());
+            a.finish_purges_now().unwrap();
+            std::thread::sleep(Duration::from_millis(5));
+            let second = a.create_collection("shop", "orders").unwrap();
+            a.insert(&second, bson::doc! { "_id": 2 }).unwrap();
+            // The tombstone has aged out on A, and B claims A's whole history.
+            a.forget_collection_drop_for_test(first.id).unwrap();
+            b.absorb_witnessed(&a.witnessed_vector().unwrap()).unwrap();
+
+            let mut stalls = PeerStalls::new();
+            assert!(stalls.plan_repair(a.node_id(), first.id, repair));
+            stalls.tick_opened();
+            sync_once_with(&b, addr, SECRET, None, &mut stalls).await.unwrap();
+            assert!(held(&b, 1) && !held(&b, 2), "{repair:?}: the ended life was written into");
+            assert!(stalls.repairing(a.node_id()), "{repair:?}: the burying snapshot is planned");
+            for _ in 0..6 {
+                stalls.tick_opened();
+                sync_once_with(&b, addr, SECRET, None, &mut stalls).await.unwrap();
+                // The page that creates the new life waits for the drop purger (ADR-189).
+                b.finish_purges_now().unwrap();
+                if !stalls.repairing(a.node_id()) {
+                    break;
+                }
+            }
+            assert!(!held(&b, 1) && held(&b, 2), "{repair:?}: B did not end up with A's life");
+        }
     }
 
     /// A Converge round is bounded by pages, and the round after it is an ordinary one

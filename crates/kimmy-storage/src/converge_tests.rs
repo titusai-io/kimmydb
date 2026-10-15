@@ -567,3 +567,77 @@ fn a_young_lost_insert_at_the_cut_counts_apart_from_one_above_it() {
     assert_eq!(done.created, 2);
     assert_eq!(done.created_at_cut, 1);
 }
+
+// -- The first page's life (ADR-235) ----------------------------------------------------------
+
+/// S dropped life 0 and made life 1 (its tombstone aged out), and O still holds life 0:
+/// the first page of a repair pull of S carries a life that has not been buried on O.
+fn o_holds_the_life_before() -> (Engine, Engine, [tempfile::TempDir; 2]) {
+    let (s, ds) = engine();
+    let (o, d_o) = engine();
+    let first = s.create_collection("shop", "orders").unwrap();
+    s.insert(&first, doc! { "_id": 1, "v": 1 }).unwrap();
+    pull(&o, &s);
+    later();
+    assert!(s.drop_collection("shop", "orders").unwrap());
+    s.finish_purges_now().unwrap();
+    later();
+    let second = s.create_collection("shop", "orders").unwrap();
+    s.insert(&second, doc! { "_id": 2, "v": 7 }).unwrap();
+    // The tombstone has aged out on the sender.
+    let txn = s.begin_write(crate::WriterHolder::Ddl).unwrap();
+    txn.open_table(crate::tables::COLLECTIONS_DROPPED).unwrap().remove(orders().0).unwrap();
+    txn.commit().unwrap();
+    // O's position is raised to claim the sender's whole history, as a lost entry leaves it.
+    o.absorb_witnessed(&s.witnessed_vector().unwrap()).unwrap();
+    (s, o, [ds, d_o])
+}
+
+#[test]
+fn a_page_of_the_life_after_a_drop_that_ended_the_standing_life_ends_the_pull_and_writes_nothing() {
+    let (s, o, _d) = o_holds_the_life_before();
+    let mut progress =
+        SnapshotProgress::of_collection_converging(orders(), kimmy_core::VersionVector::new());
+    let page = s.snapshot_page(None, progress.scope()).unwrap();
+    let done = o.apply_snapshot_page(s.node_id(), &mut progress, &page).unwrap();
+    assert!(done.history, "the page's life was not recognised as the successor");
+    assert_eq!((done.applied, done.created, done.left), (0, 0, 0));
+    assert_eq!(value(&o, 1), Some(1), "life 0's document is untouched");
+    assert_eq!(value(&o, 2), None, "life 1's young document was written into life 0");
+}
+
+#[test]
+fn the_same_life_is_not_taken_for_a_successor() {
+    // Two members of one life: the page's floor is not above the standing life's creation.
+    let (a, b, _d) = pair();
+    a.insert(&coll(&a), doc! { "_id": 1, "v": 1 }).unwrap();
+    pull(&b, &a);
+    later();
+    a.replace(&coll(&a), &DocId::Int64(1), doc! { "_id": 1, "v": 2 }, false).unwrap();
+    let done = converge(&b, &a);
+    assert!(done.applied >= 1 && value(&b, 1) == Some(2));
+}
+
+#[test]
+fn a_page_whose_floor_the_senders_coverage_does_not_name_is_not_a_successor() {
+    let (s, o, _d) = o_holds_the_life_before();
+    let mut progress =
+        SnapshotProgress::of_collection_converging(orders(), kimmy_core::VersionVector::new());
+    let mut page = s.snapshot_page(None, progress.scope()).unwrap();
+    page.versions = kimmy_core::VersionVector::new();
+    let done = o.apply_snapshot_page(s.node_id(), &mut progress, &page).unwrap();
+    assert!(!done.history, "a floor nothing vouched for ended a repair");
+}
+
+#[test]
+fn only_the_first_page_decides() {
+    let (s, o, _d) = o_holds_the_life_before();
+    let mut progress =
+        SnapshotProgress::of_collection_converging(orders(), kimmy_core::VersionVector::new());
+    let page = s.snapshot_page(None, progress.scope()).unwrap();
+    // A page this member has already applied one of: the pull is under way, and the decision
+    // was made when it began.
+    progress.test_mark_paged();
+    let done = o.apply_snapshot_page(s.node_id(), &mut progress, &page).unwrap();
+    assert!(!done.history);
+}

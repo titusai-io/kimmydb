@@ -100,6 +100,17 @@ impl crate::Engine {
         }
         let scope = progress.scope().expect("a Definitions pull is scoped");
         let limit = progress.max_index_documents();
+        // The page's life began after a drop that ended the standing one: its indexes belong
+        // to a life this member has not buried, and building them here puts them in the
+        // ended life. The pull ends; the count kind's snapshot buries (ADR-235).
+        if self.first_page_is_a_life_this_member_has_not_buried(progress, page)? {
+            progress.finish_after_one_page();
+            return Ok(SnapshotApplied {
+                history: true,
+                definitions: DefinitionRestore { history: 1, ..Default::default() },
+                ..Default::default()
+            });
+        }
         let definitions = match page
             .collections
             .iter()
