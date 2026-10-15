@@ -674,6 +674,14 @@ impl SnapshotProgress {
     }
 }
 
+/// What a `Converge` page counts of the deletes it carries: the rows left (this member holds
+/// nothing for them), the tombstones it replaced at the finding's cut (progress), and the
+/// cut itself.
+struct ConvergeTombstones<'a> {
+    left: &'a mut usize,
+    replaced_at_cut: &'a mut usize,
+    at_cut: &'a dyn Fn(Stamp) -> bool,
+}
 impl Engine {
     /// Produce one page of a snapshot of current state: the whole database,
     /// or — for a repair — the one collection `scope` names.
@@ -1175,7 +1183,6 @@ impl Engine {
                 &mut pending,
                 &mut superseded,
                 None,
-                None,
             )?;
 
             // Only a *completed* snapshot grants coverage: adopting it
@@ -1425,8 +1432,11 @@ impl Engine {
                 page,
                 &mut pending,
                 &mut superseded,
-                Some(&mut left_tombstone),
-                Some((&at_cut, &mut replaced_at_cut)),
+                Some(ConvergeTombstones {
+                    left: &mut left_tombstone,
+                    replaced_at_cut: &mut replaced_at_cut,
+                    at_cut: &at_cut,
+                }),
             )?;
             applied_at_cut += replaced_at_cut
                 + pending[documents_applied..].iter().filter(|p| at_cut(p.entry.stamp)).count();
@@ -1588,15 +1598,13 @@ impl Engine {
         page: &SnapshotPage,
         pending: &mut Vec<Pending>,
         superseded: &mut usize,
-        converge: Option<&mut usize>,
-        replaced_at_cut: Option<(&dyn Fn(Stamp) -> bool, &mut usize)>,
+        converge: Option<ConvergeTombstones<'_>>,
     ) -> Result<usize> {
         // Under `Converge` (`converge` carries the count of rows left) a tombstone
         // is applied only over a live document it out-stamps: where this node holds
         // nothing, or only a tombstone, nothing is written, and the bare tombstone
         // of ADR-228 is never recorded.
         let mut converge = converge;
-        let mut replaced_at_cut = replaced_at_cut;
         let mut recorded = 0usize;
         for tombstone in &page.deleted_documents {
             if tombstone.stamp.hlc > page.versions.get(tombstone.stamp.node) {
@@ -1622,8 +1630,8 @@ impl Engine {
             let Some(collection) = collection else {
                 // No collection here: under `Converge` the row is a tombstone this member holds
                 // nothing for, and says so.
-                if let Some(left) = converge.as_deref_mut() {
-                    *left += 1;
+                if let Some(c) = converge.as_mut() {
+                    *c.left += 1;
                 }
                 continue;
             };
@@ -1636,8 +1644,8 @@ impl Engine {
                 }
             };
             let Some(current) = existing else {
-                if let Some(left) = converge.as_deref_mut() {
-                    *left += 1;
+                if let Some(c) = converge.as_mut() {
+                    *c.left += 1;
                     continue;
                 }
                 self.record_bare_tombstone(txn, &collection, tombstone)?;
@@ -1657,8 +1665,8 @@ impl Engine {
                 self.record_bare_tombstone(txn, &collection, tombstone)?;
                 recorded += 1;
                 // A replaced tombstone at the finding's cut is progress, as a row is.
-                if let Some((at_cut, n)) = replaced_at_cut.as_mut() {
-                    **n += usize::from(at_cut(tombstone.stamp));
+                if let Some(c) = converge.as_mut() {
+                    *c.replaced_at_cut += usize::from((c.at_cut)(tombstone.stamp));
                 }
                 continue;
             };
