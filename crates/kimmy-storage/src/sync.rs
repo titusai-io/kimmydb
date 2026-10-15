@@ -7859,6 +7859,59 @@ mod tests {
         race_hooks::assert_absorbed(race_hooks::Race::ReplicatedCreate);
     }
 
+    /// A creation in a held drop's own `Hlc` is refused before the writer, as one older
+    /// than the drop is (ADR-236): nothing taken, nothing appended.
+    #[test]
+    fn a_creation_in_a_held_drops_own_hlc_is_refused_before_the_writer() {
+        let (a, _da) = engine();
+        let (b, _db) = engine();
+        a.create_collection("shop", "orders").unwrap();
+        let (_, window) = window_for(&b, &a);
+        let create = window
+            .entries
+            .iter()
+            .find(|e| e.kind == OpKind::CreateCollection)
+            .cloned()
+            .expect("the creation's entry");
+        let below = Stamp::new(create.stamp.hlc, kimmy_core::NodeId::from_bytes([0; 16]));
+        b.record_collection_drop(create.collection, below).unwrap();
+        b.apply_batch(std::slice::from_ref(&create)).unwrap();
+        assert!(b.get_collection("shop", "orders").is_err(), "a creation in the drop's Hlc stood");
+        assert!(b.oplog_entry(&create.stamp).unwrap().is_none(), "judged under the writer");
+    }
+
+    /// A vector shadow is a collection: a peer's configuration in the shadow's drop's own
+    /// `Hlc`, from a node above the dropper's, makes no shadow (ADR-236), as a creation in
+    /// a drop's `Hlc` is history everywhere; the configuration itself still applies.
+    #[test]
+    fn a_configuration_in_its_shadows_drop_hlc_makes_no_shadow() {
+        let (b, _db) = engine();
+        let orders = b.create_collection("shop", "orders").unwrap();
+        b.configure_vectors("shop", "orders", vector_config()).unwrap();
+        b.disable_vectors("shop", "orders", true).unwrap();
+        b.finish_purges_now().unwrap();
+        let shadow = kimmy_core::vector_meta::shadow_name("orders");
+        let dropped = b
+            .collection_dropped_at(CollectionId::derive("shop", &shadow))
+            .unwrap()
+            .expect("the shadow's drop");
+        let tied = Stamp::new(dropped.hlc, kimmy_core::NodeId::from_bytes([0xff; 16]));
+        let entry = crate::engine::ddl_entry(
+            tied,
+            OpKind::ConfigureVectors,
+            orders.id,
+            &kimmy_core::VectorSet {
+                db: "shop".into(),
+                collection: "orders".into(),
+                config: Some(vector_config()),
+            },
+        )
+        .unwrap();
+        b.apply_batch(std::slice::from_ref(&entry)).unwrap();
+        assert!(b.get_collection("shop", "orders").unwrap().vector.is_some(), "premise: applied");
+        assert!(b.get_collection("shop", &shadow).is_err(), "a shadow made in its drop's Hlc");
+    }
+
     /// A definition in the drop's own `Hlc`, from a node above the dropper's, is of the
     /// life the drop ended (ADR-236: a tie is the drop's), so it is history for a
     /// collection this node dropped and does not stop the batch: no later life can carry

@@ -223,6 +223,10 @@ fn an_expansion_of_a_database_drop_follows_a_later_drop_of_the_database() {
     let orders = CollectionId::derive("shop", "orders");
     let own = a.collection_dropped_at(orders).unwrap().expect("the dropper's own burial");
     assert_ne!(own, first, "premise: a stamp of its own");
+    // A tombstone of another database's collection, below the first drop.
+    let elsewhere = CollectionId::derive("other", "x");
+    let older = Stamp::new(Hlc::new(first.hlc.wall_ms - 1, 0), NodeId::from_bytes([9; 16]));
+    a.record_collection_drop(elsewhere, older).unwrap();
     later();
     let second = stamp_of(crate::physical_now_ms() + 1_000, 7);
     a.apply_batch(&[drop_database_entry("shop", second)]).unwrap();
@@ -233,6 +237,31 @@ fn an_expansion_of_a_database_drop_follows_a_later_drop_of_the_database() {
         Some(own),
         "a collection's own drop moved"
     );
+    assert_eq!(a.collection_dropped_at(elsewhere).unwrap(), Some(older), "an unrelated one moved");
+}
+
+/// The same when the later drop of the database arrives on a whole page, to a member
+/// that still holds a collection of the database (one made after the first drop).
+#[test]
+fn an_expansion_follows_a_later_drop_of_the_database_carried_by_a_page() {
+    let (a, b, _da, _db, late) = the_field_sequence();
+    pull(&a, &b);
+    let first = a.database_dropped_at("shop").unwrap().expect("the first drop");
+    assert_eq!(a.collection_dropped_at(late).unwrap(), Some(first), "premise: expanded at it");
+    later();
+    a.create_collection("shop", "fresh").unwrap();
+    // P drops the database later, without having met `late`.
+    let (p, _dp) = engine();
+    later();
+    p.create_collection("shop", "other").unwrap();
+    assert!(p.drop_database("shop").unwrap());
+    let second = p.database_dropped_at("shop").unwrap().expect("the second drop");
+    assert!(second > first, "premise: later");
+    let page = p.snapshot_page(None, None).unwrap();
+    assert!(!page.dropped_collections.iter().any(|(id, _)| *id == late), "premise");
+    a.apply_snapshot_page(p.node_id(), &mut SnapshotProgress::whole_database(), &page).unwrap();
+    assert_eq!(a.database_dropped_at("shop").unwrap(), Some(second));
+    assert_eq!(a.collection_dropped_at(late).unwrap(), Some(second), "the expansion stayed behind");
 }
 
 /// Control: a collection created after the drop stands and replicates. The
