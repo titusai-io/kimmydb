@@ -88,6 +88,13 @@ pub struct Engine {
     /// count misses the case where one document is deleted and another added.
     /// A counter is exact and free.
     vector_generations: Mutex<std::collections::HashMap<CollectionId, u64>>,
+    /// For a collection absent here, the coverage of the scoped pages that left it
+    /// absent from a sender holding no life of it (ADR-236 item 4). A definition that
+    /// coverage names is one its sender processed and holds no life for: history here,
+    /// as it is there, whoever serves it (`Engine::answered_by_a_page`). Kept in memory:
+    /// after a restart a stop at such a definition asks for the page again, once.
+    pub(crate) answered_absent:
+        Mutex<std::collections::HashMap<CollectionId, kimmy_core::VersionVector>>,
     /// Where the database file lives, kept so that size can be reported
     /// without the caller having to remember what it opened.
     path: std::path::PathBuf,
@@ -1452,6 +1459,7 @@ impl Engine {
             swept: Mutex::new(Default::default()),
             collections_generation: std::sync::atomic::AtomicU64::new(0),
             vector_generations: Mutex::new(Default::default()),
+            answered_absent: Mutex::new(Default::default()),
             path: path.to_path_buf(),
             unique_violations: std::sync::atomic::AtomicU64::new(0),
             unkeyed_writes: std::sync::atomic::AtomicU64::new(0),

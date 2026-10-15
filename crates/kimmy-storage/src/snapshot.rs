@@ -890,6 +890,18 @@ impl Engine {
                 Err(e) => return Err(e),
             }
         }
+        // A scoped page from a sender that holds no life of the collection, which leaves
+        // it absent here: the answer to a stop at a definition stamped after the drop, for
+        // every definition the sender's coverage names (`Engine::answered_by_a_page`,
+        // ADR-236 item 4). On the first page, the one that carries the definition when
+        // the sender holds one.
+        if let Some(id) = progress.scope
+            && progress.pages == 0
+            && page.collections.is_empty()
+            && self.collection_by_id(id)?.is_none()
+        {
+            self.record_answered_absent(id, &page.versions);
+        }
         let shadows_missing = self.shadows_missing(page)?;
         let shadows_orphaned = self.shadows_orphaned(page)?;
 

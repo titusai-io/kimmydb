@@ -456,6 +456,12 @@ pub(crate) enum Category {
     /// sort below state it holds; the consequences reach other members only through a
     /// later step that mints, so this is checked where it arises.
     ClockBehind,
+    /// Once quiet, a member has not taken everything a peer holds: its witnessed vector
+    /// does not cover the peer's version vector. Replication from that peer is stuck at
+    /// an entry it cannot take, so nothing the peer writes after it arrives by entries,
+    /// whether or not the state shows it yet (the review of 4a0cb5f3 found F7's stop
+    /// doing this with every member's state equal).
+    Wedged,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -1425,6 +1431,20 @@ impl Cluster {
         for behind in &self.clock_behind {
             fail(Category::ClockBehind, behind.clone());
         }
+        // Once quiet, every member has taken what every peer holds; a pair that has
+        // not is a replication wedge, whatever the state shows.
+        for (i, taker) in LETTERS.iter().enumerate() {
+            for (j, holder) in LETTERS.iter().enumerate() {
+                if i == j {
+                    continue;
+                }
+                let mine = self.e(i).witnessed_vector().map_err(|e| err("witnessed", e))?;
+                let theirs = self.e(j).version_vector().map_err(|e| err("versions", e))?;
+                if !mine.covers(&theirs) {
+                    fail(Category::Wedged, format!("{taker} has not taken all {holder} holds"));
+                }
+            }
+        }
         // No lost write, from the ghost.
         let mut latest: BTreeMap<(usize, i64), (Stamp, Option<usize>)> = BTreeMap::new();
         for (i, w) in self.ghost.writes.iter().enumerate() {
@@ -2364,7 +2384,10 @@ fn census_takes(name: &str, pre: &[Op], variants: &[(&str, Vec<Op>)], expect: Ex
 #[ignore = "the vacuity census; see the convergence model test report"]
 fn vacuity_census() {
     CENSUS.with(|c| *c.borrow_mut() = Some(Vec::new()));
-    let named: [fn(); 34] = [
+    let named: [fn(); 37] = [
+        review_cfr_an_index_created_and_dropped_after_a_drop_wedges_the_window,
+        review_cfr_seed_13739_wedges_without_a_visible_difference,
+        review_cfr_seed_13739_without_the_write,
         known_residual_a_collections_own_drop_and_a_later_database_drop,
         finding_f16_a_delete_made_after_a_drop_is_kept_as_a_write_after_it_is,
         known_residual_two_drops_of_one_database_the_first_dropper_held_the_collection,
@@ -3111,5 +3134,47 @@ fn the_enumeration_counts() {
     assert!(
         all.iter().all(|ops| ops[0].step == Create { m: A, c: ORDERS }),
         "a first delivery does nothing"
+    );
+}
+
+/// Review of 4a0cb5f3 (F7's stop). An index created after a concurrent drop and
+/// dropped again before the drop arrives: the creating member buries the life (nothing
+/// is stamped after the drop) and still serves the `CreateIndex`; every member that
+/// lacks the collection stopped at it on every round, and A's later write in another
+/// collection never reached them by entries or by the repair. The scoped page that holds
+/// no life now answers the stop (ADR-236 item 4).
+#[test]
+fn review_cfr_an_index_created_and_dropped_after_a_drop_wedges_the_window() {
+    finding(
+        "review F7 wedge",
+        "A.create(items)@100; A.create(orders)@110; C<-A entries; C.drop(orders)@150; \
+         A.index(orders,k_1:asc)@200; A.dropindex(orders,k_1)@210; A<-C entries; \
+         A.write(items/1)@220",
+        &[(ORDERS, None), (ITEMS, Some(&[1]))],
+    );
+}
+
+/// Review of 4a0cb5f3 (F7's stop), the generator's own shape (seed 13739, minimised): no
+/// delivery in the schedule at all. B's life is buried by A's drop at quiescence with
+/// nothing stamped after it (the index was dropped), and A and C stop at B's
+/// `CreateIndex` for good. Visible only to the `Wedged` check or a later write;
+/// `review_cfr_seed_13739_without_the_write` is the shape with no write.
+#[test]
+fn review_cfr_seed_13739_without_the_write() {
+    finding(
+        "review F7 seed 13739, no write",
+        "B.create(orders)@120; A.create(orders)@130; A.drop(orders)@140; \
+         B.index(orders,k_1:desc)@160; B.dropindex(orders,k_1)@170",
+        &[(ORDERS, None)],
+    );
+}
+
+#[test]
+fn review_cfr_seed_13739_wedges_without_a_visible_difference() {
+    finding(
+        "review F7 seed 13739",
+        "B.create(items)@110; B.create(orders)@120; A.create(orders)@130; A.drop(orders)@140; \
+         B.index(orders,k_1:desc)@160; B.dropindex(orders,k_1)@170; B.write(items/1)@180",
+        &[(ORDERS, None), (ITEMS, Some(&[1]))],
     );
 }

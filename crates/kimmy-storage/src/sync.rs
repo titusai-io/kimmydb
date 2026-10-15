@@ -2067,6 +2067,33 @@ impl Engine {
         Ok(Some(database.map_or(own, |database| database.max(own))))
     }
 
+    /// Whether a scoped page has answered a stop at this definition of a collection
+    /// absent here (`defines_a_later_life`): its sender held no life of the collection,
+    /// the page left the collection absent here, and the sender's coverage names the
+    /// definition (ADR-236 item 4). The sender processed the definition and holds no
+    /// life it belongs to, so it is history there, and here, whichever member serves
+    /// it. A member that buried the life because nothing stamped after the drop still
+    /// stood (an index created and dropped again before the drop arrived), or a 0.49.x
+    /// member that buried a life its database's drop covered, definitions and all,
+    /// still serves the entry; without this the stop asked for the same tombstone on
+    /// every round, and nothing past the entry, in any collection, reached this member
+    /// by entries. A sender that holds a life this member refuses (older than the drop
+    /// here) leaves the stop standing: it keeps that life, re-dated, once it hears the
+    /// drop, and its page then brings it.
+    pub(crate) fn answered_by_a_page(&self, entry: &OplogEntry) -> bool {
+        self.answered_absent
+            .lock()
+            .get(&entry.collection)
+            .is_some_and(|coverage| entry.stamp.hlc <= coverage.get(entry.stamp.node))
+    }
+
+    /// Record that a scoped page of `id` from a sender holding no life of it left the
+    /// collection absent here, through the sender's `coverage` (`answered_by_a_page`).
+    /// The pages add up: each names definitions its own sender processed.
+    pub(crate) fn record_answered_absent(&self, id: CollectionId, coverage: &VersionVector) {
+        self.answered_absent.lock().entry(id).or_default().merge(coverage);
+    }
+
     /// Process one replicated entry. Witnessing is the caller's job, so that
     /// no branch here can forget it.
     ///
@@ -2112,9 +2139,15 @@ impl Engine {
                     // may still arrive, and so may the life a definition
                     // stamped after the drop belongs to (`defines_a_later_life`):
                     // both stop the batch, and the scoped page (ADR-148) brings
-                    // the life with its definitions.
+                    // the life with its definitions. Until a page has answered
+                    // it: a sender whose page held no life of the collection and
+                    // whose coverage names the definition has none to bring, and
+                    // the definition is history (`answered_by_a_page`).
                     match self.drop_a_definition_is_judged_by(entry)? {
-                        Some(dropped) if !defines_a_later_life(entry, dropped) => {
+                        Some(dropped)
+                            if !defines_a_later_life(entry, dropped)
+                                || self.answered_by_a_page(entry) =>
+                        {
                             outcome.superseded += 1;
                         }
                         _ => return Ok(Step::Unknown(Some(name))),
@@ -7834,6 +7867,54 @@ mod tests {
             "and the round converged rather than re-serving the same window for ever"
         );
         assert_eq!(round(&b, &a, BATCH), SyncOutcome::default(), "and stays converged");
+    }
+
+    /// The bound on that stop (ADR-236 item 4), the side it leaves standing: a page from
+    /// a sender that still holds the life the drop here ended (it has not heard the
+    /// drop) carries that life, which B refuses, and the definition is not taken as
+    /// history; the stop stands until A hears the drop and keeps the life, re-dated
+    /// with the index, and A's page then brings it. Taken as history on the first
+    /// page, B would never hold the life A keeps: a re-dated life has no creation entry.
+    #[test]
+    fn a_page_carrying_a_life_this_member_refuses_leaves_the_later_life_stop_standing() {
+        let (a, _da) = engine();
+        let (b, _db) = engine();
+        a.create_collection("shop", "orders").unwrap();
+        let other = a.create_collection("shop", "other").unwrap();
+        round(&b, &a, BATCH);
+        b.drop_collection("shop", "orders").unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(2));
+        let field = crate::meta::IndexField { path: "n".into(), descending: false };
+        a.create_index("shop", "orders", vec![field], false, None).unwrap();
+        a.insert(&other, doc! { "_id": "behind-it" }).unwrap();
+        let scoped = |b: &Engine, a: &Engine, id| {
+            let mut progress = crate::SnapshotProgress::of_collection(id);
+            while !progress.is_complete() {
+                let page = a.snapshot_page(progress.after().cloned(), progress.scope()).unwrap();
+                b.apply_snapshot_page(a.node_id(), &mut progress, &page).unwrap();
+            }
+        };
+
+        // Answered before A has heard the drop: the page carries A's life, B refuses it.
+        let stopped = round(&b, &a, BATCH).unknown.expect("a later life's definition stops");
+        scoped(&b, &a, stopped.id);
+        assert!(b.get_collection("shop", "orders").is_err(), "premise: B refused A's life");
+        let outcome = round(&b, &a, BATCH);
+        assert_eq!(outcome.unknown_collection, 1, "the stop stands: {outcome:?}");
+
+        // A hears the drop and keeps the life; its page brings it.
+        round(&a, &b, BATCH);
+        assert!(a.get_collection("shop", "orders").unwrap().is_redated(), "premise: kept");
+        scoped(&b, &a, stopped.id);
+        let outcome = round(&b, &a, BATCH);
+        assert_eq!(outcome.unknown_collection, 0, "{outcome:?}");
+        assert_eq!(
+            b.get_collection("shop", "orders").expect("the life arrived").indexes.len(),
+            1,
+            "with its index"
+        );
+        assert_eq!(ids_on(&b, "shop", "other"), ids_on(&a, "shop", "other"), "nothing stranded");
+        assert!(b.witnessed_vector().unwrap().covers(&a.version_vector().unwrap()));
     }
 
     /// A drop of an index on a collection this node dropped, stamped after the drop,
