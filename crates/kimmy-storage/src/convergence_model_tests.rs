@@ -2919,6 +2919,73 @@ fn known_residual_a_later_write_a_refused_life_s_whole_page_granted_past() {
     );
 }
 
+/// ADR-237 closes ADR-236's residual 4: the document repair (a `Converge` pull of the
+/// collection, as the transport runs one for a confirmed cut-digest finding) takes the write
+/// C was granted past. The schedule is the residual row's. The cluster is first settled as the
+/// row pins it (the `Repaired` route leaves C holding `2@t150.1C` against `2@t160.1B` on A and
+/// B, every count equal, the digests different); then C pulls A's collection under `Converge`
+/// and holds `t160.1B`, B and A are untouched, the three digests agree, and a second pull
+/// writes nothing, so the finding does not come back (one effective repair, no loop). Without
+/// the apply, C keeps the older write: the assertion after the pull is the one that fails.
+#[test]
+fn residual_4_is_closed_by_the_document_repair() {
+    let ops = parse(
+        "A.create(orders)@100; C.create(orders)@110; A.dropdb@130; C.write(orders/2)@150; \
+         B<-C whole; B.write(orders/2)@160",
+    );
+    let mut cluster = Cluster::new(base());
+    cluster.run(&ops).expect("the schedule runs");
+    let settled = settle(&mut cluster, Route::Repaired);
+    assert!(
+        settled.failures.iter().any(|f| f.category == Category::Docs),
+        "premise: the residual stands before the repair: {:?}",
+        settled.failures
+    );
+
+    let orders = CollectionId::derive(DB, NAMES[ORDERS as usize]);
+    let held = |cluster: &Cluster, m: u8| {
+        let (observed, _) = cluster.observe(m as usize).expect("observe");
+        let coll = observed.collections.get(NAMES[ORDERS as usize]).expect("orders is held");
+        let (stamp, _) = coll.documents.get(&2).expect("orders/2 is held");
+        (cluster.stamp(*stamp), observed.clone())
+    };
+    let digest = |cluster: &Cluster, m: u8| {
+        cluster.e(m as usize).digest_row(orders).expect("digest row").expect("a digest row").digest
+    };
+    let (a_before, a_state) = held(&cluster, A);
+    let (b_before, b_state) = held(&cluster, B);
+    let (c_before, _) = held(&cluster, C);
+    assert_eq!((a_before.as_str(), b_before.as_str()), ("t160.1B", "t160.1B"), "premise");
+    assert_eq!(c_before, "t150.1C", "premise: C was granted past B's write");
+    assert_ne!(digest(&cluster, C), digest(&cluster, A), "premise: the cut digest sees it");
+    assert_eq!(digest(&cluster, A), digest(&cluster, B), "premise");
+
+    let pull = |cluster: &Cluster, to: u8, from: u8| {
+        let (to, from) = (cluster.e(to as usize), cluster.e(from as usize));
+        let mut progress =
+            SnapshotProgress::of_collection_converging(orders, kimmy_core::VersionVector::new());
+        let mut applied = 0;
+        let mut pages = 0;
+        while !progress.is_complete() {
+            let page = from.snapshot_page(progress.after().cloned(), progress.scope()).unwrap();
+            applied +=
+                to.apply_snapshot_page(from.node_id(), &mut progress, &page).unwrap().applied;
+            pages += 1;
+            assert!(pages < 16, "a repair that never completes");
+        }
+        applied
+    };
+    assert!(pull(&cluster, C, A) >= 1, "the repair wrote the document C lacked");
+
+    assert_eq!(held(&cluster, C).0, "t160.1B", "C holds B's write: {}", render(&ops, &[settled]));
+    assert_eq!(digest(&cluster, C), digest(&cluster, A), "the digests agree");
+    assert_eq!(digest(&cluster, C), digest(&cluster, B), "the digests agree");
+    assert_eq!(held(&cluster, A).1, a_state, "A is untouched");
+    assert_eq!(held(&cluster, B).1, b_state, "B is untouched");
+    assert_eq!(pull(&cluster, C, A), 0, "a second repair writes nothing: no loop");
+    assert_eq!(held(&cluster, C).0, "t160.1B");
+}
+
 // -- Generated schedules -------------------------------------------------------------------
 
 fn env_u64(name: &str, default: u64) -> u64 {
