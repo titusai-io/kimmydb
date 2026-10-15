@@ -254,6 +254,28 @@ fn a_stamp_the_senders_coverage_does_not_name_moves_nothing() {
     assert!(b.clock_last() < far.hlc, "the clock followed a stamp nothing vouched for");
 }
 
+/// A local drop is minted above the life it buries, whatever the clock says (ADR-236). A
+/// creation a page stored without witnessing it (a scoped page from a relay whose own
+/// coverage does not name it, ADR-233's trade) stands above this member's clock, and a
+/// drop minted at the clock was judged, on every member holding the life, as aimed at one
+/// that ended before it: the acknowledged drop was undone everywhere.
+#[test]
+fn a_local_drop_is_minted_above_a_creation_the_clock_never_witnessed() {
+    let (a, _da, _) = engine_an_hour_ahead();
+    let (relay, _dr) = engine();
+    let (c, _dc) = engine();
+    let orders = a.create_collection("shop", "orders").unwrap();
+    transfer_under(&relay, &a, SnapshotProgress::of_collection(orders.id));
+    transfer_under(&c, &relay, SnapshotProgress::of_collection(orders.id));
+    assert!(c.clock_last() < orders.created, "premise: stored and not witnessed");
+
+    c.drop_collection("shop", "orders").unwrap();
+    let dropped = c.collection_dropped_at(orders.id).unwrap().expect("the drop's tombstone");
+    assert!(dropped.hlc > orders.created, "the drop {dropped:?} is below the life it buried");
+    pull(&a, &c);
+    assert!(a.get_collection("shop", "orders").is_err(), "the drop reaches the life it buried");
+}
+
 // -- A restore honours the receiver's own index tombstone --------------------------------
 
 /// `a` and `b` hold `shop.orders.x`; then `b` drops it and `a` has not heard.

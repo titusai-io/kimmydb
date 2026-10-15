@@ -4826,8 +4826,21 @@ impl Engine {
         replicated: Option<Stamp>,
     ) -> Result<Burial> {
         let log = replicated.is_none();
-        // Under the writer, as `create_collection_inner` mints (ADR-148).
-        let stamp = replicated.unwrap_or_else(|| self.next_stamp());
+        // Under the writer, as `create_collection_inner` mints (ADR-148), and a
+        // local drop **above the life it buries**, whatever the clock says
+        // (ADR-236), as a change to a stamped thing is minted above its stamp
+        // (ADR-226). A creation a page stored without witnessing it (the sender's
+        // coverage did not name it, ADR-233's trade) can stand above this
+        // member's clock; a drop minted below it is judged, on every member that
+        // holds the life, as aimed at a life that ended before this one, and the
+        // life comes back here by entries over the acknowledged drop.
+        let stamp = match replicated {
+            Some(stamp) => stamp,
+            None => {
+                let created = shadow.as_ref().map_or(meta.created, |s| s.created.max(meta.created));
+                self.next_stamp_above(Some(Stamp::new(created, self.node_id)))
+            }
+        };
         let database_emptied = {
             let mut collections = txn.open_table(tables::COLLECTIONS)?;
             collections.remove((db, name))?;
