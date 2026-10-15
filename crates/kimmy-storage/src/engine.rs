@@ -4465,8 +4465,19 @@ impl Engine {
             }
 
             // Every check that ends the creation without a write is behind us:
-            // the stamp is minted here, once, for the write that follows.
-            let stamp = mint();
+            // the stamp is minted here, once, for the write that follows. A local
+            // creation is minted **above the floor it takes** (ADR-236), as a local
+            // drop is minted above the life it buries: a tombstone this member
+            // recorded without witnessing it (a scoped page's drop its sender's
+            // coverage did not name) can stand above the clock, and a life created
+            // below its own floor is history on every other member, its writes
+            // with it.
+            let stamp = match (mint(), incarnation_floor) {
+                (stamp, Some(floor)) if log && stamp.hlc <= floor => {
+                    self.next_stamp_above(Some(Stamp::new(floor, self.node_id)))
+                }
+                (stamp, _) => stamp,
+            };
 
             // `created` is the stamp of the create that produced this
             // incarnation *at its origin* — for a replicated create, the

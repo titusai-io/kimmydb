@@ -2293,7 +2293,8 @@ fn census_takes(name: &str, pre: &[Op], variants: &[(&str, Vec<Op>)], expect: Ex
 #[ignore = "the vacuity census; see the convergence model test report"]
 fn vacuity_census() {
     CENSUS.with(|c| *c.borrow_mut() = Some(Vec::new()));
-    let named: [fn(); 27] = [
+    let named: [fn(); 28] = [
+        finding_f11_a_local_creation_below_the_floor_it_takes_is_history_everywhere,
         row_a_page_moves_the_clock_past_the_creation_it_vouches_for,
         row_a_page_moves_the_clock_past_the_drop_it_vouches_for,
         finding_f10_a_local_drop_below_an_unwitnessed_creation_is_undone,
@@ -2562,6 +2563,21 @@ fn finding_f10_a_local_drop_below_an_unwitnessed_creation_is_undone() {
         "F10",
         "A.create(orders)@300; B<-A scoped(orders); C<-B scoped(orders); C.drop(orders)@110",
         &[(ORDERS, None)],
+    );
+}
+
+/// F11 (found while closing the vacuity gap of ADR-233's witnesses). A scoped page from a
+/// relay carries the drop of the collection it no longer holds, a stamp the relay's own
+/// coverage does not name: recorded, not witnessed. A local creation of the name then took
+/// its floor from that tombstone and was minted at the member's clock, below it: the
+/// creation and every write into the life were history on every other member.
+#[test]
+fn finding_f11_a_local_creation_below_the_floor_it_takes_is_history_everywhere() {
+    finding(
+        "F11",
+        "A.create(orders)@300; A.drop(orders)@310; B<-A scoped(orders); C<-B scoped(orders); \
+         C.create(orders)@200; C.write(orders/1)@205",
+        &[(ORDERS, Some(&[1]))],
     );
 }
 
