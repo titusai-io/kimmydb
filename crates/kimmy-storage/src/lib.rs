@@ -66,6 +66,9 @@ mod key_walk_tests;
 mod database_drop_tests;
 
 #[cfg(test)]
+mod converge_tests;
+
+#[cfg(test)]
 mod keep_later_writes_tests;
 
 #[cfg(test)]
@@ -130,7 +133,7 @@ pub use purge::PurgeCounters;
 pub use refusal_hint::{HintKind, RefusalHint};
 pub use snapshot::{
     CollectionState, SNAPSHOT_PAGE, ServeVerdict, SnapshotApplied, SnapshotCursor, SnapshotDoc,
-    SnapshotPage, SnapshotProgress, SnapshotTombstone,
+    SnapshotPage, SnapshotPolicy, SnapshotProgress, SnapshotTombstone,
 };
 pub use sync::{
     EntryWait, MarkedRange, PeerWindow, PullTiming, SyncOutcome, UnknownCollection, WindowEnd,
