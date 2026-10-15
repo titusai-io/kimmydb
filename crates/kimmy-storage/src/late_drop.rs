@@ -333,8 +333,10 @@ impl Engine {
             }
         }
         // As for an index, a change in the drop's own `Hlc` is the drop's, whatever its node
-        // (ADR-236), and is turned off at its own stamp where that sorts above the drop's,
-        // not by last-writer-wins, which would keep it here alone.
+        // (ADR-236), and is turned off at its own stamp where that sorts above the drop's:
+        // at the drop's, last-writer-wins would keep it here alone. Judged strictly
+        // (`Configured::Swept`), so a configuration changed above that stamp before the
+        // disable takes the writer is the newer life's and stays.
         if standing.vector.is_some()
             && let Some(changed) =
                 standing.vector_changed.filter(|changed| changed.hlc <= dropped.hlc)
@@ -2011,6 +2013,46 @@ mod tests {
             e.count_repair_replay_from(&floored).unwrap(),
             floored.incarnation_floor.unwrap(),
             "the floor, where it is the lowest"
+        );
+    }
+
+    /// A configuration made while the sweep turns off a tied one (ADR-236 item 2). The sweep
+    /// reads the standing configuration without the writer, then turns it off as `Swept`,
+    /// and its retry loop reads the definition again. A configuration a client makes in
+    /// between, stamped after the drop, is the newer life's: it stays, as it does on every
+    /// other member. (`Swept` skipped last-writer-wins, and turned it off at the older swept
+    /// stamp: this member alone lost a definition the drop keeps.)
+    #[test]
+    fn a_configuration_made_while_the_sweep_turns_off_a_tied_one_is_kept() {
+        let (a, b, _da, _db, dropped) = a_drop_and_a_later_life();
+        let b = std::sync::Arc::new(b);
+        b.configure_vectors("shop", "orders", byo_config()).unwrap();
+        let above = Stamp::new(dropped.hlc, NodeId::from_bytes([0xff; 16]));
+        edit_meta(&b, |meta| meta.vector_changed = Some(above));
+        let competing = std::sync::Arc::clone(&b);
+        let ((), made) = crate::sync::race_hooks::race(
+            crate::sync::race_hooks::Race::VectorRemoval,
+            move || {
+                let mut config = byo_config();
+                config.fields = vec!["body".into()];
+                competing.configure_vectors("shop", "orders", config).unwrap()
+            },
+            || pull(&b, &a),
+        );
+        let made = made.vector_changed.expect("a local configuration is stamped");
+        assert!(made.hlc > dropped.hlc, "premise: the client's configuration is after the drop");
+        let standing = b.get_collection("shop", "orders").unwrap();
+        assert!(
+            standing.vector.is_some(),
+            "a configuration stamped after the drop was turned off by the sweep: changed {:?}, \
+             made {made:?}",
+            standing.vector_changed
+        );
+        quiesce(&[&a, &b]);
+        assert_eq!(
+            a.get_collection("shop", "orders").unwrap().vector.is_some(),
+            b.get_collection("shop", "orders").unwrap().vector.is_some(),
+            "the members agree"
         );
     }
 }

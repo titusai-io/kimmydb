@@ -27319,8 +27319,11 @@ stamps (its YS1), and F17 from a storm test of the count half (a loop that repla
    the one member that swept it while every other member refused it by its floor (ADR-231's addendum item 3 is
    reversed). The index tombstone is recorded at that stamp. **A vector configuration changed in the drop's own `Hlc`**
    is turned off the same way: the sweep turns it off in a mode of its own (`Configured::Swept`), at the change's own
-   stamp where that sorts above the drop's, and that mode is not judged by last-writer-wins, which read the drop's
-   stamp as older than such a change and kept the configuration on the sweeping member alone.
+   stamp where that sorts above the drop's (at the drop's stamp, last-writer-wins read it as older than such a change
+   and kept the configuration on the sweeping member alone). That mode is judged by last-writer-wins strictly: the
+   configuration at the swept stamp goes, and one changed above it after the sweep read it (a client's, or a
+   replicated change stamped after the drop, landing before the disable takes the writer) is the newer life's and
+   stays, as on every other member; judged by neither, the sweep turned that one off too, on this member alone.
 3. **What a member decides about a drop, it serves onward (F4).** A replicated `DropCollection` it ignores (its own
    life is newer) is appended as an applied one is, and so is a `CreateCollection` its database's drop refuses. The
    member's vector named the origin past both, so a peer that pulled it was never served them by anyone: it kept a

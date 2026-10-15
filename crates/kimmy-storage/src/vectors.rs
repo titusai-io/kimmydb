@@ -87,9 +87,11 @@ pub(crate) enum Configured {
     FromSnapshot(Option<kimmy_core::Stamp>),
     /// A late-drop sweep turning off a configuration of the life before (ADR-231),
     /// at the stamp given: the drop's, or the change's own where that sorts above the
-    /// drop's in the drop's own `Hlc` (ADR-236: a tie is the drop's). Not judged by
-    /// last-writer-wins, which would read the drop's stamp as older than such a change
-    /// and keep it on this member alone. Only ever turns a configuration off.
+    /// drop's in the drop's own `Hlc` (ADR-236: a tie is the drop's). Judged by
+    /// last-writer-wins strictly: a configuration at that stamp is turned off (the drop's
+    /// stamp alone would read as older than such a change and keep it on this member
+    /// alone), and one changed above it since the sweep read it is kept. Only ever turns
+    /// a configuration off.
     Swept(kimmy_core::Stamp),
 }
 
@@ -449,13 +451,18 @@ impl crate::Engine {
             }
             #[cfg(test)]
             crate::sync::race_hooks::reach(crate::sync::race_hooks::Race::VectorRemoval);
-            // Last writer wins, on the stamp (ADR-226), as for a configuration; but
-            // not for a sweep's turning off a configuration of the life before.
-            if !matches!(by, Configured::Swept(_))
-                && by
-                    .stamp()
-                    .is_some_and(|incoming| meta.vector_changed.is_some_and(|c| c >= incoming))
-            {
+            // Last writer wins, on the stamp (ADR-226), as for a configuration. A sweep's
+            // turning off a configuration of the life before is judged strictly: the
+            // configuration at the swept stamp itself (a change in the drop's own `Hlc`,
+            // passed at its own stamp) is the drop's and goes, and one changed above it
+            // since the sweep read it (a client's, or a replicated change stamped after
+            // the drop, landing before the sweep takes the writer) is the newer life's
+            // and stays, as it does on every other member.
+            let swept = matches!(by, Configured::Swept(_));
+            if by.stamp().is_some_and(|incoming| {
+                meta.vector_changed
+                    .is_some_and(|c| if swept { c > incoming } else { c >= incoming })
+            }) {
                 return Ok(VectorsOff { disabled: false, dropped_vectors: false });
             }
             // Already off. A **local** call is still a change: it is stamped and logged,
