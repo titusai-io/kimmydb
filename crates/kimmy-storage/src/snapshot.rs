@@ -769,7 +769,9 @@ impl Engine {
             // A definition the tombstone here makes history is not restored
             // (`restore_collection`'s rule), so it waits on nothing.
             if let Some(dropped) = self.collection_dropped_at(id)?
-                && state.created.is_none_or(|created| created <= dropped.hlc)
+                && state
+                    .created
+                    .is_none_or(|created| crate::sync::creation_is_history(created, dropped.hlc))
             {
                 continue;
             }
@@ -1681,7 +1683,9 @@ impl Engine {
             // path, where a resurrection cannot be undone.
             let id = CollectionId::derive(&state.db, &state.name);
             if let Some(dropped) = self.collection_dropped_at(id)?
-                && state.created.is_none_or(|created| created <= dropped.hlc)
+                && state
+                    .created
+                    .is_none_or(|created| crate::sync::creation_is_history(created, dropped.hlc))
             {
                 debug!(
                     db = %state.db,
@@ -1724,8 +1728,11 @@ impl Engine {
             #[cfg(test)]
             crate::sync::race_hooks::reach(crate::sync::race_hooks::Race::Restore);
             // The tombstone rule above, judged again under the writer.
-            let history =
-                |dropped: Stamp| state.created.is_none_or(|created| created <= dropped.hlc);
+            let history = |dropped: Stamp| {
+                state
+                    .created
+                    .is_none_or(|created| crate::sync::creation_is_history(created, dropped.hlc))
+            };
             // A re-dated life arrives with the creation it was re-dated from, and
             // is created with it in the one transaction, so that a database's
             // drop this node learns of after this page buries it as it buries
@@ -3854,10 +3861,13 @@ mod tests {
     }
 
     /// A collection standing at exactly its own incarnation floor, which is
-    /// what a create that beat a same-millisecond drop on the node id leaves:
-    /// `apply_ddl`'s creation rule compares `Stamp` strictly, so the create is
-    /// not history and is applied, taking `created` from its origin and the
-    /// floor from the tombstone that survived it. Both are the same `Hlc`.
+    /// what a create that beat a same-millisecond drop on the node id left
+    /// before ADR-236: `apply_ddl`'s creation rule compared `Stamp` strictly, so
+    /// the create was not history and was applied, taking `created` from its
+    /// origin and the floor from the tombstone that survived it. Both are the
+    /// same `Hlc`. A tie is the drop's now (`sync::creation_is_history`), so a
+    /// store reaches this only from a build before it; the fixture applies the
+    /// create one tick later and writes the `created` such a build stored.
     ///
     /// Returned with the drop's stamp, which is the one a peer that applied
     /// the drop and never saw the create still answers a repair with, and
@@ -3879,7 +3889,18 @@ mod tests {
         let drop = OplogEntry { stamp: dropped, ..of(OpKind::DropCollection) };
 
         b.record_collection_drop(ca.id, dropped).unwrap();
-        b.apply_batch(&[OplogEntry { stamp: Stamp::new(tie, high), ..create }]).unwrap();
+        b.apply_batch(&[OplogEntry { stamp: Stamp::new(tie, high), ..create.clone() }]).unwrap();
+        assert!(
+            b.get_collection("shop", "orders").is_err(),
+            "a creation in the drop's own Hlc is history (ADR-236)"
+        );
+        b.apply_batch(&[OplogEntry { stamp: Stamp::new(tie.successor(), high), ..create }])
+            .unwrap();
+        let mut legacy = b.get_collection("shop", "orders").unwrap();
+        legacy.created = tie;
+        let txn = b.begin_write(crate::WriterHolder::Ddl).unwrap();
+        Engine::put_collection_meta(&txn, &legacy).unwrap();
+        txn.commit().unwrap();
 
         let current = b.get_collection("shop", "orders").unwrap();
         assert_eq!(current.created, tie, "the create was applied under its own origin stamp");

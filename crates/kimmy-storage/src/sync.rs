@@ -1599,6 +1599,28 @@ pub(crate) fn below_floor(standing: &CollectionMeta, stamp: Stamp) -> bool {
     standing.incarnation_floor.is_some_and(|floor| stamp.hlc <= floor)
 }
 
+/// Whether a collection's creation, stamped `created` at its origin, belongs to
+/// a life a drop stamped `dropped` ended: `created <= dropped`, on `Hlc` and not
+/// strict, so **a tie in one `Hlc` is the drop's** (ADR-236).
+///
+/// The one comparison of a creation against a collection drop, on every route:
+/// the replicated `CreateCollection` arm (before the writer and under it), a
+/// snapshot page's definition (`restore_collection`), a vector shadow created by
+/// a replicated configuration, and, as its complement, the drop's own rule
+/// ([`aims_at_a_previous_incarnation`]'s first clause). They used to disagree at
+/// a tie: the entry compared `Stamp`s strictly, so a creation minted in the
+/// drop's millisecond by a node sorting above the dropper's survived it on a
+/// member that had the drop first, while the creating member, getting the drop
+/// second, buried its life (`Hlc`, the drop not older than the creation), and a
+/// page refused it (`Hlc`, not strict). The tie is a creation concurrent with
+/// the drop within one millisecond; it goes to the drop everywhere, the
+/// database's rule (ADR-229 item 3) already reads it so, and the alternative,
+/// the creation's whole `Stamp` on the stored metadata and on the page, would
+/// need a field on both.
+pub(crate) fn creation_is_history(created: Hlc, dropped: Hlc) -> bool {
+    created <= dropped
+}
+
 /// Whether a drop stamped `dropped` is aimed at a life of `current` that has
 /// already ended, rather than at the collection standing here now.
 ///
@@ -1619,18 +1641,21 @@ pub(crate) fn below_floor(standing: &CollectionMeta, stamp: Stamp) -> bool {
 /// Two clauses, and both are needed:
 ///
 /// - It **predates the create** that produced this incarnation, origin stamps
-///   on both sides.
+///   on both sides: the complement of [`creation_is_history`], so a drop in the
+///   creation's own `Hlc` is aimed at it, as the creation would be history
+///   behind the drop had it arrived second.
 /// - It is **at or before that incarnation's floor**, which is the drop it was
 ///   created after. Not redundant with the first, because `created` and the
-///   floor can be the same `Hlc`: `apply_ddl`'s creation rule compares `Stamp`
-///   strictly, so a create minted at `(H, node)` by a node sorting above the
-///   node that stamped a drop at `(H, other)` is not history and is applied —
-///   with `created = H` from the origin and `floor = H` from the surviving
-///   tombstone. The drop that produced that floor then arrives again, as
-///   overlapping ranges and re-planned repairs both deliver it, and only this
-///   clause turns it away.
+///   floor can be the same `Hlc` in a store written before ADR-236: the
+///   creation rule compared `Stamp` strictly then, so a create minted at
+///   `(H, node)` by a node sorting above the node that stamped a drop at
+///   `(H, other)` was applied with `created = H` from the origin and
+///   `floor = H` from the surviving tombstone. The drop that produced that
+///   floor then arrives again, as overlapping ranges and re-planned repairs
+///   both deliver it, and only this clause turns it away. It is also the
+///   clause a life re-dated above a drop is turned away by (ADR-231).
 pub(crate) fn aims_at_a_previous_incarnation(current: &CollectionMeta, dropped: Hlc) -> bool {
-    let predates_create = dropped < current.created;
+    let predates_create = !creation_is_history(current.created, dropped);
     let at_or_before_floor = current.incarnation_floor.is_some_and(|floor| dropped <= floor);
     predates_create || at_or_before_floor
 }
@@ -2137,9 +2162,10 @@ impl Engine {
 
                 // A creation older than the drop that removed it is history,
                 // not an instruction. Without this a peer partitioned across
-                // the drop would recreate the collection on rejoining.
+                // the drop would recreate the collection on rejoining. A tie on
+                // the `Hlc` is the drop's (`creation_is_history`, ADR-236).
                 if let Some(dropped_at) = self.collection_dropped_at(entry.collection)?
-                    && entry.stamp < dropped_at
+                    && creation_is_history(entry.stamp.hlc, dropped_at.hlc)
                 {
                     debug!(
                         db = %target.db,
@@ -2175,7 +2201,7 @@ impl Engine {
                             &target.name,
                             false,
                             Some(entry.stamp.hlc),
-                            &|dropped_at| entry.stamp < dropped_at,
+                            &|dropped_at| creation_is_history(entry.stamp.hlc, dropped_at.hlc),
                         ) {
                             Ok(Some(_)) => {
                                 debug!(db = %target.db, collection = %target.name, "created a replicated collection");

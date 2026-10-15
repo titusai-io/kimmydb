@@ -1156,9 +1156,12 @@ async fn a_stream_of_a_dropped_collection_starts_after_its_drop() {
     );
 }
 
-/// A creation stamped at the tombstone's own `Hlc` (the node breaks the tie in
-/// its favour) is placed by the tombstone's stamp like any other life that began
-/// after it: the replay starts at the new life.
+/// A creation stamped at the tombstone's own `Hlc` (the node broke the tie in
+/// its favour, which a build before ADR-236 allowed, and a store it wrote still
+/// holds) is placed by the tombstone's stamp like any other life that began
+/// after it: the replay starts at the new life. A tie is the drop's now, so the
+/// creation is applied one tick later and the stored `created` written back to
+/// the tie, the state such a build left.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_creation_stamped_at_the_drops_hlc_is_placed_by_the_tombstones_stamp() {
     let (e, _d) = engine();
@@ -1184,13 +1187,18 @@ async fn a_creation_stamped_at_the_drops_hlc_is_placed_by_the_tombstones_stamp()
     }
     // What the drop held is the purger's before the name can be made again.
     e.finish_purges_now().unwrap();
-    for entry in [
-        // The same `Hlc` as the drop, from a node that sorts above it: not history.
-        create_entry("shop", "x", stamp_of(5_000, 2)),
-        insert(stamp_of(5_100, 2), "new"),
-    ] {
+    // The same `Hlc` as the drop, from a node that sorts above it: history (ADR-236).
+    e.apply_batch(&[create_entry("shop", "x", stamp_of(5_000, 2))]).unwrap();
+    assert!(e.get_collection("shop", "x").is_err(), "a tie is the drop's");
+    for entry in [create_entry("shop", "x", stamp_of(5_001, 2)), insert(stamp_of(5_100, 2), "new")]
+    {
         e.apply_batch(std::slice::from_ref(&entry)).unwrap();
     }
+    let mut legacy = e.get_collection("shop", "x").unwrap();
+    legacy.created = Hlc::new(5_000, 0);
+    let txn = e.begin_write(crate::WriterHolder::Ddl).unwrap();
+    Engine::put_collection_meta(&txn, &legacy).unwrap();
+    txn.commit().unwrap();
     let live = e.get_collection("shop", "x").unwrap();
     assert_eq!(live.created, Hlc::new(5_000, 0), "premise: the creation is at the tombstone's Hlc");
     let from_start = WatchOptions { resume_after: None, start_at: Some(Hlc::ZERO) };

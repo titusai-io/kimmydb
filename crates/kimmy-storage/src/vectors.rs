@@ -256,7 +256,7 @@ impl crate::Engine {
                     &shadow,
                     false,
                     Some(stamp.hlc),
-                    &|dropped| stamp < dropped,
+                    &|dropped| crate::sync::creation_is_history(stamp.hlc, dropped.hlc),
                     || stamp,
                 )),
                 Configured::FromSnapshot(_) => None,

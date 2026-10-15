@@ -2330,16 +2330,18 @@ fn finding_f1_an_ignored_drop_from_a_page_records_no_tombstone() {
 }
 
 /// F3. A drop and another member's creation of the name in one `Hlc`: the creation's
-/// stamp sorts above the drop's, so a member that has the drop first creates the life;
-/// the member that made the creation takes the drop as aimed at its life (`Hlc`, not
-/// `Stamp`) and buries it. A write into the life then never reaches that member.
+/// stamp sorts above the drop's, so a member that has the drop first created the life;
+/// the member that made the creation took the drop as aimed at its life (`Hlc`, not
+/// `Stamp`) and buried it, and a write into the life then never reached that member.
+/// Ruled (ADR-236): a tie in one `Hlc` is the drop's on every route, so the creation is
+/// history everywhere, nobody holds the life, and the write finds no collection.
 #[test]
 fn finding_f3_a_drop_and_a_creation_in_one_hlc() {
     finding(
         "F3",
         "B.create(orders)@110; C.create(orders)@190; B.drop(orders)@190; A<-B entries; \
          A<-C entries; A.write(orders/1)@300",
-        &[(ORDERS, Some(&[1]))],
+        &[(ORDERS, None)],
     );
 }
 
