@@ -27715,17 +27715,21 @@ close the cases it can prove safe, leave the rest to the operator in words, and 
    its active and queued repairs as transient. **The catching-up marker F18 can leave standing (ADR-236: a page that
    withholds a later definition of a life it refuses) holds both repairs too**, on that member and on every peer
    repairing from it, for as long as the marker stands: within retention it clears once the stop clears, past it it
-   lasts for good (the F7/B1 wedge), and so does the hold. **One way only runs the other way: a compared-equal cut digest clears a
+   lasts for good (the F7/B1 wedge), and so does the hold. **One way only runs the other way: a compared-equal cut digest quiets a
    suspended count finding.** A count finding whose latest probe the gate deferred is *suspended* (ADR-236): confirmed
    for the gauge, planning nothing. While this member takes writes a peer that trails it and moves defers every probe,
    so the finding, and `kimmy_sync_divergent_collections` with it, would stand for as long as the writes go on after
    the two hold the same documents (in the storm of the review, the gauge read 2 for the rest of the run, with the
    digests of both collections comparing equal on every contact). `DivergenceTracker::observe_digest(.., equal)` now
-   clears a suspended finding of the **same peer and collection**: it leaves the confirmed set, the pending mark and the
-   suspension. Nothing else: not a finding the count probe itself last compared (that probe is its own evidence and
-   only a compared count probe clears it), not another pair, not a digest the contact did not compare (silence is not
-   reconciliation), and never a plan: a digest mismatch confirms no count finding and a digest finding plans a digest
-   repair only. The separation this point states is kept; the digest only takes a finding down.
+   **quiets** a suspended finding of the **same peer and collection**: it leaves the confirmed set and the gauge and
+   plans nothing, but stays *reported* (`reported_against`), so `retain_repaired` keeps the cooldown of the repair it
+   planned, and a peer that stops and moves in turn is still repaired at most once per `REPAIR_COOLDOWN_ROUNDS`
+   contacts (ADR-236 item 10); clearing the finding outright forgot the cooldown and repaired such a peer at every stop
+   (26 repairs in 130 contacts, review rrD M1). The next compared count probe decides the pair: a match clears it, a
+   mismatch confirms it again. Nothing else is quieted: not a finding the count probe itself last compared (that probe is
+   its own evidence), not another pair, not a digest the contact did not compare (silence is not reconciliation), and
+   never a plan: a digest mismatch confirms no count finding and a digest finding plans a digest repair only. The
+   separation this point states is kept; the digest only takes a finding off the gauge.
 3. **The young-stamp rule rests on a persisted collected-through horizon.** A lost insert (an insert this member never
    received) and a deleted document whose tombstone was collected look the same to a member that holds nothing for the
    id. A row is written only if its stamp is **newer than every tombstone cutoff either member of the pair has
