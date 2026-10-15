@@ -27365,6 +27365,27 @@ stamps (its YS1), and F17 from a storm test of the count half (a loop that repla
    vector first, so a pull cut short while the sender held the life, and resumed after the sender buried it, is
    answered by the pages that follow (from the review of the second cut; it waited for a fresh pull after the repair
    cooldown). Not from every page: a resumed page from a sender that holds a life carries no definition either.
+   **And by the receiver's own tombstone retention, past the retention contract (from the review of the second
+   cut).** The stop stands while the sender holds a life the receiver refuses, that is, until the sender hears the
+   drop. Under the contract (no partition as long as `storage.tombstone_retention_secs`, which is at least the oplog
+   retention) it does, by the time the drop is as old as tombstone retention, plus a retention pass and the clocks'
+   skew, and the receiver's next scoped pull, within a repair cooldown, brings the life. Past the contract the sender may never hear
+   it: a member collected the drop before the sender witnessed it, and granted the sender coverage past it. The
+   receiver's own tombstone of that drop, which is what the stop is judged by (`drop_a_definition_is_judged_by`), has
+   the same stamp and so expires at the same age on the receiver's clock: its retention pass collects it (its
+   database's tombstone with it) about one pass, plus the skew, after the member that collected first. From then the
+   definition names a collection the receiver has no record of, which still stops, and the scoped page installs the
+   sender's life with the definition, nothing refusing it now: ADR-085's past-retention outcome, the members holding
+   the life the lost drop ended. So the stop outlasts the drop's retention by about a retention pass, the skew and a
+   repair cooldown, and no rule of its own is needed. A window on the definition's stamp against the receiver's clock
+   would only ever be reached after that tombstone had expired. **The exception is collection disabled**
+   (`storage.gc_interval_secs = 0`) on a member while another member collects: that member keeps the tombstone, and
+   a drop some member collected before every member heard it stops it for good at a later definition from a member
+   that never heard it, with nothing behind that entry in that peer's window reaching it by entries.
+   `unknown_collection` climbing on it is the signal (`operations.md`). The convergence model's age-out collects on
+   one member; at quiescence every member collects at the same time, as their own passes would, and the generated
+   AgedOut seed 6883 that the model had reported as a permanent stop converges
+   (`row_a_later_life_stop_past_retention_clears_once_every_member_collects`).
    **A whole page grants no later definition of a life the receiver refuses (F18, found by a generated seed outside
    the first runs' range).** A whole page carrying such a life refused its definitions with it, those made after the
    drop too, and granted the coverage of their entries; the receiver's own whole pages then granted that coverage on
