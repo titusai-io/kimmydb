@@ -779,7 +779,7 @@ mod tests {
                 Some(120),
                 None,
                 crate::index::CreateOrigin::Replicated { created: Some(later), logged: None },
-                &|_, _| false,
+                &|_, _| Ok(false),
             )
             .unwrap();
         let coll = engine.get_collection("app", "sessions").unwrap();

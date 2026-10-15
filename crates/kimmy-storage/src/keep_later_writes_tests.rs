@@ -6,7 +6,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use bson::doc;
-use kimmy_core::{CollectionId, DocId, Hlc, IndexField, VectorRecord};
+use kimmy_core::{CollectionId, DocId, Hlc, IndexField, Stamp, VectorRecord};
 
 use crate::late_drop::hooks;
 use crate::live_count::test_support::assert_counts_exact;
@@ -346,6 +346,163 @@ fn a_whole_page_brings_the_definitions_its_drop_keeps_into_the_newer_life() {
         Vec::<i64>::new(),
         "the life before's document stays out"
     );
+}
+
+/// F15 (ADR-236). A drop that reaches a life created before it, holding a write after it,
+/// re-dates the life, sweeps the definitions of the life before, then its records a chunk
+/// at a time, and takes the floor in the last chunk. A `CreateIndex` of the life before
+/// that arrives between two chunks (a re-served window, a count-half replay) was judged by
+/// the floor alone, which was not there yet: built, and kept once the floor landed over it,
+/// an index every other member refused. It is judged by the drop's tombstone too.
+fn a_life_kept_by_a_drop_with_the_old_lifes_index_arriving_between_two_chunks(
+    arrives: impl FnOnce(&Engine, &[kimmy_core::OplogEntry], &Engine) + 'static,
+) -> (Engine, Engine, Engine, Stamp, [tempfile::TempDir; 3]) {
+    let (a, da) = engine();
+    let (d, dd) = engine();
+    let (x, dx) = engine();
+    let on_a = a.create_collection("shop", "orders").unwrap();
+    a.insert(&on_a, doc! { "_id": 1i64 }).unwrap();
+    pull(&d, &a);
+    later();
+    a.create_index("shop", "orders", vec![IndexField::ascending("v")], false, Some("old_i".into()))
+        .unwrap();
+    later();
+    // More than a chunk of the life before, so the sweep takes two.
+    let docs: Vec<_> = (1_000..2_400i64).map(|i| doc! { "_id": i }).collect();
+    a.insert_many(&on_a, docs).unwrap();
+    pull(&x, &a);
+    let entries = a.entries_for_peer(Hlc::ZERO, 10_000, WalkScope::Background).unwrap().entries;
+    let create: Vec<_> =
+        entries.iter().filter(|e| e.kind == kimmy_core::OpKind::CreateIndex).cloned().collect();
+    let rest: Vec<_> =
+        entries.iter().filter(|e| e.kind != kimmy_core::OpKind::CreateIndex).cloned().collect();
+    // D holds the life before without its index.
+    d.apply_batch(&rest).unwrap();
+    later();
+    assert!(a.drop_collection("shop", "orders").unwrap());
+    let dropped = a.collection_dropped_at(on_a.id).unwrap().expect("the drop's tombstone");
+    later();
+    // D makes an index after the drop, so the drop keeps its life.
+    d.create_index("shop", "orders", vec![IndexField::ascending("k")], false, Some("k_1".into()))
+        .unwrap();
+    let d = Arc::new(d);
+    let x = Arc::new(x);
+    let (on_d, from_x) = (Arc::clone(&d), Arc::clone(&x));
+    hooks::run_after_the_next_chunk(move || arrives(&on_d, &create, &from_x));
+    let start = d.version_vector().unwrap().behind(&a.version_vector().unwrap()).unwrap();
+    let window = a.entries_for_peer(start, 10_000, WalkScope::Background).unwrap().entries;
+    d.apply_batch(&window).unwrap();
+    let d = Arc::try_unwrap(d).ok().expect("the hook ran and let go");
+    let x = Arc::try_unwrap(x).ok().expect("the hook ran and let go");
+    (a, d, x, dropped, [da, dd, dx])
+}
+
+fn indexes_of_the_life_before(e: &Engine, dropped: Stamp) -> Vec<String> {
+    let kept = e.get_collection("shop", "orders").unwrap();
+    assert_eq!(kept.incarnation_floor, Some(dropped.hlc), "premise: the sweep finished");
+    kept.indexes
+        .iter()
+        .filter(|i| i.created.is_some_and(|c| c.hlc <= dropped.hlc))
+        .map(|i| i.name.clone())
+        .collect()
+}
+
+#[test]
+fn a_replicated_index_of_the_life_before_between_two_sweep_chunks_is_history() {
+    let (_a, d, _x, dropped, _dirs) =
+        a_life_kept_by_a_drop_with_the_old_lifes_index_arriving_between_two_chunks(
+            |d, create, _| {
+                d.apply_batch(create).unwrap();
+            },
+        );
+    assert_eq!(indexes_of_the_life_before(&d, dropped), Vec::<String>::new());
+    let names: Vec<_> =
+        d.get_collection("shop", "orders").unwrap().indexes.into_iter().map(|i| i.name).collect();
+    assert_eq!(names, vec!["k_1".to_string()], "the life's own index stands");
+}
+
+/// The same by a page: X, still holding the life before with its index, serves D a whole
+/// page between two chunks of D's sweep.
+#[test]
+fn a_pages_index_of_the_life_before_between_two_sweep_chunks_is_history() {
+    let (_a, d, _x, dropped, _dirs) =
+        a_life_kept_by_a_drop_with_the_old_lifes_index_arriving_between_two_chunks(|d, _, x| {
+            let page = x.snapshot_page(None, None).unwrap();
+            assert!(
+                page.collections.iter().any(|c| c.indexes.iter().any(|i| i.name == "old_i")),
+                "premise: the page carries the index"
+            );
+            let mut progress = SnapshotProgress::whole_database();
+            d.apply_snapshot_page(x.node_id(), &mut progress, &page).unwrap();
+        });
+    assert_eq!(indexes_of_the_life_before(&d, dropped), Vec::<String>::new());
+}
+
+/// A definition in the drop's own `Hlc`, from a node above the dropper's, arriving in the
+/// same window, is the drop's too (ADR-236: a tie is the drop's).
+#[test]
+fn a_replicated_index_in_the_drops_hlc_between_two_sweep_chunks_is_history() {
+    let (_a, d, _x, dropped, _dirs) =
+        a_life_kept_by_a_drop_with_the_old_lifes_index_arriving_between_two_chunks(
+            |d, create, _| {
+                let held = d.collection_dropped_at(CollectionId::derive("shop", "orders"));
+                let dropped = held.unwrap().expect("the tombstone is recorded first");
+                let mut tied = create[0].clone();
+                tied.stamp = Stamp::new(dropped.hlc, kimmy_core::NodeId::from_bytes([0xff; 16]));
+                d.apply_batch(std::slice::from_ref(&tied)).unwrap();
+            },
+        );
+    assert_eq!(indexes_of_the_life_before(&d, dropped), Vec::<String>::new());
+    let names: Vec<_> =
+        d.get_collection("shop", "orders").unwrap().indexes.into_iter().map(|i| i.name).collect();
+    assert_eq!(names, vec!["k_1".to_string()], "only the life's own index stands");
+}
+
+/// The same window for a vector configuration of the life before: judged by the drop's
+/// tombstone, not by the floor alone (ADR-236).
+#[test]
+fn a_replicated_vector_configuration_of_the_life_before_between_two_sweep_chunks_is_history() {
+    let (a, _da) = engine();
+    let (d, _dd) = engine();
+    let on_a = a.create_collection("shop", "orders").unwrap();
+    a.insert(&on_a, doc! { "_id": 1i64 }).unwrap();
+    pull(&d, &a);
+    later();
+    a.configure_vectors("shop", "orders", byo_config()).unwrap();
+    later();
+    let docs: Vec<_> = (1_000..2_400i64).map(|i| doc! { "_id": i }).collect();
+    a.insert_many(&on_a, docs).unwrap();
+    let entries = a.entries_for_peer(Hlc::ZERO, 10_000, WalkScope::Background).unwrap().entries;
+    let configure: Vec<_> = entries
+        .iter()
+        .filter(|e| e.kind == kimmy_core::OpKind::ConfigureVectors)
+        .cloned()
+        .collect();
+    assert_eq!(configure.len(), 1, "premise");
+    let rest: Vec<_> = entries
+        .iter()
+        .filter(|e| e.kind != kimmy_core::OpKind::ConfigureVectors)
+        .cloned()
+        .collect();
+    d.apply_batch(&rest).unwrap();
+    assert!(d.get_collection("shop", "orders").unwrap().vector.is_none(), "premise: withheld");
+    later();
+    assert!(a.drop_collection("shop", "orders").unwrap());
+    let dropped = a.collection_dropped_at(on_a.id).unwrap().expect("the drop's tombstone");
+    later();
+    d.create_index("shop", "orders", vec![IndexField::ascending("k")], false, Some("k_1".into()))
+        .unwrap();
+    let d = Arc::new(d);
+    let on_d = Arc::clone(&d);
+    hooks::run_after_the_next_chunk(move || {
+        on_d.apply_batch(&configure).unwrap();
+    });
+    let start = d.version_vector().unwrap().behind(&a.version_vector().unwrap()).unwrap();
+    let window = a.entries_for_peer(start, 10_000, WalkScope::Background).unwrap().entries;
+    d.apply_batch(&window).unwrap();
+    let kept = d.get_collection("shop", "orders").unwrap();
+    assert_eq!(kept.incarnation_floor, Some(dropped.hlc), "premise: the sweep finished");
+    assert!(kept.vector.is_none(), "the life before's configuration: {:?}", kept.vector_changed);
 }
 
 /// An explicit collection drop that reaches a member in a whole-database page

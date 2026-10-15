@@ -1599,6 +1599,40 @@ pub(crate) fn below_floor(standing: &CollectionMeta, stamp: Stamp) -> bool {
     standing.incarnation_floor.is_some_and(|floor| stamp.hlc <= floor)
 }
 
+impl Engine {
+    /// Whether a definition change stamped `stamp` (an index's creation, a vector
+    /// configuration) belongs to a life of `standing`'s collection that a drop has
+    /// ended: at or below its floor ([`below_floor`]), **or at or before the drop
+    /// tombstone of the collection, or of its database, that this node holds** (`Hlc`,
+    /// not strict: a tie is the drop's, ADR-236).
+    ///
+    /// **The one rule a definition is judged by on every route**: the replicated
+    /// `CreateIndex` and `ConfigureVectors` arms and a snapshot page's restore call it,
+    /// under the writer where they decide, and a definition repair should call it too.
+    /// The floor alone has a window: a drop that reaches a life created before it, or a
+    /// newer life that took in the one before's definitions, records the tombstone
+    /// first, sweeps the old life's definitions, then its records a chunk at a time, and
+    /// takes the floor in the last chunk. A definition of the ended life that arrived
+    /// between two chunks (a re-served window, a count-half replay, a page) was judged
+    /// live, built, and kept once the floor landed over it: a definition every other
+    /// member refused, for good. The tombstone closes the window and changes nothing
+    /// outside it: every life standing here began after the tombstones it holds (a drop
+    /// aimed at it re-dates or buries it), so every definition it legitimately carries is
+    /// stamped above them.
+    pub(crate) fn definition_of_an_ended_life(
+        &self,
+        standing: &CollectionMeta,
+        stamp: Stamp,
+    ) -> Result<bool> {
+        if below_floor(standing, stamp) {
+            return Ok(true);
+        }
+        let drops =
+            [self.collection_dropped_at(standing.id)?, self.database_dropped_at(&standing.db)?];
+        Ok(drops.into_iter().flatten().any(|dropped| stamp.hlc <= dropped.hlc))
+    }
+}
+
 /// Whether a definition change for a collection this node does not hold, under a
 /// drop's tombstone `dropped` (the later of the collection's and its database's,
 /// `Engine::drop_a_definition_is_judged_by`), belongs to a life of the name this node
@@ -2643,7 +2677,7 @@ impl Engine {
                         &target.collection,
                         config,
                         crate::vectors::Configured::FromEntry(entry.stamp),
-                        &|standing| below_floor(standing, entry.stamp),
+                        &|standing| self.definition_of_an_ended_life(standing, entry.stamp),
                     ))?
                     .map(|_| ()),
                     // Never `drop_vectors`: discarding a peer's stored
@@ -2654,7 +2688,7 @@ impl Engine {
                         &target.collection,
                         false,
                         crate::vectors::Configured::FromEntry(entry.stamp),
-                        &|standing| below_floor(standing, entry.stamp),
+                        &|standing| self.definition_of_an_ended_life(standing, entry.stamp),
                     ))?
                     .map(|_| ()),
                 };
@@ -2851,7 +2885,7 @@ impl Engine {
         // stands is history too: a burial writes the collection's tombstone,
         // not the index's, so the index tombstone alone let a dropped life's
         // index onto the recreation.
-        if below_floor(&meta, stamp) {
+        if self.definition_of_an_ended_life(&meta, stamp)? {
             debug!(
                 db = %target.db,
                 collection = %target.collection,
@@ -2895,7 +2929,8 @@ impl Engine {
             target.index.partial_filter.clone(),
             crate::index::CreateOrigin::Replicated { created: Some(created), logged: Some(entry) },
             &|standing, dropped| {
-                below_floor(standing, stamp) || dropped.is_some_and(|dropped_at| stamp < dropped_at)
+                Ok(self.definition_of_an_ended_life(standing, stamp)?
+                    || dropped.is_some_and(|dropped_at| stamp < dropped_at))
             },
         )?;
         match created {
@@ -4475,7 +4510,7 @@ mod tests {
                 None,
                 None,
                 crate::index::CreateOrigin::Replicated { created: Some(entry.stamp), logged: None },
-                &|_, _| false,
+                &|_, _| Ok(false),
             )
             .unwrap();
         assert_eq!(held_bytes(engine, &entry.stamp), None, "premise: no entry");
@@ -5766,7 +5801,7 @@ mod tests {
                     None,
                     nan(),
                     origin,
-                    &|_, _| false,
+                    &|_, _| Ok(false),
                 )
                 .unwrap();
             match created {
@@ -8236,7 +8271,7 @@ mod tests {
                     None,
                     None,
                     crate::index::CreateOrigin::Replicated { created: Some(later), logged: None },
-                    &|_, _| false,
+                    &|_, _| Ok(false),
                 )
             },
         );

@@ -322,7 +322,7 @@ impl Engine {
                 name,
                 false,
                 crate::vectors::Configured::FromEntry(dropped),
-                &|_| false,
+                &|_| Ok(false),
             )?;
         }
         Ok(())

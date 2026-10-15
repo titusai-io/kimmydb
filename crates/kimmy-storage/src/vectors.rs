@@ -121,7 +121,7 @@ impl crate::Engine {
         collection: &str,
         config: VectorConfig,
     ) -> Result<CollectionMeta> {
-        self.configure_vectors_inner(db, collection, config, Configured::Locally, &|_| false)
+        self.configure_vectors_inner(db, collection, config, Configured::Locally, &|_| Ok(false))
     }
 
     /// `log = false` when applying a replicated configuration. See
@@ -132,7 +132,7 @@ impl crate::Engine {
         collection: &str,
         config: VectorConfig,
         by: Configured,
-        history: &dyn Fn(&CollectionMeta) -> bool,
+        history: &dyn Fn(&CollectionMeta) -> Result<bool>,
     ) -> Result<CollectionMeta> {
         // **A loop, not a self-call.** Every retry passes the same arguments, so
         // a lost race is a `continue`. It was a self-call, which made an
@@ -156,18 +156,21 @@ impl crate::Engine {
 
             let mut meta = self.get_collection(db, collection)?;
             let read = meta.clone();
-            #[cfg(test)]
-            crate::sync::race_hooks::reach(crate::sync::race_hooks::Race::VectorConfiguration);
             // A configuration of a life of the collection that has since been
             // dropped and recreated here is history, and is not applied to the
             // life that stands. Judged on the definition read here, which the
-            // writer's `definition_is` below holds unchanged, and before the shadow
-            // is created, so history mints no shadow either.
-            if history(&meta) {
+            // writer's `definition_is` below holds unchanged, with the drop
+            // tombstones held as it is judged (`definition_of_an_ended_life`), and
+            // before the shadow is created, so history mints no shadow either. A
+            // drop that lands after the judgement changes the definition (a burial,
+            // a re-dating) or records a tombstone its own sweep then judges.
+            if history(&meta)? {
                 #[cfg(test)]
                 crate::sync::race_hooks::absorbed(crate::sync::race_hooks::Race::VectorHistory);
                 return Ok(meta);
             }
+            #[cfg(test)]
+            crate::sync::race_hooks::reach(crate::sync::race_hooks::Race::VectorConfiguration);
             // Last writer wins, on the stamp (ADR-226): a change at or below the one
             // standing here is the same change arriving again, or an older one
             // arriving late, and is not applied. An unstamped standing state reads as
@@ -365,7 +368,7 @@ impl crate::Engine {
     ) -> Result<VectorsOff> {
         let off =
             self.disable_vectors_inner(db, collection, drop_vectors, Configured::Locally, &|_| {
-                false
+                Ok(false)
             })?;
         if off.disabled || !drop_vectors {
             return Ok(off);
@@ -419,7 +422,7 @@ impl crate::Engine {
         collection: &str,
         drop_vectors: bool,
         by: Configured,
-        history: &dyn Fn(&CollectionMeta) -> bool,
+        history: &dyn Fn(&CollectionMeta) -> Result<bool>,
     ) -> Result<VectorsOff> {
         let log = matches!(by, Configured::Locally);
         // **A loop, not a self-call.** Every retry passes the same arguments, so
@@ -432,13 +435,13 @@ impl crate::Engine {
         for _ in 0..crate::Engine::MAX_DEFINITION_RETRIES {
             let mut meta = self.get_collection(db, collection)?;
             let read = meta.clone();
-            #[cfg(test)]
-            crate::sync::race_hooks::reach(crate::sync::race_hooks::Race::VectorRemoval);
             // As `configure_vectors_inner`: turning vectors off for a life that
             // has since been dropped and recreated here is history.
-            if history(&meta) {
+            if history(&meta)? {
                 return Ok(VectorsOff { disabled: false, dropped_vectors: false });
             }
+            #[cfg(test)]
+            crate::sync::race_hooks::reach(crate::sync::race_hooks::Race::VectorRemoval);
             // Last writer wins, on the stamp (ADR-226), as for a configuration.
             if by.stamp().is_some_and(|incoming| meta.vector_changed.is_some_and(|c| c >= incoming))
             {
