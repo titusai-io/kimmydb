@@ -2307,8 +2307,13 @@ impl Engine {
                     // records none, and withheld here it was never met past this
                     // member, whose vector names the creation's origin past it.
                     // A receiver holding the database's tombstone refuses it the
-                    // same way; one that does not yet takes the drop after it in
-                    // the same window, from the same member.
+                    // same way. One that does not yet may create the collection;
+                    // it buries it when the database's drop reaches it, which this
+                    // member serves after the creation if it holds the drop's
+                    // entry. A member that took the drop by a page holds only the
+                    // tombstone and serves no entry for it (pages never relay a
+                    // drop, as before), and the creator serves the creation
+                    // anyway: this relay adds a route, not that gap.
                     return self.append_replicated_ddl(entry);
                 }
 

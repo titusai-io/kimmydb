@@ -170,8 +170,16 @@ can come back holding only such writes. A 0.49.x member in a mixed cluster burie
 a collection with the write, and refuses the kept collection from a 0.50.0 member
 until it is upgraded; **a store rolled back to 0.49.x buries, at its next start, every
 collection 0.50.0 kept under a database drop, with the writes it kept**, so the members
-differ until they run one version. No table, schema, wire field, backup tag or entry
-kind changed.
+differ until they run one version. Two other differences outlast the roll. A creation
+in a drop's own millisecond that a 0.49.x member applied stays where it was applied
+(0.50.0 gives such a tie to the drop, and nothing repairs the life a 0.49.x member
+kept). And a 0.49.x member that buried a collection its database's drop covered,
+indexes and all, still serves an index or vector change stamped after the drop for as
+long as it retains the entry: a 0.50.0 member that lacks the collection stops at it
+once, and the 0.49.x member's snapshot of the collection, which holds nothing, lets it
+pass. No table, schema, wire field, backup tag or entry kind changed; a 0.50.0 member
+relays a drop it ignored and a creation its database's drop refused, as entries a
+0.49.x member reads and judges as it would the originals.
 
 **A member-at-a-time roll is not evidence that mixed versions work together.**
 The 0.28.0 roll took about 10 s from first member to last, the cluster was
