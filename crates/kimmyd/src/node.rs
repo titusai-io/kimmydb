@@ -814,6 +814,10 @@ async fn start_and_serve(
         options =
             options.force_rebuild("the previous run cannot be shown to have kept the digests");
     }
+    // The lab's loss of one replicated entry, armed from the environment (a build with the
+    // `lab-hooks` feature only).
+    #[cfg(feature = "lab-hooks")]
+    kimmy_storage::lab_hooks::arm_from_env();
     let engine = match Engine::open_with(&path, &options) {
         Ok(engine) => {
             // The open returns only after a forced rebuild has run to its end
@@ -2798,6 +2802,9 @@ async fn spawn_cluster(
                 // Nothing pushed: the gauge is computed from these when read.
                 on_lag: None,
                 lag_vectors: Some(lag_vectors),
+                divergence_repair: config.cluster.divergence_repair,
+                repair_max_documents: config.cluster.repair_max_documents,
+                repair_max_index_documents: config.cluster.repair_max_index_documents,
             },
         ),
     );

@@ -4023,3 +4023,286 @@ fn strip_ansi(line: &str) -> String {
     }
     out
 }
+
+// ---------------------------------------------------------------------------
+// The divergence repair, on real processes (repair design sections 15 and 6)
+// ---------------------------------------------------------------------------
+//
+// These need a member that loses one replicated entry, which only the `lab-hooks` build of
+// `kimmyd` can do (`KIMMY_TEST_DROP_APPLY`, absent from every shipped build: the release check is
+// `strings kimmyd | grep -c DROP_APPLY` reading 0). They are compiled only with that feature, so
+// the default harness run does not see them, and CI runs them as a step of their own:
+//
+// ```text
+// cargo test -p kimmyd --features lab-hooks --test cluster -- --ignored --test-threads=1 lab_hook_
+// ```
+
+/// Everything the three repair cases share: three members, B restarted with the hook set,
+/// the collection and its first documents written through A.
+#[cfg(feature = "lab-hooks")]
+async fn lab_hook_cluster(client: &reqwest::Client, hook: &str) -> (Node, Node, Node, String) {
+    let (a, mut b, c) = three_nodes(client).await;
+    eventually("gossip to form", || all_report(client, vec![&a, &b, &c], 2)).await;
+    // The restart must set the variable deliberately: a restart that keeps it re-arms it.
+    b.restart_with(&[("KIMMY_TEST_DROP_APPLY", hook)]);
+    b.wait_ready(client).await;
+    eventually("gossip to re-form", || all_report(client, vec![&a, &b, &c], 2)).await;
+    let token = a.login(client).await;
+    (a, b, c, token)
+}
+
+#[cfg(feature = "lab-hooks")]
+async fn lab_hook_scrape(client: &reqwest::Client, node: &Node, series: &str) -> u64 {
+    node.gauge(client, series).await.unwrap_or(0)
+}
+
+/// A document B holds as a number, or `None` while it does not hold it.
+#[cfg(feature = "lab-hooks")]
+async fn lab_hook_version(
+    client: &reqwest::Client,
+    node: &Node,
+    token: &str,
+    coll: &str,
+    id: i64,
+) -> Option<i64> {
+    let res = client
+        .get(node.url(&format!("/v1/db/shop/coll/{coll}/docs/{id}")))
+        .bearer_auth(token)
+        .send()
+        .await
+        .ok()?;
+    if res.status() != 200 {
+        return None;
+    }
+    let body: serde_json::Value = res.json().await.ok()?;
+    body["v"].as_i64().or_else(|| body["document"]["v"].as_i64())
+}
+
+/// B loses the replicated update of a document it holds: the counts agree, the cut digest finds
+/// it, and the document repair applies the newer row. Judged effective at the next compared
+/// digest, and the finding clears on every member.
+#[cfg(feature = "lab-hooks")]
+#[tokio::test]
+#[ignore = "boots a real three-node cluster; run with --ignored"]
+async fn lab_hook_a_lost_update_is_repaired_by_the_document_repair() {
+    let client = reqwest::Client::new();
+    // The third document entry applied to shop.lost on B: two inserts, then the replace.
+    let (a, b, c, token) = lab_hook_cluster(&client, "shop.lost:3").await;
+    client
+        .post(a.url("/v1/db/shop/collections"))
+        .bearer_auth(&token)
+        .json(&serde_json::json!({ "name": "lost" }))
+        .send()
+        .await
+        .unwrap();
+    for id in [1, 2] {
+        client
+            .post(a.url("/v1/db/shop/coll/lost/docs"))
+            .bearer_auth(&token)
+            .json(&serde_json::json!({ "_id": id, "v": 0 }))
+            .send()
+            .await
+            .unwrap();
+    }
+    let b_token = b.login(&client).await;
+    eventually("both documents to reach B", || {
+        let (client, b, b_token) = (&client, &b, &b_token);
+        async move {
+            lab_hook_version(client, b, b_token, "lost", 1).await.is_some()
+                && lab_hook_version(client, b, b_token, "lost", 2).await.is_some()
+        }
+    })
+    .await;
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    let put = client
+        .put(a.url("/v1/db/shop/coll/lost/docs/1"))
+        .bearer_auth(&token)
+        .json(&serde_json::json!({ "v": 1 }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(put.status(), 200, "{:?}", put.text().await);
+    eventually("the hook to lose the update on B", || {
+        let b = &b;
+        async move { b.log().contains("KIMMY_TEST_DROP_APPLY: lost a replicated entry") }
+    })
+    .await;
+
+    // The repair brings the update to B, and B's loop judged it effective.
+    let c_token = c.login(&client).await;
+    eventually("B to hold the update", || {
+        let (client, b, b_token) = (&client, &b, &b_token);
+        async move { lab_hook_version(client, b, b_token, "lost", 1).await == Some(1) }
+    })
+    .await;
+    assert_eq!(lab_hook_version(&client, &c, &c_token, "lost", 1).await, Some(1));
+    eventually("the repair to be judged effective and the finding to clear", || {
+        let (client, b) = (&client, &b);
+        async move {
+            lab_hook_scrape(
+                client,
+                b,
+                "kimmy_sync_digest_repair_judgements_total{result=\"effective\"}",
+            )
+            .await
+                >= 1
+                && b.gauge(client, "kimmy_sync_digest_divergent_collections").await == Some(0)
+        }
+    })
+    .await;
+    assert!(
+        lab_hook_scrape(&client, &b, "kimmy_sync_digest_repairs_total{outcome=\"applied\"}").await
+            >= 1
+    );
+    assert_eq!(b.gauge(&client, "kimmy_sync_divergence_repair_enabled").await, Some(1));
+    // And A and C, which saw the finding against B and cannot repair B's side, stop reporting it
+    // at their next compared digest.
+    eventually("A and C to stop reporting the finding", || {
+        let (client, a, c) = (&client, &a, &c);
+        async move {
+            a.gauge(client, "kimmy_sync_digest_divergent_collections").await == Some(0)
+                && c.gauge(client, "kimmy_sync_digest_divergent_collections").await == Some(0)
+        }
+    })
+    .await;
+}
+
+/// B loses the creation of a plain index: the definition digest finds it and the definition
+/// repair builds it, once, from the first page of A's snapshot.
+#[cfg(feature = "lab-hooks")]
+#[tokio::test]
+#[ignore = "boots a real three-node cluster; run with --ignored"]
+async fn lab_hook_a_lost_plain_index_is_built_by_the_definition_repair() {
+    let client = reqwest::Client::new();
+    let (a, b, _c, token) = lab_hook_cluster(&client, "shop.idx:1:create_index").await;
+    client
+        .post(a.url("/v1/db/shop/collections"))
+        .bearer_auth(&token)
+        .json(&serde_json::json!({ "name": "idx" }))
+        .send()
+        .await
+        .unwrap();
+    client
+        .post(a.url("/v1/db/shop/coll/idx/docs"))
+        .bearer_auth(&token)
+        .json(&serde_json::json!({ "_id": 1, "v": 3 }))
+        .send()
+        .await
+        .unwrap();
+    eventually("B to hold the collection", || {
+        let (client, b) = (&client, &b);
+        async move {
+            let token = b.login(client).await;
+            lab_hook_version(client, b, &token, "idx", 1).await.is_some()
+        }
+    })
+    .await;
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    let created = client
+        .post(a.url("/v1/db/shop/coll/idx/indexes"))
+        .bearer_auth(&token)
+        .json(&serde_json::json!({ "name": "by_v", "fields": [{ "path": "v" }] }))
+        .send()
+        .await
+        .unwrap();
+    assert!(created.status().is_success(), "{:?}", created.text().await);
+    eventually("the hook to lose the index on B", || {
+        let b = &b;
+        async move { b.log().contains("KIMMY_TEST_DROP_APPLY: lost a replicated entry") }
+    })
+    .await;
+    let b_token = b.login(&client).await;
+    eventually("B to build the index", || {
+        let (client, b, b_token) = (&client, &b, &b_token);
+        async move {
+            let Ok(res) =
+                client.get(b.url("/v1/db/shop/coll/idx/indexes")).bearer_auth(b_token).send().await
+            else {
+                return false;
+            };
+            let Ok(body) = res.json::<serde_json::Value>().await else {
+                return false;
+            };
+            body["indexes"].as_array().is_some_and(|i| i.iter().any(|i| i["name"] == "by_v"))
+        }
+    })
+    .await;
+    eventually("the repair to be judged effective", || {
+        let (client, b) = (&client, &b);
+        async move {
+            lab_hook_scrape(
+                client,
+                b,
+                "kimmy_sync_definition_repair_judgements_total{result=\"effective\"}",
+            )
+            .await
+                >= 1
+        }
+    })
+    .await;
+    assert_eq!(
+        lab_hook_scrape(
+            &client,
+            &b,
+            "kimmy_sync_definition_repair_indexes_total{result=\"built\"}"
+        )
+        .await,
+        1
+    );
+    assert_eq!(b.gauge(&client, "kimmy_sync_definition_divergent_collections").await, Some(0));
+}
+
+/// B loses the replicated insert of a document: either half repairs it (the count half's
+/// replay, or the document repair's young-stamp rule), and which one is recorded. The pass line
+/// is that B ends holding the document and no finding stands.
+#[cfg(feature = "lab-hooks")]
+#[tokio::test]
+#[ignore = "boots a real three-node cluster; run with --ignored"]
+async fn lab_hook_a_lost_insert_is_repaired_by_either_half() {
+    let client = reqwest::Client::new();
+    let (a, b, _c, token) = lab_hook_cluster(&client, "shop.ins:2:insert").await;
+    client
+        .post(a.url("/v1/db/shop/collections"))
+        .bearer_auth(&token)
+        .json(&serde_json::json!({ "name": "ins" }))
+        .send()
+        .await
+        .unwrap();
+    for id in [1, 2, 3] {
+        client
+            .post(a.url("/v1/db/shop/coll/ins/docs"))
+            .bearer_auth(&token)
+            .json(&serde_json::json!({ "_id": id, "v": id }))
+            .send()
+            .await
+            .unwrap();
+    }
+    eventually("the hook to lose the insert on B", || {
+        let b = &b;
+        async move { b.log().contains("KIMMY_TEST_DROP_APPLY: lost a replicated entry") }
+    })
+    .await;
+    let b_token = b.login(&client).await;
+    eventually("B to hold all three documents", || {
+        let (client, b, b_token) = (&client, &b, &b_token);
+        async move {
+            for id in [1, 2, 3] {
+                if lab_hook_version(client, b, b_token, "ins", id).await.is_none() {
+                    return false;
+                }
+            }
+            true
+        }
+    })
+    .await;
+    eventually("the finding to clear on B", || {
+        let (client, b) = (&client, &b);
+        async move { b.gauge(client, "kimmy_sync_divergent_collections").await == Some(0) }
+    })
+    .await;
+    let count_half = lab_hook_scrape(&client, &b, "kimmy_sync_repair_rounds_total").await;
+    let young =
+        lab_hook_scrape(&client, &b, "kimmy_sync_digest_repair_rows_total{result=\"created\"}")
+            .await;
+    eprintln!("lost insert repaired: count-half rounds {count_half}, young rows created {young}");
+}

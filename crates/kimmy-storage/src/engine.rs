@@ -1379,6 +1379,14 @@ impl Engine {
             // The violations table, with the others so a read never meets it
             // missing (ADR-200).
             let _ = txn.open_table(tables::UNIQUE_VIOLATIONS)?;
+            // The tombstone horizon's reset, in this commit and before the sidecar is
+            // brought to this build (design 13.1): a store the evidence cannot vouch
+            // for, or with no key, starts at this start's time, never lower than it was.
+            crate::tombstone_horizon::reset_at_open(
+                &txn,
+                cleared.horizon_is_untrusted(),
+                kimmy_core::Hlc::new(physical_now_ms(), 0),
+            )?;
         }
         txn.commit()?;
 
@@ -4860,6 +4868,21 @@ impl Engine {
             Some(stamp) => stamp,
             None => self.next_stamp_above(Some(Stamp::new(meta.created, self.node_id))),
         };
+        // The purge that follows removes every record of the life, and the life can hold a
+        // tombstone stamped **after** the drop (a delete of a write made after it): that is
+        // above the drop tombstone's floor, so nothing covers it, and a collected tombstone
+        // that raised no horizon lets the young-stamp rule write the deleted document back
+        // (repair design 13.1; the young-stamp model test's YS1). Raise the horizon to the
+        // highest stamp the life held, in this commit, when it is above the drop; a local drop
+        // mints above everything and raises nothing.
+        {
+            let rows = txn.open_table(tables::LIVE_DIGESTS)?;
+            let highest = crate::live_digest::kept_row(&rows, meta.id.0)?
+                .and_then(|row| row.maxw.values().max().copied());
+            if let Some(highest) = highest.filter(|highest| *highest > stamp.hlc) {
+                crate::tombstone_horizon::set_at_least_in_txn(txn, highest)?;
+            }
+        }
         let database_emptied = {
             let mut collections = txn.open_table(tables::COLLECTIONS)?;
             collections.remove((db, name))?;
@@ -7797,6 +7820,11 @@ mod tests {
         // A cache far smaller than the collection, so a walk reads the file.
         let engine = Arc::new(Engine::open_with_cache(&path, Some(64 * 1024)).unwrap());
         let coll = engine.get_collection("app", "c").unwrap();
+        // A write first, so the file has the room the armed one needs: a write that has to grow
+        // the file syncs for the new length before it commits, and an injected failure there
+        // is a failure before the commit, which is answered as a failure and not as unknown.
+        // Whether the file has room depends on where the last page of the store landed.
+        engine.insert(&coll, doc! {"_id": 99_998}).unwrap();
         let (reporting, reported) = std::sync::mpsc::channel::<()>();
         let (release, released) = std::sync::mpsc::channel::<()>();
         let released = parking_lot::Mutex::new(released);
@@ -8282,7 +8310,13 @@ mod clearing {
     fn rebuilding_the_arrival_index_does_not_grow_the_file() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("kimmy.redb");
-        let written = one_arrival_row_short(&path);
+        one_arrival_row_short(&path);
+        // A first rebuild settles the file: redb doubles it when it runs out of room, and
+        // whether a small clear runs out depends on where the last page of the store
+        // happened to land, which is not what this test is about. The rebuild measured is the
+        // second, from a file that has already had to hold the first.
+        drop(super::Engine::open(&path).unwrap());
+        let written = drop_the_last_arrival_row(&path);
         let before = file(&path);
 
         // Measured with the engine still open: redb hands the growth back
@@ -8314,6 +8348,12 @@ mod clearing {
             let docs: Vec<bson::Document> = (0..5_000i64).map(|i| doc! {"_id": i}).collect();
             engine.insert_many(&t, docs).unwrap();
         }
+        drop_the_last_arrival_row(path)
+    }
+
+    /// Remove the last row of the arrival index with raw redb, as a build that did not keep
+    /// it would have. Answers how many oplog entries the database holds.
+    fn drop_the_last_arrival_row(path: &std::path::Path) -> u64 {
         let db = redb::Database::create(path).unwrap();
         let txn = db.begin_write().unwrap();
         let written = {

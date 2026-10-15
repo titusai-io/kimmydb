@@ -123,6 +123,10 @@ pub fn sidecar_path(database: &Path) -> PathBuf {
     database.with_extension("format")
 }
 
+/// What `written_by` says in a sidecar written before the open for a store that had none:
+/// no build is called this, so a start that finds it resets the tombstone horizon.
+const UNKNOWN_BUILD: &str = "unknown";
+
 /// What was read before the open, and what it said.
 #[derive(Debug)]
 enum Prior {
@@ -743,10 +747,37 @@ impl Cleared {
             Prior::Sidecar(sidecar) => sidecar.schema,
             Prior::CleanNoSidecar { schema } => schema.unwrap_or(0),
         };
-        let wanted = self.stamp(schema);
+        // **`written_by` keeps the prior value** until the open's first commit has landed
+        // (`reconcile_after_open` names this build): it is the evidence the tombstone
+        // horizon's reset is decided from, and a kill between this write and that commit
+        // must leave it for the next start. A store with no prior sidecar is written as
+        // `unknown`, which no build is, so the next start also resets.
+        let mut wanted = self.stamp(schema);
+        wanted.written_by = match &self.prior {
+            Prior::Sidecar(sidecar) => sidecar.written_by.clone(),
+            _ => UNKNOWN_BUILD.to_string(),
+        };
         match &self.prior {
             Prior::Sidecar(sidecar) if *sidecar == wanted => None,
             _ => Some(wanted),
+        }
+    }
+
+    /// Whether the tombstone horizon this store carries cannot be trusted: it was last
+    /// written by another build (whose retention passes may have collected tombstones
+    /// without raising it), or by none that left a sidecar. Decided from the **prior**
+    /// sidecar, read before the open overwrites it (design 13.1).
+    pub(crate) fn horizon_is_untrusted(&self) -> bool {
+        match &self.prior {
+            // Another build's evidence, or a build whose retention passes do not raise the key
+            // whatever it calls itself: the 0.49 line writes the same `written_by` as a
+            // development build of the next release until the version is bumped, and a store
+            // that line collected from would otherwise read as this build's own.
+            Prior::Sidecar(sidecar) => {
+                sidecar.written_by != self.build.written_by
+                    || !keeps_the_tombstone_horizon(&sidecar.written_by)
+            }
+            Prior::Fresh | Prior::CleanNoSidecar { .. } | Prior::DirtyNoSidecar => true,
         }
     }
 
@@ -757,6 +788,19 @@ impl Cleared {
             redb_file_format: self.build.file_format,
             written_by: self.build.written_by.clone(),
         }
+    }
+}
+
+/// Whether a build that wrote a store (its `written_by`, the workspace version) maintains the
+/// collected-through horizon: 0.50 and later do, the 0.49 line and everything before it does
+/// not, and a string that is not a version is not trusted. The pre-release suffix is ignored:
+/// `0.50.0-dev` is a build of the release that introduced the key.
+pub(crate) fn keeps_the_tombstone_horizon(written_by: &str) -> bool {
+    let core = written_by.split(['-', '+']).next().unwrap_or(written_by);
+    let mut parts = core.split('.').map(str::parse::<u64>);
+    match (parts.next(), parts.next()) {
+        (Some(Ok(major)), Some(Ok(minor))) => (major, minor) >= (0, 50),
+        _ => false,
     }
 }
 
@@ -2250,5 +2294,46 @@ mod tests {
             Err(other) => panic!("refused with the wrong error: {other}"),
             Ok(_) => panic!("opened"),
         }
+    }
+
+    #[test]
+    fn only_a_0_50_build_or_later_keeps_the_tombstone_horizon() {
+        for version in ["0.49.0", "0.49.7", "0.48.0", "0.1.0", "unknown", "", "x.y.z", "0.x"] {
+            assert!(!keeps_the_tombstone_horizon(version), "{version:?}");
+        }
+        for version in ["0.50.0", "0.50.0-dev", "0.50.1", "0.51.0", "1.0.0", "0.50", "0.50.0+abc"] {
+            assert!(keeps_the_tombstone_horizon(version), "{version:?}");
+        }
+    }
+
+    /// The reset reads the version string as evidence, so the build that ships the key must
+    /// not call itself by the name of the release that does not keep it.
+    #[test]
+    fn this_build_is_not_called_by_the_name_of_a_release_that_does_not_keep_the_horizon() {
+        assert!(
+            keeps_the_tombstone_horizon(kimmy_core::build::VERSION),
+            "{} is a version of the line that does not maintain the collected-through horizon",
+            kimmy_core::build::VERSION
+        );
+    }
+
+    /// The reset must not trust a store a 0.49-line build wrote even when this build calls
+    /// itself by the same string (a development build before the version is bumped): that
+    /// line does not maintain the key, so equal strings prove nothing (review revA M1).
+    #[test]
+    fn a_store_written_by_the_0_49_line_is_untrusted_even_under_a_build_of_the_same_name() {
+        let (_dir, path) = a_store();
+        let mut sidecar = read_sidecar(&path).expect("a sidecar");
+        sidecar.written_by = "0.49.0".into();
+        write_sidecar(&path, &sidecar).unwrap();
+        let same_name = BuildVersions { written_by: "0.49.0".into(), ..BuildVersions::ours() };
+        let cleared = check_before_open_with(&path, &same_name).unwrap();
+        assert!(cleared.horizon_is_untrusted(), "a 0.49.0 store was trusted by a 0.49.0 build");
+        // The control: a build of the line that keeps the key trusts its own store.
+        sidecar.written_by = "0.50.0".into();
+        write_sidecar(&path, &sidecar).unwrap();
+        let ours = BuildVersions { written_by: "0.50.0".into(), ..BuildVersions::ours() };
+        let cleared = check_before_open_with(&path, &ours).unwrap();
+        assert!(!cleared.horizon_is_untrusted(), "a 0.50.0 store was not trusted by 0.50.0");
     }
 }

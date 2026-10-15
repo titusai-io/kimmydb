@@ -4574,6 +4574,9 @@ async fn a_confirmed_count_divergence_is_repaired_through_the_real_loop() {
         ReplicationConfig::new(vec![SeedSource::Static(vec![a.addr])], SECRET.into(), b.addr);
     config.sync_interval = Duration::from_millis(50);
     config.discovery_interval = Duration::from_millis(50);
+    // The count half's repair is what this test is about; the document repair would
+    // converge the same hole first.
+    config.divergence_repair = false;
     config.on_round = Some(Arc::new(move |report| {
         let _ = tx.send(report);
     }));
@@ -10258,5 +10261,288 @@ async fn a_fault_answering_the_definitions_costs_the_definitions_and_not_the_con
         ),
         "the next contact compares: {:?}",
         outcome.definitions
+    );
+}
+
+// ---------------------------------------------------------------------------
+// B3 repair: the loop plans, runs and judges the repairs of confirmed findings
+// ---------------------------------------------------------------------------
+
+/// Run B's replication loop against A until `done` holds of what it has reported, or fail
+/// with every report's totals. `configure` sets the loop up (the switch, the intervals).
+async fn repair_loop(
+    a: &Node,
+    b: &Node,
+    configure: impl FnOnce(&mut kimmy_cluster::ReplicationConfig),
+    mut done: impl FnMut(&kimmy_cluster::RoundReport, &kimmy_cluster::RepairCounts) -> bool,
+) -> (kimmy_cluster::RepairCounts, kimmy_cluster::RoundReport) {
+    use kimmy_cluster::{RepairCounts, ReplicationConfig, RoundReport, SeedSource, replicate};
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<RoundReport>();
+    let mut config =
+        ReplicationConfig::new(vec![SeedSource::Static(vec![a.addr])], SECRET.into(), b.addr);
+    config.sync_interval = Duration::from_millis(100);
+    config.discovery_interval = Duration::from_millis(100);
+    config.on_round = Some(Arc::new(move |report| {
+        let _ = tx.send(report);
+    }));
+    configure(&mut config);
+    let looping = tokio::spawn(replicate(Arc::clone(&b.engine), config));
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(45);
+    let mut totals = RepairCounts::default();
+    let outcome = loop {
+        let report = match tokio::time::timeout_at(deadline, rx.recv()).await {
+            Ok(Some(report)) => report,
+            _ => break None,
+        };
+        totals.add(&report.repair);
+        if done(&report, &totals) {
+            break Some((totals, report));
+        }
+    };
+    looping.abort();
+    match outcome {
+        Some(found) => found,
+        None => panic!("the loop never reached the state asked for; totals {totals:?}"),
+    }
+}
+
+/// A updates a document and B is made to believe it has witnessed the update without
+/// applying it: the same count, the same vectors, one stale document.
+async fn a_and_b_with_a_lost_update() -> (Node, Node, kimmy_storage::CollectionMeta) {
+    let a = node().await;
+    let b = node().await;
+    let ca = a.engine.create_collection("shop", "orders").unwrap();
+    for i in 0..5i64 {
+        a.engine.insert(&ca, doc! { "_id": i, "v": 0 }).unwrap();
+    }
+    sync(&a, &b).await;
+    sync(&a, &b).await;
+    tokio::time::sleep(Duration::from_millis(5)).await;
+    a.engine.replace(&ca, &DocId::Int64(2), doc! { "_id": 2i64, "v": 1 }, false).unwrap();
+    let theirs = a.engine.version_vector().unwrap();
+    b.engine.apply_peer_batch(&theirs, &[], Hlc::ZERO, true).unwrap();
+    (a, b, ca)
+}
+
+fn version_of(node: &Node, id: i64) -> i32 {
+    let meta = node.engine.get_collection("shop", "orders").unwrap();
+    node.engine.get(&meta, &DocId::Int64(id)).unwrap().unwrap().get_i32("v").unwrap()
+}
+
+#[tokio::test]
+async fn a_lost_update_is_repaired_by_the_document_repair_and_judged_effective() {
+    use kimmy_cluster::{DigestRepairOutcome, Judgement};
+    let (a, b, _ca) = a_and_b_with_a_lost_update().await;
+    assert_eq!(version_of(&b, 2), 0, "premise: B holds the stale version");
+    let (totals, last) = repair_loop(
+        &a,
+        &b,
+        |_| {},
+        |report, totals| {
+            totals.digest_judgements[Judgement::Effective.index()] >= 1
+                && report.digest_divergent_collections == 0
+        },
+    )
+    .await;
+    assert_eq!(version_of(&b, 2), 1, "the update B missed was not repaired");
+    assert!(totals.digest_repairs[DigestRepairOutcome::Applied.index()] >= 1, "{totals:?}");
+    assert!(totals.digest_rows[kimmy_cluster::RowResult::Applied.index()] >= 1, "{totals:?}");
+    assert!(last.repair_enabled);
+    assert_eq!(last.digest_repair_stopped, 0);
+}
+
+#[tokio::test]
+async fn with_the_switch_off_the_finding_stands_and_nothing_is_planned() {
+    use kimmy_cluster::DigestRepairOutcome;
+    let (a, b, _ca) = a_and_b_with_a_lost_update().await;
+    let mut rounds = 0;
+    let (totals, last) = repair_loop(
+        &a,
+        &b,
+        |config| config.divergence_repair = false,
+        |report, totals| {
+            // Counted once for the finding that stands, however many contacts it stands for.
+            rounds += 1;
+            report.digest_divergent_collections == 1
+                && totals.digest_repairs[DigestRepairOutcome::Disabled.index()] >= 1
+                && rounds >= 25
+        },
+    )
+    .await;
+    assert_eq!(totals.digest_repairs[DigestRepairOutcome::Disabled.index()], 1, "{totals:?}");
+    assert_eq!(version_of(&b, 2), 0, "a repair ran with the switch off");
+    assert_eq!(totals.digest_repairs[DigestRepairOutcome::Applied.index()], 0, "{totals:?}");
+    assert!(!last.repair_enabled, "the gauge says this member only detects");
+}
+
+#[tokio::test]
+async fn a_collection_over_the_size_gate_is_left_to_the_operator_and_counted() {
+    use kimmy_cluster::DigestRepairOutcome;
+    let (a, b, _ca) = a_and_b_with_a_lost_update().await;
+    let mut rounds = 0;
+    let (totals, _) = repair_loop(
+        &a,
+        &b,
+        |config| config.repair_max_documents = 3,
+        |_, totals| {
+            rounds += 1;
+            totals.digest_repairs[DigestRepairOutcome::TooLarge.index()] >= 1 && rounds >= 25
+        },
+    )
+    .await;
+    assert_eq!(totals.digest_repairs[DigestRepairOutcome::TooLarge.index()], 1, "{totals:?}");
+    assert_eq!(version_of(&b, 2), 0, "a repair ran over the gate");
+    assert_eq!(totals.digest_repairs[DigestRepairOutcome::Applied.index()], 0);
+}
+
+/// A plain index A holds and B lacks, B made to believe it has witnessed the creation.
+async fn a_and_b_with_a_lost_index() -> (Node, Node) {
+    let a = node().await;
+    let b = node().await;
+    let ca = a.engine.create_collection("shop", "orders").unwrap();
+    for i in 0..5i64 {
+        a.engine.insert(&ca, doc! { "_id": i, "v": i }).unwrap();
+    }
+    sync(&a, &b).await;
+    sync(&a, &b).await;
+    tokio::time::sleep(Duration::from_millis(5)).await;
+    a.engine.create_index("shop", "orders", vec![field("v")], false, Some("by_v".into())).unwrap();
+    let theirs = a.engine.version_vector().unwrap();
+    b.engine.apply_peer_batch(&theirs, &[], Hlc::ZERO, true).unwrap();
+    assert!(b.engine.list_indexes("shop", "orders").unwrap().is_empty(), "premise");
+    (a, b)
+}
+
+#[tokio::test]
+async fn a_lost_plain_index_is_built_by_the_definition_repair_and_judged_effective() {
+    use kimmy_cluster::DefinitionJudgement;
+    let (a, b) = a_and_b_with_a_lost_index().await;
+    let (totals, last) = repair_loop(
+        &a,
+        &b,
+        |_| {},
+        |report, totals| {
+            totals.definition_judgements[DefinitionJudgement::Effective.index()] >= 1
+                && report.definition_divergent_collections == 0
+        },
+    )
+    .await;
+    let names: Vec<_> =
+        b.engine.list_indexes("shop", "orders").unwrap().into_iter().map(|i| i.name).collect();
+    assert_eq!(names, vec!["by_v".to_string()], "the index B lacked was not built");
+    let built = kimmy_storage::DEFINITION_RESULTS.iter().position(|l| *l == "built").unwrap();
+    assert_eq!(totals.definition_indexes[built], 1, "{totals:?}");
+    assert_eq!(last.digest_repair_stopped, 0);
+}
+
+#[tokio::test]
+async fn a_lost_unique_index_stays_a_finding_and_is_never_repaired() {
+    let a = node().await;
+    let b = node().await;
+    let ca = a.engine.create_collection("shop", "orders").unwrap();
+    a.engine.insert(&ca, doc! { "_id": 1, "v": 1 }).unwrap();
+    sync(&a, &b).await;
+    sync(&a, &b).await;
+    tokio::time::sleep(Duration::from_millis(5)).await;
+    a.engine.create_index("shop", "orders", vec![field("v")], true, Some("u".into())).unwrap();
+    let theirs = a.engine.version_vector().unwrap();
+    b.engine.apply_peer_batch(&theirs, &[], Hlc::ZERO, true).unwrap();
+    let unique = kimmy_storage::DEFINITION_RESULTS.iter().position(|l| *l == "unique").unwrap();
+    let (totals, last) = repair_loop(
+        &a,
+        &b,
+        |_| {},
+        |report, totals| {
+            totals.definition_indexes[unique] >= 1 && report.definition_divergent_collections == 1
+        },
+    )
+    .await;
+    assert!(
+        b.engine.list_indexes("shop", "orders").unwrap().is_empty(),
+        "a unique index was built"
+    );
+    assert_eq!(last.definition_divergent_collections, 1, "the finding stands");
+    let _ = totals;
+}
+
+#[tokio::test]
+async fn a_member_that_is_catching_up_plans_no_repair() {
+    use kimmy_cluster::DigestRepairOutcome;
+    let (a, b, _ca) = a_and_b_with_a_lost_update().await;
+    let dir = tempfile::tempdir().unwrap();
+    let catch_up = kimmy_cluster::catchup::CatchUp::open(dir.path(), Duration::from_secs(120));
+    catch_up.mark(kimmy_cluster::facts::CatchUpReason::Snapshot).unwrap();
+    let seen = std::cell::Cell::new(0u32);
+    let (totals, last) = repair_loop(
+        &a,
+        &b,
+        |config| {
+            config.catch_up = Some(Arc::clone(&catch_up));
+            // The marker clears only against this many members; two are reached.
+            config.expected_members = Some(3);
+        },
+        |report, _| {
+            // Wait until the finding has been confirmed and stood for a few more ticks.
+            if report.digest_divergent_collections == 1 {
+                seen.set(seen.get() + 1);
+            }
+            seen.get() >= 8
+        },
+    )
+    .await;
+    assert_eq!(version_of(&b, 2), 0, "a repair ran while this member was catching up");
+    assert_eq!(totals.digest_repairs[DigestRepairOutcome::Applied.index()], 0, "{totals:?}");
+    assert_eq!(last.digest_divergent_collections, 1);
+}
+
+// ---------------------------------------------------------------------------
+// kimmy_sync_repair_rounds_total is narrowed to the count half (design v3.5 sections 7
+// item 3 and 15.2): a repair of the other two kinds must not move it.
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn a_document_repair_does_not_move_the_count_halfs_repair_rounds() {
+    use kimmy_cluster::{DigestRepairOutcome, Judgement};
+    let (a, b, _ca) = a_and_b_with_a_lost_update().await;
+    let rounds = std::cell::Cell::new(0usize);
+    let (totals, _) = repair_loop(
+        &a,
+        &b,
+        |_| {},
+        |report, totals| {
+            rounds.set(rounds.get() + report.repair_rounds);
+            totals.digest_judgements[Judgement::Effective.index()] >= 1
+        },
+    )
+    .await;
+    assert!(totals.digest_repairs[DigestRepairOutcome::Applied.index()] >= 1, "{totals:?}");
+    assert_eq!(
+        rounds.get(),
+        0,
+        "kimmy_sync_repair_rounds_total counted {} rounds of a document repair",
+        rounds.get()
+    );
+}
+
+#[tokio::test]
+async fn a_definition_repair_does_not_move_the_count_halfs_repair_rounds() {
+    use kimmy_cluster::DefinitionJudgement;
+    let (a, b) = a_and_b_with_a_lost_index().await;
+    let rounds = std::cell::Cell::new(0usize);
+    let _ = repair_loop(
+        &a,
+        &b,
+        |_| {},
+        |report, totals| {
+            rounds.set(rounds.get() + report.repair_rounds);
+            totals.definition_judgements[DefinitionJudgement::Effective.index()] >= 1
+        },
+    )
+    .await;
+    assert_eq!(
+        rounds.get(),
+        0,
+        "kimmy_sync_repair_rounds_total counted {} rounds of a definition repair",
+        rounds.get()
     );
 }

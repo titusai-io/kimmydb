@@ -488,6 +488,25 @@ impl DivergenceTracker {
         self.cursor
     }
 
+    /// Forget every finding, pending or confirmed, against a peer that is not in
+    /// `members` (repair design R7). `advance_probe` sweeps by collection only,
+    /// so a member that was removed kept its confirmed findings for the life of
+    /// the process: they held the gauges up, and a ledger entry keyed by the
+    /// same peer could never be told the finding was gone.
+    pub fn retain_members(&mut self, members: Option<&BTreeSet<NodeId>>) {
+        let Some(members) = members else {
+            return;
+        };
+        self.pending.retain(|peer, _| members.contains(peer));
+        self.confirmed.retain(|peer, _| members.contains(peer));
+        self.count_pending.retain(|(peer, _)| members.contains(peer));
+        self.count_confirmed.retain(|peer, _| members.contains(peer));
+        self.digest_pending.retain(|(peer, _)| members.contains(peer));
+        self.digest_confirmed.retain(|peer, _| members.contains(peer));
+        self.definition_pending.retain(|(peer, _)| members.contains(peer));
+        self.definition_confirmed.retain(|peer, _| members.contains(peer));
+    }
+
     /// Fold in what one contact with `peer` found — [`compare`]'s result.
     /// Call this once per peer the check actually ran against this tick; a
     /// peer not contacted, or contacted but not checked (the round had a
@@ -580,6 +599,14 @@ impl DivergenceTracker {
         self.digest_confirmed.get(&peer).is_some_and(|set| set.contains(&id))
     }
 
+    /// Collections the cut digest has confirmed divergent against `peer`: what the
+    /// document repair is planned from. **Only the planner reads this.**
+    /// [`Self::confirmed_against`] never holds a digest finding (B3), so the count
+    /// half's repair, its cooldown and its `retain_repaired` never see one.
+    pub fn digest_confirmed_against(&self, peer: NodeId) -> BTreeSet<CollectionId> {
+        self.digest_confirmed.get(&peer).cloned().unwrap_or_default()
+    }
+
     /// Distinct collections confirmed divergent by the cut digest against at
     /// least one peer: what `kimmy_sync_digest_divergent_collections` reports,
     /// so an operator can tell which half moved the gauge.
@@ -623,6 +650,10 @@ impl DivergenceTracker {
     /// Distinct collections confirmed divergent by the definition digest
     /// against at least one peer: what
     /// `kimmy_sync_definition_divergent_collections` reports.
+    pub fn definition_confirmed_against(&self, peer: NodeId) -> BTreeSet<CollectionId> {
+        self.definition_confirmed.get(&peer).cloned().unwrap_or_default()
+    }
+
     pub fn definition_confirmed_count(&self) -> usize {
         self.definition_confirmed.values().flatten().collect::<BTreeSet<_>>().len()
     }
@@ -699,6 +730,33 @@ mod tests {
         (engine, dir)
     }
 
+    /// R7: a removed member's findings, of every kind, go with it, so no gauge is held
+    /// up by a peer that is gone and no repair is planned against one.
+    #[test]
+    fn a_removed_members_findings_are_forgotten_of_every_kind() {
+        let mut tracker = DivergenceTracker::new();
+        let (gone, kept) = (peer(1), peer(2));
+        // The gauges count collections, not pairs: one collection per peer.
+        let (c, other) = (CollectionId(7), CollectionId(8));
+        for (p, id) in [(gone, c), (kept, other)] {
+            tracker.observe_digest(p, id, true);
+            tracker.observe_digest(p, id, true);
+            tracker.observe_definition(p, id, true);
+            tracker.observe_definition(p, id, true);
+        }
+        assert_eq!(tracker.digest_confirmed_count(), 2);
+        assert_eq!(tracker.definition_confirmed_count(), 2);
+        tracker.retain_members(Some(&BTreeSet::from([kept])));
+        assert_eq!(tracker.digest_confirmed_count(), 1);
+        assert_eq!(tracker.definition_confirmed_count(), 1);
+        assert!(tracker.digest_confirmed_against(gone).is_empty());
+        assert!(!tracker.is_digest_confirmed(gone, c));
+        assert!(!tracker.is_definition_confirmed(gone, c));
+        // And the pending half went too: one mismatch more does not confirm.
+        assert!(!tracker.observe_digest(gone, c, true));
+        assert!(tracker.is_digest_confirmed(kept, other));
+    }
+
     #[test]
     fn a_digest_finding_confirms_on_two_compared_mismatches_and_clears_on_a_match() {
         let mut tracker = DivergenceTracker::new();
@@ -742,6 +800,21 @@ mod tests {
         assert_eq!(tracker.confirmed_count(), 1, "the gauge reads it");
         assert_eq!(tracker.definition_confirmed_count(), 1, "the attribution gauge");
         assert_eq!(tracker.digest_confirmed_count(), 0, "and it is not the digest's");
+    }
+
+    /// The planner's own reader for the digest: it holds the digest's findings and the
+    /// count half's reader still does not.
+    #[test]
+    fn a_digest_finding_is_read_by_its_own_reader_and_not_by_the_count_halfs() {
+        let mut tracker = DivergenceTracker::new();
+        let (p, q, c) = (NodeId::generate(), NodeId::generate(), CollectionId(7));
+        tracker.observe_digest(p, c, true);
+        tracker.observe_digest(p, c, true);
+        assert_eq!(tracker.digest_confirmed_against(p), BTreeSet::from([c]));
+        assert!(tracker.digest_confirmed_against(q).is_empty(), "another peer's is its own");
+        assert!(tracker.confirmed_against(p).is_empty(), "never the count half's reader");
+        tracker.observe_digest(p, c, false);
+        assert!(tracker.digest_confirmed_against(p).is_empty(), "a compared match clears it");
     }
 
     /// One collection under two kinds is one collection on the gauge.

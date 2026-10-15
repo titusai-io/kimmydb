@@ -1721,6 +1721,7 @@ mod tests {
                 dropped_collections: Vec::new(),
                 deleted_documents: Vec::new(),
                 dropped_indexes: Vec::new(),
+                tombstone_horizon: None,
             })),
         )
         .await
@@ -1790,6 +1791,7 @@ mod tests {
                 stamp: stamp(600),
             }],
             dropped_indexes: vec![(CollectionId(7), 2_032_551_883, stamp(550))],
+            tombstone_horizon: Some(Hlc::new(777, 3)),
         };
 
         let mut written = Vec::new();
@@ -1826,6 +1828,25 @@ mod tests {
             read_frame(&mut frame.as_slice()).await.unwrap(),
             Message::Snapshot(Box::new(without)),
             "a sender that predates the index drops writes none, and the page still reads"
+        );
+
+        // The collected-through horizon (repair design 13.1): carried when set, and a sender that
+        // predates it writes none, which reads as none and never as a zero horizon.
+        assert!(sent.contains_key("tombstone_horizon"), "the frame must carry the horizon: {sent}");
+        let mut before_horizon = sent.clone();
+        before_horizon.remove("tombstone_horizon");
+        let frame = {
+            let bytes = bson::serialize_to_vec(&bson::doc! { "Snapshot": before_horizon }).unwrap();
+            let mut buffer = (bytes.len() as u32).to_be_bytes().to_vec();
+            buffer.extend_from_slice(&bytes);
+            buffer
+        };
+        let mut no_horizon = page.clone();
+        no_horizon.tombstone_horizon = None;
+        assert_eq!(
+            read_frame(&mut frame.as_slice()).await.unwrap(),
+            Message::Snapshot(Box::new(no_horizon)),
+            "a sender that predates the horizon writes none, and the page reads with none"
         );
 
         let mut future = sent;

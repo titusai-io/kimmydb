@@ -114,11 +114,42 @@ use crate::sync::{Memo, Pending};
 use crate::tables;
 use crate::walk::{WalkScope, open_walk_table};
 
+/// How many of the live rows a document repair left are named in its log line.
+pub const LEFT_IDS_NAMED: usize = 10;
+
 /// Documents per page.
 ///
 /// Bounded so a large collection crosses the wire in several frames rather than
 /// one the receiver may not have the memory to hold.
 pub const SNAPSHOT_PAGE: usize = 512;
+
+/// What applying a snapshot page does (ADR-148, ADR-152, and the repair of a
+/// confirmed digest finding).
+///
+/// Carried by the pull's [`SnapshotProgress`] and never stored with it.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum SnapshotPolicy {
+    /// Everything a page can do: collections and their definitions, the vector
+    /// state, the carried collection and index drops, and the documents. The
+    /// whole-database catch-up and the count half's scoped repair.
+    #[default]
+    All,
+    /// **Documents only**, and of those only what this member can judge by
+    /// itself. A row is applied over a row this member already holds (live or a
+    /// tombstone) and only if strictly newer; an id this member holds nothing
+    /// for is counted `left` and nothing is written, a tombstone for it
+    /// included (no bare tombstone). Every other part of the page is skipped, so
+    /// a page can never create an index, change a configuration, drop anything
+    /// or plan a shadow repair through this route. Never persists, resumes or
+    /// forgets a stored cursor; grants nothing.
+    Converge,
+    /// **The first page only, and of it only the plain indexes this member lacks**
+    /// (repair design section 12): the definition repair builds at most one plain index
+    /// by name that a peer holds and this member lacks, if every clause of the table
+    /// admits it. Documents, drops and the vector state are ignored. Never persists,
+    /// resumes or forgets a stored cursor; grants nothing.
+    Definitions,
+}
 
 /// Where a snapshot left off, so it can resume rather than restart.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -304,6 +335,44 @@ pub struct SnapshotApplied {
     /// that drop, and restoring the shadow would leave it parentless here
     /// (ADR-138). The transport cancels a repair still queued for each.
     pub shadows_orphaned: Vec<CollectionId>,
+    /// Under [`SnapshotPolicy::Converge`]: the rows of the page (live or
+    /// tombstone) this node held nothing for, which the policy does not write.
+    /// Always 0 under `All`.
+    pub left: usize,
+    /// Under [`SnapshotPolicy::Converge`]: the ids of the first ten live rows this page left,
+    /// for the line that tells the operator which rows the rule is about.
+    pub left_ids: Vec<DocId>,
+    /// Under [`SnapshotPolicy::Converge`]: the **tombstone** rows of the page this node
+    /// held nothing for. They are digest-invisible (the digest folds live records only),
+    /// travel by key with no `_id`, and cannot be named, so they are counted apart from
+    /// `left` and never raise the operator warning. Always 0 under `All`.
+    pub left_tombstone: usize,
+    /// Under [`SnapshotPolicy::Converge`]: the live rows this node held nothing for and
+    /// wrote because they are **young** (newer than every tombstone cutoff either member
+    /// of the pair has applied, design section 13): the lost inserts the pull closed.
+    /// Not counted in `applied`. Always 0 under `All`.
+    pub created: usize,
+    /// Under [`SnapshotPolicy::Converge`]: of `applied`, the rows (documents and deletes)
+    /// stamped **at or below the cut of the finding that planned the pull**: the ones
+    /// ordinary replication would not have delivered. A repair's progress is these and
+    /// `created_at_cut`, and not the rest, which under live writes are tail rows the
+    /// ordinary route also brings. Always 0 under `All`.
+    pub applied_at_cut: usize,
+    /// Under [`SnapshotPolicy::Definitions`]: what the page's indexes came to. All zero
+    /// under every other policy.
+    pub definitions: crate::definition_repair::DefinitionRestore,
+    /// Under [`SnapshotPolicy::Converge`]: of `created`, those at or below the cut.
+    pub created_at_cut: usize,
+    /// Under [`SnapshotPolicy::Converge`] and [`SnapshotPolicy::Definitions`]: the first page's
+    /// life of the collection began after a drop that ended the life standing here
+    /// (`sync::arriving_life_ends_the_standing_one`, with the sender's floor named by its own
+    /// coverage): its rows and its indexes belong to a life this member has not buried yet.
+    /// Nothing was applied and the pull ends; the count kind's snapshot buries it (ADR-235).
+    pub history: bool,
+    /// Under [`SnapshotPolicy::Converge`]: the page said the sender no longer
+    /// holds the collection (`SnapshotPage::dropped`). Nothing was applied and
+    /// the progress did not move; the repair is abandoned, not applied.
+    pub sender_dropped: bool,
     /// A collection the page defines that this node cannot create yet,
     /// because a drop of an earlier collection of that name still has rows
     /// under its id (ADR-189). The page applied nothing past its drops,
@@ -427,6 +496,18 @@ pub struct SnapshotPage {
     /// the new definition and the old drop, and the new one stands.
     #[serde(default)]
     pub dropped_indexes: Vec<(CollectionId, u32, Stamp)>,
+    /// The sender's collected-through horizon: the highest tombstone cutoff its
+    /// retention passes have applied, read **in or after the walk this page's rows came
+    /// from** so it is never older than the documents it vouches for (design v3.4,
+    /// section 13.1). The young-stamp rule of a `Converge` pull compares a row's stamp
+    /// with the larger of this and the receiver's own.
+    ///
+    /// **An `Option`, never an `Hlc` defaulting to zero.** Absent from a sender that
+    /// predates it: the receiver's rule is then off for that pull, and every row it
+    /// holds nothing for is `left`. Optional on the wire, so an older receiver ignores
+    /// it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tombstone_horizon: Option<Hlc>,
 }
 
 /// Where a snapshot pull stands on the receiver.
@@ -439,6 +520,23 @@ pub struct SnapshotPage {
 /// is at or below.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct SnapshotProgress {
+    /// What applying a page does (see [`SnapshotPolicy`]). **Never stored**: a
+    /// persisted row is always an `All` pull, and a row read back is one, so a
+    /// restart or a rollback cannot resume a `Converge` cursor as a pull that
+    /// restores definitions.
+    #[serde(skip)]
+    policy: SnapshotPolicy,
+    /// Under [`SnapshotPolicy::Converge`]: the cut of the finding that planned the pull
+    /// (`min` of the two members' witnessed vectors when the digest was compared). A row
+    /// stamped at or below it is one ordinary replication should have delivered already;
+    /// the pull counts those apart ([`SnapshotApplied::applied_at_cut`]), because they
+    /// are the progress of a repair. Never stored; empty for every other pull.
+    #[serde(skip)]
+    cut: VersionVector,
+    /// Under [`SnapshotPolicy::Definitions`]: the most live documents the collection may
+    /// hold for an index to be built (`cluster.repair_max_index_documents`). Never stored.
+    #[serde(skip)]
+    max_index_documents: u64,
     /// The one collection the snapshot is of, or `None` for the whole
     /// database.
     scope: Option<CollectionId>,
@@ -470,8 +568,41 @@ impl SnapshotProgress {
         Self::new(Some(id))
     }
 
+    /// A scoped snapshot under [`SnapshotPolicy::Converge`], not yet started:
+    /// what the document repair of a confirmed digest finding pulls. It is
+    /// never persisted, resumed or forgotten, and grants nothing.
+    pub fn of_collection_converging(id: CollectionId, cut: VersionVector) -> Self {
+        SnapshotProgress { policy: SnapshotPolicy::Converge, cut, ..Self::new(Some(id)) }
+    }
+
+    /// A scoped snapshot under [`SnapshotPolicy::Definitions`], not yet started: what the
+    /// definition repair pulls. One page, never persisted, grants nothing.
+    pub fn of_collection_definitions(id: CollectionId, max_index_documents: u64) -> Self {
+        SnapshotProgress {
+            policy: SnapshotPolicy::Definitions,
+            max_index_documents,
+            ..Self::new(Some(id))
+        }
+    }
+
+    /// The gate on the live documents of a collection that is given an index.
+    pub fn max_index_documents(&self) -> u64 {
+        self.max_index_documents
+    }
+
+    /// A pull that applies one page and ends: the page is counted and the pull is complete,
+    /// whatever `next` it carried.
+    pub(crate) fn finish_after_one_page(&mut self) {
+        self.pages += 1;
+        self.after = None;
+        self.complete = true;
+    }
+
     fn new(scope: Option<CollectionId>) -> Self {
         SnapshotProgress {
+            policy: SnapshotPolicy::All,
+            cut: VersionVector::default(),
+            max_index_documents: 0,
             scope,
             after: None,
             granted: None,
@@ -498,9 +629,28 @@ impl SnapshotProgress {
         next
     }
 
+    /// A progress that has applied a page and not finished, for another crate's
+    /// tests of what the planner does with one. Under `cfg(test)` and the
+    /// `test-hooks` feature, absent from every build that ships.
+    #[cfg(any(test, feature = "test-hooks"))]
+    pub fn test_mark_paged(&mut self) {
+        self.pages = 1;
+        self.complete = false;
+    }
+
+    /// Under `Converge`, the cut of the finding that planned the pull; empty otherwise.
+    pub fn cut(&self) -> &VersionVector {
+        &self.cut
+    }
+
     /// The collection the snapshot is scoped to, if any.
     pub fn scope(&self) -> Option<CollectionId> {
         self.scope
+    }
+
+    /// What applying a page of this pull does.
+    pub fn policy(&self) -> SnapshotPolicy {
+        self.policy
     }
 
     /// Where the next page begins; what to ask the sender for.
@@ -585,6 +735,9 @@ impl Engine {
         let dropped_indexes = self.indexes_dropped(scope)?;
 
         let (documents, deleted_documents, next) = self.snapshot_documents(after, scope)?;
+        // After the walk: monotone, so a value read later is at least what the rows
+        // above were collected under (design 13.1, "where it is read").
+        let tombstone_horizon = self.tombstone_horizon()?;
         Ok(SnapshotPage {
             collections,
             documents,
@@ -594,6 +747,7 @@ impl Engine {
             dropped_collections,
             deleted_documents,
             dropped_indexes,
+            tombstone_horizon,
         })
     }
 
@@ -801,6 +955,12 @@ impl Engine {
         progress: &mut SnapshotProgress,
         page: &SnapshotPage,
     ) -> Result<SnapshotApplied> {
+        if progress.policy == SnapshotPolicy::Converge {
+            return self.apply_converge_page(progress, page);
+        }
+        if progress.policy == SnapshotPolicy::Definitions {
+            return self.apply_definitions_page(progress, page);
+        }
         // Definitions first, through the DDL path with transactions of its
         // own — the reason a replicated run ends at a schema change
         // (ADR-119) — so every document below has a collection to land in.
@@ -1014,6 +1174,7 @@ impl Engine {
                 page,
                 &mut pending,
                 &mut superseded,
+                None,
             )?;
 
             // Only a *completed* snapshot grants coverage: adopting it
@@ -1026,6 +1187,11 @@ impl Engine {
             let mut wrote = !pending.is_empty() || recorded > 0;
             if let Some(granted) = &grant {
                 wrote |= Engine::absorb_version_vector_in_txn(&txn, granted)?;
+                // And the sender's forgetting with it: a member that was behind forgets
+                // what the sender has forgotten, and serves on with that horizon.
+                if let Some(sender) = page.tombstone_horizon {
+                    wrote |= crate::tombstone_horizon::adopt_in_txn(&txn, sender)?;
+                }
             }
             // Where the pull has got to, in the page's own transaction so a
             // snapshot still costs no commit of bookkeeping (ADR-152's rule,
@@ -1058,28 +1224,9 @@ impl Engine {
                 txn.abort()?;
             }
 
-            // What had to wait for the commit, for every applied document
-            // whether or not an earlier report failed, and the first error
-            // afterwards: a report skipped for an entry that is already
-            // durable would never publish and never mint its violation
-            // (`commit_run`, ADR-029).
-            applied = pending.len();
-            let mut published = Vec::with_capacity(pending.len());
-            for Pending { collection, entry, id, violations } in pending {
-                match self.report_remote_write(
-                    WriterHolder::Repair,
-                    &collection,
-                    &entry,
-                    &id,
-                    &violations,
-                ) {
-                    Ok(entries) => published.extend(entries),
-                    Err(e) => {
-                        failed.get_or_insert(e);
-                    }
-                }
-            }
-            self.publish(published);
+            let (count, error) = self.report_pending(pending);
+            applied = count;
+            failed = error;
         }
 
         *progress = progress.advanced(page, applied);
@@ -1118,9 +1265,284 @@ impl Engine {
                 superseded,
                 shadows_missing,
                 shadows_orphaned,
+                left: 0,
+                left_ids: Vec::new(),
+                left_tombstone: 0,
+                created: 0,
+                applied_at_cut: 0,
+                definitions: Default::default(),
+                created_at_cut: 0,
+                history: false,
+                sender_dropped: false,
                 purge_pending: None,
             }),
         }
+    }
+
+    /// Apply one page of a scoped pull under [`SnapshotPolicy::Converge`].
+    ///
+    /// The document repair of a confirmed digest finding: ruling F2 done by the
+    /// requester on its own state. A row is applied over a row this member
+    /// already holds, live or a tombstone, and only if strictly newer (the
+    /// ordinary replicated write decides, so indexes, violations, the oplog
+    /// append under `Position::Hold` and change-stream publication are as for any
+    /// replicated row). An id this member holds nothing for is counted `left` and
+    /// nothing is written: it may never have arrived, or may have been deleted
+    /// with the tombstone since collected, and the page cannot say which.
+    ///
+    /// **Everything else a page can do is skipped**, each with a test:
+    /// `page.collections` (so no definition, index, vector state or collection is
+    /// created, superseded or restored), `page.dropped` (the sender no longer
+    /// holds the collection: the repair is abandoned, [`SnapshotApplied::sender_dropped`]),
+    /// `page.dropped_collections`, the carried index drops and the burial sweeps.
+    /// The shadow plan and cancel the caller derives from `page.collections` are
+    /// therefore empty. The bare tombstone of ADR-228 is never recorded.
+    ///
+    /// **Never persists, resumes or forgets a stored cursor**, and grants no
+    /// coverage: a restart or a rollback starts from page one, a stored cursor of
+    /// an `All` pull is neither taken nor deleted by a `Converge` completion, and
+    /// the in-memory progress alone advances.
+    fn apply_converge_page(
+        &self,
+        progress: &mut SnapshotProgress,
+        page: &SnapshotPage,
+    ) -> Result<SnapshotApplied> {
+        debug_assert!(progress.scope.is_some(), "a Converge pull is always scoped");
+        if page.dropped.is_some() {
+            return Ok(SnapshotApplied { sender_dropped: true, ..Default::default() });
+        }
+        if progress.pages == 0
+            && self.first_page_is_a_life_this_member_has_not_buried(progress, page)?
+        {
+            return Ok(SnapshotApplied { history: true, ..Default::default() });
+        }
+        let mut applied = 0usize;
+        let mut superseded = 0usize;
+        let mut left = 0usize;
+        let mut left_ids: Vec<DocId> = Vec::new();
+        let mut left_tombstone = 0usize;
+        let mut created = 0usize;
+        let mut applied_at_cut = 0usize;
+        let mut created_at_cut = 0usize;
+        let mut failed = None;
+        // At or below the cut of the finding that planned the pull.
+        let at_cut = |stamp: Stamp| stamp.hlc <= progress.cut.get(stamp.node);
+        if !page.documents.is_empty() || !page.deleted_documents.is_empty() {
+            let mut memo = Memo::default();
+            #[cfg(test)]
+            crate::sync::race_hooks::reach(crate::sync::race_hooks::Race::ConvergePage);
+            let txn = self.begin_write(WriterHolder::Repair)?;
+            // The young-stamp rule's two horizons (design section 13.2). The receiver's own
+            // is read **in this write transaction**, beside the "no row" read below, so a
+            // collection that commits between a plan and this page cannot leave the page
+            // judging with a horizon that has not moved while the tombstone is gone. The
+            // sender's rides on the page; absent (a sender that predates it) turns the rule
+            // off for the pull. An absent own key fails closed too.
+            let young_above =
+                match (crate::tombstone_horizon::read_in_txn(&txn)?, page.tombstone_horizon) {
+                    (Some(own), Some(sender)) => Some(own.max(sender)),
+                    _ => None,
+                };
+            // Per collection, once: whether it owes ADR-231's sweep. Judged under this
+            // transaction, next to the row write, because the sweep is chunked with the
+            // writer released between chunks and the floor is set last.
+            let mut owing: std::collections::HashMap<CollectionId, bool> =
+                std::collections::HashMap::new();
+            let mut pending = Vec::new();
+            for document in &page.documents {
+                let collection = self.memo_collection(&mut memo, document.collection)?;
+                if self.is_history(
+                    &mut memo,
+                    collection.as_deref(),
+                    document.collection,
+                    document.stamp,
+                )? {
+                    superseded += 1;
+                    continue;
+                }
+                // No collection here: nothing for the policy to judge, and it
+                // creates none. A tombstone for it is history and counted above.
+                let Some(collection) = collection else {
+                    left += 1;
+                    if left_ids.len() < LEFT_IDS_NAMED {
+                        left_ids.push(document.id.clone());
+                    }
+                    continue;
+                };
+                let key = crate::docs::doc_key(&document.id)?;
+                let held = {
+                    let docs = txn.open_table(tables::DOCS)?;
+                    docs.get((collection.id.0, key.as_slice()))?.is_some()
+                };
+                let mut young = false;
+                if !held {
+                    // A row this member holds nothing for: never arrived, or deleted and
+                    // the tombstone collected. Written only if young, and only into a
+                    // life that owes no sweep; otherwise left (F2).
+                    let owes = match owing.get(&collection.id) {
+                        Some(owes) => *owes,
+                        None => {
+                            let owes = self.owes_a_sweep_in_txn(&txn, &collection)?;
+                            owing.insert(collection.id, owes);
+                            owes
+                        }
+                    };
+                    let is_young = young_above.is_some_and(|above| document.stamp.hlc > above);
+                    if !is_young || owes {
+                        left += 1;
+                        if left_ids.len() < LEFT_IDS_NAMED {
+                            left_ids.push(document.id.clone());
+                        }
+                        continue;
+                    }
+                    young = true;
+                }
+                let entry = OplogEntry {
+                    stamp: document.stamp,
+                    kind: OpKind::Replace,
+                    collection: collection.id,
+                    doc_id: Some(document.id.clone()),
+                    body: document.body.clone(),
+                };
+                if let RemoteApplied::Applied { id, violations, .. } =
+                    self.apply_remote_in_txn(&txn, &collection, &entry, Position::Hold)?
+                {
+                    if young {
+                        created += 1;
+                        created_at_cut += usize::from(at_cut(document.stamp));
+                    } else {
+                        applied_at_cut += usize::from(at_cut(document.stamp));
+                    }
+                    pending.push(Pending { collection, entry, id, violations });
+                }
+            }
+            let documents_applied = pending.len();
+            let replaced = self.apply_carried_document_deletes(
+                &txn,
+                &mut memo,
+                page,
+                &mut pending,
+                &mut superseded,
+                Some(&mut left_tombstone),
+            )?;
+            applied_at_cut +=
+                pending[documents_applied..].iter().filter(|p| at_cut(p.entry.stamp)).count();
+            if pending.is_empty() && replaced == 0 {
+                txn.abort()?;
+            } else {
+                txn.commit()?;
+            }
+            let (count, error) = self.report_pending(pending);
+            applied = count - created + replaced;
+            failed = error;
+        }
+        *progress = progress.advanced(page, applied + created);
+        if progress.complete {
+            info!(
+                collection = ?progress.scope,
+                pages = progress.pages,
+                documents = progress.documents,
+                "converge pull of the collection complete"
+            );
+        }
+        match failed {
+            Some(e) => Err(e),
+            None => Ok(SnapshotApplied {
+                applied,
+                superseded,
+                left,
+                left_ids,
+                left_tombstone,
+                created,
+                applied_at_cut,
+                created_at_cut,
+                ..Default::default()
+            }),
+        }
+    }
+
+    /// Whether the first page of a scoped repair pull carries the successor of the life
+    /// standing here: its floor (named by the sender's own coverage, ADR-163) is a drop that
+    /// ended the standing life, so the page's rows and indexes belong to a life this member
+    /// has not buried. A `Converge` pull would write them into the ended life and a
+    /// `Definitions` pull would build its indexes there; both end instead, and the count
+    /// kind's scoped snapshot buries through ADR-235's route.
+    pub(crate) fn first_page_is_a_life_this_member_has_not_buried(
+        &self,
+        progress: &SnapshotProgress,
+        page: &SnapshotPage,
+    ) -> Result<bool> {
+        let Some(scope) = progress.scope else {
+            return Ok(false);
+        };
+        let Some(state) = page
+            .collections
+            .iter()
+            .find(|state| CollectionId::derive(&state.db, &state.name) == scope)
+        else {
+            return Ok(false);
+        };
+        let Some(floor) =
+            state.incarnation_floor.filter(|floor| hlc_is_named(*floor, &page.versions))
+        else {
+            return Ok(false);
+        };
+        let Some(standing) = Self::unless_gone(self.get_collection(&state.db, &state.name))? else {
+            return Ok(false);
+        };
+        Ok(crate::sync::arriving_life_ends_the_standing_one(
+            &standing,
+            state.created,
+            state.redated_from,
+            Some(floor),
+        ))
+    }
+
+    /// Whether `collection` owes ADR-231's sweep for either tombstone that could end the
+    /// life before it: its own and its database's, read through the caller's write
+    /// transaction. (The digests use [`owes_a_sweep`] for the collection's alone; the
+    /// repair is the stricter reader.)
+    fn owes_a_sweep_in_txn(
+        &self,
+        txn: &crate::engine::WriteTxn<'_>,
+        collection: &CollectionMeta,
+    ) -> Result<bool> {
+        let dropped = txn.open_table(tables::COLLECTIONS_DROPPED)?;
+        for id in [collection.id, kimmy_core::database_drop_id(&collection.db)] {
+            if let Some(raw) = dropped.get(id.0)? {
+                let stamp = codec::decode_oplog_key(raw.value())?;
+                if crate::late_drop::owes_a_sweep(collection, stamp.hlc) {
+                    return Ok(true);
+                }
+            }
+        }
+        Ok(false)
+    }
+
+    /// What had to wait for the commit, for every applied document whether or
+    /// not an earlier report failed, and the first error afterwards: a report
+    /// skipped for an entry that is already durable would never publish and never
+    /// mint its violation (`commit_run`, ADR-029).
+    fn report_pending(&self, pending: Vec<Pending>) -> (usize, Option<crate::StorageError>) {
+        let count = pending.len();
+        let mut failed = None;
+        let mut published = Vec::with_capacity(count);
+        for Pending { collection, entry, id, violations } in pending {
+            match self.report_remote_write(
+                WriterHolder::Repair,
+                &collection,
+                &entry,
+                &id,
+                &violations,
+            ) {
+                Ok(entries) => published.extend(entries),
+                Err(e) => {
+                    failed.get_or_insert(e);
+                }
+            }
+        }
+        self.publish(published);
+        (count, failed)
     }
 
     /// Apply the document tombstones a page carries (ADR-167), inside the
@@ -1163,7 +1585,13 @@ impl Engine {
         page: &SnapshotPage,
         pending: &mut Vec<Pending>,
         superseded: &mut usize,
+        converge: Option<&mut usize>,
     ) -> Result<usize> {
+        // Under `Converge` (`converge` carries the count of rows left) a tombstone
+        // is applied only over a live document it out-stamps: where this node holds
+        // nothing, or only a tombstone, nothing is written, and the bare tombstone
+        // of ADR-228 is never recorded.
+        let mut converge = converge;
         let mut recorded = 0usize;
         for tombstone in &page.deleted_documents {
             if tombstone.stamp.hlc > page.versions.get(tombstone.stamp.node) {
@@ -1187,6 +1615,11 @@ impl Engine {
                 continue;
             }
             let Some(collection) = collection else {
+                // No collection here: under `Converge` the row is a tombstone this member holds
+                // nothing for, and says so.
+                if let Some(left) = converge.as_deref_mut() {
+                    *left += 1;
+                }
                 continue;
             };
 
@@ -1198,6 +1631,10 @@ impl Engine {
                 }
             };
             let Some(current) = existing else {
+                if let Some(left) = converge.as_deref_mut() {
+                    *left += 1;
+                    continue;
+                }
                 self.record_bare_tombstone(txn, &collection, tombstone)?;
                 recorded += 1;
                 continue;
@@ -1207,7 +1644,11 @@ impl Engine {
             }
             let Some(document) = current.document()? else {
                 // A tombstone here, at an older stamp: the newer delete is the one to
-                // carry (ADR-228).
+                // carry (ADR-228). `Converge` carries it too (repair review C m2): the
+                // stamp is the sender's, named by its own coverage, and the replaced
+                // tombstone is a delete of the same document, so nothing is brought back
+                // and no row is written; without it a live row stamped between the two
+                // deletes, taken later from a third member, would show until a later repair.
                 self.record_bare_tombstone(txn, &collection, tombstone)?;
                 recorded += 1;
                 continue;
@@ -2097,7 +2538,7 @@ impl Engine {
     /// `None` for a collection that is gone, the error otherwise. Not `settle`: a
     /// collection waiting on the drop purger is not gone, and a page reading it fails and
     /// retries rather than skipping what it cannot place (unreachable for a read today).
-    fn unless_gone<T>(read: Result<T>) -> Result<Option<T>> {
+    pub(crate) fn unless_gone<T>(read: Result<T>) -> Result<Option<T>> {
         match read {
             Ok(value) => Ok(Some(value)),
             Err(crate::StorageError::Core(kimmy_core::Error::CollectionNotFound { .. })) => {
@@ -4099,6 +4540,7 @@ mod tests {
             dropped_collections: Vec::new(),
             deleted_documents: Vec::new(),
             dropped_indexes: Vec::new(),
+            tombstone_horizon: None,
         };
         b.apply_snapshot_page(no_sender(), &mut SnapshotProgress::of_collection(current.id), &page)
             .unwrap();
@@ -4160,6 +4602,7 @@ mod tests {
             dropped_collections: Vec::new(),
             deleted_documents: Vec::new(),
             dropped_indexes: Vec::new(),
+            tombstone_horizon: None,
         };
         let outcome = b
             .apply_snapshot_page(no_sender(), &mut SnapshotProgress::of_collection(id), &page)
@@ -4646,6 +5089,7 @@ mod tests {
             dropped_collections: Vec::new(),
             deleted_documents: Vec::new(),
             dropped_indexes: Vec::new(),
+            tombstone_horizon: None,
         };
         let _ = own;
         b.apply_snapshot_page(a.node_id(), &mut SnapshotProgress::whole_database(), &page).unwrap();
@@ -5726,6 +6170,7 @@ mod tests {
                 stamp: delete,
             }],
             dropped_indexes: Vec::new(),
+            tombstone_horizon: None,
         };
         b.apply_snapshot_page(no_sender(), &mut SnapshotProgress::of_collection(id), &page)
             .unwrap();

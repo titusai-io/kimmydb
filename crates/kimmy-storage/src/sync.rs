@@ -279,6 +279,11 @@ pub struct SyncOutcome {
     /// batch had stopped at a collection this node lacks. Set only by
     /// `kimmy-cluster`'s `sync_once`, like `exhausted`.
     pub repairing: bool,
+    /// Whether the repair this round was spent on is a *count* repair (a replay or a
+    /// whole-database or scoped snapshot, ADR-148), the half `kimmy_sync_repair_rounds_total`
+    /// counts. A document or definition repair (`Converge`, `Definitions`) sets `repairing`
+    /// and not this: they have their own series. Set only by `kimmy-cluster`'s `sync_once`.
+    pub count_repair: bool,
     /// The peer answered `BeyondHorizon` and this round did **not** take a
     /// snapshot from it: it was set aside so the tick's other contacts could serve
     /// this member first (ADR-224). Nothing else in the outcome is meaningful: the
@@ -1298,6 +1303,13 @@ impl Engine {
             // stamp is recorded for an entry that was not applied. See
             // ADR-054. The one entry not taken — a collection this node
             // lacks — is not observed, and the batch ends at it.
+            // The lab's loss of one replicated entry: witnessed, not written (repair design
+            // section 15.1). Not compiled into any build that ships.
+            #[cfg(feature = "lab-hooks")]
+            if crate::lab_hooks::drops(entry, || self.lab_hook_entry_would_write(entry)) {
+                witnessed.observe(entry.stamp);
+                continue;
+            }
             match self.apply_one(entry, position, run, &mut memo, outcome)? {
                 Step::Taken => witnessed.observe(entry.stamp),
                 Step::Unknown(name) => {
@@ -3105,6 +3117,12 @@ pub(crate) mod race_hooks {
         /// Turning vectors off found them already off and has not yet taken
         /// the writer to drop the shadow a partial disable left.
         LeftoverShadow,
+        /// A definition repair chose the index it will build, and has not yet taken
+        /// the writer to build it.
+        DefinitionRepair,
+        /// A document repair's page has been taken and judged to apply, and has not yet taken
+        /// the writer: a retention pass can commit between a plan and the page.
+        ConvergePage,
     }
 
     type Hook = Box<dyn FnOnce()>;
