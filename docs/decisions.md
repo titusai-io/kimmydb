@@ -26859,7 +26859,7 @@ the other side of the life. The decision and the two commits:
    (see 6), and, if the sweep left no live record and no definition stamped after `D`, **buries the life and its
    shadow in that commit** (not a shadow whose parent stands with a vector configuration). The burial does not
    go through the incarnation rule that would turn the same drop away from a life dated above it
-   (`bury_redated_in_txn`).
+   (`bury_redated_in_txn`). (**Amended by [ADR-236](#adr-236--a-databases-drop-keeps-what-is-stamped-after-it-as-a-collections-does-and-one-rule-judges-each-drop-creation-and-definition-on-every-route)**, F16: "no live record" is now "no record stamped after `D`, a tombstone included": a delete made after the drop is a write after it, and the life keeps it.)
 5. **The database's guard, one rule on every route (D-3).** A life created **at or before** its database's
    tombstone is buried with the database, whichever route the collection's drop came by (an entry, a scoped
    snapshot, a whole-database page): this is ADR-229, unchanged. A life created **after** it (a database dropped
@@ -27268,7 +27268,8 @@ state without the field decodes to none and none is not written. Mutation rows (
 > **Amends [ADR-229](#adr-229--a-database-drop-is-a-tombstone-filed-under-a-reserved-collection-name-and-every-member-buries-what-it-covers)**
 > (item 4's burial "writes and all", the Breaking list, the warning for a lost write),
 > **[ADR-231](#adr-231--a-drop-that-reaches-a-newer-life-sets-its-floor-at-the-drop-and-removes-what-that-life-took-in-of-the-one-before)**
-> (the extension's "for collection drops only" and its D-3 guard; item 7's replay origin; the addendum's tie),
+> (the extension's "for collection drops only", its D-3 guard and item 4's burial of a life holding only a delete;
+> item 7's replay origin; the addendum's tie),
 > **[ADR-155](#adr-155--a-collection-this-node-dropped-is-not-a-divergence-and-a-snapshot-does-not-bring-it-back)**
 > (the creation-history rule's two shapes), **ADR-148** (a definition for a collection this node dropped),
 > **[ADR-233](#adr-233--a-snapshot-page-moves-the-clock-past-what-it-restores-and-honours-the-receivers-own-index-tombstone)**
@@ -27285,7 +27286,8 @@ settled three ways (entries, entries with the divergence check's repairs, pages)
 databases, collections, documents with their stamps, index definitions, floors and tombstones, and lose no write a
 history kept by the test says survives. Its first report named nine findings (F1 to F10, F2 withdrawn, F8 fixed by
 ADR-235's last commit); fixing them exposed four more (F11 to F14), and the ADR-233 vacuity gap below. F15 came from a
-review of the repair design (a calibration test that showed the window).
+review of the repair design (a calibration test that showed the window), and F16 from a second model test, of young
+stamps (its YS1).
 
 **Decision.**
 
@@ -27314,7 +27316,10 @@ review of the repair design (a calibration test that showed the window).
    down (F13):** the late-drop sweep selects a definition at the drop's own `Hlc` as the drop's, and now passes the
    index's own stamp where it sorts above the drop's, so the replicated drop's `Stamp` rule no longer declines it on
    the one member that swept it while every other member refused it by its floor (ADR-231's addendum item 3 is
-   reversed). The index tombstone is recorded at that stamp.
+   reversed). The index tombstone is recorded at that stamp. **A vector configuration changed in the drop's own `Hlc`**
+   is turned off the same way: the sweep turns it off in a mode of its own (`Configured::Swept`), at the change's own
+   stamp where that sorts above the drop's, and that mode is not judged by last-writer-wins, which read the drop's
+   stamp as older than such a change and kept the configuration on the sweeping member alone.
 3. **What a member decides about a drop, it serves onward (F4).** A replicated `DropCollection` it ignores (its own
    life is newer) is appended as an applied one is, and so is a `CreateCollection` its database's drop refuses. The
    member's vector named the origin past both, so a peer that pulled it was never served them by anyone: it kept a
@@ -27371,6 +27376,18 @@ review of the repair design (a calibration test that showed the window).
    trailing clock reaches other members only through a later step that mints, which a stamp-based ghost reads as
    ordered. Once a page is applied, the receiver's clock must be at or past every stamp it restores that the sender's
    coverage names (`ClockBehind`); two named rows build the case on both page routes.
+9. **A delete made after the drop is a write after it (F16, from the young-stamp model test's YS1; ruled by Chris,
+   2026-10-15).** The sweep's last commit buried a re-dated life when nothing live was left, so a life holding, after
+   the drop, only a delete (a write after the drop, itself deleted) was buried and purged, the delete with it. The
+   member then held a newer life of the name with no record of the document, and a scoped page from a member that had
+   not yet heard the delete (the count repair's, or any other) wrote it back; on the page route every member ended
+   holding it. The last commit now buries only a life that holds nothing stamped after the drop at all: no record,
+   tombstones included, that the sweep walked, and none by the digest row (which counts tombstones and is never
+   lowered) for one that landed in a range already walked. Otherwise the life is re-dated and keeps the tombstone, as
+   it keeps a live write. A shadow's rows are its parent's vectors and stay judged by its parent. The other burial
+   sites read the same evidence already: the fast path is taken only when the digest row puts every record at or below
+   the drop, and a database's drop goes through the same path (item 1). Amends ADR-231's extension item 4 ("if the
+   sweep left no live record").
 
 **Why not the alternatives.** *Make the newer life refuse an entry of a covered life* (F6's other option) needs a
 life identity on the entry, which entries do not carry. *Store the creation's whole `Stamp`* (F3's) needs a field on
@@ -27399,24 +27416,30 @@ the writes it kept**, while 0.50.0 members keep them; the members differ until t
 points a 0.49.x member keeps its old behaviour and the members can differ as before until the roll completes: it does
 not relay an ignored drop or a refused creation, applies a creation tied with a drop, takes a later-life definition
 as history, refuses a page's later definition with its life, keeps a tied index its sweep selects, and mints a local
-drop or creation at its clock.
+drop or creation at its clock; and, holding a life whose only write after a drop is a delete, it buries the life and
+purges the delete when the drop arrives (F16).
 
-**Residuals.** (1) **A collection the first of two drops of one database reached through its dropper.** The
-dropper buries a collection it holds with an entry of its own stamp (ADR-229 item 2), and that tombstone is not the
-database's expansion, so item 5's raise does not move it; a member that met the same collection's creation only
-under the second drop holds the second drop's stamp. The difference is on the entries route only (a page carries
-both and the table converges), and decides nothing: both members lack the collection under a database tombstone at
-or above both. The model reports it as a subsumed tombstone difference, not a failing group. Closing it needs a
-tombstone that knows its database. (2) A vector configuration changed in a drop's own `Hlc` by a node above the
-dropper's is selected by the sweep and turned off at the drop's stamp, which loses to it on last-writer-wins; item 2's
-remedy for an index (the definition's own stamp) is not enough there, since an equal stamp also loses. Not reached by
-the model, which has no vectors. (3) As before, a far-future stamp: item 6's mints move the clock to a stored stamp
-the coverage did not vouch for, the trade ADR-226 already makes. (4) A vector configuration is judged before its
-writer, on the definition the writer's check then holds unchanged; a drop of an older life whose tombstone lands in
-that instant changes no definition, and its own sweep, which runs after its tombstone, turns the configuration off.
+**Residuals.** (1) **A collection's own drop against a later database drop's expansion: accepted as by design (ruled
+by Chris, 2026-10-15).** A drop of the collection itself (an explicit drop, or a database drop's burial of a
+collection its dropper held, ADR-229 item 2) records a tombstone of its own stamp, which is not a database drop's
+expansion, so item 5's raise does not move it; a member that met the same collection's creation only under a later
+drop of its database holds that drop's stamp. The difference is on the entries route only (a page carries both and the
+table converges), and decides nothing: both members lack the collection under a database tombstone at or above both.
+Closing it would need a tombstone that knows its database, a stored-format change it does not justify. The model
+classifies exactly this shape (one side a drop of the collection, the other a later database drop's stamp) as
+`KnownSubsumed`, counts it apart, keeps it out of a sweep's failing groups, and pins both of its forms with named tests
+of their exact failures on each route
+(`known_residual_two_drops_of_one_database_the_first_dropper_held_the_collection`,
+`known_residual_a_collections_own_drop_and_a_later_database_drop`), so a change in it shows; any other subsumed
+difference is still reported. (2) As before, a far-future stamp: item 6's mints move the clock to a stored
+stamp the coverage did not vouch for, the trade ADR-226 already makes. (3) A vector configuration is judged before
+its writer, on the definition the writer's check then holds unchanged; a drop of an older life whose tombstone lands
+in that instant changes no definition, and its own sweep, which runs after its tombstone, turns the configuration
+off.
 
-**Tests.** The model's rows and findings (`finding_f1` to `finding_f14`, the two clock rows, every required row) and
-its long runs (below). Unit tests: `snapshot_stamp_tests` (a local drop above an unwitnessed creation);
+**Tests.** The model's rows and findings (`finding_f1` to `finding_f16`, the two clock rows, the pinned residual,
+every required row), its no-lost-delete check (F16's mirror of the no-lost-write one: no member holds live a document a
+delete stamped after every drop removed) and its long runs (below). Unit tests: `snapshot_stamp_tests` (a local drop above an unwitnessed creation);
 `database_drop_tests` (a database drop keeps a write after it and says so; a sweep counts what it kept; a creation
 the database refuses is relayed and its tombstone follows; a definition below the database's tombstone is history; a
 life created over the database's tombstone takes its own and its shadow's; a local creation whose next tick is its
@@ -27435,7 +27458,12 @@ a drop taken as history) now pin these. F15's: four `keep_later_writes_tests` ca
 index, an index in the drop's own `Hlc`, and a vector configuration, each arriving between two chunks of the sweep;
 the first is the review's calibration test made to assert the fix), the rule judged before the writer (no writer
 taken) and again under it (a database's drop recorded in between), and a page's vector configuration against a
-tombstone that lands before it applies.
+tombstone that lands before it applies. The vector tie's: a configuration changed in the drop's own `Hlc` is turned
+off at its own stamp (`late_drop`). F16's: the count repair's scoped page does not write a document back over a
+delete made after the drop; a life holding only such a delete keeps it, re-dated; without a digest row the walk's
+records say it; a delete landing behind the sweep's cursor is read from the digest row; and a shadow is judged by its
+parent, not by its own tombstones (`keep_later_writes_tests`). The tests that pinned the emptied-life burial now reach
+it by a life that holds nothing after the drop (an absent digest row).
 
 **Mutation run: 50 rows, 47 killed, 3 equivalent.** A harness that is not in the tree (the rows are named here as the
 record), each row one textual change to the committed tree run under `bash` with a 900 s timeout, reset by `git

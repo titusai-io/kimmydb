@@ -617,6 +617,10 @@ members stayed different. Two things follow, and both are intended:
   writes to it through another member before that member has applied the drop
   can bring it back. Do not write into a collection through a member that has
   not yet received its drop; confirm the drop on the members first.
+- **A delete counts as a write** (since 0.50.0, [ADR-236](decisions.md)). If the
+  only thing written after the drop was a delete, the collection comes back holding
+  no document, with the delete, so a document the delete removed cannot be written
+  back by a peer that had not yet heard it.
 - **Clock skew can cause it.** "After" is decided by the stamp, not by real
   time. A write made *earlier* in real time by a member whose clock runs
   *ahead* of the dropping member's is stamped after the drop and counts as
