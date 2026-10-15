@@ -85,6 +85,12 @@ pub(crate) enum Configured {
     /// it. The shadow is its own collection on the page, restored at its own stamp,
     /// and is not created here.
     FromSnapshot(Option<kimmy_core::Stamp>),
+    /// A late-drop sweep turning off a configuration of the life before (ADR-231),
+    /// at the stamp given: the drop's, or the change's own where that sorts above the
+    /// drop's in the drop's own `Hlc` (ADR-236: a tie is the drop's). Not judged by
+    /// last-writer-wins, which would read the drop's stamp as older than such a change
+    /// and keep it on this member alone. Only ever turns a configuration off.
+    Swept(kimmy_core::Stamp),
 }
 
 impl Configured {
@@ -103,7 +109,7 @@ impl Configured {
     fn stamp(self) -> Option<kimmy_core::Stamp> {
         match self {
             Self::Locally => None,
-            Self::FromEntry(stamp) => Some(stamp),
+            Self::FromEntry(stamp) | Self::Swept(stamp) => Some(stamp),
             Self::FromSnapshot(stamp) => stamp,
         }
     }
@@ -262,7 +268,8 @@ impl crate::Engine {
                     &|dropped| crate::sync::creation_is_history(stamp.hlc, dropped.hlc),
                     || stamp,
                 )),
-                Configured::FromSnapshot(_) => None,
+                // A sweep only turns a configuration off, and never configures.
+                Configured::FromSnapshot(_) | Configured::Swept(_) => None,
             };
             let shadow_entry = match created {
                 Some(Ok(crate::engine::InTxn::Created(_, entry))) => entry,
@@ -442,8 +449,12 @@ impl crate::Engine {
             }
             #[cfg(test)]
             crate::sync::race_hooks::reach(crate::sync::race_hooks::Race::VectorRemoval);
-            // Last writer wins, on the stamp (ADR-226), as for a configuration.
-            if by.stamp().is_some_and(|incoming| meta.vector_changed.is_some_and(|c| c >= incoming))
+            // Last writer wins, on the stamp (ADR-226), as for a configuration; but
+            // not for a sweep's turning off a configuration of the life before.
+            if !matches!(by, Configured::Swept(_))
+                && by
+                    .stamp()
+                    .is_some_and(|incoming| meta.vector_changed.is_some_and(|c| c >= incoming))
             {
                 return Ok(VectorsOff { disabled: false, dropped_vectors: false });
             }

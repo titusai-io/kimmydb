@@ -314,14 +314,18 @@ impl Engine {
                 self.drop_index_inner(db, name, &index.name, Some(dropped.max(created)))?;
             }
         }
+        // As for an index, a change in the drop's own `Hlc` is the drop's, whatever its node
+        // (ADR-236), and is turned off at its own stamp where that sorts above the drop's,
+        // not by last-writer-wins, which would keep it here alone.
         if standing.vector.is_some()
-            && standing.vector_changed.is_some_and(|changed| changed.hlc <= dropped.hlc)
+            && let Some(changed) =
+                standing.vector_changed.filter(|changed| changed.hlc <= dropped.hlc)
         {
             self.disable_vectors_inner(
                 db,
                 name,
                 false,
-                crate::vectors::Configured::FromEntry(dropped),
+                crate::vectors::Configured::Swept(dropped.max(changed)),
                 &|_| Ok(false),
             )?;
         }
@@ -1707,6 +1711,26 @@ mod tests {
             Some(above),
             "the tie's drop is recorded at the index's own stamp"
         );
+    }
+
+    /// The same for a vector configuration changed in the drop's own `Hlc` by a node above
+    /// the dropper's (ADR-236): the sweep selects it as the drop's and turns it off, though
+    /// last-writer-wins would read the drop's stamp as older than the change. The change's
+    /// stamp stays the one recorded, as the index's drop is recorded at the index's own.
+    /// (It was turned off at the drop's stamp, which lost to the change: this member alone
+    /// kept a configuration every other member refused by its floor.)
+    #[test]
+    fn a_vector_configuration_tied_at_the_drop_is_turned_off_as_the_drops() {
+        let (a, b, _da, _db, dropped) = a_drop_and_a_later_life();
+        b.configure_vectors("shop", "orders", byo_config()).unwrap();
+        let above = Stamp::new(dropped.hlc, NodeId::from_bytes([0xff; 16]));
+        assert!(above > dropped, "premise: the tie sorts above the dropper's");
+        edit_meta(&b, |meta| meta.vector_changed = Some(above));
+        pull(&b, &a);
+        let standing = b.get_collection("shop", "orders").unwrap();
+        assert!(standing.vector.is_none(), "the tie was kept: {:?}", standing.vector);
+        assert_eq!(standing.vector_changed, Some(above), "turned off at the change's own stamp");
+        assert_eq!(standing.incarnation_floor, Some(dropped.hlc), "and the sweep finished");
     }
 
     /// f-1. A newer life's index with the same derived id as the old one's (same
