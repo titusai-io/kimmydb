@@ -71,6 +71,8 @@ struct Storm {
     count_repairs_planned: usize,
     /// Count repairs planned, by requester and peer.
     count_plans: BTreeMap<(&'static str, &'static str), usize>,
+    /// Simulated minutes at which each of them was planned.
+    count_plan_minutes: BTreeMap<(&'static str, &'static str), Vec<f64>>,
     skipped_count_repair: usize,
     ticks: u64,
 }
@@ -217,6 +219,13 @@ async fn tick(
                         storm.count_repairs_planned += planned;
                         if let Some(peer) = names.get(&node).copied() {
                             *storm.count_plans.entry((m.name, peer)).or_default() += planned;
+                            if planned > 0 {
+                                storm
+                                    .count_plan_minutes
+                                    .entry((m.name, peer))
+                                    .or_default()
+                                    .push(now.as_secs_f64() / 60.0);
+                            }
                         }
                         let digest_confirmed = m.divergence.digest_confirmed_against(node);
                         plan_digest_repairs(
@@ -547,7 +556,15 @@ fn summary(label: &str, storm: &Storm) -> String {
     );
     for ((me, peer), n) in &storm.count_plans {
         if *n > 0 {
-            s.push_str(&format!("REVC STORM {label}:   {me}<-{peer}: {n} count repairs planned\n"));
+            let at: Vec<String> = storm
+                .count_plan_minutes
+                .get(&(*me, *peer))
+                .map(|v| v.iter().map(|m| format!("{m:.1}")).collect())
+                .unwrap_or_default();
+            s.push_str(&format!(
+                "REVC STORM {label}:   {me}<-{peer}: {n} count repairs planned at min [{}]\n",
+                at.join(", ")
+            ));
         }
     }
     for ((me, peer), log) in &storm.pairs {
@@ -706,10 +723,14 @@ async fn revc_storm_a_peer_that_stops_and_moves_is_count_repaired_once_per_coold
     println!("{}", summary("stop-and-move", &storm));
     let ticks = knobs.hours * 3600 / INTERVAL.as_secs();
     let cycles = ticks / (stopped + 3);
-    let limit = ticks / u64::from(crate::transport::REPAIR_COOLDOWN_ROUNDS) + 3;
+    // The cooldown is per collection: the pair's `orders` and the written `live` both differ
+    // by a count while B trails, so each may be planned once per cooldown (and once at the
+    // start).
+    let collections = 2;
+    let limit = collections * (ticks / u64::from(crate::transport::REPAIR_COOLDOWN_ROUNDS) + 2);
     let planned = storm.count_plans.get(&("A", "B")).copied().unwrap_or(0) as u64;
     assert!(
-        cycles > 4 * limit,
+        cycles > 2 * limit,
         "the shape is meant to stop B {cycles} times, far more than the {limit} the cooldown allows"
     );
     assert!(planned >= 1, "the storm never formed\n{}", summary("stop-and-move", &storm));
