@@ -248,7 +248,10 @@ held, and a member that buries one has no entry of its own to end the stream on
 it: the sweep, a snapshot page and a start bury without minting one. The engine
 sends a notice instead, and a stream of that collection ends with
 `Invalidate{CollectionDropped}` as it does for an entry. A stream opened while
-the sweep runs, or after a notice was missed, is ended too.
+the sweep runs, or after a notice was missed, is ended too. A collection the drop
+covers that holds writes stamped after it is kept with them (ADR-236) and
+re-dated just above the drop, as a collection's own drop keeps it; its streams
+end the same way, at the first commit, as at a burial.
 
 A collection that **stands** under a database's drop (created after it) keeps
 its streams and its resume tokens, including a token issued before the drop

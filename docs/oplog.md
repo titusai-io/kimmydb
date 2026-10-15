@@ -436,7 +436,19 @@ collection dropped here is not one that may still arrive, so an entry addressed
 to it — including a peer's ordinary write made before it heard the drop — is
 superseded, witnessed and carried past rather than stopping anything. That is
 ADR-123's case: re-delivering it unchanged can never succeed
-([ADR-148](decisions.md)).
+([ADR-148](decisions.md)). A document is brought back where it belongs by the
+count half's replay. **A definition stamped after the tombstone is the one
+exception** (an index creation or a vector configuration, [ADR-236](decisions.md)):
+it belongs to a life of the name this node has not had yet, a newer one whose
+creation sorts after it or the one the drop kept elsewhere, and nothing replays a
+definition, so it stops the batch as a collection with no record does and the
+scoped snapshot brings the life with it. An index's drop stays history: its
+tombstone is recorded, which is all of it the later life needs.
+
+**A drop this node ignores is held and served onward like one it applies**
+([ADR-236](decisions.md)), and so is a creation its database's drop refuses: the
+vector this node serves names the origin past them, so withholding them left the
+next member never served them by anyone.
 
 **A stamp is minted only under the writer, so `oplog_versions` never names a
 stamp the committed oplog does not hold for the local origin.** Every local

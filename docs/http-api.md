@@ -551,10 +551,12 @@ they are removed ([ADR-189](decisions.md)).
 
 **A database drop is cluster-wide, and it reaches collections the member
 answering it does not hold.** The drop is stamped. On every member, every
-collection of the database created at or before that stamp is dropped, with its
-documents, **including one created on another member that this member had not
-received**, and no collection created at or before it can be created. A
-collection created after it stands. (Before 0.47.0 a drop covered only the
+collection of the database created at or before that stamp is dropped, with the
+documents written into it at or before the stamp, **including one created on
+another member that this member had not received**, and no collection created at
+or before it can be created. A collection created after it stands. **A write
+stamped after the drop is kept**, as it is for a collection's drop (below; since
+0.50.0, [ADR-236](decisions.md)). (Before 0.47.0 a drop covered only the
 collections the member held when it was applied, and a collection it had not
 received brought the database back, on every member, with that collection in
 it. [ADR-229](decisions.md).)
@@ -571,14 +573,19 @@ drop on each.
 member lists it gone** (`GET /v1/databases` on each) before creating it anywhere
 else. A creation is judged by the stamp it was made at, and a member that has
 not yet received the drop may stamp a creation before it, when its clock is
-behind the dropping member's. Such a creation is dropped with the database, with
-the documents written into it afterwards, and the writes are answered `200`.
-The window is the replication lag, the clock skew between the members and the
-time the drop takes to bury its collections; it closes once the creating member
-has received the drop. **A write acknowledged into a collection on a member
-that has not yet applied a database drop is lost with it.** The same holds for
-a member that is behind longer than `storage.tombstone_retention_secs`, which
-can bring the database back.
+behind the dropping member's. Such a creation is dropped with the database. The
+documents written into it are judged by their own stamps, as for a collection's
+drop: those stamped at or before the drop go with it, and those stamped after it
+are kept, so the collection, and the database, come back on every member holding
+only them. The window is the replication lag, the clock skew between the members
+and the time the drop takes to bury its collections; it closes once the creating
+member has received the drop. **A write acknowledged into a collection on a
+member that has not yet applied a database drop is kept when it is stamped after
+the drop, and brings the collection back** (since 0.50.0,
+[ADR-236](decisions.md); 0.47.0 to 0.49.x lost it with the collection on the
+member that held the collection, and kept it on a member that held a newer one
+of the name, so the members could stay different). A member that is behind
+longer than `storage.tombstone_retention_secs` can still bring the database back.
 
 **Dropping a collection on one member and creating the same name through
 another before the drop has replicated converges since 0.49.0**
@@ -615,8 +622,10 @@ members stayed different. Two things follow, and both are intended:
   *ahead* of the dropping member's is stamped after the drop and counts as
   "after" if it reaches a member that has not applied the drop.
 
-A **database** drop is unchanged: a collection created at or before it is
-buried with the database and what was written into it afterwards, as above. While
+A **database** drop does the same since 0.50.0 ([ADR-236](decisions.md)): a
+collection created at or before it keeps what was written into it after the
+drop's stamp, and can come back with it, database and all. (0.49.x buried such a
+collection with the writes made into it afterwards.) While
 a member removes what the drop covers (a thousand records per commit, bounded
 by the chunk) a read of the collection still shows documents stamped before the
 drop and counts them; the change streams open on the collection end when the

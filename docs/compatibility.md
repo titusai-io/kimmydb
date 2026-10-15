@@ -162,6 +162,17 @@ That restart needs the tombstone, which every member collects after
 any database drop made during it**, or the collection, and with it the database,
 comes back on every member.
 
+**A database drop keeps what is stamped after it (0.50.0, [ADR-236](decisions.md)),
+which changes what the route means again.** A write made into a collection of the
+database after the drop's stamp, through a member that had not received the drop,
+is kept, as for a collection's drop since 0.49.0, so the collection and the database
+can come back holding only such writes. A 0.49.x member in a mixed cluster buries such
+a collection with the write, and refuses the kept collection from a 0.50.0 member
+until it is upgraded; **a store rolled back to 0.49.x buries, at its next start, every
+collection 0.50.0 kept under a database drop, with the writes it kept**, so the members
+differ until they run one version. No table, schema, wire field, backup tag or entry
+kind changed.
+
 **A member-at-a-time roll is not evidence that mixed versions work together.**
 The 0.28.0 roll took about 10 s from first member to last, the cluster was
 mixed for 6.8 s of it, and no sync round crossed versions in that window, so a
