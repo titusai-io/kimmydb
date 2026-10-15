@@ -583,6 +583,9 @@ fn logged(run: impl FnOnce()) -> Vec<String> {
     let seen = Arc::clone(&lines.0);
     {
         let _recording = tracing::subscriber::set_default(lines);
+        // A callsite first hit on a thread with no subscriber is cached as uninteresting for
+        // every thread; rebuild so this subscriber sees the events of a parallel run.
+        tracing::callsite::rebuild_interest_cache();
         run();
     }
     seen.lock().unwrap().clone()

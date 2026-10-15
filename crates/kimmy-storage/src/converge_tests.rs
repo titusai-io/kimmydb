@@ -228,7 +228,6 @@ fn a_row_of_a_buried_life_is_superseded_not_left() {
 #[test]
 fn the_pages_definitions_are_not_restored() {
     let (a, b, _d) = pair();
-    use crate::IndexField;
     a.create_index_with(
         "shop",
         "orders",
@@ -285,7 +284,6 @@ fn the_pages_definitions_are_not_restored() {
 #[test]
 fn the_pages_carried_index_drops_are_not_applied() {
     let (a, b, _d) = pair();
-    use crate::IndexField;
     b.create_index(
         "shop",
         "orders",
@@ -485,7 +483,6 @@ fn a_young_row_is_not_written_into_a_life_that_owes_a_sweep_for_a_database_drop(
 #[test]
 fn a_created_row_maintains_the_indexes_like_any_replicated_row() {
     let (a, b, _d) = young_pair();
-    use crate::IndexField;
     for e in [&a, &b] {
         e.create_index(
             "shop",

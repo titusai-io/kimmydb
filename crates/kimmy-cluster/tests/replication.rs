@@ -4574,6 +4574,9 @@ async fn a_confirmed_count_divergence_is_repaired_through_the_real_loop() {
         ReplicationConfig::new(vec![SeedSource::Static(vec![a.addr])], SECRET.into(), b.addr);
     config.sync_interval = Duration::from_millis(50);
     config.discovery_interval = Duration::from_millis(50);
+    // The count half's repair is what this test is about; the document repair would
+    // converge the same hole first.
+    config.divergence_repair = false;
     config.on_round = Some(Arc::new(move |report| {
         let _ = tx.send(report);
     }));
@@ -10352,16 +10355,21 @@ async fn a_lost_update_is_repaired_by_the_document_repair_and_judged_effective()
 async fn with_the_switch_off_the_finding_stands_and_nothing_is_planned() {
     use kimmy_cluster::DigestRepairOutcome;
     let (a, b, _ca) = a_and_b_with_a_lost_update().await;
+    let mut rounds = 0;
     let (totals, last) = repair_loop(
         &a,
         &b,
         |config| config.divergence_repair = false,
         |report, totals| {
+            // Counted once for the finding that stands, however many contacts it stands for.
+            rounds += 1;
             report.digest_divergent_collections == 1
-                && totals.digest_repairs[DigestRepairOutcome::Disabled.index()] >= 2
+                && totals.digest_repairs[DigestRepairOutcome::Disabled.index()] >= 1
+                && rounds >= 25
         },
     )
     .await;
+    assert_eq!(totals.digest_repairs[DigestRepairOutcome::Disabled.index()], 1, "{totals:?}");
     assert_eq!(version_of(&b, 2), 0, "a repair ran with the switch off");
     assert_eq!(totals.digest_repairs[DigestRepairOutcome::Applied.index()], 0, "{totals:?}");
     assert!(!last.repair_enabled, "the gauge says this member only detects");
@@ -10371,13 +10379,18 @@ async fn with_the_switch_off_the_finding_stands_and_nothing_is_planned() {
 async fn a_collection_over_the_size_gate_is_left_to_the_operator_and_counted() {
     use kimmy_cluster::DigestRepairOutcome;
     let (a, b, _ca) = a_and_b_with_a_lost_update().await;
+    let mut rounds = 0;
     let (totals, _) = repair_loop(
         &a,
         &b,
         |config| config.repair_max_documents = 3,
-        |_, totals| totals.digest_repairs[DigestRepairOutcome::TooLarge.index()] >= 2,
+        |_, totals| {
+            rounds += 1;
+            totals.digest_repairs[DigestRepairOutcome::TooLarge.index()] >= 1 && rounds >= 25
+        },
     )
     .await;
+    assert_eq!(totals.digest_repairs[DigestRepairOutcome::TooLarge.index()], 1, "{totals:?}");
     assert_eq!(version_of(&b, 2), 0, "a repair ran over the gate");
     assert_eq!(totals.digest_repairs[DigestRepairOutcome::Applied.index()], 0);
 }

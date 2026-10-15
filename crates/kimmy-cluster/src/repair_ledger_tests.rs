@@ -495,7 +495,7 @@ mod model {
                     Outcome::Transient { ended } => {
                         // The third in a row climbs one level (R1).
                         transient += 1;
-                        if transient % 3 == 0 {
+                        if transient.is_multiple_of(3) {
                             level = (level + 1).min(5);
                             not_before = ended + BACKOFF[usize::from(level) - 1];
                         }

@@ -8883,6 +8883,21 @@ mod tests {
         assert_eq!(rounds[0].1, rounds[1].1, "the ordinary round repaired nothing: {rounds:?}");
     }
 
+    /// The Definitions page's index build runs off the async worker (review B m10). A source
+    /// guard: a build over up to the size gate's documents on a tokio worker stalls its other
+    /// tasks, and no timing test of ours would see it on an idle runtime.
+    #[test]
+    fn the_definitions_page_is_applied_under_blocking() {
+        let source = include_str!("transport.rs");
+        let needle =
+            ["kimmy_storage::blocking(|| engine.", "apply_snapshot_page(node, progress, &page))"]
+                .concat();
+        assert_eq!(source.matches(&needle).count(), 1);
+        let at = source.find(&needle).unwrap();
+        let before = &source[at.saturating_sub(200)..at];
+        assert!(before.contains("SnapshotPolicy::Definitions"), "{before}");
+    }
+
     /// A Converge repair ends once it has walked the pages its bound allows, whether or not
     /// the collection has more (review B m9): a collection of three pages bounded at two
     /// finishes with the third unwalked, and the repair is then judged.

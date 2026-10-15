@@ -2254,7 +2254,11 @@ fn plan_definition_repairs(
 /// that cannot be read is as large as can be, so the gate refuses rather than lets a repair
 /// through that it could not size; a collection this member does not hold has none.
 fn live_documents(engine: &Engine, collection: kimmy_core::CollectionId) -> u64 {
-    match engine.count_by_id(collection) {
+    gate_count(engine.count_by_id(collection))
+}
+
+fn gate_count<E>(read: Result<Option<u64>, E>) -> u64 {
+    match read {
         Ok(Some(live)) => live,
         Ok(None) => 0,
         Err(_) => u64::MAX,
@@ -5049,6 +5053,20 @@ mod definition_fold_tests {
         hear(false);
         catch_up.mark(crate::facts::CatchUpReason::Snapshot).unwrap();
         assert!(either_side_is_catching_up(&config, peer), "this member's marker is set");
+    }
+
+    /// A count that cannot be read refuses the repair rather than letting it through.
+    #[test]
+    fn a_size_gate_count_that_cannot_be_read_is_as_large_as_can_be() {
+        assert_eq!(gate_count::<()>(Ok(Some(7))), 7);
+        assert_eq!(gate_count::<()>(Ok(None)), 0, "a collection this member does not hold");
+        assert_eq!(gate_count(Err(())), u64::MAX);
+        let config =
+            ReplicationConfig::new(Vec::new(), "secret".into(), "127.0.0.1:1".parse().unwrap());
+        assert_eq!(
+            repair_gate(&config, false, gate_count(Err(())), config.repair_max_documents),
+            RepairGate::TooLarge
+        );
     }
 
     /// The gates before the planner, in order: the switch wins over everything, then a side

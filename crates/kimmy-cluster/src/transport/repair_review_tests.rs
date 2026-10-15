@@ -67,6 +67,7 @@ async fn two_small_converge_repairs_leave_no_ordinary_round_between_them() {
     let a = Arc::new(Engine::open(&a_dir.path().join("kimmy.redb")).unwrap());
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
+    // UNSUPERVISED: a test peer, ended with the test
     tokio::spawn(serve(Arc::clone(&a), listener, SECRET.into()));
     let c1 = a.create_collection("shop", "c1").unwrap();
     let c2 = a.create_collection("shop", "c2").unwrap();
@@ -236,6 +237,7 @@ fn background_writers(b: &Arc<Engine>, n: usize) -> Writers {
                 Arc::clone(&longest_us),
                 coll.clone(),
             );
+            // UNSUPERVISED: a test driver, aborted or joined below; a panic in it fails the test
             std::thread::spawn(move || {
                 let mut i = 0i64;
                 while !stop.load(Ordering::SeqCst) {
@@ -279,6 +281,7 @@ async fn a_stop_mid_converge_with_background_writers_is_prompt_and_holds_nothing
     let a = Arc::new(Engine::open(&a_dir.path().join("kimmy.redb")).unwrap());
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
+    // UNSUPERVISED: a test peer, ended with the test
     tokio::spawn(serve(Arc::clone(&a), listener, SECRET.into()));
     let orders = a.create_collection("shop", "orders").unwrap();
     let docs = 40 * kimmy_storage::SNAPSHOT_PAGE as i64;
@@ -323,6 +326,7 @@ async fn a_stop_mid_converge_with_background_writers_is_prompt_and_holds_nothing
         stalls.plan_digest_repair(a.node_id(), orders.id, VersionVector::default()),
         DigestPlan::Planned
     );
+    // UNSUPERVISED: a test driver, aborted or joined below; a panic in it fails the test
     let looping = tokio::spawn({
         let b = Arc::clone(&b);
         async move {
@@ -369,6 +373,7 @@ async fn a_stop_mid_definition_build_with_background_writers_is_prompt() {
     let a = Arc::new(Engine::open(&a_dir.path().join("kimmy.redb")).unwrap());
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
+    // UNSUPERVISED: a test peer, ended with the test
     tokio::spawn(serve(Arc::clone(&a), listener, SECRET.into()));
     let orders = a.create_collection("shop", "orders").unwrap();
     let docs = 120_000i64;
@@ -407,6 +412,7 @@ async fn a_stop_mid_definition_build_with_background_writers_is_prompt() {
         DigestPlan::Planned
     );
     let started = Instant::now();
+    // UNSUPERVISED: a test driver, aborted or joined below; a panic in it fails the test
     let looping = tokio::spawn({
         let b = Arc::clone(&b);
         async move {
@@ -525,6 +531,11 @@ fn a_member_is_removed_only_after_the_grace_and_the_tracker_follows() {
             DigestPlan::Planned
         );
     }
+    stalls.digest_repair_refused(p, c, DigestRepairOutcome::TooLarge);
+    assert_eq!(
+        stalls.take_repair_counts().digest_repairs[DigestRepairOutcome::TooLarge.index()],
+        1
+    );
     // Only `q` is live from here on.
     let down = BTreeSet::from([q]);
     stalls.set_repair_clock(secs(60), secs(5));
@@ -543,6 +554,9 @@ fn a_member_is_removed_only_after_the_grace_and_the_tracker_follows() {
         DigestPlan::Planned,
         "removed beyond the grace: a fresh entry"
     );
+    stalls.digest_repair_refused(p, c, DigestRepairOutcome::TooLarge);
+    let again = stalls.take_repair_counts().digest_repairs[DigestRepairOutcome::TooLarge.index()];
+    assert_eq!(again, 1, "and a refusal is counted afresh");
     assert_eq!(stalls.retain_ledger(&held, None), None, "no member list, nothing judged");
 }
 

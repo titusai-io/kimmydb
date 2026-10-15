@@ -27313,7 +27313,10 @@ close the cases it can prove safe, leave the rest to the operator in words, and 
    classifies it: counted, hinted, and the next comparison is `explained`.
 5. **The loop guard** (a pure state machine, `repair_ledger.rs`, one entry per `(peer, collection, kind)`, in memory;
    a restart forgets it). **R1** a transient end (a peer error, a stop, a drop, a whole-database takeover, a
-   cancellation) changes nothing but the cooldown. **R2** a repair is judged at the first *compared* probe after its end
+   cancellation, a definition page that does not carry the collection) changes nothing but the cooldown, **except that
+   the third consecutive transient end of one `(peer, collection, kind)` climbs one level** (a failure that repeats
+   deterministically, such as a page that always faults, is not allowed to retry at the cooldown for ever; a repair that
+   ran to its end and was judged resets the run). **R2** a repair is judged at the first *compared* probe after its end
    and only there; an unjudged deadline (three rotation periods, at least 30 minutes) counts as transient, but every
    second consecutive unjudged end is one ineffective step. **R3** an ineffective repair backs off 5 min, 15 min, 45 min,
    2 h 15 min, 6 h (cap 5); a repair that made **progress lowers the level to 1**, and progress is **a row at or below the
@@ -27321,12 +27324,33 @@ close the cases it can prove safe, leave the rest to the operator in words, and 
    `apply_snapshot_page`) for the document kind and a built index for the definition kind. Rows above the cut are what
    ordinary replication also brings under live writes; counting them lowers the level on nearly every repair and a
    standing ambiguous id would never climb to the cap. **R4** more than three clear-and-recur episodes in a rolling
-   hour, per collection and deduplicated across peers within three rotation periods, stop the collection for six
-   hours or until it has been clear for an hour. **R5** only a confirmed, un-stopped, un-backed-off finding plans, and
-   not while a repair is in flight or awaiting its probe. **R7** the ledger and the tracker (by member as well as by
-   collection) are pruned in the tick's `if let Ok(held)` block, guarded textually.
+   hour, **per collection and kind**, stop that kind of repair of the collection for six hours or until it has been clear
+   for an hour. An episode counts when a repair that cleared the finding is followed by the finding standing again; the
+   arm belongs to the kind, so a digest repair that cleared its finding is no recurrence of a definition finding that
+   stands. Episodes are deduplicated **only across different peers** (a partition that heals on five members is one
+   event, not five), within a window of three rotation periods **capped at 15 minutes**: the same peer's recurrence
+   always counts, so a member with many collections (a long rotation) still stops a one-peer loop. **R5** only a
+   confirmed, un-stopped, un-backed-off finding plans, and not while a repair is in flight or awaiting its probe. A plan
+   gate that refuses (`disabled`, `too_large`, `skipped_count_repair`) is counted **once per standing finding**, not at
+   every contact it stands. **R7** the ledger, the tracker and the planner's per-peer state are pruned in the tick's
+   `if let Ok(held)` block, guarded textually: by collection when it is no longer held, and by member **only after the
+   member has been absent from the live member list for 12 hours** (`MEMBER_GRACE`). The cluster has no configured
+   member set with node ids (`cluster.seeds` are addresses and SWIM discovers the rest), and SWIM removes a member from
+   the live list the moment it marks it down, so a peer down for a restart or a six-second cut would otherwise lose its
+   level, back-off and arm and be repaired again at level 0 on its return. The tracker is pruned by member only with the
+   repair switched on, so with `cluster.divergence_repair = false` the gauges are exactly 0.49.0's. The loop guard's
+   clock and its unjudged deadlines are read before the collections are listed, so a failed listing does not skip them.
+5a. **A repair does not starve ordinary replication, and does not chase a tail.** A `Converge` or `Definitions` pull
+   alternates **per peer**: after any such pull to a peer the next contact with it is an ordinary one, whichever repair
+   is next, and a second pull in the contact that had one is ordinary too (`[repair, ordinary, repair, ordinary]`). A
+   count repair is not alternated (ADR-148). A `Converge` round is capped at 20 pages or 10 seconds, whichever comes
+   first, and resumes two contacts later from its in-memory cursor. A `Converge` repair is also bounded in pages by
+   **this member's live count of the collection when it was planned plus `cluster.repair_max_documents`** (512 records
+   a page): reaching the bound ends it as finished and the loop guard judges it, so a collection under inserts faster
+   than the pull walks cannot hold the peer in a repair for ever. The `Definitions` build runs off the async worker
+   (`kimmy_storage::blocking`), and the size gates fail closed when the count cannot be read.
 6. **`cluster.divergence_repair`** (`true`) switches both repairs; `false` detects only, as 0.49.0, and counts each
-   skipped plan `disabled`. `cluster.repair_max_documents` (2,000,000) and `cluster.repair_max_index_documents`
+   finding's plan `disabled` (once per standing finding). `cluster.repair_max_documents` (2,000,000) and `cluster.repair_max_index_documents`
    (250,000) are refused at zero. Read at start.
 7. **The lab hook** `KIMMY_TEST_DROP_APPLY` (the `lab-hooks` feature; absent from every shipped build) loses one
    replicated entry, witnessed and not written, so the lab can make the divergences these repairs close. The grammar is
