@@ -864,6 +864,7 @@ impl Engine {
         // definition and the old drop (ADR-225).
         self.apply_carried_index_drops(page, progress.scope)?;
         let mut ddl_refused = 0usize;
+        let mut withheld: Vec<Stamp> = Vec::new();
         for state in &page.collections {
             // The sender's tombstone for this id, which a whole page carries
             // (ADR-162): the burial of a life the arriving one followed is named
@@ -876,7 +877,12 @@ impl Engine {
                 }
             };
             match self.restore_collection(state, &page.versions, peer, carried) {
-                Ok(refused) => ddl_refused += refused,
+                Ok(refused) => {
+                    ddl_refused += refused;
+                    if progress.scope.is_none() {
+                        withheld.extend(self.definitions_a_refused_life_keeps(state)?);
+                    }
+                }
                 // The page's own drops just buried a life of this name, and
                 // its rows are the purger's now. What the page committed so
                 // far is its drops and the definitions before this one, and
@@ -910,9 +916,18 @@ impl Engine {
         let shadows_orphaned = self.shadows_orphaned(page)?;
 
         // The coverage a whole-database snapshot grants is the first page's
-        // vector (module docs), remembered here and recorded with the last.
+        // vector (module docs), remembered here and recorded with the last. Short of
+        // each definition of a life this page left absent here that its drop keeps
+        // (`definitions_a_refused_life_keeps`): this member takes it as the entries
+        // route does, once the life reaches it.
         if progress.scope.is_none() && progress.pages == 0 {
-            progress.granted = Some(page.versions.clone());
+            let mut granted = page.versions.clone();
+            for stamp in withheld {
+                if stamp.hlc <= granted.get(stamp.node) {
+                    granted.insert(stamp.node, stamp.hlc.predecessor());
+                }
+            }
+            progress.granted = Some(granted);
         }
         let complete = page.next.is_none();
         // Cloned rather than borrowed: the borrow would outlive the page's
@@ -1592,6 +1607,40 @@ impl Engine {
         if hlc_is_named(hlc, versions) {
             self.witness_hlc(hlc);
         }
+    }
+
+    /// The definitions of a whole page's life, left absent here under a drop, that the
+    /// drop keeps: an index created, or a vector configuration changed, **stamped after**
+    /// the later of the collection's tombstone and its database's (`Hlc`, a tie is the
+    /// drop's; the judgement `defines_a_later_life` makes of the same entry).
+    ///
+    /// A page carrying a life this member refuses (created at or before its drop, from a
+    /// sender that has not heard the drop) is refused whole, its definitions with it. A
+    /// definition made after the drop is not of the life the drop ended: the drop keeps it
+    /// (ADR-231, extended), and the sender keeps the life, re-dated, with it once it hears
+    /// the drop. Its entry is not granted (ADR-236 item 4): granted, this member held the
+    /// coverage of a definition it never held, and its own pages granted it on to a member
+    /// that keeps the life, which then never received the definition, and nothing replays
+    /// a definition. Not granted, it is served again, stops the batch as a later-life
+    /// definition does, and arrives with the life, by the scoped page or by a whole page
+    /// once the sender has re-dated it. A document of the life is history here as it is by
+    /// entries (ADR-148), and the existence and count halves repair it.
+    fn definitions_a_refused_life_keeps(&self, state: &CollectionState) -> Result<Vec<Stamp>> {
+        if self.get_collection(&state.db, &state.name).is_ok() {
+            return Ok(Vec::new());
+        }
+        let id = CollectionId::derive(&state.db, &state.name);
+        let drops = [self.collection_dropped_at(id)?, self.database_dropped_at(&state.db)?];
+        let Some(dropped) = drops.into_iter().flatten().max() else {
+            return Ok(Vec::new());
+        };
+        Ok(state
+            .indexes
+            .iter()
+            .filter_map(|index| index.created)
+            .chain(state.vector_changed)
+            .filter(|stamp| stamp.hlc > dropped.hlc)
+            .collect())
     }
 
     /// A page's life began after a drop that ended the one standing here, and no

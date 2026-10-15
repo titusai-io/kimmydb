@@ -27365,6 +27365,19 @@ stamps (its YS1), and F17 from a storm test of the count half (a loop that repla
    vector first, so a pull cut short while the sender held the life, and resumed after the sender buried it, is
    answered by the pages that follow (from the review of the second cut; it waited for a fresh pull after the repair
    cooldown). Not from every page: a resumed page from a sender that holds a life carries no definition either.
+   **A whole page grants no later definition of a life the receiver refuses (F18, found by a generated seed outside
+   the first runs' range).** A whole page carrying such a life refused its definitions with it, those made after the
+   drop too, and granted the coverage of their entries; the receiver's own whole pages then granted that coverage on
+   to a member keeping the life (re-dated by the drop, with a write made after it), which never received the
+   definition. Seed 48093 has it for an index made after a database's drop; a collection's drop does the same, and
+   since 0.49.0 (ADR-231's keep). The coverage that page grants now stops short of each definition of a life it
+   leaves absent here that is stamped after the later of the collection's tombstone and its database's
+   (`definitions_a_refused_life_keeps`, the judgement `defines_a_later_life` makes of its entry): the receiver is
+   served the entry again, stops at it as above, and takes it with the life, by the scoped page or by a whole page,
+   once the sender has heard the drop and kept the life. A document of the refused life stays history, as by entries
+   (ADR-148), and the existence and count halves bring it with the life. The answer above relies on this too: a page
+   holding no life answers for every definition its sender's coverage names, and that coverage named one its sender
+   had refused with a life the drop keeps.
    **A page judges each definition by its stamp too (F12):** `restore_collection` refused every definition of a life
    the receiver's floor said had ended, though one made after the drop is what the drop keeps; it granted the
    coverage of the definition's entry all the same, and the receiver never held it. Each index, and a dated vector

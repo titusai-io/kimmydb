@@ -3195,3 +3195,34 @@ fn finding_f7_seed_13739_wedges_without_a_visible_difference() {
         &[(ORDERS, None), (ITEMS, Some(&[1]))],
     );
 }
+
+/// F18 (generated Full seed 48093, minimised). C creates `orders` after A's, B takes C's life
+/// by a whole page, writes into it after A's database drop and, later, makes an index on it.
+/// At quiescence A takes B's whole page while B's life is still the one the drop covers
+/// (created before it): A refuses the life, and the page granted A the coverage of its
+/// index's entry, made after the drop, which A never held. C then takes A's whole page and is
+/// granted the same coverage; C keeps its own life, re-dated by A's carried drop with the
+/// write, and never receives the index. Nothing repairs a definition, so C lacked it for good
+/// on the entries routes. A refused life's definition stamped after the drop is not granted
+/// (ADR-236 item 4): A takes it once the life it belongs to reaches it, as by entries.
+#[test]
+fn finding_f18_seed_48093_an_index_on_a_kept_life_is_granted_past_a_member_that_refused_it() {
+    finding(
+        "F18 seed 48093",
+        "A.create(orders)@100; C.create(orders)@110; A.dropdb@130; B<-C whole; \
+         B.write(orders/2)@160; C<-B entries; B.index(orders,k_1:asc)@210",
+        &[(ORDERS, Some(&[2]))],
+    );
+}
+
+/// F18 by the collection's own drop: A drops `orders` (its own life) in place of the
+/// database. C's life was created before that drop too, so A refuses it the same way.
+#[test]
+fn finding_f18_the_same_by_a_collection_drop() {
+    finding(
+        "F18 by a collection drop",
+        "A.create(orders)@100; C.create(orders)@110; A.drop(orders)@130; B<-C whole; \
+         B.write(orders/2)@160; C<-B entries; B.index(orders,k_1:asc)@210",
+        &[(ORDERS, Some(&[2]))],
+    );
+}

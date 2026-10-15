@@ -495,7 +495,13 @@ receiver's vectors as they land: a snapshot is state in key order, not history
 in stamp order, and a document the sender wrote behind the cursor while the
 snapshot ran is not in it — its entry is above the first page's vector, so the
 next round pulls it from the oplog, where the last page's vector would have
-covered it and left a hole. A repair ([ADR-148](decisions.md)) pulls a snapshot
+covered it and left a hole. **Short of a refused life's later definitions**
+([ADR-236](decisions.md)): a page carrying a life the receiver refuses (created at
+or before its drop, from a sender that has not heard the drop) does not grant the
+entry of an index creation or vector configuration of that life stamped after the
+drop, which the drop keeps; the receiver is served it again, stops at it as above,
+and takes it with the life. Granted, it reached no member that keeps the life
+through this one. A repair ([ADR-148](decisions.md)) pulls a snapshot
 of the **one collection** it was planned for, which grants no coverage — the
 position the member already holds carries the rest — and, when the sender has
 since dropped the collection, carries the drop instead so the entries the

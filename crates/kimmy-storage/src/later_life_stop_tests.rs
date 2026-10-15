@@ -41,6 +41,15 @@ fn scoped(into: &Engine, from: &Engine, id: CollectionId) {
     }
 }
 
+/// A whole-database snapshot, every page.
+fn whole(into: &Engine, from: &Engine) {
+    let mut progress = SnapshotProgress::whole_database();
+    while !progress.is_complete() {
+        let page = from.snapshot_page(progress.after().cloned(), progress.scope()).unwrap();
+        into.apply_snapshot_page(from.node_id(), &mut progress, &page).unwrap();
+    }
+}
+
 /// Rounds of `into <- from` with the protocol's answer to a stop; how many stopped.
 fn settle(into: &Engine, from: &Engine) -> usize {
     let mut stops = 0;
@@ -138,6 +147,90 @@ fn finding_f7_a_049_burial_of_a_later_definition_wedges_a_050_puller() {
         ids_on(&r, "other", "things"),
         ids_on(&s, "other", "things"),
         "R never took S's acknowledged write behind the index ({stops} stops in 6 rounds)"
+    );
+}
+
+/// F18 (ADR-236 item 4), on the whole-page route. A whole page carrying a life this member
+/// refuses (created before its drop, from a sender that has not heard the drop) refused the
+/// life's definition made after the drop with the life, and granted the coverage of the
+/// definition's entry all the same. C, which keeps the life (re-dated by that drop, with a
+/// write made after it) and takes A's whole page, was granted the same coverage and never
+/// received the definition; nothing replays one. The entry is not granted: C takes it from B,
+/// and A takes it with the life once B has heard the drop and kept the life.
+fn a_whole_page_grants_no_later_definition_of_a_life_it_refuses(
+    define: impl Fn(&Engine) -> kimmy_core::Stamp,
+    holds: impl Fn(&crate::meta::CollectionMeta) -> bool,
+) {
+    let (a, _da) = engine();
+    let (b, _db) = engine();
+    let (c, _dc) = engine();
+    a.create_collection("shop", "orders").unwrap();
+    std::thread::sleep(Duration::from_millis(2));
+    c.create_collection("shop", "orders").unwrap();
+    whole(&b, &c);
+    std::thread::sleep(Duration::from_millis(2));
+    assert!(a.drop_collection("shop", "orders").unwrap());
+    a.finish_purges_now().unwrap();
+    std::thread::sleep(Duration::from_millis(2));
+    let on_b = b.get_collection("shop", "orders").unwrap();
+    b.insert(&on_b, doc! { "_id": 1i64 }).unwrap();
+    round(&c, &b);
+    std::thread::sleep(Duration::from_millis(2));
+    let made = define(&b);
+
+    whole(&a, &b);
+    assert!(a.get_collection("shop", "orders").is_err(), "premise: A refused B's life");
+    assert!(
+        a.witnessed_vector().unwrap().get(made.node) < made.hlc,
+        "the page granted A the definition of the life it refused"
+    );
+    whole(&c, &a);
+    let kept = c.get_collection("shop", "orders").expect("premise: C keeps its life");
+    assert!(kept.is_redated(), "premise: re-dated by A's drop: {kept:?}");
+    assert!(
+        c.witnessed_vector().unwrap().get(made.node) < made.hlc,
+        "A's page granted C the definition it never held"
+    );
+
+    round(&b, &a);
+    assert!(b.get_collection("shop", "orders").unwrap().is_redated(), "premise: B kept it");
+    settle(&c, &b);
+    settle(&a, &b);
+    for (member, e) in [("A", &a), ("B", &b), ("C", &c)] {
+        let standing = e.get_collection("shop", "orders").expect("the life stands");
+        assert!(holds(&standing), "{member} lacks the definition: {standing:?}");
+        assert_eq!(ids_on(e, "shop", "orders"), BTreeSet::from(["1".to_string()]), "{member}");
+    }
+    for (x, y) in [(&a, &b), (&a, &c), (&c, &a), (&c, &b)] {
+        assert!(x.witnessed_vector().unwrap().covers(&y.version_vector().unwrap()));
+    }
+}
+
+#[test]
+fn finding_f18_a_whole_page_grants_no_later_index_of_a_life_it_refuses() {
+    a_whole_page_grants_no_later_definition_of_a_life_it_refuses(
+        |b| b.create_index("shop", "orders", field(), false, None).unwrap().created.unwrap(),
+        |standing| standing.indexes.len() == 1,
+    );
+}
+
+/// The same for a vector configuration made after the drop.
+#[test]
+fn finding_f18_a_whole_page_grants_no_later_vector_configuration_of_a_life_it_refuses() {
+    a_whole_page_grants_no_later_definition_of_a_life_it_refuses(
+        |b| {
+            let config = kimmy_core::VectorConfig {
+                fields: vec!["text".into()],
+                provider: kimmy_core::ProviderConfig::Byo {},
+                dim: 4,
+                metric: Default::default(),
+                document_prefix: None,
+                query_prefix: None,
+                chunk: Default::default(),
+            };
+            b.configure_vectors("shop", "orders", config).unwrap().vector_changed.unwrap()
+        },
+        |standing| standing.vector.is_some(),
     );
 }
 
