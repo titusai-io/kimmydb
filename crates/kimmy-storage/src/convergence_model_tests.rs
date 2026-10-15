@@ -437,6 +437,12 @@ pub(crate) enum Category {
     /// by, so it does not hide the differences that decide something.
     TombstoneSubsumed,
     LostWrite,
+    /// A page left its receiver's clock behind a stamp it restored that the sender's
+    /// coverage names (ADR-233 item 1: a collection's `created`, a carried collection or
+    /// index drop, a scoped page's `dropped`). The receiver's next local stamp could then
+    /// sort below state it holds; the consequences reach other members only through a
+    /// later step that mints, so this is checked where it arises.
+    ClockBehind,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -495,6 +501,8 @@ struct Cluster {
     step: usize,
     /// Set by `PurgerOff`: purges run only at `Purge` steps until quiescence.
     defer_purges: bool,
+    /// Every page that left its receiver's clock behind a stamp it vouched for.
+    clock_behind: Vec<String>,
 }
 
 type Res<T> = std::result::Result<T, String>;
@@ -525,6 +533,7 @@ impl Cluster {
             aged_out: false,
             step: 0,
             defer_purges: false,
+            clock_behind: Vec::new(),
         }
     }
 
@@ -874,22 +883,74 @@ impl Cluster {
             let applied = dst
                 .apply_snapshot_page(src.node_id(), &mut progress, &page)
                 .map_err(|e| err("apply_snapshot_page", e))?;
-            if applied.purge_pending.is_some() {
-                if self.defer_purges {
-                    self.note(format!(
-                        "{}<-{}: a page waits for the purger; asked again in a later round",
-                        LETTERS[to], LETTERS[from]
-                    ));
-                    return Ok(());
-                }
-                waits += 1;
-                if waits > 4 {
-                    return Err("a page that waits for a purge that never finishes".into());
-                }
-                dst.finish_purges_now().map_err(|e| err("finish_purges_now", e))?;
+            if applied.purge_pending.is_none() {
+                self.check_the_clock_followed(to, from, scope, &page);
+                continue;
             }
+            if self.defer_purges {
+                self.note(format!(
+                    "{}<-{}: a page waits for the purger; asked again in a later round",
+                    LETTERS[to], LETTERS[from]
+                ));
+                return Ok(());
+            }
+            waits += 1;
+            if waits > 4 {
+                return Err("a page that waits for a purge that never finishes".into());
+            }
+            self.e(to).finish_purges_now().map_err(|e| err("finish_purges_now", e))?;
         }
         Ok(())
+    }
+
+    /// ADR-233 item 1, checked where it arises: once a page is applied, the receiver's
+    /// clock is at or past every stamp the page restores that the sender's own coverage
+    /// names. A stamp the coverage does not name is stored and not witnessed by design
+    /// (ADR-163), and is not checked.
+    fn check_the_clock_followed(
+        &mut self,
+        to: usize,
+        from: usize,
+        scope: Option<CollectionId>,
+        page: &crate::SnapshotPage,
+    ) {
+        let named = |hlc: Hlc| page.versions.iter().any(|(_, covered)| hlc <= covered);
+        let covered = |stamp: &Stamp| stamp.hlc <= page.versions.get(stamp.node);
+        let mut vouched: Vec<(&str, Hlc)> = Vec::new();
+        for state in &page.collections {
+            if let Some(created) = state.created.filter(|c| named(*c)) {
+                vouched.push(("a creation", created));
+            }
+        }
+        if scope.is_none() {
+            for (_, dropped) in page.dropped_collections.iter().filter(|(_, s)| covered(s)) {
+                vouched.push(("a carried drop", dropped.hlc));
+            }
+        }
+        if let Some(dropped) = page.dropped.filter(|s| scope.is_some() && covered(s)) {
+            vouched.push(("a scoped page's drop", dropped.hlc));
+        }
+        for (collection, _, dropped) in &page.dropped_indexes {
+            if scope.is_none_or(|scope| scope == *collection) && covered(dropped) {
+                vouched.push(("a carried index drop", dropped.hlc));
+            }
+        }
+        let last = self.e(to).clock_last();
+        for (what, stamp) in vouched {
+            if last < stamp {
+                let s = format!(
+                    "step {}: {}<-{} left the clock at {} behind {what} at {}",
+                    self.step,
+                    LETTERS[to],
+                    LETTERS[from],
+                    self.hlc(last),
+                    self.hlc(stamp)
+                );
+                if !self.clock_behind.contains(&s) {
+                    self.clock_behind.push(s);
+                }
+            }
+        }
     }
 
     fn restart(&mut self, m: usize) -> Res<()> {
@@ -1327,6 +1388,9 @@ impl Cluster {
                 };
                 fail(category, detail);
             }
+        }
+        for behind in &self.clock_behind {
+            fail(Category::ClockBehind, behind.clone());
         }
         // No lost write, from the ghost.
         let mut latest: BTreeMap<(usize, i64), (Stamp, Option<usize>)> = BTreeMap::new();
@@ -2167,6 +2231,35 @@ fn row_pr193b_a_recreation_that_waits_for_the_purger() {
     row("pr193b signature 2", &[], &variants, &[(ORDERS, Some(&[3]))]);
 }
 
+/// ADR-233's witness of a page's `created`: a member whose clock trails a creation it
+/// restores by a page that vouches for it. Without the witness its clock stays at its own
+/// time (here 110, the creation at 300) and its next write into the life is stamped
+/// below the life (the report's vacuity gap: every other schedule moved the clock past
+/// the creation by something else first, a document or a local step).
+#[test]
+fn row_a_page_moves_the_clock_past_the_creation_it_vouches_for() {
+    let pre = parse("C.write(items/1)@110; A.create(orders)@300");
+    let variants = vec![
+        ("by a scoped page", parse("C<-A scoped(orders); C.write(orders/1)@120")),
+        ("by a whole page", parse("C<-A whole; C.write(orders/1)@120")),
+    ];
+    row("clock past a vouched creation", &pre, &variants, &[(ORDERS, Some(&[1]))]);
+}
+
+/// ADR-233's witness of a carried drop: a whole page carrying a tombstone its sender's
+/// coverage names, to a member whose clock trails it. Without the witness the member's
+/// next local creation of the name is minted below the floor it takes from that
+/// tombstone, and its creation and writes are history everywhere else.
+#[test]
+fn row_a_page_moves_the_clock_past_the_drop_it_vouches_for() {
+    let pre = parse("C.write(items/1)@110; A.create(orders)@300; A.drop(orders)@310");
+    let variants = vec![
+        ("by a whole page", parse("C<-A whole; C.create(orders)@200; C.write(orders/1)@205")),
+        ("by a scoped page", parse("C<-A scoped(orders); C.create(orders)@200")),
+    ];
+    row("clock past a vouched drop", &pre, &variants, &[]);
+}
+
 // -- The census a vacuity check compares -------------------------------------------------
 
 /// A named schedule, with what its row expects at the end.
@@ -2200,7 +2293,9 @@ fn census_takes(name: &str, pre: &[Op], variants: &[(&str, Vec<Op>)], expect: Ex
 #[ignore = "the vacuity census; see the convergence model test report"]
 fn vacuity_census() {
     CENSUS.with(|c| *c.borrow_mut() = Some(Vec::new()));
-    let named: [fn(); 25] = [
+    let named: [fn(); 27] = [
+        row_a_page_moves_the_clock_past_the_creation_it_vouches_for,
+        row_a_page_moves_the_clock_past_the_drop_it_vouches_for,
         finding_f10_a_local_drop_below_an_unwitnessed_creation_is_undone,
         row_pr193b_a_write_after_a_drop_set_aside_before_the_recreation,
         row_pr193b_a_recreation_that_waits_for_the_purger,
