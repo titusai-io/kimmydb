@@ -2316,4 +2316,24 @@ mod tests {
             kimmy_core::build::VERSION
         );
     }
+
+    /// The reset must not trust a store a 0.49-line build wrote even when this build calls
+    /// itself by the same string (a development build before the version is bumped): that
+    /// line does not maintain the key, so equal strings prove nothing (review revA M1).
+    #[test]
+    fn a_store_written_by_the_0_49_line_is_untrusted_even_under_a_build_of_the_same_name() {
+        let (_dir, path) = a_store();
+        let mut sidecar = read_sidecar(&path).expect("a sidecar");
+        sidecar.written_by = "0.49.0".into();
+        write_sidecar(&path, &sidecar).unwrap();
+        let same_name = BuildVersions { written_by: "0.49.0".into(), ..BuildVersions::ours() };
+        let cleared = check_before_open_with(&path, &same_name).unwrap();
+        assert!(cleared.horizon_is_untrusted(), "a 0.49.0 store was trusted by a 0.49.0 build");
+        // The control: a build of the line that keeps the key trusts its own store.
+        sidecar.written_by = "0.50.0".into();
+        write_sidecar(&path, &sidecar).unwrap();
+        let ours = BuildVersions { written_by: "0.50.0".into(), ..BuildVersions::ours() };
+        let cleared = check_before_open_with(&path, &ours).unwrap();
+        assert!(!cleared.horizon_is_untrusted(), "a 0.50.0 store was not trusted by 0.50.0");
+    }
 }

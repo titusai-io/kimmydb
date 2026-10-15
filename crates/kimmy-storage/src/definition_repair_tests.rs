@@ -763,3 +763,34 @@ fn an_unstamped_rival_in_the_race_is_a_rival_and_leaves_no_refusal_hint() {
     assert_eq!(done.definitions.built, 0);
     assert!(b.refusal_hints(orders()).unwrap().is_empty(), "a rival was written as a refusal");
 }
+
+/// A tombstone of the collection (or of its database) says an index made before it belongs to a
+/// life the drop ended, whether or not the floor has been set yet (a late-drop sweep sets it in
+/// its last chunk). Such an index is history and does not spend the repair's one build.
+fn an_index_before_a_tombstone_is_history(tombstone_of: CollectionId) {
+    let (a, b, _d) = pair();
+    later();
+    index(&a, "v", "old");
+    later();
+    let at = kimmy_core::Stamp::new(Hlc::new(crate::physical_now_ms(), 0), a_node());
+    b.record_collection_drop(tombstone_of, at).unwrap();
+    later();
+    index(&a, "w", "fresh");
+    assert!(
+        b.get_collection("shop", "orders").unwrap().incarnation_floor.is_none(),
+        "premise: the floor is not set, as between two sweep chunks"
+    );
+    let done = repair(&b, &a, BIG);
+    assert_eq!((done.definitions.history, done.definitions.built), (1, 1));
+    assert_eq!(names(&b), vec!["fresh".to_string()]);
+}
+
+#[test]
+fn an_index_made_before_the_collections_tombstone_is_history() {
+    an_index_before_a_tombstone_is_history(orders());
+}
+
+#[test]
+fn an_index_made_before_the_databases_tombstone_is_history() {
+    an_index_before_a_tombstone_is_history(kimmy_core::database_drop_id("shop"));
+}
