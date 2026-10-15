@@ -27371,18 +27371,26 @@ stamps (its YS1), and F17 from a storm test of the count half (a loop that repla
    retention) it does, by the time the drop is as old as tombstone retention, plus a retention pass and the clocks'
    skew, and the receiver's next scoped pull, within a repair cooldown, brings the life. Past the contract the sender may never hear
    it: a member collected the drop before the sender witnessed it, and granted the sender coverage past it. The
-   receiver's own tombstone of that drop, which is what the stop is judged by (`drop_a_definition_is_judged_by`), has
-   the same stamp and so expires at the same age on the receiver's clock: its retention pass collects it (its
-   database's tombstone with it) about one pass, plus the skew, after the member that collected first. From then the
-   definition names a collection the receiver has no record of, which still stops, and the scoped page installs the
-   sender's life with the definition, nothing refusing it now: ADR-085's past-retention outcome, the members holding
-   the life the lost drop ended. So the stop outlasts the drop's retention by about a retention pass, the skew and a
+   receiver's own tombstones, which are what the stop is judged by (`drop_a_definition_is_judged_by`: the later of the
+   collection's and its database's), have the same stamps and so expire at the same age on the receiver's clock: its
+   retention pass collects them about one pass, plus the skew, after the member that collected first. **The later of
+   the two** is what counts: once the collection's own tombstone is gone, the scoped page is still refused by the
+   database's (`database_refusal`), and that refusal records the collection's tombstone again at the database's stamp
+   (`record_database_refusal`); a tombstone with rows still under it is kept until the purger has removed them
+   (ADR-189). From then the definition names a collection the receiver has no record of, which still stops, and the
+   scoped page installs the sender's life with the definition, nothing refusing it now: ADR-085's past-retention
+   outcome, the members holding the life the lost drop ended. So the stop outlasts the drop's retention by about a retention pass, the skew and a
    repair cooldown, and no rule of its own is needed. A window on the definition's stamp against the receiver's clock
    would only ever be reached after that tombstone had expired. **The exception is collection disabled**
    (`storage.gc_interval_secs = 0`) on a member while another member collects: that member keeps the tombstone, and
    a drop some member collected before every member heard it stops it for good at a later definition from a member
    that never heard it, with nothing behind that entry in that peer's window reaching it by entries.
-   `unknown_collection` climbing on it is the signal (`operations.md`). The convergence model's age-out collects on
+   `unknown_collection` climbing on it is the signal (`operations.md`). The bound assumes every member collects, not
+   only the receiver: a whole page from a peer that still holds the tombstone (a longer retention, a later pass, a
+   slower clock, or collection disabled) records it again here after this member collected it
+   (`restore_collection_drop` checks no age). Before the stop has ended that is only a delay, the next pass collecting
+   it again; after the life is installed, the re-applied drop takes the keep path on this member alone, re-dating the
+   life and sweeping what it held from before the drop (ADR-085's class: retention broken). The convergence model's age-out collects on
    one member; at quiescence every member collects at the same time, as their own passes would, and the generated
    AgedOut seed 6883 that the model had reported as a permanent stop converges
    (`row_a_later_life_stop_past_retention_clears_once_every_member_collects`).
@@ -27398,7 +27406,10 @@ stamps (its YS1), and F17 from a storm test of the count half (a loop that repla
    once the sender has heard the drop and kept the life. A document of the refused life stays history, as by entries
    (ADR-148), and the existence and count halves bring it with the life. The answer above relies on this too: a page
    holding no life answers for every definition its sender's coverage names, and that coverage named one its sender
-   had refused with a life the drop keeps.
+   had refused with a life the drop keeps. Its cost, until the sender hears the drop: the receiver's witnessed
+   vector stays below the sender's servable one on that definition's origin, so a member that caught up by a whole
+   snapshot cannot clear its catching-up marker (ADR-202), and where the sender holds that origin only as state, or
+   past its horizon, each contact is another whole snapshot.
    **A page judges each definition by its stamp too (F12):** `restore_collection` refused every definition of a life
    the receiver's floor said had ended, though one made after the drop is what the drop keeps; it granted the
    coverage of the definition's entry all the same, and the receiver never held it. Each index, and a dated vector
@@ -27561,8 +27572,8 @@ the drop included, as the entries route does (ADR-148), and the page grants the 
 that keeps the life with an older version of the same document, and takes the first member's whole page, is granted
 past the write and keeps its own version. Every count agrees, so neither half of the check plans a repair. F18's
 withholding does not reach it: a write so withheld is served again and taken as history again. The cut digest
-detects it (`kimmy_sync_digest_divergent_collections`, the `(id, stamp)` sets differ), and the divergence repair
-restores the document. Pinned by `known_residual_a_later_write_a_refused_life_s_whole_page_granted_past`, with its
+detects it (ADR-230; `kimmy_sync_digest_divergent_collections`, the `(id, stamp)` sets differ), which on this build
+only counts it; the divergence repair restores the document once it is present. Pinned by `known_residual_a_later_write_a_refused_life_s_whole_page_granted_past`, with its
 exact failures on each route; the generated runs have not reached it.
 
 **Tests.** The model's rows and findings (`finding_f1` to `finding_f16`, the two clock rows, the pinned residual,
@@ -27605,7 +27616,9 @@ cut: `late_drop` (a configuration made while the sweep turns off a tied one is k
 takes from an unwitnessed drop, over four members); F18's model rows (`finding_f18_*`, by a database's drop and by a
 collection's) and `later_life_stop_tests` (a whole page grants no later index, and no later vector configuration, of a
 life it refuses); `sync` (a resumed page carrying the drop answers the stop); residual 1's tie row; and residual 4's
-row.
+row. From the review of the second fold-in: `late_drop` (a local index minted below the drop while the sweep reads is
+swept), F19's model row (`finding_f19_seed_86387_*`), the re-pointed burial pin in `life_supersession_tests`, and the
+row for a later-life stop past retention that clears once every member collects.
 
 **Mutation run: 85 rows, 82 killed, 3 equivalent.** A harness that is not in the tree (the rows are named here as the
 record), each row one textual change to the committed tree run under `bash` with a 900 s timeout, reset by `git
