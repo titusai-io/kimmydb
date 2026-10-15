@@ -2787,12 +2787,6 @@ fn judge_catch_up_at(
     }
 }
 
-// The real-loop storms of the repair build's third review (a child of `peers`, so it can call
-// the tick's private functions).
-#[cfg(test)]
-#[path = "revc_storm_tests.rs"]
-mod revc_storm_tests;
-
 #[cfg(test)]
 mod tests {
     /// The lag gauge's source (ADR-175's addendum): what a peer advertised,
@@ -5191,3 +5185,9 @@ mod definition_fold_tests {
         }
     }
 }
+
+// The real-loop storms of the repair build's third review (a child of `peers`, so it can call
+// the tick's private functions).
+#[cfg(test)]
+#[path = "revc_storm_tests.rs"]
+mod revc_storm_tests;

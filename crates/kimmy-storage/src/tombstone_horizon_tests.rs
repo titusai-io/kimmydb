@@ -116,6 +116,21 @@ fn the_horizon_never_goes_down() {
     assert_eq!(engine.tombstone_horizon().unwrap(), Some(high), "the horizon was lowered");
 }
 
+/// Every burial of a life raises the horizon when the life holds a record above the drop: the
+/// purge that follows removes tombstones too, and one stamped after the drop is covered by no
+/// floor (the young-stamp model test's YS1). `bury_standing_in_txn` is the one function every
+/// burial site passes through (an ordinary drop, a re-dated life's end of sweep, the covered
+/// fast path, a database drop's burial of a re-dated life).
+#[test]
+fn every_burial_raises_the_horizon_to_the_highest_stamp_the_life_held() {
+    let source = include_str!("engine.rs");
+    let start = source.find("pub(crate) fn bury_standing_in_txn(").expect("the burial");
+    let end = source[start..].find("pub(crate) fn finish_burial").map(|n| start + n).unwrap();
+    let function = &source[start..end];
+    assert!(function.contains("set_at_least_in_txn"), "the burial raises no horizon");
+    assert!(function.contains("kept_row"), "and reads the life's highest stamp from the kept row");
+}
+
 /// Every write transaction in `gc.rs` that removes from `DOCS`, `COLLECTIONS_DROPPED` or
 /// `INDEXES_DROPPED` raises the horizon in that same transaction: a collector added later
 /// that does not is a hole in section 13.3's own-side argument.

@@ -2798,14 +2798,20 @@ fn finding(name: &str) {
     assert!(outcome.findings.is_empty(), "finding {name}:\n{}", render(&schedule, &outcome));
 }
 
+/// YS1, fixed: a burial raises the horizon to the highest stamp the life held, so the young rule
+/// cannot write back a delete the purge removed.
 #[test]
-#[ignore = "finding YS1, fails on this tree: see the young-stamp model test report"]
 fn finding_ys1_a_burial_of_a_re_dated_life_forgets_a_delete_stamped_after_the_drop() {
     finding("ys1");
 }
 
+/// YS2 is a **stated limit**, not a defect to fix (ADR-237, repair design 13.1): a restore's
+/// reset covers deletes stamped at or below its own wall clock, and a member whose HLC leads its
+/// wall clock (a fast peer's clock reached it) can have deleted above that. The row pins the
+/// limit and fails by design; the planner's catching-up gate holds repairs of a restored member
+/// until its catch-up has delivered the row by entries.
 #[test]
-#[ignore = "finding YS2, fails on this tree: see the young-stamp model test report"]
+#[ignore = "pins the stated limit of a restore's reset (YS2); fails by design"]
 fn finding_ys2_a_restore_resets_below_its_own_deletes_when_the_hlc_leads_the_wall_clock() {
     finding("ys2");
 }

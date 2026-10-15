@@ -72,6 +72,7 @@ async fn member(name: &'static str) -> Member {
     let engine = Arc::new(Engine::open(&dir.path().join("kimmy.redb")).unwrap());
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
+    // UNSUPERVISED: a test peer, ended with the test; a panic in it fails the storm's rounds
     tokio::spawn(serve(Arc::clone(&engine), listener, SECRET.into()));
     let mut config = ReplicationConfig::new(Vec::new(), SECRET.into(), addr);
     config.sync_interval = INTERVAL;

@@ -4816,6 +4816,21 @@ impl Engine {
         let log = replicated.is_none();
         // Under the writer, as `create_collection_inner` mints (ADR-148).
         let stamp = replicated.unwrap_or_else(|| self.next_stamp());
+        // The purge that follows removes every record of the life, and the life can hold a
+        // tombstone stamped **after** the drop (a delete of a write made after it): that is
+        // above the drop tombstone's floor, so nothing covers it, and a collected tombstone
+        // that raised no horizon lets the young-stamp rule write the deleted document back
+        // (repair design 13.1; the young-stamp model test's YS1). Raise the horizon to the
+        // highest stamp the life held, in this commit, when it is above the drop; a local drop
+        // mints above everything and raises nothing.
+        {
+            let rows = txn.open_table(tables::LIVE_DIGESTS)?;
+            let highest = crate::live_digest::kept_row(&rows, meta.id.0)?
+                .and_then(|row| row.maxw.values().max().copied());
+            if let Some(highest) = highest.filter(|highest| *highest > stamp.hlc) {
+                crate::tombstone_horizon::set_at_least_in_txn(txn, highest)?;
+            }
+        }
         let database_emptied = {
             let mut collections = txn.open_table(tables::COLLECTIONS)?;
             collections.remove((db, name))?;

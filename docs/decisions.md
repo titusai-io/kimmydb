@@ -27273,8 +27273,14 @@ close the cases it can prove safe, leave the rest to the operator in words, and 
    only, applied over rows this member already holds**. A row is written only if strictly newer than the row held (live
    or tombstone); a delete only over a live document it out-stamps; an id this member holds **nothing for** is `left`
    and logged, unless it is **young** (point 3), when it is written and counted `created`. No definition is restored,
-   nothing is dropped, no vector state is touched, no bare tombstone is recorded, no cursor is stored, no coverage is
-   granted. The cursor of a Converge pull is in memory only, keyed by scope and policy.
+   nothing is dropped, no vector state is touched, no cursor is stored, no coverage is granted, and the one tombstone
+   it records is a **strictly newer delete over a tombstone it already holds** (the stamp is named by the sender's own
+   coverage, ADR-163; no document is brought back and no row written; without it a live row stamped between the two
+   deletes, taken later from a third member, would show until a later repair); a bare tombstone where nothing is held
+   is never recorded (ADR-228's reason stands). **A delete learned by repair is not relayed by that member's next
+   repair**: its coverage of the origin does not name the stamp (ADR-163 is kept, since relaying would grant coverage of
+   history the member did not receive), so a member that lost the delete is healed by a repair from the original
+   deleter, and with the origin gone the finding between the two stands for the operator. Nothing is resurrected either way. The cursor of a Converge pull is in memory only, keyed by scope and policy.
 2. **Planned from the digest finding, not the count finding.** `confirmed_against` (the count half) never sees a digest
    or definition finding and `retain_repaired` never clears one (tests and mutation rows pin it); the digest and the
    definition series have `digest_confirmed_against`, `definition_confirmed_against`, `retain_digest` and
@@ -27297,8 +27303,19 @@ close the cases it can prove safe, leave the rest to the operator in words, and 
    after the walk the page's rows came from; **absent from a sender that predates it, the rule is off for the pull**. A
    completed whole-database snapshot adopts `max(own, the page's)` in the completing page's transaction. Soundness is
    pairwise (the convergence model test, a separate change, checks it against the union of both members' ghost
-   histories); a third member's collected delete is the ADR-085 window. **Cost, stated:** after every upgrade there is a young-repair dead time, and a restore's
-   too.
+   histories); a third member's collected delete is the ADR-085 window. **Two more removals are covered.** (a) The
+   **burial** of a life (the sweep's end for a re-dated life, its covered fast path, a database drop's burial, an
+   ordinary drop) removes every record of the life in the purge that follows, and the life can hold a tombstone stamped
+   *after* the drop, which no floor covers (a delete of a write made after the drop): `bury_standing_in_txn` raises
+   the horizon to the highest stamp the life held, in the burial's commit, when that is above the drop (a local drop
+   mints above everything and raises nothing); a source guard pins it. Found by the young-stamp model test (YS1). The
+   count repair's scoped page writes the same row back, which is ADR-231's question for the convergence work, not this
+   change's. (b) **A restore's reset covers deletes stamped at or below the restore's own wall clock, not "every
+   delete it applied after the backup"** (YS2): a member whose HLC leads its wall clock because a fast peer's clock
+   reached it can have deleted above the reset. This is a stated limit and no mechanism is added: the repair loses
+   nothing the restore had not already lost (a plain pull brings the row back from the restored vector), and a
+   restored member is marked catching up, which holds both repairs until the catch-up has delivered the row by
+   entries. **Cost, stated:** after every upgrade there is a young-repair dead time, and a restore's too.
 4. **The definition repair** is the first page only of a scoped snapshot under `SnapshotPolicy::Definitions`, documents
    ignored, building **at most one plain index this member lacks by name and a peer holds**. Per index, in order: held by
    name under another definition is `rival`; `unique` and `ttl` are left (building the first can refuse documents, the
@@ -27314,8 +27331,10 @@ close the cases it can prove safe, leave the rest to the operator in words, and 
 5. **The loop guard** (a pure state machine, `repair_ledger.rs`, one entry per `(peer, collection, kind)`, in memory;
    a restart forgets it). **R1** a transient end (a peer error, a stop, a drop, a whole-database takeover, a
    cancellation, a definition page that does not carry the collection) changes nothing but the cooldown, **except that
-   the third consecutive transient end of one `(peer, collection, kind)` climbs one level** (a failure that repeats
-   deterministically, such as a page that always faults, is not allowed to retry at the cooldown for ever; a repair that
+   every abandon (three rounds that landed nothing) and every `dropped` page climbs one level, and the third consecutive
+   transient end of any other kind for one `(peer, collection, kind)` climbs one** (a failure that repeats by itself,
+   such as a page that always faults, is not allowed to retry at the cooldown for ever; a peer whose Converge rounds
+   always fail is repaired on the back-off schedule, about eight times a day; a repair that
    ran to its end and was judged resets the run). **R2** a repair is judged at the first *compared* probe after its end
    and only there; an unjudged deadline (three rotation periods, at least 30 minutes) counts as transient, but every
    second consecutive unjudged end is one ineffective step. **R3** an ineffective repair backs off 5 min, 15 min, 45 min,
