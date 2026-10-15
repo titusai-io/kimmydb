@@ -4,11 +4,12 @@
 //! The loop guard judges time by `tick_started - loop_started` (real time), and its
 //! back-off is minutes to hours, so `replicate` itself cannot be run for a simulated day.
 //! This module runs the same tick, in the same order, through the same functions the loop
-//! calls (`advance_probe_on`, `sync_once_with` against a real `serve` over TLS,
-//! `fold_digest_round`, `fold_definition_round`, the count half's planning,
-//! `plan_digest_repairs`, `plan_definition_repairs`, the `retain_*` calls and the ledger's
+//! calls (`advance_probe_on`, `sync_once_with` against a real `serve` over TLS, `fold_check`,
+//! `fold_digest_round`, `fold_definition_round`, `plan_count_repairs`, `plan_digest_repairs`,
+//! `plan_definition_repairs`, the `retain_*` calls, `retain_tracker_members` and the ledger's
 //! clock, expiry and pruning), with the clock handed to `set_repair_clock` advanced by the
-//! sync interval each tick. Only the clock is simulated; every round is real.
+//! sync interval each tick. Only the clock is simulated; every round is real. A textual guard
+//! in `peers.rs` (`the_storm_tick_calls_what_the_loops_tick_calls`) keeps it so.
 //!
 //! The forged divergence is the lab's row 5 crossing pair, which neither half can close:
 //! A holds `x`, B holds `y`, C holds `x`; each member witnessed the other's insert without
@@ -27,7 +28,7 @@ use std::time::Duration;
 
 use bson::doc;
 use kimmy_core::{DocId, Hlc, NodeId};
-use kimmy_storage::{DivergenceFindings, DivergenceTracker, Engine, WalkScope};
+use kimmy_storage::{DivergenceTracker, Engine, WalkScope};
 
 use super::*;
 use crate::transport::{DigestRepairOutcome, DivergenceProbe, Judgement, PeerStalls, serve};
@@ -68,6 +69,8 @@ struct Storm {
     digest_compared: usize,
     digest_deferred: usize,
     count_repairs_planned: usize,
+    /// Count repairs planned, by requester and peer.
+    count_plans: BTreeMap<(&'static str, &'static str), usize>,
     skipped_count_repair: usize,
     ticks: u64,
 }
@@ -122,13 +125,9 @@ async fn tick(
     let held = engine.all_collection_ids().unwrap();
     m.digest_state.prune(&held);
     m.definition_state.begin_tick();
-    let members = m.config.members.as_ref().map(Members::node_ids);
-    m.definition_state.prune(&held, members.as_ref());
-    m.stalls.retain_definition_detail(members.as_ref(), &held);
-    m.stalls.set_repair_clock(
-        now,
-        m.config.sync_interval * u32::try_from(held.len().max(1)).unwrap_or(u32::MAX),
-    );
+    // The loop's order: the clock and the deadlines before the listing is used, then the
+    // pruning of what a gone collection or member leaves behind.
+    m.stalls.set_repair_time(now);
     for (key, verdict) in m.stalls.expire_repairs() {
         log_repair_verdict(key.peer, key.collection, verdict);
         // Unjudged ends, attributed to their pair here.
@@ -136,8 +135,15 @@ async fn tick(
         *storm.pairs.entry((m.name, peer)).or_default().judged.entry("unjudged").or_default() += 1;
     }
     let _ = m.stalls.take_repair_counts();
-    m.stalls.retain_ledger(&held, members.as_ref());
-    m.divergence.retain_members(members.as_ref());
+    let members = m.config.members.as_ref().map(Members::node_ids);
+    m.definition_state.prune(&held, members.as_ref());
+    m.stalls.retain_definition_detail(members.as_ref(), &held);
+    m.stalls.set_repair_clock(
+        now,
+        m.config.sync_interval * u32::try_from(held.len().max(1)).unwrap_or(u32::MAX),
+    );
+    let known = m.stalls.retain_ledger(&held, members.as_ref());
+    retain_tracker_members(&mut m.divergence, known.as_ref(), m.config.divergence_repair);
     let probe =
         advance_probe_on(&mut m.divergence, Ok::<_, ()>(held.clone())).map(|id| {
             match engine.count_probe_reading(id) {
@@ -174,7 +180,14 @@ async fn tick(
                     {
                         let mut report = RoundReport::default();
                         let count = outcome.count_probe.take();
-                        m.divergence.observe(node, DivergenceFindings { existence, count });
+                        fold_check(
+                            &mut m.divergence,
+                            node,
+                            existence,
+                            count,
+                            outcome.count_probe_deferred,
+                            probe.as_ref(),
+                        );
                         if let Some(round) = outcome.digest.take() {
                             fold_digest_round(
                                 &engine,
@@ -199,21 +212,12 @@ async fn tick(
                                 &mut report,
                             );
                         }
-                        let confirmed = m.divergence.confirmed_against(node);
-                        for collection in &confirmed {
-                            let repair = match engine.collection_by_id(*collection) {
-                                Ok(Some(meta)) => Repair::Replay {
-                                    from: meta
-                                        .incarnation_floor
-                                        .map_or(meta.created, |floor| floor.min(meta.created)),
-                                },
-                                _ => Repair::Snapshot,
-                            };
-                            if m.stalls.plan_repair(node, *collection, repair) {
-                                storm.count_repairs_planned += 1;
-                            }
+                        let planned =
+                            plan_count_repairs(&engine, &m.divergence, &mut m.stalls, node, addr);
+                        storm.count_repairs_planned += planned;
+                        if let Some(peer) = names.get(&node).copied() {
+                            *storm.count_plans.entry((m.name, peer)).or_default() += planned;
                         }
-                        m.stalls.retain_repaired(node, &confirmed);
                         let digest_confirmed = m.divergence.digest_confirmed_against(node);
                         plan_digest_repairs(
                             &engine,
@@ -320,6 +324,11 @@ struct Knobs {
     /// oplog, so B's next ordinary pull from A is answered `BeyondHorizon` and becomes a
     /// whole-database pull competing with B's document repair against A.
     whole_db_at: Option<(u64, u64)>,
+    /// B stops pulling (it contacts nobody) for the first number of ticks of every cycle of
+    /// the second, then moves for the rest, while A writes: the count probe of A against B is
+    /// compared while B stands still and deferred while it moves, and its difference is only
+    /// that B trails.
+    stop_and_move: Option<(u64, u64)>,
 }
 
 impl Default for Knobs {
@@ -333,6 +342,7 @@ impl Default for Knobs {
             drop_recreate_at: None,
             corrupt_c_after: None,
             whole_db_at: None,
+            stop_and_move: None,
         }
     }
 }
@@ -487,6 +497,20 @@ async fn storm(knobs: Knobs) -> Storm {
                 ms[2].config.members.as_ref().unwrap().insert_for_test(addr, node);
             }
         }
+        if let Some((stopped, cycle)) = knobs.stop_and_move {
+            let phase = t % cycle;
+            if phase == 0 {
+                for other in [0, 2] {
+                    ms[1].config.members.as_ref().unwrap().remove_for_test(&ms[other].addr);
+                }
+            }
+            if phase == stopped {
+                for other in [0, 2] {
+                    let (addr, node) = (ms[other].addr, ms[other].node);
+                    ms[1].config.members.as_ref().unwrap().insert_for_test(addr, node);
+                }
+            }
+        }
         // C flaps out of A's and B's live sets for one tick.
         let flapping = knobs.flap_every.is_some_and(|every| t > 0 && t % every == 0);
         if flapping {
@@ -521,6 +545,11 @@ fn summary(label: &str, storm: &Storm) -> String {
         storm.count_repairs_planned,
         storm.skipped_count_repair
     );
+    for ((me, peer), n) in &storm.count_plans {
+        if *n > 0 {
+            s.push_str(&format!("REVC STORM {label}:   {me}<-{peer}: {n} count repairs planned\n"));
+        }
+    }
     for ((me, peer), log) in &storm.pairs {
         if log.ends.is_empty() && log.judged.values().all(|n| *n == 0) {
             continue;
@@ -660,6 +689,36 @@ async fn revc_storm_a_whole_database_pull_competing_for_the_peer_stays_bounded()
     let storm = storm(knobs).await;
     println!("{}", summary("whole-db", &storm));
     assert_bounded("whole-db", &storm, knobs.hours);
+}
+
+/// B stops and moves in turn while A writes (the count half's stop-and-move shape, with the cut
+/// digest folded in as the loop does): A's count probe of B is compared while B stands still
+/// and deferred while it moves, and the digest of the same contact compares equal. The count
+/// repair of the pair is planned at most once per `REPAIR_COOLDOWN_ROUNDS` contacts however
+/// often B stops (ADR-236 item 10), so a digest that clears the finding's gauge must not clear
+/// its cooldown.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "a 2-simulated-hour storm of the real loop; run with --ignored --test-threads=1"]
+async fn revc_storm_a_peer_that_stops_and_moves_is_count_repaired_once_per_cooldown() {
+    let stopped = u64::from(crate::transport::FROZEN_CONTACTS) + 2;
+    let knobs = Knobs { hours: 2, stop_and_move: Some((stopped, stopped + 3)), ..Knobs::default() };
+    let storm = storm(knobs).await;
+    println!("{}", summary("stop-and-move", &storm));
+    let ticks = knobs.hours * 3600 / INTERVAL.as_secs();
+    let cycles = ticks / (stopped + 3);
+    let limit = ticks / u64::from(crate::transport::REPAIR_COOLDOWN_ROUNDS) + 3;
+    let planned = storm.count_plans.get(&("A", "B")).copied().unwrap_or(0) as u64;
+    assert!(
+        cycles > 4 * limit,
+        "the shape is meant to stop B {cycles} times, far more than the {limit} the cooldown allows"
+    );
+    assert!(planned >= 1, "the storm never formed\n{}", summary("stop-and-move", &storm));
+    assert!(
+        planned <= limit,
+        "A planned {planned} count repairs against B in {ticks} contacts ({cycles} stops); the \
+         cooldown allows {limit}\n{}",
+        summary("stop-and-move", &storm)
+    );
 }
 
 /// The planner and the ledger alone, over a simulated day, for a peer whose every Converge

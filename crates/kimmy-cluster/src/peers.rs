@@ -5224,6 +5224,50 @@ mod definition_fold_tests {
         }
     }
 
+    /// The storms run the loop's tick (`peers/revc_storm_tests.rs`), and after the count half
+    /// moved into `fold_check` and `plan_count_repairs` and the tracker's pruning into
+    /// `retain_tracker_members` they stopped doing so without any test failing, so they said
+    /// nothing of those. Textual, like the guards above: the storm tick must call each of the
+    /// functions the loop's tick calls for the count half, the tracker and the ledger, and none
+    /// of the pre-merge inline forms.
+    #[test]
+    fn the_storm_tick_calls_what_the_loops_tick_calls() {
+        let production = include_str!("peers.rs").split("\n#[cfg(test)]").next().unwrap();
+        let loop_code = tick_calls_guard::without_comments(production);
+        let storm_code =
+            tick_calls_guard::without_comments(include_str!("peers/revc_storm_tests.rs"));
+        let compact = |text: &str| -> String { text.split_whitespace().collect() };
+        let (in_loop, in_storm) = (compact(&loop_code), compact(&storm_code));
+        for call in [
+            "fold_check(",
+            "plan_count_repairs(",
+            "retain_tracker_members(",
+            "fold_digest_round(",
+            "fold_definition_round(",
+            "plan_digest_repairs(",
+            "plan_definition_repairs(",
+            "advance_probe_on(",
+            "stalls.retain_ledger(",
+            "stalls.retain_digest(",
+            "stalls.retain_definition(",
+            "stalls.set_repair_time(",
+            "stalls.set_repair_clock(",
+            "stalls.expire_repairs()",
+        ] {
+            assert!(
+                in_loop.contains(call),
+                "{call}: the loop no longer calls it; update the guard"
+            );
+            assert!(in_storm.contains(call), "{call}: the storm tick does not call it");
+        }
+        for form in ["divergence.observe(", "divergence.retain_members(", ".retain_repaired("] {
+            assert!(
+                !in_storm.contains(form),
+                "{form}: an inline form of what the loop reaches through its functions"
+            );
+        }
+    }
+
     /// The text handling of the guard above, with a test of its own so the guard
     /// is known to see what it claims to.
     mod tick_calls_guard {
