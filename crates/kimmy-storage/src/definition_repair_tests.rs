@@ -441,3 +441,117 @@ fn a_vector_shadow_is_not_repaired() {
     assert_eq!(done.definitions, DefinitionRestore::default());
     assert!(c.list_indexes("shop", &shadow).unwrap().is_empty());
 }
+
+/// The standing life's own floor: an index made at or before the drop that began this life
+/// belongs to a life this member has buried.
+#[test]
+fn an_index_at_or_below_the_standing_lifes_floor_is_history() {
+    let (a, b, _d) = pair();
+    later();
+    index(&a, "v", "by_v");
+    later();
+    // This member drops and recreates the collection: its floor is above the index's stamp.
+    assert!(b.drop_collection("shop", "orders").unwrap());
+    b.finish_purges_now().unwrap();
+    later();
+    b.create_collection("shop", "orders").unwrap();
+    let floor = b.get_collection("shop", "orders").unwrap().incarnation_floor.unwrap();
+    assert!(a.get_collection("shop", "orders").unwrap().indexes[0].created.unwrap().hlc <= floor);
+    let done = repair(&b, &a, BIG);
+    assert_eq!(done.definitions, DefinitionRestore { history: 1, ..Default::default() });
+    assert!(names(&b).is_empty());
+}
+
+/// The same floor raised between the check and the build: the closure judges it again.
+#[test]
+fn a_floor_raised_between_the_check_and_the_build_wins() {
+    let (a, b, _d) = pair();
+    later();
+    index(&a, "v", "by_v");
+    let b = std::rc::Rc::new(b);
+    let competing = std::rc::Rc::clone(&b);
+    let (done, ()) = crate::sync::race_hooks::race(
+        crate::sync::race_hooks::Race::DefinitionRepair,
+        move || {
+            later();
+            assert!(competing.drop_collection("shop", "orders").unwrap());
+            competing.finish_purges_now().unwrap();
+            later();
+            competing.create_collection("shop", "orders").unwrap();
+        },
+        || repair(&b, &a, BIG),
+    );
+    assert_eq!(done.definitions, DefinitionRestore { history: 1, ..Default::default() });
+    assert!(names(&b).is_empty());
+}
+
+/// This member's own horizon is read for the choice of the one build, not only under the
+/// writer: an index at or below it is ambiguous and does not spend the repair's build.
+#[test]
+fn this_members_own_horizon_is_read_before_the_choice_of_the_build() {
+    let (a, b, _d) = pair();
+    later();
+    index(&a, "v", "old");
+    let old = a.get_collection("shop", "orders").unwrap().indexes[0].created.unwrap().hlc;
+    later();
+    index(&a, "w", "new");
+    b.test_set_tombstone_horizon(old).unwrap();
+    let done = repair_with(&b, &a, BIG, |page| page.tombstone_horizon = Some(Hlc::ZERO));
+    assert_eq!((done.definitions.ambiguous, done.definitions.built), (1, 1));
+    assert_eq!(names(&b), vec!["new".to_string()]);
+}
+
+/// A sender that sends no horizon admits nothing: every index is ambiguous, not one.
+#[test]
+fn a_sender_without_a_horizon_leaves_every_index_ambiguous() {
+    let (a, b, _d) = pair();
+    later();
+    index(&a, "v", "one");
+    later();
+    index(&a, "w", "two");
+    let done = repair_with(&b, &a, BIG, |page| page.tombstone_horizon = None);
+    assert_eq!(done.definitions, DefinitionRestore { ambiguous: 2, ..Default::default() });
+    assert!(names(&b).is_empty());
+}
+
+/// A rival that lands between the check and the build, older than the page's definition:
+/// the replicated route would supersede it by stamp, and the repair must not. The page's
+/// definition is given a stamp ahead of this machine's clock so that the rival is older.
+#[test]
+fn a_rival_older_than_the_pages_definition_is_not_superseded() {
+    let (a, b, _d) = pair();
+    later();
+    index(&a, "v", "by_v");
+    let ahead = Hlc::new(crate::physical_now_ms() + 3_600_000, 0);
+    let b = std::rc::Rc::new(b);
+    let competing = std::rc::Rc::clone(&b);
+    let node = a.node_id();
+    let (done, ()) = crate::sync::race_hooks::race(
+        crate::sync::race_hooks::Race::DefinitionRepair,
+        move || {
+            later();
+            competing
+                .create_index(
+                    "shop",
+                    "orders",
+                    vec![IndexField::ascending("z")],
+                    false,
+                    Some("by_v".into()),
+                )
+                .unwrap();
+        },
+        || {
+            repair_with(&b, &a, BIG, move |page| {
+                for state in &mut page.collections {
+                    for index in &mut state.indexes {
+                        index.created = Some(kimmy_core::Stamp::new(ahead, node));
+                    }
+                }
+                page.tombstone_horizon = Some(Hlc::ZERO);
+            })
+        },
+    );
+    assert_eq!(done.definitions.built, 0, "{:?}", done.definitions);
+    let held = b.get_collection("shop", "orders").unwrap();
+    assert_eq!(held.indexes[0].fields, vec![IndexField::ascending("z")], "the rival was replaced");
+}
