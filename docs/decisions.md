@@ -27516,13 +27516,13 @@ drop of its database holds that drop's stamp. The difference is on the entries r
 table converges), and decides nothing: both members lack the collection under a database tombstone at or above both.
 Closing it would need a tombstone that knows its database, a stored-format change it does not justify. The model
 classifies exactly this shape (one side a drop of the collection, the other a later database drop's stamp) as
-`KnownSubsumed`, counts it apart, keeps it out of a sweep's failing groups, and pins both of its forms with named tests
-of their exact failures on each route
+`KnownSubsumed`, the two drops tied in one `Hlc` (later by node only) included, counts it apart, keeps it out of a
+sweep's failing groups, and pins its forms with named tests of their exact failures on each route
 (`known_residual_two_drops_of_one_database_the_first_dropper_held_the_collection`,
-`known_residual_a_collections_own_drop_and_a_later_database_drop`), so a change in it shows; any other subsumed
-difference is still reported. (2) As before, a far-future stamp: item 6's mints, and the clock passing a floor at
-install and at a sweep, move the clock to a stored stamp the coverage did not vouch for, the trade ADR-226 already makes and
-ADR-233's restart rule makes at the next start. (3) A vector configuration is judged before
+`known_residual_a_collections_own_drop_and_a_later_database_drop` and its `_in_one_hlc` tie), so a change in it shows;
+any other subsumed difference is still reported. (2) As before, a far-future stamp: item 6's mints, and the clock
+passing a floor at install and at a sweep, move the clock to a stored stamp the coverage did not vouch for, the trade
+ADR-226 already makes and ADR-233's restart rule makes at the next start. (3) A vector configuration is judged before
 its writer, on the definition the writer's check then holds unchanged; a drop of an older life whose tombstone lands
 in that instant changes no definition, and its own sweep, which runs after its tombstone, turns the configuration
 off.

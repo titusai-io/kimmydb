@@ -1416,12 +1416,14 @@ impl Cluster {
                     let expansion = |s: &Stamp| self.ghost.db_drops.contains(s);
                     (burial(x) && expansion(y) && y > x) || (burial(y) && expansion(x) && x > y)
                 };
+                // The residual's shape is checked first: its two drops can tie in `Hlc`
+                // (the same millisecond on two members) and differ by node only.
                 let category = match (ta, tb) {
-                    (Some(x), Some(y)) if x.hlc == y.hlc => Category::TombstoneNode,
-                    _ if key == "#database" => Category::DbTombstone,
                     (Some(x), Some(y)) if subsumed(a) && subsumed(b) && known(x, y) => {
                         Category::KnownSubsumed
                     }
+                    (Some(x), Some(y)) if x.hlc == y.hlc => Category::TombstoneNode,
+                    _ if key == "#database" => Category::DbTombstone,
                     _ if subsumed(a) && subsumed(b) => Category::TombstoneSubsumed,
                     _ => Category::CollTombstone,
                 };
@@ -2858,8 +2860,18 @@ fn sweep(label: &str, schedules: impl Iterator<Item = (String, Vec<Op>)>) {
         ran += 1;
         aged += usize::from(ops.iter().any(|o| matches!(o.step, Step::AgeOut { .. })));
         let outcomes = result.into_inner().unwrap().expect("ran");
-        let repaired_ok =
-            outcomes.iter().any(|o| o.route == Route::Repaired && o.signature().is_empty());
+        // The repair loop converged it: the repaired route is clean, or fails only past
+        // retention (by design, below), which also leaves the pure entries route failing
+        // where the schedule without its collection step converges.
+        let repaired_ok = outcomes.iter().any(|o| {
+            o.route == Route::Repaired && {
+                let signature: Vec<Category> = o.signature().into_iter().collect();
+                signature.is_empty()
+                    || (collects(&ops)
+                        && !signature.contains(&Category::Error)
+                        && !reproduces_without_collection(&ops, Route::Repaired, &signature))
+            }
+        });
         for outcome in &outcomes {
             created_differs +=
                 usize::from(outcome.route == Route::Pages && outcome.created_differs);
@@ -3224,5 +3236,29 @@ fn finding_f18_the_same_by_a_collection_drop() {
         "A.create(orders)@100; C.create(orders)@110; A.drop(orders)@130; B<-C whole; \
          B.write(orders/2)@160; C<-B entries; B.index(orders,k_1:asc)@210",
         &[(ORDERS, Some(&[2]))],
+    );
+}
+
+/// ADR-236's residual 1 in the drops' own `Hlc` (generated Full seeds 27993 and 41044,
+/// AgedOut 20069): the collection's own drop (t190.1A) and a later database drop's expansion
+/// (t190.1C) tie in `Hlc` and differ by node. The same shape as the row above, classified as
+/// it is: both members lack `orders` under the database's tombstone t190.1C.
+#[test]
+fn known_residual_a_collections_own_drop_and_a_later_database_drop_in_one_hlc() {
+    let ops = parse("A.create(orders)@120; C.create(items)@160; C.dropdb@190; A.drop(orders)@190");
+    if census_takes("known residual, one hlc", &ops, &[("as found", vec![])], &[]) {
+        return;
+    }
+    let outcomes = check(&ops);
+    let found: Vec<(Route, Vec<(Category, String)>)> = outcomes
+        .iter()
+        .map(|o| (o.route, o.failures.iter().map(|f| (f.category, f.detail.clone())).collect()))
+        .collect();
+    let known = vec![(Category::KnownSubsumed, "A/C orders: t190.1A vs t190.1C".to_string())];
+    assert_eq!(
+        found,
+        vec![(Route::Entries, known.clone()), (Route::Repaired, known), (Route::Pages, vec![])],
+        "{}",
+        render(&ops, &outcomes)
     );
 }
