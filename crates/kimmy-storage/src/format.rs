@@ -769,7 +769,14 @@ impl Cleared {
     /// sidecar, read before the open overwrites it (design 13.1).
     pub(crate) fn horizon_is_untrusted(&self) -> bool {
         match &self.prior {
-            Prior::Sidecar(sidecar) => sidecar.written_by != self.build.written_by,
+            // Another build's evidence, or a build whose retention passes do not raise the key
+            // whatever it calls itself: the 0.49 line writes the same `written_by` as a
+            // development build of the next release until the version is bumped, and a store
+            // that line collected from would otherwise read as this build's own.
+            Prior::Sidecar(sidecar) => {
+                sidecar.written_by != self.build.written_by
+                    || !keeps_the_tombstone_horizon(&sidecar.written_by)
+            }
             Prior::Fresh | Prior::CleanNoSidecar { .. } | Prior::DirtyNoSidecar => true,
         }
     }
@@ -781,6 +788,19 @@ impl Cleared {
             redb_file_format: self.build.file_format,
             written_by: self.build.written_by.clone(),
         }
+    }
+}
+
+/// Whether a build that wrote a store (its `written_by`, the workspace version) maintains the
+/// collected-through horizon: 0.50 and later do, the 0.49 line and everything before it does
+/// not, and a string that is not a version is not trusted. The pre-release suffix is ignored:
+/// `0.50.0-dev` is a build of the release that introduced the key.
+pub(crate) fn keeps_the_tombstone_horizon(written_by: &str) -> bool {
+    let core = written_by.split(['-', '+']).next().unwrap_or(written_by);
+    let mut parts = core.split('.').map(str::parse::<u64>);
+    match (parts.next(), parts.next()) {
+        (Some(Ok(major)), Some(Ok(minor))) => (major, minor) >= (0, 50),
+        _ => false,
     }
 }
 
@@ -2274,5 +2294,26 @@ mod tests {
             Err(other) => panic!("refused with the wrong error: {other}"),
             Ok(_) => panic!("opened"),
         }
+    }
+
+    #[test]
+    fn only_a_0_50_build_or_later_keeps_the_tombstone_horizon() {
+        for version in ["0.49.0", "0.49.7", "0.48.0", "0.1.0", "unknown", "", "x.y.z", "0.x"] {
+            assert!(!keeps_the_tombstone_horizon(version), "{version:?}");
+        }
+        for version in ["0.50.0", "0.50.0-dev", "0.50.1", "0.51.0", "1.0.0", "0.50", "0.50.0+abc"] {
+            assert!(keeps_the_tombstone_horizon(version), "{version:?}");
+        }
+    }
+
+    /// The reset reads the version string as evidence, so the build that ships the key must
+    /// not call itself by the name of the release that does not keep it.
+    #[test]
+    fn this_build_is_not_called_by_the_name_of_a_release_that_does_not_keep_the_horizon() {
+        assert!(
+            keeps_the_tombstone_horizon(kimmy_core::build::VERSION),
+            "{} is a version of the line that does not maintain the collected-through horizon",
+            kimmy_core::build::VERSION
+        );
     }
 }

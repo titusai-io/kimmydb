@@ -232,7 +232,7 @@ fn the_pages_definitions_are_not_restored() {
     a.create_index_with(
         "shop",
         "orders",
-        vec![IndexField::ascending("t")],
+        vec![crate::IndexField::ascending("t")],
         false,
         crate::Enforcement::Local,
         Some("ttl_t".into()),
@@ -240,20 +240,33 @@ fn the_pages_definitions_are_not_restored() {
         None,
     )
     .unwrap();
-    a.create_index("shop", "orders", vec![IndexField::ascending("u")], true, Some("uniq_u".into()))
-        .unwrap();
-    a.create_index("shop", "orders", vec![IndexField::ascending("k")], false, Some("ik".into()))
-        .unwrap();
+    a.create_index(
+        "shop",
+        "orders",
+        vec![crate::IndexField::ascending("u")],
+        true,
+        Some("uniq_u".into()),
+    )
+    .unwrap();
+    a.create_index(
+        "shop",
+        "orders",
+        vec![crate::IndexField::ascending("k")],
+        false,
+        Some("ik".into()),
+    )
+    .unwrap();
     // The requester has a same-name rival for `ik`, over another field.
     b.create_index(
         "shop",
         "orders",
-        vec![IndexField::ascending("other")],
+        vec![crate::IndexField::ascending("other")],
         false,
         Some("ik".into()),
     )
     .unwrap();
     let before = b.list_indexes("shop", "orders").unwrap();
+    let meta_before = serde_json::to_vec(&b.get_collection("shop", "orders").unwrap()).unwrap();
     converge(&b, &a);
     let after = b.list_indexes("shop", "orders").unwrap();
     assert_eq!(
@@ -261,18 +274,36 @@ fn the_pages_definitions_are_not_restored() {
         serde_json::to_vec(&after).unwrap(),
         "a Converge page changed the requester's definitions"
     );
+    // The whole collection definition, not only its index list.
+    assert_eq!(
+        meta_before,
+        serde_json::to_vec(&b.get_collection("shop", "orders").unwrap()).unwrap(),
+        "a Converge page changed the requester's collection metadata"
+    );
 }
 
 #[test]
 fn the_pages_carried_index_drops_are_not_applied() {
     let (a, b, _d) = pair();
     use crate::IndexField;
-    b.create_index("shop", "orders", vec![IndexField::ascending("k")], false, Some("ik".into()))
-        .unwrap();
+    b.create_index(
+        "shop",
+        "orders",
+        vec![crate::IndexField::ascending("k")],
+        false,
+        Some("ik".into()),
+    )
+    .unwrap();
     later();
     // The sender created and dropped an index of the same name: the drop is carried.
-    a.create_index("shop", "orders", vec![IndexField::ascending("k")], false, Some("ik".into()))
-        .unwrap();
+    a.create_index(
+        "shop",
+        "orders",
+        vec![crate::IndexField::ascending("k")],
+        false,
+        Some("ik".into()),
+    )
+    .unwrap();
     later();
     a.drop_index("shop", "orders", "ik").unwrap();
     let page = a.snapshot_page(None, Some(orders())).unwrap();
@@ -459,7 +490,7 @@ fn a_created_row_maintains_the_indexes_like_any_replicated_row() {
         e.create_index(
             "shop",
             "orders",
-            vec![IndexField::ascending("v")],
+            vec![crate::IndexField::ascending("v")],
             false,
             Some("by_v".into()),
         )
@@ -640,4 +671,205 @@ fn only_the_first_page_decides() {
     progress.test_mark_paged();
     let done = o.apply_snapshot_page(s.node_id(), &mut progress, &page).unwrap();
     assert!(!done.history);
+}
+
+// -- Claims the first tests left open (review revA) --------------------------------------------
+
+/// Rows `created` and `left` of a whole Converge pull of `from`'s scoped snapshot into `into`.
+fn converge_created(into: &Engine, from: &Engine) -> (usize, usize) {
+    let done = converge(into, from);
+    (done.created, done.left)
+}
+
+/// Gap (design 2.3 item 1): a Converge page whose collection state carries a vector
+/// configuration, a TTL index, a unique index and a same-name rival leaves the requester's
+/// whole collection metadata byte-identical, not only its index list.
+#[test]
+fn a_converge_page_leaves_the_whole_collection_meta_byte_identical() {
+    let (a, _da) = engine();
+    let (b, _db) = engine();
+    a.create_collection("shop", "orders").unwrap();
+    pull(&b, &a);
+    later();
+    a.configure_vectors(
+        "shop",
+        "orders",
+        kimmy_core::VectorConfig {
+            fields: vec!["text".into()],
+            provider: kimmy_core::ProviderConfig::Byo {},
+            dim: 4,
+            metric: Default::default(),
+            document_prefix: None,
+            query_prefix: None,
+            chunk: Default::default(),
+        },
+    )
+    .unwrap();
+    a.create_index_with(
+        "shop",
+        "orders",
+        vec![crate::IndexField::ascending("t")],
+        false,
+        crate::Enforcement::Local,
+        Some("ttl_t".into()),
+        Some(60),
+        None,
+    )
+    .unwrap();
+    a.create_index(
+        "shop",
+        "orders",
+        vec![crate::IndexField::ascending("u")],
+        true,
+        Some("u".into()),
+    )
+    .unwrap();
+    a.create_index(
+        "shop",
+        "orders",
+        vec![crate::IndexField::ascending("k")],
+        false,
+        Some("ik".into()),
+    )
+    .unwrap();
+    b.create_index(
+        "shop",
+        "orders",
+        vec![crate::IndexField::ascending("z")],
+        false,
+        Some("ik".into()),
+    )
+    .unwrap();
+    let ca = a.get_collection("shop", "orders").unwrap();
+    a.insert(&ca, doc! { "_id": 5, "text": "x" }).unwrap();
+    let page = a.snapshot_page(None, Some(orders())).unwrap();
+    assert!(page.collections[0].vector.is_some(), "premise: the page carries the configuration");
+    let before = serde_json::to_vec(&b.get_collection("shop", "orders").unwrap()).unwrap();
+    let shadow = kimmy_core::vector_meta::shadow_name("orders");
+    assert!(b.get_collection("shop", &shadow).is_err(), "premise: no shadow here");
+    let mut progress =
+        SnapshotProgress::of_collection_converging(orders(), kimmy_core::VersionVector::new());
+    let done = b.apply_snapshot_page(a.node_id(), &mut progress, &page).unwrap();
+    let after = serde_json::to_vec(&b.get_collection("shop", "orders").unwrap()).unwrap();
+    assert_eq!(before, after, "a Converge page changed the requester's collection metadata");
+    assert!(b.get_collection("shop", &shadow).is_err(), "a Converge page created the shadow");
+    assert!(done.shadows_missing.is_empty() && done.shadows_orphaned.is_empty());
+}
+
+/// Gap: a Converge page for a collection the requester does not hold creates nothing, and
+/// its rows are `left`.
+#[test]
+fn a_converge_page_for_a_collection_this_member_lacks_creates_nothing() {
+    let (a, _da) = engine();
+    let (b, _db) = engine();
+    let ca = a.create_collection("shop", "orders").unwrap();
+    a.insert(&ca, doc! { "_id": 1, "v": 1 }).unwrap();
+    let (created, left) = converge_created(&b, &a);
+    assert!(b.get_collection("shop", "orders").is_err(), "a Converge page created a collection");
+    assert_eq!((created, left), (0, 1));
+}
+
+/// Gap (design 2.3 item 4): a newer tombstone over an older held tombstone writes nothing
+/// under Converge (the `All` route records a bare tombstone over it).
+#[test]
+fn a_newer_tombstone_over_a_held_older_tombstone_writes_nothing() {
+    let (a, _da) = engine();
+    let (b, _db) = engine();
+    let ca = a.create_collection("shop", "orders").unwrap();
+    pull(&b, &a);
+    a.insert(&ca, doc! { "_id": 1, "v": 1 }).unwrap();
+    pull(&b, &a);
+    later();
+    let cb = b.get_collection("shop", "orders").unwrap();
+    b.delete(&cb, &DocId::Int64(1)).unwrap();
+    later();
+    a.replace(&ca, &DocId::Int64(1), doc! { "_id": 1, "v": 2 }, false).unwrap();
+    later();
+    a.delete(&ca, &DocId::Int64(1)).unwrap();
+    let raw = |e: &Engine| {
+        use redb::ReadableDatabase;
+        let key = crate::docs::doc_key(&DocId::Int64(1)).unwrap();
+        let txn = e.db().begin_read().unwrap();
+        let table = txn.open_table(crate::tables::DOCS).unwrap();
+        table.get((orders().0, key.as_slice())).unwrap().map(|v| v.value().to_vec())
+    };
+    let before = raw(&b);
+    let commits = b.commits();
+    let mut progress =
+        SnapshotProgress::of_collection_converging(orders(), kimmy_core::VersionVector::new());
+    let page = a.snapshot_page(None, Some(orders())).unwrap();
+    let done = b.apply_snapshot_page(a.node_id(), &mut progress, &page).unwrap();
+    assert_eq!(raw(&b), before, "the held tombstone was rewritten");
+    assert_eq!(b.commits(), commits, "a page that wrote nothing committed");
+    assert_eq!((done.applied, done.left, done.left_tombstone), (0, 0, 0));
+}
+
+#[test]
+fn a_tombstone_for_a_collection_this_member_lacks_is_counted_left_tombstone() {
+    let (a, _da) = engine();
+    let (b, _db) = engine();
+    let ca = a.create_collection("shop", "orders").unwrap();
+    a.insert(&ca, doc! { "_id": 1, "v": 1 }).unwrap();
+    later();
+    a.delete(&ca, &DocId::Int64(1)).unwrap();
+    let done = converge(&b, &a);
+    assert!(b.get_collection("shop", "orders").is_err(), "a Converge page created a collection");
+    assert_eq!((done.left, done.left_tombstone), (0, 1), "{done:?}");
+}
+
+// -- A retention pass between the plan and the page ------------------------------------------
+
+/// The horizon is read inside the page's write transaction. This member deleted `x` (the sender
+/// never heard), and a retention pass collects the tombstone between the plan and the page: the
+/// row the page carries is older than the horizon that pass raised, so it is `left`. A horizon
+/// read before the writer, or carried from the plan, would call it young and write back a
+/// document this member deleted.
+#[test]
+fn a_tombstone_collected_between_the_plan_and_the_page_does_not_let_the_row_back() {
+    use crate::gc::RetentionPolicy;
+    let (a, b, _d) = pair();
+    a.insert(&coll(&a), doc! { "_id": 1, "v": 1 }).unwrap();
+    pull(&b, &a);
+    later();
+    b.delete(&coll(&b), &DocId::Int64(1)).unwrap();
+    assert!(!held_row(&b, 1) || value(&b, 1).is_none(), "premise: deleted on b");
+    let page = a.snapshot_page(None, Some(orders())).unwrap();
+    let b = std::rc::Rc::new(b);
+    let competing = std::rc::Rc::clone(&b);
+    let (done, ()) = crate::sync::race_hooks::race(
+        crate::sync::race_hooks::Race::ConvergePage,
+        move || {
+            // Ten minutes on: the cutoff passes the tombstone, which is collected, and the
+            // horizon is raised above the row the page carries.
+            let now = crate::physical_now_ms() + 10 * 60 * 1_000;
+            let outcome = competing.collect_garbage_at(now, RetentionPolicy::new(60, 60)).unwrap();
+            assert!(outcome.tombstones_removed >= 1, "premise: the tombstone was collected");
+        },
+        || {
+            let mut progress = SnapshotProgress::of_collection_converging(
+                orders(),
+                kimmy_core::VersionVector::new(),
+            );
+            b.apply_snapshot_page(a.node_id(), &mut progress, &page).unwrap()
+        },
+    );
+    assert_eq!((done.created, done.left), (0, 1), "{done:?}");
+    assert!(!held_row(&b, 1), "a document this member deleted came back");
+}
+
+/// A sender that predates the horizon sends none. The rule is then off for the pull: nothing is
+/// young and every id this member holds nothing for is `left`, but a strictly newer row still
+/// lands over a held one (the 0.49-shaped sender under Converge, design 6 test 9).
+#[test]
+fn a_0_49_shaped_sender_still_has_its_newer_rows_applied_over_held_rows() {
+    let (a, b, _d) = pair();
+    a.insert(&coll(&a), doc! { "_id": 1, "v": 1 }).unwrap();
+    pull(&b, &a);
+    later();
+    a.replace(&coll(&a), &DocId::Int64(1), doc! { "_id": 1, "v": 2 }, false).unwrap();
+    a.insert(&coll(&a), doc! { "_id": 2, "v": 7 }).unwrap();
+    let done = converge_without_a_horizon(&b, &a);
+    assert_eq!(value(&b, 1), Some(2), "a newer row did not land over a held one");
+    assert_eq!(value(&b, 2), None, "a row this member holds nothing for was written");
+    assert_eq!((done.applied, done.created, done.left), (1, 0, 1), "{done:?}");
 }

@@ -109,10 +109,9 @@ fn the_built_index_is_logged_at_its_own_stamp_and_the_page_grants_nothing() {
         served.entries.iter().any(|e| e.stamp == ca.indexes[0].created.unwrap()),
         "the definition was not appended"
     );
-    // No coverage was granted beyond that stamp's own.
-    let after = b.witnessed_vector().unwrap();
-    let _ = before;
-    assert!(!after.is_empty());
+    // The page granted nothing: the creation is appended to the oplog (re-logging a restored
+    // definition is not minting one), and the witnessed vector is exactly as it was.
+    assert_eq!(b.witnessed_vector().unwrap(), before, "the page granted coverage");
 }
 
 #[test]
@@ -356,6 +355,8 @@ fn an_index_this_build_cannot_apply_is_refused_counted_and_leaves_a_hint() {
     });
     assert_eq!(done.definitions, DefinitionRestore { refused: 1, ..Default::default() });
     assert!(names(&b).is_empty());
+    // And the refusal is remembered, so the next comparison is explained and not a finding.
+    assert_eq!(b.refusal_hints(orders()).unwrap().len(), 1, "no refusal hint was written");
 }
 
 #[test]
@@ -373,15 +374,39 @@ fn a_page_whose_sender_dropped_the_collection_ends_the_pull_abandoned() {
 fn a_vector_configuration_and_the_pages_drops_are_not_applied() {
     let (a, b, _d) = pair();
     later();
+    a.configure_vectors(
+        "shop",
+        "orders",
+        kimmy_core::VectorConfig {
+            fields: vec!["text".into()],
+            provider: kimmy_core::ProviderConfig::Byo {},
+            dim: 4,
+            metric: Default::default(),
+            document_prefix: None,
+            query_prefix: None,
+            chunk: Default::default(),
+        },
+    )
+    .unwrap();
+    later();
     index(&a, "v", "by_v");
+    let built = a.get_collection("shop", "orders").unwrap();
+    let id = built.indexes.iter().find(|i| i.name == "by_v").unwrap().id;
     let before = b.get_collection("shop", "orders").unwrap();
     let done = repair_with(&b, &a, BIG, |page| {
-        // Whatever else the page carries is ignored.
-        page.dropped_indexes.push((orders(), 1, kimmy_core::Stamp::new(Hlc::new(1, 0), a_node())));
+        assert!(page.collections[0].vector.is_some(), "premise: the page carries the vectors");
+        // The page says the sender dropped the index it also carries, at a stamp above its
+        // creation: under the `All` route that would remove it again.
+        let above =
+            kimmy_core::Stamp::new(Hlc::new(crate::physical_now_ms() + 60_000, 0), a_node());
+        page.dropped_indexes.push((orders(), id, above));
     });
     assert_eq!(done.definitions.built, 1);
     let after = b.get_collection("shop", "orders").unwrap();
-    assert_eq!(after.vector, before.vector);
+    assert_eq!(after.vector, before.vector, "the vector configuration was applied");
+    assert!(after.vector.is_none());
+    assert_eq!(names(&b), vec!["by_v".to_string()], "a drop the page carried was applied");
+    assert!(b.get_collection("shop", &kimmy_core::vector_meta::shadow_name("orders")).is_err());
 }
 
 fn a_node() -> kimmy_core::NodeId {
@@ -597,4 +622,144 @@ fn an_index_of_the_life_after_a_drop_that_ended_the_standing_life_is_not_built_i
     assert!(done.history, "the page's life was not recognised as the successor");
     assert_eq!(done.definitions, DefinitionRestore { history: 1, ..Default::default() });
     assert!(names(&o).is_empty(), "life 1's index was built into life 0");
+}
+
+/// M2. The definition repair's history clause reads the standing life's floor, which a
+/// late-drop sweep sets only in the commit of its last chunk; the sweep removes the old
+/// life's definitions first. A definition repair landing between two chunks builds an
+/// index of the life the drop ended (created before the drop, so the sweep would have
+/// removed it), and the floor then lands over it: the member keeps an index stamped at or
+/// below its own floor for good, which no other member holds and no repair removes. The
+/// document repair refuses the same window (`owes_a_sweep_in_txn`); this one does not.
+#[test]
+fn a_definition_repair_between_two_sweep_chunks_builds_no_index_of_the_buried_life() {
+    let (a, _da) = engine();
+    let (d, _dd) = engine();
+    let (e, _de) = engine();
+    let on_a = a.create_collection("shop", "orders").unwrap();
+    a.insert(&on_a, doc! { "_id": 1i64 }).unwrap();
+    pull(&d, &a);
+    pull(&e, &a);
+    later();
+    // The old life gains a plain index; d loses its entry (witnessed, not applied: the
+    // later inserts carry its vector past it), e has it.
+    a.create_index("shop", "orders", vec![IndexField::ascending("v")], false, Some("old_i".into()))
+        .unwrap();
+    later();
+    // More than a chunk of the life, so the sweep takes two.
+    let docs: Vec<_> = (1_000..2_400i64).map(|i| doc! { "_id": i }).collect();
+    a.insert_many(&on_a, docs).unwrap();
+    let entries =
+        a.entries_for_peer(Hlc::ZERO, 10_000, crate::WalkScope::Background).unwrap().entries;
+    let lost: Vec<_> =
+        entries.iter().filter(|x| x.kind != kimmy_core::OpKind::CreateIndex).cloned().collect();
+    d.apply_batch(&lost).unwrap();
+    pull(&e, &a);
+    assert!(d.list_indexes("shop", "orders").unwrap().is_empty(), "premise: d lost the index");
+    assert_eq!(e.list_indexes("shop", "orders").unwrap().len(), 1, "premise: e holds it");
+    let created = e.get_collection("shop", "orders").unwrap().indexes[0].created.unwrap();
+    later();
+    // a drops the life; d writes after the drop before it hears of it, so its life is kept
+    // (re-dated) and owes the sweep when the drop arrives.
+    assert!(a.drop_collection("shop", "orders").unwrap());
+    let dropped = a.collection_dropped_at(orders()).unwrap().unwrap();
+    later();
+    d.create_index("shop", "orders", vec![IndexField::ascending("k")], false, Some("k_1".into()))
+        .unwrap();
+    // Between the sweep's first and second chunk (the writer released), a definition repair
+    // from e, which still holds the old life, runs on d.
+    let d = std::sync::Arc::new(d);
+    let e = std::sync::Arc::new(e);
+    let (on_d, from) = (std::sync::Arc::clone(&d), std::sync::Arc::clone(&e));
+    let ran = std::rc::Rc::new(std::cell::Cell::new(None));
+    let into = std::rc::Rc::clone(&ran);
+    crate::late_drop::hooks::run_after_the_next_chunk(move || {
+        let mut progress = SnapshotProgress::of_collection_definitions(orders(), 1_000_000);
+        let page = from.snapshot_page(None, progress.scope()).unwrap();
+        let done = on_d.apply_snapshot_page(from.node_id(), &mut progress, &page).unwrap();
+        into.set(Some(done.definitions.built));
+    });
+    let start = d.version_vector().unwrap().behind(&a.version_vector().unwrap()).unwrap();
+    let entries = a.entries_for_peer(start, 10_000, crate::WalkScope::Background).unwrap().entries;
+    d.apply_batch(&entries).unwrap();
+    let built = ran.get().expect("premise: the sweep ran more than one chunk");
+    let kept = d.get_collection("shop", "orders").unwrap();
+    assert!(kept.is_redated(), "premise: the life was kept");
+    assert_eq!(kept.incarnation_floor, Some(dropped.hlc), "premise: the sweep finished");
+    assert!(created.hlc <= dropped.hlc, "premise: the index predates the drop");
+    let below: Vec<_> = kept
+        .indexes
+        .iter()
+        .filter(|i| i.created.is_some_and(|c| c.hlc <= dropped.hlc))
+        .map(|i| i.name.clone())
+        .collect();
+    assert!(
+        below.is_empty(),
+        "the definition repair (built {built}) left an index of the buried life at or below \
+         the floor: {below:?}"
+    );
+}
+
+/// The same definition landing between the check and the build is nothing to repair: it is not
+/// a rival and not a refusal.
+#[test]
+fn the_same_definition_landing_between_the_check_and_the_build_is_nothing() {
+    let (a, b, _d) = pair();
+    later();
+    index(&a, "v", "by_v");
+    let b = std::rc::Rc::new(b);
+    let competing = std::rc::Rc::clone(&b);
+    let (done, ()) = crate::sync::race_hooks::race(
+        crate::sync::race_hooks::Race::DefinitionRepair,
+        move || {
+            later();
+            competing
+                .create_index(
+                    "shop",
+                    "orders",
+                    vec![IndexField::ascending("v")],
+                    false,
+                    Some("by_v".into()),
+                )
+                .unwrap();
+        },
+        || repair(&b, &a, BIG),
+    );
+    assert_eq!(done.definitions, DefinitionRestore::default(), "{:?}", done.definitions);
+    assert_eq!(names(&b), vec!["by_v".to_string()]);
+}
+
+/// An unstamped rival (a definition older than ADR-132) that lands in the race is a rival,
+/// not a refusal: no hint is written, or the next comparison would call the difference
+/// explained and the finding would stop being reported.
+#[test]
+fn an_unstamped_rival_in_the_race_is_a_rival_and_leaves_no_refusal_hint() {
+    let (a, b, _d) = pair();
+    later();
+    index(&a, "v", "by_v");
+    let b = std::rc::Rc::new(b);
+    let competing = std::rc::Rc::clone(&b);
+    let (done, ()) = crate::sync::race_hooks::race(
+        crate::sync::race_hooks::Race::DefinitionRepair,
+        move || {
+            competing
+                .create_index_inner(
+                    "shop",
+                    "orders",
+                    vec![IndexField::ascending("z")],
+                    false,
+                    crate::Enforcement::Local,
+                    Some("by_v".into()),
+                    None,
+                    None,
+                    crate::index::CreateOrigin::Replicated { created: None, logged: None },
+                    &|_, _| false,
+                )
+                .unwrap();
+        },
+        || repair(&b, &a, BIG),
+    );
+    assert_eq!(done.definitions.refused, 0, "{:?}", done.definitions);
+    assert_eq!(done.definitions.built, 0);
+    assert!(b.refusal_hints(orders()).unwrap().is_empty(), "a rival was written as a refusal");
 }

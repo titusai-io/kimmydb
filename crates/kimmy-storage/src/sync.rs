@@ -1301,7 +1301,7 @@ impl Engine {
             // The lab's loss of one replicated entry: witnessed, not written (repair design
             // section 15.1). Not compiled into any build that ships.
             #[cfg(feature = "lab-hooks")]
-            if crate::lab_hooks::drops(entry) {
+            if crate::lab_hooks::drops(entry, || self.lab_hook_entry_would_write(entry)) {
                 witnessed.observe(entry.stamp);
                 continue;
             }
@@ -2946,6 +2946,9 @@ pub(crate) mod race_hooks {
         /// A definition repair chose the index it will build, and has not yet taken
         /// the writer to build it.
         DefinitionRepair,
+        /// A document repair's page has been taken and judged to apply, and has not yet taken
+        /// the writer: a retention pass can commit between a plan and the page.
+        ConvergePage,
     }
 
     type Hook = Box<dyn FnOnce()>;

@@ -87,6 +87,25 @@ fn same_definition(a: &IndexMeta, b: &IndexMeta) -> bool {
 }
 
 impl crate::Engine {
+    /// Whether an index made at `created` was made before a drop of its collection or of its
+    /// database that this member holds a tombstone for: `is_history` for an index, as it is for
+    /// a document. A late-drop sweep removes the old life's definitions first and sets the
+    /// floor only in the commit of its last chunk, so between two chunks the floor says
+    /// nothing and the tombstone does (review revA M2).
+    fn index_predates_a_drop(
+        &self,
+        db: &str,
+        collection: CollectionId,
+        created: Stamp,
+    ) -> Result<bool> {
+        for id in [collection, kimmy_core::database_drop_id(db)] {
+            if self.collection_dropped_at(id)?.is_some_and(|dropped| created < dropped) {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
     /// Apply the first page of a scoped pull under `Definitions`. The pull ends here: it
     /// never asks for page two, persists no cursor, forgets none, and grants no coverage.
     pub(crate) fn apply_definitions_page(
@@ -166,7 +185,9 @@ impl crate::Engine {
                 out.history += 1;
                 continue;
             };
-            if standing.incarnation_floor.is_some_and(|floor| created.hlc <= floor) {
+            if standing.incarnation_floor.is_some_and(|floor| created.hlc <= floor)
+                || self.index_predates_a_drop(&state.db, id, created)?
+            {
                 out.history += 1;
                 continue;
             }
@@ -197,41 +218,47 @@ impl crate::Engine {
         let created = index.created.expect("a candidate carries its stamp");
         // The gate on the requester's own live count, re-read immediately before the build:
         // a catch-up or a write load can grow the collection between the plan and here.
-        if self.count_by_id(id)?.unwrap_or(0) > limit {
+        let live = self.count_by_id(id)?.unwrap_or(0);
+        if live > limit {
             out.too_large += 1;
             return Ok(out);
         }
-        warn!(
-            db = %state.db,
-            collection = %state.name,
-            index = %index.name,
-            documents = self.count_by_id(id)?.unwrap_or(0),
-            "a definition repair is building an index and holds the writer"
-        );
         #[cfg(test)]
         crate::sync::race_hooks::reach(crate::sync::race_hooks::Race::DefinitionRepair);
         // Judged again under the writer, where a drop that landed since the check wins.
         let vetoed_by: Cell<Option<&'static str>> = Cell::new(None);
-        let veto =
-            |standing: &CollectionMeta, dropped: Option<Stamp>| -> bool {
-                let reason =
-                    if standing.incarnation_floor.is_some_and(|floor| created.hlc <= floor) {
-                        Some("history")
-                    } else if dropped.is_some_and(|at| created < at) {
-                        Some("tombstoned")
-                    } else if standing.indexes.iter().any(|i| i.name == index.name) {
-                        // Held now (a rival create landed): the build would mutate a held index.
-                        Some("rival")
-                    } else if self.tombstone_horizon().ok().flatten().is_none_or(|own| {
-                        created.hlc <= own.max(sender_horizon.unwrap_or(Hlc::MAX))
-                    }) {
-                        Some("ambiguous")
-                    } else {
-                        None
-                    };
-                vetoed_by.set(reason);
-                reason.is_some()
+        let veto = |standing: &CollectionMeta, dropped: Option<Stamp>| -> bool {
+            let reason = if standing.incarnation_floor.is_some_and(|floor| created.hlc <= floor)
+                || self.index_predates_a_drop(&state.db, id, created).unwrap_or(true)
+            {
+                Some("history")
+            } else if dropped.is_some_and(|at| created < at) {
+                Some("tombstoned")
+            } else if let Some(held) = standing.indexes.iter().find(|i| i.name == index.name) {
+                // Held now (a create landed): the build would mutate a held index. The
+                // same definition is nothing to repair, a different one is a rival.
+                Some(if same_definition(held, index) { "held" } else { "rival" })
+            } else if self
+                .tombstone_horizon()
+                .ok()
+                .flatten()
+                .is_none_or(|own| created.hlc <= own.max(sender_horizon.unwrap_or(Hlc::MAX)))
+            {
+                Some("ambiguous")
+            } else {
+                // Past every check, under the writer: the build starts now.
+                warn!(
+                    db = %state.db,
+                    collection = %state.name,
+                    index = %index.name,
+                    documents = live,
+                    "a definition repair is building an index and holds the writer"
+                );
+                None
             };
+            vetoed_by.set(reason);
+            reason.is_some()
+        };
         let built = self.create_index_inner(
             &state.db,
             &state.name,
@@ -256,9 +283,15 @@ impl crate::Engine {
                 Some("history") => out.history += 1,
                 Some("tombstoned") => out.tombstoned += 1,
                 Some("ambiguous") => out.ambiguous += 1,
+                // The same definition landed meanwhile: there is nothing left to repair.
+                Some("held") => {}
                 _ => out.rival += 1,
             },
             crate::sync::Ddl::Gone | crate::sync::Ddl::PurgePending(_) => out.gone += 1,
+            // An unstamped rival held under the name (a definition older than ADR-132): the name
+            // is held under another definition, which this build can apply. Not a refusal of
+            // the definition, so no hint, or the next comparison would call the rival explained.
+            crate::sync::Ddl::Refused(kimmy_core::Error::IndexExists { .. }) => out.rival += 1,
             crate::sync::Ddl::Refused(reason) => {
                 out.refused += 1;
                 warn!(

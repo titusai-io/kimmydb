@@ -123,20 +123,49 @@ fn the_horizon_never_goes_down() {
 fn every_tombstone_collector_raises_the_horizon_in_its_removing_transaction() {
     let source = include_str!("gc.rs");
     let product = source.split("#[cfg(test)]").next().unwrap();
+    // Split at every `fn` at item depth, whatever its visibility, so a collector added later as
+    // `pub(crate) fn` is a function of its own and not part of the one above it.
+    let mut starts: Vec<usize> = product
+        .match_indices("fn ")
+        .map(|(at, _)| at)
+        .filter(|at| {
+            let line_start = product[..*at].rfind('\n').map_or(0, |n| n + 1);
+            let prefix = &product[line_start..*at];
+            // An item inside `impl`: four spaces of indent, then at most a visibility.
+            prefix.starts_with("    ")
+                && !prefix.starts_with("     ")
+                && matches!(prefix.trim(), "" | "pub" | "pub(crate)" | "pub(super)" | "const")
+        })
+        .collect();
+    starts.push(product.len());
     let mut checked = 0;
-    for function in product.split("\n    fn ") {
+    for window in starts.windows(2) {
+        let function = &product[window[0]..window[1]];
         let removes = function.contains("begin_write(WriterHolder::Retention)")
             && (function.contains("tables::DOCS")
                 || function.contains("COLLECTIONS_DROPPED")
                 || function.contains("INDEXES_DROPPED"));
-        if removes {
-            checked += 1;
-            assert!(
-                function.contains("raise_tombstone_horizon_in_txn"),
-                "a tombstone collector does not raise the horizon: {}",
-                function.lines().next().unwrap_or("")
-            );
+        if !removes {
+            continue;
         }
+        checked += 1;
+        let name = function.lines().next().unwrap_or("");
+        // The raise sits in the removing transaction: after the transaction opens and before
+        // the commit that follows it. A raise in a second transaction after the commit leaves
+        // the crash window the design forbids (13.1), and a raise before the transaction
+        // opens is in nothing.
+        let begin = function.find("begin_write(WriterHolder::Retention)").unwrap();
+        let commit = function[begin..]
+            .find("txn.commit()")
+            .map(|at| begin + at)
+            .unwrap_or_else(|| panic!("{name}: no commit follows the transaction"));
+        let raise = function
+            .find("raise_tombstone_horizon_in_txn")
+            .unwrap_or_else(|| panic!("a tombstone collector does not raise the horizon: {name}"));
+        assert!(
+            begin < raise && raise < commit,
+            "{name}: the horizon is not raised inside the removing transaction"
+        );
     }
     assert_eq!(checked, 3, "the three collectors: documents, collections and databases, indexes");
 }
@@ -269,6 +298,13 @@ fn the_sidecar_written_before_the_open_keeps_the_prior_build_until_the_reset_lan
     let before_open = cleared.sidecar_before_open().expect("the redb fields are brought up");
     assert_eq!(before_open.written_by, "0.48.0", "the pre-open write named this build");
     assert!(cleared.horizon_is_untrusted());
+    // A kill here: the sidecar is on disk as the pre-open write left it. The next start still
+    // reads the evidence, and resets: the horizon is at least that start.
+    drop(cleared);
+    let second_start = crate::physical_now_ms();
+    let engine = Engine::open(&path_of(&dir)).unwrap();
+    let horizon = engine.tombstone_horizon().unwrap().expect("a horizon");
+    assert!(horizon.wall_ms >= second_start, "{horizon:?} is below the second start");
 }
 
 // -- A completed whole-database snapshot adopts its sender's forgetting ------------------------
@@ -345,4 +381,129 @@ fn a_page_without_a_horizon_and_a_scoped_snapshot_adopt_nothing() {
     page.tombstone_horizon = Some(sender);
     b.apply_snapshot_page(a.node_id(), &mut progress, &page).unwrap();
     assert_eq!(b.tombstone_horizon().unwrap(), Some(own), "a scoped snapshot grants nothing");
+}
+
+// -- The 0.49 line is not this build (review revA M1) ------------------------------------------
+
+fn held_row(e: &Engine, id: i64) -> bool {
+    use redb::ReadableDatabase;
+    let key = crate::docs::doc_key(&kimmy_core::DocId::Int64(id)).unwrap();
+    let txn = e.db().begin_read().unwrap();
+    let table = txn.open_table(crate::tables::DOCS).unwrap();
+    table
+        .get((kimmy_core::CollectionId::derive("shop", "orders").0, key.as_slice()))
+        .unwrap()
+        .is_some()
+}
+
+/// A store that the 0.49.0 release ran between two starts of this build, and whose retention
+/// pass collected a tombstone without raising the key, must reset: the real previous release's
+/// `written_by` (not an invented string) is untrusted whatever this build calls itself. Without
+/// it the young-stamp rule writes back a document this member deleted.
+#[test]
+fn a_0_49_release_that_collected_between_two_starts_resets_the_horizon() {
+    let (a, _da) = engine();
+    let dir_b = tempfile::tempdir().unwrap();
+    let path_b = dir_b.path().join("kimmy.redb");
+    let b = Engine::open(&path_b).unwrap();
+    a.create_collection("shop", "orders").unwrap();
+    let pull = |into: &Engine, from: &Engine| {
+        let entries =
+            from.entries_for_peer(Hlc::ZERO, 10_000, WalkScope::Background).unwrap().entries;
+        into.apply_batch(&entries).unwrap();
+    };
+    pull(&b, &a);
+    std::thread::sleep(std::time::Duration::from_millis(5));
+    let ca = a.get_collection("shop", "orders").unwrap();
+    a.insert(&ca, doc! { "_id": 1, "v": 1 }).unwrap();
+    pull(&b, &a);
+    std::thread::sleep(std::time::Duration::from_millis(5));
+    // B deletes the document; A never hears of it.
+    let cb = b.get_collection("shop", "orders").unwrap();
+    b.delete(&cb, &kimmy_core::DocId::Int64(1)).unwrap();
+    // The 0.49.0 release runs the store: its retention pass collects the tombstone and, knowing
+    // nothing of the key, does not raise it.
+    {
+        let txn = b.begin_write(crate::WriterHolder::Retention).unwrap();
+        {
+            let mut docs = txn.open_table(crate::tables::DOCS).unwrap();
+            let key = crate::docs::doc_key(&kimmy_core::DocId::Int64(1)).unwrap();
+            let id = kimmy_core::CollectionId::derive("shop", "orders").0;
+            assert!(crate::live_count::remove_record(&txn, &mut docs, id, &key).unwrap());
+        }
+        txn.commit().unwrap();
+    }
+    drop(b);
+    // ... and leaves its sidecar, as every 0.49.0 open does.
+    let mut sidecar = crate::format::read_sidecar(&path_b).expect("a sidecar");
+    sidecar.written_by = "0.49.0".into();
+    crate::format::write_sidecar(&path_b, &sidecar).unwrap();
+    // This build starts again.
+    let before_start = crate::physical_now_ms();
+    let b = Engine::open(&path_b).unwrap();
+    let horizon = b.tombstone_horizon().unwrap().expect("a horizon");
+    assert!(
+        horizon.wall_ms >= before_start,
+        "the horizon was not reset to this start: {horizon:?}"
+    );
+    assert!(!held_row(&b, 1), "premise: the tombstone is gone");
+    let mut progress = crate::SnapshotProgress::of_collection_converging(
+        kimmy_core::CollectionId::derive("shop", "orders"),
+        kimmy_core::VersionVector::new(),
+    );
+    while !progress.is_complete() {
+        let page = a.snapshot_page(progress.after().cloned(), progress.scope()).unwrap();
+        b.apply_snapshot_page(a.node_id(), &mut progress, &page).unwrap();
+    }
+    assert!(!held_row(&b, 1), "a document this member deleted came back through the young rule");
+}
+
+// -- Scenarios the first tests left to pieces (review revA m9) ---------------------------------
+
+/// A retention raised across a restart admits nothing below the horizon: the horizon a pass
+/// raised under the old retention survives the restart (the same build keeps it), and a later
+/// pass under a longer retention does not lower it. A row older than it is `left`, whatever the
+/// retention says now.
+#[test]
+fn a_retention_raised_across_a_restart_admits_nothing_below_the_horizon() {
+    let (a, _da) = engine();
+    let dir_b = tempfile::tempdir().unwrap();
+    let path_b = path_of(&dir_b);
+    let b = Engine::open(&path_b).unwrap();
+    a.create_collection("shop", "orders").unwrap();
+    let pull = |into: &Engine, from: &Engine| {
+        let entries =
+            from.entries_for_peer(Hlc::ZERO, 10_000, WalkScope::Background).unwrap().entries;
+        into.apply_batch(&entries).unwrap();
+    };
+    pull(&b, &a);
+    let ca = a.get_collection("shop", "orders").unwrap();
+    a.insert(&ca, doc! { "_id": 1, "v": 1 }).unwrap();
+    pull(&b, &a);
+    std::thread::sleep(std::time::Duration::from_millis(5));
+    let cb = b.get_collection("shop", "orders").unwrap();
+    b.delete(&cb, &kimmy_core::DocId::Int64(1)).unwrap();
+    // A pass under a 60 s retention collects the tombstone and raises the horizon above it.
+    let now = later_than_the_retention();
+    b.collect_garbage_at(now, policy()).unwrap();
+    let raised = b.tombstone_horizon().unwrap().unwrap();
+    drop(b);
+    // The restart, then a pass under a retention an hour longer: it collects nothing and the
+    // horizon does not move down.
+    let b = Engine::open(&path_b).unwrap();
+    assert_eq!(b.tombstone_horizon().unwrap(), Some(raised), "the restart lowered the horizon");
+    b.collect_garbage_at(now, RetentionPolicy::new(3_600, 3_600)).unwrap();
+    assert_eq!(b.tombstone_horizon().unwrap(), Some(raised));
+    // The row the sender still holds is older than the horizon: left, not created.
+    let mut progress = crate::SnapshotProgress::of_collection_converging(
+        kimmy_core::CollectionId::derive("shop", "orders"),
+        kimmy_core::VersionVector::new(),
+    );
+    let mut created = 0;
+    while !progress.is_complete() {
+        let page = a.snapshot_page(progress.after().cloned(), progress.scope()).unwrap();
+        created += b.apply_snapshot_page(a.node_id(), &mut progress, &page).unwrap().created;
+    }
+    assert_eq!(created, 0);
+    assert!(!held_row(&b, 1), "a document this member deleted came back");
 }

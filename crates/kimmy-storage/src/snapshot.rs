@@ -1293,6 +1293,8 @@ impl Engine {
         let at_cut = |stamp: Stamp| stamp.hlc <= progress.cut.get(stamp.node);
         if !page.documents.is_empty() || !page.deleted_documents.is_empty() {
             let mut memo = Memo::default();
+            #[cfg(test)]
+            crate::sync::race_hooks::reach(crate::sync::race_hooks::Race::ConvergePage);
             let txn = self.begin_write(WriterHolder::Repair)?;
             // The young-stamp rule's two horizons (design section 13.2). The receiver's own
             // is read **in this write transaction**, beside the "no row" read below, so a
@@ -1577,6 +1579,11 @@ impl Engine {
                 continue;
             }
             let Some(collection) = collection else {
+                // No collection here: under `Converge` the row is a tombstone this member holds
+                // nothing for, and says so.
+                if let Some(left) = converge.as_deref_mut() {
+                    *left += 1;
+                }
                 continue;
             };
 

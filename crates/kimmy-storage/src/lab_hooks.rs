@@ -19,10 +19,10 @@
 //! `<db>.<coll>`, split at the first `.`. A value that does not parse unambiguously, or names
 //! a database containing `.`, `:` or `,`, arms nothing.
 
-use std::sync::OnceLock;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Mutex, OnceLock};
 
-use kimmy_core::{CollectionId, OpKind, OplogEntry};
+use kimmy_core::{CollectionId, OpKind, OplogEntry, Stamp};
 use tracing::warn;
 
 /// The six kind words.
@@ -44,6 +44,10 @@ struct Armed {
     kind: Option<OpKind>,
     seen: AtomicU64,
     fired: AtomicBool,
+    /// The stamp of the entry this hook lost. A batch that fails after the loss is applied
+    /// again, and the retry must lose the same entry again: one loss per process, not one per
+    /// attempt (review revA m1).
+    lost: Mutex<Option<Stamp>>,
 }
 
 static ARMED: OnceLock<Vec<Armed>> = OnceLock::new();
@@ -75,6 +79,7 @@ fn parse_entry(entry: &str) -> Result<Armed, String> {
         kind,
         seen: AtomicU64::new(0),
         fired: AtomicBool::new(false),
+        lost: Mutex::new(None),
     })
 }
 
@@ -121,13 +126,22 @@ pub fn arm(value: &str) -> usize {
 }
 
 /// Whether the replicated entry `entry` is the one an armed list entry loses. Called once
-/// per entry the replicated path takes.
-pub(crate) fn drops(entry: &OplogEntry) -> bool {
+/// per entry the replicated path takes. `would_write` says whether the entry would change this
+/// member's state if it were applied: a re-delivery of an entry already applied, or one a
+/// newer row supersedes, is not counted, so the loss the log announces is a loss.
+pub(crate) fn drops(entry: &OplogEntry, would_write: impl Fn() -> bool) -> bool {
     let Some(armed) = ARMED.get() else {
         return false;
     };
     for hook in armed {
-        if hook.id != entry.collection || hook.fired.load(Ordering::Relaxed) {
+        if hook.id != entry.collection {
+            continue;
+        }
+        if hook.lost.lock().unwrap().as_ref() == Some(&entry.stamp) {
+            // The batch that lost it failed and is applied again.
+            return true;
+        }
+        if hook.fired.load(Ordering::Relaxed) {
             continue;
         }
         let counts = match hook.kind {
@@ -137,11 +151,12 @@ pub(crate) fn drops(entry: &OplogEntry) -> bool {
                 OpKind::Insert | OpKind::Update | OpKind::Replace | OpKind::Delete
             ),
         };
-        if !counts {
+        if !counts || !would_write() {
             continue;
         }
         if hook.n != 0 && hook.seen.fetch_add(1, Ordering::Relaxed) + 1 == hook.n {
             hook.fired.store(true, Ordering::Relaxed);
+            *hook.lost.lock().unwrap() = Some(entry.stamp);
             warn!(
                 db = %hook.db,
                 collection = %hook.coll,
@@ -153,6 +168,34 @@ pub(crate) fn drops(entry: &OplogEntry) -> bool {
         }
     }
     false
+}
+
+impl crate::Engine {
+    /// Whether applying the replicated entry would change this member: a document entry that a
+    /// row at the same or a newer stamp already supersedes does not. Anything this cannot read
+    /// counts as a write. Only for the lab's hook.
+    pub(crate) fn lab_hook_entry_would_write(&self, entry: &OplogEntry) -> bool {
+        use redb::ReadableDatabase;
+        let Some(id) = &entry.doc_id else {
+            return true;
+        };
+        let Ok(key) = crate::docs::doc_key(id) else {
+            return true;
+        };
+        let Ok(txn) = self.db().begin_read() else {
+            return true;
+        };
+        let Ok(docs) = txn.open_table(crate::tables::DOCS) else {
+            return true;
+        };
+        let Ok(Some(raw)) = docs.get((entry.collection.0, key.as_slice())) else {
+            return true;
+        };
+        match crate::codec::decode_doc_record(raw.value()) {
+            Ok(held) => entry.stamp.wins_over(&held.stamp),
+            Err(_) => true,
+        }
+    }
 }
 
 #[cfg(test)]
@@ -212,7 +255,7 @@ mod tests {
     #[test]
     fn the_nth_counted_entry_is_witnessed_and_not_written_and_only_once() {
         use bson::doc;
-        assert_eq!(arm("hook.lost:2:insert,hook.other:1"), 2);
+        assert_eq!(arm("hook.lost:2:insert,hook.other:1,hook.dup:2:insert"), 3);
         let dir_a = tempfile::tempdir().unwrap();
         let dir_b = tempfile::tempdir().unwrap();
         let a = crate::Engine::open(&dir_a.path().join("kimmy.redb")).unwrap();
@@ -233,8 +276,26 @@ mod tests {
         assert!(held(1) && !held(2) && held(3), "document 2 (the second insert) is the one lost");
         // Witnessed: the vector covers it, so a pull from the position does not bring it back.
         assert!(b.witnessed_vector().unwrap().covers(&a.witnessed_vector().unwrap()));
-        // And once only: a re-delivery of the whole batch applies it.
+        // One loss for good: the batch that lost it, applied again (it failed after the loss,
+        // or a window overlapped), loses the same entry again and no other.
         b.apply_batch(&entries).unwrap();
-        assert!(held(2), "a second delivery was lost as well");
+        assert!(!held(2), "the retry of the batch applied the entry the hook lost");
+        assert!(held(1) && held(3));
+
+        // A re-delivery of an entry already applied is not a count: the second *applied*
+        // insert of `hook.dup` is the one lost, not the second delivery.
+        let dup = a.create_collection("hook", "dup").unwrap();
+        a.insert(&dup, doc! { "_id": 1 }).unwrap();
+        let first =
+            a.entries_for_peer(kimmy_core::Hlc::ZERO, 1_000, crate::WalkScope::Background).unwrap();
+        b.apply_batch(&first.entries).unwrap();
+        b.apply_batch(&first.entries).unwrap();
+        a.insert(&dup, doc! { "_id": 2 }).unwrap();
+        let all =
+            a.entries_for_peer(kimmy_core::Hlc::ZERO, 1_000, crate::WalkScope::Background).unwrap();
+        b.apply_batch(&all.entries).unwrap();
+        let cd = b.get_collection("hook", "dup").unwrap();
+        let has = |id: i64| b.get(&cd, &kimmy_core::DocId::Int64(id)).unwrap().is_some();
+        assert!(has(1) && !has(2), "a re-delivery was counted as an applied entry");
     }
 }
