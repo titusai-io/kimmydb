@@ -164,7 +164,7 @@ impl Engine {
         let resolved =
             crate::engine::blocking(|| self.resolve_start(&scope, &options, &mut walked));
         report_resolve(self, began.elapsed(), &scope, &walked, resolved.is_ok());
-        let Resolved { opened, start, incarnation_floor } = resolved?;
+        let Resolved { opened, start, incarnation_floor, passes_drops_below } = resolved?;
 
         Ok(ChangeStream {
             rx,
@@ -179,6 +179,7 @@ impl Engine {
             pending: None,
             skip: opened.skip,
             incarnation_floor,
+            passes_drops_below,
             db_of_collection: HashMap::new(),
             finished: false,
         })
@@ -246,7 +247,16 @@ impl Engine {
             WatchScope::Collection(id) => self.clamp_to_incarnation(*id, start, options, walked)?,
             _ => (start, None),
         };
-        Ok(Resolved { opened, start, incarnation_floor })
+        // The life the stream follows, for the drops of earlier ones a member relays
+        // (`ChangeStream::passes_drops_below`).
+        let passes_drops_below = match scope {
+            WatchScope::Collection(id) => self.collection_by_id(*id)?.map(|live| {
+                let resumed = options.resume_after.as_ref().map(|token| token.to_stamp().hlc);
+                resumed.map_or(live.created, |at| at.min(live.created))
+            }),
+            _ => None,
+        };
+        Ok(Resolved { opened, start, incarnation_floor, passes_drops_below })
     }
 
     /// Move a start position forward past a drop of this collection.
@@ -1177,6 +1187,8 @@ struct Resolved {
     start: u64,
     /// See `ChangeStream::incarnation_floor`.
     incarnation_floor: Option<(CollectionId, Stamp)>,
+    /// See `ChangeStream::passes_drops_below`.
+    passes_drops_below: Option<Hlc>,
 }
 
 /// What a stream's resolve of where it starts did, for [`report_resolve`].
@@ -1441,6 +1453,15 @@ pub struct ChangeStream {
     /// its incarnation began after: entries of the collection stamped at or
     /// before it belong to the previous one.
     incarnation_floor: Option<(CollectionId, Stamp)>,
+    /// For a collection stream opened on a life that stands: a drop of the collection
+    /// stamped below this is of a life before the one the stream follows, and is passed
+    /// over (ADR-236). A member that ignores a drop because its own life is newer appends
+    /// and serves it, so its peers hear the drop, and a stream on the life that stands
+    /// would otherwise end at it. The life's `created` at the open, lowered to the token
+    /// it resumed from and to every stamp it delivers but a creation's: a stream that has
+    /// delivered a change at or before the drop holds history of the life the drop ended,
+    /// and ends.
+    passes_drops_below: Option<Hlc>,
     /// Cache for database-scoped filtering.
     db_of_collection: HashMap<CollectionId, String>,
     finished: bool,
@@ -1655,10 +1676,21 @@ impl ChangeStream {
         if entry.kind == OpKind::DropCollection
             && matches!(self.scope, WatchScope::Collection(id) if id == entry.collection)
         {
+            // A relayed drop of a life before the one this stream follows.
+            if self.passes_drops_below.is_some_and(|below| entry.stamp.hlc < below) {
+                return None;
+            }
             self.finished = true;
             return Some(ChangeEvent::Invalidate { reason: InvalidateReason::CollectionDropped });
         }
 
+        // A creation is not history the client holds: a member relays a creation of an
+        // earlier life past the one that stands, as it relays its drop.
+        if let Some(below) = &mut self.passes_drops_below
+            && entry.kind != OpKind::CreateCollection
+        {
+            *below = (*below).min(entry.stamp.hlc);
+        }
         self.last_delivered = Some(entry.stamp);
         let token = ResumeToken::issued(entry.stamp, self.issuer, self.delivered.clone());
         Some(ChangeEvent::Change { entry, token })
@@ -2004,6 +2036,73 @@ mod tests {
         assert_eq!(recreated.id, coll.id, "the id is derived from the name");
         engine.insert(&recreated, doc! { "_id": 2i64 }).unwrap();
         assert!(stream.next(&engine).await.is_none(), "the stream is over");
+    }
+
+    /// A member relays a drop it ignored (ADR-236), and a stream on the life that stands
+    /// passes over it; the pass is bounded by what the stream has delivered. A stream
+    /// that has delivered a change of the life the drop ended still ends at the drop:
+    /// with the tombstone gone (aged out), nothing floors a `from_start` stream, which
+    /// replays the earlier life and its drop before the life that stands.
+    #[tokio::test]
+    async fn a_stream_that_delivered_the_earlier_lifes_history_still_ends_at_its_drop() {
+        let (engine, coll, _dir) = setup();
+        engine.insert(&coll, doc! { "_id": 1i64 }).unwrap();
+        engine.drop_collection("app", "docs").unwrap();
+        engine.finish_purges_now().unwrap();
+        let recreated = engine.create_collection("app", "docs").unwrap();
+        engine.insert(&recreated, doc! { "_id": 99i64 }).unwrap();
+        let txn = engine.begin_write(crate::WriterHolder::Ddl).unwrap();
+        txn.open_table(crate::tables::COLLECTIONS_DROPPED).unwrap().remove(coll.id.0).unwrap();
+        txn.commit().unwrap();
+        assert!(engine.collection_dropped_at(coll.id).unwrap().is_none(), "premise: aged out");
+
+        let mut stream = engine
+            .watch(
+                WatchScope::Collection(recreated.id),
+                WatchOptions { start_at: Some(Hlc::ZERO), ..Default::default() },
+            )
+            .unwrap();
+        assert_eq!(doc_ids(&take(&engine, &mut stream, 1).await), vec![1], "premise");
+        let event = tokio::time::timeout(std::time::Duration::from_secs(5), stream.next(&engine))
+            .await
+            .expect("the stream answered")
+            .expect("an event");
+        assert!(
+            matches!(
+                event,
+                ChangeEvent::Invalidate { reason: InvalidateReason::CollectionDropped }
+            ),
+            "the earlier life's drop ends a stream that delivered that life: {event:?}"
+        );
+    }
+
+    /// A drop in the standing life's own `Hlc` ends it (the tie is the drop's, ADR-236),
+    /// so it is not one the stream passes over.
+    #[tokio::test]
+    async fn a_drop_in_the_lifes_own_hlc_ends_a_stream_on_it() {
+        let (engine, coll, _dir) = setup();
+        let mut stream = engine.watch(WatchScope::Collection(coll.id), Default::default()).unwrap();
+        let tied = Stamp::new(coll.created, kimmy_core::NodeId::from_bytes([0xff; 16]));
+        let drop = crate::engine::ddl_entry(
+            tied,
+            OpKind::DropCollection,
+            coll.id,
+            &kimmy_core::CollectionRef::new("app", "docs"),
+        )
+        .unwrap();
+        engine.apply_batch(std::slice::from_ref(&drop)).unwrap();
+        assert!(engine.get_collection("app", "docs").is_err(), "premise: the tie is the drop's");
+        let event = tokio::time::timeout(std::time::Duration::from_secs(5), stream.next(&engine))
+            .await
+            .expect("the stream answered")
+            .expect("an event");
+        assert!(
+            matches!(
+                event,
+                ChangeEvent::Invalidate { reason: InvalidateReason::CollectionDropped }
+            ),
+            "{event:?}"
+        );
     }
 
     #[tokio::test]

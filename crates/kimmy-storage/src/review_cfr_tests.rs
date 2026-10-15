@@ -7,6 +7,7 @@ use bson::doc;
 use kimmy_core::{CollectionId, IndexField};
 
 use crate::sync::SyncOutcome;
+use crate::watch::{ChangeEvent, WatchOptions, WatchScope};
 use crate::{Engine, SnapshotProgress, WalkScope};
 
 const BATCH: usize = 1024;
@@ -137,4 +138,34 @@ fn review_f7_a_049_burial_of_a_later_definition_wedges_a_050_puller() {
         ids_on(&s, "other", "things"),
         "R never took S's acknowledged write behind the index ({stops} stops in 6 rounds)"
     );
+}
+
+/// F4. A drop this member ignores (its own life is newer) is now appended and published,
+/// and a collection stream open on the live collection takes it as the collection's drop:
+/// `Invalidate{CollectionDropped}` for a collection that stands, holding its documents.
+/// Before ADR-236 the ignored drop was neither appended nor published.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn review_f4_a_relayed_ignored_drop_ends_a_stream_on_the_live_collection() {
+    let (c, _dc) = engine();
+    let (m, _dm) = engine();
+    c.create_collection("shop", "orders").unwrap();
+    assert!(c.drop_collection("shop", "orders").unwrap());
+    std::thread::sleep(Duration::from_millis(2));
+    let live = m.create_collection("shop", "orders").unwrap();
+    m.insert(&live, doc! { "_id": 1i64 }).unwrap();
+    let mut stream = m.watch(WatchScope::Collection(live.id), WatchOptions::default()).unwrap();
+    round(&m, &c);
+    let standing = m.get_collection("shop", "orders").expect("premise: the drop is ignored");
+    assert_eq!(standing.created, live.created, "premise: the same life");
+    m.insert(&live, doc! { "_id": 2i64 }).unwrap();
+    loop {
+        let heard = tokio::time::timeout(Duration::from_secs(2), stream.next(&m))
+            .await
+            .expect("the stream answered");
+        match heard {
+            Some(ChangeEvent::Change { entry, .. }) if entry.kind.is_document() => break,
+            Some(ChangeEvent::Change { .. }) => continue,
+            other => panic!("a stream on a live collection ended: {other:?}"),
+        }
+    }
 }

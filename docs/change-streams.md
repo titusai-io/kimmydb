@@ -259,6 +259,28 @@ reached the member: the stream's incarnation is bounded by the drop's stamp,
 which every entry of the live collection is above, and not by the position the
 drop's entry arrived at.
 
+### A drop a member ignored and passed on does not end the collection's streams
+
+A member that holds a newer life of a collection than the one a replicated drop
+ended ignores the drop, and since 0.50.0 (ADR-236) appends it and serves it on, so
+that its peers hear the drop; it does the same for a creation its database's drop
+refused. A stream of the collection that stands on that member **passes over** such
+a drop, where it would otherwise end with `Invalidate{CollectionDropped}` on a
+collection that still holds its documents. The test is the stream's own: the drop is
+stamped below the `created` of the life the stream opened on, and below the token it
+resumed from and every change it has delivered. A stream that has delivered a change
+at or before the drop (a `from_start` stream replaying the earlier life, with no
+tombstone left to floor it) holds history of the life the drop ended, and still ends
+there, and so does a stream at a drop in its life's own millisecond, which the drop
+wins.
+
+Wider scopes on the relaying member show the relayed entries as they show any entry.
+A `Cluster` stream delivers a `dropCollection` for a collection that still stands
+there, and a `createCollection` for a collection its database's drop refused there.
+A `Database` stream delivers the drop (the collection stands in the database) and not
+the refused creation: a collection the member does not hold matches no database, as
+for any entry of a collection it lacks.
+
 ---
 
 ## Scopes
