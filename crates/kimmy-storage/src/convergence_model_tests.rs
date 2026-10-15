@@ -2889,6 +2889,7 @@ fn sweep(label: &str, schedules: impl Iterator<Item = (String, Vec<Op>)>) {
     let mut known: BTreeMap<Route, usize> = BTreeMap::new();
     let mut by_design: BTreeMap<(Route, Vec<Category>), usize> = BTreeMap::new();
     let mut subsumed_example: Option<(Route, String, Vec<Op>)> = None;
+    let mut classes = String::new();
     let schedules: Vec<(String, Vec<Op>)> = schedules.collect();
     let threads =
         env_u64("CONV_THREADS", std::thread::available_parallelism().map_or(4, |n| n.get() as u64))
@@ -2942,22 +2943,34 @@ fn sweep(label: &str, schedules: impl Iterator<Item = (String, Vec<Op>)>) {
                 }
             }
             let signature: Vec<Category> = outcome.signature().into_iter().collect();
+            let mut class = |class: &str| {
+                let _ = writeln!(classes, "{id}\t{:?}\t{signature:?}\t{class}", outcome.route);
+            };
             if signature.is_empty() {
+                class("ok");
                 continue;
             }
             if outcome.route == Route::Entries
                 && repaired_ok
                 && !signature.contains(&Category::Error)
             {
+                class("needed repair");
                 *needed_repair.entry(signature).or_default() += 1;
                 continue;
             }
             if collects(&ops) && !reproduces_without_collection(&ops, outcome.route, &signature) {
+                class("past retention");
                 *by_design.entry((outcome.route, signature)).or_default() += 1;
                 continue;
             }
+            class("failing");
             groups.entry((outcome.route, signature)).or_default().push((id.clone(), ops.clone()));
         }
+    }
+    // Each route run's signature and how the sweep classified it, one line each, to compare
+    // two builds' runs schedule by schedule.
+    if let Ok(path) = std::env::var("CONV_CLASSES") {
+        std::fs::write(path, &classes).unwrap();
     }
     let elapsed = started.elapsed();
     let mut out = String::new();
@@ -3012,7 +3025,7 @@ fn sweep(label: &str, schedules: impl Iterator<Item = (String, Vec<Op>)>) {
 }
 
 /// The seeded generator: `CONV_SEEDS` schedules (default 200) from `CONV_SEED_START`,
-/// each 8 to 12 steps.
+/// each 8 to 12 steps. `CONV_CLASSES` names a file for each route run's signature and class.
 #[test]
 #[ignore = "the model's long run; see the convergence model test report"]
 fn generated_schedules() {
