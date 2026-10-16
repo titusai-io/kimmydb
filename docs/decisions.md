@@ -5362,6 +5362,14 @@ and its rotation remains what it was.
 
 ## ADR-102 — Vector-search filters use the planner, and the exact and lexical paths hold only the top k
 
+> **Amended by [ADR-239](#adr-239--a-vector-chunk-id-is-an-injective-encoding-of-the-source-_id-keeping-the-050-form-where-it-was-unambiguous).**
+> A chunk key is no longer `{source}#{chunk}` with `{source}` the `_id`'s display text, under which every binary
+> `_id` of one length was one document: it is an injective encoding of the source, which keeps that text for
+> ObjectId, Int64 and every String that cannot be read as another type. A document's chunks are still one
+> contiguous run, under its encoded id, and the keyed read below still reads that run; it keeps the chunks whose
+> record names the document, and also reads the ids a 0.50 build wrote for a binary or a reserved String. Search
+> compares documents as `DocId`.
+
 **Decision.** The `filter` of `vector_search` and `hybrid_search` is evaluated
 by the executor's planner-backed read — the primary key when it pins `_id`, a
 secondary index when one applies, a collection scan otherwise, every candidate
@@ -27945,3 +27953,115 @@ removed; the loop passing `false` to it; the contact's flag not carried out, or 
 plan; an existence finding held by this member's own marker; the hold of a count repair under
 way, or queued, removed, or counted as a stalled round; a snapshot held like the replay; and the
 fix off as a whole (the pre-fix behaviour).
+
+---
+
+## ADR-239 — A vector chunk id is an injective encoding of the source `_id`, keeping the 0.50 form where it was unambiguous
+
+> **Amends [ADR-102](#adr-102--vector-search-filters-use-the-planner-and-the-exact-and-lexical-paths-hold-only-the-top-k)**,
+> whose chunk keys were `{source}#{chunk}` with `{source}` the `_id`'s display text. No `kimmy.format` schema, codec tag,
+> wire field, record shape or configuration key changes, and no rollback boundary is added. The HNSW snapshot's
+> `meta.json` goes to format 3.
+
+**The case.** A chunk id was `DocId`'s `Display`, `#`, and the chunk number. `Display` is a format for people: every
+binary `_id` printed as `bin(N bytes)`, a String as itself, an Int64 as its decimal, an ObjectId as its hex. So every
+binary `_id` of one length (every UUID) shared one chunk set in its collection, and a String shared the chunks of the
+Int64 or the ObjectId it prints as. The per-document reads grouped chunks by the same string, and search used it as
+document identity. Seen through the real worker and search path at 0.50.0: four documents with UUID `_id`s left one
+chunk, the last writer's, which every one of them read as its own and as current, so no rescan re-embedded the others; a
+delete of any of them removed it; an unfiltered search returned one document; and a filter that admitted only tenant `a`
+returned tenant `b`'s document and its text, in both join directions. A filter on the Int64 `7` returned the String
+`"7"`'s document. No collision crossed collections, and members did not diverge: every member computed the same ids.
+
+**Decision.**
+
+1. **The chunk source and its grammar** (`kimmy-core`, `ChunkSource`). A chunk id is `DocId::String` of
+   `source "#" chunk`, `chunk` a `u32` with no sign and no leading zero, and `source` one of: an ObjectId's 24 lowercase
+   hex digits; an Int64's canonical decimal; a **plain String**, itself; or a tagged form: `~s:` and a **reserved
+   String** (one that begins with `~`, or is 24 lowercase hex digits, or is an `i64`'s canonical decimal), `~b:`, the
+   bytes in lowercase hex, `.` and the subtype in two hex digits, or `~d:` and the 38 hex digits of a Decimal128's
+   canonical 19 bytes (reserved: no `DocId` carries a Decimal128 yet, and the arm that maps one lands with it; every
+   match over `DocId` here is exhaustive so it cannot be forgotten). The encoding is total and injective over chunk
+   sources; values kimmydb keys as one document (Int32 5 and Int64 5) share one source. **The 0.50 id is kept for
+   ObjectId, Int64 and every plain String**, so the default `_id`'s chunks never move, and in a mixed roll both builds
+   write the same ids for them; only binaries and reserved Strings change. The parse is strict: split at the last `#`, a
+   leading `~` must be a tagged form (`~s:` only before a reserved String), 24 lowercase hex is an ObjectId, a
+   canonical `i64` decimal is an Int64, anything else is a plain String, and every id it accepts re-encodes to itself.
+   A binary's run, `~b:` hex `.`, is prefix-closed: it begins exactly the chunk ids of those bytes under every subtype.
+2. **The subtype comes from the body.** The document key folds a binary's subtype (until 0.53.0), so only a writer with
+   the stored body can name it: the embedding worker's `prepare`, which every embed passes through, sets
+   `ChunkSource::of(id, body._id)`. The client's `PUT …/vectors` route writes `ChunkSource::from(id)`; its ids are never
+   binary. Every site without a body reads and deletes the document's run under every subtype, which is the key's
+   identity. Nothing about a chunk id changes when 0.53.0 puts the subtype in the key: the run narrows to one subtype.
+3. **Per-document reads and writes** (`kimmy-storage`). A document S's **run** is the keys under its run prefix whose
+   parse names a source of S; its **legacy run** is the keys under the id a 0.50 build wrote for it (`bin(N bytes)#`
+   for a binary, its raw text for a reserved String), read and never written. A chunk is S's when **its record names
+   S**. `get_vectors` and `for_each_vector_of` return S's chunks of both, in chunk order, the run's winning a number
+   both hold. `vectors_are_stale` is true when (a) neither holds a chunk of S's, (b) one of S's is behind the document
+   or made under another configuration, as before, (c) the legacy run holds one of S's, or (d) the run holds a chunk
+   that is not S's (debris, which only S's put removes). A put writes each record at its id and removes, by stored id,
+   every id of S's run it does not rewrite, whatever it holds, and S's chunks of the legacy run; a delete, and the
+   refused-input removal, take S's chunks of both and nothing else (a chunk in S's run that names T is T's 0.50 chunk,
+   for T's own put to remove). These run in the scope's own transaction, so a second document of one batch is judged
+   by what the first wrote. **A reserved String's legacy run is adopted** with no provider call: when every chunk at
+   its 0.50 ids names it and its run is empty, each record is written unchanged at the new id and the old id deleted.
+4. **The worker.** The owner adopts before each staleness judgement of a reserved String, on the entry path and in
+   every scan. **Owner only, which the design did not say:** a member that does not own the collection could otherwise
+   move a document's older chunks onto the new ids after the owner's embed of a newer version, and a replicated write
+   to a shadow is never judged again. The first start of this build queues a `check` scan mark for every
+   server-embedded collection and sets the metadata key `vector_chunk_ids` to `2`, in one commit and only while it is
+   not `2` (a mark already standing is kept: a `force` one is stronger). The marks run as any others, by the owner
+   only: on a cluster they repeat the first-sight rescan every start performs, on a single node they are the only
+   trigger, and a store restored from a pre-0.51.0 backup lacks the key and is queued again.
+5. **Search.** A filter's admitted set is `HashSet<DocId>` and the exact scan admits by the record's `source`, through
+   one admission function; the keyed join is exact through point 3. The graph is keyed by the id each chunk is stored
+   under (`for_each_vector` passes it), never one recomputed from the record, and admits a candidate **after the load**,
+   by the record's source: a key names a slot, not who holds it. The per-document cap, the tie-break and fusion key a
+   document by its encoding, which equals the old `Display` for ObjectId, Int64 and plain Strings, so their order did
+   not move. The snapshot format goes to 3, so no graph keyed by the old derivation is adopted: one rebuild per vector
+   collection per member, on its first search. A hit's `_id` is unchanged, the folded `DocId`.
+
+**Recovery.** Nothing runs at open. Reads are right at once, on every 0.51.0 member. The one-time `check` rescan, and
+every rescan after it, takes each document through adoption, then staleness: a binary document is re-embedded once
+under its own id (its chunk is gone, or another document's, or under the 0.50 id; only one document per id length kept
+a chunk, so re-embedding is the only recovery), a twin is re-embedded, a reserved String is moved, and ObjectId,
+Int64 and plain-String documents read as current and are left alone. A `byo` collection has no worker: its 0.50
+chunks are served as they are until the client's next `PUT` replaces them or its `DELETE` removes them.
+
+**The mixed roll.** The shadow replicates as an ordinary collection with String keys, so members converge and the cut
+digest agrees. ObjectId, Int64 and plain-String documents have one id on both builds. A binary or reserved String
+document's 0.50-written chunk is read by a 0.51.0 member through its legacy run and moved or re-embedded at the next
+judgement; a 0.51.0-written chunk is found on a 0.50 member only by a full scan (its keyed join, graph keys, staleness
+and delete miss it), so each ownership move between builds costs one provider call per such document, during the roll
+only. Deletes converge: every member processes every `Delete` entry, the 0.51.0 ones removing the new ids and the 0.50
+ones the old. The filter-scope defect stays on 0.50 members until they are upgraded.
+
+**Rollback.** Inside 0.51.0's existing boundary; this adds none. Where a 0.51.0-written shadow reaches a 0.50 build, its
+chunks for binary and reserved-String documents are found there only by full scans, are not deleted with their
+document (`only_live` drops their hits, but they keep storage and can take result slots first), and the collisions and
+the filter-scope defect return. A pre-upgrade backup holds none of them. A 0.50 build refuses a format-3 snapshot and
+rebuilds.
+
+**Alternatives rejected.** A sweep or re-embed inside the schema migration: it runs at open with no provider, so it
+cannot re-embed, and a rename there lengthens the downtime for keys that need no re-key. A startup sweep: downtime, and
+the read rules are needed anyway for what a 0.50 member writes during the roll. Marking every vector stale: it
+re-embeds every collection though ObjectId, Int64 and plain-String chunks are correct; the rescan is its targeted form.
+A fully type-tagged grammar: every chunk of every collection moves, and each ownership move between builds during a
+roll re-embeds whole collections. Fixing `Display`: it couples a log format to stored keys, cannot separate `"7"` from
+`7` without changing how every String prints, and leaves the search-identity defects. Renaming binary chunks: it keeps
+part sets and cannot restore what was lost.
+
+**Tests.** `kimmy-core`: injectivity as a property over generated pairs weighted to twins (a value's 0.50 display, its
+encoding, the same bytes under another subtype, Int32 against Int64), the round trip, strictness (every accepted id
+re-encodes to itself; leading zeros, signs, `u32` overflow, `~s:` before a plain String, odd or uppercase hex, a subtype
+that is not two digits and unknown tags refused), the 0.50 forms against a frozen copy of 0.50's function, the binary
+run's prefix closure, and one pinned id per kind. `kimmy-storage`: S8 inverted, one key under two subtypes, twins, the
+legacy reads and rules (a) to (d) each by a fixture, put and delete over both runs, adoption and its refusals, debris,
+two puts in one scope, and the one-time mark. `kimmy-vector`: V1 and V4 inverted through the worker, V5's twins, the
+recovery (binaries re-embedded with one provider input each, a reserved String moved with none, ObjectId chunks
+untouched, a second rescan doing nothing), the first start on a single node and the mark on a member that does not
+own the collection, adoption by the owner only, grouping, the graph's keys, its admission after the load against a
+debris chunk, and a format-2 snapshot refused; and the mixed roll between a test-side 0.50 writer and this build
+(digests equal, exact reads, a delete leaving no chunk in either format, the rescan moving or re-embedding, one
+re-embed per ownership move). `kimmy-api`: V2, V3 (both join directions, with debris) and V5 inverted. Mutation rows
+in bash, one per clause.
