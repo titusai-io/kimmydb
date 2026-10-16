@@ -118,7 +118,7 @@ fn step(db: &Database, path: &std::path::Path, raise: &dyn Fn(u8) -> Result<()>)
         // so their absence is what "finished" means.
         Some(SCHEMA_VERSION) if resuming => {
             info!("resuming an interrupted storage schema 4 -> 5 migration (exact number keys)");
-            let plan = crate::migrate_v5::preflight(db, path)?;
+            let plan = crate::migrate_v5::preflight(db, path, SCHEMA_VERSION)?;
             raise(SCHEMA_VERSION)?;
             crate::migrate_v5::run(db, &plan)
         }
@@ -129,7 +129,7 @@ fn step(db: &Database, path: &std::path::Path, raise: &dyn Fn(u8) -> Result<()>)
         // rule, which subsumes it, and its first commit deletes 3 -> 4's
         // markers and carries its unreported collisions.
         Some(found @ 1..SCHEMA_VERSION) => {
-            let plan = crate::migrate_v5::preflight(db, path)?;
+            let plan = crate::migrate_v5::preflight(db, path, found)?;
             raise(SCHEMA_VERSION)?;
             if found == 1 {
                 info!("migrating storage schema 1 -> 2 (derived collection ids)");

@@ -1622,7 +1622,7 @@ fn the_preflight_refuses_with_the_figures_and_leaves_a_store_0_50_opens() {
     }
     let message = err.to_string();
     for wanted in
-        ["needs", "MiB free", "100 MiB is free", "growth step of 2048 MiB", "Nothing was written"]
+        ["needs", "100 MiB is free", "growth step of 2048 MiB", "still schema 4", "previous build"]
     {
         assert!(message.contains(wanted), "{wanted:?} not in: {message}");
     }
@@ -1664,7 +1664,7 @@ fn the_requirement_is_the_growth_step_and_a_working_set_from_the_tables() {
     let path = f.copy();
     let plan = {
         let db = Database::create(&path).unwrap();
-        crate::migrate_v5::preflight(&db, &path).unwrap()
+        crate::migrate_v5::preflight(&db, &path, 4).unwrap()
     };
     assert_eq!(plan.collections, 3, "items, strs and empty: gone was dropped");
     assert_eq!(plan.purge_pending, 1, "the dropped collection's rows");

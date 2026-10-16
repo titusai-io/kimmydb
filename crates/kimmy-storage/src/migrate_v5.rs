@@ -404,7 +404,9 @@ impl Plan {
 
 /// Plan the migration and refuse to start, writing nothing, if the free space
 /// does not cover it (design 6.1 step 0). Called before `raise(5)`, so a
-/// refusal leaves a store the previous build opens.
+/// refusal of a store at `found` below 5 leaves a store the previous build
+/// opens; a refusal of an interrupted migration (`found` 5) leaves it for this
+/// build to resume once there is room.
 ///
 /// **The figure is provisional** (design 6.1 step 0): drain-then-refill and
 /// move-then-delete keep the file near its size, since freed pages are reused
@@ -414,7 +416,7 @@ impl Plan {
 /// a multikey index). Every figure is read without a walk: a preflight that
 /// read the store would cost a cold store its size in seconds before saying a
 /// word.
-pub(crate) fn preflight(db: &Database, path: &std::path::Path) -> Result<Plan> {
+pub(crate) fn preflight(db: &Database, path: &std::path::Path, found: u8) -> Result<Plan> {
     let plan = plan(db, path)?;
     let free = free_bytes(path);
     info!(
@@ -433,21 +435,31 @@ pub(crate) fn preflight(db: &Database, path: &std::path::Path) -> Result<Plan> {
          is for the migration alone, and the first start after it also walks the oplog once"
     );
     match free {
-        Some(free) if free < plan.required_bytes => Err(StorageError::Io(std::io::Error::new(
-            std::io::ErrorKind::StorageFull,
-            format!(
-                "the storage schema 4 -> 5 migration needs {} MiB free beside {} ({} MiB: \
-                     redb's growth step of {REDB_GROWTH_STEP_MIB} MiB and {} MiB of working \
-                     set), and {} MiB is free. Nothing was written: the store is still schema \
-                     4, and the previous build opens it. Free space, or grow the volume, and \
-                     start again",
-                plan.required_bytes >> 20,
-                path.display(),
-                plan.file_bytes >> 20,
-                (plan.required_bytes >> 20).saturating_sub(REDB_GROWTH_STEP_MIB),
-                free >> 20,
-            ),
-        ))),
+        Some(free) if free < plan.required_bytes => {
+            let state = if found < crate::migrate::SCHEMA_VERSION {
+                format!(
+                    "Nothing was written: the store is still schema {found}, and the previous \
+                     build opens it"
+                )
+            } else {
+                "Nothing more was written: the interrupted migration is where it stopped, and \
+                 only this build or a later one opens the store"
+                    .to_string()
+            };
+            Err(StorageError::Io(std::io::Error::new(
+                std::io::ErrorKind::StorageFull,
+                format!(
+                    "the storage schema 4 -> 5 migration needs {} MiB free beside {} ({} MiB): \
+                     redb's growth step of {REDB_GROWTH_STEP_MIB} MiB and {} MiB of working set, \
+                     and {} MiB is free. {state}. Free space, or grow the volume, and start again",
+                    plan.required_bytes >> 20,
+                    path.display(),
+                    plan.file_bytes >> 20,
+                    (plan.required_bytes >> 20).saturating_sub(REDB_GROWTH_STEP_MIB),
+                    free >> 20,
+                ),
+            )))
+        }
         Some(_) => Ok(plan),
         None => {
             warn!(
@@ -497,8 +509,11 @@ fn estimate_secs(plan: &Plan) -> u64 {
         / 1_000_000
 }
 
-/// The measured cost of re-keying one row, both phases (see the measurement
-/// harness at the end of `migrate_v5_tests`).
+/// The cost of re-keying one row, both phases, the up-front estimate is made
+/// from: a bound, as [`crate::migrate::MICROS_PER_DOCUMENT`] is. Measured with
+/// `examples/schema4_migration` on a laptop's SSD, warm, in a release build:
+/// 21 to 31 s for 2,000,000 rows, 5 to 8 us each; 8 covers that, and a spinning
+/// disk is slower, which is why the line says "estimate".
 pub const MICROS_PER_REKEYED_ROW: u64 = 8;
 
 /// Every collection id `DOCS` holds a row under, in order: one seek per id,
@@ -1371,6 +1386,8 @@ pub(crate) fn recorded_collisions(db: &Database) -> Result<crate::migrate::Unrep
         Err(redb::TableError::TableDoesNotExist(_)) => return Ok(Vec::new()),
         Err(e) => return Err(e.into()),
     };
+    // `(collection, index) -> (index key, what was recorded under it)`.
+    #[allow(clippy::type_complexity)]
     let mut by_index: BTreeMap<(u64, u32), Vec<(Vec<u8>, Collision)>> = BTreeMap::new();
     for row in table.iter()? {
         let (key, value) = row?;
