@@ -11,6 +11,13 @@
 //! no answer. A test that compares the new code against its own caller cannot
 //! show that, because after the move the two are the same code.
 //!
+//! The Decimal128 lifts (0.51.0) were shown the same way, over this corpus with
+//! its decimals: of 288,040 rows, the 72,960 that changed had all been
+//! `refused` (a decimal operand) and now answer, and no other row changed. The
+//! answers they now give are held, without a second commit, by
+//! `a_decimal128_answers_as_the_number_it_equals` and
+//! `every_numeric_comparison_answers_by_exact_value` below.
+//!
 //! ```text
 //! FIND_DIFFERENTIAL_OUT=/tmp/before.tsv cargo test -p kimmy-query \
 //!     --test find_differential -- --ignored      # on the parent commit

@@ -11967,6 +11967,9 @@ smallest element in both directions, all unchanged. A match the window turns
 away costs its keys and is not projected. `shape::unsortable` still runs on the
 stored document, before any projection, so a Decimal128 where the sort would
 read it refuses the query whether or not the page would have carried the field.
+(**Amended 2026-10-16:** `shape::unsortable` is gone. ADR-238 places a
+`Decimal128` among the numbers by its exact value, so the order is total and a
+sort refuses no document; the window ranks a decimal like any number.)
 
 **Why.** One request took a cluster member out of its process. A
 `POST /v1/db/{db}/coll/{coll}/find` of
@@ -19682,7 +19685,7 @@ is the more useful half of the exercise:
 
 ### The defect
 
-The canonical order ranks a `Decimal128` equal to **every** number ([http-api.md](http-api.md), [key-encoding.md](key-encoding.md)), because it has nothing exact to compare with. So equality is not transitive, and containment reasoning that assumes it is will prove the wrong thing. A stored `Decimal128("1")`:
+The canonical order ranks a `Decimal128` equal to **every** number ([http-api.md](http-api.md), [key-encoding.md](key-encoding.md)), because it has nothing exact to compare with. So equality is not transitive, and containment reasoning that assumes it is will prove the wrong thing. (**Corrected 2026-10-16:** true through 0.50. ADR-238 gives a `Decimal128` its exact place in the canonical order, so the comparator half of this paragraph no longer holds; what that means for the filing below is ADR-238's to say.) A stored `Decimal128("1")`:
 
 - satisfies `{k: 7}`, `{k: {$gte: 6}}` and `{k: {$lte: 0}}`;
 - fails `{k: {$gt: 5}}` and `{k: {$lt: 9}}`.
@@ -19717,7 +19720,7 @@ so is better than a table that looks uniformly reproducible and is not.
 
 Widening membership costs no index use at all. Its price is index size, and a measured one: of 432 documents, **27** are held that the filter does not select — exactly the 27 that were being lost.
 
-**Revisiting the canonical order was not taken.** It is the root cause, and it reopens a contract two documents state and the whole key encoding is built on.
+**Revisiting the canonical order was not taken.** It is the root cause, and it reopens a contract two documents state and the whole key encoding is built on. (**Corrected 2026-10-16:** it was taken later, by ADR-238, with the key encoding and a storage migration.)
 
 ### What "a path the filter constrains" means
 
@@ -19832,13 +19835,15 @@ The old test `a_document_outside_a_partial_filter_is_not_unkeyed_it_is_absent` s
 
 ## ADR-186 — A set's members are identified the way `$group` identifies a bucket
 
-**Decision.** `$addToSet` keeps one member per `$group` key, the first in input order. The key is `group_key`: the `keyenc` encoding the indexes use, with a `Decimal128`, which `keyenc` refuses ([ADR-005](#adr-005--exact-mantissaexponent-numeric-encoding)), identified by its raw bytes. The aggregation accumulator and the `$addToSet` update operator take the same identity, the update against the elements already stored.
+**Decision.** `$addToSet` keeps one member per `$group` key, the first in input order. The key is `group_key`: the `keyenc` encoding the indexes use, which gives every value a key, a `Decimal128` by its exact value, so two values are one member exactly when `$eq` calls them equal. The aggregation accumulator and the `$addToSet` update operator take the same identity, the update against the elements already stored.
+
+**Amended 2026-10-16 (ADR-238, the Decimal128 release).** As first decided, a `Decimal128`, which `keyenc` refused ([ADR-005](#adr-005--exact-mantissaexponent-numeric-encoding)), was identified by its raw bytes: never the same member as a number, and the same member as another decimal only with the same bytes. Since the canonical order places a decimal by its exact value and `keyenc` keys it, equal numbers and decimals are one member (Chris's ruling, by value), and the sections below are amended to say so.
 
 ### The defect
 
 The accumulator de-duplicated with `Bson`'s `==`, which is structural: `f64`'s equality for doubles and never equal across variants. Every `NaN` was a new member, `1`, `1.0` and `1_i64` were three, and so were `0.0` and `-0.0`, and `null` and `undefined`. On a 17-value corpus `$addToSet` kept 14 members where `$group` on the same values made 9 buckets. "The distinct values of `$k`" already means `group_key` here, through `$group: {_id: "$k"}` and the keys `$lookup` collects, so two spellings of one question answered differently.
 
-The update operator compared with `canonical_cmp`, which ranks a `Decimal128` equal to **every** number ([ADR-185](#adr-185--a-partial-index-holds-the-documents-its-filter-cannot-decide)). Its operand was refused when it held one, but a stored element can hold one: `$addToSet: {t: 5}` on `{t: [Decimal128("1")]}` judged the 5 already present and dropped it, silently.
+The update operator compared with `canonical_cmp`, which then ranked a `Decimal128` equal to **every** number ([ADR-185](#adr-185--a-partial-index-holds-the-documents-its-filter-cannot-decide); exact since ADR-238). Its operand was refused when it held one, but a stored element can hold one: `$addToSet: {t: 5}` on `{t: [Decimal128("1")]}` judged the 5 already present and dropped it, silently.
 
 ### What changes for a caller
 
@@ -19850,36 +19855,43 @@ The update operator compared with `canonical_cmp`, which ranks a `Decimal128` eq
 | `null`, `undefined` | two | one |
 | the string `"s"`, the symbol `"s"` | two | one |
 | `{a: 1, b: 2}`, `{b: 2, a: 1}` | two | two: nested key order counts, as `find` counts it |
-| `Decimal128("1.0")`, `Decimal128("1.00")` | two | two: one member only with the same bytes |
-| `Decimal128("1")`, `1` | two | two: the order cannot rank a `Decimal128` against a number, so neither is the other |
+| `Decimal128("1.0")`, `Decimal128("1.00")`, `Decimal128("1")`, `1`, `1.0` | five | one: one value (amended 2026-10-16; the decimals were one member each by their bytes, and never a number) |
+| a decimal `NaN` of either sign, signalling or with a payload, a double `NaN` | two or more | one |
+| `Decimal128("Infinity")` with payload bits set, the double infinity | two | one |
+| `Decimal128("-0")`, `Decimal128("0E-100")`, a non-canonical coefficient, `0` | four | one: every zero is zero |
+| `Decimal128("0.1")`, `0.1` (a double) | two | two: different numbers, the double's exact value being slightly above one tenth |
 
-**A value holding a `Decimal128` anywhere, nested or in an array, is identified by its rendering.** `keyenc` cannot encode it, so the whole value falls back to the raw form and the collapses above do not happen inside it: `{a: 1, d: Decimal128("1")}` and `{a: 1.0, d: Decimal128("1")}` are two members, as are `[0.0, Decimal128("1")]` and `[-0.0, Decimal128("1")]`. `$group` makes the same two buckets, so the two still agree.
+**A value holding a `Decimal128` anywhere, nested or in an array, is identified by its value, as any nested number is** (amended 2026-10-16). `{a: 1, d: Decimal128("1")}` and `{a: 1.0, d: Decimal128("1.00")}` are one member, as are `[0.0, Decimal128("1")]` and `[Decimal128("-0"), 1]`, and `$group` makes the one bucket. Until ADR-238 `keyenc` could not encode a decimal, so the whole value fell back to its rendering, the collapses above did not happen inside it, and those pairs were two members and two buckets.
 
-Stored `[Decimal128("1")]` plus `$addToSet: {t: 5}` now gives `[Decimal128("1"), 5]`. Stored `[1]` plus `{t: 1.0}` stays `[1]`.
+A `$group` bucket's `_id` is its first-seen member: `$group` over `[Decimal128("1.00"), 1]` reports `_id: Decimal128("1.00")`.
+
+Stored `[Decimal128("1")]` plus `$addToSet: {t: 5}` now gives `[Decimal128("1"), 5]`. Stored `[1]` plus `{t: 1.0}`, or plus `{t: Decimal128("1.00")}`, stays `[1]`.
 
 ### Properties
 
 - **It is an equivalence**: reflexive (`NaN` is one member), symmetric and transitive.
-- **It agrees with the canonical order wherever that order is an equivalence**: `keyenc` is property-tested to sort exactly as `canonical_cmp` does.
+- **It agrees with the canonical order on every value**: `keyenc` is property-tested to sort exactly as `canonical_cmp` does, and `group_key(a) == group_key(b)` exactly when `canonical_cmp(a, b)` is `Equal`. (Amended 2026-10-16: it agreed only wherever that order was an equivalence, which left out a `Decimal128`.)
 - **It is hashable**, so the accumulator keeps a set of keys rather than scanning its members.
 
 ### Considered and rejected
 
-- **`canonical_cmp` as the equality.** A `Decimal128` equal to every number makes it non-transitive, so the set depends on input order: `[1, Decimal128("5"), 2]` keeps `[1, 2]` and `[Decimal128("5"), 1, 2]` keeps `[Decimal128("5")]`. An accumulator cannot refuse the value as an update's `$pull` operand can, because it is stored data, and failing an aggregation over one field would be worse.
+- **`canonical_cmp` as the equality.** Rejected while a `Decimal128` ranked equal to every number, which made it non-transitive, so the set depended on input order: `[1, Decimal128("5"), 2]` kept `[1, 2]` and `[Decimal128("5"), 1, 2]` kept `[Decimal128("5")]`. **Amended 2026-10-16:** the premise is gone. The order places a decimal by its exact value (ADR-238), so its `Equal` is an equivalence on every value and is now this identity; the set operators ([ADR-207](#adr-207--a-set-operators-member-is-what-eq-calls-equal-its-result-is-first-seen-and-what-it-cannot-compare-it-refuses)) use it directly. The key bytes stay the implementation here because they hash.
 - **Exact bytes.** Makes `NaN` one member but keeps `1` and `1.0` apart, disagreeing with `$group`, the indexes and every filter.
 - **Structural `==`.** The behaviour this replaces.
 
-### The operand refusal is lifted for `$addToSet`, and stands for the other four
+### The operand refusal is lifted for all five operators
 
-`$addToSet` refused an operand holding a `Decimal128`, with the rest of `$min`, `$max`, `$pull` and `$pullAll`, because the canonical order ranks one equal to every number: an add would have been judged present and dropped. That hazard is the canonical order deciding membership, and it no longer does. A `Decimal128` operand, plain, inside `$each`, or nested in a document or array, is identified by its bytes, so it is a duplicate only of a `Decimal128` with the same bytes, and a request that was refused now succeeds. `$min`, `$max`, `$pull` and `$pullAll` still compare through the canonical order, so their refusal, and its message, stand.
+`$addToSet` refused an operand holding a `Decimal128`, with the rest of `$min`, `$max`, `$pull` and `$pullAll`, because the canonical order ranked one equal to every number: an add would have been judged present and dropped. This record lifted it for `$addToSet` first, since its membership is the key's and not the order's, and kept it for the other four, which compared through the order. **Amended 2026-10-16:** the order places a decimal by its exact value (ADR-238), so the refusal is lifted for all five. A `Decimal128` operand, plain, inside `$each`, or nested in a document or array, is compared by its value: `$max: {v: 5}` over a stored `Decimal128("1.5")` sets `5`, `$min: {v: Decimal128("0.1")}` over a stored double `0.1` sets the decimal, and `$pull: {t: Decimal128("1")}` removes `1`, `1.0` and `Decimal128("1.00")` and nothing else.
 
-### `$pull` and `$pullAll` are unchanged, on purpose
+### `$pull` and `$pullAll` compare by the canonical order, as the others do
 
-They remove the elements that **match**, and matching is `find`'s rule: a stored `Decimal128` satisfies `{k: 7}` ([ADR-185](#adr-185--a-partial-index-holds-the-documents-its-filter-cannot-decide)). A set's membership is a different question from a filter's match. Answering both with one rule would mean either a filter that stopped matching what `find` matches, or a set whose members depend on the order they arrived in. The asymmetry is the point; it is not an inconsistency to fix.
+They remove the elements that **match**, and matching is `find`'s rule. As first written this section defended an asymmetry: a stored `Decimal128` satisfied `{k: 7}` under `find`'s rule while `$addToSet` kept it apart from 7, and answering both with one rule meant either a filter that stopped matching what `find` matched or a set whose members depended on input order. **Amended 2026-10-16:** the premise is false since ADR-238. A stored `Decimal128("1")` satisfies `{k: 1}` and not `{k: 7}`, so `$pull: {t: 5}` over `[Decimal128("1"), 2]` keeps the decimal (it used to remove it), and a filter's match and a set's membership are one rule.
 
 ### Tests
 
-The differential (the members of `$addToSet: "$v"` are exactly the buckets of `$group: {_id: "$v"}`, by `group_key`, 9 = 9 on the corpus), order independence over both orders of the table and every rotation of the corpus, and the update cases: a stored `Decimal128` beside a number, `1` against `1.0`, the exact array an `$each` keeps (`[NaN, 2]`), stored duplicates left as they are, and a `Decimal128` operand plain, in `$each` and nested. Setting the identity back to `==`, and setting it back to `canonical_cmp`, each fail both the differential and order independence; the update's own `canonical_cmp` fails `add_to_set_identifies_members_as_group_does_against_stored_elements`, and re-adding the operand refusal for `$addToSet` fails `add_to_set_takes_a_decimal128_operand_and_identifies_it_by_its_bytes`. A pair of values holding a nested `Decimal128` is pinned as two members and two buckets.
+The differential (the members of `$addToSet: "$v"` are exactly the buckets of `$group: {_id: "$v"}`, by `group_key`, 9 = 9 on the corpus), order independence over both orders of the table and every rotation of the corpus, and the update cases: a stored `Decimal128` beside a number, `1` against `1.0`, the exact array an `$each` keeps (`[NaN, 2]`), stored duplicates left as they are, and a `Decimal128` operand plain, in `$each` and nested. Setting the identity back to `==`, and setting it back to `canonical_cmp`, each fail both the differential and order independence; the update's own `canonical_cmp` fails `add_to_set_identifies_members_as_group_does_against_stored_elements`, and re-adding the operand refusal for `$addToSet` fails `add_to_set_takes_a_decimal128_operand_and_identifies_it_by_its_value`.
+
+**Amended 2026-10-16.** The 9 = 9 differential, and the pair of values holding a nested `Decimal128` pinned as two members, are replaced by the identity differential of `kimmy-query`'s `aggregate::identity`. `group_key_and_the_set_member_are_eq_on_every_pair` takes 61 values (a decimal `NaN` of either sign, signalling and with a payload; infinities with payload bits; zeros in every spelling, a non-canonical coefficient and the `11` form among them; cohorts; decimals equal to integers above 2^53, to `i64::MAX`, to 2^63 and to 2^-48; the exponent extremes; `0.1` the decimal beside `0.1` the double; and the non-numbers they could be confused with), each bare and nested in a document, an array, an array in a document and a scoped JavaScript value, and asserts on every pair that `group_key(a) == group_key(b)` exactly when `canonical_cmp(a, b)` is `Equal`, and that `$setIsSubset` and `$setUnion` agree. `group_key_is_eq_over_generated_values` asserts the same over generated nested values, each also re-spelled (an integer as an equal decimal, a decimal as another member of its cohort), which must keep its key. `a_bucket_is_a_class_of_eq_and_its_id_the_first_member_seen` holds `$group` and `$addToSet` to one bucket per class with the first member seen as its `_id`. Filing a value that holds a `Decimal128` by its rendering again (this record's first rule) fails the identity differential, as does a set member that keeps a decimal apart from the number it equals.
 
 ---
 
@@ -23178,15 +23190,16 @@ left so: `$map` over a `$range` of indexes reads arrays by position, and
   order. An array or document element is a member whole, compared whole, never
   flattened. Membership is kept in an ordered set keyed by that comparison, so
   each operator is `O(n log n)` in its inputs rather than pairwise.
-- **A `Decimal128` anywhere in a set input is refused**, `400`, naming the
-  operator and the argument: `$setIsSubset cannot compare a Decimal128
-  (argument 1 holds one)`. The canonical order ranks one equal to every other
-  number, which makes its equality non-transitive, so `[Decimal128("5")]`
-  would be a subset of `[1]` and a union's members would depend on input
-  order. With every `Decimal128` refused, the order is total and its `Equal`
-  is an equivalence, and on every value left it agrees with `group_key`, the
-  identity `$addToSet` and `$group` use: a set operator and `$addToSet` keep
-  the same members. Beside a null nothing is compared and the result is null.
+- **A `Decimal128` anywhere in a set input was refused** (lifted 2026-10-16,
+  see the amendment below), `400`, naming the operator and the argument:
+  `$setIsSubset cannot compare a Decimal128 (argument 1 holds one)`. The
+  canonical order ranked one equal to every other number, which made its
+  equality non-transitive, so `[Decimal128("5")]` would have been a subset of
+  `[1]` and a union's members would have depended on input order. With every
+  `Decimal128` refused, the order was total and its `Equal` an equivalence,
+  and on every value left it agreed with `group_key`, the identity `$addToSet`
+  and `$group` use: a set operator and `$addToSet` keep the same members.
+  Beside a null nothing is compared and the result is null.
 - **A result is first-seen**: members in the order they first appear,
   arguments left to right and each array from its start, and the element kept
   is that first appearance, untouched, its numeric type included.
@@ -23248,6 +23261,23 @@ nothing left to refuse, so the two operators take the element. **The set
 operators still refuse a `Decimal128`**: theirs is a refusal about equality,
 the canonical order ranking one equal to every number, and truthiness compares
 nothing. Neither operator has shipped, so no request that answered changes.
+
+**Amended 2026-10-16 (ADR-238) — a `Decimal128` in a set input is a member by
+its value, not refused.** The canonical order places a decimal by its exact
+value, so its `Equal` is an equivalence on every value and agrees with
+`group_key` on every value, decimals included: the refusal had nothing left to
+protect. `Decimal128("5")` is one member with `5` and `5.0`, `Decimal128("1.0")`
+with `Decimal128("1.00")`, a decimal `NaN` with a double one; `Decimal128("0.1")`
+and the double `0.1` are two, being different numbers. `$setIsSubset:
+[[Decimal128("5")], [1]]` is `false` and `$setIsSubset: [[Decimal128("5")],
+[5.0, 1]]` is `true`. A request that was refused now answers; none that
+answered changes. Tested by `a_decimal128_in_a_set_input_is_a_member_by_its_value`
+(`expr::sets_and_pairs`), by the seventeen-value corpus grown to twenty-six
+with decimals (twelve members), and by ADR-186's identity differential, which
+holds `$setIsSubset` and `$setUnion` to `group_key` and `$eq` on every pair of
+a corpus with a decimal in every special form; a set member that keeps a
+decimal apart from the number it equals fails it, and restoring the refusal
+fails the first.
 
 ### Considered and rejected
 
@@ -23611,9 +23641,16 @@ and nobody who writes `localField: "productIds"` means "the list as one value".
   side, as before. (An earlier build still wanted a `null` key for an input
   document without the field, which attached nothing but held every foreign
   document whose key was `null` and counted them against the ceiling.)
-- **A value that cannot be keyed yields no key.** A `Decimal128` cannot be
-  keyed (ADR-005) and joins nothing, as before. Inside an array the array as a
-  whole has no key and its other elements do: `[Decimal128, 5]` joins on its `5`.
+- **A value that cannot be keyed yields no key.** A `Decimal128` could not be
+  keyed (ADR-005) and joined nothing, as before; inside an array the array as a
+  whole had no key and its other elements did: `[Decimal128, 5]` joined on its
+  `5`. **Amended 2026-10-16 (ADR-238):** every value has a key, a `Decimal128`
+  by its exact value, so a decimal joins the values `$eq` calls equal to it:
+  `[Decimal128("5.0"), 5]` joins under the one key `5`, and as a whole array it
+  joins `[5, 5]` and `[Decimal128("5"), 5.0]`. The pipeline form's hash join
+  ([ADR-222](#adr-222--a-lookup-sub-pipelines-match-reads-the-let-names-through-expr-and-a-correlated-eq-is-a-hash-join))
+  files a decimal key too, and stays exact because two values have equal keys
+  exactly when `$eq` calls them equal.
 - **A foreign document is attached once.** The foreign documents that match are
   held once, in scan order, in a vector, and the keys index into it. An input
   document attaches the sorted, de-duplicated union of the indices of its keys'
@@ -23707,7 +23744,9 @@ accepted under four, one document under four keys held once under one); the
 attached ceiling (nine attachments of three held documents refused under eight,
 accepted under nine, naming the count); a missing local field holds nothing under
 a ceiling below the foreign `null`s; a `Decimal128` key joins nothing and
-`[Decimal128, 5]` joins on `5`; and a join against a naive reference over 120
+`[Decimal128, 5]` joins on `5` (amended 2026-10-16: a `Decimal128` key joins
+by its value, `a_decimal128_key_joins_by_value_and_its_array_on_each_element`);
+and a join against a naive reference over 120
 generated pairs of documents, with arrays, nested arrays, missing fields, `null`,
 numbers of several types, documents and `Decimal128`, agrees with the reference
 document for document. Over HTTP the example attaches Gasket and Bolt, and
@@ -23974,7 +24013,9 @@ by this project's bar a wrong answer nothing documents is a defect.
   the same rule a document follows anywhere else in an expression, and
   `{$literal: [...]}` is the way to keep one.
 - **A `Decimal128` element is refused as before**, now by the element's own
-  parse, with the same message.
+  parse, with the same message. (**Amended 2026-10-16:** lifted by ADR-238,
+  which gives a `Decimal128` its exact place in the order; an element is a
+  literal like any other, folded or not, and compared by its value.)
 
 **Why not refuse.** Refusing a `$`-string inside an array would also refuse
 arrays of plain strings that happen to begin with `$`, which `$literal` already
@@ -24025,7 +24066,8 @@ name refused at parse; `free_variables` inside arrays and not inside
 `$literal`; `reads_document` through arrays; the first failing element's error,
 and an `$and`/`$or` deciding past a failing array or reporting its error;
 folding, including constant documents and arrays nested in them, and a
-`Decimal128` element refused folded or not; an operator-shaped document in an
+`Decimal128` element refused folded or not (since 2026-10-16, held as a literal
+folded or not); an operator-shaped document in an
 array parsed and refused, and kept by `$literal`; the named operands of
 `$reduce`, `$switch`, `$convert`, `$map`, `$filter` and `$let` read as arrays; a property test
 over generated arrays of literals and plain documents in which the parsed
@@ -24603,6 +24645,14 @@ The four differences in type conversion are kept and documented exactly
   form.
 
 `decimal` stays refused ([ADR-005](#adr-005--exact-mantissaexponent-numeric-encoding)).
+(**Amended 2026-10-16:** still refused, for another reason. ADR-005's, that a
+`Decimal128` has no exact key, is gone with ADR-238, which keys and orders one by
+its exact value. Converting a double to a `Decimal128` needs a rounding rule: a
+double's exact binary value can run to about 767 significant digits and a
+`Decimal128` holds 34, so the double `0.1` has no equal `Decimal128`. Choosing that
+rule is a decimal-arithmetic decision this build does not make, and the message
+now gives that reason: `unsupported operator "$toDecimal": converting to
+Decimal128 needs a rounding rule, …`. It is a `400` as before.)
 The one change is a message. `$toDecimal` was never built, so it was refused
 as an unknown operator and the message pointed at nothing, where `$convert`
 to `decimal` explained itself. `$toDecimal` is now refused with that
@@ -25824,6 +25874,23 @@ configuration. An older member answers `400` to a `$$name` in a sub-pipeline
 - *Substituting the variables into the filter per input:* a rewrite per input that
   has to respect `$let`, `$map`, `$filter` and `$reduce` shadowing, where binding is
   a lookup the evaluator already does.
+
+**Amended 2026-10-16 (ADR-238).** Every value has a key and `$eq` places a
+`Decimal128` by its exact value, so step 4's "a key that cannot be encoded, which is
+a `Decimal128`" names nothing: a decimal key is filed like any number, on the build
+side and on a probe, and the join stays exact because two values have equal keys
+exactly when `$eq` calls them equal (`Decimal128("1.00")` joins `1` and
+`Decimal128("1")`; `Decimal128("0.1")` does not join the double `0.1`). "A
+`Decimal128` equals every number (so is never filed)" no longer holds, and the
+measurement with one `Decimal128` key among 10,000 describes a fallback that no
+longer happens. A `Decimal128` literal in the sub-pipeline's `$match`, refused at
+parse before, is accepted and compared exactly. Of the reasons the foreign-field
+index was rejected, the decimal one is gone and the other two stand. Tests:
+`a_decimal128_key_is_joined_by_its_value` (build side, probe side, the spellings of
+one value, the tenth both ways, a decimal literal beside the key), decimal rows in
+`each_type_pair_joins_as_eq_says`, decimals in every spelling in the generated
+corpora and two pipelines with a decimal literal; filing a decimal key by its
+rendering fails them.
 
 ### Test
 

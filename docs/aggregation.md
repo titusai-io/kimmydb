@@ -215,14 +215,16 @@ overflow. `$avg` is a double whenever it has an answer at all — it never
 returns an integer, and the one thing it returns that is not a double is the
 `null` above. `$addToSet` identifies its members the way `$group` identifies a bucket
 ([ADR-186](decisions.md#adr-186--a-sets-members-are-identified-the-way-group-identifies-a-bucket)),
-keeping the first of each in input order: `5`, `5.0` and `{"$numberLong": "5"}`
-are one member, every `NaN` is one, `0.0` and `-0.0` are one, and `null` and
-`undefined` are one. Two documents are one member only with their keys in the
-same order, and two `Decimal128`s only with the same bytes; a `Decimal128` is
-never the same member as a number. A value holding a `Decimal128` anywhere,
-nested or in an array, cannot be key-encoded and is identified by its
-rendering, so inside it `1` and `1.0` are not one member; `$group` does the
-same.
+keeping the first of each in input order: `5`, `5.0`, `{"$numberLong": "5"}`
+and `{"$numberDecimal": "5.00"}` are one member, every `NaN` (a decimal one
+too) is one, every zero (`0.0`, `-0.0`, a decimal zero of any exponent) is one,
+and `null` and `undefined` are one. `0.1` the decimal and `0.1` the double are
+two members: they are different numbers. Two documents are one member only with
+their keys in the same order, and a decimal nested in a document or array is
+identified by its value as any nested number is. `$group` buckets by the same
+identity, and a bucket's `_id` is the first member seen: `$group` over
+`[Decimal128("1.00"), 1]` reports `_id: Decimal128("1.00")`. `$max` and `$min`
+rank a decimal by its value: over `[Decimal128("1.5"), 5]`, `$max` is `5`.
 
 ---
 
@@ -546,20 +548,18 @@ non-array is a `400` even beside a null — a set has no first argument that
 could hide the others, so the refusal does not depend on where the bad value
 is written.
 
-**A `Decimal128` anywhere in a set input is refused.** The canonical order
-ranks a `Decimal128` equal to every other number, so `[Decimal128("5")]` would
-be a subset of `[1]`. Rather than answer that, the operator refuses, `400`,
-naming the argument: `$setIsSubset cannot compare a Decimal128 (argument 1
-holds one)`. Nested inside an element counts. Beside a null nothing is
-compared, and the result is null.
+**A `Decimal128` in a set input is a member by its value**, as `$eq` compares
+it: `[Decimal128("5")]` is not a subset of `[1]` and is a subset of `[5.0]`, and
+`Decimal128("1.0")` and `Decimal128("1.00")` are one member. Until 0.51.0 a
+decimal anywhere in a set input was refused, because the canonical order ranked
+one equal to every other number ([ADR-207](decisions.md#adr-207--a-set-operators-member-is-what-eq-calls-equal-its-result-is-first-seen-and-what-it-cannot-compare-it-refuses)).
 
 **`$anyElementTrue` and `$allElementsTrue` read truthiness** as `$and` and
 `$or` do: `false`, `null`, `0` and missing are false, and everything else is
 true, the empty array included, and an array element is not looked inside.
 An empty array is `false` for `$anyElementTrue` and `true` for
 `$allElementsTrue`. A stored `Decimal128` element is read like any other
-number, false when it is a zero; unlike the set operators these compare
-nothing, so there is nothing to refuse. The argument is one
+number, false when it is a zero. The argument is one
 array, so a literal is written inside the argument list:
 `{"$anyElementTrue": [[true, false]]}`, not `{"$anyElementTrue": [true,
 false]}`, which is two arguments and refused.
@@ -664,10 +664,13 @@ an error.
   form**: `1e21` is `"1000000000000000000000"` and `1e-7` is `"0.0000001"`.
   The engine's JSON output prints doubles the same way.
 
-**`decimal` (`Decimal128`) is refused at parse**: it has no exact key
-encoding here ([ADR-005](decisions.md)), so a value converted to it could be
-neither indexed nor grouped, and producing one would only move the refusal
-somewhere less obvious. Convert to `double` or `long` instead.
+**`decimal` (`Decimal128`) is refused at parse**: converting a double to a
+`Decimal128` needs a rounding rule — a double's exact binary value can run to
+about 767 significant digits and a `Decimal128` holds 34, so the double `0.1`
+has no equal decimal — and choosing one is a decimal-arithmetic decision this
+build does not make. Convert to `double` or `long` instead. A `Decimal128` in
+the data, or written as a literal, is compared, grouped and indexed by its
+exact value; it is only the conversion that is missing.
 
 ---
 
@@ -739,9 +742,10 @@ an index and a field name). Four rules decide the rest:
   them in. The reference behaviour does not promise an order here.
 - **Nothing at the path joins nothing.** An input document without the field
   attaches nothing, and a foreign document without it is never a candidate; an
-  explicit `null` joins an explicit `null`. A stored `Decimal128` cannot be a
-  key and joins nothing, and inside an array the rest of the array still joins:
-  `[Decimal128, 5]` joins on `5`.
+  explicit `null` joins an explicit `null`. A stored `Decimal128` joins by its
+  value, like any number: `Decimal128("5.00")` joins `5`, and `[Decimal128("5.0"),
+  5]` joins under the one key `5`. (Until 0.51.0 a decimal could not be a key
+  and joined nothing.)
 - **The ceiling counts what is held and what is attached.** The foreign
   collection is still scanned once, and the documents any key of the input needs
   are held in memory, each once, up to the pipeline's ceiling of 100,000. The
@@ -826,11 +830,12 @@ The equality is `$expr`'s `$eq`, not the filter's and not the `localField` form'
 numbers are equal across types (`5`, `5.0`), `null` and a missing field are the
 same value (so a foreign document without the field joins an input whose variable
 is `null`, where the `localField` form joins nothing), `NaN` equals `NaN`, an array
-is compared whole (never opened) and a document field by field in order. A key
-that holds a `Decimal128` cannot be filed, because `$eq` ranks it equal to every
-number: the stage then runs as the nested loop, and so does any input document
-whose evaluation raises, which raises exactly what the loop would, or nothing. A
-join never raises an error the loop would not.
+is compared whole (never opened) and a document field by field in order, and a
+`Decimal128` is equal to the numbers of its value (`0.1` the decimal is not `0.1`
+the double). Every value is filed by its key, which is equal for two values
+exactly when `$eq` calls them equal, a decimal included. Any input document whose
+evaluation raises runs as the nested loop, which raises exactly what the loop
+would, or nothing. A join never raises an error the loop would not.
 
 What does not join runs as the nested loop, bounded only by the 100,000 ceilings
 below: an `$or` or `$nor` with a variable in it, a comparison other than `$eq`
@@ -1040,9 +1045,9 @@ documents holding large arrays can exceed the cap long before the stage ends.
 | `$zip`, `$sortArray` | Not built, by decision: both are refused at parse as **unknown operators**. `$map` over a `$range` of indexes, with `$arrayElemAt`, reads several arrays by position, and an `$unwind`, `$sort` and `$group` with `$push` orders an array's elements |
 | System variables other than `$$ROOT` and `$$CURRENT` — `$$NOW`, `$$REMOVE`, `$$DESCEND`, `$$PRUNE`, `$$KEEP` | Not built. Refused with a message saying so, rather than as an unknown name |
 | `$lookup` with both `localField`/`foreignField` and `pipeline` | Refused, by decision ([ADR-217](decisions.md#adr-217--the-refusals-and-differences-ruled-to-stay-are-recorded-as-a-set)). Join on the key, then `$filter`/`$map` the attached array in the next stage |
-| `$convert` to `decimal` (or code `19`) | `Decimal128` has no exact key encoding ([ADR-005](decisions.md)); refused at parse, naming `double` and `long` as the alternatives |
-| A `Decimal128` literal — bare, under `$literal`, or inside a document or array written in an expression | The same reason from the other side: the canonical order ranks a Decimal128 equal to every other number, so a comparison against one would hold for every number and a value computed from one could be neither indexed nor grouped. Refused at parse — `a Decimal128 literal is not supported in an expression` — wherever an expression is parsed, `$expr` included. A `$sort` stage refuses a document holding one at a sort path the way `find`'s sort does ([Query language](query-language.md#sort-and-projection)); a *stored* Decimal128 read through a field path is not refused, and `$type` finds it, except by the set operators, which refuse one in their input rather than compare it ([ADR-207](decisions.md), [Sets](#sets)); where truth is read, a `Decimal128` zero is false like any zero ([What reads as false](#behaviours-worth-knowing)) |
-| `$toDecimal` | Never built as an operator, and refused at parse with the reason `$convert` gives for `decimal`: `unsupported operator "$toDecimal": Decimal128 has no exact key encoding in this engine, so the result could be neither indexed nor grouped; convert to double or long instead`. A `400`, as before; only the explanation is new |
+| `$convert` to `decimal` (or code `19`) | Converting a double to a `Decimal128` needs a rounding rule (a double's exact value can run to about 767 significant digits, a `Decimal128` holds 34), and choosing one is a decimal-arithmetic decision this build does not make; refused at parse, naming `double` and `long` as the alternatives. A `Decimal128` literal, or one in the data, is compared and grouped by its exact value ([Query language](query-language.md#3-comparisons-do-not-cross-type-groups)) |
+| `$toDecimal` | Never built as an operator, and refused at parse with the reason `$convert` gives for `decimal`: `unsupported operator "$toDecimal": converting to Decimal128 needs a rounding rule, because a double's exact binary value can run to about 767 significant digits and a Decimal128 holds 34, and this build has none; convert to double or long instead`. A `400`, as before |
+| Arithmetic on a `Decimal128` — `$add`, `$subtract`, `$multiply`, `$divide`, `$sum`, `$avg` | Not built: `$add` and the other operators answer `400`, *needs numbers, found a Decimal128*, and `$sum` and `$avg` skip a decimal as they skip any non-number. Comparing, grouping and sorting a decimal need no arithmetic and take it by value |
 | `$facet`, `$bucket`, `$graphLookup`, `$merge`, `$out` | Not built. An unknown stage is refused with a message listing what is supported |
 | `$vectorSearch` anywhere but first, or inside a `$lookup` sub-pipeline | `400`, naming the rule: it is the pipeline's source, in place of the collection scan |
 | `$vectorSearch` fields from other systems — `queryVector`, `numCandidates`, `limit`, `index` | Refused, each naming the KimmyDB spelling (`vector`, `k`) or saying there is no such knob: KimmyDB has one vector index per collection ([ADR-216](decisions.md)) |
