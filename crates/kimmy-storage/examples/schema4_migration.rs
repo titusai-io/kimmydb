@@ -301,6 +301,9 @@ fn migrate(dir: &Path, keep: bool) -> Result<(), String> {
             kimmy_storage::format::sidecar_path(&path),
         )
         .map_err(|e| e.to_string())?;
+        // The copy's pages to disk before the clock starts: left dirty, the
+        // migration's first sync would pay for writing the whole copy.
+        std::fs::File::open(&path).and_then(|f| f.sync_all()).map_err(|e| e.to_string())?;
     }
     tracing_subscriber::fmt().with_writer(std::io::stderr).with_ansi(false).init();
     let before = std::fs::metadata(&path).map_err(|e| e.to_string())?.len();
@@ -309,15 +312,25 @@ fn migrate(dir: &Path, keep: bool) -> Result<(), String> {
     let opened = started.elapsed();
     let during = std::fs::metadata(&path).map_err(|e| e.to_string())?.len();
     drop(engine);
+    let (reads, writes) = block_io();
     eprintln!(
         "SUMMARY open with the migration {opened:?}; file {} MiB before, {} MiB after, {} MiB \
-         closed; peak rss {} MiB",
+         closed; peak rss {} MiB; block reads {reads}, block writes {writes} (getrusage; 512-byte \
+         blocks on Linux, operations on macOS)",
         before >> 20,
         during >> 20,
         std::fs::metadata(&path).map_err(|e| e.to_string())?.len() >> 20,
         peak_rss_mib()
     );
     Ok(())
+}
+
+/// The process's block input and output, as `getrusage` counts them.
+fn block_io() -> (i64, i64) {
+    // SAFETY: as in `peak_rss_mib`.
+    let mut usage: libc::rusage = unsafe { std::mem::zeroed() };
+    unsafe { libc::getrusage(libc::RUSAGE_SELF, &mut usage) };
+    (usage.ru_inblock as i64, usage.ru_oublock as i64)
 }
 
 /// The process's peak resident set, in MiB.
