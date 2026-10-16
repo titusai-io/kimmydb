@@ -7041,6 +7041,93 @@ async fn meaningless_fusion_controls_are_a_400() {
     assert_eq!(res.status, 200, "{:?}", res.body);
 }
 
+/// Two documents that the halves of a hybrid search for the query
+/// `"merger confidential"` with vector `[1, 0, 0]` find for different reasons,
+/// as in the reproduction of a filtered hybrid search returning a document its
+/// filter excluded (V6 and V9):
+///
+/// - `a` (tenant `a`) is the query vector and shares no term with the query,
+///   so only the dense half finds it;
+/// - `b` (tenant `b`) is orthogonal to the query vector and shares both terms,
+///   so the keyword half ranks it first.
+///
+/// `filter: {tenant: "a"}` admits `a` only.
+async fn tenant_fixture(server: &Server) -> String {
+    let token = byo_collection(server).await;
+    for (id, vector, text) in [
+        ("a", [1.0, 0.0, 0.0], "quarterly figures public"),
+        ("b", [0.0, 1.0, 0.0], "merger plans confidential"),
+    ] {
+        let doc = json!({ "_id": id, "tenant": id, "text": text });
+        server.post("/v1/db/shop/coll/docs/docs", Some(&token), doc).await;
+        let stored = server
+            .put(
+                &format!("/v1/db/shop/coll/docs/docs/{id}/vectors"),
+                Some(&token),
+                json!([{ "chunk": 0, "vector": vector, "text": text }]),
+            )
+            .await;
+        assert_eq!(stored.status, 200, "{:?}", stored.body);
+    }
+    token
+}
+
+/// A hybrid search over [`tenant_fixture`] with `extra` merged into the
+/// request, answered `200`; the matched ids in result order.
+async fn tenant_hybrid(server: &Server, token: &str, extra: Value) -> (Vec<String>, Value) {
+    let mut body = json!({ "query": "merger confidential", "vector": [1.0, 0.0, 0.0] });
+    for (k, v) in extra.as_object().unwrap() {
+        body[k] = v.clone();
+    }
+    let res = server.post("/v1/db/shop/coll/docs/hybrid_search", Some(token), body).await;
+    assert_eq!(res.status, 200, "{:?}", res.body);
+    (ranked(&res.body).into_iter().map(|(id, _)| id).collect(), res.body)
+}
+
+/// V6: the keyword half ranked every stored chunk, so a filtered hybrid
+/// search returned `b`, with its text, beside the admitted `a`.
+#[tokio::test]
+async fn hybrid_v6_a_filter_restricts_the_keyword_half_too() {
+    let server = Server::start().await;
+    let token = tenant_fixture(&server).await;
+    let (ids, body) = tenant_hybrid(&server, &token, json!({ "filter": { "tenant": "a" } })).await;
+    assert_eq!(ids, ["a"], "{body:?}");
+}
+
+/// V9: a filter that admits nothing returned `b` through the keyword half.
+#[tokio::test]
+async fn hybrid_v9_a_filter_that_admits_nothing_returns_nothing() {
+    let server = Server::start().await;
+    let token = tenant_fixture(&server).await;
+    let (ids, body) =
+        tenant_hybrid(&server, &token, json!({ "filter": { "tenant": "nobody" } })).await;
+    assert_eq!(body["count"], 0, "{body:?}");
+    assert!(ids.is_empty(), "{body:?}");
+}
+
+/// V9: with `k: 1` and the keyword half weighted twice the dense one, the
+/// excluded `b` took the one slot and the admitted `a` was gone.
+#[tokio::test]
+async fn hybrid_v9_an_excluded_keyword_match_cannot_displace_an_admitted_document() {
+    let server = Server::start().await;
+    let token = tenant_fixture(&server).await;
+    let extra = json!({
+        "filter": { "tenant": "a" }, "k": 1, "weights": { "dense": 1.0, "lexical": 2.0 },
+    });
+    let (ids, body) = tenant_hybrid(&server, &token, extra).await;
+    assert_eq!(ids, ["a"], "{body:?}");
+}
+
+/// Without a filter both halves rank everything, as they always have: `b` on
+/// both halves ahead of `a` on the dense half alone.
+#[tokio::test]
+async fn hybrid_without_a_filter_still_returns_both_halves() {
+    let server = Server::start().await;
+    let token = tenant_fixture(&server).await;
+    let (ids, body) = tenant_hybrid(&server, &token, json!({})).await;
+    assert_eq!(ids, ["b", "a"], "{body:?}");
+}
+
 #[tokio::test]
 async fn client_supplied_vectors_become_searchable() {
     let server = Server::start().await;
