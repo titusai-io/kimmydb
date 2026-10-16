@@ -2876,6 +2876,19 @@ mod decimal128 {
         );
     }
 
+    /// `$inc` and `$mul` are arithmetic, which this change leaves as it was: a
+    /// decimal operand is refused at parse and a stored decimal at apply.
+    #[test]
+    fn inc_and_mul_on_a_decimal128_are_what_they_were() {
+        for op in ["$inc", "$mul"] {
+            let msg = parse(&doc! { op: { "v": dec("1") } }).unwrap_err().to_string();
+            assert!(msg.contains("requires a number"), "{op}: {msg}");
+            let parsed = parse(&doc! { op: { "v": 1 } }).unwrap();
+            let msg = apply(&parsed, &mut doc! { "v": dec("1.5") }, 0).unwrap_err().to_string();
+            assert!(msg.contains("non-numeric field"), "{op}: {msg}");
+        }
+    }
+
     #[test]
     fn pull_and_pull_all_remove_by_exact_value() {
         // Design 2.2: `$pull: {t: 5}` on `[Decimal128("1"), 2]` keeps the decimal;

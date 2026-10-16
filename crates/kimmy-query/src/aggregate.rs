@@ -3745,6 +3745,32 @@ mod identity {
         assert_eq!(extremes(vec![dec("2.0"), Bson::Int32(2)]), (dec("2.0"), dec("2.0")));
     }
 
+    /// Decimal arithmetic is outside the design that placed a decimal in the
+    /// order, and is what it was: `$sum` and `$avg` skip a decimal as they skip
+    /// any non-number, and `$add`, `$subtract`, `$multiply` and `$divide`
+    /// refuse one. None of them compares, so none changed with the comparator.
+    #[test]
+    fn arithmetic_on_a_decimal128_is_what_it_was() {
+        let input = vec![doc! { "v": 1 }, doc! { "v": dec("1.5") }, doc! { "v": 2 }];
+        let out = run(
+            vec![
+                doc! { "$group": { "_id": null, "sum": { "$sum": "$v" }, "avg": { "$avg": "$v" } } },
+            ],
+            input,
+        );
+        assert_eq!(out[0].get("sum"), Some(&Bson::Int64(3)));
+        assert_eq!(out[0].get("avg"), Some(&Bson::Double(1.5)));
+        for op in ["$add", "$subtract", "$multiply", "$divide"] {
+            let mut expr = Document::new();
+            expr.insert(op, vec![Bson::from("$v"), Bson::Int32(1)]);
+            let stages = parse(&[doc! { "$project": { "r": expr } }]).unwrap();
+            let msg = apply(&stages[0], vec![doc! { "v": dec("1.5") }], &Limits::default())
+                .unwrap_err()
+                .to_string();
+            assert!(msg.contains("found a Decimal128"), "{op}: {msg}");
+        }
+    }
+
     /// A number re-spelled as an equal value of another type, or a decimal as
     /// another member of its cohort, where one exists: the transformations
     /// that must never change a value's identity.
