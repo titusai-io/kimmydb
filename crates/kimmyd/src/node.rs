@@ -3433,6 +3433,30 @@ mod tests {
         );
     }
 
+    /// The `Decimal128` gate (ADR-238) is installed from the configured key, the
+    /// clustering switch and the membership switch, before the engine can take a
+    /// write through this node, and is handed the live member set beside the
+    /// routes. A source check: the gate's answers are tested in `kimmy-cluster`,
+    /// and what this pins is that the node builds it from the right inputs and
+    /// in the right place.
+    #[test]
+    fn the_decimal128_gate_is_installed_from_the_key_before_anything_serves() {
+        let source = include_str!("node.rs");
+        let built = source
+            .find(
+                "kimmy_cluster::Decimal128Gate::new(\n        config.cluster.decimal128(),\n        \
+                 config.cluster.enabled,\n        config.cluster.membership,\n    );",
+            )
+            .expect("the gate built from the key, clustering and membership");
+        let installed =
+            source.find("engine.set_decimal128_gate(decimal128.predicate());").expect("installed");
+        let handed = source.find("decimal128.set_members(members.clone());").expect("handed");
+        let serving = source.find("front.install(app);").expect("the swap to serving");
+        let open = source.find("Engine::open_with(&path, &options)").expect("the open");
+        assert!(open < built && built < installed, "built from the opened engine's config");
+        assert!(installed < handed && handed < serving, "installed and handed before serving");
+    }
+
     /// **The stop freezes the yield evaluator first** (ADR-213, B9): at the stop's
     /// first signal, before `shutdown` is announced to the supervised tasks. A task
     /// that wakes on the announcement therefore always finds the evaluator frozen,

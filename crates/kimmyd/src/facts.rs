@@ -171,6 +171,18 @@ mod tests {
         assert!(first.class_state.is_none() && first.responsive.is_none());
     }
 
+    /// Every block of this build says it can hold a `Decimal128` id and bound
+    /// (ADR-238), with an engine or without: the field is the binary's, not the
+    /// configuration's, so a peer's gate can count this member as one that can.
+    #[test]
+    fn the_block_says_this_build_can_hold_a_decimal128() {
+        let (engine, _dir) = engine();
+        let source = source(Arc::downgrade(&engine), vec![1; 16], false, false, None, None);
+        assert_eq!(source().decimal128, Some(true));
+        drop(engine);
+        assert_eq!(source().decimal128, Some(true), "whatever the store says");
+    }
+
     /// With the engine gone the block still says who it is, and lists nothing.
     #[test]
     fn a_block_without_an_engine_lists_nothing() {
