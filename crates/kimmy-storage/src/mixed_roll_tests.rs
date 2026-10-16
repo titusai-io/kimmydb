@@ -1384,3 +1384,55 @@ fn neither_digest_format_moves() {
     assert_eq!(crate::live_digest::FORMAT, 1, "the cut digest's format");
     assert_eq!(crate::definition_digest::FORMAT, 2, "the definition digest's format");
 }
+
+/// A `Decimal128` id has no schema-4 key (design 7.1): its carried delete and a cursor that
+/// ends at it travel as `FF` and the stored key, the receiver lands the delete on it, the
+/// sender resumes after it, and the digest hashes the same marked form.
+#[test]
+fn a_decimal_id_travels_marked_and_lands_on_its_own_document() {
+    let decimal =
+        |text: &str| DocId::try_from_bson(&bson::Bson::Decimal128(text.parse().unwrap())).unwrap();
+    let (s, _ds) = engine();
+    let (r, _dr) = engine();
+    let coll = s.create_collection("shop", "orders").unwrap();
+    let ids = [int(1), decimal("1.5"), decimal("2.5"), int(3)];
+    for id in &ids {
+        s.insert(&coll, doc! { "_id": id.to_bson() }).unwrap();
+    }
+    pull(&r, &s);
+    assert!(s.delete(&coll, &decimal("1.5")).unwrap());
+    let marked = |id: &DocId| {
+        let mut out = vec![0xFF];
+        out.extend(crate::docs::doc_key(id).unwrap());
+        out
+    };
+
+    let page = s.snapshot_page(None, Some(coll.id)).unwrap();
+    let carried: Vec<Vec<u8>> = page.deleted_documents.iter().map(|t| t.key.clone()).collect();
+    assert_eq!(carried, vec![marked(&decimal("1.5"))]);
+    let mut progress = SnapshotProgress::of_collection(coll.id);
+    r.apply_snapshot_page(s.node_id(), &mut progress, &page).unwrap();
+    let rc = r.get_collection("shop", "orders").unwrap();
+    assert!(r.get(&rc, &decimal("1.5")).unwrap().is_none(), "the delete landed");
+    for id in [int(1), decimal("2.5"), int(3)] {
+        assert!(r.get(&rc, &id).unwrap().is_some(), "{id:?} untouched");
+    }
+
+    // A cursor ending at a decimal id is marked, and the sender resumes after it.
+    let after = SnapshotCursor { collection: coll.id, after_key: marked(&decimal("2.5")) };
+    let rest = s.snapshot_page(Some(after), Some(coll.id)).unwrap();
+    assert_eq!(rest.documents.iter().map(|d| d.id.clone()).collect::<Vec<_>>(), vec![int(3)]);
+
+    // The digest's term of a decimal id is over the marked form.
+    let stamp =
+        |e: &Engine, id: &DocId| held_at(e, coll.id, &crate::docs::doc_key(id).unwrap()).unwrap().0;
+    let want = [int(1), decimal("2.5"), int(3)].iter().fold(0u128, |digest, id| {
+        let key = match id {
+            DocId::Decimal128(_) => marked(id),
+            other => v1::key(other),
+        };
+        digest ^ v1::term(&key, &stamp(&s, id))
+    });
+    assert_eq!(s.digest_row(coll.id).unwrap().unwrap().digest, want);
+    assert_eq!(r.digest_row(rc.id).unwrap().unwrap().digest, want);
+}

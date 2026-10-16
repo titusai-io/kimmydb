@@ -277,10 +277,7 @@ const BOUNDED_READS: &[(&str, &str)] = &[
         "mixed_roll_tests::records",
         "test code reading a store of a few hundred rows it wrote itself",
     ),
-    (
-        "mixed_roll_tests::rows",
-        "test code reading a store of a few hundred rows it wrote itself",
-    ),
+    ("mixed_roll_tests::rows", "test code reading a store of a few hundred rows it wrote itself"),
     (
         "index::clear_index_entries",
         "walks the walk table its caller opened, so its caller's WalkStop decides: in_write \
