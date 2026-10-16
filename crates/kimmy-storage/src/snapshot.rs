@@ -361,6 +361,10 @@ pub struct SnapshotApplied {
     /// Under [`SnapshotPolicy::Definitions`]: what the page's indexes came to. All zero
     /// under every other policy.
     pub definitions: crate::definition_repair::DefinitionRestore,
+    /// Under [`SnapshotPolicy::Definitions`]: the first ten indexes the page left, as
+    /// `name (kind)`, for the line that tells the operator which kind each one is. Empty
+    /// for a skip that names no index (the collection is gone, or the life was buried).
+    pub definitions_left: Vec<String>,
     /// Under [`SnapshotPolicy::Converge`]: of `created`, those at or below the cut.
     pub created_at_cut: usize,
     /// Under [`SnapshotPolicy::Converge`] and [`SnapshotPolicy::Definitions`]: the first page's
@@ -1279,6 +1283,7 @@ impl Engine {
                 created: 0,
                 applied_at_cut: 0,
                 definitions: Default::default(),
+                definitions_left: Vec::new(),
                 created_at_cut: 0,
                 history: false,
                 sender_dropped: false,

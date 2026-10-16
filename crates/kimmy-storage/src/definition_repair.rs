@@ -63,6 +63,17 @@ impl DefinitionRestore {
     }
 }
 
+/// How many left indexes a definition repair names for the operator.
+const DEFINITION_LEFT_NAMED: usize = 10;
+
+/// Record `name` among the indexes a definition repair left, as `name (kind)`, up to
+/// [`DEFINITION_LEFT_NAMED`], for the WARN that tells the operator which kind each one is.
+fn leave(left: &mut Vec<String>, kind: &str, name: &str) {
+    if left.len() < DEFINITION_LEFT_NAMED {
+        left.push(format!("{name} ({kind})"));
+    }
+}
+
 /// The labels of [`DefinitionRestore::counts`].
 pub const DEFINITION_RESULTS: [&str; 10] = [
     "built",
@@ -111,12 +122,15 @@ impl crate::Engine {
                 ..Default::default()
             });
         }
+        let mut left = Vec::new();
         let definitions = match page
             .collections
             .iter()
             .find(|state| CollectionId::derive(&state.db, &state.name) == scope)
         {
-            Some(state) => self.restore_definitions(state, page.tombstone_horizon, limit)?,
+            Some(state) => {
+                self.restore_definitions(state, page.tombstone_horizon, limit, &mut left)?
+            }
             // The page names no such collection: the sender holds it under no definition
             // (a sender that predates the scope serves its whole database, whose first page
             // need not carry it).
@@ -125,16 +139,23 @@ impl crate::Engine {
         progress.finish_after_one_page();
         // A definition this build cannot apply is counted where a refusal reached through the
         // oplog or a whole-database page is (ADR-123).
-        Ok(SnapshotApplied { ddl_refused: definitions.refused, definitions, ..Default::default() })
+        Ok(SnapshotApplied {
+            ddl_refused: definitions.refused,
+            definitions,
+            definitions_left: left,
+            ..Default::default()
+        })
     }
 
     /// Build at most one plain index `state` carries and this member lacks, if every
-    /// clause of the table in repair design section 12 admits it.
+    /// clause of the table in repair design section 12 admits it. `left` collects the
+    /// names of the indexes it skipped, by kind.
     fn restore_definitions(
         &self,
         state: &CollectionState,
         sender_horizon: Option<Hlc>,
         limit: u64,
+        left: &mut Vec<String>,
     ) -> Result<DefinitionRestore> {
         let mut out = DefinitionRestore::default();
         let id = CollectionId::derive(&state.db, &state.name);
@@ -153,29 +174,35 @@ impl crate::Engine {
             if let Some(held) = standing.indexes.iter().find(|i| i.name == index.name) {
                 if !same_definition(held, index) {
                     out.rival += 1;
+                    leave(left, "rival", &index.name);
                 }
                 continue;
             }
             if index.unique {
                 out.unique += 1;
+                leave(left, "unique", &index.name);
                 continue;
             }
             if index.expire_after_secs.is_some() {
                 out.ttl += 1;
+                leave(left, "ttl", &index.name);
                 continue;
             }
             let Some(created) = index.created else {
                 out.history += 1;
+                leave(left, "history", &index.name);
                 continue;
             };
             // The one rule a definition is judged by on every route (ADR-236): the floor,
             // or a drop tombstone of the collection or its database this member holds.
             if self.definition_of_an_ended_life(&standing, created)? {
                 out.history += 1;
+                leave(left, "history", &index.name);
                 continue;
             }
             if self.index_dropped_at(id, index.id)?.is_some_and(|at| created < at) {
                 out.tombstoned += 1;
+                leave(left, "tombstoned", &index.name);
                 continue;
             }
             // The index analogue of a document row's admission: only an index made after
@@ -187,6 +214,7 @@ impl crate::Engine {
             };
             if !admitted {
                 out.ambiguous += 1;
+                leave(left, "ambiguous", &index.name);
                 continue;
             }
             // The one build of this repair is the first that passes, chosen before the
@@ -204,6 +232,7 @@ impl crate::Engine {
         let live = self.count_by_id(id)?.unwrap_or(0);
         if live > limit {
             out.too_large += 1;
+            leave(left, "too_large", &index.name);
             return Ok(out);
         }
         #[cfg(test)]
@@ -261,18 +290,33 @@ impl crate::Engine {
                 }
             }
             crate::sync::Ddl::Applied((_, _)) => match vetoed_by.get() {
-                Some("history") => out.history += 1,
-                Some("tombstoned") => out.tombstoned += 1,
-                Some("ambiguous") => out.ambiguous += 1,
+                Some("history") => {
+                    out.history += 1;
+                    leave(left, "history", &index.name);
+                }
+                Some("tombstoned") => {
+                    out.tombstoned += 1;
+                    leave(left, "tombstoned", &index.name);
+                }
+                Some("ambiguous") => {
+                    out.ambiguous += 1;
+                    leave(left, "ambiguous", &index.name);
+                }
                 // The same definition landed meanwhile: there is nothing left to repair.
                 Some("held") => {}
-                _ => out.rival += 1,
+                _ => {
+                    out.rival += 1;
+                    leave(left, "rival", &index.name);
+                }
             },
             crate::sync::Ddl::Gone | crate::sync::Ddl::PurgePending(_) => out.gone += 1,
             // An unstamped rival held under the name (a definition older than ADR-132): the name
             // is held under another definition, which this build can apply. Not a refusal of
             // the definition, so no hint, or the next comparison would call the rival explained.
-            crate::sync::Ddl::Refused(kimmy_core::Error::IndexExists { .. }) => out.rival += 1,
+            crate::sync::Ddl::Refused(kimmy_core::Error::IndexExists { .. }) => {
+                out.rival += 1;
+                leave(left, "rival", &index.name);
+            }
             crate::sync::Ddl::Refused(reason) => {
                 out.refused += 1;
                 warn!(

@@ -4249,7 +4249,13 @@ async fn lab_hook_a_lost_plain_index_is_built_by_the_definition_repair() {
         .await,
         1
     );
-    assert_eq!(b.gauge(&client, "kimmy_sync_definition_divergent_collections").await, Some(0));
+    // B holds a finding against each peer; the one the repair did not come from clears at that
+    // peer's next compared probe, so the gauge reaches 0 a contact later, not at the judgement.
+    eventually("B's definition findings to clear", || {
+        let (client, b) = (&client, &b);
+        async move { b.gauge(client, "kimmy_sync_definition_divergent_collections").await == Some(0) }
+    })
+    .await;
 }
 
 /// B loses the replicated insert of a document: either half repairs it (the count half's

@@ -6735,6 +6735,34 @@ async fn a_peer_set_aside_in_an_earlier_tick_is_snapshotted_at_its_next_refusal(
     assert!(!m.engine.state_held().unwrap().is_empty(), "snapshotted unconditionally");
 }
 
+/// [`an_origin_that_can_serve_m_and_a_member_with_a_hole`] and one more listener, made by
+/// `make`, whose address is above `p`'s, so that a tick selecting in address order asks `p`
+/// first and the other after it.
+///
+/// `p` is held fixed while `make` is tried a bounded number of times: ports rise on some
+/// systems and wrap at the top of the range, so a `p` near the top has nothing above it
+/// but a wrap away, and retrying only the other side would climb through thousands of
+/// listeners. When none of the tries lands above `p`, the whole fixture is built again, so
+/// `p` is fresh too.
+async fn a_hole_fixture_and_a_listener_above_its_member_with_a_hole<T, Fut>(
+    make: impl Fn() -> Fut,
+    address_of: impl Fn(&T) -> std::net::SocketAddr,
+) -> ((Node, Node, Node), T)
+where
+    Fut: std::future::Future<Output = T>,
+{
+    const TRIES: usize = 8;
+    loop {
+        let fixture = an_origin_that_can_serve_m_and_a_member_with_a_hole().await;
+        for _ in 0..TRIES {
+            let above = make().await;
+            if address_of(&above) > fixture.2.addr {
+                return (fixture, above);
+            }
+        }
+    }
+}
+
 #[tokio::test]
 async fn a_member_past_every_peers_horizon_still_snapshots() {
     // Nothing can serve `m` by entries: it holds nothing, `a` has collected, and `p`
@@ -6758,13 +6786,8 @@ async fn a_refusing_peer_is_asked_again_after_the_other_contacts_in_the_same_tic
     // help; `p` is asked again once `x` has had its turn, still refuses, and the
     // snapshot is taken in that tick. The interval is a minute, so a second tick is
     // not what does it: a set-aside that waited for the next tick would still be waiting.
-    let (_a, m, p) = an_origin_that_can_serve_m_and_a_member_with_a_hole().await;
-    let x = loop {
-        let x = node().await;
-        if x.addr > p.addr {
-            break x;
-        }
-    };
+    let ((_a, m, p), x) =
+        a_hole_fixture_and_a_listener_above_its_member_with_a_hole(node, |x| x.addr).await;
     sync_once(&x.engine, m.addr, SECRET, None).await.unwrap();
     let caught_up = m_replicates_every(
         &m,
@@ -6776,6 +6799,9 @@ async fn a_refusing_peer_is_asked_again_after_the_other_contacts_in_the_same_tic
     )
     .await;
     assert!(caught_up, "snapshotted within the first tick, after x had its turn");
+    // The premise: `p` was asked first, set aside, and asked again after `x`. Asked last,
+    // with nobody left to wait for, it would have been snapshotted on its first refusal.
+    assert_eq!(p.engine.state_held_refusals(), 2, "p was refused, set aside, then asked again");
 }
 
 #[tokio::test]
@@ -6867,13 +6893,11 @@ async fn a_peer_set_aside_is_snapshotted_within_two_ticks_whatever_the_others_do
     // The bound: the peer is carried to the next tick, where its second refusal is a
     // snapshot. Within two ticks of the first refusal, counted in ticks and not in
     // seconds: not "when the other recovers".
-    let (_a, _m, p) = an_origin_that_can_serve_m_and_a_member_with_a_hole().await;
-    let silent = loop {
-        let silent = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-        if silent.local_addr().unwrap() > p.addr {
-            break silent;
-        }
-    };
+    let ((_a, _m, p), silent) = a_hole_fixture_and_a_listener_above_its_member_with_a_hole(
+        || async { std::net::TcpListener::bind("127.0.0.1:0").unwrap() },
+        |silent| silent.local_addr().unwrap(),
+    )
+    .await;
     let silent_at = silent.local_addr().unwrap();
     let fresh = node().await;
     let (caught_up, ticks) = m_replicates_counting_ticks(
@@ -6898,15 +6922,13 @@ async fn a_peer_set_aside_when_the_tick_runs_out_is_contacted_first_in_the_next(
     // The other contact is slow but answers, so it is not backed off, and with one
     // contact a tick the rotation would go to it again. The carried peer takes the
     // slot instead: the other contact is dialled once before the snapshot, not twice.
-    let (_a, _m, p) = an_origin_that_can_serve_m_and_a_member_with_a_hole().await;
     let x = node().await;
     let dialled = Arc::new(AtomicUsize::new(0));
-    let relay = loop {
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        if listener.local_addr().unwrap() > p.addr {
-            break listener;
-        }
-    };
+    let ((_a, _m, p), relay) = a_hole_fixture_and_a_listener_above_its_member_with_a_hole(
+        || async { TcpListener::bind("127.0.0.1:0").await.unwrap() },
+        |listener| listener.local_addr().unwrap(),
+    )
+    .await;
     let relay_at = relay.local_addr().unwrap();
     let target = x.addr;
     tokio::spawn({
