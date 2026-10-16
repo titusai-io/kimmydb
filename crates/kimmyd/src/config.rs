@@ -940,6 +940,26 @@ pub struct ClusterConfig {
     /// (ADR-220 does not judge an index build), so this bounds the hold, and it is
     /// lower than `repair_max_documents` for that reason. Greater than zero.
     pub repair_max_index_documents: u64,
+    /// Whether this member may create a document whose `_id` is a `Decimal128`,
+    /// or an index whose partial filter holds one (ADR-238): the operator's
+    /// declaration that every member runs 0.51 or later, has finished its
+    /// storage migration, and will not run an older build again. A member
+    /// before 0.51 that meets such a document never catches up, and one that
+    /// meets such a definition never builds it. With clustering on, a creation
+    /// also waits until every live peer says it can hold one.
+    ///
+    /// Unset reads as `true` with clustering off and `false` with it on
+    /// ([`Self::decimal128`]); `check-config` prints the value in effect. Set it
+    /// only after the whole roll, as its own change and restart, never in the
+    /// change that upgrades the binary. It gates **local creation only**: what
+    /// a peer replicates is always applied. Read at start.
+    ///
+    /// **A rollback effect.** `ClusterConfig` refuses unknown keys, so a 0.49 or
+    /// 0.50 binary refuses to start on a config that names this key, at any
+    /// value. Setting it back to `false` does not make a rollback possible: the
+    /// `kimmy_decimal128_id_present` marker, not this key, says whether a
+    /// decimal id exists.
+    pub decimal128: Option<bool>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -1315,7 +1335,17 @@ impl Default for ClusterConfig {
             divergence_repair: true,
             repair_max_documents: 2_000_000,
             repair_max_index_documents: 250_000,
+            decimal128: None,
         }
+    }
+}
+
+impl ClusterConfig {
+    /// `decimal128` in effect: as set, or by default `true` with clustering off
+    /// and `false` with it on. A lone node has no member that could fail to
+    /// read one; a cluster is declared by its operator once the roll is done.
+    pub fn decimal128(&self) -> bool {
+        self.decimal128.unwrap_or(!self.enabled)
     }
 }
 
@@ -2627,6 +2657,34 @@ api_key_env = "KIMMY_PROVIDER_HOSTED"
         cfg.cluster.repair_max_index_documents = 0;
         let err = cfg.validate().unwrap_err().to_string();
         assert!(err.contains("repair_max_index_documents"), "unhelpful error: {err}");
+    }
+
+    /// `cluster.decimal128` (ADR-238): unset reads `true` alone and `false` in a
+    /// cluster, a value set wins either way, and a typo is refused by name. The
+    /// same `deny_unknown_fields` is why a 0.49 or 0.50 binary refuses a config
+    /// that names the key at all: a rollback effect, documented, not tested here.
+    #[test]
+    fn decimal128_defaults_by_clustering_and_parses() {
+        let mut cfg = Config::default();
+        assert_eq!(cfg.cluster.decimal128, None, "unset");
+        assert!(cfg.cluster.decimal128(), "a lone node has no member that cannot read one");
+        cfg.cluster.enabled = true;
+        assert!(!cfg.cluster.decimal128(), "a cluster waits for its operator");
+
+        for (text, enabled, expected) in [
+            ("[cluster]\ndecimal128 = true\nenabled = true\n", true, true),
+            ("[cluster]\ndecimal128 = false\n", false, false),
+            ("[cluster]\nenabled = true\n", true, false),
+            ("", false, true),
+        ] {
+            let parsed: Config = toml::from_str(text).unwrap();
+            assert_eq!(parsed.cluster.enabled, enabled, "{text:?}");
+            assert_eq!(parsed.cluster.decimal128(), expected, "{text:?}");
+        }
+
+        let err =
+            toml::from_str::<Config>("[cluster]\ndecimal128_ids = true\n").unwrap_err().to_string();
+        assert!(err.contains("decimal128_ids"), "unhelpful error: {err}");
     }
 
     #[test]

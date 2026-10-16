@@ -594,6 +594,20 @@ catch_up_wait_secs = 120
 # index in it. The build holds the single writer for its whole length. Greater than zero.
 # repair_max_index_documents = 250000
 
+# Whether this member may create a document whose `_id` is a Decimal128, or an index
+# whose partialFilterExpression holds one. Setting it true declares that every member
+# runs 0.51 or later, has finished its storage migration, and will not run an older
+# build again: a member before 0.51 that meets such a document never catches up. With
+# clustering on, a creation also waits until every live peer says it can hold one.
+# Unset reads as true with clustering off and false with it on. Set it only after the
+# whole roll, as its own change and restart, never with the binary upgrade. Only local
+# creation is gated; what a peer replicates is always applied.
+#
+# NAMING THIS KEY AT ANY VALUE MAKES A 0.49 OR 0.50 BINARY REFUSE TO START ON THIS
+# FILE, and setting it back to false does not make a rollback possible: the
+# kimmy_decimal128_id_present marker says whether a Decimal128 _id exists.
+# decimal128 = false
+
 [webhooks]
 # Hosts a webhook may target beyond the public internet.
 #

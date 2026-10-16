@@ -1066,6 +1066,20 @@ impl crate::Engine {
             // applying.
             if let Some(filter) = &partial_filter {
                 kimmy_core::PartialFilter::parse(filter).map_err(StorageError::Core)?;
+                // The third chokepoint (ADR-238): a member before 0.51 refuses a
+                // definition whose filter holds a `Decimal128` anywhere, records
+                // a refusal hint and never builds it, even after it upgrades. So
+                // a local create of one waits for the gate. Replicated, restored
+                // and repaired definitions are applied whatever it says:
+                // refusing one would leave this member without an index its
+                // peers hold, which is the failure the gate exists to prevent.
+                if matches!(origin, CreateOrigin::Local)
+                    && kimmy_core::holds_decimal128(&bson::Bson::Document(filter.clone()))
+                {
+                    self.refuse_unless_decimal128_allowed(
+                        kimmy_core::Decimal128Use::PartialFilterBound,
+                    )?;
+                }
             }
             if let Some(secs) = expire_after_secs {
                 if secs < 0 {

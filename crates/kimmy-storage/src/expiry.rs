@@ -801,13 +801,13 @@ mod tests {
 
     #[test]
     fn a_filter_this_build_cannot_parse_skips_its_index_and_deletes_nothing() {
-        // A filter an earlier build accepted and this one refuses: a
-        // `Decimal128` operand, from before parsing refused it, handed to the
-        // pass as a definition that build stored would be.
+        // A filter this build refuses, handed to the pass as a definition an
+        // earlier build stored would be. It was a `Decimal128` operand until
+        // ADR-238 lifted that refusal; a `$ne` is refused for its own reason.
         let (engine, _, _dir) = engine();
         let (coll, mut index) = with_filtered_ttl(&engine, doc! {"size": {"$gt": 5}});
         engine.insert(&coll, doc! {"_id": 1, "size": 10, "seen": dt(0)}).unwrap();
-        index.partial_filter = Some(doc! {"size": {"$gt": bson::Decimal128::from_bytes([0; 16])}});
+        index.partial_filter = Some(doc! {"size": {"$ne": 5}});
         assert!(index.partial().unwrap().is_err(), "premise: this build refuses the filter");
 
         let out = engine.expire_documents(&coll, &index, 10_000_000).unwrap();

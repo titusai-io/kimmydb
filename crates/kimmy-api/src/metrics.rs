@@ -132,6 +132,10 @@ pub struct StorageReadings {
     pub held_marks_released: u64,
     /// Entries held as state right now (`Engine::held_marks`, ADR-160).
     pub held_marks: u64,
+    /// Whether a document whose `_id` is a `Decimal128` has been written or
+    /// applied on this member (`Engine::decimal128_id_present`, ADR-238): the
+    /// durable marker a rollback runbook reads, read at scrape.
+    pub decimal128_id_present: bool,
     /// Registered webhook subscriptions by state, counted from the registry
     /// at the read (ADR-187). They were set by the dispatcher at the end of
     /// each pass, so a dispatcher that had stopped left them at whatever it
@@ -490,6 +494,9 @@ pub struct MetricsSnapshot {
     pub sync_divergence_repair_enabled: u64,
     /// The collected-through horizon, seconds since the epoch. A level.
     pub gc_tombstone_horizon_seconds: u64,
+    /// 1 once a document whose `_id` is a `Decimal128` has been written or
+    /// applied on this member (ADR-238): an engine reading.
+    pub decimal128_id_present: u64,
     /// Definition repairs by outcome (`DigestRepairOutcome::DEFINITION` are the labels used),
     /// the loop guard's judgements of them (`DefinitionJudgement::ALL`) and what their pages
     /// did with indexes (`kimmy_storage::DEFINITION_RESULTS`).
@@ -1487,6 +1494,7 @@ impl Metrics {
                 .get(&self.sync_digest_repair_stopped_collections),
             sync_divergence_repair_enabled: self.get(&self.sync_divergence_repair_enabled),
             gc_tombstone_horizon_seconds: self.get(&self.gc_tombstone_horizon_seconds),
+            decimal128_id_present: u64::from(readings.decimal128_id_present),
             sync_definition_repairs: std::array::from_fn(|slot| {
                 self.get(&self.sync_definition_repairs[slot])
             }),
@@ -1909,6 +1917,9 @@ impl Metrics {
              # HELP kimmy_gc_tombstone_horizon_seconds The collected-through horizon, as a Unix time in seconds: the cutoff of the last retention pass that removed a tombstone, or this build's reset at open (a start after an upgrade, a rollback or a restore resets it to the start time). It moves only when a pass removes something, so a member that collects nothing holds it indefinitely; it is not now minus retention. A document repair writes a row only when the row is newer than the larger of this member's horizon and the sender's. A fast clock pins it ahead until real time passes it.\n\
              # TYPE kimmy_gc_tombstone_horizon_seconds gauge\n\
              kimmy_gc_tombstone_horizon_seconds {gc_tombstone_horizon}\n\
+             # HELP kimmy_decimal128_id_present 1 once a document whose _id is a Decimal128 (an integral one stored as an integer id included) has been written or applied on this member, else 0. Durable and never cleared, and a backup carries it. Read it on every member before a rollback: once it is 1 anywhere, no member can be rolled back by wiping it and resyncing on a build before 0.51 (operations.md, cluster.decimal128 and the marker).\n\
+             # TYPE kimmy_decimal128_id_present gauge\n\
+             kimmy_decimal128_id_present {decimal128_id_present}\n\
              # HELP kimmy_sync_definition_repairs_total Definition repairs of a confirmed definition finding, by outcome: the end of a repair, or the gate that refused to plan one. applied: the repair pulled the first page of the peer's snapshot of the collection and applied it; whether it worked is judged at the next compared definition digest (kimmy_sync_definition_repair_judgements_total), and what it did with each index is in kimmy_sync_definition_repair_indexes_total. too_large: the collection holds more live documents than cluster.repair_max_index_documents. abandoned: three rounds in a row applied nothing. transient: a peer error, a stop, a drop, a whole-database pull taking the peer over, or a cancellation. disabled: cluster.divergence_repair is off.\n\
              # TYPE kimmy_sync_definition_repairs_total counter\n\
              {sync_definition_repairs_lines}\
@@ -2110,6 +2121,7 @@ impl Metrics {
             sync_digest_repair_stopped = self.get(&self.sync_digest_repair_stopped_collections),
             sync_divergence_repair_enabled = self.get(&self.sync_divergence_repair_enabled),
             gc_tombstone_horizon = self.get(&self.gc_tombstone_horizon_seconds),
+            decimal128_id_present = u64::from(readings.decimal128_id_present),
             sync_definition_repairs_lines = kimmy_cluster::DigestRepairOutcome::DEFINITION
                 .iter()
                 .map(|outcome| {
@@ -3111,6 +3123,7 @@ mod tests {
             writer_hold_max_us: 52_500_000,
             held_marks_released: 53,
             held_marks: 54,
+            decimal128_id_present: true,
             ownership: OwnershipReading {
                 peers: [1_501, 1_502, 1_503, 1_504, 1_505],
                 unconfirmed: [1_511, 1_512, 1_513],
@@ -3798,6 +3811,9 @@ kimmy_sync_divergence_repair_enabled 1
 # HELP kimmy_gc_tombstone_horizon_seconds The collected-through horizon, as a Unix time in seconds: the cutoff of the last retention pass that removed a tombstone, or this build's reset at open (a start after an upgrade, a rollback or a restore resets it to the start time). It moves only when a pass removes something, so a member that collects nothing holds it indefinitely; it is not now minus retention. A document repair writes a row only when the row is newer than the larger of this member's horizon and the sender's. A fast clock pins it ahead until real time passes it.
 # TYPE kimmy_gc_tombstone_horizon_seconds gauge
 kimmy_gc_tombstone_horizon_seconds 1700000002
+# HELP kimmy_decimal128_id_present 1 once a document whose _id is a Decimal128 (an integral one stored as an integer id included) has been written or applied on this member, else 0. Durable and never cleared, and a backup carries it. Read it on every member before a rollback: once it is 1 anywhere, no member can be rolled back by wiping it and resyncing on a build before 0.51 (operations.md, cluster.decimal128 and the marker).
+# TYPE kimmy_decimal128_id_present gauge
+kimmy_decimal128_id_present 1
 # HELP kimmy_sync_definition_repairs_total Definition repairs of a confirmed definition finding, by outcome: the end of a repair, or the gate that refused to plan one. applied: the repair pulled the first page of the peer's snapshot of the collection and applied it; whether it worked is judged at the next compared definition digest (kimmy_sync_definition_repair_judgements_total), and what it did with each index is in kimmy_sync_definition_repair_indexes_total. too_large: the collection holds more live documents than cluster.repair_max_index_documents. abandoned: three rounds in a row applied nothing. transient: a peer error, a stop, a drop, a whole-database pull taking the peer over, or a cancellation. disabled: cluster.divergence_repair is off.
 # TYPE kimmy_sync_definition_repairs_total counter
 kimmy_sync_definition_repairs_total{outcome=\"applied\"} 262
@@ -4462,6 +4478,7 @@ kimmy_storage_cache_reads_total{result=\"miss\"} 9104
             s.sync_divergence_repair_enabled
         ));
         expect(&format!("kimmy_gc_tombstone_horizon_seconds {}\n", s.gc_tombstone_horizon_seconds));
+        expect(&format!("kimmy_decimal128_id_present {}\n", s.decimal128_id_present));
         for outcome in kimmy_cluster::DigestRepairOutcome::DEFINITION {
             expect(&format!(
                 "kimmy_sync_definition_repairs_total{{outcome=\"{}\"}} {}\n",
@@ -4901,6 +4918,8 @@ kimmy_storage_cache_reads_total{result=\"miss\"} 9104
                 + 1
                 + 1
                 // The collected-through horizon.
+                + 1
+                // The marker that a `Decimal128` id exists here (ADR-238).
                 + 1
                 // And the definition repair's: outcomes, judgements and index results.
                 + kimmy_cluster::DigestRepairOutcome::DEFINITION.len()

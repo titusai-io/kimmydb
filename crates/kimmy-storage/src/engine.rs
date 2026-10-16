@@ -255,6 +255,9 @@ pub struct Engine {
     hold_counters: crate::hold_meter::HoldCounters,
     /// What serving peers' windows cost this node (ADR-176).
     serve_counters: crate::hold_meter::ServeCounters,
+    /// The gate on persisting a `Decimal128` id or partial-filter bound
+    /// (ADR-238), as the node installed it.
+    pub(crate) decimal128: crate::decimal128_gate::Decimal128State,
     /// The unique-violations table's state in process (ADR-200).
     violations: crate::violations_table::ViolationsState,
     /// Where the retention pass's tombstone scan resumes next pass
@@ -1523,6 +1526,7 @@ impl Engine {
             writer_hold_sum_us: std::array::from_fn(|_| std::sync::atomic::AtomicU64::new(0)),
             hold_counters: Default::default(),
             serve_counters: Default::default(),
+            decimal128: Default::default(),
             violations: Default::default(),
             gc_scan_cursor: parking_lot::Mutex::new(None),
             expiry_cursors: Default::default(),

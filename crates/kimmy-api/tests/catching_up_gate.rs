@@ -653,9 +653,16 @@ async fn in_owed_replay_readyz_names_the_cause_and_the_members_that_owe() {
     assert_eq!(ready.status, 200, "{}", ready.text);
     assert_eq!(
         keys(&ready.body),
-        ["catching_up", "node", "owed_members", "status", "unknown_because"]
-            .map(String::from)
-            .into(),
+        [
+            "catching_up",
+            "decimal128_id_present",
+            "node",
+            "owed_members",
+            "status",
+            "unknown_because"
+        ]
+        .map(String::from)
+        .into(),
         "{}",
         ready.text
     );
@@ -679,9 +686,16 @@ async fn with_no_counting_peer_readyz_names_that_cause() {
     assert_eq!(ready.status, 200, "{}", ready.text);
     assert_eq!(
         keys(&ready.body),
-        ["catching_up", "node", "owed_members", "status", "unknown_because"]
-            .map(String::from)
-            .into(),
+        [
+            "catching_up",
+            "decimal128_id_present",
+            "node",
+            "owed_members",
+            "status",
+            "unknown_because"
+        ]
+        .map(String::from)
+        .into(),
         "{}",
         ready.text
     );

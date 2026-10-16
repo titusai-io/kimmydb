@@ -46,7 +46,7 @@ use std::cmp::Ordering;
 
 use bson::{Bson, Document};
 
-use crate::cmp::{canonical_cmp, holds_decimal128};
+use crate::cmp::canonical_cmp;
 use crate::error::{Error, Result};
 use crate::path;
 
@@ -123,26 +123,21 @@ impl PartialOp {
     /// - **`{k: null}` matches a missing field**, so it implies nothing about
     ///   presence and no bound: only itself.
     ///
-    /// **Not transitive for a document value that is a `Decimal128`, and that
-    /// is answered elsewhere.** This reasons through a single value `w`, which
-    /// assumes equality is transitive. `canonical_cmp` ranks a `Decimal128`
-    /// equal to every number — the settled contract in `docs/http-api.md` and
-    /// `docs/key-encoding.md` — so `Eq(5)` and `Eq(6)` both hold on one while
-    /// neither implies the other, and a query can be judged contained by a
-    /// filter that does not *select* the document.
+    /// **Transitive for every value, a `Decimal128` included.** This reasons
+    /// through a single value `w`, which assumes equality is transitive.
+    /// `canonical_cmp` places a `Decimal128` by its exact value (ADR-238), in
+    /// the number bracket beside the other numbers, so it is: `Eq(5)` and
+    /// `Eq(6)` cannot both hold on one value, and a decimal operand is a bound
+    /// like any number. Before ADR-238 the order ranked a decimal equal to
+    /// every number, implication was not transitive for a decimal document
+    /// value, and [ADR-185](../../../docs/decisions.md) widened membership
+    /// instead of making this sound (see [`PartialFilter::undecidable_path`]).
     ///
-    /// [ADR-185](../../../docs/decisions.md) left this function alone and
-    /// widened membership instead: an index also holds the documents its
-    /// filter cannot decide (see [`Self::undecidable_path`]), so being
-    /// contained by a filter that does not select a document no longer means
-    /// the index lacks it. Making `implies` itself sound was measured and
-    /// rejected — quantifying over witnesses does not converge, and the rule
-    /// that is sound declines 67% of index uses.
-    ///
-    /// The soundness property below still holds no `Decimal128`, because it is
-    /// about implication alone and implication is still not transitive. The
-    /// end-to-end property, which is the one that matters and which does hold,
-    /// is `partial_containment.rs` in `kimmy-query`.
+    /// The soundness property below holds decimal document values and
+    /// decimal operands. The end-to-end property is `partial_containment.rs`
+    /// in `kimmy-query`, whose corpus of caller-written operands is still the
+    /// pre-ADR-238 one (its extension to decimal operands is ADR-238's
+    /// removal of the undecidable filing, a change of its own).
     pub fn implies(&self, other: &PartialOp) -> bool {
         use crate::cmp::same_type_group;
         let bracket = |a: &Bson, b: &Bson| same_type_group(a, b);
@@ -250,27 +245,23 @@ impl PartialFilter {
         self.predicates.iter().all(|(field, op)| op.selects(&path::resolve(doc, field)))
     }
 
-    /// The first path at which this filter's answer for `doc` cannot be
-    /// trusted, because a value there holds a `Decimal128`.
+    /// The first path at which a value holds a `Decimal128`: what
+    /// [ADR-185](../../../docs/decisions.md) files as undecidable.
     ///
-    /// [ADR-185](../../../docs/decisions.md). The canonical order ranks a
-    /// `Decimal128` equal to every number, so `selects` returns an answer that
-    /// is *an* answer rather than *the* answer: the same value satisfies
-    /// `{$eq: 5}` and `{$eq: 6}` and fails `{$gt: 5}`. A document like that is
-    /// held by the index anyway, for the scan to re-check, because a
-    /// membership decision made on an untrustworthy comparison is how a
-    /// partial index came to miss documents `find` returns.
+    /// ADR-185 was written when the canonical order ranked a `Decimal128`
+    /// equal to every number, so `selects` returned *an* answer rather than
+    /// *the* answer for such a document, and the index held it anyway for the
+    /// scan to re-check. That premise is gone: the comparator places a
+    /// decimal by its exact value (ADR-238) and `selects` decides it as it
+    /// decides any number, a decimal bound in the filter included. The filing
+    /// still stands until ADR-238 removes it (a change of its own); holding a
+    /// document the filter does not select costs index size and a re-check,
+    /// never a document `find` returns.
     ///
     /// **Read through the same resolution as [`Self::selects`]**, so the two
-    /// cannot disagree about which values a path offers.
-    ///
-    /// Deliberately wider than the minimum: `holds_decimal128` searches the
-    /// whole value, so `{k: {a: Decimal128(1)}}` counts for a filter on `k`
-    /// even though a document is never ranked against a number. Widening costs
-    /// index size and a re-check; narrowing costs correctness, and the narrow
-    /// version would have to reason about where inside a value a comparison
-    /// actually reaches — which is the reasoning ADR-185 rejected as not
-    /// finite.
+    /// cannot disagree about which values a path offers. `holds_decimal128`
+    /// searches the whole value, so `{k: {a: Decimal128(1)}}` counts for a
+    /// filter on `k`.
     pub fn undecidable_path(&self, doc: &Document) -> Option<&str> {
         self.predicates.iter().find_map(|(field, _)| {
             path::resolve(doc, field)
@@ -312,18 +303,14 @@ impl PartialFilter {
 }
 
 fn parse_op(path: &str, value: &Bson) -> Result<PartialOp> {
-    // A `Decimal128` cannot be a bound or an equality: `canonical_cmp` ranks
-    // it equal to every other number, so a filter holding one would select
-    // every numeric value and the index would hold documents its definition
-    // never named. Checked over the whole value, operator and all, because
-    // every shape below compares its operand.
-    if holds_decimal128(value) {
-        return Err(Error::InvalidQuery(format!(
-            "partialFilterExpression for {path:?} holds a Decimal128, which cannot be compared: \
-             it has no exact key encoding in this engine and ranks equal to every other number; \
-             use a double or a long"
-        )));
-    }
+    // A `Decimal128` operand is a bound like any number: `canonical_cmp`
+    // places it by its exact value (ADR-238). Accepted here always, because
+    // this parse is shared by a local create, a replicated or restored
+    // definition and the migration's check of stored ones, and a member that
+    // refuses a definition its peers hold never builds it. Builds before 0.51
+    // refuse it here, which is why a *local* creation of such an index is
+    // gated in storage (`cluster.decimal128`, ADR-238) until every member can
+    // hold it.
     let Bson::Document(spec) = value else {
         // A bare value is equality, as it is everywhere else in the filter
         // language.
@@ -634,7 +621,23 @@ mod tests {
             }),
             true.into(),
             Bson::DateTime(bson::DateTime::from_millis(1_000)),
+            // Decimals, as document values and as operands (ADR-238): one
+            // equal to `5` in another cohort, one between the integers, one
+            // that is not the double of the same digits, the specials, and
+            // one inside an array.
+            dec("5.00"),
+            dec("6.5"),
+            dec("0.1"),
+            Bson::Double(0.1),
+            dec("NaN"),
+            dec("-Infinity"),
+            dec("Infinity"),
+            Bson::Array(vec![dec("1"), 2.into()]),
         ]
+    }
+
+    fn dec(text: &str) -> Bson {
+        Bson::Decimal128(text.parse().unwrap())
     }
 
     fn ops() -> Vec<PartialOp> {
@@ -700,24 +703,50 @@ mod decimal128 {
     use super::*;
     use bson::doc;
 
+    fn dec(text: &str) -> Bson {
+        Bson::Decimal128(text.parse().unwrap())
+    }
+
     #[test]
-    fn a_decimal128_cannot_be_a_bound_or_an_equality() {
-        // A partial filter compares on every write; a Decimal128 operand
-        // would select every numeric value. Refused at index creation, where
-        // an operator is there to read it, whatever shape carries it.
-        let d = Bson::Decimal128("1.5".parse().unwrap());
+    fn a_decimal128_operand_parses_in_every_shape() {
+        // Accepted always (ADR-238): the parse is shared by a local create, a
+        // replicated or restored definition and the migration's check of
+        // stored ones. Whether a *local* create may persist one is the
+        // storage gate's question (`cluster.decimal128`), not this one's.
+        let d = dec("1.5");
         for filter in [
             doc! { "v": d.clone() },
             doc! { "v": { "$gt": d.clone() } },
             doc! { "v": { "$eq": { "n": d.clone() } } },
             doc! { "ok": { "$exists": true }, "v": { "$lte": d.clone() } },
         ] {
-            let Err(err) = PartialFilter::parse(&filter) else {
-                panic!("{filter} should be refused")
-            };
-            let msg = err.to_string();
-            assert!(msg.contains("Decimal128") && msg.contains("\"v\""), "{filter}: {msg}");
+            let parsed = PartialFilter::parse(&filter).unwrap_or_else(|e| panic!("{filter}: {e}"));
+            assert_eq!(PartialFilter::parse(&parsed.to_document()).unwrap(), parsed, "{filter}");
         }
-        assert!(PartialFilter::parse(&doc! { "v": { "$gt": 1.5 } }).is_ok());
+    }
+
+    #[test]
+    fn a_decimal128_bound_decides_by_exact_value() {
+        // Not "equal to every number": the comparator places the decimal by
+        // its value, so the filter selects exactly what `find` would.
+        let gt = PartialFilter::parse(&doc! { "v": { "$gt": dec("1.5") } }).unwrap();
+        for selected in [Bson::Int32(2), Bson::Double(1.6), dec("1.5000000000000001"), dec("2E0")] {
+            assert!(gt.selects(&doc! { "v": selected.clone() }), "{selected:?} > 1.5");
+        }
+        for not in [Bson::Double(1.5), dec("1.50"), Bson::Int64(1), dec("-Infinity"), dec("NaN")] {
+            assert!(!gt.selects(&doc! { "v": not.clone() }), "{not:?} is not > 1.5");
+        }
+        let eq = PartialFilter::parse(&doc! { "v": dec("1.5") }).unwrap();
+        assert!(eq.selects(&doc! { "v": 1.5 }), "1.5 is exactly representable in binary");
+        assert!(eq.selects(&doc! { "v": dec("1.500") }), "one cohort, one value");
+        assert!(!eq.selects(&doc! { "v": 999_999 }), "no longer equal to every number");
+        let tenth = PartialFilter::parse(&doc! { "v": dec("0.1") }).unwrap();
+        assert!(!tenth.selects(&doc! { "v": 0.1 }), "the double 0.1 is not one tenth");
+        // A query bound on the decimal is contained exactly at its edge.
+        let gte = PartialFilter::parse(&doc! { "v": { "$gte": dec("1.5") } }).unwrap();
+        let q = |op| vec![("v".to_string(), op)];
+        assert!(gte.covered_by(&q(PartialOp::Gt(Bson::Double(1.5)))));
+        assert!(gte.covered_by(&q(PartialOp::Eq(dec("1.50")))));
+        assert!(!gte.covered_by(&q(PartialOp::Gte(Bson::Double(1.4999999)))));
     }
 }

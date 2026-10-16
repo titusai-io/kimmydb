@@ -1770,6 +1770,13 @@ impl TelemetryGuard {
         );
         observe!(
             u64_observable_gauge,
+            "kimmy.decimal128_id_present",
+            "1",
+            "1 once a document whose _id is a Decimal128 has been written or applied on this member: the marker a rollback reads (ADR-238).",
+            decimal128_id_present
+        );
+        observe!(
+            u64_observable_gauge,
             "kimmy.sync.divergence_repair_enabled",
             "1",
             "1 when cluster.divergence_repair is on, 0 when this member only detects.",

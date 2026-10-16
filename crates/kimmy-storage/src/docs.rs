@@ -248,11 +248,13 @@ impl WriteScope<'_> {
 }
 
 /// An insert that has passed every check and is not yet written: its id, its
-/// key and its encoded body.
+/// key and its encoded body, and whether its stored `_id` is a `Decimal128`
+/// (ADR-238), for the write to set the marker in the same transaction.
 struct CheckedInsert {
     id: DocId,
     key: Vec<u8>,
     body: Vec<u8>,
+    decimal128_id: bool,
 }
 
 impl Engine {
@@ -570,6 +572,15 @@ impl Engine {
                 (id, value)
             }
         };
+        // The first of the three chokepoints (ADR-238): a row whose stored
+        // `_id` is a `Decimal128` is created only where every member can hold
+        // it. Keyed on the type of the value stored, not on the `DocId`, which
+        // is an `Int64` for an integral decimal whose body keeps the decimal.
+        // Before anything is checked or filed, so a refusal costs nothing.
+        let decimal128_id = crate::decimal128_gate::id_value_is_decimal128(&id_value);
+        if decimal128_id {
+            self.refuse_unless_decimal128_allowed(kimmy_core::Decimal128Use::Id)?;
+        }
         let doc = with_id_first(doc, id_value);
 
         let key = doc_key(&id)?;
@@ -594,7 +605,7 @@ impl Engine {
         // entries with the rest.
         let newly_multikey = index::maintain(self, txn, coll, None, Some(&doc), &key)?;
         index::mark_multikey(txn, &coll.db, &coll.name, &newly_multikey)?;
-        Ok(CheckedInsert { id, key, body })
+        Ok(CheckedInsert { id, key, body, decimal128_id })
     }
 
     /// The half of an insert that writes: the stamp, the record and the oplog
@@ -605,7 +616,7 @@ impl Engine {
         coll: &CollectionMeta,
         checked: CheckedInsert,
     ) -> Result<(DocId, OplogEntry)> {
-        let CheckedInsert { id, key, body } = checked;
+        let CheckedInsert { id, key, body, decimal128_id } = checked;
         // Minted once the write is certain to be made, under the writer
         // (ADR-148): a refused insert is not an event, so it does not tick
         // the clock.
@@ -620,6 +631,10 @@ impl Engine {
                 &key,
                 &codec::encode_doc_record(&record),
             )?;
+        }
+        // In the transaction that writes the row (ADR-238).
+        if decimal128_id {
+            crate::decimal128_gate::mark_in_txn(txn, &stamp)?;
         }
 
         let entry = OplogEntry {
@@ -729,6 +744,7 @@ impl Engine {
             };
             let stored_id = stored_doc.as_ref().and_then(|d| d.get(ID_FIELD));
             let id_value = replace_id_value(id, stored_id, doc.get(ID_FIELD));
+            let decimal128_id = crate::decimal128_gate::id_value_is_decimal128(&id_value);
             let doc = with_id_first(doc, id_value);
             let body = bson::serialize_to_vec(&doc)?;
             // The previous image is needed to remove the index entries it
@@ -757,6 +773,14 @@ impl Engine {
                     WriteOutcome { matched: true, modified: false, upserted: false, stamp: None };
                 return Ok((unchanged, None));
             }
+            // The second chokepoint (ADR-238): a replace that **creates** a
+            // row whose stored `_id` is a `Decimal128`. One over a live
+            // document keeps the stored `_id` (`replace_id_value`) and creates
+            // nothing, so a document replicated from a member whose key is
+            // set can still be replaced here when this one's is not.
+            if decimal128_id && !existed {
+                self.refuse_unless_decimal128_allowed(kimmy_core::Decimal128Use::Id)?;
+            }
 
             // Same transaction as the document write, so the index cannot
             // describe a state that never existed. A unique violation returns
@@ -777,6 +801,13 @@ impl Engine {
                 &key,
                 &codec::encode_doc_record(&record),
             )?;
+            drop(docs);
+            // Whenever the row written holds one, not only when it is
+            // created: a store that met one before it ran 0.51 has no marker
+            // yet, and the write is the first chance to say so (ADR-238).
+            if decimal128_id {
+                crate::decimal128_gate::mark_in_txn(txn, &stamp)?;
+            }
             (existed, stamp, body)
         };
 
@@ -1196,6 +1227,11 @@ impl Engine {
                 drop(docs);
                 if owed && crate::engine::delete_entry_is_owed(txn, &entry.stamp)? {
                     // No document, index or count write: the tombstone stands.
+                    // The entry joins this member's oplog, and a decimal id in
+                    // it is one an older member cannot decode (ADR-238).
+                    if matches!(id, DocId::Decimal128(_)) {
+                        crate::decimal128_gate::mark_in_txn(txn, &entry.stamp)?;
+                    }
                     let released = crate::engine::append_oplog_at(txn, entry, position)?;
                     self.witness(&entry.stamp);
                     return Ok(RemoteApplied::Applied { id, violations: Vec::new(), released });
@@ -1243,6 +1279,23 @@ impl Engine {
             // multikey flag an earlier entry set is seen by the next one even
             // though `coll` was resolved from the last committed state.
             let next = winner.document()?;
+            // The marker (ADR-238), on apply as well as on creation, and keyed
+            // on the BSON type of the body's `_id`: an integral decimal arrives
+            // as a `DocId::Int64` whose body keeps the decimal, which an older
+            // member fails on as surely as on the new variant. A body-less
+            // winner (a delete) is judged by its `DocId`, the only id it has,
+            // which this member's oplog now carries. Every replicated route
+            // shares this function: entries, `All` and scoped pages, the
+            // deletes a page carries, and `Converge` rows applied or created.
+            let decimal128_id = match next.as_ref() {
+                Some(doc) => {
+                    doc.get(ID_FIELD).is_some_and(crate::decimal128_gate::id_value_is_decimal128)
+                }
+                None => matches!(id, DocId::Decimal128(_)),
+            };
+            if decimal128_id {
+                crate::decimal128_gate::mark_in_txn(txn, &entry.stamp)?;
+            }
             let (violations, newly_multikey) =
                 index::maintain_remote(self, txn, coll, previous.as_ref(), next.as_ref(), &key)?;
             // A replicated array write makes this node's index multikey exactly

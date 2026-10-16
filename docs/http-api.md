@@ -225,6 +225,19 @@ curl -XDELETE localhost:7878/v1/db/shop/coll/orders/docs/42 -H "$A"
 The `{id}` segment is interpreted by shape: 24 hex characters → ObjectId, an
 integer → integer, anything else → string.
 
+**A `Decimal128` `_id` is reachable by these routes only when it is an
+integer** ([ADR-238](decisions.md)). An integral one in the 64-bit range is the
+integer id of its value: `{"_id": {"$numberDecimal": "5"}}` is the document at
+`docs/5`, and its body keeps the decimal as written. A non-integer one
+(`{"$numberDecimal": "1.5"}`), or one outside the 64-bit range, has no path
+form, since the segment is never read as a decimal: such a document is reached
+through a filter on `_id` only (`find`, `update`, `delete`, `find_and_modify`).
+Creating a document whose `_id` is a `Decimal128`, by any route, is refused
+`400 bad_request` naming `cluster.decimal128` until the operator has set it
+and every live member can hold one
+([Operations](operations.md#clusterdecimal128-and-the-marker)); so is creating
+an index whose `partialFilterExpression` holds a `Decimal128`.
+
 `PUT` returns `{"matched": 0|1, "modified": 0|1, "upserted": true|false}` —
 **counts**, as `update` and `find_and_modify` return, even though a replace
 touches at most one document. Replacement is **not** a merge — unnamed fields
@@ -864,13 +877,16 @@ Full detail in [Change Streams](change-streams.md).
 
 ```bash
 curl localhost:7878/healthz    # {"status":"ok"}
-curl localhost:7878/readyz     # {"status":"ready","node":"9d5200f2-…"}
+curl localhost:7878/readyz     # {"status":"ready","node":"9d5200f2-…","decimal128_id_present":false}
 curl localhost:7878/metrics    # Prometheus text format
 ```
 
 All three are unauthenticated so a load balancer can probe them without
 credentials. `/healthz` is liveness; `/readyz` proves the storage engine
 actually responds, so a node with a wedged database is taken out of rotation.
+A ready answer carries `decimal128_id_present`: whether a document whose `_id`
+is a `Decimal128` has ever been written or applied on this member, the marker
+a rollback reads ([Operations](operations.md#clusterdecimal128-and-the-marker)).
 
 **A node answers these from the moment it binds its port, before its store is
 open** ([ADR-198](decisions.md)). Until the store is open `/healthz` is `200`
@@ -896,7 +912,7 @@ and `owed_members`, the node ids of the members that owe the replay, sorted (nev
 empty under `owed_replay`):
 
 ```json
-{"status":"ready","node":"9d5200f2-…","catching_up":"unknown",
+{"status":"ready","node":"9d5200f2-…","decimal128_id_present":false,"catching_up":"unknown",
  "unknown_because":"owed_replay","owed_members":["4c1e07a9-…"]}
 ```
 
