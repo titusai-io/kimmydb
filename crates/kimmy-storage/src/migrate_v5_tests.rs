@@ -604,6 +604,9 @@ fn item(id: i64) -> Document {
         1_020 => {
             d.insert("email2", "solo");
             d.insert("balance", dec("10"));
+            // Selected now, and an array at `arr_when_rich`'s path: the
+            // rebuild makes that index multikey, which 0.50's never was.
+            d.insert("arr", vec![1, 2]);
         }
         1_021 => {
             d.insert("email2", "neg");
@@ -612,6 +615,7 @@ fn item(id: i64) -> Document {
         1_022 => {
             d.insert("email2", "plain");
             d.insert("balance", 7);
+            d.insert("arr", 5);
         }
         // TTL: 0.50 ranked a decimal equal to 3, so `$lt: 3` did not select it
         // and `$gte: 3` did; exactly, both answers turn round.
@@ -659,6 +663,19 @@ pub(crate) fn fixture() -> Fixture {
             None,
             doc! {"balance": {"$gt": 0}},
         );
+        partial(
+            &engine,
+            "items",
+            "arr_when_rich",
+            vec![IndexField::ascending("arr")],
+            false,
+            None,
+            doc! {"balance": {"$gt": 0}},
+        );
+        // A dropped index: its tombstone is one of the tables the rebuild leaves
+        // alone.
+        index(&engine, "items", "dropme", vec![IndexField::ascending("s")], false);
+        assert!(engine.drop_index("shop", "items", "dropme").unwrap());
         partial(
             &engine,
             "items",
@@ -882,18 +899,21 @@ fn to_schema_4(path: &Path, ids: &BTreeMap<u64, BTreeSet<i64>>) -> BTreeMap<(u64
     old_multikey
 }
 
+/// What a 0.50.0 build calls itself in a sidecar. A build of the 0.50.0
+/// release and not this one, whatever this branch's own version says until the
+/// release bumps it: the horizon's reset is decided by the two differing.
+const V050: &str = "0.50.0+release";
+
 /// The sidecar a 0.50.0 node writes.
 fn v050_sidecar() -> crate::format::Sidecar {
-    let mut sidecar = crate::format::stamp(4, &v050());
-    sidecar.written_by = "0.50.0".into();
-    sidecar
+    crate::format::stamp(4, &v050())
 }
 
 /// The versions a 0.50.0 build carries.
 pub(crate) fn v050() -> crate::format::BuildVersions {
     crate::format::BuildVersions {
         schema: 4,
-        written_by: "0.50.0".into(),
+        written_by: V050.into(),
         ..crate::format::BuildVersions::ours()
     }
 }
@@ -1202,4 +1222,993 @@ pub(crate) fn rewind_keys_to_v1(txn: &redb::WriteTransaction) {
     for (c, i, k, d) in &held {
         entries.insert((*c, *i, k.as_slice(), v1_of(d).as_slice()), ()).unwrap();
     }
+}
+
+use crate::migrate_v5::{
+    Collision, DOCS_REKEYED, INDEX_STEPS, IndexMark, Phase, RANGE_PHASES, RangeMark, Step, hooks,
+};
+
+/// Chunk sizes for the migrations this thread runs: rows per re-key chunk and
+/// entry bytes per drain or refill chunk.
+fn chunks(rows: usize, bytes: usize) {
+    hooks::REKEY_ROWS.with(|c| c.set(Some(rows)));
+    hooks::INDEX_BYTES.with(|c| c.set(Some(bytes)));
+}
+
+/// The markers a killed migration left, read without writing.
+fn phases(path: &Path) -> (BTreeMap<u64, RangeMark>, BTreeMap<(u64, u32), IndexMark>) {
+    let db = read_only(path);
+    let ranges = rows(&db, RANGE_PHASES)
+        .into_iter()
+        .map(|(k, v)| (u64::from_le_bytes(k.try_into().unwrap()), RangeMark::decode(&v).unwrap()))
+        .collect();
+    let txn = db.begin_read().unwrap();
+    let indexes = match txn.open_table(INDEX_STEPS) {
+        Ok(t) => t
+            .iter()
+            .unwrap()
+            .map(|r| {
+                let (k, v) = r.unwrap();
+                (k.value(), IndexMark::decode(v.value()).unwrap())
+            })
+            .collect(),
+        Err(_) => BTreeMap::new(),
+    };
+    (ranges, indexes)
+}
+
+/// **I-DOCS**, read from a store a migration was killed in: in every range the
+/// rows in `DOCS` and in the staging table are each in the form the range's
+/// phase says -- schema 4 in `DOCS` while `rekeying` (and before the first
+/// commit), schema 5 everywhere after -- every fixture id is held exactly once
+/// across the two, and each row holds that id's own record. A key is matched
+/// only as the exact key of a known id in the expected form, so the pair whose
+/// keys cross between the schemas (A2) cannot pass in the wrong form: its row
+/// would hold the other document's record.
+fn assert_i_docs(
+    path: &Path,
+    f: &Fixture,
+    reference: &BTreeMap<(u64, Vec<u8>), Vec<u8>>,
+    at: usize,
+) {
+    let db = read_only(path);
+    let docs = docs_of(&db);
+    let staged: BTreeMap<(u64, Vec<u8>), Vec<u8>> = {
+        let txn = db.begin_read().unwrap();
+        match txn.open_table(DOCS_REKEYED) {
+            Ok(t) => t
+                .iter()
+                .unwrap()
+                .map(|r| {
+                    let (k, v) = r.unwrap();
+                    ((k.value().0, k.value().1.to_vec()), v.value().to_vec())
+                })
+                .collect(),
+            Err(_) => BTreeMap::new(),
+        }
+    };
+    let (ranges, _) = phases(path);
+    for (&coll, ids) in &f.ids {
+        let as_v1: BTreeMap<Vec<u8>, i64> = ids.iter().map(|&id| (v1::int64(id), id)).collect();
+        let as_v2: BTreeMap<Vec<u8>, i64> = ids.iter().map(|&id| (v1::v2_int64(id), id)).collect();
+        let phase = ranges.get(&coll).map(|m| m.phase);
+        let (in_docs, in_staging) = match phase {
+            None | Some(Phase::Rekeying) => (&as_v1, &as_v2),
+            Some(Phase::MovingBack) | Some(Phase::Done) => (&as_v2, &as_v2),
+        };
+        let mut seen = BTreeSet::new();
+        let mut check = |form: &BTreeMap<Vec<u8>, i64>, key: &[u8], record: &[u8], where_: &str| {
+            let id = *form.get(key).unwrap_or_else(|| {
+                panic!("killed at {at}: {where_} of {coll} holds {key:02x?}, not in the form {phase:?} says")
+            });
+            assert!(seen.insert(id), "killed at {at}: {id} held twice");
+            assert_eq!(
+                record,
+                reference[&(coll, v1::v2_int64(id))].as_slice(),
+                "killed at {at}: the row of {id} holds another record"
+            );
+        };
+        for ((c, key), record) in docs.range((coll, vec![0x20])..(coll, vec![0x21])) {
+            assert_eq!(*c, coll);
+            check(in_docs, key, record, "docs");
+        }
+        for ((c, key), record) in staged.range((coll, Vec::new())..(coll + 1, Vec::new())) {
+            assert_eq!(*c, coll);
+            assert_ne!(phase, Some(Phase::Done), "killed at {at}: a done range has staged rows");
+            check(in_staging, key, record, "the staging table");
+        }
+        assert_eq!(&seen, ids, "killed at {at}: rows of {coll} lost");
+    }
+}
+
+/// What a killed migration was in the middle of, for the coverage the kill
+/// test claims.
+fn where_killed(path: &Path, f: &Fixture) -> BTreeSet<&'static str> {
+    let (ranges, indexes) = phases(path);
+    let mut out = BTreeSet::new();
+    for (coll, mark) in &ranges {
+        let total = f.ids.get(coll).map_or(0, |ids| ids.len()) as u64;
+        match mark.phase {
+            Phase::Rekeying if mark.out > 0 => {
+                out.insert("mid re-key");
+            }
+            Phase::MovingBack if mark.back == 0 => {
+                assert_eq!(mark.out, total, "every row moved out before any moves back");
+                out.insert("between the last re-key chunk and the first move-back chunk");
+            }
+            Phase::MovingBack => {
+                out.insert("mid move-back");
+            }
+            _ => {}
+        }
+    }
+    for mark in indexes.values() {
+        match &mark.step {
+            Step::Draining => {
+                out.insert("mid drain");
+            }
+            Step::Refilling { after: Some(_) } => {
+                out.insert("mid refill");
+            }
+            Step::Refilling { after: None } => {
+                out.insert("between the drain and the refill");
+            }
+            _ => {}
+        }
+    }
+    out
+}
+
+#[test]
+fn killed_at_every_commit_the_migration_resumes_to_the_store_this_build_writes() {
+    // The guard on resumability: the migration killed before each of its
+    // commits in turn, I-DOCS read from what each kill left, and the next open
+    // finishing to the reference, byte for byte. Small chunks, so every phase
+    // is cut part-way. The cursor must be the one in the store: the work the
+    // two runs do together is the clean run's and at most one chunk.
+    chunks(9, 1_500);
+    let f = fixture();
+    let reference = read_only(&f.reference);
+    let reference_docs = docs_of(&reference);
+    let standing: BTreeSet<u64> = metas_of(&reference).keys().copied().collect();
+    let reference_entries = entries_of(&reference, &standing);
+    drop(reference);
+    let (commits, refilled) = {
+        let path = f.copy();
+        let (before, walked) = (hooks::commits(), hooks::documents_refilled());
+        drop(Engine::open(&path).unwrap());
+        (hooks::commits() - before, hooks::documents_refilled() - walked)
+    };
+    assert!(commits > 40, "premise: many commits ({commits})");
+    let mut seen = BTreeSet::new();
+    for at in 1..=commits {
+        let path = f.copy();
+        let walked = hooks::documents_refilled();
+        hooks::fail_at_commit(at);
+        assert!(Engine::open(&path).is_err(), "premise: the failure was reached at {at}");
+        seen.extend(where_killed(&path, &f));
+        assert_i_docs(&path, &f, &reference_docs, at);
+        assert_multikey_with_its_entries(&path, at);
+        let engine = Engine::open(&path).unwrap();
+        assert_eq!(docs_of(engine.db()), reference_docs, "killed at {at}: DOCS");
+        assert_eq!(
+            entries_of(engine.db(), &standing),
+            reference_entries,
+            "killed at {at}: INDEX_ENTRIES"
+        );
+        assert!(!crate::migrate_v5::unfinished(engine.db()).unwrap(), "killed at {at}: finished");
+        drop(engine);
+        let both = hooks::documents_refilled() - walked;
+        assert!(
+            both <= refilled + hooks::largest_refill_chunk(),
+            "killed at {at}: the two runs refilled {both} documents, the clean run {refilled}: the \
+             resume did not start at the cursor its last commit left"
+        );
+        std::fs::remove_file(&path).unwrap();
+    }
+    for wanted in [
+        "mid re-key",
+        "between the last re-key chunk and the first move-back chunk",
+        "mid move-back",
+        "mid drain",
+        "between the drain and the refill",
+        "mid refill",
+    ] {
+        assert!(seen.contains(wanted), "no kill landed {wanted}: {seen:?}");
+    }
+}
+
+#[test]
+fn the_a2_pair_keeps_both_documents() {
+    // The schema 5 key of A2.0 is the schema 4 key of A2.1. Re-keyed in place,
+    // the first to move (A2.0 sorts first) would land on the second's row and
+    // replace it. Staged, both survive, each under its own new key.
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("kimmy.redb");
+    {
+        let engine = Engine::open(&path).unwrap();
+        let pair = engine.create_collection("shop", "pair").unwrap();
+        engine
+            .insert_many(
+                &pair,
+                vec![doc! {"_id": A2.0, "who": "a"}, doc! {"_id": A2.1, "who": "b"}],
+            )
+            .unwrap();
+    }
+    {
+        let db = Database::create(&path).unwrap();
+        let txn = db.begin_write().unwrap();
+        rewind_keys_to_v1(&txn);
+        txn.open_table(tables::META)
+            .unwrap()
+            .insert(tables::META_FORMAT_VERSION, [4u8].as_slice())
+            .unwrap();
+        txn.commit().unwrap();
+    }
+    let docs = docs_of(&read_only(&path));
+    let coll = CollectionId::derive("shop", "pair").0;
+    assert_eq!(
+        docs.keys().filter(|(c, _)| *c == coll).cloned().collect::<BTreeSet<_>>(),
+        BTreeSet::from([(coll, v1::int64(A2.0)), (coll, v1::int64(A2.1))]),
+        "premise: both under their schema 4 keys"
+    );
+    chunks(1, 1_000);
+    let engine = Engine::open(&path).unwrap();
+    let pair = engine.get_collection("shop", "pair").unwrap();
+    for (id, who) in [(A2.0, "a"), (A2.1, "b")] {
+        let doc = engine.get(&pair, &DocId::Int64(id)).unwrap().expect("both survive");
+        assert_eq!(doc.get_str("who").unwrap(), who, "{id:#x} holds its own document");
+    }
+    assert_eq!(engine.count(&pair, crate::WalkScope::Request).unwrap(), 2);
+}
+
+/// No index holds a document's two or more keyed entries while its definition
+/// says it is not multikey: the flag lands in the commit of the chunk that
+/// wrote the entries, never later (design 6.2, review v2.2 m3). Sound one way
+/// only (an empty array is multikey with one entry), which is the way that
+/// loses rows.
+fn assert_multikey_with_its_entries(path: &Path, at: usize) {
+    let db = read_only(path);
+    let metas = metas_of(&db);
+    let standing: BTreeSet<u64> = metas.keys().copied().collect();
+    let mut keyed: BTreeMap<(u64, u32, Vec<u8>), usize> = BTreeMap::new();
+    for (c, i, k, d) in entries_of(&db, &standing) {
+        if !crate::index::is_sentinel(&k) {
+            *keyed.entry((c, i, d)).or_default() += 1;
+        }
+    }
+    for ((c, i, d), n) in keyed {
+        let index = metas[&c].index_by_id(i).unwrap();
+        assert!(
+            n < 2 || index.multikey,
+            "killed at {at}: {} holds {n} entries of {d:02x?} and says it is not multikey",
+            index.name
+        );
+    }
+}
+
+/// Every `Int64` id a store this build wrote holds, by collection id.
+fn ids_of(path: &Path) -> BTreeMap<u64, BTreeSet<i64>> {
+    let mut out: BTreeMap<u64, BTreeSet<i64>> = BTreeMap::new();
+    for (c, key) in docs_of(&read_only(path)).into_keys() {
+        if let Some(id) = v2_int64_of(&key) {
+            out.entry(c).or_default().insert(id);
+        }
+    }
+    out
+}
+
+/// A schema 4 store: written by this build's engine with `build`, then each
+/// `(collection, id, body)` of `edit` put in place of that document's body by a
+/// raw write, keeping its stamp -- what a replicated write can leave on 0.50
+/// that a local one would be refused -- and taken back to schema 4.
+fn small_schema_4(
+    build: impl FnOnce(&Engine),
+    edit: &[(&str, i64, Document)],
+) -> (tempfile::TempDir, PathBuf) {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("kimmy.redb");
+    {
+        let engine = Engine::open(&path).unwrap();
+        build(&engine);
+    }
+    {
+        let db = Database::create(&path).unwrap();
+        let txn = db.begin_write().unwrap();
+        {
+            let mut docs = txn.open_table(tables::DOCS).unwrap();
+            for (coll, id, body) in edit {
+                let c = CollectionId::derive("shop", coll).0;
+                let key = v1::v2_int64(*id);
+                let mut record = codec::decode_doc_record(
+                    docs.get((c, key.as_slice())).unwrap().expect("the document to edit").value(),
+                )
+                .unwrap();
+                record.body = bson::serialize_to_vec(body).unwrap();
+                docs.insert((c, key.as_slice()), codec::encode_doc_record(&record).as_slice())
+                    .unwrap();
+            }
+        }
+        txn.commit().unwrap();
+    }
+    let ids = ids_of(&path);
+    to_schema_4(&path, &ids);
+    (dir, path)
+}
+
+/// A copy of a closed store beside it.
+fn copy_beside(path: &Path, name: &str) -> PathBuf {
+    let copy = path.with_file_name(format!("{name}.redb"));
+    copy_store(path, &copy);
+    copy
+}
+
+/// How many migration commits a clean run of a copy of `path` makes.
+fn clean_commits(path: &Path) -> usize {
+    let before = hooks::commits();
+    drop(Engine::open(&copy_beside(path, "clean")).unwrap());
+    hooks::commits() - before
+}
+
+/// The store and its sidecar, as bytes.
+fn snapshot(path: &Path) -> (Vec<u8>, Option<Vec<u8>>) {
+    (std::fs::read(path).unwrap(), std::fs::read(crate::format::sidecar_path(path)).ok())
+}
+
+/// An older build refuses the store, and nothing in it changes.
+fn assert_refused_untouched(path: &Path, build: &crate::format::BuildVersions, what: &str) {
+    let before = snapshot(path);
+    match crate::format::check_before_open_with(path, build) {
+        Err(crate::StorageError::RefusedStore { .. }) => {}
+        other => panic!("{what}: the check did not refuse: {other:?}"),
+    }
+    assert!(Engine::open_as(path, None, build).is_err(), "{what}: the open did not refuse");
+    assert!(snapshot(path) == before, "{what}: the store or its sidecar changed");
+}
+
+/// The versions a 0.49 build carries.
+fn v049() -> crate::format::BuildVersions {
+    crate::format::BuildVersions { written_by: "0.49.3".into(), ..v050() }
+}
+
+#[test]
+fn a_050_or_049_build_refuses_the_store_from_raise_5() {
+    // The rollback boundary is `raise(5)`, immediately before the first commit
+    // (design 6.1, 6.5 item 1): from it the sidecar refuses an older build;
+    // from the first commit META does too, which is what refuses a copy whose
+    // sidecar is gone.
+    let f = fixture();
+    let items = CollectionId::derive("shop", "items").0;
+    for (name, build) in [("0.50", v050()), ("0.49", v049())] {
+        // Killed after `raise(5)` and before the first commit.
+        let path = f.copy();
+        hooks::fail_at_commit(1);
+        assert!(Engine::open(&path).is_err(), "premise: the first commit failed");
+        assert_eq!(crate::format::read_sidecar(&path).unwrap().schema, 5, "raised");
+        assert_eq!(version(&read_only(&path)), Some(4), "premise: before the first commit");
+        assert_refused_untouched(&path, &build, &format!("{name}, raised, with the sidecar"));
+        // With no sidecar, META says 4 and nothing of the migration was
+        // written: it is the store the previous build left, and it opens it.
+        std::fs::remove_file(crate::format::sidecar_path(&path)).unwrap();
+        assert!(crate::format::check_before_open_with(&path, &build).is_ok(), "{name}");
+        assert!(!has_table(&path, "schema5_docs_phases"));
+        assert!(docs_of(&read_only(&path)).contains_key(&(items, v1::int64(1_000))));
+
+        // Killed after the first commit: refused with the sidecar, and without.
+        let path = f.copy();
+        hooks::fail_at_commit(2);
+        assert!(Engine::open(&path).is_err(), "premise: the second commit failed");
+        assert_eq!(version(&read_only(&path)), Some(5), "the version went down first");
+        assert_refused_untouched(&path, &build, &format!("{name}, first commit, sidecar"));
+        std::fs::remove_file(crate::format::sidecar_path(&path)).unwrap();
+        assert_refused_untouched(&path, &build, &format!("{name}, first commit, no sidecar"));
+        // And this build resumes it.
+        drop(Engine::open(&path).unwrap());
+    }
+}
+
+#[test]
+fn the_preflight_refuses_with_the_figures_and_leaves_a_store_0_50_opens() {
+    let f = fixture();
+    let path = f.copy();
+    let items = CollectionId::derive("shop", "items").0;
+    hooks::FREE.with(|c| c.set(Some(100 << 20)));
+    let (err, logs) = crate::log_capture::logged(|| Engine::open(&path).err());
+    hooks::FREE.with(|c| c.set(None));
+    let err = err.expect("refused");
+    match &err {
+        crate::StorageError::Io(e) if e.kind() == std::io::ErrorKind::StorageFull => {}
+        other => panic!("the wrong refusal: {other}"),
+    }
+    let message = err.to_string();
+    for wanted in
+        ["needs", "MiB free", "100 MiB is free", "growth step of 2048 MiB", "Nothing was written"]
+    {
+        assert!(message.contains(wanted), "{wanted:?} not in: {message}");
+    }
+    // The plan was announced before the refusal: what it would do.
+    for wanted in
+        ["collections=3", "ranges=3", "purge_pending_ranges=1", "indexes=", "required_free_mib="]
+    {
+        assert!(logs.contains(wanted), "{wanted:?} not in the announcement: {logs}");
+    }
+    // Nothing of the migration was written: the version, the keys, the
+    // sidecar's schema and author are where 0.50 left them, and its check
+    // passes.
+    let db = read_only(&path);
+    assert_eq!(version(&db), Some(4));
+    assert!(docs_of(&db).contains_key(&(items, v1::int64(1_000))), "still schema 4 keys");
+    drop(db);
+    for table in [
+        "schema5_docs_phases",
+        "schema5_index_steps",
+        "schema5_docs_rekeyed",
+        "schema5_unique_collisions",
+    ] {
+        assert!(!has_table(&path, table), "{table} exists after a refusal");
+    }
+    let sidecar = crate::format::read_sidecar(&path).unwrap();
+    assert_eq!((sidecar.schema, sidecar.written_by.as_str()), (4, V050));
+    assert!(crate::format::check_before_open_with(&path, &v050()).is_ok());
+    // With the space, the next start migrates.
+    hooks::FREE.with(|c| c.set(Some(1 << 40)));
+    drop(Engine::open(&path).unwrap());
+    hooks::FREE.with(|c| c.set(None));
+    assert_eq!(version(&read_only(&path)), Some(5));
+}
+
+#[test]
+fn the_requirement_is_the_growth_step_and_a_working_set_from_the_tables() {
+    // Read without a walk: the tables' own counts and the file's size.
+    let f = fixture();
+    let path = f.copy();
+    let plan = {
+        let db = Database::create(&path).unwrap();
+        crate::migrate_v5::preflight(&db, &path).unwrap()
+    };
+    assert_eq!(plan.collections, 3, "items, strs and empty: gone was dropped");
+    assert_eq!(plan.purge_pending, 1, "the dropped collection's rows");
+    assert_eq!(plan.ranges, 3, "items, gone and strs hold rows; empty holds none");
+    let rows: usize = f.ids.values().map(BTreeSet::len).sum::<usize>() + 9;
+    assert_eq!(plan.docs_rows, rows as u64);
+    assert!(plan.required_bytes > crate::migrate_v5::REDB_GROWTH_STEP_MIB << 20);
+    assert!(
+        plan.required_bytes < (crate::migrate_v5::REDB_GROWTH_STEP_MIB << 20) + (1 << 30),
+        "a working set, not a copy of the store: {}",
+        plan.required_bytes
+    );
+}
+
+#[test]
+fn a_numeric_key_no_build_wrote_is_refused() {
+    // `decode_v1` is strict: a key with the number tag that is not exactly the
+    // schema 4 key of an `Int64` refuses the migration, loudly, rather than
+    // being re-keyed as the nearest id.
+    let f = fixture();
+    let path = f.copy();
+    let items = CollectionId::derive("shop", "items").0;
+    {
+        let db = Database::create(&path).unwrap();
+        let txn = db.begin_write().unwrap();
+        {
+            let mut docs = txn.open_table(tables::DOCS).unwrap();
+            let record =
+                docs.get((items, v1::int64(1_000).as_slice())).unwrap().unwrap().value().to_vec();
+            // 5 with its mantissa's top bit clear: no encoder writes it.
+            let bad = [0x20, 0x04, 0x80, 0x02, 0x50, 0, 0, 0, 0, 0, 0, 0];
+            docs.insert((items, bad.as_slice()), record.as_slice()).unwrap();
+        }
+        txn.commit().unwrap();
+    }
+    chunks(1_000, 1 << 20);
+    match Engine::open(&path) {
+        Err(crate::StorageError::Corrupt(why)) => {
+            assert!(why.contains("not the schema 4 key of any Int64 id"), "{why}")
+        }
+        Err(other) => panic!("the wrong refusal: {other}"),
+        Ok(_) => panic!("re-keyed a key no build wrote"),
+    }
+    assert!(crate::migrate_v5::unfinished(&Database::create(&path).unwrap()).unwrap());
+}
+
+#[test]
+fn a_schema_4_store_with_3_to_4_markers_loses_them_in_the_first_commit() {
+    // The 3 -> 4 markers on a store that never finished that migration: the
+    // first 4 -> 5 commit deletes them, so no schema 5 store holds them.
+    let f = fixture();
+    let path = f.copy();
+    let items = CollectionId::derive("shop", "items").0;
+    {
+        let db = Database::create(&path).unwrap();
+        let txn = db.begin_write().unwrap();
+        txn.open_table(crate::migrate_v5::PARTIAL_REBUILT)
+            .unwrap()
+            .insert((items, 7u32), ())
+            .unwrap();
+        txn.commit().unwrap();
+    }
+    assert!(has_table(&path, "partial_rebuilt_under_find"), "premise");
+    hooks::fail_at_commit(2);
+    assert!(Engine::open(&path).is_err());
+    assert_eq!(version(&read_only(&path)), Some(5));
+    assert!(!has_table(&path, "partial_rebuilt_under_find"), "gone with the first commit");
+    drop(Engine::open(&path).unwrap());
+    assert!(!has_table(&path, "partial_rebuilt_under_find"));
+}
+
+/// Build `shop.t`, with the given unique indexes created before the documents.
+fn unique_store(
+    indexes: &[(&str, &str, Option<Document>)],
+    docs: Vec<Document>,
+    edit: &[(&str, i64, Document)],
+) -> (tempfile::TempDir, PathBuf) {
+    small_schema_4(
+        |engine| {
+            let t = engine.create_collection("shop", "t").unwrap();
+            for (name, path, filter) in indexes {
+                match filter {
+                    Some(filter) => partial(
+                        engine,
+                        "t",
+                        name,
+                        vec![IndexField::ascending(*path)],
+                        true,
+                        None,
+                        filter.clone(),
+                    ),
+                    None => index(engine, "t", name, vec![IndexField::ascending(*path)], true),
+                }
+            }
+            engine.insert_many(&t, docs).unwrap();
+        },
+        edit,
+    )
+}
+
+#[test]
+fn a_finished_3_to_4_rebuilds_unreported_collisions_are_carried_and_reported_once() {
+    // A 0.50 store a crash left between its 3 -> 4 rebuild's last commit and
+    // the report: the recorded collisions are pending. One of them the exact
+    // comparator dissolves (the documents' decimal `tier` was "at least 3" only
+    // by ranking equal to 3), so only the carried row names it; the other the
+    // refill finds again under the schema 5 form of its key, and it is reported
+    // once, not twice.
+    let t = CollectionId::derive("shop", "t").0;
+    let (_dir, path) = unique_store(
+        &[("email_once", "email", Some(doc! {"tier": {"$gte": 3}})), ("num_once", "num", None)],
+        vec![
+            doc! {"_id": 1_i64, "email": "x", "tier": dec("1"), "num": 1},
+            doc! {"_id": 2_i64, "email": "y", "tier": dec("1"), "num": 2},
+            doc! {"_id": 5_i64, "email": "z", "num": 7},
+            doc! {"_id": 6_i64, "email": "w", "num": 8},
+        ],
+        &[
+            ("t", 2, doc! {"_id": 2_i64, "email": "x", "tier": dec("1"), "num": 2}),
+            ("t", 6, doc! {"_id": 6_i64, "email": "w", "num": 7}),
+        ],
+    );
+    let metas = metas_of(&read_only(&path));
+    let (email, num) =
+        (metas[&t].index("email_once").unwrap().id, metas[&t].index("num_once").unwrap().id);
+    {
+        let db = Database::create(&path).unwrap();
+        let txn = db.begin_write().unwrap();
+        {
+            let mut recorded =
+                txn.open_table(crate::migrate_v5::PARTIAL_REBUILT_VIOLATIONS).unwrap();
+            for (index, name, key, holders) in [
+                (email, "email_once", v1::encode(&Bson::String("x".into())).unwrap(), [1, 2]),
+                (num, "num_once", v1::encode(&Bson::Int32(7)).unwrap(), [5, 6]),
+            ] {
+                let row = crate::migrate::RecordedViolations {
+                    db: "shop".into(),
+                    collection: "t".into(),
+                    violations: vec![crate::index::UniqueViolation {
+                        index: name.into(),
+                        key,
+                        holders: holders.iter().map(|&id| v1::int64(id)).collect(),
+                    }],
+                };
+                recorded.insert((t, index), serde_json::to_vec(&row).unwrap().as_slice()).unwrap();
+            }
+        }
+        txn.commit().unwrap();
+    }
+    // The report reads what the migration recorded: stop just before it.
+    crate::migrate::hooks::fail_before_the_report();
+    assert!(Engine::open(&path).is_err(), "premise: stopped before the report");
+    assert!(!has_table(&path, "partial_rebuilt_unique_violations"), "carried, not kept");
+    let recorded =
+        crate::migrate_v5::recorded_collisions(&Database::create(&path).unwrap()).unwrap();
+    let mut named: Vec<(String, Vec<i64>)> = recorded
+        .iter()
+        .flat_map(|(_, violations)| violations.iter())
+        .map(|v| {
+            (
+                v.index.clone(),
+                v.holders.iter().map(|h| v2_int64_of(h).expect("schema 5 holders")).collect(),
+            )
+        })
+        .collect();
+    named.sort();
+    assert_eq!(
+        named,
+        vec![("email_once".to_string(), vec![1, 2]), ("num_once".to_string(), vec![5, 6])],
+        "each collision once, its holders in their schema 5 form"
+    );
+    let engine = Engine::open(&path).unwrap();
+    assert_eq!(engine.unique_violations(), 2, "both reported");
+    drop(engine);
+    let engine = Engine::open(&path).unwrap();
+    assert_eq!(engine.unique_violations(), 0, "and forgotten once reported");
+    drop(engine);
+    assert!(!has_table(&path, "schema5_unique_collisions"));
+}
+
+#[test]
+fn a_collision_is_recorded_in_its_chunks_commit_wherever_the_migration_is_killed() {
+    // A replication-merged duplicate on a 0.50 store: two documents share a
+    // unique key, which 0.50 already reported. The refill finds it again,
+    // whichever side of a resumed cursor each holder is on, and it is reported
+    // once more, once.
+    let docs: Vec<Document> = (1..=40_i64)
+        .map(|i| doc! {"_id": i, "email": format!("e{i}"), "pad": "p".repeat(40)})
+        .collect();
+    let (_dir, path) = unique_store(
+        &[("email_once", "email", None)],
+        docs,
+        &[
+            ("t", 5, doc! {"_id": 5_i64, "email": "dup", "pad": "p".repeat(40)}),
+            ("t", 30, doc! {"_id": 30_i64, "email": "dup", "pad": "p".repeat(40)}),
+        ],
+    );
+    let t = CollectionId::derive("shop", "t").0;
+    let email = metas_of(&read_only(&path))[&t].index("email_once").unwrap().id;
+    chunks(4, 160);
+    let commits = clean_commits(&path);
+    let dup = kimmy_core::keyenc::encode(&Bson::String("dup".into())).unwrap();
+    let mut sides = BTreeSet::new();
+    for at in 1..=commits {
+        let run = copy_beside(&path, &format!("run{at}"));
+        hooks::fail_at_commit(at);
+        assert!(Engine::open(&run).is_err(), "premise: killed at {at}");
+        let (_, steps) = phases(&run);
+        let recorded = rows(&read_only(&run), crate::migrate_v5::COLLISIONS);
+        let past = |id: i64| match steps.get(&(t, email)).map(|m| &m.step) {
+            Some(Step::Done) => true,
+            Some(Step::Refilling { after: Some(after) }) => *after >= v1::v2_int64(id),
+            _ => false,
+        };
+        // Where the committed cursor stood: before both, between, past both.
+        sides.insert((past(5), past(30)));
+        let row: Option<Collision> = recorded
+            .iter()
+            .find(|(k, _)| k.ends_with(&dup))
+            .map(|(_, v)| Collision::decode(v).unwrap());
+        if past(30) {
+            let row = row.unwrap_or_else(|| panic!("killed at {at}: past both, and not recorded"));
+            assert_eq!(row.holders, vec![v1::v2_int64(5), v1::v2_int64(30)], "killed at {at}");
+        } else {
+            assert!(row.is_none(), "killed at {at}: recorded before the refill reached it");
+        }
+        let engine = Engine::open(&run).unwrap();
+        assert_eq!(engine.unique_violations(), 1, "killed at {at}: reported once more");
+        drop(engine);
+        let engine = Engine::open(&run).unwrap();
+        assert_eq!(engine.unique_violations(), 0, "killed at {at}: and once");
+        drop(engine);
+    }
+    for side in [(false, false), (true, false), (true, true)] {
+        assert!(sides.contains(&side), "no kill left the cursor at {side:?}: {sides:?}");
+    }
+}
+
+#[test]
+fn the_money_field_collision_is_reported() {
+    // A partial unique index whose filter path holds a decimal: 0.50 filed both
+    // documents undecidable and enforced nothing. Decided exactly, both are
+    // selected, keyed under one email, and collide.
+    let (_dir, path) = unique_store(
+        &[("money_once", "email", Some(doc! {"balance": {"$gt": 0}}))],
+        vec![
+            doc! {"_id": 1_i64, "email": "x", "balance": dec("10")},
+            doc! {"_id": 2_i64, "email": "y", "balance": dec("10")},
+        ],
+        &[("t", 2, doc! {"_id": 2_i64, "email": "x", "balance": dec("10")})],
+    );
+    let t = CollectionId::derive("shop", "t").0;
+    let money = metas_of(&read_only(&path))[&t].index("money_once").unwrap().id;
+    let undecided = entries_of(&read_only(&path), &BTreeSet::from([t]))
+        .into_iter()
+        .filter(|(_, i, k, _)| *i == money && k.as_slice() == crate::index::UNDECIDABLE)
+        .count();
+    assert_eq!(undecided, 2, "premise: 0.50 decided neither");
+    let engine = Engine::open(&path).unwrap();
+    assert_eq!(engine.unique_violations(), 1, "the collision 0.50 never enforced");
+}
+
+#[test]
+fn a_dropped_collections_rows_are_re_keyed_and_the_purge_finishes() {
+    // A drop stopped mid-purge: rows under an id no collection stands over.
+    // Re-keyed with the rest, they are what the purger removes, folding each
+    // one's term out; it finishes, the name can be created again, the count
+    // and digest rows go, and a forced open walk completes over the result.
+    let f = fixture();
+    let path = f.copy();
+    let gone = f.gone;
+    let engine = Engine::open(&path).unwrap();
+    let held: Vec<Vec<u8>> =
+        docs_of(engine.db()).into_keys().filter(|(c, _)| *c == gone.0).map(|(_, k)| k).collect();
+    assert_eq!(held.len(), f.ids[&gone.0].len(), "premise: every row, tombstones too");
+    for key in &held {
+        assert!(v2_int64_of(key).is_some(), "{key:02x?} is not a schema 5 key");
+    }
+    assert!(engine.purge_dropped_collection(gone).unwrap() > 0);
+    assert_eq!(engine.rows_under(gone).unwrap(), 0, "the purge finished");
+    {
+        let txn = engine.db().begin_read().unwrap();
+        assert!(txn.open_table(tables::LIVE_COUNTS).unwrap().get(gone.0).unwrap().is_none());
+        assert!(txn.open_table(tables::LIVE_DIGESTS).unwrap().get(gone.0).unwrap().is_none());
+    }
+    engine.create_collection("shop", "gone").unwrap();
+    drop(engine);
+    drop(Engine::open_with(&path, &crate::OpenOptions::new().force_rebuild("a test")).unwrap());
+}
+
+#[test]
+fn the_rebuild_changes_no_definition_stamp_tombstone_or_entry_of_the_oplog() {
+    // Review m3: the rebuild writes INDEX_ENTRIES and the multikey bit, and
+    // nothing else a peer compares. A creation path that minted a stamp would
+    // put an index above the drop tombstones that refused it.
+    let f = fixture();
+    let path = f.copy();
+    let before = read_only(&path);
+    let (metas, digests): (BTreeMap<u64, CollectionMeta>, BTreeMap<u64, _>) = {
+        let metas = metas_of(&before);
+        let digests = metas
+            .iter()
+            .map(|(id, m)| (*id, crate::definition_digest::definition_digest(m)))
+            .collect();
+        (metas, digests)
+    };
+    let tables_before = (
+        rows(&before, tables::OPLOG),
+        rows(&before, tables::OPLOG_VERSIONS),
+        rows(&before, tables::OPLOG_WITNESSED),
+        rows(&before, tables::OPLOG_HELD),
+        rows(&before, tables::COLLECTIONS_DROPPED),
+        rows(&before, tables::INDEXES_DROPPED),
+        rows(&before, tables::LIVE_COUNTS),
+        rows(&before, tables::LIVE_DIGESTS),
+        rows(&before, tables::LIVE_DIGESTS_THROUGH),
+        rows(&before, tables::LIVE_COUNTS_THROUGH),
+    );
+    assert!(!tables_before.4.is_empty() && !tables_before.5.is_empty(), "premise: tombstones");
+    let meta_rows = |db: &redb::ReadOnlyDatabase| -> BTreeMap<Vec<u8>, Vec<u8>> {
+        rows(db, tables::META)
+            .into_iter()
+            .filter(|(k, _)| {
+                ![tables::META_FORMAT_VERSION, tables::META_TOMBSTONE_HORIZON]
+                    .iter()
+                    .any(|m| k.as_slice() == m.as_bytes())
+            })
+            .collect()
+    };
+    let meta_before = meta_rows(&before);
+    drop(before);
+    drop(Engine::open(&path).unwrap());
+    let after = read_only(&path);
+    let tables_after = (
+        rows(&after, tables::OPLOG),
+        rows(&after, tables::OPLOG_VERSIONS),
+        rows(&after, tables::OPLOG_WITNESSED),
+        rows(&after, tables::OPLOG_HELD),
+        rows(&after, tables::COLLECTIONS_DROPPED),
+        rows(&after, tables::INDEXES_DROPPED),
+        rows(&after, tables::LIVE_COUNTS),
+        rows(&after, tables::LIVE_DIGESTS),
+        rows(&after, tables::LIVE_DIGESTS_THROUGH),
+        rows(&after, tables::LIVE_COUNTS_THROUGH),
+    );
+    assert!(
+        tables_after == tables_before,
+        "the oplog, the vectors, the tombstones, the counts or the digests moved"
+    );
+    assert_eq!(meta_rows(&after), meta_before, "META, the refusal hints included");
+    for (id, meta) in metas_of(&after) {
+        let was = &metas[&id];
+        let unflag = |m: &CollectionMeta| {
+            let mut m = m.clone();
+            for index in &mut m.indexes {
+                index.multikey = false;
+            }
+            m
+        };
+        assert_eq!(unflag(&meta), unflag(was), "{}: only multikey may move", meta.name);
+        assert_eq!(
+            crate::definition_digest::definition_digest(&meta),
+            digests[&id],
+            "{}",
+            meta.name
+        );
+    }
+}
+
+#[test]
+fn the_horizon_reset_lands_before_raise_5() {
+    // Design 6.1, order at open: the ensure-tables commit resets the tombstone
+    // horizon (0.50.0 wrote the sidecar, so it is not this build's evidence),
+    // and only then does `raise(5)` name this build in the sidecar. Killed
+    // between `raise(5)` and the first commit, the reset is already there.
+    let f = fixture();
+    let path = f.copy();
+    let horizon = |path: &Path| {
+        let db = read_only(path);
+        let raw = rows(&db, tables::META);
+        raw.get(tables::META_TOMBSTONE_HORIZON.as_bytes())
+            .map(|v| kimmy_core::Hlc::from_bytes(v.as_slice().try_into().expect("an hlc")))
+    };
+    let was = horizon(&path).expect("premise: the reference kept a horizon");
+    let started = kimmy_core::Hlc::new(crate::physical_now_ms(), 0);
+    hooks::fail_at_commit(1);
+    assert!(Engine::open(&path).is_err());
+    let sidecar = crate::format::read_sidecar(&path).unwrap();
+    assert_eq!((sidecar.schema, sidecar.written_by), (5, kimmy_core::build::VERSION.to_string()));
+    let reset = horizon(&path).unwrap();
+    assert!(reset >= started && reset > was, "the reset landed before raise(5): {was} -> {reset}");
+}
+
+/// Writers on another store in the same directory, as long as `stop` is clear:
+/// the disk and the scheduler busy beside a migration.
+fn background_writers(
+    dir: &Path,
+    stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
+) -> Vec<std::thread::JoinHandle<u64>> {
+    (0..2)
+        .map(|w| {
+            let path = dir.join(format!("beside{w}.redb"));
+            let stop = std::sync::Arc::clone(&stop);
+            std::thread::spawn(move || {
+                let engine = Engine::open(&path).unwrap();
+                let coll = engine.create_collection("load", "w").unwrap();
+                let mut written = 0u64;
+                let mut next = 0i64;
+                while !stop.load(std::sync::atomic::Ordering::SeqCst) {
+                    let docs: Vec<Document> = (next..next + 50)
+                        .map(|i| doc! {"_id": i, "pad": "x".repeat(200)})
+                        .collect();
+                    next += 50;
+                    written += engine.insert_many(&coll, docs).unwrap().len() as u64;
+                }
+                written
+            })
+        })
+        .collect()
+}
+
+#[test]
+fn a_stop_ends_the_migration_within_one_chunk_while_a_writer_holds_it() {
+    // The stop-path rule: a stop asked for during the migration waits for at
+    // most the chunk it arrived in, in every kind of chunk, timed, with
+    // writers busy beside it; the next start resumes to the reference. Each
+    // chunk holds the writer for HOLD before its commit, and the stop arrives
+    // inside one of them.
+    const HOLD: std::time::Duration = std::time::Duration::from_millis(60);
+    let f = fixture();
+    let reference = read_only(&f.reference);
+    let reference_docs = docs_of(&reference);
+    let standing: BTreeSet<u64> = metas_of(&reference).keys().copied().collect();
+    let reference_entries = entries_of(&reference, &standing);
+    drop(reference);
+    let load = tempfile::tempdir().unwrap();
+    let stop_load = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let writers = background_writers(load.path(), std::sync::Arc::clone(&stop_load));
+    chunks(16, 2_000);
+    for kind in ["re-keying", "moving back", "draining an index", "refilling indexes"] {
+        let path = f.copy();
+        hooks::hold_in_chunks(Some(HOLD), None);
+        hooks::stop_inside(kind, 2);
+        let result = Engine::open(&path);
+        let returned = std::time::Instant::now();
+        let (raised, commits_then) = hooks::stop_raised().expect("the stop was raised");
+        let after = hooks::commits() - commits_then;
+        hooks::hold_in_chunks(None, None);
+        let phase = crate::open_progress::tests::THIS_THREAD_PHASE.with(std::cell::Cell::get);
+        assert!(
+            matches!(phase, Some((crate::open_progress::OpenPhase::Migrating, total)) if total > 0),
+            "{kind}: the open's progress said {phase:?}, not migrating with a total"
+        );
+        assert!(
+            matches!(result, Err(crate::StorageError::Stopping(_))),
+            "{kind}: the open did not stop: {:?}",
+            result.map(|_| ())
+        );
+        let waited = returned - raised;
+        eprintln!("STOP {kind}: answered {waited:?} after it was asked for, {after} commits");
+        assert!(
+            waited < HOLD + std::time::Duration::from_millis(1_500),
+            "{kind}: the stop waited {waited:?}, more than the chunk it arrived in"
+        );
+        // The chunk it arrived in, and nothing after it.
+        assert!(after <= 1, "{kind}: {after} commits after the stop");
+        assert!(crate::migrate_v5::unfinished(&Database::create(&path).unwrap()).unwrap());
+        let engine = Engine::open(&path).unwrap();
+        assert_eq!(docs_of(engine.db()), reference_docs, "{kind}: resumed");
+        assert_eq!(entries_of(engine.db(), &standing), reference_entries, "{kind}: resumed");
+    }
+    stop_load.store(true, std::sync::atomic::Ordering::SeqCst);
+    let written: u64 = writers.into_iter().map(|w| w.join().unwrap()).sum();
+    assert!(written > 0, "premise: the writers wrote beside the migration");
+}
+
+/// A schema 4 store of `n` documents in one collection with one index over a
+/// number, built by this build's engine and its keys put back by hand: the
+/// size a drain has to be measured at.
+fn indexed_schema_4(dir: &Path, n: i64) -> PathBuf {
+    let path = dir.join("kimmy.redb");
+    {
+        let engine = Engine::open(&path).unwrap();
+        let t = engine.create_collection("shop", "t").unwrap();
+        index(&engine, "t", "by_n", vec![IndexField::ascending("n")], false);
+        for start in (0..n).step_by(20_000) {
+            let docs: Vec<Document> =
+                (start..(start + 20_000).min(n)).map(|i| doc! {"_id": i, "n": i * 7}).collect();
+            engine.insert_many(&t, docs).unwrap();
+        }
+    }
+    let db = Database::create(&path).unwrap();
+    let txn = db.begin_write().unwrap();
+    rewind_keys_to_v1(&txn);
+    txn.open_table(tables::META)
+        .unwrap()
+        .insert(tables::META_FORMAT_VERSION, [4u8].as_slice())
+        .unwrap();
+    txn.commit().unwrap();
+    path
+}
+
+/// **The guard on draining by key** (`index::clear_index_entries`, never
+/// redb's `retain_in`): the migration drains every index of a store holding
+/// hundreds of thousands of entries, at the shipped chunk sizes, and the file
+/// must stay near its size. `retain_in` with a predicate that keeps nothing
+/// grew a file from 2.1 to 12 GiB over 742,858 entries (see
+/// `clear_index_entries`); a drain written with it fails here.
+///
+/// ```text
+/// cargo test --release -p kimmy-storage --lib -- --ignored --exact \
+///     migrate_v5_tests::draining_by_key_keeps_the_file_near_its_size
+/// ```
+#[test]
+#[ignore = "heavy: 300,000 entries; run it in release, see the doc comment"]
+fn draining_by_key_keeps_the_file_near_its_size() {
+    let n: i64 = std::env::var("DRAIN_N").map(|s| s.parse().unwrap()).unwrap_or(300_000);
+    let dir = tempfile::tempdir().unwrap();
+    let path = indexed_schema_4(dir.path(), n);
+    let entries = {
+        let db = read_only(&path);
+        let txn = db.begin_read().unwrap();
+        redb::ReadableTableMetadata::len(&txn.open_table(tables::INDEX_ENTRIES).unwrap()).unwrap()
+    };
+    assert!(entries >= n as u64, "premise: {entries} entries");
+    let before = std::fs::metadata(&path).unwrap().len();
+    chunks(8_192, 16 << 20);
+    hooks::watch_file(&path);
+    let engine = Engine::open(&path).unwrap();
+    let largest = hooks::largest_file().unwrap();
+    let ([rekey, back, drain, refill], rows) = hooks::timings().unwrap();
+    drop(engine);
+    eprintln!(
+        "DRAIN n={n}: {entries} entries; file {} MiB before, {} MiB at its largest; re-key \
+         {rekey:?}, move back {back:?}, drain {drain:?} ({} entries), refill {refill:?}",
+        before >> 20,
+        largest >> 20,
+        rows[2]
+    );
+    assert_eq!(rows[2], entries, "every entry drained");
+    assert!(
+        largest <= before + before / 2 + (64 << 20),
+        "the migration grew the file from {} to {} MiB",
+        before >> 20,
+        largest >> 20
+    );
 }

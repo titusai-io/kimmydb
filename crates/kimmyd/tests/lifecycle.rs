@@ -2061,11 +2061,12 @@ async fn a_stop_between_two_migration_steps_is_a_clean_shutdown_and_the_next_sta
         }
         engine.close().unwrap();
     }
-    kimmy_storage::make_schema_3_for_test(&path).unwrap();
+    kimmy_storage::make_schema_4_for_test(&path).unwrap();
 
     let mut run = Run::spawn_with(dir.path(), "migrating", &[("KIMMY_TEST_OPEN_STEP_MS", "20000")]);
     let deadline = Instant::now() + PATIENCE;
-    while !run.log().contains("rebuilt a partial index") {
+    // The re-key's step ends with this line, and the indexes are still owed.
+    while !run.log().contains("re-keyed a collection's documents") {
         assert!(Instant::now() < deadline, "no step finished: {}", run.log());
         tokio::time::sleep(POLL).await;
     }
@@ -2089,7 +2090,7 @@ async fn a_stop_between_two_migration_steps_is_a_clean_shutdown_and_the_next_sta
     let log = next.log();
     assert!(log.contains("previous run ended cleanly"), "{log}");
     assert!(!log.contains("repair"), "{log}");
-    assert!(log.contains("rebuilt a partial index"), "the migration resumed: {log}");
+    assert!(log.contains("rebuilt an index for storage schema 5"), "the migration resumed: {log}");
     next.signal("TERM");
     assert!(next.wait_exit().success());
 }

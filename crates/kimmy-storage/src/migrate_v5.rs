@@ -71,16 +71,18 @@ use crate::walk::{WalkStop, open_walk_table_in};
 
 /// `(collection id, schema 5 key) -> the record`: the rows of a range between
 /// its two phases. Empty, and deleted, once the migration finishes.
-const DOCS_REKEYED: TableDefinition<(u64, &[u8]), &[u8]> =
+pub(crate) const DOCS_REKEYED: TableDefinition<(u64, &[u8]), &[u8]> =
     TableDefinition::new("schema5_docs_rekeyed");
 
-/// `collection id -> phase || rows moved`, one row per `DOCS` collection-id
+/// `collection id -> phase || rows moved out || rows moved back`, one row per `DOCS` collection-id
 /// range, listed in the first commit whether or not a collection stands over
 /// the id. Its presence is what "unfinished" means.
-const RANGE_PHASES: TableDefinition<u64, &[u8]> = TableDefinition::new("schema5_docs_phases");
+pub(crate) const RANGE_PHASES: TableDefinition<u64, &[u8]> =
+    TableDefinition::new("schema5_docs_phases");
 
 /// `(collection id, index id) -> the index's step and what its rebuild found`.
-const INDEX_STEPS: TableDefinition<(u64, u32), &[u8]> = TableDefinition::new("schema5_index_steps");
+pub(crate) const INDEX_STEPS: TableDefinition<(u64, u32), &[u8]> =
+    TableDefinition::new("schema5_index_steps");
 
 /// `(collection id, index id, index key) -> flags || holders`: every unique
 /// collision the rebuild found, and the schema 3 -> 4 rebuild's unreported
@@ -94,12 +96,12 @@ pub(crate) const COLLISIONS: TableDefinition<(u64, u32, &[u8]), &[u8]> =
 /// The schema 3 -> 4 markers, deleted in the first commit on every store older
 /// than 5, finished or not: 4 -> 5 rebuilds every index under the current rule,
 /// which subsumes what 3 -> 4 did.
-const PARTIAL_REBUILT: TableDefinition<(u64, u32), ()> =
+pub(crate) const PARTIAL_REBUILT: TableDefinition<(u64, u32), ()> =
     TableDefinition::new("partial_rebuilt_under_find");
 
 /// What a finished schema 3 -> 4 rebuild found and had not yet reported, carried
 /// into [`COLLISIONS`] in the first commit rather than deleted.
-const PARTIAL_REBUILT_VIOLATIONS: TableDefinition<(u64, u32), &[u8]> =
+pub(crate) const PARTIAL_REBUILT_VIOLATIONS: TableDefinition<(u64, u32), &[u8]> =
     TableDefinition::new("partial_rebuilt_unique_violations");
 
 /// The first byte of a number key, in both schemas: the only `DOCS` keys that
@@ -128,16 +130,13 @@ const PROGRESS_EVERY: u64 = 100_000;
 #[cfg(test)]
 const PROGRESS_EVERY: u64 = 10;
 
-/// The longest a chunk's commit is left non-durable (see [`Run::commit`]).
-const DURABLE_EVERY: Duration = Duration::from_secs(2);
-
 /// redb's growth step: the file extends by this when its slack does not cover a
 /// commit (ADR-183 measured 4,096 to 6,199 MiB for a rebuild needing 166 MiB).
 pub(crate) const REDB_GROWTH_STEP_MIB: u64 = 2048;
 
 /// The phase of one `DOCS` collection-id range.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum Phase {
+pub(crate) enum Phase {
     /// Old-form rows are moved into [`DOCS_REKEYED`]; every numeric row left in
     /// `DOCS` under this id is old-form.
     Rekeying,
@@ -146,44 +145,56 @@ enum Phase {
     Done,
 }
 
-/// A range's marker: its phase, and the rows its two phases have moved.
+/// A range's marker: its phase, and the rows each phase has moved so far.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-struct RangeMark {
-    phase: Phase,
-    moved: u64,
+pub(crate) struct RangeMark {
+    pub(crate) phase: Phase,
+    /// Rows moved into the staging table.
+    pub(crate) out: u64,
+    /// Rows moved back into `DOCS`.
+    pub(crate) back: u64,
 }
 
 impl RangeMark {
-    fn encode(&self) -> [u8; 9] {
-        let mut out = [0u8; 9];
+    fn new(phase: Phase) -> Self {
+        Self { phase, out: 0, back: 0 }
+    }
+
+    fn encode(&self) -> [u8; 17] {
+        let mut out = [0u8; 17];
         out[0] = match self.phase {
             Phase::Rekeying => 1,
             Phase::MovingBack => 2,
             Phase::Done => 3,
         };
-        out[1..].copy_from_slice(&self.moved.to_be_bytes());
+        out[1..9].copy_from_slice(&self.out.to_be_bytes());
+        out[9..].copy_from_slice(&self.back.to_be_bytes());
         out
     }
 
-    fn decode(raw: &[u8]) -> Result<Self> {
+    pub(crate) fn decode(raw: &[u8]) -> Result<Self> {
         let phase = match raw.first() {
             Some(1) => Phase::Rekeying,
             Some(2) => Phase::MovingBack,
             Some(3) => Phase::Done,
             _ => return Err(corrupt_marker("a range's phase")),
         };
-        let moved = raw
-            .get(1..9)
-            .and_then(|b| b.try_into().ok())
-            .map(u64::from_be_bytes)
-            .ok_or_else(|| corrupt_marker("a range's phase"))?;
-        Ok(Self { phase, moved })
+        let at = |from: usize| {
+            raw.get(from..from + 8)
+                .and_then(|b| b.try_into().ok())
+                .map(u64::from_be_bytes)
+                .ok_or_else(|| corrupt_marker("a range's phase"))
+        };
+        if raw.len() != 17 {
+            return Err(corrupt_marker("a range's phase"));
+        }
+        Ok(Self { phase, out: at(1)?, back: at(9)? })
     }
 }
 
 /// The step of one index's rebuild.
 #[derive(Clone, Debug, PartialEq, Eq)]
-enum Step {
+pub(crate) enum Step {
     Pending,
     Draining,
     /// Every document up to and including `after` has its entries.
@@ -196,15 +207,15 @@ enum Step {
 /// An index's marker: its step, and what its rebuild has found so far, carried
 /// across a restart so the closing line counts the whole rebuild.
 #[derive(Clone, Debug, PartialEq, Eq)]
-struct IndexMark {
-    step: Step,
-    drained: u64,
-    entries: u64,
-    unkeyed: u64,
-    collisions: u64,
+pub(crate) struct IndexMark {
+    pub(crate) step: Step,
+    pub(crate) drained: u64,
+    pub(crate) entries: u64,
+    pub(crate) unkeyed: u64,
+    pub(crate) collisions: u64,
     /// For a TTL index: documents its filter now selects that it did not, and
     /// the reverse (design 2.6), counted before the drain.
-    ttl: Option<(u64, u64)>,
+    pub(crate) ttl: Option<(u64, u64)>,
 }
 
 impl IndexMark {
@@ -240,7 +251,7 @@ impl IndexMark {
         out
     }
 
-    fn decode(raw: &[u8]) -> Result<Self> {
+    pub(crate) fn decode(raw: &[u8]) -> Result<Self> {
         let bad = || corrupt_marker("an index's step");
         let mut input = raw;
         let mut take = |n: usize| -> Result<&[u8]> {
@@ -285,11 +296,11 @@ impl IndexMark {
 /// rebuild and not found again, and the keys of the documents holding it, the
 /// one that revealed it last.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
-struct Collision {
+pub(crate) struct Collision {
     /// Carried from a schema 3 -> 4 rebuild's record: its index key is in the
     /// schema 4 form, and the refill has not found it again under that key.
-    carried: bool,
-    holders: Vec<Vec<u8>>,
+    pub(crate) carried: bool,
+    pub(crate) holders: Vec<Vec<u8>>,
 }
 
 impl Collision {
@@ -303,7 +314,7 @@ impl Collision {
         out
     }
 
-    fn decode(raw: &[u8]) -> Result<Self> {
+    pub(crate) fn decode(raw: &[u8]) -> Result<Self> {
         let bad = || corrupt_marker("a recorded collision");
         let (&flags, mut rest) = raw.split_first().ok_or_else(bad)?;
         let u32_at = |rest: &mut &[u8]| -> Result<usize> {
@@ -375,20 +386,19 @@ pub(crate) struct Plan {
 }
 
 impl Plan {
-    /// The working set one chunk can add to the file before the pages it frees
-    /// can be reused: each chunk's own rows written twice (copy on write of the
-    /// tree's pages, and the staging or index pages it adds), for the largest
-    /// chunk of either kind, with the window [`Run::commit`] leaves non-durable
-    /// on top. A row's footprint is estimated as the file's size over its
-    /// documents, which over-counts (the file holds the indexes too).
+    /// The working set chunks can add to the file before the pages they free
+    /// are reused: every chunk commits durably ([`commit`]), so the pages one
+    /// chunk frees are free for the chunk after the next, and at most a few
+    /// chunks' pages are in flight. Each chunk's own rows written twice (copy
+    /// on write of the tree's pages, and the staging or index pages it adds),
+    /// for the larger chunk of the two kinds, four times over. A row's
+    /// footprint is estimated as the file's size over its documents, which
+    /// over-counts (the file holds the indexes too).
     fn margin_bytes(docs_rows: u64, file_bytes: u64) -> u64 {
         let per_row = file_bytes / docs_rows.max(1);
         let rekey = REKEY_CHUNK_ROWS as u64 * per_row * 2;
         let index = INDEX_CHUNK_BYTES as u64 * 2;
-        // The bytes a non-durable window can write: rows re-keyed or entries
-        // refilled in DURABLE_EVERY, taken generously as 64 chunks.
-        let window = 64 * rekey.max(index);
-        2 * rekey.max(index) + window
+        4 * rekey.max(index)
     }
 }
 
@@ -590,7 +600,7 @@ pub(crate) fn begin(db: &Database) -> Result<()> {
         let mut phases = txn.open_table(RANGE_PHASES)?;
         for id in range_ids(&docs)? {
             let phase = if has_numeric(&docs, id)? { Phase::Rekeying } else { Phase::Done };
-            phases.insert(id, RangeMark { phase, moved: 0 }.encode().as_slice())?;
+            phases.insert(id, RangeMark::new(phase).encode().as_slice())?;
         }
         let mut steps = txn.open_table(INDEX_STEPS)?;
         for row in txn.open_table(tables::COLLECTIONS)?.iter()? {
@@ -601,7 +611,7 @@ pub(crate) fn begin(db: &Database) -> Result<()> {
             }
         }
     }
-    commit(txn, true)
+    commit(txn)
 }
 
 /// Move the schema 3 -> 4 rebuild's unreported collisions into [`COLLISIONS`],
@@ -688,8 +698,6 @@ struct Run {
     rows: [u64; 4],
     /// Time spent in each of those four kinds of chunk.
     spent: [Duration; 4],
-    /// When the last durable commit landed.
-    durable_at: Instant,
     /// The open progress's total, and how far it is.
     total: u64,
     done: u64,
@@ -716,21 +724,6 @@ impl Kind {
 }
 
 impl Run {
-    /// Commit one chunk. A chunk is a resumable state on its own -- its rows,
-    /// its marker and its cursor are in the one transaction -- so a chunk that
-    /// is not yet durable when the process dies costs only the work since the
-    /// last durable one, which the next start redoes from that state. So most
-    /// chunks commit without a sync, and one every [`DURABLE_EVERY`] does; a
-    /// step's last chunk syncs, as does a stop.
-    fn commit(&mut self, txn: WriteTransaction, durable: bool) -> Result<()> {
-        let durable = durable || self.durable_at.elapsed() >= DURABLE_EVERY;
-        commit(txn, durable)?;
-        if durable {
-            self.durable_at = Instant::now();
-        }
-        Ok(())
-    }
-
     /// Count `n` rows of `kind`, `spent` on them, and say so every
     /// [`PROGRESS_EVERY`] rows.
     fn advance(&mut self, kind: Kind, n: u64, spent: Duration, coll: &str) {
@@ -753,17 +746,22 @@ impl Run {
     }
 }
 
-/// Commit, and nothing else may: the one place a test can make a commit fail as
-/// a kill before it would.
-fn commit(mut txn: WriteTransaction, durable: bool) -> Result<()> {
+/// Commit one chunk, durably, and nothing else may: the one place a test can
+/// make a commit fail as a kill before it would.
+///
+/// **Every chunk is durable**, though each is a resumable state on its own and
+/// a lost one would only be redone. Measured on redb 4.3 (the measurement
+/// harness at the end of `migrate_v5_tests`): with chunks committed
+/// non-durably and one in every two seconds durably, the durable commit that
+/// follows a run of non-durable ones took 4.4 to 9.5 s for 100,000 rows, the
+/// re-key took seven times as long as with every commit durable, and the file
+/// doubled, since the pages a non-durable commit frees are not reused until a
+/// durable one. Durable, the file did not grow at all.
+fn commit(txn: WriteTransaction) -> Result<()> {
     #[cfg(test)]
     if hooks::fails_now() {
         drop(txn);
         return Err(StorageError::Database("a failure injected mid-migration".into()));
-    }
-    if !durable {
-        txn.set_durability(redb::Durability::None)
-            .map_err(|e| StorageError::Database(e.to_string()))?;
     }
     txn.commit()?;
     #[cfg(test)]
@@ -781,10 +779,9 @@ fn stop_requested() -> bool {
     crate::open_progress::open_stop_requested()
 }
 
-/// End the open at a stop: the chunks committed so far are made durable, and
-/// the next start resumes from their markers.
-fn stopped(db: &Database) -> Result<()> {
-    commit(db.begin_write()?, true)?;
+/// End the open at a stop: every chunk committed so far is durable, and the
+/// next start resumes from their markers.
+fn stopped() -> Result<()> {
     info!(
         "a stop ended the storage schema 4 -> 5 migration between two chunks; the next start resumes it"
     );
@@ -799,7 +796,6 @@ pub(crate) fn run(db: &Database, plan: &Plan) -> Result<()> {
         started: Instant::now(),
         rows: [0; 4],
         spent: [Duration::ZERO; 4],
-        durable_at: Instant::now(),
         // Rows moved out and back, and every document refilled once.
         total: plan.docs_rows.saturating_mul(3),
         done: 0,
@@ -868,7 +864,7 @@ pub(crate) fn run(db: &Database, plan: &Plan) -> Result<()> {
 fn rekey_range(db: &Database, run: &mut Run, id: u64, name: &str) -> Result<()> {
     loop {
         if stop_requested() {
-            return stopped(db);
+            return stopped();
         }
         let started = Instant::now();
         let txn = db.begin_write()?;
@@ -894,19 +890,21 @@ fn rekey_range(db: &Database, run: &mut Run, id: u64, name: &str) -> Result<()> 
                 (if more { Phase::MovingBack } else { Phase::Done }, Kind::RekeyB, moved)
             }
         };
-        txn.open_table(RANGE_PHASES)?.insert(
-            id,
-            RangeMark { phase: next, moved: mark.moved + moved as u64 }.encode().as_slice(),
-        )?;
+        let (out, back) = match kind {
+            Kind::RekeyA => (mark.out + moved as u64, mark.back),
+            _ => (mark.out, mark.back + moved as u64),
+        };
+        txn.open_table(RANGE_PHASES)?
+            .insert(id, RangeMark { phase: next, out, back }.encode().as_slice())?;
         #[cfg(test)]
-        hooks::hold();
-        run.commit(txn, next != mark.phase)?;
+        hooks::hold(kind.label());
+        commit(txn)?;
         run.advance(kind, moved as u64, started.elapsed(), name);
         if next == Phase::Done {
             info!(
                 collection = name,
                 collection_id = id,
-                rows = mark.moved + moved as u64,
+                rows = out,
                 "re-keyed a collection's documents for storage schema 5"
             );
             crate::open_progress::test_step_pause();
@@ -1001,12 +999,6 @@ fn chunk_bytes() -> usize {
     INDEX_CHUNK_BYTES
 }
 
-fn read_index(txn: &WriteTransaction, coll: u64, index: u32) -> Result<IndexMark> {
-    let steps = txn.open_table(INDEX_STEPS)?;
-    let raw = steps.get((coll, index))?.ok_or_else(|| corrupt_marker("an index's step"))?;
-    IndexMark::decode(raw.value())
-}
-
 fn write_index(txn: &WriteTransaction, coll: u64, index: u32, mark: &IndexMark) -> Result<()> {
     txn.open_table(INDEX_STEPS)?.insert((coll, index), mark.encode().as_slice())?;
     Ok(())
@@ -1039,7 +1031,7 @@ fn drain(db: &Database, run: &mut Run, meta: &CollectionMeta, index: &IndexMeta)
     let coll = meta.id.0;
     loop {
         if stop_requested() {
-            return stopped(db);
+            return stopped();
         }
         let mut mark = {
             let txn = db.begin_read()?;
@@ -1074,8 +1066,8 @@ fn drain(db: &Database, run: &mut Run, meta: &CollectionMeta, index: &IndexMeta)
         mark.step = if empty { Step::Refilling { after: None } } else { Step::Draining };
         write_index(&txn, coll, index.id, &mark)?;
         #[cfg(test)]
-        hooks::hold();
-        run.commit(txn, empty || counted.is_some())?;
+        hooks::hold(Kind::Drain.label());
+        commit(txn)?;
         run.advance(Kind::Drain, removed as u64, started.elapsed(), &meta.name);
         if let Some((now_selected, now_unselected)) = counted {
             info!(
@@ -1161,22 +1153,33 @@ fn refill(
     indexes: &mut [IndexMeta],
 ) -> Result<()> {
     let coll = meta.id.0;
+    // Read once, where this run takes the refill up: from here the marks are
+    // carried across chunks and written in each chunk's commit, so the store
+    // always holds the cursor of the last chunk that committed.
+    let mut marks = {
+        let txn = db.begin_read()?;
+        let steps = txn.open_table(INDEX_STEPS)?;
+        indexes
+            .iter()
+            .map(|index| {
+                let raw = steps
+                    .get((coll, index.id))?
+                    .ok_or_else(|| corrupt_marker("an index's step"))?;
+                IndexMark::decode(raw.value())
+            })
+            .collect::<Result<Vec<_>>>()?
+    };
+    let active: Vec<usize> =
+        (0..indexes.len()).filter(|&i| matches!(marks[i].step, Step::Refilling { .. })).collect();
+    if active.is_empty() {
+        return Ok(());
+    }
     loop {
         if stop_requested() {
-            return stopped(db);
+            return stopped();
         }
         let started = Instant::now();
         let txn = db.begin_write()?;
-        let mut marks = Vec::with_capacity(indexes.len());
-        for index in indexes.iter() {
-            marks.push(read_index(&txn, coll, index.id)?);
-        }
-        let active: Vec<usize> = (0..indexes.len())
-            .filter(|&i| matches!(marks[i].step, Step::Refilling { .. }))
-            .collect();
-        if active.is_empty() {
-            return Ok(());
-        }
         // The walk starts at the earliest cursor.
         let from: Option<Vec<u8>> = active
             .iter()
@@ -1286,8 +1289,8 @@ fn refill(
             index.multikey = true;
         }
         #[cfg(test)]
-        hooks::hold();
-        run.commit(txn, exhausted)?;
+        hooks::hold(Kind::Refill.label());
+        commit(txn)?;
         run.advance(Kind::Refill, walked, started.elapsed(), &meta.name);
         #[cfg(test)]
         hooks::refilled(walked);
@@ -1349,7 +1352,7 @@ fn finish(db: &Database) -> Result<()> {
     if txn.open_table(COLLISIONS)?.iter()?.next().is_none() {
         txn.delete_table(COLLISIONS)?;
     }
-    commit(txn, true)
+    commit(txn)
 }
 
 /// Every collision the migration recorded and has not yet reported, by
@@ -1440,13 +1443,19 @@ pub(crate) mod hooks {
         static FAIL_AT: Cell<Option<usize>> = const { Cell::new(None) };
         static PROGRESS: Cell<usize> = const { Cell::new(0) };
         static REFILLED: Cell<u64> = const { Cell::new(0) };
+        static LARGEST_REFILL: Cell<u64> = const { Cell::new(0) };
         static STOP: RefCell<Option<Arc<AtomicBool>>> = const { RefCell::new(None) };
         static HOLD: Cell<Option<Duration>> = const { Cell::new(None) };
         static HELD: RefCell<Option<Arc<AtomicBool>>> = const { RefCell::new(None) };
+        static HOLDS: RefCell<std::collections::BTreeMap<&'static str, usize>> =
+            const { RefCell::new(std::collections::BTreeMap::new()) };
+        static STOP_AT: Cell<Option<(&'static str, usize)>> = const { Cell::new(None) };
+        static RAISED: Cell<Option<(std::time::Instant, usize)>> = const { Cell::new(None) };
         pub(crate) static REKEY_ROWS: Cell<Option<usize>> = const { Cell::new(None) };
         pub(crate) static INDEX_BYTES: Cell<Option<usize>> = const { Cell::new(None) };
         pub(crate) static FREE: Cell<Option<u64>> = const { Cell::new(None) };
         static TIMINGS: Cell<Option<([Duration; 4], [u64; 4])>> = const { Cell::new(None) };
+        static WATCHED: RefCell<Option<(std::path::PathBuf, u64)>> = const { RefCell::new(None) };
     }
 
     /// Migration commits made on this thread so far.
@@ -1474,6 +1483,24 @@ pub(crate) mod hooks {
 
     pub(super) fn committed() {
         COMMITS.with(|c| c.set(c.get() + 1));
+        WATCHED.with(|w| {
+            if let Some((path, largest)) = w.borrow_mut().as_mut() {
+                let len = std::fs::metadata(&*path).map_or(0, |m| m.len());
+                *largest = (*largest).max(len);
+            }
+        });
+    }
+
+    /// Watch the length of the file at `path` after every migration commit on
+    /// this thread, from its length now.
+    pub(crate) fn watch_file(path: &std::path::Path) {
+        let len = std::fs::metadata(path).map_or(0, |m| m.len());
+        WATCHED.with(|w| *w.borrow_mut() = Some((path.to_path_buf(), len)));
+    }
+
+    /// The largest the watched file has been after a commit; stops watching.
+    pub(crate) fn largest_file() -> Option<u64> {
+        WATCHED.with(|w| w.borrow_mut().take().map(|(_, largest)| largest))
     }
 
     pub(super) fn progress() {
@@ -1487,6 +1514,12 @@ pub(crate) mod hooks {
 
     pub(super) fn refilled(n: u64) {
         REFILLED.with(|r| r.set(r.get() + n));
+        LARGEST_REFILL.with(|r| r.set(r.get().max(n)));
+    }
+
+    /// The most documents one refill chunk has walked on this thread.
+    pub(crate) fn largest_refill_chunk() -> u64 {
+        LARGEST_REFILL.with(Cell::get)
     }
 
     /// Documents the refill has walked on this thread so far.
@@ -1500,7 +1533,8 @@ pub(crate) mod hooks {
     }
 
     pub(super) fn stop_signalled() -> bool {
-        STOP.with(|s| s.borrow().as_ref().is_some_and(|s| s.load(Ordering::SeqCst)))
+        RAISED.with(|r| r.get().is_some())
+            || STOP.with(|s| s.borrow().as_ref().is_some_and(|s| s.load(Ordering::SeqCst)))
     }
 
     /// Hold every chunk's write transaction open for `hold` before its commit,
@@ -1508,9 +1542,33 @@ pub(crate) mod hooks {
     pub(crate) fn hold_in_chunks(hold: Option<Duration>, held: Option<Arc<AtomicBool>>) {
         HOLD.with(|h| h.set(hold));
         HELD.with(|h| *h.borrow_mut() = held);
+        HOLDS.with(|h| h.borrow_mut().clear());
+        RAISED.with(|r| r.set(None));
     }
 
-    pub(super) fn hold() {
+    /// Ask for a stop inside the `n`th chunk (from 1) of `kind`, while it holds
+    /// the writer, before its commit: a stop that arrives mid-chunk.
+    pub(crate) fn stop_inside(kind: &'static str, n: usize) {
+        STOP_AT.with(|s| s.set(Some((kind, n))));
+    }
+
+    /// When the stop [`stop_inside`] asked for was raised, and the commits made
+    /// by then; clears it.
+    pub(crate) fn stop_raised() -> Option<(std::time::Instant, usize)> {
+        RAISED.with(|r| r.take())
+    }
+
+    pub(super) fn hold(kind: &'static str) {
+        let n = HOLDS.with(|h| {
+            let mut h = h.borrow_mut();
+            let n = h.entry(kind).or_insert(0);
+            *n += 1;
+            *n
+        });
+        if STOP_AT.with(|s| s.get()) == Some((kind, n)) {
+            STOP_AT.with(|s| s.set(None));
+            RAISED.with(|r| r.set(Some((std::time::Instant::now(), commits()))));
+        }
         if let Some(hold) = HOLD.with(Cell::get) {
             HELD.with(|h| {
                 if let Some(held) = h.borrow().as_ref() {
