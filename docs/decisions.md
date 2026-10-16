@@ -27685,7 +27685,7 @@ later write already costs.
 > whose findings were detect-only. Adds three `cluster.*` keys and nine series, a persisted metadata key
 > (`gc:tombstone_horizon`), one optional field on the snapshot page (`tombstone_horizon`), and the `lab-hooks` cargo feature.
 > Not a rollback boundary: a 0.49.0 binary ignores the key and the field. A config that names the new `cluster.*` keys
-> is refused by 0.49.0 (`ClusterConfig` denies unknown keys), so remove them before rolling back. (The number is fixed at merge.)
+> is refused by 0.49.0 (`ClusterConfig` denies unknown keys), so remove them before rolling back.
 
 **The case.** 0.48.0 and 0.49.0 find a document updated on one member and not on the other, and an index one member
 lacks, and then do nothing. The first finding in a lab round was a real divergence nothing closed. The repair must

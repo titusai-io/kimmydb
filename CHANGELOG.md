@@ -10,7 +10,18 @@ Versioning follows the pre-1.0 policy in
 [docs/compatibility.md](docs/compatibility.md): a `0.MINOR` bump may carry
 breaking changes and says so here; a `0.x.PATCH` bump never does.
 
-## Unreleased
+## 0.50.0 - 2026-10-16
+
+**Read before upgrading, two things.**
+
+**(a) Breaking: a database's drop now keeps the writes stamped after it** ([ADR-236](docs/decisions.md)), as a collection's drop does since 0.49.0. A write made into a collection of the database after the drop's stamp, through a member that had not yet heard of the drop, is kept, re-dated just above the drop, so the collection, and its database, can come back holding **only** the writes stamped after the drop. **Clock skew can cause it.** The way to avoid it is unchanged: confirm a drop on the members before writing through another one. A collection with nothing stamped after the drop is buried as before.
+
+**(b) The divergence check now repairs what it finds** ([ADR-237](docs/decisions.md)), **on by default**. A confirmed cut-digest finding plans a document repair, which writes a row only where it is strictly newer than the one held (and a young lost insert); a confirmed definition finding plans the build of one plain index this member lacks and a peer holds. Everything else stays a finding for you, in words, in `docs/operations.md` ("The cut digest" and "The definition digest"). A loop guard judges every repair and backs off one that changes nothing. `cluster.divergence_repair = false` makes a member detect only, as 0.49.0 does. Nine series report it.
+
+**Rolling and rolling back.** Member-at-a-time is safe, and 0.50.0 is **not a rollback boundary**: no `kimmy.format` schema (still 4), `I_EPOCH`, table, backup tag or entry kind changed.
+- During a roll a 0.49.x member buries a collection a 0.50.0 member keeps under a database drop, and refuses it from a 0.50.0 member until it is upgraded; it repairs nothing, and a 0.50.0 member repairing from it writes no young lost insert.
+- **Before rolling back to 0.49.x, remove `cluster.divergence_repair`, `cluster.repair_max_documents` and `cluster.repair_max_index_documents` from the configuration**: 0.49.x refuses to start on a configuration that names any of them.
+- **A store rolled back to 0.49.x buries, at its next start, every collection 0.50.0 kept under a database drop, with the writes it kept**, so the members differ until they run one version. `docs/compatibility.md` has the two differences that outlast a roll.
 
 ### Added
 
