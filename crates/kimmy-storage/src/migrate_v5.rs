@@ -512,9 +512,10 @@ fn estimate_secs(plan: &Plan) -> u64 {
 /// The cost of re-keying one row, both phases, the up-front estimate is made
 /// from: a bound, as [`crate::migrate::MICROS_PER_DOCUMENT`] is. Measured with
 /// `examples/schema4_migration` on a laptop's SSD, warm, in a release build:
-/// 21 to 31 s for 2,000,000 rows, 5 to 8 us each; 8 covers that, and a spinning
-/// disk is slower, which is why the line says "estimate".
-pub const MICROS_PER_REKEYED_ROW: u64 = 8;
+/// both phases took 15 to 31 s for 2,000,000 rows of about 350 bytes, 8 to 16
+/// us each, bound by the durable commit of each chunk; a spinning disk is
+/// slower, which is why the line says "estimate".
+pub const MICROS_PER_REKEYED_ROW: u64 = 16;
 
 /// Every collection id `DOCS` holds a row under, in order: one seek per id,
 /// skipping from range to range, so a store of few large collections is a
