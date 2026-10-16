@@ -206,7 +206,8 @@ pub struct SyncOutcome {
     /// named for a count, the check ran, and the caller dropped the probe
     /// because the peer is behind this node and still advancing
     /// (`divergence_probe_for` in `kimmy-cluster`, ADR-133 defect 2 as
-    /// amended by ADR-145). `false` whenever `count_probe` is `Some`, and
+    /// amended by ADR-145), or because either member is catching up
+    /// (ADR-237's addendum). `false` whenever `count_probe` is `Some`, and
     /// also when there was simply nothing to probe. Carried so a caller can
     /// count "compared" and "deferred" apart: without it a count half that
     /// never runs against a peer permanently behind is indistinguishable

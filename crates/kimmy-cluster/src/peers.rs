@@ -1452,6 +1452,7 @@ pub async fn replicate(engine: Arc<Engine>, config: ReplicationConfig) {
                                         &mut stalls,
                                         node,
                                         peer,
+                                        either_side_is_catching_up(&config, node),
                                     );
                                     // The cut digest's findings plan a document repair
                                     // (repair design section 3).
@@ -2794,16 +2795,22 @@ fn fold_check(
 /// (`DivergenceTracker::observe_count_deferred`) and keeps the cooldown of the repair it
 /// planned before, so a finding that cannot be compared against a peer that trails this
 /// member and moves is not repaired again every cooldown on old evidence.
+///
+/// Nothing is planned while this member or the peer is catching up (`catching_up`,
+/// ADR-237's addendum), as for the digest and definition repairs: a repair from a member
+/// part-way through a snapshot reads a state that is about to change. A finding stands and
+/// is planned on the first contact after the marker clears.
 fn plan_count_repairs(
     engine: &Engine,
     divergence: &kimmy_storage::DivergenceTracker,
     stalls: &mut PeerStalls,
     node: NodeId,
     peer: SocketAddr,
+    catching_up: bool,
 ) -> usize {
     let confirmed = divergence.confirmed_against(node);
     let mut planned = 0;
-    for collection in &confirmed {
+    for collection in confirmed.iter().filter(|_| !catching_up) {
         let repair = repair_for(engine, *collection);
         if stalls.plan_repair(node, *collection, repair) {
             planned += 1;

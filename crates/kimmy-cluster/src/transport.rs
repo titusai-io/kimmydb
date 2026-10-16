@@ -2095,6 +2095,9 @@ where
             return Err(ProtocolError::Malformed(format!("expected Vectors, got {other:?}")));
         }
     };
+    // What the peer's block says of its catching-up marker, read before the block
+    // is handed on: the count half's gate below defers on it.
+    let peer_catching_up = their_facts.as_ref().is_some_and(|facts| facts.catching_up);
     let processed = stalls.gate_vector(peer, their_node, &theirs, their_witnessed.as_ref());
     // For the lag gauge, whatever becomes of the round from here.
     stalls.vectors_read.push((peer, theirs.clone()));
@@ -2217,7 +2220,11 @@ where
         stalls.horizon_resolved(their_node);
         let position = stalls.position(their_node, processed, &mine, &theirs, probe.as_ref());
         let busy = probe.as_ref().map(|p| p.id);
-        let gate = divergence_probe_for(probe, position);
+        let catching_up = count_catching_up(peer_catching_up, stalls.catch_up.as_deref());
+        let gate = divergence_probe_for(probe, position, catching_up);
+        if catching_up && gate.deferred {
+            debug!(%peer, peer_catching_up, "count probe deferred: a member is catching up");
+        }
         let context = their_witnessed.as_ref().map(|theirs_witnessed| DigestContext {
             theirs_witnessed,
             busy,
@@ -2765,7 +2772,11 @@ where
     if window_exhausted {
         let position = stalls.position(their_node, processed, &mine, &theirs, probe.as_ref());
         let busy = probe.as_ref().map(|p| p.id);
-        let gate = divergence_probe_for(probe, position);
+        let catching_up = count_catching_up(peer_catching_up, stalls.catch_up.as_deref());
+        let gate = divergence_probe_for(probe, position, catching_up);
+        if catching_up && gate.deferred {
+            debug!(%peer, peer_catching_up, "count probe deferred: a member is catching up");
+        }
         let context = their_witnessed.as_ref().map(|theirs_witnessed| DigestContext {
             theirs_witnessed,
             busy,
@@ -2881,11 +2892,36 @@ fn behind_beyond_horizon(
 /// Without that a count half that never runs against a peer permanently
 /// behind is indistinguishable from one that runs and agrees, which is
 /// what the wedged cluster above read as.
-fn divergence_probe_for(probe: Option<DivergenceProbe>, position: PeerPosition) -> CountGate {
+///
+/// **Either member catching up defers, whatever its position (ADR-237's
+/// addendum).** A member taking a whole-database snapshot holds the pages it
+/// has applied as state its vector does not name, and its vector does not move
+/// until the last page grants the coverage (ADR-152, ADR-224): it reads as
+/// behind and *still*, so after [`FROZEN_CONTACTS`] contacts the rule above
+/// compared its part-way count, two such contacts confirmed a finding, and a
+/// repair was planned from it (lab row 7 of 0.50.0, against a member 59 pages
+/// into a 394-page snapshot). Its marker says what the vector cannot, and the
+/// peer's block on this contact's `Vectors` carries it (ADR-201). The deferral
+/// ends when the marker clears: the member's vector then covers what it holds,
+/// and the next contact is judged by position alone.
+fn divergence_probe_for(
+    probe: Option<DivergenceProbe>,
+    position: PeerPosition,
+    catching_up: bool,
+) -> CountGate {
     match position {
+        _ if catching_up => CountGate { probe: None, deferred: probe.is_some() },
         PeerPosition::Advancing => CountGate { probe: None, deferred: probe.is_some() },
         PeerPosition::CaughtUp | PeerPosition::Frozen => CountGate { probe, deferred: false },
     }
+}
+
+/// Whether either member of this contact is catching up, for the count half
+/// (ADR-237's addendum): the peer's block on this contact's `Vectors` said its
+/// marker is set (`peer`), or this member's own is. A peer that sends no block
+/// (a version before ADR-201) is read as not catching up, as before.
+fn count_catching_up(peer: bool, own: Option<&crate::catchup::CatchUp>) -> bool {
+    peer || own.is_some_and(crate::catchup::CatchUp::is_set)
 }
 
 /// The count half's position for a contact, from both sides (ADR-168).
@@ -6729,7 +6765,7 @@ mod tests {
             let theirs = vector(&[(me, their_wall), (peer, 5)]);
             let position = stalls.observe(peer, &theirs, &mine);
             assert_eq!(position, PeerPosition::Advancing, "moved since last contact");
-            let gate = divergence_probe_for(probe(), position);
+            let gate = divergence_probe_for(probe(), position, false);
             assert_eq!(gate, CountGate { probe: None, deferred: true }, "at {their_wall}");
         }
 
@@ -6744,13 +6780,13 @@ mod tests {
             stalls.tick_opened();
             let position = stalls.observe(peer, &theirs, &mine);
             assert_eq!(position, PeerPosition::Advancing, "sighting {sighting}: not yet frozen");
-            assert!(divergence_probe_for(probe(), position).deferred, "sighting {sighting}");
+            assert!(divergence_probe_for(probe(), position, false).deferred, "sighting {sighting}");
         }
         stalls.tick_opened();
         let position = stalls.observe(peer, &theirs, &mine);
         assert_eq!(position, PeerPosition::Frozen, "unchanged for FROZEN_CONTACTS contacts");
         assert_eq!(
-            divergence_probe_for(probe(), position),
+            divergence_probe_for(probe(), position, false),
             CountGate { probe: probe(), deferred: false },
             "a still peer's count is what it holds and will keep holding"
         );
@@ -6764,7 +6800,7 @@ mod tests {
         let position = stalls.observe(peer, &caught_up, &mine);
         assert_eq!(position, PeerPosition::CaughtUp);
         assert_eq!(
-            divergence_probe_for(probe(), position),
+            divergence_probe_for(probe(), position, false),
             CountGate { probe: probe(), deferred: false }
         );
         assert!(stalls.by_peer.is_empty(), "nothing to remember about a peer that is level");
@@ -6772,10 +6808,37 @@ mod tests {
         // No probe named this tick is neither compared nor deferred,
         // whatever the peer's position.
         assert_eq!(
-            divergence_probe_for(None, PeerPosition::Advancing),
+            divergence_probe_for(None, PeerPosition::Advancing, false),
             CountGate { probe: None, deferred: false },
             "nothing in rotation is not a deferral"
         );
+    }
+
+    /// Either member catching up defers the probe whatever the position, a still
+    /// peer's included (ADR-237's addendum), and is counted `deferred` like a
+    /// moving one; with nothing named in rotation it is not a deferral. Either
+    /// marker, the peer's block or this member's own, is enough.
+    #[test]
+    fn a_member_catching_up_defers_the_count_probe_in_every_position() {
+        for position in [PeerPosition::CaughtUp, PeerPosition::Advancing, PeerPosition::Frozen] {
+            assert_eq!(
+                divergence_probe_for(probe(), position, true),
+                CountGate { probe: None, deferred: true },
+                "{position:?}"
+            );
+            assert_eq!(
+                divergence_probe_for(None, position, true),
+                CountGate { probe: None, deferred: false },
+                "{position:?}: nothing in rotation is not a deferral"
+            );
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let own = crate::catchup::CatchUp::open(dir.path(), Duration::from_secs(120));
+        assert!(!count_catching_up(false, None), "no block and no marker");
+        assert!(!count_catching_up(false, Some(&own)), "a marker that is not set");
+        assert!(count_catching_up(true, Some(&own)), "the peer's block says so");
+        own.mark(crate::CatchUpReason::Snapshot).unwrap();
+        assert!(count_catching_up(false, Some(&own)), "this member's own marker");
     }
 
     /// The two movements that must not break a stall's run, and the one that
@@ -6847,7 +6910,8 @@ mod tests {
             let mine_at = vector(&[(me, 50), (peer, my_wall)]);
             let position = stalls.observe_self(peer, &their_servable, Some(&mine_at));
             assert_eq!(position, PeerPosition::Advancing, "at {my_wall}");
-            let gate = divergence_probe_for(probe(), combine(PeerPosition::CaughtUp, position));
+            let gate =
+                divergence_probe_for(probe(), combine(PeerPosition::CaughtUp, position), false);
             assert_eq!(gate, CountGate { probe: None, deferred: true }, "at {my_wall}");
         }
 
@@ -6864,7 +6928,7 @@ mod tests {
         let position = stalls.observe_self(peer, &their_servable, Some(&stuck));
         assert_eq!(position, PeerPosition::Frozen, "unchanged for FROZEN_CONTACTS contacts");
         assert_eq!(
-            divergence_probe_for(probe(), combine(PeerPosition::CaughtUp, position)),
+            divergence_probe_for(probe(), combine(PeerPosition::CaughtUp, position), false),
             CountGate { probe: probe(), deferred: false },
             "a member that has stopped taking in its peer's writes is compared"
         );
@@ -6917,7 +6981,7 @@ mod tests {
                 PeerPosition::CaughtUp,
                 "contact {contact}: nothing to catch up on"
             );
-            assert!(!divergence_probe_for(probe.clone(), position).deferred);
+            assert!(!divergence_probe_for(probe.clone(), position, false).deferred);
         }
 
         // The same reading on the witnessed vector: what the wrong pairing does.
@@ -6970,7 +7034,7 @@ mod tests {
             let position = stalls.observe(peer, &their_witnessed, &mine);
             assert_eq!(position, PeerPosition::CaughtUp, "processed everything this node has");
             assert_eq!(
-                divergence_probe_for(probe(), position),
+                divergence_probe_for(probe(), position, false),
                 CountGate { probe: probe(), deferred: false }
             );
         }
@@ -6984,7 +7048,7 @@ mod tests {
             stalls.tick_opened();
             let position = stalls.observe(peer, &their_servable, &mine);
             assert_eq!(position, PeerPosition::Advancing, "behind on what it can serve");
-            assert!(divergence_probe_for(probe(), position).deferred);
+            assert!(divergence_probe_for(probe(), position, false).deferred);
         }
         stalls.tick_opened();
         assert_eq!(
@@ -7000,7 +7064,7 @@ mod tests {
         let position = stalls.observe(peer, &trailing, &mine);
         assert_eq!(position, PeerPosition::Advancing);
         assert_eq!(
-            divergence_probe_for(probe(), position),
+            divergence_probe_for(probe(), position, false),
             CountGate { probe: None, deferred: true }
         );
     }

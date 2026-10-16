@@ -214,8 +214,14 @@ async fn tick(
                                 &mut report,
                             );
                         }
-                        let planned =
-                            plan_count_repairs(&engine, &m.divergence, &mut m.stalls, node, addr);
+                        let planned = plan_count_repairs(
+                            &engine,
+                            &m.divergence,
+                            &mut m.stalls,
+                            node,
+                            addr,
+                            either_side_is_catching_up(&m.config, node),
+                        );
                         storm.count_repairs_planned += planned;
                         if let Some(peer) = names.get(&node).copied() {
                             *storm.count_plans.entry((m.name, peer)).or_default() += planned;
