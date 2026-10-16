@@ -3720,6 +3720,31 @@ mod identity {
         assert_eq!(out[0].get("_id"), Some(&dec("1.00")));
     }
 
+    /// `$max` and `$min` rank a decimal among the numbers by its value
+    /// (design 2.2: `$max` over `[Decimal128("1.5"), 5]` is 5; it used to be
+    /// 1.5, the decimal ranked equal to 5 and kept as the first seen).
+    #[test]
+    fn the_max_and_min_accumulators_rank_a_decimal128_by_its_value() {
+        let extremes = |values: Vec<Bson>| {
+            let input = values.into_iter().map(|v| doc! { "v": v }).collect();
+            let out = run(
+                vec![
+                    doc! { "$group": { "_id": null, "hi": { "$max": "$v" }, "lo": { "$min": "$v" } } },
+                ],
+                input,
+            );
+            (out[0].get("hi").unwrap().clone(), out[0].get("lo").unwrap().clone())
+        };
+        assert_eq!(extremes(vec![dec("1.5"), Bson::Int32(5)]), (Bson::Int32(5), dec("1.5")));
+        assert_eq!(extremes(vec![Bson::Int32(5), dec("1.5")]), (Bson::Int32(5), dec("1.5")));
+        assert_eq!(
+            extremes(vec![Bson::Double(0.1), dec("0.1"), dec("1E+400"), Bson::Double(f64::MAX)]),
+            (dec("1E+400"), dec("0.1"))
+        );
+        // Equal values keep the first seen, whatever its type.
+        assert_eq!(extremes(vec![dec("2.0"), Bson::Int32(2)]), (dec("2.0"), dec("2.0")));
+    }
+
     /// A number re-spelled as an equal value of another type, or a decimal as
     /// another member of its cohort, where one exists: the transformations
     /// that must never change a value's identity.
