@@ -27832,7 +27832,7 @@ close the cases it can prove safe, leave the rest to the operator in words, and 
 and that is not young (`left`); a rival, unique, TTL, vector, dropped-here, buried-life or ambiguous index; a collection
 over a size gate; a collection the loop guard has stopped. A document repair that leaves rows logs `a divergence repair left
 rows it will not write` and a definition repair that skips any index logs `a definition repair left indexes it will not
-build`, each with `the operator rule in operations.md decides`; the definition one carries the count of each kind and
+build`, each with `the operator rule in operations.md decides` (not for a `gone` end, which is retried); the definition one carries the count of each kind and
 the first ten index names as `name (kind)`. **Decided (owner, 2026-10-14):** the older-`created` settle of
 two concurrent creates is **not** built (it lost data across a drop); what is checked instead is a convergence model
 test, a separate change.
@@ -27861,7 +27861,7 @@ return. With `cluster.divergence_repair` off the residual stays a finding, as in
 rule and a model test against a replay of each pair's history), `digest_repair_tests.rs` (the planner with the guard),
 `residual_4_is_closed_by_the_document_repair` (the model's schedule, then the repair), and four end-to-end tests through the real loop (a lost update repaired and judged effective, a lost plain index built, a
 unique index never built, the switch off, the size gate); the definition repair's `WARN` for a TTL-only and a unique remainder and none for a
-fully built repair (`digest_repair_tests.rs`). Mutation rows (in bash, each killed unless named): every clause
+fully built or a gone-only repair (`digest_repair_tests.rs`). Mutation rows (in bash, each killed unless named): every clause
 of the policy table, the young-stamp comparison and its absent-horizon fail-closed, each collector's horizon write, the
 reset, the adoption's `set` for `max`, the cut counts, the ledger's rules (16 rows), and the definition table (22
 rows). Equivalent mutants are named in the test files that pin the clause.

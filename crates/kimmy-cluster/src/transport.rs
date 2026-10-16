@@ -3527,7 +3527,8 @@ fn log_repair_end(
                 ambiguous = definitions.ambiguous,
                 "a divergence repair ended"
             );
-            if skipped > 0 {
+            // A gone end is transient and retried, not a remainder for the operator.
+            if skipped > definitions.gone {
                 warn!(
                     peer = %peer,
                     collection = %collection,

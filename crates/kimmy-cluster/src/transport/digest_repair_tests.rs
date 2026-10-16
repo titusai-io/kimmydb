@@ -717,6 +717,26 @@ fn a_definition_repair_that_left_a_unique_index_warns_and_names_the_kind_and_the
 }
 
 #[test]
+fn a_definition_repair_that_only_found_the_collection_gone_raises_no_warning() {
+    let lines = definition_repair_logged(
+        kimmy_storage::DefinitionRestore { gone: 1, ..Default::default() },
+        &[],
+    );
+    assert!(lines.iter().any(|l| l.contains("a divergence repair ended")));
+    assert!(the_definition_warn(&lines).is_none(), "{lines:?}");
+}
+
+#[test]
+fn a_gone_beside_a_left_index_is_a_field_of_the_warning() {
+    let lines = definition_repair_logged(
+        kimmy_storage::DefinitionRestore { gone: 1, ttl: 1, ..Default::default() },
+        &["expire_at (ttl)"],
+    );
+    let warn = the_definition_warn(&lines).expect("the WARN");
+    assert!(warn.contains("gone=1") && warn.contains("ttl=1"), "{warn}");
+}
+
+#[test]
 fn a_definition_repair_that_built_everything_raises_no_warning() {
     let lines = definition_repair_logged(
         kimmy_storage::DefinitionRestore { built: 1, ..Default::default() },
