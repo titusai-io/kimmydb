@@ -27865,3 +27865,45 @@ fully built or a gone-only repair (`digest_repair_tests.rs`). Mutation rows (in 
 of the policy table, the young-stamp comparison and its absent-horizon fail-closed, each collector's horizon write, the
 reset, the adoption's `set` for `max`, the cut counts, the ledger's rules (16 rows), and the definition table (22
 rows). Equivalent mutants are named in the test files that pin the clause.
+
+**Addendum, 0.50.0: the count half does not compare against, or repair from, a member catching
+up.** Point 2 holds the document and definition repairs while either member is catching up; the
+count half had no such rule, and a lab round found the gap. A wiped member B fell behind its
+peers' retention horizon and took a whole-database snapshot (394 pages, almost four minutes). A
+snapshot's pages are state B's version vector does not name until the last page grants the
+coverage (ADR-152, ADR-224), so B's position stood still behind both peers, the count gate read
+it as frozen after `FROZEN_CONTACTS` contacts (ADR-145), compared its part-way count of a
+200,000-document collection, confirmed a count divergence on the next probe, and planned the
+count repair from B: a replay B refused as history it holds only as state, then the
+collection's snapshot from B, which landed nothing. A false finding, and a pull of a partial
+state. 0.49.0 does the same, and worse: its fallback for that replay was a whole-database
+snapshot that marked the repairing member catching up (scoped by ADR-236).
+
+- **The gate.** The count probe is deferred while either member of the contact is catching up,
+  whatever the position: the block the peer sends on the contact's `Vectors` (ADR-201) says its
+  marker is set, or this member's own marker is. It is counted under the existing `deferred`
+  outcome of `kimmy_sync_divergence_count_probes_total`; no label or series is added. A deferred
+  probe suspends a confirmed count finding as any deferral does (ADR-236).
+- **The plan.** `plan_count_repairs` plans nothing while either member is catching up
+  (`either_side_is_catching_up`, the rule the other two repairs already use), which also covers
+  an existence finding against such a member.
+- **It ends with the marker.** Once the marker clears, the member's vector covers what it holds
+  and the next contact is judged by position alone; a real difference is compared, confirmed
+  and repaired as before (`a_real_count_divergence_is_found_and_repaired_once_the_marker_clears`).
+  A marker that stands for good (point 2's F7/B1 wedge) holds the count half too, and is
+  already its own reported state (`kimmy_catching_up`, `503 catching_up`); the existence half
+  and the cut digest's detection still run against the member.
+- **Wire and roll.** No field is added: the block and its `catching_up` have been on every
+  `Vectors` since 0.43.0. A peer before 0.43.0 sends no block and is judged by position, as
+  before. During a roll a 0.49.x member still compares a catching-up member and repairs from it,
+  with its own whole-database fallback, until it is upgraded.
+
+**Tests.** `count_finding_tests.rs`: a member part-way through a real whole-database snapshot is
+probed with no count compared, no finding and no repair; the deferral ends with the marker and a
+real divergence is then found and repaired; the member catching up compares and plans nothing
+itself; the check after a pull defers too; and in the loop (`replicate`), a collection a peer
+catching up holds only as snapshot state is not repaired from it until its marker clears. The
+gate's truth table is in `transport.rs`. Mutation rows (in bash, all killed): the gate's clause
+removed, counted as not deferred, or comparing; the peer's block ignored; this member's marker
+ignored; the block's flag never read; each of the two check sites passing `false`; the plan gate
+removed; the loop passing `false` to it; and the fix off as a whole (the pre-fix behaviour).
