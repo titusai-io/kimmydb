@@ -88,7 +88,8 @@ fn a_token_is_the_schema_4_key_of_the_last_id_and_a_walk_sees_every_id_once() {
     let state = seeded(&dir);
     for limit in [1, 2, 3, 4] {
         let (mut seen, mut cursor): (Vec<i64>, _) = (Vec::new(), None);
-        loop {
+        // Bounded: a token read in the wrong form can resume at the row it names, for ever.
+        for _ in 0..=ids().len() {
             let (ids, next) = page(&state, cursor, limit);
             seen.extend(&ids);
             let Some(next) = next else { break };
@@ -96,7 +97,7 @@ fn a_token_is_the_schema_4_key_of_the_last_id_and_a_walk_sees_every_id_once() {
             assert_eq!(URL_SAFE_NO_PAD.decode(&next).unwrap(), v1(last), "after {last:#x}");
             cursor = Some(next);
         }
-        assert_eq!(seen, ids(), "page size {limit}");
+        assert_eq!(seen, ids(), "page size {limit}: every id once, and the walk ends");
     }
 }
 
@@ -122,7 +123,10 @@ fn a_token_issued_here_continues_on_a_0_50_member() {
     by_v1.sort_by_key(|id| v1(*id));
     for limit in [1, 2, 3] {
         let mut cursor = None;
+        let mut pages = 0;
         loop {
+            pages += 1;
+            assert!(pages <= ids().len() + 1, "a walk that does not end (page size {limit})");
             let (_, next) = page(&state, cursor, limit);
             let Some(next) = next else { break };
             let bound = URL_SAFE_NO_PAD.decode(&next).unwrap();

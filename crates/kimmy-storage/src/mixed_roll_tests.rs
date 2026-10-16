@@ -631,7 +631,8 @@ fn a_page_carries_its_deletes_and_its_cursor_in_the_schema_4_form() {
     for scope in [Some(coll.id), None] {
         let mut after = None;
         let mut carried = Vec::new();
-        loop {
+        for pages in 1.. {
+            assert!(pages <= 16, "a walk that does not end");
             let page = s.snapshot_page(after.clone(), scope).unwrap();
             oracle::page(&s, &page).unwrap();
             carried.extend(page.deleted_documents.iter().map(|t| t.key.clone()));
