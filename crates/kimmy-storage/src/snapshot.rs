@@ -108,7 +108,7 @@
 //! on exit, and [`Engine::apply_snapshot_page`] converts every carried delete's
 //! key to the stored form as its first act, before the policy dispatch, so the
 //! `All`, `Converge` and `Definitions` paths only ever see stored keys
-//! ([`CarriedDelete`]). A page's `next` is **not** converted by a receiver: it
+//! (`CarriedDelete`). A page's `next` is **not** converted by a receiver: it
 //! is stored as received and sent back, and only a sender uses a cursor as a
 //! bound. The transport passes frames through unchanged, so every caller, the
 //! model tests included, exercises these conversions.
