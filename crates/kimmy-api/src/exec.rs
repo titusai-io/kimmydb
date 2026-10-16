@@ -481,6 +481,9 @@ fn sort_is_id_ascending(sort: &[shape::SortKey]) -> bool {
 /// documents and a projection may have dropped `_id` from them (ADR-150).
 /// Reading it back out of the page would have made `{"_id": 0}` a walk that
 /// ended after one page, silently and looking like the end of the collection.
+///
+/// Built from the stored key; the token the client is given is its legacy form
+/// (`kimmy_core::Cursor::encode`, Decimal128 design 7.2).
 fn next_cursor(last: Option<&bson::Bson>) -> Option<kimmy_core::Cursor> {
     let id = DocId::try_from_bson(last?).ok()?;
     let key = kimmy_core::keyenc::encode(&id.to_bson()).ok()?;
@@ -771,6 +774,11 @@ pub fn collect_matching_stamped_after(
 pub enum Order<'a> {
     /// `_id` ascending, resuming strictly after an encoded document key — the
     /// order a page is returned in and a cursor resumes from.
+    ///
+    /// `after` is a **stored** key: a client's token was converted from the legacy
+    /// form by `kimmy_core::Cursor::decode`, and the vector filter's paging hands
+    /// its own stored keys straight in. Nothing here may read it as legacy
+    /// (Decimal128 design 7.2).
     ById { after: Option<&'a [u8]> },
     /// Whichever order the access path finds cheapest. For a count, which
     /// has no order, or a sort, which imposes its own.
