@@ -190,6 +190,9 @@ struct MembersInner {
     /// [`crate::health::WARN_INTERVAL`] and peer.
     undecodable_said: Mutex<BTreeMap<NodeId, Instant>>,
     unheard_said: Mutex<BTreeMap<NodeId, Instant>>,
+    /// When each peer was last named in the WARN that a `Decimal128` id exists
+    /// here while it cannot hold one (ADR-238).
+    decimal128_said: Mutex<BTreeMap<NodeId, Instant>>,
 }
 
 /// The blocks held, and where a block must have been decoded after to count.
@@ -404,6 +407,39 @@ impl Members {
             );
         }
         due
+    }
+
+    /// The live peers that do not advertise `Facts.decimal128 = Some(true)`, a
+    /// peer not heard from yet included: what holds back a locally created
+    /// `Decimal128` id or bound (ADR-238). One load of the view, no lock.
+    pub fn decimal128_blockers(&self) -> Vec<NodeId> {
+        crate::facts::decimal128_blockers(&self.view())
+    }
+
+    /// The peers to name now in the WARN that this member holds a document
+    /// whose `_id` is a `Decimal128` while they cannot hold one (ADR-238): each
+    /// blocking peer the first time it is seen, then again every
+    /// [`crate::decimal128::DECIMAL128_WARN_INTERVAL`] while it still blocks.
+    /// The caller asks only while the marker is set. A peer that stops
+    /// blocking (it upgraded, or left the live set) is forgotten, so one that
+    /// blocks again is named at once.
+    pub fn decimal128_warn_due(&self, now: Instant) -> Vec<NodeId> {
+        let blockers = self.decimal128_blockers();
+        let mut said = self.0.decimal128_said.lock();
+        said.retain(|node, _| blockers.contains(node));
+        blockers
+            .into_iter()
+            .filter(|node| {
+                let due = said.get(node).is_none_or(|at| {
+                    now.saturating_duration_since(*at)
+                        >= crate::decimal128::DECIMAL128_WARN_INTERVAL
+                });
+                if due {
+                    said.insert(*node, now);
+                }
+                due
+            })
+            .collect()
     }
 
     /// Drop what `node` last said, and what it last echoed of ours: it is a new

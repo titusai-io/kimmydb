@@ -10249,6 +10249,7 @@ async fn the_metrics_body_exposes_exactly_these_series_in_exactly_this_order() {
         "kimmy_sync_digest_repair_stopped_collections",
         "kimmy_sync_divergence_repair_enabled",
         "kimmy_gc_tombstone_horizon_seconds",
+        "kimmy_decimal128_id_present",
         "kimmy_sync_definition_repairs_total",
         "kimmy_sync_definition_repairs_total",
         "kimmy_sync_definition_repairs_total",
@@ -14842,4 +14843,121 @@ async fn aggregate_explain_plans_and_the_body_stays_closed() {
         assert_eq!(planned.status, ran.status, "{coll} {pipeline}");
         assert_eq!(planned.body, ran.body, "{coll} {pipeline}");
     }
+}
+
+// ---------------------------------------------------------------------------
+// The Decimal128 gate and its marker (ADR-238)
+// ---------------------------------------------------------------------------
+
+fn decimal(text: &str) -> Value {
+    json!({ "$numberDecimal": text })
+}
+
+fn close_decimal128_gate(server: &Server) {
+    server.state.engine.set_decimal128_gate(Arc::new(|| {
+        Err(kimmy_core::Decimal128Closed::Peers(vec!["peer-b".into()]))
+    }));
+}
+
+fn refused_by_the_gate(res: &Res, path: &str) {
+    assert_eq!(res.status, 400, "{path}: {:?}", res.body);
+    let message = res.body["message"].as_str().unwrap_or_default();
+    assert!(
+        message.contains("cluster.decimal128") && message.contains("peer-b"),
+        "{path}: the refusal names the key and the peer: {message}"
+    );
+}
+
+#[tokio::test]
+async fn every_write_path_answers_400_for_a_decimal_id_while_the_gate_is_closed() {
+    let server = Server::start().await;
+    let token = server.root().await;
+    server.post("/v1/db/shop/collections", Some(&token), json!({ "name": "c" })).await;
+    close_decimal128_gate(&server);
+
+    let docs = "/v1/db/shop/coll/c/docs";
+    let res = server.post(docs, Some(&token), json!({ "_id": decimal("1.5"), "v": 1 })).await;
+    refused_by_the_gate(&res, "insert");
+    // An integral decimal: the id `7`, and a body that keeps the decimal.
+    let res = server.post(docs, Some(&token), json!({ "_id": decimal("7") })).await;
+    refused_by_the_gate(&res, "insert of an integral decimal");
+    let res = server
+        .post(
+            "/v1/db/shop/coll/c/bulk",
+            Some(&token),
+            json!([{ "_id": 1 }, { "_id": decimal("2.5") }]),
+        )
+        .await;
+    refused_by_the_gate(&res, "bulk");
+    // An upsert takes its `_id` from the filter's equalities (`$setOnInsert` cannot
+    // set `_id`). On this build a decimal filter operand is still refused by the
+    // filter, which answers first; the gate's own refusal of an upsert, with and
+    // without `$setOnInsert`, is pinned at the storage chokepoint the edge reaches
+    // (`decimal128_gate_tests`). Either way: a 400, and nothing created.
+    let fam = "/v1/db/shop/coll/c/find_and_modify";
+    for update in [json!({ "$set": { "v": 1 } }), json!({ "$setOnInsert": { "created_at": 1 } })] {
+        let res = server
+            .post(
+                fam,
+                Some(&token),
+                json!({ "filter": { "_id": decimal("3.5") }, "update": update, "upsert": true }),
+            )
+            .await;
+        assert_eq!(res.status, 400, "upsert {update}: {:?}", res.body);
+    }
+    let res = server
+        .put(&format!("{docs}/8?upsert=true"), Some(&token), json!({ "_id": decimal("8") }))
+        .await;
+    refused_by_the_gate(&res, "a replace that creates the row");
+    let res = server
+        .post(
+            "/v1/db/shop/coll/c/indexes",
+            Some(&token),
+            json!({ "name": "positive", "fields": [{ "path": "email" }],
+                    "partialFilterExpression": { "balance": { "$gt": decimal("0") } } }),
+        )
+        .await;
+    refused_by_the_gate(&res, "a partial index with a decimal bound");
+
+    // Nothing was written, and the marker says so.
+    let count = server.post("/v1/db/shop/coll/c/count", Some(&token), json!({})).await;
+    assert_eq!(count.body["count"], 0, "{:?}", count.body);
+    let indexes = server.get("/v1/db/shop/coll/c/indexes", Some(&token)).await;
+    assert!(!indexes.body.to_string().contains("positive"), "{:?}", indexes.body);
+    assert_eq!(server.get("/readyz", None).await.body["decimal128_id_present"], false);
+    assert!(metrics_text(&server).await.contains("\nkimmy_decimal128_id_present 0\n"));
+}
+
+#[tokio::test]
+async fn the_marker_reaches_readyz_and_metrics_with_the_first_decimal_id() {
+    // A lone node installs no gate: every creation is allowed, as `cluster.decimal128`
+    // defaults to `true` with clustering off.
+    let server = Server::start().await;
+    let token = server.root().await;
+    server.post("/v1/db/shop/collections", Some(&token), json!({ "name": "c" })).await;
+    let ready = server.get("/readyz", None).await;
+    assert_eq!(ready.status, 200);
+    assert_eq!(ready.body["decimal128_id_present"], false, "{:?}", ready.body);
+
+    let docs = "/v1/db/shop/coll/c/docs";
+    let res = server.post(docs, Some(&token), json!({ "_id": 1, "v": decimal("1.5") })).await;
+    assert_eq!(res.status, 200, "{:?}", res.body);
+    assert_eq!(server.get("/readyz", None).await.body["decimal128_id_present"], false, "a value");
+
+    let res = server
+        .put(&format!("{docs}/7?upsert=true"), Some(&token), json!({ "_id": decimal("7") }))
+        .await;
+    assert_eq!(res.status, 200, "{:?}", res.body);
+    assert_eq!(server.get("/readyz", None).await.body["decimal128_id_present"], true);
+    assert!(metrics_text(&server).await.contains("\nkimmy_decimal128_id_present 1\n"));
+
+    // A replace over the existing decimal id creates nothing and is not refused
+    // once the gate closes.
+    close_decimal128_gate(&server);
+    let res = server.put(&format!("{docs}/7"), Some(&token), json!({ "v": 2 })).await;
+    assert_eq!(res.status, 200, "{:?}", res.body);
+    let found = server
+        .post("/v1/db/shop/coll/c/find", Some(&token), json!({ "filter": { "_id": 7 } }))
+        .await;
+    assert_eq!(found.body["documents"][0]["_id"], decimal("7"), "{:?}", found.body);
 }

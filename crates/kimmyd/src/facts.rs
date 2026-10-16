@@ -35,6 +35,10 @@ pub fn source(
             catching_up,
             catching_up_reason,
             started_ms,
+            // This binary can hold a `Decimal128` id and bound, whatever this
+            // member's `cluster.decimal128` says (ADR-238): the key is the
+            // operator's word about the cluster, this the build's about itself.
+            decimal128: Some(true),
             ..Facts::default()
         };
         let mut block = match engine.upgrade() {

@@ -20,6 +20,7 @@
 
 pub mod catchup;
 pub mod confirm;
+pub mod decimal128;
 pub mod discovery;
 pub mod facts;
 pub mod health;
@@ -37,10 +38,11 @@ mod codec_tests;
 pub use confirm::{
     ConfirmConfig, ConfirmHook, ConfirmOutcome, Confirmer, PushSentHook, Resolution,
 };
+pub use decimal128::{DECIMAL128_WARN_INTERVAL, Decimal128Gate};
 pub use discovery::{DEFAULT_CLUSTER_PORT, ResolveError, SeedSource, names_another_member};
 pub use facts::{
     CatchUpReason, ClassState, Facts, FactsSource, MAX_TTL_COLLECTIONS, OwnerClass, PeerState,
-    PerClass, StallCause, TtlHeld, Yielding, facts_undecodable_total,
+    PerClass, StallCause, TtlHeld, Yielding, decimal128_blockers, facts_undecodable_total,
 };
 pub use health::{DEFAULT_FANOUT, MAX_BACKOFF, PeerHealth, WARN_INTERVAL};
 pub use membership::{Member, Members, PeerView, SeedFeed, ViewBlock};

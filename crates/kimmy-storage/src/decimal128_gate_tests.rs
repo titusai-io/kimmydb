@@ -172,6 +172,53 @@ fn a_scope_insert_and_a_scope_replace_are_gated() {
     assert!(!marked(&e));
 }
 
+/// An upsert as `find_and_modify` builds one when nothing matches: the seed the
+/// filter's equalities imply, with `$setOnInsert` and the update applied by the
+/// query layer, exactly as the HTTP edge does it.
+struct Upsert(Document);
+
+impl crate::ModifySpec for Upsert {
+    fn matches(&self, _: &Document) -> kimmy_core::Result<bool> {
+        Ok(false)
+    }
+    fn compare(&self, _: &Document, _: &Document) -> std::cmp::Ordering {
+        std::cmp::Ordering::Equal
+    }
+    fn apply(&self, doc: &Document) -> std::result::Result<Option<Document>, String> {
+        Ok(Some(doc.clone()))
+    }
+    fn upsert(&self) -> Option<std::result::Result<Document, String>> {
+        Some(Ok(self.0.clone()))
+    }
+}
+
+fn upsert_seed(id: Bson, update: Document) -> Document {
+    let update = kimmy_query::update::parse(&update).unwrap();
+    let mut seed = doc! { "_id": id };
+    kimmy_query::update::apply_on_insert(&update, &mut seed, 0).unwrap();
+    seed
+}
+
+#[test]
+fn an_upsert_and_a_set_on_insert_that_create_a_decimal_id_are_refused() {
+    let (e, _d) = closed();
+    for seed in [
+        upsert_seed(dec("3.5"), doc! { "$set": { "v": 1 } }),
+        upsert_seed(dec("4"), doc! { "$setOnInsert": { "created_at": 1 }, "$inc": { "n": 1 } }),
+    ] {
+        let refused = e.find_and_modify(&coll(&e), &crate::Candidates::Scan, &Upsert(seed.clone()));
+        gated(refused.unwrap_err(), Decimal128Use::Id);
+    }
+    assert_eq!(count(&e), 0);
+    assert!(!marked(&e));
+
+    open(&e);
+    let seed = upsert_seed(dec("4"), doc! { "$setOnInsert": { "created_at": 1 } });
+    let done = e.find_and_modify(&coll(&e), &crate::Candidates::Scan, &Upsert(seed)).unwrap();
+    assert_eq!(done.upserted, Some(DocId::Int64(4)));
+    assert!(marked(&e), "the upsert's commit carries the marker");
+}
+
 // -- The second chokepoint: replace_in_txn ------------------------------------------
 
 #[test]

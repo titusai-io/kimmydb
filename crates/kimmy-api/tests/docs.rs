@@ -579,6 +579,7 @@ fn nothing_the_endpoint_exposes_depends_on_the_engine_readings() {
         violations: kimmy_storage::ViolationsSnapshot::default(),
         held_marks_released: 14,
         held_marks: 15,
+        decimal128_id_present: true,
         webhook_active: 18,
         webhook_invalidated: 19,
         webhook_unreadable: 21,

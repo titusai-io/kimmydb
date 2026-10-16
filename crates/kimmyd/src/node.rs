@@ -866,6 +866,16 @@ async fn start_and_serve(
     let class = kimmy_storage::DurabilityClass::parse(&config.storage.durability)
         .unwrap_or(kimmy_storage::DurabilityClass::Durable);
     engine.set_durability(class, Duration::from_millis(config.storage.commit_coalesce_ms));
+    // The gate on a locally created `Decimal128` id or partial-filter bound
+    // (ADR-238), installed before anything can write through this node: the
+    // operator's declaration now, the live member set once the cluster is up
+    // (until then a clustered member refuses, failing closed).
+    let decimal128 = kimmy_cluster::Decimal128Gate::new(
+        config.cluster.decimal128(),
+        config.cluster.enabled,
+        config.cluster.membership,
+    );
+    engine.set_decimal128_gate(decimal128.predicate());
 
     // Version and commit together, because during a rolling upgrade or an
     // incident the question is "which build is this exactly", and a version
@@ -1326,6 +1336,7 @@ async fn start_and_serve(
     // after the router was built — hence a late hand-off rather than a
     // constructor argument.
     if let Some(members) = cluster.members.clone() {
+        decimal128.set_members(members.clone());
         state.set_members(members);
     }
 

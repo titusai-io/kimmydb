@@ -726,7 +726,13 @@ async fn readyz(State(state): State<SharedState>) -> Result<Json<Value>, ApiErro
         refusal.extra = Some(Box::new(extra));
         return Err(refusal);
     }
-    let mut body = json!({ "status": "ready", "node": state.engine.node_id().to_string() });
+    // The durable marker that a `Decimal128` id exists on this member (ADR-238):
+    // what a rollback runbook reads on every member, beside the node's id.
+    let mut body = json!({
+        "status": "ready",
+        "node": state.engine.node_id().to_string(),
+        "decimal128_id_present": state.engine.decimal128_id_present()?,
+    });
     if let Some(catch_up) = catching_up {
         // Serving as `unknown`: why, and who owes the replay (ADR-212).
         body["catching_up"] = json!(catch_up.state_label(now));
