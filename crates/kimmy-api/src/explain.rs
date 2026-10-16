@@ -235,10 +235,8 @@ fn describe(stage: &Stage, per_input: bool) -> Value {
                             Some(_) => 1,
                         };
                         out["residualClauses"] = json!(residual);
-                        out["fallback"] = json!(
-                            "nested loop at run time if a key holds a Decimal128, or the build or a \
-                             probe raises"
-                        );
+                        out["fallback"] =
+                            json!("nested loop at run time if the build or a probe raises");
                     }
                     let mut inner = Vec::new();
                     for (i, stage) in sub.iter().enumerate() {
@@ -686,7 +684,7 @@ mod tests {
         assert_eq!(lookup["strategy"], "foreignScanHashJoin");
         assert_eq!(lookup["joinKey"], json!({ "foreign": "$n", "local": "$$n" }));
         assert_eq!(lookup["residualClauses"], 1);
-        assert!(lookup["fallback"].as_str().unwrap().contains("Decimal128"));
+        assert!(lookup["fallback"].as_str().unwrap().contains("raises"));
         let inner = lookup["stages"].as_array().unwrap();
         assert_eq!(inner[0]["part"], "independent");
         assert_eq!(inner[0]["perInputDocument"], false);

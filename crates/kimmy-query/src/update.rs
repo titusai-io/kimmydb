@@ -2927,7 +2927,7 @@ mod decimal128 {
     }
 
     #[test]
-    fn add_to_set_takes_a_decimal128_operand_and_identifies_it_by_its_bytes() {
+    fn add_to_set_takes_a_decimal128_operand_and_identifies_it_by_its_value() {
         let add = |update: Document, stored: Vec<Bson>| {
             let mut d = doc! { "_id": 1, "t": stored };
             let parsed = parse(&update).unwrap_or_else(|e| panic!("refused {update}: {e}"));
@@ -2935,15 +2935,19 @@ mod decimal128 {
             d.get_array("t").unwrap().clone()
         };
         let one = || doc! { "$addToSet": { "t": dec("1") } };
-        // A number is not a `Decimal128`, whichever is stored.
-        assert_eq!(add(one(), vec![Bson::Int32(1)]), vec![Bson::Int32(1), dec("1")]);
-        // The same bytes are the same member.
+        // An equal number is the same member, whichever is stored.
+        assert_eq!(add(one(), vec![Bson::Int32(1)]), vec![Bson::Int32(1)]);
+        assert_eq!(add(one(), vec![Bson::Double(1.0)]), vec![Bson::Double(1.0)]);
+        // So is an equal decimal, whatever its spelling.
         assert_eq!(add(one(), vec![dec("1")]), vec![dec("1")]);
-        // Different bytes are two members.
-        assert_eq!(add(one(), vec![dec("1.0")]), vec![dec("1.0"), dec("1")]);
+        assert_eq!(add(one(), vec![dec("1.0")]), vec![dec("1.0")]);
+        // A different value is a new member, and 0.1 the decimal is not 0.1 the double.
+        assert_eq!(add(one(), vec![Bson::Int32(2)]), vec![Bson::Int32(2), dec("1")]);
+        let tenth = || doc! { "$addToSet": { "t": dec("0.1") } };
+        assert_eq!(add(tenth(), vec![Bson::Double(0.1)]), vec![Bson::Double(0.1), dec("0.1")]);
         // Inside `$each`, and in a document or array operand.
-        let each = doc! { "$addToSet": { "t": { "$each": [dec("1"), dec("1"), 1] } } };
-        assert_eq!(add(each, vec![]), vec![dec("1"), Bson::Int32(1)]);
+        let each = doc! { "$addToSet": { "t": { "$each": [dec("1"), dec("1.0"), 1, 2] } } };
+        assert_eq!(add(each, vec![]), vec![dec("1"), Bson::Int32(2)]);
         let nested = doc! { "$addToSet": { "t": { "n": dec("1") } } };
         assert_eq!(add(nested, vec![]), vec![Bson::Document(doc! { "n": dec("1") })]);
         let array = doc! { "$addToSet": { "t": [dec("1")] } };

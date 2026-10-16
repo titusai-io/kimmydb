@@ -2480,7 +2480,7 @@ fn matched_for_input(
 }
 
 /// The foreign side filed by `A(d)`, or `Declined` if evaluating or encoding it
-/// failed for any document (an error, or a `Decimal128`, which has no key).
+/// failed for any document (an error: every value has a key now).
 fn build_table(key: &aggregate::JoinKey, base: &[bson::Document]) -> JoinTable {
     #[cfg(test)]
     join_counters::builds();
@@ -2565,9 +2565,9 @@ fn encode_key(value: &bson::Bson) -> Option<Vec<u8>> {
 /// The distinct keys a document joins under at `field`: one for every value of
 /// [`aggregate::join_values`] (what the path yields, and the elements of any
 /// that is an array), the same function the input side's wanted set is built
-/// from. A value that cannot be keyed (a `Decimal128`, alone or inside an array)
-/// yields none, so `[Decimal128, 5]` joins on its `5` and not as a whole, and a
-/// document without the field yields no keys at all.
+/// from. A `Decimal128` is keyed by its value, alone or inside an array, so
+/// `[Decimal128("5.0"), 5]` joins under the one key, and a document without the
+/// field yields no keys at all.
 fn join_keys(doc: &bson::Document, field: &str) -> Vec<Vec<u8>> {
     let mut keys: Vec<Vec<u8>> =
         aggregate::join_values(doc, field).into_iter().filter_map(encode_key).collect();
@@ -3241,7 +3241,8 @@ mod tests {
             ]
         );
         assert!(join_keys(&doc, "missing").is_empty());
-        assert!(join_keys(&doc, "d").is_empty(), "a value that cannot be keyed yields none");
+        // A decimal zero is keyed like the number zero.
+        assert_eq!(join_keys(&doc, "d"), vec![encode_key(&bson::Bson::Int32(0)).unwrap()]);
     }
 
     /// The ceiling counts the foreign documents held, once each: a join that
@@ -3334,10 +3335,10 @@ mod tests {
         assert_eq!(out["documents"][0]["p"], json!([]));
     }
 
-    /// A value that cannot be keyed joins nothing, and inside an array the
-    /// elements that can be still do.
+    /// A `Decimal128` joins what equals it by value, and inside an array each
+    /// element joins on its own.
     #[test]
-    fn a_decimal128_key_joins_nothing_and_its_array_joins_on_the_rest() {
+    fn a_decimal128_key_joins_by_value_and_its_array_on_each_element() {
         let dir = tempfile::tempdir().unwrap();
         let state = live_state(&dir);
         let dec = || bson::Bson::Decimal128(bson::Decimal128::from_bytes([0; 16]));
@@ -3356,7 +3357,10 @@ mod tests {
             { "$sort": { "_id": 1 } },
         ]);
         let out = agg(&state, &superuser(), "app", "orders", &join).unwrap();
-        assert_eq!(joined_ids(&out, "p"), vec![vec![], vec![json!("five")]]);
+        assert_eq!(
+            joined_ids(&out, "p"),
+            vec![vec![json!("dec")], vec![json!("dec"), json!("five")]]
+        );
     }
 
     #[test]
@@ -3510,6 +3514,7 @@ mod decimal128_at_the_edge {
         // the stored bytes; createIndex-then-insert files the document the
         // edge produced. The count used to differ — 1 and 0 — because the
         // edge left `$numberDecimal` a nested document the index could key.
+        // Both now key the `Decimal128` as a number, and the two agree.
         let (first, _d1) = engine();
         let coll = first.get_collection("app", "docs").unwrap();
         first.insert(&coll, decimal_document()).unwrap();
@@ -3521,9 +3526,9 @@ mod decimal128_at_the_edge {
         second.insert(&coll, decimal_document()).unwrap();
         let written = second.unkeyed_count(&coll, coll.index("av").unwrap().id).unwrap();
 
-        assert_eq!(backfilled, 1, "the backfill files the Decimal128 unkeyed");
+        assert_eq!(backfilled, 0, "the backfill keys the Decimal128");
         assert_eq!(written, backfilled, "and so does the write path, on the same member");
-        assert_eq!(second.unkeyed_writes(), 1, "counted, as every unkeyed filing is");
+        assert_eq!(second.unkeyed_writes(), 0, "nothing was filed unkeyed");
     }
 
     #[test]
@@ -3607,7 +3612,7 @@ mod decimal128_at_the_edge {
 /// A join against a naive reference over generated documents (ADR-210): two
 /// documents join when a value of one, and the elements of it when it is an
 /// array, equals a value of the other read the same way; a missing field joins
-/// nothing and a `Decimal128` cannot be a key. Scan order is ascending `_id`.
+/// nothing and a `Decimal128` is equal to the number of its value. Scan order is ascending `_id`.
 #[cfg(test)]
 mod join_differential {
     use super::*;
@@ -3698,19 +3703,8 @@ mod join_differential {
         }
     }
 
-    fn has_decimal(v: &Bson) -> bool {
-        match v {
-            Bson::Decimal128(_) => true,
-            Bson::Array(a) => a.iter().any(has_decimal),
-            Bson::Document(d) => d.values().any(has_decimal),
-            _ => false,
-        }
-    }
-
     fn equal(a: &Bson, b: &Bson) -> bool {
-        !has_decimal(a)
-            && !has_decimal(b)
-            && kimmy_core::cmp::canonical_cmp(a, b) == Ordering::Equal
+        kimmy_core::cmp::canonical_cmp(a, b) == Ordering::Equal
     }
 
     /// The reference's values: each resolved value, then its elements.

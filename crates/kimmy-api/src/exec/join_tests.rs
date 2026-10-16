@@ -495,26 +495,30 @@ fn a_residual_that_raises_falls_back_for_that_input_only() {
     assert!(run.outcome.is_err(), "the second input raises in the loop too");
 }
 
-/// A `Decimal128` on either side cannot be keyed: the loop answers, and `$eq` ranks it
-/// equal to every number.
+/// A `Decimal128` on either side is keyed by its value: the hash join answers, and answers
+/// as the loop does, where `$eq` now matches a decimal against the equal number only.
 #[test]
-fn a_decimal128_key_takes_the_loop() {
-    let dec: bson::Decimal128 = "7".parse().unwrap();
+fn a_decimal128_key_is_joined_by_its_value() {
+    let dec: bson::Decimal128 = "2.0".parse().unwrap();
     let dir = tempfile::tempdir().unwrap();
     let state = state_with(
         &dir,
         vec![doc! { "_id": 1, "v": 1 }, doc! { "_id": 2, "v": 2 }],
-        vec![doc! { "_id": 10, "k": Bson::Decimal128(dec) }, doc! { "_id": 11, "k": 2 }],
+        vec![doc! { "_id": 10, "k": Bson::Decimal128(dec) }, doc! { "_id": 11, "k": 1 }],
     );
     let run = both(&state, &eq_on_k());
-    assert_eq!(run.probes, 0, "a Decimal128 on the build side declines the whole execution");
+    assert_eq!(
+        run.probes, 1,
+        "a Decimal128 on the build side no longer declines: the second input probes"
+    );
     let dir = tempfile::tempdir().unwrap();
     let state = state_with(
         &dir,
         vec![doc! { "_id": 1, "v": 1 }, doc! { "_id": 2, "v": Bson::Decimal128(dec) }],
         vec![doc! { "_id": 10, "k": 1 }, doc! { "_id": 11, "k": 2 }],
     );
-    both(&state, &eq_on_k());
+    let run = both(&state, &eq_on_k());
+    assert_eq!(run.probes, 1, "nor on the probe side");
 }
 
 /// The attached ceiling reads the same on the first input and on a later one.

@@ -8311,16 +8311,22 @@ mod clearing {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("kimmy.redb");
         one_arrival_row_short(&path);
-        // A first rebuild settles the file: redb doubles it when it runs out of room, and
-        // whether a small clear runs out depends on where the last page of the store
-        // happened to land, which is not what this test is about. The rebuild measured is the
-        // second, from a file that has already had to hold the first.
-        drop(super::Engine::open(&path).unwrap());
+        // The file is measured **while the engine is open**: redb hands growth back within a
+        // commit or two, and closing the engine commits (and can truncate the file). So the
+        // figure that means something is the high-water mark of a rebuild, and what the bound
+        // asks is that a further rebuild needs no more room than the earlier ones already did.
+        // Those earlier rebuilds are the settling: the peak depends on where the last page of
+        // the store happened to land (it alternates between two figures here), which is not
+        // what this test is about, so the bound is on the largest of several.
+        let mut settled = 0;
+        for _ in 0..3 {
+            let engine = super::Engine::open(&path).unwrap();
+            settled = settled.max(file(&path));
+            drop(engine);
+            drop_the_last_arrival_row(&path);
+        }
         let written = drop_the_last_arrival_row(&path);
-        let before = file(&path);
 
-        // Measured with the engine still open: redb hands the growth back
-        // within a commit or two, and closing the engine commits.
         let engine = super::Engine::open(&path).unwrap();
         let during = file(&path);
         drop(engine);
@@ -8335,7 +8341,7 @@ mod clearing {
         // too would leave all three empty and equal.
         assert_eq!(oplog, written, "the oplog the index is rebuilt from is untouched");
         assert_eq!((arrival, by_stamp), (oplog, oplog), "premise: the index was rebuilt");
-        assert_no_growth(before, during, "rebuilding the arrival index");
+        assert_no_growth(settled, during, "rebuilding the arrival index");
     }
 
     /// A database of 5,000 documents whose arrival index is one row short,

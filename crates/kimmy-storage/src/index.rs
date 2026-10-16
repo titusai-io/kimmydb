@@ -3035,10 +3035,9 @@ mod tests {
 
     #[test]
     fn every_way_an_index_can_fail_to_key_a_document_is_the_same_outcome() {
-        // Three causes, one classification: the guard against a
-        // combinatorial number of entries, and the one value type with no
-        // exact key encoding (ADR-005). Each used to be a refusal on the
-        // write path and a permanent failure on the replication path.
+        // The guard against a combinatorial number of entries is the way left for a
+        // document to fail to key. It used to share the classification with the one
+        // value type with no exact key encoding (ADR-005); a `Decimal128` now has one.
         let single = index(vec![IndexField::ascending("a")], false);
         let big: Vec<Bson> = (0..1_000).map(Bson::Int32).collect();
         match document_keys(&single, &doc! { "a": big }).unwrap() {
@@ -3057,14 +3056,11 @@ mod tests {
             "998 elements and the whole array are 999 keys, under the cap"
         );
         let decimal = doc! { "a": Bson::Decimal128("1.5".parse().unwrap()) };
-        match document_keys(&single, &decimal).unwrap() {
-            DocumentKeys::Unkeyed { reason, multikey } => {
-                assert!(reason.contains("Decimal128"), "{reason}");
-                assert!(!multikey, "a scalar, however unencodable, is not an array");
-            }
-            other => panic!("Decimal128 must be unkeyed, got {other:?}"),
-        }
-        assert!(index_keys(&single, &decimal).is_err(), "the strict form still refuses");
+        assert!(
+            matches!(document_keys(&single, &decimal).unwrap(), DocumentKeys::Keyed { .. }),
+            "a Decimal128 has an exact key and is keyed like any number"
+        );
+        assert!(index_keys(&single, &decimal).is_ok(), "and the strict form keys it");
     }
 
     #[test]
@@ -5013,10 +5009,12 @@ mod tests {
                 .unwrap();
             let coll = engine.get_collection("app", "docs").unwrap();
             let old = Bson::DateTime(bson::DateTime::from_millis(1_000));
-            engine.insert(&coll, doc! { "_id": 1i64, "at": old }).unwrap();
-            engine
-                .insert(&coll, doc! { "_id": 2i64, "at": Bson::Decimal128("1".parse().unwrap()) })
-                .unwrap();
+            engine.insert(&coll, doc! { "_id": 1i64, "at": old.clone() }).unwrap();
+            // A thousand entries is the cap past which an index files a document
+            // unkeyed.
+            let too_many: Vec<Bson> =
+                (0..1_000).map(|i| Bson::DateTime(bson::DateTime::from_millis(i))).collect();
+            engine.insert(&coll, doc! { "_id": 2i64, "at": too_many }).unwrap();
             let index = coll.index("ttl").unwrap().clone();
             assert_eq!(engine.unkeyed_count(&coll, index.id).unwrap(), 1);
 
@@ -5034,6 +5032,8 @@ mod tests {
             let thousand: Vec<Bson> = (0..1_000).map(Bson::Int32).collect();
             for extra in [
                 doc! { "_id": 20i64, "a": [1, 2], "n": [10, 20] },
+                // A decimal is keyed now; it stays in the dataset beside the shapes
+                // that are not.
                 doc! { "_id": 21i64, "a": 1, "n": Bson::Decimal128("10".parse().unwrap()) },
                 doc! { "_id": 22i64, "a": thousand, "n": 10 },
                 doc! { "_id": 23i64, "a": [1], "n": [10] },
@@ -5050,7 +5050,7 @@ mod tests {
                 )
                 .unwrap();
             let coll = engine.get_collection("app", "docs").unwrap();
-            assert_eq!(engine.unkeyed_count(&coll, coll.indexes[0].id).unwrap(), 4);
+            assert_eq!(engine.unkeyed_count(&coll, coll.indexes[0].id).unwrap(), 3);
 
             for query in [
                 doc! { "a": 1 },

@@ -12005,11 +12005,6 @@ fn unkeyable_shapes() -> Vec<(&'static str, Value, Value)> {
             json!({ "a": (0..1_000).collect::<Vec<i32>>(), "b": 5 }),
             json!({ "b": 5 }),
         ),
-        (
-            "a Decimal128",
-            json!({ "a": 1, "b": { "$numberDecimal": "1.5" } }),
-            json!({ "b": { "$type": "decimal" } }),
-        ),
     ]
 }
 
@@ -12120,9 +12115,10 @@ async fn every_unkeyable_shape_is_filed_unkeyed_on_the_member_that_accepts_it() 
     // under a real key while both peers, applying the same bytes through
     // replication, filed it unkeyed: the JSON edge did not read
     // `$numberDecimal`, so the accepting member keyed a nested document
-    // where every re-decode of the stored bytes held a Decimal128. Every
-    // shape, by every way a document can arrive, now lands in the one state
-    // ADR-139 promises.
+    // where every re-decode of the stored bytes held a Decimal128. A
+    // `Decimal128` has a key now and is no longer one of the shapes; the rest,
+    // by every way a document can arrive, land in the one state ADR-139
+    // promises.
     for (shape, body, scan_only) in unkeyable_shapes() {
         for via in [Arrival::Insert, Arrival::Replace, Arrival::Set, Arrival::BeforeTheIndex] {
             unkeyed_on_the_accepting_member(shape, body.clone(), scan_only.clone(), via).await;
@@ -12131,10 +12127,10 @@ async fn every_unkeyable_shape_is_filed_unkeyed_on_the_member_that_accepts_it() 
 }
 
 #[tokio::test]
-async fn a_unique_index_refuses_a_decimal128_at_its_path_on_a_local_write() {
-    // The one refusal ADR-139 keeps, for the one shape the accepting member
-    // used to let through: a Decimal128 at a unique index's path is a
-    // document the index cannot key, and the client is there to be told.
+async fn a_unique_index_keys_a_decimal128_by_its_value_on_a_local_write() {
+    // A `Decimal128` at a unique index's path has an exact key, so it is stored
+    // and enforced like any number: a second document of the same value is a
+    // duplicate whatever the types and the spelling, and a different value is not.
     let server = Server::start().await;
     let token = server.root().await;
     server.post("/v1/db/shop/collections", Some(&token), json!({ "name": "prices" })).await;
@@ -12148,34 +12144,30 @@ async fn a_unique_index_refuses_a_decimal128_at_its_path_on_a_local_write() {
     assert_eq!(created.status, 200, "{:?}", created.body);
 
     let docs = "/v1/db/shop/coll/prices/docs";
-    let refused = server
-        .post(docs, Some(&token), json!({ "_id": 1, "amount": { "$numberDecimal": "9.99" } }))
-        .await;
-    assert_eq!(refused.status, 400, "{:?}", refused.body);
-    assert_eq!(refused.body["error"], "bad_request");
-    let message = refused.body["message"].as_str().unwrap();
-    assert!(message.contains("\"by_amount\""), "names the index: {message}");
-    assert!(message.contains("Decimal128"), "names the cause: {message}");
-    assert!(message.contains("a unique index must be able to key"), "{message}");
-    assert_eq!(server.get(&format!("{docs}/1"), Some(&token)).await.status, 404, "not stored");
-
-    // Without the unique constraint the same document is stored, unkeyed.
-    let dropped = server.delete("/v1/db/shop/coll/prices/indexes/by_amount", Some(&token)).await;
-    assert_eq!(dropped.status, 200, "{:?}", dropped.body);
-    let plain = server
-        .post(
-            "/v1/db/shop/coll/prices/indexes",
-            Some(&token),
-            json!({ "name": "by_amount", "fields": [{ "path": "amount" }] }),
-        )
-        .await;
-    assert_eq!(plain.status, 200, "{:?}", plain.body);
     let stored = server
         .post(docs, Some(&token), json!({ "_id": 1, "amount": { "$numberDecimal": "9.99" } }))
         .await;
     assert_eq!(stored.status, 200, "{:?}", stored.body);
+    for (id, amount) in
+        [(2, json!({ "$numberDecimal": "9.990" })), (3, json!({ "$numberDecimal": "99.9E-1" }))]
+    {
+        let duplicate =
+            server.post(docs, Some(&token), json!({ "_id": id, "amount": amount })).await;
+        assert_eq!(duplicate.status, 409, "{amount}: {:?}", duplicate.body);
+    }
+    // 9.99 the decimal is not 9.99 the double.
+    let double = server.post(docs, Some(&token), json!({ "_id": 4, "amount": 9.99 })).await;
+    assert_eq!(double.status, 200, "{:?}", double.body);
+    // An integral decimal and the integer are one value.
+    let ten = server.post(docs, Some(&token), json!({ "_id": 5, "amount": 10 })).await;
+    assert_eq!(ten.status, 200, "{:?}", ten.body);
+    let same = server
+        .post(docs, Some(&token), json!({ "_id": 6, "amount": { "$numberDecimal": "10.0" } }))
+        .await;
+    assert_eq!(same.status, 409, "{:?}", same.body);
+
     let listed = server.get("/v1/db/shop/coll/prices/indexes", Some(&token)).await;
-    assert_eq!(listed.body["indexes"][0]["unkeyed"], 1, "{}", listed.body);
+    assert_eq!(listed.body["indexes"][0]["unkeyed"], 0, "{}", listed.body);
 }
 
 #[tokio::test]
@@ -12470,12 +12462,10 @@ async fn a_decimal128_is_stored_intact_and_returned_as_it_was_sent() {
 }
 
 #[tokio::test]
-async fn a_decimal128_cannot_be_a_filter_operand_a_sort_key_or_an_id() {
-    // Once the edge reads `$numberDecimal`, a Decimal128 operand would
-    // reach `canonical_cmp`, which ranks a Decimal128 equal to every number
-    // — so `{v: 1.5m}` would match every numeric `v`. It is refused on
-    // purpose instead, wherever a filter compares, and a sort or an `_id`
-    // has no place for it either.
+async fn a_decimal128_cannot_yet_be_a_filter_operand_or_a_sort_key_but_can_be_an_id() {
+    // The comparator places a Decimal128 exactly now, but the operand sites that
+    // refuse one by name are lifted separately (the design's section 2.5), and
+    // until then they refuse. A `Decimal128` `_id` is accepted: it has a key.
     let server = Server::start().await;
     let token = server.root().await;
     server.post("/v1/db/shop/collections", Some(&token), json!({ "name": "v" })).await;
@@ -12565,10 +12555,18 @@ async fn a_decimal128_cannot_be_a_filter_operand_a_sort_key_or_an_id() {
     );
     assert_eq!(others.body["documents"][0]["_id"], 2, "{}", others.body);
 
-    // And an `_id` cannot be one, which the write path already refused.
+    // An `_id` can be one. A non-integer decimal id is reachable through filters
+    // only, and a filter cannot name a decimal yet, so it is found by another field.
     let as_id = server.post(docs, Some(&token), json!({ "_id": dec, "v": 0 })).await;
-    assert_eq!(as_id.status, 400, "{:?}", as_id.body);
-    assert_eq!(as_id.body["error"], "bad_request", "{:?}", as_id.body);
+    assert_eq!(as_id.status, 200, "{:?}", as_id.body);
+    let found =
+        server.post("/v1/db/shop/coll/v/find", Some(&token), json!({ "filter": { "v": 0 } })).await;
+    assert_eq!(found.body["count"], 1, "{}", found.body);
+    assert_eq!(found.body["documents"][0]["_id"], dec, "{}", found.body);
+    let gone = server
+        .post("/v1/db/shop/coll/v/delete", Some(&token), json!({ "filter": { "v": 0 } }))
+        .await;
+    assert_eq!(gone.status, 200, "{:?}", gone.body);
 
     // The update operators that compare their operand against every
     // element refuse one too. Before they did, `$pull` of a Decimal128
@@ -14082,9 +14080,8 @@ async fn explain_reports_the_undecidable_run_it_read() {
         "and not folded into the run that means a fault: {hit}"
     );
     assert_eq!(
-        hit["count"], 2,
-        "the two decimals match `k: 7`, which is why the index has to hold them (ADR-185); the \
-         document with `k: 9` does not: {hit}"
+        hit["count"], 0,
+        "the two decimals are read from the run and rechecked, and neither is 7: {hit}"
     );
 
     // A collection scan reads no index, so it reports neither figure rather

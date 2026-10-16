@@ -919,11 +919,10 @@ fn value_at<'a>(doc: &'a Document, p: &str) -> Option<&'a Bson> {
 /// A total, order-consistent byte key for grouping.
 ///
 /// `keyenc` is the same encoding indexes use, so numerically equal values of
-/// different types collapse into one bucket — 5 and 5.0 group together, exactly
-/// as they would match one index entry. It refuses `Decimal128` (ADR-005), and
-/// a grouping key is not a place to fail the whole query over a type that is
-/// merely awkward to order, so that falls back to a debug rendering: distinct
-/// values stay distinct, they simply do not participate in cross-type equality.
+/// different types collapse into one bucket — 5, 5.0 and `Decimal128("5.00")`
+/// group together, exactly as they would match one index entry. Every value has a
+/// key, so the rendering fallback is unreachable; it stays so that a grouping key
+/// is never a place to fail the whole query.
 pub(crate) fn group_key(value: &Bson) -> Vec<u8> {
     kimmy_core::keyenc::encode(value).unwrap_or_else(|_| format!("raw:{value:?}").into_bytes())
 }
@@ -2045,9 +2044,9 @@ mod tests {
     }
 
     /// Seventeen values that exercise every way two values can be one member or
-    /// two: NaN against itself, one number in three widths, signed zeros, the
-    /// two nulls, documents differing in key order and in a nested width,
-    /// `Decimal128`s by their bytes, and a string against a symbol.
+    /// two: NaN against itself, one number in three widths and as a
+    /// `Decimal128`, signed zeros, the two nulls, documents differing in key
+    /// order and in a nested width, and a string against a symbol.
     fn set_corpus() -> Vec<Bson> {
         vec![
             Bson::Double(f64::NAN),
@@ -2096,8 +2095,8 @@ mod tests {
         let got = members(&corpus);
         // Premises: a set that is empty or collapses everything would satisfy
         // the equality below.
-        assert_eq!(buckets.len(), 9, "buckets: {buckets:?}");
-        assert_eq!(got.len(), 9, "members: {got:?}");
+        assert_eq!(buckets.len(), 7, "buckets: {buckets:?}");
+        assert_eq!(got.len(), 7, "members: {got:?}");
         assert_eq!(keys_of(&got), keys_of(&buckets));
         // One member per key, and each is the first of its kind in input order.
         assert_eq!(keys_of(&got).len(), got.len());
@@ -2111,33 +2110,38 @@ mod tests {
     }
 
     #[test]
-    fn a_value_holding_a_decimal128_is_identified_by_its_rendering() {
-        // `keyenc` refuses a `Decimal128` anywhere in a value, so the whole
-        // value is identified by its rendering and `1` against `1.0` no longer
-        // collapses inside it. `$group` does the same, and the two agree.
-        let pairs = [
+    fn a_value_holding_a_decimal128_is_identified_by_its_value() {
+        // A `Decimal128` has an exact key anywhere in a value, so `1` against
+        // `1.0` collapses inside a document or array exactly as it does bare, and
+        // a decimal equal to the number beside it is the same member. `$group`
+        // does the same, and the two agree.
+        let one_member = [
             (
                 Bson::Document(doc! { "a": 1, "d": dec("1") }),
-                Bson::Document(doc! { "a": 1.0, "d": dec("1") }),
+                Bson::Document(doc! { "a": 1.0, "d": dec("1.00") }),
             ),
             (
                 Bson::Array(vec![Bson::Double(0.0), dec("1")]),
-                Bson::Array(vec![Bson::Double(-0.0), dec("1")]),
+                Bson::Array(vec![dec("-0"), Bson::Int64(1)]),
             ),
         ];
-        for (x, y) in pairs {
+        for (x, y) in one_member {
             let both = [x, y];
             let buckets = run(vec![doc! {"$group": {"_id": "$v"}}], as_docs(&both)).unwrap();
-            assert_eq!(buckets.len(), 2, "{both:?}");
-            assert_eq!(members(&both).len(), 2, "{both:?}");
+            assert_eq!(buckets.len(), 1, "{both:?}");
+            assert_eq!(members(&both).len(), 1, "{both:?}");
         }
+        // Different values stay different, and 0.1 the decimal is not 0.1 the double.
+        let two_members = [dec("0.1"), Bson::Double(0.1)];
+        let buckets = run(vec![doc! {"$group": {"_id": "$v"}}], as_docs(&two_members)).unwrap();
+        assert_eq!(buckets.len(), 2);
+        assert_eq!(members(&two_members).len(), 2);
     }
 
     #[test]
     fn add_to_set_members_do_not_depend_on_input_order() {
-        // `Decimal128` ranks equal to every number in the canonical order, so a
-        // set built on that order kept `[1, 2]` from one order and `[Dec(5)]`
-        // from the other.
+        // A set built on an order that ranked `Decimal128` equal to every number
+        // kept `[1, 2]` from one order and `[Dec(5)]` from the other.
         for order in
             [[Bson::Int32(1), dec("5"), Bson::Int32(2)], [dec("5"), Bson::Int32(1), Bson::Int32(2)]]
         {
@@ -2145,7 +2149,7 @@ mod tests {
         }
         let corpus = set_corpus();
         let expected = keys_of(&members(&corpus));
-        assert_eq!(expected.len(), 9);
+        assert_eq!(expected.len(), 7);
         let mut reversed = corpus.clone();
         reversed.reverse();
         let mut orders = vec![reversed];
