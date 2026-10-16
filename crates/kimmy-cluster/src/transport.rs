@@ -6112,7 +6112,8 @@ mod tests {
         }
         let transport = files.iter().find(|p| p.ends_with("src/transport.rs")).expect("transport");
         let source = std::fs::read_to_string(transport).unwrap();
-        let product = source.split("\n#[cfg(test)]").next().unwrap();
+        // Up to the tests module: test hooks earlier in the file are `#[cfg(test)]` items too.
+        let product = source.split("\n#[cfg(test)]\nmod tests").next().unwrap();
         for call in [
             "engine.snapshot_page(",
             "engine.apply_snapshot_page(",
@@ -6123,7 +6124,11 @@ mod tests {
             assert!(product.contains(call), "the frames are no longer built here: {call}");
         }
         for path in &files {
+            if path.to_string_lossy().ends_with("tests.rs") {
+                continue;
+            }
             let source = std::fs::read_to_string(path).unwrap();
+            let source = source.split("\n#[cfg(test)]\nmod tests").next().unwrap();
             for conversion in [
                 "legacy_of_stored",
                 "stored_of_legacy",
