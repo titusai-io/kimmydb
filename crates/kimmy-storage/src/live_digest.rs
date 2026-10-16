@@ -26,9 +26,21 @@
 //! the counts' mark behind a format number, written and carried with it. A
 //! shared mark would let a build that keeps the counts and not the digests keep
 //! it current.
+//!
+//! **The hashed key is the legacy key** (Decimal128 design 7.3). Schema 5 changed
+//! the stored bytes of every number key, and a member of the previous release
+//! hashes its own (schema-4) keys. Hashing the stored key would make every
+//! collection with an integer `_id` differ between the two for the length of a
+//! roll, which the check reports and the repair pulls again and again. So every
+//! site that folds or subtracts a term hashes the frozen schema-4 form: [`term`]
+//! takes a [`LegacyKey`], which only `keyenc::legacy_key` and the total
+//! `keyenc::legacy_of_stored` make, so a stored key handed to it does not build.
+//! The format number does not move: the rows a 0.50 member kept are the rows
+//! this build would have kept.
 
 use std::collections::BTreeMap;
 
+use kimmy_core::keyenc::{self, LegacyKey};
 use kimmy_core::{Hlc, NodeId, Stamp};
 use redb::{ReadableTable, WriteTransaction};
 
@@ -63,7 +75,7 @@ pub struct DigestRow {
 
 impl DigestRow {
     /// Fold one record in or out of the digest.
-    pub fn flip(&mut self, key: &[u8], stamp: &Stamp) {
+    pub fn flip(&mut self, key: &LegacyKey, stamp: &Stamp) {
         self.digest ^= term(key, stamp);
     }
 
@@ -141,14 +153,25 @@ fn raise(map: &mut BTreeMap<NodeId, Hlc>, stamp: &Stamp) {
 }
 
 /// The term one live record contributes to its collection's digest:
-/// `xxh3_128(key || stamp)`. The stamp is fixed width and last, so the pair
-/// encodes unambiguously.
-pub fn term(key: &[u8], stamp: &Stamp) -> u128 {
+/// `xxh3_128(key || stamp)`, over the record's **legacy** key (module docs). The
+/// stamp is fixed width and last, so the pair encodes unambiguously.
+pub fn term(key: &LegacyKey, stamp: &Stamp) -> u128 {
     let mut hasher = xxhash_rust::xxh3::Xxh3::new();
-    hasher.update(key);
+    hasher.update(key.as_bytes());
     hasher.update(&stamp.hlc.to_bytes());
     hasher.update(&stamp.node.to_bytes());
     hasher.digest128()
+}
+
+/// The term of the record stored under `stored_key`: [`term`] of its legacy form.
+///
+/// **Never fails** (design 7.3): bytes that are not a canonical stored key are
+/// hashed as they are. A purge chunk refused here would be retried for ever and
+/// keep the name from being created again, and an open walk refused here could
+/// not complete; no such row should exist in a schema-5 store, so this is a
+/// guard and not a need.
+pub fn legacy_term(stored_key: &[u8], stamp: &Stamp) -> u128 {
+    term(&keyenc::legacy_of_stored(stored_key), stamp)
 }
 
 /// What one transaction owes one collection's row, gathered as it writes and
@@ -165,10 +188,11 @@ pub(crate) struct Delta {
 }
 
 impl Delta {
-    /// One write: the record that was there (if any) and the one now.
+    /// One write: the record that was there (if any) and the one now, under the
+    /// legacy form of its key.
     pub(crate) fn wrote(
         &mut self,
-        key: &[u8],
+        key: &LegacyKey,
         before: Option<(Stamp, bool)>,
         after: Option<(Stamp, bool)>,
     ) {
@@ -300,11 +324,12 @@ pub(crate) fn kept_row(
 /// raises `bare_max` too: the walk sees headers, not whether an oplog entry
 /// stands behind a tombstone, so the rebuilt value is the highest tombstone
 /// stamp per origin. That defers longer after a rebuild than a maintained row
-/// would, never less, and ages out as the cut rises (B3 design 2.1).
+/// would, never less, and ages out as the cut rises (B3 design 2.1). `key` is
+/// the legacy form of the record's key, as every fold site's is.
 pub(crate) fn fold_walked(
     rows: &mut BTreeMap<u64, DigestRow>,
     collection: u64,
-    key: &[u8],
+    key: &LegacyKey,
     stamp: &Stamp,
     live: bool,
 ) {
@@ -321,6 +346,11 @@ pub(crate) fn fold_walked(
 mod tests {
     use super::*;
 
+    /// A key with no number in it: its legacy form is its bytes.
+    fn k(bytes: &[u8]) -> LegacyKey {
+        keyenc::legacy_of_stored(bytes)
+    }
+
     fn stamp(wall: u64, node: u8) -> Stamp {
         Stamp::new(Hlc::new(wall, 0), NodeId::from_bytes([node; 16]))
     }
@@ -328,7 +358,7 @@ mod tests {
     #[test]
     fn a_row_round_trips() {
         let mut row = DigestRow::default();
-        row.flip(b"a", &stamp(5, 1));
+        row.flip(&k(b"a"), &stamp(5, 1));
         row.raise_maxw(&stamp(5, 1));
         row.raise_maxw(&stamp(9, 2));
         row.raise_bare(&stamp(7, 2));
@@ -345,26 +375,26 @@ mod tests {
 
     #[test]
     fn the_term_depends_on_the_key_and_the_whole_stamp() {
-        let base = term(b"k", &stamp(5, 1));
-        assert_ne!(base, term(b"j", &stamp(5, 1)));
-        assert_ne!(base, term(b"k", &stamp(6, 1)));
-        assert_ne!(base, term(b"k", &stamp(5, 2)));
-        assert_ne!(base, term(b"k", &Stamp::new(Hlc::new(5, 1), NodeId::from_bytes([1; 16]))));
-        assert_eq!(base, term(b"k", &stamp(5, 1)));
+        let base = term(&k(b"k"), &stamp(5, 1));
+        assert_ne!(base, term(&k(b"j"), &stamp(5, 1)));
+        assert_ne!(base, term(&k(b"k"), &stamp(6, 1)));
+        assert_ne!(base, term(&k(b"k"), &stamp(5, 2)));
+        assert_ne!(base, term(&k(b"k"), &Stamp::new(Hlc::new(5, 1), NodeId::from_bytes([1; 16]))));
+        assert_eq!(base, term(&k(b"k"), &stamp(5, 1)));
         // The stamp is fixed width and last: moving a byte between the key
         // and the stamp cannot give the same input.
-        assert_ne!(term(b"ab", &stamp(5, 1)), term(b"a", &stamp(5, 1)));
+        assert_ne!(term(&k(b"ab"), &stamp(5, 1)), term(&k(b"a"), &stamp(5, 1)));
     }
 
     #[test]
     fn a_term_folds_in_and_out() {
         let mut row = DigestRow::default();
-        row.flip(b"a", &stamp(1, 1));
-        row.flip(b"b", &stamp(2, 1));
+        row.flip(&k(b"a"), &stamp(1, 1));
+        row.flip(&k(b"b"), &stamp(2, 1));
         let both = row.digest;
-        row.flip(b"a", &stamp(1, 1));
-        assert_eq!(row.digest, term(b"b", &stamp(2, 1)));
-        row.flip(b"b", &stamp(2, 1));
+        row.flip(&k(b"a"), &stamp(1, 1));
+        assert_eq!(row.digest, term(&k(b"b"), &stamp(2, 1)));
+        row.flip(&k(b"b"), &stamp(2, 1));
         assert_eq!(row.digest, 0);
         assert_ne!(both, 0);
     }
@@ -380,13 +410,13 @@ mod tests {
     #[test]
     fn a_delta_that_nets_to_nothing_moves_no_row() {
         let mut delta = Delta::default();
-        delta.wrote(b"k", None, Some((stamp(1, 1), true)));
+        delta.wrote(&k(b"k"), None, Some((stamp(1, 1), true)));
         assert!(!delta.moves_nothing());
         let mut delta = Delta::default();
         // Written live and removed again inside one transaction: the digest
         // nets to nothing, but the stamp was still seen.
-        delta.wrote(b"k", None, Some((stamp(1, 1), true)));
-        delta.wrote(b"k", Some((stamp(1, 1), true)), None);
+        delta.wrote(&k(b"k"), None, Some((stamp(1, 1), true)));
+        delta.wrote(&k(b"k"), Some((stamp(1, 1), true)), None);
         assert_eq!(delta.xor, 0);
         assert!(!delta.moves_nothing(), "maxw rose");
     }

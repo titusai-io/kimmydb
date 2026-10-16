@@ -151,6 +151,12 @@ impl Pending {
 
     /// One write to `key` of `collection`: the record that was there and the
     /// one now, each as its stamp and whether it is live.
+    ///
+    /// `key` is the stored key, and the digest moves by the terms of its
+    /// **legacy** form (`live_digest`'s module docs): the one conversion every
+    /// write to `DOCS` passes through, `put_record`, `put_bare_tombstone` and
+    /// `remove_record` (the drop purger's) alike. Total, so no row can refuse a
+    /// write here.
     #[cfg(not(kimmy_bench_no_live_counts))]
     fn wrote(
         &mut self,
@@ -159,7 +165,8 @@ impl Pending {
         before: Option<(kimmy_core::Stamp, bool)>,
         after: Option<(kimmy_core::Stamp, bool)>,
     ) {
-        self.digests.entry(collection).or_default().wrote(key, before, after);
+        let key = kimmy_core::keyenc::legacy_of_stored(key);
+        self.digests.entry(collection).or_default().wrote(&key, before, after);
     }
 
     /// The control's no-op (`--cfg kimmy_bench_no_live_counts`).
@@ -443,7 +450,8 @@ pub(crate) mod test_support {
             let (key, value) = row.unwrap();
             let (collection, doc_key) = key.value();
             let (stamp, live) = codec::doc_record_header(value.value()).unwrap();
-            crate::live_digest::fold_walked(&mut walked, collection, doc_key, &stamp, live);
+            let key = kimmy_core::keyenc::legacy_of_stored(doc_key);
+            crate::live_digest::fold_walked(&mut walked, collection, &key, &stamp, live);
         }
         let rows = txn.open_table(tables::LIVE_DIGESTS).unwrap();
         let mut kept: BTreeMap<u64, crate::live_digest::DigestRow> = BTreeMap::new();

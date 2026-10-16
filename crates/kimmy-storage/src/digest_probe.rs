@@ -29,11 +29,21 @@
 //!
 //! Every outcome that is not a comparison has a [`Defer`] reason and is
 //! counted by the caller; none is silent.
+//!
+//! **Uncovered keys are legacy end to end** (Decimal128 design 7.1 and 7.3). A
+//! key in an uncovered list is the frozen schema-4 form of its id, which is what
+//! a 0.50 peer sends and reads: [`Engine::digest_plan`] and
+//! [`Engine::digest_answer`] ship it, and the sets, their unions with a peer's
+//! keys and the byte caps inside this module are all of that form, so a key
+//! present on both sides is one member of a union and is never subtracted
+//! twice, and a cap counts the bytes the peer reads. Only the point read of
+//! `DOCS` that subtracts a key's term converts it to the stored form.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::atomic::Ordering;
 use std::time::{Duration, Instant};
 
+use kimmy_core::keyenc::{self, LegacyKey};
 use kimmy_core::{CollectionId, Hlc, Stamp, VersionVector};
 use redb::{ReadableDatabase, ReadableTable};
 use serde::{Deserialize, Serialize};
@@ -376,8 +386,9 @@ struct Facet {
     row: DigestRow,
     quiet: bool,
     deferred: Option<Defer>,
-    /// The keys stamped above the cut. Empty for a quiet collection.
-    uncovered: BTreeSet<Vec<u8>>,
+    /// The keys stamped above the cut, in the legacy form. Empty for a quiet
+    /// collection.
+    uncovered: BTreeSet<LegacyKey>,
 }
 
 /// The requester's side, kept between the plan and the comparison.
@@ -462,7 +473,8 @@ impl Engine {
             if facet.deferred.is_some() || facet.uncovered.is_empty() {
                 continue;
             }
-            let size: usize = facet.uncovered.iter().map(Vec::len).sum();
+            // Wire bytes: the legacy form is what the peer reads.
+            let size: usize = facet.uncovered.iter().map(|k| k.as_bytes().len()).sum();
             if bytes + size > budget.ask_keys {
                 facet.deferred = Some(Defer::UncoveredCap);
                 continue;
@@ -470,7 +482,12 @@ impl Engine {
             bytes += size;
             uncovered.push(Uncovered {
                 collection: *id,
-                keys: facet.uncovered.iter().cloned().map(ByteBuf::from).collect(),
+                keys: facet
+                    .uncovered
+                    .iter()
+                    .cloned()
+                    .map(|k| ByteBuf::from(k.into_bytes()))
+                    .collect(),
             });
         }
         Ok(DigestPlan { cut: cut.clone(), ask: DigestAsk { cut, uncovered, busy }, facets })
@@ -491,10 +508,14 @@ impl Engine {
         let mut spend = Spend::new(budget);
         let txn = self.db().begin_read()?;
         let facets = self.assess(&txn, &ask.cut, ScanFor::Only(ask.busy), &mut spend)?;
-        let theirs: BTreeMap<CollectionId, BTreeSet<Vec<u8>>> = ask
+        // The requester's keys as they came, legacy by definition: the wire
+        // boundary, and the form this side's own set is in.
+        let theirs: BTreeMap<CollectionId, BTreeSet<LegacyKey>> = ask
             .uncovered
             .iter()
-            .map(|u| (u.collection, u.keys.iter().map(|k| k.to_vec()).collect()))
+            .map(|u| {
+                (u.collection, u.keys.iter().map(|k| LegacyKey::from_wire(k.to_vec())).collect())
+            })
             .collect();
         let docs = txn.open_table(tables::DOCS)?;
         let mut read = 0usize;
@@ -515,11 +536,12 @@ impl Engine {
                 deferred: facet.deferred,
             };
             if entry.deferred.is_none() {
-                let own: usize = facet.uncovered.iter().map(Vec::len).sum();
+                let own: usize = facet.uncovered.iter().map(|k| k.as_bytes().len()).sum();
                 if own > budget.answer_keys {
                     entry.deferred = Some(Defer::UncoveredCap);
                 } else {
-                    let union: BTreeSet<&Vec<u8>> = theirs.iter().chain(&facet.uncovered).collect();
+                    let union: BTreeSet<&LegacyKey> =
+                        theirs.iter().chain(&facet.uncovered).collect();
                     match self.excluded_digest(
                         &docs,
                         *id,
@@ -531,8 +553,12 @@ impl Engine {
                     )? {
                         Excluded::Digest(digest) => {
                             entry.digest = ByteBuf::from(digest.to_be_bytes().to_vec());
-                            entry.uncovered =
-                                facet.uncovered.iter().cloned().map(ByteBuf::from).collect();
+                            entry.uncovered = facet
+                                .uncovered
+                                .iter()
+                                .cloned()
+                                .map(|k| ByteBuf::from(k.into_bytes()))
+                                .collect();
                         }
                         Excluded::OverCap => entry.deferred = Some(Defer::UncoveredCap),
                         Excluded::OverBudget => entry.deferred = Some(Defer::Budget),
@@ -592,8 +618,10 @@ impl Engine {
                 out.push(defer(Defer::UncoveredCap));
                 continue;
             }
-            let theirs: BTreeSet<Vec<u8>> = entry.uncovered.iter().map(|k| k.to_vec()).collect();
-            let union: BTreeSet<&Vec<u8>> = then.uncovered.iter().chain(&theirs).collect();
+            // The peer's keys as they came: legacy, the form of this side's set.
+            let theirs: BTreeSet<LegacyKey> =
+                entry.uncovered.iter().map(|k| LegacyKey::from_wire(k.to_vec())).collect();
+            let union: BTreeSet<&LegacyKey> = then.uncovered.iter().chain(&theirs).collect();
             let mine = match self.excluded_digest(
                 &docs,
                 id,
@@ -631,13 +659,17 @@ impl Engine {
     /// of `DOCS`. Each read is charged to the probe's budget as a page and
     /// the stop is looked for before it, so thousands of cold random reads can
     /// neither run past the budget nor hold a stop up.
+    ///
+    /// `keys` are legacy (module docs), and the cap counts their bytes. Each is
+    /// converted to the stored form for its point read and nowhere else, and the
+    /// term taken out is the one the row folded for the record read.
     #[allow(clippy::too_many_arguments)]
     fn excluded_digest<'k>(
         &self,
         docs: &impl ReadableTable<(u64, &'static [u8]), &'static [u8]>,
         collection: CollectionId,
         row: &DigestRow,
-        keys: impl IntoIterator<Item = &'k Vec<u8>>,
+        keys: impl IntoIterator<Item = &'k LegacyKey>,
         spend: &mut Spend,
         read: &mut usize,
         cap: usize,
@@ -645,17 +677,18 @@ impl Engine {
         let mut digest = row.digest;
         for key in keys {
             self.check_walk(WalkScope::Background)?;
-            *read += key.len();
+            *read += key.as_bytes().len();
             if *read > cap {
                 return Ok(Excluded::OverCap);
             }
             if !spend.charge(POINT_READ_COST) {
                 return Ok(Excluded::OverBudget);
             }
-            if let Some(record) = docs.get((collection.0, key.as_slice()))? {
+            let stored = keyenc::stored_of_legacy(key.as_bytes());
+            if let Some(record) = docs.get((collection.0, stored.as_slice()))? {
                 let (stamp, live) = codec::doc_record_header(record.value())?;
                 if live {
-                    digest ^= live_digest::term(key, &stamp);
+                    digest ^= live_digest::legacy_term(&stored, &stamp);
                 }
             }
         }
@@ -760,7 +793,8 @@ impl Engine {
     }
 
     /// The keys of `busy` collections written above `cut`, read from the
-    /// oplog starting at `from`. `None` if the budget was spent first.
+    /// oplog starting at `from`, in the legacy form. `None` if the budget was
+    /// spent first.
     ///
     /// Stop-aware at every row (`walks_stop`).
     fn scan_uncovered(
@@ -770,10 +804,10 @@ impl Engine {
         busy: &BTreeSet<CollectionId>,
         from: Hlc,
         spend: &mut Spend,
-    ) -> Result<Option<BTreeMap<CollectionId, BTreeSet<Vec<u8>>>>> {
+    ) -> Result<Option<BTreeMap<CollectionId, BTreeSet<LegacyKey>>>> {
         let oplog = open_walk_table(txn, tables::OPLOG, self.walk(WalkScope::Background))?;
         let start = codec::oplog_key_lower_bound(from);
-        let mut found: BTreeMap<CollectionId, BTreeSet<Vec<u8>>> = BTreeMap::new();
+        let mut found: BTreeMap<CollectionId, BTreeSet<LegacyKey>> = BTreeMap::new();
         for row in oplog.range::<&[u8]>(start.as_slice()..)? {
             let (key, value) = row?;
             let (key, value) = (key.value(), value.value());
@@ -789,9 +823,10 @@ impl Engine {
                 continue;
             }
             // A DDL entry has no document id; a unique violation names a
-            // document but writes no record, which over-includes, safely.
+            // document but writes no record, which over-includes, safely. The
+            // legacy key, straight from the id: the form every set here is in.
             if let Some(doc_id) = codec::decode_oplog_entry(value)?.doc_id {
-                found.entry(collection).or_default().insert(crate::docs::doc_key(&doc_id)?);
+                found.entry(collection).or_default().insert(keyenc::legacy_key(&doc_id));
             }
         }
         Ok(Some(found))
@@ -924,7 +959,9 @@ impl Engine {
             }
             // not a row: a record header that does not decode, left out as the rebuild does
             if let Ok((stamp, live)) = codec::doc_record_header(value) {
-                live_digest::fold_walked(&mut walked, collection.0, doc_key, &stamp, live);
+                // The legacy form, as every fold site hashes (`live_digest`).
+                let key = keyenc::legacy_of_stored(doc_key);
+                live_digest::fold_walked(&mut walked, collection.0, &key, &stamp, live);
             }
         }
         // not a row: the walk's own map, read after the walk
