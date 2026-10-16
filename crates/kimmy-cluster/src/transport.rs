@@ -3275,6 +3275,7 @@ impl Repairs {
             tally: std::mem::take(&mut self.tally),
             left_ids: std::mem::take(&mut self.left_ids),
             definitions: std::mem::take(&mut self.definitions),
+            definitions_left: std::mem::take(&mut self.definitions_left),
         }
     }
 }
@@ -3464,7 +3465,7 @@ impl RepairCounts {
 }
 
 /// The INFO line that reports a repair's end, and the WARN for rows a document repair left
-/// (repair design section 15.2). Fields are structured; the texts are fixed.
+/// or indexes a definition repair left (repair design section 15.2). Fields are structured; the texts are fixed.
 fn log_repair_end(
     peer: NodeId,
     collection: CollectionId,
@@ -3526,6 +3527,24 @@ fn log_repair_end(
                 ambiguous = definitions.ambiguous,
                 "a divergence repair ended"
             );
+            if skipped > 0 {
+                warn!(
+                    peer = %peer,
+                    collection = %collection,
+                    built = definitions.built,
+                    unique = definitions.unique,
+                    ttl = definitions.ttl,
+                    rival = definitions.rival,
+                    history = definitions.history,
+                    tombstoned = definitions.tombstoned,
+                    ambiguous = definitions.ambiguous,
+                    gone = definitions.gone,
+                    too_large = definitions.too_large,
+                    left = ?data.definitions_left,
+                    "a definition repair left indexes it will not build; the operator rule in \
+                     operations.md decides"
+                );
+            }
         }
         RepairKind::Count => {}
     }
@@ -3596,6 +3615,7 @@ struct EndData {
     tally: Tally,
     left_ids: Vec<kimmy_core::DocId>,
     definitions: kimmy_storage::DefinitionRestore,
+    definitions_left: Vec<String>,
 }
 
 /// Why a document repair was not planned (the planner's answer to a confirmed finding).
@@ -3625,6 +3645,7 @@ struct Repairs {
     /// definition repair did with its page's indexes, for the line that reports its end.
     left_ids: Vec<kimmy_core::DocId>,
     definitions: kimmy_storage::DefinitionRestore,
+    definitions_left: Vec<String>,
     /// A Converge repair is handed out once per contact and the contact after it is an
     /// ordinary one, so a repair of a large collection cannot starve this peer's ordinary
     /// replication (repair design section 2.6). `handed` is set once the contact has had its
@@ -4460,6 +4481,7 @@ impl PeerStalls {
         if let Some(repairs) = self.repairs.get_mut(&peer) {
             repairs.tally.built += applied.definitions.built;
             repairs.definitions = applied.definitions;
+            repairs.definitions_left.clone_from(&applied.definitions_left);
         }
     }
 
@@ -4606,6 +4628,7 @@ impl PeerStalls {
             repairs.tally = Tally::default();
             repairs.left_ids.clear();
             repairs.definitions = Default::default();
+            repairs.definitions_left.clear();
             repairs.active_cut = match repairs.active {
                 Some((collection, Repair::Converge)) => {
                     repairs.cuts.remove(&collection).unwrap_or_default()

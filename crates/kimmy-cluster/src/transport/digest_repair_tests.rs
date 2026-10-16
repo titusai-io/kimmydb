@@ -667,6 +667,65 @@ fn a_definition_repair_ends_with_what_it_built_and_what_it_skipped_in_one_line()
     }
 }
 
+/// A definition repair whose one page came to `definitions` and left `names`, and the lines
+/// it logged.
+fn definition_repair_logged(
+    definitions: kimmy_storage::DefinitionRestore,
+    names: &[&str],
+) -> Vec<String> {
+    logged(|| {
+        let mut stalls = stalls_at(mins(1));
+        let p = node(1);
+        stalls.plan_definition_repair(p, C, 10);
+        due(&mut stalls, p);
+        let page = kimmy_storage::SnapshotApplied {
+            definitions,
+            definitions_left: names.iter().map(ToString::to_string).collect(),
+            ..Default::default()
+        };
+        stalls.definitions_page_applied(p, &page);
+        stalls.repair_finished(p);
+    })
+}
+
+fn the_definition_warn(lines: &[String]) -> Option<&String> {
+    lines.iter().find(|l| l.contains("it will not build"))
+}
+
+#[test]
+fn a_definition_repair_that_left_a_ttl_index_warns_and_names_the_kind_and_the_index() {
+    let lines = definition_repair_logged(
+        kimmy_storage::DefinitionRestore { ttl: 1, ..Default::default() },
+        &["expire_at (ttl)"],
+    );
+    let warn = the_definition_warn(&lines).expect("the WARN");
+    for want in ["WARN ", "ttl=1", "unique=0", "built=0", "expire_at (ttl)", "operations.md"] {
+        assert!(warn.contains(want), "{want}: {warn}");
+    }
+}
+
+#[test]
+fn a_definition_repair_that_left_a_unique_index_warns_and_names_the_kind_and_the_index() {
+    let lines = definition_repair_logged(
+        kimmy_storage::DefinitionRestore { built: 1, unique: 1, ..Default::default() },
+        &["email_u (unique)"],
+    );
+    let warn = the_definition_warn(&lines).expect("the WARN");
+    for want in ["WARN ", "unique=1", "ttl=0", "built=1", "email_u (unique)", "operations.md"] {
+        assert!(warn.contains(want), "{want}: {warn}");
+    }
+}
+
+#[test]
+fn a_definition_repair_that_built_everything_raises_no_warning() {
+    let lines = definition_repair_logged(
+        kimmy_storage::DefinitionRestore { built: 1, ..Default::default() },
+        &[],
+    );
+    assert!(lines.iter().any(|l| l.contains("a divergence repair ended")));
+    assert!(the_definition_warn(&lines).is_none(), "{lines:?}");
+}
+
 #[test]
 fn a_transient_end_is_reported_as_transient() {
     let lines = logged(|| {

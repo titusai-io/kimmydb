@@ -122,6 +122,7 @@ fn a_unique_index_is_counted_and_not_built() {
         .unwrap();
     let done = repair(&b, &a, BIG);
     assert_eq!(done.definitions, DefinitionRestore { unique: 1, ..Default::default() });
+    assert_eq!(done.definitions_left, vec!["u (unique)".to_string()]);
     assert!(names(&b).is_empty());
 }
 
@@ -142,6 +143,7 @@ fn a_ttl_index_is_counted_and_not_built() {
     .unwrap();
     let done = repair(&b, &a, BIG);
     assert_eq!(done.definitions, DefinitionRestore { ttl: 1, ..Default::default() });
+    assert_eq!(done.definitions_left, vec!["ttl (ttl)".to_string()]);
     assert!(names(&b).is_empty());
 }
 
@@ -155,6 +157,7 @@ fn a_rival_under_the_same_name_is_counted_and_the_local_index_is_untouched() {
     let before = b.get_collection("shop", "orders").unwrap();
     let done = repair(&b, &a, BIG);
     assert_eq!(done.definitions, DefinitionRestore { rival: 1, ..Default::default() });
+    assert_eq!(done.definitions_left, vec!["by_x (rival)".to_string()]);
     let after = b.get_collection("shop", "orders").unwrap();
     assert_eq!(after.indexes, before.indexes, "the supersede branch must be unreachable");
 }
