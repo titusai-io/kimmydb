@@ -1023,6 +1023,23 @@ Through 0.24.0 the edge did not read `$numberDecimal` at all: the wrapper
 arrived as a nested document, which is why a Decimal128 written to a member
 was keyed there and filed unkeyed on its peers ([ADR-139](decisions.md)).
 
+**A binary `_id` is echoed with its subtype, but keyed without it.** The ids
+a write or a report answers with (`insertedId`, `insertedIds`, `upsertedId`,
+and the `ids` and `merged` of `GET .../violations`) are the `_id` as stored,
+subtype included, so `find {_id: <echo>}` finds the document. Two things
+still carry the subtype folded to `00`:
+- **A change stream's and a webhook's `documentKey`, and a `uniqueViolation`
+  event's `documentKeys` and `merged`.** A delete's entry carries no body, so
+  its key cannot carry the subtype, and an insert's `documentKey` that did
+  would never match its later delete's. Match a binary `documentKey` on its
+  bytes, or read the subtype from `fullDocument`.
+- **The document key.** A binary `_id` is keyed by its length and bytes only,
+  so `BinData(0, X)`, `BinData(3, X)` and `BinData(4, X)` are one document: a
+  second insert of the same bytes under another subtype is refused
+  `duplicate_key`, and writes of the two on two members are merged into one
+  document, last writer wins. **Do not mix subtypes for one value**: write a
+  UUID in one representation everywhere.
+
 **Whole numbers stay integers.** A JSON `42` becomes `Int32`, not `Double`.
 Widening would break `$type` queries and lose precision above 2^53; `2^53 + 1`
 round-trips exactly, and there is a test pinning it.
