@@ -429,8 +429,10 @@ length, and a start that used to be killed and begun again for ever, because
 nothing listened until the open finished and Kubernetes' defaults restart a
 container after about 30 seconds of failed liveness checks, now finishes. What
 the open is doing is on `/readyz`: `phase` is one of `repairing`, `opening`,
-`migrating` (`done` of `total` rows: documents re-keyed, moved back and walked by the index
-rebuild, [Storage schema 5](#storage-schema-5-the-first-start-of-0510)), `verifying` (`done` of `total` oplog
+`migrating`, `draining` and `refilling` (the schema migration's steps, each with its own
+`done` of `total`: a collection's documents re-keyed, one index's entries drained, one
+collection's documents walked to refill its indexes, [Storage schema
+5](#storage-schema-5-the-first-start-of-0510)), `verifying` (`done` of `total` oplog
 rows), `counting`, `starting` and `reconciling` (`done` of `total` databases whose
 drop the node is burying before it serves, [ADR-229](decisions.md), or collections it is sweeping of what a
 drop that reached them late left behind, [ADR-231](decisions.md); absent when
@@ -2681,8 +2683,14 @@ says `migrating`; peers see it as down, and nothing is written to it. In order:
 3. **Every document with an integer `_id` is re-keyed** (tombstones too), a
    chunk of 8,192 rows per commit, in two passes through a staging table, and
    **every index is drained and rebuilt** from the documents, a chunk of about
-   16 MiB of entries per commit. A progress line, `migrating storage schema 4
-   -> 5`, comes every 100,000 rows with the phase and the collection; each
+   16 MiB of entries per commit. `/readyz` reports each step on its own:
+   `migrating` while a collection's documents are re-keyed (`done` of `total`
+   rows, once out and once back), `draining` for each index (entries removed),
+   `refilling` for each collection (documents walked); `total` starts from the
+   collection's kept document count and is raised if the step outruns it. A
+   progress line, `migrating storage schema 4 -> 5`, gives the same `phase`,
+   `done` and `total`, with the collection and the index, every 100,000 rows of
+   a step; each
    collection ends with `re-keyed a collection's documents for storage schema
    5`, each index with `rebuilt an index for storage schema 5` (its entries,
    the documents it could not key, and `unique_collisions`), and the migration

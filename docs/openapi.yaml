@@ -293,9 +293,13 @@ paths:
           description: |
             Not ready. While the node's store is opening the body is the error
             envelope (`error: starting`) with `status: opening`, `phase`
-            (`repairing`, `opening`, `migrating`, `verifying`, `counting`,
-            `starting` or `reconciling`), `phase_age_seconds`, and `done` and `total` when the
-            phase counts. It is also the answer of a node whose storage engine
+            (`repairing`, `opening`, `migrating`, `draining`, `refilling`, `verifying`,
+            `counting`, `starting` or `reconciling`), `phase_age_seconds`, and `done` and
+            `total` when the phase counts. `migrating`, `draining` and `refilling` are the
+            storage schema migration's steps: a collection's documents re-keyed, one
+            index's entries drained, one collection's documents walked to refill its
+            indexes; each starts its own count, and a step whose total was an estimate
+            raises it to stay ahead of `done`. It is also the answer of a node whose storage engine
             has hit an I/O error, and of a member that knows it is behind
             (`error: catching_up`, `retry: elsewhere`, and `reason`, the state; its
             catching-up marker is set, see `x-kimmy-catching-up`), with
@@ -310,7 +314,7 @@ paths:
                       status: { const: opening }
                       phase:
                         type: string
-                        enum: [repairing, opening, migrating, verifying, counting, starting, reconciling]
+                        enum: [repairing, opening, migrating, draining, refilling, verifying, counting, starting, reconciling]
                       phase_age_seconds: { type: number }
                       done: { type: integer }
                       total: { type: integer }

@@ -2161,9 +2161,14 @@ fn a_stop_ends_the_migration_within_one_chunk_while_a_writer_holds_it() {
         let after = hooks::commits() - commits_then;
         hooks::hold_in_chunks(None, None);
         let phase = crate::open_progress::tests::THIS_THREAD_PHASE.with(std::cell::Cell::get);
+        let want = match kind {
+            "draining an index" => crate::open_progress::OpenPhase::Draining,
+            "refilling indexes" => crate::open_progress::OpenPhase::Refilling,
+            _ => crate::open_progress::OpenPhase::Migrating,
+        };
         assert!(
-            matches!(phase, Some((crate::open_progress::OpenPhase::Migrating, total)) if total > 0),
-            "{kind}: the open's progress said {phase:?}, not migrating with a total"
+            matches!(phase, Some((p, total)) if p == want && total > 0),
+            "{kind}: the open's progress said {phase:?}, not {want:?} with a total"
         );
         assert!(
             matches!(result, Err(crate::StorageError::Stopping(_))),
@@ -2429,4 +2434,80 @@ fn i_epoch_and_check_store_answer_for_a_store_mid_migration_and_after() {
     let theirs = previous(&path).expect_err("0.50 refuses a migrated store");
     assert!(theirs.contains("schema 5"), "{theirs}");
     eprintln!("CHECK-STORE: this build: {}; 0.50: refused: {theirs}", ours.json_line());
+}
+
+#[test]
+fn progress_advances_with_every_chunk_in_every_phase() {
+    // `/readyz` while the migration runs: every step reports its own phase
+    // (`migrating` for a range's two re-key passes, `draining` for each
+    // index, `refilling` for each collection) and a `done` that moves with
+    // every chunk that did work and stays below `total` until the step ends.
+    // The mars run of 2,000,000 documents sat at one `done == total` for 565 s
+    // through the drain and the refill before this.
+    use crate::open_progress::OpenPhase;
+    let f = fixture();
+    let path = f.copy();
+    chunks(7, 300);
+    hooks::chunks_seen();
+    let (engine, logs) = crate::log_capture::logged(|| Engine::open(&path).unwrap());
+    let items = engine.get_collection("shop", "items").unwrap();
+    drop(engine);
+    let seen = hooks::chunks_seen();
+    let mut previous: Option<&hooks::ChunkSeen> = None;
+    let mut steps: BTreeSet<(&str, String, Option<String>)> = BTreeSet::new();
+    for chunk in &seen {
+        let want = match chunk.kind {
+            "re-keying" | "moving back" => OpenPhase::Migrating,
+            "draining an index" => OpenPhase::Draining,
+            _ => OpenPhase::Refilling,
+        };
+        assert_eq!(chunk.phase, Some(want), "{chunk:?}");
+        assert!(chunk.done < chunk.total, "done reached total before the step ended: {chunk:?}");
+        let same_step = previous.is_some_and(|p| {
+            p.kind == chunk.kind && p.collection == chunk.collection && p.index == chunk.index
+        });
+        if chunk.rows > 0 {
+            match previous.filter(|_| same_step) {
+                Some(p) => assert!(chunk.done > p.done, "no advance: {p:?} then {chunk:?}"),
+                None => assert!(chunk.done >= chunk.rows, "{chunk:?}"),
+            }
+        }
+        steps.insert((chunk.kind, chunk.collection.clone(), chunk.index.clone()));
+        previous = Some(chunk);
+    }
+    // Every kind of step was seen, and a drain of every index of `items`.
+    for kind in ["re-keying", "moving back", "refilling indexes"] {
+        assert!(steps.iter().any(|(k, c, _)| *k == kind && c == "items"), "no {kind} of items");
+    }
+    for index in &items.indexes {
+        assert!(
+            steps.iter().any(|(k, c, i)| *k == "draining an index"
+                && c == "items"
+                && i.as_deref() == Some(index.name.as_str())),
+            "no drain step for {}",
+            index.name
+        );
+    }
+    let multi_chunk = |kind: &str| {
+        seen.iter().filter(|c| c.kind == kind && c.collection == "items" && c.rows > 0).count() > 2
+    };
+    for kind in ["re-keying", "moving back", "draining an index", "refilling indexes"] {
+        assert!(multi_chunk(kind), "premise: {kind} takes several chunks");
+    }
+    // The progress lines say the same, phase by phase, with the same figures.
+    for phase in ["migrating", "draining", "refilling"] {
+        let lines: Vec<&str> = logs
+            .lines()
+            .filter(|l| {
+                l.contains("migrating storage schema 4 -> 5")
+                    && l.contains(&format!("phase=\"{phase}\""))
+            })
+            .collect();
+        assert!(lines.len() >= 2, "{phase}: no progress lines: {logs}");
+        assert!(lines.iter().all(|l| l.contains("done=") && l.contains("total=")), "{lines:?}");
+    }
+    assert!(
+        logs.lines().any(|l| l.contains("phase=\"draining\"") && l.contains("index=")),
+        "a drain's line names its index"
+    );
 }

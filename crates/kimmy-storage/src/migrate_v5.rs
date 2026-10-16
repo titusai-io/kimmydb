@@ -809,9 +809,15 @@ struct Run {
     rows: [u64; 4],
     /// Time spent in each of those four kinds of chunk.
     spent: [Duration; 4],
-    /// The open progress's total, and how far it is.
-    total: u64,
+    /// The step `/readyz` reports (a range's re-key, an index's drain, a
+    /// collection's refill): how far it is, and its total.
     done: u64,
+    total: u64,
+    /// Each collection id's live documents, as the kept counts say: the
+    /// estimate a step's total starts from.
+    documents: HashMap<u64, u64>,
+    /// What a step's total starts from where a collection has no kept count.
+    fallback: u64,
 }
 
 /// The four kinds of chunk, as [`Run::rows`] and [`Run::spent`] index them.
@@ -834,22 +840,67 @@ impl Kind {
     }
 }
 
+impl Kind {
+    /// What `/readyz` calls a step of this kind.
+    fn phase(self) -> crate::open_progress::OpenPhase {
+        use crate::open_progress::OpenPhase;
+        match self {
+            Kind::RekeyA | Kind::RekeyB => OpenPhase::Migrating,
+            Kind::Drain => OpenPhase::Draining,
+            Kind::Refill => OpenPhase::Refilling,
+        }
+    }
+}
+
 impl Run {
-    /// Count `n` rows of `kind`, `spent` on them, and say so every
-    /// [`PROGRESS_EVERY`] rows.
-    fn advance(&mut self, kind: Kind, n: u64, spent: Duration, coll: &str) {
-        let before = self.rows[kind as usize];
+    /// The live documents of collection `id`, the estimate a step's total
+    /// starts from: read from the kept counts, so with no walk.
+    fn documents_of(&self, id: u64) -> u64 {
+        self.documents.get(&id).copied().unwrap_or(self.fallback)
+    }
+
+    /// Begin a step `/readyz` reports on its own: its phase, `total` (exact,
+    /// or an estimate), and how far an earlier run took it.
+    fn step(&mut self, kind: Kind, total: u64, done: u64) {
+        self.done = done;
+        self.total = total.max(done + 1);
+        crate::open_progress::set_open_phase_of(kind.phase(), self.total);
+        crate::open_progress::set_open_done(self.done);
+    }
+
+    /// A step done: its total is what it did.
+    fn end_step(&mut self) {
+        self.total = self.done;
+        crate::open_progress::set_open_total(self.total);
+    }
+
+    /// Count `n` rows of `kind`, `spent` on them, in the step's progress, and
+    /// say so every [`PROGRESS_EVERY`] rows of the step, with the figures
+    /// `/readyz` gives. An estimated total the step has outrun is raised to
+    /// stay ahead of it, so `done` keeps moving and never reads as finished
+    /// before the step is.
+    fn advance(&mut self, kind: Kind, n: u64, spent: Duration, coll: &str, index: Option<&str>) {
         self.rows[kind as usize] += n;
         self.spent[kind as usize] += spent;
-        self.done = self.done.saturating_add(n).min(self.total);
+        let before = self.done;
+        self.done += n;
+        if self.done >= self.total {
+            self.total = self.done + 1;
+            crate::open_progress::set_open_total(self.total);
+        }
         crate::open_progress::set_open_done(self.done);
-        if before / PROGRESS_EVERY != self.rows[kind as usize] / PROGRESS_EVERY {
+        #[cfg(test)]
+        hooks::chunk_done(kind.label(), coll, index, n);
+        if before / PROGRESS_EVERY != self.done / PROGRESS_EVERY {
             #[cfg(test)]
             hooks::progress();
             info!(
-                phase = kind.label(),
+                phase = kind.phase().label(),
+                step = kind.label(),
                 collection = coll,
-                rows = self.rows[kind as usize],
+                index,
+                done = self.done,
+                total = self.total,
                 elapsed_ms = self.started.elapsed().as_millis() as u64,
                 "migrating storage schema 4 -> 5"
             );
@@ -903,15 +954,26 @@ fn stopped() -> Result<()> {
 /// index rebuilt, then [`finish`]. Resumes wherever an earlier run stopped,
 /// since every step reads its state from its marker.
 pub(crate) fn run(db: &Database, plan: &Plan) -> Result<()> {
+    let documents: HashMap<u64, u64> = {
+        let txn = db.begin_read()?;
+        txn.open_table(tables::LIVE_COUNTS)?
+            .iter()?
+            .map(|row| {
+                let (id, n) = row?;
+                Ok((id.value(), n.value()))
+            })
+            .collect::<Result<_>>()?
+    };
     let mut run = Run {
         started: Instant::now(),
         rows: [0; 4],
         spent: [Duration::ZERO; 4],
-        // Rows moved out and back, and every document refilled once.
-        total: plan.docs_rows.saturating_mul(3),
         done: 0,
+        total: 0,
+        documents,
+        fallback: plan.docs_rows / plan.ranges.max(1),
     };
-    crate::open_progress::set_open_phase_of(crate::open_progress::OpenPhase::Migrating, run.total);
+    crate::open_progress::set_open_phase(crate::open_progress::OpenPhase::Migrating);
     let (ranges, collections, steps) = {
         let txn = db.begin_read()?;
         let ranges: Vec<u64> = txn
@@ -973,6 +1035,10 @@ pub(crate) fn run(db: &Database, plan: &Plan) -> Result<()> {
 
 /// Re-key one `DOCS` collection-id range, from its marker to `done`.
 fn rekey_range(db: &Database, run: &mut Run, id: u64, name: &str) -> Result<()> {
+    // Each phase is its own step on `/readyz`: moving out against the
+    // collection's documents (an estimate: tombstones move too), moving back
+    // against what moved out (exact).
+    let mut stepping = None;
     loop {
         if stop_requested() {
             return stopped();
@@ -980,6 +1046,14 @@ fn rekey_range(db: &Database, run: &mut Run, id: u64, name: &str) -> Result<()> 
         let started = Instant::now();
         let txn = db.begin_write()?;
         let mark = read_range(&txn, id)?;
+        if stepping != Some(mark.phase) {
+            match mark.phase {
+                Phase::Rekeying => run.step(Kind::RekeyA, run.documents_of(id), mark.out),
+                Phase::MovingBack => run.step(Kind::RekeyB, mark.out, mark.back),
+                Phase::Done => {}
+            }
+            stepping = Some(mark.phase);
+        }
         let (next, kind, moved) = match mark.phase {
             Phase::Done => return Ok(()),
             Phase::Rekeying => {
@@ -1010,7 +1084,10 @@ fn rekey_range(db: &Database, run: &mut Run, id: u64, name: &str) -> Result<()> 
         #[cfg(test)]
         hooks::hold(kind.label());
         commit(txn)?;
-        run.advance(kind, moved as u64, started.elapsed(), name);
+        run.advance(kind, moved as u64, started.elapsed(), name, None);
+        if next != mark.phase {
+            run.end_step();
+        }
         if next == Phase::Done {
             info!(
                 collection = name,
@@ -1140,6 +1217,10 @@ fn rebuild_indexes(db: &Database, run: &mut Run, meta: &CollectionMeta, ids: &[u
 /// first, while its old entries are there to be read.
 fn drain(db: &Database, run: &mut Run, meta: &CollectionMeta, index: &IndexMeta) -> Result<()> {
     let coll = meta.id.0;
+    // Its own step on `/readyz`, entries removed against the collection's
+    // documents: an estimate (an index holds one entry per document unless it
+    // is multikey or partial), raised if the drain outruns it.
+    let mut stepping = false;
     loop {
         if stop_requested() {
             return stopped();
@@ -1153,6 +1234,10 @@ fn drain(db: &Database, run: &mut Run, meta: &CollectionMeta, index: &IndexMeta)
         };
         if !matches!(mark.step, Step::Pending | Step::Draining) {
             return Ok(());
+        }
+        if !stepping {
+            run.step(Kind::Drain, run.documents_of(coll), mark.drained);
+            stepping = true;
         }
         // A TTL index's count, once, before its first chunk: the entries the
         // drain removes are the previous build's selection.
@@ -1187,7 +1272,7 @@ fn drain(db: &Database, run: &mut Run, meta: &CollectionMeta, index: &IndexMeta)
         #[cfg(test)]
         hooks::hold(Kind::Drain.label());
         commit(txn)?;
-        run.advance(Kind::Drain, removed as u64, started.elapsed(), &meta.name);
+        run.advance(Kind::Drain, removed as u64, started.elapsed(), &meta.name, Some(&index.name));
         match counted {
             Some(TtlCount::Counted(now_selected, now_unselected)) => info!(
                 db = %meta.db,
@@ -1212,6 +1297,7 @@ fn drain(db: &Database, run: &mut Run, meta: &CollectionMeta, index: &IndexMeta)
             _ => {}
         }
         if empty {
+            run.end_step();
             return Ok(());
         }
     }
@@ -1316,6 +1402,10 @@ fn refill(
     if active.is_empty() {
         return Ok(());
     }
+    // Its own step on `/readyz`, documents walked against the collection's
+    // documents: an estimate (tombstones are walked too), raised if outrun. A
+    // resumed refill counts from where it resumes.
+    run.step(Kind::Refill, run.documents_of(coll), 0);
     loop {
         if stop_requested() {
             return stopped();
@@ -1433,7 +1523,7 @@ fn refill(
         #[cfg(test)]
         hooks::hold(Kind::Refill.label());
         commit(txn)?;
-        run.advance(Kind::Refill, walked, started.elapsed(), &meta.name);
+        run.advance(Kind::Refill, walked, started.elapsed(), &meta.name, None);
         #[cfg(test)]
         hooks::refilled(walked);
         if exhausted {
@@ -1450,6 +1540,7 @@ fn refill(
                     "rebuilt an index for storage schema 5"
                 );
             }
+            run.end_step();
             crate::open_progress::test_step_pause();
             return Ok(());
         }
@@ -1688,6 +1779,7 @@ pub(crate) mod hooks {
         pub(crate) static FREE: Cell<Option<u64>> = const { Cell::new(None) };
         static TIMINGS: Cell<Option<([Duration; 4], [u64; 4])>> = const { Cell::new(None) };
         static WATCHED: RefCell<Option<(std::path::PathBuf, u64)>> = const { RefCell::new(None) };
+        static CHUNKS: RefCell<Vec<ChunkSeen>> = const { RefCell::new(Vec::new()) };
     }
 
     /// Migration commits made on this thread so far.
@@ -1737,6 +1829,42 @@ pub(crate) mod hooks {
 
     pub(super) fn progress() {
         PROGRESS.with(|p| p.set(p.get() + 1));
+    }
+
+    /// One chunk's progress as `/readyz` showed it after the chunk: its kind,
+    /// collection, index, rows, and the open's phase, done and total then.
+    #[derive(Clone, Debug)]
+    pub(crate) struct ChunkSeen {
+        pub(crate) kind: &'static str,
+        pub(crate) collection: String,
+        pub(crate) index: Option<String>,
+        pub(crate) rows: u64,
+        pub(crate) phase: Option<crate::open_progress::OpenPhase>,
+        pub(crate) done: u64,
+        pub(crate) total: u64,
+    }
+
+    pub(super) fn chunk_done(kind: &'static str, coll: &str, index: Option<&str>, rows: u64) {
+        let (phase, total) = crate::open_progress::tests::THIS_THREAD_PHASE
+            .with(Cell::get)
+            .map_or((None, 0), |(p, t)| (Some(p), t));
+        let done = crate::open_progress::tests::THIS_THREAD_DONE.with(Cell::get);
+        CHUNKS.with(|c| {
+            c.borrow_mut().push(ChunkSeen {
+                kind,
+                collection: coll.to_string(),
+                index: index.map(str::to_string),
+                rows,
+                phase,
+                done,
+                total,
+            })
+        });
+    }
+
+    /// Every chunk's progress on this thread since the last call; clears it.
+    pub(crate) fn chunks_seen() -> Vec<ChunkSeen> {
+        CHUNKS.with(|c| std::mem::take(&mut *c.borrow_mut()))
     }
 
     /// Progress lines written on this thread so far.
