@@ -429,7 +429,8 @@ length, and a start that used to be killed and begun again for ever, because
 nothing listened until the open finished and Kubernetes' defaults restart a
 container after about 30 seconds of failed liveness checks, now finishes. What
 the open is doing is on `/readyz`: `phase` is one of `repairing`, `opening`,
-`migrating` (`done` of `total` indexes), `verifying` (`done` of `total` oplog
+`migrating` (`done` of `total` rows: documents re-keyed, moved back and walked by the index
+rebuild, [Storage schema 5](#storage-schema-5-the-first-start-of-0510)), `verifying` (`done` of `total` oplog
 rows), `counting`, `starting` and `reconciling` (`done` of `total` databases whose
 drop the node is burying before it serves, [ADR-229](decisions.md), or collections it is sweeping of what a
 drop that reached them late left behind, [ADR-231](decisions.md); absent when
@@ -441,9 +442,9 @@ database's drop covers for any reason but a stop (a damaged collection row, say)
 [`kimmyd check-store`](#checking-a-store) on the stopped member, and if the store is damaged, wipe its data
 directory and let it catch up from its peers ([A member that is catching up](#a-member-that-is-catching-up)). The open's cost is
 unchanged: the walk of the retained oplog is about 46 s per 10 million entries
-with the store in the page cache and far more cold, and the schema migration
-adds 8 us per document per partial index; a node logs a line for each phase
-as it goes.
+with the store in the page cache and far more cold, and the schema 5 migration
+adds about 16 us per document re-keyed and 8 us per document per index to it,
+as bounds; a node logs a line for each phase as it goes.
 **A start after an unclean stop repairs the database file first**, before the
 open's own work: about 0.4 s per GiB of `kimmy.redb`, measured at 1.3 s for a
 4 GiB file and 5.2 s for 12 GiB on an NVMe disk ([ADR-188](decisions.md)). It
@@ -2624,18 +2625,21 @@ Refusing on a *newer* schema is the right failure: a build cannot know a layout
 that did not exist when it was written, and guessing corrupts further. Migrating
 an *older* one is equally right — a user with data has no other route forward.
 
-Current schema is **4**. Migrations run in sequence, so an older database steps
+Current schema is **5**. Migrations run in sequence, so an older database steps
 through each one rather than needing its own path to the latest.
 
 | Step | What it does |
 |---|---|
 | 1 → 2 | Collections renumbered to ids derived from their names ([ADR-031](decisions.md)) — rewrites document keys, index entries, and the collection field of every oplog entry |
 | 2 → 3 | Indexes renumbered to ids derived from their names ([ADR-032](decisions.md)) — rewrites index-entry keys |
-| 3 → 4 | Every partial index rebuilt so that it holds what `find` with its filter returns, plus the documents the filter cannot decide ([ADR-183](decisions.md), [ADR-185](decisions.md)) — **moves no bytes of the layout** and changes what a partial index's entries mean. One transaction per index, with a marker per index so an interrupted run resumes rather than starting again. Schema 4 is written with the *first* index, so a half-migrated directory is refused by the older build rather than opened and maintained under the old rule |
+| 3 → 4 | Every partial index rebuilt so that it holds what `find` with its filter returns, plus the documents the filter cannot decide ([ADR-183](decisions.md), [ADR-185](decisions.md)) — **moves no bytes of the layout** and changes what a partial index's entries mean. One transaction per index, with a marker per index so an interrupted run resumes rather than starting again. Schema 4 is written with the *first* index, so a half-migrated directory is refused by the older build rather than opened and maintained under the old rule. **Not run on the way to 5**: 4 → 5 rebuilds every index under the current rule, which covers it |
+| 4 → 5 | Every number key made exact ([ADR-238](decisions.md)): every document with an integer `_id` re-keyed and **every index drained and rebuilt**, in chunks that each commit and resume. A **rollback boundary**: from the moment it starts, 0.50 and 0.49 refuse the store. See [Storage schema 5](#storage-schema-5-the-first-start-of-0510) |
 
-All three are idempotent and run before the node serves anything.
+All four are idempotent and run before the node serves anything.
 
-> **Back up the data directory before a version-crossing upgrade.** The
+> **Back up the data directory before a version-crossing upgrade**, and for
+> 0.51.0 roll with the deploy tool's `BACKUP=true`: the backup taken before the
+> upgrade is the only way back to 0.50 or 0.49. The
 > migration is transactional per step, but a rollback to the older build is not
 > possible once it has run — the older build will refuse the newer schema. **An
 > upgrade interrupted part-way cannot be rolled back either**, and deliberately
@@ -2646,6 +2650,76 @@ All three are idempotent and run before the node serves anything.
 > wipe its data directory and let it catch up from its peers, keeping clients
 > off it until it has (see [ADR-183](decisions.md)); to roll the whole cluster
 > back, restore the backup.
+
+### Storage schema 5: the first start of 0.51.0
+
+**The first start of 0.51.0 on a store of an earlier release migrates it before
+the node serves anything** ([ADR-238](decisions.md)). Every number key on disk
+changes: a number is keyed by its exact value, so that a `Decimal128` has a
+place in the order. While it runs, the node answers `/healthz` and `/readyz`
+says `migrating`; peers see it as down, and nothing is written to it. In order:
+
+1. **The plan and the free-space check, before anything of the migration is
+   written.** One line, `storage schema 4 -> 5 (exact number keys)`, names the
+   collections, the ranges of documents (`purge_pending_ranges` counts those a
+   drop left being purged, which are re-keyed too), the documents and
+   tombstones, the indexes and their entries, the file's size, the free space
+   required and the free space there is, and `estimate_secs`. **The start is
+   refused if the volume holding the store has less free space than the
+   requirement**, with the two figures (`the storage schema migration needs N
+   MiB free and M MiB is free`): one of redb's growth steps from the file's
+   size (the file doubles while it is under 4 GiB; above, at worst the rest of
+   its last 4 GiB region and one more region) and a working set of a few chunks.
+   A refused start writes nothing of the migration: the store is still schema
+   4 and 0.50 opens it. Free space and start again. A partial index whose stored
+   filter this build cannot parse refuses the start the same way.
+2. **From here, 0.50 and 0.49 refuse the store.** `kimmy.format` records schema
+   5 just before the first commit, which writes schema 5 into the store and
+   lists the work as markers. A start of 0.50 or 0.49 on the store, finished or
+   interrupted, is refused with nothing written, and so is a 0.50 restore of a
+   backup taken on 0.51.0; 0.50's `kimmyd check-store` answers `not_checked`.
+3. **Every document with an integer `_id` is re-keyed** (tombstones too), a
+   chunk of 8,192 rows per commit, in two passes through a staging table, and
+   **every index is drained and rebuilt** from the documents, a chunk of about
+   16 MiB of entries per commit. A progress line, `migrating storage schema 4
+   -> 5`, comes every 100,000 rows with the phase and the collection; each
+   collection ends with `re-keyed a collection's documents for storage schema
+   5`, each index with `rebuilt an index for storage schema 5` (its entries,
+   the documents it could not key, and `unique_collisions`), and the migration
+   with `migrated storage schema 4 -> 5` and the time of each phase. A TTL
+   index with a partial filter logs one more line: the documents its filter now
+   selects that it did not (they expire once due) and the reverse, because a
+   decimal at the filter's path is now compared by its exact value
+   (`before="not recorded"` for a store that comes from schema 3).
+4. **The first start on schema 5 also walks the oplog once** (`checked the
+   version vector against the oplog`); later starts log `skipped the oplog
+   walk`.
+
+**A stop, or a crash, at any point is safe**: each chunk is its own commit, a
+stop is answered within one chunk, and the next start resumes from the markers
+(`resuming an interrupted storage schema 4 -> 5 migration`), on 0.51.0 or later
+only.
+
+**Two unique documents that share a key are reported** when the rebuild finds
+them, as a replicated build's are, with a `/violations` row, the metric and a
+line each. That includes a pair 0.50 never enforced: a partial unique index
+whose filter's path holds a decimal now decides it exactly, and a pair a
+replication merge left, which 0.50 reported once already, is reported once
+more.
+
+**How long it takes.** Measured on a laptop's SSD with the page cache warm, in
+a release build (`examples/schema4_migration`), for documents of about 350 bytes
+with integer `_id`s and three indexes: 1.5 s for 100,000 documents, 5 to 7 s for
+500,000, and 20 to 47 s for 2,000,000, plus under a second for the oplog walk;
+the file grew from 2,411 to 4,096 MiB during the 2,000,000-document run and was
+back to 2,415 MiB once the node closed. The design's estimate for the same
+2,000,000 documents on a spinning disk is 12 to 20 minutes. Re-keying is bound
+by its commits, a disk sync each, so a slower disk costs more than a slower
+CPU; a store whose `_id`s are strings or ObjectIds has no re-key. The oplog
+walk is about 30 s per GB read cold. **Check the deploy tool's per-member
+readiness wait against this before the roll**, and allow for the migration
+and the oplog walk being longer than `storage.oplog_retention_secs`: then the
+member's return is a whole-database snapshot.
 
 ### Rolling back, and `kimmy.format`
 
@@ -2696,6 +2770,8 @@ defaults rolls back untouched.
 **Rolling back from 0.47.0 to 0.46.0 needs no store work and no edit to the configuration, and a roll or a rollback must finish within `storage.tombstone_retention_secs` of any database drop made during it.** No table, `kimmy.format` schema (still 4), redb version, backup tag, snapshot field, entry kind or configuration key changed. A database's drop is a row of the dropped-collections table under a reserved collection name, and an ordinary `DropCollection` entry that names it ([ADR-229](decisions.md)); 0.46.0 reads, applies, stores and serves both as the drop of a collection it never held, which a 0.46.0 member was shown to do on the 0.46.0 build before the change. A backup taken on 0.47.0 restores on 0.46.0, and the reverse. **What a member on 0.46.0 does not do is act on it:** it drops the collections the dropper held and *keeps* a collection the dropper never held, and keeps serving it, acknowledged writes included, until it restarts on 0.47.0, which buries it (and the writes). A member that stays on 0.46.0 longer than the tombstone's retention after a database drop never has the tombstone to act on; the other members, which have also collected theirs, then see the collection as an existence divergence and anti-entropy brings it back, and with it the database. Finish a roll or a rollback inside the retention window, and do not drop databases in the middle of one if you can wait. While the cluster is mixed, a database drop issued on a 0.46.0 member records no tombstone and behaves as it did.
 
 **Rolling back from 0.47.1 to 0.47.0 needs nothing:** the store, the wire and the configuration are the same, and the release changes only a log level and where a change stream starts.
+
+**Rolling back from 0.51.0 to 0.50.x or 0.49.x needs the backup taken before the upgrade.** Storage schema 5 is a rollback boundary ([ADR-238](decisions.md)): from the moment a 0.51.0 start raises `kimmy.format` to schema 5, just before its migration's first commit, 0.50 and 0.49 refuse the store with nothing written, an interrupted migration's included, and refuse a backup taken on 0.51.0 before the restore creates a file. A 0.51.0 start that was refused before that point (the free-space check, an unparseable partial filter) leaves a store 0.50 opens. The way back is the backup taken before the upgrade (`BACKUP=true`): restored on 0.50, it loses every write made after it on that member, which the member then catches up from its peers. Wiping the data directory and letting the member catch up from its peers works while no member holds a document whose `_id` is a `Decimal128`.
 
 **Rolling back from 0.50.0 to 0.49.x needs no store work, and the configuration may need an edit.** No `kimmy.format` schema (still 4), `I_EPOCH`, table, backup tag or entry kind changed. The store gains one metadata key, `gc:tombstone_horizon`, and the snapshot page one optional field, `tombstone_horizon`; 0.49.x ignores both, and a backup carries the key. **Remove `cluster.divergence_repair`, `cluster.repair_max_documents` and `cluster.repair_max_index_documents` from the configuration first**: 0.49.x refuses to start on a configuration that names any of them, at any value. **A store rolled back to 0.49.x buries, at its next start or database sweep, every collection 0.50.0 kept under a database drop, with the writes it kept** ([ADR-236](decisions.md)), so the members differ until they run one version; the details, and the two differences that outlast a roll, are in [Compatibility](compatibility.md). During a roll a 0.49.x member repairs nothing, and a 0.50.0 member repairing from it writes no young lost insert, since a 0.49.x sender reports no horizon.
 

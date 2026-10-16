@@ -2376,3 +2376,57 @@ fn a_ttl_index_never_filed_under_adr_185_has_no_before_to_count_against() {
         }
     }
 }
+
+/// The verified record's epoch and schema bytes, read without writing.
+fn verified_record(path: &Path) -> Option<(u8, u8)> {
+    let rows = rows(&read_only(path), tables::VECTOR_VERIFIED);
+    rows.get("verified".as_bytes()).map(|v| (v[0], v[1]))
+}
+
+#[test]
+fn i_epoch_and_check_store_answer_for_a_store_mid_migration_and_after() {
+    // Design 6.3 (m5): the migration leaves `I_EPOCH` where it is and writes
+    // no verified record; the record moves to schema 5 only with the first
+    // start's walk. And `kimmyd check-store`: this build checks a store
+    // mid-migration and after it alike (redb's checksums, which a migration's
+    // chunks keep, being commits like any other); the previous build answers
+    // `not_checked` for both, refusing, before it reads anything, a store a
+    // newer build wrote.
+    let f = fixture();
+    let previous = |path: &Path| {
+        crate::format::check_reading_only(path, &v050()).map(|_| ()).map_err(|e| e.to_string())
+    };
+    let path = f.copy();
+    assert_eq!(verified_record(&path), Some((crate::verified::I_EPOCH, 4)), "premise: 0.50's");
+    assert_eq!(crate::verified::I_EPOCH, 1, "the migration does not move the epoch");
+
+    // Mid-migration: killed half-way through its commits.
+    let half = {
+        let probe = f.copy();
+        let before = hooks::commits();
+        drop(Engine::open(&probe).unwrap());
+        (hooks::commits() - before) / 2
+    };
+    hooks::fail_at_commit(half);
+    assert!(Engine::open(&path).is_err());
+    assert!(crate::migrate_v5::unfinished(&Database::create(&path).unwrap()).unwrap());
+    assert_eq!(
+        verified_record(&path),
+        Some((1, 4)),
+        "mid-migration: the record is untouched, epoch 1 for schema 4, so it counts for nothing"
+    );
+    let ours = crate::check::check_store(&path, &Default::default());
+    assert_eq!(ours.verdict, crate::check::Verdict::Clean, "mid-migration, this build: {ours:?}");
+    let theirs = previous(&path).expect_err("0.50 refuses a store mid-migration");
+    assert!(theirs.contains("schema 5"), "{theirs}");
+
+    // Finished: the first start walks the oplog and records the walk for
+    // schema 5 under the same epoch.
+    drop(Engine::open(&path).unwrap());
+    assert_eq!(verified_record(&path), Some((1, 5)), "after: epoch 1, schema 5");
+    let ours = crate::check::check_store(&path, &Default::default());
+    assert_eq!(ours.verdict, crate::check::Verdict::Clean, "after, this build: {ours:?}");
+    let theirs = previous(&path).expect_err("0.50 refuses a migrated store");
+    assert!(theirs.contains("schema 5"), "{theirs}");
+    eprintln!("CHECK-STORE: this build: {}; 0.50: refused: {theirs}", ours.json_line());
+}
