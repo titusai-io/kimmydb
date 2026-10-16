@@ -162,10 +162,10 @@ fn records(engine: &Engine, collection: CollectionId) -> Vec<(Vec<u8>, Stamp, Op
     for row in docs.range(crate::engine::doc_range(collection)).unwrap() {
         let (key, value) = row.unwrap();
         let record = codec::decode_doc_record(value.value()).unwrap();
-        let id = match record.document().unwrap() {
-            Some(body) => Some(DocId::try_from_bson(body.get(crate::ID_FIELD).unwrap()).unwrap()),
-            None => None,
-        };
+        let id = record
+            .document()
+            .unwrap()
+            .map(|body| DocId::try_from_bson(body.get(crate::ID_FIELD).unwrap()).unwrap());
         out.push((key.value().1.to_vec(), record.stamp, id));
     }
     out
@@ -1371,4 +1371,15 @@ fn the_conversions_are_at_the_wire_api_and_the_fold_sites_and_nowhere_else() {
         using("legacy_term("),
         sites(&[("digest_probe.rs", "excluded_digest"), ("live_digest.rs", "legacy_term")])
     );
+}
+
+/// Neither digest's format moves (design 7.3 and 8, review m6): the cut digest's rows a 0.50
+/// member kept are the rows this build keeps, since every term is over the legacy key, and a
+/// definition digest hashes no key at all. A bump would defer every comparison (`format`)
+/// between a 0.50 and a 0.51 member for the whole roll, and rebuild every kept row at the
+/// first start of 0.51 for nothing.
+#[test]
+fn neither_digest_format_moves() {
+    assert_eq!(crate::live_digest::FORMAT, 1, "the cut digest's format");
+    assert_eq!(crate::definition_digest::FORMAT, 2, "the definition digest's format");
 }
