@@ -1997,10 +1997,11 @@ async fn every_member_files_an_unkeyable_document_the_same_way() {
     // member was filed under a real key there and unkeyed on both peers,
     // because the member's JSON edge left `$numberDecimal` a nested
     // document while every re-decode of the stored bytes held a Decimal128.
-    // Each shape an index cannot key is written to A; every node must
-    // report the same `unkeyed` and count the document through the index —
-    // and again for the mirror order, an index created after the documents
-    // have replicated.
+    // A `Decimal128` has a key now, and is written beside the shapes an index
+    // still cannot key to keep the finding pinned: every node must report the
+    // same `unkeyed` (the two shapes that cannot be keyed, not the decimal) and
+    // count all three documents through the index — and again for the mirror
+    // order, an index created after the documents have replicated.
     let client = reqwest::Client::new();
     let (a, b, c) = three_nodes(&client).await;
     eventually("gossip to form", || all_report(&client, vec![&a, &b, &c], 2)).await;
@@ -2040,21 +2041,24 @@ async fn every_member_files_an_unkeyable_document_the_same_way() {
 
     let tokens = [a.login(&client).await, b.login(&client).await, c.login(&client).await];
     let nodes = [&a, &b, &c];
-    eventually("every node to file all three documents unkeyed and count them", || {
-        let client = &client;
-        let tokens = &tokens;
-        async move {
-            for (node, token) in nodes.iter().zip(tokens) {
-                if unkeyed_on(client, node, token, "ab").await != Some(3) {
-                    return false;
+    eventually(
+        "every node to file the two unkeyable documents unkeyed and count all three",
+        || {
+            let client = &client;
+            let tokens = &tokens;
+            async move {
+                for (node, token) in nodes.iter().zip(tokens) {
+                    if unkeyed_on(client, node, token, "ab").await != Some(2) {
+                        return false;
+                    }
+                    if indexed_count_on(client, node, token).await != Some(3) {
+                        return false;
+                    }
                 }
-                if indexed_count_on(client, node, token).await != Some(3) {
-                    return false;
-                }
+                true
             }
-            true
-        }
-    })
+        },
+    )
     .await;
 
     // The mirror order: the documents are everywhere already, and a new
@@ -2072,7 +2076,7 @@ async fn every_member_files_an_unkeyable_document_the_same_way() {
         let tokens = &tokens;
         async move {
             for (node, token) in nodes.iter().zip(tokens) {
-                if unkeyed_on(client, node, token, "ba").await != Some(3) {
+                if unkeyed_on(client, node, token, "ba").await != Some(2) {
                     return false;
                 }
             }
