@@ -710,6 +710,12 @@ impl DivergenceTracker {
         out
     }
 
+    /// The existence half's share of [`Self::confirmed_against`]: collections `peer` holds
+    /// that this node does not, found on its two most recent consecutive contacts.
+    pub fn existence_confirmed_against(&self, peer: NodeId) -> BTreeSet<CollectionId> {
+        self.confirmed.get(&peer).cloned().unwrap_or_default()
+    }
+
     /// Every collection the check still reports against `peer`, suspended and quieted
     /// count findings included: what the repairs done against it are kept for
     /// (`PeerStalls::retain_repaired`). A suspended finding a compared probe renews, and a

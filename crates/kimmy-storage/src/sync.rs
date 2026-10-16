@@ -285,6 +285,11 @@ pub struct SyncOutcome {
     /// counts. A document or definition repair (`Converge`, `Definitions`) sets `repairing`
     /// and not this: they have their own series. Set only by `kimmy-cluster`'s `sync_once`.
     pub count_repair: bool,
+    /// Whether the peer's block on this contact said its catching-up marker is set
+    /// (ADR-201): what the loop's repair plans read beside what membership holds of the
+    /// peer, which cannot see a peer it lists under another id or does not list yet
+    /// (ADR-237's addendum). Set only by `kimmy-cluster`'s `sync_once`.
+    pub peer_catching_up: bool,
     /// The peer answered `BeyondHorizon` and this round did **not** take a
     /// snapshot from it: it was set aside so the tick's other contacts could serve
     /// this member first (ADR-224). Nothing else in the outcome is meaningful: the

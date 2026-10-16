@@ -92,13 +92,14 @@ fn hold_own_marker(side: &mut Side) {
     side.stalls.set_catch_up(side.own_marker.clone());
 }
 
-/// What the loop asks before it plans a repair from `node` (`either_side_is_catching_up`): this
-/// side's own marker, when its rounds hold it, and the block `node` last served it.
-fn catching_up(side: &Side, node: NodeId) -> bool {
+/// What the loop asks before it plans a repair from `node` (`CatchingUp::of`): this side's own
+/// marker, when its rounds hold it, and the peer's, from the block this contact carried
+/// (`said`) or the one membership holds for `node`.
+fn catching_up(side: &Side, node: NodeId, said: bool) -> CatchingUp {
     let mut config = ReplicationConfig::new(Vec::new(), SECRET.into(), side.addr);
     config.members = Some(side.members.clone());
     config.catch_up = side.own_marker.clone();
-    either_side_is_catching_up(&config, node)
+    CatchingUp::of(&config, node, said)
 }
 
 fn pull(into: &Engine, from: &Engine) {
@@ -150,7 +151,7 @@ async fn tick(side: &mut Side) -> usize {
                     outcome.count_probe_deferred,
                     probe.as_ref(),
                 );
-                let catching_up = catching_up(side, node);
+                let catching_up = catching_up(side, node, outcome.peer_catching_up);
                 planned += plan_count_repairs(
                     &engine,
                     &side.divergence,
@@ -324,7 +325,7 @@ async fn tick_with_digest(side: &mut Side, digest: &mut DigestState) -> usize {
                         &mut report,
                     );
                 }
-                let catching_up = catching_up(side, node);
+                let catching_up = catching_up(side, node, outcome.peer_catching_up);
                 planned += plan_count_repairs(
                     &engine,
                     &side.divergence,
@@ -506,11 +507,13 @@ async fn the_check_after_a_pull_defers_against_a_member_catching_up() {
         assert!(outcome.applied > 0 && outcome.exhausted, "premise {i}: a pull, then the check");
         assert_eq!(outcome.count_probe, None, "contact {i}: compared a member catching up");
         assert!(outcome.count_probe_deferred, "contact {i}: and counted deferred");
+        assert!(outcome.peer_catching_up, "contact {i}: and the round says why");
     }
     b.catch_up.clear("the test");
     tokio::time::sleep(BLOCK_REBUILT).await;
     let outcome = contact(&a, &b, &own, 1_000, &mut stalls).await;
     assert_eq!(outcome.count_probe, Some((live, true)), "B still, marker clear: compared");
+    assert!(!outcome.peer_catching_up, "and the round says B is not catching up");
 }
 
 /// The deferral ends with the marker. B's snapshot stops where it stood and its marker clears,
@@ -555,11 +558,81 @@ async fn a_member_catching_up_compares_no_count_and_plans_no_repair_itself() {
 /// The repair's own gate, in the loop itself (`replicate`): B holds a collection A does not,
 /// only as state part of a snapshot gave it (no entry of it that a pull could bring), and its
 /// marker is set. The existence half finds the collection on B, and nothing is pulled from B
-/// while it is catching up; once its marker clears, the collection is repaired from B.
+/// while it is catching up; once its marker clears, the collection is repaired from B. Both with
+/// membership, which holds B's block, and without it (static seeds), where the block this
+/// contact carried is all the loop has to go on.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn the_loop_repairs_nothing_from_a_peer_until_its_marker_clears() {
-    let (a, b) = (side().await, side().await);
-    a.members.insert_for_test(b.addr, b.node);
+    for membership in [true, false] {
+        let (a, b) = (side().await, side().await);
+        a.members.insert_for_test(b.addr, b.node);
+        let _source = b_holds_part_of_a_snapshot_of_extra(&b);
+        b.catch_up.mark(crate::CatchUpReason::Snapshot).unwrap();
+
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<RoundReport>();
+        let seeds = vec![SeedSource::Static(vec![b.addr])];
+        let mut config = ReplicationConfig::new(seeds, SECRET.into(), a.addr);
+        config.sync_interval = Duration::from_millis(100);
+        config.discovery_interval = Duration::from_millis(100);
+        config.members = membership.then(|| a.members.clone());
+        config.on_round = Some(Arc::new(move |report| {
+            let _ = tx.send(report);
+        }));
+        let looping = tokio::spawn(replicate(Arc::clone(&a.engine), config));
+        let held = || a.engine.get_collection("shop", "extra").is_ok();
+
+        let (mut checks, mut repairs) = (0, 0);
+        while checks < 10 {
+            let Ok(Some(report)) = tokio::time::timeout(Duration::from_secs(10), rx.recv()).await
+            else {
+                break;
+            };
+            checks += report.divergence_checks;
+            repairs += report.repair_rounds;
+        }
+        assert!(checks >= 10, "premise (membership {membership}): A checked B: {checks}");
+        assert_eq!(
+            repairs, 0,
+            "membership {membership}: a repair round against a peer catching up"
+        );
+        assert!(!held(), "membership {membership}: a collection repaired from a peer catching up");
+
+        b.catch_up.clear("the test");
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
+        while !held() && tokio::time::Instant::now() < deadline {
+            let _ = tokio::time::timeout(Duration::from_secs(1), rx.recv()).await;
+        }
+        looping.abort();
+        assert!(held(), "membership {membership}: repaired from B once its marker cleared");
+    }
+}
+
+/// B holds a collection A does not, only as the state part of a snapshot gave it, and its marker
+/// is set. A's membership still lists B's address under the id B had before it was wiped, as
+/// SWIM does until the new id is gossiped, so what membership holds says nothing of B; the
+/// block B sent on this contact says it is catching up, and nothing is planned from it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_peer_listed_under_another_id_is_not_repaired_from_while_its_block_says_it_catches_up() {
+    let (mut a, b) = (side().await, side().await);
+    a.members.insert_for_test(b.addr, NodeId::from_bytes([7; 16]));
+    b_holds_part_of_a_snapshot_of_extra(&b);
+    b.catch_up.mark(crate::CatchUpReason::Snapshot).unwrap();
+    let mut planned = 0;
+    for _ in 0..4 {
+        planned += tick(&mut a).await;
+    }
+    assert!(b.catch_up.is_set(), "premise: B is still catching up");
+    let held = a.engine.get_collection("shop", "extra").is_ok();
+    assert!(
+        planned == 0 && !held,
+        "repaired from a member whose block on this contact says it is catching up: \
+         {planned} planned, collection taken: {held}"
+    );
+}
+
+/// B, as the state part of a snapshot gave it: a collection, `extra`, with no entry of it that a
+/// pull could bring.
+fn b_holds_part_of_a_snapshot_of_extra(b: &Side) -> tempfile::TempDir {
     let source_dir = tempfile::tempdir().unwrap();
     let source = Engine::open(&source_dir.path().join("kimmy.redb")).unwrap();
     let extra = source.create_collection("shop", "extra").unwrap();
@@ -569,37 +642,70 @@ async fn the_loop_repairs_nothing_from_a_peer_until_its_marker_clears() {
     let mut progress = kimmy_storage::SnapshotProgress::whole_database();
     let page = source.snapshot_page(None, None).unwrap();
     b.engine.apply_snapshot_page(source.node_id(), &mut progress, &page).unwrap();
-    b.catch_up.mark(crate::CatchUpReason::Snapshot).unwrap();
+    source_dir
+}
 
-    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<RoundReport>();
-    let mut config = ReplicationConfig::new(Vec::new(), SECRET.into(), a.addr);
-    config.sync_interval = Duration::from_millis(100);
-    config.discovery_interval = Duration::from_millis(100);
-    config.members = Some(a.members.clone());
-    config.on_round = Some(Arc::new(move |report| {
-        let _ = tx.send(report);
-    }));
-    let looping = tokio::spawn(replicate(Arc::clone(&a.engine), config));
-    let held = || a.engine.get_collection("shop", "extra").is_ok();
-
-    let (mut checks, mut repairs) = (0, 0);
-    while checks < 10 {
-        let Ok(Some(report)) = tokio::time::timeout(Duration::from_secs(10), rx.recv()).await
-        else {
+/// A count repair planned from B while B was not catching up waits once B's block says it is:
+/// the next contact runs no count repair against B, and the repair is still owed, and runs, once
+/// B's marker has cleared.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_count_repair_planned_before_the_peer_marks_waits_until_its_marker_clears() {
+    let (mut a, b) = (side().await, side().await);
+    a.members.insert_for_test(b.addr, b.node);
+    b.members.insert_for_test(a.addr, a.node);
+    let live = a.engine.create_collection("shop", "live").unwrap();
+    pull(&b.engine, &a.engine);
+    for i in 0..5i64 {
+        a.engine.insert(&live, doc! { "_id": i }).unwrap();
+    }
+    let mut planned = 0;
+    for _ in 0..FROZEN_CONTACTS + 4 {
+        planned += tick(&mut a).await;
+        if planned > 0 {
             break;
-        };
-        checks += report.divergence_checks;
-        repairs += report.repair_rounds;
+        }
     }
-    assert!(checks >= 10, "premise: A checked B: {checks}");
-    assert_eq!(repairs, 0, "a repair round against a peer catching up");
-    assert!(!held(), "a collection repaired from a peer catching up");
-
+    assert_eq!(
+        planned, 1,
+        "premise: a count repair was planned from B while B was not catching up"
+    );
+    b.catch_up.mark(crate::CatchUpReason::Snapshot).unwrap();
+    tokio::time::sleep(BLOCK_REBUILT).await;
+    async fn contact(a: &mut Side, b: &Side) -> kimmy_storage::SyncOutcome {
+        a.tick += 1;
+        a.stalls.begin_tick(a.tick);
+        a.stalls.set_members(Some(a.members.clone()));
+        a.stalls.tick_opened();
+        a.stalls.allow_horizon_deferral(false);
+        sync_once_with(&a.engine, b.addr, SECRET, None, &mut a.stalls).await.unwrap()
+    }
+    for round in 0..crate::transport::REPAIR_ATTEMPTS + 2 {
+        let outcome = contact(&mut a, &b).await;
+        assert!(outcome.peer_catching_up, "premise {round}: B's block says it is catching up");
+        assert!(!outcome.count_repair, "round {round}: a count repair ran against B");
+    }
     b.catch_up.clear("the test");
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
-    while !held() && tokio::time::Instant::now() < deadline {
-        let _ = tokio::time::timeout(Duration::from_secs(1), rx.recv()).await;
+    tokio::time::sleep(BLOCK_REBUILT).await;
+    let outcome = contact(&mut a, &b).await;
+    assert!(outcome.count_repair, "the repair is still owed, and runs once B has caught up");
+}
+
+/// The other way round, for the existence half: A is catching up and lacks a collection B holds
+/// (B is not catching up). A's own marker holds no repair of a collection it lacks, since that
+/// repair is what brings a collection its own catch-up may not; it is planned and A takes it.
+/// A count finding of A's would still be held (`a_member_catching_up_compares_no_count_...`).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_member_catching_up_still_repairs_a_collection_it_lacks_from_a_peer_that_is_not() {
+    let (mut a, b) = (side().await, side().await);
+    a.members.insert_for_test(b.addr, b.node);
+    hold_own_marker(&mut a);
+    a.catch_up.mark(crate::CatchUpReason::Restored).unwrap();
+    let _source = b_holds_part_of_a_snapshot_of_extra(&b);
+    let mut planned = 0;
+    for _ in 0..4 {
+        planned += tick(&mut a).await;
     }
-    looping.abort();
-    assert!(held(), "repaired from B once its marker cleared");
+    assert!(a.catch_up.is_set(), "premise: A is still catching up");
+    assert_eq!(planned, 1, "the collection A lacks is planned from B");
+    assert!(a.engine.get_collection("shop", "extra").is_ok(), "and A takes it");
 }

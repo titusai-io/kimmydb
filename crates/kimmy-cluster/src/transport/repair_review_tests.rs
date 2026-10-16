@@ -42,7 +42,7 @@ fn a_queued_converge_is_not_handed_out_on_the_resting_contact() {
     let mut handed = Vec::new();
     for _ in 0..4 {
         stalls.tick_opened();
-        let due = stalls.repair_due(p);
+        let due = stalls.repair_due(p, false);
         handed.push(due.map(|(c, r)| (c.0, r)));
         if due.is_some() {
             // A small collection: the Converge pull completes in its one round.
@@ -184,7 +184,7 @@ fn a_peer_down_for_one_tick_keeps_its_back_off() {
         // A Converge pull rests the contact after it: take the contacts it needs.
         let due = (0..3).find_map(|_| {
             stalls.tick_opened();
-            stalls.repair_due(p)
+            stalls.repair_due(p, false)
         });
         assert_eq!(due, Some((c, Repair::Converge)));
         stalls.repair_finished(p);
@@ -463,7 +463,7 @@ fn an_abandoned_repairs_left_ids_do_not_reach_the_next_repairs_line() {
     let (c1, c2) = (CollectionId(1), CollectionId(2));
     assert_eq!(stalls.plan_digest_repair(p, c1, VersionVector::default()), DigestPlan::Planned);
     stalls.tick_opened();
-    assert_eq!(stalls.repair_due(p), Some((c1, Repair::Converge)));
+    assert_eq!(stalls.repair_due(p, false), Some((c1, Repair::Converge)));
     let left_in_c1 = kimmy_storage::SnapshotApplied {
         left: 1,
         left_ids: vec![DocId::Int64(111)],
@@ -474,12 +474,12 @@ fn an_abandoned_repairs_left_ids_do_not_reach_the_next_repairs_line() {
     // Three Converge rounds that land nothing: abandoned.
     while stalls.repairing(p) {
         stalls.tick_opened();
-        stalls.repair_due(p);
+        stalls.repair_due(p, false);
     }
     assert_eq!(stalls.plan_digest_repair(p, c2, VersionVector::default()), DigestPlan::Planned);
     loop {
         stalls.tick_opened();
-        if stalls.repair_due(p).is_some() {
+        if stalls.repair_due(p, false).is_some() {
             break;
         }
     }
@@ -507,11 +507,11 @@ fn a_queued_converge_does_not_run_while_the_count_repair_of_its_collection_cools
     assert_eq!(stalls.plan_digest_repair(p, c, VersionVector::default()), DigestPlan::Planned);
     assert!(stalls.plan_repair(p, c, Repair::Snapshot), "a count repair is not refused");
     stalls.tick_opened();
-    assert_eq!(stalls.repair_due(p), Some((c, Repair::Snapshot)));
+    assert_eq!(stalls.repair_due(p, false), Some((c, Repair::Snapshot)));
     stalls.repair_finished(p);
     assert!(stalls.count_repair_pending(p, c), "premise: the count repair is cooling");
     stalls.tick_opened();
-    assert_eq!(stalls.repair_due(p), None, "a Converge ran beside a cooling count repair");
+    assert_eq!(stalls.repair_due(p, false), None, "a Converge ran beside a cooling count repair");
 }
 
 /// R7 with the grace: a member absent from the live list for less than `MEMBER_GRACE` keeps its

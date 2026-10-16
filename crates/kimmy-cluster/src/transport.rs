@@ -2152,7 +2152,7 @@ where
     // horizon by the threshold it asks from rather than by the vector
     // it holds, so a floor below what the peer retains becomes the
     // snapshot it would have been anyway.
-    let repair = stalls.repair_due(their_node);
+    let repair = stalls.repair_due(their_node, peer_catching_up);
     let replay_floor = match repair {
         Some((_, Repair::Replay { from })) => Some(from),
         _ => None,
@@ -2243,6 +2243,7 @@ where
             digest,
             definitions,
             exhausted: true,
+            peer_catching_up,
             ..SyncOutcome::default()
         });
     };
@@ -2800,6 +2801,7 @@ where
     // acted on: the loop decides what to say about it.
     outcome.behind_ms = behind_beyond_horizon(engine, &theirs, &mine)?;
     outcome.peer = Some(their_node);
+    outcome.peer_catching_up = peer_catching_up;
     Ok(outcome)
 }
 
@@ -2902,8 +2904,11 @@ fn behind_beyond_horizon(
 /// repair was planned from it (lab row 7 of 0.50.0, against a member 59 pages
 /// into a 394-page snapshot). Its marker says what the vector cannot, and the
 /// peer's block on this contact's `Vectors` carries it (ADR-201). The deferral
-/// ends when the marker clears: the member's vector then covers what it holds,
-/// and the next contact is judged by position alone.
+/// ends when the marker clears. Cleared by dominance or the mutual clear, the
+/// member's vector then covers what it holds, and the next contact is judged by
+/// position alone; removed by an operator from a member part-way through a
+/// snapshot, it is set again at its next snapshot round, and one compared
+/// mismatch confirms nothing.
 fn divergence_probe_for(
     probe: Option<DivergenceProbe>,
     position: PeerPosition,
@@ -4563,7 +4568,17 @@ impl PeerStalls {
     /// repair done for this peer, for the cooldown, and against the repair
     /// under way, which is abandoned to the cooldown after
     /// [`REPAIR_ATTEMPTS`] rounds that did not advance it.
-    pub fn repair_due(&mut self, peer: NodeId) -> Option<(CollectionId, Repair)> {
+    ///
+    /// While `peer_catching_up` (the peer's block on this contact says so) a count
+    /// repair is not handed out: one under way stays under way and one queued stays
+    /// queued, and the round is not counted against it, since it was not handed
+    /// out. It reads a state that is about to change, and it was planned before the
+    /// peer said so (ADR-237's addendum).
+    pub fn repair_due(
+        &mut self,
+        peer: NodeId,
+        peer_catching_up: bool,
+    ) -> Option<(CollectionId, Repair)> {
         let repairs = self.repairs.get_mut(&peer)?;
         // Repairs with a ledger entry that this call ends, for the loop guard.
         let mut ended: Vec<(CollectionId, RepairKind, EndData)> = Vec::new();
@@ -4590,6 +4605,9 @@ impl PeerStalls {
         // count repair is not alternated; ADR-148.)
         let ordinary = repairs.resting || repairs.handed;
         if ordinary && matches!(repairs.active, Some((_, Repair::Converge | Repair::Definitions))) {
+            return None;
+        }
+        if peer_catching_up && repairs.active.is_some_and(|(_, r)| r.kind() == RepairKind::Count) {
             return None;
         }
         // A repair handed out on the previous round and neither advanced
@@ -4642,6 +4660,10 @@ impl PeerStalls {
                 // A document or definition repair waits for the whole-database pull, and for
                 // the contact that is ordinary.
                 if kind != RepairKind::Count && (whole_pending || ordinary) {
+                    continue;
+                }
+                // A count repair waits for a peer that is catching up.
+                if kind == RepairKind::Count && peer_catching_up {
                     continue;
                 }
                 // The count gate again, at promotion: a Converge queued before a count repair
@@ -8472,7 +8494,7 @@ mod tests {
             assert!(failed.is_err(), "attempt {attempt}: the peer went away");
         }
         assert_eq!(
-            stalls.repair_due(their_node),
+            stalls.repair_due(their_node, false),
             None,
             "abandoned after three rounds that landed nothing"
         );
@@ -8654,13 +8676,13 @@ mod tests {
         // warning names.
         for attempt in 0..REPAIR_ATTEMPTS {
             assert_eq!(
-                stalls.repair_due(peer),
+                stalls.repair_due(peer, false),
                 Some((collection, Repair::Snapshot)),
                 "attempt {attempt}"
             );
         }
         // The round after that abandons it rather than asking again.
-        assert_eq!(stalls.repair_due(peer), None, "abandoned");
+        assert_eq!(stalls.repair_due(peer, false), None, "abandoned");
         assert!(!stalls.repairing(peer));
         assert!(!stalls.plan_repair(peer, collection, Repair::Snapshot), "and cooling down");
 
@@ -8669,10 +8691,39 @@ mod tests {
         let mut stalls = PeerStalls::new();
         assert!(stalls.plan_repair(peer, collection, Repair::Replay { from: Hlc::new(1, 0) }));
         for wall in 1..=(REPAIR_ATTEMPTS as u64 * 4) {
-            assert!(stalls.repair_due(peer).is_some(), "still going at {wall}");
+            assert!(stalls.repair_due(peer, false).is_some(), "still going at {wall}");
             stalls.repair_continues(peer, Repair::Replay { from: Hlc::new(wall, 0) });
         }
         assert!(stalls.repairing(peer), "a repair making progress is never abandoned");
+    }
+
+    /// A count repair is not handed to a peer that is catching up (ADR-237's addendum), and
+    /// the rounds it waits are not counted against it: one under way is handed out again
+    /// once the peer has caught up, however many rounds went by, and one queued is promoted
+    /// only then.
+    #[test]
+    fn a_count_repair_waits_while_its_peer_catches_up_and_is_not_abandoned_for_it() {
+        let peer = node(1);
+        let collection = CollectionId(7);
+        let mut stalls = PeerStalls::new();
+        assert!(stalls.plan_repair(peer, collection, Repair::Snapshot));
+        assert_eq!(stalls.repair_due(peer, false), Some((collection, Repair::Snapshot)));
+        for round in 1..=REPAIR_ATTEMPTS * 3 {
+            assert_eq!(stalls.repair_due(peer, true), None, "round {round}: handed out");
+        }
+        assert!(stalls.repairing(peer), "still under way");
+        assert_eq!(
+            stalls.repair_due(peer, false),
+            Some((collection, Repair::Snapshot)),
+            "handed out again once the peer has caught up, not abandoned"
+        );
+
+        let mut stalls = PeerStalls::new();
+        let replay = Repair::Replay { from: Hlc::new(1, 0) };
+        assert!(stalls.plan_repair(peer, collection, replay));
+        assert_eq!(stalls.repair_due(peer, true), None, "promoted for a peer catching up");
+        assert!(stalls.repairing(peer), "left queued");
+        assert_eq!(stalls.repair_due(peer, false), Some((collection, replay)));
     }
 
     /// The count after progress (ADR-152). A repair that advanced — a page
@@ -8691,16 +8742,16 @@ mod tests {
         // A snapshot repair: a page landed in the round it was handed to.
         let mut stalls = PeerStalls::new();
         assert!(stalls.plan_repair(peer, collection, Repair::Snapshot));
-        assert_eq!(stalls.repair_due(peer), Some((collection, Repair::Snapshot)));
+        assert_eq!(stalls.repair_due(peer, false), Some((collection, Repair::Snapshot)));
         stalls.snapshot_advanced(peer);
         for empty in 1..=REPAIR_ATTEMPTS {
             assert_eq!(
-                stalls.repair_due(peer),
+                stalls.repair_due(peer, false),
                 Some((collection, Repair::Snapshot)),
                 "empty round {empty} after the page: still handed out"
             );
         }
-        assert_eq!(stalls.repair_due(peer), None, "and abandoned on the round after");
+        assert_eq!(stalls.repair_due(peer, false), None, "and abandoned on the round after");
         assert!(!stalls.repairing(peer));
 
         // A replay, and a run that restarts: two empty rounds, then the
@@ -8708,15 +8759,15 @@ mod tests {
         let mut stalls = PeerStalls::new();
         let replay = Repair::Replay { from: Hlc::new(1, 0) };
         assert!(stalls.plan_repair(peer, collection, replay));
-        assert_eq!(stalls.repair_due(peer), Some((collection, replay)));
+        assert_eq!(stalls.repair_due(peer, false), Some((collection, replay)));
         stalls.repair_continues(peer, Repair::Replay { from: Hlc::new(2, 0) });
-        assert!(stalls.repair_due(peer).is_some(), "first empty round");
-        assert!(stalls.repair_due(peer).is_some(), "second empty round");
+        assert!(stalls.repair_due(peer, false).is_some(), "first empty round");
+        assert!(stalls.repair_due(peer, false).is_some(), "second empty round");
         stalls.repair_continues(peer, Repair::Replay { from: Hlc::new(3, 0) });
         for empty in 1..=REPAIR_ATTEMPTS {
-            assert!(stalls.repair_due(peer).is_some(), "empty round {empty} after the move");
+            assert!(stalls.repair_due(peer, false).is_some(), "empty round {empty} after the move");
         }
-        assert_eq!(stalls.repair_due(peer), None, "abandoned on the fourth");
+        assert_eq!(stalls.repair_due(peer, false), None, "abandoned on the fourth");
     }
 
     // -- The repair of a confirmed digest finding: kinds, gates, progress ---------------------
@@ -8740,9 +8791,9 @@ mod tests {
             assert!(stalls.plan_repair(peer, collection, Repair::Snapshot));
             match stage {
                 "queued" => {}
-                "active" => assert!(stalls.repair_due(peer).is_some()),
+                "active" => assert!(stalls.repair_due(peer, false).is_some()),
                 _ => {
-                    assert!(stalls.repair_due(peer).is_some());
+                    assert!(stalls.repair_due(peer, false).is_some());
                     stalls.repair_finished(peer);
                 }
             }
@@ -8770,7 +8821,7 @@ mod tests {
         let collection = CollectionId(7);
         let mut stalls = PeerStalls::new();
         assert!(stalls.plan_repair(peer, collection, Repair::Converge));
-        assert_eq!(stalls.repair_due(peer), Some((collection, Repair::Converge)));
+        assert_eq!(stalls.repair_due(peer, false), Some((collection, Repair::Converge)));
         stalls.repair_finished(peer);
         assert!(!stalls.plan_repair(peer, collection, Repair::Converge), "cooling down");
 
@@ -8788,7 +8839,7 @@ mod tests {
         // And the reverse: a count repair's cooldown is not the digest's to clear.
         let mut stalls = PeerStalls::new();
         assert!(stalls.plan_repair(peer, collection, Repair::Snapshot));
-        assert!(stalls.repair_due(peer).is_some());
+        assert!(stalls.repair_due(peer, false).is_some());
         stalls.repair_finished(peer);
         stalls.retain_digest(peer, &BTreeSet::new());
         assert!(
@@ -8860,7 +8911,7 @@ mod tests {
         let next = |stalls: &mut PeerStalls| {
             for _ in 0..2 {
                 stalls.tick_opened();
-                if let Some(due) = stalls.repair_due(peer) {
+                if let Some(due) = stalls.repair_due(peer, false) {
                     return Some(due);
                 }
             }
@@ -8891,14 +8942,14 @@ mod tests {
         progress.test_mark_paged();
         stalls.snapshots.insert(peer, progress);
         assert_eq!(
-            stalls.repair_due(peer),
+            stalls.repair_due(peer, false),
             None,
             "a Converge repair was handed out beside the pull"
         );
         assert!(stalls.repairing(peer), "and it is kept, queued");
         // The pull ends; the repair is handed out.
         stalls.snapshots.remove(&peer);
-        assert_eq!(stalls.repair_due(peer), Some((collection, Repair::Converge)));
+        assert_eq!(stalls.repair_due(peer, false), Some((collection, Repair::Converge)));
 
         // A pull that starts while a Converge repair is active abandons it.
         assert!(stalls.plan_repair(peer, CollectionId(8), Repair::Converge));
@@ -8913,7 +8964,7 @@ mod tests {
         );
         // Another peer's repair and a count repair are untouched.
         assert!(stalls.plan_repair(other, collection, Repair::Snapshot));
-        assert!(stalls.repair_due(other).is_some());
+        assert!(stalls.repair_due(other, false).is_some());
         stalls.whole_database_takes_over(other);
         assert!(
             stalls.repairing(other),
@@ -9228,16 +9279,16 @@ mod tests {
         let collection = CollectionId(7);
         let mut stalls = PeerStalls::new();
         assert!(stalls.plan_repair(peer, collection, Repair::Snapshot));
-        assert_eq!(stalls.repair_due(peer), Some((collection, Repair::Snapshot)));
+        assert_eq!(stalls.repair_due(peer, false), Some((collection, Repair::Snapshot)));
         stalls.repair_finished(peer);
         assert!(!stalls.repairing(peer));
         for _ in 1..REPAIR_COOLDOWN_ROUNDS {
             stalls.tick_opened();
-            assert_eq!(stalls.repair_due(peer), None);
+            assert_eq!(stalls.repair_due(peer, false), None);
             assert!(!stalls.plan_repair(peer, collection, Repair::Snapshot), "cooling down");
         }
         stalls.tick_opened();
-        assert_eq!(stalls.repair_due(peer), None);
+        assert_eq!(stalls.repair_due(peer, false), None);
         assert!(stalls.plan_repair(peer, collection, Repair::Snapshot), "cooled down");
     }
 
@@ -9250,13 +9301,13 @@ mod tests {
         let (shadow, other) = (CollectionId(7), CollectionId(8));
         let mut stalls = PeerStalls::new();
         assert!(stalls.plan_repair(under_way, shadow, Repair::Snapshot));
-        assert_eq!(stalls.repair_due(under_way), Some((shadow, Repair::Snapshot)));
+        assert_eq!(stalls.repair_due(under_way, false), Some((shadow, Repair::Snapshot)));
         assert!(stalls.plan_repair(queued, other, Repair::Snapshot));
         assert!(stalls.plan_repair(queued, shadow, Repair::Snapshot));
 
         assert_eq!(stalls.repairs_cancelled(shadow), 1);
-        assert_eq!(stalls.repair_due(under_way), Some((shadow, Repair::Snapshot)));
-        assert_eq!(stalls.repair_due(queued), Some((other, Repair::Snapshot)));
+        assert_eq!(stalls.repair_due(under_way, false), Some((shadow, Repair::Snapshot)));
+        assert_eq!(stalls.repair_due(queued, false), Some((other, Repair::Snapshot)));
         stalls.repair_finished(queued);
         assert!(!stalls.repairing(queued), "the shadow's pull is gone");
     }
@@ -9275,14 +9326,14 @@ mod tests {
         let mut stalls = PeerStalls::new();
         assert!(stalls.plan_repair(peer, collection, Repair::Snapshot));
         stalls.tick_opened();
-        assert_eq!(stalls.repair_due(peer), Some((collection, Repair::Snapshot)));
+        assert_eq!(stalls.repair_due(peer, false), Some((collection, Repair::Snapshot)));
         stalls.repair_finished(peer);
 
         // One tick, a hundred pulls: far past the cooldown's count, and it
         // has not moved.
         stalls.tick_opened();
         for _ in 0..(REPAIR_COOLDOWN_ROUNDS as usize * 2) {
-            assert_eq!(stalls.repair_due(peer), None);
+            assert_eq!(stalls.repair_due(peer, false), None);
         }
         assert!(
             !stalls.plan_repair(peer, collection, Repair::Snapshot),
@@ -9292,7 +9343,7 @@ mod tests {
         // And the ticks after it do move it.
         for _ in 1..REPAIR_COOLDOWN_ROUNDS {
             stalls.tick_opened();
-            assert_eq!(stalls.repair_due(peer), None);
+            assert_eq!(stalls.repair_due(peer, false), None);
         }
         assert!(stalls.plan_repair(peer, collection, Repair::Snapshot), "cooled down");
     }
@@ -9317,19 +9368,23 @@ mod tests {
         let mut stalls = PeerStalls::new();
         assert!(stalls.plan_repair(peer, collection, Repair::Snapshot));
         stalls.tick_opened();
-        assert_eq!(stalls.repair_due(peer), Some((collection, Repair::Snapshot)));
+        assert_eq!(stalls.repair_due(peer, false), Some((collection, Repair::Snapshot)));
         stalls.repair_finished(peer);
 
         for _ in 1..REPAIR_COOLDOWN_ROUNDS {
             // One ordinary tick, opening the peer's contact for it...
             stalls.tick_opened();
-            assert_eq!(stalls.repair_due(peer), None);
+            assert_eq!(stalls.repair_due(peer, false), None);
             // ...followed by several reset ticks continuing it, which must
             // not call `tick_opened` and so must not move the cooldown
             // either -- a drain firing resets back-to-back is still the
             // one contact its first, Budget-ending tick opened.
             for _ in 0..5 {
-                assert_eq!(stalls.repair_due(peer), None, "a reset tick is not a fresh contact");
+                assert_eq!(
+                    stalls.repair_due(peer, false),
+                    None,
+                    "a reset tick is not a fresh contact"
+                );
             }
             assert!(
                 !stalls.plan_repair(peer, collection, Repair::Snapshot),
@@ -9337,7 +9392,7 @@ mod tests {
             );
         }
         stalls.tick_opened();
-        assert_eq!(stalls.repair_due(peer), None);
+        assert_eq!(stalls.repair_due(peer, false), None);
         assert!(
             stalls.plan_repair(peer, collection, Repair::Snapshot),
             "cooled down after REPAIR_COOLDOWN_ROUNDS ordinary ticks, not before"
