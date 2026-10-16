@@ -307,17 +307,40 @@ fn migrate(dir: &Path, keep: bool) -> Result<(), String> {
     }
     tracing_subscriber::fmt().with_writer(std::io::stderr).with_ansi(false).init();
     let before = std::fs::metadata(&path).map_err(|e| e.to_string())?.len();
+    // The file's length, sampled every 20 ms while the open runs: its largest,
+    // and every length it took, which is what the preflight's figure is about.
+    let sampling = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
+    let sampler = {
+        let (path, sampling) = (path.clone(), std::sync::Arc::clone(&sampling));
+        std::thread::spawn(move || {
+            let mut lengths: Vec<u64> = Vec::new();
+            while sampling.load(std::sync::atomic::Ordering::Relaxed) {
+                let len = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
+                if lengths.last() != Some(&len) {
+                    lengths.push(len);
+                }
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            }
+            lengths
+        })
+    };
     let started = Instant::now();
     let engine = Engine::open(&path).map_err(|e| e.to_string())?;
     let opened = started.elapsed();
+    sampling.store(false, std::sync::atomic::Ordering::Relaxed);
+    let lengths = sampler.join().map_err(|_| "the sampler panicked".to_string())?;
     let during = std::fs::metadata(&path).map_err(|e| e.to_string())?.len();
     drop(engine);
     let (reads, writes) = block_io();
+    let largest = lengths.iter().copied().max().unwrap_or(before);
+    let path_mib: Vec<u64> = lengths.iter().map(|l| l >> 20).collect();
     eprintln!(
-        "SUMMARY open with the migration {opened:?}; file {} MiB before, {} MiB after, {} MiB \
-         closed; peak rss {} MiB; block reads {reads}, block writes {writes} (getrusage; 512-byte \
-         blocks on Linux, operations on macOS)",
+        "SUMMARY open with the migration {opened:?}; file {} MiB before, {} MiB at its largest, \
+         {} MiB after, {} MiB closed (lengths seen, MiB: {path_mib:?}); peak rss {} MiB; block \
+         reads {reads}, block writes {writes} (getrusage; 512-byte blocks on Linux, operations on \
+         macOS)",
         before >> 20,
+        largest >> 20,
         during >> 20,
         std::fs::metadata(&path).map_err(|e| e.to_string())?.len() >> 20,
         peak_rss_mib()

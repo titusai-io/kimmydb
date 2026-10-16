@@ -484,6 +484,20 @@ jobs:
             verified::tests::a_skipping_open_reads_a_fixed_amount_and_a_walking_one_reads_the_oplog 2>&1 | tee skipping-open.log
           grep -q 'test result: ok. 1 passed' skipping-open.log
 
+      # The schema 5 migration drains and refills 300,000 index entries at
+      # its shipped chunk sizes, and the file stays near its size and inside
+      # the one growth step its preflight asks room for (ADR-238). Ignored in
+      # the default run, where a debug build spends about 20 s of one core on
+      # it; in release it is about 2 s, and it shares the build of the step
+      # above.
+      - name: A migration's drain keeps the file near its size
+        shell: bash
+        run: |
+          cargo test -p kimmy-storage --release --lib -- \
+            --include-ignored --exact \
+            migrate_v5_tests::draining_keeps_the_file_near_its_size 2>&1 | tee migration-drain.log
+          grep -q 'test result: ok. 1 passed' migration-drain.log
+
   # One build of `kimmyd`, shared — and it is the build the release makes.
   #
   # Shared: the docker job puts this binary in the image rather than

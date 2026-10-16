@@ -343,6 +343,11 @@ const BOUNDED_READS: &[(&str, &str)] = &[
         "the schema 5 migration's markers and the registry, at open: one row per range, \
          collection and index",
     ),
+    (
+        "migrate_v5::settle_carried",
+        "the schema 5 migration's last commit, at open: the recorded collisions, the registry \
+         and one document per carried holder",
+    ),
     ("migrate_v5::staged_is_empty", "one seek: whether a range has staged rows"),
     (
         "migrate_v5::ttl_selection_changes",

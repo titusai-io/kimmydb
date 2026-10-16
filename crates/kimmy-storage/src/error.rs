@@ -56,6 +56,17 @@ pub enum StorageError {
     )]
     UnparseablePartialFilter { found: u8, refused: Vec<String> },
 
+    /// The storage schema migration needs more free space beside the store
+    /// than the volume has (ADR-238, design 6.1 step 0). Refused before the
+    /// sidecar is raised, so nothing the migration owns was written; `detail`
+    /// says how `needed` is made up and what state the store is left in.
+    #[error(
+        "the storage schema migration needs {} MiB free and {} MiB is free, {detail}",
+        needed >> 20,
+        free >> 20
+    )]
+    NotEnoughSpace { needed: u64, free: u64, detail: String },
+
     /// A conditional write found a different version than the caller expected.
     ///
     /// `current` is the stamp the document holds now, or `None` when there is

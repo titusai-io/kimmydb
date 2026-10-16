@@ -1612,18 +1612,28 @@ fn the_preflight_refuses_with_the_figures_and_leaves_a_store_0_50_opens() {
     let f = fixture();
     let path = f.copy();
     let items = CollectionId::derive("shop", "items").0;
-    hooks::FREE.with(|c| c.set(Some(100 << 20)));
+    // A few KiB: below any requirement, however small the test's chunks.
+    hooks::FREE.with(|c| c.set(Some(4_096)));
     let (err, logs) = crate::log_capture::logged(|| Engine::open(&path).err());
     hooks::FREE.with(|c| c.set(None));
     let err = err.expect("refused");
+    let file = std::fs::metadata(&path).unwrap().len();
     match &err {
-        crate::StorageError::Io(e) if e.kind() == std::io::ErrorKind::StorageFull => {}
+        crate::StorageError::NotEnoughSpace { needed, free, .. } => {
+            assert_eq!(*free, 4_096, "the free space it was told");
+            assert!(*needed >= crate::migrate_v5::worst_growth(file), "{needed}");
+        }
         other => panic!("the wrong refusal: {other}"),
     }
     let message = err.to_string();
-    for wanted in
-        ["needs", "100 MiB is free", "growth step of 2048 MiB", "still schema 4", "previous build"]
-    {
+    for wanted in [
+        "needs",
+        "0 MiB is free",
+        "redb's growth steps",
+        "MiB of working set",
+        "still schema 4",
+        "previous build",
+    ] {
         assert!(message.contains(wanted), "{wanted:?} not in: {message}");
     }
     // The plan was announced before the refusal: what it would do.
@@ -1658,7 +1668,7 @@ fn the_preflight_refuses_with_the_figures_and_leaves_a_store_0_50_opens() {
 }
 
 #[test]
-fn the_requirement_is_the_growth_step_and_a_working_set_from_the_tables() {
+fn the_requirement_is_one_growth_step_of_the_file_and_a_working_set_from_the_tables() {
     // Read without a walk: the tables' own counts and the file's size.
     let f = fixture();
     let path = f.copy();
@@ -1671,12 +1681,40 @@ fn the_requirement_is_the_growth_step_and_a_working_set_from_the_tables() {
     assert_eq!(plan.ranges, 3, "items, gone and strs hold rows; empty holds none");
     let rows: usize = f.ids.values().map(BTreeSet::len).sum::<usize>() + 9;
     assert_eq!(plan.docs_rows, rows as u64);
-    assert!(plan.required_bytes > crate::migrate_v5::REDB_GROWTH_STEP_MIB << 20);
+    assert!(plan.file_bytes > 0, "the file's length, read as the store stands");
+    assert_eq!(plan.growth_bytes, crate::migrate_v5::worst_growth(plan.file_bytes));
+    assert!(plan.required_bytes > plan.growth_bytes);
     assert!(
-        plan.required_bytes < (crate::migrate_v5::REDB_GROWTH_STEP_MIB << 20) + (1 << 30),
+        plan.required_bytes < plan.growth_bytes + (1 << 30),
         "a working set, not a copy of the store: {}",
         plan.required_bytes
     );
+}
+
+#[test]
+fn the_growth_bound_follows_redbs_regions() {
+    use crate::migrate_v5::{REDB_REGION_BYTES as R, worst_growth};
+    const MIB: u64 = 1 << 20;
+    let page = 4096;
+    // One partial region: the file doubles.
+    assert_eq!(worst_growth(128 * MIB + page), 128 * MIB);
+    // The measurement at 2,000,000 documents: a 2,411 MiB file grew to 4,096
+    // MiB during its migration (sampled every 20 ms by
+    // `examples/schema4_migration`), 1,685 MiB, inside the bound of one
+    // doubling; it was back at 2,415 MiB when closed.
+    let measured = 2_411 * MIB;
+    assert_eq!(worst_growth(measured), measured - page);
+    assert!(4_096 * MIB - measured <= worst_growth(measured));
+    // Past one region: the rest of the partial region and one more, at the
+    // worst; a whole number of regions grows by one.
+    assert_eq!(worst_growth(R + MIB + page), 2 * R - MIB);
+    assert_eq!(worst_growth(5 * (R / 4) + page), 2 * R - R / 4);
+    assert_eq!(worst_growth(2 * R + page), R);
+    assert_eq!(worst_growth(R + page), R);
+    // Never more than two regions, never less than nothing.
+    for len in [0, page, R - 1, R, 3 * R + 1, 10 * R - page] {
+        assert!(worst_growth(len) <= 2 * R, "{len}");
+    }
 }
 
 #[test]
@@ -1766,13 +1804,14 @@ fn unique_store(
 }
 
 #[test]
-fn a_finished_3_to_4_rebuilds_unreported_collisions_are_carried_and_reported_once() {
+fn a_finished_3_to_4_rebuilds_unreported_collisions_are_carried_and_settled() {
     // A 0.50 store a crash left between its 3 -> 4 rebuild's last commit and
-    // the report: the recorded collisions are pending. One of them the exact
-    // comparator dissolves (the documents' decimal `tier` was "at least 3" only
-    // by ranking equal to 3), so only the carried row names it; the other the
-    // refill finds again under the schema 5 form of its key, and it is reported
-    // once, not twice.
+    // the report: the recorded collisions are pending, and carried. One of them
+    // the refill finds again under the schema 5 form of its key: reported once,
+    // not twice. The other the exact comparator dissolves (the documents'
+    // decimal `tier` was "at least 3" only by ranking equal to 3, so the rebuilt
+    // index holds neither): not reported, since it is no violation now, and
+    // named in one line.
     let t = CollectionId::derive("shop", "t").0;
     let (_dir, path) = unique_store(
         &[("email_once", "email", Some(doc! {"tier": {"$gte": 3}})), ("num_once", "num", None)],
@@ -1816,8 +1855,16 @@ fn a_finished_3_to_4_rebuilds_unreported_collisions_are_carried_and_reported_onc
     }
     // The report reads what the migration recorded: stop just before it.
     crate::migrate::hooks::fail_before_the_report();
-    assert!(Engine::open(&path).is_err(), "premise: stopped before the report");
+    let (opened, logs) = crate::log_capture::logged(|| Engine::open(&path).map(drop));
+    assert!(opened.is_err(), "premise: stopped before the report");
     assert!(!has_table(&path, "partial_rebuilt_unique_violations"), "carried, not kept");
+    let lines: Vec<&str> = logs.lines().filter(|l| l.contains("is not reported")).collect();
+    assert_eq!(lines.len(), 1, "one line for the dissolved collision: {logs}");
+    assert!(
+        lines[0].contains("index=email_once") && lines[0].contains(r#"holders=["1", "2"]"#),
+        "it names the index and its holders by _id: {}",
+        lines[0]
+    );
     let recorded =
         crate::migrate_v5::recorded_collisions(&Database::create(&path).unwrap()).unwrap();
     let mut named: Vec<(String, Vec<i64>)> = recorded
@@ -1833,11 +1880,11 @@ fn a_finished_3_to_4_rebuilds_unreported_collisions_are_carried_and_reported_onc
     named.sort();
     assert_eq!(
         named,
-        vec![("email_once".to_string(), vec![1, 2]), ("num_once".to_string(), vec![5, 6])],
-        "each collision once, its holders in their schema 5 form"
+        vec![("num_once".to_string(), vec![5, 6])],
+        "the collision that stands, once, its holders in their schema 5 form"
     );
     let engine = Engine::open(&path).unwrap();
-    assert_eq!(engine.unique_violations(), 2, "both reported");
+    assert_eq!(engine.unique_violations(), 1, "the one that stands, reported");
     drop(engine);
     let engine = Engine::open(&path).unwrap();
     assert_eq!(engine.unique_violations(), 0, "and forgotten once reported");
@@ -2142,23 +2189,51 @@ fn a_stop_ends_the_migration_within_one_chunk_while_a_writer_holds_it() {
 }
 
 /// A schema 4 store of `n` documents in one collection with one index over a
-/// number, built by this build's engine and its keys put back by hand: the
-/// size a drain has to be measured at.
+/// number, written by hand with the frozen encoder in large transactions: the
+/// size a drain has to be measured at, built in seconds.
 fn indexed_schema_4(dir: &Path, n: i64) -> PathBuf {
     let path = dir.join("kimmy.redb");
-    {
-        let engine = Engine::open(&path).unwrap();
-        let t = engine.create_collection("shop", "t").unwrap();
-        index(&engine, "t", "by_n", vec![IndexField::ascending("n")], false);
-        for start in (0..n).step_by(20_000) {
-            let docs: Vec<Document> =
-                (start..(start + 20_000).min(n)).map(|i| doc! {"_id": i, "n": i * 7}).collect();
-            engine.insert_many(&t, docs).unwrap();
-        }
-    }
+    let coll = CollectionId::derive("shop", "t");
+    let mut meta = CollectionMeta::new(coll, "shop", "t", kimmy_core::Hlc::new(1, 0), None);
+    meta.indexes.push(IndexMeta {
+        id: IndexMeta::derive_id("by_n"),
+        name: "by_n".into(),
+        fields: vec![IndexField::ascending("n")],
+        unique: false,
+        enforcement: Enforcement::Local,
+        multikey: false,
+        expire_after_secs: None,
+        partial_filter: None,
+        created: None,
+    });
+    let index = meta.indexes[0].id;
+    let node = kimmy_core::NodeId::generate();
     let db = Database::create(&path).unwrap();
+    for start in (0..n).step_by(100_000) {
+        let txn = db.begin_write().unwrap();
+        {
+            let mut docs = txn.open_table(tables::DOCS).unwrap();
+            let mut entries = txn.open_table(tables::INDEX_ENTRIES).unwrap();
+            for i in start..(start + 100_000).min(n) {
+                let key = v1::int64(i);
+                let record = kimmy_core::DocRecord {
+                    stamp: kimmy_core::Stamp::new(kimmy_core::Hlc::new(10 + i as u64, 0), node),
+                    deleted: false,
+                    body: bson::serialize_to_vec(&doc! {"_id": i, "n": i * 7}).unwrap(),
+                };
+                docs.insert((coll.0, key.as_slice()), codec::encode_doc_record(&record).as_slice())
+                    .unwrap();
+                let value = v1::encode(&Bson::Int64(i * 7)).unwrap();
+                entries.insert((coll.0, index, value.as_slice(), key.as_slice()), ()).unwrap();
+            }
+        }
+        txn.commit().unwrap();
+    }
     let txn = db.begin_write().unwrap();
-    rewind_keys_to_v1(&txn);
+    txn.open_table(tables::COLLECTIONS)
+        .unwrap()
+        .insert(("shop", "t"), serde_json::to_vec(&meta).unwrap().as_slice())
+        .unwrap();
     txn.open_table(tables::META)
         .unwrap()
         .insert(tables::META_FORMAT_VERSION, [4u8].as_slice())
@@ -2167,20 +2242,24 @@ fn indexed_schema_4(dir: &Path, n: i64) -> PathBuf {
     path
 }
 
-/// **The guard on draining by key** (`index::clear_index_entries`, never
-/// redb's `retain_in`): the migration drains every index of a store holding
-/// hundreds of thousands of entries, at the shipped chunk sizes, and the file
-/// must stay near its size. `retain_in` with a predicate that keeps nothing
-/// grew a file from 2.1 to 12 GiB over 742,858 entries (see
-/// `clear_index_entries`); a drain written with it fails here.
+/// **A bound on the file's growth across a drain and a refill of hundreds of
+/// thousands of entries**, at the shipped chunk sizes: the file must stay near
+/// its size, and well inside the one growth step the preflight asks room for
+/// ([`crate::migrate_v5::worst_growth`]).
+///
+/// It was first written to fail a drain written with redb's `retain_in`, which
+/// once grew a file from 2.1 to 12 GiB over 742,858 entries. On redb 4.3 it
+/// cannot: `retain_in` drains faster than removing by key and grows the file no
+/// more (see `index::clear_index_entries`), so that mutant is equivalent here,
+/// and the drain is by key for its stop-and-resume chunks, not for the file.
 ///
 /// ```text
-/// cargo test --release -p kimmy-storage --lib -- --ignored --exact \
-///     migrate_v5_tests::draining_by_key_keeps_the_file_near_its_size
+/// cargo test --release -p kimmy-storage --lib -- --include-ignored --exact \
+///     migrate_v5_tests::draining_keeps_the_file_near_its_size
 /// ```
 #[test]
-#[ignore = "heavy: 300,000 entries; run it in release, see the doc comment"]
-fn draining_by_key_keeps_the_file_near_its_size() {
+#[ignore = "heavy: 300,000 entries, about 20 s in a debug build; CI runs it in release"]
+fn draining_keeps_the_file_near_its_size() {
     let n: i64 = std::env::var("DRAIN_N").map(|s| s.parse().unwrap()).unwrap_or(300_000);
     let dir = tempfile::tempdir().unwrap();
     let path = indexed_schema_4(dir.path(), n);
@@ -2206,9 +2285,94 @@ fn draining_by_key_keeps_the_file_near_its_size() {
     );
     assert_eq!(rows[2], entries, "every entry drained");
     assert!(
+        largest - before <= crate::migrate_v5::worst_growth(before),
+        "the file grew by more than the step the preflight asks room for"
+    );
+    assert!(
         largest <= before + before / 2 + (64 << 20),
         "the migration grew the file from {} to {} MiB",
         before >> 20,
         largest >> 20
     );
+}
+
+/// A store with one TTL partial index over a decimal-bearing collection, at
+/// schema `version`, its keys in schema 4 form.
+fn ttl_store(version: u8, rebuilt: Option<bool>) -> (tempfile::TempDir, PathBuf) {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("kimmy.redb");
+    {
+        let engine = Engine::open(&path).unwrap();
+        let t = engine.create_collection("shop", "t").unwrap();
+        partial(
+            &engine,
+            "t",
+            "ttl_lt",
+            vec![IndexField::ascending("at")],
+            false,
+            Some(3_600),
+            doc! {"tier": {"$lt": 3}},
+        );
+        let at = bson::DateTime::from_millis(1_000);
+        engine
+            .insert_many(
+                &t,
+                vec![
+                    doc! {"_id": 1_i64, "at": at, "tier": dec("1")},
+                    doc! {"_id": 2_i64, "at": at, "tier": 1},
+                ],
+            )
+            .unwrap();
+    }
+    let db = Database::create(&path).unwrap();
+    let txn = db.begin_write().unwrap();
+    rewind_keys_to_v1(&txn);
+    txn.open_table(tables::META)
+        .unwrap()
+        .insert(tables::META_FORMAT_VERSION, [version].as_slice())
+        .unwrap();
+    if let Some(rebuilt) = rebuilt {
+        // An interrupted 3 -> 4 rebuild's markers: this index done, or not.
+        let mut markers = txn.open_table(crate::migrate_v5::PARTIAL_REBUILT).unwrap();
+        if rebuilt {
+            let id = IndexMeta::derive_id("ttl_lt");
+            markers.insert((CollectionId::derive("shop", "t").0, id), ()).unwrap();
+        } else {
+            markers.insert((0u64, 0u32), ()).unwrap();
+        }
+    }
+    txn.commit().unwrap();
+    drop(db);
+    (dir, path)
+}
+
+#[test]
+fn a_ttl_index_never_filed_under_adr_185_has_no_before_to_count_against() {
+    // A schema 3 store never filed a partial index's undecidable documents, so
+    // what its TTL index selected before is not in the store: the line says
+    // so, and gives no count, rather than a count of 0 it did not make. So
+    // does an index an interrupted 3 -> 4 rebuild had not reached; one it had
+    // reached is counted like any schema 4 index.
+    for (version, rebuilt, counted) in
+        [(3, None, false), (4, Some(false), false), (4, Some(true), true), (4, None, true)]
+    {
+        let (_dir, path) = ttl_store(version, rebuilt);
+        let (engine, logs) = crate::log_capture::logged(|| Engine::open(&path).unwrap());
+        drop(engine);
+        let line = logs
+            .lines()
+            .find(|l| l.contains("a TTL index's partial filter") && l.contains("index=ttl_lt"))
+            .unwrap_or_else(|| panic!("schema {version}, {rebuilt:?}: no TTL line: {logs}"));
+        if counted {
+            assert!(
+                line.contains("now_selected=") && !line.contains("not recorded"),
+                "schema {version}, {rebuilt:?}: {line}"
+            );
+        } else {
+            assert!(
+                line.contains(r#"before="not recorded""#) && !line.contains("now_selected"),
+                "schema {version}, {rebuilt:?}: {line}"
+            );
+        }
+    }
 }

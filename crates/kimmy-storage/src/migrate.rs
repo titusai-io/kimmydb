@@ -140,7 +140,7 @@ fn step(db: &Database, path: &std::path::Path, raise: &dyn Fn(u8) -> Result<()>)
                 derive_index_ids(db)?;
             }
             info!("migrating storage schema {} -> 5 (exact number keys)", found.max(3));
-            crate::migrate_v5::begin(db)?;
+            crate::migrate_v5::begin(db, found)?;
             crate::migrate_v5::run(db, &plan)
         }
         // A newer schema means a newer build wrote this directory. Refusing is
