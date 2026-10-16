@@ -28013,9 +28013,10 @@ returned tenant `b`'s document and its text, in both join directions. A filter o
    not `2` (a mark already standing is kept: a `force` one is stronger). The marks run as any others, by the owner
    only: on a cluster they repeat the first-sight rescan every start performs, on a single node they are the only
    trigger, and a store restored from a pre-0.51.0 backup lacks the key and is queued again.
-5. **Search.** A filter's admitted set is `HashSet<DocId>` and the exact scan admits by the record's `source`, through
-   one admission function; the keyed join is exact through point 3. The graph is keyed by the id each chunk is stored
-   under (`for_each_vector` passes it), never one recomputed from the record, and admits a candidate **after the load**,
+5. **Search.** A filter's admitted set is `HashSet<DocId>`, and the exact scan and hybrid search's keyword half admit by
+   the record's `source`, through the one admission function ADR-102's addendum of 2026-10-16 gave them; the keyed
+   join is exact through point 3. The graph is keyed by the id each chunk is stored under (`for_each_vector` passes
+   it), never one recomputed from the record, and admits a candidate **after the load**, through the same function,
    by the record's source: a key names a slot, not who holds it. The per-document cap, the tie-break and fusion key a
    document by its encoding, which equals the old `Display` for ObjectId, Int64 and plain Strings, so their order did
    not move. The snapshot format goes to 3, so no graph keyed by the old derivation is adopted: one rebuild per vector
