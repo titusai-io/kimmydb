@@ -1586,8 +1586,10 @@ mod membership_migration {
     }
 
     /// Rewrite the stored `partialFilterExpression` of each named index to one
-    /// this build refuses: a bound on a `Decimal128`, which `PartialFilter::parse`
-    /// declines because it ranks equal to every other number (ADR-181).
+    /// this build refuses: a `$ne`, which `PartialFilter::parse` declines
+    /// because containment is not decidable for it (ADR-181). It was a bound on
+    /// a `Decimal128` until ADR-238 placed decimals exactly and lifted that
+    /// refusal; any shape this build refuses serves.
     ///
     /// Written straight into the metadata, because `create_index_inner` parses
     /// the filter for every origin, so no door of this build stores one. That is
@@ -1614,8 +1616,7 @@ mod membership_migration {
                         .iter()
                         .any(|(db, coll, name)| *db == d && *coll == c && *name == index.name)
                     {
-                        index.partial_filter = Some(doc! {"size": {"$gt":
-                        bson::Bson::Decimal128(bson::Decimal128::from_bytes([0; 16]))}});
+                        index.partial_filter = Some(doc! {"size": {"$ne": 1}});
                         touched = true;
                     }
                 }
@@ -1846,7 +1847,7 @@ mod membership_migration {
             assert!(refused.iter().any(|r| r.contains(&named)), "{coll} unnamed: {refused:?}");
         }
         let message = err.to_string();
-        assert!(message.contains("Decimal128"), "no parse error in the message: {message}");
+        assert!(message.contains("$ne"), "no parse error in the message: {message}");
         assert!(
             message.contains("previous build") && message.contains("drop each index"),
             "no remedy in the message: {message}"

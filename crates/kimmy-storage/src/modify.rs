@@ -728,6 +728,15 @@ impl Engine {
                 &codec::encode_doc_record(&record),
             )?;
         }
+        // An update keeps the stored `_id`, so it creates no decimal id; but a
+        // store that met one before it ran 0.51 has no marker yet, and this
+        // write is a chance to set it (ADR-238).
+        if next
+            .and_then(|doc| doc.get(crate::docs::ID_FIELD))
+            .is_some_and(crate::decimal128_gate::id_value_is_decimal128)
+        {
+            crate::decimal128_gate::mark_in_txn(txn, &stamp)?;
+        }
 
         let entry = OplogEntry { stamp, kind, collection: coll.id, doc_id: Some(id.clone()), body };
         append_oplog(txn, &entry)?;
