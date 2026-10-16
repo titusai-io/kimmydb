@@ -161,12 +161,27 @@ impl WriteScope<'_> {
 
     /// [`Engine::for_each_doc`], read in this scope's transaction, as
     /// [`Self::get`] is. Return `false` from `f` to stop.
-    pub fn for_each_doc<F>(&self, coll: &CollectionMeta, mut f: F) -> Result<()>
+    pub fn for_each_doc<F>(&self, coll: &CollectionMeta, f: F) -> Result<()>
+    where
+        F: FnMut(DocId, Document) -> Result<bool>,
+    {
+        self.for_each_doc_after(coll, None, f)
+    }
+
+    /// [`Engine::for_each_doc_after`], read in this scope's transaction, as
+    /// [`Self::get`] is: the documents after the encoded key `after`. Return
+    /// `false` from `f` to stop.
+    pub(crate) fn for_each_doc_after<F>(
+        &self,
+        coll: &CollectionMeta,
+        after: Option<&[u8]>,
+        mut f: F,
+    ) -> Result<()>
     where
         F: FnMut(DocId, Document) -> Result<bool>,
     {
         let docs = self.txn.open_table(tables::DOCS)?;
-        for entry in docs.range(doc_range_after(coll.id, None))? {
+        for entry in docs.range(doc_range_after(coll.id, after))? {
             let (_, value) = entry?;
             let record = codec::decode_doc_record(value.value())?;
             if record.deleted {

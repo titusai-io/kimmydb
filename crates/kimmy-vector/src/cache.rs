@@ -1287,7 +1287,7 @@ fn remove_snapshot(path: &std::path::Path, why: &'static str) -> bool {
 /// O(n) — see `access`, which caches its verdict for exactly that reason.
 pub fn count_vectors(engine: &Engine, shadow: &CollectionMeta) -> Result<usize> {
     let mut n = 0;
-    engine.for_each_vector(shadow, kimmy_storage::WalkScope::Request, |_| {
+    engine.for_each_vector(shadow, kimmy_storage::WalkScope::Request, |_, _| {
         n += 1;
         Ok(true)
     })?;
@@ -1548,7 +1548,7 @@ mod tests {
         // `put_vectors` stores it, `_id` and all, stamped by a node this
         // engine has never heard from, into the shadow collection by id.
         let source = DocId::Int64(999);
-        let chunk_id = VectorRecord::id(&source, 0);
+        let chunk_id = VectorRecord::id(&kimmy_core::ChunkSource::from(&source), 0);
         let record = VectorRecord {
             source: source.clone(),
             chunk: 0,

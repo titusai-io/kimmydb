@@ -30,7 +30,9 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
-use kimmy_core::{ChunkConfig, Hlc, OpKind, Unstamped, VectorConfig, VectorRecord, path};
+use kimmy_core::{
+    ChunkConfig, ChunkSource, Hlc, OpKind, Unstamped, VectorConfig, VectorRecord, path,
+};
 use kimmy_storage::class_step;
 use kimmy_storage::{
     ChangeEvent, CollectionMeta, Engine, VectorWrite, WatchOptions, WatchScope, WriterHolder,
@@ -269,6 +271,11 @@ impl Default for BatchSettings {
 /// and the version that text belongs to.
 struct Job {
     source: kimmy_core::DocId,
+    /// What the chunk ids name (ADR-239): the document, with the binary
+    /// subtype its stored body carries, which the key folds. Taken from the
+    /// body in [`EmbeddingWorker::prepare`], the one place every embed passes
+    /// through with the body in hand.
+    chunk_source: ChunkSource,
     /// The document version this work is for. Checked again after the
     /// provider call: a document that moved meanwhile has its own entry
     /// behind this one, and a deleted one has nothing to store vectors for.
@@ -947,6 +954,10 @@ impl EmbeddingWorker {
     async fn run_loop(&mut self) -> Result<()> {
         let mut resume = self.engine.consumer_position(CONSUMER)?;
         let mut recovering = false;
+        // The one recheck 0.51.0's chunk ids owe every server-embedded
+        // collection, queued as marks at the first start (ADR-239), and loaded
+        // with the rest below.
+        self.queue_chunk_id_recheck().await?;
         // What the last run left owed: its held and skipped batches were
         // recorded as marks before the position passed them, so a start finds
         // them here and scans those collections, rather than the oplog.
@@ -1734,6 +1745,18 @@ impl EmbeddingWorker {
             return Ok(Prepared::Done(Outcome::Skipped));
         };
 
+        // A String `_id` whose chunk id changed in 0.51.0 has the chunks a 0.50
+        // build wrote moved first, with no provider call, so the judgement below
+        // reads them where this build does (ADR-239). On the owner only: a move
+        // by another member could land after the owner's own embed of a newer
+        // version, and put the older chunks back over it.
+        if VectorRecord::legacy_prefix(&source).is_some()
+            && matches!(source, kimmy_core::DocId::String(_))
+            && self.is_owner_of(&collection.db, &collection.name)
+        {
+            self.engine.adopt_legacy_chunks(&shadow, &source)?;
+        }
+
         // The entry carries the version this work is for. Anything newer has
         // its own entry coming, so redoing older work would be wasted. Vectors
         // at that version made under another configuration are redone.
@@ -2137,6 +2160,11 @@ impl EmbeddingWorker {
             return Ok(None);
         };
         let Judgement { fingerprint, unstamped, handed_over } = judgement;
+        // Moved before the judgement, as on the entry path, and only while the
+        // collection is this member's (ADR-239).
+        if !handed_over {
+            self.engine.adopt_legacy_chunks(shadow, source)?;
+        }
         let stale = |unstamped| {
             self.engine.vectors_are_stale(shadow, source, stamp.hlc, fingerprint, unstamped)
         };
@@ -2175,7 +2203,10 @@ impl EmbeddingWorker {
         }
         let inputs = prefixed(config, &chunks);
         let tokens = inputs.iter().map(|input| ChunkConfig::estimate_tokens(input)).sum();
-        Ok(Some(Job { source, hlc, chunks, inputs, tokens, unstamped }))
+        // The subtype of a binary `_id` is in the body and not in the key, so
+        // it is read here, where every embed path has the body (ADR-239).
+        let chunk_source = ChunkSource::of(&source, document.get(kimmy_storage::ID_FIELD));
+        Ok(Some(Job { source, chunk_source, hlc, chunks, inputs, tokens, unstamped }))
     }
 
     /// One provider call for every chunk of every job, in job order.
@@ -2326,7 +2357,7 @@ impl EmbeddingWorker {
                     config: Some(fingerprint),
                 })
                 .collect();
-            let write = VectorWrite::encode(&job.source, &records)?;
+            let write = VectorWrite::encode(&job.source, &job.chunk_source, &records)?;
             writes.push((job.source, job.hlc, count, write));
         }
 
@@ -2623,6 +2654,27 @@ impl EmbeddingWorker {
             .or_insert_with(|| Backoff::new(tokio::time::Instant::now()));
         entry.rescan = Some(stronger(entry.rescan, how));
         self.mark(collection, how).await;
+    }
+
+    /// Queue the recheck of every server-embedded collection that 0.51.0's
+    /// chunk ids owe, at the first start of this build on the store
+    /// ([`Engine::queue_vector_chunk_recheck`], ADR-239), and say so once.
+    /// The marks are scanned like any others: by the owner only (a mark on a
+    /// collection another member owns is cleared, and on a cluster every
+    /// start's first-sight rescan does the same work), and on a single node,
+    /// which has no first-sight rescan, they are the only trigger.
+    async fn queue_chunk_id_recheck(&mut self) -> Result<()> {
+        let engine = Arc::clone(&self.engine);
+        let queued = kimmy_storage::blocking(move || engine.queue_vector_chunk_recheck())?;
+        if !queued.is_empty() {
+            let collections: Vec<String> =
+                queued.iter().map(|c| format!("{}/{}", c.db, c.name)).collect();
+            info!(
+                ?collections,
+                "queued a one-time recheck of embedded collections for 0.51.0's vector chunk ids:                  each collection's owner re-embeds every document with a binary _id once, moves                  the chunks of a String _id that begins with ~, is 24 lowercase hex digits or is                  an integer's decimal, with no provider call, and leaves every other document's                  vectors as they are"
+            );
+        }
+        Ok(())
     }
 
     /// Load the marks a previous run left, as scans to run: the collections
@@ -3315,12 +3367,22 @@ pub(crate) mod tests {
         .unwrap()
     }
 
+    /// The store as the first start of this build leaves it once the recheck
+    /// its chunk ids owe (ADR-239) has run: where a test of anything else
+    /// starts, so that scan does not run beside what it tests.
+    fn past_the_chunk_id_recheck(engine: &Engine) {
+        for queued in engine.queue_vector_chunk_recheck().unwrap() {
+            engine.clear_vector_rescan(queued.id).unwrap();
+        }
+    }
+
     /// An engine with an embedding-enabled collection and a fake provider.
     async fn setup() -> (Arc<Engine>, CollectionMeta, EmbeddingWorker, tempfile::TempDir) {
         let dir = tempfile::tempdir().unwrap();
         let engine = Arc::new(Engine::open(&dir.path().join("kimmy.redb")).unwrap());
         engine.create_collection("app", "docs").unwrap();
         engine.configure_vectors("app", "docs", config(&["title", "body"])).unwrap();
+        past_the_chunk_id_recheck(&engine);
         // Re-read so the returned metadata carries the vector config.
         let coll = engine.get_collection("app", "docs").unwrap();
 
@@ -4852,6 +4914,7 @@ pub(crate) mod tests {
         engine.create_collection("app", "b").unwrap();
         engine.configure_vectors("app", "a", config(&["title"])).unwrap();
         engine.configure_vectors("app", "b", config(&["title"])).unwrap();
+        past_the_chunk_id_recheck(&engine);
         let a = engine.get_collection("app", "a").unwrap();
         let b = engine.get_collection("app", "b").unwrap();
         let mut worker = EmbeddingWorker::new(Arc::clone(&engine));
@@ -5182,6 +5245,7 @@ pub(crate) mod tests {
     fn a_job() -> Job {
         Job {
             source: kimmy_core::DocId::Int64(1),
+            chunk_source: ChunkSource::Int64(1),
             hlc: Hlc::ZERO,
             chunks: vec!["hello".into()],
             inputs: vec!["hello".into()],
@@ -8188,5 +8252,610 @@ pub(crate) mod tests {
             assert_eq!(cell.reading().local_fault, 1, "the stop is no fault");
         })
         .await;
+    }
+
+    // -----------------------------------------------------------------------
+    // Chunk ids (ADR-239)
+    // -----------------------------------------------------------------------
+
+    /// A UUID `_id` as a client writes it: sixteen bytes from `seed`, binary
+    /// subtype 4.
+    fn uuid_id(seed: u8) -> bson::Bson {
+        bson::Bson::Binary(bson::Binary {
+            subtype: bson::spec::BinarySubtype::Uuid,
+            bytes: (seed..seed + 16).collect(),
+        })
+    }
+
+    /// The chunk id a 0.50.0 build wrote: `DocId`'s `Display` then, frozen.
+    fn id_050(source: &kimmy_core::DocId, chunk: u32) -> kimmy_core::DocId {
+        use kimmy_core::DocId;
+        let display = match source {
+            DocId::ObjectId(oid) => oid.to_hex(),
+            DocId::String(s) => s.clone(),
+            DocId::Int64(i) => i.to_string(),
+            DocId::Binary(b) => format!("bin({} bytes)", b.len()),
+            DocId::Uuid(u) => u.to_string(),
+        };
+        DocId::String(format!("{display}#{chunk}"))
+    }
+
+    /// The defect page's fixture: four documents with UUID `_id`s, two per
+    /// tenant.
+    const FOUR: [(u8, &str, &str); 4] = [
+        (0, "a", "alpha report"),
+        (16, "a", "beta report"),
+        (32, "b", "gamma secret"),
+        (48, "b", "delta secret"),
+    ];
+
+    /// Every id the shadow holds, in key order.
+    fn shadow_ids(engine: &Engine, shadow: &CollectionMeta) -> Vec<String> {
+        let mut ids = Vec::new();
+        engine
+            .for_each_doc(shadow, kimmy_storage::WalkScope::Request, |id, _| {
+                ids.push(match id {
+                    kimmy_core::DocId::String(s) => s,
+                    other => format!("{other:?}"),
+                });
+                Ok(true)
+            })
+            .unwrap();
+        ids
+    }
+
+    fn texts(engine: &Engine, shadow: &CollectionMeta, id: &kimmy_core::DocId) -> Vec<String> {
+        engine.get_vectors(shadow, id).unwrap().into_iter().map(|r| r.text).collect()
+    }
+
+    fn uuid_chunk_id(seed: u8) -> String {
+        let hex: String = (seed..seed + 16).map(|b| format!("{b:02x}")).collect();
+        format!("~b:{hex}.04#0")
+    }
+
+    /// The four documents written and each embedded through the worker's entry
+    /// path, as the probe did; their ids.
+    async fn four_uuid_documents(
+        engine: &Engine,
+        coll: &CollectionMeta,
+        worker: &mut EmbeddingWorker,
+    ) -> Vec<kimmy_core::DocId> {
+        let mut ids = Vec::new();
+        for (seed, tenant, body) in FOUR {
+            let id = engine
+                .insert(coll, doc! { "_id": uuid_id(seed), "tenant": tenant, "body": body })
+                .unwrap();
+            let outcome = worker.process(&last_entry(engine)).await.unwrap();
+            assert!(matches!(outcome, Outcome::Embedded { chunks: 1 }), "{outcome:?}");
+            ids.push(id);
+        }
+        ids
+    }
+
+    /// V1 inverted (test 13): four documents with UUID `_id`s leave four
+    /// chunk sets, each id carrying its bytes and subtype 4; each reads its
+    /// own text and reads as current; deleting one leaves three; and a
+    /// rescan finds them current. At 0.50.0 they left one chunk, the last
+    /// writer's, and every document read it.
+    #[tokio::test]
+    async fn v1_four_uuid_documents_keep_four_chunk_sets() {
+        let (engine, coll, mut worker, _dir) = setup().await;
+        let fake = FakeProvider::new(4);
+        worker.set_provider(coll.id.0, Arc::clone(&fake) as Arc<dyn EmbeddingProvider>);
+        let ids = four_uuid_documents(&engine, &coll, &mut worker).await;
+        let shadow = engine.vector_collection("app", "docs").unwrap().unwrap();
+        let config = coll.vector.clone().unwrap();
+
+        let expected: Vec<String> = FOUR.iter().map(|(seed, ..)| uuid_chunk_id(*seed)).collect();
+        assert_eq!(shadow_ids(&engine, &shadow), expected);
+        for (id, (_, _, body)) in ids.iter().zip(FOUR) {
+            assert_eq!(texts(&engine, &shadow, id), [body]);
+            let stamp = engine.document_stamp(&coll, id).unwrap().unwrap();
+            let stale = engine
+                .vectors_are_stale(
+                    &shadow,
+                    id,
+                    stamp.hlc,
+                    config.fingerprint(),
+                    Unstamped::ByVersion,
+                )
+                .unwrap();
+            assert!(!stale, "{body} is current");
+        }
+
+        engine.delete(&coll, &ids[1]).unwrap();
+        assert_eq!(worker.process(&last_entry(&engine)).await.unwrap(), Outcome::Removed);
+        assert_eq!(shadow_ids(&engine, &shadow).len(), 3, "deleting one leaves three");
+        for i in [0, 2, 3] {
+            assert_eq!(texts(&engine, &shadow, &ids[i]), [FOUR[i].2]);
+        }
+
+        let calls = fake.calls();
+        let scanned = worker
+            .scan_collection(&coll, &shadow, &config, "a test", Unscanned::Check)
+            .await
+            .unwrap();
+        assert_eq!(scanned.embedded, 0, "a rescan finds them current");
+        assert_eq!(fake.calls(), calls);
+    }
+
+    /// V4 inverted: an update of one UUID document re-embeds it alone, and a
+    /// delete of another removes its chunks alone. At 0.50.0 the update took
+    /// the shared slot, and the delete emptied it for every document.
+    #[tokio::test]
+    async fn v4_an_update_and_a_delete_touch_only_their_own_documents() {
+        let (engine, coll, mut worker, _dir) = setup().await;
+        let ids = four_uuid_documents(&engine, &coll, &mut worker).await;
+        let shadow = engine.vector_collection("app", "docs").unwrap().unwrap();
+
+        engine
+            .replace(&coll, &ids[0], doc! { "tenant": "a", "body": "alpha report v2" }, false)
+            .unwrap();
+        let outcome = worker.process(&last_entry(&engine)).await.unwrap();
+        assert!(matches!(outcome, Outcome::Embedded { chunks: 1 }), "{outcome:?}");
+        assert_eq!(texts(&engine, &shadow, &ids[0]), ["alpha report v2"]);
+        assert_eq!(texts(&engine, &shadow, &ids[3]), ["delta secret"], "document 4 kept its own");
+
+        engine.delete(&coll, &ids[1]).unwrap();
+        assert_eq!(worker.process(&last_entry(&engine)).await.unwrap(), Outcome::Removed);
+        assert_eq!(
+            texts(&engine, &shadow, &ids[0]),
+            ["alpha report v2"],
+            "document 1 kept its own"
+        );
+        assert!(texts(&engine, &shadow, &ids[1]).is_empty());
+        assert_eq!(shadow_ids(&engine, &shadow).len(), 3);
+    }
+
+    /// V5 inverted, through the worker: the Int64 7 and the String `"7"`, an
+    /// ObjectId and the String of its hex, each keep their own chunks, and
+    /// deleting the String leaves the Int64's.
+    #[tokio::test]
+    async fn v5_cross_type_twins_keep_their_own_chunks_through_the_worker() {
+        let (engine, coll, mut worker, _dir) = setup().await;
+        let oid = bson::oid::ObjectId::parse_str("65f1a2b3c4d5e6f708192a3b").unwrap();
+        let mut ids = Vec::new();
+        for (id, body) in [
+            (bson::Bson::Int64(7), "int seven"),
+            (bson::Bson::String("7".into()), "string seven"),
+            (bson::Bson::ObjectId(oid), "object id doc"),
+            (bson::Bson::String(oid.to_hex()), "hex string doc"),
+        ] {
+            ids.push((engine.insert(&coll, doc! { "_id": id, "body": body }).unwrap(), body));
+            worker.process(&last_entry(&engine)).await.unwrap();
+        }
+        let shadow = engine.vector_collection("app", "docs").unwrap().unwrap();
+        assert_eq!(
+            shadow_ids(&engine, &shadow),
+            ["65f1a2b3c4d5e6f708192a3b#0", "7#0", "~s:65f1a2b3c4d5e6f708192a3b#0", "~s:7#0"],
+            "the Int64's and the ObjectId's ids are the 0.50 ones"
+        );
+        for (id, body) in &ids {
+            assert_eq!(texts(&engine, &shadow, id), [*body], "{id:?}");
+        }
+
+        engine.delete(&coll, &ids[1].0).unwrap();
+        assert_eq!(worker.process(&last_entry(&engine)).await.unwrap(), Outcome::Removed);
+        assert_eq!(texts(&engine, &shadow, &ids[0].0), ["int seven"], "the Int64 keeps its own");
+    }
+
+    /// The store as a 0.50 build left it for `docs`: each document's chunk
+    /// under its 0.50 id, made at its current version under the current
+    /// configuration, written in order, so the binaries of one length share
+    /// one id and the last one's record holds it.
+    fn as_050_left_it(
+        engine: &Engine,
+        coll: &CollectionMeta,
+        shadow: &CollectionMeta,
+        docs: &[(kimmy_core::DocId, &str)],
+    ) {
+        let fingerprint = coll.vector.as_ref().unwrap().fingerprint();
+        for (id, body) in docs {
+            let stamp = engine.document_stamp(coll, id).unwrap().unwrap();
+            let record = VectorRecord {
+                source: id.clone(),
+                chunk: 0,
+                source_hlc: stamp.hlc,
+                vector: vec![body.chars().count() as f32, 0.0, 0.0, 0.0],
+                text: (*body).to_string(),
+                config: Some(fingerprint),
+            };
+            let doc = bson::serialize_to_document(&record).unwrap();
+            engine.replace(shadow, &id_050(id, 0), doc, true).unwrap();
+        }
+    }
+
+    /// Four UUID documents, a String that prints as an integer, and two
+    /// ObjectIds, written, with the shadow as 0.50 left them.
+    fn a_050_shaped_collection(
+        engine: &Engine,
+        coll: &CollectionMeta,
+        shadow: &CollectionMeta,
+    ) -> Vec<(kimmy_core::DocId, &'static str)> {
+        let mut docs = Vec::new();
+        for (seed, tenant, body) in FOUR {
+            let id = engine
+                .insert(coll, doc! { "_id": uuid_id(seed), "tenant": tenant, "body": body })
+                .unwrap();
+            docs.push((id, body));
+        }
+        let id = engine.insert(coll, doc! { "_id": "12345", "body": "string doc" }).unwrap();
+        docs.push((id, "string doc"));
+        for (hex, body) in
+            [("65f1a2b3c4d5e6f708192a3b", "object one"), ("65f1a2b3c4d5e6f708192a3c", "object two")]
+        {
+            let oid = bson::oid::ObjectId::parse_str(hex).unwrap();
+            docs.push((engine.insert(coll, doc! { "_id": oid, "body": body }).unwrap(), body));
+        }
+        as_050_left_it(engine, coll, shadow, &docs);
+        docs
+    }
+
+    /// Test 14, the recovery: one `check` rescan over a shadow 0.50 left
+    /// re-embeds every binary document, with one provider input each, moves
+    /// the String's chunk with no provider call, leaves the ObjectId chunks
+    /// as they were, ids and stamps alike, and empties the 0.50 binary run. A
+    /// second rescan does nothing.
+    #[tokio::test]
+    async fn a_recheck_re_embeds_binaries_moves_reserved_strings_and_leaves_the_rest() {
+        let (engine, coll, mut worker, _dir) = setup().await;
+        let fake = FakeProvider::new(4);
+        worker.set_provider(coll.id.0, Arc::clone(&fake) as Arc<dyn EmbeddingProvider>);
+        let shadow = engine.vector_collection("app", "docs").unwrap().unwrap();
+        let config = coll.vector.clone().unwrap();
+        let docs = a_050_shaped_collection(&engine, &coll, &shadow);
+        assert_eq!(
+            shadow_ids(&engine, &shadow),
+            [
+                "12345#0",
+                "65f1a2b3c4d5e6f708192a3b#0",
+                "65f1a2b3c4d5e6f708192a3c#0",
+                "bin(16 bytes)#0"
+            ]
+        );
+        assert_eq!(texts(&engine, &shadow, &docs[3].0), ["delta secret"], "document 4's chunk");
+        assert!(texts(&engine, &shadow, &docs[0].0).is_empty(), "the others' were lost");
+        let objects: Vec<(kimmy_core::DocId, Option<kimmy_core::Stamp>, Option<bson::Document>)> =
+            docs[5..]
+                .iter()
+                .map(|(id, _)| {
+                    let chunk = id_050(id, 0);
+                    let stamp = engine.document_stamp(&shadow, &chunk).unwrap();
+                    (chunk.clone(), stamp, engine.get(&shadow, &chunk).unwrap())
+                })
+                .collect();
+        let string_before = engine.get_vectors(&shadow, &docs[4].0).unwrap();
+
+        let scanned = worker
+            .scan_collection(&coll, &shadow, &config, "a test", Unscanned::Check)
+            .await
+            .unwrap();
+        assert_eq!(scanned.embedded, 4, "the four binaries, once each");
+        let mut sent = fake.inputs.lock().unwrap().clone();
+        sent.sort();
+        assert_eq!(sent, ["alpha report", "beta report", "delta secret", "gamma secret"]);
+
+        let mut expected: Vec<String> =
+            FOUR.iter().map(|(seed, ..)| uuid_chunk_id(*seed)).collect();
+        expected.extend(["65f1a2b3c4d5e6f708192a3b#0".into(), "65f1a2b3c4d5e6f708192a3c#0".into()]);
+        expected.push("~s:12345#0".into());
+        expected.sort();
+        let mut held = shadow_ids(&engine, &shadow);
+        held.sort();
+        assert_eq!(held, expected, "the 0.50 binary run is empty");
+        for (id, body) in &docs {
+            assert_eq!(texts(&engine, &shadow, id), [*body], "{id:?}");
+        }
+        assert_eq!(
+            engine.get_vectors(&shadow, &docs[4].0).unwrap(),
+            string_before,
+            "moved as it was"
+        );
+        for (chunk, stamp, doc) in &objects {
+            assert_eq!(
+                &engine.document_stamp(&shadow, chunk).unwrap(),
+                stamp,
+                "{chunk:?} untouched"
+            );
+            assert_eq!(&engine.get(&shadow, chunk).unwrap(), doc);
+        }
+
+        let (calls, commits) = (fake.calls(), engine.commits());
+        let again = worker
+            .scan_collection(&coll, &shadow, &config, "a test", Unscanned::Check)
+            .await
+            .unwrap();
+        assert_eq!(again.embedded, 0);
+        assert_eq!(fake.calls(), calls, "a second rescan calls nothing");
+        assert_eq!(engine.commits(), commits, "and writes nothing");
+    }
+
+    /// Test 15: the first start queues one `check` mark per server-embedded
+    /// collection, none for a client-supplied one, and on a single node the
+    /// marks run: the 0.50 binary chunk is re-embedded under its own id. The
+    /// second start queues nothing and calls nothing.
+    #[tokio::test]
+    async fn the_first_start_rechecks_each_embedded_collection_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let engine = Arc::new(Engine::open(&dir.path().join("kimmy.redb")).unwrap());
+        let coll = engine.create_collection("app", "docs").unwrap();
+        engine.configure_vectors("app", "docs", config(&["body"])).unwrap();
+        let coll = engine.get_collection(&coll.db, &coll.name).unwrap();
+        engine.create_collection("app", "client").unwrap();
+        let byo = VectorConfig { provider: ProviderConfig::Byo {}, ..config(&["body"]) };
+        engine.configure_vectors("app", "client", byo).unwrap();
+        let shadow = engine.vector_collection("app", "docs").unwrap().unwrap();
+        let id = engine.insert(&coll, doc! { "_id": uuid_id(0), "body": "alpha report" }).unwrap();
+        as_050_left_it(&engine, &coll, &shadow, &[(id.clone(), "alpha report")]);
+        position_at_latest(&engine);
+
+        let mut worker = EmbeddingWorker::new(Arc::clone(&engine));
+        let fake = FakeProvider::new(4);
+        worker.set_provider(coll.id.0, Arc::clone(&fake) as Arc<dyn EmbeddingProvider>);
+        worker.queue_chunk_id_recheck().await.unwrap();
+        assert_eq!(
+            engine.vector_rescans().unwrap(),
+            vec![(coll.id, false)],
+            "one, not the client's"
+        );
+        worker.load_marks().await.unwrap();
+        worker.retry_one_collection().await.unwrap();
+        assert_eq!(
+            shadow_ids(&engine, &shadow),
+            [uuid_chunk_id(0)],
+            "re-embedded under its own id"
+        );
+        assert_eq!(fake.calls(), 1);
+        assert!(engine.vector_rescans().unwrap().is_empty(), "the mark is cleared once run");
+
+        let mut second = EmbeddingWorker::new(Arc::clone(&engine));
+        let fake = FakeProvider::new(4);
+        second.set_provider(coll.id.0, Arc::clone(&fake) as Arc<dyn EmbeddingProvider>);
+        second.queue_chunk_id_recheck().await.unwrap();
+        assert!(engine.vector_rescans().unwrap().is_empty(), "the second start queues nothing");
+        second.load_marks().await.unwrap();
+        second.retry_one_collection().await.unwrap();
+        assert_eq!(fake.calls(), 0);
+    }
+
+    /// Test 15, on a member that does not own the collection: the mark is
+    /// cleared with no provider call, and the collection is left unsettled, so
+    /// gaining it later rescans it.
+    #[tokio::test]
+    async fn a_recheck_mark_on_a_collection_owned_elsewhere_is_cleared_harmlessly() {
+        let dir = tempfile::tempdir().unwrap();
+        let engine = Arc::new(Engine::open(&dir.path().join("kimmy.redb")).unwrap());
+        engine.create_collection("app", "docs").unwrap();
+        engine.configure_vectors("app", "docs", config(&["body"])).unwrap();
+        let coll = engine.get_collection("app", "docs").unwrap();
+        let shadow = engine.vector_collection("app", "docs").unwrap().unwrap();
+        let id = engine.insert(&coll, doc! { "_id": uuid_id(0), "body": "alpha report" }).unwrap();
+        as_050_left_it(&engine, &coll, &shadow, &[(id, "alpha report")]);
+
+        let mut worker = EmbeddingWorker::new(Arc::clone(&engine));
+        let fake = FakeProvider::new(4);
+        worker.set_provider(coll.id.0, Arc::clone(&fake) as Arc<dyn EmbeddingProvider>);
+        switchable_owner(&mut worker, false);
+        worker.queue_chunk_id_recheck().await.unwrap();
+        worker.load_marks().await.unwrap();
+        worker.retry_one_collection().await.unwrap();
+        assert_eq!(fake.calls(), 0);
+        assert!(engine.vector_rescans().unwrap().is_empty());
+        assert_eq!(worker.ownership_settled.get("app/docs"), Some(&false));
+    }
+
+    /// A String whose chunk id changed is moved by the owner before it judges
+    /// the document's entry, with no provider call; a member that does not
+    /// own the collection moves nothing.
+    #[tokio::test]
+    async fn the_owner_moves_a_reserved_strings_chunks_before_judging_its_entry() {
+        let (engine, coll, mut worker, _dir) = setup().await;
+        let fake = FakeProvider::new(4);
+        worker.set_provider(coll.id.0, Arc::clone(&fake) as Arc<dyn EmbeddingProvider>);
+        let shadow = engine.vector_collection("app", "docs").unwrap().unwrap();
+        let id = engine.insert(&coll, doc! { "_id": "~note", "body": "a note" }).unwrap();
+        let entry = last_entry(&engine);
+        as_050_left_it(&engine, &coll, &shadow, &[(id.clone(), "a note")]);
+
+        let owner = switchable_owner(&mut worker, false);
+        assert_eq!(worker.process(&entry).await.unwrap(), Outcome::Deferred);
+        assert_eq!(shadow_ids(&engine, &shadow), ["~note#0"], "not moved by a non-owner");
+
+        owner.store(true, Ordering::SeqCst);
+        assert_eq!(worker.process(&entry).await.unwrap(), Outcome::Skipped, "current once moved");
+        assert_eq!(shadow_ids(&engine, &shadow), ["~s:~note#0"]);
+        assert_eq!(fake.calls(), 0);
+    }
+
+    // The mixed roll, in process (test 19): A is a 0.50.0 member, written by a
+    // test-side copy of 0.50's ids and 0.50's delete; B is this build. Their
+    // oplogs are exchanged both ways, as replication does.
+
+    /// One direction of replication, until there is nothing left to pull.
+    fn pull(into: &Engine, from: &Engine) {
+        loop {
+            let (mine, theirs) = (into.version_vector().unwrap(), from.version_vector().unwrap());
+            let Some(start) = mine.behind(&theirs) else { return };
+            let entries = from
+                .entries_for_peer(start, 10_000, kimmy_storage::WalkScope::Background)
+                .unwrap()
+                .entries;
+            if into.apply_batch(&entries).unwrap().applied == 0 {
+                return;
+            }
+        }
+    }
+
+    fn exchange(a: &Engine, b: &Engine) {
+        pull(b, a);
+        pull(a, b);
+    }
+
+    /// 0.50's delete of a document's vectors: every key of the run under its
+    /// display text, whatever its record names.
+    fn delete_050(engine: &Engine, shadow: &CollectionMeta, id: &kimmy_core::DocId) -> usize {
+        let display = match id_050(id, 0) {
+            kimmy_core::DocId::String(s) => s.trim_end_matches("#0").to_string(),
+            _ => unreachable!(),
+        };
+        let mut run = Vec::new();
+        engine
+            .for_each_doc(shadow, kimmy_storage::WalkScope::Request, |key, _| {
+                if let kimmy_core::DocId::String(s) = &key
+                    && s.rsplit_once('#').is_some_and(|(source, _)| source == display)
+                {
+                    run.push(key);
+                }
+                Ok(true)
+            })
+            .unwrap();
+        run.iter().filter(|key| engine.delete(shadow, key).unwrap()).count()
+    }
+
+    struct Roll {
+        a: Arc<Engine>,
+        b: Arc<Engine>,
+        coll: CollectionMeta,
+        shadow: CollectionMeta,
+        worker: EmbeddingWorker,
+        fake: Arc<FakeProvider>,
+        docs: Vec<(kimmy_core::DocId, &'static str)>,
+        _dirs: (tempfile::TempDir, tempfile::TempDir),
+    }
+
+    /// A owns the collection and embedded it as 0.50 did; B has received it.
+    async fn a_mixed_roll() -> Roll {
+        let (da, db) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+        let a = Arc::new(Engine::open(&da.path().join("kimmy.redb")).unwrap());
+        let b = Arc::new(Engine::open(&db.path().join("kimmy.redb")).unwrap());
+        a.create_collection("app", "docs").unwrap();
+        a.configure_vectors("app", "docs", config(&["body"])).unwrap();
+        let coll = a.get_collection("app", "docs").unwrap();
+        let shadow = a.vector_collection("app", "docs").unwrap().unwrap();
+        let docs = a_050_shaped_collection(&a, &coll, &shadow);
+        exchange(&a, &b);
+        past_the_chunk_id_recheck(&b);
+        let mut worker = EmbeddingWorker::new(Arc::clone(&b));
+        let fake = FakeProvider::new(4);
+        worker.set_provider(coll.id.0, Arc::clone(&fake) as Arc<dyn EmbeddingProvider>);
+        Roll { a, b, coll, shadow, worker, fake, docs, _dirs: (da, db) }
+    }
+
+    /// A `check` rescan of the collection on B: what it embedded.
+    async fn rescan(roll: &mut Roll) -> usize {
+        let config = roll.coll.vector.clone().unwrap();
+        let scanned = roll
+            .worker
+            .scan_collection(&roll.coll, &roll.shadow, &config, "a test", Unscanned::Check)
+            .await
+            .unwrap();
+        scanned.embedded
+    }
+
+    fn digest(engine: &Engine, shadow: &CollectionMeta) -> u128 {
+        engine.digest_row(shadow.id).unwrap().unwrap_or_default().digest
+    }
+
+    #[tokio::test]
+    async fn a_mixed_roll_converges_to_equal_shadow_digests() {
+        let mut roll = a_mixed_roll().await;
+        assert_eq!(digest(&roll.a, &roll.shadow), digest(&roll.b, &roll.shadow));
+        assert_ne!(digest(&roll.a, &roll.shadow), 0, "the shadow holds chunks");
+        // And after B writes this build's ids and A writes 0.50's again.
+        rescan(&mut roll).await;
+        as_050_left_it(&roll.a, &roll.coll, &roll.shadow, &roll.docs[..2]);
+        exchange(&roll.a, &roll.b);
+        assert_eq!(digest(&roll.a, &roll.shadow), digest(&roll.b, &roll.shadow));
+        assert_eq!(shadow_ids(&roll.a, &roll.shadow), shadow_ids(&roll.b, &roll.shadow));
+    }
+
+    #[tokio::test]
+    async fn a_mixed_roll_reads_exactly_on_the_new_member() {
+        let roll = a_mixed_roll().await;
+        let (b, shadow) = (&roll.b, &roll.shadow);
+        // The binaries' one 0.50 chunk is document 4's; the others hold none.
+        for (i, (id, body)) in roll.docs.iter().enumerate() {
+            let expected: Vec<&str> = if i < 3 { vec![] } else { vec![*body] };
+            assert_eq!(texts(b, shadow, id), expected, "{id:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn a_mixed_roll_delete_leaves_no_chunk_in_either_format() {
+        let mut roll = a_mixed_roll().await;
+        // B embeds under this build's ids; A, a 0.50 owner for a moment,
+        // embeds document 4 under 0.50's again (another record than the one
+        // it held, or the write would change nothing). Both replicate.
+        rescan(&mut roll).await;
+        let (gone, _) = roll.docs[3].clone();
+        as_050_left_it(&roll.a, &roll.coll, &roll.shadow, &[(gone.clone(), "delta, again")]);
+        exchange(&roll.a, &roll.b);
+        let id_051 = uuid_chunk_id(48);
+        let both = shadow_ids(&roll.b, &roll.shadow);
+        assert!(
+            both.contains(&id_051) && both.contains(&"bin(16 bytes)#0".to_string()),
+            "{both:?}"
+        );
+
+        // The document is deleted on A; each member processes the Delete.
+        roll.a.delete(&roll.coll, &gone).unwrap();
+        delete_050(&roll.a, &roll.shadow, &gone);
+        exchange(&roll.a, &roll.b);
+        let entry = roll
+            .b
+            .read_oplog_from(Hlc::ZERO, 100_000, kimmy_storage::WalkScope::Background)
+            .unwrap()
+            .into_iter()
+            .rfind(|e| {
+                e.kind == OpKind::Delete
+                    && e.collection == roll.coll.id
+                    && e.doc_id.as_ref() == Some(&gone)
+            })
+            .expect("the delete reached B");
+        assert_eq!(roll.worker.process(&entry).await.unwrap(), Outcome::Removed);
+        exchange(&roll.a, &roll.b);
+        for engine in [&roll.a, &roll.b] {
+            let held = shadow_ids(engine, &roll.shadow);
+            assert!(
+                !held.contains(&id_051) && !held.contains(&"bin(16 bytes)#0".into()),
+                "{held:?}"
+            );
+            assert!(texts(engine, &roll.shadow, &gone).is_empty());
+        }
+        for (id, body) in roll.docs.iter().filter(|(id, _)| *id != gone) {
+            assert_eq!(texts(&roll.b, &roll.shadow, id), [*body], "{id:?} kept");
+        }
+        assert_eq!(digest(&roll.a, &roll.shadow), digest(&roll.b, &roll.shadow));
+    }
+
+    #[tokio::test]
+    async fn a_mixed_roll_rescan_on_the_new_member_moves_or_re_embeds_the_old_chunks() {
+        let mut roll = a_mixed_roll().await;
+        assert_eq!(rescan(&mut roll).await, 4, "the binaries re-embedded");
+        assert_eq!(roll.fake.inputs.lock().unwrap().len(), 4, "and nothing else sent");
+        exchange(&roll.a, &roll.b);
+        let held = shadow_ids(&roll.a, &roll.shadow);
+        assert!(held.contains(&"~s:12345#0".to_string()), "moved, and replicated: {held:?}");
+        assert!(!held.iter().any(|id| id.starts_with("bin(")), "{held:?}");
+        for (id, body) in &roll.docs {
+            assert_eq!(texts(&roll.b, &roll.shadow, id), [*body], "{id:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn a_mixed_roll_costs_one_re_embed_per_ownership_move() {
+        let mut roll = a_mixed_roll().await;
+        assert_eq!(rescan(&mut roll).await, 4);
+        assert_eq!(rescan(&mut roll).await, 0, "and no more");
+        exchange(&roll.a, &roll.b);
+
+        // Ownership moves to A, which re-embeds one binary under 0.50's ids,
+        // and back to B.
+        as_050_left_it(&roll.a, &roll.coll, &roll.shadow, &roll.docs[..1]);
+        exchange(&roll.a, &roll.b);
+        let calls = roll.fake.calls();
+        assert_eq!(rescan(&mut roll).await, 1, "one re-embed for the move");
+        assert_eq!(roll.fake.calls(), calls + 1);
+        assert_eq!(rescan(&mut roll).await, 0, "and no more");
     }
 }
