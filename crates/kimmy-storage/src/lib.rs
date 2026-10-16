@@ -114,6 +114,9 @@ mod later_life_stop_tests;
 mod young_stamp_model_tests;
 
 #[cfg(test)]
+mod mixed_roll_tests;
+
+#[cfg(test)]
 mod log_capture;
 #[cfg(feature = "test-hooks")]
 pub use live_walk::stop_open_after_rows_for_test;
