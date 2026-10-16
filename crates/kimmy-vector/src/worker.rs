@@ -8618,6 +8618,34 @@ pub(crate) mod tests {
         assert_eq!(fake.calls(), 0);
     }
 
+    /// Test 15, through the worker's own start: a running worker on a store
+    /// that has not had the recheck re-embeds a binary document's 0.50 chunk
+    /// under its own id, with nothing in its stream to make it look, and
+    /// records the recheck as queued.
+    #[tokio::test]
+    async fn a_running_worker_rechecks_at_its_first_start() {
+        let dir = tempfile::tempdir().unwrap();
+        let engine = Arc::new(Engine::open(&dir.path().join("kimmy.redb")).unwrap());
+        engine.create_collection("app", "docs").unwrap();
+        engine.configure_vectors("app", "docs", config(&["body"])).unwrap();
+        let coll = engine.get_collection("app", "docs").unwrap();
+        let shadow = engine.vector_collection("app", "docs").unwrap().unwrap();
+        let id = engine.insert(&coll, doc! { "_id": uuid_id(0), "body": "alpha report" }).unwrap();
+        as_050_left_it(&engine, &coll, &shadow, &[(id, "alpha report")]);
+        position_at_latest(&engine);
+
+        let mut worker = EmbeddingWorker::new(Arc::clone(&engine));
+        worker.set_provider(coll.id.0, FakeProvider::new(4));
+        let running = tokio::spawn(async move { worker.run().await });
+        let deadline = std::time::Instant::now() + Duration::from_secs(30);
+        while shadow_ids(&engine, &shadow) != [uuid_chunk_id(0)] {
+            assert!(std::time::Instant::now() < deadline, "{:?}", shadow_ids(&engine, &shadow));
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        running.abort();
+        assert!(engine.queue_vector_chunk_recheck().unwrap().is_empty(), "recorded as queued");
+    }
+
     /// Test 15, on a member that does not own the collection: the mark is
     /// cleared with no provider call, and the collection is left unsettled, so
     /// gaining it later rescans it.
