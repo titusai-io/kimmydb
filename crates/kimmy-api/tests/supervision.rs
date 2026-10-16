@@ -328,7 +328,7 @@ fn every_long_lived_task_is_spawned_through_the_supervisor() {
     // `type`, a test-hook module -- and each was hidden until the walk stopped
     // cutting at a line.
     for (file, production) in [
-        ("kimmy-storage/src/migrate.rs", "fn rebuild_partial_indexes"),
+        ("kimmy-storage/src/migrate.rs", "fn refuse_unparseable_partial_filters"),
         ("kimmy-vector/src/cache.rs", "impl IndexCache"),
         ("kimmyd/src/logging.rs", "fn hold_instruments"),
         ("kimmy-storage/src/engine.rs", "pub(crate) fn doc_range("),

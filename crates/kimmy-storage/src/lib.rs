@@ -42,6 +42,9 @@ pub mod live_digest;
 mod live_walk;
 pub mod meta;
 pub mod migrate;
+mod migrate_v5;
+#[cfg(test)]
+mod migrate_v5_tests;
 pub mod modify;
 pub mod open_progress;
 pub mod purge;
@@ -158,7 +161,7 @@ pub use hold_meter::{
 pub use index::{CandidateOrder, Dropped, IndexScan, IndexScanOutcome};
 pub use meta::{CollectionMeta, DatabaseMeta, Enforcement, IndexField, IndexMeta, VectorConfig};
 #[cfg(feature = "test-hooks")]
-pub use migrate::make_schema_3_for_test;
+pub use migrate::make_schema_4_for_test;
 pub use modify::{Candidates, MAX_CANDIDATES, ModifyManyOutcome, ModifyOutcome, ModifySpec};
 pub use open_progress::{
     OpenPhase, OpenSnapshot, open_snapshot, open_stop_requested, request_open_stop, set_open_phase,

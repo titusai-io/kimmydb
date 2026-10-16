@@ -1357,6 +1357,12 @@ fn the_conversions_are_at_the_wire_api_and_the_fold_sites_and_nowhere_else() {
             ("live_walk.rs", "run"),
             ("digest_probe.rs", "walk_headers"),
             ("live_digest.rs", "legacy_term"),
+            // The migration reads the old index entries it has not yet rebuilt, whose
+            // document keys are still schema 4, by the legacy form of the re-keyed row.
+            ("migrate_v5.rs", "ttl_selection_changes"),
+            // A test hook that writes a schema 4 store: the stored-to-legacy half of the
+            // fixture a migration test starts from.
+            ("migrate.rs", "make_schema_4_for_test"),
         ])
     );
     // The uncovered keys, legacy from the id itself.

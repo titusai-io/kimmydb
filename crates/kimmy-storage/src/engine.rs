@@ -1396,8 +1396,9 @@ impl Engine {
         // Before anything reads a collection id: schema 1 allocated them from a
         // counter, schema 2 derives them from the name.
         let build = cleared.build.clone();
-        let unreported =
-            crate::migrate::run(&db, &|schema| crate::format::raise_schema(path, schema, &build))?;
+        let unreported = crate::migrate::run(&db, path, &|schema| {
+            crate::format::raise_schema(path, schema, &build)
+        })?;
         // The redb that last opened this store for writing, in the store too,
         // so a clean store whose sidecar is gone is still refused by an older
         // redb's build.
@@ -6120,11 +6121,12 @@ mod tests {
         // Where a commit happens before or outside an open `Engine`, and so
         // cannot be counted by one. Each is a whole-file exemption because each
         // file's entire job is one of these.
-        const NO_ENGINE_YET: [&str; 4] = [
-            "migrate.rs",   // runs on the raw database during `Engine::open`
-            "live_walk.rs", // the open's rebuild of the counts and digests, in chunks
-            "backup.rs",    // restores into a fresh file that no engine has opened
-            "engine.rs",    // `Engine::open` itself, plus the chokepoint
+        const NO_ENGINE_YET: [&str; 5] = [
+            "migrate.rs",    // runs on the raw database during `Engine::open`
+            "migrate_v5.rs", // the schema 5 migration, likewise, a chunk per commit
+            "live_walk.rs",  // the open's rebuild of the counts and digests, in chunks
+            "backup.rs",     // restores into a fresh file that no engine has opened
+            "engine.rs",     // `Engine::open` itself, plus the chokepoint
         ];
 
         let src = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");

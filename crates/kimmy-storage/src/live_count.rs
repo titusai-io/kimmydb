@@ -1436,11 +1436,22 @@ mod tests {
     #[test]
     fn every_document_write_moves_the_count() {
         // Exempt: `migrate.rs` moves rows between ids during `Engine::open`,
-        // before the counts are rebuilt; `backup.rs` restores into a file no
-        // engine has opened, which the first open rebuilds; `faults.rs`
+        // before the counts are rebuilt; `migrate_v5.rs` re-keys rows within
+        // their own id during `Engine::open`, which moves no count (each row
+        // leaves and returns as the same record) and no digest term (the term
+        // is the key's schema 4 form, which a re-key does not change), and its
+        // tests build schema 4 stores by hand; `backup.rs` restores into a file
+        // no engine has opened, which the first open rebuilds; `faults.rs`
         // stores test-only records that are not documents, for readers that
         // must survive them; and this module.
-        const EXEMPT: [&str; 4] = ["live_count.rs", "migrate.rs", "backup.rs", "faults.rs"];
+        const EXEMPT: [&str; 6] = [
+            "live_count.rs",
+            "migrate.rs",
+            "migrate_v5.rs",
+            "migrate_v5_tests.rs",
+            "backup.rs",
+            "faults.rs",
+        ];
         let src = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
         let mut offenders = Vec::new();
         for entry in std::fs::read_dir(&src).unwrap() {

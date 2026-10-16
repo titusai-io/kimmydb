@@ -9,8 +9,8 @@
 //! One store is opened at a time in a daemon, so the state is process-wide:
 //! an atomic phase, its start, a done and a total. It changes no behaviour of
 //! the open, except that a stop asked for during it ([`request_open_stop`]) is
-//! honoured at the two points that can take it safely: between the migration's
-//! per-index steps (which are resumable, one commit each), and in the
+//! honoured at the two points that can take it safely: between two of the
+//! migration's chunks (which are resumable, one commit each), and in the
 //! verification walk, which is abandoned and simply not recorded.
 
 use std::sync::OnceLock;
@@ -28,7 +28,8 @@ pub enum OpenPhase {
     Repairing = 1,
     /// Opening the file and reading its tables.
     Opening = 2,
-    /// The schema migration, one index at a time: `done` of `total`.
+    /// The schema migration's re-key of one collection's documents (ADR-238):
+    /// rows moved of `total`, first into the staging table and then back.
     Migrating = 3,
     /// The walk that verifies the version vector against the oplog: rows
     /// read of the oplog's rows.
@@ -41,16 +42,26 @@ pub enum OpenPhase {
     /// Burying what a database's drop covers (ADR-229): `done` of `total`
     /// databases, before the node serves.
     Reconciling = 7,
+    /// The schema migration's drain of one index (ADR-238): entries removed of
+    /// `total`, the collection's documents when the drain began (an index can
+    /// hold more, and the total is raised to stay ahead of `done`).
+    Draining = 8,
+    /// The schema migration's refill of one collection's indexes (ADR-238):
+    /// documents walked of `total`, the collection's documents when the
+    /// refill began, raised likewise.
+    Refilling = 9,
 }
 
 impl OpenPhase {
     /// Every phase a probe reports, `Idle` (no open running) left out. A test
     /// holds this to the numbering and to the phases the OpenAPI document lists.
-    pub const fn reported() -> [OpenPhase; 7] {
+    pub const fn reported() -> [OpenPhase; 9] {
         [
             Self::Repairing,
             Self::Opening,
             Self::Migrating,
+            Self::Draining,
+            Self::Refilling,
             Self::Verifying,
             Self::Counting,
             Self::Starting,
@@ -68,6 +79,8 @@ impl OpenPhase {
             Self::Counting => "counting",
             Self::Starting => "starting",
             Self::Reconciling => "reconciling",
+            Self::Draining => "draining",
+            Self::Refilling => "refilling",
         }
     }
 
@@ -80,6 +93,8 @@ impl OpenPhase {
             5 => Self::Counting,
             6 => Self::Starting,
             7 => Self::Reconciling,
+            8 => Self::Draining,
+            9 => Self::Refilling,
             _ => Self::Idle,
         }
     }
@@ -129,6 +144,8 @@ fn now_ms() -> u64 {
 pub fn set_open_phase(phase: OpenPhase) {
     #[cfg(test)]
     tests::THIS_THREAD_PHASE.with(|seen| seen.set(Some((phase, 0))));
+    #[cfg(test)]
+    tests::THIS_THREAD_DONE.with(|seen| seen.set(0));
     DONE.store(0, Relaxed);
     TOTAL.store(0, Relaxed);
     SINCE_MS.store(now_ms(), Relaxed);
@@ -145,7 +162,21 @@ pub(crate) fn set_open_phase_of(phase: OpenPhase, total: u64) {
 
 /// How far through the current phase.
 pub(crate) fn set_open_done(done: u64) {
+    #[cfg(test)]
+    tests::THIS_THREAD_DONE.with(|seen| seen.set(done));
     DONE.store(done, Relaxed);
+}
+
+/// A new total for the current phase, when its first was an estimate the work
+/// has outrun.
+pub(crate) fn set_open_total(total: u64) {
+    #[cfg(test)]
+    tests::THIS_THREAD_PHASE.with(|seen| {
+        if let Some((phase, _)) = seen.get() {
+            seen.set(Some((phase, total)));
+        }
+    });
+    TOTAL.store(total, Relaxed);
 }
 
 /// The open in progress, as a probe reads it.
@@ -214,6 +245,8 @@ pub(crate) mod tests {
         /// the process, and a test that raised it would stop every open running
         /// beside it in the same test binary.
         pub(crate) static THIS_THREAD_STOPS: Cell<bool> = const { Cell::new(false) };
+        /// How far this thread's open said it was, beside its phase.
+        pub(crate) static THIS_THREAD_DONE: Cell<u64> = const { Cell::new(0) };
     }
 
     /// The verification walk checks for a stop every 8,192 rows, and a stop asked

@@ -603,7 +603,7 @@ pub(crate) fn mark_multikey(
 
 /// Every document id currently filed under one exact index key: a unique
 /// key's holder, or a whole sentinel run.
-fn holders_of<T>(
+pub(crate) fn holders_of<T>(
     table: &WalkTable<'_, T>,
     coll: CollectionId,
     index_id: u32,
@@ -2645,21 +2645,44 @@ pub(crate) mod clear_hooks {
 /// Remove every index entry in `range`, inside the caller's transaction, and
 /// answer how many.
 ///
-/// **Never `retain_in`.** redb's `retain_in` with a predicate that keeps
-/// nothing is not a faster way to remove a range; it is a slower one. Measured
-/// on 742,858 entries: `retain_in` took 33 s and grew the file from 2.1 to
-/// 12 GiB inside the transaction, while gathering the keys and removing each
-/// took 0.51 s and grew it not at all. redb hands the growth back within a
-/// couple of commits, but it has to be free when the clear runs, and the
-/// writer is held throughout. That is on a drop, and on a peer's rival
-/// definition superseding this node's inside the winner's build, where nobody
-/// chose to wait.
+/// **By key**: a batch of keys gathered, then each removed. That is what lets
+/// [`clear_index_entries_upto`] stop at a byte budget, so a caller that commits
+/// between parts (the schema 5 migration's drain) can stop and resume between
+/// them; redb's `retain_in` takes a range in one call and cannot stop part-way.
+///
+/// **Not for `retain_in`'s cost, any more.** On the redb this was first written
+/// against, `retain_in` with a predicate that kept nothing was the slower way:
+/// measured on 742,858 entries it took 33 s and grew the file from 2.1 to 12 GiB
+/// inside the transaction, against 0.51 s by key and no growth. redb 4.2.0 made
+/// `retain` and `retain_in` 30 to 100 times faster (its CHANGELOG), and on redb
+/// 4.3 it is the faster of the two and grows the file no more: draining
+/// 300,000 entries left the file at 184 MiB either way, and 1,000,000 entries
+/// drained in 61 ms by `retain_in` against 647 ms by key, the file at 736 MiB
+/// either way (`migrate_v5_tests::draining_keeps_the_file_near_its_size`, in
+/// release, with this function's body replaced by a `retain_in`).
 pub(crate) fn clear_index_entries(
     entries: &mut WalkTable<'_, redb::Table<'_, tables::IndexKey<'static>, ()>>,
     range: impl std::ops::RangeBounds<tables::IndexKey<'static>> + Clone + 'static,
 ) -> Result<usize> {
-    let mut removed = 0;
+    clear_index_entries_upto(entries, range, usize::MAX).map(|(removed, _)| removed)
+}
+
+/// [`clear_index_entries`], stopping once the keys removed add up to `budget`
+/// bytes or more: the part of a clear that fits one transaction, for a caller
+/// that commits between parts and must not hold one transaction for a whole
+/// index (the schema 5 migration's drain). Answers how many keys it removed and
+/// whether the range is now empty, which the caller commits with the last part.
+pub(crate) fn clear_index_entries_upto(
+    entries: &mut WalkTable<'_, redb::Table<'_, tables::IndexKey<'static>, ()>>,
+    range: impl std::ops::RangeBounds<tables::IndexKey<'static>> + Clone + 'static,
+    budget: usize,
+) -> Result<(usize, bool)> {
+    let (mut removed, mut bytes) = (0, 0usize);
     loop {
+        if bytes >= budget {
+            let rest = entries.range(range.clone())?.next().transpose()?.is_none();
+            return Ok((removed, rest));
+        }
         #[allow(clippy::type_complexity)]
         let batch: Vec<(u64, u32, Vec<u8>, Vec<u8>)> = entries
             .range(range.clone())?
@@ -2671,8 +2694,9 @@ pub(crate) fn clear_index_entries(
             })
             .collect::<Result<_>>()?;
         if batch.is_empty() {
-            return Ok(removed);
+            return Ok((removed, true));
         }
+        bytes = bytes.saturating_add(batch.iter().map(|(_, _, v, d)| 12 + v.len() + d.len()).sum());
         let mut gone = 0;
         for (collection, index, value, doc_key) in &batch {
             #[cfg(test)]
