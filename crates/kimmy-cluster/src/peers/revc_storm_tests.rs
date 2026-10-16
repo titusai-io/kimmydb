@@ -214,8 +214,15 @@ async fn tick(
                                 &mut report,
                             );
                         }
-                        let planned =
-                            plan_count_repairs(&engine, &m.divergence, &mut m.stalls, node, addr);
+                        let catching_up = CatchingUp::of(&m.config, node, outcome.peer_catching_up);
+                        let planned = plan_count_repairs(
+                            &engine,
+                            &m.divergence,
+                            &mut m.stalls,
+                            node,
+                            addr,
+                            catching_up,
+                        );
                         storm.count_repairs_planned += planned;
                         if let Some(peer) = names.get(&node).copied() {
                             *storm.count_plans.entry((m.name, peer)).or_default() += planned;
@@ -236,6 +243,7 @@ async fn tick(
                             node,
                             addr,
                             &digest_confirmed,
+                            catching_up,
                         );
                         m.stalls.retain_digest(node, &digest_confirmed);
                         let definition_confirmed = m.divergence.definition_confirmed_against(node);
@@ -246,6 +254,7 @@ async fn tick(
                             node,
                             addr,
                             &definition_confirmed,
+                            catching_up,
                         );
                         m.stalls.retain_definition(node, &definition_confirmed);
                         storm.digest_compared += report.digest_compared;
@@ -765,7 +774,7 @@ fn revc_a_peer_whose_converge_rounds_always_fail_is_repaired_every_cooldown() {
         stalls.tick_opened();
         // The round: a Converge round if one is due, which fails (no page lands); otherwise
         // an ordinary round, which succeeds and runs the check.
-        match stalls.repair_due(peer) {
+        match stalls.repair_due(peer, false) {
             Some(due) => {
                 if last_active != Some(due) || !stalls.repairing(peer) {
                     handed += 1;

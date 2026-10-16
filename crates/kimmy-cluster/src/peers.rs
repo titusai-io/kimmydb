@@ -1446,12 +1446,15 @@ pub async fn replicate(engine: Arc<Engine>, config: ReplicationConfig) {
                                     // history from its creation, or the
                                     // peer's snapshot for a collection this
                                     // node does not hold at all.
+                                    let catching_up =
+                                        CatchingUp::of(&config, node, outcome.peer_catching_up);
                                     plan_count_repairs(
                                         &engine,
                                         &divergence,
                                         &mut stalls,
                                         node,
                                         peer,
+                                        catching_up,
                                     );
                                     // The cut digest's findings plan a document repair
                                     // (repair design section 3).
@@ -1464,6 +1467,7 @@ pub async fn replicate(engine: Arc<Engine>, config: ReplicationConfig) {
                                         node,
                                         peer,
                                         &digest_confirmed,
+                                        catching_up,
                                     );
                                     stalls.retain_digest(node, &digest_confirmed);
                                     // And the definition digest's: a plain index this
@@ -1477,6 +1481,7 @@ pub async fn replicate(engine: Arc<Engine>, config: ReplicationConfig) {
                                         node,
                                         peer,
                                         &definition_confirmed,
+                                        catching_up,
                                     );
                                     stalls.retain_definition(node, &definition_confirmed);
                                 } else {
@@ -2134,15 +2139,37 @@ fn fold_digest_round(
     }
 }
 
-/// This member's own `CatchUp` marker and the peer's `catching_up` fact: a repair compares
-/// rows (or definitions) against a peer, and either side mid-catch-up would be repaired from
-/// or to a state that is about to change (review B m9; a restored member is marked catching
-/// up). An index built over a collection still arriving is rebuilt by every following page.
-fn either_side_is_catching_up(config: &ReplicationConfig, node: NodeId) -> bool {
-    config.catch_up.as_ref().is_some_and(|catch_up| catch_up.is_set())
-        || config.members.as_ref().is_some_and(|members| {
-            members.peer_states().get(&node) == Some(&crate::facts::PeerState::IneligibleCatchingUp)
-        })
+/// Which side of a contact is catching up, for the repair plans: this member's own `CatchUp`
+/// marker, and the peer's `catching_up` fact. A repair compares rows (or definitions) against
+/// a peer, and either side mid-catch-up would be repaired from or to a state that is about to
+/// change (review B m9; a restored member is marked catching up). An index built over a
+/// collection still arriving is rebuilt by every following page.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct CatchingUp {
+    own: bool,
+    peer: bool,
+}
+
+impl CatchingUp {
+    /// This member's marker, and the peer's as the block this contact carried said it
+    /// (`said`, `SyncOutcome::peer_catching_up`) or as membership holds it for `node`; either
+    /// is enough (ADR-237's addendum). Membership alone cannot see a peer it lists under
+    /// another id (a wiped member SWIM has not renamed yet) or does not list yet (one found by
+    /// discovery), nor a block it refused on ordering.
+    fn of(config: &ReplicationConfig, node: NodeId, said: bool) -> Self {
+        Self {
+            own: config.catch_up.as_ref().is_some_and(|catch_up| catch_up.is_set()),
+            peer: said
+                || config.members.as_ref().is_some_and(|members| {
+                    members.peer_states().get(&node)
+                        == Some(&crate::facts::PeerState::IneligibleCatchingUp)
+                }),
+        }
+    }
+
+    fn either(self) -> bool {
+        self.own || self.peer
+    }
 }
 
 /// Why a confirmed finding is not planned a repair before the planner is asked (repair design
@@ -2184,9 +2211,10 @@ fn plan_definition_repairs(
     node: NodeId,
     peer: SocketAddr,
     confirmed: &BTreeSet<kimmy_core::CollectionId>,
+    catching_up: CatchingUp,
 ) {
     use crate::transport::{DigestPlan, DigestRepairOutcome};
-    let catching_up = either_side_is_catching_up(config, node);
+    let catching_up = catching_up.either();
     for collection in confirmed {
         let finding = stalls.definition_finding_confirmed(node, *collection);
         if finding.newly_stopped {
@@ -2249,6 +2277,7 @@ fn gate_count<E>(read: Result<Option<u64>, E>) -> u64 {
 /// Plan a document repair for each digest finding confirmed against `node`, or count why
 /// not (repair design sections 3 and 5): the switch, the catching-up gates, the size gate,
 /// then the planner's own (a count repair, a whole-database pull, the loop guard).
+#[allow(clippy::too_many_arguments)]
 fn plan_digest_repairs(
     engine: &Engine,
     config: &ReplicationConfig,
@@ -2257,9 +2286,10 @@ fn plan_digest_repairs(
     node: NodeId,
     peer: SocketAddr,
     confirmed: &BTreeSet<kimmy_core::CollectionId>,
+    catching_up: CatchingUp,
 ) {
     use crate::transport::{DigestPlan, DigestRepairOutcome};
-    let catching_up = either_side_is_catching_up(config, node);
+    let catching_up = catching_up.either();
     for collection in confirmed {
         let finding = stalls.digest_finding_confirmed(node, *collection);
         if finding.newly_stopped {
@@ -2794,16 +2824,30 @@ fn fold_check(
 /// (`DivergenceTracker::observe_count_deferred`) and keeps the cooldown of the repair it
 /// planned before, so a finding that cannot be compared against a peer that trails this
 /// member and moves is not repaired again every cooldown on old evidence.
+///
+/// Nothing is planned from a peer that is catching up, and no count finding is planned while
+/// this member is (`catching_up`, ADR-237's addendum), as for the digest and definition
+/// repairs: a repair from a member part-way through a snapshot reads a state that is about to
+/// change, and so does a count this member took while catching up. A collection the peer holds
+/// and this member lacks (the existence half) is still planned while only this member is
+/// catching up: it is what brings a collection the member's own catch-up cannot, such as one
+/// its replay of its own origin stops at. A finding stands and is planned on the first contact
+/// after the marker clears.
 fn plan_count_repairs(
     engine: &Engine,
     divergence: &kimmy_storage::DivergenceTracker,
     stalls: &mut PeerStalls,
     node: NodeId,
     peer: SocketAddr,
+    catching_up: CatchingUp,
 ) -> usize {
     let confirmed = divergence.confirmed_against(node);
+    let existence = divergence.existence_confirmed_against(node);
+    let held = |collection: &&kimmy_core::CollectionId| {
+        if existence.contains(*collection) { catching_up.peer } else { catching_up.either() }
+    };
     let mut planned = 0;
-    for collection in &confirmed {
+    for collection in confirmed.iter().filter(|c| !held(c)) {
         let repair = repair_for(engine, *collection);
         if stalls.plan_repair(node, *collection, repair) {
             planned += 1;
@@ -4544,7 +4588,7 @@ mod digest_fold_tests {
                 kimmy_core::VersionVector::default(),
             );
             assert_eq!(plan, DigestPlan::Planned);
-            f.stalls.repair_due(f.node);
+            f.stalls.repair_due(f.node, false);
             f.stalls.repair_finished(f.node);
         };
         let mut f = fixture();
@@ -5141,7 +5185,8 @@ mod definition_fold_tests {
     }
 
     /// A repair is not planned while this member or the peer is catching up: either marker
-    /// alone gates it, and a peer that is not catching up does not.
+    /// alone gates it, the peer's from this contact's block or from what membership holds,
+    /// and a peer that is not catching up does not.
     #[test]
     fn either_side_catching_up_gates_a_repair() {
         use crate::facts::Facts;
@@ -5162,12 +5207,14 @@ mod definition_fold_tests {
             );
         };
         hear(false);
-        assert!(!either_side_is_catching_up(&config, peer), "neither side is");
+        assert_eq!(CatchingUp::of(&config, peer, false), CatchingUp::default(), "neither side is");
+        assert!(CatchingUp::of(&config, peer, true).peer, "this contact's block says it is");
         hear(true);
-        assert!(either_side_is_catching_up(&config, peer), "the peer says it is");
+        assert!(CatchingUp::of(&config, peer, false).peer, "membership holds that it is");
         hear(false);
         catch_up.mark(crate::facts::CatchUpReason::Snapshot).unwrap();
-        assert!(either_side_is_catching_up(&config, peer), "this member's marker is set");
+        let own = CatchingUp::of(&config, peer, false);
+        assert!(own.own && !own.peer && own.either(), "this member's marker is set");
     }
 
     /// A count that cannot be read refuses the repair rather than letting it through.
@@ -5195,6 +5242,31 @@ mod definition_fold_tests {
         assert_eq!(repair_gate(&config, true, 11, 10), RepairGate::CatchingUp, "before size");
         config.divergence_repair = false;
         assert_eq!(repair_gate(&config, true, 11, 10), RepairGate::Disabled, "before all");
+    }
+
+    /// The tick's three repair plans read the catching-up marker the peer's block carried on
+    /// this contact (`outcome.peer_catching_up`) beside what membership holds. No end-to-end
+    /// test sees each plan's share: a count repair's replay planned from a peer catching up
+    /// also waits in `repair_due`, and the document and definition repairs need a confirmed
+    /// digest finding against such a peer. Textual, like the guards above.
+    #[test]
+    fn the_tick_plans_every_repair_with_what_this_contact_said_of_catching_up() {
+        let source = include_str!("peers.rs");
+        let production = source.split("\n#[cfg(test)]").next().unwrap();
+        let code = tick_calls_guard::compact(&tick_calls_guard::without_comments(production));
+        assert_eq!(
+            code.matches("letcatching_up=CatchingUp::of(&config,node,outcome.peer_catching_up);")
+                .count(),
+            1,
+            "the tick reads this contact's block for the plans"
+        );
+        for call in [
+            "plan_count_repairs(&engine,&divergence,&mutstalls,node,peer,catching_up,);",
+            "&digest_confirmed,catching_up,);",
+            "&definition_confirmed,catching_up,);",
+        ] {
+            assert_eq!(code.matches(call).count(), 1, "{call}: planned without it");
+        }
     }
 
     /// The tick plans a document repair from each confirmed digest finding and a definition

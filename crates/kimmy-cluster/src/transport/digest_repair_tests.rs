@@ -31,7 +31,7 @@ fn stalls_at(now: Duration) -> PeerStalls {
 fn due(stalls: &mut PeerStalls, peer: NodeId) -> Option<(CollectionId, Repair)> {
     for _ in 0..3 {
         stalls.tick_opened();
-        if let Some(due) = stalls.repair_due(peer) {
+        if let Some(due) = stalls.repair_due(peer, false) {
             return Some(due);
         }
     }
@@ -764,7 +764,7 @@ fn a_transient_end_is_reported_as_transient() {
 /// One contact with the peer: the loop's `tick_opened`, then the pull's `repair_due`.
 fn contact(stalls: &mut PeerStalls, peer: NodeId) -> Option<(CollectionId, Repair)> {
     stalls.tick_opened();
-    stalls.repair_due(peer)
+    stalls.repair_due(peer, false)
 }
 
 #[test]
@@ -773,12 +773,12 @@ fn a_converge_repair_is_handed_out_every_second_contact_and_never_twice_in_one()
     let p = node(1);
     assert_eq!(stalls.plan_digest_repair(p, C, VersionVector::default()), DigestPlan::Planned);
     stalls.tick_opened();
-    assert_eq!(stalls.repair_due(p), Some((C, Repair::Converge)), "the first contact");
+    assert_eq!(stalls.repair_due(p, false), Some((C, Repair::Converge)), "the first contact");
     // A draining tick pulls again at the same peer: that pull is an ordinary one.
-    assert_eq!(stalls.repair_due(p), None, "a second pull of the contact");
-    assert_eq!(stalls.repair_due(p), None);
+    assert_eq!(stalls.repair_due(p, false), None, "a second pull of the contact");
+    assert_eq!(stalls.repair_due(p, false), None);
     assert_eq!(contact(&mut stalls, p), None, "the contact after a Converge pull is ordinary");
-    assert_eq!(stalls.repair_due(p), None);
+    assert_eq!(stalls.repair_due(p, false), None);
     assert_eq!(contact(&mut stalls, p), Some((C, Repair::Converge)), "and then it resumes");
     assert!(stalls.repairing(p), "the repair is still under way throughout");
 }
@@ -834,7 +834,11 @@ fn a_count_repair_is_not_alternated() {
     let p = node(1);
     assert!(stalls.plan_repair(p, C, Repair::Snapshot));
     assert_eq!(contact(&mut stalls, p), Some((C, Repair::Snapshot)));
-    assert_eq!(stalls.repair_due(p), Some((C, Repair::Snapshot)), "a second pull of the contact");
+    assert_eq!(
+        stalls.repair_due(p, false),
+        Some((C, Repair::Snapshot)),
+        "a second pull of the contact"
+    );
     assert_eq!(contact(&mut stalls, p), Some((C, Repair::Snapshot)), "and the next contact");
 }
 

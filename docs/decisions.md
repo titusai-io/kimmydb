@@ -27865,3 +27865,74 @@ fully built or a gone-only repair (`digest_repair_tests.rs`). Mutation rows (in 
 of the policy table, the young-stamp comparison and its absent-horizon fail-closed, each collector's horizon write, the
 reset, the adoption's `set` for `max`, the cut counts, the ledger's rules (16 rows), and the definition table (22
 rows). Equivalent mutants are named in the test files that pin the clause.
+
+**Addendum, 0.50.0: the count half does not compare against, or repair from, a member catching
+up.** Point 2 holds the document and definition repairs while either member is catching up; the
+count half had no such rule, and a lab round found the gap. A wiped member B fell behind its
+peers' retention horizon and took a whole-database snapshot (394 pages, almost four minutes). A
+snapshot's pages are state B's version vector does not name until the last page grants the
+coverage (ADR-152, ADR-224), so B's position stood still behind both peers, the count gate read
+it as frozen after `FROZEN_CONTACTS` contacts (ADR-145), compared its part-way count of a
+200,000-document collection, confirmed a count divergence on the next probe, and planned the
+count repair from B: a replay B refused as history it holds only as state, then the
+collection's snapshot from B, which landed nothing. A false finding, and a pull of a partial
+state. 0.49.0 does the same, and worse: its fallback for that replay was a whole-database
+snapshot that marked the repairing member catching up (scoped by ADR-236).
+
+- **The gate.** The count probe is deferred while either member of the contact is catching up,
+  whatever the position: the block the peer sends on the contact's `Vectors` (ADR-201) says its
+  marker is set, or this member's own marker is. It is counted under the existing `deferred`
+  outcome of `kimmy_sync_divergence_count_probes_total`; no label or series is added. A deferred
+  probe suspends a confirmed count finding as any deferral does (ADR-236).
+- **The plan.** `plan_count_repairs` plans nothing from a peer that is catching up, and no
+  count finding while this member is. The peer's marker is read from the block this contact
+  carried as well as from what membership holds (`CatchingUp::of`), for all three repairs:
+  membership cannot see a peer it lists under another id (a wiped member SWIM has not renamed
+  yet), one it does not list yet (found by discovery), or a block it refused on ordering. **An
+  existence finding** (a collection the peer holds and this member lacks) is held by the peer's
+  marker only: this member's own would hold the repair that brings a collection its own
+  catch-up cannot, such as one its replay of its own origin stops at.
+- **A repair planned before the marker.** A count repair's replay planned while the peer was
+  not catching up is not handed out on a contact whose block says it is: queued, it stays
+  queued; under way, it stays under way, and the rounds it waits are not counted against it, so
+  it is not abandoned into the cooldown for them. **Only the replay is held.** A snapshot of one
+  collection is handed out (an existence finding's, or the one a pull plans when it stops at a
+  collection this member has no record of): it only adds what this member lacks, and without
+  the stop's snapshot every pull from that peer stops at the same entry. A document or
+  definition repair queued before the marker runs once, as point 2 bounds it.
+- **It ends with the marker.** Once the marker clears by dominance or the mutual clear, the
+  member's vector covers what it holds and the next contact is judged by position alone; a real
+  difference is compared, confirmed and repaired as before
+  (`a_real_count_divergence_is_found_and_repaired_once_the_marker_clears`). A marker an
+  operator removes from a member part-way through a snapshot is set again at its next snapshot
+  round, and one compared mismatch confirms nothing. **A marker that does not clear by itself
+  holds the count half for as long as it stands**, against the member and by it, with the count
+  repairs from it and by it and the existence repairs from it (the document and definition
+  repairs already were): point 2's F7/B1 wedge, which is gated (`503 catching_up`), and the
+  **`unknown`** state (`kimmy_catching_up{reason="unknown"}`: a replay still owed, or no counting
+  peer reached), in which the member serves `200` with its marker still set. The existence half
+  and the cut digest's detection still run against it and by it, so a difference still lights
+  the gauge.
+- **Wire and roll.** No field is added: the block and its `catching_up` have been on every
+  `Vectors` since 0.43.0. A peer before 0.43.0 sends no block and is judged by position, as
+  before. During a roll a 0.49.x member still compares a catching-up member and repairs from it,
+  with its own whole-database fallback, until it is upgraded.
+
+**Tests.** `count_finding_tests.rs`: a member part-way through a real whole-database snapshot is
+probed with no count compared, no finding and no repair; the deferral ends with the marker and a
+real divergence is then found and repaired; the member catching up compares and plans nothing
+itself; the check after a pull defers too; in the loop (`replicate`), a collection a peer
+catching up holds only as snapshot state is not repaired from it until its marker clears; a peer
+membership lists under another id is not repaired from while its block says it is catching up; a
+count repair planned before the peer marks waits, and runs once the marker clears; a member
+catching up still repairs a collection it lacks from a peer that is not; and a pull that stops
+at a collection it lacks takes the collection's snapshot from a peer catching up.
+`transport.rs`: the gate's truth table, and a count repair under way or queued waiting for a
+peer catching up without being abandoned. `peers.rs`: a textual guard that the tick hands this
+contact's flag to all three plans. Mutation rows (in bash, all killed): the gate's clause
+removed, counted as not deferred, or comparing; the peer's block ignored; this member's marker
+ignored; the block's flag never read; each of the two check sites passing `false`; the plan gate
+removed; the loop passing `false` to it; the contact's flag not carried out, or not read by the
+plan; an existence finding held by this member's own marker; the hold of a count repair under
+way, or queued, removed, or counted as a stalled round; a snapshot held like the replay; and the
+fix off as a whole (the pre-fix behaviour).
