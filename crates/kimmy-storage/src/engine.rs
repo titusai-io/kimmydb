@@ -8293,8 +8293,13 @@ mod converted_filters_line {
     }
 }
 
-/// Whole-table clears, held to the bound redb's `retain` breaks (see
-/// `index::clear_index_entries`).
+/// Whole-table clears, held to a bound on how far they grow the file.
+///
+/// These are growth-bound smoke tests, not detectors of redb's `retain`: on redb 4.2 and
+/// later `retain` is no longer measurably worse than removing by key (see
+/// `index::clear_index_entries`), and a `retain` mutant of the arrival-index clear passes
+/// them, at 5,000 documents and at 200,000. They catch a clear that grows the file well
+/// past one rebuild's own need, whatever the cause.
 #[cfg(test)]
 mod clearing {
     use bson::doc;
@@ -8308,7 +8313,7 @@ mod clearing {
         assert!(
             after <= before + before / 4,
             "{what} grew the file from {before} to {after} bytes; a clear that grows the file \
-             is retain's cost, see index::clear_index_entries"
+             past a rebuild's own need is the cost index::clear_index_entries was written to avoid"
         );
     }
 
