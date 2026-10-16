@@ -1068,10 +1068,12 @@ pub async fn run_hybrid_search(
     // The overlap gate applies to the lexical half only. A document it drops
     // here is still in `dense` if the dense half ranked it, and keeps that
     // contribution: the gate removes lexical evidence, not documents.
+    // The filter restricts this half as it does the dense one.
     // Every stored chunk's text tokenized: a walk, off the async worker
     // (ADR-199).
+    let set = allowed.as_ref().map(|a| &a.set);
     let lexical = kimmy_storage::blocking(|| {
-        search::keyword_search(&state.engine, &shadow, &text, &wide, min_overlap)
+        search::keyword_search(&state.engine, &shadow, &text, &wide, min_overlap, set)
     })
     .map_err(vector_error)?;
 

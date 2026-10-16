@@ -1038,11 +1038,22 @@ pub fn insert(
     let _span = op_span("insert", db, Some(coll)).entered();
     let meta = authorize(state, auth, Action::Write, db, coll)?;
     let doc = json_to_document(document)?;
+    let sent = doc.get(kimmy_storage::ID_FIELD).cloned();
     let (id, stamp) = state.engine.insert_stamped(&meta, doc)?;
     Ok(json!({
-        "insertedId": crate::json::bson_to_json(&id.to_bson()),
+        "insertedId": crate::json::bson_to_json(&inserted_id(sent, &id)),
         "stamp": stamp.encode(),
     }))
+}
+
+/// The `_id` an insert reports: the one the client sent, which the engine
+/// stores as sent, or else the ObjectId it generated.
+///
+/// Not `id.to_bson()` for a sent one. The document key folds a binary's
+/// subtype to generic, so a UUID `_id` echoed from it is another value, one
+/// `find {_id: <echo>}` does not match.
+fn inserted_id(sent: Option<bson::Bson>, id: &DocId) -> bson::Bson {
+    sent.unwrap_or_else(|| id.to_bson())
 }
 
 /// Insert many documents in one durable commit, or none of them.
@@ -1073,6 +1084,7 @@ pub fn insert_many(
         .enumerate()
         .map(|(i, value)| json_to_document(value).map_err(|e| at_index(i, e)))
         .collect::<Result<Vec<_>, _>>()?;
+    let sent: Vec<_> = docs.iter().map(|doc| doc.get(kimmy_storage::ID_FIELD).cloned()).collect();
 
     let stamped = state.engine.insert_many_stamped(&meta, docs).map_err(|e| match e.index {
         Some(i) => at_index(i, e.source.into()),
@@ -1086,7 +1098,8 @@ pub fn insert_many(
         "inserted": stamped.len(),
         "insertedIds": stamped
             .iter()
-            .map(|(id, _)| crate::json::bson_to_json(&id.to_bson()))
+            .zip(sent)
+            .map(|((id, _), sent)| crate::json::bson_to_json(&inserted_id(sent, id)))
             .collect::<Vec<_>>(),
         "stamps": stamped.iter().map(|(_, stamp)| stamp.encode()).collect::<Vec<_>>(),
     }))
@@ -1543,7 +1556,11 @@ pub fn find_and_modify(
         "upserted": outcome.upserted.is_some(),
     });
     if let Some(id) = outcome.upserted {
-        body["upsertedId"] = crate::json::bson_to_json(&id.to_bson());
+        // The created document's own `_id`, as `insertedId` is (a binary's
+        // subtype included): `after` is the image the engine stored.
+        let stored = outcome.after.as_ref().and_then(|doc| doc.get(kimmy_storage::ID_FIELD));
+        body["upsertedId"] =
+            crate::json::bson_to_json(&stored.map_or_else(|| id.to_bson(), Clone::clone));
     }
     if let Some(stamp) = outcome.stamp {
         // The version the write produced — what the next conditional write
@@ -1849,19 +1866,37 @@ pub fn violations(
 
     let mut groups = Vec::new();
     for v in live.iter().filter(|v| v.index == name).take(MAX_LIMIT) {
+        let mut ids = Vec::with_capacity(v.ids.len());
         let mut documents = Vec::with_capacity(v.ids.len());
         for id in &v.ids {
-            if let Some(doc) = state.engine.get(&meta, id)? {
-                documents.push(document_to_json(&doc));
-            }
+            let (stored, doc) = stored_id(state, &meta, id)?;
+            ids.push(crate::json::bson_to_json(&stored));
+            documents.extend(doc.as_ref().map(document_to_json));
         }
-        groups.push(json!({
-            "ids": v.ids.iter().map(|id| crate::json::bson_to_json(&id.to_bson())).collect::<Vec<_>>(),
-            "merged": crate::json::bson_to_json(&v.merged.to_bson()),
-            "documents": documents,
-        }));
+        // Usually one of the group; read on its own when it has left it.
+        let merged = match v.ids.iter().position(|id| *id == v.merged) {
+            Some(i) => ids[i].clone(),
+            None => crate::json::bson_to_json(&stored_id(state, &meta, &v.merged)?.0),
+        };
+        groups.push(json!({ "ids": ids, "merged": merged, "documents": documents }));
     }
     Ok(json!({ "index": name, "count": groups.len(), "groups": groups }))
+}
+
+/// The `_id` the document `id` names is stored under, and the document.
+///
+/// A violation names its documents by key, and the key folds a binary's
+/// subtype to generic, so the report reads each one's own `_id` rather than
+/// echoing a value no filter on `_id` matches. A document gone since the
+/// violation was re-evaluated keeps the key's form.
+fn stored_id(
+    state: &SharedState,
+    meta: &CollectionMeta,
+    id: &DocId,
+) -> Result<(bson::Bson, Option<Document>), ApiError> {
+    let doc = state.engine.get(meta, id)?;
+    let stored = doc.as_ref().and_then(|doc| doc.get(kimmy_storage::ID_FIELD)).cloned();
+    Ok((stored.unwrap_or_else(|| id.to_bson()), doc))
 }
 
 pub fn drop_index(

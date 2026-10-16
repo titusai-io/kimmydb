@@ -248,14 +248,28 @@ fn seed(server: &Server) {
 /// vector and shares no term, `z` is second nearest and shares both, `y` is
 /// farthest and shares one — the candidate `min_overlap` gates.
 fn seed_vectors(server: &Server) {
+    seed_vector_documents(
+        server,
+        "notes",
+        &[
+            (bson::doc! { "_id": "x", "text": "green paint" }, [1.0, 0.0, 0.0]),
+            (bson::doc! { "_id": "y", "text": "red apple" }, [0.0, 1.0, 0.0]),
+            (bson::doc! { "_id": "z", "text": "red blue" }, [0.6, 0.0, 0.8]),
+        ],
+    );
+}
+
+/// A `byo` collection `kb.<coll>` holding `rows`: each document, with a
+/// string `_id`, and one chunk of its `text` stored directly with the vector.
+fn seed_vector_documents(server: &Server, coll: &str, rows: &[(bson::Document, [f32; 3])]) {
     use kimmy_core::{ChunkConfig, DocId, Metric, ProviderConfig, VectorConfig, VectorRecord};
 
-    let meta = server.engine.create_collection("kb", "notes").unwrap();
+    let meta = server.engine.create_collection("kb", coll).unwrap();
     server
         .engine
         .configure_vectors(
             "kb",
-            "notes",
+            coll,
             VectorConfig {
                 fields: vec!["text".into()],
                 provider: ProviderConfig::Byo {},
@@ -267,14 +281,11 @@ fn seed_vectors(server: &Server) {
             },
         )
         .unwrap();
-    let shadow = server.engine.vector_collection("kb", "notes").unwrap().unwrap();
-    for (id, vector, text) in [
-        ("x", [1.0, 0.0, 0.0], "green paint"),
-        ("y", [0.0, 1.0, 0.0], "red apple"),
-        ("z", [0.6, 0.0, 0.8], "red blue"),
-    ] {
-        server.engine.insert(&meta, bson::doc! { "_id": id, "text": text }).unwrap();
-        let source = DocId::String(id.to_string());
+    let shadow = server.engine.vector_collection("kb", coll).unwrap().unwrap();
+    for (doc, vector) in rows {
+        let text = doc.get_str("text").unwrap();
+        server.engine.insert(&meta, doc.clone()).unwrap();
+        let source = DocId::String(doc.get_str("_id").unwrap().to_string());
         let stamp = server.engine.document_stamp(&meta, &source).unwrap().unwrap();
         let record = VectorRecord {
             source: source.clone(),
@@ -727,6 +738,81 @@ async fn every_write_tool_reports_the_stamp_it_produced() {
 }
 
 #[tokio::test]
+async fn insert_and_insert_many_echo_the_id_they_stored() {
+    // A binary `_id` keeps its subtype in the echo, where the tools used to
+    // answer every binary as subtype 00, a value `find` does not match; a
+    // generated ObjectId and an integer echo as they always did. Each case's
+    // bytes differ, because a binary is keyed by length and bytes only.
+    let server = Server::start().await;
+    server.engine.create_collection("app", "one").unwrap();
+    server.engine.create_collection("app", "many").unwrap();
+    let root = server.root();
+    let mut sent: Vec<(Value, Value)> = Vec::new();
+    for subtype in [0x00u8, 0x03, 0x04, 0x80] {
+        for len in [16usize, 5] {
+            let bytes = (0..len).map(|i| [subtype, len as u8].get(i).copied().unwrap_or(i as u8));
+            let id = bson::Bson::Binary(bson::Binary {
+                subtype: subtype.into(),
+                bytes: bytes.collect(),
+            })
+            .into_relaxed_extjson();
+            sent.push((id.clone(), id));
+        }
+    }
+    sent.push((json!(7), json!(7)));
+    sent.push((json!({"$numberLong": "9007199254740993"}), json!(9_007_199_254_740_993i64)));
+
+    let find = |collection: &'static str, id: Value| {
+        let (server, root) = (&server, &root);
+        async move {
+            let found = server
+                .call_ok(
+                    root,
+                    "find",
+                    json!({"database":"app","collection":collection,"filter":{"_id": id}}),
+                )
+                .await;
+            found["count"].as_u64().unwrap()
+        }
+    };
+
+    for (id, echoed) in &sent {
+        let inserted = server
+            .call_ok(
+                &root,
+                "insert",
+                json!({"database":"app","collection":"one","document":{"_id": id}}),
+            )
+            .await;
+        assert_eq!(&inserted["insertedId"], echoed, "{id}");
+        assert_eq!(find("one", inserted["insertedId"].clone()).await, 1, "{id}");
+    }
+    let inserted = server
+        .call_ok(&root, "insert", json!({"database":"app","collection":"one","document":{}}))
+        .await;
+    assert!(inserted["insertedId"]["$oid"].is_string(), "{inserted}");
+    assert_eq!(find("one", inserted["insertedId"].clone()).await, 1);
+
+    let mut documents: Vec<Value> = sent.iter().map(|(id, _)| json!({"_id": id})).collect();
+    documents.push(json!({}));
+    let many = server
+        .call_ok(
+            &root,
+            "insert_many",
+            json!({"database":"app","collection":"many","documents":documents}),
+        )
+        .await;
+    let echoed = many["insertedIds"].as_array().expect("insertedIds");
+    assert_eq!(echoed.len(), sent.len() + 1);
+    for (echo, (id, expected)) in echoed.iter().zip(&sent) {
+        assert_eq!(echo, expected, "{id}");
+        assert_eq!(find("many", echo.clone()).await, 1, "{id}");
+    }
+    assert!(echoed[sent.len()]["$oid"].is_string(), "{many}");
+    assert_eq!(find("many", echoed[sent.len()].clone()).await, 1);
+}
+
+#[tokio::test]
 async fn grants_are_scoped_per_collection() {
     let server = Server::start().await;
     seed(&server);
@@ -845,6 +931,44 @@ async fn hybrid_search_takes_the_fusion_controls() {
     let refused = server.call(&token, "hybrid_search", bad).await;
     let message = refused["error"]["message"].as_str().unwrap_or_default();
     assert!(message.contains("min_overlap"), "expected a refusal naming the field: {refused}");
+}
+
+#[tokio::test]
+async fn hybrid_search_v6_the_tool_filter_restricts_the_keyword_half_too() {
+    // V6 through the tool: `b` shares both query terms and is outside the
+    // filter, `a` is the query vector and inside it. The keyword half ranked
+    // every stored chunk, so the tool returned `b` beside `a`. Holds the
+    // tool's `filter` argument to reaching both halves of the shared search.
+    let server = Server::start().await;
+    seed_vector_documents(
+        &server,
+        "tenants",
+        &[
+            (
+                bson::doc! { "_id": "a", "tenant": "a", "text": "quarterly figures public" },
+                [1.0, 0.0, 0.0],
+            ),
+            (
+                bson::doc! { "_id": "b", "tenant": "b", "text": "merger plans confidential" },
+                [0.0, 1.0, 0.0],
+            ),
+        ],
+    );
+    let token = server.root();
+    let result = server
+        .call_ok(
+            &token,
+            "hybrid_search",
+            json!({
+                "database": "kb", "collection": "tenants",
+                "query": "merger confidential", "vector": [1.0, 0.0, 0.0],
+                "filter": { "tenant": "a" },
+            }),
+        )
+        .await;
+    let ids: Vec<&str> =
+        result["matches"].as_array().unwrap().iter().map(|m| m["_id"].as_str().unwrap()).collect();
+    assert_eq!(ids, ["a"], "{result}");
 }
 
 #[tokio::test]

@@ -10,7 +10,7 @@
 //! deliberately unaware that an index exists. See `docs/vectors.md`.
 
 use std::cmp::Ordering;
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
 use kimmy_core::{DocId, Metric, VectorRecord, similarity};
 use kimmy_storage::{CollectionMeta, Engine};
@@ -57,7 +57,7 @@ pub fn vector_search(
     shadow: &CollectionMeta,
     query: &[f32],
     options: &SearchOptions,
-    allowed: Option<&std::collections::HashSet<String>>,
+    allowed: Option<&HashSet<String>>,
 ) -> Result<Vec<Hit>> {
     let mut top = TopK::new(options);
 
@@ -68,9 +68,7 @@ pub fn vector_search(
         if record.vector.len() != query.len() {
             return Ok(true);
         }
-        if let Some(allowed) = allowed
-            && !allowed.contains(&record.source.to_string())
-        {
+        if !admitted(allowed, &record) {
             return Ok(true);
         }
         top.offer(Hit {
@@ -83,6 +81,17 @@ pub fn vector_search(
     })?;
 
     Ok(top.into_hits())
+}
+
+/// Whether a filter's admitted set lets `record` into a search: `None` is no
+/// filter and admits everything.
+///
+/// The one admission check of both halves of a hybrid search, the scan in
+/// [`vector_search`] and the walk in [`keyword_search`], so that the two
+/// cannot admit different documents. A chunk is admitted by its source
+/// document, rendered as the strings the caller's set holds.
+fn admitted(allowed: Option<&HashSet<String>>, record: &VectorRecord) -> bool {
+    allowed.is_none_or(|a| a.contains(&record.source.to_string()))
 }
 
 /// Exact search over the chunks of the named documents only.
@@ -336,15 +345,21 @@ pub fn weighted_reciprocal_rank_fusion(rankings: &[(&[Hit], f32)], limit: usize)
 /// actually looks like — and leaves the rest to the dense half. A query with
 /// fewer distinct terms than `min_overlap` is held to its own count, so a
 /// one-word query is never gated to nothing; `0` is treated as `1`.
+///
+/// `allowed` restricts the ranking to a filter's admitted documents, by the
+/// same check as [`vector_search`], so a filtered hybrid search's two halves
+/// rank the same documents. A set that admits nothing returns nothing without
+/// walking.
 pub fn keyword_search(
     engine: &Engine,
     shadow: &CollectionMeta,
     query: &str,
     options: &SearchOptions,
     min_overlap: usize,
+    allowed: Option<&HashSet<String>>,
 ) -> Result<Vec<Hit>> {
     let terms: Vec<String> = tokenize(query);
-    if terms.is_empty() {
+    if terms.is_empty() || allowed.is_some_and(|a| a.is_empty()) {
         return Ok(Vec::new());
     }
     let mut distinct: Vec<&str> = terms.iter().map(String::as_str).collect();
@@ -354,6 +369,10 @@ pub fn keyword_search(
 
     let mut top = TopK::new(options);
     engine.for_each_vector(shadow, kimmy_storage::WalkScope::Request, |record: VectorRecord| {
+        // Before tokenizing, so an excluded chunk costs nothing more.
+        if !admitted(allowed, &record) {
+            return Ok(true);
+        }
         let haystack = tokenize(&record.text);
         if haystack.is_empty() {
             return Ok(true);
@@ -541,7 +560,8 @@ mod tests {
             (2, 0, [0.0, 1.0], "a slow green turtle"),
         ]);
         let hits =
-            keyword_search(&engine, &shadow, "quick fox", &SearchOptions::default(), 1).unwrap();
+            keyword_search(&engine, &shadow, "quick fox", &SearchOptions::default(), 1, None)
+                .unwrap();
         assert_eq!(ids(&hits), vec![1]);
     }
 
@@ -549,11 +569,12 @@ mod tests {
     fn keyword_search_ignores_punctuation_and_empty_queries() {
         let (engine, shadow, _dir) = setup(&[(1, 0, [1.0, 0.0], "hello, world!")]);
         assert_eq!(
-            ids(&keyword_search(&engine, &shadow, "world", &SearchOptions::default(), 1).unwrap()),
+            ids(&keyword_search(&engine, &shadow, "world", &SearchOptions::default(), 1, None)
+                .unwrap()),
             vec![1]
         );
         assert!(
-            keyword_search(&engine, &shadow, "   ", &SearchOptions::default(), 1)
+            keyword_search(&engine, &shadow, "   ", &SearchOptions::default(), 1, None)
                 .unwrap()
                 .is_empty()
         );
@@ -821,11 +842,12 @@ mod tests {
         let (engine, shadow, _dir) =
             setup(&[(1, 0, [1.0, 0.0], "the red apple"), (2, 0, [0.0, 1.0], "red and blue paint")]);
         let options = SearchOptions::default();
-        let mut loose = ids(&keyword_search(&engine, &shadow, "red blue", &options, 1).unwrap());
+        let mut loose =
+            ids(&keyword_search(&engine, &shadow, "red blue", &options, 1, None).unwrap());
         loose.sort_unstable();
         assert_eq!(loose, vec![1, 2]);
 
-        let strict = keyword_search(&engine, &shadow, "red blue", &options, 2).unwrap();
+        let strict = keyword_search(&engine, &shadow, "red blue", &options, 2, None).unwrap();
         assert_eq!(ids(&strict), vec![2], "one shared term is no longer enough");
     }
 
@@ -836,16 +858,66 @@ mod tests {
 
         // "red red" has one distinct term. A gate of 2 is held to that one, so
         // the single-word query is not gated to nothing...
-        let capped = keyword_search(&engine, &shadow, "red red", &options, 2).unwrap();
+        let capped = keyword_search(&engine, &shadow, "red red", &options, 2, None).unwrap();
         assert_eq!(ids(&capped), vec![1]);
         // ...and a chunk repeating one query term does not count it twice.
         assert!(
-            keyword_search(&engine, &shadow, "red blue", &options, 2).unwrap().is_empty(),
+            keyword_search(&engine, &shadow, "red blue", &options, 2, None).unwrap().is_empty(),
             "three occurrences of one term are one distinct term"
         );
         // Zero is not a meaningful gate and behaves as one.
-        let zero = keyword_search(&engine, &shadow, "red blue", &options, 0).unwrap();
+        let zero = keyword_search(&engine, &shadow, "red blue", &options, 0, None).unwrap();
         assert_eq!(ids(&zero), vec![1]);
+    }
+
+    #[test]
+    fn keyword_search_with_an_admitted_set_ranks_only_admitted_sources() {
+        // Every chunk shares the query term; the filter admitted 1 and 3.
+        let (engine, shadow, _dir) = setup(&[
+            (1, 0, [1.0, 0.0], "red apple"),
+            (2, 0, [0.0, 1.0], "red paint"),
+            (3, 0, [0.0, 1.0], "red car"),
+        ]);
+        let allowed: HashSet<String> = ["1".to_string(), "3".to_string()].into_iter().collect();
+        let options = SearchOptions::default();
+        let hits = keyword_search(&engine, &shadow, "red", &options, 1, Some(&allowed)).unwrap();
+        let mut found = ids(&hits);
+        found.sort_unstable();
+        assert_eq!(found, vec![1, 3]);
+    }
+
+    #[test]
+    fn keyword_search_with_an_empty_admitted_set_returns_nothing() {
+        // A filter that admits nothing returns nothing. The early return for
+        // an empty set is an equivalent mutant: without it the walk's
+        // admission check excludes every chunk anyway, so no test tells the
+        // two apart and it has no mutation row; it only saves the walk.
+        let (engine, shadow, _dir) = setup(&[(1, 0, [1.0, 0.0], "red apple")]);
+        let nothing: HashSet<String> = HashSet::new();
+        let options = SearchOptions::default();
+        assert!(
+            keyword_search(&engine, &shadow, "red", &options, 1, Some(&nothing))
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn keyword_search_excludes_a_source_that_outscores_every_admitted_one() {
+        // Doc 2 matches both terms in a short chunk and ranks first unfiltered;
+        // with one slot and only doc 1 admitted, doc 1 takes it.
+        let (engine, shadow, _dir) = setup(&[
+            (1, 0, [1.0, 0.0], "the board discussed a merger at length"),
+            (2, 0, [0.0, 1.0], "merger confidential"),
+        ]);
+        let options = SearchOptions { k: 1, ..Default::default() };
+        let query = "merger confidential";
+        let unfiltered = keyword_search(&engine, &shadow, query, &options, 1, None).unwrap();
+        assert_eq!(ids(&unfiltered), vec![2], "doc 2 out-scores doc 1");
+
+        let allowed: HashSet<String> = ["1".to_string()].into_iter().collect();
+        let hits = keyword_search(&engine, &shadow, query, &options, 1, Some(&allowed)).unwrap();
+        assert_eq!(ids(&hits), vec![1]);
     }
 
     #[test]

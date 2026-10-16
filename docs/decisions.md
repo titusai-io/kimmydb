@@ -5446,6 +5446,15 @@ and the filter's read is written to become one call to it. Hybrid search's
 lexical half still ignores `filter` — a pre-existing gap this change neither
 widens nor closes.
 
+**Addendum, 2026-10-16: the lexical half admits by the same check, and the gap is
+closed in 0.51.0.** A hybrid search's keyword half walked every chunk and ranked
+the ones that matched, whatever the filter said, so a document the filter excluded
+could be returned and could displace an admitted one. `keyword_search` now takes the
+filter's admitted set, returns nothing for an empty one, and tests admission before
+it tokenises a chunk; the dense half and the keyword half call one function for that
+test, so the two cannot drift apart. Nothing else about the decision changes. The
+CHANGELOG states it under Fixed.
+
 ---
 
 ## ADR-103 — HNSW graphs are built off the lock and live under a budget

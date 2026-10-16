@@ -613,6 +613,9 @@ count have no shared scale.
 Each half is retrieved 4× wider than `k` before fusing, so a document ranked
 moderately by both can beat one ranked first by only one.
 
+`filter` restricts both halves: each ranks only the chunks of the documents the
+filter admits, so a hybrid search never returns a document its filter excludes.
+
 The lexical half is **term overlap, not BM25**. Since RRF only consumes the
 ordering, the absolute scores need not be principled — but a real BM25 would
 rank better on its own. Recorded in [Deviations](deviations.md).
