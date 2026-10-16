@@ -1000,9 +1000,6 @@ pub fn apply_with_vars(
             // the same rules `find`'s sort does — an array sorts by its
             // elements, and a path that crosses one is not fanned out.
             let mut docs = input;
-            for doc in &docs {
-                shape::refuse_unsortable(keys, doc)?;
-            }
             shape::sort(keys, &mut docs);
             docs
         }
@@ -3320,20 +3317,26 @@ mod decimal128 {
     use super::*;
     use bson::doc;
 
+    /// The stage that sorts a pipeline's documents in hand places a decimal
+    /// among the numbers by its value, as `find`'s sort does. It used to
+    /// refuse the pipeline naming the document.
     #[test]
-    fn a_sort_stage_refuses_a_document_it_cannot_place() {
-        // The same refusal `find`'s sort makes, from the stage that sorts a
-        // pipeline's documents in hand.
-        let d = Bson::Decimal128("1.5".parse().unwrap());
-        let input =
-            vec![doc! { "_id": 1, "v": 1 }, doc! { "_id": 2, "v": d }, doc! { "_id": 3, "v": 2 }];
-        let stages = parse(&[doc! { "$sort": { "v": 1 } }]).unwrap();
-        let msg = apply(&stages[0], input.clone(), &Limits::default()).unwrap_err().to_string();
-        assert!(msg.contains("cannot sort by \"v\"") && msg.contains("document 2"), "{msg}");
-        // Sorting by a path the Decimal128 is not on is unaffected.
-        let stages = parse(&[doc! { "$sort": { "_id": -1 } }]).unwrap();
-        let out = apply(&stages[0], input, &Limits::default()).unwrap();
-        assert_eq!(out[0].get_i32("_id").unwrap(), 3);
+    fn a_sort_stage_places_a_decimal128_by_its_value() {
+        let dec = |text: &str| Bson::Decimal128(text.parse().unwrap());
+        let input = vec![
+            doc! { "_id": 1, "v": 1 },
+            doc! { "_id": 2, "v": dec("1.5") },
+            doc! { "_id": 3, "v": 2 },
+            doc! { "_id": 4, "v": dec("0.1") },
+            doc! { "_id": 5, "v": 0.1 },
+        ];
+        let ids = |spec: Document| -> Vec<i32> {
+            let stages = parse(&[doc! { "$sort": spec }]).unwrap();
+            let out = apply(&stages[0], input.clone(), &Limits::default()).unwrap();
+            out.iter().map(|d| d.get_i32("_id").unwrap()).collect()
+        };
+        assert_eq!(ids(doc! { "v": 1 }), vec![4, 5, 1, 2, 3]);
+        assert_eq!(ids(doc! { "v": -1 }), vec![3, 2, 1, 5, 4]);
     }
 }
 
@@ -3491,5 +3494,299 @@ mod lead {
         };
         let Stage::Lookup { join: Join::Pipeline { lead, .. }, .. } = &inner[0] else { panic!() };
         assert!(lead.as_ref().is_some_and(|l| l.key.is_some()));
+    }
+}
+
+/// The grouping identity against the canonical order (ADR-186, amended by the
+/// Decimal128 design, 2.4): two values are one `$group` bucket, one
+/// `$addToSet` member and one set-operator member exactly when `$eq` calls
+/// them equal, a `Decimal128` in every special form included, bare and nested.
+#[cfg(test)]
+mod identity {
+    use std::cmp::Ordering;
+
+    use super::*;
+    use bson::doc;
+    use kimmy_core::canonical_cmp;
+    use proptest::prelude::*;
+
+    fn dec(text: &str) -> Bson {
+        Bson::Decimal128(text.parse().unwrap_or_else(|e| panic!("{text}: {e:?}")))
+    }
+
+    /// A `Decimal128` from its 128 bits, sign first.
+    fn raw(bits: u128) -> Bson {
+        Bson::Decimal128(bson::Decimal128::from_bytes(bits.to_le_bytes()))
+    }
+
+    /// Scalars meant to meet every way two numbers can be one value or two:
+    /// a decimal NaN of either sign, signalling or with a payload, against a
+    /// double NaN; an infinity with payload bits set; a zero in every spelling,
+    /// a non-canonical coefficient and the `11` combination form included;
+    /// cohorts; a decimal equal to an integer above 2^53, to `i64::MAX` and to
+    /// a power of two below one; the extremes; and `0.1` the decimal apart
+    /// from `0.1` the double, which is slightly above a tenth.
+    fn leaves() -> Vec<Bson> {
+        vec![
+            Bson::Double(f64::NAN),
+            raw(0x7c_u128 << 120),
+            raw(0xfc_u128 << 120),
+            raw(0x7e_u128 << 120),
+            raw((0x7c_u128 << 120) | 12_345),
+            Bson::Double(f64::INFINITY),
+            dec("Infinity"),
+            raw((0x78_u128 << 120) | 7),
+            Bson::Double(f64::NEG_INFINITY),
+            dec("-Infinity"),
+            raw((0xf8_u128 << 120) | 7),
+            Bson::Int32(0),
+            Bson::Double(-0.0),
+            dec("0"),
+            dec("-0"),
+            dec("0E-6176"),
+            dec("0E+6111"),
+            dec("-0.000"),
+            raw((1u128 << 113) - 1),
+            raw((0b011_u128 << 125) | 1),
+            Bson::Int32(1),
+            Bson::Double(1.0),
+            dec("1"),
+            dec("1.0"),
+            dec("1.00"),
+            dec("10E-1"),
+            dec("0.1E1"),
+            dec("1.000000000000000000000000000000000"),
+            dec("1.000000000000000000000000000000001"),
+            Bson::Double(0.1),
+            dec("0.1"),
+            dec("0.10"),
+            dec("0.1000000000000000055511151231257827"),
+            Bson::Int64(5),
+            dec("5"),
+            dec("5.000000000000000000000000000000001"),
+            dec("4.999999999999999999999999999999999"),
+            Bson::Double(9_007_199_254_740_992.0),
+            Bson::Int64(9_007_199_254_740_993),
+            dec("9007199254740993"),
+            dec("9007199254740992.0"),
+            Bson::Int64(i64::MAX),
+            dec("9223372036854775807"),
+            Bson::Double(9_223_372_036_854_775_808.0),
+            dec("9223372036854775808"),
+            Bson::Double(2f64.powi(-48)),
+            dec("3.552713678800500929355621337890625E-15"),
+            dec("1E-6176"),
+            Bson::Double(5e-324),
+            dec("9.999999999999999999999999999999999E+6144"),
+            Bson::Double(f64::MAX),
+            Bson::Double(-1.5),
+            dec("-1.50"),
+            dec("-15E-1"),
+            Bson::Null,
+            Bson::Undefined,
+            Bson::String("1".into()),
+            Bson::Symbol("1".into()),
+            Bson::Boolean(true),
+            Bson::MinKey,
+            Bson::MaxKey,
+        ]
+    }
+
+    /// Each leaf bare, and nested where the comparison reaches it: in a
+    /// document, in an array beside another value, in an array in a document,
+    /// and in a scoped JavaScript value, which compares by its scope.
+    fn corpus() -> Vec<Bson> {
+        let mut out = Vec::new();
+        for leaf in leaves() {
+            out.push(Bson::Document(doc! { "a": leaf.clone() }));
+            out.push(Bson::Array(vec![leaf.clone(), Bson::String("s".into())]));
+            out.push(Bson::Document(doc! { "a": [leaf.clone()] }));
+            out.push(Bson::JavaScriptCodeWithScope(bson::JavaScriptCodeWithScope {
+                code: "f".into(),
+                scope: doc! { "a": leaf.clone() },
+            }));
+            out.push(leaf);
+        }
+        out
+    }
+
+    fn equal(a: &Bson, b: &Bson) -> bool {
+        canonical_cmp(a, b) == Ordering::Equal
+    }
+
+    /// Whether a set operator holds `a` and `b` as one member: `[a]` is a
+    /// subset of `[b]`, and the union of the two has one member.
+    fn one_member(a: &Bson, b: &Bson) -> (bool, bool) {
+        static SUBSET: std::sync::LazyLock<Expr> = std::sync::LazyLock::new(|| {
+            Expr::parse(&Bson::Document(doc! { "$setIsSubset": ["$a", "$b"] })).unwrap()
+        });
+        static UNION: std::sync::LazyLock<Expr> = std::sync::LazyLock::new(|| {
+            Expr::parse(&Bson::Document(doc! { "$setUnion": ["$a", "$b"] })).unwrap()
+        });
+        let d = doc! { "a": [a.clone()], "b": [b.clone()] };
+        let subset = SUBSET.eval(&d).unwrap();
+        let union = UNION.eval(&d).unwrap();
+        let Bson::Array(union) = union else { panic!("{union:?}") };
+        (subset == Bson::Boolean(true), union.len() == 1)
+    }
+
+    /// The differential that replaces ADR-186's 9 = 9: on every pair of the
+    /// corpus, the key bytes are equal exactly when `$eq` says equal, and the
+    /// set operators' member agrees with both.
+    #[test]
+    fn group_key_and_the_set_member_are_eq_on_every_pair() {
+        let corpus = corpus();
+        let keys: Vec<Vec<u8>> = corpus.iter().map(group_key).collect();
+        let (mut equal_pairs, mut decimal_equal_pairs) = (0usize, 0usize);
+        for (i, a) in corpus.iter().enumerate() {
+            for (j, b) in corpus.iter().enumerate() {
+                let eq = equal(a, b);
+                assert_eq!(keys[i] == keys[j], eq, "group_key and $eq disagree: {a:?} / {b:?}");
+                if j >= i {
+                    // The set operators are slower to ask; one direction of
+                    // each pair is enough, `$eq` being symmetric.
+                    let (subset, union) = one_member(a, b);
+                    assert_eq!(subset, eq, "$setIsSubset and $eq disagree: {a:?} / {b:?}");
+                    assert_eq!(union, eq, "$setUnion and $eq disagree: {a:?} / {b:?}");
+                }
+                if eq && i != j {
+                    equal_pairs += 1;
+                    if kimmy_core::holds_decimal128(a) != kimmy_core::holds_decimal128(b) {
+                        decimal_equal_pairs += 1;
+                    }
+                }
+            }
+        }
+        // Premises: a corpus with no equal pairs, or none across a decimal and
+        // another type, satisfies every assertion above.
+        assert!(equal_pairs > 400, "premise: {equal_pairs} equal pairs");
+        assert!(decimal_equal_pairs > 150, "premise: {decimal_equal_pairs} across a decimal");
+    }
+
+    fn run(pipeline: Vec<Document>, input: Vec<Document>) -> Vec<Document> {
+        let stages = parse(&pipeline).unwrap();
+        let mut current = input;
+        for stage in &stages {
+            current = apply(stage, current, &Limits::default()).unwrap();
+        }
+        current
+    }
+
+    /// `$group` makes one bucket per class of `$eq`, its `_id` the first member
+    /// seen, and `$addToSet` keeps the same members (design 2.2: `$group` over
+    /// `[Decimal128("1.00"), 1]` reports `_id: Decimal128("1.00")`).
+    #[test]
+    fn a_bucket_is_a_class_of_eq_and_its_id_the_first_member_seen() {
+        let corpus = corpus();
+        let input: Vec<Document> = corpus
+            .iter()
+            .enumerate()
+            .map(|(i, v)| doc! { "i": i as i64, "v": v.clone() })
+            .collect();
+        let mut classes: Vec<&Bson> = Vec::new();
+        for v in &corpus {
+            if !classes.iter().any(|c| equal(c, v)) {
+                classes.push(v);
+            }
+        }
+        let buckets =
+            run(vec![doc! { "$group": { "_id": "$v", "n": { "$sum": 1 } } }], input.clone());
+        assert_eq!(buckets.len(), classes.len());
+        for bucket in &buckets {
+            let id = bucket.get("_id").unwrap();
+            let first = corpus.iter().find(|v| equal(v, id)).unwrap();
+            assert_eq!(format!("{id:?}"), format!("{first:?}"), "the first member seen");
+            let members = corpus.iter().filter(|v| equal(v, id)).count() as i64;
+            assert_eq!(bucket.get_i64("n").unwrap(), members, "{id:?}");
+        }
+        let set = run(vec![doc! { "$group": { "_id": null, "s": { "$addToSet": "$v" } } }], input);
+        let members = set[0].get_array("s").unwrap();
+        assert_eq!(members.len(), classes.len());
+        for (member, class) in members.iter().zip(&classes) {
+            assert_eq!(format!("{member:?}"), format!("{class:?}"), "first-seen order");
+        }
+
+        // The design's worked row.
+        let out = run(
+            vec![doc! { "$group": { "_id": "$v" } }],
+            vec![
+                doc! { "v": dec("1.00") },
+                doc! { "v": 1 },
+                doc! { "v": 1.0 },
+                doc! { "v": dec("1") },
+            ],
+        );
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].get("_id"), Some(&dec("1.00")));
+    }
+
+    /// A number re-spelled as an equal value of another type, or a decimal as
+    /// another member of its cohort, where one exists: the transformations
+    /// that must never change a value's identity.
+    fn respell(value: &Bson, pick: u8) -> Bson {
+        match value {
+            Bson::Int32(n) => match pick % 3 {
+                0 => Bson::Int64(i64::from(*n)),
+                1 => dec(&format!("{n}.000")),
+                _ => Bson::Double(f64::from(*n)),
+            },
+            Bson::Int64(n) => dec(&format!("{n}{}", ".0".repeat(usize::from(pick % 2)))),
+            Bson::Decimal128(d) => {
+                // `c E e` is `c·10^k E (e−k)` while the coefficient has room.
+                let text = d.to_string();
+                if text.contains("NaN") || text.contains("Inf") || text.contains('E') {
+                    return value.clone();
+                }
+                let digits = text.chars().filter(char::is_ascii_digit).count();
+                if digits + 1 > 34 {
+                    return value.clone();
+                }
+                let padded =
+                    if text.contains('.') { format!("{text}0") } else { format!("{text}.0") };
+                dec(&padded)
+            }
+            Bson::Array(items) => {
+                Bson::Array(items.iter().map(|v| respell(v, pick.wrapping_add(1))).collect())
+            }
+            Bson::Document(d) => Bson::Document(
+                d.iter().map(|(k, v)| (k.clone(), respell(v, pick.wrapping_add(1)))).collect(),
+            ),
+            other => other.clone(),
+        }
+    }
+
+    fn any_leaf() -> impl Strategy<Value = Bson> {
+        let fixed = leaves();
+        prop_oneof![
+            (0..fixed.len()).prop_map(move |i| fixed[i].clone()),
+            any::<i32>().prop_map(Bson::Int32),
+            any::<i64>().prop_map(Bson::Int64),
+            (any::<i64>(), -40i32..40).prop_map(|(c, e)| dec(&format!("{c}E{e}"))),
+            (-1000i32..1000).prop_map(|n| Bson::Double(f64::from(n) / 8.0)),
+            any::<u128>().prop_map(raw),
+        ]
+    }
+
+    fn any_value() -> impl Strategy<Value = Bson> {
+        any_leaf().prop_recursive(3, 24, 4, |inner| {
+            prop_oneof![
+                prop::collection::vec(inner.clone(), 0..4).prop_map(Bson::Array),
+                prop::collection::vec(("[ab]", inner), 0..3)
+                    .prop_map(|fields| Bson::Document(fields.into_iter().collect())),
+            ]
+        })
+    }
+
+    proptest! {
+        #[test]
+        fn group_key_is_eq_over_generated_values(a in any_value(), b in any_value(), pick in any::<u8>()) {
+            let same = respell(&a, pick);
+            prop_assert!(equal(&a, &same), "the respelling changed the value: {:?} / {:?}", a, same);
+            prop_assert_eq!(group_key(&a), group_key(&same), "{:?} / {:?}", a, same);
+            prop_assert_eq!(group_key(&a) == group_key(&b), equal(&a, &b), "{:?} / {:?}", a, b);
+            let (subset, union) = one_member(&a, &same);
+            prop_assert!(subset && union, "{:?} / {:?}", a, same);
+            prop_assert_eq!(one_member(&a, &b), (equal(&a, &b), equal(&a, &b)), "{:?} / {:?}", a, b);
+        }
     }
 }

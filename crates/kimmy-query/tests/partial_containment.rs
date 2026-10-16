@@ -97,11 +97,10 @@ fn values() -> Vec<Bson> {
     ]
 }
 
-/// The values a *caller* may write, which excludes every `Decimal128`: the
-/// product refuses one as a filter operand, an index bound, a sort key and an
-/// expression literal, precisely because the order cannot rank it. So a
-/// `Decimal128` reaches the question only as a stored document value, which is
-/// the asymmetry this whole record is about.
+/// The values a partial filter may hold as a bound, which excludes every
+/// `Decimal128`: the product refuses one there (`PartialFilter::parse`). A
+/// query's operands are every value, decimals included ([`values`]): a filter
+/// takes a `Decimal128` operand and compares it by its exact value.
 fn operands() -> Vec<Bson> {
     values().into_iter().filter(|v| !kimmy_core::holds_decimal128(v)).collect()
 }
@@ -157,7 +156,7 @@ fn queries() -> Vec<Document> {
     for path in ["k", "k.a"] {
         out.push(doc! {path: {"$exists": true}});
         out.push(doc! {path: {"$exists": false}});
-        for v in operands() {
+        for v in values() {
             out.push(doc! {path: v.clone()});
             out.push(doc! {path: {"$eq": v.clone()}});
             for op in ["$gt", "$gte", "$lt", "$lte", "$ne"] {
@@ -216,8 +215,10 @@ fn a_chosen_partial_index_holds_every_document_find_returns() {
     assert_eq!(partials.len(), 442, "the partial filters that parse");
     // 20 fewer since a regex among the values of `$in`, `$nin` or `$all`, or
     // as the operand of `$ne`, is refused: two regex operands, five such
-    // queries each, on two paths.
-    assert_eq!(queries.len(), 1_392, "the queries that parse");
+    // queries each, on two paths. 96 more since a `Decimal128` operand is
+    // compared rather than refused: three values holding one, sixteen queries
+    // each, on two paths.
+    assert_eq!(queries.len(), 1_488, "the queries that parse");
     assert_eq!(
         docs.iter().filter(|d| kimmy_core::holds_decimal128(&Bson::Document((*d).clone()))).count(),
         27,

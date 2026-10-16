@@ -57,8 +57,8 @@ pub mod arb;
 ///
 /// Every parser target evaluates what it parsed against these, so a filter
 /// that parses cleanly is also *run* — over arrays, nested documents, a `NaN`,
-/// an infinity, a NUL inside a string, `MinKey`/`MaxKey`, a missing field, and
-/// an empty document. Small on purpose: what matters is that each interesting
+/// an infinity, `Decimal128`s, a NUL inside a string, `MinKey`/`MaxKey`, a
+/// missing field, and an empty document. Small on purpose: what matters is that each interesting
 /// shape appears once, not that there are many of them.
 pub static FIXTURES: LazyLock<Vec<Document>> = LazyLock::new(|| {
     vec![
@@ -88,9 +88,22 @@ pub static FIXTURES: LazyLock<Vec<Document>> = LazyLock::new(|| {
             "min": Bson::MinKey, "max": Bson::MaxKey,
             "ts": bson::Timestamp { time: 1, increment: 2 },
         },
+        // Decimals where the others hold numbers: equal to one (`5`), a tenth
+        // beside the double one, a NaN, and inside an array and a document, so
+        // every filter, update, sort and pipeline the fuzzer builds meets them.
+        doc! {
+            "_id": decimal("7.5"), "qty": decimal("5.00"), "price": decimal("0.1"),
+            "total": decimal("NaN"), "status": "paid", "tags": [decimal("1"), "a", 2.5],
+            "n": [decimal("3"), 1], "nested": { "a": [{ "b": decimal("2.0") }] },
+            "items": [{ "sku": "a", "qty": decimal("9") }],
+        },
         doc! {},
     ]
 });
+
+fn decimal(text: &str) -> Bson {
+    Bson::Decimal128(text.parse().unwrap())
+}
 
 /// A fixed "now" for `$currentDate`, so a harness is a pure function of its
 /// input and a crash reproduces.
@@ -323,7 +336,8 @@ pub fn extended_json_bson(data: &[u8]) {
 /// in `kimmy-core` states the same thing over its own generator; this one
 /// states it over a coverage-guided one, and adds the variants that generator
 /// omits (`Symbol`, `Timestamp`, regular expressions, JavaScript, `Undefined`,
-/// non-generic binary subtypes, and `Decimal128`, which must be *refused*).
+/// non-generic binary subtypes). Every value has a key, a `Decimal128`
+/// included, so an encoder that refuses one is a failure here.
 pub fn key_encoding(data: &[u8]) {
     use kimmy_core::canonical_cmp;
     use kimmy_core::keyenc::{encode, encode_compound_ordered};
@@ -338,10 +352,7 @@ pub fn key_encoding(data: &[u8]) {
     assert_eq!(order, canonical_cmp(&b, &a).reverse(), "canonical_cmp is not antisymmetric");
 
     let (Ok(ea), Ok(eb)) = (encode(&a), encode(&b)) else {
-        // Only `Decimal128` may be refused, and it must be refused wherever
-        // it appears, so a value holding one never becomes half a key.
-        assert!(arb::holds_decimal(&a) || arb::holds_decimal(&b), "encode refused {a:?} / {b:?}");
-        return;
+        panic!("encode refused {a:?} / {b:?}");
     };
 
     assert_eq!(ea.cmp(&eb), order, "encoding disagrees with canonical_cmp for {a:?} vs {b:?}");
@@ -565,6 +576,30 @@ mod tests {
                 harness(input);
             }
         }
+    }
+
+    /// The value targets over pseudo-random bytes, a few thousand inputs on
+    /// the stable path: the generator draws a `Decimal128` as often as any
+    /// number, so the key encoder's order is checked against the comparator
+    /// on decimals here, and not only when the fuzzer runs.
+    #[test]
+    fn the_value_targets_run_clean_over_generated_inputs() {
+        let mut state = 0x9E37_79B9_7F4A_7C15_u64;
+        let mut next = || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state
+        };
+        let mut decimals = 0usize;
+        for _ in 0..4_000 {
+            let bytes: Vec<u8> = (0..64).flat_map(|_| next().to_le_bytes()).collect();
+            key_encoding(&bytes);
+            extended_json_bson(&bytes);
+            let mut u = Unstructured::new(&bytes);
+            decimals += usize::from(kimmy_core::holds_decimal128(&arb::bson(&mut u)));
+        }
+        assert!(decimals > 100, "premise: {decimals} generated values held a Decimal128");
     }
 
     /// The signed paths must actually be reached, or the verifier targets

@@ -946,6 +946,54 @@ async fn find_accepts_the_query_language() {
     assert_eq!(found["documents"][0]["_id"], "c");
 }
 
+/// A `$numberDecimal` operand reaches the `find` tool as a `Decimal128` and is
+/// compared by its exact value, as over REST: it finds the equal numbers of
+/// any type and spelling and nothing else, and a sort places a stored decimal
+/// among the numbers. Both used to be refused.
+#[tokio::test]
+async fn find_compares_a_decimal128_operand_by_its_exact_value() {
+    let server = Server::start().await;
+    seed(&server);
+    let meta = server.engine.get_collection("sales", "orders").unwrap();
+    let dec = |text: &str| bson::Bson::Decimal128(text.parse().unwrap());
+    for (id, total) in [("d", dec("20.00")), ("e", dec("0.1")), ("f", bson::Bson::Double(0.1))] {
+        server
+            .engine
+            .insert(&meta, bson::doc! { "_id": id, "status": "open", "total": total })
+            .unwrap();
+    }
+    let token = server.root();
+    let ids = |found: &Value| -> Vec<Value> {
+        found["documents"].as_array().unwrap().iter().map(|d| d["_id"].clone()).collect()
+    };
+
+    for (filter, want) in [
+        (json!({"total": {"$numberDecimal": "20"}}), json!(["b", "d"])),
+        (json!({"total": {"$gt": {"$numberDecimal": "19.99"}, "$lt": 30}}), json!(["b", "d"])),
+        (json!({"total": {"$numberDecimal": "0.10"}}), json!(["e"])),
+        (json!({"total": 0.1}), json!(["f"])),
+        (json!({"total": {"$ne": {"$numberDecimal": "20"}}}), json!(["a", "c", "e", "f"])),
+    ] {
+        let found = server
+            .call_ok(
+                &token,
+                "find",
+                json!({"database":"sales","collection":"orders","filter":filter}),
+            )
+            .await;
+        assert_eq!(Value::from(ids(&found)), want, "{filter}");
+    }
+
+    let sorted = server
+        .call_ok(
+            &token,
+            "find",
+            json!({"database":"sales","collection":"orders","sort":{"total":1}}),
+        )
+        .await;
+    assert_eq!(Value::from(ids(&sorted)), json!(["e", "f", "a", "b", "d", "c"]));
+}
+
 /// The `find` and `aggregate` tools shape through the same projection as
 /// REST, so a path through an array keeps the array here too (ADR-214).
 #[tokio::test]

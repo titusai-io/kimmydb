@@ -383,26 +383,9 @@ pub fn find(
             // whatever order the matches arrive in.
             let order = with_id_tiebreak(&sort);
             let mut top = TopK::new(window, &order, projection.as_ref());
-            // A match the order has no position for — a Decimal128 where the
-            // sort would read it — refuses the whole query by name, after
-            // the visit: the visitor cannot fail, and offering nothing more
-            // once one is found costs one pass it was making anyway.
-            let mut unsortable: Option<String> = None;
             let stats = visit_matching(state, &meta, &filter, Order::Any, None, |stamp, doc| {
-                if unsortable.is_some() {
-                    return;
-                }
-                // Asked of the stored document, before the projection: a
-                // Decimal128 at a sort path refuses the query whether or not
-                // the page would have carried it.
-                match shape::unsortable(&order, &doc) {
-                    None => top.offer(stamp, doc),
-                    Some(why) => unsortable = Some(why),
-                }
+                top.offer(stamp, doc);
             })?;
-            if let Some(why) = unsortable {
-                return Err(ApiError::bad_request(why));
-            }
             // The window shaped `skip + limit` documents and `skip` of them
             // are dropped here. Nothing cheaper is available: which matches
             // the offset steps over is not known until the sort is done, and
@@ -1409,10 +1392,6 @@ impl kimmy_storage::ModifySpec for Modify<'_> {
 
     fn compare(&self, a: &Document, b: &Document) -> std::cmp::Ordering {
         shape::compare(self.sort, a, b)
-    }
-
-    fn unsortable(&self, doc: &Document) -> Option<String> {
-        shape::unsortable(self.sort, doc)
     }
 
     fn apply(&self, doc: &Document) -> std::result::Result<Option<Document>, String> {
