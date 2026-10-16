@@ -564,10 +564,11 @@ fn apply_entries(
 }
 
 /// A document's `_id` as a log field, or a placeholder for one without.
+///
+/// The value the body holds, not the key's `Display`, which says only
+/// `bin(16 bytes)` for a binary and so names no document an operator can find.
 fn id_of(doc: &Document) -> String {
-    doc.get("_id")
-        .and_then(|v| kimmy_core::DocId::try_from_bson(v).ok())
-        .map_or_else(|| "?".to_string(), |id| id.to_string())
+    doc.get("_id").map_or_else(|| "?".to_string(), ToString::to_string)
 }
 
 /// Persist that these indexes are now multikey, in the caller's transaction.
@@ -4583,6 +4584,22 @@ mod tests {
             }
             assert_eq!(by_index(&engine, &coll, &doc! { "a": 1, "b": 4 }).unwrap(), vec![1]);
             assert_eq!(by_index(&engine, &coll, &doc! { "a": 5 }).unwrap(), Vec::<i64>::new());
+        }
+
+        #[test]
+        fn the_warning_for_a_document_the_index_cannot_key_names_its_id_as_stored() {
+            // The fix the warning asks for needs the document. A binary `_id`
+            // was named by the key's `Display`, `bin(16 bytes)`, which names
+            // none; it is named by its value, subtype and bytes.
+            let (engine, _, _dir) = engine();
+            let coll = compound(&engine, "ab");
+            let uuid =
+                bson::Binary { subtype: bson::spec::BinarySubtype::Uuid, bytes: (0..16).collect() };
+            let logs = crate::log_capture::logs_of(|| {
+                engine.insert(&coll, doc! { "_id": uuid, "a": [1, 2], "b": [3, 4] }).unwrap();
+            });
+            assert!(logs.contains("stored a document this index cannot key"), "{logs}");
+            assert!(logs.contains("id=Binary(0x4, AAECAwQFBgcICQoLDA0ODw==)"), "{logs}");
         }
 
         #[test]

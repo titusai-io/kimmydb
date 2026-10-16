@@ -585,7 +585,10 @@ impl Engine {
             }
         };
         if occupied || seen.is_some_and(|seen| !seen.insert(key.clone())) {
-            return Err(CoreError::DuplicateKey(id.to_string()).into());
+            // Named by the value sent, not by the key's `Display`, which says
+            // only `bin(16 bytes)` for a binary.
+            let named = doc.get(ID_FIELD).map_or_else(|| id.to_string(), ToString::to_string);
+            return Err(CoreError::DuplicateKey(named).into());
         }
 
         // Same transaction as the document write, so the index cannot describe

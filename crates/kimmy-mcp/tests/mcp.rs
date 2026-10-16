@@ -727,6 +727,81 @@ async fn every_write_tool_reports_the_stamp_it_produced() {
 }
 
 #[tokio::test]
+async fn insert_and_insert_many_echo_the_id_they_stored() {
+    // A binary `_id` keeps its subtype in the echo, where the tools used to
+    // answer every binary as subtype 00, a value `find` does not match; a
+    // generated ObjectId and an integer echo as they always did. Each case's
+    // bytes differ, because a binary is keyed by length and bytes only.
+    let server = Server::start().await;
+    server.engine.create_collection("app", "one").unwrap();
+    server.engine.create_collection("app", "many").unwrap();
+    let root = server.root();
+    let mut sent: Vec<(Value, Value)> = Vec::new();
+    for subtype in [0x00u8, 0x03, 0x04, 0x80] {
+        for len in [16usize, 5] {
+            let bytes = (0..len).map(|i| [subtype, len as u8].get(i).copied().unwrap_or(i as u8));
+            let id = bson::Bson::Binary(bson::Binary {
+                subtype: subtype.into(),
+                bytes: bytes.collect(),
+            })
+            .into_relaxed_extjson();
+            sent.push((id.clone(), id));
+        }
+    }
+    sent.push((json!(7), json!(7)));
+    sent.push((json!({"$numberLong": "9007199254740993"}), json!(9_007_199_254_740_993i64)));
+
+    let find = |collection: &'static str, id: Value| {
+        let (server, root) = (&server, &root);
+        async move {
+            let found = server
+                .call_ok(
+                    root,
+                    "find",
+                    json!({"database":"app","collection":collection,"filter":{"_id": id}}),
+                )
+                .await;
+            found["count"].as_u64().unwrap()
+        }
+    };
+
+    for (id, echoed) in &sent {
+        let inserted = server
+            .call_ok(
+                &root,
+                "insert",
+                json!({"database":"app","collection":"one","document":{"_id": id}}),
+            )
+            .await;
+        assert_eq!(&inserted["insertedId"], echoed, "{id}");
+        assert_eq!(find("one", inserted["insertedId"].clone()).await, 1, "{id}");
+    }
+    let inserted = server
+        .call_ok(&root, "insert", json!({"database":"app","collection":"one","document":{}}))
+        .await;
+    assert!(inserted["insertedId"]["$oid"].is_string(), "{inserted}");
+    assert_eq!(find("one", inserted["insertedId"].clone()).await, 1);
+
+    let mut documents: Vec<Value> = sent.iter().map(|(id, _)| json!({"_id": id})).collect();
+    documents.push(json!({}));
+    let many = server
+        .call_ok(
+            &root,
+            "insert_many",
+            json!({"database":"app","collection":"many","documents":documents}),
+        )
+        .await;
+    let echoed = many["insertedIds"].as_array().expect("insertedIds");
+    assert_eq!(echoed.len(), sent.len() + 1);
+    for (echo, (id, expected)) in echoed.iter().zip(&sent) {
+        assert_eq!(echo, expected, "{id}");
+        assert_eq!(find("many", echo.clone()).await, 1, "{id}");
+    }
+    assert!(echoed[sent.len()]["$oid"].is_string(), "{many}");
+    assert_eq!(find("many", echoed[sent.len()].clone()).await, 1);
+}
+
+#[tokio::test]
 async fn grants_are_scoped_per_collection() {
     let server = Server::start().await;
     seed(&server);

@@ -1005,6 +1005,186 @@ async fn a_bulk_insert_with_a_duplicate_id_inserts_nothing() {
     assert_eq!(res.body["count"], 0, "a failed batch must leave the collection empty");
 }
 
+/// A binary `_id` as Extended JSON, rendered by `bson` itself rather than by
+/// the code under test.
+///
+/// The bytes differ per case: a binary is keyed by its length and bytes only,
+/// so `BinData(0, X)` and `BinData(4, X)` are one document key, and two cases
+/// sharing bytes would collide in one collection.
+fn binary_id(subtype: u8, len: usize) -> Value {
+    binary_value(subtype, len).into_relaxed_extjson()
+}
+
+/// [`binary_id`] as BSON.
+fn binary_value(subtype: u8, len: usize) -> bson::Bson {
+    let bytes = (0..len).map(|i| [subtype, len as u8].get(i).copied().unwrap_or(i as u8)).collect();
+    bson::Bson::Binary(bson::Binary { subtype: subtype.into(), bytes })
+}
+
+/// Generic, the legacy and the standard UUID, and a user-defined subtype, each
+/// at a UUID's 16 bytes and at another length.
+fn binary_ids() -> Vec<Value> {
+    [0x00, 0x03, 0x04, 0x80]
+        .into_iter()
+        .flat_map(|subtype| [16, 5].map(|len| binary_id(subtype, len)))
+        .collect()
+}
+
+/// What `find {_id: id}` returns.
+async fn find_by_id(server: &Server, token: &str, coll: &str, id: &Value) -> Vec<Value> {
+    let res = server
+        .post(
+            &format!("/v1/db/shop/coll/{coll}/find"),
+            Some(token),
+            json!({ "filter": {"_id": id} }),
+        )
+        .await;
+    assert_eq!(res.status, 200, "{:?}", res.body);
+    res.body["documents"].as_array().unwrap().clone()
+}
+
+/// An insert, a bulk insert and an upserting `find_and_modify` answer the
+/// `_id` they stored, a binary's subtype included.
+///
+/// The echo was rendered from the document key, which folds every binary to
+/// subtype 00: a UUID `_id` came back as a generic binary of the same bytes,
+/// and `find {_id: <echo>}` then matched nothing, because a filter compares
+/// the subtype the key does not hold.
+#[tokio::test]
+async fn every_insert_route_echoes_the_binary_id_it_stored_with_its_subtype() {
+    let server = Server::start().await;
+    let token = server.root().await;
+    for name in ["one", "bulk", "upsert"] {
+        server.post("/v1/db/shop/collections", Some(&token), json!({ "name": name })).await;
+    }
+    let ids = binary_ids();
+
+    for id in &ids {
+        let res = server.post("/v1/db/shop/coll/one/docs", Some(&token), json!({"_id": id})).await;
+        assert_eq!(res.status, 200, "{id}: {:?}", res.body);
+        assert_eq!(&res.body["insertedId"], id, "insert echoes the value sent");
+        let found = find_by_id(&server, &token, "one", &res.body["insertedId"]).await;
+        assert_eq!(found.len(), 1, "{id}: find by the echo finds the document");
+        assert_eq!(&found[0]["_id"], id);
+    }
+
+    let documents: Vec<Value> = ids.iter().map(|id| json!({"_id": id})).collect();
+    let res = server.post("/v1/db/shop/coll/bulk/bulk", Some(&token), json!(documents)).await;
+    assert_eq!(res.status, 200, "{:?}", res.body);
+    assert_eq!(res.body["insertedIds"], json!(ids), "bulk echoes every value sent, in order");
+    for id in &ids {
+        assert_eq!(find_by_id(&server, &token, "bulk", id).await.len(), 1, "{id}");
+    }
+
+    for id in &ids {
+        let res = server
+            .post(
+                "/v1/db/shop/coll/upsert/find_and_modify",
+                Some(&token),
+                json!({ "filter": {"_id": id}, "update": {"$set": {"n": 1}}, "upsert": true }),
+            )
+            .await;
+        assert_eq!(res.status, 200, "{id}: {:?}", res.body);
+        assert_eq!(res.body["upserted"], true);
+        assert_eq!(&res.body["upsertedId"], id, "an upsert echoes the value it stored");
+        let found = find_by_id(&server, &token, "upsert", &res.body["upsertedId"]).await;
+        assert_eq!(found.len(), 1, "{id}: find by the echo finds the document");
+        assert_eq!(found[0]["n"], 1);
+    }
+}
+
+/// A generated ObjectId and an integer `_id` echo exactly as they did before
+/// the echo was taken from the stored value.
+#[tokio::test]
+async fn a_generated_or_integer_id_echoes_as_before() {
+    let server = Server::start().await;
+    let token = server.root().await;
+    for name in ["one", "bulk", "upsert"] {
+        server.post("/v1/db/shop/collections", Some(&token), json!({ "name": name })).await;
+    }
+    let generated = |echo: &Value| {
+        let hex = echo["$oid"].as_str().unwrap_or_else(|| panic!("an ObjectId: {echo}"));
+        assert_eq!(hex.len(), 24, "{echo}");
+    };
+    // Sent, and echoed: an Int32 and an Int64, plain numbers either way.
+    let integers = [
+        (json!(7), json!(7)),
+        (json!({"$numberInt": "-3"}), json!(-3)),
+        (json!({"$numberLong": "9007199254740993"}), json!(9_007_199_254_740_993i64)),
+    ];
+
+    let res = server.post("/v1/db/shop/coll/one/docs", Some(&token), json!({"k": "gen"})).await;
+    generated(&res.body["insertedId"]);
+    let found = find_by_id(&server, &token, "one", &res.body["insertedId"]).await;
+    assert_eq!(found.len(), 1);
+    assert_eq!(found[0]["k"], "gen");
+    for (sent, echoed) in &integers {
+        let res =
+            server.post("/v1/db/shop/coll/one/docs", Some(&token), json!({"_id": sent})).await;
+        assert_eq!(&res.body["insertedId"], echoed, "{sent}");
+        assert_eq!(find_by_id(&server, &token, "one", echoed).await.len(), 1, "{sent}");
+    }
+
+    let mut documents = vec![json!({"k": "gen"})];
+    documents.extend(integers.iter().map(|(sent, _)| json!({"_id": sent})));
+    let res = server.post("/v1/db/shop/coll/bulk/bulk", Some(&token), json!(documents)).await;
+    assert_eq!(res.status, 200, "{:?}", res.body);
+    let echoed = res.body["insertedIds"].as_array().unwrap();
+    generated(&echoed[0]);
+    assert_eq!(find_by_id(&server, &token, "bulk", &echoed[0]).await[0]["k"], "gen");
+    assert_eq!(echoed[1..], integers.iter().map(|(_, e)| e.clone()).collect::<Vec<_>>());
+
+    let res = server
+        .post(
+            "/v1/db/shop/coll/upsert/find_and_modify",
+            Some(&token),
+            json!({ "filter": {"k": "gen"}, "update": {"$set": {"n": 1}}, "upsert": true }),
+        )
+        .await;
+    generated(&res.body["upsertedId"]);
+    assert_eq!(find_by_id(&server, &token, "upsert", &res.body["upsertedId"]).await[0]["k"], "gen");
+    for (sent, echoed) in &integers {
+        let res = server
+            .post(
+                "/v1/db/shop/coll/upsert/find_and_modify",
+                Some(&token),
+                json!({ "filter": {"_id": sent}, "update": {"$set": {"n": 1}}, "upsert": true }),
+            )
+            .await;
+        assert_eq!(&res.body["upsertedId"], echoed, "{sent}");
+    }
+}
+
+/// A duplicate binary `_id` is refused naming the value, where the message
+/// used to say only `bin(16 bytes)`.
+#[tokio::test]
+async fn a_duplicate_binary_id_is_refused_naming_the_value() {
+    let server = Server::start().await;
+    let token = server.root().await;
+    server.post("/v1/db/shop/collections", Some(&token), json!({"name":"c"})).await;
+    let uuid = binary_id(0x04, 16);
+    let named = format!("Binary(0x4, {})", uuid["$binary"]["base64"].as_str().unwrap());
+
+    let res = server.post("/v1/db/shop/coll/c/docs", Some(&token), json!({"_id": uuid})).await;
+    assert_eq!(res.status, 200, "{:?}", res.body);
+    let res = server.post("/v1/db/shop/coll/c/docs", Some(&token), json!({"_id": uuid})).await;
+    assert_eq!(res.status, 409, "{:?}", res.body);
+    assert_eq!(res.body["error"], "duplicate_key");
+    let message = res.body["message"].as_str().unwrap();
+    assert!(message.contains(&named), "{message}");
+
+    // The same check refuses a duplicate inside one batch.
+    let res =
+        server.post("/v1/db/shop/coll/c/bulk", Some(&token), json!([{"_id": 1}, {"_id": 1}])).await;
+    assert_eq!(res.status, 409, "{:?}", res.body);
+    let res = server
+        .post("/v1/db/shop/coll/c/bulk", Some(&token), json!([{"_id": 2}, {"_id": uuid}]))
+        .await;
+    assert_eq!(res.status, 409, "{:?}", res.body);
+    let message = res.body["message"].as_str().unwrap();
+    assert!(message.contains("index 1") && message.contains(&named), "{message}");
+}
+
 #[tokio::test]
 async fn a_bulk_insert_over_the_cap_is_rejected() {
     let server = Server::start().await;
@@ -3387,6 +3567,64 @@ async fn standing_unique_violations_are_reported_until_resolved() {
     // Read is enough to look; a principal without it is refused.
     let res = server.get("/v1/db/shop/coll/users/violations", None).await;
     assert_eq!(res.status, 401);
+}
+
+/// The violations report names each holder by the `_id` it stored: a UUID
+/// holder with subtype 04, where the report used to fold it to 00.
+///
+/// The peer's entry carries the folded document id, as every replicated
+/// entry does, and its body the UUID: the report reads the holder.
+#[tokio::test]
+async fn a_violation_names_a_uuid_holder_with_its_subtype() {
+    let server = Server::start().await;
+    let token = server.root().await;
+    server.post("/v1/db/shop/collections", Some(&token), json!({"name":"users"})).await;
+    let res = server
+        .post(
+            "/v1/db/shop/coll/users/indexes",
+            Some(&token),
+            json!({ "fields": [{ "path": "email" }], "unique": true }),
+        )
+        .await;
+    assert_eq!(res.status, 200, "{:?}", res.body);
+    let local = bson::Bson::Binary(bson::Binary { subtype: 0x04.into(), bytes: vec![0xaa; 16] })
+        .into_relaxed_extjson();
+    let remote_id = binary_value(0x04, 16);
+    let remote = remote_id.clone().into_relaxed_extjson();
+    let res = server
+        .post(
+            "/v1/db/shop/coll/users/docs",
+            Some(&token),
+            json!({"_id": local, "email": "clash@x"}),
+        )
+        .await;
+    assert_eq!(res.status, 200, "{:?}", res.body);
+
+    let meta = server.state.engine.get_collection("shop", "users").unwrap();
+    let remote_entry = kimmy_core::OplogEntry {
+        stamp: kimmy_core::Stamp::new(
+            kimmy_core::Hlc::new(9_000, 0),
+            kimmy_core::NodeId::generate(),
+        ),
+        kind: kimmy_core::OpKind::Insert,
+        collection: meta.id,
+        doc_id: Some(kimmy_core::DocId::try_from_bson(&remote_id).unwrap()),
+        body: Some(
+            bson::serialize_to_vec(&bson::doc! { "_id": remote_id, "email": "clash@x" }).unwrap(),
+        ),
+    };
+    server.state.engine.apply_remote(&meta, &remote_entry).unwrap();
+
+    let res = server.get("/v1/db/shop/coll/users/violations?index=email_1", Some(&token)).await;
+    assert_eq!(res.body["count"], 1, "{:?}", res.body);
+    let group = &res.body["groups"][0];
+    assert_eq!(group["merged"], remote, "{group}");
+    let ids = group["ids"].as_array().unwrap();
+    assert_eq!(ids.len(), 2, "{group}");
+    assert!(ids.contains(&local) && ids.contains(&remote), "{group}");
+    for id in ids {
+        assert_eq!(find_by_id(&server, &token, "users", id).await.len(), 1, "{id}");
+    }
 }
 
 /// Rewriting a colliding value resolves a violation as surely as deleting the
