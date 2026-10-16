@@ -10,6 +10,7 @@ pub mod cmp;
 pub mod conflict;
 pub mod cursor;
 pub mod ddl;
+pub mod decimal;
 pub mod error;
 pub mod hlc;
 pub mod ids;
