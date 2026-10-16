@@ -9,8 +9,8 @@
 //! One store is opened at a time in a daemon, so the state is process-wide:
 //! an atomic phase, its start, a done and a total. It changes no behaviour of
 //! the open, except that a stop asked for during it ([`request_open_stop`]) is
-//! honoured at the two points that can take it safely: between the migration's
-//! per-index steps (which are resumable, one commit each), and in the
+//! honoured at the two points that can take it safely: between two of the
+//! migration's chunks (which are resumable, one commit each), and in the
 //! verification walk, which is abandoned and simply not recorded.
 
 use std::sync::OnceLock;

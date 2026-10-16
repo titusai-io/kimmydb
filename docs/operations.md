@@ -2715,16 +2715,18 @@ whose filter's path holds a decimal now decides it exactly, and a pair a
 replication merge left, which 0.50 reported once already, is reported once
 more.
 
-**How long it takes.** Measured on a laptop's SSD with the page cache warm, in
-a release build (`examples/schema4_migration`), for documents of about 350 bytes
-with integer `_id`s and three indexes: 1.5 s for 100,000 documents, 5 to 7 s for
-500,000, and 20 to 47 s for 2,000,000, plus under a second for the oplog walk;
-the file grew from 2,411 to 4,096 MiB during the 2,000,000-document run and was
-back to 2,415 MiB once the node closed. The design's estimate for the same
-2,000,000 documents on a spinning disk is 12 to 20 minutes. Re-keying is bound
-by its commits, a disk sync each, so a slower disk costs more than a slower
-CPU; a store whose `_id`s are strings or ObjectIds has no re-key. The oplog
-walk is about 30 s per GB read cold. **Check the deploy tool's per-member
+**How long it takes.** On the lab host's spinning disk, cold, 2,000,000
+documents of about 350 bytes with integer `_id`s and three indexes took **19.3
+minutes** from the container's start to the node answering: 3 minutes moving the
+documents out, 3.3 moving them back, 5.4 draining the three indexes, 6.5
+refilling them, and 1.1 walking the oplog; the next start took a second. Its
+memory peaked at 373 MiB and its file did not grow. On a laptop's SSD with the
+page cache warm the same migration took 20 to 47 s (1.5 s for 100,000
+documents, 5 to 7 s for 500,000); there the file grew from 2,411 to 4,096 MiB
+while it ran and was back to 2,415 MiB once the node closed. Every chunk is a
+commit with a disk sync, so a slower disk costs more than a slower CPU; a store
+whose `_id`s are strings or ObjectIds has no re-key, and one with fewer indexes
+less rebuild. The oplog walk is about 30 s per GB read cold. **Check the deploy tool's per-member
 readiness wait against this before the roll**, and allow for the migration
 and the oplog walk being longer than `storage.oplog_retention_secs`: then the
 member's return is a whole-database snapshot.
