@@ -1751,6 +1751,53 @@ mod tests {
         assert_eq!(none.stats.matched, 0);
     }
 
+    /// The filter's paging hands the executor its own **stored** keys, which the executor
+    /// must take as they are (Decimal128 design 7.2): only a client's token is read as
+    /// legacy, and in `Cursor::decode`. The stored key of `A` below is the schema-4 key of
+    /// `B` (design 6.1), so a resume bound read as legacy here would skip from `A` to past
+    /// `B`. Through a scan and through an index.
+    #[test]
+    fn a_filters_paging_over_integer_ids_resumes_on_the_stored_key() {
+        const A: i64 = 0x5000_0081_0180_0000;
+        const B: i64 = 0x5000_7F80_8101_8000;
+        let dir = tempfile::tempdir().unwrap();
+        let state = live_state(&dir);
+        let source = state.engine.create_collection("app", "docs").unwrap();
+        let ids = [-3i64, 0, 1, 2, A, A + 1, B - 1, B, B + 1, i64::MAX];
+        for id in ids {
+            state.engine.insert(&source, bson::doc! { "_id": id, "tag": 1 }).unwrap();
+        }
+        for indexed in [false, true] {
+            if indexed {
+                state
+                    .engine
+                    .create_index(
+                        "app",
+                        "docs",
+                        vec![kimmy_storage::IndexField::ascending("tag")],
+                        false,
+                        None,
+                    )
+                    .unwrap();
+            }
+            let source = state.engine.get_collection("app", "docs").unwrap();
+            for page in [1, 2, 3, 4, 1_000] {
+                let all =
+                    filter_ids(&state, &source, &parse(bson::doc! { "tag": 1 }), page).unwrap();
+                assert_eq!(all.stats.index.is_some(), indexed);
+                let got: Vec<i64> = all
+                    .ids
+                    .iter()
+                    .map(|id| match id {
+                        DocId::Int64(n) => *n,
+                        other => panic!("{other:?}"),
+                    })
+                    .collect();
+                assert_eq!(got, ids, "page size {page}, indexed {indexed}");
+            }
+        }
+    }
+
     #[test]
     fn the_join_direction_turns_on_the_set_size() {
         assert_eq!(join_for(0), Join::Keyed, "an empty set reads nothing");

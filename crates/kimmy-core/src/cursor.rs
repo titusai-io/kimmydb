@@ -149,4 +149,25 @@ mod tests {
         let id = DocId::String("shared".into());
         assert_eq!(Cursor::from_key(key_of(&id)), Cursor::from_key(key_of(&id)));
     }
+
+    #[test]
+    fn a_token_carries_the_legacy_key_and_reads_back_to_the_stored_one() {
+        let decimal =
+            DocId::try_from_bson(&bson::Bson::Decimal128("1.5".parse().unwrap())).unwrap();
+        for id in [
+            DocId::Int64(5),
+            DocId::Int64(-5),
+            DocId::Int64(0x5000_0081_0180_0000),
+            DocId::String("abc".into()),
+            decimal,
+        ] {
+            let stored = key_of(&id);
+            let token = Cursor::from_key(stored.clone()).encode();
+            let raw = URL_SAFE_NO_PAD.decode(&token).unwrap();
+            assert_eq!(raw, keyenc::legacy_key(&id).into_bytes(), "{id:?}: issued legacy");
+            assert_eq!(Cursor::decode(&token).unwrap().key(), stored, "{id:?}: read stored");
+        }
+        // A marker with no key behind it says "after the beginning": refused, as empty is.
+        assert!(Cursor::decode(&URL_SAFE_NO_PAD.encode([0xFF])).is_err());
+    }
 }

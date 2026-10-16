@@ -3815,3 +3815,6 @@ mod join_differential {
 
 #[cfg(test)]
 mod join_tests;
+
+#[cfg(test)]
+mod token_tests;
