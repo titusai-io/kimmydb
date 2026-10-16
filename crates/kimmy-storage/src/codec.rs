@@ -105,6 +105,8 @@ const DOC_ID_STRING: u8 = 2;
 const DOC_ID_INT64: u8 = 3;
 const DOC_ID_BINARY: u8 = 4;
 const DOC_ID_UUID: u8 = 5;
+/// A `Decimal128` id: its 19 canonical bytes (`DocId`'s `Decimal128Id`).
+const DOC_ID_DECIMAL128: u8 = 6;
 
 pub fn encode_doc_id(id: &DocId, out: &mut Vec<u8>) {
     match id {
@@ -127,6 +129,10 @@ pub fn encode_doc_id(id: &DocId, out: &mut Vec<u8>) {
         DocId::Uuid(u) => {
             out.push(DOC_ID_UUID);
             out.extend_from_slice(u.as_bytes());
+        }
+        DocId::Decimal128(d) => {
+            out.push(DOC_ID_DECIMAL128);
+            out.extend_from_slice(&d.to_bytes());
         }
     }
 }
@@ -153,6 +159,13 @@ pub fn decode_doc_id(input: &mut &[u8]) -> Result<DocId> {
         DOC_ID_UUID => {
             let bytes: [u8; 16] = take(input, 16)?.try_into().expect("16 bytes");
             DocId::Uuid(uuid::Uuid::from_bytes(bytes))
+        }
+        DOC_ID_DECIMAL128 => {
+            let bytes = take(input, kimmy_core::DECIMAL128_ID_LEN)?;
+            DocId::Decimal128(
+                kimmy_core::Decimal128Id::from_bytes(bytes)
+                    .ok_or_else(|| corrupt("document id is not a canonical Decimal128"))?,
+            )
         }
         other => return Err(corrupt(&format!("unknown document id tag {other}"))),
     })
@@ -347,7 +360,13 @@ mod tests {
             DocId::Binary(vec![0, 1, 2, 255]),
             DocId::Binary(Vec::new()),
             DocId::Uuid(uuid::Uuid::new_v4()),
+            DocId::try_from_bson(&bson::Bson::Decimal128("-1.5".parse().unwrap())).unwrap(),
+            DocId::try_from_bson(&bson::Bson::Decimal128("1E+6144".parse().unwrap())).unwrap(),
         ];
+        assert!(
+            ids.iter().filter(|id| matches!(id, DocId::Decimal128(_))).count() == 2,
+            "the fixture must carry decimal ids"
+        );
         for id in ids {
             let mut buf = Vec::new();
             encode_doc_id(&id, &mut buf);

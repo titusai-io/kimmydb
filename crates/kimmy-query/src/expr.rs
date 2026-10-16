@@ -2998,18 +2998,11 @@ pub fn truthy(value: &Bson) -> bool {
 /// `bson` crate's own decoding does. That covers every encoding whose two
 /// bits after the sign are `11` and that is not a `NaN` or an infinity: its
 /// coefficient starts at `2^113`, which is already above the limit.
+///
+/// Read through the one decoder the comparator and the keys use, so truthiness
+/// and the order cannot disagree on what a zero is.
 pub(crate) fn decimal128_is_zero(d: &bson::Decimal128) -> bool {
-    const MAX_COEFFICIENT: u128 = 9_999_999_999_999_999_999_999_999_999_999_999;
-    // BSON stores the 128 bits little-endian; bit 127 is the sign.
-    let bits = u128::from_le_bytes(d.bytes());
-    if (bits >> 122) & 0b1_1110 == 0b1_1110 {
-        return false; // `11110` is an infinity, `11111` a NaN
-    }
-    if (bits >> 125) & 0b11 == 0b11 {
-        return true; // a non-canonical coefficient, read as zero
-    }
-    let coefficient = bits & ((1u128 << 113) - 1);
-    coefficient == 0 || coefficient > MAX_COEFFICIENT
+    matches!(kimmy_core::decimal::decode(d), kimmy_core::decimal::Decimal::Zero)
 }
 
 pub(crate) fn type_name(value: &Bson) -> &'static str {

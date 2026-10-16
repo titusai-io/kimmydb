@@ -32,7 +32,11 @@ pub enum Decimal {
     ///
     /// The pair is *as written*: `1.0` and `1.00` are different pairs of the same
     /// value. [`Decimal::normalized`] gives the canonical pair.
-    Finite { negative: bool, coefficient: u128, exponent: i16 },
+    Finite {
+        negative: bool,
+        coefficient: u128,
+        exponent: i16,
+    },
 }
 
 /// Decode the BID bytes of a `Decimal128`.
@@ -197,6 +201,84 @@ mod tests {
                 decode(&pack(neg, c, e)),
                 Decimal::Finite { negative: neg, coefficient: c, exponent: e }
             );
+        }
+    }
+
+    mod against_the_text {
+        //! The decoder against the `bson` crate's own `Display` and `FromStr`,
+        //! read by the exact parser of the comparator's oracle, which shares no
+        //! code with [`decode`]. Review A re-derived the BID layout by hand; this
+        //! is what checks the code that implements it.
+
+        use num_bigint::BigInt;
+        use proptest::prelude::*;
+
+        use super::*;
+        use crate::cmp::oracle::{Text, any_coefficient, parse_text};
+
+        /// The decoder and the text agree on what `bits` is.
+        fn agree(bits: u128) -> Result<(), TestCaseError> {
+            let d = Decimal128::from_bytes(bits.to_le_bytes());
+            let text = d.to_string();
+            match (decode(&d), parse_text(&text)) {
+                (Decimal::Nan, Text::Nan) => {}
+                (Decimal::PosInfinity, Text::Infinity { negative: false }) => {}
+                (Decimal::NegInfinity, Text::Infinity { negative: true }) => {}
+                (Decimal::Zero, Text::Finite { coefficient, .. }) => {
+                    prop_assert_eq!(coefficient, BigInt::from(0), "{}", text);
+                }
+                (
+                    Decimal::Finite { negative, coefficient, exponent },
+                    Text::Finite { negative: n, coefficient: c, exponent: e },
+                ) => {
+                    prop_assert_eq!(
+                        (negative, BigInt::from(coefficient), i64::from(exponent)),
+                        (n, c, e),
+                        "{}",
+                        text
+                    );
+                }
+                (decoded, read) => prop_assert!(false, "{bits:#034x}: {decoded:?} vs {read:?}"),
+            }
+            Ok(())
+        }
+
+        proptest! {
+            #![proptest_config(ProptestConfig::with_cases(5000))]
+
+            /// Canonical values decode to exactly the pair their text spells, and
+            /// the text parses back to the same bits.
+            #[test]
+            fn a_canonical_value_decodes_to_the_pair_its_text_spells(
+                negative in any::<bool>(),
+                coefficient in prop_oneof![Just(0u128), any_coefficient()],
+                biased in prop_oneof![0u128..12288, Just(0u128), Just(6176u128), Just(12287u128)],
+            ) {
+                let bits = (u128::from(negative) << 127) | (biased << 113) | coefficient;
+                agree(bits)?;
+                let d = Decimal128::from_bytes(bits.to_le_bytes());
+                let back: Decimal128 = d.to_string().parse().unwrap();
+                prop_assert_eq!(back.bytes(), d.bytes(), "{}", d);
+            }
+
+            /// Any 128 bits at all: NaN, infinity, the `11` form and coefficients
+            /// above the limit decode to the class the text names.
+            #[test]
+            fn any_bit_pattern_decodes_to_the_class_its_text_names(
+                bits in any::<u128>(),
+                form in 0u8..4,
+            ) {
+                let bits = match form {
+                    // A zero coefficient, anywhere in the exponent range.
+                    0 => bits & !((1u128 << 113) - 1),
+                    // The two specials and the `11` form.
+                    1 => bits | (0b11 << 125),
+                    // A canonical-looking exponent with any coefficient bits.
+                    2 => bits & !(0b11 << 125),
+                    _ => bits,
+                };
+                agree(bits)?;
+            }
         }
     }
 
