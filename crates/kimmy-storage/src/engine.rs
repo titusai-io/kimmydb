@@ -6121,8 +6121,8 @@ mod tests {
             "migrate.rs",    // runs on the raw database during `Engine::open`
             "migrate_v5.rs", // the schema 5 migration, likewise, a chunk per commit
             "live_walk.rs",  // the open's rebuild of the counts and digests, in chunks
-            "backup.rs",    // restores into a fresh file that no engine has opened
-            "engine.rs",    // `Engine::open` itself, plus the chokepoint
+            "backup.rs",     // restores into a fresh file that no engine has opened
+            "engine.rs",     // `Engine::open` itself, plus the chokepoint
         ];
 
         let src = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
