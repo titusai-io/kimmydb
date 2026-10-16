@@ -11,6 +11,13 @@
 //! no answer. A test that compares the new code against its own caller cannot
 //! show that, because after the move the two are the same code.
 //!
+//! The Decimal128 lifts (0.51.0) were shown the same way, over this corpus with
+//! its decimals: of 288,040 rows, the 72,960 that changed had all been
+//! `refused` (a decimal operand) and now answer, and no other row changed. The
+//! answers they now give are held, without a second commit, by
+//! `a_decimal128_answers_as_the_number_it_equals` and
+//! `every_numeric_comparison_answers_by_exact_value` below.
+//!
 //! ```text
 //! FIND_DIFFERENTIAL_OUT=/tmp/before.tsv cargo test -p kimmy-query \
 //!     --test find_differential -- --ignored      # on the parent commit
@@ -23,6 +30,10 @@ use std::fmt::Write as _;
 use bson::spec::BinarySubtype;
 use bson::{Binary, Bson, Document, doc};
 use kimmy_query::filter;
+
+fn dec(text: &str) -> Bson {
+    Bson::Decimal128(text.parse().unwrap())
+}
 
 fn values() -> Vec<Bson> {
     let oid = bson::oid::ObjectId::parse_str("65a1b2c3d4e5f60718293a4b").unwrap();
@@ -49,6 +60,22 @@ fn values() -> Vec<Bson> {
         Bson::Double(f64::INFINITY),
         Bson::Double(f64::NEG_INFINITY),
         Bson::Decimal128(bson::Decimal128::from_bytes([0; 16])),
+        // Decimals equal to a number above (5, 7.5, zero, the specials and
+        // i64::MAX), one just past 5, one tenth beside the double one tenth,
+        // and one past every double; as stored values and as operands.
+        dec("5"),
+        dec("5.00"),
+        dec("5.000000000000000000000000000000001"),
+        dec("7.5"),
+        dec("-0"),
+        dec("-1"),
+        dec("0.1"),
+        Bson::Double(0.1),
+        dec("9223372036854775807"),
+        dec("1E+400"),
+        dec("NaN"),
+        dec("Infinity"),
+        dec("-Infinity"),
         Bson::String(String::new()),
         Bson::String("5".into()),
         Bson::String("a".into()),
@@ -67,6 +94,9 @@ fn values() -> Vec<Bson> {
         Bson::Array(vec![Bson::Null]),
         Bson::Array(vec![Bson::Document(doc! {"a": 1})]),
         Bson::Array(vec![Bson::Document(doc! {"a": 5}), Bson::Document(doc! {"b": 1})]),
+        Bson::Array(vec![dec("5.0")]),
+        Bson::Array(vec![dec("1"), "x".into()]),
+        Bson::Document(doc! {"a": dec("1.0")}),
         Bson::Binary(Binary { subtype: BinarySubtype::Generic, bytes: vec![1, 2] }),
         Bson::Binary(Binary { subtype: BinarySubtype::Uuid, bytes: vec![0; 16] }),
         Bson::ObjectId(oid),
@@ -181,4 +211,162 @@ fn a_partial_filter_selects_exactly_what_find_returns() {
             );
         }
     }
+}
+
+/// The filters of [`filters`] whose operand is `v`, in the same order.
+fn filters_with(v: &Bson) -> Vec<Document> {
+    let mut out = Vec::new();
+    for path in ["k", "k.a"] {
+        out.push(doc! {path: v.clone()});
+        for op in ["$eq", "$ne", "$gt", "$gte", "$lt", "$lte"] {
+            out.push(doc! {path: {op: v.clone()}});
+        }
+        out.push(doc! {path: {"$in": [v.clone()]}});
+        out.push(doc! {path: {"$nin": [v.clone()]}});
+        out.push(doc! {path: {"$all": [v.clone()]}});
+        out.push(doc! {path: {"$not": {"$gt": v.clone()}}});
+        out.push(doc! {path: {"$gt": v.clone(), "$lt": Bson::MaxKey}});
+        out.push(doc! {path: {"$elemMatch": {"$gte": v.clone()}}});
+    }
+    out
+}
+
+/// The documents of [`docs`] holding `v`, in the same order.
+fn docs_with(v: &Bson) -> Vec<Document> {
+    vec![
+        doc! {"_id": 0, "k": v.clone()},
+        doc! {"_id": 0, "k": {"a": v.clone()}},
+        doc! {"_id": 0, "k": [{"a": v.clone()}]},
+        doc! {"_id": 0, "k": [v.clone(), "x"]},
+    ]
+}
+
+fn answer(filter: &Document, d: &Document) -> &'static str {
+    match filter::parse(filter) {
+        Ok(parsed) => match filter::matches(&parsed, d) {
+            Ok(true) => "1",
+            Ok(false) => "0",
+            Err(_) => "unevaluable",
+        },
+        Err(_) => "refused",
+    }
+}
+
+/// A `Decimal128` behaves, as an operand and as a stored value, exactly as
+/// the number of another type it equals: every filter answers every document
+/// the same with one in place of the other. The numbers' own answers are the
+/// ones this file pinned before a decimal could be an operand, so this holds
+/// the decimal to them.
+#[test]
+fn a_decimal128_answers_as_the_number_it_equals() {
+    let pairs = [
+        (dec("5"), Bson::Int32(5)),
+        (dec("5.00"), Bson::Double(5.0)),
+        (dec("5E0"), Bson::Int64(5)),
+        (dec("7.5"), Bson::Double(7.5)),
+        (dec("-0"), Bson::Double(-0.0)),
+        (Bson::Decimal128(bson::Decimal128::from_bytes([0; 16])), Bson::Int32(0)),
+        (dec("-1"), Bson::Int32(-1)),
+        (dec("NaN"), Bson::Double(f64::NAN)),
+        (dec("Infinity"), Bson::Double(f64::INFINITY)),
+        (dec("-Infinity"), Bson::Double(f64::NEG_INFINITY)),
+        (dec("9223372036854775807"), Bson::Int64(i64::MAX)),
+        (dec("2147483647.0"), Bson::Int32(i32::MAX)),
+        (Bson::Array(vec![dec("5.0")]), Bson::Array(vec![5.into()])),
+        (Bson::Document(doc! {"a": dec("1.0")}), Bson::Document(doc! {"a": 1})),
+    ];
+    let (all_docs, all_filters) = (docs(), filters());
+    let mut compared = 0usize;
+    for (decimal, number) in &pairs {
+        // As the operand, against every document.
+        for (fd, fnum) in filters_with(decimal).iter().zip(filters_with(number).iter()) {
+            for d in &all_docs {
+                assert_eq!(answer(fd, d), answer(fnum, d), "{fd} and {fnum} on {d}");
+                compared += 1;
+            }
+        }
+        // As the stored value, under every filter.
+        for (dd, dnum) in docs_with(decimal).iter().zip(docs_with(number).iter()) {
+            for f in &all_filters {
+                assert_eq!(answer(f, dd), answer(f, dnum), "{f} on {dd} and {dnum}");
+                compared += 1;
+            }
+        }
+    }
+    assert!(compared > 100_000, "premise: {compared} answers compared");
+}
+
+/// The numbers of the corpus by exact value, least first: each inner list is
+/// one value in every type the corpus holds it in. Written by hand, as the
+/// oracle the comparisons are held to.
+fn numeric_classes() -> Vec<Vec<Bson>> {
+    vec![
+        vec![Bson::Double(f64::NAN), dec("NaN")],
+        vec![Bson::Double(f64::NEG_INFINITY), dec("-Infinity")],
+        vec![Bson::Int64(i64::MIN)],
+        vec![Bson::Int32(-1), dec("-1")],
+        vec![
+            Bson::Int32(0),
+            Bson::Double(0.0),
+            Bson::Double(-0.0),
+            dec("-0"),
+            Bson::Decimal128(bson::Decimal128::from_bytes([0; 16])),
+        ],
+        // A tenth, then the double written 0.1, which is slightly above one.
+        vec![dec("0.1")],
+        vec![Bson::Double(0.1)],
+        vec![Bson::Int32(5), Bson::Int64(5), Bson::Double(5.0), dec("5"), dec("5.00")],
+        vec![dec("5.000000000000000000000000000000001")],
+        vec![Bson::Int32(6)],
+        vec![Bson::Double(7.5), dec("7.5")],
+        vec![Bson::Int32(i32::MAX)],
+        vec![Bson::Int64(i64::MAX), dec("9223372036854775807")],
+        // Past every double but the infinity.
+        vec![dec("1E+400")],
+        vec![Bson::Double(f64::INFINITY), dec("Infinity")],
+    ]
+}
+
+/// Every comparison operator, with every number of the corpus as the operand,
+/// against every number of the corpus stored, answers by the exact values
+/// alone: the hand-written order of [`numeric_classes`] says what each must be.
+#[test]
+fn every_numeric_comparison_answers_by_exact_value() {
+    let classes = numeric_classes();
+    // Premise: the oracle covers every number in the corpus.
+    let listed: Vec<String> = classes.iter().flatten().map(|v| format!("{v:?}")).collect();
+    for v in values() {
+        if matches!(v, Bson::Int32(_) | Bson::Int64(_) | Bson::Double(_) | Bson::Decimal128(_)) {
+            assert!(listed.contains(&format!("{v:?}")), "the oracle does not place {v:?}");
+        }
+    }
+    let mut checked = 0usize;
+    for (rs, stored) in classes.iter().enumerate() {
+        for s in stored {
+            let d = doc! {"k": s.clone()};
+            for (ro, operands) in classes.iter().enumerate() {
+                for o in operands {
+                    let want = [
+                        (doc! {"k": o.clone()}, rs == ro),
+                        (doc! {"k": {"$eq": o.clone()}}, rs == ro),
+                        (doc! {"k": {"$ne": o.clone()}}, rs != ro),
+                        (doc! {"k": {"$gt": o.clone()}}, rs > ro),
+                        (doc! {"k": {"$gte": o.clone()}}, rs >= ro),
+                        (doc! {"k": {"$lt": o.clone()}}, rs < ro),
+                        (doc! {"k": {"$lte": o.clone()}}, rs <= ro),
+                        (doc! {"k": {"$in": [o.clone()]}}, rs == ro),
+                        (doc! {"k": {"$nin": [o.clone()]}}, rs != ro),
+                        (doc! {"k": {"$all": [o.clone()]}}, rs == ro),
+                        (doc! {"k": {"$not": {"$lte": o.clone()}}}, rs > ro),
+                    ];
+                    for (f, expected) in want {
+                        let got = answer(&f, &d);
+                        assert_eq!(got, if expected { "1" } else { "0" }, "{f:?} on {d:?}");
+                        checked += 1;
+                    }
+                }
+            }
+        }
+    }
+    assert!(checked > 9_000, "premise: {checked}");
 }

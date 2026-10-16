@@ -189,12 +189,16 @@ pub struct PrimaryKeyPlan {
 ///
 /// # Why a rejected value falls back rather than being dropped
 ///
-/// `try_from_bson` refuses types that cannot be a primary key — `Double`,
-/// `Decimal128`, null. Those are not merely unhelpful: filter equality is
-/// **cross-type within the numeric group**, so `{_id: 5.0}` really does match
-/// a document stored under `Int64(5)`. Dropping such a value would lose that
-/// document silently, so any value this cannot normalize abandons the fast
-/// path for the whole filter and lets the collection scan answer it.
+/// `try_from_bson` refuses types that cannot be a primary key — `Double`, a
+/// `Decimal128` NaN or infinity, null. Those are not merely unhelpful: filter
+/// equality is **cross-type within the numeric group**, so `{_id: 5.0}` really
+/// does match a document stored under `Int64(5)`. Dropping such a value would
+/// lose that document silently, so any value this cannot normalize abandons
+/// the fast path for the whole filter and lets the collection scan answer it.
+///
+/// A finite `Decimal128` is an id, normalized as the write path normalizes it
+/// (an integral one in `i64` range is that `Int64`, any other is one key per
+/// value, whatever its spelling), so it probes the key its document is under.
 pub fn choose_primary_key(filter: &Filter) -> Option<PrimaryKeyPlan> {
     let predicates = extract(filter);
     let bounds = predicates.get(crate::shape::ID_FIELD)?;
@@ -620,6 +624,28 @@ mod tests {
     fn other_predicates_do_not_prevent_the_lookup() {
         let plan = pk(doc! { "_id": 5i64, "status": "new" }).expect("still pinned to one _id");
         assert_eq!(plan.keys.len(), 1);
+    }
+
+    /// A `Decimal128` operand probes the key the write path files its value
+    /// under: an integral one is the `Int64`, any other is its value's one
+    /// key, and a NaN or an infinity, which no id can be, falls back to a scan.
+    #[test]
+    fn a_decimal128_id_probes_the_key_its_value_is_stored_under() {
+        let dec = |text: &str| bson::Bson::Decimal128(text.parse().unwrap());
+        let stored = |v: bson::Bson| {
+            keyenc::encode(&kimmy_core::DocId::try_from_bson(&v).unwrap().to_bson()).unwrap()
+        };
+        assert_eq!(
+            pk(doc! { "_id": dec("5.00") }).unwrap().keys,
+            vec![stored(bson::Bson::Int64(5))]
+        );
+        assert_eq!(pk(doc! { "_id": dec("5.50") }).unwrap().keys, vec![stored(dec("5.5"))]);
+        assert_eq!(pk(doc! { "_id": dec("55E-1") }).unwrap().keys, vec![stored(dec("5.5"))]);
+        let both = pk(doc! { "_id": { "$in": [dec("5.0"), 5i64, dec("0.1")] } }).unwrap();
+        assert_eq!(both.keys.len(), 2, "5.0 and 5 are one probe");
+        for refused in [dec("NaN"), dec("Infinity"), dec("-Infinity")] {
+            assert_eq!(pk(doc! { "_id": refused.clone() }), None, "{refused}");
+        }
     }
 
     /// Every id type that can be a primary key resolves.

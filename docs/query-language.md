@@ -398,55 +398,45 @@ Strings sort after numbers in canonical order (used for *sorting*), but
 comparison operators are type-restricted. Equality, by contrast, *does* span
 numeric types — `5`, `5i64`, and `5.0` are all equal.
 
-**A `Decimal128` cannot be a filter operand.** The canonical order has no
-exact place for one — it ranks equal to every other number, and the key
-encoder refuses it ([Key encoding](key-encoding.md#decimal128-is-refused)) —
-so `{"v": {"$numberDecimal": "1.5"}}` would match every numeric `v` and
-could never use an index. It is refused instead, `400` with a message saying
-a Decimal128 *cannot be compared in a filter*: as a bare equality, under
-`$eq`, `$ne`, `$gt`, `$gte`, `$lt`, `$lte`, `$in`, `$nin` and `$all`, inside
-a document or array literal, under `$not` and `$elemMatch`, and as an `_id`.
-A literal anywhere in a `$expr` expression is refused too, but by the
-expression parser, so that message is the one every expression gives — *a
-Decimal128 literal is not supported in an expression* ([HTTP API](http-api.md#the-json-boundary),
-[Aggregation](aggregation.md#not-supported)). `$type: "decimal"` and
-`$exists` compare nothing and find such documents as ever.
+**Numbers compare by their exact values, a `Decimal128` included.** Every
+number — `int`, `long`, `double` and `decimal` — denotes one exact value, and
+equality, the comparison operators and the [sort order](#sort-and-projection)
+compare those values: `5`, `5i64`, `5.0` and `{"$numberDecimal": "5.00"}` are
+equal, and a decimal sits among the integers and doubles where its value puts
+it. A `Decimal128` is an operand like any other number — a bare equality,
+`$eq`, `$ne`, `$gt`, `$gte`, `$lt`, `$lte`, `$in`, `$nin` and `$all`, inside a
+document or array literal, under `$not` and `$elemMatch`, as an `_id`, and as
+a literal in a `$expr` — and an index over a path holding decimals keys them,
+so a range with decimal bounds is answered from the index.
 
-> ### ⚠ A *stored* `Decimal128` is matched wrongly by a numeric filter, and this is a defect
->
-> Everything above is about the **operand** — the value in the query — and that
-> side is closed: a `Decimal128` there is refused at parse.
->
-> **The stored side is not.** A filter whose operand is an ordinary number still
-> reaches `canonical_cmp` against whatever the document holds, and against a
-> stored `Decimal128` that comparison answers *equal* — to every number. So a
-> document holding one behaves like this, measured:
->
-> | filter, against a document holding `{"v": {"$numberDecimal": "1.5"}}` | result |
-> |---|---|
-> | `{"v": 1}`, `{"v": 999999}`, `{"v": {"$eq": <any number>}}` | **matches** |
-> | `{"v": {"$gte": 999999}}`, `{"v": {"$lte": -999999}}` | **matches** |
-> | `{"v": {"$in": [42]}}` | **matches** |
-> | `{"v": {"$gt": 999999}}`, `{"v": {"$lt": -999999}}` | does not match |
-> | `{"v": {"$ne": 999999}}` | **does not match** |
-> | `{"v": "a string"}` | does not match — type groups still hold |
->
-> **The `$ne` row is the one that bites.** Because the stored value compares
-> equal to every number, `$ne` excludes it against every number — so **a document
-> holding a `Decimal128` cannot be filtered out the ordinary way.** A query
-> written to skip such documents keeps them, and one written to find them finds
-> everything.
->
-> **This is a known defect and not the contract.** It is recorded here so that
-> the behaviour is discoverable, not so that it can be relied on or asserted
-> against: the intended behaviour is for a stored `Decimal128` to have a real
-> position among the numbers, and a fix is tracked as a finding in the project's
-> knowledge base. Until then, **do not store a `Decimal128` in a field you
-> filter on numerically.** Store a `double` or a `long`; `$type: "decimal"` and
-> `$exists` remain the reliable ways to find the ones you already have. The refusal is
-deliberate: through 0.24.0 the same filter was refused only by accident, as
-`unsupported operator "$numberDecimal"`, because the JSON edge did not read
-the wrapper.
+**`0.1` the decimal is not `0.1` the double.** A double holds a binary
+fraction: the double written `0.1` is exactly
+0.1000000000000000055511151231257827021181583404541015625. So, against a
+document holding `{"v": {"$numberDecimal": "0.1"}}`:
+
+| filter | result |
+|---|---|
+| `{"v": {"$numberDecimal": "0.1"}}`, `{"v": {"$numberDecimal": "0.10"}}` | matches: one value, two spellings |
+| `{"v": 0.1}` | does not match |
+| `{"v": {"$lt": 0.1}}`, `{"v": {"$ne": 0.1}}` | matches: the decimal is below the double |
+
+A value a double holds exactly does match: `{"v": {"$numberDecimal": "1.5"}}`
+matches `{"v": 1.5}`. Comparing exact values is the only rule that is
+transitive — rounding the double to the decimal's precision first would make
+`0.1` the decimal equal `0.1` the double, and that double equal
+`0.10000000000000001` the decimal, while the two decimals differ — and a sort
+and an index need a transitive order. MongoDB compares the same way. Store a
+decimal where a value is decimal by nature (money), and compare it with
+decimal operands.
+
+**Before 0.51.0** the order ranked a stored `Decimal128` equal to every number,
+so `{"v": {"$eq": 999999}}`, `{"v": {"$gte": 999999}}` and `{"v": {"$in": [42]}}`
+matched one and `{"v": {"$ne": 999999}}` could not exclude it, and a
+`Decimal128` operand was refused (`cannot be compared in a filter`). Both are
+gone: the results of such filters change, under every command that takes a
+filter — `find`, `count`, `update`, `delete` and `$match`
+([Compatibility](compatibility.md)). `deleteMany({"v": {"$ne": 999999}})`
+now deletes the documents holding a decimal, where it kept them.
 
 ---
 
@@ -460,11 +450,11 @@ both — mixing them is rejected rather than guessed at.
 | `$set` `$unset` | Set / remove, at any dot path |
 | `$setOnInsert` | Set only when an upsert inserts; ignored on a match |
 | `$inc` `$mul` | Arithmetic; a missing field starts at `0` |
-| `$min` `$max` | Set only if smaller / larger, in the [canonical order](#3-comparisons-do-not-cross-type-groups); a `Decimal128` operand is refused, because that order cannot compare one |
+| `$min` `$max` | Set only if smaller / larger, in the [canonical order](#3-comparisons-do-not-cross-type-groups), a `Decimal128` by its exact value: `$max: {v: 5}` over a stored `Decimal128("1.5")` sets `5` |
 | `$push` | Append; `{"$each": [...]}` appends several, with `$position`, `$sort`, `$slice` |
-| `$addToSet` | Append only if not already present, where a member is identified as `$group` identifies a bucket ([ADR-186](decisions.md#adr-186--a-sets-members-are-identified-the-way-group-identifies-a-bucket)): `2` and `2.0` are one, and a `Decimal128` is never the same member as a number; takes `$each`. A `Decimal128` operand is taken, and is the same member only as a `Decimal128` with the same bytes. |
-| `$pull` `$pop` | Remove matching elements / one end. A `$pull` operand holding a `Decimal128` is refused: it would compare equal to every number and remove them all |
-| `$pullAll` | Remove every element equal to **any** value in a list; a `Decimal128` in the list is refused for the same reason |
+| `$addToSet` | Append only if not already present, where a member is identified as `$group` identifies a bucket ([ADR-186](decisions.md#adr-186--a-sets-members-are-identified-the-way-group-identifies-a-bucket)), by value: `2`, `2.0` and `{"$numberDecimal": "2.00"}` are one member, and `0.1` the decimal and `0.1` the double are two; takes `$each` |
+| `$pull` `$pop` | Remove matching elements / one end. Matching is by value, a `Decimal128` included: `$pull: {t: 5}` over `[Decimal128("1"), 2]` keeps both, and `$pull: {t: Decimal128("1")}` removes `1`, `1.0` and `Decimal128("1.00")` |
+| `$pullAll` | Remove every element equal to **any** value in a list, by value as `$pull` matches |
 | `$rename` | Move a field |
 | `$currentDate` | Set to the server's current time |
 | `$[]` / `$[<identifier>]` in a path | Address array elements — see [Positional updates](#positional-updates) |
@@ -866,23 +856,13 @@ It is not the rule `$lookup` follows for a join key, which reads the *first*
 element of a path that crosses an array rather than the least
 ([Aggregation](aggregation.md#lookup)).
 
-**A matching document holding a `Decimal128` at a sort path refuses the
-query.** The canonical order ranks a Decimal128 equal to every other number,
-which is not an order a sort can use: the document would land somewhere among
-the numbers that depended on which of them it happened to be compared with.
-So `find`, `find_and_modify` and an aggregation `$sort` check every document
-they would order before ordering any, and answer `400` — `cannot sort by
-"v": document 3 holds a Decimal128 there` — naming the document rather than
-placing it. `$push`'s `$sort` refuses the same value once the elements are
-spliced in: its by-fields form gives that same message behind a `$push $sort`
-prefix, and its whole-element form gives `$push $sort cannot order an element
-holding a Decimal128`. Either
-way the update is refused and nothing is written. Only the documents the
-filter matched are checked:
-narrow the filter past them, sort by another field, or store the value as a
-double or a long. The same applies to `$min`, `$max`, `$pull` and
-`$pullAll`, which compare their operand and refuse a Decimal128 one;
-`$addToSet` does not compare, and takes one.
+**A `Decimal128` at a sort path takes its place among the numbers**, by its
+exact value: `Decimal128("1.5")` sorts between `1` and `2`, and
+`Decimal128("0.1")` just before the double `0.1`. The order is total, so
+`find`, `find_and_modify`, an aggregation `$sort` and `$push`'s `$sort` order
+every document and element. Until 0.51.0 each of them refused a sort that met
+a decimal, naming the document, because the order ranked one equal to every
+number.
 
 ```javascript
 { "projection": { "item": 1, "qty": 1 } }          // inclusion (+ _id)

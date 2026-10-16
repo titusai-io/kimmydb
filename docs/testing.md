@@ -667,7 +667,7 @@ wrong answer is worse, for the usual reason.
 | `aggregate_parse_run` | pipeline → parse → every stage but `$lookup` run in memory over 36 documents under a low document cap | — |
 | `expr_eval` | aggregation expression → parse → `eval` against each fixture | — |
 | `extended_json_bson` | the HTTP edge's JSON ⇄ BSON, from a JSON body and from a generated BSON value | one round trip reaches a fixed point; the decoder accepts everything the encoder emits |
-| `key_encoding` | the order-preserving key encoder over generated BSON pairs | invariant #1 above, plus equal values encode identically, descending inverts, `canonical_cmp` is antisymmetric, and only `Decimal128` is ever refused |
+| `key_encoding` | the order-preserving key encoder over generated BSON pairs, a `Decimal128` drawn as often as any number | invariant #1 above, plus equal values encode identically, descending inverts, `canonical_cmp` is antisymmetric, and no value is refused |
 | `jwt_local_verify` | HS256 verifier: the raw bytes as a bearer token, and a token signed with the fixture secret over generated claims | — |
 | `jwt_oidc_verify` | OIDC verifier against a fixed in-memory JWKS: the raw bytes, and a token signed with the fixture ES256 key over generated claims | an accepted token yields a federated principal |
 

@@ -128,6 +128,11 @@ fn the_executor_yields_each_candidate_once_and_loses_none() {
         doc! { "name": "n", "k": 7 },
         doc! { "name": { "$lt": "z" }, "k": { "$gte": 6 } },
         doc! { "k": { "$gte": 6 } },
+        // A `Decimal128` operand, compared by its exact value: equal to 7,
+        // just above 5, and a bound past every stored number.
+        doc! { "name": { "$gt": "a" }, "k": Bson::Decimal128("7.00".parse().unwrap()) },
+        doc! { "k": { "$gte": Bson::Decimal128("5.000000000000000000000000000000001".parse().unwrap()) } },
+        doc! { "name": "n", "k": { "$gt": Bson::Decimal128("9".parse().unwrap()) } },
     ];
 
     let mut checked = 0;

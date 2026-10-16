@@ -122,20 +122,11 @@ pub enum ArraySort {
 }
 
 impl ArraySort {
-    /// Refused, rather than sorted, when an element holds a `Decimal128`
-    /// where the order would read it: the canonical order ranks one equal to
-    /// every other number, so it has no position among them to be given.
-    fn sort(&self, items: &mut [Bson]) -> Result<()> {
+    /// Every element has a place in the canonical order, a `Decimal128` among
+    /// the numbers by its exact value, so no array is refused.
+    fn sort(&self, items: &mut [Bson]) {
         match self {
             ArraySort::Whole { descending } => {
-                if items.iter().any(kimmy_core::holds_decimal128) {
-                    return Err(Error::InvalidUpdate(
-                        "$push $sort cannot order an element holding a Decimal128, which cannot \
-                         be compared: it has no exact key encoding in this engine and ranks equal \
-                         to every other number; store a double or a long instead"
-                            .into(),
-                    ));
-                }
                 items.sort_by(|a, b| {
                     let ordering = canonical_cmp(a, b);
                     if *descending { ordering.reverse() } else { ordering }
@@ -149,17 +140,11 @@ impl ArraySort {
                         _ => empty,
                     }
                 }
-                for item in items.iter() {
-                    if let Some(why) = shape::unsortable(keys, as_document(item, &empty)) {
-                        return Err(Error::InvalidUpdate(format!("$push $sort {why}")));
-                    }
-                }
                 items.sort_by(|a, b| {
                     shape::compare(keys, as_document(a, &empty), as_document(b, &empty))
                 });
             }
         }
-        Ok(())
     }
 }
 
@@ -593,24 +578,9 @@ fn parse_op(op: &str, arg: &Bson) -> Result<OpKind> {
         "unset" => OpKind::Unset,
         "inc" => OpKind::Inc(numeric(arg)?),
         "mul" => OpKind::Mul(numeric(arg)?),
-        // These four compare their operand against what is stored — `$min`
-        // and `$max` against the value, `$pull` and `$pullAll` against every
-        // element — and the canonical order ranks a Decimal128 equal to every
-        // other number. Let through, a `$pull` of one would empty an array of
-        // its numbers, silently. `$set` and `$push` take any value; these only
-        // what they can compare. Checked over the whole operand, so a
-        // Decimal128 inside a condition document counts.
-        //
-        // `$addToSet` is not among them: a set's members are identified by
-        // their group key, with a Decimal128 by its bytes, so no comparison
-        // decides membership and a Decimal128 operand is well defined
-        // (ADR-186).
-        "min" | "max" | "pull" | "pullAll" if kimmy_core::holds_decimal128(arg) => {
-            return Err(Error::InvalidUpdate(format!(
-                "${op} cannot compare a Decimal128 operand: it has no exact key encoding in this \
-                 engine and ranks equal to every other number; use $set, or a double or a long"
-            )));
-        }
+        // `$min`, `$max`, `$pull` and `$pullAll` compare their operand with
+        // what is stored through the canonical order, which places a
+        // `Decimal128` by its exact value, so they take any operand.
         "min" => OpKind::Min(arg.clone()),
         "max" => OpKind::Max(arg.clone()),
         "push" => match modifier_document(arg) {
@@ -1015,7 +985,7 @@ fn apply_one(op: &Operation, doc: &mut Document, now_ms: i64) -> Result<()> {
             };
             items.splice(at..at, each.values.iter().cloned());
             if let Some(sort) = &each.sort {
-                sort.sort(&mut items)?;
+                sort.sort(&mut items);
             }
             if let Some(n) = each.slice {
                 slice(&mut items, n);
@@ -1025,9 +995,10 @@ fn apply_one(op: &Operation, doc: &mut Document, now_ms: i64) -> Result<()> {
 
         OpKind::AddToSet(values) => {
             let mut items = as_array(&current, &op.path)?;
-            // Members are identified as `$group` identifies a bucket, not by
-            // the canonical order: a stored `Decimal128` ranks equal to every
-            // number there, so it would swallow the add (ADR-186).
+            // Members are identified as `$group` identifies a bucket, by the
+            // key bytes (ADR-186). The key and the canonical order agree on
+            // every value, a `Decimal128` included; the key is the hashable
+            // form of that one identity.
             let mut keys: HashSet<Vec<u8>> = items.iter().map(group_key).collect();
             for value in values {
                 if keys.insert(group_key(value)) {
@@ -2848,55 +2819,129 @@ mod decimal128 {
         Bson::Decimal128(text.parse().unwrap())
     }
 
-    #[test]
-    fn set_stores_a_decimal128_and_the_comparing_operators_refuse_one() {
-        // `$set` takes any value: a Decimal128 is stored intact, which is
-        // the promise the JSON edge now keeps. `$min` and `$max` compare,
-        // and the canonical order has nothing to compare a Decimal128 with.
-        let mut d = doc! { "_id": 1 };
-        let set = parse(&doc! { "$set": { "amount": dec("9.99") } }).unwrap();
-        apply(&set, &mut d, 0).unwrap();
-        assert_eq!(d.get("amount"), Some(&dec("9.99")));
-
-        for op in ["$min", "$max"] {
-            let msg = parse(&doc! { op: { "amount": dec("1") } }).unwrap_err().to_string();
-            assert!(msg.contains(op) && msg.contains("Decimal128"), "{op}: {msg}");
-            let msg = parse(&doc! { op: { "amount": { "n": dec("1") } } }).unwrap_err().to_string();
-            assert!(msg.contains("Decimal128"), "{op}, nested: {msg}");
-        }
-        assert!(parse(&doc! { "$max": { "amount": 1.5 } }).is_ok());
+    /// `doc` after `update`, which must parse and apply.
+    fn after(update: Document, mut doc: Document) -> Document {
+        let parsed = parse(&update).unwrap_or_else(|e| panic!("refused {update}: {e}"));
+        apply(&parsed, &mut doc, 0).unwrap_or_else(|e| panic!("{update} failed: {e}"));
+        doc
     }
 
     #[test]
-    fn the_pull_operators_refuse_an_operand_they_cannot_compare() {
-        // Each compares its operand against every element; let through, a
-        // `$pull` of a Decimal128 emptied `[1, 2.5, "s", 3]` down to `["s"]`,
-        // silently.
-        for update in [
-            doc! { "$pull": { "xs": dec("1.5") } },
-            doc! { "$pull": { "xs": { "$gt": dec("1.5") } } },
-            doc! { "$pull": { "xs": { "n": dec("1.5") } } },
-            doc! { "$pullAll": { "xs": [1, dec("0")] } },
-        ] {
-            let msg = parse(&update).expect_err("refused").to_string();
-            let op = update.keys().next().unwrap();
-            assert!(msg.contains(op) && msg.contains("Decimal128"), "{update}: {msg}");
-            assert!(msg.contains("ranks equal to every other number"), "{update}: {msg}");
+    fn min_and_max_compare_a_decimal128_by_its_exact_value() {
+        // `$set` takes any value, as ever.
+        let d = after(doc! { "$set": { "amount": dec("9.99") } }, doc! { "_id": 1 });
+        assert_eq!(d.get("amount"), Some(&dec("9.99")));
+
+        // A stored decimal against a number operand (design 2.2: `$max: {v: 5}`
+        // on `Decimal128("1.5")` sets 5; it used to leave it, ranked equal).
+        let v = |d: Document| d.get("v").cloned().unwrap();
+        assert_eq!(v(after(doc! { "$max": { "v": 5 } }, doc! { "v": dec("1.5") })), Bson::Int32(5));
+        assert_eq!(v(after(doc! { "$min": { "v": 5 } }, doc! { "v": dec("1.5") })), dec("1.5"));
+        assert_eq!(v(after(doc! { "$min": { "v": 1 } }, doc! { "v": dec("1.5") })), Bson::Int32(1));
+        assert_eq!(v(after(doc! { "$max": { "v": 1 } }, doc! { "v": dec("1.5") })), dec("1.5"));
+
+        // A decimal operand against a stored number, both ways, and an equal
+        // value in another type leaves the stored one as it is.
+        assert_eq!(v(after(doc! { "$max": { "v": dec("2.5") } }, doc! { "v": 2 })), dec("2.5"));
+        assert_eq!(v(after(doc! { "$min": { "v": dec("2.5") } }, doc! { "v": 2 })), Bson::Int32(2));
+        assert_eq!(v(after(doc! { "$min": { "v": dec("1.99") } }, doc! { "v": 2 })), dec("1.99"));
+        assert_eq!(
+            v(after(doc! { "$max": { "v": dec("2.00") } }, doc! { "v": 2 })),
+            Bson::Int32(2)
+        );
+        assert_eq!(
+            v(after(doc! { "$min": { "v": dec("2.00") } }, doc! { "v": 2.0 })),
+            Bson::Double(2.0)
+        );
+        // 0.1 the decimal is below 0.1 the double, whose exact value is above a tenth.
+        assert_eq!(v(after(doc! { "$min": { "v": dec("0.1") } }, doc! { "v": 0.1 })), dec("0.1"));
+        assert_eq!(
+            v(after(doc! { "$max": { "v": dec("0.1") } }, doc! { "v": 0.1 })),
+            Bson::Double(0.1)
+        );
+        // Past every double, and a NaN below every number.
+        assert_eq!(
+            v(after(doc! { "$max": { "v": dec("1E+400") } }, doc! { "v": f64::MAX })),
+            dec("1E+400")
+        );
+        assert_eq!(v(after(doc! { "$min": { "v": dec("NaN") } }, doc! { "v": -1 })), dec("NaN"));
+        // Nested in a document operand, compared field by field.
+        assert_eq!(
+            v(after(doc! { "$max": { "v": { "n": dec("1.5") } } }, doc! { "v": { "n": 1 } })),
+            Bson::Document(doc! { "n": dec("1.5") })
+        );
+        assert_eq!(
+            v(after(doc! { "$max": { "v": { "n": dec("0.5") } } }, doc! { "v": { "n": 1 } })),
+            Bson::Document(doc! { "n": 1 })
+        );
+    }
+
+    /// `$inc` and `$mul` are arithmetic, which this change leaves as it was: a
+    /// decimal operand is refused at parse and a stored decimal at apply.
+    #[test]
+    fn inc_and_mul_on_a_decimal128_are_what_they_were() {
+        for op in ["$inc", "$mul"] {
+            let msg = parse(&doc! { op: { "v": dec("1") } }).unwrap_err().to_string();
+            assert!(msg.contains("requires a number"), "{op}: {msg}");
+            let parsed = parse(&doc! { op: { "v": 1 } }).unwrap();
+            let msg = apply(&parsed, &mut doc! { "v": dec("1.5") }, 0).unwrap_err().to_string();
+            assert!(msg.contains("non-numeric field"), "{op}: {msg}");
         }
-        // The same operators over a double behave as ever.
-        let mut d = doc! { "_id": 1, "xs": [1, 2.5, "s", 3] };
-        let pull = parse(&doc! { "$pull": { "xs": 2.5 } }).unwrap();
-        apply(&pull, &mut d, 0).unwrap();
-        assert_eq!(d.get_array("xs").unwrap().len(), 3);
-        let add = parse(&doc! { "$addToSet": { "xs": { "$each": [3, 9.9] } } }).unwrap();
-        apply(&add, &mut d, 0).unwrap();
-        assert_eq!(d.get_array("xs").unwrap().len(), 4);
+    }
+
+    #[test]
+    fn pull_and_pull_all_remove_by_exact_value() {
+        // Design 2.2: `$pull: {t: 5}` on `[Decimal128("1"), 2]` keeps the decimal;
+        // it used to remove it, ranked equal to 5.
+        let t = |d: Document| d.get_array("t").unwrap().clone();
+        assert_eq!(
+            t(after(doc! { "$pull": { "t": 5 } }, doc! { "t": [dec("1"), 2] })),
+            vec![dec("1"), Bson::Int32(2)]
+        );
+        // A decimal operand removes every element equal to its value, in any
+        // type and spelling, and nothing else: it used to be refused, and before
+        // that it emptied the array of its numbers.
+        let stored =
+            || doc! { "t": [1, 1.0, dec("1.00"), 2, dec("0.1"), 0.1, "1", [1], { "n": 1 }] };
+        assert_eq!(
+            t(after(doc! { "$pull": { "t": dec("1") } }, stored())),
+            vec![
+                Bson::Int32(2),
+                dec("0.1"),
+                Bson::Double(0.1),
+                Bson::String("1".into()),
+                Bson::Array(vec![Bson::Int32(1)]),
+                Bson::Document(doc! { "n": 1 }),
+            ]
+        );
+        assert_eq!(t(after(doc! { "$pull": { "t": dec("0.10") } }, stored())).len(), 8);
+        assert!(!t(after(doc! { "$pull": { "t": dec("0.10") } }, stored())).contains(&dec("0.1")));
+        assert_eq!(t(after(doc! { "$pull": { "t": 0.1 } }, stored())).len(), 8);
+        assert!(t(after(doc! { "$pull": { "t": 0.1 } }, stored())).contains(&dec("0.1")));
+        // Inside a document or array operand, compared by contents.
+        assert_eq!(t(after(doc! { "$pull": { "t": { "n": dec("1.0") } } }, stored())).len(), 8);
+        assert_eq!(t(after(doc! { "$pull": { "t": [dec("1E0")] } }, stored())).len(), 8);
+
+        assert_eq!(
+            t(after(doc! { "$pullAll": { "t": [dec("2.0"), dec("0.1")] } }, stored())),
+            vec![
+                Bson::Int32(1),
+                Bson::Double(1.0),
+                dec("1.00"),
+                Bson::Double(0.1),
+                Bson::String("1".into()),
+                Bson::Array(vec![Bson::Int32(1)]),
+                Bson::Document(doc! { "n": 1 }),
+            ]
+        );
+        // A value equal to nothing stored removes nothing.
+        assert_eq!(t(after(doc! { "$pullAll": { "t": [dec("3"), dec("1.000000000000000000000000000000001")] } }, stored())).len(), 9);
     }
 
     #[test]
     fn add_to_set_identifies_members_as_group_does_against_stored_elements() {
-        // A stored `Decimal128` ranks equal to every number in the canonical
-        // order, so the 5 was judged present and dropped (ADR-186).
+        // A stored `Decimal128` is a member only of its own value: the 5 is
+        // added beside a stored `Decimal128("1")` (ADR-186).
         let mut d = doc! { "_id": 1, "t": [dec("1")] };
         let add = parse(&doc! { "$addToSet": { "t": 5 } }).unwrap();
         apply(&add, &mut d, 0).unwrap();
@@ -2955,22 +3000,28 @@ mod decimal128 {
     }
 
     #[test]
-    fn push_sort_refuses_an_element_it_cannot_place() {
-        // Whole elements, and documents sorted by a field: either way the
-        // element has no position among the numbers, and the update says so
-        // rather than leaving it somewhere.
-        let mut d = doc! { "_id": 1, "xs": [3, dec("2")], "ds": [{ "n": 3 }, { "n": dec("2") }] };
-        let whole = parse(&doc! { "$push": { "xs": { "$each": [1], "$sort": 1 } } }).unwrap();
-        let msg = apply(&whole, &mut d.clone(), 0).unwrap_err().to_string();
-        assert!(msg.contains("$push $sort") && msg.contains("Decimal128"), "{msg}");
-        let by_field =
-            parse(&doc! { "$push": { "ds": { "$each": [{ "n": 1 }], "$sort": { "n": 1 } } } })
-                .unwrap();
-        let msg = apply(&by_field, &mut d.clone(), 0).unwrap_err().to_string();
-        assert!(msg.contains("$push $sort") && msg.contains("Decimal128"), "{msg}");
-        // The same pushes without a sort append as ever.
-        let plain = parse(&doc! { "$push": { "xs": { "$each": [1] } } }).unwrap();
-        apply(&plain, &mut d, 0).unwrap();
-        assert_eq!(d.get_array("xs").unwrap().len(), 3);
+    fn push_sort_places_a_decimal128_by_its_value() {
+        // Whole elements, and documents sorted by a field: either way a decimal
+        // element takes its place among the numbers. It used to refuse the
+        // update.
+        let d = doc! { "_id": 1, "xs": [3, dec("2.5")], "ds": [{ "n": 3 }, { "n": dec("2.5") }] };
+        let whole = doc! { "$push": { "xs": { "$each": [dec("0.1"), 0.1, 2], "$sort": 1 } } };
+        assert_eq!(
+            after(whole, d.clone()).get_array("xs").unwrap(),
+            &vec![dec("0.1"), Bson::Double(0.1), Bson::Int32(2), dec("2.5"), Bson::Int32(3)]
+        );
+        let descending = doc! { "$push": { "xs": { "$each": [dec("3.5")], "$sort": -1 } } };
+        assert_eq!(
+            after(descending, d.clone()).get_array("xs").unwrap(),
+            &vec![dec("3.5"), Bson::Int32(3), dec("2.5")]
+        );
+        let by_field = doc! { "$push": { "ds": { "$each": [{ "n": 2 }, { "n": dec("2.75") }], "$sort": { "n": 1 } } } };
+        let ns: Vec<Bson> = after(by_field, d)
+            .get_array("ds")
+            .unwrap()
+            .iter()
+            .map(|e| e.as_document().unwrap().get("n").unwrap().clone())
+            .collect();
+        assert_eq!(ns, vec![Bson::Int32(2), dec("2.5"), dec("2.75"), Bson::Int32(3)]);
     }
 }

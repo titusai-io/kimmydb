@@ -334,10 +334,10 @@ impl Op {
 
 /// The type a `$convert` produces.
 ///
-/// The seven of MongoDB's targets the engine can hold. `decimal` is refused at
-/// parse: `Decimal128` has no exact key encoding here (ADR-005), so a value
-/// converted to it could be neither indexed nor grouped, and producing one
-/// would only move the refusal somewhere less obvious.
+/// Seven of MongoDB's targets. `decimal` is refused at parse, for the reason
+/// in [`DECIMAL_TARGET_REASON`]: producing a `Decimal128` from a double needs a
+/// rounding rule this build does not have. Comparing, grouping and indexing a
+/// `Decimal128` are not the reason; all three take one by its exact value.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ConvertTo {
     Double,
@@ -350,29 +350,16 @@ pub enum ConvertTo {
 }
 
 /// Why `decimal` is not a conversion target, in the words `$convert` and
-/// `$toDecimal` both refuse with (ADR-005).
-const DECIMAL_TARGET_REASON: &str = "Decimal128 has no exact key encoding in this engine, so the \
-     result could be neither indexed nor grouped; convert to double or long instead";
-
-/// Refuse a `Decimal128` literal, wherever an expression would hold one.
+/// `$toDecimal` both refuse with.
 ///
-/// The reason `$convert` refuses `decimal` as a target, met from the other
-/// side: a Decimal128 has no exact key encoding here (ADR-005) and ranks
-/// equal to every other number in `canonical_cmp`, so a comparison against
-/// one would hold for every number and a value computed from one could be
-/// neither indexed nor grouped. Recursive, because a document or array
-/// literal is compared by its contents.
-fn refuse_decimal_literal(value: &Bson) -> Result<()> {
-    if kimmy_core::holds_decimal128(value) {
-        return Err(Error::InvalidQuery(
-            "a Decimal128 literal is not supported in an expression: it has no exact key \
-             encoding in this engine and ranks equal to every other number, so nothing compared \
-             with it or computed from it could be exact; write a double or a long instead"
-                .into(),
-        ));
-    }
-    Ok(())
-}
+/// A conversion to `Decimal128` must round: a double's exact binary value can
+/// run to about 767 significant digits and a `Decimal128` holds 34, so `0.1`
+/// the double has no `Decimal128` equal to it. Which rounding to apply is a
+/// decision about decimal arithmetic, which this build does not make; until it
+/// does, producing one would pick a rule silently.
+const DECIMAL_TARGET_REASON: &str = "converting to Decimal128 needs a rounding rule, because a \
+     double's exact binary value can run to about 767 significant digits and a Decimal128 holds \
+     34, and this build has none; convert to double or long instead";
 
 impl ConvertTo {
     /// `to` as written: a type name or its numeric BSON code, both as `$type`
@@ -971,10 +958,7 @@ impl Expr {
             }),
             Bson::Document(doc) => Self::parse_document(doc, declared),
             Bson::Array(items) => Self::parse_array(items, declared),
-            other => {
-                refuse_decimal_literal(other)?;
-                Ok(Expr::Literal(other.clone()))
-            }
+            other => Ok(Expr::Literal(other.clone())),
         }
     }
 
@@ -1117,7 +1101,6 @@ impl Expr {
                     });
                 };
                 if op == Op::Literal {
-                    refuse_decimal_literal(raw)?;
                     return Ok(Expr::Op(op, vec![Expr::Literal(raw.clone())]));
                 }
                 let args = Self::parse_args(op, raw, declared)?;
@@ -2402,11 +2385,13 @@ fn range(args: &[Bson]) -> Result<Bson> {
 //
 // The set operators read each array as the set of its distinct members, and
 // two values are one member exactly when `$eq` says they are equal: when
-// `canonical_cmp` ranks them `Equal`. So `1`, `1.0` and `1_i64` are one
-// member, every `NaN` is one, `0.0` and `-0.0` are one, `null` and
-// `undefined` are one, and two documents are one only with their keys in the
-// same order. A `Decimal128` anywhere in an input is refused, because that
-// order ranks one equal to every other number (ADR-207).
+// `canonical_cmp` ranks them `Equal`. So `1`, `1.0`, `1_i64` and
+// `Decimal128("1.00")` are one member, every `NaN` (a decimal one too) is
+// one, `0.0` and `-0.0` are one, `null` and `undefined` are one, and two
+// documents are one only with their keys in the same order. `Decimal128("0.1")`
+// and the double `0.1` are two: they are different numbers. This is the
+// identity `$group` and `$addToSet` take from the key bytes (ADR-186), which
+// agree with `canonical_cmp` on every value (ADR-207).
 //
 // A result is in **first-seen order**: the members as they first appear,
 // reading the arguments left to right and each array from its start, and the
@@ -2416,8 +2401,8 @@ fn range(args: &[Bson]) -> Result<Bson> {
 // builds from two integers.
 
 /// A value ordered by [`canonical_cmp`], so an ordered set of them holds one
-/// entry per member. With every `Decimal128` refused before one is built, the
-/// order is total and its `Equal` is an equivalence.
+/// entry per member. The order is total, a `Decimal128` placed by its exact
+/// value, and its `Equal` is an equivalence.
 struct Member<'a>(&'a Bson);
 
 impl PartialEq for Member<'_> {
@@ -2447,8 +2432,7 @@ type Members<'a> = std::collections::BTreeSet<Member<'a>>;
 ///
 /// Every argument's type is checked before a null is honoured, so a
 /// non-array is refused wherever it stands; a set has no first argument that
-/// could hide the others. A `Decimal128` anywhere in an array is refused once
-/// no argument is null — the point where it would be compared.
+/// could hide the others.
 fn set_inputs(op: Op, args: &[Bson]) -> Result<Option<Vec<&[Bson]>>> {
     let mut arrays = Vec::with_capacity(args.len());
     let mut null = false;
@@ -2460,17 +2444,6 @@ fn set_inputs(op: Op, args: &[Bson]) -> Result<Option<Vec<&[Bson]>>> {
     }
     if null {
         return Ok(None);
-    }
-    for (i, items) in arrays.iter().enumerate() {
-        if items.iter().any(kimmy_core::holds_decimal128) {
-            return Err(Error::InvalidQuery(format!(
-                "{} cannot compare a Decimal128 (argument {} holds one): the canonical order \
-                 ranks a Decimal128 equal to every other number, so set membership would be \
-                 wrong; store a double or a long",
-                op.name(),
-                i + 1
-            )));
-        }
     }
     Ok(Some(arrays))
 }
@@ -2552,8 +2525,6 @@ fn set_is_subset(args: &[Bson]) -> Result<Bson> {
 /// no true element and no false one, so it is `false` and `true`.
 ///
 /// A `Decimal128` element is read like any number: false when it is a zero.
-/// Unlike the set operators, nothing here compares two values, so the
-/// canonical order's trouble with a `Decimal128` does not arise.
 fn element_truth(op: Op, value: &Bson) -> Result<Bson> {
     let Some(items) = as_array(op, value)? else {
         return Ok(Bson::Null);
@@ -4671,13 +4642,18 @@ mod tests {
 
     #[test]
     fn convert_to_decimal_is_refused_with_a_reason() {
-        // Decimal128 has no exact key encoding here (ADR-005), so a value
-        // converted to it could be neither indexed nor grouped.
+        // A conversion to Decimal128 needs a rounding rule for a double, which
+        // this build does not have. Comparing one is not the reason: a
+        // Decimal128 compares, groups and indexes by its exact value.
         let by_name = Expr::parse(&doc! {"$convert": {"input": 1, "to": "decimal"}}.into());
         let by_code = Expr::parse(&doc! {"$convert": {"input": 1, "to": 19}}.into());
         for result in [by_name, by_code] {
             let msg = result.expect_err("decimal must be refused").to_string();
-            assert!(msg.contains("Decimal128"), "the refusal should say why: {msg}");
+            assert!(
+                msg.contains("Decimal128") && msg.contains("rounding rule"),
+                "the refusal should say why: {msg}"
+            );
+            assert!(!msg.contains("key encoding"), "the old reason is gone: {msg}");
         }
     }
 
@@ -4697,9 +4673,10 @@ mod tests {
             assert!(matches!(err, Error::UnsupportedOperator { .. }), "{err:?}");
             assert_eq!(
                 err.to_string(),
-                "unsupported operator \"$toDecimal\": Decimal128 has no exact key encoding in \
-                 this engine, so the result could be neither indexed nor grouped; convert to \
-                 double or long instead"
+                "unsupported operator \"$toDecimal\": converting to Decimal128 needs a rounding \
+                 rule, because a double's exact binary value can run to about 767 significant \
+                 digits and a Decimal128 holds 34, and this build has none; convert to double or \
+                 long instead"
             );
             assert!(err.to_string().ends_with(reason), "{err} vs {convert}");
         }
@@ -5441,33 +5418,77 @@ mod and_or_nested {
 #[cfg(test)]
 mod decimal128 {
     use super::*;
-    use bson::doc;
+    use bson::{bson, doc};
 
+    fn b(text: &str) -> Bson {
+        Bson::Decimal128(dec(text))
+    }
+
+    /// A `Decimal128` literal is a value like any other, wherever an expression
+    /// holds one: bare, as `$literal`, and inside a document or array literal.
+    /// It used to be refused at parse, because the order ranked one equal to
+    /// every number.
     #[test]
-    fn a_decimal128_literal_is_refused_wherever_an_expression_would_hold_one() {
-        // The mirror of `$convert` refusing `decimal` as a target: a literal
-        // Decimal128 would compare equal to every number and could be
-        // neither indexed nor grouped, so it is refused at parse — bare, as
-        // `$literal`, and inside a document or array literal.
-        let d = Bson::Decimal128("1.5".parse().unwrap());
-        for expr in [
-            Bson::Document(doc! { "$eq": ["$v", d.clone()] }),
-            Bson::Document(doc! { "$literal": d.clone() }),
-            Bson::Document(doc! { "$literal": { "n": d.clone() } }),
-            Bson::Document(doc! { "$in": [d.clone(), "$tags"] }),
-            Bson::Document(doc! { "$add": ["$v", d.clone()] }),
-            Bson::Document(doc! { "n": d.clone() }),
-            Bson::Array(vec![Bson::Int32(1), d.clone()]),
-            d.clone(),
+    fn a_decimal128_literal_is_held_as_the_value_it_is() {
+        let none = doc! {};
+        for (expr, want) in [
+            (b("1.5"), b("1.5")),
+            (Bson::Document(doc! { "$literal": b("1.5") }), b("1.5")),
+            (Bson::Document(doc! { "$literal": { "n": b("1.5") } }), bson!({ "n": b("1.5") })),
+            (Bson::Document(doc! { "n": b("1.5") }), bson!({ "n": b("1.5") })),
+            (Bson::Array(vec![Bson::Int32(1), b("1.5")]), bson!([1, b("1.5")])),
         ] {
-            let Err(err) = Expr::parse(&expr) else { panic!("{expr:?} should be refused") };
-            let msg = err.to_string();
-            assert!(
-                msg.contains("Decimal128 literal"),
-                "{expr:?}: the refusal should say why: {msg}"
-            );
+            let parsed = Expr::parse(&expr).unwrap_or_else(|e| panic!("{expr:?}: {e}"));
+            assert_eq!(parsed.eval(&none).unwrap(), want, "{expr:?}");
         }
-        assert!(Expr::parse(&Bson::Document(doc! { "$eq": ["$v", 1.5] })).is_ok());
+        // Arithmetic on a `Decimal128` is not part of this: `$add` refuses one,
+        // a literal as a stored value, when it evaluates.
+        let add = Expr::parse(&Bson::Document(doc! { "$add": ["$v", b("1.5")] })).unwrap();
+        let msg = add.eval(&doc! { "v": 1 }).unwrap_err().to_string();
+        assert!(msg.contains("$add needs numbers, found a Decimal128"), "{msg}");
+    }
+
+    /// Every comparison an expression makes reads a `Decimal128` by its exact
+    /// value, literal or stored (design 2.2: `$expr: {$eq: ["$v", 5]}` against
+    /// `Decimal128("1.5")` is false; it used to be true).
+    #[test]
+    fn every_expression_comparison_reads_a_decimal128_by_its_exact_value() {
+        let at = |expr: Bson, v: Bson| -> Bson {
+            Expr::parse(&expr)
+                .unwrap_or_else(|e| panic!("{expr:?}: {e}"))
+                .eval(&doc! { "v": v.clone(), "xs": [1, b("2.5"), 0.1] })
+                .unwrap_or_else(|e| panic!("{expr:?} on {v:?}: {e}"))
+        };
+        let t = Bson::Boolean(true);
+        let f = Bson::Boolean(false);
+        // A stored decimal against a number literal.
+        assert_eq!(at(bson!({ "$eq": ["$v", 5] }), b("1.5")), f);
+        assert_eq!(at(bson!({ "$ne": ["$v", 5] }), b("1.5")), t);
+        assert_eq!(at(bson!({ "$eq": ["$v", 1.5] }), b("1.5")), t);
+        assert_eq!(at(bson!({ "$gt": ["$v", 1] }), b("1.5")), t);
+        assert_eq!(at(bson!({ "$gte": ["$v", 999_999] }), b("1.5")), f);
+        assert_eq!(at(bson!({ "$lte": ["$v", -999_999] }), b("1.5")), f);
+        assert_eq!(at(bson!({ "$lt": ["$v", 2] }), b("1.5")), t);
+        // A decimal literal against a stored number, and against a stored decimal.
+        assert_eq!(at(bson!({ "$eq": ["$v", b("5.00")] }), Bson::Int64(5)), t);
+        assert_eq!(at(bson!({ "$eq": ["$v", b("0.1")] }), Bson::Double(0.1)), f);
+        assert_eq!(at(bson!({ "$lt": ["$v", b("0.1")] }), Bson::Double(0.1)), f);
+        assert_eq!(at(bson!({ "$gt": ["$v", b("0.1")] }), Bson::Double(0.1)), t);
+        assert_eq!(at(bson!({ "$eq": ["$v", b("0.10")] }), b("0.1")), t);
+        assert_eq!(at(bson!({ "$gt": ["$v", b("1E+400")] }), Bson::Double(f64::MAX)), f);
+        // `$cmp`, the `$in` expression and `$indexOfArray`.
+        assert_eq!(at(bson!({ "$cmp": ["$v", 5] }), b("1.5")), Bson::Int32(-1));
+        assert_eq!(at(bson!({ "$cmp": ["$v", b("1.50")] }), Bson::Double(1.5)), Bson::Int32(0));
+        assert_eq!(at(bson!({ "$cmp": ["$v", b("0.1")] }), Bson::Double(0.1)), Bson::Int32(1));
+        assert_eq!(at(bson!({ "$in": ["$v", "$xs"] }), b("1.0")), t);
+        assert_eq!(at(bson!({ "$in": ["$v", "$xs"] }), b("0.1")), f);
+        assert_eq!(at(bson!({ "$in": ["$v", "$xs"] }), Bson::Int32(5)), f);
+        assert_eq!(at(bson!({ "$in": [b("2.50"), "$xs"] }), Bson::Null), t);
+        assert_eq!(at(bson!({ "$indexOfArray": ["$xs", b("2.5")] }), Bson::Null), Bson::Int64(1));
+        assert_eq!(at(bson!({ "$indexOfArray": ["$xs", 2.5] }), Bson::Null), Bson::Int64(1));
+        assert_eq!(at(bson!({ "$indexOfArray": ["$xs", b("0.1")] }), Bson::Null), Bson::Int64(-1));
+        assert_eq!(at(bson!({ "$indexOfArray": ["$xs", "$v"] }), b("1")), Bson::Int64(0));
+        assert_eq!(at(bson!({ "$indexOfArray": ["$xs", "$v"] }), b("7")), Bson::Int64(-1));
     }
 
     fn dec(text: &str) -> bson::Decimal128 {
@@ -5767,7 +5788,8 @@ mod sets_and_pairs {
         assert_eq!(ok(doc! { "$setIsSubset": [[[1]], [1]] }), false.into());
     }
 
-    /// Every way two values can be one member or two, without a Decimal128.
+    /// Every way two values can be one member or two, a `Decimal128` joining
+    /// the number it equals and `0.1` the decimal apart from `0.1` the double.
     fn corpus() -> Vec<Bson> {
         vec![
             Bson::Double(f64::NAN),
@@ -5787,6 +5809,15 @@ mod sets_and_pairs {
             Bson::Array(vec![Bson::Int32(1)]),
             Bson::Array(vec![Bson::Double(1.0)]),
             Bson::Boolean(true),
+            dec("1.00"),
+            dec("-NaN"),
+            dec("-0E-100"),
+            dec("0.1"),
+            Bson::Double(0.1),
+            dec("Infinity"),
+            Bson::Double(f64::INFINITY),
+            Bson::Document(doc! { "a": dec("1"), "b": dec("2.0") }),
+            Bson::Array(vec![dec("1E0")]),
         ]
     }
 
@@ -5795,8 +5826,10 @@ mod sets_and_pairs {
         let corpus = corpus();
         let got = on(doc! { "$setUnion": ["$v"] }, doc! { "v": corpus.clone() });
         let Bson::Array(got) = got else { panic!("{got:?}") };
-        // NaN, 1, 0, null, two documents, the string, [1] and true: nine.
-        assert_eq!(got.len(), 9, "{got:?}");
+        // NaN, 1, 0, null, two documents, the string, [1] and true, then the
+        // decimal 0.1, the double 0.1 and infinity: twelve. Each decimal
+        // equal to one of the first nine joins it.
+        assert_eq!(got.len(), 12, "{got:?}");
         // Pairwise, no two members are `$eq`, and every corpus value is `$eq`
         // to exactly one member, which is its first appearance.
         for (i, x) in got.iter().enumerate() {
@@ -5831,29 +5864,44 @@ mod sets_and_pairs {
         Bson::Decimal128(text.parse().unwrap())
     }
 
+    /// A `Decimal128` in a set input is a member by its value, nested or not.
+    /// It used to be refused (ADR-207), because the order ranked one equal to
+    /// every number: `[Decimal128("5")]` was a subset of `[1]`.
     #[test]
-    fn a_decimal128_anywhere_in_a_set_input_is_refused() {
-        // The canonical order ranks a Decimal128 equal to every number, so
-        // `[Decimal128("5")]` would be a subset of `[1]`.
+    fn a_decimal128_in_a_set_input_is_a_member_by_its_value() {
+        let d = doc! {
+            "one": [1],
+            "five": [dec("5")],
+            "five_and_one": [5, 1],
+            "ones": [1, dec("1.0")],
+            "one_dec": [dec("1.00")],
+            "nested_dec": [{ "n": dec("5") }, [2, dec("5")]],
+            "nested_num": [[2.0, 5_i64], { "n": 5 }],
+            "mixed": [1, dec("2"), dec("0.1")],
+            "two_tenth": [2, 0.1],
+        };
+        assert_eq!(on(doc! { "$setIsSubset": ["$five", "$one"] }, d.clone()), false.into());
+        assert_eq!(on(doc! { "$setIsSubset": ["$five", "$five_and_one"] }, d.clone()), true.into());
+        assert_eq!(on(doc! { "$setEquals": ["$ones", "$one_dec"] }, d.clone()), true.into());
+        assert_eq!(on(doc! { "$setEquals": ["$five", "$one"] }, d.clone()), false.into());
+        exactly(
+            &on(doc! { "$setUnion": ["$one", "$five", "$ones"] }, d.clone()),
+            &[Bson::Int32(1), dec("5")],
+        );
+        exactly(
+            &on(doc! { "$setIntersection": ["$nested_dec", "$nested_num"] }, d.clone()),
+            &[Bson::Document(doc! { "n": dec("5") }), Bson::Array(vec![Bson::Int32(2), dec("5")])],
+        );
+        exactly(
+            &on(doc! { "$setDifference": ["$mixed", "$two_tenth"] }, d.clone()),
+            &[Bson::Int32(1), dec("0.1")],
+        );
+        // Beside a null, nothing is compared and the result is null, as ever.
         for op in ["$setUnion", "$setIntersection", "$setDifference", "$setEquals", "$setIsSubset"]
         {
-            for (d, at) in [
-                (doc! { "a": [1], "b": [dec("5")] }, "argument 2"),
-                (doc! { "a": [{ "n": dec("5") }], "b": [1] }, "argument 1"),
-                (doc! { "a": [1], "b": [[2, dec("5")]] }, "argument 2"),
-            ] {
-                let mut expr = Document::new();
-                expr.insert(op, vec![Bson::from("$a"), Bson::from("$b")]);
-                let msg = refused(expr, d.clone());
-                assert!(
-                    msg.contains(op) && msg.contains("Decimal128") && msg.contains(at),
-                    "{op} {d:?}: {msg}"
-                );
-            }
-            // Beside a null, nothing is compared and the result is null.
             let mut expr = Document::new();
-            expr.insert(op, vec![Bson::from("$b"), Bson::Null]);
-            assert_eq!(on(expr, doc! { "b": [dec("5")] }), Bson::Null, "{op}");
+            expr.insert(op, vec![Bson::from("$five"), Bson::Null]);
+            assert_eq!(on(expr, d.clone()), Bson::Null, "{op}");
         }
     }
 
@@ -6282,12 +6330,14 @@ mod arrays {
         assert!(matches!(Expr::parse(&bson!([1, ["$a"]])).unwrap(), Expr::Array(_)));
         assert!(matches!(Expr::parse(&bson!([1, {"k": "$a"}])).unwrap(), Expr::Array(_)));
         assert!(matches!(Expr::parse(&bson!([[{"k": [1, "$a"]}]])).unwrap(), Expr::Array(_)));
-        // A Decimal128 element is refused, folded or not.
+        // A Decimal128 element is a literal like any other, folded or not.
         let d = Bson::Decimal128("1.5".parse().unwrap());
-        for array in [Bson::Array(vec![d.clone()]), Bson::Array(vec![Bson::from("$a"), d])] {
-            let msg = Expr::parse(&array).unwrap_err().to_string();
-            assert!(msg.contains("Decimal128 literal"), "{msg}");
-        }
+        assert_eq!(
+            Expr::parse(&Bson::Array(vec![d.clone()])).unwrap(),
+            Expr::Literal(Bson::Array(vec![d.clone()]))
+        );
+        let mixed = Expr::parse(&Bson::Array(vec![Bson::from("$a"), d.clone()])).unwrap();
+        assert_eq!(mixed.eval(&doc! { "a": 1 }).unwrap(), Bson::Array(vec![Bson::Int32(1), d]));
     }
 
     /// An array of constants folds to one literal even when an element is a

@@ -152,11 +152,25 @@ fn each_combination_reads_the_range_of_its_tightest_bounds() {
     }
 }
 
+fn dec(text: &str) -> Bson {
+    Bson::Decimal128(text.parse().unwrap())
+}
+
 /// Values of every comparable type, for bounds and for documents.
 ///
-/// No `Decimal128`: a filter refuses one as a comparison operand.
+/// `Decimal128`s among them, as bounds and as stored values: equal to a number
+/// beside them (`4.5`, `5`, NaN, minus infinity), just past one (`5` plus one
+/// unit in the 34th digit, which no double can hold), one tenth, and one past
+/// every double.
 fn values() -> Vec<Bson> {
     vec![
+        dec("NaN"),
+        dec("-Infinity"),
+        dec("4.50"),
+        dec("5"),
+        dec("5.000000000000000000000000000000001"),
+        dec("0.1"),
+        dec("1E+400"),
         Bson::MinKey,
         Bson::Null,
         Bson::Double(f64::NAN),
@@ -186,6 +200,8 @@ fn values() -> Vec<Bson> {
 /// intersection that is too narrow would lose.
 fn arrays() -> Vec<Bson> {
     vec![
+        Bson::Array(vec![dec("11"), dec("0")]),
+        Bson::Array(vec![dec("4.5000000000000000000000000000001"), "b".into()]),
         Bson::Array(vec![11.into(), 0.into()]),
         Bson::Array(vec![6.into(), "b".into()]),
         Bson::Array(vec!["a".into(), 4.5.into()]),

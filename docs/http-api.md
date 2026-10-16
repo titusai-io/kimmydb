@@ -1016,25 +1016,22 @@ edge uses **Extended JSON v2**:
 Plain JSON keeps working for anything expressible in it — you only meet this
 when you need a type JSON lacks.
 
-**A Decimal128 is stored, returned, and never compared.** `$numberDecimal`
-is read on input and written on output, and the digits come back exactly as
-sent. It cannot be an index key or an `_id` — a document holding one at an
-indexed path is stored and filed under the index's unkeyed run
-([Indexes](indexes.md#documents-an-index-cannot-key)); one as `_id` is
-refused — and it cannot be a filter operand: `{"v": {"$numberDecimal":
-"1.5"}}`, or a Decimal128 under `$eq`, `$ne`, `$gt`, `$gte`, `$lt`, `$lte`,
-`$in`, `$nin`, `$all`, or inside a document or array literal, is `400
-bad_request` saying that a Decimal128 *cannot be compared in a filter*; as a
-literal in an expression, `$expr` included, the `400` says *a Decimal128
-literal is not supported in an expression*. The canonical order has no exact
-place for it — it ranks equal to every other number — so a filter that let
-one through would match every numeric value of the field. A sort over a
-field where a matching document holds one is refused naming the document
-(*cannot sort by "v": document 3 holds a Decimal128 there*), and the update
-operators that compare their operand — `$min`, `$max`, `$pull`,
-`$pullAll` — refuse one (*`$pull` cannot compare a Decimal128 operand*);
-`$type: "decimal"` finds such documents without comparing them
+**A Decimal128 is stored and returned as sent, and compared by its exact
+value.** `$numberDecimal` is read on input and written on output, and the
+digits come back exactly as sent. It cannot be an index key or an `_id` — a
+document holding one at an indexed path is stored and filed under the index's
+unkeyed run ([Indexes](indexes.md#documents-an-index-cannot-key)); one as `_id`
+is refused. As an operand it is a number like any other: `{"v":
+{"$numberDecimal": "1.5"}}`, and a Decimal128 under `$eq`, `$ne`, `$gt`,
+`$gte`, `$lt`, `$lte`, `$in`, `$nin`, `$all`, inside a document or array
+literal, or as a literal in an expression, `$expr` included, matches the
+values equal to it in any numeric type and spelling, and orders among them by
+value; `0.1` the decimal is not `0.1` the double. A sort places a stored one
+among the numbers, and the update operators that compare their operand —
+`$min`, `$max`, `$pull`, `$pullAll` — compare it by value
 ([Query language](query-language.md#3-comparisons-do-not-cross-type-groups)).
+Until 0.51.0 each of these was refused, `400`, because the canonical order
+ranked a Decimal128 equal to every other number.
 Through 0.24.0 the edge did not read `$numberDecimal` at all: the wrapper
 arrived as a nested document, which is why a Decimal128 written to a member
 was keyed there and filed unkeyed on its peers ([ADR-139](decisions.md)).
