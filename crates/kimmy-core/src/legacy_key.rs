@@ -104,6 +104,19 @@ pub fn stored_of_legacy(legacy: &[u8]) -> Vec<u8> {
     }
 }
 
+/// The `i64` whose schema-4 key `key` is, or `None` for any other bytes: the
+/// strict decoder the schema-5 migration re-keys a stored `DOCS` key with.
+///
+/// **Strict means canonical**: `Some(v)` is returned only when `key` is exactly
+/// the schema-4 key of `v`, byte for byte, so a key this encoder never wrote is
+/// refused rather than read as some nearby id. **It does not tell a schema-5 key
+/// from a schema-4 one**: the schema-5 key of `0x5000008101800000` is the
+/// canonical schema-4 key of `0x50007F8081018000`, and this returns the second.
+/// Only the migration's durable phases say which form a key is in.
+pub fn decode_v1(key: &[u8]) -> Option<i64> {
+    v1_int64_of(key)
+}
+
 /// The schema-4 key of an `i64`: tag, sign, then a biased 2-byte exponent and the
 /// 8-byte normalised mantissa, the whole body inverted when negative.
 fn v1_int64(v: i64) -> Vec<u8> {
@@ -414,6 +427,53 @@ mod tests {
         // hashed as it is.
         let v1 = v1_int64(5);
         assert_eq!(legacy_of_stored(&v1).as_bytes(), v1);
+    }
+
+    #[test]
+    fn decode_v1_answers_only_for_the_exact_bytes_of_an_integer_key() {
+        // Every shape a schema-4 integer key cannot have: the wrong length, a
+        // mantissa without its top bit, a fraction, an exponent out of range, a
+        // magnitude past `i64`, a sub-tag that is not a sign, a zero with a body.
+        let refused: [&[u8]; 12] = [
+            &[],
+            &[0x20],
+            &[0x20, 0x03, 0x00],
+            &[0x20, 0x04, 0x80, 0x02, 0xA0, 0, 0, 0, 0, 0, 0],
+            &[0x20, 0x04, 0x80, 0x02, 0xA0, 0, 0, 0, 0, 0, 0, 0, 0],
+            &[0x20, 0x04, 0x80, 0x02, 0x50, 0, 0, 0, 0, 0, 0, 0],
+            &[0x20, 0x04, 0x80, 0x02, 0xA0, 0, 0, 0, 0, 0, 0, 0x01],
+            &[0x20, 0x04, 0x80, 0x40, 0x80, 0, 0, 0, 0, 0, 0, 0],
+            &[0x20, 0x04, 0x7F, 0xFF, 0x80, 0, 0, 0, 0, 0, 0, 0],
+            &[0x20, 0x04, 0x80, 0x3F, 0x80, 0, 0, 0, 0, 0, 0, 0],
+            &[0x20, 0x05, 0x80, 0x02, 0xA0, 0, 0, 0, 0, 0, 0, 0],
+            &[0x30, 0x04, 0x80, 0x02, 0xA0, 0, 0, 0, 0, 0, 0, 0],
+        ];
+        for key in refused {
+            assert_eq!(decode_v1(key), None, "{key:02x?}");
+        }
+        // And whatever it does accept is the canonical key of what it returns:
+        // every 12-byte string over a few varied bodies, both signs.
+        let mut accepted = 0;
+        for sub in [NUM_NEGATIVE, NUM_POSITIVE] {
+            for exp in [0u16, 1, 31, 62, 63, 64, 0x7FFF, 0x8000, 0x8001, 0x803E, 0x803F, 0x8040] {
+                for mantissa in [0u64, 1, 0x8000_0000_0000_0000, 0xA000_0000_0000_0000, u64::MAX] {
+                    let mut key = vec![TAG_NUMBER, sub];
+                    key.extend_from_slice(&exp.to_be_bytes());
+                    key.extend_from_slice(&mantissa.to_be_bytes());
+                    if let Some(v) = decode_v1(&key) {
+                        accepted += 1;
+                        assert_eq!(v1_int64(v), key, "{key:02x?} read as {v}");
+                    }
+                }
+            }
+        }
+        assert!(accepted > 0, "premise: some of these are keys");
+        // The A2 pair: a schema-5 key that is also a canonical schema-4 key, read
+        // as the other id. Strictness is not detection.
+        let a = 0x5000_0081_0180_0000_i64;
+        let b = 0x5000_7F80_8101_8000_i64;
+        assert_eq!(v2_int64(a), v1_int64(b), "premise: the pair");
+        assert_eq!(decode_v1(&v2_int64(a)), Some(b));
     }
 
     #[test]

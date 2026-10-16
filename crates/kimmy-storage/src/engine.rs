@@ -1393,8 +1393,9 @@ impl Engine {
         // Before anything reads a collection id: schema 1 allocated them from a
         // counter, schema 2 derives them from the name.
         let build = cleared.build.clone();
-        let unreported =
-            crate::migrate::run(&db, &|schema| crate::format::raise_schema(path, schema, &build))?;
+        let unreported = crate::migrate::run(&db, path, &|schema| {
+            crate::format::raise_schema(path, schema, &build)
+        })?;
         // The redb that last opened this store for writing, in the store too,
         // so a clean store whose sidecar is gone is still refused by an older
         // redb's build.

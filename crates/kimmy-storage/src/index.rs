@@ -603,7 +603,7 @@ pub(crate) fn mark_multikey(
 
 /// Every document id currently filed under one exact index key: a unique
 /// key's holder, or a whole sentinel run.
-fn holders_of<T>(
+pub(crate) fn holders_of<T>(
     table: &WalkTable<'_, T>,
     coll: CollectionId,
     index_id: u32,
@@ -2644,8 +2644,25 @@ pub(crate) fn clear_index_entries(
     entries: &mut WalkTable<'_, redb::Table<'_, tables::IndexKey<'static>, ()>>,
     range: impl std::ops::RangeBounds<tables::IndexKey<'static>> + Clone + 'static,
 ) -> Result<usize> {
-    let mut removed = 0;
+    clear_index_entries_upto(entries, range, usize::MAX).map(|(removed, _)| removed)
+}
+
+/// [`clear_index_entries`], stopping once the keys removed add up to `budget`
+/// bytes or more: the part of a clear that fits one transaction, for a caller
+/// that commits between parts and must not hold one transaction for a whole
+/// index (the schema 5 migration's drain). Answers how many keys it removed and
+/// whether the range is now empty, which the caller commits with the last part.
+pub(crate) fn clear_index_entries_upto(
+    entries: &mut WalkTable<'_, redb::Table<'_, tables::IndexKey<'static>, ()>>,
+    range: impl std::ops::RangeBounds<tables::IndexKey<'static>> + Clone + 'static,
+    budget: usize,
+) -> Result<(usize, bool)> {
+    let (mut removed, mut bytes) = (0, 0usize);
     loop {
+        if bytes >= budget {
+            let rest = entries.range(range.clone())?.next().transpose()?.is_none();
+            return Ok((removed, rest));
+        }
         #[allow(clippy::type_complexity)]
         let batch: Vec<(u64, u32, Vec<u8>, Vec<u8>)> = entries
             .range(range.clone())?
@@ -2657,8 +2674,9 @@ pub(crate) fn clear_index_entries(
             })
             .collect::<Result<_>>()?;
         if batch.is_empty() {
-            return Ok(removed);
+            return Ok((removed, true));
         }
+        bytes = bytes.saturating_add(batch.iter().map(|(_, _, v, d)| 12 + v.len() + d.len()).sum());
         let mut gone = 0;
         for (collection, index, value, doc_key) in &batch {
             #[cfg(test)]
