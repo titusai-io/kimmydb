@@ -1664,13 +1664,10 @@ pub async fn replicate(engine: Arc<Engine>, config: ReplicationConfig) {
                 // A `Decimal128` id here and a live peer that cannot hold one:
                 // that peer fails every frame carrying it and never catches up,
                 // so say so, once per peer and every ten minutes (ADR-238). The
-                // marker is read only when some peer blocks; with none, the call
-                // below names nobody and forgets who was named.
-                if let Some(members) = &config.members
-                    && (members.decimal128_blockers().is_empty()
-                        || engine.decimal128_id_present().unwrap_or(false))
-                {
-                    for peer in members.decimal128_warn_due(Instant::now()) {
+                // marker is read only when some peer blocks.
+                if let Some(members) = &config.members {
+                    let marker = || engine.decimal128_id_present().unwrap_or(false);
+                    for peer in members.decimal128_warnings(marker, Instant::now()) {
                         warn!(
                             %peer,
                             "a document whose _id is a Decimal128 exists on this member, and a \

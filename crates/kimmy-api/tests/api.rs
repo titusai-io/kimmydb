@@ -14961,3 +14961,56 @@ async fn the_marker_reaches_readyz_and_metrics_with_the_first_decimal_id() {
         .await;
     assert_eq!(found.body["documents"][0]["_id"], decimal("7"), "{:?}", found.body);
 }
+
+#[tokio::test]
+async fn the_live_peer_net_holds_back_a_decimal_id_and_bound_until_every_peer_can_hold_one() {
+    // The node's own gate (`kimmy_cluster::Decimal128Gate`) over a member set, with the
+    // key set: an older live peer (its block says nothing of the capability) holds both
+    // creations back, named in the 400; a live peer not heard from yet does too; once
+    // every live peer says it can, both are created.
+    let server = Server::start().await;
+    let token = server.root().await;
+    server.post("/v1/db/shop/collections", Some(&token), json!({ "name": "c" })).await;
+    let members = kimmy_cluster::Members::default();
+    let gate = kimmy_cluster::Decimal128Gate::new(true, true, true);
+    gate.set_members(members.clone());
+    server.state.engine.set_decimal128_gate(gate.predicate());
+
+    let older = kimmy_core::NodeId::from_bytes([2; 16]);
+    let unheard = kimmy_core::NodeId::from_bytes([3; 16]);
+    members.insert_for_test("10.0.0.2:7900".parse().unwrap(), older);
+    members.record_peer_facts_for_test(
+        older,
+        kimmy_cluster::Facts { boot: vec![2; 16], ..Default::default() },
+        std::time::Duration::ZERO,
+    );
+    members.insert_for_test("10.0.0.3:7900".parse().unwrap(), unheard);
+
+    let docs = "/v1/db/shop/coll/c/docs";
+    let indexes = "/v1/db/shop/coll/c/indexes";
+    let index = json!({ "name": "positive", "fields": [{ "path": "v" }],
+                        "partialFilterExpression": { "v": { "$gt": decimal("0") } } });
+    for (path, body) in [(docs, json!({ "_id": decimal("1.5") })), (indexes, index.clone())] {
+        let res = server.post(path, Some(&token), body).await;
+        assert_eq!(res.status, 400, "{path}: {:?}", res.body);
+        let message = res.body["message"].as_str().unwrap_or_default();
+        for peer in [older, unheard] {
+            assert!(message.contains(&peer.to_string()), "{path}: names {peer}: {message}");
+        }
+    }
+
+    let can = |boot: u8| kimmy_cluster::Facts {
+        boot: vec![boot; 16],
+        decimal128: Some(true),
+        ..Default::default()
+    };
+    members.record_peer_facts_for_test(older, can(2), std::time::Duration::ZERO);
+    let res = server.post(docs, Some(&token), json!({ "_id": decimal("1.5") })).await;
+    assert_eq!(res.status, 400, "the unheard peer still holds it back: {:?}", res.body);
+    members.record_peer_facts_for_test(unheard, can(3), std::time::Duration::ZERO);
+    for (path, body) in [(docs, json!({ "_id": decimal("1.5") })), (indexes, index)] {
+        let res = server.post(path, Some(&token), body).await;
+        assert_eq!(res.status, 200, "{path}: {:?}", res.body);
+    }
+    assert_eq!(server.get("/readyz", None).await.body["decimal128_id_present"], true);
+}

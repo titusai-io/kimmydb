@@ -196,13 +196,16 @@ mod tests {
         let start = Instant::now();
         assert_eq!(members.decimal128_warn_due(start), vec![node(2)], "only the peer that cannot");
         assert!(members.decimal128_warn_due(start + Duration::from_secs(1)).is_empty(), "once");
-        assert!(
-            members
-                .decimal128_warn_due(start + DECIMAL128_WARN_INTERVAL - Duration::from_secs(1))
-                .is_empty(),
-            "not before ten minutes"
-        );
-        let again = start + DECIMAL128_WARN_INTERVAL;
+        // Ten minutes as written in the design, not as the constant says.
+        let ten_minutes = Duration::from_secs(600);
+        assert_eq!(DECIMAL128_WARN_INTERVAL, ten_minutes);
+        for early in [300, 599] {
+            assert!(
+                members.decimal128_warn_due(start + Duration::from_secs(early)).is_empty(),
+                "not before ten minutes: {early} s"
+            );
+        }
+        let again = start + ten_minutes;
         assert_eq!(members.decimal128_warn_due(again), vec![node(2)], "again at ten minutes");
 
         // A peer that upgrades stops being named, and one that later blocks again is
@@ -211,5 +214,30 @@ mod tests {
         assert!(members.decimal128_warn_due(again + Duration::from_secs(1)).is_empty());
         members.record_peer_facts_for_test(node(2), can(None), Duration::ZERO);
         assert_eq!(members.decimal128_warn_due(again + Duration::from_secs(2)), vec![node(2)]);
+    }
+
+    #[test]
+    fn the_warn_waits_for_the_marker_and_reads_it_only_when_a_peer_blocks() {
+        let members = Members::default();
+        let read = std::cell::Cell::new(0);
+        let marker = |present: bool| {
+            let read = &read;
+            move || {
+                read.set(read.get() + 1);
+                present
+            }
+        };
+        let now = Instant::now();
+        assert!(members.decimal128_warnings(marker(true), now).is_empty(), "no peer");
+        assert_eq!(read.get(), 0, "no peer blocks, so the store is not read");
+
+        members.insert_for_test(addr(2), node(2));
+        assert!(members.decimal128_warnings(marker(false), now).is_empty(), "no marker, no WARN");
+        assert_eq!(read.get(), 1);
+        assert_eq!(members.decimal128_warnings(marker(true), now), vec![node(2)]);
+        assert!(
+            members.decimal128_warnings(marker(true), now + Duration::from_secs(1)).is_empty(),
+            "the cadence of decimal128_warn_due"
+        );
     }
 }

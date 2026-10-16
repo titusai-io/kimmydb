@@ -442,6 +442,17 @@ impl Members {
             .collect()
     }
 
+    /// [`Self::decimal128_warn_due`] while the marker is set (ADR-238): the peers
+    /// to name now in the WARN. `marker` reads the store's marker, and is asked
+    /// only when some live peer blocks, so a cluster that can hold decimals
+    /// costs no read; with none blocking, the call forgets who was named.
+    pub fn decimal128_warnings(&self, marker: impl FnOnce() -> bool, now: Instant) -> Vec<NodeId> {
+        if !self.decimal128_blockers().is_empty() && !marker() {
+            return Vec::new();
+        }
+        self.decimal128_warn_due(now)
+    }
+
     /// Drop what `node` last said, and what it last echoed of ours: it is a new
     /// incarnation, or SWIM declared it down (ADR-201). The slot remembers when it
     /// was dropped, so a block decoded before cannot come back (ADR-213).
