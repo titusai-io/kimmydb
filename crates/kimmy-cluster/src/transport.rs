@@ -4570,10 +4570,13 @@ impl PeerStalls {
     /// [`REPAIR_ATTEMPTS`] rounds that did not advance it.
     ///
     /// While `peer_catching_up` (the peer's block on this contact says so) a count
-    /// repair is not handed out: one under way stays under way and one queued stays
-    /// queued, and the round is not counted against it, since it was not handed
-    /// out. It reads a state that is about to change, and it was planned before the
-    /// peer said so (ADR-237's addendum).
+    /// repair's replay is not handed out: one under way stays under way and one
+    /// queued stays queued, and the round is not counted against it, since it was
+    /// not handed out. It reads a state that is about to change, and it was planned
+    /// before the peer said so (ADR-237's addendum). A snapshot of one collection is
+    /// handed out: it only adds what this member lacks, and the one a pull plans when
+    /// it stops at a collection this member has no record of is what lets the pull go
+    /// on.
     pub fn repair_due(
         &mut self,
         peer: NodeId,
@@ -4607,7 +4610,7 @@ impl PeerStalls {
         if ordinary && matches!(repairs.active, Some((_, Repair::Converge | Repair::Definitions))) {
             return None;
         }
-        if peer_catching_up && repairs.active.is_some_and(|(_, r)| r.kind() == RepairKind::Count) {
+        if peer_catching_up && matches!(repairs.active, Some((_, Repair::Replay { .. }))) {
             return None;
         }
         // A repair handed out on the previous round and neither advanced
@@ -4662,8 +4665,13 @@ impl PeerStalls {
                 if kind != RepairKind::Count && (whole_pending || ordinary) {
                     continue;
                 }
-                // A count repair waits for a peer that is catching up.
-                if kind == RepairKind::Count && peer_catching_up {
+                // A count repair's replay waits for a peer that is catching up.
+                if peer_catching_up
+                    && matches!(
+                        repairs.queued.get(&(collection, kind)),
+                        Some(Repair::Replay { .. })
+                    )
+                {
                     continue;
                 }
                 // The count gate again, at promotion: a Converge queued before a count repair
@@ -8697,33 +8705,44 @@ mod tests {
         assert!(stalls.repairing(peer), "a repair making progress is never abandoned");
     }
 
-    /// A count repair is not handed to a peer that is catching up (ADR-237's addendum), and
-    /// the rounds it waits are not counted against it: one under way is handed out again
-    /// once the peer has caught up, however many rounds went by, and one queued is promoted
-    /// only then.
+    /// A count repair's replay is not handed to a peer that is catching up (ADR-237's
+    /// addendum), and the rounds it waits are not counted against it: one under way is
+    /// handed out again once the peer has caught up, however many rounds went by, and one
+    /// queued is promoted only then. A snapshot of one collection is handed out all the
+    /// same, queued or under way: it only adds what this member lacks.
     #[test]
     fn a_count_repair_waits_while_its_peer_catches_up_and_is_not_abandoned_for_it() {
         let peer = node(1);
         let collection = CollectionId(7);
+        let replay = Repair::Replay { from: Hlc::new(1, 0) };
         let mut stalls = PeerStalls::new();
-        assert!(stalls.plan_repair(peer, collection, Repair::Snapshot));
-        assert_eq!(stalls.repair_due(peer, false), Some((collection, Repair::Snapshot)));
+        assert!(stalls.plan_repair(peer, collection, replay));
+        assert_eq!(stalls.repair_due(peer, false), Some((collection, replay)));
         for round in 1..=REPAIR_ATTEMPTS * 3 {
             assert_eq!(stalls.repair_due(peer, true), None, "round {round}: handed out");
         }
         assert!(stalls.repairing(peer), "still under way");
         assert_eq!(
             stalls.repair_due(peer, false),
-            Some((collection, Repair::Snapshot)),
+            Some((collection, replay)),
             "handed out again once the peer has caught up, not abandoned"
         );
 
         let mut stalls = PeerStalls::new();
-        let replay = Repair::Replay { from: Hlc::new(1, 0) };
         assert!(stalls.plan_repair(peer, collection, replay));
         assert_eq!(stalls.repair_due(peer, true), None, "promoted for a peer catching up");
         assert!(stalls.repairing(peer), "left queued");
         assert_eq!(stalls.repair_due(peer, false), Some((collection, replay)));
+
+        let mut stalls = PeerStalls::new();
+        assert!(stalls.plan_repair(peer, collection, Repair::Snapshot));
+        for round in 1..=2 {
+            assert_eq!(
+                stalls.repair_due(peer, true),
+                Some((collection, Repair::Snapshot)),
+                "round {round}: a snapshot held for a peer catching up"
+            );
+        }
     }
 
     /// The count after progress (ADR-152). A repair that advanced — a page

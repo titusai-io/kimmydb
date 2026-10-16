@@ -27892,10 +27892,14 @@ snapshot that marked the repairing member catching up (scoped by ADR-236).
   existence finding** (a collection the peer holds and this member lacks) is held by the peer's
   marker only: this member's own would hold the repair that brings a collection its own
   catch-up cannot, such as one its replay of its own origin stops at.
-- **A repair planned before the marker.** A count repair planned while the peer was not
-  catching up is not handed out on a contact whose block says it is: queued, it stays queued;
-  under way, it stays under way, and the rounds it waits are not counted against it, so it is
-  not abandoned into the cooldown for them.
+- **A repair planned before the marker.** A count repair's replay planned while the peer was
+  not catching up is not handed out on a contact whose block says it is: queued, it stays
+  queued; under way, it stays under way, and the rounds it waits are not counted against it, so
+  it is not abandoned into the cooldown for them. **Only the replay is held.** A snapshot of one
+  collection is handed out (an existence finding's, or the one a pull plans when it stops at a
+  collection this member has no record of): it only adds what this member lacks, and without
+  the stop's snapshot every pull from that peer stops at the same entry. A document or
+  definition repair queued before the marker runs once, as point 2 bounds it.
 - **It ends with the marker.** Once the marker clears by dominance or the mutual clear, the
   member's vector covers what it holds and the next contact is judged by position alone; a real
   difference is compared, confirmed and repaired as before
@@ -27919,16 +27923,16 @@ probed with no count compared, no finding and no repair; the deferral ends with 
 real divergence is then found and repaired; the member catching up compares and plans nothing
 itself; the check after a pull defers too; in the loop (`replicate`), a collection a peer
 catching up holds only as snapshot state is not repaired from it until its marker clears; a peer
-membership lists under another id is not repaired from while its block says it is catching up;
-a count repair planned before the peer marks waits, and runs once the marker clears; and a
-member catching up still repairs a collection it lacks from a peer that is not. `transport.rs`:
-the gate's truth table, and a count repair under way or queued waiting for a peer catching up
-without being abandoned. `peers.rs`: a textual guard that the tick hands this contact's flag to
-all three plans (no end-to-end test sees the count plan's share, since a count repair planned
-from a peer catching up also waits in `repair_due`). Mutation rows (in bash, all killed): the gate's clause removed, counted
-as not deferred, or comparing; the peer's block ignored; this member's marker ignored; the
-block's flag never read; each of the two check sites passing `false`; the plan gate removed; the
-loop passing `false` to it; the contact's flag not carried out, or not read by the plan; an
-existence finding held by this member's own marker; the hold of a count repair under way, or
-queued, removed, or counted as a stalled round; and the fix off as a whole (the pre-fix
-behaviour).
+membership lists under another id is not repaired from while its block says it is catching up; a
+count repair planned before the peer marks waits, and runs once the marker clears; a member
+catching up still repairs a collection it lacks from a peer that is not; and a pull that stops
+at a collection it lacks takes the collection's snapshot from a peer catching up.
+`transport.rs`: the gate's truth table, and a count repair under way or queued waiting for a
+peer catching up without being abandoned. `peers.rs`: a textual guard that the tick hands this
+contact's flag to all three plans. Mutation rows (in bash, all killed): the gate's clause
+removed, counted as not deferred, or comparing; the peer's block ignored; this member's marker
+ignored; the block's flag never read; each of the two check sites passing `false`; the plan gate
+removed; the loop passing `false` to it; the contact's flag not carried out, or not read by the
+plan; an existence finding held by this member's own marker; the hold of a count repair under
+way, or queued, removed, or counted as a stalled round; a snapshot held like the replay; and the
+fix off as a whole (the pre-fix behaviour).

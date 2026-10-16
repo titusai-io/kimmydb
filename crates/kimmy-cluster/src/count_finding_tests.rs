@@ -709,3 +709,22 @@ async fn a_member_catching_up_still_repairs_a_collection_it_lacks_from_a_peer_th
     assert_eq!(planned, 1, "the collection A lacks is planned from B");
     assert!(a.engine.get_collection("shop", "extra").is_ok(), "and A takes it");
 }
+
+/// A pull from B stops at a collection A has no record of (A witnessed its creation without
+/// applying it), and the stop plans the collection's snapshot from B. B is catching up, and the
+/// snapshot is pulled all the same: it only adds what A lacks, and without it every pull from B
+/// stops at the same entry. Only a count repair's replay waits for a peer catching up.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_pull_that_stops_at_a_collection_it_lacks_takes_its_snapshot_from_a_peer_catching_up() {
+    let (mut a, b) = (side().await, side().await);
+    a.members.insert_for_test(b.addr, b.node);
+    let x = b.engine.create_collection("shop", "x").unwrap();
+    a.engine.absorb_witnessed(&b.engine.witnessed_vector().unwrap()).unwrap();
+    b.engine.insert(&x, doc! { "_id": 1 }).unwrap();
+    b.catch_up.mark(crate::CatchUpReason::Snapshot).unwrap();
+    for _ in 0..4 {
+        tick(&mut a).await;
+    }
+    assert!(b.catch_up.is_set(), "premise: B is still catching up");
+    assert!(a.engine.get_collection("shop", "x").is_ok(), "the stop's snapshot was held");
+}

@@ -5246,8 +5246,9 @@ mod definition_fold_tests {
 
     /// The tick's three repair plans read the catching-up marker the peer's block carried on
     /// this contact (`outcome.peer_catching_up`) beside what membership holds. No end-to-end
-    /// test sees the count plan's share: a count repair planned from a peer catching up also
-    /// waits in `repair_due` until the peer has caught up. Textual, like the guards above.
+    /// test sees each plan's share: a count repair's replay planned from a peer catching up
+    /// also waits in `repair_due`, and the document and definition repairs need a confirmed
+    /// digest finding against such a peer. Textual, like the guards above.
     #[test]
     fn the_tick_plans_every_repair_with_what_this_contact_said_of_catching_up() {
         let source = include_str!("peers.rs");
