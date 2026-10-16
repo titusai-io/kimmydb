@@ -192,6 +192,8 @@ mod tests {
         let members = Members::default();
         members.insert_for_test(addr(2), node(2));
         members.insert_for_test(addr(3), node(3));
+        // Node 2 runs an older build: its block says nothing of the capability.
+        members.record_peer_facts_for_test(node(2), can(None), Duration::ZERO);
         members.record_peer_facts_for_test(node(3), can(Some(true)), Duration::ZERO);
         let start = Instant::now();
         assert_eq!(members.decimal128_warn_due(start), vec![node(2)], "only the peer that cannot");
@@ -217,6 +219,24 @@ mod tests {
     }
 
     #[test]
+    fn a_peer_not_heard_from_is_named_only_after_a_lease() {
+        // It blocks the gate at once, failing closed, but is named in the WARN only
+        // once it has been unheard for longer than a lease, as the unheard-peer WARN
+        // names one: a peer not contacted yet is not a peer that cannot hold one.
+        let members = Members::default();
+        let gate = gate_over(&members);
+        members.insert_for_test(addr(4), node(4));
+        assert!(gate.check().is_err(), "the gate fails closed at once");
+        let now = Instant::now();
+        assert!(members.decimal128_warn_due(now).is_empty(), "not named within its lease");
+        let lease = members.lease();
+        assert_eq!(
+            members.decimal128_warn_due(now + lease + Duration::from_secs(1)),
+            vec![node(4)]
+        );
+    }
+
+    #[test]
     fn the_warn_waits_for_the_marker_and_reads_it_only_when_a_peer_blocks() {
         let members = Members::default();
         let read = std::cell::Cell::new(0);
@@ -232,6 +252,7 @@ mod tests {
         assert_eq!(read.get(), 0, "no peer blocks, so the store is not read");
 
         members.insert_for_test(addr(2), node(2));
+        members.record_peer_facts_for_test(node(2), can(None), Duration::ZERO);
         assert!(members.decimal128_warnings(marker(false), now).is_empty(), "no marker, no WARN");
         assert_eq!(read.get(), 1);
         assert_eq!(members.decimal128_warnings(marker(true), now), vec![node(2)]);

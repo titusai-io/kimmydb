@@ -423,8 +423,28 @@ impl Members {
     /// The caller asks only while the marker is set. A peer that stops
     /// blocking (it upgraded, or left the live set) is forgotten, so one that
     /// blocks again is named at once.
+    ///
+    /// **A live peer this member has not heard from is named only once it has
+    /// been unheard for more than a lease**, as the unheard-peer WARN does: it
+    /// blocks the gate at once (failing closed), but a peer that came up a
+    /// moment ago and has not been contacted yet is not one that cannot hold a
+    /// decimal, and saying so at every start would teach an operator to skip
+    /// the line.
     pub fn decimal128_warn_due(&self, now: Instant) -> Vec<NodeId> {
-        let blockers = self.decimal128_blockers();
+        let lease = self.lease();
+        let view = self.view();
+        let blockers: Vec<NodeId> = {
+            let up = self.0.up_since.lock();
+            crate::facts::decimal128_blockers(&view)
+                .into_iter()
+                .filter(|node| {
+                    view.blocks.contains_key(node)
+                        || up
+                            .get(node)
+                            .is_none_or(|since| now.saturating_duration_since(*since) > lease)
+                })
+                .collect()
+        };
         let mut said = self.0.decimal128_said.lock();
         said.retain(|node, _| blockers.contains(node));
         blockers

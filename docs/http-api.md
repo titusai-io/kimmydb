@@ -877,13 +877,16 @@ Full detail in [Change Streams](change-streams.md).
 
 ```bash
 curl localhost:7878/healthz    # {"status":"ok"}
-curl localhost:7878/readyz     # {"status":"ready","node":"9d5200f2-…"}
+curl localhost:7878/readyz     # {"status":"ready","node":"9d5200f2-…","decimal128_id_present":false}
 curl localhost:7878/metrics    # Prometheus text format
 ```
 
 All three are unauthenticated so a load balancer can probe them without
 credentials. `/healthz` is liveness; `/readyz` proves the storage engine
 actually responds, so a node with a wedged database is taken out of rotation.
+A ready answer carries `decimal128_id_present`: whether a document whose `_id`
+is a `Decimal128` has ever been written or applied on this member, the marker
+a rollback reads ([Operations](operations.md#clusterdecimal128-and-the-marker)).
 
 **A node answers these from the moment it binds its port, before its store is
 open** ([ADR-198](decisions.md)). Until the store is open `/healthz` is `200`
@@ -909,7 +912,7 @@ and `owed_members`, the node ids of the members that owe the replay, sorted (nev
 empty under `owed_replay`):
 
 ```json
-{"status":"ready","node":"9d5200f2-…","catching_up":"unknown",
+{"status":"ready","node":"9d5200f2-…","decimal128_id_present":false,"catching_up":"unknown",
  "unknown_because":"owed_replay","owed_members":["4c1e07a9-…"]}
 ```
 
