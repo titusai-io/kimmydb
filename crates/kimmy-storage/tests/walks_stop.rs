@@ -417,6 +417,10 @@ const BOUNDED_READS: &[(&str, &str)] = &[
         "one snapshot page's records phase: at most RECORD_PAGE (512) records of one collection",
     ),
     (
+        "idempotency_tests::rows",
+        "test code reading a store of a few thousand rows it wrote itself",
+    ),
+    (
         "idempotency::records_for_window",
         "the rows between a served window's first and last stamps, read in the window's own read \
          transaction: a row per stamp the window's walk passed over at most",
