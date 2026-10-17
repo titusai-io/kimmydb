@@ -199,13 +199,27 @@ fn is_reserved(s: &str) -> bool {
 /// An `i64` written as `i64` writes it: an optional `-`, no `+`, no leading
 /// zero, never `-0`, in range.
 fn is_canonical_i64(s: &str) -> bool {
-    s.parse::<i64>().is_ok_and(|n| n.to_string() == s)
+    let digits = s.strip_prefix('-').unwrap_or(s);
+    is_canonical_digits(digits) && s != "-0" && s.parse::<i64>().is_ok()
 }
 
 /// A chunk number written as `u32` writes it: no sign, no leading zero.
 fn parse_chunk(s: &str) -> Option<u32> {
-    let n: u32 = s.parse().ok()?;
-    (n.to_string() == s).then_some(n)
+    if !is_canonical_digits(s) {
+        return None;
+    }
+    s.parse().ok()
+}
+
+/// Decimal digits with no sign and no leading zero, as an integer writes them:
+/// checked without writing the number back, since the graph's key pre-filter
+/// parses every candidate it is offered.
+fn is_canonical_digits(s: &str) -> bool {
+    match s.as_bytes() {
+        [] => false,
+        [b'0'] => true,
+        [first, rest @ ..] => (b'1'..=b'9').contains(first) && rest.iter().all(u8::is_ascii_digit),
+    }
 }
 
 fn push_hex(out: &mut String, bytes: &[u8]) {
@@ -701,6 +715,22 @@ mod tests {
                 if let Some(document) = expected {
                     prop_assert!(source.is_of(&document));
                 }
+            }
+
+            /// The canonical-number checks are what writing the number back
+            /// and comparing would say, without the allocation.
+            #[test]
+            fn canonical_numbers_are_what_writing_them_back_says(
+                t in prop_oneof!["[-+0-9]{0,21}", any::<i64>().prop_map(|i| i.to_string())]
+            ) {
+                prop_assert_eq!(
+                    is_canonical_i64(&t),
+                    t.parse::<i64>().is_ok_and(|n| n.to_string() == t)
+                );
+                prop_assert_eq!(
+                    parse_chunk(&t),
+                    t.parse::<u32>().ok().filter(|n| n.to_string() == t)
+                );
             }
 
             /// Test 2, the round trip.
