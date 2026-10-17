@@ -129,6 +129,7 @@ mod tests {
         let block = source();
         assert_eq!(block.boot, vec![1; 16]);
         assert!(block.embeddings_disabled && !block.ttl_disabled);
+        assert_eq!(block.vector_chunk_ids, Some(2), "this build's chunk-id format (ADR-239)");
         let sessions = engine.get_collection("app", "sessions").unwrap();
         let plain = engine.get_collection("app", "plain").unwrap();
         assert!(block.holds_ttl(sessions.id));

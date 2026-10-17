@@ -9073,4 +9073,23 @@ pub(crate) mod tests {
         assert_eq!(texts(&roll.b, &roll.shadow, &int), ["int seven"], "re-embedded");
         assert!(texts(&roll.b, &roll.shadow, &string).is_empty());
     }
+
+    /// The end-of-roll recheck fires on the turn only: a member that finds
+    /// every peer writing 0.51.0's ids from its first evaluation was never in
+    /// a roll, and its first-sight rescan covered its start, so later
+    /// evaluations rescan nothing.
+    #[tokio::test]
+    async fn no_roll_is_seen_when_every_member_writes_0510s_ids_from_the_start() {
+        let mut roll = a_mixed_roll().await;
+        let everywhere = as_a_clustered_owner(&mut roll).await;
+        // As though it had read `Some(true)` all along.
+        roll.worker.chunk_ids_seen = Some(true);
+        *everywhere.lock().unwrap() = Some(true);
+        as_050_left_it(&roll.a, &roll.coll, &roll.shadow, &[(roll.docs[0].0.clone(), "late")]);
+        exchange(&roll.a, &roll.b);
+        let calls = roll.fake.calls();
+        roll.worker.rescan_gained(Instant::now()).await.unwrap();
+        assert_eq!(roll.fake.calls(), calls);
+        assert_eq!(roll.worker.ownership_settled.get("app/docs"), Some(&true));
+    }
 }
