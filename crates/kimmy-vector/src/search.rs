@@ -57,11 +57,11 @@ pub fn vector_search(
     shadow: &CollectionMeta,
     query: &[f32],
     options: &SearchOptions,
-    allowed: Option<&HashSet<String>>,
+    allowed: Option<&HashSet<DocId>>,
 ) -> Result<Vec<Hit>> {
     let mut top = TopK::new(options);
 
-    engine.for_each_vector(shadow, kimmy_storage::WalkScope::Request, |record: VectorRecord| {
+    engine.for_each_vector(shadow, kimmy_storage::WalkScope::Request, |_, record| {
         // A dimension mismatch means this vector was written under a different
         // model. Scoring it would produce a meaningless number rather than an
         // error, so it is skipped.
@@ -88,10 +88,13 @@ pub fn vector_search(
 ///
 /// The one admission check of both halves of a hybrid search, the scan in
 /// [`vector_search`] and the walk in [`keyword_search`], so that the two
-/// cannot admit different documents. A chunk is admitted by its source
-/// document, rendered as the strings the caller's set holds.
-fn admitted(allowed: Option<&HashSet<String>>, record: &VectorRecord) -> bool {
-    allowed.is_none_or(|a| a.contains(&record.source.to_string()))
+/// cannot admit different documents, and of the graph's candidates once
+/// loaded ([`crate::HnswIndex::search`]). A chunk is admitted by the document
+/// its record names, as a `DocId` (ADR-239): never by a rendering of it, under
+/// which every binary `_id` of one length was one document, and never by the
+/// id the chunk is stored under, which names a slot and not who holds it.
+pub(crate) fn admitted(allowed: Option<&HashSet<DocId>>, record: &VectorRecord) -> bool {
+    allowed.is_none_or(|a| a.contains(&record.source))
 }
 
 /// Exact search over the chunks of the named documents only.
@@ -143,6 +146,9 @@ pub(crate) fn rank_hits(hits: Vec<Hit>, options: &SearchOptions) -> Vec<Hit> {
 
 /// Where a hit stands relative to the others: score first, then the chunk's
 /// key, so equal scores rank the same way on every run and on every path.
+/// The document is its [`VectorRecord::source_key`], which tells every two
+/// documents apart (ADR-239); `Display` made every binary `_id` of one length
+/// one document here, sharing one per-document allowance.
 ///
 /// Ordered so that the *worst* standing is the least — the one a full set
 /// evicts — and the best is the greatest. `total_cmp` rather than
@@ -228,7 +234,8 @@ impl TopK {
             return;
         }
 
-        let standing = Standing { score: hit.score, doc: hit.id.to_string(), chunk: hit.chunk };
+        let standing =
+            Standing { score: hit.score, doc: VectorRecord::source_key(&hit.id), chunk: hit.chunk };
 
         if let Some(mine) = self.per_doc.get(&standing.doc)
             && mine.len() >= self.per_document
@@ -319,8 +326,10 @@ pub fn weighted_reciprocal_rank_fusion(rankings: &[(&[Hit], f32)], limit: usize)
         }
         for (position, hit) in ranking.iter().enumerate() {
             let contribution = weight / (RRF_K + position as f32 + 1.0);
+            // By the injective key, so two documents never fuse into one
+            // (ADR-239).
             fused
-                .entry(hit.id.to_string())
+                .entry(VectorRecord::source_key(&hit.id))
                 .and_modify(|(_, score)| *score += contribution)
                 .or_insert_with(|| (hit.clone(), contribution));
         }
@@ -356,7 +365,7 @@ pub fn keyword_search(
     query: &str,
     options: &SearchOptions,
     min_overlap: usize,
-    allowed: Option<&HashSet<String>>,
+    allowed: Option<&HashSet<DocId>>,
 ) -> Result<Vec<Hit>> {
     let terms: Vec<String> = tokenize(query);
     if terms.is_empty() || allowed.is_some_and(|a| a.is_empty()) {
@@ -368,7 +377,7 @@ pub fn keyword_search(
     let required = min_overlap.clamp(1, distinct.len());
 
     let mut top = TopK::new(options);
-    engine.for_each_vector(shadow, kimmy_storage::WalkScope::Request, |record: VectorRecord| {
+    engine.for_each_vector(shadow, kimmy_storage::WalkScope::Request, |_, record| {
         // Before tokenizing, so an excluded chunk costs nothing more.
         if !admitted(allowed, &record) {
             return Ok(true);
@@ -405,8 +414,6 @@ fn tokenize(text: &str) -> Vec<String> {
 
 #[cfg(test)]
 mod tests {
-    use std::collections::HashSet;
-
     use kimmy_core::{ChunkConfig, ProviderConfig, VectorConfig};
 
     use super::*;
@@ -510,7 +517,7 @@ mod tests {
         // language: the filter runs first and its ids are passed in.
         let (engine, shadow, _dir) = setup(&[(1, 0, [1.0, 0.0], "a"), (2, 0, [0.9, 0.1], "b")]);
 
-        let allowed: HashSet<String> = ["2".to_string()].into_iter().collect();
+        let allowed: HashSet<DocId> = [DocId::Int64(2)].into_iter().collect();
         let hits =
             vector_search(&engine, &shadow, &[1.0, 0.0], &SearchOptions::default(), Some(&allowed))
                 .unwrap();
@@ -634,13 +641,13 @@ mod tests {
         hits.sort_by(|a, b| {
             b.score
                 .total_cmp(&a.score)
-                .then_with(|| a.id.to_string().cmp(&b.id.to_string()))
+                .then_with(|| VectorRecord::source_key(&a.id).cmp(&VectorRecord::source_key(&b.id)))
                 .then_with(|| a.chunk.cmp(&b.chunk))
         });
         let mut per_doc: HashMap<String, usize> = HashMap::new();
         let mut out = Vec::new();
         for hit in hits {
-            let seen = per_doc.entry(hit.id.to_string()).or_insert(0);
+            let seen = per_doc.entry(VectorRecord::source_key(&hit.id)).or_insert(0);
             if *seen >= options.per_document.max(1) {
                 continue;
             }
@@ -798,7 +805,7 @@ mod tests {
         // cap of one and of several, and for a k past the candidate count.
         let (engine, shadow, _dir) = wide_fixture();
         let sources: Vec<DocId> = [2i64, 5, 7, 11].into_iter().map(DocId::Int64).collect();
-        let allowed: HashSet<String> = sources.iter().map(ToString::to_string).collect();
+        let allowed: HashSet<DocId> = sources.iter().cloned().collect();
         let query = [0.3f32, -0.95];
 
         for (k, per_document) in [(3, 1), (5, 2), (100, 3), (1, 1)] {
@@ -808,7 +815,7 @@ mod tests {
             let keyed = vector_search_among(&engine, &shadow, &query, &options, &sources).unwrap();
             assert_eq!(keyed, scanned, "k {k}, per_document {per_document}");
             assert!(!keyed.is_empty());
-            assert!(keyed.iter().all(|h| allowed.contains(&h.id.to_string())));
+            assert!(keyed.iter().all(|h| allowed.contains(&h.id)));
         }
     }
 
@@ -878,7 +885,7 @@ mod tests {
             (2, 0, [0.0, 1.0], "red paint"),
             (3, 0, [0.0, 1.0], "red car"),
         ]);
-        let allowed: HashSet<String> = ["1".to_string(), "3".to_string()].into_iter().collect();
+        let allowed: HashSet<DocId> = [DocId::Int64(1), DocId::Int64(3)].into_iter().collect();
         let options = SearchOptions::default();
         let hits = keyword_search(&engine, &shadow, "red", &options, 1, Some(&allowed)).unwrap();
         let mut found = ids(&hits);
@@ -893,7 +900,7 @@ mod tests {
         // admission check excludes every chunk anyway, so no test tells the
         // two apart and it has no mutation row; it only saves the walk.
         let (engine, shadow, _dir) = setup(&[(1, 0, [1.0, 0.0], "red apple")]);
-        let nothing: HashSet<String> = HashSet::new();
+        let nothing: HashSet<DocId> = HashSet::new();
         let options = SearchOptions::default();
         assert!(
             keyword_search(&engine, &shadow, "red", &options, 1, Some(&nothing))
@@ -915,7 +922,7 @@ mod tests {
         let unfiltered = keyword_search(&engine, &shadow, query, &options, 1, None).unwrap();
         assert_eq!(ids(&unfiltered), vec![2], "doc 2 out-scores doc 1");
 
-        let allowed: HashSet<String> = ["1".to_string()].into_iter().collect();
+        let allowed: HashSet<DocId> = [DocId::Int64(1)].into_iter().collect();
         let hits = keyword_search(&engine, &shadow, query, &options, 1, Some(&allowed)).unwrap();
         assert_eq!(ids(&hits), vec![1]);
     }
@@ -977,5 +984,27 @@ mod tests {
         ];
         let out = rank_hits(hits, &SearchOptions::default());
         assert_eq!(out.len(), 2, "a NaN must not drop results or panic");
+    }
+
+    // -----------------------------------------------------------------------
+    // Document identity (ADR-239)
+    // -----------------------------------------------------------------------
+
+    /// Test 17: two documents with binary `_id`s of one length are two
+    /// documents to the per-document cap and to fusion. Under `Display` both
+    /// were `bin(16 bytes)`, one allowance and one fused hit.
+    #[test]
+    fn two_binary_ids_of_one_length_take_two_slots_and_fuse_as_two() {
+        let (x, y) = (DocId::Binary(vec![1; 16]), DocId::Binary(vec![2; 16]));
+        let hit =
+            |id: &DocId, score: f32| Hit { id: id.clone(), score, chunk: 0, text: String::new() };
+        let options = SearchOptions { k: 2, per_document: 1, ..Default::default() };
+        let ranked = rank_hits(vec![hit(&x, 0.9), hit(&y, 0.8)], &options);
+        assert_eq!(ranked.iter().map(|h| h.id.clone()).collect::<Vec<_>>(), [x.clone(), y.clone()]);
+
+        let fused =
+            reciprocal_rank_fusion(&[vec![hit(&x, 0.9), hit(&y, 0.8)], vec![hit(&y, 0.5)]], 10);
+        assert_eq!(fused.len(), 2, "two documents, not one");
+        assert_eq!(fused[0].id, y, "the one ranked by both halves leads");
     }
 }

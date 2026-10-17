@@ -147,6 +147,14 @@ struct SnapshotMeta {
     #[serde(default)]
     created: Hlc,
     keys: Vec<String>,
+    /// [`Engine::vector_renames`] of the shadow when the graph was built: a
+    /// move of chunks to other ids since (an adoption, or a re-embed that took
+    /// a document off its 0.50 ids) keeps the count and changes the keys, so
+    /// a previous process's graph is judged by this as well as by the count
+    /// (ADR-239). Defaulted, for a snapshot without it, which format 3 refuses
+    /// anyway when it is older.
+    #[serde(default)]
+    renames: u64,
 }
 
 /// Bumped when the snapshot layout changes; a mismatch is a rebuild, not a
@@ -156,7 +164,15 @@ struct SnapshotMeta {
 /// and rebuilt on its first access, which is the ordinary cost of a format
 /// change and cheaper than trusting a graph that cannot say which incarnation
 /// of a name it was built for.
-const SNAPSHOT_FORMAT: u32 = 2;
+///
+/// 3 keys the graph by the id each chunk is stored under (ADR-239). A format-2
+/// graph's keys were recomputed from the records under 0.50's chunk ids, which
+/// named every binary `_id` of one length alike and miss every chunk this build
+/// writes for a binary or for a String whose id changed; adopted on an equal
+/// count, it would serve them for as long as the count held. The cost is one
+/// rebuild per vector collection per member, on its first search after the
+/// upgrade. A 0.50 build refuses a format-3 snapshot in turn, and rebuilds.
+const SNAPSHOT_FORMAT: u32 = 3;
 
 /// What the snapshot at `dir` says it was built for, read from its
 /// `meta.json` and nothing else: which incarnation, and at which shape.
@@ -268,6 +284,9 @@ pub struct HnswIndex {
     /// [`estimate_bytes`] at construction, so the cache can budget without
     /// recomputing it on every install.
     bytes: usize,
+    /// [`SnapshotMeta::renames`]: the shadow's moves of chunk ids when this was
+    /// built, read before its walk.
+    renames: u64,
 }
 
 impl HnswIndex {
@@ -382,13 +401,24 @@ impl HnswIndex {
         // the entire shadow collection — text included — until the
         // reachability probe below had finished with it. That was most of the
         // headroom a rebuild needed, paid every `MAX_STALENESS` under writes.
+        //
+        // The key is the id the chunk is stored under, never one recomputed
+        // from the record (ADR-239): the record's source carries no binary
+        // subtype, and a chunk under a 0.50 id is not at the id this build
+        // would compute, so a recomputed key misses both. A record stored
+        // under an id that is not a String (a client's insert into the
+        // shadow) has no key a load can name, and is left out.
+        // Read before the walk, so a move that lands during it makes the
+        // graph read as behind, never as fresh.
+        let renames = engine.vector_renames(shadow.id)?;
         let mut records: Vec<(String, Vec<f32>)> = Vec::new();
-        engine.for_each_vector(shadow, kimmy_storage::WalkScope::Request, |record| {
+        engine.for_each_vector(shadow, kimmy_storage::WalkScope::Request, |id, record| {
             // A wrong width belongs to a different model and would corrupt
             // every distance the graph computes.
-            if record.vector.len() == dim {
-                let VectorRecord { source, chunk, vector, .. } = record;
-                records.push((VectorRecord::id(&source, chunk).to_string(), vector));
+            if record.vector.len() == dim
+                && let DocId::String(key) = id
+            {
+                records.push((key.clone(), record.vector));
             }
             Ok(true)
         })?;
@@ -465,14 +495,14 @@ impl HnswIndex {
 
         debug!(vectors = keys.len(), "built HNSW index");
         let bytes = estimate_bytes(&keys, dim);
-        let index = Self { graph, keys, metric, dim, created: shadow.created, bytes };
+        let index = Self { graph, keys, metric, dim, created: shadow.created, bytes, renames };
 
         // Ask the sampled vectors to find themselves. A few dozen searches
         // against an O(n log n) build, and no extra reads.
         let mut reach = Reachability::default();
         for (i, vector) in &probes {
             reach.sampled += 1;
-            let found = index.search_keys(vector, 1, None)?;
+            let found = index.search_keys(vector, 1)?;
             if found.first() == index.keys.get(*i) {
                 continue;
             }
@@ -532,6 +562,12 @@ impl HnswIndex {
         self.keys.len()
     }
 
+    /// The shadow's moves of chunk ids when this graph was built
+    /// ([`Engine::vector_renames`]).
+    pub(crate) fn renames(&self) -> u64 {
+        self.renames
+    }
+
     pub fn is_empty(&self) -> bool {
         self.keys.is_empty()
     }
@@ -578,6 +614,7 @@ impl HnswIndex {
             dim: self.dim,
             created: self.created,
             keys: self.keys.clone(),
+            renames: self.renames,
         };
         std::fs::write(
             staging.join("meta.json"),
@@ -639,20 +676,20 @@ impl HnswIndex {
 
         debug!(vectors = meta.keys.len(), ?dir, "loaded HNSW snapshot");
         let bytes = estimate_bytes(&meta.keys, dim);
-        Ok(Self { graph, keys: meta.keys, metric, dim, created: meta.created, bytes })
+        Ok(Self {
+            graph,
+            keys: meta.keys,
+            metric,
+            dim,
+            created: meta.created,
+            bytes,
+            renames: meta.renames,
+        })
     }
 
-    /// Approximate k-nearest neighbours, as chunk keys.
-    ///
-    /// `allowed` holds *document* ids; chunk keys are mapped back before
-    /// comparing. Filtering happens after the graph walk, so the search is
-    /// widened to compensate.
-    pub fn search_keys(
-        &self,
-        query: &[f32],
-        k: usize,
-        allowed: Option<&HashSet<String>>,
-    ) -> Result<Vec<String>> {
+    /// Approximate k-nearest neighbours, as chunk keys: the `k` nearest the
+    /// graph finds, whatever document each belongs to.
+    pub fn search_keys(&self, query: &[f32], k: usize) -> Result<Vec<String>> {
         if query.len() != self.dim {
             return Err(VectorError::DimensionMismatch { expected: self.dim, found: query.len() });
         }
@@ -660,31 +697,12 @@ impl HnswIndex {
             return Ok(Vec::new());
         }
 
-        // A post-filter discards results after the walk, so a selective filter
-        // needs a much wider search to still return k.
-        let wanted = if allowed.is_some() { k * 8 } else { k };
-        let ef = (wanted * EF_SEARCH_FACTOR).max(MIN_EF_SEARCH);
-
+        let ef = (k * EF_SEARCH_FACTOR).max(MIN_EF_SEARCH);
         let neighbours = match &self.graph {
-            Graph::Cosine(g) => g.search(query, wanted, ef),
-            Graph::Euclidean(g) => g.search(query, wanted, ef),
+            Graph::Cosine(g) => g.search(query, k, ef),
+            Graph::Euclidean(g) => g.search(query, k, ef),
         };
-
-        let mut out = Vec::with_capacity(neighbours.len());
-        for neighbour in neighbours {
-            let Some(key) = self.keys.get(neighbour.d_id) else {
-                continue;
-            };
-            if let Some(allowed) = allowed {
-                let matches = VectorRecord::parse_id(&DocId::String(key.clone()))
-                    .is_some_and(|(source, _)| allowed.contains(&source));
-                if !matches {
-                    continue;
-                }
-            }
-            out.push(key.clone());
-        }
-        Ok(out)
+        Ok(neighbours.into_iter().filter_map(|n| self.keys.get(n.d_id).cloned()).collect())
     }
 
     /// Approximate search returning full hits.
@@ -692,26 +710,49 @@ impl HnswIndex {
     /// Over-fetches from the graph, because the per-document cap can collapse
     /// several chunks of one document into a single result and would otherwise
     /// return fewer than `k`.
+    ///
+    /// `allowed` holds *document* ids. A candidate is admitted only once its
+    /// record is loaded, by the document the record names (ADR-239): a key
+    /// names a slot, not who holds it, and a chunk a 0.50 build left at
+    /// another document's id, or debris, would be admitted under one document
+    /// and returned as another. **What is loaded is chosen by the key first**
+    /// ([`may_hold`]): only a key that can hold an admitted document's chunk,
+    /// its run's or its 0.50 id, so a filtered search reads what it reads
+    /// unfiltered scaled by the filter, not every candidate of the widened
+    /// walk. Filtering happens after the graph walk, so the search is widened
+    /// to compensate.
     pub fn search(
         &self,
         engine: &Engine,
         shadow: &CollectionMeta,
         query: &[f32],
         options: &SearchOptions,
-        allowed: Option<&HashSet<String>>,
+        allowed: Option<&HashSet<DocId>>,
     ) -> Result<Vec<Hit>> {
         // Over-fetch: the per-document cap can collapse several chunks of one
         // document into a single result, which would otherwise return under k.
         let over_fetch = (options.k * 4).max(options.k + 10);
-        let keys = self.search_keys(query, over_fetch, allowed)?;
+        // A post-filter discards results after the walk, so a selective filter
+        // needs a much wider search to still return k.
+        let wanted = if allowed.is_some() { over_fetch * 8 } else { over_fetch };
+        let keys = self.search_keys(query, wanted)?;
+        let old_forms = allowed.map(old_forms).unwrap_or_default();
 
         let mut hits = Vec::with_capacity(keys.len());
         for key in keys {
+            if let Some(allowed) = allowed
+                && !may_hold(allowed, &old_forms, &key)
+            {
+                continue;
+            }
             let Some(record) = load_record(engine, shadow, &key)? else {
                 // The index can lag storage; a missing record just means this
                 // chunk was deleted since the build.
                 continue;
             };
+            if !crate::search::admitted(allowed, &record) {
+                continue;
+            }
             hits.push(Hit {
                 score: similarity(query, &record.vector, self.metric),
                 id: record.source,
@@ -721,6 +762,36 @@ impl HnswIndex {
         }
         Ok(crate::search::rank_hits(hits, options))
     }
+}
+
+/// The 0.50 forms of the admitted documents whose chunk ids changed in 0.51.0
+/// ([`VectorRecord::legacy_prefix`], less its `#`): the text before a key's
+/// last `#` when it holds such a document's chunk under the id a 0.50 build
+/// wrote. Empty unless the filter admitted a binary or a reserved String.
+fn old_forms(allowed: &HashSet<DocId>) -> HashSet<String> {
+    allowed
+        .iter()
+        .filter_map(VectorRecord::legacy_prefix)
+        .map(|mut prefix| {
+            prefix.pop();
+            prefix
+        })
+        .collect()
+}
+
+/// Whether the chunk at `key` can be an admitted document's, judged before it
+/// is loaded: its id parses to a source of one (a binary's under any subtype,
+/// as the document key folds it), or it is one's 0.50 id (`old_forms`). Those
+/// are exactly the places a document's own read covers, its run and its 0.50
+/// ids, so no chunk of an admitted document is passed over; whether a loaded
+/// chunk is that document's is still the record's to say.
+fn may_hold(allowed: &HashSet<DocId>, old_forms: &HashSet<String>, key: &str) -> bool {
+    let by_run = VectorRecord::parse_key(key)
+        .and_then(|(source, _)| source.document())
+        .is_some_and(|document| allowed.contains(&document));
+    let by_legacy = !old_forms.is_empty()
+        && key.rsplit_once('#').is_some_and(|(text, _)| old_forms.contains(text));
+    by_run || by_legacy
 }
 
 /// Fetch one chunk record by its stored key.
@@ -743,7 +814,7 @@ fn load_record(
 
 #[cfg(test)]
 mod tests {
-    use kimmy_core::{ChunkConfig, Hlc, ProviderConfig, VectorConfig};
+    use kimmy_core::{ChunkConfig, ChunkSource, Hlc, ProviderConfig, VectorConfig};
 
     use super::*;
 
@@ -811,7 +882,7 @@ mod tests {
         let (engine, shadow, _dir) = setup(0, 8);
         let index = HnswIndex::build(&engine, &shadow, Metric::Cosine, 8).unwrap();
         assert!(index.is_empty());
-        assert!(index.search_keys(&pseudo_random(1, 8), 5, None).unwrap().is_empty());
+        assert!(index.search_keys(&pseudo_random(1, 8), 5).unwrap().is_empty());
     }
 
     #[test]
@@ -819,7 +890,7 @@ mod tests {
         let (engine, shadow, _dir) = setup(10, 8);
         let index = HnswIndex::build(&engine, &shadow, Metric::Cosine, 8).unwrap();
         assert!(matches!(
-            index.search_keys(&[0.0; 4], 5, None).err(),
+            index.search_keys(&[0.0; 4], 5).err(),
             Some(VectorError::DimensionMismatch { .. })
         ));
     }
@@ -883,7 +954,7 @@ mod tests {
         let (engine, shadow, _dir) = setup(COUNT, DIM);
         let mut records = Vec::new();
         engine
-            .for_each_vector(&shadow, kimmy_storage::WalkScope::Request, |r| {
+            .for_each_vector(&shadow, kimmy_storage::WalkScope::Request, |_, r| {
                 records.push(r);
                 Ok(true)
             })
@@ -1014,7 +1085,7 @@ mod tests {
         let (engine, shadow, _dir) = setup(COUNT, DIM);
         let mut records = Vec::new();
         engine
-            .for_each_vector(&shadow, kimmy_storage::WalkScope::Request, |r| {
+            .for_each_vector(&shadow, kimmy_storage::WalkScope::Request, |_, r| {
                 records.push(r);
                 Ok(true)
             })
@@ -1271,15 +1342,14 @@ mod tests {
         let index = HnswIndex::build(&engine, &shadow, Metric::Cosine, 8).unwrap();
         let options = SearchOptions { k: 5, metric: Metric::Cosine, per_document: 1 };
 
-        let allowed: HashSet<String> =
-            (0..100).filter(|i| i % 2 == 0).map(|i| i.to_string()).collect();
+        let allowed: HashSet<DocId> = (0..100).filter(|i| i % 2 == 0).map(DocId::Int64).collect();
         let hits =
             index.search(&engine, &shadow, &pseudo_random(1, 8), &options, Some(&allowed)).unwrap();
 
         assert!(!hits.is_empty(), "the filter should not exclude everything");
         assert!(hits.len() <= options.k, "no more than k: {}", hits.len());
         for hit in &hits {
-            assert!(allowed.contains(&hit.id.to_string()), "{:?} was filtered out", hit.id);
+            assert!(allowed.contains(&hit.id), "{:?} was filtered out", hit.id);
         }
     }
 
@@ -1318,5 +1388,205 @@ mod tests {
             HnswIndex::build(&engine, &shadow, Metric::Dot, 8).is_err(),
             "building a dot index must fail cleanly, not panic later during a query"
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // Chunk ids (ADR-239)
+    // -----------------------------------------------------------------------
+
+    /// `n` documents with UUID `_id`s (binary subtype 4), each chunk stored
+    /// under its own id as the embedding worker stores it, the first at the
+    /// query `[1, 0]` and the rest spread away from it.
+    fn uuid_documents(n: u8) -> (Engine, CollectionMeta, Vec<DocId>, tempfile::TempDir) {
+        let dir = tempfile::tempdir().unwrap();
+        let engine = Engine::open(&dir.path().join("kimmy.redb")).unwrap();
+        engine.create_collection("app", "docs").unwrap();
+        engine.configure_vectors("app", "docs", config(2)).unwrap();
+        let shadow = engine.vector_collection("app", "docs").unwrap().unwrap();
+        let mut ids = Vec::new();
+        for i in 0..n {
+            let id = DocId::Binary(vec![i; 16]);
+            let angle = f32::from(i) * 0.05;
+            put_as_uuid(&engine, &shadow, &id, vec![angle.cos(), angle.sin()], &format!("doc {i}"));
+            ids.push(id);
+        }
+        (engine, shadow, ids, dir)
+    }
+
+    fn put_as_uuid(
+        engine: &Engine,
+        shadow: &CollectionMeta,
+        id: &DocId,
+        vector: Vec<f32>,
+        text: &str,
+    ) {
+        let DocId::Binary(bytes) = id else { panic!("a binary") };
+        let source = ChunkSource::Binary { subtype: 4, bytes: bytes.clone() };
+        let record = VectorRecord {
+            source: id.clone(),
+            chunk: 0,
+            source_hlc: Hlc::new(1, 0),
+            vector,
+            text: text.into(),
+            config: None,
+        };
+        let write = kimmy_storage::VectorWrite::encode(id, &source, &[record]).unwrap();
+        engine
+            .write_batch(kimmy_storage::WriterHolder::Embedding, |scope| {
+                scope.put_vectors(shadow, write)
+            })
+            .unwrap();
+    }
+
+    /// Test 18: the graph finds a subtype-4 document's chunks. Keyed by an id
+    /// recomputed from the record, which carries no subtype, it named ids no
+    /// chunk is stored under and loaded nothing.
+    #[test]
+    fn the_graph_finds_the_chunks_of_a_uuid_document() {
+        let (engine, shadow, ids, _dir) = uuid_documents(40);
+        let index = HnswIndex::build(&engine, &shadow, Metric::Cosine, 2).unwrap();
+        assert_eq!(index.len(), 40);
+        let hex: String = std::iter::repeat_n("00", 16).collect();
+        assert!(index.keys.contains(&format!("~b:{hex}.04#0")), "keyed by the stored id");
+        let options = SearchOptions { k: 3, metric: Metric::Cosine, per_document: 1 };
+        let hits = index.search(&engine, &shadow, &[1.0, 0.0], &options, None).unwrap();
+        assert_eq!(hits.len(), 3);
+        assert_eq!(hits[0].id, ids[0]);
+        assert_eq!(hits[0].text, "doc 0");
+    }
+
+    /// Test 16, the graph's direction: a filtered search admits a candidate by
+    /// the document its record names, after the load. The nearest chunk sits
+    /// at an admitted document's id and names another one (debris); it is not
+    /// returned, though its key names the admitted document.
+    #[test]
+    fn the_graph_admits_a_candidate_by_its_record_not_its_key() {
+        let (engine, shadow, ids, _dir) = uuid_documents(40);
+        let hex: String = std::iter::repeat_n("01", 16).collect();
+        let debris = VectorRecord {
+            source: ids[39].clone(),
+            chunk: 1,
+            source_hlc: Hlc::new(1, 0),
+            vector: vec![1.0, 0.0],
+            text: "debris".into(),
+            config: None,
+        };
+        let doc = bson::serialize_to_document(&debris).unwrap();
+        engine.replace(&shadow, &DocId::String(format!("~b:{hex}.04#1")), doc, true).unwrap();
+        let index = HnswIndex::build(&engine, &shadow, Metric::Cosine, 2).unwrap();
+        let allowed: HashSet<DocId> = [ids[1].clone(), ids[2].clone()].into_iter().collect();
+        let options = SearchOptions { k: 5, metric: Metric::Cosine, per_document: 3 };
+
+        let graph = index.search(&engine, &shadow, &[1.0, 0.0], &options, Some(&allowed)).unwrap();
+        let exact =
+            crate::search::vector_search(&engine, &shadow, &[1.0, 0.0], &options, Some(&allowed))
+                .unwrap();
+        let keyed =
+            crate::search::vector_search_among(&engine, &shadow, &[1.0, 0.0], &options, &ids[1..3])
+                .unwrap();
+        for (path, hits) in [("graph", graph), ("exact", exact), ("keyed", keyed)] {
+            let got: Vec<(DocId, String)> = hits.into_iter().map(|h| (h.id, h.text)).collect();
+            assert_eq!(
+                got,
+                [(ids[1].clone(), "doc 1".to_string()), (ids[2].clone(), "doc 2".to_string())],
+                "{path}"
+            );
+        }
+    }
+
+    /// Test 18: a snapshot in the format a 0.50 build wrote, whose keys were
+    /// recomputed from the records, is refused, and so rebuilt.
+    #[test]
+    fn a_format_2_snapshot_is_refused() {
+        let (engine, shadow, _ids, _dir) = uuid_documents(10);
+        let index = HnswIndex::build(&engine, &shadow, Metric::Cosine, 2).unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("snapshot");
+        index.save(&path).unwrap();
+        assert!(HnswIndex::load(&path, Metric::Cosine, 2, shadow.created).is_ok(), "the control");
+
+        let mut meta: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(path.join("meta.json")).unwrap()).unwrap();
+        meta["format"] = serde_json::json!(2);
+        std::fs::write(path.join("meta.json"), serde_json::to_vec(&meta).unwrap()).unwrap();
+        let refused = HnswIndex::load(&path, Metric::Cosine, 2, shadow.created);
+        assert!(
+            matches!(&refused, Err(VectorError::Snapshot(detail)) if detail.contains("format 2")),
+            "a format-2 graph keyed by 0.50's ids must not be adopted: {:?}",
+            refused.as_ref().err()
+        );
+    }
+
+    /// The filtered graph path loads a candidate only when its key can hold an
+    /// admitted document's chunk, and that includes the ids a 0.50 build
+    /// wrote: an admitted binary whose only chunk is at `bin(16 bytes)#0`, and
+    /// an admitted reserved String whose only chunk is at its raw text, are
+    /// found; another document's chunk at those ids is still refused by its
+    /// record.
+    #[test]
+    fn the_filtered_graph_finds_a_document_whose_only_chunk_is_under_its_050_id() {
+        let (engine, shadow, ids, _dir) = uuid_documents(40);
+        let old_binary = DocId::Binary(vec![200; 16]);
+        let tilde = DocId::String("~x".into());
+        for (key, source, vector, text) in [
+            ("bin(16 bytes)#0", &old_binary, vec![1.0, 0.0], "old binary"),
+            ("~x#0", &tilde, vec![0.999, 0.04], "old tilde"),
+        ] {
+            let record = VectorRecord {
+                source: source.clone(),
+                chunk: 0,
+                source_hlc: Hlc::new(1, 0),
+                vector,
+                text: text.into(),
+                config: None,
+            };
+            let doc = bson::serialize_to_document(&record).unwrap();
+            engine.replace(&shadow, &DocId::String(key.into()), doc, true).unwrap();
+        }
+        let index = HnswIndex::build(&engine, &shadow, Metric::Cosine, 2).unwrap();
+        let allowed: HashSet<DocId> =
+            [old_binary.clone(), tilde.clone(), ids[1].clone()].into_iter().collect();
+        let options = SearchOptions { k: 5, metric: Metric::Cosine, per_document: 1 };
+        let hits = index.search(&engine, &shadow, &[1.0, 0.0], &options, Some(&allowed)).unwrap();
+        let got: Vec<(DocId, String)> = hits.into_iter().map(|h| (h.id, h.text)).collect();
+        assert_eq!(
+            got,
+            [
+                (old_binary, "old binary".to_string()),
+                (tilde, "old tilde".to_string()),
+                (ids[1].clone(), "doc 1".to_string())
+            ]
+        );
+        // A 16-byte binary not admitted keeps its own chunks out.
+        let only: HashSet<DocId> = [ids[2].clone()].into_iter().collect();
+        let hits = index.search(&engine, &shadow, &[1.0, 0.0], &options, Some(&only)).unwrap();
+        assert_eq!(hits.iter().map(|h| h.id.clone()).collect::<Vec<_>>(), [ids[2].clone()]);
+    }
+
+    /// The key pre-filter loads what the filter can admit and nothing else:
+    /// a candidate whose key names no admitted document, in its run or under a
+    /// 0.50 id, is never read.
+    #[test]
+    fn the_key_pre_filter_admits_by_run_and_by_050_id_only() {
+        let allowed: HashSet<DocId> =
+            [DocId::Binary(vec![1; 16]), DocId::String("7".into()), DocId::Int64(9)]
+                .into_iter()
+                .collect();
+        let old = old_forms(&allowed);
+        let hex: String = std::iter::repeat_n("01", 16).collect();
+        for (key, expected) in [
+            (format!("~b:{hex}.04#0"), true),
+            (format!("~b:{hex}.00#3"), true),
+            ("bin(16 bytes)#0".to_string(), true),
+            ("~s:7#0".to_string(), true),
+            ("7#0".to_string(), true),
+            ("9#2".to_string(), true),
+            ("8#0".to_string(), false),
+            ("bin(8 bytes)#0".to_string(), false),
+            ("~s:8#0".to_string(), false),
+            ("junk".to_string(), false),
+        ] {
+            assert_eq!(may_hold(&allowed, &old, &key), expected, "{key}");
+        }
     }
 }

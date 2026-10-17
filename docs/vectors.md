@@ -17,6 +17,17 @@ A vector-enabled collection gets a **shadow collection** — an ordinary
 collection named `{coll}.__vectors`, stored the same way as any other, holding
 one document per *chunk* of one source document.
 
+Each chunk is stored under a String `_id` built from its source `_id` and its
+chunk number, `{source}#{chunk}`. Since 0.51.0 the `{source}` part is an
+encoding that tells every two documents apart ([ADR-239](decisions.md)): an
+ObjectId is its hex, an integer its decimal and a String itself, as before, but
+a binary `_id` is `~b:`, its bytes in hex, `.` and its subtype (a UUID's
+ends `.04`), and a String that could be read as another type (one that begins
+with `~`, is 24 lowercase hex digits, or is an integer's decimal) is `~s:` and
+itself. Until 0.51.0 a binary `_id` was written as its length, so every UUID in a
+collection shared one chunk set; see [Operations](operations.md#vector-chunk-ids-in-0510)
+for what the first start of 0.51.0 does about the chunks such a collection holds.
+
 Nothing special maintains it. A background worker subscribes to the oplog as an
 ordinary change-stream consumer and reacts to what it sees:
 
@@ -576,8 +587,9 @@ filter by speeds the search up exactly as it speeds up `find`, and `find` with
 What happens next depends on how many documents the filter admitted:
 
 - **At most 1,000**: the search reads those documents' chunks from the shadow
-  collection by key — a document's chunks are one contiguous run under its id —
-  and scores them exactly. The cost is the size of the admitted set, not the
+  collection by key — a document's chunks are one contiguous run under its
+  encoded id, and a chunk counts as the document's when its record names the
+  document — and scores them exactly. The cost is the size of the admitted set, not the
   collection, and the answer is exact whichever path the collection would
   otherwise take.
 - **More than 1,000**: the search runs as it would without a filter, exact
