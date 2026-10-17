@@ -1722,14 +1722,17 @@ fn a_sender_finds_the_records_of_the_entries_it_ships() {
         assert_eq!((carried.collection, carried.scope), (coll.id, k.scope));
         assert_eq!(IdempotencyRecord::decode(&carried.record).unwrap(), Some(stored.clone()));
     }
-    let shipped: std::collections::HashSet<Stamp> = entries.iter().copied().skip(4).collect();
+    // A frame that ships the second and third chunks' entries and not the
+    // first's: the range covers all three rows, the frame carries two.
+    let firsts: Vec<Stamp> = at.iter().map(|c| c.carrying).collect();
+    let shipped: std::collections::HashSet<Stamp> =
+        entries.iter().copied().filter(|s| *s > firsts[0]).collect();
     let window =
         idempotency::records_for_window(&txn, entries[0], *entries.last().unwrap(), &|s| {
             shipped.contains(s)
         })
         .unwrap();
-    assert!(window.iter().all(|c| shipped.contains(&c.carrying)));
-    assert_eq!(window.len(), at.iter().filter(|c| shipped.contains(&c.carrying)).count());
+    assert_eq!(window.iter().map(|c| c.carrying).collect::<Vec<_>>(), firsts[1..].to_vec());
 
     drop(txn);
     let other = engine.create_collection("shop", "items").unwrap();
