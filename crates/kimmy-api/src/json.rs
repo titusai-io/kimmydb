@@ -229,9 +229,17 @@ fn extended_json(map: &Map<String, Value>) -> Result<Option<Bson>, ApiError> {
         // re-decode of the stored bytes yielded a Decimal128 — so the member
         // that accepted a write keyed the value under an index its peers,
         // applying the same bytes, filed unkeyed (ADR-139).
+        //
+        // Read by kimmydb's own parser, not `bson`'s `FromStr`, which took
+        // `""` and `"."` as zero, `"++1"` as one and `"e100"` as `0E+100`: a
+        // blank imported price was stored as `0`. The text is a number in the
+        // General Decimal Arithmetic syntax, read exactly, or the request is
+        // refused naming it and saying why.
         "$numberDecimal" => {
             let s = value.as_str().ok_or_else(|| bad("$numberDecimal"))?;
-            Bson::Decimal128(s.parse().map_err(|_| bad("$numberDecimal"))?)
+            Bson::Decimal128(kimmy_core::decimal::parse(s).map_err(|why| {
+                ApiError::bad_request(format!("invalid $numberDecimal: {value}: {why}"))
+            })?)
         }
         "$binary" => {
             use base64::Engine as _;
@@ -465,6 +473,35 @@ mod tests {
         assert!(json_to_bson(&json!({ "$numberDecimal": 1.5 })).is_err());
     }
 
+    /// The texts `bson`'s own parser took as numbers, and a value that would
+    /// need rounding, are refused, `400`, naming the text and the reason.
+    #[test]
+    fn a_decimal128_text_that_is_not_a_number_is_refused_naming_it() {
+        for (text, why) in [
+            ("", "not a decimal number"),
+            (".", "not a decimal number"),
+            ("-", "not a decimal number"),
+            ("++1", "not a decimal number"),
+            ("-+1", "not a decimal number"),
+            ("0+5", "not a decimal number"),
+            ("e100", "not a decimal number"),
+            ("+.E+1", "not a decimal number"),
+            (" 1", "not a decimal number"),
+            ("1.0000000000000000000000000000000001", "more than 34 significant digits"),
+            ("1E+6145", "above the largest Decimal128"),
+            ("1E-6177", "below the smallest Decimal128"),
+        ] {
+            let err = json_to_bson(&json!({ "$numberDecimal": text })).unwrap_err();
+            assert_eq!(err.status, axum::http::StatusCode::BAD_REQUEST, "{text:?}");
+            let message = err.message.to_string();
+            assert!(
+                message.starts_with(&format!("invalid $numberDecimal: {}: ", json!(text)))
+                    && message.contains(why),
+                "{text:?}: {message}"
+            );
+        }
+    }
+
     #[test]
     fn decimal128_is_read_as_it_is_written() {
         // `bson_to_json` has always emitted `$numberDecimal`; the decoder did
@@ -486,6 +523,13 @@ mod tests {
             "-Infinity",
             "9999999999999999999999999999999999",
             "1.234567890123456789012345678901234E-6143",
+            // Exact, though written with more than 34 digits or past the
+            // exponent range: the value is kept, zeros dropped or clamped.
+            "1.0000000000000000000000000000000000000",
+            "1E+6144",
+            "0E+9999",
+            "+.5",
+            "1.",
         ] {
             let b = json_to_bson(&json!({ "$numberDecimal": text })).unwrap();
             assert!(matches!(b, Bson::Decimal128(_)), "{text}");
@@ -493,6 +537,15 @@ mod tests {
             // value, and the JSON form is a fixed point.
             let j = bson_to_json(&b);
             assert_eq!(json_to_bson(&j).unwrap(), b, "{text}");
+            assert_eq!(bson_to_json(&json_to_bson(&j).unwrap()), j, "{text}");
+        }
+
+        // A signalling NaN and a NaN's payload are read, as the syntax allows,
+        // and shown as MongoDB shows every NaN, `NaN`, which is a fixed point.
+        for text in ["sNaN", "NaN123", "-NaN"] {
+            let b = json_to_bson(&json!({ "$numberDecimal": text })).unwrap();
+            let j = bson_to_json(&b);
+            assert_eq!(j, json!({ "$numberDecimal": "NaN" }), "{text}");
             assert_eq!(bson_to_json(&json_to_bson(&j).unwrap()), j, "{text}");
         }
 
