@@ -8996,11 +8996,14 @@ pub(crate) mod tests {
     }
 
     /// A clustered B that owns the collection, through its first-sight rescan,
-    /// with a roll check that answers what the returned cell holds (a live
-    /// member writing 0.50's ids, to begin with).
-    async fn as_a_clustered_owner(roll: &mut Roll) -> Arc<std::sync::Mutex<Option<bool>>> {
+    /// with a roll check that answers what the returned cell holds (`first`,
+    /// to begin with).
+    async fn as_a_clustered_owner(
+        roll: &mut Roll,
+        first: Option<bool>,
+    ) -> Arc<std::sync::Mutex<Option<bool>>> {
         switchable_owner(&mut roll.worker, true);
-        let everywhere = Arc::new(std::sync::Mutex::new(Some(false)));
+        let everywhere = Arc::new(std::sync::Mutex::new(first));
         let answer = Arc::clone(&everywhere);
         roll.worker.set_chunk_ids_check(Box::new(move || *answer.lock().unwrap()));
         roll.worker.ownership_settle = Duration::ZERO;
@@ -9017,7 +9020,7 @@ pub(crate) mod tests {
     #[tokio::test]
     async fn a_mixed_roll_late_050_write_is_judged_again_when_the_roll_finishes() {
         let mut roll = a_mixed_roll().await;
-        let everywhere = as_a_clustered_owner(&mut roll).await;
+        let everywhere = as_a_clustered_owner(&mut roll, Some(false)).await;
         exchange(&roll.a, &roll.b);
         let (late, _) = roll.docs[0].clone();
         as_050_left_it(&roll.a, &roll.coll, &roll.shadow, &[(late.clone(), "alpha, late")]);
@@ -9045,7 +9048,7 @@ pub(crate) mod tests {
         let string =
             roll.a.insert(&roll.coll, doc! { "_id": "7", "body": "string seven" }).unwrap();
         exchange(&roll.a, &roll.b);
-        let everywhere = as_a_clustered_owner(&mut roll).await;
+        let everywhere = as_a_clustered_owner(&mut roll, Some(false)).await;
         exchange(&roll.a, &roll.b);
         assert_eq!(texts(&roll.a, &roll.shadow, &int), ["int seven"]);
 
@@ -9074,16 +9077,14 @@ pub(crate) mod tests {
         assert!(texts(&roll.b, &roll.shadow, &string).is_empty());
     }
 
-    /// The end-of-roll recheck fires on the turn only: a member that finds
-    /// every peer writing 0.51.0's ids from its first evaluation was never in
-    /// a roll, and its first-sight rescan covered its start, so later
-    /// evaluations rescan nothing.
+    /// The end-of-roll recheck fires on the turn from a member writing 0.50's
+    /// ids only: a member whose peers were not yet heard during its first
+    /// sight, and then all write 0.51.0's, was never seen in a roll, and its
+    /// first-sight rescan covered its start, so it rescans nothing more.
     #[tokio::test]
-    async fn no_roll_is_seen_when_every_member_writes_0510s_ids_from_the_start() {
+    async fn no_roll_is_seen_when_no_member_was_seen_writing_050s_ids() {
         let mut roll = a_mixed_roll().await;
-        let everywhere = as_a_clustered_owner(&mut roll).await;
-        // As though it had read `Some(true)` all along.
-        roll.worker.chunk_ids_seen = Some(true);
+        let everywhere = as_a_clustered_owner(&mut roll, None).await;
         *everywhere.lock().unwrap() = Some(true);
         as_050_left_it(&roll.a, &roll.coll, &roll.shadow, &[(roll.docs[0].0.clone(), "late")]);
         exchange(&roll.a, &roll.b);
