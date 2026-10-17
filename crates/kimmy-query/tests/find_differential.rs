@@ -11,10 +11,18 @@
 //! no answer. A test that compares the new code against its own caller cannot
 //! show that, because after the move the two are the same code.
 //!
-//! The Decimal128 lifts (0.51.0) were shown the same way, over this corpus with
-//! its decimals: of 288,040 rows, the 72,960 that changed had all been
-//! `refused` (a decimal operand) and now answer, and no other row changed. The
-//! answers they now give are held, without a second commit, by
+//! 0.51.0's Decimal128 change was measured the same way, over this corpus with
+//! its decimals (288,040 rows), against two parents:
+//!
+//! - against 0.50.0, 79,096 rows change. 72,960 went from `refused` (a decimal
+//!   operand) to an answer, and 6,136 changed answer, 3,969 from a match to no
+//!   match and 2,167 the other way. Every one of those 6,136 is a document
+//!   holding a decimal, which the old order ranked equal to every number: the
+//!   comparator's fix.
+//! - against the exact comparator alone (before the operand refusals were
+//!   lifted), the lifts change only the 72,960 `refused` rows.
+//!
+//! The answers they now give are held, without a second commit, by
 //! `a_decimal128_answers_as_the_number_it_equals` and
 //! `every_numeric_comparison_answers_by_exact_value` below.
 //!
