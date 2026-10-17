@@ -572,15 +572,7 @@ impl Engine {
                 (id, value)
             }
         };
-        // The first of the three chokepoints (ADR-238): a row whose stored
-        // `_id` is a `Decimal128` is created only where every member can hold
-        // it. Keyed on the type of the value stored, not on the `DocId`, which
-        // is an `Int64` for an integral decimal whose body keeps the decimal.
-        // Before anything is checked or filed, so a refusal costs nothing.
         let decimal128_id = crate::decimal128_gate::id_value_is_decimal128(&id_value);
-        if decimal128_id {
-            self.refuse_unless_decimal128_allowed(kimmy_core::Decimal128Use::Id)?;
-        }
         let doc = with_id_first(doc, id_value);
 
         let key = doc_key(&id)?;
@@ -600,6 +592,17 @@ impl Engine {
             // only `bin(16 bytes)` for a binary.
             let named = doc.get(ID_FIELD).map_or_else(|| id.to_string(), ToString::to_string);
             return Err(CoreError::DuplicateKey(named).into());
+        }
+        // The first of the three chokepoints (ADR-238): a row whose stored
+        // `_id` is a `Decimal128` is created only where every member can hold
+        // it. Keyed on the type of the value stored, not on the `DocId`, which
+        // is an `Int64` for an integral decimal whose body keeps the decimal.
+        // **After the duplicate check**: a duplicate creates nothing, and is
+        // `DuplicateKey` whatever its id's type, as a replace over a live
+        // decimal `_id` is never gated. Before anything is filed in an index,
+        // so a refusal costs no index work.
+        if decimal128_id {
+            self.refuse_unless_decimal128_allowed(kimmy_core::Decimal128Use::Id)?;
         }
 
         // Same transaction as the document write, so the index cannot describe
