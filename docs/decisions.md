@@ -19923,7 +19923,33 @@ indexes on such a database, or start it again from empty.
 
 Every row above was run alone on the final tree, across `kimmy-core`, `kimmy-storage`, `kimmy-query` and `kimmy-api` (and `kimmyd` for the last), and names every test that failed.
 
-`a_chosen_partial_index_holds_every_document_find_returns` is the reviewer's differential, in the suite, with a `Decimal128` in its corpus — which is what the corpus exclusions in `partial.rs` and `plan.rs` existed to avoid. It asserts its own premises: 432 documents, 442 filters, 1,412 queries, **27 of the documents holding a `Decimal128`**, and more than ten thousand index uses, because an empty search satisfies every other assertion in it. It runs in 5.7 s.
+**Amended 2026-10-16 — the table above is retired with the filing (ADR-238).**
+Its rows guarded a run that no longer exists, and the tests they name were
+rewritten or renamed to what remains true. The rows that replace them, each
+applied alone to the committed tree, its targeted tests run, all killed:
+
+| Taken out, or put back | What fails |
+|---|---|
+| the undecidable filing restored: a decimal at a filtered path the filter does not select is held by the index | `a_partial_index_holds_exactly_what_the_filter_selects`, `a_document_the_filter_decides_against_is_absent_a_decimal_included`, the moves, backfill and unique tests, `a_partial_filter_decides_a_decimal_by_its_exact_value_in_both_directions`, the replicated, snapshot and both migration tests, and `the_executor_yields_each_candidate_once_and_loses_none` (a candidate outside the filter) |
+| the same, filed in a sentinel run and never enforced (this record's first sketch) | the same tests but the expiry one |
+| the schema 5 refill filing a not-selected decimal in the `UNDECIDABLE` run | `a_migrated_store_equals_the_store_this_build_writes`, `the_money_field_collision_is_reported`, `a_ttl_partial_index_over_decimals_counts_and_expires_by_exact_value`, and both 3 → 5 rebuild tests |
+| the drain leaving the sentinel runs (clearing from `ABOVE_SENTINELS`) | `a_migrated_store_equals_the_store_this_build_writes`, the money-field and TTL migration tests |
+| `undecidable: 0` kept on an index | `an_index_carries_every_field_the_specification_requires`, `explain_reads_only_what_the_filter_selects_a_decimal_included` |
+| `undecidableCandidates: 0` kept in `explain` | `explain_reads_only_what_the_filter_selects_a_decimal_included` |
+| `kimmy_index_undecidable_total` kept at 0 | the render's golden and its parse, `the_metrics_body_exposes_exactly_these_series_in_exactly_this_order`, `operations_lists_every_series_the_metrics_endpoint_exposes` |
+| openapi still requiring `undecidable` | `an_index_carries_every_field_the_specification_requires` |
+| the OTLP instrument `kimmy.index.undecidable` kept | `no_two_bridge_instruments_read_the_same_field` |
+| a decimal below a filter's bound read as equal to it (TTL wrong one way) | `a_partial_filter_decides_a_decimal_by_its_exact_value_in_both_directions`, `a_ttl_partial_index_over_decimals_counts_and_expires_by_exact_value` |
+| a decimal above a filter's bound read as equal to it (TTL wrong the other way) | `a_partial_filter_decides_a_decimal_by_its_exact_value_in_both_directions` |
+| the migration's TTL count reading the unkeyed run, or looking a document up under its schema 5 key | `a_ttl_partial_index_over_decimals_counts_and_expires_by_exact_value`, `a_migrated_store_equals_the_store_this_build_writes` |
+| a selected decimal not enforced on a local write | `a_unique_partial_index_enforces_on_a_decimal_its_filter_selects`, `the_money_field_collision_is_reported` |
+| a merged pair of selected decimals not reported | `a_merged_pair_of_selected_decimals_is_a_reported_violation` |
+| a local backfill not checking a selected decimal's key | `a_backfill_decides_a_decimal_at_the_filtered_path` |
+| the refill's collision check skipping a selected decimal | `the_money_field_collision_is_reported` |
+| the comparator's decimal-against-binary arm answering `Equal` (this record's defect) | `implication_is_sound_for_what_find_selects`, `no_filter_is_used_for_a_query_it_does_not_contain`, `a_chosen_partial_index_holds_every_document_find_returns` |
+| `implies` relating a decimal bound across type brackets | the same three |
+
+`a_chosen_partial_index_holds_every_document_find_returns` is the reviewer's differential, in the suite, with a `Decimal128` in its corpus — which is what the corpus exclusions in `partial.rs` and `plan.rs` existed to avoid. It asserts its own premises: 432 documents, 442 filters, 1,412 queries, **27 of the documents holding a `Decimal128`**, and more than ten thousand index uses, because an empty search satisfies every other assertion in it. It runs in 5.7 s. (**Amended 2026-10-16:** with ADR-238 it holds decimals on every side and models membership as `selects` alone: 531 documents, 117 of them holding a `Decimal128`, 582 filters, 130 with a decimal bound, 1,840 queries, 416 with a decimal operand, and 35,106 index uses, in about 9 s.)
 
 The old test `a_document_outside_a_partial_filter_is_not_unkeyed_it_is_absent` stated the rule as "outside the filter means absent", which stopped being the whole truth. It is renamed and widened rather than left to contradict the code.
 
