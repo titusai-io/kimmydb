@@ -2573,7 +2573,7 @@ to the release, and no more than that: it sits beside the archive, and whoever
 could replace one could replace both.
 
 ```bash
-V=0.50.0; A=kimmyd-x86_64-unknown-linux-musl.tar.xz
+V=0.51.0; A=kimmyd-x86_64-unknown-linux-musl.tar.xz
 curl -LO "https://github.com/titusai-io/kimmydb/releases/download/v$V/$A"
 curl -LO "https://github.com/titusai-io/kimmydb/releases/download/v$V/$A.sha256"
 shasum -a 256 -c "$A.sha256"
@@ -2593,7 +2593,7 @@ signing key, because there is none to copy. `gh` performs the check:
 gh attestation verify kimmyd-x86_64-unknown-linux-musl.tar.xz -R titusai-io/kimmydb
 
 # The container image, by tag or by digest
-gh attestation verify oci://ghcr.io/titusai-io/kimmydb:0.50.0 -R titusai-io/kimmydb
+gh attestation verify oci://ghcr.io/titusai-io/kimmydb:0.51.0 -R titusai-io/kimmydb
 ```
 
 A successful verification prints the workflow that produced the artifact and
@@ -2741,8 +2741,9 @@ filesystems measured.
 2. **From here, 0.50 and 0.49 refuse the store.** `kimmy.format` records schema
    5 just before the first commit, which writes schema 5 into the store and
    lists the work as markers. A start of 0.50 or 0.49 on the store, finished or
-   interrupted, is refused with nothing written, and so is a 0.50 restore of a
-   backup taken on 0.51.0; 0.50's `kimmyd check-store` answers `not_checked`.
+   interrupted, is refused — `kimmy.redb` and `kimmy.format` are left bytewise as they were and no file is added or removed, but the refusing build rewrites `kimmy.last-exit` to record the failed start (exit `error`, `failed_start`, the cause and a `[previous]` block), which a later 0.51.0 start reads with no effect.
+   A 0.50 `kimmyd restore` of a backup taken on 0.51.0 is refused with nothing
+   written: the data directory stays empty; 0.50's `kimmyd check-store` answers `not_checked`.
 3. **Every document with an integer `_id` is re-keyed** (tombstones too), a
    chunk of 8,192 rows per commit, in two passes through a staging table, and
    **every index is drained and rebuilt** from the documents, a chunk of about
@@ -2813,9 +2814,14 @@ readiness wait against this before the roll**, and allow for the migration
 and the oplog walk being longer than `storage.oplog_retention_secs`: then the
 member's return is a whole-database snapshot.
 
+**Restoring a 0.50 backup with 0.51.0 migrates inside the restore.** `kimmyd restore` of a
+backup taken at storage schema 4 runs the whole migration (the free-space check, the re-key,
+the index rebuild) before it prints `restored …`, taking the time a first start would, and the
+next start finds schema 5 and migrates nothing.
+
 ### Rolling back, and `kimmy.format`
 
-**From 0.36.0, a build that refuses a newer store writes nothing to it**
+**From 0.36.0, a build that refuses a newer store writes nothing to it** (it does record the failed start in `kimmy.last-exit`, beside the store, and touches nothing else)
 ([ADR-190](decisions.md)). Before it opens `kimmy.redb` for writing, it reads
 redb's file header and `kimmy.format`, a small sidecar file beside the database.
 It refuses to start, with the path and what was newer, when any of these is
@@ -2863,7 +2869,7 @@ defaults rolls back untouched.
 
 **Rolling back from 0.47.1 to 0.47.0 needs nothing:** the store, the wire and the configuration are the same, and the release changes only a log level and where a change stream starts.
 
-**Rolling back from 0.51.0 to 0.50.x or 0.49.x needs the backup taken before the upgrade.** Storage schema 5 is a rollback boundary ([ADR-238](decisions.md)): from the moment a 0.51.0 start raises `kimmy.format` to schema 5, just before its migration's first commit, 0.50 and 0.49 refuse the store with nothing written, an interrupted migration's included, and refuse a backup taken on 0.51.0 before the restore creates a file. A 0.51.0 start that was refused before that point (the free-space check, an unparseable partial filter) leaves a store 0.50 opens. The way back is the backup taken before the upgrade (`BACKUP=true`): restored on 0.50, it loses every write made after it on that member, which the member then catches up from its peers. Wiping the data directory and letting the member catch up from its peers works while no member holds a document whose `_id` is a `Decimal128`.
+**Rolling back from 0.51.0 to 0.50.x or 0.49.x needs the backup taken before the upgrade.** Storage schema 5 is a rollback boundary ([ADR-238](decisions.md)): from the moment a 0.51.0 start raises `kimmy.format` to schema 5, just before its migration's first commit, 0.50 and 0.49 refuse the store, an interrupted migration's included: `kimmy.redb` and `kimmy.format` are left bytewise as they were and no file is added or removed, but the refusing build rewrites `kimmy.last-exit` to record the failed start (exit `error`, `failed_start`, the cause and a `[previous]` block), which a later 0.51.0 start reads with no effect. They refuse a backup taken on 0.51.0 before the restore creates a file, so the data directory stays empty and nothing is written. A 0.51.0 start that was refused before that point (the free-space check, an unparseable partial filter) leaves a store 0.50 opens. The way back is the backup taken before the upgrade (`BACKUP=true`): restored on 0.50, it loses every write made after it on that member, which the member then catches up from its peers. Wiping the data directory and letting the member catch up from its peers works while no member holds a document whose `_id` is a `Decimal128`.
 
 #### `cluster.decimal128` and the marker
 

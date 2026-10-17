@@ -197,7 +197,7 @@ relays a drop it ignored and a creation its database's drop refused, as entries 
 rollback boundary to 0.50.x and 0.49.x, and give the roll a declaration.** Every number
 key on disk changes, so the first start migrates the store before it serves (about 16 to 19 minutes
 for 2,000,000 documents with integer `_id`s and three indexes on the lab host) and, from the
-moment it raises the sidecar, a 0.50 or 0.49 build refuses the store; the way back is the
+moment it raises the sidecar, a 0.50 or 0.49 build refuses the store (leaving `kimmy.redb` and `kimmy.format` as they were, though it rewrites `kimmy.last-exit` to record the failed start); the way back is the
 backup taken before the upgrade. The wire does not change shape: every key a member sends
 or hashes into the cut digest keeps its schema 4 form, so a 0.50 and a 0.51 member in one
 cluster compare and repair as two 0.50 members do, and a 0.51 member's tombstone horizon
