@@ -219,6 +219,37 @@ fn an_upsert_and_a_set_on_insert_that_create_a_decimal_id_are_refused() {
     assert!(marked(&e), "the upsert's commit carries the marker");
 }
 
+#[test]
+fn a_duplicate_decimal_id_is_a_duplicate_key_while_the_gate_is_closed() {
+    // A duplicate creates nothing, so the gate has nothing to answer: it is
+    // `DuplicateKey`, as for any id, and as a replace over the same live row is
+    // never gated. Nothing is written and no marker moves.
+    let (e, _d) = engine();
+    e.create_collection("shop", "orders").unwrap();
+    let c = coll(&e);
+    e.insert(&c, doc! { "_id": dec("1.5") }).unwrap();
+    e.insert(&c, doc! { "_id": 5 }).unwrap();
+    close(&e);
+    let duplicate = |result: crate::Result<DocId>, what: &str| match result {
+        Err(StorageError::Core(CoreError::DuplicateKey(_))) => {}
+        other => panic!("{what}: expected DuplicateKey, found {other:?}"),
+    };
+    duplicate(e.insert(&c, doc! { "_id": dec("1.5") }), "the same decimal");
+    duplicate(e.insert(&c, doc! { "_id": dec("1.50") }), "the same value in another cohort");
+    duplicate(e.insert(&c, doc! { "_id": dec("5") }), "an integral decimal over the integer");
+    let batch = e.insert_many(&c, vec![doc! { "_id": 9 }, doc! { "_id": dec("1.5") }]).unwrap_err();
+    assert_eq!(batch.index, Some(1));
+    assert!(matches!(batch.source, StorageError::Core(CoreError::DuplicateKey(_))), "{batch:?}");
+    assert_eq!(count(&e), 2, "nothing was written");
+    // A new decimal id is still refused, in a batch with a duplicate of itself too:
+    // the first creates, and is the gate's.
+    gated(e.insert(&c, doc! { "_id": dec("2.5") }).unwrap_err(), Decimal128Use::Id);
+    let batch = e.insert_many(&c, vec![doc! { "_id": dec("3.5") }, doc! { "_id": dec("3.5") }]);
+    let batch = batch.unwrap_err();
+    assert_eq!(batch.index, Some(0));
+    gated(batch.source, Decimal128Use::Id);
+}
+
 // -- The second chokepoint: replace_in_txn ------------------------------------------
 
 #[test]
@@ -449,4 +480,72 @@ fn a_repaired_decimal_bound_definition_is_built_with_the_gate_closed() {
     let done = b.apply_snapshot_page(a.node_id(), &mut progress, &page).unwrap();
     assert_eq!(done.definitions.built, 1, "{done:?}");
     assert!(names(&b).contains(&"positive".to_string()), "the repair built it");
+}
+
+#[test]
+fn an_identical_recreate_of_a_replicated_decimal_bound_index_stands_with_the_gate_closed() {
+    // A client that creates its indexes on every boot, on a member whose key is not
+    // set, re-creates a definition the member already holds by replication: the
+    // idempotent answer, as for any index, and nothing minted.
+    let (a, b, _d) = pair();
+    let held = bounded(&a, doc! { "balance": { "$gt": dec("0") } }).unwrap();
+    pull(&b, &a);
+    let before = b.oplog_entries().unwrap();
+    let again = bounded(&b, doc! { "balance": { "$gt": dec("0") } }).unwrap();
+    assert_eq!(again.created, held.created, "the standing definition, not a new one");
+    assert_eq!(b.oplog_entries().unwrap(), before, "nothing minted");
+    // A different definition under the name is `IndexExists`, as for any index:
+    // nothing would be minted either.
+    match bounded(&b, doc! { "balance": { "$gt": dec("1") } }) {
+        Err(StorageError::Core(CoreError::IndexExists { .. })) => {}
+        other => panic!("expected IndexExists, found {other:?}"),
+    }
+    // A new decimal-bound definition under another name is still the gate's.
+    let refused = b.create_index_with(
+        "shop",
+        "orders",
+        vec![IndexField::ascending("email")],
+        false,
+        crate::Enforcement::Local,
+        Some("other".into()),
+        None,
+        Some(doc! { "balance": { "$lt": dec("0") } }),
+    );
+    gated(refused.unwrap_err(), Decimal128Use::PartialFilterBound);
+}
+
+#[test]
+fn the_restamp_of_an_inherited_decimal_bound_index_is_the_gates() {
+    // An identical definition inherited from the collection's earlier life is
+    // re-stamped by a local create: a new creation, replicated as one, so it waits
+    // for the gate like a new definition.
+    let (a, da) = engine();
+    let (b, db) = engine();
+    let _dirs = (da, db);
+    let on_a = a.create_collection("shop", "orders").unwrap();
+    open(&a);
+    bounded(&a, doc! { "balance": { "$gt": dec("0") } }).unwrap();
+    a.insert(&on_a, doc! { "_id": 1i64, "balance": 1 }).unwrap();
+    assert!(a.drop_collection("shop", "orders").unwrap());
+    a.finish_purges_now().unwrap();
+    later();
+    let on_b = b.create_collection("shop", "orders").unwrap();
+    b.insert(&on_b, doc! { "_id": 2i64 }).unwrap();
+    let start = b.version_vector().unwrap().behind(&a.version_vector().unwrap()).unwrap();
+    let entries = a.entries_for_peer(start, 10_000, WalkScope::Background).unwrap().entries;
+    let drop_at = entries.iter().position(|e| e.kind == kimmy_core::OpKind::DropCollection);
+    b.apply_batch(&entries[..drop_at.expect("the drop is in the window")]).unwrap();
+    let inherited = b.get_collection("shop", "orders").unwrap();
+    assert!(inherited.indexes[0].created.unwrap().hlc < inherited.created, "premise: inherited");
+
+    close(&b);
+    let refused = bounded(&b, doc! { "balance": { "$gt": dec("0") } });
+    gated(refused.unwrap_err(), Decimal128Use::PartialFilterBound);
+    let after = b.get_collection("shop", "orders").unwrap();
+    assert_eq!(after.indexes[0].created, inherited.indexes[0].created, "not re-stamped");
+
+    open(&b);
+    bounded(&b, doc! { "balance": { "$gt": dec("0") } }).unwrap();
+    let after = b.get_collection("shop", "orders").unwrap();
+    assert!(after.indexes[0].created > inherited.indexes[0].created, "re-stamped once allowed");
 }

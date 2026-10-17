@@ -9,9 +9,12 @@
 //! move it.
 //!
 //! The form is a type, [`LegacyKey`], so that a stored (schema-5) key cannot be
-//! handed to something expecting a legacy one. It is constructed by
-//! [`legacy_key`] (from a `DocId`), [`legacy_of_stored`] (from a stored key; total)
-//! and, at the wire boundary only, [`LegacyKey::from_wire`].
+//! handed to something expecting a legacy one. It is constructed by [`legacy_key`]
+//! (from a `DocId`) and [`legacy_of_stored`] (from a stored key; total), and by
+//! nothing else: there is no constructor from raw bytes, so a stored key passed
+//! where a legacy one is wanted does not compile. Bytes received from a peer are
+//! read back through both conversions, `legacy_of_stored(&stored_of_legacy(b))`,
+//! which is the identity on every legacy key a 0.50 or a 0.51 member sends.
 //!
 //! A `Decimal128` id has no schema-4 form. It travels as `0xFF` followed by its
 //! stored key, which no schema-4 key can begin with (the highest tag is
@@ -38,13 +41,6 @@ const EXPONENT_BIAS: i32 = 32_768;
 pub struct LegacyKey(Vec<u8>);
 
 impl LegacyKey {
-    /// Wrap bytes received from a peer or a client, which are legacy by
-    /// definition. Only the wire boundary has any business calling this; every
-    /// other legacy key comes from [`legacy_key`] or [`legacy_of_stored`].
-    pub fn from_wire(bytes: Vec<u8>) -> Self {
-        Self(bytes)
-    }
-
     pub fn as_bytes(&self) -> &[u8] {
         &self.0
     }

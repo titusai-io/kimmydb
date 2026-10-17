@@ -1,0 +1,19 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc 1efaaf324b026e744f902a29eb30a308558d039764cb4a3a0dff0ab8c93bf43a # shrinks to bytes = [], (other, _) = (Bson(ObjectId("000000000000000000000000")), Bson(String("000000000000000000000000"))), cut = 0, st = 0, n = 0
+cc 736bba96dbace778bc4c0f1c0940ad13c1b86b5b5ff52f41ff467b22360761ff # shrinks to a = Bson(String("~")), n = 0
+cc 195053be591a6bf5dbef12e67cfa3b6402d8f1473888c6dda795a40a764111d7 # shrinks to (a, b) = (Bson(Binary { subtype: Generic, bytes: [] }), Bson(String("~b:.00"))), n = 0, m = 0
+cc 78ea8915314037be4f506b82ae6f8ca7c7897180396b1b628d8257d5723127e0 # shrinks to (a, b) = (Bson(ObjectId("000000000000000000000000")), Bson(String("000000000000000000000000"))), n = 1, m = 1
+cc 85ae663ef8db00f7d9396269a8cb95ebc93c88af38bcc4f5eda4e990aca27290 # shrinks to a = Bson(String("a0aaa0aa00a0aaaa000a0a00")), n = 0
+cc 348304236850d7bf3465734d43b15d5976c191d3eb2fc2c0dc542afaf3914c9d # shrinks to (a, b) = (Bson(Int32(0)), Bson(String("0"))), n = 0, m = 0
+cc 56faeb0d0eb402cb55762b47e17ec142b9abfda9f450ce6a74e1dc80a35c7330 # shrinks to a = Bson(String("0")), n = 0
+cc 835b9fd309db07d5e5c60cda033898b131f2d39314c6b112ea4d97ff86b0585a # shrinks to a = Bson(Int64(-1)), n = 0, at = Index(0), with = '0'
+cc c542d19bd2abb1f5cc75c17bbb05952937968fbdd4fd990bddd0e7fb876d4c11 # shrinks to a = Bson(Binary { subtype: Function, bytes: [] }), n = 0
+cc cfefe999321b4c77420a741f9fdbdd0fde65b3c9f58bcf73b08826242c2343f9 # shrinks to a = Bson(Binary { subtype: Generic, bytes: [0, 0, 0, 0, 0] }), n = 0, at = Index(14347467612885206813), with = '9'
+cc 5ea842e7f284f6a6b621ecaab0d5275f03d94f28f569732de22834191c90d03b # shrinks to (a, b) = (Bson(Binary { subtype: Generic, bytes: [] }), Bson(Binary { subtype: Function, bytes: [] })), n = 4294967295, m = 4294967295
+cc 7b9ccae9f41d54329a4347fb4c191cbf61a52000183277106b65645ca7dd2370 # shrinks to t = "-#+0"
+cc c8210f5c485ad5d08eb1e84f250f08ea2ed5e9b6c14baace9126995f7b025f51 # shrinks to a = Bson(Int32(0)), n = 3000000000, at = Index(3074457345618258603), with = '#'

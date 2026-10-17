@@ -1223,9 +1223,11 @@ async fn resolve_query_vector(
 struct Allowed {
     /// Every admitted id, for the join that reads their chunks by key.
     ids: Vec<DocId>,
-    /// The same ids as the strings a chunk's `source` renders to, for the
-    /// join that searches everything and discards.
-    set: HashSet<String>,
+    /// The same ids as a set, for the join that searches everything and
+    /// discards: compared with the document a chunk's record names, as a
+    /// `DocId` (ADR-239). Its rendering made every binary `_id` of one length
+    /// one document, and a String `"7"` the Int64 `7`.
+    set: HashSet<DocId>,
     /// How the filter was answered — which access path, how much it examined
     /// — so a test can hold the planner to having run. Summed across pages.
     stats: QueryStats,
@@ -1320,7 +1322,7 @@ fn filter_ids(
             };
             let id = DocId::try_from_bson(raw)?;
             last = Some(kimmy_core::keyenc::encode(&id.to_bson())?);
-            set.insert(id.to_string());
+            set.insert(id.clone());
             ids.push(id);
         }
         match stats.as_mut() {
@@ -1822,13 +1824,13 @@ mod tests {
         shadow: &kimmy_storage::CollectionMeta,
         query: &[f32],
         options: &SearchOptions,
-        allowed: &HashSet<String>,
+        allowed: &HashSet<DocId>,
     ) -> Vec<(String, u32, f32, String)> {
         let mut all = Vec::new();
         state
             .engine
-            .for_each_vector(shadow, kimmy_storage::WalkScope::Request, |r| {
-                if allowed.contains(&r.source.to_string()) {
+            .for_each_vector(shadow, kimmy_storage::WalkScope::Request, |_, r| {
+                if allowed.contains(&r.source) {
                     let score = similarity(query, &r.vector, options.metric);
                     all.push((r.source.to_string(), r.chunk, score, r.text));
                 }
@@ -1982,5 +1984,179 @@ mod tests {
             detail: "not present on this node".into(),
         });
         assert_eq!(unknown_model.log_level(), Some(LogLevel::Error));
+    }
+
+    // -----------------------------------------------------------------------
+    // Document identity in search (ADR-239)
+    // -----------------------------------------------------------------------
+
+    /// Write `records` for the document keyed `id` as the embedding worker
+    /// does: under the chunk source its stored `_id` names.
+    fn embedded_as_stored(
+        state: &SharedState,
+        shadow: &kimmy_storage::CollectionMeta,
+        id: &DocId,
+        stored_id: &bson::Bson,
+        records: Vec<VectorRecord>,
+    ) {
+        let source = kimmy_core::ChunkSource::of(id, Some(stored_id));
+        let write = kimmy_storage::VectorWrite::encode(id, &source, &records).unwrap();
+        state
+            .engine
+            .write_batch(kimmy_storage::WriterHolder::Embedding, |scope| {
+                scope.put_vectors(shadow, write)
+            })
+            .unwrap();
+    }
+
+    fn chunk(id: &DocId, angle: f32, text: &str) -> VectorRecord {
+        VectorRecord {
+            source: id.clone(),
+            chunk: 0,
+            source_hlc: kimmy_core::Hlc::new(1, 0),
+            vector: vec![angle.cos(), angle.sin()],
+            text: text.into(),
+            config: None,
+        }
+    }
+
+    /// The defect page's fixture: four documents with UUID `_id`s, two per
+    /// tenant, each with its own chunk, and document 4 nearest the query
+    /// `[1, 0]`. Plus debris: a chunk at document 1's id whose record names
+    /// document 4, as a 0.50 member's write can leave, nearest of all.
+    fn tenants(
+        state: &SharedState,
+    ) -> (kimmy_storage::CollectionMeta, kimmy_storage::CollectionMeta, Vec<DocId>) {
+        state.engine.create_collection("app", "docs").unwrap();
+        state.engine.configure_vectors("app", "docs", config()).unwrap();
+        let source = state.engine.get_collection("app", "docs").unwrap();
+        let shadow = state.engine.vector_collection("app", "docs").unwrap().unwrap();
+        let mut ids = Vec::new();
+        for (seed, tenant, text, angle) in [
+            (0u8, "a", "alpha report", 0.6f32),
+            (16, "a", "beta report", 0.8),
+            (32, "b", "gamma secret", 0.2),
+            (48, "b", "delta secret", 0.1),
+        ] {
+            let stored = bson::Bson::Binary(bson::Binary {
+                subtype: bson::spec::BinarySubtype::Uuid,
+                bytes: (seed..seed + 16).collect(),
+            });
+            let id = state
+                .engine
+                .insert(
+                    &source,
+                    bson::doc! { "_id": stored.clone(), "tenant": tenant, "text": text },
+                )
+                .unwrap();
+            embedded_as_stored(state, &shadow, &id, &stored, vec![chunk(&id, angle, text)]);
+            ids.push(id);
+        }
+        let debris = bson::serialize_to_document(&chunk(&ids[3], 0.0, "debris of delta")).unwrap();
+        let at: String = (0u8..16).map(|b| format!("{b:02x}")).collect();
+        state
+            .engine
+            .replace(&shadow, &DocId::String(format!("~b:{at}.04#1")), debris, true)
+            .unwrap();
+        (source, shadow, ids)
+    }
+
+    /// V2 inverted: an unfiltered search over four UUID documents returns
+    /// four documents, each with its own text. It returned one at 0.50.0.
+    #[test]
+    fn v2_an_unfiltered_search_returns_every_uuid_document() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = live_state(&dir);
+        let (_, shadow, ids) = tenants(&state);
+        let options = SearchOptions { k: 10, metric: Metric::Cosine, per_document: 1 };
+        let hits = knn(&state, &shadow, &config(), &[1.0, 0.0], &options, None).unwrap();
+        let mut got: Vec<(DocId, String)> = hits.into_iter().map(|h| (h.id, h.text)).collect();
+        got.sort();
+        // Document 4's nearest chunk is the debris that names it, wherever it
+        // is stored: a chunk is scored as the document its record names.
+        let texts = ["alpha report", "beta report", "gamma secret", "debris of delta"];
+        let mut expected: Vec<(DocId, String)> =
+            ids.iter().cloned().zip(texts.map(String::from)).collect();
+        expected.sort();
+        assert_eq!(got, expected, "four documents, not one per id length");
+        assert_eq!(
+            render(&knn(&state, &shadow, &config(), &[1.0, 0.0], &options, None).unwrap())["count"],
+            4
+        );
+    }
+
+    /// V3 inverted (test 16): a filter that admits tenant `a` returns only
+    /// tenant `a`'s documents, with their own text, by both join directions:
+    /// not the debris at document 1's id, though it is nearest, and not
+    /// another tenant's document of the same id length.
+    #[test]
+    fn v3_a_filtered_search_never_returns_a_document_outside_its_filter() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = live_state(&dir);
+        let (source, shadow, ids) = tenants(&state);
+        let allowed =
+            filter_ids(&state, &source, &parse(bson::doc! { "tenant": "a" }), 1_000).unwrap();
+        assert_eq!(allowed.ids, ids[..2]);
+        for join in [Join::Keyed, Join::Discard] {
+            for per_document in [1, 3] {
+                let options = SearchOptions { k: 10, metric: Metric::Cosine, per_document };
+                let hits = knn_joined(
+                    &state,
+                    &shadow,
+                    &config(),
+                    &[1.0, 0.0],
+                    &options,
+                    Some((&allowed, join)),
+                )
+                .unwrap();
+                let got: Vec<(DocId, String)> = hits.into_iter().map(|h| (h.id, h.text)).collect();
+                assert_eq!(
+                    got,
+                    [
+                        (ids[0].clone(), "alpha report".into()),
+                        (ids[1].clone(), "beta report".into())
+                    ],
+                    "{join:?}, per_document {per_document}"
+                );
+            }
+        }
+    }
+
+    /// V5 inverted: a filter on the Int64 `7` returns the Int64's document and
+    /// never the String `"7"`'s, by both join directions.
+    #[test]
+    fn v5_a_filter_on_an_int64_does_not_return_the_string_that_prints_as_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = live_state(&dir);
+        state.engine.create_collection("app", "docs").unwrap();
+        state.engine.configure_vectors("app", "docs", config()).unwrap();
+        let source = state.engine.get_collection("app", "docs").unwrap();
+        let shadow = state.engine.vector_collection("app", "docs").unwrap().unwrap();
+        for (stored, text, angle) in [
+            (bson::Bson::Int32(7), "int seven", 0.5f32),
+            (bson::Bson::String("7".into()), "string seven", 0.0),
+        ] {
+            let id = state
+                .engine
+                .insert(&source, bson::doc! { "_id": stored.clone(), "text": text })
+                .unwrap();
+            embedded_as_stored(&state, &shadow, &id, &stored, vec![chunk(&id, angle, text)]);
+        }
+        let allowed = filter_ids(&state, &source, &parse(bson::doc! { "_id": 7 }), 1_000).unwrap();
+        assert_eq!(allowed.ids, [DocId::Int64(7)]);
+        for join in [Join::Keyed, Join::Discard] {
+            let options = SearchOptions { k: 10, metric: Metric::Cosine, per_document: 1 };
+            let hits = knn_joined(
+                &state,
+                &shadow,
+                &config(),
+                &[1.0, 0.0],
+                &options,
+                Some((&allowed, join)),
+            )
+            .unwrap();
+            let got: Vec<(DocId, String)> = hits.into_iter().map(|h| (h.id, h.text)).collect();
+            assert_eq!(got, [(DocId::Int64(7), "int seven".to_string())], "{join:?}");
+        }
     }
 }

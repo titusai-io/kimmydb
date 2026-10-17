@@ -15702,10 +15702,14 @@ async fn the_marker_reaches_readyz_and_metrics_with_the_first_decimal_id() {
     assert!(metrics_text(&server).await.contains("\nkimmy_decimal128_id_present 1\n"));
 
     // A replace over the existing decimal id creates nothing and is not refused
-    // once the gate closes.
+    // once the gate closes, and an insert of it again is the duplicate it is for
+    // any id, not the gate's refusal.
     close_decimal128_gate(&server);
     let res = server.put(&format!("{docs}/7"), Some(&token), json!({ "v": 2 })).await;
     assert_eq!(res.status, 200, "{:?}", res.body);
+    let res = server.post(docs, Some(&token), json!({ "_id": decimal("7") })).await;
+    assert_eq!(res.status, 409, "{:?}", res.body);
+    assert_eq!(res.body["error"], "duplicate_key", "{:?}", res.body);
     let found = server
         .post("/v1/db/shop/coll/c/find", Some(&token), json!({ "filter": { "_id": 7 } }))
         .await;

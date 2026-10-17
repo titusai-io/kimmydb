@@ -675,6 +675,13 @@ fn parse_array_sort(value: &Bson) -> Result<ArraySort> {
         Bson::Int32(-1) | Bson::Int64(-1) | Bson::Double(-1.0) => {
             Ok(ArraySort::Whole { descending: true })
         }
+        // A decimal direction by its value, as `1.0` and `-1.0` are.
+        Bson::Decimal128(d) if kimmy_core::decimal::whole_number(d) == Some(1) => {
+            Ok(ArraySort::Whole { descending: false })
+        }
+        Bson::Decimal128(d) if kimmy_core::decimal::whole_number(d) == Some(-1) => {
+            Ok(ArraySort::Whole { descending: true })
+        }
         Bson::Document(spec) if !spec.is_empty() => {
             let keys = shape::parse_sort(spec).map_err(|e| match e {
                 Error::InvalidQuery(msg) => Error::InvalidUpdate(format!("$push: $sort: {msg}")),
@@ -695,6 +702,11 @@ fn integer(what: &str, value: &Bson) -> Result<i64> {
         Bson::Int64(n) => Ok(*n),
         // JSON has one number type, so `-3` may arrive as `-3.0`.
         Bson::Double(d) if d.fract() == 0.0 && d.abs() < 9_007_199_254_740_992.0 => Ok(*d as i64),
+        // A decimal by its exact value: an integer in `i64`, as an `Int64` is.
+        Bson::Decimal128(d) => kimmy_core::decimal::integer_part(d)
+            .filter(|part| part.whole && part.in_range)
+            .map(|part| part.value)
+            .ok_or_else(|| Error::InvalidUpdate(format!("{what} requires an integer"))),
         _ => Err(Error::InvalidUpdate(format!("{what} requires an integer"))),
     }
 }
@@ -3023,5 +3035,45 @@ mod decimal128 {
             .map(|e| e.as_document().unwrap().get("n").unwrap().clone())
             .collect();
         assert_eq!(ns, vec![Bson::Int32(2), dec("2.5"), dec("2.75"), Bson::Int32(3)]);
+    }
+
+    /// `$push`'s `$position`, `$slice` and `$sort` take a decimal of whole
+    /// value as they take the double of it. They used to refuse it.
+    #[test]
+    fn push_modifiers_read_a_decimal_as_the_double_of_its_value() {
+        let stored = || doc! { "_id": 1, "xs": [3, 1, 2] };
+        for (decimal, double) in [
+            (
+                doc! { "$push": { "xs": { "$each": [9], "$position": dec("1") } } },
+                doc! { "$push": { "xs": { "$each": [9], "$position": 1.0 } } },
+            ),
+            (
+                doc! { "$push": { "xs": { "$each": [9], "$slice": dec("-2.00") } } },
+                doc! { "$push": { "xs": { "$each": [9], "$slice": -2.0 } } },
+            ),
+            (
+                doc! { "$push": { "xs": { "$each": [0], "$sort": dec("1") } } },
+                doc! { "$push": { "xs": { "$each": [0], "$sort": 1.0 } } },
+            ),
+            (
+                doc! { "$push": { "xs": { "$each": [0], "$sort": dec("-1.0") } } },
+                doc! { "$push": { "xs": { "$each": [0], "$sort": -1.0 } } },
+            ),
+            // Past 2^53, where a double is refused, a decimal is an exact
+            // integer, as an `Int64` is.
+            (
+                doc! { "$push": { "xs": { "$each": [9], "$position": dec("9007199254740993") } } },
+                doc! { "$push": { "xs": { "$each": [9], "$position": 9_007_199_254_740_993_i64 } } },
+            ),
+        ] {
+            assert_eq!(after(decimal.clone(), stored()), after(double, stored()), "{decimal}");
+        }
+        for bad in [
+            doc! { "$push": { "xs": { "$each": [9], "$position": dec("1.5") } } },
+            doc! { "$push": { "xs": { "$each": [9], "$slice": dec("NaN") } } },
+            doc! { "$push": { "xs": { "$each": [9], "$sort": dec("2") } } },
+        ] {
+            assert!(parse(&bad).is_err(), "{bad}");
+        }
     }
 }

@@ -695,6 +695,13 @@ mod tests {
             ("for_each_record_after", |e, c| {
                 e.for_each_record_after(c, None, WalkScope::Request, |_, _, _| Ok(true))
             }),
+            // covers: docs::Engine::for_each_doc_after_each
+            ("for_each_doc_after_each", |e, c| {
+                let from_the_start = [Vec::new(), Vec::new()];
+                e.for_each_doc_after_each(c, &from_the_start, WalkScope::Request, |_, _, _| {
+                    Ok(true)
+                })
+            }),
             // covers: docs::Engine::for_each_doc_or_undecodable
             ("for_each_doc_or_undecodable", |e, c| {
                 e.for_each_doc_or_undecodable(c, WalkScope::Request, |_, _| Ok(true))
