@@ -665,14 +665,10 @@ pub struct QueryStats {
     /// documents under the index — zero for an index that keys everything
     /// it holds.
     pub unkeyed: Option<usize>,
-    /// Of `index_entries`, the ones read from the index's **undecidable** run:
-    /// documents held because a partial filter could not decide them, which
-    /// every scan of that index reads and rechecks (ADR-185). Reported and read
-    /// exactly as `unkeyed` is, and separate from it for the reason the two
-    /// counters are separate: that one is a fault an owner can fix, this one is
-    /// the documented cost of a `Decimal128` at a filtered path, and an owner
-    /// tuning a query needs to see which of the two they are paying for.
-    pub undecidable: Option<usize>,
+    // `undecidableCandidates` stood beside `unkeyedCandidates` from ADR-185 to
+    // ADR-238: the entries read from a partial index's undecidable run. The
+    // run is gone (a filter decides a `Decimal128` by its exact value), and so
+    // is the field, rather than a constant 0 a client would go on reading.
     /// Whether the filter pinned `_id` and was answered by primary-key reads.
     ///
     /// Reported separately from `index` because the primary key is not one: no
@@ -708,9 +704,6 @@ impl QueryStats {
         }
         if let Some(unkeyed) = self.unkeyed {
             out["unkeyedCandidates"] = json!(unkeyed);
-        }
-        if let Some(undecidable) = self.undecidable {
-            out["undecidableCandidates"] = json!(undecidable);
         }
         out
     }
@@ -841,7 +834,6 @@ impl QueryStats {
             probes: 0,
             index_entries: None,
             unkeyed: None,
-            undecidable: None,
             id_lookup: false,
         };
         match access {
@@ -937,7 +929,6 @@ where
             probes: pk.keys.len(),
             index_entries: None,
             unkeyed: None,
-            undecidable: None,
             id_lookup: true,
         });
     }
@@ -959,7 +950,6 @@ where
     };
     let mut entries = None;
     let mut unkeyed = None;
-    let mut undecidable = None;
     if let Some(p) = &plan {
         // Candidates stream out of the index and are rechecked as they come,
         // so stopping stops the read; nothing proportional to the range is
@@ -995,7 +985,6 @@ where
             Some(outcome) => {
                 entries = Some(outcome.entries);
                 unkeyed = Some(outcome.unkeyed);
-                undecidable = Some(outcome.undecidable);
             }
             None => plan = None,
         }
@@ -1019,7 +1008,6 @@ where
         probes: plan.as_ref().map_or(0, |p| p.ranges.len()),
         index_entries: entries,
         unkeyed,
-        undecidable,
         id_lookup: false,
     })
 }
@@ -1724,16 +1712,11 @@ fn create_index_stamped(
     // What the backfill could not key, read back from the index it just
     // built: the one number a client creating an index over existing data
     // most wants beside `multikey`, and the listing reports the same field.
-    // Each count walks its run of the index, which can be every document:
-    // off the async worker (ADR-199).
+    // The count walks its run of the index, which can be every document: off
+    // the async worker (ADR-199).
     let meta = state.engine.get_collection(db, coll)?;
-    let (unkeyed, undecidable) = kimmy_storage::blocking(|| {
-        Ok::<_, kimmy_storage::StorageError>((
-            state.engine.unkeyed_count(&meta, index.id)?,
-            state.engine.undecidable_count(&meta, index.id)?,
-        ))
-    })?;
-    Ok((index_to_json(&index, unkeyed, undecidable), index.created))
+    let unkeyed = kimmy_storage::blocking(|| state.engine.unkeyed_count(&meta, index.id))?;
+    Ok((index_to_json(&index, unkeyed), index.created))
 }
 
 /// Confirm a schema change this node just minted on every live member
@@ -1819,11 +1802,7 @@ pub fn list_indexes(
     // off the async worker, once for the listing (ADR-199).
     kimmy_storage::blocking(|| {
         for index in &meta.indexes {
-            indexes.push(index_to_json(
-                index,
-                state.engine.unkeyed_count(&meta, index.id)?,
-                state.engine.undecidable_count(&meta, index.id)?,
-            ));
+            indexes.push(index_to_json(index, state.engine.unkeyed_count(&meta, index.id)?));
         }
         Ok::<_, kimmy_storage::StorageError>(())
     })?;
@@ -1945,15 +1924,17 @@ fn drop_index_stamped(
     Ok((json!({ "dropped": dropped.removed }), dropped.stamp))
 }
 
-/// `unkeyed` is how many documents the index holds that it could not key, and
-/// `undecidable` how many it holds because its partial filter could not decide
-/// them — both read from the index, since the definition carries neither.
+/// `unkeyed` is how many documents the index holds that it could not key, read
+/// from the index, since the definition does not carry it.
 ///
-/// **Two figures rather than one.** They were one for a while, and it made
-/// `unkeyed` mean something other than what every place it is documented says:
-/// a collection with a `Decimal128` at a filtered path reported `unkeyed: 2`
-/// while `kimmy_index_unkeyed_total` read 0 (ADR-185).
-pub fn index_to_json(index: &kimmy_storage::IndexMeta, unkeyed: u64, undecidable: u64) -> Value {
+/// **One figure, and only that reason.** From ADR-185 to ADR-238 a second one,
+/// `undecidable`, stood beside it for the documents a partial filter could not
+/// decide (a `Decimal128` at a filtered path), after a version that folded them
+/// into `unkeyed` made it mean something other than what every place it is
+/// documented says. A filter decides a decimal by its exact value since
+/// ADR-238, so that figure is gone from the listing, `describe` and
+/// `createIndex`, and the schema no longer requires it.
+pub fn index_to_json(index: &kimmy_storage::IndexMeta, unkeyed: u64) -> Value {
     let mut out = json!({
         "name": index.name,
         "fields": index.fields.iter().map(|f| json!({
@@ -1969,23 +1950,11 @@ pub fn index_to_json(index: &kimmy_storage::IndexMeta, unkeyed: u64, undecidable
         // index does not stop at its upper bound.
         "multikey": index.multikey,
         // Documents the index holds and could not key: arrays at two of a
-        // compound index's paths, more than 1,000 keys, a Decimal128. Every
-        // scan of the index rechecks them (ADR-139). Zero is the index doing
-        // its whole job; anything else names work for the collection's owner,
-        // who can see it here without access to the server's logs.
+        // compound index's paths, or more than 1,000 keys. Every scan of the
+        // index rechecks them (ADR-139). Zero is the index doing its whole
+        // job; anything else names work for the collection's owner, who can see
+        // it here without access to the server's logs.
         "unkeyed": unkeyed,
-        // Documents the index holds because its partial filter could not decide
-        // them: a `Decimal128` at a filtered path ranks equal to every number, so
-        // the filter's answer is not an answer and the index holds the document
-        // for the scan to re-check (ADR-185). Every scan pays for these, so an
-        // owner needs the standing number — on a money field it may be most of
-        // the collection.
-        //
-        // **Always present, like `unkeyed` beside it.** Rendering it only when
-        // non-zero would be a second convention in one object: a client would
-        // have to know that absent means zero, and a typed client would break the
-        // first time it appeared.
-        "undecidable": undecidable,
     });
 
     // Added only when set, so listing ordinary indexes does not suggest every
@@ -2679,7 +2648,6 @@ mod tests {
             probes,
             index_entries: None,
             unkeyed: None,
-            undecidable: None,
             id_lookup: false,
         }
     }

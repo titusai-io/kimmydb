@@ -13,25 +13,34 @@
 //! `count` over-counted, a sorted `find` returned the same `_id` twice, and
 //! `explain` over-reported entries read. It predates ADR-185 — a document no
 //! index can key was already doubled — and ADR-185 made the class common,
-//! because a `Decimal128` on a money field puts most of a collection in that run.
+//! because a `Decimal128` on a money field put most of a collection in a
+//! sentinel run. ADR-238 removed that run: the comparator places a decimal by
+//! its exact value, so the filter decides it, and a partial index holds exactly
+//! what its filter selects.
 //!
 //! So this file drives the real `visit_index_candidates`, in each of the orders
 //! a query can ask for, and compares what comes back with what a collection scan
-//! says. Two properties, and the first is the one a membership model cannot see:
+//! says. Three properties, and the first is the one a membership model cannot
+//! see:
 //!
 //! 1. **No document is yielded twice.**
 //! 2. **No document `find` returns is missing.**
+//! 3. **No document the filter does not select is yielded**, a decimal at the
+//!    filtered path included: the index holds the filter's selection and no
+//!    more, which is what a partial unique index enforces on and a TTL index
+//!    expires by.
 
 use bson::{Bson, Document, doc};
 use kimmy_storage::{CandidateOrder, CollectionMeta, Engine, IndexField, IndexScan};
 
-/// Values that put a document in a sentinel run, and values that do not.
+/// Values on both sides of the filters' bounds.
 ///
-/// The `Decimal128`s are ADR-185's case — the order cannot rank one against a
-/// number, so the filter cannot decide the document. `NaN` and the infinities
-/// are ordinary `Double`s that the order *can* rank, and they are here because a
-/// reviewer asked for them and because they are the values most likely to be
-/// confused with the first group.
+/// The `Decimal128`s were ADR-185's case: the order ranked one equal to every
+/// number, so the filter could not decide the document and the index held it
+/// in a run of its own. They are decided by their exact value now (ADR-238),
+/// on either side of the bound and on it. `NaN` and the infinities are here
+/// because a reviewer asked for them and because they are the values most
+/// likely to be confused with the decimals' specials.
 fn values() -> Vec<(&'static str, Bson)> {
     let dec = |s: &str| Bson::Decimal128(s.parse().unwrap());
     vec![
@@ -39,7 +48,12 @@ fn values() -> Vec<(&'static str, Bson)> {
         ("a plain number above it", Bson::Int32(9)),
         ("a decimal", dec("1")),
         ("a decimal above the bound", dec("9")),
+        ("a decimal on the bound", dec("5.000")),
+        ("a decimal just above the bound", dec("5.000000000000000000000000000000001")),
+        ("a decimal NaN", dec("NaN")),
+        ("a decimal infinity", dec("Infinity")),
         ("a decimal in an array", Bson::Array(vec![dec("1"), Bson::Int32(2)])),
+        ("decimals either side of it in an array", Bson::Array(vec![dec("1"), dec("9")])),
         ("a decimal alone in an array", Bson::Array(vec![dec("1")])),
         ("a decimal nested twice", Bson::Array(vec![Bson::Array(vec![dec("1")])])),
         ("NaN", Bson::Double(f64::NAN)),
@@ -116,8 +130,15 @@ fn the_executor_yields_each_candidate_once_and_loses_none() {
         ("on the filtered path", vec![IndexField::ascending("k")]),
     ];
     // Filters on `k` and on a nested `k.a`, so a decimal at either depth is
-    // covered.
-    let filters = [doc! { "k": { "$gt": 5 } }, doc! { "k.a": { "$gt": 5 } }];
+    // covered, and a decimal bound (ADR-238), which decides the same documents
+    // as the integer one here except the decimal sitting on 5.
+    let dec_bound = Bson::Decimal128("5.0".parse().unwrap());
+    let filters = [
+        doc! { "k": { "$gt": 5 } },
+        doc! { "k.a": { "$gt": 5 } },
+        doc! { "k": { "$gte": dec_bound.clone() } },
+        doc! { "k.a": { "$gt": dec_bound } },
+    ];
     // Queries whose ranges have an open low end, an open high end, both bounds,
     // and an exact probe — the open low end is the shape that was broken, and
     // the others are here so a fix that breaks them is caught.
@@ -137,6 +158,7 @@ fn the_executor_yields_each_candidate_once_and_loses_none() {
 
     let mut checked = 0;
     let mut used = 0;
+    let mut decimals_yielded = 0;
     for (shape, fields) in &shapes {
         for filter in &filters {
             let (engine, _dir) = engine();
@@ -144,6 +166,7 @@ fn the_executor_yields_each_candidate_once_and_loses_none() {
             // One document per value, at both `k` and `k.a`, so the filter's
             // path and the other path are both exercised.
             let mut docs = 0;
+            let mut decimal_ids = std::collections::BTreeSet::new();
             for (_, value) in values() {
                 for nested in [false, true] {
                     // **The indexed value varies too.** With every document
@@ -167,15 +190,18 @@ fn the_executor_yields_each_candidate_once_and_loses_none() {
                         }
                     }
                     engine.insert(&coll, d).unwrap();
+                    if kimmy_core::holds_decimal128(&value) {
+                        decimal_ids.insert(docs as i64);
+                    }
                     docs += 1;
                 }
             }
-            // **Documents that populate the other sentinel run.** Arrays at both
+            // **Documents that populate the sentinel run.** Arrays at both
             // compound paths are unkeyable — but only for a document the filter
             // *selects*, because an unselected one never reaches the keying step
             // at all. So these carry a `k` above the bound as well. Without them
-            // the `UNKEYED` run stayed empty and this file exercised one of the
-            // two prepended ranges.
+            // the `UNKEYED` run stayed empty and this file never exercised the
+            // prepended range.
             for extra in 0..3 {
                 engine
                     .insert(
@@ -214,20 +240,18 @@ fn the_executor_yields_each_candidate_once_and_loses_none() {
                 .unwrap();
             let coll = engine.get_collection("app", "docs").unwrap();
 
-            // Premise: both sentinel runs hold something for at least the
-            // compound shape, or this file is testing one of the two paths.
+            // Premise: the sentinel run holds something for the compound shape,
+            // or this file is not testing the prepended range.
             let idx = coll.index("idx").unwrap();
-            let (cannot_key, undecided) = (
-                engine.unkeyed_count(&coll, idx.id).unwrap(),
-                engine.undecidable_count(&coll, idx.id).unwrap(),
-            );
+            let cannot_key = engine.unkeyed_count(&coll, idx.id).unwrap();
             if *shape == "compound" {
                 assert!(
-                    cannot_key > 0 && undecided > 0,
-                    "premise: the {shape} index with filter {filter} must populate both sentinel \
-                     runs, and holds {cannot_key} unkeyable and {undecided} undecidable"
+                    cannot_key > 0,
+                    "premise: the {shape} index with filter {filter} must populate the unkeyed \
+                     run, and holds {cannot_key}"
                 );
             }
+            let partial = kimmy_core::PartialFilter::parse(filter).unwrap();
 
             for query in &queries {
                 // Both deliveries: `Any` is what a `count` uses, and `ById`
@@ -264,6 +288,25 @@ fn the_executor_yields_each_candidate_once_and_loses_none() {
                         "a collection scan returns {missing:?} and the indexed answer does not, \
                          which is a document short and says nothing: {where_}"
                     );
+
+                    // 3. Nothing outside the filter.
+                    let outside: Vec<i64> = ids
+                        .iter()
+                        .filter(|id| {
+                            let d = engine.get(&coll, &kimmy_core::DocId::Int64(**id)).unwrap();
+                            !partial.selects(&d.expect("a yielded document exists"))
+                        })
+                        .copied()
+                        .collect();
+                    assert!(
+                        outside.is_empty(),
+                        "the index yielded {outside:?}, which its filter does not select: it holds \
+                         more than its filter's selection, so a partial unique index would \
+                         enforce, and a TTL index expire, by a rule find does not apply: {where_}"
+                    );
+                    if ids.iter().any(|id| decimal_ids.contains(id)) {
+                        decimals_yielded += 1;
+                    }
                     checked += 1;
                 }
             }
@@ -273,4 +316,8 @@ fn the_executor_yields_each_candidate_once_and_loses_none() {
     // Premises: an empty search satisfies both assertions above.
     assert!(used > 30, "premise: the planner chose the index, {used} times");
     assert!(checked > 30, "premise: comparisons were made ({checked})");
+    assert!(
+        decimals_yielded > 30,
+        "premise: indexed answers held decimal documents ({decimals_yielded})"
+    );
 }

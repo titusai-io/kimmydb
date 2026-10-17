@@ -1005,10 +1005,11 @@ mod tests {
 }
 
 /// ADR-183: the schema 3 -> 4 migration rebuilt every partial index so its
-/// membership is what `find` selects — and, since ADR-185, the documents whose
-/// membership the filter cannot decide. A schema 3 store now goes straight to
-/// 5, whose rebuild of every index under the current rule subsumes it
-/// (ADR-238); these hold that path to what 3 -> 4 promised.
+/// membership is what `find` selects (and, from ADR-185 to ADR-238, also the
+/// documents holding a `Decimal128` the filter could not decide). A schema 3
+/// store now goes straight to 5, whose rebuild of every index under the
+/// current rule subsumes it (ADR-238); these hold that path to what 3 -> 4
+/// promised.
 #[cfg(test)]
 mod membership_migration {
     use std::cmp::Ordering;
@@ -1420,12 +1421,13 @@ mod membership_migration {
         (dir, path)
     }
 
-    /// A schema 3 database holding a partial index and three documents: one the
-    /// filter decides against, one it selects, and one it cannot decide.
+    /// A schema 3 database holding a partial index and four documents: a number
+    /// and a `Decimal128` the filter decides against, and a number and a
+    /// `Decimal128` it selects.
     ///
     /// A function rather than a block, because the engine has to be dropped
     /// before the file can be reopened — and a block did not do it.
-    fn schema_3_with_an_undecidable_document() -> (tempfile::TempDir, std::path::PathBuf) {
+    fn schema_3_with_decimals_at_a_filtered_path() -> (tempfile::TempDir, std::path::PathBuf) {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("kimmy.redb");
         {
@@ -1444,28 +1446,62 @@ mod membership_migration {
                 )
                 .unwrap();
             let coll = engine.get_collection("shop", "orders").unwrap();
-            engine
-                .insert_many(
-                    &coll,
-                    vec![
-                        doc! {"_id": 1_i64, "size": 1, "x": 1},
-                        doc! {"_id": 2_i64, "size": 10, "x": 2},
-                        doc! {"_id": 3_i64, "size": Bson::Decimal128("1".parse().unwrap()), "x": 3},
-                    ],
-                )
-                .unwrap();
+            engine.insert_many(&coll, decimal_sizes(&["x"])).unwrap();
         }
         as_schema_3(&path, &[]);
         (dir, path)
     }
 
+    /// Four documents under `{size: {$gt: 5}}`, with each of `fields` set: `_id`s
+    /// 2 and 4 selected (a number and a `Decimal128`), 1 and 3 not.
+    fn decimal_sizes(fields: &[&str]) -> Vec<Document> {
+        let dec = |s: &str| Bson::Decimal128(s.parse().unwrap());
+        [(1_i64, Bson::Int32(1)), (2, Bson::Int32(10)), (3, dec("1")), (4, dec("10.0"))]
+            .into_iter()
+            .map(|(id, size)| {
+                let mut d = doc! {"_id": id, "size": size};
+                for field in fields {
+                    d.insert(*field, id);
+                }
+                d
+            })
+            .collect()
+    }
+
+    /// The `_id`s an index holds, every run included, read from its entries.
+    fn held(engine: &Engine, coll: &crate::CollectionMeta, index: u32) -> Vec<i64> {
+        let keys = crate::index::scan_range(
+            engine,
+            crate::WalkScope::Request,
+            coll.id,
+            index,
+            &[],
+            None,
+            crate::index::Unkeyed::Include,
+        )
+        .unwrap();
+        let mut ids: Vec<i64> = keys
+            .iter()
+            .map(|k| {
+                let doc = engine.get_by_encoded_key(coll, k).unwrap().expect("a live holder");
+                doc.get_i64("_id").unwrap()
+            })
+            .collect();
+        ids.sort_unstable();
+        ids
+    }
+
     #[test]
-    fn the_rebuild_files_a_document_its_filter_cannot_decide() {
-        // **The carrier nothing held.** The 3 -> 4 rebuild has its own
-        // `Undecidable` arm, and it is the path *every existing database* takes
-        // to ADR-185's membership: a live node never re-files these documents,
-        // the migration does. Deleting that arm left the whole suite green.
-        let (_dir, path) = schema_3_with_an_undecidable_document();
+    fn the_rebuild_decides_a_decimal_at_the_filtered_path() {
+        // **The carrier nothing held.** The rebuild is the path *every existing
+        // database* takes to the current membership rule: a live node never
+        // re-files these documents, the migration does. Through schema 4 that
+        // rule held a decimal the filter did not select in ADR-185's undecidable
+        // run, and deleting that arm left the whole suite green. Since ADR-238
+        // the filter decides a decimal by its value, so the rebuilt index holds
+        // exactly what the filter selects, a decimal included and a decimal
+        // excluded.
+        let (_dir, path) = schema_3_with_decimals_at_a_filtered_path();
         assert_eq!(version(&path), Some(3), "premise: a schema 3 database");
 
         let engine = Engine::open(&path).unwrap();
@@ -1478,23 +1514,20 @@ mod membership_migration {
         let coll = engine.get_collection("shop", "orders").unwrap();
         let id = coll.index("by_size").unwrap().id;
         assert_eq!(
-            engine.undecidable_count(&coll, id).unwrap(),
-            1,
-            "the rebuild must file the document its filter cannot decide, or every database that \
-             migrates loses it from this index until something rewrites it"
+            held(&engine, &coll, id),
+            vec![2, 4],
+            "the rebuild must key the decimal its filter selects, or every database that \
+             migrates loses it from this index until something rewrites it, and hold nothing for \
+             the one it does not"
         );
-        assert_eq!(
-            engine.unkeyed_count(&coll, id).unwrap(),
-            0,
-            "and under the reason that is true of it, not the other one"
-        );
+        assert_eq!(engine.unkeyed_count(&coll, id).unwrap(), 0, "and nothing is unkeyed");
     }
 
     #[test]
-    fn an_interrupted_rebuild_files_the_documents_its_filters_cannot_decide_when_it_resumes() {
+    fn an_interrupted_rebuild_decides_the_decimals_at_its_filtered_paths_when_it_resumes() {
         // The same carrier through the resume. Two partial indexes, the run
         // killed at each of its commits in turn: the next open finishes from the
-        // markers, and must file the undecidable document in both.
+        // markers, and must decide the decimal documents in both.
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("kimmy.redb");
         {
@@ -1515,16 +1548,7 @@ mod membership_migration {
                     .unwrap();
             }
             let coll = engine.get_collection("shop", "orders").unwrap();
-            engine
-                .insert_many(
-                    &coll,
-                    vec![
-                        doc! {"_id": 1_i64, "size": 1, "x": 1, "y": 1},
-                        doc! {"_id": 2_i64, "size": 10, "x": 2, "y": 2},
-                        doc! {"_id": 3_i64, "size": Bson::Decimal128("1".parse().unwrap()), "x": 3, "y": 3},
-                    ],
-                )
-                .unwrap();
+            engine.insert_many(&coll, decimal_sizes(&["x", "y"])).unwrap();
         }
         as_schema_3(&path, &[]);
 
@@ -1539,11 +1563,11 @@ mod membership_migration {
             for name in ["by_x", "by_y"] {
                 let id = coll.index(name).unwrap().id;
                 assert_eq!(
-                    engine.undecidable_count(&coll, id).unwrap(),
-                    1,
-                    "{name}, killed at {at}: the document its filter cannot decide"
+                    held(&engine, &coll, id),
+                    vec![2, 4],
+                    "{name}, killed at {at}: exactly what the filter selects"
                 );
-                assert_eq!(engine.unkeyed_count(&coll, id).unwrap(), 0, "{name}: and only there");
+                assert_eq!(engine.unkeyed_count(&coll, id).unwrap(), 0, "{name}: nothing unkeyed");
             }
         }
     }

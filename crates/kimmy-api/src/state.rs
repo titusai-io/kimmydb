@@ -232,7 +232,6 @@ impl AppState {
             process_resident_bytes: memory.resident_bytes,
             process_resident_peak_bytes: memory.peak_resident_bytes,
             index_unkeyed: self.engine.unkeyed_writes(),
-            index_undecidable: self.engine.undecidable_writes(),
             sync_ddl_relogged: self.engine.ddl_relogged(),
             sync_horizon_state_held: self.engine.state_held_refusals(),
             // What a write costs *before* it starts (ADR-151): the wait for

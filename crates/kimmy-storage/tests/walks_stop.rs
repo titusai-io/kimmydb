@@ -427,9 +427,8 @@ const DELEGATES: &[(&str, &str)] = &[
     ("docs::Engine::count", "Engine::for_each_doc"),
     ("index::Engine::visit_index_candidates", "Walk::in_index_order"),
     ("index::Engine::create_index_with", "Engine::create_index_inner"),
-    // An index's unkeyed and undecidable runs.
+    // An index's unkeyed run.
     ("index::Engine::unkeyed_count", "holders_of"),
-    ("index::Engine::undecidable_count", "holders_of"),
     // A shadow collection's vectors, decoded from its documents.
     ("vectors::Engine::for_each_vector", "Engine::for_each_doc"),
     // The oplog window a peer is served, in each of its forms. The last one

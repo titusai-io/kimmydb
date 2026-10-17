@@ -492,6 +492,8 @@ mod tests {
             "documentsMatched",
             "indexEntriesRead",
             "unkeyedCandidates",
+            // Gone with ADR-238's removal of the undecidable run, and so absent
+            // from every answer; named so its return is caught here too.
             "undecidableCandidates",
         ] {
             assert!(!text.contains(measured), "{measured} in {text}");

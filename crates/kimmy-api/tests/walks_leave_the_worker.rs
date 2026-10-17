@@ -44,7 +44,7 @@ use std::path::Path;
 
 /// Storage calls whose cost is the size of a collection, the oplog or the
 /// store rather than of one key.
-const WALKS: [&str; 24] = [
+const WALKS: [&str; 23] = [
     ".for_each_doc(",
     ".for_each_doc_or_undecodable(",
     ".for_each_doc_after(",
@@ -53,9 +53,8 @@ const WALKS: [&str; 24] = [
     ".count(&",
     ".live_unique_violations(",
     ".backup_to(",
-    // An index's unkeyed or undecidable run, which can be every document.
+    // An index's unkeyed run, which can be every document.
     ".unkeyed_count(",
-    ".undecidable_count(",
     // An oplog window from a position, in each of its forms: it can pass over
     // far more than it returns.
     ".entries_for_peer",

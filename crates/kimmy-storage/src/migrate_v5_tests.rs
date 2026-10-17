@@ -1953,25 +1953,219 @@ fn a_collision_is_recorded_in_its_chunks_commit_wherever_the_migration_is_killed
 #[test]
 fn the_money_field_collision_is_reported() {
     // A partial unique index whose filter path holds a decimal: 0.50 filed both
-    // documents undecidable and enforced nothing. Decided exactly, both are
-    // selected, keyed under one email, and collide.
+    // documents undecidable and enforced nothing, so it accepted both. Decided
+    // exactly (design 2.6), both are selected, keyed under one email, and
+    // collide: the migration reports it through the existing path, and from
+    // then on a write that would add or keep a third holder is refused.
     let (_dir, path) = unique_store(
         &[("money_once", "email", Some(doc! {"balance": {"$gt": 0}}))],
         vec![
             doc! {"_id": 1_i64, "email": "x", "balance": dec("10")},
             doc! {"_id": 2_i64, "email": "y", "balance": dec("10")},
+            doc! {"_id": 3_i64, "email": "z", "balance": dec("-10")},
         ],
         &[("t", 2, doc! {"_id": 2_i64, "email": "x", "balance": dec("10")})],
     );
     let t = CollectionId::derive("shop", "t").0;
     let money = metas_of(&read_only(&path))[&t].index("money_once").unwrap().id;
-    let undecided = entries_of(&read_only(&path), &BTreeSet::from([t]))
-        .into_iter()
-        .filter(|(_, i, k, _)| *i == money && k.as_slice() == crate::index::UNDECIDABLE)
-        .count();
-    assert_eq!(undecided, 2, "premise: 0.50 decided neither");
+    let run = |path: &Path, key: &[u8]| {
+        entries_of(&read_only(path), &BTreeSet::from([t]))
+            .into_iter()
+            .filter(|(_, i, k, _)| *i == money && k.as_slice() == key)
+            .count()
+    };
+    assert_eq!(run(&path, crate::index::UNDECIDABLE), 3, "premise: 0.50 decided none of them");
     let engine = Engine::open(&path).unwrap();
     assert_eq!(engine.unique_violations(), 1, "the collision 0.50 never enforced");
+    let coll = engine.get_collection("shop", "t").unwrap();
+    let x = kimmy_core::keyenc::encode(&Bson::String("x".into())).unwrap();
+    let held = |engine: &Engine| {
+        crate::index::scan_range(
+            engine,
+            crate::WalkScope::Request,
+            coll.id,
+            money,
+            &x,
+            Some(&x),
+            crate::index::Unkeyed::Exclude,
+        )
+        .unwrap()
+    };
+    assert_eq!(held(&engine), vec![v1::v2_int64(1), v1::v2_int64(2)], "both keyed under x");
+    assert_eq!(
+        entries_of(engine.db(), &BTreeSet::from([t]))
+            .iter()
+            .filter(|(_, i, ..)| *i == money)
+            .count(),
+        2,
+        "the negative balance is not selected and the index holds nothing for it: no run"
+    );
+    // A live write after 2.6: a third decimal holder of x is refused.
+    let err = engine
+        .insert(&coll, doc! {"_id": 4_i64, "email": "x", "balance": dec("10.00")})
+        .unwrap_err();
+    assert!(
+        matches!(err, crate::StorageError::Core(kimmy_core::Error::UniqueViolation { .. })),
+        "{err}"
+    );
+    // A standing holder's update that keeps the key is refused too, which 0.50
+    // allowed; one that leaves the filter's selection is accepted.
+    let err = engine
+        .replace(
+            &coll,
+            &DocId::Int64(1),
+            doc! {"_id": 1_i64, "email": "x", "balance": dec("11")},
+            false,
+        )
+        .unwrap_err();
+    assert!(err.to_string().contains("already holds this value"), "{err}");
+    engine
+        .replace(
+            &coll,
+            &DocId::Int64(1),
+            doc! {"_id": 1_i64, "email": "x", "balance": dec("0")},
+            false,
+        )
+        .unwrap();
+    assert_eq!(held(&engine), vec![v1::v2_int64(2)], "the one that left the filter is unfiled");
+    // And the document 0.50 did not select stays outside the constraint.
+    engine
+        .replace(
+            &coll,
+            &DocId::Int64(3),
+            doc! {"_id": 3_i64, "email": "x", "balance": dec("-1")},
+            false,
+        )
+        .unwrap();
+}
+
+/// The schema 4 store of the TTL test: two TTL partial indexes over `tier`,
+/// `$lt: 3` on `at` and `$gte: 3` on `at2`, and documents whose `tier` 0.50
+/// compared as equal to 3 whenever it was a decimal.
+fn ttl_decimal_store() -> (tempfile::TempDir, PathBuf) {
+    let (expired, fresh) =
+        (bson::DateTime::from_millis(1_000), bson::DateTime::from_millis(10_000_000_000_000));
+    let docs: Vec<Document> = [
+        // Newly expired: `$lt` selects it now, and `at` is due.
+        (1_i64, dec("1"), expired, fresh),
+        // Newly kept: 0.50's `$gte` selected it and `at2` is due, so 0.50
+        // expired it; now `$gte` does not select it, and `$lt`'s `at` is fresh.
+        (2, dec("1"), fresh, expired),
+        // A decimal whose selection did not change, both ways: untouched.
+        (3, dec("5"), expired, fresh),
+        // Not a decimal: what 0.50 did, this build does.
+        (4, Bson::Int32(1), expired, expired),
+        // Equal to the bound: `$lt` never, `$gte` always, so `ttl_gte`
+        // expires it on both builds.
+        (5, dec("3.0"), expired, expired),
+        // Below the bound by 10^-33: `$lt` now, `$gte` no longer.
+        (6, dec("2.999999999999999999999999999999999"), expired, expired),
+        // Selected now by `$lt`, and not due.
+        (7, dec("-Infinity"), fresh, fresh),
+        // Not a decimal, not due.
+        (8, Bson::Int32(5), fresh, fresh),
+    ]
+    .into_iter()
+    .map(|(id, tier, at, at2)| doc! {"_id": id, "tier": tier, "at": at, "at2": at2})
+    .collect();
+    small_schema_4(
+        |engine| {
+            let t = engine.create_collection("shop", "t").unwrap();
+            for (name, field, filter) in [
+                ("ttl_lt", "at", doc! {"tier": {"$lt": 3}}),
+                ("ttl_gte", "at2", doc! {"tier": {"$gte": 3}}),
+            ] {
+                partial(
+                    engine,
+                    "t",
+                    name,
+                    vec![IndexField::ascending(field)],
+                    false,
+                    Some(3_600),
+                    filter,
+                );
+            }
+            engine.insert_many(&t, docs).unwrap();
+        },
+        &[],
+    )
+}
+
+#[test]
+fn a_ttl_partial_index_over_decimals_counts_and_expires_by_exact_value() {
+    // Design 2.6 and the v2.3 test plan's (b), Chris's ruling: a TTL partial
+    // index decides a decimal at its filter path by exact value, in both
+    // directions. On 0.50 a decimal the `$lt: 3` filter did not select sat in
+    // the undecidable run and a TTL index never expired it, while `$gte: 3`
+    // selected every decimal (ranked equal to 3) and expired it once due. The
+    // migration counts, per TTL index, what changes, from that run; the first
+    // expiry pass after it deletes exactly the documents now selected and due.
+    let (_dir, path) = ttl_decimal_store();
+    let t = CollectionId::derive("shop", "t").0;
+    let metas = metas_of(&read_only(&path));
+    let (lt, gte) = (metas[&t].index("ttl_lt").unwrap().id, metas[&t].index("ttl_gte").unwrap().id);
+    let in_run = |index: u32| -> BTreeSet<i64> {
+        entries_of(&read_only(&path), &BTreeSet::from([t]))
+            .into_iter()
+            .filter(|(_, i, k, _)| *i == index && k.as_slice() == crate::index::UNDECIDABLE)
+            .map(|(.., d)| kimmy_core::legacy_key::decode_v1(&d).expect("a schema 4 key"))
+            .collect()
+    };
+    assert_eq!(
+        in_run(lt),
+        BTreeSet::from([1, 2, 3, 5, 6, 7]),
+        "premise: 0.50 filed every decimal `$lt` did not select undecidable"
+    );
+    assert!(in_run(gte).is_empty(), "premise: 0.50's `$gte` selected every decimal");
+
+    let (engine, logs) = crate::log_capture::logged(|| Engine::open(&path).unwrap());
+    // Now selected under `$lt`: 1, 2, 6, 7; under `$gte` no longer: 1, 2, 6,
+    // 7. 3 and 5 are decimals whose selection did not change, and 4 and 8 are
+    // not decimals: in neither count.
+    for (index, line) in [
+        ("ttl_lt", "index=ttl_lt now_selected=4 now_not_selected=0"),
+        ("ttl_gte", "index=ttl_gte now_selected=0 now_not_selected=4"),
+    ] {
+        assert!(logs.contains(line), "{index}: {logs}");
+    }
+    let coll = engine.get_collection("shop", "t").unwrap();
+    let ids = |index: u32| -> BTreeSet<i64> {
+        crate::index::scan_range(
+            &engine,
+            crate::WalkScope::Request,
+            coll.id,
+            index,
+            &[],
+            None,
+            crate::index::Unkeyed::Include,
+        )
+        .unwrap()
+        .iter()
+        .map(|k| v2_int64_of(k).expect("a schema 5 key"))
+        .collect()
+    };
+    assert_eq!(ids(lt), BTreeSet::from([1, 2, 4, 6, 7]), "ttl_lt holds what `$lt: 3` selects");
+    assert_eq!(ids(gte), BTreeSet::from([3, 5, 8]), "ttl_gte holds what `$gte: 3` selects");
+
+    // The first pass: past `at`'s and `at2`'s due time for the expired dates.
+    let now = 1_000 + 3_600_000 + 1;
+    let mut deleted = BTreeSet::new();
+    for index in crate::expiry::ttl_indexes(&coll) {
+        let before: BTreeSet<i64> =
+            (1..=8).filter(|&id| engine.get(&coll, &DocId::Int64(id)).unwrap().is_some()).collect();
+        let out = engine.expire_documents(&coll, index, now).unwrap();
+        assert_eq!(out.skipped_filter, 0, "{}: holds only what its filter selects", index.name);
+        let after: BTreeSet<i64> =
+            (1..=8).filter(|&id| engine.get(&coll, &DocId::Int64(id)).unwrap().is_some()).collect();
+        assert_eq!(out.deleted as usize, before.len() - after.len(), "{}", index.name);
+        deleted.extend(before.difference(&after).copied());
+    }
+    assert_eq!(
+        deleted,
+        BTreeSet::from([1, 4, 5, 6]),
+        "exactly the documents now selected and due: 1 newly expired (0.50 never expired it), 2 \
+         newly kept (0.50 expired it), 3 untouched, 4 and 5 as on 0.50, 6 by the other index"
+    );
 }
 
 #[test]
