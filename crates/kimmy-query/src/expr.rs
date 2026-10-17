@@ -2132,6 +2132,16 @@ fn as_index(value: &Bson, what: &str) -> Result<usize> {
         Bson::Int32(n) => i64::from(*n),
         Bson::Int64(n) => *n,
         Bson::Double(d) => *d as i64,
+        // Read as the double of the same value is: truncated toward zero and
+        // saturated, a NaN as zero and an infinity as the bound it points to.
+        Bson::Decimal128(d) => match kimmy_core::decimal::integer_part(d) {
+            Some(part) => part.value,
+            None => match kimmy_core::decimal::decode(d) {
+                kimmy_core::decimal::Decimal::PosInfinity => i64::MAX,
+                kimmy_core::decimal::Decimal::NegInfinity => i64::MIN,
+                _ => 0,
+            },
+        },
         other => {
             return Err(Error::InvalidQuery(format!(
                 "{what} must be a number, found {}",
@@ -2180,15 +2190,19 @@ fn as_array(op: Op, value: &Bson) -> Result<Option<&[Bson]>> {
 ///
 /// A double with a fraction is refused rather than truncated:
 /// `{$arrayElemAt: ["$xs", 1.5]}` is a mistake, not a request for element 1.
+/// A decimal is read by its exact value, as the double of that value is:
+/// `Decimal128("1")` and `Decimal128("1.00")` are 1, `Decimal128("1.5")` is
+/// refused, and one past `i64` saturates as `2.0e19` does.
 fn as_integer(value: &Bson, what: &str) -> Result<i64> {
+    let refused = || {
+        Error::InvalidQuery(format!("{what} must be a whole number, found {}", type_name(value)))
+    };
     match value {
         Bson::Int32(n) => Ok(i64::from(*n)),
         Bson::Int64(n) => Ok(*n),
         Bson::Double(d) if d.is_finite() && d.fract() == 0.0 => Ok(*d as i64),
-        other => Err(Error::InvalidQuery(format!(
-            "{what} must be a whole number, found {}",
-            type_name(other)
-        ))),
+        Bson::Decimal128(d) => kimmy_core::decimal::whole_number(d).ok_or_else(refused),
+        _ => Err(refused()),
     }
 }
 
@@ -5610,6 +5624,65 @@ mod decimal128 {
             let kept = on(doc! { "$filter": { "input": "$items", "cond": "$$this" } }, d).unwrap();
             let want = if truth { 2 } else { 1 };
             assert_eq!(kept.as_array().unwrap().len(), want, "{text} in $filter: {kept}");
+        }
+    }
+
+    /// Where an operator takes a whole number it takes a decimal of a whole
+    /// value, as it takes the double of that value: `$arrayElemAt`, `$slice`,
+    /// `$range`, `$filter`'s `limit`, `$indexOfArray`'s bounds, and `$substr`,
+    /// which truncates. A decimal with a fraction is refused as the double is.
+    /// They used to refuse every decimal, "must be a whole number, found a
+    /// Decimal128" even for `Decimal128("1")`.
+    #[test]
+    fn a_whole_number_argument_takes_a_decimal_of_whole_value_as_it_takes_a_double() {
+        let doc = doc! { "xs": [10, 20, 30, 40], "s": "hello" };
+        let at = |expr: Bson| Expr::parse(&expr).and_then(|e| e.eval(&doc));
+        for (decimal, double) in [
+            (bson!({ "$arrayElemAt": ["$xs", b("1")] }), bson!({ "$arrayElemAt": ["$xs", 1.0] })),
+            (
+                bson!({ "$arrayElemAt": ["$xs", b("-1.00")] }),
+                bson!({ "$arrayElemAt": ["$xs", -1.0] }),
+            ),
+            (bson!({ "$slice": ["$xs", b("2")] }), bson!({ "$slice": ["$xs", 2.0] })),
+            (
+                bson!({ "$slice": ["$xs", b("1"), b("20E-1")] }),
+                bson!({ "$slice": ["$xs", 1.0, 2.0] }),
+            ),
+            (bson!({ "$range": [b("0"), b("6"), b("2")] }), bson!({ "$range": [0.0, 6.0, 2.0] })),
+            (
+                bson!({ "$filter": { "input": "$xs", "cond": true, "limit": b("2") } }),
+                bson!({ "$filter": { "input": "$xs", "cond": true, "limit": 2.0 } }),
+            ),
+            (
+                bson!({ "$indexOfArray": ["$xs", 30, b("1"), b("3")] }),
+                bson!({ "$indexOfArray": ["$xs", 30, 1.0, 3.0] }),
+            ),
+            (bson!({ "$substr": ["$s", b("1"), b("2")] }), bson!({ "$substr": ["$s", 1.0, 2.0] })),
+            // `$substr` truncates a fraction, the double's and the decimal's alike.
+            (
+                bson!({ "$substr": ["$s", b("1.9"), b("2.5")] }),
+                bson!({ "$substr": ["$s", 1.9, 2.5] }),
+            ),
+        ] {
+            let (got, want) = (at(decimal.clone()), at(double));
+            assert_eq!(got.as_ref().ok(), want.as_ref().ok(), "{decimal}");
+            assert!(got.is_ok(), "{decimal}: {got:?}");
+        }
+        assert_eq!(at(bson!({ "$arrayElemAt": ["$xs", b("2")] })).unwrap(), Bson::Int32(30));
+        // A fraction, a NaN and an infinity are refused, as the double ones are.
+        for (decimal, double) in [
+            (bson!({ "$arrayElemAt": ["$xs", b("1.5")] }), bson!({ "$arrayElemAt": ["$xs", 1.5] })),
+            (bson!({ "$slice": ["$xs", b("NaN")] }), bson!({ "$slice": ["$xs", f64::NAN] })),
+            (bson!({ "$range": [0, b("Infinity")] }), bson!({ "$range": [0, f64::INFINITY] })),
+        ] {
+            let msg = at(decimal.clone()).unwrap_err().to_string();
+            assert!(msg.contains("must be a whole number, found a Decimal128"), "{decimal}: {msg}");
+            assert!(
+                at(double)
+                    .unwrap_err()
+                    .to_string()
+                    .contains("must be a whole number, found a double")
+            );
         }
     }
 }

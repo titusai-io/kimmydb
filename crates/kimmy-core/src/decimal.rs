@@ -109,6 +109,65 @@ impl Decimal {
     }
 }
 
+/// A finite decimal's integer part, as a whole-number argument reads one.
+///
+/// What an operator that takes a whole number needs to accept a decimal the way
+/// it accepts a double of the same value: `Decimal128("2")` and `Decimal128("2.00")`
+/// are the whole number 2, exactly as `2.0` is.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct IntegerPart {
+    /// The value truncated toward zero and saturated at `i64::MIN` and
+    /// `i64::MAX`, as Rust's `f64 as i64` saturates a double.
+    pub value: i64,
+    /// The value has no fraction.
+    pub whole: bool,
+    /// The truncated value is within `i64`, so [`IntegerPart::value`] is exact.
+    pub in_range: bool,
+}
+
+/// The whole number a decimal is, if it is one: its value when it has no
+/// fraction, saturated past `i64` as a double's `as i64` is. `None` for a
+/// fraction, a NaN or an infinity, which a double of the same value is refused
+/// for too.
+pub fn whole_number(d: &Decimal128) -> Option<i64> {
+    integer_part(d).filter(|part| part.whole).map(|part| part.value)
+}
+
+/// [`IntegerPart`] of a decimal; `None` for a NaN or an infinity.
+pub fn integer_part(d: &Decimal128) -> Option<IntegerPart> {
+    let (negative, magnitude, whole) = match decode(d) {
+        Decimal::Zero => return Some(IntegerPart { value: 0, whole: true, in_range: true }),
+        Decimal::Nan | Decimal::NegInfinity | Decimal::PosInfinity => return None,
+        Decimal::Finite { negative, coefficient, exponent } if exponent >= 0 => {
+            // `None` past `u128`, which is past `i64` too.
+            let magnitude =
+                10u128.checked_pow(exponent as u32).and_then(|p| coefficient.checked_mul(p));
+            (negative, magnitude, true)
+        }
+        Decimal::Finite { negative, coefficient, exponent } => {
+            let places = exponent.unsigned_abs() as u32;
+            if places > 38 {
+                // `10^places` exceeds every coefficient, below `10^34`.
+                (negative, Some(0), false)
+            } else {
+                let scale = 10u128.pow(places);
+                (negative, Some(coefficient / scale), coefficient % scale == 0)
+            }
+        }
+    };
+    let limit = if negative { 1u128 << 63 } else { (1u128 << 63) - 1 };
+    Some(match magnitude {
+        Some(m) if m <= limit => {
+            let value = if negative { (-(m as i128)) as i64 } else { m as i64 };
+            IntegerPart { value, whole, in_range: true }
+        }
+        _ => {
+            let value = if negative { i64::MIN } else { i64::MAX };
+            IntegerPart { value, whole, in_range: false }
+        }
+    })
+}
+
 /// Pack a normalised pair back into BID, padding the coefficient with zeros when
 /// the exponent is above `MAX_EXPONENT`.
 ///
@@ -286,6 +345,42 @@ mod tests {
                 };
                 agree(bits)?;
             }
+        }
+    }
+
+    #[test]
+    fn the_integer_part_truncates_toward_zero_and_saturates_as_a_double_does() {
+        let part = |text: &str| integer_part(&dec(text));
+        let whole = |value: i64| Some(IntegerPart { value, whole: true, in_range: true });
+        let fraction = |value: i64| Some(IntegerPart { value, whole: false, in_range: true });
+        assert_eq!(part("2"), whole(2));
+        assert_eq!(part("2.000"), whole(2));
+        assert_eq!(part("20E-1"), whole(2));
+        assert_eq!(part("-0"), whole(0));
+        assert_eq!(part("0E+20"), whole(0));
+        assert_eq!(part("-7E+2"), whole(-700));
+        assert_eq!(part("2.5"), fraction(2));
+        assert_eq!(part("-2.5"), fraction(-2));
+        assert_eq!(part("-0.5"), fraction(0));
+        assert_eq!(part("1E-6176"), fraction(0));
+        assert_eq!(part("9223372036854775807"), whole(i64::MAX));
+        assert_eq!(part("-9223372036854775808"), whole(i64::MIN));
+        assert_eq!(part("9223372036854775807.5"), fraction(i64::MAX));
+        // Past `i64`: saturated, as `f64 as i64` saturates, and marked.
+        for (text, value) in [
+            ("9223372036854775808", i64::MAX),
+            ("-9223372036854775809", i64::MIN),
+            ("1E+6144", i64::MAX),
+        ] {
+            assert_eq!(
+                part(text),
+                Some(IntegerPart { value, whole: true, in_range: false }),
+                "{text}"
+            );
+            assert_eq!(part(text).unwrap().value, text.parse::<f64>().unwrap() as i64, "{text}");
+        }
+        for text in ["NaN", "-NaN", "Infinity", "-Infinity"] {
+            assert_eq!(part(text), None, "{text}");
         }
     }
 

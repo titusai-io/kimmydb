@@ -29,6 +29,9 @@ pub fn parse_sort(doc: &Document) -> Result<Vec<SortKey>> {
             let descending = match direction {
                 Bson::Int32(1) | Bson::Int64(1) | Bson::Double(1.0) => false,
                 Bson::Int32(-1) | Bson::Int64(-1) | Bson::Double(-1.0) => true,
+                // A decimal direction by its value, as `1.0` and `-1.0` are.
+                Bson::Decimal128(d) if kimmy_core::decimal::whole_number(d) == Some(1) => false,
+                Bson::Decimal128(d) if kimmy_core::decimal::whole_number(d) == Some(-1) => true,
                 _ => {
                     return Err(Error::InvalidQuery(format!(
                         "sort direction for {path:?} must be 1 or -1"
@@ -165,7 +168,18 @@ pub fn parse_projection(doc: &Document) -> Result<Option<Projection>> {
     for (path, flag) in doc {
         let keep = match flag {
             Bson::Int32(0) | Bson::Int64(0) | Bson::Double(0.0) | Bson::Boolean(false) => false,
-            Bson::Int32(_) | Bson::Int64(_) | Bson::Double(_) | Bson::Boolean(true) => true,
+            // A decimal flag reads as the number it is, as a double does: zero
+            // excludes, anything else includes.
+            Bson::Decimal128(d)
+                if kimmy_core::decimal::decode(d) == kimmy_core::decimal::Decimal::Zero =>
+            {
+                false
+            }
+            Bson::Int32(_)
+            | Bson::Int64(_)
+            | Bson::Double(_)
+            | Bson::Decimal128(_)
+            | Bson::Boolean(true) => true,
             // `{items: {$slice: 3}}`, `{items: {$elemMatch: {...}}}`: a
             // projection operator, which this projection language does not
             // have. Named, so the refusal says what was asked for rather than
@@ -1007,5 +1021,30 @@ mod decimal128 {
         let keys = parse_sort(&spec).unwrap();
         sort(&keys, &mut docs);
         docs
+    }
+
+    /// A sort direction and a projection flag read a decimal as the number it
+    /// is, as a double: `1`, `-1.0`; zero excludes, anything else includes.
+    #[test]
+    fn a_decimal_direction_or_flag_reads_as_the_double_of_its_value() {
+        assert_eq!(
+            parse_sort(&doc! { "a": dec("1") }).unwrap(),
+            parse_sort(&doc! { "a": 1.0 }).unwrap()
+        );
+        assert_eq!(
+            parse_sort(&doc! { "a": dec("-1.00") }).unwrap(),
+            parse_sort(&doc! { "a": -1.0 }).unwrap()
+        );
+        for bad in [dec("2"), dec("0.5"), dec("NaN")] {
+            assert!(parse_sort(&doc! { "a": bad.clone() }).is_err(), "{bad}");
+        }
+        assert_eq!(
+            parse_projection(&doc! { "a": dec("1"), "b": dec("2.5") }).unwrap(),
+            parse_projection(&doc! { "a": 1.0, "b": 2.5 }).unwrap()
+        );
+        assert_eq!(
+            parse_projection(&doc! { "a": dec("0"), "b": dec("-0.00") }).unwrap(),
+            parse_projection(&doc! { "a": 0.0, "b": -0.0 }).unwrap()
+        );
     }
 }

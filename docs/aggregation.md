@@ -458,6 +458,18 @@ true}}` keeps the document here, and the same holds for an index out of range
 and for a field path that resolves to nothing.
 **A fractional index is refused**, not truncated.
 
+**A whole-number argument may be any number of whole value**: an integer, a
+double such as `2.0`, or a decimal such as `{"$numberDecimal": "2"}` or
+`"2.00"`. That holds for `$arrayElemAt`'s index, `$slice`'s position and count,
+`$range`, `$filter`'s `limit`, `$indexOfArray`'s bounds, `$limit`, `$skip` and
+`$vectorSearch`'s `k`; a decimal with a fraction is refused as a double with
+one is. `$substr` truncates a fractional start or length, the double's and the
+decimal's alike. A projection's flag and a sort direction read a decimal as
+the number it is too. Until 0.51.0 each refused a decimal, `Decimal128("1")`
+included. A `$vectorSearch` query vector still takes only doubles and
+integers: a decimal component would have to be rounded to a 32-bit float
+([Deviations](deviations.md)).
+
 **`$slice` has two shapes.** `[array, n]` takes the first `n`, or the last
 `|n|` when `n` is negative. `[array, position, n]` takes `n` from `position`,
 counted from the end when negative, and `n` must be positive there. A window

@@ -323,6 +323,11 @@ fn parse_condition(
             Bson::Int32(n) => Condition::Size(i64::from(*n)),
             Bson::Int64(n) => Condition::Size(*n),
             Bson::Double(n) if n.fract() == 0.0 => Condition::Size(*n as i64),
+            // A decimal by its value, as the double of that value is.
+            Bson::Decimal128(d) => match kimmy_core::decimal::whole_number(d) {
+                Some(n) => Condition::Size(n),
+                None => return Err(Error::InvalidQuery("$size requires an integer".into())),
+            },
             _ => return Err(Error::InvalidQuery("$size requires an integer".into())),
         },
         "mod" => parse_mod(arg)?,
@@ -511,11 +516,23 @@ fn mod_operand(value: &Bson, what: &str) -> Result<i64> {
                 "$mod {what} must be representable as a 64-bit integer, found {d}"
             ))
         }),
+        // Truncated toward zero, as a double is, by its exact value.
+        Bson::Decimal128(d) => truncate_decimal(d).ok_or_else(|| {
+            Error::InvalidQuery(format!(
+                "$mod {what} must be representable as a 64-bit integer, found {d}"
+            ))
+        }),
         other => Err(Error::InvalidQuery(format!(
             "$mod {what} must be a number, found {}",
             type_name_of(other)
         ))),
     }
+}
+
+/// A decimal truncated toward zero, when that is an `i64`: the double's rule,
+/// on the exact value.
+fn truncate_decimal(d: &bson::Decimal128) -> Option<i64> {
+    kimmy_core::decimal::integer_part(d).filter(|part| part.in_range).map(|part| part.value)
 }
 
 /// A double truncated toward zero, when that is an `i64`.
@@ -1087,6 +1104,10 @@ fn condition_matches(
                 Bson::Int32(n) => i64::from(*n),
                 Bson::Int64(n) => *n,
                 Bson::Double(d) => match truncate_to_i64(*d) {
+                    Some(n) => n,
+                    None => return false,
+                },
+                Bson::Decimal128(d) => match truncate_decimal(d) {
                     Some(n) => n,
                     None => return false,
                 },
@@ -2686,6 +2707,43 @@ mod decimal128 {
         let stored = doc! { "v": dec("1.5") };
         assert!(hit(doc! { "v": { "$type": "decimal" } }, &stored));
         assert!(hit(doc! { "v": { "$exists": true } }, &stored));
+    }
+
+    /// `$size` takes a decimal of whole value and `$mod` truncates a decimal
+    /// operand and a stored decimal toward zero, each as the double of the
+    /// same value is read. They used to refuse the operand and never match a
+    /// stored decimal.
+    #[test]
+    fn size_and_mod_read_a_decimal_as_the_double_of_its_value() {
+        let pair = doc! { "v": [1, 2] };
+        assert!(hit(doc! { "v": { "$size": dec("2") } }, &pair));
+        assert!(hit(doc! { "v": { "$size": dec("2.00") } }, &pair));
+        assert!(!hit(doc! { "v": { "$size": dec("3") } }, &pair));
+        for bad in [dec("2.5"), dec("NaN"), dec("Infinity")] {
+            assert!(parse(&doc! { "v": { "$size": bad.clone() } }).is_err(), "{bad}");
+        }
+        // `$mod` operands, truncated as a double's are.
+        assert!(hit(doc! { "v": { "$mod": [dec("2"), dec("0")] } }, &doc! { "v": 4 }));
+        assert!(hit(doc! { "v": { "$mod": [dec("4.5"), 0] } }, &doc! { "v": 8 }));
+        assert!(hit(doc! { "v": { "$mod": [4.5, 0] } }, &doc! { "v": 8 }), "the double's rule");
+        for bad in [dec("NaN"), dec("-Infinity"), dec("1E+19")] {
+            let err = parse(&doc! { "v": { "$mod": [bad.clone(), 0] } }).unwrap_err().to_string();
+            assert!(err.contains("must be representable as a 64-bit integer"), "{bad}: {err}");
+        }
+        // A stored decimal, truncated as a stored double is.
+        let even = doc! { "v": { "$mod": [2, 0] } };
+        for (stored, want) in [
+            (dec("4"), true),
+            (dec("4.00"), true),
+            (dec("5"), false),
+            (dec("4.5"), true),
+            (dec("-4"), true),
+            (dec("NaN"), false),
+            (dec("1E+30"), false),
+        ] {
+            assert_eq!(hit(even.clone(), &doc! { "v": stored.clone() }), want, "{stored}");
+        }
+        assert!(hit(even.clone(), &doc! { "v": 4.5 }), "the double's rule");
     }
 }
 

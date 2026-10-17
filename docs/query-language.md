@@ -241,7 +241,10 @@ tested:
 - **Doubles are truncated toward zero**, on both sides: `8.5` satisfies
   `[4, 0]`, and `[4.9, 0.7]` means `[4, 0]`. A value with no integer at all —
   `NaN`, infinity, past 2^63 — is a `400` in the argument and a non-match in a
-  document.
+  document. A `Decimal128` is truncated the same way, by its exact value:
+  `{"$numberDecimal": "8.5"}` satisfies `[4, 0]` and is a divisor of `8`.
+  (Until 0.51.0 a decimal argument was refused and a stored decimal never
+  matched.)
 - **The remainder keeps the dividend's sign**, as in C: `-7` satisfies
   `[3, -1]`, not `[3, 2]`.
 - **A zero divisor is a `400`** at parse, rather than a filter that quietly
