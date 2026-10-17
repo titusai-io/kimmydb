@@ -2686,7 +2686,7 @@ filesystems measured.
    collections, the ranges of documents (`purge_pending_ranges` counts those a
    drop left being purged, which are re-keyed too), the documents and
    tombstones, the indexes and their entries, the file's size, the free space
-   required and the free space there is, and `estimate_secs`. **The start is
+   required and the free space there is, and the time to plan downtime from: `estimate_secs_low` and `estimate_secs`, in seconds, for the migration and the oplog walk the first start makes after it. **Plan on the upper figure**: it is a spinning disk with a cold page cache, the lower an SSD with a warm one, and a store is somewhere between (the 2,000,000-document store with three indexes reads about 52 to 1,162 s, and took 936 to 1,158 s on the lab host's spinning disk and 20 to 47 s, plus about a second of walk, on a laptop's SSD). It is an estimate calibrated on those two machines and on nothing else; a store with nothing to re-key and no indexes costs only the walk, near zero. **The start is
    refused if the volume holding the store has less free space than the
    requirement**, with the two figures (`the storage schema migration needs N
    MiB free and M MiB is free`) and its terms. The requirement is **the larger

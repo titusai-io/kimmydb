@@ -603,6 +603,8 @@ pub(crate) struct Plan {
     pub indexes: u64,
     /// Every entry of `INDEX_ENTRIES`, to drain.
     pub index_entries: u64,
+    /// Every entry of the oplog, which the first start on schema 5 walks once.
+    pub oplog_entries: u64,
     /// The store's file, in bytes.
     pub file_bytes: u64,
     /// What the re-key will stage.
@@ -649,10 +651,14 @@ pub(crate) fn preflight(db: &Database, path: &std::path::Path, found: u8) -> Res
         margin_mib = plan.need.margin >> 20,
         required_free_mib = plan.required_bytes >> 20,
         free_mib = free.map(|f| f >> 20),
-        estimate_secs = estimate_secs(&plan),
+        estimate_secs_low = estimate_secs_range(&plan).0,
+        estimate_secs = estimate_secs_range(&plan).1,
+        oplog_entries = plan.oplog_entries,
         "storage schema 4 -> 5 (exact number keys): every document with a numeric _id is re-keyed \
-         and every index is drained and rebuilt before this node serves anything; the estimate \
-         is for the migration alone, and the first start after it also walks the oplog once"
+         and every index is drained and rebuilt before this node serves anything, and the first \
+         start after it walks the oplog once; the whole takes about estimate_secs_low to \
+         estimate_secs seconds: the upper figure is a spinning disk with a cold page cache, the \
+         lower an SSD with a warm one"
     );
     match free {
         Some(free) if free < plan.required_bytes => {
@@ -724,6 +730,7 @@ fn plan(db: &Database, path: &std::path::Path) -> Result<Plan> {
     }
     plan.docs_rows = docs.len()?;
     plan.index_entries = entries.len()?;
+    plan.oplog_entries = txn.open_table(tables::OPLOG)?.len()?;
     plan.file_bytes = file_bytes(path);
     plan.staged = staged(&docs, &numeric, plan.docs_rows)?;
     let (index_bytes, largest_entry) = index_bytes_upto(&entries, chunk_bytes() as u64)?;
@@ -808,22 +815,52 @@ where
     Ok((bytes, if largest == 0 { 0 } else { allocation(largest + 16) }))
 }
 
-/// Seconds the migration is expected to take, from the measured per-row costs
-/// ([`crate::migrate::MICROS_PER_DOCUMENT`] per document per index, and
-/// [`MICROS_PER_REKEYED_ROW`] per row re-keyed).
-fn estimate_secs(plan: &Plan) -> u64 {
-    let per_index = plan.docs_rows * plan.indexes.min(64) / plan.collections.max(1);
-    (plan.docs_rows * MICROS_PER_REKEYED_ROW + per_index * crate::migrate::MICROS_PER_DOCUMENT)
-        / 1_000_000
+/// What the migration and the oplog walk after it cost, in microseconds, per unit of
+/// work, at the two ends of the hardware it has been measured on.
+///
+/// **The fast end** is a laptop's SSD with a warm page cache, release build, every chunk
+/// durable (`examples/schema4_migration`, 2,000,000 documents of about 350 bytes with
+/// three indexes: the re-key 16 us a row over both passes, the drain 3.0 to 4.3 s for
+/// 6,000,000 entries, the refill 7.9 to 10.8 s for 6,000,000 document-index pairs, the
+/// walk 0.5 to 1.0 s). **The slow end** is the lab host, a spinning disk with a cold
+/// cache, same store, container start to serving: 1,158 s then 936 s, the first run's
+/// phases being the re-key out 182 s and back 198 s (190 us a row), the drain 323 s
+/// (54 us an entry), the refill 387 s (65 us a document-index pair) and the oplog walk
+/// 67 s (34 us an entry). They are rounded up, so the upper figure of the fixture is
+/// 1,162 s. An estimate calibrated on those two machines, nothing more.
+mod rate {
+    pub const REKEY_FAST: u64 = 16;
+    pub const REKEY_SLOW: u64 = 190;
+    pub const DRAIN_FAST: u64 = 1;
+    pub const DRAIN_SLOW: u64 = 54;
+    pub const REFILL_FAST: u64 = 2;
+    pub const REFILL_SLOW: u64 = 65;
+    pub const WALK_FAST: u64 = 1;
+    pub const WALK_SLOW: u64 = 34;
 }
 
-/// The cost of re-keying one row, both phases, the up-front estimate is made
-/// from: a bound, as [`crate::migrate::MICROS_PER_DOCUMENT`] is. Measured with
-/// `examples/schema4_migration` on a laptop's SSD, warm, in a release build:
-/// both phases took 15 to 31 s for 2,000,000 rows of about 350 bytes, 8 to 16
-/// us each, bound by the durable commit of each chunk; a spinning disk is
-/// slower, which is why the line says "estimate".
-pub const MICROS_PER_REKEYED_ROW: u64 = 16;
+/// Seconds the migration and the first start's oplog walk are expected to take, as a
+/// range: the fast end (an SSD, warm) and the slow end (a spinning disk, cold). Nothing to
+/// re-key and no indexes leaves only the walk.
+///
+/// A refill reads a collection's documents once for all its indexes, so it is counted per
+/// document and index as the lab host's figure is (the documents of a store, times its
+/// indexes, over its collections as an average).
+pub(crate) fn estimate_secs_range(plan: &Plan) -> (u64, u64) {
+    let pairs = plan.docs_rows * plan.indexes.min(64) / plan.collections.max(1);
+    let rekeyed = plan.staged.rows;
+    let cost = |rekey: u64, drain: u64, refill: u64, walk: u64| {
+        (rekeyed * rekey
+            + plan.index_entries * drain
+            + if plan.indexes == 0 { 0 } else { pairs * refill }
+            + plan.oplog_entries * walk)
+            / 1_000_000
+    };
+    (
+        cost(rate::REKEY_FAST, rate::DRAIN_FAST, rate::REFILL_FAST, rate::WALK_FAST),
+        cost(rate::REKEY_SLOW, rate::DRAIN_SLOW, rate::REFILL_SLOW, rate::WALK_SLOW),
+    )
+}
 
 /// Every collection id `DOCS` holds a row under, in order: one seek per id,
 /// skipping from range to range, so a store of few large collections is a

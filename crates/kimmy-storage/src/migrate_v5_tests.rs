@@ -3618,3 +3618,39 @@ fn a_ttl_index_without_a_partial_filter_is_not_counted() {
     assert!(!logs.contains("partial filter now decides"), "{logs}");
     assert!(!logs.contains("before=\"not recorded\""), "{logs}");
 }
+
+/// The estimate is a range calibrated on the two machines the migration has been measured
+/// on: the lab host's cold 2,000,000-document runs (1,158 s and 936 s) must fall inside it,
+/// the laptop's warm 20 to 47 s must not fall below its lower end by more than a rounding,
+/// and a store with nothing to re-key and no indexes costs only the oplog walk.
+#[test]
+fn the_estimate_is_a_range_that_holds_both_measured_machines() {
+    use crate::migrate_v5::{Plan, Staged, estimate_secs_range};
+
+    let fixture = Plan {
+        collections: 1,
+        ranges: 1,
+        docs_rows: 2_000_000,
+        indexes: 3,
+        index_entries: 6_000_000,
+        oplog_entries: 2_000_000,
+        staged: Staged { rows: 2_000_000, ..Staged::default() },
+        ..Plan::default()
+    };
+    let (low, high) = estimate_secs_range(&fixture);
+    for lab_host in [936, 1_158] {
+        assert!(low <= lab_host && lab_host <= high, "{lab_host} s outside {low}..{high}");
+    }
+    // The laptop's SSD took 20 to 47 s for the migration and about a second for the walk.
+    assert!((40..=60).contains(&low), "the fast end is {low} s");
+    assert!((1_158..=1_300).contains(&high), "the slow end is {high} s");
+
+    // kimmy3's shape: nothing to re-key, no indexes, 2,000,000 oplog entries is the walk.
+    let walk_only =
+        Plan { collections: 1, docs_rows: 4, oplog_entries: 2_000_000, ..Plan::default() };
+    let (low, high) = estimate_secs_range(&walk_only);
+    assert!(low <= 2 && high <= 70, "a walk alone is {low}..{high} s");
+
+    // And a store with nothing at all is nothing.
+    assert_eq!(estimate_secs_range(&Plan::default()), (0, 0));
+}

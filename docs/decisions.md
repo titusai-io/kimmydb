@@ -28327,7 +28327,7 @@ The acceptance store's figure was 2,539 MiB under the first preflight. On a 10 G
 
 **A stop costs one chunk.** The stop is looked for before every chunk, inside a range and inside an index. Measured with every chunk holding the writer 60 ms and writers busy on another store beside it, a stop was answered in 148 to 198 ms, with at most one commit after it, in each of the four kinds of chunk.
 
-**Measured against the design's estimate: 19.3 minutes on mars, against 12 to 20.** The acceptance run on mars: 2,000,000 documents of about 350 bytes with integer `_id`s and three indexes, on its spinning disk, cold, from the container's start to `/v1/version` answering 200, **1,158 s**. Its phases:
+**Measured against the design's estimate: 19.3 minutes on mars, against 12 to 20.** The acceptance run on mars: 2,000,000 documents of about 350 bytes with integer `_id`s and three indexes, on its spinning disk, cold, from the container's start to `/v1/version` answering 200, **1,158 s**. Its phases: **The line the start logs, `estimate_secs_low` to `estimate_secs`, is a range from these two machines and no others:** the fast end is the laptop's rates (16 us a row re-keyed, 1 us an index entry drained, 2 us a document-index pair refilled, 1 us an oplog entry walked, rounded up), the slow end the lab host's (190, 54, 65 and 34 us), so the 2,000,000-document fixture reads about 52 to 1,162 s, the lab host's 936 and 1,158 s inside it. A first version carried one number from the laptop's rates, 48 s, about twenty times low on the target hardware; the upper figure is the one to plan downtime from. A store with nothing to re-key and no indexes costs only the walk.
 
 | Phase | From | To | Took |
 |---|---|---|---|
