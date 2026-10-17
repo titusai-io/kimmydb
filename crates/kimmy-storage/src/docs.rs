@@ -1320,6 +1320,19 @@ impl Engine {
             // as a local one would — the planner here answers queries over the
             // merged data, wherever it was written.
             index::mark_multikey(txn, &coll.db, &coll.name, &newly_multikey)?;
+            // A chunk a peer removed from a shadow may be half of a move of
+            // chunk ids (an adoption, a re-embed off a 0.50 id), which keeps the
+            // count: counted here, in this transaction, as a move made on this
+            // member is, so a graph this member saved before it is not adopted
+            // as fresh after a restart (ADR-239). Any key the shadow loses
+            // comes by a removal, and an insert changes the count, so the
+            // removals are enough.
+            if previous.is_some()
+                && next.is_none()
+                && kimmy_core::vector_meta::is_shadow(&coll.name)
+            {
+                crate::vectors::bump_vector_renames(txn, &[coll.id])?;
+            }
             violations
         };
 
