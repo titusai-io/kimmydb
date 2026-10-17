@@ -918,8 +918,12 @@ impl EmbeddingWorker {
     /// turns from `Some(false)` to `Some(true)` the roll to 0.51.0 has
     /// finished, and every embedded collection this member owns is rescanned
     /// once its ownership has held, so what a 0.50 member wrote during the
-    /// roll, after the document was last judged here, is judged again. Only
-    /// with an ownership check: a lone member has no roll.
+    /// roll, after the document was last judged here, is judged again. The
+    /// answer is over the live members, so the turn comes when the last 0.50
+    /// member leaves to be upgraded, not when it returns: what it wrote that
+    /// no peer pulled first is judged by its own first-sight rescan on its
+    /// return, in what it owns then. Only with an ownership check: a lone
+    /// member has no roll.
     pub fn set_chunk_ids_check(&mut self, f: ChunkIdsCheck) {
         self.chunk_ids_everywhere = Some(f);
     }

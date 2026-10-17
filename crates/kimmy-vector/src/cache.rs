@@ -2859,4 +2859,71 @@ mod tests {
             .unwrap();
         assert_eq!(hits[0].id, source, "found under its new id");
     }
+
+    /// One direction of replication, until there is nothing left to pull.
+    fn pull(into: &Engine, from: &Engine) {
+        loop {
+            let (mine, theirs) = (into.version_vector().unwrap(), from.version_vector().unwrap());
+            let Some(start) = mine.behind(&theirs) else { return };
+            let entries = from
+                .entries_for_peer(start, 10_000, kimmy_storage::WalkScope::Background)
+                .unwrap()
+                .entries;
+            if into.apply_batch(&entries).unwrap().applied == 0 {
+                return;
+            }
+        }
+    }
+
+    /// On a member that does not own the collection, the moves of chunk ids
+    /// arrive by replication, an insert and a removal that keep the count: a
+    /// graph that member saved before them is rebuilt after a restart, not
+    /// adopted as fresh with keys that no longer exist (ADR-239).
+    #[test]
+    fn a_non_owners_snapshot_saved_before_a_replicated_move_is_rebuilt() {
+        let (owner, owner_shadow, _owner_dir) = setup(60);
+        let source = DocId::String("12345".into());
+        let record = VectorRecord {
+            source: source.clone(),
+            chunk: 0,
+            source_hlc: Hlc::new(1, 0),
+            vector: vec![99.0, 1.0, 0.0, 0.0],
+            text: "t".into(),
+            config: None,
+        };
+        let doc = bson::serialize_to_document(&record).unwrap();
+        owner.replace(&owner_shadow, &DocId::String("12345#0".into()), doc, true).unwrap();
+
+        let dir = tempfile::tempdir().unwrap();
+        let replica = Engine::open(&dir.path().join("kimmy.redb")).unwrap();
+        pull(&replica, &owner);
+        let shadow = replica.vector_collection("app", "docs").unwrap().unwrap();
+        let cache = snapshot_cache(&dir);
+        cache.access(&replica, &shadow, Metric::Cosine, 4);
+        drop(cache);
+
+        assert_eq!(owner.adopt_legacy_chunks(&owner_shadow, &source).unwrap(), 1);
+        let renames = replica.vector_renames(shadow.id).unwrap();
+        pull(&replica, &owner);
+        assert_eq!(replica.vector_renames(shadow.id).unwrap(), renames + 1, "the removal counted");
+        drop(replica);
+
+        let (replica, shadow) = reopen(&dir);
+        let cache = snapshot_cache(&dir);
+        let Access::Approximate(first) = cache.access(&replica, &shadow, Metric::Cosine, 4) else {
+            panic!("the snapshot serves once");
+        };
+        assert_eq!(first.len(), 61, "the count agrees");
+        let Access::Approximate(second) = cache.access(&replica, &shadow, Metric::Cosine, 4) else {
+            panic!("then a rebuild serves");
+        };
+        assert!(
+            !Arc::ptr_eq(&first, &second),
+            "a snapshot from before the move was adopted as fresh"
+        );
+        let options = crate::search::SearchOptions { k: 1, ..Default::default() };
+        let hits =
+            second.search(&replica, &shadow, &[99.0, 1.0, 0.0, 0.0], &options, None).unwrap();
+        assert_eq!(hits[0].id, source, "found under its new id");
+    }
 }

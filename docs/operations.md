@@ -3073,9 +3073,11 @@ move.
   snapshot`, `snapshot format 2 is not 3`) and rebuilt on the collection's first
   search after the upgrade, on each member. A format-3 snapshot also records
   how many times the collection's chunks had been moved to other ids when it
-  was built (`vector_renames:<collection id>` in the store's metadata), and one
-  saved before the recheck moved them is rebuilt after a restart rather than
-  served with ids that no longer exist. Nothing to do.
+  was built (`vector_renames:<collection id>` in the store's metadata, which
+  counts the moves this member made and the removals replication brought it),
+  and one saved before the recheck moved them is rebuilt after a restart rather
+  than served with ids that no longer exist, on the owner and on every other
+  member. Nothing to do.
 - **During a roll** both builds write the same ids for ObjectId, integer and
   plain-String documents. For a binary or reserved-String document the ids
   differ: a 0.51.0 member reads a 0.50 member's chunks and moves or re-embeds
@@ -3090,10 +3092,15 @@ move.
   `INFO` (`every live member now writes 0.51.0's vector chunk ids`), each
   owner rechecks its collections once more after its ownership has held, which
   re-embeds such a document and judges again whatever a 0.50 member wrote
-  after a document was last judged. The filter defect stays on 0.50 members
-  until they are upgraded. To force a recheck of a collection by hand on a
-  cluster, restart its owner: every clustered start rescans what the member
-  owns.
+  after a document was last judged. **That happens about 30 s after the last
+  0.50 member leaves**, when it stops to be upgraded, not when it returns.
+  What it wrote that no peer had pulled before it stopped arrives when it
+  comes back as 0.51.0: its own first-sight rescan judges it in the
+  collections it then owns, and in any other the document's next write or a
+  restart of that collection's owner does. The filter defect stays on 0.50
+  members until they are upgraded. To force a recheck of a collection by hand
+  on a cluster, restart its owner: every clustered start rescans what the
+  member owns.
 - **Rolling back to 0.50.x** needs no store work: no schema, codec, wire field
   or configuration key changed. A 0.50 build finds the chunks 0.51.0 wrote for
   binary and reserved-String documents only by full scans and does not remove
