@@ -183,7 +183,7 @@ relays a drop it ignored and a creation its database's drop refused, as entries 
 
 **Decimal128 and storage schema 5 (0.51.0, [ADR-238](decisions.md)) make 0.51.0 a
 rollback boundary to 0.50.x and 0.49.x, and give the roll a declaration.** Every number
-key on disk changes, so the first start migrates the store before it serves (19.3 minutes
+key on disk changes, so the first start migrates the store before it serves (about 16 to 19 minutes
 for 2,000,000 documents with integer `_id`s and three indexes on the lab host) and, from the
 moment it raises the sidecar, a 0.50 or 0.49 build refuses the store; the way back is the
 backup taken before the upgrade. The wire does not change shape: every key a member sends
