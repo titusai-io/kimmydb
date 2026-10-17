@@ -70,6 +70,8 @@ pub mod writer_hold;
 #[cfg(test)]
 mod decimal128_gate_tests;
 #[cfg(test)]
+mod decimal_cost_tests;
+#[cfg(test)]
 mod key_walk_tests;
 
 #[cfg(test)]
