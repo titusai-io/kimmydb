@@ -28007,14 +28007,18 @@ returned tenant `b`'s document and its text, in both join directions. A filter o
    does not rewrite, whatever it holds, and S's chunks of the legacy run; a delete, and the refused-input removal, take
    S's chunks of both and nothing else (a chunk in S's run that names T is T's 0.50 chunk, for T's own put to remove).
    **One exception: a twin's whole set is moved.** An Int64's or an ObjectId's run holds the 0.50 chunks of the String
-   that prints as it; its put moves them, records unchanged, to that String's own ids when they are a whole set (numbers
-   0 to n − 1, one version) and the String has none of its own, so the String is not re-embedded for want of them. A 0.50
+   that prints as it; its put moves them, records unchanged, to that String's own ids when the String is a live
+   document, they are a whole set (numbers 0 to n − 1, one version) and the String has none of its own, so the String is
+   not re-embedded for want of them. A set whose String is no document is an orphan a 0.50 member left, and is deleted:
+   moved, it would stand under an id no judgement and no delete names again. A 0.50
    put wrote a set from chunk 0 up, so a twin's set that another's put partly overwrote kept a tail, never a head, and a
    tail is deleted as before rather than moved and read as current with its head missing. These run in the scope's own
    transaction, so a second document of one batch is judged by what the first wrote. **A reserved String's legacy run is
    adopted** with no provider call: when every chunk at its 0.50 ids names it and its run is empty, each record is
    written unchanged at the new id and the old id deleted. Every move of chunk ids (an adoption, a twin's move, a put
-   that removed an id it did not rewrite) is counted in the commit that makes it, under `vector_renames:<shadow id>`.
+   that removed an id it did not rewrite) is counted in the commit that makes it, under `vector_renames:<shadow id>`,
+   and so is every removal from a shadow that replication applies: the owner makes the moves, and every other member
+   receives each as an insert and a removal.
 4. **The worker.** The owner adopts before each staleness judgement of a reserved String, on the entry path and in
    every scan. **Owner only, which the design did not say:** a member that does not own the collection could otherwise
    move a document's older chunks onto the new ids after the owner's embed of a newer version, and a replicated write
@@ -28033,7 +28037,14 @@ returned tenant `b`'s document and its text, in both join directions. A filter o
    settled as a gain, rescanned once ownership has held. That is what judges again a 0.50 member's chunk that landed
    after its document was last judged, and an Int64 whose chunks a 0.50 member's delete of the String that prints as
    it removed (0.50 deleted every `7#n`, which are the Int64 `7`'s ids too); otherwise nothing would until the
-   document's next write.
+   document's next write. **It fires when the last 0.50 member leaves, not when it returns**: the answer is read over
+   the live members, so it turns about `OWNERSHIP_SETTLE` after that member stops to be upgraded, normally while it is
+   still down. What that member wrote that no peer pulled before it stopped arrives when it comes back as 0.51.0: in
+   the collections it owns then, its own first-sight rescan judges those writes from its store; in a collection it does
+   not own then, they wait for the document's next write or a restart of the collection's owner. That residue is writes
+   the member made in the moments of dual ownership around its restarts, to collections it does not own afterwards. A
+   trigger on its return (a member heard at format 2 that was heard at another before) would close it, at the cost of a
+   per-member record of formats across process boots in the worker; it is not built.
 5. **Search.** A filter's admitted set is `HashSet<DocId>`, and the exact scan and hybrid search's keyword half admit by
    the record's `source`, through the one admission function ADR-102's addendum of 2026-10-16 gave them; the keyed
    join is exact through point 3. The graph is keyed by the id each chunk is stored under (`for_each_vector` passes
