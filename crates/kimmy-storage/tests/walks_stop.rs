@@ -465,6 +465,9 @@ const WRITES: &[&str] = &[
     // with no usable index, the whole collection (`modify::scan_until`).
     "modify_where",
     "find_and_modify",
+    // The same, keyed (B5): the same bodies, in the same transactions.
+    "modify_where_keyed",
+    "find_and_modify_keyed",
 ];
 
 /// Public walks that iterate no table themselves, and the function each
