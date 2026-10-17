@@ -181,6 +181,25 @@ pass. No table, schema, wire field, backup tag or entry kind changed; a 0.50.0 m
 relays a drop it ignored and a creation its database's drop refused, as entries a
 0.49.x member reads and judges as it would the originals.
 
+**Decimal128 and storage schema 5 (0.51.0, [ADR-238](decisions.md)) make 0.51.0 a
+rollback boundary to 0.50.x and 0.49.x, and give the roll a declaration.** Every number
+key on disk changes, so the first start migrates the store before it serves (19.3 minutes
+for 2,000,000 documents with integer `_id`s and three indexes on the lab host) and, from the
+moment it raises the sidecar, a 0.50 or 0.49 build refuses the store; the way back is the
+backup taken before the upgrade. The wire does not change shape: every key a member sends
+or hashes into the cut digest keeps its schema 4 form, so a 0.50 and a 0.51 member in one
+cluster compare and repair as two 0.50 members do, and a 0.51 member's tombstone horizon
+resets at its first start. What a 0.50 member cannot hold is not sent to it: a `Decimal128`
+`_id` fails to decode on 0.50 and 0.49, and a `Decimal128` partial-index bound is refused
+there and never retried, so the creation of either is refused by the operator's declaration
+`cluster.decimal128` (default `false` with clustering on) and by every live peer's
+advertisement. A 0.50 or 0.49 binary refuses a configuration that names the key, and
+**once a decimal `_id` exists a member can no longer be rolled back by wipe and resync**
+(a durable marker records it). A migration that outlasts `storage.oplog_retention_secs`
+turns the member's return into a whole-database snapshot. Two differences outlast the roll
+until a member migrates: its partial unique indexes enforce on decimals (and its TTL
+indexes decide them by exact value), where a 0.50 member's do not.
+
 **A member-at-a-time roll is not evidence that mixed versions work together.**
 The 0.28.0 roll took about 10 s from first member to last, the cluster was
 mixed for 6.8 s of it, and no sync round crossed versions in that window, so a

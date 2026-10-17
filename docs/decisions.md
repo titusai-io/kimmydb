@@ -28129,3 +28129,190 @@ removed; the loop passing `false` to it; the contact's flag not carried out, or 
 plan; an existence finding held by this member's own marker; the hold of a count repair under
 way, or queued, removed, or counted as a stalled round; a snapshot held like the replay; and the
 fix off as a whole (the pre-fix behaviour).
+
+---
+
+## ADR-238 — A stored number is an exact value: a Decimal128 has a place in the order, and number keys are exact and variable length (storage schema 5)
+
+**Amends [ADR-005](#adr-005--exact-mantissaexponent-numeric-encoding), ADR-139's list of what cannot be keyed, ADR-183's exclusion, ADR-185 (its whole Decision), ADR-186 (its identity rule and six sections), ADR-207's set-operator refusal and ADR-210's join statement.** Moves the storage schema to 5. **Breaking, and a rollback boundary to 0.50 and 0.49.**
+
+**The defect.** `cmp_numbers` ranked a stored `Decimal128` equal to every number, so `$eq`, `$gte`, `$lte` and `$in` matched it against anything and `$ne` could never exclude it. Every operand path refused a decimal and the keyer refused it, which closed the operand side and left the stored side open. ADR-185 and ADR-186 then built filing and identity rules around the hole.
+
+**Decision.**
+1. A number is its exact rational value, and the order is the order of those values. Equal values are equal across `Int32`, `Int64`, `Double` and `Decimal128`. A `Decimal128` and a `Double` are equal only when they denote the same rational: `Decimal128("0.1")` is not `Double(0.1)`, which is slightly above one tenth. This is the only choice that is transitive, which a sort and an index need.
+2. `canonical_cmp` compares a `Decimal128` exactly. One decoder (`kimmy_core::decimal`) reads the BID bytes; every consumer of a decimal's value reads it through that decoder. A decimal against a decimal compares adjusted exponents, then the coefficients aligned to 34 digits in a `u128`. A decimal against a binary value brackets both magnitudes by an integer interval of `⌊log2⌋` and, only where the intervals overlap, compares `c·5^p·2^(p+t)` against `m·5^q·2^(q+s)` on a private big unsigned integer. No new product dependency. `num-bigint` and `num-rational` are dev-dependency oracles.
+3. The number key is `exp(2) ‖ esc(M) ‖ END` after the tag and the sub-tag. `M` is the first 128 bits of the value's binary expansion with trailing zero bytes stripped; `00` is escaped as `00 FF`; `END` is `00 00` when no later bit of the expansion is nonzero and `00 01` when one is. `END` is a property of the value, never of how it was written. `Int64(5)` is 7 bytes where it was 12. Zero, NaN and the infinities stay 2 bytes. The 128-bit window of a decimal is taken on a fast path (a 192-bit table of `5^k` with a stated error bound, deferring to the exact path whenever the bits below the cut are within the error of a carry) and `END` comes from a closed form. The order is proved by two lemmas (below) and checked against the comparator and against an independent exact-rational key function.
+4. Schema 5 re-keys numeric `_id` documents and rebuilds every non-vector index. It is stamped in its first commit; the sidecar is raised to 5 (`raise(5)`) immediately before. A 0.50 or 0.49 build refuses the store from `raise(5)`; a start refused before `raise(5)` leaves a store that 0.50 opens. See *The storage migration*.
+5. Keys that leave the engine, and the input of the cut digest, keep the frozen schema 4 form. See *The mixed roll*.
+6. `_id` may be a `Decimal128`. An integer-valued one that fits `i64` is an `Int64` id, with its stored body unchanged. See *The gate*.
+7. **Identity.** The grouping identity (`$group`, `$addToSet`, `$lookup` join keys, the set operators) is by value: equal numbers and decimals are one member, and a bucket's `_id` is its first-seen member. The `raw:` rendering fallback in `group_key` is unreachable.
+8. **A decimal at a partial filter's path is decided by the filter, by exact value.** ADR-185's undecidable filing, the `undecidable` field and its metric are removed. A TTL partial index can therefore expire documents holding a decimal at its filter path, and the reverse, and a partial unique index enforces on them.
+9. **Every refusal that existed only because the comparator could not place a decimal is lifted:** the filter operand (both callers of `comparable`), the `$push $sort` element, the `$min`, `$max`, `$pull` and `$pullAll` operand, every sort (`find`, `find_and_modify`, the aggregate `$sort` stage and `$push $sort` by field: the design named one site and the tree had four), the expression literal, and the set operators' stored decimal. `$convert` to decimal and `$toDecimal` stay refused for their own reason: converting a `Double` needs a rounding rule (a double's exact expansion runs to about 767 digits and a `Decimal128` holds 34). Decimal arithmetic (`$inc`, `$sum`, `$multiply`) is not changed by this decision.
+
+### The order is exact
+
+**Lemma 1 (a decimal against a decimal).** If `x ≠ y` are positive `Decimal128` values, then `|x − y| / max(x, y) ≥ 10^-34`. *Proof.* Write `x = X·10^a` and `y = Y·10^b` with `1 ≤ X, Y < 10^34` and `a ≥ b`, and measure both in units of `10^b`: `A = X·10^(a−b)` and `B = Y` are positive integers, `B < 10^34`, and `10 | A` when `a > b`. If `max(A, B) ≤ 10^34`, then `|A − B| ≥ 1` gives a ratio of at least `1/max(A, B) ≥ 10^-34`. Otherwise `max(A, B) = A > 10^34`, so `a > b`, and `A` is a multiple of 10 above `10^34`, so `A ≥ 10^34 + 10`; the ratio is `1 − B/A ≥ 1 − (10^34 − 1)/A`, which grows with `A`, and at `A = 10^34 + 10` it is `11/(10^34 + 10) > 10^-34`. ∎ Two values whose first `n` significand bits agree differ by less than `2^-(n−1)` of the larger, so distinct decimals share at most **113** leading bits, and 128 leaves a margin of 15 bits for the window. (The design's draft said `1/(2·10^34)` and 114 bits. The bound is one bit tighter, which the numerics builder proved and the adjacent-pair tests reach exactly: the most leading bits shared by adjacent distinct decimals is 113, and the test asserts it. The conclusion is unaffected.)
+
+**Lemma 2 (a decimal against a binary value).** `Int32`, `Int64` and `Double` have significands of at most 64 bits, so their `M` is the whole significand and their `END` is `00 00`. A decimal with the same 128-bit prefix as such a value is either equal to it (then every bit beyond the 128th is zero and its `END` is `00 00`) or strictly greater (then `END` is `00 01`, which sorts above `00 00` and below every key that continues past `M`). Truncation only discards bits, so there is no case with an equal prefix and `x < y`. Lemma 1 does not cover this pair: a 34-digit decimal can lie within `2^-128` of a double without being equal. A constructive generator produces such pairs by the thousand (about 63,000 of 200,000 near-double pairs share the whole 128-bit window), where random search found two in 1.5 million trials.
+
+**Verification.** Three implementations that share no code agree: the comparator (big-integer cross-multiplication), the encoder (a closed-form `END`, an exact window and a fast window), and a reference key function on exact rationals in the test module. `encode(a).cmp(encode(b)) == canonical_cmp(a, b)` holds over all four types and against the reference over every required generator (near-double, decimal-equals-double for both signs of the exponent, `c = 2^k` with a long binary window including the pair `1267650600228229401496703205376E+22` and `Double(2^122·5^22)`, which have equal bytes, adjacent `c ± 1` pairs at every boundary exponent, cohorts, compound keys with a descending number first, and the `00 01` end inside arrays and documents). The heavy runs cover 162,832 values over every exponent plus a boundary set, 200,000 near-double pairs, 100,000 equal pairs and 200,000 random pairs. The closed-form `END` equals the exact-path `END` on all of them. Release timings on a laptop: an encode is 19 to 22 ns for `|e| ≤ 20` and 9 ns at `e = −6176` and `e = +6111` (the exact path is 55 ns, 72 µs and 10.8 µs); a comparison is 13 to 14 ns when the intervals decide, 45 ns for `0.1m` against `0.1`, and 194 ns at worst. The fast path defers on none of a million values at extreme exponents; it defers on every decimal whose expansion ends and whose exponent is negative (`5^q | c`, such as `1.5`), which is correct and costs 55 ns. 53 mutation rows were run against the numerics: 52 are killed, and the survivor is the design's own equivalent mutant (the constants of the interval bound not swapped for negative exponents), which the exhaustive interval test confirms equivalent over every exponent.
+
+### `Decimal128` as `_id`
+
+`DocId` gains `Decimal128(Decimal128Id)`, a canonical 19-byte form (`sign (1) ‖ exponent (i16, big endian) ‖ coefficient (u128, big endian)`) normalised so that equal values have equal bytes. It is the stored codec form (tag 6) and the serde form (`serde_bytes`). `Display` is a bounded canonical scientific form that is also injective. `to_bson` re-pads the exponent into BID's range, because `1E+6144` normalises to `c = 1, e = 6144`, which packed straight into BID reads as a non-canonical zero and would key like `_id: 0`. `DocId::try_from_bson` maps an integral decimal in `i64` range to `Int64` (so `Decimal128("5")`, `Int32(5)` and `Int64(5)` are one document, with the stored body's `_id` as the client wrote it), any other finite decimal to the new variant, and refuses NaN and the infinities. A non-integer decimal `_id` is reachable through filters only: the by-id routes parse the path segment as an integer or a string. The derived `Ord` of `DocId` is not the numeric order; nothing orders by it.
+
+### The mixed roll
+
+The roll is member-at-a-time, and 0.49 and 0.51 may share a cluster if an operator skips 0.50. Every byte string that crosses the line is an id or derived from one. **Both 0.50 and 0.51 repair and both send a horizon. Every cut digest and every key on the wire is in the frozen schema 4 form, so a 0.50 and a 0.51 member compare and repair exactly as two 0.50 members do. A 0.51 member's tombstone horizon resets at its first start.**
+
+- **The frozen form.** `kimmy_core::legacy_key` holds the schema 4 key of an id, sharing no code with the live encoder and held to golden bytes printed by a v0.50.0 build. `LegacyKey` is a type; `legacy_key(&DocId)` and `legacy_of_stored(&[u8])` (total: bytes that are not a canonical stored key come back as they are) construct it, and `LegacyKey::from_wire` wraps bytes received from a peer or a client, at the boundary only. A `Decimal128` id has no schema 4 form and travels as `0xFF` followed by its stored key.
+- **The conversions are at the engine's wire API and nowhere else.** `Engine::snapshot_page` converts the request's cursor legacy to stored on entry and its `next` and every carried delete's key stored to legacy on exit. `Engine::apply_snapshot_page` converts every carried delete's key legacy to stored as its first act, into a private type (`CarriedDelete`) that is the only thing the get, the comparison and both bare-tombstone writes accept, so a wire key cannot reach `DOCS`; it leaves `page.next` as received, to be stored in `SNAPSHOT_PROGRESS` and sent back. `digest_plan` emits legacy uncovered keys, and `digest_answer` and `digest_compare` take them; every uncovered set, union and byte cap is legacy end to end (an `Int64` key is 7 bytes stored and 12 legacy). The transport passes frames through unchanged, pinned by a source guard over the cluster crate's product code. Every caller, the model tests included, therefore exercises the product's conversion.
+- **Why the receiver converts first.** A stored key can equal another id's schema 4 key (the A2 pair: the stored key of `0x5000008101800000` is the schema 4 key of `0x50007F8081018000`). A delete for one would otherwise be applied to the other.
+- **The cut digest.** `live_digest::term` takes a `LegacyKey`, and `DigestRow::flip`, `Delta::wrote` and `fold_walked` take one too, so a stored key passed to any of them does not compile. Every fold site (`live_count`'s write, the open walk, the self-check) and `excluded_digest` convert through `legacy_of_stored`. The digest's `FORMAT` stays 1 and the definition digest's stays 2: bumping either would defer every comparison for the whole roll. A digest taken by a 0.50 member equals one taken by a 0.51 member over the same data.
+- **Client tokens.** A `Cursor` is issued in the legacy form for every id schema 4 can represent (and `0xFF` and the stored key for a `Decimal128` id) and accepts both; the conversion is in `Cursor::decode`, never in the executor, which the vector filter feeds stored keys.
+- **Oracles.** Two oracles run inside the existing all-0.51 model runs, so no mixed-format engine is needed: every key a member serves on a page or in an uncovered list equals the frozen schema 4 encoding of its `DocId`, and at quiescence every member's digest row equals a recomputation with the frozen encoder from its own documents. They run in the convergence model's `residual_4`, `finding_f16` and generated schedules and in `young_stamp_seeded`, whose previous-release step is now a 0.50 run (legal only before the member's first 0.51 start).
+- **Mutation rows.** 26 rows are killed: the conversion removed at the cursor, `next`, the tombstone keys, the receiver's first act, the get, the comparison and both bare-tombstone writes; `page.next` converted on receipt; the uncovered lists built or deduplicated on stored keys; the point read; the three fold sites; `legacy_term` failing on a schema 4 key; and the token converted inside the executor. Three rows (consistent at both ends) are caught only by the oracles. The row that halves the answer's byte cap is caught only by the source guard, since it is behaviourally equivalent.
+
+### The gate
+
+A 0.49 or 0.50 member cannot hold a `Decimal128` `_id`, and cannot parse a `Decimal128` partial-filter bound: an entry or page that carries the new `DocId` variant fails to decode, the window is requested for ever, and a refused index definition is recorded, never retried, and survives the member's own upgrade. So accepting either is an operator declaration, the featureCompatibilityVersion pattern.
+- **The switch.** `cluster.decimal128` (bool), default `true` when clustering is off and `false` when it is on. It states that every member runs 0.51 and has migrated, and it gates local creation only. An entry, a page, a restored or a repaired definition from another member is always applied; refusing one would wedge replication.
+- **Three chokepoints**, keyed on the BSON type of the `_id`, not on the `DocId` variant (an integral decimal is an `Int64` with a decimal body, which breaks an older member's full scans): `check_insert` (insert, bulk, scope inserts, upserts and `$setOnInsert`), `replace_in_txn` (only when the replace creates the row; a replace over an existing decimal `_id` is not refused), and the local `create_index` of an index whose partial filter holds a `Decimal128` operand. Each refuses with `400`, naming `cluster.decimal128` and the peers that do not advertise it.
+- **The net.** A gated creation is also refused unless every live peer advertises `Facts.decimal128 = Some(true)` (written by every 0.51 member regardless of the key). An unheard peer fails closed, a migrating member is not live, and `cluster.membership = false` with clustering on always refuses. It is a net, not a check: a peer that restarts on an older build keeps its last block for up to one lease.
+- **The marker.** A `META` row `decimal128:id_present` is written in the transaction that writes or applies the first document whose body `_id` has BSON type `Decimal128`: at `write_insert`, `replace_in_txn`, `write_chosen`, and in `apply_remote_in_txn` (entries, `All` and scoped pages, the deletes a page carries, `Converge` rows), and a backup carries it. It is exposed as the gauge `kimmy_decimal128_id_present`, a `/readyz` field, and a WARN once per peer and every ten minutes while it is set and a live peer cannot hold such an id. **The marker, not the key, is the authority**: the key can be set back to `false` and the ids remain.
+- **The procedure.** Set `cluster.decimal128` only after every member runs 0.51 and has finished its migration, and never in the same change as the binary. The same procedure covers a decimal partial-filter bound.
+- **Mutation rows.** 31 rows are killed, among them: the BSON-type test replaced by the variant at both chokepoints, the key ignored, the net removed, an unheard peer passing, the marker unwritten or keyed on the variant, any of the three chokepoints ungated, the third chokepoint gating replicated definitions, the integer normalisation removed, and `to_bson` not re-padding.
+
+### Rollback
+
+**The boundary begins at `raise(5)`** and is real for 0.50 and 0.49: with `kimmy.format` present the check before the open refuses `schema 5 > 4` as `RefusedStore { Newer }`; without it the read-only fallback or `migrate::refuse_newer` refuses it; a 0.50 restore refuses a schema 5 backup. The way back is a backup taken before the upgrade (the deploy tool's `BACKUP=true`), which loses the member's later writes and pulls them back from its peers. A 0.50 config that names `cluster.decimal128` is refused (`deny_unknown_fields`). Once the marker is set on a member, that member and its peers can no longer be rolled back by wipe and resync, and a member on an older build that has met such a document is rolled forward, never wiped.
+
+### A decimal at a partial filter's path is decided (ADR-185 superseded)
+
+ADR-185's whole Decision was the decimal case: a partial index held every document with a `Decimal128` at a path its filter read, in an undecidable run, and a partial unique index never enforced on it. The root cause it declined to fix is fixed, so it goes.
+- `PartialFilter::undecidable_path`, `DocumentKeys::Undecidable` and the undecidable run are removed from every write, backfill, replicated-apply and unfile path. A document is judged by the filter like any other: one the filter does not select is absent from the index, a decimal included, and `unique_keys` enforces on a decimal. The `UNDECIDABLE` sentinel stays as a constant for schema 4 only: the migration reads it for the TTL count, and the drain clears it through the index's range.
+- The index's `undecidable` field, `kimmy_index_undecidable_total`, the OTLP instrument `kimmy.index.undecidable` and `explain`'s `undecidableCandidates` are removed, and the openapi `Index` schema no longer requires `undecidable`. This is Breaking for typed clients.
+- **TTL decides a decimal by exact value.** The expiry pass reads keyed entries only and deletes a candidate only if the filter selects it. On 0.50 a document whose partial-filter path held a decimal sat in the undecidable run and a TTL index never expired it; after the rebuild it is keyed whenever the exact filter selects it, and the next pass deletes it (`{tier: {$lt: 3}}` over `tier: Decimal128("1")`). The reverse also happens: a `$gte` filter that selected a decimal only because it ranked equal to every number no longer does, and the document is kept. The deletes are ordinary replicated deletes, so they reach 0.50 members mid-roll and are irreversible except from a pre-upgrade backup. The migration logs one line per TTL index with the count of documents whose selection changed.
+- **A partial unique index enforces on decimals.** `{email: 1}` with the filter `{balance: {$gt: 0}}` accepted any number of `{email: "x", balance: Decimal128("10")}` documents; now the second is refused. Standing duplicates are found by the rebuild and reported (`/violations`, `kimmy_unique_violations_total`, a log line), and an update of either holder that keeps the key is refused.
+- **Soundness.** `PartialFilter::implies` stays sound with decimals on both sides: `implication_is_sound_for_what_find_selects` (5,026 implied pairs, 1,341 with a decimal on both sides), `containment_is_sound`, and the `a_chosen_partial_index_holds_every_document_find_returns` differential (531 documents of which 117 hold a decimal, 582 filters of which 130 have a decimal bound, 1,840 queries of which 416 have a decimal operand, 35,106 index uses, none lost).
+- **Mixed roll.** Nothing compares index entries between members: the definition digest reads definitions, the cut digest reads documents and stamps, and a snapshot or a repair carries documents. The differences during a roll are behaviour. A 0.51 member refuses or reports a decimal pair that a 0.50 member accepts silently, until that member's own migration reports it, and TTL deletes follow whichever member owns the collection's expiry, so a 0.50 owner still deletes the decimals a `$gte` filter selected by the old ranking.
+
+### Identity
+
+The grouping identity is `keyenc`, which is exact, so `$group`, `$addToSet`, the `$lookup` join key and the set operators identify equal numbers and decimals as one member (`1`, `1.0`, `Decimal128("1")` and `Decimal128("1.00")`), a decimal NaN of any sign or payload joins a double NaN, a decimal infinity joins the double infinity, and `-0`, `0E-100` and a non-canonical coefficient join `0`. `Double(0.1)` and `Decimal128("0.1")` stay two members. ADR-186 is amended in place: its table, the rendering paragraph, "considered and rejected" (non-transitivity was the premise, and it is gone), the properties (the identity now agrees with the canonical order everywhere), the operand refusal (lifted for all five operators) and the `$pull` and `$pullAll` section. `group_key(a) == group_key(b)` exactly when `canonical_cmp(a, b) == Equal`, over 305 values that put every special form bare and nested four ways, and for the set operators' `Member`.
+
+**`$sum` and `$avg` refuse a `Decimal128`.** Decimal arithmetic is not built, and a pipeline that skipped a decimal answered a wrong total. A `$group` whose `$sum` or `$avg` meets a `Decimal128` operand answers `400`, in the words `$add` uses. An array or a document holding a decimal is still ignored, as any array or document is. `$inc`, `$mul` and the expression operators already refused one.
+
+### The storage migration: schema 4 to 5
+
+**Decision.** Every number key on disk changes, so `SCHEMA_VERSION` is 5 and the first start of 0.51.0 migrates the store before it serves anything (`kimmy_storage::migrate_v5`). It re-keys every document with a numeric `_id` per `DOCS` collection-id range, through a staging table, under a durable phase per range. It then drains and rebuilds every index, in chunks, recording every unique collision it finds in the commit of the chunk that found it. The migration writes raw transactions and folds nothing: the live counts and the cut digests stand as they are, since every fold site hashes the key's schema 4 form. **From `raise(5)`, immediately before its first commit, 0.50 and 0.49 refuse the store.** That is the rollback boundary.
+
+**The order at open.**
+1. The ensure-tables commit, with the tombstone horizon's reset.
+2. The refusals that write nothing: unparseable partial filters, and the free-space preflight.
+3. `raise(5)`: the sidecar records schema 5, written by this build.
+4. The first migration commit. It writes schema 5 into `META`, deletes the 3 to 4 markers, carries their unreported collisions, and creates the staging table, the collision table and every marker, all in one transaction.
+
+A start refused at step 2 leaves a store 0.50 opens. The markers, not the version, mean unfinished: a store at schema 5 with markers resumes, and the last commit deletes them.
+
+**The unit of re-keying is the `DOCS` collection-id range, not the collection.** A drop leaves its rows under an id nothing resolves until the purger removes them (ADR-189). The purger folds each row's digest term out as it removes it, so those rows are re-keyed too. They get no index rebuild: their entries are only ever removed by range.
+
+**Invariant I-DOCS: one id's range of `DOCS` never holds both forms of a numeric key.** A new key can equal the old key of another id: the schema 5 key of `0x5000008101800000` is the schema 4 key of `0x50007F8081018000` (the A2 pair). Each range therefore passes through two phases:
+- **`rekeying`:** a chunk of 8,192 old rows per commit, each decoded strictly, put into the staging table under its new key and deleted from `DOCS`. The commit that drains the range sets `moving_back`. A range that had nothing numeric is `done` from the first commit.
+- **`moving_back`:** the staged rows return, a chunk per commit, and the commit that empties the staging set sets `done`. `DOCS` is never read for old keys in this phase.
+
+A strict decoder refuses a key no build wrote. It cannot tell a moved-back key from an old one (the A2 pair decodes as the other id). Only the phase, committed with the chunk it covers, says which form a row is in.
+
+**Every non-vector index is drained, then refilled.** Old and new entries can be byte-identical for different values, so an index's range is emptied first. Each index moves through `pending`, `draining` (about 16 MiB of entries per commit, by key), `refilling` (the document cursor in each chunk's commit) and `done`.
+- One walk of a collection's documents refills all of its indexes. Each document is read and parsed once, which saves about a quarter of the refill at 500,000 documents with three indexes.
+- A unique index's collisions are found by looking each entry up in `INDEX_ENTRIES` as it is written, so a resumed run sees the entries of every earlier chunk. Each collision is recorded, in the commit of its chunk, as one row per `(collection, index, key)` of a table that outlives the last commit and is forgotten only after the engine has reported it. Every collision is reported, including a pair 0.50 never enforced: a partial unique index whose filter's path holds a decimal now decides it exactly.
+- `multikey` is raised, through a full `CollectionMeta` round trip, in the commit of the chunk that wrote the entry that needs it.
+- Nothing else of a definition moves: no `IndexMeta` field but `multikey`, no stamp (`created` in particular), no tombstone, no refusal hint and no oplog entry.
+
+**The 3 to 4 rebuild's unreported collisions are carried, then settled.** The first commit converts their holders to schema 5 keys while those keys are still exactly schema 4. The last commit, once every index is refilled under the final comparator, drops each carried row:
+- one whose holders a refill row of the same index includes, as the same collision found again under its new key;
+- one no refill row covers, as a state that no longer exists, named in one INFO line with its holders' `_id`s.
+
+A carried collision is therefore never reported itself. Carrying it guarantees that nothing it recorded is lost before the rebuild has looked again.
+
+**TTL.** Before draining a TTL partial index, the migration counts the documents holding a `Decimal128` at a filter path whose selection changes. The "before" is the previous build's undecidable run; the "after" is the exact filter. It logs one line per TTL index: `now_selected` (they expire once due) and `now_not_selected`. A store from schema 3 never filed under ADR-185's rule, so its line says `before="not recorded"` rather than a count.
+
+**The preflight asks for one of redb's growth steps, from the file's size, plus a working set.** In redb 4.3 a region holds 4 GiB. With `U` the file's usable bytes and `T = U mod 4 GiB`:
+- under one region, the file doubles: `U`;
+- past it, at worst the rest of the partial region and one more: `2 × 4 GiB − T`;
+- at a whole number of regions: one region.
+
+On top of that comes four times the larger chunk's working set, estimated from the file's size over its documents. Measured at 2,000,000 documents on a laptop (APFS), the 2,411 MiB file reached 4,096 MiB during the migration, inside the 2,411 MiB bound, and returned to 2,415 MiB at close; on mars (ext4) the same store, at 2,944 MiB, did not grow at all. Too little room refuses the start with `StorageError::NotEnoughSpace`, which names the two figures; nothing of the migration is written.
+
+**Every chunk commits durably.** On redb 4.3, chunks committed non-durably with a durable commit every two seconds made that durable commit take 4.4 to 9.5 s for 100,000 rows. The re-key took seven times as long, and the file doubled, since redb reuses a non-durable commit's freed pages only after a durable one. Durable, the file did not grow at 100,000 or 500,000 documents.
+
+**A stop costs one chunk.** The stop is looked for before every chunk, inside a range and inside an index. Measured with every chunk holding the writer 60 ms and writers busy on another store beside it, a stop was answered in 148 to 198 ms, with at most one commit after it, in each of the four kinds of chunk.
+
+**Measured against the design's estimate: 19.3 minutes on mars, against 12 to 20.** The acceptance run on mars: 2,000,000 documents of about 350 bytes with integer `_id`s and three indexes, on its spinning disk, cold, from the container's start to `/v1/version` answering 200, **1,158 s**. Its phases:
+
+| Phase | From | To | Took |
+|---|---|---|---|
+| Re-key, moving out | 0 s | 182 s | 182 s |
+| Re-key, moving back | 182 s | 380 s | 198 s |
+| Drain, three indexes | 380 s | 703 s | 323 s |
+| Refill, three indexes in one walk | 703 s | 1,090 s | 387 s |
+| The first start's oplog walk | 1,090 s | 1,158 s | 67 s |
+
+The second open took 1.0 s. Peak anonymous memory was 372.6 MiB, and the file stayed at 2,944 MiB throughout. The design's split was 8 to 15 minutes of re-keying and 2 to 3 of index rebuild; mars spent 6.3 minutes re-keying and 11.8 rebuilding. Removing 6,000,000 index entries by key is the larger cost on a spinning disk (see draining by key, below).
+
+The same example on a laptop, for the shape of the cost:
+
+| Documents (3 indexes, about 350 bytes, integer `_id`s) | Re-key, both passes | Drain | Refill | Migration | First-start oplog walk |
+|---|---|---|---|---|---|
+| 100,000 | 0.6 s | 0.2 s | 0.6 s | 1.5 s | 26 ms |
+| 500,000 | 2.4 to 4.1 s | 0.8 to 1.0 s | 1.6 to 2.0 s | 4.8 to 7.3 s | 0.1 s |
+| 2,000,000 | 9.6 to 31 s | 3.0 to 4.3 s | 7.0 to 10.8 s | 20 to 47 s | 0.5 to 1.0 s |
+
+These figures are from a laptop's SSD, warm page cache, release build, every chunk durable, measured with `examples/schema4_migration`. Re-keying is bound by its commits: one sync each, about 490 of them at 2,000,000 documents, each writing about twice its rows' bytes.
+
+**`/readyz` reports every step.** The mars run first showed `migrating, done 6000003 / total 6000003` for 565 s, from the drain to the oplog walk: one count for the whole migration that the drain had already reached. Each step is now its own phase with its own count: `migrating` while a range is re-keyed (rows out, then back against what went out), `draining` for each index (entries removed), `refilling` for each collection (documents walked). A total that starts from the collection's kept document count is raised to stay ahead of `done`. The progress line every 100,000 rows of a step gives the same phase, `done` and `total`, with the collection and the index. A test holds `done` to moving with every chunk that did work, in every step.
+
+**Draining by key is for stopping, not for the file.** The drain removes keys one at a time so that it can stop at a byte budget and resume. redb's `retain_in` takes a range in one call. The note that `retain_in` grew a file from 2.1 to 12 GiB over 742,858 entries predates redb 4.2.0, whose CHANGELOG records a 30 to 100 times speedup. On redb 4.3, `retain_in` drained 1,000,000 entries in 61 ms against 647 ms by key, and the file stayed at 736 MiB either way. The test that bounds the drain's growth therefore cannot tell the two apart, and that mutation is equivalent. The drain is a quarter of the mars run, so a chunked `retain_in` (read a chunk's last key, then remove up to it in one call) is the obvious lever if the downtime has to shrink.
+
+**What 0.50 and this build answer.**
+- 0.50 refuses a store mid-migration and a migrated one alike, before reading anything (`RefusedStore`, `Newer`). Its `kimmyd check-store` answers `not_checked`.
+- This build's `kimmyd check-store` answers `clean` for both: the migration's chunks are ordinary commits.
+- `I_EPOCH` stays 1. The verified record stays 0.50's (schema 4) until the first start on schema 5 walks the oplog and records it for schema 5.
+
+**Tests.** `kimmy-storage/src/migrate_v5_tests.rs` builds a schema 4 store by hand with a frozen schema 4 encoder, cross-checked against `legacy_key` and the live encoder, and compares the migrated store with one this build's engine wrote: every `DOCS` and `INDEX_ENTRIES` row, 14 planner queries, every `(id, stamp)`. It also covers:
+- a kill before every commit, with I-DOCS read from each kill, including between the last re-key chunk and the first move-back chunk, mid move-back, mid drain and mid refill;
+- the A2 pair;
+- 0.50 and 0.49 refused from `raise(5)`, with and without `kimmy.format`;
+- the preflight, and the growth formula against the measurement;
+- a key no build wrote;
+- 3 to 4 markers, and carried collisions (found again, and dissolved);
+- a collision recorded wherever the run is killed, with the colliding pair on both sides of the cursor;
+- the money-field collision;
+- a dropped collection's rows and its purge;
+- no definition, stamp, tombstone, oplog, count or digest moved;
+- the horizon reset landing before `raise(5)`;
+- a timed stop in each kind of chunk;
+- `/readyz` moving with every chunk, in its own phase for every step, and the progress lines saying the same;
+- the TTL line, counted and not recorded;
+- `I_EPOCH` and `check-store` mid-migration and after;
+- a 300,000-entry drain bounding the file's growth (in CI, release).
+
+**Mutation rows.** Each of these is killed:
+- phase B skipped; the cursor not persisted; a phase written a commit late; `DOCS` rescanned in `moving_back`; `decode_v1` loosened;
+- the version stamped last; the markers deleted early; the sidecar not raised; a purge-pending range skipped; the 3 to 4 residue not deleted; the drain skipped;
+- the stop check removed from the re-key, the drain and the refill;
+- the preflight removed; the collision check against `INDEX_ENTRIES` removed; a collision recorded late; only decimal collisions reported;
+- the carried rows deleted in the first commit; the collision table forgotten before the report; the carried rows left in schema 4 form; a dissolved carried collision reported;
+- `multikey` raised late; the TTL count not logged; `created` re-stamped;
+- a TTL count made up for an index never filed under ADR-185's rule;
+- a drain not reported as its own step; a step's estimated total not raised when `done` reaches it.
+
+The drain written with `retain_in` survives and is recorded as equivalent on redb 4.3.
+
+### Tests and mutation rows
+
+The tests are listed with the pieces above. In all, 53 mutation rows were run against the comparator and the encoder (52 killed, one equivalent), 29 against the migration (28 killed, one equivalent on redb 4.3), 26 against the wire conversions, 31 against the gate, 19 against the lifts, 3 against `$sum` and `$avg`, and 19 against the removal of the undecidable filing; every one that is not recorded as equivalent is killed. The mixed roll is covered in process, against a test-side copy of 0.50's writer and a frozen schema 4 encoder checked against bytes a v0.50.0 build printed; it has not been run against a real 0.50 binary.
+
+### Consequences
+
+Documents, queries, sorts and unique indexes behave by value. A `Decimal128` is indexable and can be an `_id`. Two equal values of different types collide in a unique index. `Decimal128("0.1")` is not `Double(0.1)`, and a filter that relied on a stored decimal ranking equal to every number returns different documents. The first start of 0.51.0 migrates before it serves, which takes time proportional to the documents and indexes plus the oplog walk, and needs free space. Once a `Decimal128` `_id` exists a member cannot be rolled back by wipe and resync.
