@@ -995,8 +995,10 @@ impl crate::Engine {
     /// Each keeps the count of chunks while changing their ids, so a graph
     /// saved before one is behind though the count agrees; the index cache
     /// compares this, not the count alone, before it adopts a graph a
-    /// previous process saved (ADR-239). Only this member's own writes count:
-    /// what replication brings is the count's to judge, as before.
+    /// previous process saved (ADR-239). A chunk a peer's write removes from
+    /// the shadow counts too, when it is applied here
+    /// (`Engine::apply_remote_in_txn`): the owner makes the moves, and every
+    /// other member receives them as an insert and a removal.
     pub fn vector_renames(&self, shadow: CollectionId) -> Result<u64> {
         let txn = self.db().begin_read()?;
         let meta = txn.open_table(crate::tables::META)?;
@@ -1104,9 +1106,9 @@ impl WriteScope<'_> {
     /// and every chunk under the document's 0.50 ids whose record names it.
     /// **A twin's whole 0.50 chunk set is moved, not lost**: the String that
     /// prints as an Int64 or an ObjectId had its 0.50 chunks at this
-    /// document's ids, and they go to its own ids when they are the whole of
-    /// its set and it has none of its own ([`movable_twins`]), so it is not
-    /// re-embedded for want of them.
+    /// document's ids, and they go to its own ids when it is a live document,
+    /// they are the whole of its set and it has none of its own
+    /// ([`movable_twins`]), so it is not re-embedded for want of them.
     ///
     /// The generation bump belongs to the commit, not to the write: the
     /// shadow is recorded here, when a chunk was written or removed, and
@@ -1134,7 +1136,7 @@ impl WriteScope<'_> {
                 }
             },
         )?;
-        let moves = movable_twins(&*self, shadow, twins)?;
+        let moves = movable_twins(self, shadow, twins)?;
 
         let written = !docs.is_empty();
         let mut rewritten = std::collections::HashSet::with_capacity(docs.len());
@@ -1396,18 +1398,35 @@ fn twin_050_chunk(
 }
 
 /// The writes that move a twin's 0.50 chunks to its own ids, from what a put
-/// found in its run ([`twin_050_chunk`]): per twin, only when they are the
-/// whole of a chunk set, numbered 0 to n − 1 and of one version, and the
-/// twin's own run is empty. A 0.50 put wrote a set from chunk 0 up, so a twin
-/// whose set was partly overwritten kept a tail of it, never a head: a set
-/// that starts anywhere but 0, or has a gap, is part of one, and would read
-/// as current with chunks missing if it were moved. Such a twin is left to be
-/// re-embedded, as before.
+/// found in its run ([`twin_050_chunk`]): per twin, only when its document is
+/// live, they are the whole of a chunk set, numbered 0 to n − 1 and of one
+/// version, and the twin's own run is empty. A twin that is no document is an
+/// orphan a 0.50 member left (its delete raced the embed, or its write landed
+/// after the delete was processed here): moved, it would stand under an id no
+/// judgement and no delete ever names again, so it is deleted, as any debris
+/// in the run is. A 0.50 put wrote a set from chunk 0 up, so a twin whose set
+/// was partly overwritten kept a tail of it, never a head: a set that starts
+/// anywhere but 0, or has a gap, is part of one, and would read as current
+/// with chunks missing if it were moved. Such a twin is left to be
+/// re-embedded, as before. Liveness is read in the scope, under the writer.
 fn movable_twins(
-    view: &impl ShadowRead,
+    scope: &WriteScope<'_>,
     shadow: &CollectionMeta,
     found: Vec<(DocId, u32, VectorRecord, bson::Document)>,
 ) -> Result<Vec<(DocId, bson::Document)>> {
+    if found.is_empty() {
+        return Ok(Vec::new());
+    }
+    // The collection the shadow serves; none (it has gone) means no twin is a
+    // live document.
+    let parent = match vector_meta::base_name(&shadow.name) {
+        Some(base) => match scope.engine.get_collection(&shadow.db, base) {
+            Ok(parent) => Some(parent),
+            Err(StorageError::Core(CoreError::CollectionNotFound { .. })) => None,
+            Err(e) => return Err(e),
+        },
+        None => None,
+    };
     let mut by_twin: std::collections::BTreeMap<DocId, Vec<(u32, VectorRecord, bson::Document)>> =
         Default::default();
     for (twin, chunk, record, doc) in found {
@@ -1424,8 +1443,15 @@ fn movable_twins(
         if !whole {
             continue;
         }
+        let live = match &parent {
+            Some(parent) => scope.get(parent, &twin)?.is_some(),
+            None => false,
+        };
+        if !live {
+            continue;
+        }
         let mut run_empty = true;
-        visit_document(view, shadow, &twin, |_, _, _, _| run_empty = false, |_, _, _| {})?;
+        visit_document(scope, shadow, &twin, |_, _, _, _| run_empty = false, |_, _, _| {})?;
         if !run_empty {
             continue;
         }
@@ -3234,14 +3260,24 @@ mod tests {
         assert_eq!(ids_in(&engine, &shadow), ["~s:12345#0", "~s:~z#0"], "and the move landed");
     }
 
+    /// A collection holding the documents `ids`, with its shadow.
+    fn with_documents(ids: &[DocId]) -> (Engine, CollectionMeta, tempfile::TempDir) {
+        let (engine, shadow, dir) = with_vectors();
+        let docs = engine.get_collection("app", "docs").unwrap();
+        for id in ids {
+            engine.insert(&docs, bson::doc! { "_id": id.to_bson(), "body": "b" }).unwrap();
+        }
+        (engine, shadow, dir)
+    }
+
     /// An Int64's put moves its twin String's whole 0.50 chunk set, which sat
     /// at the Int64's ids, to the String's own ids, records unchanged, so the
     /// String reads as current and costs no provider call. Part of a set is
     /// not moved: it would read as current with its head missing.
     #[test]
     fn an_int64_put_moves_its_twin_strings_whole_050_set() {
-        let (engine, shadow, _dir) = with_vectors();
         let (int, string) = (DocId::Int64(7), DocId::String("7".into()));
+        let (engine, shadow, _dir) = with_documents(&[int.clone(), string.clone()]);
         put_050(
             &engine,
             &shadow,
@@ -3255,19 +3291,44 @@ mod tests {
         assert_eq!(texts_of(&engine, &shadow, &int), ["int"]);
 
         // A tail of a set (chunk 0 was the Int64's): deleted, not moved.
-        let (engine, shadow, _dir) = with_vectors();
+        let (engine, shadow, _dir) = with_documents(&[int.clone(), string.clone()]);
         put_050(&engine, &shadow, &[chunk_of(&string, 1, AT, "s1")]);
         engine.put_vectors(&shadow, &int, &[chunk_of(&int, 0, AT, "int")]).unwrap();
         assert_eq!(ids_in(&engine, &shadow), ["7#0"]);
         assert!(stale(&engine, &shadow, &string), "left to be re-embedded");
 
         // A twin that already has its own chunks: its 0.50 ones are debris.
-        let (engine, shadow, _dir) = with_vectors();
+        let (engine, shadow, _dir) = with_documents(&[int.clone(), string.clone()]);
         put_050(&engine, &shadow, &[chunk_of(&string, 0, AT, "old")]);
         stored_at(&engine, &shadow, "~s:7#0", &chunk_of(&string, 0, AT, "new"));
         engine.put_vectors(&shadow, &int, &[chunk_of(&int, 0, AT, "int")]).unwrap();
         assert_eq!(ids_in(&engine, &shadow), ["7#0", "~s:7#0"]);
         assert_eq!(texts_of(&engine, &shadow, &string), ["new"]);
+    }
+
+    /// A twin's 0.50 set whose document is gone is an orphan a 0.50 member
+    /// left: an Int64's put deletes it, as any debris in its run, and does not
+    /// move it under an id that no judgement and no delete would ever name.
+    #[test]
+    fn an_int64_put_deletes_a_gone_twins_050_set() {
+        let (int, string) = (DocId::Int64(7), DocId::String("7".into()));
+        let (engine, shadow, _dir) = with_documents(std::slice::from_ref(&int));
+        put_050(&engine, &shadow, &[chunk_of(&string, 0, AT, "orphan of a deleted String")]);
+        engine.put_vectors(&shadow, &int, &[chunk_of(&int, 0, AT, "int")]).unwrap();
+        assert_eq!(ids_in(&engine, &shadow), ["7#0"], "the orphan was removed, not moved");
+        assert!(engine.get_vectors(&shadow, &string).unwrap().is_empty());
+
+        // Deleted, rather than never written: the same.
+        let (engine, shadow, _dir) = with_documents(&[int.clone(), string.clone()]);
+        let docs = engine.get_collection("app", "docs").unwrap();
+        assert!(engine.delete(&docs, &string).unwrap());
+        put_050(
+            &engine,
+            &shadow,
+            &[chunk_of(&string, 0, AT, "s0"), chunk_of(&string, 1, AT, "s1")],
+        );
+        engine.put_vectors(&shadow, &int, &[chunk_of(&int, 0, AT, "int")]).unwrap();
+        assert_eq!(ids_in(&engine, &shadow), ["7#0"]);
     }
 
     /// A move of chunk ids is counted in the commit that makes it, and a write
