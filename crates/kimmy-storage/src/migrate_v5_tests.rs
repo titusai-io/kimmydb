@@ -2634,21 +2634,65 @@ fn i_epoch_and_check_store_answer_for_a_store_mid_migration_and_after() {
 fn progress_advances_with_every_chunk_in_every_phase() {
     // `/readyz` while the migration runs: every step reports its own phase
     // (`migrating` for a range's two re-key passes, `draining` for each
-    // index, `refilling` for each collection) and a `done` that moves with
-    // every chunk that did work and stays below `total` until the step ends.
-    // The mars run of 2,000,000 documents sat at one `done == total` for 565 s
-    // through the drain and the refill before this.
+    // index, `refilling` for each collection), a total in the step's own unit,
+    // and a `done` that moves with every chunk that did work and reads `done
+    // == total` once the step ends. The mars run of 2,000,000 documents sat at
+    // one `done == total` for 565 s through the drain and the refill before
+    // per-step progress, and then showed a drain of 2,000,000 (the
+    // collection's documents) for an index that held fewer entries, its last
+    // `done` far below that total.
+    //
+    // Units: the re-key's two passes and the refill count rows of `DOCS`
+    // (documents and tombstones); a drain counts its own index's entries,
+    // exactly, counted before its first chunk. Moving back is exact too (what
+    // moved out); moving out and the refill start from the kept live count, an
+    // estimate the end of the step finalizes.
     use crate::open_progress::OpenPhase;
     let f = fixture();
     let path = f.copy();
+    // What each step has to do, read from the schema 4 store before the open:
+    // each index's entries, each collection's rows of `DOCS`, and its kept
+    // live count.
+    let (entries_of, rows_of, live_of) = {
+        let db = Database::create(&path).unwrap();
+        let txn = db.begin_read().unwrap();
+        let mut entries_of: BTreeMap<(u64, u32), u64> = BTreeMap::new();
+        for row in txn.open_table(tables::INDEX_ENTRIES).unwrap().iter().unwrap() {
+            let (coll, index, _, _) = row.unwrap().0.value();
+            *entries_of.entry((coll, index)).or_default() += 1;
+        }
+        let mut rows_of: BTreeMap<u64, u64> = BTreeMap::new();
+        for row in txn.open_table(tables::DOCS).unwrap().iter().unwrap() {
+            *rows_of.entry(row.unwrap().0.value().0).or_default() += 1;
+        }
+        let live_of: BTreeMap<u64, u64> = txn
+            .open_table(tables::LIVE_COUNTS)
+            .unwrap()
+            .iter()
+            .unwrap()
+            .map(|row| {
+                let (id, n) = row.unwrap();
+                (id.value(), n.value())
+            })
+            .collect();
+        (entries_of, rows_of, live_of)
+    };
     chunks(7, 300);
     hooks::chunks_seen();
+    hooks::steps_seen();
     let (engine, logs) = crate::log_capture::logged(|| Engine::open(&path).unwrap());
     let items = engine.get_collection("shop", "items").unwrap();
     drop(engine);
+    let live_items = live_of[&items.id.0];
     let seen = hooks::chunks_seen();
+    let ended = hooks::steps_seen();
+    type StepId = (&'static str, String, Option<String>);
+    let id_of = |kind: &'static str, c: &str, i: &Option<String>| (kind, c.to_owned(), i.clone());
+    let ends: BTreeMap<StepId, &hooks::StepSeen> =
+        ended.iter().map(|e| (id_of(e.kind, &e.collection, &e.index), e)).collect();
+    assert_eq!(ends.len(), ended.len(), "a step ended twice: {ended:#?}");
     let mut previous: Option<&hooks::ChunkSeen> = None;
-    let mut steps: BTreeSet<(&str, String, Option<String>)> = BTreeSet::new();
+    let mut steps: BTreeSet<StepId> = BTreeSet::new();
     for chunk in &seen {
         let want = match chunk.kind {
             "re-keying" | "moving back" => OpenPhase::Migrating,
@@ -2656,7 +2700,16 @@ fn progress_advances_with_every_chunk_in_every_phase() {
             _ => OpenPhase::Refilling,
         };
         assert_eq!(chunk.phase, Some(want), "{chunk:?}");
-        assert!(chunk.done < chunk.total, "done reached total before the step ended: {chunk:?}");
+        let end = ends
+            .get(&id_of(chunk.kind, &chunk.collection, &chunk.index))
+            .unwrap_or_else(|| panic!("a step with chunks never ended: {chunk:?}"));
+        if end.exact {
+            // An exact total holds from the step's first chunk to its last.
+            assert_eq!(chunk.total, end.total, "an exact total moved: {chunk:?} {end:?}");
+            assert!(chunk.done <= chunk.total, "{chunk:?}");
+        } else {
+            assert!(chunk.done < chunk.total, "an estimate read finished early: {chunk:?}");
+        }
         let same_step = previous.is_some_and(|p| {
             p.kind == chunk.kind && p.collection == chunk.collection && p.index == chunk.index
         });
@@ -2688,6 +2741,67 @@ fn progress_advances_with_every_chunk_in_every_phase() {
     for kind in ["re-keying", "moving back", "draining an index", "refilling indexes"] {
         assert!(multi_chunk(kind), "premise: {kind} takes several chunks");
     }
+    // Every step ends at `done == total` on `/readyz`: re-key out, re-key back,
+    // each index's drain, each collection's refill. An exact total is what the
+    // step did from its start; an estimate is finalized to it.
+    assert_eq!(steps, ends.keys().cloned().collect(), "steps with chunks, steps that ended");
+    for end in &ended {
+        assert_eq!(end.done, end.total, "a step ended with done != total: {end:?}");
+        if end.exact {
+            assert_eq!(end.began.1, end.done, "an exact total was not the step's work: {end:?}");
+        }
+    }
+    let end = |kind: &'static str, index: Option<&str>| {
+        ends[&id_of(kind, "items", &index.map(str::to_owned))]
+    };
+    // Each drain's total is its own index's entries, counted, whatever the
+    // collection holds: `money_once` (partial, `balance > 0`) holds a handful
+    // of `items`' documents, as the mars fixture's partial index held 14 of
+    // 2,000,000.
+    for index in &items.indexes {
+        let drain = end("draining an index", Some(&index.name));
+        let held = entries_of.get(&(items.id.0, index.id)).copied().unwrap_or(0);
+        assert!(drain.exact, "{drain:?}");
+        assert_eq!((drain.began.1, drain.done), (held, held), "{}: {drain:?}", index.name);
+    }
+    let money = end("draining an index", Some("money_once"));
+    assert!(
+        (1..=3).contains(&money.total) && money.total * 10 < live_items,
+        "premise: a partial index over a handful of {live_items} documents: {money:?}"
+    );
+    // Moving out and the refill walk every row of `items`, tombstones too: the
+    // live count they start from is raised to that, and moving back's exact
+    // total is what moved out.
+    let rows = rows_of[&items.id.0];
+    assert!(rows > live_items, "premise: items holds tombstones ({rows} rows, {live_items} live)");
+    for kind in ["re-keying", "refilling indexes"] {
+        let step = end(kind, None);
+        assert!(!step.exact, "{step:?}");
+        assert_eq!((step.began.1, step.done), (live_items, rows), "{kind}: {step:?}");
+    }
+    let back = end("moving back", None);
+    assert!(back.exact && back.done == rows, "{back:?}");
+    // An estimate above the work is lowered to it: a collection of 20 number
+    // ids and 30 string ids starts its move out from its 50 live documents and
+    // moves the 20, the string keys being the same in both schemas.
+    let (_dir, mixed) = small_schema_4(
+        |engine| {
+            let c = engine.create_collection("shop", "mixed").unwrap();
+            index(engine, "mixed", "by_n", vec![IndexField::ascending("n")], false);
+            let ints = (1..=20_i64).map(|i| doc! {"_id": i, "n": i});
+            let strs = (0..30_i64).map(|i| doc! {"_id": format!("s{i}"), "n": i});
+            engine.insert_many(&c, ints.chain(strs).collect()).unwrap();
+        },
+        &[],
+    );
+    hooks::steps_seen();
+    drop(Engine::open(&mixed).unwrap());
+    let ended = hooks::steps_seen();
+    let step = |kind: &str| ended.iter().find(|e| e.kind == kind && e.collection == "mixed");
+    let out = step("re-keying").expect("a move out of mixed");
+    assert_eq!((out.began.1, out.done, out.total), (50, 20, 20), "{out:?}");
+    let refill = step("refilling indexes").expect("a refill of mixed");
+    assert_eq!((refill.done, refill.total), (50, 50), "{refill:?}");
     // The progress lines say the same, phase by phase, with the same figures.
     for phase in ["migrating", "draining", "refilling"] {
         let lines: Vec<&str> = logs
