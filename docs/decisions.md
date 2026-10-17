@@ -28270,7 +28270,7 @@ The same example on a laptop, for the shape of the cost:
 
 These figures are from a laptop's SSD, warm page cache, release build, every chunk durable, measured with `examples/schema4_migration`. Re-keying is bound by its commits: one sync each, about 490 of them at 2,000,000 documents, each writing about twice its rows' bytes.
 
-**`/readyz` reports every step.** The mars run first showed `migrating, done 6000003 / total 6000003` for 565 s, from the drain to the oplog walk: one count for the whole migration that the drain had already reached. Each step is now its own phase with its own count: `migrating` while a range is re-keyed (rows out, then back against what went out), `draining` for each index (entries removed), `refilling` for each collection (documents walked). A total that starts from the collection's kept document count is raised to stay ahead of `done`. The progress line every 100,000 rows of a step gives the same phase, `done` and `total`, with the collection and the index. A test holds `done` to moving with every chunk that did work, in every step.
+**`/readyz` reports every step.** The mars run first showed `migrating, done 6000003 / total 6000003` for 565 s, from the drain to the oplog walk: one count for the whole migration that the drain had already reached. Each step is now its own phase with its own count: `migrating` while a range is re-keyed (rows out, then back against what went out), `draining` for each index (entries removed), `refilling` for each collection (rows walked). The next mars run showed a drain at `total` 2,000,000, the collection's documents, with `done` last seen at 1,000,000 before the refill began: an index's entries counted against a collection's documents. A drain's total is now its own index's entries, counted with one read of the index's keys before its first chunk, and a move back's is what moved out; both are exact. A move out's and a refill's total start from the collection's kept document count (rows include tombstones, and a document whose `_id` is not a number does not move out), are raised to stay ahead of `done`, and are set to what the step did when it ends. Every step ends reading `done == total`. The progress line every 100,000 rows of a step gives the same phase, `done` and `total`, with the collection and the index. A test holds `done` to moving with every chunk that did work, in every step.
 
 **Draining by key is for stopping, not for the file.** The drain removes keys one at a time so that it can stop at a byte budget and resume. redb's `retain_in` takes a range in one call. The note that `retain_in` grew a file from 2.1 to 12 GiB over 742,858 entries predates redb 4.2.0, whose CHANGELOG records a 30 to 100 times speedup. On redb 4.3, `retain_in` drained 1,000,000 entries in 61 ms against 647 ms by key, and the file stayed at 736 MiB either way. The test that bounds the drain's growth therefore cannot tell the two apart, and that mutation is equivalent. The drain is a quarter of the mars run, so a chunked `retain_in` (read a chunk's last key, then remove up to it in one call) is the obvious lever if the downtime has to shrink.
 
@@ -28292,7 +28292,7 @@ These figures are from a laptop's SSD, warm page cache, release build, every chu
 - no definition, stamp, tombstone, oplog, count or digest moved;
 - the horizon reset landing before `raise(5)`;
 - a timed stop in each kind of chunk;
-- `/readyz` moving with every chunk, in its own phase for every step, and the progress lines saying the same;
+- `/readyz` moving with every chunk, in its own phase for every step, ending every step at `done == total` (a drain's total its index's entries, a partial index holding a handful of entries included), and the progress lines saying the same;
 - the TTL line, counted and not recorded;
 - `I_EPOCH` and `check-store` mid-migration and after;
 - a 300,000-entry drain bounding the file's growth (in CI, release).
@@ -28305,13 +28305,13 @@ These figures are from a laptop's SSD, warm page cache, release build, every chu
 - the carried rows deleted in the first commit; the collision table forgotten before the report; the carried rows left in schema 4 form; a dissolved carried collision reported;
 - `multikey` raised late; the TTL count not logged; `created` re-stamped;
 - a TTL count made up for an index never filed under ADR-185's rule;
-- a drain not reported as its own step; a step's estimated total not raised when `done` reaches it.
+- a drain not reported as its own step; a drain's total taken from the collection's documents rather than its index's entries; a step's estimated total not raised when `done` reaches it; the step-end total not finalized.
 
 The drain written with `retain_in` survives and is recorded as equivalent on redb 4.3.
 
 ### Tests and mutation rows
 
-The tests are listed with the pieces above. In all, 53 mutation rows were run against the comparator and the encoder (52 killed, one equivalent), 29 against the migration (28 killed, one equivalent on redb 4.3), 26 against the wire conversions, 31 against the gate, 19 against the lifts, 3 against `$sum` and `$avg`, and 19 against the removal of the undecidable filing; every one that is not recorded as equivalent is killed. The mixed roll is covered in process, against a test-side copy of 0.50's writer and a frozen schema 4 encoder checked against bytes a v0.50.0 build printed; it has not been run against a real 0.50 binary.
+The tests are listed with the pieces above. In all, 53 mutation rows were run against the comparator and the encoder (52 killed, one equivalent), 31 against the migration (30 killed, one equivalent on redb 4.3), 26 against the wire conversions, 31 against the gate, 19 against the lifts, 3 against `$sum` and `$avg`, and 19 against the removal of the undecidable filing; every one that is not recorded as equivalent is killed. The mixed roll is covered in process, against a test-side copy of 0.50's writer and a frozen schema 4 encoder checked against bytes a v0.50.0 build printed; it has not been run against a real 0.50 binary.
 
 ### Consequences
 
