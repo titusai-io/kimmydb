@@ -110,8 +110,9 @@ value = ±M × 2^(exp − 127),    M the first 128 bits of the binary expansion,
 so `exp = ⌊log2 |value|⌋`, exactly. For an `Int32`, `Int64` or `Double` the
 expansion has at most 64 significant bits, so `M` is the 64-bit normalised
 significand followed by 64 zero bits and nothing is lost. For a `Decimal128`
-the expansion can run to about 14,000 bits (`1E-6176`), so `M` is its first 128
-bits and a mark says whether anything nonzero follows. Equal values have equal
+the expansion can be far longer than 128 bits, or never end (`0.1` is
+`0.000110011001100…` in binary), so `M` is its first 128 bits and a mark says
+whether anything nonzero follows. Equal values have equal
 expansions, so they get equal bytes whatever their type or spelling.
 
 ```mermaid

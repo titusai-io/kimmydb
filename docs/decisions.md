@@ -21822,7 +21822,8 @@ its addenda missed. Each now runs under `blocking`:
 
 - **An index's `unkeyed` and `undecidable` counts**, in the answer to an index
   creation, the index listing and `describe_collection`. Each walks a run of the
-  index, which can be the whole collection.
+  index, which can be the whole collection. (**Amended 2026-10-16:** the
+  `undecidable` count is gone with its run, ADR-238; `unkeyed` stays here.)
 - **A webhook listing** reads the whole registry, and **a webhook removal**
   lists its progress records.
 - **An `update`, a `delete` and a `find_and_modify`** match inside their write
@@ -21874,7 +21875,8 @@ already made to before the match, and the inner one then runs inline.
 
 **The guard.** `walks_leave_the_worker.rs` now also reads `kimmyd`, and it
 looks for more calls:
-- `.unkeyed_count(` and `.undecidable_count(`;
+- `.unkeyed_count(` and `.undecidable_count(` (the second removed with its
+  run by ADR-238, 2026-10-16);
 - every form of `.entries_for_peer` and `.read_oplog_`;
 - `.for_each_vector(`;
 - `.modify_where(` and `.find_and_modify(`;
@@ -25784,7 +25786,9 @@ Nothing named it in a test. Chris chose to build it, as `find`, `count`, `update
   and the leading filter's access path. The answer is `{"explain": {"executed":
   false, "planner": ..., "source": ..., "stages": [...]}}` with no `documents` and no
   `count`, and none of `documentsExamined`, `documentsMatched`, `indexEntriesRead`,
-  `unkeyedCandidates`, `undecidableCandidates`: not as `null` either.
+  `unkeyedCandidates`, `undecidableCandidates`: not as `null` either. (The last
+  is removed from every `explain` by ADR-238, 2026-10-16; the test still names it
+  as absent.)
 - **The source plan is the read's, by construction.** `plan_access(filter, indexes)`
   chooses the primary key, then an index, then a scan, and `visit_matching` and
   `explain` both call it; `QueryStats::planned` and `plan_json` render the plan's
