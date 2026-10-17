@@ -79,10 +79,11 @@ do the same, per document, at write time. It no longer refuses either: the
 document is stored and filed under the index's *unkeyed* run, which every
 scan of that index reads beside its ranges and rechecks like any other
 candidate, so every query still finds it and none finds it wrongly. The same
-holds for a document that would produce more than 1,000 keys and for one
-holding a `Decimal128` at an indexed path. A unique index still refuses such
-a document on a local write, because a unique index must be able to key
-every document it covers.
+holds for a document that would produce more than 1,000 keys. (It held for one
+holding a `Decimal128` at an indexed path through 0.50.x; since 0.51.0 a
+`Decimal128` has an exact key and is indexed like any number, ADR-238.) A
+unique index still refuses such a document on a local write, because a unique
+index must be able to key every document it covers.
 
 **Why.** A refusal that depends on an index is a constraint, and a leaderless
 store cannot hold a constraint across members without coordination
@@ -97,9 +98,11 @@ a quorum; a store that accepts writes on every member cannot.
 **What closes it.** Nothing needs to: a client that wants the refusal back
 polices document shape itself, or splits the compound index into single-field
 indexes, which key every shape. The `unkeyed` field on the index listing and
-`unkeyedCandidates` on `explain` say when it matters — and they count *this*
-reason only, not a document a partial filter could not decide, which the listing
-reports separately as `undecidable` ([ADR-185](decisions.md)).
+`unkeyedCandidates` on `explain` say when it matters, and they count *this*
+reason only. (From 0.34.0 to 0.50.x the listing also reported `undecidable`, the
+documents a partial filter could not decide, [ADR-185](decisions.md); a filter
+decides a `Decimal128` by its exact value since 0.51.0, and the field is
+removed, [ADR-238](decisions.md).)
 
 ---
 

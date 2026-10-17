@@ -100,6 +100,23 @@ is **refused** as an index key or `_id` rather than encoded approximately.
 Refusing is honest; an approximate index key is a wrong answer waiting to
 happen.
 
+**Amended 2026-10-16 — the key is exact for every number, a `Decimal128`
+included, and variable length (ADR-238, storage schema 5, 0.51.0).** The
+principle stands, an exact key or none, and the form is extended rather than
+replaced: the tag, the six sub-tags and the 2-byte biased exponent are
+unchanged, and the fixed 8-byte mantissa becomes the first 128 bits of the
+value's binary expansion, trailing zero bytes stripped, escaped as a string is
+(`00` written `00 FF`) and ended by `00 00` when no later bit is nonzero or
+`00 01` when one is. `Int64(5)` is `20 04 80 02 A0 00 00`, 7 bytes where it was
+12; a key is 2 to 36 bytes. Every `Int32`, `Int64` and `Double` has at most 64
+significant bits, so its key is exact as before; two distinct `Decimal128`
+values share at most 113 leading bits, so 128 bits separate them, and the end
+mark orders a decimal against the binary value that shares its window. So a
+`Decimal128` is an index key and can be an `_id`, and the refusal above is
+gone. Every number key on disk changed, so the schema 5 migration re-keys and
+rebuilds; [Key encoding](key-encoding.md#numbers-the-hard-part) has the layout
+and the order proof.
+
 ---
 
 ## ADR-006 — HLC with node-id tiebreak, whole-document LWW
@@ -10177,8 +10194,10 @@ issued once rather than per member.
 **Decision.** An index never refuses a document. Where an index cannot derive
 a finite, exact set of keys for a document — arrays at two of a compound
 index's paths, more than 1,000 keys for one document, a `Decimal128` at an
-indexed path — the document is stored and filed under the index's **unkeyed
-run**: one entry per such document under the empty key, which no real key
+indexed path (**amended 2026-10-16:** no longer; since ADR-238 a `Decimal128`
+has an exact key, so the list is the first two, and the schema 5 migration
+takes every decimal out of the unkeyed run) — the document is stored and filed
+under the index's **unkeyed run**: one entry per such document under the empty key, which no real key
 can be and which sorts ahead of every real key. Every scan of the index reads
 that run beside its ranges, in every delivery order, and rechecks each
 document against the full filter as it rechecks any candidate. `index_keys`
@@ -19340,6 +19359,12 @@ A relaxed filter written by an earlier build is read as it was stored, which the
 > number. Membership is a superset of the selection, exact except for values
 > the order cannot rank. Everything below holds unchanged for every value it
 > can rank, which is every value but that one.
+>
+> **Amended 2026-10-16 — the narrowing is withdrawn (ADR-238, 0.51.0).** The
+> order ranks every value now, a `Decimal128` by its exact value, so this
+> record's rule holds for every value with no exception: a partial index holds
+> exactly the documents `find` with its filter would return. The exclusion
+> below is lifted with it.
 
 **Decision.** A partial index holds exactly the documents `find` with its filter would return. Membership is `PartialFilter::selects`, built on `kimmy_core::matching`, the code `find` itself evaluates these operators with (ADR-181). The second rule index maintenance used, `PartialFilter::matches`, is removed. Containment (`implies`, `covered_by`) is re-derived against that one rule. Every partial index is **rebuilt once**, at open, by a storage migration from schema 3 to **schema 4**.
 
@@ -19366,9 +19391,9 @@ A document satisfies a query predicate through some value, or array element, `w`
 
 That one definition of a type bracket serves `find`, membership and containment alike is the same rule that made ADR-181 move the operators' evaluation: two definitions of one thing were the bug each time.
 
-**Proved, not argued — with one type excluded, named below.** `implication_is_sound_for_what_find_selects` asserts, for every pair of operators over a corpus of every type bracket (692 implied pairs), that a document the query selects is one the index holds. The test it replaces used only integers and could not have failed.
+**Proved, not argued — with one type excluded, named below.** `implication_is_sound_for_what_find_selects` asserts, for every pair of operators over a corpus of every type bracket (692 implied pairs), that a document the query selects is one the index holds. The test it replaces used only integers and could not have failed. (**Amended 2026-10-16:** with no type excluded. The corpus holds decimal document values and decimal operands on both sides, and the property holds over 5,026 implied pairs, 1,341 of them with a decimal operand in the query and in the filter.)
 
-**The exclusion: a document value that is a `Decimal128`.** Soundness here rests on implication being transitive through a single value, and equality with a `Decimal128` is not transitive — `canonical_cmp` ranks one equal to every number, which is the settled contract (`docs/http-api.md`, `docs/key-encoding.md`), so `Eq(5)` and `Eq(6)` both hold on it while neither implies the other. A differential run during review found 825 losing (filter, query) pairs on this branch, every one of them involving a `Decimal128` document value. Its control was 3,840 losing pairs holding no `Decimal128` **on `main`** — the defects this record fixes — of which this branch leaves **none**. So the control says the differential can see a loss when there is one, and that the 825 are what is left rather than what was always there. The defect predates this record and is identical on `main`; it is filed as `kimmydb-a-partial-index-is-used-for-a-query-that-matches-a-document-holding-a-decimal128-the-index-does-not-hold-because-equality-with-a-decimal128-is-not-transitive`. It is **not** fixed here, because a fix trades index use for soundness under a settled contract and needs a record of its own. The corpus is deliberately left without a `Decimal128` rather than given one that asserts the loss, which would read as the loss being intended. Each of the three rules above, removed on its own, fails the test with a concrete counterexample:
+**The exclusion: a document value that is a `Decimal128`.** (**Amended 2026-10-16 — lifted by ADR-238.** `canonical_cmp` places a `Decimal128` by its exact value, so equality and the order are transitive for every value, and nothing below about the exclusion holds any more. The 825 losing pairs are gone with no change to `implies`, and the widening ADR-185 put in their place is removed. `a_chosen_partial_index_holds_every_document_find_returns` now holds 531 documents, 117 of them holding a decimal, 582 filters, 130 with a decimal bound, and 1,840 queries, 416 with a decimal operand, and finds no losing pair over 35,106 index uses; `no_filter_is_used_for_a_query_it_does_not_contain` holds decimals in its three corpora. The paragraph is kept as the record of why the exclusion existed.) Soundness here rests on implication being transitive through a single value, and equality with a `Decimal128` is not transitive — `canonical_cmp` ranks one equal to every number, which is the settled contract (`docs/http-api.md`, `docs/key-encoding.md`), so `Eq(5)` and `Eq(6)` both hold on it while neither implies the other. A differential run during review found 825 losing (filter, query) pairs on this branch, every one of them involving a `Decimal128` document value. Its control was 3,840 losing pairs holding no `Decimal128` **on `main`** — the defects this record fixes — of which this branch leaves **none**. So the control says the differential can see a loss when there is one, and that the 825 are what is left rather than what was always there. The defect predates this record and is identical on `main`; it is filed as `kimmydb-a-partial-index-is-used-for-a-query-that-matches-a-document-holding-a-decimal128-the-index-does-not-hold-because-equality-with-a-decimal128-is-not-transitive`. It is **not** fixed here, because a fix trades index use for soundness under a settled contract and needs a record of its own. The corpus is deliberately left without a `Decimal128` rather than given one that asserts the loss, which would read as the loss being intended. Each of the three rules above, removed on its own, fails the test with a concrete counterexample:
 - `Lte(null)` implying `Lt(5)`;
 - `Eq(5)` implying `Gt(null)`;
 - `Eq(null)` implying `Exists`, with an empty document lost.
@@ -19688,7 +19713,67 @@ is the more useful half of the exercise:
 
 ## ADR-185 — A partial index holds the documents its filter cannot decide
 
-**Decision.** A partial index holds every document its filter selects, **plus every document holding a `Decimal128` at one of the filter's paths**. The extra documents go in a sentinel run of their own, beside the unkeyed run, and every scan re-checks both against the full filter. Membership is therefore a superset of `find`'s selection, exact except for values the canonical order cannot rank. This narrows [ADR-183](#adr-183--a-partial-filter-selects-exactly-what-find-with-the-same-expression-returns) by name and changes nothing else about it.
+> **Superseded 2026-10-16 by ADR-238 (0.51.0, storage schema 5).** The root
+> cause this record declined to fix is fixed: the canonical order places a
+> `Decimal128` by its exact value, so a partial filter decides a document
+> holding one like any other, and the filing below is removed with everything
+> built for it. The record is kept as written, with the corrections and
+> amendments dated in place, because the argument for widening membership
+> rather than weakening `implies` was right under the order it was written
+> for, and the measurements explain what ADR-238 had to keep.
+
+**Amended 2026-10-16 — the decision is reversed (ADR-238).** A partial index
+holds **exactly** the documents its filter selects, as `find` with the filter
+returns them ([ADR-183](#adr-183--a-partial-filter-selects-exactly-what-find-with-the-same-expression-returns),
+with no narrowing): a document holding a `Decimal128` at a filtered path is
+selected or not by the decimal's exact value, and is keyed or absent like any
+other. In consequence:
+
+- **Removed:** `PartialFilter::undecidable_path`, the `DocumentKeys::Undecidable`
+  arm and every write, unfile, backfill and rebuild of the undecidable run; the
+  scan's read of it; the per-index `undecidable` figure on the listing,
+  `describe` and `createIndex` (and from the openapi `Index` schema's
+  `required`); `explain`'s `undecidableCandidates`; and
+  `kimmy_index_undecidable_total` with its OTLP instrument
+  `kimmy.index.undecidable`. Removed rather than left at a constant 0, which a
+  client or a dashboard would go on reading as a measurement: breaking for a
+  typed client that declared them.
+- **Kept:** the key `[0x00]` (`UNDECIDABLE`) is still named, read only by the
+  schema 5 migration, on a schema 4 store: its per-TTL-index count reads the run
+  as "what 0.50 did not select" before the drain empties it with the rest of the
+  index's range. No schema 5 store holds an entry under it, so nothing else
+  looks. `ABOVE_SENTINELS`, `is_sentinel` and the two premises in `keyenc` stay,
+  and a query's range still starts above `[0x00]`.
+- **A partial unique index enforces on a selected decimal.** Two documents
+  `{email: "x", balance: Decimal128("10")}` under a unique index on `email`
+  filtered by `{balance: {$gt: 0}}` collide: locally the second is refused, a
+  replicated pair is a reported violation, and on upgrade the rebuild reports
+  every standing pair through the existing collision path; a later write that
+  keeps a holder's key is refused.
+- **A TTL partial index decides by exact value (Chris's ruling), in both
+  directions.** Under `{tier: {$lt: 3}}` a document holding
+  `tier: Decimal128("1")`, which this record held undecidable and a TTL index
+  never expired, is selected and expires once due; under `{tier: {$gte: 3}}`
+  the same document, which the old order selected by ranking it equal to 3 and
+  which 0.50 expired, is kept. The migration logs, per TTL index, how many
+  documents are now selected and how many no longer are, before the first pass;
+  the deletes are ordinary replicated deletes.
+- **Soundness rests on `implies` again**, and holds: the differential this
+  record introduced is extended to decimal documents, decimal query operands
+  and decimal filter bounds (531 documents, 582 filters, 1,840 queries, 35,106
+  index uses, no loss), and `implication_is_sound_for_what_find_selects` and
+  `no_filter_is_used_for_a_query_it_does_not_contain` hold decimals on every
+  side.
+- **The mixed roll.** A 0.50 member and a 0.51 member hold different entries
+  for such a document, and nothing compares them: the definition digest reads
+  definitions, the cut digest reads documents and their stamps, and the repair
+  and the snapshot carry documents, never index entries. What differs between
+  them during the roll is behaviour, not state: a query each answers by its own
+  comparator, a pair a 0.51 member refuses or reports and a 0.50 member does
+  not, and TTL deletes by whichever member owns the collection's expiry. Each
+  0.50 member's own migration re-decides its indexes when it upgrades.
+
+**Decision (as first written; reversed above).** A partial index holds every document its filter selects, **plus every document holding a `Decimal128` at one of the filter's paths**. The extra documents go in a sentinel run of their own, beside the unkeyed run, and every scan re-checks both against the full filter. Membership is therefore a superset of `find`'s selection, exact except for values the canonical order cannot rank. This narrows [ADR-183](#adr-183--a-partial-filter-selects-exactly-what-find-with-the-same-expression-returns) by name and changes nothing else about it.
 
 **This is a return to the documented architecture rather than a reversal of it.** [indexes.md](indexes.md) has always opened with the rule everything follows from: *"An index answers **which documents might match**. Only the filter decides membership"*, and *"every candidate an index produces is re-checked against the full filter"*. A candidate set that over-produces is exactly what that describes. ADR-183's "membership is `find`'s selection" was the stricter claim — true, useful, and one value short.
 
@@ -19789,6 +19874,8 @@ could not have.
 **No per-document `WARN`.** The filing is expected. Raising it to the level of the real fault is how an operator learns to ignore the real fault.
 
 ### TTL is unaffected, and already guarded
+
+(**Amended 2026-10-16:** TTL is affected now, by design. With the filing gone, a decimal-bearing document the filter selects is keyed under its date and expires once due, and one it does not select is absent and never a candidate: see the amended Decision above, and ADR-238.)
 
 `expired_range` builds its bounds from dates and reads keyed entries only; both sentinel runs sort below either bound. So an undecidable document is never an expiry candidate — correct, since the filter does not select it, and deleting it would be precisely the [ADR-181](#adr-181--expiry-deletes-a-document-only-if-its-indexs-filter-read-as-find-reads-it-still-selects-it) bug. That is `expiry_never_reads_the_unkeyed_run`, which already existed. ADR-181's re-check is unchanged and still guards the rest.
 
