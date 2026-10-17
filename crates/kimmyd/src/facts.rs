@@ -35,6 +35,10 @@ pub fn source(
             catching_up,
             catching_up_reason,
             started_ms,
+            // This binary can hold a `Decimal128` id and bound, whatever this
+            // member's `cluster.decimal128` says (ADR-238): the key is the
+            // operator's word about the cluster, this the build's about itself.
+            decimal128: Some(true),
             vector_chunk_ids: Some(kimmy_core::CHUNK_ID_FORMAT),
             ..Facts::default()
         };
@@ -167,6 +171,18 @@ mod tests {
         assert!(started >= before, "read when the source was made, not before");
         assert_eq!(second.started_ms, Some(started), "and not again");
         assert!(first.class_state.is_none() && first.responsive.is_none());
+    }
+
+    /// Every block of this build says it can hold a `Decimal128` id and bound
+    /// (ADR-238), with an engine or without: the field is the binary's, not the
+    /// configuration's, so a peer's gate can count this member as one that can.
+    #[test]
+    fn the_block_says_this_build_can_hold_a_decimal128() {
+        let (engine, _dir) = engine();
+        let source = source(Arc::downgrade(&engine), vec![1; 16], false, false, None, None);
+        assert_eq!(source().decimal128, Some(true));
+        drop(engine);
+        assert_eq!(source().decimal128, Some(true), "whatever the store says");
     }
 
     /// With the engine gone the block still says who it is, and lists nothing.

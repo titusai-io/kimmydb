@@ -14,7 +14,7 @@
 
 mod source;
 
-use source::{opens_a_module, test_modules_declared, without_test_modules};
+use source::{opens_a_module, without_test_modules};
 use std::path::{Path, PathBuf};
 
 /// The repository root.
@@ -22,74 +22,9 @@ fn root() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("../..").canonicalize().expect("the repo root")
 }
 
-/// Every production `.rs` under `crates/`, with each `#[cfg(test)]` **module**
-/// removed and nothing else.
-///
-/// **Cutting at the first `#[cfg(test)]` line hid production code, twice.** The
-/// first version cut at the first line whose *trimmed* text began
-/// `#[cfg(test)]`, which matches one on a hook or a field, so `engine.rs` was
-/// read as far as line 625 of about 3,700. The second cut at the first
-/// *unindented* one — and that attribute sits on a `const`, a `type` and a
-/// `pub(crate) mod hooks` in six files here, with real production code after it.
-/// A second review measured what that still hid: about 1,230 lines, including
-/// `kimmy-vector`'s whole `IndexCache`, the OTLP bridge in `logging.rs`, and
-/// `engine.rs`'s `doc_range`. A `tokio::spawn` in any of them passed in silence,
-/// and so did the first review's own control.
-///
-/// It also matched `mod tests` as a *prefix*, so a `mod testsupport;` would have
-/// hidden every line after it.
-///
-/// So nothing is cut at a line any more. `#[cfg(test)]` on a module removes that
-/// module — the braced block, or the `mod x;` and the file it names. On anything
-/// else it removes nothing: keeping a test-only `fn` or `const` is loud-safe,
-/// because the worst it can do is ask for a marker that costs one comment.
+/// Every production `.rs` under `crates/` (`source::production_sources`).
 fn production_sources() -> Vec<(PathBuf, String)> {
-    fn walk(dir: &Path, out: &mut Vec<PathBuf>) {
-        // Only a **crate's own** top-level `tests/`, `examples/` and `benches/`
-        // are skipped. A production module that happens to be called `tests`
-        // deeper in a crate is production code, and skipping it by name would be
-        // the same class of hole as everything above.
-        let is_crate_root = dir.join("Cargo.toml").is_file();
-        for entry in std::fs::read_dir(dir).expect("a readable directory") {
-            let path = entry.expect("a directory entry").path();
-            let name = path.file_name().and_then(|n| n.to_str()).unwrap_or_default();
-            if path.is_dir() {
-                let own_harness = is_crate_root && ["tests", "examples", "benches"].contains(&name);
-                if !name.starts_with('.') && name != "target" && !own_harness {
-                    walk(&path, out);
-                }
-            } else if name.ends_with(".rs") {
-                out.push(path);
-            }
-        }
-    }
-    let mut files = Vec::new();
-    walk(&root().join("crates"), &mut files);
-    files.sort();
-
-    // A `#[cfg(test)] mod x;` names a file that is test code wherever it lives,
-    // so it leaves the walk with the module.
-    let mut test_only_files = Vec::new();
-    let read: Vec<(PathBuf, String)> = files
-        .iter()
-        .map(|path| {
-            let body = std::fs::read_to_string(path).expect("a readable source file");
-            for named in test_modules_declared(&body) {
-                let dir = path.parent().expect("a file has a parent");
-                test_only_files.push(dir.join(format!("{named}.rs")));
-                test_only_files.push(dir.join(&named).join("mod.rs"));
-            }
-            (path.clone(), body)
-        })
-        .collect();
-
-    read.into_iter()
-        .filter(|(path, _)| !test_only_files.contains(path))
-        .map(|(path, body)| {
-            let kept = without_test_modules(&body);
-            (path, kept)
-        })
-        .collect()
+    source::production_sources(&root())
 }
 
 /// The marker that exempts one spawn, with the reason it is exempt.
@@ -328,7 +263,7 @@ fn every_long_lived_task_is_spawned_through_the_supervisor() {
     // `type`, a test-hook module -- and each was hidden until the walk stopped
     // cutting at a line.
     for (file, production) in [
-        ("kimmy-storage/src/migrate.rs", "fn rebuild_partial_indexes"),
+        ("kimmy-storage/src/migrate.rs", "fn refuse_unparseable_partial_filters"),
         ("kimmy-vector/src/cache.rs", "impl IndexCache"),
         ("kimmyd/src/logging.rs", "fn hold_instruments"),
         ("kimmy-storage/src/engine.rs", "pub(crate) fn doc_range("),

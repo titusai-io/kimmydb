@@ -635,6 +635,7 @@ fn is_local_failure(e: &kimmy_storage::StorageError) -> bool {
         | E::RefusedStore { .. }
         | E::StoreInUse(_)
         | E::OutcomeUnknown(_)
+        | E::NotEnoughSpace { .. }
         | E::Stopping(_) => true,
         // A client request's answer, never an apply's; placed by what
         // stopped it.
@@ -6085,6 +6086,66 @@ mod tests {
 
     fn emfile() -> io::Error {
         io::Error::from_raw_os_error(24)
+    }
+
+    /// The keys on a snapshot page and in the cut digest's uncovered lists are converted
+    /// between the stored and the legacy (schema-4) form at the engine's wire API and
+    /// nowhere else (Decimal128 design 7.1, review v2.3-delta M2): `snapshot_page`,
+    /// `apply_snapshot_page`, `digest_plan`, `digest_answer` and `digest_compare` take and
+    /// give legacy keys. This crate builds and reads the frames, and passes them through
+    /// unchanged. A source guard: a conversion here would run a second time over keys the
+    /// engine already converted, and every in-process test, the model runs among them,
+    /// calls the engine directly and would never see it.
+    #[test]
+    fn the_transport_passes_wire_keys_through_unchanged() {
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        let mut files = Vec::new();
+        let mut pending = vec![dir];
+        while let Some(dir) = pending.pop() {
+            for entry in std::fs::read_dir(&dir).unwrap() {
+                let path = entry.unwrap().path();
+                if path.is_dir() {
+                    pending.push(path);
+                } else if path.extension().is_some_and(|e| e == "rs") {
+                    files.push(path);
+                }
+            }
+        }
+        let transport = files.iter().find(|p| p.ends_with("src/transport.rs")).expect("transport");
+        let source = std::fs::read_to_string(transport).unwrap();
+        // Up to the tests module: test hooks earlier in the file are `#[cfg(test)]` items too.
+        let product = source.split("\n#[cfg(test)]\nmod tests").next().unwrap();
+        for call in [
+            "engine.snapshot_page(",
+            "engine.apply_snapshot_page(",
+            "engine.digest_plan(",
+            "engine.digest_answer(",
+            "engine.digest_compare(",
+        ] {
+            assert!(product.contains(call), "the frames are no longer built here: {call}");
+        }
+        for path in &files {
+            if path.to_string_lossy().ends_with("tests.rs") {
+                continue;
+            }
+            let source = std::fs::read_to_string(path).unwrap();
+            let source = source.split("\n#[cfg(test)]\nmod tests").next().unwrap();
+            for conversion in [
+                "legacy_of_stored",
+                "stored_of_legacy",
+                "legacy_key",
+                "LegacyKey",
+                "keyenc::",
+                "STORED_FORM_MARKER",
+            ] {
+                assert!(
+                    !source.contains(conversion),
+                    "{} names `{conversion}`: the engine's wire API converts, the transport \
+                     passes keys through",
+                    path.display()
+                );
+            }
+        }
     }
 
     fn counting_hook() -> (AcceptErrorHook, Arc<std::sync::atomic::AtomicU64>) {

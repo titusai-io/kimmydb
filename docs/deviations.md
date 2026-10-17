@@ -79,10 +79,11 @@ do the same, per document, at write time. It no longer refuses either: the
 document is stored and filed under the index's *unkeyed* run, which every
 scan of that index reads beside its ranges and rechecks like any other
 candidate, so every query still finds it and none finds it wrongly. The same
-holds for a document that would produce more than 1,000 keys and for one
-holding a `Decimal128` at an indexed path. A unique index still refuses such
-a document on a local write, because a unique index must be able to key
-every document it covers.
+holds for a document that would produce more than 1,000 keys. (It held for one
+holding a `Decimal128` at an indexed path through 0.50.x; since 0.51.0 a
+`Decimal128` has an exact key and is indexed like any number, ADR-238.) A
+unique index still refuses such a document on a local write, because a unique
+index must be able to key every document it covers.
 
 **Why.** A refusal that depends on an index is a constraint, and a leaderless
 store cannot hold a constraint across members without coordination
@@ -97,9 +98,11 @@ a quorum; a store that accepts writes on every member cannot.
 **What closes it.** Nothing needs to: a client that wants the refusal back
 polices document shape itself, or splits the compound index into single-field
 indexes, which key every shape. The `unkeyed` field on the index listing and
-`unkeyedCandidates` on `explain` say when it matters — and they count *this*
-reason only, not a document a partial filter could not decide, which the listing
-reports separately as `undecidable` ([ADR-185](decisions.md)).
+`unkeyedCandidates` on `explain` say when it matters, and they count *this*
+reason only. (From 0.34.0 to 0.50.x the listing also reported `undecidable`, the
+documents a partial filter could not decide, [ADR-185](decisions.md); a filter
+decides a `Decimal128` by its exact value since 0.51.0, and the field is
+removed, [ADR-238](decisions.md).)
 
 ---
 
@@ -322,16 +325,21 @@ recorded exactly below and in [aggregation.md](aggregation.md#type-conversion);
   converted string and a returned double read alike. A string built from a
   large or small double therefore compares unequal to the same string built
   there.
-- **`decimal` is refused.** `Decimal128` has no exact key encoding
-  ([ADR-005](decisions.md)); a value converted to it could be neither indexed
-  nor grouped. `$convert` to `decimal` or `19` is a `400` naming `double` and
-  `long` as the alternatives. **`$toDecimal` is a `400` with the same
-  explanation**: `unsupported operator "$toDecimal": Decimal128 has no exact
-  key encoding in this engine, so the result could be neither indexed nor
-  grouped; convert to double or long instead`. It was never built as an
-  operator and used to be refused as an unknown one, with a message that
-  pointed at nothing; it is still refused for any argument. A `Decimal128`
-  *input* is likewise unconvertible.
+- **`decimal` is refused.** Converting a double to a `Decimal128` needs a
+  rounding rule: a double's exact binary value can run to about 767
+  significant digits and a `Decimal128` holds 34, so the double `0.1` has no
+  equal decimal. Choosing the rule is a decimal-arithmetic decision this build
+  does not make. (Until 0.51.0 the reason given was that a `Decimal128` had no
+  exact key encoding; it has one now, and is compared, grouped and indexed by
+  its exact value.) `$convert` to `decimal` or `19` is a `400` naming `double`
+  and `long` as the alternatives. **`$toDecimal` is a `400` with the same
+  explanation**: `unsupported operator "$toDecimal": converting to Decimal128
+  needs a rounding rule, because a double's exact binary value can run to about
+  767 significant digits and a Decimal128 holds 34, and this build has none;
+  convert to double or long instead`. It was never built as an operator and
+  used to be refused as an unknown one, with a message that pointed at nothing;
+  it is still refused for any argument. A `Decimal128` *input* is likewise
+  unconvertible.
 
 **`$mod` and `$pullAll` have no entry.** Both follow MongoDB — `$mod`
 truncates doubles toward zero, refuses a zero divisor, and refuses a `NaN` or
@@ -346,8 +354,55 @@ recorded rather than scheduled. The third and fourth close by widening the
 date parser and adding an exponent threshold to the double renderer, if a
 ported pipeline ever needs either; the second by evaluating `to` per document,
 which a `decimal` target would then have to be refused at run time. None is
-planned: the four are kept on purpose, and `decimal` goes when the canonical
-order can place one ([ADR-005](decisions.md)).
+planned: the four are kept on purpose, and `decimal` goes when a rounding rule
+for a double is chosen. (It was to go "when the canonical order can place one";
+0.51.0 does, and that turned out not to be what the conversion lacks.)
+
+---
+
+## 🟡 Arithmetic on a `Decimal128` is refused, where MongoDB computes it
+
+**Raised 2026-10-16, with 0.51.0, which gives a `Decimal128` its exact place in
+the order; ruled the same day: refused, not skipped.** A decimal is compared,
+grouped, sorted and indexed by its exact value, but nothing here adds,
+multiplies or divides one: decimal arithmetic needs its own rounding rules and
+is a later design. Until it is built, every operation that would do arithmetic
+on a decimal refuses it, `400`, rather than leave it out of the answer:
+
+- **The expression operators** `$add`, `$subtract`, `$multiply`, `$divide` and
+  `$mod`: `$add needs numbers, found a Decimal128`, as ever.
+- **The `$sum` and `$avg` accumulators of `$group`**, in the same words:
+  `$sum needs numbers, found a Decimal128`. **Changed in 0.51.0:** they used to
+  skip a decimal as they skip a string, so over `1`, `Decimal128("2.5")` and
+  `2` a report read a total of `3` and a mean of `1.5`, where the values add up
+  to `5.5`. The operand itself is what counts: an array or a document holding a
+  decimal is ignored by both, as any array or document is, because they never
+  read inside one (MongoDB's `$group` does not either). `$sum: 1` counts as ever.
+  `$sum` and `$avg` are not expression operators here, so there is no `$project`
+  form to refuse a decimal in.
+- **The update operators `$inc` and `$mul`**: a decimal operand is refused at
+  parse (`$inc requires a number`) and a stored decimal when the update applies
+  (`cannot apply arithmetic to non-numeric field "v"`).
+- **`$convert` to `decimal` and `$toDecimal`** are refused for a related reason,
+  the rounding rule a double needs (the entry above).
+
+A filter's `$mod` is not arithmetic on the value but a test of its integer
+part: it truncates a decimal toward zero, operand and stored value alike, as
+it truncates a double. So does every operator that takes a whole number
+(`$arrayElemAt`, `$slice`, `$range`, `$limit`, `$skip`, `$push`'s `$position`
+and `$slice`, `$size`): it takes a decimal of whole value as it takes the
+double of that value.
+
+**One numeric argument stays refused for a decimal: a `$vectorSearch` query
+vector's components.** The engine searches 32-bit floats; a double or an
+integer is converted the way it always was, and a decimal would need the
+decimal-to-binary rounding rule this build does not have. The refusal says so:
+`a Decimal128 would have to be rounded to a 32-bit float`. It goes with
+decimal arithmetic.
+
+**To close:** decimal arithmetic, with the rounding rules MongoDB's `Decimal128`
+follows, as its own design. Until then a refusal is the honest answer: a total
+that leaves a number out is wrong and says nothing.
 
 ---
 
@@ -522,7 +577,7 @@ expression layer has been able to state in a sentence. Not planned.
 
 ---
 
-## 🟡 Set operators answer in a fixed order and refuse a `Decimal128`
+## 🟡 Set operators answer in a fixed order
 
 **Raised 2026-10-01, with the set operators, `$objectToArray` and
 `$arrayToObject` (ADR-207).** Two choices a pipeline ported from MongoDB can
@@ -535,10 +590,10 @@ of a set result, which MongoDB leaves unspecified.
   element kept is that first appearance. A port that sorted the result keeps
   working; one that relied on whatever order MongoDB happened to give may see
   a different one.
-- **A `Decimal128` in a set input is a `400`.** MongoDB compares it exactly.
-  Here the canonical order ranks one equal to every other number, so an
-  answer would be wrong rather than merely different. `$anyElementTrue` and
-  `$allElementsTrue` compare nothing and read a `Decimal128` element by its
+- **A `Decimal128` in a set input was a `400`** until 0.51.0, because the
+  canonical order ranked one equal to every other number. It is now a member by
+  its exact value, as MongoDB compares it, so this is no longer a deviation.
+  `$anyElementTrue` and `$allElementsTrue` read a `Decimal128` element by its
   value, a zero as false, as MongoDB does.
 
 `$arrayToObject` takes every string key but one holding a NUL, the empty,
@@ -551,7 +606,7 @@ outcome does not depend on which argument is written first; what MongoDB
 answers for that pair is not verified here, so no claim is made about it.
 
 **To close:** the order is a promise, not a debt, and stays. The `Decimal128`
-refusal goes when the canonical order can place one ([ADR-005](decisions.md)).
+refusal went in 0.51.0, when the canonical order came to place one.
 
 ---
 
@@ -2607,7 +2662,9 @@ value through the same function the write path uses makes probe and stored key
 agree by construction.
 
 **And why a value it refuses falls back rather than being dropped.**
-`try_from_bson` rejects `Double`, `Decimal128` and null. That is not merely
+`try_from_bson` rejects `Double`, a `Decimal128` NaN or infinity, and null (a
+finite `Decimal128` is an id since 0.51.0, normalized as the write path
+normalizes it, so it probes its own key). That is not merely
 unhelpful: filter equality is cross-type *within* the numeric group, so
 `{_id: 5.0}` genuinely matches a document stored under `Int64(5)`. Probing only
 the values that normalize would lose it silently, so a single unusable value

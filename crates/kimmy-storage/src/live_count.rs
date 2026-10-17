@@ -151,6 +151,12 @@ impl Pending {
 
     /// One write to `key` of `collection`: the record that was there and the
     /// one now, each as its stamp and whether it is live.
+    ///
+    /// `key` is the stored key, and the digest moves by the terms of its
+    /// **legacy** form (`live_digest`'s module docs): the one conversion every
+    /// write to `DOCS` passes through, `put_record`, `put_bare_tombstone` and
+    /// `remove_record` (the drop purger's) alike. Total, so no row can refuse a
+    /// write here.
     #[cfg(not(kimmy_bench_no_live_counts))]
     fn wrote(
         &mut self,
@@ -159,7 +165,8 @@ impl Pending {
         before: Option<(kimmy_core::Stamp, bool)>,
         after: Option<(kimmy_core::Stamp, bool)>,
     ) {
-        self.digests.entry(collection).or_default().wrote(key, before, after);
+        let key = kimmy_core::keyenc::legacy_of_stored(key);
+        self.digests.entry(collection).or_default().wrote(&key, before, after);
     }
 
     /// The control's no-op (`--cfg kimmy_bench_no_live_counts`).
@@ -443,7 +450,8 @@ pub(crate) mod test_support {
             let (key, value) = row.unwrap();
             let (collection, doc_key) = key.value();
             let (stamp, live) = codec::doc_record_header(value.value()).unwrap();
-            crate::live_digest::fold_walked(&mut walked, collection, doc_key, &stamp, live);
+            let key = kimmy_core::keyenc::legacy_of_stored(doc_key);
+            crate::live_digest::fold_walked(&mut walked, collection, &key, &stamp, live);
         }
         let rows = txn.open_table(tables::LIVE_DIGESTS).unwrap();
         let mut kept: BTreeMap<u64, crate::live_digest::DigestRow> = BTreeMap::new();
@@ -1428,11 +1436,22 @@ mod tests {
     #[test]
     fn every_document_write_moves_the_count() {
         // Exempt: `migrate.rs` moves rows between ids during `Engine::open`,
-        // before the counts are rebuilt; `backup.rs` restores into a file no
-        // engine has opened, which the first open rebuilds; `faults.rs`
+        // before the counts are rebuilt; `migrate_v5.rs` re-keys rows within
+        // their own id during `Engine::open`, which moves no count (each row
+        // leaves and returns as the same record) and no digest term (the term
+        // is the key's schema 4 form, which a re-key does not change), and its
+        // tests build schema 4 stores by hand; `backup.rs` restores into a file
+        // no engine has opened, which the first open rebuilds; `faults.rs`
         // stores test-only records that are not documents, for readers that
         // must survive them; and this module.
-        const EXEMPT: [&str; 4] = ["live_count.rs", "migrate.rs", "backup.rs", "faults.rs"];
+        const EXEMPT: [&str; 6] = [
+            "live_count.rs",
+            "migrate.rs",
+            "migrate_v5.rs",
+            "migrate_v5_tests.rs",
+            "backup.rs",
+            "faults.rs",
+        ];
         let src = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
         let mut offenders = Vec::new();
         for entry in std::fs::read_dir(&src).unwrap() {

@@ -190,6 +190,9 @@ struct MembersInner {
     /// [`crate::health::WARN_INTERVAL`] and peer.
     undecodable_said: Mutex<BTreeMap<NodeId, Instant>>,
     unheard_said: Mutex<BTreeMap<NodeId, Instant>>,
+    /// When each peer was last named in the WARN that a `Decimal128` id exists
+    /// here while it cannot hold one (ADR-238).
+    decimal128_said: Mutex<BTreeMap<NodeId, Instant>>,
 }
 
 /// The blocks held, and where a block must have been decoded after to count.
@@ -404,6 +407,70 @@ impl Members {
             );
         }
         due
+    }
+
+    /// The live peers that do not advertise `Facts.decimal128 = Some(true)`, a
+    /// peer not heard from yet included: what holds back a locally created
+    /// `Decimal128` id or bound (ADR-238). One load of the view, no lock.
+    pub fn decimal128_blockers(&self) -> Vec<NodeId> {
+        crate::facts::decimal128_blockers(&self.view())
+    }
+
+    /// The peers to name now in the WARN that this member holds a document
+    /// whose `_id` is a `Decimal128` while they cannot hold one (ADR-238): each
+    /// blocking peer the first time it is seen, then again every
+    /// [`crate::decimal128::DECIMAL128_WARN_INTERVAL`] while it still blocks.
+    /// The caller asks only while the marker is set. A peer that stops
+    /// blocking (it upgraded, or left the live set) is forgotten, so one that
+    /// blocks again is named at once.
+    ///
+    /// **A live peer this member has not heard from is named only once it has
+    /// been unheard for more than a lease**, as the unheard-peer WARN does: it
+    /// blocks the gate at once (failing closed), but a peer that came up a
+    /// moment ago and has not been contacted yet is not one that cannot hold a
+    /// decimal, and saying so at every start would teach an operator to skip
+    /// the line.
+    pub fn decimal128_warn_due(&self, now: Instant) -> Vec<NodeId> {
+        let lease = self.lease();
+        let view = self.view();
+        let blockers: Vec<NodeId> = {
+            let up = self.0.up_since.lock();
+            crate::facts::decimal128_blockers(&view)
+                .into_iter()
+                .filter(|node| {
+                    view.blocks.contains_key(node)
+                        || up
+                            .get(node)
+                            .is_none_or(|since| now.saturating_duration_since(*since) > lease)
+                })
+                .collect()
+        };
+        let mut said = self.0.decimal128_said.lock();
+        said.retain(|node, _| blockers.contains(node));
+        blockers
+            .into_iter()
+            .filter(|node| {
+                let due = said.get(node).is_none_or(|at| {
+                    now.saturating_duration_since(*at)
+                        >= crate::decimal128::DECIMAL128_WARN_INTERVAL
+                });
+                if due {
+                    said.insert(*node, now);
+                }
+                due
+            })
+            .collect()
+    }
+
+    /// [`Self::decimal128_warn_due`] while the marker is set (ADR-238): the peers
+    /// to name now in the WARN. `marker` reads the store's marker, and is asked
+    /// only when some live peer blocks, so a cluster that can hold decimals
+    /// costs no read; with none blocking, the call forgets who was named.
+    pub fn decimal128_warnings(&self, marker: impl FnOnce() -> bool, now: Instant) -> Vec<NodeId> {
+        if !self.decimal128_blockers().is_empty() && !marker() {
+            return Vec::new();
+        }
+        self.decimal128_warn_due(now)
     }
 
     /// Drop what `node` last said, and what it last echoed of ours: it is a new

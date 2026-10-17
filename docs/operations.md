@@ -52,6 +52,7 @@ fails fast on a bad volume mount.
 | `cluster.divergence_repair` | — | `true` | Whether this member repairs what the divergence check finds: the document repair of a confirmed cut-digest finding and the definition repair of a confirmed definition finding. The detectors run either way; `false` makes the member detect only, as 0.49.0 does, and counts each skipped plan `disabled`. Does not touch the count half's repair. Read at start. **A rollback effect:** a 0.49.0 binary refuses to start on a config that names this key (or the two below) at any value, so remove them before rolling back |
 | `cluster.repair_max_documents` | — | `2000000` | The most live documents a collection may hold for the document repair to pull it; above it the repair is counted `too_large` and left to you. Must be greater than zero |
 | `cluster.repair_max_index_documents` | — | `250000` | The most live documents a collection may hold for the definition repair to build an index in it. The build holds the single writer for its whole length, so this is lower than the key above. Must be greater than zero |
+| `cluster.decimal128` | — | `true` with clustering off, `false` with it on | Whether this member may **create** a document whose `_id` is a `Decimal128`, or an index whose `partialFilterExpression` holds one ([ADR-238](decisions.md)). `true` declares that every member runs 0.51 or later, has finished its storage migration, and will not run an older build again: a member before 0.51 that meets such a document fails every frame carrying it and never catches up, and one that meets such an index definition never builds it, even after it upgrades. With clustering on, a creation is also refused (`400`, naming the key and the peers) until every member SWIM lists live says it can hold one; a live member not heard from yet counts as one that cannot, and a member that is down or migrating is not live, so the net cannot see it. With `cluster.membership` off a clustered member cannot see its peers and refuses such a creation whatever the key says. **Only local creation is gated**: what a peer replicates, a snapshot restores or a repair builds is always applied, and a replace of an existing document keeps its stored `_id` and is never refused. Nor is anything that creates nothing: an insert of an `_id` that is already there is `409 duplicate_key`, and re-creating an index the member already holds (by replication, from a member whose key is set) answers as it does for any index. **Set it only after the whole roll, as its own change and restart, never in the change that upgrades the binary.** `check-config` prints the value in effect. Read at start. **A rollback effect:** a 0.49 or 0.50 binary refuses to start on a config that names this key, at any value, and setting it back to `false` does not make a rollback possible; see [`cluster.decimal128` and the marker](#clusterdecimal128-and-the-marker) |
 | `cluster.membership` | — | `true` | Gossip liveness over UDP. Off falls back to discovery-only peers |
 | `server.tls.cert_file` | `KIMMY_TLS_CERT` | — | PEM chain, leaf first. TLS is on when this and the key are both set. Re-read on SIGHUP, or within 60s of changing |
 | `server.tls.key_file` | `KIMMY_TLS_KEY` | — | PEM private key (PKCS#8, PKCS#1 or SEC1) |
@@ -429,7 +430,10 @@ length, and a start that used to be killed and begun again for ever, because
 nothing listened until the open finished and Kubernetes' defaults restart a
 container after about 30 seconds of failed liveness checks, now finishes. What
 the open is doing is on `/readyz`: `phase` is one of `repairing`, `opening`,
-`migrating` (`done` of `total` indexes), `verifying` (`done` of `total` oplog
+`preflight`, `migrating`, `draining` and `refilling` (the schema migration's steps, each
+with its own `done` of `total`: the preflight's rows read, a collection's rows re-keyed,
+one index's entries drained, one collection's rows walked to refill its indexes, [Storage schema
+5](#storage-schema-5-the-first-start-of-0510)), `verifying` (`done` of `total` oplog
 rows), `counting`, `starting` and `reconciling` (`done` of `total` databases whose
 drop the node is burying before it serves, [ADR-229](decisions.md), or collections it is sweeping of what a
 drop that reached them late left behind, [ADR-231](decisions.md); absent when
@@ -441,9 +445,9 @@ database's drop covers for any reason but a stop (a damaged collection row, say)
 [`kimmyd check-store`](#checking-a-store) on the stopped member, and if the store is damaged, wipe its data
 directory and let it catch up from its peers ([A member that is catching up](#a-member-that-is-catching-up)). The open's cost is
 unchanged: the walk of the retained oplog is about 46 s per 10 million entries
-with the store in the page cache and far more cold, and the schema migration
-adds 8 us per document per partial index; a node logs a line for each phase
-as it goes.
+with the store in the page cache and far more cold, and the schema 5 migration
+adds about 16 us per document re-keyed and 8 us per document per index to it,
+as bounds; a node logs a line for each phase as it goes.
 **A start after an unclean stop repairs the database file first**, before the
 open's own work: about 0.4 s per GiB of `kimmy.redb`, measured at 1.3 s for a
 4 GiB file and 5.2 s for 12 GiB on an NVMe disk ([ADR-188](decisions.md)). It
@@ -878,6 +882,9 @@ start after that is the first one the line means what it says.
 
 `/readyz` performing a real storage read is the point: a node with a wedged
 database is taken out of rotation rather than served traffic it cannot handle.
+A ready answer also carries `decimal128_id_present`, the marker that a document
+whose `_id` is a `Decimal128` exists on this member (see [`cluster.decimal128`
+and the marker](#clusterdecimal128-and-the-marker)).
 
 **While the store opens** ([ADR-198](decisions.md)) the node answers only these
 two. `/readyz` is `503` in the error envelope (`error: starting`, `retry:
@@ -1217,8 +1224,7 @@ the series; every series the endpoint exposes has a row.
 | `kimmy_ttl_expired_total` | Documents deleted by a TTL index. Summed across members it counts one delete per expired document once membership and the members' blocks have settled. **More than one holder may delete the same expired document**, and the deletes converge ([ADR-201](decisions.md)): for about one sync interval after a TTL index is created (each holder counts only itself until the others' blocks arrive); for as long as a member's sync contacts fail while SWIM keeps it up (its peers' blocks go stale on it, and it counts only itself); and, permanently, for every collection past the 256 a member's block lists, which each holder owns. The last two show in `kimmy_ttl_collections` below |
 | `kimmy_ttl_skipped_total` | Expiry candidates the pass declined because the document was refreshed between the scan and the delete — a session heartbeat landing while the pass ran ([TTL indexes](indexes.md#ttl-indexes--expiring-documents)) |
 | `kimmy_ttl_skipped_filter_total` | Expiry candidates a TTL index held that its partial filter, read as `find` reads it, did not select when the delete re-read the document — so they were **not** deleted ([ADR-181](decisions.md)). Two causes: a document moved out of the filter while the pass ran, and a document the index held that the filter never selected. The second was a defect in partial-index membership, which compared across type brackets, so `{size: {$gt: 5}}` held strings, documents and booleans and expiry deleted them. That is fixed, and every partial index was rebuilt on the first start of the release carrying [ADR-183](decisions.md), so **on a migrated database only the first cause is left and this should read near zero**. A rate above that on such a database is a genuine race, not the old defect; a rate that stays high is worth reporting. Kept apart from `kimmy_ttl_skipped_total` so that fall can be seen |
-| `kimmy_index_unkeyed_total` | Documents stored under an index that could not key them — arrays at two of a compound index's paths, more than 1,000 keys for one document, a `Decimal128` at an indexed path — and are rechecked on every scan of that index instead ([Indexes](indexes.md#documents-an-index-cannot-key)). Local writes, replicated writes and backfills all count here; each is logged at warning naming the database, collection, index and document id. Rising steadily is a schema the index does not fit: reshape the documents, or split the index. The standing number per index is `unkeyed` on the index listing, which a collection's owner can read without this endpoint ([ADR-139](decisions.md)). **This counts that reason only**: a document an index holds because a partial filter could not *decide* it is `kimmy_index_undecidable_total` below, and the index listing reports the two as separate standing figures ([ADR-185](decisions.md)) |
-| `kimmy_index_undecidable_total` | Documents an index holds because its partial filter could not decide them: a `Decimal128` at a filtered path ranks equal to every number, so the filter's answer is not an answer, and the index holds the document for the scan to re-check ([ADR-185](decisions.md)). **Expected, not a fault** — it rises whenever such a document is written, needs no action, and is a separate series from `kimmy_index_unkeyed_total` precisely so an alert on that one keeps meaning what it meant |
+| `kimmy_index_unkeyed_total` | Documents stored under an index that could not key them — arrays at two of a compound index's paths, or more than 1,000 keys for one document — and are rechecked on every scan of that index instead ([Indexes](indexes.md#documents-an-index-cannot-key)). Local writes, replicated writes and backfills all count here; each is logged at warning naming the database, collection, index and document id. Rising steadily is a schema the index does not fit: reshape the documents, or split the index. The standing number per index is `unkeyed` on the index listing, which a collection's owner can read without this endpoint ([ADR-139](decisions.md)). A `Decimal128` at an indexed path was a third reason through 0.50.x; since 0.51.0 it has an exact key. **`kimmy_index_undecidable_total` is gone since 0.51.0** (and its OTLP instrument `kimmy.index.undecidable`): it counted the documents a partial index held because its filter could not decide them, a `Decimal128` at a filtered path, and a partial filter now decides a `Decimal128` by its exact value ([ADR-238](decisions.md)). Remove any dashboard or alert built on it |
 | `kimmy_webhook_deliveries_total{outcome}` | Webhook delivery attempts, `delivered` or `failed` |
 | `kimmy_webhook_events_total` | Change events pushed to endpoints |
 | `kimmy_webhook_subscriptions{state}` | Registered subscriptions, counted from this node's registry when the page is read: `active`, or `invalidated` after falling too far behind ([Webhooks](webhooks.md)), or `unreadable`. A record the dispatcher cannot load (one missing a field) is counted as `active`: it is registered, even though nothing delivers it. A record that does not decode at all is counted as `unreadable`, and should read 0: above 0, a record in the registry is damaged and nothing delivers it, and the rest of the page still reads. If the registry itself cannot be read, the scrape fails rather than reporting 0 ([ADR-187](decisions.md)) |
@@ -1247,6 +1253,7 @@ the series; every series the endpoint exposes has a row.
 | `kimmy_sync_divergence_definition_probes_total{outcome,reason}` | What the definition digest did with each collection it looked at. **`compared`**: both digests of the collection's index and vector definitions were taken at one cut and compared; the gauge above reading 0 means the members agree only while this rises, and it must be above 0 for each live pair. **`explained`**: the digests differed and a valid refusal hint on one member covers every differing definition (a definition this member or its peer refused, which the member remembers across a restart; the per-process `kimmy_sync_ddl_refused_total` does not), so the difference is known; **never counted as `compared`**, so a refusal masking a collection shows. Read `GET /v1/db/{db}/coll/{coll}/indexes` on both members to see what differs. **`unanswered`**: a checked contact whose peer returned no definition digest (a build before 0.49.0). **`deferred{reason}`**: not compared, and none is silent: `incarnation` and `database_tombstone` (the same rule as the cut digest's: a drop tombstone the cut does not yet cover, or a collection not newer than the drop, or one that still owes the late-drop sweep), `definition_above_cut` (an index or vector configuration of the collection was made or dropped above the cut, so it is in motion), `horizon` (the cut is below what retention removed, so no collection can be judged on either side), `error` (this side failed to compute or to compare, and the contact went on without it), `malformed` (an entry of the peer's answer did not decode, or carried a digest of the wrong width), `format` (the peer's answer is of another format of the digest, which no build in this release produces; it appears during a roll across a release that changes what is hashed, and no collection is compared with that peer until both run the same). Deferrals are reported, not alerted on. |
 | `kimmy_sync_digest_drift_total` | Kept digest rows a self-check found disagreeing with the records they summarise, and corrected, since the process started. **A healthy node reads 0.** A rising value is a bug in the digest's maintenance, is logged at `ERROR` (`this node's kept digest of a collection disagreed with its records and has been corrected`), and means no finding was reported for that comparison. |
 | `kimmy_sync_divergence_repair_enabled` | 1 when `cluster.divergence_repair` is on, 0 when this member only detects (`cluster.divergence_repair`). A cluster of members reading 0 here is detecting and repairing nothing. |
+| `kimmy_decimal128_id_present` | 1 once a document whose `_id` is a `Decimal128` (an integral one stored as an integer id included) has been written or applied on this member, else 0 ([ADR-238](decisions.md)). Durable, never cleared, carried by a backup; also `decimal128_id_present` on `/readyz`. **Read it on every member before a rollback**: once it is 1 anywhere, no member can be rolled back by wiping it and resyncing on a build before 0.51. See [`cluster.decimal128` and the marker](#clusterdecimal128-and-the-marker). |
 | `kimmy_sync_digest_repairs_total{outcome}` | Document repairs of a confirmed cut-digest finding ([The cut digest](#the-cut-digest)), by outcome: the end of a repair, or the gate that refused to plan one. **`applied`**: the repair ran to its end (whether it worked is the judgement below). **`too_large`**: the collection holds more live documents than `cluster.repair_max_documents`; left to you. **`abandoned`**: three rounds in a row applied nothing. **`transient`**: a peer error, a stop, a drop, a whole-database pull taking the peer over, or a cancellation; it changes nothing but the five-minute cooldown. **`skipped_count_repair`**: a count repair of the collection is queued, active or cooling, and the replay lands what a document repair would. **`disabled`**: `cluster.divergence_repair` is off. |
 | `kimmy_sync_digest_repair_judgements_total{result}` | What the loop guard made of a document repair, at the first **compared** digest after it ended. **`effective`**: the digests matched. **`ineffective`**: they differed, and the repair backs off (5 min, 15 min, 45 min, 2 h 15 min, 6 h; a repair that wrote a row at or below the finding's cut lowers the level to 1). **`unjudged`**: no compared digest arrived within the deadline (three rotation periods, at least 30 minutes); every second one in a row counts as an ineffective step. **`recurring`**: the finding cleared and recurred more than three times in an hour and the collection was stopped (`ERROR`, below). |
 | `kimmy_sync_digest_repair_rows_total{result}` | Rows of the pages a document repair pulled. **`applied`**: rows that won last-writer-wins over a row this member held. **`created`**: young lost inserts written (stamped after every tombstone cutoff either member has applied). **`left`**: live rows this member held nothing for and the repair did not write: **read the rule below**. **`left_tombstone`**: tombstone rows this member held nothing for (digest-invisible; they raise no warning). **`superseded`**: rows that addressed a life this member has buried. |
@@ -2624,18 +2631,21 @@ Refusing on a *newer* schema is the right failure: a build cannot know a layout
 that did not exist when it was written, and guessing corrupts further. Migrating
 an *older* one is equally right — a user with data has no other route forward.
 
-Current schema is **4**. Migrations run in sequence, so an older database steps
+Current schema is **5**. Migrations run in sequence, so an older database steps
 through each one rather than needing its own path to the latest.
 
 | Step | What it does |
 |---|---|
 | 1 → 2 | Collections renumbered to ids derived from their names ([ADR-031](decisions.md)) — rewrites document keys, index entries, and the collection field of every oplog entry |
 | 2 → 3 | Indexes renumbered to ids derived from their names ([ADR-032](decisions.md)) — rewrites index-entry keys |
-| 3 → 4 | Every partial index rebuilt so that it holds what `find` with its filter returns, plus the documents the filter cannot decide ([ADR-183](decisions.md), [ADR-185](decisions.md)) — **moves no bytes of the layout** and changes what a partial index's entries mean. One transaction per index, with a marker per index so an interrupted run resumes rather than starting again. Schema 4 is written with the *first* index, so a half-migrated directory is refused by the older build rather than opened and maintained under the old rule |
+| 3 → 4 | Every partial index rebuilt so that it holds what `find` with its filter returns, plus the documents the filter cannot decide ([ADR-183](decisions.md), [ADR-185](decisions.md)) — **moves no bytes of the layout** and changes what a partial index's entries mean. One transaction per index, with a marker per index so an interrupted run resumes rather than starting again. Schema 4 is written with the *first* index, so a half-migrated directory is refused by the older build rather than opened and maintained under the old rule. **Not run on the way to 5**: 4 → 5 rebuilds every index under the current rule, which covers it |
+| 4 → 5 | Every number key made exact ([ADR-238](decisions.md)): every document with an integer `_id` re-keyed and **every index drained and rebuilt**, in chunks that each commit and resume. A **rollback boundary**: from the moment it starts, 0.50 and 0.49 refuse the store. See [Storage schema 5](#storage-schema-5-the-first-start-of-0510) |
 
-All three are idempotent and run before the node serves anything.
+All four are idempotent and run before the node serves anything.
 
-> **Back up the data directory before a version-crossing upgrade.** The
+> **Back up the data directory before a version-crossing upgrade**, and for
+> 0.51.0 roll with the deploy tool's `BACKUP=true`: the backup taken before the
+> upgrade is the only way back to 0.50 or 0.49. The
 > migration is transactional per step, but a rollback to the older build is not
 > possible once it has run — the older build will refuse the newer schema. **An
 > upgrade interrupted part-way cannot be rolled back either**, and deliberately
@@ -2646,6 +2656,162 @@ All three are idempotent and run before the node serves anything.
 > wipe its data directory and let it catch up from its peers, keeping clients
 > off it until it has (see [ADR-183](decisions.md)); to roll the whole cluster
 > back, restore the backup.
+
+### Storage schema 5: the first start of 0.51.0
+
+**The first start of 0.51.0 on a store of an earlier release migrates it before
+the node serves anything** ([ADR-238](decisions.md)). Every number key on disk
+changes: a number is keyed by its exact value, so that a `Decimal128` has a
+place in the order. While it runs, the node answers `/healthz` and `/readyz`
+says `migrating`; peers see it as down, and nothing is written to it. In order:
+
+**Before upgrading, check the free space on the volume that holds the data
+directory.** The first start needs, free: at least **the size of the store's
+`kimmy.redb` file** while that file is under 4 GiB (above 4 GiB, the rest of its
+last 4 GiB region, or a whole region when the file ends exactly on one), or the
+size of the documents with an integer `_id` if that is larger, **plus about 64
+MiB and the index working space (at most 128 MiB)**. A store with nothing to
+re-key and no indexes still needs its file's size: a 1,602 MiB file needs 1,666
+MiB. If the start is refused for want of space it says so with both figures
+(`the storage schema migration needs N MiB free and M MiB is free`), and nothing
+of the migration was written: every row, the sidecar and the schema are as they
+were, and 0.50 still opens the store. Add the space, temporarily if need be (a
+larger volume, or a second volume the data directory can be moved to, or another
+member's backup space), and start again; the space is used only while the
+migration runs, and the file returns to about its size afterwards on the
+filesystems measured.
+
+1. **The plan and the free-space check, before anything of the migration is
+   written.** One line, `storage schema 4 -> 5 (exact number keys)`, names the
+   collections, the ranges of documents (`purge_pending_ranges` counts those a
+   drop left being purged, which are re-keyed too), the documents and
+   tombstones, the indexes and their entries, the file's size, the free space
+   required and the free space there is, and the time to plan downtime from: `estimate_secs_low` and `estimate_secs`, in seconds, for the migration and the oplog walk the first start makes after it. **Plan on the upper figure**: it is a spinning disk with a cold page cache, the lower an SSD with a warm one, and a store is somewhere between (the 2,000,000-document store with three indexes reads about 52 to 1,162 s, and took 936 to 1,158 s on the lab host's spinning disk and 20 to 47 s, plus about a second of walk, on a laptop's SSD). It is an estimate calibrated on those two machines and on nothing else; a store with nothing to re-key and no indexes costs only the walk, near zero. **The start is
+   refused if the volume holding the store has less free space than the
+   requirement**, with the two figures (`the storage schema migration needs N
+   MiB free and M MiB is free`) and its terms. The requirement is **the larger
+   of redb's next growth step and the documents re-keyed, plus the index chunks
+   in flight and a margin**:
+   - **redb's next growth step for the file**: while the file is under 4 GiB it
+     doubles; above, redb fills out its last 4 GiB region (the rest of that
+     region), or adds a whole region when the file ends on a region boundary,
+     and adds one region more only when the last region has less than twice
+     the largest single allocation left. Where filling out the last region
+     leaves less than the migration's working set (the index chunks, the
+     re-key's chunks in flight and the margin, about 200 MiB at most), the
+     next allocation adds a whole 4 GiB region after it, and both are
+     charged. The step is the file's length: ext4, XFS and APFS leave it
+     unallocated until it is written, and HFS+ and ExFAT allocate it;
+   - **the documents re-keyed**: every document and tombstone with a number
+     `_id`, once, at the size the staging table holds them in, plus four chunks
+     of 8,192 of them. It does not add to the step: each chunk is deleted from
+     the documents in the commit that stages it, so the chunks after it reuse
+     the pages it freed, and the file grows only when none is left, by one step;
+   - **the index chunks in flight**: eight times one 16 MiB chunk of entries,
+     or eight times what the indexes hold if that is less;
+   - **a 64 MiB margin**.
+
+   Nothing in it is the file's size over its document count: a store that is
+   mostly oplog, or holds the freed pages of a purged collection, requires its
+   growth step and the margin. An empty store requires 64 MiB; two documents in
+   a 52 MiB file of oplog, 116 MiB; the 2,000,000-document acceptance store, a
+   2,411 MiB file, 2,603 MiB (the 2,411 MiB step, which holds its 884 MiB of
+   documents, 128 for the index chunks and the margin). On disk images of a
+   fixed size (APFS, HFS+ and ExFAT) with exactly the requirement free, every
+   store tried migrated to its end, and with 1 MiB less every start was
+   refused. On a 10 GiB volume, redb's step leaves room for a store of up to
+   just under 8 GiB; at 8 GiB it is a whole 4 GiB region, and above it the rest
+   of the region, more than is left.
+
+   The documents are measured by one read of the rows with a number `_id`
+   before the line is written: `/readyz` says `preflight`, with `done` of
+   `total` rows, and a stop ends it with nothing written. A store whose ids are
+   not numbers reads nothing. On a cold disk the read costs a read of those
+   documents (49 s for 2,000,000 just copied, on a busy laptop; 0.4 s for a
+   store just written), and the re-key that follows reads them again from a
+   warmer cache. A refused start writes nothing of the migration: every row, the
+   sidecar and the schema are as they were, the store is still schema 4 and 0.50
+   opens it. The open's own table commit (with the tombstone horizon's reset, as in
+   0.50) comes before the refusals, so the file's bytes may have been touched; on
+   HFS+ and ExFAT, which allocate the length a file is extended to, a store with no
+   free page can hit `ENOSPC` at that first commit, as it can on 0.50, and the start
+   fails there rather than with the preflight's message. Free space and start again. A partial
+   index whose stored filter this build cannot parse refuses the start the same
+   way.
+2. **From here, 0.50 and 0.49 refuse the store.** `kimmy.format` records schema
+   5 just before the first commit, which writes schema 5 into the store and
+   lists the work as markers. A start of 0.50 or 0.49 on the store, finished or
+   interrupted, is refused with nothing written, and so is a 0.50 restore of a
+   backup taken on 0.51.0; 0.50's `kimmyd check-store` answers `not_checked`.
+3. **Every document with an integer `_id` is re-keyed** (tombstones too), a
+   chunk of 8,192 rows per commit, in two passes through a staging table, and
+   **every index is drained and rebuilt** from the documents, a chunk of about
+   16 MiB of entries per commit; a refill chunk also ends after 8,192
+   documents walked or 250 ms of work, whichever comes first, so a partial
+   index that selects few documents, or a run of tombstones, still commits,
+   looks for a stop and moves `/readyz` every chunk. `/readyz` reports each
+   step on its own:
+   `migrating` while a collection's documents are re-keyed (`done` of `total`
+   rows, tombstones included, once out and once back), `draining` for each
+   index (its own entries removed), `refilling` for each collection (rows
+   walked, one step for all its indexes); a TTL index with a partial filter
+   first counts what the exact comparator changed (below), a step of its own
+   in `draining`, in documents scanned; and every index's entries are counted
+   before its drain, another step in `draining`, in entries read. A drain's
+   `total` is that count, and a move back's is what moved out:
+   both exact. A move out's, a count's and a refill's start from the
+   collection's kept document count, are raised if the step outruns them, and
+   are set to what the step did when it ends. Every step ends reading `done` equal to `total`. A
+   progress line, `migrating storage schema 4 -> 5`, gives the same `phase`,
+   `done` and `total`, with the collection and the index, every 100,000 rows of
+   a step; each
+   collection ends with `re-keyed a collection's documents for storage schema
+   5`, each index with `rebuilt an index for storage schema 5` (its entries,
+   the documents it could not key, and `unique_collisions`), and the migration
+   with `migrated storage schema 4 -> 5` and the time of each phase. A TTL
+   index with a partial filter logs one more line: the documents its filter now
+   selects that it did not (`now_selected`: they expire once due) and the
+   reverse (`now_not_selected`: 0.50 would have expired them, and they are
+   kept), because a decimal at the filter's path is now compared by its exact
+   value where 0.50 never expired one its filter did not select
+   (`before="not recorded"` for a store that comes from schema 3). **Read it
+   before the first expiry pass**: those deletes are ordinary replicated
+   deletes, which reach every member, 0.50 ones mid-roll included, and cannot
+   be undone except from the backup taken before the upgrade
+   ([Indexes](indexes.md#a-decimal128-at-a-filtered-path)).
+4. **The first start on schema 5 also walks the oplog once** (`checked the
+   version vector against the oplog`); later starts log `skipped the oplog
+   walk`.
+
+**A stop, or a crash, at any point is safe**: each chunk is its own commit, a
+stop is answered within one chunk, and the next start resumes from the markers
+(`resuming an interrupted storage schema 4 -> 5 migration`), on 0.51.0 or later
+only.
+
+**Two unique documents that share a key are reported** when the rebuild finds
+them, as a replicated build's are, with a `/violations` row, the metric and a
+line each. That includes a pair 0.50 never enforced: a partial unique index
+whose filter's path holds a decimal now decides it exactly, and a pair a
+replication merge left, which 0.50 reported once already, is reported once
+more. From then on a local write that would keep either holder's key, or add
+another holder, is refused as a duplicate, where 0.50 accepted it; resolve the
+pair as any other violation.
+
+**How long it takes.** On the lab host's spinning disk, cold, 2,000,000
+documents of about 350 bytes with integer `_id`s and three indexes took **19.3
+minutes** from the container's start to the node answering: 3 minutes moving the
+documents out, 3.3 moving them back, 5.4 draining the three indexes, 6.5
+refilling them, and 1.1 walking the oplog; the next start took a second. Its
+memory peaked at 373 MiB and its file did not grow. On a laptop's SSD with the
+page cache warm the same migration took 20 to 47 s (1.5 s for 100,000
+documents, 5 to 7 s for 500,000); there the file grew from 2,411 to 4,096 MiB
+while it ran and was back to 2,415 MiB once the node closed. Every chunk is a
+commit with a disk sync, so a slower disk costs more than a slower CPU; a store
+whose `_id`s are strings or ObjectIds has no re-key, and one with fewer indexes
+less rebuild. The oplog walk is about 30 s per GB read cold. **Check the deploy tool's per-member
+readiness wait against this before the roll**, and allow for the migration
+and the oplog walk being longer than `storage.oplog_retention_secs`: then the
+member's return is a whole-database snapshot.
 
 ### Rolling back, and `kimmy.format`
 
@@ -2696,6 +2862,16 @@ defaults rolls back untouched.
 **Rolling back from 0.47.0 to 0.46.0 needs no store work and no edit to the configuration, and a roll or a rollback must finish within `storage.tombstone_retention_secs` of any database drop made during it.** No table, `kimmy.format` schema (still 4), redb version, backup tag, snapshot field, entry kind or configuration key changed. A database's drop is a row of the dropped-collections table under a reserved collection name, and an ordinary `DropCollection` entry that names it ([ADR-229](decisions.md)); 0.46.0 reads, applies, stores and serves both as the drop of a collection it never held, which a 0.46.0 member was shown to do on the 0.46.0 build before the change. A backup taken on 0.47.0 restores on 0.46.0, and the reverse. **What a member on 0.46.0 does not do is act on it:** it drops the collections the dropper held and *keeps* a collection the dropper never held, and keeps serving it, acknowledged writes included, until it restarts on 0.47.0, which buries it (and the writes). A member that stays on 0.46.0 longer than the tombstone's retention after a database drop never has the tombstone to act on; the other members, which have also collected theirs, then see the collection as an existence divergence and anti-entropy brings it back, and with it the database. Finish a roll or a rollback inside the retention window, and do not drop databases in the middle of one if you can wait. While the cluster is mixed, a database drop issued on a 0.46.0 member records no tombstone and behaves as it did.
 
 **Rolling back from 0.47.1 to 0.47.0 needs nothing:** the store, the wire and the configuration are the same, and the release changes only a log level and where a change stream starts.
+
+**Rolling back from 0.51.0 to 0.50.x or 0.49.x needs the backup taken before the upgrade.** Storage schema 5 is a rollback boundary ([ADR-238](decisions.md)): from the moment a 0.51.0 start raises `kimmy.format` to schema 5, just before its migration's first commit, 0.50 and 0.49 refuse the store with nothing written, an interrupted migration's included, and refuse a backup taken on 0.51.0 before the restore creates a file. A 0.51.0 start that was refused before that point (the free-space check, an unparseable partial filter) leaves a store 0.50 opens. The way back is the backup taken before the upgrade (`BACKUP=true`): restored on 0.50, it loses every write made after it on that member, which the member then catches up from its peers. Wiping the data directory and letting the member catch up from its peers works while no member holds a document whose `_id` is a `Decimal128`.
+
+#### `cluster.decimal128` and the marker
+
+**`cluster.decimal128` is a rollback effect, and the marker, not the key, is the authority** ([ADR-238](decisions.md)). A 0.49.x or 0.50.x binary refuses to start on a configuration that names `cluster.decimal128`, at any value (`[cluster]` refuses unknown keys): remove it before rolling a member back. **Setting it back to `false` does not make a rollback possible.** The key gates only the local creation of a document whose `_id` is a `Decimal128` and of an index whose partial filter holds one; what was created stays, and replicates. A member before 0.51 that meets such a document fails every frame that carries it (entries, replays, pushes and snapshot pages are decoded whole), asks for the same window for ever and never catches up; a document whose `_id` is an integral decimal (`Decimal128("5")`, stored as the id `5` with the decimal kept in the body) also fails every full scan of its collection there and that member's snapshot sender.
+
+**Read the marker on every member before a rollback.** `kimmy_decimal128_id_present` (and `decimal128_id_present` on `/readyz`) is `1` once a document whose `_id` is a `Decimal128` has been written or applied on that member; it is never cleared, and a backup carries it. **Once it reads 1 on any member, no member can be rolled back by wiping its data directory and letting it resync on an older build.** A member on an older build that has met such a document is **rolled forward to 0.51**, never wiped and resynced. While the marker is set and a live peer does not say it can hold one, the member logs a `WARN` naming that peer (`a document whose _id is a Decimal128 exists on this member, and a live peer does not say it can hold one`), once and then every ten minutes; a live peer not heard from at all is named once it has been unheard for longer than a lease. A backup restore is offline and is not gated: a backup holding such a document, restored into a cluster that still has a member before 0.51, carries it past the gate.
+
+**The procedure.** Set `cluster.decimal128 = true` only once every member runs 0.51 and has finished its storage migration, and as a configuration change and restart of its own, never in the change that upgrades the binary. The gate also refuses while any live member does not advertise the capability, but a member that is stopped for its upgrade, or still migrating, is not live and is not asked: with the key shipped beside the binary, a member whose upgrade is refused and which is brought back on 0.50 meets documents created while it was down and never catches up. The same holds for an index whose partial filter holds a `Decimal128`: created while a member is down or older, it is refused there and never built, even after that member upgrades.
 
 **Rolling back from 0.50.0 to 0.49.x needs no store work, and the configuration may need an edit.** No `kimmy.format` schema (still 4), `I_EPOCH`, table, backup tag or entry kind changed. The store gains one metadata key, `gc:tombstone_horizon`, and the snapshot page one optional field, `tombstone_horizon`; 0.49.x ignores both, and a backup carries the key. **Remove `cluster.divergence_repair`, `cluster.repair_max_documents` and `cluster.repair_max_index_documents` from the configuration first**: 0.49.x refuses to start on a configuration that names any of them, at any value. **A store rolled back to 0.49.x buries, at its next start or database sweep, every collection 0.50.0 kept under a database drop, with the writes it kept** ([ADR-236](decisions.md)), so the members differ until they run one version; the details, and the two differences that outlast a roll, are in [Compatibility](compatibility.md). During a roll a 0.49.x member repairs nothing, and a 0.50.0 member repairing from it writes no young lost insert, since a 0.49.x sender reports no horizon.
 

@@ -1997,10 +1997,11 @@ async fn every_member_files_an_unkeyable_document_the_same_way() {
     // member was filed under a real key there and unkeyed on both peers,
     // because the member's JSON edge left `$numberDecimal` a nested
     // document while every re-decode of the stored bytes held a Decimal128.
-    // Each shape an index cannot key is written to A; every node must
-    // report the same `unkeyed` and count the document through the index —
-    // and again for the mirror order, an index created after the documents
-    // have replicated.
+    // A `Decimal128` has a key now, and is written beside the shapes an index
+    // still cannot key to keep the finding pinned: every node must report the
+    // same `unkeyed` (the two shapes that cannot be keyed, not the decimal) and
+    // count all three documents through the index — and again for the mirror
+    // order, an index created after the documents have replicated.
     let client = reqwest::Client::new();
     let (a, b, c) = three_nodes(&client).await;
     eventually("gossip to form", || all_report(&client, vec![&a, &b, &c], 2)).await;
@@ -2040,21 +2041,24 @@ async fn every_member_files_an_unkeyable_document_the_same_way() {
 
     let tokens = [a.login(&client).await, b.login(&client).await, c.login(&client).await];
     let nodes = [&a, &b, &c];
-    eventually("every node to file all three documents unkeyed and count them", || {
-        let client = &client;
-        let tokens = &tokens;
-        async move {
-            for (node, token) in nodes.iter().zip(tokens) {
-                if unkeyed_on(client, node, token, "ab").await != Some(3) {
-                    return false;
+    eventually(
+        "every node to file the two unkeyable documents unkeyed and count all three",
+        || {
+            let client = &client;
+            let tokens = &tokens;
+            async move {
+                for (node, token) in nodes.iter().zip(tokens) {
+                    if unkeyed_on(client, node, token, "ab").await != Some(2) {
+                        return false;
+                    }
+                    if indexed_count_on(client, node, token).await != Some(3) {
+                        return false;
+                    }
                 }
-                if indexed_count_on(client, node, token).await != Some(3) {
-                    return false;
-                }
+                true
             }
-            true
-        }
-    })
+        },
+    )
     .await;
 
     // The mirror order: the documents are everywhere already, and a new
@@ -2072,7 +2076,7 @@ async fn every_member_files_an_unkeyable_document_the_same_way() {
         let tokens = &tokens;
         async move {
             for (node, token) in nodes.iter().zip(tokens) {
-                if unkeyed_on(client, node, token, "ba").await != Some(3) {
+                if unkeyed_on(client, node, token, "ba").await != Some(2) {
                     return false;
                 }
             }
@@ -4311,4 +4315,128 @@ async fn lab_hook_a_lost_insert_is_repaired_by_either_half() {
         lab_hook_scrape(&client, &b, "kimmy_sync_digest_repair_rows_total{result=\"created\"}")
             .await;
     eprintln!("lost insert repaired: count-half rounds {count_half}, young rows created {young}");
+}
+
+/// The `Decimal128` gate on a live cluster (ADR-238). A declares
+/// `cluster.decimal128`; B and C keep the clustered default, `false`. A creates a
+/// document whose `_id` is a `Decimal128` once every live member has said it can
+/// hold one (all three run this build); B refuses the same creation `400`, naming
+/// the key; the document reaches B and C all the same, since what replicates is
+/// never gated, and the marker reads 1 on all three, on `/readyz` and on the
+/// gauge. A partial index whose filter holds a `Decimal128` is the same: refused
+/// on B, created on A, built on every member.
+#[tokio::test]
+#[ignore = "boots a real three-node cluster; run with --ignored"]
+async fn a_decimal128_id_is_created_where_declared_and_applied_everywhere() {
+    let client = reqwest::Client::new();
+    let (pa, pb, pc) = (ports::choose(), ports::choose(), ports::choose());
+    let a = Node::spawn_configured("node-a", pa, &[pb], "", 1, "decimal128 = true");
+    let b = Node::spawn_configured("node-b", pb, &[pa], "", 1, "");
+    let c = Node::spawn_configured("node-c", pc, &[pa], "", 1, "");
+    for node in [&a, &b, &c] {
+        node.wait_ready(&client).await;
+    }
+    eventually("gossip to form", || all_report(&client, vec![&a, &b, &c], 2)).await;
+    for node in [&a, &b, &c] {
+        assert_eq!(node.gauge(&client, "kimmy_decimal128_id_present").await, Some(0));
+    }
+
+    let (ta, tb) = (a.login(&client).await, b.login(&client).await);
+    let created = client
+        .post(a.url("/v1/db/shop/collections"))
+        .bearer_auth(&ta)
+        .json(&serde_json::json!({ "name": "prices" }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(created.status(), 200);
+    let decimal_doc = serde_json::json!({ "_id": { "$numberDecimal": "1.5" }, "v": 1 });
+
+    // B's key is unset, so a clustered B refuses whatever its peers can hold.
+    eventually("the collection on B", || async {
+        client
+            .get(b.url("/v1/db/shop/coll/prices/indexes"))
+            .bearer_auth(&tb)
+            .send()
+            .await
+            .is_ok_and(|res| res.status().is_success())
+    })
+    .await;
+    let refused = client
+        .post(b.url("/v1/db/shop/coll/prices/docs"))
+        .bearer_auth(&tb)
+        .json(&decimal_doc)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(refused.status(), 400);
+    let text = refused.text().await.unwrap();
+    assert!(text.contains("cluster.decimal128"), "the refusal names the key: {text}");
+
+    // A's key is set: accepted once A has heard every live member say it can.
+    eventually("A to accept a decimal _id", || async {
+        client
+            .post(a.url("/v1/db/shop/coll/prices/docs"))
+            .bearer_auth(&ta)
+            .json(&decimal_doc)
+            .send()
+            .await
+            .is_ok_and(|res| res.status().is_success())
+    })
+    .await;
+    let index = serde_json::json!({
+        "name": "positive",
+        "fields": [{ "path": "v" }],
+        "partialFilterExpression": { "v": { "$gt": { "$numberDecimal": "0" } } },
+    });
+    let refused = client
+        .post(b.url("/v1/db/shop/coll/prices/indexes"))
+        .bearer_auth(&tb)
+        .json(&index)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(refused.status(), 400, "a decimal bound waits for B's key too");
+    let built = client
+        .post(a.url("/v1/db/shop/coll/prices/indexes"))
+        .bearer_auth(&ta)
+        .json(&index)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(built.status(), 200, "{}", built.text().await.unwrap());
+
+    let tokens = [ta.clone(), tb.clone(), c.login(&client).await];
+    let nodes = [&a, &b, &c];
+    eventually("the document, its marker and the index on every member", || {
+        let client = &client;
+        let tokens = &tokens;
+        async move {
+            for (node, token) in nodes.iter().zip(tokens) {
+                let ready: serde_json::Value = match client.get(node.url("/readyz")).send().await {
+                    Ok(res) => res.json().await.unwrap_or_default(),
+                    Err(_) => return false,
+                };
+                if ready["decimal128_id_present"] != true
+                    || node.gauge(client, "kimmy_decimal128_id_present").await != Some(1)
+                {
+                    return false;
+                }
+                let indexes: serde_json::Value = match client
+                    .get(node.url("/v1/db/shop/coll/prices/indexes"))
+                    .bearer_auth(token)
+                    .send()
+                    .await
+                {
+                    Ok(res) => res.json().await.unwrap_or_default(),
+                    Err(_) => return false,
+                };
+                if !indexes.to_string().contains("\"positive\"") {
+                    return false;
+                }
+            }
+            true
+        }
+    })
+    .await;
 }

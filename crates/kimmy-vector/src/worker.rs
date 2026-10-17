@@ -8351,6 +8351,8 @@ pub(crate) mod tests {
             DocId::Int64(i) => i.to_string(),
             DocId::Binary(b) => format!("bin({} bytes)", b.len()),
             DocId::Uuid(u) => u.to_string(),
+            // No such `_id` existed in 0.50.0; its `Display` is the twin a String collides with.
+            DocId::Decimal128(d) => d.to_string(),
         };
         DocId::String(format!("{display}#{chunk}"))
     }

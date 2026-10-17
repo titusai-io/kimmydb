@@ -383,26 +383,9 @@ pub fn find(
             // whatever order the matches arrive in.
             let order = with_id_tiebreak(&sort);
             let mut top = TopK::new(window, &order, projection.as_ref());
-            // A match the order has no position for — a Decimal128 where the
-            // sort would read it — refuses the whole query by name, after
-            // the visit: the visitor cannot fail, and offering nothing more
-            // once one is found costs one pass it was making anyway.
-            let mut unsortable: Option<String> = None;
             let stats = visit_matching(state, &meta, &filter, Order::Any, None, |stamp, doc| {
-                if unsortable.is_some() {
-                    return;
-                }
-                // Asked of the stored document, before the projection: a
-                // Decimal128 at a sort path refuses the query whether or not
-                // the page would have carried it.
-                match shape::unsortable(&order, &doc) {
-                    None => top.offer(stamp, doc),
-                    Some(why) => unsortable = Some(why),
-                }
+                top.offer(stamp, doc);
             })?;
-            if let Some(why) = unsortable {
-                return Err(ApiError::bad_request(why));
-            }
             // The window shaped `skip + limit` documents and `skip` of them
             // are dropped here. Nothing cheaper is available: which matches
             // the offset steps over is not known until the sort is done, and
@@ -481,6 +464,9 @@ fn sort_is_id_ascending(sort: &[shape::SortKey]) -> bool {
 /// documents and a projection may have dropped `_id` from them (ADR-150).
 /// Reading it back out of the page would have made `{"_id": 0}` a walk that
 /// ended after one page, silently and looking like the end of the collection.
+///
+/// Built from the stored key; the token the client is given is its legacy form
+/// (`kimmy_core::Cursor::encode`, Decimal128 design 7.2).
 fn next_cursor(last: Option<&bson::Bson>) -> Option<kimmy_core::Cursor> {
     let id = DocId::try_from_bson(last?).ok()?;
     let key = kimmy_core::keyenc::encode(&id.to_bson()).ok()?;
@@ -679,14 +665,10 @@ pub struct QueryStats {
     /// documents under the index — zero for an index that keys everything
     /// it holds.
     pub unkeyed: Option<usize>,
-    /// Of `index_entries`, the ones read from the index's **undecidable** run:
-    /// documents held because a partial filter could not decide them, which
-    /// every scan of that index reads and rechecks (ADR-185). Reported and read
-    /// exactly as `unkeyed` is, and separate from it for the reason the two
-    /// counters are separate: that one is a fault an owner can fix, this one is
-    /// the documented cost of a `Decimal128` at a filtered path, and an owner
-    /// tuning a query needs to see which of the two they are paying for.
-    pub undecidable: Option<usize>,
+    // `undecidableCandidates` stood beside `unkeyedCandidates` from ADR-185 to
+    // ADR-238: the entries read from a partial index's undecidable run. The
+    // run is gone (a filter decides a `Decimal128` by its exact value), and so
+    // is the field, rather than a constant 0 a client would go on reading.
     /// Whether the filter pinned `_id` and was answered by primary-key reads.
     ///
     /// Reported separately from `index` because the primary key is not one: no
@@ -722,9 +704,6 @@ impl QueryStats {
         }
         if let Some(unkeyed) = self.unkeyed {
             out["unkeyedCandidates"] = json!(unkeyed);
-        }
-        if let Some(undecidable) = self.undecidable {
-            out["undecidableCandidates"] = json!(undecidable);
         }
         out
     }
@@ -771,6 +750,11 @@ pub fn collect_matching_stamped_after(
 pub enum Order<'a> {
     /// `_id` ascending, resuming strictly after an encoded document key — the
     /// order a page is returned in and a cursor resumes from.
+    ///
+    /// `after` is a **stored** key: a client's token was converted from the legacy
+    /// form by `kimmy_core::Cursor::decode`, and the vector filter's paging hands
+    /// its own stored keys straight in. Nothing here may read it as legacy
+    /// (Decimal128 design 7.2).
     ById { after: Option<&'a [u8]> },
     /// Whichever order the access path finds cheapest. For a count, which
     /// has no order, or a sort, which imposes its own.
@@ -850,7 +834,6 @@ impl QueryStats {
             probes: 0,
             index_entries: None,
             unkeyed: None,
-            undecidable: None,
             id_lookup: false,
         };
         match access {
@@ -946,7 +929,6 @@ where
             probes: pk.keys.len(),
             index_entries: None,
             unkeyed: None,
-            undecidable: None,
             id_lookup: true,
         });
     }
@@ -968,7 +950,6 @@ where
     };
     let mut entries = None;
     let mut unkeyed = None;
-    let mut undecidable = None;
     if let Some(p) = &plan {
         // Candidates stream out of the index and are rechecked as they come,
         // so stopping stops the read; nothing proportional to the range is
@@ -1004,7 +985,6 @@ where
             Some(outcome) => {
                 entries = Some(outcome.entries);
                 unkeyed = Some(outcome.unkeyed);
-                undecidable = Some(outcome.undecidable);
             }
             None => plan = None,
         }
@@ -1028,7 +1008,6 @@ where
         probes: plan.as_ref().map_or(0, |p| p.ranges.len()),
         index_entries: entries,
         unkeyed,
-        undecidable,
         id_lookup: false,
     })
 }
@@ -1416,10 +1395,6 @@ impl kimmy_storage::ModifySpec for Modify<'_> {
         shape::compare(self.sort, a, b)
     }
 
-    fn unsortable(&self, doc: &Document) -> Option<String> {
-        shape::unsortable(self.sort, doc)
-    }
-
     fn apply(&self, doc: &Document) -> std::result::Result<Option<Document>, String> {
         let Some(update) = self.update else {
             return Ok(None);
@@ -1737,16 +1712,11 @@ fn create_index_stamped(
     // What the backfill could not key, read back from the index it just
     // built: the one number a client creating an index over existing data
     // most wants beside `multikey`, and the listing reports the same field.
-    // Each count walks its run of the index, which can be every document:
-    // off the async worker (ADR-199).
+    // The count walks its run of the index, which can be every document: off
+    // the async worker (ADR-199).
     let meta = state.engine.get_collection(db, coll)?;
-    let (unkeyed, undecidable) = kimmy_storage::blocking(|| {
-        Ok::<_, kimmy_storage::StorageError>((
-            state.engine.unkeyed_count(&meta, index.id)?,
-            state.engine.undecidable_count(&meta, index.id)?,
-        ))
-    })?;
-    Ok((index_to_json(&index, unkeyed, undecidable), index.created))
+    let unkeyed = kimmy_storage::blocking(|| state.engine.unkeyed_count(&meta, index.id))?;
+    Ok((index_to_json(&index, unkeyed), index.created))
 }
 
 /// Confirm a schema change this node just minted on every live member
@@ -1832,11 +1802,7 @@ pub fn list_indexes(
     // off the async worker, once for the listing (ADR-199).
     kimmy_storage::blocking(|| {
         for index in &meta.indexes {
-            indexes.push(index_to_json(
-                index,
-                state.engine.unkeyed_count(&meta, index.id)?,
-                state.engine.undecidable_count(&meta, index.id)?,
-            ));
+            indexes.push(index_to_json(index, state.engine.unkeyed_count(&meta, index.id)?));
         }
         Ok::<_, kimmy_storage::StorageError>(())
     })?;
@@ -1958,15 +1924,17 @@ fn drop_index_stamped(
     Ok((json!({ "dropped": dropped.removed }), dropped.stamp))
 }
 
-/// `unkeyed` is how many documents the index holds that it could not key, and
-/// `undecidable` how many it holds because its partial filter could not decide
-/// them — both read from the index, since the definition carries neither.
+/// `unkeyed` is how many documents the index holds that it could not key, read
+/// from the index, since the definition does not carry it.
 ///
-/// **Two figures rather than one.** They were one for a while, and it made
-/// `unkeyed` mean something other than what every place it is documented says:
-/// a collection with a `Decimal128` at a filtered path reported `unkeyed: 2`
-/// while `kimmy_index_unkeyed_total` read 0 (ADR-185).
-pub fn index_to_json(index: &kimmy_storage::IndexMeta, unkeyed: u64, undecidable: u64) -> Value {
+/// **One figure, and only that reason.** From ADR-185 to ADR-238 a second one,
+/// `undecidable`, stood beside it for the documents a partial filter could not
+/// decide (a `Decimal128` at a filtered path), after a version that folded them
+/// into `unkeyed` made it mean something other than what every place it is
+/// documented says. A filter decides a decimal by its exact value since
+/// ADR-238, so that figure is gone from the listing, `describe` and
+/// `createIndex`, and the schema no longer requires it.
+pub fn index_to_json(index: &kimmy_storage::IndexMeta, unkeyed: u64) -> Value {
     let mut out = json!({
         "name": index.name,
         "fields": index.fields.iter().map(|f| json!({
@@ -1982,23 +1950,11 @@ pub fn index_to_json(index: &kimmy_storage::IndexMeta, unkeyed: u64, undecidable
         // index does not stop at its upper bound.
         "multikey": index.multikey,
         // Documents the index holds and could not key: arrays at two of a
-        // compound index's paths, more than 1,000 keys, a Decimal128. Every
-        // scan of the index rechecks them (ADR-139). Zero is the index doing
-        // its whole job; anything else names work for the collection's owner,
-        // who can see it here without access to the server's logs.
+        // compound index's paths, or more than 1,000 keys. Every scan of the
+        // index rechecks them (ADR-139). Zero is the index doing its whole
+        // job; anything else names work for the collection's owner, who can see
+        // it here without access to the server's logs.
         "unkeyed": unkeyed,
-        // Documents the index holds because its partial filter could not decide
-        // them: a `Decimal128` at a filtered path ranks equal to every number, so
-        // the filter's answer is not an answer and the index holds the document
-        // for the scan to re-check (ADR-185). Every scan pays for these, so an
-        // owner needs the standing number — on a money field it may be most of
-        // the collection.
-        //
-        // **Always present, like `unkeyed` beside it.** Rendering it only when
-        // non-zero would be a second convention in one object: a client would
-        // have to know that absent means zero, and a typed client would break the
-        // first time it appeared.
-        "undecidable": undecidable,
     });
 
     // Added only when set, so listing ordinary indexes does not suggest every
@@ -2515,7 +2471,7 @@ fn matched_for_input(
 }
 
 /// The foreign side filed by `A(d)`, or `Declined` if evaluating or encoding it
-/// failed for any document (an error, or a `Decimal128`, which has no key).
+/// failed for any document (an error: every value has a key now).
 fn build_table(key: &aggregate::JoinKey, base: &[bson::Document]) -> JoinTable {
     #[cfg(test)]
     join_counters::builds();
@@ -2600,9 +2556,9 @@ fn encode_key(value: &bson::Bson) -> Option<Vec<u8>> {
 /// The distinct keys a document joins under at `field`: one for every value of
 /// [`aggregate::join_values`] (what the path yields, and the elements of any
 /// that is an array), the same function the input side's wanted set is built
-/// from. A value that cannot be keyed (a `Decimal128`, alone or inside an array)
-/// yields none, so `[Decimal128, 5]` joins on its `5` and not as a whole, and a
-/// document without the field yields no keys at all.
+/// from. A `Decimal128` is keyed by its value, alone or inside an array, so
+/// `[Decimal128("5.0"), 5]` joins under the one key, and a document without the
+/// field yields no keys at all.
 fn join_keys(doc: &bson::Document, field: &str) -> Vec<Vec<u8>> {
     let mut keys: Vec<Vec<u8>> =
         aggregate::join_values(doc, field).into_iter().filter_map(encode_key).collect();
@@ -2692,7 +2648,6 @@ mod tests {
             probes,
             index_entries: None,
             unkeyed: None,
-            undecidable: None,
             id_lookup: false,
         }
     }
@@ -3276,7 +3231,8 @@ mod tests {
             ]
         );
         assert!(join_keys(&doc, "missing").is_empty());
-        assert!(join_keys(&doc, "d").is_empty(), "a value that cannot be keyed yields none");
+        // A decimal zero is keyed like the number zero.
+        assert_eq!(join_keys(&doc, "d"), vec![encode_key(&bson::Bson::Int32(0)).unwrap()]);
     }
 
     /// The ceiling counts the foreign documents held, once each: a join that
@@ -3369,10 +3325,10 @@ mod tests {
         assert_eq!(out["documents"][0]["p"], json!([]));
     }
 
-    /// A value that cannot be keyed joins nothing, and inside an array the
-    /// elements that can be still do.
+    /// A `Decimal128` joins what equals it by value, and inside an array each
+    /// element joins on its own.
     #[test]
-    fn a_decimal128_key_joins_nothing_and_its_array_joins_on_the_rest() {
+    fn a_decimal128_key_joins_by_value_and_its_array_on_each_element() {
         let dir = tempfile::tempdir().unwrap();
         let state = live_state(&dir);
         let dec = || bson::Bson::Decimal128(bson::Decimal128::from_bytes([0; 16]));
@@ -3391,7 +3347,10 @@ mod tests {
             { "$sort": { "_id": 1 } },
         ]);
         let out = agg(&state, &superuser(), "app", "orders", &join).unwrap();
-        assert_eq!(joined_ids(&out, "p"), vec![vec![], vec![json!("five")]]);
+        assert_eq!(
+            joined_ids(&out, "p"),
+            vec![vec![json!("dec")], vec![json!("dec"), json!("five")]]
+        );
     }
 
     #[test]
@@ -3545,6 +3504,7 @@ mod decimal128_at_the_edge {
         // the stored bytes; createIndex-then-insert files the document the
         // edge produced. The count used to differ — 1 and 0 — because the
         // edge left `$numberDecimal` a nested document the index could key.
+        // Both now key the `Decimal128` as a number, and the two agree.
         let (first, _d1) = engine();
         let coll = first.get_collection("app", "docs").unwrap();
         first.insert(&coll, decimal_document()).unwrap();
@@ -3556,9 +3516,9 @@ mod decimal128_at_the_edge {
         second.insert(&coll, decimal_document()).unwrap();
         let written = second.unkeyed_count(&coll, coll.index("av").unwrap().id).unwrap();
 
-        assert_eq!(backfilled, 1, "the backfill files the Decimal128 unkeyed");
+        assert_eq!(backfilled, 0, "the backfill keys the Decimal128");
         assert_eq!(written, backfilled, "and so does the write path, on the same member");
-        assert_eq!(second.unkeyed_writes(), 1, "counted, as every unkeyed filing is");
+        assert_eq!(second.unkeyed_writes(), 0, "nothing was filed unkeyed");
     }
 
     #[test]
@@ -3642,7 +3602,7 @@ mod decimal128_at_the_edge {
 /// A join against a naive reference over generated documents (ADR-210): two
 /// documents join when a value of one, and the elements of it when it is an
 /// array, equals a value of the other read the same way; a missing field joins
-/// nothing and a `Decimal128` cannot be a key. Scan order is ascending `_id`.
+/// nothing and a `Decimal128` is equal to the number of its value. Scan order is ascending `_id`.
 #[cfg(test)]
 mod join_differential {
     use super::*;
@@ -3733,19 +3693,8 @@ mod join_differential {
         }
     }
 
-    fn has_decimal(v: &Bson) -> bool {
-        match v {
-            Bson::Decimal128(_) => true,
-            Bson::Array(a) => a.iter().any(has_decimal),
-            Bson::Document(d) => d.values().any(has_decimal),
-            _ => false,
-        }
-    }
-
     fn equal(a: &Bson, b: &Bson) -> bool {
-        !has_decimal(a)
-            && !has_decimal(b)
-            && kimmy_core::cmp::canonical_cmp(a, b) == Ordering::Equal
+        kimmy_core::cmp::canonical_cmp(a, b) == Ordering::Equal
     }
 
     /// The reference's values: each resolved value, then its elements.
@@ -3848,3 +3797,6 @@ mod join_differential {
 
 #[cfg(test)]
 mod join_tests;
+
+#[cfg(test)]
+mod token_tests;

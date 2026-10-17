@@ -16,6 +16,7 @@ pub mod check;
 pub mod class_step;
 pub mod codec;
 mod database_tombstone;
+pub mod decimal128_gate;
 pub mod definition_digest;
 pub mod definition_probe;
 mod definition_repair;
@@ -41,6 +42,9 @@ pub mod live_digest;
 mod live_walk;
 pub mod meta;
 pub mod migrate;
+mod migrate_v5;
+#[cfg(test)]
+mod migrate_v5_tests;
 pub mod modify;
 pub mod open_progress;
 pub mod purge;
@@ -63,6 +67,10 @@ pub use walk::WalkScope;
 pub mod watch;
 pub mod writer_hold;
 
+#[cfg(test)]
+mod decimal128_gate_tests;
+#[cfg(test)]
+mod decimal_cost_tests;
 #[cfg(test)]
 mod key_walk_tests;
 
@@ -114,11 +122,15 @@ mod later_life_stop_tests;
 mod young_stamp_model_tests;
 
 #[cfg(test)]
+mod mixed_roll_tests;
+
+#[cfg(test)]
 mod log_capture;
 #[cfg(feature = "test-hooks")]
 pub use live_walk::stop_open_after_rows_for_test;
 
 pub use database_tombstone::{Buried, BuriedCollection, Swept};
+pub use decimal128_gate::Decimal128Predicate;
 pub use definition_digest::{DefinitionKey, DefinitionKind};
 pub use definition_probe::{
     DefinitionAnswered, DefinitionAsk, DefinitionDefer, DefinitionEntry, DefinitionOutcome,
@@ -151,7 +163,7 @@ pub use hold_meter::{
 pub use index::{CandidateOrder, Dropped, IndexScan, IndexScanOutcome};
 pub use meta::{CollectionMeta, DatabaseMeta, Enforcement, IndexField, IndexMeta, VectorConfig};
 #[cfg(feature = "test-hooks")]
-pub use migrate::make_schema_3_for_test;
+pub use migrate::make_schema_4_for_test;
 pub use modify::{Candidates, MAX_CANDIDATES, ModifyManyOutcome, ModifyOutcome, ModifySpec};
 pub use open_progress::{
     OpenPhase, OpenSnapshot, open_snapshot, open_stop_requested, request_open_stop, set_open_phase,

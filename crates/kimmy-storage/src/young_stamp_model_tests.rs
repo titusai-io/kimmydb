@@ -28,9 +28,13 @@
 //! database drop; plain index create and drop; a filler of 1001 documents (so a late drop's
 //! sweep takes two chunks); a retention pass with the member's own retention (unequal per
 //! member) and clock; a restart, optionally with a changed retention; a run of the real
-//! previous release (`0.49.0`) over the store, from the step until the member's next start
-//! (its passes collect without raising the key, its pages carry no horizon, it adopts
-//! nothing and repairs nothing, and it leaves its sidecar); a start killed between the
+//! previous release over the store, from the step until the member's next start, and only
+//! before the member's first start of this build, because the previous release refuses a
+//! schema-5 store (Decimal128 design 10, review m8): `0.50.0`, which keeps the horizon and
+//! repairs as this build does, and leaves its sidecar; or, for a roll that skips 0.50
+//! (`Config::skip`), `0.49.0`, whose passes collect without raising the key, whose pages
+//! carry no horizon, which adopts nothing and repairs nothing, and which leaves its
+//! sidecar; a start killed between the
 //! pre-open sidecar write and the reset commit (the pre-open write landing and nothing
 //! after it, or an fsync failure injected into the open), then a start; a backup and a
 //! restore of an earlier one; a wipe with a whole-database resync; a skew change; pulls by
@@ -82,8 +86,13 @@ use crate::{
 const DB: &str = "shop";
 const NAMES: [&str; 2] = ["orders", "items"];
 const LETTERS: [char; 3] = ['A', 'B', 'C'];
-/// The release before the one that keeps the horizon, by its real version string.
-const PREVIOUS_RELEASE: &str = "0.49.0";
+/// The release before this one, by its real version string. It keeps the horizon and repairs
+/// as this build does; what is left of it here is its sidecar, which a start of this build
+/// does not trust.
+const PREVIOUS_RELEASE: &str = "0.50.0";
+/// The release a roll that skips 0.50 comes from (`Config::skip`): the one before the one that
+/// keeps the horizon.
+const SKIPPED_FROM: &str = "0.49.0";
 const BATCH: usize = 1024;
 /// The filler's ids: more records than one chunk of a late drop's sweep examines.
 const FILLER_FROM: i64 = 1_000;
@@ -161,7 +170,10 @@ pub(crate) enum Step {
         m: u8,
         how: u8,
     },
-    /// The 0.49.0 release runs the store from here until the member's next start.
+    /// The previous release (`0.50.0`, or `0.49.0` under `Config::skip`) runs the store from
+    /// here until the member's next start. Only before the member's first start of this
+    /// build: from that start on, the store is schema 5 and no earlier release opens it, so
+    /// the step does nothing.
     Foreign {
         m: u8,
     },
@@ -270,7 +282,7 @@ impl std::fmt::Display for Step {
             Step::Kill { m, how } => {
                 write!(f, "{}.kill({})", l(m), if how == 0 { "after-sidecar" } else { "fsync" })
             }
-            Step::Foreign { m } => write!(f, "{}.run-0.49.0", l(m)),
+            Step::Foreign { m } => write!(f, "{}.run-previous-release", l(m)),
             Step::Backup { m } => write!(f, "{}.backup", l(m)),
             Step::Restore { m, b } => write!(f, "{}.restore(#{b})", l(m)),
             Step::Wipe { m, from } => write!(f, "{}.wipe(resync from {})", l(m), l(from)),
@@ -319,14 +331,23 @@ pub(crate) struct Config {
     pub skew: [u8; 3],
     /// Whether the member's passes keep the oplog (else they collect it at the same cutoff).
     pub keep_oplog: [bool; 3],
-    /// This build calls itself `0.49.0` (the shape of review revA M1: a development build
-    /// of the next release before the version bump).
+    /// This build calls itself by the previous release's version (the shape of review revA
+    /// M1: a development build of the next release before the version bump).
     pub same_name: bool,
+    /// The roll skips 0.50: the previous release is `0.49.0`, which does not keep the
+    /// horizon. Otherwise it is `0.50.0`.
+    pub skip: bool,
 }
 
 impl Default for Config {
     fn default() -> Self {
-        Config { retention: [1, 1, 5], skew: [0; 3], keep_oplog: [true; 3], same_name: false }
+        Config {
+            retention: [1, 1, 5],
+            skew: [0; 3],
+            keep_oplog: [true; 3],
+            same_name: false,
+            skip: false,
+        }
     }
 }
 
@@ -370,11 +391,12 @@ impl Schedule {
 
     fn show(&self) -> String {
         let mut out = format!(
-            "config: retention {:?} skew {:?} keep_oplog {:?} same_name {}\n  steps:",
+            "config: retention {:?} skew {:?} keep_oplog {:?} same_name {} skip {}\n  steps:",
             self.cfg.retention.map(ret),
             self.cfg.skew.map(|s| SKEWS[s as usize]),
             self.cfg.keep_oplog,
-            self.cfg.same_name
+            self.cfg.same_name,
+            self.cfg.skip
         );
         for (i, s) in self.steps.iter().enumerate() {
             let _ = write!(out, "\n    {i:>3}: {s}");
@@ -384,8 +406,12 @@ impl Schedule {
 
     fn as_rust(&self) -> String {
         let mut out = format!(
-            "Schedule {{ cfg: Config {{ retention: {:?}, skew: {:?}, keep_oplog: {:?}, same_name: {} }}, steps: vec![",
-            self.cfg.retention, self.cfg.skew, self.cfg.keep_oplog, self.cfg.same_name
+            "Schedule {{ cfg: Config {{ retention: {:?}, skew: {:?}, keep_oplog: {:?}, same_name: {}, skip: {} }}, steps: vec![",
+            self.cfg.retention,
+            self.cfg.skew,
+            self.cfg.keep_oplog,
+            self.cfg.same_name,
+            self.cfg.skip
         );
         for s in &self.steps {
             let _ = write!(out, "Step::{s:?}, ");
@@ -644,7 +670,9 @@ struct RepairOut {
     held_before: Option<(Vec<Event>, Vec<Event>)>,
 }
 
-/// The sender's page as the requester receives it: from a 0.49 sender, no horizon.
+/// The sender's page as the requester receives it: from a 0.49 sender, no horizon. Held to
+/// the wire oracle (review Q7): every key on it is the schema-4 key of its own id, which is
+/// what lets this model's all-0.51 runs stand for a 0.50/0.51 pair.
 fn page_from(
     from: &Engine,
     from_old: bool,
@@ -652,6 +680,9 @@ fn page_from(
     scope: Option<CollectionId>,
 ) -> crate::Result<crate::SnapshotPage> {
     let mut page = from.snapshot_page(after, scope)?;
+    if let Err(e) = crate::mixed_roll_tests::oracle::page(from, &page) {
+        panic!("the wire oracle: {e}");
+    }
     if from_old {
         page.tombstone_horizon = None;
     }
@@ -851,8 +882,11 @@ struct Member {
     retention: u32,
     skew: i32,
     keep_oplog: bool,
-    /// The 0.49.0 release is running the store.
+    /// The previous release is running the store.
     old: bool,
+    /// The member has started this build since the run began: no earlier release can open
+    /// its store again.
+    upgraded: bool,
     backups: Vec<Vec<u8>>,
     /// Every delete and drop held, with the identity generation it was first seen under.
     ghost: BTreeMap<Event, u8>,
@@ -877,6 +911,7 @@ struct Cluster {
     step: usize,
     current: Option<Step>,
     same_name: bool,
+    skip: bool,
     notes: Vec<String>,
     writes: BTreeSet<(u8, i64, Stamp)>,
     findings: Vec<Finding>,
@@ -900,6 +935,7 @@ impl Cluster {
                     skew: SKEWS[cfg.skew[m] as usize],
                     keep_oplog: cfg.keep_oplog[m],
                     old: false,
+                    upgraded: false,
                     backups: Vec::new(),
                     ghost: BTreeMap::new(),
                     gone: BTreeMap::new(),
@@ -915,6 +951,7 @@ impl Cluster {
             step: 0,
             current: None,
             same_name: cfg.same_name,
+            skip: cfg.skip,
             notes: Vec::new(),
             writes: BTreeSet::new(),
             findings: Vec::new(),
@@ -925,6 +962,9 @@ impl Cluster {
         for m in 0..3 {
             cluster.place_template(m);
             cluster.start(m, None).expect("a template opens");
+            // The cluster as it stood before the roll: each member's first start of this
+            // build is its first open step.
+            cluster.members[m].upgraded = false;
         }
         // The schedule's times count from here, after the first starts.
         cluster.base = crate::physical_now_ms() + 1;
@@ -934,9 +974,21 @@ impl Cluster {
     fn build(&self) -> BuildVersions {
         let mut build = BuildVersions::ours();
         if self.same_name {
-            build.written_by = PREVIOUS_RELEASE.into();
+            build.written_by = self.previous_release().into();
         }
         build
+    }
+
+    /// The release a `Foreign` step runs.
+    fn previous_release(&self) -> &'static str {
+        if self.skip { SKIPPED_FROM } else { PREVIOUS_RELEASE }
+    }
+
+    /// Whether `m` is run by 0.49.0 now: the previous release of a roll that skips 0.50, which
+    /// keeps no horizon, sends none, adopts nothing and repairs nothing. A 0.50 run does all
+    /// four as this build does.
+    fn runs_0_49(&self, m: usize) -> bool {
+        self.members[m].old && self.skip
     }
 
     fn place_template(&mut self, m: usize) {
@@ -1039,6 +1091,7 @@ impl Cluster {
         engine.reconcile_late_drops().map_err(|e| err("reconcile_late_drops", e))?;
         engine.finish_purges_now().map_err(|e| err("finish_purges_now", e))?;
         self.members[m].engine = Some(Rc::new(engine));
+        self.members[m].upgraded = true;
         Ok(())
     }
 
@@ -1046,11 +1099,11 @@ impl Cluster {
         let engine = self.members[m].engine.take().expect("open");
         let engine = Rc::try_unwrap(engine).unwrap_or_else(|_| panic!("an engine is still shared"));
         let _ = engine.close();
-        // The 0.49.0 release leaves its own sidecar on the way out (its open wrote it).
+        // The previous release leaves its own sidecar on the way out (its open wrote it).
         if std::mem::take(&mut self.members[m].old) {
             let path = &self.members[m].path;
             let mut sidecar = crate::format::read_sidecar(path).expect("a sidecar");
-            sidecar.written_by = PREVIOUS_RELEASE.into();
+            sidecar.written_by = self.previous_release().into();
             crate::format::write_sidecar(path, &sidecar).unwrap();
         }
     }
@@ -1272,10 +1325,15 @@ impl Cluster {
             }
             Step::Foreign { m } => {
                 let m = m as usize;
-                if !self.members[m].old {
+                let release = self.previous_release();
+                if self.members[m].upgraded {
+                    // Schema 5 from the first start of this build: the previous release
+                    // refuses the store (review m8).
+                    self.note(format!("{}: {release} refuses the store now; not run", l(m as u8)));
+                } else if !self.members[m].old {
                     self.members[m].old = true;
                     self.stats.foreign_runs += 1;
-                    self.note(format!("{} is run by {PREVIOUS_RELEASE}", l(m as u8)));
+                    self.note(format!("{} is run by {release}", l(m as u8)));
                 }
             }
             Step::Backup { m } => {
@@ -1344,12 +1402,11 @@ impl Cluster {
             }
             Step::Converge { to, from, c } => {
                 let (to, from) = (to as usize, from as usize);
-                if self.members[to].old {
+                if self.runs_0_49(to) {
                     return Ok(());
                 }
-                let out =
-                    converge_once(&self.e(to), &self.e(from), self.members[from].old, c, None)
-                        .map_err(|e| err("converge", e))?;
+                let out = converge_once(&self.e(to), &self.e(from), self.runs_0_49(from), c, None)
+                    .map_err(|e| err("converge", e))?;
                 self.judge(to, from, out);
             }
             Step::ConvergeRacingGc { to, from, c } => {
@@ -1357,10 +1414,10 @@ impl Cluster {
             }
             Step::Definitions { to, from, c } => {
                 let (to, from) = (to as usize, from as usize);
-                if self.members[to].old {
+                if self.runs_0_49(to) {
                     return Ok(());
                 }
-                let out = definitions_once(&self.e(to), &self.e(from), self.members[from].old, c)
+                let out = definitions_once(&self.e(to), &self.e(from), self.runs_0_49(from), c)
                     .map_err(|e| err("definitions", e))?;
                 self.judge(to, from, out);
             }
@@ -1380,7 +1437,7 @@ impl Cluster {
         // The 0.49 run's passes are clamped to the wall clock of the start that follows:
         // a pass ahead of it is the clock stepped back that design 13.1 states and does not
         // close.
-        let skew = if member.old { member.skew.min(0) } else { member.skew };
+        let skew = if self.runs_0_49(m) { member.skew.min(0) } else { member.skew };
         Some(self.at(self.t, skew).saturating_sub(self.k * u64::from(member.retention)))
     }
 
@@ -1388,7 +1445,7 @@ impl Cluster {
         let Some(cutoff) = self.cutoff(m) else { return Ok(()) };
         let e = self.e(m);
         let oplog = if self.members[m].keep_oplog { u64::MAX } else { 0 };
-        let removed = if self.members[m].old {
+        let removed = if self.runs_0_49(m) {
             e.collect_garbage_at(cutoff, RetentionPolicy::new(oplog, u64::MAX))
                 .map_err(|e| err("collect_garbage", e))?;
             old_release_collects(&e, Hlc::new(cutoff, 0)).map_err(|e| err("0.49 collect", e))?
@@ -1403,7 +1460,7 @@ impl Cluster {
                 "{} collected {removed} tombstones below {}{}; horizon {}",
                 l(m as u8),
                 self.rel(Hlc::new(cutoff, 0)),
-                if self.members[m].old { " (0.49.0: no horizon)" } else { "" },
+                if self.runs_0_49(m) { " (0.49.0: no horizon)" } else { "" },
                 e.tombstone_horizon().ok().flatten().map_or("-".into(), |h| self.rel(h))
             );
             self.note(s);
@@ -1504,7 +1561,7 @@ impl Cluster {
     fn transfer(&mut self, to: usize, from: usize, scope: Option<CollectionId>) -> Res<()> {
         let mut progress =
             scope.map_or_else(SnapshotProgress::whole_database, SnapshotProgress::of_collection);
-        let strip = self.members[from].old || self.members[to].old;
+        let strip = self.runs_0_49(from) || self.runs_0_49(to);
         let (src, dst) = (self.e(from), self.e(to));
         let mut waits = 0;
         let mut pages = 0;
@@ -1512,6 +1569,9 @@ impl Cluster {
             let mut page = src
                 .snapshot_page(progress.after().cloned(), progress.scope())
                 .map_err(|e| err("snapshot_page", e))?;
+            if let Err(e) = crate::mixed_roll_tests::oracle::page(&src, &page) {
+                panic!("the wire oracle, step {}: {e}\n{}", self.step, self.notes.join("\n"));
+            }
             if strip {
                 page.tombstone_horizon = None;
             }
@@ -1534,7 +1594,7 @@ impl Cluster {
     }
 
     fn converge_racing_gc(&mut self, to: usize, from: usize, c: u8) -> Res<()> {
-        if self.members[to].old {
+        if self.runs_0_49(to) {
             return Ok(());
         }
         let cutoff = self.cutoff(to);
@@ -1561,7 +1621,7 @@ impl Cluster {
             });
         }
         let out =
-            converge_once(&self.e(to), &self.e(from), self.members[from].old, c, Some(&*before));
+            converge_once(&self.e(to), &self.e(from), self.runs_0_49(from), c, Some(&*before));
         cancelled.set(true);
         // An unreached hook is consumed here, doing nothing.
         crate::sync::race_hooks::reach(crate::sync::race_hooks::Race::ConvergePage);
@@ -1585,10 +1645,10 @@ impl Cluster {
     fn pull_sweep_race(&mut self, to: usize, from: usize, rp: usize, defs: bool) -> Res<()> {
         let results: Rc<RefCell<Vec<crate::Result<RepairOut>>>> = Rc::new(RefCell::new(Vec::new()));
         let cancelled = Rc::new(Cell::new(false));
-        if !self.members[to].old && to != rp {
+        if !self.runs_0_49(to) && to != rp {
             let to_weak = Rc::downgrade(self.members[to].engine.as_ref().unwrap());
             let rp_weak = Rc::downgrade(self.members[rp].engine.as_ref().unwrap());
-            let rp_old = self.members[rp].old;
+            let rp_old = self.runs_0_49(rp);
             let (results, cancelled) = (Rc::clone(&results), Rc::clone(&cancelled));
             crate::late_drop::hooks::run_after_the_next_chunk(move || {
                 if cancelled.get() {
@@ -2050,6 +2110,14 @@ pub(crate) fn minimise(schedule: &Schedule, want: &BTreeSet<String>) -> Schedule
                 shrunk = true;
             }
         }
+        if current.cfg.skip {
+            let mut candidate = current.clone();
+            candidate.cfg.skip = false;
+            if fails(&candidate) {
+                current = candidate;
+                shrunk = true;
+            }
+        }
         if !shrunk {
             return current;
         }
@@ -2096,6 +2164,8 @@ pub(crate) fn generate(seed: u64, len: usize) -> Schedule {
         skew: std::array::from_fn(|_| if rng.below(14) == 0 { 4 } else { rng.below(4) as u8 }),
         keep_oplog: std::array::from_fn(|_| rng.below(2) == 0),
         same_name: rng.below(4) == 0,
+        // Not drawn from the generator, so every seed's steps are what they were.
+        skip: seed % 4 == 3,
     };
     let first = rng.m();
     let mut steps = vec![
@@ -2238,11 +2308,11 @@ pub(crate) fn families() -> Vec<Family> {
             ],
             depth: 4,
         },
-        // What forgets a delete: the 0.49.0 release's passes, a killed start, a restore, a
-        // wipe.
+        // What forgets a delete: the 0.49.0 release's passes (a roll that skips 0.50), a
+        // killed start, a restore, a wipe.
         Family {
             name: "forgetting",
-            cfg: short.clone(),
+            cfg: Config { skip: true, ..short.clone() },
             prefix: vec![
                 Create { m: A, c: O },
                 Pull { to: B, from: A },
@@ -2269,7 +2339,7 @@ pub(crate) fn families() -> Vec<Family> {
         // The same, with this build calling itself 0.49.0 (review revA M1).
         Family {
             name: "forgetting-same-name",
-            cfg: Config { same_name: true, ..short.clone() },
+            cfg: Config { same_name: true, skip: true, ..short.clone() },
             prefix: vec![
                 Create { m: A, c: O },
                 Write { m: A, c: O, d: 1 },
@@ -2337,7 +2407,7 @@ pub(crate) fn families() -> Vec<Family> {
         // The delete already made: what forgets it, under this build's real name, at depth 4.
         Family {
             name: "forgetting-deleted",
-            cfg: short.clone(),
+            cfg: Config { skip: true, ..short.clone() },
             prefix: vec![
                 Create { m: A, c: O },
                 Pull { to: B, from: A },
@@ -2754,6 +2824,7 @@ pub(crate) fn rows_named() -> Vec<(&'static str, Schedule)> {
                     skew: [0, 2, 0],
                     keep_oplog: [true, true, true],
                     same_name: false,
+                    skip: false,
                 },
                 steps: vec![
                     Step::Create { m: 2, c: 0 },

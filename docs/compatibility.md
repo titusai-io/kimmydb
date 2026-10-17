@@ -69,6 +69,18 @@ it.
 | Changing what a route *means* while keeping its shape | The worst kind, because nothing observable changes for a client until its data is wrong |
 | Changing a default | A client that omitted the field gets different behaviour without asking for it |
 
+**Recorded exceptions, 0.51.0 ([ADR-238](decisions.md)).** The release makes
+these changes on purpose, under Breaking in the CHANGELOG, each because the old behaviour
+was wrong in a way no client could have depended on safely: the index's `undecidable`
+field, `explain`'s `undecidableCandidates` and the metric `kimmy_index_undecidable_total`
+are removed (a decimal is decided by its filter, so there is nothing to count); `$sum` and
+`$avg` over a `Decimal128` answer `400` where they skipped the decimal and answered a wrong
+total; a `$numberDecimal` text that is not a number is a `400` where it was stored as one;
+a partial unique index enforces on a `Decimal128` at its filter path, so a write that was
+accepted can be refused; and a stored `Decimal128` is compared by its exact value, which
+changes which documents a filter selects. A client that read the removed field or relied
+on one of these must change; none of them changes a route's shape.
+
 When `/v2` arrives, `/v1` keeps being served for **at least one minor release
 line, and no less than six months from the day `/v2` first ships**, whichever
 is longer. Removal is a release-note event, not a quiet one.
@@ -180,6 +192,25 @@ once, and the 0.49.x member's snapshot of the collection, which holds nothing, l
 pass. No table, schema, wire field, backup tag or entry kind changed; a 0.50.0 member
 relays a drop it ignored and a creation its database's drop refused, as entries a
 0.49.x member reads and judges as it would the originals.
+
+**Decimal128 and storage schema 5 (0.51.0, [ADR-238](decisions.md)) make 0.51.0 a
+rollback boundary to 0.50.x and 0.49.x, and give the roll a declaration.** Every number
+key on disk changes, so the first start migrates the store before it serves (about 16 to 19 minutes
+for 2,000,000 documents with integer `_id`s and three indexes on the lab host) and, from the
+moment it raises the sidecar, a 0.50 or 0.49 build refuses the store; the way back is the
+backup taken before the upgrade. The wire does not change shape: every key a member sends
+or hashes into the cut digest keeps its schema 4 form, so a 0.50 and a 0.51 member in one
+cluster compare and repair as two 0.50 members do, and a 0.51 member's tombstone horizon
+resets at its first start. What a 0.50 member cannot hold is not sent to it: a `Decimal128`
+`_id` fails to decode on 0.50 and 0.49, and a `Decimal128` partial-index bound is refused
+there and never retried, so the creation of either is refused by the operator's declaration
+`cluster.decimal128` (default `false` with clustering on) and by every live peer's
+advertisement. A 0.50 or 0.49 binary refuses a configuration that names the key, and
+**once a decimal `_id` exists a member can no longer be rolled back by wipe and resync**
+(a durable marker records it). A migration that outlasts `storage.oplog_retention_secs`
+turns the member's return into a whole-database snapshot. Two differences outlast the roll
+until a member migrates: its partial unique indexes enforce on decimals (and its TTL
+indexes decide them by exact value), where a 0.50 member's do not.
 
 **A member-at-a-time roll is not evidence that mixed versions work together.**
 The 0.28.0 roll took about 10 s from first member to last, the cluster was

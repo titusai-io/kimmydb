@@ -541,8 +541,9 @@ mod tests {
         // rows to be stopped among.
         const HELD_ORIGIN: kimmy_core::NodeId = kimmy_core::NodeId::from_bytes([7; 16]);
         // Documents, a unique index over them, a compound one that cannot key
-        // the documents with two arrays and a partial one that cannot decide
-        // those with a Decimal128 (ADR-185), deleted documents for
+        // the documents with two arrays, documents holding a Decimal128 (a
+        // partial index once held them in ADR-185's undecidable run, gone
+        // since ADR-238 with the walk that counted it), deleted documents for
         // retention's tombstones, and the marks.
         let fixture = || -> Fixture {
             let (engine, _, dir) = engine_with(10);
@@ -595,19 +596,6 @@ mod tests {
                     vec![field("a"), field("b")],
                     false,
                     Some("ab".into()),
-                )
-                .unwrap();
-            // A partial filter a Decimal128 leaves undecided (ADR-185).
-            engine
-                .create_index_with(
-                    "shop",
-                    "orders",
-                    vec![field("_id")],
-                    false,
-                    Default::default(),
-                    Some("partial".into()),
-                    None,
-                    Some(doc! { "k": { "$gt": 5 } }),
                 )
                 .unwrap();
             let db = engine.db();
@@ -741,10 +729,6 @@ mod tests {
             }),
             // covers: index::holders_of
             ("unkeyed_count", |e, c| e.unkeyed_count(c, c.index("ab").unwrap().id).map(drop)),
-            // covers: index::holders_of
-            ("undecidable_count", |e, c| {
-                e.undecidable_count(c, c.index("partial").unwrap().id).map(drop)
-            }),
             // The candidate walks: in index order, one exact run, exact runs
             // merged, and an inexact range put in key order.
             // covers: index::has_entries_at, index::Walk::in_index_order

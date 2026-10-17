@@ -225,6 +225,19 @@ curl -XDELETE localhost:7878/v1/db/shop/coll/orders/docs/42 -H "$A"
 The `{id}` segment is interpreted by shape: 24 hex characters → ObjectId, an
 integer → integer, anything else → string.
 
+**A `Decimal128` `_id` is reachable by these routes only when it is an
+integer** ([ADR-238](decisions.md)). An integral one in the 64-bit range is the
+integer id of its value: `{"_id": {"$numberDecimal": "5"}}` is the document at
+`docs/5`, and its body keeps the decimal as written. A non-integer one
+(`{"$numberDecimal": "1.5"}`), or one outside the 64-bit range, has no path
+form, since the segment is never read as a decimal: such a document is reached
+through a filter on `_id` only (`find`, `update`, `delete`, `find_and_modify`).
+Creating a document whose `_id` is a `Decimal128`, by any route, is refused
+`400 bad_request` naming `cluster.decimal128` until the operator has set it
+and every live member can hold one
+([Operations](operations.md#clusterdecimal128-and-the-marker)); so is creating
+an index whose `partialFilterExpression` holds a `Decimal128`.
+
 `PUT` returns `{"matched": 0|1, "modified": 0|1, "upserted": true|false}` —
 **counts**, as `update` and `find_and_modify` return, even though a replace
 touches at most one document. Replacement is **not** a merge — unnamed fields
@@ -864,13 +877,16 @@ Full detail in [Change Streams](change-streams.md).
 
 ```bash
 curl localhost:7878/healthz    # {"status":"ok"}
-curl localhost:7878/readyz     # {"status":"ready","node":"9d5200f2-…"}
+curl localhost:7878/readyz     # {"status":"ready","node":"9d5200f2-…","decimal128_id_present":false}
 curl localhost:7878/metrics    # Prometheus text format
 ```
 
 All three are unauthenticated so a load balancer can probe them without
 credentials. `/healthz` is liveness; `/readyz` proves the storage engine
 actually responds, so a node with a wedged database is taken out of rotation.
+A ready answer carries `decimal128_id_present`: whether a document whose `_id`
+is a `Decimal128` has ever been written or applied on this member, the marker
+a rollback reads ([Operations](operations.md#clusterdecimal128-and-the-marker)).
 
 **A node answers these from the moment it binds its port, before its store is
 open** ([ADR-198](decisions.md)). Until the store is open `/healthz` is `200`
@@ -896,7 +912,7 @@ and `owed_members`, the node ids of the members that owe the replay, sorted (nev
 empty under `owed_replay`):
 
 ```json
-{"status":"ready","node":"9d5200f2-…","catching_up":"unknown",
+{"status":"ready","node":"9d5200f2-…","decimal128_id_present":false,"catching_up":"unknown",
  "unknown_because":"owed_replay","owed_members":["4c1e07a9-…"]}
 ```
 
@@ -1000,28 +1016,50 @@ edge uses **Extended JSON v2**:
 Plain JSON keeps working for anything expressible in it — you only meet this
 when you need a type JSON lacks.
 
-**A Decimal128 is stored, returned, and never compared.** `$numberDecimal`
-is read on input and written on output, and the digits come back exactly as
-sent. It cannot be an index key or an `_id` — a document holding one at an
-indexed path is stored and filed under the index's unkeyed run
-([Indexes](indexes.md#documents-an-index-cannot-key)); one as `_id` is
-refused — and it cannot be a filter operand: `{"v": {"$numberDecimal":
-"1.5"}}`, or a Decimal128 under `$eq`, `$ne`, `$gt`, `$gte`, `$lt`, `$lte`,
-`$in`, `$nin`, `$all`, or inside a document or array literal, is `400
-bad_request` saying that a Decimal128 *cannot be compared in a filter*; as a
-literal in an expression, `$expr` included, the `400` says *a Decimal128
-literal is not supported in an expression*. The canonical order has no exact
-place for it — it ranks equal to every other number — so a filter that let
-one through would match every numeric value of the field. A sort over a
-field where a matching document holds one is refused naming the document
-(*cannot sort by "v": document 3 holds a Decimal128 there*), and the update
-operators that compare their operand — `$min`, `$max`, `$pull`,
-`$pullAll` — refuse one (*`$pull` cannot compare a Decimal128 operand*);
-`$type: "decimal"` finds such documents without comparing them
+**A Decimal128 is stored and returned as sent, and compared by its exact
+value.** `$numberDecimal` is read on input and written on output, and the
+digits come back exactly as sent. It is an index key like any number, keyed by
+its exact value, so an index answers a range over it and a unique index
+enforces on it ([Key encoding](key-encoding.md#numbers-the-hard-part)); a
+partial index's filter decides it by value, and a partial unique or TTL index
+enforces and expires by that decision
+([Indexes](indexes.md#a-decimal128-at-a-filtered-path)). It can be an `_id`
+under the gate described [above](#get-replace-delete-by-id). As an operand it is a number like any other: `{"v":
+{"$numberDecimal": "1.5"}}`, and a Decimal128 under `$eq`, `$ne`, `$gt`,
+`$gte`, `$lt`, `$lte`, `$in`, `$nin`, `$all`, inside a document or array
+literal, or as a literal in an expression, `$expr` included, matches the
+values equal to it in any numeric type and spelling, and orders among them by
+value; `0.1` the decimal is not `0.1` the double. A sort places a stored one
+among the numbers, and the update operators that compare their operand —
+`$min`, `$max`, `$pull`, `$pullAll` — compare it by value
 ([Query language](query-language.md#3-comparisons-do-not-cross-type-groups)).
+Until 0.51.0 each of these was refused, `400`, because the canonical order
+ranked a Decimal128 equal to every other number; for the same reason it could
+not be an index key or an `_id` (a document holding one at an indexed path was
+filed under the index's unkeyed run, and one at a partial filter's path in an
+undecidable run that the listing's `undecidable` and `explain`'s
+`undecidableCandidates` counted: both fields are removed in 0.51.0, a breaking
+change for a typed client that declared them).
 Through 0.24.0 the edge did not read `$numberDecimal` at all: the wrapper
 arrived as a nested document, which is why a Decimal128 written to a member
 was keyed there and filed unkeyed on its peers ([ADR-139](decisions.md)).
+
+**The `$numberDecimal` text is a number, read exactly, or a `400`.** The
+syntax is the General Decimal Arithmetic specification's, and nothing else: an
+optional sign, digits with at most one `.` and at least one digit (`1.50`,
+`.5` and `1.` are numbers; `.` is not), an optional exponent of `e` or `E`, an
+optional sign and digits (`1E+3`, `25e-1`); or, in either case, `Infinity`,
+`Inf`, `NaN` or `sNaN`, a NaN with an optional payload of up to 33 digits. No
+white space, ASCII digits only. The value is never rounded: a nonzero digit
+past the 34th, a value below `1E-6176` or with a digit below it, and one above
+`9.999999999999999999999999999999999E+6144` are refused, each with its reason.
+An exact value keeps its written exponent where it fits, and otherwise moves
+only as far as the format requires (`1.0000000000000000000000000000000000000`
+is stored with 34 digits, `1E+6144` as `1000000000000000000000000000000000E+6111`,
+`0E+9999` as `0E+6111`). A refusal names the text: `invalid $numberDecimal:
+"": not a decimal number: …`. **Until 0.51.0** the edge used the `bson`
+crate's parser, which took `""`, `"."` and `"-"` as zero, `"++1"` as `1`,
+`"0+5"` as `5` and `"e100"` as `0E+100`; each is now refused.
 
 **A binary `_id` is echoed with its subtype, but keyed without it.** The ids
 a write or a report answers with (`insertedId`, `insertedIds`, `upsertedId`,

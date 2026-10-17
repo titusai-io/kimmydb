@@ -118,11 +118,7 @@ pub fn describe_collection(
     // (ADR-199).
     kimmy_storage::blocking(|| {
         for index in &meta.indexes {
-            indexes.push(index_to_json(
-                index,
-                state.engine.unkeyed_count(&meta, index.id)?,
-                state.engine.undecidable_count(&meta, index.id)?,
-            ));
+            indexes.push(index_to_json(index, state.engine.unkeyed_count(&meta, index.id)?));
         }
         Ok::<_, kimmy_storage::StorageError>(())
     })?;

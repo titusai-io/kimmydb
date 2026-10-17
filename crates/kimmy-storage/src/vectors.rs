@@ -2735,6 +2735,8 @@ mod tests {
             DocId::Int64(i) => i.to_string(),
             DocId::Binary(b) => format!("bin({} bytes)", b.len()),
             DocId::Uuid(u) => u.to_string(),
+            // No such `_id` existed in 0.50.0; its `Display` is the twin a String collides with.
+            DocId::Decimal128(d) => d.to_string(),
         };
         DocId::String(format!("{display}#{chunk}"))
     }
@@ -2875,6 +2877,41 @@ mod tests {
         assert_eq!(texts_of(&engine, &shadow, &x), ["as generic", "u"]);
         assert_eq!(engine.delete_vectors(&shadow, &x).unwrap(), 2);
         assert!(ids_in(&engine, &shadow).is_empty());
+    }
+
+    /// A `Decimal128` `_id` has chunks of its own, under `~d:` and its canonical bytes: the
+    /// String that is its `Display` text (the twin a display-text id would have shared
+    /// chunks with) keeps separate ones, and deleting either leaves the other's.
+    #[test]
+    fn a_decimal128_id_keeps_its_own_chunks() {
+        let (engine, shadow, _dir) = with_vectors();
+        let decimal =
+            DocId::try_from_bson(&bson::Bson::Decimal128("1.5".parse().unwrap())).unwrap();
+        assert!(matches!(decimal, DocId::Decimal128(_)));
+        let twin = DocId::String(decimal.to_string());
+        put_as(
+            &engine,
+            &shadow,
+            &decimal,
+            &ChunkSource::from(&decimal),
+            &[chunk_of(&decimal, 0, AT, "the decimal")],
+        );
+        put_as(
+            &engine,
+            &shadow,
+            &twin,
+            &ChunkSource::from(&twin),
+            &[chunk_of(&twin, 0, AT, "the string")],
+        );
+        assert_eq!(
+            ids_in(&engine, &shadow),
+            vec!["1.5E+0#0".to_string(), "~d:00ffff0000000000000000000000000000000f#0".to_string()],
+            "the String keeps its 0.50 id and the decimal has its own"
+        );
+        assert_eq!(texts_of(&engine, &shadow, &decimal), ["the decimal"]);
+        assert_eq!(texts_of(&engine, &shadow, &twin), ["the string"]);
+        assert_eq!(engine.delete_vectors(&shadow, &decimal).unwrap(), 1);
+        assert_eq!(texts_of(&engine, &shadow, &twin), ["the string"], "the twin keeps its vectors");
     }
 
     /// Test 9, twins: the Int64 7 and the String `"7"`, an ObjectId and the

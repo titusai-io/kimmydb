@@ -111,17 +111,6 @@ pub struct Engine {
     /// the standing number per index as `unkeyed` on the listing, and this is
     /// the rate, for the metrics endpoint.
     unkeyed_writes: std::sync::atomic::AtomicU64,
-    /// Documents an index holds because its partial filter could not decide
-    /// them, since start ([ADR-185](../../../docs/decisions.md)).
-    ///
-    /// **A series of its own rather than a label on `unkeyed_writes`**, and
-    /// deliberately: that one counts a fault an operator can fix, and an alert
-    /// on it means "someone's documents are not being indexed properly". Adding
-    /// a reason label would have kept the name and quietly changed what the
-    /// unlabelled series counts, so every existing alert on it would start
-    /// firing on ordinary Decimal128 writes. Two names, two meanings, and the
-    /// old one means today what it meant yesterday.
-    undecidable_writes: std::sync::atomic::AtomicU64,
     /// Entries a snapshot restore appended behind the schema it restored, so
     /// that this node can serve them onward (ADR-180), since start. Counted
     /// after the commit that made each one durable, here rather than on the
@@ -255,6 +244,9 @@ pub struct Engine {
     hold_counters: crate::hold_meter::HoldCounters,
     /// What serving peers' windows cost this node (ADR-176).
     serve_counters: crate::hold_meter::ServeCounters,
+    /// The gate on persisting a `Decimal128` id or partial-filter bound
+    /// (ADR-238), as the node installed it.
+    pub(crate) decimal128: crate::decimal128_gate::Decimal128State,
     /// The unique-violations table's state in process (ADR-200).
     violations: crate::violations_table::ViolationsState,
     /// Where the retention pass's tombstone scan resumes next pass
@@ -1393,8 +1385,9 @@ impl Engine {
         // Before anything reads a collection id: schema 1 allocated them from a
         // counter, schema 2 derives them from the name.
         let build = cleared.build.clone();
-        let unreported =
-            crate::migrate::run(&db, &|schema| crate::format::raise_schema(path, schema, &build))?;
+        let unreported = crate::migrate::run(&db, path, &|schema| {
+            crate::format::raise_schema(path, schema, &build)
+        })?;
         // The redb that last opened this store for writing, in the store too,
         // so a clean store whose sidecar is gone is still refused by an older
         // redb's build.
@@ -1471,7 +1464,6 @@ impl Engine {
             path: path.to_path_buf(),
             unique_violations: std::sync::atomic::AtomicU64::new(0),
             unkeyed_writes: std::sync::atomic::AtomicU64::new(0),
-            undecidable_writes: std::sync::atomic::AtomicU64::new(0),
             ddl_relogged: std::sync::atomic::AtomicU64::new(0),
             state_held_refusals: std::sync::atomic::AtomicU64::new(0),
             digest_probe_busy: std::sync::atomic::AtomicBool::new(false),
@@ -1523,6 +1515,7 @@ impl Engine {
             writer_hold_sum_us: std::array::from_fn(|_| std::sync::atomic::AtomicU64::new(0)),
             hold_counters: Default::default(),
             serve_counters: Default::default(),
+            decimal128: Default::default(),
             violations: Default::default(),
             gc_scan_cursor: parking_lot::Mutex::new(None),
             expiry_cursors: Default::default(),
@@ -1542,12 +1535,12 @@ impl Engine {
         for (meta, violations) in &unreported {
             engine.report_index_backfill_violations(meta, violations)?;
         }
-        // Only now, and only if every one of them was reported: they are held in
-        // the store precisely so that a crash before this point does not lose
-        // them, so deleting them any earlier would defeat that.
-        if !unreported.is_empty() {
-            crate::migrate::forget_reported_violations(engine.db())?;
-        }
+        // Only now, once every one of them was reported: they are held in the
+        // store precisely so that a crash before this point does not lose them,
+        // so deleting them any earlier would defeat that. Whatever was reported,
+        // even nothing: rows whose collection or index is gone are not reported,
+        // and would otherwise keep the table for good.
+        crate::migrate::forget_reported_violations(engine.db())?;
 
         // Whether the violations table is complete: after the reports above, so
         // the tail it is compared with includes them (ADR-200).
@@ -2048,12 +2041,6 @@ impl Engine {
         self.unkeyed_writes.load(std::sync::atomic::Ordering::Relaxed)
     }
 
-    /// How many documents an index has held because its partial filter could
-    /// not decide them since start (ADR-185).
-    pub fn undecidable_writes(&self) -> u64 {
-        self.undecidable_writes.load(std::sync::atomic::Ordering::Relaxed)
-    }
-
     /// How many schema changes a snapshot restore has appended to this node's
     /// oplog since start, so that it can serve them onward (ADR-180).
     pub fn ddl_relogged(&self) -> u64 {
@@ -2109,10 +2096,6 @@ impl Engine {
 
     pub(crate) fn count_unkeyed(&self, n: u64) {
         self.unkeyed_writes.fetch_add(n, std::sync::atomic::Ordering::Relaxed);
-    }
-
-    pub(crate) fn count_undecidable(&self, n: u64) {
-        self.undecidable_writes.fetch_add(n, std::sync::atomic::Ordering::Relaxed);
     }
 
     /// What has to follow the commit of an entry a snapshot restore appended
@@ -6116,11 +6099,12 @@ mod tests {
         // Where a commit happens before or outside an open `Engine`, and so
         // cannot be counted by one. Each is a whole-file exemption because each
         // file's entire job is one of these.
-        const NO_ENGINE_YET: [&str; 4] = [
-            "migrate.rs",   // runs on the raw database during `Engine::open`
-            "live_walk.rs", // the open's rebuild of the counts and digests, in chunks
-            "backup.rs",    // restores into a fresh file that no engine has opened
-            "engine.rs",    // `Engine::open` itself, plus the chokepoint
+        const NO_ENGINE_YET: [&str; 5] = [
+            "migrate.rs",    // runs on the raw database during `Engine::open`
+            "migrate_v5.rs", // the schema 5 migration, likewise, a chunk per commit
+            "live_walk.rs",  // the open's rebuild of the counts and digests, in chunks
+            "backup.rs",     // restores into a fresh file that no engine has opened
+            "engine.rs",     // `Engine::open` itself, plus the chokepoint
         ];
 
         let src = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
@@ -8287,8 +8271,13 @@ mod converted_filters_line {
     }
 }
 
-/// Whole-table clears, held to the bound redb's `retain` breaks (see
-/// `index::clear_index_entries`).
+/// Whole-table clears, held to a bound on how far they grow the file.
+///
+/// These are growth-bound smoke tests, not detectors of redb's `retain`: on redb 4.2 and
+/// later `retain` is no longer measurably worse than removing by key (see
+/// `index::clear_index_entries`), and a `retain` mutant of the arrival-index clear passes
+/// them, at 5,000 documents and at 200,000. They catch a clear that grows the file well
+/// past one rebuild's own need, whatever the cause.
 #[cfg(test)]
 mod clearing {
     use bson::doc;
@@ -8302,7 +8291,7 @@ mod clearing {
         assert!(
             after <= before + before / 4,
             "{what} grew the file from {before} to {after} bytes; a clear that grows the file \
-             is retain's cost, see index::clear_index_entries"
+             past a rebuild's own need is the cost index::clear_index_entries was written to avoid"
         );
     }
 
@@ -8311,16 +8300,22 @@ mod clearing {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("kimmy.redb");
         one_arrival_row_short(&path);
-        // A first rebuild settles the file: redb doubles it when it runs out of room, and
-        // whether a small clear runs out depends on where the last page of the store
-        // happened to land, which is not what this test is about. The rebuild measured is the
-        // second, from a file that has already had to hold the first.
-        drop(super::Engine::open(&path).unwrap());
+        // The file is measured **while the engine is open**: redb hands growth back within a
+        // commit or two, and closing the engine commits (and can truncate the file). So the
+        // figure that means something is the high-water mark of a rebuild, and what the bound
+        // asks is that a further rebuild needs no more room than the earlier ones already did.
+        // Those earlier rebuilds are the settling: the peak depends on where the last page of
+        // the store happened to land (it alternates between two figures here), which is not
+        // what this test is about, so the bound is on the largest of several.
+        let mut settled = 0;
+        for _ in 0..3 {
+            let engine = super::Engine::open(&path).unwrap();
+            settled = settled.max(file(&path));
+            drop(engine);
+            drop_the_last_arrival_row(&path);
+        }
         let written = drop_the_last_arrival_row(&path);
-        let before = file(&path);
 
-        // Measured with the engine still open: redb hands the growth back
-        // within a commit or two, and closing the engine commits.
         let engine = super::Engine::open(&path).unwrap();
         let during = file(&path);
         drop(engine);
@@ -8335,7 +8330,7 @@ mod clearing {
         // too would leave all three empty and equal.
         assert_eq!(oplog, written, "the oplog the index is rebuilt from is untouched");
         assert_eq!((arrival, by_stamp), (oplog, oplog), "premise: the index was rebuilt");
-        assert_no_growth(before, during, "rebuilding the arrival index");
+        assert_no_growth(settled, during, "rebuilding the arrival index");
     }
 
     /// A database of 5,000 documents whose arrival index is one row short,

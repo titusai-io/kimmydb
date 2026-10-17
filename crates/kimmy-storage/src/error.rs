@@ -28,24 +28,25 @@ pub enum StorageError {
     Io(#[from] std::io::Error),
 
     /// Partial index definitions an earlier build stored that this build
-    /// refuses to parse, found by the schema 3 -> 4 migration before it
-    /// rebuilt anything (ADR-183).
+    /// refuses to parse, found by the schema migration before it rebuilt
+    /// anything (ADR-183, ADR-238).
     ///
-    /// The migration's whole job is to rebuild each partial index to hold what
-    /// `find` with its filter selects, and it cannot know what an index should
-    /// hold from a filter it cannot read. Refusing at open confines the
-    /// condition to schema 3 files, which is what lets ADR-181 call it
-    /// transient and decline a metric for it. Nothing is written: the on-disk
-    /// version is left as it was and no index entries were cleared.
+    /// The migration rebuilds every index from its definition, and it cannot
+    /// know what an index should hold from a filter it cannot read. Refusing
+    /// at open confines the condition to files older than this build's schema,
+    /// which is what lets ADR-181 call it transient and decline a metric for
+    /// it. Nothing is written: the on-disk version is left as it was and no
+    /// index entries were cleared.
     ///
     /// **What an operator can do depends on that version**, which is why the
     /// message asks `unparseable_filter_remedy` rather than stating one. Below
-    /// schema 4 the previous build still opens the directory, so the index can
-    /// be dropped there and the upgrade retried. At schema 4 -- a refusal while
-    /// resuming an interrupted migration -- neither build opens it: that one
-    /// refuses the schema and this one refuses the definition.
+    /// this build's schema the previous build still opens the directory, so the
+    /// index can be dropped there and the upgrade retried. At this build's
+    /// schema -- a refusal while resuming an interrupted migration -- neither
+    /// build opens it: that one refuses the schema and this one refuses the
+    /// definition.
     #[error(
-        "this build cannot parse {} stored partial index definition(s), so the schema 3 to 4 \
+        "this build cannot parse {} stored partial index definition(s), so the schema \
          migration cannot know what those indexes should hold. This attempt changed nothing: \
          the on-disk version is still {found} and no index entries were cleared. Refused: {}. \
          {}",
@@ -54,6 +55,17 @@ pub enum StorageError {
         unparseable_filter_remedy(*found)
     )]
     UnparseablePartialFilter { found: u8, refused: Vec<String> },
+
+    /// The storage schema migration needs more free space beside the store
+    /// than the volume has (ADR-238, design 6.1 step 0). Refused before the
+    /// sidecar is raised, so nothing the migration owns was written; `detail`
+    /// says how `needed` is made up and what state the store is left in.
+    #[error(
+        "the storage schema migration needs {} MiB free and {} MiB is free, {detail}",
+        needed >> 20,
+        free >> 20
+    )]
+    NotEnoughSpace { needed: u64, free: u64, detail: String },
 
     /// A conditional write found a different version than the caller expected.
     ///
@@ -200,20 +212,20 @@ impl std::fmt::Display for Applied {
 /// What an operator can actually do about a stored partial filter this build
 /// refuses, which depends on the version the file is at.
 ///
-/// Below schema 4 the previous build still opens the directory, so the index can
-/// be dropped there and the upgrade retried. At schema 4 it cannot: that build
-/// refuses the schema and this one refuses the definition, so no build can serve
-/// the directory until the definition is gone. That state needs a migration to
-/// have been interrupted *and* a filter this build refuses, so it is close to
-/// unreachable -- but saying "use the previous build" there would be advice that
-/// cannot be followed.
+/// Below this build's schema the previous build still opens the directory, so
+/// the index can be dropped there and the upgrade retried. At this build's
+/// schema it cannot: that build refuses the schema and this one refuses the
+/// definition, so no build can serve the directory until the definition is
+/// gone. That state needs a migration to have been interrupted *and* a filter
+/// this build refuses, so it is close to unreachable -- but saying "use the
+/// previous build" there would be advice that cannot be followed.
 fn unparseable_filter_remedy(found: u8) -> &'static str {
-    if found < 4 {
+    if found < crate::migrate::SCHEMA_VERSION {
         "To proceed, start this data directory with the previous build, drop each index named \
          above -- recreating it with a filter this build accepts -- and upgrade again"
     } else {
         "This directory cannot be opened by either build until that definition is gone: the \
-         previous build refuses schema 4, and this one refuses the definition. Wipe the data \
+         previous build refuses this schema, and this one refuses the definition. Wipe the data \
          directory and let the member catch up from its peers, or restore a backup taken \
          before the upgrade"
     }

@@ -5,6 +5,8 @@ use std::fmt;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
+use crate::decimal::{self, Decimal};
+
 /// Stable identity of a node in the cluster.
 ///
 /// Generated once on first start and persisted, so a restarting node keeps its
@@ -204,6 +206,9 @@ pub enum DocId {
     Int64(i64),
     Binary(Vec<u8>),
     Uuid(Uuid),
+    /// A `Decimal128` that is not an integer in `i64` range. An integer one is
+    /// [`DocId::Int64`]. Appended last: serde numbers variants by position.
+    Decimal128(Decimal128Id),
 }
 
 impl DocId {
@@ -214,6 +219,12 @@ impl DocId {
 
     /// Convert from a user-supplied `_id` value, rejecting types that cannot
     /// serve as a primary key.
+    ///
+    /// A `Decimal128` that is an integer in `i64` range is the `Int64` of that
+    /// value — `_id: Decimal128("5")`, `Int32(5)` and `Int64(5)` are one document,
+    /// as the exact order says they are one value. Any other finite `Decimal128`
+    /// is [`DocId::Decimal128`]; NaN and the infinities are refused (legal keys,
+    /// poor identifiers, easy to relax later).
     pub fn try_from_bson(value: &bson::Bson) -> crate::Result<Self> {
         match value {
             bson::Bson::ObjectId(oid) => Ok(Self::ObjectId(*oid)),
@@ -221,6 +232,16 @@ impl DocId {
             bson::Bson::Int32(i) => Ok(Self::Int64(i64::from(*i))),
             bson::Bson::Int64(i) => Ok(Self::Int64(*i)),
             bson::Bson::Binary(b) => Ok(Self::Binary(b.bytes.clone())),
+            bson::Bson::Decimal128(d) => match decimal::decode(d) {
+                Decimal::Zero => Ok(Self::Int64(0)),
+                finite @ Decimal::Finite { .. } => {
+                    let id = Decimal128Id::from_normalized(finite.normalized());
+                    Ok(id.as_i64().map_or(Self::Decimal128(id), Self::Int64))
+                }
+                Decimal::Nan | Decimal::NegInfinity | Decimal::PosInfinity => {
+                    Err(crate::Error::InvalidDocumentId { found: "Decimal128 (not finite)".into() })
+                }
+            },
             other => Err(crate::Error::InvalidDocumentId {
                 found: format!("{:?}", other.element_type()),
             }),
@@ -240,6 +261,7 @@ impl DocId {
                 subtype: bson::spec::BinarySubtype::Uuid,
                 bytes: u.as_bytes().to_vec(),
             }),
+            Self::Decimal128(d) => bson::Bson::Decimal128(d.to_decimal128()),
         }
     }
 }
@@ -252,7 +274,140 @@ impl fmt::Display for DocId {
             Self::Int64(i) => write!(f, "{i}"),
             Self::Binary(b) => write!(f, "bin({} bytes)", b.len()),
             Self::Uuid(u) => write!(f, "{u}"),
+            Self::Decimal128(d) => write!(f, "{d}"),
         }
+    }
+}
+
+/// A finite, non-zero `Decimal128` in canonical form, as a document id.
+///
+/// The value is `±coefficient × 10^exponent` with the coefficient stripped of
+/// trailing decimal zeros and the exponent raised to match, so **equal values are
+/// equal ids** (`1.0` and `1.00` are one id). The exponent may therefore leave
+/// BID's range (`1E+6144` is `1E6144`); [`Decimal128Id::to_decimal128`] pads it
+/// back. Zero cannot occur (it is `Int64(0)`), nor can an integer that fits
+/// `i64`.
+///
+/// The byte form (the stored codec and the serde form) is 19 bytes: the sign, the
+/// exponent as a big-endian `i16`, the coefficient as a big-endian `u128`. BSON
+/// has no 128-bit integer, so the coefficient is never a BSON integer.
+///
+/// The derived order is the order of those bytes' fields, **not** numeric order.
+/// Nothing may order ids by it; the numeric order is the key's.
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Debug)]
+pub struct Decimal128Id {
+    negative: bool,
+    exponent: i16,
+    coefficient: u128,
+}
+
+/// The width of [`Decimal128Id::to_bytes`].
+pub const DECIMAL128_ID_LEN: usize = 19;
+
+impl Decimal128Id {
+    fn from_normalized(d: Decimal) -> Self {
+        let Decimal::Finite { negative, coefficient, exponent } = d else {
+            unreachable!("only finite values are ids")
+        };
+        Self { negative, exponent, coefficient }
+    }
+
+    /// The canonical bytes: `sign (1) ‖ exponent (2) ‖ coefficient (16)`.
+    pub fn to_bytes(self) -> [u8; DECIMAL128_ID_LEN] {
+        let mut out = [0u8; DECIMAL128_ID_LEN];
+        out[0] = u8::from(self.negative);
+        out[1..3].copy_from_slice(&self.exponent.to_be_bytes());
+        out[3..].copy_from_slice(&self.coefficient.to_be_bytes());
+        out
+    }
+
+    /// Read the canonical bytes, refusing anything [`Self::to_bytes`] would not
+    /// have written: another length, a sign other than 0 or 1, a pair no
+    /// `Decimal128` holds ([`decimal::representable`]: a zero or out-of-range
+    /// coefficient, one with a trailing zero digit, an exponent below BID's
+    /// minimum, or an exponent and digit count above the largest value,
+    /// `e + digits(c) > 6111 + 34`), or a value that is an `i64` (that is
+    /// `DocId::Int64`). What it accepts is exactly what [`Self::to_bytes`]
+    /// writes, so [`Self::to_decimal128`] holds for every id a peer can send.
+    pub fn from_bytes(bytes: &[u8]) -> Option<Self> {
+        let bytes: &[u8; DECIMAL128_ID_LEN] = bytes.try_into().ok()?;
+        let negative = match bytes[0] {
+            0 => false,
+            1 => true,
+            _ => return None,
+        };
+        let exponent = i16::from_be_bytes([bytes[1], bytes[2]]);
+        let coefficient = u128::from_be_bytes(bytes[3..].try_into().ok()?);
+        let id = Self { negative, exponent, coefficient };
+        (decimal::representable(coefficient, exponent) && id.as_i64().is_none()).then_some(id)
+    }
+
+    /// The `Decimal128` this id denotes, in canonical BID (the exponent padded
+    /// back into range, which always fits because the original did).
+    pub fn to_decimal128(self) -> bson::Decimal128 {
+        decimal::pack_padded(self.negative, self.coefficient, self.exponent).expect(
+            "an id is a value a Decimal128 holds: from_normalized reads one, and from_bytes \
+             admits nothing else",
+        )
+    }
+
+    /// The value as an `i64`, if it is an integer in range.
+    fn as_i64(self) -> Option<i64> {
+        let mut magnitude = self.coefficient;
+        if self.exponent < 0 {
+            // Normalised: no trailing zeros to shed, so a negative exponent is a
+            // fraction.
+            return None;
+        }
+        for _ in 0..self.exponent {
+            magnitude = magnitude.checked_mul(10)?;
+            if magnitude > 1u128 << 63 {
+                return None;
+            }
+        }
+        if self.negative {
+            if magnitude == 1u128 << 63 {
+                Some(i64::MIN)
+            } else {
+                i64::try_from(magnitude).ok().map(|m| -m)
+            }
+        } else {
+            i64::try_from(magnitude).ok()
+        }
+    }
+}
+
+/// A bounded canonical scientific form that is also injective: the normalised
+/// digits and the adjusted exponent, never the plain decimal (about 6,000
+/// characters at either extreme) and never truncated digits. A vector chunk id is
+/// `{source}#{chunk}`, so two ids that printed alike would share chunks, and a
+/// duplicate-key message must name the right id.
+impl fmt::Display for Decimal128Id {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let digits = self.coefficient.to_string();
+        let adjusted = i32::from(self.exponent) + digits.len() as i32 - 1;
+        if self.negative {
+            f.write_str("-")?;
+        }
+        f.write_str(&digits[..1])?;
+        if digits.len() > 1 {
+            write!(f, ".{}", &digits[1..])?;
+        }
+        write!(f, "E{adjusted:+}")
+    }
+}
+
+impl Serialize for Decimal128Id {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serde_bytes::serialize(&self.to_bytes()[..], serializer)
+    }
+}
+
+impl<'de> Deserialize<'de> for Decimal128Id {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let bytes: Vec<u8> = serde_bytes::deserialize(deserializer)?;
+        Self::from_bytes(&bytes)
+            .ok_or_else(|| serde::de::Error::custom("not a canonical Decimal128 document id"))
     }
 }
 
@@ -274,6 +429,249 @@ mod tests {
         assert_eq!(id, DocId::Int64(7));
         // Otherwise `{_id: 7}` inserted as int32 and looked up as int64 would miss.
         assert_eq!(DocId::try_from_bson(&bson::Bson::Int64(7)).unwrap(), id);
+    }
+
+    fn dec(s: &str) -> bson::Bson {
+        bson::Bson::Decimal128(s.parse().unwrap())
+    }
+
+    fn id(s: &str) -> DocId {
+        DocId::try_from_bson(&dec(s)).unwrap()
+    }
+
+    #[test]
+    fn an_integral_decimal_in_i64_range_is_the_int64_of_its_value() {
+        for (text, want) in [
+            ("5", 5i64),
+            ("5.00", 5),
+            ("50E-1", 5),
+            ("0.5E+1", 5),
+            ("-0", 0),
+            ("0", 0),
+            ("0E-100", 0),
+            ("0E+6111", 0),
+            ("9223372036854775807", i64::MAX),
+            ("-9223372036854775808", i64::MIN),
+            ("-92233720368547758080E-1", i64::MIN),
+            ("1E+18", 1_000_000_000_000_000_000),
+        ] {
+            assert_eq!(id(text), DocId::Int64(want), "{text}");
+        }
+        // Int32, Int64 and an equal decimal are one id.
+        assert_eq!(id("7"), DocId::try_from_bson(&bson::Bson::Int32(7)).unwrap());
+    }
+
+    #[test]
+    fn a_non_zero_non_i64_decimal_is_a_decimal_id() {
+        for text in [
+            "1.5",
+            "-1.5",
+            "0.1",
+            "9223372036854775808",
+            "-9223372036854775809",
+            "1E+19",
+            "1E+6112",
+            "1E+6144",
+            "9.999999999999999999999999999999999E+6144",
+            "1E-6176",
+            "1.000000000000000000000000000000001E-6143",
+        ] {
+            assert!(matches!(id(text), DocId::Decimal128(_)), "{text}");
+        }
+    }
+
+    #[test]
+    fn equal_decimals_are_one_id_and_unequal_ones_are_not() {
+        assert_eq!(id("1.5"), id("1.50"));
+        assert_eq!(id("1.5"), id("15E-1"));
+        assert_eq!(id("1.5").to_string(), id("1.500").to_string());
+        assert_ne!(id("1.5"), id("-1.5"));
+        assert_ne!(id("1.5"), id("1.6"));
+        assert_ne!(id("1E+6144"), id("1E+6143"));
+    }
+
+    #[test]
+    fn nan_and_infinity_are_refused_as_ids() {
+        for text in ["NaN", "-NaN", "Infinity", "-Infinity"] {
+            assert!(DocId::try_from_bson(&dec(text)).is_err(), "{text}");
+        }
+    }
+
+    #[test]
+    fn to_bson_repads_an_exponent_above_the_bid_range() {
+        // Normalised `1E+6144` is c = 1, e = 6144, which BID cannot hold: packed
+        // straight in it would read back as a non-canonical zero and key like
+        // `_id: 0`.
+        for text in ["1E+6112", "1E+6144", "-1E+6144", "9.999999999999999999999999999999999E+6144"]
+        {
+            let original = dec(text);
+            let back = id(text).to_bson();
+            assert_eq!(back, original, "{text}");
+            let bson::Bson::Decimal128(d) = back else { panic!("decimal") };
+            assert_ne!(decimal::decode(&d), Decimal::Zero, "{text} read back as zero");
+        }
+    }
+
+    #[test]
+    fn the_byte_form_round_trips_and_is_canonical() {
+        for text in ["1.5", "-1.5", "1E+6144", "1E-6176", "0.1", "1E+19", "123456789.987654321"] {
+            let DocId::Decimal128(d) = id(text) else { panic!("{text}") };
+            let bytes = d.to_bytes();
+            assert_eq!(bytes.len(), DECIMAL128_ID_LEN);
+            assert_eq!(Decimal128Id::from_bytes(&bytes), Some(d), "{text}");
+        }
+        let DocId::Decimal128(d) = id("1.5") else { panic!() };
+        let mut bytes = d.to_bytes();
+        // Everything to_bytes would not write is refused.
+        assert_eq!(Decimal128Id::from_bytes(&bytes[..18]), None);
+        bytes[0] = 2;
+        assert_eq!(Decimal128Id::from_bytes(&bytes), None, "a sign other than 0 or 1");
+        let mut zero = d.to_bytes();
+        zero[3..].fill(0);
+        assert_eq!(Decimal128Id::from_bytes(&zero), None, "a zero coefficient");
+        let mut trailing = d.to_bytes();
+        trailing[3..].copy_from_slice(&150u128.to_be_bytes());
+        assert_eq!(Decimal128Id::from_bytes(&trailing), None, "a coefficient ending in 0");
+        let mut integer = d.to_bytes();
+        integer[1..3].copy_from_slice(&0i16.to_be_bytes());
+        integer[3..].copy_from_slice(&5u128.to_be_bytes());
+        assert_eq!(Decimal128Id::from_bytes(&integer), None, "an i64 is DocId::Int64");
+
+        // The largest values: an exponent and digit count past `1E+6144` and
+        // `9.99…E+6144` is no `Decimal128`, and once reached `to_bson` panicked.
+        let pair = |c: u128, e: i16| {
+            let mut bytes = [0u8; DECIMAL128_ID_LEN];
+            bytes[1..3].copy_from_slice(&e.to_be_bytes());
+            bytes[3..].copy_from_slice(&c.to_be_bytes());
+            Decimal128Id::from_bytes(&bytes)
+        };
+        for (c, e) in [
+            (12, 6144),
+            (1, 6145),
+            (decimal::MAX_COEFFICIENT, 6112),
+            (99, 6144),
+            (1, i16::MAX),
+            (1, decimal::MIN_EXPONENT - 1),
+            (1, i16::MIN),
+        ] {
+            assert_eq!(pair(c, e), None, "{c}E{e} is no Decimal128");
+        }
+        for (c, e) in
+            [(1, 6144), (12, 6143), (decimal::MAX_COEFFICIENT, 6111), (1, decimal::MIN_EXPONENT)]
+        {
+            let id = pair(c, e).unwrap_or_else(|| panic!("{c}E{e} is a Decimal128"));
+            let back = DocId::try_from_bson(&DocId::Decimal128(id).to_bson()).unwrap();
+            assert_eq!(back, DocId::Decimal128(id), "{c}E{e}");
+        }
+    }
+
+    use proptest::strategy::Strategy as _;
+
+    proptest::proptest! {
+        /// Every byte string `from_bytes` accepts is an id that reads back
+        /// through `to_bson`, without a panic, as itself; the bytes are biased
+        /// toward the edges a peer's frame could carry.
+        #[test]
+        fn every_accepted_byte_string_round_trips_through_to_bson(
+            sign in proptest::prop_oneof![0u8..=1, proptest::prelude::any::<u8>()],
+            e in proptest::prop_oneof![
+                proptest::prelude::any::<i16>(),
+                6100i16..=6150,
+                (decimal::MIN_EXPONENT - 3)..=(decimal::MIN_EXPONENT + 3),
+                -40i16..=40,
+            ],
+            c in proptest::prop_oneof![
+                proptest::prelude::any::<u128>(),
+                1..=decimal::MAX_COEFFICIENT,
+                1..100_000u128,
+                (0u32..=38).prop_map(|k| 10u128.pow(k).saturating_sub(1)),
+                (0u32..34).prop_map(|k| 10u128.pow(k) + 1),
+            ],
+        ) {
+            let mut bytes = [0u8; DECIMAL128_ID_LEN];
+            bytes[0] = sign;
+            bytes[1..3].copy_from_slice(&e.to_be_bytes());
+            bytes[3..].copy_from_slice(&c.to_be_bytes());
+            if let Some(id) = Decimal128Id::from_bytes(&bytes) {
+                let value = DocId::Decimal128(id).to_bson();
+                proptest::prop_assert_eq!(DocId::try_from_bson(&value).unwrap(), DocId::Decimal128(id));
+                proptest::prop_assert_eq!(id.to_bytes(), bytes);
+            }
+        }
+    }
+
+    #[test]
+    fn the_serde_form_is_the_19_bytes() {
+        #[derive(Serialize, Deserialize, PartialEq, Debug)]
+        struct W {
+            id: DocId,
+        }
+        for text in ["1.5", "-0.1", "1E+6144", "1E-6176"] {
+            let w = W { id: id(text) };
+            let doc = bson::serialize_to_document(&w).unwrap();
+            // An enum is `{ variant: payload }`; the payload is binary.
+            let inner = doc.get_document("id").unwrap();
+            let bson::Bson::Binary(b) = inner.get("Decimal128").expect("variant") else {
+                panic!("the payload is binary: {doc:?}")
+            };
+            assert_eq!(b.bytes.len(), DECIMAL128_ID_LEN, "{text}");
+            let back: W = bson::deserialize_from_document(doc).unwrap();
+            assert_eq!(back, w, "{text}");
+        }
+        // Appended last: the earlier variants keep their serde position.
+        let doc = bson::serialize_to_document(&W { id: DocId::Int64(3) }).unwrap();
+        assert!(doc.get_document("id").unwrap().contains_key("Int64"));
+    }
+
+    #[test]
+    fn a_corrupt_decimal_id_is_refused_on_decode_not_trusted() {
+        #[derive(Deserialize, Debug)]
+        struct W {
+            #[allow(dead_code)]
+            id: DocId,
+        }
+        let doc = bson::doc! { "id": { "Decimal128": bson::Binary {
+            subtype: bson::spec::BinarySubtype::Generic,
+            bytes: vec![0u8; DECIMAL128_ID_LEN],
+        } } };
+        assert!(bson::deserialize_from_document::<W>(doc).is_err());
+    }
+
+    #[test]
+    fn display_is_bounded_canonical_and_injective() {
+        let texts = [
+            "1.5",
+            "-1.5",
+            "0.15",
+            "15",
+            "1.50",
+            "150E-2",
+            "1E+19",
+            "1E+6144",
+            "1E+6112",
+            "9.999999999999999999999999999999999E+6144",
+            "1E-6176",
+            "1.5E+19",
+            "1.5E-19",
+        ];
+        let mut seen = std::collections::HashMap::new();
+        for text in texts {
+            let shown = id(text).to_string();
+            assert!(shown.len() <= 48, "{text} prints {} chars", shown.len());
+            if let Some(prior) = seen.insert(shown.clone(), text) {
+                let a: bson::Decimal128 = prior.parse().unwrap();
+                let b: bson::Decimal128 = text.parse().unwrap();
+                assert_eq!(
+                    decimal::decode(&a).normalized(),
+                    decimal::decode(&b).normalized(),
+                    "{prior} and {text} print alike ({shown}) but are different values"
+                );
+            }
+        }
+        assert_eq!(id("1.5").to_string(), "1.5E+0");
+        assert_eq!(id("-0.15").to_string(), "-1.5E-1");
+        assert_eq!(id("1E+19").to_string(), "1E+19");
+        assert_eq!(id("1.50").to_string(), id("1.5").to_string());
     }
 
     #[test]

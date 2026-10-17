@@ -10,11 +10,13 @@ pub mod cmp;
 pub mod conflict;
 pub mod cursor;
 pub mod ddl;
+pub mod decimal;
 pub mod error;
 pub mod hlc;
 pub mod ids;
 pub mod index_meta;
 pub mod keyenc;
+pub mod legacy_key;
 pub mod matching;
 pub mod oplog;
 pub mod partial;
@@ -30,10 +32,11 @@ pub use cursor::Cursor;
 pub use ddl::{
     CollectionRef, DATABASE_DROP_NAME, IndexCreate, IndexDrop, VectorSet, database_drop_id,
 };
-pub use error::{Error, Result};
+pub use error::{Decimal128Closed, Decimal128Use, Error, Result};
 pub use hlc::{HLC_ENCODED_LEN, Hlc, HlcClock, Stamp};
-pub use ids::{CollectionId, DocId, NodeId};
+pub use ids::{CollectionId, DECIMAL128_ID_LEN, Decimal128Id, DocId, NodeId};
 pub use index_meta::{Enforcement, IndexField, IndexMeta};
+pub use legacy_key::LegacyKey;
 pub use oplog::{Issued, MAX_TOKEN_ORIGINS, OpKind, OplogEntry, ResumeToken};
 pub use partial::{PartialFilter, PartialOp};
 pub use record::DocRecord;

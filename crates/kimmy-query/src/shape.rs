@@ -2,7 +2,7 @@
 //! filtering has decided its membership.
 
 use bson::{Bson, Document};
-use kimmy_core::cmp::{canonical_cmp, holds_decimal128};
+use kimmy_core::cmp::canonical_cmp;
 use kimmy_core::{Error, Result};
 use std::cmp::Ordering;
 use std::collections::HashMap;
@@ -29,6 +29,9 @@ pub fn parse_sort(doc: &Document) -> Result<Vec<SortKey>> {
             let descending = match direction {
                 Bson::Int32(1) | Bson::Int64(1) | Bson::Double(1.0) => false,
                 Bson::Int32(-1) | Bson::Int64(-1) | Bson::Double(-1.0) => true,
+                // A decimal direction by its value, as `1.0` and `-1.0` are.
+                Bson::Decimal128(d) if kimmy_core::decimal::whole_number(d) == Some(1) => false,
+                Bson::Decimal128(d) if kimmy_core::decimal::whole_number(d) == Some(-1) => true,
                 _ => {
                     return Err(Error::InvalidQuery(format!(
                         "sort direction for {path:?} must be 1 or -1"
@@ -112,40 +115,13 @@ fn sort_value(doc: &Document, path: &str) -> Bson {
 
 /// Sort documents in place.
 ///
-/// The caller has asked [`refuse_unsortable`] about every document first;
-/// this comparator has no way to refuse one.
+/// Every value has a place in the canonical order, a `Decimal128` among the
+/// numbers by its exact value, so there is no document this can fail to place.
 pub fn sort(keys: &[SortKey], docs: &mut [Document]) {
     if keys.is_empty() {
         return;
     }
     docs.sort_by(|a, b| compare(keys, a, b));
-}
-
-/// Why `keys` cannot order `doc`, if they cannot.
-///
-/// `canonical_cmp` ranks a `Decimal128` equal to every other number, which is
-/// not an order a sort can use: the document would land somewhere among the
-/// numbers that depended on which of them it happened to be compared with.
-/// Every place that sorts documents by keys asks this before it compares, so
-/// the refusal names the document and the path rather than placing it
-/// nowhere in particular. The path is resolved the way [`compare`] resolves
-/// it, so a Decimal128 inside an array or a document at the path counts.
-pub fn unsortable(keys: &[SortKey], doc: &Document) -> Option<String> {
-    let key = keys
-        .iter()
-        .find(|key| path::resolve(doc, &key.path).iter().any(|v| holds_decimal128(v)))?;
-    let id = doc.get(ID_FIELD).map_or_else(|| "?".to_string(), Bson::to_string);
-    Some(format!(
-        "cannot sort by {:?}: document {id} holds a Decimal128 there, which cannot be compared: \
-         it has no exact key encoding in this engine and ranks equal to every other number; \
-         store a double or a long instead",
-        key.path
-    ))
-}
-
-/// [`unsortable`], as the refusal a query returns.
-pub fn refuse_unsortable(keys: &[SortKey], doc: &Document) -> Result<()> {
-    unsortable(keys, doc).map_or(Ok(()), |why| Err(Error::InvalidQuery(why)))
 }
 
 // ---------------------------------------------------------------------------
@@ -192,7 +168,18 @@ pub fn parse_projection(doc: &Document) -> Result<Option<Projection>> {
     for (path, flag) in doc {
         let keep = match flag {
             Bson::Int32(0) | Bson::Int64(0) | Bson::Double(0.0) | Bson::Boolean(false) => false,
-            Bson::Int32(_) | Bson::Int64(_) | Bson::Double(_) | Bson::Boolean(true) => true,
+            // A decimal flag reads as the number it is, as a double does: zero
+            // excludes, anything else includes.
+            Bson::Decimal128(d)
+                if kimmy_core::decimal::decode(d) == kimmy_core::decimal::Decimal::Zero =>
+            {
+                false
+            }
+            Bson::Int32(_)
+            | Bson::Int64(_)
+            | Bson::Double(_)
+            | Bson::Decimal128(_)
+            | Bson::Boolean(true) => true,
             // `{items: {$slice: 3}}`, `{items: {$elemMatch: {...}}}`: a
             // projection operator, which this projection language does not
             // have. Named, so the refusal says what was asked for rather than
@@ -987,30 +974,77 @@ mod decimal128 {
     use super::*;
     use bson::doc;
 
+    fn dec(text: &str) -> Bson {
+        Bson::Decimal128(text.parse().unwrap())
+    }
+
+    fn ids(docs: &[Document]) -> Vec<i32> {
+        docs.iter().map(|d| d.get_i32("_id").unwrap()).collect()
+    }
+
+    /// A sort over a path holding decimals takes each to its place among the
+    /// numbers, by its exact value: before `2` and after `1`, `0.1` the
+    /// decimal before `0.1` the double, a cohort (`2`, `2.00`) tied and kept in
+    /// input order, and wherever the sort reads it, inside an array or a
+    /// sub-document. It used to be refused naming the document.
     #[test]
-    fn a_document_holding_a_decimal128_at_a_sort_path_is_refused_by_name() {
-        // Wherever the sort would read it: at the path, inside an array at
-        // the path, or in a document the path descends into.
-        let keys = parse_sort(&doc! { "qty": 1, "meta.rank": -1 }).unwrap();
-        let d = Bson::Decimal128("2".parse().unwrap());
-        for held in [
-            doc! { "_id": 7, "qty": d.clone() },
-            doc! { "_id": 7, "qty": [1, d.clone()] },
-            doc! { "_id": 7, "meta": { "rank": d.clone() } },
-            doc! { "_id": 7, "meta": [{ "rank": d.clone() }] },
-        ] {
-            let why =
-                unsortable(&keys, &held).unwrap_or_else(|| panic!("{held} should be refused"));
-            assert!(why.contains("cannot sort by"), "{why}");
-            assert!(why.contains("document 7"), "names the document: {why}");
-            assert!(why.contains("Decimal128"), "{why}");
-            assert!(refuse_unsortable(&keys, &held).is_err());
+    fn a_decimal128_at_a_sort_path_takes_its_place_among_the_numbers() {
+        let docs = vec![
+            doc! { "_id": 1, "v": 2 },
+            doc! { "_id": 2, "v": dec("1.5") },
+            doc! { "_id": 3, "v": 1 },
+            doc! { "_id": 4, "v": Bson::Double(0.1) },
+            doc! { "_id": 5, "v": dec("0.1") },
+            doc! { "_id": 6, "v": dec("2.00") },
+            doc! { "_id": 7, "v": dec("-Infinity") },
+            doc! { "_id": 8, "v": "s" },
+            doc! { "_id": 9, "v": dec("1E+400") },
+            doc! { "_id": 10, "v": Bson::Double(f64::INFINITY) },
+            doc! { "_id": 11, "v": dec("NaN") },
+        ];
+        let up = sorted(doc! { "v": 1 }, docs.clone());
+        assert_eq!(ids(&up), vec![11, 7, 5, 4, 3, 2, 1, 6, 9, 10, 8]);
+        let down = sorted(doc! { "v": -1 }, docs);
+        assert_eq!(ids(&down), vec![8, 10, 9, 1, 6, 2, 3, 4, 5, 7, 11]);
+
+        // Inside an array (the least element) and down a path.
+        let nested = vec![
+            doc! { "_id": 1, "a": [5, dec("0.5")], "m": { "r": 3 } },
+            doc! { "_id": 2, "a": [1], "m": { "r": dec("2.5") } },
+            doc! { "_id": 3, "a": [dec("0.75"), 9], "m": { "r": dec("2.49") } },
+        ];
+        assert_eq!(ids(&sorted(doc! { "a": 1 }, nested.clone())), vec![1, 3, 2]);
+        assert_eq!(ids(&sorted(doc! { "m.r": 1 }, nested)), vec![3, 2, 1]);
+    }
+
+    fn sorted(spec: Document, mut docs: Vec<Document>) -> Vec<Document> {
+        let keys = parse_sort(&spec).unwrap();
+        sort(&keys, &mut docs);
+        docs
+    }
+
+    /// A sort direction and a projection flag read a decimal as the number it
+    /// is, as a double: `1`, `-1.0`; zero excludes, anything else includes.
+    #[test]
+    fn a_decimal_direction_or_flag_reads_as_the_double_of_its_value() {
+        assert_eq!(
+            parse_sort(&doc! { "a": dec("1") }).unwrap(),
+            parse_sort(&doc! { "a": 1.0 }).unwrap()
+        );
+        assert_eq!(
+            parse_sort(&doc! { "a": dec("-1.00") }).unwrap(),
+            parse_sort(&doc! { "a": -1.0 }).unwrap()
+        );
+        for bad in [dec("2"), dec("0.5"), dec("NaN")] {
+            assert!(parse_sort(&doc! { "a": bad.clone() }).is_err(), "{bad}");
         }
-        // Elsewhere in the document it is nobody's business.
-        let elsewhere = doc! { "_id": 8, "qty": 1, "meta": { "rank": 2 }, "price": d.clone() };
-        assert_eq!(unsortable(&keys, &elsewhere), None);
-        assert!(refuse_unsortable(&keys, &elsewhere).is_ok());
-        let no_id = doc! { "qty": d };
-        assert!(unsortable(&keys, &no_id).unwrap().contains("document ?"));
+        assert_eq!(
+            parse_projection(&doc! { "a": dec("1"), "b": dec("2.5") }).unwrap(),
+            parse_projection(&doc! { "a": 1.0, "b": 2.5 }).unwrap()
+        );
+        assert_eq!(
+            parse_projection(&doc! { "a": dec("0"), "b": dec("-0.00") }).unwrap(),
+            parse_projection(&doc! { "a": 0.0, "b": -0.0 }).unwrap()
+        );
     }
 }

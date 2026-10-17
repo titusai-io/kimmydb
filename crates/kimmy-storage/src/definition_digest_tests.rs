@@ -395,6 +395,19 @@ fn the_rendering_of_every_filter_type_is_pinned() {
             Bson::Document(doc! { "b": 2, "a": 1 }),
             r#"{"k":{"b":{"$numberInt":"2"},"a":{"$numberInt":"1"}}}"#,
         ),
+        // A partial filter may hold a decimal bound (ADR-238): its rendering
+        // keeps the written quantum, and the clamped form of a value written
+        // past the exponent range.
+        (
+            "decimal128",
+            Bson::Decimal128("1.50".parse().unwrap()),
+            r#"{"k":{"$numberDecimal":"1.50"}}"#,
+        ),
+        (
+            "decimal128 at the top of the range",
+            Bson::Decimal128("1E+6144".parse().unwrap()),
+            r#"{"k":{"$numberDecimal":"1.000000000000000000000000000000000E+6144"}}"#,
+        ),
     ];
     for (what, value, expected) in cases {
         assert_eq!(rendered(value), expected, "{what}");

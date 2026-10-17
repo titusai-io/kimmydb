@@ -10568,3 +10568,97 @@ async fn a_definition_repair_does_not_move_the_count_halfs_repair_rounds() {
         rounds.get()
     );
 }
+
+// ---------------------------------------------------------------------------
+// Decimal128 design 7.1: keys on the wire are legacy, through the real exchange
+// ---------------------------------------------------------------------------
+
+/// The id whose stored (schema-5) key is the schema-4 key of [`A2_B`] (design 6.1).
+const A2_A: i64 = 0x5000_0081_0180_0000;
+/// The id whose schema-4 key is the stored key of [`A2_A`].
+const A2_B: i64 = 0x5000_7F80_8101_8000;
+
+fn held_live(node: &Node, id: i64) -> bool {
+    let meta = node.engine.get_collection("shop", "orders").unwrap();
+    node.engine.get(&meta, &DocId::Int64(id)).unwrap().is_some()
+}
+
+/// A delete B lost (witnessed, not applied) of the A2 pair's second id, in a collection that
+/// holds both, beside an insert it lost too, so the counts agree and only the digest sees it.
+/// The document repair's page carries the delete by key: it lands on `A2_B` and never on
+/// `A2_A`, whose stored key is the carried one's schema-4 bytes.
+#[tokio::test]
+async fn a_lost_delete_of_the_a2_pair_is_repaired_onto_its_own_document() {
+    use kimmy_cluster::Judgement;
+    let a = node().await;
+    let b = node().await;
+    let ca = a.engine.create_collection("shop", "orders").unwrap();
+    for id in [1, 2, A2_A, A2_A + 1, A2_B, A2_B + 1] {
+        a.engine.insert(&ca, doc! { "_id": id, "v": 0 }).unwrap();
+    }
+    sync(&a, &b).await;
+    sync(&a, &b).await;
+    tokio::time::sleep(Duration::from_millis(5)).await;
+    assert!(a.engine.delete(&ca, &DocId::Int64(A2_B)).unwrap());
+    a.engine.insert(&ca, doc! { "_id": 3i64, "v": 0 }).unwrap();
+    let theirs = a.engine.version_vector().unwrap();
+    b.engine.apply_peer_batch(&theirs, &[], Hlc::ZERO, true).unwrap();
+    assert!(held_live(&b, A2_B) && held_live(&b, A2_A), "premise: B lost the delete");
+    assert_eq!(a.engine.count_by_id(ca.id).unwrap(), b.engine.count_by_id(ca.id).unwrap());
+
+    let (totals, _) = repair_loop(
+        &a,
+        &b,
+        |_| {},
+        |report, totals| {
+            totals.digest_judgements[Judgement::Effective.index()] >= 1
+                && report.digest_divergent_collections == 0
+        },
+    )
+    .await;
+    assert!(!held_live(&b, A2_B), "the delete was repaired: {totals:?}");
+    assert!(held_live(&b, A2_A), "and landed on its own document, not on A2_A");
+    assert!(held_live(&b, A2_A + 1) && held_live(&b, A2_B + 1) && held_live(&b, 3));
+}
+
+/// A member past its peer's retention catches up by whole-database pages whose cursor
+/// crosses a page boundary at `A2_A` and whose carried deletes include `A2_B`: every row
+/// arrives once and each delete lands on the document its key names.
+#[tokio::test]
+async fn a_whole_database_snapshot_across_an_a2_boundary_lands_every_delete_on_its_own_document() {
+    use kimmy_cluster::{PeerStalls, sync_once_with};
+    let a = node().await;
+    let ca = a.engine.create_collection("shop", "orders").unwrap();
+    let mut ids: Vec<i64> = (1..kimmy_storage::SNAPSHOT_PAGE as i64).collect();
+    ids.extend([A2_A, A2_A + 1, A2_B - 1, A2_B, A2_B + 1]);
+    a.engine.insert_many(&ca, ids.iter().map(|id| doc! { "_id": *id, "v": 0 }).collect()).unwrap();
+    let b = node().await;
+    sync(&a, &b).await;
+    sync(&a, &b).await;
+    let deleted = [5i64, A2_B - 1, A2_B];
+    for id in deleted {
+        assert!(a.engine.delete(&ca, &DocId::Int64(id)).unwrap());
+    }
+    // A's history is gone, its tombstones kept: B is served pages.
+    a.engine
+        .collect_garbage_at(
+            kimmy_storage::physical_now_ms() + 1_000_000_000,
+            kimmy_storage::RetentionPolicy::new(0, u64::MAX),
+        )
+        .unwrap();
+    let mut stalls = PeerStalls::new();
+    for _ in 0..16 {
+        sync_once_with(&b.engine, a.addr, SECRET, None, &mut stalls).await.unwrap();
+        if ids.iter().all(|id| held_live(&b, *id) != deleted.contains(id)) {
+            break;
+        }
+    }
+    for id in &ids {
+        assert_eq!(held_live(&b, *id), !deleted.contains(id), "{id:#x}");
+    }
+    let cb = b.engine.get_collection("shop", "orders").unwrap();
+    assert_eq!(
+        b.engine.count(&cb, kimmy_storage::WalkScope::Request).unwrap(),
+        (ids.len() - deleted.len()) as u64
+    );
+}

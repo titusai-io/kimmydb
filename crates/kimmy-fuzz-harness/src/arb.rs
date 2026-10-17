@@ -48,6 +48,35 @@ const DOUBLES: [f64; 11] = [
 /// agree on order across the boundary each one cannot represent.
 const INTS: [i64; 9] =
     [0, 1, -1, i32::MAX as i64, i32::MIN as i64, i32::MAX as i64 + 1, i64::MAX, i64::MIN, 1 << 53];
+/// Decimals where an exact comparison against the binary types is most likely
+/// to be wrong: equal to an entry of [`INTS`] or [`DOUBLES`] in another
+/// spelling (a cohort member, a zero with an exponent, the specials), one unit
+/// in the 34th digit either side of one, a tenth (which no double equals), a
+/// power of two below one, and the extremes of the exponent range.
+const DECIMALS: [&str; 22] = [
+    "0",
+    "-0E-100",
+    "1.00",
+    "-1",
+    "1.000000000000000000000000000000001",
+    "0.9999999999999999999999999999999999",
+    "0.1",
+    "0.1000000000000000055511151231257827",
+    "2147483647.0",
+    "9007199254740992",
+    "9007199254740993",
+    "9223372036854775807",
+    "9223372036854775808",
+    "3.552713678800500929355621337890625E-15",
+    "1E-6176",
+    "9.999999999999999999999999999999999E+6144",
+    "1.797693134862315708145274237317044E+308",
+    "4.940656458412465441765687928682213E-324",
+    "NaN",
+    "-NaN",
+    "Infinity",
+    "-Infinity",
+];
 
 /// One BSON value, of any variant the crate can construct.
 pub fn bson(u: &mut Unstructured<'_>) -> Bson {
@@ -85,19 +114,26 @@ fn bson_at(u: &mut Unstructured<'_>, depth: u8) -> Bson {
         }),
         17 => Bson::JavaScriptCode(string(u)),
         18 => regex(u).unwrap_or(Bson::Null),
-        // Deliberately rare: it is the one variant the encoder refuses, and
-        // a generator that produced it often would spend its budget on the
-        // refusal path.
-        19 if u.arbitrary::<u8>().unwrap_or(0) == 0 => {
-            Bson::Decimal128(bson::Decimal128::from_bytes(u.arbitrary().unwrap_or([0; 16])))
-        }
-        19 => Bson::Int32(0),
+        // A decimal as often as any other number: an edge from the table, or
+        // any 128 bits, which reach the non-canonical and special forms.
+        19 => decimal(u),
         20 => Bson::Array(array(u, depth + 1)),
         21 => Bson::Document(document(u, depth + 1)),
         _ => Bson::JavaScriptCodeWithScope(bson::JavaScriptCodeWithScope {
             code: string(u),
             scope: document(u, depth + 1),
         }),
+    }
+}
+
+fn decimal(u: &mut Unstructured<'_>) -> Bson {
+    if u.arbitrary::<bool>().unwrap_or(true) {
+        let text = *u.choose(&DECIMALS).unwrap_or(&"0");
+        Bson::Decimal128(
+            kimmy_core::decimal::parse(text).unwrap_or_else(|_| panic!("{text} is a Decimal128")),
+        )
+    } else {
+        Bson::Decimal128(bson::Decimal128::from_bytes(u.arbitrary().unwrap_or([0; 16])))
     }
 }
 
@@ -147,18 +183,6 @@ pub fn has_dollar_key(value: &Bson) -> bool {
             doc.iter().any(|(key, value)| key.starts_with('$') || has_dollar_key(value))
         }
         Bson::JavaScriptCodeWithScope(cws) => has_dollar_key(&Bson::Document(cws.scope.clone())),
-        _ => false,
-    }
-}
-
-/// Whether a value contains a `Decimal128` anywhere, which is the one thing
-/// the key encoder is allowed to refuse.
-pub fn holds_decimal(value: &Bson) -> bool {
-    match value {
-        Bson::Decimal128(_) => true,
-        Bson::Array(items) => items.iter().any(holds_decimal),
-        Bson::Document(doc) => doc.values().any(holds_decimal),
-        Bson::JavaScriptCodeWithScope(cws) => cws.scope.values().any(holds_decimal),
         _ => false,
     }
 }
@@ -304,4 +328,14 @@ fn grant(u: &mut Unstructured<'_>) -> Value {
         grant.insert("actions".into(), Value::Array(actions));
     }
     Value::Object(grant)
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn every_decimal_edge_is_a_decimal128() {
+        for text in super::DECIMALS {
+            assert!(kimmy_core::decimal::parse(text).is_ok(), "{text}");
+        }
+    }
 }

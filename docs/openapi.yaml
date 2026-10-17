@@ -253,13 +253,22 @@ paths:
             application/json:
               schema:
                 type: object
-                required: [status, node]
+                required: [status, node, decimal128_id_present]
                 properties:
                   status:
                     const: ready
                   node:
                     type: string
                     description: This node's id.
+                  decimal128_id_present:
+                    type: boolean
+                    description: |
+                      Whether a document whose `_id` is a `Decimal128` has
+                      ever been written or applied on this member (ADR-238).
+                      Durable and never cleared. Once it is `true` on any
+                      member, no member can be rolled back by wiping it and
+                      resyncing on a build before 0.51. Also
+                      `kimmy_decimal128_id_present`.
                   catching_up:
                     const: unknown
                     description: |
@@ -293,9 +302,19 @@ paths:
           description: |
             Not ready. While the node's store is opening the body is the error
             envelope (`error: starting`) with `status: opening`, `phase`
-            (`repairing`, `opening`, `migrating`, `verifying`, `counting`,
-            `starting` or `reconciling`), `phase_age_seconds`, and `done` and `total` when the
-            phase counts. It is also the answer of a node whose storage engine
+            (`repairing`, `opening`, `preflight`, `migrating`, `draining`, `refilling`,
+            `verifying`, `counting`, `starting` or `reconciling`), `phase_age_seconds`, and
+            `done` and `total` when the phase counts. `preflight`, `migrating`, `draining`
+            and `refilling` are the storage schema migration's steps: the preflight's
+            read of the documents with a number `_id`, before anything is written, a
+            collection's rows re-keyed (out, then
+            back), one index's entries drained, one collection's rows walked to refill
+            its indexes, and, in `draining`, a TTL partial index's count of the
+            documents the exact comparator decides differently; each starts its own
+            count and ends at `done` equal to `total`. A drain's total, and a move
+            back's, are exact; a move out's, a count's and a refill's start from the
+            collection's kept document count, are raised to stay ahead of `done`, and
+            are set to what the step did when it ends. It is also the answer of a node whose storage engine
             has hit an I/O error, and of a member that knows it is behind
             (`error: catching_up`, `retry: elsewhere`, and `reason`, the state; its
             catching-up marker is set, see `x-kimmy-catching-up`), with
@@ -310,7 +329,7 @@ paths:
                       status: { const: opening }
                       phase:
                         type: string
-                        enum: [repairing, opening, migrating, verifying, counting, starting, reconciling]
+                        enum: [repairing, opening, preflight, migrating, draining, refilling, verifying, counting, starting, reconciling]
                       phase_age_seconds: { type: number }
                       done: { type: integer }
                       total: { type: integer }
@@ -3770,24 +3789,20 @@ components:
           description: |
             Of `indexEntriesRead`, the entries read from the index's unkeyed
             run: documents the index holds but could not key — arrays at two
-            of a compound index's paths, more than 1,000 keys, a Decimal128 —
-            which every scan of that index reads and rechecks whatever the
-            filter asked for. Present whenever `indexEntriesRead` is, and 0
-            for an index that keys every document it holds. A number above 0
-            is the cost of leaving such documents under the index; the index
-            listing's `unkeyed` reports the same set by size.
-        undecidableCandidates:
-          type: integer
-          description: |
-            Of `indexEntriesRead`, the entries read from the index's
-            undecidable run: documents a partial index holds because its filter
-            could not decide them — a `Decimal128` at a filtered path, which
-            the canonical order ranks equal to every number — and which every
-            scan of that index reads and rechecks (ADR-185). Present whenever
-            `indexEntriesRead` is, and 0 for an index with none. Separate from
-            `unkeyedCandidates`: that one counts documents the index could not
-            key, which is a fault to fix, and this one is expected. The index
-            listing's `undecidable` reports the same set by size.
+            of a compound index's paths, or more than 1,000 keys — which every
+            scan of that index reads and rechecks whatever the filter asked
+            for. Present whenever `indexEntriesRead` is, and 0 for an index
+            that keys every document it holds. A number above 0 is the cost of
+            leaving such documents under the index; the index listing's
+            `unkeyed` reports the same set by size.
+
+            **`undecidableCandidates` was removed in 0.51.0** (ADR-238), a
+            breaking change for a typed client that declared it: it counted
+            the entries read from a partial index's undecidable run, where
+            0.50 and earlier held a document with a `Decimal128` at a filtered
+            path. A partial filter now decides a `Decimal128` by its exact
+            value, so a partial index holds exactly what its filter selects
+            and there is no such run to read.
 
     ViolationGroup:
       type: object
@@ -3810,7 +3825,7 @@ components:
 
     Index:
       type: object
-      required: [name, fields, unique, enforcement, multikey, unkeyed, undecidable]
+      required: [name, fields, unique, enforcement, multikey, unkeyed]
       properties:
         name: { type: string }
         fields:
@@ -3835,31 +3850,24 @@ components:
           type: integer
           description: |
             Documents the index holds that it could not key: arrays at two of
-            a compound index's paths, more than 1,000 keys for one document,
-            or a Decimal128 at an indexed path. They are stored and every
-            query still finds them, but each scan of this index rechecks all
-            of them, and a unique index does not check them at all. Zero is
-            the index doing its whole job. Anything else names work for the
-            collection's owner — reshape those documents, or split the index
-            — visible here without access to the server's logs, where each
-            one was also warned about by id.
-        undecidable:
-          type: integer
-          description: |
-            Documents the index holds because its partial filter could not
-            decide them. The canonical order ranks a Decimal128 equal to every
-            number, so a filter compared against one gives an answer that is
-            *an* answer rather than *the* answer — and the index holds the
-            document anyway, for each scan to recheck against the full filter,
-            rather than deciding membership on a comparison that is not an
-            order.
+            a compound index's paths, or more than 1,000 keys for one
+            document. They are stored and every query still finds them, but
+            each scan of this index rechecks all of them, and a unique index
+            does not check them at all. Zero is the index doing its whole job.
+            Anything else names work for the collection's owner — reshape
+            those documents, or split the index — visible here without access
+            to the server's logs, where each one was also warned about by id.
+            (A Decimal128 at an indexed path was a third reason through 0.50;
+            since 0.51.0 it has an exact key.)
 
-            Expected rather than a fault, which is what distinguishes it from
-            `unkeyed`: nothing is wrong with these documents or with the index,
-            and on a field holding money it may be most of the collection. What
-            it costs is the recheck on every scan, which is why the standing
-            number is here. A unique index enforces nothing on them, and a TTL
-            index never expires them, because the filter does not select them.
+            **`undecidable` was removed in 0.51.0** (ADR-238), from this schema
+            and from every response, a breaking change for a typed client that
+            declared it: it counted the documents a partial index held because
+            its filter could not decide them (a Decimal128 at a filtered path,
+            which the canonical order ranked equal to every number). A partial
+            filter now decides a Decimal128 by its exact value, so a partial
+            index holds exactly what its filter selects, a partial unique index
+            enforces on it, and a TTL index expires by it.
         expireAfterSeconds:
           type: integer
           description: Present only on a TTL index.

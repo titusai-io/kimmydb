@@ -99,7 +99,6 @@ pub struct StorageReadings {
     /// Documents filed under an index's unkeyed run since start
     /// (`Engine::unkeyed_writes`, ADR-139).
     pub index_unkeyed: u64,
-    pub index_undecidable: u64,
     /// Schema changes a snapshot restore appended to the oplog since start
     /// (`Engine::ddl_relogged`, ADR-180). A reading rather than a counter
     /// here: the engine counts each once its commit lands, which a round's
@@ -132,6 +131,10 @@ pub struct StorageReadings {
     pub held_marks_released: u64,
     /// Entries held as state right now (`Engine::held_marks`, ADR-160).
     pub held_marks: u64,
+    /// Whether a document whose `_id` is a `Decimal128` has been written or
+    /// applied on this member (`Engine::decimal128_id_present`, ADR-238): the
+    /// durable marker a rollback runbook reads, read at scrape.
+    pub decimal128_id_present: bool,
     /// Registered webhook subscriptions by state, counted from the registry
     /// at the read (ADR-187). They were set by the dispatcher at the end of
     /// each pass, so a dispatcher that had stopped left them at whatever it
@@ -372,7 +375,6 @@ pub struct MetricsSnapshot {
     /// key the index could derive, so every scan of that index rechecks
     /// them (ADR-139). One of the engine's readings.
     pub index_unkeyed: u64,
-    pub index_undecidable: u64,
     /// Writes that gave up waiting for the writer, and the longest hold in
     /// microseconds (ADR-151); the wait histogram itself is not bridged.
     pub write_lock_wait_timeouts: u64,
@@ -490,6 +492,9 @@ pub struct MetricsSnapshot {
     pub sync_divergence_repair_enabled: u64,
     /// The collected-through horizon, seconds since the epoch. A level.
     pub gc_tombstone_horizon_seconds: u64,
+    /// 1 once a document whose `_id` is a `Decimal128` has been written or
+    /// applied on this member (ADR-238): an engine reading.
+    pub decimal128_id_present: u64,
     /// Definition repairs by outcome (`DigestRepairOutcome::DEFINITION` are the labels used),
     /// the loop guard's judgements of them (`DefinitionJudgement::ALL`) and what their pages
     /// did with indexes (`kimmy_storage::DEFINITION_RESULTS`).
@@ -1432,7 +1437,6 @@ impl Metrics {
             ttl_skipped: self.get(&self.ttl_skipped),
             ttl_skipped_filter: self.get(&self.ttl_skipped_filter),
             index_unkeyed: readings.index_unkeyed,
-            index_undecidable: readings.index_undecidable,
             webhook_delivered: self.get(&self.webhook_delivered),
             webhook_failed: self.get(&self.webhook_failed),
             webhook_events: self.get(&self.webhook_events),
@@ -1487,6 +1491,7 @@ impl Metrics {
                 .get(&self.sync_digest_repair_stopped_collections),
             sync_divergence_repair_enabled: self.get(&self.sync_divergence_repair_enabled),
             gc_tombstone_horizon_seconds: self.get(&self.gc_tombstone_horizon_seconds),
+            decimal128_id_present: u64::from(readings.decimal128_id_present),
             sync_definition_repairs: std::array::from_fn(|slot| {
                 self.get(&self.sync_definition_repairs[slot])
             }),
@@ -1800,12 +1805,9 @@ impl Metrics {
              # HELP kimmy_ttl_skipped_filter_total Expiry candidates a TTL index held that its partial filter, evaluated as find evaluates it, did not select when the delete re-read the document, and were not deleted. A document moved out of the filter while the pass ran, or one the index should never have held. Should fall to near zero once partial-index membership agrees with the filter; until then each one is a document expiry used to delete.\n\
              # TYPE kimmy_ttl_skipped_filter_total counter\n\
              kimmy_ttl_skipped_filter_total {ttl_skipped_filter}\n\
-             # HELP kimmy_index_unkeyed_total Documents stored under an index that could not key them - arrays at two of a compound index's paths, more than 1000 keys, or a Decimal128 - and are rechecked on every scan of that index instead. Each one is logged at warning naming the index and the document; the index listing reports how many stand under each index as `unkeyed`. This counts that reason only; a document held because a partial filter could not decide it is kimmy_index_undecidable_total.\n\
+             # HELP kimmy_index_unkeyed_total Documents stored under an index that could not key them - arrays at two of a compound index's paths, or more than 1000 keys - and are rechecked on every scan of that index instead. Each one is logged at warning naming the index and the document; the index listing reports how many stand under each index as `unkeyed`.\n\
              # TYPE kimmy_index_unkeyed_total counter\n\
              kimmy_index_unkeyed_total {index_unkeyed}\n\
-             # HELP kimmy_index_undecidable_total Documents an index holds because its partial filter could not decide them: a Decimal128 at a filtered path, which the canonical order ranks equal to every number, so the filter's answer is not an answer. The index holds them and every scan re-checks them, which is what stops a partial index missing documents find returns. Expected, not a fault - the separate kimmy_index_unkeyed_total counts documents an index could not key, which is one.\n\
-             # TYPE kimmy_index_undecidable_total counter\n\
-             kimmy_index_undecidable_total {index_undecidable}\n\
              # HELP kimmy_webhook_deliveries_total Webhook delivery attempts by outcome.\n\
              # TYPE kimmy_webhook_deliveries_total counter\n\
              kimmy_webhook_deliveries_total{{outcome=\"delivered\"}} {wh_ok}\n\
@@ -1909,6 +1911,9 @@ impl Metrics {
              # HELP kimmy_gc_tombstone_horizon_seconds The collected-through horizon, as a Unix time in seconds: the cutoff of the last retention pass that removed a tombstone, or this build's reset at open (a start after an upgrade, a rollback or a restore resets it to the start time). It moves only when a pass removes something, so a member that collects nothing holds it indefinitely; it is not now minus retention. A document repair writes a row only when the row is newer than the larger of this member's horizon and the sender's. A fast clock pins it ahead until real time passes it.\n\
              # TYPE kimmy_gc_tombstone_horizon_seconds gauge\n\
              kimmy_gc_tombstone_horizon_seconds {gc_tombstone_horizon}\n\
+             # HELP kimmy_decimal128_id_present 1 once a document whose _id is a Decimal128 (an integral one stored as an integer id included) has been written or applied on this member, else 0. Durable and never cleared, and a backup carries it. Read it on every member before a rollback: once it is 1 anywhere, no member can be rolled back by wiping it and resyncing on a build before 0.51 (operations.md, cluster.decimal128 and the marker).\n\
+             # TYPE kimmy_decimal128_id_present gauge\n\
+             kimmy_decimal128_id_present {decimal128_id_present}\n\
              # HELP kimmy_sync_definition_repairs_total Definition repairs of a confirmed definition finding, by outcome: the end of a repair, or the gate that refused to plan one. applied: the repair pulled the first page of the peer's snapshot of the collection and applied it; whether it worked is judged at the next compared definition digest (kimmy_sync_definition_repair_judgements_total), and what it did with each index is in kimmy_sync_definition_repair_indexes_total. too_large: the collection holds more live documents than cluster.repair_max_index_documents. abandoned: three rounds in a row applied nothing. transient: a peer error, a stop, a drop, a whole-database pull taking the peer over, or a cancellation. disabled: cluster.divergence_repair is off.\n\
              # TYPE kimmy_sync_definition_repairs_total counter\n\
              {sync_definition_repairs_lines}\
@@ -2039,7 +2044,6 @@ impl Metrics {
             ttl_skipped = self.get(&self.ttl_skipped),
             ttl_skipped_filter = self.get(&self.ttl_skipped_filter),
             index_unkeyed = readings.index_unkeyed,
-            index_undecidable = readings.index_undecidable,
             wh_active = readings.webhook_active,
             wh_invalid = readings.webhook_invalidated,
             wh_unreadable = readings.webhook_unreadable,
@@ -2110,6 +2114,7 @@ impl Metrics {
             sync_digest_repair_stopped = self.get(&self.sync_digest_repair_stopped_collections),
             sync_divergence_repair_enabled = self.get(&self.sync_divergence_repair_enabled),
             gc_tombstone_horizon = self.get(&self.gc_tombstone_horizon_seconds),
+            decimal128_id_present = u64::from(readings.decimal128_id_present),
             sync_definition_repairs_lines = kimmy_cluster::DigestRepairOutcome::DEFINITION
                 .iter()
                 .map(|outcome| {
@@ -3091,11 +3096,6 @@ mod tests {
             process_resident_bytes: 49,
             process_resident_peak_bytes: 50,
             index_unkeyed: 26,
-            // 37 rather than a small number: the golden is asserted
-            // byte-for-byte, and a value shared with another series (4 was also
-            // `kimmy_responses_total{class="5xx"}`) lets an assertion that names
-            // this one match the wrong line.
-            index_undecidable: 37,
             sync_ddl_relogged: 91,
             sync_horizon_state_held: 92,
             webhook_active: 15,
@@ -3111,6 +3111,7 @@ mod tests {
             writer_hold_max_us: 52_500_000,
             held_marks_released: 53,
             held_marks: 54,
+            decimal128_id_present: true,
             ownership: OwnershipReading {
                 peers: [1_501, 1_502, 1_503, 1_504, 1_505],
                 unconfirmed: [1_511, 1_512, 1_513],
@@ -3639,12 +3640,9 @@ kimmy_ttl_skipped_total 12
 # HELP kimmy_ttl_skipped_filter_total Expiry candidates a TTL index held that its partial filter, evaluated as find evaluates it, did not select when the delete re-read the document, and were not deleted. A document moved out of the filter while the pass ran, or one the index should never have held. Should fall to near zero once partial-index membership agrees with the filter; until then each one is a document expiry used to delete.
 # TYPE kimmy_ttl_skipped_filter_total counter
 kimmy_ttl_skipped_filter_total 93
-# HELP kimmy_index_unkeyed_total Documents stored under an index that could not key them - arrays at two of a compound index's paths, more than 1000 keys, or a Decimal128 - and are rechecked on every scan of that index instead. Each one is logged at warning naming the index and the document; the index listing reports how many stand under each index as `unkeyed`. This counts that reason only; a document held because a partial filter could not decide it is kimmy_index_undecidable_total.
+# HELP kimmy_index_unkeyed_total Documents stored under an index that could not key them - arrays at two of a compound index's paths, or more than 1000 keys - and are rechecked on every scan of that index instead. Each one is logged at warning naming the index and the document; the index listing reports how many stand under each index as `unkeyed`.
 # TYPE kimmy_index_unkeyed_total counter
 kimmy_index_unkeyed_total 26
-# HELP kimmy_index_undecidable_total Documents an index holds because its partial filter could not decide them: a Decimal128 at a filtered path, which the canonical order ranks equal to every number, so the filter's answer is not an answer. The index holds them and every scan re-checks them, which is what stops a partial index missing documents find returns. Expected, not a fault - the separate kimmy_index_unkeyed_total counts documents an index could not key, which is one.
-# TYPE kimmy_index_undecidable_total counter
-kimmy_index_undecidable_total 37
 # HELP kimmy_webhook_deliveries_total Webhook delivery attempts by outcome.
 # TYPE kimmy_webhook_deliveries_total counter
 kimmy_webhook_deliveries_total{outcome=\"delivered\"} 2
@@ -3798,6 +3796,9 @@ kimmy_sync_divergence_repair_enabled 1
 # HELP kimmy_gc_tombstone_horizon_seconds The collected-through horizon, as a Unix time in seconds: the cutoff of the last retention pass that removed a tombstone, or this build's reset at open (a start after an upgrade, a rollback or a restore resets it to the start time). It moves only when a pass removes something, so a member that collects nothing holds it indefinitely; it is not now minus retention. A document repair writes a row only when the row is newer than the larger of this member's horizon and the sender's. A fast clock pins it ahead until real time passes it.
 # TYPE kimmy_gc_tombstone_horizon_seconds gauge
 kimmy_gc_tombstone_horizon_seconds 1700000002
+# HELP kimmy_decimal128_id_present 1 once a document whose _id is a Decimal128 (an integral one stored as an integer id included) has been written or applied on this member, else 0. Durable and never cleared, and a backup carries it. Read it on every member before a rollback: once it is 1 anywhere, no member can be rolled back by wiping it and resyncing on a build before 0.51 (operations.md, cluster.decimal128 and the marker).
+# TYPE kimmy_decimal128_id_present gauge
+kimmy_decimal128_id_present 1
 # HELP kimmy_sync_definition_repairs_total Definition repairs of a confirmed definition finding, by outcome: the end of a repair, or the gate that refused to plan one. applied: the repair pulled the first page of the peer's snapshot of the collection and applied it; whether it worked is judged at the next compared definition digest (kimmy_sync_definition_repair_judgements_total), and what it did with each index is in kimmy_sync_definition_repair_indexes_total. too_large: the collection holds more live documents than cluster.repair_max_index_documents. abandoned: three rounds in a row applied nothing. transient: a peer error, a stop, a drop, a whole-database pull taking the peer over, or a cancellation. disabled: cluster.divergence_repair is off.
 # TYPE kimmy_sync_definition_repairs_total counter
 kimmy_sync_definition_repairs_total{outcome=\"applied\"} 262
@@ -4318,7 +4319,6 @@ kimmy_storage_cache_reads_total{result=\"miss\"} 9104
         expect(&format!("kimmy_ttl_skipped_total {}\n", s.ttl_skipped));
         expect(&format!("kimmy_ttl_skipped_filter_total {}\n", s.ttl_skipped_filter));
         expect(&format!("kimmy_index_unkeyed_total {}\n", s.index_unkeyed));
-        expect(&format!("kimmy_index_undecidable_total {}\n", s.index_undecidable));
         expect(&format!(
             "kimmy_webhook_deliveries_total{{outcome=\"delivered\"}} {}\n",
             s.webhook_delivered
@@ -4462,6 +4462,7 @@ kimmy_storage_cache_reads_total{result=\"miss\"} 9104
             s.sync_divergence_repair_enabled
         ));
         expect(&format!("kimmy_gc_tombstone_horizon_seconds {}\n", s.gc_tombstone_horizon_seconds));
+        expect(&format!("kimmy_decimal128_id_present {}\n", s.decimal128_id_present));
         for outcome in kimmy_cluster::DigestRepairOutcome::DEFINITION {
             expect(&format!(
                 "kimmy_sync_definition_repairs_total{{outcome=\"{}\"}} {}\n",
@@ -4810,10 +4811,10 @@ kimmy_storage_cache_reads_total{result=\"miss\"} 9104
         // since ADR-180, one for schema changes a snapshot restore re-logged;
         // since ADR-181, one for expiry declined by the partial filter;
         // since ADR-184, one retry counter per supervised task; since
-        // ADR-185, one for documents an index holds because its partial
-        // filter could not decide them; and since ADR-195, one for sync
-        // ticks a reset scheduled; and since ADR-224, one for pulls refused for a
-        // hole a snapshot left.
+        // ADR-195, one for sync ticks a reset scheduled; and since ADR-224,
+        // one for pulls refused for a hole a snapshot left. (ADR-185's one,
+        // for documents an index held because its partial filter could not
+        // decide them, went with ADR-238.)
         assert_eq!(
             samples,
             108 + 6 + 17
@@ -4824,9 +4825,6 @@ kimmy_storage_cache_reads_total{result=\"miss\"} 9104
                 + 1
                 + 5
                 + 15
-                // ADR-185: one for documents an index holds because its
-                // partial filter could not decide them.
-                + 1
                 // Since ADR-184, one per supervised task: the label set is
                 // `kimmy_task::TASKS`, so this counts the tasks rather than a
                 // number written twice.
@@ -4901,6 +4899,8 @@ kimmy_storage_cache_reads_total{result=\"miss\"} 9104
                 + 1
                 + 1
                 // The collected-through horizon.
+                + 1
+                // The marker that a `Decimal128` id exists here (ADR-238).
                 + 1
                 // And the definition repair's: outcomes, judgements and index results.
                 + kimmy_cluster::DigestRepairOutcome::DEFINITION.len()

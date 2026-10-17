@@ -2478,6 +2478,8 @@ version = "0.50.0"
 dependencies = [
  "base64 0.23.1",
  "bson",
+ "num-bigint",
+ "num-rational",
  "proptest",
  "serde",
  "serde_bytes",
@@ -2557,6 +2559,7 @@ dependencies = [
  "kimmy-core",
  "kimmy-query",
  "libc",
+ "num-bigint",
  "parking_lot",
  "proptest",
  "redb",

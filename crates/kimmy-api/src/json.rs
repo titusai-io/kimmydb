@@ -229,9 +229,17 @@ fn extended_json(map: &Map<String, Value>) -> Result<Option<Bson>, ApiError> {
         // re-decode of the stored bytes yielded a Decimal128 — so the member
         // that accepted a write keyed the value under an index its peers,
         // applying the same bytes, filed unkeyed (ADR-139).
+        //
+        // Read by kimmydb's own parser, not `bson`'s `FromStr`, which took
+        // `""` and `"."` as zero, `"++1"` as one and `"e100"` as `0E+100`: a
+        // blank imported price was stored as `0`. The text is a number in the
+        // General Decimal Arithmetic syntax, read exactly, or the request is
+        // refused naming it and saying why.
         "$numberDecimal" => {
             let s = value.as_str().ok_or_else(|| bad("$numberDecimal"))?;
-            Bson::Decimal128(s.parse().map_err(|_| bad("$numberDecimal"))?)
+            Bson::Decimal128(kimmy_core::decimal::parse(s).map_err(|why| {
+                ApiError::bad_request(format!("invalid $numberDecimal: {value}: {why}"))
+            })?)
         }
         "$binary" => {
             use base64::Engine as _;
@@ -331,9 +339,9 @@ mod tests {
 
     #[test]
     fn a_decimal128_operand_in_extended_json_reaches_add_to_set_intact() {
-        // ADR-186: `$addToSet` takes the operand and identifies it by its
-        // bytes, so the JSON boundary must hand it over as a `Decimal128`
-        // rather than a nested document.
+        // `$addToSet` takes the operand and identifies it by its value, so the
+        // JSON boundary must hand it over as a `Decimal128` rather than a nested
+        // document (which would be a second member beside the equal number).
         let update = json_to_bson(&json!({
             "$addToSet": { "t": { "$numberDecimal": "1" } }
         }))
@@ -346,7 +354,11 @@ mod tests {
         let parsed = kimmy_query::update::parse(&update).expect("accepted");
         let mut stored = bson::doc! { "t": [1] };
         kimmy_query::update::apply(&parsed, &mut stored, 0).unwrap();
-        assert_eq!(stored.get_array("t").unwrap().len(), 2);
+        assert_eq!(
+            stored.get_array("t").unwrap().len(),
+            1,
+            "1 and Decimal128(\"1\") are one member"
+        );
     }
 
     fn round_trip(value: Value) -> Value {
@@ -461,6 +473,35 @@ mod tests {
         assert!(json_to_bson(&json!({ "$numberDecimal": 1.5 })).is_err());
     }
 
+    /// The texts `bson`'s own parser took as numbers, and a value that would
+    /// need rounding, are refused, `400`, naming the text and the reason.
+    #[test]
+    fn a_decimal128_text_that_is_not_a_number_is_refused_naming_it() {
+        for (text, why) in [
+            ("", "not a decimal number"),
+            (".", "not a decimal number"),
+            ("-", "not a decimal number"),
+            ("++1", "not a decimal number"),
+            ("-+1", "not a decimal number"),
+            ("0+5", "not a decimal number"),
+            ("e100", "not a decimal number"),
+            ("+.E+1", "not a decimal number"),
+            (" 1", "not a decimal number"),
+            ("1.0000000000000000000000000000000001", "more than 34 significant digits"),
+            ("1E+6145", "above the largest Decimal128"),
+            ("1E-6177", "below the smallest Decimal128"),
+        ] {
+            let err = json_to_bson(&json!({ "$numberDecimal": text })).unwrap_err();
+            assert_eq!(err.status, axum::http::StatusCode::BAD_REQUEST, "{text:?}");
+            let message = err.message.to_string();
+            assert!(
+                message.starts_with(&format!("invalid $numberDecimal: {}: ", json!(text)))
+                    && message.contains(why),
+                "{text:?}: {message}"
+            );
+        }
+    }
+
     #[test]
     fn decimal128_is_read_as_it_is_written() {
         // `bson_to_json` has always emitted `$numberDecimal`; the decoder did
@@ -482,6 +523,13 @@ mod tests {
             "-Infinity",
             "9999999999999999999999999999999999",
             "1.234567890123456789012345678901234E-6143",
+            // Exact, though written with more than 34 digits or past the
+            // exponent range: the value is kept, zeros dropped or clamped.
+            "1.0000000000000000000000000000000000000",
+            "1E+6144",
+            "0E+9999",
+            "+.5",
+            "1.",
         ] {
             let b = json_to_bson(&json!({ "$numberDecimal": text })).unwrap();
             assert!(matches!(b, Bson::Decimal128(_)), "{text}");
@@ -492,6 +540,15 @@ mod tests {
             assert_eq!(bson_to_json(&json_to_bson(&j).unwrap()), j, "{text}");
         }
 
+        // A signalling NaN and a NaN's payload are read, as the syntax allows,
+        // and shown as MongoDB shows every NaN, `NaN`, which is a fixed point.
+        for text in ["sNaN", "NaN123", "-NaN"] {
+            let b = json_to_bson(&json!({ "$numberDecimal": text })).unwrap();
+            let j = bson_to_json(&b);
+            assert_eq!(j, json!({ "$numberDecimal": "NaN" }), "{text}");
+            assert_eq!(bson_to_json(&json_to_bson(&j).unwrap()), j, "{text}");
+        }
+
         // The value in memory is the value a re-decode of its bytes yields,
         // which is what lets every path file it the same way.
         let doc = json_to_document(&json!({ "v": { "$numberDecimal": "1.5" } })).unwrap();
@@ -499,6 +556,59 @@ mod tests {
         let again: bson::Document = bson::deserialize_from_slice(&bytes).unwrap();
         assert_eq!(doc, again);
         assert!(matches!(again.get("v"), Some(Bson::Decimal128(_))));
+    }
+
+    /// A JSON number becomes the double it denotes, to the last bit: the edge
+    /// relies on `serde_json`'s `float_roundtrip` feature, declared in the
+    /// workspace. This crate's own tests get the feature from `jsonschema`
+    /// too, so they cannot see the declaration go (the guard below can);
+    /// `kimmyd/tests/json_floats.rs`, built without `jsonschema`, holds the
+    /// same cases where the loss shows.
+    #[test]
+    fn a_json_number_is_the_double_it_denotes_to_the_last_bit() {
+        for (text, bits) in [
+            ("2.2250738585072011e-308", 0x000f_ffff_ffff_ffff_u64),
+            ("1.00000000000000011102230246251565404236316680908203125", 0x3ff0_0000_0000_0000),
+            ("1.2345678901234567e-300", 0x01aa_74fe_1c1e_8908),
+        ] {
+            let value: Value = serde_json::from_str(text).unwrap();
+            match json_to_bson(&value).unwrap() {
+                Bson::Double(v) => assert_eq!(v.to_bits(), bits, "{text}"),
+                other => panic!("{text}: {other:?}"),
+            }
+        }
+    }
+
+    /// The declaration the edge's float parsing rests on, read from the
+    /// workspace manifest, so a workspace-wide test run, whose feature
+    /// unification hides its loss, still sees it go; and every crate takes
+    /// `serde_json` from the workspace, so every one gets the feature.
+    #[test]
+    fn the_workspace_declares_serde_jsons_float_roundtrip_and_every_crate_inherits_it() {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let manifest = std::fs::read_to_string(root.join("Cargo.toml")).unwrap();
+        let declaration = manifest
+            .lines()
+            .find(|l| l.starts_with("serde_json = "))
+            .expect("serde_json is a workspace dependency");
+        assert!(declaration.contains("\"float_roundtrip\""), "{declaration}");
+        assert!(declaration.contains("\"preserve_order\""), "{declaration}");
+
+        let mut checked = 0;
+        for entry in std::fs::read_dir(root.join("crates")).unwrap() {
+            let path = entry.unwrap().path().join("Cargo.toml");
+            let Ok(text) = std::fs::read_to_string(&path) else { continue };
+            for line in text.lines().filter(|l| l.trim_start().starts_with("serde_json")) {
+                assert_eq!(
+                    line.trim(),
+                    "serde_json.workspace = true",
+                    "{}: serde_json must come from the workspace, with its features",
+                    path.display()
+                );
+                checked += 1;
+            }
+        }
+        assert!(checked >= 8, "premise: {checked} crates declare serde_json");
     }
 
     #[test]

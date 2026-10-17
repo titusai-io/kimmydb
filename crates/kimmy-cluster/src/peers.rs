@@ -1661,6 +1661,24 @@ pub async fn replicate(engine: Arc<Engine>, config: ReplicationConfig) {
                     .ok()
                     .flatten()
                     .map_or(0, |horizon| horizon.wall_ms / 1_000);
+                // A `Decimal128` id here and a live peer that cannot hold one:
+                // that peer fails every frame carrying it and never catches up,
+                // so say so, once per peer and every ten minutes (ADR-238). The
+                // marker is read only when some peer blocks.
+                if let Some(members) = &config.members {
+                    let marker = || engine.decimal128_id_present().unwrap_or(false);
+                    for peer in members.decimal128_warnings(marker, Instant::now()) {
+                        warn!(
+                            %peer,
+                            "a document whose _id is a Decimal128 exists on this member, and a \
+                             live peer does not say it can hold one (a build older than 0.51, \
+                             or a member not yet heard from). Such a peer fails every frame \
+                             carrying that document and does not catch up: roll it forward to \
+                             0.51, and never wipe it and resync it on an older build \
+                             (operations.md)"
+                        );
+                    }
+                }
                 report.definition_divergent_collections = divergence.definition_confirmed_count();
                 report.digest_drift_total = engine.digest_drift_total();
                 // And when that reading was last re-examined (ADR-145): the

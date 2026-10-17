@@ -1093,6 +1093,49 @@ async fn every_insert_route_echoes_the_binary_id_it_stored_with_its_subtype() {
     }
 }
 
+/// A `Decimal128` `_id` echoes as the decimal the client sent, an integral one included.
+///
+/// An integral decimal in `i64` range is the `Int64` id of that value, with its stored body
+/// unchanged, so an echo rendered from the key would say `5` for a client that sent
+/// `Decimal128("5")`; the echo is the stored `_id`, and `find` by it finds the document.
+#[tokio::test]
+async fn a_decimal128_id_echoes_as_the_decimal_that_was_sent() {
+    let server = Server::start().await;
+    let token = server.root().await;
+    for name in ["one", "bulk", "upsert"] {
+        server.post("/v1/db/shop/collections", Some(&token), json!({ "name": name })).await;
+    }
+    let ids = [
+        json!({ "$numberDecimal": "5" }),
+        json!({ "$numberDecimal": "1.50" }),
+        json!({ "$numberDecimal": "-0.1" }),
+        json!({ "$numberDecimal": "1E+19" }),
+    ];
+    for id in &ids {
+        let res = server.post("/v1/db/shop/coll/one/docs", Some(&token), json!({"_id": id})).await;
+        assert_eq!(res.status, 200, "{id}: {:?}", res.body);
+        assert_eq!(&res.body["insertedId"], id, "insert echoes the decimal as sent");
+        let found = find_by_id(&server, &token, "one", &res.body["insertedId"]).await;
+        assert_eq!(found.len(), 1, "{id}: find by the echo finds the document");
+        assert_eq!(&found[0]["_id"], id);
+    }
+    let documents: Vec<Value> = ids.iter().map(|id| json!({"_id": id})).collect();
+    let res = server.post("/v1/db/shop/coll/bulk/bulk", Some(&token), json!(documents)).await;
+    assert_eq!(res.status, 200, "{:?}", res.body);
+    assert_eq!(res.body["insertedIds"], json!(ids), "bulk echoes every decimal as sent");
+    for id in &ids {
+        let res = server
+            .post(
+                "/v1/db/shop/coll/upsert/find_and_modify",
+                Some(&token),
+                json!({ "filter": {"_id": id}, "update": {"$set": {"n": 1}}, "upsert": true }),
+            )
+            .await;
+        assert_eq!(res.status, 200, "{id}: {:?}", res.body);
+        assert_eq!(&res.body["upsertedId"], id, "an upsert echoes the decimal it stored");
+    }
+}
+
 /// A generated ObjectId and an integer `_id` echo exactly as they did before
 /// the echo was taken from the stored value.
 #[tokio::test]
@@ -9348,24 +9391,31 @@ async fn set_operators_and_pair_conversions_run_in_a_pipeline_over_http() {
         assert!(message.contains(want), "{pipeline}: {message}");
     }
 
-    // A stored Decimal128 cannot be a set member: the canonical order ranks
-    // it equal to every number, so it is refused rather than compared.
+    // A stored Decimal128 is a set member by its value: `[5m]` is not a
+    // subset of `[1]` (it used to be refused, because the order ranked it
+    // equal to every number), and is a subset of `[5.0, 1]`.
     let res = server
         .post(
             "/v1/db/shop/coll/customers/docs",
             Some(&token),
-            json!({"_id": 4, "tags": [{"$numberDecimal": "5"}], "wants": [1]}),
+            json!({"_id": 4, "tags": [{"$numberDecimal": "5"}], "wants": [1], "more": [5.0, 1]}),
         )
         .await;
     assert_eq!(res.status, 200, "{:?}", res.body);
     let res = aggregate(json!([
         {"$match": {"_id": 4}},
-        {"$project": {"sub": {"$setIsSubset": ["$tags", "$wants"]}}}
+        {"$project": {
+            "sub": {"$setIsSubset": ["$tags", "$wants"]},
+            "more": {"$setIsSubset": ["$tags", "$more"]},
+            "union": {"$setUnion": ["$more", "$tags"]}
+        }}
     ]))
     .await;
-    assert_eq!(res.status, 400, "{:?}", res.body);
-    let message = res.body["message"].as_str().unwrap_or_default();
-    assert!(message.contains("$setIsSubset cannot compare a Decimal128"), "{message}");
+    assert_eq!(res.status, 200, "{:?}", res.body);
+    let got = &res.body["documents"][0];
+    assert_eq!(got["sub"], false, "{got}");
+    assert_eq!(got["more"], true, "{got}");
+    assert_eq!(got["union"], json!([5.0, 1]), "first seen, the decimal 5 joins the double: {got}");
 }
 
 #[tokio::test]
@@ -10482,7 +10532,6 @@ async fn the_metrics_body_exposes_exactly_these_series_in_exactly_this_order() {
         "kimmy_ttl_skipped_total",
         "kimmy_ttl_skipped_filter_total",
         "kimmy_index_unkeyed_total",
-        "kimmy_index_undecidable_total",
         "kimmy_webhook_deliveries_total",
         "kimmy_webhook_deliveries_total",
         "kimmy_webhook_events_total",
@@ -10574,6 +10623,7 @@ async fn the_metrics_body_exposes_exactly_these_series_in_exactly_this_order() {
         "kimmy_sync_digest_repair_stopped_collections",
         "kimmy_sync_divergence_repair_enabled",
         "kimmy_gc_tombstone_horizon_seconds",
+        "kimmy_decimal128_id_present",
         "kimmy_sync_definition_repairs_total",
         "kimmy_sync_definition_repairs_total",
         "kimmy_sync_definition_repairs_total",
@@ -12330,11 +12380,6 @@ fn unkeyable_shapes() -> Vec<(&'static str, Value, Value)> {
             json!({ "a": (0..1_000).collect::<Vec<i32>>(), "b": 5 }),
             json!({ "b": 5 }),
         ),
-        (
-            "a Decimal128",
-            json!({ "a": 1, "b": { "$numberDecimal": "1.5" } }),
-            json!({ "b": { "$type": "decimal" } }),
-        ),
     ]
 }
 
@@ -12445,9 +12490,10 @@ async fn every_unkeyable_shape_is_filed_unkeyed_on_the_member_that_accepts_it() 
     // under a real key while both peers, applying the same bytes through
     // replication, filed it unkeyed: the JSON edge did not read
     // `$numberDecimal`, so the accepting member keyed a nested document
-    // where every re-decode of the stored bytes held a Decimal128. Every
-    // shape, by every way a document can arrive, now lands in the one state
-    // ADR-139 promises.
+    // where every re-decode of the stored bytes held a Decimal128. A
+    // `Decimal128` has a key now and is no longer one of the shapes; the rest,
+    // by every way a document can arrive, land in the one state ADR-139
+    // promises.
     for (shape, body, scan_only) in unkeyable_shapes() {
         for via in [Arrival::Insert, Arrival::Replace, Arrival::Set, Arrival::BeforeTheIndex] {
             unkeyed_on_the_accepting_member(shape, body.clone(), scan_only.clone(), via).await;
@@ -12456,10 +12502,10 @@ async fn every_unkeyable_shape_is_filed_unkeyed_on_the_member_that_accepts_it() 
 }
 
 #[tokio::test]
-async fn a_unique_index_refuses_a_decimal128_at_its_path_on_a_local_write() {
-    // The one refusal ADR-139 keeps, for the one shape the accepting member
-    // used to let through: a Decimal128 at a unique index's path is a
-    // document the index cannot key, and the client is there to be told.
+async fn a_unique_index_keys_a_decimal128_by_its_value_on_a_local_write() {
+    // A `Decimal128` at a unique index's path has an exact key, so it is stored
+    // and enforced like any number: a second document of the same value is a
+    // duplicate whatever the types and the spelling, and a different value is not.
     let server = Server::start().await;
     let token = server.root().await;
     server.post("/v1/db/shop/collections", Some(&token), json!({ "name": "prices" })).await;
@@ -12473,34 +12519,30 @@ async fn a_unique_index_refuses_a_decimal128_at_its_path_on_a_local_write() {
     assert_eq!(created.status, 200, "{:?}", created.body);
 
     let docs = "/v1/db/shop/coll/prices/docs";
-    let refused = server
-        .post(docs, Some(&token), json!({ "_id": 1, "amount": { "$numberDecimal": "9.99" } }))
-        .await;
-    assert_eq!(refused.status, 400, "{:?}", refused.body);
-    assert_eq!(refused.body["error"], "bad_request");
-    let message = refused.body["message"].as_str().unwrap();
-    assert!(message.contains("\"by_amount\""), "names the index: {message}");
-    assert!(message.contains("Decimal128"), "names the cause: {message}");
-    assert!(message.contains("a unique index must be able to key"), "{message}");
-    assert_eq!(server.get(&format!("{docs}/1"), Some(&token)).await.status, 404, "not stored");
-
-    // Without the unique constraint the same document is stored, unkeyed.
-    let dropped = server.delete("/v1/db/shop/coll/prices/indexes/by_amount", Some(&token)).await;
-    assert_eq!(dropped.status, 200, "{:?}", dropped.body);
-    let plain = server
-        .post(
-            "/v1/db/shop/coll/prices/indexes",
-            Some(&token),
-            json!({ "name": "by_amount", "fields": [{ "path": "amount" }] }),
-        )
-        .await;
-    assert_eq!(plain.status, 200, "{:?}", plain.body);
     let stored = server
         .post(docs, Some(&token), json!({ "_id": 1, "amount": { "$numberDecimal": "9.99" } }))
         .await;
     assert_eq!(stored.status, 200, "{:?}", stored.body);
+    for (id, amount) in
+        [(2, json!({ "$numberDecimal": "9.990" })), (3, json!({ "$numberDecimal": "99.9E-1" }))]
+    {
+        let duplicate =
+            server.post(docs, Some(&token), json!({ "_id": id, "amount": amount })).await;
+        assert_eq!(duplicate.status, 409, "{amount}: {:?}", duplicate.body);
+    }
+    // 9.99 the decimal is not 9.99 the double.
+    let double = server.post(docs, Some(&token), json!({ "_id": 4, "amount": 9.99 })).await;
+    assert_eq!(double.status, 200, "{:?}", double.body);
+    // An integral decimal and the integer are one value.
+    let ten = server.post(docs, Some(&token), json!({ "_id": 5, "amount": 10 })).await;
+    assert_eq!(ten.status, 200, "{:?}", ten.body);
+    let same = server
+        .post(docs, Some(&token), json!({ "_id": 6, "amount": { "$numberDecimal": "10.0" } }))
+        .await;
+    assert_eq!(same.status, 409, "{:?}", same.body);
+
     let listed = server.get("/v1/db/shop/coll/prices/indexes", Some(&token)).await;
-    assert_eq!(listed.body["indexes"][0]["unkeyed"], 1, "{}", listed.body);
+    assert_eq!(listed.body["indexes"][0]["unkeyed"], 0, "{}", listed.body);
 }
 
 #[tokio::test]
@@ -12792,152 +12834,518 @@ async fn a_decimal128_is_stored_intact_and_returned_as_it_was_sent() {
         .await;
     assert_eq!(bad.status, 400, "{:?}", bad.body);
     assert!(bad.body["message"].as_str().unwrap().contains("$numberDecimal"), "{:?}", bad.body);
+
+    // So are the texts the `bson` crate's parser read as numbers: a blank
+    // price was stored as 0, `++1` as 1, `e100` as 0E+100. Each is a `400`
+    // naming the text, in a write and in a filter, and nothing is stored.
+    for (text, id) in [("", 3), (".", 4), ("++1", 5), ("-+1", 6), ("e100", 7), ("0+5", 8)] {
+        let res = server
+            .post(docs, Some(&token), json!({ "_id": id, "amount": { "$numberDecimal": text } }))
+            .await;
+        assert_eq!(res.status, 400, "{text:?}: {:?}", res.body);
+        assert_eq!(res.body["error"], "bad_request", "{text:?}");
+        let message = res.body["message"].as_str().unwrap();
+        assert!(
+            message.starts_with(&format!(
+                "invalid $numberDecimal: {}: not a decimal number",
+                json!(text)
+            )),
+            "{text:?}: {message}"
+        );
+        let missing = server.get(&format!("{docs}/{id}"), Some(&token)).await;
+        assert_eq!(missing.status, 404, "{text:?} stored nothing");
+        let filter = server
+            .post(
+                "/v1/db/shop/coll/ledger/find",
+                Some(&token),
+                json!({ "filter": { "amount": { "$numberDecimal": text } } }),
+            )
+            .await;
+        assert_eq!(filter.status, 400, "{text:?} as a filter operand: {:?}", filter.body);
+    }
+    // A value that would need rounding is refused, never rounded.
+    let res = server
+        .post(
+            docs,
+            Some(&token),
+            json!({ "_id": 9, "amount": { "$numberDecimal": "0.10000000000000000000000000000000001" } }),
+        )
+        .await;
+    assert_eq!(res.status, 400, "{:?}", res.body);
+    assert!(res.body["message"].as_str().unwrap().contains("more than 34 significant digits"));
+}
+
+/// The `_id`s of what a find over `filter` returns, in `_id` order.
+async fn decimal_find_ids(server: &Server, token: &str, coll: &str, body: Value) -> Vec<Value> {
+    let res =
+        server.post(&format!("/v1/db/shop/coll/{coll}/find"), Some(token), body.clone()).await;
+    assert_eq!(res.status, 200, "{body}: {:?}", res.body);
+    res.body["documents"].as_array().unwrap().iter().map(|d| d["_id"].clone()).collect()
+}
+
+fn dec(text: &str) -> Value {
+    json!({ "$numberDecimal": text })
 }
 
 #[tokio::test]
-async fn a_decimal128_cannot_be_a_filter_operand_a_sort_key_or_an_id() {
-    // Once the edge reads `$numberDecimal`, a Decimal128 operand would
-    // reach `canonical_cmp`, which ranks a Decimal128 equal to every number
-    // — so `{v: 1.5m}` would match every numeric `v`. It is refused on
-    // purpose instead, wherever a filter compares, and a sort or an `_id`
-    // has no place for it either.
+async fn a_decimal128_filter_operand_is_compared_by_its_exact_value() {
+    // Design 2.2, over HTTP. A `$numberDecimal` operand used to be refused
+    // ("cannot be compared in a filter"), and a stored one matched every
+    // number by equality and could not be excluded by `$ne`. Every number is
+    // now its exact value: a decimal equals the number it equals, and
+    // `0.1` the decimal is not `0.1` the double.
     let server = Server::start().await;
     let token = server.root().await;
     server.post("/v1/db/shop/collections", Some(&token), json!({ "name": "v" })).await;
     let docs = "/v1/db/shop/coll/v/docs";
-    for (id, v) in [(1, json!(1)), (2, json!(1.5)), (3, json!({ "$numberDecimal": "1.5" }))] {
+    for (id, v) in [
+        (1, json!(1)),
+        (2, json!(1.5)),
+        (3, dec("1.5")),
+        (4, dec("0.1")),
+        (5, json!(0.1)),
+        (6, json!([1, dec("2.5")])),
+        (7, json!({ "n": dec("1") })),
+        (8, json!("1.5")),
+        (9, dec("1E+400")),
+    ] {
         let res = server.post(docs, Some(&token), json!({ "_id": id, "v": v })).await;
         assert_eq!(res.status, 200, "{:?}", res.body);
     }
-    let dec = json!({ "$numberDecimal": "1.5" });
+    let all: Vec<Value> = (1..=9).map(|i| json!(i)).collect();
+    let ids = |list: &[i32]| -> Vec<Value> { list.iter().map(|i| json!(i)).collect() };
 
-    let refused = |filter: Value| {
+    // Both callers that used to refuse: a bare equality (and one inside a
+    // document or `$or`), and every comparing operator.
+    let cases = [
+        (json!({ "v": dec("1.5") }), ids(&[2, 3])),
+        (json!({ "v": dec("1.50") }), ids(&[2, 3])),
+        (json!({ "v": { "$eq": 1.5 } }), ids(&[2, 3])),
+        (json!({ "v": { "$eq": 999_999 } }), ids(&[])),
+        (json!({ "v": { "$ne": 999_999 } }), all.clone()),
+        (json!({ "v": { "$eq": 0.1 } }), ids(&[5])),
+        (json!({ "v": dec("0.1") }), ids(&[4])),
+        (json!({ "v": { "$eq": dec("0.10") } }), ids(&[4])),
+        (json!({ "v": { "$gt": dec("1") } }), ids(&[2, 3, 6, 9])),
+        (json!({ "v": { "$gte": dec("1.0") } }), ids(&[1, 2, 3, 6, 9])),
+        (json!({ "v": { "$lt": dec("0.1") } }), ids(&[])),
+        (json!({ "v": { "$lte": dec("0.1") } }), ids(&[4])),
+        (json!({ "v": { "$lt": 0.1 } }), ids(&[4])),
+        (json!({ "v": { "$in": [dec("1"), dec("0.1")] } }), ids(&[1, 4, 6])),
+        (json!({ "v": { "$nin": [dec("1.5")] } }), ids(&[1, 4, 5, 6, 7, 8, 9])),
+        (json!({ "v": { "$all": [dec("2.50"), 1] } }), ids(&[6])),
+        (json!({ "v": { "$elemMatch": { "$gt": dec("2"), "$lt": dec("3") } } }), ids(&[6])),
+        (json!({ "v": { "$not": { "$gt": dec("1") } } }), ids(&[1, 4, 5, 7, 8])),
+        (json!({ "v": { "n": dec("1.0") } }), ids(&[7])),
+        (json!({ "v.n": 1 }), ids(&[7])),
+        (json!({ "$or": [{ "v": 1 }, { "v": dec("0.1") }] }), ids(&[1, 4, 6])),
+        // `$expr` takes a decimal literal, and its comparisons are the
+        // canonical order's: across types, strings and documents and arrays
+        // sort above every number.
+        (json!({ "$expr": { "$eq": ["$v", dec("1.5")] } }), ids(&[2, 3])),
+        (json!({ "$expr": { "$eq": ["$v", 5] } }), ids(&[])),
+        (json!({ "$expr": { "$gt": ["$v", dec("1E+399")] } }), ids(&[6, 7, 8, 9])),
+    ];
+    for (filter, want) in &cases {
+        let got = decimal_find_ids(&server, &token, "v", json!({ "filter": filter })).await;
+        assert_eq!(&got, want, "{filter}");
+        let res = server
+            .post("/v1/db/shop/coll/v/count", Some(&token), json!({ "filter": filter }))
+            .await;
+        assert_eq!(res.body["count"], want.len(), "count {filter}: {:?}", res.body);
+    }
+
+    // `$type` and `$exists` compare nothing and find decimals as ever.
+    let by_type = json!({ "filter": { "v": { "$type": "decimal" } } });
+    assert_eq!(decimal_find_ids(&server, &token, "v", by_type).await, ids(&[3, 4, 6, 9]));
+
+    // Through an index on `v`: the decimals are keyed, and a range with
+    // decimal bounds answers from the index exactly what the scan answered.
+    let res = server
+        .post("/v1/db/shop/coll/v/indexes", Some(&token), json!({ "fields": [{ "path": "v" }] }))
+        .await;
+    assert_eq!(res.status, 200, "{:?}", res.body);
+    for (filter, want) in &cases {
+        let got = decimal_find_ids(&server, &token, "v", json!({ "filter": filter })).await;
+        assert_eq!(&got, want, "indexed: {filter}");
+    }
+    let res = server
+        .post(
+            "/v1/db/shop/coll/v/find",
+            Some(&token),
+            json!({ "filter": { "v": { "$gt": dec("1"), "$lt": dec("1E+500") } }, "explain": true }),
+        )
+        .await;
+    assert_eq!(res.body["explain"]["strategy"], "index", "{:?}", res.body);
+    let got: Vec<Value> =
+        res.body["documents"].as_array().unwrap().iter().map(|d| d["_id"].clone()).collect();
+    assert_eq!(got, ids(&[2, 3, 6, 9]), "{:?}", res.body);
+    let res = server
+        .post(
+            "/v1/db/shop/coll/v/find",
+            Some(&token),
+            json!({ "filter": { "v": { "$in": [dec("1.5"), dec("0.10")] } }, "explain": true }),
+        )
+        .await;
+    assert_eq!(res.body["explain"]["strategy"], "indexUnion", "{:?}", res.body);
+    assert_eq!(res.body["count"], 3, "{:?}", res.body);
+
+    // An `_id` can be one, and a non-integer decimal id is reached by a
+    // filter (the by-id routes parse an integer or a string), by the
+    // primary-key lookup, whatever its spelling. An integral one is the
+    // integer id, its body keeping the decimal as written.
+    let as_id = server.post(docs, Some(&token), json!({ "_id": dec("2.5"), "v": 0 })).await;
+    assert_eq!(as_id.status, 200, "{:?}", as_id.body);
+    let integral = server.post(docs, Some(&token), json!({ "_id": dec("70.0"), "v": 0 })).await;
+    assert_eq!(integral.status, 200, "{:?}", integral.body);
+    for (filter, want) in [
+        (json!({ "_id": dec("2.50") }), json!([dec("2.5")])),
+        (json!({ "_id": dec("25E-1") }), json!([dec("2.5")])),
+        (json!({ "_id": 2.5 }), json!([dec("2.5")])),
+        (json!({ "_id": 70 }), json!([dec("70.0")])),
+        (json!({ "_id": dec("7E+1") }), json!([dec("70.0")])),
+        (json!({ "_id": { "$in": [dec("2.5"), 70] } }), json!([dec("2.5"), dec("70.0")])),
+    ] {
+        let res = server
+            .post(
+                "/v1/db/shop/coll/v/find",
+                Some(&token),
+                json!({ "filter": filter, "explain": true }),
+            )
+            .await;
+        assert_eq!(res.status, 200, "{filter}: {:?}", res.body);
+        let got: Vec<Value> =
+            res.body["documents"].as_array().unwrap().iter().map(|d| d["_id"].clone()).collect();
+        assert_eq!(Value::from(got), want, "{filter}");
+    }
+    let res = server
+        .post(
+            "/v1/db/shop/coll/v/find",
+            Some(&token),
+            json!({ "filter": { "_id": dec("2.5") }, "explain": true }),
+        )
+        .await;
+    assert_eq!(res.body["explain"]["strategy"], "idLookup", "{:?}", res.body);
+}
+
+#[tokio::test]
+async fn sum_and_avg_over_a_decimal128_answer_400_where_they_skipped_it() {
+    // `$sum` and `$avg` used to skip a `Decimal128` as they skip a string, so
+    // over 1, 2.5 (a decimal) and 2 a report read a total of 3 and a mean of
+    // 1.5, where the values add up to 5.5. Decimal arithmetic is not built, so
+    // the pipeline is refused, `400`, in the words `$add` refuses one with.
+    let server = Server::start().await;
+    let token = server.root().await;
+    server.post("/v1/db/shop/collections", Some(&token), json!({ "name": "s" })).await;
+    for (id, v) in [(1, json!(1)), (2, dec("2.5")), (3, json!(2))] {
+        let res = server
+            .post("/v1/db/shop/coll/s/docs", Some(&token), json!({ "_id": id, "v": v }))
+            .await;
+        assert_eq!(res.status, 200, "{:?}", res.body);
+    }
+    let aggregate = |pipeline: Value| {
+        let server = &server;
+        let token = &token;
+        async move {
+            server
+                .post("/v1/db/shop/coll/s/aggregate", Some(token), json!({ "pipeline": pipeline }))
+                .await
+        }
+    };
+    for op in ["$sum", "$avg"] {
+        let res = aggregate(json!([{ "$group": { "_id": null, "r": { op: "$v" } } }])).await;
+        assert_eq!(res.status, 400, "{op}: {:?}", res.body);
+        assert_eq!(res.body["error"], "bad_request", "{op}");
+        assert_eq!(
+            res.body["message"],
+            format!("invalid query: {op} needs numbers, found a Decimal128"),
+            "{op}"
+        );
+    }
+    let add = aggregate(json!([{ "$project": { "r": { "$add": ["$v", 1] } } }])).await;
+    assert_eq!(add.status, 400, "{:?}", add.body);
+    assert_eq!(add.body["message"], "invalid query: $add needs numbers, found a Decimal128");
+
+    // Counting, and the accumulators that do no arithmetic, are unaffected.
+    let res = aggregate(json!([{ "$group": {
+        "_id": null, "n": { "$sum": 1 }, "hi": { "$max": "$v" }, "all": { "$push": "$v" }
+    } }]))
+    .await;
+    assert_eq!(res.status, 200, "{:?}", res.body);
+    let got = &res.body["documents"][0];
+    assert_eq!(got["n"], 3);
+    assert_eq!(got["hi"], dec("2.5"));
+    assert_eq!(got["all"], json!([1, dec("2.5"), 2]));
+    // Without the decimal, the total is what it was.
+    let res = aggregate(json!([
+        { "$match": { "v": { "$type": ["int", "long", "double"] } } },
+        { "$group": { "_id": null, "t": { "$sum": "$v" }, "m": { "$avg": "$v" } } }
+    ]))
+    .await;
+    assert_eq!(res.status, 200, "{:?}", res.body);
+    assert_eq!(res.body["documents"][0]["t"], 3);
+    assert_eq!(res.body["documents"][0]["m"], 1.5);
+}
+
+#[tokio::test]
+async fn aggregation_groups_joins_and_ranks_a_decimal128_by_its_value() {
+    // Design 2.2: `$group`, `$addToSet` and the `$lookup` join keys identify
+    // equal numbers and decimals as one member, a bucket's `_id` the first
+    // member seen; `$max`/`$min` rank a decimal by its value; `$expr` and the
+    // pipeline-form join compare exactly.
+    let server = Server::start().await;
+    let token = server.root().await;
+    for name in ["g", "items"] {
+        server.post("/v1/db/shop/collections", Some(&token), json!({ "name": name })).await;
+    }
+    for (id, v) in [
+        (1, dec("1.00")),
+        (2, json!(1)),
+        (3, json!(1.0)),
+        (4, dec("1")),
+        (5, dec("0.1")),
+        (6, json!(0.1)),
+    ] {
+        server
+            .post("/v1/db/shop/coll/g/docs", Some(&token), json!({ "_id": id, "v": v, "x": 5 }))
+            .await;
+    }
+    server
+        .post(
+            "/v1/db/shop/coll/g/docs",
+            Some(&token),
+            json!({ "_id": 7, "v": dec("1.5"), "x": dec("1.5") }),
+        )
+        .await;
+    for (id, k) in
+        [(10, json!(1)), (11, dec("0.10")), (12, json!(0.1)), (13, dec("1.5")), (14, json!(5))]
+    {
+        server
+            .post("/v1/db/shop/coll/items/docs", Some(&token), json!({ "_id": id, "k": k }))
+            .await;
+    }
+    let aggregate = |pipeline: Value| {
         let server = &server;
         let token = &token;
         async move {
             let res = server
-                .post("/v1/db/shop/coll/v/find", Some(token), json!({ "filter": filter }))
+                .post("/v1/db/shop/coll/g/aggregate", Some(token), json!({ "pipeline": pipeline }))
                 .await;
-            assert_eq!(res.status, 400, "{filter}: {:?}", res.body);
-            assert_eq!(res.body["error"], "bad_request", "{filter}");
-            let message = res.body["message"].as_str().unwrap().to_string();
-            assert!(
-                message.contains("Decimal128")
-                    && message.contains("cannot be compared in a filter"),
-                "{filter}: {message}"
-            );
-            message
+            assert_eq!(res.status, 200, "{:?}", res.body);
+            res.body["documents"].as_array().unwrap().clone()
         }
     };
-    refused(json!({ "v": dec })).await;
-    refused(json!({ "v": { "$eq": dec } })).await;
-    refused(json!({ "v": { "$ne": dec } })).await;
-    refused(json!({ "v": { "$gt": dec } })).await;
-    refused(json!({ "v": { "$lte": dec } })).await;
-    refused(json!({ "v": { "$in": [1, dec] } })).await;
-    refused(json!({ "v": { "$nin": [dec] } })).await;
-    refused(json!({ "v": { "$all": [dec] } })).await;
-    refused(json!({ "v": { "$not": { "$gt": dec } } })).await;
-    refused(json!({ "v": { "$elemMatch": { "$eq": dec } } })).await;
-    refused(json!({ "$or": [{ "v": 1 }, { "v": dec }] })).await;
-    refused(json!({ "v": { "n": dec } })).await;
-    refused(json!({ "v": [dec] })).await;
-    refused(json!({ "_id": dec })).await;
-    let expr = server
-        .post(
-            "/v1/db/shop/coll/v/find",
-            Some(&token),
-            json!({ "filter": { "$expr": { "$eq": ["$v", dec] } } }),
-        )
-        .await;
-    assert_eq!(expr.status, 400, "{:?}", expr.body);
-    assert!(expr.body["message"].as_str().unwrap().contains("Decimal128"), "{:?}", expr.body);
 
-    // The refusal is about comparing, not about the type: a filter that
-    // asks for the type, or for the document by another field, still works.
-    let by_type = server
-        .post(
-            "/v1/db/shop/coll/v/find",
-            Some(&token),
-            json!({ "filter": { "v": { "$type": "decimal" } } }),
-        )
-        .await;
-    assert_eq!(by_type.status, 200, "{:?}", by_type.body);
-    assert_eq!(by_type.body["count"], 1, "{}", by_type.body);
-
-    // A sort over a field where a matching document holds a Decimal128 is
-    // refused naming the document, rather than placing it nowhere in
-    // particular among the numbers.
-    let sorted = server
-        .post("/v1/db/shop/coll/v/find", Some(&token), json!({ "filter": {}, "sort": { "v": 1 } }))
-        .await;
-    assert_eq!(sorted.status, 400, "{:?}", sorted.body);
-    let message = sorted.body["message"].as_str().unwrap();
-    assert!(message.contains("cannot sort by \"v\""), "{message}");
-    assert!(message.contains("Decimal128"), "{message}");
-    assert!(message.contains('3'), "names the document: {message}");
-    let others = server
-        .post(
-            "/v1/db/shop/coll/v/find",
-            Some(&token),
-            json!({ "filter": { "_id": { "$in": [1, 2] } }, "sort": { "v": -1 } }),
-        )
-        .await;
+    // One bucket for 1, 1.0, 1m and 1.00m, named by the first seen; 0.1 the
+    // decimal and 0.1 the double are two.
+    let groups = aggregate(json!([
+        { "$sort": { "_id": 1 } },
+        { "$group": { "_id": "$v", "n": { "$sum": 1 } } },
+        { "$sort": { "_id": 1 } }
+    ]))
+    .await;
     assert_eq!(
-        others.status, 200,
-        "the Decimal128 document is not among the matches: {:?}",
-        others.body
+        groups,
+        vec![
+            json!({ "_id": dec("0.1"), "n": 1 }),
+            json!({ "_id": 0.1, "n": 1 }),
+            json!({ "_id": dec("1.00"), "n": 4 }),
+            json!({ "_id": dec("1.5"), "n": 1 }),
+        ]
     );
-    assert_eq!(others.body["documents"][0]["_id"], 2, "{}", others.body);
+    let set = aggregate(json!([
+        { "$sort": { "_id": 1 } },
+        { "$group": { "_id": null, "s": { "$addToSet": "$v" }, "hi": { "$max": "$x" }, "lo": { "$min": "$x" } } }
+    ]))
+    .await;
+    assert_eq!(set[0]["s"], json!([dec("1.00"), dec("0.1"), 0.1, dec("1.5")]));
+    // `$max` over `[Decimal128("1.5"), 5]` is 5; it used to be 1.5.
+    assert_eq!(set[0]["hi"], 5);
+    assert_eq!(set[0]["lo"], dec("1.5"));
 
-    // And an `_id` cannot be one, which the write path already refused.
-    let as_id = server.post(docs, Some(&token), json!({ "_id": dec, "v": 0 })).await;
-    assert_eq!(as_id.status, 400, "{:?}", as_id.body);
-    assert_eq!(as_id.body["error"], "bad_request", "{:?}", as_id.body);
+    // The equality `$lookup` and the pipeline form, whose leading `$eq` is the
+    // hash join: each joins exactly the equal values.
+    let joined = |docs: Vec<Value>| -> Vec<(Value, Vec<Value>)> {
+        docs.iter()
+            .map(|d| {
+                let got = d["got"].as_array().unwrap().iter().map(|g| g["_id"].clone()).collect();
+                (d["_id"].clone(), got)
+            })
+            .collect()
+    };
+    let want = vec![
+        (json!(1), vec![json!(10)]),
+        (json!(2), vec![json!(10)]),
+        (json!(3), vec![json!(10)]),
+        (json!(4), vec![json!(10)]),
+        (json!(5), vec![json!(11)]),
+        (json!(6), vec![json!(12)]),
+        (json!(7), vec![json!(13)]),
+    ];
+    let by_field = aggregate(json!([
+        { "$lookup": { "from": "items", "localField": "v", "foreignField": "k", "as": "got" } }
+    ]))
+    .await;
+    assert_eq!(joined(by_field), want);
+    let by_pipeline = aggregate(json!([
+        { "$lookup": { "from": "items", "let": { "v": "$v" }, "as": "got",
+            "pipeline": [{ "$match": { "$expr": { "$eq": ["$k", "$$v"] } } }] } }
+    ]))
+    .await;
+    assert_eq!(joined(by_pipeline), want);
+    // A decimal literal in the sub-pipeline, beside the join.
+    let literal = aggregate(json!([
+        { "$match": { "_id": 7 } },
+        { "$lookup": { "from": "items", "let": { "v": "$v" }, "as": "got",
+            "pipeline": [{ "$match": { "$expr": { "$lte": ["$k", dec("1.50")] } } }] } }
+    ]))
+    .await;
+    let got: Vec<Value> =
+        literal[0]["got"].as_array().unwrap().iter().map(|g| g["_id"].clone()).collect();
+    assert_eq!(got, vec![json!(10), json!(11), json!(12), json!(13)]);
 
-    // The update operators that compare their operand against every
-    // element refuse one too. Before they did, `$pull` of a Decimal128
-    // emptied an array of its numbers, with a `200`. `$addToSet` does not
-    // compare: a member is identified by its bytes (ADR-186), so it takes one.
-    let arrays = json!({ "_id": 4, "xs": [1, 2.5, "s", 3], "ys": [1, 2], "zs": [7, 8] });
-    let res = server.post(docs, Some(&token), arrays.clone()).await;
-    assert_eq!(res.status, 200, "{:?}", res.body);
-    for update in [
-        json!({ "$pull": { "xs": dec } }),
-        json!({ "$pullAll": { "zs": [dec] } }),
-        json!({ "$min": { "xs": dec } }),
-        json!({ "$max": { "xs": dec } }),
+    // `$expr` against a stored decimal (design 2.2: `$eq: ["$v", 5]` on 1.5 is
+    // false; it used to be true).
+    let res = aggregate(json!([
+        { "$match": { "_id": 7 } },
+        { "$project": { "eq5": { "$eq": ["$v", 5] }, "cmp": { "$cmp": ["$v", 1.5] },
+                        "lt": { "$lt": ["$v", dec("1.51")] } } }
+    ]))
+    .await;
+    assert_eq!(res[0]["eq5"], false);
+    assert_eq!(res[0]["cmp"], 0);
+    assert_eq!(res[0]["lt"], true);
+}
+
+#[tokio::test]
+async fn a_sort_places_a_decimal128_among_the_numbers() {
+    // Design 2.2: a sort over a path holding a decimal used to be refused
+    // naming the document; the order is total now, and a decimal takes its
+    // place among the numbers in `find`, `find_and_modify` and `$sort`.
+    let server = Server::start().await;
+    let token = server.root().await;
+    server.post("/v1/db/shop/collections", Some(&token), json!({ "name": "s" })).await;
+    let docs = "/v1/db/shop/coll/s/docs";
+    for (id, v) in [
+        (1, json!(2)),
+        (2, dec("1.5")),
+        (3, json!(1)),
+        (4, json!(0.1)),
+        (5, dec("0.1")),
+        (6, json!("a")),
+        (7, json!([dec("3"), 9])),
     ] {
-        let res = server
-            .post(
-                "/v1/db/shop/coll/v/update",
-                Some(&token),
-                json!({ "filter": { "_id": 4 }, "update": update }),
-            )
-            .await;
-        assert_eq!(res.status, 400, "{update}: {:?}", res.body);
-        assert_eq!(res.body["error"], "bad_request", "{update}");
-        let message = res.body["message"].as_str().unwrap();
-        assert!(message.contains("Decimal128"), "{update}: {message}");
+        server.post(docs, Some(&token), json!({ "_id": id, "v": v })).await;
     }
-    let untouched = server.get(&format!("{docs}/4"), Some(&token)).await;
-    assert_eq!(untouched.body, arrays, "nothing was pulled");
-    // A Decimal128 arriving as extended JSON is added intact, once.
+    let order = |list: &[i32]| -> Vec<Value> { list.iter().map(|i| json!(i)).collect() };
+    let up = json!({ "filter": {}, "sort": { "v": 1 } });
+    assert_eq!(decimal_find_ids(&server, &token, "s", up).await, order(&[5, 4, 3, 2, 1, 7, 6]));
+    let down = json!({ "filter": {}, "sort": { "v": -1 }, "limit": 3 });
+    assert_eq!(decimal_find_ids(&server, &token, "s", down).await, order(&[6, 7, 1]));
+
+    let res = server
+        .post(
+            "/v1/db/shop/coll/s/aggregate",
+            Some(&token),
+            json!({ "pipeline": [{ "$sort": { "v": 1 } }, { "$limit": 3 }] }),
+        )
+        .await;
+    assert_eq!(res.status, 200, "{:?}", res.body);
+    let got: Vec<Value> =
+        res.body["documents"].as_array().unwrap().iter().map(|d| d["_id"].clone()).collect();
+    assert_eq!(got, order(&[5, 4, 3]));
+
+    // `find_and_modify` takes the first in the sort: the decimal tenth.
+    let res = server
+        .post(
+            "/v1/db/shop/coll/s/find_and_modify",
+            Some(&token),
+            json!({ "filter": {}, "sort": { "v": 1 }, "update": { "$set": { "first": true } } }),
+        )
+        .await;
+    assert_eq!(res.status, 200, "{:?}", res.body);
+    assert_eq!(res.body["document"]["_id"], 5, "{:?}", res.body);
+}
+
+#[tokio::test]
+async fn update_delete_and_count_reach_a_decimal128_by_its_value() {
+    // Design 2.2: `$ne`/`$nin` against any other number now selects a
+    // document holding a decimal, so `deleteMany({v: {$ne: 999999}})` deletes
+    // it (it used to keep it), and the update operators that compare their
+    // operand take a decimal one and compare it exactly.
+    let server = Server::start().await;
+    let token = server.root().await;
+    server.post("/v1/db/shop/collections", Some(&token), json!({ "name": "u" })).await;
+    let docs = "/v1/db/shop/coll/u/docs";
+    for (id, v) in [(1, dec("1.5")), (2, json!(999_999)), (3, dec("2"))] {
+        server.post(docs, Some(&token), json!({ "_id": id, "v": v })).await;
+    }
+    let res = server
+        .post(
+            "/v1/db/shop/coll/u/count",
+            Some(&token),
+            json!({ "filter": { "v": { "$ne": 999_999 } } }),
+        )
+        .await;
+    assert_eq!(res.body["count"], 2, "{:?}", res.body);
+    let res = server
+        .post(
+            "/v1/db/shop/coll/u/update",
+            Some(&token),
+            json!({ "filter": { "v": { "$nin": [999_999] } }, "update": { "$set": { "seen": true } }, "multi": true }),
+        )
+        .await;
+    assert_eq!(res.body["matched"], 2, "{:?}", res.body);
+    let res = server
+        .post(
+            "/v1/db/shop/coll/u/delete",
+            Some(&token),
+            json!({ "filter": { "v": { "$ne": 999_999 } }, "multi": true }),
+        )
+        .await;
+    assert_eq!(res.status, 200, "{:?}", res.body);
+    assert_eq!(res.body["deleted"], 2, "{:?}", res.body);
+    let left = decimal_find_ids(&server, &token, "u", json!({ "filter": {} })).await;
+    assert_eq!(left, vec![json!(2)]);
+
+    // The update operators. `$pull` and `$pullAll` remove by value, `$min`
+    // and `$max` compare by value, `$push`'s `$sort` places a decimal, and
+    // `$addToSet` identifies by value; each with a decimal operand, which
+    // all but `$addToSet` used to refuse.
+    let arrays = json!({ "_id": 4, "xs": [1, 2.5, "s", 3], "zs": [7, 8], "t": [dec("1"), 2], "m": dec("1.5") });
+    server.post(docs, Some(&token), arrays).await;
     for update in [
-        json!({ "$addToSet": { "ys": dec } }),
-        json!({ "$addToSet": { "ys": { "$each": [dec, dec] } } }),
+        json!({ "$pull": { "xs": dec("2.50") } }),
+        json!({ "$pull": { "t": 5 } }),
+        json!({ "$pullAll": { "zs": [dec("8.0"), dec("7.1")] } }),
+        json!({ "$max": { "m": 5 } }),
+        json!({ "$push": { "xs": { "$each": [dec("2")], "$sort": 1 } } }),
+        json!({ "$addToSet": { "zs": { "$each": [dec("7.00"), dec("0.1"), 0.1] } } }),
     ] {
         let res = server
             .post(
-                "/v1/db/shop/coll/v/update",
+                "/v1/db/shop/coll/u/update",
                 Some(&token),
                 json!({ "filter": { "_id": 4 }, "update": update }),
             )
             .await;
         assert_eq!(res.status, 200, "{update}: {:?}", res.body);
     }
-    let added = server.get(&format!("{docs}/4"), Some(&token)).await;
-    assert_eq!(added.body["ys"], json!([1, 2, dec]), "{:?}", added.body);
+    let got = server.get(&format!("{docs}/4"), Some(&token)).await;
+    assert_eq!(got.body["xs"], json!([1, dec("2"), 3, "s"]), "{:?}", got.body);
+    assert_eq!(got.body["t"], json!([dec("1"), 2]), "$pull of 5 keeps the decimal one");
+    assert_eq!(got.body["zs"], json!([7, dec("0.1"), 0.1]), "{:?}", got.body);
+    assert_eq!(got.body["m"], 5, "$max of 5 over a decimal 1.5 sets 5");
+    let res = server
+        .post(
+            "/v1/db/shop/coll/u/update",
+            Some(&token),
+            json!({ "filter": { "_id": 4 }, "update": { "$min": { "m": dec("4.99") } } }),
+        )
+        .await;
+    assert_eq!(res.body["modified"], 1, "{:?}", res.body);
+    let got = server.get(&format!("{docs}/4"), Some(&token)).await;
+    assert_eq!(got.body["m"], dec("4.99"));
 }
 
 // ---------------------------------------------------------------------------
@@ -14297,29 +14705,35 @@ async fn an_index_carries_every_field_the_specification_requires() {
         .iter()
         .map(|v| v.as_str().expect("a field name").to_string())
         .collect();
+    assert!(required.contains(&"unkeyed".to_string()), "premise: the Index schema ({required:?})");
+    // ADR-238 removed `undecidable` (ADR-185's figure for the documents a
+    // partial filter could not decide), from the response and from the schema:
+    // a filter decides a `Decimal128` by its exact value.
     assert!(
-        required.contains(&"unkeyed".to_string()) && required.contains(&"undecidable".to_string()),
-        "premise: the list read is the Index schema's ({required:?})"
+        !required.contains(&"undecidable".to_string())
+            && spec["components"]["schemas"]["Index"]["properties"].get("undecidable").is_none(),
+        "docs/openapi.yaml still promises the removed `undecidable` ({required:?})"
     );
 
     let server = Server::start().await;
     let token = server.root().await;
     server.post("/v1/db/shop/collections", Some(&token), json!({ "name": "orders" })).await;
-    // A partial index, so the two sentinel figures are both meaningful, and one
-    // document the filter cannot decide so `undecidable` is not merely present.
-    server
-        .post(
-            "/v1/db/shop/coll/orders/docs",
-            Some(&token),
-            json!({ "_id": "a", "note": "x", "k": { "$numberDecimal": "1" } }),
-        )
-        .await;
+    // A partial compound index, and documents with arrays at both of its paths,
+    // which it cannot key: one the filter selects, by a decimal's exact value,
+    // so `unkeyed` is not merely present, and one it does not, which the index
+    // does not hold at all.
+    let docs = "/v1/db/shop/coll/orders/docs";
+    for (id, k) in [("a", "9"), ("b", "1")] {
+        let doc =
+            json!({ "_id": id, "note": ["x", "y"], "tag": [1, 2], "k": { "$numberDecimal": k } });
+        assert_eq!(server.post(docs, Some(&token), doc).await.status, 200);
+    }
     let created = server
         .post(
             "/v1/db/shop/coll/orders/indexes",
             Some(&token),
             json!({
-                "fields": [{ "path": "note" }],
+                "fields": [{ "path": "note" }, { "path": "tag" }],
                 "partialFilterExpression": { "k": { "$gt": 5 } },
             }),
         )
@@ -14334,37 +14748,39 @@ async fn an_index_carries_every_field_the_specification_requires() {
                 "{what} does not carry {field:?}, which docs/openapi.yaml marks required: {body}"
             );
         }
+        assert!(body.get("undecidable").is_none(), "{what} renders the removed field: {body}");
     }
     assert_eq!(
-        listing["undecidable"], 1,
-        "and the figure is the real one, not a zero that would pass whatever it counted: {listing}"
+        listing["unkeyed"], 1,
+        "and the figure is the real one, not a zero that would pass whatever it counted: the \
+         decimal 9 is selected and unkeyable, the decimal 1 is not selected: {listing}"
     );
-    assert_eq!(listing["unkeyed"], 0, "the other reason is separate: {listing}");
 }
 
 #[tokio::test]
-async fn explain_reports_the_undecidable_run_it_read() {
-    // ADR-185 tells an owner that an undecidable document is rechecked on every
-    // scan of the index, and `explain` is where they would look for what that
-    // costs a query. The figure was computed and dropped: a query that read two
-    // entries from the undecidable run reported `unkeyedCandidates: 0` and
-    // nothing else, so the cost was invisible exactly where it is documented.
+async fn explain_reads_only_what_the_filter_selects_a_decimal_included() {
+    // From ADR-185 to ADR-238 a partial index held every document with a
+    // `Decimal128` at a filtered path in an undecidable run, read and rechecked
+    // by every scan, and `explain` reported the entries as
+    // `undecidableCandidates`. The comparator now places a decimal by its
+    // exact value, so the filter decides it: the index holds what the filter
+    // selects and nothing else, a scan reads exactly those entries, and the
+    // field is gone rather than left at a constant 0.
     let server = Server::start().await;
     let token = server.root().await;
     server.post("/v1/db/shop/collections", Some(&token), json!({ "name": "orders" })).await;
     let docs = "/v1/db/shop/coll/orders/docs";
-    // Two the filter cannot decide, and one it selects, so the run's entries
-    // are neither all of the index nor none of it.
-    for id in ["a", "b"] {
-        server
-            .post(
-                docs,
-                Some(&token),
-                json!({ "_id": id, "note": "n", "k": { "$numberDecimal": "1" } }),
-            )
-            .await;
+    // Two decimals the filter decides against, one it selects, and a plain
+    // number it selects.
+    for (id, k) in [
+        ("a", json!({ "$numberDecimal": "1" })),
+        ("b", json!({ "$numberDecimal": "5.000" })),
+        ("c", json!(9)),
+        ("d", json!({ "$numberDecimal": "9.5" })),
+    ] {
+        let res = server.post(docs, Some(&token), json!({ "_id": id, "note": "n", "k": k })).await;
+        assert_eq!(res.status, 200, "{:?}", res.body);
     }
-    server.post(docs, Some(&token), json!({ "_id": "c", "note": "n", "k": 9 })).await;
     let created = server
         .post(
             "/v1/db/shop/coll/orders/indexes",
@@ -14375,11 +14791,9 @@ async fn explain_reports_the_undecidable_run_it_read() {
             }),
         )
         .await;
-    assert_eq!(
-        created.body["undecidable"], 2,
-        "premise: the backfill filed both: {}",
-        created.body
-    );
+    assert_eq!(created.status, 200, "{:?}", created.body);
+    assert_eq!(created.body["unkeyed"], 0, "{}", created.body);
+    assert!(created.body.get("undecidable").is_none(), "the removed field: {}", created.body);
 
     let count = |filter: Value| {
         let (server, token) = (&server, &token);
@@ -14396,35 +14810,44 @@ async fn explain_reports_the_undecidable_run_it_read() {
         }
     };
 
-    let hit = count(json!({ "note": "n", "k": 7 })).await;
-    assert_eq!(hit["explain"]["strategy"], "index", "{hit}");
-    assert_eq!(
-        hit["explain"]["undecidableCandidates"], 2,
-        "the entries this query read from the undecidable run: {hit}"
-    );
-    assert_eq!(
-        hit["explain"]["unkeyedCandidates"], 0,
-        "and not folded into the run that means a fault: {hit}"
-    );
-    assert_eq!(
-        hit["count"], 2,
-        "the two decimals match `k: 7`, which is why the index has to hold them (ADR-185); the \
-         document with `k: 9` does not: {hit}"
-    );
+    for (filter, matched) in [
+        (json!({ "note": "n", "k": 7 }), 0),
+        (json!({ "note": "n", "k": { "$gt": { "$numberDecimal": "9" } } }), 1),
+        (json!({ "note": "n", "k": { "$gte": 9 } }), 2),
+    ] {
+        let hit = count(filter.clone()).await;
+        assert_eq!(hit["explain"]["strategy"], "index", "{filter}: {hit}");
+        assert_eq!(
+            hit["explain"]["indexEntriesRead"], 2,
+            "{filter}: the 9 and the decimal 9.5, and neither decimal the filter decides \
+             against: {hit}"
+        );
+        assert_eq!(hit["explain"]["unkeyedCandidates"], 0, "{filter}: {hit}");
+        assert!(
+            hit["explain"].get("undecidableCandidates").is_none(),
+            "{filter}: the removed field: {hit}"
+        );
+        assert_eq!(hit["count"], matched, "{filter}: {hit}");
+    }
 
-    // A collection scan reads no index, so it reports neither figure rather
-    // than a zero that would read as an index with an empty run.
+    // A collection scan reads no index either.
     let scan = count(json!({ "other": 1 })).await;
     assert_eq!(scan["explain"]["strategy"], "collectionScan", "{scan}");
-    assert!(scan["explain"].get("undecidableCandidates").is_none(), "no index, no run: {scan}");
+    assert!(scan["explain"].get("undecidableCandidates").is_none(), "{scan}");
 
-    // And the field a client reads is the documented one.
+    // And the schema a client reads no longer documents it.
     let spec: serde_json::Value =
         serde_norway::from_str(include_str!("../../../docs/openapi.yaml"))
             .expect("docs/openapi.yaml is valid YAML");
     assert!(
-        spec["components"]["schemas"]["Explain"]["properties"]["undecidableCandidates"].is_object(),
-        "docs/openapi.yaml's Explain schema does not document undecidableCandidates"
+        spec["components"]["schemas"]["Explain"]["properties"]
+            .get("undecidableCandidates")
+            .is_none(),
+        "docs/openapi.yaml's Explain schema still documents the removed undecidableCandidates"
+    );
+    assert!(
+        spec["components"]["schemas"]["Explain"]["properties"]["unkeyedCandidates"].is_object(),
+        "premise: the Explain schema read is the one with the candidate figures"
     );
 }
 
@@ -15170,4 +15593,178 @@ async fn aggregate_explain_plans_and_the_body_stays_closed() {
         assert_eq!(planned.status, ran.status, "{coll} {pipeline}");
         assert_eq!(planned.body, ran.body, "{coll} {pipeline}");
     }
+}
+
+// ---------------------------------------------------------------------------
+// The Decimal128 gate and its marker (ADR-238)
+// ---------------------------------------------------------------------------
+
+fn decimal(text: &str) -> Value {
+    json!({ "$numberDecimal": text })
+}
+
+fn close_decimal128_gate(server: &Server) {
+    server.state.engine.set_decimal128_gate(Arc::new(|| {
+        Err(kimmy_core::Decimal128Closed::Peers(vec!["peer-b".into()]))
+    }));
+}
+
+fn refused_by_the_gate(res: &Res, path: &str) {
+    assert_eq!(res.status, 400, "{path}: {:?}", res.body);
+    let message = res.body["message"].as_str().unwrap_or_default();
+    assert!(
+        message.contains("cluster.decimal128") && message.contains("peer-b"),
+        "{path}: the refusal names the key and the peer: {message}"
+    );
+}
+
+#[tokio::test]
+async fn every_write_path_answers_400_for_a_decimal_id_while_the_gate_is_closed() {
+    let server = Server::start().await;
+    let token = server.root().await;
+    server.post("/v1/db/shop/collections", Some(&token), json!({ "name": "c" })).await;
+    close_decimal128_gate(&server);
+
+    let docs = "/v1/db/shop/coll/c/docs";
+    let res = server.post(docs, Some(&token), json!({ "_id": decimal("1.5"), "v": 1 })).await;
+    refused_by_the_gate(&res, "insert");
+    // An integral decimal: the id `7`, and a body that keeps the decimal.
+    let res = server.post(docs, Some(&token), json!({ "_id": decimal("7") })).await;
+    refused_by_the_gate(&res, "insert of an integral decimal");
+    let res = server
+        .post(
+            "/v1/db/shop/coll/c/bulk",
+            Some(&token),
+            json!([{ "_id": 1 }, { "_id": decimal("2.5") }]),
+        )
+        .await;
+    refused_by_the_gate(&res, "bulk");
+    // An upsert takes its `_id` from the filter's equalities (`$setOnInsert` cannot
+    // set `_id`). On this build a decimal filter operand is still refused by the
+    // filter, which answers first; the gate's own refusal of an upsert, with and
+    // without `$setOnInsert`, is pinned at the storage chokepoint the edge reaches
+    // (`decimal128_gate_tests`). Either way: a 400, and nothing created.
+    let fam = "/v1/db/shop/coll/c/find_and_modify";
+    for update in [json!({ "$set": { "v": 1 } }), json!({ "$setOnInsert": { "created_at": 1 } })] {
+        let res = server
+            .post(
+                fam,
+                Some(&token),
+                json!({ "filter": { "_id": decimal("3.5") }, "update": update, "upsert": true }),
+            )
+            .await;
+        assert_eq!(res.status, 400, "upsert {update}: {:?}", res.body);
+    }
+    let res = server
+        .put(&format!("{docs}/8?upsert=true"), Some(&token), json!({ "_id": decimal("8") }))
+        .await;
+    refused_by_the_gate(&res, "a replace that creates the row");
+    let res = server
+        .post(
+            "/v1/db/shop/coll/c/indexes",
+            Some(&token),
+            json!({ "name": "positive", "fields": [{ "path": "email" }],
+                    "partialFilterExpression": { "balance": { "$gt": decimal("0") } } }),
+        )
+        .await;
+    refused_by_the_gate(&res, "a partial index with a decimal bound");
+
+    // Nothing was written, and the marker says so.
+    let count = server.post("/v1/db/shop/coll/c/count", Some(&token), json!({})).await;
+    assert_eq!(count.body["count"], 0, "{:?}", count.body);
+    let indexes = server.get("/v1/db/shop/coll/c/indexes", Some(&token)).await;
+    assert!(!indexes.body.to_string().contains("positive"), "{:?}", indexes.body);
+    assert_eq!(server.get("/readyz", None).await.body["decimal128_id_present"], false);
+    assert!(metrics_text(&server).await.contains("\nkimmy_decimal128_id_present 0\n"));
+}
+
+#[tokio::test]
+async fn the_marker_reaches_readyz_and_metrics_with_the_first_decimal_id() {
+    // A lone node installs no gate: every creation is allowed, as `cluster.decimal128`
+    // defaults to `true` with clustering off.
+    let server = Server::start().await;
+    let token = server.root().await;
+    server.post("/v1/db/shop/collections", Some(&token), json!({ "name": "c" })).await;
+    let ready = server.get("/readyz", None).await;
+    assert_eq!(ready.status, 200);
+    assert_eq!(ready.body["decimal128_id_present"], false, "{:?}", ready.body);
+
+    let docs = "/v1/db/shop/coll/c/docs";
+    let res = server.post(docs, Some(&token), json!({ "_id": 1, "v": decimal("1.5") })).await;
+    assert_eq!(res.status, 200, "{:?}", res.body);
+    assert_eq!(server.get("/readyz", None).await.body["decimal128_id_present"], false, "a value");
+
+    let res = server
+        .put(&format!("{docs}/7?upsert=true"), Some(&token), json!({ "_id": decimal("7") }))
+        .await;
+    assert_eq!(res.status, 200, "{:?}", res.body);
+    assert_eq!(server.get("/readyz", None).await.body["decimal128_id_present"], true);
+    assert!(metrics_text(&server).await.contains("\nkimmy_decimal128_id_present 1\n"));
+
+    // A replace over the existing decimal id creates nothing and is not refused
+    // once the gate closes, and an insert of it again is the duplicate it is for
+    // any id, not the gate's refusal.
+    close_decimal128_gate(&server);
+    let res = server.put(&format!("{docs}/7"), Some(&token), json!({ "v": 2 })).await;
+    assert_eq!(res.status, 200, "{:?}", res.body);
+    let res = server.post(docs, Some(&token), json!({ "_id": decimal("7") })).await;
+    assert_eq!(res.status, 409, "{:?}", res.body);
+    assert_eq!(res.body["error"], "duplicate_key", "{:?}", res.body);
+    let found = server
+        .post("/v1/db/shop/coll/c/find", Some(&token), json!({ "filter": { "_id": 7 } }))
+        .await;
+    assert_eq!(found.body["documents"][0]["_id"], decimal("7"), "{:?}", found.body);
+}
+
+#[tokio::test]
+async fn the_live_peer_net_holds_back_a_decimal_id_and_bound_until_every_peer_can_hold_one() {
+    // The node's own gate (`kimmy_cluster::Decimal128Gate`) over a member set, with the
+    // key set: an older live peer (its block says nothing of the capability) holds both
+    // creations back, named in the 400; a live peer not heard from yet does too; once
+    // every live peer says it can, both are created.
+    let server = Server::start().await;
+    let token = server.root().await;
+    server.post("/v1/db/shop/collections", Some(&token), json!({ "name": "c" })).await;
+    let members = kimmy_cluster::Members::default();
+    let gate = kimmy_cluster::Decimal128Gate::new(true, true, true);
+    gate.set_members(members.clone());
+    server.state.engine.set_decimal128_gate(gate.predicate());
+
+    let older = kimmy_core::NodeId::from_bytes([2; 16]);
+    let unheard = kimmy_core::NodeId::from_bytes([3; 16]);
+    members.insert_for_test("10.0.0.2:7900".parse().unwrap(), older);
+    members.record_peer_facts_for_test(
+        older,
+        kimmy_cluster::Facts { boot: vec![2; 16], ..Default::default() },
+        std::time::Duration::ZERO,
+    );
+    members.insert_for_test("10.0.0.3:7900".parse().unwrap(), unheard);
+
+    let docs = "/v1/db/shop/coll/c/docs";
+    let indexes = "/v1/db/shop/coll/c/indexes";
+    let index = json!({ "name": "positive", "fields": [{ "path": "v" }],
+                        "partialFilterExpression": { "v": { "$gt": decimal("0") } } });
+    for (path, body) in [(docs, json!({ "_id": decimal("1.5") })), (indexes, index.clone())] {
+        let res = server.post(path, Some(&token), body).await;
+        assert_eq!(res.status, 400, "{path}: {:?}", res.body);
+        let message = res.body["message"].as_str().unwrap_or_default();
+        for peer in [older, unheard] {
+            assert!(message.contains(&peer.to_string()), "{path}: names {peer}: {message}");
+        }
+    }
+
+    let can = |boot: u8| kimmy_cluster::Facts {
+        boot: vec![boot; 16],
+        decimal128: Some(true),
+        ..Default::default()
+    };
+    members.record_peer_facts_for_test(older, can(2), std::time::Duration::ZERO);
+    let res = server.post(docs, Some(&token), json!({ "_id": decimal("1.5") })).await;
+    assert_eq!(res.status, 400, "the unheard peer still holds it back: {:?}", res.body);
+    members.record_peer_facts_for_test(unheard, can(3), std::time::Duration::ZERO);
+    for (path, body) in [(docs, json!({ "_id": decimal("1.5") })), (indexes, index)] {
+        let res = server.post(path, Some(&token), body).await;
+        assert_eq!(res.status, 200, "{path}: {:?}", res.body);
+    }
+    assert_eq!(server.get("/readyz", None).await.body["decimal128_id_present"], true);
 }

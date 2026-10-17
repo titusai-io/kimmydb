@@ -5926,11 +5926,13 @@ mod tests {
     }
 
     #[test]
-    fn a_replicated_document_moving_in_and_out_of_the_undecidable_state_is_refiled_on_the_peer() {
+    fn a_replicated_decimal_moving_across_the_filter_is_refiled_on_the_peer() {
         // The old-image unfile on the replicated path. A peer applying a
-        // document's moves into, out of and back into the undecidable run must
-        // hold it where the origin does after each one — a stale sentinel entry
-        // is a candidate for every query for ever.
+        // document's moves across a partial filter must hold it where the
+        // origin does after each one -- a stale entry is a candidate for every
+        // query for ever. Through schema 4 the decimal moved the document into
+        // ADR-185's undecidable run; since ADR-238 the filter decides it on
+        // both members, by its value.
         let (a, _da) = engine();
         let (b, _db) = engine();
         a.create_collection("shop", "orders").unwrap();
@@ -5946,18 +5948,36 @@ mod tests {
         )
         .unwrap();
         pull(&b, &a);
-        let runs = |e: &Engine| {
+        // Every entry the index holds, sentinel runs included, and its unkeyed
+        // run alone.
+        let held = |e: &Engine| {
             let coll = e.get_collection("shop", "orders").unwrap();
             let id = coll.index("a_gt5").expect("the index is held").id;
-            (e.undecidable_count(&coll, id).unwrap(), e.unkeyed_count(&coll, id).unwrap())
+            let all = crate::index::scan_range(
+                e,
+                crate::WalkScope::Request,
+                coll.id,
+                id,
+                &[],
+                None,
+                crate::index::Unkeyed::Exclude,
+            )
+            .unwrap();
+            (all.len(), e.unkeyed_count(&coll, id).unwrap())
         };
-        let dec = bson::Bson::Decimal128("1".parse().unwrap());
+        let dec = |s: &str| bson::Bson::Decimal128(s.parse().unwrap());
         let coll = a.get_collection("shop", "orders").unwrap();
-        a.insert(&coll, bson::doc! { "_id": 1_i64, "k": dec.clone(), "a": 1 }).unwrap();
+        a.insert(&coll, bson::doc! { "_id": 1_i64, "k": dec("1"), "a": 1 }).unwrap();
         pull(&b, &a);
-        assert_eq!(runs(&b), (1, 0), "in: the peer holds it in the undecidable run");
+        assert_eq!(held(&b), (0, 0), "a decimal the filter does not select: absent on the peer");
 
-        for (k, held) in [(bson::Bson::Int32(9), 0), (bson::Bson::Int32(1), 0), (dec, 1)] {
+        for (k, inside) in [
+            (dec("9"), 1),
+            (bson::Bson::Int32(9), 1),
+            (dec("5.0"), 0),
+            (dec("5.000000000000000000000000000000001"), 1),
+            (bson::Bson::Int32(1), 0),
+        ] {
             a.replace(
                 &coll,
                 &DocId::Int64(1),
@@ -5966,8 +5986,51 @@ mod tests {
             )
             .unwrap();
             pull(&b, &a);
-            assert_eq!(runs(&a), (held, 0), "the origin, at k = {k}");
-            assert_eq!(runs(&b), runs(&a), "the peer holds it where the origin does, at k = {k}");
+            assert_eq!(held(&a), (inside, 0), "the origin, at k = {k:?}");
+            assert_eq!(held(&b), held(&a), "the peer holds it where the origin does, at k = {k:?}");
+        }
+    }
+
+    #[test]
+    fn a_merged_pair_of_selected_decimals_is_a_reported_violation() {
+        // The money field on the replicated path. Each member accepts its own
+        // `{email: "x", balance: Decimal128("10")}` before it has seen the
+        // other's, which a leaderless store cannot prevent. Through schema 4
+        // both were undecidable under `{balance: {$gt: 0}}` and nothing was
+        // recorded; decided by value, both are selected and keyed under "x", so
+        // the merge reports the collision on each member rather than refusing
+        // it (ADR-020).
+        let (a, _da) = engine();
+        let (b, _db) = engine();
+        a.create_collection("shop", "accounts").unwrap();
+        a.create_index_with(
+            "shop",
+            "accounts",
+            vec![field("email")],
+            true,
+            Default::default(),
+            Some("money_once".into()),
+            None,
+            Some(bson::doc! { "balance": { "$gt": 0 } }),
+        )
+        .unwrap();
+        pull(&b, &a);
+        let dec = |s: &str| bson::Bson::Decimal128(s.parse().unwrap());
+        let ca = a.get_collection("shop", "accounts").unwrap();
+        let cb = b.get_collection("shop", "accounts").unwrap();
+        a.insert(&ca, bson::doc! { "_id": 1_i64, "email": "x", "balance": dec("10") }).unwrap();
+        b.insert(&cb, bson::doc! { "_id": 2_i64, "email": "x", "balance": dec("10.00") }).unwrap();
+        // And one each that the filter does not select: never a violation.
+        a.insert(&ca, bson::doc! { "_id": 3_i64, "email": "y", "balance": dec("-1") }).unwrap();
+        b.insert(&cb, bson::doc! { "_id": 4_i64, "email": "y", "balance": dec("0E+3") }).unwrap();
+        pull(&b, &a);
+        pull(&a, &b);
+        assert_eq!(a.unique_violations(), 1, "the selected pair, once, on the member that merged");
+        assert_eq!(b.unique_violations(), 1, "and on the other");
+        for (e, coll) in [(&a, &ca), (&b, &cb)] {
+            for id in 1..=4 {
+                assert!(e.get(coll, &DocId::Int64(id)).unwrap().is_some(), "{id} converged");
+            }
         }
     }
 

@@ -41,10 +41,16 @@ use crate::walk::open_walk_table_in;
 /// the version guards "this build can correctly **maintain** this data", not
 /// only "this build can parse it", and a build that cannot is refused here
 /// rather than let loose on it.
-pub const SCHEMA_VERSION: u8 = 4;
+///
+/// **5 (ADR-238) moves every number key**: a number is keyed by the first 128
+/// bits of its exact value, variable length, so a `Decimal128` has a place in
+/// the order. Every document with an `Int64` `_id` is re-keyed and every index
+/// rebuilt ([`crate::migrate_v5`]), and from the sidecar's raise before the
+/// first commit a 0.50 or 0.49 build refuses the store: a rollback boundary.
+pub const SCHEMA_VERSION: u8 = 5;
 
 /// What a migration found that has to be reported once the engine exists:
-/// the collisions a rebuilt unique partial index holds (ADR-183).
+/// the unique collisions a rebuilt index holds (ADR-183, ADR-238).
 pub(crate) type Unreported = Vec<(CollectionMeta, Vec<crate::index::UniqueViolation>)>;
 
 /// Bring a database up to [`SCHEMA_VERSION`], or refuse if it cannot be.
@@ -52,21 +58,38 @@ pub(crate) type Unreported = Vec<(CollectionMeta, Vec<crate::index::UniqueViolat
 /// (ADR-190): called immediately before the first write of any
 /// migration, and before a fresh store's version is written, so an older build
 /// refuses a store whose migration has begun, and a migration that never
-/// began leaves a rollback open.
-pub(crate) fn run(db: &Database, raise: &dyn Fn(u8) -> Result<()>) -> Result<Unreported> {
-    step(db, raise)?;
+/// began leaves a rollback open. `path` is the store's file, whose volume's
+/// free space the schema 5 migration checks before it raises anything.
+pub(crate) fn run(
+    db: &Database,
+    path: &std::path::Path,
+    raise: &dyn Fn(u8) -> Result<()>,
+) -> Result<Unreported> {
+    step(db, path, raise)?;
+    // A crash after the migration's last commit and before the report: what
+    // the next open finds recorded.
+    #[cfg(test)]
+    if hooks::fails_before_the_report() {
+        return Err(StorageError::Database("a failure injected before the report".into()));
+    }
     // Read from the store, not carried out of the loop: this run's recorded
     // collisions and any an earlier interrupted run left unreported.
     persisted_violations(db)
 }
 
 /// Take the database to [`SCHEMA_VERSION`], or refuse if it cannot be.
-fn step(db: &Database, raise: &dyn Fn(u8) -> Result<()>) -> Result<()> {
+///
+/// The order is the design's (6.1, "Order at open"): the open's ensure-tables
+/// commit, with the tombstone horizon's reset, has already landed; then the
+/// refusals that write nothing (the unparseable-filter check and the schema 5
+/// preflight); then `raise(5)`; then the first migration commit. A start
+/// refused before `raise(5)` leaves a store the previous build opens.
+fn step(db: &Database, path: &std::path::Path, raise: &dyn Fn(u8) -> Result<()>) -> Result<()> {
     let found = stored_version(db)?;
 
     // Before the migration writes anything, on every path that migrates --
     // including a schema 1 or 2 source, whose id-deriving steps run before the
-    // rebuild, and a schema 4 file whose rebuild was interrupted. Any later and
+    // re-key, and a schema 5 file whose migration was interrupted. Any later and
     // the claim the refusal makes, that no version and no entry was changed,
     // would already be false. The open before this point has written, though
     // nothing the previous build reads differently: redb's repair of a dirty
@@ -74,10 +97,10 @@ fn step(db: &Database, raise: &dyn Fn(u8) -> Result<()>) -> Result<()> {
     // fields, with its schema left where it was (ADR-190). So "a refused start
     // writes nothing" holds for a newer store, refused before the open, and
     // not for this refusal of an older one. (What an operator can then do
-    // depends on the version it found -- the previous build opens a schema 1,
-    // 2 or 3 directory, and no build opens a half-migrated one; the message
+    // depends on the version it found -- the previous build opens a schema 1
+    // to 4 directory, and no build opens a half-migrated one; the message
     // says which.)
-    let resuming = found == Some(SCHEMA_VERSION) && partial_rebuild_owed(db)?;
+    let resuming = found == Some(SCHEMA_VERSION) && crate::migrate_v5::unfinished(db)?;
     if matches!(found, Some(1..SCHEMA_VERSION)) || resuming {
         refuse_unparseable_partial_filters(db, found.expect("a version was read"))?;
     }
@@ -88,40 +111,37 @@ fn step(db: &Database, raise: &dyn Fn(u8) -> Result<()>) -> Result<()> {
             raise(SCHEMA_VERSION)?;
             write_version(db, SCHEMA_VERSION)
         }
-        // Schema 4 with markers still present is a migration interrupted
+        // Schema 5 with markers still present is a migration interrupted
         // part-way, not a finished one: the version is written in the first
-        // index's commit precisely so that an older build refuses a file in
-        // this state, and the markers say which indexes are still owed. The
-        // last commit deletes them, so their absence is what "finished" means.
-        Some(SCHEMA_VERSION) if partial_rebuild_owed(db)? => {
-            info!("resuming an interrupted storage schema 3 -> 4 migration (partial indexes)");
+        // commit precisely so that an older build refuses a file in this state,
+        // and the markers say what is still owed. The last commit deletes them,
+        // so their absence is what "finished" means.
+        Some(SCHEMA_VERSION) if resuming => {
+            info!("resuming an interrupted storage schema 4 -> 5 migration (exact number keys)");
+            let plan = crate::migrate_v5::preflight(db, path, SCHEMA_VERSION)?;
             raise(SCHEMA_VERSION)?;
-            rebuild_partial_indexes(db)
+            crate::migrate_v5::run(db, &plan)
         }
         Some(SCHEMA_VERSION) => Ok(()),
-        // Migrations run in sequence, so a schema 1 database steps through 2
-        // rather than needing its own path to the latest. The last step
-        // writes the version itself, with its own bookkeeping.
-        Some(1) => {
+        // Migrations run in sequence: the id-deriving steps of a schema 1 or 2
+        // source first, then 4 -> 5. **The 3 -> 4 partial-index rebuild is not
+        // run on the way to 5**: 4 -> 5 rebuilds every index under the current
+        // rule, which subsumes it, and its first commit deletes 3 -> 4's
+        // markers and carries its unreported collisions.
+        Some(found @ 1..SCHEMA_VERSION) => {
+            let plan = crate::migrate_v5::preflight(db, path, found)?;
             raise(SCHEMA_VERSION)?;
-            info!("migrating storage schema 1 -> 2 (derived collection ids)");
-            derive_collection_ids(db)?;
-            info!("migrating storage schema 2 -> 3 (derived index ids)");
-            derive_index_ids(db)?;
-            info!("migrating storage schema 3 -> 4 (partial index membership)");
-            rebuild_partial_indexes(db)
-        }
-        Some(2) => {
-            raise(SCHEMA_VERSION)?;
-            info!("migrating storage schema 2 -> 3 (derived index ids)");
-            derive_index_ids(db)?;
-            info!("migrating storage schema 3 -> 4 (partial index membership)");
-            rebuild_partial_indexes(db)
-        }
-        Some(3) => {
-            raise(SCHEMA_VERSION)?;
-            info!("migrating storage schema 3 -> 4 (partial index membership)");
-            rebuild_partial_indexes(db)
+            if found == 1 {
+                info!("migrating storage schema 1 -> 2 (derived collection ids)");
+                derive_collection_ids(db)?;
+            }
+            if found <= 2 {
+                info!("migrating storage schema 2 -> 3 (derived index ids)");
+                derive_index_ids(db)?;
+            }
+            info!("migrating storage schema {} -> 5 (exact number keys)", found.max(3));
+            crate::migrate_v5::begin(db, found)?;
+            crate::migrate_v5::run(db, &plan)
         }
         // A newer schema means a newer build wrote this directory. Refusing is
         // the right failure: guessing at a layout we do not know would corrupt
@@ -132,73 +152,25 @@ fn step(db: &Database, raise: &dyn Fn(u8) -> Result<()>) -> Result<()> {
     }
 }
 
-/// The partial indexes rebuilt so far, by `(collection, index)`: node-local,
-/// written in each index's own transaction, and deleted in the commit that
-/// writes schema 4. Its rows are what a migration interrupted part-way does
-/// not do again.
-const PARTIAL_REBUILT: redb::TableDefinition<(u64, u32), ()> =
-    redb::TableDefinition::new("partial_rebuilt_under_find");
-
-/// What a rebuild of a unique partial index found, by `(collection, index)`,
-/// written in the same commit as that index's marker and deleted only once it
-/// has been reported (ADR-183).
-///
-/// In the store rather than carried back in memory. Reporting needs an engine,
-/// which does not exist until after the migration returns, so a crash in
-/// between used to lose the finding entirely: both duplicates stayed, and
-/// nothing counted, logged or recorded them. The invariant is that a marked
-/// index's collisions are never lost, which means the record has to be as
-/// durable as the marker and committed with it.
-const PARTIAL_REBUILT_VIOLATIONS: redb::TableDefinition<(u64, u32), &[u8]> =
-    redb::TableDefinition::new("partial_rebuilt_unique_violations");
-
-/// One index's collisions, with the collection they belong to by name, because
-/// an id is not enough to find the metadata a report needs.
+/// One index's collisions as the schema 3 -> 4 rebuild recorded them, with the
+/// collection they belong to by name. Read only by the schema 5 migration's
+/// first commit, which carries them ([`crate::migrate_v5`]).
 #[derive(serde::Serialize, serde::Deserialize)]
-struct RecordedViolations {
-    db: String,
-    collection: String,
-    violations: Vec<crate::index::UniqueViolation>,
+pub(crate) struct RecordedViolations {
+    pub(crate) db: String,
+    pub(crate) collection: String,
+    pub(crate) violations: Vec<crate::index::UniqueViolation>,
 }
 
 /// Every recorded collision not yet reported, resolved against the collection
 /// metadata as it now stands.
 ///
-/// Read on every open, not only on one that migrates: the marker table is gone
-/// once the migration finishes, so a crash after the last index and before the
-/// report would otherwise leave a recorded collision that nothing ever looks
-/// at again.
+/// Read on every open, not only on one that migrates: the markers are gone
+/// once the migration finishes, so a crash after its last commit and before the
+/// report would otherwise leave a recorded collision that nothing ever looks at
+/// again.
 fn persisted_violations(db: &Database) -> Result<Unreported> {
-    let txn = db.begin_read()?;
-    let recorded = match txn.open_table(PARTIAL_REBUILT_VIOLATIONS) {
-        Ok(table) => table,
-        Err(redb::TableError::TableDoesNotExist(_)) => return Ok(Vec::new()),
-        Err(e) => return Err(e.into()),
-    };
-    let collections = txn.open_table(tables::COLLECTIONS)?;
-    let mut out = Vec::new();
-    for row in recorded.iter()? {
-        let (_, value) = row?;
-        let held: RecordedViolations = serde_json::from_slice(value.value()).map_err(|e| {
-            StorageError::Corrupt(format!(
-                "a pending row of the recorded-collision table \
-                 (partial_rebuilt_unique_violations) will not decode, so this open cannot \
-                 report a collision an earlier rebuild found: {e}"
-            ))
-        })?;
-        // Gone since, or replaced: there is nothing to report a collision
-        // against, and the entries went with it. Such a row lingers, because the
-        // forget below runs only when something was reported -- so a file whose
-        // only pending rows name dropped collections keeps them. Unreachable in
-        // practice: it needs the collection dropped between the rebuild's commit
-        // and the next open, in the window before the engine exists. Named here
-        // rather than guarded, since the cost is one dead row.
-        let Some(raw) = collections.get((held.db.as_str(), held.collection.as_str()))? else {
-            continue;
-        };
-        out.push((serde_json::from_slice::<CollectionMeta>(raw.value())?, held.violations));
-    }
-    Ok(out)
+    crate::migrate_v5::recorded_collisions(db)
 }
 
 /// Forget the recorded collisions, once they have been reported.
@@ -209,32 +181,11 @@ fn persisted_violations(db: &Database) -> Result<Unreported> {
 /// crash between the report and this leaves them to be reported again on the
 /// next open, which is the side to err on.
 pub(crate) fn forget_reported_violations(db: &Database) -> Result<()> {
-    let txn = db.begin_write()?;
-    match txn.delete_table(PARTIAL_REBUILT_VIOLATIONS) {
-        Ok(_) => {}
-        Err(redb::TableError::TableDoesNotExist(_)) => {}
-        Err(e) => return Err(e.into()),
-    }
-    txn.commit()?;
-    Ok(())
+    crate::migrate_v5::forget_collisions(db)
 }
 
-/// Whether the marker table is still there, which is what an interrupted
-/// migration leaves behind.
-///
-/// Its absence is the only thing that means finished, and that is why the last
-/// commit deletes it. A migration that found no partial index never creates it.
-fn partial_rebuild_owed(db: &Database) -> Result<bool> {
-    let txn = db.begin_read()?;
-    match txn.open_table(PARTIAL_REBUILT) {
-        Ok(_) => Ok(true),
-        Err(redb::TableError::TableDoesNotExist(_)) => Ok(false),
-        Err(e) => Err(e.into()),
-    }
-}
-
-/// The cost of a rebuild, per document per index, that the up-front estimate is
-/// made from (ADR-183).
+/// The cost of an index rebuild, per document per index, that the up-front
+/// estimate is made from (ADR-183).
 ///
 /// **Not linear in the document count, which is why this is a bound and not a
 /// rate.** Measured on the machine the migration was written on: 73 s for 10
@@ -248,59 +199,19 @@ fn partial_rebuild_owed(db: &Database) -> Result<bool> {
 /// during its own documented example.
 pub const MICROS_PER_DOCUMENT: u64 = 8;
 
-/// redb's growth step, which is what the file extends by when its slack does
-/// not cover a rebuild (ADR-183): a rebuild needing 166 MiB took the file from
-/// 4,096 to 6,199 MiB. Reported beside the largest index's own size, because
-/// the space to have free is the two added together, not either alone.
-const REDB_GROWTH_STEP_MIB: u64 = 2048;
-
-/// The measured size of an index entry on disk, including the tree's own
-/// overhead (ADR-183): 553 MiB for 7.43 million entries. A rebuild needs about
-/// this much free inside the file for its largest index.
-const BYTES_PER_ENTRY: u64 = 80;
-
-/// How many documents between two progress lines. Small under test, so a
-/// small fixture shows that the beat is kept.
-#[cfg(not(test))]
-const PROGRESS_EVERY: u64 = 100_000;
-#[cfg(test)]
-const PROGRESS_EVERY: u64 = 10;
-
-/// What the migration is about to do, stated before it starts.
-#[derive(Debug, Default, PartialEq)]
-pub(crate) struct PartialRebuildPlan {
-    /// `(collection, index, documents to scan)`, in the order they run.
-    pub indexes: Vec<(CollectionMeta, crate::IndexMeta, u64)>,
-    pub documents: u64,
-    /// The most documents any one partial index's collection holds: an upper
-    /// bound on its entries for an index that is not multikey.
-    pub largest_documents: u64,
-}
-
-impl PartialRebuildPlan {
-    pub(crate) fn estimate_secs(&self) -> u64 {
-        self.documents * MICROS_PER_DOCUMENT / 1_000_000
-    }
-
-    pub(crate) fn largest_needs_mib(&self) -> u64 {
-        self.largest_documents * BYTES_PER_ENTRY / (1 << 20)
-    }
-}
-
 /// Refuse the migration, naming every partial index whose stored filter this
 /// build will not parse, before anything is rebuilt.
 ///
 /// The rebuild derives each index's membership from its filter, so an index
 /// whose filter this build refuses has no membership this build can build. A
-/// filter can be one an earlier build accepted and this one does not -- one
-/// holding a `Decimal128`, from before parsing refused it -- which is stored
-/// metadata, a fact about a definition rather than about any document.
+/// filter can be one an earlier build accepted and this one does not, which is
+/// stored metadata, a fact about a definition rather than about any document.
 ///
 /// **It refuses rather than skipping**, unlike a TTL pass, which skips such an
 /// index and deletes nothing (ADR-181). A pass is a recurring runtime gate
 /// where refusing would stop every other index's expiry; an upgrade is a gate
 /// where refusing costs nothing irreversible, and skipping would make the
-/// condition permanent in a schema 4 file, which is exactly what ADR-181 relies
+/// condition permanent in a migrated file, which is exactly what ADR-181 relies
 /// on not happening when it calls the condition transient. A skipped index
 /// would also leave a node running for weeks with a collection refusing every
 /// write, explained by one line at a start nobody reads again.
@@ -310,11 +221,11 @@ impl PartialRebuildPlan {
 ///
 /// **Every partial index in the file is parsed**, in every database, whether or
 /// not its collection holds a document and whether or not an interrupted
-/// migration already marked it rebuilt: an index on an empty collection is
-/// never handed a document, so the rebuild alone would never parse its filter
-/// and would mark it done. **Every offender is named at once**, so one pass
-/// with the previous build fixes them all rather than finding the next on the
-/// next upgrade attempt.
+/// migration already rebuilt it: an index on an empty collection is never
+/// handed a document, so the rebuild alone would never parse its filter and
+/// would mark it done. **Every offender is named at once**, so one pass with
+/// the previous build fixes them all rather than finding the next on the next
+/// upgrade attempt.
 fn refuse_unparseable_partial_filters(db: &Database, found: u8) -> Result<()> {
     let txn = db.begin_read()?;
     let collections = txn.open_table(tables::COLLECTIONS)?;
@@ -332,257 +243,6 @@ fn refuse_unparseable_partial_filters(db: &Database, found: u8) -> Result<()> {
         return Ok(());
     }
     Err(StorageError::UnparseablePartialFilter { found, refused })
-}
-
-/// Every partial index not yet rebuilt, with what the announcement states.
-///
-/// Each collection's size comes from its kept live count (ADR-174), one row,
-/// when the counts are current. Counting instead -- ten million documents and
-/// six million entries -- took 48 s just to announce the job, more than half
-/// the job itself. This runs before `Engine::open` rebuilds stale counts,
-/// though, and a database restored from a backup carries none: trusted then,
-/// the announcement would say nothing was to be done. So when the counts'
-/// mark does not match the store, each collection's records are counted, and
-/// that open pays the 48 s.
-pub(crate) fn partial_rebuild_plan(db: &Database) -> Result<PartialRebuildPlan> {
-    let txn = db.begin_read()?;
-    let collections = txn.open_table(tables::COLLECTIONS)?;
-    let counts = txn.open_table(tables::LIVE_COUNTS)?;
-    let current = crate::live_count::counts_are_current(&txn)?;
-    let docs = txn.open_table(tables::DOCS)?;
-    let done: std::collections::HashSet<(u64, u32)> = match txn.open_table(PARTIAL_REBUILT) {
-        Ok(table) => table.iter()?.map(|row| Ok(row?.0.value())).collect::<Result<_>>()?,
-        Err(redb::TableError::TableDoesNotExist(_)) => Default::default(),
-        Err(e) => return Err(e.into()),
-    };
-    let mut plan = PartialRebuildPlan::default();
-    for row in collections.iter()? {
-        let (_, value) = row?;
-        let meta: CollectionMeta = serde_json::from_slice(value.value())?;
-        let mut documents = None;
-        for index in &meta.indexes {
-            if index.partial_filter.is_none() || done.contains(&(meta.id.0, index.id)) {
-                continue;
-            }
-            let documents = match documents {
-                Some(n) => n,
-                None if current => {
-                    *documents.insert(counts.get(meta.id.0)?.map_or(0, |n| n.value()))
-                }
-                None => {
-                    *documents.insert(docs.range(crate::engine::doc_range(meta.id))?.count() as u64)
-                }
-            };
-            plan.documents += documents;
-            plan.largest_documents = plan.largest_documents.max(documents);
-            plan.indexes.push((meta.clone(), index.clone(), documents));
-        }
-    }
-    Ok(plan)
-}
-
-/// Rebuild every partial index under `find`'s semantics, then write schema 4
-/// (ADR-183).
-///
-/// One transaction per index: its entries are cleared by key and rebuilt from
-/// every document, its `multikey` flag raised if the new membership makes it
-/// so, and its marker written, all in that commit. A crash rolls that index
-/// back, marker and all, and the next open does it again; the ones already
-/// marked are not redone. Nothing reads the index meanwhile: this runs inside
-/// `Engine::open` before the engine exists, and redb refuses a second opener.
-///
-/// A unique index is rebuilt in full whatever its documents share, and the
-/// keys two or more of them share are returned for the engine to report as a
-/// replicated build's are (ADR-020, ADR-123): a migration cannot refuse, and
-/// documents accepted while the constraint was misapplied are real.
-fn rebuild_partial_indexes(db: &Database) -> Result<()> {
-    let plan = partial_rebuild_plan(db)?;
-    let total = plan.indexes.len();
-    if total > 0 {
-        info!(
-            partial_indexes = total,
-            documents = plan.documents,
-            estimate_secs = plan.estimate_secs(),
-            largest_collection_documents = plan.largest_documents,
-            largest_needs_free_mib = plan.largest_needs_mib(),
-            plus_growth_step_mib = REDB_GROWTH_STEP_MIB,
-            "rebuilding every partial index so its membership is what find selects, plus the documents \
-             the filter cannot decide because a Decimal128 ranks equal to every number \
-             (ADR-183, ADR-185), before this node serves anything; each index is rebuilt in one transaction and \
-             needs about its own size free inside the database file, up to the figure for the \
-             largest -- and if the file's slack does not cover it, redb extends the file by its \
-             growth step, so allow the two added together"
-        );
-    }
-    if total > 0 {
-        crate::open_progress::set_open_phase_of(
-            crate::open_progress::OpenPhase::Migrating,
-            total as u64,
-        );
-    }
-    for (n, (meta, index, documents)) in plan.indexes.iter().enumerate() {
-        // The safe point of a stop asked for during the open: between indexes,
-        // each of which is one commit with its marker, so an interrupted
-        // migration resumes from the markers on the next start.
-        if crate::open_progress::open_stop_requested() {
-            return Err(crate::StorageError::Stopping(crate::StopReason::Shutdown));
-        }
-        crate::open_progress::set_open_done(n as u64);
-        let started = std::time::Instant::now();
-        info!(
-            n = n + 1,
-            of = total,
-            db = %meta.db,
-            collection = %meta.name,
-            index = %index.name,
-            documents,
-            "rebuilding a partial index"
-        );
-        let txn = db.begin_write()?;
-        let (built, multikey, violations) = {
-            let mut entries =
-                open_walk_table_in(&txn, tables::INDEX_ENTRIES, crate::walk::WalkStop::in_write())?;
-            crate::index::clear_index_entries(
-                &mut entries,
-                crate::index::index_id_range(meta.id, index.id),
-            )?;
-            let docs = txn.open_table(tables::DOCS)?;
-            let mut holders: HashMap<Vec<u8>, Vec<Vec<u8>>> = HashMap::new();
-            let (mut built, mut scanned, mut multikey) = (0u64, 0u64, false);
-            for row in docs.range(crate::engine::doc_range(meta.id))? {
-                let (key, value) = row?;
-                let record = codec::decode_doc_record(value.value())?;
-                let Some(doc) = record.document()? else { continue };
-                let (_, doc_key) = key.value();
-                match crate::index::document_keys(index, &doc)? {
-                    crate::index::DocumentKeys::Keyed { keys, multikey: many } => {
-                        multikey |= many;
-                        for key in keys {
-                            if index.unique {
-                                holders.entry(key.clone()).or_default().push(doc_key.to_vec());
-                            }
-                            entries.insert((meta.id.0, index.id, key.as_slice(), doc_key), ())?;
-                            built += 1;
-                        }
-                    }
-                    // The 3 -> 4 rebuild is where option-2 membership is
-                    // built for an existing database (ADR-185): a document the
-                    // filter cannot decide goes into the undecidable run here,
-                    // exactly as a later write would file it.
-                    crate::index::DocumentKeys::Undecidable { .. } => {
-                        // The 3 -> 4 rebuild writes the new sentinel directly.
-                        // Still no schema 5: 4 is unreleased, so no deployed
-                        // database holds these entries under the old key
-                        // (ADR-185).
-                        entries.insert(
-                            (meta.id.0, index.id, crate::index::UNDECIDABLE, doc_key),
-                            (),
-                        )?;
-                        built += 1;
-                    }
-                    crate::index::DocumentKeys::Unkeyed { multikey: many, .. } => {
-                        multikey |= many;
-                        entries
-                            .insert((meta.id.0, index.id, crate::index::UNKEYED, doc_key), ())?;
-                        built += 1;
-                    }
-                }
-                scanned += 1;
-                if scanned % PROGRESS_EVERY == 0 {
-                    #[cfg(test)]
-                    hooks::progress();
-                    info!(n = n + 1, of = total, index = %index.name, scanned, of_documents = documents, "rebuilding a partial index");
-                }
-            }
-            let mut violations: Vec<crate::index::UniqueViolation> = holders
-                .into_iter()
-                .filter(|(_, holders)| holders.len() > 1)
-                .map(|(key, holders)| crate::index::UniqueViolation {
-                    index: index.name.clone(),
-                    key,
-                    holders,
-                })
-                .collect();
-            violations.sort_by(|a, b| a.key.cmp(&b.key));
-            (built, multikey, violations)
-        };
-        // One-way, like every other write that can make an index multikey:
-        // a two-sided range over one that is and says it is not loses rows.
-        let mut standing = meta.clone();
-        if multikey && !index.multikey {
-            let mut collections = txn.open_table(tables::COLLECTIONS)?;
-            let fresh = collections
-                .get((meta.db.as_str(), meta.name.as_str()))?
-                .map(|raw| serde_json::from_slice::<CollectionMeta>(raw.value()))
-                .transpose()?;
-            if let Some(mut fresh) = fresh {
-                for held in fresh.indexes.iter_mut().filter(|i| i.id == index.id) {
-                    held.multikey = true;
-                }
-                collections.insert(
-                    (meta.db.as_str(), meta.name.as_str()),
-                    serde_json::to_vec(&fresh)?.as_slice(),
-                )?;
-                standing = fresh;
-            }
-        }
-        txn.open_table(PARTIAL_REBUILT)?.insert((meta.id.0, index.id), ())?;
-        // What this index's rebuild found, in the same commit as its marker.
-        // Reporting needs an engine and so happens after the migration returns;
-        // recorded here, an interrupt in between leaves them to be reported on
-        // the next open instead of losing them.
-        if !violations.is_empty() {
-            let recorded = RecordedViolations {
-                db: standing.db.clone(),
-                collection: standing.name.clone(),
-                violations: violations.clone(),
-            };
-            txn.open_table(PARTIAL_REBUILT_VIOLATIONS)?
-                .insert((meta.id.0, index.id), serde_json::to_vec(&recorded)?.as_slice())?;
-        }
-        // The version, in the same commit as the first index's marker rather
-        // than at the end. Until this change a half-migrated file was still
-        // schema 3, so the previous build opened it and maintained the indexes
-        // it had not rebuilt under the old rule: entries the new rule does not
-        // hold stayed, and a later run marked the rest done and stamped 4 over
-        // them for good. A query answered from such an index misses rows and a
-        // unique one refuses a key that is free. Stamping it here means an
-        // older build refuses the file instead, and a rollback is the wipe and
-        // resync the operations guide documents.
-        if n == 0 {
-            txn.open_table(tables::META)?
-                .insert(tables::META_FORMAT_VERSION, [SCHEMA_VERSION].as_slice())?;
-        }
-        #[cfg(test)]
-        if hooks::fails_at(n + 1) {
-            drop(txn);
-            return Err(StorageError::Database("a failure injected mid-migration".into()));
-        }
-        txn.commit()?;
-        info!(
-            n = n + 1,
-            of = total,
-            index = %index.name,
-            entries = built,
-            elapsed_ms = started.elapsed().as_millis() as u64,
-            "rebuilt a partial index"
-        );
-        crate::open_progress::test_step_pause();
-    }
-    // The end of the bookkeeping. The version is already 4 if any index was
-    // rebuilt in this run or an earlier one; it is written here too, for the
-    // database that has no partial index to rebuild at all, where the loop
-    // above never ran.
-    let txn = db.begin_write()?;
-    match txn.delete_table(PARTIAL_REBUILT) {
-        Ok(_) => {}
-        Err(redb::TableError::TableDoesNotExist(_)) => {}
-        Err(e) => return Err(e.into()),
-    }
-    txn.open_table(tables::META)?
-        .insert(tables::META_FORMAT_VERSION, [SCHEMA_VERSION].as_slice())?;
-    txn.commit()?;
-    Ok(())
 }
 
 /// Record the redb major.minor in META, if it is not already what is there
@@ -607,56 +267,102 @@ pub(crate) fn record_redb_version(
     Ok(())
 }
 
-/// Test-only points in the membership migration.
+/// Test-only points in the migration chain.
 #[cfg(test)]
 pub(crate) mod hooks {
     use std::cell::Cell;
 
     thread_local! {
-        static PROGRESS: Cell<usize> = const { Cell::new(0) };
-        static FAIL_AT: Cell<Option<usize>> = const { Cell::new(None) };
+        static FAIL_BEFORE_REPORT: Cell<bool> = const { Cell::new(false) };
     }
 
-    pub(crate) fn progress() {
-        PROGRESS.with(|p| p.set(p.get() + 1));
+    /// Fail the next open on this thread after its migration's last commit and
+    /// before the collisions it recorded are read for the report.
+    pub(crate) fn fail_before_the_report() {
+        FAIL_BEFORE_REPORT.with(|f| f.set(true));
     }
 
-    /// Progress lines written on this thread so far.
-    pub(crate) fn progress_lines() -> usize {
-        PROGRESS.with(|p| p.get())
-    }
-
-    /// Fail the next migration on this thread at the `n`th index (from 1),
-    /// after its work and before its commit, as a crash there would.
-    pub(crate) fn fail_at_index(n: usize) {
-        FAIL_AT.with(|f| f.set(Some(n)));
-    }
-
-    pub(crate) fn fails_at(n: usize) -> bool {
-        FAIL_AT.with(|f| {
-            if f.get() == Some(n) {
-                f.set(None);
-                true
-            } else {
-                false
-            }
-        })
+    pub(crate) fn fails_before_the_report() -> bool {
+        FAIL_BEFORE_REPORT.with(|f| f.replace(false))
     }
 }
 
-/// Put a closed store back where a schema 3 node leaves it, so the next open
-/// runs the 3 -> 4 migration, which rebuilds every partial index. For a test of
-/// another crate that stops a real node in the middle of it.
-#[cfg(feature = "test-hooks")]
+/// Put a closed store this build wrote back where a 0.50 node (schema 4) leaves
+/// it, so the next open runs the schema 5 migration: every numeric document key
+/// in its schema 4 form, in `DOCS` and as the document part of every index
+/// entry, META and the sidecar at schema 4, the sidecar written by 0.50.0, and
+/// the verified record for schema 4. Index values are left as they are: the
+/// migration drains every index before it refills it, so it never reads them.
+/// For a test of another crate that stops a real node in the middle of it.
+#[cfg(any(test, feature = "test-hooks"))]
 // A closed store rewritten by a test, on purpose, outside the check `Engine::open`
-// makes: the point is to hand the next open a store a schema 3 node left.
+// makes: the point is to hand the next open a store a schema 4 node left.
 #[allow(clippy::disallowed_methods)]
-pub fn make_schema_3_for_test(path: &std::path::Path) -> Result<()> {
+pub fn make_schema_4_for_test(path: &std::path::Path) -> Result<()> {
+    use kimmy_core::legacy_key::legacy_of_stored;
+    let numeric = |key: &[u8]| key.first() == Some(&0x20);
     let db = Database::create(path)?;
     let txn = db.begin_write()?;
-    txn.open_table(tables::META)?.insert(tables::META_FORMAT_VERSION, [3u8].as_slice())?;
+    {
+        // Every numeric row out, then every one back under its schema 4 key:
+        // one at a time could put a schema 4 key over a schema 5 row it equals.
+        let mut docs = txn.open_table(tables::DOCS)?;
+        #[allow(clippy::type_complexity)]
+        let rows: Vec<(u64, Vec<u8>, Vec<u8>)> = docs
+            .iter()?
+            .filter_map(|row| match row {
+                Ok((k, v)) => {
+                    let (c, key) = k.value();
+                    numeric(key).then(|| Ok((c, key.to_vec(), v.value().to_vec())))
+                }
+                Err(e) => Some(Err(e.into())),
+            })
+            .collect::<Result<_>>()?;
+        for (c, key, _) in &rows {
+            docs.remove((*c, key.as_slice()))?;
+        }
+        for (c, key, value) in &rows {
+            docs.insert((*c, legacy_of_stored(key).as_bytes()), value.as_slice())?;
+        }
+        let mut entries = txn.open_table(tables::INDEX_ENTRIES)?;
+        #[allow(clippy::type_complexity)]
+        let held: Vec<(u64, u32, Vec<u8>, Vec<u8>)> = entries
+            .iter()?
+            .filter_map(|row| match row {
+                Ok((k, _)) => {
+                    let (c, i, value, doc) = k.value();
+                    numeric(doc).then(|| Ok((c, i, value.to_vec(), doc.to_vec())))
+                }
+                Err(e) => Some(Err(e.into())),
+            })
+            .collect::<Result<_>>()?;
+        for (c, i, value, doc) in &held {
+            entries.remove((*c, *i, value.as_slice(), doc.as_slice()))?;
+        }
+        for (c, i, value, doc) in &held {
+            entries.insert((*c, *i, value.as_slice(), legacy_of_stored(doc).as_bytes()), ())?;
+        }
+        txn.open_table(tables::META)?.insert(tables::META_FORMAT_VERSION, [4u8].as_slice())?;
+        let mut verified = txn.open_table(tables::VECTOR_VERIFIED)?;
+        let records: Vec<(String, Vec<u8>)> = verified
+            .iter()?
+            .map(|row| {
+                let (k, v) = row?;
+                Ok((k.value().to_string(), v.value().to_vec()))
+            })
+            .collect::<Result<_>>()?;
+        for (key, mut record) in records {
+            if let Some(schema) = record.get_mut(1) {
+                *schema = 4;
+            }
+            verified.insert(key.as_str(), record.as_slice())?;
+        }
+    }
     txn.commit()?;
-    Ok(())
+    drop(db);
+    let mut sidecar = crate::format::stamp(4, &crate::format::BuildVersions::ours());
+    sidecar.written_by = "0.50.0".into();
+    crate::format::write_sidecar(path, &sidecar)
 }
 
 pub(crate) fn stored_version(db: &Database) -> Result<Option<u8>> {
@@ -1040,7 +746,16 @@ mod tests {
             move_index_entries(&db, *new, *old).unwrap();
         }
         rewrite_oplog(&db, &remap).unwrap();
+        rewind_keys(&db);
         write_version(&db, 1).unwrap();
+    }
+
+    /// Every numeric document key back in the schema 4 form a store older than
+    /// 5 holds, as the frozen test-side encoder writes it.
+    pub(super) fn rewind_keys(db: &Database) {
+        let txn = db.begin_write().unwrap();
+        crate::migrate_v5_tests::rewind_keys_to_v1(&txn);
+        txn.commit().unwrap();
     }
 
     #[test]
@@ -1280,6 +995,7 @@ mod tests {
             }
             txn.commit().unwrap();
         }
+        rewind_keys(&db);
         write_version(&db, 2).unwrap();
     }
 
@@ -1288,9 +1004,12 @@ mod tests {
     }
 }
 
-/// ADR-183: the schema 3 -> 4 migration rebuilds every partial index so its
-/// membership is what `find` selects — and, since ADR-185, the documents whose
-/// membership the filter cannot decide.
+/// ADR-183: the schema 3 -> 4 migration rebuilt every partial index so its
+/// membership is what `find` selects (and, from ADR-185 to ADR-238, also the
+/// documents holding a `Decimal128` the filter could not decide). A schema 3
+/// store now goes straight to 5, whose rebuild of every index under the
+/// current rule subsumes it (ADR-238); these hold that path to what 3 -> 4
+/// promised.
 #[cfg(test)]
 mod membership_migration {
     use std::cmp::Ordering;
@@ -1582,17 +1301,27 @@ mod membership_migration {
                 .insert(tables::META_FORMAT_VERSION, [3u8].as_slice())
                 .unwrap();
         }
+        // And the keys a schema 3 node holds: every number in its schema 4 form.
+        crate::migrate_v5_tests::rewind_keys_to_v1(&txn);
         txn.commit().unwrap();
+        drop(db);
+        // And the sidecar such a node wrote.
+        crate::format::write_sidecar(
+            path,
+            &crate::format::stamp(3, &crate::format::BuildVersions::ours()),
+        )
+        .unwrap();
     }
 
     /// Rewrite the stored `partialFilterExpression` of each named index to one
-    /// this build refuses: a bound on a `Decimal128`, which `PartialFilter::parse`
-    /// declines because it ranks equal to every other number (ADR-181).
+    /// this build refuses: `$exists: false`, which `PartialFilter::parse`
+    /// declines (no query could be proven to imply it).
     ///
     /// Written straight into the metadata, because `create_index_inner` parses
     /// the filter for every origin, so no door of this build stores one. That is
     /// the point of the case: such a definition can only have been stored by an
-    /// earlier build whose parser accepted it.
+    /// earlier build whose parser accepted it. (It was a `Decimal128` bound
+    /// until ADR-238 began to lift that refusal.)
     fn store_unparseable_filter(path: &std::path::Path, named: &[(&str, &str, &str)]) {
         let db = Database::create(path).unwrap();
         let txn = db.begin_write().unwrap();
@@ -1614,8 +1343,7 @@ mod membership_migration {
                         .iter()
                         .any(|(db, coll, name)| *db == d && *coll == c && *name == index.name)
                     {
-                        index.partial_filter = Some(doc! {"size": {"$gt":
-                        bson::Bson::Decimal128(bson::Decimal128::from_bytes([0; 16]))}});
+                        index.partial_filter = Some(doc! {"size": {"$exists": false}});
                         touched = true;
                     }
                 }
@@ -1693,12 +1421,13 @@ mod membership_migration {
         (dir, path)
     }
 
-    /// A schema 3 database holding a partial index and three documents: one the
-    /// filter decides against, one it selects, and one it cannot decide.
+    /// A schema 3 database holding a partial index and four documents: a number
+    /// and a `Decimal128` the filter decides against, and a number and a
+    /// `Decimal128` it selects.
     ///
     /// A function rather than a block, because the engine has to be dropped
     /// before the file can be reopened — and a block did not do it.
-    fn schema_3_with_an_undecidable_document() -> (tempfile::TempDir, std::path::PathBuf) {
+    fn schema_3_with_decimals_at_a_filtered_path() -> (tempfile::TempDir, std::path::PathBuf) {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("kimmy.redb");
         {
@@ -1717,58 +1446,88 @@ mod membership_migration {
                 )
                 .unwrap();
             let coll = engine.get_collection("shop", "orders").unwrap();
-            engine
-                .insert_many(
-                    &coll,
-                    vec![
-                        doc! {"_id": 1_i64, "size": 1, "x": 1},
-                        doc! {"_id": 2_i64, "size": 10, "x": 2},
-                        doc! {"_id": 3_i64, "size": Bson::Decimal128("1".parse().unwrap()), "x": 3},
-                    ],
-                )
-                .unwrap();
+            engine.insert_many(&coll, decimal_sizes(&["x"])).unwrap();
         }
         as_schema_3(&path, &[]);
         (dir, path)
     }
 
+    /// Four documents under `{size: {$gt: 5}}`, with each of `fields` set: `_id`s
+    /// 2 and 4 selected (a number and a `Decimal128`), 1 and 3 not.
+    fn decimal_sizes(fields: &[&str]) -> Vec<Document> {
+        let dec = |s: &str| Bson::Decimal128(s.parse().unwrap());
+        [(1_i64, Bson::Int32(1)), (2, Bson::Int32(10)), (3, dec("1")), (4, dec("10.0"))]
+            .into_iter()
+            .map(|(id, size)| {
+                let mut d = doc! {"_id": id, "size": size};
+                for field in fields {
+                    d.insert(*field, id);
+                }
+                d
+            })
+            .collect()
+    }
+
+    /// The `_id`s an index holds, every run included, read from its entries.
+    fn held(engine: &Engine, coll: &crate::CollectionMeta, index: u32) -> Vec<i64> {
+        let keys = crate::index::scan_range(
+            engine,
+            crate::WalkScope::Request,
+            coll.id,
+            index,
+            &[],
+            None,
+            crate::index::Unkeyed::Include,
+        )
+        .unwrap();
+        let mut ids: Vec<i64> = keys
+            .iter()
+            .map(|k| {
+                let doc = engine.get_by_encoded_key(coll, k).unwrap().expect("a live holder");
+                doc.get_i64("_id").unwrap()
+            })
+            .collect();
+        ids.sort_unstable();
+        ids
+    }
+
     #[test]
-    fn the_rebuild_files_a_document_its_filter_cannot_decide() {
-        // **The carrier nothing held.** The 3 -> 4 rebuild has its own
-        // `Undecidable` arm, and it is the path *every existing database* takes
-        // to ADR-185's membership: a live node never re-files these documents,
-        // the migration does. Deleting that arm left the whole suite green.
-        let (_dir, path) = schema_3_with_an_undecidable_document();
+    fn the_rebuild_decides_a_decimal_at_the_filtered_path() {
+        // **The carrier nothing held.** The rebuild is the path *every existing
+        // database* takes to the current membership rule: a live node never
+        // re-files these documents, the migration does. Through schema 4 that
+        // rule held a decimal the filter did not select in ADR-185's undecidable
+        // run, and deleting that arm left the whole suite green. Since ADR-238
+        // the filter decides a decimal by its value, so the rebuilt index holds
+        // exactly what the filter selects, a decimal included and a decimal
+        // excluded.
+        let (_dir, path) = schema_3_with_decimals_at_a_filtered_path();
         assert_eq!(version(&path), Some(3), "premise: a schema 3 database");
 
         let engine = Engine::open(&path).unwrap();
         assert_eq!(
             stored_version(engine.db()).unwrap(),
-            Some(4),
+            Some(SCHEMA_VERSION),
             "the open migrated it — read through the open engine, since the file cannot be \
              opened twice"
         );
         let coll = engine.get_collection("shop", "orders").unwrap();
         let id = coll.index("by_size").unwrap().id;
         assert_eq!(
-            engine.undecidable_count(&coll, id).unwrap(),
-            1,
-            "the rebuild must file the document its filter cannot decide, or every database that \
-             migrates loses it from this index until something rewrites it"
+            held(&engine, &coll, id),
+            vec![2, 4],
+            "the rebuild must key the decimal its filter selects, or every database that \
+             migrates loses it from this index until something rewrites it, and hold nothing for \
+             the one it does not"
         );
-        assert_eq!(
-            engine.unkeyed_count(&coll, id).unwrap(),
-            0,
-            "and under the reason that is true of it, not the other one"
-        );
+        assert_eq!(engine.unkeyed_count(&coll, id).unwrap(), 0, "and nothing is unkeyed");
     }
 
     #[test]
-    fn an_interrupted_rebuild_files_the_documents_its_filters_cannot_decide_when_it_resumes() {
+    fn an_interrupted_rebuild_decides_the_decimals_at_its_filtered_paths_when_it_resumes() {
         // The same carrier through the resume. Two partial indexes, the run
-        // stopped after the first commits: the second is rebuilt on the next
-        // open, from the markers, and must file the undecidable document as the
-        // first did — and the first must not be redone.
+        // killed at each of its commits in turn: the next open finishes from the
+        // markers, and must decide the decimal documents in both.
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("kimmy.redb");
         {
@@ -1789,37 +1548,44 @@ mod membership_migration {
                     .unwrap();
             }
             let coll = engine.get_collection("shop", "orders").unwrap();
-            engine
-                .insert_many(
-                    &coll,
-                    vec![
-                        doc! {"_id": 1_i64, "size": 1, "x": 1, "y": 1},
-                        doc! {"_id": 2_i64, "size": 10, "x": 2, "y": 2},
-                        doc! {"_id": 3_i64, "size": Bson::Decimal128("1".parse().unwrap()), "x": 3, "y": 3},
-                    ],
-                )
-                .unwrap();
+            engine.insert_many(&coll, decimal_sizes(&["x", "y"])).unwrap();
         }
         as_schema_3(&path, &[]);
 
-        hooks::fail_at_index(2);
-        assert!(Engine::open(&path).is_err(), "premise: the failure was reached");
-        assert!(
-            partial_rebuild_owed(&Database::create(&path).unwrap()).unwrap(),
-            "premise: the second index is still owed"
-        );
-
-        let engine = Engine::open(&path).unwrap();
-        let coll = engine.get_collection("shop", "orders").unwrap();
-        for name in ["by_x", "by_y"] {
-            let id = coll.index(name).unwrap().id;
-            assert_eq!(
-                engine.undecidable_count(&coll, id).unwrap(),
-                1,
-                "{name}: the document its filter cannot decide, filed by the run that built it"
-            );
-            assert_eq!(engine.unkeyed_count(&coll, id).unwrap(), 0, "{name}: and only there");
+        let commits = commits_of_a_clean_run(&path);
+        assert!(commits > 2, "premise: the migration commits more than once ({commits})");
+        for at in 1..=commits {
+            let run = copy_of(&path, &format!("run{at}"));
+            crate::migrate_v5::hooks::fail_at_commit(at);
+            assert!(Engine::open(&run).is_err(), "premise: the failure was reached at {at}");
+            let engine = Engine::open(&run).unwrap();
+            let coll = engine.get_collection("shop", "orders").unwrap();
+            for name in ["by_x", "by_y"] {
+                let id = coll.index(name).unwrap().id;
+                assert_eq!(
+                    held(&engine, &coll, id),
+                    vec![2, 4],
+                    "{name}, killed at {at}: exactly what the filter selects"
+                );
+                assert_eq!(engine.unkeyed_count(&coll, id).unwrap(), 0, "{name}: nothing unkeyed");
+            }
         }
+    }
+
+    /// A copy of a closed store and its sidecar, beside it.
+    fn copy_of(path: &std::path::Path, name: &str) -> std::path::PathBuf {
+        let copy = path.with_file_name(format!("{name}.redb"));
+        std::fs::copy(path, &copy).unwrap();
+        std::fs::copy(crate::format::sidecar_path(path), crate::format::sidecar_path(&copy))
+            .unwrap();
+        copy
+    }
+
+    /// How many commits the schema 5 migration of a copy of `path` makes.
+    fn commits_of_a_clean_run(path: &std::path::Path) -> usize {
+        let before = crate::migrate_v5::hooks::commits();
+        drop(Engine::open(&copy_of(path, "clean")).unwrap());
+        crate::migrate_v5::hooks::commits() - before
     }
 
     #[test]
@@ -1846,7 +1612,7 @@ mod membership_migration {
             assert!(refused.iter().any(|r| r.contains(&named)), "{coll} unnamed: {refused:?}");
         }
         let message = err.to_string();
-        assert!(message.contains("Decimal128"), "no parse error in the message: {message}");
+        assert!(message.contains("$exists"), "no parse error in the message: {message}");
         assert!(
             message.contains("previous build") && message.contains("drop each index"),
             "no remedy in the message: {message}"
@@ -1856,20 +1622,25 @@ mod membership_migration {
         // the entries a rebuild would have cleared are where they were.
         assert_eq!(version(&path), Some(3), "the version is still 3");
         assert_eq!(entry_count(&path, "shop", "held"), before, "no entries were cleared");
+        assert_eq!(
+            crate::format::read_sidecar(&path).map(|s| s.schema),
+            Some(3),
+            "and the sidecar was never raised: refused before raise(5)"
+        );
     }
 
     #[test]
     fn a_refused_filter_is_found_on_a_resume_too() {
-        // An interrupted migration leaves schema 4 with markers, and resumes
+        // An interrupted migration leaves schema 5 with markers, and resumes
         // through them rather than through the version. The refusal has to run
         // on that path as well, before the rebuild goes any further.
         let (_dir, path) = fixture();
-        hooks::fail_at_index(2);
+        crate::migrate_v5::hooks::fail_at_commit(3);
         assert!(Engine::open(&path).is_err(), "premise: the failure was reached");
-        assert_eq!(version(&path), Some(SCHEMA_VERSION), "premise: schema 4 already");
+        assert_eq!(version(&path), Some(SCHEMA_VERSION), "premise: schema 5 already");
         assert!(
-            partial_rebuild_owed(&Database::create(&path).unwrap()).unwrap(),
-            "premise: with an index still owed"
+            crate::migrate_v5::unfinished(&Database::create(&path).unwrap()).unwrap(),
+            "premise: with work still owed"
         );
         store_unparseable_filter(&path, &[("shop", "t", "by_range")]);
 
@@ -1884,8 +1655,8 @@ mod membership_migration {
             "the wrong error: {err}"
         );
         assert!(
-            partial_rebuild_owed(&Database::create(&path).unwrap()).unwrap(),
-            "and the rebuild went no further: the index is still owed"
+            crate::migrate_v5::unfinished(&Database::create(&path).unwrap()).unwrap(),
+            "and the rebuild went no further: the work is still owed"
         );
     }
 
@@ -1974,7 +1745,7 @@ mod membership_migration {
             matches!(&err, StorageError::UnparseablePartialFilter { refused, .. } if refused.len() == 1),
             "the wrong error: {err}"
         );
-        assert_eq!(version(&path), Some(3), "the version is still 3, not 4");
+        assert_eq!(version(&path), Some(3), "the version is still 3, not 5");
     }
 
     /// The `_id`s an index holds, read from the file.
@@ -2059,163 +1830,36 @@ mod membership_migration {
     fn a_partial_index_built_under_the_old_rule_is_rebuilt_to_what_find_selects() {
         let (_dir, path) = fixture();
         assert_the_fixture_is_the_old_membership(&path);
-        let plan = partial_rebuild_plan(&Database::create(&path).unwrap()).unwrap();
-        assert_eq!(plan.indexes.len(), 2);
-        assert_eq!(plan.documents, 2 * 29, "each index scans the collection's 29 documents");
-        assert_eq!(plan.largest_documents, 29);
-        let lines_before = hooks::progress_lines();
+        let lines_before = crate::migrate_v5::hooks::progress_lines();
 
         drop(Engine::open(&path).unwrap());
 
         assert_eq!(members(&path, "by_array"), BTreeSet::from([1, 3]));
         assert_eq!(members(&path, "by_range"), BTreeSet::from([4]));
         assert_eq!(version(&path), Some(SCHEMA_VERSION));
-        let db = Database::create(&path).unwrap();
         assert!(
-            db.begin_read().unwrap().open_table(PARTIAL_REBUILT).is_err(),
+            !crate::migrate_v5::unfinished(&Database::create(&path).unwrap()).unwrap(),
             "the markers are gone"
         );
-        assert!(hooks::progress_lines() - lines_before >= 4, "every ten documents, on each index");
-    }
-
-    /// Rewrites the kept counts of every collection to `n` in place, leaving
-    /// their mark alone.
-    fn set_kept_counts(path: &std::path::Path, n: Option<u64>) {
-        let db = Database::create(path).unwrap();
-        let txn = db.begin_write().unwrap();
-        {
-            let mut counts = txn.open_table(tables::LIVE_COUNTS).unwrap();
-            let ids: Vec<u64> = counts.iter().unwrap().map(|row| row.unwrap().0.value()).collect();
-            assert!(!ids.is_empty(), "premise: the fixture's counts are kept");
-            for id in ids {
-                match n {
-                    Some(n) => counts.insert(id, n).unwrap(),
-                    None => counts.remove(id).unwrap(),
-                };
-            }
-        }
-        txn.commit().unwrap();
-    }
-
-    #[test]
-    fn the_estimate_is_for_the_whole_migration_and_not_for_one_index() {
-        // What an operator decides whether to wait on: several large indexes
-        // in sequence, not the largest of them.
-        let plan = PartialRebuildPlan {
-            indexes: Vec::new(),
-            documents: 15_000_000,
-            largest_documents: 10_000_000,
-        };
-        assert_eq!(plan.estimate_secs(), 15_000_000 * MICROS_PER_DOCUMENT / 1_000_000);
-        assert_ne!(
-            plan.estimate_secs(),
-            10_000_000 * MICROS_PER_DOCUMENT / 1_000_000,
-            "premise: the total and the largest give different estimates"
-        );
-    }
-
-    #[test]
-    fn the_announcement_reads_the_kept_counts_when_they_are_current() {
-        let (_dir, path) = fixture();
-        set_kept_counts(&path, Some(7));
-        let db = Database::create(&path).unwrap();
         assert!(
-            crate::live_count::counts_are_current(&db.begin_read().unwrap()).unwrap(),
-            "premise: rewriting a count in place leaves its mark matching"
-        );
-        let plan = partial_rebuild_plan(&db).unwrap();
-        // Seven, not the 29 documents there are: the count was read, not
-        // walked for.
-        assert_eq!((plan.documents, plan.largest_documents), (2 * 7, 7));
-    }
-
-    #[test]
-    fn the_announcement_counts_the_collection_when_a_restore_left_no_counts() {
-        let (_dir, path) = fixture();
-        // What a backup restores: neither the counts nor their mark (ADR-174).
-        set_kept_counts(&path, None);
-        {
-            let db = Database::create(&path).unwrap();
-            let txn = db.begin_write().unwrap();
-            txn.open_table(tables::LIVE_COUNTS_THROUGH)
-                .unwrap()
-                .remove(crate::live_count::THROUGH)
-                .unwrap()
-                .expect("premise: the fixture's counts had a mark");
-            txn.commit().unwrap();
-        }
-        let plan = partial_rebuild_plan(&Database::create(&path).unwrap()).unwrap();
-        assert_eq!((plan.documents, plan.largest_documents), (2 * 29, 29));
-    }
-
-    #[test]
-    fn the_announcement_counts_the_collection_when_the_counts_mark_is_behind() {
-        let (_dir, path) = fixture();
-        // An older build wrote since: the counts stand at 7 and the mark no
-        // longer matches the oplog.
-        set_kept_counts(&path, Some(7));
-        {
-            let db = Database::create(&path).unwrap();
-            let txn = db.begin_write().unwrap();
-            txn.open_table(tables::LIVE_COUNTS_THROUGH)
-                .unwrap()
-                .insert(crate::live_count::THROUGH, &[0u8; 8][..])
-                .unwrap();
-            txn.commit().unwrap();
-        }
-        let plan = partial_rebuild_plan(&Database::create(&path).unwrap()).unwrap();
-        assert_eq!((plan.documents, plan.largest_documents), (2 * 29, 29));
-    }
-
-    #[test]
-    fn a_migration_interrupted_between_indexes_finishes_without_redoing_one() {
-        let (_dir, path) = fixture();
-        assert_the_fixture_is_the_old_membership(&path);
-
-        hooks::fail_at_index(2);
-        assert!(Engine::open(&path).is_err(), "premise: the failure was reached");
-
-        // Schema 4 already, with the markers still there. The version goes down
-        // in the first index's commit so that a file in this state -- one index
-        // rebuilt, one still holding what the old rule selected -- is refused by
-        // the previous build rather than opened and maintained under that rule.
-        assert_eq!(version(&path), Some(SCHEMA_VERSION), "the version went down with index 1");
-        assert!(
-            partial_rebuild_owed(&Database::create(&path).unwrap()).unwrap(),
-            "the markers say the migration is not finished"
-        );
-        assert_eq!(members(&path, "by_array"), BTreeSet::from([1, 3]), "the first index committed");
-        assert_eq!(members(&path, "by_range"), BTreeSet::from([4, 5]), "the second rolled back");
-        let plan = partial_rebuild_plan(&Database::create(&path).unwrap()).unwrap();
-        let pending: Vec<&str> = plan.indexes.iter().map(|(_, i, _)| i.name.as_str()).collect();
-        assert_eq!(pending, ["by_range"], "only the unfinished index is left to do");
-
-        // Reopening resumes from the markers, finishes, and clears them. The
-        // version was already 4, so the resume is reached through the marker
-        // table rather than through the version.
-        drop(Engine::open(&path).unwrap());
-        assert_eq!(members(&path, "by_range"), BTreeSet::from([4]));
-        assert_eq!(members(&path, "by_array"), BTreeSet::from([1, 3]), "and index 1 not redone");
-        assert_eq!(version(&path), Some(SCHEMA_VERSION));
-        assert!(
-            !partial_rebuild_owed(&Database::create(&path).unwrap()).unwrap(),
-            "the markers are gone, which is what finished means"
+            crate::migrate_v5::hooks::progress_lines() - lines_before >= 4,
+            "every ten rows, in each phase"
         );
     }
 
     /// ADR-190: the sidecar records the new schema before the first
-    /// write of a migration. A migration that fails at its first index, before
-    /// that commit, leaves the sidecar ahead of META, so a build of the old
-    /// schema refuses the store without touching it rather than opening one
-    /// whose migration has begun.
+    /// write of a migration. A migration that fails at its first commit
+    /// leaves the sidecar ahead of META, so a build of the old schema refuses
+    /// the store without touching it rather than opening one whose migration
+    /// has begun.
     #[test]
     fn the_sidecar_is_raised_before_a_migration_writes() {
         let (_dir, path) = fixture();
         assert_the_fixture_is_the_old_membership(&path);
         std::fs::remove_file(crate::format::sidecar_path(&path)).unwrap();
 
-        hooks::fail_at_index(1);
-        assert!(Engine::open(&path).is_err(), "premise: the first index's commit failed");
+        crate::migrate_v5::hooks::fail_at_commit(1);
+        assert!(Engine::open(&path).is_err(), "premise: the first commit failed");
         assert_eq!(version(&path), Some(3), "META did not move");
         assert_eq!(
             crate::format::read_sidecar(&path).map(|s| s.schema),
@@ -2318,8 +1962,8 @@ mod membership_migration {
                     ],
                 )
                 .unwrap();
-            // The unique one first, so it is the index that commits, and a
-            // second partial index after it, so there is something to fail on.
+            // A unique partial index that finds the shared key, and a second
+            // partial index after it, so the run has more to do once it has.
             for (name, unique, filter) in [
                 ("email_once", true, doc! {"k": [1, 2]}),
                 ("by_range", false, doc! {"size": {"$gt": 5}}),
@@ -2345,7 +1989,10 @@ mod membership_migration {
         as_schema_3(&path, &["email_once"]);
         assert!(members(&path, "email_once").is_empty(), "premise: neither was a member");
 
-        hooks::fail_at_index(2);
+        // Killed at its last commit: every index rebuilt, the collision found
+        // and recorded, the markers not yet deleted.
+        let commits = commits_of_a_clean_run(&path);
+        crate::migrate_v5::hooks::fail_at_commit(commits);
         assert!(Engine::open(&path).is_err(), "premise: the failure was reached");
         assert_eq!(
             members(&path, "email_once"),
@@ -2353,8 +2000,8 @@ mod membership_migration {
             "premise: the unique index committed, holding both duplicates"
         );
         assert!(
-            partial_rebuild_owed(&Database::create(&path).unwrap()).unwrap(),
-            "premise: the migration is unfinished, and email_once is marked done"
+            crate::migrate_v5::unfinished(&Database::create(&path).unwrap()).unwrap(),
+            "premise: the migration is unfinished, and email_once is rebuilt"
         );
 
         // The next open resumes, and reports what the interrupted run found.
@@ -2410,81 +2057,5 @@ mod membership_migration {
         drop(engine);
         assert_eq!(members(&path, "email_once"), BTreeSet::from([1, 2]), "built in full");
         assert_eq!(version(&path), Some(SCHEMA_VERSION));
-    }
-}
-
-/// What the schema 3 -> 4 migration costs on a realistic collection
-/// (ADR-183): a harness, not a test, run in release on the machine a figure
-/// is quoted from.
-///
-/// ```text
-/// MIGRATION_N=10000000 cargo test --release -p kimmy-storage --lib \
-///     migrate::migration_cost -- --ignored --nocapture
-/// ```
-#[cfg(test)]
-mod migration_cost {
-    use bson::doc;
-
-    use super::*;
-    use crate::Engine;
-
-    #[test]
-    #[ignore = "a measurement harness: see the module documentation"]
-    fn measure() {
-        let n: i64 = std::env::var("MIGRATION_N").map(|s| s.parse().unwrap()).unwrap_or(1_000_000);
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("kimmy.redb");
-        {
-            let engine = Engine::open(&path).unwrap();
-            let t = engine.create_collection("shop", "t").unwrap();
-            let pad = "p".repeat(200);
-            for start in (0..n).step_by(10_000) {
-                let docs: Vec<bson::Document> = (start..(start + 10_000).min(n))
-                    .map(|i| {
-                        let size = if i % 7 == 0 { bson::Bson::from("large") } else { (i % 20).into() };
-                        doc! {"_id": i, "size": size, "at": bson::DateTime::from_millis(i), "pad": &pad}
-                    })
-                    .collect();
-                engine.insert_many(&t, docs).unwrap();
-            }
-            engine
-                .create_index_with(
-                    "shop",
-                    "t",
-                    vec![crate::meta::IndexField::ascending("at")],
-                    false,
-                    crate::meta::Enforcement::Local,
-                    Some("ttl".into()),
-                    Some(3600),
-                    Some(doc! {"size": {"$gt": 5}}),
-                )
-                .unwrap();
-        }
-        write_version(&redb::Database::create(&path).unwrap(), 3).unwrap();
-        let plan = partial_rebuild_plan(&redb::Database::create(&path).unwrap()).unwrap();
-        let before = std::fs::metadata(&path).unwrap().len() >> 20;
-        let planned = std::time::Instant::now();
-        drop(partial_rebuild_plan(&redb::Database::create(&path).unwrap()).unwrap());
-        let planning = planned.elapsed();
-        let started = std::time::Instant::now();
-        drop(Engine::open(&path).unwrap());
-        let migrated = started.elapsed();
-        // The control: the same open with nothing to migrate.
-        let reopened = std::time::Instant::now();
-        drop(Engine::open(&path).unwrap());
-        eprintln!(
-            "MIGRATION n={n}: planning alone {planning:?}; an ordinary open afterwards {:?}",
-            reopened.elapsed()
-        );
-        eprintln!(
-            "MIGRATION n={n}: open with the migration took {migrated:?}; announced {} documents, \
-             estimate {} s, largest collection {} documents needing up to {} MiB; file {before} -> \
-             {} MiB",
-            plan.documents,
-            plan.estimate_secs(),
-            plan.largest_documents,
-            plan.largest_needs_mib(),
-            std::fs::metadata(&path).unwrap().len() >> 20
-        );
     }
 }

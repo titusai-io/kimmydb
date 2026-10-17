@@ -143,7 +143,21 @@ fn pool() -> Vec<Option<Bson>> {
         Some(Bson::Decimal128("1.5".parse().unwrap())),
         Some(Bson::Array(vec![Bson::Decimal128("2".parse().unwrap()), Bson::Int32(1)])),
         Some(Bson::Document(doc! { "a": Bson::Decimal128("1".parse().unwrap()) })),
+        // Decimals equal to values above (1, 0, NaN, 2^53 + 1, [1, 2]), the
+        // decimal tenth beside the double one, and a decimal past every double.
+        Some(dec("1.00")),
+        Some(dec("-0E-100")),
+        Some(dec("NaN")),
+        Some(dec("9007199254740993")),
+        Some(Bson::Array(vec![dec("1"), dec("2.0")])),
+        Some(dec("0.1")),
+        Some(Bson::Double(0.1)),
+        Some(dec("1E+400")),
     ]
+}
+
+fn dec(text: &str) -> Bson {
+    Bson::Decimal128(text.parse().unwrap())
 }
 
 fn with_field(id: i64, name: &str, value: &Option<Bson>, z: i64) -> Document {
@@ -190,6 +204,20 @@ fn the_join_equals_the_loop_over_generated_corpora() {
             json!([{ "$match": { "$and": [
                 { "$expr": { "$lte": ["$z", "$$w"] } },
                 { "$expr": { "$eq": ["$k", "$$v"] } } ] } }]),
+        ),
+        // A decimal literal as an independent clause beside the key, and as a
+        // residual against a variable.
+        lookup(
+            json!({ "v": "$v" }),
+            json!([{ "$match": { "$and": [
+                { "$expr": { "$eq": ["$k", "$$v"] } },
+                { "$expr": { "$lt": ["$z", { "$numberDecimal": "2.5" }] } } ] } }]),
+        ),
+        lookup(
+            json!({ "v": "$v", "w": "$w" }),
+            json!([{ "$match": { "$and": [
+                { "$expr": { "$eq": ["$k", "$$v"] } },
+                { "$expr": { "$gte": [{ "$numberDecimal": "1.5" }, "$$w"] } } ] } }]),
         ),
         // Not a join: `$or`, an inequality.
         lookup(
@@ -298,6 +326,28 @@ fn each_type_pair_joins_as_eq_says() {
             Bson::Document(doc! { "a": 1.0, "b": 2_i64 }),
             true,
         ),
+        // A decimal joins the number it equals, in every spelling, and nothing
+        // else: not the double 0.1, not 2^53 for 2^53 + 1.
+        (dec("5"), Bson::Int32(5), true),
+        (dec("5.00"), Bson::Double(5.0), true),
+        (Bson::Int64(5), dec("50E-1"), true),
+        (dec("1.0"), dec("1.000"), true),
+        (dec("0.1"), Bson::Double(0.1), false),
+        (dec("0.1"), dec("0.10"), true),
+        (dec("-0"), Bson::Double(0.0), true),
+        (dec("NaN"), Bson::Double(f64::NAN), true),
+        (dec("-Infinity"), Bson::Double(f64::NEG_INFINITY), true),
+        (dec("9007199254740993"), Bson::Int64(9_007_199_254_740_993), true),
+        (dec("9007199254740993"), Bson::Double(big), false),
+        (dec("9223372036854775808"), Bson::Double(9_223_372_036_854_775_808.0), true),
+        (dec("5.000000000000000000000000000000001"), Bson::Int32(5), false),
+        (
+            Bson::Array(vec![dec("1"), dec("2.0")]),
+            Bson::Array(vec![Bson::Int64(1), Bson::Double(2.0)]),
+            true,
+        ),
+        (Bson::Document(doc! { "a": dec("1.0") }), Bson::Document(doc! { "a": 1 }), true),
+        (dec("1"), Bson::String("1".into()), false),
         (
             Bson::Binary(bson::Binary {
                 subtype: bson::spec::BinarySubtype::Generic,
@@ -495,26 +545,69 @@ fn a_residual_that_raises_falls_back_for_that_input_only() {
     assert!(run.outcome.is_err(), "the second input raises in the loop too");
 }
 
-/// A `Decimal128` on either side cannot be keyed: the loop answers, and `$eq` ranks it
-/// equal to every number.
+/// A `Decimal128` on either side is keyed by its value: the hash join answers, and answers
+/// as the loop does, where `$eq` now matches a decimal against the equal number only.
 #[test]
-fn a_decimal128_key_takes_the_loop() {
-    let dec: bson::Decimal128 = "7".parse().unwrap();
+fn a_decimal128_key_is_joined_by_its_value() {
+    let two = dec("2.0");
     let dir = tempfile::tempdir().unwrap();
     let state = state_with(
         &dir,
         vec![doc! { "_id": 1, "v": 1 }, doc! { "_id": 2, "v": 2 }],
-        vec![doc! { "_id": 10, "k": Bson::Decimal128(dec) }, doc! { "_id": 11, "k": 2 }],
+        vec![doc! { "_id": 10, "k": two.clone() }, doc! { "_id": 11, "k": 1 }],
     );
     let run = both(&state, &eq_on_k());
-    assert_eq!(run.probes, 0, "a Decimal128 on the build side declines the whole execution");
+    assert_eq!(
+        run.probes, 1,
+        "a Decimal128 on the build side no longer declines: the second input probes"
+    );
     let dir = tempfile::tempdir().unwrap();
     let state = state_with(
         &dir,
-        vec![doc! { "_id": 1, "v": 1 }, doc! { "_id": 2, "v": Bson::Decimal128(dec) }],
+        vec![doc! { "_id": 1, "v": 1 }, doc! { "_id": 2, "v": two }],
         vec![doc! { "_id": 10, "k": 1 }, doc! { "_id": 11, "k": 2 }],
     );
-    both(&state, &eq_on_k());
+    let run = both(&state, &eq_on_k());
+    assert_eq!(run.probes, 1, "nor on the probe side");
+
+    // Each side in several spellings, and the decimal tenth beside the double
+    // one: the join files equal values under one key and nothing else, and a
+    // decimal literal in a clause beside the key is compared exactly too.
+    let dir = tempfile::tempdir().unwrap();
+    let state = state_with(
+        &dir,
+        vec![
+            doc! { "_id": 1, "v": dec("1.00") },
+            doc! { "_id": 2, "v": 0.1 },
+            doc! { "_id": 3, "v": dec("0.10") },
+            doc! { "_id": 4, "v": 5_i64 },
+        ],
+        vec![
+            doc! { "_id": 10, "k": 1, "z": 1 },
+            doc! { "_id": 11, "k": dec("1"), "z": 3 },
+            doc! { "_id": 12, "k": dec("0.1"), "z": 1 },
+            doc! { "_id": 13, "k": 0.1, "z": 1 },
+            doc! { "_id": 14, "k": dec("5E0"), "z": 2 },
+        ],
+    );
+    let run = both(&state, &eq_on_k());
+    assert_eq!(
+        ids(run.outcome.as_ref().unwrap()),
+        vec![vec![json!(10), json!(11)], vec![json!(13)], vec![json!(12)], vec![json!(14)]]
+    );
+    assert_eq!(run.probes, 3);
+    let with_literal = lookup(
+        json!({ "v": "$v" }),
+        json!([{ "$match": { "$and": [
+            { "$expr": { "$eq": ["$k", "$$v"] } },
+            { "$expr": { "$lt": ["$z", { "$numberDecimal": "2.5" }] } } ] } }]),
+    );
+    let run = both(&state, &with_literal);
+    assert_eq!(
+        ids(run.outcome.as_ref().unwrap()),
+        vec![vec![json!(10)], vec![json!(13)], vec![json!(12)], vec![json!(14)]]
+    );
+    assert_eq!(run.probes, 3);
 }
 
 /// The attached ceiling reads the same on the first input and on a later one.
@@ -786,6 +879,7 @@ fn data_can_raise(e: &kimmy_core::Error) -> bool {
         | E::MalformedResumeToken
         | E::MalformedCursor
         | E::MalformedStamp
+        | E::Decimal128Gated { .. }
         | E::Bson(_)
         | E::Serialization(_) => false,
     }

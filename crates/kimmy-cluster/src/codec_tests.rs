@@ -279,7 +279,9 @@ fn this_build_reads_a_043_block_and_frames() {
 fn unset_fields_add_no_keys() {
     let facts = bson::serialize_to_bson(&Facts::default()).unwrap();
     let doc = facts.as_document().unwrap();
-    for key in ["class_state", "class_cause", "responsive", "writer_wedged", "started_ms"] {
+    for key in
+        ["class_state", "class_cause", "responsive", "writer_wedged", "started_ms", "decimal128"]
+    {
         assert!(!doc.contains_key(key), "{key}");
     }
     let frame = bson::serialize_to_bson(&Message::AskVersions {
@@ -337,9 +339,68 @@ fn a_full_block_round_trips() {
         }),
         responsive: Some(true),
         started_ms: Some(42),
+        decimal128: Some(true),
         ..Facts::default()
     };
     let back: Facts =
         bson::deserialize_from_slice(&bson::serialize_to_vec(&block).unwrap()).unwrap();
     assert_eq!(back, block);
+}
+
+/// `Facts.decimal128` (ADR-238) is read by this build from an older sender's block
+/// as `None`, which is *cannot*, and a value of another shape costs the field only.
+#[test]
+fn this_build_reads_decimal128_leniently_and_an_older_block_as_cannot() {
+    assert_eq!(facts_of(doc! { "decimal128": true }).decimal128, Some(true));
+    assert_eq!(facts_of(doc! { "decimal128": false }).decimal128, Some(false));
+    // A 0.50 sender: no key.
+    let older = facts_of(doc! { "catching_up": true, "boot": bson::Binary {
+    subtype: bson::spec::BinarySubtype::Generic, bytes: vec![8; 16] } });
+    assert_eq!(older.decimal128, None);
+    for odd in [Bson::String("yes".into()), Bson::Int32(1), Bson::Null, doc! { "a": 1 }.into()] {
+        let block = facts_of(doc! { "catching_up": true, "decimal128": odd.clone() });
+        assert!(block.catching_up, "{odd:?} cost the block");
+        assert_eq!(block.decimal128, None, "{odd:?} reads as cannot");
+    }
+}
+
+/// A 0.50 decoder, which knows nothing of `decimal128`, reads a 0.51 block and frame
+/// carrying it: an older member is not failed by the field.
+#[test]
+fn a_050_decoder_reads_a_block_carrying_decimal128() {
+    #[derive(Debug, Deserialize)]
+    struct Facts050 {
+        #[serde(default, with = "serde_bytes")]
+        boot: Vec<u8>,
+        #[serde(default)]
+        catching_up: bool,
+        #[serde(default)]
+        started_ms: Option<u64>,
+    }
+    #[derive(Debug, Deserialize)]
+    enum Message050 {
+        AskVersions {
+            #[serde(default)]
+            facts: Option<Facts050>,
+        },
+    }
+    let block = Facts {
+        boot: vec![3; 16],
+        catching_up: true,
+        started_ms: Some(7),
+        decimal128: Some(true),
+        ..Facts::default()
+    };
+    let raw = bson::serialize_to_bson(&block).unwrap();
+    assert_eq!(raw.as_document().unwrap().get("decimal128"), Some(&Bson::Boolean(true)));
+    let message = Message::AskVersions {
+        witnessed: true,
+        facts: Some(Arc::new(block)),
+        facts_gen: Some(1),
+        echo: None,
+    };
+    let bytes = bson::serialize_to_vec(&message).unwrap();
+    let Message050::AskVersions { facts } = bson::deserialize_from_slice(&bytes).unwrap();
+    let facts = facts.unwrap();
+    assert_eq!((facts.boot, facts.catching_up, facts.started_ms), (vec![3; 16], true, Some(7)));
 }

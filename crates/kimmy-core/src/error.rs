@@ -103,6 +103,68 @@ pub enum Error {
     /// documents and hide it for others. See [`Error::is_deferrable`].
     #[error("internal error: {0}")]
     Internal(String),
+
+    /// A locally originated creation that would persist a `Decimal128` where
+    /// a member older than 0.51 can meet it and cannot read it, refused
+    /// (ADR-238): a row whose stored `_id` is a `Decimal128`, or an index whose
+    /// partial filter holds one. Such a member fails every frame that carries
+    /// the row and never catches up, and refuses such a definition for good,
+    /// so the creation waits until the operator has declared that every
+    /// member can hold one (`cluster.decimal128`) and every live peer says so.
+    /// Replicated, restored and repaired writes are never refused by it.
+    #[error("{}", decimal128_refusal(*what, closed))]
+    Decimal128Gated { what: Decimal128Use, closed: Decimal128Closed },
+}
+
+/// What a [`Error::Decimal128Gated`] refusal would have persisted.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Decimal128Use {
+    /// A row whose stored `_id` has BSON type `Decimal128`, an integral one
+    /// (whose `DocId` is an `Int64`) included: the body keeps the decimal.
+    Id,
+    /// An index whose `partialFilterExpression` holds a `Decimal128` operand.
+    PartialFilterBound,
+}
+
+/// Why the gate on a [`Decimal128Use`] is closed.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Decimal128Closed {
+    /// `cluster.decimal128` is false: the operator has not declared that
+    /// every member runs 0.51 and has migrated.
+    Undeclared,
+    /// The key is set, and these live peers (node ids, sorted) do not
+    /// advertise that they can hold one: an older build, or a peer this
+    /// member has not heard from yet.
+    Peers(Vec<String>),
+    /// The key is set, and this member cannot see what its peers say about
+    /// themselves, for the reason given.
+    Unseen(&'static str),
+}
+
+fn decimal128_refusal(what: Decimal128Use, closed: &Decimal128Closed) -> String {
+    let what = match what {
+        Decimal128Use::Id => "a document whose _id is a Decimal128 cannot be created",
+        Decimal128Use::PartialFilterBound => {
+            "an index whose partialFilterExpression holds a Decimal128 cannot be created"
+        }
+    };
+    match closed {
+        Decimal128Closed::Undeclared => format!(
+            "{what} until cluster.decimal128 is set. Set it only once every member runs 0.51 \
+             or later and has finished its storage migration, as a configuration change of \
+             its own and never in the change that upgrades the binary: a member older than \
+             0.51 that meets one never catches up"
+        ),
+        Decimal128Closed::Peers(peers) => format!(
+            "{what}: cluster.decimal128 is set, but the live member(s) {} do not say they can \
+             hold one (a build older than 0.51, or a member not yet heard from); it is accepted \
+             once every live member does",
+            peers.join(", ")
+        ),
+        Decimal128Closed::Unseen(why) => {
+            format!("{what}: cluster.decimal128 is set, but {why}")
+        }
+    }
 }
 
 impl Error {
@@ -161,6 +223,11 @@ impl Error {
             | Error::MalformedCursor
             | Error::MalformedStamp => false,
 
+            // Raised on locally originated creations only; replication never
+            // asks the gate (ADR-238). Failing the round is the safe answer if
+            // it ever did: skipping would lose the write for good.
+            Error::Decimal128Gated { .. } => false,
+
             // A value that will not decode or encode. Indistinguishable here
             // from corruption, which must never be skipped quietly.
             Error::Bson(_) | Error::Serialization(_) => false,
@@ -212,6 +279,7 @@ impl Error {
             | Error::MalformedResumeToken
             | Error::MalformedCursor
             | Error::MalformedStamp
+            | Error::Decimal128Gated { .. }
             | Error::Bson(_)
             | Error::Serialization(_) => false,
         }
@@ -269,6 +337,33 @@ mod tests {
         assert!(!limit.is_deferrable());
         assert!(limit.is_a_request_refusal());
         assert_eq!(limit.to_string(), "invalid query: $group produced 3 documents");
+    }
+
+    #[test]
+    fn a_decimal128_refusal_names_the_key_and_the_peers() {
+        let undeclared = Error::Decimal128Gated {
+            what: Decimal128Use::Id,
+            closed: Decimal128Closed::Undeclared,
+        };
+        let text = undeclared.to_string();
+        assert!(
+            text.contains("_id is a Decimal128") && text.contains("cluster.decimal128"),
+            "{text}"
+        );
+        let peers = Error::Decimal128Gated {
+            what: Decimal128Use::PartialFilterBound,
+            closed: Decimal128Closed::Peers(vec!["peer-a".into(), "peer-b".into()]),
+        };
+        let text = peers.to_string();
+        assert!(
+            text.contains("partialFilterExpression")
+                && text.contains("cluster.decimal128")
+                && text.contains("peer-a, peer-b"),
+            "{text}"
+        );
+        // Never skipped by replication, never set aside by an expression.
+        assert!(!peers.is_a_request_refusal());
+        assert!(!peers.is_deferrable());
     }
 
     #[test]

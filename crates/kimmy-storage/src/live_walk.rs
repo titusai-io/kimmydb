@@ -177,6 +177,13 @@ impl Cursor {
     }
 
     /// Whether this build may resume what the cursor describes.
+    ///
+    /// Also what keeps `after`, a stored `DOCS` key, meaningful (Decimal128 design
+    /// 5.1): schema 5 changed the bytes of every number key, and a cursor is
+    /// resumed only by the build and commit that wrote it, at the schema it was
+    /// written under. The walk runs after the migration (`Engine::open`), so a
+    /// cursor a 0.50 build left is never resumed over re-keyed rows; it is
+    /// discarded and the walk starts again.
     fn is_ours(&self, schema: u8) -> bool {
         self.build == build_id() && self.schema == schema && self.format == live_digest::FORMAT
     }
@@ -333,7 +340,9 @@ pub(crate) fn run(db: &Database, forced: Option<&'static str>) -> Result<Option<
                         if live {
                             *counts.entry(collection).or_default() += 1;
                         }
-                        live_digest::fold_walked(&mut digests, collection, doc_key, &stamp, live);
+                        // The legacy form, as every fold site hashes (`live_digest`).
+                        let key = kimmy_core::keyenc::legacy_of_stored(doc_key);
+                        live_digest::fold_walked(&mut digests, collection, &key, &stamp, live);
                     }
                     // Not counted, as no reader can return it either; refusing
                     // to open over one unreadable record would be worse than a

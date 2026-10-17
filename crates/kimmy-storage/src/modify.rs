@@ -113,16 +113,6 @@ pub trait ModifySpec {
     /// which is `_id` order for an index scan and storage order otherwise.
     fn compare(&self, a: &Document, b: &Document) -> Ordering;
 
-    /// Why `compare` cannot place this document, if it cannot.
-    ///
-    /// Asked of every match before any two are compared, so a document the
-    /// caller's order has no position for — one holding a `Decimal128` where
-    /// the sort would read it — is refused by name rather than placed
-    /// somewhere. Nothing is refused by default.
-    fn unsortable(&self, _doc: &Document) -> Option<String> {
-        None
-    }
-
     /// The new document, or `None` to remove it.
     fn apply(&self, doc: &Document) -> std::result::Result<Option<Document>, String>;
 
@@ -525,11 +515,6 @@ impl Engine {
         if matches.is_empty() {
             return Ok(None);
         }
-        for found in &matches {
-            if let Some(why) = spec.unsortable(&found.doc) {
-                return Err(StorageError::Core(kimmy_core::Error::InvalidQuery(why)));
-            }
-        }
         // `sort_by` rather than picking a minimum: the comparator is the
         // caller's whole sort specification, and a stable sort keeps the
         // scan's order for documents the sort does not separate.
@@ -727,6 +712,15 @@ impl Engine {
                 &key,
                 &codec::encode_doc_record(&record),
             )?;
+        }
+        // An update keeps the stored `_id`, so it creates no decimal id; but a
+        // store that met one before it ran 0.51 has no marker yet, and this
+        // write is a chance to set it (ADR-238).
+        if next
+            .and_then(|doc| doc.get(crate::docs::ID_FIELD))
+            .is_some_and(crate::decimal128_gate::id_value_is_decimal128)
+        {
+            crate::decimal128_gate::mark_in_txn(txn, &stamp)?;
         }
 
         let entry = OplogEntry { stamp, kind, collection: coll.id, doc_id: Some(id.clone()), body };

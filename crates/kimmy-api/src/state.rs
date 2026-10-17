@@ -232,7 +232,6 @@ impl AppState {
             process_resident_bytes: memory.resident_bytes,
             process_resident_peak_bytes: memory.peak_resident_bytes,
             index_unkeyed: self.engine.unkeyed_writes(),
-            index_undecidable: self.engine.undecidable_writes(),
             sync_ddl_relogged: self.engine.ddl_relogged(),
             sync_horizon_state_held: self.engine.state_held_refusals(),
             // What a write costs *before* it starts (ADR-151): the wait for
@@ -264,6 +263,9 @@ impl AppState {
             // release counter above cannot say: it moves only when a mark
             // goes (ADR-160, ADR-172).
             held_marks: self.engine.held_marks()?,
+            // The durable marker that a `Decimal128` id exists here (ADR-238):
+            // one point read of the metadata table.
+            decimal128_id_present: self.engine.decimal128_id_present()?,
             // Read here rather than set by the dispatcher (ADR-187): live
             // state needs no writer, so it cannot be left unwritten, frozen
             // or late. A registry that cannot be read fails the scrape.

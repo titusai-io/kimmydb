@@ -235,10 +235,8 @@ fn describe(stage: &Stage, per_input: bool) -> Value {
                             Some(_) => 1,
                         };
                         out["residualClauses"] = json!(residual);
-                        out["fallback"] = json!(
-                            "nested loop at run time if a key holds a Decimal128, or the build or a \
-                             probe raises"
-                        );
+                        out["fallback"] =
+                            json!("nested loop at run time if the build or a probe raises");
                     }
                     let mut inner = Vec::new();
                     for (i, stage) in sub.iter().enumerate() {
@@ -494,6 +492,8 @@ mod tests {
             "documentsMatched",
             "indexEntriesRead",
             "unkeyedCandidates",
+            // Gone with ADR-238's removal of the undecidable run, and so absent
+            // from every answer; named so its return is caught here too.
             "undecidableCandidates",
         ] {
             assert!(!text.contains(measured), "{measured} in {text}");
@@ -686,7 +686,7 @@ mod tests {
         assert_eq!(lookup["strategy"], "foreignScanHashJoin");
         assert_eq!(lookup["joinKey"], json!({ "foreign": "$n", "local": "$$n" }));
         assert_eq!(lookup["residualClauses"], 1);
-        assert!(lookup["fallback"].as_str().unwrap().contains("Decimal128"));
+        assert!(lookup["fallback"].as_str().unwrap().contains("raises"));
         let inner = lookup["stages"].as_array().unwrap();
         assert_eq!(inner[0]["part"], "independent");
         assert_eq!(inner[0]["perInputDocument"], false);

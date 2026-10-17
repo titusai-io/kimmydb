@@ -6,7 +6,7 @@
 //! optimisation — it is the shared representation.
 
 use bson::{Bson, Document};
-use kimmy_core::cmp::{canonical_cmp, holds_decimal128};
+use kimmy_core::cmp::canonical_cmp;
 use kimmy_core::matching::{self, any_element};
 use kimmy_core::{Error, Result};
 use std::cmp::Ordering;
@@ -225,10 +225,8 @@ fn parse_logical(op: &str, value: &Bson, scope: Scope<'_>) -> Result<Filter> {
 /// `path` is the field the conditions apply to, empty for an array element,
 /// and only names it in a refusal.
 fn parse_conditions(path: &str, value: &Bson, scope: Scope<'_>) -> Result<Vec<Condition>> {
-    let equality = |value: &Bson| -> Result<Vec<Condition>> {
-        comparable("equality", value)?;
-        Ok(vec![Condition::Eq(value.clone())])
-    };
+    let equality =
+        |value: &Bson| -> Result<Vec<Condition>> { Ok(vec![Condition::Eq(value.clone())]) };
     let Bson::Document(doc) = value else {
         return equality(value);
     };
@@ -305,13 +303,6 @@ fn parse_condition(
         }
     };
 
-    // Every operator that compares its operand against the field refuses a
-    // Decimal128 in it, for the reason on `comparable`; the ones below this
-    // block ask about shape or type and never compare.
-    if matches!(op, "eq" | "ne" | "gt" | "gte" | "lt" | "lte" | "in" | "nin" | "all") {
-        comparable(&format!("${op}"), arg)?;
-    }
-
     Ok(match op {
         "eq" => Condition::Eq(arg.clone()),
         "ne" => Condition::Ne(not_regex(arg)?.clone()),
@@ -332,6 +323,11 @@ fn parse_condition(
             Bson::Int32(n) => Condition::Size(i64::from(*n)),
             Bson::Int64(n) => Condition::Size(*n),
             Bson::Double(n) if n.fract() == 0.0 => Condition::Size(*n as i64),
+            // A decimal by its value, as the double of that value is.
+            Bson::Decimal128(d) => match kimmy_core::decimal::whole_number(d) {
+                Some(n) => Condition::Size(n),
+                None => return Err(Error::InvalidQuery("$size requires an integer".into())),
+            },
             _ => return Err(Error::InvalidQuery("$size requires an integer".into())),
         },
         "mod" => parse_mod(arg)?,
@@ -486,26 +482,6 @@ fn non_empty_all(path: &str, values: Vec<Bson>) -> Result<Vec<Bson>> {
     Ok(values)
 }
 
-/// Refuse a `Decimal128` anywhere in a comparison operand.
-///
-/// `canonical_cmp` ranks a Decimal128 equal to every other number — it has no
-/// exact representation there, and the key encoder refuses it outright
-/// (ADR-005) — so an operand holding one would match every numeric value of
-/// the field and could never be bounded by an index. The refusal lands at
-/// parse, where the caller can read it; matching everything would say
-/// nothing. The check is recursive because equality against a document or
-/// an array compares their contents by the same order.
-fn comparable(what: &str, operand: &Bson) -> Result<()> {
-    if holds_decimal128(operand) {
-        return Err(Error::InvalidQuery(format!(
-            "{what} operand holds a Decimal128, which cannot be compared in a filter: it has no \
-             exact key encoding in this engine and ranks equal to every other number, so the \
-             match would be neither exact nor indexable; compare a double or a long instead"
-        )));
-    }
-    Ok(())
-}
-
 /// `{$mod: [divisor, remainder]}`, exactly two numbers.
 ///
 /// A double operand is truncated toward zero, as MongoDB does — `{$mod: [4.5,
@@ -540,11 +516,23 @@ fn mod_operand(value: &Bson, what: &str) -> Result<i64> {
                 "$mod {what} must be representable as a 64-bit integer, found {d}"
             ))
         }),
+        // Truncated toward zero, as a double is, by its exact value.
+        Bson::Decimal128(d) => truncate_decimal(d).ok_or_else(|| {
+            Error::InvalidQuery(format!(
+                "$mod {what} must be representable as a 64-bit integer, found {d}"
+            ))
+        }),
         other => Err(Error::InvalidQuery(format!(
             "$mod {what} must be a number, found {}",
             type_name_of(other)
         ))),
     }
+}
+
+/// A decimal truncated toward zero, when that is an `i64`: the double's rule,
+/// on the exact value.
+fn truncate_decimal(d: &bson::Decimal128) -> Option<i64> {
+    kimmy_core::decimal::integer_part(d).filter(|part| part.in_range).map(|part| part.value)
 }
 
 /// A double truncated toward zero, when that is an `i64`.
@@ -1116,6 +1104,10 @@ fn condition_matches(
                 Bson::Int32(n) => i64::from(*n),
                 Bson::Int64(n) => *n,
                 Bson::Double(d) => match truncate_to_i64(*d) {
+                    Some(n) => n,
+                    None => return false,
+                },
+                Bson::Decimal128(d) => match truncate_decimal(d) {
                     Some(n) => n,
                     None => return false,
                 },
@@ -2602,54 +2594,156 @@ mod decimal128 {
     use super::*;
     use bson::doc;
 
-    fn dec() -> Bson {
-        Bson::Decimal128("1.5".parse().unwrap())
+    fn dec(text: &str) -> Bson {
+        Bson::Decimal128(text.parse().unwrap())
     }
 
-    fn refused(filter: Document) {
-        let Err(err) = parse(&filter) else { panic!("{filter} should be refused") };
-        let msg = err.to_string();
-        assert!(
-            msg.contains("Decimal128") && msg.contains("cannot be compared in a filter"),
-            "{filter}: the refusal should say why: {msg}"
-        );
+    /// Whether `filter`, which must parse, matches `doc`.
+    fn hit(filter: Document, d: &Document) -> bool {
+        let parsed = parse(&filter).unwrap_or_else(|e| panic!("{filter} refused: {e}"));
+        matches(&parsed, d).unwrap()
+    }
+
+    /// The stored side, design 2.2: a stored `Decimal128` is found only by an
+    /// equal number, and `$ne` against any other number keeps it. It used to
+    /// match every number by equality and be excluded by `$ne` from all of
+    /// them.
+    #[test]
+    fn a_stored_decimal128_is_compared_by_its_exact_value() {
+        let d = doc! { "v": dec("1.5") };
+        assert!(hit(doc! { "v": { "$eq": 1.5 } }, &d), "1.5 is exactly binary");
+        assert!(hit(doc! { "v": 1.5 }, &d));
+        assert!(!hit(doc! { "v": { "$eq": 999_999 } }, &d));
+        assert!(!hit(doc! { "v": 1 }, &d));
+        assert!(hit(doc! { "v": { "$ne": 999_999 } }, &d));
+        assert!(!hit(doc! { "v": { "$gte": 999_999 } }, &d));
+        assert!(!hit(doc! { "v": { "$lte": -999_999 } }, &d));
+        assert!(!hit(doc! { "v": { "$in": [42] } }, &d));
+        assert!(hit(doc! { "v": { "$nin": [42] } }, &d));
+        assert!(hit(doc! { "v": { "$gt": 1, "$lt": 2 } }, &d));
+        assert!(!hit(doc! { "v": "1.5" }, &d), "type groups still hold");
+
+        let tenth = doc! { "v": dec("0.1") };
+        assert!(!hit(doc! { "v": { "$eq": 0.1 } }, &tenth), "0.1 the double is above a tenth");
+        assert!(hit(doc! { "v": { "$lt": 0.1 } }, &tenth));
+        assert!(hit(doc! { "v": { "$ne": 0.1 } }, &tenth));
+    }
+
+    /// The bare equality caller (`parse_conditions`): a field's value, a
+    /// document or an array literal holding a decimal, an `_id`, and a
+    /// document-form `$elemMatch` body. Each used to be refused.
+    #[test]
+    fn a_decimal128_is_an_equality_operand_and_compares_exactly() {
+        let d = doc! {
+            "_id": dec("2.5"),
+            "v": 1.5,
+            "w": dec("0.1"),
+            "n": { "a": 2 },
+            "xs": [1, [dec("3.0")]],
+            "ls": [{ "q": 7 }, { "q": dec("8.5") }],
+        };
+        assert!(hit(doc! { "v": dec("1.5") }, &d));
+        assert!(hit(doc! { "v": dec("1.50") }, &d));
+        assert!(!hit(doc! { "v": dec("1.51") }, &d));
+        assert!(hit(doc! { "w": dec("0.10") }, &d), "a cohort is one value");
+        assert!(!hit(doc! { "w": 0.1 }, &d));
+        assert!(hit(doc! { "n": { "a": dec("2.0") } }, &d), "inside a document literal");
+        assert!(!hit(doc! { "n": { "a": dec("2.5") } }, &d));
+        assert!(hit(doc! { "xs": [dec("1"), [3]] }, &d), "inside an array literal");
+        assert!(hit(doc! { "xs": [dec("3")] }, &d), "an element of the array");
+        assert!(!hit(doc! { "xs": [dec("1"), [4]] }, &d));
+        assert!(hit(doc! { "_id": dec("2.50") }, &d));
+        assert!(!hit(doc! { "_id": 2 }, &d));
+        assert!(hit(doc! { "ls": { "$elemMatch": { "q": dec("8.50") } } }, &d));
+        assert!(!hit(doc! { "ls": { "$elemMatch": { "q": dec("8.4") } } }, &d));
+        assert!(hit(doc! { "$and": [{ "v": 1.5 }, { "v": dec("1.5") }] }, &d));
+        assert!(!hit(doc! { "$and": [{ "v": 1.5 }, { "v": dec("1.6") }] }, &d));
+    }
+
+    /// The operator caller (`parse_condition`): every operator that compares
+    /// its operand, a decimal operand against stored numbers of every type.
+    /// Each used to be refused.
+    #[test]
+    fn a_decimal128_is_an_operator_operand_and_compares_exactly() {
+        let one = doc! { "v": 1 };
+        let half = doc! { "v": 1.5 };
+        let tenth = doc! { "v": 0.1 };
+        let big = doc! { "v": 9_007_199_254_740_993_i64 };
+        let arr = doc! { "v": [1, 2.5] };
+        assert!(hit(doc! { "v": { "$eq": dec("1.0") } }, &one));
+        assert!(!hit(doc! { "v": { "$eq": dec("1.0") } }, &half));
+        assert!(hit(doc! { "v": { "$ne": dec("1.0") } }, &half));
+        assert!(!hit(doc! { "v": { "$ne": dec("1.0") } }, &one));
+        assert!(hit(doc! { "v": { "$gt": dec("1.4999999999999999999999999999999") } }, &half));
+        assert!(!hit(doc! { "v": { "$gt": dec("1.5") } }, &half));
+        assert!(hit(doc! { "v": { "$gte": dec("1.5") } }, &half));
+        assert!(hit(doc! { "v": { "$lt": dec("1.5000000000000000000000000000001") } }, &half));
+        assert!(!hit(doc! { "v": { "$lt": dec("1.5") } }, &half));
+        assert!(hit(doc! { "v": { "$lte": dec("1.5") } }, &half));
+        // A decimal operand against the double 0.1: below it, not equal.
+        assert!(hit(doc! { "v": { "$gt": dec("0.1") } }, &tenth));
+        assert!(!hit(doc! { "v": { "$lte": dec("0.1") } }, &tenth));
+        // Beyond 2^53, where a double cannot tell the integers apart.
+        assert!(hit(doc! { "v": { "$eq": dec("9007199254740993") } }, &big));
+        assert!(!hit(doc! { "v": { "$eq": dec("9007199254740992") } }, &big));
+        assert!(hit(doc! { "v": { "$gt": dec("9007199254740992") } }, &big));
+        assert!(hit(doc! { "v": { "$in": [dec("7"), dec("1.00")] } }, &one));
+        assert!(!hit(doc! { "v": { "$in": [dec("7"), dec("1.01")] } }, &one));
+        assert!(hit(doc! { "v": { "$nin": [dec("7"), dec("1.01")] } }, &one));
+        assert!(!hit(doc! { "v": { "$nin": [dec("1E0")] } }, &one));
+        assert!(hit(doc! { "v": { "$all": [dec("2.50"), dec("1")] } }, &arr));
+        assert!(!hit(doc! { "v": { "$all": [dec("2.5"), dec("2")] } }, &arr));
+        assert!(hit(doc! { "v": { "$not": { "$gt": dec("1.5") } } }, &half));
+        assert!(!hit(doc! { "v": { "$not": { "$gte": dec("1.5") } } }, &half));
+        assert!(hit(doc! { "v": { "$elemMatch": { "$gt": dec("2"), "$lt": dec("2.6") } } }, &arr));
+        assert!(!hit(doc! { "v": { "$elemMatch": { "$gt": dec("2.5") } } }, &arr));
+        // Comparisons still stay within a type group.
+        assert!(!hit(doc! { "v": { "$gt": dec("1") } }, &doc! { "v": "a" }));
+        assert!(!hit(doc! { "v": { "$lt": dec("1") } }, &doc! { "v": Bson::Null }));
     }
 
     #[test]
-    fn a_decimal128_operand_is_refused_wherever_a_filter_would_compare_it() {
-        // `canonical_cmp` ranks a Decimal128 equal to every number, so a
-        // parse that let one through would match every numeric value of the
-        // field. Refused on purpose, by every operator that compares — and
-        // inside a document or array literal, which compare by contents.
-        refused(doc! { "v": dec() });
-        refused(doc! { "v": { "$eq": dec() } });
-        refused(doc! { "v": { "$ne": dec() } });
-        refused(doc! { "v": { "$gt": dec() } });
-        refused(doc! { "v": { "$gte": dec() } });
-        refused(doc! { "v": { "$lt": dec() } });
-        refused(doc! { "v": { "$lte": dec() } });
-        refused(doc! { "v": { "$in": [1, dec()] } });
-        refused(doc! { "v": { "$nin": [dec()] } });
-        refused(doc! { "v": { "$all": [dec()] } });
-        refused(doc! { "v": { "$not": { "$lt": dec() } } });
-        refused(doc! { "v": { "$elemMatch": { "$gte": dec() } } });
-        refused(doc! { "v": { "$elemMatch": { "n": dec() } } });
-        refused(doc! { "$and": [{ "v": 1 }, { "v": dec() }] });
-        refused(doc! { "v": { "n": dec() } });
-        refused(doc! { "v": [1, [dec()]] });
-        refused(doc! { "_id": dec() });
+    fn type_and_exists_find_a_stored_decimal128_as_ever() {
+        let stored = doc! { "v": dec("1.5") };
+        assert!(hit(doc! { "v": { "$type": "decimal" } }, &stored));
+        assert!(hit(doc! { "v": { "$exists": true } }, &stored));
     }
 
+    /// `$size` takes a decimal of whole value and `$mod` truncates a decimal
+    /// operand and a stored decimal toward zero, each as the double of the
+    /// same value is read. They used to refuse the operand and never match a
+    /// stored decimal.
     #[test]
-    fn the_refusal_is_about_comparing_not_about_the_type() {
-        // A filter that asks what type a field holds, or whether it exists,
-        // compares nothing and still finds a stored Decimal128.
-        let stored = doc! { "v": dec() };
-        let by_type = parse(&doc! { "v": { "$type": "decimal" } }).unwrap();
-        assert!(matches(&by_type, &stored).unwrap());
-        let exists = parse(&doc! { "v": { "$exists": true } }).unwrap();
-        assert!(matches(&exists, &stored).unwrap());
-        assert!(parse(&doc! { "v": { "$eq": 1.5 } }).is_ok(), "a double compares as ever");
+    fn size_and_mod_read_a_decimal_as_the_double_of_its_value() {
+        let pair = doc! { "v": [1, 2] };
+        assert!(hit(doc! { "v": { "$size": dec("2") } }, &pair));
+        assert!(hit(doc! { "v": { "$size": dec("2.00") } }, &pair));
+        assert!(!hit(doc! { "v": { "$size": dec("3") } }, &pair));
+        for bad in [dec("2.5"), dec("NaN"), dec("Infinity")] {
+            assert!(parse(&doc! { "v": { "$size": bad.clone() } }).is_err(), "{bad}");
+        }
+        // `$mod` operands, truncated as a double's are.
+        assert!(hit(doc! { "v": { "$mod": [dec("2"), dec("0")] } }, &doc! { "v": 4 }));
+        assert!(hit(doc! { "v": { "$mod": [dec("4.5"), 0] } }, &doc! { "v": 8 }));
+        assert!(hit(doc! { "v": { "$mod": [4.5, 0] } }, &doc! { "v": 8 }), "the double's rule");
+        for bad in [dec("NaN"), dec("-Infinity"), dec("1E+19")] {
+            let err = parse(&doc! { "v": { "$mod": [bad.clone(), 0] } }).unwrap_err().to_string();
+            assert!(err.contains("must be representable as a 64-bit integer"), "{bad}: {err}");
+        }
+        // A stored decimal, truncated as a stored double is.
+        let even = doc! { "v": { "$mod": [2, 0] } };
+        for (stored, want) in [
+            (dec("4"), true),
+            (dec("4.00"), true),
+            (dec("5"), false),
+            (dec("4.5"), true),
+            (dec("-4"), true),
+            (dec("NaN"), false),
+            (dec("1E+30"), false),
+        ] {
+            assert_eq!(hit(even.clone(), &doc! { "v": stored.clone() }), want, "{stored}");
+        }
+        assert!(hit(even.clone(), &doc! { "v": 4.5 }), "the double's rule");
     }
 }
 

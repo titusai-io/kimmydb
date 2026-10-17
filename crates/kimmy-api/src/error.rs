@@ -973,6 +973,12 @@ impl From<CoreError> for ApiError {
             | CoreError::MalformedResumeToken
             | CoreError::MalformedCursor
             | CoreError::MalformedStamp => ApiError::bad_request(e.to_string()),
+            // A creation this member will not persist yet (ADR-238): the
+            // request names a `Decimal128` id or partial-filter bound, and
+            // the answer names `cluster.decimal128` and any peer that holds
+            // it back. The caller's to act on, so 400, never a retry hint:
+            // repeating it changes nothing until the operator acts.
+            CoreError::Decimal128Gated { .. } => ApiError::bad_request(e.to_string()),
             CoreError::ResumeTokenExpired => {
                 ApiError::new(StatusCode::GONE, ErrorCode::ResumeTokenExpired, e.to_string())
             }

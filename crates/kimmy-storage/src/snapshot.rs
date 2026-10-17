@@ -94,9 +94,33 @@
 //! walked, so the first page's vector never claims a document the snapshot
 //! did not carry; whatever the sender wrote after it is above that vector and
 //! the next round pulls it from the oplog, which is where it still is.
+//!
+//! # Keys on a page are legacy
+//!
+//! A page carries document keys in two places: a carried delete's
+//! [`SnapshotTombstone::key`] and the cursor, [`SnapshotCursor::after_key`].
+//! Schema 5 changed the stored bytes of every number key, and in a mixed roll
+//! the other end may be a 0.50 member, which stores, sends and reads schema-4
+//! keys. So both are the frozen schema-4 form on the wire (Decimal128 design
+//! 7.1; `kimmy_core::legacy_key`), and the conversions live here, at the
+//! engine's wire API and nowhere else: [`Engine::snapshot_page`] converts the
+//! request's cursor to the stored form on entry and every key to the legacy form
+//! on exit, and [`Engine::apply_snapshot_page`] converts every carried delete's
+//! key to the stored form as its first act, before the policy dispatch, so the
+//! `All`, `Converge` and `Definitions` paths only ever see stored keys
+//! (`CarriedDelete`). A page's `next` is **not** converted by a receiver: it
+//! is stored as received and sent back, and only a sender uses a cursor as a
+//! bound. The transport passes frames through unchanged, so every caller, the
+//! model tests included, exercises these conversions.
+//!
+//! Left unconverted, the receiver's point read of a received schema-4 key in a
+//! schema-5 `DOCS` can find **another** document: the schema-5 key of id
+//! `0x5000008101800000` is byte for byte the schema-4 key of `0x50007F8081018000`
+//! (design 6.1), so a delete of the second would land on the first.
 
 use std::fmt;
 
+use kimmy_core::keyenc;
 use kimmy_core::{
     CollectionId, DocId, Hlc, IndexMeta, NodeId, OpKind, OplogEntry, Stamp, VectorConfig,
     VersionVector,
@@ -160,7 +184,8 @@ pub struct SnapshotCursor {
     /// beyond a peer's retention horizon — the only case a snapshot serves —
     /// could never catch up. Same defect as ADR-031's, on the other wire type.
     pub collection: CollectionId,
-    /// Encoded document key; the next page starts strictly after it.
+    /// Encoded document key, in the legacy (schema-4) form on the wire (module
+    /// docs); the next page starts strictly after it.
     pub after_key: Vec<u8>,
 }
 
@@ -290,11 +315,41 @@ pub struct SnapshotDoc {
 pub struct SnapshotTombstone {
     /// See [`SnapshotCursor::collection`] for why this is not a `u64`.
     pub collection: CollectionId,
-    /// The encoded document key the tombstone is stored under.
+    /// The encoded document key the tombstone is stored under, in the legacy
+    /// (schema-4) form on the wire (module docs).
     #[serde(with = "serde_bytes")]
     pub key: Vec<u8>,
     /// The stamp of the delete.
     pub stamp: Stamp,
+}
+
+/// A delete a received page carries, with its key in the **stored** form: what the
+/// receiver's paths work with (module docs, "Keys on a page are legacy").
+///
+/// A type of its own rather than a [`SnapshotTombstone`] with its key rewritten, so
+/// that a wire tombstone, whose key is legacy, cannot reach a read or a write of
+/// `DOCS`: only [`CarriedDelete::of_page`] makes one.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct CarriedDelete {
+    collection: CollectionId,
+    /// The stored (schema-5) key.
+    key: Vec<u8>,
+    stamp: Stamp,
+}
+
+impl CarriedDelete {
+    /// The page's carried deletes, each key converted from the legacy form to the
+    /// stored one (total: bytes in neither form are kept as they are).
+    fn of_page(page: &SnapshotPage) -> Vec<Self> {
+        page.deleted_documents
+            .iter()
+            .map(|tombstone| CarriedDelete {
+                collection: tombstone.collection,
+                key: keyenc::stored_of_legacy(&tombstone.key),
+                stamp: tombstone.stamp,
+            })
+            .collect()
+    }
 }
 
 /// What applying one snapshot page did.
@@ -746,7 +801,26 @@ impl Engine {
         // the whole database, the one collection's for a repair.
         let dropped_indexes = self.indexes_dropped(scope)?;
 
-        let (documents, deleted_documents, next) = self.snapshot_documents(after, scope)?;
+        // The wire boundary (Decimal128 design 7.1): every key on a page, the
+        // cursor the requester sends back included, is the frozen schema-4 form,
+        // which is what a 0.50 member stores, sends and reads. The walk works on
+        // the stored form, so the request's cursor is converted on the way in and
+        // every key on the way out. A requester stores the cursor as it received
+        // it (`SnapshotProgress`, `SNAPSHOT_PROGRESS`), so it is legacy whichever
+        // build sent it, and the walk is in value order in both forms, so it
+        // resumes where it ended.
+        let after = after.map(|cursor| SnapshotCursor {
+            after_key: keyenc::stored_of_legacy(&cursor.after_key),
+            ..cursor
+        });
+        let (documents, mut deleted_documents, next) = self.snapshot_documents(after, scope)?;
+        for tombstone in &mut deleted_documents {
+            tombstone.key = keyenc::legacy_of_stored(&tombstone.key).into_bytes();
+        }
+        let next = next.map(|cursor| SnapshotCursor {
+            after_key: keyenc::legacy_of_stored(&cursor.after_key).into_bytes(),
+            ..cursor
+        });
         // After the walk: monotone, so a value read later is at least what the rows
         // above were collected under (design 13.1, "where it is read").
         let tombstone_horizon = self.tombstone_horizon()?;
@@ -967,8 +1041,12 @@ impl Engine {
         progress: &mut SnapshotProgress,
         page: &SnapshotPage,
     ) -> Result<SnapshotApplied> {
+        // The wire boundary, first and before the policy dispatch (module docs):
+        // every carried delete's key in the stored form, which is all any path
+        // below reads. `page.next` is left as received.
+        let deletes = CarriedDelete::of_page(page);
         if progress.policy == SnapshotPolicy::Converge {
-            return self.apply_converge_page(progress, page);
+            return self.apply_converge_page(progress, page, &deletes);
         }
         if progress.policy == SnapshotPolicy::Definitions {
             return self.apply_definitions_page(progress, page);
@@ -1110,7 +1188,7 @@ impl Engine {
         let mut applied = 0usize;
         let mut superseded = 0usize;
         let mut failed = None;
-        if !page.documents.is_empty() || !page.deleted_documents.is_empty() || grant.is_some() {
+        if !page.documents.is_empty() || !deletes.is_empty() || grant.is_some() {
             // Resolved per distinct collection rather than per document —
             // a page is one collection's worth of documents, usually — and
             // outside the writer, from the state the definitions above left.
@@ -1183,7 +1261,8 @@ impl Engine {
             let recorded = self.apply_carried_document_deletes(
                 &txn,
                 &mut memo,
-                page,
+                &page.versions,
+                &deletes,
                 &mut pending,
                 &mut superseded,
                 None,
@@ -1248,7 +1327,7 @@ impl Engine {
         // persisted a cursor costs nothing here. ADR-161.
         if complete
             && page.documents.is_empty()
-            && page.deleted_documents.is_empty()
+            && deletes.is_empty()
             && grant.is_none()
             && self.snapshot_progress_recorded(peer, progress.scope)?
         {
@@ -1319,6 +1398,7 @@ impl Engine {
         &self,
         progress: &mut SnapshotProgress,
         page: &SnapshotPage,
+        deletes: &[CarriedDelete],
     ) -> Result<SnapshotApplied> {
         debug_assert!(progress.scope.is_some(), "a Converge pull is always scoped");
         if page.dropped.is_some() {
@@ -1340,7 +1420,7 @@ impl Engine {
         let mut failed = None;
         // At or below the cut of the finding that planned the pull.
         let at_cut = |stamp: Stamp| stamp.hlc <= progress.cut.get(stamp.node);
-        if !page.documents.is_empty() || !page.deleted_documents.is_empty() {
+        if !page.documents.is_empty() || !deletes.is_empty() {
             let mut memo = Memo::default();
             #[cfg(test)]
             crate::sync::race_hooks::reach(crate::sync::race_hooks::Race::ConvergePage);
@@ -1434,7 +1514,8 @@ impl Engine {
             let replaced = self.apply_carried_document_deletes(
                 &txn,
                 &mut memo,
-                page,
+                &page.versions,
+                deletes,
                 &mut pending,
                 &mut superseded,
                 Some(ConvergeTombstones {
@@ -1596,11 +1677,17 @@ impl Engine {
     /// applied when it comes — `apply_remote_in_txn` supersedes an equal stamp
     /// before it appends — so this node's oplog never held the delete and a
     /// member pulling entries from here kept the document.
+    ///
+    /// `deletes` are the page's, with their keys in the stored form
+    /// ([`CarriedDelete::of_page`]): the read, the comparison with the held
+    /// document's own key and the bare tombstone's write all use that key.
+    #[allow(clippy::too_many_arguments)]
     fn apply_carried_document_deletes(
         &self,
         txn: &crate::engine::WriteTxn<'_>,
         memo: &mut Memo,
-        page: &SnapshotPage,
+        versions: &VersionVector,
+        deletes: &[CarriedDelete],
         pending: &mut Vec<Pending>,
         superseded: &mut usize,
         converge: Option<ConvergeTombstones<'_>>,
@@ -1611,12 +1698,12 @@ impl Engine {
         // of ADR-228 is never recorded.
         let mut converge = converge;
         let mut recorded = 0usize;
-        for tombstone in &page.deleted_documents {
-            if tombstone.stamp.hlc > page.versions.get(tombstone.stamp.node) {
+        for tombstone in deletes {
+            if tombstone.stamp.hlc > versions.get(tombstone.stamp.node) {
                 warn!(
                     collection = %tombstone.collection,
                     stamp = ?tombstone.stamp,
-                    covered_to = ?page.versions.get(tombstone.stamp.node),
+                    covered_to = ?versions.get(tombstone.stamp.node),
                     "a snapshot page deleted a document with a stamp its sender's own coverage \
                      does not name; ignored"
                 );
@@ -1727,7 +1814,7 @@ impl Engine {
         &self,
         txn: &crate::engine::WriteTxn<'_>,
         collection: &CollectionMeta,
-        tombstone: &SnapshotTombstone,
+        tombstone: &CarriedDelete,
     ) -> Result<()> {
         let record = kimmy_core::DocRecord::tombstone(tombstone.stamp);
         let mut docs = txn.open_table(tables::DOCS)?;
@@ -3448,22 +3535,25 @@ mod tests {
     }
 
     #[test]
-    fn a_snapshot_partial_index_files_the_documents_its_filter_cannot_decide() {
-        // The other way ADR-185's membership reaches a member: not a local
+    fn a_snapshot_partial_index_decides_the_decimals_at_its_filtered_path() {
+        // The other way partial-index membership reaches a member: not a local
         // write and not a replicated entry, but a page. It rides on the
         // backfill in `create_index_inner` and on `apply_remote`, and nothing
-        // in-tree named it, so a restore that filed these documents under the
-        // wrong run — or under no run — would have looked the same.
+        // in-tree named it, so a restore that filed these documents wrongly
+        // would have looked the same. Through schema 4 the decimals below
+        // were held in ADR-185's undecidable run; since ADR-238 the filter
+        // decides each by its value, on this route as on the others.
         //
-        // B holds a document of its own that the filter cannot decide either,
-        // so the receiver's own documents and the page's both have to land in
-        // the run, which a build that only walked the page would miss.
+        // B holds documents of its own with decimals at the filtered path, so
+        // the receiver's own documents and the page's both have to be decided,
+        // which a build that only walked the page would miss.
         let (a, _da) = engine();
         let (b, _db) = engine();
         a.create_collection("shop", "orders").unwrap();
         let ca = a.get_collection("shop", "orders").unwrap();
         let dec = |s: &str| bson::Bson::Decimal128(s.parse().unwrap());
         a.insert(&ca, doc! { "_id": "a-dec", "note": "n", "k": dec("1") }).unwrap();
+        a.insert(&ca, doc! { "_id": "a-dec-in", "note": "n", "k": dec("5.5") }).unwrap();
         a.insert(&ca, doc! { "_id": "a-in", "note": "n", "k": 9 }).unwrap();
         a.insert(&ca, doc! { "_id": "a-out", "note": "n", "k": 1 }).unwrap();
         a.create_index_with(
@@ -3479,6 +3569,7 @@ mod tests {
         .unwrap();
         let cb = b.create_collection("shop", "orders").unwrap();
         b.insert(&cb, doc! { "_id": "b-dec", "note": "n", "k": dec("2") }).unwrap();
+        b.insert(&cb, doc! { "_id": "b-dec-in", "note": "n", "k": dec("5E+1") }).unwrap();
 
         let page = a.snapshot_page(None, None).unwrap();
         let outcome = b
@@ -3488,22 +3579,16 @@ mod tests {
 
         let cb = b.get_collection("shop", "orders").unwrap();
         let index = cb.index("by_note").expect("the definition builds here too").clone();
-        assert_eq!(
-            b.undecidable_count(&cb, index.id).unwrap(),
-            2,
-            "the page's decimal and the receiver's own, both held for the re-check"
-        );
-        assert_eq!(b.unkeyed_count(&cb, index.id).unwrap(), 0, "and under the reason that is true");
-        // Which documents, not only how many: the one the filter selects is
-        // keyed, the one it decides against is absent, and the two it cannot
-        // decide are candidates of every scan.
+        assert_eq!(b.unkeyed_count(&cb, index.id).unwrap(), 0, "nothing is unkeyed");
+        // Which documents, not only how many: the ones the filter selects are
+        // keyed, a decimal among them on each side, and the ones it decides
+        // against are absent, a decimal among them on each side.
         let candidates: std::collections::BTreeSet<Vec<u8>> =
             b.index_candidates(&cb, index.id, &[], &[0xFF]).unwrap().into_iter().collect();
         let key = |id: &str| crate::index::doc_key_for(&DocId::String(id.into())).unwrap();
-        assert!(candidates.contains(&key("a-dec")), "the page's undecidable document");
-        assert!(candidates.contains(&key("b-dec")), "the receiver's own");
-        assert!(candidates.contains(&key("a-in")), "the document the filter selects");
-        assert!(!candidates.contains(&key("a-out")), "and not the one it decides against");
+        let held: std::collections::BTreeSet<Vec<u8>> =
+            ["a-in", "a-dec-in", "b-dec-in"].map(key).into_iter().collect();
+        assert_eq!(candidates, held, "exactly what the filter selects, on both sides of the page");
     }
 
     #[test]
@@ -5935,7 +6020,8 @@ mod tests {
         let mut page = a.snapshot_page(None, None).unwrap();
         page.deleted_documents = vec![SnapshotTombstone {
             collection: ca.id,
-            key: crate::docs::doc_key(&DocId::Int64(1)).unwrap(),
+            // The wire form, as a sender puts it on a page.
+            key: kimmy_core::keyenc::legacy_key(&DocId::Int64(1)).into_bytes(),
             stamp: Stamp::new(Hlc::new(u64::MAX, 0), a.node_id()),
         }];
         b.apply_snapshot_page(a.node_id(), &mut SnapshotProgress::whole_database(), &page).unwrap();
@@ -6188,7 +6274,8 @@ mod tests {
             dropped_collections: Vec::new(),
             deleted_documents: vec![SnapshotTombstone {
                 collection: id,
-                key: crate::docs::doc_key(&DocId::Int64(1)).unwrap(),
+                // The wire form, as a sender puts it on a page.
+                key: kimmy_core::keyenc::legacy_key(&DocId::Int64(1)).into_bytes(),
                 stamp: delete,
             }],
             dropped_indexes: Vec::new(),
@@ -7383,7 +7470,7 @@ mod tests {
         let carried = page
             .deleted_documents
             .iter()
-            .find(|t| t.key == crate::docs::doc_key(&DocId::Int64(3)).unwrap());
+            .find(|t| t.key == kimmy_core::keyenc::legacy_key(&DocId::Int64(3)).into_bytes());
         assert_eq!(stamp_of(3).stamp, carried.unwrap().stamp);
     }
 
@@ -7425,7 +7512,7 @@ mod tests {
         let orphan = DocId::Int64(777);
         let mut page = a.snapshot_page(None, None).unwrap();
         for t in &mut page.deleted_documents {
-            t.key = crate::docs::doc_key(&orphan).unwrap();
+            t.key = kimmy_core::keyenc::legacy_key(&orphan).into_bytes();
         }
         b.apply_snapshot_page(a.node_id(), &mut SnapshotProgress::whole_database(), &page).unwrap();
         assert!(holds_tombstone(&b, &cb, &orphan), "premise: recorded");

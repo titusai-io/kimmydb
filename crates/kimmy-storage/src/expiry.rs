@@ -801,13 +801,13 @@ mod tests {
 
     #[test]
     fn a_filter_this_build_cannot_parse_skips_its_index_and_deletes_nothing() {
-        // A filter an earlier build accepted and this one refuses: a
-        // `Decimal128` operand, from before parsing refused it, handed to the
-        // pass as a definition that build stored would be.
+        // A filter this build refuses, handed to the pass as a definition an
+        // earlier build stored would be. It was a `Decimal128` operand until
+        // ADR-238 lifted that refusal; a `$ne` is refused for its own reason.
         let (engine, _, _dir) = engine();
         let (coll, mut index) = with_filtered_ttl(&engine, doc! {"size": {"$gt": 5}});
         engine.insert(&coll, doc! {"_id": 1, "size": 10, "seen": dt(0)}).unwrap();
-        index.partial_filter = Some(doc! {"size": {"$gt": bson::Decimal128::from_bytes([0; 16])}});
+        index.partial_filter = Some(doc! {"size": {"$ne": 5}});
         assert!(index.partial().unwrap().is_err(), "premise: this build refuses the filter");
 
         let out = engine.expire_documents(&coll, &index, 10_000_000).unwrap();
@@ -853,5 +853,67 @@ mod tests {
             .filter(|id| engine.get(&coll, &kimmy_core::DocId::Int64(*id)).unwrap().is_some())
             .collect();
         assert_eq!(left, [1, 2, 3, 4], "only size 10 expires");
+    }
+
+    #[test]
+    fn a_partial_filter_decides_a_decimal_by_its_exact_value_in_both_directions() {
+        // Chris's ruling (ADR-238, design 2.6). Through 0.50 a decimal at the
+        // filter path was undecidable: `{tier: {$lt: 3}}` never expired
+        // `tier: Decimal128("1")`, and `{tier: {$gte: 3}}` expired it, having
+        // ranked it equal to 3. Both are decided by the decimal's exact value
+        // now, and a decimal bound decides the same way.
+        let dec = |s: &str| Bson::Decimal128(s.parse().unwrap());
+        let tiers = [
+            Bson::Int32(1),
+            dec("1"),
+            dec("2.999999999999999999999999999999999"),
+            dec("3.0"),
+            Bson::Double(3.0),
+            dec("5"),
+            dec("-Infinity"),
+            dec("NaN"),
+        ];
+        for (filter, expired) in [
+            // 1, the decimal 1, the decimal just below 3, -Infinity, and the
+            // decimal NaN, which the order places below every number.
+            (doc! {"tier": {"$lt": 3}}, vec![0, 1, 2, 6, 7]),
+            // The reverse: 3 in either type and 5, and none of the decimals
+            // below 3 that 0.50 ranked equal to it.
+            (doc! {"tier": {"$gte": 3}}, vec![3, 4, 5]),
+            // A decimal bound: the double 3.0 is the decimal 3.00, not below it.
+            (doc! {"tier": {"$lt": dec("3.00")}}, vec![0, 1, 2, 6, 7]),
+            (doc! {"tier": {"$gt": dec("2.999999999999999999999999999999999")}}, vec![3, 4, 5]),
+        ] {
+            let (engine, _, _dir) = engine();
+            let (coll, index) = with_filtered_ttl(&engine, filter.clone());
+            for (id, tier) in tiers.iter().enumerate() {
+                engine
+                    .insert(&coll, doc! {"_id": id as i64, "tier": tier.clone(), "seen": dt(0)})
+                    .unwrap();
+            }
+            // Each tier again, not due: the filter's answer alone never
+            // expires a document.
+            for (id, tier) in tiers.iter().enumerate() {
+                let fresh = dt(10_000_000_000);
+                let id = 100 + id as i64;
+                engine
+                    .insert(&coll, doc! {"_id": id, "tier": tier.clone(), "seen": fresh})
+                    .unwrap();
+            }
+
+            let out = engine.expire_documents(&coll, &index, 100_000).unwrap();
+
+            assert_eq!(out.deleted as usize, expired.len(), "{filter}: {out:?}");
+            assert_eq!(out.skipped_filter, 0, "{filter}: the index held only what it selects");
+            let gone: Vec<usize> = (0..tiers.len())
+                .filter(|&id| {
+                    engine.get(&coll, &kimmy_core::DocId::Int64(id as i64)).unwrap().is_none()
+                })
+                .collect();
+            assert_eq!(gone, expired, "{filter}: the expired ones, by exact value");
+            for id in 100..100 + tiers.len() as i64 {
+                assert!(engine.get(&coll, &kimmy_core::DocId::Int64(id)).unwrap().is_some());
+            }
+        }
     }
 }

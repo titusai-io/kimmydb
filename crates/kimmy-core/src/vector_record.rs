@@ -53,9 +53,8 @@ pub enum ChunkSource {
     String(String),
     /// Int32 and Int64, which `DocId` normalises to one.
     Int64(i64),
-    /// The canonical 19 bytes of a `Decimal128` `_id` (the 0.51.0 decimal
-    /// design, §5.3). Encoded and parsed here already; nothing yields one until
-    /// `DocId::Decimal128` lands, with its arm in `From<&DocId>`.
+    /// The canonical 19 bytes of a `Decimal128` `_id` ([`Decimal128Id::to_bytes`],
+    /// ADR-238): equal values have equal bytes, so one decimal is one source.
     Decimal128([u8; 19]),
     /// Any length. `DocId::Uuid(u)` is subtype 4 over `u`'s bytes.
     Binary {
@@ -69,16 +68,15 @@ impl From<&DocId> for ChunkSource {
     /// the generic one, 0; [`ChunkSource::of`] takes the subtype from the
     /// stored body where there is one.
     fn from(id: &DocId) -> Self {
-        // No wildcard, here or in the other matches over `DocId` below:
-        // `DocId::Decimal128` lands with the 0.51.0 decimal work, and its arm
-        // here is `Self::Decimal128(<its canonical 19 bytes>)`, encoded
-        // `~d:` and 38 lowercase hex digits.
+        // No wildcard, here or in the other matches over `DocId` below: a new
+        // kind of `_id` must name its chunk source, and the compiler asks.
         match id {
             DocId::ObjectId(oid) => Self::ObjectId(oid.bytes()),
             DocId::String(s) => Self::String(s.clone()),
             DocId::Int64(i) => Self::Int64(*i),
             DocId::Binary(bytes) => Self::Binary { subtype: 0x00, bytes: bytes.clone() },
             DocId::Uuid(u) => Self::Binary { subtype: 0x04, bytes: u.as_bytes().to_vec() },
+            DocId::Decimal128(d) => Self::Decimal128(d.to_bytes()),
         }
     }
 }
@@ -102,15 +100,17 @@ impl ChunkSource {
     }
 
     /// The document this source is a chunk source of, as the key identifies
-    /// it: a binary's subtype folded away. `None` for a Decimal128 until
-    /// `DocId::Decimal128` lands, with the arm that names it here.
+    /// it: a binary's subtype folded away. `None` for a `Decimal128` whose
+    /// bytes are not a canonical id (a chunk id is parsed from stored text).
     pub fn document(&self) -> Option<DocId> {
         match self {
             Self::ObjectId(bytes) => Some(DocId::ObjectId(bson::oid::ObjectId::from_bytes(*bytes))),
             Self::String(s) => Some(DocId::String(s.clone())),
             Self::Int64(i) => Some(DocId::Int64(*i)),
             Self::Binary { bytes, .. } => Some(DocId::Binary(bytes.clone())),
-            Self::Decimal128(_) => None,
+            Self::Decimal128(bytes) => {
+                crate::ids::Decimal128Id::from_bytes(bytes).map(DocId::Decimal128)
+            }
         }
     }
 
@@ -126,6 +126,7 @@ impl ChunkSource {
             DocId::Uuid(u) => {
                 matches!(self, Self::Binary { bytes, .. } if bytes.as_slice() == u.as_bytes())
             }
+            DocId::Decimal128(d) => *self == Self::Decimal128(d.to_bytes()),
         }
     }
 
@@ -354,7 +355,7 @@ impl VectorRecord {
         match id {
             DocId::Binary(bytes) => binary(bytes),
             DocId::Uuid(u) => binary(u.as_bytes()),
-            DocId::ObjectId(_) | DocId::String(_) | DocId::Int64(_) => {
+            DocId::ObjectId(_) | DocId::String(_) | DocId::Int64(_) | DocId::Decimal128(_) => {
                 format!("{}#", ChunkSource::from(id).encode())
             }
         }
@@ -373,7 +374,8 @@ impl VectorRecord {
             DocId::Binary(bytes) => Some(format!("bin({} bytes)#", bytes.len())),
             DocId::Uuid(u) => Some(format!("{u}#")),
             DocId::String(s) if is_reserved(s) => Some(format!("{s}#")),
-            DocId::String(_) | DocId::ObjectId(_) | DocId::Int64(_) => None,
+            // A Decimal128 `_id` did not exist before 0.51.0, so no 0.50 chunk is its.
+            DocId::String(_) | DocId::ObjectId(_) | DocId::Int64(_) | DocId::Decimal128(_) => None,
         }
     }
 
@@ -528,6 +530,9 @@ mod tests {
             DocId::Int64(i) => i.to_string(),
             DocId::Binary(b) => format!("bin({} bytes)", b.len()),
             DocId::Uuid(u) => u.to_string(),
+            // No Decimal128 `_id` existed in 0.50.0; this is its `Display`, which
+            // is the twin a String can be made to collide with.
+            DocId::Decimal128(d) => d.to_string(),
         }
     }
 
@@ -549,7 +554,9 @@ mod tests {
         Bson(bson::Bson),
         /// A `DocId::Uuid`, which only the engine's API builds.
         Uuid(uuid::Uuid),
-        /// A `Decimal128` `_id`'s canonical bytes, which no `DocId` carries yet.
+        /// A `Decimal128` `_id`'s bytes, any 19 of them: the encoding is tested
+        /// over bytes that are not a canonical id too; `Value::Bson` carries the
+        /// real ones.
         Decimal([u8; 19]),
     }
 
@@ -649,6 +656,12 @@ mod tests {
                     .prop_map(|(st, b)| Value::Bson(binary(st, b))),
                 any::<[u8; 16]>().prop_map(|b| Value::Uuid(uuid::Uuid::from_bytes(b))),
                 any::<[u8; 19]>().prop_map(Value::Decimal),
+                // Real decimals, which `DocId` keys by value: an integral one in
+                // range is an `Int64` (and one source with it), the rest are
+                // `DocId::Decimal128`.
+                (any::<u64>(), -40i32..40).prop_map(|(c, e)| Value::Bson(bson::Bson::Decimal128(
+                    format!("{c}E{e}").parse().unwrap()
+                ))),
             ]
         }
 
@@ -774,6 +787,8 @@ mod tests {
                     DocId::ObjectId(_) | DocId::Int64(_) => true,
                     DocId::String(s) => !is_reserved(s),
                     DocId::Binary(_) | DocId::Uuid(_) => false,
+                    // There was no such id in 0.50.0, so there is no 0.50 form to keep.
+                    DocId::Decimal128(_) => return Ok(()),
                 };
                 let now = VectorRecord::id(&ChunkSource::from(&id), n);
                 prop_assert_eq!(now == id_050(&id, n), kept, "{:?}: {:?}", id, now);
@@ -812,6 +827,26 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// A `Decimal128` `_id`'s chunk id is `~d:` and the 38 hex digits of its canonical
+    /// bytes (sign, exponent, coefficient), and equal values are one source.
+    #[test]
+    fn a_decimal128_id_has_a_pinned_chunk_id() {
+        let id = |text: &str| DocId::try_from_bson(&bson::Bson::Decimal128(text.parse().unwrap()));
+        let one_and_a_half = id("1.5").unwrap();
+        let source = ChunkSource::from(&one_and_a_half);
+        assert_eq!(source.encode(), "~d:00ffff0000000000000000000000000000000f");
+        assert_eq!(source.document(), Some(one_and_a_half.clone()));
+        assert!(source.is_of(&one_and_a_half));
+        assert_eq!(ChunkSource::from(&id("1.50").unwrap()), source, "equal values, one source");
+        assert_ne!(ChunkSource::from(&id("-1.5").unwrap()), source);
+        let chunk = VectorRecord::id(&source, 3);
+        assert_eq!(VectorRecord::parse_id(&chunk), Some((source.clone(), 3)));
+        assert!(text(&chunk).starts_with(&VectorRecord::run_prefix(&one_and_a_half)));
+        assert_eq!(VectorRecord::legacy_prefix(&one_and_a_half), None, "0.50 had no decimal ids");
+        // An integral decimal in range is the Int64 id of that value: one source with it.
+        assert_eq!(ChunkSource::from(&id("5.00").unwrap()), ChunkSource::from(&DocId::Int64(5)));
     }
 
     /// Test 3's refusals, by name.
