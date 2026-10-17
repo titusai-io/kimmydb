@@ -1303,11 +1303,17 @@ fn init((_, acc): &(String, Accumulator)) -> AccState {
 
 fn accumulate(state: &mut AccState, acc: &Accumulator, scope: &Scope<'_>) -> Result<()> {
     match (state, acc) {
-        (AccState::Sum(total), Accumulator::Sum(e)) => total.add(&e.eval_in(scope)?),
+        (AccState::Sum(total), Accumulator::Sum(e)) => {
+            let v = e.eval_in(scope)?;
+            arithmetic_operand("$sum", &v)?;
+            total.add(&v);
+        }
         (AccState::Avg(total, n), Accumulator::Avg(e)) => {
+            let v = e.eval_in(scope)?;
+            arithmetic_operand("$avg", &v)?;
             // Non-numeric values are skipped rather than counted as zero, or a
             // field that is missing on half the documents would halve the mean.
-            if let Some(x) = numeric(&e.eval_in(scope)?) {
+            if let Some(x) = numeric(&v) {
                 *total += x;
                 *n += 1;
             }
@@ -1365,6 +1371,22 @@ fn finish(state: AccState) -> Result<Bson> {
         AccState::Last(v) => v.transpose()?.unwrap_or(Bson::Null),
         AccState::Push(items) | AccState::AddToSet(items, _) => Bson::Array(items),
     })
+}
+
+/// Refuse a `Decimal128` operand of `$sum` or `$avg`, in the words `$add`
+/// refuses one with.
+///
+/// Both skip a value that is not a number, but a decimal is one: skipping it
+/// answered a total or a mean of the other numbers, which looks right and is
+/// not. Adding one needs decimal arithmetic, which this build does not have,
+/// so the group is refused instead, as an expression's `$add` is. Only the
+/// operand itself counts: an array or a document is not a number to these
+/// accumulators, which never read inside one, and is skipped whatever it holds.
+fn arithmetic_operand(op: &str, value: &Bson) -> Result<()> {
+    if matches!(value, Bson::Decimal128(_)) {
+        return Err(Error::InvalidQuery(format!("{op} needs numbers, found {}", type_name(value))));
+    }
+    Ok(())
 }
 
 fn numeric(value: &Bson) -> Option<f64> {
@@ -3745,29 +3767,145 @@ mod identity {
         assert_eq!(extremes(vec![dec("2.0"), Bson::Int32(2)]), (dec("2.0"), dec("2.0")));
     }
 
-    /// Decimal arithmetic is outside the design that placed a decimal in the
-    /// order, and is what it was: `$sum` and `$avg` skip a decimal as they skip
-    /// any non-number, and `$add`, `$subtract`, `$multiply` and `$divide`
-    /// refuse one. None of them compares, so none changed with the comparator.
+    /// The error a pipeline gives, which must fail.
+    fn refused(pipeline: Vec<Document>, input: Vec<Document>) -> String {
+        let stages = parse(&pipeline).unwrap();
+        let mut current = input;
+        for stage in &stages {
+            match apply(stage, current, &Limits::default()) {
+                Ok(next) => current = next,
+                Err(e) => return e.to_string(),
+            }
+        }
+        panic!("{pipeline:?} should be refused, gave {current:?}");
+    }
+
+    /// `$sum` and `$avg` refuse a `Decimal128` operand, `400`, in the words
+    /// `$add` uses. They used to skip it as they skip a string, which answered
+    /// a total or a mean of the other numbers: over `1`, `Decimal128("2.5")`
+    /// and `2` a `$sum` of `3` and an `$avg` of `1.5`, where the values add up
+    /// to 5.5. Decimal arithmetic is not built, so the group is refused.
     #[test]
-    fn arithmetic_on_a_decimal128_is_what_it_was() {
-        let input = vec![doc! { "v": 1 }, doc! { "v": dec("1.5") }, doc! { "v": 2 }];
+    fn sum_and_avg_refuse_a_decimal128_operand() {
+        let input = || vec![doc! { "v": 1 }, doc! { "v": dec("2.5") }, doc! { "v": 2 }];
+        for op in ["$sum", "$avg"] {
+            let mut acc = Document::new();
+            acc.insert(op, "$v");
+            let msg = refused(vec![doc! { "$group": { "_id": null, "r": acc.clone() } }], input());
+            assert_eq!(msg, format!("invalid query: {op} needs numbers, found a Decimal128"));
+            // Wherever the decimal stands, first or last, and per bucket.
+            for order in [
+                vec![doc! { "v": dec("2.5") }, doc! { "v": 1 }],
+                vec![doc! { "v": 1 }, doc! { "v": dec("2.5") }],
+            ] {
+                assert!(
+                    refused(vec![doc! { "$group": { "_id": null, "r": acc.clone() } }], order)
+                        .contains("found a Decimal128")
+                );
+            }
+            let grouped = vec![doc! { "k": 1, "v": 1 }, doc! { "k": 2, "v": dec("0") }];
+            assert!(
+                refused(vec![doc! { "$group": { "_id": "$k", "r": acc.clone() } }], grouped)
+                    .contains("found a Decimal128")
+            );
+            // A decimal literal is an operand on every document.
+            let mut literal = Document::new();
+            literal.insert(op, dec("1"));
+            assert!(
+                refused(vec![doc! { "$group": { "_id": null, "r": literal } }], input())
+                    .contains("found a Decimal128")
+            );
+        }
+        // `$add`'s own refusal is the wording matched.
+        let add = refused(
+            vec![doc! { "$project": { "r": { "$add": ["$v", 1] } } }],
+            vec![doc! { "v": dec("2.5") }],
+        );
+        assert_eq!(add, "invalid query: $add needs numbers, found a Decimal128");
+    }
+
+    /// Only the operand itself is refused. An array or a document is not a
+    /// number to these accumulators, which never read inside one, so it is
+    /// skipped whatever it holds, a decimal included, exactly as before; a
+    /// missing field and `null` are skipped; and the accumulators that do no
+    /// arithmetic take a decimal as they take any value.
+    #[test]
+    fn only_a_decimal128_operand_is_refused_and_the_other_accumulators_take_one() {
+        let input = vec![
+            doc! { "v": 1, "a": [1, dec("2.5")], "d": { "n": dec("2.5") } },
+            doc! { "v": 2, "a": [1, 2], "d": { "n": 2 } },
+            doc! { "v": Bson::Null },
+            doc! {},
+        ];
         let out = run(
-            vec![
-                doc! { "$group": { "_id": null, "sum": { "$sum": "$v" }, "avg": { "$avg": "$v" } } },
-            ],
+            vec![doc! { "$group": {
+                "_id": null,
+                "s": { "$sum": "$v" }, "m": { "$avg": "$v" },
+                "sa": { "$sum": "$a" }, "ma": { "$avg": "$a" },
+                "sd": { "$sum": "$d" }, "md": { "$avg": "$d" },
+                "n": { "$sum": 1 },
+            } }],
             input,
         );
-        assert_eq!(out[0].get("sum"), Some(&Bson::Int64(3)));
-        assert_eq!(out[0].get("avg"), Some(&Bson::Double(1.5)));
-        for op in ["$add", "$subtract", "$multiply", "$divide"] {
+        assert_eq!(out[0].get("s"), Some(&Bson::Int64(3)));
+        assert_eq!(out[0].get("m"), Some(&Bson::Double(1.5)));
+        assert_eq!(out[0].get("sa"), Some(&Bson::Int64(0)), "an array is not summed");
+        assert_eq!(out[0].get("ma"), Some(&Bson::Null));
+        assert_eq!(out[0].get("sd"), Some(&Bson::Int64(0)), "nor a document");
+        assert_eq!(out[0].get("md"), Some(&Bson::Null));
+        assert_eq!(out[0].get("n"), Some(&Bson::Int64(4)), "`$sum: 1` counts as ever");
+
+        let decimals = vec![doc! { "v": dec("2.5") }, doc! { "v": 1 }, doc! { "v": dec("2.50") }];
+        let out = run(
+            vec![doc! { "$group": {
+                "_id": null,
+                "lo": { "$min": "$v" }, "hi": { "$max": "$v" },
+                "first": { "$first": "$v" }, "last": { "$last": "$v" },
+                "all": { "$push": "$v" }, "set": { "$addToSet": "$v" },
+                "n": { "$sum": 1 },
+            } }],
+            decimals.clone(),
+        );
+        assert_eq!(out[0].get("lo"), Some(&Bson::Int32(1)));
+        assert_eq!(out[0].get("hi"), Some(&dec("2.5")));
+        assert_eq!(out[0].get("first"), Some(&dec("2.5")));
+        assert_eq!(out[0].get("last"), Some(&dec("2.50")));
+        assert_eq!(
+            out[0].get_array("all").unwrap(),
+            &vec![dec("2.5"), Bson::Int32(1), dec("2.50")]
+        );
+        assert_eq!(out[0].get_array("set").unwrap(), &vec![dec("2.5"), Bson::Int32(1)]);
+        assert_eq!(out[0].get("n"), Some(&Bson::Int64(3)));
+        let counted = run(vec![doc! { "$count": "n" }], decimals);
+        assert_eq!(counted, vec![doc! { "n": 3_i64 }]);
+    }
+
+    /// `$sum` and `$avg` are accumulators only: as expression operators, in
+    /// `$project` or anywhere an expression is parsed, they are not built and
+    /// are refused at parse whatever their operands, a decimal or an array
+    /// holding one included. So there is no expression form to refuse a
+    /// decimal in, and no array an expression sums.
+    #[test]
+    fn sum_and_avg_are_not_expression_operators() {
+        for op in ["$sum", "$avg"] {
+            for arg in [
+                Bson::Array(vec![Bson::Int32(1), dec("2.5")]),
+                Bson::String("$a".into()),
+                Bson::Array(vec![Bson::Int32(1), Bson::Int32(2)]),
+            ] {
+                let mut expr = Document::new();
+                expr.insert(op, arg.clone());
+                let err = parse(&[doc! { "$project": { "r": expr } }]).unwrap_err().to_string();
+                assert!(err.contains(op) && err.contains("not an expression operator"), "{err}");
+            }
+        }
+        // The other arithmetic refuses a decimal when it evaluates.
+        for op in ["$add", "$subtract", "$multiply", "$divide", "$mod"] {
             let mut expr = Document::new();
             expr.insert(op, vec![Bson::from("$v"), Bson::Int32(1)]);
-            let stages = parse(&[doc! { "$project": { "r": expr } }]).unwrap();
-            let msg = apply(&stages[0], vec![doc! { "v": dec("1.5") }], &Limits::default())
-                .unwrap_err()
-                .to_string();
-            assert!(msg.contains("found a Decimal128"), "{op}: {msg}");
+            let msg =
+                refused(vec![doc! { "$project": { "r": expr } }], vec![doc! { "v": dec("1.5") }]);
+            assert_eq!(msg, format!("invalid query: {op} needs numbers, found a Decimal128"));
         }
     }
 

@@ -1653,6 +1653,42 @@ async fn the_aggregate_tool_runs_a_pipeline_as_the_calling_principal() {
     assert_eq!(docs[1]["n"], 2);
 }
 
+/// `$sum` over a `Decimal128` is refused through the tool as over REST, with the
+/// same `bad_request`: it used to skip the decimal and answer a wrong total.
+#[tokio::test]
+async fn the_aggregate_tool_refuses_a_sum_over_a_decimal128() {
+    let server = Server::start().await;
+    seed(&server);
+    let meta = server.engine.get_collection("sales", "orders").unwrap();
+    let decimal = bson::Bson::Decimal128("0.5".parse().unwrap());
+    server
+        .engine
+        .insert(&meta, bson::doc! { "_id": "d", "status": "open", "total": decimal })
+        .unwrap();
+    let token = server.root();
+
+    let body = server
+        .call(
+            &token,
+            "aggregate",
+            json!({"database":"sales","collection":"orders",
+                   "pipeline":[{"$group":{"_id":null,"t":{"$sum":"$total"}}}]}),
+        )
+        .await;
+    let data = &body["error"]["data"];
+    assert_eq!(data["error"], "bad_request", "{body}");
+    assert_eq!(data["message"], "invalid query: $sum needs numbers, found a Decimal128", "{body}");
+    let counted = server
+        .call_ok(
+            &token,
+            "aggregate",
+            json!({"database":"sales","collection":"orders",
+                   "pipeline":[{"$group":{"_id":null,"n":{"$sum":1}}}]}),
+        )
+        .await;
+    assert_eq!(counted["documents"][0]["n"], 4);
+}
+
 /// ADR-221: the tool takes `explain` as the route does, answers with the plan and
 /// no documents, authorizes as a run does, and still refuses what it does not know.
 #[tokio::test]
