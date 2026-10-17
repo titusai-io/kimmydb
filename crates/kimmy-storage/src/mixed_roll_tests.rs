@@ -1345,6 +1345,7 @@ fn the_conversions_are_at_the_wire_api_and_the_fold_sites_and_nowhere_else() {
             ("snapshot.rs", "snapshot_page"),
             ("snapshot.rs", "of_page"),
             ("digest_probe.rs", "excluded_digest"),
+            ("digest_probe.rs", "received_key"),
         ])
     );
     // Stored to legacy: what a page carries, and every fold site.
@@ -1356,6 +1357,7 @@ fn the_conversions_are_at_the_wire_api_and_the_fold_sites_and_nowhere_else() {
             ("live_count.rs", "assert_digests_exact"),
             ("live_walk.rs", "run"),
             ("digest_probe.rs", "walk_headers"),
+            ("digest_probe.rs", "received_key"),
             ("live_digest.rs", "legacy_term"),
             // The migration reads the old index entries it has not yet rebuilt, whose
             // document keys are still schema 4, by the legacy form of the re-keyed row.
@@ -1367,10 +1369,14 @@ fn the_conversions_are_at_the_wire_api_and_the_fold_sites_and_nowhere_else() {
     );
     // The uncovered keys, legacy from the id itself.
     assert_eq!(using("legacy_key("), sites(&[("digest_probe.rs", "scan_uncovered")]));
-    // Received uncovered keys, legacy by definition.
+    // Received uncovered keys are read back through both conversions, in one place.
     assert_eq!(
-        using("LegacyKey::from_wire("),
-        sites(&[("digest_probe.rs", "digest_answer"), ("digest_probe.rs", "digest_compare")])
+        using("received_key("),
+        sites(&[
+            ("digest_probe.rs", "digest_answer"),
+            ("digest_probe.rs", "digest_compare"),
+            ("digest_probe.rs", "received_key"),
+        ])
     );
     // The term is taken in its own module and nowhere else.
     assert_eq!(using("live_digest::term("), sites(&[]));
@@ -1441,4 +1447,65 @@ fn a_decimal_id_travels_marked_and_lands_on_its_own_document() {
     });
     assert_eq!(s.digest_row(coll.id).unwrap().unwrap().digest, want);
     assert_eq!(r.digest_row(rc.id).unwrap().unwrap().digest, want);
+}
+
+/// The bytes a `Decimal128` id travels and is hashed under are **pinned** (build review note,
+/// ADR-238). Such an id has no schema-4 key, so its legacy form is `FF` and its *stored* key
+/// (design 7.1), and that stored key comes from the live number encoder, not from a frozen
+/// one. A later change to the encoder would move these ids' cursors, carried-delete keys and
+/// digest terms between two versions in one cluster, exactly as schema 5 moved every integer
+/// key; this change froze the schema-4 form for that reason (`kimmy_core::legacy_key`), and
+/// whoever changes the encoder must freeze this one the same way. Printed by this build and
+/// checked in: integers outside `i64`, fractions, both signs and both extreme exponents.
+#[test]
+fn a_decimal_ids_wire_form_and_digest_term_are_pinned() {
+    let stamp = Stamp::new(Hlc::new(5, 1), NodeId::from_bytes([3; 16]));
+    let golden: [(&str, &str, u128); 11] = [
+        ("9223372036854775808", "2004803f800000", 0xedd35e633a45e7e59420031f234823f4),
+        (
+            "-9223372036854775809",
+            "20027fc07fff00ff00ff00ff00ff00ff00feffff",
+            0xceb01213b63d9d31cf21c02c1a36a7e3,
+        ),
+        ("1E+30", "20048063c9f2c9cd04674edea40000", 0x904c5985ca5f0e5a312b062a9f19738d),
+        ("1.5", "20048000c00000", 0x458388e0921bca602fc3b6e5de77aa5e),
+        ("0.1", "20047ffccccccccccccccccccccccccccccccccc0001", 0x80152d2a105a81ef18bd56201b5e4a16),
+        ("-0.25", "200280017fffff", 0xe673c16c6a06130b472ff5aafc5e8d53),
+        ("-1.5E+30", "20027f9b6889e8a63cb284d904ffff", 0xfb5cc89f7d0b06b501dba2d845eb4a32),
+        (
+            "1E-6176",
+            "20042fdbda9721e80eee538ca9f8f95a224bfbca0001",
+            0x4e65dd55cb6e0b8955b1fb24590b39ca,
+        ),
+        (
+            "-1E-6176",
+            "2002d0242568de17f111ac73560706a5ddb40435fffe",
+            0x892feffc431be2bcf0b26e663fb38e76,
+        ),
+        (
+            "1E+6144",
+            "2004cfb9f33c80e873a56036d9bff7621230c8090001",
+            0xd328d0587a6d08345de2d3b5e720c2d7,
+        ),
+        (
+            "9.999999999999999999999999999999999E+6144",
+            "2004cfbd9805d09148475c224817fa9d4b5e2e160001",
+            0xdcb892787d19c5215e9e724e3e74b1ce,
+        ),
+    ];
+    for (text, stored_hex, term) in golden {
+        let id = DocId::try_from_bson(&bson::Bson::Decimal128(text.parse().unwrap())).unwrap();
+        assert!(matches!(id, DocId::Decimal128(_)), "{text} is a Decimal128 id");
+        let stored = unhex(stored_hex);
+        assert_eq!(crate::docs::doc_key(&id).unwrap(), stored, "{text}: the stored key moved");
+        let mut marked = vec![kimmy_core::legacy_key::STORED_FORM_MARKER];
+        marked.extend_from_slice(&stored);
+        let legacy = kimmy_core::keyenc::legacy_key(&id);
+        assert_eq!(legacy.as_bytes(), marked, "{text}: the wire form");
+        assert_eq!(kimmy_core::keyenc::legacy_of_stored(&stored), legacy, "{text}");
+        assert_eq!(kimmy_core::keyenc::stored_of_legacy(&marked), stored, "{text}");
+        assert_eq!(v1::term(&marked, &stamp), term, "{text}: the digest term moved");
+        assert_eq!(crate::live_digest::term(&legacy, &stamp), term, "{text}");
+        assert_eq!(crate::live_digest::legacy_term(&stored, &stamp), term, "{text}");
+    }
 }

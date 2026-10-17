@@ -438,6 +438,15 @@ pub(crate) fn drop_defers(tombstone: Option<Stamp>, created: Hlc, cut: &VersionV
     tombstone.is_some_and(|at| at.hlc > cut.get(at.node) || created <= at.hlc)
 }
 
+/// A key a peer sent in an uncovered list, which is legacy by definition, as the
+/// [`LegacyKey`] it is: read back to the stored form and out again, which is the
+/// identity on every key a 0.50 or a 0.51 member sends. There is no other way to
+/// make a `LegacyKey` from bytes (`kimmy_core::legacy_key`), so a stored key cannot
+/// pose as one here or anywhere else.
+fn received_key(bytes: &[u8]) -> LegacyKey {
+    keyenc::legacy_of_stored(&keyenc::stored_of_legacy(bytes))
+}
+
 /// What subtracting a set of keys from a row came to.
 enum Excluded {
     Digest(u128),
@@ -508,14 +517,12 @@ impl Engine {
         let mut spend = Spend::new(budget);
         let txn = self.db().begin_read()?;
         let facets = self.assess(&txn, &ask.cut, ScanFor::Only(ask.busy), &mut spend)?;
-        // The requester's keys as they came, legacy by definition: the wire
+        // The requester's keys, legacy by definition, read as such: the wire
         // boundary, and the form this side's own set is in.
         let theirs: BTreeMap<CollectionId, BTreeSet<LegacyKey>> = ask
             .uncovered
             .iter()
-            .map(|u| {
-                (u.collection, u.keys.iter().map(|k| LegacyKey::from_wire(k.to_vec())).collect())
-            })
+            .map(|u| (u.collection, u.keys.iter().map(|k| received_key(k)).collect()))
             .collect();
         let docs = txn.open_table(tables::DOCS)?;
         let mut read = 0usize;
@@ -618,9 +625,9 @@ impl Engine {
                 out.push(defer(Defer::UncoveredCap));
                 continue;
             }
-            // The peer's keys as they came: legacy, the form of this side's set.
+            // The peer's keys, read as the legacy keys they are: this side's set's form.
             let theirs: BTreeSet<LegacyKey> =
-                entry.uncovered.iter().map(|k| LegacyKey::from_wire(k.to_vec())).collect();
+                entry.uncovered.iter().map(|k| received_key(k)).collect();
             let union: BTreeSet<&LegacyKey> = then.uncovered.iter().chain(&theirs).collect();
             let mine = match self.excluded_digest(
                 &docs,
