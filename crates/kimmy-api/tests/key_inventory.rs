@@ -854,14 +854,13 @@ fn every_table_is_classified_for_schema_5() {
         .filter(|(_, _, n)| !listed.contains(n.as_str()))
         .map(|(file, constant, name)| format!("{file}: {constant} = {name:?}"))
         .collect();
+    let stale: Vec<&str> = listed.difference(&names).copied().collect();
     assert!(
-        unlisted.is_empty(),
+        unlisted.is_empty() && stale.is_empty(),
         "tables no one has classified for schema 5 (does its key or value hold a document or \
          index key? list it in TABLES as ReKeyed, Unchanged or LegacyAsReceived, with why): \
-         {unlisted:#?}"
+         {unlisted:#?}\nTABLES names tables that no longer exist: {stale:#?}"
     );
-    let stale: Vec<&str> = listed.difference(&names).copied().collect();
-    assert!(stale.is_empty(), "TABLES names tables that no longer exist: {stale:?}");
     // The classes the design fixes.
     let class = |name: &str| TABLES.iter().find(|t| t.name == name).map(|t| t.class);
     assert_eq!(class("docs"), Some(ReKeyed));
@@ -896,18 +895,17 @@ fn every_key_call_site_is_classified() {
         .filter(|(at, _)| !listed.contains(*at))
         .map(|((file, function), calls)| format!("{file} {function}: {calls:?}"))
         .collect();
-    assert!(
-        unlisted.is_empty(),
-        "functions that make, convert or carry a key and are not in CALL_SITES (is the key \
-         stored, an index key, a client token, on the wire, a digest term? a key that leaves \
-         the engine is legacy, design 7.1 and 7.2): {unlisted:#?}"
-    );
     let stale: Vec<String> = listed
         .iter()
         .filter(|at| !found.contains_key(*at))
         .map(|(file, function)| format!("{file} {function}"))
         .collect();
-    assert!(stale.is_empty(), "CALL_SITES names functions that no longer make a key: {stale:#?}");
+    assert!(
+        unlisted.is_empty() && stale.is_empty(),
+        "functions that make, convert or carry a key and are not in CALL_SITES (is the key \
+         stored, an index key, a client token, on the wire, a digest term? a key that leaves \
+         the engine is legacy, design 7.1 and 7.2): {unlisted:#?}\nCALL_SITES names functions that no longer make a key: {stale:#?}"
+    );
 }
 
 /// Rule 3, first part: every function that reads document or index keys and writes another
@@ -956,18 +954,17 @@ fn every_writer_that_reads_document_keys_is_classified() {
         .filter(|(at, _)| !listed.contains(*at))
         .map(|((file, function), tables)| format!("{file} {function} writes {tables:?}"))
         .collect();
-    assert!(
-        unlisted.is_empty(),
-        "functions that read document or index keys and write another table, not in \
-         PERSISTERS (does a key's bytes reach that table? then its form must be classified, \
-         design 5.1): {unlisted:#?}"
-    );
     let stale: Vec<String> = listed
         .iter()
         .filter(|at| !found.contains_key(*at))
         .map(|(file, function)| format!("{file} {function}"))
         .collect();
-    assert!(stale.is_empty(), "PERSISTERS names functions that no longer qualify: {stale:#?}");
+    assert!(
+        unlisted.is_empty() && stale.is_empty(),
+        "functions that read document or index keys and write another table, not in \
+         PERSISTERS (does a key's bytes reach that table? then its form must be classified, \
+         design 5.1): {unlisted:#?}\nPERSISTERS names functions that no longer qualify: {stale:#?}"
+    );
 }
 
 /// Rule 3, second part: every `META_*` slot is classified, and every named row's anchor still
@@ -997,17 +994,16 @@ fn every_slot_is_classified_and_anchored() {
         .filter(|(file, line)| !SLOTS.iter().any(|s| s.anchor_file == file && s.anchor == line))
         .map(|(file, line)| format!("{file}: {line}"))
         .collect();
-    assert!(
-        unlisted.is_empty(),
-        "META slots no one has classified (does the value hold a document key? list it in \
-         SLOTS): {unlisted:#?}"
-    );
     let stale: Vec<String> = SLOTS
         .iter()
         .filter(|s| !sources.get(s.anchor_file).is_some_and(|body| body.contains(s.anchor)))
         .map(|s| format!("{} ({}: {})", s.place, s.anchor_file, s.anchor))
         .collect();
-    assert!(stale.is_empty(), "SLOTS rows whose anchor is gone: {stale:#?}");
+    assert!(
+        unlisted.is_empty() && stale.is_empty(),
+        "META slots no one has classified (does the value hold a document key? list it in \
+         SLOTS): {unlisted:#?}\nSLOTS rows whose anchor is gone: {stale:#?}"
+    );
     let class = |place: &str| SLOTS.iter().find(|s| s.place == place).map(|s| s.class);
     assert_eq!(class("snapshot_progress[<peer>]"), Some(LegacyAsReceived));
     assert_eq!(class("live_digests_through[walk]"), Some(Unchanged));
@@ -1096,17 +1092,16 @@ fn every_slot_writer_is_classified() {
         .filter(|(at, _)| !listed.contains(*at))
         .map(|((file, function), tables)| format!("{file} {function} writes {tables:?}"))
         .collect();
-    assert!(
-        unlisted.is_empty(),
-        "functions that write a slot of a name-keyed table, not in SLOT_WRITERS (name the slot \
-         in SLOTS: does its value hold a document key?): {unlisted:#?}"
-    );
     let stale: Vec<String> = listed
         .iter()
         .filter(|at| !found.contains_key(*at))
         .map(|(file, function)| format!("{file} {function}"))
         .collect();
-    assert!(stale.is_empty(), "SLOT_WRITERS names functions that write no slot: {stale:#?}");
+    assert!(
+        unlisted.is_empty() && stale.is_empty(),
+        "functions that write a slot of a name-keyed table, not in SLOT_WRITERS (name the slot \
+         in SLOTS: does its value hold a document key?): {unlisted:#?}\nSLOT_WRITERS names functions that write no slot: {stale:#?}"
+    );
     let places: BTreeSet<&str> = SLOTS.iter().map(|s| s.place).collect();
     for w in SLOT_WRITERS {
         assert!(!w.slots.is_empty(), "{} {} names no slot", w.file, w.function);
