@@ -1621,7 +1621,7 @@ fn the_preflight_refuses_with_the_figures_and_leaves_a_store_0_50_opens() {
     match &err {
         crate::StorageError::NotEnoughSpace { needed, free, .. } => {
             assert_eq!(*free, 4_096, "the free space it was told");
-            assert!(*needed >= crate::migrate_v5::worst_growth(file), "{needed}");
+            assert!(*needed >= crate::migrate_v5::growth_step(file, 4_096), "{needed}");
         }
         other => panic!("the wrong refusal: {other}"),
     }
@@ -1629,8 +1629,10 @@ fn the_preflight_refuses_with_the_figures_and_leaves_a_store_0_50_opens() {
     for wanted in [
         "needs",
         "0 MiB is free",
-        "redb's growth steps",
-        "MiB of working set",
+        "redb's next growth step",
+        "documents and tombstones re-keyed through a staging table",
+        "index chunks in flight",
+        "MiB margin",
         "still schema 4",
         "previous build",
     ] {
@@ -1668,10 +1670,15 @@ fn the_preflight_refuses_with_the_figures_and_leaves_a_store_0_50_opens() {
 }
 
 #[test]
-fn the_requirement_is_one_growth_step_of_the_file_and_a_working_set_from_the_tables() {
-    // Read without a walk: the tables' own counts and the file's size.
+fn the_requirement_is_the_growth_step_the_staged_rows_the_index_chunks_and_a_margin() {
+    // B1 and M3 of the 0.51 build review: the requirement is redb's next growth
+    // step for the file, the rows the re-key stages, the index chunks in flight
+    // and a fixed margin, and nothing priced as the file's size over its
+    // documents.
+    use crate::migrate_v5::{MARGIN_BYTES, growth_step};
     let f = fixture();
     let path = f.copy();
+    chunks(8_192, 16 << 20);
     let plan = {
         let db = Database::create(&path).unwrap();
         crate::migrate_v5::preflight(&db, &path, 4).unwrap()
@@ -1679,42 +1686,358 @@ fn the_requirement_is_one_growth_step_of_the_file_and_a_working_set_from_the_tab
     assert_eq!(plan.collections, 3, "items, strs and empty: gone was dropped");
     assert_eq!(plan.purge_pending, 1, "the dropped collection's rows");
     assert_eq!(plan.ranges, 3, "items, gone and strs hold rows; empty holds none");
-    let rows: usize = f.ids.values().map(BTreeSet::len).sum::<usize>() + 9;
-    assert_eq!(plan.docs_rows, rows as u64);
-    assert!(plan.file_bytes > 0, "the file's length, read as the store stands");
-    assert_eq!(plan.growth_bytes, crate::migrate_v5::worst_growth(plan.file_bytes));
-    assert!(plan.required_bytes > plan.growth_bytes);
-    assert!(
-        plan.required_bytes < plan.growth_bytes + (1 << 30),
-        "a working set, not a copy of the store: {}",
-        plan.required_bytes
+    let numeric: usize = f.ids.values().map(BTreeSet::len).sum();
+    assert_eq!(plan.docs_rows, numeric as u64 + 9, "and strs' nine string ids");
+    assert_eq!(plan.staged.rows, numeric as u64, "the rows under a number key, purge-pending too");
+    // Every numeric row's leaf bytes, as a key-ordered staging table holds them.
+    let db = read_only(&path);
+    let leaf: u64 = docs_of(&db)
+        .iter()
+        .filter(|((_, k), _)| k.first() == Some(&0x20))
+        .map(|((_, k), v)| {
+            let pair = k.len() as u64 + v.len() as u64 + 20;
+            4096u64.div_ceil(4092 / pair)
+        })
+        .sum();
+    drop(db);
+    assert_eq!(plan.staged.bytes, leaf);
+    assert_eq!(plan.need.growth, growth_step(plan.file_bytes, plan.staged.largest_allocation));
+    // The fixture's rows are fewer than a chunk: the chunks in flight are the
+    // rows themselves, four times over.
+    assert_eq!(plan.need.staged_docs, leaf * 5);
+    // Its entries are less than one chunk of 16 MiB: twice their bytes, four
+    // times over.
+    assert!(plan.index_bytes > 0 && plan.index_bytes < 16 << 20, "{}", plan.index_bytes);
+    assert_eq!(plan.need.staged_index, 8 * plan.index_bytes);
+    assert_eq!(plan.need.margin, MARGIN_BYTES);
+    assert_eq!(
+        plan.required_bytes,
+        plan.need.growth + plan.need.staged_docs + plan.need.staged_index + MARGIN_BYTES
     );
 }
 
 #[test]
-fn the_growth_bound_follows_redbs_regions() {
-    use crate::migrate_v5::{REDB_REGION_BYTES as R, worst_growth};
+fn the_requirement_pins_the_shipped_chunks_against_0_2_and_2_000_000_rows() {
+    // The requirement as a function of what the tables hold, at the shipped
+    // chunk sizes: 8,192 rows and 16 MiB.
+    use crate::migrate_v5::{MARGIN_BYTES, Staged, requirement};
+    const MIB: u64 = 1 << 20;
+    let shipped =
+        |file: u64, staged: Staged, index: u64| requirement(file, &staged, index, 8_192, 16 << 20);
+    // No rows, no entries: the growth step and the margin.
+    let empty = shipped(MIB, Staged::default(), 0);
+    assert_eq!((empty.staged_docs, empty.staged_index), (0, 0));
+    assert_eq!(empty.total, MIB - 4096 + MARGIN_BYTES);
+    // Two rows of a kilobyte in a 45 MiB file of oplog: their own bytes, not
+    // 8,192 rows priced at the file over two, which was 1.5 TiB.
+    let two = Staged { rows: 2, bytes: 2 * 1366, largest_allocation: 4096 };
+    let churned = shipped(45 * MIB, two, 0);
+    assert_eq!(churned.staged_docs, 2 * 1366 * 5);
+    assert_eq!(churned.total, 45 * MIB - 4096 + 2 * 1366 * 5 + MARGIN_BYTES);
+    // 2,000,000 rows of about 410 bytes (nine to a page, 456 bytes each) in a
+    // 2,411 MiB file with three indexes: the rows once, four chunks of 8,192 of
+    // them, and eight times 16 MiB of entries.
+    let big = Staged { rows: 2_000_000, bytes: 2_000_000 * 456, largest_allocation: 4096 };
+    let fixture = shipped(2_411 * MIB, big, 1 << 30);
+    assert_eq!(fixture.growth, 2_411 * MIB - 4096);
+    assert_eq!(fixture.staged_docs, 2_000_000 * 456 + 4 * 8_192 * 456);
+    assert_eq!(fixture.staged_index, 8 * (16 << 20));
+    // The chunk sizes are what the in-flight terms are made of.
+    let smaller = requirement(2_411 * MIB, &big, 1 << 30, 1_024, 1 << 20);
+    assert_eq!(smaller.staged_docs, 2_000_000 * 456 + 4 * 1_024 * 456);
+    assert_eq!(smaller.staged_index, 8 * (1 << 20));
+}
+
+#[test]
+fn the_growth_step_is_redbs() {
+    // `TransactionalMemory::grow` in redb 4.3: below one region the file
+    // doubles; with full regions and a trailing one it fills the trailing one,
+    // and adds a region only when the allocation needs more than half of what
+    // the trailing one has left; with full regions only it adds one.
+    use crate::migrate_v5::{REDB_REGION_BYTES as R, growth_step};
     const MIB: u64 = 1 << 20;
     let page = 4096;
-    // One partial region: the file doubles.
-    assert_eq!(worst_growth(128 * MIB + page), 128 * MIB);
+    // One partial region: the step is the file, or twice an allocation larger
+    // than half of it.
+    assert_eq!(growth_step(128 * MIB + page, page), 128 * MIB);
+    assert_eq!(growth_step(page + page, page), 2 * page);
+    assert_eq!(growth_step(MIB + page, 4 * MIB), 8 * MIB);
     // The measurement at 2,000,000 documents: a 2,411 MiB file grew to 4,096
-    // MiB during its migration (sampled every 20 ms by
-    // `examples/schema4_migration`), 1,685 MiB, inside the bound of one
-    // doubling; it was back at 2,415 MiB when closed.
-    let measured = 2_411 * MIB;
-    assert_eq!(worst_growth(measured), measured - page);
-    assert!(4_096 * MIB - measured <= worst_growth(measured));
-    // Past one region: the rest of the partial region and one more, at the
-    // worst; a whole number of regions grows by one.
-    assert_eq!(worst_growth(R + MIB + page), 2 * R - MIB);
-    assert_eq!(worst_growth(5 * (R / 4) + page), 2 * R - R / 4);
-    assert_eq!(worst_growth(2 * R + page), R);
-    assert_eq!(worst_growth(R + page), R);
-    // Never more than two regions, never less than nothing.
+    // MiB during its migration, inside the doubling.
+    assert_eq!(growth_step(2_411 * MIB, page), 2_411 * MIB - page);
+    // Past one region: the rest of the trailing region (`R - T`), the step a
+    // probe of redb 4.3 measured (a 6,673 MiB file grew to 8,192 MiB, with
+    // 1 MiB allocations), not `2R - T`.
+    assert_eq!(growth_step(6_673 * MIB, MIB), 8_192 * MIB - 6_673 * MIB + page);
+    assert_eq!(growth_step(R + MIB + page, page), R - MIB);
+    assert_eq!(growth_step(5 * (R / 4) + page, MIB), R - R / 4);
+    // `2R - T` only when the trailing region has no more than twice the
+    // largest allocation left.
+    assert_eq!(growth_step(2 * R - MIB + page, MIB / 2 - page), MIB);
+    assert_eq!(growth_step(2 * R - MIB + page, MIB / 2), R + MIB);
+    // A whole number of regions grows by one.
+    assert_eq!(growth_step(2 * R + page, page), R);
+    assert_eq!(growth_step(R + page, page), R);
+    // Never more than two regions.
     for len in [0, page, R - 1, R, 3 * R + 1, 10 * R - page] {
-        assert!(worst_growth(len) <= 2 * R, "{len}");
+        assert!(growth_step(len, 16 * MIB) <= 2 * R, "{len}");
     }
+}
+
+/// The requirement of `path` at the shipped chunk sizes, as the real open plans
+/// it: a copy refused with no free space says the figure, a second copy is
+/// refused with one byte less than it, and the store migrates with exactly it.
+fn requirement_holds_on_open(path: &Path) -> crate::migrate_v5::Plan {
+    chunks(8_192, 16 << 20);
+    let refused = |free: u64, name: &str| {
+        let copy = copy_beside(path, name);
+        hooks::FREE.with(|c| c.set(Some(free)));
+        let opened = Engine::open(&copy).map(drop);
+        hooks::FREE.with(|c| c.set(None));
+        match opened {
+            Err(crate::StorageError::NotEnoughSpace { needed, .. }) => needed,
+            other => panic!("not refused with {free} bytes free: {other:?}"),
+        }
+    };
+    let needed = refused(0, "probe");
+    let plan = hooks::LAST_PLAN.with(|p| p.borrow_mut().take()).expect("the open planned");
+    assert_eq!(needed, plan.required_bytes, "the refusal names the plan's figure");
+    assert_eq!(refused(needed - 1, "short"), needed, "one byte short");
+    hooks::FREE.with(|c| c.set(Some(needed)));
+    let opened = Engine::open(path).map(drop);
+    hooks::FREE.with(|c| c.set(None));
+    opened.unwrap();
+    assert_eq!(version(&read_only(path)), Some(5));
+    plan
+}
+
+/// A store this build writes with `build`, taken back to schema 4 by the
+/// product's own helper.
+fn schema_4_store(build: impl FnOnce(&Engine)) -> (tempfile::TempDir, PathBuf) {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("kimmy.redb");
+    {
+        let engine = Engine::open(&path).unwrap();
+        build(&engine);
+    }
+    crate::migrate::make_schema_4_for_test(&path).unwrap();
+    (dir, path)
+}
+
+/// What a store's requirement is made of: the growth step, the rows' own bytes,
+/// the index chunks and the margin, whatever else the file holds.
+fn assert_bounded_by_its_rows(plan: &crate::migrate_v5::Plan, what: &str) {
+    use crate::migrate_v5::{MARGIN_BYTES, growth_step};
+    let growth = growth_step(plan.file_bytes, plan.staged.largest_allocation);
+    assert_eq!(plan.need.growth, growth, "{what}");
+    assert_eq!(plan.need.margin, MARGIN_BYTES, "{what}");
+    assert!(plan.need.staged_docs <= 5 * plan.staged.bytes, "{what}: {plan:?}");
+    assert!(plan.need.staged_index <= 8 * plan.index_bytes, "{what}: {plan:?}");
+    assert_eq!(
+        plan.required_bytes,
+        growth + plan.need.staged_docs + plan.need.staged_index + MARGIN_BYTES,
+        "{what}"
+    );
+    eprintln!(
+        "PREFLIGHT {what}: file {} KiB, {} rows to re-key in {} KiB, requires {} KiB (growth {} \
+         KiB, documents {} KiB, index {} KiB, margin {} KiB)",
+        plan.file_bytes >> 10,
+        plan.staged.rows,
+        plan.staged.bytes >> 10,
+        plan.required_bytes >> 10,
+        plan.need.growth >> 10,
+        plan.need.staged_docs >> 10,
+        plan.need.staged_index >> 10,
+        plan.need.margin >> 10
+    );
+}
+
+#[test]
+fn the_preflight_asks_an_empty_store_for_its_growth_step_and_the_margin() {
+    // The review's 12,032 MiB for a store with one empty collection: a full
+    // chunk of 8,192 rows priced at the file over no documents.
+    for (what, collection) in [("an empty store", false), ("an empty collection", true)] {
+        let (_dir, path) = schema_4_store(|engine| {
+            if collection {
+                engine.create_collection("app", "c").unwrap();
+            }
+        });
+        let plan = requirement_holds_on_open(&path);
+        assert_bounded_by_its_rows(&plan, what);
+        assert_eq!((plan.staged.rows, plan.need.staged_docs, plan.need.staged_index), (0, 0, 0));
+        assert!(plan.required_bytes < 66 << 20, "{what}: {} MiB", plan.required_bytes >> 20);
+    }
+}
+
+/// The heavier preflight cases; CI runs them in release:
+///
+/// ```text
+/// cargo test --release -p kimmy-storage --lib -- --include-ignored \
+///     migrate_v5_tests::the_preflight_of_a_store_
+/// ```
+#[test]
+#[ignore = "heavy: 60,000 documents dropped and purged; CI runs it in release"]
+fn the_preflight_of_a_store_whose_collection_was_dropped_and_purged() {
+    // The review's 6,029,660 MiB: the file holds the purged collection's freed
+    // pages and no document.
+    let (_dir, path) = schema_4_store(|engine| {
+        let tmp = engine.create_collection("app", "tmp").unwrap();
+        for start in (0..60_000_i64).step_by(10_000) {
+            let docs = (start..start + 10_000).map(|i| doc! {"_id": i, "pad": "p".repeat(400)});
+            engine.insert_many(&tmp, docs.collect()).unwrap();
+        }
+        assert!(engine.drop_collection("app", "tmp").unwrap());
+        engine.purge_dropped_collection(tmp.id).unwrap();
+        engine.create_collection("app", "c").unwrap();
+    });
+    let plan = requirement_holds_on_open(&path);
+    assert_bounded_by_its_rows(&plan, "a dropped and purged collection");
+    assert!(plan.file_bytes > 32 << 20, "premise: the file kept the purged pages");
+    assert_eq!(plan.staged.rows, 0);
+    assert_eq!(plan.required_bytes, plan.need.growth + plan.need.margin);
+}
+
+#[test]
+#[ignore = "heavy: 20,000 replacements; CI runs it in release"]
+fn the_preflight_of_a_store_of_two_documents_churned_20_000_times() {
+    // The review's 1,506,989 MiB: two documents, and an oplog of 20,000
+    // replacements of a kilobyte.
+    let (_dir, path) = schema_4_store(|engine| {
+        let c = engine.create_collection("app", "c").unwrap();
+        let two = vec![doc! {"_id": 1_i64, "n": 0}, doc! {"_id": 2_i64, "n": 0}];
+        engine.insert_many(&c, two).unwrap();
+        for i in 0..20_000_i64 {
+            let id = 1 + i % 2;
+            let body = doc! {"_id": id, "n": i, "pad": "p".repeat(1_000)};
+            engine.replace(&c, &DocId::Int64(id), body, false).unwrap();
+        }
+    });
+    let plan = requirement_holds_on_open(&path);
+    assert_bounded_by_its_rows(&plan, "two documents churned 20,000 times");
+    assert_eq!(plan.staged.rows, 2);
+    assert!(plan.staged.bytes <= 2 * 4096, "two rows of a kilobyte: {}", plan.staged.bytes);
+    assert!(plan.file_bytes > 16 << 20, "premise: the oplog fills the file");
+}
+
+#[test]
+#[ignore = "heavy: an oplog of 10,000 entries of 16 KiB; CI runs it in release"]
+fn the_preflight_of_a_store_shaped_like_kimmy1_3() {
+    // kimmy1 to kimmy3 in the lab: about 1.5 GB of file, mostly oplog, and four
+    // documents. Scaled down, with the ratio of file bytes to document bytes
+    // kept high: four documents of 16 KiB, each rewritten 2,500 times.
+    let (_dir, path) = schema_4_store(|engine| {
+        let c = engine.create_collection("app", "c").unwrap();
+        let body = |id: i64, n: i64| doc! {"_id": id, "n": n, "pad": "q".repeat(16_000)};
+        engine.insert_many(&c, (1..=4).map(|id| body(id, 0)).collect()).unwrap();
+        for n in 0..2_500_i64 {
+            for id in 1..=4 {
+                engine.replace(&c, &DocId::Int64(id), body(id, n), false).unwrap();
+            }
+        }
+    });
+    let plan = requirement_holds_on_open(&path);
+    assert_bounded_by_its_rows(&plan, "shaped like kimmy1-3");
+    assert_eq!(plan.staged.rows, 4);
+    let ratio = plan.file_bytes / plan.staged.bytes.max(1);
+    assert!(ratio > 1_000, "premise: the file is {ratio} times its documents' bytes");
+    // The old figure priced 8,192 rows at the file over four documents, twice,
+    // four times over: hundreds of GiB here. This one is the step and a few
+    // pages more than the margin.
+    let old = 4 * 8_192 * (plan.file_bytes / 4) * 2;
+    assert!(plan.required_bytes < plan.need.growth + (65 << 20), "{plan:?}");
+    assert!(plan.required_bytes * 100 < old, "{} against {old}", plan.required_bytes);
+}
+
+#[test]
+fn a_4_to_10_gib_store_on_a_10_gib_volume_passes_where_redbs_step_fits() {
+    // M3: `2R - T` refused every store of 4 to 10 GiB on the documented 10 GiB
+    // volume. With redb's real step each passes where the step fits in what is
+    // left of the volume, and is refused where redb would need more.
+    use crate::migrate_v5::REDB_REGION_BYTES as R;
+    const GIB: u64 = 1 << 30;
+    let f = fixture();
+    let volume = 10 * GIB;
+    for (file, fits) in [
+        (4 * GIB - (1 << 20), true),
+        (4 * GIB, true),
+        (5 * GIB, true),
+        (6 * GIB, true),
+        (7 * GIB, true),
+        (8 * GIB - (128 << 20), true),
+        // A whole number of regions: redb adds a region, 4 GiB, and 2 are left.
+        (2 * R + 4096, false),
+        // 9 GiB: the trailing region needs 3 GiB more, and 1 is left.
+        (9 * GIB, false),
+    ] {
+        let path = f.copy();
+        chunks(8_192, 16 << 20);
+        hooks::FILE_BYTES.with(|c| c.set(Some(file)));
+        hooks::FREE.with(|c| c.set(Some(volume - file)));
+        let opened = Engine::open(&path).map(drop);
+        hooks::FILE_BYTES.with(|c| c.set(None));
+        hooks::FREE.with(|c| c.set(None));
+        match (fits, opened) {
+            (true, Ok(())) => assert_eq!(version(&read_only(&path)), Some(5)),
+            (false, Err(crate::StorageError::NotEnoughSpace { needed, free, .. })) => {
+                assert!(needed > free, "{file}");
+                assert_eq!(version(&read_only(&path)), Some(4), "nothing written");
+            }
+            (fits, other) => panic!("{} MiB, fits {fits}: {:?}", file >> 20, other),
+        }
+    }
+}
+
+/// The requirement of the 2,000,000-document acceptance store's shape (about
+/// 350-byte documents, integer `_id`s, three indexes), which must be about the
+/// old figure: at this size that was the growth step and 128 MiB. With
+/// `PREFLIGHT_STORE` naming a schema 4 store, that store is planned instead (a
+/// copy of it).
+///
+/// ```text
+/// cargo test --release -p kimmy-storage --lib -- --include-ignored --exact \
+///     migrate_v5_tests::the_preflight_of_the_2_000_000_document_store
+/// ```
+#[test]
+#[ignore = "heavy: 2,000,000 documents; a measurement, run by hand in release"]
+fn the_preflight_of_the_2_000_000_document_store() {
+    let n: i64 = std::env::var("PREFLIGHT_N").map(|s| s.parse().unwrap()).unwrap_or(2_000_000);
+    let dir = tempfile::tempdir().unwrap();
+    let path = match std::env::var("PREFLIGHT_STORE") {
+        Ok(store) => {
+            let path = dir.path().join("kimmy.redb");
+            std::fs::copy(store, &path).unwrap();
+            path
+        }
+        Err(_) => shaped_schema_4(dir.path(), n, 300, 3),
+    };
+    let file = std::fs::metadata(&path).unwrap().len();
+    chunks(8_192, 16 << 20);
+    let started = std::time::Instant::now();
+    let plan = {
+        let db = Database::create(&path).unwrap();
+        crate::migrate_v5::preflight(&db, &path, 4).unwrap()
+    };
+    let planned = started.elapsed();
+    let old = crate::migrate_v5::growth_step(file, 4096)
+        + 4 * (8_192 * (file / plan.docs_rows.max(1)) * 2).max(2 * (16 << 20));
+    eprintln!(
+        "PREFLIGHT 2M: {} rows, file {} MiB; requires {} MiB (growth {}, documents {}, index {}, \
+         margin {}); the old figure {} MiB; planned in {planned:?}",
+        plan.docs_rows,
+        file >> 20,
+        plan.required_bytes >> 20,
+        plan.need.growth >> 20,
+        plan.need.staged_docs >> 20,
+        plan.need.staged_index >> 20,
+        plan.need.margin >> 20,
+        old >> 20
+    );
+    assert!(
+        plan.required_bytes >= old * 3 / 4 && plan.required_bytes <= old * 3 / 2,
+        "about the old figure: {} MiB against {} MiB",
+        plan.required_bytes >> 20,
+        old >> 20
+    );
 }
 
 #[test]
@@ -2203,6 +2526,17 @@ fn the_rebuild_changes_no_definition_stamp_tombstone_or_entry_of_the_oplog() {
     // put an index above the drop tombstones that refused it.
     let f = fixture();
     let path = f.copy();
+    // A snapshot pull's persisted cursor, which design 5.1 keeps as it is: a
+    // 0.51 sender converts it on the wire.
+    {
+        let db = Database::create(&path).unwrap();
+        let txn = db.begin_write().unwrap();
+        txn.open_table(tables::SNAPSHOT_PROGRESS)
+            .unwrap()
+            .insert([7u8; 16].as_slice(), br#"{"a cursor":"0.50 persisted"}"#.as_slice())
+            .unwrap();
+        txn.commit().unwrap();
+    }
     let before = read_only(&path);
     let (metas, digests): (BTreeMap<u64, CollectionMeta>, BTreeMap<u64, _>) = {
         let metas = metas_of(&before);
@@ -2223,8 +2557,10 @@ fn the_rebuild_changes_no_definition_stamp_tombstone_or_entry_of_the_oplog() {
         rows(&before, tables::LIVE_DIGESTS),
         rows(&before, tables::LIVE_DIGESTS_THROUGH),
         rows(&before, tables::LIVE_COUNTS_THROUGH),
+        rows(&before, tables::SNAPSHOT_PROGRESS),
     );
     assert!(!tables_before.4.is_empty() && !tables_before.5.is_empty(), "premise: tombstones");
+    assert!(!tables_before.10.is_empty(), "premise: a persisted snapshot cursor");
     let meta_rows = |db: &redb::ReadOnlyDatabase| -> BTreeMap<Vec<u8>, Vec<u8>> {
         rows(db, tables::META)
             .into_iter()
@@ -2250,10 +2586,12 @@ fn the_rebuild_changes_no_definition_stamp_tombstone_or_entry_of_the_oplog() {
         rows(&after, tables::LIVE_DIGESTS),
         rows(&after, tables::LIVE_DIGESTS_THROUGH),
         rows(&after, tables::LIVE_COUNTS_THROUGH),
+        rows(&after, tables::SNAPSHOT_PROGRESS),
     );
     assert!(
         tables_after == tables_before,
-        "the oplog, the vectors, the tombstones, the counts or the digests moved"
+        "the oplog, the vectors, the tombstones, the counts, the digests or a snapshot cursor \
+         moved"
     );
     assert_eq!(meta_rows(&after), meta_before, "META, the refusal hints included");
     for (id, meta) in metas_of(&after) {
@@ -2441,10 +2779,75 @@ fn indexed_schema_4(dir: &Path, n: i64) -> PathBuf {
     path
 }
 
+/// A schema 4 store of `n` documents of about `pad` bytes more than their
+/// fields in one collection with `indexes` indexes (one to three, over `n`,
+/// `m` and `k`), written by hand with the frozen encoder in large
+/// transactions: the acceptance store's shape, built in seconds.
+fn shaped_schema_4(dir: &Path, n: i64, pad: usize, indexes: usize) -> PathBuf {
+    let path = dir.join("kimmy.redb");
+    let coll = CollectionId::derive("shop", "t");
+    let mut meta = CollectionMeta::new(coll, "shop", "t", kimmy_core::Hlc::new(1, 0), None);
+    let fields = ["n", "m", "k"];
+    for field in &fields[..indexes.clamp(1, 3)] {
+        let name = format!("by_{field}");
+        meta.indexes.push(IndexMeta {
+            id: IndexMeta::derive_id(&name),
+            name,
+            fields: vec![IndexField::ascending(*field)],
+            unique: false,
+            enforcement: Enforcement::Local,
+            multikey: false,
+            expire_after_secs: None,
+            partial_filter: None,
+            created: None,
+        });
+    }
+    let node = kimmy_core::NodeId::generate();
+    let padding = "p".repeat(pad);
+    let db = Database::create(&path).unwrap();
+    for start in (0..n).step_by(100_000) {
+        let txn = db.begin_write().unwrap();
+        {
+            let mut docs = txn.open_table(tables::DOCS).unwrap();
+            let mut entries = txn.open_table(tables::INDEX_ENTRIES).unwrap();
+            for i in start..(start + 100_000).min(n) {
+                let key = v1::int64(i);
+                let doc = doc! {"_id": i, "n": i * 7, "m": i % 1_000, "k": format!("k{i}"), "pad": &padding};
+                let record = kimmy_core::DocRecord {
+                    stamp: kimmy_core::Stamp::new(kimmy_core::Hlc::new(10 + i as u64, 0), node),
+                    deleted: false,
+                    body: bson::serialize_to_vec(&doc).unwrap(),
+                };
+                docs.insert((coll.0, key.as_slice()), codec::encode_doc_record(&record).as_slice())
+                    .unwrap();
+                for index in &meta.indexes {
+                    let field = index.fields[0].path.as_str();
+                    let value = v1::encode(doc.get(field).unwrap()).unwrap();
+                    entries
+                        .insert((coll.0, index.id, value.as_slice(), key.as_slice()), ())
+                        .unwrap();
+                }
+            }
+        }
+        txn.commit().unwrap();
+    }
+    let txn = db.begin_write().unwrap();
+    txn.open_table(tables::COLLECTIONS)
+        .unwrap()
+        .insert(("shop", "t"), serde_json::to_vec(&meta).unwrap().as_slice())
+        .unwrap();
+    txn.open_table(tables::META)
+        .unwrap()
+        .insert(tables::META_FORMAT_VERSION, [4u8].as_slice())
+        .unwrap();
+    txn.commit().unwrap();
+    path
+}
+
 /// **A bound on the file's growth across a drain and a refill of hundreds of
 /// thousands of entries**, at the shipped chunk sizes: the file must stay near
 /// its size, and well inside the one growth step the preflight asks room for
-/// ([`crate::migrate_v5::worst_growth`]).
+/// ([`crate::migrate_v5::growth_step`]).
 ///
 /// It was first written to fail a drain written with redb's `retain_in`, which
 /// once grew a file from 2.1 to 12 GiB over 742,858 entries. On redb 4.3 it
@@ -2484,7 +2887,7 @@ fn draining_keeps_the_file_near_its_size() {
     );
     assert_eq!(rows[2], entries, "every entry drained");
     assert!(
-        largest - before <= crate::migrate_v5::worst_growth(before),
+        largest - before <= crate::migrate_v5::growth_step(before, 4096),
         "the file grew by more than the step the preflight asks room for"
     );
     assert!(
@@ -2742,9 +3145,15 @@ fn progress_advances_with_every_chunk_in_every_phase() {
         assert!(multi_chunk(kind), "premise: {kind} takes several chunks");
     }
     // Every step ends at `done == total` on `/readyz`: re-key out, re-key back,
-    // each index's drain, each collection's refill. An exact total is what the
-    // step did from its start; an estimate is finalized to it.
-    assert_eq!(steps, ends.keys().cloned().collect(), "steps with chunks, steps that ended");
+    // each TTL partial index's count, each index's drain, each collection's
+    // refill. An exact total is what the step did from its start; an estimate
+    // is finalized to it. A count has no chunks: it moves with every document.
+    const COUNT: &str = "counting a TTL index's selection";
+    assert_eq!(
+        steps,
+        ends.keys().filter(|(k, _, _)| *k != COUNT).cloned().collect(),
+        "steps with chunks, steps that ended"
+    );
     for end in &ended {
         assert_eq!(end.done, end.total, "a step ended with done != total: {end:?}");
         if end.exact {
@@ -2781,6 +3190,14 @@ fn progress_advances_with_every_chunk_in_every_phase() {
     }
     let back = end("moving back", None);
     assert!(back.exact && back.done == rows, "{back:?}");
+    // Each TTL partial index's count scans every row of `items`, one at a time.
+    for ttl in ["ttl_lt", "ttl_gte"] {
+        let count = end(COUNT, Some(ttl));
+        assert!(!count.exact, "{count:?}");
+        assert_eq!((count.began, count.done, count.total), ((0, live_items), rows, rows), "{ttl}");
+    }
+    let counted = ends.keys().filter(|(k, _, _)| *k == COUNT).count();
+    assert_eq!(counted, 2, "a count for each TTL partial index, and none other");
     // An estimate above the work is lowered to it: a collection of 20 number
     // ids and 30 string ids starts its move out from its 50 live documents and
     // moves the 20, the string keys being the same in both schemas.
@@ -2818,4 +3235,319 @@ fn progress_advances_with_every_chunk_in_every_phase() {
         logs.lines().any(|l| l.contains("phase=\"draining\"") && l.contains("index=")),
         "a drain's line names its index"
     );
+}
+
+/// `shop.t` of `n` documents under a partial index that selects none of them,
+/// and `shop.deleted` of `n` documents, every one deleted: a refill that writes
+/// nothing for a whole collection, twice over.
+fn sparse_refill_store(n: i64) -> (tempfile::TempDir, PathBuf) {
+    small_schema_4(
+        |engine| {
+            let t = engine.create_collection("shop", "t").unwrap();
+            partial(
+                engine,
+                "t",
+                "rare",
+                vec![IndexField::ascending("x")],
+                false,
+                None,
+                doc! {"flag": {"$gt": 0}},
+            );
+            let docs = (0..n).map(|i| doc! {"_id": i, "x": i, "pad": "p".repeat(200)});
+            engine.insert_many(&t, docs.collect()).unwrap();
+            let deleted = engine.create_collection("shop", "deleted").unwrap();
+            index(engine, "deleted", "by_x", vec![IndexField::ascending("x")], false);
+            engine
+                .insert_many(&deleted, (0..n).map(|i| doc! {"_id": i, "x": i}).collect())
+                .unwrap();
+            for i in 0..n {
+                assert!(engine.delete(&deleted, &DocId::Int64(i)).unwrap());
+            }
+        },
+        &[],
+    )
+}
+
+#[test]
+fn a_sparse_partial_index_or_a_run_of_tombstones_refills_in_bounded_chunks() {
+    // M2 of the 0.51 build review: a refill chunk ended only on the bytes of
+    // entries it wrote, so a partial index that selects nothing, or a run of
+    // tombstones, walked its whole collection in one transaction, with no stop
+    // looked for and no progress shown. A chunk now also ends on the documents
+    // it walked, and on the time it worked.
+    let n: i64 = 400;
+    let (_dir, path) = sparse_refill_store(n);
+    chunks(7, 300);
+    hooks::chunks_seen();
+    drop(Engine::open(&path).unwrap());
+    let seen = hooks::chunks_seen();
+    for coll in ["t", "deleted"] {
+        let refills: Vec<&hooks::ChunkSeen> =
+            seen.iter().filter(|c| c.kind == "refilling indexes" && c.collection == coll).collect();
+        let walked: Vec<u64> = refills.iter().map(|c| c.rows).collect();
+        assert!(walked.iter().all(|&r| r <= 7), "{coll}: chunks walked {walked:?}");
+        assert_eq!(walked.iter().sum::<u64>(), n as u64, "{coll}: every document walked once");
+        // Progress moves with every chunk.
+        assert!(refills.windows(2).all(|w| w[1].done > w[0].done), "{coll}: {refills:?}");
+    }
+}
+
+#[test]
+fn a_refill_chunk_ends_on_its_time_bound() {
+    // The documents and the bytes out of reach: the time bound alone ends each
+    // chunk. At zero, every chunk works on one document.
+    let (_dir, path) = sparse_refill_store(30);
+    chunks(1_000_000, 1 << 30);
+    hooks::REFILL_TIME.with(|c| c.set(Some(std::time::Duration::ZERO)));
+    hooks::chunks_seen();
+    let opened = Engine::open(&path).map(drop);
+    hooks::REFILL_TIME.with(|c| c.set(None));
+    opened.unwrap();
+    let walked: Vec<u64> = hooks::chunks_seen()
+        .into_iter()
+        .filter(|c| c.kind == "refilling indexes" && c.collection == "t")
+        .map(|c| c.rows)
+        .collect();
+    assert_eq!(walked, vec![1; 30], "one document a chunk");
+}
+
+#[test]
+fn a_stop_inside_a_sparse_refill_ends_it_within_one_chunk() {
+    // The stop-path rule over a refill that writes nothing: the stop asked for
+    // inside its second chunk is answered after that chunk, and the next start
+    // resumes to what a clean run leaves.
+    const HOLD: std::time::Duration = std::time::Duration::from_millis(40);
+    let (_dir, path) = sparse_refill_store(400);
+    let clean = copy_beside(&path, "clean");
+    chunks(7, 300);
+    drop(Engine::open(&clean).unwrap());
+    let want = docs_of(&read_only(&clean));
+    let standing: BTreeSet<u64> = metas_of(&read_only(&clean)).keys().copied().collect();
+    let want_entries = entries_of(&read_only(&clean), &standing);
+    hooks::hold_in_chunks(Some(HOLD), None);
+    hooks::stop_inside("refilling indexes", 2);
+    hooks::chunks_seen();
+    let result = Engine::open(&path).map(drop);
+    let returned = std::time::Instant::now();
+    let (raised, commits_then) = hooks::stop_raised().expect("a second refill chunk to stop in");
+    hooks::hold_in_chunks(None, None);
+    let after = hooks::commits() - commits_then;
+    assert!(matches!(result, Err(crate::StorageError::Stopping(_))), "{result:?}");
+    assert!(after <= 1, "{after} commits after the stop");
+    assert!(returned - raised < HOLD + std::time::Duration::from_millis(1_500));
+    let refilled: u64 =
+        hooks::chunks_seen().iter().filter(|c| c.kind == "refilling indexes").map(|c| c.rows).sum();
+    assert!(refilled <= 14, "stopped after its second chunk: {refilled} documents walked");
+    let engine = Engine::open(&path).unwrap();
+    assert_eq!(docs_of(engine.db()), want);
+    assert_eq!(entries_of(engine.db(), &standing), want_entries);
+}
+
+/// The sparse refill at the shipped chunk sizes, in release:
+///
+/// ```text
+/// cargo test --release -p kimmy-storage --lib -- --include-ignored --exact \
+///     migrate_v5_tests::a_sparse_refill_at_the_shipped_chunk_sizes_commits_every_8192_documents
+/// ```
+#[test]
+#[ignore = "heavy: 300,000 documents; CI runs it in release"]
+fn a_sparse_refill_at_the_shipped_chunk_sizes_commits_every_8192_documents() {
+    // The review measured one refill chunk of 300,000 documents here.
+    let n: i64 = 300_000;
+    let (_dir, path) = small_schema_4(
+        |engine| {
+            let t = engine.create_collection("shop", "t").unwrap();
+            partial(
+                engine,
+                "t",
+                "rare",
+                vec![IndexField::ascending("x")],
+                true,
+                None,
+                doc! {"flag": {"$gt": 0}},
+            );
+            for start in (0..n).step_by(20_000) {
+                let docs = (start..start + 20_000)
+                    .map(|i| doc! {"_id": i, "x": i, "pad": "p".repeat(300)});
+                engine.insert_many(&t, docs.collect()).unwrap();
+            }
+        },
+        &[],
+    );
+    chunks(8_192, 16 << 20);
+    hooks::chunks_seen();
+    drop(Engine::open(&path).unwrap());
+    let walked: Vec<u64> = hooks::chunks_seen()
+        .into_iter()
+        .filter(|c| c.kind == "refilling indexes")
+        .map(|c| c.rows)
+        .collect();
+    eprintln!(
+        "SPARSE REFILL at shipped sizes: {} chunks, the largest {:?}",
+        walked.len(),
+        walked.iter().max()
+    );
+    assert!(walked.iter().all(|&r| r <= 8_192), "{walked:?}");
+    assert!(walked.len() as i64 >= n / 8_192, "{} chunks", walked.len());
+    assert_eq!(walked.iter().sum::<u64>(), n as u64);
+}
+
+#[test]
+fn a_carried_row_with_the_same_key_bytes_does_not_absorb_a_dissolved_holder() {
+    // Minor 6 of the 0.51 build review: a string key's bytes are the same in
+    // both schemas, so a carried row (holders 1, 2, 3 under "x") and the
+    // refill's row for the collision that stands now (1, 2) were one row of
+    // one table, and document 3, which the exact comparator took out of the
+    // index (0.50 ranked its decimal tier equal to 3), was reported with them.
+    let t = CollectionId::derive("shop", "t").0;
+    let (_dir, path) = unique_store(
+        &[("email_once", "email", Some(doc! {"tier": {"$gte": 3}}))],
+        vec![
+            doc! {"_id": 1_i64, "email": "x", "tier": dec("5")},
+            doc! {"_id": 2_i64, "email": "x2", "tier": dec("4")},
+            doc! {"_id": 3_i64, "email": "x3", "tier": dec("1")},
+        ],
+        &[
+            ("t", 2, doc! {"_id": 2_i64, "email": "x", "tier": dec("4")}),
+            ("t", 3, doc! {"_id": 3_i64, "email": "x", "tier": dec("1")}),
+        ],
+    );
+    let email = metas_of(&read_only(&path))[&t].index("email_once").unwrap().id;
+    carry(&path, t, email, "email_once", Bson::String("x".into()), &[1, 2, 3]);
+    crate::migrate::hooks::fail_before_the_report();
+    let (opened, logs) = crate::log_capture::logged(|| Engine::open(&path).map(drop));
+    assert!(opened.is_err(), "premise: stopped before the report");
+    assert_eq!(recorded(&path), vec![("email_once".to_string(), vec![1, 2])]);
+    let line = logs
+        .lines()
+        .find(|l| l.contains("rebuilt an index") && l.contains("email_once"))
+        .expect("the index's line");
+    assert!(line.contains("unique_collisions=1"), "the refill's collision, counted: {line}");
+    let gone: Vec<&str> = logs.lines().filter(|l| l.contains("is not reported")).collect();
+    assert_eq!(gone.len(), 1, "the carried row, dissolved as recorded: {logs}");
+    assert!(gone[0].contains(r#"holders=["1", "2", "3"]"#), "{}", gone[0]);
+    assert!(!has_table(&path, "schema5_carried_collisions"), "settled by the last commit");
+}
+
+#[test]
+fn a_carried_collision_under_a_string_key_found_again_is_reported_once() {
+    // Minor 7: the re-found test of the carried rows went through an Int32 key,
+    // whose bytes change across the schemas. Under a string key, the same bytes:
+    // the collision stands, the refill finds it again under the key it was
+    // carried under, and it is reported once, with no line saying it is not.
+    let t = CollectionId::derive("shop", "t").0;
+    let (_dir, path) = unique_store(
+        &[("email_once", "email", None)],
+        vec![doc! {"_id": 1_i64, "email": "x"}, doc! {"_id": 2_i64, "email": "x2"}],
+        &[("t", 2, doc! {"_id": 2_i64, "email": "x"})],
+    );
+    let email = metas_of(&read_only(&path))[&t].index("email_once").unwrap().id;
+    carry(&path, t, email, "email_once", Bson::String("x".into()), &[1, 2]);
+    crate::migrate::hooks::fail_before_the_report();
+    let (opened, logs) = crate::log_capture::logged(|| Engine::open(&path).map(drop));
+    assert!(opened.is_err(), "premise: stopped before the report");
+    assert_eq!(recorded(&path), vec![("email_once".to_string(), vec![1, 2])]);
+    assert!(!logs.contains("is not reported"), "found again, not dissolved: {logs}");
+    assert!(!has_table(&path, "schema5_carried_collisions"), "settled by the last commit");
+    let engine = Engine::open(&path).unwrap();
+    assert_eq!(engine.unique_violations(), 1, "reported once");
+    drop(engine);
+    assert!(!has_table(&path, "schema5_unique_collisions"), "forgotten once reported");
+}
+
+#[test]
+fn the_collision_table_is_forgotten_after_a_report_pass_that_reported_nothing() {
+    // Minor 7: rows whose index is gone are not reported, and the table was
+    // forgotten only when something was; it stayed for good.
+    let f = fixture();
+    let path = f.copy();
+    drop(Engine::open(&path).unwrap());
+    {
+        let db = Database::create(&path).unwrap();
+        let txn = db.begin_write().unwrap();
+        txn.open_table(crate::migrate_v5::COLLISIONS)
+            .unwrap()
+            .insert((7u64, 9u32, b"k".as_slice()), Collision::default().encode().as_slice())
+            .unwrap();
+        txn.commit().unwrap();
+    }
+    let engine = Engine::open(&path).unwrap();
+    assert_eq!(engine.unique_violations(), 0, "nothing to report it against");
+    drop(engine);
+    assert!(!has_table(&path, "schema5_unique_collisions"), "forgotten all the same");
+}
+
+/// Record a pending schema 3 -> 4 collision on `index` of collection `coll`:
+/// `key`'s schema 4 form, held by `holders`.
+fn carry(path: &Path, coll: u64, index: u32, name: &str, key: Bson, holders: &[i64]) {
+    let db = Database::create(path).unwrap();
+    let txn = db.begin_write().unwrap();
+    {
+        let mut recorded = txn.open_table(crate::migrate_v5::PARTIAL_REBUILT_VIOLATIONS).unwrap();
+        let row = crate::migrate::RecordedViolations {
+            db: "shop".into(),
+            collection: "t".into(),
+            violations: vec![crate::index::UniqueViolation {
+                index: name.into(),
+                key: v1::encode(&key).unwrap(),
+                holders: holders.iter().map(|&id| v1::int64(id)).collect(),
+            }],
+        };
+        recorded.insert((coll, index), serde_json::to_vec(&row).unwrap().as_slice()).unwrap();
+    }
+    txn.commit().unwrap();
+}
+
+/// What the migration recorded to report, by index, holders as `_id`s.
+fn recorded(path: &Path) -> Vec<(String, Vec<i64>)> {
+    let recorded =
+        crate::migrate_v5::recorded_collisions(&Database::create(path).unwrap()).unwrap();
+    let mut named: Vec<(String, Vec<i64>)> = recorded
+        .iter()
+        .flat_map(|(_, violations)| violations.iter())
+        .map(|v| {
+            let mut ids: Vec<i64> =
+                v.holders.iter().map(|h| v2_int64_of(h).expect("schema 5 holders")).collect();
+            ids.sort_unstable();
+            (v.index.clone(), ids)
+        })
+        .collect();
+    named.sort();
+    named
+}
+
+#[test]
+fn a_ttl_index_without_a_partial_filter_is_not_counted() {
+    // Minor 8: only a partial filter can decide a document differently under
+    // the exact comparator. A TTL index without one has nothing to count: no
+    // scan of the collection, no step for it, and no line about a partial
+    // filter.
+    let (_dir, path) = small_schema_4(
+        |engine| {
+            let t = engine.create_collection("shop", "t").unwrap();
+            engine
+                .create_index_with(
+                    "shop",
+                    "t",
+                    vec![IndexField::ascending("at")],
+                    false,
+                    Enforcement::Local,
+                    Some("ttl_all".into()),
+                    Some(3_600),
+                    None,
+                )
+                .unwrap();
+            let docs =
+                (0..20_i64).map(|i| doc! {"_id": i, "at": bson::DateTime::now(), "tier": dec("1")});
+            engine.insert_many(&t, docs.collect()).unwrap();
+        },
+        &[],
+    );
+    hooks::steps_seen();
+    let (opened, logs) = crate::log_capture::logged(|| Engine::open(&path).map(drop));
+    opened.unwrap();
+    let steps = hooks::steps_seen();
+    assert!(steps.iter().all(|s| s.kind != "counting a TTL index's selection"), "{steps:#?}");
+    assert!(!logs.contains("partial filter now decides"), "{logs}");
+    assert!(!logs.contains("before=\"not recorded\""), "{logs}");
 }

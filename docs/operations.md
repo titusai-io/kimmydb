@@ -2673,12 +2673,33 @@ says `migrating`; peers see it as down, and nothing is written to it. In order:
    required and the free space there is, and `estimate_secs`. **The start is
    refused if the volume holding the store has less free space than the
    requirement**, with the two figures (`the storage schema migration needs N
-   MiB free and M MiB is free`): one of redb's growth steps from the file's
-   size (the file doubles while it is under 4 GiB; above, at worst the rest of
-   its last 4 GiB region and one more region) and a working set of a few chunks.
-   A refused start writes nothing of the migration: the store is still schema
-   4 and 0.50 opens it. Free space and start again. A partial index whose stored
-   filter this build cannot parse refuses the start the same way.
+   MiB free and M MiB is free`) and the four terms the requirement adds up:
+   - **redb's next growth step for the file**: while the file is under 4 GiB it
+     doubles; above, redb fills out its last 4 GiB region (the rest of that
+     region), or adds a whole region when the file ends on a region boundary,
+     and adds one region more only when the last region has less than twice
+     the largest single allocation left. The step is the file's length, and
+     ext4, XFS and APFS leave it unallocated until it is written;
+   - **the documents re-keyed**: every document and tombstone with a number
+     `_id`, once, at the size the staging table holds them in, plus four chunks
+     of 8,192 of them;
+   - **the index chunks in flight**: eight times one 16 MiB chunk of entries,
+     or eight times what the indexes hold if that is less;
+   - **a 64 MiB margin**.
+
+   Nothing in it is the file's size over its document count: a store that is
+   mostly oplog, or holds the freed pages of a purged collection, requires its
+   growth step, its own documents and the margin. An empty store requires 64
+   MiB; two documents in a 52 MiB file of oplog, 116 MiB; the 2,000,000-document
+   acceptance store, a 2,411 MiB file, 3,487 MiB (2,411 for the step, 884 for its
+   documents, 128 for the index chunks and the margin). On a 10 GiB volume,
+   redb's step leaves room for a store of up to just under 8 GiB; at 8 GiB it
+   is a whole 4 GiB region, and above it the rest of the region, more than is
+   left. The documents' term comes on top of the step. The documents are measured by
+   one read of them before the line is written, which looks for a stop as a
+   chunk does. A refused start writes nothing of the migration: the store is
+   still schema 4 and 0.50 opens it. Free space and start again. A partial index
+   whose stored filter this build cannot parse refuses the start the same way.
 2. **From here, 0.50 and 0.49 refuse the store.** `kimmy.format` records schema
    5 just before the first commit, which writes schema 5 into the store and
    lists the work as markers. A start of 0.50 or 0.49 on the store, finished or
@@ -2687,15 +2708,21 @@ says `migrating`; peers see it as down, and nothing is written to it. In order:
 3. **Every document with an integer `_id` is re-keyed** (tombstones too), a
    chunk of 8,192 rows per commit, in two passes through a staging table, and
    **every index is drained and rebuilt** from the documents, a chunk of about
-   16 MiB of entries per commit. `/readyz` reports each step on its own:
+   16 MiB of entries per commit; a refill chunk also ends after 8,192
+   documents walked or 250 ms of work, whichever comes first, so a partial
+   index that selects few documents, or a run of tombstones, still commits,
+   looks for a stop and moves `/readyz` every chunk. `/readyz` reports each
+   step on its own:
    `migrating` while a collection's documents are re-keyed (`done` of `total`
    rows, tombstones included, once out and once back), `draining` for each
    index (its own entries removed), `refilling` for each collection (rows
-   walked, one step for all its indexes). A drain's `total` is its index's
+   walked, one step for all its indexes); a TTL index with a partial filter
+   first counts what the exact comparator changed (below), a step of its own
+   in `draining`, in documents scanned. A drain's `total` is its index's
    entries, counted before it starts, and a move back's is what moved out:
-   both exact. A move out's and a refill's start from the collection's kept
-   document count, are raised if the step outruns them, and are set to what
-   the step did when it ends. Every step ends reading `done` equal to `total`. A
+   both exact. A move out's, a count's and a refill's start from the
+   collection's kept document count, are raised if the step outruns them, and
+   are set to what the step did when it ends. Every step ends reading `done` equal to `total`. A
    progress line, `migrating storage schema 4 -> 5`, gives the same `phase`,
    `done` and `total`, with the collection and the index, every 100,000 rows of
    a step; each

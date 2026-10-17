@@ -84,14 +84,26 @@ pub(crate) const RANGE_PHASES: TableDefinition<u64, &[u8]> =
 pub(crate) const INDEX_STEPS: TableDefinition<(u64, u32), &[u8]> =
     TableDefinition::new("schema5_index_steps");
 
-/// `(collection id, index id, index key) -> flags || holders`: every unique
-/// collision the rebuild found, and the schema 3 -> 4 rebuild's unreported
-/// ones, carried. **It outlives the migration's last commit** and is deleted
-/// only once the engine has reported what it holds
+/// `(collection id, index id, index key) -> holders`: every unique collision
+/// the rebuild found. **It outlives the migration's last commit** and is
+/// deleted only once the engine has reported what it holds
 /// ([`crate::migrate::forget_reported_violations`]): a crash between the two
 /// would otherwise lose a collision nobody was ever told about.
 pub(crate) const COLLISIONS: TableDefinition<(u64, u32, &[u8]), &[u8]> =
     TableDefinition::new("schema5_unique_collisions");
+
+/// `(collection id, index id, schema 4 index key) -> holders`: the schema 3 ->
+/// 4 rebuild's unreported collisions, carried in the first commit, their
+/// holders converted to schema 5 keys, and settled against what the refill
+/// found by the last commit, which deletes the table ([`settle_carried`]).
+///
+/// **A table of its own**, not rows of [`COLLISIONS`]: a string key's bytes are
+/// the same in both schemas, so in one keyspace a carried row and the refill's
+/// row for the collision that stands now would be one row, and a holder the
+/// exact comparator took out of the index would be reported beside the ones
+/// still in it.
+pub(crate) const CARRIED_COLLISIONS: TableDefinition<(u64, u32, &[u8]), &[u8]> =
+    TableDefinition::new("schema5_carried_collisions");
 
 /// The schema 3 -> 4 markers, deleted in the first commit on every store older
 /// than 5, finished or not: 4 -> 5 rebuilds every index under the current rule,
@@ -100,7 +112,7 @@ pub(crate) const PARTIAL_REBUILT: TableDefinition<(u64, u32), ()> =
     TableDefinition::new("partial_rebuilt_under_find");
 
 /// What a finished schema 3 -> 4 rebuild found and had not yet reported, carried
-/// into [`COLLISIONS`] in the first commit rather than deleted.
+/// into [`CARRIED_COLLISIONS`] in the first commit rather than deleted.
 pub(crate) const PARTIAL_REBUILT_VIOLATIONS: TableDefinition<(u64, u32), &[u8]> =
     TableDefinition::new("partial_rebuilt_unique_violations");
 
@@ -110,8 +122,9 @@ const NUMBER_TAG: &[u8] = &[0x20];
 /// The byte after it, which bounds the numeric part of a range.
 const ABOVE_NUMBER_TAG: &[u8] = &[0x21];
 
-/// Rows per re-keying transaction (design 6.1). Tiny under test, so every test
-/// crosses many chunk boundaries.
+/// Rows per re-keying transaction (design 6.1), and the most documents one
+/// refill chunk walks. Tiny under test, so every test crosses many chunk
+/// boundaries.
 #[cfg(not(test))]
 const REKEY_CHUNK_ROWS: usize = 8_192;
 #[cfg(test)]
@@ -123,6 +136,11 @@ const REKEY_CHUNK_ROWS: usize = 7;
 const INDEX_CHUNK_BYTES: usize = 16 << 20;
 #[cfg(test)]
 const INDEX_CHUNK_BYTES: usize = 120;
+
+/// The wall time one refill chunk works for before it ends and commits, at
+/// the most: a chunk also ends on [`INDEX_CHUNK_BYTES`] of entries written or
+/// [`REKEY_CHUNK_ROWS`] documents walked, whichever comes first.
+const REFILL_CHUNK_TIME: Duration = Duration::from_millis(250);
 
 /// How many rows between two progress lines.
 #[cfg(not(test))]
@@ -139,45 +157,171 @@ pub(crate) const REDB_REGION_BYTES: u64 = 4 << 30;
 /// redb's page, which the file's first page (the super-header) occupies.
 const REDB_PAGE_BYTES: u64 = 4096;
 
-/// The most the file can grow by in one step, from its length: what the
-/// preflight asks for beside the working set, in place of the fixed 2,048 MiB
-/// the design first named.
+/// A redb leaf page's header (`LeafAccessor` in `tree_store/btree_base.rs`):
+/// its type, a reserved byte and its count of pairs.
+const REDB_LEAF_HEADER: u64 = 4;
+
+/// What one `DOCS` row takes in a redb leaf beside its key's and its value's
+/// bytes: the key's collection id (8), a length for the key's variable part
+/// (4), and the key's and the value's end offsets (4 each).
+const DOCS_ROW_OVERHEAD: u64 = 20;
+
+/// What one `INDEX_ENTRIES` entry counts beside its index key and document key,
+/// as the refill's chunk counts it: the collection id and the index id.
+const INDEX_ENTRY_OVERHEAD: u64 = 12;
+
+/// Chunks whose pages can be held at once: redb reuses a page a commit frees
+/// only once the commit after it is durable too, so the chunk being written,
+/// the one before it and the one before that hold pages, and one more for
+/// the pages copy-on-write rewrites above them.
+const CHUNKS_IN_FLIGHT: u64 = 4;
+
+/// The preflight's fixed margin, above the growth step and the staged bytes:
+/// the branch pages, the allocator's own state and the commits' metadata, which
+/// no table's figures count.
+pub(crate) const MARGIN_BYTES: u64 = 64 << 20;
+
+/// The file's next growth step: how far redb 4.3 extends the file the first
+/// time an allocation finds no free page, from the file's length and the
+/// largest single allocation the migration makes. The preflight asks room for
+/// this step beside the bytes the migration stages ([`requirement`]).
 ///
-/// redb 4.3 grows the file only when an allocation finds no free page
-/// (`TransactionalMemory::grow`), by a step that depends on where the file
-/// stands against its 4 GiB regions. With `U` the file's usable bytes (its
-/// length less the super-header page), `R` a region and `T = U mod R` the part
-/// of the last region in use:
+/// redb grows the file in `TransactionalMemory::grow`
+/// (`redb-4.3.0/src/tree_store/page_store/page_manager.rs`, from line 2335).
+/// With `U` the file's usable bytes (its length less the super-header page),
+/// `R` a full region's usable bytes (4 GiB, [`REDB_REGION_BYTES`]), `T` the
+/// usable bytes of the trailing partial region, and `a` the allocation that did
+/// not fit (`required_growth`, a power of two pages):
 ///
-/// - `U < R`, one partial region: it asks for `max(2U, U + 2a)` bytes, `a` the
-///   allocation that did not fit, so the file **doubles**: it grows by `U`
-///   (an allocation larger than the whole file aside, which no migration's
-///   pages are). Past `R`, the layout becomes a full region and a partial one,
-///   which is still `2U` in all;
-/// - `U >= R` and `T > 0`: it fills the partial region (`R - T`), or, when the
-///   allocation needs more than half of what that region has left, fills it and
-///   adds one more region: **`2R - T` at the worst**;
-/// - `U >= R` and `T = 0`: it adds one region, `R`.
+/// - **no full region yet** (`U < R`): the new size is `max(2U, U + 2a)`, so
+///   the step is `max(U, 2a)`: the file doubles;
+/// - **full regions and a trailing one**: when `2a < R - T` it fills out the
+///   trailing region, a step of `R - T`; otherwise it fills it out and adds one
+///   region, `2R - T`;
+/// - **full regions only**: it adds one region, `R`.
+///
+/// The migration's allocations are pages for its rows and its entries, a power
+/// of two pages each, so `2R - T` is charged only where the trailing region has
+/// no more than twice the largest of them left. Charging `2R - T` always, as
+/// this did first, refused every 4 to 10 GiB store on a 10 GiB volume, though
+/// redb would have grown it by `R - T`.
+///
+/// Region header pages are left out of `U`: a few pages per 4 GiB region, inside
+/// [`MARGIN_BYTES`]. **The step is the file's length, not its blocks**: redb
+/// extends the file with `set_len`, which ext4, XFS and APFS leave sparse until
+/// pages are written (a probe saw a 4,096 MiB file with 2,594 MiB allocated), so
+/// on those the step over-counts what the volume gives up.
 ///
 /// **Checked against the measurement at 2,000,000 documents**
-/// (`examples/schema4_migration`): a 2,411 MiB file, one partial region, so at
-/// most 2,411 MiB of growth to 4,822 MiB. The file was seen at 4,096 MiB and
-/// no more: the doubling asked for one full region and 726 MiB beyond it, the
-/// allocations stayed in the full region, and the commit that followed gave the
-/// untouched partial region back (`try_shrink` removes a trailing region that
-/// is wholly free), so +1,685 MiB, inside the bound. At close the file went
-/// back to 2,415 MiB.
-///
-/// One step covers a migration whose working set fits the space that step
-/// adds; [`Plan::margin_bytes`] is asked for on top for the rest.
-pub(crate) fn worst_growth(file_bytes: u64) -> u64 {
+/// (`examples/schema4_migration`): a 2,411 MiB file, one partial region, so a
+/// step of 2,411 MiB. The file was seen at 4,096 MiB and no more: +1,685 MiB,
+/// inside the step, and back at 2,415 MiB when closed.
+pub(crate) fn growth_step(file_bytes: u64, largest_allocation: u64) -> u64 {
     let usable = file_bytes.saturating_sub(REDB_PAGE_BYTES);
+    let a = largest_allocation.max(REDB_PAGE_BYTES);
     if usable < REDB_REGION_BYTES {
-        return usable;
+        return usable.max(2 * a);
     }
     match usable % REDB_REGION_BYTES {
         0 => REDB_REGION_BYTES,
-        trailing => 2 * REDB_REGION_BYTES - trailing,
+        trailing => {
+            let rest = REDB_REGION_BYTES - trailing;
+            if 2 * a < rest { rest } else { rest + REDB_REGION_BYTES }
+        }
+    }
+}
+
+/// The allocation one leaf holding a single pair of `pair` bytes needs: redb
+/// allocates a power of two pages (`PageNumber::page_order`).
+fn allocation(pair: u64) -> u64 {
+    let pages = (pair + REDB_LEAF_HEADER).div_ceil(REDB_PAGE_BYTES);
+    REDB_PAGE_BYTES * pages.max(1).next_power_of_two()
+}
+
+/// The leaf bytes one pair of `pair` bytes takes when pairs are written in key
+/// order, as the staging table's are: as many pairs of its size as fit share a
+/// page, and a pair too large for one page takes an allocation of its own.
+fn leaf_bytes(pair: u64) -> u64 {
+    let room = REDB_PAGE_BYTES - REDB_LEAF_HEADER;
+    if pair <= room { REDB_PAGE_BYTES.div_ceil(room / pair.max(1)) } else { allocation(pair) }
+}
+
+/// What the re-key will stage, read from `DOCS` in one walk before
+/// `raise(5)`.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct Staged {
+    /// Rows under a number key: the rows the re-key moves, documents and
+    /// tombstones, purge-pending ranges included.
+    pub rows: u64,
+    /// The leaf bytes those rows take as the staging table holds them
+    /// ([`leaf_bytes`]).
+    pub bytes: u64,
+    /// The largest single allocation the migration makes: a leaf for the
+    /// largest row of `DOCS`, or for an index entry derived from it, whose key
+    /// is at most twice the value's bytes (a string key writes each zero byte as
+    /// two).
+    pub largest_allocation: u64,
+}
+
+/// What the start requires free, term by term ([`requirement`]).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct Requirement {
+    /// The file's next growth step ([`growth_step`]).
+    pub growth: u64,
+    /// The rows to re-key, once, and the chunks of them in flight.
+    pub staged_docs: u64,
+    /// The index entries the chunks in flight rewrite.
+    pub staged_index: u64,
+    /// [`MARGIN_BYTES`].
+    pub margin: u64,
+    /// The four together.
+    pub total: u64,
+}
+
+/// The free space the migration requires (B1 and M3 of the 0.51 build review):
+/// redb's next growth step for this file, the bytes the migration will stage,
+/// and a fixed margin. Nothing in it is the file's size over its document
+/// count: a store whose file is mostly oplog, or freed pages, or one whose
+/// documents are few, requires the step, its own rows and the margin.
+///
+/// - **Documents**: the rows to re-key ([`Staged`]), once. At the peak, the end
+///   of a range's first phase, they are in the file twice, the old rows' pages
+///   freed and the staged rows written; the old pages are already in the file,
+///   so the staged copy is what needs room. Beside it, the rewritten pages of
+///   [`CHUNKS_IN_FLIGHT`] chunks of `rekey_rows` rows, priced from the rows'
+///   own bytes.
+/// - **Index entries**: [`CHUNKS_IN_FLIGHT`] chunks of `index_chunk_bytes`,
+///   each up to twice its bytes in pages (inserted out of key order, a split
+///   leaf is two half-full pages), and never more than the entries `INDEX_ENTRIES`
+///   holds: a drain frees what a refill reuses, so what the index rebuild holds at
+///   once is per chunk, not per index.
+/// - **Margin**: [`MARGIN_BYTES`].
+///
+/// The chunk sizes are parameters so that a test pins the shipped 8,192 rows and
+/// 16 MiB against stores of 0, 2 and 2,000,000 documents.
+pub(crate) fn requirement(
+    file_bytes: u64,
+    staged: &Staged,
+    index_bytes: u64,
+    rekey_rows: usize,
+    index_chunk_bytes: usize,
+) -> Requirement {
+    let growth = growth_step(file_bytes, staged.largest_allocation);
+    let chunk = if staged.rows == 0 {
+        0
+    } else {
+        let rows = (rekey_rows as u64).min(staged.rows);
+        (u128::from(staged.bytes) * u128::from(rows) / u128::from(staged.rows)) as u64
+    };
+    let staged_docs = staged.bytes + CHUNKS_IN_FLIGHT * chunk;
+    let staged_index = 2 * CHUNKS_IN_FLIGHT * index_bytes.min(index_chunk_bytes as u64);
+    let margin = MARGIN_BYTES;
+    Requirement {
+        growth,
+        staged_docs,
+        staged_index,
+        margin,
+        total: growth + staged_docs + staged_index + margin,
     }
 }
 
@@ -362,20 +506,16 @@ impl IndexMark {
     }
 }
 
-/// One recorded collision: whether it was carried from the schema 3 -> 4
-/// rebuild and not found again, and the keys of the documents holding it, the
-/// one that revealed it last.
+/// One recorded collision: the keys of the documents holding it, the one that
+/// revealed it last.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub(crate) struct Collision {
-    /// Carried from a schema 3 -> 4 rebuild's record: its index key is in the
-    /// schema 4 form, and the refill has not found it again under that key.
-    pub(crate) carried: bool,
     pub(crate) holders: Vec<Vec<u8>>,
 }
 
 impl Collision {
-    fn encode(&self) -> Vec<u8> {
-        let mut out = vec![u8::from(self.carried)];
+    pub(crate) fn encode(&self) -> Vec<u8> {
+        let mut out = Vec::new();
         out.extend_from_slice(&(self.holders.len() as u32).to_be_bytes());
         for holder in &self.holders {
             out.extend_from_slice(&(holder.len() as u32).to_be_bytes());
@@ -386,7 +526,7 @@ impl Collision {
 
     pub(crate) fn decode(raw: &[u8]) -> Result<Self> {
         let bad = || corrupt_marker("a recorded collision");
-        let (&flags, mut rest) = raw.split_first().ok_or_else(bad)?;
+        let mut rest = raw;
         let u32_at = |rest: &mut &[u8]| -> Result<usize> {
             let (head, tail) = rest.split_at_checked(4).ok_or_else(bad)?;
             *rest = tail;
@@ -400,10 +540,10 @@ impl Collision {
             holders.push(holder.to_vec());
             rest = tail;
         }
-        if !rest.is_empty() || flags > 1 {
+        if !rest.is_empty() {
             return Err(bad());
         }
-        Ok(Self { carried: flags == 1, holders })
+        Ok(Self { holders })
     }
 
     /// Add `holders` that are not already named, in order.
@@ -442,8 +582,7 @@ pub(crate) struct Plan {
     pub ranges: u64,
     /// Ranges no collection stands over: a drop's rows still being purged.
     pub purge_pending: u64,
-    /// Every row of `DOCS`, tombstones included: an upper bound on the rows to
-    /// re-key, which are the numeric-id ones, read from redb's own count.
+    /// Every row of `DOCS`, tombstones included, read from redb's own count.
     pub docs_rows: u64,
     /// Indexes to rebuild.
     pub indexes: u64,
@@ -451,28 +590,15 @@ pub(crate) struct Plan {
     pub index_entries: u64,
     /// The store's file, in bytes.
     pub file_bytes: u64,
-    /// The most the file can grow by in one step ([`worst_growth`]).
-    pub growth_bytes: u64,
-    /// The free space the start requires, in bytes: that growth and
-    /// [`Plan::margin_bytes`].
+    /// What the re-key will stage.
+    pub staged: Staged,
+    /// `INDEX_ENTRIES`'s bytes as a chunk counts them, read up to one chunk's
+    /// worth: all the bound on index chunks needs.
+    pub index_bytes: u64,
+    /// The free space the start requires, term by term ([`requirement`]).
+    pub need: Requirement,
+    /// The free space the start requires, in bytes: `need.total`.
     pub required_bytes: u64,
-}
-
-impl Plan {
-    /// The working set chunks can add to the file before the pages they free
-    /// are reused: every chunk commits durably ([`commit`]), so the pages one
-    /// chunk frees are free for the chunk after the next, and at most a few
-    /// chunks' pages are in flight. Each chunk's own rows written twice (copy
-    /// on write of the tree's pages, and the staging or index pages it adds),
-    /// for the larger chunk of the two kinds, four times over. A row's
-    /// footprint is estimated as the file's size over its documents, which
-    /// over-counts (the file holds the indexes too).
-    fn margin_bytes(docs_rows: u64, file_bytes: u64) -> u64 {
-        let per_row = file_bytes / docs_rows.max(1);
-        let rekey = REKEY_CHUNK_ROWS as u64 * per_row * 2;
-        let index = INDEX_CHUNK_BYTES as u64 * 2;
-        4 * rekey.max(index)
-    }
 }
 
 /// Plan the migration and refuse to start, writing nothing, if the free space
@@ -481,16 +607,17 @@ impl Plan {
 /// opens; a refusal of an interrupted migration (`found` 5) leaves it for this
 /// build to resume once there is room.
 ///
-/// **The figure** (design 6.1 step 0): drain-then-refill and move-then-delete
-/// reuse the pages they free after each durable commit, so the file needs room
-/// for at most one of redb's growth steps, which [`worst_growth`] computes from
-/// the file's length, and a small working set, from the tables' own row counts
-/// and the file's size, not from the document count times 80 bytes
-/// `PartialRebuildPlan` used (which under-counted a multikey index). Every
-/// figure is read without a walk: a preflight that read the store would cost a
-/// cold store its size in seconds before saying a word.
+/// **The figure** ([`requirement`]): redb's next growth step for the file, the
+/// rows the re-key stages, the index chunks in flight and a fixed margin.
+/// Drain-then-refill and move-then-delete reuse the pages they free after each
+/// durable commit, so nothing larger is held at once. The rows' bytes are read
+/// in one walk of `DOCS` (redb keeps no per-range figure, and its own
+/// `TableStats` walks every page too), looking for a stop as a chunk would;
+/// `INDEX_ENTRIES` is read only up to one chunk's bytes.
 pub(crate) fn preflight(db: &Database, path: &std::path::Path, found: u8) -> Result<Plan> {
     let plan = plan(db, path)?;
+    #[cfg(test)]
+    hooks::LAST_PLAN.with(|p| *p.borrow_mut() = Some(plan.clone()));
     let free = free_bytes(path);
     info!(
         collections = plan.collections,
@@ -500,7 +627,11 @@ pub(crate) fn preflight(db: &Database, path: &std::path::Path, found: u8) -> Res
         indexes = plan.indexes,
         index_entries = plan.index_entries,
         file_mib = plan.file_bytes >> 20,
-        growth_mib = plan.growth_bytes >> 20,
+        rows_to_rekey = plan.staged.rows,
+        growth_mib = plan.need.growth >> 20,
+        staged_documents_mib = plan.need.staged_docs >> 20,
+        staged_index_mib = plan.need.staged_index >> 20,
+        margin_mib = plan.need.margin >> 20,
         required_free_mib = plan.required_bytes >> 20,
         free_mib = free.map(|f| f >> 20),
         estimate_secs = estimate_secs(&plan),
@@ -524,13 +655,17 @@ pub(crate) fn preflight(db: &Database, path: &std::path::Path, found: u8) -> Res
                 needed: plan.required_bytes,
                 free,
                 detail: format!(
-                    "beside {} ({} MiB): at most {} MiB for one of redb's growth steps from that \
-                     size, and {} MiB of working set. {state}. Free space, or grow the volume, \
-                     and start again",
+                    "beside {} ({} MiB): {} MiB for redb's next growth step from that size, {} \
+                     MiB for the {} documents and tombstones re-keyed through a staging table, {} \
+                     MiB for the index chunks in flight and a {} MiB margin. {state}. Free \
+                     space, or grow the volume, and start again",
                     path.display(),
                     plan.file_bytes >> 20,
-                    plan.growth_bytes >> 20,
-                    (plan.required_bytes - plan.growth_bytes) >> 20,
+                    plan.need.growth >> 20,
+                    plan.need.staged_docs >> 20,
+                    plan.staged.rows,
+                    plan.need.staged_index >> 20,
+                    plan.need.margin >> 20,
                 ),
             })
         }
@@ -546,8 +681,9 @@ pub(crate) fn preflight(db: &Database, path: &std::path::Path, found: u8) -> Res
     }
 }
 
-/// The plan, read in one transaction with no walk: redb's row counts, one seek
-/// per collection-id range, and the collection registry.
+/// The plan, read in one transaction: redb's row counts, one seek per
+/// collection-id range, the collection registry, one walk of `DOCS` for what the
+/// re-key stages, and `INDEX_ENTRIES` up to one chunk's bytes.
 fn plan(db: &Database, path: &std::path::Path) -> Result<Plan> {
     let txn = db.begin_read()?;
     let collections = txn.open_table(tables::COLLECTIONS)?;
@@ -568,10 +704,76 @@ fn plan(db: &Database, path: &std::path::Path) -> Result<Plan> {
     }
     plan.docs_rows = docs.len()?;
     plan.index_entries = entries.len()?;
-    plan.file_bytes = std::fs::metadata(path).map(|m| m.len()).unwrap_or(0);
-    plan.growth_bytes = worst_growth(plan.file_bytes);
-    plan.required_bytes = plan.growth_bytes + Plan::margin_bytes(plan.docs_rows, plan.file_bytes);
+    plan.file_bytes = file_bytes(path);
+    plan.staged = staged(&docs, plan.docs_rows)?;
+    plan.index_bytes = index_bytes_upto(&entries, chunk_bytes() as u64)?;
+    plan.need =
+        requirement(plan.file_bytes, &plan.staged, plan.index_bytes, chunk_rows(), chunk_bytes());
+    plan.required_bytes = plan.need.total;
     Ok(plan)
+}
+
+/// The store's length; a test can say another.
+fn file_bytes(path: &std::path::Path) -> u64 {
+    #[cfg(test)]
+    if let Some(len) = hooks::FILE_BYTES.with(std::cell::Cell::get) {
+        return len;
+    }
+    std::fs::metadata(path).map(|m| m.len()).unwrap_or(0)
+}
+
+/// What the re-key will stage: one walk of `DOCS`, the rows under a number key
+/// priced as the staging table holds them, and the largest allocation over
+/// every row. On `/readyz` as `migrating`, `done` of `total` rows read, and
+/// looking for a stop every 4,096 rows: nothing is written yet, and on a cold
+/// store the walk reads the documents' pages from disk: 49 s for the
+/// 2,000,000-document acceptance store just copied, on a laptop busy with
+/// other builds, against 0.4 s for a store of that size just written.
+fn staged<T>(docs: &T, rows: u64) -> Result<Staged>
+where
+    T: ReadableTable<(u64, &'static [u8]), &'static [u8]>,
+{
+    crate::open_progress::set_open_phase_of(crate::open_progress::OpenPhase::Migrating, rows);
+    let mut staged = Staged::default();
+    let mut largest = 0u64;
+    for (n, row) in docs.iter()?.enumerate() {
+        if n % 4_096 == 4_095 {
+            crate::open_progress::set_open_done(n as u64 + 1);
+            if stop_requested() {
+                return Err(StorageError::Stopping(crate::StopReason::Shutdown));
+            }
+        }
+        let (key, value) = row?;
+        let stored = key.value().1;
+        let pair = stored.len() as u64 + value.value().len() as u64 + DOCS_ROW_OVERHEAD;
+        largest = largest.max(pair);
+        if stored.starts_with(NUMBER_TAG) {
+            staged.rows += 1;
+            staged.bytes += leaf_bytes(pair);
+        }
+    }
+    staged.largest_allocation = if largest == 0 { 0 } else { allocation(2 * largest) };
+    crate::open_progress::set_open_done(rows);
+    Ok(staged)
+}
+
+/// `INDEX_ENTRIES`'s bytes as the refill's chunk counts them, read from the
+/// start until they reach `cap`: the index bound is per chunk, so the rest is
+/// never needed.
+fn index_bytes_upto<T>(entries: &T, cap: u64) -> Result<u64>
+where
+    T: ReadableTable<tables::IndexKey<'static>, ()>,
+{
+    let mut bytes = 0u64;
+    for row in entries.iter()? {
+        if bytes >= cap {
+            break;
+        }
+        let (entry, _) = row?;
+        let (_, _, key, doc_key) = entry.value();
+        bytes += INDEX_ENTRY_OVERHEAD + key.len() as u64 + doc_key.len() as u64;
+    }
+    Ok(bytes)
 }
 
 /// Seconds the migration is expected to take, from the measured per-row costs
@@ -696,8 +898,9 @@ pub(crate) fn begin(db: &Database, found: u8) -> Result<()> {
             Ok(_) | Err(redb::TableError::TableDoesNotExist(_)) => {}
             Err(e) => return Err(e.into()),
         }
-        let mut collisions = txn.open_table(COLLISIONS)?;
-        carry_partial_rebuilt_violations(&txn, &mut collisions)?;
+        let _ = txn.open_table(COLLISIONS)?;
+        let mut carried = txn.open_table(CARRIED_COLLISIONS)?;
+        carry_partial_rebuilt_violations(&txn, &mut carried)?;
         let _ = txn.open_table(DOCS_REKEYED)?;
         let docs = txn.open_table(tables::DOCS)?;
         let mut phases = txn.open_table(RANGE_PHASES)?;
@@ -725,9 +928,9 @@ pub(crate) fn begin(db: &Database, found: u8) -> Result<()> {
     commit(txn)
 }
 
-/// Move the schema 3 -> 4 rebuild's unreported collisions into [`COLLISIONS`],
-/// their holders converted to schema 5 keys, and delete their table (design
-/// 6.1 step 1, review v2.2 M1).
+/// Move the schema 3 -> 4 rebuild's unreported collisions into
+/// [`CARRIED_COLLISIONS`], their holders converted to schema 5 keys, and delete
+/// their table (design 6.1 step 1, review v2.2 M1).
 ///
 /// Carried, not deleted: they exist exactly in the window between that
 /// rebuild's last commit and its report, and the invariant they serve is that a
@@ -735,12 +938,11 @@ pub(crate) fn begin(db: &Database, found: u8) -> Result<()> {
 /// holder key is still genuinely schema 4, where [`kimmy_core::legacy_key::decode_v1`]
 /// is exact: left as they were, they would be compared with the refill's
 /// schema 5 holders and never match, or, by the pair the module documentation
-/// names, name another document. The index key is kept as recorded and the row
-/// marked carried; the last commit settles it against what the refill found
-/// ([`settle_carried`]).
+/// names, name another document. The index key is kept as recorded; the last
+/// commit settles the row against what the refill found ([`settle_carried`]).
 fn carry_partial_rebuilt_violations(
     txn: &WriteTransaction,
-    collisions: &mut redb::Table<'_, (u64, u32, &'static [u8]), &'static [u8]>,
+    carried: &mut redb::Table<'_, (u64, u32, &'static [u8]), &'static [u8]>,
 ) -> Result<()> {
     let recorded: Vec<((u64, u32), Vec<u8>)> = match txn.open_table(PARTIAL_REBUILT_VIOLATIONS) {
         Ok(table) => table
@@ -769,12 +971,12 @@ fn carry_partial_rebuilt_violations(
                 .map(|holder| stored_of_v1(holder))
                 .collect::<Result<Vec<_>>>()?;
             let key = (coll, index, violation.key.as_slice());
-            let mut row = match collisions.get(key)? {
+            let mut row = match carried.get(key)? {
                 Some(raw) => Collision::decode(raw.value())?,
-                None => Collision { carried: true, holders: Vec::new() },
+                None => Collision::default(),
             };
             row.hold(holders);
-            collisions.insert(key, row.encode().as_slice())?;
+            carried.insert(key, row.encode().as_slice())?;
         }
     }
     match txn.delete_table(PARTIAL_REBUILT_VIOLATIONS) {
@@ -813,6 +1015,7 @@ struct Run {
     /// index's drain, a collection's refill): its kind, how far it is, its
     /// total, whether that total is exact, and where the step began.
     kind: Kind,
+    label: &'static str,
     done: u64,
     total: u64,
     exact: bool,
@@ -824,6 +1027,9 @@ struct Run {
     /// kept count.
     fallback: u64,
 }
+
+/// The label of a TTL index's count, a step of its own before its drain.
+const TTL_COUNT_STEP: &str = "counting a TTL index's selection";
 
 /// The four kinds of chunk, as [`Run::rows`] and [`Run::spent`] index them.
 #[derive(Clone, Copy, Debug)]
@@ -869,6 +1075,7 @@ impl Run {
     /// it.
     fn step(&mut self, kind: Kind, total: u64, done: u64, exact: bool) {
         self.kind = kind;
+        self.label = kind.label();
         self.exact = exact;
         self.done = done;
         self.total = total.max(self.floor());
@@ -893,7 +1100,7 @@ impl Run {
         crate::open_progress::set_open_total(self.total);
         #[cfg(test)]
         hooks::step_ended(hooks::StepSeen {
-            kind: self.kind.label(),
+            kind: self.label,
             collection: coll.to_owned(),
             index: index.map(str::to_owned),
             exact: self.exact,
@@ -903,6 +1110,25 @@ impl Run {
         });
         #[cfg(not(test))]
         let _ = (coll, index);
+    }
+
+    /// Begin a TTL index's count of what the exact comparator changed (design
+    /// 2.6) as its own step on `/readyz`, in the `draining` phase it precedes:
+    /// documents scanned against the collection's live documents, an estimate
+    /// (tombstones are scanned too) that [`Run::end_step`] finalizes.
+    fn count_step(&mut self, coll: u64) {
+        self.step(Kind::Drain, self.documents_of(coll), 0, false);
+        self.label = TTL_COUNT_STEP;
+    }
+
+    /// One more document scanned by the step [`Run::count_step`] began.
+    fn scanned(&mut self) {
+        self.done += 1;
+        if self.total < self.floor() {
+            self.total = self.floor();
+            crate::open_progress::set_open_total(self.total);
+        }
+        crate::open_progress::set_open_done(self.done);
     }
 
     /// Count `n` rows of `kind`, `spent` on them, in the step's progress, and
@@ -1000,6 +1226,7 @@ pub(crate) fn run(db: &Database, plan: &Plan) -> Result<()> {
         rows: [0; 4],
         spent: [Duration::ZERO; 4],
         kind: Kind::RekeyA,
+        label: Kind::RekeyA.label(),
         done: 0,
         total: 0,
         exact: true,
@@ -1223,6 +1450,14 @@ fn chunk_bytes() -> usize {
     INDEX_CHUNK_BYTES
 }
 
+fn refill_chunk_time() -> Duration {
+    #[cfg(test)]
+    if let Some(time) = hooks::REFILL_TIME.with(std::cell::Cell::get) {
+        return time;
+    }
+    REFILL_CHUNK_TIME
+}
+
 fn write_index(txn: &WriteTransaction, coll: u64, index: u32, mark: &IndexMark) -> Result<()> {
     txn.open_table(INDEX_STEPS)?.insert((coll, index), mark.encode().as_slice())?;
     Ok(())
@@ -1272,24 +1507,28 @@ fn drain(db: &Database, run: &mut Run, meta: &CollectionMeta, index: &IndexMeta)
         if !matches!(mark.step, Step::Pending | Step::Draining) {
             return Ok(());
         }
+        // A TTL partial index's count, once, before its first chunk: the
+        // entries the drain removes are the previous build's selection. Only a
+        // partial filter can decide a document differently under the exact
+        // comparator, so a TTL index without one has nothing to count.
+        let counted =
+            if mark.step == Step::Pending && index.is_ttl() && index.partial_filter.is_some() {
+                Some(match mark.ttl {
+                    TtlCount::NotRecorded => TtlCount::NotRecorded,
+                    _ => {
+                        let (now_selected, now_unselected) =
+                            ttl_selection_changes(db, run, meta, index)?;
+                        TtlCount::Counted(now_selected, now_unselected)
+                    }
+                })
+            } else {
+                None
+            };
         if !stepping {
             let left = entries_left(db, meta, index)?;
             run.step(Kind::Drain, mark.drained + left, mark.drained, true);
             stepping = true;
         }
-        // A TTL index's count, once, before its first chunk: the entries the
-        // drain removes are the previous build's selection.
-        let counted = if mark.step == Step::Pending && index.is_ttl() {
-            Some(match mark.ttl {
-                TtlCount::NotRecorded => TtlCount::NotRecorded,
-                _ => {
-                    let (now_selected, now_unselected) = ttl_selection_changes(db, meta, index)?;
-                    TtlCount::Counted(now_selected, now_unselected)
-                }
-            })
-        } else {
-            None
-        };
         let started = Instant::now();
         let txn = db.begin_write()?;
         let (removed, empty) = {
@@ -1384,6 +1623,7 @@ fn entries_left(db: &Database, meta: &CollectionMeta, index: &IndexMeta) -> Resu
 /// whose selection did not change is in neither count.
 fn ttl_selection_changes(
     db: &Database,
+    run: &mut Run,
     meta: &CollectionMeta,
     index: &IndexMeta,
 ) -> Result<(u64, u64)> {
@@ -1394,10 +1634,14 @@ fn ttl_selection_changes(
     let docs = txn.open_table(tables::DOCS)?;
     let entries = txn.open_table(tables::INDEX_ENTRIES)?;
     let (mut now_selected, mut now_unselected) = (0u64, 0u64);
+    // A full scan of the collection: its own step on `/readyz`, moving with
+    // every document.
+    run.count_step(meta.id.0);
     for (n, row) in docs.range(crate::engine::doc_range(meta.id))?.enumerate() {
         if n % 4_096 == 0 && stop_requested() {
             return Err(StorageError::Stopping(crate::StopReason::Shutdown));
         }
+        run.scanned();
         let (key, value) = row?;
         let record = codec::decode_doc_record(value.value())?;
         let Some(doc) = record.document()? else { continue };
@@ -1416,6 +1660,7 @@ fn ttl_selection_changes(
             _ => {}
         }
     }
+    run.end_step(&meta.name, Some(&index.name));
     Ok((now_selected, now_unselected))
 }
 
@@ -1490,7 +1735,17 @@ fn refill(
             let mut last: Option<Vec<u8>> = None;
             let mut exhausted = true;
             for row in docs.range(crate::engine::doc_range_after(meta.id, from.as_deref()))? {
-                if bytes >= chunk_bytes() {
+                // A chunk ends on the entries it wrote, the documents it
+                // walked or the time it worked, whichever comes first: a
+                // sparse partial index, or a run of tombstones, writes
+                // nothing for as long as it lasts, and bounded by bytes alone
+                // one chunk walked the whole collection, with no stop looked
+                // for and no progress shown.
+                if walked > 0
+                    && (bytes >= chunk_bytes()
+                        || walked >= chunk_rows() as u64
+                        || started.elapsed() >= refill_chunk_time())
+                {
                     exhausted = false;
                     break;
                 }
@@ -1528,7 +1783,6 @@ fn refill(
                                                 Collision::default()
                                             }
                                         };
-                                        found.carried = false;
                                         found.hold(others.into_iter().chain([doc_key.to_vec()]));
                                         collisions.insert(row, found.encode().as_slice())?;
                                     }
@@ -1599,8 +1853,9 @@ fn refill(
 }
 
 /// The last commit (design 6.1 step 5): every marker and the staging table go,
-/// the carried collisions are settled ([`settle_carried`]), and the collision
-/// table goes too if that leaves nothing to report. The markers' absence is
+/// the carried collisions are settled and their table goes
+/// ([`settle_carried`]), and the collision table goes too if the refill
+/// recorded nothing in it. The markers' absence is
 /// what "finished" means, so this checks first that every range and every index
 /// is done, and that the staging table is empty.
 fn finish(db: &Database) -> Result<()> {
@@ -1632,6 +1887,7 @@ fn finish(db: &Database) -> Result<()> {
         }
     }
     let dissolved = settle_carried(&txn)?;
+    txn.delete_table(CARRIED_COLLISIONS)?;
     txn.delete_table(RANGE_PHASES)?;
     txn.delete_table(INDEX_STEPS)?;
     txn.delete_table(DOCS_REKEYED)?;
@@ -1670,24 +1926,23 @@ struct Dissolved {
 /// The refill checked every entry of every index under the final comparator,
 /// so it has found every collision that exists. A carried row whose holders a
 /// row the refill recorded in the same index includes is that collision found
-/// again under the schema 5 form of its key: dropped, so it is reported once. A
-/// carried row no refill row covers names documents that no longer collide
-/// (the exact comparator dissolved it, as a decimal `$gte` that ranked equal to
-/// every number does): dropped too, since reporting it would report a
-/// violation that does not exist, and named in one line each. So a carried row
-/// is never reported itself; what carrying it guarantees is that nothing it
-/// recorded can be lost before this point.
+/// again, under the schema 5 form of its key or under the same bytes: it is
+/// reported once, as the refill's row. A carried row no refill row covers names
+/// documents that no longer all collide (the exact comparator dissolved it, as
+/// a decimal `$gte` that ranked equal to every number does): not reported,
+/// since that would report a violation that does not exist, and named in one
+/// line each; whatever collision stands among some of its holders is a refill
+/// row of its own. So a carried row is never reported itself; what carrying it
+/// guarantees is that nothing it recorded can be lost before this point. The
+/// caller deletes the table in the same commit.
 fn settle_carried(txn: &WriteTransaction) -> Result<Vec<Dissolved>> {
-    let mut collisions = txn.open_table(COLLISIONS)?;
-    #[allow(clippy::type_complexity)]
-    let mut by_index: BTreeMap<(u64, u32), Vec<(Vec<u8>, Collision)>> = BTreeMap::new();
+    let carried = txn.open_table(CARRIED_COLLISIONS)?;
+    let collisions = txn.open_table(COLLISIONS)?;
+    let mut found: HashMap<(u64, u32), Vec<Collision>> = HashMap::new();
     for row in collisions.iter()? {
         let (key, value) = row?;
-        let (coll, index, k) = key.value();
-        by_index
-            .entry((coll, index))
-            .or_default()
-            .push((k.to_vec(), Collision::decode(value.value())?));
+        let (coll, index, _) = key.value();
+        found.entry((coll, index)).or_default().push(Collision::decode(value.value())?);
     }
     let mut metas = HashMap::new();
     for row in txn.open_table(tables::COLLECTIONS)?.iter()? {
@@ -1697,39 +1952,39 @@ fn settle_carried(txn: &WriteTransaction) -> Result<Vec<Dissolved>> {
     }
     let docs = txn.open_table(tables::DOCS)?;
     let mut dissolved = Vec::new();
-    for ((coll, index), rows) in by_index {
-        for (key, carried) in rows.iter().filter(|(_, c)| c.carried) {
-            collisions.remove((coll, index, key.as_slice()))?;
-            let found_again = rows
-                .iter()
-                .any(|(_, c)| !c.carried && carried.holders.iter().all(|h| c.holders.contains(h)));
-            if found_again {
-                continue;
-            }
-            let meta = metas.get(&coll);
-            let holders = carried
-                .holders
-                .iter()
-                .map(|holder| {
-                    let id = docs
-                        .get((coll, holder.as_slice()))?
-                        .map(|raw| codec::decode_doc_record(raw.value()))
-                        .transpose()?
-                        .and_then(|record| record.document().ok().flatten())
-                        .and_then(|doc| doc.get("_id").cloned())
-                        .and_then(|id| kimmy_core::DocId::try_from_bson(&id).ok());
-                    Ok(id.map_or_else(|| format!("{holder:02x?}"), |id| id.to_string()))
-                })
-                .collect::<Result<Vec<_>>>()?;
-            dissolved.push(Dissolved {
-                db: meta.map_or_else(String::new, |m| m.db.clone()),
-                collection: meta.map_or_else(|| format!("(id {coll})"), |m| m.name.clone()),
-                index: meta
-                    .and_then(|m| m.index_by_id(index))
-                    .map_or_else(|| format!("(id {index})"), |i| i.name.clone()),
-                holders,
-            });
+    for row in carried.iter()? {
+        let (key, value) = row?;
+        let (coll, index, _) = key.value();
+        let row = Collision::decode(value.value())?;
+        let found_again = found.get(&(coll, index)).is_some_and(|rows| {
+            rows.iter().any(|c| row.holders.iter().all(|h| c.holders.contains(h)))
+        });
+        if found_again {
+            continue;
         }
+        let meta = metas.get(&coll);
+        let holders = row
+            .holders
+            .iter()
+            .map(|holder| {
+                let id = docs
+                    .get((coll, holder.as_slice()))?
+                    .map(|raw| codec::decode_doc_record(raw.value()))
+                    .transpose()?
+                    .and_then(|record| record.document().ok().flatten())
+                    .and_then(|doc| doc.get("_id").cloned())
+                    .and_then(|id| kimmy_core::DocId::try_from_bson(&id).ok());
+                Ok(id.map_or_else(|| format!("{holder:02x?}"), |id| id.to_string()))
+            })
+            .collect::<Result<Vec<_>>>()?;
+        dissolved.push(Dissolved {
+            db: meta.map_or_else(String::new, |m| m.db.clone()),
+            collection: meta.map_or_else(|| format!("(id {coll})"), |m| m.name.clone()),
+            index: meta
+                .and_then(|m| m.index_by_id(index))
+                .map_or_else(|| format!("(id {index})"), |i| i.name.clone()),
+            holders,
+        });
     }
     Ok(dissolved)
 }
@@ -1738,7 +1993,8 @@ fn settle_carried(txn: &WriteTransaction) -> Result<Vec<Dissolved>> {
 /// collection, resolved against the metadata as it stands. Read on every open,
 /// not only one that migrates: the table outlives the migration's last commit,
 /// so a crash before the report leaves rows for the next open. Carried rows are
-/// settled by the last commit ([`settle_carried`]) and none is left to read.
+/// in a table of their own, settled and deleted by the last commit
+/// ([`settle_carried`]).
 pub(crate) fn recorded_collisions(db: &Database) -> Result<crate::migrate::Unreported> {
     let txn = db.begin_read()?;
     let table = match txn.open_table(COLLISIONS) {
@@ -1773,7 +2029,6 @@ pub(crate) fn recorded_collisions(db: &Database) -> Result<crate::migrate::Unrep
         let Some(index) = meta.index_by_id(index) else { continue };
         let violations: Vec<crate::index::UniqueViolation> = rows
             .iter()
-            .filter(|(_, c)| !c.carried)
             .map(|(key, c)| crate::index::UniqueViolation {
                 index: index.name.clone(),
                 key: key.clone(),
@@ -1791,8 +2046,19 @@ pub(crate) fn recorded_collisions(db: &Database) -> Result<crate::migrate::Unrep
     Ok(out)
 }
 
-/// Forget the recorded collisions once they are reported.
+/// Forget the recorded collisions once a report pass has succeeded, whatever it
+/// reported: a table holding only rows nothing is left to report them against
+/// (a collection or an index dropped since) would otherwise stay for good. No
+/// commit where there is no table, so an open with nothing recorded writes
+/// nothing.
 pub(crate) fn forget_collisions(db: &Database) -> Result<()> {
+    let held = {
+        let txn = db.begin_read()?;
+        txn.list_tables()?.any(|t| t.name() == COLLISIONS.name())
+    };
+    if !held {
+        return Ok(());
+    }
     let txn = db.begin_write()?;
     match txn.delete_table(COLLISIONS) {
         Ok(_) | Err(redb::TableError::TableDoesNotExist(_)) => {}
@@ -1828,6 +2094,9 @@ pub(crate) mod hooks {
         pub(crate) static REKEY_ROWS: Cell<Option<usize>> = const { Cell::new(None) };
         pub(crate) static INDEX_BYTES: Cell<Option<usize>> = const { Cell::new(None) };
         pub(crate) static FREE: Cell<Option<u64>> = const { Cell::new(None) };
+        pub(crate) static FILE_BYTES: Cell<Option<u64>> = const { Cell::new(None) };
+        pub(crate) static REFILL_TIME: Cell<Option<Duration>> = const { Cell::new(None) };
+        pub(crate) static LAST_PLAN: RefCell<Option<super::Plan>> = const { RefCell::new(None) };
         static TIMINGS: Cell<Option<([Duration; 4], [u64; 4])>> = const { Cell::new(None) };
         static WATCHED: RefCell<Option<(std::path::PathBuf, u64)>> = const { RefCell::new(None) };
         static CHUNKS: RefCell<Vec<ChunkSeen>> = const { RefCell::new(Vec::new()) };
