@@ -14,7 +14,7 @@
 //! `serde_json` with the features the release binary gets, and the hard cases
 //! below fail without the declaration. A workspace-wide run unifies features
 //! across every crate's dev-dependencies and would pass regardless, which is
-//! what the declaration guard is for.
+//! what the declaration guard in `kimmy-api`'s `json` tests is for.
 
 use bson::Bson;
 
@@ -50,35 +50,4 @@ fn a_hard_json_float_reaches_the_document_with_its_exact_bits() {
             other => panic!("{text} became {other:?}"),
         }
     }
-}
-
-/// The declaration itself, so a workspace-wide test run, whose feature
-/// unification hides its loss, still sees it go; and every crate takes
-/// `serde_json` from the workspace, so it gets the feature.
-#[test]
-fn the_workspace_declares_serde_jsons_float_roundtrip_and_every_crate_inherits_it() {
-    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
-    let manifest = std::fs::read_to_string(root.join("Cargo.toml")).unwrap();
-    let declaration = manifest
-        .lines()
-        .find(|l| l.starts_with("serde_json = "))
-        .expect("serde_json is a workspace dependency");
-    assert!(declaration.contains("\"float_roundtrip\""), "{declaration}");
-    assert!(declaration.contains("\"preserve_order\""), "{declaration}");
-
-    let mut checked = 0;
-    for entry in std::fs::read_dir(root.join("crates")).unwrap() {
-        let path = entry.unwrap().path().join("Cargo.toml");
-        let Ok(text) = std::fs::read_to_string(&path) else { continue };
-        for line in text.lines().filter(|l| l.trim_start().starts_with("serde_json")) {
-            assert_eq!(
-                line.trim(),
-                "serde_json.workspace = true",
-                "{}: serde_json must come from the workspace, with its features",
-                path.display()
-            );
-            checked += 1;
-        }
-    }
-    assert!(checked >= 8, "premise: {checked} crates declare serde_json");
 }

@@ -561,8 +561,9 @@ mod tests {
     /// A JSON number becomes the double it denotes, to the last bit: the edge
     /// relies on `serde_json`'s `float_roundtrip` feature, declared in the
     /// workspace. This crate's own tests get the feature from `jsonschema`
-    /// too, so they cannot see the declaration go; `kimmyd/tests/json_floats.rs`
-    /// can, and holds the same cases.
+    /// too, so they cannot see the declaration go (the guard below can);
+    /// `kimmyd/tests/json_floats.rs`, built without `jsonschema`, holds the
+    /// same cases where the loss shows.
     #[test]
     fn a_json_number_is_the_double_it_denotes_to_the_last_bit() {
         for (text, bits) in [
@@ -576,6 +577,38 @@ mod tests {
                 other => panic!("{text}: {other:?}"),
             }
         }
+    }
+
+    /// The declaration the edge's float parsing rests on, read from the
+    /// workspace manifest, so a workspace-wide test run, whose feature
+    /// unification hides its loss, still sees it go; and every crate takes
+    /// `serde_json` from the workspace, so every one gets the feature.
+    #[test]
+    fn the_workspace_declares_serde_jsons_float_roundtrip_and_every_crate_inherits_it() {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let manifest = std::fs::read_to_string(root.join("Cargo.toml")).unwrap();
+        let declaration = manifest
+            .lines()
+            .find(|l| l.starts_with("serde_json = "))
+            .expect("serde_json is a workspace dependency");
+        assert!(declaration.contains("\"float_roundtrip\""), "{declaration}");
+        assert!(declaration.contains("\"preserve_order\""), "{declaration}");
+
+        let mut checked = 0;
+        for entry in std::fs::read_dir(root.join("crates")).unwrap() {
+            let path = entry.unwrap().path().join("Cargo.toml");
+            let Ok(text) = std::fs::read_to_string(&path) else { continue };
+            for line in text.lines().filter(|l| l.trim_start().starts_with("serde_json")) {
+                assert_eq!(
+                    line.trim(),
+                    "serde_json.workspace = true",
+                    "{}: serde_json must come from the workspace, with its features",
+                    path.display()
+                );
+                checked += 1;
+            }
+        }
+        assert!(checked >= 8, "premise: {checked} crates declare serde_json");
     }
 
     #[test]

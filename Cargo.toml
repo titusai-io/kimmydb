@@ -96,7 +96,9 @@ serde = { version = "1", features = ["derive"] }
 # instead of the largest subnormal), so a client's double was stored as a
 # different double. It used to arrive only through `jsonschema`, a
 # dev-dependency, which turned it on for `kimmy-api`'s tests and not for the
-# shipped `kimmyd`. `kimmyd/tests/json_floats.rs` holds both to it.
+# shipped `kimmyd`. `kimmyd/tests/json_floats.rs` pins hard cases in a build
+# without `jsonschema`, and a guard in `kimmy-api`'s `json` tests holds this
+# line.
 serde_json = { version = "1", features = ["preserve_order", "float_roundtrip"] }
 # Encodes a `Vec<u8>` as BSON binary rather than as an array of int32s, which is
 # what serde does by default and what made every replicated document twelve times
