@@ -169,19 +169,41 @@ pub fn integer_part(d: &Decimal128) -> Option<IntegerPart> {
 }
 
 /// Pack a normalised pair back into BID, padding the coefficient with zeros when
-/// the exponent is above `MAX_EXPONENT`.
+/// the exponent is above `MAX_EXPONENT`, or `None` if no `Decimal128` holds it.
 ///
 /// Normalising can leave BID's exponent range (`1E+6144` normalises to `c = 1`,
 /// `e = 6144`). Packed straight in, the biased exponent's top two bits are `11`,
 /// the large-coefficient form, which decodes as a non-canonical zero. The
-/// re-padded form `(c × 10^(e − 6111), 6111)` always fits, because the value
-/// being packed was a `Decimal128` to begin with.
-pub fn pack_padded(negative: bool, mut coefficient: u128, mut exponent: i16) -> Decimal128 {
-    while exponent > MAX_EXPONENT {
-        coefficient *= 10;
-        exponent -= 1;
-    }
-    pack(negative, coefficient, exponent)
+/// re-padded form `(c × 10^(e − 6111), 6111)` fits exactly when the pair was a
+/// `Decimal128`'s to begin with ([`representable`]); for any other pair, such as
+/// one read from a corrupt or hostile byte string, the padding is checked, never
+/// wrapped, and the answer is `None`.
+pub fn pack_padded(negative: bool, coefficient: u128, exponent: i16) -> Option<Decimal128> {
+    let pad = u32::try_from(i32::from(exponent) - i32::from(MAX_EXPONENT)).unwrap_or(0);
+    let coefficient = coefficient.checked_mul(10u128.checked_pow(pad)?)?;
+    let exponent = exponent.min(MAX_EXPONENT);
+    ((1..=MAX_COEFFICIENT).contains(&coefficient) && exponent >= MIN_EXPONENT)
+        .then(|| pack(negative, coefficient, exponent))
+}
+
+/// The number of decimal digits of `c` (zero has none).
+pub fn digits(c: u128) -> u32 {
+    c.checked_ilog10().map_or(0, |log| log + 1)
+}
+
+/// Whether a `Decimal128` holds the normalised pair `(c, e)`: `c` has no
+/// trailing zero digit, `1 <= c <= 10^34 − 1`.
+///
+/// Exactly when `e >= −6176` and `e + digits(c) <= 6111 + 34`. A `Decimal128`
+/// holding it is `(c · 10^z, e − z)` for some `z >= 0` with `c · 10^z` at most
+/// 34 digits (`z <= 34 − digits(c)`) and `−6176 <= e − z <= 6111`; such a `z`
+/// exists exactly when `max(0, e − 6111) <= min(34 − digits(c), e + 6176)`,
+/// which is those two conditions.
+pub fn representable(coefficient: u128, exponent: i16) -> bool {
+    (1..=MAX_COEFFICIENT).contains(&coefficient)
+        && !coefficient.is_multiple_of(10)
+        && exponent >= MIN_EXPONENT
+        && i32::from(exponent) + digits(coefficient) as i32 <= i32::from(MAX_EXPONENT) + 34
 }
 
 #[cfg(test)]
@@ -385,13 +407,61 @@ mod tests {
     }
 
     #[test]
+    fn padding_a_pair_no_decimal_holds_is_refused_not_wrapped() {
+        // At the edge: `1E+6144` and `9.99…E+6144` pad to fit; one digit or one
+        // power more does not, and a coefficient whose padding would overflow a
+        // `u128` is refused rather than wrapped into a wrong value.
+        assert!(pack_padded(false, 1, 6144).is_some());
+        assert!(pack_padded(false, MAX_COEFFICIENT, MAX_EXPONENT).is_some());
+        assert!(pack_padded(false, 12, 6143).is_some());
+        for (c, e) in [
+            (12, 6144),
+            (1, 6145),
+            (MAX_COEFFICIENT, 6112),
+            (u128::MAX / 3, 6140),
+            // `(2^128 + 4) / 10`: padded by one digit it is `2^128 + 4`, which a
+            // wrapping multiplication would turn into a canonical `4E+6111`.
+            (34_028_236_692_093_846_346_337_460_743_176_821_146, 6112),
+            (u128::MAX, i16::MAX),
+            (1, MIN_EXPONENT - 1),
+            (0, 0),
+            (MAX_COEFFICIENT + 1, 0),
+        ] {
+            assert_eq!(pack_padded(false, c, e), None, "{c}E{e}");
+            assert!(!representable(c, e), "{c}E{e}");
+        }
+    }
+
+    use proptest::strategy::Strategy as _;
+
+    proptest::proptest! {
+        /// `representable` is the closed form of "padding fits": the two agree
+        /// on every normalised pair, the edges included.
+        #[test]
+        fn representable_is_exactly_what_padding_fits(
+            c in proptest::prop_oneof![
+                1..=MAX_COEFFICIENT,
+                1..1000u128,
+                (0u32..34).prop_map(|k| 10u128.pow(k) + 1),
+                proptest::prelude::Just(MAX_COEFFICIENT),
+            ],
+            e in proptest::prop_oneof![MIN_EXPONENT - 5..=MIN_EXPONENT + 5, 6100i16..=6150, proptest::prelude::any::<i16>()],
+        ) {
+            proptest::prop_assume!(c % 10 != 0);
+            let fits = pack_padded(false, c, e).is_some_and(|d| decode(&d).normalized()
+                == Decimal::Finite { negative: false, coefficient: c, exponent: e });
+            proptest::prop_assert_eq!(representable(c, e), fits, "{}E{}", c, e);
+        }
+    }
+
+    #[test]
     fn normalisation_strips_zeros_and_padding_restores_the_range() {
         let big = dec("1E+6144"); // c = 10^33, e = 6111
         let Decimal::Finite { negative, coefficient, exponent } = decode(&big).normalized() else {
             panic!("finite")
         };
         assert_eq!((coefficient, exponent), (1, 6144));
-        assert_eq!(pack_padded(negative, coefficient, exponent), big);
+        assert_eq!(pack_padded(negative, coefficient, exponent), Some(big));
         let Decimal::Finite { coefficient, exponent, .. } = decode(&dec("1.00")).normalized()
         else {
             panic!("finite")

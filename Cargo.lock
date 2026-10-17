@@ -2559,6 +2559,7 @@ dependencies = [
  "kimmy-core",
  "kimmy-query",
  "libc",
+ "num-bigint",
  "parking_lot",
  "proptest",
  "redb",

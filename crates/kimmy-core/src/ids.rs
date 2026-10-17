@@ -322,10 +322,13 @@ impl Decimal128Id {
     }
 
     /// Read the canonical bytes, refusing anything [`Self::to_bytes`] would not
-    /// have written: another length, a sign other than 0 or 1, a zero or
-    /// out-of-range coefficient, a coefficient with a trailing zero digit, an
-    /// exponent below BID's minimum or above what the coefficient can reach, or a
-    /// value that is an `i64` (that is `DocId::Int64`).
+    /// have written: another length, a sign other than 0 or 1, a pair no
+    /// `Decimal128` holds ([`decimal::representable`]: a zero or out-of-range
+    /// coefficient, one with a trailing zero digit, an exponent below BID's
+    /// minimum, or an exponent and digit count above the largest value,
+    /// `e + digits(c) > 6111 + 34`), or a value that is an `i64` (that is
+    /// `DocId::Int64`). What it accepts is exactly what [`Self::to_bytes`]
+    /// writes, so [`Self::to_decimal128`] holds for every id a peer can send.
     pub fn from_bytes(bytes: &[u8]) -> Option<Self> {
         let bytes: &[u8; DECIMAL128_ID_LEN] = bytes.try_into().ok()?;
         let negative = match bytes[0] {
@@ -336,20 +339,16 @@ impl Decimal128Id {
         let exponent = i16::from_be_bytes([bytes[1], bytes[2]]);
         let coefficient = u128::from_be_bytes(bytes[3..].try_into().ok()?);
         let id = Self { negative, exponent, coefficient };
-        let canonical = coefficient != 0
-            && coefficient <= decimal::MAX_COEFFICIENT
-            && coefficient % 10 != 0
-            && exponent >= decimal::MIN_EXPONENT
-            // The largest exponent any value can normalise to: 1E+6144.
-            && i32::from(exponent) <= i32::from(decimal::MAX_EXPONENT) + 33
-            && id.as_i64().is_none();
-        canonical.then_some(id)
+        (decimal::representable(coefficient, exponent) && id.as_i64().is_none()).then_some(id)
     }
 
     /// The `Decimal128` this id denotes, in canonical BID (the exponent padded
     /// back into range, which always fits because the original did).
     pub fn to_decimal128(self) -> bson::Decimal128 {
-        decimal::pack_padded(self.negative, self.coefficient, self.exponent)
+        decimal::pack_padded(self.negative, self.coefficient, self.exponent).expect(
+            "an id is a value a Decimal128 holds: from_normalized reads one, and from_bytes \
+             admits nothing else",
+        )
     }
 
     /// The value as an `i64`, if it is an integer in range.
@@ -537,6 +536,68 @@ mod tests {
         integer[1..3].copy_from_slice(&0i16.to_be_bytes());
         integer[3..].copy_from_slice(&5u128.to_be_bytes());
         assert_eq!(Decimal128Id::from_bytes(&integer), None, "an i64 is DocId::Int64");
+
+        // The largest values: an exponent and digit count past `1E+6144` and
+        // `9.99…E+6144` is no `Decimal128`, and once reached `to_bson` panicked.
+        let pair = |c: u128, e: i16| {
+            let mut bytes = [0u8; DECIMAL128_ID_LEN];
+            bytes[1..3].copy_from_slice(&e.to_be_bytes());
+            bytes[3..].copy_from_slice(&c.to_be_bytes());
+            Decimal128Id::from_bytes(&bytes)
+        };
+        for (c, e) in [
+            (12, 6144),
+            (1, 6145),
+            (decimal::MAX_COEFFICIENT, 6112),
+            (99, 6144),
+            (1, i16::MAX),
+            (1, decimal::MIN_EXPONENT - 1),
+            (1, i16::MIN),
+        ] {
+            assert_eq!(pair(c, e), None, "{c}E{e} is no Decimal128");
+        }
+        for (c, e) in
+            [(1, 6144), (12, 6143), (decimal::MAX_COEFFICIENT, 6111), (1, decimal::MIN_EXPONENT)]
+        {
+            let id = pair(c, e).unwrap_or_else(|| panic!("{c}E{e} is a Decimal128"));
+            let back = DocId::try_from_bson(&DocId::Decimal128(id).to_bson()).unwrap();
+            assert_eq!(back, DocId::Decimal128(id), "{c}E{e}");
+        }
+    }
+
+    use proptest::strategy::Strategy as _;
+
+    proptest::proptest! {
+        /// Every byte string `from_bytes` accepts is an id that reads back
+        /// through `to_bson`, without a panic, as itself; the bytes are biased
+        /// toward the edges a peer's frame could carry.
+        #[test]
+        fn every_accepted_byte_string_round_trips_through_to_bson(
+            sign in proptest::prop_oneof![0u8..=1, proptest::prelude::any::<u8>()],
+            e in proptest::prop_oneof![
+                proptest::prelude::any::<i16>(),
+                6100i16..=6150,
+                (decimal::MIN_EXPONENT - 3)..=(decimal::MIN_EXPONENT + 3),
+                -40i16..=40,
+            ],
+            c in proptest::prop_oneof![
+                proptest::prelude::any::<u128>(),
+                1..=decimal::MAX_COEFFICIENT,
+                1..100_000u128,
+                (0u32..=38).prop_map(|k| 10u128.pow(k).saturating_sub(1)),
+                (0u32..34).prop_map(|k| 10u128.pow(k) + 1),
+            ],
+        ) {
+            let mut bytes = [0u8; DECIMAL128_ID_LEN];
+            bytes[0] = sign;
+            bytes[1..3].copy_from_slice(&e.to_be_bytes());
+            bytes[3..].copy_from_slice(&c.to_be_bytes());
+            if let Some(id) = Decimal128Id::from_bytes(&bytes) {
+                let value = DocId::Decimal128(id).to_bson();
+                proptest::prop_assert_eq!(DocId::try_from_bson(&value).unwrap(), DocId::Decimal128(id));
+                proptest::prop_assert_eq!(id.to_bytes(), bytes);
+            }
+        }
     }
 
     #[test]

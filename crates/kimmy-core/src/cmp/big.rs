@@ -101,18 +101,22 @@ impl Big {
         }
     }
 
-    /// The top `n` bits (`1 <= n <= 192`) as an `n`-bit integer whose top bit is
-    /// set, little-endian, and whether every bit below them is zero.
+    /// The top `n` bits (`1 <= n <= 64 · L`) as an `n`-bit integer whose top bit
+    /// is set, in `L` little-endian limbs, and whether every bit below them is
+    /// zero.
     ///
     /// The integer is `⌊self · 2^(n − len)⌋`: the leading `n` bits, truncated
     /// when the value is longer and shifted up (exactly) when it is shorter.
     ///
     /// # Panics
     /// If `self` is zero (it has no top bit) or `n` is out of range.
-    pub(crate) fn top_bits(&self, n: u32) -> ([u64; 3], bool) {
-        assert!((1..=192).contains(&n) && !self.limbs.is_empty(), "top_bits({n}) of {self:?}");
+    pub(crate) fn top_bits<const L: usize>(&self, n: u32) -> ([u64; L], bool) {
+        assert!(
+            (1..=64 * L as u32).contains(&n) && !self.limbs.is_empty(),
+            "top_bits({n}) of {self:?}"
+        );
         let len = self.bit_len();
-        let mut out = [0u64; 3];
+        let mut out = [0u64; L];
         if len <= n {
             let mut shifted = self.clone();
             shifted.shl(n - len);
@@ -286,7 +290,7 @@ mod tests {
         }
 
         #[test]
-        fn top_bits_agree_with_num_bigint(a in any_big(), n in 1u32..=192) {
+        fn top_bits_agree_with_num_bigint(a in any_big(), n in 1u32..=384) {
             prop_assume!(!a.limbs.is_empty());
             let value = oracle(&a);
             let len = value.bits();
@@ -297,7 +301,7 @@ mod tests {
                 let top = value.clone() >> cut;
                 (top.clone(), (top << cut) == value)
             };
-            let (limbs, exact) = a.top_bits(n);
+            let (limbs, exact) = a.top_bits::<6>(n);
             prop_assert_eq!(oracle(&from_limbs(limbs.to_vec())), expected.clone());
             prop_assert_eq!(expected.bits(), u64::from(n), "the top bit is set");
             prop_assert_eq!(exact, below_zero);
