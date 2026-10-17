@@ -28202,7 +28202,7 @@ fix off as a whole (the pre-fix behaviour).
 | A 2 MiB `insert_many` | 0.5 s | 39–40 ms (33 documents) | 48–49 ms (40 documents) |
 | A replicated run of 1,024 documents | 5 s | 1.17–1.28 s | 1.16–1.18 s |
 
-- **Why 10 ms for one document.** The design's 5 ms is what the index's 1,000 entries cost by themselves (one of them the whole array, about 20 KB), with no margin, so the whole hold's ceiling is restated at 10 ms. The encoder's share stays held to the design's 5 ms above (measured at about 0.08 ms).
+- **Why 10 ms for one document.** The design's 5 ms is what the index's 1,000 entries cost by themselves (one of them the whole array, about 20 KB), with no margin, so the whole hold's ceiling is restated at 10 ms. The encoder's share stays held to the design's 5 ms above (measured at about 0.08 ms). The two figures bound different things: 5 ms bounds what the choice of coefficients can add (the encoder, in `kimmy-core`), 10 ms bounds the whole writer hold of one such document, index entries and commit included (measured at 4.5 to 4.9 ms, so about twice). Neither loosens the other.
 - **Crafted against random** is also asserted, on the writer thread's CPU over the hold: no more than 1.5× plus 10 ms. A writer who chooses the coefficients holds the writer no longer than one who does not.
 - **The figures are wall time on a quiet macOS development host, and the disk dominates them.** On the same host under load (another full workspace test running), the wall holds grew ten- to thirtyfold (up to 89 s for the replicated run, of which 4 s was CPU). Figures from the lab host belong here beside these.
 
