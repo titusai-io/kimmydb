@@ -23,7 +23,9 @@
 //!    - [`PERSISTERS`]: every `kimmy-storage` function that reads `DOCS`, `INDEX_ENTRIES` or the
 //!      migration's staging table and, in a write transaction, names another table, with what
 //!      reaches that table (a cursor, holder keys, or nothing but stamps and counts).
-//!    - [`SLOTS`]: every `META_*` slot of `kimmy-storage`, and the rows design 5.1 names
+//!    - [`SLOT_WRITERS`]: every `kimmy-storage` function that writes a slot of a name-keyed
+//!      table (`META`, the two marks' tables, `VECTOR_VERIFIED`), with the slots it writes;
+//!    - [`SLOTS`]: those slots, every `META_*` constant of `kimmy-storage`, and the rows design 5.1 names
 //!      (`LIVE_DIGESTS_THROUGH["walk"]`, `SNAPSHOT_PROGRESS`, `META gc:tombstone_horizon`,
 //!      `META ddl_refused:*`, the in-memory `Converge` cursor, `Engine::answered_absent`, the
 //!      vector shadow collections), each anchored to the source line that makes it, which
@@ -37,8 +39,7 @@
 //! in). A key encoder brought in by a bare name (`use …::keyenc::encode; encode(…)`) is seen
 //! at the `use` line, in the file's items, and not at the call. A value assembled in one
 //! function and written to a table by another escapes rule 3's first part; the table's own
-//! class in rule 1 is the statement for it. A slot that is not a `META_*` constant is covered
-//! only if it is one of the named rows.
+//! class in rule 1 is the statement for it.
 
 mod source;
 
@@ -310,7 +311,7 @@ const CALL_SITES: &[Site] = &[
         "the sentinel runs below LEAST_KEY_TAG",
     ),
     site("kimmy-storage/src/expiry.rs", "date_key", Use::Index, "a TTL index's date bound"),
-    site("kimmy-storage/src/vectors.rs", "for_each_chunk_doc_of", Use::Index, "a shadow id prefix"),
+    site("kimmy-storage/src/vectors.rs", "visit_document", Use::Index, "a chunk id prefix's bound"),
     // kimmy-storage: the migration
     site("kimmy-storage/src/migrate_v5.rs", "stored_of_v1", Use::Migration, "a v1 key re-keyed"),
     site(
@@ -409,6 +410,97 @@ struct Slot {
     why: &'static str,
 }
 
+/// Rule 3, third part: every function that writes a slot of a name-keyed table (`META`,
+/// `LIVE_COUNTS_THROUGH`, `LIVE_DIGESTS_THROUGH`, `VECTOR_VERIFIED`), with the slots it writes,
+/// each of which is a row of [`SLOTS`]. A slot whose name is computed (`vector_renames:<id>`)
+/// is not a `META_*` constant, so this is what makes a new one visible.
+struct SlotWriter {
+    file: &'static str,
+    function: &'static str,
+    slots: &'static [&'static str],
+}
+
+const fn writer(
+    file: &'static str,
+    function: &'static str,
+    slots: &'static [&'static str],
+) -> SlotWriter {
+    SlotWriter { file, function, slots }
+}
+
+const SLOT_WRITERS: &[SlotWriter] = &[
+    writer("kimmy-storage/src/backup.rs", "restore_with", &["meta[*], copied by a restore"]),
+    writer("kimmy-storage/src/decimal128_gate.rs", "mark_in_txn", &["meta[decimal128:id_present]"]),
+    writer("kimmy-storage/src/engine.rs", "flush_holding", &["meta[durability_flush]"]),
+    writer("kimmy-storage/src/engine.rs", "load_or_create_node_id", &["meta[node_id]"]),
+    writer("kimmy-storage/src/engine.rs", "record_state_held_in_txn", &["meta[state_held:<node>]"]),
+    // Reads the rows into a vector; the `.insert` is the vector's.
+    writer("kimmy-storage/src/engine.rs", "state_held_in", &["meta[state_held:<node>]"]),
+    writer("kimmy-storage/src/gc.rs", "remove_oplog_entries", &["meta[oplog_collected_through]"]),
+    writer("kimmy-storage/src/live_digest.rs", "carry_mark", &["live_digests_through[arrival]"]),
+    writer("kimmy-storage/src/live_digest.rs", "mark_through", &["live_digests_through[arrival]"]),
+    writer(
+        "kimmy-storage/src/live_walk.rs",
+        "run",
+        &[
+            "live_counts_through[arrival]",
+            "live_digests_through[arrival]",
+            "live_digests_through[walk]",
+        ],
+    ),
+    writer(
+        "kimmy-storage/src/migrate.rs",
+        "make_schema_4_for_test",
+        &["meta[format_version]", "vector_verified[verified]"],
+    ),
+    writer("kimmy-storage/src/migrate.rs", "record_redb_version", &["meta[redb_version]"]),
+    writer("kimmy-storage/src/migrate.rs", "write_version", &["meta[format_version]"]),
+    writer("kimmy-storage/src/migrate_v5.rs", "begin", &["meta[format_version]"]),
+    writer("kimmy-storage/src/refusal_hint.rs", "record_refusal_hint_in", &["meta[ddl_refused:*]"]),
+    writer("kimmy-storage/src/rewind.rs", "record_rewind", &["meta[rewound]"]),
+    writer(
+        "kimmy-storage/src/tombstone_horizon.rs",
+        "reset_at_open",
+        &["meta[gc:tombstone_horizon]"],
+    ),
+    writer(
+        "kimmy-storage/src/tombstone_horizon.rs",
+        "set_at_least_in_txn",
+        &["meta[gc:tombstone_horizon]"],
+    ),
+    writer(
+        "kimmy-storage/src/tombstone_horizon.rs",
+        "test_set_tombstone_horizon",
+        &["meta[gc:tombstone_horizon]"],
+    ),
+    writer(
+        "kimmy-storage/src/vectors.rs",
+        "bump_vector_renames",
+        &["meta[vector_renames:<shadow>]"],
+    ),
+    writer(
+        "kimmy-storage/src/vectors.rs",
+        "put_consumer_position_in_txn",
+        &["meta[consumer_position:<consumer>]"],
+    ),
+    writer(
+        "kimmy-storage/src/vectors.rs",
+        "put_vector_fingerprint",
+        &["meta[vector_config:<collection>]"],
+    ),
+    writer(
+        "kimmy-storage/src/vectors.rs",
+        "put_vector_rescan",
+        &["meta[vector_rescan:<collection>]"],
+    ),
+    writer(
+        "kimmy-storage/src/vectors.rs",
+        "queue_vector_chunk_recheck",
+        &["meta[vector_chunk_ids]"],
+    ),
+    writer("kimmy-storage/src/verified.rs", "write", &["vector_verified[verified]"]),
+];
+
 /// Rule 3, second part: every `META_*` slot, and the rows design 5.1 names.
 const SLOTS: &[Slot] = &[
     Slot {
@@ -480,6 +572,55 @@ const SLOTS: &[Slot] = &[
         anchor: r#"pub(crate) const META_REDB_VERSION: &str = "redb_version";"#,
         class: Unchanged,
         why: "a version string",
+    },
+    Slot {
+        place: "meta[*], copied by a restore",
+        anchor_file: "kimmy-storage/src/backup.rs",
+        anchor: "simple!(T_META, tables::META,",
+        class: Unchanged,
+        why: "a restore copies every slot of a backup of its own schema, each classed here",
+    },
+    Slot {
+        place: "meta[durability_flush]",
+        anchor_file: "kimmy-storage/src/engine.rs",
+        anchor: r#"meta.insert("durability_flush","#,
+        class: Unchanged,
+        why: "a flush counter",
+    },
+    Slot {
+        place: "meta[vector_chunk_ids]",
+        anchor_file: "kimmy-storage/src/vectors.rs",
+        anchor: r#"const CHUNK_IDS_KEY: &str = "vector_chunk_ids";"#,
+        class: Unchanged,
+        why: "the chunk-id format number (ADR-239)",
+    },
+    Slot {
+        place: "meta[vector_renames:<shadow>]",
+        anchor_file: "kimmy-storage/src/vectors.rs",
+        anchor: r#"format!("vector_renames:{}", shadow.0)"#,
+        class: Unchanged,
+        why: "a counter per shadow collection id",
+    },
+    Slot {
+        place: "meta[consumer_position:<consumer>]",
+        anchor_file: "kimmy-storage/src/vectors.rs",
+        anchor: r#"format!("consumer_position:{consumer}")"#,
+        class: Unchanged,
+        why: "an oplog position (a stamp)",
+    },
+    Slot {
+        place: "meta[vector_config:<collection>]",
+        anchor_file: "kimmy-storage/src/vectors.rs",
+        anchor: r#"format!("vector_config:{}", collection.0)"#,
+        class: Unchanged,
+        why: "a vector configuration's fingerprint",
+    },
+    Slot {
+        place: "meta[vector_rescan:<collection>]",
+        anchor_file: "kimmy-storage/src/vectors.rs",
+        anchor: r#"const RESCAN_PREFIX: &str = "vector_rescan:";"#,
+        class: Unchanged,
+        why: "a rescan marker per collection id",
     },
     Slot {
         place: "meta[ddl_refused:*]",
@@ -921,4 +1062,61 @@ fn every_entry_says_why() {
         "tables {tables:?}; call sites {sites:?}; persisters {}; slots {slots:?}",
         PERSISTERS.len()
     );
+}
+
+/// Rule 3, third part: every function that writes a slot of a name-keyed table is listed, with
+/// slots that are rows of [`SLOTS`], and every listed function still writes one.
+#[test]
+fn every_slot_writer_is_classified() {
+    let sources = sources();
+    let named = ["META", "LIVE_COUNTS_THROUGH", "LIVE_DIGESTS_THROUGH", "VECTOR_VERIFIED"];
+    let mut found: BTreeMap<(String, String), BTreeSet<&str>> = BTreeMap::new();
+    for (file, body) in sources.iter().filter(|(f, _)| f.starts_with("kimmy-storage/")) {
+        for (function, text) in functions(body).into_iter().filter(|(f, _)| f != "(items)") {
+            let words: BTreeSet<&str> =
+                text.split(|c: char| !(c.is_ascii_alphanumeric() || c == '_')).collect();
+            let tables: BTreeSet<&str> =
+                named.iter().copied().filter(|t| words.contains(t)).collect();
+            if !tables.is_empty() && text.contains(".insert(") {
+                found.insert((file.clone(), function), tables);
+            }
+        }
+    }
+    assert!(
+        found.contains_key(&(
+            "kimmy-storage/src/tombstone_horizon.rs".into(),
+            "set_at_least_in_txn".into()
+        )),
+        "premise: the horizon's writer was found"
+    );
+    let listed: BTreeSet<(String, String)> =
+        SLOT_WRITERS.iter().map(|w| (w.file.to_string(), w.function.to_string())).collect();
+    let unlisted: Vec<String> = found
+        .iter()
+        .filter(|(at, _)| !listed.contains(*at))
+        .map(|((file, function), tables)| format!("{file} {function} writes {tables:?}"))
+        .collect();
+    assert!(
+        unlisted.is_empty(),
+        "functions that write a slot of a name-keyed table, not in SLOT_WRITERS (name the slot \
+         in SLOTS: does its value hold a document key?): {unlisted:#?}"
+    );
+    let stale: Vec<String> = listed
+        .iter()
+        .filter(|at| !found.contains_key(*at))
+        .map(|(file, function)| format!("{file} {function}"))
+        .collect();
+    assert!(stale.is_empty(), "SLOT_WRITERS names functions that write no slot: {stale:#?}");
+    let places: BTreeSet<&str> = SLOTS.iter().map(|s| s.place).collect();
+    for w in SLOT_WRITERS {
+        assert!(!w.slots.is_empty(), "{} {} names no slot", w.file, w.function);
+        for slot in w.slots {
+            assert!(
+                places.contains(slot),
+                "{} {} writes {slot}, which SLOTS lacks",
+                w.file,
+                w.function
+            );
+        }
+    }
 }
