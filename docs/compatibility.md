@@ -69,6 +69,18 @@ it.
 | Changing what a route *means* while keeping its shape | The worst kind, because nothing observable changes for a client until its data is wrong |
 | Changing a default | A client that omitted the field gets different behaviour without asking for it |
 
+**Recorded exceptions, 0.51.0 ([ADR-238](decisions.md)).** The release makes
+these changes on purpose, under Breaking in the CHANGELOG, each because the old behaviour
+was wrong in a way no client could have depended on safely: the index's `undecidable`
+field, `explain`'s `undecidableCandidates` and the metric `kimmy_index_undecidable_total`
+are removed (a decimal is decided by its filter, so there is nothing to count); `$sum` and
+`$avg` over a `Decimal128` answer `400` where they skipped the decimal and answered a wrong
+total; a `$numberDecimal` text that is not a number is a `400` where it was stored as one;
+a partial unique index enforces on a `Decimal128` at its filter path, so a write that was
+accepted can be refused; and a stored `Decimal128` is compared by its exact value, which
+changes which documents a filter selects. A client that read the removed field or relied
+on one of these must change; none of them changes a route's shape.
+
 When `/v2` arrives, `/v1` keeps being served for **at least one minor release
 line, and no less than six months from the day `/v2` first ships**, whichever
 is longer. Removal is a release-note event, not a quiet one.

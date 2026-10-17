@@ -498,6 +498,26 @@ jobs:
             migrate_v5_tests::draining_keeps_the_file_near_its_size 2>&1 | tee migration-drain.log
           grep -q 'test result: ok. 1 passed' migration-drain.log
 
+      # The number key's two large corpora (ADR-238): the order, the equal
+      # bytes of equal values, the closed-form `END` against the exact path
+      # and the fast window against the exact one, over every exponent and the
+      # constructed boundary sets. About 3 s in release, and many minutes in
+      # debug, so ignored in the default run. The seeded model runs that carry
+      # the wire and digest oracles (`generated_schedules`,
+      # `young_stamp_seeded`) are not here: they run for many minutes, and run
+      # once at a release's gate of record.
+      - name: The number key's large corpora
+        shell: bash
+        run: |
+          cargo test -p kimmy-core --release --lib -- \
+            --ignored --exact \
+            keyenc::number::tests::the_large_corpus 2>&1 | tee key-corpus-a.log
+          grep -q 'test result: ok. 1 passed' key-corpus-a.log
+          cargo test -p kimmy-core --release --lib -- \
+            --ignored --exact \
+            keyenc::number_keys::a_large_corpus 2>&1 | tee key-corpus-b.log
+          grep -q 'test result: ok. 1 passed' key-corpus-b.log
+
   # One build of `kimmyd`, shared — and it is the build the release makes.
   #
   # Shared: the docker job puts this binary in the image rather than
