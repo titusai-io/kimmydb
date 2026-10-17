@@ -302,10 +302,12 @@ paths:
           description: |
             Not ready. While the node's store is opening the body is the error
             envelope (`error: starting`) with `status: opening`, `phase`
-            (`repairing`, `opening`, `migrating`, `draining`, `refilling`, `verifying`,
-            `counting`, `starting` or `reconciling`), `phase_age_seconds`, and `done` and
-            `total` when the phase counts. `migrating`, `draining` and `refilling` are the
-            storage schema migration's steps: a collection's rows re-keyed (out, then
+            (`repairing`, `opening`, `preflight`, `migrating`, `draining`, `refilling`,
+            `verifying`, `counting`, `starting` or `reconciling`), `phase_age_seconds`, and
+            `done` and `total` when the phase counts. `preflight`, `migrating`, `draining`
+            and `refilling` are the storage schema migration's steps: the preflight's
+            read of the documents with a number `_id`, before anything is written, a
+            collection's rows re-keyed (out, then
             back), one index's entries drained, one collection's rows walked to refill
             its indexes, and, in `draining`, a TTL partial index's count of the
             documents the exact comparator decides differently; each starts its own
@@ -327,7 +329,7 @@ paths:
                       status: { const: opening }
                       phase:
                         type: string
-                        enum: [repairing, opening, migrating, draining, refilling, verifying, counting, starting, reconciling]
+                        enum: [repairing, opening, preflight, migrating, draining, refilling, verifying, counting, starting, reconciling]
                       phase_age_seconds: { type: number }
                       done: { type: integer }
                       total: { type: integer }

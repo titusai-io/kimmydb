@@ -43,22 +43,28 @@ pub enum OpenPhase {
     /// databases, before the node serves.
     Reconciling = 7,
     /// The schema migration's drain of one index (ADR-238): entries removed of
-    /// `total`, the collection's documents when the drain began (an index can
-    /// hold more, and the total is raised to stay ahead of `done`).
+    /// `total`, the index's entries counted before its first chunk; and, before
+    /// a TTL partial index's drain, its count, documents scanned of the
+    /// collection's documents.
     Draining = 8,
     /// The schema migration's refill of one collection's indexes (ADR-238):
-    /// documents walked of `total`, the collection's documents when the
-    /// refill began, raised likewise.
+    /// documents walked of `total`, the collection's documents when the refill
+    /// began, raised to stay ahead of `done` and set to it when the refill ends.
     Refilling = 9,
+    /// The schema migration's preflight (ADR-238): its read of the documents
+    /// with a number `_id`, rows read of `total`, before anything of the
+    /// migration is written.
+    Preflight = 10,
 }
 
 impl OpenPhase {
     /// Every phase a probe reports, `Idle` (no open running) left out. A test
     /// holds this to the numbering and to the phases the OpenAPI document lists.
-    pub const fn reported() -> [OpenPhase; 9] {
+    pub const fn reported() -> [OpenPhase; 10] {
         [
             Self::Repairing,
             Self::Opening,
+            Self::Preflight,
             Self::Migrating,
             Self::Draining,
             Self::Refilling,
@@ -81,6 +87,7 @@ impl OpenPhase {
             Self::Reconciling => "reconciling",
             Self::Draining => "draining",
             Self::Refilling => "refilling",
+            Self::Preflight => "preflight",
         }
     }
 
@@ -95,6 +102,7 @@ impl OpenPhase {
             7 => Self::Reconciling,
             8 => Self::Draining,
             9 => Self::Refilling,
+            10 => Self::Preflight,
             _ => Self::Idle,
         }
     }

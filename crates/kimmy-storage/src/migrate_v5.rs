@@ -256,10 +256,14 @@ pub(crate) struct Staged {
     /// The leaf bytes those rows take as the staging table holds them
     /// ([`leaf_bytes`]).
     pub bytes: u64,
-    /// The largest single allocation the migration makes: a leaf for the
-    /// largest row of `DOCS`, or for an index entry derived from it, whose key
-    /// is at most twice the value's bytes (a string key writes each zero byte as
-    /// two).
+    /// The largest single allocation the migration makes, as far as the
+    /// preflight reads: a leaf for the largest row it re-keys, or for an index
+    /// entry derived from it, whose key is at most twice the value's bytes (a
+    /// string key writes each zero byte as two), or for the largest index entry
+    /// among the first chunk's. A row whose id is not a number is not read, so
+    /// an index entry larger than these from such a row is not foreseen; it
+    /// changes the step only when the trailing region has less than twice that
+    /// entry left.
     pub largest_allocation: u64,
 }
 
@@ -274,22 +278,33 @@ pub(crate) struct Requirement {
     pub staged_index: u64,
     /// [`MARGIN_BYTES`].
     pub margin: u64,
-    /// The four together.
+    /// `max(growth, staged_docs) + staged_index + margin`.
     pub total: u64,
 }
 
-/// The free space the migration requires (B1 and M3 of the 0.51 build review):
-/// redb's next growth step for this file, the bytes the migration will stage,
-/// and a fixed margin. Nothing in it is the file's size over its document
-/// count: a store whose file is mostly oplog, or freed pages, or one whose
-/// documents are few, requires the step, its own rows and the margin.
+/// The free space the migration requires (B1 and M3 of the 0.51 build review,
+/// and the manager's ruling on it): **`max(growth, staged_docs) + staged_index +
+/// margin`**. Nothing in it is the file's size over its document count: a store
+/// whose file is mostly oplog, or freed pages, or one whose documents are few,
+/// requires its growth step, its own rows and the margin.
 ///
-/// - **Documents**: the rows to re-key ([`Staged`]), once. At the peak, the end
-///   of a range's first phase, they are in the file twice, the old rows' pages
-///   freed and the staged rows written; the old pages are already in the file,
-///   so the staged copy is what needs room. Beside it, the rewritten pages of
-///   [`CHUNKS_IN_FLIGHT`] chunks of `rekey_rows` rows, priced from the rows'
-///   own bytes.
+/// - **Growth or documents, whichever is larger**: redb's next growth step for
+///   the file ([`growth_step`]), or the rows to re-key ([`Staged`]) once, with
+///   the rewritten pages of [`CHUNKS_IN_FLIGHT`] chunks of `rekey_rows` of them,
+///   priced from the rows' own bytes. The two do not stack: the first phase
+///   deletes each chunk's rows from `DOCS` in the transaction that writes them
+///   to the staging table, so the pages one chunk frees are reused by the chunks
+///   after it, and the file grows only when no freed page is left, by one step,
+///   which holds the rest. Measured: the 2,000,000-document store's file did not
+///   grow on mars, and grew inside its doubling on a laptop. **Proved on disk
+///   images of a fixed size** (`examples/schema4_migration`, `prove`), APFS,
+///   HFS+ and ExFAT, with the free space the preflight read equal to this
+///   figure rounded up to the volume's block: every store migrated to its end,
+///   and with 1 MiB less every start was refused with nothing of the migration
+///   written. On HFS+ and ExFAT, which allocate the length a file is extended
+///   to, a 300,000-document store compacted to 359 MiB took its free space from
+///   551 MiB to 192 MiB: the growth step, 359 MiB, spent whole, the staged rows
+///   (144 MiB) inside it, and the index and margin terms untouched.
 /// - **Index entries**: [`CHUNKS_IN_FLIGHT`] chunks of `index_chunk_bytes`,
 ///   each up to twice its bytes in pages (inserted out of key order, a split
 ///   leaf is two half-full pages), and never more than the entries `INDEX_ENTRIES`
@@ -321,7 +336,7 @@ pub(crate) fn requirement(
         staged_docs,
         staged_index,
         margin,
-        total: growth + staged_docs + staged_index + margin,
+        total: growth.max(staged_docs) + staged_index + margin,
     }
 }
 
@@ -681,9 +696,10 @@ pub(crate) fn preflight(db: &Database, path: &std::path::Path, found: u8) -> Res
     }
 }
 
-/// The plan, read in one transaction: redb's row counts, one seek per
-/// collection-id range, the collection registry, one walk of `DOCS` for what the
-/// re-key stages, and `INDEX_ENTRIES` up to one chunk's bytes.
+/// The plan, read in one transaction: redb's row counts, two seeks per
+/// collection-id range, the collection registry, one read of the rows under a
+/// number key for what the re-key stages, and `INDEX_ENTRIES` up to one chunk's
+/// bytes.
 fn plan(db: &Database, path: &std::path::Path) -> Result<Plan> {
     let txn = db.begin_read()?;
     let collections = txn.open_table(tables::COLLECTIONS)?;
@@ -698,15 +714,21 @@ fn plan(db: &Database, path: &std::path::Path) -> Result<Plan> {
         plan.indexes += meta.indexes.len() as u64;
         standing.insert(meta.id.0);
     }
+    let mut numeric = Vec::new();
     for id in range_ids(&docs)? {
         plan.ranges += 1;
         plan.purge_pending += u64::from(!standing.contains(&id));
+        if has_numeric(&docs, id)? {
+            numeric.push(id);
+        }
     }
     plan.docs_rows = docs.len()?;
     plan.index_entries = entries.len()?;
     plan.file_bytes = file_bytes(path);
-    plan.staged = staged(&docs, plan.docs_rows)?;
-    plan.index_bytes = index_bytes_upto(&entries, chunk_bytes() as u64)?;
+    plan.staged = staged(&docs, &numeric, plan.docs_rows)?;
+    let (index_bytes, largest_entry) = index_bytes_upto(&entries, chunk_bytes() as u64)?;
+    plan.index_bytes = index_bytes;
+    plan.staged.largest_allocation = plan.staged.largest_allocation.max(largest_entry);
     plan.need =
         requirement(plan.file_bytes, &plan.staged, plan.index_bytes, chunk_rows(), chunk_bytes());
     plan.required_bytes = plan.need.total;
@@ -722,58 +744,68 @@ fn file_bytes(path: &std::path::Path) -> u64 {
     std::fs::metadata(path).map(|m| m.len()).unwrap_or(0)
 }
 
-/// What the re-key will stage: one walk of `DOCS`, the rows under a number key
-/// priced as the staging table holds them, and the largest allocation over
-/// every row. On `/readyz` as `migrating`, `done` of `total` rows read, and
-/// looking for a stop every 4,096 rows: nothing is written yet, and on a cold
-/// store the walk reads the documents' pages from disk: 49 s for the
-/// 2,000,000-document acceptance store just copied, on a laptop busy with
-/// other builds, against 0.4 s for a store of that size just written.
-fn staged<T>(docs: &T, rows: u64) -> Result<Staged>
+/// What the re-key will stage: one read of every row under a number key, the
+/// rows the re-key moves, priced as the staging table holds them, with the
+/// largest of them. Only the numeric part of each range is read, so a store
+/// whose ids are not numbers reads nothing. On `/readyz` as `preflight`, `done`
+/// rows read of `total`, the store's rows (exact when every id is a number, and
+/// set to what was read at the end), looking for a stop every 4,096 rows:
+/// nothing is written yet.
+///
+/// **Its cost** is a read of those rows: 0.4 s for a 2,000,000-document store
+/// just written, and 49 s for the acceptance store of that size just copied, on
+/// a laptop busy with other builds. The re-key's first phase reads the same rows
+/// right after, so on a cold disk the read largely warms the cache for it.
+fn staged<T>(docs: &T, numeric: &[u64], rows: u64) -> Result<Staged>
 where
     T: ReadableTable<(u64, &'static [u8]), &'static [u8]>,
 {
-    crate::open_progress::set_open_phase_of(crate::open_progress::OpenPhase::Migrating, rows);
     let mut staged = Staged::default();
+    if numeric.is_empty() {
+        return Ok(staged);
+    }
+    crate::open_progress::set_open_phase_of(crate::open_progress::OpenPhase::Preflight, rows);
     let mut largest = 0u64;
-    for (n, row) in docs.iter()?.enumerate() {
-        if n % 4_096 == 4_095 {
-            crate::open_progress::set_open_done(n as u64 + 1);
-            if stop_requested() {
-                return Err(StorageError::Stopping(crate::StopReason::Shutdown));
+    for &id in numeric {
+        for row in docs.range::<(u64, &[u8])>((id, NUMBER_TAG)..(id, ABOVE_NUMBER_TAG))? {
+            if staged.rows % 4_096 == 4_095 {
+                crate::open_progress::set_open_done(staged.rows + 1);
+                if stop_requested() {
+                    return Err(StorageError::Stopping(crate::StopReason::Shutdown));
+                }
             }
-        }
-        let (key, value) = row?;
-        let stored = key.value().1;
-        let pair = stored.len() as u64 + value.value().len() as u64 + DOCS_ROW_OVERHEAD;
-        largest = largest.max(pair);
-        if stored.starts_with(NUMBER_TAG) {
+            let (key, value) = row?;
+            let pair = key.value().1.len() as u64 + value.value().len() as u64 + DOCS_ROW_OVERHEAD;
+            largest = largest.max(pair);
             staged.rows += 1;
             staged.bytes += leaf_bytes(pair);
         }
     }
     staged.largest_allocation = if largest == 0 { 0 } else { allocation(2 * largest) };
-    crate::open_progress::set_open_done(rows);
+    crate::open_progress::set_open_done(staged.rows);
+    crate::open_progress::set_open_total(staged.rows);
     Ok(staged)
 }
 
 /// `INDEX_ENTRIES`'s bytes as the refill's chunk counts them, read from the
-/// start until they reach `cap`: the index bound is per chunk, so the rest is
-/// never needed.
-fn index_bytes_upto<T>(entries: &T, cap: u64) -> Result<u64>
+/// start until they reach `cap` (the index bound is per chunk, so the rest is
+/// never needed), and the largest allocation one of those entries needs.
+fn index_bytes_upto<T>(entries: &T, cap: u64) -> Result<(u64, u64)>
 where
     T: ReadableTable<tables::IndexKey<'static>, ()>,
 {
-    let mut bytes = 0u64;
+    let (mut bytes, mut largest) = (0u64, 0u64);
     for row in entries.iter()? {
         if bytes >= cap {
             break;
         }
         let (entry, _) = row?;
         let (_, _, key, doc_key) = entry.value();
-        bytes += INDEX_ENTRY_OVERHEAD + key.len() as u64 + doc_key.len() as u64;
+        let counted = INDEX_ENTRY_OVERHEAD + key.len() as u64 + doc_key.len() as u64;
+        bytes += counted;
+        largest = largest.max(counted);
     }
-    Ok(bytes)
+    Ok((bytes, if largest == 0 { 0 } else { allocation(largest + 16) }))
 }
 
 /// Seconds the migration is expected to take, from the measured per-row costs

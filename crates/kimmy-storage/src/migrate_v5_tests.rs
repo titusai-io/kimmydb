@@ -1710,9 +1710,10 @@ fn the_requirement_is_the_growth_step_the_staged_rows_the_index_chunks_and_a_mar
     assert!(plan.index_bytes > 0 && plan.index_bytes < 16 << 20, "{}", plan.index_bytes);
     assert_eq!(plan.need.staged_index, 8 * plan.index_bytes);
     assert_eq!(plan.need.margin, MARGIN_BYTES);
+    // The step and the staged rows do not stack: the larger of the two.
     assert_eq!(
         plan.required_bytes,
-        plan.need.growth + plan.need.staged_docs + plan.need.staged_index + MARGIN_BYTES
+        plan.need.growth.max(plan.need.staged_docs) + plan.need.staged_index + MARGIN_BYTES
     );
 }
 
@@ -1733,7 +1734,7 @@ fn the_requirement_pins_the_shipped_chunks_against_0_2_and_2_000_000_rows() {
     let two = Staged { rows: 2, bytes: 2 * 1366, largest_allocation: 4096 };
     let churned = shipped(45 * MIB, two, 0);
     assert_eq!(churned.staged_docs, 2 * 1366 * 5);
-    assert_eq!(churned.total, 45 * MIB - 4096 + 2 * 1366 * 5 + MARGIN_BYTES);
+    assert_eq!(churned.total, 45 * MIB - 4096 + MARGIN_BYTES, "the step holds the two rows");
     // 2,000,000 rows of about 410 bytes (nine to a page, 456 bytes each) in a
     // 2,411 MiB file with three indexes: the rows once, four chunks of 8,192 of
     // them, and eight times 16 MiB of entries.
@@ -1742,6 +1743,14 @@ fn the_requirement_pins_the_shipped_chunks_against_0_2_and_2_000_000_rows() {
     assert_eq!(fixture.growth, 2_411 * MIB - 4096);
     assert_eq!(fixture.staged_docs, 2_000_000 * 456 + 4 * 8_192 * 456);
     assert_eq!(fixture.staged_index, 8 * (16 << 20));
+    assert_eq!(fixture.total, 2_411 * MIB - 4096 + 8 * (16 << 20) + MARGIN_BYTES);
+    // Past one region the step can be smaller than the rows: a 6 GiB file whose
+    // trailing region is half full grows by 2 GiB, and 3 GiB of rows to re-key
+    // is the larger term.
+    let rows = Staged { rows: 6_000_000, bytes: 3 << 30, largest_allocation: 4096 };
+    let past = shipped((6 << 30) + 4096, rows, 1 << 30);
+    assert_eq!(past.growth, 2 << 30);
+    assert_eq!(past.total, past.staged_docs + 8 * (16 << 20) + MARGIN_BYTES);
     // The chunk sizes are what the in-flight terms are made of.
     let smaller = requirement(2_411 * MIB, &big, 1 << 30, 1_024, 1 << 20);
     assert_eq!(smaller.staged_docs, 2_000_000 * 456 + 4 * 1_024 * 456);
@@ -1835,7 +1844,7 @@ fn assert_bounded_by_its_rows(plan: &crate::migrate_v5::Plan, what: &str) {
     assert!(plan.need.staged_index <= 8 * plan.index_bytes, "{what}: {plan:?}");
     assert_eq!(
         plan.required_bytes,
-        growth + plan.need.staged_docs + plan.need.staged_index + MARGIN_BYTES,
+        growth.max(plan.need.staged_docs) + plan.need.staged_index + MARGIN_BYTES,
         "{what}"
     );
     eprintln!(
@@ -1850,6 +1859,61 @@ fn assert_bounded_by_its_rows(plan: &crate::migrate_v5::Plan, what: &str) {
         plan.need.staged_index >> 10,
         plan.need.margin >> 10
     );
+}
+
+#[test]
+fn the_preflight_read_is_its_own_phase_and_a_stop_ends_it_writing_nothing() {
+    // The preflight reads every row under a number key before raise(5): its own
+    // phase on `/readyz`, `preflight`, with `done` of `total` rows, which a stop
+    // ends with nothing written, so 0.50 still opens the store. A store whose
+    // ids are not numbers reads nothing and shows no such phase.
+    use crate::open_progress::OpenPhase;
+    let n = 5_000_i64;
+    let (_dir, path) = schema_4_store(|engine| {
+        let c = engine.create_collection("app", "c").unwrap();
+        engine.insert_many(&c, (0..n).map(|i| doc! {"_id": i, "x": i}).collect()).unwrap();
+    });
+    let phase = || crate::open_progress::tests::THIS_THREAD_PHASE.with(std::cell::Cell::get);
+    let done = || crate::open_progress::tests::THIS_THREAD_DONE.with(std::cell::Cell::get);
+    // Read to its end, then refused for want of space: the read ended at its
+    // total.
+    hooks::FREE.with(|c| c.set(Some(0)));
+    let refused = Engine::open(&copy_beside(&path, "refused")).map(drop);
+    hooks::FREE.with(|c| c.set(None));
+    assert!(matches!(refused, Err(crate::StorageError::NotEnoughSpace { .. })), "{refused:?}");
+    assert_eq!((phase(), done()), (Some((OpenPhase::Preflight, n as u64)), n as u64));
+    // A stop during the read ends the open at the first row it looks for one.
+    let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
+    hooks::stop_on(Some(stop));
+    let stopped = Engine::open(&path).map(drop);
+    hooks::stop_on(None);
+    assert!(matches!(stopped, Err(crate::StorageError::Stopping(_))), "{stopped:?}");
+    assert_eq!((phase(), done()), (Some((OpenPhase::Preflight, n as u64)), 4_096));
+    let db = read_only(&path);
+    assert_eq!(version(&db), Some(4), "nothing of the migration written");
+    drop(db);
+    for table in ["schema5_docs_phases", "schema5_index_steps", "schema5_docs_rekeyed"] {
+        assert!(!has_table(&path, table), "{table} after a stopped preflight");
+    }
+    assert_eq!(crate::format::read_sidecar(&path).unwrap().schema, 4);
+    let v050 = crate::format::BuildVersions { written_by: "0.50.0".into(), ..v050() };
+    assert!(crate::format::check_before_open_with(&path, &v050).is_ok(), "0.50 opens it");
+    drop(Engine::open(&path).unwrap());
+    // String ids: nothing to read, no preflight phase.
+    let (_dir, strings) = schema_4_store(|engine| {
+        let c = engine.create_collection("app", "s").unwrap();
+        engine
+            .insert_many(&c, (0..50_i64).map(|i| doc! {"_id": format!("k{i}")}).collect())
+            .unwrap();
+    });
+    crate::open_progress::set_open_phase(OpenPhase::Opening);
+    hooks::FREE.with(|c| c.set(Some(0)));
+    let refused = Engine::open(&strings).map(drop);
+    hooks::FREE.with(|c| c.set(None));
+    assert!(matches!(refused, Err(crate::StorageError::NotEnoughSpace { .. })), "{refused:?}");
+    assert!(phase().is_none_or(|(p, _)| p != OpenPhase::Preflight), "{:?}", phase());
+    let plan = hooks::LAST_PLAN.with(|p| p.borrow_mut().take()).unwrap();
+    assert_eq!(plan.staged, crate::migrate_v5::Staged::default(), "nothing read");
 }
 
 #[test]

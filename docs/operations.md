@@ -430,9 +430,9 @@ length, and a start that used to be killed and begun again for ever, because
 nothing listened until the open finished and Kubernetes' defaults restart a
 container after about 30 seconds of failed liveness checks, now finishes. What
 the open is doing is on `/readyz`: `phase` is one of `repairing`, `opening`,
-`migrating`, `draining` and `refilling` (the schema migration's steps, each with its own
-`done` of `total`: a collection's rows re-keyed, one index's entries drained, one
-collection's rows walked to refill its indexes, [Storage schema
+`preflight`, `migrating`, `draining` and `refilling` (the schema migration's steps, each
+with its own `done` of `total`: the preflight's rows read, a collection's rows re-keyed,
+one index's entries drained, one collection's rows walked to refill its indexes, [Storage schema
 5](#storage-schema-5-the-first-start-of-0510)), `verifying` (`done` of `total` oplog
 rows), `counting`, `starting` and `reconciling` (`done` of `total` databases whose
 drop the node is burying before it serves, [ADR-229](decisions.md), or collections it is sweeping of what a
@@ -2673,33 +2673,47 @@ says `migrating`; peers see it as down, and nothing is written to it. In order:
    required and the free space there is, and `estimate_secs`. **The start is
    refused if the volume holding the store has less free space than the
    requirement**, with the two figures (`the storage schema migration needs N
-   MiB free and M MiB is free`) and the four terms the requirement adds up:
+   MiB free and M MiB is free`) and its terms. The requirement is **the larger
+   of redb's next growth step and the documents re-keyed, plus the index chunks
+   in flight and a margin**:
    - **redb's next growth step for the file**: while the file is under 4 GiB it
      doubles; above, redb fills out its last 4 GiB region (the rest of that
      region), or adds a whole region when the file ends on a region boundary,
      and adds one region more only when the last region has less than twice
-     the largest single allocation left. The step is the file's length, and
-     ext4, XFS and APFS leave it unallocated until it is written;
+     the largest single allocation left. The step is the file's length: ext4,
+     XFS and APFS leave it unallocated until it is written, and HFS+ and ExFAT
+     allocate it;
    - **the documents re-keyed**: every document and tombstone with a number
      `_id`, once, at the size the staging table holds them in, plus four chunks
-     of 8,192 of them;
+     of 8,192 of them. It does not add to the step: each chunk is deleted from
+     the documents in the commit that stages it, so the chunks after it reuse
+     the pages it freed, and the file grows only when none is left, by one step;
    - **the index chunks in flight**: eight times one 16 MiB chunk of entries,
      or eight times what the indexes hold if that is less;
    - **a 64 MiB margin**.
 
    Nothing in it is the file's size over its document count: a store that is
    mostly oplog, or holds the freed pages of a purged collection, requires its
-   growth step, its own documents and the margin. An empty store requires 64
-   MiB; two documents in a 52 MiB file of oplog, 116 MiB; the 2,000,000-document
-   acceptance store, a 2,411 MiB file, 3,487 MiB (2,411 for the step, 884 for its
-   documents, 128 for the index chunks and the margin). On a 10 GiB volume,
-   redb's step leaves room for a store of up to just under 8 GiB; at 8 GiB it
-   is a whole 4 GiB region, and above it the rest of the region, more than is
-   left. The documents' term comes on top of the step. The documents are measured by
-   one read of them before the line is written, which looks for a stop as a
-   chunk does. A refused start writes nothing of the migration: the store is
-   still schema 4 and 0.50 opens it. Free space and start again. A partial index
-   whose stored filter this build cannot parse refuses the start the same way.
+   growth step and the margin. An empty store requires 64 MiB; two documents in
+   a 52 MiB file of oplog, 116 MiB; the 2,000,000-document acceptance store, a
+   2,411 MiB file, 2,603 MiB (the 2,411 MiB step, which holds its 884 MiB of
+   documents, 128 for the index chunks and the margin). On disk images of a
+   fixed size (APFS, HFS+ and ExFAT) with exactly the requirement free, every
+   store tried migrated to its end, and with 1 MiB less every start was
+   refused. On a 10 GiB volume, redb's step leaves room for a store of up to
+   just under 8 GiB; at 8 GiB it is a whole 4 GiB region, and above it the rest
+   of the region, more than is left.
+
+   The documents are measured by one read of the rows with a number `_id`
+   before the line is written: `/readyz` says `preflight`, with `done` of
+   `total` rows, and a stop ends it with nothing written. A store whose ids are
+   not numbers reads nothing. On a cold disk the read costs a read of those
+   documents (49 s for 2,000,000 just copied, on a busy laptop; 0.4 s for a
+   store just written), and the re-key that follows reads them again from a
+   warmer cache. A refused start writes nothing of the migration: the store is
+   still schema 4 and 0.50 opens it. Free space and start again. A partial
+   index whose stored filter this build cannot parse refuses the start the same
+   way.
 2. **From here, 0.50 and 0.49 refuse the store.** `kimmy.format` records schema
    5 just before the first commit, which writes schema 5 into the store and
    lists the work as markers. A start of 0.50 or 0.49 on the store, finished or
