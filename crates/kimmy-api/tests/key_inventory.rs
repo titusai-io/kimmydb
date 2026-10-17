@@ -150,7 +150,14 @@ const TABLES: &[Table] = &[
     Table {
         name: "schema5_unique_collisions",
         class: ReKeyed,
-        why: "(collection, index, value key) -> holders' schema-5 keys, carried rows converted",
+        why: "(collection, index, value key) -> holders' schema-5 keys, as the refill found them",
+    },
+    Table {
+        name: "schema5_carried_collisions",
+        class: ReKeyed,
+        why: "(collection, index, the schema-4 value key 3 -> 4 recorded) -> holders converted to \
+              schema-5 keys in the first commit; the key is never compared with a schema-5 one \
+              (the last commit settles a row by its holders) and the last commit deletes the table",
     },
     Table {
         name: "partial_rebuilt_under_find",
@@ -160,7 +167,7 @@ const TABLES: &[Table] = &[
     Table {
         name: "partial_rebuilt_unique_violations",
         class: ReKeyed,
-        why: "3 -> 4 holders in schema 4, converted into schema5_unique_collisions in the first \
+        why: "3 -> 4 holders in schema 4, converted into schema5_carried_collisions in the first \
               commit",
     },
 ];

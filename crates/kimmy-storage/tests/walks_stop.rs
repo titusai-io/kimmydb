@@ -266,6 +266,10 @@ const BOUNDED_READS: &[(&str, &str)] = &[
     ("migrate_v5_tests::entries_of", "test code reading a store it wrote itself"),
     ("migrate_v5_tests::metas_of", "test code reading a store it wrote itself"),
     ("migrate_v5_tests::phases", "test code reading a store it wrote itself"),
+    (
+        "migrate_v5_tests::progress_advances_with_every_chunk_in_every_phase",
+        "test code reading a store it wrote itself",
+    ),
     ("migrate_v5_tests::rewind_keys_to_v1", "test code rewriting a store it wrote itself"),
     ("migrate_v5_tests::rows", "test code reading a store it wrote itself"),
     ("migrate_v5_tests::to_schema_4", "test code rewriting a store it wrote itself"),
@@ -331,7 +335,17 @@ const BOUNDED_READS: &[(&str, &str)] = &[
         "migrate_v5::finish",
         "the schema 5 migration's last commit, at open: its markers, one row per range and index",
     ),
+    (
+        "migrate_v5::entries_left",
+        "one index's entries, keys only, once before its drain, at open, before the node \
+         serves; it looks for the stop every 4,096 entries itself",
+    ),
     ("migrate_v5::has_numeric", "one seek: whether a range holds a numeric key"),
+    (
+        "migrate_v5::index_bytes_upto",
+        "the preflight, at open, before the node serves: index entries up to one chunk's bytes \
+         (16 MiB), then it ends",
+    ),
     (
         "migrate_v5::move_back_chunk",
         "one chunk of a range's staged rows, at open, before the node serves; the stop is looked \
@@ -365,6 +379,11 @@ const BOUNDED_READS: &[(&str, &str)] = &[
         "migrate_v5::settle_carried",
         "the schema 5 migration's last commit, at open: the recorded collisions, the registry \
          and one document per carried holder",
+    ),
+    (
+        "migrate_v5::staged",
+        "the preflight's one read of the documents, at open, before the node serves and before \
+         anything is written; it looks for the stop every 4,096 rows itself",
     ),
     ("migrate_v5::staged_is_empty", "one seek: whether a range has staged rows"),
     (
