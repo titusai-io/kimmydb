@@ -129,7 +129,9 @@ fn bson_at(u: &mut Unstructured<'_>, depth: u8) -> Bson {
 fn decimal(u: &mut Unstructured<'_>) -> Bson {
     if u.arbitrary::<bool>().unwrap_or(true) {
         let text = *u.choose(&DECIMALS).unwrap_or(&"0");
-        Bson::Decimal128(text.parse().unwrap_or_else(|_| panic!("{text} is a Decimal128")))
+        Bson::Decimal128(
+            kimmy_core::decimal::parse(text).unwrap_or_else(|_| panic!("{text} is a Decimal128")),
+        )
     } else {
         Bson::Decimal128(bson::Decimal128::from_bytes(u.arbitrary().unwrap_or([0; 16])))
     }
@@ -333,7 +335,7 @@ mod tests {
     #[test]
     fn every_decimal_edge_is_a_decimal128() {
         for text in super::DECIMALS {
-            assert!(text.parse::<bson::Decimal128>().is_ok(), "{text}");
+            assert!(kimmy_core::decimal::parse(text).is_ok(), "{text}");
         }
     }
 }

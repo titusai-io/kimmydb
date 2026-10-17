@@ -6,8 +6,15 @@
 //! Every consumer of a decimal's value — the exact comparator, the key encoder,
 //! `DocId::Decimal128`, the expression layer's truthiness — reads it through
 //! [`decode`], so there is exactly one answer to "what number is this".
+//!
+//! Text is read by [`parse`], kimmydb's own strict and exact reader, and never
+//! by `bson`'s `FromStr`, which takes `""` as zero (see the `parse` module).
 
 use bson::Decimal128;
+
+mod parse;
+
+pub use parse::{ParseError, parse};
 
 /// The largest coefficient a `Decimal128` can hold: `10^34 - 1`.
 pub const MAX_COEFFICIENT: u128 = 9_999_999_999_999_999_999_999_999_999_999_999;
