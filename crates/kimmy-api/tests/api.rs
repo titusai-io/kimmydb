@@ -9029,6 +9029,45 @@ async fn find_and_modify_can_remove_and_can_project() {
     assert_eq!(gone.status, 404);
 }
 
+/// `find_and_modify` reports the version it produced only for a document that
+/// still exists: a change reports it, a removal (whose tombstone nothing can be
+/// conditional on) and an update that left the document as it was (ADR-208) do
+/// not. Held here because the answer is now rendered from an outcome (B5), and
+/// nothing else drove a removal's answer for the absence of `stamp`.
+#[tokio::test]
+async fn find_and_modify_reports_a_stamp_only_for_a_document_that_still_exists() {
+    let server = Server::start().await;
+    let token = jobs(&server).await;
+    let path = "/v1/db/app/coll/jobs/find_and_modify";
+
+    let changed = server
+        .post(
+            path,
+            Some(&token),
+            json!({ "filter": {"_id": 1}, "update": {"$set": {"status": "seen"}} }),
+        )
+        .await;
+    assert_eq!(changed.status, 200, "{:?}", changed.body);
+    assert!(changed.body["stamp"].is_string(), "a change names its version: {:?}", changed.body);
+
+    let unchanged = server
+        .post(
+            path,
+            Some(&token),
+            json!({ "filter": {"_id": 1}, "update": {"$set": {"status": "seen"}} }),
+        )
+        .await;
+    assert_eq!(unchanged.status, 200, "{:?}", unchanged.body);
+    assert_eq!(unchanged.body["modified"], 0);
+    assert!(unchanged.body.get("stamp").is_none(), "nothing written: {:?}", unchanged.body);
+
+    let removed =
+        server.post(path, Some(&token), json!({ "filter": {"_id": 1}, "remove": true })).await;
+    assert_eq!(removed.status, 200, "{:?}", removed.body);
+    assert_eq!(removed.body["modified"], 1);
+    assert!(removed.body.get("stamp").is_none(), "a tombstone is not named: {:?}", removed.body);
+}
+
 #[tokio::test]
 async fn upsert_seeds_the_filters_equalities() {
     // The Mongo behaviour people rely on: the created document carries the
