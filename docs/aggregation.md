@@ -182,8 +182,8 @@ wrong quietly:
 
 | | Over non-numeric values | Over `null` and missing | When nothing was usable |
 |---|---|---|---|
-| `$sum` | **Ignored** — a string, a bool, an array, a document contributes nothing. A field holding `42` on some documents and `"42"` on others sums only the first kind | Ignored | `0` |
-| `$avg` | Ignored, in the numerator **and** the count — a field present on half the documents gives the mean of that half, not half the mean | Ignored | `null` |
+| `$sum` | **Ignored** — a string, a bool, an array, a document contributes nothing. A field holding `42` on some documents and `"42"` on others sums only the first kind. **A `Decimal128` is refused**, `400`, `$sum needs numbers, found a Decimal128` — it is a number, and decimal arithmetic is not built; an array or a document holding one is ignored like any other | Ignored | `0` |
+| `$avg` | Ignored, in the numerator **and** the count — a field present on half the documents gives the mean of that half, not half the mean. **A `Decimal128` is refused**, as by `$sum` | Ignored | `null` |
 | `$min` `$max` | **Compared**, across types, in the [canonical order](key-encoding.md#type-ordering) — numbers below strings below documents below arrays below binary below ObjectIds below bools below dates | **Skipped**, both of them | `null` |
 | `$first` `$last` | Taken as they are | Taken as they are — `null` is a value here | — every group has a first and a last |
 | `$push` `$addToSet` | Taken as they are | Appended as `null`; `$addToSet` keeps one of them, and `undefined` is that same member | — nothing is unusable |
@@ -686,7 +686,9 @@ keeps documents' integer types intact ([ADR-002](decisions.md)).
 
 **`$avg` skips non-numeric and missing values rather than counting them as
 zero.** A field present on half the documents would otherwise halve the mean,
-silently.
+silently. A `Decimal128` is not skipped but refused, by `$avg` and `$sum`
+alike: it is a number, and a mean or a total of the other numbers would be a
+wrong answer that looks right.
 
 **`$group` buckets by value, not by type.** `5`, `5.0` and `5i64` share a
 bucket, because they share an index entry everywhere else in this database. The
@@ -1047,7 +1049,7 @@ documents holding large arrays can exceed the cap long before the stage ends.
 | `$lookup` with both `localField`/`foreignField` and `pipeline` | Refused, by decision ([ADR-217](decisions.md#adr-217--the-refusals-and-differences-ruled-to-stay-are-recorded-as-a-set)). Join on the key, then `$filter`/`$map` the attached array in the next stage |
 | `$convert` to `decimal` (or code `19`) | Converting a double to a `Decimal128` needs a rounding rule (a double's exact value can run to about 767 significant digits, a `Decimal128` holds 34), and choosing one is a decimal-arithmetic decision this build does not make; refused at parse, naming `double` and `long` as the alternatives. A `Decimal128` literal, or one in the data, is compared and grouped by its exact value ([Query language](query-language.md#3-comparisons-do-not-cross-type-groups)) |
 | `$toDecimal` | Never built as an operator, and refused at parse with the reason `$convert` gives for `decimal`: `unsupported operator "$toDecimal": converting to Decimal128 needs a rounding rule, because a double's exact binary value can run to about 767 significant digits and a Decimal128 holds 34, and this build has none; convert to double or long instead`. A `400`, as before |
-| Arithmetic on a `Decimal128` — `$add`, `$subtract`, `$multiply`, `$divide`, `$sum`, `$avg` | Not built: `$add` and the other operators answer `400`, *needs numbers, found a Decimal128*, and `$sum` and `$avg` skip a decimal as they skip any non-number. Comparing, grouping and sorting a decimal need no arithmetic and take it by value |
+| Arithmetic on a `Decimal128` — `$add`, `$subtract`, `$multiply`, `$divide`, `$mod`, and the `$sum` and `$avg` accumulators | Not built, and refused wherever it would be done, never skipped: each answers `400`, *`<operator>` needs numbers, found a Decimal128* (`$add needs numbers, found a Decimal128`, `$sum needs numbers, found a Decimal128`). Until 0.51.0 `$sum` and `$avg` skipped a decimal as they skip a string and answered a total or a mean of the other numbers. An array or a document holding a decimal is ignored by `$sum` and `$avg` as any array or document is: they never read inside one. Comparing, grouping and sorting a decimal need no arithmetic and take it by value ([Deviations](deviations.md)) |
 | `$facet`, `$bucket`, `$graphLookup`, `$merge`, `$out` | Not built. An unknown stage is refused with a message listing what is supported |
 | `$vectorSearch` anywhere but first, or inside a `$lookup` sub-pipeline | `400`, naming the rule: it is the pipeline's source, in place of the collection scan |
 | `$vectorSearch` fields from other systems — `queryVector`, `numCandidates`, `limit`, `index` | Refused, each naming the KimmyDB spelling (`vector`, `k`) or saying there is no such knob: KimmyDB has one vector index per collection ([ADR-216](decisions.md)) |
