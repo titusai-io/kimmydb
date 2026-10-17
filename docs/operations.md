@@ -2665,6 +2665,22 @@ changes: a number is keyed by its exact value, so that a `Decimal128` has a
 place in the order. While it runs, the node answers `/healthz` and `/readyz`
 says `migrating`; peers see it as down, and nothing is written to it. In order:
 
+**Before upgrading, check the free space on the volume that holds the data
+directory.** The first start needs, free: at least **the size of the store's
+`kimmy.redb` file** while that file is under 4 GiB (above 4 GiB, the rest of its
+last 4 GiB region, or a whole region when the file ends exactly on one), or the
+size of the documents with an integer `_id` if that is larger, **plus about 64
+MiB and the index working space (at most 128 MiB)**. A store with nothing to
+re-key and no indexes still needs its file's size: a 1,602 MiB file needs 1,666
+MiB. If the start is refused for want of space it says so with both figures
+(`the storage schema migration needs N MiB free and M MiB is free`), and nothing
+of the migration was written: every row, the sidecar and the schema are as they
+were, and 0.50 still opens the store. Add the space, temporarily if need be (a
+larger volume, or a second volume the data directory can be moved to, or another
+member's backup space), and start again; the space is used only while the
+migration runs, and the file returns to about its size afterwards on the
+filesystems measured.
+
 1. **The plan and the free-space check, before anything of the migration is
    written.** One line, `storage schema 4 -> 5 (exact number keys)`, names the
    collections, the ranges of documents (`purge_pending_ranges` counts those a
