@@ -2896,6 +2896,74 @@ fingerprint and ignores it.
 - **A member rolled back to 0.42.0** keeps the fingerprints on the records it
   holds, ignores them, and writes its own records without one.
 
+### Vector chunk ids in 0.51.0
+
+Until 0.51.0 a vector chunk was stored under its source `_id`'s display text,
+so **every binary `_id` of one length (every UUID) in a collection shared one
+chunk set**, and a String `_id` shared the chunks of the integer or ObjectId it
+prints as. Such a collection kept one document's vectors per id length, a
+delete of any document removed them, and a filtered search could return a
+document its filter excluded. 0.51.0 stores each chunk under an encoding that
+tells every two documents apart ([ADR-239](decisions.md)), and **keeps the old
+id for ObjectId, integer and every other String `_id`**, so those chunks do not
+move.
+
+- **Reads are right from the first start**, on every 0.51.0 member: a
+  document's chunks are read by the document their record names, under the new
+  id and under the old one.
+- **Every collection the server embeds is rechecked once.** A single node
+  queues the recheck at its first start, logged once at `INFO` (`queued a
+  one-time recheck of embedded collections for 0.51.0's vector chunk ids`,
+  with the collections), and its scans log `the 0.51.0 chunk-id recheck` as
+  their reason. A cluster member rechecks the collections it owns at its
+  first start, once its ownership has held, as every start's rescan of what a
+  member owns does. The collection's owner rescans it: **every document with a binary `_id` is
+  re-embedded once**, one provider call's worth each, though only one per id
+  length still had vectors; the chunks of a String `_id` that begins with `~`,
+  is 24 lowercase hex digits or is an integer's decimal are **moved, with no
+  provider call**, unless an integer or ObjectId of the same text shares them,
+  in which case it is re-embedded; everything else reads as current and costs
+  a read. A single node records that the recheck was queued
+  (`vector_chunk_ids` in its metadata), so later starts queue nothing; **a
+  backup taken before 0.51.0 and restored on it is queued again.** Size the
+  provider budget for the binary-keyed documents.
+- **Client-supplied (`byo`) collections are not rechecked**: no worker writes
+  them. Their vectors are served as they are, and the client's next `PUT` of a
+  document's vectors stores them under the new id and removes the old.
+- **Every vector index rebuilds once.** The HNSW snapshot on disk
+  (`<data_dir>/hnsw/`) is now format 3, keyed by the ids chunks are stored
+  under; a format-2 snapshot is refused (`discarding an unusable HNSW
+  snapshot`, `snapshot format 2 is not 3`) and rebuilt on the collection's first
+  search after the upgrade, on each member. A format-3 snapshot also records
+  how many times the collection's chunks had been moved to other ids when it
+  was built (`vector_renames:<collection id>` in the store's metadata), and one
+  saved before the recheck moved them is rebuilt after a restart rather than
+  served with ids that no longer exist. Nothing to do.
+- **During a roll** both builds write the same ids for ObjectId, integer and
+  plain-String documents. For a binary or reserved-String document the ids
+  differ: a 0.51.0 member reads a 0.50 member's chunks and moves or re-embeds
+  them at its next look, a 0.50 member finds a 0.51.0 member's only by a full
+  scan, and each move of a collection's ownership between the two builds costs
+  one provider call per such document. Members converge either way, and
+  deletes reach both kinds of id, **except one case**: a 0.50 member's delete
+  of a document whose `_id` is a String equal to an integer's decimal or an
+  ObjectId's hex removes the integer's or ObjectId's vectors too, on every
+  member. Each member says in its facts block which chunk-id format it writes
+  (`vector_chunk_ids`); **when every live member writes 0.51.0's**, logged at
+  `INFO` (`every live member now writes 0.51.0's vector chunk ids`), each
+  owner rechecks its collections once more after its ownership has held, which
+  re-embeds such a document and judges again whatever a 0.50 member wrote
+  after a document was last judged. The filter defect stays on 0.50 members
+  until they are upgraded. To force a recheck of a collection by hand on a
+  cluster, restart its owner: every clustered start rescans what the member
+  owns.
+- **Rolling back to 0.50.x** needs no store work: no schema, codec, wire field
+  or configuration key changed. A 0.50 build finds the chunks 0.51.0 wrote for
+  binary and reserved-String documents only by full scans and does not remove
+  them when their document is deleted (a search drops their hits, but they keep
+  storage), the shared chunk sets come back, and it rebuilds each vector index
+  once, refusing the format-3 snapshots.
+
 ### Rebuild vector indexes after upgrading past 2026-08-15
 
 **Builds before this date could produce an HNSW index that silently lost part

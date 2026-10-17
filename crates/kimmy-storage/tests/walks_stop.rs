@@ -41,6 +41,9 @@ const STOP_AWARE_WALKS: &[&str] = &[
     // Request scans of documents and of the oplog.
     "docs::Engine::for_each_doc_or_undecodable",
     "docs::Engine::for_each_record_after",
+    // One document's vector chunks, its run and its 0.50 ids, in one read
+    // (ADR-239).
+    "docs::Engine::for_each_doc_after_each",
     "docs::Engine::live_unique_violations_from_oplog",
     "docs::Engine::live_unique_violations_from_table",
     // Retention's scans, which serve no client.
@@ -148,8 +151,10 @@ const BOUNDED_READS: &[(&str, &str)] = &[
         "at most one chunk of a thousand rows of one collection, inside the write that removes them; the stop is looked for between two chunks (ADR-231)",
     ),
     (
-        "docs::WriteScope::for_each_doc",
-        "inside a write scope, which holds the single writer: close_writes bounds it (ADR-192)",
+        "docs::WriteScope::for_each_doc_after",
+        "inside a write scope, which holds the single writer: close_writes bounds it (ADR-192); \
+         `for_each_doc` is it from the start, and the vector writes read one document's chunks \
+         with it (ADR-239)",
     ),
     (
         "engine::Engine::all_collections_in",
