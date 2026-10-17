@@ -1093,6 +1093,49 @@ async fn every_insert_route_echoes_the_binary_id_it_stored_with_its_subtype() {
     }
 }
 
+/// A `Decimal128` `_id` echoes as the decimal the client sent, an integral one included.
+///
+/// An integral decimal in `i64` range is the `Int64` id of that value, with its stored body
+/// unchanged, so an echo rendered from the key would say `5` for a client that sent
+/// `Decimal128("5")`; the echo is the stored `_id`, and `find` by it finds the document.
+#[tokio::test]
+async fn a_decimal128_id_echoes_as_the_decimal_that_was_sent() {
+    let server = Server::start().await;
+    let token = server.root().await;
+    for name in ["one", "bulk", "upsert"] {
+        server.post("/v1/db/shop/collections", Some(&token), json!({ "name": name })).await;
+    }
+    let ids = [
+        json!({ "$numberDecimal": "5" }),
+        json!({ "$numberDecimal": "1.50" }),
+        json!({ "$numberDecimal": "-0.1" }),
+        json!({ "$numberDecimal": "1E+19" }),
+    ];
+    for id in &ids {
+        let res = server.post("/v1/db/shop/coll/one/docs", Some(&token), json!({"_id": id})).await;
+        assert_eq!(res.status, 200, "{id}: {:?}", res.body);
+        assert_eq!(&res.body["insertedId"], id, "insert echoes the decimal as sent");
+        let found = find_by_id(&server, &token, "one", &res.body["insertedId"]).await;
+        assert_eq!(found.len(), 1, "{id}: find by the echo finds the document");
+        assert_eq!(&found[0]["_id"], id);
+    }
+    let documents: Vec<Value> = ids.iter().map(|id| json!({"_id": id})).collect();
+    let res = server.post("/v1/db/shop/coll/bulk/bulk", Some(&token), json!(documents)).await;
+    assert_eq!(res.status, 200, "{:?}", res.body);
+    assert_eq!(res.body["insertedIds"], json!(ids), "bulk echoes every decimal as sent");
+    for id in &ids {
+        let res = server
+            .post(
+                "/v1/db/shop/coll/upsert/find_and_modify",
+                Some(&token),
+                json!({ "filter": {"_id": id}, "update": {"$set": {"n": 1}}, "upsert": true }),
+            )
+            .await;
+        assert_eq!(res.status, 200, "{id}: {:?}", res.body);
+        assert_eq!(&res.body["upsertedId"], id, "an upsert echoes the decimal it stored");
+    }
+}
+
 /// A generated ObjectId and an integer `_id` echo exactly as they did before
 /// the echo was taken from the stored value.
 #[tokio::test]
