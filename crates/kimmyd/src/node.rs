@@ -861,6 +861,10 @@ async fn start_and_serve(
             .context("writing the replay floor")?;
     }
     engine.set_multi_chunk_docs(config.storage.multi_chunk_docs);
+    // An idempotency key is remembered for the oplog's window (B5, Decision Q3):
+    // the lookup treats a record past it as absent, at the cutoff the retention
+    // pass collects it at, so the two read one setting.
+    engine.set_idempotency_window(config.storage.oplog_retention_secs);
     // Validation already refused anything else; the fallback is only so a
     // future class name cannot silently mean "durable".
     let class = kimmy_storage::DurabilityClass::parse(&config.storage.durability)
