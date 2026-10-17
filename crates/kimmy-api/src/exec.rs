@@ -19,6 +19,10 @@ use serde_json::{Value, json};
 
 use crate::error::ApiError;
 use crate::json::{document_to_json, json_to_document};
+use crate::outcome::{
+    BulkInsertOutcome, DeleteByIdOutcome, DeleteOutcome, FindAndModifyOutcome, InsertOutcome,
+    ReplaceOutcome, UpdateOutcome,
+};
 use crate::state::{Auth, SharedState};
 
 /// Default page size, so an unbounded `find` cannot be used to pull an entire
@@ -1028,10 +1032,7 @@ pub fn insert(
     let doc = json_to_document(document)?;
     let sent = doc.get(kimmy_storage::ID_FIELD).cloned();
     let (id, stamp) = state.engine.insert_stamped(&meta, doc)?;
-    Ok(json!({
-        "insertedId": crate::json::bson_to_json(&inserted_id(sent, &id)),
-        "stamp": stamp.encode(),
-    }))
+    Ok(InsertOutcome { inserted_id: inserted_id(sent, &id), stamp }.render())
 }
 
 /// The `_id` an insert reports: the one the client sent, which the engine
@@ -1082,15 +1083,10 @@ pub fn insert_many(
     // Positionally parallel to `insertedIds`: every document gets its own
     // stamp, and a caller following one up with a conditional write needs
     // the version it landed at, exactly as `insert` reports.
-    Ok(json!({
-        "inserted": stamped.len(),
-        "insertedIds": stamped
-            .iter()
-            .zip(sent)
-            .map(|((id, _), sent)| crate::json::bson_to_json(&inserted_id(sent, id)))
-            .collect::<Vec<_>>(),
-        "stamps": stamped.iter().map(|(_, stamp)| stamp.encode()).collect::<Vec<_>>(),
-    }))
+    let inserted_ids =
+        stamped.iter().zip(sent).map(|((id, _), sent)| inserted_id(sent, id)).collect();
+    let stamps = stamped.into_iter().map(|(_, stamp)| stamp).collect();
+    Ok(BulkInsertOutcome { inserted_ids, stamps }.render())
 }
 
 /// Name the offending document's position without changing the error envelope.
@@ -1135,16 +1131,14 @@ pub fn replace(
     // the same field name carrying two types on one protocol. Nothing stated
     // the type, so nothing disagreed until the specification's contract test
     // drove both routes and compared them (ADR-056). `upserted` stays a
-    // boolean because it genuinely is one.
-    let mut body = json!({
-        "matched": u8::from(outcome.matched),
-        "modified": u8::from(outcome.modified),
-        "upserted": outcome.upserted,
-    });
-    if let Some(stamp) = outcome.stamp {
-        body["stamp"] = json!(stamp.encode());
+    // boolean because it genuinely is one. [`ReplaceOutcome::render`] holds that.
+    Ok(ReplaceOutcome {
+        matched: outcome.matched,
+        modified: outcome.modified,
+        upserted: outcome.upserted,
+        stamp: outcome.stamp,
     }
-    Ok(body)
+    .render())
 }
 
 pub fn delete_by_id(
@@ -1164,11 +1158,7 @@ pub fn delete_by_id(
     // already did, and a by-id delete that said only `{"deleted": 1}` was the
     // one write a client could not follow with the version it made.
     let stamp = state.engine.delete_if(&meta, &doc_id, expected)?;
-    let mut body = json!({ "deleted": u8::from(stamp.is_some()) });
-    if let Some(stamp) = stamp {
-        body["stamp"] = json!(stamp.encode());
-    }
-    Ok(body)
+    Ok(DeleteByIdOutcome { stamp }.render())
 }
 
 /// A filtered write's parameters, mirroring [`FindParams`].
@@ -1271,15 +1261,14 @@ pub fn update(
         state.engine.modify_where(&meta, &candidates, &modify, stop_after)
     })?;
 
-    let mut body = json!({
-        "matched": outcome.matched,
-        "modified": outcome.modified,
-        "commits": outcome.commits,
-    });
-    if let Some(stamp) = single_stamp(multi, &outcome) {
-        body["stamp"] = json!(stamp.encode());
+    Ok(UpdateOutcome {
+        matched: outcome.matched,
+        modified: outcome.modified,
+        commits: outcome.commits,
+        stamp: single_stamp(multi, &outcome),
+        resumed: None,
     }
-    Ok(body)
+    .render())
 }
 
 /// An update body and the request's `arrayFilters`, parsed together: the
@@ -1525,41 +1514,31 @@ pub fn find_and_modify(
         kimmy_storage::blocking(|| state.engine.find_and_modify(&meta, &candidates, &modify))?;
 
     let returned = match spec.return_document {
-        ReturnDocument::Before => outcome.before.clone(),
-        ReturnDocument::After => outcome.after.clone(),
-    };
-    let document = match returned {
-        Some(doc) => document_to_json(&shape::project(projection.as_ref(), &doc)),
-        None => Value::Null,
+        ReturnDocument::Before => outcome.before.as_ref(),
+        ReturnDocument::After => outcome.after.as_ref(),
     };
 
     // `modified` as `/update` counts it (ADR-208): 1 when an existing
     // document was changed or removed, 0 when the update left it byte for
     // byte as it was, which writes nothing and so reports no `stamp`, and 0
     // for a document the upsert created, which `upserted` says, as on `PUT`.
-    let mut body = json!({
-        "document": document,
-        "matched": u64::from(outcome.matched),
-        "modified": u64::from(outcome.modified),
-        "upserted": outcome.upserted.is_some(),
-    });
-    if let Some(id) = outcome.upserted {
+    Ok(FindAndModifyOutcome {
+        document: returned.map(|doc| shape::project(projection.as_ref(), doc)),
+        matched: outcome.matched,
+        modified: outcome.modified,
         // The created document's own `_id`, as `insertedId` is (a binary's
         // subtype included): `after` is the image the engine stored.
-        let stored = outcome.after.as_ref().and_then(|doc| doc.get(kimmy_storage::ID_FIELD));
-        body["upsertedId"] =
-            crate::json::bson_to_json(&stored.map_or_else(|| id.to_bson(), Clone::clone));
-    }
-    if let Some(stamp) = outcome.stamp {
+        upserted_id: outcome.upserted.as_ref().map(|id| {
+            let stored = outcome.after.as_ref().and_then(|doc| doc.get(kimmy_storage::ID_FIELD));
+            stored.map_or_else(|| id.to_bson(), Clone::clone)
+        }),
         // The version the write produced — what the next conditional write
         // names. A removal produces a tombstone's stamp, which nothing can
         // be conditional on, so it is reported only for a document that
         // still exists.
-        if outcome.after.is_some() {
-            body["stamp"] = json!(stamp.encode());
-        }
+        stamp: outcome.stamp.filter(|_| outcome.after.is_some()),
     }
-    Ok(body)
+    .render())
 }
 
 pub fn delete(
@@ -1601,11 +1580,13 @@ pub fn delete(
         state.engine.modify_where(&meta, &candidates, &modify, stop_after)
     })?;
 
-    let mut body = json!({ "deleted": outcome.modified, "commits": outcome.commits });
-    if let Some(stamp) = single_stamp(multi, &outcome) {
-        body["stamp"] = json!(stamp.encode());
+    Ok(DeleteOutcome {
+        deleted: outcome.modified,
+        commits: outcome.commits,
+        stamp: single_stamp(multi, &outcome),
+        resumed: None,
     }
-    Ok(body)
+    .render())
 }
 
 // ---------------------------------------------------------------------------

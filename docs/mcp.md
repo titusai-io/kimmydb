@@ -196,6 +196,18 @@ Both require the collection to have embeddings configured — see
 | `create_collection` | Required before inserting; a write to a missing collection fails rather than creating it. Needs `ddl` |
 | `create_index` | Secondary index. Needs `ddl` |
 
+`insert`, `insert_many`, `update` and `delete` take an optional
+`idempotency_key`, the MCP form of the `Idempotency-Key` header: 16 to 255
+printable ASCII characters, such as a UUID, with no quotes
+([HTTP API](http-api.md#idempotency-keys)). The same call sent again with the
+same key is answered with its first result, which carries
+`"kimmydb/idempotency-replayed": true` in its `_meta`, and nothing is written
+again. A call is the same when the tool and its other arguments are, every
+document's fields in the order sent. The argument is refused where the header
+would be: malformed, reused for a different call, or while this member does not
+take keys. `/mcp` itself refuses the header: a tool call is keyed by its
+argument.
+
 `ddl` is its own action, and it federates ([ADR-090](decisions.md)): an agent
 authenticating through an identity provider can be given the right to create
 the collection it writes to without being given the server. Before 0.14.0 both

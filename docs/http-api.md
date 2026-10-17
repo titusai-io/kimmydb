@@ -162,7 +162,9 @@ curl -XPOST localhost:7878/v1/db/shop/coll/orders/docs -H "$A" \
 { "insertedId": { "$oid": "6745f2a1b3c4d5e6f7081920" } }
 ```
 
-`_id` is generated if absent. A duplicate `_id` is **409** with
+`_id` is generated if absent: a random ObjectId, or, on a request carrying an
+`Idempotency-Key`, a string derived from the key and the request (see
+[The derived `_id`](#the-derived-_id)). A duplicate `_id` is **409** with
 `"error": "duplicate_key"`.
 
 ### Bulk insert
@@ -483,7 +485,38 @@ curl -XPOST localhost:7878/v1/db/shop/coll/orders/update -H "$A" -d '{
 Sent again after `partially_applied`, it touches exactly the documents the
 first attempt did not. `if_stamp` does not help here: it names one document,
 and cannot be combined with `multi`. **A client must never resend a
-multi-document write automatically**, on this code or any other.
+multi-document write automatically**, on this code or any other, unless it
+carries a key.
+
+**Sending it again with its key.** A `multi: true` update or delete sent with
+an [`Idempotency-Key`](#idempotency-keys) is recovered by sending it again
+with the same key, whatever ended it: `partially_applied`, a dropped
+connection, a crash, a node that stopped at its drain deadline. It **resumes**:
+it continues past the point it reached, and writes only matching documents
+that **have not changed since the request's first write**, by stamp order, so
+it never writes a document twice, on any member. A match it leaves because it
+changed after that write, by this request on another member or by another
+write, is counted in **`skipped`**, not in `matched`, and the answer carries
+**`resumed: true`**:
+
+```json
+{"matched": 1800, "modified": 1800, "commits": 2, "skipped": 3, "resumed": true}
+```
+
+`matched`, `modified`, `commits` and `skipped` are cumulative across the
+request's attempts. If it fails again it answers `partially_applied` as above,
+with cumulative counts, and can be sent again. A request whose record says it
+is done is answered with its counts (a replay); one still running on this
+member is `409 idempotency_key_in_flight`, `Retry-After: 1`. A resume on the
+member that started it starts after the point the record names; on another
+member it starts from the beginning and relies on the stamp rule alone.
+
+**A keyed resend leaves the matches that changed.** That is the point for a
+`$inc`, which must not land twice, and a difference for a `$set` to constants,
+which an unkeyed resend would also write to the documents changed meanwhile. A
+client that needs every *current* match written sends the request again
+**without the key**, for an update that is idempotent, or uses the marker
+pattern above, which is also the answer for a client that sends no keys.
 
 ### Describe
 
@@ -529,6 +562,208 @@ writing already says what an acknowledged write means.
 
 The same information backs the MCP `describe_collection` tool; see
 [MCP](mcp.md).
+
+---
+
+## Idempotency keys
+
+A document write may carry an **`Idempotency-Key`**. The member that applies
+the write keeps a record of it in the write's own transaction, so a retry of
+the same request with the same key gets the **first answer** back, marked
+`Idempotency-Replayed: ?1`, and nothing is written again. The record survives
+exactly what the write survives: a crash, a failed fsync, a restart, under both
+durability classes. This is what makes a write safe to send again after an
+answer that never came or said
+[`outcome_unknown`](clients.md#retrying-after-an-unknown-outcome).
+
+```bash
+curl -XPOST localhost:7878/v1/db/shop/coll/orders/docs -H "$A" \
+  -H 'Idempotency-Key: "6f1c0e52-8a1d-4f53-9b3e-2c1d6a7e4b90"' \
+  -d '{"item":"widget","qty":5}'
+```
+
+Sent again, the same request answers `200` with the same body, `insertedId`
+and `stamp` included, and the header `Idempotency-Replayed: ?1`. A member
+lists the capability `idempotency-keys` in
+[`GET /v1/version`](#version-and-capabilities) while it takes the header.
+
+### The header
+
+The value is a structured-field **String** (RFC 9651), as the
+draft-ietf-httpapi-idempotency-key-header-07 requires: **quoted**, and once
+unquoted and unescaped, **16 to 255 printable ASCII characters**. `\"` and
+`\\` are the only escapes, and each counts as one character. Use a UUID (v4
+or v7), a new one for every new request. Refused `400 bad_request`, with the
+message naming the header and what is wrong:
+
+- the header on more than one field line;
+- an empty or unquoted value (a bare token is not a String);
+- a key shorter than 16 or longer than 255 characters, or holding a character
+  outside printable ASCII;
+- parameters on the value (`"k";a=1`), which are refused rather than ignored,
+  or anything else after the string.
+
+### Routes that take it
+
+| Route | |
+|---|---|
+| `POST …/docs` | insert |
+| `POST …/bulk` | one key for the whole batch |
+| `PUT …/docs/{id}` | replace. The method is idempotent already; a key turns a retry's `409 stale` (with `if_stamp`) into the first answer |
+| `DELETE …/docs/{id}` | and turns a retry's `{"deleted": 0}` into the first answer |
+| `POST …/update` | single, or `multi: true` |
+| `POST …/find_and_modify` | including an upsert |
+| `POST …/delete` | single, or `multi: true` |
+| MCP tools `insert`, `insert_many`, `update`, `delete` | as the argument `idempotency_key`, the same key without the quotes: an MCP client sets no header per tool call. A replayed tool result carries `"kimmydb/idempotency-replayed": true` in its `_meta` ([MCP](mcp.md)) |
+
+**Every other route refuses the header with `400 bad_request`** ("this route
+does not take an Idempotency-Key"): reads, including the `POST` `find`,
+`count` and `aggregate`; schema changes; vectors, webhooks, users, roles and
+the backup; the health probes; `/mcp` itself; and `update` and `delete` with
+`explain: true`, which write nothing. A client that believes it is protected
+and is not is worse off than one told no, so the header is refused where it
+would do nothing, never ignored. Schema changes are left out on purpose: their
+retries already say what an earlier attempt did (a second create is `409
+conflict`, a second drop is `{"dropped": false}`), and a database drop that
+answered `partially_applied` is recovered by sending it again. The refusal is
+made before authentication, as a query string's is: it reads the header and the
+route and nothing else.
+
+**This changed in 0.52.0.** Earlier releases ignored the header on every
+route, so a client or a proxy that stamps it on every request breaks against
+this release. A member of an earlier release still ignores it, and does not
+list `idempotency-keys`.
+
+### Same key, same request
+
+A key belongs to a **principal and a collection**: the same key from another
+user, or on another collection, is another key. The principal is its name,
+`local:<user>` or, for a federated caller, its issuer and subject; users
+replicate cluster-wide, so a caller has the same scope on every member. A
+local user deleted and created again under the same name within the window
+inherits the old one's keys. The key itself is never stored, only a hash over
+the principal, the collection and the key.
+
+What makes a retry **the same request** is its fingerprint: a SHA-256 over the
+method, the route, the path and query string **as sent**, and the body
+**as sent**. A retry must therefore send the same bytes: a body whose fields
+come in another order, or a path percent-encoded differently, is another
+request. An MCP call is fingerprinted over the tool and its arguments without
+`idempotency_key`, with every document's fields in the order sent.
+
+### What each case answers
+
+| Case | Answer |
+|---|---|
+| The member does not take keys now (see [The gate](#the-gate)) | `400 bad_request` naming the header and the cause. Nothing is looked up or written |
+| No record of the key | Processed as without a key. If it wrote anything, the record is written with it. No marker |
+| A record, the same request | The first answer: `200` and the body the first attempt returned, with `Idempotency-Replayed: ?1`. Nothing is written. Under `coalesced` it is answered once the record's commit is durable |
+| A record, a different request | `422 idempotency_key_reused`, `retry: no`. Nothing is written |
+| A `multi: true` update or delete with this key is still running on this member | `409 idempotency_key_in_flight`, `retry: wait`, `Retry-After: 1`. Nothing is written; sent again here once it ends, it is answered from its record |
+| A record of a `multi: true` request that stopped and is not running here | It resumes: [a request that was partly applied](#a-request-that-was-partly-applied) |
+| Two single-document requests with one key at once | They wait for the single writer as any write does: whichever commits first applies, and the other is answered from its record |
+| The request changed nothing: refused, matched nothing, or left every document as it was ([ADR-208](decisions.md)) | No record: a retry is evaluated again, and since the first attempt changed nothing it is still the request's only change |
+
+**Authorization comes first.** A principal whose grant was revoked since gets
+`403`, not a replay.
+
+**A replay is the first answer, not the current state.** Its `stamp` names the
+version the first attempt produced; an `if_stamp` built from it is `409
+stale` if the document has moved on since, which is correct. When the first
+attempt was answered `outcome_unknown`, or not at all, the replay is the `200`
+that attempt never delivered. Only an answer that wrote is replayed: a
+`409 duplicate_key` or a `400` is not remembered.
+
+### The derived `_id`
+
+A keyed insert without `_id` (an insert, each document of a bulk, a
+`find_and_modify` upsert's seed) gets an `_id` **derived from the key and the
+request** instead of a random ObjectId: a UUID version 8 (RFC 9562, built from
+SHA-256 over the collection, the key's scope, the request's fingerprint and the
+document's position in the batch), stored as its canonical 36-character
+**string**. A retry of the same request derives the same `_id`, so two
+applications of one insert on two members are two versions of one document,
+and last-writer-wins keeps one. A key reused with a different request derives
+a different one, so it never replaces a document another request wrote.
+
+**It is a string beside ObjectIds.** A collection written with and without keys
+holds both types of `_id`. Comparisons stay within a type, so an `_id` range
+over ObjectIds (paging by time order, `{"_id": {"$gt": {"$oid": …}}}`) silently
+excludes the string ids, and in `_id` order the strings sort before every
+ObjectId. `$toDate` does not apply to them. A by-id route addresses one as any
+string `_id` (`docs/6f1c0e52-…`). Send your own `_id` if the collection needs
+one type.
+
+### How long a key is remembered
+
+A key is remembered **`storage.oplog_retention_secs` after the write's last
+commit**, 24 hours by default: the window in which the write itself is kept and
+replicated. `GET /v1/version` publishes it as `idempotencyWindowSecs`, and it is
+**each member's own**: members configured differently remember keys for
+different times. After it, the same request is a new one; a keyed insert
+without `_id` still lands on its derived `_id`, and answers `409 duplicate_key`
+while that document stands.
+
+### A retry on another member
+
+The record travels with the write's entries, so **a member that has received
+the write replays it** like the member that took it. A member that has **not
+received it yet cannot know the key**, and applies the request a second time,
+answering without the marker. That window runs from the first member's commit
+until the member the retry reaches has pulled the write, directly or through
+another member: at least one `cluster.sync_interval_secs` while the first member
+serves, longer in a large cluster or one whose rounds against it fail, and for
+as long as the first member is down or cut off, which is the usual state right
+after a failed fsync. **There is no wait after which a retry elsewhere is
+safe.** What the second application does:
+
+- **By id** (insert, bulk, replace, delete by id) it targets the same documents
+  and leaves no duplicate; an insert without `_id` uses the derived `_id`.
+- **By filter** (`update`, `delete`, `find_and_modify` and its upsert) it
+  targets what the filter selects on the member it reaches, which can be
+  different documents, and then both changes stand.
+- Where both applications started from the same version of a document,
+  last-writer-wins keeps one of them, which is the change made once: a `$inc`
+  lands once. Where they did not (a later write the second member had not
+  seen), last-writer-wins decides as for any concurrent write, and that later
+  write can be lost.
+
+**To stay protected, retry on the member that took the write, once it serves
+again.** Every client's member selection is sticky already
+([Clients](clients.md)). Retrying elsewhere accepts the above, and is the only
+choice if that member does not come back.
+
+### The gate
+
+A member takes the header only while **its `cluster.idempotency_keys` is set
+and every live member carries records**. Otherwise every keyed route refuses
+it with `400 bad_request`, naming the header and the cause: the switch when it
+is off, otherwise the live member that does not carry records (a member of an
+earlier release, or one not heard from yet). The member then does not list
+`idempotency-keys`. The switch defaults to `true` with clustering off, so a
+single node takes keys with no setting, and to `false` with clustering on: a
+cluster takes them once its operator has set it, after every member runs this
+release ([Operations](operations.md#clusteridempotency_keys-and-the-procedure)).
+During a roll the members of this release refuse the header; branch on the
+capability per node, as for every capability. A client that read
+`idempotency-keys` and then meets this `400` has met a roll, a rollback or a
+change of the switch in between. A refused retry is not lost: a record written
+before the gate closed stays for its window, and the retry replays from it once
+the gate opens again.
+
+### What is not guaranteed
+
+- Nothing after the key's window ends.
+- Nothing on a member of an earlier release, which ignores the header.
+- Nothing across collections or principals: a key is scoped to both.
+- Nothing for schema changes, vectors, webhooks or administration, which refuse
+  the header.
+- Nothing about the change stream and webhooks, which carry each application
+  of a request as its own event.
+- Once the switch is set, **rolling any member back to an earlier release
+  reopens the gap** it closes: that member relays keyed writes without their
+  records, and a retry on a member that pulled one through it can apply on top
+  of the first application.
 
 ---
 
@@ -1316,17 +1551,20 @@ curl localhost:7878/v1/version
                    "client-supplied-vectors", "cursor-paging", "find-and-modify",
                    "hybrid-search", "partial-indexes", "token-refresh", "topology",
                    "ttl-indexes", "vector-search", "webhooks", "conditional-writes",
-                   "local-embeddings"],
-  "durability": "durable" }
+                   "local-embeddings", "idempotency-keys"],
+  "durability": "durable",
+  "idempotencyWindowSecs": 86400 }
 ```
 
 That is the complete list, in the order the server emits it. Every entry but
-one is constant for a build: `local-embeddings` is **the only conditional
-capability**, present on a build compiled with that feature and absent
-otherwise, so a `local` embedding provider is accepted on such a node and
-refused everywhere else. What each name entitles a client to is tabulated
-under `Capability` in [`openapi.yaml`](openapi.yaml), and a test holds the
-server's enum, that table and this list to one set.
+two is constant for a build. `local-embeddings` is present on a build compiled
+with that feature and absent otherwise, so a `local` embedding provider is
+accepted on such a node and refused everywhere else. `idempotency-keys` is
+present **while the member takes `Idempotency-Key`**, which can change while it
+runs: its `cluster.idempotency_keys` is set and every live member carries
+records ([Idempotency keys](#the-gate)). What each name entitles a client to is
+tabulated under `Capability` in [`openapi.yaml`](openapi.yaml), and a test
+holds the server's enum, that table and this list to one set.
 
 `commit` and `durability` are fields, not capabilities. `commit` is the short
 git commit the binary was built from — `unknown` for a build made without git,
@@ -1336,6 +1574,9 @@ is how this node makes a commit durable, `durable` or `coalesced`; both are
 durable when a write returns, and the value is a fact about the node's
 configuration rather than its build, which is why it is not in the capability
 list ([Storage](storage.md#durability-classes), [ADR-088](decisions.md)).
+`idempotencyWindowSecs` is how long this node remembers an `Idempotency-Key`,
+its `storage.oplog_retention_secs`, a field for the same reason
+([Idempotency keys](#how-long-a-key-is-remembered)).
 
 **Branch on `capabilities`, not on `version`.** A version number only answers
 "can I use this" if the client also carries a table mapping versions to
@@ -1369,7 +1610,7 @@ and `verify` today, and a client treats a class it does not know as `no`.
 
 | Status | `error` | `retry` | Cause |
 |---|---|---|---|
-| 400 | `bad_request` | no | Malformed filter, update, projection, or Extended JSON; a bulk batch over 1000 documents; a query parameter the route does not define, or one it cannot parse or honour — `?sample=0` on `describe` ([ADR-121](decisions.md)); an `if_stamp` that is not a stamp the server issued; a `vector_search` or `hybrid_search` on a collection with **no vector configuration**, where the message names the `POST …/vector` route that enables it; **a key `$unwind`'s document form, `$lookup`, or `$replaceRoot` does not define, or a document whose `$unwind` path crosses an array** ([ADR-129](decisions.md), [ADR-130](decisions.md)) |
+| 400 | `bad_request` | no | Malformed filter, update, projection, or Extended JSON; a bulk batch over 1000 documents; an `Idempotency-Key` on a route that does not take one, a malformed one, or one while the member does not take keys, naming the header and the cause ([Idempotency keys](#idempotency-keys)); a query parameter the route does not define, or one it cannot parse or honour — `?sample=0` on `describe` ([ADR-121](decisions.md)); an `if_stamp` that is not a stamp the server issued; a `vector_search` or `hybrid_search` on a collection with **no vector configuration**, where the message names the `POST …/vector` route that enables it; **a key `$unwind`'s document form, `$lookup`, or `$replaceRoot` does not define, or a document whose `$unwind` path crosses an array** ([ADR-129](decisions.md), [ADR-130](decisions.md)) |
 | 422 | `bad_request` | no | A body that is valid JSON but the wrong shape — an object where `/bulk` wants an array, a required field missing, a field the route does not define, or an explicit `null` on a declared *optional* field that does not accept one; the message names it ([ADR-121](decisions.md), [ADR-128](decisions.md)). A `null` sent for a *required* field is refused too, but by that field's own type — see [The JSON boundary](#the-json-boundary) — and is not always this status. **Not** a pipeline stage operand's unknown key, which is untyped JSON at this layer and is refused `400` once `kimmy-query` parses it (ADR-129) |
 | 401 | `unauthorized` | no | Missing, malformed, invalid, or expired token; bad credentials; a token whose account was deleted, disabled, or had its password or grants changed ([ADR-052](decisions.md)) |
 | 403 | `forbidden` | no | Denied by RBAC |
@@ -1377,6 +1618,8 @@ and `verify` today, and a client treats a class it does not know as `no`.
 | 409 | `conflict` | no | Collection exists; an index name already taken by a different definition; last user; self-deletion |
 | 409 | `duplicate_key` | no | `_id` already present |
 | 409 | `unique_violation` | no | A unique index would be violated |
+| 422 | `idempotency_key_reused` | no | The request's `Idempotency-Key` is remembered on this member for a different request (another body, path, query or method) from this principal on this collection. Nothing was written. Use a new key for a new request ([Idempotency keys](#what-each-case-answers)) |
+| 409 | `idempotency_key_in_flight` | wait | A `multi: true` update or delete with this `Idempotency-Key` is still running on this member. Nothing was written. Carries `Retry-After: 1`; sent again here once it has finished, it is answered from its record. Not elsewhere: a member that has not received the record would apply it a second time |
 | 409 | `stale` | no | A conditional write's `if_stamp` did not match: the document is at another version, or is gone. Nothing was written — re-read, decide again, and send a new request with the current stamp ([conditional writes](#get-replace-delete-by-id)) |
 | 503 | `collection_purging` | wait | Creating a collection, or enabling vectors, under a name whose earlier collection's drop is still being removed on this node. Nothing was written, and that removal was moved to the front. Carries `Retry-After` in seconds; the retry succeeds once the removal is done ([ADR-189](decisions.md)) |
 | 503 | `resolver_busy` | wait | A host the request had to resolve — a webhook's on registration, an embedding provider's on configuration or for a search's `query` — was not looked up, because the lookups this node allows at once were all waiting on a resolver that has not answered ([Operations](operations.md#discovery-formats)). Nothing was done. Carries `Retry-After` in seconds, how long a failed lookup's answer is kept. A host that does not resolve is a `400` on registration and configuration, and a `502 provider_error` on a search |

@@ -778,6 +778,95 @@ fn the_routes_that_read_a_query_string_are_the_ones_the_specification_gives_one(
     );
 }
 
+/// Every `(method, path)` the specification gives the `Idempotency-Key` header
+/// parameter, at the operation or at the path level.
+fn operations_with_the_idempotency_header() -> BTreeSet<(String, String)> {
+    let spec = spec();
+    let has = |parameters: &Value| {
+        parameters.as_array().is_some_and(|list| {
+            list.iter().any(|p| {
+                let p = resolve(spec, p);
+                p["in"] == "header" && p["name"] == "Idempotency-Key"
+            })
+        })
+    };
+    let mut out = BTreeSet::new();
+    for (template, item) in spec["paths"].as_object().expect("paths") {
+        let path_level = has(&item["parameters"]);
+        for (method, operation) in item.as_object().expect("path item") {
+            if method == "parameters" {
+                continue;
+            }
+            if path_level || has(&operation["parameters"]) {
+                out.insert((method.to_uppercase(), template.clone()));
+            }
+        }
+    }
+    out
+}
+
+/// The routes the server opens to `Idempotency-Key` are exactly the operations
+/// the specification gives the header (B5), and each of them documents what a
+/// key can draw: the replay marker on its `200`, and `idempotency_key_reused`
+/// on its `422`.
+///
+/// `IDEMPOTENT_ROUTES` only opens routes, as `QUERY_STRING_ROUTES` does: a
+/// route absent from it refuses the header, so a documented header the server
+/// refuses, or a route open to a key the document does not mention, is a
+/// failure here rather than a client that believes it is protected. The
+/// entries are held to be registered routes too, so a typo cannot open
+/// nothing and pass.
+#[test]
+fn the_routes_that_take_an_idempotency_key_are_the_ones_the_specification_gives_one() {
+    let opened: BTreeSet<(String, String)> = kimmy_api::routes::IDEMPOTENT_ROUTES
+        .iter()
+        .map(|(method, template)| (method.to_string(), template.to_string()))
+        .collect();
+    assert_eq!(
+        opened.len(),
+        kimmy_api::routes::IDEMPOTENT_ROUTES.len(),
+        "IDEMPOTENT_ROUTES lists a route twice"
+    );
+    let documented = operations_with_the_idempotency_header();
+    assert_eq!(
+        opened, documented,
+        "IDEMPOTENT_ROUTES and the operations docs/openapi.yaml gives the Idempotency-Key \
+         header disagree"
+    );
+    let registered = registered_operations();
+    let unregistered: Vec<_> = opened.difference(&registered).collect();
+    assert!(
+        unregistered.is_empty(),
+        "IDEMPOTENT_ROUTES names unregistered routes: {unregistered:#?}"
+    );
+
+    let spec = spec();
+    for (method, template) in &opened {
+        let operation = &spec["paths"][template][method.to_lowercase()];
+        let ok = resolve(spec, &operation["responses"]["200"]);
+        assert!(
+            ok["headers"].get("Idempotency-Replayed").is_some(),
+            "{method} {template}: its 200 does not document Idempotency-Replayed"
+        );
+        let reused = resolve(spec, &operation["responses"]["422"]);
+        assert!(
+            reused["description"].as_str().is_some_and(|d| d.contains("idempotency_key_reused")),
+            "{method} {template}: its 422 does not document idempotency_key_reused"
+        );
+    }
+    // A request with the key still running here is a `multi: true` update or
+    // delete, the two that commit in chunks.
+    for template in ["/v1/db/{db}/coll/{coll}/update", "/v1/db/{db}/coll/{coll}/delete"] {
+        let conflict = resolve(spec, &spec["paths"][template]["post"]["responses"]["409"]);
+        assert!(
+            conflict["description"]
+                .as_str()
+                .is_some_and(|d| d.contains("idempotency_key_in_flight")),
+            "POST {template}: its 409 does not document idempotency_key_in_flight"
+        );
+    }
+}
+
 /// Every operation documents the `400` a query string can draw.
 ///
 /// This used to hold only the operations that take a query parameter, for
@@ -1321,7 +1410,7 @@ async fn every_documented_operation_answers_as_the_specification_says() {
         .collect();
     assert_eq!(
         served,
-        kimmy_api::version::capabilities(),
+        kimmy_api::version::capabilities(&c.server.state),
         "the wire and the server's own list disagree"
     );
     // Both assertions around this one are satisfied by an *empty* list: the
@@ -1334,11 +1423,18 @@ async fn every_documented_operation_answers_as_the_specification_says() {
     // that is the failure the whole mechanism exists to prevent.
     //
     // So the unconditional ones are named. `Capability::present` answers
-    // `true` for everything except `LocalEmbeddings`, so every other
-    // capability must appear in any build.
+    // `true` for everything except `LocalEmbeddings`, which the build decides,
+    // and `IdempotencyKeys`, which the gate decides at each answer, so every
+    // other capability must appear in any build.
     let always: Vec<&str> = kimmy_api::version::Capability::ALL
         .iter()
-        .filter(|c| !matches!(c, kimmy_api::version::Capability::LocalEmbeddings))
+        .filter(|c| {
+            !matches!(
+                c,
+                kimmy_api::version::Capability::LocalEmbeddings
+                    | kimmy_api::version::Capability::IdempotencyKeys
+            )
+        })
         .map(|c| c.as_str())
         .collect();
     assert!(!always.is_empty(), "the fixture itself must not be vacuous");
@@ -1358,6 +1454,10 @@ async fn every_documented_operation_answers_as_the_specification_says() {
         kimmy_vector::local_embeddings_available(),
         "local-embeddings is advertised exactly when this build has it; served {served:?}"
     );
+    // A lone node whose gate nobody closed takes keys, so it lists them (B5),
+    // and says how long it remembers one.
+    assert!(served.contains(&"idempotency-keys"), "served {served:?}");
+    assert_eq!(advertised["idempotencyWindowSecs"], 86_400);
 
     // -- auth --------------------------------------------------------------
     let root = c.login("root", ROOT_PASSWORD).await;

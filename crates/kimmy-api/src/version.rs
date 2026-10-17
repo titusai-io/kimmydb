@@ -27,7 +27,7 @@ use axum::extract::State;
 use axum::{Json, response::IntoResponse};
 use serde_json::{Value, json};
 
-use crate::state::SharedState;
+use crate::state::{AppState, SharedState};
 
 /// The protocol major version this build serves.
 ///
@@ -64,10 +64,17 @@ pub enum Capability {
     /// reason this list is not a constant: a `local` provider is accepted on a
     /// node built with `local-embeddings` and refused on one without.
     LocalEmbeddings,
+    /// `Idempotency-Key` on the document writes, the `Idempotency-Replayed`
+    /// marker and the two key codes (B5). **The one that varies at run time**:
+    /// listed only while this member takes the header, which is while the
+    /// operator's switch is set and every live member carries records. A
+    /// client that read it and then meets the gate's `400` has met a roll, a
+    /// rollback or a change of the switch in between.
+    IdempotencyKeys,
 }
 
 impl Capability {
-    pub const ALL: [Capability; 16] = [
+    pub const ALL: [Capability; 17] = [
         Self::Aggregation,
         Self::BulkInsert,
         Self::Backup,
@@ -84,6 +91,7 @@ impl Capability {
         Self::Webhooks,
         Self::ConditionalWrites,
         Self::LocalEmbeddings,
+        Self::IdempotencyKeys,
     ];
 
     pub fn as_str(self) -> &'static str {
@@ -104,26 +112,30 @@ impl Capability {
             Self::Webhooks => "webhooks",
             Self::ConditionalWrites => "conditional-writes",
             Self::LocalEmbeddings => "local-embeddings",
+            Self::IdempotencyKeys => "idempotency-keys",
         }
     }
 
-    /// Whether *this* node has it.
+    /// Whether *this* node has it, now.
     ///
-    /// Constant for everything a build always carries, and a real question for
-    /// the one that is feature-gated. A capability whose answer is always
-    /// `true` still belongs here: it is `true` on this build, and the client
-    /// asking is one that may also be talking to a node from before it existed.
-    pub fn present(self) -> bool {
+    /// Constant for everything a build always carries, a question about the
+    /// build for the one that is feature-gated, and a question about this
+    /// moment for the one that is gated at run time. A capability whose answer
+    /// is always `true` still belongs here: it is `true` on this build, and the
+    /// client asking is one that may also be talking to a node from before it
+    /// existed.
+    pub fn present(self, state: &AppState) -> bool {
         match self {
             Self::LocalEmbeddings => kimmy_vector::local_embeddings_available(),
+            Self::IdempotencyKeys => state.idempotency_gate().is_ok(),
             _ => true,
         }
     }
 }
 
-/// The capabilities this node actually has, in a stable order.
-pub fn capabilities() -> Vec<&'static str> {
-    Capability::ALL.iter().filter(|c| c.present()).map(|c| c.as_str()).collect()
+/// The capabilities this node actually has now, in a stable order.
+pub fn capabilities(state: &AppState) -> Vec<&'static str> {
+    Capability::ALL.iter().filter(|c| c.present(state)).map(|c| c.as_str()).collect()
 }
 
 /// What this node is, and what it can do.
@@ -142,11 +154,17 @@ pub async fn version(State(state): State<SharedState>) -> impl IntoResponse {
         // over lands on different builds, and this is what tells it which one
         // this answer came from.
         "node": state.engine.node_id().to_string(),
-        "capabilities": capabilities(),
+        "capabilities": capabilities(&state),
         // A fact about this node's configuration rather than its build, so
         // a field rather than a capability: the capability set is closed by
         // an enum, and "durable" is not a feature a client uses (ADR-088).
         "durability": state.engine.durability().as_str(),
+        // How long this node remembers an `Idempotency-Key`, in seconds:
+        // `storage.oplog_retention_secs`, a field for the reason `durability`
+        // is one. The draft's §2.5.2 asks a server to publish its expiry
+        // policy, and members configured differently remember keys for
+        // different times, so it is this node's (B5).
+        "idempotencyWindowSecs": state.idempotency_window_secs(),
     })) as Json<Value>
 }
 
@@ -157,5 +175,42 @@ mod tests {
     #[test]
     fn the_reported_version_is_the_workspace_version() {
         assert_eq!(env!("CARGO_PKG_VERSION"), kimmy_core::build::VERSION);
+    }
+
+    /// `idempotency-keys` is listed exactly while the gate is open, read at
+    /// each answer (B5), and appended last: a client that reads the list as
+    /// ordered finds every earlier capability where it was.
+    #[test]
+    fn idempotency_keys_is_listed_only_while_the_gate_is_open() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = crate::state::tests::a_state(&dir);
+        assert!(super::capabilities(&state).contains(&"idempotency-keys"), "no gate: open");
+        assert_eq!(super::Capability::ALL.last(), Some(&super::Capability::IdempotencyKeys));
+
+        let open = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let gate = std::sync::Arc::clone(&open);
+        state.set_idempotency_gate(std::sync::Arc::new(move || {
+            if gate.load(std::sync::atomic::Ordering::SeqCst) {
+                Ok(())
+            } else {
+                Err(kimmy_cluster::IdempotencyClosed::Undeclared)
+            }
+        }));
+        let closed = super::capabilities(&state);
+        assert!(!closed.contains(&"idempotency-keys"), "{closed:?}");
+        assert!(closed.contains(&"conditional-writes"), "and nothing else moves: {closed:?}");
+        open.store(true, std::sync::atomic::Ordering::SeqCst);
+        assert!(super::capabilities(&state).contains(&"idempotency-keys"), "read live");
+    }
+
+    /// The window is this node's `storage.oplog_retention_secs`, its default
+    /// until the daemon says otherwise.
+    #[test]
+    fn the_window_is_the_retention_the_node_was_given() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = crate::state::tests::a_state(&dir);
+        assert_eq!(state.idempotency_window_secs(), 86_400);
+        state.set_idempotency_window_secs(3_600);
+        assert_eq!(state.idempotency_window_secs(), 3_600);
     }
 }
