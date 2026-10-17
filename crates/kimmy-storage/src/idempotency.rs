@@ -1015,6 +1015,7 @@ impl Engine {
     pub(crate) fn replay<T>(
         &self,
         txn: WriteTxn<'_>,
+        coll: &CollectionMeta,
         record: IdempotencyRecord,
         kind: OutcomeKind,
     ) -> Result<Keyed<T>> {
@@ -1024,6 +1025,8 @@ impl Engine {
         }
         txn.abort_for_replay()?;
         debug!(
+            db = %coll.db,
+            collection = %coll.name,
             origin = %record.origin,
             age_ms = crate::engine::physical_now_ms().saturating_sub(record.last.hlc.wall_ms),
             "replayed a keyed write"

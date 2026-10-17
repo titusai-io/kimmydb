@@ -441,7 +441,7 @@ impl Engine {
             match self.chunk_record(&txn, coll, run, after, outcome) {
                 Ok(None) => {}
                 Ok(Some(record)) => {
-                    return match self.replay(txn, record, OutcomeKind::Modify) {
+                    return match self.replay(txn, coll, record, OutcomeKind::Modify) {
                         Ok(Keyed::Replayed(record)) => Ok(ChunkEnd::Replayed(record)),
                         Ok(Keyed::Fresh(())) => unreachable!("a replay answers with its record"),
                         Err(e) => Err(none(e)),
@@ -715,7 +715,7 @@ impl Engine {
             match self.keyed_lookup(&txn, coll, keyed, Owner::No) {
                 Ok(Found::Absent) => {}
                 Ok(Found::Done(record) | Found::Applying(record)) => {
-                    return self.replay(txn, record, OutcomeKind::FindAndModify);
+                    return self.replay(txn, coll, record, OutcomeKind::FindAndModify);
                 }
                 Err(e) => {
                     txn.abort()?;

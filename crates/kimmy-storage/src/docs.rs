@@ -529,7 +529,7 @@ impl Engine {
             match self.keyed_lookup(&txn, coll, keyed, Owner::No) {
                 Ok(Found::Absent) => {}
                 Ok(Found::Done(record) | Found::Applying(record)) => {
-                    return self.replay(txn, record, OutcomeKind::Insert);
+                    return self.replay(txn, coll, record, OutcomeKind::Insert);
                 }
                 Err(e) => {
                     txn.abort()?;
@@ -632,7 +632,7 @@ impl Engine {
                 Ok(Found::Absent) => {}
                 Ok(Found::Done(record) | Found::Applying(record)) => {
                     return self
-                        .replay(txn, record, OutcomeKind::Bulk)
+                        .replay(txn, coll, record, OutcomeKind::Bulk)
                         .map_err(BulkInsertError::transaction);
                 }
                 Err(e) => {
@@ -892,7 +892,7 @@ impl Engine {
             match self.keyed_lookup(&txn, coll, keyed, Owner::No) {
                 Ok(Found::Absent) => {}
                 Ok(Found::Done(record) | Found::Applying(record)) => {
-                    return self.replay(txn, record, OutcomeKind::Replace);
+                    return self.replay(txn, coll, record, OutcomeKind::Replace);
                 }
                 Err(e) => {
                     txn.abort()?;
@@ -1188,7 +1188,7 @@ impl Engine {
             match found {
                 Ok(Found::Absent) => {}
                 Ok(Found::Done(record) | Found::Applying(record)) => {
-                    return self.replay(txn, record, OutcomeKind::Delete);
+                    return self.replay(txn, coll, record, OutcomeKind::Delete);
                 }
                 Err(e) => {
                     txn.abort()?;
