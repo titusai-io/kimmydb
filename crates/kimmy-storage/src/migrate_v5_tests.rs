@@ -1793,6 +1793,131 @@ fn the_growth_step_is_redbs() {
     }
 }
 
+#[test]
+fn past_one_region_a_trailing_region_shorter_than_the_working_set_is_charged_a_region_more() {
+    // D1 of the 0.51 delta check. Past one region redb's step fills out the
+    // trailing region (`R - T`); when that leaves less than the migration's
+    // working set (the index chunks, the re-key's chunks in flight and the
+    // margin), the next allocation that finds no free page adds a whole region,
+    // so both are charged: `R - T + R`. Below one region the file doubles, and a
+    // region boundary adds one region, as before. The figures at the shipped
+    // chunks, for 2,000,000 rows of 456 leaf bytes and 1 GiB of entries:
+    // working set 128 MiB + 4 x 8,192 x 456 + 64 MiB = 216,268,800 bytes; staged
+    // rows 926,942,208; index and margin 201,326,592.
+    use crate::migrate_v5::{REDB_REGION_BYTES as R, Staged, growth_for, requirement};
+    const MIB: u64 = 1 << 20;
+    let page = 4096;
+    let rows = Staged { rows: 2_000_000, bytes: 2_000_000 * 456, largest_allocation: page };
+    let working = 216_268_800;
+    let staged = 926_942_208;
+    let rest = 201_326_592;
+    // A file whose trailing region has `left` bytes of room.
+    let file = |regions: u64, left: u64| page + regions * R - left;
+    let need = |file: u64, staged: &Staged| requirement(file, staged, 1 << 30, 8_192, 16 << 20);
+    for (what, file, growth, total) in [
+        // Just short of the working set left: both steps.
+        ("8 GiB, 4 KiB short", file(2, working - page), working - page + R, 4_712_558_592),
+        // Just more than it: the trailing region holds the working set.
+        ("8 GiB, 4 KiB over", file(2, working + page), working + page, staged + rest),
+        // The other side of 4 GiB: under one region the file doubles, whatever
+        // is left below the region's end.
+        ("100 MiB under 4 GiB", R - 100 * MIB, R - 100 * MIB - page, 4_391_432_192),
+        ("100 MiB over 4 GiB", file(2, R - 100 * MIB), R - 100 * MIB, 4_391_436_288),
+        // A whole number of regions: one region, as before.
+        ("8 GiB on the boundary", page + 2 * R, R, R + rest),
+        // The review's store: 7.95 GiB of ObjectId ids with three indexes, 50 MiB
+        // left in its trailing region, which a 4 GiB region follows.
+        ("7.95 GiB", file(2, 50 * MIB), 50 * MIB + R, 50 * MIB + R + rest),
+    ] {
+        let staged_rows = if what == "7.95 GiB" { Staged::default() } else { rows };
+        let need = need(file, &staged_rows);
+        assert_eq!((need.growth, need.total), (growth, total), "{what}");
+    }
+    // The largest allocation's own test, `2a` against what is left: a 128 MiB
+    // allocation (`2a` = 256 MiB, above the working set) with 4 KiB less than
+    // `2a` left is redb's `2R - T` already, and with 4 KiB more the trailing
+    // region holds both.
+    let big = Staged { largest_allocation: 128 * MIB, ..rows };
+    let short = need(file(2, 256 * MIB - page), &big);
+    assert_eq!((short.growth, short.total), (256 * MIB - page + R, 4_764_725_248));
+    let over = need(file(2, 256 * MIB + page), &big);
+    assert_eq!((over.growth, over.total), (256 * MIB + page, staged + rest));
+    // `growth_for` is `growth_step` but where the trailing region is too short.
+    assert_eq!(growth_for(file(2, working + page), page, working), working + page);
+    assert_eq!(growth_for(file(2, working), page, working), working, "equal is enough");
+    assert_eq!(growth_for(file(2, working - page), page, working), working - page + R);
+}
+
+#[test]
+fn an_indexs_entry_count_moves_readyz_while_it_reads() {
+    // D2 of the 0.51 delta check: the count of an index's entries before its
+    // drain read every key with no step on `/readyz`. It is a step of its own
+    // now, its `done` moving every 4,096 entries and ending at the count.
+    let dir = tempfile::tempdir().unwrap();
+    let path = shaped_schema_4(dir.path(), 10_000, 10, 1);
+    chunks(1_000, 1 << 20);
+    hooks::counts_seen();
+    drop(Engine::open(&path).unwrap());
+    let seen: Vec<u64> = hooks::counts_seen()
+        .into_iter()
+        .filter(|(label, _)| *label == "counting an index's entries")
+        .map(|(_, done)| done)
+        .collect();
+    assert_eq!(seen, vec![4_096, 8_192, 10_000], "one index of 10,000 entries");
+}
+
+#[test]
+fn the_refill_estimate_sums_each_collections_documents_times_its_indexes() {
+    // D3 of the 0.51 delta check: the refill term was the store's documents
+    // times its indexes over its collections, an average that put one large
+    // indexed collection beside many unindexed ones at a fraction of its work.
+    use crate::migrate_v5::{Plan, Staged, estimate_secs_range};
+    let (_dir, path) = schema_4_store(|engine| {
+        let big = engine.create_collection("app", "big").unwrap();
+        for (name, field) in [("by_a", "a"), ("by_b", "b"), ("by_c", "c")] {
+            engine
+                .create_index_with(
+                    "app",
+                    "big",
+                    vec![IndexField::ascending(field)],
+                    false,
+                    Enforcement::Local,
+                    Some(name.into()),
+                    None,
+                    None,
+                )
+                .unwrap();
+        }
+        let docs = (0..3_000_i64).map(|i| doc! {"_id": i, "a": i, "b": -i, "c": format!("c{i}")});
+        engine.insert_many(&big, docs.collect()).unwrap();
+        for c in 0..99 {
+            let small = engine.create_collection("app", &format!("small{c}")).unwrap();
+            engine.insert_many(&small, vec![doc! {"_id": 1_i64}]).unwrap();
+        }
+    });
+    let plan = {
+        let db = Database::create(&path).unwrap();
+        crate::migrate_v5::preflight(&db, &path, 4).unwrap()
+    };
+    assert_eq!((plan.collections, plan.indexes, plan.docs_rows), (100, 3, 3_099));
+    assert_eq!(plan.refill_pairs, 3 * 3_000, "the big collection's documents times its indexes");
+    let averaged = plan.docs_rows * plan.indexes / plan.collections;
+    assert_eq!(averaged, 92, "the average was about a hundredth of the work");
+    // At the acceptance store's size the refill alone is 390 s at the slow end;
+    // the average made it 4 s.
+    let skewed = Plan {
+        collections: 100,
+        indexes: 3,
+        docs_rows: 2_000_099,
+        refill_pairs: 6_000_000,
+        staged: Staged::default(),
+        ..Plan::default()
+    };
+    assert_eq!(estimate_secs_range(&skewed), (12, 390));
+    let as_averaged = Plan { refill_pairs: 2_000_099 * 3 / 100, ..skewed.clone() };
+    assert_eq!(estimate_secs_range(&as_averaged), (0, 3));
+}
+
 /// The requirement of `path` at the shipped chunk sizes, as the real open plans
 /// it: a copy refused with no free space says the figure, a second copy is
 /// refused with one byte less than it, and the store migrates with exactly it.
@@ -3211,13 +3336,15 @@ fn progress_advances_with_every_chunk_in_every_phase() {
         assert!(multi_chunk(kind), "premise: {kind} takes several chunks");
     }
     // Every step ends at `done == total` on `/readyz`: re-key out, re-key back,
-    // each TTL partial index's count, each index's drain, each collection's
-    // refill. An exact total is what the step did from its start; an estimate
-    // is finalized to it. A count has no chunks: it moves with every document.
+    // each TTL partial index's count, each index's count of its entries, each
+    // index's drain, each collection's refill. An exact total is what the step
+    // did from its start; an estimate is finalized to it. A count has no
+    // chunks: it moves with the rows it reads.
     const COUNT: &str = "counting a TTL index's selection";
+    const ENTRIES: &str = "counting an index's entries";
     assert_eq!(
         steps,
-        ends.keys().filter(|(k, _, _)| *k != COUNT).cloned().collect(),
+        ends.keys().filter(|(k, _, _)| *k != COUNT && *k != ENTRIES).cloned().collect(),
         "steps with chunks, steps that ended"
     );
     for end in &ended {
@@ -3238,6 +3365,16 @@ fn progress_advances_with_every_chunk_in_every_phase() {
         let held = entries_of.get(&(items.id.0, index.id)).copied().unwrap_or(0);
         assert!(drain.exact, "{drain:?}");
         assert_eq!((drain.began.1, drain.done), (held, held), "{}: {drain:?}", index.name);
+    }
+    // Before each drain, its count of the index's entries: its own step, from
+    // the collection's live documents as an estimate to the entries it read, so
+    // `/readyz` moves while the drain's exact total is counted (D2 of the 0.51
+    // delta check).
+    for index in &items.indexes {
+        let count = end(ENTRIES, Some(&index.name));
+        let held = entries_of.get(&(items.id.0, index.id)).copied().unwrap_or(0);
+        assert!(!count.exact, "{count:?}");
+        assert_eq!((count.began, count.done, count.total), ((0, live_items), held, held));
     }
     let money = end("draining an index", Some("money_once"));
     assert!(
@@ -3633,6 +3770,7 @@ fn the_estimate_is_a_range_that_holds_both_measured_machines() {
         docs_rows: 2_000_000,
         indexes: 3,
         index_entries: 6_000_000,
+        refill_pairs: 6_000_000,
         oplog_entries: 2_000_000,
         staged: Staged { rows: 2_000_000, ..Staged::default() },
         ..Plan::default()

@@ -231,6 +231,26 @@ pub(crate) fn growth_step(file_bytes: u64, largest_allocation: u64) -> u64 {
     }
 }
 
+/// The growth the migration can cause (D1 of the 0.51 delta check): redb's
+/// next step ([`growth_step`]) and, past one region, a whole region more when
+/// that step only fills out the trailing region and what it leaves there is
+/// less than `working`, the most the migration allocates beyond the file's free
+/// pages at once (the chunks in flight and the margin). Once the trailing region
+/// is full the file ends on a region boundary, and the next allocation that
+/// finds no free page adds a whole region (`R`): two extensions, `R - T + R`.
+/// On ext4, XFS and APFS the second is sparse until written; on HFS+ and ExFAT,
+/// which allocate the length a file is extended to, it is 4 GiB the volume must
+/// have, or the start passes the preflight and stops on `ENOSPC` after
+/// `raise(5)`.
+pub(crate) fn growth_for(file_bytes: u64, largest_allocation: u64, working: u64) -> u64 {
+    let step = growth_step(file_bytes, largest_allocation);
+    let usable = file_bytes.saturating_sub(REDB_PAGE_BYTES);
+    let trailing = usable % REDB_REGION_BYTES;
+    let fills_out =
+        usable >= REDB_REGION_BYTES && trailing != 0 && step == REDB_REGION_BYTES - trailing;
+    if fills_out && step < working { step + REDB_REGION_BYTES } else { step }
+}
+
 /// The allocation one leaf holding a single pair of `pair` bytes needs: redb
 /// allocates a power of two pages (`PageNumber::page_order`).
 fn allocation(pair: u64) -> u64 {
@@ -270,7 +290,8 @@ pub(crate) struct Staged {
 /// What the start requires free, term by term ([`requirement`]).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(crate) struct Requirement {
-    /// The file's next growth step ([`growth_step`]).
+    /// The file's growth ([`growth_for`]): redb's next step, and a whole region
+    /// more where that step leaves less than the working set.
     pub growth: u64,
     /// The rows to re-key, once, and the chunks of them in flight.
     pub staged_docs: u64,
@@ -312,6 +333,10 @@ pub(crate) struct Requirement {
 ///   once is per chunk, not per index.
 /// - **Margin**: [`MARGIN_BYTES`].
 ///
+/// The growth term is [`growth_for`] with the working set `staged_index`, the
+/// re-key's chunks in flight and the margin: past one region, a trailing region
+/// with less room than that left is charged a whole region more.
+///
 /// The chunk sizes are parameters so that a test pins the shipped 8,192 rows and
 /// 16 MiB against stores of 0, 2 and 2,000,000 documents.
 pub(crate) fn requirement(
@@ -321,7 +346,6 @@ pub(crate) fn requirement(
     rekey_rows: usize,
     index_chunk_bytes: usize,
 ) -> Requirement {
-    let growth = growth_step(file_bytes, staged.largest_allocation);
     let chunk = if staged.rows == 0 {
         0
     } else {
@@ -331,6 +355,8 @@ pub(crate) fn requirement(
     let staged_docs = staged.bytes + CHUNKS_IN_FLIGHT * chunk;
     let staged_index = 2 * CHUNKS_IN_FLIGHT * index_bytes.min(index_chunk_bytes as u64);
     let margin = MARGIN_BYTES;
+    let working = staged_index + CHUNKS_IN_FLIGHT * chunk + margin;
+    let growth = growth_for(file_bytes, staged.largest_allocation, working);
     Requirement {
         growth,
         staged_docs,
@@ -603,6 +629,9 @@ pub(crate) struct Plan {
     pub indexes: u64,
     /// Every entry of `INDEX_ENTRIES`, to drain.
     pub index_entries: u64,
+    /// The refill's work: each standing collection's documents (its kept live
+    /// count) times its indexes, summed over the collections.
+    pub refill_pairs: u64,
     /// Every entry of the oplog, which the first start on schema 5 walks once.
     pub oplog_entries: u64,
     /// The store's file, in bytes.
@@ -711,6 +740,7 @@ fn plan(db: &Database, path: &std::path::Path) -> Result<Plan> {
     let collections = txn.open_table(tables::COLLECTIONS)?;
     let docs = txn.open_table(tables::DOCS)?;
     let entries = txn.open_table(tables::INDEX_ENTRIES)?;
+    let live = txn.open_table(tables::LIVE_COUNTS)?;
     let mut plan = Plan::default();
     let mut standing = std::collections::HashSet::new();
     for row in collections.iter()? {
@@ -718,6 +748,8 @@ fn plan(db: &Database, path: &std::path::Path) -> Result<Plan> {
         let meta: CollectionMeta = serde_json::from_slice(value.value())?;
         plan.collections += 1;
         plan.indexes += meta.indexes.len() as u64;
+        let documents = live.get(meta.id.0)?.map_or(0, |n| n.value());
+        plan.refill_pairs += documents * (meta.indexes.len() as u64).min(64);
         standing.insert(meta.id.0);
     }
     let mut numeric = Vec::new();
@@ -844,16 +876,15 @@ mod rate {
 /// re-key and no indexes leaves only the walk.
 ///
 /// A refill reads a collection's documents once for all its indexes, so it is counted per
-/// document and index as the lab host's figure is (the documents of a store, times its
-/// indexes, over its collections as an average).
+/// document and index as the lab host's figure is: [`Plan::refill_pairs`], each
+/// collection's documents times its own indexes, summed. An average over the collections
+/// put one large indexed collection beside many unindexed ones at a fraction of its work
+/// (D3 of the 0.51 delta check).
 pub(crate) fn estimate_secs_range(plan: &Plan) -> (u64, u64) {
-    let pairs = plan.docs_rows * plan.indexes.min(64) / plan.collections.max(1);
+    let pairs = plan.refill_pairs;
     let rekeyed = plan.staged.rows;
     let cost = |rekey: u64, drain: u64, refill: u64, walk: u64| {
-        (rekeyed * rekey
-            + plan.index_entries * drain
-            + if plan.indexes == 0 { 0 } else { pairs * refill }
-            + plan.oplog_entries * walk)
+        (rekeyed * rekey + plan.index_entries * drain + pairs * refill + plan.oplog_entries * walk)
             / 1_000_000
     };
     (
@@ -1100,6 +1131,11 @@ struct Run {
 /// The label of a TTL index's count, a step of its own before its drain.
 const TTL_COUNT_STEP: &str = "counting a TTL index's selection";
 
+/// The label of the count of an index's entries before its drain, which gives
+/// the drain its exact total: a step of its own, so `/readyz` moves while it
+/// reads.
+const ENTRY_COUNT_STEP: &str = "counting an index's entries";
+
 /// The four kinds of chunk, as [`Run::rows`] and [`Run::spent`] index them.
 #[derive(Clone, Copy, Debug)]
 enum Kind {
@@ -1181,18 +1217,28 @@ impl Run {
         let _ = (coll, index);
     }
 
-    /// Begin a TTL index's count of what the exact comparator changed (design
-    /// 2.6) as its own step on `/readyz`, in the `draining` phase it precedes:
-    /// documents scanned against the collection's live documents, an estimate
-    /// (tombstones are scanned too) that [`Run::end_step`] finalizes.
-    fn count_step(&mut self, coll: u64) {
+    /// Begin a count before a drain as its own step on `/readyz`, in the
+    /// `draining` phase it precedes, labelled `label`: a TTL index's count of
+    /// what the exact comparator changed (design 2.6), in documents scanned, or
+    /// the count of an index's entries, in entries read. Its total starts from
+    /// the collection's live documents, an estimate (tombstones are scanned too,
+    /// and an index can hold fewer entries or more) that [`Run::end_step`]
+    /// finalizes.
+    fn count_step(&mut self, coll: u64, label: &'static str) {
         self.step(Kind::Drain, self.documents_of(coll), 0, false);
-        self.label = TTL_COUNT_STEP;
+        self.label = label;
     }
 
-    /// One more document scanned by the step [`Run::count_step`] began.
+    /// One more row read by the step [`Run::count_step`] began.
     fn scanned(&mut self) {
-        self.done += 1;
+        self.scanned_by(1);
+    }
+
+    /// `n` more rows read by the step [`Run::count_step`] began.
+    fn scanned_by(&mut self, n: u64) {
+        self.done += n;
+        #[cfg(test)]
+        hooks::counted(self.label, self.done);
         if self.total < self.floor() {
             self.total = self.floor();
             crate::open_progress::set_open_total(self.total);
@@ -1594,7 +1640,7 @@ fn drain(db: &Database, run: &mut Run, meta: &CollectionMeta, index: &IndexMeta)
                 None
             };
         if !stepping {
-            let left = entries_left(db, meta, index)?;
+            let left = entries_left(db, run, meta, index)?;
             run.step(Kind::Drain, mark.drained + left, mark.drained, true);
             stepping = true;
         }
@@ -1651,18 +1697,31 @@ fn drain(db: &Database, run: &mut Run, meta: &CollectionMeta, index: &IndexMeta)
 
 /// The entries still in one index's range: what its drain has left to remove,
 /// the drain's exact total. One read of the range's keys (an entry has no
-/// value), looking for a stop as often as a chunk would.
-fn entries_left(db: &Database, meta: &CollectionMeta, index: &IndexMeta) -> Result<u64> {
+/// value), its own step on `/readyz` moving every 4,096 entries, when it also
+/// looks for a stop (D2 of the 0.51 delta check: read with no step, a 2,000,000
+/// entry index on a cold disk showed the step before it finished for seconds).
+fn entries_left(
+    db: &Database,
+    run: &mut Run,
+    meta: &CollectionMeta,
+    index: &IndexMeta,
+) -> Result<u64> {
     let txn = db.begin_read()?;
     let entries = txn.open_table(tables::INDEX_ENTRIES)?;
+    run.count_step(meta.id.0, ENTRY_COUNT_STEP);
     let mut left = 0u64;
     for row in entries.range(crate::index::index_id_range(meta.id, index.id))? {
         row?;
         left += 1;
-        if left.is_multiple_of(4_096) && stop_requested() {
-            return Err(StorageError::Stopping(crate::StopReason::Shutdown));
+        if left.is_multiple_of(4_096) {
+            run.scanned_by(4_096);
+            if stop_requested() {
+                return Err(StorageError::Stopping(crate::StopReason::Shutdown));
+            }
         }
     }
+    run.scanned_by(left % 4_096);
+    run.end_step(&meta.name, Some(&index.name));
     Ok(left)
 }
 
@@ -1705,7 +1764,7 @@ fn ttl_selection_changes(
     let (mut now_selected, mut now_unselected) = (0u64, 0u64);
     // A full scan of the collection: its own step on `/readyz`, moving with
     // every document.
-    run.count_step(meta.id.0);
+    run.count_step(meta.id.0, TTL_COUNT_STEP);
     for (n, row) in docs.range(crate::engine::doc_range(meta.id))?.enumerate() {
         if n % 4_096 == 0 && stop_requested() {
             return Err(StorageError::Stopping(crate::StopReason::Shutdown));
@@ -2170,6 +2229,7 @@ pub(crate) mod hooks {
         static WATCHED: RefCell<Option<(std::path::PathBuf, u64)>> = const { RefCell::new(None) };
         static CHUNKS: RefCell<Vec<ChunkSeen>> = const { RefCell::new(Vec::new()) };
         static STEPS: RefCell<Vec<StepSeen>> = const { RefCell::new(Vec::new()) };
+        static COUNTED: RefCell<Vec<(&'static str, u64)>> = const { RefCell::new(Vec::new()) };
     }
 
     /// Migration commits made on this thread so far.
@@ -2284,6 +2344,16 @@ pub(crate) mod hooks {
     /// Every step's end on this thread since the last call; clears it.
     pub(crate) fn steps_seen() -> Vec<StepSeen> {
         STEPS.with(|s| std::mem::take(&mut *s.borrow_mut()))
+    }
+
+    pub(super) fn counted(label: &'static str, done: u64) {
+        COUNTED.with(|c| c.borrow_mut().push((label, done)));
+    }
+
+    /// Every `done` a count step showed on this thread since the last call,
+    /// with the step's label; clears it.
+    pub(crate) fn counts_seen() -> Vec<(&'static str, u64)> {
+        COUNTED.with(|c| std::mem::take(&mut *c.borrow_mut()))
     }
 
     /// Progress lines written on this thread so far.

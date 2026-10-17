@@ -2696,9 +2696,12 @@ filesystems measured.
      doubles; above, redb fills out its last 4 GiB region (the rest of that
      region), or adds a whole region when the file ends on a region boundary,
      and adds one region more only when the last region has less than twice
-     the largest single allocation left. The step is the file's length: ext4,
-     XFS and APFS leave it unallocated until it is written, and HFS+ and ExFAT
-     allocate it;
+     the largest single allocation left. Where filling out the last region
+     leaves less than the migration's working set (the index chunks, the
+     re-key's chunks in flight and the margin, about 200 MiB at most), the
+     next allocation adds a whole 4 GiB region after it, and both are
+     charged. The step is the file's length: ext4, XFS and APFS leave it
+     unallocated until it is written, and HFS+ and ExFAT allocate it;
    - **the documents re-keyed**: every document and tombstone with a number
      `_id`, once, at the size the staging table holds them in, plus four chunks
      of 8,192 of them. It does not add to the step: each chunk is deleted from
@@ -2753,8 +2756,9 @@ filesystems measured.
    index (its own entries removed), `refilling` for each collection (rows
    walked, one step for all its indexes); a TTL index with a partial filter
    first counts what the exact comparator changed (below), a step of its own
-   in `draining`, in documents scanned. A drain's `total` is its index's
-   entries, counted before it starts, and a move back's is what moved out:
+   in `draining`, in documents scanned; and every index's entries are counted
+   before its drain, another step in `draining`, in entries read. A drain's
+   `total` is that count, and a move back's is what moved out:
    both exact. A move out's, a count's and a refill's start from the
    collection's kept document count, are raised if the step outruns them, and
    are set to what the step did when it ends. Every step ends reading `done` equal to `total`. A
