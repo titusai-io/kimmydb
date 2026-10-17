@@ -386,9 +386,19 @@ on a decimal refuses it, `400`, rather than leave it out of the answer:
 - **`$convert` to `decimal` and `$toDecimal`** are refused for a related reason,
   the rounding rule a double needs (the entry above).
 
-A filter's `$mod` refuses a decimal operand at parse; against a stored decimal
-it does not match, the answer it gives any value it cannot divide, since a
-filter answers per document rather than failing the request.
+A filter's `$mod` is not arithmetic on the value but a test of its integer
+part: it truncates a decimal toward zero, operand and stored value alike, as
+it truncates a double. So does every operator that takes a whole number
+(`$arrayElemAt`, `$slice`, `$range`, `$limit`, `$skip`, `$push`'s `$position`
+and `$slice`, `$size`): it takes a decimal of whole value as it takes the
+double of that value.
+
+**One numeric argument stays refused for a decimal: a `$vectorSearch` query
+vector's components.** The engine searches 32-bit floats; a double or an
+integer is converted the way it always was, and a decimal would need the
+decimal-to-binary rounding rule this build does not have. The refusal says so:
+`a Decimal128 would have to be rounded to a 32-bit float`. It goes with
+decimal arithmetic.
 
 **To close:** decimal arithmetic, with the rounding rules MongoDB's `Decimal128`
 follows, as its own design. Until then a refusal is the honest answer: a total

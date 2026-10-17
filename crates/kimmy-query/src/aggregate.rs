@@ -489,6 +489,13 @@ fn parse_query_vector(value: &Bson) -> Result<Vec<f32>> {
             Bson::Double(d) => Ok(*d as f32),
             Bson::Int32(n) => Ok(*n as f32),
             Bson::Int64(n) => Ok(*n as f32),
+            // A number, but one whose conversion to a 32-bit float needs the
+            // decimal-to-binary rounding this build does not have.
+            Bson::Decimal128(_) => Err(Error::InvalidQuery(
+                "$vectorSearch `vector` must hold doubles or integers: a Decimal128 would have to \
+                 be rounded to a 32-bit float, which this build does not do"
+                    .into(),
+            )),
             other => Err(Error::InvalidQuery(format!(
                 "$vectorSearch `vector` must hold only numbers, found {}",
                 type_name(other)
@@ -573,7 +580,22 @@ fn parse_project(doc: &Document, vars: &[String]) -> Result<Stage> {
                     excluded_other = true;
                 }
             }
-            Bson::Int32(_) | Bson::Int64(_) | Bson::Double(_) | Bson::Boolean(true) => {
+            // A decimal flag reads as the number it is, as a double does: zero
+            // excludes, anything else includes.
+            Bson::Decimal128(d)
+                if kimmy_core::decimal::decode(d) == kimmy_core::decimal::Decimal::Zero =>
+            {
+                if key == ID_FIELD {
+                    excluded_id = true;
+                } else {
+                    excluded_other = true;
+                }
+            }
+            Bson::Int32(_)
+            | Bson::Int64(_)
+            | Bson::Double(_)
+            | Bson::Decimal128(_)
+            | Bson::Boolean(true) => {
                 include.push(key.clone());
             }
             other => computed.push((key.clone(), Expr::parse_with_vars(other, vars)?)),
@@ -638,18 +660,21 @@ fn deny_unknown_keys(stage: &str, doc: &Document, allowed: &[&str]) -> Result<()
 }
 
 fn as_count(stage: &str, value: &Bson) -> Result<usize> {
+    let refused = || {
+        Error::InvalidQuery(format!(
+            "{stage} takes a non-negative whole number, found {}",
+            type_name(value)
+        ))
+    };
     let n = match value {
         Bson::Int32(n) => i64::from(*n),
         Bson::Int64(n) => *n,
         // A double that is not a whole number is a mistake worth reporting
         // rather than rounding: `$limit: 2.5` has no defensible meaning.
         Bson::Double(d) if d.fract() == 0.0 => *d as i64,
-        _ => {
-            return Err(Error::InvalidQuery(format!(
-                "{stage} takes a non-negative whole number, found {}",
-                type_name(value)
-            )));
-        }
+        // A decimal by its exact value, as the double of that value is.
+        Bson::Decimal128(d) => kimmy_core::decimal::whole_number(d).ok_or_else(refused)?,
+        _ => return Err(refused()),
     };
     if n < 0 {
         return Err(Error::InvalidQuery(format!("{stage} cannot be negative, found {n}")));
@@ -3359,6 +3384,53 @@ mod decimal128 {
         };
         assert_eq!(ids(doc! { "v": 1 }), vec![4, 5, 1, 2, 3]);
         assert_eq!(ids(doc! { "v": -1 }), vec![3, 2, 1, 5, 4]);
+    }
+
+    /// `$limit`, `$skip` and `$vectorSearch`'s `k` take a decimal of whole
+    /// value as they take a double, and `$project` reads a decimal flag as the
+    /// number it is. They used to refuse it, and `$project` computed the
+    /// decimal as a literal instead of including the field.
+    #[test]
+    fn stage_arguments_read_a_decimal_as_the_double_of_its_value() {
+        let dec = |text: &str| Bson::Decimal128(text.parse().unwrap());
+        let input: Vec<Document> = (1..=5).map(|i| doc! { "_id": i, "a": i, "b": -i }).collect();
+        let run = |stage: Document| {
+            let stages = parse(&[stage])?;
+            apply(&stages[0], input.clone(), &Limits::default())
+        };
+        for (decimal, double) in [
+            (doc! { "$limit": dec("2") }, doc! { "$limit": 2.0 }),
+            (doc! { "$limit": dec("2.00") }, doc! { "$limit": 2.0 }),
+            (doc! { "$skip": dec("3") }, doc! { "$skip": 3.0 }),
+            (doc! { "$project": { "a": dec("1") } }, doc! { "$project": { "a": 1.0 } }),
+            (doc! { "$project": { "a": dec("0E+3") } }, doc! { "$project": { "a": 0.0 } }),
+            (
+                doc! { "$project": { "a": dec("-0.5"), "_id": dec("0") } },
+                doc! { "$project": { "a": -0.5, "_id": 0.0 } },
+            ),
+        ] {
+            assert_eq!(run(decimal.clone()).unwrap(), run(double).unwrap(), "{decimal}");
+        }
+        assert_eq!(
+            run(doc! { "$project": { "a": dec("1") } }).unwrap()[0],
+            doc! { "_id": 1, "a": 1 }
+        );
+        for bad in [dec("2.5"), dec("NaN"), dec("-1")] {
+            let msg = run(doc! { "$limit": bad.clone() }).unwrap_err().to_string();
+            assert!(
+                msg.contains("non-negative whole number, found a Decimal128")
+                    || msg.contains("cannot be negative"),
+                "{bad}: {msg}"
+            );
+        }
+        let k = parse(&[doc! { "$vectorSearch": { "vector": [1, 0.5], "k": dec("5") } }]).unwrap();
+        let k_double =
+            parse(&[doc! { "$vectorSearch": { "vector": [1, 0.5], "k": 5.0 } }]).unwrap();
+        assert_eq!(format!("{k:?}"), format!("{k_double:?}"));
+        // A decimal component of a query vector stays refused: converting it to
+        // a 32-bit float needs a rounding rule this build does not have.
+        let err = parse(&[doc! { "$vectorSearch": { "vector": [1, dec("0.5")] } }]).unwrap_err();
+        assert!(err.to_string().contains("would have to be rounded to a 32-bit float"), "{err}");
     }
 }
 
