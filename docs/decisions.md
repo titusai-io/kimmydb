@@ -28165,6 +28165,47 @@ fix off as a whole (the pre-fix behaviour).
 
 **Verification.** Three implementations that share no code agree: the comparator (big-integer cross-multiplication), the encoder (a closed-form `END`, an exact window and a fast window), and a reference key function on exact rationals in the test module. `encode(a).cmp(encode(b)) == canonical_cmp(a, b)` holds over all four types and against the reference over every required generator (near-double, decimal-equals-double for both signs of the exponent, `c = 2^k` with a long binary window including the pair `1267650600228229401496703205376E+22` and `Double(2^122·5^22)`, which have equal bytes, adjacent `c ± 1` pairs at every boundary exponent, cohorts, compound keys with a descending number first, and the `00 01` end inside arrays and documents). The heavy runs cover 162,832 values over every exponent plus a boundary set, 200,000 near-double pairs, 100,000 equal pairs and 200,000 random pairs. The closed-form `END` equals the exact-path `END` on all of them. Release timings on a laptop: an encode is 19 to 22 ns for `|e| ≤ 20` and 9 ns at `e = −6176` and `e = +6111` (the exact path is 55 ns, 72 µs and 10.8 µs); a comparison is 13 to 14 ns when the intervals decide, 45 ns for `0.1m` against `0.1`, and 194 ns at worst. The fast path defers on none of a million values at extreme exponents; it defers on every decimal whose expansion ends and whose exponent is negative (`5^q | c`, such as `1.5`), which is correct and costs 55 ns. 53 mutation rows were run against the numerics: 52 are killed, and the survivor is the design's own equivalent mutant (the constants of the interval bound not swapped for negative exponents), which the exhaustive interval test confirms equivalent over every exponent.
 
+### Write-cost ceilings (design §4.3), and crafted values
+
+**In scope: values chosen by an authenticated writer.** Any client that can write can choose every coefficient it sends. Before `decimal128-numfix`, continued fractions of a 192-bit `5^k` table entry gave coefficients that land within the table's error of a carry, and each took the exact path. That cost 80.8 µs at `e = −6176` and 12.4 µs at `+6111`, against about 10 ns for a random coefficient. One document of 999 such values cost the encoder about 93 ms per index, and the build review measured about 160 ms end to end.
+
+**The second tier.** A lazily built table of 384-bit mantissas (about 690 KB, built in 2.2 ms, on first use) is consulted before the exact path.
+- **Proof.** At every cut the second tier makes, `2^K ≥ 2·(10^34)²`. By Legendre's theorem, every deferring coefficient is then a multiple of a convergent denominator of `entry / 2^K`, so enumerating the convergents is complete.
+  - That enumeration, over all 12,288 entries of both tiers, finds no coefficient below `10^34` that the second tier hands on, except values whose expansion ends (`e < 0`, `5^q | c`, `q ≤ 48`).
+  - The test is `no_coefficient_defers_past_the_second_tier` (release, ignored, 5 s).
+- **Before and after.** At least 5.8 × 10^11 coefficients whose expansion does not end defer from the first tier, at 12,215 of the 12,288 exponents. That is a lower bound, and there are at least 28 at each such exponent. After: none get past the second tier.
+- **Values whose expansion ends.** They always defer in both tiers, by construction. So they go straight to the exact path, which costs about 77 ns at those exponents.
+- **Per value, release:**
+  - random extreme exponents: 10–11 ns;
+  - `|e| ≤ 20`: 21–22 ns;
+  - values crafted against the first tier: 11–13 ns (were 3–81 µs);
+  - random-corpus fallback to the exact path: 0 of 1,000,000 at the extreme exponents.
+
+**The ceilings, on the encoder's share of a write, per index, in a release build.** This is the part of the cost a writer's choice of values can move. The cost of a write's index entries and commit does not depend on which coefficients are written.
+
+| Shape | Ceiling | Random | Crafted | Crafted, before the second tier |
+|---|---|---|---|---|
+| One document of 999 extreme decimals | 5 ms | 0.084 ms | 0.076 ms | about 93 ms |
+| A 2 MiB `insert_many` of such documents (40 crafted, 44 random) | 0.5 s | 3.6 ms | 3.8 ms | about 3.7 s |
+| A replicated run of 1,024 such documents | 5 s | 82 ms | 87 ms | about 95 s |
+
+- **999, not 1,000.** An index keys an array's elements and the array itself, and refuses more than 1,000 keys a document. A document of 1,000 is filed unkeyed and costs nothing to key.
+- **Asserted by:**
+  - `kimmy-core` `crafted_extreme_decimals_cost_no_more_to_key_than_random_ones`, always on: no crafted value reaches the exact path; release at the ceilings exactly, debug at 40× them.
+  - `encode_cost_ceilings`: `cargo test -p kimmy-core --release --lib keyenc::number::tests::encode_cost_ceilings -- --ignored --nocapture`.
+
+**The whole writer hold.** The same shapes on the engine's writer-hold path: `kimmy-storage` `crafted_decimals_hold_the_writer_no_longer_than_random_ones`, run with `cargo test -p kimmy-storage --release --lib decimal_cost_tests -- --ignored --nocapture --test-threads 1` (19 s on a quiet host). Per index means what the two indexes add to the hold (the hold with them less the hold without, halved), the least of five interleaved runs.
+
+| Shape | Ceiling, per index | Random | Crafted |
+|---|---|---|---|
+| One document of 999 extreme decimals | 10 ms (design: 5 ms) | 4.5–4.9 ms | 4.8–4.9 ms |
+| A 2 MiB `insert_many` | 0.5 s | 39–40 ms (33 documents) | 48–49 ms (40 documents) |
+| A replicated run of 1,024 documents | 5 s | 1.17–1.28 s | 1.16–1.18 s |
+
+- **Why 10 ms for one document.** The design's 5 ms is what the index's 1,000 entries cost by themselves (one of them the whole array, about 20 KB), with no margin, so the whole hold's ceiling is restated at 10 ms. The encoder's share stays held to the design's 5 ms above (measured at about 0.08 ms).
+- **Crafted against random** is also asserted, on the writer thread's CPU over the hold: no more than 1.5× plus 10 ms. A writer who chooses the coefficients holds the writer no longer than one who does not.
+- **The figures are wall time on a quiet macOS development host, and the disk dominates them.** On the same host under load (another full workspace test running), the wall holds grew ten- to thirtyfold (up to 89 s for the replicated run, of which 4 s was CPU). Figures from the lab host belong here beside these.
+
 ### `Decimal128` as `_id`
 
 `DocId` gains `Decimal128(Decimal128Id)`, a canonical 19-byte form (`sign (1) ‖ exponent (i16, big endian) ‖ coefficient (u128, big endian)`) normalised so that equal values have equal bytes. It is the stored codec form (tag 6) and the serde form (`serde_bytes`). `Display` is a bounded canonical scientific form that is also injective. `to_bson` re-pads the exponent into BID's range, because `1E+6144` normalises to `c = 1, e = 6144`, which packed straight into BID reads as a non-canonical zero and would key like `_id: 0`. `DocId::try_from_bson` maps an integral decimal in `i64` range to `Int64` (so `Decimal128("5")`, `Int32(5)` and `Int64(5)` are one document, with the stored body's `_id` as the client wrote it), any other finite decimal to the new variant, and refuses NaN and the infinities. A non-integer decimal `_id` is reachable through filters only: the by-id routes parse the path segment as an integer or a string. The derived `Ord` of `DocId` is not the numeric order; nothing orders by it.
