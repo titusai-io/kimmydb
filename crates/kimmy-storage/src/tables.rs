@@ -296,6 +296,29 @@ pub const VECTOR_VERIFIED: TableDefinition<&str, &[u8]> = TableDefinition::new("
 pub const SNAPSHOT_PROGRESS: TableDefinition<&[u8], &[u8]> =
     TableDefinition::new("snapshot_progress");
 
+/// `(collection id, scope hash) -> the idempotency record` (B5,
+/// `crate::idempotency`): a keyed write's record, written in the write's own
+/// transaction, so it survives exactly what the write survives.
+///
+/// The scope hash (32 bytes) is SHA-256 over the principal and the client's key;
+/// the key itself is never stored. The value leads with its own version byte. A
+/// record lives `storage.oplog_retention_secs` after its `last`, and is judged by
+/// the history rule documents are, on that `last`. Carried by a backup (tag 12).
+/// Created by `Engine::open` with no schema bump: an older build never opens it.
+pub const IDEMPOTENCY: TableDefinition<(u64, &[u8]), &[u8]> = TableDefinition::new("idempotency");
+
+/// `stamp (26 bytes, an oplog key) -> collection id (8) ‖ scope hash (32)`:
+/// every record by the stamps that carry it (B5).
+///
+/// One row at each record's merged `last`, written by every store of it (a local
+/// commit, a frame, a page), and on a receiver one more at each carrying stamp a
+/// frame names, so a sender finds the record of an entry it ships by the entry's
+/// stamp. What retention reads, a range below its cutoff, to find records past
+/// their window; its last key is in the clock's high water at open. A row whose
+/// record is gone names nothing and expires. Carried by a backup (tag 13).
+pub const IDEMPOTENCY_BY_STAMP: TableDefinition<&[u8], &[u8]> =
+    TableDefinition::new("idempotency_by_stamp");
+
 // Keys within the META table.
 pub const META_NODE_ID: &str = "node_id";
 pub const META_FORMAT_VERSION: &str = "format_version";

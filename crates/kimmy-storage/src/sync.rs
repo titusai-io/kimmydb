@@ -3168,6 +3168,13 @@ pub(crate) mod race_hooks {
         HOOK.with(|h| *h.borrow_mut() = Some((race, Box::new(competitor))));
     }
 
+    /// Drop the hook armed on this thread, if the run it was armed for never
+    /// reached it, and what it holds with it (an engine, which would keep the
+    /// store open).
+    pub(crate) fn clear() {
+        drop(HOOK.with(|h| h.borrow_mut().take()));
+    }
+
     /// Record that the side that lost `race` found the other side's work
     /// under the writer and took it as done. Set only in that branch, so a
     /// hook that moves ahead of the check it races leaves it unset; and not

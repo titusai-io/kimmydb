@@ -264,6 +264,9 @@ pub struct Engine {
     expiry_cursors: parking_lot::Mutex<std::collections::HashMap<(u64, u32), ExpiryCursor>>,
     /// The drop purger's queue, wake and counters (ADR-189).
     pub(crate) purges: crate::purge::Purges,
+    /// Idempotency keys in process (B5): the in-flight set, the window, the
+    /// retention count.
+    pub(crate) idempotency: crate::idempotency::IdempotencyState,
 }
 
 /// Upper bounds of the writer-wait histogram, in microseconds.
@@ -979,6 +982,36 @@ impl WriteTxn<'_> {
         self.release();
         result
     }
+
+    /// Abort, for a keyed write answered from the idempotency record it found
+    /// under the writer (B5), and return only once that record is durable.
+    ///
+    /// Under `coalesced` a commit is visible before it is durable: the record a
+    /// replay found may belong to a commit whose flush has not run, and a
+    /// replay told `200` for it could be undone by that flush failing. So the
+    /// replay takes a ticket while it still holds the gate, as a committer does
+    /// in [`Self::commit`]: the flush that covers the ticket covers every commit
+    /// that landed before it, the record's included. It waits for that flush,
+    /// at most one window, and a failed one is
+    /// [`StorageError::OutcomeUnknown`], exactly as the first attempt is
+    /// answered. Under `durable` the record's commit fsynced before the writer
+    /// was let go, so there is nothing to wait for. A ticket is taken whatever
+    /// the class was when this transaction opened: a class changed since then
+    /// can have left a record committed without its flush.
+    pub(crate) fn abort_for_replay(mut self) -> Result<()> {
+        let txn = self.txn.take().expect("a transaction is taken once");
+        let engine = self.engine;
+        let ticket = engine.issue_ticket();
+        let waits = self.coalesced || ticket.is_some();
+        let aborted = txn.abort();
+        self.release();
+        aborted?;
+        if waits {
+            blocking(|| engine.wait_for_flush(ticket))
+                .map_err(|e| StorageError::OutcomeUnknown(e.to_string()))?;
+        }
+        Ok(())
+    }
 }
 
 /// The error a waiter gets from a failed flush that covered its commit: the
@@ -1371,6 +1404,11 @@ impl Engine {
             // The violations table, with the others so a read never meets it
             // missing (ADR-200).
             let _ = txn.open_table(tables::UNIQUE_VIOLATIONS)?;
+            // The idempotency records and their rows by stamp (B5), created as
+            // the tables above were, with no schema bump: an older build never
+            // opens them, and ignores them.
+            let _ = txn.open_table(tables::IDEMPOTENCY)?;
+            let _ = txn.open_table(tables::IDEMPOTENCY_BY_STAMP)?;
             // The tombstone horizon's reset, in this commit and before the sidecar is
             // brought to this build (design 13.1): a store the evidence cannot vouch
             // for, or with no key, starts at this start's time, never lower than it was.
@@ -1520,6 +1558,7 @@ impl Engine {
             gc_scan_cursor: parking_lot::Mutex::new(None),
             expiry_cursors: Default::default(),
             purges: Default::default(),
+            idempotency: Default::default(),
         };
 
         // A drop a restart interrupted is announced here and finished by the
@@ -3512,6 +3551,11 @@ impl Engine {
     /// the clock had folded them in while the process ran (`witness`), and a restart
     /// that resumed from the oplog tail alone would mint the next change below one
     /// already standing.
+    ///
+    /// And the highest stamp an idempotency record carries (B5, the last key of
+    /// `IDEMPOTENCY_BY_STAMP`): a record a page stored was folded into the clock
+    /// while the process ran, and a resume of its request must write above its
+    /// `first` after a restart too.
     fn resume_hlc(db: &Database) -> Result<Hlc> {
         let tail = Self::last_oplog_hlc(db)?;
         let named = [tables::OPLOG_VERSIONS, tables::OPLOG_WITNESSED]
@@ -3522,7 +3566,7 @@ impl Engine {
             .flat_map(|versions| versions.iter().map(|(_, hlc)| hlc).collect::<Vec<_>>())
             .max()
             .unwrap_or(Hlc::ZERO);
-        Ok(tail.max(named).max(Self::metadata_high_water(db)?))
+        Ok(tail.max(named).max(Self::metadata_high_water(db)?).max(Self::records_high_water(db)?))
     }
 
     /// The highest stamp the stored metadata carries: each collection's `created`,
@@ -4964,7 +5008,9 @@ impl Engine {
     pub fn purge_dropped_collection(&self, id: CollectionId) -> Result<usize> {
         let mut removed = 0usize;
         loop {
-            if self.collection_range_is_empty(id)? {
+            // The records too, which the purger's chunks remove after the
+            // documents and index entries, and which a creation never waits for.
+            if self.collection_range_is_empty(id)? && !self.records_under(id)? {
                 break;
             }
             let chunk = self.purge_chunk(id)?;
@@ -5145,6 +5191,14 @@ impl Engine {
                         indexes.remove((id.0, *index, value.as_slice(), doc.as_slice()))?;
                     }
                     removed += keys.len();
+                }
+                // The collection's idempotency records, after its documents and
+                // index entries and in what is left of the chunk (B5). For space
+                // only: a record of a dropped life is history by the life rule
+                // whether it stays or goes. Their rows by stamp are left to
+                // expire, since they name nothing now.
+                if removed < DROP_PURGE_CHUNK {
+                    removed += Self::purge_records_in(&txn, id, DROP_PURGE_CHUNK - removed)?;
                 }
                 // The ranges are exhausted: the digest row of a collection
                 // that is gone goes with this commit (a row of zeros and the

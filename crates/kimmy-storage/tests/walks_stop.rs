@@ -49,6 +49,8 @@ const STOP_AWARE_WALKS: &[&str] = &[
     // Retention's scans, which serve no client.
     "gc::Engine::collect_oplog",
     "gc::Engine::collect_tombstones_within",
+    // Retention's read of the idempotency records' rows below its cutoff (B5).
+    "idempotency::Engine::collect_idempotency_records",
     // The read ahead of a drop purge chunk, which serves no client: the stop is
     // its error, so the chunk never reaches the writer during the drain.
     "engine::Engine::warm_purge_chunk",
@@ -394,6 +396,30 @@ const BOUNDED_READS: &[(&str, &str)] = &[
     (
         "modify::scan_until",
         "inside find_and_modify's write transaction: close_writes bounds it (ADR-192)",
+    ),
+    (
+        "idempotency::Engine::purge_records_in",
+        "what is left of one purge chunk of DROP_PURGE_CHUNK rows, in its write: close_writes \
+         bounds it (ADR-192)",
+    ),
+    (
+        "idempotency::Engine::records_under",
+        "one seek: whether a collection id has any idempotency record",
+    ),
+    ("idempotency::Engine::rewind_records_in", "`kimmyd rewind`, which runs on a stopped node"),
+    (
+        "idempotency::Engine::sweep_late_drop_records",
+        "one chunk of RECORD_COLLECT_CHUNK records of one collection, in a write: close_writes \
+         bounds it (ADR-192); the stop is looked for between two chunks (ADR-231)",
+    ),
+    (
+        "idempotency::records_for_collection_page",
+        "one snapshot page's records phase: at most RECORD_PAGE (512) records of one collection",
+    ),
+    (
+        "idempotency::records_for_window",
+        "the rows between a served window's first and last stamps, read in the window's own read \
+         transaction: a row per stamp the window's walk passed over at most",
     ),
     (
         "purge::Engine::owed_purges",

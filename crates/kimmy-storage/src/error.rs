@@ -138,6 +138,19 @@ pub enum StorageError {
     /// and replicating; `cause` is why the request stopped there.
     #[error("the request was partly applied ({applied}) and then failed: {cause}")]
     PartiallyApplied { applied: Applied, cause: Box<StorageError> },
+
+    /// The `Idempotency-Key` names a request already made with another body,
+    /// path or query (its record's fingerprint differs), or of another kind.
+    /// Nothing was written. The API's `422 idempotency_key_reused`, `retry: no`
+    /// (draft §2.7): the client must send a new key.
+    #[error("this Idempotency-Key was used for a different request")]
+    IdempotencyKeyReused,
+
+    /// A multi-chunk request with this `Idempotency-Key` is running on this
+    /// member. Nothing was written. The API's `409 idempotency_key_in_flight`,
+    /// `retry: wait`: once it ends, the retry replays or resumes it.
+    #[error("a request with this Idempotency-Key is still running on this member")]
+    IdempotencyKeyInFlight,
 }
 
 /// What kind of refusal a [`StorageError::RefusedStore`] is (ADR-204).

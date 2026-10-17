@@ -646,6 +646,9 @@ fn is_local_failure(e: &kimmy_storage::StorageError) -> bool {
         | E::UnparseablePartialFilter { .. }
         | E::Stale { .. }
         | E::CollectionPurging { .. } => false,
+        // A keyed client request's answer (B5), never an apply's, and about
+        // the request, not this node's storage.
+        E::IdempotencyKeyReused | E::IdempotencyKeyInFlight => false,
     }
 }
 

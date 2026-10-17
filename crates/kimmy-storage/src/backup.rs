@@ -20,6 +20,14 @@
 //! and the tag list below is hand-written in both directions, so a table added
 //! to it makes every backup this build writes unrestorable by an older one.
 //!
+//! The idempotency records and their rows by stamp (B5) are carried as tags 12
+//! and 13, so a restored member keeps the records of the writes it holds, those
+//! it took by snapshot included: without them a retry there would apply on top
+//! of a write the backup brought back. That is a backup rollback boundary
+//! (Decision Q4): a build before 0.52 refuses a backup that holds either tag, as
+//! it refuses every tag it does not know. A backup an older build wrote restores
+//! into this one with no records, and nothing about restoring changes for it.
+//!
 //! Index entries are derivable
 //! from documents, so omitting them would make backups smaller — and would make
 //! a restore's correctness depend on replaying index maintenance exactly, which
@@ -77,6 +85,10 @@ const T_OPLOG_ARRIVAL_SEQ: u8 = 8;
 const T_COLLECTIONS_DROPPED: u8 = 9;
 const T_OPLOG_VERSIONS: u8 = 10;
 const T_INDEXES_DROPPED: u8 = 11;
+/// `(collection id, scope hash) -> record` (B5).
+const T_IDEMPOTENCY: u8 = 12;
+/// `stamp -> collection id ‖ scope hash` (B5).
+const T_IDEMPOTENCY_BY_STAMP: u8 = 13;
 
 /// What a backup or restore moved.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -187,6 +199,14 @@ impl Engine {
             out.extend_from_slice(&k.1.to_be_bytes());
             out
         });
+        // The records, so a restored member answers a retry of a write it holds
+        // from the record and not by applying it again (B5).
+        simple!(T_IDEMPOTENCY, tables::IDEMPOTENCY, |k: (u64, &[u8])| {
+            let mut out = k.0.to_be_bytes().to_vec();
+            out.extend_from_slice(k.1);
+            out
+        });
+        simple!(T_IDEMPOTENCY_BY_STAMP, tables::IDEMPOTENCY_BY_STAMP, <[u8]>::to_vec);
 
         // Value types that are not `&[u8]` need their own arm.
         if let Some(t) = open_walk_table_if_exists(&txn, tables::OPLOG_ARRIVAL_SEQ, walk)? {
@@ -353,6 +373,8 @@ pub fn restore_with(
             let mut dropped = txn.open_table(tables::COLLECTIONS_DROPPED)?;
             let mut versions = txn.open_table(tables::OPLOG_VERSIONS)?;
             let mut indexes_dropped = txn.open_table(tables::INDEXES_DROPPED)?;
+            let mut idempotency = txn.open_table(tables::IDEMPOTENCY)?;
+            let mut idempotency_by_stamp = txn.open_table(tables::IDEMPOTENCY_BY_STAMP)?;
 
             loop {
                 let (tag, key, value) = match pending.pop_front() {
@@ -438,6 +460,18 @@ pub fn restore_with(
                         }
                         let index_id = u32::from_be_bytes(rest.try_into().expect("4 bytes"));
                         indexes_dropped.insert((coll, index_id), value.as_slice())?;
+                    }
+                    T_IDEMPOTENCY => {
+                        let (coll, scope) = split_u64(&key)?;
+                        if scope.len() != 32 {
+                            return Err(StorageError::Database(
+                                "bad idempotency record key in backup".into(),
+                            ));
+                        }
+                        idempotency.insert((coll, scope), value.as_slice())?;
+                    }
+                    T_IDEMPOTENCY_BY_STAMP => {
+                        idempotency_by_stamp.insert(key.as_slice(), value.as_slice())?;
                     }
                     // A tag this build does not know means the backup came from
                     // a newer version. Skipping it would restore a database

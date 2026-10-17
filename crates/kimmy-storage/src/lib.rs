@@ -33,6 +33,7 @@ pub mod format;
 pub mod gc;
 pub mod health;
 pub mod hold_meter;
+pub mod idempotency;
 pub mod index;
 #[cfg(feature = "lab-hooks")]
 pub mod lab_hooks;
@@ -125,6 +126,9 @@ mod young_stamp_model_tests;
 mod mixed_roll_tests;
 
 #[cfg(test)]
+mod idempotency_tests;
+
+#[cfg(test)]
 mod log_capture;
 #[cfg(feature = "test-hooks")]
 pub use live_walk::stop_open_after_rows_for_test;
@@ -159,6 +163,10 @@ pub use gc::{GcOutcome, RetentionPolicy};
 pub use hold_meter::{
     Component as HoldComponent, HoldDecomposition, Phase as HoldPhase, SERVE_WALK_BUCKETS_US,
     ServeSnapshot, ServeWalk, WalkPath,
+};
+pub use idempotency::{
+    CarriedRecord, IdempotencyRecord, InFlightGuard, Keyed, KeyedWrite, ModifyRecorded,
+    RecordOutcome, RecordState, ReturnedImage,
 };
 pub use index::{CandidateOrder, Dropped, IndexScan, IndexScanOutcome};
 pub use meta::{CollectionMeta, DatabaseMeta, Enforcement, IndexField, IndexMeta, VectorConfig};

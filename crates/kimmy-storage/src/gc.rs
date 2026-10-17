@@ -87,11 +87,13 @@ struct ExpiredTombstone {
 pub struct GcOutcome {
     pub oplog_removed: usize,
     pub tombstones_removed: usize,
+    /// Idempotency records past their window (B5).
+    pub records_removed: usize,
 }
 
 impl GcOutcome {
     pub fn is_empty(&self) -> bool {
-        self.oplog_removed == 0 && self.tombstones_removed == 0
+        self.oplog_removed == 0 && self.tombstones_removed == 0 && self.records_removed == 0
     }
 }
 
@@ -116,15 +118,24 @@ impl Engine {
         // it as rows left behind (ADR-189). The pass asks the purger to look,
         // and keeps any tombstone with rows still under it, below.
         self.ask_for_owed_check();
-        let oplog_removed = self.collect_oplog(cutoff(now_ms, policy.oplog_secs))?;
+        let oplog_cutoff = cutoff(now_ms, policy.oplog_secs);
+        let oplog_removed = self.collect_oplog(oplog_cutoff)?;
         if oplog_removed > 0 {
             self.trim_violation_rows()?;
         }
+        // The idempotency records (B5), after the oplog step and at its cutoff,
+        // so a record and the entries it describes age out under one clock.
+        // Whatever the oplog step found, nothing included: it has its own early
+        // ends (an empty oplog, nothing expired), and the records step is not
+        // one of them. Only a stop ends the pass before it, as it ends every
+        // step.
+        let records_removed = self.collect_idempotency_records(oplog_cutoff)?;
         let outcome = GcOutcome {
             oplog_removed,
             tombstones_removed: self.collect_tombstones(tombstone_cutoff)?
                 + self.collect_dropped_collections(tombstone_cutoff)?
                 + self.collect_dropped_indexes(tombstone_cutoff)?,
+            records_removed,
         };
         // The one place the violations table's `through` moves forward, when
         // the table is ready, in every pass: a start that found no violation
@@ -141,6 +152,7 @@ impl Engine {
         debug!(
             oplog = outcome.oplog_removed,
             tombstones = outcome.tombstones_removed,
+            records = outcome.records_removed,
             elapsed_ms = started.elapsed().as_millis() as u64,
             "retention pass"
         );
@@ -571,7 +583,10 @@ impl Engine {
 /// Saturating, so a retention window longer than the clock's age keeps
 /// everything instead of wrapping into a cutoff in the far future — which would
 /// collect the entire database.
-fn cutoff(now_ms: u64, retention_secs: u64) -> Hlc {
+///
+/// The idempotency records' life rule reads it too, so a record is absent on
+/// lookup exactly when the records step would collect it (B5).
+pub(crate) fn cutoff(now_ms: u64, retention_secs: u64) -> Hlc {
     let age_ms = retention_secs.saturating_mul(1000);
     Hlc::new(now_ms.saturating_sub(age_ms), 0)
 }
