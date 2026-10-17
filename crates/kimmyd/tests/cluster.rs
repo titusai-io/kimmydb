@@ -4317,6 +4317,98 @@ async fn lab_hook_a_lost_insert_is_repaired_by_either_half() {
     eprintln!("lost insert repaired: count-half rounds {count_half}, young rows created {young}");
 }
 
+/// The `Idempotency-Key` gate on a live cluster (B5). A sets
+/// `cluster.idempotency_keys`; B keeps the clustered default, `false`. B refuses a
+/// keyed write `400`, naming the switch, counts it `gated`, and does not list
+/// `idempotency-keys`; A takes a key once it has heard B say it carries records
+/// (both run this build), lists the capability, and publishes its own window,
+/// `storage.oplog_retention_secs`. The switch, the facts block the net reads, the
+/// gate and the member set it is handed are the daemon's own, end to end.
+#[tokio::test]
+#[ignore = "boots a real two-node cluster; run with --ignored"]
+async fn the_idempotency_gate_takes_keys_only_where_the_switch_is_set_and_every_member_carries_them()
+ {
+    const KEY: &str = "\"6f1c0e52-8a1d-4f53-9b3e-2c1d6a7e4b90\"";
+    let client = reqwest::Client::new();
+    let (pa, pb) = (ports::choose(), ports::choose());
+    let a = Node::spawn_configured(
+        "node-a",
+        pa,
+        &[pb],
+        "oplog_retention_secs = 7200",
+        1,
+        "idempotency_keys = true",
+    );
+    let b = Node::spawn_configured("node-b", pb, &[pa], "", 1, "");
+    for node in [&a, &b] {
+        node.wait_ready(&client).await;
+    }
+    eventually("gossip to form", || all_report(&client, vec![&a, &b], 1)).await;
+    let (ta, tb) = (a.login(&client).await, b.login(&client).await);
+    let created = client
+        .post(a.url("/v1/db/shop/collections"))
+        .bearer_auth(&ta)
+        .json(&serde_json::json!({ "name": "orders" }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(created.status(), 200);
+    eventually("the collection on B", || async {
+        client
+            .get(b.url("/v1/db/shop/coll/orders/indexes"))
+            .bearer_auth(&tb)
+            .send()
+            .await
+            .is_ok_and(|res| res.status().is_success())
+    })
+    .await;
+    let capabilities = |node: &Node| {
+        let url = node.url("/v1/version");
+        let client = &client;
+        async move {
+            let version: serde_json::Value =
+                client.get(url).send().await.unwrap().json().await.unwrap();
+            version
+        }
+    };
+
+    // B's switch is unset, so a clustered B refuses whatever its peers carry.
+    let refused = client
+        .post(b.url("/v1/db/shop/coll/orders/docs"))
+        .bearer_auth(&tb)
+        .header("Idempotency-Key", KEY)
+        .json(&serde_json::json!({ "n": 1 }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(refused.status(), 400);
+    let text = refused.text().await.unwrap();
+    assert!(text.contains("cluster.idempotency_keys"), "the refusal names the switch: {text}");
+    assert_eq!(
+        b.gauge(&client, "kimmy_idempotency_requests_total{outcome=\"gated\"}").await,
+        Some(1)
+    );
+    let version = capabilities(&b).await;
+    assert!(!version["capabilities"].to_string().contains("idempotency-keys"), "{version}");
+    assert_eq!(version["idempotencyWindowSecs"], 86_400);
+
+    // A's switch is set: a key is taken once A has heard B say it carries records.
+    eventually("A to take a key", || async {
+        client
+            .post(a.url("/v1/db/shop/coll/orders/docs"))
+            .bearer_auth(&ta)
+            .header("Idempotency-Key", KEY)
+            .json(&serde_json::json!({ "n": 2 }))
+            .send()
+            .await
+            .is_ok_and(|res| res.status().is_success())
+    })
+    .await;
+    let version = capabilities(&a).await;
+    assert!(version["capabilities"].to_string().contains("idempotency-keys"), "{version}");
+    assert_eq!(version["idempotencyWindowSecs"], 7_200, "this member's own retention");
+}
+
 /// The `Decimal128` gate on a live cluster (ADR-238). A declares
 /// `cluster.decimal128`; B and C keep the clustered default, `false`. A creates a
 /// document whose `_id` is a `Decimal128` once every live member has said it can

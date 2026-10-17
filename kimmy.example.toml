@@ -195,7 +195,9 @@ tombstone_retention_secs = 86400
 
 # How much oplog history to retain, which bounds two things: how long a
 # disconnected change-stream client can be away and still resume, and how far
-# behind a peer can fall and still catch up incrementally.
+# behind a peer can fall and still catch up incrementally. It is also how long
+# this member remembers an Idempotency-Key after the keyed write's last commit
+# (GET /v1/version reports it as idempotencyWindowSecs).
 oplog_retention_secs = 86400
 # Bound on the storage engine's page cache — most of the node's resident
 # memory. redb fills it and evicts only for room, never on a timer, so a node
@@ -607,6 +609,23 @@ catch_up_wait_secs = 120
 # FILE, and setting it back to false does not make a rollback possible: the
 # kimmy_decimal128_id_present marker says whether a Decimal128 _id exists.
 # decimal128 = false
+
+# Whether this member takes `Idempotency-Key` on a document write (and the MCP
+# argument `idempotency_key`). Setting it true declares that every member runs
+# 0.52 or later and will not run an older release again: a member of an older
+# release relays a keyed write without its record, and a retry on a member that
+# pulled it through that one applies it a second time. With clustering on, a key
+# is also refused while any live peer does not say it carries records. Unset reads
+# as true with clustering off and false with it on. Set it only once every member
+# runs this release, as its own change and restart, never with the binary
+# upgrade. Only local acceptance is gated; records and keyed writes from other
+# members are always stored and applied. How long a key is remembered is
+# storage.oplog_retention_secs.
+#
+# NAMING THIS KEY AT ANY VALUE MAKES A 0.51 BINARY REFUSE TO START ON THIS FILE:
+# remove it before rolling a member back. Rolling any member back after setting
+# it reopens the gap it closes.
+# idempotency_keys = false
 
 [webhooks]
 # Hosts a webhook may target beyond the public internet.

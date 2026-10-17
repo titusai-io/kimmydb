@@ -119,8 +119,9 @@ known whether it did**. The third comes two ways:
   it restarts and serves its peers.
 - **Never blindly resend** an insert with a server-assigned `_id`, or an
   `$inc`: that is how one write becomes two.
-- **Never resend a multi-document write automatically**, whatever it was
-  answered: a `multi: true` update or delete, or a database drop. It commits
+- **Never resend a multi-document write automatically** without a key,
+  whatever it was answered: a `multi: true` update or delete, or a database
+  drop. It commits
   in several transactions, and a failure after the first is answered
   `partially_applied` with what landed; a resend re-applies that part. Build a
   non-idempotent one with a marker so it can be sent again safely: see
@@ -129,11 +130,36 @@ known whether it did**. The third comes two ways:
   a reset must not retry non-idempotent writes. See
   [Operations](operations.md#a-write-whose-outcome-is-unknown).
 
-**The planned cure** is server-side idempotency keys: a key the client sends
-with a write, so that the server applies any retry of it only once. With them,
-every write becomes safe to retry after an unknown outcome. They are planned,
-on the [roadmap](roadmap.md#planned-not-scheduled) with no version set, and not
-in this release.
+**Send an idempotency key, and the write is safe to send again.** From 0.52.0
+a document write may carry `Idempotency-Key`: one quoted string of 16 to 255
+printable ASCII characters, a new UUID per request
+([HTTP API](http-api.md#idempotency-keys)). The member that applied the write
+keeps a record of it in the write's own transaction, so the same request sent
+again with the same key, after `outcome_unknown` or a dropped connection, is
+answered with the first answer and `Idempotency-Replayed: ?1`, and nothing is
+written twice. A `multi: true` update or delete sent again with its key resumes
+where it stopped instead of applying again. What a client must do to rely on it:
+
+- **Branch on the capability `idempotency-keys`**, per node, from
+  `GET /v1/version`. A member that does not list it refuses the header with
+  `400` (a cluster during a roll, or before its operator has set
+  `cluster.idempotency_keys`), and a member of an earlier release ignores it.
+  Without the capability, the rules above apply.
+- **Send the retry byte for byte as the first attempt**, with the same key.
+  The same key with a different body, path or query is
+  `422 idempotency_key_reused`; a new request needs a new key.
+- **Retry on the member that took the write, once it serves again.** A member
+  that has not yet received the write cannot know the key and applies it a
+  second time, answering without the marker; there is no wait after which
+  retrying elsewhere is safe. Selection is sticky already; keep it so for a
+  keyed retry, and move only if that member does not come back.
+- **Expect a string `_id`.** A keyed insert without `_id` gets one derived from
+  the key and the request, a UUID string, which sorts apart from ObjectIds and
+  falls outside an `_id` range over them.
+- **`409 idempotency_key_in_flight`** means the same request is still running
+  there: wait (`Retry-After: 1`) and send it again to the same member.
+- A key is remembered for `idempotencyWindowSecs` (`GET /v1/version`), 24 hours
+  by default. A retry later than that is a new request.
 
 ---
 

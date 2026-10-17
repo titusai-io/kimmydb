@@ -237,6 +237,18 @@ pub struct Facts {
     /// integer reads as `None`.
     #[serde(default, skip_serializing_if = "Option::is_none", deserialize_with = "lenient_millis")]
     pub vector_chunk_ids: Option<u64>,
+    /// This member carries idempotency records: it stores the record a frame
+    /// brings with a keyed write and relays it with the write's entries, so a
+    /// peer that pulls a keyed write through it gets the record too. Every
+    /// 0.52 member sends `Some(true)` whatever its `cluster.idempotency_keys`:
+    /// the switch is the operator's statement about the whole cluster, this is
+    /// the binary's about itself. Absent from an older sender, which relays a
+    /// keyed write without its record, and anything but a bool reads as
+    /// `None`, which is *does not carry*: this member takes no
+    /// `Idempotency-Key` while any live peer reads anything but `Some(true)`
+    /// ([`idempotency_records_blockers`]).
+    #[serde(default, skip_serializing_if = "Option::is_none", deserialize_with = "lenient_bool")]
+    pub idempotency_records: Option<bool>,
 }
 
 /// The live peers that do not advertise [`Facts::decimal128`] as `Some(true)`,
@@ -251,6 +263,23 @@ pub fn decimal128_blockers(view: &crate::membership::PeerView) -> Vec<NodeId> {
         .iter()
         .filter(|node| {
             !view.blocks.get(node).is_some_and(|held| held.facts.decimal128 == Some(true))
+        })
+        .copied()
+        .collect()
+}
+
+/// The live peers that do not advertise [`Facts::idempotency_records`] as
+/// `Some(true)`, in node-id order: a peer whose block says otherwise or says
+/// nothing of it (a build older than 0.52, which relays a keyed write without
+/// its record), and **a live peer this member holds no block from yet, which
+/// fails closed**. A member SWIM does not list live is not asked, as for
+/// [`decimal128_blockers`]: one that is down cannot be seen, which is why the
+/// operator's switch comes first and this is a net, not a check.
+pub fn idempotency_records_blockers(view: &crate::membership::PeerView) -> Vec<NodeId> {
+    view.live
+        .iter()
+        .filter(|node| {
+            !view.blocks.get(node).is_some_and(|held| held.facts.idempotency_records == Some(true))
         })
         .copied()
         .collect()

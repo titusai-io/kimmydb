@@ -125,6 +125,16 @@ pub struct AppState {
     /// for `kimmy_ttl_collections`: without clustering there is no block to say
     /// it (ADR-201). Unset reads as on.
     pub(crate) expiry_off: std::sync::OnceLock<bool>,
+    /// Whether this member may take an `Idempotency-Key` now (B5): the
+    /// operator's switch and the live-peer net, as `kimmy-cluster`'s
+    /// [`kimmy_cluster::IdempotencyGate`] answers it. Set before anything
+    /// serves, like `local_login`; unset reads as open, which is what a node
+    /// with clustering off and the switch at its default answers.
+    pub(crate) idempotency_gate: std::sync::OnceLock<kimmy_cluster::IdempotencyPredicate>,
+    /// How long this member remembers a key, `storage.oplog_retention_secs`
+    /// (B5): published as `idempotencyWindowSecs`. Unset reads as that
+    /// setting's default.
+    pub(crate) idempotency_window_secs: std::sync::OnceLock<u64>,
 }
 
 /// A peer that has been away longer than tombstone retention.
@@ -266,6 +276,9 @@ impl AppState {
             // The durable marker that a `Decimal128` id exists here (ADR-238):
             // one point read of the metadata table.
             decimal128_id_present: self.engine.decimal128_id_present()?,
+            // The records a keyed write leaves (B5): the table's length and
+            // the engine's counters, read at the scrape.
+            idempotency: self.idempotency_reading()?,
             // Read here rather than set by the dispatcher (ADR-187): live
             // state needs no writer, so it cannot be left unwritten, frozen
             // or late. A registry that cannot be read fails the scrape.
@@ -365,6 +378,56 @@ impl AppState {
     pub fn local_login(&self) -> crate::local_login::LocalLogin {
         self.local_login.get().copied().unwrap_or_default()
     }
+
+    /// Install the gate on `Idempotency-Key` (B5): the predicate of
+    /// [`kimmy_cluster::IdempotencyGate`], built from `cluster.idempotency_keys`
+    /// and handed the live member set once the cluster is up. Called once,
+    /// before anything serves; a second call is ignored.
+    pub fn set_idempotency_gate(&self, gate: kimmy_cluster::IdempotencyPredicate) {
+        let _ = self.idempotency_gate.set(gate);
+    }
+
+    /// Whether this member takes an `Idempotency-Key` now, and if not, why:
+    /// asked by the layer over the route table and by the MCP write tools, and
+    /// by `GET /v1/version`, which lists `idempotency-keys` only while it is
+    /// open. Open with no gate installed.
+    pub fn idempotency_gate(&self) -> Result<(), kimmy_cluster::IdempotencyClosed> {
+        self.idempotency_gate.get().map_or(Ok(()), |gate| gate())
+    }
+
+    /// Say how long this member remembers a key: `storage.oplog_retention_secs`.
+    /// Called once, at startup; a second call is ignored.
+    pub fn set_idempotency_window_secs(&self, secs: u64) {
+        let _ = self.idempotency_window_secs.set(secs);
+    }
+
+    /// How long this member remembers a key, in seconds (B5): one window with
+    /// the write's own history, so a key is remembered as long as its write is
+    /// kept and replicated by pull.
+    pub fn idempotency_window_secs(&self) -> u64 {
+        self.idempotency_window_secs
+            .get()
+            .copied()
+            .unwrap_or(crate::idempotency::DEFAULT_WINDOW_SECS)
+    }
+
+    /// The name a principal's idempotency keys are scoped to (B5): the key its
+    /// request budget is kept under, `local:<user>` or `oidc:<issuer>:<sub>`.
+    /// Users replicate cluster-wide, so a caller has the same scope on every
+    /// member, and one principal cannot reach another's records.
+    pub fn principal_scope(&self, principal: &Principal) -> String {
+        let issuer = principal.federated.then(|| self.federation().map(|f| f.issuer())).flatten();
+        principal_key(principal, issuer.as_deref())
+    }
+
+    /// The engine's idempotency records, read at the scrape (B5): how many
+    /// this member holds, how many it took from peers by each way, how many it
+    /// could not decode and how many retention removed. The records live in the
+    /// storage half, which reads them here; until it does, every count is zero,
+    /// and the series are on the page all the same.
+    pub fn idempotency_reading(&self) -> Result<crate::metrics::IdempotencyReading, ApiError> {
+        Ok(crate::metrics::IdempotencyReading::default())
+    }
 }
 
 pub type SharedState = Arc<AppState>;
@@ -437,9 +500,7 @@ impl FromRequestParts<SharedState> for Auth {
         // each of them would have to remember.
         let limiter = &state.limits.per_principal;
         if !limiter.limit().is_disabled() {
-            let issuer =
-                principal.federated.then(|| state.federation().map(|f| f.issuer())).flatten();
-            let key = principal_key(&principal, issuer.as_deref());
+            let key = state.principal_scope(&principal);
             if let crate::ratelimit::Decision::Limited { retry_after } = limiter.acquire(&key) {
                 state.metrics.record_principal_rate_limited();
                 warn!(

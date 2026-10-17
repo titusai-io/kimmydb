@@ -163,6 +163,23 @@ info:
     - **A token does not expire**, and nothing on the server holds it. There is
       no session to keep alive and none to lose.
 
+    ## Idempotency keys
+
+    A document write may carry `Idempotency-Key` (draft-ietf-httpapi-idempotency-key-header-07):
+    one quoted string (RFC 9651) of 16 to 255 printable ASCII characters,
+    such as a UUID. The member that applies the write keeps a record of it in
+    the write's own transaction, so a retry with the same key gets the first
+    answer back, marked `Idempotency-Replayed: ?1`, and nothing is written
+    again. The operations that take it list the `Idempotency-Key` parameter;
+    **every other operation refuses it with `400`**, rather than ignoring it,
+    and so does a member while it does not take keys (the operator's switch
+    `cluster.idempotency_keys` is off, or a live member does not carry
+    records), which then does not list `idempotency-keys` among its
+    capabilities. A key is remembered for `idempotencyWindowSecs`
+    (`GET /v1/version`) and is scoped to the principal and the collection.
+    What a retry on another member does, and what a resumed multi-document
+    request answers, is in `docs/http-api.md` ("Idempotency keys").
+
     ## Versioning
 
     **The path carries the major version, and `/v1` does not break.** Adding a
@@ -597,6 +614,14 @@ paths:
                       at the cost of a few milliseconds of latency. A fact
                       about configuration rather than build, so a field
                       rather than a capability.
+                  idempotencyWindowSecs:
+                    type: integer
+                    description: |
+                      How long this node remembers an `Idempotency-Key`, in
+                      seconds after the keyed write's last commit: its
+                      `storage.oplog_retention_secs`, 86,400 by default (B5).
+                      This node's, like `durability`: members configured
+                      differently remember keys for different times.
         "400": { $ref: "#/components/responses/BadRequest" }
 
   /v1/auth/refresh:
@@ -1482,6 +1507,8 @@ paths:
         An absent `_id` is assigned. A duplicate `_id`, or a value that would
         break a unique index, is refused with `409`.
       x-kimmy-action: write
+      parameters:
+        - $ref: "#/components/parameters/IdempotencyKey"
       requestBody:
         required: true
         content:
@@ -1490,6 +1517,8 @@ paths:
       responses:
         "200":
           description: Inserted, and durable.
+          headers:
+            Idempotency-Replayed: { $ref: "#/components/headers/IdempotencyReplayed" }
           content:
             application/json:
               schema:
@@ -1501,6 +1530,7 @@ paths:
                     allOf: [{ $ref: "#/components/schemas/Stamp" }]
                     description: The version the insert produced.
         "400": { $ref: "#/components/responses/BadRequest" }
+        "422": { $ref: "#/components/responses/IdempotencyKeyReused" }
         "401": { $ref: "#/components/responses/Unauthorized" }
         "403": { $ref: "#/components/responses/Forbidden" }
         "404": { $ref: "#/components/responses/NotFound" }
@@ -1525,6 +1555,8 @@ paths:
         so batching is worth roughly two orders of magnitude over inserting one
         at a time.
       x-kimmy-action: write
+      parameters:
+        - $ref: "#/components/parameters/IdempotencyKey"
       requestBody:
         required: true
         content:
@@ -1535,6 +1567,8 @@ paths:
       responses:
         "200":
           description: Every document landed.
+          headers:
+            Idempotency-Replayed: { $ref: "#/components/headers/IdempotencyReplayed" }
           content:
             application/json:
               schema:
@@ -1554,7 +1588,7 @@ paths:
                       parallel to `insertedIds` — what `insert` reports as
                       `stamp`, once per document.
         "400": { $ref: "#/components/responses/BadRequest" }
-        "422": { $ref: "#/components/responses/WrongShape" }
+        "422": { $ref: "#/components/responses/WrongShapeOrKeyReused" }
         "401": { $ref: "#/components/responses/Unauthorized" }
         "403": { $ref: "#/components/responses/Forbidden" }
         "404": { $ref: "#/components/responses/NotFound" }
@@ -1737,6 +1771,8 @@ paths:
         checks no version, so it cannot answer whether a conditional update
         would happen.
       x-kimmy-action: write
+      parameters:
+        - $ref: "#/components/parameters/IdempotencyKey"
       requestBody:
         required: true
         content:
@@ -1772,6 +1808,8 @@ paths:
       responses:
         "200":
           description: What changed.
+          headers:
+            Idempotency-Replayed: { $ref: "#/components/headers/IdempotencyReplayed" }
           content:
             application/json:
               schema:
@@ -1817,13 +1855,30 @@ paths:
                       document was unchanged, which writes nothing and keeps
                       its version (ADR-208), and always absent under
                       `explain: true`, which writes nothing (ADR-131).
+                  skipped:
+                    type: integer
+                    description: |
+                      Present only on a keyed request that resumed after it had
+                      stopped, with `resumed`: the matches it left because they
+                      changed after the request's first write, by this request
+                      on another member or by another write. Cumulative across
+                      the request's attempts, and counted here rather than in
+                      `matched` (see "A request that was partly applied" in
+                      `docs/http-api.md`).
+                  resumed:
+                    type: boolean
+                    const: true
+                    description: |
+                      Present, and `true`, only when an attempt of this keyed
+                      request resumed one that had stopped, continuing past where
+                      it stopped and never writing a document twice.
                   explain: { $ref: "#/components/schemas/Explain" }
         "400": { $ref: "#/components/responses/BadRequest" }
-        "422": { $ref: "#/components/responses/WrongShape" }
+        "422": { $ref: "#/components/responses/WrongShapeOrKeyReused" }
         "401": { $ref: "#/components/responses/Unauthorized" }
         "403": { $ref: "#/components/responses/Forbidden" }
         "404": { $ref: "#/components/responses/NotFound" }
-        "409": { $ref: "#/components/responses/Conflict" }
+        "409": { $ref: "#/components/responses/ConflictOrKeyInFlight" }
         "500": { $ref: "#/components/responses/PartiallyApplied" }
 
   /v1/db/{db}/coll/{coll}/find_and_modify:
@@ -1848,6 +1903,8 @@ paths:
         to one path, or to a path and a path inside it, are refused `400`
         with nothing written (ADR-205).
       x-kimmy-action: write
+      parameters:
+        - $ref: "#/components/parameters/IdempotencyKey"
       requestBody:
         required: true
         content:
@@ -1886,6 +1943,8 @@ paths:
           description: |
             The chosen document, before or after the change as asked. `document`
             is null when nothing matched.
+          headers:
+            Idempotency-Replayed: { $ref: "#/components/headers/IdempotencyReplayed" }
           content:
             application/json:
               schema:
@@ -1922,7 +1981,7 @@ paths:
                       unchanged — and after a removal: nothing can be
                       conditional on a document that is gone.
         "400": { $ref: "#/components/responses/BadRequest" }
-        "422": { $ref: "#/components/responses/WrongShape" }
+        "422": { $ref: "#/components/responses/WrongShapeOrKeyReused" }
         "401": { $ref: "#/components/responses/Unauthorized" }
         "403": { $ref: "#/components/responses/Forbidden" }
         "404": { $ref: "#/components/responses/NotFound" }
@@ -1949,6 +2008,8 @@ paths:
         with `if_stamp`: a plan checks no version, so it cannot answer
         whether a conditional delete would happen.
       x-kimmy-action: write
+      parameters:
+        - $ref: "#/components/parameters/IdempotencyKey"
       requestBody:
         required: true
         content:
@@ -1978,6 +2039,8 @@ paths:
       responses:
         "200":
           description: How many were deleted.
+          headers:
+            Idempotency-Replayed: { $ref: "#/components/headers/IdempotencyReplayed" }
           content:
             application/json:
               schema:
@@ -2002,12 +2065,30 @@ paths:
                       The tombstone's version. Present only when the request
                       deleted exactly one document without `multi` (ADR-084).
                       Always absent under `explain: true`.
+                  skipped:
+                    type: integer
+                    description: |
+                      Present only on a keyed request that resumed after it had
+                      stopped, with `resumed`: the matches it left because they
+                      changed after the request's first write, by this request
+                      on another member or by another write. Cumulative across
+                      the request's attempts, and counted here rather than in
+                      `matched` (see "A request that was partly applied" in
+                      `docs/http-api.md`).
+                  resumed:
+                    type: boolean
+                    const: true
+                    description: |
+                      Present, and `true`, only when an attempt of this keyed
+                      request resumed one that had stopped, continuing past where
+                      it stopped and never writing a document twice.
                   explain: { $ref: "#/components/schemas/Explain" }
         "400": { $ref: "#/components/responses/BadRequest" }
-        "422": { $ref: "#/components/responses/WrongShape" }
+        "422": { $ref: "#/components/responses/WrongShapeOrKeyReused" }
         "401": { $ref: "#/components/responses/Unauthorized" }
         "403": { $ref: "#/components/responses/Forbidden" }
         "404": { $ref: "#/components/responses/NotFound" }
+        "409": { $ref: "#/components/responses/IdempotencyKeyInFlight" }
         "500": { $ref: "#/components/responses/PartiallyApplied" }
 
   /v1/db/{db}/coll/{coll}/docs/{id}:
@@ -2066,6 +2147,7 @@ paths:
             `409 stale` and nothing is written. A missing document is stale
             too, `upsert` or not — the condition says "at this version",
             not "or create it".
+        - $ref: "#/components/parameters/IdempotencyKey"
       requestBody:
         required: true
         content:
@@ -2076,6 +2158,8 @@ paths:
           description: |
             What happened. `matched` is 0 when nothing was there and `upsert`
             was not asked for.
+          headers:
+            Idempotency-Replayed: { $ref: "#/components/headers/IdempotencyReplayed" }
           content:
             application/json:
               schema:
@@ -2105,6 +2189,7 @@ paths:
                     allOf: [{ $ref: "#/components/schemas/Stamp" }]
                     description: The version the write produced. Absent when nothing was written.
         "400": { $ref: "#/components/responses/BadRequest" }
+        "422": { $ref: "#/components/responses/IdempotencyKeyReused" }
         "401": { $ref: "#/components/responses/Unauthorized" }
         "403": { $ref: "#/components/responses/Forbidden" }
         "404": { $ref: "#/components/responses/NotFound" }
@@ -2122,6 +2207,7 @@ paths:
           description: |
             Delete only if the document is at this stamp; otherwise
             `409 stale` and nothing is written.
+        - $ref: "#/components/parameters/IdempotencyKey"
       responses:
         "200":
           description: |
@@ -2129,6 +2215,8 @@ paths:
             an error either way. When one was, `stamp` is the tombstone's
             version, as every write reports the version it produced
             (ADR-084).
+          headers:
+            Idempotency-Replayed: { $ref: "#/components/headers/IdempotencyReplayed" }
           content:
             application/json:
               schema:
@@ -2144,6 +2232,7 @@ paths:
                       The tombstone's version — what `POST .../delete` of one
                       document reports. Present exactly when `deleted` is 1.
         "400": { $ref: "#/components/responses/BadRequest" }
+        "422": { $ref: "#/components/responses/IdempotencyKeyReused" }
         "401": { $ref: "#/components/responses/Unauthorized" }
         "403": { $ref: "#/components/responses/Forbidden" }
         "404": { $ref: "#/components/responses/NotFound" }
@@ -3016,6 +3105,45 @@ components:
       required: true
       schema: { type: string }
       description: Subscription id, as returned by registration.
+    IdempotencyKey:
+      name: Idempotency-Key
+      in: header
+      required: false
+      schema: { type: string }
+      example: '"6f1c0e52-8a1d-4f53-9b3e-2c1d6a7e4b90"'
+      description: |
+        Makes a retry of this write safe to send: the member that applied it
+        answers the same request with the same key, from the same principal on
+        the same collection, with the first answer and
+        `Idempotency-Replayed: ?1`, writing nothing (B5). One field line
+        holding one RFC 9651 String: quoted, 16 to 255 printable ASCII
+        characters once unescaped (`\"` and `\\` count as one each), no
+        parameters. Anything else is `400 bad_request` naming the header.
+        A UUID (v4 or v7) is the recommended key.
+
+        - A different request under a key this member remembers is
+          `422 idempotency_key_reused`; on `update` and `delete`, a
+          `multi: true` request with the key still running here is
+          `409 idempotency_key_in_flight`.
+        - Refused `400` while this member does not take keys
+          (`cluster.idempotency_keys` is off here, or a live member does not
+          carry records), and on `update` and `delete` with `explain: true`.
+        - Remembered for `idempotencyWindowSecs` (`GET /v1/version`) after the
+          write's last commit. A retry on a member that has not yet received
+          the write is applied there a second time, without the marker: retry
+          on the member that took the write. `docs/http-api.md` states what
+          that second application does.
+
+  headers:
+    IdempotencyReplayed:
+      description: |
+        `?1` (an RFC 9651 Boolean) on a replay: this is the first answer to
+        the same request sent earlier with the same `Idempotency-Key`,
+        returned from its record, and nothing was written now. Absent on a
+        first answer, including a second application on a member that had not
+        yet received the first one. KimmyDB's own; the draft defines no
+        marker.
+      schema: { type: string, const: "?1" }
 
   responses:
     BadRequest:
@@ -3027,7 +3155,12 @@ components:
         parameter, any query string at all: the message names the first
         parameter and says the route takes none (ADR-124). A query string is
         refused `400` where a body of the wrong shape is `422`: it is part of
-        the request line, not an entity the server failed to process.
+        the request line, not an entity the server failed to process. And an
+        `Idempotency-Key` on an operation that does not list it ("this route
+        does not take an Idempotency-Key"), a malformed one, or one while this
+        member does not take keys, the message naming the header and the
+        cause: `cluster.idempotency_keys`, or the live member that does not
+        carry records (B5).
       content:
         application/json:
           schema: { $ref: "#/components/schemas/Error" }
@@ -3053,6 +3186,52 @@ components:
         Retry-After:
           schema: { type: integer }
           description: Seconds to wait before retrying; how long a failed lookup's answer is kept.
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/Error" }
+    IdempotencyKeyReused:
+      description: |
+        `idempotency_key_reused`, `retry: no` (B5): this member remembers the
+        `Idempotency-Key` for a different request (another body, path, query
+        or method) from this principal on this collection. Nothing was
+        written. Use a new key for a new request.
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/Error" }
+    WrongShapeOrKeyReused:
+      description: |
+        A body of the wrong shape (see `WrongShape`, `bad_request`), or, on a
+        request with an `Idempotency-Key`, `idempotency_key_reused`: the key
+        is remembered here for a different request (see
+        `IdempotencyKeyReused`). The `error` code tells them apart; nothing
+        was written either way.
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/Error" }
+    IdempotencyKeyInFlight:
+      description: |
+        `idempotency_key_in_flight`, `retry: wait` (B5): a `multi: true`
+        request with this `Idempotency-Key` is still running on this member.
+        Nothing was written. Send it again here once it has finished, when it
+        is answered from its record; not elsewhere, where a member that has
+        not received the record would apply it a second time.
+      headers:
+        Retry-After:
+          schema: { type: integer }
+          description: Seconds to wait before sending it again; 1.
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/Error" }
+    ConflictOrKeyInFlight:
+      description: |
+        A `409` of the route's own (see `Conflict`: `duplicate_key`,
+        `unique_violation`, `stale`), or, on a `multi: true` request with an
+        `Idempotency-Key`, `idempotency_key_in_flight` with `Retry-After: 1`
+        (see `IdempotencyKeyInFlight`). The `error` code tells them apart.
+      headers:
+        Retry-After:
+          schema: { type: integer }
+          description: On `idempotency_key_in_flight` only; 1.
       content:
         application/json:
           schema: { $ref: "#/components/schemas/Error" }
@@ -3211,6 +3390,8 @@ components:
         | `node_stopping` | 503 | elsewhere | This node is shutting down and did not complete the request: nothing was written. Send it to another member |
         | `starting` | 503 | elsewhere | This node has bound its port and is still starting, and answers only `/healthz` and `/readyz` until it is up: nothing was read or written. Send it to another member |
         | `resolver_busy` | 503 | wait | A host the request had to resolve — a webhook's on registration, an embedding provider's on configuration or for a search's `query` — was not looked up, because the lookups this node allows at once were all waiting on a resolver that has not answered. Nothing was done. Carries `Retry-After`. A host that does not resolve is a `400` on registration and configuration, and a `502 provider_error` on a search |
+        | `idempotency_key_reused` | 422 | no | The request's `Idempotency-Key` is remembered on this member for a different request (another body, path, query or method) from this principal on this collection. Nothing was written. Use a new key for a new request |
+        | `idempotency_key_in_flight` | 409 | wait | A `multi: true` update or delete with this `Idempotency-Key` is still running on this member. Nothing was written. Carries `Retry-After: 1`; sent again here once it has finished, it is answered from its record |
         | `catching_up` | 503 | elsewhere | This member knows it is behind (it created its store in a cluster it has seeds for, was restored from a backup, or fell behind its peers' retention horizon, and its catching-up marker is set) and answers only `/healthz`, `/readyz`, `/metrics` and `/v1/topology` until it has caught up: nothing was read or written. Send it to another member |
       enum:
         - bad_request
@@ -3239,6 +3420,8 @@ components:
         - starting
         - catching_up
         - resolver_busy
+        - idempotency_key_reused
+        - idempotency_key_in_flight
 
     Capability:
       type: string
@@ -3248,11 +3431,12 @@ components:
         adding a feature without naming it here is a visible omission rather
         than a silent one.
 
-        Most are constant for a given build; `local-embeddings` is the one that
-        genuinely varies today, because in-process embedding is a compile-time
-        feature and a `local` provider is refused on a build without it. The
-        rest matter across *versions*: a client may be talking to a node from
-        before the feature existed.
+        Most are constant for a given build; `local-embeddings` varies between
+        builds, because in-process embedding is a compile-time feature and a
+        `local` provider is refused on a build without it, and
+        `idempotency-keys` varies at run time, listed only while the member
+        takes the header. The rest matter across *versions*: a client may be
+        talking to a node from before the feature existed.
 
         **A client should treat an unknown capability as one it does not use,
         and a missing capability as a feature to avoid** — not as an error.
@@ -3269,6 +3453,7 @@ components:
         | `find-and-modify` | `POST .../find_and_modify` |
         | `conditional-writes` | `if_stamp` on every single-document write, `stamps` on `find`, `ETag` on a read by id, and the `stale` error code (ADR-084) |
         | `hybrid-search` | `POST .../hybrid_search` |
+        | `idempotency-keys` | `Idempotency-Key` on the document writes, the `Idempotency-Replayed` marker, and the codes `idempotency_key_reused` and `idempotency_key_in_flight`. Listed only while this member takes the header: its `cluster.idempotency_keys` is set and every live member carries records. A client that read it and then meets the gate's `400` has met a roll, a rollback or a change of the switch in between |
         | `local-embeddings` | This build can embed in-process; a `local` provider will be accepted |
         | `partial-indexes` | `partialFilterExpression` on index creation |
         | `token-refresh` | `POST /v1/auth/refresh`, so an active client never re-sends credentials |
@@ -3286,6 +3471,7 @@ components:
         - cursor-paging
         - find-and-modify
         - hybrid-search
+        - idempotency-keys
         - local-embeddings
         - partial-indexes
         - token-refresh

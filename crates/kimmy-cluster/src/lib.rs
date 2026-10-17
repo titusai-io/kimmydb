@@ -24,6 +24,7 @@ pub mod decimal128;
 pub mod discovery;
 pub mod facts;
 pub mod health;
+pub mod idempotency;
 pub mod membership;
 pub mod peers;
 pub mod protocol;
@@ -43,8 +44,10 @@ pub use discovery::{DEFAULT_CLUSTER_PORT, ResolveError, SeedSource, names_anothe
 pub use facts::{
     CatchUpReason, ClassState, Facts, FactsSource, MAX_TTL_COLLECTIONS, OwnerClass, PeerState,
     PerClass, StallCause, TtlHeld, Yielding, decimal128_blockers, facts_undecodable_total,
+    idempotency_records_blockers,
 };
 pub use health::{DEFAULT_FANOUT, MAX_BACKOFF, PeerHealth, WARN_INTERVAL};
+pub use idempotency::{IdempotencyClosed, IdempotencyGate, IdempotencyPredicate};
 pub use membership::{Member, Members, PeerView, SeedFeed, ViewBlock};
 pub use peers::{
     ContactEnd, DEFAULT_DISCOVERY_INTERVAL, DEFAULT_SYNC_INTERVAL, ENTRY_WAIT_BUCKETS_US,

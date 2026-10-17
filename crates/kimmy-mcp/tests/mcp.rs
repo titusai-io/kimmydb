@@ -21,6 +21,9 @@ struct Server {
     base: String,
     tokens: TokenIssuer,
     engine: Arc<Engine>,
+    /// The shared state, for the one thing a request cannot reach: the gate on
+    /// `idempotency_key`, which the daemon installs at start.
+    state: kimmy_api::SharedState,
     _dir: tempfile::TempDir,
 }
 
@@ -57,7 +60,7 @@ impl Server {
             let _ = axum::serve(listener, app).await;
         });
 
-        Self { base: format!("http://{addr}"), tokens, engine, _dir: dir }
+        Self { base: format!("http://{addr}"), tokens, engine, state, _dir: dir }
     }
 
     /// Mint a token directly, so a test can describe the grants it needs
@@ -1530,15 +1533,25 @@ async fn every_optional_tool_argument_refuses_an_explicit_null() {
             ],
         ),
         (
+            "insert",
+            json!({"database":"sales","collection":"orders","document":{"n":1}}),
+            vec![("idempotency_key", false)],
+        ),
+        (
+            "insert_many",
+            json!({"database":"sales","collection":"orders","documents":[{"n":1}]}),
+            vec![("idempotency_key", false)],
+        ),
+        (
             "update",
             json!({"database":"sales","collection":"orders","filter":{"_id":"a"},
                    "update":{"$set":{"seen":true}}}),
-            vec![("filter", false)],
+            vec![("filter", false), ("idempotency_key", false)],
         ),
         (
             "delete",
             json!({"database":"sales","collection":"orders","filter":{"_id":"a"}}),
-            vec![("filter", false)],
+            vec![("filter", false), ("idempotency_key", false)],
         ),
         (
             "create_index",
@@ -1823,4 +1836,126 @@ async fn a_vector_search_whose_filter_expr_cannot_be_evaluated_is_refused() {
     let message = refused["error"]["message"].as_str().unwrap_or_default();
     assert!(message.contains("$expr cannot be evaluated for the document with _id"), "{message}");
     assert!(message.contains("$add needs numbers, found a string"), "{message}");
+}
+
+// ---------------------------------------------------------------------------
+// Idempotency keys (B5): the argument behaves as the REST header does
+// ---------------------------------------------------------------------------
+
+const KEY: &str = "6f1c0e52-8a1d-4f53-9b3e-2c1d6a7e4b90";
+
+/// The four write tools, each with arguments that succeed once.
+fn keyed_calls() -> Vec<(&'static str, Value)> {
+    vec![
+        ("insert", json!({"database":"sales","collection":"orders","document":{"n":1}})),
+        ("insert_many", json!({"database":"sales","collection":"orders","documents":[{"n":2}]})),
+        (
+            "update",
+            json!({"database":"sales","collection":"orders","filter":{"_id":"a"},
+                   "update":{"$set":{"k":1}}}),
+        ),
+        ("delete", json!({"database":"sales","collection":"orders","filter":{"_id":"b"}})),
+    ]
+}
+
+fn with_key(mut arguments: Value, key: &str) -> Value {
+    arguments["idempotency_key"] = Value::from(key);
+    arguments
+}
+
+/// The refusal a tool call drew, as the envelope `data` carries it.
+fn refusal(body: &Value) -> (&str, &str) {
+    let data = &body["error"]["data"];
+    (data["error"].as_str().unwrap_or_default(), data["message"].as_str().unwrap_or_default())
+}
+
+/// `/mcp` itself refuses the header: a tool call is keyed by its argument, and
+/// a header on the transport would otherwise be read as nothing. Refused before
+/// the transport runs, as on every route outside the keyed table.
+#[tokio::test]
+async fn mcp_refuses_the_idempotency_key_header() {
+    let server = Server::start().await;
+    let root = server.root();
+    let (status, body) = server
+        .rpc_at(
+            "/mcp",
+            Some(&root),
+            &[("Idempotency-Key", "\"6f1c0e52-8a1d-4f53-9b3e-2c1d6a7e4b90\"")],
+            json!({"jsonrpc":"2.0","id":1,"method":"tools/list"}),
+        )
+        .await;
+    assert_eq!(status, 400, "{body}");
+    assert_eq!(body["error"], "bad_request");
+    assert!(
+        body["message"]
+            .as_str()
+            .unwrap()
+            .starts_with("this route does not take an Idempotency-Key"),
+        "{body}"
+    );
+    // And without it, the same request is served.
+    let (status, _) =
+        server.rpc(Some(&root), json!({"jsonrpc":"2.0","id":1,"method":"tools/list"})).await;
+    assert_eq!(status, 200);
+}
+
+/// A well-formed key is taken by every write tool; a malformed one is refused
+/// naming the argument, and the call does not run.
+#[tokio::test]
+async fn the_write_tools_take_a_well_formed_key_and_refuse_a_malformed_one() {
+    let server = Server::start().await;
+    seed(&server);
+    let root = server.root();
+    let documents = || async {
+        server.call_ok(&root, "find", json!({"database":"sales","collection":"orders"})).await
+    };
+    let before = documents().await;
+    for (tool, arguments) in keyed_calls() {
+        for bad in ["short", &"k".repeat(256), "6f1c0e52-8a1d-4f53-9b3e-2c1d6a7e4b90\u{e9}"] {
+            let body = server.call(&root, tool, with_key(arguments.clone(), bad)).await;
+            let (code, message) = refusal(&body);
+            assert_eq!(code, "bad_request", "{tool} {bad:?}: {body}");
+            assert!(message.starts_with("idempotency_key: "), "{tool}: {message}");
+        }
+    }
+    assert_eq!(documents().await, before, "no refused call wrote anything");
+    for (tool, arguments) in keyed_calls() {
+        let done = server.call_ok(&root, tool, with_key(arguments, KEY)).await;
+        assert!(done.is_object(), "{tool}: {done}");
+    }
+}
+
+/// The gate refuses the argument exactly as it refuses the header: naming the
+/// switch while it is off, naming the live member that does not carry records
+/// while one does not, and taking it once the gate is open.
+#[tokio::test]
+async fn the_argument_is_gated_as_the_header_is() {
+    use kimmy_api::idempotency::IdempotencyClosed;
+    let server = Server::start().await;
+    seed(&server);
+    let root = server.root();
+    let state = Arc::new(std::sync::Mutex::new(Err(IdempotencyClosed::Undeclared)));
+    let gate = Arc::clone(&state);
+    server.state.set_idempotency_gate(Arc::new(move || gate.lock().unwrap().clone()));
+
+    for (tool, arguments) in keyed_calls() {
+        let body = server.call(&root, tool, with_key(arguments.clone(), KEY)).await;
+        let (code, message) = refusal(&body);
+        assert_eq!(code, "bad_request", "{tool}: {body}");
+        assert!(
+            message.contains("cluster.idempotency_keys"),
+            "{tool}: names the switch: {message}"
+        );
+        // Without the argument the call is untouched by the gate.
+        assert!(server.call(&root, tool, arguments).await["error"].is_null(), "{tool}");
+    }
+
+    *state.lock().unwrap() = Err(IdempotencyClosed::Peers(vec!["peer-node-0002".into()]));
+    let (tool, arguments) = keyed_calls().remove(0);
+    let body = server.call(&root, tool, with_key(arguments.clone(), KEY)).await;
+    let (_, message) = refusal(&body);
+    assert!(message.contains("peer-node-0002"), "names the member: {message}");
+
+    *state.lock().unwrap() = Ok(());
+    server.call_ok(&root, tool, with_key(arguments, KEY)).await;
 }
