@@ -10489,7 +10489,6 @@ async fn the_metrics_body_exposes_exactly_these_series_in_exactly_this_order() {
         "kimmy_ttl_skipped_total",
         "kimmy_ttl_skipped_filter_total",
         "kimmy_index_unkeyed_total",
-        "kimmy_index_undecidable_total",
         "kimmy_webhook_deliveries_total",
         "kimmy_webhook_deliveries_total",
         "kimmy_webhook_events_total",
@@ -14624,29 +14623,35 @@ async fn an_index_carries_every_field_the_specification_requires() {
         .iter()
         .map(|v| v.as_str().expect("a field name").to_string())
         .collect();
+    assert!(required.contains(&"unkeyed".to_string()), "premise: the Index schema ({required:?})");
+    // ADR-238 removed `undecidable` (ADR-185's figure for the documents a
+    // partial filter could not decide), from the response and from the schema:
+    // a filter decides a `Decimal128` by its exact value.
     assert!(
-        required.contains(&"unkeyed".to_string()) && required.contains(&"undecidable".to_string()),
-        "premise: the list read is the Index schema's ({required:?})"
+        !required.contains(&"undecidable".to_string())
+            && spec["components"]["schemas"]["Index"]["properties"].get("undecidable").is_none(),
+        "docs/openapi.yaml still promises the removed `undecidable` ({required:?})"
     );
 
     let server = Server::start().await;
     let token = server.root().await;
     server.post("/v1/db/shop/collections", Some(&token), json!({ "name": "orders" })).await;
-    // A partial index, so the two sentinel figures are both meaningful, and one
-    // document the filter cannot decide so `undecidable` is not merely present.
-    server
-        .post(
-            "/v1/db/shop/coll/orders/docs",
-            Some(&token),
-            json!({ "_id": "a", "note": "x", "k": { "$numberDecimal": "1" } }),
-        )
-        .await;
+    // A partial compound index, and documents with arrays at both of its paths,
+    // which it cannot key: one the filter selects, by a decimal's exact value,
+    // so `unkeyed` is not merely present, and one it does not, which the index
+    // does not hold at all.
+    let docs = "/v1/db/shop/coll/orders/docs";
+    for (id, k) in [("a", "9"), ("b", "1")] {
+        let doc =
+            json!({ "_id": id, "note": ["x", "y"], "tag": [1, 2], "k": { "$numberDecimal": k } });
+        assert_eq!(server.post(docs, Some(&token), doc).await.status, 200);
+    }
     let created = server
         .post(
             "/v1/db/shop/coll/orders/indexes",
             Some(&token),
             json!({
-                "fields": [{ "path": "note" }],
+                "fields": [{ "path": "note" }, { "path": "tag" }],
                 "partialFilterExpression": { "k": { "$gt": 5 } },
             }),
         )
@@ -14661,37 +14666,39 @@ async fn an_index_carries_every_field_the_specification_requires() {
                 "{what} does not carry {field:?}, which docs/openapi.yaml marks required: {body}"
             );
         }
+        assert!(body.get("undecidable").is_none(), "{what} renders the removed field: {body}");
     }
     assert_eq!(
-        listing["undecidable"], 1,
-        "and the figure is the real one, not a zero that would pass whatever it counted: {listing}"
+        listing["unkeyed"], 1,
+        "and the figure is the real one, not a zero that would pass whatever it counted: the \
+         decimal 9 is selected and unkeyable, the decimal 1 is not selected: {listing}"
     );
-    assert_eq!(listing["unkeyed"], 0, "the other reason is separate: {listing}");
 }
 
 #[tokio::test]
-async fn explain_reports_the_undecidable_run_it_read() {
-    // ADR-185 tells an owner that an undecidable document is rechecked on every
-    // scan of the index, and `explain` is where they would look for what that
-    // costs a query. The figure was computed and dropped: a query that read two
-    // entries from the undecidable run reported `unkeyedCandidates: 0` and
-    // nothing else, so the cost was invisible exactly where it is documented.
+async fn explain_reads_only_what_the_filter_selects_a_decimal_included() {
+    // From ADR-185 to ADR-238 a partial index held every document with a
+    // `Decimal128` at a filtered path in an undecidable run, read and rechecked
+    // by every scan, and `explain` reported the entries as
+    // `undecidableCandidates`. The comparator now places a decimal by its
+    // exact value, so the filter decides it: the index holds what the filter
+    // selects and nothing else, a scan reads exactly those entries, and the
+    // field is gone rather than left at a constant 0.
     let server = Server::start().await;
     let token = server.root().await;
     server.post("/v1/db/shop/collections", Some(&token), json!({ "name": "orders" })).await;
     let docs = "/v1/db/shop/coll/orders/docs";
-    // Two the filter cannot decide, and one it selects, so the run's entries
-    // are neither all of the index nor none of it.
-    for id in ["a", "b"] {
-        server
-            .post(
-                docs,
-                Some(&token),
-                json!({ "_id": id, "note": "n", "k": { "$numberDecimal": "1" } }),
-            )
-            .await;
+    // Two decimals the filter decides against, one it selects, and a plain
+    // number it selects.
+    for (id, k) in [
+        ("a", json!({ "$numberDecimal": "1" })),
+        ("b", json!({ "$numberDecimal": "5.000" })),
+        ("c", json!(9)),
+        ("d", json!({ "$numberDecimal": "9.5" })),
+    ] {
+        let res = server.post(docs, Some(&token), json!({ "_id": id, "note": "n", "k": k })).await;
+        assert_eq!(res.status, 200, "{:?}", res.body);
     }
-    server.post(docs, Some(&token), json!({ "_id": "c", "note": "n", "k": 9 })).await;
     let created = server
         .post(
             "/v1/db/shop/coll/orders/indexes",
@@ -14702,11 +14709,9 @@ async fn explain_reports_the_undecidable_run_it_read() {
             }),
         )
         .await;
-    assert_eq!(
-        created.body["undecidable"], 2,
-        "premise: the backfill filed both: {}",
-        created.body
-    );
+    assert_eq!(created.status, 200, "{:?}", created.body);
+    assert_eq!(created.body["unkeyed"], 0, "{}", created.body);
+    assert!(created.body.get("undecidable").is_none(), "the removed field: {}", created.body);
 
     let count = |filter: Value| {
         let (server, token) = (&server, &token);
@@ -14723,34 +14728,44 @@ async fn explain_reports_the_undecidable_run_it_read() {
         }
     };
 
-    let hit = count(json!({ "note": "n", "k": 7 })).await;
-    assert_eq!(hit["explain"]["strategy"], "index", "{hit}");
-    assert_eq!(
-        hit["explain"]["undecidableCandidates"], 2,
-        "the entries this query read from the undecidable run: {hit}"
-    );
-    assert_eq!(
-        hit["explain"]["unkeyedCandidates"], 0,
-        "and not folded into the run that means a fault: {hit}"
-    );
-    assert_eq!(
-        hit["count"], 0,
-        "the two decimals are read from the run and rechecked, and neither is 7: {hit}"
-    );
+    for (filter, matched) in [
+        (json!({ "note": "n", "k": 7 }), 0),
+        (json!({ "note": "n", "k": { "$gt": { "$numberDecimal": "9" } } }), 1),
+        (json!({ "note": "n", "k": { "$gte": 9 } }), 2),
+    ] {
+        let hit = count(filter.clone()).await;
+        assert_eq!(hit["explain"]["strategy"], "index", "{filter}: {hit}");
+        assert_eq!(
+            hit["explain"]["indexEntriesRead"], 2,
+            "{filter}: the 9 and the decimal 9.5, and neither decimal the filter decides \
+             against: {hit}"
+        );
+        assert_eq!(hit["explain"]["unkeyedCandidates"], 0, "{filter}: {hit}");
+        assert!(
+            hit["explain"].get("undecidableCandidates").is_none(),
+            "{filter}: the removed field: {hit}"
+        );
+        assert_eq!(hit["count"], matched, "{filter}: {hit}");
+    }
 
-    // A collection scan reads no index, so it reports neither figure rather
-    // than a zero that would read as an index with an empty run.
+    // A collection scan reads no index either.
     let scan = count(json!({ "other": 1 })).await;
     assert_eq!(scan["explain"]["strategy"], "collectionScan", "{scan}");
-    assert!(scan["explain"].get("undecidableCandidates").is_none(), "no index, no run: {scan}");
+    assert!(scan["explain"].get("undecidableCandidates").is_none(), "{scan}");
 
-    // And the field a client reads is the documented one.
+    // And the schema a client reads no longer documents it.
     let spec: serde_json::Value =
         serde_norway::from_str(include_str!("../../../docs/openapi.yaml"))
             .expect("docs/openapi.yaml is valid YAML");
     assert!(
-        spec["components"]["schemas"]["Explain"]["properties"]["undecidableCandidates"].is_object(),
-        "docs/openapi.yaml's Explain schema does not document undecidableCandidates"
+        spec["components"]["schemas"]["Explain"]["properties"]
+            .get("undecidableCandidates")
+            .is_none(),
+        "docs/openapi.yaml's Explain schema still documents the removed undecidableCandidates"
+    );
+    assert!(
+        spec["components"]["schemas"]["Explain"]["properties"]["unkeyedCandidates"].is_object(),
+        "premise: the Explain schema read is the one with the candidate figures"
     );
 }
 

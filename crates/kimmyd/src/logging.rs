@@ -632,14 +632,6 @@ impl TelemetryGuard {
         );
         observe!(
             u64_observable_counter,
-            "kimmy.index.undecidable",
-            "{document}",
-            "Documents an index holds because its partial filter could not decide them; every \
-             scan re-checks them (ADR-185).",
-            index_undecidable
-        );
-        observe!(
-            u64_observable_counter,
             "kimmy.ttl.skipped",
             "{document}",
             "Expiry candidates refused because the document was refreshed first.",
@@ -2899,7 +2891,7 @@ mod tests {
     fn no_two_bridge_instruments_read_the_same_field() {
         // The bridge is a list of `observe!(kind, "kimmy.x.y", unit, help,
         // field)` calls, and **nothing checked which field each one reads**.
-        // `kimmy.index.undecidable` reading `index_unkeyed` would publish one
+        // `kimmy.ttl.skipped` reading `ttl_expired` would publish one
         // figure under two names, on the surface alerting is built from, and
         // every existing test would pass: the coverage test below matches names
         // only, and the snapshot that might have caught it renders

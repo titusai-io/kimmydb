@@ -1712,12 +1712,11 @@ impl Engine {
             if let Some(doc) = self.get(coll, id)? {
                 // A document the index cannot key holds no key, so it can
                 // share none: it has left the group, whatever it shared before.
+                // One its partial filter does not select is `Keyed` with no
+                // keys, a decimal at a filtered path included (ADR-238).
                 let keys = match index::document_keys(index, &doc)? {
                     index::DocumentKeys::Keyed { keys, .. } => keys,
-                    // And one the filter cannot decide holds none either
-                    // (ADR-185): it is in the undecidable run, sharing no key.
-                    index::DocumentKeys::Unkeyed { .. }
-                    | index::DocumentKeys::Undecidable { .. } => Vec::new(),
+                    index::DocumentKeys::Unkeyed { .. } => Vec::new(),
                 };
                 keyed.push((id, keys));
             }

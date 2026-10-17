@@ -1224,8 +1224,7 @@ the series; every series the endpoint exposes has a row.
 | `kimmy_ttl_expired_total` | Documents deleted by a TTL index. Summed across members it counts one delete per expired document once membership and the members' blocks have settled. **More than one holder may delete the same expired document**, and the deletes converge ([ADR-201](decisions.md)): for about one sync interval after a TTL index is created (each holder counts only itself until the others' blocks arrive); for as long as a member's sync contacts fail while SWIM keeps it up (its peers' blocks go stale on it, and it counts only itself); and, permanently, for every collection past the 256 a member's block lists, which each holder owns. The last two show in `kimmy_ttl_collections` below |
 | `kimmy_ttl_skipped_total` | Expiry candidates the pass declined because the document was refreshed between the scan and the delete — a session heartbeat landing while the pass ran ([TTL indexes](indexes.md#ttl-indexes--expiring-documents)) |
 | `kimmy_ttl_skipped_filter_total` | Expiry candidates a TTL index held that its partial filter, read as `find` reads it, did not select when the delete re-read the document — so they were **not** deleted ([ADR-181](decisions.md)). Two causes: a document moved out of the filter while the pass ran, and a document the index held that the filter never selected. The second was a defect in partial-index membership, which compared across type brackets, so `{size: {$gt: 5}}` held strings, documents and booleans and expiry deleted them. That is fixed, and every partial index was rebuilt on the first start of the release carrying [ADR-183](decisions.md), so **on a migrated database only the first cause is left and this should read near zero**. A rate above that on such a database is a genuine race, not the old defect; a rate that stays high is worth reporting. Kept apart from `kimmy_ttl_skipped_total` so that fall can be seen |
-| `kimmy_index_unkeyed_total` | Documents stored under an index that could not key them — arrays at two of a compound index's paths, more than 1,000 keys for one document, a `Decimal128` at an indexed path — and are rechecked on every scan of that index instead ([Indexes](indexes.md#documents-an-index-cannot-key)). Local writes, replicated writes and backfills all count here; each is logged at warning naming the database, collection, index and document id. Rising steadily is a schema the index does not fit: reshape the documents, or split the index. The standing number per index is `unkeyed` on the index listing, which a collection's owner can read without this endpoint ([ADR-139](decisions.md)). **This counts that reason only**: a document an index holds because a partial filter could not *decide* it is `kimmy_index_undecidable_total` below, and the index listing reports the two as separate standing figures ([ADR-185](decisions.md)) |
-| `kimmy_index_undecidable_total` | Documents an index holds because its partial filter could not decide them: a `Decimal128` at a filtered path ranks equal to every number, so the filter's answer is not an answer, and the index holds the document for the scan to re-check ([ADR-185](decisions.md)). **Expected, not a fault** — it rises whenever such a document is written, needs no action, and is a separate series from `kimmy_index_unkeyed_total` precisely so an alert on that one keeps meaning what it meant |
+| `kimmy_index_unkeyed_total` | Documents stored under an index that could not key them — arrays at two of a compound index's paths, or more than 1,000 keys for one document — and are rechecked on every scan of that index instead ([Indexes](indexes.md#documents-an-index-cannot-key)). Local writes, replicated writes and backfills all count here; each is logged at warning naming the database, collection, index and document id. Rising steadily is a schema the index does not fit: reshape the documents, or split the index. The standing number per index is `unkeyed` on the index listing, which a collection's owner can read without this endpoint ([ADR-139](decisions.md)). A `Decimal128` at an indexed path was a third reason through 0.50.x; since 0.51.0 it has an exact key. **`kimmy_index_undecidable_total` is gone since 0.51.0** (and its OTLP instrument `kimmy.index.undecidable`): it counted the documents a partial index held because its filter could not decide them, a `Decimal128` at a filtered path, and a partial filter now decides a `Decimal128` by its exact value ([ADR-238](decisions.md)). Remove any dashboard or alert built on it |
 | `kimmy_webhook_deliveries_total{outcome}` | Webhook delivery attempts, `delivered` or `failed` |
 | `kimmy_webhook_events_total` | Change events pushed to endpoints |
 | `kimmy_webhook_subscriptions{state}` | Registered subscriptions, counted from this node's registry when the page is read: `active`, or `invalidated` after falling too far behind ([Webhooks](webhooks.md)), or `unreadable`. A record the dispatcher cannot load (one missing a field) is counted as `active`: it is registered, even though nothing delivers it. A record that does not decode at all is counted as `unreadable`, and should read 0: above 0, a record in the registry is damaged and nothing delivers it, and the rest of the page still reads. If the registry itself cannot be read, the scrape fails rather than reporting 0 ([ADR-187](decisions.md)) |
@@ -2701,9 +2700,15 @@ says `migrating`; peers see it as down, and nothing is written to it. In order:
    the documents it could not key, and `unique_collisions`), and the migration
    with `migrated storage schema 4 -> 5` and the time of each phase. A TTL
    index with a partial filter logs one more line: the documents its filter now
-   selects that it did not (they expire once due) and the reverse, because a
-   decimal at the filter's path is now compared by its exact value
-   (`before="not recorded"` for a store that comes from schema 3).
+   selects that it did not (`now_selected`: they expire once due) and the
+   reverse (`now_not_selected`: 0.50 would have expired them, and they are
+   kept), because a decimal at the filter's path is now compared by its exact
+   value where 0.50 never expired one its filter did not select
+   (`before="not recorded"` for a store that comes from schema 3). **Read it
+   before the first expiry pass**: those deletes are ordinary replicated
+   deletes, which reach every member, 0.50 ones mid-roll included, and cannot
+   be undone except from the backup taken before the upgrade
+   ([Indexes](indexes.md#a-decimal128-at-a-filtered-path)).
 4. **The first start on schema 5 also walks the oplog once** (`checked the
    version vector against the oplog`); later starts log `skipped the oplog
    walk`.
@@ -2718,7 +2723,9 @@ them, as a replicated build's are, with a `/violations` row, the metric and a
 line each. That includes a pair 0.50 never enforced: a partial unique index
 whose filter's path holds a decimal now decides it exactly, and a pair a
 replication merge left, which 0.50 reported once already, is reported once
-more.
+more. From then on a local write that would keep either holder's key, or add
+another holder, is refused as a duplicate, where 0.50 accepted it; resolve the
+pair as any other violation.
 
 **How long it takes.** On the lab host's spinning disk, cold, 2,000,000
 documents of about 350 bytes with integer `_id`s and three indexes took **19.3

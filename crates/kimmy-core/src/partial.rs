@@ -2,10 +2,12 @@
 //!
 //! # Why it is bounded rather than general
 //!
-//! A partial index holds the documents matching its filter — and, since
-//! [ADR-185](../../../docs/decisions.md), those it cannot decide, which is a
-//! superset rather than an exception to the rule below. The planner may use such
-//! an index **only for a query provably contained by that filter**.
+//! A partial index holds exactly the documents matching its filter, a
+//! `Decimal128` at a filtered path decided by its exact value like any number
+//! (ADR-238; from [ADR-185](../../../docs/decisions.md) until then, such a
+//! document was held whatever the filter said, because the comparator could
+//! not place it). The planner may use such an index **only for a query
+//! provably contained by that filter**.
 //! Get that wrong and results silently lose documents — the same failure this
 //! codebase already met with multikey, and the one it is least able to notice.
 //!
@@ -123,21 +125,23 @@ impl PartialOp {
     /// - **`{k: null}` matches a missing field**, so it implies nothing about
     ///   presence and no bound: only itself.
     ///
-    /// **Transitive for every value, a `Decimal128` included.** This reasons
-    /// through a single value `w`, which assumes equality is transitive.
+    /// **Sound for every value, a `Decimal128` included.** This reasons
+    /// through a single value `w`, which assumes the order is transitive.
     /// `canonical_cmp` places a `Decimal128` by its exact value (ADR-238), in
     /// the number bracket beside the other numbers, so it is: `Eq(5)` and
-    /// `Eq(6)` cannot both hold on one value, and a decimal operand is a bound
-    /// like any number. Before ADR-238 the order ranked a decimal equal to
-    /// every number, implication was not transitive for a decimal document
-    /// value, and [ADR-185](../../../docs/decisions.md) widened membership
-    /// instead of making this sound (see [`PartialFilter::undecidable_path`]).
+    /// `Eq(6)` cannot both hold on one value, `Decimal128("1.0")` and `1` are
+    /// one value, `Decimal128("0.1")` lies below `Double(0.1)`, and a decimal
+    /// operand is a bound like any number. Before ADR-238 the order ranked a
+    /// decimal equal to every number, so implication was not sound for a
+    /// decimal document value, and [ADR-185](../../../docs/decisions.md)
+    /// widened membership (an undecidable run every scan re-read) instead of
+    /// making this sound. The widening is gone with its premise: membership is
+    /// [`PartialFilter::selects`] alone.
     ///
-    /// The soundness property below holds decimal document values and
-    /// decimal operands. The end-to-end property is `partial_containment.rs`
-    /// in `kimmy-query`, whose corpus of caller-written operands is still the
-    /// pre-ADR-238 one (its extension to decimal operands is ADR-238's
-    /// removal of the undecidable filing, a change of its own).
+    /// The soundness property below holds decimal document values and decimal
+    /// operands on both sides, a query's and a filter's. The end-to-end property
+    /// is `partial_containment.rs` in `kimmy-query`, over decimal documents,
+    /// decimal query operands and decimal partial-filter bounds.
     pub fn implies(&self, other: &PartialOp) -> bool {
         use crate::cmp::same_type_group;
         let bracket = |a: &Bson, b: &Bson| same_type_group(a, b);
@@ -231,7 +235,9 @@ impl PartialFilter {
     }
 
     /// Whether `find` with this filter as its expression would return `doc`
-    /// -- which is also whether `doc` belongs in the index (ADR-183).
+    /// -- which is also whether `doc` belongs in the index (ADR-183), with
+    /// nothing added: a `Decimal128` at a filtered path is decided here like
+    /// any number (ADR-238), where ADR-185 held it whatever this said.
     ///
     /// Evaluated by [`crate::matching`], the same code `kimmy-query`'s filter
     /// evaluates these operators with, so the answer is `find`'s by
@@ -243,32 +249,6 @@ impl PartialFilter {
     /// judged against the one while `find` answered by the other.
     pub fn selects(&self, doc: &Document) -> bool {
         self.predicates.iter().all(|(field, op)| op.selects(&path::resolve(doc, field)))
-    }
-
-    /// The first path at which a value holds a `Decimal128`: what
-    /// [ADR-185](../../../docs/decisions.md) files as undecidable.
-    ///
-    /// ADR-185 was written when the canonical order ranked a `Decimal128`
-    /// equal to every number, so `selects` returned *an* answer rather than
-    /// *the* answer for such a document, and the index held it anyway for the
-    /// scan to re-check. That premise is gone: the comparator places a
-    /// decimal by its exact value (ADR-238) and `selects` decides it as it
-    /// decides any number, a decimal bound in the filter included. The filing
-    /// still stands until ADR-238 removes it (a change of its own); holding a
-    /// document the filter does not select costs index size and a re-check,
-    /// never a document `find` returns.
-    ///
-    /// **Read through the same resolution as [`Self::selects`]**, so the two
-    /// cannot disagree about which values a path offers. `holds_decimal128`
-    /// searches the whole value, so `{k: {a: Decimal128(1)}}` counts for a
-    /// filter on `k`.
-    pub fn undecidable_path(&self, doc: &Document) -> Option<&str> {
-        self.predicates.iter().find_map(|(field, _)| {
-            path::resolve(doc, field)
-                .iter()
-                .any(|v| crate::cmp::holds_decimal128(v))
-                .then_some(field.as_str())
-        })
     }
 
     /// Whether a query carrying `query` is provably contained by this filter.
@@ -621,18 +601,38 @@ mod tests {
             }),
             true.into(),
             Bson::DateTime(bson::DateTime::from_millis(1_000)),
-            // Decimals, as document values and as operands (ADR-238): one
-            // equal to `5` in another cohort, one between the integers, one
-            // that is not the double of the same digits, the specials, and
-            // one inside an array.
+            // Decimals, as document values and as operands on both sides
+            // (ADR-238): one equal to `5` in another cohort, one between the
+            // integers, one that is not the double of the same digits and the
+            // two 34-digit decimals either side of that double, one equal to a
+            // double, one equal to an `Int64` the doubles cannot hold, zeros,
+            // values past every double, the specials, and decimals inside
+            // arrays and documents.
             dec("5.00"),
             dec("6.5"),
             dec("0.1"),
             Bson::Double(0.1),
+            dec("0.1000000000000000055511151231257827"),
+            dec("0.1000000000000000055511151231257828"),
+            dec("7.50"),
+            Bson::Int64(9_007_199_254_740_993),
+            Bson::Double(9_007_199_254_740_992.0),
+            dec("9007199254740993"),
+            Bson::Int32(0),
+            Bson::Double(-0.0),
+            dec("-0E-100"),
+            dec("1E+400"),
+            dec("-1E+400"),
             dec("NaN"),
+            dec("-NaN"),
+            Bson::Double(f64::NAN),
             dec("-Infinity"),
             dec("Infinity"),
             Bson::Array(vec![dec("1"), 2.into()]),
+            Bson::Array(vec![dec("5")]),
+            Bson::Array(vec![dec("6.5"), "x".into()]),
+            doc! {"a": dec("1.0")}.into(),
+            Bson::Array(vec![doc! {"a": dec("1")}.into()]),
         ]
     }
 
@@ -661,24 +661,49 @@ mod tests {
         // have failed.
         let mut docs = vec![doc! {}];
         docs.extend(corpus().into_iter().map(|v| doc! {"k": v}));
-        let mut implied = 0usize;
+        let operand = |op: &PartialOp| match op {
+            PartialOp::Exists => None,
+            PartialOp::Eq(v)
+            | PartialOp::Gt(v)
+            | PartialOp::Gte(v)
+            | PartialOp::Lt(v)
+            | PartialOp::Lte(v) => Some(v.clone()),
+        };
+        let decimal = |op: &PartialOp| operand(op).is_some_and(|v| crate::holds_decimal128(&v));
+        let (mut implied, mut both_decimal, mut decimal_witnessed) = (0usize, 0usize, 0usize);
         for qop in ops() {
             for iop in ops() {
                 if !qop.implies(&iop) {
                     continue;
                 }
                 implied += 1;
+                both_decimal += usize::from(decimal(&qop) && decimal(&iop));
                 for d in &docs {
                     let values = path::resolve(d, "k");
+                    let matched = qop.selects(&values);
                     assert!(
-                        !qop.selects(&values) || iop.selects(&values),
+                        !matched || iop.selects(&values),
                         "{qop:?} claims to imply {iop:?}, but {d:?} matches the query and \
                          is not in the index -- this is the silent document loss"
                     );
+                    if matched && crate::holds_decimal128(&Bson::Document(d.clone())) {
+                        decimal_witnessed += 1;
+                    }
                 }
             }
         }
-        assert!(implied > 600, "premise: the corpus exercises implication (692 pairs): {implied}");
+        // Premises: an empty search passes the assertion above, so the corpus
+        // is asserted to reach implication, implication between two decimal
+        // operands, and decimal documents the query matched.
+        assert!(implied > 4_500, "premise: implication is reached (5,026 pairs): {implied}");
+        assert!(
+            both_decimal > 1_200,
+            "premise: a decimal query operand implies a decimal bound (1,341 pairs): {both_decimal}"
+        );
+        assert!(
+            decimal_witnessed > 15_000,
+            "premise: decimal documents matched an implying query (18,293): {decimal_witnessed}"
+        );
     }
 
     // -- round-tripping ---------------------------------------------------

@@ -57,8 +57,9 @@ const TAG_MIN_KEY: u8 = 0x01;
 ///
 /// Exported so that the storage layer can place its sentinel runs **below every
 /// real key** without repeating a literal that would then be able to drift away
-/// from this table. `kimmy-storage`'s `UNKEYED` and `UNDECIDABLE` runs sit below
-/// this, and a query's range starts at it.
+/// from this table. `kimmy-storage`'s `UNKEYED` run sits below this, and so did a
+/// schema 4 store's `UNDECIDABLE` run (ADR-185, removed by ADR-238; the schema 5
+/// migration still reads it there), and a query's range starts at it.
 pub const LEAST_KEY_TAG: u8 = TAG_MIN_KEY;
 const TAG_NULL: u8 = 0x10;
 const TAG_NUMBER: u8 = 0x20;
@@ -386,10 +387,11 @@ mod tests {
     #[test]
     fn every_real_key_sorts_above_every_sentinel() {
         // `kimmy-storage` files documents it **cannot key** under the empty key,
-        // and documents whose membership its filter **cannot decide** under
-        // `[0x00]` — both below every real key, so each run is walked exactly
-        // once by its own prepended range while a query's ranges start at
-        // `LEAST_KEY_TAG`.
+        // and through schema 4 filed documents whose membership its filter
+        // could not decide under `[0x00]` (ADR-185; the schema 5 migration
+        // reads that run on such a store before draining it) — both below every
+        // real key, so each run was walked exactly once by its own prepended
+        // range while a query's ranges start at `LEAST_KEY_TAG`.
         //
         // All of that rests on one fact, and the fact lives here rather than
         // there: no real key begins below `LEAST_KEY_TAG`. A tag added below it

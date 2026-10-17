@@ -1314,21 +1314,19 @@ fn drain(db: &Database, run: &mut Run, meta: &CollectionMeta, index: &IndexMeta)
 /// filter path that its filter did not select in the undecidable run (ADR-185),
 /// and every other one in the index, so "selected before" is "not in that run",
 /// looked up under the document's schema 4 key. "Selected now" is the filter's
-/// answer under the current comparator. Generic: when the undecidable filing goes
-/// (design 2.6) the count is unchanged, since it reads the run the previous
-/// build wrote and the filter's answer today, not how today's build files it.
+/// answer under the current comparator. Generic: it reads the run the previous
+/// build wrote and the filter's answer today, not how today's build files it,
+/// which since design 2.6 is never in that run. This is the one reader of
+/// `UNDECIDABLE` left in the product, and it reads a schema 4 store only.
 ///
-/// What this branch can test is the count against today's filing, where a
-/// decimal the filter does not select is still filed undecidable. The test
-/// that belongs with design 2.6 must assert, on a schema 4 store whose TTL
-/// partial index 0.50 filed a decimal-bearing document undecidable: that the
-/// migration's line counts it in `now_selected` when the exact filter selects
-/// it, and that after the migration the index holds it under its date key (so
-/// an expiry pass deletes it once due); that a document 0.50 selected only by
-/// ranking a decimal equal to the bound (a `$gte`) is counted in
-/// `now_not_selected` and is no longer in the index at all (no undecidable run
-/// to fall into); and that a document whose selection did not change is in
-/// neither count.
+/// The test is `a_ttl_partial_index_over_decimals_counts_and_expires_by_exact_value`
+/// in `migrate_v5_tests`: on a schema 4 store whose TTL partial indexes 0.50
+/// filed decimal-bearing documents undecidable, the line counts a document the
+/// exact filter now selects in `now_selected` and the index holds it under its
+/// date key, so the next expiry pass deletes it; a document 0.50 selected only
+/// by ranking a decimal equal to the bound (a `$gte`) is counted in
+/// `now_not_selected` and is no longer in the index at all; and a document
+/// whose selection did not change is in neither count.
 fn ttl_selection_changes(
     db: &Database,
     meta: &CollectionMeta,
@@ -1490,10 +1488,6 @@ fn refill(
                             bytes += 12 + doc_key.len();
                             entries.insert((coll, index.id, UNKEYED, doc_key), ())?;
                             mark.unkeyed += 1;
-                        }
-                        DocumentKeys::Undecidable { .. } => {
-                            bytes += 13 + doc_key.len();
-                            entries.insert((coll, index.id, UNDECIDABLE, doc_key), ())?;
                         }
                     }
                 }

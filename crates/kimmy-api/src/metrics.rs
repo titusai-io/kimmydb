@@ -99,7 +99,6 @@ pub struct StorageReadings {
     /// Documents filed under an index's unkeyed run since start
     /// (`Engine::unkeyed_writes`, ADR-139).
     pub index_unkeyed: u64,
-    pub index_undecidable: u64,
     /// Schema changes a snapshot restore appended to the oplog since start
     /// (`Engine::ddl_relogged`, ADR-180). A reading rather than a counter
     /// here: the engine counts each once its commit lands, which a round's
@@ -376,7 +375,6 @@ pub struct MetricsSnapshot {
     /// key the index could derive, so every scan of that index rechecks
     /// them (ADR-139). One of the engine's readings.
     pub index_unkeyed: u64,
-    pub index_undecidable: u64,
     /// Writes that gave up waiting for the writer, and the longest hold in
     /// microseconds (ADR-151); the wait histogram itself is not bridged.
     pub write_lock_wait_timeouts: u64,
@@ -1439,7 +1437,6 @@ impl Metrics {
             ttl_skipped: self.get(&self.ttl_skipped),
             ttl_skipped_filter: self.get(&self.ttl_skipped_filter),
             index_unkeyed: readings.index_unkeyed,
-            index_undecidable: readings.index_undecidable,
             webhook_delivered: self.get(&self.webhook_delivered),
             webhook_failed: self.get(&self.webhook_failed),
             webhook_events: self.get(&self.webhook_events),
@@ -1808,12 +1805,9 @@ impl Metrics {
              # HELP kimmy_ttl_skipped_filter_total Expiry candidates a TTL index held that its partial filter, evaluated as find evaluates it, did not select when the delete re-read the document, and were not deleted. A document moved out of the filter while the pass ran, or one the index should never have held. Should fall to near zero once partial-index membership agrees with the filter; until then each one is a document expiry used to delete.\n\
              # TYPE kimmy_ttl_skipped_filter_total counter\n\
              kimmy_ttl_skipped_filter_total {ttl_skipped_filter}\n\
-             # HELP kimmy_index_unkeyed_total Documents stored under an index that could not key them - arrays at two of a compound index's paths, more than 1000 keys, or a Decimal128 - and are rechecked on every scan of that index instead. Each one is logged at warning naming the index and the document; the index listing reports how many stand under each index as `unkeyed`. This counts that reason only; a document held because a partial filter could not decide it is kimmy_index_undecidable_total.\n\
+             # HELP kimmy_index_unkeyed_total Documents stored under an index that could not key them - arrays at two of a compound index's paths, or more than 1000 keys - and are rechecked on every scan of that index instead. Each one is logged at warning naming the index and the document; the index listing reports how many stand under each index as `unkeyed`.\n\
              # TYPE kimmy_index_unkeyed_total counter\n\
              kimmy_index_unkeyed_total {index_unkeyed}\n\
-             # HELP kimmy_index_undecidable_total Documents an index holds because its partial filter could not decide them: a Decimal128 at a filtered path, which the canonical order ranks equal to every number, so the filter's answer is not an answer. The index holds them and every scan re-checks them, which is what stops a partial index missing documents find returns. Expected, not a fault - the separate kimmy_index_unkeyed_total counts documents an index could not key, which is one.\n\
-             # TYPE kimmy_index_undecidable_total counter\n\
-             kimmy_index_undecidable_total {index_undecidable}\n\
              # HELP kimmy_webhook_deliveries_total Webhook delivery attempts by outcome.\n\
              # TYPE kimmy_webhook_deliveries_total counter\n\
              kimmy_webhook_deliveries_total{{outcome=\"delivered\"}} {wh_ok}\n\
@@ -2050,7 +2044,6 @@ impl Metrics {
             ttl_skipped = self.get(&self.ttl_skipped),
             ttl_skipped_filter = self.get(&self.ttl_skipped_filter),
             index_unkeyed = readings.index_unkeyed,
-            index_undecidable = readings.index_undecidable,
             wh_active = readings.webhook_active,
             wh_invalid = readings.webhook_invalidated,
             wh_unreadable = readings.webhook_unreadable,
@@ -3103,11 +3096,6 @@ mod tests {
             process_resident_bytes: 49,
             process_resident_peak_bytes: 50,
             index_unkeyed: 26,
-            // 37 rather than a small number: the golden is asserted
-            // byte-for-byte, and a value shared with another series (4 was also
-            // `kimmy_responses_total{class="5xx"}`) lets an assertion that names
-            // this one match the wrong line.
-            index_undecidable: 37,
             sync_ddl_relogged: 91,
             sync_horizon_state_held: 92,
             webhook_active: 15,
@@ -3652,12 +3640,9 @@ kimmy_ttl_skipped_total 12
 # HELP kimmy_ttl_skipped_filter_total Expiry candidates a TTL index held that its partial filter, evaluated as find evaluates it, did not select when the delete re-read the document, and were not deleted. A document moved out of the filter while the pass ran, or one the index should never have held. Should fall to near zero once partial-index membership agrees with the filter; until then each one is a document expiry used to delete.
 # TYPE kimmy_ttl_skipped_filter_total counter
 kimmy_ttl_skipped_filter_total 93
-# HELP kimmy_index_unkeyed_total Documents stored under an index that could not key them - arrays at two of a compound index's paths, more than 1000 keys, or a Decimal128 - and are rechecked on every scan of that index instead. Each one is logged at warning naming the index and the document; the index listing reports how many stand under each index as `unkeyed`. This counts that reason only; a document held because a partial filter could not decide it is kimmy_index_undecidable_total.
+# HELP kimmy_index_unkeyed_total Documents stored under an index that could not key them - arrays at two of a compound index's paths, or more than 1000 keys - and are rechecked on every scan of that index instead. Each one is logged at warning naming the index and the document; the index listing reports how many stand under each index as `unkeyed`.
 # TYPE kimmy_index_unkeyed_total counter
 kimmy_index_unkeyed_total 26
-# HELP kimmy_index_undecidable_total Documents an index holds because its partial filter could not decide them: a Decimal128 at a filtered path, which the canonical order ranks equal to every number, so the filter's answer is not an answer. The index holds them and every scan re-checks them, which is what stops a partial index missing documents find returns. Expected, not a fault - the separate kimmy_index_unkeyed_total counts documents an index could not key, which is one.
-# TYPE kimmy_index_undecidable_total counter
-kimmy_index_undecidable_total 37
 # HELP kimmy_webhook_deliveries_total Webhook delivery attempts by outcome.
 # TYPE kimmy_webhook_deliveries_total counter
 kimmy_webhook_deliveries_total{outcome=\"delivered\"} 2
@@ -4334,7 +4319,6 @@ kimmy_storage_cache_reads_total{result=\"miss\"} 9104
         expect(&format!("kimmy_ttl_skipped_total {}\n", s.ttl_skipped));
         expect(&format!("kimmy_ttl_skipped_filter_total {}\n", s.ttl_skipped_filter));
         expect(&format!("kimmy_index_unkeyed_total {}\n", s.index_unkeyed));
-        expect(&format!("kimmy_index_undecidable_total {}\n", s.index_undecidable));
         expect(&format!(
             "kimmy_webhook_deliveries_total{{outcome=\"delivered\"}} {}\n",
             s.webhook_delivered
@@ -4827,10 +4811,10 @@ kimmy_storage_cache_reads_total{result=\"miss\"} 9104
         // since ADR-180, one for schema changes a snapshot restore re-logged;
         // since ADR-181, one for expiry declined by the partial filter;
         // since ADR-184, one retry counter per supervised task; since
-        // ADR-185, one for documents an index holds because its partial
-        // filter could not decide them; and since ADR-195, one for sync
-        // ticks a reset scheduled; and since ADR-224, one for pulls refused for a
-        // hole a snapshot left.
+        // ADR-195, one for sync ticks a reset scheduled; and since ADR-224,
+        // one for pulls refused for a hole a snapshot left. (ADR-185's one,
+        // for documents an index held because its partial filter could not
+        // decide them, went with ADR-238.)
         assert_eq!(
             samples,
             108 + 6 + 17
@@ -4841,9 +4825,6 @@ kimmy_storage_cache_reads_total{result=\"miss\"} 9104
                 + 1
                 + 5
                 + 15
-                // ADR-185: one for documents an index holds because its
-                // partial filter could not decide them.
-                + 1
                 // Since ADR-184, one per supervised task: the label set is
                 // `kimmy_task::TASKS`, so this counts the tasks rather than a
                 // number written twice.

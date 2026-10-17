@@ -188,17 +188,22 @@ encode identically, so a lookup for `5` finds a document that stored `5.0`. See
 
 ### Documents an index cannot key
 
-Three shapes give an index no finite, exact set of keys for a document:
+Two shapes give an index no finite, exact set of keys for a document:
 
 - **arrays at two of a compound index's paths** — the keys would be the
   cartesian product, `|a| × |b|` entries for one document;
 - **more than 1,000 keys for one document** — the backstop behind that rule,
-  and the ceiling for a single-field index over one very large array;
-- **a `Decimal128` at an indexed path** — which has no exact key encoding
-  ([Key Encoding](key-encoding.md#decimal128-is-refused)).
+  and the ceiling for a single-field index over one very large array.
+
+Through 0.50.x there was a third, **a `Decimal128` at an indexed path**, which
+had no exact key encoding. Since 0.51.0 a `Decimal128` is keyed by its exact
+value like any number ([Key Encoding](key-encoding.md#numbers-the-hard-part),
+[ADR-238](decisions.md)), so such a document is keyed, a range query over it is
+answered from the index, and a unique index enforces on it; the storage schema 5
+migration rebuilds every index, and a decimal leaves the unkeyed run there.
 
 MongoDB refuses the first ("cannot index parallel arrays"). KimmyDB used to
-refuse all three, per document, at write time. **It no longer refuses any of
+refuse these, per document, at write time. **It no longer refuses any of
 them.** The document is stored, and the index files it under its **unkeyed
 run** — one entry under an empty key, which no real key can be and which
 sorts ahead of every real key. Every scan of the index reads that run beside
@@ -223,10 +228,10 @@ database, collection, index and document id, and counted in
 report `unkeyed` — how many documents the index holds that it could not
 key — and `explain` reports `unkeyedCandidates` beside `indexEntriesRead`,
 the entries a query read from the run. **That figure means this reason and no
-other**: a document the index holds because a partial filter could not *decide*
-it is counted by `undecidable` instead, and the two are worth telling apart
-because this one is a fault and that one is not
-([below](#a-decimal128-at-a-filtered-path)). Zero is the index doing its whole
+other.** (From 0.34.0 to 0.50.x a second figure, `undecidable`, counted the
+documents a partial index held because its filter could not *decide* them, with
+`undecidableCandidates` in `explain`; both are gone since 0.51.0, see
+[below](#a-decimal128-at-a-filtered-path).) Zero is the index doing its whole
 job. Anything else is the cost of leaving such documents under the index:
 every scan of it rechecks all of them. The fix is the collection owner's, and
 needs no access to the server — reshape the documents, or split the compound
@@ -508,8 +513,10 @@ whose key carries a second component.
 ## Partial indexes — indexing only some documents
 
 An index with a `partialFilterExpression` holds **the documents matching it**,
-and nothing else — with one exception, [below](#a-decimal128-at-a-filtered-path).
-Smaller index, and a unique constraint that applies to a subset.
+and nothing else. (Through 0.50.x there was one exception, a `Decimal128` at a
+filtered path; since 0.51.0 the filter decides it like any number,
+[below](#a-decimal128-at-a-filtered-path).) Smaller index, and a unique
+constraint that applies to a subset.
 
 ```json
 { "fields": [{ "path": "email" }],
@@ -522,11 +529,18 @@ That example is the motivating case: **unique only where the field is present**.
 It was impossible before, because a missing field indexes as null and two
 documents lacking it collided on that null entry.
 
-A bound or an equality in the expression cannot be a `Decimal128`: the
-canonical order ranks one equal to every other number, so the filter would
-select every numeric value and the index would hold documents its definition
-never named. `createIndex` refuses it, naming the path
-([Key encoding](key-encoding.md#decimal128-is-refused)).
+A bound or an equality in the expression can be a `Decimal128` since 0.51.0,
+compared by its exact value like any number: `{balance: {$gt:
+{"$numberDecimal": "0.00"}}}` selects exactly the balances above zero, and
+`{k: {"$numberDecimal": "0.1"}}` does not select the double `0.1`, which is not
+one tenth. Through 0.50.x `createIndex` refused it, because the canonical order
+ranked a `Decimal128` equal to every other number. **Creating such an index
+locally is refused (`400`, naming `cluster.decimal128`) until every member runs
+0.51 and the operator has said so**: an older member would refuse the
+definition and never build it, even after it upgrades
+([Operations](operations.md#clusterdecimal128-and-the-marker),
+[ADR-238](decisions.md)). A definition that arrives from a peer, a restore or a
+repair is always applied.
 
 **There is no separate `sparse` flag.** A sparse index is exactly
 `{field: {$exists: true}}`, which is where MongoDB has been steering people for
@@ -590,40 +604,59 @@ presence-filtered index would silently drop every document missing the field.
 
 ### A Decimal128 at a filtered path
 
-**The one case where a partial index holds a document its filter does not
-select.** The canonical order ranks a `Decimal128` equal to *every* number
-([key-encoding.md](key-encoding.md)) — there is nothing exact to compare it
-with — so a stored `Decimal128` satisfies `{k: 7}` and `{k: {$gte: 6}}` and
-fails `{k: {$gt: 5}}`. Comparison with one is not an order, and a filter's
-answer about such a document is *an* answer rather than *the* answer.
+**Decided by the filter, by its exact value, like any number** (since 0.51.0,
+[ADR-238](decisions.md)). The canonical order places a `Decimal128` by its
+value ([Key encoding](key-encoding.md#numbers-the-hard-part)), so under
+`{k: {$gt: 5}}` a stored `Decimal128("1")` is not selected and
+`Decimal128("5.000000000000000000000000000000001")` is, and the index holds
+exactly what the filter selects. Everything the rest of this page says about a
+partial index holds for a decimal-bearing document as it does for any other:
 
-So the index holds it anyway, in a run of its own beside the unkeyed run, and
-every scan re-checks it against the full filter. Without that, an index with `{k: {$gt: 5}}` would be
-used for the query `{k: 7}` — the planner can prove that containment — and
-would miss a document holding `Decimal128("1")` that `find` returns, silently
-([ADR-185](decisions.md)).
+- **A partial unique index enforces on it.** Two documents
+  `{email: "x", balance: Decimal128("10")}` under a unique index on `email`
+  filtered by `{balance: {$gt: 0}}` are both selected and both keyed under
+  `"x"`, so the second local write is refused as a duplicate; one with
+  `balance: Decimal128("-5")` is outside the constraint.
+- **A TTL partial index expires by it**, in both directions. Under
+  `{tier: {$lt: 3}}`, a document holding `tier: Decimal128("1")` is selected and
+  expires once its date is due; under `{tier: {$gte: 3}}` it is not selected and
+  is kept.
+- **The planner's containment proof holds for it**, a decimal in the query, in
+  the filter or in the document, so a chosen partial index never misses a
+  document `find` returns.
 
-This is the documented behaviour, not a fault:
+**Amended in 0.51.0: what 0.50.x and earlier did instead** ([ADR-185](decisions.md),
+superseded by ADR-238). The order then ranked a `Decimal128` equal to *every*
+number, so a filter's answer about one was *an* answer rather than *the* answer,
+and a partial index held every document with a decimal at a filtered path that
+its filter did not select, in an undecidable run of its own that every scan
+re-checked. The listing, `describe` and `createIndex` reported the run's size as
+`undecidable`, `explain` reported `undecidableCandidates`, and
+`kimmy_index_undecidable_total` counted the filings. A partial unique index
+enforced nothing on such a document, and **a TTL index never expired it**. All
+of that is gone, and it changes what a store holds:
 
-- **It costs index size**, and the listing, `describe` and `createIndex` report
-  it as its own `undecidable` figure — **not** folded into `unkeyed`, which keeps
-  meaning "documents the index could not key". Both are always present, so
-  `undecidable: 0` is what an index with none reads. The rate since start is
-  `kimmy_index_undecidable_total`, again separate from
-  `kimmy_index_unkeyed_total`: that one is worth an alert, this one is not.
-- **Nothing is logged at warning.** A filing here is expected, and raising it
-  to the level of a real fault is how an operator learns to ignore both.
-- **A unique index does not enforce anything on it**, because the filter does
-  not select it and a partial unique constraint applies to the subset the
-  filter selects. Writing such a document is an ordinary write, not a
-  collision and not a refusal.
-- **A TTL index never expires it**, for the same reason: the filter does not
-  select it, and expiry reads only keyed entries.
-
-The values a *caller* supplies are unaffected: a `Decimal128` is refused as a
-filter operand, an index bound, a sort key and an expression literal, exactly
-because the order cannot rank it. Only a stored document value reaches this
-case.
+- **The upgrade decides every such document.** Storage schema 5's migration
+  rebuilds every index under the current rule, so the run is emptied and each
+  document is filed by what the filter selects
+  ([Operations](operations.md#storage-schema-5-the-first-start-of-0510)).
+- **A partial unique index starts enforcing.** Two holders 0.50 accepted
+  become a reported violation (`/violations`, `kimmy_unique_violations_total`
+  and a log line), and a write that would keep or add a holder of the key is
+  refused; the migration's log names how many each index has.
+- **A TTL partial index can now expire documents holding a decimal at its
+  filter path that 0.50 never expired, and the reverse**: one that a `$gte`
+  filter selected only by ranking the decimal equal to the bound is kept. The
+  migration logs, for each TTL index, how many documents are now selected and
+  how many no longer are, before the first expiry pass runs. The deletes are
+  ordinary replicated deletes and cannot be undone except from a backup taken
+  before the upgrade.
+- **The fields and the series are removed, not left at 0**: `undecidable` on
+  the index listing, `describe` and `createIndex` (and from the openapi
+  `Index` schema's `required`), `undecidableCandidates` in `explain`, and
+  `kimmy_index_undecidable_total` with its OTLP instrument
+  `kimmy.index.undecidable`. A typed client that declared them must drop
+  them.
 
 ### Other behaviours
 

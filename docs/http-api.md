@@ -1018,10 +1018,13 @@ when you need a type JSON lacks.
 
 **A Decimal128 is stored and returned as sent, and compared by its exact
 value.** `$numberDecimal` is read on input and written on output, and the
-digits come back exactly as sent. It cannot be an index key or an `_id` — a
-document holding one at an indexed path is stored and filed under the index's
-unkeyed run ([Indexes](indexes.md#documents-an-index-cannot-key)); one as `_id`
-is refused. As an operand it is a number like any other: `{"v":
+digits come back exactly as sent. It is an index key like any number, keyed by
+its exact value, so an index answers a range over it and a unique index
+enforces on it ([Key encoding](key-encoding.md#numbers-the-hard-part)); a
+partial index's filter decides it by value, and a partial unique or TTL index
+enforces and expires by that decision
+([Indexes](indexes.md#a-decimal128-at-a-filtered-path)). It can be an `_id`
+under the gate described [above](#get-replace-delete-by-id). As an operand it is a number like any other: `{"v":
 {"$numberDecimal": "1.5"}}`, and a Decimal128 under `$eq`, `$ne`, `$gt`,
 `$gte`, `$lt`, `$lte`, `$in`, `$nin`, `$all`, inside a document or array
 literal, or as a literal in an expression, `$expr` included, matches the
@@ -1031,7 +1034,12 @@ among the numbers, and the update operators that compare their operand —
 `$min`, `$max`, `$pull`, `$pullAll` — compare it by value
 ([Query language](query-language.md#3-comparisons-do-not-cross-type-groups)).
 Until 0.51.0 each of these was refused, `400`, because the canonical order
-ranked a Decimal128 equal to every other number.
+ranked a Decimal128 equal to every other number; for the same reason it could
+not be an index key or an `_id` (a document holding one at an indexed path was
+filed under the index's unkeyed run, and one at a partial filter's path in an
+undecidable run that the listing's `undecidable` and `explain`'s
+`undecidableCandidates` counted: both fields are removed in 0.51.0, a breaking
+change for a typed client that declared them).
 Through 0.24.0 the edge did not read `$numberDecimal` at all: the wrapper
 arrived as a nested document, which is why a Decimal128 written to a member
 was keyed there and filed unkeyed on its peers ([ADR-139](decisions.md)).

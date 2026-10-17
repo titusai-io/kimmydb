@@ -63,9 +63,10 @@ pub struct IndexMeta {
     /// at creation.
     #[serde(default)]
     pub expire_after_secs: Option<i64>,
-    /// Index only the documents matching this filter — and those it cannot
-    /// decide, which the index holds for the scan to re-check
-    /// ([ADR-185](../../../docs/decisions.md)).
+    /// Index only the documents matching this filter, as `find` reads it: a
+    /// `Decimal128` at a filtered path is decided by its exact value like any
+    /// number (ADR-238; [ADR-185](../../../docs/decisions.md) held such a
+    /// document whatever the filter said, until the comparator could place it).
     ///
     /// `None` indexes everything. `Some(_)` makes it a **partial** index, and
     /// the planner may then use it only for a query provably contained by the
