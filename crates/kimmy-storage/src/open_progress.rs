@@ -167,8 +167,8 @@ pub(crate) fn set_open_done(done: u64) {
     DONE.store(done, Relaxed);
 }
 
-/// A new total for the current phase, when its first was an estimate the work
-/// has outrun.
+/// A new total for the current phase: when its first was an estimate the work
+/// has outrun, and when a step ends, its final total.
 pub(crate) fn set_open_total(total: u64) {
     #[cfg(test)]
     tests::THIS_THREAD_PHASE.with(|seen| {
