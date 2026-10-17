@@ -12834,6 +12834,45 @@ async fn a_decimal128_is_stored_intact_and_returned_as_it_was_sent() {
         .await;
     assert_eq!(bad.status, 400, "{:?}", bad.body);
     assert!(bad.body["message"].as_str().unwrap().contains("$numberDecimal"), "{:?}", bad.body);
+
+    // So are the texts the `bson` crate's parser read as numbers: a blank
+    // price was stored as 0, `++1` as 1, `e100` as 0E+100. Each is a `400`
+    // naming the text, in a write and in a filter, and nothing is stored.
+    for (text, id) in [("", 3), (".", 4), ("++1", 5), ("-+1", 6), ("e100", 7), ("0+5", 8)] {
+        let res = server
+            .post(docs, Some(&token), json!({ "_id": id, "amount": { "$numberDecimal": text } }))
+            .await;
+        assert_eq!(res.status, 400, "{text:?}: {:?}", res.body);
+        assert_eq!(res.body["error"], "bad_request", "{text:?}");
+        let message = res.body["message"].as_str().unwrap();
+        assert!(
+            message.starts_with(&format!(
+                "invalid $numberDecimal: {}: not a decimal number",
+                json!(text)
+            )),
+            "{text:?}: {message}"
+        );
+        let missing = server.get(&format!("{docs}/{id}"), Some(&token)).await;
+        assert_eq!(missing.status, 404, "{text:?} stored nothing");
+        let filter = server
+            .post(
+                "/v1/db/shop/coll/ledger/find",
+                Some(&token),
+                json!({ "filter": { "amount": { "$numberDecimal": text } } }),
+            )
+            .await;
+        assert_eq!(filter.status, 400, "{text:?} as a filter operand: {:?}", filter.body);
+    }
+    // A value that would need rounding is refused, never rounded.
+    let res = server
+        .post(
+            docs,
+            Some(&token),
+            json!({ "_id": 9, "amount": { "$numberDecimal": "0.10000000000000000000000000000000001" } }),
+        )
+        .await;
+    assert_eq!(res.status, 400, "{:?}", res.body);
+    assert!(res.body["message"].as_str().unwrap().contains("more than 34 significant digits"));
 }
 
 /// The `_id`s of what a find over `filter` returns, in `_id` order.

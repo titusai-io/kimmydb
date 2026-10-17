@@ -1044,6 +1044,23 @@ Through 0.24.0 the edge did not read `$numberDecimal` at all: the wrapper
 arrived as a nested document, which is why a Decimal128 written to a member
 was keyed there and filed unkeyed on its peers ([ADR-139](decisions.md)).
 
+**The `$numberDecimal` text is a number, read exactly, or a `400`.** The
+syntax is the General Decimal Arithmetic specification's, and nothing else: an
+optional sign, digits with at most one `.` and at least one digit (`1.50`,
+`.5` and `1.` are numbers; `.` is not), an optional exponent of `e` or `E`, an
+optional sign and digits (`1E+3`, `25e-1`); or, in either case, `Infinity`,
+`Inf`, `NaN` or `sNaN`, a NaN with an optional payload of up to 33 digits. No
+white space, ASCII digits only. The value is never rounded: a nonzero digit
+past the 34th, a value below `1E-6176` or with a digit below it, and one above
+`9.999999999999999999999999999999999E+6144` are refused, each with its reason.
+An exact value keeps its written exponent where it fits, and otherwise moves
+only as far as the format requires (`1.0000000000000000000000000000000000000`
+is stored with 34 digits, `1E+6144` as `1000000000000000000000000000000000E+6111`,
+`0E+9999` as `0E+6111`). A refusal names the text: `invalid $numberDecimal:
+"": not a decimal number: …`. **Until 0.51.0** the edge used the `bson`
+crate's parser, which took `""`, `"."` and `"-"` as zero, `"++1"` as `1`,
+`"0+5"` as `5` and `"e100"` as `0E+100`; each is now refused.
+
 **A binary `_id` is echoed with its subtype, but keyed without it.** The ids
 a write or a report answers with (`insertedId`, `insertedIds`, `upsertedId`,
 and the `ids` and `merged` of `GET .../violations`) are the `_id` as stored,
