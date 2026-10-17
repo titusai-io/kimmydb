@@ -1869,7 +1869,9 @@ fn the_preflight_asks_an_empty_store_for_its_growth_step_and_the_margin() {
     }
 }
 
-/// The heavier preflight cases; CI runs them in release:
+/// The heavier preflight cases, in release. CI runs this one (about 1 s); the
+/// churned store (about 70 s) and the one shaped like kimmy1-3 (about 45 s) are
+/// run by hand:
 ///
 /// ```text
 /// cargo test --release -p kimmy-storage --lib -- --include-ignored \
@@ -1898,7 +1900,7 @@ fn the_preflight_of_a_store_whose_collection_was_dropped_and_purged() {
 }
 
 #[test]
-#[ignore = "heavy: 20,000 replacements; CI runs it in release"]
+#[ignore = "heavy: 20,000 replacements, about 70 s in release; run by hand"]
 fn the_preflight_of_a_store_of_two_documents_churned_20_000_times() {
     // The review's 1,506,989 MiB: two documents, and an oplog of 20,000
     // replacements of a kilobyte.
@@ -1920,7 +1922,7 @@ fn the_preflight_of_a_store_of_two_documents_churned_20_000_times() {
 }
 
 #[test]
-#[ignore = "heavy: an oplog of 10,000 entries of 16 KiB; CI runs it in release"]
+#[ignore = "heavy: an oplog of 10,000 entries of 16 KiB, about 45 s in release; run by hand"]
 fn the_preflight_of_a_store_shaped_like_kimmy1_3() {
     // kimmy1 to kimmy3 in the lab: about 1.5 GB of file, mostly oplog, and four
     // documents. Scaled down, with the ratio of file bytes to document bytes
@@ -3343,7 +3345,8 @@ fn a_stop_inside_a_sparse_refill_ends_it_within_one_chunk() {
     assert_eq!(entries_of(engine.db(), &standing), want_entries);
 }
 
-/// The sparse refill at the shipped chunk sizes, in release:
+/// The sparse refill at the shipped chunk sizes, in release (about 7 s; CI runs
+/// it):
 ///
 /// ```text
 /// cargo test --release -p kimmy-storage --lib -- --include-ignored --exact \
