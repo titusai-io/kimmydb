@@ -1476,6 +1476,7 @@ async fn start_and_serve(
         // a full-corpus provider bill on every member at once.
         let worker_me = engine.node_id();
         let worker_members = cluster.members.clone();
+        let worker_roll = cluster.members.clone();
         let worker_gate = state.catch_up().cloned();
         let worker_clustered = config.cluster.enabled;
         let worker_counters = Arc::new(kimmy_vector::WorkerCounters::default());
@@ -1497,6 +1498,11 @@ async fn start_and_serve(
                     embedding_owner_check(worker_me, worker_members, worker_gate, worker_clustered)
                 {
                     worker.set_owner_check(check);
+                }
+                // When every live member writes 0.51.0's chunk ids, from what
+                // each says about itself (ADR-239).
+                if let Some(members) = worker_roll {
+                    worker.set_chunk_ids_check(Box::new(move || members.chunk_ids_everywhere()));
                 }
                 worker.set_counters(worker_counters);
                 // Every error `run` returns is a storage error, which is

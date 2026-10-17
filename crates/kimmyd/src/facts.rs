@@ -35,6 +35,7 @@ pub fn source(
             catching_up,
             catching_up_reason,
             started_ms,
+            vector_chunk_ids: Some(kimmy_core::CHUNK_ID_FORMAT),
             ..Facts::default()
         };
         let mut block = match engine.upgrade() {

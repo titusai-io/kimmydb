@@ -653,7 +653,9 @@ impl IndexCache {
     /// A snapshot a previous process wrote has no generation to compare — the
     /// counter is in-memory and resets with the process — so for that one the
     /// check is the vector *count* the snapshot covered against the count
-    /// stored now. Equal counts adopt the snapshot as fresh. The corner this
+    /// stored now, and the shadow's moves of chunk ids since it was built
+    /// ([`Engine::vector_renames`], ADR-239), which keep the count and change
+    /// the keys. Both equal adopt the snapshot as fresh. The corner this
     /// accepts, on purpose: a delete-and-add while the node was down leaves
     /// the count equal, and that snapshot serves as fresh until the next
     /// vector write bumps the generation. Same class of bound as the
@@ -705,12 +707,19 @@ impl IndexCache {
                 fresh
             }
             None => {
+                // The count, and the moves of chunk ids since the build: an
+                // adoption, or a re-embed that took a document off its 0.50
+                // ids, keeps the count and changes the keys (ADR-239).
                 let current = count_vectors(engine, shadow).ok()?;
-                let fresh = current == index.len();
+                let renames = engine.vector_renames(shadow.id).ok()?;
+                let fresh = current == index.len() && renames == index.renames();
                 if !fresh {
                     debug!(
                         snapshot = index.len(),
-                        current, "snapshot is behind the store; serving it once and rebuilding"
+                        current,
+                        snapshot_renames = index.renames(),
+                        renames,
+                        "snapshot is behind the store; serving it once and rebuilding"
                     );
                 }
                 fresh
@@ -2799,5 +2808,55 @@ mod tests {
             )
             .unwrap();
         assert_eq!(graph(&cache, &engine, &a).len(), 60, "loaded from the snapshot, not rebuilt");
+    }
+
+    /// A move of chunk ids keeps the count, so a snapshot a previous process
+    /// saved before one is behind though the count agrees (ADR-239): it is
+    /// served once and rebuilt, not adopted as fresh with keys that no longer
+    /// exist.
+    #[test]
+    fn a_snapshot_saved_before_a_move_of_chunk_ids_is_rebuilt() {
+        let (engine, shadow, dir) = setup(60);
+        // A String's chunk where a 0.50 build wrote it, in the graph.
+        let source = DocId::String("12345".into());
+        let record = VectorRecord {
+            source: source.clone(),
+            chunk: 0,
+            source_hlc: Hlc::new(1, 0),
+            vector: vec![99.0, 1.0, 0.0, 0.0],
+            text: "t".into(),
+            config: None,
+        };
+        let doc = bson::serialize_to_document(&record).unwrap();
+        engine.replace(&shadow, &DocId::String("12345#0".into()), doc, true).unwrap();
+        let cache = snapshot_cache(&dir);
+        cache.access(&engine, &shadow, Metric::Cosine, 4);
+        drop(cache);
+        drop(engine);
+
+        let (engine, shadow) = reopen(&dir);
+        assert_eq!(engine.adopt_legacy_chunks(&shadow, &source).unwrap(), 1);
+        let cache = snapshot_cache(&dir);
+        let Access::Approximate(first) = cache.access(&engine, &shadow, Metric::Cosine, 4) else {
+            panic!("the snapshot serves once");
+        };
+        assert_eq!(first.len(), 61, "the count agrees");
+        let Access::Approximate(second) = cache.access(&engine, &shadow, Metric::Cosine, 4) else {
+            panic!("then a rebuild serves");
+        };
+        assert!(
+            !Arc::ptr_eq(&first, &second),
+            "a snapshot from before the move was adopted as fresh"
+        );
+        let hits = second
+            .search(
+                &engine,
+                &shadow,
+                &[99.0, 1.0, 0.0, 0.0],
+                &crate::search::SearchOptions { k: 1, ..Default::default() },
+                None,
+            )
+            .unwrap();
+        assert_eq!(hits[0].id, source, "found under its new id");
     }
 }

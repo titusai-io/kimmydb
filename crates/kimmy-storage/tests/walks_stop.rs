@@ -41,6 +41,9 @@ const STOP_AWARE_WALKS: &[&str] = &[
     // Request scans of documents and of the oplog.
     "docs::Engine::for_each_doc_or_undecodable",
     "docs::Engine::for_each_record_after",
+    // One document's vector chunks, its run and its 0.50 ids, in one read
+    // (ADR-239).
+    "docs::Engine::for_each_doc_after_each",
     "docs::Engine::live_unique_violations_from_oplog",
     "docs::Engine::live_unique_violations_from_table",
     // Retention's scans, which serve no client.

@@ -209,6 +209,10 @@ const MAX_DEFERRED: usize = 4096;
 /// The injected ownership test. See [`EmbeddingWorker::set_owner_check`].
 pub type OwnerCheck = Box<dyn Fn(&str) -> bool + Send>;
 
+/// The injected roll test: whether every live member writes this build's
+/// vector chunk ids. See [`EmbeddingWorker::set_chunk_ids_check`].
+pub type ChunkIdsCheck = Box<dyn Fn() -> Option<bool> + Send>;
+
 /// How the worker gathers documents into one provider call (ADR-095).
 ///
 /// [`EmbeddingProvider::embed`] has always taken a batch; until this the
@@ -674,6 +678,14 @@ pub struct EmbeddingWorker {
     /// shorten them and drive a running worker through a gain.
     ownership_tick: Duration,
     ownership_settle: Duration,
+    /// Whether every live member writes this build's chunk ids
+    /// ([`Self::set_chunk_ids_check`], ADR-239), and what it last said:
+    /// `Some(false)` once a live member was seen writing 0.50's.
+    chunk_ids_everywhere: Option<ChunkIdsCheck>,
+    chunk_ids_seen: Option<bool>,
+    /// The collections whose scan marks this run's first-start recheck wrote,
+    /// so their scan says why it ran.
+    chunk_id_rechecks: std::collections::HashSet<u64>,
     /// Counters behind `/metrics`. Plain atomics for the same reason
     /// `kimmy_api::metrics` is plain atomics: a fixed small set of series
     /// does not want a registry dependency. Shared by handle so the
@@ -864,6 +876,9 @@ impl EmbeddingWorker {
             ownership_gaining: HashMap::new(),
             ownership_tick: OWNERSHIP_TICK,
             ownership_settle: OWNERSHIP_SETTLE,
+            chunk_ids_everywhere: None,
+            chunk_ids_seen: None,
+            chunk_id_rechecks: Default::default(),
             counters: Arc::new(WorkerCounters::default()),
             shutdown: None,
         }
@@ -896,6 +911,17 @@ impl EmbeddingWorker {
     /// hashed, not parsed.
     pub fn set_owner_check(&mut self, f: OwnerCheck) {
         self.am_owner = Some(f);
+    }
+
+    /// Install the roll check: whether every live member writes this build's
+    /// vector chunk ids, from what each says about itself (ADR-239). When it
+    /// turns from `Some(false)` to `Some(true)` the roll to 0.51.0 has
+    /// finished, and every embedded collection this member owns is rescanned
+    /// once its ownership has held, so what a 0.50 member wrote during the
+    /// roll, after the document was last judged here, is judged again. Only
+    /// with an ownership check: a lone member has no roll.
+    pub fn set_chunk_ids_check(&mut self, f: ChunkIdsCheck) {
+        self.chunk_ids_everywhere = Some(f);
     }
 
     /// The counters to hand the `/metrics` renderer. Call once, before
@@ -1339,6 +1365,7 @@ impl EmbeddingWorker {
         }
         let started = self.ownership_checked.is_none();
         self.ownership_checked = Some(now);
+        let everywhere = self.chunk_ids_everywhere.as_ref().and_then(|check| check());
         let embedded =
             kimmy_storage::blocking(|| -> Result<Vec<(CollectionMeta, String, bool)>> {
                 let mut embedded = Vec::new();
@@ -1363,6 +1390,33 @@ impl EmbeddingWorker {
         let owned = embedded.iter().filter(|(_, _, owner)| *owner).count();
         class_step::with_cell(|cell| cell.set_owned(owned as u64));
         class_step::beat();
+        // The roll to 0.51.0's chunk ids has finished: every live member writes
+        // them now, and one did not when last asked. What a 0.50 member wrote
+        // during the roll may have landed after its document was last judged
+        // here, and nothing judges a shadow write, so every collection this
+        // member owns and had settled reads as a gain, rescanned once it has
+        // held, one per evaluation (ADR-239). A first answer of `Some(true)`
+        // is no roll: the start's first-sight rescan covers it.
+        let rolled = self.chunk_ids_seen == Some(false) && everywhere == Some(true);
+        if everywhere.is_some() {
+            self.chunk_ids_seen = everywhere;
+        }
+        if rolled {
+            let mut rechecked = 0;
+            for (_, key, owner) in &embedded {
+                if *owner && self.ownership_settled.get(key) == Some(&true) {
+                    self.ownership_settled.insert(key.clone(), false);
+                    self.ownership_gaining.insert(key.clone(), now);
+                    rechecked += 1;
+                }
+            }
+            info!(
+                collections = rechecked,
+                "every live member now writes 0.51.0's vector chunk ids; rechecking the embedded \
+                 collections this member owns once their ownership has held, for what a 0.50 \
+                 member wrote during the roll"
+            );
+        }
         let mut seen = std::collections::HashSet::new();
         let mut due: Option<(CollectionMeta, String)> = None;
         for (collection, key, owner) in embedded {
@@ -2161,8 +2215,14 @@ impl EmbeddingWorker {
         };
         let Judgement { fingerprint, unstamped, handed_over } = judgement;
         // Moved before the judgement, as on the entry path, and only while the
-        // collection is this member's (ADR-239).
-        if !handed_over {
+        // collection is this member's (ADR-239): asked per document, since a
+        // scan asks again only before a batch, and a scan of documents that are
+        // only moved fills no batch.
+        if !handed_over
+            && VectorRecord::legacy_prefix(source).is_some()
+            && matches!(source, kimmy_core::DocId::String(_))
+            && self.is_owner_of(&collection.db, &collection.name)
+        {
             self.engine.adopt_legacy_chunks(shadow, source)?;
         }
         let stale = |unstamped| {
@@ -2657,15 +2717,22 @@ impl EmbeddingWorker {
     }
 
     /// Queue the recheck of every server-embedded collection that 0.51.0's
-    /// chunk ids owe, at the first start of this build on the store
-    /// ([`Engine::queue_vector_chunk_recheck`], ADR-239), and say so once.
-    /// The marks are scanned like any others: by the owner only (a mark on a
-    /// collection another member owns is cleared, and on a cluster every
-    /// start's first-sight rescan does the same work), and on a single node,
-    /// which has no first-sight rescan, they are the only trigger.
+    /// chunk ids owe, at the first start of this build on a store with no
+    /// ownership check ([`Engine::queue_vector_chunk_recheck`], ADR-239), and
+    /// say so once. A single node has no first-sight rescan, so the marks are
+    /// its only trigger; they are scanned like any others.
     async fn queue_chunk_id_recheck(&mut self) -> Result<()> {
+        // Not with an ownership check: at its start a clustered member has not
+        // heard its peers, so it answers as owner of what it may not own, and a
+        // mark is scanned at once, before the settle a first sight waits for.
+        // The first-sight rescan of what it owns, and the rescan when the roll
+        // has finished ([`Self::set_chunk_ids_check`]), do the work there.
+        if self.am_owner.is_some() {
+            return Ok(());
+        }
         let engine = Arc::clone(&self.engine);
         let queued = kimmy_storage::blocking(move || engine.queue_vector_chunk_recheck())?;
+        self.chunk_id_rechecks.extend(queued.iter().map(|c| c.id.0));
         if !queued.is_empty() {
             let collections: Vec<String> =
                 queued.iter().map(|c| format!("{}/{}", c.db, c.name)).collect();
@@ -2819,8 +2886,12 @@ impl EmbeddingWorker {
             }
         }
         if let Some(how) = rescan {
-            self.scan_collection(&collection, &shadow, &config, "a provider that was failing", how)
-                .await?;
+            let reason = if self.chunk_id_rechecks.remove(&key) {
+                "the 0.51.0 chunk-id recheck"
+            } else {
+                "a provider that was failing"
+            };
+            self.scan_collection(&collection, &shadow, &config, reason, how).await?;
         }
         Ok(())
     }
@@ -8646,32 +8717,6 @@ pub(crate) mod tests {
         assert!(engine.queue_vector_chunk_recheck().unwrap().is_empty(), "recorded as queued");
     }
 
-    /// Test 15, on a member that does not own the collection: the mark is
-    /// cleared with no provider call, and the collection is left unsettled, so
-    /// gaining it later rescans it.
-    #[tokio::test]
-    async fn a_recheck_mark_on_a_collection_owned_elsewhere_is_cleared_harmlessly() {
-        let dir = tempfile::tempdir().unwrap();
-        let engine = Arc::new(Engine::open(&dir.path().join("kimmy.redb")).unwrap());
-        engine.create_collection("app", "docs").unwrap();
-        engine.configure_vectors("app", "docs", config(&["body"])).unwrap();
-        let coll = engine.get_collection("app", "docs").unwrap();
-        let shadow = engine.vector_collection("app", "docs").unwrap().unwrap();
-        let id = engine.insert(&coll, doc! { "_id": uuid_id(0), "body": "alpha report" }).unwrap();
-        as_050_left_it(&engine, &coll, &shadow, &[(id, "alpha report")]);
-
-        let mut worker = EmbeddingWorker::new(Arc::clone(&engine));
-        let fake = FakeProvider::new(4);
-        worker.set_provider(coll.id.0, Arc::clone(&fake) as Arc<dyn EmbeddingProvider>);
-        switchable_owner(&mut worker, false);
-        worker.queue_chunk_id_recheck().await.unwrap();
-        worker.load_marks().await.unwrap();
-        worker.retry_one_collection().await.unwrap();
-        assert_eq!(fake.calls(), 0);
-        assert!(engine.vector_rescans().unwrap().is_empty());
-        assert_eq!(worker.ownership_settled.get("app/docs"), Some(&false));
-    }
-
     /// A String whose chunk id changed is moved by the owner before it judges
     /// the document's entry, with no provider call; a member that does not
     /// own the collection moves nothing.
@@ -8885,5 +8930,147 @@ pub(crate) mod tests {
         assert_eq!(rescan(&mut roll).await, 1, "one re-embed for the move");
         assert_eq!(roll.fake.calls(), calls + 1);
         assert_eq!(rescan(&mut roll).await, 0, "and no more");
+    }
+    /// On a cluster the start queues no recheck marks: a member that has not
+    /// yet heard its peers answers as owner of what it may not own, and a mark
+    /// is scanned at once. Its first-sight rescan waits for its ownership to
+    /// hold, and here the collection turns out to be another member's, so
+    /// nothing is scanned and nothing is sent.
+    #[tokio::test]
+    async fn a_clustered_start_rechecks_only_what_it_owns_once_ownership_has_held() {
+        let dir = tempfile::tempdir().unwrap();
+        let engine = Arc::new(Engine::open(&dir.path().join("kimmy.redb")).unwrap());
+        engine.create_collection("app", "docs").unwrap();
+        engine.configure_vectors("app", "docs", config(&["body"])).unwrap();
+        let coll = engine.get_collection("app", "docs").unwrap();
+        let shadow = engine.vector_collection("app", "docs").unwrap().unwrap();
+        let id = engine.insert(&coll, doc! { "_id": uuid_id(0), "body": "alpha report" }).unwrap();
+        as_050_left_it(&engine, &coll, &shadow, &[(id, "alpha report")]);
+
+        let mut worker = EmbeddingWorker::new(Arc::clone(&engine));
+        let fake = FakeProvider::new(4);
+        worker.set_provider(coll.id.0, Arc::clone(&fake) as Arc<dyn EmbeddingProvider>);
+        let owner = switchable_owner(&mut worker, true);
+        worker.queue_chunk_id_recheck().await.unwrap();
+        assert!(engine.vector_rescans().unwrap().is_empty(), "no marks on a cluster");
+        worker.load_marks().await.unwrap();
+        worker.retry_one_collection().await.unwrap();
+        assert_eq!(fake.calls(), 0, "nothing scanned at the start");
+
+        // The first evaluation sees a gain; by the settle the view has settled
+        // on another owner.
+        let start = Instant::now();
+        worker.rescan_gained(start).await.unwrap();
+        owner.store(false, Ordering::SeqCst);
+        worker.rescan_gained(start + worker.ownership_settle).await.unwrap();
+        assert_eq!(fake.calls(), 0);
+        assert_eq!(shadow_ids(&engine, &shadow), ["bin(16 bytes)#0"], "nothing moved or embedded");
+    }
+
+    /// A scan moves a reserved String's chunks only while it owns the
+    /// collection, asked per document: a scan of documents that are only
+    /// moved fills no batch, so its own check before a batch never runs.
+    #[tokio::test]
+    async fn a_scan_moves_reserved_strings_only_while_it_owns_the_collection() {
+        let (engine, coll, mut worker, _dir) = setup().await;
+        let fake = FakeProvider::new(4);
+        worker.set_provider(coll.id.0, Arc::clone(&fake) as Arc<dyn EmbeddingProvider>);
+        let shadow = engine.vector_collection("app", "docs").unwrap().unwrap();
+        let mut docs = Vec::new();
+        for text in ["~a", "~b", "~c"] {
+            docs.push((
+                engine.insert(&coll, doc! { "_id": text, "body": "a note" }).unwrap(),
+                "a note",
+            ));
+        }
+        as_050_left_it(&engine, &coll, &shadow, &docs);
+        // Owner for the first question only: the collection moves away after it.
+        let asked = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counted = Arc::clone(&asked);
+        worker.set_owner_check(Box::new(move |_| counted.fetch_add(1, Ordering::SeqCst) == 0));
+
+        let config = coll.vector.clone().unwrap();
+        worker.scan_collection(&coll, &shadow, &config, "a test", Unscanned::Check).await.unwrap();
+        assert_eq!(shadow_ids(&engine, &shadow), ["~b#0", "~c#0", "~s:~a#0"], "the first only");
+        assert_eq!(fake.calls(), 0);
+    }
+
+    /// A clustered B that owns the collection, through its first-sight rescan,
+    /// with a roll check that answers what the returned cell holds (a live
+    /// member writing 0.50's ids, to begin with).
+    async fn as_a_clustered_owner(roll: &mut Roll) -> Arc<std::sync::Mutex<Option<bool>>> {
+        switchable_owner(&mut roll.worker, true);
+        let everywhere = Arc::new(std::sync::Mutex::new(Some(false)));
+        let answer = Arc::clone(&everywhere);
+        roll.worker.set_chunk_ids_check(Box::new(move || *answer.lock().unwrap()));
+        roll.worker.ownership_settle = Duration::ZERO;
+        let now = Instant::now();
+        roll.worker.rescan_gained(now).await.unwrap();
+        roll.worker.rescan_gained(now).await.unwrap();
+        assert_eq!(roll.worker.ownership_settled.get("app/docs"), Some(&true), "first sight done");
+        everywhere
+    }
+
+    /// Test 19, the roll's residue: a 0.50 member's chunk that lands after B
+    /// last judged the document is judged again once every live member writes
+    /// 0.51.0's ids, and only then.
+    #[tokio::test]
+    async fn a_mixed_roll_late_050_write_is_judged_again_when_the_roll_finishes() {
+        let mut roll = a_mixed_roll().await;
+        let everywhere = as_a_clustered_owner(&mut roll).await;
+        exchange(&roll.a, &roll.b);
+        let (late, _) = roll.docs[0].clone();
+        as_050_left_it(&roll.a, &roll.coll, &roll.shadow, &[(late.clone(), "alpha, late")]);
+        exchange(&roll.a, &roll.b);
+        assert!(shadow_ids(&roll.b, &roll.shadow).contains(&"bin(16 bytes)#0".to_string()));
+
+        let calls = roll.fake.calls();
+        roll.worker.rescan_gained(Instant::now()).await.unwrap();
+        assert_eq!(roll.fake.calls(), calls, "not before the roll has finished");
+        *everywhere.lock().unwrap() = Some(true);
+        roll.worker.rescan_gained(Instant::now()).await.unwrap();
+        assert_eq!(roll.fake.calls(), calls + 1, "the late document, once");
+        let held = shadow_ids(&roll.b, &roll.shadow);
+        assert!(!held.iter().any(|id| id.starts_with("bin(")), "{held:?}");
+        assert_eq!(texts(&roll.b, &roll.shadow, &late), ["alpha report"]);
+    }
+
+    /// Test 19, the twin delete: a 0.50 member's delete of the String `"7"`
+    /// removes every `7#n`, which are the Int64 `7`'s ids too, on every
+    /// member. The Int64 is re-embedded when the roll finishes.
+    #[tokio::test]
+    async fn a_mixed_roll_twin_delete_is_re_embedded_when_the_roll_finishes() {
+        let mut roll = a_mixed_roll().await;
+        let int = roll.a.insert(&roll.coll, doc! { "_id": 7, "body": "int seven" }).unwrap();
+        let string =
+            roll.a.insert(&roll.coll, doc! { "_id": "7", "body": "string seven" }).unwrap();
+        exchange(&roll.a, &roll.b);
+        let everywhere = as_a_clustered_owner(&mut roll).await;
+        exchange(&roll.a, &roll.b);
+        assert_eq!(texts(&roll.a, &roll.shadow, &int), ["int seven"]);
+
+        roll.a.delete(&roll.coll, &string).unwrap();
+        delete_050(&roll.a, &roll.shadow, &string);
+        exchange(&roll.a, &roll.b);
+        let entry = roll
+            .b
+            .read_oplog_from(Hlc::ZERO, 100_000, kimmy_storage::WalkScope::Background)
+            .unwrap()
+            .into_iter()
+            .rfind(|e| {
+                e.kind == OpKind::Delete
+                    && e.collection == roll.coll.id
+                    && e.doc_id.as_ref() == Some(&string)
+            })
+            .expect("the delete reached B");
+        assert_eq!(roll.worker.process(&entry).await.unwrap(), Outcome::Removed);
+        assert!(texts(&roll.b, &roll.shadow, &int).is_empty(), "the twin delete took the Int64's");
+
+        *everywhere.lock().unwrap() = Some(true);
+        let calls = roll.fake.calls();
+        roll.worker.rescan_gained(Instant::now()).await.unwrap();
+        assert_eq!(roll.fake.calls(), calls + 1);
+        assert_eq!(texts(&roll.b, &roll.shadow, &int), ["int seven"], "re-embedded");
+        assert!(texts(&roll.b, &roll.shadow, &string).is_empty());
     }
 }

@@ -147,6 +147,14 @@ struct SnapshotMeta {
     #[serde(default)]
     created: Hlc,
     keys: Vec<String>,
+    /// [`Engine::vector_renames`] of the shadow when the graph was built: a
+    /// move of chunks to other ids since (an adoption, or a re-embed that took
+    /// a document off its 0.50 ids) keeps the count and changes the keys, so
+    /// a previous process's graph is judged by this as well as by the count
+    /// (ADR-239). Defaulted, for a snapshot without it, which format 3 refuses
+    /// anyway when it is older.
+    #[serde(default)]
+    renames: u64,
 }
 
 /// Bumped when the snapshot layout changes; a mismatch is a rebuild, not a
@@ -276,6 +284,9 @@ pub struct HnswIndex {
     /// [`estimate_bytes`] at construction, so the cache can budget without
     /// recomputing it on every install.
     bytes: usize,
+    /// [`SnapshotMeta::renames`]: the shadow's moves of chunk ids when this was
+    /// built, read before its walk.
+    renames: u64,
 }
 
 impl HnswIndex {
@@ -397,6 +408,9 @@ impl HnswIndex {
         // would compute, so a recomputed key misses both. A record stored
         // under an id that is not a String (a client's insert into the
         // shadow) has no key a load can name, and is left out.
+        // Read before the walk, so a move that lands during it makes the
+        // graph read as behind, never as fresh.
+        let renames = engine.vector_renames(shadow.id)?;
         let mut records: Vec<(String, Vec<f32>)> = Vec::new();
         engine.for_each_vector(shadow, kimmy_storage::WalkScope::Request, |id, record| {
             // A wrong width belongs to a different model and would corrupt
@@ -481,7 +495,7 @@ impl HnswIndex {
 
         debug!(vectors = keys.len(), "built HNSW index");
         let bytes = estimate_bytes(&keys, dim);
-        let index = Self { graph, keys, metric, dim, created: shadow.created, bytes };
+        let index = Self { graph, keys, metric, dim, created: shadow.created, bytes, renames };
 
         // Ask the sampled vectors to find themselves. A few dozen searches
         // against an O(n log n) build, and no extra reads.
@@ -548,6 +562,12 @@ impl HnswIndex {
         self.keys.len()
     }
 
+    /// The shadow's moves of chunk ids when this graph was built
+    /// ([`Engine::vector_renames`]).
+    pub(crate) fn renames(&self) -> u64 {
+        self.renames
+    }
+
     pub fn is_empty(&self) -> bool {
         self.keys.is_empty()
     }
@@ -594,6 +614,7 @@ impl HnswIndex {
             dim: self.dim,
             created: self.created,
             keys: self.keys.clone(),
+            renames: self.renames,
         };
         std::fs::write(
             staging.join("meta.json"),
@@ -655,7 +676,15 @@ impl HnswIndex {
 
         debug!(vectors = meta.keys.len(), ?dir, "loaded HNSW snapshot");
         let bytes = estimate_bytes(&meta.keys, dim);
-        Ok(Self { graph, keys: meta.keys, metric, dim, created: meta.created, bytes })
+        Ok(Self {
+            graph,
+            keys: meta.keys,
+            metric,
+            dim,
+            created: meta.created,
+            bytes,
+            renames: meta.renames,
+        })
     }
 
     /// Approximate k-nearest neighbours, as chunk keys: the `k` nearest the
@@ -686,8 +715,12 @@ impl HnswIndex {
     /// record is loaded, by the document the record names (ADR-239): a key
     /// names a slot, not who holds it, and a chunk a 0.50 build left at
     /// another document's id, or debris, would be admitted under one document
-    /// and returned as another. Filtering happens after the graph walk, so the
-    /// search is widened to compensate.
+    /// and returned as another. **What is loaded is chosen by the key first**
+    /// ([`may_hold`]): only a key that can hold an admitted document's chunk,
+    /// its run's or its 0.50 id, so a filtered search reads what it reads
+    /// unfiltered scaled by the filter, not every candidate of the widened
+    /// walk. Filtering happens after the graph walk, so the search is widened
+    /// to compensate.
     pub fn search(
         &self,
         engine: &Engine,
@@ -703,9 +736,15 @@ impl HnswIndex {
         // needs a much wider search to still return k.
         let wanted = if allowed.is_some() { over_fetch * 8 } else { over_fetch };
         let keys = self.search_keys(query, wanted)?;
+        let old_forms = allowed.map(old_forms).unwrap_or_default();
 
         let mut hits = Vec::with_capacity(keys.len());
         for key in keys {
+            if let Some(allowed) = allowed
+                && !may_hold(allowed, &old_forms, &key)
+            {
+                continue;
+            }
             let Some(record) = load_record(engine, shadow, &key)? else {
                 // The index can lag storage; a missing record just means this
                 // chunk was deleted since the build.
@@ -723,6 +762,36 @@ impl HnswIndex {
         }
         Ok(crate::search::rank_hits(hits, options))
     }
+}
+
+/// The 0.50 forms of the admitted documents whose chunk ids changed in 0.51.0
+/// ([`VectorRecord::legacy_prefix`], less its `#`): the text before a key's
+/// last `#` when it holds such a document's chunk under the id a 0.50 build
+/// wrote. Empty unless the filter admitted a binary or a reserved String.
+fn old_forms(allowed: &HashSet<DocId>) -> HashSet<String> {
+    allowed
+        .iter()
+        .filter_map(VectorRecord::legacy_prefix)
+        .map(|mut prefix| {
+            prefix.pop();
+            prefix
+        })
+        .collect()
+}
+
+/// Whether the chunk at `key` can be an admitted document's, judged before it
+/// is loaded: its id parses to a source of one (a binary's under any subtype,
+/// as the document key folds it), or it is one's 0.50 id (`old_forms`). Those
+/// are exactly the places a document's own read covers, its run and its 0.50
+/// ids, so no chunk of an admitted document is passed over; whether a loaded
+/// chunk is that document's is still the record's to say.
+fn may_hold(allowed: &HashSet<DocId>, old_forms: &HashSet<String>, key: &str) -> bool {
+    let by_run = VectorRecord::parse_key(key)
+        .and_then(|(source, _)| source.document())
+        .is_some_and(|document| allowed.contains(&document));
+    let by_legacy = !old_forms.is_empty()
+        && key.rsplit_once('#').is_some_and(|(text, _)| old_forms.contains(text));
+    by_run || by_legacy
 }
 
 /// Fetch one chunk record by its stored key.
@@ -1446,5 +1515,78 @@ mod tests {
             "a format-2 graph keyed by 0.50's ids must not be adopted: {:?}",
             refused.as_ref().err()
         );
+    }
+
+    /// The filtered graph path loads a candidate only when its key can hold an
+    /// admitted document's chunk, and that includes the ids a 0.50 build
+    /// wrote: an admitted binary whose only chunk is at `bin(16 bytes)#0`, and
+    /// an admitted reserved String whose only chunk is at its raw text, are
+    /// found; another document's chunk at those ids is still refused by its
+    /// record.
+    #[test]
+    fn the_filtered_graph_finds_a_document_whose_only_chunk_is_under_its_050_id() {
+        let (engine, shadow, ids, _dir) = uuid_documents(40);
+        let old_binary = DocId::Binary(vec![200; 16]);
+        let tilde = DocId::String("~x".into());
+        for (key, source, vector, text) in [
+            ("bin(16 bytes)#0", &old_binary, vec![1.0, 0.0], "old binary"),
+            ("~x#0", &tilde, vec![0.999, 0.04], "old tilde"),
+        ] {
+            let record = VectorRecord {
+                source: source.clone(),
+                chunk: 0,
+                source_hlc: Hlc::new(1, 0),
+                vector,
+                text: text.into(),
+                config: None,
+            };
+            let doc = bson::serialize_to_document(&record).unwrap();
+            engine.replace(&shadow, &DocId::String(key.into()), doc, true).unwrap();
+        }
+        let index = HnswIndex::build(&engine, &shadow, Metric::Cosine, 2).unwrap();
+        let allowed: HashSet<DocId> =
+            [old_binary.clone(), tilde.clone(), ids[1].clone()].into_iter().collect();
+        let options = SearchOptions { k: 5, metric: Metric::Cosine, per_document: 1 };
+        let hits = index.search(&engine, &shadow, &[1.0, 0.0], &options, Some(&allowed)).unwrap();
+        let got: Vec<(DocId, String)> = hits.into_iter().map(|h| (h.id, h.text)).collect();
+        assert_eq!(
+            got,
+            [
+                (old_binary, "old binary".to_string()),
+                (tilde, "old tilde".to_string()),
+                (ids[1].clone(), "doc 1".to_string())
+            ]
+        );
+        // A 16-byte binary not admitted keeps its own chunks out.
+        let only: HashSet<DocId> = [ids[2].clone()].into_iter().collect();
+        let hits = index.search(&engine, &shadow, &[1.0, 0.0], &options, Some(&only)).unwrap();
+        assert_eq!(hits.iter().map(|h| h.id.clone()).collect::<Vec<_>>(), [ids[2].clone()]);
+    }
+
+    /// The key pre-filter loads what the filter can admit and nothing else:
+    /// a candidate whose key names no admitted document, in its run or under a
+    /// 0.50 id, is never read.
+    #[test]
+    fn the_key_pre_filter_admits_by_run_and_by_050_id_only() {
+        let allowed: HashSet<DocId> =
+            [DocId::Binary(vec![1; 16]), DocId::String("7".into()), DocId::Int64(9)]
+                .into_iter()
+                .collect();
+        let old = old_forms(&allowed);
+        let hex: String = std::iter::repeat_n("01", 16).collect();
+        for (key, expected) in [
+            (format!("~b:{hex}.04#0"), true),
+            (format!("~b:{hex}.00#3"), true),
+            ("bin(16 bytes)#0".to_string(), true),
+            ("~s:7#0".to_string(), true),
+            ("7#0".to_string(), true),
+            ("9#2".to_string(), true),
+            ("8#0".to_string(), false),
+            ("bin(8 bytes)#0".to_string(), false),
+            ("~s:8#0".to_string(), false),
+            ("junk".to_string(), false),
+        ] {
+            assert_eq!(may_hold(&allowed, &old, &key), expected, "{key}");
+        }
     }
 }

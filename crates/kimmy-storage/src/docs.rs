@@ -113,6 +113,9 @@ pub struct WriteScope<'a> {
     /// Shadow collections whose vectors this scope changed, each once, for
     /// the generation bump that follows the commit.
     vector_generations: Vec<CollectionId>,
+    /// Shadow collections whose chunk ids this scope moved, each once, counted
+    /// in the commit itself (`crate::vectors::bump_vector_renames`).
+    vector_renames: Vec<CollectionId>,
     /// The first write that failed, as its error read; `Some` means the
     /// transaction may hold a partial write and can never commit.
     poisoned: Option<String>,
@@ -237,6 +240,14 @@ impl WriteScope<'_> {
         }
     }
 
+    /// Note that this scope moved a shadow collection's chunks to other ids,
+    /// so `write_batch` counts it in the commit ([`Engine::vector_renames`]).
+    pub(crate) fn note_vector_renames(&mut self, shadow: CollectionId) {
+        if !self.vector_renames.contains(&shadow) {
+            self.vector_renames.push(shadow);
+        }
+    }
+
     /// Remember the first failure and hand it back unchanged: the caller
     /// sees the error it caused, and the scope sees that it can never
     /// commit.
@@ -321,6 +332,41 @@ impl Engine {
         F: FnMut(DocId, Document) -> Result<bool>,
     {
         self.for_each_record_after(coll, after, scope, |id, _, doc| f(id, doc))
+    }
+
+    /// [`Engine::for_each_doc_after`] from each encoded key of `afters` in
+    /// turn, **in one read transaction**, so the places read are read at one
+    /// moment: one document's vector chunks, under its run and under the ids
+    /// an older build wrote for it (ADR-239), which a commit between two reads
+    /// could move from one to the other unseen. `f` is told which place, and
+    /// answers `false` to end that one.
+    pub(crate) fn for_each_doc_after_each<F>(
+        &self,
+        coll: &CollectionMeta,
+        afters: &[Vec<u8>],
+        scope: WalkScope,
+        mut f: F,
+    ) -> Result<()>
+    where
+        F: FnMut(usize, DocId, Document) -> Result<bool>,
+    {
+        let txn = self.db().begin_read()?;
+        let docs = open_walk_table(&txn, tables::DOCS, self.walk(scope))?;
+        for (place, after) in afters.iter().enumerate() {
+            for entry in docs.range(doc_range_after(coll.id, Some(after)))? {
+                let (_, value) = entry?;
+                let record = codec::decode_doc_record(value.value())?;
+                if record.deleted {
+                    continue;
+                }
+                let doc: Document = bson::deserialize_from_slice(&record.body)?;
+                let id = extract_id(&doc)?;
+                if !f(place, id, doc)? {
+                    break;
+                }
+            }
+        }
+        Ok(())
     }
 
     /// [`Engine::for_each_doc_after`], with each document's stamp.
@@ -1057,6 +1103,7 @@ impl Engine {
             entries: Vec::new(),
             wrote: false,
             vector_generations: Vec::new(),
+            vector_renames: Vec::new(),
             poisoned: None,
         };
         let value = match f(&mut scope) {
@@ -1066,7 +1113,9 @@ impl Engine {
                 return Err(e);
             }
         };
-        let WriteScope { txn, entries, wrote, vector_generations, poisoned, .. } = scope;
+        let WriteScope {
+            txn, entries, wrote, vector_generations, vector_renames, poisoned, ..
+        } = scope;
         if let Some(first) = poisoned {
             // The closure answered `Ok` over a failed write. What the
             // transaction holds is not a state that ever existed, and it
@@ -1077,6 +1126,10 @@ impl Engine {
         if !wrote {
             txn.abort()?;
             return Ok(value);
+        }
+        if let Err(e) = crate::vectors::bump_vector_renames(&txn, &vector_renames) {
+            txn.abort()?;
+            return Err(e);
         }
         txn.commit()?;
         // Committed, so a build that reads the new generation now reads the

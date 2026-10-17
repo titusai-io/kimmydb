@@ -34,6 +34,13 @@ use serde::{Deserialize, Serialize};
 use crate::hlc::Hlc;
 use crate::ids::DocId;
 
+/// The chunk-id format this build writes (ADR-239): 2, the injective encoding
+/// of [`ChunkSource`]. 0.50.0 and every build before it wrote the `_id`'s
+/// display text, which is format 1 and is never named. A member says it in its
+/// facts block, and a store records that the recheck the change owes was
+/// queued under it.
+pub const CHUNK_ID_FORMAT: u64 = 2;
+
 /// What a chunk id names as its source: the `_id` value as the document key
 /// identifies it, and a binary's subtype (ADR-239).
 ///
@@ -92,6 +99,19 @@ impl ChunkSource {
             }
         }
         Self::from(id)
+    }
+
+    /// The document this source is a chunk source of, as the key identifies
+    /// it: a binary's subtype folded away. `None` for a Decimal128 until
+    /// `DocId::Decimal128` lands, with the arm that names it here.
+    pub fn document(&self) -> Option<DocId> {
+        match self {
+            Self::ObjectId(bytes) => Some(DocId::ObjectId(bson::oid::ObjectId::from_bytes(*bytes))),
+            Self::String(s) => Some(DocId::String(s.clone())),
+            Self::Int64(i) => Some(DocId::Int64(*i)),
+            Self::Binary { bytes, .. } => Some(DocId::Binary(bytes.clone())),
+            Self::Decimal128(_) => None,
+        }
     }
 
     /// Whether this is a source of the document keyed `id`: the same value,
@@ -294,8 +314,13 @@ impl VectorRecord {
         let DocId::String(s) = id else {
             return None;
         };
+        Self::parse_key(s)
+    }
+
+    /// [`Self::parse_id`] of a String key, which the graph holds as text.
+    pub fn parse_key(key: &str) -> Option<(ChunkSource, u32)> {
         // Split from the right: a string `_id` may itself contain '#'.
-        let (source, chunk) = s.rsplit_once('#')?;
+        let (source, chunk) = key.rsplit_once('#')?;
         Some((ChunkSource::decode(source)?, parse_chunk(chunk)?))
     }
 
@@ -660,6 +685,22 @@ mod tests {
                 prop_assert_eq!(a.source() == b.source(), same, "{:?} / {:?}", a, b);
                 let (ia, ib) = (VectorRecord::id(&a.source(), n), VectorRecord::id(&b.source(), m));
                 prop_assert_eq!(ia == ib, same && n == m, "{:?}#{} / {:?}#{}: {:?}", a, n, b, m, ia);
+            }
+
+            /// A source names the document its key identifies, a binary's
+            /// subtype folded: what the graph's key pre-filter looks up.
+            #[test]
+            fn a_source_names_the_document_its_key_identifies(a in any_value()) {
+                let source = a.source();
+                let expected = match &a {
+                    Value::Bson(b) => Some(DocId::try_from_bson(b).unwrap()),
+                    Value::Uuid(u) => Some(DocId::Binary(u.as_bytes().to_vec())),
+                    Value::Decimal(_) => None,
+                };
+                prop_assert_eq!(source.document(), expected.clone());
+                if let Some(document) = expected {
+                    prop_assert!(source.is_of(&document));
+                }
             }
 
             /// Test 2, the round trip.

@@ -66,6 +66,12 @@ impl VectorWrite {
                 "a chunk source {source:?} that is not the document {document:?}'s"
             )));
         }
+        // A record that names another document would sit in this one's run
+        // for good, as debris it is re-embedded over.
+        debug_assert!(
+            records.iter().all(|record| record.source == *document),
+            "every record of a document's chunk set names that document"
+        );
         let docs = records
             .iter()
             .map(|record| {
@@ -839,16 +845,19 @@ impl crate::Engine {
         self.write_batch(WriterHolder::Embedding, |scope| scope.put_vectors(shadow, write))
     }
 
-    /// Every vector belonging to one source document, in chunk order.
+    /// Every vector belonging to one source document, in chunk order, once per
+    /// chunk number.
     ///
     /// A document's chunks are those whose record names it, in the two places
-    /// they can be (ADR-239): its run ([`VectorRecord::run_prefix`]), and the
-    /// ids a 0.50 build wrote it under where those changed
-    /// ([`VectorRecord::legacy_prefix`]), which are read and never written. A
-    /// chunk in either place whose record names another document is not
-    /// returned: before 0.51.0 every binary `_id` of one length shared one
-    /// chunk set, and a String shared the number's or the ObjectId's it prints
-    /// as. Where both places hold one chunk number, the run's wins.
+    /// they can be (ADR-239), read in one read: its run
+    /// ([`VectorRecord::run_prefix`]), and the ids a 0.50 build wrote it under
+    /// where those changed ([`VectorRecord::legacy_prefix`]), which are read
+    /// and never written. A chunk in either place whose record names another
+    /// document is not returned: before 0.51.0 every binary `_id` of one length
+    /// shared one chunk set, and a String shared the number's or the
+    /// ObjectId's it prints as. Where both places hold one chunk number, the
+    /// run's wins, and where the run holds it under two binary subtypes, the
+    /// later version's.
     pub fn get_vectors(
         &self,
         shadow: &CollectionMeta,
@@ -951,7 +960,8 @@ impl crate::Engine {
         let txn = self.begin_write(WriterHolder::Embedding)?;
         let queued = (|| -> Result<bool> {
             let mut meta = txn.open_table(crate::tables::META)?;
-            if meta.get(CHUNK_IDS_KEY)?.is_some_and(|v| v.value() == CHUNK_IDS_CURRENT) {
+            if meta.get(CHUNK_IDS_KEY)?.is_some_and(|v| v.value() == chunk_ids_current().as_slice())
+            {
                 return Ok(false);
             }
             for collection in &embedded {
@@ -960,7 +970,7 @@ impl crate::Engine {
                     meta.insert(key.as_str(), &b"check"[..])?;
                 }
             }
-            meta.insert(CHUNK_IDS_KEY, CHUNK_IDS_CURRENT)?;
+            meta.insert(CHUNK_IDS_KEY, chunk_ids_current().as_slice())?;
             Ok(true)
         })();
         match queued {
@@ -979,12 +989,26 @@ impl crate::Engine {
         }
     }
 
+    /// How many times one shadow's chunks have been moved to other ids here: by
+    /// [`Self::adopt_legacy_chunks`], a twin's move, or a put that removed an
+    /// id it did not rewrite (a re-embed taking a document off its 0.50 ids).
+    /// Each keeps the count of chunks while changing their ids, so a graph
+    /// saved before one is behind though the count agrees; the index cache
+    /// compares this, not the count alone, before it adopts a graph a
+    /// previous process saved (ADR-239). Only this member's own writes count:
+    /// what replication brings is the count's to judge, as before.
+    pub fn vector_renames(&self, shadow: CollectionId) -> Result<u64> {
+        let txn = self.db().begin_read()?;
+        let meta = txn.open_table(crate::tables::META)?;
+        read_renames(meta.get(renames_key(shadow).as_str())?.as_ref().map(|v| v.value()))
+    }
+
     /// Whether this store's chunk ids have had the one recheck 0.51.0 owes
     /// them queued ([`Self::queue_vector_chunk_recheck`]).
     fn vector_chunk_ids_current(&self) -> Result<bool> {
         let txn = self.db().begin_read()?;
         let meta = txn.open_table(crate::tables::META)?;
-        Ok(meta.get(CHUNK_IDS_KEY)?.is_some_and(|v| v.value() == CHUNK_IDS_CURRENT))
+        Ok(meta.get(CHUNK_IDS_KEY)?.is_some_and(|v| v.value() == chunk_ids_current().as_slice()))
     }
 
     /// Visit every stored vector, with the id it is stored under. Used by
@@ -1037,7 +1061,10 @@ impl crate::Engine {
     ///   re-embeds once;
     /// - (d) the document's run holds a chunk whose record names another
     ///   document, or none: debris at its ids, which only its own put removes,
-    ///   and which a judgement that passed it over would serve beside it.
+    ///   and which a judgement that passed it over would serve beside it;
+    /// - (e) its run holds its chunks under two binary subtypes, which two
+    ///   owners embedding one key from bodies of two subtypes leave: served
+    ///   once, and removed by its next put.
     ///
     /// The fingerprint rides on the records this reads anyway, so the
     /// configuration costs no read of its own.
@@ -1075,22 +1102,39 @@ impl WriteScope<'_> {
     /// whatever its record names (another source's chunk there is debris the
     /// staleness check would otherwise re-embed the document for, for ever),
     /// and every chunk under the document's 0.50 ids whose record names it.
+    /// **A twin's whole 0.50 chunk set is moved, not lost**: the String that
+    /// prints as an Int64 or an ObjectId had its 0.50 chunks at this
+    /// document's ids, and they go to its own ids when they are the whole of
+    /// its set and it has none of its own ([`movable_twins`]), so it is not
+    /// re-embedded for want of them.
     ///
     /// The generation bump belongs to the commit, not to the write: the
     /// shadow is recorded here, when a chunk was written or removed, and
     /// `write_batch` bumps it once after the commit has landed — never
     /// inside the scope, and never for a scope that aborted. An empty chunk
     /// set over a document that has none writes nothing and records
-    /// nothing.
+    /// nothing. A write that removed a chunk it did not rewrite also counts a
+    /// move of the shadow's ids ([`crate::Engine::vector_renames`]).
     pub fn put_vectors(&mut self, shadow: &CollectionMeta, write: VectorWrite) -> Result<()> {
         let VectorWrite { document, docs } = write;
-        let mut held = Vec::new();
-        visit_run(&*self, shadow, &document, |id, _, _| held.push(id))?;
-        visit_legacy(&*self, shadow, &document, |id, _, doc| {
-            if names(doc, &document) {
-                held.push(id);
-            }
-        })?;
+        let (mut run, mut legacy, mut twins) = (Vec::new(), Vec::new(), Vec::new());
+        visit_document(
+            &*self,
+            shadow,
+            &document,
+            |id, _, chunk, doc| {
+                if let Some(twin) = twin_050_chunk(&id, &document, chunk, &doc) {
+                    twins.push(twin);
+                }
+                run.push(id);
+            },
+            |id, _, doc| {
+                if names(doc, &document) {
+                    legacy.push(id);
+                }
+            },
+        )?;
+        let moves = movable_twins(&*self, shadow, twins)?;
 
         let written = !docs.is_empty();
         let mut rewritten = std::collections::HashSet::with_capacity(docs.len());
@@ -1098,17 +1142,25 @@ impl WriteScope<'_> {
             self.replace(shadow, &id, doc, true)?;
             rewritten.insert(id);
         }
+        let moved = moves.len();
+        for (id, doc) in moves {
+            self.replace(shadow, &id, doc, true)?;
+        }
 
         // Drop what this write did not rewrite: the tail of a previously
-        // longer document, debris, and the 0.50 ids.
+        // longer document, debris, a twin's chunks (moved above, or left to be
+        // re-embedded), and the 0.50 ids.
         let mut removed = 0;
-        for id in held {
+        for id in run.into_iter().chain(legacy) {
             if !rewritten.contains(&id) && self.delete(shadow, &id)? {
                 removed += 1;
             }
         }
-        if written || removed > 0 {
+        if written || removed > 0 || moved > 0 {
             self.touch_vector_generation(shadow.id);
+        }
+        if removed > 0 || moved > 0 {
+            self.note_vector_renames(shadow.id);
         }
         Ok(())
     }
@@ -1148,16 +1200,24 @@ impl WriteScope<'_> {
     /// own put, or its own delete, to remove. The shadow is recorded for the
     /// post-commit bump only when a chunk was removed. Returns how many were.
     pub fn delete_vectors(&mut self, shadow: &CollectionMeta, source: &DocId) -> Result<usize> {
-        let mut owned = Vec::new();
-        let mut own = |id: DocId, doc: bson::Document| {
-            if names(doc, source) {
-                owned.push(id);
-            }
-        };
-        visit_run(&*self, shadow, source, |id, _, doc| own(id, doc))?;
-        visit_legacy(&*self, shadow, source, |id, _, doc| own(id, doc))?;
+        let (mut run, mut legacy) = (Vec::new(), Vec::new());
+        visit_document(
+            &*self,
+            shadow,
+            source,
+            |id, _, _, doc| {
+                if names(doc, source) {
+                    run.push(id);
+                }
+            },
+            |id, _, doc| {
+                if names(doc, source) {
+                    legacy.push(id);
+                }
+            },
+        )?;
         let mut removed = 0;
-        for id in owned {
+        for id in run.into_iter().chain(legacy) {
             if self.delete(shadow, &id)? {
                 removed += 1;
             }
@@ -1180,7 +1240,9 @@ impl WriteScope<'_> {
     /// as stale and re-embeds it: a run already written is this build's, and
     /// a 0.50 id that also holds another document's chunk (the Int64 or the
     /// ObjectId that prints as the String shares those ids) may hold a
-    /// mixture. Returns how many were moved.
+    /// mixture. A move counts toward [`crate::Engine::vector_renames`], so a
+    /// graph saved before it is not adopted as fresh after a restart. Returns
+    /// how many were moved.
     pub fn adopt_legacy_chunks(
         &mut self,
         shadow: &CollectionMeta,
@@ -1196,6 +1258,7 @@ impl WriteScope<'_> {
             self.delete(shadow, &old)?;
         }
         self.touch_vector_generation(shadow.id);
+        self.note_vector_renames(shadow.id);
         Ok(moved)
     }
 }
@@ -1204,106 +1267,98 @@ impl WriteScope<'_> {
 /// scope's transaction, under the writer and seeing what the scope has
 /// already written, which a decision the scope then writes by must see.
 trait ShadowRead {
-    /// Visit the shadow's documents after the encoded key `after`, until `f`
-    /// answers `false`.
-    fn docs_after(
+    /// Visit the shadow's documents after each encoded key of `afters` in turn,
+    /// **in one read**, so what one place says is never judged beside what
+    /// another said at another moment: `f` is told which, and answers `false`
+    /// to end that one.
+    fn docs_after_each(
         &self,
         shadow: &CollectionMeta,
-        after: &[u8],
-        f: &mut dyn FnMut(DocId, bson::Document) -> Result<bool>,
+        afters: &[Vec<u8>],
+        f: &mut dyn FnMut(usize, DocId, bson::Document) -> Result<bool>,
     ) -> Result<()>;
 }
 
 impl ShadowRead for crate::Engine {
-    fn docs_after(
+    fn docs_after_each(
         &self,
         shadow: &CollectionMeta,
-        after: &[u8],
-        f: &mut dyn FnMut(DocId, bson::Document) -> Result<bool>,
+        afters: &[Vec<u8>],
+        f: &mut dyn FnMut(usize, DocId, bson::Document) -> Result<bool>,
     ) -> Result<()> {
         // One document's chunks, which is bounded: `Request`, so only the drain's
         // deadline ends it.
-        self.for_each_doc_after(shadow, Some(after), WalkScope::Request, f)
+        self.for_each_doc_after_each(shadow, afters, WalkScope::Request, f)
     }
 }
 
 impl ShadowRead for WriteScope<'_> {
-    fn docs_after(
+    fn docs_after_each(
         &self,
         shadow: &CollectionMeta,
-        after: &[u8],
-        f: &mut dyn FnMut(DocId, bson::Document) -> Result<bool>,
+        afters: &[Vec<u8>],
+        f: &mut dyn FnMut(usize, DocId, bson::Document) -> Result<bool>,
     ) -> Result<()> {
-        self.for_each_doc_after(shadow, Some(after), f)
+        for (i, after) in afters.iter().enumerate() {
+            self.for_each_doc_after(shadow, Some(after), |id, doc| f(i, id, doc))?;
+        }
+        Ok(())
     }
 }
 
-/// Visit the keys of one document's run, whatever their records hold: every
-/// key under [`VectorRecord::run_prefix`] whose parse names a source of the
-/// document ([`ChunkSource::is_of`]; for a binary, its bytes under any
-/// subtype), with its chunk number (ADR-239).
+/// Visit one document's chunks in the two places they can be (ADR-239), in
+/// one read, whatever their records hold:
+///
+/// - `run`: every key under [`VectorRecord::run_prefix`] whose parse names a
+///   source of the document ([`ChunkSource::is_of`]; for a binary, its bytes
+///   under any subtype), with that source and its chunk number;
+/// - `legacy`: every key under the document's 0.50 ids
+///   ([`VectorRecord::legacy_prefix`]), where its id changed in 0.51.0, with
+///   its chunk number. They may be another document's (every binary of one
+///   length shared them), so the caller decides by the record. Nothing for a
+///   document whose id did not change.
 ///
 /// Chunk ids are String keys, and a string key encodes byte-for-byte in `_id`
-/// order, so one document's chunks are a contiguous run of the shadow
-/// collection: the scan starts just past the encoded prefix — which sorts
-/// before every key that extends it — and stops at the first key that does not
-/// carry it. Reading a document's chunks therefore costs its chunk count, not
-/// the collection's.
+/// order, so each place is a contiguous run of the shadow collection: its scan
+/// starts just past the encoded prefix — which sorts before every key that
+/// extends it — and stops at the first key that does not carry it. Reading a
+/// document's chunks therefore costs its chunk count, not the collection's.
 ///
 /// The prefix alone is not proof of ownership: a String may itself contain
 /// `#`, so `a#1#0` (document `a#1`, chunk 0) sits inside `a#`'s run. Each key
 /// is parsed and its source compared, and a key inside the run that belongs to
 /// another document is passed over rather than ending the scan.
-fn visit_run(
+fn visit_document(
     view: &impl ShadowRead,
     shadow: &CollectionMeta,
     document: &DocId,
-    mut f: impl FnMut(DocId, u32, bson::Document),
+    mut run: impl FnMut(DocId, ChunkSource, u32, bson::Document),
+    mut legacy: impl FnMut(DocId, u32, bson::Document),
 ) -> Result<()> {
-    let prefix = VectorRecord::run_prefix(document);
-    let after = kimmy_core::keyenc::encode(&bson::Bson::String(prefix.clone()))?;
-    view.docs_after(shadow, &after, &mut |id, doc| {
+    let mut prefixes = vec![VectorRecord::run_prefix(document)];
+    prefixes.extend(VectorRecord::legacy_prefix(document));
+    let afters = prefixes
+        .iter()
+        .map(|prefix| Ok(kimmy_core::keyenc::encode(&bson::Bson::String(prefix.clone()))?))
+        .collect::<Result<Vec<_>>>()?;
+    view.docs_after_each(shadow, &afters, &mut |place, id, doc| {
         // Strings sort together, so the first non-string key — or the first
-        // string outside the prefix — is the end of the run.
+        // string outside the prefix — is the end of the place.
         let DocId::String(raw) = &id else {
             return Ok(false);
         };
-        if !raw.starts_with(&prefix) {
+        let prefix = &prefixes[place];
+        if !raw.starts_with(prefix.as_str()) {
             return Ok(false);
         }
-        if let Some((source, chunk)) = VectorRecord::parse_id(&id)
-            && source.is_of(document)
-        {
-            f(id, chunk, doc);
-        }
-        Ok(true)
-    })
-}
-
-/// Visit the keys under one document's 0.50 ids
-/// ([`VectorRecord::legacy_prefix`]), where its id changed in 0.51.0, with
-/// their chunk numbers, whatever their records hold: they may be another
-/// document's (every binary of one length shared them), so the caller decides
-/// by the record. Nothing for a document whose id did not change.
-fn visit_legacy(
-    view: &impl ShadowRead,
-    shadow: &CollectionMeta,
-    document: &DocId,
-    mut f: impl FnMut(DocId, u32, bson::Document),
-) -> Result<()> {
-    let Some(prefix) = VectorRecord::legacy_prefix(document) else {
-        return Ok(());
-    };
-    let after = kimmy_core::keyenc::encode(&bson::Bson::String(prefix.clone()))?;
-    view.docs_after(shadow, &after, &mut |id, doc| {
-        let DocId::String(raw) = &id else {
-            return Ok(false);
-        };
-        if !raw.starts_with(&prefix) {
-            return Ok(false);
-        }
-        if let Some(chunk) = VectorRecord::legacy_chunk(&id, &prefix) {
-            f(id, chunk, doc);
+        if place == 0 {
+            if let Some((source, chunk)) = VectorRecord::parse_id(&id)
+                && source.is_of(document)
+            {
+                run(id, source, chunk, doc);
+            }
+        } else if let Some(chunk) = VectorRecord::legacy_chunk(&id, prefix) {
+            legacy(id, chunk, doc);
         }
         Ok(true)
     })
@@ -1314,10 +1369,77 @@ fn names(doc: bson::Document, document: &DocId) -> bool {
     decode_vector(doc).is_ok_and(|record| record.source == *document)
 }
 
+/// A reserved String's 0.50 chunk found in `document`'s run: the chunk at `id`
+/// names a String whose 0.50 ids are exactly where it sits (the String `"7"`'s
+/// at the Int64 `7`'s ids, a hex String's at the ObjectId's), with its record.
+/// Only an Int64's or an ObjectId's run can hold one, and the record's source
+/// is read alone first, so an ordinary put decodes no record.
+fn twin_050_chunk(
+    id: &DocId,
+    document: &DocId,
+    chunk: u32,
+    doc: &bson::Document,
+) -> Option<(DocId, u32, VectorRecord, bson::Document)> {
+    if !matches!(document, DocId::Int64(_) | DocId::ObjectId(_)) {
+        return None;
+    }
+    let twin: DocId = bson::deserialize_from_bson(doc.get("source")?.clone()).ok()?;
+    if !matches!(twin, DocId::String(_)) {
+        return None;
+    }
+    let prefix = VectorRecord::legacy_prefix(&twin)?;
+    if VectorRecord::legacy_chunk(id, &prefix) != Some(chunk) {
+        return None;
+    }
+    let record = decode_vector(doc.clone()).ok()?;
+    Some((twin, chunk, record, doc.clone()))
+}
+
+/// The writes that move a twin's 0.50 chunks to its own ids, from what a put
+/// found in its run ([`twin_050_chunk`]): per twin, only when they are the
+/// whole of a chunk set, numbered 0 to n − 1 and of one version, and the
+/// twin's own run is empty. A 0.50 put wrote a set from chunk 0 up, so a twin
+/// whose set was partly overwritten kept a tail of it, never a head: a set
+/// that starts anywhere but 0, or has a gap, is part of one, and would read
+/// as current with chunks missing if it were moved. Such a twin is left to be
+/// re-embedded, as before.
+fn movable_twins(
+    view: &impl ShadowRead,
+    shadow: &CollectionMeta,
+    found: Vec<(DocId, u32, VectorRecord, bson::Document)>,
+) -> Result<Vec<(DocId, bson::Document)>> {
+    let mut by_twin: std::collections::BTreeMap<DocId, Vec<(u32, VectorRecord, bson::Document)>> =
+        Default::default();
+    for (twin, chunk, record, doc) in found {
+        by_twin.entry(twin).or_default().push((chunk, record, doc));
+    }
+    let mut moves = Vec::new();
+    for (twin, mut chunks) in by_twin {
+        chunks.sort_by_key(|(chunk, ..)| *chunk);
+        let whole = chunks.iter().enumerate().all(|(i, (chunk, record, _))| {
+            *chunk as usize == i
+                && record.chunk == *chunk
+                && record.source_hlc == chunks[0].1.source_hlc
+        });
+        if !whole {
+            continue;
+        }
+        let mut run_empty = true;
+        visit_document(view, shadow, &twin, |_, _, _, _| run_empty = false, |_, _, _| {})?;
+        if !run_empty {
+            continue;
+        }
+        let own = ChunkSource::from(&twin);
+        moves
+            .extend(chunks.into_iter().map(|(chunk, _, doc)| (VectorRecord::id(&own, chunk), doc)));
+    }
+    Ok(moves)
+}
+
 /// The chunks to move for [`WriteScope::adopt_legacy_chunks`], as `(0.50 id,
 /// chunk, stored record)`: `Some` only for a String whose id changed, with at
 /// least one chunk under its 0.50 ids, every one of them naming it, and an
-/// empty run.
+/// empty run, read in one read.
 fn adoptable(
     view: &impl ShadowRead,
     shadow: &CollectionMeta,
@@ -1328,18 +1450,23 @@ fn adoptable(
     }
     let mut legacy = Vec::new();
     let mut all_named = true;
-    visit_legacy(view, shadow, source, |id, chunk, doc| {
-        if names(doc.clone(), source) {
-            legacy.push((id, chunk, doc));
-        } else {
-            all_named = false;
-        }
-    })?;
+    let mut run_empty = true;
+    visit_document(
+        view,
+        shadow,
+        source,
+        |_, _, _, _| run_empty = false,
+        |id, chunk, doc| {
+            if names(doc.clone(), source) {
+                legacy.push((id, chunk, doc));
+            } else {
+                all_named = false;
+            }
+        },
+    )?;
     if legacy.is_empty() || !all_named {
         return Ok(None);
     }
-    let mut run_empty = true;
-    visit_run(view, shadow, source, |_, _, _| run_empty = false)?;
     Ok(run_empty.then_some(legacy))
 }
 
@@ -1348,73 +1475,130 @@ fn adoptable(
 struct Held {
     document: DocId,
     /// Every key of the document's run, as its record, `None` where the
-    /// record does not decode.
-    run: Vec<Option<VectorRecord>>,
+    /// record does not decode, with the binary subtype its id names.
+    run: Vec<(Option<u8>, Option<VectorRecord>)>,
     /// The chunks under the document's 0.50 ids whose record names it.
     legacy: Vec<VectorRecord>,
 }
 
 impl Held {
     fn read(view: &impl ShadowRead, shadow: &CollectionMeta, document: &DocId) -> Result<Self> {
-        let mut run = Vec::new();
-        visit_run(view, shadow, document, |id, _, doc| {
-            run.push(match decode_vector(doc) {
-                Ok(record) => Some(record),
-                Err(e) => {
-                    tracing::warn!(
-                        collection = %shadow.name,
-                        document = %id,
-                        error = %e,
-                        "skipping a document in a vector collection that is not a vector record"
-                    );
-                    None
+        let (mut run, mut legacy) = (Vec::new(), Vec::new());
+        visit_document(
+            view,
+            shadow,
+            document,
+            |id, source, _, doc| {
+                let subtype = match source {
+                    ChunkSource::Binary { subtype, .. } => Some(subtype),
+                    _ => None,
+                };
+                let record = match decode_vector(doc) {
+                    Ok(record) => Some(record),
+                    Err(e) => {
+                        tracing::warn!(
+                            collection = %shadow.name,
+                            document = %id,
+                            error = %e,
+                            "skipping a document in a vector collection that is not a vector record"
+                        );
+                        None
+                    }
+                };
+                run.push((subtype, record));
+            },
+            |_, _, doc| {
+                if let Ok(record) = decode_vector(doc)
+                    && record.source == *document
+                {
+                    legacy.push(record);
                 }
-            });
-        })?;
-        let mut legacy = Vec::new();
-        visit_legacy(view, shadow, document, |_, _, doc| {
-            if let Ok(record) = decode_vector(doc)
-                && record.source == *document
-            {
-                legacy.push(record);
-            }
-        })?;
+            },
+        )?;
         Ok(Self { document: document.clone(), run, legacy })
     }
 
     /// The run's chunks whose record names the document.
     fn named(&self) -> impl Iterator<Item = &VectorRecord> {
-        self.run.iter().flatten().filter(|record| record.source == self.document)
+        self.run.iter().filter_map(|(_, r)| r.as_ref()).filter(|r| r.source == self.document)
     }
 
-    /// What is served for the document: the run's chunks that name it, and
-    /// the 0.50 ids' at the chunk numbers those do not hold, in chunk order.
+    /// What is served for the document, once per chunk number and in chunk
+    /// order: the run's chunks that name it (of two under different subtypes,
+    /// the one from the later version), and the 0.50 ids' at the numbers
+    /// those do not hold.
     fn served(self) -> Vec<VectorRecord> {
         let Self { document, run, legacy } = self;
-        let mut out: Vec<VectorRecord> =
-            run.into_iter().flatten().filter(|record| record.source == document).collect();
-        let held: std::collections::HashSet<u32> = out.iter().map(|r| r.chunk).collect();
-        out.extend(legacy.into_iter().filter(|record| !held.contains(&record.chunk)));
-        // Keys order chunk numbers as text — `#10` before `#2` — so the read
-        // sorts numerically rather than trusting the scan.
-        out.sort_by_key(|r| r.chunk);
-        out
+        let mut by_chunk: std::collections::BTreeMap<u32, VectorRecord> = Default::default();
+        for record in run.into_iter().filter_map(|(_, r)| r).filter(|r| r.source == document) {
+            match by_chunk.get(&record.chunk) {
+                Some(held) if held.source_hlc >= record.source_hlc => {}
+                _ => {
+                    by_chunk.insert(record.chunk, record);
+                }
+            }
+        }
+        for record in legacy {
+            by_chunk.entry(record.chunk).or_insert(record);
+        }
+        by_chunk.into_values().collect()
     }
 
-    /// Rules (a) to (d) of [`crate::Engine::vectors_are_stale`].
+    /// Rules (a) to (e) of [`crate::Engine::vectors_are_stale`].
     fn is_stale(&self, current: Hlc, config: u64, unstamped: Unstamped) -> bool {
         let none = self.named().next().is_none() && self.legacy.is_empty();
         let behind =
             self.named().chain(&self.legacy).any(|r| r.is_stale(current, config, unstamped));
         let legacy = !self.legacy.is_empty();
         let debris = self.named().count() < self.run.len();
-        none || behind || legacy || debris
+        let subtypes: std::collections::BTreeSet<u8> = self
+            .run
+            .iter()
+            .filter(|(_, r)| r.as_ref().is_some_and(|r| r.source == self.document))
+            .filter_map(|(subtype, _)| *subtype)
+            .collect();
+        let two_subtypes = subtypes.len() > 1;
+        none || behind || legacy || debris || two_subtypes
     }
 }
 
-/// META key saying the recheck 0.51.0's chunk ids owe has been queued.
+/// META key saying the recheck 0.51.0's chunk ids owe has been queued, and the
+/// chunk-id format it was queued for ([`kimmy_core::CHUNK_ID_FORMAT`]).
 const CHUNK_IDS_KEY: &str = "vector_chunk_ids";
-const CHUNK_IDS_CURRENT: &[u8] = b"2";
+
+fn chunk_ids_current() -> Vec<u8> {
+    kimmy_core::CHUNK_ID_FORMAT.to_string().into_bytes()
+}
+
+/// META key counting the moves of one shadow's chunks to other ids.
+fn renames_key(shadow: CollectionId) -> String {
+    format!("vector_renames:{}", shadow.0)
+}
+
+/// Count one move of each shadow's chunk ids, inside the transaction that
+/// commits the scope that moved them ([`WriteScope::note_vector_renames`]).
+pub(crate) fn bump_vector_renames(txn: &WriteTxn<'_>, shadows: &[CollectionId]) -> Result<()> {
+    if shadows.is_empty() {
+        return Ok(());
+    }
+    let mut meta = txn.open_table(crate::tables::META)?;
+    for shadow in shadows {
+        let key = renames_key(*shadow);
+        let now = read_renames(meta.get(key.as_str())?.as_ref().map(|v| v.value()))?;
+        meta.insert(key.as_str(), &(now + 1).to_be_bytes()[..])?;
+    }
+    Ok(())
+}
+
+fn read_renames(raw: Option<&[u8]>) -> Result<u64> {
+    match raw {
+        None => Ok(0),
+        Some(raw) => Ok(u64::from_be_bytes(
+            raw.try_into()
+                .map_err(|_| StorageError::Corrupt("vector renames is not 8 bytes".into()))?,
+        )),
+    }
+}
 
 /// META key holding one consumer's oplog position.
 fn consumer_key(consumer: &str) -> String {
@@ -2979,5 +3163,138 @@ mod tests {
         assert!(engine.queue_vector_chunk_recheck().unwrap().is_empty(), "once");
         assert_eq!(engine.commits(), commits, "and nothing written");
         assert_eq!(engine.vector_rescans().unwrap(), vec![(forced, true)]);
+    }
+
+    /// Rule (e): one chunk number under two subtypes, which two owners
+    /// embedding one key from bodies of two subtypes leave, is served once,
+    /// the later version's, and makes the document stale; its next put removes
+    /// the other, and then it reads as current.
+    #[test]
+    fn one_chunk_under_two_subtypes_is_served_once_and_stale() {
+        let (engine, shadow, _dir) = with_vectors();
+        let (x, _) = x_and_y();
+        let hx = hex(&bytes_of(&x));
+        stored_at(&engine, &shadow, &format!("~b:{hx}.00#0"), &chunk_of(&x, 0, AT - 1, "older"));
+        stored_at(&engine, &shadow, &format!("~b:{hx}.04#0"), &chunk_of(&x, 0, AT, "newer"));
+        assert_eq!(texts_of(&engine, &shadow, &x), ["newer"], "once, the later version");
+        let mut visited = 0;
+        engine
+            .for_each_vector_of(&shadow, &x, |_| {
+                visited += 1;
+                Ok(true)
+            })
+            .unwrap();
+        assert_eq!(visited, 1);
+        // Both are current by version against an older document stamp: only
+        // the two subtypes make it stale.
+        let at = Hlc::new(AT - 1, 0);
+        let stale = engine.vectors_are_stale(&shadow, &x, at, 7, Unstamped::ByVersion).unwrap();
+        assert!(stale, "two subtypes");
+
+        put_as(&engine, &shadow, &x, &uuid_of(&bytes_of(&x)), &[chunk_of(&x, 0, AT, "newer")]);
+        assert_eq!(ids_in(&engine, &shadow), [format!("~b:{hx}.04#0")]);
+        assert!(!stale_at(&engine, &shadow, &x, AT - 1));
+    }
+
+    fn stale_at(engine: &Engine, shadow: &CollectionMeta, source: &DocId, ms: u64) -> bool {
+        engine.vectors_are_stale(shadow, source, Hlc::new(ms, 0), 7, Unstamped::ByVersion).unwrap()
+    }
+
+    /// The run and the 0.50 ids are read in one read transaction: a move that
+    /// commits between the two places is not seen by the read already under
+    /// way, which finds the chunk where it was. Read in two, it found it in
+    /// neither, and a search missed the document for that query.
+    #[test]
+    fn a_documents_two_places_are_read_in_one_read() {
+        let (engine, shadow, _dir) = with_vectors();
+        let s = DocId::String("12345".into());
+        put_050(&engine, &shadow, &[chunk_of(&s, 0, AT, "s0")]);
+        // A key after the run's place, so the read of the run sees a key.
+        let after = DocId::String("~z".into());
+        engine.put_vectors(&shadow, &after, &[chunk_of(&after, 0, AT, "z")]).unwrap();
+        let afters: Vec<Vec<u8>> =
+            [VectorRecord::run_prefix(&s), VectorRecord::legacy_prefix(&s).unwrap()]
+                .iter()
+                .map(|p| kimmy_core::keyenc::encode(&bson::Bson::String(p.clone())).unwrap())
+                .collect();
+        let mut moved = false;
+        let mut found = Vec::new();
+        engine
+            .for_each_doc_after_each(&shadow, &afters, WalkScope::Request, |place, id, _| {
+                if place == 0 && !moved {
+                    moved = true;
+                    assert_eq!(engine.adopt_legacy_chunks(&shadow, &s).unwrap(), 1);
+                }
+                found.push((place, id));
+                Ok(false)
+            })
+            .unwrap();
+        assert!(moved);
+        assert_eq!(found[1], (1, DocId::String("12345#0".into())), "the read's own moment");
+        assert_eq!(ids_in(&engine, &shadow), ["~s:12345#0", "~s:~z#0"], "and the move landed");
+    }
+
+    /// An Int64's put moves its twin String's whole 0.50 chunk set, which sat
+    /// at the Int64's ids, to the String's own ids, records unchanged, so the
+    /// String reads as current and costs no provider call. Part of a set is
+    /// not moved: it would read as current with its head missing.
+    #[test]
+    fn an_int64_put_moves_its_twin_strings_whole_050_set() {
+        let (engine, shadow, _dir) = with_vectors();
+        let (int, string) = (DocId::Int64(7), DocId::String("7".into()));
+        put_050(
+            &engine,
+            &shadow,
+            &[chunk_of(&string, 0, AT, "s0"), chunk_of(&string, 1, AT, "s1")],
+        );
+        let before = engine.get_vectors(&shadow, &string).unwrap();
+        engine.put_vectors(&shadow, &int, &[chunk_of(&int, 0, AT, "int")]).unwrap();
+        assert_eq!(ids_in(&engine, &shadow), ["7#0", "~s:7#0", "~s:7#1"]);
+        assert_eq!(engine.get_vectors(&shadow, &string).unwrap(), before, "moved as they were");
+        assert!(!stale(&engine, &shadow, &string), "current: no provider call owed");
+        assert_eq!(texts_of(&engine, &shadow, &int), ["int"]);
+
+        // A tail of a set (chunk 0 was the Int64's): deleted, not moved.
+        let (engine, shadow, _dir) = with_vectors();
+        put_050(&engine, &shadow, &[chunk_of(&string, 1, AT, "s1")]);
+        engine.put_vectors(&shadow, &int, &[chunk_of(&int, 0, AT, "int")]).unwrap();
+        assert_eq!(ids_in(&engine, &shadow), ["7#0"]);
+        assert!(stale(&engine, &shadow, &string), "left to be re-embedded");
+
+        // A twin that already has its own chunks: its 0.50 ones are debris.
+        let (engine, shadow, _dir) = with_vectors();
+        put_050(&engine, &shadow, &[chunk_of(&string, 0, AT, "old")]);
+        stored_at(&engine, &shadow, "~s:7#0", &chunk_of(&string, 0, AT, "new"));
+        engine.put_vectors(&shadow, &int, &[chunk_of(&int, 0, AT, "int")]).unwrap();
+        assert_eq!(ids_in(&engine, &shadow), ["7#0", "~s:7#0"]);
+        assert_eq!(texts_of(&engine, &shadow, &string), ["new"]);
+    }
+
+    /// A move of chunk ids is counted in the commit that makes it, and a write
+    /// that only replaces in place counts none.
+    #[test]
+    fn moves_of_chunk_ids_are_counted() {
+        let (engine, shadow, _dir) = with_vectors();
+        let s = DocId::String("12345".into());
+        engine.put_vectors(&shadow, &DocId::Int64(1), &[record(0, AT, "a")]).unwrap();
+        engine.put_vectors(&shadow, &DocId::Int64(1), &[record(0, AT + 1, "b")]).unwrap();
+        assert_eq!(engine.vector_renames(shadow.id).unwrap(), 0, "in place");
+        put_050(&engine, &shadow, &[chunk_of(&s, 0, AT, "s0")]);
+        assert_eq!(engine.adopt_legacy_chunks(&shadow, &s).unwrap(), 1);
+        assert_eq!(engine.vector_renames(shadow.id).unwrap(), 1, "an adoption");
+        let (x, _) = x_and_y();
+        put_050(&engine, &shadow, &[chunk_of(&x, 0, AT, "x")]);
+        put_as(&engine, &shadow, &x, &uuid_of(&bytes_of(&x)), &[chunk_of(&x, 0, AT, "x")]);
+        assert_eq!(engine.vector_renames(shadow.id).unwrap(), 2, "a re-embed off a 0.50 id");
+    }
+
+    /// A record naming another document is refused in a debug build: in the
+    /// document's run it would be debris for good.
+    #[test]
+    #[cfg(debug_assertions)]
+    #[should_panic(expected = "names that document")]
+    fn a_record_of_another_document_is_refused_in_a_debug_build() {
+        let (x, y) = x_and_y();
+        let _ = VectorWrite::encode(&x, &ChunkSource::from(&x), &[chunk_of(&y, 0, AT, "y")]);
     }
 }
