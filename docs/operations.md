@@ -2710,8 +2710,13 @@ says `migrating`; peers see it as down, and nothing is written to it. In order:
    not numbers reads nothing. On a cold disk the read costs a read of those
    documents (49 s for 2,000,000 just copied, on a busy laptop; 0.4 s for a
    store just written), and the re-key that follows reads them again from a
-   warmer cache. A refused start writes nothing of the migration: the store is
-   still schema 4 and 0.50 opens it. Free space and start again. A partial
+   warmer cache. A refused start writes nothing of the migration: every row, the
+   sidecar and the schema are as they were, the store is still schema 4 and 0.50
+   opens it. The open's own table commit (with the tombstone horizon's reset, as in
+   0.50) comes before the refusals, so the file's bytes may have been touched; on
+   HFS+ and ExFAT, which allocate the length a file is extended to, a store with no
+   free page can hit `ENOSPC` at that first commit, as it can on 0.50, and the start
+   fails there rather than with the preflight's message. Free space and start again. A partial
    index whose stored filter this build cannot parse refuses the start the same
    way.
 2. **From here, 0.50 and 0.49 refuse the store.** `kimmy.format` records schema

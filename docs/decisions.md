@@ -28262,7 +28262,7 @@ The grouping identity is `keyenc`, which is exact, so `$group`, `$addToSet`, the
 3. `raise(5)`: the sidecar records schema 5, written by this build.
 4. The first migration commit. It writes schema 5 into `META`, deletes the 3 to 4 markers, carries their unreported collisions into a table of their own, and creates the staging table, the collision table and every marker, all in one transaction.
 
-A start refused at step 2 leaves a store 0.50 opens. The markers, not the version, mean unfinished: a store at schema 5 with markers resumes, and the last commit deletes them.
+A start refused at step 2 leaves every row, the sidecar and the schema as they were, and 0.50 opens the store; the open's table commit of step 1 (with the horizon's reset, as in 0.50) comes before the refusals, so the file's bytes may have been touched, and a store with no free page can hit `ENOSPC` at that first commit on a filesystem that allocates a file's extended length (HFS+, ExFAT), exactly as on 0.50. The markers, not the version, mean unfinished: a store at schema 5 with markers resumes, and the last commit deletes them.
 
 **The unit of re-keying is the `DOCS` collection-id range, not the collection.** A drop leaves its rows under an id nothing resolves until the purger removes them (ADR-189). The purger folds each row's digest term out as it removes it, so those rows are re-keyed too. They get no index rebuild: their entries are only ever removed by range.
 
