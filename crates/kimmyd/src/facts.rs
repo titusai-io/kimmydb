@@ -39,6 +39,7 @@ pub fn source(
             // member's `cluster.decimal128` says (ADR-238): the key is the
             // operator's word about the cluster, this the build's about itself.
             decimal128: Some(true),
+            vector_chunk_ids: Some(kimmy_core::CHUNK_ID_FORMAT),
             ..Facts::default()
         };
         let mut block = match engine.upgrade() {
@@ -132,6 +133,7 @@ mod tests {
         let block = source();
         assert_eq!(block.boot, vec![1; 16]);
         assert!(block.embeddings_disabled && !block.ttl_disabled);
+        assert_eq!(block.vector_chunk_ids, Some(2), "this build's chunk-id format (ADR-239)");
         let sessions = engine.get_collection("app", "sessions").unwrap();
         let plain = engine.get_collection("app", "plain").unwrap();
         assert!(block.holds_ttl(sessions.id));
