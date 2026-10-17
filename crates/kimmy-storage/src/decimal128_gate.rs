@@ -14,12 +14,17 @@
 //! chokepoints and nowhere else:
 //!
 //! - `check_insert` (`docs.rs`): an insert, insert-many, bulk and scope
-//!   insert, and an upsert through `modify.rs`, `$setOnInsert` included;
+//!   insert, and an upsert through `modify.rs`, `$setOnInsert` included, once
+//!   the id is known not to be a duplicate (a duplicate creates nothing and is
+//!   `DuplicateKey`, as for any id);
 //! - `replace_in_txn` (`docs.rs`) when the replace **creates** the row (a
 //!   replace of an existing document keeps the stored `_id`, creates nothing,
 //!   and is never refused);
-//! - `create_index_inner` (`index.rs`) for [`crate::index::CreateOrigin::Local`]
-//!   only.
+//! - `create_index_inner` (`index.rs`), for a [`crate::index::CreateOrigin::Local`]
+//!   create that mints a definition: a new one, or the re-stamp of an identical
+//!   one inherited from an earlier life of the collection. An identical
+//!   definition already standing here is the idempotent no-op it is for any
+//!   index, and a different one under the name is `IndexExists`.
 //!
 //! The test is the **BSON type of the `_id` the row would store**, not the
 //! `DocId` variant: an integral decimal in `i64` range is a `DocId::Int64`
