@@ -558,6 +558,26 @@ mod tests {
         assert!(matches!(again.get("v"), Some(Bson::Decimal128(_))));
     }
 
+    /// A JSON number becomes the double it denotes, to the last bit: the edge
+    /// relies on `serde_json`'s `float_roundtrip` feature, declared in the
+    /// workspace. This crate's own tests get the feature from `jsonschema`
+    /// too, so they cannot see the declaration go; `kimmyd/tests/json_floats.rs`
+    /// can, and holds the same cases.
+    #[test]
+    fn a_json_number_is_the_double_it_denotes_to_the_last_bit() {
+        for (text, bits) in [
+            ("2.2250738585072011e-308", 0x000f_ffff_ffff_ffff_u64),
+            ("1.00000000000000011102230246251565404236316680908203125", 0x3ff0_0000_0000_0000),
+            ("1.2345678901234567e-300", 0x01aa_74fe_1c1e_8908),
+        ] {
+            let value: Value = serde_json::from_str(text).unwrap();
+            match json_to_bson(&value).unwrap() {
+                Bson::Double(v) => assert_eq!(v.to_bits(), bits, "{text}"),
+                other => panic!("{text}: {other:?}"),
+            }
+        }
+    }
+
     #[test]
     fn non_finite_doubles_do_not_become_null() {
         // JSON has no NaN; emitting null would turn a number into a missing

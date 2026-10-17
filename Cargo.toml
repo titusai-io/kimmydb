@@ -89,7 +89,15 @@ serde = { version = "1", features = ["derive"] }
 # was throwing the order away (ADR-120). An index definition is compared by the
 # same encoding, so without it two partial filters differing only in a nested
 # key order would read as one definition (ADR-182).
-serde_json = { version = "1", features = ["preserve_order"] }
+#
+# `float_roundtrip` is load-bearing too: without it a JSON number is parsed by a
+# fast path that is one unit in the last place off for about a third of long or
+# extreme inputs (`2.2250738585072011e-308` becomes the smallest normal double
+# instead of the largest subnormal), so a client's double was stored as a
+# different double. It used to arrive only through `jsonschema`, a
+# dev-dependency, which turned it on for `kimmy-api`'s tests and not for the
+# shipped `kimmyd`. `kimmyd/tests/json_floats.rs` holds both to it.
+serde_json = { version = "1", features = ["preserve_order", "float_roundtrip"] }
 # Encodes a `Vec<u8>` as BSON binary rather than as an array of int32s, which is
 # what serde does by default and what made every replicated document twelve times
 # its own size on the wire. Pure Rust, and already in the tree under `bson`.
