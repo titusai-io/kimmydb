@@ -28219,7 +28219,7 @@ The grouping identity is `keyenc`, which is exact, so `$group`, `$addToSet`, the
 1. The ensure-tables commit, with the tombstone horizon's reset.
 2. The refusals that write nothing: unparseable partial filters, and the free-space preflight.
 3. `raise(5)`: the sidecar records schema 5, written by this build.
-4. The first migration commit. It writes schema 5 into `META`, deletes the 3 to 4 markers, carries their unreported collisions, and creates the staging table, the collision table and every marker, all in one transaction.
+4. The first migration commit. It writes schema 5 into `META`, deletes the 3 to 4 markers, carries their unreported collisions into a table of their own, and creates the staging table, the collision table and every marker, all in one transaction.
 
 A start refused at step 2 leaves a store 0.50 opens. The markers, not the version, mean unfinished: a store at schema 5 with markers resumes, and the last commit deletes them.
 
@@ -28233,24 +28233,37 @@ A strict decoder refuses a key no build wrote. It cannot tell a moved-back key f
 
 **Every non-vector index is drained, then refilled.** Old and new entries can be byte-identical for different values, so an index's range is emptied first. Each index moves through `pending`, `draining` (about 16 MiB of entries per commit, by key), `refilling` (the document cursor in each chunk's commit) and `done`.
 - One walk of a collection's documents refills all of its indexes. Each document is read and parsed once, which saves about a quarter of the refill at 500,000 documents with three indexes.
+- A refill chunk ends at 16 MiB of entries written, 8,192 documents walked or 250 ms of work, whichever comes first. Bounded by bytes alone, a partial index that selects few documents, or a run of tombstones, wrote nothing for as long as it lasted, and one chunk walked the whole collection (300,000 documents in one transaction, in the build review), with no stop looked for and no progress shown.
 - A unique index's collisions are found by looking each entry up in `INDEX_ENTRIES` as it is written, so a resumed run sees the entries of every earlier chunk. Each collision is recorded, in the commit of its chunk, as one row per `(collection, index, key)` of a table that outlives the last commit and is forgotten only after the engine has reported it. Every collision is reported, including a pair 0.50 never enforced: a partial unique index whose filter's path holds a decimal now decides it exactly.
 - `multikey` is raised, through a full `CollectionMeta` round trip, in the commit of the chunk that wrote the entry that needs it.
 - Nothing else of a definition moves: no `IndexMeta` field but `multikey`, no stamp (`created` in particular), no tombstone, no refusal hint and no oplog entry.
 
-**The 3 to 4 rebuild's unreported collisions are carried, then settled.** The first commit converts their holders to schema 5 keys while those keys are still exactly schema 4. The last commit, once every index is refilled under the final comparator, drops each carried row:
+**The 3 to 4 rebuild's unreported collisions are carried, then settled.** The first commit converts their holders to schema 5 keys while those keys are still exactly schema 4, and keeps the rows in a table of their own, `schema5_carried_collisions`. In the refill's table a carried row under a string key, whose bytes are the same in both schemas, was one row with the refill's row for the collision that stands now, and a holder the exact comparator had taken out of the index was reported with the others. The last commit, once every index is refilled under the final comparator, drops each carried row and deletes the table:
 - one whose holders a refill row of the same index includes, as the same collision found again under its new key;
 - one no refill row covers, as a state that no longer exists, named in one INFO line with its holders' `_id`s.
 
 A carried collision is therefore never reported itself. Carrying it guarantees that nothing it recorded is lost before the rebuild has looked again.
 
-**TTL.** Before draining a TTL partial index, the migration counts the documents holding a `Decimal128` at a filter path whose selection changes. The "before" is the previous build's undecidable run; the "after" is the exact filter. It logs one line per TTL index: `now_selected` (they expire once due) and `now_not_selected`. A store from schema 3 never filed under ADR-185's rule, so its line says `before="not recorded"` rather than a count.
+**TTL.** Before draining a TTL partial index, the migration counts the documents holding a `Decimal128` at a filter path whose selection changes. The "before" is the previous build's undecidable run; the "after" is the exact filter. It logs one line per TTL partial index: `now_selected` (they expire once due) and `now_not_selected`. A store from schema 3 never filed under ADR-185's rule, so its line says `before="not recorded"` rather than a count. A TTL index without a partial filter is not counted and logs nothing: only a filter can decide a document differently. The count scans the whole collection, so it is a step of its own on `/readyz`, in `draining`, moving with every document scanned and ending at `done == total`.
 
-**The preflight asks for one of redb's growth steps, from the file's size, plus a working set.** In redb 4.3 a region holds 4 GiB. With `U` the file's usable bytes and `T = U mod 4 GiB`:
-- under one region, the file doubles: `U`;
-- past it, at worst the rest of the partial region and one more: `2 × 4 GiB − T`;
-- at a whole number of regions: one region.
+**The preflight asks for redb's next growth step, the bytes the migration stages, and a fixed margin.** Nothing in it is the file's size over its document count. The first preflight priced a chunk of 8,192 rows at the file over its documents and charged `2R − T` past one region, and the build review measured what that refused: a store with one empty collection asked 12,032 MiB, a store whose dropped collection had been purged 6,029,660 MiB, and two documents rewritten 20,000 times 1,506,989 MiB; every store of 4 to 10 GiB was refused on a 10 GiB volume. The requirement is now four terms:
+- **redb's next growth step** (`TransactionalMemory::grow`, `page_manager.rs` from line 2335 in redb 4.3). With `U` the file's usable bytes, `R` = 4 GiB a region, `T` the trailing region's usable bytes and `a` the largest single allocation the migration makes (a leaf for the largest document, or for an index entry derived from it at twice its bytes): under one region the file doubles, `max(U, 2a)`; past it redb fills out the trailing region, `R − T`, and adds one more region, `2R − T`, only when `2a ≥ R − T`; at a whole number of regions it adds one, `R`. A probe of redb 4.3 with 1 MiB values saw exactly these steps (6,673 to 8,192 MiB is `R − T`). The step is the file's length: ext4, XFS and APFS leave it unallocated until written (the probe saw a 4,096 MiB file with 2,594 MiB allocated);
+- **the documents re-keyed**: every row under a number key, documents and tombstones, at the leaf bytes a key-ordered staging table holds it in, once. At the end of a range's first phase the rows are in the file twice, the old pages freed and the staged ones written; the old pages are already in the file. Beside them, four chunks of 8,192 rows priced from the rows' own bytes;
+- **the index chunks in flight**: four chunks of 16 MiB, each up to twice its bytes in pages, so 128 MiB, or eight times what `INDEX_ENTRIES` holds if that is less. A drain frees what a refill reuses, so the rebuild holds a chunk's pages at a time, not an index's;
+- **a 64 MiB margin**, for branch pages, the allocator's state and the commits' metadata.
 
-On top of that comes four times the larger chunk's working set, estimated from the file's size over its documents. Measured at 2,000,000 documents on a laptop (APFS), the 2,411 MiB file reached 4,096 MiB during the migration, inside the 2,411 MiB bound, and returned to 2,415 MiB at close; on mars (ext4) the same store, at 2,944 MiB, did not grow at all. Too little room refuses the start with `StorageError::NotEnoughSpace`, which names the two figures; nothing of the migration is written.
+The documents' figure takes one read of `DOCS` before `raise(5)` (redb keeps no per-range figure, and its `TableStats` walks every page too); `INDEX_ENTRIES` is read only up to one chunk's bytes. The read moves `/readyz` (`migrating`, rows read) and looks for a stop every 4,096 rows. It cost 0.4 s on a 2,000,000-document store just written and 49 s on the acceptance store just copied, on a laptop busy with other builds. Measured on the real open path, release build, shipped chunk sizes:
+
+| Schema 4 store | File | Requires | Of which: growth, documents, index, margin |
+|---|---|---|---|
+| Empty | 68 KiB | 64.1 MiB | 64 KiB, 0, 0, 64 MiB |
+| One empty collection | 188 KiB | 64.2 MiB | 184 KiB, 0, 0, 64 MiB |
+| A dropped and purged collection of 60,000 documents | 92 MiB | 156 MiB | 92 MiB, 0, 0, 64 MiB |
+| Two documents rewritten 20,000 times | 52 MiB | 116 MiB | 52 MiB, 13 KiB, 0, 64 MiB |
+| Four documents of 16 KiB rewritten 2,500 times each (shaped like the lab's kimmy1 to kimmy3, mostly oplog) | 184 MiB | 248 MiB | 184 MiB, 320 KiB, 0, 64 MiB |
+| The 2,000,000-document acceptance store | 2,411 MiB | 3,487 MiB | 2,411, 884, 128 and 64 MiB |
+
+The acceptance store's figure was 2,539 MiB under the first preflight. On a 10 GiB volume, with the file's length set to each size and the fixture's few documents, a store of just under 4 GiB, and of 4, 5, 6, 7 and 7.875 GiB, now passes; one that ends on a region boundary at 8 GiB (redb adds a 4 GiB region, 2 GiB is left) and one of 9 GiB (the trailing region needs 3 GiB, 1 GiB is left) are refused, as redb would need that room. The documents' term comes on top of the step, so a store of that size made mostly of numeric-id documents needs their bytes free as well. Too little room refuses the start with `StorageError::NotEnoughSpace`, which names the two figures and the four terms; nothing of the migration is written. Measured at 2,000,000 documents on a laptop (APFS), the 2,411 MiB file reached 4,096 MiB during the migration and returned to 2,415 MiB at close; on mars (ext4) the same store, at 2,944 MiB, did not grow at all.
 
 **Every chunk commits durably.** On redb 4.3, chunks committed non-durably with a durable commit every two seconds made that durable commit take 4.4 to 9.5 s for 100,000 rows. The re-key took seven times as long, and the file doubled, since redb reuses a non-durable commit's freed pages only after a durable one. Durable, the file did not grow at 100,000 or 500,000 documents.
 
@@ -28291,17 +28304,19 @@ These figures are from a laptop's SSD, warm page cache, release build, every chu
 - a kill before every commit, with I-DOCS read from each kill, including between the last re-key chunk and the first move-back chunk, mid move-back, mid drain and mid refill;
 - the A2 pair;
 - 0.50 and 0.49 refused from `raise(5)`, with and without `kimmy.format`;
-- the preflight, and the growth formula against the measurement;
+- the preflight on the real open path, release build, shipped chunk sizes: an empty store, an empty collection, a dropped and purged collection, two documents churned 20,000 times, a store shaped like kimmy1 to kimmy3, synthetic 4 to 10 GiB files on a 10 GiB volume, and the 2,000,000-document store, each refused one byte short of its figure and migrated with exactly it; the requirement pinned at 8,192 rows and 16 MiB against 0, 2 and 2,000,000 rows; the growth step against redb's code and a probe of it;
 - a key no build wrote;
-- 3 to 4 markers, and carried collisions (found again, and dissolved);
+- 3 to 4 markers, and carried collisions (found again under a changed key and under the same bytes, dissolved, and one whose key bytes equal a refill row's, which keeps its dissolved holder out of the report); the carried table gone after the last commit, and the collision table forgotten after a report pass that reported nothing;
 - a collision recorded wherever the run is killed, with the colliding pair on both sides of the cursor;
 - the money-field collision;
 - a dropped collection's rows and its purge;
 - no definition, stamp, tombstone, oplog, count or digest moved;
 - the horizon reset landing before `raise(5)`;
-- a timed stop in each kind of chunk;
+- a timed stop in each kind of chunk, and inside a refill that writes nothing;
+- a refill over a partial index that selects nothing and over a run of tombstones, in chunks of at most the documents' bound, at the test's chunk sizes and at the shipped ones (in CI, release), and a refill chunk ended by its time bound;
 - `/readyz` moving with every chunk, in its own phase for every step, ending every step at `done == total` (a drain's total its index's entries, a partial index holding a handful of entries included), and the progress lines saying the same;
-- the TTL line, counted and not recorded;
+- the TTL line, counted and not recorded, and no count or line for a TTL index without a partial filter;
+- `SNAPSHOT_PROGRESS` kept as it is;
 - `I_EPOCH` and `check-store` mid-migration and after;
 - a 300,000-entry drain bounding the file's growth (in CI, release).
 
@@ -28313,7 +28328,14 @@ These figures are from a laptop's SSD, warm page cache, release build, every chu
 - the carried rows deleted in the first commit; the collision table forgotten before the report; the carried rows left in schema 4 form; a dissolved carried collision reported;
 - `multikey` raised late; the TTL count not logged; `created` re-stamped;
 - a TTL count made up for an index never filed under ADR-185's rule;
-- a drain not reported as its own step; a drain's total taken from the collection's documents rather than its index's entries; a step's estimated total not raised when `done` reaches it; the step-end total not finalized.
+- a drain not reported as its own step; a drain's total taken from the collection's documents rather than its index's entries; a step's estimated total not raised when `done` reaches it; the step-end total not finalized;
+- the requirement without its growth step, without the staged rows, without the index chunks, without its margin, or with the file-over-documents term put back; the growth step `2R − T` whenever a trailing region exists;
+- a refill chunk not ended on the documents it walked, or on the time it worked;
+- `SNAPSHOT_PROGRESS` cleared by the first commit;
+- carried rows written into the refill's collision table; a carried row found again settled as dissolved; the carried table kept after the last commit; the collision table forgotten only when something was reported;
+- a TTL index without a partial filter counted; the TTL count not moving `/readyz`.
+
+The table of rows and the tests that kill each is in the fragment `adr238-migration-rows.md`.
 
 The drain written with `retain_in` survives and is recorded as equivalent on redb 4.3.
 
