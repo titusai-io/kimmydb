@@ -554,7 +554,7 @@ negotiation for this.
 
 | Field | On | Meaning |
 |---|---|---|
-| `facts` | both | The sender's block about itself: whether it is catching up, which classes it yields (`yielding`), which of expiry and embeddings it has off, its TTL holder list, and, from 0.44.0, `class_state` and `class_cause` (per class: `ok`, `idle`, `suspect`, `stalled`, and why), `responsive` and `started_ms` (its process start, in its own clock). A block that does not decode is no block and is counted |
+| `facts` | both | The sender's block about itself: whether it is catching up, which classes it yields (`yielding`), which of expiry and embeddings it has off, its TTL holder list, and, from 0.44.0, `class_state` and `class_cause` (per class: `ok`, `idle`, `suspect`, `stalled`, and why), `responsive` and `started_ms` (its process start, in its own clock), and, from 0.51.0, `vector_chunk_ids` (the vector chunk-id format it writes, `2`; ADR-239). A block that does not decode is no block and is counted |
 | `facts_gen` | both | The generation of the sender's block: a counter per process, an `Int64`, that rises each time the block changes. A receiver never replaces a held block with a lower generation from the same process, so a late-decoded older frame cannot undo a newer one |
 | `echo` | both | `{ boot, generation }`: the **other** side's block as the sender holds it. On `AskVersions` it is the server's block as the requester holds it; on `Vectors` it is the requester's block as the server holds it after recording the request's, which it does before it replies. A sender that holds nothing of the other side sends an empty `boot` and generation 0 |
 
