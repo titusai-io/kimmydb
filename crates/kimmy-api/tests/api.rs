@@ -12948,6 +12948,65 @@ async fn a_decimal128_filter_operand_is_compared_by_its_exact_value() {
 }
 
 #[tokio::test]
+async fn sum_and_avg_over_a_decimal128_answer_400_where_they_skipped_it() {
+    // `$sum` and `$avg` used to skip a `Decimal128` as they skip a string, so
+    // over 1, 2.5 (a decimal) and 2 a report read a total of 3 and a mean of
+    // 1.5, where the values add up to 5.5. Decimal arithmetic is not built, so
+    // the pipeline is refused, `400`, in the words `$add` refuses one with.
+    let server = Server::start().await;
+    let token = server.root().await;
+    server.post("/v1/db/shop/collections", Some(&token), json!({ "name": "s" })).await;
+    for (id, v) in [(1, json!(1)), (2, dec("2.5")), (3, json!(2))] {
+        let res = server
+            .post("/v1/db/shop/coll/s/docs", Some(&token), json!({ "_id": id, "v": v }))
+            .await;
+        assert_eq!(res.status, 200, "{:?}", res.body);
+    }
+    let aggregate = |pipeline: Value| {
+        let server = &server;
+        let token = &token;
+        async move {
+            server
+                .post("/v1/db/shop/coll/s/aggregate", Some(token), json!({ "pipeline": pipeline }))
+                .await
+        }
+    };
+    for op in ["$sum", "$avg"] {
+        let res = aggregate(json!([{ "$group": { "_id": null, "r": { op: "$v" } } }])).await;
+        assert_eq!(res.status, 400, "{op}: {:?}", res.body);
+        assert_eq!(res.body["error"], "bad_request", "{op}");
+        assert_eq!(
+            res.body["message"],
+            format!("invalid query: {op} needs numbers, found a Decimal128"),
+            "{op}"
+        );
+    }
+    let add = aggregate(json!([{ "$project": { "r": { "$add": ["$v", 1] } } }])).await;
+    assert_eq!(add.status, 400, "{:?}", add.body);
+    assert_eq!(add.body["message"], "invalid query: $add needs numbers, found a Decimal128");
+
+    // Counting, and the accumulators that do no arithmetic, are unaffected.
+    let res = aggregate(json!([{ "$group": {
+        "_id": null, "n": { "$sum": 1 }, "hi": { "$max": "$v" }, "all": { "$push": "$v" }
+    } }]))
+    .await;
+    assert_eq!(res.status, 200, "{:?}", res.body);
+    let got = &res.body["documents"][0];
+    assert_eq!(got["n"], 3);
+    assert_eq!(got["hi"], dec("2.5"));
+    assert_eq!(got["all"], json!([1, dec("2.5"), 2]));
+    // Without the decimal, the total is what it was.
+    let res = aggregate(json!([
+        { "$match": { "v": { "$type": ["int", "long", "double"] } } },
+        { "$group": { "_id": null, "t": { "$sum": "$v" }, "m": { "$avg": "$v" } } }
+    ]))
+    .await;
+    assert_eq!(res.status, 200, "{:?}", res.body);
+    assert_eq!(res.body["documents"][0]["t"], 3);
+    assert_eq!(res.body["documents"][0]["m"], 1.5);
+}
+
+#[tokio::test]
 async fn aggregation_groups_joins_and_ranks_a_decimal128_by_its_value() {
     // Design 2.2: `$group`, `$addToSet` and the `$lookup` join keys identify
     // equal numbers and decimals as one member, a bucket's `_id` the first

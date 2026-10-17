@@ -357,6 +357,42 @@ for a double is chosen. (It was to go "when the canonical order can place one";
 
 ---
 
+## 🟡 Arithmetic on a `Decimal128` is refused, where MongoDB computes it
+
+**Raised 2026-10-16, with 0.51.0, which gives a `Decimal128` its exact place in
+the order; ruled the same day: refused, not skipped.** A decimal is compared,
+grouped, sorted and indexed by its exact value, but nothing here adds,
+multiplies or divides one: decimal arithmetic needs its own rounding rules and
+is a later design. Until it is built, every operation that would do arithmetic
+on a decimal refuses it, `400`, rather than leave it out of the answer:
+
+- **The expression operators** `$add`, `$subtract`, `$multiply`, `$divide` and
+  `$mod`: `$add needs numbers, found a Decimal128`, as ever.
+- **The `$sum` and `$avg` accumulators of `$group`**, in the same words:
+  `$sum needs numbers, found a Decimal128`. **Changed in 0.51.0:** they used to
+  skip a decimal as they skip a string, so over `1`, `Decimal128("2.5")` and
+  `2` a report read a total of `3` and a mean of `1.5`, where the values add up
+  to `5.5`. The operand itself is what counts: an array or a document holding a
+  decimal is ignored by both, as any array or document is, because they never
+  read inside one (MongoDB's `$group` does not either). `$sum: 1` counts as ever.
+  `$sum` and `$avg` are not expression operators here, so there is no `$project`
+  form to refuse a decimal in.
+- **The update operators `$inc` and `$mul`**: a decimal operand is refused at
+  parse (`$inc requires a number`) and a stored decimal when the update applies
+  (`cannot apply arithmetic to non-numeric field "v"`).
+- **`$convert` to `decimal` and `$toDecimal`** are refused for a related reason,
+  the rounding rule a double needs (the entry above).
+
+A filter's `$mod` refuses a decimal operand at parse; against a stored decimal
+it does not match, the answer it gives any value it cannot divide, since a
+filter answers per document rather than failing the request.
+
+**To close:** decimal arithmetic, with the rounding rules MongoDB's `Decimal128`
+follows, as its own design. Until then a refusal is the honest answer: a total
+that leaves a number out is wrong and says nothing.
+
+---
+
 ## 🟡 The `$` positional operator is not implemented; `$[<identifier>]` and `$[]` are
 
 **Raised 2026-08-30, with ADR-104.** MongoDB has three ways to address array
