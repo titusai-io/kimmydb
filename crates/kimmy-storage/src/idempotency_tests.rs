@@ -645,6 +645,45 @@ fn a_keyed_find_and_modify_records_its_answer() {
     assert_eq!(record(&engine, &coll, &k3), None);
 }
 
+/// The upserted `_id` a record keeps is the stored body's own value, never the
+/// `DocId` rendered back: an `Int32` the seed carried stays an `Int32`.
+#[test]
+fn a_keyed_upsert_records_the_stored_id_value() {
+    struct Seeded;
+    impl ModifySpec for Seeded {
+        fn matches(&self, _: &Document) -> kimmy_core::Result<bool> {
+            Ok(false)
+        }
+        fn compare(&self, _: &Document, _: &Document) -> Ordering {
+            Ordering::Equal
+        }
+        fn apply(&self, doc: &Document) -> std::result::Result<Option<Document>, String> {
+            Ok(Some(doc.clone()))
+        }
+        fn upsert(&self) -> Option<std::result::Result<Document, String>> {
+            Some(Ok(doc! { "_id": 5i32, "v": 1 }))
+        }
+    }
+    let (engine, coll, _dir, _path) = open();
+    let k = keyed(93);
+    let first = fresh(
+        engine
+            .find_and_modify_keyed(&coll, &Candidates::Scan, &Seeded, &k, ReturnedImage::Before)
+            .unwrap(),
+    );
+    assert_eq!(first.upserted, Some(DocId::Int64(5)), "premise: the DocId is an Int64");
+    let again = replayed(
+        engine
+            .find_and_modify_keyed(&coll, &Candidates::Scan, &Seeded, &k, ReturnedImage::Before)
+            .unwrap(),
+    );
+    let RecordOutcome::FindAndModify { upserted_id, document, .. } = again.outcome else {
+        panic!("a find_and_modify record");
+    };
+    assert_eq!(upserted_id, Some(Bson::Int32(5)));
+    assert_eq!(document, None, "the image before an upsert is none");
+}
+
 /// A request that changed nothing is not remembered: a retry is evaluated
 /// again, and a refusal leaves no record.
 #[test]
@@ -722,6 +761,62 @@ fn a_record_of_an_earlier_life_is_never_replayed() {
     let stored = record(&engine, &again, &k).unwrap();
     assert_eq!(stored.first, second, "replaced, not merged with the earlier life's");
     assert_eq!(count(&engine, &again), 1);
+}
+
+/// A record is judged by its `last`: a drop whose stamp falls between two
+/// chunks of one request keeps the later chunks' documents (ADR-231, ADR-236),
+/// and so their record. Judged by `first`, a retry would write them again.
+#[test]
+fn a_record_is_judged_by_its_last() {
+    let (engine, _coll, _dir, _path) = open();
+    engine.drop_collection("shop", "orders").unwrap();
+    let again = engine.create_collection("shop", "orders").unwrap();
+    let floor = again.incarnation_floor.expect("a life after a drop has a floor");
+    let k = keyed(91);
+    let r = IdempotencyRecord {
+        fingerprint: k.fingerprint,
+        first: Stamp::new(Hlc::new(floor.wall_ms - 10, 0), engine.node_id()),
+        last: Stamp::new(Hlc::new(floor.wall_ms + 10_000, 0), engine.node_id()),
+        origin: engine.node_id(),
+        state: RecordState::Done,
+        outcome: RecordOutcome::Modify(ModifyRecorded { matched: 2, ..Default::default() }),
+    };
+    {
+        let txn = engine.begin_write(crate::WriterHolder::Replication).unwrap();
+        let stored = engine
+            .store_record(&txn, &mut Default::default(), Some(&again), again.id, &k.scope, &r, None)
+            .unwrap();
+        assert!(stored.is_some(), "not history: its last is above the floor");
+        txn.commit().unwrap();
+    }
+    counters(&engine, &again, 2);
+    let replay =
+        replayed(engine.modify_where_keyed(&again, &Candidates::Scan, &Inc, None, &k).unwrap());
+    assert_eq!(replay.first, r.first);
+    assert_eq!(ns(&engine, &again, 2), vec![0, 0], "nothing written again");
+}
+
+/// A record's `last` is the stamp of the first entry its transaction wrote,
+/// for a chunk of several documents as for a bulk: where a sender looks for it.
+#[test]
+fn a_chunks_record_is_at_its_first_entry() {
+    let (engine, coll, _dir, _path) = open();
+    counters(&engine, &coll, 3);
+    engine.set_multi_chunk_docs(10);
+    let k = keyed(92);
+    let out = fresh(engine.modify_where_keyed(&coll, &Candidates::Scan, &Inc, None, &k).unwrap());
+    assert_eq!(out.commits, 1);
+    let written: Vec<Stamp> = engine
+        .read_oplog_from(Hlc::ZERO, 100, WalkScope::Request)
+        .unwrap()
+        .iter()
+        .filter(|e| e.kind == kimmy_core::OpKind::Replace)
+        .map(|e| e.stamp)
+        .collect();
+    assert_eq!(written.len(), 3);
+    let stored = record(&engine, &coll, &k).unwrap();
+    assert_eq!((stored.first, stored.last), (written[0], written[0]));
+    assert_eq!(rows(&engine).iter().map(|(s, ..)| *s).collect::<Vec<_>>(), vec![written[0]]);
 }
 
 /// A record is absent on lookup once its `last` is past the window, at
@@ -1120,6 +1215,10 @@ fn a_duplicate_while_a_multi_chunk_request_runs_is_in_flight() {
 fn a_resume_of_another_members_attempt_writes_each_document_once() {
     let (a, ca, _da, _) = open();
     let (b, cb, _db, _) = open();
+    // A document B alone holds, keyed below every one A's attempt reached: a
+    // cursor from A would pass over it, and that attempt never saw it.
+    b.insert(&cb, doc! { "_id": -1i64, "n": 0i64 }).unwrap();
+    std::thread::sleep(std::time::Duration::from_millis(2));
     counters(&a, &ca, 3);
     // B holds the same three documents, as A's bulk replicated.
     for entry in a.read_oplog_from(Hlc::ZERO, 100, WalkScope::Request).unwrap() {
@@ -1167,6 +1266,8 @@ fn a_resume_of_another_members_attempt_writes_each_document_once() {
     assert!(out.resumed);
     assert_eq!(out.skipped, 1, "A's write, left");
     assert_eq!(ns(&b, &cb, 3), vec![1, 1, 1], "each once");
+    let below = b.get(&cb, &DocId::Int64(-1)).unwrap().unwrap();
+    assert_eq!(below.get_i64("n").unwrap(), 1, "from the beginning, not from A's cursor");
     let merged = b.idempotency_record(cb.id, &k.scope).unwrap().unwrap();
     assert_eq!(merged.first, record.first, "the merged first is A's");
     assert_eq!(merged.origin, b.node_id());

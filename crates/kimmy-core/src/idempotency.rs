@@ -356,6 +356,9 @@ mod tests {
     #[test]
     fn the_raw_form_holds_the_same_rule_and_reaches_the_same_scope() {
         assert_eq!(IdempotencyKey::from_raw("short"), Err(KeyError::Length { found: 5 }));
+        assert_eq!(IdempotencyKey::from_raw(&"a".repeat(15)), Err(KeyError::Length { found: 15 }));
+        assert!(IdempotencyKey::from_raw(&"a".repeat(16)).is_ok());
+        assert!(IdempotencyKey::from_raw(&"a".repeat(255)).is_ok());
         assert_eq!(
             IdempotencyKey::from_raw(&"a".repeat(256)),
             Err(KeyError::Length { found: 256 })
