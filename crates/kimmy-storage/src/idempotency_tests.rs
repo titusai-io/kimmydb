@@ -817,6 +817,39 @@ fn a_chunks_record_is_at_its_first_entry() {
     let stored = record(&engine, &coll, &k).unwrap();
     assert_eq!((stored.first, stored.last), (written[0], written[0]));
     assert_eq!(rows(&engine).iter().map(|(s, ..)| *s).collect::<Vec<_>>(), vec![written[0]]);
+    // A chunk that found fewer than its budget ends the request: done, in its
+    // own commit, and a retry replays it rather than resuming it.
+    assert_eq!(stored.state, RecordState::Done);
+    let commits = engine.commits();
+    let again =
+        replayed(engine.modify_where_keyed(&coll, &Candidates::Scan, &Inc, None, &k).unwrap());
+    assert_eq!(again, stored);
+    assert_eq!(engine.commits(), commits);
+    assert_eq!(ns(&engine, &coll, 3), vec![1, 1, 1]);
+}
+
+/// The single-document form of a keyed update or delete by filter is one
+/// transaction: its record is done when it commits, and a retry replays it,
+/// with the stamp the single form reports.
+#[test]
+fn a_single_document_keyed_update_replays() {
+    let (engine, coll, _dir, _path) = open();
+    counters(&engine, &coll, 2);
+    let k = keyed(94);
+    let out =
+        fresh(engine.modify_where_keyed(&coll, &Candidates::Scan, &Inc, Some(1), &k).unwrap());
+    assert_eq!((out.matched, out.modified, out.commits), (1, 1, 1));
+    let stored = record(&engine, &coll, &k).unwrap();
+    assert_eq!(stored.state, RecordState::Done);
+    assert_eq!(modify(&stored).stamp, out.stamp);
+    let again =
+        replayed(engine.modify_where_keyed(&coll, &Candidates::Scan, &Inc, Some(1), &k).unwrap());
+    assert_eq!(again, stored);
+    assert_eq!(ns(&engine, &coll, 2), vec![1, 0], "one document, once");
+    let k2 = keyed(95);
+    fresh(engine.modify_where_keyed(&coll, &Candidates::Scan, &Remove, Some(1), &k2).unwrap());
+    replayed(engine.modify_where_keyed(&coll, &Candidates::Scan, &Remove, Some(1), &k2).unwrap());
+    assert_eq!(count(&engine, &coll), 1, "one deleted, once");
 }
 
 /// A record is absent on lookup once its `last` is past the window, at
