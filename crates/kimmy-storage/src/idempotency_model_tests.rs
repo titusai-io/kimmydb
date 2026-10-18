@@ -3757,13 +3757,13 @@ fn row_r2_a_record_taken_by_frame_rides_the_next_page_its_member_serves() {
     );
 }
 
-/// R2 across a restart: B's last change-log key is stamped ahead of its oplog and its
-/// rows (its clock moved forward, then it took a record by page), and that key is the
-/// base of C's next page. B restarts between C's pages and takes a write by frame
-/// stamped behind that key; its clock must resume above the log's keys, or the change's
-/// key falls below the base and the record misses the page that brings its effect.
+/// R2 across a restart: B, its clock moved forward before it took a record by page,
+/// serves C a scoped pull, restarts between C's pages, and takes a write stamped behind
+/// that clock by frame; the record must ride the page that brings its effect. (Where
+/// the clock resumes is pinned by `the_clock_resumes_above_the_change_logs_keys_after_a_restart`:
+/// this row's other stamps at B's moved clock keep it above the base without the log.)
 #[test]
-fn row_r2_a_restart_resumes_above_the_change_logs_keys() {
+fn row_r2_a_restart_between_the_pages_a_member_serves() {
     row(
         "r2-clock",
         3,
