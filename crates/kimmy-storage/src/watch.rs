@@ -1092,6 +1092,13 @@ pub struct OplogWindow {
     /// one was kept, withheld, or passed over (ADR-194). `None` for a window
     /// that filled or reached the end.
     pub passed_through: Option<Stamp>,
+    /// The idempotency records the window's entries carry (B5): for each
+    /// entry with a row in `IDEMPOTENCY_BY_STAMP`, its record as it stands,
+    /// read in the read transaction that read the entries, so a record committed
+    /// with its entry is never missing from a window that holds the entry. Filled
+    /// by the peer windows (`Engine::entries_for_peer` and its forms); empty for
+    /// every other read.
+    pub records: Vec<crate::idempotency::CarriedRecord>,
 }
 
 /// How much of the oplog one served window may examine before it ends

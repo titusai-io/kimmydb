@@ -650,14 +650,60 @@ fn put_rows(
     Ok(())
 }
 
-/// A record a sender ships: its key, the stamp of the entry that carries it,
-/// and its bytes as stored.
-#[derive(Clone, Debug, PartialEq, Eq)]
+/// A record on the wire: its key, the stamp of the entry that carries it, and
+/// its bytes as stored (B5, "How a record travels").
+///
+/// The `records` of a frame (`Entries`, `ReplayEntries`, `Push`) and of a
+/// snapshot page are lists of these. The record's bytes are opaque to the
+/// transport, which passes them through: only [`IdempotencyRecord::decode`]
+/// reads them, on the member that stores them. They carry no document key a
+/// peer reads (a multi request's cursor inside is a stored key read back only on
+/// its origin), so the wire's legacy-key rule (Decimal128 design 7.1) has
+/// nothing to convert here. `carrying` is absent on a snapshot page, whose
+/// records travel ahead of the collection's documents and not with an entry.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct CarriedRecord {
+    /// See `SnapshotCursor::collection` for why this is not a `u64`.
     pub collection: CollectionId,
+    #[serde(with = "scope_bytes")]
     pub scope: ScopeHash,
-    pub carrying: Stamp,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub carrying: Option<Stamp>,
+    #[serde(with = "serde_bytes")]
     pub record: Vec<u8>,
+}
+
+/// A scope hash on the wire: its 32 bytes as a BSON binary. Any other length
+/// fails the one record, never the frame (the frame's list is read leniently).
+mod scope_bytes {
+    use kimmy_core::ScopeHash;
+    use serde::{Deserialize, Deserializer, Serializer};
+
+    pub fn serialize<S: Serializer>(scope: &ScopeHash, serializer: S) -> Result<S::Ok, S::Error> {
+        serde_bytes::serialize(scope.as_bytes().as_slice(), serializer)
+    }
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(deserializer: D) -> Result<ScopeHash, D::Error> {
+        let bytes: serde_bytes::ByteBuf = Deserialize::deserialize(deserializer)?;
+        ScopeHash::from_slice(&bytes)
+            .ok_or_else(|| serde::de::Error::custom("a scope hash is 32 bytes"))
+    }
+}
+
+/// A frame's or a page's `records`, read leniently: a list that does not decode
+/// is none, and an element that does not decode is dropped, so a field of
+/// another shape costs the records and never the frame. A record whose own bytes
+/// do not decode is dropped later, by the member storing it, and counted
+/// (`kimmy_idempotency_records_undecodable_total`).
+pub fn lenient_records<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> std::result::Result<Vec<CarriedRecord>, D::Error> {
+    use serde::Deserialize;
+    let raw = Option::<bson::Bson>::deserialize(deserializer)?;
+    let Some(bson::Bson::Array(items)) = raw else {
+        return Ok(Vec::new());
+    };
+    Ok(items.into_iter().filter_map(|item| bson::deserialize_from_bson(item).ok()).collect())
 }
 
 /// The records that ride with the entries stamped `stamps`, read in the read
@@ -675,7 +721,7 @@ pub fn records_at_stamps(txn: &ReadTransaction, stamps: &[Stamp]) -> Result<Vec<
             out.push(CarriedRecord {
                 collection,
                 scope,
-                carrying: *stamp,
+                carrying: Some(*stamp),
                 record: record.value().to_vec(),
             });
         }
@@ -708,7 +754,7 @@ pub fn records_for_window(
             out.push(CarriedRecord {
                 collection,
                 scope,
-                carrying,
+                carrying: Some(carrying),
                 record: record.value().to_vec(),
             });
         }
@@ -757,6 +803,10 @@ pub(crate) struct IdempotencyState {
     window_secs: AtomicU64,
     /// Records retention removed, since start.
     collected: AtomicU64,
+    /// Records stored from peers, since start, by [`RecordsVia`].
+    received: [AtomicU64; RecordsVia::ALL.len()],
+    /// Records a peer sent that this build could not decode, since start.
+    undecodable: AtomicU64,
     /// The wall clock the life rule reads, set by a test that moves time; 0 is
     /// the real one.
     #[cfg(any(test, feature = "test-hooks"))]
@@ -769,9 +819,206 @@ impl Default for IdempotencyState {
             in_flight: Default::default(),
             window_secs: AtomicU64::new(DEFAULT_WINDOW_SECS),
             collected: AtomicU64::new(0),
+            received: Default::default(),
+            undecodable: AtomicU64::new(0),
             #[cfg(any(test, feature = "test-hooks"))]
             now_ms: AtomicU64::new(0),
         }
+    }
+}
+
+/// How a record reached this member from a peer: the label of
+/// `kimmy_idempotency_records_received_total{via}`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RecordsVia {
+    /// A window this member pulled.
+    Pull,
+    /// A window a peer pushed (ADR-140).
+    Push,
+    /// The replay of this member's own origin (ADR-212).
+    Replay,
+    /// A page of a whole-database snapshot.
+    Snapshot,
+    /// A page of a scoped repair: a count repair's snapshot, or a converge page.
+    Repair,
+}
+
+impl RecordsVia {
+    /// Every way, in the order of [`Engine::idempotency_records_received`] and of
+    /// the API's `RECORDS_RECEIVED_VIA`.
+    pub const ALL: [Self; 5] = [Self::Pull, Self::Push, Self::Replay, Self::Snapshot, Self::Repair];
+
+    /// The metric label.
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Pull => "pull",
+            Self::Push => "push",
+            Self::Replay => "replay",
+            Self::Snapshot => "snapshot",
+            Self::Repair => "repair",
+        }
+    }
+
+    const fn slot(self) -> usize {
+        self as usize
+    }
+}
+
+/// A frame's records, decoded once for the batch that applies its entries, and
+/// each stored at most once: in the run that takes the first entry of its
+/// collection (B5, "On the receiving side").
+pub(crate) struct FrameRecords {
+    via: RecordsVia,
+    /// `(collection, scope, carrying stamp, record, stored yet)`.
+    records: Vec<(CollectionId, ScopeHash, Option<Stamp>, IdempotencyRecord, bool)>,
+}
+
+impl FrameRecords {
+    /// None: an unkeyed frame, or one from a sender that carries no records.
+    pub(crate) fn none() -> Self {
+        Self { via: RecordsVia::Pull, records: Vec::new() }
+    }
+
+    /// Whether any of the frame's records is of collection `id` and not stored
+    /// yet.
+    pub(crate) fn owes(&self, id: CollectionId) -> bool {
+        self.records.iter().any(|(collection, _, _, _, stored)| *collection == id && !stored)
+    }
+}
+
+impl Engine {
+    /// Decode a frame's records, dropping and counting those this build cannot
+    /// read: a newer format is skipped, never fatal to what carries it.
+    pub(crate) fn frame_records(&self, carried: &[CarriedRecord], via: RecordsVia) -> FrameRecords {
+        let mut records = Vec::with_capacity(carried.len());
+        for wire in carried {
+            match IdempotencyRecord::decode(&wire.record) {
+                Ok(Some(record)) => {
+                    records.push((wire.collection, wire.scope, wire.carrying, record, false))
+                }
+                Ok(None) | Err(_) => {
+                    self.idempotency.undecodable.fetch_add(1, Ordering::Relaxed);
+                }
+            }
+        }
+        FrameRecords { via, records }
+    }
+
+    /// Store, in the run's transaction, every record of the frame for the
+    /// collection `id` that is not stored yet: called when the run takes (applies
+    /// or supersedes) an entry of that collection, on both outcomes of the
+    /// merge. Each through [`Self::store_record`]: refused if history by the life
+    /// rule, merged with the live record, rows at the merged `last` and at the
+    /// carrying stamp, its stamps witnessed. Marked stored either way, so a later
+    /// entry of the collection asks nothing again. Returns how many were stored.
+    pub(crate) fn store_frame_records(
+        &self,
+        txn: &WriteTxn<'_>,
+        memo: &mut Memo,
+        standing: Option<&CollectionMeta>,
+        id: CollectionId,
+        frame: &mut FrameRecords,
+    ) -> Result<usize> {
+        let mut stored = 0usize;
+        for (collection, scope, carrying, record, done) in &mut frame.records {
+            if *collection != id || *done {
+                continue;
+            }
+            if self.store_record(txn, memo, standing, id, scope, record, *carrying)?.is_some() {
+                stored += 1;
+            }
+            *done = true;
+        }
+        Ok(stored)
+    }
+
+    /// Whether any of the frame's records of collection `id` not stored yet is
+    /// not history by the life rule: what makes an entry judged history worth a
+    /// transaction for the frame's records.
+    pub(crate) fn frame_holds_a_live_record(
+        &self,
+        memo: &mut Memo,
+        standing: Option<&CollectionMeta>,
+        id: CollectionId,
+        frame: &FrameRecords,
+    ) -> Result<bool> {
+        for (collection, _, _, record, stored) in &frame.records {
+            if *collection == id
+                && !stored
+                && !self.record_is_history(memo, standing, id, record)?
+            {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
+    /// Store a snapshot or converge page's records in the page's transaction
+    /// (B5, "Snapshots carry records"): each of a collection that stands here,
+    /// through [`Self::store_record`] with no carrying stamp (its row at its own
+    /// `last`), refused if history by the life rule. A record of a collection
+    /// absent here is not stored, as the page's documents of it are not. Those
+    /// this build cannot decode are dropped and counted. Returns how many it
+    /// stored, to count once the page's transaction commits.
+    pub(crate) fn store_page_records(
+        &self,
+        txn: &WriteTxn<'_>,
+        memo: &mut Memo,
+        records: &[CarriedRecord],
+    ) -> Result<usize> {
+        let mut stored = 0usize;
+        for wire in records {
+            let record = match IdempotencyRecord::decode(&wire.record) {
+                Ok(Some(record)) => record,
+                Ok(None) | Err(_) => {
+                    self.idempotency.undecodable.fetch_add(1, Ordering::Relaxed);
+                    continue;
+                }
+            };
+            let Some(standing) = self.memo_collection(memo, wire.collection)? else {
+                continue;
+            };
+            if self
+                .store_record(
+                    txn,
+                    memo,
+                    Some(&standing),
+                    wire.collection,
+                    &wire.scope,
+                    &record,
+                    None,
+                )?
+                .is_some()
+            {
+                stored += 1;
+            }
+        }
+        Ok(stored)
+    }
+
+    /// Count `n` records stored from peers by `via`, once the transaction that
+    /// stored them has committed.
+    pub(crate) fn count_records_received(&self, via: RecordsVia, n: usize) {
+        if n > 0 {
+            self.idempotency.received[via.slot()].fetch_add(n as u64, Ordering::Relaxed);
+        }
+    }
+
+    /// The frame's way.
+    pub(crate) fn frame_via(frame: &FrameRecords) -> RecordsVia {
+        frame.via
+    }
+
+    /// Records stored from peers since start, by [`RecordsVia::ALL`]: pull,
+    /// push, replay, snapshot, repair (`kimmy_idempotency_records_received_total`).
+    pub fn idempotency_records_received(&self) -> [u64; RecordsVia::ALL.len()] {
+        std::array::from_fn(|slot| self.idempotency.received[slot].load(Ordering::Relaxed))
+    }
+
+    /// Records a peer sent that this build could not decode, and dropped
+    /// (`kimmy_idempotency_records_undecodable_total`).
+    pub fn idempotency_records_undecodable(&self) -> u64 {
+        self.idempotency.undecodable.load(Ordering::Relaxed)
     }
 }
 
@@ -1108,8 +1355,12 @@ impl Engine {
     ///
     /// At or below, and not only at: a record whose `last` is below a row's
     /// stamp that is below the cutoff is past its window, and its own row at
-    /// `last` is the only other thing that removes it. A stop ends the read of
-    /// the next chunk with its error, between two chunks.
+    /// `last` is the only other thing that removes it. A record this build
+    /// cannot decode has no `last` to age by: it goes with the first of its rows
+    /// to expire, which is at least one window after its first commit. It was
+    /// absent to every lookup here all along, so that costs only a newer build
+    /// rolled forward to, and a rollback already reopens that gap. A stop ends
+    /// the read of the next chunk with its error, between two chunks.
     pub(crate) fn collect_idempotency_records(&self, cutoff: Hlc) -> Result<usize> {
         use redb::ReadableDatabase;
         let bound = codec::oplog_key_lower_bound(cutoff);
@@ -1165,9 +1416,12 @@ impl Engine {
                 let stale = match records.get(record_key)? {
                     Some(raw) => match IdempotencyRecord::decode(raw.value()) {
                         Ok(Some(record)) => record.last <= stamp,
-                        // Not this build's to judge: kept, as unreadable data
-                        // is everywhere here, and only its row goes.
-                        Ok(None) | Err(_) => false,
+                        // A record this build cannot read (a newer format, or
+                        // damage) has no `last` it can age by, and is absent to
+                        // every lookup and overwritten by every store here. It
+                        // goes with the first of its rows to expire: kept past
+                        // that, nothing would ever find it again.
+                        Ok(None) | Err(_) => true,
                     },
                     None => false,
                 };

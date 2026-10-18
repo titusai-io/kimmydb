@@ -187,6 +187,34 @@ pub struct SnapshotCursor {
     /// Encoded document key, in the legacy (schema-4) form on the wire (module
     /// docs); the next page starts strictly after it.
     pub after_key: Vec<u8>,
+    /// Where the collection's **records phase** stands (B5, "Snapshots carry
+    /// records"): `Some` while the sender is sending `collection`'s idempotency
+    /// records, ahead of its documents, `after_key` then empty. The bytes are the
+    /// last scope hash sent, or empty to begin with the collection's first record.
+    /// `None` for the documents phase, as every cursor was before.
+    ///
+    /// Optional on the wire and read leniently: an older receiver drops it and
+    /// echoes `{collection, after_key}`, so its sender goes straight to the
+    /// collection's documents, losing only records that receiver could not use;
+    /// an older sender writes none. A scope hash, never a key.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "lenient_records_at"
+    )]
+    pub records: Option<Vec<u8>>,
+}
+
+/// A cursor's records position, read leniently: a binary is the position, and
+/// anything else is none, the documents phase.
+fn lenient_records_at<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> std::result::Result<Option<Vec<u8>>, D::Error> {
+    let raw = Option::<bson::Bson>::deserialize(deserializer)?;
+    Ok(match raw {
+        Some(bson::Bson::Binary(binary)) => Some(binary.bytes),
+        _ => None,
+    })
 }
 
 /// `collection/hex-key`, for a log line that says where a snapshot stands.
@@ -567,6 +595,22 @@ pub struct SnapshotPage {
     /// it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tombstone_horizon: Option<Hlc>,
+    /// The idempotency records of the page's collection (B5, "Snapshots carry
+    /// records"), sent **before** its documents: a page of up to
+    /// [`crate::idempotency::RECORD_PAGE`] of them opens each collection's part of
+    /// the snapshot, and a page never holds one collection's records after
+    /// another's documents. A member that takes a document by snapshot must not
+    /// take it without the record of the write that produced it, or a retry there
+    /// would apply on top of what the snapshot brought. Stored in the page's one
+    /// transaction, by the life rule. No carrying stamp: each is rowed at its own
+    /// `last`. Optional on the wire and read leniently: an older receiver ignores
+    /// them, and an older sender writes none.
+    #[serde(
+        default,
+        skip_serializing_if = "Vec::is_empty",
+        deserialize_with = "crate::idempotency::lenient_records"
+    )]
+    pub records: Vec<crate::idempotency::CarriedRecord>,
 }
 
 /// Where a snapshot pull stands on the receiver.
@@ -813,7 +857,7 @@ impl Engine {
             after_key: keyenc::stored_of_legacy(&cursor.after_key),
             ..cursor
         });
-        let (documents, mut deleted_documents, next) = self.snapshot_documents(after, scope)?;
+        let (records, documents, mut deleted_documents, next) = self.snapshot_rows(after, scope)?;
         for tombstone in &mut deleted_documents {
             tombstone.key = keyenc::legacy_of_stored(&tombstone.key).into_bytes();
         }
@@ -834,6 +878,7 @@ impl Engine {
             deleted_documents,
             dropped_indexes,
             tombstone_horizon,
+            records,
         })
     }
 
@@ -850,139 +895,204 @@ impl Engine {
         Ok(out)
     }
 
-    /// Read up to [`SNAPSHOT_PAGE`] records — live documents and tombstones
-    /// together — resuming after `cursor`.
+    /// One page's rows: a collection's idempotency records, then documents and
+    /// tombstones, resuming after `cursor` (its key in the stored form).
     ///
-    /// Walks the `docs` table in key order, which is `(collection, id)` — so a
-    /// single cursor covers every collection without needing to track which one
-    /// is in progress, and a scoped snapshot is the same walk bounded to one
-    /// collection's key range.
+    /// **Collection by collection, in id order**, each in two phases (B5):
+    /// first its records, up to [`crate::idempotency::RECORD_PAGE`] a page, then
+    /// its rows of `docs` in key order, which is `(collection, id)`, up to
+    /// [`SNAPSHOT_PAGE`] a page, live documents and tombstones together. A page
+    /// never holds one collection's records after another's documents: it ends at
+    /// the boundary into a collection that has records, and the cursor names that
+    /// collection's records phase. Into one with none, the walk goes on, so a
+    /// store written without keys pages exactly as before. A scoped snapshot is
+    /// the same walk over its one collection.
+    ///
+    /// Only the rows of a collection that stands, read in this walk's own
+    /// transaction: under an id with no collection over it lies what a drop left
+    /// for the drop purger (ADR-189), or residue an older collector orphaned, a
+    /// life that has ended, which a receiver must never be handed.
     #[allow(clippy::type_complexity)]
-    fn snapshot_documents(
+    fn snapshot_rows(
         &self,
         after: Option<SnapshotCursor>,
         scope: Option<CollectionId>,
-    ) -> Result<(Vec<SnapshotDoc>, Vec<SnapshotTombstone>, Option<SnapshotCursor>)> {
+    ) -> Result<(
+        Vec<crate::idempotency::CarriedRecord>,
+        Vec<SnapshotDoc>,
+        Vec<SnapshotTombstone>,
+        Option<SnapshotCursor>,
+    )> {
         use std::ops::Bound;
+
+        /// Where a page begins: a collection's records after a scope (`None` from
+        /// its first), or its rows after a key (`None` from its first).
+        enum Phase {
+            Records(u64, Option<Vec<u8>>),
+            Rows(u64, Option<Vec<u8>>),
+        }
 
         let txn = self.db().begin_read()?;
         // A page served to a peer, which no client asked for, so it ends at the
-        // signal: the rows under a dropped collection it passes over are not
-        // bounded by the page.
+        // signal.
         let walk = self.walk(WalkScope::Background);
         let docs = open_walk_table(&txn, tables::DOCS, walk)?;
-
-        let mut out = Vec::new();
-        let mut deleted = Vec::new();
-        let mut cursor = None;
-        let empty: &[u8] = &[];
-
-        // `Excluded` on the resume point, so the document that ended the last
-        // page is not sent twice; from the scoped collection's first key
-        // otherwise, and from the beginning for the whole database.
-        let start = match (&after, scope) {
-            (Some(c), _) => Bound::Excluded((c.collection.0, c.after_key.as_slice())),
-            (None, Some(id)) => Bound::Included((id.0, empty)),
-            (None, None) => Bound::Unbounded,
-        };
-        // A scoped walk ends where the next collection's keys begin. The
-        // top id has no successor, and an unbounded end reads the same for
-        // it: nothing sorts after its keys.
-        let end = match scope.and_then(|id| id.0.checked_add(1)) {
-            Some(next_collection) => Bound::Excluded((next_collection, empty)),
-            None => Bound::Unbounded,
-        };
-
-        // Only the rows of a collection that stands. Under an id with no
-        // collection over it lies what a drop left for the drop purger
-        // (ADR-189), or residue an older collector orphaned: a life that has
-        // ended, which a receiver must never be handed as documents. A drop's
-        // rows lie there for as long as its purge runs, so this is an
-        // ordinary state, not a narrow one. Read in the walk's own transaction,
-        // so the set and the rows are one snapshot.
-        let live: std::collections::HashSet<u64> = {
+        let live: std::collections::BTreeSet<u64> = {
             let collections = open_walk_table(&txn, tables::COLLECTIONS, walk)?;
-            let mut live = std::collections::HashSet::new();
+            let mut live = std::collections::BTreeSet::new();
             for row in collections.iter()? {
                 let (_, value) = row?;
                 let meta: CollectionMeta = serde_json::from_slice(value.value())?;
-                live.insert(meta.id.0);
+                if scope.is_none_or(|id| id == meta.id) {
+                    live.insert(meta.id.0);
+                }
             }
             live
         };
-        let mut start = start;
+        let next_after = |id: u64| {
+            // not a row: the next standing collection id, from the set read above.
+            live.range((Bound::Excluded(id), Bound::Unbounded)).next().copied()
+        };
+        let has_records = |id: u64| -> Result<bool> {
+            let (page, _) =
+                crate::idempotency::records_for_collection_page(&txn, CollectionId(id), None, 1)?;
+            Ok(!page.is_empty())
+        };
+        let records_cursor = |id: u64, at: Vec<u8>| SnapshotCursor {
+            collection: CollectionId(id),
+            after_key: Vec::new(),
+            records: Some(at),
+        };
 
-        // The key that ended a full page, kept only once the page is full.
+        let mut records = Vec::new();
+        let mut out = Vec::new();
+        let mut deleted = Vec::new();
+        // The row that ended a full page, kept only once it is: across
+        // collections, since a page can fill at the last row of one.
         let mut last_sent: Option<(u64, Vec<u8>)> = None;
-        'walk: loop {
-            for row in docs.range::<(u64, &[u8])>((start, end))? {
-                if out.len() + deleted.len() >= SNAPSHOT_PAGE {
-                    // Another row exists past a full page, so there is a next
-                    // page; the cursor names the last row sent, a document or a
-                    // tombstone. Looking
-                    // one row ahead is what lets a snapshot of exactly a page's
-                    // worth end here rather than with an empty page after it.
-                    cursor = last_sent.take().map(|(collection, after_key)| SnapshotCursor {
-                        collection: CollectionId(collection),
-                        after_key,
-                    });
-                    break;
-                }
-
-                let (key, value) = row?;
-                let (collection, doc_key) = key.value();
-                if !live.contains(&collection) {
-                    // Past the whole of that id's range in one seek, rather than
-                    // row by row through what may be a large purge.
-                    match collection.checked_add(1) {
-                        Some(next) => {
-                            start = Bound::Included((next, empty));
-                            continue 'walk;
+        let mut phase = match after {
+            // not a row: the first standing collection id, from the set above.
+            None => match live.iter().next() {
+                Some(first) => Phase::Records(*first, None),
+                None => return Ok((records, out, deleted, None)),
+            },
+            Some(cursor) => match cursor.records {
+                Some(at) => Phase::Records(cursor.collection.0, (!at.is_empty()).then_some(at)),
+                None => Phase::Rows(cursor.collection.0, Some(cursor.after_key)),
+            },
+        };
+        loop {
+            match phase {
+                Phase::Records(id, at) => {
+                    if !live.contains(&id) {
+                        // Dropped since the cursor was cut: on to the next.
+                        match next_after(id) {
+                            Some(next) => phase = Phase::Records(next, None),
+                            None => return Ok((records, out, deleted, None)),
                         }
-                        None => break 'walk,
+                        continue;
+                    }
+                    if !out.is_empty()
+                        || !deleted.is_empty()
+                        || records.len() >= crate::idempotency::RECORD_PAGE
+                    {
+                        // Another collection's documents are on this page, or
+                        // its records are a page already.
+                        // not a row: the records position, empty for the first.
+                        let cursor = records_cursor(id, at.unwrap_or_default());
+                        return Ok((records, out, deleted, Some(cursor)));
+                    }
+                    let after = at.as_deref().and_then(kimmy_core::ScopeHash::from_slice);
+                    let (page, more) = crate::idempotency::records_for_collection_page(
+                        &txn,
+                        CollectionId(id),
+                        after.as_ref(),
+                        crate::idempotency::RECORD_PAGE - records.len(),
+                    )?;
+                    records.extend(page.into_iter().map(|(scope, record)| {
+                        crate::idempotency::CarriedRecord {
+                            collection: CollectionId(id),
+                            scope,
+                            carrying: None,
+                            record,
+                        }
+                    }));
+                    if let Some(last) = more {
+                        let cursor = records_cursor(id, last.as_bytes().to_vec());
+                        return Ok((records, out, deleted, Some(cursor)));
+                    }
+                    phase = Phase::Rows(id, None);
+                }
+                Phase::Rows(id, after_key) => {
+                    if live.contains(&id) {
+                        // `Excluded` on the resume point, so the row that ended
+                        // the last page is not sent twice.
+                        let start = match &after_key {
+                            Some(key) => Bound::Excluded((id, key.as_slice())),
+                            None => Bound::Included((id, [].as_slice())),
+                        };
+                        let end = match id.checked_add(1) {
+                            Some(next) => Bound::Excluded((next, [].as_slice())),
+                            None => Bound::Unbounded,
+                        };
+                        for row in docs.range::<(u64, &[u8])>((start, end))? {
+                            if out.len() + deleted.len() >= SNAPSHOT_PAGE {
+                                // Another row exists past a full page, so there
+                                // is a next page; the cursor names the last row
+                                // sent. Looking one row ahead is what lets a
+                                // snapshot of exactly a page's worth end here
+                                // rather than with an empty page after it.
+                                let cursor =
+                                    last_sent.map(|(collection, after_key)| SnapshotCursor {
+                                        collection: CollectionId(collection),
+                                        after_key,
+                                        records: None,
+                                    });
+                                return Ok((records, out, deleted, cursor));
+                            }
+                            let (key, value) = row?;
+                            let (collection, doc_key) = key.value();
+                            let record = codec::decode_doc_record(value.value())?;
+                            // A tombstone travels by KEY (ADR-167): it has no
+                            // `_id` to recover, so it cannot be a `SnapshotDoc`,
+                            // and a receiver below this node's horizon may well
+                            // hold the document.
+                            if !record.is_live() {
+                                deleted.push(SnapshotTombstone {
+                                    collection: CollectionId(collection),
+                                    key: doc_key.to_vec(),
+                                    stamp: record.stamp,
+                                });
+                            } else {
+                                let Some(document) = record.document()? else {
+                                    continue;
+                                };
+                                let id = match document.get(crate::ID_FIELD) {
+                                    Some(value) => DocId::try_from_bson(value)?,
+                                    None => continue,
+                                };
+                                out.push(SnapshotDoc {
+                                    collection: CollectionId(collection),
+                                    id,
+                                    stamp: record.stamp,
+                                    body: Some(record.body),
+                                });
+                            }
+                            if out.len() + deleted.len() == SNAPSHOT_PAGE {
+                                last_sent = Some((collection, doc_key.to_vec()));
+                            }
+                        }
+                    }
+                    // The collection's rows are done: on to the next, through
+                    // its records phase when it has records.
+                    match next_after(id) {
+                        Some(next) if has_records(next)? => phase = Phase::Records(next, None),
+                        Some(next) => phase = Phase::Rows(next, None),
+                        None => return Ok((records, out, deleted, None)),
                     }
                 }
-                let record = codec::decode_doc_record(value.value())?;
-
-                // A tombstone travels by KEY. It has no `_id` to recover -- the
-                // body is gone and keyenc is one-way -- so it cannot be a
-                // `SnapshotDoc`, and it used to be skipped here. That skip was the
-                // defect ADR-167 closes: a receiver below this node's retention
-                // horizon may well hold the document, and completing a
-                // whole-database snapshot grants it coverage of the `Delete`, so
-                // no peer would ever send it. A receiver does not need the `_id`
-                // from us: where it holds the document, its own body carries one.
-                if !record.is_live() {
-                    deleted.push(SnapshotTombstone {
-                        collection: CollectionId(collection),
-                        key: doc_key.to_vec(),
-                        stamp: record.stamp,
-                    });
-                } else {
-                    let Some(document) = record.document()? else {
-                        continue;
-                    };
-                    let id = match document.get(crate::ID_FIELD) {
-                        Some(value) => DocId::try_from_bson(value)?,
-                        None => continue,
-                    };
-
-                    out.push(SnapshotDoc {
-                        collection: CollectionId(collection),
-                        id,
-                        stamp: record.stamp,
-                        body: Some(record.body),
-                    });
-                }
-                if out.len() + deleted.len() == SNAPSHOT_PAGE {
-                    last_sent = Some((collection, doc_key.to_vec()));
-                }
             }
-
-            break 'walk;
         }
-
-        Ok((out, deleted, cursor))
     }
 
     /// The first collection `page` defines that this node cannot create yet,
@@ -1188,7 +1298,16 @@ impl Engine {
         let mut applied = 0usize;
         let mut superseded = 0usize;
         let mut failed = None;
-        if !page.documents.is_empty() || !deletes.is_empty() || grant.is_some() {
+        // The page's idempotency records ride its documents' transaction (B5).
+        let via = match progress.scope {
+            None => crate::idempotency::RecordsVia::Snapshot,
+            Some(_) => crate::idempotency::RecordsVia::Repair,
+        };
+        if !page.documents.is_empty()
+            || !deletes.is_empty()
+            || !page.records.is_empty()
+            || grant.is_some()
+        {
             // Resolved per distinct collection rather than per document —
             // a page is one collection's worth of documents, usually — and
             // outside the writer, from the state the definitions above left.
@@ -1197,6 +1316,9 @@ impl Engine {
             // for the whole page.
             let mut memo = Memo::default();
             let txn = self.begin_write(WriterHolder::Repair)?;
+            // The collection's records before its documents, as the sender
+            // sent them; in the one transaction either way.
+            let records_stored = self.store_page_records(&txn, &mut memo, &page.records)?;
             let mut pending = Vec::new();
             for document in &page.documents {
                 let collection = self.memo_collection(&mut memo, document.collection)?;
@@ -1275,7 +1397,7 @@ impl Engine {
             // batch's vector).
             // A bare tombstone (ADR-228) is a write that has nothing to publish, so it
             // is not in `pending`; a page that only recorded those must still commit.
-            let mut wrote = !pending.is_empty() || recorded > 0;
+            let mut wrote = !pending.is_empty() || recorded > 0 || records_stored > 0;
             if let Some(granted) = &grant {
                 wrote |= Engine::absorb_version_vector_in_txn(&txn, granted)?;
                 // And the sender's forgetting with it: a member that was behind forgets
@@ -1309,6 +1431,7 @@ impl Engine {
             }
             if wrote {
                 txn.commit()?;
+                self.count_records_received(via, records_stored);
             } else {
                 // Nothing was written, so nothing is committed — a page
                 // this node already holds must not cost an fsync.
@@ -1328,6 +1451,7 @@ impl Engine {
         if complete
             && page.documents.is_empty()
             && deletes.is_empty()
+            && page.records.is_empty()
             && grant.is_none()
             && self.snapshot_progress_recorded(peer, progress.scope)?
         {
@@ -1420,11 +1544,16 @@ impl Engine {
         let mut failed = None;
         // At or below the cut of the finding that planned the pull.
         let at_cut = |stamp: Stamp| stamp.hlc <= progress.cut.get(stamp.node);
-        if !page.documents.is_empty() || !deletes.is_empty() {
+        if !page.documents.is_empty() || !deletes.is_empty() || !page.records.is_empty() {
             let mut memo = Memo::default();
             #[cfg(test)]
             crate::sync::race_hooks::reach(crate::sync::race_hooks::Race::ConvergePage);
             let txn = self.begin_write(WriterHolder::Repair)?;
+            // The collection's records, ahead of its rows, in the page's
+            // transaction (B5): a converge repair (ADR-237) ships them for the
+            // whole window, the cost the design accepts, so that a member it
+            // repairs also replays the keys of the writes it was given.
+            let records_stored = self.store_page_records(&txn, &mut memo, &page.records)?;
             // The young-stamp rule's two horizons (design section 13.2). The receiver's own
             // is read **in this write transaction**, beside the "no row" read below, so a
             // collection that commits between a plan and this page cannot leave the page
@@ -1526,10 +1655,11 @@ impl Engine {
             )?;
             applied_at_cut += replaced_at_cut
                 + pending[documents_applied..].iter().filter(|p| at_cut(p.entry.stamp)).count();
-            if pending.is_empty() && replaced == 0 {
+            if pending.is_empty() && replaced == 0 && records_stored == 0 {
                 txn.abort()?;
             } else {
                 txn.commit()?;
+                self.count_records_received(crate::idempotency::RecordsVia::Repair, records_stored);
             }
             let (count, error) = self.report_pending(pending);
             applied = count - created + replaced;
@@ -3144,6 +3274,7 @@ mod tests {
             scanned_to: window.scanned_to,
             exhausted: window.exhausted,
             passed_through: None,
+            records: Vec::new(),
         };
         assert_eq!(
             after.entries.iter().map(|e| e.kind).collect::<Vec<_>>(),
@@ -3219,6 +3350,7 @@ mod tests {
             scanned_to: window.scanned_to,
             exhausted: window.exhausted,
             passed_through: None,
+            records: Vec::new(),
         };
         assert_eq!(
             after.entries.iter().map(|e| e.kind).collect::<Vec<_>>(),
@@ -4648,6 +4780,7 @@ mod tests {
             deleted_documents: Vec::new(),
             dropped_indexes: Vec::new(),
             tombstone_horizon: None,
+            records: Vec::new(),
         };
         b.apply_snapshot_page(no_sender(), &mut SnapshotProgress::of_collection(current.id), &page)
             .unwrap();
@@ -4710,6 +4843,7 @@ mod tests {
             deleted_documents: Vec::new(),
             dropped_indexes: Vec::new(),
             tombstone_horizon: None,
+            records: Vec::new(),
         };
         let outcome = b
             .apply_snapshot_page(no_sender(), &mut SnapshotProgress::of_collection(id), &page)
@@ -5197,6 +5331,7 @@ mod tests {
             deleted_documents: Vec::new(),
             dropped_indexes: Vec::new(),
             tombstone_horizon: None,
+            records: Vec::new(),
         };
         let _ = own;
         b.apply_snapshot_page(a.node_id(), &mut SnapshotProgress::whole_database(), &page).unwrap();
@@ -6280,6 +6415,7 @@ mod tests {
             }],
             dropped_indexes: Vec::new(),
             tombstone_horizon: None,
+            records: Vec::new(),
         };
         b.apply_snapshot_page(no_sender(), &mut SnapshotProgress::of_collection(id), &page)
             .unwrap();

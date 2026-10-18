@@ -312,6 +312,18 @@ pub enum Message {
         exhausted: bool,
         #[serde(default)]
         passed_through: Option<kimmy_core::Stamp>,
+        /// The idempotency records the shipped entries carry (B5, "How a
+        /// record travels"): `{collection, scope hash, carrying stamp, record
+        /// bytes}`, read in the read transaction that read the window and only
+        /// for the stamps shipped. The bytes are opaque here and pass through.
+        /// Optional on the wire and read leniently: an older receiver ignores
+        /// the field, and an older sender sends none, which reads as no records.
+        #[serde(
+            default,
+            skip_serializing_if = "Vec::is_empty",
+            deserialize_with = "kimmy_storage::lenient_records"
+        )]
+        records: Vec<kimmy_storage::CarriedRecord>,
     },
     /// "That many entries will not fit in a frame; ask for this many."
     ///
@@ -365,6 +377,18 @@ pub enum Message {
         /// cut short before it reached the requester's entries therefore still
         /// makes progress at every contact.
         scanned_to: Hlc,
+        /// The idempotency records the shipped entries carry (B5, "How a
+        /// record travels"): `{collection, scope hash, carrying stamp, record
+        /// bytes}`, read in the read transaction that read the window and only
+        /// for the stamps shipped. The bytes are opaque here and pass through.
+        /// Optional on the wire and read leniently: an older receiver ignores
+        /// the field, and an older sender sends none, which reads as no records.
+        #[serde(
+            default,
+            skip_serializing_if = "Vec::is_empty",
+            deserialize_with = "kimmy_storage::lenient_records"
+        )]
+        records: Vec<kimmy_storage::CarriedRecord>,
     },
     /// The answer to [`Message::ReplayEntries`]: where the replay stands now.
     /// `next_from` is the position it asks from next; `done` that the sender has
@@ -520,7 +544,24 @@ pub enum Message {
     /// past every earlier entry from the same origin the receiver had not
     /// yet pulled, and nothing re-served them: a member could be handed an
     /// index for a collection it was never sent.
-    Push { entries: Vec<OplogEntry>, scanned_to: Hlc, exhausted: bool, versions: VersionVector },
+    Push {
+        entries: Vec<OplogEntry>,
+        scanned_to: Hlc,
+        exhausted: bool,
+        versions: VersionVector,
+        /// The idempotency records the shipped entries carry (B5, "How a
+        /// record travels"): `{collection, scope hash, carrying stamp, record
+        /// bytes}`, read in the read transaction that read the window and only
+        /// for the stamps shipped. The bytes are opaque here and pass through.
+        /// Optional on the wire and read leniently: an older receiver ignores
+        /// the field, and an older sender sends none, which reads as no records.
+        #[serde(
+            default,
+            skip_serializing_if = "Vec::is_empty",
+            deserialize_with = "kimmy_storage::lenient_records"
+        )]
+        records: Vec<kimmy_storage::CarriedRecord>,
+    },
     /// What the pushed window became on the receiver: the fields of its
     /// `SyncOutcome` a pusher can act on. `ddl_declined` is a drop the
     /// receiver turned away as older than the index it holds (ADR-141).
@@ -952,12 +993,14 @@ mod tests {
                 scanned_to: Hlc::new(11, 2),
                 exhausted: false,
                 passed_through: None,
+                records: Vec::new(),
             },
             Message::Entries {
                 entries: Vec::new(),
                 scanned_to: Hlc::ZERO,
                 exhausted: true,
                 passed_through: None,
+                records: Vec::new(),
             },
             Message::Hello { node: NodeId::generate(), nonce: vec![1, 2, 3] },
             Message::Confirm { proof: vec![9, 9] },
@@ -975,6 +1018,7 @@ mod tests {
                 after: Some(SnapshotCursor {
                     collection: CollectionId(u64::MAX),
                     after_key: vec![1, 2],
+                    records: None,
                 }),
                 collection: Some(CollectionId(u64::MAX)),
             },
@@ -1007,6 +1051,7 @@ mod tests {
                 scanned_to: Hlc::new(11, 2),
                 exhausted: false,
                 versions: populated_vector(),
+                records: Vec::new(),
             },
             Message::Pushed {
                 applied: 1,
@@ -1187,6 +1232,7 @@ mod tests {
             scanned_to: p.hlc,
             exhausted: false,
             passed_through: Some(p),
+            records: Vec::new(),
         };
         let sent = body_of(&entries, "Entries").await;
         assert!(sent.contains_key("passed_through"), "the frame carries the field: {sent}");
@@ -1203,6 +1249,7 @@ mod tests {
                 scanned_to: p.hlc,
                 exhausted: false,
                 passed_through: None,
+                records: Vec::new(),
             },
             "a window from before the field names no end of its own"
         );
@@ -1722,6 +1769,7 @@ mod tests {
                 deleted_documents: Vec::new(),
                 dropped_indexes: Vec::new(),
                 tombstone_horizon: None,
+                records: Vec::new(),
             })),
         )
         .await
@@ -1781,7 +1829,11 @@ mod tests {
         let page = SnapshotPage {
             collections: Vec::new(),
             documents: Vec::new(),
-            next: Some(SnapshotCursor { collection: CollectionId(7), after_key: vec![1, 2, 3] }),
+            next: Some(SnapshotCursor {
+                collection: CollectionId(7),
+                after_key: vec![1, 2, 3],
+                records: None,
+            }),
             versions: versions.clone(),
             dropped: None,
             dropped_collections: vec![(CollectionId(9), stamp(500))],
@@ -1792,6 +1844,7 @@ mod tests {
             }],
             dropped_indexes: vec![(CollectionId(7), 2_032_551_883, stamp(550))],
             tombstone_horizon: Some(Hlc::new(777, 3)),
+            records: Vec::new(),
         };
 
         let mut written = Vec::new();

@@ -686,7 +686,7 @@ impl Confirmer {
             Ok(window) => window,
             Err(e) => return failed(crate::transport::from_storage(e, ProtocolError::Malformed)),
         };
-        if let Fits::Only(fits) = how_many_fit(&window.entries) {
+        if let Fits::Only(fits) = how_many_fit(&window.entries, &window.records) {
             if fits == 0 {
                 return failed(ProtocolError::Malformed(format!(
                     "a single oplog entry at or after {from:?} exceeds the frame limit and \
@@ -762,6 +762,8 @@ impl Confirmer {
             scanned_to: window.scanned_to,
             exhausted: window.exhausted,
             versions: mine.clone(),
+            // The records of the entries it carries, read with the window (B5).
+            records: crate::transport::records_to_send(engine, window.records),
         };
         if let Err(e) = write_frame(&mut stream, &push).await {
             return sent_failure(e.to_string());

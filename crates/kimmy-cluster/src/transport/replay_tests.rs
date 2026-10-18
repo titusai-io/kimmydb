@@ -265,6 +265,7 @@ async fn pages_that_were_not_asked_for_are_refused() {
                 exhausted: true,
                 horizon: false,
                 scanned_to: from,
+                records: Vec::new(),
             },
         )
         .await
@@ -283,6 +284,7 @@ async fn pages_that_were_not_asked_for_are_refused() {
                 exhausted: true,
                 horizon: false,
                 scanned_to: at(1),
+                records: Vec::new(),
             },
         ),
         (
@@ -293,6 +295,7 @@ async fn pages_that_were_not_asked_for_are_refused() {
                 exhausted: false,
                 horizon: false,
                 scanned_to: at(4),
+                records: Vec::new(),
             },
         ),
         (
@@ -303,6 +306,7 @@ async fn pages_that_were_not_asked_for_are_refused() {
                 exhausted: false,
                 horizon: false,
                 scanned_to: at(9),
+                records: Vec::new(),
             },
         ),
         (
@@ -313,6 +317,7 @@ async fn pages_that_were_not_asked_for_are_refused() {
                 exhausted: false,
                 horizon: false,
                 scanned_to: at(9),
+                records: Vec::new(),
             },
         ),
         (
@@ -326,6 +331,7 @@ async fn pages_that_were_not_asked_for_are_refused() {
                 exhausted: false,
                 horizon: false,
                 scanned_to: at(9),
+                records: Vec::new(),
             },
         ),
         (
@@ -338,6 +344,7 @@ async fn pages_that_were_not_asked_for_are_refused() {
                 exhausted: false,
                 horizon: false,
                 scanned_to: at(MAX_BATCH as u64 + 9),
+                records: Vec::new(),
             },
         ),
     ];
@@ -370,6 +377,7 @@ async fn an_empty_page_that_is_not_the_end_does_not_finish_the_replay() {
                 exhausted: false,
                 horizon: false,
                 scanned_to: from,
+                records: Vec::new(),
             },
         )
         .await
@@ -389,6 +397,7 @@ async fn an_empty_page_that_is_not_the_end_does_not_finish_the_replay() {
                 exhausted: true,
                 horizon: false,
                 scanned_to: from,
+                records: Vec::new(),
             },
         )
         .await
@@ -420,6 +429,7 @@ async fn a_horizon_page_is_recorded_and_answers_nothing() {
                 exhausted: false,
                 horizon: true,
                 scanned_to: from,
+                records: Vec::new(),
             },
         )
         .await
@@ -545,6 +555,7 @@ fn the_new_frames_round_trip_and_an_older_build_ignores_the_ask() {
             exhausted: true,
             horizon: false,
             scanned_to: Hlc::new(3, 1),
+            records: Vec::new(),
         },
         Message::ReplayAck { next_from: Hlc::new(4, 0), done: false, stalled: None },
         Message::ReplayAck {
@@ -606,6 +617,7 @@ fn frames_page() -> Message {
         exhausted: true,
         horizon: false,
         scanned_to: Hlc::ZERO,
+        records: Vec::new(),
     }
 }
 
@@ -734,7 +746,7 @@ fn applying_a_page_twice_and_at_once_is_safe() {
         window.entries.iter().filter(|e| e.stamp.node == f.a.node_id()).cloned().collect();
     assert!(!page.is_empty());
     let apply = |via| {
-        replay_apply(&f.a, &f.catch_up, &"c", c, from, page.clone(), from, true, via).unwrap()
+        replay_apply(&f.a, &f.catch_up, &"c", c, from, page.clone(), &[], from, true, via).unwrap()
     };
     let (one, two) = std::thread::scope(|scope| {
         // UNSUPERVISED: a scripted peer or racing applier in a test, joined below, whose panic fails it
@@ -819,6 +831,7 @@ async fn the_ack_names_the_cursor_the_page_reached() {
                 exhausted: false,
                 horizon: false,
                 scanned_to: at(2),
+                records: Vec::new(),
             },
         )
         .await
@@ -1188,6 +1201,7 @@ async fn a_replay_of_many_pages_is_reported_once_not_once_per_page() {
                     exhausted,
                     horizon: false,
                     scanned_to,
+                    records: Vec::new(),
                 },
             )
             .await
