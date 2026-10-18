@@ -98,14 +98,11 @@ impl Node {
     ///
     /// `storage` is added to the node's `[storage]` section, for a test that
     /// needs a setting the other tests do not.
-    fn spawn_with(name: &'static str, cluster: u16, seeds: &[u16], storage: &str) -> Node {
-        Self::spawn_with_interval(name, cluster, seeds, storage, 1)
-    }
-
-    /// [`Self::spawn_with`], with the sync interval a test chooses rather
-    /// than the shortened default: a test proving something about the gap
-    /// *between* ticks needs the interval wide enough that the gap it is
-    /// measuring cannot be mistaken for an ordinary tick boundary.
+    ///
+    /// The sync interval is the test's: 1 s for most, and a test proving
+    /// something about the gap *between* ticks needs the interval wide enough
+    /// that the gap it is measuring cannot be mistaken for an ordinary tick
+    /// boundary.
     fn spawn_with_interval(
         name: &'static str,
         cluster: u16,
@@ -537,12 +534,21 @@ async fn three_nodes(client: &reqwest::Client) -> (Node, Node, Node) {
 /// the node exits with it in use, and the three start again on new ports:
 /// a few attempts, each answered as soon as a node exits.
 async fn three_nodes_with(client: &reqwest::Client, storage: &str) -> (Node, Node, Node) {
+    three_nodes_configured(client, storage, "").await
+}
+
+/// [`three_nodes_with`], with `cluster_extra` added to each node's `[cluster]` section.
+async fn three_nodes_configured(
+    client: &reqwest::Client,
+    storage: &str,
+    cluster_extra: &str,
+) -> (Node, Node, Node) {
     const ATTEMPTS: usize = 5;
     for _ in 0..ATTEMPTS {
         let (pa, pb, pc) = (ports::choose(), ports::choose(), ports::choose());
-        let a = Node::spawn_with("node-a", pa, &[pb], storage);
-        let b = Node::spawn_with("node-b", pb, &[pa], storage);
-        let c = Node::spawn_with("node-c", pc, &[pa], storage);
+        let a = Node::spawn_configured("node-a", pa, &[pb], storage, 1, cluster_extra);
+        let b = Node::spawn_configured("node-b", pb, &[pa], storage, 1, cluster_extra);
+        let c = Node::spawn_configured("node-c", pc, &[pa], storage, 1, cluster_extra);
         let mut collided = false;
         for node in [&a, &b, &c] {
             match node.try_ready(client).await {
@@ -4531,4 +4537,667 @@ async fn a_decimal128_id_is_created_where_declared_and_applied_everywhere() {
         }
     })
     .await;
+}
+
+// ---------------------------------------------------------------------------
+// Idempotency keys across members (B5, design section "Cluster")
+// ---------------------------------------------------------------------------
+//
+// C1 to C9 over real processes and real HTTP, every member with
+// `cluster.idempotency_keys = true`. The same rows run in process over real sockets in
+// `kimmy-cluster/tests/idempotency.rs`; C4 (a hook between a keyed write's commit and anything
+// after it) and C7 (the frames across a version boundary) are a storage and a codec test there.
+// C9 and the race between chunks need the `lab-hooks` build (`KIMMY_TEST_STRIP_RECORDS`,
+// `KIMMY_TEST_HOLD_BETWEEN_CHUNKS`), and are named `lab_hook_` for its CI step.
+
+/// The `[cluster]` line every member of these tests carries.
+const KEYED: &str = "idempotency_keys = true";
+
+/// One keyed request's answer.
+#[derive(Debug)]
+struct KeyedAnswer {
+    status: u16,
+    /// `Idempotency-Replayed: ?1` on the answer.
+    replayed: bool,
+    text: String,
+    body: serde_json::Value,
+}
+
+/// `body` sent to `node` with `Idempotency-Key: "<key>"`. The same `body` and `key` make
+/// the same request, byte for byte, on any member.
+async fn keyed_send(
+    client: &reqwest::Client,
+    node: &Node,
+    token: &str,
+    method: reqwest::Method,
+    path: &str,
+    body: &str,
+    key: &str,
+) -> KeyedAnswer {
+    let res = client
+        .request(method, node.url(path))
+        .bearer_auth(token)
+        .header("Idempotency-Key", format!("\"{key}\""))
+        .header("Content-Type", "application/json")
+        .body(body.to_string())
+        .send()
+        .await
+        .unwrap();
+    keyed_answer(res).await
+}
+
+async fn keyed_answer(res: reqwest::Response) -> KeyedAnswer {
+    let status = res.status().as_u16();
+    let replayed = match res.headers().get("idempotency-replayed") {
+        Some(value) => {
+            assert_eq!(value, "?1", "the marker's one value");
+            true
+        }
+        None => false,
+    };
+    let text = res.text().await.unwrap();
+    let body = serde_json::from_str(&text).unwrap_or(serde_json::Value::Null);
+    KeyedAnswer { status, replayed, text, body }
+}
+
+/// Whether `node` lists `idempotency-keys`: its gate is open.
+async fn takes_keys(client: &reqwest::Client, node: &Node) -> bool {
+    let Ok(res) = client.get(node.url("/v1/version")).send().await else { return false };
+    let version: serde_json::Value = res.json().await.unwrap_or_default();
+    version["capabilities"].as_array().is_some_and(|c| c.iter().any(|c| c == "idempotency-keys"))
+}
+
+/// How many documents of `shop.orders` match `filter` on `node`, if it answers.
+async fn orders_where(
+    client: &reqwest::Client,
+    node: &Node,
+    token: &str,
+    filter: serde_json::Value,
+) -> Option<u64> {
+    let res = client
+        .post(node.url("/v1/db/shop/coll/orders/count"))
+        .bearer_auth(token)
+        .json(&serde_json::json!({ "filter": filter }))
+        .send()
+        .await
+        .ok()?;
+    if res.status() != 200 {
+        return None;
+    }
+    res.json::<serde_json::Value>().await.ok()?["count"].as_u64()
+}
+
+/// The `n` of `shop.orders` document `id` on `node`, or `None` while it does not hold it.
+async fn n_of(client: &reqwest::Client, node: &Node, token: &str, id: i64) -> Option<i64> {
+    let res = client
+        .get(node.url(&format!("/v1/db/shop/coll/orders/docs/{id}")))
+        .bearer_auth(token)
+        .send()
+        .await
+        .ok()?;
+    if res.status() != 200 {
+        return None;
+    }
+    let body: serde_json::Value = res.json().await.ok()?;
+    body["n"].as_i64().or_else(|| body["document"]["n"].as_i64())
+}
+
+/// A counter from `/metrics`, 0 while the series is absent.
+async fn series(client: &reqwest::Client, node: &Node, name: &str) -> u64 {
+    node.gauge(client, name).await.unwrap_or(0)
+}
+
+const RECEIVED_PULL: &str = "kimmy_idempotency_records_received_total{via=\"pull\"}";
+const RECEIVED_SNAPSHOT: &str = "kimmy_idempotency_records_received_total{via=\"snapshot\"}";
+const PEER_REPLAYS: &str = "kimmy_idempotency_peer_replays_total";
+
+/// Records `node` has stored from peers, by every way they come.
+#[cfg(feature = "lab-hooks")]
+async fn received(client: &reqwest::Client, node: &Node) -> u64 {
+    let mut total = 0;
+    for via in ["pull", "push", "replay", "snapshot", "repair"] {
+        let name = format!("kimmy_idempotency_records_received_total{{via=\"{via}\"}}");
+        total += series(client, node, &name).await;
+    }
+    total
+}
+
+/// Three members with `cluster.idempotency_keys` set and `storage` added, gossip formed,
+/// `shop.orders` holding `docs` on every member, every member taking keys, and a token for
+/// each, in the order A, B, C.
+async fn keyed_cluster(
+    client: &reqwest::Client,
+    storage: &str,
+    docs: serde_json::Value,
+) -> (Node, Node, Node, [String; 3]) {
+    let (a, b, c) = three_nodes_configured(client, storage, KEYED).await;
+    eventually("gossip to form", || all_report(client, vec![&a, &b, &c], 2)).await;
+    let tokens = [a.login(client).await, b.login(client).await, c.login(client).await];
+    let created = client
+        .post(a.url("/v1/db/shop/collections"))
+        .bearer_auth(&tokens[0])
+        .json(&serde_json::json!({ "name": "orders" }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(created.status(), 200);
+    let held = docs.as_array().map_or(0, Vec::len) as u64;
+    if held > 0 {
+        let seeded = client
+            .post(a.url("/v1/db/shop/coll/orders/bulk"))
+            .bearer_auth(&tokens[0])
+            .json(&docs)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(seeded.status(), 200);
+    }
+    for (node, token) in [(&a, &tokens[0]), (&b, &tokens[1]), (&c, &tokens[2])] {
+        eventually("every member to hold the collection and take keys", || async {
+            orders_where(client, node, token, serde_json::json!({})).await == Some(held)
+                && takes_keys(client, node).await
+        })
+        .await;
+    }
+    (a, b, c, tokens)
+}
+
+/// Until every member answers a retry of `body` under `key` from a record, with `expected`.
+async fn every_member_replays(
+    client: &reqwest::Client,
+    nodes: [&Node; 3],
+    tokens: &[String; 3],
+    path: &str,
+    body: &str,
+    key: &str,
+    expected: &str,
+) {
+    for (node, token) in nodes.iter().zip(tokens) {
+        eventually("every member to replay the request with one answer", || async {
+            let retry =
+                keyed_send(client, node, token, reqwest::Method::POST, path, body, key).await;
+            assert_eq!(retry.status, 200, "{}: {}", node.name, retry.text);
+            retry.replayed && retry.text == expected
+        })
+        .await;
+    }
+}
+
+/// C1. A keyed insert on A replicates to B, and the retry sent to B is answered from A's
+/// record: `200` with A's body byte for byte and `Idempotency-Replayed: ?1`. B counts a peer
+/// replay, and its pull counted the record it stored. One document, on every member.
+#[tokio::test]
+#[ignore = "boots a real three-node cluster; run with --ignored"]
+async fn c1_a_retry_on_the_member_a_keyed_write_replicated_to_is_answered_from_its_record() {
+    const PATH: &str = "/v1/db/shop/coll/orders/docs";
+    const BODY: &str = r#"{"v":"c1"}"#;
+    const KEY: &str = "c1-replicated-then-retried-on-b";
+    let client = reqwest::Client::new();
+    let (a, b, c, t) = keyed_cluster(&client, "", serde_json::json!([])).await;
+    let pulled = series(&client, &b, RECEIVED_PULL).await;
+    let peer = series(&client, &b, PEER_REPLAYS).await;
+
+    let first = keyed_send(&client, &a, &t[0], reqwest::Method::POST, PATH, BODY, KEY).await;
+    assert_eq!(first.status, 200, "{}", first.text);
+    assert!(!first.replayed, "a first answer carries no marker");
+    eventually("B to hold the write", || async {
+        orders_where(&client, &b, &t[1], serde_json::json!({ "v": "c1" })).await == Some(1)
+    })
+    .await;
+    assert!(
+        series(&client, &b, RECEIVED_PULL).await > pulled,
+        "B's pull stored the record with the entry"
+    );
+
+    let retry = keyed_send(&client, &b, &t[1], reqwest::Method::POST, PATH, BODY, KEY).await;
+    assert_eq!(retry.status, 200, "{}", retry.text);
+    assert!(retry.replayed, "the retry on B is a replay: {retry:?}");
+    assert_eq!(retry.text, first.text, "A's answer, byte for byte");
+    assert_eq!(series(&client, &b, PEER_REPLAYS).await, peer + 1, "counted as a peer's");
+    for (node, token) in [(&a, &t[0]), (&b, &t[1]), (&c, &t[2])] {
+        eventually("one document on every member", || async {
+            orders_where(&client, node, token, serde_json::json!({ "v": "c1" })).await == Some(1)
+        })
+        .await;
+    }
+}
+
+/// C2. A commits a keyed insert and stops before any peer has it; the retry goes to B, which
+/// holds no record and applies it, without the marker, under the key's derived `_id`. Once A
+/// returns, every member holds one document, and the records converge to one: every member
+/// answers a retry with B's answer, the later application's. The cut digest then compares
+/// equal on every member.
+#[tokio::test]
+#[ignore = "boots a real three-node cluster; run with --ignored"]
+async fn c2_a_retry_applied_while_the_first_member_was_stopped_converges_to_one_document() {
+    const PATH: &str = "/v1/db/shop/coll/orders/docs";
+    const BODY: &str = r#"{"v":"c2"}"#;
+    const KEY: &str = "c2-a-stops-right-after-its-commit";
+    let client = reqwest::Client::new();
+    let (a, b, c, t) = keyed_cluster(&client, "", serde_json::json!([])).await;
+
+    b.signal("STOP");
+    c.signal("STOP");
+    let first = keyed_send(&client, &a, &t[0], reqwest::Method::POST, PATH, BODY, KEY).await;
+    assert_eq!(first.status, 200, "{}", first.text);
+    a.signal("STOP");
+    b.signal("CONT");
+    c.signal("CONT");
+    let retry = keyed_send(&client, &b, &t[1], reqwest::Method::POST, PATH, BODY, KEY).await;
+    assert_eq!(retry.status, 200, "{}", retry.text);
+    assert!(!retry.replayed, "B holds no record, and applies without the marker: {retry:?}");
+    assert_eq!(retry.body["insertedId"], first.body["insertedId"], "the key's derived `_id`");
+    assert_ne!(retry.text, first.text, "another application: its own stamp");
+    a.signal("CONT");
+
+    for (node, token) in [(&a, &t[0]), (&b, &t[1]), (&c, &t[2])] {
+        eventually("one document on every member", || async {
+            orders_where(&client, node, token, serde_json::json!({ "v": "c2" })).await == Some(1)
+        })
+        .await;
+    }
+    every_member_replays(&client, [&a, &b, &c], &t, PATH, BODY, KEY, &retry.text).await;
+
+    // The cut digest compares, on every member, and finds nothing.
+    let compared = "kimmy_sync_divergence_digest_probes_total{outcome=\"compared\"}";
+    let before = [
+        series(&client, &a, compared).await,
+        series(&client, &b, compared).await,
+        series(&client, &c, compared).await,
+    ];
+    for (node, from) in [(&a, before[0]), (&b, before[1]), (&c, before[2])] {
+        eventually("the cut digest to compare equal", || async {
+            series(&client, node, compared).await >= from + 2
+                && node.gauge(&client, "kimmy_sync_digest_divergent_collections").await == Some(0)
+        })
+        .await;
+    }
+}
+
+/// C3. One keyed `$inc` applied on A and, before B has received it, on B, from the same
+/// version: once each has the other's, every member holds base + 1, and answers a retry from
+/// the one record.
+#[tokio::test]
+#[ignore = "boots a real three-node cluster; run with --ignored"]
+async fn c3_one_keyed_inc_applied_on_two_members_ends_at_base_plus_one() {
+    const PATH: &str = "/v1/db/shop/coll/orders/update";
+    const BODY: &str = r#"{"filter":{"_id":1},"update":{"$inc":{"n":1}}}"#;
+    const KEY: &str = "c3-one-inc-applied-on-two-members";
+    let client = reqwest::Client::new();
+    let (a, b, c, t) = keyed_cluster(&client, "", serde_json::json!([{ "_id": 1, "n": 0 }])).await;
+
+    b.signal("STOP");
+    c.signal("STOP");
+    let on_a = keyed_send(&client, &a, &t[0], reqwest::Method::POST, PATH, BODY, KEY).await;
+    assert_eq!((on_a.status, on_a.replayed), (200, false), "{}", on_a.text);
+    a.signal("STOP");
+    b.signal("CONT");
+    let on_b = keyed_send(&client, &b, &t[1], reqwest::Method::POST, PATH, BODY, KEY).await;
+    assert_eq!((on_b.status, on_b.replayed), (200, false), "B had not received A's: {}", on_b.text);
+    a.signal("CONT");
+    c.signal("CONT");
+
+    for (node, token) in [(&a, &t[0]), (&b, &t[1]), (&c, &t[2])] {
+        eventually("base + 1 on every member", || async {
+            n_of(&client, node, token, 1).await == Some(1)
+        })
+        .await;
+    }
+    for (node, token) in [(&a, &t[0]), (&b, &t[1]), (&c, &t[2])] {
+        eventually("every member to answer from the record", || async {
+            let retry =
+                keyed_send(&client, node, token, reqwest::Method::POST, PATH, BODY, KEY).await;
+            retry.status == 200 && retry.replayed
+        })
+        .await;
+        assert_eq!(n_of(&client, node, token, 1).await, Some(1), "{}: still base + 1", node.name);
+    }
+}
+
+/// C5. B holds a newer, independent version of the document, so A's keyed `$inc` loses
+/// there. B stores the record all the same, and a retry on B is answered from it rather than
+/// applied after the version that beat it.
+#[tokio::test]
+#[ignore = "boots a real three-node cluster; run with --ignored"]
+async fn c5_a_retry_is_answered_where_the_keyed_entry_lost() {
+    const PATH: &str = "/v1/db/shop/coll/orders/update";
+    const BODY: &str = r#"{"filter":{"_id":1},"update":{"$inc":{"n":1}}}"#;
+    const KEY: &str = "c5-the-keyed-entry-loses-on-b";
+    let client = reqwest::Client::new();
+    let (a, b, c, t) = keyed_cluster(&client, "", serde_json::json!([{ "_id": 1, "n": 0 }])).await;
+
+    b.signal("STOP");
+    c.signal("STOP");
+    let first = keyed_send(&client, &a, &t[0], reqwest::Method::POST, PATH, BODY, KEY).await;
+    assert_eq!((first.status, first.replayed), (200, false), "{}", first.text);
+    a.signal("STOP");
+    b.signal("CONT");
+    let newer = client
+        .put(b.url("/v1/db/shop/coll/orders/docs/1"))
+        .bearer_auth(&t[1])
+        .json(&serde_json::json!({ "n": 10 }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(newer.status(), 200, "B's own, newer write");
+    let pulled = series(&client, &b, RECEIVED_PULL).await;
+    a.signal("CONT");
+    c.signal("CONT");
+    eventually("B to store A's record from its pull", || async {
+        series(&client, &b, RECEIVED_PULL).await > pulled
+    })
+    .await;
+
+    let retry = keyed_send(&client, &b, &t[1], reqwest::Method::POST, PATH, BODY, KEY).await;
+    assert_eq!(retry.status, 200, "{}", retry.text);
+    assert!(retry.replayed, "answered from the record: {retry:?}");
+    assert_eq!(retry.text, first.text);
+    for (node, token) in [(&a, &t[0]), (&b, &t[1]), (&c, &t[2])] {
+        eventually("B's version on every member", || async {
+            n_of(&client, node, token, 1).await == Some(10)
+        })
+        .await;
+    }
+}
+
+/// C6. A member stopped while its peers collect the history it would need catches up by a
+/// snapshot, and the snapshot carries the record of a keyed write made since: its snapshot
+/// counter moves, and a retry on it is answered from the record.
+#[tokio::test]
+#[ignore = "boots a real three-node cluster; run with --ignored"]
+async fn c6_a_member_that_caught_up_by_snapshot_answers_a_retry_from_the_record() {
+    const PATH: &str = "/v1/db/shop/coll/orders/docs";
+    const BODY: &str = r#"{"v":"c6"}"#;
+    const KEY: &str = "c6-retried-on-a-member-past-the-horizon";
+    let client = reqwest::Client::new();
+    let (a, b, c, t) = keyed_cluster(
+        &client,
+        "oplog_retention_secs = 30\ngc_interval_secs = 2",
+        serde_json::json!([]),
+    )
+    .await;
+
+    // Read before C stops: a stopped member answers nothing, a scrape included.
+    let snapshots = series(&client, &c, RECEIVED_SNAPSHOT).await;
+    c.signal("STOP");
+    let docs: Vec<serde_json::Value> =
+        (0..20).map(|i| serde_json::json!({ "_id": i, "n": 0 })).collect();
+    let seeded = client
+        .post(a.url("/v1/db/shop/coll/orders/bulk"))
+        .bearer_auth(&t[0])
+        .json(&docs)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(seeded.status(), 200);
+    eventually("B to hold the documents", || async {
+        orders_where(&client, &b, &t[1], serde_json::json!({})).await == Some(20)
+    })
+    .await;
+    // The documents C has not seen, collected on A and on B. They were written at one
+    // instant, after every other entry but a few, and expire together: once twenty entries
+    // have left the oplog, they are among them.
+    let held = [
+        a.gauge(&client, "kimmy_oplog_entries").await.unwrap(),
+        b.gauge(&client, "kimmy_oplog_entries").await.unwrap(),
+    ];
+    assert!(held.iter().all(|n| *n >= 20), "premise: the documents are in the oplog: {held:?}");
+    eventually("A and B to collect the history C would need", || async {
+        a.gauge(&client, "kimmy_oplog_entries").await.is_some_and(|n| n + 20 <= held[0])
+            && b.gauge(&client, "kimmy_oplog_entries").await.is_some_and(|n| n + 20 <= held[1])
+    })
+    .await;
+    let first = keyed_send(&client, &a, &t[0], reqwest::Method::POST, PATH, BODY, KEY).await;
+    assert_eq!(first.status, 200, "{}", first.text);
+    c.signal("CONT");
+
+    eventually("C to catch up by snapshot, with the record", || async {
+        orders_where(&client, &c, &t[2], serde_json::json!({ "v": "c6" })).await == Some(1)
+            && series(&client, &c, RECEIVED_SNAPSHOT).await > snapshots
+    })
+    .await;
+    let retry = keyed_send(&client, &c, &t[2], reqwest::Method::POST, PATH, BODY, KEY).await;
+    assert_eq!(retry.status, 200, "{}", retry.text);
+    assert!(retry.replayed, "answered from the record the snapshot carried: {retry:?}");
+    assert_eq!(retry.text, first.text);
+    assert_eq!(orders_where(&client, &c, &t[2], serde_json::json!({})).await, Some(21));
+}
+
+/// C8. A key used in one life of a collection, the collection dropped and created again: a
+/// retry with the old key applies afresh in the new life, and every member holds that one
+/// document.
+#[tokio::test]
+#[ignore = "boots a real three-node cluster; run with --ignored"]
+async fn c8_an_old_key_applies_afresh_after_a_drop_and_a_recreation() {
+    const PATH: &str = "/v1/db/shop/coll/orders/docs";
+    const BODY: &str = r#"{"_id":50,"v":"c8"}"#;
+    const KEY: &str = "c8-a-key-from-the-life-before";
+    let client = reqwest::Client::new();
+    let (a, b, c, t) = keyed_cluster(&client, "", serde_json::json!([])).await;
+    let first = keyed_send(&client, &a, &t[0], reqwest::Method::POST, PATH, BODY, KEY).await;
+    assert_eq!(first.status, 200, "{}", first.text);
+    for (node, token) in [(&a, &t[0]), (&b, &t[1]), (&c, &t[2])] {
+        eventually("the write on every member", || async {
+            orders_where(&client, node, token, serde_json::json!({ "v": "c8" })).await == Some(1)
+        })
+        .await;
+    }
+
+    let dropped =
+        client.delete(a.url("/v1/db/shop/coll/orders")).bearer_auth(&t[0]).send().await.unwrap();
+    assert_eq!(dropped.status(), 200);
+    eventually("the name created again", || async {
+        client
+            .post(a.url("/v1/db/shop/collections"))
+            .bearer_auth(&t[0])
+            .json(&serde_json::json!({ "name": "orders" }))
+            .send()
+            .await
+            .is_ok_and(|res| res.status() == 200)
+    })
+    .await;
+    for (node, token) in [(&b, &t[1]), (&c, &t[2])] {
+        eventually("the new, empty life on every member", || async {
+            orders_where(&client, node, token, serde_json::json!({})).await == Some(0)
+        })
+        .await;
+    }
+
+    let again = keyed_send(&client, &b, &t[1], reqwest::Method::POST, PATH, BODY, KEY).await;
+    assert_eq!(again.status, 200, "{}", again.text);
+    assert!(!again.replayed, "the old life's record answers nothing: {again:?}");
+    for (node, token) in [(&a, &t[0]), (&b, &t[1]), (&c, &t[2])] {
+        eventually("the new write on every member", || async {
+            orders_where(&client, node, token, serde_json::json!({ "v": "c8" })).await == Some(1)
+        })
+        .await;
+    }
+}
+
+/// C9, the mixed-version test. C stands in for a release before 0.52: restarted with
+/// `KIMMY_TEST_STRIP_RECORDS`, it serves every frame and page without records, and its block
+/// omits `idempotency_records`. A and B have `cluster.idempotency_keys` set, so their refusal
+/// is the live-peer net's:
+///
+/// 1. while C is live, a keyed write on A or on B is refused `400`, naming C, and neither
+///    lists `idempotency-keys`. (C's own gate sees A and B carry records, and a keyed write C
+///    takes reaches A and B without its record: what an older relay does.)
+/// 2. without the net (a mutant), the schedule below would end at base + 2;
+/// 3. once C runs this build again, the schedule is answered from the record on B, and ends
+///    at base + 1: a keyed `$inc` on A; C pulls it from A; B pulls from C before it pulls
+///    from A; A stops; the retry lands on B.
+#[cfg(feature = "lab-hooks")]
+#[tokio::test]
+#[ignore = "boots a real three-node cluster; run with --ignored"]
+async fn lab_hook_c9_a_live_member_that_does_not_carry_records_closes_the_gate() {
+    const PATH: &str = "/v1/db/shop/coll/orders/update";
+    const BODY: &str = r#"{"filter":{"_id":1},"update":{"$inc":{"n":1}}}"#;
+    let client = reqwest::Client::new();
+    let (a, b, mut c, mut t) =
+        keyed_cluster(&client, "", serde_json::json!([{ "_id": 1, "n": 0 }])).await;
+    let c_id = c.node_id(&client).await;
+
+    // 1. C as an older release.
+    c.restart_with(&[("KIMMY_TEST_STRIP_RECORDS", "1")]);
+    c.wait_ready(&client).await;
+    eventually("gossip to re-form", || all_report(&client, vec![&a, &b, &c], 2)).await;
+    t[2] = c.login(&client).await;
+    eventually("A and B to hear C's block without the field", || async {
+        !takes_keys(&client, &a).await && !takes_keys(&client, &b).await
+    })
+    .await;
+    for (node, token) in [(&a, &t[0]), (&b, &t[1])] {
+        let refused = keyed_send(
+            &client,
+            node,
+            token,
+            reqwest::Method::POST,
+            PATH,
+            BODY,
+            "c9-refused-while-c-is-live",
+        )
+        .await;
+        assert_eq!(refused.status, 400, "{}: {}", node.name, refused.text);
+        assert!(refused.text.contains(&c_id.to_string()), "names C: {}", refused.text);
+    }
+    let base = [received(&client, &a).await, received(&client, &b).await];
+    let relayed = keyed_send(
+        &client,
+        &c,
+        &t[2],
+        reqwest::Method::POST,
+        "/v1/db/shop/coll/orders/docs",
+        r#"{"v":"c9-through-c"}"#,
+        "c9-a-write-c-relays-without-its-record",
+    )
+    .await;
+    assert_eq!(relayed.status, 200, "{}", relayed.text);
+    for (node, token) in [(&a, &t[0]), (&b, &t[1])] {
+        eventually("C's write on A and B", || async {
+            orders_where(&client, node, token, serde_json::json!({ "v": "c9-through-c" })).await
+                == Some(1)
+        })
+        .await;
+    }
+    assert_eq!(
+        [received(&client, &a).await, received(&client, &b).await],
+        base,
+        "C sent its write without the record"
+    );
+    for (node, token) in [(&a, &t[0]), (&b, &t[1]), (&c, &t[2])] {
+        assert_eq!(n_of(&client, node, token, 1).await, Some(0), "nothing applied: base");
+    }
+
+    // 3. C runs this build again.
+    c.restart_with(&[]);
+    c.wait_ready(&client).await;
+    eventually("gossip to re-form", || all_report(&client, vec![&a, &b, &c], 2)).await;
+    t[2] = c.login(&client).await;
+    eventually("A and B to take keys again", || async {
+        takes_keys(&client, &a).await && takes_keys(&client, &b).await
+    })
+    .await;
+    const KEY: &str = "c9-the-schedule-once-c-carries-records";
+    b.signal("STOP");
+    let first = keyed_send(&client, &a, &t[0], reqwest::Method::POST, PATH, BODY, KEY).await;
+    assert_eq!((first.status, first.replayed), (200, false), "{}", first.text);
+    eventually("C to pull it from A", || async { n_of(&client, &c, &t[2], 1).await == Some(1) })
+        .await;
+    a.signal("STOP");
+    b.signal("CONT");
+    eventually("B to pull it from C", || async { n_of(&client, &b, &t[1], 1).await == Some(1) })
+        .await;
+    let retry = keyed_send(&client, &b, &t[1], reqwest::Method::POST, PATH, BODY, KEY).await;
+    assert_eq!(retry.status, 200, "{}", retry.text);
+    assert!(retry.replayed, "answered from the record C relayed: {retry:?}");
+    assert_eq!(n_of(&client, &b, &t[1], 1).await, Some(1), "base + 1");
+    a.signal("CONT");
+    for (node, token) in [(&a, &t[0]), (&b, &t[1]), (&c, &t[2])] {
+        eventually("base + 1 on every member", || async {
+            n_of(&client, node, token, 1).await == Some(1)
+        })
+        .await;
+    }
+}
+
+/// The stamp rule on a fresh attempt (Chris's ruling on the design's departure 1): a keyed
+/// `multi` `$inc` on A, two documents a chunk, held between its first and second chunk
+/// (`KIMMY_TEST_HOLD_BETWEEN_CHUNKS`). Meanwhile B writes document 5, which A pulls, and a
+/// client writes document 6 on A. Both are left alone and counted in `skipped`, the answer
+/// says nothing of `resumed`, and after quiescence every member holds the four increments and
+/// the two unrelated writes; a retry on B is answered from the record.
+#[cfg(feature = "lab-hooks")]
+#[tokio::test]
+#[ignore = "boots a real three-node cluster; run with --ignored"]
+async fn lab_hook_a_fresh_keyed_multi_update_skips_what_others_wrote_between_its_chunks() {
+    const PATH: &str = "/v1/db/shop/coll/orders/update";
+    const BODY: &str = r#"{"filter":{},"update":{"$inc":{"n":1}},"multi":true}"#;
+    const KEY: &str = "race-a-fresh-multi-chunk-request";
+    let client = reqwest::Client::new();
+    let docs: Vec<serde_json::Value> =
+        (1..=6).map(|i| serde_json::json!({ "_id": i, "n": 0 })).collect();
+    let (mut a, b, c, mut t) =
+        keyed_cluster(&client, "multi_chunk_docs = 2", serde_json::json!(docs)).await;
+    let release = a.dir.path().join("release-the-held-request");
+    a.restart_with(&[("KIMMY_TEST_HOLD_BETWEEN_CHUNKS", release.to_str().unwrap())]);
+    a.wait_ready(&client).await;
+    eventually("gossip to re-form", || all_report(&client, vec![&a, &b, &c], 2)).await;
+    t[0] = a.login(&client).await;
+    eventually("A to take keys", || takes_keys(&client, &a)).await;
+
+    let held = tokio::spawn({
+        let request = client
+            .post(a.url(PATH))
+            .bearer_auth(&t[0])
+            .header("Idempotency-Key", format!("\"{KEY}\""))
+            .header("Content-Type", "application/json")
+            .body(BODY);
+        async move { keyed_answer(request.send().await.unwrap()).await }
+    });
+    eventually("the request to be held between its chunks", || async {
+        a.log().contains("holding a request between two chunks")
+    })
+    .await;
+    let on_b = client
+        .put(b.url("/v1/db/shop/coll/orders/docs/5"))
+        .bearer_auth(&t[1])
+        .json(&serde_json::json!({ "n": 100 }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(on_b.status(), 200);
+    eventually("A to take B's write", || async { n_of(&client, &a, &t[0], 5).await == Some(100) })
+        .await;
+    let on_a = client
+        .put(a.url("/v1/db/shop/coll/orders/docs/6"))
+        .bearer_auth(&t[0])
+        .json(&serde_json::json!({ "n": 200 }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(on_a.status(), 200);
+    std::fs::write(&release, b"").unwrap();
+
+    let answer = held.await.unwrap();
+    assert_eq!((answer.status, answer.replayed), (200, false), "{}", answer.text);
+    assert_eq!(answer.body["modified"], 4, "{}", answer.text);
+    assert_eq!(answer.body["skipped"], 2, "{}", answer.text);
+    assert!(answer.body.get("resumed").is_none(), "a fresh attempt: {}", answer.text);
+
+    for (node, token) in [(&a, &t[0]), (&b, &t[1]), (&c, &t[2])] {
+        eventually("every member to settle on the same documents", || async {
+            let mut held = Vec::new();
+            for id in 1..=6 {
+                held.push(n_of(&client, node, token, id).await);
+            }
+            held == [Some(1), Some(1), Some(1), Some(1), Some(100), Some(200)]
+        })
+        .await;
+    }
+    eventually("B to answer a retry from the record", || async {
+        let retry = keyed_send(&client, &b, &t[1], reqwest::Method::POST, PATH, BODY, KEY).await;
+        retry.status == 200 && retry.replayed && retry.text == answer.text
+    })
+    .await;
+    assert_eq!(n_of(&client, &b, &t[1], 1).await, Some(1), "not applied again");
 }

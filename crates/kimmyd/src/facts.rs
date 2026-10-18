@@ -47,6 +47,14 @@ pub fn source(
             idempotency_records: Some(true),
             ..Facts::default()
         };
+        // A member standing in for a release before 0.52 says nothing of records
+        // (the `lab-hooks` build's `KIMMY_TEST_STRIP_RECORDS`).
+        #[cfg(feature = "lab-hooks")]
+        let base = if crate::lab_hooks::strips_records() {
+            Facts { idempotency_records: None, ..base }
+        } else {
+            base
+        };
         let mut block = match engine.upgrade() {
             // A schema that cannot be read is sent as holding nothing: the peers
             // then do not count this member a holder, which fails toward another
