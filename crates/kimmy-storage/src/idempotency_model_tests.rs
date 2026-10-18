@@ -127,6 +127,10 @@
 //!   says (the request's records are of the life the drop ended), on a counter whose
 //!   version a write stamped after the drop carried into the next life with the request's
 //!   earlier application in it (ADR-236): the counter is incremented twice.
+//! - **D3** (counted; fails a named row): an `$inc` completes short of counters I8
+//!   expects because its record's `first` is of a life a drop ended: applied on both
+//!   sides of a concurrent drop, its two records merged on a member before the drop
+//!   reached it, and a resume there after the drop reads the ended life's `first`.
 //! - **KR** (counted): an `$inc` completes short of counters I8 expects because its
 //!   record's `first` is another request's: a key reused for another request, applied on
 //!   a member that did not hold the first request's record, and the two records merged.
@@ -566,6 +570,9 @@ pub(crate) struct Outcome {
     /// Finding KR: an `$inc` completed short of counters because its record's `first`
     /// is another request's under a reused key (see `check_i8`).
     pub kr: usize,
+    /// Finding D3: an `$inc` completed short of counters I8 expects because its record's
+    /// `first` is of a life a drop ended (see `check_i8`).
+    pub d3: usize,
 }
 
 type Res<T> = std::result::Result<T, String>;
@@ -1814,7 +1821,12 @@ impl World {
         let first_of_another = record.as_ref().and_then(|rec| {
             self.ghost.entries.get(&rec.first).map(|(q, ..)| *q).filter(|q| *q != r)
         });
+        // Finding D3: the record's `first` is at or below the life's floor, a record of
+        // the request merged across a drop it straddles; the stamp rule then reads the
+        // ended life's first.
+        let across = record.as_ref().is_some_and(|rec| rec.first.hlc <= floor);
         let mut short = Vec::new();
+        let mut across_short = Vec::new();
         for d in 0..COUNTERS {
             if !kind.targets(d) {
                 continue;
@@ -1825,6 +1837,10 @@ impl World {
             {
                 if let Some(q) = first_of_another {
                     short.push(format!("{d} at {} ({doc}), the first r{q}'s", self.stamp(stamp)));
+                    continue;
+                }
+                if across {
+                    across_short.push(format!("{d} at {} ({doc})", self.stamp(stamp)));
                     continue;
                 }
                 let s = format!(
@@ -1841,6 +1857,22 @@ impl World {
                     )),
                 );
                 self.fail(Inv::I8, s);
+            }
+        }
+        if !across_short.is_empty() {
+            self.out.d3 += 1;
+            let s = format!(
+                "D3: r{r} completed on {} short of counters {}: its first write in this life \
+                 is {}, the life from {}, its record's first {}",
+                LETTERS[m],
+                across_short.join(", "),
+                self.stamp(first_here),
+                self.hlc(floor),
+                record.as_ref().map(|rec| self.stamp(rec.first)).unwrap_or_default(),
+            );
+            self.note(s.clone());
+            if self.strict_s1 {
+                self.fail(Inv::I8, format!("(strict) {s}"));
             }
         }
         if !short.is_empty() {
@@ -3596,6 +3628,7 @@ struct Sweep {
     i5_off: usize,
     d2: usize,
     kr: usize,
+    d3: usize,
 }
 
 /// Run each seed of `seeds` on both tracks, `threads` at a time; panic with the first
@@ -3637,13 +3670,17 @@ fn sweep(seeds: std::ops::Range<u64>, len: usize, threads: usize) -> Sweep {
                         t.i5_off += out.i5_off;
                         t.d2 += out.d2;
                         t.kr += out.kr;
+                        t.d3 += out.d3;
                     }
                     // `IDEM_LIST=1`: each counted finding's schedule, by seed and track.
                     if std::env::var("IDEM_LIST").is_ok_and(|v| v == "1")
-                        && out.relay + out.l1 + out.s1 + out.d2 + out.kr > 0
+                        && out.relay + out.l1 + out.s1 + out.d2 + out.d3 + out.kr > 0
                     {
                         for n in out.notes.iter().filter(|n| {
-                            n.contains("finding:") || n.contains("D2:") || n.contains("KR:")
+                            n.contains("finding:")
+                                || n.contains("D2:")
+                                || n.contains("D3:")
+                                || n.contains("KR:")
                         }) {
                             eprintln!("FINDING seed {seed} {track:?}: {n}");
                         }
@@ -3662,7 +3699,7 @@ fn sweep(seeds: std::ops::Range<u64>, len: usize, threads: usize) -> Sweep {
          between commits), {} replays, {} resumes, {} crashes, {} life-rule applications, {} exempt by a drop elsewhere (D1), \
          {} relay, {} L1, {} S1; drops of orders: {} schedules with one during a call, {} \
          with an `$inc` written on both sides of one, {} I8 checks, {} home runs without \
-         exact I5, {} D2, {} KR; in {:.1?}",
+         exact I5, {} D2, {} D3, {} KR; in {:.1?}",
         totals.schedules,
         totals.steps,
         totals.between,
@@ -3679,6 +3716,7 @@ fn sweep(seeds: std::ops::Range<u64>, len: usize, threads: usize) -> Sweep {
         totals.i8_checks,
         totals.i5_off,
         totals.d2,
+        totals.d3,
         totals.kr,
         started.elapsed()
     );
@@ -3791,6 +3829,18 @@ fn row_with(name: &str, members: u8, requests: Vec<Request>, ops: Vec<Op>, at_co
         eprintln!("row {name}:\n{}", render(None, &sched, &out));
     }
     assert!(out.failures.is_empty(), "row {name}:\n{}", render(None, &sched, &out));
+}
+
+/// A finding's reproducer: the schedule run as a named row is (every classified finding
+/// failing it), and the finding's own count zero.
+fn finding(name: &str, requests: Vec<Request>, ops: Vec<Op>, count: impl Fn(&Outcome) -> usize) {
+    let sched = Schedule { track: Track::Anywhere, home: 0, members: 3, requests, ops };
+    let out = run_with(&sched, Some(true), false);
+    let shown = render(None, &sched, &out);
+    if trace() {
+        eprintln!("finding {name}:\n{shown}");
+    }
+    assert!(out.failures.is_empty() && count(&out) == 0, "finding {name}:\n{shown}");
 }
 
 const A: u8 = 0;
@@ -4322,6 +4372,77 @@ fn row_a_resumed_requests_record_reaches_every_member() {
 }
 
 // -- Reproducers -------------------------------------------------------------------------------
+
+/// Finding D2. A applies an `$inc` of every counter and B takes it; A drops `orders`;
+/// B, before it hears of the drop, writes counter 0 (unkeyed) on top of its version,
+/// which carries the `$inc`, stamped after the drop. B then takes the drop, which keeps
+/// that write (ADR-236), so `orders` stands on B with counter 0; the request's record is
+/// of the life the drop ended. A retry on B applies afresh, as the life rule says, and
+/// counter 0 is incremented by the request a second time.
+#[test]
+#[ignore = "finding D2: a retry after a drop applies afresh on a counter a later write carried over"]
+fn finding_d2_a_retry_after_a_drop_doubles_a_counter_a_later_write_kept() {
+    finding(
+        "d2",
+        vec![req(1, Kind::IncMulti)],
+        vec![
+            ask(0, A, 100),
+            pull(B, A),
+            Op { step: Step::Drop { m: A, c: ORDERS }, t: 150 },
+            touch(B, ORDERS, 0, 160),
+            pull(B, A),
+            ask(0, B, 170),
+        ],
+        |out| out.d2,
+    );
+}
+
+/// Finding KR. r0 and r1 are two `$inc`s of every counter under one key. C applies r0;
+/// A, without r0's record, applies r1 and stops after its first chunk (counters 0 and
+/// 1); A then takes r0's effect and record from C, and the two records merge: r1's, the
+/// later `last`, wins, with r0's `first`. A retry of r1 on A resumes and writes only the
+/// counters stored below r0's `first`, none, and r1 completes without counters 2 to 4.
+#[test]
+#[ignore = "finding KR: a reused key's records merge, and the stamp rule reads the other request's first"]
+fn finding_kr_a_reused_keys_records_merge_and_a_resume_writes_short() {
+    finding(
+        "kr",
+        vec![req(1, Kind::IncMulti), req(1, Kind::IncMulti)],
+        vec![
+            ask(0, C, 100),
+            ask_crash(1, A, 130, 1, Crash::AfterCommit),
+            pull(A, C),
+            ask(1, A, 140),
+        ],
+        |out| out.kr,
+    );
+}
+
+/// Finding D3, a multi-chunk request applied on both sides of a concurrent drop: A applies an
+/// `$inc` of every counter; B drops `orders` and creates it again, its counters fresh;
+/// C, before it hears of either, applies the same request, stamped after the drop, and
+/// stops after its first chunk. C takes A's effect and record (merged: A's `first`, of the
+/// life the drop ended, under C's applying record), then the drop and the new life: C's
+/// first chunk is kept (ADR-236), its other counters are B's fresh ones, stored before
+/// C's application began. A retry on C resumes, and must write those (I8).
+#[test]
+#[ignore = "finding D3: a record merged across a concurrent drop keeps the ended life's first"]
+fn finding_d3_a_resume_after_a_merge_across_a_concurrent_drop_writes_short() {
+    finding(
+        "d3",
+        vec![req(1, Kind::IncMulti)],
+        vec![
+            ask(0, A, 100),
+            Op { step: Step::Drop { m: B, c: ORDERS }, t: 150 },
+            Op { step: Step::Create { m: B, c: ORDERS }, t: 152 },
+            ask_crash(0, C, 160, 1, Crash::AfterCommit),
+            pull(C, A),
+            pull(C, B),
+            ask(0, C, 170),
+        ],
+        |out| out.d3,
+    );
+}
 
 /// `$inc` of `n` by one, with no key set: the reproducer's own.
 struct PlainInc;
