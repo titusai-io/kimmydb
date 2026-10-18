@@ -666,6 +666,7 @@ request. An MCP call is fingerprinted over the tool and its arguments without
 | No record of the key | Processed as without a key. If it wrote anything, the record is written with it. No marker |
 | A record, the same request | The first answer: `200` and the body the first attempt returned, with `Idempotency-Replayed: ?1`. Nothing is written. Under `coalesced` it is answered once the record's commit is durable |
 | A record, a different request | `422 idempotency_key_reused`, `retry: no`. Nothing is written |
+| A record two requests met in: two members each accepted the key, for two different requests, before either had the other's record, and the records have since met in a merge (a **contested** record) | `422 idempotency_key_reused`, `retry: no`, for every retry of either request, until the key's window ends. Nothing is written. Neither first answer can stand for the key, so neither is replayed; a `multi: true` request whose record turns contested between its chunks stops with `500 partially_applied` |
 | A `multi: true` update or delete with this key is still running on this member, or another retry of it is being answered there (a retry of a `multi: true` request holds its place while it replays, so of two sent at once one is answered and the other refused) | `409 idempotency_key_in_flight`, `retry: wait`, `Retry-After: 1`. Nothing is written; sent again here once it ends, it is answered from its record |
 | A record of a `multi: true` request that stopped and is not running here | It resumes: [a request that was partly applied](#a-request-that-was-partly-applied) |
 | Two single-document requests with one key at once | They wait for the single writer as any write does: whichever commits first applies, and the other is answered from its record |
@@ -752,6 +753,14 @@ different times. After it, the same request is a new one; a keyed insert
 without `_id` still lands on its derived `_id`, and answers `409 duplicate_key`
 while that document stands.
 
+**A drop of the collection does not end it.** A key outlives a drop of its
+collection for its window, as MongoDB's retryable writes outlive a drop of
+theirs: a retry after the collection was dropped, created again or not, is
+answered with its first answer and writes nothing to the new collection, and
+another request under the key is `422 idempotency_key_reused` until the window
+ends. A database drop is the same. The window is the only thing that forgets a
+key.
+
 ### A retry on another member
 
 The record travels with the write, whichever member relays it and by whatever
@@ -805,7 +814,8 @@ the gate opens again.
 
 ### What is not guaranteed
 
-- Nothing after the key's window ends.
+- Nothing after the key's window ends. A drop of the collection does not end
+  it: a key outlives a drop of its collection for its window.
 - Nothing on a member of an earlier release, which ignores the header.
 - Nothing across collections or principals: a key is scoped to both.
 - Nothing for schema changes, vectors, webhooks or administration, which refuse
@@ -1670,7 +1680,7 @@ and `verify` today, and a client treats a class it does not know as `no`.
 | 409 | `conflict` | no | Collection exists; an index name already taken by a different definition; last user; self-deletion |
 | 409 | `duplicate_key` | no | `_id` already present |
 | 409 | `unique_violation` | no | A unique index would be violated |
-| 422 | `idempotency_key_reused` | no | The request's `Idempotency-Key` is remembered on this member for a different request (another body, path, query or method) from this principal on this collection. Nothing was written. Use a new key for a new request ([Idempotency keys](#what-each-case-answers)) |
+| 422 | `idempotency_key_reused` | no | The request's `Idempotency-Key` is remembered on this member for a different request (another body, path, query or method) from this principal on this collection, or two members accepted it for two different requests and their records have met (a contested record, refused for every retry of either). Nothing was written. Use a new key for a new request ([Idempotency keys](#what-each-case-answers)) |
 | 409 | `idempotency_key_in_flight` | wait | A `multi: true` update or delete with this `Idempotency-Key` is still running on this member, or another retry of it is being answered there. Nothing was written. Carries `Retry-After: 1`; sent again here once it has finished, it is answered from its record. Not elsewhere: a member that has not received the record would apply it a second time |
 | 409 | `stale` | no | A conditional write's `if_stamp` did not match: the document is at another version, or is gone. Nothing was written — re-read, decide again, and send a new request with the current stamp ([conditional writes](#get-replace-delete-by-id)) |
 | 503 | `collection_purging` | wait | Creating a collection, or enabling vectors, under a name whose earlier collection's drop is still being removed on this node. Nothing was written, and that removal was moved to the front. Carries `Retry-After` in seconds; the retry succeeds once the removal is done ([ADR-189](decisions.md)) |

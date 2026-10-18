@@ -1388,13 +1388,12 @@ impl RecordsVia {
 /// batch's last transaction, the one that raises the witnessed vector (B5,
 /// records travel with coverage).
 ///
-/// Not in the run of an entry before the row: the batch takes its entries in
-/// stamp order, and one before the row can be of a life of the collection a drop
-/// between the two ends, a drop this member has not taken yet. Stored there, a
-/// record of the life after the drop met the earlier life's record under its key
-/// while that one was still alive here, and the two merged: the earlier life's
-/// `first` under the later life's request, so a resume here wrote nothing the
-/// stamp rule reads as written below it.
+/// Not in the run of an entry before the row: a record is stored with the
+/// coverage that vouches for it, never ahead of it. (Before records outlived a
+/// drop of their collection, this also kept a later life's record out of the
+/// run of an earlier life's entry, where it met that life's record under the
+/// key; a record now lives its window whatever the drops, and the merge is the
+/// join in any order.)
 pub(crate) struct FrameRecords {
     via: RecordsVia,
     /// `(collection, scope, carrying stamp, record, stored yet)`.
@@ -1485,10 +1484,8 @@ impl Engine {
     ///
     /// **Not one whose row is at or past `stop`**, the entry a batch ended at: the
     /// window grants no coverage there, so the record is served again with what
-    /// follows, and the entries between the stop and its row, a drop of its
-    /// collection among them, are not taken. Stored now, a record of the life after
-    /// that drop met the earlier life's record, still alive here, and merged with
-    /// it ([`FrameRecords`]).
+    /// follows, and the entries between the stop and its row are not taken: the
+    /// coverage that vouches for it is not granted ([`FrameRecords`]).
     pub(crate) fn store_owed_records(
         &self,
         txn: &WriteTxn<'_>,
@@ -1880,7 +1877,7 @@ impl Engine {
     /// Put a local commit's record, merged into the live one if there is one
     /// (a resumed or continuing request's), with its row at the merged `last`.
     /// What stands under the key and is not alive is overwritten, never merged
-    /// with: an earlier life's record, or one past the window, belongs to
+    /// with: a record past the window, or one this build cannot read, belongs to
     /// another request.
     pub(crate) fn put_record(
         &self,

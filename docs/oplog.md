@@ -313,7 +313,8 @@ and the only row of the record in its advance is the one at `first`.
 | `SnapshotCursor` | An optional records position, so a snapshot resumes inside a records phase, and an optional `records_base`, `{key, epoch}`, the base of the next page's delta |
 
 **A sender ships a record at a row of its own. A row below the record's
-`first` was left by an earlier life under the same key, and ships nothing.** The
+`first` was left by an earlier record under the same key, one past its window
+and overwritten, and ships nothing.** The
 frame fit that answers `BatchTooLarge` counts every record: the F3 records first,
 since a window carries them whatever else it carries, and each other with the
 first entry at or after its row. When the F3 records alone overfill a frame, the
@@ -327,7 +328,8 @@ of the record's collection was taken and whether or not the collection stands
 here: a stamp a window covers is never served again, so a record vouched for at
 one is stored then or never. **A batch that ends at an entry stores no record
 whose row is at or past that entry; the window serves those again.** A record
-that is history by its collection's drop is not stored. Two records of one key
+is stored whether or not a drop of its collection came after it, since a record
+outlives a drop for its window; one already past its window is not stored. Two records of one key
 merge as a join ([Time & Conflicts](time-and-conflicts.md#idempotency-records-merge-as-a-join)),
 and the receiver's clock moves past both of the record's stamps. A store that
 changes nothing writes nothing, and a frame of records held already costs no
