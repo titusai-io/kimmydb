@@ -135,6 +135,12 @@ fn retry_must_replay(m: &Engine, cm: &CollectionMeta, k: &KeyedWrite, id: i64) {
     );
 }
 
+/// Begin `y`'s change log, no change in it: a sender whose records retention
+/// has collected since its log began (`idempotency::begin_log_for_test`).
+fn begun(y: &Engine) {
+    crate::idempotency::begin_log_for_test(y).unwrap();
+}
+
 /// The rows of `engine`'s change log, where it begins not counted.
 fn log_rows(engine: &Engine) -> usize {
     use redb::ReadableDatabase;
@@ -244,6 +250,9 @@ fn r1b_a_retry_between_the_effects_page_and_the_pulls_end_replays() {
     let (y, x) = (open(&dir, "y"), open(&dir, "x"));
     let target = SNAPSHOT_PAGE as i64 + 40;
     let cy = three_pages(&y, target);
+    // Its log has begun, so the base names an epoch and the next page's delta
+    // answers it (a zero base would be refused at the first keyed write).
+    begun(&y);
     let mut progress = SnapshotProgress::of_collection(cy.id);
     take(&x, &y, &mut progress);
     let k = key(7);
@@ -321,6 +330,9 @@ fn a_pages_records_commit_with_its_documents() {
     let (y, x) = (open(&dir, "y"), Arc::new(open(&dir, "x")));
     let target = SNAPSHOT_PAGE as i64 + 40;
     let cy = three_pages(&y, target);
+    // Its log has begun, so the base names an epoch and the next page's delta
+    // answers it (a zero base would be refused at the first keyed write).
+    begun(&y);
     let mut progress = SnapshotProgress::of_collection(cy.id);
     take(&x, &y, &mut progress);
     let k = key(7);
@@ -355,6 +367,9 @@ fn a_delta_larger_than_the_byte_budget_goes_as_records_only_pages() {
     let dir = tempfile::tempdir().unwrap();
     let (y, x) = (open(&dir, "y"), open(&dir, "x"));
     let cy = three_pages(&y, 1);
+    // Its log has begun, so the base names an epoch and the next page's delta
+    // answers it (a zero base would be refused at the first keyed write).
+    begun(&y);
     let mut progress = SnapshotProgress::of_collection(cy.id);
     take(&x, &y, &mut progress);
     let n = crate::idempotency::RECORD_PAGE as u64 + 60;
@@ -475,6 +490,9 @@ fn a_delta_reads_a_bounded_number_of_rows_a_page() {
     let target = SNAPSHOT_PAGE as i64 + 40;
     let cy = three_pages(&y, target);
     let other = y.create_collection("shop", "other").unwrap();
+    // Its log has begun, so the base names an epoch and the next page's delta
+    // answers it (a zero base would be refused at the first keyed write).
+    begun(&y);
     let mut progress = SnapshotProgress::of_collection(cy.id);
     take(&x, &y, &mut progress);
     y.set_record_delta_budget_for_test(Some((crate::SNAPSHOT_PAGE_BYTES, 4)));
@@ -513,6 +531,9 @@ fn a_resumed_pull_is_first_sent_every_record_that_changed_since() {
     let x_path = dir.path().join("x.redb");
     let target = SNAPSHOT_PAGE as i64 + 40;
     let cy = three_pages(&y, target);
+    // Its log has begun, so the base names an epoch and the next page's delta
+    // answers it (a zero base would be refused at the first keyed write).
+    begun(&y);
     let mut progress = SnapshotProgress::of_collection(cy.id);
     {
         let x = Engine::open(&x_path).unwrap();
@@ -930,8 +951,11 @@ fn a_base_of_another_epoch_restarts_its_collection_from_its_records() {
     retry_must_replay(&x, &cx, &k, target);
 }
 
-/// The zero base, which a log that had held nothing cuts, is answered with every
-/// change the log holds since, whatever its epoch: no restart.
+/// The zero base, which a log that had held nothing cuts, is answered by the
+/// sender with every change the log holds since, whatever its epoch: no restart
+/// on the sender. The receiver refuses that page all the same, since the page
+/// names an epoch the base was not cut under (guard ii of the review's m4), and
+/// the restart it asks for brings the record: a retry replays.
 #[test]
 fn the_zero_base_is_sent_every_change_the_log_holds() {
     let dir = tempfile::tempdir().unwrap();
@@ -945,9 +969,13 @@ fn the_zero_base_is_sent_every_change_the_log_holds() {
     assert_eq!(asked.records_base.unwrap().key.hlc, Hlc::ZERO);
     let k = key(7);
     fresh(y.modify_where_keyed(&cy, &Candidates::Scan, &Inc, Some(1), &k).unwrap());
-    let page = take(&x, &y, &mut progress);
+    let page = y.snapshot_page(Some(asked), Some(cy.id)).unwrap();
     assert_eq!(page.records.len(), 1, "the change, as a delta");
     assert_eq!(page.documents[0].id, DocId::Int64(SNAPSHOT_PAGE as i64 + 1), "no restart");
+    assert!(page.records_epoch.is_some(), "the page names the epoch begun since");
+    let applied = x.apply_snapshot_page(y.node_id(), &mut progress, &page).unwrap();
+    assert!(applied.records_restarted, "the receiver refuses it");
+    assert_eq!(finish_noting(&x, &y, &mut progress), 0, "and the restart is answered");
     let cx = x.get_collection("shop", "orders").unwrap();
     retry_must_replay(&x, &cx, &k, target);
 }
@@ -1161,6 +1189,149 @@ fn a_pull_across_two_restores_of_a_sender_with_records_takes_every_record() {
     let cx = x.get_collection("shop", "orders").unwrap();
     assert_eq!(n_of(&x, &cx, target), 11, "premise: the page brought b2's effect");
     retry_must_replay(&x, &cx, &k, target);
+}
+
+/// The next page of `progress` from `from`, applied on `to`, and whether `to`
+/// refused it for its zero base (`SnapshotApplied::records_restarted`).
+fn take_noting(
+    to: &Engine,
+    from: &Engine,
+    progress: &mut SnapshotProgress,
+) -> (SnapshotPage, bool) {
+    let page = from.snapshot_page(progress.after().cloned(), progress.scope()).unwrap();
+    let applied = to.apply_snapshot_page(from.node_id(), progress, &page).unwrap();
+    (page, applied.records_restarted)
+}
+
+/// The pull to its end, and how many of its pages `to` refused for their zero
+/// base.
+fn finish_noting(to: &Engine, from: &Engine, progress: &mut SnapshotProgress) -> usize {
+    let mut refused = 0;
+    for _ in 0..64 {
+        if progress.is_complete() {
+            return refused;
+        }
+        refused += usize::from(take_noting(to, from, progress).1);
+    }
+    panic!("the pull did not end in 64 pages ({refused} refused)");
+}
+
+/// Guard (ii) on a schedule of two restores during one pull: the sender holds no
+/// records when the first page is cut, so the page carries the zero base; it is
+/// restored, from a backup that holds a keyed `$inc` on a later page's document,
+/// whose open begins its log over the restored records with an epoch and logs
+/// none of them. The sender answers the zero base with an empty delta and the
+/// `$inc`'s effect; the receiver refuses that page, since the page names an
+/// epoch the zero base was not cut under, and asks for the collection from its
+/// records phase, which carries the record.
+#[test]
+fn a_zero_base_answered_after_a_restore_with_records_is_refused_and_restarts_the_records() {
+    let dir = tempfile::tempdir().unwrap();
+    let y0 = open(&dir, "y0");
+    let target = SNAPSHOT_PAGE as i64 + 40;
+    let cy = three_pages(&y0, target);
+    let b0 = backup_of(&y0);
+    let k = key(7);
+    fresh(y0.modify_where_keyed(&cy, &Candidates::Scan, &Inc, Some(1), &k).unwrap());
+    let b2 = backup_of(&y0);
+    drop(y0);
+
+    let y1 = restored(&dir, "y1", &b0);
+    let x = open(&dir, "x");
+    let mut progress = SnapshotProgress::of_collection(cy.id);
+    let (first, _) = take_noting(&x, &y1, &mut progress);
+    assert!(first.records.is_empty() && first.records_epoch.is_none(), "premise: no records");
+    let base = progress.after().unwrap().records_base.unwrap();
+    assert_eq!((base.key.hlc, base.epoch), (Hlc::ZERO, None), "premise: the zero base");
+    drop(y1);
+
+    // The sender is restored again, from b2, whose open begins its log.
+    let y2 = restored(&dir, "y2", &b2);
+    let epoch = log_begin(&y2).expect("premise: begun at open").epoch;
+    let asked = progress.after().cloned().unwrap();
+    let cx = x.get_collection("shop", "orders").unwrap();
+    let held = count(&x, &cx);
+    let (answer, refused) = take_noting(&x, &y2, &mut progress);
+    assert!(answer.records.is_empty(), "premise: the sender answers the zero base, empty");
+    assert!(answer.documents.iter().any(|d| d.id == DocId::Int64(target)), "with the effect");
+    assert_eq!(answer.records_epoch, Some(epoch), "naming the epoch begun since");
+    assert!(refused, "the receiver refuses it");
+    assert_eq!(count(&x, &cx), held, "nothing of it applied");
+    let restart = progress.after().cloned().unwrap();
+    assert_eq!(
+        restart,
+        SnapshotCursor {
+            collection: asked.collection,
+            after_key: Vec::new(),
+            records: Some(Vec::new()),
+            records_base: None,
+        },
+        "and asks for the collection from its records phase, with no base"
+    );
+    assert_eq!(finish_noting(&x, &y2, &mut progress), 0, "no page refused again");
+    assert_eq!(n_of(&x, &cx, target), 11, "premise: the pull brought b2's effect");
+    retry_must_replay(&x, &cx, &k, target);
+}
+
+/// The cost of guard (ii) on an ordinary pull: the sender holds no records when
+/// the pull begins, and its first keyed write lands mid-pull. Its log begins
+/// with that write and names it, so the page answering the zero base would have
+/// been right, but the receiver cannot tell it from a restore and refuses it:
+/// **exactly one** records-phase restart, and the pull completes, on a scoped
+/// pull and on a converge pull. Keyed writes after the log has begun cost none.
+#[test]
+fn a_first_keyed_write_mid_pull_costs_exactly_one_records_restart() {
+    let dir = tempfile::tempdir().unwrap();
+    let (y, x) = (open(&dir, "y"), open(&dir, "x"));
+    let target = SNAPSHOT_PAGE as i64 + 40;
+    let cy = three_pages(&y, target);
+
+    // A scoped pull.
+    let mut progress = SnapshotProgress::of_collection(cy.id);
+    take(&x, &y, &mut progress);
+    assert_eq!(progress.after().unwrap().records_base.unwrap().epoch, None, "premise: zero");
+    let k = key(7);
+    fresh(y.modify_where_keyed(&cy, &Candidates::Scan, &Inc, Some(1), &k).unwrap());
+    // The sender's own answer is right: the change, as a delta, no restart.
+    let answer = y.snapshot_page(progress.after().cloned(), Some(cy.id)).unwrap();
+    assert_eq!(answer.records.len(), 1, "the change, as a delta");
+    assert_eq!(answer.documents[0].id, DocId::Int64(SNAPSHOT_PAGE as i64 + 1), "no restart");
+    let (_, refused) = take_noting(&x, &y, &mut progress);
+    assert!(refused, "refused all the same");
+    // A keyed write on a later page now, under the log's epoch: no restart.
+    let late = 2 * SNAPSHOT_PAGE as i64 + 7;
+    let on = Candidates::Keys(vec![crate::docs::doc_key(&DocId::Int64(late)).unwrap()]);
+    y.replace(&cy, &DocId::Int64(late), doc! { "_id": late, "n": 0i64 }, false).unwrap();
+    let k2 = key(8);
+    let refused = {
+        let mut refused = 0;
+        // One page into the restart, then the second keyed write, then the rest.
+        refused += usize::from(take_noting(&x, &y, &mut progress).1);
+        fresh(y.modify_where_keyed(&cy, &on, &Inc, Some(1), &k2).unwrap());
+        refused + finish_noting(&x, &y, &mut progress)
+    };
+    assert_eq!(refused, 0, "after the one restart, no page is refused");
+    let cx = x.get_collection("shop", "orders").unwrap();
+    assert_eq!(count(&x, &cx), count(&y, &cy), "the pull completed");
+    retry_must_replay(&x, &cx, &k, target);
+    retry_must_replay(&x, &cx, &k2, late);
+
+    // A converge pull, from a second sender whose log has not begun, by a
+    // member that holds the collection, as a converge pull's receiver does.
+    let (w, c) = (open(&dir, "w"), open(&dir, "c"));
+    let cw = three_pages(&w, target);
+    pull(&c, &w);
+    let cc = c.get_collection("shop", "orders").unwrap();
+    let mut converge = SnapshotProgress::of_collection_converging(cc.id, Default::default());
+    let (first, refused) = take_noting(&c, &w, &mut converge);
+    assert!(!refused && first.records_epoch.is_none(), "premise: the zero base");
+    let k3 = key(9);
+    fresh(w.modify_where_keyed(&cw, &Candidates::Scan, &Inc, Some(1), &k3).unwrap());
+    let (_, refused) = take_noting(&c, &w, &mut converge);
+    assert!(refused, "a converge page is refused the same way");
+    assert_eq!(finish_noting(&c, &w, &mut converge), 0, "once, then the pull completes");
+    assert_eq!(n_of(&c, &cc, target), 11, "premise: the converge pull brought the effect");
+    retry_must_replay(&c, &cc, &k3, target);
 }
 
 // -- The records phase within the page's records budget ------------------------------------

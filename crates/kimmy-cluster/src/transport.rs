@@ -8340,6 +8340,7 @@ mod tests {
             tombstone_horizon: None,
             deleted_documents: Vec::new(),
             records: Vec::new(),
+            records_epoch: None,
         }
     }
 
@@ -9809,6 +9810,17 @@ mod tests {
         scope: Option<CollectionId>,
         policy: kimmy_storage::SnapshotPolicy,
     ) -> (Result<(), ProtocolError>, Result<SnapshotPulled, ProtocolError>) {
+        pull_through_with(a, b, scope, policy, &mut PeerStalls::new()).await
+    }
+
+    /// [`pull_through`], resuming whatever pull `stalls` holds with `b`.
+    async fn pull_through_with(
+        a: &Engine,
+        b: &Engine,
+        scope: Option<CollectionId>,
+        policy: kimmy_storage::SnapshotPolicy,
+        stalls: &mut PeerStalls,
+    ) -> (Result<(), ProtocolError>, Result<SnapshotPulled, ProtocolError>) {
         const SECRET: &str = "a-page-bytes-secret";
         const BINDING: &[u8] = b"a-page-bytes-binding";
         let (mut ours, theirs) = tokio::io::duplex(1 << 20);
@@ -9817,7 +9829,6 @@ mod tests {
         };
         let pulling = async {
             open_handshake(a, &mut ours, SECRET, BINDING).await.unwrap();
-            let mut stalls = PeerStalls::new();
             let clock = RoundClock::default();
             let deadline = Instant::now() + Duration::from_secs(300);
             let addr: SocketAddr = "127.0.0.1:1".parse().unwrap();
@@ -9828,7 +9839,7 @@ mod tests {
                 b.node_id(),
                 scope,
                 policy,
-                &mut stalls,
+                stalls,
                 deadline,
                 &clock,
             )
@@ -9837,6 +9848,98 @@ mod tests {
             pulled
         };
         tokio::join!(serving, pulling)
+    }
+
+    /// The requester's guard on the zero records base (m4, guard ii), through the
+    /// listener and `pull_snapshot`: the sender held no records when the pull
+    /// began, so the first page carried the zero base; it is then restored from a
+    /// backup that holds a keyed `$inc` on a document of the next page, whose open
+    /// begins its change log over the restored records and logs none of them. The
+    /// round refuses the page that answers the zero base, asks for the collection
+    /// again from its records phase, and completes in the same round with the
+    /// record: a retry replays.
+    #[tokio::test]
+    async fn a_pull_refuses_a_zero_base_page_once_and_completes_with_the_record() {
+        use kimmy_storage::SnapshotPolicy::All;
+        struct Inc;
+        impl kimmy_storage::ModifySpec for Inc {
+            fn matches(&self, doc: &bson::Document) -> kimmy_core::Result<bool> {
+                Ok(doc.contains_key("n"))
+            }
+            fn compare(&self, _: &bson::Document, _: &bson::Document) -> std::cmp::Ordering {
+                std::cmp::Ordering::Equal
+            }
+            fn apply(
+                &self,
+                doc: &bson::Document,
+            ) -> std::result::Result<Option<bson::Document>, String> {
+                let mut next = doc.clone();
+                next.insert("n", doc.get_i64("n").map_err(|e| e.to_string())? + 1);
+                Ok(Some(next))
+            }
+            fn upsert(&self) -> Option<std::result::Result<bson::Document, String>> {
+                None
+            }
+        }
+        let b_dir = tempfile::tempdir().unwrap();
+        let b = Engine::open(&b_dir.path().join("kimmy.redb")).unwrap();
+        let coll = b.create_collection("shop", "orders").unwrap();
+        let target = kimmy_storage::SNAPSHOT_PAGE as i64 + 40;
+        let docs = (1..3 * kimmy_storage::SNAPSHOT_PAGE as i64)
+            .map(|i| {
+                if i == target {
+                    bson::doc! { "_id": i, "n": 10i64 }
+                } else {
+                    bson::doc! { "_id": i }
+                }
+            })
+            .collect();
+        b.insert_many(&coll, docs).unwrap();
+        let backup = |e: &Engine| {
+            let mut out = Vec::new();
+            e.backup_to(&mut out, kimmy_storage::WalkScope::Background).unwrap();
+            out
+        };
+        let restored = |name: &str, from: &[u8]| {
+            let path = b_dir.path().join(name);
+            kimmy_storage::backup::restore(&path, &mut &from[..]).unwrap();
+            Engine::open(&path).unwrap()
+        };
+        let bare = backup(&b);
+        let key = kimmy_storage::idempotency::KeyedWrite::new(
+            kimmy_core::ScopeHash([7; 32]),
+            kimmy_core::Fingerprint([7; 32]),
+        );
+        let on = kimmy_storage::Candidates::Scan;
+        let done = b.modify_where_keyed(&coll, &on, &Inc, Some(1), &key).unwrap();
+        assert!(matches!(done, kimmy_storage::idempotency::Keyed::Fresh(_)), "{done:?}");
+        let keyed = backup(&b);
+        drop(b);
+        let a_dir = tempfile::tempdir().unwrap();
+        let a = Engine::open(&a_dir.path().join("kimmy.redb")).unwrap();
+        // The first page, by hand, from the sender restored without records: the
+        // zero base.
+        let b1 = restored("b1.redb", &bare);
+        let mut stalls = PeerStalls::new();
+        let progress = stalls.snapshot_progress(b1.node_id(), Some(coll.id), All);
+        let page = b1.snapshot_page(None, Some(coll.id)).unwrap();
+        a.apply_snapshot_page(b1.node_id(), progress, &page).unwrap();
+        let base = progress.after().and_then(|after| after.records_base).unwrap();
+        assert_eq!(base.epoch, None, "premise: the zero base");
+        drop(b1);
+        // Restored again, with the keyed write's record.
+        let b = restored("b2.redb", &keyed);
+        let (served, pulled) = pull_through_with(&a, &b, Some(coll.id), All, &mut stalls).await;
+        assert!(matches!(served, Ok(()) | Err(ProtocolError::Closed)), "{served:?}");
+        assert!(pulled.unwrap().complete, "the pull completes in the round");
+        let held = a.get_collection("shop", "orders").unwrap();
+        let id = kimmy_core::DocId::Int64(target);
+        let n = |e: &Engine| e.get(&held, &id).unwrap().unwrap().get_i64("n").unwrap();
+        assert_eq!(n(&a), 11, "premise: the pull brought the effect");
+        assert!(a.idempotency_record(held.id, &key.scope).unwrap().is_some(), "and the record");
+        let retry = a.modify_where_keyed(&held, &on, &Inc, Some(1), &key).unwrap();
+        assert!(matches!(retry, kimmy_storage::idempotency::Keyed::Replayed(_)), "{retry:?}");
+        assert_eq!(n(&a), 11, "the retry replays");
     }
 
     /// The v0.51.0 stall (B5, P2): 600 documents of 130 KiB, whose first page

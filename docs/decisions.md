@@ -28588,7 +28588,7 @@ in bash, one per clause.
 > it again with its key. Three tables are added: `idempotency` and `idempotency_by_stamp`, carried by a backup as tags
 > 12 and 13, which are a backup rollback boundary, and `idempotency_changes`, a node-local change log no backup carries.
 > No `kimmy.format` schema (still 5), `I_EPOCH`, existing codec or entry kind changes. One configuration key
-> (`cluster.idempotency_keys`), six optional wire fields, one facts field, two error codes, a capability, a version
+> (`cluster.idempotency_keys`), seven optional wire fields, one facts field, two error codes, a capability, a version
 > field and a response header are added.
 
 **The case.** A write has three outcomes: it happened, it did not, or it is not known whether it did, which a client
@@ -28773,7 +28773,15 @@ with it, and not be offered while any member could carry the write without it.
      one pull cuts bases of two epochs (the build review's m4). Keys are compared only within one epoch: a base of another epoch, or a key without one,
      restarts the cursor's collection from its records phase, since a sender restored onto a host whose clock is behind
      logs keys below a base cut before the restore, which no comparison of keys can tell; the zero base of a log that
-     had held nothing is sent every change. **The remainder rule:** a page carries documents only with the whole
+     had held nothing is sent every change. **The requester holds a page asked with the zero base to the epoch the page
+     names** (`SnapshotPage.records_epoch`, on every page, the last included, which has no cursor to carry a base): one
+     that names an epoch comes from a log begun since the base was cut, by a keyed write, which logs every record since,
+     or at an open over restored records, which logs none of them. The requester cannot tell which, so it refuses the
+     page, applies nothing of it, and asks for the cursor's collection again from its records phase with no base, which
+     is never refused again. That costs one records-phase restart when a sender's first keyed write lands during a pull,
+     accepted. A 0.51 sender writes no `records_epoch` and holds no records; a 0.51 receiver ignores the field. With the
+     open's beginning (item 6), a sender restored during a pull, once or twice, never lands an effect without its
+     record (the build review's m4). **The remainder rule:** a page carries documents only with the whole
      remainder of the log above its base within 32 MiB and 65,536 log rows; otherwise it is a records-only page, its
      document position unchanged and its base moved to the last key it examined, logged at `INFO`. A sender whose keyed
      changes, per page round trip, outrun what a frame carries sends records-only pages and stalls its snapshot until

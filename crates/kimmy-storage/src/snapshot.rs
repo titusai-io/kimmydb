@@ -586,6 +586,13 @@ pub struct SnapshotApplied {
     /// `progress` did not move, and the drop purger has been asked to take
     /// the id next: the same page is asked for again in a later round.
     pub purge_pending: Option<CollectionId>,
+    /// The page was asked with the **zero records base** and its sender's change
+    /// log has an epoch now (`SnapshotPage::records_epoch`): the log began since
+    /// the base was cut, by a keyed write or by an open over restored records,
+    /// and only the first names every record since. Nothing was applied, the
+    /// page is not counted, and `progress` now asks for the cursor's collection
+    /// again from its records phase (B5, the build review's m4, guard ii).
+    pub records_restarted: bool,
 }
 
 /// One page of a snapshot.
@@ -739,6 +746,25 @@ pub struct SnapshotPage {
         deserialize_with = "crate::idempotency::lenient_records"
     )]
     pub records: Vec<crate::idempotency::CarriedRecord>,
+    /// The epoch of the sender's change log of idempotency records as this
+    /// page's transaction read it (B5, the build review's m4): on every page,
+    /// the last included, from a sender whose log has begun; absent from one
+    /// whose log has held nothing.
+    ///
+    /// What a requester holds a page asked with the **zero base** to
+    /// ([`RecordsBase`]): a zero base is cut by a log with no epoch, and a page
+    /// that names one comes from a log begun since, by a keyed write (which logs
+    /// every record since) or by an open over records a restore brought (which
+    /// logs none of them). The requester cannot tell which, so it refuses the
+    /// page and asks for the cursor's collection again from its records phase
+    /// ([`SnapshotApplied::records_restarted`]): one restart of a records phase
+    /// when the log begins during a pull. `next`'s base names the epoch too, but
+    /// the last page has no `next`.
+    ///
+    /// Optional on the wire and read leniently: a 0.51 receiver ignores it, and
+    /// a 0.51 sender writes none and holds no records.
+    #[serde(default, skip_serializing_if = "Option::is_none", deserialize_with = "lenient")]
+    pub records_epoch: Option<i64>,
 }
 
 /// Where a snapshot pull stands on the receiver.
@@ -905,6 +931,38 @@ impl SnapshotProgress {
     }
 }
 
+/// The requester's guard on the zero records base (B5, the build review's m4,
+/// guard ii): the cursor `page` was asked with carried the zero base, and the
+/// page names an epoch of its sender's change log
+/// ([`SnapshotPage::records_epoch`]), so the log began after the base was cut.
+/// Begun by a keyed write, it names every record changed since, and the page is
+/// right; begun at an open over records a restore brought
+/// (`idempotency::begin_log_over_held_records`), it names none of them, and the
+/// page can hold their effects without them. The requester cannot tell which,
+/// so the page is refused, and the cursor returned asks for the asked cursor's
+/// collection again from its records phase, which the sender reads in that
+/// page's own transaction. It carries no base, so it carries no delta and is
+/// never refused for this again: the restart costs one records phase.
+///
+/// **The invariant** (INV-E on pages): a page is applied only when every record
+/// its sender changed since the base it was asked with is on it, in its delta or
+/// in a records phase it read. A base of the sender's epoch is answered by the
+/// sender's log; one of another epoch, the sender restarts; the zero base, the
+/// sender answers by its log, which is right only when no record reached it
+/// outside the log since, and this is where that is checked.
+fn refused_zero_base(progress: &SnapshotProgress, page: &SnapshotPage) -> Option<SnapshotCursor> {
+    let asked = progress.after.as_ref()?;
+    let base = asked.records_base?;
+    let zero = base.epoch.is_none() && base.key.hlc == Hlc::ZERO;
+    (zero && page.records_epoch.is_some()).then(|| SnapshotCursor {
+        collection: asked.collection,
+        after_key: Vec::new(),
+        // not a row: the records phase from its first record.
+        records: Some(Vec::new()),
+        records_base: None,
+    })
+}
+
 /// What a `Converge` page counts of the deletes it carries: the rows left (this member holds
 /// nothing for them), the tombstones it replaced at the finding's cut (progress), and the
 /// cut itself.
@@ -998,11 +1056,19 @@ impl Engine {
             dropped_indexes: dropped_indexes.clone(),
             tombstone_horizon: None,
             records: Vec::new(),
+            // As large as any epoch: an `int64`.
+            records_epoch: Some(0),
         })
         .map_or(0, |bytes| bytes.len());
         let first = after.is_none();
-        let (records, documents, mut deleted_documents, next) =
-            self.snapshot_rows(after, scope, self.snapshot_rows_room(fixed), first)?;
+        let mut records_epoch = None;
+        let (records, documents, mut deleted_documents, next) = self.snapshot_rows(
+            after,
+            scope,
+            self.snapshot_rows_room(fixed),
+            first,
+            &mut records_epoch,
+        )?;
         #[cfg(test)]
         crate::sync::race_hooks::reach(crate::sync::race_hooks::Race::PageRead);
         for tombstone in &mut deleted_documents {
@@ -1026,6 +1092,7 @@ impl Engine {
             dropped_indexes,
             tombstone_horizon,
             records,
+            records_epoch,
         })
     }
 
@@ -1101,6 +1168,7 @@ impl Engine {
         scope: Option<CollectionId>,
         room: usize,
         first: bool,
+        records_epoch: &mut Option<i64>,
     ) -> Result<(
         Vec<crate::idempotency::CarriedRecord>,
         Vec<SnapshotDoc>,
@@ -1192,6 +1260,8 @@ impl Engine {
             }
             None => RecordsBase { key: Stamp::new(Hlc::ZERO, self.node_id()), epoch: None },
         };
+        // The page names it, the last page included (`SnapshotPage::records_epoch`).
+        *records_epoch = cut_base.epoch;
         let mut records = Vec::new();
         let mut restart = false;
         if let Some(cursor) = &after
@@ -1503,6 +1573,17 @@ impl Engine {
         // every carried delete's key in the stored form, which is all any path
         // below reads. `page.next` is left as received.
         let deletes = CarriedDelete::of_page(page);
+        // Before anything of the page is applied, on every policy that pages.
+        if let Some(restart) = refused_zero_base(progress, page) {
+            info!(
+                collection = %restart.collection,
+                epoch = ?page.records_epoch,
+                "a snapshot page asked with the zero records base comes from a sender whose \
+                 change log has begun since; its collection is asked for again from its records"
+            );
+            progress.after = Some(restart);
+            return Ok(SnapshotApplied { records_restarted: true, ..Default::default() });
+        }
         if progress.policy == SnapshotPolicy::Converge {
             return self.apply_converge_page(progress, page, &deletes);
         }
@@ -1841,6 +1922,7 @@ impl Engine {
                 history: false,
                 sender_dropped: false,
                 purge_pending: None,
+                records_restarted: false,
             }),
         }
     }
@@ -5133,6 +5215,7 @@ mod tests {
             dropped_indexes: Vec::new(),
             tombstone_horizon: None,
             records: Vec::new(),
+            records_epoch: None,
         };
         b.apply_snapshot_page(no_sender(), &mut SnapshotProgress::of_collection(current.id), &page)
             .unwrap();
@@ -5196,6 +5279,7 @@ mod tests {
             dropped_indexes: Vec::new(),
             tombstone_horizon: None,
             records: Vec::new(),
+            records_epoch: None,
         };
         let outcome = b
             .apply_snapshot_page(no_sender(), &mut SnapshotProgress::of_collection(id), &page)
@@ -5684,6 +5768,7 @@ mod tests {
             dropped_indexes: Vec::new(),
             tombstone_horizon: None,
             records: Vec::new(),
+            records_epoch: None,
         };
         let _ = own;
         b.apply_snapshot_page(a.node_id(), &mut SnapshotProgress::whole_database(), &page).unwrap();
@@ -6768,6 +6853,7 @@ mod tests {
             dropped_indexes: Vec::new(),
             tombstone_horizon: None,
             records: Vec::new(),
+            records_epoch: None,
         };
         b.apply_snapshot_page(no_sender(), &mut SnapshotProgress::of_collection(id), &page)
             .unwrap();

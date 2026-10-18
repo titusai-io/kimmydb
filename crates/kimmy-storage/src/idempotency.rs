@@ -1091,6 +1091,20 @@ pub(crate) fn begin_log_over_held_records(engine: &Engine) -> Result<bool> {
     Ok(true)
 }
 
+/// Begin this node's change log now, with a new epoch and no change in it: the
+/// state of a sender whose log began and whose records retention has collected
+/// since, so its pages cut bases that name an epoch. For a test of a delta from
+/// such a base, which a pull from a log that has never begun (the zero base)
+/// cannot show past its first keyed write (`SnapshotPage::records_epoch`).
+#[cfg(test)]
+pub(crate) fn begin_log_for_test(engine: &Engine) -> Result<LogBegin> {
+    let txn = engine.begin_write(WriterHolder::Ddl)?;
+    let begin = LogBegin { at: engine.next_stamp(), epoch: new_epoch() };
+    txn.open_table(IDEMPOTENCY_CHANGES)?.insert(LOG_BEGINS, begin.encode().as_slice())?;
+    txn.commit()?;
+    Ok(begin)
+}
+
 /// A new log's epoch: random, never 0.
 fn new_epoch() -> i64 {
     loop {

@@ -382,6 +382,7 @@ fn v1_page(
         dropped_indexes: Vec::new(),
         tombstone_horizon: sender.tombstone_horizon().unwrap(),
         records: Vec::new(),
+        records_epoch: None,
     };
     for row in taken {
         match row.live {
