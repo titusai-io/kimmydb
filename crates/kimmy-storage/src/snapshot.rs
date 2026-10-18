@@ -204,6 +204,52 @@ pub struct SnapshotCursor {
         deserialize_with = "lenient_records_at"
     )]
     pub records: Option<Vec<u8>>,
+    /// The base of the next page's **records delta** (B5, "Snapshots carry
+    /// records"): the sender's witnessed vector as the page that cut this cursor
+    /// read it in its documents' transaction, raised at the sender's own node to
+    /// its highest own record row (`idempotency::delta_base`). The next page
+    /// carries, ahead of its documents and read in their transaction, every
+    /// record with a row above it at the row's origin: every record that changed
+    /// since that read. So a page never holds a document whose record changed
+    /// after its collection's records phase without the record. A scoped or
+    /// converge pull's pages carry only the collection's.
+    ///
+    /// A cursor without it carries no delta: the first page of a pull, which
+    /// each collection's records phase covers, and a cursor a 0.51 receiver
+    /// echoes, having dropped the field (keyed writes are refused while a 0.51
+    /// member is live). Persisted with the cursor (`SNAPSHOT_PROGRESS`), so a
+    /// resumed pull is sent everything that changed since. Read leniently: a
+    /// value of another shape is none.
+    #[serde(default, skip_serializing_if = "Option::is_none", deserialize_with = "lenient")]
+    pub records_base: Option<VersionVector>,
+    /// Set on a **records-only page**: one whose delta did not fit (more than
+    /// [`crate::idempotency::RECORD_PAGE`] records, their bytes, or the rows one
+    /// page reads), which carries no documents and leaves `collection`,
+    /// `after_key` and `records` exactly as they came. The last record row the
+    /// delta examined: the next page goes on after it, origins in node order,
+    /// with `records_base` naming, origin by origin, the base still to be read
+    /// above or the one the next delta starts from. `None` otherwise. Read
+    /// leniently.
+    #[serde(default, skip_serializing_if = "Option::is_none", deserialize_with = "lenient")]
+    pub records_from: Option<Stamp>,
+}
+
+/// An optional cursor field read leniently, in the wire's BSON and in the JSON a
+/// requester persists its progress in: a value that does not read as `T` is
+/// none, so a field of another shape costs the delta and never the cursor.
+fn lenient<'de, D: serde::Deserializer<'de>, T: Deserialize<'de>>(
+    deserializer: D,
+) -> std::result::Result<Option<T>, D::Error> {
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum Lenient<T> {
+        Read(T),
+        Other(serde::de::IgnoredAny),
+    }
+    Ok(match Option::<Lenient<T>>::deserialize(deserializer)? {
+        Some(Lenient::Read(value)) => Some(value),
+        Some(Lenient::Other(_)) | None => None,
+    })
 }
 
 /// A cursor's records position on the wire: a binary, which is what
@@ -626,9 +672,16 @@ pub struct SnapshotPage {
     /// another's documents. A member that takes a document by snapshot must not
     /// take it without the record of the write that produced it, or a retry there
     /// would apply on top of what the snapshot brought. Stored in the page's one
-    /// transaction, by the life rule. No carrying stamp: each is rowed at its own
-    /// `last`. Optional on the wire and read leniently: an older receiver ignores
-    /// them, and an older sender writes none.
+    /// transaction, by the life rule. No carrying stamp: each is rowed at its
+    /// `first` and `last`, and at a fresh stamp of the receiver's when it changes
+    /// what the receiver holds. Optional on the wire and read leniently: an older
+    /// receiver ignores them, and an older sender writes none.
+    ///
+    /// Ahead of those, on every page whose request carried a
+    /// [`SnapshotCursor::records_base`], the page's **records delta**: every
+    /// record (of the scoped collection, for a scoped or converge pull) that
+    /// changed since the page before read its documents, read in this page's
+    /// documents' transaction. On a records-only page the delta is all there is.
     #[serde(
         default,
         skip_serializing_if = "Vec::is_empty",
@@ -882,6 +935,8 @@ impl Engine {
             ..cursor
         });
         let (records, documents, mut deleted_documents, next) = self.snapshot_rows(after, scope)?;
+        #[cfg(test)]
+        crate::sync::race_hooks::reach(crate::sync::race_hooks::Race::PageRead);
         for tombstone in &mut deleted_documents {
             tombstone.key = keyenc::legacy_of_stored(&tombstone.key).into_bytes();
         }
@@ -936,6 +991,17 @@ impl Engine {
     /// transaction: under an id with no collection over it lies what a drop left
     /// for the drop purger (ADR-189), or residue an older collector orphaned, a
     /// life that has ended, which a receiver must never be handed.
+    ///
+    /// **The records delta** (B5, "Snapshots carry records"), first, in the same
+    /// transaction: when the cursor carries a `records_base`, every record of a
+    /// standing collection (of the scoped one, for a scoped snapshot) with a row
+    /// above it ([`crate::idempotency::records_delta`]), ahead of the page's
+    /// records phase and documents. The cursor this page cuts carries the next
+    /// page's base, read here too ([`crate::idempotency::delta_base`]), the first
+    /// page's included. A delta one page cannot hold makes this a
+    /// **records-only page**: the delta's first part and the cursor as it came,
+    /// with where the delta stopped. The records phase's own budget does not
+    /// count the delta, so a delta never starves it.
     #[allow(clippy::type_complexity)]
     fn snapshot_rows(
         &self,
@@ -986,9 +1052,52 @@ impl Engine {
             collection: CollectionId(id),
             after_key: Vec::new(),
             records: Some(at),
+            records_base: None,
+            records_from: None,
         };
 
+        // The records delta, and the base the cursor this page cuts carries, both
+        // read in this transaction, the documents' own.
+        let now_base = crate::idempotency::delta_base(&txn, self.node_id())?;
         let mut records = Vec::new();
+        let mut next_base = now_base.clone();
+        if let Some(cursor) = &after
+            && let Some(base) = &cursor.records_base
+        {
+            let standing = |id: CollectionId| live.contains(&id.0);
+            let delta = crate::idempotency::records_delta(
+                &txn,
+                base,
+                cursor.records_from,
+                &standing,
+                self.record_delta_budget(),
+            )?;
+            next_base = crate::idempotency::next_base(
+                base,
+                cursor.records_from.map(|at| at.node),
+                delta.stopped_at.map(|at| at.node),
+                &now_base,
+            );
+            records = delta.records;
+            if let Some(stopped) = delta.stopped_at {
+                // A records-only page: the document position as it came.
+                let cursor = SnapshotCursor {
+                    records_base: Some(next_base),
+                    records_from: Some(stopped),
+                    ..cursor.clone()
+                };
+                return Ok((records, Vec::new(), Vec::new(), Some(cursor)));
+            }
+        }
+        let delta_len = records.len();
+        let cut = |cursor: Option<SnapshotCursor>| {
+            cursor.map(|cursor| SnapshotCursor {
+                records_base: Some(next_base.clone()),
+                records_from: None,
+                ..cursor
+            })
+        };
+
         let mut out = Vec::new();
         let mut deleted = Vec::new();
         // The row that ended a full page, kept only once it is: across
@@ -1016,22 +1125,24 @@ impl Engine {
                         }
                         continue;
                     }
+                    // The records phase's own, not the delta's.
+                    let phased = records.len() - delta_len;
                     if !out.is_empty()
                         || !deleted.is_empty()
-                        || records.len() >= crate::idempotency::RECORD_PAGE
+                        || phased >= crate::idempotency::RECORD_PAGE
                     {
                         // Another collection's documents are on this page, or
                         // its records are a page already.
                         // not a row: the records position, empty for the first.
                         let cursor = records_cursor(id, at.unwrap_or_default());
-                        return Ok((records, out, deleted, Some(cursor)));
+                        return Ok((records, out, deleted, cut(Some(cursor))));
                     }
                     let after = at.as_deref().and_then(kimmy_core::ScopeHash::from_slice);
                     let (page, more) = crate::idempotency::records_for_collection_page(
                         &txn,
                         CollectionId(id),
                         after.as_ref(),
-                        crate::idempotency::RECORD_PAGE - records.len(),
+                        crate::idempotency::RECORD_PAGE - phased,
                     )?;
                     records.extend(page.into_iter().map(|(scope, record)| {
                         crate::idempotency::CarriedRecord {
@@ -1043,7 +1154,7 @@ impl Engine {
                     }));
                     if let Some(last) = more {
                         let cursor = records_cursor(id, last.as_bytes().to_vec());
-                        return Ok((records, out, deleted, Some(cursor)));
+                        return Ok((records, out, deleted, cut(Some(cursor))));
                     }
                     phase = Phase::Rows(id, None);
                 }
@@ -1071,8 +1182,10 @@ impl Engine {
                                         collection: CollectionId(collection),
                                         after_key,
                                         records: None,
+                                        records_base: None,
+                                        records_from: None,
                                     });
-                                return Ok((records, out, deleted, cursor));
+                                return Ok((records, out, deleted, cut(cursor)));
                             }
                             let (key, value) = row?;
                             let (collection, doc_key) = key.value();
@@ -1456,6 +1569,8 @@ impl Engine {
             if wrote {
                 txn.commit()?;
                 self.count_records_received(via, records_stored);
+                #[cfg(test)]
+                crate::sync::race_hooks::reach(crate::sync::race_hooks::Race::PageCommitted);
             } else {
                 // Nothing was written, so nothing is committed — a page
                 // this node already holds must not cost an fsync.
