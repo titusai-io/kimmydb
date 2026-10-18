@@ -1855,17 +1855,6 @@ impl World {
     /// it, a partial application in this life.
     fn check_i8(&mut self, r: u8, m: usize) -> Res<()> {
         let floor = self.floor(m, ORDERS)?;
-        let first_here = self
-            .ghost
-            .entries
-            .iter()
-            .filter(|(s, (q, qc, _))| *q == r && *qc == ORDERS && s.hlc > floor)
-            .map(|(s, _)| *s)
-            .min();
-        let Some(first_here) = first_here else { return Ok(()) };
-        self.out.i8_checks += 1;
-        let kind = self.sched.requests[r as usize].kind;
-        let e = self.e(m);
         let record = self.live_record(m, ORDERS, self.sched.requests[r as usize].key)?;
         // Finding KR: the record's `first` is another request's under the same key (a key
         // reused for another request, applied on a member without the first one's record,
@@ -1873,6 +1862,25 @@ impl World {
         let first_of_another = record.as_ref().and_then(|rec| {
             self.ghost.entries.get(&rec.first).map(|(q, ..)| *q).filter(|q| *q != r)
         });
+        // The record's `first`, when it is this request's and of this life, counts too: an
+        // attempt still running on another member (this one between its commits) has
+        // minted entries the test has not read yet.
+        let running_first = record
+            .as_ref()
+            .map(|rec| rec.first)
+            .filter(|first| first.hlc > floor && first_of_another.is_none());
+        let first_here = self
+            .ghost
+            .entries
+            .iter()
+            .filter(|(s, (q, qc, _))| *q == r && *qc == ORDERS && s.hlc > floor)
+            .map(|(s, _)| *s)
+            .chain(running_first)
+            .min();
+        let Some(first_here) = first_here else { return Ok(()) };
+        self.out.i8_checks += 1;
+        let kind = self.sched.requests[r as usize].kind;
+        let e = self.e(m);
         // Finding D3: the record's `first` is at or below the life's floor, a record of
         // the request merged across a drop it straddles; the stamp rule then reads the
         // ended life's first.
