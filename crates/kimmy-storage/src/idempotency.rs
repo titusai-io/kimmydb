@@ -2361,3 +2361,7 @@ pub(crate) fn unkeyed<T>(answer: Keyed<T>) -> T {
         Keyed::Replayed(_) => unreachable!("a write made without a key has no record to replay"),
     }
 }
+
+#[path = "idempotency_replay.rs"]
+mod replay;
+pub use replay::{ReplayPageRecords, ReplayRecords};

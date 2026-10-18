@@ -1444,3 +1444,355 @@ async fn a_replay_of_many_pages_is_reported_once_not_once_per_page() {
     f.catch_up.arm_replay(f.a.own_position_at_open(), None).unwrap();
     assert!(f.catch_up.replay_first_loss_from(c), "armed afresh, it is the first again");
 }
+
+// -- B2 and m1 of the B5 build review: what a replay page carries, both ways -----------------
+
+impl Fixture {
+    /// One round the other way: A dials C, and its own round asks C for the replay
+    /// of its origin (`replay_own_origin`, the outbound way), over the real serve
+    /// and sync code.
+    async fn round_outbound(&self) -> Result<SyncOutcome, ProtocolError> {
+        let (mut ours, far) = tokio::io::duplex(MAX_FRAME);
+        let serving = async {
+            let _ = serve_peer(&self.c, far, SECRET, BINDING, None, ServeBudgets::serving(), None)
+                .await;
+        };
+        let mut stalls = PeerStalls::new();
+        stalls.set_catch_up(Some(Arc::clone(&self.catch_up)));
+        let asking = async {
+            open_handshake(&self.a, &mut ours, SECRET, BINDING).await.unwrap();
+            let outcome =
+                sync_over(&self.a, &mut ours, addr(), self.c.node_id(), None, &mut stalls).await;
+            drop(ours);
+            outcome
+        };
+        let ((), outcome) = tokio::join!(serving, asking);
+        outcome
+    }
+
+    /// Rounds one way until C has answered A's replay, at most eight.
+    async fn replay_through(&self, outbound: bool) {
+        for _ in 0..8 {
+            let round = if outbound { self.round_outbound().await } else { self.round().await };
+            round.unwrap();
+            if self.catch_up.replay_answered(self.c.node_id()) {
+                return;
+            }
+        }
+        panic!("the replay is not answered after eight rounds");
+    }
+}
+
+/// The value of `n` in document `id` of `shop.orders` on `engine`.
+fn n_of(engine: &Engine, id: i64) -> i64 {
+    let coll = engine.get_collection("shop", "orders").unwrap();
+    engine.get(&coll, &kimmy_core::DocId::Int64(id)).unwrap().unwrap().get_i64("n").unwrap()
+}
+
+/// G5 with the record's rows at another origin (B2 of the build review). Q's keyed
+/// update-many writes chunk 1 (d1, d2); before Q's chunk 2, the client's retry
+/// runs on R, which lacks Q's record: a fresh attempt writes d1..d4 in one chunk.
+/// Q's chunk 2 then writes d3, d4 later. The merged record's `first` (Q's chunk
+/// 1) and `last` (Q's chunk 2) are both of Q's origin. R pulls Q, and C pulls R:
+/// C holds R's entries and the record, with no row of R's origin. R is restored
+/// from a backup that predates all of it, and C replays R's own entries to it.
+/// With `f3`, R also writes d3, d4 after Q's chunk 2, so none of Q's entries is
+/// in R's oplog: C holds Q's rows above its servable vector, and the page carries
+/// the record by F3 (X4 of the build review's M1).
+fn other_origins_record(f3: bool) -> (Fixture, kimmy_storage::KeyedWrite) {
+    let writer_dir = tempfile::tempdir().unwrap();
+    let writer = Arc::new(Engine::open(&writer_dir.path().join("kimmy.redb")).unwrap());
+    let mut q_dirs = Vec::new();
+    // R is the writer that is later restored; Q must sort before it.
+    let q = loop {
+        let dir = tempfile::tempdir().unwrap();
+        let q = Engine::open(&dir.path().join("kimmy.redb")).unwrap();
+        q_dirs.push(dir);
+        if q.node_id() < writer.node_id() {
+            break Arc::new(q);
+        }
+    };
+    let orders = writer.create_collection("shop", "orders").unwrap();
+    for i in 1..=4i64 {
+        writer.insert(&orders, bson::doc! { "_id": i, "n": 0i64 }).unwrap();
+    }
+    pull_all(&q, &writer);
+    let c_dir = tempfile::tempdir().unwrap();
+    let c = Engine::open(&c_dir.path().join("kimmy.redb")).unwrap();
+    pull_all(&c, &writer);
+    let mut backup = Vec::new();
+    writer.backup_to(&mut backup, kimmy_storage::WalkScope::Request).unwrap();
+    std::thread::sleep(Duration::from_millis(15));
+
+    let k = lost_key(1);
+    let qorders = q.get_collection("shop", "orders").unwrap();
+    q.set_multi_chunk_docs(2);
+    let (w1, q1) = (Arc::clone(&writer), Arc::clone(&q));
+    q.before_next_continuing_write(move || {
+        let worders = w1.get_collection("shop", "orders").unwrap();
+        let first_q = q1.idempotency_record(worders.id, &k.scope).unwrap().unwrap().first;
+        w1.advance_clock_past(&Stamp::new(
+            Hlc::new(first_q.hlc.wall_ms + 5, 0),
+            NodeId::from_bytes([0; 16]),
+        ));
+        let kimmy_storage::Keyed::Fresh(out) = w1
+            .modify_where_keyed(&worders, &kimmy_storage::Candidates::Scan, &IncN, None, &k)
+            .unwrap()
+        else {
+            panic!("R lacks Q's record: a fresh attempt")
+        };
+        assert_eq!(out.modified, 4, "{out:?}");
+        let last_r = w1.idempotency_record(worders.id, &k.scope).unwrap().unwrap().last;
+        q1.advance_clock_past(&Stamp::new(
+            Hlc::new(last_r.hlc.wall_ms + 5, 0),
+            NodeId::from_bytes([0; 16]),
+        ));
+    });
+    let kimmy_storage::Keyed::Fresh(out) =
+        q.modify_where_keyed(&qorders, &kimmy_storage::Candidates::Scan, &IncN, None, &k).unwrap()
+    else {
+        panic!("a fresh key on Q")
+    };
+    assert_eq!(out.modified, 4, "{out:?}");
+    if f3 {
+        let q_last = q.idempotency_record(qorders.id, &k.scope).unwrap().unwrap().last;
+        writer.advance_clock_past(&Stamp::new(
+            Hlc::new(q_last.hlc.wall_ms + 5, 0),
+            NodeId::from_bytes([0; 16]),
+        ));
+        for id in [3i64, 4] {
+            writer
+                .replace(&orders, &kimmy_core::DocId::Int64(id), bson::doc! { "n": 7i64 }, false)
+                .unwrap();
+        }
+    }
+    pull_all(&writer, &q);
+    let merged = writer.idempotency_record(orders.id, &k.scope).unwrap().unwrap();
+    assert_eq!(merged.first.node, q.node_id(), "premise: first is Q's: {merged:?}");
+    assert_eq!(merged.last.node, q.node_id(), "premise: last is Q's: {merged:?}");
+    if f3 {
+        let q_last = q.idempotency_record(qorders.id, &k.scope).unwrap().unwrap().last;
+        assert!(!writer.has_oplog_entry(&q_last).unwrap(), "premise: Q's entries lost on R");
+    }
+    pull_all(&c, &writer);
+    for id in 1..=2 {
+        assert_eq!(n_of(&c, id), 1, "premise: once on C");
+    }
+    let corders = c.get_collection("shop", "orders").unwrap();
+    assert!(c.idempotency_record(corders.id, &k.scope).unwrap().is_some(), "premise: C holds it");
+
+    let a_dir = tempfile::tempdir().unwrap();
+    let path = a_dir.path().join("kimmy.redb");
+    kimmy_storage::backup::restore(&path, &mut backup.as_slice()).unwrap();
+    let a = Engine::open(&path).unwrap();
+    assert_eq!(a.node_id(), writer.node_id());
+    a.create_collection("shop", "startup").unwrap();
+    let marker_dir = tempfile::tempdir().unwrap();
+    let catch_up = CatchUp::open(marker_dir.path(), Duration::from_secs(120));
+    catch_up.arm_replay(a.own_position_at_open(), None).unwrap();
+    let members = Members::default();
+    members.set_catch_up(Arc::clone(&catch_up));
+    let mut dirs = vec![writer_dir, c_dir, a_dir, marker_dir];
+    dirs.extend(q_dirs);
+    (Fixture { a, c, catch_up, members, lost: 0, _dirs: dirs }, k)
+}
+
+/// After the replay, the restored member holds the request's effects with its
+/// record, and a retry there replays rather than applying again.
+fn the_restored_member_holds_the_effect_with_its_record(
+    f: &Fixture,
+    k: &kimmy_storage::KeyedWrite,
+) {
+    let effects: Vec<i64> = (1..=4).map(|id| n_of(&f.a, id)).collect();
+    assert!(effects.contains(&1), "premise: the replay brought effects back: {effects:?}");
+    let aorders = f.a.get_collection("shop", "orders").unwrap();
+    let record = f.a.idempotency_record(aorders.id, &k.scope).unwrap();
+    let retry =
+        f.a.modify_where_keyed(&aorders, &kimmy_storage::Candidates::Scan, &IncN, None, k).unwrap();
+    let after: Vec<i64> = (1..=4).map(|id| n_of(&f.a, id)).collect();
+    assert!(
+        record.is_some() && after == effects,
+        "the restored member holds the request's effect {effects:?} with record {record:?}; \
+         the retry answered {retry:?} and the documents are now {after:?}"
+    );
+}
+
+/// B2, the inbound way: C serves the replay on the contact it opened, and the
+/// page carries the record of the page's collection whose request spans it.
+#[tokio::test]
+async fn b2_an_inbound_replay_carries_a_record_with_no_row_of_the_requesters_origin() {
+    let (f, k) = other_origins_record(false);
+    f.replay_through(false).await;
+    the_restored_member_holds_the_effect_with_its_record(&f, &k);
+}
+
+/// B2, the outbound way: A dials C and asks for its replay (`AskEntries` with
+/// `replay`), and the answer carries the record the same way.
+#[tokio::test]
+async fn b2_an_outbound_replay_carries_a_record_with_no_row_of_the_requesters_origin() {
+    let (f, k) = other_origins_record(false);
+    f.replay_through(true).await;
+    the_restored_member_holds_the_effect_with_its_record(&f, &k);
+}
+
+/// X4 of the build review's M1: the F3 half of a replay page. C holds Q's rows
+/// above its servable vector, so the record rides the page by F3.
+#[tokio::test]
+async fn a_replay_page_carries_a_record_its_sender_cannot_vouch_for() {
+    let (f, k) = other_origins_record(true);
+    f.replay_through(false).await;
+    the_restored_member_holds_the_effect_with_its_record(&f, &k);
+}
+
+/// Plant on `engine` a row of `idempotency_by_stamp` at `stamp` naming a key with
+/// no record, as a retention pass stopped between chunks leaves one, through a
+/// frame's store of a record and the record's removal.
+fn plant_orphan_row(engine: &Engine, stamp: Stamp) -> kimmy_core::ScopeHash {
+    let orders = engine.get_collection("shop", "orders").unwrap();
+    let scope = kimmy_core::ScopeHash([0x0f; 32]);
+    let record = kimmy_storage::IdempotencyRecord {
+        fingerprint: kimmy_core::Fingerprint([0x0f; 32]),
+        first: stamp,
+        last: stamp,
+        origin: stamp.node,
+        state: kimmy_storage::RecordState::Done,
+        outcome: kimmy_storage::RecordOutcome::Insert { stamp },
+    };
+    let carried = kimmy_storage::CarriedRecord {
+        collection: orders.id,
+        scope,
+        carrying: Some(stamp),
+        record: record.encode(),
+    };
+    engine.apply_batch_carrying(&[], &[carried], kimmy_storage::RecordsVia::Pull).unwrap();
+    assert!(engine.idempotency_record(orders.id, &scope).unwrap().is_some(), "premise: stored");
+    assert!(engine.remove_idempotency_record_for_test(orders.id, &scope).unwrap(), "premise");
+    scope
+}
+
+/// An orphan row inside a replay page's range (its record gone, as a retention
+/// pass stopped between chunks leaves it) is passed over without error and ships
+/// nothing, on both ways.
+async fn an_orphan_row_inside_the_page_ships_nothing(outbound: bool) {
+    let f = fixture_of(6, 0, 0, true);
+    let from = f.a.own_position_at_open();
+    let orders = f.c.get_collection("shop", "orders").unwrap();
+    let at = Stamp::new(Hlc::new(from.wall_ms + 1, 0), f.a.node_id());
+    let scope = plant_orphan_row(&f.c, at);
+    f.replay_through(outbound).await;
+    assert_eq!(f.orders(), 2 + 6, "every lost write is back");
+    let aorders = f.a.get_collection("shop", "orders").unwrap();
+    assert_eq!(
+        f.a.idempotency_record(aorders.id, &scope).unwrap(),
+        None,
+        "the orphan shipped nothing"
+    );
+    assert_eq!(aorders.id, orders.id);
+    for i in 2..8 {
+        assert!(f.a.idempotency_record(aorders.id, &lost_scope(i)).unwrap().is_some(), "{i}");
+    }
+}
+
+#[tokio::test]
+async fn an_orphan_row_inside_an_inbound_replay_page_ships_nothing() {
+    an_orphan_row_inside_the_page_ships_nothing(false).await;
+}
+
+#[tokio::test]
+async fn an_orphan_row_inside_an_outbound_replay_page_ships_nothing() {
+    an_orphan_row_inside_the_page_ships_nothing(true).await;
+}
+
+/// A frame's budget for this test thread, put back when dropped.
+struct EntryBudget;
+
+impl EntryBudget {
+    fn set(bytes: usize) -> Self {
+        TEST_ENTRY_BUDGET.with(|budget| budget.set(Some(bytes)));
+        EntryBudget
+    }
+}
+
+impl Drop for EntryBudget {
+    fn drop(&mut self) {
+        TEST_ENTRY_BUDGET.with(|budget| budget.set(None));
+    }
+}
+
+/// `count` records on C of requests that span the replay's start (`first` at or
+/// below it, `last` above it, both of A's origin, at stamps with no entry), each
+/// a `find_and_modify` record carrying a document of about a kilobyte: what
+/// every page of the replay carries at its `first`, so all ride its first entry.
+fn plant_spanning_records(f: &Fixture, count: u16) -> Vec<kimmy_core::ScopeHash> {
+    let from = f.a.own_position_at_open();
+    let orders = f.c.get_collection("shop", "orders").unwrap();
+    let node = f.a.node_id();
+    let pad = "p".repeat(1_000);
+    (0..count)
+        .map(|k| {
+            let first = Stamp::new(Hlc::new(from.wall_ms - 1, k), node);
+            let last = Stamp::new(Hlc::new(from.wall_ms + 1, k), node);
+            let mut scope = [0x5a; 32];
+            scope[30..].copy_from_slice(&k.to_be_bytes());
+            let scope = kimmy_core::ScopeHash(scope);
+            let record = kimmy_storage::IdempotencyRecord {
+                fingerprint: kimmy_core::Fingerprint([0x5a; 32]),
+                first,
+                last,
+                origin: node,
+                state: kimmy_storage::RecordState::Done,
+                outcome: kimmy_storage::RecordOutcome::FindAndModify {
+                    matched: true,
+                    modified: true,
+                    removed: false,
+                    upserted_id: None,
+                    stamp: Some(last),
+                    document: Some(bson::doc! { "pad": pad.clone() }),
+                },
+            };
+            let carried = kimmy_storage::CarriedRecord {
+                collection: orders.id,
+                scope,
+                carrying: Some(first),
+                record: record.encode(),
+            };
+            f.c.apply_batch_carrying(&[], &[carried], kimmy_storage::RecordsVia::Pull).unwrap();
+            scope
+        })
+        .collect()
+}
+
+/// m1 of the build review, and the residual its ruling did not accept: the
+/// records a replay's first entry needs, all of requests that span the replay's
+/// start (carried at a `first` at or below it, so no page of records alone can
+/// move the position past them), fill more than one page. They cross on pages of
+/// records alone at the same position, each going on after the last key the one
+/// before sent, and then the entries follow: the replay is answered, with every
+/// record and every lost write.
+async fn the_records_at_the_replay_start_cross_on_several_pages(outbound: bool) {
+    let f = fixture(5, 0);
+    let scopes = plant_spanning_records(&f, 40);
+    let _budget = EntryBudget::set(8 * 1024);
+    TEST_REPLAY_PAGES_SENT.with(|n| n.set(0));
+    f.replay_through(outbound).await;
+    assert_eq!(f.orders(), 2 + 5, "every lost write is back");
+    let orders = f.a.get_collection("shop", "orders").unwrap();
+    for scope in &scopes {
+        assert!(f.a.idempotency_record(orders.id, scope).unwrap().is_some(), "every record");
+    }
+    assert_eq!(records_unfit().get(UnfitPath::Replay), 0, "nothing was left unfit");
+    if !outbound {
+        let pages = TEST_REPLAY_PAGES_SENT.with(std::cell::Cell::get);
+        assert!(pages >= 5, "pages of records alone, then the entries: {pages}");
+    }
+}
+
+#[tokio::test]
+async fn the_records_at_an_inbound_replays_start_cross_on_several_pages() {
+    the_records_at_the_replay_start_cross_on_several_pages(false).await;
+}
+
+#[tokio::test]
+async fn the_records_at_an_outbound_replays_start_cross_on_several_pages() {
+    the_records_at_the_replay_start_cross_on_several_pages(true).await;
+}

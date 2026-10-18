@@ -688,6 +688,7 @@ impl Confirmer {
         };
         let fits = how_many_fit(&window.entries, &window.records, window.unanchored);
         if let Fits::Nothing = fits {
+            crate::transport::records_unfit().bump(crate::transport::UnfitPath::Push);
             return PushResult::NothingSent {
                 their_node,
                 unreached: Some(
@@ -698,10 +699,17 @@ impl Confirmer {
         }
         if let Fits::Only(fits) = fits {
             if fits == 0 {
-                return failed(ProtocolError::Malformed(format!(
-                    "a single oplog entry at or after {from:?} exceeds the frame limit and \
-                     cannot replicate"
-                )));
+                // No entry fits with the records riding the first (m1 of the B5
+                // build review), or the first is larger than a frame itself:
+                // nothing is pushed, and the waiters resolve pending. A pull's
+                // partial window of records alone carries such records.
+                return PushResult::NothingSent {
+                    their_node,
+                    unreached: Some(format!(
+                        "the member's first entry at or after {from:?} does not fit one frame \
+                         with the idempotency records that ride it; anti-entropy will carry them"
+                    )),
+                };
             }
             // The same push read again to fit its frame, not a second push
             // window: it is not counted.

@@ -178,7 +178,8 @@ pub use hold_meter::{
 };
 pub use idempotency::{
     CarriedRecord, IdempotencyRecord, InFlightGuard, Keyed, KeyedWrite, ModifyRecorded,
-    RecordOutcome, RecordState, RecordsVia, ReturnedImage, lenient_records,
+    RecordOutcome, RecordState, RecordsVia, ReplayPageRecords, ReplayRecords, ReturnedImage,
+    lenient_records,
 };
 pub use index::{CandidateOrder, Dropped, IndexScan, IndexScanOutcome};
 pub use meta::{CollectionMeta, DatabaseMeta, Enforcement, IndexField, IndexMeta, VectorConfig};
