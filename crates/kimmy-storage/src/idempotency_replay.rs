@@ -501,9 +501,33 @@ mod tests {
         for n in 2..=4 {
             plant(&engine, &a, n, at(5), at(15));
         }
-        let read = engine.replay_page_records(&[a.id], from, through, Some(&cursor), 1).unwrap();
+        let read = engine.replay_page_records(&[a.id], from, through, Some(&cursor), 300).unwrap();
         assert!(read.resumed && !read.changed_whole, "{read:?}");
-        assert_eq!(read.changed.len(), 1, "one record past a budget of one byte goes alone");
+        assert_eq!(read.changed.len(), 1, "a budget that holds one record stops after it");
         assert!(read.base.key > cursor.base.key && read.base.epoch == cursor.base.epoch);
+    }
+
+    /// A changed record larger than the budget cannot cross on a page holding
+    /// nothing else, and is refused by name rather than sent alone (P2's rule).
+    #[test]
+    fn a_changed_record_larger_than_the_budget_is_refused_by_name() {
+        let (engine, a, _b, _dir) = open();
+        let (from, through) = (at(10).hlc, at(20).hlc);
+        plant(&engine, &a, 1, at(5), at(15));
+        let cut = engine.replay_page_records(&[a.id], from, through, None, 1 << 20).unwrap();
+        let cursor = ReplayRecords {
+            at: from,
+            through,
+            collections: vec![a.id],
+            collection: a.id,
+            scope: scope(9),
+            base: cut.base,
+        };
+        plant(&engine, &a, 2, at(5), at(15));
+        let refused = engine.replay_page_records(&[a.id], from, through, Some(&cursor), 1);
+        assert!(
+            matches!(&refused, Err(crate::StorageError::SnapshotRowTooLarge { .. })),
+            "{refused:?}"
+        );
     }
 }
