@@ -4903,6 +4903,16 @@ async fn c5_a_retry_is_answered_where_the_keyed_entry_lost() {
 /// C6. A member stopped while its peers collect the history it would need catches up by a
 /// snapshot, and the snapshot carries the record of a keyed write made since: its snapshot
 /// counter moves, and a retry on it is answered from the record.
+///
+/// One setting does two things here: the window that collects the history C would need,
+/// which forces the snapshot, is also the record's window, which the keyed write starts
+/// afresh after that collection. The record must still stand on A when C's snapshot reads
+/// it, and must not be past its window on C when C stores it (a record past its window is
+/// refused, review m2). So the window is sized for the margin: 60 s, of which C's catch-up
+/// takes a few, leaves a stall of C of half a minute or more at its snapshot step (as a
+/// loaded scheduler causes) inside the record's life. At 30 s a 32 s stall had A and B
+/// collect the record two seconds before C's snapshot landed, and the poller below could
+/// never succeed.
 #[tokio::test]
 #[ignore = "boots a real three-node cluster; run with --ignored"]
 async fn c6_a_member_that_caught_up_by_snapshot_answers_a_retry_from_the_record() {
@@ -4912,7 +4922,7 @@ async fn c6_a_member_that_caught_up_by_snapshot_answers_a_retry_from_the_record(
     let client = reqwest::Client::new();
     let (a, b, c, t) = keyed_cluster(
         &client,
-        "oplog_retention_secs = 30\ngc_interval_secs = 2",
+        "oplog_retention_secs = 60\ngc_interval_secs = 2",
         serde_json::json!([]),
     )
     .await;
@@ -4933,8 +4943,8 @@ async fn c6_a_member_that_caught_up_by_snapshot_answers_a_retry_from_the_record(
     // The documents C has not seen, collected on A and on B. They were written at one
     // instant, after every other entry but a few, and expire together: once twenty entries
     // have left the oplog, they are among them. Each count is read as soon as its member
-    // holds the documents: with a 30 s window a slow runner can collect them before a later
-    // read, and the premise is then lost to the clock and not to the code.
+    // holds the documents: a slow runner can collect them before a later read, and the
+    // premise is then lost to the clock and not to the code.
     let held_a = a.gauge(&client, "kimmy_oplog_entries").await.unwrap();
     let held_b = std::cell::Cell::new(0);
     eventually("B to hold the documents in its oplog", || async {
@@ -4958,6 +4968,10 @@ async fn c6_a_member_that_caught_up_by_snapshot_answers_a_retry_from_the_record(
             && series(&client, &c, RECEIVED_SNAPSHOT).await > snapshots
     })
     .await;
+    // A member back from a long stop has not yet heard its peers' blocks again, and its gate
+    // refuses keys until it has (a live member not heard from counts as one that does not
+    // carry records); a client branches on the capability per node, and so does this test.
+    eventually("C to take keys again", || takes_keys(&client, &c)).await;
     let retry = keyed_send(&client, &c, &t[2], reqwest::Method::POST, PATH, BODY, KEY).await;
     assert_eq!(retry.status, 200, "{}", retry.text);
     assert!(retry.replayed, "answered from the record the snapshot carried: {retry:?}");
