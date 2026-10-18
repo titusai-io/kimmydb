@@ -256,6 +256,22 @@ ROWS = [
         "suites": MODEL,
     },
     {
+        "name": "replay-without-the-barrier",
+        "group": "design",
+        "doc": "A coalesced replay answers without waiting for the flush that makes its record durable (F3)",
+        "patches": [
+            ("crates/kimmy-storage/src/engine.rs",
+             """        if waits {
+            blocking(|| engine.wait_for_flush(ticket))
+                .map_err(|e| StorageError::OutcomeUnknown(e.to_string()))?;
+        }
+""",
+             """        let _ = (waits, ticket);
+"""),
+        ],
+        "suites": [("kimmy-storage", "--lib", "idempotency_tests::f3", "no")],
+    },
+    {
         "name": "header-guard-not-over-mcp",
         "group": "elsewhere",
         "doc": "The header guard lets `/mcp` through",

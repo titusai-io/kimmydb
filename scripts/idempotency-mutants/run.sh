@@ -111,7 +111,7 @@ for name in "${ROWS[@]}"; do
         *) result="exit-$rc" ;;
     esac
     invs=$(grep -h "^MODEL-KILL:" "$log" | sed 's/MODEL-KILL: //' | tr ',' '\n' | sort -u | paste -sd, -)
-    [ -z "$invs" ] && invs=$(grep -h "^test .* FAILED$\|^    [a-z_:]*$" "$log" | sed 's/^test //; s/ \.\.\. FAILED//; s/^ *//' | sort -u | paste -sd, -)
+    [ -z "$invs" ] && invs=$(grep -h " \.\.\. FAILED" "$log" | sed 's/^test //; s/ \.\.\. FAILED.*//' | sort -u | paste -sd, -)
     secs=$(( $(date +%s) - start ))
     echo -e "$name\t$result\t${invs:--}\t$secs" >> "$RESULTS"
     echo "$name: $result ($invs) in ${secs}s"

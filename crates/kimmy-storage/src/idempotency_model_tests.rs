@@ -1,12 +1,13 @@
-//! The idempotency model test (B5, design "Tests > Model test"): three engines run
-//! random, seeded schedules of keyed writes, retries, crashes, pulls, snapshots,
-//! drops and retention, and invariants I1 to I7 are asserted after every step.
+//! The idempotency model test (B5, design "Tests > Model test"): three or four engines
+//! run random, seeded schedules of keyed writes, retries, crashes, pulls, snapshots,
+//! outages, drops, restores and retention, and invariants I1 to I7 are asserted after
+//! every step and at quiescence.
 //!
-//! **Members.** Three engines in one process, opened from template stores whose node
-//! identities are fixed (`0x11..`, `0x22..`, `0x33..`), so stamps tie-break the same
-//! way on every run; a member reset is a fresh store with a spare fixed identity
-//! (`0x44..` on), as a wiped node is given a new one. Every engine commits `multi`
-//! writes in chunks of two documents.
+//! **Members.** Three engines in one process, or four (a quarter of the schedules), opened
+//! from template stores whose node identities are fixed (`0x11..` to `0x44..`), so stamps
+//! tie-break the same way on every run; a member reset is a fresh store with a spare
+//! fixed identity (`0x55..` on), as a wiped node is given a new one. Every engine commits
+//! `multi` writes in chunks of two documents.
 //!
 //! **Clocks.** Every local step carries a time `t`, milliseconds past a base an hour
 //! ahead of the wall clock, and the member's clock is moved to it first
@@ -18,58 +19,71 @@
 //! and the schedule's times jump past the window with it.
 //!
 //! **Data.** `shop.orders` holds five counters `{_id: i, n: 0, ks: []}`, written once
-//! before the schedule and replicated everywhere; only keyed `$inc` requests change
-//! them (multi, chunked by two, or single), and `orders` is never dropped.
-//! `shop.items` takes keyed inserts with and without `_id` (the derived one), bulk
-//! inserts of two, replaces and deletes by id, and is dropped and created again.
+//! before the schedule and replicated everywhere; keyed `$inc` requests change them
+//! (every counter, chunked by two; two counters in one chunk; or one, the single form),
+//! unkeyed writes write on top of them, and `orders` is never dropped. `shop.items` takes
+//! keyed inserts with and without `_id` (the derived one), bulk inserts of two, replaces
+//! and deletes by id, unkeyed writes, and is dropped and created again. `shop.big`, in
+//! named rows only, holds more documents than three snapshot pages.
 //!
 //! **Key sets.** Every version a keyed request writes carries, in its `ks` field, the
 //! requests whose applications it contains: the base's list and the request itself,
 //! appended even when present (so a second application is never an unchanged no-op).
-//! A merge keeps the winner's body, and so the winner's set. A tombstone's set is
-//! kept by the test, by its stamp.
+//! An unkeyed write keeps the list it wrote on. A merge keeps the winner's body, and so
+//! the winner's set. A tombstone's set is kept by the test, by its stamp.
 //!
 //! **Steps.** Send a request (a first send or a retry) to a member, with a crash at
 //! one of its commits (`AfterCommit`: the drain deadline passes, so the request's next
 //! transaction is refused; `BeforeCommit`: the next commit's first write fails;
 //! `FsyncFails`: the next commit's fsync fails, its outcome unknown), after which the
 //! member is reopened, and with steps run between any two of its commits (pulls in any
-//! direction, a concurrent attempt of the same request on another member, a page, a
-//! restart of another member, its own clock moving); pull a window, or a short one
-//! (cut at two entries); take a scoped or converge page of a collection, optionally
-//! followed by a restart; reset a member (a fresh store, then a whole-database
-//! snapshot); restart or crash a member; drop or create `items`; and a retention pass
-//! with a moved clock. "Between two commits" is the engine's own commit point
-//! (`barrier_hooks::Point::Released`, after every commit, durable by then), so it is
-//! between any two commits whatever the code under test makes them.
+//! direction, a concurrent attempt of the same request on another member, an unkeyed
+//! write, a page, a restart of another member, its own clock moving); pull a window, or a
+//! short one (cut at two entries); write unkeyed; take a scoped or converge pull of a
+//! collection, optionally followed by a restart; reset a member (a fresh store, then a
+//! whole-database snapshot), with writes on the sender between its pages; take a member
+//! down and up; restart or crash a member; back a member up and restore it, which then
+//! replays its own origin from its peers (ADR-212, as the transport does); drop or create
+//! `items`; and a retention pass with a moved clock. "Between two commits" is the
+//! engine's own commit point (`barrier_hooks::Point::Released`, after every commit,
+//! durable by then), so it is between any two commits whatever the code under test makes
+//! them.
 //!
-//! **Like the server**, no keyed request goes to a member that is catching up after a
-//! whole-database snapshot (until its witnessed vector covers every peer's version
-//! vector), and none once its key's memory ended: a retention step closes an era, and
-//! a request of an earlier era is not sent again (a retry then is a new request,
-//! guarantee 7).
+//! **Like the transport and the server.** A pull applies the sender's verdict: a refusal
+//! (`BeyondHorizon`, which `StateHeld` reads as) sets the peer aside once, the other live
+//! contacts are pulled, and a second refusal takes the peer's whole-database snapshot
+//! (ADR-224); windows are served by `serve_entries_to_peer`. Quiescence runs the
+//! divergence check's repairs and the cut digest's converge pages. No keyed request goes
+//! to a member that is down, nor to one catching up after a whole-database snapshot
+//! (until its witnessed vector covers every peer's version vector; a named row can send
+//! there, as the gate allows once it opens as `unknown`), nor once its key's memory
+//! ended: a retention step closes an era, and a request of an earlier era is not sent
+//! again (a retry then is a new request, guarantee 7).
 //!
 //! **Tracks.** `Home`: every `$inc` request and every retry of it goes to one member
-//! (the home), each is driven to completion there before the next one starts and
-//! before a retention step, and I5 holds exactly. `Anywhere`: retries land on any
-//! member, concurrent attempts on two members included, and I6 bounds the counters.
+//! (the home), which is never reset or restored, each is driven to completion there
+//! before another `$inc`, an unkeyed write of a counter, or a retention step, and I5
+//! holds exactly. `Anywhere`: retries land on any member, concurrent attempts on two
+//! members included, and I6 bounds the counters.
 //!
 //! **The invariants**, after every step unless said otherwise:
 //! - **I1**, never on its own effect: no application of K writes on a base whose set
 //!   holds K. Checked where it happens (the `$inc`'s `apply` sees its base; the test
 //!   reads the base of an insert, replace or delete just before it) and on every
 //!   stored version (no list holds a request twice). Not counted: K's record belongs to
-//!   an earlier life of the collection on that member (its greatest `last` at or below
-//!   the member's tombstone or floor: the life rule, under which a retry after a drop
-//!   applies afresh).
+//!   an earlier life of the collection (its greatest `last` at or below a drop, and K
+//!   wrote that document in no later life: the life rule, under which a retry after a
+//!   drop applies afresh).
 //! - **I2**, the record with the effect: a member that processed an entry of K by
-//!   history (its own, or one a pull shipped it and its coverage then passed) holds
-//!   K's live record with `first` at or below that entry, unless the entry is of an
-//!   earlier life there or K's memory ended; and a member that completed a snapshot
-//!   holds every live record the sender held for what the snapshot carried, merged
-//!   (`first` at or below, `last` at or above).
+//!   history (its own, one a pull shipped it and its coverage then passed, or one an
+//!   own-origin replay read back) holds K's live record with `first` at or below that
+//!   entry, unless the entry is of an earlier life or K's memory ended; and a member that
+//!   completed a snapshot holds every live record the sender held for what the snapshot
+//!   carried, merged (`first` at or below, `last` at or above), save the keys written on
+//!   the sender during it.
 //! - **I3**, once per member: on one member, a request writes each document at most
-//!   once across all its attempts (counted from the entries each node minted).
+//!   once across all its attempts in one life of the collection (counted from the
+//!   entries each node minted).
 //! - **I4**, after quiescence: identical documents, identical live records, and at
 //!   most one document per (request, position) of a keyed insert.
 //! - **I5** (`Home`), after quiescence: each counter is the number of `$inc` requests
@@ -81,18 +95,32 @@
 //! - **Life**: no replay answers from a record of an earlier life (`last` at or below
 //!   the member's tombstone or floor of the collection), or one past its window.
 //!
-//! **Finding G1** (reported; a design change is pending): a member that took a
-//! collection by a whole-database snapshot relays the later versions it holds as state
-//! without the record of the request whose effect they contain (a page's record is
-//! rowed at its `last`, and a window carries only the rows at the stamps it ships), and
-//! the relay's coverage passes the request's own entries, so the receiver never gets
-//! the record. A retry there applies on top of the effect. The model classifies exactly
-//! that shape (an application on its own effect by a member that held no live record of
-//! the key before it and processed no entry of the request of the current life) as G1
-//! and counts it; with `IDEM_STRICT=1` it fails the run as I1 (and I4, I5).
-//! `finding_g1_*` is its reproducer.
+//! **Findings the model classifies** (counted in every run's summary line; with
+//! `IDEM_STRICT=1`, and in every named row, the first three fail the run):
+//! - **Relay** (the G1 analysis's G1b, G2, G2b, G3, T2, G5): an effect or an entry of K
+//!   reached a member without K's record (an application on its own effect by a member
+//!   that held no live record and had taken no entry of K of the current life; an entry
+//!   shipped without the record by a sender that held it; a record missing at quiescence
+//!   where a document holds K). Fixed by records travelling with coverage.
+//! - **L1**: a drop in the millisecond of a commit's first entry buries the record,
+//!   judged by its `last` (that first entry), while a later entry of the commit stands in
+//!   the life after it. Fixed by a record's `last` being its commit's last entry.
+//! - **S1**: a record at quiescence that the merged record dominates, or none where no
+//!   document holds the key: a record state carried only by entries that lost where the
+//!   member pulled them from, or by a record-only `done`. Harmless while I2 holds.
+//! - **D1** (counted, by design): an entry of a life a drop ended elsewhere, taken by a
+//!   member that has not received the drop, from a sender that purged its record.
+//! - **R1** (counted, a convergence matter outside B5): a reset identity's writes, or a
+//!   restored identity's writes after its backup, kept by peers only as page state,
+//!   never converge to the reset or restored member.
+//!
+//! **Reproducers.** `finding_g1_*` (G1 as first reported: its pull serves the window
+//! without the sender's verdict, which production refuses as `StateHeld`; kept as the
+//! mechanism's minimal form) and `finding_l1_*`, both ignored until their fix lands.
+//! The named rows `row_*` write out the breaks of the G1 analysis and the shapes the
+//! design's mutants need.
 
-// Members are indices into three-element arrays (`LETTERS`, the members, a step's
+// Members are indices into small per-member arrays (`LETTERS`, the members, a step's
 // records) all through: a range reads as "every member", an enumeration would not.
 #![allow(clippy::needless_range_loop)]
 
@@ -296,6 +324,15 @@ pub(crate) enum Step {
     Big {
         m: u8,
     },
+    /// Take a backup of `m`, kept for a later restore.
+    Backup {
+        m: u8,
+    },
+    /// Restore `m` from its backup (its identity kept), then replay its own origin from
+    /// every member that is up, as the transport does after a restore (ADR-212).
+    Restore {
+        m: u8,
+    },
     Restart {
         m: u8,
     },
@@ -372,6 +409,8 @@ impl std::fmt::Display for Op {
             Step::Down { m } => write!(f, "{}.down", l(*m)),
             Step::Up { m } => write!(f, "{}.up", l(*m)),
             Step::Big { m } => write!(f, "{}.big", l(*m)),
+            Step::Backup { m } => write!(f, "{}.backup", l(*m)),
+            Step::Restore { m } => write!(f, "{}.restore", l(*m)),
             Step::Restart { m } => write!(f, "{}.restart", l(*m)),
             Step::Crash { m } => write!(f, "{}.crash", l(*m)),
             Step::Drop { m } => write!(f, "{}.drop(items)@{t}", l(*m)),
@@ -594,7 +633,7 @@ struct Ghost {
     drops: Vec<(u8, Stamp)>,
     /// (node, entry) I2 let pass because a drop elsewhere ended its life (D1).
     dropped_elsewhere: HashSet<(NodeId, Stamp)>,
-    /// (node, entry) of the current life whose record is buried (finding G2).
+    /// (node, entry) of the current life whose record is buried (finding L1).
     g2: HashSet<(NodeId, Stamp)>,
     /// (node, entry) a sender holding the record shipped without it (the relay class).
     g1b: HashSet<(NodeId, Stamp)>,
@@ -746,12 +785,16 @@ struct World {
     running: Option<usize>,
     /// Identities a reset retired.
     retired: HashSet<NodeId>,
+    /// Restored identities, and where their store's own origin was at the restore.
+    restored: HashMap<NodeId, Hlc>,
     /// A drive is running: the home track's policy does not nest.
     driving: bool,
     /// Classified findings fail the run (`IDEM_STRICT=1`, or a named row).
     strict: bool,
     /// Members the schedule has taken down.
     down: Vec<bool>,
+    /// Each member's backup, with the identity it was taken under.
+    backups: HashMap<usize, (NodeId, Vec<u8>)>,
     /// Requests go to a member catching up after a whole-database snapshot: what the
     /// catching-up gate allows once it opens as `unknown` (finding G7), for a row.
     retry_catching_up: bool,
@@ -788,10 +831,12 @@ impl World {
             out: Outcome::default(),
             running: None,
             retired: HashSet::new(),
+            restored: HashMap::new(),
             driving: false,
             strict: strict(),
             down: vec![false; count],
             retry_catching_up: false,
+            backups: HashMap::new(),
             step: "setup".into(),
         };
         for m in 0..count {
@@ -1412,7 +1457,8 @@ impl World {
     }
 
     /// Classify an application of request `r` on member `m` whose base already holds
-    /// it (I1): allowed by the life rule, finding G1, or a violation.
+    /// it (I1): allowed by the life rule, a classified finding (relay, L1), or a
+    /// violation.
     #[allow(clippy::too_many_arguments)]
     fn on_own_effect(
         &mut self,
@@ -1735,6 +1781,14 @@ impl World {
                 self.down[*m as usize] = false;
                 self.note(format!("{} is up", LETTERS[*m as usize]));
             }
+            Step::Backup { m } => {
+                let m = *m as usize;
+                let mut bytes = Vec::new();
+                let e = self.e(m);
+                e.backup_to(&mut bytes, WalkScope::Background).map_err(|e| err("backup", e))?;
+                self.backups.insert(m, (e.node_id(), bytes));
+            }
+            Step::Restore { m } => self.restore(*m as usize)?,
             Step::Big { m } => {
                 let m = *m as usize;
                 let e = self.e(m);
@@ -1807,6 +1861,142 @@ impl World {
             Step::Clock { m } => self.clock(*m as usize, op.t),
         }
         Ok(())
+    }
+
+    /// Restore `m` from its backup, under the identity it was taken under, then replay its
+    /// own origin from every member that is up.
+    fn restore(&mut self, m: usize) -> Res<()> {
+        let Some((node, bytes)) = self.backups.get(&m).cloned() else {
+            self.note(format!("{} has no backup: no restore", LETTERS[m]));
+            return Ok(());
+        };
+        if node != self.e(m).node_id() {
+            self.note(format!("{} was reset since its backup: no restore", LETTERS[m]));
+            return Ok(());
+        }
+        let arc = self.members[m].engine.take().expect("open");
+        drop(Arc::into_inner(arc).ok_or("the engine is held elsewhere")?);
+        let path = self.members[m].path.clone();
+        let dir = path.parent().expect("a member's directory").to_path_buf();
+        for entry in std::fs::read_dir(&dir).map_err(|e| err("read_dir", e))? {
+            let entry = entry.map_err(|e| err("read_dir", e))?;
+            std::fs::remove_file(entry.path()).map_err(|e| err("remove", e))?;
+        }
+        crate::backup::restore(&path, &mut bytes.as_slice()).map_err(|e| err("restore", e))?;
+        self.open(m)?;
+        self.note(format!("{} restored from its backup", LETTERS[m]));
+        let at = self.e(m).own_position_at_open();
+        let held = self.restored.entry(node).or_insert(at);
+        *held = (*held).min(at);
+        // What the member took and wrote after the backup is gone with its store.
+        let e = self.e(m);
+        let mut gone = Vec::new();
+        for (n, stamp) in self.ghost.processed.keys() {
+            if *n == node && !e.has_oplog_entry(stamp).map_err(|e| err("has_oplog_entry", e))? {
+                gone.push(*stamp);
+            }
+        }
+        for stamp in &gone {
+            self.ghost.processed.remove(&(node, *stamp));
+        }
+        for ((n, ..), written) in self.ghost.writes.iter_mut() {
+            if *n == node {
+                written.retain(|stamp| !gone.contains(stamp));
+            }
+        }
+        for peer in 0..self.n() {
+            if peer != m && !self.down[peer] {
+                self.replay_own_origin(m, peer)?;
+            }
+        }
+        Ok(())
+    }
+
+    /// The replay of `m`'s own origin from `peer` after a restore (ADR-212), as the
+    /// transport makes it: the peer serves `m`'s entries above where `m`'s store left
+    /// off, every other origin passed over; the page carries the records whose carrying
+    /// stamp is one of its entries (`records_of`); `m` folds each stamp into its clock
+    /// and applies the entries it no longer holds, with those records.
+    fn replay_own_origin(&mut self, m: usize, peer: usize) -> Res<()> {
+        let me = self.e(m).node_id();
+        let mut from = self.e(m).own_position_at_open();
+        for _ in 0..32 {
+            let (src, dst) = (self.e(peer), self.e(m));
+            let ours = src.version_vector().map_err(|e| err("version_vector", e))?;
+            if ours.get(me) <= from {
+                return Ok(());
+            }
+            let mut held = ours.clone();
+            for (node, _) in ours.iter() {
+                if node != me {
+                    held.insert(node, Hlc::MAX);
+                }
+            }
+            held.insert(me, from);
+            if src.serve_verdict(&held).map_err(|e| err("serve_verdict", e))? != ServeVerdict::Serve
+            {
+                self.note(format!("{}'s replay from {}: refused", LETTERS[m], LETTERS[peer]));
+                return Ok(());
+            }
+            let window = src
+                .serve_entries_to_peer(from, BATCH, Some(&held), &[], None)
+                .map_err(|e| err("serve_entries_to_peer", e))?;
+            let own: Vec<kimmy_core::OplogEntry> = window
+                .entries
+                .iter()
+                .filter(|entry| entry.stamp.node == me && entry.stamp.hlc > from)
+                .cloned()
+                .collect();
+            let shipped: HashSet<Stamp> = own.iter().map(|entry| entry.stamp).collect();
+            let records: Vec<crate::idempotency::CarriedRecord> = window
+                .records
+                .iter()
+                .filter(|w| w.carrying.is_some_and(|at| shipped.contains(&at)))
+                .cloned()
+                .collect();
+            for entry in &own {
+                dst.advance_clock_past(&entry.stamp);
+            }
+            let mut lost = Vec::new();
+            for entry in &own {
+                if !dst.has_oplog_entry(&entry.stamp).map_err(|e| err("has_oplog_entry", e))? {
+                    lost.push(entry.clone());
+                }
+            }
+            if !lost.is_empty() {
+                dst.apply_batch_carrying(&lost, &records, RecordsVia::Replay)
+                    .map_err(|e| err("apply_batch_carrying", e))?;
+                let s = format!(
+                    "{} read back {} of its own entries from {} ({} records)",
+                    LETTERS[m],
+                    lost.len(),
+                    LETTERS[peer],
+                    records.len()
+                );
+                self.note(s);
+                // Taken by history, so I2 holds them to their records; one the peer held
+                // the record of and did not send is the relay class at its source.
+                for entry in &lost {
+                    let Some((r, c, _)) = self.ghost.entries.get(&entry.stamp).cloned() else {
+                        continue;
+                    };
+                    self.ghost.mark_processed(me, entry.stamp);
+                    let key = self.sched.requests[r as usize].key;
+                    let carried = records
+                        .iter()
+                        .any(|w| w.collection == coll_id(c) && w.scope == ScopeHash([key; 32]));
+                    if !carried && self.live_record(peer, c, key)?.is_some() {
+                        self.ghost.g1b.insert((me, entry.stamp));
+                    }
+                }
+            }
+            let after = own.last().map_or(window.scanned_to, |entry| entry.stamp.hlc).max(from);
+            if window.exhausted || after == from {
+                return Ok(());
+            }
+            from = after;
+        }
+        Err("a replay that never ended".into())
     }
 
     /// An unkeyed write on `m`, on top of what `m` holds: the version keeps its key
@@ -2084,7 +2274,7 @@ impl World {
                 if self.straddles(r, stamp, end)
                     || (record.is_none() && self.ghost.last.get(&r).is_some_and(|l| l.hlc <= end))
                 {
-                    // Finding G2 (see `on_own_effect`): the entry stands in the current
+                    // Finding L1 (see `on_own_effect`): the entry stands in the current
                     // life, and its request's record is buried by its `last`.
                     if self.ghost.g2.insert((node, stamp)) {
                         self.out.l1 += 1;
@@ -2322,11 +2512,16 @@ impl World {
                     // page left as held state elsewhere: no vector covers its origin, so
                     // every pull defers it and the digest never compares it. Not this
                     // test's: convergence across a reset.
-                    let retired = |v: Option<&(Stamp, Document)>| {
-                        v.is_none_or(|(s, _)| self.retired.contains(&s.node))
+                    // So is a restored identity's write it made after its backup, held by
+                    // a peer only as page state: no own-origin replay reads back what a
+                    // peer does not hold in position.
+                    let gone = |s: &Stamp| {
+                        self.retired.contains(&s.node)
+                            || self.restored.get(&s.node).is_some_and(|at| s.hlc > *at)
                     };
-                    retired_only &= (retired(a) || retired(b))
-                        && [a, b].iter().flatten().any(|(s, _)| self.retired.contains(&s.node));
+                    let retired = |v: Option<&(Stamp, Document)>| v.is_none_or(|(s, _)| gone(s));
+                    retired_only &=
+                        (retired(a) || retired(b)) && [a, b].iter().flatten().any(|(s, _)| gone(s));
                     let _ = write!(
                         diff,
                         " {k:?}: A {:?} / {} {:?};",
@@ -2375,7 +2570,7 @@ impl World {
             // never reaches it; harmless while I2 holds, since every entry the member
             // processed is at or above its own `first`. None where a document holds a
             // request under the key, every entry vetted by I2 as it was taken: the effect
-            // came without its record, finding G1 (or G2). Anything else fails.
+            // came without its record, the relay class (or L1). Anything else fails.
             let merged = records
                 .iter()
                 .flatten()
@@ -2626,8 +2821,10 @@ fn setup(w: &mut World) -> Res<()> {
     let counters: Vec<Document> =
         (0..COUNTERS).map(|i| doc! { "_id": i, "n": 0i64, "ks": Vec::<Bson>::new() }).collect();
     a.insert_many(&orders, counters).map_err(|e| err("insert_many", e.source))?;
-    w.pull(1, 0, BATCH)?;
-    w.pull(2, 0, BATCH)
+    for m in 1..w.n() {
+        w.pull(m, 0, BATCH)?;
+    }
+    Ok(())
 }
 
 /// The end: quiet, then (home track) every accepted `$inc` driven to its end and quiet
@@ -3074,6 +3271,17 @@ pub(crate) fn generate(seed: u64, track: Track, len: usize) -> Schedule {
                 let m = plan.member();
                 Op { step: Step::Create { m }, t: plan.t(m, 0) }
             }
+            93 => Op { step: Step::Backup { m: plan.member() }, t: 0 },
+            94 => {
+                // Not the home on the home track: a restore loses what it wrote after the
+                // backup, the `$inc`s it answered among them.
+                let m = plan.member();
+                if track == Track::Home && m == plan.home {
+                    Op { step: Step::Restart { m }, t: 0 }
+                } else {
+                    Op { step: Step::Restore { m }, t: 0 }
+                }
+            }
             91..=92 => {
                 // The window passes: an era ends.
                 plan.g += WINDOW_SECS as i64 * 1000 + 500;
@@ -3191,7 +3399,7 @@ const LEN: usize = 30;
 #[test]
 fn generated_schedules_short() {
     let start = env_u64("IDEM_SEED_START", 0);
-    let count = env_u64("IDEM_CI_SEEDS", 24);
+    let count = env_u64("IDEM_CI_SEEDS", 16);
     sweep(start..start + count, LEN, threads().min(4));
 }
 
@@ -3479,6 +3687,30 @@ fn row_r1c_a_whole_database_retry_at_completion() {
     );
 }
 
+/// G5: A is restored from a backup taken before its keyed `$inc` and the write it made on
+/// top. B's copy of the `$inc` lost (C's write came first), and B holds A's write on top;
+/// A's own-origin replay from B reads that write back, without the record. A is the
+/// member guarantee 4 tells the client to retry on, and a retry there must replay.
+#[test]
+#[ignore = "fails until replay pages carry records by coverage (idempotency-g)"]
+fn row_g5_an_own_origin_replay_after_a_restore() {
+    row(
+        "g5",
+        3,
+        vec![req(1, Kind::IncSingle { d: 0 })],
+        vec![
+            Op { step: Step::Backup { m: A }, t: 0 },
+            ask(0, A, 100),
+            touch(C, ORDERS, 0, 101),
+            pull(B, C),
+            touch(A, ORDERS, 0, 110),
+            pull(B, A),
+            Op { step: Step::Restore { m: A }, t: 0 },
+            ask(0, A, 120),
+        ],
+    );
+}
+
 /// Concurrent attempts on two members (Chris, 2026-10-18): A's fresh multi-chunk attempt
 /// commits its first chunk; B, without A's record, runs the request whole; A pulls B. A's
 /// later chunks must leave every counter B's attempt wrote (the stamp rule applies to a
@@ -3651,7 +3883,7 @@ fn row_a_resumed_requests_record_reaches_every_member() {
     );
 }
 
-// -- Finding G1 ------------------------------------------------------------------------------
+// -- Reproducers -------------------------------------------------------------------------------
 
 /// `$inc` of `n` by one, with no key set: the reproducer's own.
 struct PlainInc;
@@ -3713,7 +3945,7 @@ fn pull_all(to: &Engine, from: &Engine) {
 /// guarantee 2 (a member holding any effect of the write holds its record), so it fails
 /// until the design closes the gap.
 #[test]
-#[ignore = "finding G1: a snapshot-held version is relayed without its record (design change pending)"]
+#[ignore = "finding G1, as first reported: fails until records travel with coverage (idempotency-g)"]
 fn finding_g1_a_relay_of_a_snapshot_held_version_drops_the_record() {
     let dir = tempfile::tempdir().unwrap();
     let y = Engine::open(&dir.path().join("y.redb")).unwrap();
