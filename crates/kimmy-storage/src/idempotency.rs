@@ -2284,8 +2284,9 @@ impl Engine {
             };
             let (from, to) = (row_key_at(at.node, Hlc::ZERO), row_key_at(at.node, Hlc::MAX));
             // not a row: the origin's last key, one seek.
-            let last = rows.range::<&[u8]>((Included(from.as_slice()), Included(to.as_slice())))?;
-            if let Some(last) = last.last().transpose()?
+            let mut last =
+                rows.range::<&[u8]>((Included(from.as_slice()), Included(to.as_slice())))?;
+            if let Some(last) = last.next_back().transpose()?
                 && let Some(stamp) = decode_row_key(last.0.value())
             {
                 high = high.max(stamp.hlc);
