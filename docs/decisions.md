@@ -28765,7 +28765,11 @@ with it, and not be offered while any member could carry the write without it.
      collection, the id, the size) instead of a frame `write_frame` refuses. Before it a page carried 512 rows whatever
      their size, so 512 averaging over about 128 KiB (64 KiB with records on the page) made a page over a frame, the
      connection closed, and the pull asked for the same page for ever (found in 0.51.0 while bounding the records
-     phase).
+     phase). **A converge repair's bound** (ADR-237: it ends once it has walked the collection's size at planning)
+     **counts the documents and tombstones its pages carried**, against that size and two full pages more, not its
+     pages: a page cut short by its bytes, or one of records only, carries fewer than 512 rows, and counted as a page
+     either ended the repair before it had walked the collection (the build review's m6). Where every page is full the
+     bound is what it was.
    - **The page delta.** A keyed write on the sender after a collection's records phase and before the page that holds
      its document would reach the receiver without its record. So each member keeps a node-local **change log**,
      `idempotency_changes`: one row per store that changes a record, on every path (a local commit, a frame, a replay

@@ -808,6 +808,12 @@ pub struct SnapshotProgress {
     pages: usize,
     /// Documents written so far — those that won last-writer-wins here.
     documents: usize,
+    /// Under [`SnapshotPolicy::Converge`]: the rows the applied pages carried,
+    /// documents and tombstones, written here or not, records not counted, which
+    /// is what its bound is measured in (the transport's `bound_converge`). Never
+    /// stored, as that pull never is; 0 for every other pull.
+    #[serde(skip)]
+    rows: usize,
     /// Whether the final page has been applied.
     complete: bool,
 }
@@ -865,23 +871,28 @@ impl SnapshotProgress {
             granted: None,
             pages: 0,
             documents: 0,
+            rows: 0,
             complete: false,
         }
     }
 
     /// This progress as it stands after `page` has been applied, `applied`
-    /// documents of it having been written here.
+    /// documents of it having been written here; `deletes` the deletes it
+    /// carried (`CarriedDelete::of_page`, the one reader of them).
     ///
     /// Split out because the record persisted in the page's own transaction
     /// has to be the state the page LEAVES, and that transaction commits
     /// before the caller's `progress` is advanced. One function so the two
     /// cannot drift: a persisted cursor that disagreed with the in-memory one
     /// would resume somewhere neither had been.
-    fn advanced(&self, page: &SnapshotPage, applied: usize) -> Self {
+    fn advanced(&self, page: &SnapshotPage, applied: usize, deletes: usize) -> Self {
         let mut next = self.clone();
         next.after = page.next.clone();
         next.pages += 1;
         next.documents += applied;
+        if self.policy == SnapshotPolicy::Converge {
+            next.rows += page.documents.len() + deletes;
+        }
         next.complete = page.next.is_none();
         next
     }
@@ -923,6 +934,13 @@ impl SnapshotProgress {
     /// Documents written so far.
     pub fn documents(&self) -> usize {
         self.documents
+    }
+
+    /// Under [`SnapshotPolicy::Converge`]: the rows (documents and tombstones)
+    /// the applied pages carried, written here or not; a page of records only
+    /// carries none. 0 for every other pull.
+    pub fn rows(&self) -> usize {
+        self.rows
     }
 
     /// Whether the final page has been applied.
@@ -1870,7 +1888,7 @@ impl Engine {
                 Engine::persist_snapshot_progress_in_txn(
                     &txn,
                     peer,
-                    &progress.advanced(page, pending.len()),
+                    &progress.advanced(page, pending.len(), deletes.len()),
                 )?;
             }
             if wrote {
@@ -1889,7 +1907,7 @@ impl Engine {
             failed = error;
         }
 
-        *progress = progress.advanced(page, applied);
+        *progress = progress.advanced(page, applied, deletes.len());
         // The one completion with no page transaction to ride in: a final page
         // that wrote nothing, which cannot clear a record an earlier page
         // left. Checked before it is opened, so a snapshot that never
@@ -2112,7 +2130,7 @@ impl Engine {
             applied = count - created + replaced;
             failed = error;
         }
-        *progress = progress.advanced(page, applied + created);
+        *progress = progress.advanced(page, applied + created, deletes.len());
         if progress.complete {
             info!(
                 collection = ?progress.scope,
