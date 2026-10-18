@@ -82,7 +82,7 @@ fn rows(engine: &Engine) -> Vec<(Stamp, u64, [u8; 32])> {
         .unwrap()
         .map(|row| {
             let (key, value) = row.unwrap();
-            let stamp = crate::codec::decode_oplog_key(key.value()).unwrap();
+            let stamp = idempotency::decode_row_key(key.value()).unwrap();
             let value = value.value();
             let id = u64::from_be_bytes(value[..8].try_into().unwrap());
             (stamp, id, value[8..].try_into().unwrap())
@@ -1393,10 +1393,12 @@ fn f7_retention_collects_a_record_one_window_after_its_last() {
     let first_row = rows(&engine).iter().map(|(s, ..)| *s).min().unwrap();
     assert!(stored.last.hlc.wall_ms >= first_row.hlc.wall_ms + 10_000, "premise");
     let between = first_row.hlc.wall_ms + DAY_MS + 1;
+    let held_rows = rows(&engine);
     let pass = engine.collect_garbage_at(between, policy).unwrap();
     assert_eq!(pass.records_removed, 0, "a later chunk changed it");
     assert_eq!(record(&engine, &coll, &k2), Some(stored.clone()));
-    assert!(rows(&engine).iter().all(|(s, ..)| *s > first_row), "only the row went");
+    assert_eq!(stored.first, first_row, "premise: the expired row is the record's first");
+    assert_eq!(rows(&engine), held_rows, "a live record's row at `first` stays (F1)");
     let pass = engine.collect_garbage_at(stored.last.hlc.wall_ms + DAY_MS + 1, policy).unwrap();
     assert_eq!(pass.records_removed, 1);
 
@@ -1501,7 +1503,8 @@ fn a_stop_ends_the_records_step_between_chunks() {
         txn.commit().unwrap();
     }
     let cutoff = Hlc::new(1_000_000_000, 0);
-    engine.stop_walks_after_rows(idempotency::RECORD_COLLECT_CHUNK as u64 + 1);
+    // A chunk's rows, and the one seek that finds the origin they belong to.
+    engine.stop_walks_after_rows(idempotency::RECORD_COLLECT_CHUNK as u64 + 2);
     let stopped = engine.collect_idempotency_records(cutoff);
     assert!(matches!(stopped, Err(StorageError::Stopping(_))), "{stopped:?}");
     assert_eq!(engine.idempotency_records().unwrap(), 500, "the first chunk stands");
@@ -1533,7 +1536,7 @@ fn a_record_whose_row_at_last_is_missing_is_still_collected() {
             .unwrap();
         txn.open_table(tables::IDEMPOTENCY_BY_STAMP)
             .unwrap()
-            .remove(crate::codec::oplog_key(&r.last).as_slice())
+            .remove(idempotency::row_key(&r.last).as_slice())
             .unwrap();
         txn.commit().unwrap();
     }

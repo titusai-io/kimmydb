@@ -471,6 +471,12 @@ pub fn restore_with(
                         idempotency.insert((coll, scope), value.as_slice())?;
                     }
                     T_IDEMPOTENCY_BY_STAMP => {
+                        // Keyed origin-major, `node ‖ hlc` (`idempotency::row_key`).
+                        if crate::idempotency::decode_row_key(&key).is_none() {
+                            return Err(StorageError::Database(
+                                "bad idempotency row key in backup".into(),
+                            ));
+                        }
                         idempotency_by_stamp.insert(key.as_slice(), value.as_slice())?;
                     }
                     // A tag this build does not know means the backup came from

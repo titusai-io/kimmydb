@@ -403,6 +403,10 @@ const BOUNDED_READS: &[(&str, &str)] = &[
          bounds it (ADR-192)",
     ),
     (
+        "idempotency::Engine::records_high_water",
+        "at open: two seeks per origin that has a record row, its first key and its last",
+    ),
+    (
         "idempotency::Engine::records_under",
         "one seek: whether a collection id has any idempotency record",
     ),
@@ -420,7 +424,8 @@ const BOUNDED_READS: &[(&str, &str)] = &[
     (
         "idempotency::records_for_window",
         "the rows between a served window's first and last stamps, read in the window's own read \
-         transaction: a row per stamp the window's walk passed over at most",
+         transaction, a seek per origin with a row: a row per stamp the window's walk passed over \
+         at most",
     ),
     (
         "purge::Engine::owed_purges",

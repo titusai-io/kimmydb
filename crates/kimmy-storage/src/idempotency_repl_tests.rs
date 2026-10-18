@@ -570,7 +570,7 @@ fn an_undecodable_record_goes_when_its_row_expires() {
         row.extend_from_slice(k.scope.as_bytes());
         txn.open_table(crate::tables::IDEMPOTENCY_BY_STAMP)
             .unwrap()
-            .insert(crate::codec::oplog_key(&at).as_slice(), row.as_slice())
+            .insert(crate::idempotency::row_key(&at).as_slice(), row.as_slice())
             .unwrap();
         txn.commit().unwrap();
     }
