@@ -413,8 +413,12 @@ fn a_dropped_slot_refuses_a_block_decoded_before_it() {
     assert!(hear(&members, 1, block(1), Some(1), crate::facts::next_decoded_seq()));
     // This member's own Defunct drops every slot, one never heard included.
     let before_defunct = crate::facts::next_decoded_seq();
-    let mut collector =
-        Collector { outgoing: Vec::new(), timers: Vec::new(), members: members.clone() };
+    let mut collector = Collector {
+        outgoing: Vec::new(),
+        timers: Vec::new(),
+        members: members.clone(),
+        rejoined: false,
+    };
     collector.notify(Notification::Defunct);
     assert!(!hear(&members, 1, block(1), Some(2), before_defunct));
     assert!(!hear(&members, 2, block(2), Some(2), before_defunct));
@@ -474,8 +478,12 @@ fn the_drop_floors_are_pruned() {
     );
     // This member's own Defunct sets a floor above every drop floor, which then
     // say nothing more: they are pruned at the next block.
-    let mut collector =
-        Collector { outgoing: Vec::new(), timers: Vec::new(), members: members.clone() };
+    let mut collector = Collector {
+        outgoing: Vec::new(),
+        timers: Vec::new(),
+        members: members.clone(),
+        rejoined: false,
+    };
     collector.notify(Notification::Defunct);
     assert!(hear(&members, 1, block(1), Some(3), crate::facts::next_decoded_seq()));
     assert_eq!(members.drop_floors_for_test(), 0, "covered by the global floor");
@@ -498,8 +506,12 @@ fn own_defunct_and_rejoin_clear_the_read_map_and_the_peer_blocks() {
             rig.echo(p, generation);
         }
         assert!(rig.effective(), "confirmed by both");
-        let mut collector =
-            Collector { outgoing: Vec::new(), timers: Vec::new(), members: rig.members.clone() };
+        let mut collector = Collector {
+            outgoing: Vec::new(),
+            timers: Vec::new(),
+            members: rig.members.clone(),
+            rejoined: false,
+        };
         let identity = Member::identified(a(7900), n(9));
         if rejoin {
             collector.notify(Notification::Rejoin(&identity));
@@ -634,8 +646,12 @@ fn no_yield_transition_moves_the_address_generations() {
     rig.set_yield(false);
     rig.members.note_echo(n(1), None);
     hear(&rig.members, 1, block(2), Some(1), crate::facts::next_decoded_seq());
-    let mut collector =
-        Collector { outgoing: Vec::new(), timers: Vec::new(), members: rig.members.clone() };
+    let mut collector = Collector {
+        outgoing: Vec::new(),
+        timers: Vec::new(),
+        members: rig.members.clone(),
+        rejoined: false,
+    };
     collector.notify(Notification::Defunct);
     assert_eq!(rig.members.generation(&addr), Some(before), "nothing moved it");
     rig.members.insert_for_test(addr, n(1));
