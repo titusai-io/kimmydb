@@ -222,10 +222,11 @@ until a member migrates: its partial unique indexes enforce on decimals (and its
 indexes decide them by exact value), where a 0.50 member's do not.
 
 **Idempotency keys (0.52.0, [ADR-240](decisions.md)) add optional wire fields and give
-the roll a declaration.** A keyed write's record travels beside its entries, as an
-optional `records` field on entries, replays, pushes and snapshot pages, with an optional
-records position in the snapshot cursor and `idempotency_records` in the facts block; a
-0.51 member ignores all of them and sends none. That is safe to roll and not safe to
+the roll a declaration.** A keyed write's record travels with the coverage a window
+grants, as an optional `records` field on entries, replays, pushes and snapshot pages (a
+list that may carry records riding no entry the frame ships), with an optional records
+position and `records_base` in the snapshot cursor and `idempotency_records` in the facts
+block; a 0.51 member ignores all of them and sends none. That is safe to roll and not safe to
 take keys across. A 0.51 member ignores the header (it applies the write, with a random
 `_id`) and serves every entry from its own oplog without its record, and an entry a
 member already holds is never served to it again, so a 0.52 member that pulls a keyed
@@ -235,11 +236,13 @@ is set, which the operator declares once every member runs 0.52 and as a change 
 own, and every live member says it carries records. During the roll the members of 0.52
 refuse the header with `400` and do not list `idempotency-keys`; a client branches on the
 capability per node. **Rolling any member back after the switch is set reopens the gap**,
-and 0.51 refuses a configuration that names the key. The store keeps schema 5; the two
+and 0.51 refuses a configuration that names the key. The store keeps schema 5; the three
 tables are new and 0.51 never opens them; **a backup holding a record is a rollback
 boundary**, since backup tags 12 and 13 are unknown to 0.51's restore. The deliberate
 mixed-version test this release names is C9, in process
-(`c9_a_live_member_that_does_not_carry_records_closes_the_gate`): a member that serves
+(`c9_a_live_member_that_does_not_carry_records_closes_the_gate`) and over HTTP on real
+processes in the `lab-hooks` build
+(`lab_hook_c9_a_live_member_that_does_not_carry_records_closes_the_gate`): a member that serves
 without records and sends a block without the field, as 0.51 does, closes the gate on the
 others, and with the gate removed the same schedule applies a keyed `$inc` twice. Each new
 field also has its version-boundary test beside the protocol.
@@ -372,7 +375,7 @@ two requests.
 | `update` / `delete` with `multi: true` | **Atomic per chunk** of `storage.multi_chunk_docs` documents (default 1,000): each chunk one transaction and one fsync, the writer released between chunks, a later failure leaving earlier chunks committed; `commits` reports how many landed (ADR-086) | `modify_where`, resuming after the last key written | `a_multi_write_commits_in_chunks_of_the_configured_size`, `a_failure_in_a_later_chunk_leaves_the_earlier_chunks_committed`, `a_filtered_write_past_the_cap_commits_in_chunks_rather_than_refusing`, `a_multi_update_reports_its_commits` |
 | Unique indexes | Enforced on the accepting node before the write is acknowledged; **across nodes, detected after the fact** — a collision that replicated in surfaces as a `UniqueViolation` oplog entry and a counter (ADR-029) | `index::maintain` locally; `sync.rs` on merge | `unique_violation_entries_are_never_sent` and the index tests |
 | Any single-document write with `if_stamp` | **Compare-and-set on the accepting node**: written only if the document is still at the named version, else `409 stale` and nothing written — no oplog entry, no event (ADR-084) | The stamp check inside `modify_in_txn` / `replace_if` / `delete_where` | `racing_conditional_writers_produce_exactly_one_winner`, `a_stale_write_leaves_the_document_the_oplog_and_the_commit_count_alone`, `racing_conditional_claims_have_exactly_one_winner` |
-| Any document write with an `Idempotency-Key` | **Applied once on the member that took it**, and on any member that has received it: the record is in the write's own transaction, travels with its entries and snapshot pages, and a retry of the same request is answered from it with `Idempotency-Replayed: ?1`, writing nothing. A member that has not yet received the write applies a retry a second time. A keyed `multi: true` request resumes, writing only matches stamped below its first write (ADR-240) | `idempotency.rs`, the keyed twin of each write path; `sync.rs` and `snapshot.rs` for the records a frame or a page carries | `a_keyed_insert_replays_the_same_stamp_and_leaves_one_document`, `f1_a_keyed_insert_whose_fsync_fails_replays_after_the_repair`, `a_multi_chunk_request_across_crashes_writes_each_document_once`, `c1_a_retry_on_the_member_the_write_replicated_to_replays`, `c9_a_live_member_that_does_not_carry_records_closes_the_gate` |
+| Any document write with an `Idempotency-Key` | **Applied once on the member that took it**, and on any member that has received it: the record is in the write's own transaction, travels with the coverage a window grants and with snapshot pages, and a retry of the same request is answered from it with `Idempotency-Replayed: ?1`, writing nothing. A member that has not yet received the write applies a retry a second time. A keyed `multi: true` request resumes, writing only matches stamped below its first write (ADR-240) | `idempotency.rs`, the keyed twin of each write path; `sync.rs` and `snapshot.rs` for the records a frame or a page carries | `a_keyed_insert_replays_the_same_stamp_and_leaves_one_document`, `f1_a_keyed_insert_whose_fsync_fails_replays_after_the_repair`, `a_multi_chunk_request_across_crashes_writes_each_document_once`, `c1_a_retry_on_the_member_the_write_replicated_to_replays`, `c9_a_live_member_that_does_not_carry_records_closes_the_gate` |
 | Anything across two requests | **No guarantee.** There are no multi-request transactions; two writes are two commits, and a reader may see the state between them | — | — |
 | The cluster | Basically available, soft state, eventually consistent: every node accepts writes, anti-entropy carries the oplog, whole-document last-writer-wins on a hybrid logical clock. Read-your-writes holds only on the node written to; convergence holds while a partition is shorter than tombstone retention | `kimmy-cluster` + `sync.rs` | `two_engines_converge_after_one_round`, `conflicting_writes_converge_to_the_same_document`, `three_nodes_converge_through_a_middle_peer` |
 

@@ -666,7 +666,7 @@ request. An MCP call is fingerprinted over the tool and its arguments without
 | No record of the key | Processed as without a key. If it wrote anything, the record is written with it. No marker |
 | A record, the same request | The first answer: `200` and the body the first attempt returned, with `Idempotency-Replayed: ?1`. Nothing is written. Under `coalesced` it is answered once the record's commit is durable |
 | A record, a different request | `422 idempotency_key_reused`, `retry: no`. Nothing is written |
-| A `multi: true` update or delete with this key is still running on this member | `409 idempotency_key_in_flight`, `retry: wait`, `Retry-After: 1`. Nothing is written; sent again here once it ends, it is answered from its record |
+| A `multi: true` update or delete with this key is still running on this member, or another retry of it is being answered there (a retry of a `multi: true` request holds its place while it replays, so of two sent at once one is answered and the other refused) | `409 idempotency_key_in_flight`, `retry: wait`, `Retry-After: 1`. Nothing is written; sent again here once it ends, it is answered from its record |
 | A record of a `multi: true` request that stopped and is not running here | It resumes: [a request that was partly applied](#a-request-that-was-partly-applied) |
 | Two single-document requests with one key at once | They wait for the single writer as any write does: whichever commits first applies, and the other is answered from its record |
 | The request changed nothing: refused, matched nothing, or left every document as it was ([ADR-208](decisions.md)) | No record: a retry is evaluated again, and since the first attempt changed nothing it is still the request's only change |
@@ -704,6 +704,16 @@ without a key, for an update that is idempotent, or uses the marker pattern
 under [a request that was partly applied](#a-request-that-was-partly-applied).
 MongoDB draws the same line from the other side: its retryable writes exclude
 `updateMany` and `deleteMany` altogether.
+
+**Where it ends.** The request's last full chunk looks past its last match for
+one more it could write; finding none, it records the request as done with its
+own writes, so a member that has received that chunk replays a retry. When that
+look runs out first, over a long tail of matches the rule leaves, a later chunk
+finds the end having written nothing and records it alone. A retry on a member
+that has received the last writing chunk and not that record is then answered
+as a resume: `resumed: true`, the counts cumulative, the matches the request
+wrote counted in `skipped`, nothing written twice, and no `Idempotency-Replayed`
+marker.
 
 **A replay is the first answer, not the current state.** Its `stamp` names the
 version the first attempt produced; an `if_stamp` built from it is `409
@@ -744,8 +754,9 @@ while that document stands.
 
 ### A retry on another member
 
-The record travels with the write's entries, so **a member that has received
-the write replays it** like the member that took it. A member that has **not
+The record travels with the write, whichever member relays it and by whatever
+route (a window, a snapshot or repair page), so **a member that has received
+the write, or any part of it, replays it** like the member that took it. A member that has **not
 received it yet cannot know the key**, and applies the request a second time,
 answering without the marker. That window runs from the first member's commit
 until the member the retry reaches has pulled the write, directly or through
@@ -1660,7 +1671,7 @@ and `verify` today, and a client treats a class it does not know as `no`.
 | 409 | `duplicate_key` | no | `_id` already present |
 | 409 | `unique_violation` | no | A unique index would be violated |
 | 422 | `idempotency_key_reused` | no | The request's `Idempotency-Key` is remembered on this member for a different request (another body, path, query or method) from this principal on this collection. Nothing was written. Use a new key for a new request ([Idempotency keys](#what-each-case-answers)) |
-| 409 | `idempotency_key_in_flight` | wait | A `multi: true` update or delete with this `Idempotency-Key` is still running on this member. Nothing was written. Carries `Retry-After: 1`; sent again here once it has finished, it is answered from its record. Not elsewhere: a member that has not received the record would apply it a second time |
+| 409 | `idempotency_key_in_flight` | wait | A `multi: true` update or delete with this `Idempotency-Key` is still running on this member, or another retry of it is being answered there. Nothing was written. Carries `Retry-After: 1`; sent again here once it has finished, it is answered from its record. Not elsewhere: a member that has not received the record would apply it a second time |
 | 409 | `stale` | no | A conditional write's `if_stamp` did not match: the document is at another version, or is gone. Nothing was written — re-read, decide again, and send a new request with the current stamp ([conditional writes](#get-replace-delete-by-id)) |
 | 503 | `collection_purging` | wait | Creating a collection, or enabling vectors, under a name whose earlier collection's drop is still being removed on this node. Nothing was written, and that removal was moved to the front. Carries `Retry-After` in seconds; the retry succeeds once the removal is done ([ADR-189](decisions.md)) |
 | 503 | `resolver_busy` | wait | A host the request had to resolve — a webhook's on registration, an embedding provider's on configuration or for a search's `query` — was not looked up, because the lookups this node allows at once were all waiting on a resolver that has not answered ([Operations](operations.md#discovery-formats)). Nothing was done. Carries `Retry-After` in seconds, how long a failed lookup's answer is kept. A host that does not resolve is a `400` on registration and configuration, and a `502 provider_error` on a search |

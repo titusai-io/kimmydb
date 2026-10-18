@@ -3125,8 +3125,8 @@ components:
 
         - A different request under a key this member remembers is
           `422 idempotency_key_reused`; on `update` and `delete`, a
-          `multi: true` request with the key still running here is
-          `409 idempotency_key_in_flight`.
+          `multi: true` request with the key still running here, or another
+          retry of it being answered here, is `409 idempotency_key_in_flight`.
         - Refused `400` while this member does not take keys
           (`cluster.idempotency_keys` is off here, or a live member does not
           carry records), after authentication, so a request with no token is
@@ -3217,8 +3217,8 @@ components:
     IdempotencyKeyInFlight:
       description: |
         `idempotency_key_in_flight`, `retry: wait` (ADR-240): a `multi: true`
-        request with this `Idempotency-Key` is still running on this member.
-        Nothing was written. Send it again here once it has finished, when it
+        request with this `Idempotency-Key` is still running on this member, or
+        another retry of it is being answered here. Nothing was written. Send it again here once it has finished, when it
         is answered from its record; not elsewhere, where a member that has
         not received the record would apply it a second time.
       headers:
@@ -3397,7 +3397,7 @@ components:
         | `starting` | 503 | elsewhere | This node has bound its port and is still starting, and answers only `/healthz` and `/readyz` until it is up: nothing was read or written. Send it to another member |
         | `resolver_busy` | 503 | wait | A host the request had to resolve — a webhook's on registration, an embedding provider's on configuration or for a search's `query` — was not looked up, because the lookups this node allows at once were all waiting on a resolver that has not answered. Nothing was done. Carries `Retry-After`. A host that does not resolve is a `400` on registration and configuration, and a `502 provider_error` on a search |
         | `idempotency_key_reused` | 422 | no | The request's `Idempotency-Key` is remembered on this member for a different request (another body, path, query or method) from this principal on this collection. Nothing was written. Use a new key for a new request |
-        | `idempotency_key_in_flight` | 409 | wait | A `multi: true` update or delete with this `Idempotency-Key` is still running on this member. Nothing was written. Carries `Retry-After: 1`; sent again here once it has finished, it is answered from its record |
+        | `idempotency_key_in_flight` | 409 | wait | A `multi: true` update or delete with this `Idempotency-Key` is still running on this member, or another retry of it is being answered there. Nothing was written. Carries `Retry-After: 1`; sent again here once it has finished, it is answered from its record |
         | `catching_up` | 503 | elsewhere | This member knows it is behind (it created its store in a cluster it has seeds for, was restored from a backup, or fell behind its peers' retention horizon, and its catching-up marker is set) and answers only `/healthz`, `/readyz`, `/metrics` and `/v1/topology` until it has caught up: nothing was read or written. Send it to another member |
       enum:
         - bad_request
