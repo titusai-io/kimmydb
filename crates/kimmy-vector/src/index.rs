@@ -172,7 +172,17 @@ struct SnapshotMeta {
 /// count, it would serve them for as long as the count held. The cost is one
 /// rebuild per vector collection per member, on its first search after the
 /// upgrade. A 0.50 build refuses a format-3 snapshot in turn, and rebuilds.
-const SNAPSHOT_FORMAT: u32 = 3;
+///
+/// 4 is a graph `hnsw_rs` 0.3.5 built (ADR-241). The dump's layout did not
+/// change, so 0.3.5 would read a format-3 snapshot; what changed is the graph
+/// in it. 0.3.4 stored each reverse edge at the new point's top layer instead
+/// of the layer it was found on, which left 0.5% to 3.8% of every collection
+/// of 500 vectors or more that no search reaches, and a format-3 graph adopted
+/// on an equal count would keep them unreachable until the collection's next
+/// write. Refused, it is rebuilt once per vector collection per member, on the
+/// collection's first search. A 0.51 build refuses a format-4 snapshot in
+/// turn, before its library reads the dump, and rebuilds.
+const SNAPSHOT_FORMAT: u32 = 4;
 
 /// What the snapshot at `dir` says it was built for, read from its
 /// `meta.json` and nothing else: which incarnation, and at which shape.
@@ -204,14 +214,19 @@ pub(crate) struct SnapshotIdentity {
     pub(crate) dim: usize,
 }
 
-/// Reload one graph from a leaked io handle, containing `hnsw_rs`'s panics.
+/// Reload one graph from a leaked io handle, once [`crate::dump::check`] has
+/// passed its files, containing `hnsw_rs`'s panics.
 ///
-/// The library `unwrap`s on a corrupt graph file — bad magic aborts the
-/// process — and a torn file on disk must cost a rebuild, never the node.
-/// Found by the corrupt-snapshot test, the same way `DistDot`'s assert was
-/// found: by testing the failure path rather than trusting the library's.
-/// `AssertUnwindSafe` is sound here: the closure touches only the leaked io
-/// and the files it reads — no engine state a mid-load panic could tear.
+/// The library `unwrap`s and asserts on a corrupt dump, and a torn file on
+/// disk must cost a rebuild, never the node. Found by the corrupt-snapshot
+/// test, the same way `DistDot`'s assert was found: by testing the failure
+/// path rather than trusting the library's. **`catch_unwind` is not enough on
+/// its own** (ADR-241): the loader also ends the process (`exit(1)`) and
+/// aborts it (an allocation of a declared size), which no unwind sees, and so
+/// the files are checked first, by `check`. The catch stays for whatever that
+/// check does not foresee. `AssertUnwindSafe` is sound here: the closure
+/// touches only the leaked io and the files it reads — no engine state a
+/// mid-load panic could tear.
 fn load_graph<D>(dir: &std::path::Path) -> std::result::Result<Hnsw<'static, f32, D>, String>
 where
     D: hnsw_rs::anndists::dist::Distance<f32> + Default + Send + Sync,
@@ -224,7 +239,7 @@ where
         // problem. One small allocation per collection per process, bounded
         // and deliberate, in exchange for not pulling in a
         // self-referential-struct dependency to hold the pair.
-        let io = Box::leak(Box::new(hnsw_rs::hnswio::HnswIo::new(&dir, "index")));
+        let io = Box::leak(Box::new(hnsw_rs::hnswio::HnswIo::new(&dir, crate::dump::BASENAME)));
         io.load_hnsw::<f32, D>().map_err(|e| e.to_string())
     }))
     .unwrap_or_else(|_| Err("reload panicked; the file is corrupt".to_string()))
@@ -269,6 +284,41 @@ fn estimate_bytes(keys: &[String], dim: usize) -> usize {
     let per_node = dim * 4 + NODE_OVERHEAD_BYTES;
     let key_bytes: usize = keys.iter().map(|k| k.len() + 24).sum();
     keys.len() * per_node + key_bytes
+}
+
+/// Put `items` in the order build `attempt` inserts them (ADR-241).
+///
+/// **The order is the draw.** `hnsw_rs` 0.3.5 gives each point the next level
+/// of one generator that every graph seeds with the constant 397, and has no
+/// way to seed it otherwise: the point inserted `i`-th always gets the `i`-th
+/// level of the same sequence. So the same records inserted in the same order
+/// build the same graph, level for level and edge for edge, and a retry that
+/// kept the order would rebuild exactly the graph it was retrying (0.3.4 drew
+/// levels from an unseeded generator, which is what made its retries
+/// independent). Each attempt therefore inserts in another order.
+///
+/// The scheme: a Fisher–Yates shuffle of the walk's order (the chunk keys in
+/// key order), driven by SplitMix64 seeded with the attempt number, every
+/// attempt the first included. It is a function of the records and the
+/// attempt alone, so a collection's graph is reproducible on every member and
+/// across restarts, and two attempts differ. Shuffling the first attempt as
+/// well keeps the key order out of the build: a key order that tracks the
+/// vectors (ids that grow with time while what is written drifts) is an
+/// insertion order HNSW builds poorer graphs from.
+fn insertion_order<T>(items: &mut [T], attempt: usize) {
+    let mut state = attempt as u64;
+    let mut next = move || {
+        state = state.wrapping_add(0x9E37_79B9_7F4A_7C15);
+        let mut z = state;
+        z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+        z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+        z ^ (z >> 31)
+    };
+    for i in (1..items.len()).rev() {
+        // Lemire's multiply-shift: an index in 0..=i without a modulo's bias.
+        let j = ((u128::from(next()) * (i as u128 + 1)) >> 64) as usize;
+        items.swap(i, j);
+    }
 }
 
 /// An approximate index over one collection's vectors.
@@ -336,7 +386,7 @@ impl HnswIndex {
         metric: Metric,
         dim: usize,
     ) -> Result<Self> {
-        let mut built = Self::build_once(engine, shadow, metric, dim)?;
+        let mut built = Self::build_once(engine, shadow, metric, dim, 0)?;
         for attempt in 1..=MAX_BUILD_ATTEMPTS {
             if built.1.unreachable < REACHABILITY_MAX_UNREACHABLE {
                 return Ok(built.0);
@@ -346,9 +396,9 @@ impl HnswIndex {
                 unreachable = built.1.unreachable,
                 missed = built.1.missed,
                 vectors = built.0.keys.len(),
-                "HNSW build left data unreachable; rebuilding"
+                "HNSW build left data unreachable; rebuilding in another insertion order"
             );
-            built = Self::build_once(engine, shadow, metric, dim)?;
+            built = Self::build_once(engine, shadow, metric, dim, attempt)?;
         }
         if built.1.unreachable >= REACHABILITY_MAX_UNREACHABLE {
             // Never fail: a poor index still answers, and refusing to build one
@@ -383,6 +433,7 @@ impl HnswIndex {
         shadow: &CollectionMeta,
         metric: Metric,
         dim: usize,
+        attempt: usize,
     ) -> Result<(Self, Reachability)> {
         if !Self::supports(metric) {
             return Err(VectorError::MalformedResponse {
@@ -422,6 +473,9 @@ impl HnswIndex {
             }
             Ok(true)
         })?;
+        // The library draws every level from one fixed seed, so the order is
+        // the only thing that tells two attempts apart ([`insertion_order`]).
+        insertion_order(&mut records, attempt);
 
         let expected = records.len().max(1);
         let graph = match metric {
@@ -603,8 +657,8 @@ impl HnswIndex {
         std::fs::create_dir_all(&staging).map_err(io)?;
 
         match &self.graph {
-            Graph::Cosine(g) => g.file_dump(&staging, "index"),
-            Graph::Euclidean(g) => g.file_dump(&staging, "index"),
+            Graph::Cosine(g) => g.file_dump(&staging, crate::dump::BASENAME),
+            Graph::Euclidean(g) => g.file_dump(&staging, crate::dump::BASENAME),
         }
         .map_err(|e| VectorError::Snapshot(e.to_string()))?;
 
@@ -666,6 +720,21 @@ impl HnswIndex {
                 meta.created
             )));
         }
+
+        // Before the library sees a byte of the dump: it ends the process on
+        // some of what a corrupt or foreign file holds (ADR-241).
+        let distance = match metric {
+            Metric::Cosine => std::any::type_name::<DistCosine>(),
+            Metric::Euclidean => std::any::type_name::<DistL2>(),
+            Metric::Dot => return Err(corrupt("dot has no approximate index".to_string())),
+        };
+        let expect = crate::dump::Expect {
+            points: meta.keys.len(),
+            dim,
+            connections: MAX_CONNECTIONS as u8,
+            distance,
+        };
+        crate::dump::check(dir, &expect).map_err(|e| corrupt(format!("graph dump: {e}")))?;
 
         let graph = match metric {
             Metric::Cosine => load_graph::<DistCosine>(dir).map(Graph::Cosine),
@@ -869,6 +938,74 @@ mod tests {
         (engine, shadow, dir)
     }
 
+    /// `setup`'s shape at sizes where a commit per document is minutes: the
+    /// same records, written a few thousand to a commit, with `fixture`
+    /// choosing another set of vectors (`0` is `setup`'s).
+    fn setup_bulk(
+        count: usize,
+        dim: usize,
+        fixture: u64,
+    ) -> (Engine, CollectionMeta, tempfile::TempDir) {
+        const PER_COMMIT: usize = 5_000;
+        let dir = tempfile::tempdir().unwrap();
+        let engine = Engine::open(&dir.path().join("kimmy.redb")).unwrap();
+        engine.create_collection("app", "docs").unwrap();
+        engine.configure_vectors("app", "docs", config(dim)).unwrap();
+        let shadow = engine.vector_collection("app", "docs").unwrap().unwrap();
+        for start in (0..count).step_by(PER_COMMIT) {
+            engine
+                .write_batch(kimmy_storage::WriterHolder::Embedding, |scope| {
+                    for i in start..(start + PER_COMMIT).min(count) {
+                        let source = DocId::Int64(i as i64);
+                        let record = VectorRecord {
+                            source: source.clone(),
+                            chunk: 0,
+                            source_hlc: Hlc::new(1, 0),
+                            vector: pseudo_random((fixture << 32) | (i as u64 + 1), dim),
+                            text: format!("document {i}"),
+                            config: None,
+                        };
+                        let write = kimmy_storage::VectorWrite::encode(
+                            &source,
+                            &ChunkSource::from(&source),
+                            &[record],
+                        )?;
+                        scope.put_vectors(&shadow, write)?;
+                    }
+                    Ok(())
+                })
+                .unwrap();
+        }
+        (engine, shadow, dir)
+    }
+
+    /// Every stored vector by the key the graph names it by.
+    fn vectors_by_key(
+        engine: &Engine,
+        shadow: &CollectionMeta,
+    ) -> std::collections::HashMap<String, Vec<f32>> {
+        let mut vectors = std::collections::HashMap::new();
+        engine
+            .for_each_vector(shadow, kimmy_storage::WalkScope::Request, |id, record| {
+                if let DocId::String(key) = id {
+                    vectors.insert(key.clone(), record.vector);
+                }
+                Ok(true)
+            })
+            .unwrap();
+        vectors
+    }
+
+    /// How many of the graph's points do not come back for their own vector
+    /// when effort stops being the limit: every point checked, not a sample.
+    /// The ground truth a sampled score is judged against.
+    fn truly_orphaned(
+        index: &HnswIndex,
+        vectors: &std::collections::HashMap<String, Vec<f32>>,
+    ) -> usize {
+        (0..index.keys.len()).filter(|&i| !index.finds_itself(&vectors[&index.keys[i]], i)).count()
+    }
+
     #[test]
     fn an_index_builds_over_stored_vectors() {
         let (engine, shadow, _dir) = setup(50, 8);
@@ -952,18 +1089,12 @@ mod tests {
         const DRAWS: usize = 3;
 
         let (engine, shadow, _dir) = setup(COUNT, DIM);
-        let mut records = Vec::new();
-        engine
-            .for_each_vector(&shadow, kimmy_storage::WalkScope::Request, |_, r| {
-                records.push(r);
-                Ok(true)
-            })
-            .unwrap();
+        let vectors = vectors_by_key(&engine, &shadow);
 
         let mut graded = 0;
         for draw in 0..DRAWS {
             let (index, reach) =
-                HnswIndex::build_once(&engine, &shadow, Metric::Cosine, DIM).unwrap();
+                HnswIndex::build_once(&engine, &shadow, Metric::Cosine, DIM, draw).unwrap();
             assert_eq!(reach.sampled, REACHABILITY_SAMPLE, "the sample must be full at this size");
             assert!(
                 reach.unreachable <= reach.missed,
@@ -971,9 +1102,7 @@ mod tests {
             );
             // Every point, not the sample: the ground truth the score is
             // judged against.
-            let orphaned = (0..index.keys.len())
-                .filter(|&i| !index.finds_itself(&records[i].vector, i))
-                .count();
+            let orphaned = truly_orphaned(&index, &vectors);
             if orphaned as f64 >= HEALTHY_ORPHANED_BELOW * index.keys.len() as f64 {
                 println!(
                     "draw {draw}: {orphaned} of {} truly orphaned (sampled score {}); not a \
@@ -1021,39 +1150,84 @@ mod tests {
         // flat. It is not. Width drives it far harder than count does, and 384
         // is the realistic embedding width — the regime that matters is the one
         // a 16-dimensional fixture does not show.
-        for &(dim, count, builds) in &[
-            (16, 500, 40),
-            (16, 4_000, 12),
-            (384, 500, 30),
-            (384, 1_000, 20),
-            (384, 2_000, 14),
-            (384, 4_000, 10),
-        ] {
-            let (engine, shadow, _dir) = setup(count, dim);
+        //
+        // A build is a function of its records and its attempt (see
+        // `insertion_order`), so the draws are the attempts over several
+        // fixtures, and every point of every build is checked: the true
+        // orphaned count beside the sampled score the threshold judges.
+        // `KIMMY_REACH_SIZES` (`dim:count:fixtures:attempts,...`) runs a
+        // chosen grid instead; `row,` lines are the raw data.
+        let grid: Vec<(usize, usize, u64, usize)> = match std::env::var("KIMMY_REACH_SIZES") {
+            Ok(spec) => spec
+                .split(',')
+                .map(|cell| {
+                    let v: Vec<usize> = cell.split(':').map(|x| x.parse().unwrap()).collect();
+                    (v[0], v[1], v[2] as u64, v[3])
+                })
+                .collect(),
+            Err(_) => vec![
+                (8, 50, 10, 20),
+                (8, 100, 10, 20),
+                (16, 200, 10, 20),
+                (16, 400, 10, 30),
+                (16, 500, 10, 20),
+                (16, 4_000, 4, 5),
+                (384, 500, 6, 10),
+                (384, 1_000, 5, 8),
+                (384, 2_000, 4, 5),
+                (384, 4_000, 3, 4),
+                (384, 10_000, 2, 3),
+            ],
+        };
+        for (dim, count, fixtures, attempts) in grid {
+            let mut orphaned = Vec::new();
             let mut missed = Vec::new();
             let mut unreachable = Vec::new();
-            for _ in 0..builds {
-                let (_, reach) =
-                    HnswIndex::build_once(&engine, &shadow, Metric::Cosine, dim).unwrap();
-                missed.push(reach.missed);
-                unreachable.push(reach.unreachable);
+            for fixture in 0..fixtures {
+                let (engine, shadow, _dir) = setup_bulk(count, dim, fixture);
+                let vectors = vectors_by_key(&engine, &shadow);
+                for attempt in 0..attempts {
+                    let started = std::time::Instant::now();
+                    let (index, reach) =
+                        HnswIndex::build_once(&engine, &shadow, Metric::Cosine, dim, attempt)
+                            .unwrap();
+                    let built = started.elapsed();
+                    let lost = truly_orphaned(&index, &vectors);
+                    println!(
+                        "row,{dim},{count},{fixture},{attempt},{lost},{},{},{},{}",
+                        reach.sampled,
+                        reach.missed,
+                        reach.unreachable,
+                        built.as_millis()
+                    );
+                    orphaned.push(lost);
+                    missed.push(reach.missed);
+                    unreachable.push(reach.unreachable);
+                }
             }
-            missed.sort_unstable();
-            unreachable.sort_unstable();
+            for v in [&mut orphaned, &mut missed, &mut unreachable] {
+                v.sort_unstable();
+            }
+            let builds = orphaned.len();
             let median = |v: &Vec<usize>| v[v.len() / 2];
             let over = |v: &Vec<usize>, t: usize| v.iter().filter(|&&x| x >= t).count();
             println!(
                 "dim={dim:<4} n={count:<6} builds={builds:<4} \
+                 truly orphaned: median={} max={} ({:.2}%) builds with any={} | \
                  missed: median={:<3} max={:<3} | unreachable: median={:<3} max={:<3} \
-                 >=3:{:<3} >=5:{:<3} >=8:{:<3} >=13:{}",
+                 >=1:{:<3} >=2:{:<3} >=3:{:<3} >=8:{}",
+                median(&orphaned),
+                orphaned.last().unwrap(),
+                100.0 * *orphaned.last().unwrap() as f64 / count as f64,
+                over(&orphaned, 1),
                 median(&missed),
                 missed.last().unwrap(),
                 median(&unreachable),
                 unreachable.last().unwrap(),
+                over(&unreachable, 1),
+                over(&unreachable, 2),
                 over(&unreachable, 3),
-                over(&unreachable, 5),
                 over(&unreachable, 8),
-                over(&unreachable, 13),
             );
         }
     }
@@ -1083,24 +1257,16 @@ mod tests {
         const BUILDS: usize = 600;
 
         let (engine, shadow, _dir) = setup(COUNT, DIM);
-        let mut records = Vec::new();
-        engine
-            .for_each_vector(&shadow, kimmy_storage::WalkScope::Request, |_, r| {
-                records.push(r);
-                Ok(true)
-            })
-            .unwrap();
+        let vectors = vectors_by_key(&engine, &shadow);
 
         let mut healthy = Vec::new();
         let mut bad = Vec::new();
-        for _ in 0..BUILDS {
+        for attempt in 0..BUILDS {
             let (index, reach) =
-                HnswIndex::build_once(&engine, &shadow, Metric::Cosine, DIM).unwrap();
+                HnswIndex::build_once(&engine, &shadow, Metric::Cosine, DIM, attempt).unwrap();
             // Every point, not a sample: this is the ground truth the sampled
             // score is being judged against.
-            let truly = (0..index.keys.len())
-                .filter(|&i| !index.finds_itself(&records[i].vector, i))
-                .count();
+            let truly = truly_orphaned(&index, &vectors);
             let fraction = truly as f64 / index.keys.len() as f64;
             if fraction >= 0.05 { &mut bad } else { &mut healthy }
                 .push((fraction, reach.unreachable));

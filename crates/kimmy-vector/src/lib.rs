@@ -10,6 +10,7 @@
 #![allow(dead_code)]
 
 pub mod cache;
+mod dump;
 pub mod error;
 pub mod index;
 #[cfg(feature = "local-embeddings")]
