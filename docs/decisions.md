@@ -28733,7 +28733,10 @@ with it, and not be offered while any member could carry the write without it.
      reach (F2), and every live record with a row above both what the requester holds and what the sender's servable
      vector reaches (F3): a row a page or a lost entry left, which no window of the sender would otherwise ever vouch
      for. A replay page carries its own advance and the F3 records. **A sender ships a record at a row of its own. A
-     row below the record's `first` was left by an earlier life under the same key, and ships nothing.** The frame
+     row below the record's `first` was left by an earlier life under the same key, and ships nothing.** **Of the
+     record's own rows the window finds, it is carried at the lowest**, whichever F3 or an origin read first found:
+     carried at a higher one, a batch that stops, or splits into runs, between the two takes the effect at the lower
+     row and, by the rule below, stores the record with neither. The frame
      fit counts every record, the F3 records first, each other with the first entry at or after its row; **when the F3
      records alone overfill a frame, the window carries no entries and grants nothing** (`Fits::Nothing`) until the
      sender has pulled their entries, and the sender logs it at `WARN`.
