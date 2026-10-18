@@ -396,26 +396,38 @@ fn a_member_rejoined_after_its_peers_died_declares_them_down() {
 }
 
 /// The other `TurnUndead` path: a member that rejoins on hearing it was
-/// declared down from a peer it holds down itself. A is cut off from B and C
-/// until each side has declared the other down; when the cut heals, the
-/// announces cross, and a member holding the sender down answers it with a
-/// `TurnUndead`, which its receiver also holds down. Every member must be live
-/// to every other within the time a probe and a discovery interval take.
+/// declared down from a peer it holds down itself, while it still holds other
+/// members active. Every member was seeded with D, which is gone, so no
+/// announce to a seed reaches anyone. A is cut off from B and C until each side
+/// has declared the other down; when the cut heals, A (alone) announces to the
+/// members it knows, and B and C, holding A down, answer with a `TurnUndead`
+/// that A, holding them down, answers in kind: B or C rejoins on the word of a
+/// member it holds down, with the other still active. Every member must be live
+/// to every other within the time a probe and an announce take.
 #[test]
 fn a_member_that_rejoins_on_a_down_peers_word_resumes() {
-    let (a, b, c) = (0, 1, 2);
-    let mut net = Net::new(&[&[b], &[a], &[a]], daemon);
+    let (a, b, c, d) = (0, 1, 2, 3);
+    let mut net = Net::new(&[&[d], &[d], &[d], &[a]], daemon);
+    net.kill(d);
     net.partition(a, &[b, c]);
     net.run_for(20_000);
-    assert!(net.live_at(a).is_empty() && !net.live_at(b).contains(&net.nodes[a].addr), "premise");
+    assert!(net.live_at(a).is_empty(), "premise: A holds B and C down");
+    assert_eq!(net.live_at(b), net.addrs(&[c]), "premise: B holds A down, C live");
     net.heal();
     let healed = net.now;
     net.run_for(20_000);
-    let via_down: Vec<usize> = (0..3)
-        .filter(|node| net.nodes[*node].rejoins.iter().any(|(via, _)| *via == Via::DownSender))
-        .collect();
-    assert!(!via_down.is_empty(), "premise: a member rejoined on a down sender's word");
-    for node in 0..3 {
+    assert!(
+        [b, c].iter().any(|node| {
+            net.nodes[*node]
+                .rejoins
+                .iter()
+                .any(|(via, at)| *via == Via::DownSender && *at >= healed)
+        }),
+        "premise: B or C rejoined on the word of a member it held down: {:?} {:?}",
+        net.nodes[b].rejoins,
+        net.nodes[c].rejoins
+    );
+    for node in [a, b, c] {
         let others: BTreeSet<_> = net
             .addrs(&[a, b, c])
             .into_iter()
