@@ -749,14 +749,15 @@ pub(crate) fn decode_row_key(key: &[u8]) -> Option<Stamp> {
 }
 
 /// A rewind's removal of the rows by stamp of the records it removed
-/// (`named`), in its transaction: every such row is stamped above `until`,
-/// since each record's `first` is, and every row of a record is at or above its
-/// `first`. One range per origin, above `until`. A reopened record's rows,
+/// (`named`), in its transaction: every row of a record is at or above its
+/// `first`, so every such row is at or above `from`, the lowest `first` among
+/// them (above the rewind's target for a record whose every write it
+/// discarded). One range per origin, from `from`. A reopened record's rows,
 /// the one at its `last` included, name a record that stays, and stay. Returns
 /// how many rows it removed.
 fn remove_rows_naming(
     txn: &WriteTxn<'_>,
-    until: Hlc,
+    from: Hlc,
     named: &HashSet<(CollectionId, ScopeHash)>,
 ) -> Result<usize> {
     use std::ops::Bound::{Excluded, Included, Unbounded};
@@ -780,8 +781,8 @@ fn remove_rows_naming(
             past = Some(key);
             continue;
         };
-        let (above, end) = (row_key_at(at.node, until), row_key_at(at.node, Hlc::MAX));
-        for row in rows.range::<&[u8]>((Excluded(above.as_slice()), Included(end.as_slice())))? {
+        let (start, end) = (row_key_at(at.node, from), row_key_at(at.node, Hlc::MAX));
+        for row in rows.range::<&[u8]>((Included(start.as_slice()), Included(end.as_slice())))? {
             let (key, value) = row?;
             if parse_row_value(value.value()).is_some_and(|row| named.contains(&row)) {
                 doomed.push(key.value().to_vec());
@@ -2160,9 +2161,8 @@ impl Engine {
     /// record of a request whose every write the rewind discards (`first` after
     /// `until`) goes, since nothing of the request stands and a retry must apply
     /// it afresh, **with its rows by stamp** ([`remove_rows_naming`]): left
-    /// behind, each would be above the rewound servable vector, read as an F3
-    /// candidate by every frame until retention collected it, and would make a
-    /// backup of a store with no record carry tag 13. One the rewind cuts part-way (`first` at or before `until`,
+    /// behind, they would be above the rewound servable vector, read as F3
+    /// candidates by every frame until retention collected them. One the rewind cuts part-way (`first` at or before `until`,
     /// `last` after it) is a multi-chunk request that was still applying at
     /// `until`: it becomes `applying`, with no cursor, so a retry resumes from
     /// the beginning and the stamp rule writes what the rewind undid and nothing
@@ -2195,8 +2195,14 @@ impl Engine {
                 reopened.push((id, scope.to_vec(), open.encode()));
             }
         }
+        // The lowest `first` of what goes: where its rows begin.
+        let mut from: Option<Hlc> = None;
         for (id, scope) in &gone {
-            records.remove((*id, scope.as_slice()))?;
+            if let Some(old) = records.remove((*id, scope.as_slice()))?
+                && let Ok(Some(old)) = IdempotencyRecord::decode(old.value())
+            {
+                from = Some(from.map_or(old.first.hlc, |from| from.min(old.first.hlc)));
+            }
         }
         for (id, scope, bytes) in &reopened {
             records.insert((*id, scope.as_slice()), bytes.as_slice())?;
@@ -2206,7 +2212,9 @@ impl Engine {
             .iter()
             .filter_map(|(id, scope)| Some((CollectionId(*id), ScopeHash::from_slice(scope)?)))
             .collect();
-        remove_rows_naming(txn, until, &named)?;
+        if let Some(from) = from {
+            remove_rows_naming(txn, from, &named)?;
+        }
         for (id, scope, _) in &reopened {
             if let Some(scope) = ScopeHash::from_slice(scope) {
                 log_change(self, txn, CollectionId(*id), &scope)?;
