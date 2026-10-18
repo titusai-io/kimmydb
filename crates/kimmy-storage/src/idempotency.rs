@@ -111,6 +111,33 @@
 //! member that takes a request's effect under any origin takes its record with
 //! it. [`records_for_collection_page`] reads a snapshot's records phase.
 //! [`Engine::record_is_history`] is the life rule for a record a peer sent.
+//!
+//! # The records delta on snapshot pages
+//!
+//! A snapshot, scoped or converge page carries each collection's records once,
+//! in its records phase, ahead of its documents; a keyed write on the sender
+//! after that phase and before the page that holds its document would reach the
+//! receiver without its record. So this node keeps a **change log**
+//! ([`IDEMPOTENCY_CHANGES`]): one row per store that changes a record, on every
+//! path, in the store's transaction ([`put_rows`], and a rewind's reopen),
+//! keyed by a stamp minted under the writer, so in commit order. A store that
+//! changes nothing writes no row. The log is never shipped by a window and not
+//! carried by a backup; retention drops rows older than the record window.
+//!
+//! Every page after the first carries a **records delta**
+//! ([`records_changed_since`]): the records the log names above the base its
+//! cursor carries (`SnapshotCursor::records_base`), the log's high water as the
+//! page before read it in its documents' transaction ([`changes_high_water`]).
+//! One range, each change sent once, nothing for a store without keys. A page
+//! carries documents only with the whole of the log above its base; otherwise
+//! it is a records-only page and its base moves to the last key it examined.
+//!
+//! Keys are compared only within one **epoch** ([`changes_begin`]): a random
+//! number the log is given when it begins, with its first change, and again
+//! after a restore (a backup carries no log), an identity reset, or an open
+//! that found no log. A base of another epoch restarts the cursor's collection
+//! from its records phase, whatever the keys say: a sender restored onto a host
+//! whose clock is behind logs keys below a base cut before the restore.
 
 use std::collections::HashSet;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -125,7 +152,7 @@ use crate::engine::{Engine, WriteTxn, WriterHolder};
 use crate::error::{Result, StorageError};
 use crate::meta::CollectionMeta;
 use crate::sync::Memo;
-use crate::tables::{self, IDEMPOTENCY, IDEMPOTENCY_BY_STAMP};
+use crate::tables::{self, IDEMPOTENCY, IDEMPOTENCY_BY_STAMP, IDEMPOTENCY_CHANGES};
 use crate::walk::{WalkScope, open_walk_table};
 
 /// Records removed per write transaction of a retention pass, and per chunk of
@@ -135,6 +162,22 @@ pub const RECORD_COLLECT_CHUNK: usize = 1_000;
 
 /// Records on one snapshot page's records phase.
 pub const RECORD_PAGE: usize = 512;
+
+/// The bytes of records one snapshot page's records delta carries at most
+/// ([`records_changed_since`]): half the cluster's 64 MiB frame, so the delta,
+/// the records phase and the documents share a frame. A page whose delta does
+/// not fit is a records-only page. One record larger than this goes alone, as
+/// the only record of its page's delta.
+pub const RECORD_DELTA_BYTES: usize = 32 * 1024 * 1024;
+
+/// The change-log rows one page's records delta examines at most, whatever they
+/// come to: the bound on one page's read, so a delta from an old base (a resumed
+/// pull) or of a scoped pull over a busy store is read over several pages.
+pub const RECORD_DELTA_ROWS: usize = 64 * 1024;
+
+/// What a carried record costs on the wire beyond its bytes: the collection id,
+/// the scope hash and BSON's framing, a bound and not a measure.
+const CARRIED_OVERHEAD: usize = 96;
 
 /// The window a bare engine remembers a key for: `storage.oplog_retention_secs`'
 /// default. The daemon sets its own ([`Engine::set_idempotency_window`]).
@@ -710,19 +753,23 @@ fn row_stamps(record: &IdempotencyRecord, carrying: Option<Stamp>) -> Vec<Stamp>
     stamps
 }
 
-/// Write `record` under its key, and its rows ([`row_stamps`]), in `txn`.
+/// Write `record` under its key, and its rows ([`row_stamps`]), in `txn`, and
+/// log the change ([`log_change`]): every store that writes comes here, and a
+/// store that would change nothing does not.
 ///
 /// **The row at `first` (F1)** is what lets a member that holds the record vouch
 /// for it at the stamp a resume is judged by: a member whose coverage of
 /// `first`'s origin passes it, through any window of a member that holds the
 /// record, is sent the record (the coverage rule, [`records_for_coverage`]).
 fn put_rows(
+    engine: &Engine,
     txn: &redb::WriteTransaction,
     collection: CollectionId,
     scope: &ScopeHash,
     record: &IdempotencyRecord,
     carrying: Option<Stamp>,
 ) -> Result<()> {
+    log_change(engine, txn, collection, scope)?;
     txn.open_table(IDEMPOTENCY)?
         .insert((collection.0, scope.as_bytes().as_slice()), record.encode().as_slice())?;
     let mut rows = txn.open_table(IDEMPOTENCY_BY_STAMP)?;
@@ -967,6 +1014,189 @@ fn records_in_advance(
     Ok(())
 }
 
+/// One row of this node's change log ([`IDEMPOTENCY_CHANGES`]) for a store of
+/// the record under `(collection, scope)`, in the store's transaction, keyed by a
+/// stamp minted for it now. The caller holds the writer, so keys are in commit
+/// order.
+///
+/// **The log begins** with the first change it holds, and begins again, with a
+/// new epoch, at the first change after an open that found no beginning (a new
+/// store, one from before the log, one restored from a backup, which carries
+/// none) or one this node's identity did not write (an identity reset).
+fn log_change(
+    engine: &Engine,
+    txn: &redb::WriteTransaction,
+    collection: CollectionId,
+    scope: &ScopeHash,
+) -> Result<()> {
+    let at = engine.next_stamp();
+    let key = codec::oplog_key(&at);
+    let mut log = txn.open_table(IDEMPOTENCY_CHANGES)?;
+    let begun = log
+        .get(LOG_BEGINS)?
+        .and_then(|raw| LogBegin::decode(raw.value()))
+        .is_some_and(|begun| begun.at.node == engine.node_id());
+    if !begun {
+        let begin = LogBegin { at, epoch: new_epoch() };
+        log.insert(LOG_BEGINS, begin.encode().as_slice())?;
+    }
+    log.insert(key.as_slice(), row_value(collection, scope).as_slice())?;
+    Ok(())
+}
+
+/// A new log's epoch: random, never 0.
+fn new_epoch() -> i64 {
+    loop {
+        let (high, _) = uuid::Uuid::new_v4().as_u64_pair();
+        if high != 0 {
+            return high as i64;
+        }
+    }
+}
+
+/// Where this node's change log began ([`IDEMPOTENCY_CHANGES`]'s empty key): the
+/// key of its first change, and its epoch (`snapshot::RecordsBase`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct LogBegin {
+    pub at: Stamp,
+    pub epoch: i64,
+}
+
+impl LogBegin {
+    /// `key (26) ‖ epoch (8, big-endian)`.
+    fn encode(&self) -> [u8; codec::STAMP_LEN + 8] {
+        let mut out = [0u8; codec::STAMP_LEN + 8];
+        out[..codec::STAMP_LEN].copy_from_slice(&codec::oplog_key(&self.at));
+        out[codec::STAMP_LEN..].copy_from_slice(&self.epoch.to_be_bytes());
+        out
+    }
+
+    fn decode(bytes: &[u8]) -> Option<Self> {
+        let (at, epoch) = bytes.split_at_checked(codec::STAMP_LEN)?;
+        Some(Self {
+            at: codec::decode_oplog_key(at).ok()?,
+            epoch: i64::from_be_bytes(epoch.try_into().ok()?),
+        })
+    }
+}
+
+/// The change log's empty key: where it begins.
+const LOG_BEGINS: &[u8] = &[];
+
+/// Where this node's change log began, and its epoch, as `txn` sees it; `None`
+/// while it has held no change.
+pub(crate) fn changes_begin(txn: &ReadTransaction) -> Result<Option<LogBegin>> {
+    let log = txn.open_table(IDEMPOTENCY_CHANGES)?;
+    let Some(raw) = log.get(LOG_BEGINS)? else { return Ok(None) };
+    Ok(LogBegin::decode(raw.value()))
+}
+
+/// The change log's high water as `txn` sees it: its last key, or where it began
+/// when retention has dropped every row; `None` while it has held none.
+pub(crate) fn changes_high_water(txn: &ReadTransaction) -> Result<Option<Stamp>> {
+    use std::ops::Bound::{Excluded, Unbounded};
+    let log = txn.open_table(IDEMPOTENCY_CHANGES)?;
+    // not a row: the log's last key, one seek.
+    let last = log.range::<&[u8]>((Excluded(LOG_BEGINS), Unbounded))?.next_back();
+    if let Some(last) = last.transpose()?
+        && let Ok(stamp) = codec::decode_oplog_key(last.0.value())
+    {
+        return Ok(Some(stamp));
+    }
+    Ok(changes_begin(txn)?.map(|begun| begun.at))
+}
+
+/// [`changes_high_water`]'s time, at open, for where the clock resumes.
+pub(crate) fn changes_high_water_at_open(db: &redb::Database) -> Result<Hlc> {
+    use redb::ReadableDatabase;
+    let txn = db.begin_read()?;
+    Ok(changes_high_water(&txn)?.map_or(Hlc::ZERO, |stamp| stamp.hlc))
+}
+
+/// What one page's records delta may carry and read ([`records_changed_since`]).
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct DeltaBudget {
+    /// The bytes of its records, at most [`RECORD_DELTA_BYTES`].
+    pub bytes: usize,
+    /// The log rows it examines, at most [`RECORD_DELTA_ROWS`].
+    pub rows: usize,
+}
+
+impl DeltaBudget {
+    /// A page's.
+    pub(crate) const PAGE: Self = Self { bytes: RECORD_DELTA_BYTES, rows: RECORD_DELTA_ROWS };
+}
+
+/// One page's records delta.
+#[derive(Debug)]
+pub(crate) struct Delta {
+    /// The records, each once, as stored, with no carrying stamp.
+    pub records: Vec<CarriedRecord>,
+    /// `None` when the delta holds **the whole remainder**: every log row above
+    /// the base, read to the log's end. Otherwise the last key it examined, every
+    /// row up to which it carries: the base the next page goes on from.
+    pub stopped_at: Option<Stamp>,
+}
+
+/// One page's **records delta** (B5, "Snapshots carry records"): the records the
+/// change log names above `base`, of a collection `standing` names, each once,
+/// read in the page's own read transaction, so a page never holds a document
+/// whose record changed after its collection's records phase without the
+/// record. One range of the log, in key order; a log key is taken under the
+/// writer, so every change committed after the read that cut `base` is above it.
+///
+/// Stops before the budget is passed ([`DeltaBudget`]), naming the last key it
+/// examined; a record larger than the byte budget goes alone. A row whose record
+/// is gone (purged or collected) carries nothing. No keyed change since `base` is
+/// an empty read.
+pub(crate) fn records_changed_since(
+    txn: &ReadTransaction,
+    base: Stamp,
+    standing: &dyn Fn(CollectionId) -> bool,
+    budget: DeltaBudget,
+) -> Result<Delta> {
+    use std::ops::Bound::{Excluded, Unbounded};
+    let log = txn.open_table(IDEMPOTENCY_CHANGES)?;
+    let records = txn.open_table(IDEMPOTENCY)?;
+    let mut out = Vec::new();
+    let mut seen: HashSet<(u64, [u8; 32])> = HashSet::new();
+    let (mut bytes, mut examined) = (0usize, 0usize);
+    let mut last: Option<Stamp> = None;
+    let rows_cap = budget.rows.max(1);
+    let from = codec::oplog_key(&base);
+    for row in log.range::<&[u8]>((Excluded(from.as_slice()), Unbounded))? {
+        let (key, value) = row?;
+        let Ok(at) = codec::decode_oplog_key(key.value()) else { continue };
+        if examined == rows_cap {
+            return Ok(Delta { records: out, stopped_at: last });
+        }
+        examined += 1;
+        let named = parse_row_value(value.value())
+            .filter(|(collection, scope)| {
+                standing(*collection) && !seen.contains(&(collection.0, scope.0))
+            })
+            .map(|(collection, scope)| {
+                records
+                    .get((collection.0, scope.as_bytes().as_slice()))
+                    .map(|raw| raw.map(|raw| (collection, scope, raw.value().to_vec())))
+            })
+            .transpose()?
+            .flatten();
+        if let Some((collection, scope, record)) = named {
+            let size = record.len() + CARRIED_OVERHEAD;
+            if !out.is_empty() && bytes + size > budget.bytes {
+                // This row is the next page's first.
+                return Ok(Delta { records: out, stopped_at: last });
+            }
+            seen.insert((collection.0, scope.0));
+            bytes += size;
+            out.push(CarriedRecord { collection, scope, carrying: None, record });
+        }
+        last = Some(at);
+    }
+    Ok(Delta { records: out, stopped_at: None })
+}
+
 /// One page of a collection's records for a snapshot's records phase: up to
 /// `limit` (at most [`RECORD_PAGE`]) records after the scope `after`, in scope
 /// order, and the scope to go on after, `None` once the collection's records
@@ -1016,6 +1246,9 @@ pub(crate) struct IdempotencyState {
     /// the real one.
     #[cfg(any(test, feature = "test-hooks"))]
     now_ms: AtomicU64,
+    /// A test's budget for a page's records delta; `None` is the real one.
+    #[cfg(test)]
+    delta_budget: parking_lot::Mutex<Option<DeltaBudget>>,
 }
 
 impl Default for IdempotencyState {
@@ -1028,6 +1261,8 @@ impl Default for IdempotencyState {
             undecodable: AtomicU64::new(0),
             #[cfg(any(test, feature = "test-hooks"))]
             now_ms: AtomicU64::new(0),
+            #[cfg(test)]
+            delta_budget: parking_lot::Mutex::new(None),
         }
     }
 }
@@ -1231,11 +1466,14 @@ impl Engine {
 
     /// Store a snapshot or converge page's records in the page's transaction
     /// (B5, "Snapshots carry records"): each of a collection that stands here,
-    /// through [`Self::store_record`] with no carrying stamp (its row at its own
-    /// `last`), refused if history by the life rule. A record of a collection
-    /// absent here is not stored, as the page's documents of it are not. Those
-    /// this build cannot decode are dropped and counted. Returns how many it
-    /// stored, to count once the page's transaction commits.
+    /// through [`Self::store_record_noting`] with no carrying stamp (rows at its
+    /// merged `first` and `last`, and a row of this node's change log),
+    /// refused if history by the life rule. A record of a collection absent here
+    /// is not stored, as the page's documents of it are not. Those this build
+    /// cannot decode are dropped and counted. Returns how many it **changed**, to
+    /// count once the page's transaction commits: a page whose records change
+    /// nothing here writes nothing and costs no commit, as a page whose documents
+    /// all lose costs none (ADR-152).
     pub(crate) fn store_page_records(
         &self,
         txn: &WriteTxn<'_>,
@@ -1266,6 +1504,24 @@ impl Engine {
             stored += usize::from(wrote);
         }
         Ok(stored)
+    }
+
+    /// The budget of one page's records delta: [`DeltaBudget::PAGE`], or a test's.
+    pub(crate) fn record_delta_budget(&self) -> DeltaBudget {
+        #[cfg(test)]
+        if let Some(budget) = *self.idempotency.delta_budget.lock() {
+            return budget;
+        }
+        DeltaBudget::PAGE
+    }
+
+    /// Set the budget of a page's records delta in bytes and log rows examined,
+    /// for a test that pages one without writing 32 MiB or 65,536 rows; `None`
+    /// for the real one.
+    #[cfg(test)]
+    pub(crate) fn set_record_delta_budget_for_test(&self, bytes_and_rows: Option<(usize, usize)>) {
+        *self.idempotency.delta_budget.lock() =
+            bytes_and_rows.map(|(bytes, rows)| DeltaBudget { bytes, rows });
     }
 
     /// Count `n` records stored from peers by `via`, once the transaction that
@@ -1570,7 +1826,7 @@ impl Engine {
             Some(live) => live.merge(record),
             None => record.clone(),
         };
-        put_rows(txn, collection, scope, &merged, None)?;
+        put_rows(self, txn, collection, scope, &merged, None)?;
         Ok(merged)
     }
 
@@ -1640,7 +1896,7 @@ impl Engine {
         {
             return Ok((Some(merged), false));
         }
-        put_rows(txn, collection, scope, &merged, carrying)?;
+        put_rows(self, txn, collection, scope, &merged, carrying)?;
         Ok((Some(merged), true))
     }
 
@@ -1732,6 +1988,53 @@ impl Engine {
             }
         }
         Ok(collected)
+    }
+
+    /// Retention's share of the change log ([`IDEMPOTENCY_CHANGES`]): its rows
+    /// keyed below `cutoff`, [`RECORD_COLLECT_CHUNK`] per commit with the writer
+    /// released between them (ADR-151). Looked for first under a read
+    /// transaction, one seek, so a pass with nothing to drop takes no writer.
+    /// Where the log begins is kept. A base older than what is kept loses
+    /// nothing: a record changed only before the cutoff is past its window.
+    /// Returns how many rows it dropped.
+    pub(crate) fn trim_idempotency_changes(&self, cutoff: Hlc) -> Result<usize> {
+        use redb::ReadableDatabase;
+        use std::ops::Bound::Excluded;
+        let below = codec::oplog_key(&Stamp::new(cutoff, NodeId::from_bytes([0; 16])));
+        let bounds = (Excluded(LOG_BEGINS), Excluded(below.as_slice()));
+        {
+            let txn = self.db().begin_read()?;
+            let log = txn.open_table(IDEMPOTENCY_CHANGES)?;
+            // not a row: whether any row is below the cutoff, one seek.
+            if log.range::<&[u8]>(bounds)?.next().transpose()?.is_none() {
+                return Ok(0);
+            }
+        }
+        let mut trimmed = 0usize;
+        loop {
+            let txn = self.begin_write(WriterHolder::Retention)?;
+            let n = {
+                let mut log = txn.open_table(IDEMPOTENCY_CHANGES)?;
+                let mut keys = Vec::new();
+                for row in log.range::<&[u8]>(bounds)?.take(RECORD_COLLECT_CHUNK) {
+                    let (key, _) = row?;
+                    keys.push(key.value().to_vec());
+                }
+                for key in &keys {
+                    log.remove(key.as_slice())?;
+                }
+                keys.len()
+            };
+            if n == 0 {
+                txn.abort()?;
+                return Ok(trimmed);
+            }
+            txn.commit()?;
+            trimmed += n;
+            if n < RECORD_COLLECT_CHUNK {
+                return Ok(trimmed);
+            }
+        }
     }
 
     /// One chunk of [`Self::collect_idempotency_records`], under the writer: each
@@ -1910,8 +2213,14 @@ impl Engine {
     /// `until`: it becomes `applying`, with no cursor, so a retry resumes from
     /// the beginning and the stamp rule writes what the rewind undid and nothing
     /// the request still holds. Its counts are left as they were, an
-    /// overcount. Returns how many records it removed and reopened.
-    pub(crate) fn rewind_records_in(txn: &WriteTxn<'_>, until: Hlc) -> Result<(usize, usize)> {
+    /// overcount. A reopened record is a change, logged as every store of one is
+    /// ([`IDEMPOTENCY_CHANGES`]). Returns how many records it removed and
+    /// reopened.
+    pub(crate) fn rewind_records_in(
+        &self,
+        txn: &WriteTxn<'_>,
+        until: Hlc,
+    ) -> Result<(usize, usize)> {
         let mut records = txn.open_table(IDEMPOTENCY)?;
         let mut gone = Vec::new();
         let mut reopened = Vec::new();
@@ -1937,6 +2246,12 @@ impl Engine {
         }
         for (id, scope, bytes) in &reopened {
             records.insert((*id, scope.as_slice()), bytes.as_slice())?;
+        }
+        drop(records);
+        for (id, scope, _) in &reopened {
+            if let Some(scope) = ScopeHash::from_slice(scope) {
+                log_change(self, txn, CollectionId(*id), &scope)?;
+            }
         }
         Ok((gone.len(), reopened.len()))
     }

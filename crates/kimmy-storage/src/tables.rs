@@ -319,6 +319,28 @@ pub const IDEMPOTENCY: TableDefinition<(u64, &[u8]), &[u8]> = TableDefinition::n
 pub const IDEMPOTENCY_BY_STAMP: TableDefinition<&[u8], &[u8]> =
     TableDefinition::new("idempotency_by_stamp");
 
+/// `stamp (26 bytes, an oplog key) -> collection id (8) ‖ scope hash (32)`: this
+/// node's **change log** of idempotency records (B5, "Snapshots carry records").
+///
+/// One row per store that changes a record, on every path (a local commit, a
+/// frame, a replay page, a snapshot or converge page, a rewind's reopen), in the
+/// store's own transaction, keyed by a stamp this node mints for it under the
+/// writer: so keys are in commit order, and every change committed after a read
+/// has a key above the log's high water as that read saw it. A store that changes
+/// nothing writes no row. What a snapshot page's records delta reads, one range
+/// above the base its cursor carries. Node-local: never shipped by a window, not
+/// carried by a backup. Retention drops rows older than the record window.
+///
+/// The empty key holds where this log began, the key of the first change it
+/// held, and its **epoch** (`key (26) ‖ epoch (8)`): a random number given again
+/// when the log begins again, at the first change after a restore (a backup
+/// carries none), an identity reset, or an open that found no log. A snapshot
+/// cursor's base names the epoch, and one of another is told apart whatever the
+/// keys say. The log's high water is in the clock's at open. Created by
+/// `Engine::open` with no schema bump.
+pub const IDEMPOTENCY_CHANGES: TableDefinition<&[u8], &[u8]> =
+    TableDefinition::new("idempotency_changes");
+
 // Keys within the META table.
 pub const META_NODE_ID: &str = "node_id";
 pub const META_FORMAT_VERSION: &str = "format_version";

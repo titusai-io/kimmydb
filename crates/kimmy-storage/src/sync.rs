@@ -3365,6 +3365,13 @@ pub(crate) mod race_hooks {
         /// A keyed insert has committed, and not yet published (B5): not a race, the point
         /// a pull between the write and anything after it reads.
         KeyedCommitted,
+        /// A snapshot page's rows have been read and its cursor cut (B5): not a race, a
+        /// point to show the next page's records base is read in the page's own
+        /// transaction.
+        PageRead,
+        /// A snapshot page's transaction has committed (B5): not a race, a point to show
+        /// its records committed with its documents.
+        PageCommitted,
     }
 
     type Hook = Box<dyn FnOnce()>;

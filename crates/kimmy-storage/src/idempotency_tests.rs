@@ -1132,6 +1132,39 @@ fn the_lookahead_does_not_end_a_request_with_a_match_it_could_write() {
     assert_eq!(record(&engine, &coll, &k).unwrap().state, RecordState::Done);
 }
 
+/// The lookahead stops at the first match past the chunk that the request
+/// could write: what it adds to a chunk's hold on the writer, where the request
+/// goes on, is one match. Two-document chunks over four documents read each
+/// document once, and the third once more, for the first chunk's lookahead.
+#[test]
+fn the_lookahead_reads_one_match_where_the_request_goes_on() {
+    struct Counted(std::sync::atomic::AtomicUsize);
+    impl ModifySpec for Counted {
+        fn matches(&self, doc: &Document) -> kimmy_core::Result<bool> {
+            self.0.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            Ok(doc.contains_key("n"))
+        }
+        fn compare(&self, _: &Document, _: &Document) -> Ordering {
+            Ordering::Equal
+        }
+        fn apply(&self, doc: &Document) -> std::result::Result<Option<Document>, String> {
+            Inc.apply(doc)
+        }
+        fn upsert(&self) -> Option<std::result::Result<Document, String>> {
+            None
+        }
+    }
+    let (engine, coll, _dir, _path) = open();
+    counters(&engine, &coll, 4);
+    engine.set_multi_chunk_docs(2);
+    let spec = Counted(std::sync::atomic::AtomicUsize::new(0));
+    let out = fresh(
+        engine.modify_where_keyed(&coll, &Candidates::Scan, &spec, None, &keyed(94)).unwrap(),
+    );
+    assert_eq!((out.modified, out.commits), (4, 2), "{out:?}");
+    assert_eq!(spec.0.load(std::sync::atomic::Ordering::Relaxed), 5, "four reads, and one ahead");
+}
+
 /// F4. A three-chunk `$inc` that fails at chunk two's commit: after the reopen
 /// the retry resumes after chunk one, and every document is incremented once.
 #[test]
