@@ -28808,7 +28808,10 @@ with it, and not be offered while any member could carry the write without it.
    with no floor.** A late drop's sweep (ADR-231) removes the records whose `last` is at or before the drop; a database
    drop buries each collection the same way; the rows a purge leaves name nothing and expire. A rewind removes the
    records of requests whose every write it discarded, which would replay an answer for a write that no longer exists,
-   and reopens, to resume, one it cut part-way. A backup carries `idempotency` and `idempotency_by_stamp` as tags 12
+   and of one it cut part-way, an update or delete by filter excepted, which it reopens to resume: only a bulk insert
+   minted in the millisecond it rewinds to is cut otherwise, and nothing resumes one, so a retry meets the first
+   document that stands as a duplicate and writes nothing, where a kept record would answer every document inserted. A
+   backup carries `idempotency` and `idempotency_by_stamp` as tags 12
    and 13, so a restored member keeps the records of the writes it holds, those it took by snapshot included: without
    them a retry there would apply on top of a write the backup brought back. It carries no change log; the first change
    after the restore begins one with a new epoch. **The clock:** at open `resume_hlc` takes the largest of each

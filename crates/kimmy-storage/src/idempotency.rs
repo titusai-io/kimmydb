@@ -2222,11 +2222,20 @@ impl Engine {
     /// record of a request whose every write the rewind discards (`first` after
     /// `until`) goes, since nothing of the request stands and a retry must apply
     /// it afresh. One the rewind cuts part-way (`first` at or before `until`,
-    /// `last` after it) is a multi-chunk request that was still applying at
-    /// `until`: it becomes `applying`, with no cursor, so a retry resumes from
-    /// the beginning and the stamp rule writes what the rewind undid and nothing
-    /// the request still holds. Its counts are left as they were, an
-    /// overcount. A reopened record is a change, logged as every store of one is
+    /// `last` after it) is of a request only some of whose writes stand:
+    ///
+    /// - **an update or delete by filter** (`Modify`) becomes `applying`, with
+    ///   no cursor, so a retry resumes from the beginning and the stamp rule
+    ///   writes what the rewind undid and nothing the request still holds. Its
+    ///   counts are left as they were, an overcount;
+    /// - **any other kind goes**, as one discarded whole does. Only a bulk insert
+    ///   spans stamps among them (a batch minted in the millisecond the rewind
+    ///   is to keeps a prefix, since `--until` is a millisecond), and nothing
+    ///   resumes one: kept, its replay would answer every document inserted
+    ///   while only the prefix stands. Gone, a retry is a fresh attempt, which
+    ///   meets the first document that stands as a duplicate and writes nothing.
+    ///
+    /// A reopened record is a change, logged as every store of one is
     /// ([`IDEMPOTENCY_CHANGES`]). Returns how many records it removed and
     /// reopened.
     pub(crate) fn rewind_records_in(
@@ -2243,9 +2252,11 @@ impl Engine {
             let (key, value) = row?;
             let (id, scope) = key.value();
             let Ok(Some(record)) = IdempotencyRecord::decode(value.value()) else { continue };
-            if record.first.hlc > until {
+            let cut = record.last.hlc > until;
+            let resumes = matches!(record.outcome, RecordOutcome::Modify(_));
+            if record.first.hlc > until || (cut && !resumes) {
                 gone.push((id, scope.to_vec()));
-            } else if record.last.hlc > until {
+            } else if cut {
                 let mut open = record;
                 open.state = RecordState::Applying;
                 if let RecordOutcome::Modify(m) = &mut open.outcome {
