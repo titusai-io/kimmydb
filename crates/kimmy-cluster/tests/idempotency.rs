@@ -332,6 +332,92 @@ async fn c6_a_snapshot_carries_more_records_than_a_page() {
     assert_eq!(b.engine.idempotency_records_received()[3], n, "by snapshot");
 }
 
+/// `$inc` of `n` on every document that has one.
+struct IncAll;
+
+impl ModifySpec for IncAll {
+    fn matches(&self, doc: &Document) -> kimmy_core::Result<bool> {
+        Ok(doc.contains_key("n"))
+    }
+    fn compare(&self, _: &Document, _: &Document) -> Ordering {
+        Ordering::Equal
+    }
+    fn apply(&self, doc: &Document) -> Result<Option<Document>, String> {
+        Inc(0).apply(doc)
+    }
+    fn upsert(&self) -> Option<Result<Document, String>> {
+        None
+    }
+}
+
+/// The stamp rule on a fresh attempt (Chris's ruling on S departure 1): a keyed
+/// multi-chunk `$inc` on A, two documents a chunk, races two unrelated writers
+/// between its first and second chunk, one on B (pulled into A before the next
+/// chunk) and one on A itself. Each document they wrote is left alone and
+/// counted in `skipped`; the rest are incremented once; after quiescence every
+/// member holds the same documents and record, and a retry on either replays.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_fresh_multi_chunk_request_skips_what_unrelated_writers_wrote_between_its_chunks() {
+    let (a, b) = pair().await;
+    let orders = a.orders();
+    for id in 2..=6i64 {
+        a.engine.insert(&orders, doc! { "_id": id, "n": 0i64 }).unwrap();
+    }
+    sync(&a, &b).await;
+    assert_eq!(b.count(), 6, "premise: B holds the six");
+    a.engine.set_multi_chunk_docs(2);
+
+    let (a_engine, b_engine, a_addr, b_addr) =
+        (Arc::clone(&a.engine), Arc::clone(&b.engine), a.addr, b.addr);
+    a.engine.before_next_continuing_write(move || {
+        // Between the first chunk and the second, on another thread with a
+        // runtime of its own: the request's thread is the one waiting here.
+        std::thread::spawn(move || {
+            let runtime =
+                tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+            runtime.block_on(async {
+                // B takes the first chunk, so its clock is past the record's
+                // `first`, and writes document 5; A pulls that write.
+                sync_once(&b_engine, a_addr, SECRET, None).await.unwrap();
+                let b_orders = b_engine.get_collection("shop", "orders").unwrap();
+                b_engine.replace(&b_orders, &DocId::Int64(5), doc! { "n": 100i64 }, false).unwrap();
+                let pulled = sync_once(&a_engine, b_addr, SECRET, None).await.unwrap();
+                assert!(pulled.applied >= 1, "A took B's write: {pulled:?}");
+                // And an unrelated writer on A itself, to document 6.
+                let a_orders = a_engine.get_collection("shop", "orders").unwrap();
+                a_engine.replace(&a_orders, &DocId::Int64(6), doc! { "n": 200i64 }, false).unwrap();
+            });
+        })
+        .join()
+        .unwrap();
+    });
+    let k = keyed(40);
+    let out =
+        fresh(a.engine.modify_where_keyed(&orders, &Candidates::Scan, &IncAll, None, &k).unwrap());
+    // Two chunks wrote; the third found both its documents written after the
+    // record's `first`, and its record-only commit is not counted.
+    assert_eq!(out.commits, 2, "premise: more than one chunk: {out:?}");
+    assert_eq!((out.modified, out.skipped), (4, 2), "{out:?}");
+    assert!(!out.resumed, "a fresh attempt");
+
+    // Quiescence.
+    sync(&a, &b).await;
+    sync(&a, &b).await;
+    for node in [&a, &b] {
+        let held: Vec<i64> = (1..=6).map(|id| node.n(id)).collect();
+        assert_eq!(held, vec![1, 1, 1, 1, 100, 200], "each member");
+    }
+    assert_eq!(a.record(&k), b.record(&k), "one record");
+    assert_eq!(
+        a.engine.digest_row(orders.id).unwrap().map(|r| r.digest),
+        b.engine.digest_row(b.orders().id).unwrap().map(|r| r.digest),
+    );
+    let only = Candidates::Scan;
+    replayed(a.engine.modify_where_keyed(&orders, &only, &IncAll, None, &k).unwrap());
+    replayed(b.engine.modify_where_keyed(&b.orders(), &only, &IncAll, None, &k).unwrap());
+    assert_eq!((1..=6).map(|id| b.n(id)).collect::<Vec<_>>(), vec![1, 1, 1, 1, 100, 200]);
+}
+
 /// C8. A key used in one life of a collection, dropped and created again: the
 /// same key applies afresh in the new life, on every member, and the old
 /// life's record is never brought back.

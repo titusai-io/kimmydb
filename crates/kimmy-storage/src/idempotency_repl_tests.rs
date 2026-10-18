@@ -437,10 +437,10 @@ fn c6_a_snapshot_carries_each_collections_records_before_its_documents() {
         }
         let documented: std::collections::HashSet<CollectionId> =
             page.documents.iter().map(|d| d.collection).collect();
-        // A page ends at the boundary into a collection with records: one that
-        // holds records starts with them, and holds no earlier collection's
-        // documents (a collection without records may follow on the page).
-        if let Some(from) = recorded.iter().min() {
+        // A page ends at the boundary into a collection with records: no page
+        // holds a collection's records after another collection's documents
+        // (a collection without records may follow on the page).
+        if let Some(from) = recorded.iter().max() {
             assert!(
                 documented.iter().all(|c| c >= from),
                 "a page holds records after another collection's documents: {page:?}"
