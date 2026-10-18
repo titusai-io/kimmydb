@@ -648,8 +648,9 @@ user, or on another collection, is another key. The principal is its name,
 `local:<user>` or, for a federated caller, its issuer and subject; users
 replicate cluster-wide, so a caller has the same scope on every member. A
 local user deleted and created again under the same name within the window
-inherits the old one's keys. The key itself is never stored, only a hash over
-the principal, the collection and the key.
+inherits the old one's keys. The key itself is never stored: the record is
+kept under the collection's id and a hash over a domain tag, the principal and
+the key.
 
 What makes a retry **the same request** is its fingerprint: a SHA-256 over the
 method, the route, the path and query string **as sent**, and the body

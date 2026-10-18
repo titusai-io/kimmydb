@@ -855,15 +855,18 @@ fn the_routes_that_take_an_idempotency_key_are_the_ones_the_specification_gives_
         );
     }
     // A request with the key still running here is a `multi: true` update or
-    // delete, the two that commit in chunks.
+    // delete, the two that commit in chunks; and either, single-document with
+    // an `if_stamp` the document has moved past, is `409 stale`, so the one
+    // `409` each documents names both.
     for template in ["/v1/db/{db}/coll/{coll}/update", "/v1/db/{db}/coll/{coll}/delete"] {
         let conflict = resolve(spec, &spec["paths"][template]["post"]["responses"]["409"]);
-        assert!(
-            conflict["description"]
-                .as_str()
-                .is_some_and(|d| d.contains("idempotency_key_in_flight")),
-            "POST {template}: its 409 does not document idempotency_key_in_flight"
-        );
+        let described = conflict["description"].as_str().unwrap_or_default();
+        for code in ["idempotency_key_in_flight", "stale"] {
+            assert!(
+                described.contains(code),
+                "POST {template}: its 409 does not document {code}: {described}"
+            );
+        }
     }
 }
 
@@ -2445,6 +2448,38 @@ async fn documented_refusals_use_the_documented_envelope() {
         c.check("POST", docs_t, docs, Some(&root), Some(json!({ "_id": "a" })), 409).await;
     assert_eq!(conflict["error"], "duplicate_key", "the code is what a client branches on");
     assert_eq!(conflict["retry"], "no", "a duplicate key does not become un-duplicate");
+
+    // A delete by filter whose `if_stamp` the document has moved past: `409
+    // stale`, which the delete's documented `409` must name, as the update's
+    // does (it once named only `idempotency_key_in_flight`).
+    let first = c.check("POST", docs_t, docs, Some(&root), Some(json!({ "_id": "s" })), 200).await;
+    let first_stamp = first["stamp"].clone();
+    c.check(
+        "POST",
+        "/v1/db/{db}/coll/{coll}/update",
+        "/v1/db/shop/coll/orders/update",
+        Some(&root),
+        Some(json!({ "filter": { "_id": "s" }, "update": { "$set": { "v": 1 } } })),
+        200,
+    )
+    .await;
+    let delete_t = "/v1/db/{db}/coll/{coll}/delete";
+    let stale = c
+        .check(
+            "POST",
+            delete_t,
+            "/v1/db/shop/coll/orders/delete",
+            Some(&root),
+            Some(json!({ "filter": { "_id": "s" }, "if_stamp": first_stamp })),
+            409,
+        )
+        .await;
+    assert_eq!(stale["error"], "stale", "{stale}");
+    let documented = resolve(spec(), &spec()["paths"][delete_t]["post"]["responses"]["409"]);
+    assert!(
+        documented["description"].as_str().is_some_and(|d| d.contains("`stale`")),
+        "the delete's documented 409 does not name `stale`: {documented}"
+    );
 
     // Valid JSON of the wrong shape. 422 rather than 400, and it was in the
     // HTTP reference but in no specification until the taxonomy was written
