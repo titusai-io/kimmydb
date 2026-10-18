@@ -692,12 +692,12 @@ impl Engine {
     /// replaces wherever the two meet.
     ///
     /// **The residual (G8).** The last writing chunk's lookahead finds the end
-    /// itself and writes `done` there, unless the request is not over at that
-    /// chunk's end: its budget runs out on matches the stamp rule leaves, or it
-    /// finds a match it could write that the next chunk then does not write (the
-    /// spec leaves it unchanged, ADR-208, or another writer rewrites it between
-    /// the two chunks, so the stamp rule leaves it). Then the next chunk finds
-    /// the end having written nothing, and this commit marks it, and a member
+    /// itself and writes `done` there, unless it cannot tell that chunk ends the
+    /// request: its budget runs out on matches the stamp rule leaves, or it
+    /// finds a match it could write that no later chunk then writes (the spec
+    /// leaves it unchanged, ADR-208, or another writer rewrites it between the
+    /// two chunks, so the stamp rule leaves it). Then a later chunk finds the
+    /// end having written nothing, and this commit marks it, and a member
     /// that took the last writing chunk's entry before it, and so covers that
     /// `last`, never receives `done`: a retry there resumes (`resumed: true`,
     /// its counts cumulative, the request's own writes left by the stamp rule)
