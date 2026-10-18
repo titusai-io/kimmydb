@@ -28762,7 +28762,11 @@ with it, and not be offered while any member could carry the write without it.
      cursor's base that is larger than the delta's half of a frame** (refused by name, as a snapshot page's delta
      refuses one): that replay page carries nothing, the contact ends in step, and **the replay of that peer's own
      origin stalls at its position, its cursor kept**, until the log's row of the change is trimmed with the record's
-     window (or the cursor is lost with a restart of the serving member, inbound, and starts over).
+     window (or the cursor is lost with a restart of the serving member, inbound, and starts over). **Every other page
+     of records alone strictly advances the cursor's last key sent**, so the pages at a position end, with one
+     exception, also logged at `WARN` and counted there: a page that what changed since the cursor's base fills
+     carries that alone, keeps its key and moves its base, so under keyed changes faster than a page's round trip
+     carries them the replay makes no headway past its key.
    - **The receiver stores on coverage.** **A receiver stores a frame's record with the first entry it takes at or
      after the record's row, or in the batch's last transaction**, the one that raises its witnessed vector, whether or
      not an entry of the record's collection was taken and whether or not the collection stands here: a stamp a window

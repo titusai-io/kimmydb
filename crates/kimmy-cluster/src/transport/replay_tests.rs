@@ -2187,3 +2187,130 @@ async fn a_changed_record_too_large_for_an_outbound_replays_delta_is_counted_and
     assert_eq!(f.catch_up.replay_from(c), at, "at its position");
     assert_eq!(f.catch_up.replay_records(c), Some(cursor), "with its cursor");
 }
+
+/// The pages a test's replay cut on this thread since it last looked.
+fn take_cuts() -> Vec<TestReplayCut> {
+    TEST_REPLAY_CUTS.with(|cuts| std::mem::take(&mut *cuts.borrow_mut()))
+}
+
+fn key_of(cursor: &kimmy_storage::ReplayRecords) -> (u64, [u8; 32]) {
+    (cursor.collection.0, cursor.scope.0)
+}
+
+/// Every page of records alone a replay cuts **strictly advances its cursor's
+/// last key sent**, so the pages at a position end (the ruling on m1(c)): each
+/// leaves a cursor of its own position whose key is past the key of the cursor
+/// it came with. (The one page of records alone that keeps the key, a delta that
+/// fills it, is said and counted, below.)
+async fn every_page_of_records_alone_advances_its_key(outbound: bool) {
+    let f = fixture(5, 0);
+    plant_spanning_records(&f, 40);
+    let _budget = EntryBudget::set(8 * 1024);
+    take_cuts();
+    f.replay_through(outbound).await;
+    let cuts = take_cuts();
+    let alone: Vec<_> = cuts.iter().filter(|cut| cut.records_alone).collect();
+    assert!(alone.len() >= 4, "premise: pages of records alone: {}", alone.len());
+    for cut in alone {
+        assert!(!cut.unfit, "{cut:?}");
+        let went = cut.went.as_ref().expect("a page of records alone leaves a cursor");
+        assert_eq!(went.at, cut.from, "of its own position");
+        if let Some(came) = cut.came.as_ref().filter(|came| came.at == cut.from) {
+            assert!(key_of(went) > key_of(came), "the key strictly advances: {cut:?}");
+        }
+    }
+}
+
+#[tokio::test]
+async fn every_page_of_records_alone_of_an_inbound_replay_advances_its_key() {
+    every_page_of_records_alone_advances_its_key(false).await;
+}
+
+#[tokio::test]
+async fn every_page_of_records_alone_of_an_outbound_replay_advances_its_key() {
+    every_page_of_records_alone_advances_its_key(true).await;
+}
+
+/// The page of records alone that does not advance the key: records changed
+/// since the cursor's base fill it (each small enough for the delta, together
+/// more than it carries), so it carries those, keeps its key and moves its
+/// base. It is said at `WARN` and counted, and the replay still finishes, with
+/// every record.
+#[tokio::test]
+async fn a_page_filled_by_what_changed_since_the_cursor_keeps_its_key_and_is_counted() {
+    let f = fixture(5, 0);
+    let mut scopes = plant_spanning_records(&f, 30);
+    let _budget = EntryBudget::set(8 * 1024);
+    TEST_REPLAY_MAX_PAGES.with(|cap| cap.set(Some(1)));
+    f.round().await.unwrap();
+    TEST_REPLAY_MAX_PAGES.with(|cap| cap.set(None));
+    let c = f.c.node_id();
+    assert!(inbound_records(c, f.a.node_id(), f.catch_up.replay_from(c)).is_some(), "premise");
+    // Twelve changes of about 600 bytes each: more than the delta's 4 KiB.
+    let from = f.a.own_position_at_open();
+    let orders = f.c.get_collection("shop", "orders").unwrap();
+    let node = f.a.node_id();
+    for k in 0..12u16 {
+        let at = Stamp::new(Hlc::new(from.wall_ms + 1, 700 + k), node);
+        let record = kimmy_storage::IdempotencyRecord {
+            fingerprint: kimmy_core::Fingerprint([0x7c; 32]),
+            first: at,
+            last: at,
+            origin: node,
+            state: kimmy_storage::RecordState::Done,
+            outcome: kimmy_storage::RecordOutcome::FindAndModify {
+                matched: true,
+                modified: true,
+                removed: false,
+                upserted_id: None,
+                stamp: Some(at),
+                document: Some(bson::doc! { "pad": "c".repeat(500) }),
+            },
+        };
+        let mut scope = [0x7c; 32];
+        scope[30..].copy_from_slice(&k.to_be_bytes());
+        let scope = kimmy_core::ScopeHash(scope);
+        let carried = kimmy_storage::CarriedRecord {
+            collection: orders.id,
+            scope,
+            carrying: Some(at),
+            record: record.encode(),
+        };
+        f.c.apply_batch_carrying(&[], &[carried], kimmy_storage::RecordsVia::Pull).unwrap();
+        scopes.push(scope);
+    }
+    let seen = Seen::default();
+    let log = Arc::clone(&seen.0);
+    let _recording = tracing::subscriber::set_default(seen);
+    tracing::callsite::rebuild_interest_cache();
+    let unfit = records_unfit().get(UnfitPath::Replay);
+    take_cuts();
+    f.replay_through(false).await;
+    let cuts = take_cuts();
+    let kept: Vec<_> = cuts
+        .iter()
+        .filter(|cut| {
+            cut.records_alone
+                && cut.came.as_ref().zip(cut.went.as_ref()).is_some_and(|(came, went)| {
+                    key_of(came) == key_of(went) && went.base.key > came.base.key
+                })
+        })
+        .collect();
+    assert!(!kept.is_empty(), "premise: a page the delta filled: {cuts:#?}");
+    assert!(records_unfit().get(UnfitPath::Replay) >= unfit + kept.len() as u64, "counted");
+    let said = log
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|(level, message)| {
+            *level == tracing::Level::WARN
+                && message.contains("carries only the idempotency records changed since")
+        })
+        .count();
+    assert_eq!(said, kept.len(), "said for each");
+    let aorders = f.a.get_collection("shop", "orders").unwrap();
+    for scope in &scopes {
+        assert!(f.a.idempotency_record(aorders.id, scope).unwrap().is_some(), "every record");
+    }
+    assert_eq!(f.orders(), 2 + 5, "every lost write is back");
+}

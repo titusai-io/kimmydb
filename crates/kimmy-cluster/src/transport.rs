@@ -382,6 +382,68 @@ pub(crate) fn cut_replay_page(
     exhausted: bool,
     cursor: Option<kimmy_storage::ReplayRecords>,
 ) -> Result<ReplayCut, ProtocolError> {
+    #[cfg(test)]
+    let came = cursor.clone();
+    let cut = cut_replay_page_from(
+        engine,
+        peer,
+        their_node,
+        from,
+        entries,
+        window_records,
+        unanchored,
+        scanned_to,
+        exhausted,
+        cursor,
+    );
+    #[cfg(test)]
+    if let Ok(cut) = &cut {
+        TEST_REPLAY_CUTS.with(|cuts| {
+            cuts.borrow_mut().push(TestReplayCut {
+                from,
+                came,
+                went: cut.replay_records.clone(),
+                records_alone: cut.entries.is_empty() && !cut.records.is_empty(),
+                unfit: cut.unfit,
+            })
+        });
+    }
+    cut
+}
+
+/// One page a test saw [`cut_replay_page`] cut: its position, the records cursor
+/// it came with and the one it left, and whether it carried records alone.
+#[cfg(test)]
+#[derive(Clone, Debug)]
+pub(crate) struct TestReplayCut {
+    pub(crate) from: Hlc,
+    pub(crate) came: Option<kimmy_storage::ReplayRecords>,
+    pub(crate) went: Option<kimmy_storage::ReplayRecords>,
+    pub(crate) records_alone: bool,
+    pub(crate) unfit: bool,
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Every page [`cut_replay_page`] cut on this thread, for a test that reads
+    /// how a replay's records cursor moved.
+    pub(crate) static TEST_REPLAY_CUTS: std::cell::RefCell<Vec<TestReplayCut>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
+#[allow(clippy::too_many_arguments)]
+fn cut_replay_page_from(
+    engine: &Engine,
+    peer: &dyn std::fmt::Display,
+    their_node: NodeId,
+    from: Hlc,
+    entries: Vec<OplogEntry>,
+    window_records: Vec<kimmy_storage::CarriedRecord>,
+    unanchored: usize,
+    scanned_to: Hlc,
+    exhausted: bool,
+    cursor: Option<kimmy_storage::ReplayRecords>,
+) -> Result<ReplayCut, ProtocolError> {
     let budget = entry_budget();
     let cursor = cursor.filter(|cursor| cursor.at == from);
     let (mut entries, mut scanned_to, mut exhausted) = (entries, scanned_to, exhausted);
@@ -498,6 +560,20 @@ pub(crate) fn cut_replay_page(
         if size_of(&records).is_none_or(|bytes| bytes > budget) {
             return unfit("the idempotency records changed since this replay's records cursor");
         }
+        // The one page of records alone that does not move the cursor's key: what
+        // changed since its base fills it, and the base moves on instead. Under
+        // keyed changes faster than a page's round trip carries them, the replay
+        // makes no headway past its key on such pages, so each is said and
+        // counted as a page that could not carry what it must.
+        records_unfit().bump(UnfitPath::Replay);
+        warn!(
+            %peer,
+            ?from,
+            records = records.len(),
+            "a replay page carries only the idempotency records changed since its records \
+             cursor: they fill the page, so it sends nothing after the cursor's key and moves \
+             only its base; counted in kimmy_idempotency_records_unfit_total"
+        );
         return Ok(ReplayCut {
             entries: Vec::new(),
             records,
