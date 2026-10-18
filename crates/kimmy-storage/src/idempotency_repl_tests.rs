@@ -789,6 +789,52 @@ fn a_window_ships_a_record_at_its_own_row_not_at_one_an_earlier_life_left() {
     assert_eq!(shipped[0].carrying, Some(now.first), "at its own row, not the earlier life's");
 }
 
+/// A record found again at a lower row is carried there (B1 of the build
+/// review), but only at a row of its own: a row another record under its key
+/// left below its `first` lowers nothing. Here that row is planted at an origin
+/// that sorts after the record's own, so F2 reads it after the record was
+/// shipped at its own row.
+#[test]
+fn a_row_below_the_records_first_found_later_does_not_lower_its_carrying_row() {
+    let a = member();
+    let z = loop {
+        let z = member();
+        if z.engine.node_id() > a.engine.node_id() {
+            break z;
+        }
+    };
+    let ca = a.engine.create_collection("shop", "orders").unwrap();
+    pull(&z.engine, &a.engine);
+    let cz = z.engine.get_collection("shop", "orders").unwrap();
+    z.engine.insert(&cz, doc! { "_id": 7i64 }).unwrap();
+    pull(&a.engine, &z.engine);
+    let k = keyed(43);
+    fresh(a.engine.insert_keyed(&ca, doc! { "v": 1 }, &k).unwrap());
+    let own = a.engine.idempotency_record(ca.id, &k.scope).unwrap().expect("premise").first;
+    let z_node = z.engine.node_id();
+    let stray = Stamp::new(a.engine.version_vector().unwrap().get(z_node), z_node);
+    assert!(stray < own, "premise: the planted row is below the record's first");
+    {
+        let db = a.engine.db();
+        let txn = db.begin_write().unwrap();
+        let mut row = ca.id.0.to_be_bytes().to_vec();
+        row.extend_from_slice(k.scope.as_bytes());
+        txn.open_table(crate::tables::IDEMPOTENCY_BY_STAMP)
+            .unwrap()
+            .insert(crate::idempotency::row_key(&stray).as_slice(), row.as_slice())
+            .unwrap();
+        txn.commit().unwrap();
+    }
+    let empty = kimmy_core::VersionVector::new();
+    let window = a
+        .engine
+        .entries_for_peer_holding(Hlc::ZERO, 1024, Some(&empty), WalkScope::Background)
+        .unwrap();
+    let shipped: Vec<_> = window.records.iter().filter(|r| r.scope == k.scope).collect();
+    assert_eq!(shipped.len(), 1, "one per key: {shipped:?}");
+    assert_eq!(shipped[0].carrying, Some(own), "at its own row, not the lower one");
+}
+
 /// A frame's record is stored with the entry at or after its row, never in the
 /// run of an earlier entry of its collection: the batch takes entries in stamp
 /// order, and one before the row can be of a life a drop between them ends, a
