@@ -3757,6 +3757,36 @@ fn row_r2_a_record_taken_by_frame_rides_the_next_page_its_member_serves() {
     );
 }
 
+/// R2 across a restart: B's last change-log key is stamped ahead of its oplog and its
+/// rows (its clock moved forward, then it took a record by page), and that key is the
+/// base of C's next page. B restarts between C's pages and takes a write by frame
+/// stamped behind that key; its clock must resume above the log's keys, or the change's
+/// key falls below the base and the record misses the page that brings its effect.
+#[test]
+fn row_r2_a_restart_resumes_above_the_change_logs_keys() {
+    row(
+        "r2-clock",
+        3,
+        vec![req(1, Kind::IncBig { d: 0 }), req(2, Kind::IncBig { d: 1200 })],
+        vec![
+            big(A),
+            ask(0, A, 100),
+            Op { step: Step::Clock { m: B }, t: 200 },
+            scoped(B, A, BIG, Vec::new()),
+            scoped(
+                C,
+                B,
+                BIG,
+                vec![(
+                    1,
+                    vec![Op { step: Step::Restart { m: B }, t: 0 }, ask(1, A, 115), pull(B, A)],
+                )],
+            ),
+            ask(1, C, 130),
+        ],
+    );
+}
+
 /// R1c: a whole-database snapshot whose later page brings an effect whose record came
 /// after the collection's records phase; a retry at completion (what the catching-up
 /// gate allows once it opens as `unknown`) must replay.
