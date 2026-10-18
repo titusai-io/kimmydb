@@ -28998,7 +28998,14 @@ receivers, the store on coverage, a record at its own row and with the entry at 
 snapshot's records phase and an older receiver, repair and converge pages), `idempotency_coverage_tests.rs` (the G1
 analysis's G1b, G2, G2b, G3, T2 and G8 as storage tests) and `page_delta_tests.rs` (the R1 and R2 schedules, the base
 read in the page's own transaction, the remainder rule by bytes and rows, a resumed pull, the epoch after a restore, an
-identity reset and a clock behind). `kimmy-cluster` (`tests/idempotency.rs`, in process over real sockets): C1 pulled and
+identity reset and a clock behind), `idempotency_review_tests.rs` (what the build review's M1 found untested: every
+record and the change log expiring, the log kept across a pull's pages, a records-only page inside a records phase)
+and `idempotency_replay.rs` (B2's selection, an orphan row, the records cursor's set, its delta and its epoch);
+`kimmy-cluster`'s `replay_tests.rs` (B2 on both ways, F3 on a replay page, a page that stops between a request's
+effects and its `last`, an orphan row on both ways, and records at a replay's start filling several pages on both
+ways), a pull and a push whose first entry cannot cross with its records, and the build review's B1 schedules (a
+batch stopped, or split into runs, between two rows of one record) in `idempotency_coverage_tests.rs`. A rewind that
+cuts a keyed bulk part-way removes its record (m3). `kimmy-cluster` (`tests/idempotency.rs`, in process over real sockets): C1 pulled and
 pushed, C2, C3, C5, C6 with more records than a page, C8, C9, and a fresh multi-chunk request racing writers on two
 members; C7 as the version-boundary decodes beside the protocol.
 `kimmyd` (`tests/cluster.rs`, real processes over HTTP): C1, C2, C3, C5, C6, C8, C9 and the multi-chunk race, T2 over
