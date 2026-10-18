@@ -4,7 +4,7 @@ source, applied once to a `git archive` export, run against its suites under a t
 and reverted by copying the pristine file back. A row whose text does not occur exactly
 once fails `check` and is never run.
 
-    mutants.py list [group]            names of the rows (group: design, fix-e, elsewhere, all)
+    mutants.py list [group]            names of the rows (group: design, fix-e, lives, elsewhere, all)
     mutants.py check <tree>            every row applies to <tree>, exactly once
     mutants.py apply <name> <tree>     patch <tree> in place
     mutants.py files <name>            the files a row touches
@@ -83,8 +83,8 @@ ROWS = [
         "doc": "The receiver stores a frame's record only when the entry wins",
         "patches": [
             ("crates/kimmy-storage/src/sync.rs",
-             "        if frame.owes(collection.id) {\n",
-             "        if frame.owes(collection.id) && matches!(applied, RemoteApplied::Applied { .. }) {\n"),
+             "        if frame.owes(collection.id, entry.stamp) {\n",
+             "        if frame.owes(collection.id, entry.stamp) && matches!(applied, RemoteApplied::Applied { .. }) {\n"),
         ],
         "suites": MODEL,
     },
@@ -390,6 +390,39 @@ ROWS = [
 """),
         ],
         "suites": [("kimmy-storage", "--lib", "idempotency_tests::f3", "no")],
+    },
+    {
+        "name": "purge-removes-every-record-under-the-id",
+        "group": "lives",
+        "doc": "The drop purger removes every record under the collection's id, a later life's too (P1 reverted)",
+        "patches": [
+            ("crates/kimmy-storage/src/idempotency.rs",
+             "                    Ok(Some(record)) => dropped.is_none_or(|at| record.last.hlc <= at.hlc),\n",
+             "                    Ok(Some(_)) => true,\n"),
+        ],
+        "suites": MODEL,
+    },
+    {
+        "name": "ships-a-record-at-an-earlier-lifes-row",
+        "group": "lives",
+        "doc": "A sender ships a record at a row below its first, one an earlier life under its key left",
+        "patches": [
+            ("crates/kimmy-storage/src/idempotency.rs",
+             "            && carrying < standing.first\n",
+             "            && carrying < standing.first\n            && carrying.hlc == Hlc::MAX\n"),
+        ],
+        "suites": MODEL,
+    },
+    {
+        "name": "stores-a-record-with-an-earlier-entry",
+        "group": "lives",
+        "doc": "A receiver stores a frame's record in the run of its collection's first entry, before its row",
+        "patches": [
+            ("crates/kimmy-storage/src/idempotency.rs",
+             "        carrying.is_none_or(|row| row <= at)\n",
+             "        let _ = (carrying, at);\n        true\n"),
+        ],
+        "suites": MODEL,
     },
     {
         "name": "header-guard-not-over-mcp",

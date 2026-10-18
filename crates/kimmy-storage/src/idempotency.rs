@@ -1790,7 +1790,14 @@ impl Engine {
     /// with coverage), so a member that has applied a drop, its purge pending, can
     /// hold the record of a write stamped after the drop (kept in the next life,
     /// ADR-236); removed here, that write's effect would stand without its record.
-    /// A record this build cannot decode goes, as it went before.
+    /// A record this build cannot decode goes, as it went before, and so does every
+    /// record under an id with no tombstone over it (ADR-158's residual before its
+    /// addendum, a purge a creation asked for): nothing there tells one life from
+    /// another, and the name is created again with no floor over what stays.
+    ///
+    /// A chunk that examines a record of a later life removes less than it
+    /// examined, so the purger reads it as the end: dropped-life records past it
+    /// are left for retention, history by the life rule meanwhile.
     pub(crate) fn purge_records_in(
         txn: &WriteTxn<'_>,
         id: CollectionId,
@@ -1806,7 +1813,7 @@ impl Engine {
             for row in records.range(collection_records(id, None))?.take(budget) {
                 let (key, value) = row?;
                 let of_the_dropped_life = match IdempotencyRecord::decode(value.value()) {
-                    Ok(Some(record)) => dropped.is_some_and(|at| record.last.hlc <= at.hlc),
+                    Ok(Some(record)) => dropped.is_none_or(|at| record.last.hlc <= at.hlc),
                     Ok(None) | Err(_) => true,
                 };
                 if of_the_dropped_life {
