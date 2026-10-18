@@ -3294,6 +3294,7 @@ mod tests {
         let window = a.entries_for_peer(Hlc::ZERO, 1_024, crate::WalkScope::Background).unwrap();
         let n = window.entries.len();
         let after = crate::watch::OplogWindow {
+            unanchored: 0,
             entries: window.entries[n - 2..].to_vec(),
             scanned_to: window.scanned_to,
             exhausted: window.exhausted,
@@ -3361,6 +3362,7 @@ mod tests {
         let theirs = a.version_vector().unwrap();
         let window = a.entries_for_peer(Hlc::ZERO, 1_024, crate::WalkScope::Background).unwrap();
         let after = crate::watch::OplogWindow {
+            unanchored: 0,
             entries: window
                 .entries
                 .iter()

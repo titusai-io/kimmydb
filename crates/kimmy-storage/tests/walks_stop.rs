@@ -422,10 +422,16 @@ const BOUNDED_READS: &[(&str, &str)] = &[
     ),
     ("idempotency_tests::rows", "test code reading a store of a few thousand rows it wrote itself"),
     (
-        "idempotency::records_for_window",
-        "the rows between a served window's first and last stamps, read in the window's own read \
-         transaction, a seek per origin with a row: a row per stamp the window's walk passed over \
-         at most",
+        "idempotency::records_in_advance",
+        "F2 of a served window's records, in the window's own read transaction: per origin, the \
+         rows inside the coverage the window grants the requester, a row per stamp its coverage \
+         passes at most",
+    ),
+    (
+        "idempotency::records_unanchored",
+        "F3 of a served window's records, in the window's own read transaction: a seek per origin \
+         with a row, and the rows above this node's own servable vector, which its next pull of \
+         their entries anchors",
     ),
     (
         "purge::Engine::owed_purges",
