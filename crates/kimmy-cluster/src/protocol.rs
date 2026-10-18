@@ -91,6 +91,16 @@ fn lenient_hlc<'de, D: serde::Deserializer<'de>>(deserializer: D) -> Result<Opti
     Ok(raw.and_then(|raw| bson::deserialize_from_bson::<Hlc>(raw).ok()))
 }
 
+/// A replay's records cursor, read leniently (m1 of the B5 build review): one
+/// that does not decode is none, so the page's records start over at its
+/// position, and the frame is never refused for it.
+fn lenient_replay_records<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<Option<kimmy_storage::ReplayRecords>, D::Error> {
+    let raw = Option::<bson::Bson>::deserialize(deserializer)?;
+    Ok(raw.and_then(|raw| bson::deserialize_from_bson(raw).ok()))
+}
+
 /// A digest request, read leniently (B3): one that does not decode is none, so a
 /// field of another shape costs the field and never the frame.
 fn lenient_digest_ask<'de, D: serde::Deserializer<'de>>(
@@ -280,6 +290,27 @@ pub enum Message {
         /// requester that predates it sends none, which reads as `false`.
         #[serde(default)]
         partial: bool,
+        /// The requester asks for a page of the replay of its own origin
+        /// (ADR-212), from `from` (B2 of the B5 build review): the sender cuts
+        /// the answer as a replay page, with the records of the page's
+        /// collections whose request spans it, and sizes it to the frame itself,
+        /// down to a page of records alone (`Entries::replay_records`). Optional
+        /// on the wire, read as `false` when absent and not written when false: a
+        /// sender that predates it ignores it and answers the window as a pull
+        /// (0.51 holds no records, and keyed writes are taken only while every
+        /// live member carries records).
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        replay: bool,
+        /// Where the replay's last page of records alone at `from` left off, as
+        /// that page's `Entries::replay_records` said: the sender goes on after
+        /// it. Optional and read leniently; absent from a requester that predates
+        /// it or has none.
+        #[serde(
+            default,
+            skip_serializing_if = "Option::is_none",
+            deserialize_with = "lenient_replay_records"
+        )]
+        replay_records: Option<kimmy_storage::ReplayRecords>,
     },
     /// The answer, in stamp order, and where the window it came from ended.
     ///
@@ -324,6 +355,16 @@ pub enum Message {
             deserialize_with = "kimmy_storage::lenient_records"
         )]
         records: Vec<kimmy_storage::CarriedRecord>,
+        /// On the answer to an `AskEntries` that set `replay`: the page carries
+        /// records alone (m1 of the B5 build review), and the next page at the
+        /// same `from` goes on after this. Optional and read leniently: an older
+        /// receiver ignores it, and an older sender sends none.
+        #[serde(
+            default,
+            skip_serializing_if = "Option::is_none",
+            deserialize_with = "lenient_replay_records"
+        )]
+        replay_records: Option<kimmy_storage::ReplayRecords>,
     },
     /// "That many entries will not fit in a frame; ask for this many."
     ///
@@ -960,6 +1001,8 @@ mod tests {
                 held: None,
                 marked: Vec::new(),
                 partial: false,
+                replay: false,
+                replay_records: None,
             },
             Message::AskEntries {
                 from: Hlc::new(7, 1),
@@ -967,6 +1010,8 @@ mod tests {
                 held: Some(populated_vector()),
                 marked: Vec::new(),
                 partial: false,
+                replay: false,
+                replay_records: None,
             },
             Message::AskEntries {
                 from: Hlc::new(7, 1),
@@ -978,6 +1023,8 @@ mod tests {
                     through: Hlc::new(5, 2),
                 }],
                 partial: false,
+                replay: false,
+                replay_records: None,
             },
             Message::Versions(populated_vector()),
             Message::Vectors {
@@ -994,6 +1041,7 @@ mod tests {
                 exhausted: false,
                 passed_through: None,
                 records: Vec::new(),
+                replay_records: None,
             },
             Message::Entries {
                 entries: Vec::new(),
@@ -1001,6 +1049,7 @@ mod tests {
                 exhausted: true,
                 passed_through: None,
                 records: Vec::new(),
+                replay_records: None,
             },
             Message::Hello { node: NodeId::generate(), nonce: vec![1, 2, 3] },
             Message::Confirm { proof: vec![9, 9] },
@@ -1104,6 +1153,8 @@ mod tests {
                 held: None,
                 marked: Vec::new(),
                 partial: false,
+                replay: false,
+                replay_records: None,
             },
         )
         .await
@@ -1121,7 +1172,9 @@ mod tests {
                 limit: 5,
                 held: None,
                 marked: Vec::new(),
-                partial: false
+                partial: false,
+                replay: false,
+                replay_records: None
             }
         );
     }
@@ -1142,7 +1195,15 @@ mod tests {
         buffer.extend_from_slice(&body);
         assert_eq!(
             read_frame(&mut buffer.as_slice()).await.unwrap(),
-            Message::AskEntries { from, limit: 10, held: None, marked: Vec::new(), partial: false },
+            Message::AskEntries {
+                from,
+                limit: 10,
+                held: None,
+                marked: Vec::new(),
+                partial: false,
+                replay: false,
+                replay_records: None
+            },
             "a request without the field must read as one that did not send it"
         );
 
@@ -1156,9 +1217,114 @@ mod tests {
         buffer.extend_from_slice(&body);
         assert_eq!(
             read_frame(&mut buffer.as_slice()).await.unwrap(),
-            Message::AskEntries { from, limit: 10, held: None, marked: Vec::new(), partial: false },
+            Message::AskEntries {
+                from,
+                limit: 10,
+                held: None,
+                marked: Vec::new(),
+                partial: false,
+                replay: false,
+                replay_records: None
+            },
             "a field this build does not know must not fail the frame"
         );
+    }
+
+    /// The same boundary for `AskEntries::replay` and the replay's records cursor
+    /// (B2 and m1 of the B5 build review), in both directions. A request that
+    /// sets neither writes neither key; a sender before them reads a request that
+    /// sets them as the window it knew; a frame from before them reads as `false`
+    /// and `None`; and a cursor of another shape reads as none, never refusing the
+    /// frame.
+    #[tokio::test]
+    async fn the_replay_fields_cross_a_version_boundary_in_both_directions() {
+        /// `AskEntries` as a sender before B5 declares it.
+        #[derive(Debug, Deserialize)]
+        struct AskEntriesBeforeReplay {
+            from: Hlc,
+            limit: usize,
+            #[serde(default)]
+            partial: bool,
+        }
+        async fn body_of(message: &Message, variant: &str) -> bson::Document {
+            let mut written = Vec::new();
+            write_frame(&mut written, message).await.unwrap();
+            let body = bson::deserialize_from_slice::<bson::Document>(&written[4..]).unwrap();
+            body.get_document(variant).unwrap().clone()
+        }
+        async fn read_back(variant: &str, fields: bson::Document) -> Message {
+            let bytes = bson::serialize_to_vec(&bson::doc! { variant: fields }).unwrap();
+            let mut frame = (bytes.len() as u32).to_be_bytes().to_vec();
+            frame.extend_from_slice(&bytes);
+            read_frame(&mut frame.as_slice()).await.unwrap()
+        }
+        let cursor = kimmy_storage::ReplayRecords {
+            at: Hlc::new(7, 1),
+            through: Hlc::new(9, 0),
+            collections: vec![kimmy_core::CollectionId(u64::MAX - 3)],
+            collection: kimmy_core::CollectionId(u64::MAX - 3),
+            scope: kimmy_core::ScopeHash([5; 32]),
+            base: kimmy_storage::RecordsBase {
+                key: kimmy_core::Stamp::new(Hlc::new(8, 0), NodeId::generate()),
+                epoch: Some(-42),
+            },
+        };
+        let plain = Message::AskEntries {
+            from: Hlc::new(7, 1),
+            limit: 10,
+            held: None,
+            marked: Vec::new(),
+            partial: false,
+            replay: false,
+            replay_records: None,
+        };
+        let sent = body_of(&plain, "AskEntries").await;
+        assert!(!sent.contains_key("replay") && !sent.contains_key("replay_records"), "{sent}");
+        let ask = Message::AskEntries {
+            from: Hlc::new(7, 1),
+            limit: 10,
+            held: None,
+            marked: Vec::new(),
+            partial: false,
+            replay: true,
+            replay_records: Some(cursor.clone()),
+        };
+        let sent = body_of(&ask, "AskEntries").await;
+        assert_eq!(sent.get_bool("replay").ok(), Some(true), "{sent}");
+        assert_eq!(read_back("AskEntries", sent.clone()).await, ask, "it round-trips");
+        let older: AskEntriesBeforeReplay = bson::deserialize_from_document(sent.clone())
+            .expect("a sender that predates the fields reads the request");
+        assert_eq!((older.from, older.limit, older.partial), (Hlc::new(7, 1), 10, false));
+        let mut before = sent.clone();
+        before.remove("replay");
+        before.remove("replay_records");
+        assert_eq!(read_back("AskEntries", before).await, plain, "from before: a pull");
+        let mut other = sent;
+        other.insert("replay_records", "a cursor of another shape");
+        let Message::AskEntries { replay_records: none, replay, .. } =
+            read_back("AskEntries", other).await
+        else {
+            panic!("not AskEntries")
+        };
+        assert!(replay && none.is_none(), "a cursor of another shape reads as none");
+
+        let page = Message::Entries {
+            entries: Vec::new(),
+            scanned_to: Hlc::new(7, 1),
+            exhausted: false,
+            passed_through: None,
+            records: Vec::new(),
+            replay_records: Some(cursor),
+        };
+        let sent = body_of(&page, "Entries").await;
+        assert_eq!(read_back("Entries", sent.clone()).await, page, "it round-trips");
+        let mut before = sent;
+        before.remove("replay_records");
+        let Message::Entries { replay_records: none, .. } = read_back("Entries", before).await
+        else {
+            panic!("not Entries")
+        };
+        assert!(none.is_none(), "an answer from before the field carries no cursor");
     }
 
     /// The same boundary for `AskEntries::partial` and `Entries::
@@ -1206,6 +1372,8 @@ mod tests {
             held: Some(held.clone()),
             marked: Vec::new(),
             partial: true,
+            replay: false,
+            replay_records: None,
         };
         let sent = body_of(&ask, "AskEntries").await;
         assert_eq!(
@@ -1228,6 +1396,8 @@ mod tests {
                 held: Some(held),
                 marked: Vec::new(),
                 partial: false,
+                replay: false,
+                replay_records: None
             },
             "a request from before the field asks for a whole window"
         );
@@ -1239,6 +1409,7 @@ mod tests {
             exhausted: false,
             passed_through: Some(p),
             records: Vec::new(),
+            replay_records: None,
         };
         let sent = body_of(&entries, "Entries").await;
         assert!(sent.contains_key("passed_through"), "the frame carries the field: {sent}");
@@ -1256,6 +1427,7 @@ mod tests {
                 exhausted: false,
                 passed_through: None,
                 records: Vec::new(),
+                replay_records: None
             },
             "a window from before the field names no end of its own"
         );
@@ -1353,6 +1525,7 @@ mod tests {
             exhausted: true,
             passed_through: None,
             records: records.clone(),
+            replay_records: None,
         };
         let sent = body_of(&message, "Entries").await;
         assert!(sent.get_array("records").is_ok_and(|r| r.len() == 1), "carried: {sent}");
@@ -1534,6 +1707,8 @@ mod tests {
                 through: Hlc::new(5, 2),
             }],
             partial: false,
+            replay: false,
+            replay_records: None,
         };
         let mut written = Vec::new();
         write_frame(&mut written, &request).await.unwrap();
@@ -1566,6 +1741,8 @@ mod tests {
                 held: Some(held),
                 marked: Vec::new(),
                 partial: false,
+                replay: false,
+                replay_records: None
             },
             "a request without the field must read as one naming no spans"
         );

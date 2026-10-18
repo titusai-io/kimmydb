@@ -2002,6 +2002,33 @@ fn a_rewind_removes_or_reopens_the_records_it_cuts() {
     assert_eq!(ns(&engine, &coll, 3), vec![1, 1, 1]);
 }
 
+/// A rewind that cuts a keyed bulk insert part-way removes its record (m3 of the
+/// build review): a bulk minted in the millisecond the rewind is to keeps a
+/// prefix, and nothing resumes a bulk, so a reopened record would replay
+/// "inserted 3" while two documents stand. The retry is a fresh attempt, which
+/// meets the first document that stands as a duplicate and writes nothing.
+#[test]
+fn a_rewind_that_cuts_a_bulk_part_way_removes_its_record() {
+    let (engine, coll, _dir, _path) = open();
+    let k = keyed(64);
+    let docs = vec![doc! { "v": 0 }, doc! { "v": 1 }, doc! { "v": 2 }];
+    let ids = fresh(engine.insert_many_keyed(&coll, docs.clone(), &k).unwrap());
+    let stamps: Vec<Stamp> = ids.iter().map(|(_, stamp)| *stamp).collect();
+    let until = stamps[1].hlc;
+    assert!(stamps[0].hlc <= until && until < stamps[2].hlc, "premise: {stamps:?}");
+    let out = engine.rewind_to(until).unwrap();
+    assert_eq!((out.records_removed, out.records_reopened), (1, 0));
+    assert_eq!(record(&engine, &coll, &k), None, "cut part-way, and not reopened");
+    assert_eq!(count(&engine, &coll), 2, "premise: the rewind kept two of three");
+    let retry = engine.insert_many_keyed(&coll, docs, &k);
+    assert!(
+        matches!(&retry, Err(e) if e.index == Some(0) && matches!(e.source, StorageError::Core(_))),
+        "a duplicate at the first document: {retry:?}"
+    );
+    assert_eq!(count(&engine, &coll), 2, "the retry wrote nothing");
+    assert_eq!(record(&engine, &coll, &k), None, "and stored no record");
+}
+
 /// A backup carries the records and their rows (tags 12 and 13), and a
 /// restored member replays from them.
 #[test]

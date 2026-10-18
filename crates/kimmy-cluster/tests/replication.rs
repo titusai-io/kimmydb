@@ -3540,6 +3540,7 @@ async fn a_tick_at_the_pull_ceiling(fresh: bool, margin: u32) -> CeilingTick {
                                     exhausted: false,
                                     passed_through: None,
                                     records: Vec::new(),
+                                    replay_records: None,
                                 }
                             }
                             _ => return,
@@ -7412,6 +7413,7 @@ async fn wedged_fake(b: &Node) -> std::net::SocketAddr {
                             exhausted: false,
                             passed_through: None,
                             records: Vec::new(),
+                            replay_records: None,
                         },
                         _ => return,
                     };
@@ -7531,6 +7533,7 @@ async fn advance_then_wedge(b: &Node) -> std::net::SocketAddr {
                             exhausted: false,
                             passed_through: None,
                             records: Vec::new(),
+                            replay_records: None,
                         },
                         _ => return,
                     };
@@ -7651,6 +7654,7 @@ async fn wedged_fake_slow(b: &Node, delay: Duration) -> std::net::SocketAddr {
                                 exhausted: false,
                                 passed_through: None,
                                 records: Vec::new(),
+                                replay_records: None,
                             }
                         }
                         _ => return,
@@ -8060,6 +8064,7 @@ async fn a_reset_chain_opens_about_once_an_interval_not_once_a_tick() {
                                         exhausted: false,
                                         passed_through: None,
                                         records: Vec::new(),
+                                        replay_records: None,
                                     }
                                 } else {
                                     Message::Entries {
@@ -8068,6 +8073,7 @@ async fn a_reset_chain_opens_about_once_an_interval_not_once_a_tick() {
                                         exhausted: true,
                                         passed_through: None,
                                         records: Vec::new(),
+                                        replay_records: None,
                                     }
                                 }
                             }
@@ -8225,6 +8231,7 @@ async fn an_advancing_contact_ending_at_the_ceiling_is_not_reset_or_carried() {
                                     exhausted: false,
                                     passed_through: None,
                                     records: Vec::new(),
+                                    replay_records: None,
                                 }
                             }
                             _ => return,

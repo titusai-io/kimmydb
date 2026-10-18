@@ -876,10 +876,14 @@ pub fn lenient_records<'de, D: serde::Deserializer<'de>>(
 /// - **F2**: every record with a row of `o` in `(floor[o], reach[o]]`, where
 ///   `reach` is the coverage the window grants ([`records_in_advance`]).
 ///
-/// One per key, the first row found naming it as `carrying`, and only a record
-/// that stands under its key (a row whose record was purged or collected ships
-/// nothing). Returns them with the F3 records leading, and how many those are:
-/// what the transport fits first.
+/// One per key, **carried at the lowest row found** across F3 and F2, and only a
+/// record that stands under its key (a row whose record was purged or collected
+/// ships nothing). The lowest, and not the first found: F3 is read first and F2
+/// origin by origin in node order, so the first row found can lie above another
+/// row the same advance covers, and a batch that stops, or splits into runs,
+/// between the two would take the effect at the lower row without the record
+/// (the receiver stores a record by its carrying row). Returns them with the F3
+/// records leading, and how many those are: what the transport fits first.
 pub fn records_for_coverage(
     txn: &ReadTransaction,
     floor: &dyn Fn(NodeId) -> Hlc,
@@ -888,7 +892,7 @@ pub fn records_for_coverage(
 ) -> Result<(Vec<CarriedRecord>, usize)> {
     let rows = txn.open_table(IDEMPOTENCY_BY_STAMP)?;
     let records = txn.open_table(IDEMPOTENCY)?;
-    let mut shipping = Shipping { seen: HashSet::new(), out: Vec::new() };
+    let mut shipping = Shipping { seen: Default::default(), out: Vec::new() };
     records_unanchored(&rows, &records, floor, servable, &mut shipping)?;
     let unanchored = shipping.out.len();
     records_in_advance(&rows, &records, floor, reach, &mut shipping)?;
@@ -897,13 +901,17 @@ pub fn records_for_coverage(
 
 /// The records a window has found so far, one per key.
 struct Shipping {
-    seen: HashSet<(u64, [u8; 32])>,
+    /// Per key: its place in `out`, and the standing record's `first` (`None`
+    /// for a record this build cannot decode).
+    seen: std::collections::HashMap<(u64, [u8; 32]), (usize, Option<Stamp>)>,
     out: Vec<CarriedRecord>,
 }
 
 impl Shipping {
-    /// Ship the record the row `(key, value)` names, unless it is shipped already,
-    /// nothing stands under its key, or the row is **below the record's `first`**.
+    /// Ship the record the row `(key, value)` names, unless nothing stands under
+    /// its key or the row is **below the record's `first`**; a record shipped
+    /// already is carried at this row instead when it is lower than the one it
+    /// was carried at (see [`records_for_coverage`]).
     ///
     /// Every row a record has is at or above its merged `first` (its `first`, its
     /// `last`, and the sender's rows it was stored with, each at or above that
@@ -924,18 +932,23 @@ impl Shipping {
         else {
             return Ok(());
         };
-        if self.seen.contains(&(collection.0, *scope.as_bytes())) {
+        if let Some(&(at, first)) = self.seen.get(&(collection.0, *scope.as_bytes())) {
+            let shipped = &mut self.out[at];
+            if shipped.carrying.is_some_and(|row| carrying < row)
+                && first.is_none_or(|first| carrying >= first)
+            {
+                shipped.carrying = Some(carrying);
+            }
             return Ok(());
         }
         let Some(record) = records.get((collection.0, scope.as_bytes().as_slice()))? else {
             return Ok(());
         };
-        if let Ok(Some(standing)) = IdempotencyRecord::decode(record.value())
-            && carrying < standing.first
-        {
+        let first = IdempotencyRecord::decode(record.value()).ok().flatten().map(|r| r.first);
+        if first.is_some_and(|first| carrying < first) {
             return Ok(());
         }
-        self.seen.insert((collection.0, *scope.as_bytes()));
+        self.seen.insert((collection.0, *scope.as_bytes()), (self.out.len(), first));
         self.out.push(CarriedRecord {
             collection,
             scope,
@@ -2209,11 +2222,20 @@ impl Engine {
     /// record of a request whose every write the rewind discards (`first` after
     /// `until`) goes, since nothing of the request stands and a retry must apply
     /// it afresh. One the rewind cuts part-way (`first` at or before `until`,
-    /// `last` after it) is a multi-chunk request that was still applying at
-    /// `until`: it becomes `applying`, with no cursor, so a retry resumes from
-    /// the beginning and the stamp rule writes what the rewind undid and nothing
-    /// the request still holds. Its counts are left as they were, an
-    /// overcount. A reopened record is a change, logged as every store of one is
+    /// `last` after it) is of a request only some of whose writes stand:
+    ///
+    /// - **an update or delete by filter** (`Modify`) becomes `applying`, with
+    ///   no cursor, so a retry resumes from the beginning and the stamp rule
+    ///   writes what the rewind undid and nothing the request still holds. Its
+    ///   counts are left as they were, an overcount;
+    /// - **any other kind goes**, as one discarded whole does. Only a bulk insert
+    ///   spans stamps among them (a batch minted in the millisecond the rewind
+    ///   is to keeps a prefix, since `--until` is a millisecond), and nothing
+    ///   resumes one: kept, its replay would answer every document inserted
+    ///   while only the prefix stands. Gone, a retry is a fresh attempt, which
+    ///   meets the first document that stands as a duplicate and writes nothing.
+    ///
+    /// A reopened record is a change, logged as every store of one is
     /// ([`IDEMPOTENCY_CHANGES`]). Returns how many records it removed and
     /// reopened.
     pub(crate) fn rewind_records_in(
@@ -2230,9 +2252,11 @@ impl Engine {
             let (key, value) = row?;
             let (id, scope) = key.value();
             let Ok(Some(record)) = IdempotencyRecord::decode(value.value()) else { continue };
-            if record.first.hlc > until {
+            let cut = record.last.hlc > until;
+            let resumes = matches!(record.outcome, RecordOutcome::Modify(_));
+            if record.first.hlc > until || (cut && !resumes) {
                 gone.push((id, scope.to_vec()));
-            } else if record.last.hlc > until {
+            } else if cut {
                 let mut open = record;
                 open.state = RecordState::Applying;
                 if let RecordOutcome::Modify(m) = &mut open.outcome {
@@ -2337,3 +2361,7 @@ pub(crate) fn unkeyed<T>(answer: Keyed<T>) -> T {
         Keyed::Replayed(_) => unreachable!("a write made without a key has no record to replay"),
     }
 }
+
+#[path = "idempotency_replay.rs"]
+mod replay;
+pub use replay::{ReplayPageRecords, ReplayRecords};

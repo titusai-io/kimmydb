@@ -474,3 +474,173 @@ fn g8_the_lookahead_ends_past_matches_the_stamp_rule_leaves() {
     retry_must_replay(&m, &cm, &k, 4, false);
     assert_eq!(n_of(&m, &cm, 5), 50, "left as the other writer left it");
 }
+
+/// One pull of `to` from `from`, the window as served but with an entry of a
+/// collection `to` has never heard of inserted at `stop`: the batch stops there
+/// (ADR-123), as it does at an unknown collection or a creation waiting for the
+/// purger (ADR-189).
+fn pull_stopping_at(to: &Engine, from: &Engine, stop: Stamp) -> SyncOutcome {
+    let theirs = from.version_vector().unwrap();
+    let mine = to.witnessed_vector().unwrap();
+    let start = mine.behind(&theirs).unwrap();
+    let marked = to.held_ranges_covered_by(&mine).unwrap();
+    let mut window = from.serve_entries_to_peer(start, 1024, Some(&mine), &marked, None).unwrap();
+    window.entries.push(kimmy_core::OplogEntry {
+        stamp: stop,
+        kind: kimmy_core::OpKind::Insert,
+        collection: kimmy_core::CollectionId(0x5EED_5EED),
+        doc_id: Some(DocId::Int64(1)),
+        body: Some(bson::serialize_to_vec(&doc! { "_id": 1i64 }).unwrap()),
+    });
+    window.entries.sort_by_key(|e| e.stamp);
+    let mut outcome = SyncOutcome::default();
+    to.apply_peer_window_carrying_into(
+        &theirs,
+        Some(&mine),
+        &window.entries,
+        &window.records,
+        RecordsVia::Pull,
+        PeerWindow {
+            scanned_to: window.scanned_to,
+            exhausted: window.exhausted,
+            passed_through: None,
+            asked_partial: false,
+        },
+        &mut outcome,
+    )
+    .unwrap();
+    outcome
+}
+
+/// B's keyed `$inc` (r_b), then the retry on A, which lacks B's record (r_a,
+/// later). X holds both, merged, with rows at r_b and r_a. M pulls X, and its
+/// batch stops between the two rows. A window carries a record at the **lowest**
+/// row it finds (B1 of the build review): carried at r_a, as it was when A sorts
+/// first and its row was found first, the stopped batch stores no record whose
+/// row is at or past the stop, though its coverage passes r_b and it took r_b's
+/// effect; B, the only member M then reaches, ships nothing, since M covers its
+/// rows, and a retry on M applies again.
+#[test]
+fn a_stopped_batch_covers_a_row_whose_record_rode_a_later_one() {
+    a_stopped_batch(true);
+}
+
+/// The same schedule with B sorting first, whose row was found first already.
+#[test]
+fn a_stopped_batch_with_the_lower_row_found_first() {
+    a_stopped_batch(false);
+}
+
+fn a_stopped_batch(a_sorts_first: bool) {
+    let dir = tempfile::tempdir().unwrap();
+    let b = open(&dir, "b");
+    let mut n = 0;
+    let a = loop {
+        let a = open(&dir, &format!("a{n}"));
+        n += 1;
+        if (a.node_id() < b.node_id()) == a_sorts_first {
+            break a;
+        }
+    };
+    let (x, m) = (open(&dir, "x"), open(&dir, "m"));
+    let cb = b.create_collection("shop", "orders").unwrap();
+    b.insert(&cb, doc! { "_id": 1i64, "n": 10i64 }).unwrap();
+    for member in [&a, &x, &m] {
+        assert_eq!(pull(member, &b), Pulled::Served);
+    }
+    let ca = a.get_collection("shop", "orders").unwrap();
+    let cm = m.get_collection("shop", "orders").unwrap();
+    let k = key();
+    assert!(matches!(
+        b.modify_where_keyed(&cb, &Candidates::Scan, &Inc, Some(1), &k).unwrap(),
+        Keyed::Fresh(_)
+    ));
+    let r_b = b.idempotency_record(cb.id, &k.scope).unwrap().unwrap().first;
+    later_than(&a, r_b, 10);
+    assert!(matches!(
+        a.modify_where_keyed(&ca, &Candidates::Scan, &Inc, Some(1), &k).unwrap(),
+        Keyed::Fresh(_)
+    ));
+    let r_a = a.idempotency_record(ca.id, &k.scope).unwrap().unwrap().first;
+    assert_eq!(pull(&x, &b), Pulled::Served);
+    assert_eq!(pull(&x, &a), Pulled::Served);
+    let stop = Stamp::new(Hlc::new(r_b.hlc.wall_ms + 1, 0), a.node_id());
+    assert!(r_b < stop && stop < r_a, "premise: the stop lies between the two");
+    let out = pull_stopping_at(&m, &x, stop);
+    assert_eq!(out.unknown_collection, 1, "premise: the batch stopped: {out:?}");
+    assert_eq!(n_of(&m, &cm, 1), 11, "premise: M took B's application");
+    assert!(m.witnessed_vector().unwrap().get(b.node_id()) >= r_b.hlc, "premise: covers r_b");
+    // X and A go down; M hears only B.
+    assert_eq!(pull(&m, &b), Pulled::Served);
+    retry_must_replay(&m, &cm, &k, 1, true);
+}
+
+/// The same carried row, without a stop. X's window holds B's keyed `$inc`
+/// (r_b), a schema change, and A's retry (r_a, A sorting first). The schema
+/// change ends M's first run, which commits r_b's effect; the batch then fails
+/// before its last commit (a crash, an I/O error). Carried at r_a, the record
+/// would ride with an entry at or after r_a and the first run would hold the
+/// effect without it, its own append covering r_b; carried at r_b, the lowest
+/// row, it rides with r_b's entry in that run.
+#[test]
+fn a_run_committed_before_the_carried_row_holds_the_effect_bare() {
+    let dir = tempfile::tempdir().unwrap();
+    let b = open(&dir, "b");
+    let mut n = 0;
+    let a = loop {
+        let a = open(&dir, &format!("a{n}"));
+        n += 1;
+        if a.node_id() < b.node_id() {
+            break a;
+        }
+    };
+    let (x, m) = (open(&dir, "x"), open(&dir, "m"));
+    let cb = b.create_collection("shop", "orders").unwrap();
+    b.insert(&cb, doc! { "_id": 1i64, "n": 10i64 }).unwrap();
+    for member in [&a, &x, &m] {
+        assert_eq!(pull(member, &b), Pulled::Served);
+    }
+    let ca = a.get_collection("shop", "orders").unwrap();
+    let cm = m.get_collection("shop", "orders").unwrap();
+    let k = key();
+    assert!(matches!(
+        b.modify_where_keyed(&cb, &Candidates::Scan, &Inc, Some(1), &k).unwrap(),
+        Keyed::Fresh(_)
+    ));
+    let r_b = b.idempotency_record(cb.id, &k.scope).unwrap().unwrap().first;
+    later_than(&a, r_b, 5);
+    a.create_collection("shop", "zzz").unwrap();
+    later_than(&a, r_b, 10);
+    assert!(matches!(
+        a.modify_where_keyed(&ca, &Candidates::Scan, &Inc, Some(1), &k).unwrap(),
+        Keyed::Fresh(_)
+    ));
+    assert_eq!(pull(&x, &b), Pulled::Served);
+    assert_eq!(pull(&x, &a), Pulled::Served);
+    // M pulls X; the batch fails before its last commit.
+    let theirs = x.version_vector().unwrap();
+    let mine = m.witnessed_vector().unwrap();
+    let start = mine.behind(&theirs).unwrap();
+    let window = x.serve_entries_to_peer(start, 1024, Some(&mine), &[], None).unwrap();
+    crate::sync::count_hooks::fail_next(crate::sync::count_hooks::Fail::BeforeLastCommit);
+    let mut outcome = SyncOutcome::default();
+    let failed = m.apply_peer_window_carrying_into(
+        &theirs,
+        Some(&mine),
+        &window.entries,
+        &window.records,
+        RecordsVia::Pull,
+        PeerWindow {
+            scanned_to: window.scanned_to,
+            exhausted: window.exhausted,
+            passed_through: None,
+            asked_partial: false,
+        },
+        &mut outcome,
+    );
+    assert!(failed.is_err(), "premise: the batch failed before its last commit");
+    assert_eq!(n_of(&m, &cm, 1), 11, "premise: M's first run committed B's application");
+    // X and A go down; M hears only B.
+    assert_eq!(pull(&m, &b), Pulled::Served);
+    retry_must_replay(&m, &cm, &k, 1, true);
+}

@@ -56,7 +56,8 @@ pub use peers::{
 };
 pub use transport::{
     AcceptErrorHook, AcceptListener, DefinitionJudgement, DigestRepairOutcome, FROZEN_CONTACTS,
-    Judgement, PeerPosition, PeerStalls, PushHook, REPAIR_ATTEMPTS, REPAIR_COOLDOWN_ROUNDS, Repair,
-    RepairCounts, ReplayCounters, ReplayResult, RowResult, ServeFailHook, ServeFailure,
-    accept_error_is_the_listeners, replay_counters, serve, serve_with, sync_once, sync_once_with,
+    Judgement, PeerPosition, PeerStalls, PushHook, REPAIR_ATTEMPTS, REPAIR_COOLDOWN_ROUNDS,
+    RecordsUnfit, Repair, RepairCounts, ReplayCounters, ReplayResult, RowResult, ServeFailHook,
+    ServeFailure, UnfitPath, accept_error_is_the_listeners, records_unfit, replay_counters, serve,
+    serve_with, sync_once, sync_once_with,
 };
