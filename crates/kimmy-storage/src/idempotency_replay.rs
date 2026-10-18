@@ -288,3 +288,218 @@ impl Engine {
         Ok(out)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use kimmy_core::{Fingerprint, NodeId};
+
+    use super::*;
+    use crate::idempotency::{RecordOutcome, RecordState, RecordsVia};
+    use crate::meta::CollectionMeta;
+
+    fn open() -> (Engine, CollectionMeta, CollectionMeta, tempfile::TempDir) {
+        let dir = tempfile::tempdir().unwrap();
+        let engine = Engine::open(&dir.path().join("kimmy.redb")).unwrap();
+        // The window's clock at the stamps the records are planted at, so they live.
+        engine.set_idempotency_clock_for_test(Some(at(0).hlc.wall_ms));
+        let a = engine.create_collection("shop", "a").unwrap();
+        let b = engine.create_collection("shop", "b").unwrap();
+        (engine, a, b, dir)
+    }
+
+    const NODE: NodeId = NodeId::from_bytes([7; 16]);
+
+    fn at(ms: u64) -> Stamp {
+        Stamp::new(Hlc::new(1_000_000 + ms, 0), NODE)
+    }
+
+    fn scope(n: u8) -> ScopeHash {
+        ScopeHash([n; 32])
+    }
+
+    fn record(first: Stamp, last: Stamp) -> IdempotencyRecord {
+        IdempotencyRecord {
+            fingerprint: Fingerprint([1; 32]),
+            first,
+            last,
+            origin: NODE,
+            state: RecordState::Done,
+            outcome: RecordOutcome::Insert { stamp: last },
+        }
+    }
+
+    /// Store a record as a frame of records alone does.
+    fn plant(engine: &Engine, coll: &CollectionMeta, n: u8, first: Stamp, last: Stamp) {
+        let carried = CarriedRecord {
+            collection: coll.id,
+            scope: scope(n),
+            carrying: Some(first),
+            record: record(first, last).encode(),
+        };
+        engine.apply_batch_carrying(&[], &[carried], RecordsVia::Pull).unwrap();
+        assert!(engine.idempotency_record(coll.id, &scope(n)).unwrap().is_some(), "premise");
+    }
+
+    fn keys(records: &[CarriedRecord]) -> Vec<(u64, u8)> {
+        records.iter().map(|r| (r.collection.0, r.scope.0[0])).collect()
+    }
+
+    /// B2's rule: the records of the named collections with `last` above the
+    /// page's start and `first` at or below its end, live by the window, carried
+    /// at their `first`, in key order; nothing of another collection, of a request
+    /// that ended at or before the start or began after the end, or past its
+    /// window.
+    #[test]
+    fn a_replay_page_takes_the_live_spanning_records_of_its_collections_at_their_first() {
+        let (engine, a, b, _dir) = open();
+        let (from, through) = (at(10).hlc, at(20).hlc);
+        plant(&engine, &a, 1, at(5), at(15)); // spans the start
+        plant(&engine, &a, 2, at(12), at(30)); // inside, ends past the end
+        plant(&engine, &a, 3, at(2), at(10)); // ends at the start
+        plant(&engine, &a, 4, at(21), at(25)); // begins past the end
+        plant(&engine, &b, 5, at(5), at(15)); // another collection
+        plant(&engine, &a, 6, at(5), at(11)); // past its window, below
+        engine.set_idempotency_window(60);
+        engine.set_idempotency_clock_for_test(Some(at(11).hlc.wall_ms + 60_000 + 1));
+        let page = engine.records_for_replay_page(&[a.id], from, through).unwrap();
+        assert_eq!(keys(&page), vec![(a.id.0, 1), (a.id.0, 2)]);
+        assert_eq!(page[0].carrying, Some(at(5)), "carried at its first");
+        assert_eq!(page[1].carrying, Some(at(12)));
+        assert_eq!(
+            IdempotencyRecord::decode(&page[0].record).unwrap(),
+            engine.idempotency_record(a.id, &scope(1)).unwrap(),
+            "the record as stored"
+        );
+    }
+
+    /// An orphan row (its record gone, as a retention pass stopped between chunks
+    /// leaves one) inside a replay page's range is passed over without error and
+    /// ships nothing: B2 reads the records, and the window's own rows (F2, F3)
+    /// name a record that is not there.
+    #[test]
+    fn an_orphan_row_inside_a_replay_page_ships_nothing() {
+        let (engine, a, _b, _dir) = open();
+        plant(&engine, &a, 1, at(15), at(15));
+        assert!(engine.remove_idempotency_record_for_test(a.id, &scope(1)).unwrap());
+        let page = engine.records_for_replay_page(&[a.id], at(10).hlc, at(20).hlc).unwrap();
+        assert!(page.is_empty(), "{page:?}");
+        let empty = kimmy_core::VersionVector::new();
+        let window = engine
+            .entries_for_peer_holding(Hlc::ZERO, 1024, Some(&empty), crate::WalkScope::Background)
+            .unwrap();
+        assert!(window.records.is_empty(), "the orphan row ships nothing: {:?}", window.records);
+    }
+
+    /// A records cursor of this page's position and of this log, read again: its
+    /// set at or before its key, unchanged since its base, is passed; a record that
+    /// changed since is carried as it stands now, and one outside the set (another
+    /// collection than the cursor's, or a `first` past its end) is never passed.
+    #[test]
+    fn a_records_cursor_passes_its_set_up_to_its_key_and_nothing_that_changed() {
+        let (engine, a, b, _dir) = open();
+        let (from, through) = (at(10).hlc, at(20).hlc);
+        for n in 1..=4 {
+            plant(&engine, &a, n, at(5), at(15));
+        }
+        plant(&engine, &b, 1, at(5), at(15));
+        let cut = engine.replay_page_records(&[a.id], from, through, None, 1 << 20).unwrap();
+        assert!(!cut.resumed && cut.passed.is_empty());
+        assert_eq!(keys(&cut.records).len(), 4);
+        let cursor = ReplayRecords {
+            at: from,
+            through,
+            collections: vec![a.id],
+            collection: a.id,
+            scope: scope(3),
+            base: cut.base,
+        };
+        // Changed since the cut: record 2 merges with a later attempt.
+        plant(&engine, &a, 2, at(6), at(18));
+        let read = engine
+            .replay_page_records(&[a.id, b.id], from, through, Some(&cursor), 1 << 20)
+            .unwrap();
+        assert!(read.resumed && read.changed_whole);
+        let passed: Vec<_> = read.passed.iter().map(|(c, s)| (c.0, s.0[0])).collect();
+        assert_eq!(passed, vec![(a.id.0, 1), (a.id.0, 3)], "its set up to its key, unchanged");
+        assert_eq!(keys(&read.changed), vec![(a.id.0, 2)], "what changed, as it stands now");
+        assert_eq!(read.changed[0].carrying, Some(at(5)), "at its first");
+        let mut rest = keys(&read.records);
+        rest.sort();
+        let mut want = vec![(a.id.0, 2), (a.id.0, 4), (b.id.0, 1)];
+        want.sort();
+        assert_eq!(rest, want, "the rest, another collection's included");
+        // Another position: not honoured.
+        let elsewhere = engine
+            .replay_page_records(&[a.id], at(11).hlc, through, Some(&cursor), 1 << 20)
+            .unwrap();
+        assert!(!elsewhere.resumed && elsewhere.passed.is_empty());
+        // Another epoch (a restore, an identity reset): the position starts over.
+        let other = ReplayRecords {
+            base: RecordsBase {
+                epoch: cursor.base.epoch.map(|e| e.wrapping_add(1)),
+                ..cursor.base
+            },
+            ..cursor.clone()
+        };
+        let restarted =
+            engine.replay_page_records(&[a.id], from, through, Some(&other), 1 << 20).unwrap();
+        assert!(!restarted.resumed && restarted.passed.is_empty());
+        assert_eq!(keys(&restarted.records).len(), 4);
+    }
+
+    /// What a cursor passes is its own set alone: a record of a collection its
+    /// page did not name, or one whose `first` lies past its end, is never passed,
+    /// whatever its key.
+    #[test]
+    fn a_records_cursor_passes_nothing_outside_its_set() {
+        let (engine, a, b, _dir) = open();
+        let (from, through) = (at(10).hlc, at(20).hlc);
+        plant(&engine, &a, 1, at(5), at(15));
+        plant(&engine, &a, 2, at(25), at(30)); // its first past the cursor's end
+        plant(&engine, &b, 1, at(5), at(15)); // a collection the cursor did not name
+        let cut = engine.replay_page_records(&[a.id], from, through, None, 1 << 20).unwrap();
+        let cursor = ReplayRecords {
+            at: from,
+            through,
+            collections: vec![a.id],
+            collection: CollectionId(u64::MAX),
+            scope: ScopeHash([0xff; 32]),
+            base: cut.base,
+        };
+        let read = engine
+            .replay_page_records(&[a.id, b.id], from, at(30).hlc, Some(&cursor), 1 << 20)
+            .unwrap();
+        assert!(read.resumed);
+        let passed: Vec<_> = read.passed.iter().map(|(c, s)| (c.0, s.0[0])).collect();
+        assert_eq!(passed, vec![(a.id.0, 1)], "its own set alone");
+        let mut rest = keys(&read.records);
+        rest.sort();
+        let mut want = vec![(a.id.0, 2), (b.id.0, 1)];
+        want.sort();
+        assert_eq!(rest, want);
+    }
+
+    /// A delta larger than its budget stops, and the base moves to where it did.
+    #[test]
+    fn a_records_cursors_delta_stops_at_its_budget_and_moves_the_base() {
+        let (engine, a, _b, _dir) = open();
+        let (from, through) = (at(10).hlc, at(20).hlc);
+        plant(&engine, &a, 1, at(5), at(15));
+        let cut = engine.replay_page_records(&[a.id], from, through, None, 1 << 20).unwrap();
+        let cursor = ReplayRecords {
+            at: from,
+            through,
+            collections: vec![a.id],
+            collection: a.id,
+            scope: scope(9),
+            base: cut.base,
+        };
+        for n in 2..=4 {
+            plant(&engine, &a, n, at(5), at(15));
+        }
+        let read = engine.replay_page_records(&[a.id], from, through, Some(&cursor), 1).unwrap();
+        assert!(read.resumed && !read.changed_whole, "{read:?}");
+        assert_eq!(read.changed.len(), 1, "one record past a budget of one byte goes alone");
+        assert!(read.base.key > cursor.base.key && read.base.epoch == cursor.base.epoch);
+    }
+}

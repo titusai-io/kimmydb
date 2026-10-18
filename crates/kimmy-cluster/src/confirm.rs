@@ -1967,6 +1967,61 @@ mod tests {
         assert!(b.served.windows().is_empty(), "the member was sent no window");
     }
 
+    /// m1 of the B5 build review: a push none of whose entries fits one frame
+    /// with the idempotency records riding its first sends nothing and leaves the
+    /// change to anti-entropy, whose partial windows carry such records alone,
+    /// rather than failing as an entry that cannot replicate.
+    #[tokio::test]
+    async fn a_push_whose_first_entry_cannot_cross_with_its_records_sends_nothing() {
+        let b = member().await;
+        let a = pusher_for(&b, quick());
+        let node = b.engine.node_id();
+        let orders = a.engine.get_collection("shop", "orders").unwrap();
+        let me = a.engine.node_id();
+        let base = a.engine.version_vector().unwrap().get(me);
+        let pad = "p".repeat(1_000);
+        for k in 0..40u16 {
+            let at = Stamp::new(Hlc::new(base.wall_ms + 1, k), me);
+            let record = kimmy_storage::IdempotencyRecord {
+                fingerprint: kimmy_core::Fingerprint([3; 32]),
+                first: at,
+                last: at,
+                origin: me,
+                state: kimmy_storage::RecordState::Done,
+                outcome: kimmy_storage::RecordOutcome::FindAndModify {
+                    matched: true,
+                    modified: true,
+                    removed: false,
+                    upserted_id: None,
+                    stamp: Some(at),
+                    document: Some(bson::doc! { "pad": pad.clone() }),
+                },
+            };
+            let mut scope = [3u8; 32];
+            scope[30..].copy_from_slice(&k.to_be_bytes());
+            let carried = kimmy_storage::CarriedRecord {
+                collection: orders.id,
+                scope: kimmy_core::ScopeHash(scope),
+                carrying: Some(at),
+                record: record.encode(),
+            };
+            a.engine
+                .apply_batch_carrying(&[], &[carried], kimmy_storage::RecordsVia::Pull)
+                .unwrap();
+        }
+        crate::transport::TEST_ENTRY_BUDGET.with(|budget| budget.set(Some(8 * 1024)));
+        let one = a.confirmer.confirm(b.addr, node, create(&a.engine, "e1"), DEADLINE).await;
+        crate::transport::TEST_ENTRY_BUDGET.with(|budget| budget.set(None));
+        match &one {
+            Resolution::Pending { outcome: ConfirmOutcome::Unreached, reason } => {
+                assert!(reason.contains("with the idempotency records that ride it"), "{reason}");
+            }
+            other => panic!("not left to anti-entropy for the records: {other:?}"),
+        }
+        assert_eq!(a.pushes.load(Ordering::SeqCst), 0, "no Push frame was sent");
+        assert!(b.served.windows().is_empty(), "the member was sent no window");
+    }
+
     /// A window cut by the batch cap between two changes queued before it:
     /// the one inside it is confirmed, and the one past the cut is unreached,
     /// resolved by that push rather than carried to another (ADR-191).

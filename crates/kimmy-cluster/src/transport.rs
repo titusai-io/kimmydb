@@ -56,7 +56,7 @@ const ENTRY_BUDGET: usize = MAX_FRAME - (1024 * 1024);
 thread_local! {
     /// A test's own [`ENTRY_BUDGET`], on the thread its frames are cut on, so a
     /// test fills a frame without writing 63 MiB.
-    static TEST_ENTRY_BUDGET: std::cell::Cell<Option<usize>> = const { std::cell::Cell::new(None) };
+    pub(crate) static TEST_ENTRY_BUDGET: std::cell::Cell<Option<usize>> = const { std::cell::Cell::new(None) };
 }
 
 /// [`ENTRY_BUDGET`], or a test's own.

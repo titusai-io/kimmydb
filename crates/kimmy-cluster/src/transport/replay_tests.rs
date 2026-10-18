@@ -1796,3 +1796,176 @@ async fn the_records_at_an_inbound_replays_start_cross_on_several_pages() {
 async fn the_records_at_an_outbound_replays_start_cross_on_several_pages() {
     the_records_at_the_replay_start_cross_on_several_pages(true).await;
 }
+
+/// B2's records ride at their `first`: a replay page that stops between a
+/// request's effects and its `last` stores the record with the effects. As
+/// [`other_origins_record`], with R writing into a collection Q created after
+/// the backup, between its attempt and Q's chunk 2, so the record's `last` (Q's
+/// chunk 2) lies past an entry the restored member cannot take yet: the page
+/// stops there, at a collection it lacks. Carried at `last`, the record would be
+/// stored with nothing the stopped batch took; carried at `first`, it rides with
+/// the effects.
+#[tokio::test]
+async fn a_replay_page_that_stops_between_the_effects_and_last_stores_the_record() {
+    let writer_dir = tempfile::tempdir().unwrap();
+    let writer = Arc::new(Engine::open(&writer_dir.path().join("kimmy.redb")).unwrap());
+    let mut q_dirs = Vec::new();
+    let q = loop {
+        let dir = tempfile::tempdir().unwrap();
+        let q = Engine::open(&dir.path().join("kimmy.redb")).unwrap();
+        q_dirs.push(dir);
+        if q.node_id() < writer.node_id() {
+            break Arc::new(q);
+        }
+    };
+    let orders = writer.create_collection("shop", "orders").unwrap();
+    for i in 1..=4i64 {
+        writer.insert(&orders, bson::doc! { "_id": i, "n": 0i64 }).unwrap();
+    }
+    pull_all(&q, &writer);
+    let c_dir = tempfile::tempdir().unwrap();
+    let c = Engine::open(&c_dir.path().join("kimmy.redb")).unwrap();
+    pull_all(&c, &writer);
+    let mut backup = Vec::new();
+    writer.backup_to(&mut backup, kimmy_storage::WalkScope::Request).unwrap();
+    std::thread::sleep(Duration::from_millis(15));
+    // A collection the restored member will not have heard of.
+    q.create_collection("shop", "x").unwrap();
+    pull_all(&writer, &q);
+
+    let k = lost_key(1);
+    let qorders = q.get_collection("shop", "orders").unwrap();
+    q.set_multi_chunk_docs(2);
+    let (w1, q1) = (Arc::clone(&writer), Arc::clone(&q));
+    q.before_next_continuing_write(move || {
+        let worders = w1.get_collection("shop", "orders").unwrap();
+        let first_q = q1.idempotency_record(worders.id, &k.scope).unwrap().unwrap().first;
+        w1.advance_clock_past(&Stamp::new(
+            Hlc::new(first_q.hlc.wall_ms + 5, 0),
+            NodeId::from_bytes([0; 16]),
+        ));
+        let kimmy_storage::Keyed::Fresh(_) = w1
+            .modify_where_keyed(&worders, &kimmy_storage::Candidates::Scan, &IncN, None, &k)
+            .unwrap()
+        else {
+            panic!("R lacks Q's record: a fresh attempt")
+        };
+        let wx = w1.get_collection("shop", "x").unwrap();
+        w1.insert(&wx, bson::doc! { "_id": 1i64 }).unwrap();
+        let stop = w1.version_vector().unwrap().get(w1.node_id());
+        q1.advance_clock_past(&Stamp::new(
+            Hlc::new(stop.wall_ms + 5, 0),
+            NodeId::from_bytes([0; 16]),
+        ));
+    });
+    let kimmy_storage::Keyed::Fresh(_) =
+        q.modify_where_keyed(&qorders, &kimmy_storage::Candidates::Scan, &IncN, None, &k).unwrap()
+    else {
+        panic!("a fresh key on Q")
+    };
+    pull_all(&writer, &q);
+    pull_all(&c, &writer);
+    let a_dir = tempfile::tempdir().unwrap();
+    let path = a_dir.path().join("kimmy.redb");
+    kimmy_storage::backup::restore(&path, &mut backup.as_slice()).unwrap();
+    let a = Engine::open(&path).unwrap();
+    a.create_collection("shop", "startup").unwrap();
+    assert!(a.get_collection("shop", "x").is_err(), "premise: the restored member lacks x");
+    let marker_dir = tempfile::tempdir().unwrap();
+    let catch_up = CatchUp::open(marker_dir.path(), Duration::from_secs(120));
+    catch_up.arm_replay(a.own_position_at_open(), None).unwrap();
+    let members = Members::default();
+    members.set_catch_up(Arc::clone(&catch_up));
+    let mut dirs = vec![writer_dir, c_dir, a_dir, marker_dir];
+    dirs.extend(q_dirs);
+    let f = Fixture { a, c, catch_up, members, lost: 0, _dirs: dirs };
+    let stalled = replay_counters().get(true, ReplayResult::Stalled);
+    for _ in 0..2 {
+        f.round().await.unwrap();
+    }
+    assert!(!f.catch_up.replay_answered(f.c.node_id()), "premise: the page stops at x");
+    assert!(replay_counters().get(true, ReplayResult::Stalled) > stalled, "premise: stalled");
+    the_restored_member_holds_the_effect_with_its_record(&f, &k);
+}
+
+/// One pull of `from` by `to` over the real serve and sync code.
+async fn pull_round(to: &Engine, from: &Engine) -> Result<SyncOutcome, ProtocolError> {
+    let (mut ours, far) = tokio::io::duplex(MAX_FRAME);
+    let serving = async {
+        let _ = serve_peer(from, far, SECRET, BINDING, None, ServeBudgets::serving(), None).await;
+    };
+    let mut stalls = PeerStalls::new();
+    let asking = async {
+        open_handshake(to, &mut ours, SECRET, BINDING).await.unwrap();
+        let outcome = sync_over(to, &mut ours, addr(), from.node_id(), None, &mut stalls).await;
+        drop(ours);
+        outcome
+    };
+    let ((), outcome) = tokio::join!(serving, asking);
+    outcome
+}
+
+/// m1 of the build review, on a pull: the records riding a window's first entry
+/// overfill a frame with it. Before, the answer was `fits: 0`, which the
+/// requester reads as an entry that can never replicate, every round. Now it is a
+/// partial window of records alone that ends before the first record left out:
+/// the requester stores those, its coverage moves up to them, and the next window
+/// carries the rest, then the entry.
+#[tokio::test]
+async fn a_pull_whose_first_entry_cannot_cross_with_its_records_takes_them_alone_first() {
+    let s_dir = tempfile::tempdir().unwrap();
+    let s = Engine::open(&s_dir.path().join("kimmy.redb")).unwrap();
+    let orders = s.create_collection("shop", "orders").unwrap();
+    let m_dir = tempfile::tempdir().unwrap();
+    let m = Engine::open(&m_dir.path().join("kimmy.redb")).unwrap();
+    pull_all(&m, &s);
+    let me = s.node_id();
+    let base = s.version_vector().unwrap().get(me);
+    let pad = "p".repeat(1_000);
+    let scopes: Vec<_> = (0..40u16)
+        .map(|k| {
+            let at = Stamp::new(Hlc::new(base.wall_ms + 1, k), me);
+            let record = kimmy_storage::IdempotencyRecord {
+                fingerprint: kimmy_core::Fingerprint([4; 32]),
+                first: at,
+                last: at,
+                origin: me,
+                state: kimmy_storage::RecordState::Done,
+                outcome: kimmy_storage::RecordOutcome::FindAndModify {
+                    matched: true,
+                    modified: true,
+                    removed: false,
+                    upserted_id: None,
+                    stamp: Some(at),
+                    document: Some(bson::doc! { "pad": pad.clone() }),
+                },
+            };
+            let mut scope = [4u8; 32];
+            scope[30..].copy_from_slice(&k.to_be_bytes());
+            let scope = kimmy_core::ScopeHash(scope);
+            let carried = kimmy_storage::CarriedRecord {
+                collection: orders.id,
+                scope,
+                carrying: Some(at),
+                record: record.encode(),
+            };
+            s.apply_batch_carrying(&[], &[carried], kimmy_storage::RecordsVia::Pull).unwrap();
+            scope
+        })
+        .collect();
+    s.insert(&orders, bson::doc! { "_id": 99i64, "n": 0i64 }).unwrap();
+    let unfit = records_unfit().get(UnfitPath::Pull);
+    let _budget = EntryBudget::set(8 * 1024);
+    let morders = m.get_collection("shop", "orders").unwrap();
+    let mut rounds = 0;
+    while m.get(&morders, &kimmy_core::DocId::Int64(99)).unwrap().is_none() {
+        rounds += 1;
+        assert!(rounds <= 16, "the entry never crossed");
+        pull_round(&m, &s).await.unwrap();
+    }
+    assert!(rounds >= 3, "windows of records alone came first: {rounds}");
+    for scope in &scopes {
+        assert!(m.idempotency_record(morders.id, scope).unwrap().is_some(), "every record");
+    }
+    assert_eq!(records_unfit().get(UnfitPath::Pull), unfit, "nothing was left unfit");
+}
