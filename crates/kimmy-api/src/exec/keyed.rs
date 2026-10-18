@@ -86,3 +86,80 @@ pub(super) fn mismatched(record: &IdempotencyRecord) -> ApiError {
     );
     ApiError::internal("an idempotency record could not be replayed")
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use kimmy_core::{Fingerprint, Hlc, NodeId, ScopeHash, Stamp};
+    use kimmy_storage::{RecordOutcome, RecordState};
+
+    fn record(origin: NodeId) -> IdempotencyRecord {
+        let stamp = Stamp::new(Hlc::new(1_760_000_000_000, 0), origin);
+        IdempotencyRecord {
+            fingerprint: Fingerprint([1; 32]),
+            first: stamp,
+            last: stamp,
+            origin,
+            state: RecordState::Done,
+            outcome: RecordOutcome::Insert { stamp },
+        }
+    }
+
+    fn read(state: &SharedState, series: &str) -> String {
+        let page = state.metrics.render();
+        page.lines().find(|l| l.starts_with(series)).unwrap_or_default().to_string()
+    }
+
+    /// A replay counts as one, and as a peer's only when another member wrote
+    /// the record: the cross-member deduplication the series is about.
+    #[test]
+    fn a_replay_of_another_members_record_is_a_peer_replay() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = crate::state::tests::a_state(&dir);
+        let call = KeyedCall {
+            state: &state,
+            write: KeyedWrite::new(ScopeHash([2; 32]), Fingerprint([1; 32])),
+        };
+        let own = call.replayed(&record(state.engine.node_id()), Value::Null);
+        assert!(own.replayed);
+        assert_eq!(
+            read(&state, "kimmy_idempotency_peer_replays_total"),
+            "kimmy_idempotency_peer_replays_total 0"
+        );
+        call.replayed(&record(NodeId::from_bytes([9; 16])), Value::Null);
+        assert_eq!(
+            read(&state, "kimmy_idempotency_peer_replays_total"),
+            "kimmy_idempotency_peer_replays_total 1"
+        );
+        assert_eq!(
+            read(&state, "kimmy_idempotency_requests_total{outcome=\"replayed\"}"),
+            "kimmy_idempotency_requests_total{outcome=\"replayed\"} 2"
+        );
+    }
+
+    /// The two refusals a key draws are counted by name; any other storage
+    /// error is answered as it always was and counted as neither.
+    #[test]
+    fn the_keys_own_refusals_are_counted_and_mapped() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = crate::state::tests::a_state(&dir);
+        let call = KeyedCall {
+            state: &state,
+            write: KeyedWrite::new(ScopeHash([2; 32]), Fingerprint([1; 32])),
+        };
+        let reused = call.refused(StorageError::IdempotencyKeyReused);
+        assert_eq!((reused.status.as_u16(), reused.code.as_str()), (422, "idempotency_key_reused"));
+        let in_flight = call.refused(StorageError::IdempotencyKeyInFlight);
+        assert_eq!(
+            (in_flight.status.as_u16(), in_flight.code.as_str()),
+            (409, "idempotency_key_in_flight")
+        );
+        assert_eq!(in_flight.retry_after_secs, Some(1));
+        let other = call.refused(StorageError::Stale { current: None });
+        assert_eq!(other.code.as_str(), "stale");
+        for (label, n) in [("reused", 1), ("in_flight", 1), ("applied", 0), ("replayed", 0)] {
+            let series = format!("kimmy_idempotency_requests_total{{outcome=\"{label}\"}}");
+            assert_eq!(read(&state, &series), format!("{series} {n}"));
+        }
+    }
+}

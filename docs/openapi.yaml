@@ -1858,13 +1858,14 @@ paths:
                   skipped:
                     type: integer
                     description: |
-                      Present only on a keyed request that resumed after it had
-                      stopped, with `resumed`: the matches it left because they
-                      changed after the request's first write, by this request
-                      on another member or by another write. Cumulative across
-                      the request's attempts, and counted here rather than in
-                      `matched` (see "A request that was partly applied" in
-                      `docs/http-api.md`).
+                      Present on a keyed request, whenever above 0: the matches
+                      it left because they changed after the request's first
+                      write, by an attempt of it on another member or by
+                      another write. Cumulative across the request's attempts,
+                      and counted here rather than in `matched` (see "A request
+                      that was partly applied" in `docs/http-api.md`). A resumed
+                      attempt leaves them; so can a fresh one, whose every chunk
+                      after the first applies the same rule.
                   resumed:
                     type: boolean
                     const: true
@@ -2068,13 +2069,14 @@ paths:
                   skipped:
                     type: integer
                     description: |
-                      Present only on a keyed request that resumed after it had
-                      stopped, with `resumed`: the matches it left because they
-                      changed after the request's first write, by this request
-                      on another member or by another write. Cumulative across
-                      the request's attempts, and counted here rather than in
-                      `matched` (see "A request that was partly applied" in
-                      `docs/http-api.md`).
+                      Present on a keyed request, whenever above 0: the matches
+                      it left because they changed after the request's first
+                      write, by an attempt of it on another member or by
+                      another write. Cumulative across the request's attempts,
+                      and counted here rather than in `matched` (see "A request
+                      that was partly applied" in `docs/http-api.md`). A resumed
+                      attempt leaves them; so can a fresh one, whose every chunk
+                      after the first applies the same rule.
                   resumed:
                     type: boolean
                     const: true
@@ -3127,7 +3129,8 @@ components:
           `409 idempotency_key_in_flight`.
         - Refused `400` while this member does not take keys
           (`cluster.idempotency_keys` is off here, or a live member does not
-          carry records), and on `update` and `delete` with `explain: true`.
+          carry records), after authentication, so a request with no token is
+          `401` first; and on `update` and `delete` with `explain: true`.
         - Remembered for `idempotencyWindowSecs` (`GET /v1/version`) after the
           write's last commit. A retry on a member that has not yet received
           the write is applied there a second time, without the marker: retry
@@ -3157,10 +3160,11 @@ components:
         refused `400` where a body of the wrong shape is `422`: it is part of
         the request line, not an entity the server failed to process. And an
         `Idempotency-Key` on an operation that does not list it ("this route
-        does not take an Idempotency-Key"), a malformed one, or one while this
-        member does not take keys, the message naming the header and the
-        cause: `cluster.idempotency_keys`, or the live member that does not
-        carry records (B5).
+        does not take an Idempotency-Key") or a malformed one, both before
+        authentication; or, after authentication, one while this member does
+        not take keys, the message naming the header and the cause:
+        `cluster.idempotency_keys`, or the live member that does not carry
+        records (B5).
       content:
         application/json:
           schema: { $ref: "#/components/schemas/Error" }

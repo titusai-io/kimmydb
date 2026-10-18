@@ -88,6 +88,8 @@ struct Req {
     headers: Vec<(HeaderName, HeaderValue)>,
     body: Option<(Vec<u8>, &'static str)>,
     anonymous: bool,
+    /// Another principal's token, in place of root's.
+    token: Option<String>,
 }
 
 impl Req {
@@ -120,7 +122,7 @@ impl Node {
         let method = reqwest::Method::from_bytes(method.as_bytes()).unwrap();
         let mut builder = reqwest::Client::new().request(method, format!("{}{path}", self.base));
         if !req.anonymous {
-            builder = builder.bearer_auth(&self.token);
+            builder = builder.bearer_auth(req.token.as_deref().unwrap_or(&self.token));
         }
         for (name, value) in req.headers {
             // `header` appends: two calls are two field lines.
@@ -707,4 +709,468 @@ async fn every_idempotency_series_is_on_the_page_at_zero() {
     ] {
         assert!(page.lines().any(|l| l == line), "missing {line:?}");
     }
+}
+
+// ---------------------------------------------------------------------------
+// What a key does: the record, the replay, the refusals it draws
+// ---------------------------------------------------------------------------
+
+fn replayed(answer: &Answer) -> bool {
+    answer.headers.get("idempotency-replayed").is_some_and(|v| v == "?1")
+}
+
+fn counted(page: &str, series: &str) -> u64 {
+    page.lines()
+        .find(|l| l.starts_with(&format!("{series} ")))
+        .and_then(|l| l.rsplit(' ').next())
+        .unwrap_or_else(|| panic!("no {series}:\n{page}"))
+        .parse()
+        .unwrap()
+}
+
+impl Node {
+    async fn metric(&self, series: &str) -> u64 {
+        counted(&self.send("GET", "/metrics", Req::default()).await.text, series)
+    }
+
+    /// A user with `actions` over `shop.*`, and a token for it.
+    async fn user(&self, name: &str, actions: &[&str]) -> String {
+        let created = self
+            .post(
+                "/v1/users",
+                json!({ "user": name, "password": "a-user-password",
+                        "grants": [{ "db": "shop", "collection": "*", "actions": actions }] }),
+            )
+            .await;
+        assert!(created.status / 100 == 2, "{}", created.text);
+        self.login_as(name).await
+    }
+
+    async fn login_as(&self, name: &str) -> String {
+        let res = self
+            .send(
+                "POST",
+                "/v1/auth/login",
+                Req { anonymous: true, ..Req::default() }
+                    .json(&json!({ "user": name, "password": "a-user-password" })),
+            )
+            .await;
+        assert_eq!(res.status, 200, "{}", res.text);
+        res.body["token"].as_str().unwrap().to_string()
+    }
+
+    async fn doc(&self, id: &str) -> Value {
+        self.send("GET", &format!("/v1/db/shop/coll/orders/docs/{id}"), Req::default()).await.body
+    }
+}
+
+/// Every keyed route, sent twice with its key: the second answer is the first
+/// one, status and body byte for byte, marked `Idempotency-Replayed: ?1`, and
+/// nothing is written again: an `$inc` lands once.
+#[tokio::test]
+async fn a_replay_of_every_keyed_route_is_the_first_answer_byte_for_byte() {
+    let node = node().await;
+    let cases: Vec<(&str, &str, Option<&str>)> = vec![
+        ("POST", "/v1/db/shop/coll/orders/docs", Some(r#"{"n":1}"#)),
+        ("POST", "/v1/db/shop/coll/orders/docs", Some(r#"{"_id":"c-1","n":1}"#)),
+        ("POST", "/v1/db/shop/coll/orders/bulk", Some(r#"[{"n":1},{"_id":"b-2"},{"n":3}]"#)),
+        ("PUT", "/v1/db/shop/coll/orders/docs/20?upsert=true", Some(r#"{"n":20}"#)),
+        ("PUT", "/v1/db/shop/coll/orders/docs/1", Some(r#"{"n":100}"#)),
+        ("DELETE", "/v1/db/shop/coll/orders/docs/2", None),
+        (
+            "POST",
+            "/v1/db/shop/coll/orders/update",
+            Some(r#"{"filter":{"_id":1},"update":{"$inc":{"n":1}}}"#),
+        ),
+        (
+            "POST",
+            "/v1/db/shop/coll/orders/update",
+            Some(r#"{"filter":{},"update":{"$set":{"seen":true}},"multi":true}"#),
+        ),
+        ("POST", "/v1/db/shop/coll/orders/delete", Some(r#"{"filter":{"_id":"c-1"}}"#)),
+        ("POST", "/v1/db/shop/coll/orders/delete", Some(r#"{"filter":{"n":3},"multi":true}"#)),
+        (
+            "POST",
+            "/v1/db/shop/coll/orders/find_and_modify",
+            Some(
+                r#"{"filter":{"_id":1},"update":{"$inc":{"n":1}},"returnDocument":"after","projection":{"n":1}}"#,
+            ),
+        ),
+        (
+            "POST",
+            "/v1/db/shop/coll/orders/find_and_modify",
+            Some(
+                r#"{"filter":{"sku":"x"},"update":{"$set":{"q":1}},"upsert":true,"returnDocument":"after"}"#,
+            ),
+        ),
+        (
+            "POST",
+            "/v1/db/shop/coll/orders/find_and_modify",
+            Some(r#"{"filter":{"_id":20},"remove":true}"#),
+        ),
+    ];
+    let before = node.metric("kimmy_idempotency_requests_total{outcome=\"replayed\"}").await;
+    for (i, (method, path, body)) in cases.iter().enumerate() {
+        let key = format!("\"replay-{i:02}-6f1c0e52-8a1d\"");
+        let request = || {
+            let req = Req::key(&key);
+            match body {
+                Some(body) => req.raw(body.as_bytes(), "application/json"),
+                None => req,
+            }
+        };
+        let first = node.send(method, path, request()).await;
+        assert_eq!(first.status, 200, "{method} {path}: {}", first.text);
+        assert!(!replayed(&first), "{method} {path}: a first answer is not a replay");
+        let again = node.send(method, path, request()).await;
+        assert_eq!(again.status, first.status, "{method} {path}");
+        assert_eq!(again.text, first.text, "{method} {path}: the first answer, byte for byte");
+        assert!(replayed(&again), "{method} {path}: marked as a replay");
+        assert_eq!(
+            again.headers.get("content-type"),
+            first.headers.get("content-type"),
+            "{method} {path}"
+        );
+    }
+    assert_eq!(
+        node.metric("kimmy_idempotency_requests_total{outcome=\"replayed\"}").await,
+        before + cases.len() as u64
+    );
+    // Each write landed once: 100, then two `$inc`s.
+    assert_eq!(node.doc("1").await["n"], 102);
+    // The upsert created one document, and its replay none.
+    let found =
+        node.post("/v1/db/shop/coll/orders/find", json!({ "filter": { "sku": "x" } })).await;
+    assert_eq!(found.body["documents"].as_array().map(Vec::len), Some(1), "{}", found.text);
+    assert_eq!(node.metric("kimmy_idempotency_peer_replays_total").await, 0, "all this member's");
+}
+
+/// A keyed insert without `_id` stores the key's derived one, a string, and
+/// its answer and its replay echo that; a bulk's documents each derive their
+/// own, by position; a `find_and_modify` upsert's seed takes position 0's.
+#[tokio::test]
+async fn a_keyed_insert_without_an_id_stores_and_echoes_the_derived_one() {
+    let node = node().await;
+    let key = "\"derived-6f1c0e52-8a1d-4f53\"";
+    let first = node
+        .send(
+            "POST",
+            "/v1/db/shop/coll/orders/docs",
+            Req::key(key).raw(br#"{"n":1}"#, "application/json"),
+        )
+        .await;
+    let id = first.body["insertedId"].as_str().expect("a string id").to_string();
+    assert_eq!(id.len(), 36, "a UUID's canonical form: {id}");
+    assert_eq!(uuid::Uuid::parse_str(&id).unwrap().get_version_num(), 8);
+    assert_eq!(node.doc(&id).await["n"], 1, "the stored document has it");
+    let again = node
+        .send(
+            "POST",
+            "/v1/db/shop/coll/orders/docs",
+            Req::key(key).raw(br#"{"n":1}"#, "application/json"),
+        )
+        .await;
+    assert_eq!(again.body["insertedId"], id);
+
+    let bulk = node
+        .send(
+            "POST",
+            "/v1/db/shop/coll/orders/bulk",
+            Req::key("\"derived-bulk-6f1c0e52-8a1d\"")
+                .raw(br#"[{"n":1},{"n":1},{"_id":"mine"}]"#, "application/json"),
+        )
+        .await;
+    let ids = bulk.body["insertedIds"].as_array().unwrap().clone();
+    assert_ne!(ids[0], ids[1], "each position derives its own");
+    assert_eq!(ids[2], "mine", "a client's own `_id` is kept");
+    for id in &ids {
+        assert_eq!(node.doc(id.as_str().unwrap()).await["_id"], *id);
+    }
+
+    let upsert = node
+        .send(
+            "POST",
+            "/v1/db/shop/coll/orders/find_and_modify",
+            Req::key("\"derived-upsert-6f1c0e52-8a1d\"").raw(
+                br#"{"filter":{"sku":"y"},"update":{"$set":{"q":1}},"upsert":true}"#,
+                "application/json",
+            ),
+        )
+        .await;
+    let upserted = upsert.body["upsertedId"].as_str().expect("a derived string").to_string();
+    assert_eq!(uuid::Uuid::parse_str(&upserted).unwrap().get_version_num(), 8);
+    assert_eq!(node.doc(&upserted).await["sku"], "y");
+}
+
+/// The derived `_id` is a function of the key, the principal, the collection
+/// and the request: two separate engines given the same request under the same
+/// key and principal derive the same one, which is `kimmy-core`'s derivation of
+/// the edge's fingerprint; another request under the same key derives another.
+#[tokio::test]
+async fn the_derived_id_is_the_same_on_two_engines_and_another_for_another_request() {
+    let (a, b) = (node().await, node().await);
+    let path = "/v1/db/shop/coll/orders/docs";
+    let key = "6f1c0e52-8a1d-4f53-9b3e-2c1d6a7e4b90";
+    async fn send(node: &Node, key: &str, body: &[u8]) -> Answer {
+        let path = "/v1/db/shop/coll/orders/docs";
+        node.send("POST", path, Req::key(&format!("\"{key}\"")).raw(body, "application/json")).await
+    }
+    let on_a = send(&a, key, br#"{"n":1}"#).await.body["insertedId"].clone();
+    let on_b = send(&b, key, br#"{"n":1}"#).await.body["insertedId"].clone();
+    assert_eq!(on_a, on_b, "one request, one document key, on every member");
+
+    let fingerprint = kimmy_api::idempotency::fingerprint(
+        "POST",
+        "/v1/db/{db}/coll/{coll}/docs",
+        path,
+        br#"{"n":1}"#,
+    );
+    let scope = kimmy_core::IdempotencyKey::from_raw(key).unwrap().scope_hash("local:root");
+    let expected = kimmy_core::idempotency::derived_id(
+        kimmy_core::CollectionId::derive("shop", "orders"),
+        &scope,
+        &fingerprint,
+        0,
+    );
+    assert_eq!(on_a, expected.as_str());
+
+    // The same key with another request is a key reused on A; on a member
+    // without the record it is another request, and another document.
+    let other = send(&b, key, br#"{"n":2}"#).await;
+    assert_eq!(other.status, 422, "{}", other.text);
+    let c = node().await;
+    let elsewhere = send(&c, key, br#"{"n":2}"#).await.body["insertedId"].clone();
+    assert_ne!(elsewhere, on_a, "never another request's document (I7)");
+}
+
+/// A key remembered for one request refuses another under it, `422
+/// idempotency_key_reused`, `retry: no`, writing nothing: one body byte, the
+/// path or the query string is enough to make it another request.
+#[tokio::test]
+async fn a_different_request_under_a_remembered_key_is_refused_and_writes_nothing() {
+    let node = node().await;
+    let insert = "/v1/db/shop/coll/orders/docs";
+    let k1 = "\"reused-body-6f1c0e52-8a1d\"";
+    assert_eq!(
+        node.send("POST", insert, Req::key(k1).raw(br#"{"n":1}"#, "application/json")).await.status,
+        200
+    );
+    let k2 = "\"reused-path-6f1c0e52-8a1d\"";
+    assert_eq!(
+        node.send(
+            "PUT",
+            "/v1/db/shop/coll/orders/docs/1?upsert=true",
+            Req::key(k2).raw(br#"{"n":5}"#, "application/json")
+        )
+        .await
+        .status,
+        200
+    );
+    let count = node.count().await;
+    let before = node.metric("kimmy_idempotency_requests_total{outcome=\"reused\"}").await;
+    let others: Vec<(&str, &str, &str, &[u8])> = vec![
+        ("one value differs", insert, k1, br#"{"n":2}"#),
+        ("one byte of spacing differs", insert, k1, br#"{"n": 1}"#),
+        ("the path differs", "/v1/db/shop/coll/orders/docs/2?upsert=true", k2, br#"{"n":5}"#),
+        ("the query differs", "/v1/db/shop/coll/orders/docs/1", k2, br#"{"n":5}"#),
+    ];
+    for (what, path, key, body) in &others {
+        let method = if *path == insert { "POST" } else { "PUT" };
+        let answer = node.send(method, path, Req::key(key).raw(body, "application/json")).await;
+        assert_eq!(answer.status, 422, "{what}: {}", answer.text);
+        assert_eq!(answer.body["error"], "idempotency_key_reused", "{what}");
+        assert_eq!(answer.body["retry"], "no", "{what}");
+        assert!(!replayed(&answer), "{what}");
+    }
+    assert_eq!(node.count().await, count, "nothing written");
+    assert_eq!(node.doc("1").await["n"], 5);
+    assert_eq!(
+        node.metric("kimmy_idempotency_requests_total{outcome=\"reused\"}").await,
+        before + others.len() as u64
+    );
+}
+
+/// A key belongs to a principal: the same key and request from another one is
+/// another request, applied on its own, never the first principal's replay.
+#[tokio::test]
+async fn the_same_key_from_another_principal_applies_independently() {
+    let node = node().await;
+    let ada = node.user("ada", &["read", "write"]).await;
+    let key = "\"scoped-6f1c0e52-8a1d-4f53\"";
+    let body: &[u8] = br#"{"n":7}"#;
+    let path = "/v1/db/shop/coll/orders/docs";
+    let roots = node.send("POST", path, Req::key(key).raw(body, "application/json")).await;
+    let adas = node
+        .send(
+            "POST",
+            path,
+            Req { token: Some(ada.clone()), ..Req::key(key).raw(body, "application/json") },
+        )
+        .await;
+    assert_eq!((roots.status, adas.status), (200, 200), "{} {}", roots.text, adas.text);
+    assert!(!replayed(&adas), "not root's answer");
+    assert_ne!(roots.body["insertedId"], adas.body["insertedId"], "two documents");
+    // Each principal's retry replays its own.
+    let again = node
+        .send("POST", path, Req { token: Some(ada), ..Req::key(key).raw(body, "application/json") })
+        .await;
+    assert!(replayed(&again));
+    assert_eq!(again.text, adas.text);
+}
+
+/// Authorization comes before the record: a principal whose grant was taken
+/// away is refused `403`, never answered from what it did while it held one.
+#[tokio::test]
+async fn a_revoked_grant_is_refused_before_the_record_is_read() {
+    let node = node().await;
+    let ada = node.user("ada", &["read", "write"]).await;
+    let key = "\"revoked-6f1c0e52-8a1d-4f53\"";
+    let request = |token: &str| Req {
+        token: Some(token.to_string()),
+        ..Req::key(key).raw(br#"{"n":9}"#, "application/json")
+    };
+    let first = node.send("POST", "/v1/db/shop/coll/orders/docs", request(&ada)).await;
+    assert_eq!(first.status, 200, "{}", first.text);
+    let revoked = node
+        .post(
+            "/v1/users/ada/grants",
+            json!({ "grants": [{ "db": "shop", "collection": "*", "actions": ["read"] }] }),
+        )
+        .await;
+    assert!(revoked.status / 100 == 2, "{}", revoked.text);
+    let ada = node.login_as("ada").await;
+    let retry = node.send("POST", "/v1/db/shop/coll/orders/docs", request(&ada)).await;
+    assert_eq!(retry.status, 403, "{}", retry.text);
+    assert!(!replayed(&retry));
+}
+
+/// A request that changed nothing leaves no record, so its retry is evaluated
+/// again and answers without the marker.
+#[tokio::test]
+async fn a_request_that_changed_nothing_is_not_remembered() {
+    let node = node().await;
+    for (method, path, body) in [
+        ("DELETE", "/v1/db/shop/coll/orders/docs/99", None),
+        (
+            "POST",
+            "/v1/db/shop/coll/orders/update",
+            Some(r#"{"filter":{"_id":99},"update":{"$set":{"a":1}}}"#),
+        ),
+        ("POST", "/v1/db/shop/coll/orders/delete", Some(r#"{"filter":{"_id":99},"multi":true}"#)),
+    ] {
+        let request = || {
+            let req = Req::key("\"nothing-6f1c0e52-8a1d-4f53\"");
+            match body {
+                Some(body) => req.raw(body.as_bytes(), "application/json"),
+                None => req,
+            }
+        };
+        let first = node.send(method, path, request()).await;
+        let again = node.send(method, path, request()).await;
+        assert_eq!((first.status, again.status), (200, 200), "{method} {path}");
+        assert_eq!(again.text, first.text);
+        assert!(!replayed(&again), "{method} {path}: evaluated again, not replayed");
+    }
+}
+
+/// One-document chunks over three documents, for the multi-chunk cases.
+async fn three_chunk_node() -> Node {
+    let node = node().await;
+    node.state.engine.set_multi_chunk_docs(1);
+    let seeded = node.post("/v1/db/shop/coll/orders/docs", json!({ "_id": 3 })).await;
+    assert_eq!(seeded.status, 200);
+    node
+}
+
+/// A duplicate of a keyed multi-document request still running on this member
+/// is refused `409 idempotency_key_in_flight`, `retry: wait`, `Retry-After: 1`,
+/// and writes nothing; once the request ends, the same request is its replay.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_duplicate_of_a_running_multi_request_is_in_flight_and_then_its_replay() {
+    let node = Arc::new(three_chunk_node().await);
+    let (started, has_started) = std::sync::mpsc::channel::<()>();
+    let (release, released) = std::sync::mpsc::channel::<()>();
+    node.state.engine.before_next_continuing_write(move || {
+        started.send(()).unwrap();
+        released.recv().unwrap();
+    });
+    let key = "\"in-flight-6f1c0e52-8a1d-4f53\"";
+    let body: &'static [u8] = br#"{"filter":{},"update":{"$inc":{"n":1}},"multi":true}"#;
+    let path = "/v1/db/shop/coll/orders/update";
+    let running = {
+        let node = Arc::clone(&node);
+        tokio::spawn(async move {
+            node.send("POST", path, Req::key(key).raw(body, "application/json")).await
+        })
+    };
+    tokio::task::spawn_blocking(move || has_started.recv().unwrap()).await.unwrap();
+
+    let before = node.metric("kimmy_idempotency_requests_total{outcome=\"in_flight\"}").await;
+    let duplicate = node.send("POST", path, Req::key(key).raw(body, "application/json")).await;
+    assert_eq!(duplicate.status, 409, "{}", duplicate.text);
+    assert_eq!(duplicate.body["error"], "idempotency_key_in_flight");
+    assert_eq!(duplicate.body["retry"], "wait");
+    assert_eq!(duplicate.headers.get("retry-after").map(|v| v.to_str().unwrap()), Some("1"));
+    assert_eq!(
+        node.metric("kimmy_idempotency_requests_total{outcome=\"in_flight\"}").await,
+        before + 1
+    );
+
+    release.send(()).unwrap();
+    let first = running.await.unwrap();
+    assert_eq!(first.status, 200, "{}", first.text);
+    assert_eq!(first.body["matched"], 3, "{}", first.text);
+    let again = node.send("POST", path, Req::key(key).raw(body, "application/json")).await;
+    assert!(replayed(&again));
+    assert_eq!(again.text, first.text);
+    for id in ["1", "2", "3"] {
+        assert_eq!(node.doc(id).await["n"], 1, "each document incremented once: {id}");
+    }
+}
+
+/// A keyed multi-document update that stopped part-way resumes when sent again
+/// with its key: past the document it reached, leaving the match changed since
+/// its first write (counted in `skipped`, not `matched`), with cumulative
+/// counts and `resumed: true`; and once done, it replays that answer.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_stopped_multi_update_resumes_with_its_key_and_counts_what_it_left() {
+    let node = three_chunk_node().await;
+    // Document 2 cannot take the `$inc`, so the request stops after document 1.
+    let poisoned = node
+        .send("PUT", "/v1/db/shop/coll/orders/docs/2", Req::default().json(&json!({ "n": "two" })))
+        .await;
+    assert_eq!(poisoned.status, 200);
+    let key = "\"resume-6f1c0e52-8a1d-4f53-9b3e\"";
+    let body: &[u8] = br#"{"filter":{},"update":{"$inc":{"n":1}},"multi":true}"#;
+    let path = "/v1/db/shop/coll/orders/update";
+    let stopped = node.send("POST", path, Req::key(key).raw(body, "application/json")).await;
+    assert_eq!(stopped.status, 500, "{}", stopped.text);
+    assert_eq!(stopped.body["error"], "partially_applied");
+    assert_eq!(stopped.body["applied"]["modified"], 1, "{}", stopped.text);
+
+    // Document 2 changes after the request's first write: the resume leaves it.
+    let fixed = node
+        .send("PUT", "/v1/db/shop/coll/orders/docs/2", Req::default().json(&json!({ "n": 10 })))
+        .await;
+    assert_eq!(fixed.status, 200);
+    let before = node.metric("kimmy_idempotency_requests_total{outcome=\"resumed\"}").await;
+    let resumed = node.send("POST", path, Req::key(key).raw(body, "application/json")).await;
+    assert_eq!(resumed.status, 200, "{}", resumed.text);
+    assert!(!replayed(&resumed), "a resume is processed now, not replayed");
+    assert_eq!(resumed.body["resumed"], true, "{}", resumed.text);
+    assert_eq!(resumed.body["skipped"], 1, "{}", resumed.text);
+    assert_eq!(resumed.body["matched"], 2, "documents 1 and 3, cumulative: {}", resumed.text);
+    assert_eq!(resumed.body["modified"], 2, "{}", resumed.text);
+    assert_eq!(resumed.body["commits"], 2, "{}", resumed.text);
+    assert_eq!(
+        node.metric("kimmy_idempotency_requests_total{outcome=\"resumed\"}").await,
+        before + 1
+    );
+    assert_eq!(node.doc("1").await["n"], 1, "written once, by the first attempt");
+    assert_eq!(node.doc("2").await["n"], 10, "left as the later write left it");
+    assert_eq!(node.doc("3").await["n"], 1, "written by the resume");
+
+    let again = node.send("POST", path, Req::key(key).raw(body, "application/json")).await;
+    assert!(replayed(&again), "done now, so replayed");
+    assert_eq!(again.text, resumed.text);
 }

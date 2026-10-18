@@ -497,7 +497,10 @@ that **have not changed since the request's first write**, by stamp order, so
 it never writes a document twice, on any member. A match it leaves because it
 changed after that write, by this request on another member or by another
 write, is counted in **`skipped`**, not in `matched`, and the answer carries
-**`resumed: true`**:
+**`resumed: true`**. `skipped` appears whenever it is above 0, `resumed` only
+when an attempt resumed: a fresh attempt can leave a match too, since every
+chunk after its first applies the rule once its record exists (another attempt
+of the request may have written meanwhile):
 
 ```json
 {"matched": 1800, "modified": 1800, "commits": 2, "skipped": 3, "resumed": true}
@@ -625,9 +628,12 @@ and is not is worse off than one told no, so the header is refused where it
 would do nothing, never ignored. Schema changes are left out on purpose: their
 retries already say what an earlier attempt did (a second create is `409
 conflict`, a second drop is `{"dropped": false}`), and a database drop that
-answered `partially_applied` is recovered by sending it again. The refusal is
-made before authentication, as a query string's is: it reads the header and the
-route and nothing else.
+answered `partially_applied` is recovered by sending it again. The route's
+refusal, and a malformed key's, are made before authentication, as a query
+string's is: they read the header and the route and nothing else. Whether this
+member takes keys now ([The gate](#the-gate)) is asked after authentication,
+since its refusal can name a member of the cluster: a keyed request with no
+token is `401`, as without the header.
 
 **This changed in 0.52.0.** Earlier releases ignored the header on every
 route, so a client or a proxy that stamps it on every request breaks against
@@ -739,8 +745,10 @@ A member takes the header only while **its `cluster.idempotency_keys` is set
 and every live member carries records**. Otherwise every keyed route refuses
 it with `400 bad_request`, naming the header and the cause: the switch when it
 is off, otherwise the live member that does not carry records (a member of an
-earlier release, or one not heard from yet). The member then does not list
-`idempotency-keys`. The switch defaults to `true` with clustering off, so a
+earlier release, or one not heard from yet). The refusal comes after
+authentication, so a caller with no token is answered `401` and learns nothing
+of the cluster. The member then does not list `idempotency-keys`. The switch
+defaults to `true` with clustering off, so a
 single node takes keys with no setting, and to `false` with clustering on: a
 cluster takes them once its operator has set it, after every member runs this
 release ([Operations](operations.md#clusteridempotency_keys-and-the-procedure)).
