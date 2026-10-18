@@ -4930,17 +4930,19 @@ async fn c6_a_member_that_caught_up_by_snapshot_answers_a_retry_from_the_record(
         .await
         .unwrap();
     assert_eq!(seeded.status(), 200);
-    eventually("B to hold the documents", || async {
-        orders_where(&client, &b, &t[1], serde_json::json!({})).await == Some(20)
-    })
-    .await;
     // The documents C has not seen, collected on A and on B. They were written at one
     // instant, after every other entry but a few, and expire together: once twenty entries
-    // have left the oplog, they are among them.
-    let held = [
-        a.gauge(&client, "kimmy_oplog_entries").await.unwrap(),
-        b.gauge(&client, "kimmy_oplog_entries").await.unwrap(),
-    ];
+    // have left the oplog, they are among them. Each count is read as soon as its member
+    // holds the documents: with a 30 s window a slow runner can collect them before a later
+    // read, and the premise is then lost to the clock and not to the code.
+    let held_a = a.gauge(&client, "kimmy_oplog_entries").await.unwrap();
+    let held_b = std::cell::Cell::new(0);
+    eventually("B to hold the documents in its oplog", || async {
+        held_b.set(b.gauge(&client, "kimmy_oplog_entries").await.unwrap_or(0));
+        held_b.get() >= 20
+    })
+    .await;
+    let held = [held_a, held_b.get()];
     assert!(held.iter().all(|n| *n >= 20), "premise: the documents are in the oplog: {held:?}");
     eventually("A and B to collect the history C would need", || async {
         a.gauge(&client, "kimmy_oplog_entries").await.is_some_and(|n| n + 20 <= held[0])
