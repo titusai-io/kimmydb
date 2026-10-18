@@ -298,6 +298,40 @@ async fn c6_a_member_that_caught_up_by_snapshot_replays() {
     assert_eq!(b.count(), 21);
 }
 
+/// C6 with more records than a snapshot page holds: the records phase spans
+/// pages, its position crossing the wire in the cursor and back, and the member
+/// takes every record.
+#[tokio::test]
+async fn c6_a_snapshot_carries_more_records_than_a_page() {
+    let a = node().await;
+    let orders = a.engine.create_collection("shop", "orders").unwrap();
+    a.engine.insert(&orders, doc! { "_id": -1i64, "n": 0i64 }).unwrap();
+    tokio::time::sleep(Duration::from_millis(20)).await;
+    let n = 600u64;
+    let mut first = None;
+    for i in 0..n {
+        let mut scope = [0u8; 32];
+        scope[..8].copy_from_slice(&i.to_be_bytes());
+        let k = KeyedWrite::new(ScopeHash(scope), Fingerprint([1; 32]));
+        let (_, at) = fresh(a.engine.insert_keyed(&orders, doc! { "_id": i as i64 }, &k).unwrap());
+        first.get_or_insert(at);
+    }
+    let at = first.unwrap();
+    a.engine
+        .collect_garbage_at(at.hlc.wall_ms - 1, kimmy_storage::RetentionPolicy::new(0, u64::MAX))
+        .unwrap();
+    let b = node().await;
+    for _ in 0..10 {
+        pull(&b, &a).await;
+        if b.engine.get_collection("shop", "orders").is_ok() && b.count() == n + 1 {
+            break;
+        }
+    }
+    assert_eq!(b.count(), n + 1, "caught up");
+    assert_eq!(b.engine.idempotency_records().unwrap(), n, "every record");
+    assert_eq!(b.engine.idempotency_records_received()[3], n, "by snapshot");
+}
+
 /// C8. A key used in one life of a collection, dropped and created again: the
 /// same key applies afresh in the new life, on every member, and the old
 /// life's record is never brought back.

@@ -503,6 +503,16 @@ fn a_records_phase_spans_pages_and_an_older_receiver_skips_it() {
     let skipped = a.engine.snapshot_page(Some(older), None).unwrap();
     assert!(skipped.records.is_empty());
     assert_eq!(skipped.documents.first().map(|d| d.id.clone()), Some(DocId::Int64(0)));
+
+    // A receiver of this build asks from where its progress says, and so takes
+    // every record.
+    let b = member();
+    let mut progress = SnapshotProgress::whole_database();
+    while !progress.is_complete() {
+        let page = a.engine.snapshot_page(progress.after().cloned(), None).unwrap();
+        b.engine.apply_snapshot_page(a.engine.node_id(), &mut progress, &page).unwrap();
+    }
+    assert_eq!(b.engine.idempotency_records().unwrap(), n as u64);
 }
 
 /// A scoped repair snapshot and a converge page carry the collection's records,
