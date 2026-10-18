@@ -75,9 +75,9 @@ run_suites() {
         [ -z "$crate" ] && continue
         local extra=()
         [ "$ignored" = yes ] && [ "${MUTANT_INCLUDE_IGNORED:-1}" = 1 ] && extra=(--include-ignored)
-        echo "== cargo test -p $crate $target $filt -- ${extra[*]:-}" >> "$log"
+        echo "== cargo test -p $crate $target $filt -- ${extra[*]+${extra[*]}}" >> "$log"
         # shellcheck disable=SC2086
-        (cd "$WORK" && run_timed "$TIMEOUT" nice -n 10 cargo test -p "$crate" $target -- "$filt" "${extra[@]}" --test-threads 4) >> "$log" 2>&1
+        (cd "$WORK" && run_timed "$TIMEOUT" nice -n 10 cargo test -p "$crate" $target -- "$filt" ${extra[@]+"${extra[@]}"} --test-threads 4) >> "$log" 2>&1
         local rc=$?
         echo "== exit $rc" >> "$log"
         if [ $rc -eq 124 ]; then return 124; fi
