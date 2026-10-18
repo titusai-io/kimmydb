@@ -3665,7 +3665,6 @@ fn row_g1b_a_write_between_snapshot_pages_then_a_relay() {
 /// `$inc` on the sender of a document on the second page. The receiver holds the effect
 /// after the pull, and a retry there must replay.
 #[test]
-#[ignore = "fails until every page carries a records delta"]
 fn row_r1_a_keyed_write_between_the_records_phase_and_its_page() {
     row(
         "r1",
@@ -3683,7 +3682,6 @@ fn row_r1_a_keyed_write_between_the_records_phase_and_its_page() {
 /// R1b: as R1, with the retry on the receiver between the page that brings the effect
 /// and the end of the pull.
 #[test]
-#[ignore = "fails until every page carries a records delta"]
 fn row_r1b_a_retry_between_the_effects_page_and_the_pulls_end() {
     row(
         "r1b",
@@ -3701,7 +3699,6 @@ fn row_r1b_a_retry_between_the_effects_page_and_the_pulls_end() {
 /// the effect's page and the pull's end (the receiver's own held entries are above its
 /// servable vector, so an ordinary pull defers them), and a retry there must replay.
 #[test]
-#[ignore = "fails until every page carries a records delta"]
 fn row_r1b_a_peer_takes_a_page_from_the_receiver_mid_pull() {
     row(
         "r1b-relay",
@@ -3726,7 +3723,6 @@ fn row_r1b_a_peer_takes_a_page_from_the_receiver_mid_pull() {
 /// after the collection's records phase; a retry at completion (what the catching-up
 /// gate allows once it opens as `unknown`) must replay.
 #[test]
-#[ignore = "fails until every page carries a records delta"]
 fn row_r1c_a_whole_database_retry_at_completion() {
     row_with(
         "r1c",

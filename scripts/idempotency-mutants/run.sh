@@ -51,7 +51,7 @@ fi
 ROWS=()
 for s in "${SELECT[@]}"; do
     case "$s" in
-        all|design|fix-e|lives|elsewhere) while read -r n; do ROWS+=("$n"); done < <(python3 "$TABLE" list "$s") ;;
+        all|design|fix-e|lives|delta|elsewhere) while read -r n; do ROWS+=("$n"); done < <(python3 "$TABLE" list "$s") ;;
         *) ROWS+=("$s") ;;
     esac
 done
@@ -71,6 +71,11 @@ run_suites() {
     else
         suites=$(python3 "$TABLE" suites "$name")
     fi
+    local secs=$TIMEOUT own
+    if [ "$name" != baseline ]; then
+        own=$(python3 "$TABLE" timeout "$name")
+        [ -n "$own" ] && secs=$own
+    fi
     : > "$log"
     while IFS='|' read -r crate target filt ignored; do
         [ -z "$crate" ] && continue
@@ -78,7 +83,7 @@ run_suites() {
         [ "$ignored" = yes ] && [ "${MUTANT_INCLUDE_IGNORED:-1}" = 1 ] && extra=(--include-ignored)
         echo "== cargo test -p $crate $target $filt -- ${extra[*]+${extra[*]}}" >> "$log"
         # shellcheck disable=SC2086
-        (cd "$WORK" && run_timed "$TIMEOUT" nice -n 10 cargo test -p "$crate" $target -- "$filt" ${extra[@]+"${extra[@]}"} --test-threads 4) >> "$log" 2>&1
+        (cd "$WORK" && run_timed "$secs" nice -n 10 cargo test -p "$crate" $target -- "$filt" ${extra[@]+"${extra[@]}"} --test-threads 4) >> "$log" 2>&1
         local rc=$?
         echo "== exit $rc" >> "$log"
         if [ $rc -eq 124 ]; then return 124; fi

@@ -4,10 +4,11 @@ source, applied once to a `git archive` export, run against its suites under a t
 and reverted by copying the pristine file back. A row whose text does not occur exactly
 once fails `check` and is never run.
 
-    mutants.py list [group]            names of the rows (group: design, fix-e, lives, elsewhere, all)
+    mutants.py list [group]            names of the rows (group: design, fix-e, lives, delta, elsewhere, all)
     mutants.py check <tree>            every row applies to <tree>, exactly once
     mutants.py apply <name> <tree>     patch <tree> in place
     mutants.py files <name>            the files a row touches
+    mutants.py timeout <name>          the row's own suite timeout in seconds, if it has one
     mutants.py suites <name>           the suites a row runs, one per line:
                                        <crate> <target> <filter> <ignored: yes|no>
 """
@@ -17,6 +18,9 @@ import sys
 # reproducers, and the unit, replication and coverage tests. What is ignored (the long
 # run, rows waiting for a fix not on the tree) is left out.
 MODEL = [("kimmy-storage", "--lib", "idempotency", "no")]
+# The model alone: what the generated sweep and the named rows see of a mutant, without
+# the unit tests that kill it elsewhere (P's page delta rows: its own table has those).
+MODEL_ONLY = [("kimmy-storage", "--lib", "idempotency_model_tests", "no")]
 
 ROWS = [
     {
@@ -180,8 +184,8 @@ ROWS = [
         "doc": "`resume_hlc` without the records' high water",
         "patches": [
             ("crates/kimmy-storage/src/engine.rs",
-             "        Ok(tail.max(named).max(Self::metadata_high_water(db)?).max(Self::records_high_water(db)?))\n",
-             "        Ok(tail.max(named).max(Self::metadata_high_water(db)?))\n"),
+             "            .max(Self::records_high_water(db)?)\n            .max(crate::idempotency::changes_high_water_at_open(db)?))\n",
+             "            .max(crate::idempotency::changes_high_water_at_open(db)?))\n"),
         ],
         "suites": MODEL,
     },
@@ -191,10 +195,11 @@ ROWS = [
         "doc": "A received record rowed at its carrying stamp only, not at its `last` (a page store gets no row)",
         "patches": [
             ("crates/kimmy-storage/src/idempotency.rs",
-             """        put_rows(txn, collection, scope, &merged, carrying)?;
+             """        put_rows(self, txn, collection, scope, &merged, carrying)?;
         Ok((Some(merged), true))
 """,
-             """        txn.open_table(IDEMPOTENCY)?
+             """        log_change(self, txn, collection, scope)?;
+        txn.open_table(IDEMPOTENCY)?
             .insert((collection.0, scope.as_bytes().as_slice()), merged.encode().as_slice())?;
         if let Some(carrying) = carrying {
             txn.open_table(IDEMPOTENCY_BY_STAMP)?
@@ -330,8 +335,8 @@ ROWS = [
         "doc": "The lookahead takes a match the stamp rule leaves for one the request could write",
         "patches": [
             ("crates/kimmy-storage/src/modify.rs",
-             "        if ahead.iter().any(|found| first.is_none_or(|first| found.stamp < first)) {\n",
-             "        let _ = first;\n        if !ahead.is_empty() {\n"),
+             "        let writable = |found: &Match| first.is_none_or(|first| found.stamp < first);\n",
+             "        let writable = |found: &Match| {\n            let _ = (first, found);\n            true\n        };\n"),
         ],
         "suites": MODEL,
     },
@@ -436,6 +441,117 @@ ROWS = [
         "suites": MODEL,
     },
     {
+        "name": 'delta-off',
+        "group": "delta",
+        "doc": "P's M01: delta off: no page carries a delta",
+        "patches": [
+            ('crates/kimmy-storage/src/snapshot.rs',
+             '            && let Some(base) = cursor.records_base\n        {\n',
+             '            && let Some(base) = cursor.records_base.filter(|_| false)\n        {\n'),
+        ],
+        "suites": MODEL_ONLY,
+        "timeout": 600,
+    },
+    {
+        "name": 'delta-only-on-the-completing-page',
+        "group": "delta",
+        "doc": "P's M02: delta only on the completing page (non-final pages carry none, base frozen at the first page's)",
+        "patches": [
+            ('crates/kimmy-storage/src/snapshot.rs',
+             '        let (records, documents, mut deleted_documents, next) = self.snapshot_rows(after, scope)?;',
+             '        let (records, documents, mut deleted_documents, next) = {\n            let whole = self.snapshot_rows(after.clone(), scope)?;\n            if whole.3.is_some() {\n                let frozen = after.as_ref().and_then(|a| a.records_base);\n                let stripped = after.clone().map(|c| SnapshotCursor { records_base: None, ..c });\n                let mut part = self.snapshot_rows(stripped, scope)?;\n                part.3 = part.3.map(|c| SnapshotCursor { records_base: frozen.or(c.records_base), ..c });\n                part\n            } else {\n                whole\n            }\n        };'),
+        ],
+        "suites": MODEL_ONLY,
+        "timeout": 600,
+    },
+    {
+        "name": 'delta-base-never-advances',
+        "group": "delta",
+        "doc": "P's M03x: base from the wrong page: the cursor keeps the base it came with (never advances)",
+        "patches": [
+            ('crates/kimmy-storage/src/snapshot.rs',
+             '        let delta_len = records.len();\n',
+             '        let delta_len = records.len();\n        let frozen = after.as_ref().and_then(|a| a.records_base);\n'),
+            ('crates/kimmy-storage/src/snapshot.rs',
+             '            cursor.map(|cursor| SnapshotCursor { records_base: Some(cut_base), ..cursor })',
+             '            cursor.map(|cursor| SnapshotCursor { records_base: frozen.or(Some(cut_base)), ..cursor })'),
+        ],
+        "suites": MODEL_ONLY,
+        "timeout": 600,
+    },
+    {
+        "name": 'delta-base-read-outside-the-documents-txn',
+        "group": "delta",
+        "doc": "P's M05: next base read outside the documents' transaction (after the page's read)",
+        "patches": [
+            ('crates/kimmy-storage/src/snapshot.rs',
+             '        crate::sync::race_hooks::reach(crate::sync::race_hooks::Race::PageRead);\n',
+             '        crate::sync::race_hooks::reach(crate::sync::race_hooks::Race::PageRead);\n        let later = {\n            let t = self.db().begin_read()?;\n            let begun = crate::idempotency::changes_begin(&t)?;\n            let high = crate::idempotency::changes_high_water(&t)?.map_or(Hlc::ZERO, |high| high.hlc);\n            RecordsBase { key: Stamp::new(high, self.node_id()), epoch: begun.map(|begun| begun.epoch) }\n        };\n        let next = next.map(|cursor| SnapshotCursor {\n            records_base: cursor.records_base.and(Some(later)),\n            ..cursor\n        });\n'),
+        ],
+        "suites": MODEL_ONLY,
+        "timeout": 600,
+    },
+    {
+        "name": 'page-stores-log-no-change',
+        "group": "delta",
+        "doc": "P's M06: page stores write no log row",
+        "patches": [
+            ('crates/kimmy-storage/src/idempotency.rs',
+             '    log_change(engine, txn, collection, scope)?;',
+             '    if carrying.is_some() || record.origin == engine.node_id() {\n        log_change(engine, txn, collection, scope)?;\n    }'),
+        ],
+        "suites": MODEL_ONLY,
+        "timeout": 600,
+    },
+    {
+        "name": 'frame-stores-log-no-change',
+        "group": "delta",
+        "doc": "P's M07: frame stores (pull, push, replay, F2/F3) write no log row",
+        "patches": [
+            ('crates/kimmy-storage/src/idempotency.rs',
+             '    log_change(engine, txn, collection, scope)?;',
+             '    if carrying.is_none() {\n        log_change(engine, txn, collection, scope)?;\n    }'),
+        ],
+        "suites": MODEL_ONLY,
+        "timeout": 600,
+    },
+    {
+        "name": 'local-commits-log-no-change',
+        "group": "delta",
+        "doc": "P's M08: local commits write no log row",
+        "patches": [
+            ('crates/kimmy-storage/src/idempotency.rs',
+             '    log_change(engine, txn, collection, scope)?;',
+             '    if carrying.is_some() || record.origin != engine.node_id() {\n        log_change(engine, txn, collection, scope)?;\n    }'),
+        ],
+        "suites": MODEL_ONLY,
+        "timeout": 600,
+    },
+    {
+        "name": 'records-only-page-moves-the-document-position',
+        "group": "delta",
+        "doc": "P's M13: a records-only page moves the cursor's document position",
+        "patches": [
+            ('crates/kimmy-storage/src/snapshot.rs',
+             '                    let cursor = SnapshotCursor { records_base: Some(base), ..cursor.clone() };',
+             '                    let cursor = SnapshotCursor {\n                        records_base: Some(base),\n                        after_key: Vec::new(),\n                        records: None,\n                        ..cursor.clone()\n                    };'),
+        ],
+        "suites": MODEL_ONLY,
+        "timeout": 600,
+    },
+    {
+        "name": "resume-hlc-without-the-change-log",
+        "group": "delta",
+        "doc": "`resume_hlc` without the change log's high water (its keys are minted stamps)",
+        "patches": [
+            ("crates/kimmy-storage/src/engine.rs",
+             "            .max(Self::records_high_water(db)?)\n            .max(crate::idempotency::changes_high_water_at_open(db)?))\n",
+             "            .max(Self::records_high_water(db)?))\n"),
+        ],
+        "suites": MODEL,
+        "timeout": 600,
+    },
+    {
         "name": "header-guard-not-over-mcp",
         "group": "elsewhere",
         "doc": "The header guard lets `/mcp` through",
@@ -530,6 +646,8 @@ def main():
     elif cmd == "suites":
         for crate, target, filt, ignored in row(sys.argv[2])["suites"]:
             print(f"{crate}|{target}|{filt}|{ignored}")
+    elif cmd == "timeout":
+        print(row(sys.argv[2]).get("timeout", ""))
     elif cmd == "doc":
         print(row(sys.argv[2])["doc"])
     else:
