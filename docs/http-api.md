@@ -498,9 +498,8 @@ it never writes a document twice, on any member. A match it leaves because it
 changed after that write, by this request on another member or by another
 write, is counted in **`skipped`**, not in `matched`, and the answer carries
 **`resumed: true`**. `skipped` appears whenever it is above 0, `resumed` only
-when an attempt resumed: a fresh attempt can leave a match too, since every
-chunk after its first applies the rule once its record exists (another attempt
-of the request may have written meanwhile):
+when an attempt resumed: a fresh attempt that runs past one chunk leaves such
+a match too ([a keyed write past one chunk](#a-keyed-write-past-one-chunk)):
 
 ```json
 {"matched": 1800, "modified": 1800, "commits": 2, "skipped": 3, "resumed": true}
@@ -672,6 +671,36 @@ request. An MCP call is fingerprinted over the tool and its arguments without
 
 **Authorization comes first.** A principal whose grant was revoked since gets
 `403`, not a replay.
+
+### A keyed write past one chunk
+
+**A keyed `update` or `delete` with `multi: true` that runs past one chunk
+(`storage.multi_chunk_docs`, 1,000 documents by default,
+[ADR-086](decisions.md)) never touches a document written after its first
+write, by anyone, and counts those matches in `skipped`**, not in `matched`.
+Every chunk after the first holds to it, on a fresh attempt as well as on a
+resumed one; `resumed: true` appears only when an attempt continued one that had
+stopped, and `skipped` whenever it is above 0:
+
+```json
+{"matched": 2400, "modified": 2400, "commits": 3, "skipped": 7}
+```
+
+Unkeyed writes are unchanged, and so is a keyed write that fits in one chunk:
+both write every match they reach.
+
+**Why.** In a leaderless cluster two attempts of one request can run on
+different members at once: a retry sent elsewhere while the first attempt still
+runs, or before its writes have arrived there. Each writes at or above its own
+first write, and once their records meet, the rule leaves whatever either wrote.
+That is what keeps the invariant that no application of a request writes on top
+of its own effect, so a keyed `$inc` lands once per document. The cost is that a
+document another client changed meanwhile is left as that change left it, and
+counted. A client that needs every current match written sends the request
+without a key, for an update that is idempotent, or uses the marker pattern
+under [a request that was partly applied](#a-request-that-was-partly-applied).
+MongoDB draws the same line from the other side: its retryable writes exclude
+`updateMany` and `deleteMany` altogether.
 
 **A replay is the first answer, not the current state.** Its `stamp` names the
 version the first attempt produced; an `if_stamp` built from it is `409

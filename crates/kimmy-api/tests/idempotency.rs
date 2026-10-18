@@ -1177,3 +1177,57 @@ async fn a_stopped_multi_update_resumes_with_its_key_and_counts_what_it_left() {
     assert!(replayed(&again), "done now, so replayed");
     assert_eq!(again.text, resumed.text);
 }
+
+/// A fresh keyed request that runs past one chunk leaves a match written after
+/// its first write, by anyone, and counts it in `skipped`, with no `resumed`:
+/// every chunk after the first applies the stamp rule once the request's record
+/// exists, since another attempt of it may be running on another member.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_fresh_multi_chunk_request_leaves_a_match_written_after_its_first_write() {
+    let node = three_chunk_node().await;
+    let engine = Arc::clone(&node.state.engine);
+    // Between chunk one (document 1) and chunk two, another write changes
+    // document 3, which the request has not reached yet.
+    node.state.engine.before_next_continuing_write(move || {
+        let orders = engine.get_collection("shop", "orders").unwrap();
+        engine
+            .replace(
+                &orders,
+                &kimmy_core::DocId::Int64(3),
+                bson::doc! { "_id": 3i64, "n": 10 },
+                false,
+            )
+            .unwrap();
+    });
+    let answer = node
+        .send(
+            "POST",
+            "/v1/db/shop/coll/orders/update",
+            Req::key("\"fresh-skip-6f1c0e52-8a1d-4f53\"").raw(
+                br#"{"filter":{},"update":{"$inc":{"n":1}},"multi":true}"#,
+                "application/json",
+            ),
+        )
+        .await;
+    assert_eq!(answer.status, 200, "{}", answer.text);
+    assert_eq!(answer.body["skipped"], 1, "{}", answer.text);
+    assert!(
+        answer.body.get("resumed").is_none(),
+        "a fresh attempt did not resume: {}",
+        answer.text
+    );
+    assert_eq!(answer.body["matched"], 2, "{}", answer.text);
+    assert_eq!(answer.body["modified"], 2, "{}", answer.text);
+    assert_eq!(node.doc("3").await["n"], 10, "left as the other write left it");
+    assert_eq!(node.doc("2").await["n"], 1);
+
+    // The same request without a key writes every match it reaches, as always.
+    let plain = node
+        .post(
+            "/v1/db/shop/coll/orders/update",
+            json!({ "filter": {}, "update": {"$inc": {"n": 1}}, "multi": true }),
+        )
+        .await;
+    assert_eq!(plain.body["matched"], 3, "{}", plain.text);
+    assert!(plain.body.get("skipped").is_none(), "{}", plain.text);
+}
