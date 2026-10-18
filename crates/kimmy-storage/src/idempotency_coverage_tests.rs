@@ -433,3 +433,44 @@ fn g8_residual_a_tail_of_left_matches_past_the_lookahead_resumes_without_a_doubl
     assert_eq!((again.modified, again.skipped), (1, 3), "cumulative, everything left: {again:?}");
     assert_eq!((1..=3).map(|id| n_of(&m, &cm, id)).collect::<Vec<_>>(), before, "no double");
 }
+
+/// G8: the lookahead finds the end past matches the stamp rule leaves. A
+/// two-document chunk writes documents 3 and 4; past them only document 5 is
+/// left, rewritten by another writer after the request's first write, and then
+/// the scan ends: the chunk writes `done`, counting document 5 in `skipped`. A
+/// member that pulled before a further chunk would have run (one runs only if
+/// the lookahead took document 5 for a match it could write) gets `done` and
+/// replays.
+#[test]
+fn g8_the_lookahead_ends_past_matches_the_stamp_rule_leaves() {
+    let dir = tempfile::tempdir().unwrap();
+    let (y, m) = (std::sync::Arc::new(open(&dir, "y")), std::sync::Arc::new(open(&dir, "m")));
+    let cy = y.create_collection("shop", "orders").unwrap();
+    y.set_multi_chunk_docs(2);
+    let docs: Vec<Document> = (1..=5i64).map(|i| doc! { "_id": i, "n": 0i64 }).collect();
+    y.insert_many(&cy, docs).unwrap();
+    assert_eq!(pull(&m, &y), Pulled::Served);
+    let cm = m.get_collection("shop", "orders").unwrap();
+    let k = key();
+    let (y1, m1) = (std::sync::Arc::clone(&y), std::sync::Arc::clone(&m));
+    y.before_next_continuing_write(move || {
+        let coll = y1.get_collection("shop", "orders").unwrap();
+        y1.replace(&coll, &DocId::Int64(5), doc! { "n": 50i64 }, false).unwrap();
+        let (y2, m2) = (std::sync::Arc::clone(&y1), std::sync::Arc::clone(&m1));
+        y1.before_next_continuing_write(move || {
+            assert_eq!(pull(&m2, &y2), Pulled::Served);
+        });
+    });
+    let Keyed::Fresh(out) = y.modify_where_keyed(&cy, &Candidates::Scan, &Inc, None, &k).unwrap()
+    else {
+        panic!("a fresh request")
+    };
+    assert_eq!((out.modified, out.skipped, out.commits), (4, 1, 2), "{out:?}");
+    pull(&m, &y);
+    assert_eq!(
+        m.idempotency_record(cm.id, &k.scope).unwrap().map(|r| r.state),
+        Some(crate::idempotency::RecordState::Done)
+    );
+    retry_must_replay(&m, &cm, &k, 4, false);
+    assert_eq!(n_of(&m, &cm, 5), 50, "left as the other writer left it");
+}
