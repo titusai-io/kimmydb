@@ -1553,8 +1553,8 @@ fn n_of(engine: &Engine, id: i64) -> i64 {
 /// G5 with the record's rows at another origin (B2 of the build review). Q's keyed
 /// update-many writes chunk 1 (d1, d2); before Q's chunk 2, the client's retry
 /// runs on R, which lacks Q's record: a fresh attempt writes d1..d4 in one chunk.
-/// Q's chunk 2 then writes d3, d4 later. The merged record's `first` (Q's chunk
-/// 1) and `last` (Q's chunk 2) are both of Q's origin. R pulls Q, and C pulls R:
+/// Q's chunk 2 then writes d3, d4 later. The merged record's `first` (Q's first
+/// chunk) and `last` (Q's second) are both of Q's origin. R pulls Q, and C pulls R:
 /// C holds R's entries and the record, with no row of R's origin. R is restored
 /// from a backup that predates all of it, and C replays R's own entries to it.
 /// With `f3`, R also writes d3, d4 after Q's chunk 2, so none of Q's entries is
