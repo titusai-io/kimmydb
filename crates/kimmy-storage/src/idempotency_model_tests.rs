@@ -687,6 +687,9 @@ struct Ghost {
     /// (collection, document key, request) of every application on its own effect
     /// the life rule allows or that is a classified finding: a stored double it explains.
     explained: HashSet<(u8, Vec<u8>, u8)>,
+    /// The latest version of each document a page brought each member (by node,
+    /// collection and `_id`): a version held without its entry.
+    paged: HashMap<(NodeId, u8, DocId), Stamp>,
     /// Of those, the applications afresh the life rule allows on an earlier life's effect
     /// that a version written after the drop carried into the next life (ADR-236).
     life: HashSet<(u8, Vec<u8>, u8)>,
@@ -1310,6 +1313,14 @@ impl World {
             let applied = dst
                 .apply_snapshot_page(src.node_id(), &mut progress, &page)
                 .map_err(|e| err("apply_snapshot_page", e))?;
+            let node = dst.node_id();
+            for doc in &page.documents {
+                let Some(c) = (0..NAMES.len() as u8).find(|c| coll_id(*c) == doc.collection) else {
+                    continue;
+                };
+                let at = self.ghost.paged.entry((node, c, doc.id.clone())).or_insert(doc.stamp);
+                *at = (*at).max(doc.stamp);
+            }
             if applied.sender_dropped || applied.history {
                 // Refused whole (the sender's life is dropped, or one this member
                 // buried): the pull ends with nothing taken.
@@ -1556,7 +1567,10 @@ impl World {
         let record_dead = p.last_before.is_some_and(|last| last.hlc <= end)
             || current.iter().any(|s| self.straddles(r, *s, end));
         let current = !current.is_empty();
-        if record_dead && !current {
+        // Or the member holds no record and the effect it applies on is of an ended life
+        // only: an entry of that life it took before the drop reached it, from a sender
+        // that held no record of it (D1), whatever records the request has elsewhere.
+        if (record_dead || p.pre_record.is_none()) && !current {
             self.out.life_exempt += 1;
             if p.last_before.is_some_and(|last| last.hlc > p.floor) {
                 self.out.dropped_elsewhere += 1;
@@ -1655,7 +1669,27 @@ impl World {
         let seen: Vec<(DocId, Vec<i64>, usize)> =
             std::mem::take(&mut *p.on_own_effect.lock().unwrap());
         for (id, ks, phase) in &seen {
-            self.on_own_effect(&p, id, ks, None, *phase, &minted_set);
+            // The version the `$inc` wrote on: the latest this member held of the
+            // document below this call's write of it, by entry or by page.
+            let below = minted
+                .iter()
+                .filter(|e| e.doc_id.as_ref() == Some(id))
+                .map(|e| e.stamp)
+                .min()
+                .unwrap_or(Stamp::new(Hlc::MAX, p.node));
+            let by_entry = self
+                .e(m)
+                .read_oplog_from(Hlc::ZERO, 1_000_000, WalkScope::Request)
+                .map_err(|e| err("read_oplog_from", e))?
+                .into_iter()
+                .filter(|e| e.collection == coll_id(c) && e.doc_id.as_ref() == Some(id))
+                .map(|e| e.stamp)
+                .filter(|s| *s < below)
+                .max();
+            let by_page =
+                self.ghost.paged.get(&(p.node, c, id.clone())).copied().filter(|s| *s < below);
+            let base_at = by_entry.max(by_page);
+            self.on_own_effect(&p, id, ks, base_at, *phase, &minted_set);
         }
         // An insert, replace or delete whose write landed (answered or not: a failed
         // fsync's may have) on a base already holding the request.
