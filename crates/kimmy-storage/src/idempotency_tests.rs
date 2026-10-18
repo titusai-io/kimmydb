@@ -2279,9 +2279,11 @@ fn a_row_whose_record_is_gone_ships_nothing() {
     let gone = ScopeHash([66; 32]);
     let mut names_gone = coll.id.0.to_be_bytes().to_vec();
     names_gone.extend_from_slice(&gone.0);
-    let base = engine.next_stamp();
+    let base;
     {
         let txn = engine.begin_write(crate::WriterHolder::Repair).unwrap();
+        // The delta's base, minted under the writer as every log key is.
+        base = engine.next_stamp();
         let mut by_stamp = txn.open_table(tables::IDEMPOTENCY_BY_STAMP).unwrap();
         // Inside the advance a whole-history window grants, below the live row.
         let inside = Stamp::new(at.hlc.predecessor(), me);
