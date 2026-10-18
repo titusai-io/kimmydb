@@ -843,6 +843,9 @@ async fn a_replay_of_every_keyed_route_is_the_first_answer_byte_for_byte() {
         node.post("/v1/db/shop/coll/orders/find", json!({ "filter": { "sku": "x" } })).await;
     assert_eq!(found.body["documents"].as_array().map(Vec::len), Some(1), "{}", found.text);
     assert_eq!(node.metric("kimmy_idempotency_peer_replays_total").await, 0, "all this member's");
+    // One record per keyed request that wrote, read from the engine at the
+    // scrape; the replays added none.
+    assert_eq!(node.metric("kimmy_idempotency_records").await, cases.len() as u64);
 }
 
 /// A keyed insert without `_id` stores the key's derived one, a string, and
