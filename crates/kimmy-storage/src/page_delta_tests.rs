@@ -593,7 +593,6 @@ fn a_record_a_member_takes_by_page_while_serving_a_snapshot_rides_its_next_page(
     let cs = s.get_collection("shop", "orders").unwrap();
     let held = s.idempotency_record(cs.id, &k.scope).unwrap().unwrap();
     assert_eq!(held.state, RecordState::Applying, "premise: S pulled it before `done`");
-    assert_eq!(y.idempotency_record(cy.id, &k.scope).unwrap().unwrap().last, held.last);
 
     // M takes S's first page: the record as S holds it, and both documents.
     let mut progress = SnapshotProgress::of_collection(cs.id);

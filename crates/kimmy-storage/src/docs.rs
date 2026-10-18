@@ -691,12 +691,15 @@ impl Engine {
             }
         }
 
-        // With the batch's first entry, in the batch's transaction (B5).
+        // From the batch's first entry to its last (L1), in the batch's
+        // transaction (B5).
         if let Some(keyed) = keyed {
             let stamps: Vec<Stamp> = ids.iter().map(|(_, stamp)| *stamp).collect();
-            let record = IdempotencyRecord::written(
+            let (first, last) = (stamps[0], stamps[stamps.len() - 1]);
+            let record = IdempotencyRecord::written_through(
                 keyed,
-                stamps[0],
+                first,
+                last,
                 self.node_id(),
                 RecordOutcome::Bulk { stamps },
             );

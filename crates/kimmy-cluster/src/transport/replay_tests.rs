@@ -267,6 +267,147 @@ async fn a_replay_brings_back_the_records_of_the_keyed_writes_it_restores() {
     }
 }
 
+/// `$inc` of `n`, for G5.
+struct IncN;
+
+impl kimmy_storage::ModifySpec for IncN {
+    fn matches(&self, doc: &bson::Document) -> kimmy_core::Result<bool> {
+        Ok(doc.contains_key("n"))
+    }
+    fn compare(&self, _: &bson::Document, _: &bson::Document) -> std::cmp::Ordering {
+        std::cmp::Ordering::Equal
+    }
+    fn apply(&self, doc: &bson::Document) -> Result<Option<bson::Document>, String> {
+        let mut next = doc.clone();
+        next.insert("n", doc.get_i64("n").map_err(|e| e.to_string())? + 1);
+        Ok(Some(next))
+    }
+    fn upsert(&self) -> Option<Result<bson::Document, String>> {
+        None
+    }
+}
+
+/// `to` pulls everything `from` holds that it lacks, window by window, records and all.
+fn pull_all(to: &Engine, from: &Engine) {
+    for _ in 0..16 {
+        let theirs = from.version_vector().unwrap();
+        let mine = to.witnessed_vector().unwrap();
+        let Some(start) = mine.behind(&theirs) else { return };
+        let window = from
+            .entries_for_peer_holding(
+                start,
+                MAX_BATCH,
+                Some(&mine),
+                kimmy_storage::WalkScope::Background,
+            )
+            .unwrap();
+        let mut outcome = SyncOutcome::default();
+        to.apply_peer_window_carrying_into(
+            &theirs,
+            Some(&mine),
+            &window.entries,
+            &window.records,
+            kimmy_storage::RecordsVia::Pull,
+            kimmy_storage::PeerWindow {
+                scanned_to: window.scanned_to,
+                exhausted: window.exhausted,
+                passed_through: None,
+                asked_partial: false,
+            },
+            &mut outcome,
+        )
+        .unwrap();
+        if window.exhausted {
+            return;
+        }
+    }
+}
+
+/// G5: a member restored from a backup that lacks its own keyed `$inc` and the
+/// write it made on top, replayed by a peer whose copy of the `$inc` lost there
+/// (C wrote the document in between) and which holds the write on top. C's oplog
+/// has no entry at the `$inc`'s stamp, so the page carries only the write on top;
+/// the record rides the page all the same, by the row C holds inside the page's
+/// own advance, and a retry on the restored member is answered from it rather
+/// than applied over the write on top.
+#[tokio::test]
+async fn g5_a_replay_from_a_peer_whose_copy_of_the_keyed_entry_lost_carries_its_record() {
+    let writer_dir = tempfile::tempdir().unwrap();
+    let writer = Engine::open(&writer_dir.path().join("kimmy.redb")).unwrap();
+    let orders = writer.create_collection("shop", "orders").unwrap();
+    writer.insert(&orders, bson::doc! { "_id": 1i64, "n": 10i64 }).unwrap();
+    let c_dir = tempfile::tempdir().unwrap();
+    let c = Engine::open(&c_dir.path().join("kimmy.redb")).unwrap();
+    pull_all(&c, &writer);
+    let mut backup = Vec::new();
+    writer.backup_to(&mut backup, kimmy_storage::WalkScope::Request).unwrap();
+    std::thread::sleep(Duration::from_millis(15));
+
+    let k = lost_key(1);
+    let kimmy_storage::Keyed::Fresh(_) = writer
+        .modify_where_keyed(&orders, &kimmy_storage::Candidates::Scan, &IncN, Some(1), &k)
+        .unwrap()
+    else {
+        panic!("a fresh key")
+    };
+    let s1 = writer.idempotency_record(orders.id, &lost_scope(1)).unwrap().unwrap().first;
+    let corders = c.get_collection("shop", "orders").unwrap();
+    let later = |ms: u64| Stamp::new(Hlc::new(s1.hlc.wall_ms + ms, 0), NodeId::from_bytes([0; 16]));
+    c.advance_clock_past(&later(10));
+    c.replace(&corders, &kimmy_core::DocId::Int64(1), bson::doc! { "n": 100i64 }, false).unwrap();
+    writer.advance_clock_past(&later(20));
+    writer
+        .replace(
+            &orders,
+            &kimmy_core::DocId::Int64(1),
+            bson::doc! { "n": 11i64, "tag": "w" },
+            false,
+        )
+        .unwrap();
+    pull_all(&c, &writer);
+    let held = |engine: &Engine| {
+        let coll = engine.get_collection("shop", "orders").unwrap();
+        engine.get(&coll, &kimmy_core::DocId::Int64(1)).unwrap().unwrap().get_i64("n").unwrap()
+    };
+    assert_eq!(held(&c), 11, "premise: the write on top won on C");
+    assert!(!c.has_oplog_entry(&s1).unwrap(), "premise: the $inc lost on C");
+    assert!(c.idempotency_record(corders.id, &lost_scope(1)).unwrap().is_some(), "premise");
+
+    let a_dir = tempfile::tempdir().unwrap();
+    let path = a_dir.path().join("kimmy.redb");
+    kimmy_storage::backup::restore(&path, &mut backup.as_slice()).unwrap();
+    let a = Engine::open(&path).unwrap();
+    assert_eq!(a.node_id(), writer.node_id());
+    a.create_collection("shop", "startup").unwrap();
+    let marker_dir = tempfile::tempdir().unwrap();
+    let catch_up = CatchUp::open(marker_dir.path(), Duration::from_secs(120));
+    catch_up.arm_replay(a.own_position_at_open(), None).unwrap();
+    let members = Members::default();
+    members.set_catch_up(Arc::clone(&catch_up));
+    let f = Fixture {
+        a,
+        c,
+        catch_up,
+        members,
+        lost: 0,
+        _dirs: vec![writer_dir, c_dir, a_dir, marker_dir],
+    };
+    for _ in 0..8 {
+        f.round().await.unwrap();
+        if f.catch_up.replay_answered(f.c.node_id()) {
+            break;
+        }
+    }
+    assert!(f.catch_up.replay_answered(f.c.node_id()), "the replay is answered");
+    assert_eq!(held(&f.a), 11, "the restored member holds the write on top");
+    let aorders = f.a.get_collection("shop", "orders").unwrap();
+    let retry =
+        f.a.modify_where_keyed(&aorders, &kimmy_storage::Candidates::Scan, &IncN, Some(1), &k)
+            .unwrap();
+    assert!(matches!(retry, kimmy_storage::Keyed::Replayed(_)), "{retry:?}");
+    assert_eq!(held(&f.a), 11, "applied once");
+}
+
 /// An unmarked member asks as well: it is armed, and nothing says it was restored
 /// until the replay proves it.
 #[tokio::test]

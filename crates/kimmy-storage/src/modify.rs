@@ -560,13 +560,13 @@ impl Engine {
         }
 
         // The record, in this chunk's transaction: `applying` until the chunk
-        // that ends the request, and at this chunk's first entry.
+        // that ends the request, from this chunk's first entry to its last (L1).
         if let Some(run) = run.as_deref() {
-            let first_entry = entries[0].stamp;
+            let (first_entry, last_entry) = (entries[0].stamp, entries[entries.len() - 1].stamp);
             let record = IdempotencyRecord {
                 fingerprint: run.keyed.fingerprint,
                 first: first_entry,
-                last: first_entry,
+                last: last_entry,
                 origin: self.node_id(),
                 state: if ends { RecordState::Done } else { RecordState::Applying },
                 outcome: RecordOutcome::Modify(ModifyRecorded {
@@ -641,10 +641,15 @@ impl Engine {
     }
 
     /// The commit of a record alone, `done` (B5): a keyed request's end found
-    /// by a chunk that wrote nothing, with its record standing. Its `last` is
-    /// the standing record's, so the commit has no entry of its own and is
-    /// served with the earlier chunks' entries; at that equal `last`, `done`
-    /// beats the `applying` it replaces wherever the two meet.
+    /// by a chunk that wrote nothing, with its record standing. **Its `last` is
+    /// a stamp minted for it** (G8), above the standing record's, with a row of
+    /// its own: a member that took the last writing chunk's entry before this
+    /// commit covers that `last` already, and a record that kept it would
+    /// never reach such a member as `done`, so a retry there would resume
+    /// rather than replay. The new row has no entry behind it, so this node
+    /// ships it as one it cannot vouch for by its oplog (F3) until it next
+    /// writes, and then within the coverage its windows grant (F2); `done` at the
+    /// later `last` beats the `applying` it replaces wherever the two meet.
     #[allow(clippy::too_many_arguments)]
     fn record_done_alone(
         &self,
@@ -660,7 +665,7 @@ impl Engine {
         let record = IdempotencyRecord {
             fingerprint: run.keyed.fingerprint,
             first: live.first,
-            last: live.last,
+            last: self.done_alone_last(live),
             origin: self.node_id(),
             state: RecordState::Done,
             outcome: RecordOutcome::Modify(ModifyRecorded {
@@ -675,6 +680,13 @@ impl Engine {
         };
         self.put_record(txn, coll.id, &run.keyed.scope, Some(live), &record)?;
         Ok(())
+    }
+
+    /// The `last` of a record-only `done` commit (G8): a stamp minted for it,
+    /// above the standing record's `last`. The one place it is minted, so what
+    /// anchors such a row (it has no entry behind it) is decided here.
+    fn done_alone_last(&self, live: &IdempotencyRecord) -> Stamp {
+        self.next_stamp_above(Some(live.last))
     }
 
     /// Find one document, change it, and return it — atomically.
