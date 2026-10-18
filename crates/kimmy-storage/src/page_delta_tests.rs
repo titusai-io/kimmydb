@@ -1,19 +1,24 @@
 //! The records delta on every snapshot, scoped and converge page (B5, "Snapshots
-//! carry records"), and the fresh row a page store writes.
+//! carry records"), read from the sender's change log of idempotency records.
 //!
 //! The residual this closes: a keyed write on the sender after its collection's
 //! records phase and before the page that holds its document. Without the delta
 //! that page brings the effect without the record, and a retry on the receiver
 //! applies the request a second time. R1, R1b and R1c are the G1 review's
-//! reproductions of it (scoped, a retry before the pull's end, whole-database).
+//! reproductions of it (scoped, a retry before the pull's end, whole-database);
+//! R2 is a record the sender stores below its own witnessed vector, by the replay
+//! path, which only a log of changes, and not a vector of stamps, sees.
 
 use std::cmp::Ordering;
 use std::sync::Arc;
 
 use bson::{Bson, Document, doc};
-use kimmy_core::{DocId, Fingerprint, Hlc, NodeId, ScopeHash, Stamp, VersionVector};
+use kimmy_core::{DocId, Fingerprint, Hlc, NodeId, OpKind, OplogEntry, ScopeHash, Stamp};
 
-use crate::idempotency::{Keyed, KeyedWrite, RecordState, RecordsVia};
+use crate::idempotency::{
+    CarriedRecord, IdempotencyRecord, Keyed, KeyedWrite, ModifyRecorded, RecordOutcome,
+    RecordState, RecordsVia,
+};
 use crate::{
     Candidates, CollectionMeta, Engine, ModifySpec, PeerWindow, SNAPSHOT_PAGE, ServeVerdict,
     SnapshotCursor, SnapshotPage, SnapshotProgress, SyncOutcome,
@@ -130,29 +135,60 @@ fn retry_must_replay(m: &Engine, cm: &CollectionMeta, k: &KeyedWrite, id: i64) {
     );
 }
 
-/// `engine`'s record rows at its own origin.
-fn own_rows(engine: &Engine) -> usize {
+/// The rows of `engine`'s change log, where it begins not counted.
+fn log_rows(engine: &Engine) -> usize {
     use redb::ReadableDatabase;
     let txn = engine.db().begin_read().unwrap();
-    let rows = txn.open_table(crate::tables::IDEMPOTENCY_BY_STAMP).unwrap();
-    let own = engine.node_id().to_bytes();
+    let log = txn.open_table(crate::tables::IDEMPOTENCY_CHANGES).unwrap();
     let mut n = 0;
-    for row in redb::ReadableTable::iter(&rows).unwrap() {
+    for row in redb::ReadableTable::iter(&log).unwrap() {
         let (key, _) = row.unwrap();
-        if key.value().starts_with(&own) {
-            n += 1;
-        }
+        n += usize::from(!key.value().is_empty());
     }
     n
 }
 
-/// Whether a page is records-only: records and no documents, the cursor moved
-/// only in its delta fields.
+/// `pull`, counting the records the windows carried.
+fn pull_counting(to: &Engine, from: &Engine) -> usize {
+    let mut carried = 0;
+    for _ in 0..16 {
+        let theirs = from.version_vector().unwrap();
+        let mine = to.witnessed_vector().unwrap();
+        let Some(start) = mine.behind(&theirs) else { return carried };
+        let marked = to.held_ranges_covered_by(&mine).unwrap();
+        let window = from.serve_entries_to_peer(start, 1024, Some(&mine), &marked, None).unwrap();
+        carried += window.records.len();
+        let mut outcome = SyncOutcome::default();
+        to.apply_peer_window_carrying_into(
+            &theirs,
+            Some(&mine),
+            &window.entries,
+            &window.records,
+            RecordsVia::Pull,
+            PeerWindow {
+                scanned_to: window.scanned_to,
+                exhausted: window.exhausted,
+                passed_through: None,
+                asked_partial: false,
+            },
+            &mut outcome,
+        )
+        .unwrap();
+        if window.exhausted {
+            return carried;
+        }
+    }
+    carried
+}
+
+/// Whether a page is records-only: no documents, the cursor moved only in its
+/// base.
 fn records_only(page: &SnapshotPage, asked: &SnapshotCursor) -> bool {
     let Some(next) = &page.next else { return false };
     page.documents.is_empty()
         && page.deleted_documents.is_empty()
-        && next.records_from.is_some()
+        && next.records_base.is_some()
+        && next.records_base != asked.records_base
         && (next.collection, &next.after_key, &next.records)
             == (asked.collection, &asked.after_key, &asked.records)
 }
@@ -217,6 +253,9 @@ fn r1b_a_retry_between_the_effects_page_and_the_pulls_end_replays() {
     let cx = x.get_collection("shop", "orders").unwrap();
     assert_eq!(n_of(&x, &cx, target), 11, "premise: this page brought the effect");
     retry_must_replay(&x, &cx, &k, target);
+    // Each change rides one page: the next base is above it.
+    let rest = finish(&x, &y, &mut progress);
+    assert!(rest.iter().all(|page| page.records.is_empty()), "sent once");
 }
 
 /// R1c: the whole-database route. The collection's records phase (it holds an
@@ -305,37 +344,27 @@ fn a_pages_records_commit_with_its_documents() {
 
 // -- Paging and resuming ----------------------------------------------------------------------
 
-/// A delta larger than [`crate::idempotency::RECORD_PAGE`] goes as records-only
-/// pages, each leaving the cursor's document position as it came, and then the
-/// documents; one larger than the byte budget the same, and a record larger than
-/// the byte budget goes alone. Every record and every document arrives.
+/// A delta is bounded by the frame budget, not by a page of records: more than
+/// [`crate::idempotency::RECORD_PAGE`] changed records ride one page with its
+/// documents. One larger than the byte budget goes as records-only pages, each
+/// leaving the cursor's document position as it came and moving its base, and
+/// then the documents with the rest; a record larger than the byte budget goes
+/// alone. Every record and every document arrives.
 #[test]
-fn a_delta_larger_than_a_page_goes_as_records_only_pages() {
+fn a_delta_larger_than_the_byte_budget_goes_as_records_only_pages() {
     let dir = tempfile::tempdir().unwrap();
     let (y, x) = (open(&dir, "y"), open(&dir, "x"));
     let cy = three_pages(&y, 1);
     let mut progress = SnapshotProgress::of_collection(cy.id);
     take(&x, &y, &mut progress);
-    // More records than a page, written between two pages.
     let n = crate::idempotency::RECORD_PAGE as u64 + 60;
     for i in 0..n {
         let id = 10_000 + i as i64;
         fresh(y.insert_keyed(&cy, doc! { "_id": id, "v": 1 }, &key_of(i)).unwrap());
     }
-    let asked = progress.after().cloned().unwrap();
     let page = take(&x, &y, &mut progress);
-    assert!(records_only(&page, &asked), "a records-only page: {:?}", page.next);
-    assert_eq!(page.records.len(), crate::idempotency::RECORD_PAGE);
-    let asked = progress.after().cloned().unwrap();
-    let page = take(&x, &y, &mut progress);
-    assert_eq!(page.records.len(), 60, "the rest of the delta");
-    assert!(!page.documents.is_empty(), "then the documents, on the page that ends the delta");
-    assert_eq!(
-        page.documents[0].id,
-        DocId::Int64(SNAPSHOT_PAGE as i64 + 1),
-        "from where the cursor stood before the delta: {asked}"
-    );
-    assert_eq!(page.next.as_ref().and_then(|next| next.records_from), None);
+    assert_eq!(page.records.len(), n as usize, "more than a page of records, on one page");
+    assert_eq!(page.documents[0].id, DocId::Int64(SNAPSHOT_PAGE as i64 + 1));
 
     // By bytes: a budget of three records, then of less than one.
     let one = page.records[0].record.len() + 96;
@@ -345,13 +374,17 @@ fn a_delta_larger_than_a_page_goes_as_records_only_pages() {
         fresh(y.insert_keyed(&cy, doc! { "_id": id, "v": 1 }, &key_of(i)).unwrap());
     }
     let mut sizes = Vec::new();
+    let mut position = None;
     loop {
         let asked = progress.after().cloned().unwrap();
         let page = take(&x, &y, &mut progress);
         sizes.push(page.records.len());
         if !records_only(&page, &asked) {
+            assert!(!page.documents.is_empty(), "the page with the rest has documents");
             break;
         }
+        let at = (asked.collection, asked.after_key.clone(), asked.records.clone());
+        assert!(position.get_or_insert(at.clone()) == &at, "the document position stays");
     }
     assert_eq!(sizes, vec![3, 3, 1], "by bytes");
     y.set_record_delta_budget_for_test(Some((1, crate::idempotency::RECORD_DELTA_ROWS)));
@@ -374,6 +407,62 @@ fn a_delta_larger_than_a_page_goes_as_records_only_pages() {
     let cx = x.get_collection("shop", "orders").unwrap();
     assert_eq!(count(&x, &cx), count(&y, &cy), "every document, once");
     assert_eq!(x.idempotency_records().unwrap(), n + 9, "every record");
+}
+
+/// **A page carries documents only with the whole remainder** of the log above
+/// its base. Keyed changes before and during a delta of several pages, one on a
+/// document of the page that ends it: that page carries every record changed up
+/// to its own read, so a retry on the receiver right after it replays.
+#[test]
+fn a_page_carries_documents_only_with_the_whole_remainder() {
+    let dir = tempfile::tempdir().unwrap();
+    let (y, x) = (open(&dir, "y"), open(&dir, "x"));
+    let (target, during) = (SNAPSHOT_PAGE as i64 + 40, SNAPSHOT_PAGE as i64 + 80);
+    let cy = y.create_collection("shop", "orders").unwrap();
+    let docs = (1..(3 * SNAPSHOT_PAGE as i64))
+        .map(|i| {
+            if i == target || i == during {
+                doc! { "_id": i, "n": 10i64 }
+            } else {
+                doc! { "_id": i, "v": i }
+            }
+        })
+        .collect();
+    y.insert_many(&cy, docs).unwrap();
+    let mut progress = SnapshotProgress::of_collection(cy.id);
+    take(&x, &y, &mut progress);
+    for i in 0..7u64 {
+        fresh(y.insert_keyed(&cy, doc! { "_id": 10_000 + i as i64 }, &key_of(i)).unwrap());
+    }
+    let k = key(7);
+    let on = |id: i64| Candidates::Keys(vec![crate::docs::doc_key(&DocId::Int64(id)).unwrap()]);
+    fresh(y.modify_where_keyed(&cy, &on(target), &Inc, Some(1), &k).unwrap());
+    let one = y.snapshot_page(None, Some(cy.id)).unwrap().records.len();
+    assert_eq!(one, 8, "premise: eight records");
+    let size = {
+        let any = y.idempotency_record(cy.id, &key_of(0).scope).unwrap().unwrap();
+        any.encode().len() + 96
+    };
+    y.set_record_delta_budget_for_test(Some((3 * size, crate::idempotency::RECORD_DELTA_ROWS)));
+    let asked = progress.after().cloned().unwrap();
+    let page = take(&x, &y, &mut progress);
+    assert!(records_only(&page, &asked), "a records-only page first");
+    // A keyed change during the delta, on a document of the page that ends it.
+    let k2 = key(9);
+    fresh(y.modify_where_keyed(&cy, &on(during), &Inc, Some(1), &k2).unwrap());
+    loop {
+        let asked = progress.after().cloned().unwrap();
+        let page = take(&x, &y, &mut progress);
+        if !records_only(&page, &asked) {
+            break;
+        }
+    }
+    y.set_record_delta_budget_for_test(None);
+    let cx = x.get_collection("shop", "orders").unwrap();
+    assert_eq!((n_of(&x, &cx, target), n_of(&x, &cx, during)), (11, 11), "premise: the page");
+    assert!(!progress.is_complete(), "premise: the pull goes on");
+    retry_must_replay(&x, &cx, &k, target);
+    retry_must_replay(&x, &cx, &k2, during);
 }
 
 /// The rows one page's delta reads are bounded: a scoped delta over rows of
@@ -414,8 +503,9 @@ fn a_delta_reads_a_bounded_number_of_rows_a_page() {
 
 /// The base rides the cursor the receiver persists (`SNAPSHOT_PROGRESS`): a pull
 /// resumed after a restart is first sent every record that changed since, as
-/// records-only pages when it is more than a page, a restart part-way through
-/// those included, with the document position as it was; then the documents.
+/// records-only pages when it is more than a page holds, a restart part-way
+/// through those included, with the document position as it was; then the
+/// documents.
 #[test]
 fn a_resumed_pull_is_first_sent_every_record_that_changed_since() {
     let dir = tempfile::tempdir().unwrap();
@@ -428,15 +518,20 @@ fn a_resumed_pull_is_first_sent_every_record_that_changed_since() {
         let x = Engine::open(&x_path).unwrap();
         take(&x, &y, &mut progress);
     }
-    // The receiver stops; meanwhile the sender takes more keyed writes than a
-    // page holds, one of them on a document still to come.
-    let n = crate::idempotency::RECORD_PAGE as u64 + 30;
+    // The receiver stops; meanwhile the sender takes keyed writes, one of them
+    // on a document still to come, more than a page holds at the budget below.
+    let n = 30u64;
     for i in 0..n {
         let id = 10_000 + i as i64;
         fresh(y.insert_keyed(&cy, doc! { "_id": id, "v": 1 }, &key_of(i)).unwrap());
     }
     let k = key(7);
     fresh(y.modify_where_keyed(&cy, &Candidates::Scan, &Inc, Some(1), &k).unwrap());
+    let size = y.idempotency_record(cy.id, &key_of(0).scope).unwrap().unwrap().encode().len();
+    y.set_record_delta_budget_for_test(Some((
+        20 * (size + 96),
+        crate::idempotency::RECORD_DELTA_ROWS,
+    )));
     let x = Engine::open(&x_path).unwrap();
     let mut resumed = x.snapshots_to_resume().unwrap();
     assert_eq!(resumed.len(), 1);
@@ -446,18 +541,21 @@ fn a_resumed_pull_is_first_sent_every_record_that_changed_since() {
     assert!(asked.records_base.is_some(), "the base was persisted: {asked:?}");
     let page = take(&x, &y, &mut progress);
     assert!(records_only(&page, &asked), "records-only first: {:?}", page.next);
+    assert_eq!(page.records.len(), 20);
     drop(x);
     // And again, part-way through the delta.
     let x = Engine::open(&x_path).unwrap();
     let (_, mut progress) = x.snapshots_to_resume().unwrap().pop().unwrap();
     let at = progress.after().cloned().unwrap();
-    assert!(at.records_from.is_some(), "where the delta stopped was persisted: {at:?}");
+    assert!(at.records_base > asked.records_base, "the base moved and was persisted: {at:?}");
     assert_eq!(
         (at.collection, &at.after_key, &at.records),
         (asked.collection, &asked.after_key, &asked.records)
     );
     let page = take(&x, &y, &mut progress);
-    assert!(!page.documents.is_empty() && !page.records.is_empty(), "the rest, then documents");
+    assert_eq!(page.records.len(), 11, "the rest");
+    assert!(!page.documents.is_empty(), "then documents");
+    y.set_record_delta_budget_for_test(None);
     finish(&x, &y, &mut progress);
     let cx = x.get_collection("shop", "orders").unwrap();
     assert_eq!(x.idempotency_records().unwrap(), n + 1, "every record");
@@ -496,19 +594,15 @@ fn a_cursor_without_a_base_carries_no_delta_and_the_base_crosses_bson_and_json()
         bson::deserialize_from_slice(&bson::serialize_to_vec(&next).unwrap()).unwrap();
     let echoed: SnapshotCursor =
         bson::deserialize_from_slice(&bson::serialize_to_vec(&older).unwrap()).unwrap();
-    assert_eq!((echoed.records_base.clone(), echoed.records_from), (None, None));
+    assert_eq!(echoed.records_base, None);
     let without = y.snapshot_page(Some(echoed), Some(cy.id)).unwrap();
     assert!(without.records.is_empty(), "no base, no delta");
     assert_eq!(without.documents, with.documents, "the same page otherwise");
 
-    // Both fields, through BSON and JSON, alone and inside the persisted progress.
+    // The base, through BSON and JSON, alone and inside the persisted progress.
     let node = NodeId::from_bytes([3; 16]);
-    let mut base = VersionVector::new();
-    base.insert(node, Hlc::new(1_700_000_000_000, 4));
-    base.insert(NodeId::from_bytes([9; 16]), Hlc::new(12, 0));
     let cursor = SnapshotCursor {
-        records_base: Some(base),
-        records_from: Some(Stamp::new(Hlc::new(1_700_000_000_000, 2), node)),
+        records_base: Some(Stamp::new(Hlc::new(1_700_000_000_000, 4), node)),
         ..next
     };
     let wire: SnapshotCursor =
@@ -517,54 +611,100 @@ fn a_cursor_without_a_base_carries_no_delta_and_the_base_crosses_bson_and_json()
     let persisted: SnapshotCursor =
         serde_json::from_slice(&serde_json::to_vec(&cursor).unwrap()).unwrap();
     assert_eq!(persisted, cursor, "JSON");
-    let none = SnapshotCursor { records_base: None, records_from: None, ..cursor.clone() };
+    let none = SnapshotCursor { records_base: None, ..cursor.clone() };
     let text = serde_json::to_string(&none).unwrap();
-    assert!(!text.contains("records_base") && !text.contains("records_from"), "{text}");
+    assert!(!text.contains("records_base"), "{text}");
+    let mut progress = SnapshotProgress::of_collection(cy.id);
+    let x = open(&dir, "x");
+    x.apply_snapshot_page(y.node_id(), &mut progress, &first).unwrap();
+    let (_, persisted) = x.snapshots_to_resume().unwrap().pop().expect("persisted");
+    assert_eq!(persisted.after(), first.next.as_ref(), "the base in SNAPSHOT_PROGRESS's JSON");
 
     // A value of another shape is none, in either.
     let mut json = serde_json::to_value(&cursor).unwrap();
     json["records_base"] = serde_json::json!([1, 2, 3]);
-    json["records_from"] = serde_json::json!("later");
     let read: SnapshotCursor = serde_json::from_value(json).unwrap();
-    assert_eq!((read.records_base, read.records_from), (None, None));
+    assert_eq!(read.records_base, None);
     let mut wire = bson::serialize_to_document(&cursor).unwrap();
-    wire.insert("records_base", 5i32);
-    wire.insert("records_from", doc! { "hlc": "no" });
+    wire.insert("records_base", doc! { "hlc": "no" });
     let read: SnapshotCursor = bson::deserialize_from_document(wire).unwrap();
-    assert_eq!((read.records_base, read.records_from), (None, None));
+    assert_eq!(read.records_base, None);
 }
 
 // -- Page stores ------------------------------------------------------------------------------
 
-/// A page store that changes a record writes it, its rows and a row at a fresh
-/// stamp of the receiver's own; one that changes nothing writes nothing, and the
-/// page commits nothing.
+/// Every store that changes a record logs the change, a page store's included,
+/// and one that changes nothing logs nothing and writes nothing: a page or a
+/// frame carrying records already held costs no commit and leaves the log as it
+/// was.
 #[test]
-fn a_page_store_writes_a_fresh_row_when_it_changes_a_record_and_nothing_when_it_does_not() {
+fn a_store_that_changes_a_record_logs_it_and_one_that_changes_nothing_logs_nothing() {
     let dir = tempfile::tempdir().unwrap();
-    let (y, x) = (open(&dir, "y"), open(&dir, "x"));
+    let (y, x, s) = (open(&dir, "y"), open(&dir, "x"), open(&dir, "s"));
     let cy = y.create_collection("shop", "orders").unwrap();
-    fresh(y.insert_keyed(&cy, doc! { "_id": 1i64, "n": 0i64 }, &key(7)).unwrap());
+    let k = key(7);
+    fresh(y.insert_keyed(&cy, doc! { "_id": 1i64, "n": 0i64 }, &k).unwrap());
+    assert_eq!(log_rows(&y), 1, "a local commit logs");
     let page = y.snapshot_page(None, Some(cy.id)).unwrap();
     assert_eq!(page.records.len(), 1);
     let mut progress = SnapshotProgress::of_collection(cy.id);
     x.apply_snapshot_page(y.node_id(), &mut progress, &page).unwrap();
-    assert_eq!(own_rows(&x), 1, "the fresh row");
+    assert_eq!(log_rows(&x), 1, "a page store logs");
     let commits = x.commits();
     let mut again = SnapshotProgress::of_collection(cy.id);
     x.apply_snapshot_page(y.node_id(), &mut again, &page).unwrap();
     assert_eq!(x.commits(), commits, "a page that changes nothing commits nothing");
-    assert_eq!(own_rows(&x), 1, "and writes no fresh row");
+    assert_eq!(log_rows(&x), 1, "and logs nothing");
     assert_eq!(x.idempotency_records_received()[4], 1, "counted once, when it changed");
+
+    pull(&s, &y);
+    assert_eq!(log_rows(&s), 1, "a frame store logs");
+    // The same entries and record again: superseded, and the record held.
+    let window = y.entries_for_peer(Hlc::ZERO, 1_024, crate::WalkScope::Background).unwrap();
+    let record = y.idempotency_record(cy.id, &k.scope).unwrap().unwrap();
+    let carried = CarriedRecord {
+        collection: cy.id,
+        scope: k.scope,
+        carrying: Some(record.first),
+        record: record.encode(),
+    };
+    let commits = s.commits();
+    s.apply_batch_carrying(&window.entries, &[], RecordsVia::Pull).unwrap();
+    let bare = s.commits() - commits;
+    let commits = s.commits();
+    s.apply_batch_carrying(&window.entries, &[carried], RecordsVia::Pull).unwrap();
+    assert_eq!(log_rows(&s), 1, "a frame of what is held logs nothing");
+    assert_eq!(s.commits() - commits, bare, "and its records cost no commit of their own");
+}
+
+/// The log is node-local: a record a member stores is not shipped again by its
+/// windows. Once a peer holds it, a later window between them carries no record
+/// (no row without an entry is written to `IDEMPOTENCY_BY_STAMP`, which F3
+/// would send on every window).
+#[test]
+fn a_record_crosses_each_link_once() {
+    let dir = tempfile::tempdir().unwrap();
+    let (y, s, m) = (open(&dir, "y"), open(&dir, "s"), open(&dir, "m"));
+    let cy = y.create_collection("shop", "orders").unwrap();
+    fresh(y.insert_keyed(&cy, doc! { "_id": 1i64, "n": 0i64 }, &key(7)).unwrap());
+    pull(&s, &y);
+    assert_eq!(pull_counting(&m, &s), 1, "the record crosses once");
+    // Later traffic between them carries it no more.
+    y.insert(&cy, doc! { "_id": 2i64 }).unwrap();
+    pull(&s, &y);
+    assert_eq!(pull_counting(&m, &s), 0, "and not again");
+    let other = s.create_collection("shop", "other").unwrap();
+    s.insert(&other, doc! { "_id": 1i64 }).unwrap();
+    assert_eq!(pull_counting(&m, &s), 0, "nor with the member's own writes");
 }
 
 /// The page-store edge: a member serving a snapshot of a collection takes a
-/// converge page of it, and the page changes a record whose rows are all at
-/// stamps the member had witnessed when it cut its last page. Here the record
-/// becomes `done` by a record-only commit, which keeps its `last`: the member
-/// pulled the request's last chunk before that commit. The fresh row puts the
-/// changed record in the next page's delta, so the snapshot's receiver ends
-/// with `done`, and a retry there replays instead of resuming.
+/// converge page of it, and the page changes a record the member had already
+/// sent the snapshot's receiver. Here the record becomes `done` by a
+/// record-only commit on its origin, after the member pulled the request's last
+/// chunk. The page store logs the change, so the snapshot's next page carries
+/// it, the receiver ends with `done`, and a retry there replays instead of
+/// resuming.
 #[test]
 fn a_record_a_member_takes_by_page_while_serving_a_snapshot_rides_its_next_page() {
     use crate::sync::race_hooks::{Race, at};
@@ -627,32 +767,169 @@ fn a_store_without_keys_pages_as_before() {
     assert!(pages.iter().all(|page| page.records.is_empty()));
     let cx = x.get_collection("shop", "orders").unwrap();
     assert_eq!(count(&x, &cx), count(&y, &cy));
-    assert_eq!(own_rows(&x), 0);
+    assert_eq!(log_rows(&x), 0);
 }
 
-// -- The next base ----------------------------------------------------------------------------
+// -- A record stored below the sender's witnessed vector -----------------------------------
 
-/// Each origin's next base is the vector of the page that began reading its
-/// rows: the page's own for a delta that ended on it; for one that stopped, the
-/// base it came with for the origin it stopped in when an earlier page began
-/// that one, and for every origin it has not reached.
+/// R2 (the G1 review's section 10): a record the sender stores during the pull
+/// below its own witnessed vector, as a replay page or a frame requested before a
+/// concurrent pull raised that vector does. Origin Q's later entry raised Y's
+/// coverage of Q before the first page; Q's earlier entry, which carries a keyed
+/// request's effect and record, is applied on Y after it, by the path a replay
+/// page takes. The store is logged like any other, so the next page carries it.
 #[test]
-fn next_base_takes_each_origin_from_the_page_that_began_its_rows() {
-    use crate::idempotency::next_base;
-    let (a, b, c) =
-        (NodeId::from_bytes([1; 16]), NodeId::from_bytes([2; 16]), NodeId::from_bytes([3; 16]));
-    let vector = |hlcs: [u64; 3]| {
-        let mut v = VersionVector::new();
-        for (node, ms) in [a, b, c].into_iter().zip(hlcs) {
-            v.insert(node, Hlc::new(ms, 0));
-        }
-        v
+fn r2_a_record_stored_below_the_senders_witnessed_vector_still_rides_the_next_page() {
+    let dir = tempfile::tempdir().unwrap();
+    let (y, x) = (open(&dir, "y"), open(&dir, "x"));
+    let cy = y.create_collection("shop", "orders").unwrap();
+    let last = SNAPSHOT_PAGE as i64 + 40;
+    y.insert_many(&cy, (1..=last).map(|i| doc! { "_id": i, "v": i }).collect()).unwrap();
+    let q = NodeId::from_bytes([0xC1; 16]);
+    let now = crate::physical_now_ms();
+    let entry = |at: Stamp, id: i64, body: Document| OplogEntry {
+        stamp: at,
+        kind: OpKind::Replace,
+        collection: cy.id,
+        doc_id: Some(DocId::Int64(id)),
+        body: Some(bson::serialize_to_vec(&body).unwrap()),
     };
-    let (base, now) = (vector([10, 20, 30]), vector([11, 21, 31]));
-    let get = |v: &VersionVector| [a, b, c].map(|node| v.get(node).wall_ms);
-    assert_eq!(get(&next_base(&base, None, None, &now)), [11, 21, 31], "one page");
-    assert_eq!(get(&next_base(&base, None, Some(b), &now)), [11, 21, 30], "stopped in b");
-    assert_eq!(get(&next_base(&base, Some(b), None, &now)), [10, 20, 31], "went on in b");
-    assert_eq!(get(&next_base(&base, Some(a), Some(a), &now)), [10, 20, 30], "still in a");
-    assert_eq!(get(&next_base(&base, Some(a), Some(c), &now)), [10, 21, 31], "a to c");
+    let (early, late) =
+        (Stamp::new(Hlc::new(now + 10, 0), q), Stamp::new(Hlc::new(now + 50, 0), q));
+    y.apply_batch_carrying(
+        &[entry(late, 1, doc! { "_id": 1i64, "v": -1i64 })],
+        &[],
+        RecordsVia::Pull,
+    )
+    .unwrap();
+    let mut progress = SnapshotProgress::of_collection(cy.id);
+    take(&x, &y, &mut progress);
+    let k = key(7);
+    let record = IdempotencyRecord {
+        fingerprint: k.fingerprint,
+        first: early,
+        last: early,
+        origin: q,
+        state: RecordState::Done,
+        outcome: RecordOutcome::Modify(ModifyRecorded {
+            matched: 1,
+            modified: 1,
+            skipped: 0,
+            commits: 1,
+            stamp: Some(early),
+            cursor: None,
+            resumed: false,
+        }),
+    };
+    let carried = CarriedRecord {
+        collection: cy.id,
+        scope: k.scope,
+        carrying: Some(early),
+        record: record.encode(),
+    };
+    y.apply_batch_carrying(
+        &[entry(early, last, doc! { "_id": last, "n": 11i64 })],
+        &[carried],
+        RecordsVia::Replay,
+    )
+    .unwrap();
+    assert!(y.idempotency_record(cy.id, &k.scope).unwrap().is_some(), "premise: Y stored it");
+    assert!(y.witnessed_vector().unwrap().get(q) > early.hlc, "premise: below Y's vector");
+    finish(&x, &y, &mut progress);
+    let cx = x.get_collection("shop", "orders").unwrap();
+    assert_eq!(n_of(&x, &cx, last), 11, "premise: the page brought the effect");
+    retry_must_replay(&x, &cx, &k, last);
+}
+
+/// A record a member pulls while it serves a snapshot rides the snapshot's next
+/// page: the frame store is logged like a local commit, whatever stamps its rows
+/// are at.
+#[test]
+fn a_record_a_member_pulls_while_serving_a_snapshot_rides_its_next_page() {
+    let dir = tempfile::tempdir().unwrap();
+    let (y, s, m) = (open(&dir, "y"), open(&dir, "s"), open(&dir, "m"));
+    let target = SNAPSHOT_PAGE as i64 + 40;
+    let cy = three_pages(&y, target);
+    pull(&s, &y);
+    let cs = s.get_collection("shop", "orders").unwrap();
+    let mut progress = SnapshotProgress::of_collection(cs.id);
+    take(&m, &s, &mut progress);
+    let k = key(7);
+    fresh(y.modify_where_keyed(&cy, &Candidates::Scan, &Inc, Some(1), &k).unwrap());
+    pull(&s, &y);
+    let pages = finish(&m, &s, &mut progress);
+    assert_eq!(pages[0].records.len(), 1, "the next page's delta");
+    let cm = m.get_collection("shop", "orders").unwrap();
+    assert_eq!(n_of(&m, &cm, target), 11, "premise: the pull brought the effect");
+    retry_must_replay(&m, &cm, &k, target);
+}
+
+// -- A base the sender's log cannot answer for ---------------------------------------------
+
+/// Whether `page` is its collection again from its records phase: all `records`
+/// of it, then its documents from the first, `first`.
+fn restarted(page: &SnapshotPage, records: usize, first: i64) -> bool {
+    page.records.len() == records
+        && page.documents.first().map(|d| &d.id) == Some(&DocId::Int64(first))
+}
+
+/// A base above the sender's log's high water (a cursor from a log this node no
+/// longer has, or from a clock ahead of its own): what changed since it is
+/// unknown, so the cursor's collection restarts from its records phase, which
+/// carries the record of a keyed write made since the page before.
+#[test]
+fn a_base_above_the_senders_log_restarts_its_collection_from_its_records() {
+    let dir = tempfile::tempdir().unwrap();
+    let (y, x) = (open(&dir, "y"), open(&dir, "x"));
+    let target = SNAPSHOT_PAGE as i64 + 40;
+    let cy = three_pages(&y, target);
+    let mut progress = SnapshotProgress::of_collection(cy.id);
+    take(&x, &y, &mut progress);
+    let k = key(7);
+    fresh(y.modify_where_keyed(&cy, &Candidates::Scan, &Inc, Some(1), &k).unwrap());
+    let ahead = Stamp::new(Hlc::new(crate::physical_now_ms() + 3_600_000, 0), y.node_id());
+    let forged = SnapshotCursor { records_base: Some(ahead), ..progress.after().cloned().unwrap() };
+    let page = y.snapshot_page(Some(forged), Some(cy.id)).unwrap();
+    assert!(restarted(&page, 1, 1), "restarted: {:?}", page.next);
+    x.apply_snapshot_page(y.node_id(), &mut progress, &page).unwrap();
+    finish(&x, &y, &mut progress);
+    let cx = x.get_collection("shop", "orders").unwrap();
+    assert_eq!(n_of(&x, &cx, target), 11, "premise: the pull brought the effect");
+    retry_must_replay(&x, &cx, &k, target);
+}
+
+/// A base from before the sender's log began, as a sender restored from a backup
+/// (which carries no log) has it: the cursor's collection restarts from its
+/// records phase. And a base of another node's, as after an identity reset, the
+/// same.
+#[test]
+fn a_base_from_before_a_restore_or_of_another_node_restarts_its_collection() {
+    let dir = tempfile::tempdir().unwrap();
+    let (y, x) = (open(&dir, "y"), open(&dir, "x"));
+    let target = SNAPSHOT_PAGE as i64 + 40;
+    let cy = three_pages(&y, target);
+    fresh(y.insert_keyed(&cy, doc! { "_id": 0i64 }, &key(3)).unwrap());
+    let mut progress = SnapshotProgress::of_collection(cy.id);
+    take(&x, &y, &mut progress);
+    let asked = progress.after().cloned().unwrap();
+    // Y is replaced by a restore of its backup.
+    let mut backup = Vec::new();
+    y.backup_to(&mut backup, crate::WalkScope::Background).unwrap();
+    drop(y);
+    let restored_path = dir.path().join("y2.redb");
+    crate::backup::restore(&restored_path, &mut backup.as_slice()).unwrap();
+    let y = Engine::open(&restored_path).unwrap();
+    assert_eq!(log_rows(&y), 0, "a backup carries no log");
+    let k = key(7);
+    fresh(y.modify_where_keyed(&cy, &Candidates::Scan, &Inc, Some(1), &k).unwrap());
+    let page = y.snapshot_page(Some(asked.clone()), Some(cy.id)).unwrap();
+    assert!(restarted(&page, 2, 0), "restarted after a restore: {:?}", page.next);
+    // Another node's base.
+    let base = asked.records_base.unwrap();
+    let other = SnapshotCursor {
+        records_base: Some(Stamp::new(base.hlc, NodeId::from_bytes([0xEE; 16]))),
+        ..asked
+    };
+    let page = y.snapshot_page(Some(other), Some(cy.id)).unwrap();
+    assert!(restarted(&page, 2, 0), "restarted for another node's base: {:?}", page.next);
 }

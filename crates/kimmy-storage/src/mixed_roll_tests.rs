@@ -363,7 +363,6 @@ fn v1_page(
             after_key: last.v1.clone(),
             records: None,
             records_base: None,
-            records_from: None,
         }),
         _ => None,
     };
@@ -670,7 +669,6 @@ fn the_sender_resumes_after_the_row_a_schema_4_cursor_names() {
             after_key: v1::key(&int(*id)),
             records: None,
             records_base: None,
-            records_from: None,
         };
         let page = s.snapshot_page(Some(after), Some(coll.id)).unwrap();
         let served: Vec<DocId> = page.documents.iter().map(|d| d.id.clone()).collect();
@@ -1449,7 +1447,6 @@ fn a_decimal_id_travels_marked_and_lands_on_its_own_document() {
         after_key: marked(&decimal("2.5")),
         records: None,
         records_base: None,
-        records_from: None,
     };
     let rest = s.snapshot_page(Some(after), Some(coll.id)).unwrap();
     assert_eq!(rest.documents.iter().map(|d| d.id.clone()).collect::<Vec<_>>(), vec![int(3)]);

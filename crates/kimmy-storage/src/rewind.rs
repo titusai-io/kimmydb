@@ -370,7 +370,7 @@ impl Engine {
             // record of a write the rewind discarded would replay an answer for
             // a write that no longer exists, and a client would take it as
             // applied. One the rewind cuts part-way is reopened, to resume.
-            let (records_removed, records_reopened) = Engine::rewind_records_in(&txn, until)?;
+            let (records_removed, records_reopened) = self.rewind_records_in(&txn, until)?;
             outcome.records_removed = records_removed;
             outcome.records_reopened = records_reopened;
             // The live counts moved with every record the rewind rewrote, in

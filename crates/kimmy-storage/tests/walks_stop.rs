@@ -421,17 +421,24 @@ const BOUNDED_READS: &[(&str, &str)] = &[
         "one snapshot page's records phase: at most RECORD_PAGE (512) records of one collection",
     ),
     ("idempotency_tests::rows", "test code reading a store of a few thousand rows it wrote itself"),
-    ("page_delta_tests::own_rows", "test code reading a store of a few thousand rows it wrote itself"),
     (
-        "idempotency::delta_base",
-        "one seek, in a snapshot page's read transaction: the last record row of the sender's own \
-         origin",
+        "page_delta_tests::log_rows",
+        "test code reading a store of a few thousand rows it wrote itself",
     ),
     (
-        "idempotency::records_delta",
-        "one snapshot page's records delta, in the page's read transaction: at most \
-         RECORD_DELTA_ROWS (4,096) rows examined and RECORD_PAGE (512) records, plus a seek per \
-         origin with a row",
+        "idempotency::changes_high_water",
+        "one seek, in a snapshot page's read transaction: the last key of this node's change log",
+    ),
+    (
+        "idempotency::records_changed_since",
+        "one snapshot page's records delta, in the page's read transaction: one range of this \
+         node's change log above the cursor's base, at most RECORD_DELTA_ROWS (65,536) rows",
+    ),
+    (
+        "idempotency::Engine::trim_idempotency_changes",
+        "retention's share of the change log: one seek under a read transaction, then chunks of \
+         RECORD_COLLECT_CHUNK rows below the cutoff, each in its write: close_writes bounds it \
+         (ADR-192)",
     ),
     (
         "idempotency::records_in_advance",

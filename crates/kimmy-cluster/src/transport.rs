@@ -8338,7 +8338,6 @@ mod tests {
             after_key: after.to_be_bytes().to_vec(),
             records: None,
             records_base: None,
-            records_from: None,
         }
     }
 

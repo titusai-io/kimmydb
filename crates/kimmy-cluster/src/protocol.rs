@@ -1019,15 +1019,10 @@ mod tests {
                     collection: CollectionId(u64::MAX),
                     after_key: vec![1, 2],
                     records: None,
-                    // A records delta's base and where a records-only page
-                    // stopped (B5).
-                    records_base: Some({
-                        let mut base = VersionVector::new();
-                        base.insert(NodeId::from_bytes([3; 16]), Hlc::new(77, 1));
-                        base
-                    }),
-                    records_from: Some(kimmy_core::Stamp::new(
-                        Hlc::new(70, 2),
+                    // A records delta's base: a key of the sender's change
+                    // log (B5).
+                    records_base: Some(kimmy_core::Stamp::new(
+                        Hlc::new(77, 1),
                         NodeId::from_bytes([3; 16]),
                     )),
                 }),
@@ -1448,10 +1443,8 @@ mod tests {
                 collection: high,
                 after_key: Vec::new(),
                 records: Some(vec![9; 32]),
-                // And the records delta's base, with where a records-only page
-                // stopped.
-                records_base: Some(versions.clone()),
-                records_from: Some(at),
+                // And the records delta's base.
+                records_base: Some(at),
             }),
             versions: versions.clone(),
             dropped: None,
@@ -1470,10 +1463,7 @@ mod tests {
         let echoed = older.next.expect("the cursor");
         assert_eq!((echoed.collection, echoed.after_key.clone()), (high, Vec::new()));
         let cut = sent.get_document("next").unwrap();
-        assert!(
-            cut.contains_key("records_base") && cut.contains_key("records_from"),
-            "the delta's base rides the cursor: {cut}"
-        );
+        assert!(cut.contains_key("records_base"), "the delta's base rides the cursor: {cut}");
         assert_eq!(read_back("Snapshot", sent.clone()).await, message, "this build reads it whole");
         let mut before = sent;
         before.remove("records");
@@ -1498,7 +1488,6 @@ mod tests {
                 after_key: Vec::new(),
                 records: None,
                 records_base: None,
-                records_from: None,
             },
             "an echo without the position asks for the documents, and without the base for no \
              records delta"
@@ -1508,8 +1497,7 @@ mod tests {
             "after": {
                 "collection": bson::serialize_to_bson(&high).unwrap(),
                 "after_key": bson::Bson::Array(Vec::new()),
-                "records_base": "not a vector",
-                "records_from": 7i32,
+                "records_base": "not a stamp",
             },
             "collection": bson::Bson::Null,
         };
@@ -1517,7 +1505,7 @@ mod tests {
         else {
             panic!("not a snapshot request")
         };
-        assert_eq!((after.records_base, after.records_from), (None, None));
+        assert_eq!(after.records_base, None);
     }
 
     /// The same boundary for `AskEntries::marked` (ADR-172). A receiver
@@ -2099,7 +2087,6 @@ mod tests {
                 after_key: vec![1, 2, 3],
                 records: None,
                 records_base: None,
-                records_from: None,
             }),
             versions: versions.clone(),
             dropped: None,
