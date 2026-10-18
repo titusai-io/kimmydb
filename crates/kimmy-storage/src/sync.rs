@@ -2416,9 +2416,15 @@ impl Engine {
         let applied = self.apply_remote_in_txn(txn, &collection, entry, position)?;
         // The frame's records of this collection, on either outcome of the
         // merge, in this run's transaction (B5).
-        if frame.owes(collection.id) {
-            run.records +=
-                self.store_frame_records(txn, memo, Some(&collection), collection.id, frame)?;
+        if frame.owes(collection.id, entry.stamp) {
+            run.records += self.store_frame_records(
+                txn,
+                memo,
+                Some(&collection),
+                collection.id,
+                entry.stamp,
+                frame,
+            )?;
         }
         match applied {
             RemoteApplied::Applied { id, violations, released } => {
@@ -2449,16 +2455,28 @@ impl Engine {
         memo: &mut Memo,
         frame: &mut crate::idempotency::FrameRecords,
     ) -> Result<()> {
-        if !frame.owes(entry.collection) {
+        if !frame.owes(entry.collection, entry.stamp) {
             return Ok(());
         }
         let standing = self.memo_collection(memo, entry.collection)?;
-        if !self.frame_holds_a_live_record(memo, standing.as_deref(), entry.collection, frame)? {
+        if !self.frame_holds_a_live_record(
+            memo,
+            standing.as_deref(),
+            entry.collection,
+            entry.stamp,
+            frame,
+        )? {
             return Ok(());
         }
         let txn = self.run_txn(run)?;
-        run.records +=
-            self.store_frame_records(txn, memo, standing.as_deref(), entry.collection, frame)?;
+        run.records += self.store_frame_records(
+            txn,
+            memo,
+            standing.as_deref(),
+            entry.collection,
+            entry.stamp,
+            frame,
+        )?;
         Ok(())
     }
 

@@ -1683,6 +1683,47 @@ fn a_drops_purge_removes_the_collections_records() {
     assert_eq!(rows(&engine).len(), 6, "rows are left to expire");
 }
 
+/// The purge removes the dropped life's records only (finding P1). A window stores
+/// the records it carries whether or not their collection stands, so a member that
+/// has applied a drop, its purge pending, can hold the record of a write stamped after
+/// the drop, a write the next life keeps (ADR-236). That record stays through the
+/// purge, and a retry after the name is created again replays it; the dropped life's
+/// record goes.
+#[test]
+fn a_drops_purge_leaves_a_record_of_the_life_after_it() {
+    let (engine, coll, _dir, _path) = open();
+    let old = keyed(60);
+    fresh(engine.insert_keyed(&coll, doc! { "_id": 1i64 }, &old).unwrap());
+    engine.drop_collection("shop", "orders").unwrap();
+    let dropped = engine.collection_dropped_at(coll.id).unwrap().expect("a tombstone");
+    // As a window brings it, the collection absent here and its purge pending.
+    let k = keyed(61);
+    let at = Stamp::new(dropped.hlc.successor(), NodeId::from_bytes([9; 16]));
+    let later = IdempotencyRecord {
+        fingerprint: k.fingerprint,
+        first: at,
+        last: at,
+        origin: at.node,
+        state: RecordState::Done,
+        outcome: RecordOutcome::Insert { stamp: at },
+    };
+    {
+        let txn = engine.begin_write(crate::WriterHolder::Replication).unwrap();
+        let stored = engine
+            .store_record(&txn, &mut Default::default(), None, coll.id, &k.scope, &later, Some(at))
+            .unwrap();
+        assert!(stored.is_some(), "premise: not history, its last is above the drop");
+        txn.commit().unwrap();
+    }
+    engine.finish_purges_now().unwrap();
+    assert_eq!(record(&engine, &coll, &old), None, "the dropped life's record went");
+    assert_eq!(record(&engine, &coll, &k), Some(later), "the later life's stays");
+    let again = engine.create_collection("shop", "orders").unwrap();
+    let replay = replayed(engine.insert_keyed(&again, doc! { "_id": 2i64 }, &k).unwrap());
+    assert_eq!(replay.first, at);
+    assert_eq!(count(&engine, &again), 0, "nothing written again");
+}
+
 /// A database drop buries each collection the same way, and the purge that
 /// follows removes each one's records.
 #[test]

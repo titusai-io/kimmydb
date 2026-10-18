@@ -515,9 +515,6 @@ pub(crate) struct Outcome {
     pub l1: usize,
     /// Settled records that differ only by a dominated, earlier state: finding S1.
     pub s1: usize,
-    /// Settled records that differ on a collection dropped before the record's `last`:
-    /// finding P1, the purge of a record of the life after the drop.
-    pub p1: usize,
     /// Applications afresh on an earlier life's effect, which the life rule allows.
     pub life_exempt: usize,
     /// Of those and of I2's exemptions, the ones only a drop made elsewhere explains: the
@@ -2654,16 +2651,6 @@ impl World {
                 shown.join(" | "),
                 lives.join(", ")
             );
-            // Finding P1 (reported, a fix pending): the drop purger removes every record
-            // under the collection's id, a record of the life after the drop that a
-            // window stored while the purge was pending among them.
-            if self.ghost.drops.iter().any(|(dc, at)| *dc == c && at.hlc < merged.last.hlc)
-                && !self.strict_s1
-            {
-                self.out.p1 += 1;
-                self.note(format!("P1: {detail}"));
-                continue;
-            }
             if kinds.contains(&"bad") {
                 self.fail(Inv::I4, detail);
                 continue;
@@ -3373,7 +3360,6 @@ struct Sweep {
     relay: usize,
     l1: usize,
     s1: usize,
-    p1: usize,
     dropped_elsewhere: usize,
     life_exempt: usize,
     replays: usize,
@@ -3409,7 +3395,6 @@ fn sweep(seeds: std::ops::Range<u64>, len: usize, threads: usize) -> Sweep {
                         t.relay += out.relay;
                         t.l1 += out.l1;
                         t.s1 += out.s1;
-                        t.p1 += out.p1;
                         t.dropped_elsewhere += out.dropped_elsewhere;
                         t.life_exempt += out.life_exempt;
                         t.replays += out.replays;
@@ -3428,7 +3413,7 @@ fn sweep(seeds: std::ops::Range<u64>, len: usize, threads: usize) -> Sweep {
     eprintln!(
         "idempotency model: seeds {seeds:?} x 2 tracks, len {len}: {} schedules, {} steps ({} \
          between commits), {} replays, {} resumes, {} crashes, {} life-rule applications, {} exempt by a drop elsewhere (D1), \
-         {} relay, {} L1, {} S1, {} P1, in {:.1?}",
+         {} relay, {} L1, {} S1, in {:.1?}",
         totals.schedules,
         totals.steps,
         totals.between,
@@ -3440,7 +3425,6 @@ fn sweep(seeds: std::ops::Range<u64>, len: usize, threads: usize) -> Sweep {
         totals.relay,
         totals.l1,
         totals.s1,
-        totals.p1,
         started.elapsed()
     );
     if let Some(report) = failure.into_inner().unwrap() {
@@ -3794,7 +3778,6 @@ fn row_f1_a_window_cut_inside_a_commit() {
 /// again; C takes the drop, the replace with its record, and the creation in one window.
 /// The drop's purge on C must leave that record, and a retry on C must replay.
 #[test]
-#[ignore = "finding P1: the drop purger removes a record of the life after the drop (fix pending)"]
 fn row_a_record_of_the_life_after_a_drop_survives_its_purge() {
     row(
         "purge",

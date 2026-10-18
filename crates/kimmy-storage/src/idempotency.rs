@@ -855,8 +855,17 @@ struct Shipping {
 }
 
 impl Shipping {
-    /// Ship the record the row `(key, value)` names, unless it is shipped already
-    /// or nothing stands under its key.
+    /// Ship the record the row `(key, value)` names, unless it is shipped already,
+    /// nothing stands under its key, or the row is **below the record's `first`**.
+    ///
+    /// Every row a record has is at or above its merged `first` (its `first`, its
+    /// `last`, and the sender's rows it was stored with, each at or above that
+    /// sender's `first`). A row below it was left by another record under the same
+    /// key: one of a life a drop ended, purged with its rows left to expire, or one
+    /// past its window that a new request's record replaced. Such a row vouches for
+    /// nothing of the record standing now, and shipped at it, the record would reach
+    /// a member that has not yet applied the drop in the run of an earlier life's
+    /// entry and merge there with that life's record.
     fn row(
         &mut self,
         records: &impl ReadableTable<(u64, &'static [u8]), &'static [u8]>,
@@ -868,17 +877,24 @@ impl Shipping {
         else {
             return Ok(());
         };
-        if !self.seen.insert((collection.0, *scope.as_bytes())) {
+        if self.seen.contains(&(collection.0, *scope.as_bytes())) {
             return Ok(());
         }
-        if let Some(record) = records.get((collection.0, scope.as_bytes().as_slice()))? {
-            self.out.push(CarriedRecord {
-                collection,
-                scope,
-                carrying: Some(carrying),
-                record: record.value().to_vec(),
-            });
+        let Some(record) = records.get((collection.0, scope.as_bytes().as_slice()))? else {
+            return Ok(());
+        };
+        if let Ok(Some(standing)) = IdempotencyRecord::decode(record.value())
+            && carrying < standing.first
+        {
+            return Ok(());
         }
+        self.seen.insert((collection.0, *scope.as_bytes()));
+        self.out.push(CarriedRecord {
+            collection,
+            scope,
+            carrying: Some(carrying),
+            record: record.value().to_vec(),
+        });
         Ok(())
     }
 }
@@ -1055,8 +1071,17 @@ impl RecordsVia {
 
 /// A frame's records, decoded once for the batch that applies its entries, and
 /// each stored at most once: in the run that takes the first entry of its
-/// collection, or else in the batch's last transaction, the one that raises the
-/// witnessed vector (B5, records travel with coverage).
+/// collection **at or after the record's row** (`carrying`), or else in the
+/// batch's last transaction, the one that raises the witnessed vector (B5,
+/// records travel with coverage).
+///
+/// Not in the run of an entry before the row: the batch takes its entries in
+/// stamp order, and one before the row can be of a life of the collection a drop
+/// between the two ends, a drop this member has not taken yet. Stored there, a
+/// record of the life after the drop met the earlier life's record under its key
+/// while that one was still alive here, and the two merged: the earlier life's
+/// `first` under the later life's request, so a resume here wrote nothing the
+/// stamp rule reads as written below it.
 pub(crate) struct FrameRecords {
     via: RecordsVia,
     /// `(collection, scope, carrying stamp, record, stored yet)`.
@@ -1069,10 +1094,21 @@ impl FrameRecords {
         Self { via: RecordsVia::Pull, records: Vec::new() }
     }
 
-    /// Whether any of the frame's records is of collection `id` and not stored
+    /// Whether any of the frame's records is of collection `id`, rides at or
+    /// before the entry stamped `at` (see [`Self::rides_by`]), and is not stored
     /// yet.
-    pub(crate) fn owes(&self, id: CollectionId) -> bool {
-        self.records.iter().any(|(collection, _, _, _, stored)| *collection == id && !stored)
+    pub(crate) fn owes(&self, id: CollectionId, at: Stamp) -> bool {
+        self.records.iter().any(|(collection, _, carrying, _, stored)| {
+            *collection == id && !stored && Self::rides_by(*carrying, at)
+        })
+    }
+
+    /// Whether a record carried at `carrying` is stored with the entry stamped
+    /// `at`: its row is at or before the entry (a record with no row rides with
+    /// any). One whose row is past the entry waits for an entry at or after it,
+    /// or for the batch's last transaction.
+    fn rides_by(carrying: Option<Stamp>, at: Stamp) -> bool {
+        carrying.is_none_or(|row| row <= at)
     }
 
     /// Whether any of the frame's records is not stored yet.
@@ -1100,9 +1136,9 @@ impl Engine {
     }
 
     /// Store, in the run's transaction, every record of the frame for the
-    /// collection `id` that is not stored yet: called when the run takes (applies
-    /// or supersedes) an entry of that collection, on both outcomes of the
-    /// merge. Each through [`Self::store_record`]: refused if history by the life
+    /// collection `id` that is not stored yet and rides by the entry stamped `at`
+    /// ([`FrameRecords::rides_by`]): called when the run takes (applies or
+    /// supersedes) that entry of that collection, on both outcomes of the merge. Each through [`Self::store_record`]: refused if history by the life
     /// rule, merged with the live record, rows at the merged `last` and at the
     /// carrying stamp, its stamps witnessed. Marked stored either way, so a later
     /// entry of the collection asks nothing again. Returns how many were stored.
@@ -1112,11 +1148,12 @@ impl Engine {
         memo: &mut Memo,
         standing: Option<&CollectionMeta>,
         id: CollectionId,
+        at: Stamp,
         frame: &mut FrameRecords,
     ) -> Result<usize> {
         let mut stored = 0usize;
         for (collection, scope, carrying, record, done) in &mut frame.records {
-            if *collection != id || *done {
+            if *collection != id || *done || !FrameRecords::rides_by(*carrying, at) {
                 continue;
             }
             let (_, wrote) =
@@ -1161,19 +1198,21 @@ impl Engine {
         Ok(stored)
     }
 
-    /// Whether any of the frame's records of collection `id` not stored yet is
-    /// not history by the life rule: what makes an entry judged history worth a
+    /// Whether any of the frame's records of collection `id` not stored yet and
+    /// riding by the entry stamped `at` is not history by the life rule: what makes an entry judged history worth a
     /// transaction for the frame's records.
     pub(crate) fn frame_holds_a_live_record(
         &self,
         memo: &mut Memo,
         standing: Option<&CollectionMeta>,
         id: CollectionId,
+        at: Stamp,
         frame: &FrameRecords,
     ) -> Result<bool> {
-        for (collection, _, _, record, stored) in &frame.records {
+        for (collection, _, carrying, record, stored) in &frame.records {
             if *collection == id
                 && !stored
+                && FrameRecords::rides_by(*carrying, at)
                 && !self.record_is_history(memo, standing, id, record)?
             {
                 return Ok(true);
@@ -1740,20 +1779,39 @@ impl Engine {
         Ok(removed)
     }
 
-    /// The drop purger's share: up to `budget` of collection `id`'s records,
-    /// removed in `txn`, which has already found no collection standing under
-    /// the id. Their rows are left to expire: they name nothing now.
+    /// The drop purger's share: up to `budget` of collection `id`'s records
+    /// examined in `txn`, which has already found no collection standing under
+    /// the id, and **those of the dropped life removed**: a record whose `last` is
+    /// at or below the collection's drop tombstone (the life rule, as the late
+    /// drop's sweep judges). Their rows are left to expire: they name nothing now.
+    ///
+    /// **A record of a later life stays**, for retention. A window stores the
+    /// records it carries whether or not their collection stands (records travel
+    /// with coverage), so a member that has applied a drop, its purge pending, can
+    /// hold the record of a write stamped after the drop (kept in the next life,
+    /// ADR-236); removed here, that write's effect would stand without its record.
+    /// A record this build cannot decode goes, as it went before.
     pub(crate) fn purge_records_in(
         txn: &WriteTxn<'_>,
         id: CollectionId,
         budget: usize,
     ) -> Result<usize> {
+        let dropped = match txn.open_table(tables::COLLECTIONS_DROPPED)?.get(id.0)? {
+            Some(raw) => Some(codec::decode_oplog_key(raw.value())?),
+            None => None,
+        };
         let mut records = txn.open_table(IDEMPOTENCY)?;
         let keys: Vec<Vec<u8>> = {
             let mut keys = Vec::new();
             for row in records.range(collection_records(id, None))?.take(budget) {
-                let (key, _) = row?;
-                keys.push(key.value().1.to_vec());
+                let (key, value) = row?;
+                let of_the_dropped_life = match IdempotencyRecord::decode(value.value()) {
+                    Ok(Some(record)) => dropped.is_some_and(|at| record.last.hlc <= at.hlc),
+                    Ok(None) | Err(_) => true,
+                };
+                if of_the_dropped_life {
+                    keys.push(key.value().1.to_vec());
+                }
             }
             keys
         };
