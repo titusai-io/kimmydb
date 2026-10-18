@@ -3738,6 +3738,26 @@ fn row_g5_an_own_origin_replay_after_a_restore() {
     );
 }
 
+/// F1: a window cut inside a commit. A writes an unkeyed version, then a keyed `$inc`
+/// of two counters in one commit, whose record's `last` is its second entry (L1). B's
+/// short pull (two entries) ends at the `$inc`'s first entry, so B holds that counter's
+/// effect and covers that stamp; the record's row there (its `first`) ships it with the
+/// window. A retry on B must replay.
+#[test]
+fn row_f1_a_window_cut_inside_a_commit() {
+    row(
+        "f1",
+        3,
+        vec![req(1, Kind::IncRange { d: 0 })],
+        vec![
+            touch(A, ITEMS, 0, 100),
+            ask(0, A, 110),
+            Op { step: Step::PullShort { to: B, from: A }, t: 0 },
+            ask(0, B, 120),
+        ],
+    );
+}
+
 /// G8: a keyed `$inc` of two counters fills its one chunk, and its lookahead finds the
 /// end, so the chunk's own record says `done`. B pulls right after that commit: it holds
 /// `done`, and a retry there replays (no record-only `done` it could never receive).
