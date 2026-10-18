@@ -11,8 +11,9 @@
 # killed / survived / build failure / timeout, and the invariants a model failure names
 # (`MODEL-KILL:`). One target dir of its own, reused across rows.
 #
-# Environment: MUTANT_TIMEOUT (seconds per suite, default 1500), CARGO_TARGET_DIR
-# (default ~/.cargo-target-b5m-mut), IDEM_CI_SEEDS (passed through to the model),
+# Environment: MUTANT_TIMEOUT (seconds per suite, default 1500), MUTANT_TARGET_DIR
+# (default ~/.cargo-target-b5m-mut; an inherited CARGO_TARGET_DIR is not used, since a
+# shared one lets another build clobber the rows'), IDEM_CI_SEEDS (passed through to the model),
 # MUTANT_INCLUDE_IGNORED (1, the default: the model's ignored rows run too, which on a
 # tree without their fix fail the baseline; 0 leaves them out).
 set -u
@@ -27,7 +28,7 @@ SELECT=("$@")
 HERE=$(cd "$(dirname "$0")" && pwd)
 TABLE="$HERE/mutants.py"
 TIMEOUT=${MUTANT_TIMEOUT:-1500}
-export CARGO_TARGET_DIR=${CARGO_TARGET_DIR:-$HOME/.cargo-target-b5m-mut}
+export CARGO_TARGET_DIR=${MUTANT_TARGET_DIR:-$HOME/.cargo-target-b5m-mut}
 export IDEM_CI_SEEDS=${IDEM_CI_SEEDS:-24}
 
 mkdir -p "$OUT"

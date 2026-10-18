@@ -3401,6 +3401,14 @@ fn sweep(seeds: std::ops::Range<u64>, len: usize, threads: usize) -> Sweep {
                         t.resumes += out.resumes;
                         t.crashes += out.crashes;
                     }
+                    // `IDEM_LIST=1`: each counted finding's schedule, by seed and track.
+                    if std::env::var("IDEM_LIST").is_ok_and(|v| v == "1")
+                        && out.relay + out.l1 + out.s1 > 0
+                    {
+                        for n in out.notes.iter().filter(|n| n.contains("finding:")) {
+                            eprintln!("FINDING seed {seed} {track:?}: {n}");
+                        }
+                    }
                     if !out.failures.is_empty() {
                         failure.lock().unwrap().get_or_insert(render(Some(seed), &sched, &out));
                         return;
