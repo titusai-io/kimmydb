@@ -832,9 +832,8 @@ impl ApiError {
     }
 
     /// `422 idempotency_key_reused` (B5): the key is remembered here for a
-    /// request whose fingerprint differs from this one's. The mapping of the
-    /// storage error that says so (`StorageError::IdempotencyKeyReused`) comes
-    /// with the storage half.
+    /// request whose fingerprint differs from this one's
+    /// (`StorageError::IdempotencyKeyReused`).
     pub fn idempotency_key_reused() -> Self {
         Self::new(
             StatusCode::UNPROCESSABLE_ENTITY,
@@ -847,9 +846,8 @@ impl ApiError {
 
     /// `409 idempotency_key_in_flight` (B5): a multi-chunk request with this
     /// key is running on this member. `Retry-After: 1`: the request ends by
-    /// itself, and the same request sent then is answered from its record.
-    /// Its storage error (`StorageError::IdempotencyKeyInFlight`) is mapped
-    /// with the storage half.
+    /// itself, and the same request sent then is answered from its record
+    /// (`StorageError::IdempotencyKeyInFlight`).
     pub fn idempotency_key_in_flight() -> Self {
         Self {
             retry_after_secs: Some(IDEMPOTENCY_KEY_IN_FLIGHT_RETRY_AFTER_SECS),
@@ -1089,12 +1087,12 @@ impl From<StorageError> for ApiError {
             // its own. Nothing was written, as with a busy writer, and this
             // node is going away: another member serves.
             StorageError::Stopping(reason) => ApiError::node_stopping(reason),
-            // The two answers a key can draw from the engine (B5),
-            // `StorageError::IdempotencyKeyReused` and `::IdempotencyKeyInFlight`,
-            // map to `ApiError::idempotency_key_reused` and
-            // `::idempotency_key_in_flight` here once the storage half that
-            // raises them is integrated; until then the engine raises neither.
-            //
+            // The two answers a key can draw from the engine (B5). Nothing was
+            // written either way: a key used for another request is the
+            // client's to fix, and a request still running with it ends by
+            // itself.
+            StorageError::IdempotencyKeyReused => ApiError::idempotency_key_reused(),
+            StorageError::IdempotencyKeyInFlight => ApiError::idempotency_key_in_flight(),
             // Storage-level failures are the server's fault, not the caller's,
             // and their text can name on-disk internals, so it is logged rather
             // than returned.

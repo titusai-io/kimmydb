@@ -708,10 +708,18 @@ impl KimmyMcp {
         ctx: RequestContext<RoleServer>,
     ) -> Result<CallToolResult, ErrorData> {
         let auth = principal(&ctx)?;
-        if let Err(e) = keyed(&self.state, "insert", &args.idempotency_key, &args) {
-            return render(Err(e));
-        }
-        render(exec::insert(&self.state, &auth, &args.database, &args.collection, &args.document))
+        let key = match keyed(&self.state, "insert", &args.idempotency_key, &args) {
+            Ok(key) => key,
+            Err(e) => return render(Err(e)),
+        };
+        render_answer(exec::insert(
+            &self.state,
+            &auth,
+            &args.database,
+            &args.collection,
+            &args.document,
+            key.as_ref(),
+        ))
     }
 
     /// Insert many documents at once.
@@ -725,15 +733,17 @@ impl KimmyMcp {
         ctx: RequestContext<RoleServer>,
     ) -> Result<CallToolResult, ErrorData> {
         let auth = principal(&ctx)?;
-        if let Err(e) = keyed(&self.state, "insert_many", &args.idempotency_key, &args) {
-            return render(Err(e));
-        }
-        render(exec::insert_many(
+        let key = match keyed(&self.state, "insert_many", &args.idempotency_key, &args) {
+            Ok(key) => key,
+            Err(e) => return render(Err(e)),
+        };
+        render_answer(exec::insert_many(
             &self.state,
             &auth,
             &args.database,
             &args.collection,
             &args.documents,
+            key.as_ref(),
         ))
     }
 
@@ -751,9 +761,10 @@ impl KimmyMcp {
         ctx: RequestContext<RoleServer>,
     ) -> Result<CallToolResult, ErrorData> {
         let auth = principal(&ctx)?;
-        if let Err(e) = keyed(&self.state, "update", &args.idempotency_key, &args) {
-            return render(Err(e));
-        }
+        let key = match keyed(&self.state, "update", &args.idempotency_key, &args) {
+            Ok(key) => key,
+            Err(e) => return render(Err(e)),
+        };
         // `explain` is not surfaced to an agent: `find` already offers it for
         // working out whether an index applies, and a write is not the place
         // to go looking.
@@ -764,13 +775,14 @@ impl KimmyMcp {
             if_stamp: None,
             array_filters: args.array_filters,
         };
-        render(exec::update(
+        render_answer(exec::update(
             &self.state,
             &auth,
             &args.database,
             &args.collection,
             &args.update,
             params,
+            key.as_ref(),
         ))
     }
 
@@ -783,9 +795,10 @@ impl KimmyMcp {
         ctx: RequestContext<RoleServer>,
     ) -> Result<CallToolResult, ErrorData> {
         let auth = principal(&ctx)?;
-        if let Err(e) = keyed(&self.state, "delete", &args.idempotency_key, &args) {
-            return render(Err(e));
-        }
+        let key = match keyed(&self.state, "delete", &args.idempotency_key, &args) {
+            Ok(key) => key,
+            Err(e) => return render(Err(e)),
+        };
         let params = exec::WriteParams {
             filter: args.filter,
             multi: args.multi,
@@ -793,7 +806,14 @@ impl KimmyMcp {
             if_stamp: None,
             array_filters: Vec::new(),
         };
-        render(exec::delete(&self.state, &auth, &args.database, &args.collection, params))
+        render_answer(exec::delete(
+            &self.state,
+            &auth,
+            &args.database,
+            &args.collection,
+            params,
+            key.as_ref(),
+        ))
     }
 
     /// Create a collection.

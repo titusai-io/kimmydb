@@ -15,8 +15,9 @@
 //! Each `render` is pure: no state, no clock, no engine. An optional field
 //! appears only when it is set, which is what keeps a write without a key
 //! answering byte for byte as it did before keys existed: `stamp` when the
-//! write produced one to name, and `skipped` and `resumed` only on a request
-//! that resumed after it had stopped.
+//! write produced one to name, `skipped` only when a keyed request left a
+//! match, and `resumed` only on a keyed request that resumed after it had
+//! stopped.
 
 use bson::{Bson, Document};
 use kimmy_core::Stamp;
@@ -108,23 +109,22 @@ impl DeleteByIdOutcome {
     }
 }
 
-/// What a resumed keyed request adds to its counts (B5): the matches it left
-/// because they changed after the request's first write, by this request on
-/// another member or by another write. Cumulative across the request's
-/// attempts, and counted here rather than in `matched`.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub struct Resumed {
-    pub skipped: u64,
-}
-
-impl Resumed {
-    /// `skipped` and `resumed: true`, after every other field, so a body
-    /// without them is exactly the body of a request that never resumed.
-    fn append(this: Option<&Self>, body: &mut Value) {
-        if let Some(resumed) = this {
-            body["skipped"] = json!(resumed.skipped);
-            body["resumed"] = json!(true);
-        }
+/// What a keyed request adds to a filtered write's answer (B5), after every
+/// other field, so an unkeyed request's body is exactly what it always was:
+///
+/// - `skipped`, whenever it is above 0: the matches the request left because
+///   they changed after its first write, by an attempt of it on another member
+///   or by another write. Counted here and not in `matched`. A fresh attempt
+///   can leave some too, since every chunk after the first applies the rule
+///   once the request's record exists.
+/// - `resumed: true`, only when an attempt of the request resumed one that had
+///   stopped; the counts are then cumulative over every attempt.
+fn append_keyed(skipped: u64, resumed: bool, body: &mut Value) {
+    if skipped > 0 {
+        body["skipped"] = json!(skipped);
+    }
+    if resumed {
+        body["resumed"] = json!(true);
     }
 }
 
@@ -138,8 +138,10 @@ pub struct UpdateOutcome {
     /// The version the single-document form wrote; never set for `multi`,
     /// which names no single version (ADR-084).
     pub stamp: Option<Stamp>,
-    /// Set when an attempt of the request resumed (B5).
-    pub resumed: Option<Resumed>,
+    /// Matches a keyed request left by the stamp rule (B5); 0 for any other.
+    pub skipped: u64,
+    /// An attempt of this keyed request resumed one that had stopped (B5).
+    pub resumed: bool,
 }
 
 impl UpdateOutcome {
@@ -152,7 +154,7 @@ impl UpdateOutcome {
         if let Some(stamp) = self.stamp {
             body["stamp"] = json!(stamp.encode());
         }
-        Resumed::append(self.resumed.as_ref(), &mut body);
+        append_keyed(self.skipped, self.resumed, &mut body);
         body
     }
 }
@@ -164,7 +166,8 @@ pub struct DeleteOutcome {
     pub deleted: u64,
     pub commits: u64,
     pub stamp: Option<Stamp>,
-    pub resumed: Option<Resumed>,
+    pub skipped: u64,
+    pub resumed: bool,
 }
 
 impl DeleteOutcome {
@@ -173,7 +176,7 @@ impl DeleteOutcome {
         if let Some(stamp) = self.stamp {
             body["stamp"] = json!(stamp.encode());
         }
-        Resumed::append(self.resumed.as_ref(), &mut body);
+        append_keyed(self.skipped, self.resumed, &mut body);
         body
     }
 }
@@ -448,14 +451,16 @@ mod tests {
                         modified,
                         commits,
                         stamp: single_stamp(multi, &storage),
-                        resumed: None,
+                        skipped: 0,
+                        resumed: false,
                     };
                     assert_eq!(bytes(&update.render()), bytes(&legacy_update(multi, &storage)));
                     let delete = DeleteOutcome {
                         deleted: modified,
                         commits,
                         stamp: single_stamp(multi, &storage),
-                        resumed: None,
+                        skipped: 0,
+                        resumed: false,
                     };
                     assert_eq!(bytes(&delete.render()), bytes(&legacy_delete(multi, &storage)));
                 }
@@ -464,34 +469,41 @@ mod tests {
     }
 
     #[test]
-    fn a_resumed_request_adds_skipped_and_resumed_after_everything_else() {
+    fn a_keyed_request_adds_skipped_and_resumed_after_everything_else() {
         let update = UpdateOutcome {
             matched: 7,
             modified: 6,
             commits: 3,
             stamp: None,
-            resumed: Some(Resumed { skipped: 2 }),
+            skipped: 2,
+            resumed: true,
         };
         assert_eq!(
             bytes(&update.render()),
             r#"{"matched":7,"modified":6,"commits":3,"skipped":2,"resumed":true}"#
         );
-        // Zero skipped still says it resumed: the field is the answer's, not a
-        // count that happens to be nonzero.
+        // A resumed request that left nothing says it resumed, and nothing of
+        // what it did not skip.
         let delete = DeleteOutcome {
             deleted: 4,
             commits: 2,
             stamp: Some(stamp(1)),
-            resumed: Some(Resumed { skipped: 0 }),
+            skipped: 0,
+            resumed: true,
         };
         assert_eq!(
             bytes(&delete.render()),
             format!(
-                r#"{{"deleted":4,"commits":2,"stamp":"{}","skipped":0,"resumed":true}}"#,
+                r#"{{"deleted":4,"commits":2,"stamp":"{}","resumed":true}}"#,
                 stamp(1).encode()
             )
         );
-        // And without it, neither field.
+        // A fresh attempt whose later chunk left a match changed by another
+        // attempt counts it, and did not resume.
+        let fresh =
+            UpdateOutcome { matched: 3, modified: 3, commits: 2, skipped: 1, ..Default::default() };
+        assert_eq!(bytes(&fresh.render()), r#"{"matched":3,"modified":3,"commits":2,"skipped":1}"#);
+        // And without either, neither field: an unkeyed request's body.
         let plain = UpdateOutcome { matched: 7, modified: 6, commits: 3, ..Default::default() };
         let text = bytes(&plain.render());
         assert!(!text.contains("skipped") && !text.contains("resumed"), "{text}");

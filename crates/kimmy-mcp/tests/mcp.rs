@@ -1919,8 +1919,10 @@ async fn the_write_tools_take_a_well_formed_key_and_refuse_a_malformed_one() {
         }
     }
     assert_eq!(documents().await, before, "no refused call wrote anything");
-    for (tool, arguments) in keyed_calls() {
-        let done = server.call_ok(&root, tool, with_key(arguments, KEY)).await;
+    // A key of its own for each call: one key names one request.
+    for (i, (tool, arguments)) in keyed_calls().into_iter().enumerate() {
+        let key = format!("tool-{i:02}-6f1c0e52-8a1d-4f53");
+        let done = server.call_ok(&root, tool, with_key(arguments, &key)).await;
         assert!(done.is_object(), "{tool}: {done}");
     }
 }

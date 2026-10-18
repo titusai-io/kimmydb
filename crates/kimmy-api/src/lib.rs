@@ -148,7 +148,6 @@ pub fn state_with_policies(
         local_login: std::sync::OnceLock::new(),
         expiry_off: std::sync::OnceLock::new(),
         idempotency_gate: std::sync::OnceLock::new(),
-        idempotency_window_secs: std::sync::OnceLock::new(),
     }))
 }
 

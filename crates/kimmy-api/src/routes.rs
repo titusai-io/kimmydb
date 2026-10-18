@@ -14,7 +14,7 @@ use tracing_opentelemetry::OpenTelemetrySpanExt;
 
 use crate::error::ApiError;
 use crate::exec;
-use crate::idempotency::{KeyedJson, KeyedNoBody};
+use crate::idempotency::{KeyedJson, KeyedNoBody, WriteAnswer};
 use crate::json::{JsonBody, QueryParams};
 use crate::limits::RequestLimits;
 use crate::ratelimit::{self, Decision};
@@ -65,15 +65,16 @@ pub fn router_with_limits(
         // default is exactly what axum applied when nothing set one, so an
         // operator who never touches the setting sees no change (ADR-099).
         .layer(axum::extract::DefaultBodyLimit::max(limits.max_body_bytes))
-        // Which routes take `Idempotency-Key`, and whether this member takes it
-        // now (B5). Here, over the merged table, rather than inside `routes()`
+        // Which routes take `Idempotency-Key`, and whether its value is one
+        // (B5). Here, over the merged table, rather than inside `routes()`
         // beside the query-string guard, so that `/mcp`, merged above, refuses
         // the header too: an MCP client keys a tool call by its argument, and a
         // header on the transport would otherwise be read as nothing. Inside
         // the catching-up gate, so a member that is behind answers `503`
         // first, as it does for every other refusal; inside the count, so the
-        // `400` is counted and traced.
-        .layer(axum::middleware::from_fn_with_state(state.clone(), idempotency_guard))
+        // `400` is counted and traced. Whether this member takes keys now is
+        // the keyed routes' own question, asked after authentication.
+        .layer(axum::middleware::from_fn(idempotency_guard))
         // A member that is catching up refuses every route but the four an
         // operator or a client's routing needs (ADR-202), over the whole table
         // including `/mcp`, which is merged above. Inside the drain below, so a
@@ -333,32 +334,31 @@ pub fn takes_idempotency_key(method: &str, route: &str) -> bool {
     IDEMPOTENT_ROUTES.iter().any(|(m, r)| *m == method && *r == route)
 }
 
-/// Refuse `Idempotency-Key` where it is not taken, and everywhere while this
-/// member does not take it (B5). Three refusals, each a `400 bad_request` that
-/// names the header, in this order:
+/// Refuse `Idempotency-Key` where it is not taken (B5). Two refusals, each a
+/// `400 bad_request` that names the header, in this order:
 ///
 /// 1. on a route outside [`IDEMPOTENT_ROUTES`], `/mcp` included: this route
 ///    does not take one;
 /// 2. a value that is not one well-formed key on one field line, with what is
-///    wrong with it and the published format;
-/// 3. while the gate is closed ([`crate::AppState::idempotency_gate`]): the
-///    switch `cluster.idempotency_keys` when it is off, otherwise the live
-///    member that does not carry records. Counted as
-///    `kimmy_idempotency_requests_total{outcome="gated"}`.
+///    wrong with it and the published format.
 ///
 /// A request without the header passes untouched, and so does one that matched
 /// no route, to the `404` it is about to get. The decision is made on the
 /// matched route template, as [`refuse_unread_query_string`]'s is.
 ///
-/// # It answers before authentication
+/// # It answers before authentication, and the gate does not
 ///
 /// As the query-string guard does, and for the same reasons: it reads the
 /// header and the route template, examines no credential and touches nothing,
-/// so `POST …/find` with the header and no token is `400`, not `401`. The gate's
-/// refusal names a live member by its node id, which `/readyz` already tells an
-/// unauthenticated caller about members this node waits on.
+/// so `POST …/find` with the header and no token is `400`, not `401`; nothing
+/// in either refusal is more than the route table `docs/openapi.yaml`
+/// publishes and the caller's own header. Whether this member takes keys now
+/// (the gate, [`crate::AppState::idempotency_gate`]) is asked after
+/// authentication instead, by the keyed route's own extractor
+/// ([`crate::idempotency::KeyedJson`]): its refusal can name a live member, and
+/// a caller with no token learns nothing about the cluster from a key it sends,
+/// but the `401` it would have had anyway.
 pub async fn idempotency_guard(
-    State(state): State<SharedState>,
     request: axum::extract::Request,
     next: axum::middleware::Next,
 ) -> axum::response::Response {
@@ -379,10 +379,6 @@ pub async fn idempotency_guard(
     }
     if let Err(refused) = crate::idempotency::key_from_headers(request.headers()) {
         return refused.into_response();
-    }
-    if let Err(closed) = state.idempotency_gate() {
-        state.metrics.record_idempotency(crate::idempotency::KeyedOutcome::Gated);
-        return ApiError::bad_request(closed.to_string()).into_response();
     }
     next.run(request).await
 }
@@ -1141,9 +1137,9 @@ async fn insert_doc(
     State(state): State<SharedState>,
     auth: Auth,
     Path((db, coll)): Path<(String, String)>,
-    KeyedJson { body, key: _ }: KeyedJson<Value>,
-) -> Result<Json<Value>, ApiError> {
-    Ok(Json(exec::insert(&state, &auth, &db, &coll, &body)?))
+    KeyedJson { body, key }: KeyedJson<Value>,
+) -> Result<WriteAnswer, ApiError> {
+    exec::insert(&state, &auth, &db, &coll, &body, key.as_ref())
 }
 
 /// Insert an array of documents in one commit.
@@ -1159,9 +1155,9 @@ async fn bulk_insert_docs(
     // than the `Result<Json<_>, JsonRejection>` this route used to spell out:
     // the envelope comes from the extractor, so it is not something eighteen
     // other handlers can forget.
-    KeyedJson { body: documents, key: _ }: KeyedJson<Vec<Value>>,
-) -> Result<Json<Value>, ApiError> {
-    Ok(Json(exec::insert_many(&state, &auth, &db, &coll, &documents)?))
+    KeyedJson { body: documents, key }: KeyedJson<Vec<Value>>,
+) -> Result<WriteAnswer, ApiError> {
+    exec::insert_many(&state, &auth, &db, &coll, &documents, key.as_ref())
 }
 
 #[derive(Deserialize, Default)]
@@ -1319,10 +1315,10 @@ async fn replace_doc(
     auth: Auth,
     Path((db, coll, id)): Path<(String, String, String)>,
     QueryParams(q): QueryParams<ReplaceQuery>,
-    KeyedJson { body, key: _ }: KeyedJson<Value>,
-) -> Result<Json<Value>, ApiError> {
+    KeyedJson { body, key }: KeyedJson<Value>,
+) -> Result<WriteAnswer, ApiError> {
     let params = exec::ReplaceParams { upsert: q.upsert, if_stamp: q.if_stamp };
-    Ok(Json(exec::replace(&state, &auth, &db, &coll, &id, &body, params)?))
+    exec::replace(&state, &auth, &db, &coll, &id, &body, params, key.as_ref())
 }
 
 #[derive(Deserialize, Default)]
@@ -1337,9 +1333,9 @@ async fn delete_doc(
     auth: Auth,
     Path((db, coll, id)): Path<(String, String, String)>,
     QueryParams(q): QueryParams<DeleteQuery>,
-    KeyedNoBody(_key): KeyedNoBody,
-) -> Result<Json<Value>, ApiError> {
-    Ok(Json(exec::delete_by_id(&state, &auth, &db, &coll, &id, q.if_stamp.as_deref())?))
+    KeyedNoBody(key): KeyedNoBody,
+) -> Result<WriteAnswer, ApiError> {
+    exec::delete_by_id(&state, &auth, &db, &coll, &id, q.if_stamp.as_deref(), key.as_ref())
 }
 
 #[derive(Deserialize)]
@@ -1375,8 +1371,8 @@ async fn find_and_modify(
     State(state): State<SharedState>,
     auth: Auth,
     Path((db, coll)): Path<(String, String)>,
-    KeyedJson { body, key: _ }: KeyedJson<FindAndModifyRequest>,
-) -> Result<Json<Value>, ApiError> {
+    KeyedJson { body, key }: KeyedJson<FindAndModifyRequest>,
+) -> Result<WriteAnswer, ApiError> {
     let return_document = match body.return_document.as_deref() {
         None | Some("before") => exec::ReturnDocument::Before,
         Some("after") => exec::ReturnDocument::After,
@@ -1398,7 +1394,7 @@ async fn find_and_modify(
         if_stamp: body.if_stamp,
         array_filters: body.array_filters,
     };
-    Ok(Json(exec::find_and_modify(&state, &auth, &db, &coll, spec)?))
+    exec::find_and_modify(&state, &auth, &db, &coll, spec, key.as_ref())
 }
 
 #[derive(Deserialize)]
@@ -1425,10 +1421,7 @@ async fn update_docs(
     auth: Auth,
     Path((db, coll)): Path<(String, String)>,
     KeyedJson { body, key }: KeyedJson<UpdateRequest>,
-) -> Result<Json<Value>, ApiError> {
-    if key.is_some() && body.explain {
-        return Err(crate::idempotency::refused_with_explain());
-    }
+) -> Result<WriteAnswer, ApiError> {
     let params = exec::WriteParams {
         filter: body.filter,
         multi: body.multi,
@@ -1436,7 +1429,7 @@ async fn update_docs(
         if_stamp: body.if_stamp,
         array_filters: body.array_filters,
     };
-    Ok(Json(exec::update(&state, &auth, &db, &coll, &body.update, params)?))
+    exec::update(&state, &auth, &db, &coll, &body.update, params, key.as_ref())
 }
 
 #[derive(Deserialize)]
@@ -1459,10 +1452,7 @@ async fn delete_docs(
     auth: Auth,
     Path((db, coll)): Path<(String, String)>,
     KeyedJson { body, key }: KeyedJson<DeleteRequest>,
-) -> Result<Json<Value>, ApiError> {
-    if key.is_some() && body.explain {
-        return Err(crate::idempotency::refused_with_explain());
-    }
+) -> Result<WriteAnswer, ApiError> {
     let params = exec::WriteParams {
         filter: body.filter,
         multi: body.multi,
@@ -1470,7 +1460,7 @@ async fn delete_docs(
         if_stamp: body.if_stamp,
         array_filters: Vec::new(),
     };
-    Ok(Json(exec::delete(&state, &auth, &db, &coll, params)?))
+    exec::delete(&state, &auth, &db, &coll, params, key.as_ref())
 }
 
 // ---------------------------------------------------------------------------

@@ -228,8 +228,10 @@ async fn every_route_that_takes_the_header_accepts_a_well_formed_key() {
         kimmy_api::routes::IDEMPOTENT_ROUTES.iter().copied().collect();
     assert_eq!(covered, listed, "this test drives every listed route and nothing else");
 
-    for (method, _, path, body) in routes {
-        let mut req = Req::key(KEY);
+    // A key of its own for each: one key names one request, and the same key
+    // on another route of this collection is a key reused.
+    for (i, (method, _, path, body)) in routes.into_iter().enumerate() {
+        let mut req = Req::key(&format!("\"route-{i:02}-6f1c0e52-8a1d-4f53\""));
         if let Some(body) = &body {
             req = req.json(body);
         }
@@ -461,6 +463,19 @@ async fn with_the_switch_off_a_key_is_refused_naming_the_switch() {
     assert_eq!(node.count().await, 2, "nothing was written");
     assert!(!node.capabilities().await.contains(&"idempotency-keys".to_string()));
 
+    // The gate is asked after authentication: a caller with no token is told
+    // it has none, and learns nothing of the cluster from the key it sent.
+    for (method, _, path, body) in keyed_routes() {
+        let mut req = Req { anonymous: true, ..Req::key(KEY) };
+        if let Some(body) = &body {
+            req = req.json(body);
+        }
+        let answer = node.send(method, path, req).await;
+        assert_eq!(answer.status, 401, "{method} {path}: {}", answer.text);
+        assert!(!answer.text.contains("cluster.idempotency_keys"), "{}", answer.text);
+    }
+    assert_eq!(node.gated_count().await, before + 7, "an unauthenticated request is not gated");
+
     // The route refusal and the syntax refusal still say what they say: the
     // gate is asked only of a well-formed key on a route that takes one.
     let answer =
@@ -587,8 +602,10 @@ async fn the_fingerprint_is_taken_over_the_request_as_sent() {
     use kimmy_api::idempotency::{KeyedJson, KeyedNoBody, fingerprint};
     use tower::ServiceExt as _;
 
-    fn hex(bytes: [u8; 32]) -> String {
-        bytes.iter().map(|b| format!("{b:02x}")).collect()
+    // The extractors ask the gate, so they are routed with a node's state.
+    let node = node().await;
+    fn hex(fingerprint: kimmy_api::idempotency::Fingerprint) -> String {
+        fingerprint.0.iter().map(|b| format!("{b:02x}")).collect()
     }
     let app = axum::Router::new()
         .route(
@@ -602,7 +619,8 @@ async fn the_fingerprint_is_taken_over_the_request_as_sent() {
             delete(|KeyedNoBody(key): KeyedNoBody| async move {
                 key.map(|k| hex(k.fingerprint)).unwrap_or_default()
             }),
-        );
+        )
+        .with_state(std::sync::Arc::clone(&node.state));
     let send = |method: &str, uri: &str, body: &[u8]| {
         let request = axum::http::Request::builder()
             .method(method)
