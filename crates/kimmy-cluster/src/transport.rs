@@ -125,18 +125,24 @@ pub(crate) fn records_of(
 static TEST_STRIP_RECORDS: std::sync::RwLock<Vec<kimmy_core::NodeId>> =
     std::sync::RwLock::new(Vec::new());
 
+/// Whether any member is listed in [`TEST_STRIP_RECORDS`]: a release never arms
+/// it, so the per-frame check is one relaxed load and no lock.
+static TEST_STRIP_ARMED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
 /// Make each of `nodes` serve its windows, pushes, replays and snapshot pages
 /// without idempotency records, as an older release does. A test switch.
 #[doc(hidden)]
 pub fn set_test_strip_records(nodes: Vec<kimmy_core::NodeId>) {
     if let Ok(mut stripped) = TEST_STRIP_RECORDS.write() {
+        TEST_STRIP_ARMED.store(!nodes.is_empty(), std::sync::atomic::Ordering::Relaxed);
         *stripped = nodes;
     }
 }
 
 /// Whether `node` serves without records ([`set_test_strip_records`]).
 pub(crate) fn strips_records(node: kimmy_core::NodeId) -> bool {
-    TEST_STRIP_RECORDS.read().is_ok_and(|stripped| stripped.contains(&node))
+    TEST_STRIP_ARMED.load(std::sync::atomic::Ordering::Relaxed)
+        && TEST_STRIP_RECORDS.read().is_ok_and(|stripped| stripped.contains(&node))
 }
 
 /// The records `engine` sends with a frame: none from a member a test has made
