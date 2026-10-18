@@ -1075,6 +1075,8 @@ impl Engine {
                     // transaction: point reads, since the key walk passed over
                     // what the requester holds and a range would read past it.
                     let shipped: Vec<Stamp> = window.entries.iter().map(|e| e.stamp).collect();
+                    #[cfg(test)]
+                    race_hooks::reach(race_hooks::Race::WindowRecords);
                     window.records = crate::idempotency::records_at_stamps(&txn, &shipped)?;
                     return Ok(window);
                 }
@@ -1100,6 +1102,8 @@ impl Engine {
         if let (Some(first), Some(last)) = (window.entries.first(), window.entries.last()) {
             let shipped: std::collections::HashSet<Stamp> =
                 window.entries.iter().map(|e| e.stamp).collect();
+            #[cfg(test)]
+            race_hooks::reach(race_hooks::Race::WindowRecords);
             window.records =
                 crate::idempotency::records_for_window(&txn, first.stamp, last.stamp, &|stamp| {
                     shipped.contains(stamp)
@@ -3275,6 +3279,12 @@ pub(crate) mod race_hooks {
         /// A document repair's page has been taken and judged to apply, and has not yet taken
         /// the writer: a retention pass can commit between a plan and the page.
         ConvergePage,
+        /// A peer window has been read, and its idempotency records not yet (B5): not a
+        /// race, a point to show they are read in the window's own transaction.
+        WindowRecords,
+        /// A keyed insert has committed, and not yet published (B5): not a race, the point
+        /// a pull between the write and anything after it reads.
+        KeyedCommitted,
     }
 
     type Hook = Box<dyn FnOnce()>;

@@ -6192,6 +6192,37 @@ mod tests {
         io::Error::from_raw_os_error(24)
     }
 
+    /// A frame counts the idempotency records its entries carry (B5): a window
+    /// whose entries fit alone is cut where an entry and the record riding with
+    /// it no longer do, and a record riding with no entry of the frame costs it
+    /// nothing.
+    #[test]
+    fn a_frame_counts_the_records_its_entries_carry() {
+        use kimmy_core::{CollectionId, DocId, Hlc, NodeId, OpKind, ScopeHash, Stamp};
+        let at = |ms: u64| Stamp::new(Hlc::new(ms, 0), NodeId::from_bytes([1; 16]));
+        let entry = |ms: u64, size: usize| OplogEntry {
+            stamp: at(ms),
+            kind: OpKind::Insert,
+            collection: CollectionId(1),
+            doc_id: Some(DocId::Int64(ms as i64)),
+            body: Some(vec![0; size]),
+        };
+        let third = ENTRY_BUDGET / 3;
+        let entries = vec![entry(1, third), entry(2, third)];
+        assert!(matches!(how_many_fit(&entries, &[]), Fits::All), "premise: they fit alone");
+        let record = kimmy_storage::CarriedRecord {
+            collection: CollectionId(1),
+            scope: ScopeHash([1; 32]),
+            carrying: Some(at(2)),
+            record: vec![0; third + third / 2],
+        };
+        assert!(matches!(how_many_fit(&entries, std::slice::from_ref(&record)), Fits::Only(1)));
+        let first = kimmy_storage::CarriedRecord { carrying: Some(at(1)), ..record.clone() };
+        assert!(matches!(how_many_fit(&entries, &[first]), Fits::Only(1)));
+        let stray = kimmy_storage::CarriedRecord { carrying: Some(at(3)), ..record };
+        assert!(matches!(how_many_fit(&entries, &[stray]), Fits::All));
+    }
+
     /// The keys on a snapshot page and in the cut digest's uncovered lists are converted
     /// between the stored and the legacy (schema-4) form at the engine's wire API and
     /// nowhere else (Decimal128 design 7.1, review v2.3-delta M2): `snapshot_page`,

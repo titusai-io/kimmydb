@@ -200,19 +200,43 @@ pub struct SnapshotCursor {
     #[serde(
         default,
         skip_serializing_if = "Option::is_none",
+        serialize_with = "records_at_binary",
         deserialize_with = "lenient_records_at"
     )]
     pub records: Option<Vec<u8>>,
 }
 
-/// A cursor's records position, read leniently: a binary is the position, and
-/// anything else is none, the documents phase.
+/// A cursor's records position on the wire: a binary, which is what
+/// [`lenient_records_at`] reads back (a bare `Vec<u8>` would go as an array of
+/// integers, read back as no position).
+fn records_at_binary<S: serde::Serializer>(
+    at: &Option<Vec<u8>>,
+    serializer: S,
+) -> std::result::Result<S::Ok, S::Error> {
+    match at {
+        Some(bytes) => serializer.serialize_some(serde_bytes::Bytes::new(bytes)),
+        None => serializer.serialize_none(),
+    }
+}
+
+/// A cursor's records position, read leniently: a binary (the wire's BSON) or
+/// an array of bytes (the JSON a requester persists its progress in,
+/// `SNAPSHOT_PROGRESS`) is the position, and anything else is none, the
+/// documents phase.
 fn lenient_records_at<'de, D: serde::Deserializer<'de>>(
     deserializer: D,
 ) -> std::result::Result<Option<Vec<u8>>, D::Error> {
     let raw = Option::<bson::Bson>::deserialize(deserializer)?;
     Ok(match raw {
         Some(bson::Bson::Binary(binary)) => Some(binary.bytes),
+        Some(bson::Bson::Array(items)) => items
+            .iter()
+            .map(|item| match item {
+                bson::Bson::Int32(n) => u8::try_from(*n).ok(),
+                bson::Bson::Int64(n) => u8::try_from(*n).ok(),
+                _ => None,
+            })
+            .collect(),
         _ => None,
     })
 }

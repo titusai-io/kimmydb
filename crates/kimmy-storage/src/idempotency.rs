@@ -1417,10 +1417,12 @@ impl Engine {
                     Some(raw) => match IdempotencyRecord::decode(raw.value()) {
                         Ok(Some(record)) => record.last <= stamp,
                         // A record this build cannot read (a newer format, or
-                        // damage) has no `last` it can age by, and is absent to
-                        // every lookup and overwritten by every store here. It
-                        // goes with the first of its rows to expire: kept past
-                        // that, nothing would ever find it again.
+                        // damage) has no `last` it can age by, and nothing here
+                        // finds its other rows (they are keyed by stamp alone).
+                        // It is aged by the stamp of this row, the first of its
+                        // rows to expire, which is never after its `last`: it
+                        // does not outlive the window. Here it is absent to
+                        // every lookup and overwritten by every store anyway.
                         Ok(None) | Err(_) => true,
                     },
                     None => false,
