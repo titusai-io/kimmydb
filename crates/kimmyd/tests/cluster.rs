@@ -5205,12 +5205,13 @@ async fn lab_hook_a_fresh_keyed_multi_update_skips_what_others_wrote_between_its
 /// T2 of finding G1 over real processes: a keyed request's effect reaches a member
 /// under another origin, from a relay that cannot vouch for the request's own
 /// stamp, while the request's origin and the member that wrote on top of it are
-/// down. Y's keyed `$inc` reaches Z; X, cut off from both, writes the document
-/// later; Z writes on top of the `$inc`. X then pulls Z: the `$inc` loses to X's
-/// write (stored, not appended, so X's vector stays below it) and Z's version
-/// wins. With Y and Z down, M pulls X alone and takes Z's version, which holds the
-/// `$inc`; the record comes with it, as one X cannot vouch for by its oplog, and a
-/// retry on M is answered from it.
+/// down. M dials only X throughout (`KIMMY_TEST_REFUSE_DIAL` names Y and Z). Y's
+/// keyed `$inc` reaches Z; X, cut off from both, writes the document later; Z
+/// writes on top of the `$inc`. X then pulls Z: the `$inc` loses to X's write
+/// (stored, not appended, so X's vector stays below it) and Z's version wins.
+/// With Y and Z down, M takes Z's version from X, which holds the `$inc`; the
+/// record comes with it, as one X cannot vouch for by its oplog, and a retry on M
+/// is answered from it.
 #[tokio::test]
 #[ignore = "boots a real four-node cluster; run with --ignored"]
 async fn t2_a_cross_origin_relay_carries_the_record_while_its_origin_is_down() {
@@ -5222,10 +5223,13 @@ async fn t2_a_cross_origin_relay_carries_the_record_while_its_origin_is_down() {
     let y = Node::spawn_configured("node-y", py, &[pz], "", 1, KEYED);
     let z = Node::spawn_configured("node-z", pz, &[py], "", 1, KEYED);
     let x = Node::spawn_configured("node-x", px, &[py], "", 1, KEYED);
-    let m = Node::spawn_configured("node-m", pm, &[py], "", 1, KEYED);
+    let mut m = Node::spawn_configured("node-m", pm, &[py], "", 1, KEYED);
     for node in [&y, &z, &x, &m] {
         node.wait_ready(&client).await;
     }
+    let refused = format!("127.0.0.1:{py},127.0.0.1:{pz}");
+    m.restart_with(&[("KIMMY_TEST_REFUSE_DIAL", refused.as_str())]);
+    m.wait_ready(&client).await;
     eventually("gossip to form", || all_report(&client, vec![&y, &z, &x, &m], 3)).await;
     let t = [
         y.login(&client).await,
@@ -5263,16 +5267,16 @@ async fn t2_a_cross_origin_relay_carries_the_record_while_its_origin_is_down() {
         async move { request.send().await.unwrap().status() }
     };
 
-    // Y's keyed `$inc` reaches Z, and neither X nor M. Y takes a key again once
-    // it no longer counts the two it cannot hear (their blocks go stale, then
-    // SWIM declares them down).
+    // Y's keyed `$inc` reaches Z, and not X (stopped) nor M (which dials only X).
+    // Y takes a key again once it no longer counts X (its block goes stale, then
+    // SWIM declares it down).
     x.signal("STOP");
-    m.signal("STOP");
-    eventually("Y to take keys with X and M down", || takes_keys(&client, &y)).await;
+    eventually("Y to take keys with X down", || takes_keys(&client, &y)).await;
     let first = keyed_send(&client, &y, &t[0], reqwest::Method::POST, PATH, BODY, KEY).await;
     assert_eq!((first.status, first.replayed), (200, false), "{}", first.text);
     eventually("Z to take the $inc", || async { n_of(&client, &z, &t[1], 1).await == Some(11) })
         .await;
+    assert_eq!(n_of(&client, &m, &t[3], 1).await, Some(10), "premise: M has not");
     // X, cut off from Y and Z, writes the document after the `$inc`.
     y.signal("STOP");
     z.signal("STOP");
@@ -5286,15 +5290,13 @@ async fn t2_a_cross_origin_relay_carries_the_record_while_its_origin_is_down() {
     x.signal("CONT");
     eventually("Z's version on X", || async { n_of(&client, &x, &t[2], 1).await == Some(11) })
         .await;
-    // Y and Z down: M hears X alone.
+    // Y and Z down: M takes Z's version from X, the one member it dials.
     z.signal("STOP");
-    m.signal("CONT");
     eventually("M to take Z's version from X", || async {
         n_of(&client, &m, &t[3], 1).await == Some(11)
     })
     .await;
     eventually("M to take keys with Y and Z down", || takes_keys(&client, &m)).await;
-    assert_eq!(n_of(&client, &m, &t[3], 1).await, Some(11), "premise: M still holds Z's version");
     let retry = keyed_send(&client, &m, &t[3], reqwest::Method::POST, PATH, BODY, KEY).await;
     assert_eq!(retry.status, 200, "{}", retry.text);
     assert!(retry.replayed, "answered from the record X relayed: {retry:?}");
