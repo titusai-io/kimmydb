@@ -642,7 +642,9 @@ adds two lines, neither a fault:
 Its refusals log through `request failed` at the levels above
 (`idempotency_key_reused` and `idempotency_key_in_flight` at `INFO`); the gate's
 `400` is a `bad_request`, which writes no line, and is counted as
-`kimmy_idempotency_requests_total{outcome="gated"}`. There is no new `WARN`.
+`kimmy_idempotency_requests_total{outcome="gated"}`. The retention pass's
+`collected expired records` line gains `idempotency_records`, the records it
+removed, so a pass that removed only records still logs. There is no new `WARN`.
 
 #### A start that rebuilds the live document counts
 
@@ -871,7 +873,9 @@ write is present, and it replicates. Its client learns this in one of two ways.
   inside another thread's reporting window, as above.
 
 Either way the write **may or may not have happened**. Clients must read it back
-before resending it, unless it is idempotent: see
+before resending it, unless it is idempotent or was sent with an
+`Idempotency-Key`, which a client resends with the same key, to the same member
+once it serves again: see
 [retrying after an unknown outcome](clients.md#retrying-after-an-unknown-outcome).
 `outcome_unknown` is logged at `ERROR`.
 
@@ -2433,7 +2437,12 @@ one keystroke between recovering and corrupting a cluster's identity space.
 Documents, collection and index metadata, secondary index entries, the oplog and
 its arrival index, tombstones for deleted documents, dropped collections and
 dropped indexes, the **servable** version vector, the user store, the node
-id, and the holes a snapshot left ([a member that took a snapshot](#a-member-that-took-a-snapshot-and-what-it-will-not-serve), which are `META` rows).
+id, the holes a snapshot left ([a member that took a snapshot](#a-member-that-took-a-snapshot-and-what-it-will-not-serve), which are `META` rows),
+and, from 0.52.0, the idempotency records and their rows by stamp (tags 12 and
+13), so a restored member keeps the records of the writes it holds and a retry
+there replays rather than applying on top of a write the backup brought back
+([ADR-240](decisions.md)). A backup that holds a record cannot be restored by
+0.51.x or earlier.
 
 **Not everything the node holds.** Three tables are deliberately left out
 because each is node-local and re-derived when the database is opened: the
@@ -2897,6 +2906,8 @@ defaults rolls back untouched.
 **Rolling back from 0.47.1 to 0.47.0 needs nothing:** the store, the wire and the configuration are the same, and the release changes only a log level and where a change stream starts.
 
 **Rolling back from 0.51.0 to 0.50.x or 0.49.x needs the backup taken before the upgrade.** Storage schema 5 is a rollback boundary ([ADR-238](decisions.md)): from the moment a 0.51.0 start raises `kimmy.format` to schema 5, just before its migration's first commit, 0.50 and 0.49 refuse the store, an interrupted migration's included: `kimmy.redb` and `kimmy.format` are left bytewise as they were and no file is added or removed, but the refusing build rewrites `kimmy.last-exit` to record the failed start (exit `error`, `failed_start`, the cause and a `[previous]` block), which a later 0.51.0 start reads with no effect. They refuse a backup taken on 0.51.0 before the restore creates a file, so the data directory stays empty and nothing is written. A 0.51.0 start that was refused before that point (the free-space check, an unparseable partial filter) leaves a store 0.50 opens. The way back is the backup taken before the upgrade (`BACKUP=true`): restored on 0.50, it loses every write made after it on that member, which the member then catches up from its peers. Wiping the data directory and letting the member catch up from its peers works while no member holds a document whose `_id` is a `Decimal128`.
+
+**Rolling back from 0.52.0 to 0.51.x needs no store work and one edit to the configuration, and a backup 0.52.0 took of a store holding a record does not restore on 0.51.x** ([ADR-240](decisions.md)). The `kimmy.format` schema (still 5), `I_EPOCH`, redb version and entry kinds are unchanged, so 0.51.x opens the store. The store gains two tables, `idempotency` and `idempotency_by_stamp`, which 0.51.x never opens: its writes, drops and purges leave the records untouched, and its retention pass collects oplog entries and not records. Rolled forward again, a record of a collection the older build dropped is judged by its collection's drop and never replayed, and the rest are collected by age; nothing is rebuilt, since the tables are never derived from the oplog. **Remove `cluster.idempotency_keys` from the configuration first**: 0.51.x refuses to start on a configuration that names it, at any value. **Once the switch has been set, rolling back any member reopens the gap it closes** ([below](#clusteridempotency_keys-and-the-procedure)). **A backup is the boundary**: a backup taken by 0.52.0 carries the records as tags 12 and 13, and 0.51.x's `kimmyd restore` refuses a backup that holds either, naming the table it does not know (`backup contains table 12, which this build does not know`); a backup of a store that holds no record carries neither and restores. A backup taken by 0.51.x restores into 0.52.0 with no records. The wire's additions (`records` on entries, replays, pushes and snapshot pages, a records position in the snapshot cursor, `idempotency_records` in the facts block) are optional fields 0.51.x ignores, and a 0.52.0 member reads a 0.51.x block without the field as a member that does not carry records, so it refuses keys while one is live.
 
 #### `cluster.idempotency_keys` and the procedure
 
