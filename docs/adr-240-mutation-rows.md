@@ -345,6 +345,42 @@ This is the table [ADR-240](decisions.md#adr-240--idempotency-keys-the-record-is
 
 **39 rows: 39 killed, 0 equivalent, 0 superseded, 0 run once elsewhere, 0 survived.**
 
+## The build review's fixes (Y): B1, B2, M1, m1 and m3
+
+27 rows, on `git archive` exports of the fix branch `idempotency-y` (`100b8bec` for the first fifteen, `ae544eb0` for the rest), each with its own target directory and a 900 s timeout (1,500 s for the outbound cursor row, whose replay loops to its deadline): B1 (a window carries a record at the lowest of its own rows), B2 (a replay page's records of its collections, both ways), the five tests M1 of the build review found missing, m1 (records too many for one frame: a pull's partial window of records alone, a push not sent, a replay's pages of records alone under a records cursor) and m3 (a rewind removes a cut bulk's record). Suites: the named tests alone, by exact name, each row required to run them. Two rows survived their first run because the outbound B2 test then ran a whole round, whose ordinary pull brought Q's coverage and the record with it; the test now runs the replay alone, and both rows are killed against it.
+
+| Row | What it plants | Result | Killed by | Notes |
+|---|---|---|---|---|
+| Y-B1a-carried-at-the-first-row-found | A record found again at a lower row keeps the row it was first found at | killed | `a_stopped_batch_covers_a_row_whose_record_rode_a_later_one`, `a_run_committed_before_the_carried_row_holds_the_effect_bare` | the control `a_stopped_batch_with_the_lower_row_found_first` passes under it |
+| Y-B1b-lowered-below-first | A lower row found later lowers the carrying row even below the record's `first` | killed | `a_row_below_the_records_first_found_later_does_not_lower_its_carrying_row` |  |
+| Y-m3-rewind-reopens-a-bulk | A rewind reopens a cut bulk insert's record as it reopens a filter's | killed | `a_rewind_that_cuts_a_bulk_part_way_removes_its_record` |  |
+| Y-B2-no-collection-records-inbound | A replay page carries no record of its collections (B2 off), inbound | killed | `b2_an_inbound_replay_carries_a_record_with_no_row_of_the_requesters_origin` |  |
+| Y-B2-no-collection-records-outbound | The same, outbound | killed | `b2_an_outbound_replay_carries_a_record_with_no_row_of_the_requesters_origin` | survived the first run (see above) |
+| Y-B2-no-collection-records-storage | The same, in storage | killed | `a_replay_page_takes_the_live_spanning_records_of_its_collections_at_their_first` |  |
+| Y-B2-carried-at-last | B2's records carried at `last`, not `first` | killed | `a_replay_page_that_stops_between_the_effects_and_last_stores_the_record` |  |
+| Y-B2-outbound-asks-no-replay | The outbound replay's `AskEntries` does not set `replay` | killed | `b2_an_outbound_replay_carries_a_record_with_no_row_of_the_requesters_origin` | survived the first run (see above) |
+| Y-m1-cursor-dropped-inbound | A replay page ignores the records cursor it is given | killed | `the_records_at_an_inbound_replays_start_cross_on_several_pages` |  |
+| Y-m1-cursor-dropped-outbound | The same, outbound | killed | `the_records_at_an_outbound_replays_start_cross_on_several_pages` |  |
+| Y-m1-records-alone-not-stored | A replay page with no lost entries stores none of its records | killed | `the_records_at_an_inbound_replays_start_cross_on_several_pages` |  |
+| Y-m1-pull-no-records-alone | A pull whose first entry cannot cross with its riders is answered `fits: 0` as before | killed | `a_pull_whose_first_entry_cannot_cross_with_its_records_takes_them_alone_first` |  |
+| Y-m1-push-fails | A push that fits nothing fails as an entry that cannot replicate | killed | `a_push_whose_first_entry_cannot_cross_with_its_records_sends_nothing` |  |
+| Y-m1-changed-passed | A record the change log names as changed since the cursor's base is passed with the rest | killed | `a_records_cursor_passes_its_set_up_to_its_key_and_nothing_that_changed` |  |
+| Y-m1-epoch-unguarded | A cursor of another epoch is honoured | killed | `a_records_cursor_passes_its_set_up_to_its_key_and_nothing_that_changed` |  |
+| Y-m1-set-any-collection | A cursor passes records of collections outside its set | killed | `a_records_cursor_passes_nothing_outside_its_set` |  |
+| Y-m1-set-any-first | A cursor passes records whose `first` is past its end | killed | `a_records_cursor_passes_nothing_outside_its_set` |  |
+| Y-m1-delta-stop-ignored | A delta that stopped at its budget reads as whole | killed | `a_records_cursors_delta_stops_at_its_budget_and_moves_the_base` |  |
+| Y-m1-inbound-cursor-forgotten | The inbound serve starts every contact without the cursor its peer acknowledged | killed | `the_records_at_an_inbound_replays_start_cross_over_several_contacts` |  |
+| Y-m1-outbound-cursor-forgotten | The outbound replay starts every contact without the cursor it stored | killed | `the_records_at_an_outbound_replays_start_cross_over_several_contacts` |  |
+| M1-X07-retention-first-origin-only | Retention reads only the first origin that has rows | killed | `everything_expires_and_nothing_is_left` | the build review's M1 |
+| M1-X05-change-log-never-trimmed | The change log's trim returns at once | killed | `everything_expires_and_nothing_is_left`, `retention_trims_the_change_log_below_the_window_and_keeps_its_beginning` | the build review's M1 (X05) |
+| M1-N3-trim-not-called | The retention pass never calls the change log's trim | killed | `retention_trims_the_change_log_below_the_window_and_keeps_its_beginning` | the build review's M1 (N3) |
+| M1-N1-whole-log-trimmed | Every retention pass trims the whole change log | killed | `a_retention_pass_during_a_pull_keeps_the_log_the_next_page_reads` | the build review's M1 |
+| M1-M13a-records-only-page-drops-the-phase | A records-only page cut inside a records phase drops the phase position | killed | `a_records_only_page_inside_a_records_phase_keeps_the_phase` | the build review's M1 |
+| M1-X4-replay-drops-unanchored | A replay page drops its F3 records | killed | `a_replay_page_carries_a_record_its_sender_cannot_vouch_for` | the build review's M1 |
+| M1-X4-with-B2-off | X4 with B2's records off as well | killed | `a_replay_page_carries_a_record_its_sender_cannot_vouch_for` | the F3 test holds without B2 |
+
+**27 rows: 27 killed, 0 equivalent, 0 superseded, 0 survived.**
+
 ## Totals
 
 | Piece | Rows | Killed | Equivalent | Superseded | Run once elsewhere | Survived |
@@ -357,6 +393,7 @@ This is the table [ADR-240](decisions.md#adr-240--idempotency-keys-the-record-is
 | Records travel with coverage (G) | 42 | 33 | 1 | 0 | 8 | 0 |
 | The page records delta (P) | 20 | 20 | 0 | 0 | 0 | 0 |
 | The model's mutants (M) | 39 | 39 | 0 | 0 | 0 | 0 |
-| **All** | **265** | **250** | **4** | **3** | **8** | **0** |
+| The build review's fixes (Y) | 27 | 27 | 0 | 0 | 0 | 0 |
+| **All** | **292** | **277** | **4** | **3** | **8** | **0** |
 
-Of the 250 rows killed, 238 were killed by their piece's own suites (3 of them by a hang, with the tests that failed before it), 4 by the wider suites and 8 by the five tests added on `idempotency-h`: `a_resume_logs_at_info_and_a_replay_below_it`, `a_resume_whose_short_last_chunk_writes_nothing_marks_the_record_done` and `a_record_stays_when_a_row_between_its_first_and_last_expires` in `idempotency_tests.rs`, `a_record_lands_with_the_run_that_takes_its_entry_when_the_entry_loses` and `a_record_whose_entry_is_not_in_the_frame_rides_with_a_later_entry` in `idempotency_repl_tests.rs`. The four equivalent rows are B3 and M13 of S, O5 of F and G11 of G.
+Of the 250 rows killed before the build review, 238 were killed by their piece's own suites (3 of them by a hang, with the tests that failed before it), 4 by the wider suites and 8 by the five tests added on `idempotency-h`: `a_resume_logs_at_info_and_a_replay_below_it`, `a_resume_whose_short_last_chunk_writes_nothing_marks_the_record_done` and `a_record_stays_when_a_row_between_its_first_and_last_expires` in `idempotency_tests.rs`, `a_record_lands_with_the_run_that_takes_its_entry_when_the_entry_loses` and `a_record_whose_entry_is_not_in_the_frame_rides_with_a_later_entry` in `idempotency_repl_tests.rs`. The four equivalent rows are B3 and M13 of S, O5 of F and G11 of G.

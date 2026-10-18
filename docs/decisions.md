@@ -28989,7 +28989,7 @@ that lost where the member pulled them, or by a record-only `done`, harmless whi
 reset or restored identity that peers keep only as page state never converge to it, a convergence matter outside this
 ADR. The mutation harness (`scripts/idempotency-mutants/`, run under bash) applies each mutant to an exported tree and
 runs its suites, the model's among them; [every mutation row of B5, run again together on the merged head, is listed
-with the test that kills it](adr-240-mutation-rows.md): 265 rows, 250 killed, 4 equivalent and 3 superseded, and the 8
+with the test that kills it](adr-240-mutation-rows.md): 292 rows, 277 killed, 4 equivalent and 3 superseded, and the 8
 that G repeated from C run once. `kimmy-storage` also: `idempotency_tests.rs` (the codec, replays per path,
 the life rule and L1, the coalesced barrier, the fsync and write faults, restarts, the multi-chunk record, the
 lookahead and its residual, resumes across crashes and members, retention and the row at `first`, the clock, the drop
