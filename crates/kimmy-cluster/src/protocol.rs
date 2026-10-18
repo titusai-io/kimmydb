@@ -1230,6 +1230,103 @@ mod tests {
         );
     }
 
+    /// The same boundary for `AskEntries::replay` and the replay's records cursor
+    /// (B2 and m1 of the B5 build review), in both directions. A request that
+    /// sets neither writes neither key; a sender before them reads a request that
+    /// sets them as the window it knew; a frame from before them reads as `false`
+    /// and `None`; and a cursor of another shape reads as none, never refusing the
+    /// frame.
+    #[tokio::test]
+    async fn the_replay_fields_cross_a_version_boundary_in_both_directions() {
+        /// `AskEntries` as a sender before B5 declares it.
+        #[derive(Debug, Deserialize)]
+        struct AskEntriesBeforeReplay {
+            from: Hlc,
+            limit: usize,
+            #[serde(default)]
+            partial: bool,
+        }
+        async fn body_of(message: &Message, variant: &str) -> bson::Document {
+            let mut written = Vec::new();
+            write_frame(&mut written, message).await.unwrap();
+            let body = bson::deserialize_from_slice::<bson::Document>(&written[4..]).unwrap();
+            body.get_document(variant).unwrap().clone()
+        }
+        async fn read_back(variant: &str, fields: bson::Document) -> Message {
+            let bytes = bson::serialize_to_vec(&bson::doc! { variant: fields }).unwrap();
+            let mut frame = (bytes.len() as u32).to_be_bytes().to_vec();
+            frame.extend_from_slice(&bytes);
+            read_frame(&mut frame.as_slice()).await.unwrap()
+        }
+        let cursor = kimmy_storage::ReplayRecords {
+            at: Hlc::new(7, 1),
+            through: Hlc::new(9, 0),
+            collections: vec![kimmy_core::CollectionId(u64::MAX - 3)],
+            collection: kimmy_core::CollectionId(u64::MAX - 3),
+            scope: kimmy_core::ScopeHash([5; 32]),
+            base: kimmy_storage::RecordsBase {
+                key: kimmy_core::Stamp::new(Hlc::new(8, 0), NodeId::generate()),
+                epoch: Some(-42),
+            },
+        };
+        let plain = Message::AskEntries {
+            from: Hlc::new(7, 1),
+            limit: 10,
+            held: None,
+            marked: Vec::new(),
+            partial: false,
+            replay: false,
+            replay_records: None,
+        };
+        let sent = body_of(&plain, "AskEntries").await;
+        assert!(!sent.contains_key("replay") && !sent.contains_key("replay_records"), "{sent}");
+        let ask = Message::AskEntries {
+            from: Hlc::new(7, 1),
+            limit: 10,
+            held: None,
+            marked: Vec::new(),
+            partial: false,
+            replay: true,
+            replay_records: Some(cursor.clone()),
+        };
+        let sent = body_of(&ask, "AskEntries").await;
+        assert_eq!(sent.get_bool("replay").ok(), Some(true), "{sent}");
+        assert_eq!(read_back("AskEntries", sent.clone()).await, ask, "it round-trips");
+        let older: AskEntriesBeforeReplay = bson::deserialize_from_document(sent.clone())
+            .expect("a sender that predates the fields reads the request");
+        assert_eq!((older.from, older.limit, older.partial), (Hlc::new(7, 1), 10, false));
+        let mut before = sent.clone();
+        before.remove("replay");
+        before.remove("replay_records");
+        assert_eq!(read_back("AskEntries", before).await, plain, "from before: a pull");
+        let mut other = sent;
+        other.insert("replay_records", "a cursor of another shape");
+        let Message::AskEntries { replay_records: none, replay, .. } =
+            read_back("AskEntries", other).await
+        else {
+            panic!("not AskEntries")
+        };
+        assert!(replay && none.is_none(), "a cursor of another shape reads as none");
+
+        let page = Message::Entries {
+            entries: Vec::new(),
+            scanned_to: Hlc::new(7, 1),
+            exhausted: false,
+            passed_through: None,
+            records: Vec::new(),
+            replay_records: Some(cursor),
+        };
+        let sent = body_of(&page, "Entries").await;
+        assert_eq!(read_back("Entries", sent.clone()).await, page, "it round-trips");
+        let mut before = sent;
+        before.remove("replay_records");
+        let Message::Entries { replay_records: none, .. } = read_back("Entries", before).await
+        else {
+            panic!("not Entries")
+        };
+        assert!(none.is_none(), "an answer from before the field carries no cursor");
+    }
+
     /// The same boundary for `AskEntries::partial` and `Entries::
     /// passed_through` (ADR-194), in both directions. A sender before
     /// `partial` reads a request that sets it as the request it knew, and

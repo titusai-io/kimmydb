@@ -123,7 +123,7 @@ impl Engine {
         collection: CollectionId,
         scope: &ScopeHash,
     ) -> Result<bool> {
-        let txn = self.db().begin_write()?;
+        let txn = self.begin_write(crate::engine::WriterHolder::Retention)?;
         let removed = txn
             .open_table(IDEMPOTENCY)?
             .remove((collection.0, scope.as_bytes().as_slice()))?
