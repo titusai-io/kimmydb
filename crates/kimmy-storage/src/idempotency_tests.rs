@@ -1584,6 +1584,47 @@ fn f7_retention_collects_a_record_one_window_after_its_last() {
     assert_eq!(pass.records_removed, 1);
 }
 
+/// A record is judged by its `last` at whichever of its rows retention reaches,
+/// not only at its `first`: a three-chunk request, ten seconds between chunks,
+/// keeps a row at its second chunk's entry that is neither its `first` nor its
+/// `last`. When that row expires, the record, whose `last` is still inside the
+/// window, stays, and a retry replays.
+#[test]
+fn a_record_stays_when_a_row_between_its_first_and_last_expires() {
+    fn later_by(engine: &Engine, ms: u64) {
+        let now = crate::physical_now_ms() + ms;
+        engine.advance_clock_past(&Stamp::new(Hlc::new(now, 0), engine.node_id()));
+    }
+    let (engine, coll, _dir, _path) = open();
+    let policy = RetentionPolicy::new(DAY, DAY);
+    counters(&engine, &coll, 3);
+    let engine = Arc::new(engine);
+    let k = keyed(97);
+    let mover = Arc::clone(&engine);
+    crate::sync::race_hooks::at(crate::sync::race_hooks::Race::BetweenChunks, move || {
+        later_by(&mover, 10_000);
+        crate::sync::race_hooks::at(crate::sync::race_hooks::Race::BetweenChunks, move || {
+            later_by(&mover, 20_000);
+        });
+    });
+    fresh(engine.modify_where_keyed(&coll, &Candidates::Scan, &Inc, None, &k).unwrap());
+    crate::sync::race_hooks::clear();
+    let stored = record(&engine, &coll, &k).unwrap();
+    let held: Vec<Stamp> = rows(&engine).iter().map(|(s, ..)| *s).collect();
+    assert_eq!(held.len(), 3, "premise: a row at each chunk's entry: {held:?}");
+    let (first, middle, last) = (held[0], held[1], held[2]);
+    assert_eq!((stored.first, stored.last), (first, last), "premise");
+    assert!(last.hlc.wall_ms >= middle.hlc.wall_ms + 10_000, "premise: {held:?}");
+
+    let pass = engine.collect_garbage_at(middle.hlc.wall_ms + DAY_MS + 1, policy).unwrap();
+    assert_eq!(pass.records_removed, 0, "its `last` is inside the window");
+    assert_eq!(record(&engine, &coll, &k), Some(stored));
+    let left: Vec<Stamp> = rows(&engine).iter().map(|(s, ..)| *s).collect();
+    assert_eq!(left, [first, last], "the expired row goes, the one at `first` stays (F1)");
+    replayed(engine.modify_where_keyed(&coll, &Candidates::Scan, &Inc, None, &k).unwrap());
+    assert_eq!(ns(&engine, &coll, 3), vec![1, 1, 1]);
+}
+
 /// The records step runs whatever the oplog step found (the manager's guard):
 /// here the oplog step removes nothing, every entry being inside its window,
 /// and a record a peer sent with an older `last` still goes; and on a store

@@ -286,6 +286,60 @@ fn a_record_lands_with_the_run_that_takes_its_collections_entry() {
     assert_eq!(count(&b.engine, &cb), 1);
 }
 
+/// The same when the entry loses (C5): the record is stored with the run that
+/// takes its entry on either outcome of the merge. Here the run is committed by
+/// a schema change of the same origin after it, which raises B's coverage of A
+/// past the keyed entry, and the batch then fails at its last commit. The
+/// record stands with the run; held only for the last commit, it would be lost
+/// for good, since no later window of A covers the entry again, and a retry on B
+/// would apply the request a second time, on top of the version that beat it.
+#[test]
+fn a_record_lands_with_the_run_that_takes_its_entry_when_the_entry_loses() {
+    let (a, b, ca, cb) = pair();
+    let k = keyed(32);
+    a.engine.insert(&ca, doc! { "_id": 1i64, "n": 0i64 }).unwrap();
+    pull(&b.engine, &a.engine);
+    fresh(a.engine.modify_where_keyed(&ca, &Candidates::Scan, &Inc, Some(1), &k).unwrap());
+    let keyed_at = a.engine.idempotency_record(ca.id, &k.scope).unwrap().unwrap().last;
+    a.engine.create_collection("shop", "later").unwrap();
+    // B's own write to the document, stamped after A's keyed one.
+    let ahead = Stamp::new(Hlc::new(crate::physical_now_ms() + 60_000, 0), b.engine.node_id());
+    b.engine.advance_clock_past(&ahead);
+    b.engine.replace(&cb, &DocId::Int64(1), doc! { "n": 10i64 }, false).unwrap();
+
+    let theirs = a.engine.version_vector().unwrap();
+    let mine = b.engine.witnessed_vector().unwrap();
+    let window = a
+        .engine
+        .entries_for_peer_holding(Hlc::ZERO, 1024, Some(&mine), WalkScope::Background)
+        .unwrap();
+    crate::sync::count_hooks::fail_next(crate::sync::count_hooks::Fail::BeforeLastCommit);
+    let mut outcome = SyncOutcome::default();
+    let failed = b.engine.apply_peer_window_carrying_into(
+        &theirs,
+        Some(&mine),
+        &window.entries,
+        &window.records,
+        RecordsVia::Pull,
+        PeerWindow {
+            scanned_to: window.scanned_to,
+            exhausted: window.exhausted,
+            passed_through: None,
+            asked_partial: false,
+        },
+        &mut outcome,
+    );
+    assert!(failed.is_err(), "premise: the batch failed at its last commit");
+    assert_eq!(n_of(&b.engine, &cb, 1), 10, "premise: A's keyed entry lost on B");
+    let covered = b.engine.witnessed_vector().unwrap().get(a.engine.node_id());
+    assert!(covered > keyed_at.hlc, "premise: B's coverage of A passed the keyed entry");
+    assert!(b.engine.idempotency_record(cb.id, &k.scope).unwrap().is_some(), "with the run");
+
+    pull(&b.engine, &a.engine);
+    replayed(b.engine.modify_where_keyed(&cb, &Candidates::Scan, &Inc, Some(1), &k).unwrap());
+    assert_eq!(n_of(&b.engine, &cb, 1), 10, "not applied again");
+}
+
 /// A frame's records are stored in the transaction that raises the receiver's
 /// coverage, **whether or not an entry of their collection is taken** and
 /// whether or not the collection stands here (B5, records travel with
