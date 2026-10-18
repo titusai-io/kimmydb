@@ -28767,9 +28767,10 @@ with it, and not be offered while any member could carry the write without it.
      one optional `records_base`, `{key, epoch}`: the log's high water as the page that cut the cursor read it, in its
      documents' transaction. Each later page carries, read in its own documents' transaction, every record the log
      names above that base (the scoped collection's, on a scoped or converge pull), and the receiver stores them before
-     the documents. **The epoch** is a random `i64` the log is given when it begins, written with its first change and
-     not at open, and given again at the first change after a restore (a backup carries no log), an identity reset or an
-     open that found no log. Keys are compared only within one epoch: a base of another epoch, or a key without one,
+     the documents. **The epoch** is a random `i64` the log is given when it begins: with its first change, or at an
+     open that finds records and no log of this node's identity (a restore, since a backup carries no log; an identity
+     reset), before any page is cut, so a store that holds records always has one, and a sender restored twice during
+     one pull cuts bases of two epochs (the build review's m4). Keys are compared only within one epoch: a base of another epoch, or a key without one,
      restarts the cursor's collection from its records phase, since a sender restored onto a host whose clock is behind
      logs keys below a base cut before the restore, which no comparison of keys can tell; the zero base of a log that
      had held nothing is sent every change. **The remainder rule:** a page carries documents only with the whole
@@ -28807,8 +28808,8 @@ with it, and not be offered while any member could carry the write without it.
    records of requests whose every write it discarded, which would replay an answer for a write that no longer exists,
    and reopens, to resume, one it cut part-way. A backup carries `idempotency` and `idempotency_by_stamp` as tags 12
    and 13, so a restored member keeps the records of the writes it holds, those it took by snapshot included: without
-   them a retry there would apply on top of a write the backup brought back. It carries no change log; the first change
-   after the restore begins one with a new epoch. **The clock:** at open `resume_hlc` takes the largest of each
+   them a retry there would apply on top of a write the backup brought back. It carries no change log; the first open
+   after the restore begins one with a new epoch over the restored records. **The clock:** at open `resume_hlc` takes the largest of each
    origin's last row in `idempotency_by_stamp` and the change log's high water as well as the oplog's tail, since a
    record a page stored came with no oplog entry here, and the witness that folded its stamps in is in memory only; a
    clock resumed below a record's `first` would let a resume write a document twice.

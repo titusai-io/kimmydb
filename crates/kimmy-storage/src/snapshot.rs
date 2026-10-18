@@ -267,13 +267,14 @@ pub struct SnapshotCursor {
 /// ([`SnapshotCursor::records_base`]).
 ///
 /// The **epoch** is a random number the log is given when it begins: with its
-/// first change, and again after a restore (a backup carries no log), an
-/// identity reset, or an open that found no log. Keys are compared only within
-/// one epoch: a key is a stamp of the sender's clock, and a sender restored onto
-/// a host whose clock is behind mints keys below a base cut before the restore,
-/// so no comparison of keys can tell such a base from one cut since. `None` with
-/// the zero key is the base of a log that has held nothing: every change it
-/// logs is above it. On the wire as a BSON `int64` (BSON has no unsigned one).
+/// first change, or at an open that finds records and no log of this node (a
+/// restore, since a backup carries no log; an identity reset). Keys are compared
+/// only within one epoch: a key is a stamp of the sender's clock, and a sender
+/// restored onto a host whose clock is behind mints keys below a base cut before
+/// the restore, so no comparison of keys can tell such a base from one cut
+/// since. `None` with the zero key is the base of a log that has held nothing:
+/// every change it logs is above it. On the wire as a BSON `int64` (BSON has no
+/// unsigned one).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RecordsBase {
     /// A key of the log: the next page carries what the log names above it.

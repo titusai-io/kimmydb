@@ -981,7 +981,8 @@ fn a_restore_or_an_identity_reset_begins_the_log_again_and_restarts_older_bases(
     fresh(y.modify_where_keyed(&cy, &Candidates::Scan, &Inc, Some(1), &key(7)).unwrap());
     let page = y.snapshot_page(Some(asked.clone()), Some(cy.id)).unwrap();
     assert!(restarted(&page, 2, 0), "restarted after a restore: {:?}", page.next);
-    // Its identity is reset: the log begins again at its next change.
+    // Its identity is reset: the log begins again, at the open, over the
+    // records it holds.
     let page = y.snapshot_page(Some(asked), Some(cy.id)).unwrap();
     let before = page.next.unwrap();
     y.close().unwrap();
@@ -1029,8 +1030,7 @@ fn a_base_from_before_a_restore_onto_a_clock_behind_restarts_its_collection() {
     // Restored onto a host whose clock is an hour behind.
     let restored_path = dir.path().join("y2.redb");
     crate::backup::restore(&restored_path, &mut backup.as_slice()).unwrap();
-    let y = Engine::open(&restored_path).unwrap();
-    y.set_clock_behind_for_test(3_600_000);
+    let y = Engine::open_with_clock_behind_for_test(&restored_path, 3_600_000).unwrap();
     let k = key(7);
     fresh(y.modify_where_keyed(&cy, &Candidates::Scan, &Inc, Some(1), &k).unwrap());
     let below = y.idempotency_record(cy.id, &k.scope).unwrap().unwrap().first;
@@ -1052,6 +1052,114 @@ fn a_base_from_before_a_restore_onto_a_clock_behind_restarts_its_collection() {
     finish(&x, &y, &mut progress);
     let cx = x.get_collection("shop", "orders").unwrap();
     assert_eq!(n_of(&x, &cx, target), 11, "premise: the pull brought the effect");
+    retry_must_replay(&x, &cx, &k, target);
+}
+
+// -- Two restores during one pull (the B5 build review's m4) -------------------------------
+
+/// Where `engine`'s change log begins, and its epoch, as it stands.
+fn log_begin(engine: &Engine) -> Option<crate::idempotency::LogBegin> {
+    use redb::ReadableDatabase;
+    let txn = engine.db().begin_read().unwrap();
+    crate::idempotency::changes_begin(&txn).unwrap()
+}
+
+/// A store restored from `backup`, opened, at a path of its own.
+fn restored(dir: &tempfile::TempDir, name: &str, backup: &[u8]) -> Engine {
+    let path = dir.path().join(format!("{name}.redb"));
+    crate::backup::restore(&path, &mut &backup[..]).unwrap();
+    Engine::open(&path).unwrap()
+}
+
+/// `y`'s backup, as `kimmyd backup` writes it.
+fn backup_of(y: &Engine) -> Vec<u8> {
+    let mut out = Vec::new();
+    y.backup_to(&mut out, crate::WalkScope::Background).unwrap();
+    out
+}
+
+/// An open over records and no log of this node begins the log, with a new
+/// epoch, before any page is cut: after a restore (a backup carries no log) and
+/// after an identity reset. A store with no records begins none at open, and a
+/// store whose own log has begun keeps it across a restart.
+#[test]
+fn an_open_over_records_and_no_log_begins_the_log_with_a_new_epoch() {
+    let dir = tempfile::tempdir().unwrap();
+    let y_path = dir.path().join("y.redb");
+    let y = Engine::open(&y_path).unwrap();
+    let cy = y.create_collection("shop", "orders").unwrap();
+    y.insert(&cy, doc! { "_id": 1i64 }).unwrap();
+    let bare = backup_of(&y);
+    assert!(log_begin(&y).is_none(), "premise: no keyed write, no log");
+    fresh(y.insert_keyed(&cy, doc! { "_id": 2i64 }, &key(3)).unwrap());
+    let own = log_begin(&y).expect("premise: begun by its first change");
+    let keyed = backup_of(&y);
+    y.close().unwrap();
+
+    // A restart keeps the log it has.
+    let y = Engine::open(&y_path).unwrap();
+    assert_eq!(log_begin(&y), Some(own), "a restart keeps its log");
+    // A restore of a store with no records begins none.
+    let r0 = restored(&dir, "r0", &bare);
+    assert!(log_begin(&r0).is_none(), "no records, no log");
+    // A restore of one with records begins it at open, of this node, epoch new.
+    let r1 = restored(&dir, "r1", &keyed);
+    let begun = log_begin(&r1).expect("begun at open over the restored records");
+    assert_eq!(begun.at.node, r1.node_id());
+    assert_ne!(begun.epoch, own.epoch, "a new epoch");
+    assert_eq!(log_rows(&r1), 0, "a beginning, and no change logged");
+    // An identity reset: the log another identity began is not this node's.
+    let r1_path = dir.path().join("r1.redb");
+    r1.close().unwrap();
+    {
+        let db = redb::Database::open(&r1_path).unwrap();
+        let txn = db.begin_write().unwrap();
+        txn.open_table(crate::tables::META).unwrap().remove(crate::tables::META_NODE_ID).unwrap();
+        txn.commit().unwrap();
+    }
+    let reset = Engine::open(&r1_path).unwrap();
+    let again = log_begin(&reset).expect("begun again at open");
+    assert_eq!(again.at.node, reset.node_id());
+    assert_ne!(again.epoch, begun.epoch, "a new epoch after an identity reset");
+}
+
+/// The review's two-restore schedule (m4, `d1`): a sender restored from a
+/// backup that holds records serves the first page; it is restored again, from
+/// a backup that also holds a keyed `$inc` on a document of a later page, and
+/// the pull goes on. The first restore's open began the log with an epoch, so
+/// the first page's base names it; the second's began another, so the next page
+/// restarts the collection from its records phase, which carries the `$inc`'s
+/// record, and a retry on the receiver replays.
+#[test]
+fn a_pull_across_two_restores_of_a_sender_with_records_takes_every_record() {
+    let dir = tempfile::tempdir().unwrap();
+    let y0 = open(&dir, "y0");
+    let target = SNAPSHOT_PAGE as i64 + 40;
+    let cy = three_pages(&y0, target);
+    // b1: a record (key 3), the target untouched.
+    fresh(y0.insert_keyed(&cy, doc! { "_id": 0i64 }, &key(3)).unwrap());
+    let b1 = backup_of(&y0);
+    // b2: and the keyed $inc on the target.
+    let k = key(7);
+    fresh(y0.modify_where_keyed(&cy, &Candidates::Scan, &Inc, Some(1), &k).unwrap());
+    let b2 = backup_of(&y0);
+    drop(y0);
+
+    let y1 = restored(&dir, "y1", &b1);
+    let x = open(&dir, "x");
+    let mut progress = SnapshotProgress::of_collection(cy.id);
+    let first = take(&x, &y1, &mut progress);
+    assert_eq!(first.records.len(), 1, "premise: b1's record in the records phase");
+    let base = progress.after().unwrap().records_base.unwrap();
+    assert!(base.epoch.is_some(), "the first restore's log names the base: {base:?}");
+    drop(y1);
+
+    // The sender is restored again, from b2.
+    let y2 = restored(&dir, "y2", &b2);
+    let pages = finish(&x, &y2, &mut progress);
+    assert!(restarted(&pages[0], 2, 0), "restarted from its records: {:?}", pages[0].next);
+    let cx = x.get_collection("shop", "orders").unwrap();
+    assert_eq!(n_of(&x, &cx, target), 11, "premise: the page brought b2's effect");
     retry_must_replay(&x, &cx, &k, target);
 }
 

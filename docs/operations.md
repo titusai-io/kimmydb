@@ -661,6 +661,10 @@ replication:
 - **`INFO` `a snapshot cursor's records base is of another log`**, with `base`
   and `epoch`: the sender was restored or reset since the cursor was cut, and the
   cursor's collection starts again from its records.
+- **`INFO` `this store holds idempotency records and no change log of this
+  node`**, with `epoch`, at the first start after a restore or an identity reset:
+  the change log begins again there, so a snapshot cursor cut before it restarts
+  its collection from its records.
 
 #### A start that rebuilds the live document counts
 
@@ -2459,9 +2463,9 @@ and, from 0.52.0, the idempotency records and their rows by stamp (tags 12 and
 there replays rather than applying on top of a write the backup brought back
 ([ADR-240](decisions.md)). A backup that holds a record cannot be restored by
 0.51.x or earlier. The records' change log, `idempotency_changes`, is node-local
-and left out: the first change after the restore begins it again with a new
-epoch, and a snapshot a peer was pulling from this member restarts the records
-of the collection it was in.
+and left out: the first start after the restore begins it again with a new
+epoch (logged at `INFO`), and a snapshot a peer was pulling from this member
+restarts the records of the collection it was in.
 
 **Not everything the node holds.** Three tables are deliberately left out
 because each is node-local and re-derived when the database is opened: the

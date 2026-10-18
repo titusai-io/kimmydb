@@ -133,9 +133,10 @@
 //! it is a records-only page and its base moves to the last key it examined.
 //!
 //! Keys are compared only within one **epoch** ([`changes_begin`]): a random
-//! number the log is given when it begins, with its first change, and again
-//! after a restore (a backup carries no log), an identity reset, or an open
-//! that found no log. A base of another epoch restarts the cursor's collection
+//! number the log is given when it begins, with its first change, or at an open
+//! that finds records and no log of this node (a restore, since a backup carries
+//! no log; an identity reset: [`begin_log_over_held_records`]). A base of another
+//! epoch restarts the cursor's collection
 //! from its records phase, whatever the keys say: a sender restored onto a host
 //! whose clock is behind logs keys below a base cut before the restore.
 
@@ -1019,9 +1020,9 @@ fn records_in_advance(
 /// order.
 ///
 /// **The log begins** with the first change it holds, and begins again, with a
-/// new epoch, at the first change after an open that found no beginning (a new
-/// store, one from before the log, one restored from a backup, which carries
-/// none) or one this node's identity did not write (an identity reset).
+/// new epoch, at the first change after an open that found no beginning, or one
+/// this node's identity did not write, over a store that held no record. One
+/// that held records began it at the open ([`begin_log_over_held_records`]).
 fn log_change(
     engine: &Engine,
     txn: &redb::WriteTransaction,
@@ -1041,6 +1042,53 @@ fn log_change(
     }
     log.insert(key.as_slice(), row_value(collection, scope).as_slice())?;
     Ok(())
+}
+
+/// At open: **begin the change log, with a new epoch, over the records this
+/// store holds** when it holds any and no log of this node's identity has
+/// begun ([`IDEMPOTENCY_CHANGES`]'s empty key absent, or another identity's).
+/// Returns whether it began one.
+///
+/// Such records were written by no change this log names: a restore (a backup
+/// carries records and no log), an identity reset, a store from before the log.
+/// Without a beginning, this node would cut the **zero base** (`RecordsBase`,
+/// "a log that has held nothing") on its next page, and answer a zero base cut
+/// by an earlier store with "nothing changed": a sender restored once from a
+/// backup with records serves a page with the zero base, is restored again from
+/// another, and the next page brings that backup's effect without its record
+/// (m4). Begun here, a base this node cuts names the epoch, and a base cut before
+/// the next restore is of another epoch, which restarts its collection from its
+/// records phase. A zero base cut by a sender that held no records, answered
+/// after it was restored with some, is the requester's to refuse
+/// (`SnapshotPage::records_epoch`).
+///
+/// Before the engine serves, so no page is cut before it, in a transaction of
+/// its own (metadata alone, as a schema change's); the beginning's key is a
+/// stamp of this node's clock minted under the writer, above every key a page of
+/// this store cut before the open (`resume_hlc` covers the log).
+pub(crate) fn begin_log_over_held_records(engine: &Engine) -> Result<bool> {
+    use redb::ReadableDatabase;
+    {
+        let txn = engine.db().begin_read()?;
+        // not a row of the walk: whether the store holds any record, one seek.
+        let holds = txn.open_table(IDEMPOTENCY)?.first()?.is_some();
+        let begun = changes_begin(&txn)?.is_some_and(|begun| begun.at.node == engine.node_id());
+        if !holds || begun {
+            return Ok(false);
+        }
+    }
+    let txn = engine.begin_write(WriterHolder::Ddl)?;
+    // Minted under the writer, as every log key is.
+    let begin = LogBegin { at: engine.next_stamp(), epoch: new_epoch() };
+    txn.open_table(IDEMPOTENCY_CHANGES)?.insert(LOG_BEGINS, begin.encode().as_slice())?;
+    txn.commit()?;
+    info!(
+        epoch = begin.epoch,
+        "this store holds idempotency records and no change log of this node: the log begins \
+         again here, so a snapshot cursor cut before (a restore, an identity reset) restarts its \
+         collection from its records"
+    );
+    Ok(true)
 }
 
 /// A new log's epoch: random, never 0.
