@@ -1914,9 +1914,10 @@ impl World {
 
     /// The replay of `m`'s own origin from `peer` after a restore (ADR-212), as the
     /// transport makes it: the peer serves `m`'s entries above where `m`'s store left
-    /// off, every other origin passed over; the page carries the records whose carrying
-    /// stamp is one of its entries (`records_of`); `m` folds each stamp into its clock
-    /// and applies the entries it no longer holds, with those records.
+    /// off, every other origin passed over; the page carries the records of its own
+    /// advance and those its sender cannot vouch for (`records_of_replay`); `m` folds
+    /// each stamp into its clock and applies the entries it no longer holds, with
+    /// those records.
     fn replay_own_origin(&mut self, m: usize, peer: usize) -> Res<()> {
         let me = self.e(m).node_id();
         let mut from = self.e(m).own_position_at_open();
@@ -1947,12 +1948,22 @@ impl World {
                 .filter(|entry| entry.stamp.node == me && entry.stamp.hlc > from)
                 .cloned()
                 .collect();
-            let shipped: HashSet<Stamp> = own.iter().map(|entry| entry.stamp).collect();
+            // As the transport's `records_of_replay`: those the page's own advance
+            // vouches for (a row of this origin in `(from, through]`), and every one
+            // its sender cannot vouch for by its oplog (the window's first
+            // `unanchored`, F3).
+            let through = own.last().map_or(window.scanned_to, |entry| entry.stamp.hlc);
+            let unanchored = window.unanchored.min(window.records.len());
             let records: Vec<crate::idempotency::CarriedRecord> = window
                 .records
                 .iter()
-                .filter(|w| w.carrying.is_some_and(|at| shipped.contains(&at)))
-                .cloned()
+                .enumerate()
+                .filter(|(i, w)| {
+                    *i < unanchored
+                        || w.carrying
+                            .is_some_and(|at| at.node == me && at.hlc > from && at.hlc <= through)
+                })
+                .map(|(_, w)| w.clone())
                 .collect();
             for entry in &own {
                 dst.advance_clock_past(&entry.stamp);
@@ -3501,7 +3512,6 @@ const D: u8 = 3;
 /// pulls B, holds the effect, and its coverage of A passes the `$inc`'s entry, which A
 /// then never serves it. A retry on C must replay.
 #[test]
-#[ignore = "fails until records travel with coverage (idempotency-g)"]
 fn row_g2_a_loser_relay() {
     row(
         "g2",
@@ -3522,7 +3532,6 @@ fn row_g2_a_loser_relay() {
 /// which carries the record, and its second entry wins on B. C pulls B and holds the
 /// request's own effect on the second counter, bare. A retry on C must not apply again.
 #[test]
-#[ignore = "fails until records travel with coverage (idempotency-g)"]
 fn row_g2b_a_multi_document_request_whose_first_entry_lost() {
     row(
         "g2b",
@@ -3536,7 +3545,6 @@ fn row_g2b_a_multi_document_request_whose_first_entry_lost() {
 /// coverage of A passes the `$inc` in a window that carries no entry of its collection.
 /// A's later write on top reaches C bare. A retry on C must replay.
 #[test]
-#[ignore = "fails until records travel with coverage (idempotency-g)"]
 fn row_g3_a_coverage_only_window() {
     row(
         "g3",
@@ -3560,7 +3568,6 @@ fn row_g3_a_coverage_only_window() {
 /// D pulls only C and holds B's version, which holds the `$inc`, with no record, while
 /// its coverage of A does not move. A retry on D must replay.
 #[test]
-#[ignore = "fails until records travel with coverage (idempotency-g)"]
 fn row_t2_a_cross_origin_relay_while_the_origin_is_down() {
     row(
         "t2",
@@ -3586,7 +3593,6 @@ fn row_t2_a_cross_origin_relay_while_the_origin_is_down() {
 /// version above its grant; B then pulls A, where the keyed entry loses. C, at the grant,
 /// pulls B and takes the later version bare. A retry on C must replay.
 #[test]
-#[ignore = "fails until records travel with coverage (idempotency-g)"]
 fn row_g1b_a_write_between_snapshot_pages_then_a_relay() {
     // The keyed write goes to the collection the whole-database walk reaches second, so
     // that the first page ends before its records phase; an earlier keyed write gives
@@ -3692,7 +3698,6 @@ fn row_r1c_a_whole_database_retry_at_completion() {
 /// A's own-origin replay from B reads that write back, without the record. A is the
 /// member guarantee 4 tells the client to retry on, and a retry there must replay.
 #[test]
-#[ignore = "fails until replay pages carry records by coverage (idempotency-g)"]
 fn row_g5_an_own_origin_replay_after_a_restore() {
     row(
         "g5",
@@ -3945,7 +3950,6 @@ fn pull_all(to: &Engine, from: &Engine) {
 /// guarantee 2 (a member holding any effect of the write holds its record), so it fails
 /// until the design closes the gap.
 #[test]
-#[ignore = "finding G1, as first reported: fails until records travel with coverage (idempotency-g)"]
 fn finding_g1_a_relay_of_a_snapshot_held_version_drops_the_record() {
     let dir = tempfile::tempdir().unwrap();
     let y = Engine::open(&dir.path().join("y.redb")).unwrap();
@@ -3989,7 +3993,6 @@ fn finding_g1_a_relay_of_a_snapshot_held_version_drops_the_record() {
 /// writes of one request never lets a retry write them again), so it fails until a
 /// record's `last` is the last entry its commit wrote.
 #[test]
-#[ignore = "finding L1: a drop in the millisecond of a commit's first entry buries its record (fix pending)"]
 fn finding_l1_a_drop_in_the_millisecond_of_a_commit_buries_its_record() {
     let dir = tempfile::tempdir().unwrap();
     let a = Engine::open(&dir.path().join("a.redb")).unwrap();
