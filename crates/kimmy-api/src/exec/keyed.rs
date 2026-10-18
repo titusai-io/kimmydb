@@ -102,6 +102,7 @@ mod tests {
             origin,
             state: RecordState::Done,
             outcome: RecordOutcome::Insert { stamp },
+            contested: false,
         }
     }
 

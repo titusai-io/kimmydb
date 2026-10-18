@@ -474,3 +474,59 @@ fn g8_the_lookahead_ends_past_matches_the_stamp_rule_leaves() {
     retry_must_replay(&m, &cm, &k, 4, false);
     assert_eq!(n_of(&m, &cm, 5), 50, "left as the other writer left it");
 }
+
+// -- A sender that purged a drop (the build review's D1, ruling A) ----------------------------
+
+/// One window of at most `limit` entries, through the verdict, as `pull` serves it.
+fn pull_limited(to: &Engine, from: &Engine, limit: usize) {
+    let theirs = from.version_vector().unwrap();
+    let mine = to.witnessed_vector().unwrap();
+    assert_eq!(from.serve_verdict(&mine).unwrap(), ServeVerdict::Serve);
+    let Some(start) = mine.behind(&theirs) else { return };
+    let marked = to.held_ranges_covered_by(&mine).unwrap();
+    let window = from.serve_entries_to_peer(start, limit, Some(&mine), &marked, None).unwrap();
+    let mut outcome = SyncOutcome::default();
+    to.apply_peer_window_carrying_into(
+        &theirs,
+        Some(&mine),
+        &window.entries,
+        &window.records,
+        RecordsVia::Pull,
+        PeerWindow {
+            scanned_to: window.scanned_to,
+            exhausted: window.exhausted,
+            passed_through: None,
+            asked_partial: false,
+        },
+        &mut outcome,
+    )
+    .unwrap();
+}
+
+/// D1 of the build review, the D2 class. A sender that has applied a collection's
+/// drop and run its purge still serves the dropped life's entries from its oplog.
+/// A member behind the drop takes the keyed `$inc`'s entry, and under ruling A the
+/// record with it, since the purge leaves records: a retry there replays. Before,
+/// the purge had removed the record, the entry came bare, and the retry applied on
+/// top of its own effect, a version stamped after the drop that the next life
+/// keeps (ADR-236).
+#[test]
+fn d1_a_purged_senders_old_life_entry_reaches_a_member_behind_the_drop_with_its_record() {
+    let dir = tempfile::tempdir().unwrap();
+    let (a, m) = (open(&dir, "a"), open(&dir, "m"));
+    let ca = a.create_collection("shop", "orders").unwrap();
+    a.insert(&ca, doc! { "_id": 1i64, "n": 0i64 }).unwrap();
+    assert_eq!(pull(&m, &a), Pulled::Served);
+    let cm = m.get_collection("shop", "orders").unwrap();
+    let k = key();
+    assert!(matches!(
+        a.modify_where_keyed(&ca, &Candidates::Scan, &Inc, Some(1), &k).unwrap(),
+        Keyed::Fresh(_)
+    ));
+    assert!(a.drop_collection("shop", "orders").unwrap());
+    a.finish_purges_now().unwrap();
+    // One entry: the `$inc`'s, ahead of the drop.
+    pull_limited(&m, &a, 1);
+    assert_eq!(n_of(&m, &cm, 1), 1, "premise: M took the `$inc` and not yet the drop");
+    retry_must_replay(&m, &cm, &k, 1, true);
+}

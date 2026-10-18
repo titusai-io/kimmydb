@@ -398,24 +398,10 @@ const BOUNDED_READS: &[(&str, &str)] = &[
         "inside find_and_modify's write transaction: close_writes bounds it (ADR-192)",
     ),
     (
-        "idempotency::Engine::purge_records_in",
-        "what is left of one purge chunk of DROP_PURGE_CHUNK rows, in its write: close_writes \
-         bounds it (ADR-192)",
-    ),
-    (
         "idempotency::Engine::records_high_water",
         "at open: two seeks per origin that has a record row, its first key and its last",
     ),
-    (
-        "idempotency::Engine::records_under",
-        "one seek: whether a collection id has any idempotency record",
-    ),
     ("idempotency::Engine::rewind_records_in", "`kimmyd rewind`, which runs on a stopped node"),
-    (
-        "idempotency::Engine::sweep_late_drop_records",
-        "one chunk of RECORD_COLLECT_CHUNK records of one collection, in a write: close_writes \
-         bounds it (ADR-192); the stop is looked for between two chunks (ADR-231)",
-    ),
     (
         "idempotency::records_for_collection_page",
         "one snapshot page's records phase: at most RECORD_PAGE (512) records of one collection",

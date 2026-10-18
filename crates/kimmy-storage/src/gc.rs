@@ -588,7 +588,7 @@ impl Engine {
 /// everything instead of wrapping into a cutoff in the far future — which would
 /// collect the entire database.
 ///
-/// The idempotency records' life rule reads it too, so a record is absent on
+/// The idempotency records' window reads it too, so a record is absent on
 /// lookup exactly when the records step would collect it (B5).
 pub(crate) fn cutoff(now_ms: u64, retention_secs: u64) -> Hlc {
     let age_ms = retention_secs.saturating_mul(1000);
