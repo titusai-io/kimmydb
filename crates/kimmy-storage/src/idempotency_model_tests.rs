@@ -109,31 +109,35 @@
 //!   collection's drop or floor is at or above it), and no replay answers from a record
 //!   past its window.
 //!
-//! **Findings the model classifies** (counted in every run's summary line; with
-//! `IDEM_STRICT=1`, and in every named row, they fail the run):
+//! **Findings the model classifies**, each counted in every run's summary line:
 //! - **Relay** (the G1 analysis's G1b, G2, G2b, G3, T2, G5): an effect or an entry of K
 //!   reached a member without K's record (an application on its own effect by a member
 //!   that held no live record and had taken no entry of K; an entry shipped without the
 //!   record by a sender that held it; a record missing at quiescence where a document
-//!   holds K). Fixed by records travelling with coverage. Fails every run unless
-//!   `IDEM_LENIENT=1`.
+//!   holds K). Fixed by records travelling with coverage. **Fails every run** (generated
+//!   and named) by default; `IDEM_LENIENT=1` counts it instead, for a tree without that
+//!   fix.
+//! - **KR** (see I8): fails every run.
 //! - **S1**: a record at quiescence that the merged record dominates, or none where no
 //!   document holds the key: a record state carried only by entries that lost where the
-//!   member pulled them from, or by a record-only `done`. Harmless while I2 holds.
-//! - **R1** (counted, a convergence matter outside B5): a reset identity's writes, or a
-//!   restored identity's writes after its backup, kept by peers only as page state,
-//!   never converge to the reset or restored member.
+//!   member pulled them from, or by a record-only `done` (G8's ruled residual). Harmless
+//!   while I2 holds. Counted in a generated run; fails it with `IDEM_STRICT=1`, and fails
+//!   every named row.
+//! - **R1** (counted, never failed; a convergence matter outside B5): a reset identity's
+//!   writes, or a restored identity's writes after its backup, kept by peers only as page
+//!   state, never converge to the reset or restored member.
 //!
 //! Under the life rule the extended model found D2 (a retry after a drop doubled a
 //! counter a later write carried over), D3 (a resume across a drop left the later life's
 //! counters) and KR (a reused key's merged records). Ruling A makes D2 a Life and I1
 //! violation and D3 the stamp rule's contract; KR is refused by the `contested` flag.
 //!
-//! **Reproducers.** `finding_g1_*` (G1 as first reported: its pull serves the window
-//! without the sender's verdict, which production refuses as `StateHeld`; kept as the
-//! mechanism's minimal form) and `finding_l1_*`.
-//! The named rows `row_*` write out the breaks of the G1 analysis and the shapes the
-//! design's mutants need.
+//! **Reproducers**, both run (not ignored) and pass since their fixes landed:
+//! `finding_g1_*` (G1 as first reported: its pull serves the window without the sender's
+//! verdict, which production refuses as `StateHeld`; kept as the mechanism's minimal
+//! form) and `finding_l1_*`. The named rows `row_*` write out the breaks of the G1
+//! analysis and the shapes the design's mutants need, each run strictly; those ignored
+//! name what they wait for.
 
 // Members are indices into small per-member arrays (`LETTERS`, the members, a step's
 // records) all through: a range reads as "every member", an enumeration would not.
@@ -572,8 +576,8 @@ fn trace() -> bool {
     std::env::var("IDEM_TRACE").is_ok_and(|v| v == "1")
 }
 
-/// Whether the relay class and L1 fail a generated run: yes, since fix (e) and L1's
-/// fix landed; `IDEM_LENIENT=1` counts them instead, for a tree without those fixes.
+/// Whether the relay class fails a generated run: yes, by default, since fix (e)
+/// landed; `IDEM_LENIENT=1` counts it instead, for a tree without that fix.
 fn strict() -> bool {
     !std::env::var("IDEM_LENIENT").is_ok_and(|v| v == "1")
 }
@@ -4338,8 +4342,8 @@ fn pull_all(to: &Engine, from: &Engine) {
 /// from X and is sent the later version without the record, and its coverage then
 /// passes the `$inc`'s own entry, so Y never serves it the record either, Y serving
 /// throughout. A retry on M applies the `$inc` a second time (n 11 -> 12). Asserts
-/// guarantee 2 (a member holding any effect of the write holds its record), so it fails
-/// until the design closes the gap.
+/// guarantee 2 (a member holding any effect of the write holds its record); it passes
+/// since records travel with coverage (fix (e)).
 #[test]
 fn finding_g1_a_relay_of_a_snapshot_held_version_drops_the_record() {
     let dir = tempfile::tempdir().unwrap();
@@ -4381,7 +4385,7 @@ fn finding_g1_a_relay_of_a_snapshot_held_version_drops_the_record() {
 /// at (t,2), stands in the life after the drop (ADR-236). The member then holds that
 /// document's effect with no live record, and a retry increments it a second time.
 /// Asserts the design's intent ("judged by `last`" exists so that a drop between two
-/// writes of one request never lets a retry write them again), so it fails until a
+/// writes of one request never lets a retry write them again); it passes since a
 /// record's `last` is the last entry its commit wrote.
 #[test]
 fn finding_l1_a_drop_in_the_millisecond_of_a_commit_buries_its_record() {
