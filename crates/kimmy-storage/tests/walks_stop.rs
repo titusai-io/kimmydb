@@ -403,6 +403,10 @@ const BOUNDED_READS: &[(&str, &str)] = &[
     ),
     ("idempotency::Engine::rewind_records_in", "`kimmyd rewind`, which runs on a stopped node"),
     (
+        "idempotency::remove_rows_naming",
+        "`kimmyd rewind`'s removal of the rows of the records it removed, on a stopped node",
+    ),
+    (
         "idempotency::records_for_collection_page",
         "one snapshot page's records phase: at most RECORD_PAGE (512) records of one collection",
     ),

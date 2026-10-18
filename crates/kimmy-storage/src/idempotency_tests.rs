@@ -2137,9 +2137,10 @@ fn a_late_drops_sweep_leaves_the_records_of_the_life_before() {
     assert!(engine.get(&life, &DocId::Int64(1)).unwrap().is_none(), "nothing written again");
 }
 
-/// A rewind removes the record of a request it discards whole, and reopens one
-/// it cuts part-way, which a retry then resumes from the beginning: what the
-/// rewind undid is written again, and nothing the request still holds.
+/// A rewind removes the record of a request it discards whole, with every row
+/// by stamp that names it, and reopens one it cuts part-way, its rows kept (the
+/// one at its `last` included), which a retry then resumes from the beginning:
+/// what the rewind undid is written again, and nothing the request still holds.
 #[test]
 fn a_rewind_removes_or_reopens_the_records_it_cuts() {
     let (engine, coll, _dir, _path) = open();
@@ -2160,9 +2161,16 @@ fn a_rewind_removes_or_reopens_the_records_it_cuts() {
     let k2 = keyed(61);
     fresh(engine.insert_keyed(&coll, doc! { "_id": 9i64 }, &k2).unwrap());
     let until = until.lock().expect("the hook ran");
+    let naming = |engine: &Engine, k: &KeyedWrite| -> Vec<Stamp> {
+        rows(engine).into_iter().filter(|(_, _, scope)| *scope == k.scope.0).map(|r| r.0).collect()
+    };
+    let (kept_rows, gone_rows) = (naming(&engine, &k), naming(&engine, &k2));
+    assert!(kept_rows.len() >= 2 && !gone_rows.is_empty(), "premise: {kept_rows:?} {gone_rows:?}");
     let out = engine.rewind_to(until).unwrap();
     assert_eq!((out.records_removed, out.records_reopened), (1, 1));
     assert_eq!(record(&engine, &coll, &k2), None, "discarded whole");
+    assert_eq!(naming(&engine, &k2), Vec::<Stamp>::new(), "and no row names it");
+    assert_eq!(naming(&engine, &k), kept_rows, "the reopened record's rows stay");
     let open = record(&engine, &coll, &k).unwrap();
     assert_eq!(open.state, RecordState::Applying);
     assert_eq!(modify(&open).cursor, None);

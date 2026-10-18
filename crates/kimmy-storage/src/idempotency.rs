@@ -748,6 +748,53 @@ pub(crate) fn decode_row_key(key: &[u8]) -> Option<Stamp> {
     Some(Stamp::new(Hlc::from_bytes(hlc), NodeId::from_bytes(node)))
 }
 
+/// A rewind's removal of the rows by stamp of the records it removed
+/// (`named`), in its transaction: every such row is stamped above `until`,
+/// since each record's `first` is, and every row of a record is at or above its
+/// `first`. One range per origin, above `until`. A reopened record's rows,
+/// the one at its `last` included, name a record that stays, and stay. Returns
+/// how many rows it removed.
+fn remove_rows_naming(
+    txn: &WriteTxn<'_>,
+    until: Hlc,
+    named: &HashSet<(CollectionId, ScopeHash)>,
+) -> Result<usize> {
+    use std::ops::Bound::{Excluded, Included, Unbounded};
+    if named.is_empty() {
+        return Ok(0);
+    }
+    let mut rows = txn.open_table(IDEMPOTENCY_BY_STAMP)?;
+    let mut doomed: Vec<Vec<u8>> = Vec::new();
+    let mut past: Option<Vec<u8>> = None;
+    loop {
+        let next = match &past {
+            None => rows.range::<&[u8]>(..)?.next().transpose()?,
+            Some(past) => {
+                rows.range::<&[u8]>((Excluded(past.as_slice()), Unbounded))?.next().transpose()?
+            }
+        };
+        let Some((key, _)) = next else { break };
+        let key = key.value().to_vec();
+        let Some(at) = decode_row_key(&key) else {
+            // A key of another length names nothing; retention removes it.
+            past = Some(key);
+            continue;
+        };
+        let (above, end) = (row_key_at(at.node, until), row_key_at(at.node, Hlc::MAX));
+        for row in rows.range::<&[u8]>((Excluded(above.as_slice()), Included(end.as_slice())))? {
+            let (key, value) = row?;
+            if parse_row_value(value.value()).is_some_and(|row| named.contains(&row)) {
+                doomed.push(key.value().to_vec());
+            }
+        }
+        past = Some(end.to_vec());
+    }
+    for key in &doomed {
+        rows.remove(key.as_slice())?;
+    }
+    Ok(doomed.len())
+}
+
 /// An `IDEMPOTENCY_BY_STAMP` row's value: `collection id ‖ scope hash`.
 fn row_value(collection: CollectionId, scope: &ScopeHash) -> [u8; 40] {
     let mut out = [0u8; 40];
@@ -2095,7 +2142,10 @@ impl Engine {
     /// A rewind's share (`kimmyd restore --until`), in its transaction: a
     /// record of a request whose every write the rewind discards (`first` after
     /// `until`) goes, since nothing of the request stands and a retry must apply
-    /// it afresh. One the rewind cuts part-way (`first` at or before `until`,
+    /// it afresh, **with its rows by stamp** ([`remove_rows_naming`]): left
+    /// behind, each would be above the rewound servable vector, read as an F3
+    /// candidate by every frame until retention collected it, and would make a
+    /// backup of a store with no record carry tag 13. One the rewind cuts part-way (`first` at or before `until`,
     /// `last` after it) is a multi-chunk request that was still applying at
     /// `until`: it becomes `applying`, with no cursor, so a retry resumes from
     /// the beginning and the stamp rule writes what the rewind undid and nothing
@@ -2135,6 +2185,11 @@ impl Engine {
             records.insert((*id, scope.as_slice()), bytes.as_slice())?;
         }
         drop(records);
+        let named: HashSet<(CollectionId, ScopeHash)> = gone
+            .iter()
+            .filter_map(|(id, scope)| Some((CollectionId(*id), ScopeHash::from_slice(scope)?)))
+            .collect();
+        remove_rows_naming(txn, until, &named)?;
         for (id, scope, _) in &reopened {
             if let Some(scope) = ScopeHash::from_slice(scope) {
                 log_change(self, txn, CollectionId(*id), &scope)?;
