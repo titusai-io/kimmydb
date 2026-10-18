@@ -28757,7 +28757,15 @@ with it, and not be offered while any member could carry the write without it.
      so its sender goes straight to the documents. A whole-database snapshot, a scoped repair and a converge page
      (ADR-237) store a page's records in the page's transaction, those of a collection that stands here; a converge
      repair ships the collection's records for the whole window ahead of what may be a handful of documents, which is
-     accepted, since a bound on the page's stamps would miss a record whose rows lie below them.
+     accepted, since a bound on the page's stamps would miss a record whose rows lie below them. **One byte budget
+     per page:** `SNAPSHOT_PAGE_BYTES`, 63 MiB (`MAX_FRAME` less 1 MiB for what is not counted), less what the page's
+     definitions, drops and vector take, shared in order by the delta, the records phase and the documents and
+     tombstones. A row that does not fit goes first on the next page; one that does not fit a page holding nothing
+     else (the first page's definitions aside) is refused by name, the sender answering with `Message::Fault` (the
+     collection, the id, the size) instead of a frame `write_frame` refuses. Before it a page carried 512 rows whatever
+     their size, so 512 averaging over about 128 KiB (64 KiB with records on the page) made a page over a frame, the
+     connection closed, and the pull asked for the same page for ever (found in 0.51.0 while bounding the records
+     phase).
    - **The page delta.** A keyed write on the sender after a collection's records phase and before the page that holds
      its document would reach the receiver without its record. So each member keeps a node-local **change log**,
      `idempotency_changes`: one row per store that changes a record, on every path (a local commit, a frame, a replay
@@ -28770,10 +28778,10 @@ with it, and not be offered while any member could carry the write without it.
      the documents. **The epoch** is a random `i64` the log is given when it begins: with its first change, or at an
      open that finds records and no log of this node's identity (a restore, since a backup carries no log; an identity
      reset), before any page is cut, so a store that holds records always has one, and a sender restored twice during
-     one pull cuts bases of two epochs (the build review's m4). Keys are compared only within one epoch: a base of another epoch, or a key without one,
-     restarts the cursor's collection from its records phase, since a sender restored onto a host whose clock is behind
-     logs keys below a base cut before the restore, which no comparison of keys can tell; the zero base of a log that
-     had held nothing is sent every change. **The requester holds a page asked with the zero base to the epoch the page
+     one pull cuts bases of two epochs (the build review's m4). Keys are compared only within one epoch: a base of
+     another epoch, or a key without one, restarts the cursor's collection from its records phase, since a sender
+     restored onto a host whose clock is behind logs keys below a base cut before the restore, which no comparison of
+     keys can tell; the zero base of a log that had held nothing is sent every change. **The requester holds a page asked with the zero base to the epoch the page
      names** (`SnapshotPage.records_epoch`, on every page, the last included, which has no cursor to carry a base): one
      that names an epoch comes from a log begun since the base was cut, by a keyed write, which logs every record since,
      or at an open over restored records, which logs none of them. The requester cannot tell which, so it refuses the
@@ -28782,8 +28790,9 @@ with it, and not be offered while any member could carry the write without it.
      accepted. A 0.51 sender writes no `records_epoch` and holds no records; a 0.51 receiver ignores the field. With the
      open's beginning (item 6), a sender restored during a pull, once or twice, never lands an effect without its
      record (the build review's m4). **The remainder rule:** a page carries documents only with the whole
-     remainder of the log above its base within 32 MiB and 65,536 log rows; otherwise it is a records-only page, its
-     document position unchanged and its base moved to the last key it examined, logged at `INFO`. A sender whose keyed
+     remainder of the log above its base within the page's byte budget and 65,536 log rows; otherwise it is a
+     records-only page, its document position unchanged and its base moved to the last key it examined, logged at
+     `INFO`. A sender whose keyed
      changes, per page round trip, outrun what a frame carries sends records-only pages and stalls its snapshot until
      they slow. An older receiver drops `records_base`, and its pages carry no delta. With the delta, **a page never
      holds a document without the record of the write that produced it**: the residual the design accepted for a

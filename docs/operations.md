@@ -653,6 +653,14 @@ replication:
   pulled their entries. The window then carries no entries and grants the peer
   nothing until it has. It takes a frame's worth of such records, about 63 MiB,
   so it should not be seen.
+- **`WARN` `a snapshot page cannot be served`**, with `error`: a row of a
+  snapshot, repair or converge page, a document or the `find_and_modify` record
+  holding one, is larger than a page holds (63 MiB, what a frame holds less
+  1 MiB). The sender answers the request with a fault naming the collection, the
+  id and the size, and the requester's round fails with it
+  (`kimmy_sync_failures_total`); the pull asks again on its next round, and moves
+  on once the document is smaller. Such a document cannot cross in a window
+  either.
 - **`INFO` `a snapshot page carries only records`**, with `records`, `base` and
   `stopped`: what changed since the page before does not fit one page with its
   documents, so the page carries the records and the snapshot's position stays.
