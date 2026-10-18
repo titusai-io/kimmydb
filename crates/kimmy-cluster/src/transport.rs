@@ -56,65 +56,117 @@ const ENTRY_BUDGET: usize = MAX_FRAME - (1024 * 1024);
 pub(crate) enum Fits {
     All,
     Only(usize),
+    /// Not even the records the window must carry whatever else it carries
+    /// (the ones its sender cannot vouch for by its oplog): the frame carries no
+    /// entries and grants nothing.
+    Nothing,
 }
 
-/// How many leading entries fit inside [`ENTRY_BUDGET`], with the idempotency
-/// records they carry (B5): a record's bytes count with the entry whose stamp
-/// carries it, since a window cut to the entries that fit carries only theirs.
+/// How many leading entries fit inside [`ENTRY_BUDGET`], with **every record**
+/// the window ships (B5, records travel with coverage):
 ///
-/// Sizes each entry once and takes a running total, rather than serializing the
-/// whole batch to find out it is too big and then doing it again for a smaller one.
-/// The common case is a single pass that says `All`.
+/// - the first `unanchored` records, those the sender cannot vouch for by its
+///   oplog, are counted first, since a window carries them whatever else it
+///   carries; when they alone do not fit, [`Fits::Nothing`];
+/// - every other record counts with the first entry at or after the row that
+///   made the window ship it (`carrying`), in stamp order: a window cut before
+///   that entry ends before the row, so the coverage it grants does not pass
+///   it; a record whose row is past every entry counts at the window's end, and
+///   when it does not fit there the window is cut before its last entry.
+///
+/// Sizes each entry and record once and takes a running total, rather than
+/// serializing the whole batch to find out it is too big and then doing it
+/// again for a smaller one. The common case is a single pass that says `All`.
 pub(crate) fn how_many_fit(
     entries: &[OplogEntry],
     records: &[kimmy_storage::CarriedRecord],
+    unanchored: usize,
 ) -> Fits {
-    let mut carried: std::collections::HashMap<kimmy_core::Stamp, usize> =
-        std::collections::HashMap::new();
-    for record in records {
-        let Some(at) = record.carrying else { continue };
+    let unanchored = unanchored.min(records.len());
+    let mut total = 0usize;
+    for record in &records[..unanchored] {
+        match bson::serialize_to_vec(record) {
+            Ok(bytes) => total += bytes.len(),
+            Err(_) => return Fits::Nothing,
+        }
+    }
+    if total > ENTRY_BUDGET {
+        return Fits::Nothing;
+    }
+    let mut riders: Vec<(kimmy_core::Stamp, usize)> = Vec::new();
+    let mut at_end = 0usize;
+    for record in &records[unanchored..] {
         let size = match bson::serialize_to_vec(record) {
             Ok(bytes) => bytes.len(),
             // As an entry that does not encode: the frame would not either, so
-            // nothing from the entry that carries it on is offered.
+            // nothing from the entry its row belongs with on is offered.
             Err(_) => {
-                return Fits::Only(
-                    entries.iter().position(|e| e.stamp == at).unwrap_or(entries.len()),
-                );
+                let at = record.carrying.unwrap_or(kimmy_core::Stamp::new(
+                    kimmy_core::Hlc::ZERO,
+                    kimmy_core::NodeId::from_bytes([0; 16]),
+                ));
+                return Fits::Only(entries.iter().position(|e| e.stamp >= at).unwrap_or(0));
             }
         };
-        *carried.entry(at).or_default() += size;
+        match record.carrying {
+            Some(at) => riders.push((at, size)),
+            None => at_end += size,
+        }
     }
-    let mut total = 0usize;
+    riders.sort_by_key(|(at, _)| *at);
+    let mut next = 0usize;
     for (i, entry) in entries.iter().enumerate() {
-        let size = match bson::serialize_to_vec(entry) {
+        let mut size = match bson::serialize_to_vec(entry) {
             Ok(bytes) => bytes.len(),
             // Unencodable here means unencodable in the batch too, so stopping short
             // hands the caller the prefix that can be sent and lets the real error
             // surface where it is reported properly.
             Err(_) => return Fits::Only(i),
         };
-        let size = size + carried.get(&entry.stamp).copied().unwrap_or(0);
+        while next < riders.len() && riders[next].0 <= entry.stamp {
+            size += riders[next].1;
+            next += 1;
+        }
         if total + size > ENTRY_BUDGET {
             return Fits::Only(i);
         }
         total += size;
     }
+    let tail: usize = at_end + riders[next..].iter().map(|(_, size)| size).sum::<usize>();
+    if total + tail > ENTRY_BUDGET {
+        return match entries.len() {
+            0 => Fits::Nothing,
+            n => Fits::Only(n - 1),
+        };
+    }
     Fits::All
 }
 
-/// A window's records that ride with `entries`: those whose carrying stamp is
-/// one of theirs. What a frame cut to fewer entries than its window carries.
-pub(crate) fn records_of(
-    entries: &[OplogEntry],
+/// The records a replay page carries (B5, records travel with coverage): those
+/// the page's own advance vouches for, a row of the requester's origin in
+/// `(from, through]`, and every one its sender cannot vouch for by its oplog
+/// (the first `unanchored`, `records_for_coverage`'s F3), whatever the page
+/// carries of entries.
+pub(crate) fn records_of_replay(
+    their_node: kimmy_core::NodeId,
+    from: kimmy_core::Hlc,
+    through: kimmy_core::Hlc,
     records: Vec<kimmy_storage::CarriedRecord>,
-) -> Vec<kimmy_storage::CarriedRecord> {
-    let shipped: std::collections::HashSet<kimmy_core::Stamp> =
-        entries.iter().map(|entry| entry.stamp).collect();
-    records
+    unanchored: usize,
+) -> (Vec<kimmy_storage::CarriedRecord>, usize) {
+    let unanchored = unanchored.min(records.len());
+    let kept: Vec<_> = records
         .into_iter()
-        .filter(|record| record.carrying.is_some_and(|at| shipped.contains(&at)))
-        .collect()
+        .enumerate()
+        .filter(|(i, record)| {
+            *i < unanchored
+                || record
+                    .carrying
+                    .is_some_and(|at| at.node == their_node && at.hlc > from && at.hlc <= through)
+        })
+        .map(|(_, record)| record)
+        .collect();
+    (kept, unanchored)
 }
 
 /// The `KIMMY_TEST`-style switch that makes the listed members send every frame
@@ -125,18 +177,24 @@ pub(crate) fn records_of(
 static TEST_STRIP_RECORDS: std::sync::RwLock<Vec<kimmy_core::NodeId>> =
     std::sync::RwLock::new(Vec::new());
 
+/// Whether any member is listed in [`TEST_STRIP_RECORDS`]: a release never arms
+/// it, so the per-frame check is one relaxed load and no lock.
+static TEST_STRIP_ARMED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
 /// Make each of `nodes` serve its windows, pushes, replays and snapshot pages
 /// without idempotency records, as an older release does. A test switch.
 #[doc(hidden)]
 pub fn set_test_strip_records(nodes: Vec<kimmy_core::NodeId>) {
     if let Ok(mut stripped) = TEST_STRIP_RECORDS.write() {
+        TEST_STRIP_ARMED.store(!nodes.is_empty(), std::sync::atomic::Ordering::Relaxed);
         *stripped = nodes;
     }
 }
 
 /// Whether `node` serves without records ([`set_test_strip_records`]).
 pub(crate) fn strips_records(node: kimmy_core::NodeId) -> bool {
-    TEST_STRIP_RECORDS.read().is_ok_and(|stripped| stripped.contains(&node))
+    TEST_STRIP_ARMED.load(std::sync::atomic::Ordering::Relaxed)
+        && TEST_STRIP_RECORDS.read().is_ok_and(|stripped| stripped.contains(&node))
 }
 
 /// The records `engine` sends with a frame: none from a member a test has made
@@ -1086,8 +1144,9 @@ where
                 // fewer entries unasked would be a silent gap rather than a kindness.
                 // The records count: a window whose records push it over the
                 // frame is answered the same way (B5).
+                let unanchored = window.unanchored;
                 let records = records_to_send(engine, window.records);
-                match how_many_fit(&window.entries, &records) {
+                match how_many_fit(&window.entries, &records, unanchored) {
                     Fits::All => {
                         write_frame(
                             &mut stream,
@@ -1104,6 +1163,23 @@ where
                     Fits::Only(fits) => {
                         warn!(%limit, %fits, "batch does not fit in a frame; asking the peer for fewer");
                         write_frame(&mut stream, &Message::BatchTooLarge { fits }).await?;
+                    }
+                    Fits::Nothing => {
+                        warn!(
+                            records = unanchored,
+                            "the idempotency records this node cannot vouch for by its oplog do                              not fit one frame; this window carries no entries and grants the                              peer nothing until this node pulls their entries"
+                        );
+                        write_frame(
+                            &mut stream,
+                            &Message::Entries {
+                                entries: Vec::new(),
+                                scanned_to: from,
+                                exhausted: false,
+                                passed_through: None,
+                                records: Vec::new(),
+                            },
+                        )
+                        .await?
                     }
                 }
             }
@@ -2064,15 +2140,42 @@ where
                     .filter(|entry| entry.stamp.node == their_node && entry.stamp.hlc > from)
                     .collect();
                 let mut exhausted = window.exhausted && window.passed_through.is_none();
-                let records = records_to_send(engine, records_of(&entries, window.records));
-                if let Fits::Only(fits) = how_many_fit(&entries, &records) {
-                    // This side sizes the page: the peer cannot negotiate a limit.
-                    entries.truncate(fits.max(1).min(entries.len()));
-                    exhausted = false;
+                // The page's own advance and what this node cannot vouch for.
+                let through = entries.last().map_or(window.scanned_to, |e| e.stamp.hlc);
+                let (records, unanchored) = records_of_replay(
+                    their_node,
+                    from,
+                    through.max(window.scanned_to),
+                    records_to_send(engine, window.records),
+                    window.unanchored,
+                );
+                let mut nothing = false;
+                match how_many_fit(&entries, &records, unanchored) {
+                    Fits::All => {}
+                    Fits::Only(fits) => {
+                        // This side sizes the page: the peer cannot negotiate a limit.
+                        entries.truncate(fits.max(1).min(entries.len()));
+                        exhausted = false;
+                    }
+                    Fits::Nothing => {
+                        nothing = true;
+                        warn!(
+                            %peer,
+                            records = unanchored,
+                            "the idempotency records this node cannot vouch for by its oplog do                              not fit one replay page; the page carries nothing"
+                        );
+                        entries.clear();
+                        exhausted = false;
+                    }
                 }
-                // Only the records of the entries the page carries.
-                let records = records_of(&entries, records);
-                (entries, exhausted, false, window.scanned_to, records)
+                let scanned_to = if nothing { from } else { window.scanned_to };
+                // What the page carries: its advance as cut (to its last entry,
+                // or where an empty page's walk reached, as the cursor after it
+                // says), and the rest.
+                let through = entries.last().map_or(scanned_to, |e| e.stamp.hlc);
+                let (records, _) =
+                    records_of_replay(their_node, from, through, records, unanchored);
+                (entries, exhausted, false, scanned_to, records)
             }
         };
         let last_sent = entries.last().map(|entry| entry.stamp.hlc);
@@ -6192,12 +6295,14 @@ mod tests {
         io::Error::from_raw_os_error(24)
     }
 
-    /// A frame counts the idempotency records its entries carry (B5): a window
-    /// whose entries fit alone is cut where an entry and the record riding with
-    /// it no longer do, and a record riding with no entry of the frame costs it
-    /// nothing.
+    /// A frame counts every record its window ships (B5, records travel with
+    /// coverage): a record whose row lies at or before an entry counts with the
+    /// first such entry, so the window is cut where an entry and those records
+    /// no longer fit; a record whose row is past every entry, which rides with
+    /// no entry, counts at the window's end; and the records the sender cannot
+    /// vouch for lead, so a frame they alone overfill carries nothing.
     #[test]
-    fn a_frame_counts_the_records_its_entries_carry() {
+    fn a_frame_counts_every_record_its_window_ships() {
         use kimmy_core::{CollectionId, DocId, Hlc, NodeId, OpKind, ScopeHash, Stamp};
         let at = |ms: u64| Stamp::new(Hlc::new(ms, 0), NodeId::from_bytes([1; 16]));
         let entry = |ms: u64, size: usize| OplogEntry {
@@ -6208,19 +6313,26 @@ mod tests {
             body: Some(vec![0; size]),
         };
         let third = ENTRY_BUDGET / 3;
-        let entries = vec![entry(1, third), entry(2, third)];
-        assert!(matches!(how_many_fit(&entries, &[]), Fits::All), "premise: they fit alone");
-        let record = kimmy_storage::CarriedRecord {
+        let entries = vec![entry(10, third), entry(20, third)];
+        assert!(matches!(how_many_fit(&entries, &[], 0), Fits::All), "premise: they fit alone");
+        let record = |row: u64, size: usize| kimmy_storage::CarriedRecord {
             collection: CollectionId(1),
             scope: ScopeHash([1; 32]),
-            carrying: Some(at(2)),
-            record: vec![0; third + third / 2],
+            carrying: Some(at(row)),
+            record: vec![0; size],
         };
-        assert!(matches!(how_many_fit(&entries, std::slice::from_ref(&record)), Fits::Only(1)));
-        let first = kimmy_storage::CarriedRecord { carrying: Some(at(1)), ..record.clone() };
-        assert!(matches!(how_many_fit(&entries, &[first]), Fits::Only(1)));
-        let stray = kimmy_storage::CarriedRecord { carrying: Some(at(3)), ..record };
-        assert!(matches!(how_many_fit(&entries, &[stray]), Fits::All));
+        let big = third + third / 2;
+        // With the second entry (its row is at or before it), or with the first.
+        assert!(matches!(how_many_fit(&entries, &[record(15, big)], 0), Fits::Only(1)));
+        assert!(matches!(how_many_fit(&entries, &[record(5, big)], 0), Fits::Only(1)));
+        assert!(matches!(how_many_fit(&entries, &[record(5, third / 4)], 0), Fits::All));
+        // A record that rides no entry is counted all the same, at the end.
+        assert!(matches!(how_many_fit(&entries, &[record(30, big)], 0), Fits::Only(1)));
+        assert!(matches!(how_many_fit(&[], &[record(30, ENTRY_BUDGET)], 0), Fits::Nothing));
+        // The ones the sender cannot vouch for come first: past the budget alone,
+        // nothing; inside it, they leave less for the entries.
+        assert!(matches!(how_many_fit(&entries, &[record(30, ENTRY_BUDGET)], 1), Fits::Nothing));
+        assert!(matches!(how_many_fit(&entries, &[record(30, big)], 1), Fits::Only(1)));
     }
 
     /// The keys on a snapshot page and in the cut digest's uncovered lists are converted

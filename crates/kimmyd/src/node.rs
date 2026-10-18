@@ -826,6 +826,9 @@ async fn start_and_serve(
             lifecycle::rebuilt(&config.storage.data_dir);
             opened.store(true, std::sync::atomic::Ordering::SeqCst);
             let engine = Arc::new(engine);
+            // The B5 cluster tests' lab hooks (a build with the `lab-hooks` feature only).
+            #[cfg(feature = "lab-hooks")]
+            crate::lab_hooks::arm(&engine);
             // Kept for `run` from the moment the store is open, so that whatever
             // fails after it closes the store as a stop does: opened implies
             // kept, with no gap between.

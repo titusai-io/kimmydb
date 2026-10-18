@@ -632,7 +632,9 @@ refusal, and a malformed key's, are made before authentication, as a query
 string's is: they read the header and the route and nothing else. Whether this
 member takes keys now ([The gate](#the-gate)) is asked after authentication,
 since its refusal can name a member of the cluster: a keyed request with no
-token is `401`, as without the header.
+token is `401`, as without the header. It is asked **before authorization**, so
+for a keyed request the gate's `400` comes before RBAC's `403`: a principal
+without the write grant on the collection meets the gate's `400` first.
 
 **This changed in 0.52.0.** Earlier releases ignored the header on every
 route, so a client or a proxy that stamps it on every request breaks against
@@ -669,8 +671,9 @@ request. An MCP call is fingerprinted over the tool and its arguments without
 | Two single-document requests with one key at once | They wait for the single writer as any write does: whichever commits first applies, and the other is answered from its record |
 | The request changed nothing: refused, matched nothing, or left every document as it was ([ADR-208](decisions.md)) | No record: a retry is evaluated again, and since the first attempt changed nothing it is still the request's only change |
 
-**Authorization comes first.** A principal whose grant was revoked since gets
-`403`, not a replay.
+**Authorization comes before the record.** A principal whose grant was revoked
+since gets `403`, not a replay. (The gate is asked earlier still: while the
+member does not take keys, a keyed request is `400` whatever its grants.)
 
 ### A keyed write past one chunk
 
@@ -776,8 +779,9 @@ it with `400 bad_request`, naming the header and the cause: the switch when it
 is off, otherwise the live member that does not carry records (a member of an
 earlier release, or one not heard from yet). The refusal comes after
 authentication, so a caller with no token is answered `401` and learns nothing
-of the cluster. The member then does not list `idempotency-keys`. The switch
-defaults to `true` with clustering off, so a
+of the cluster, and before authorization, so a principal without the write
+grant gets this `400`, not `403`. The member then does not list
+`idempotency-keys`. The switch defaults to `true` with clustering off, so a
 single node takes keys with no setting, and to `false` with clustering on: a
 cluster takes them once its operator has set it, after every member runs this
 release ([Operations](operations.md#clusteridempotency_keys-and-the-procedure)).
@@ -1668,7 +1672,7 @@ and `verify` today, and a client treats a class it does not know as `no`.
 | 429 | `rate_limited` | wait | Too many failed logins from this caller, or an authenticated principal over its request budget (`server.rate_limit.per_principal`). Carries `Retry-After` in seconds |
 | 502 | `provider_error` | wait | An upstream embedding provider failed. Every node calls the same provider, so waiting helps and moving does not |
 | 503 | `timeout` | wait | The request was still waiting — for the rest of its body, or for an embedding provider — at `server.request_timeout_secs` (30 s by default) and this node abandoned it. Not a query timeout: storage work already running completes and is answered ([ADR-099](decisions.md)). **An index create or drop is never answered this way once it has committed**, even when building the index took the whole deadline: members that have not confirmed it by then are reported as pending instead ([ADR-140](decisions.md), and ADR-099's addendum) |
-| 500 | `outcome_unknown` | verify | A write reached the storage engine's durability step and then failed, so it **may or may not have been applied** — and if it was, it replicates. **Read the target back before sending it again**, unless the write is idempotent: see [retrying after an unknown outcome](clients.md#retrying-after-an-unknown-outcome). A node whose own fsync fails usually stops (ADR-188) before it can answer, so a client more often meets this as a dropped connection after its request was sent, which it must treat the same way |
+| 500 | `outcome_unknown` | verify | A write reached the storage engine's durability step and then failed, so it **may or may not have been applied** — and if it was, it replicates. **Read the target back before sending it again**, unless the write is idempotent or carries an [`Idempotency-Key`](#idempotency-keys), which makes sending it again with the same key safe on the member that took it: see [retrying after an unknown outcome](clients.md#retrying-after-an-unknown-outcome). A node whose own fsync fails usually stops (ADR-188) before it can answer, so a client more often meets this as a dropped connection after its request was sent, which it must treat the same way |
 | 500 | `partially_applied` | verify | A request that commits in more than one transaction — a `multi: true` update or delete, a database drop — failed after its first commit. **What landed stands and replicates**, and `applied` says how much; `cause` says why the rest did not. Read back, or resend a request built to skip what is done: see [a request that was partly applied](#a-request-that-was-partly-applied). Never resend it blindly |
 | 500 | `internal` | elsewhere | Storage failure on this node — details logged, never returned |
 | 503 | `starting` | elsewhere | This node has bound its port and is still starting, and answers only `/healthz` and `/readyz` until it is up: nothing was read or written. Send it to another member ([ADR-198](decisions.md)) |

@@ -35,9 +35,9 @@
 //! 1. **Look the record up**, with the life rule below. The same fingerprint
 //!    replays; another is refused.
 //! 2. **Write as today.**
-//! 3. **If it wrote**, put the record and its [`IDEMPOTENCY_BY_STAMP`] row at
-//!    the record's `last`, which for a local commit is the stamp of the first
-//!    entry the transaction wrote.
+//! 3. **If it wrote**, put the record and its [`IDEMPOTENCY_BY_STAMP`] rows at
+//!    the record's merged `first` and `last`, which for a first local commit are
+//!    one stamp, the stamp of the first entry the transaction wrote.
 //! 4. **Commit.** Under `durable` the commit fsyncs before the writer is let
 //!    go, so a later lookup can only find a durable record.
 //! 5. **Publish.**
@@ -87,14 +87,30 @@
 //! that rule, a fresh attempt's later chunks included: another attempt of the
 //! request may have merged its record and its writes in between.
 //!
-//! # For replication (phase R)
+//! # For replication: records travel with coverage
 //!
-//! [`records_at_stamps`], [`records_for_window`] and
-//! [`records_for_collection_page`] read what a sender ships;
-//! [`Engine::store_record`] merges what a receiver is sent, in the caller's
-//! transaction, writing the rows at the merged `last` and at the carrying
-//! stamp, and witnessing the record's stamps. [`Engine::record_is_history`] is
-//! the life rule for a record a peer sent.
+//! A record's **rows** ([`IDEMPOTENCY_BY_STAMP`], keyed origin-major, `node ‖
+//! hlc`, so the rows of one origin between two stamps are one range) say which
+//! stamps vouch for it: its merged `first` and `last`, and every stamp a frame
+//! carried it at. A peer window ships, with whatever entries it holds
+//! ([`records_for_coverage`]):
+//!
+//! - **F2**, every live record with a row inside the coverage the window grants
+//!   the requester: above what it holds of that origin, and at or below what the
+//!   window's end and this node's servable vector reach;
+//! - **F3**, every live record with a row this node's own servable vector does
+//!   not reach and the requester does not hold: a row a page or a lost entry
+//!   left, which no window of this node would otherwise ever vouch for.
+//!
+//! A receiver stores every record a frame carries in the transaction that
+//! raises its coverage, whether or not an entry of its collection was taken
+//! ([`Engine::store_record`], merged, history refused, rows at the merged
+//! `first` and `last` and at the sender's row, its stamps witnessed, nothing
+//! written when it holds all of that already). So a member whose coverage of an
+//! origin passes a row holds the record with `first` at or below it, and a
+//! member that takes a request's effect under any origin takes its record with
+//! it. [`records_for_collection_page`] reads a snapshot's records phase.
+//! [`Engine::record_is_history`] is the life rule for a record a peer sent.
 
 use std::collections::HashSet;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -275,9 +291,21 @@ impl RecordOutcome {
 pub struct IdempotencyRecord {
     pub fingerprint: Fingerprint,
     /// The stamp of the first entry the request wrote; after a merge, the
-    /// smallest of its attempts' `first`.
+    /// smallest of its attempts' `first`. What the stamp rule judges a resume
+    /// by: a resume writes a match only when it is stored below this.
     pub first: Stamp,
-    /// The carrying stamp of the latest commit that changed the record.
+    /// **The stamp of the last entry the latest commit that changed the record
+    /// wrote** (L1): for a commit of one entry, that entry's; for a bulk insert
+    /// or a chunk of a filtered write, the highest stamp it wrote; the
+    /// record-only commit that marks a request `done` keeps the standing
+    /// record's (G8's residual). After a merge, the larger of the two. The record's row moves with it, and the record is judged by it: the
+    /// life rule makes it **history only when a drop is at or above every entry
+    /// the request wrote**, comparing by `Hlc` with a tie going to the drop, as
+    /// every comparison of a stamp against a drop does (ADR-236). So a drop at
+    /// the HLC of a commit's first entry, with a later entry of the same commit
+    /// standing in the new life, leaves the record standing, and a retry there
+    /// is answered from it; a drop at or above the HLC of its last entry makes
+    /// it history with every document the request wrote.
     pub last: Stamp,
     /// The member that wrote it.
     pub origin: NodeId,
@@ -561,10 +589,22 @@ impl IdempotencyRecord {
         origin: NodeId,
         outcome: RecordOutcome,
     ) -> Self {
+        Self::written_through(keyed, first, first, origin, outcome)
+    }
+
+    /// [`Self::written`] for a commit of several entries: `first` the stamp of
+    /// the first it wrote, `last` the stamp of the last (L1).
+    pub(crate) fn written_through(
+        keyed: &KeyedWrite,
+        first: Stamp,
+        last: Stamp,
+        origin: NodeId,
+        outcome: RecordOutcome,
+    ) -> Self {
         Self {
             fingerprint: keyed.fingerprint,
             first,
-            last: first,
+            last,
             origin,
             state: RecordState::Done,
             outcome,
@@ -605,6 +645,35 @@ impl IdempotencyRecord {
 
 // -- The tables ------------------------------------------------------------------------------
 
+/// The length of an [`IDEMPOTENCY_BY_STAMP`] key: `node (16) ‖ hlc`.
+pub(crate) const ROW_KEY_LEN: usize = 16 + kimmy_core::HLC_ENCODED_LEN;
+
+/// An [`IDEMPOTENCY_BY_STAMP`] key: **origin-major**, the node and then the
+/// hlc, so that the rows of one origin between two stamps are one range (the
+/// coverage rule's reads, [`records_for_coverage`]) and retention seeks each
+/// origin's expired prefix. Not the oplog's `hlc ‖ node`.
+pub(crate) fn row_key(stamp: &Stamp) -> [u8; ROW_KEY_LEN] {
+    row_key_at(stamp.node, stamp.hlc)
+}
+
+fn row_key_at(node: NodeId, hlc: Hlc) -> [u8; ROW_KEY_LEN] {
+    let mut key = [0u8; ROW_KEY_LEN];
+    key[..16].copy_from_slice(&node.to_bytes());
+    key[16..].copy_from_slice(&hlc.to_bytes());
+    key
+}
+
+/// The stamp of an [`IDEMPOTENCY_BY_STAMP`] key, or `None` for a key of
+/// another length.
+pub(crate) fn decode_row_key(key: &[u8]) -> Option<Stamp> {
+    if key.len() != ROW_KEY_LEN {
+        return None;
+    }
+    let node: [u8; 16] = key[..16].try_into().ok()?;
+    let hlc: [u8; kimmy_core::HLC_ENCODED_LEN] = key[16..].try_into().ok()?;
+    Some(Stamp::new(Hlc::from_bytes(hlc), NodeId::from_bytes(node)))
+}
+
 /// An `IDEMPOTENCY_BY_STAMP` row's value: `collection id ‖ scope hash`.
 fn row_value(collection: CollectionId, scope: &ScopeHash) -> [u8; 40] {
     let mut out = [0u8; 40];
@@ -631,7 +700,22 @@ fn read_record(
     }
 }
 
-/// Write `record` under its key, and its row at its `last`, in `txn`.
+/// The stamps a stored record has rows at: its `first` and its `last` (one
+/// stamp for a record of one commit), and the carrying stamp a frame named.
+fn row_stamps(record: &IdempotencyRecord, carrying: Option<Stamp>) -> Vec<Stamp> {
+    let mut stamps = vec![record.first, record.last];
+    stamps.extend(carrying);
+    stamps.sort();
+    stamps.dedup();
+    stamps
+}
+
+/// Write `record` under its key, and its rows ([`row_stamps`]), in `txn`.
+///
+/// **The row at `first` (F1)** is what lets a member that holds the record vouch
+/// for it at the stamp a resume is judged by: a member whose coverage of
+/// `first`'s origin passes it, through any window of a member that holds the
+/// record, is sent the record (the coverage rule, [`records_for_coverage`]).
 fn put_rows(
     txn: &redb::WriteTransaction,
     collection: CollectionId,
@@ -643,11 +727,40 @@ fn put_rows(
         .insert((collection.0, scope.as_bytes().as_slice()), record.encode().as_slice())?;
     let mut rows = txn.open_table(IDEMPOTENCY_BY_STAMP)?;
     let value = row_value(collection, scope);
-    rows.insert(codec::oplog_key(&record.last).as_slice(), value.as_slice())?;
-    if let Some(carrying) = carrying {
-        rows.insert(codec::oplog_key(&carrying).as_slice(), value.as_slice())?;
+    for stamp in row_stamps(record, carrying) {
+        rows.insert(row_key(&stamp).as_slice(), value.as_slice())?;
     }
     Ok(())
+}
+
+/// Whether `stored` is exactly what is under the key, and every row a store of
+/// it would write is there already: a store that would write nothing.
+fn store_is_a_no_op(
+    txn: &redb::WriteTransaction,
+    collection: CollectionId,
+    scope: &ScopeHash,
+    stored: &IdempotencyRecord,
+    carrying: Option<Stamp>,
+) -> Result<bool> {
+    let encoded = stored.encode();
+    let same = txn
+        .open_table(IDEMPOTENCY)?
+        .get((collection.0, scope.as_bytes().as_slice()))?
+        .is_some_and(|raw| raw.value() == encoded.as_slice());
+    if !same {
+        return Ok(false);
+    }
+    let rows = txn.open_table(IDEMPOTENCY_BY_STAMP)?;
+    let value = row_value(collection, scope);
+    for stamp in row_stamps(stored, carrying) {
+        let present = rows
+            .get(row_key(&stamp).as_slice())?
+            .is_some_and(|row| row.value() == value.as_slice());
+        if !present {
+            return Ok(false);
+        }
+    }
+    Ok(true)
 }
 
 /// A record on the wire: its key, the stamp of the entry that carries it, and
@@ -706,60 +819,136 @@ pub fn lenient_records<'de, D: serde::Deserializer<'de>>(
     Ok(items.into_iter().filter_map(|item| bson::deserialize_from_bson(item).ok()).collect())
 }
 
-/// The records that ride with the entries stamped `stamps`, read in the read
-/// transaction that read them: one point read of [`IDEMPOTENCY_BY_STAMP`] per
-/// stamp, for a window that came from the arrival-index walk. A row that names
-/// no record (its record was purged or collected) carries nothing.
-pub fn records_at_stamps(txn: &ReadTransaction, stamps: &[Stamp]) -> Result<Vec<CarriedRecord>> {
+/// The records a peer window ships, read in the window's own read transaction
+/// (B5, records travel with coverage). For each origin `o`, with `floor[o]` what
+/// the requester holds of it:
+///
+/// - **F3 first**: every record with a row of `o` above both `floor[o]` and
+///   this node's `servable[o]`, a stamp no window of this node can vouch for by
+///   its oplog ([`records_unanchored`]);
+/// - **F2**: every record with a row of `o` in `(floor[o], reach[o]]`, where
+///   `reach` is the coverage the window grants ([`records_in_advance`]).
+///
+/// One per key, the first row found naming it as `carrying`, and only a record
+/// that stands under its key (a row whose record was purged or collected ships
+/// nothing). Returns them with the F3 records leading, and how many those are:
+/// what the transport fits first.
+pub fn records_for_coverage(
+    txn: &ReadTransaction,
+    floor: &dyn Fn(NodeId) -> Hlc,
+    reach: &kimmy_core::VersionVector,
+    servable: &kimmy_core::VersionVector,
+) -> Result<(Vec<CarriedRecord>, usize)> {
     let rows = txn.open_table(IDEMPOTENCY_BY_STAMP)?;
     let records = txn.open_table(IDEMPOTENCY)?;
-    let mut out = Vec::new();
-    for stamp in stamps {
-        let Some(value) = rows.get(codec::oplog_key(stamp).as_slice())? else { continue };
-        let Some((collection, scope)) = parse_row_value(value.value()) else { continue };
-        if let Some(record) = records.get((collection.0, scope.as_bytes().as_slice()))? {
-            out.push(CarriedRecord {
-                collection,
-                scope,
-                carrying: Some(*stamp),
-                record: record.value().to_vec(),
-            });
-        }
-    }
-    Ok(out)
+    let mut shipping = Shipping { seen: HashSet::new(), out: Vec::new() };
+    records_unanchored(&rows, &records, floor, servable, &mut shipping)?;
+    let unanchored = shipping.out.len();
+    records_in_advance(&rows, &records, floor, reach, &mut shipping)?;
+    Ok((shipping.out, unanchored))
 }
 
-/// [`records_at_stamps`] for a window read in stamp order: one range read of
-/// [`IDEMPOTENCY_BY_STAMP`] from `first` to `last`, both shipped, keeping the
-/// rows at stamps `shipped` says the frame carries. Bounded by the window, which
-/// the caller has already read.
-pub fn records_for_window(
-    txn: &ReadTransaction,
-    first: Stamp,
-    last: Stamp,
-    shipped: &dyn Fn(&Stamp) -> bool,
-) -> Result<Vec<CarriedRecord>> {
-    let rows = txn.open_table(IDEMPOTENCY_BY_STAMP)?;
-    let records = txn.open_table(IDEMPOTENCY)?;
-    let (from, to) = (codec::oplog_key(&first), codec::oplog_key(&last));
-    let mut out = Vec::new();
-    for row in rows.range::<&[u8]>(from.as_slice()..=to.as_slice())? {
-        let (key, value) = row?;
-        let Ok(carrying) = codec::decode_oplog_key(key.value()) else { continue };
-        if !shipped(&carrying) {
-            continue;
+/// The records a window has found so far, one per key.
+struct Shipping {
+    seen: HashSet<(u64, [u8; 32])>,
+    out: Vec<CarriedRecord>,
+}
+
+impl Shipping {
+    /// Ship the record the row `(key, value)` names, unless it is shipped already
+    /// or nothing stands under its key.
+    fn row(
+        &mut self,
+        records: &impl ReadableTable<(u64, &'static [u8]), &'static [u8]>,
+        key: &[u8],
+        value: &[u8],
+    ) -> Result<()> {
+        let (Some(carrying), Some((collection, scope))) =
+            (decode_row_key(key), parse_row_value(value))
+        else {
+            return Ok(());
+        };
+        if !self.seen.insert((collection.0, *scope.as_bytes())) {
+            return Ok(());
         }
-        let Some((collection, scope)) = parse_row_value(value.value()) else { continue };
         if let Some(record) = records.get((collection.0, scope.as_bytes().as_slice()))? {
-            out.push(CarriedRecord {
+            self.out.push(CarriedRecord {
                 collection,
                 scope,
                 carrying: Some(carrying),
                 record: record.value().to_vec(),
             });
         }
+        Ok(())
     }
-    Ok(out)
+}
+
+/// F3 of [`records_for_coverage`]: for each origin with a row, one seek to that
+/// origin's rows above `max(floor, servable)` and a range over them. Bounded by
+/// the origins that have rows and the rows this node holds above its own
+/// servable vector: rows a page or a lost entry left, which its next pull of
+/// their entries anchors.
+fn records_unanchored(
+    rows: &impl ReadableTable<&'static [u8], &'static [u8]>,
+    records: &impl ReadableTable<(u64, &'static [u8]), &'static [u8]>,
+    floor: &dyn Fn(NodeId) -> Hlc,
+    servable: &kimmy_core::VersionVector,
+    shipping: &mut Shipping,
+) -> Result<()> {
+    use std::ops::Bound::{Excluded, Included, Unbounded};
+    let mut past: Option<[u8; ROW_KEY_LEN]> = None;
+    loop {
+        // not a row: the next origin with a row, one seek.
+        let next = match &past {
+            None => rows.range::<&[u8]>(..)?.next(),
+            Some(past) => rows.range::<&[u8]>((Excluded(past.as_slice()), Unbounded))?.next(),
+        };
+        let Some(next) = next.transpose()? else { return Ok(()) };
+        let key = next.0.value().to_vec();
+        drop(next);
+        let Some(at) = decode_row_key(&key) else {
+            // A key of another length: passed over, as a row naming nothing.
+            past = key.as_slice().try_into().ok();
+            if past.is_none() {
+                return Ok(());
+            }
+            continue;
+        };
+        let above = floor(at.node).max(servable.get(at.node));
+        let (from, to) = (row_key_at(at.node, above), row_key_at(at.node, Hlc::MAX));
+        for row in rows.range::<&[u8]>((Excluded(from.as_slice()), Included(to.as_slice())))? {
+            let (key, value) = row?;
+            shipping.row(records, key.value(), value.value())?;
+        }
+        past = Some(to);
+    }
+}
+
+/// F2 of [`records_for_coverage`]: for each origin the window's coverage
+/// reaches past what the requester holds, one range over that origin's rows in
+/// `(floor, reach]`. Bounded by the rows inside the advance the window grants:
+/// at most a row per stamp the requester's coverage passes, entries this node
+/// holds or not.
+fn records_in_advance(
+    rows: &impl ReadableTable<&'static [u8], &'static [u8]>,
+    records: &impl ReadableTable<(u64, &'static [u8]), &'static [u8]>,
+    floor: &dyn Fn(NodeId) -> Hlc,
+    reach: &kimmy_core::VersionVector,
+    shipping: &mut Shipping,
+) -> Result<()> {
+    use std::ops::Bound::{Excluded, Included};
+    for (node, reached) in reach.iter() {
+        let held = floor(node);
+        if reached <= held {
+            continue;
+        }
+        let (from, to) = (row_key_at(node, held), row_key_at(node, reached));
+        for row in rows.range::<&[u8]>((Excluded(from.as_slice()), Included(to.as_slice())))? {
+            let (key, value) = row?;
+            shipping.row(records, key.value(), value.value())?;
+        }
+    }
+    Ok(())
 }
 
 /// One page of a collection's records for a snapshot's records phase: up to
@@ -866,7 +1055,8 @@ impl RecordsVia {
 
 /// A frame's records, decoded once for the batch that applies its entries, and
 /// each stored at most once: in the run that takes the first entry of its
-/// collection (B5, "On the receiving side").
+/// collection, or else in the batch's last transaction, the one that raises the
+/// witnessed vector (B5, records travel with coverage).
 pub(crate) struct FrameRecords {
     via: RecordsVia,
     /// `(collection, scope, carrying stamp, record, stored yet)`.
@@ -883,6 +1073,11 @@ impl FrameRecords {
     /// yet.
     pub(crate) fn owes(&self, id: CollectionId) -> bool {
         self.records.iter().any(|(collection, _, _, _, stored)| *collection == id && !stored)
+    }
+
+    /// Whether any of the frame's records is not stored yet.
+    pub(crate) fn owes_any(&self) -> bool {
+        self.records.iter().any(|(_, _, _, _, stored)| !stored)
     }
 }
 
@@ -924,9 +1119,43 @@ impl Engine {
             if *collection != id || *done {
                 continue;
             }
-            if self.store_record(txn, memo, standing, id, scope, record, *carrying)?.is_some() {
-                stored += 1;
+            let (_, wrote) =
+                self.store_record_noting(txn, memo, standing, id, scope, record, *carrying)?;
+            stored += usize::from(wrote);
+            *done = true;
+        }
+        Ok(stored)
+    }
+
+    /// Store, in the transaction that raises this node's coverage for the frame,
+    /// every record of the frame no run stored: **whether or not an entry of its
+    /// collection was taken, and whether or not the collection stands here**. A
+    /// window grants coverage per origin, not per collection, and a stamp it
+    /// covers is never served here again, so the record it vouched for at that
+    /// stamp is stored now or never. The life rule still refuses history.
+    /// Returns how many it wrote: a record held already writes nothing.
+    pub(crate) fn store_owed_records(
+        &self,
+        txn: &WriteTxn<'_>,
+        memo: &mut Memo,
+        frame: &mut FrameRecords,
+    ) -> Result<usize> {
+        let mut stored = 0usize;
+        for (collection, scope, carrying, record, done) in &mut frame.records {
+            if *done {
+                continue;
             }
+            let standing = self.memo_collection(memo, *collection)?;
+            let (_, wrote) = self.store_record_noting(
+                txn,
+                memo,
+                standing.as_deref(),
+                *collection,
+                scope,
+                record,
+                *carrying,
+            )?;
+            stored += usize::from(wrote);
             *done = true;
         }
         Ok(stored)
@@ -978,20 +1207,16 @@ impl Engine {
             let Some(standing) = self.memo_collection(memo, wire.collection)? else {
                 continue;
             };
-            if self
-                .store_record(
-                    txn,
-                    memo,
-                    Some(&standing),
-                    wire.collection,
-                    &wire.scope,
-                    &record,
-                    None,
-                )?
-                .is_some()
-            {
-                stored += 1;
-            }
+            let (_, wrote) = self.store_record_noting(
+                txn,
+                memo,
+                Some(&standing),
+                wire.collection,
+                &wire.scope,
+                &record,
+                None,
+            )?;
+            stored += usize::from(wrote);
         }
         Ok(stored)
     }
@@ -1302,11 +1527,12 @@ impl Engine {
         Ok(merged)
     }
 
-    /// Store a record a peer sent, in the transaction that takes its entries
-    /// (or a snapshot or converge page's): merged into the live one, with a
-    /// row at the merged `last` and, when the frame named one, at the carrying
-    /// stamp, so the record travels onward with that entry. The record's stamps
-    /// are witnessed: a resume here must write above its `first`.
+    /// Store a record a peer sent, in the transaction that raises this node's
+    /// coverage (or a snapshot or converge page's): merged into the live one,
+    /// with rows at the merged `first` and `last` and, when the frame named one,
+    /// at the sender's row (`carrying`), so this node vouches for it onward at
+    /// the stamps it was vouched for to it. The record's stamps are witnessed: a
+    /// resume here must write above its `first`.
     ///
     /// Not stored when it is history by the life rule; what stands under the
     /// key and is not alive (history, past the window, unreadable by this
@@ -1322,8 +1548,29 @@ impl Engine {
         record: &IdempotencyRecord,
         carrying: Option<Stamp>,
     ) -> Result<Option<IdempotencyRecord>> {
+        let (stored, _) =
+            self.store_record_noting(txn, memo, standing, collection, scope, record, carrying)?;
+        Ok(stored)
+    }
+
+    /// [`Self::store_record`], also saying whether it wrote anything. **A store
+    /// that would change nothing writes nothing** (the merge is what stands and
+    /// its rows are there): a sender ships a record it cannot vouch for in every
+    /// window until it can (F3), and a window of records a receiver holds already
+    /// must not cost it a write, nor a commit where nothing else is written.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn store_record_noting(
+        &self,
+        txn: &WriteTxn<'_>,
+        memo: &mut Memo,
+        standing: Option<&CollectionMeta>,
+        collection: CollectionId,
+        scope: &ScopeHash,
+        record: &IdempotencyRecord,
+        carrying: Option<Stamp>,
+    ) -> Result<(Option<IdempotencyRecord>, bool)> {
         if self.record_is_history(memo, standing, collection, record)? {
-            return Ok(None);
+            return Ok((None, false));
         }
         let live = match self.live_record_in(txn, memo, standing, collection, scope) {
             Ok(live) => live,
@@ -1339,44 +1586,87 @@ impl Engine {
             Some(live) => live.merge(record),
             None => record.clone(),
         };
-        put_rows(txn, collection, scope, &merged, carrying)?;
         self.witness(&merged.first);
         self.witness(&merged.last);
-        Ok(Some(merged))
+        if live.as_ref() == Some(&merged)
+            && store_is_a_no_op(txn, collection, scope, &merged, carrying)?
+        {
+            return Ok((Some(merged), false));
+        }
+        put_rows(txn, collection, scope, &merged, carrying)?;
+        Ok((Some(merged), true))
     }
 
     /// Retention's records step: every [`IDEMPOTENCY_BY_STAMP`] row stamped
-    /// below `cutoff`, found under a read transaction and removed
-    /// [`RECORD_COLLECT_CHUNK`] at a time, each chunk its own commit with the
-    /// writer released between them (ADR-151). Each row is re-checked under
-    /// the writer: its record goes only when the record's `last` is at or below
-    /// the row's stamp, so a record a later commit changed is kept and only the
-    /// row goes. Returns how many records it removed.
+    /// below `cutoff`, found under a read transaction, one seek per origin to
+    /// that origin's rows below the cutoff (the table is keyed origin-major),
+    /// and removed [`RECORD_COLLECT_CHUNK`] at a time, each chunk its own commit
+    /// with the writer released between them (ADR-151) and the next chunk read
+    /// on from where the last one ended. Each row is re-checked under the
+    /// writer ([`Self::remove_expired_records`]). Returns how many records it
+    /// removed.
     ///
-    /// At or below, and not only at: a record whose `last` is below a row's
-    /// stamp that is below the cutoff is past its window, and its own row at
-    /// `last` is the only other thing that removes it. A record this build
-    /// cannot decode has no `last` to age by: it goes with the first of its rows
-    /// to expire, which is at least one window after its first commit. It was
-    /// absent to every lookup here all along, so that costs only a newer build
-    /// rolled forward to, and a rollback already reopens that gap. A stop ends
-    /// the read of the next chunk with its error, between two chunks.
+    /// A record goes once its `last` is below the cutoff, with the first of its
+    /// rows at or above `last` met. **A row at the `first` of a record still
+    /// inside the window is kept** (F1): it is the stamp the record is vouched
+    /// for at when its request's first write is covered, and the coverage rule
+    /// reads it. A record this build cannot decode has no `last` to age by: it
+    /// goes with the first of its rows to expire, which is at least one window
+    /// after its first commit. It was absent to every lookup here all along, so
+    /// that costs only a newer build rolled forward to, and a rollback already
+    /// reopens that gap. A stop ends the read of the next chunk with its error,
+    /// between two chunks.
     pub(crate) fn collect_idempotency_records(&self, cutoff: Hlc) -> Result<usize> {
         use redb::ReadableDatabase;
-        let bound = codec::oplog_key_lower_bound(cutoff);
+        use std::ops::Bound::{Excluded, Unbounded};
         let mut collected = 0usize;
+        let mut after: Option<Vec<u8>> = None;
         loop {
             let expired: Vec<(Vec<u8>, Vec<u8>)> = {
                 let txn = self.db().begin_read()?;
                 let rows =
                     open_walk_table(&txn, IDEMPOTENCY_BY_STAMP, self.walk(WalkScope::Background))?;
                 let mut expired = Vec::new();
-                for row in rows.range::<&[u8]>(..bound.as_slice())? {
-                    let (key, value) = row?;
-                    expired.push((key.value().to_vec(), value.value().to_vec()));
-                    if expired.len() >= RECORD_COLLECT_CHUNK {
-                        break;
+                let mut past = after.clone();
+                'origins: loop {
+                    let next = match &past {
+                        None => rows.range::<&[u8]>(..)?.next().transpose()?,
+                        Some(past) => {
+                            let mut on =
+                                rows.range::<&[u8]>((Excluded(past.as_slice()), Unbounded))?;
+                            on.next().transpose()?
+                        }
+                    };
+                    let Some(next) = next else { break };
+                    let key = next.0.value().to_vec();
+                    drop(next);
+                    let Some(at) = decode_row_key(&key) else {
+                        // A key of another length names nothing: it goes.
+                        expired.push((key.clone(), Vec::new()));
+                        past = Some(key);
+                        if expired.len() >= RECORD_COLLECT_CHUNK {
+                            break;
+                        }
+                        continue;
+                    };
+                    let below = row_key_at(at.node, cutoff);
+                    let (from, resumed) = match &past {
+                        Some(past) => (past.clone(), true),
+                        None => (key.clone(), false),
+                    };
+                    let lower = if resumed {
+                        Excluded(from.as_slice())
+                    } else {
+                        std::ops::Bound::Included(from.as_slice())
+                    };
+                    for row in rows.range::<&[u8]>((lower, Excluded(below.as_slice())))? {
+                        let (key, value) = row?;
+                        expired.push((key.value().to_vec(), value.value().to_vec()));
+                        if expired.len() >= RECORD_COLLECT_CHUNK {
+                            break 'origins;
+                        }
                     }
+                    past = Some(row_key_at(at.node, Hlc::MAX).to_vec());
                 }
                 expired
             };
@@ -1384,7 +1674,8 @@ impl Engine {
                 break;
             }
             let full = expired.len() >= RECORD_COLLECT_CHUNK;
-            let removed = self.remove_expired_records(&expired)?;
+            after = expired.last().map(|(key, _)| key.clone());
+            let removed = self.remove_expired_records(&expired, cutoff)?;
             // Counted per chunk, once its commit has landed: a stop before the
             // next chunk leaves the count true.
             self.idempotency.collected.fetch_add(removed as u64, Ordering::Relaxed);
@@ -1396,8 +1687,11 @@ impl Engine {
         Ok(collected)
     }
 
-    /// One chunk of [`Self::collect_idempotency_records`], under the writer.
-    fn remove_expired_records(&self, rows: &[(Vec<u8>, Vec<u8>)]) -> Result<usize> {
+    /// One chunk of [`Self::collect_idempotency_records`], under the writer: each
+    /// row re-read, and removed unless it is the `first` of a record still
+    /// inside the window; the record removed with it when the record's `last` is
+    /// at or below the row's stamp.
+    fn remove_expired_records(&self, rows: &[(Vec<u8>, Vec<u8>)], cutoff: Hlc) -> Result<usize> {
         let txn = self.begin_write(WriterHolder::Retention)?;
         let mut removed = 0usize;
         {
@@ -1405,28 +1699,37 @@ impl Engine {
             let mut records = txn.open_table(IDEMPOTENCY)?;
             for (key, _) in rows {
                 // Read again under the writer: the row is what stands now.
-                let Some(value) = by_stamp.remove(key.as_slice())? else { continue };
-                let named = parse_row_value(value.value());
-                drop(value);
-                let (Some((collection, scope)), Ok(stamp)) = (named, codec::decode_oplog_key(key))
-                else {
+                let named = match by_stamp.get(key.as_slice())? {
+                    Some(value) => parse_row_value(value.value()),
+                    None => continue,
+                };
+                let (Some((collection, scope)), Some(stamp)) = (named, decode_row_key(key)) else {
+                    by_stamp.remove(key.as_slice())?;
                     continue;
                 };
                 let record_key = (collection.0, scope.as_bytes().as_slice());
-                let stale = match records.get(record_key)? {
+                let (stale, keep_row) = match records.get(record_key)? {
                     Some(raw) => match IdempotencyRecord::decode(raw.value()) {
-                        Ok(Some(record)) => record.last <= stamp,
+                        Ok(Some(record)) => (
+                            record.last <= stamp,
+                            // F1: the `first` of a record still inside the window.
+                            record.first == stamp && record.last.hlc >= cutoff,
+                        ),
                         // A record this build cannot read (a newer format, or
                         // damage) has no `last` it can age by, and nothing here
-                        // finds its other rows (they are keyed by stamp alone).
-                        // It is aged by the stamp of this row, the first of its
-                        // rows to expire, which is never after its `last`: it
-                        // does not outlive the window. Here it is absent to
-                        // every lookup and overwritten by every store anyway.
-                        Ok(None) | Err(_) => true,
+                        // finds its other rows without decoding it. It is aged
+                        // by the stamp of this row, the first of its rows to
+                        // expire, which is never after its `last`: it does not
+                        // outlive the window. Here it is absent to every lookup
+                        // and overwritten by every store anyway.
+                        Ok(None) | Err(_) => (true, false),
                     },
-                    None => false,
+                    None => (false, false),
                 };
+                if keep_row {
+                    continue;
+                }
+                by_stamp.remove(key.as_slice())?;
                 if stale {
                     records.remove(record_key)?;
                     removed += 1;
@@ -1565,19 +1868,42 @@ impl Engine {
         Ok((gone.len(), reopened.len()))
     }
 
-    /// The highest stamp any record carries: the last key of
-    /// [`IDEMPOTENCY_BY_STAMP`], one read. Part of where the clock resumes, so
-    /// that a record taken from a sender whose clock is ahead is never resumed
-    /// below its `first` after a restart (the witness that folded it in is in
-    /// memory only).
+    /// The highest stamp any record carries: the largest of each origin's last
+    /// key of [`IDEMPOTENCY_BY_STAMP`] (keyed origin-major), two seeks per
+    /// origin with a row. Part of where the clock resumes, so that a record
+    /// taken from a sender whose clock is ahead is never resumed below its
+    /// `first` after a restart (the witness that folded it in is in memory
+    /// only).
     pub(crate) fn records_high_water(db: &redb::Database) -> Result<Hlc> {
         use redb::ReadableDatabase;
+        use std::ops::Bound::{Excluded, Included, Unbounded};
         let txn = db.begin_read()?;
         let rows = txn.open_table(IDEMPOTENCY_BY_STAMP)?;
-        Ok(match rows.last()? {
-            Some((key, _)) => codec::decode_oplog_key(key.value()).map_or(Hlc::ZERO, |s| s.hlc),
-            None => Hlc::ZERO,
-        })
+        let mut high = Hlc::ZERO;
+        let mut past: Option<Vec<u8>> = None;
+        loop {
+            // not a row: the next origin with a row, one seek.
+            let next = match &past {
+                None => rows.range::<&[u8]>(..)?.next(),
+                Some(past) => rows.range::<&[u8]>((Excluded(past.as_slice()), Unbounded))?.next(),
+            };
+            let Some(next) = next.transpose()? else { return Ok(high) };
+            let key = next.0.value().to_vec();
+            drop(next);
+            let Some(at) = decode_row_key(&key) else {
+                past = Some(key);
+                continue;
+            };
+            let (from, to) = (row_key_at(at.node, Hlc::ZERO), row_key_at(at.node, Hlc::MAX));
+            // not a row: the origin's last key, one seek.
+            let last = rows.range::<&[u8]>((Included(from.as_slice()), Included(to.as_slice())))?;
+            if let Some(last) = last.last().transpose()?
+                && let Some(stamp) = decode_row_key(last.0.value())
+            {
+                high = high.max(stamp.hlc);
+            }
+            past = Some(to.to_vec());
+        }
     }
 
     /// The `INFO` line a resume writes.
