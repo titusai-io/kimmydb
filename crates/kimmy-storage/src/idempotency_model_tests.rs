@@ -752,6 +752,9 @@ struct World {
     strict: bool,
     /// Members the schedule has taken down.
     down: Vec<bool>,
+    /// Requests go to a member catching up after a whole-database snapshot: what the
+    /// catching-up gate allows once it opens as `unknown` (finding G7), for a row.
+    retry_catching_up: bool,
     step: String,
 }
 
@@ -788,6 +791,7 @@ impl World {
             driving: false,
             strict: strict(),
             down: vec![false; count],
+            retry_catching_up: false,
             step: "setup".into(),
         };
         for m in 0..count {
@@ -1214,7 +1218,7 @@ impl World {
             for (j, ops) in inner {
                 if usize::from(*j) == pages && !progress.is_complete() {
                     for op in ops {
-                        self.apply_between_pages(op, to, from)?;
+                        self.apply_between_pages(op, to, from, scope.is_none())?;
                     }
                 }
             }
@@ -1264,7 +1268,7 @@ impl World {
     fn prepare(&mut self, r: u8, m: usize, t: u32) -> Res<Option<Prepared>> {
         let req = self.sched.requests[r as usize];
         let c = req.kind.coll();
-        if self.members[m].catching_up || self.down[m] {
+        if (self.members[m].catching_up && !self.retry_catching_up) || self.down[m] {
             self.note(format!("r{r} not sent: {} is catching up or down", LETTERS[m]));
             return Ok(None);
         }
@@ -1848,12 +1852,14 @@ impl World {
 
     /// A step run between two pages of a snapshot into `to` from `from`: never one that
     /// closes or sends to the receiver, nor closes the sender.
-    fn apply_between_pages(&mut self, op: &Op, to: usize, from: usize) -> Res<()> {
+    ///
+    /// A scoped or converge receiver serves clients through its pull, so a request to it
+    /// between two pages is allowed; a whole-database receiver is catching up.
+    fn apply_between_pages(&mut self, op: &Op, to: usize, from: usize, whole: bool) -> Res<()> {
         let skip = match &op.step {
-            Step::Send { m, .. } | Step::Touch { m, .. } => *m as usize == to,
-            Step::Pull { to: t, from: f } | Step::PullShort { to: t, from: f } => {
-                *t as usize == to || *f as usize == to
-            }
+            Step::Send { m, .. } | Step::Touch { m, .. } => *m as usize == to && whole,
+            Step::Pull { to: t, .. } | Step::PullShort { to: t, .. } => *t as usize == to,
+            Step::Page { to: t, restart, .. } => *t as usize == to || *restart,
             Step::Clock { .. } => false,
             _ => true,
         };
@@ -2647,7 +2653,15 @@ fn settle(w: &mut World) -> Res<()> {
 
 /// Run a schedule and settle it.
 pub(crate) fn run(sched: &Schedule) -> Outcome {
+    run_with(sched, strict(), false)
+}
+
+/// [`run`], with classified findings failing it (`strict`), and requests sent to a
+/// member catching up (`retry_catching_up`).
+pub(crate) fn run_with(sched: &Schedule, strict: bool, retry_catching_up: bool) -> Outcome {
     let world = Rc::new(RefCell::new(World::new(sched.clone(), base())));
+    world.borrow_mut().strict = strict;
+    world.borrow_mut().retry_catching_up = retry_catching_up;
     let out = setup(&mut world.borrow_mut());
     if let Err(e) = out {
         world.borrow_mut().fail(Inv::Error, format!("setup: {e}"));
@@ -3206,6 +3220,435 @@ fn one_seed() {
     let out = run(&sched);
     eprintln!("{}", render(Some(seed), &sched, &out));
     assert!(out.failures.is_empty());
+}
+
+// -- Named rows ------------------------------------------------------------------------------
+//
+// Schedules written out, each run strictly (every classified finding fails it). The
+// first group are the breaks of the G1 analysis (sections 3 and 9) and must fail until
+// their fix lands: records travel with coverage (G1b, G2, G2b, G3, T2), a records delta
+// on every page (R1, R1b, R1c). The second group are the shapes the design's mutants
+// need, and pass today.
+
+fn req(key: u8, kind: Kind) -> Request {
+    Request { key, kind }
+}
+
+fn ask(r: u8, m: u8, t: u32) -> Op {
+    Op { step: Step::Send { r, m, crash: None, inner: Vec::new() }, t }
+}
+
+fn ask_crash(r: u8, m: u8, t: u32, j: u8, how: Crash) -> Op {
+    Op { step: Step::Send { r, m, crash: Some((j, how)), inner: Vec::new() }, t }
+}
+
+fn ask_between(r: u8, m: u8, t: u32, inner: Vec<(u8, Vec<Op>)>) -> Op {
+    Op { step: Step::Send { r, m, crash: None, inner }, t }
+}
+
+fn pull(to: u8, from: u8) -> Op {
+    Op { step: Step::Pull { to, from }, t: 0 }
+}
+
+fn touch(m: u8, c: u8, d: u16, t: u32) -> Op {
+    Op { step: Step::Touch { m, c, d }, t }
+}
+
+fn down(m: u8) -> Op {
+    Op { step: Step::Down { m }, t: 0 }
+}
+
+fn big(m: u8) -> Op {
+    Op { step: Step::Big { m }, t: 0 }
+}
+
+fn scoped(to: u8, from: u8, c: u8, inner: Vec<(u8, Vec<Op>)>) -> Op {
+    Op { step: Step::Page { to, from, c, converge: false, restart: false, inner }, t: 0 }
+}
+
+fn reset(m: u8, from: u8, inner: Vec<(u8, Vec<Op>)>) -> Op {
+    Op { step: Step::Reset { m, from, inner }, t: 0 }
+}
+
+fn row(name: &str, members: u8, requests: Vec<Request>, ops: Vec<Op>) {
+    row_with(name, members, requests, ops, false);
+}
+
+fn row_with(name: &str, members: u8, requests: Vec<Request>, ops: Vec<Op>, at_completion: bool) {
+    let sched = Schedule { track: Track::Anywhere, home: 0, members, requests, ops };
+    let out = run_with(&sched, true, at_completion);
+    if trace() {
+        eprintln!("row {name}:\n{}", render(None, &sched, &out));
+    }
+    assert!(out.failures.is_empty(), "row {name}:\n{}", render(None, &sched, &out));
+}
+
+const A: u8 = 0;
+const B: u8 = 1;
+const C: u8 = 2;
+const D: u8 = 3;
+
+/// G2: B writes the counter just after A's keyed `$inc`, so the `$inc` loses on B (its
+/// record stored, its entry not appended); A's write on top of the `$inc` wins there. C
+/// pulls B, holds the effect, and its coverage of A passes the `$inc`'s entry, which A
+/// then never serves it. A retry on C must replay.
+#[test]
+#[ignore = "fails until records travel with coverage (idempotency-g)"]
+fn row_g2_a_loser_relay() {
+    row(
+        "g2",
+        3,
+        vec![req(1, Kind::IncSingle { d: 0 })],
+        vec![
+            ask(0, A, 100),
+            touch(B, ORDERS, 0, 101),
+            touch(A, ORDERS, 0, 110),
+            pull(B, A),
+            pull(C, B),
+            ask(0, C, 120),
+        ],
+    );
+}
+
+/// G2b: a keyed `$inc` of two counters, one commit; B's own write beats its first entry,
+/// which carries the record, and its second entry wins on B. C pulls B and holds the
+/// request's own effect on the second counter, bare. A retry on C must not apply again.
+#[test]
+#[ignore = "fails until records travel with coverage (idempotency-g)"]
+fn row_g2b_a_multi_document_request_whose_first_entry_lost() {
+    row(
+        "g2b",
+        3,
+        vec![req(1, Kind::IncRange { d: 0 })],
+        vec![ask(0, A, 100), touch(B, ORDERS, 0, 101), pull(B, A), pull(C, B), ask(0, C, 120)],
+    );
+}
+
+/// G3: the `$inc` loses on B, which then appends A's write to another collection; C's
+/// coverage of A passes the `$inc` in a window that carries no entry of its collection.
+/// A's later write on top reaches C bare. A retry on C must replay.
+#[test]
+#[ignore = "fails until records travel with coverage (idempotency-g)"]
+fn row_g3_a_coverage_only_window() {
+    row(
+        "g3",
+        3,
+        vec![req(1, Kind::IncSingle { d: 0 })],
+        vec![
+            ask(0, A, 100),
+            touch(B, ORDERS, 0, 101),
+            touch(A, ITEMS, 0, 105),
+            pull(B, A),
+            pull(C, B),
+            touch(A, ORDERS, 0, 110),
+            pull(C, A),
+            ask(0, C, 120),
+        ],
+    );
+}
+
+/// T2: A's `$inc` loses on C to C's own write, so C's servable vector at A stays below
+/// it; B took the `$inc` and wrote on top, and that version wins on C. With A and B down,
+/// D pulls only C and holds B's version, which holds the `$inc`, with no record, while
+/// its coverage of A does not move. A retry on D must replay.
+#[test]
+#[ignore = "fails until records travel with coverage (idempotency-g)"]
+fn row_t2_a_cross_origin_relay_while_the_origin_is_down() {
+    row(
+        "t2",
+        4,
+        vec![req(1, Kind::IncSingle { d: 0 })],
+        vec![
+            ask(0, A, 100),
+            touch(C, ORDERS, 0, 101),
+            pull(B, A),
+            touch(B, ORDERS, 0, 110),
+            pull(C, A),
+            pull(C, B),
+            down(A),
+            down(B),
+            pull(D, C),
+            ask(0, D, 120),
+        ],
+    );
+}
+
+/// G1b: A's keyed write and a write on top land between B's first snapshot page and the
+/// collection's records phase, so B stores the record from the page and holds the later
+/// version above its grant; B then pulls A, where the keyed entry loses. C, at the grant,
+/// pulls B and takes the later version bare. A retry on C must replay.
+#[test]
+#[ignore = "fails until records travel with coverage (idempotency-g)"]
+fn row_g1b_a_write_between_snapshot_pages_then_a_relay() {
+    // The keyed write goes to the collection the whole-database walk reaches second, so
+    // that the first page ends before its records phase; an earlier keyed write gives
+    // that collection records, so the page ends at its boundary.
+    let (c, early, keyed) = if coll_id(ORDERS) < coll_id(ITEMS) {
+        (ITEMS, Kind::Insert { id: Some(1) }, Kind::Replace { at: Target::Client(0) })
+    } else {
+        (ORDERS, Kind::IncSingle { d: 4 }, Kind::IncSingle { d: 0 })
+    };
+    row(
+        "g1b",
+        3,
+        vec![req(1, early), req(2, keyed)],
+        vec![
+            ask(0, A, 100),
+            pull(C, A),
+            reset(B, A, vec![(1, vec![ask(1, A, 110), touch(A, c, 0, 120)])]),
+            pull(B, A),
+            pull(C, B),
+            ask(1, C, 130),
+        ],
+    );
+}
+
+/// R1: a scoped pull of `big`: its records phase and first document page, then a keyed
+/// `$inc` on the sender of a document on the second page. The receiver holds the effect
+/// after the pull, and a retry there must replay.
+#[test]
+#[ignore = "fails until every page carries a records delta"]
+fn row_r1_a_keyed_write_between_the_records_phase_and_its_page() {
+    row(
+        "r1",
+        3,
+        vec![req(1, Kind::IncBig { d: 0 }), req(2, Kind::IncBig { d: 1000 })],
+        vec![
+            big(A),
+            ask(0, A, 100),
+            scoped(B, A, BIG, vec![(1, vec![ask(1, A, 110)])]),
+            ask(1, B, 120),
+        ],
+    );
+}
+
+/// R1b: as R1, with the retry on the receiver between the page that brings the effect
+/// and the end of the pull.
+#[test]
+#[ignore = "fails until every page carries a records delta"]
+fn row_r1b_a_retry_between_the_effects_page_and_the_pulls_end() {
+    row(
+        "r1b",
+        3,
+        vec![req(1, Kind::IncBig { d: 0 }), req(2, Kind::IncBig { d: 600 })],
+        vec![
+            big(A),
+            ask(0, A, 100),
+            scoped(B, A, BIG, vec![(1, vec![ask(1, A, 110)]), (2, vec![ask(1, B, 120)])]),
+        ],
+    );
+}
+
+/// R1b, relayed: a peer takes a scoped page of the collection from the receiver between
+/// the effect's page and the pull's end (the receiver's own held entries are above its
+/// servable vector, so an ordinary pull defers them), and a retry there must replay.
+#[test]
+#[ignore = "fails until every page carries a records delta"]
+fn row_r1b_a_peer_takes_a_page_from_the_receiver_mid_pull() {
+    row(
+        "r1b-relay",
+        3,
+        vec![req(1, Kind::IncBig { d: 0 }), req(2, Kind::IncBig { d: 600 })],
+        vec![
+            big(A),
+            ask(0, A, 100),
+            pull(C, A),
+            scoped(
+                B,
+                A,
+                BIG,
+                vec![(1, vec![ask(1, A, 110)]), (2, vec![scoped(C, B, BIG, Vec::new())])],
+            ),
+            ask(1, C, 130),
+        ],
+    );
+}
+
+/// R1c: a whole-database snapshot whose later page brings an effect whose record came
+/// after the collection's records phase; a retry at completion (what the catching-up
+/// gate allows once it opens as `unknown`) must replay.
+#[test]
+#[ignore = "fails until every page carries a records delta"]
+fn row_r1c_a_whole_database_retry_at_completion() {
+    row_with(
+        "r1c",
+        3,
+        vec![req(1, Kind::IncBig { d: 0 }), req(2, Kind::IncBig { d: 1500 })],
+        vec![big(A), ask(0, A, 100), reset(B, A, vec![(2, vec![ask(1, A, 110)])]), ask(1, B, 120)],
+        true,
+    );
+}
+
+/// Concurrent attempts on two members (Chris, 2026-10-18): A's fresh multi-chunk attempt
+/// commits its first chunk; B, without A's record, runs the request whole; A pulls B. A's
+/// later chunks must leave every counter B's attempt wrote (the stamp rule applies to a
+/// fresh attempt's later chunks, not only to a resume).
+#[test]
+fn row_concurrent_fresh_attempts_on_two_members() {
+    row(
+        "concurrent",
+        3,
+        vec![req(1, Kind::IncMulti)],
+        vec![ask_between(0, A, 100, vec![(1, vec![ask(0, B, 105), pull(A, B)])])],
+    );
+}
+
+/// The merged `first` is the earliest attempt's (B1): A's attempt stops after a chunk, A
+/// resumes and stops again; B, without A's record, starts afresh later and stops; after
+/// the pulls the merged record's `last` is B's. A resume must still leave what A's resume
+/// wrote, which is below B's `first`.
+#[test]
+fn row_independent_attempts_merge_their_firsts() {
+    row(
+        "merge-first",
+        3,
+        vec![req(1, Kind::IncMulti)],
+        vec![
+            ask_crash(0, A, 100, 1, Crash::AfterCommit),
+            ask_crash(0, A, 105, 1, Crash::AfterCommit),
+            ask_crash(0, B, 110, 1, Crash::AfterCommit),
+            pull(A, B),
+            pull(B, A),
+            ask(0, B, 120),
+            pull(C, B),
+            ask(0, A, 130),
+        ],
+    );
+}
+
+/// The record is in the write's own transaction: a crash at the commit after a
+/// single-document `$inc`'s, then a retry on the same member, must replay; and a pull
+/// right after that commit carries the record.
+#[test]
+fn row_a_crash_or_a_pull_right_after_the_commit() {
+    row(
+        "crash-after-commit",
+        3,
+        vec![req(1, Kind::IncSingle { d: 0 }), req(2, Kind::IncSingle { d: 1 })],
+        vec![
+            ask_crash(0, A, 100, 1, Crash::BeforeCommit),
+            ask(0, A, 110),
+            ask_between(1, A, 120, vec![(1, vec![pull(B, A)])]),
+            ask(1, B, 130),
+        ],
+    );
+}
+
+/// A record a scoped page brings from a sender whose clock is ahead: the receiver
+/// witnesses its stamps and keeps them across a restart, so its resume and every later
+/// one write above the request's `first`.
+#[test]
+fn row_a_page_carried_record_resumed_after_a_restart() {
+    row(
+        "page-record-restart",
+        3,
+        vec![req(1, Kind::IncMulti)],
+        vec![
+            ask_crash(0, A, 500, 1, Crash::AfterCommit),
+            Op {
+                step: Step::Page {
+                    to: B,
+                    from: A,
+                    c: ORDERS,
+                    converge: false,
+                    restart: true,
+                    inner: Vec::new(),
+                },
+                t: 0,
+            },
+            ask_crash(0, B, 120, 1, Crash::AfterCommit),
+            pull(A, B),
+            ask(0, A, 130),
+            pull(C, A),
+            ask(0, C, 140),
+        ],
+    );
+}
+
+/// The life rule: a record of a life a drop ended, arriving from a member that applied
+/// the request before it heard of the drop, is never replayed in the life after it.
+#[test]
+fn row_a_retry_after_a_drop_and_a_recreation_applies_afresh() {
+    row(
+        "life",
+        3,
+        vec![req(1, Kind::Insert { id: Some(0) })],
+        vec![
+            ask(0, A, 100),
+            ask(0, B, 105),
+            Op { step: Step::Drop { m: A }, t: 110 },
+            Op { step: Step::Create { m: A }, t: 120 },
+            pull(A, B),
+            ask(0, A, 130),
+        ],
+    );
+}
+
+/// The derived `_id` holds the request's fingerprint (M1): a key reused for another
+/// insert on a member without the first one's record lands on another document.
+#[test]
+fn row_a_reused_key_on_a_member_without_the_record() {
+    row(
+        "reuse",
+        3,
+        vec![req(1, Kind::Insert { id: None }), req(1, Kind::Insert { id: None })],
+        vec![ask(0, A, 100), ask(1, B, 110)],
+    );
+}
+
+/// The derived `_id` is the request's: a retry on a member without the record lands on
+/// the same document key, and one document remains.
+#[test]
+fn row_a_retry_on_a_member_without_the_record_derives_the_same_id() {
+    row(
+        "derived",
+        3,
+        vec![req(1, Kind::Insert { id: None }), req(2, Kind::Bulk)],
+        vec![ask(0, A, 100), ask(0, B, 110), ask(1, A, 120), ask(1, C, 130)],
+    );
+}
+
+/// A record is stored when its entry loses: B holds a newer, independent version of the
+/// counter, A's keyed `$inc` loses there, and B must hold its record.
+#[test]
+fn row_a_losing_entry_stores_its_record() {
+    row(
+        "loser",
+        3,
+        vec![req(1, Kind::IncSingle { d: 0 })],
+        vec![ask(0, A, 100), touch(B, ORDERS, 0, 120), pull(B, A), ask(0, B, 130)],
+    );
+}
+
+/// A snapshot carries the records: a scoped page of `orders` brings the `$inc`'s record
+/// with its effect, and a retry on the receiver replays.
+#[test]
+fn row_a_scoped_page_carries_the_record() {
+    row(
+        "scoped",
+        3,
+        vec![req(1, Kind::IncSingle { d: 0 })],
+        vec![ask(0, A, 100), scoped(B, A, ORDERS, Vec::new()), ask(0, B, 110)],
+    );
+}
+
+/// Records merge as a join: a member that holds an attempt's `applying` record and then
+/// pulls the request's resumed chunks ends with the `done` record every member holds.
+#[test]
+fn row_a_resumed_requests_record_reaches_every_member() {
+    row(
+        "join",
+        3,
+        vec![req(1, Kind::IncMulti)],
+        vec![
+            ask_crash(0, A, 100, 1, Crash::AfterCommit),
+            pull(B, A),
+            ask(0, A, 110),
+            pull(B, A),
+            pull(C, B),
+            ask(0, C, 120),
+        ],
+    );
 }
 
 // -- Finding G1 ------------------------------------------------------------------------------
