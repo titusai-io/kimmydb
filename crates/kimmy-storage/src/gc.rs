@@ -130,6 +130,10 @@ impl Engine {
         // one of them. Only a stop ends the pass before it, as it ends every
         // step.
         let records_removed = self.collect_idempotency_records(oplog_cutoff)?;
+        // And the change log the snapshot pages' records deltas read (B5), on the
+        // same window: a change older than it names a record past it, or one
+        // changed again since and logged again.
+        self.trim_idempotency_changes(oplog_cutoff)?;
         let outcome = GcOutcome {
             oplog_removed,
             tombstones_removed: self.collect_tombstones(tombstone_cutoff)?

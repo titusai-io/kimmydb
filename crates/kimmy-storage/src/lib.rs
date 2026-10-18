@@ -132,6 +132,9 @@ mod idempotency_tests;
 mod idempotency_repl_tests;
 
 #[cfg(test)]
+mod page_delta_tests;
+
+#[cfg(test)]
 mod idempotency_coverage_tests;
 
 #[cfg(test)]
@@ -186,8 +189,8 @@ pub use open_progress::{
 pub use purge::PurgeCounters;
 pub use refusal_hint::{HintKind, RefusalHint};
 pub use snapshot::{
-    CollectionState, LEFT_IDS_NAMED, SNAPSHOT_PAGE, ServeVerdict, SnapshotApplied, SnapshotCursor,
-    SnapshotDoc, SnapshotPage, SnapshotPolicy, SnapshotProgress, SnapshotTombstone,
+    CollectionState, LEFT_IDS_NAMED, RecordsBase, SNAPSHOT_PAGE, ServeVerdict, SnapshotApplied,
+    SnapshotCursor, SnapshotDoc, SnapshotPage, SnapshotPolicy, SnapshotProgress, SnapshotTombstone,
 };
 pub use sync::{
     EntryWait, MarkedRange, PeerWindow, PullTiming, SyncOutcome, UnknownCollection, WindowEnd,

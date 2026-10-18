@@ -148,6 +148,10 @@ pub struct Engine {
     /// (ADR-086). Set from configuration at startup; the storage default
     /// stands for a bare engine.
     multi_chunk_docs: std::sync::atomic::AtomicUsize,
+    /// How far behind the wall clock this engine's clock reads its physical time,
+    /// for a test of a member restored onto a host whose clock is behind.
+    #[cfg(test)]
+    clock_behind_ms: std::sync::atomic::AtomicU64,
     /// How a commit becomes durable (ADR-088). `None` is the default class,
     /// `durable`: every commit fsyncs before it returns. `Some` is
     /// `coalesced`: commits skip their own fsync and wait at a shared barrier
@@ -1409,6 +1413,9 @@ impl Engine {
             // opens them, and ignores them.
             let _ = txn.open_table(tables::IDEMPOTENCY)?;
             let _ = txn.open_table(tables::IDEMPOTENCY_BY_STAMP)?;
+            // And this node's change log of them, which no backup carries: its
+            // first change says where it begins.
+            let _ = txn.open_table(tables::IDEMPOTENCY_CHANGES)?;
             // The tombstone horizon's reset, in this commit and before the sidecar is
             // brought to this build (design 13.1): a store the evidence cannot vouch
             // for, or with no key, starts at this start's time, never lower than it was.
@@ -1514,6 +1521,8 @@ impl Engine {
             multi_chunk_docs: std::sync::atomic::AtomicUsize::new(
                 crate::modify::DEFAULT_MULTI_CHUNK_DOCS,
             ),
+            #[cfg(test)]
+            clock_behind_ms: std::sync::atomic::AtomicU64::new(0),
             coalescer: Mutex::new(None),
             coalesce_woken: Condvar::new(),
             #[cfg(test)]
@@ -3555,7 +3564,9 @@ impl Engine {
     /// And the highest stamp an idempotency record carries (B5, the last key of
     /// `IDEMPOTENCY_BY_STAMP`): a record a page stored was folded into the clock
     /// while the process ran, and a resume of its request must write above its
-    /// `first` after a restart too.
+    /// `first` after a restart too. And the records' change log's last key and
+    /// where it began (`IDEMPOTENCY_CHANGES`): a snapshot page's base is a key of
+    /// it, and every change after a restart must be logged above that base.
     fn resume_hlc(db: &Database) -> Result<Hlc> {
         let tail = Self::last_oplog_hlc(db)?;
         let named = [tables::OPLOG_VERSIONS, tables::OPLOG_WITNESSED]
@@ -3566,7 +3577,11 @@ impl Engine {
             .flat_map(|versions| versions.iter().map(|(_, hlc)| hlc).collect::<Vec<_>>())
             .max()
             .unwrap_or(Hlc::ZERO);
-        Ok(tail.max(named).max(Self::metadata_high_water(db)?).max(Self::records_high_water(db)?))
+        Ok(tail
+            .max(named)
+            .max(Self::metadata_high_water(db)?)
+            .max(Self::records_high_water(db)?)
+            .max(crate::idempotency::changes_high_water_at_open(db)?))
     }
 
     /// The highest stamp the stored metadata carries: each collection's `created`,
@@ -3681,8 +3696,29 @@ impl Engine {
 
     /// Mint the next stamp for a local write.
     pub(crate) fn next_stamp(&self) -> Stamp {
-        let hlc = self.clock.lock().tick(physical_now_ms());
+        let hlc = self.clock.lock().tick(self.clock_physical_ms());
         Stamp::new(hlc, self.node_id)
+    }
+
+    /// The physical time the clock ticks from: the wall clock's, or, in a test
+    /// that holds it back, that far behind it.
+    fn clock_physical_ms(&self) -> u64 {
+        #[cfg(test)]
+        {
+            let behind = self.clock_behind_ms.load(std::sync::atomic::Ordering::Relaxed);
+            if behind > 0 {
+                return physical_now_ms().saturating_sub(behind);
+            }
+        }
+        physical_now_ms()
+    }
+
+    /// Hold this engine's clock `ms` behind the wall clock, as a host whose clock
+    /// is behind would (0 for the wall clock's own): stamps it mints then rise by
+    /// their counter above what it has witnessed.
+    #[cfg(test)]
+    pub(crate) fn set_clock_behind_for_test(&self, ms: u64) {
+        self.clock_behind_ms.store(ms, std::sync::atomic::Ordering::Relaxed);
     }
 
     /// The last time the clock handed out, for a test that a path mints

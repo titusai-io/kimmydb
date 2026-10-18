@@ -422,6 +422,25 @@ const BOUNDED_READS: &[(&str, &str)] = &[
     ),
     ("idempotency_tests::rows", "test code reading a store of a few thousand rows it wrote itself"),
     (
+        "page_delta_tests::log_rows",
+        "test code reading a store of a few thousand rows it wrote itself",
+    ),
+    (
+        "idempotency::changes_high_water",
+        "one seek, in a snapshot page's read transaction: the last key of this node's change log",
+    ),
+    (
+        "idempotency::records_changed_since",
+        "one snapshot page's records delta, in the page's read transaction: one range of this \
+         node's change log above the cursor's base, at most RECORD_DELTA_ROWS (65,536) rows",
+    ),
+    (
+        "idempotency::Engine::trim_idempotency_changes",
+        "retention's share of the change log: one seek under a read transaction, then chunks of \
+         RECORD_COLLECT_CHUNK rows below the cutoff, each in its write: close_writes bounds it \
+         (ADR-192)",
+    ),
+    (
         "idempotency::records_in_advance",
         "F2 of a served window's records, in the window's own read transaction: per origin, the \
          rows inside the coverage the window grants the requester, a row per stamp its coverage \

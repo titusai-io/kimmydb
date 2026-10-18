@@ -180,6 +180,12 @@ const TABLES: &[Table] = &[
         why: "stamp -> collection id and scope hash (B5); no key bytes",
     },
     Table {
+        name: "idempotency_changes",
+        class: Unchanged,
+        why: "the node-local change log of idempotency records (B5): a minted stamp -> \
+              collection id and scope hash, and where the log begins; no key bytes",
+    },
+    Table {
         name: "partial_rebuilt_unique_violations",
         class: ReKeyed,
         why: "3 -> 4 holders in schema 4, converted into schema5_carried_collisions in the first \
