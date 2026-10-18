@@ -156,8 +156,10 @@ where it stopped instead of applying again. What a client must do to rely on it:
 - **Expect a string `_id`.** A keyed insert without `_id` gets one derived from
   the key and the request, a UUID string, which sorts apart from ObjectIds and
   falls outside an `_id` range over them.
-- **`409 idempotency_key_in_flight`** means the same request is still running
-  there: wait (`Retry-After: 1`) and send it again to the same member.
+- **`409 idempotency_key_in_flight`** means the same `multi: true` request is
+  still running there, or another retry of it is being answered there (two
+  retries sent at once: one is answered, the other refused): wait
+  (`Retry-After: 1`) and send it again to the same member.
 - **Read the marker.** `Idempotency-Replayed: ?1` (on MCP,
   `"kimmydb/idempotency-replayed": true` in the result's `_meta`) says the
   answer is the first attempt's, read from its record: its `stamp` names the
@@ -169,6 +171,9 @@ where it stopped instead of applying again. What a client must do to rely on it:
   counts are cumulative over the attempts, and the matches it left because they
   changed after its first write are counted in `skipped`, with `resumed: true`.
   A keyed request past one chunk leaves such matches on its first attempt too.
+  A retry of a finished request can also come back as a resume, with nothing
+  written twice, on a member that has its last writing chunk and not yet the
+  record of its end.
   To have every current match written, send it without the key, if the update
   is idempotent ([HTTP API](http-api.md#a-keyed-write-past-one-chunk)).
 - **A `400` naming `Idempotency-Key` and the cluster** (the member does not take

@@ -214,9 +214,12 @@ applications on two members, merge field by field, so the result does not depend
 on the order they arrive in.
 
 - `first`, the stamp of the request's first write, is the **smaller** of the two;
-- `last`, its latest commit, is the **greater**;
+- `last`, the last entry of its latest commit, is the **greater**;
 - the state, the outcome, the cursor and the origin come from the record with the
-  greater `last`, and at an equal `last`, `done` beats `applying`.
+  greater `last`; at an equal `last`, `done` beats `applying`, and at an equal
+  `last` and state the record whose bytes are greater wins, so the merge is
+  commutative as well as associative and idempotent, and every member picks the
+  same record.
 
 Two applications therefore converge to one record: the outcome of the later one,
 whose document version last-writer-wins also keeps, and the earliest `first` of
@@ -301,8 +304,9 @@ Without this, a restart would mint stamps *below* ones already on disk, and a
 document rewritten after the restart could lose to its own older version.
 
 The resumed clock is the highest of several stamps the store holds, not the oplog
-tail alone: the version vectors, the metadata's stamps (ADR-233), and the last key
-of `idempotency_by_stamp`, the highest stamp any idempotency record carries. A
+tail alone: the version vectors, the metadata's stamps (ADR-233), the largest of
+each origin's last row in `idempotency_by_stamp` (the highest stamp any
+idempotency record carries), and the high water of the records' change log. A
 record a snapshot or repair page stored came with no oplog entry here, and a
 resumed `multi: true` request writes only above its record's `first`, so a clock
 resumed below that record would let a resume write a document twice

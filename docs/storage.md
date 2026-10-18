@@ -92,13 +92,16 @@ erDiagram
 | `oplog_collected` | node id (16 bytes) | highest `Hlc` retention has removed for that origin |
 | `oplog_held` | oplog key | `()` — the entry was appended as **state**, not history (ADR-160) |
 | `idempotency` | `(u64, &[u8])` — (collection id, scope hash, 32 bytes) | An [idempotency record](#idempotency-records): a keyed write remembered (ADR-240) |
-| `idempotency_by_stamp` | `&[u8]` — 26 bytes, a stamp in the oplog key's shape | collection id (8) ‖ scope hash (32): the record each stamp carries |
+| `idempotency_by_stamp` | `&[u8]` — 26 bytes, **origin-major**: node (16) ‖ hlc (10) | collection id (8) ‖ scope hash (32): a stamp that vouches for the record |
+| `idempotency_changes` | `&[u8]` — 26 bytes, a stamp this node minted | collection id (8) ‖ scope hash (32): the node-local change log of records; the empty key holds where it began and its epoch |
 
 `oplog_witnessed`, `oplog_collected` and `oplog_held` are **node-local and
 absent from a backup**: each is re-derived when the database is opened, so a
 restored node rebuilds them rather than carrying them across. See
 [operations.md](operations.md) for what that means when restoring during a
-snapshot. The two idempotency tables are carried, as backup tags 12 and 13.
+snapshot. `idempotency` and `idempotency_by_stamp` are carried, as backup tags
+12 and 13; `idempotency_changes` is node-local and is not, and the first change
+after a restore begins it again.
 
 ### Why the keys are shaped this way
 
@@ -212,8 +215,10 @@ A keyed write's record ([ADR-240](decisions.md),
 ```
 
 `first` is the stamp of the first entry the request wrote (after a merge, the
-smallest of its attempts'), `last` the stamp of the latest commit that changed
-the record, `origin` the member that wrote it, and `state` `applying` (a
+smallest of its attempts'), `last` the stamp of the **last** entry the commit
+that last changed the record wrote (a bulk's, a chunk's, a replace's, a
+`find_and_modify`'s or a delete's highest; after a merge, the greater),
+`origin` the member that wrote it, and `state` `applying` (a
 `multi: true` request that has not finished) or `done`. The outcome is what the
 first answer is rendered from, through the function that rendered it, never the
 response bytes, which would tie a record to one build's rendering: an insert's
@@ -228,28 +233,56 @@ newer build: it is skipped, never misread.
 **In the write's own transaction.** Each document write path has a keyed twin
 sharing its body. Inside the write transaction it already opens, under the
 writer, it looks the record up, writes as before, and, if it wrote anything,
-puts the record and its `idempotency_by_stamp` row at the record's `last`
-before the commit. So the record survives exactly what the write survives, under
-either durability class; under `coalesced` a replay waits for the flush that
-covers the record, as the first attempt's answer did. A request that changed
-nothing writes no record.
+puts the record and its `idempotency_by_stamp` rows before the commit. So the
+record survives exactly what the write survives, under either durability class;
+under `coalesced` a replay waits for the flush that covers the record, as the
+first attempt's answer did. A request that changed nothing writes no record.
+
+**Its rows.** Every store of a record writes a row at its merged `first` and one
+at its merged `last`, and a store from a peer's frame one more at the row the
+sender shipped it at. They are the stamps that vouch for the record: a peer
+window ships every record with a row inside the coverage it grants, and a member
+whose coverage of an origin passes a row holds the record
+([Oplog](oplog.md#idempotency-records-travel-with-coverage)). The key is
+origin-major, node then HLC, so one origin's rows between two stamps are one
+range.
+
+**The change log.** `idempotency_changes` holds one row per store that changes a
+record, on every path (a local commit, a frame, a replay or snapshot page, a
+rewind's reopen), in the store's own transaction, keyed by a stamp minted under
+the writer, so in commit order; a store that changes nothing writes no row. A
+snapshot page reads it to carry what changed since the page before. It is never
+shipped and not carried by a backup. Its empty key holds the key of its first
+change and a random **epoch**, written by that first change, not at open, and
+given again at the first change after a restore, an identity reset, or an open
+that found no log.
 
 **How long a record lives.** A record is judged by its `last`. It is absent to
-a lookup once `last` is older than `storage.oplog_retention_secs`, or once the
-collection's drop tombstone or incarnation floor covers `last` (the history rule
-documents are judged by), and a keyed delete by id is replayed only while its own
-tombstone, or a later version over it, stands. The retention pass collects
-records **after its oplog step**: a range read of `idempotency_by_stamp` below
-its cutoff, under a read transaction, then 1,000 rows per commit with the writer
-released between them (ADR-151). Each row is read again under the writer, and
-its record goes only when the record's `last` is at or below the row's stamp, so
-a record a later commit changed is kept and only the row goes. A record this
+a lookup once `last` is older than `storage.oplog_retention_secs`, or once it is
+**history**: a drop of its collection at or above every entry the request wrote,
+which is the drop tombstone or incarnation floor covering `last`, by HLC, a tie
+going to the drop (the history rule documents are judged by). A drop in the
+millisecond of a commit's first entry, with a later entry of it standing in the
+next life, leaves the record standing with that entry. A keyed delete by id is
+replayed only while its own tombstone, or a later version over it, stands. The
+retention pass collects records **after its oplog step**: one seek per origin to
+its rows below the cutoff, under a read transaction, then 1,000 rows per commit
+with the writer released between them (ADR-151). Each row is read again under
+the writer: a record goes once its `last` is below the cutoff, with the first of
+its rows at or above `last`, so a record a later commit changed is kept and only
+the row goes, and the row at the `first` of a record still inside the window is
+kept. The same pass trims the change log's rows below the cutoff. A record this
 build cannot decode has no `last` to age by and goes with the first of its rows
-to expire, at least one window after its first commit. The drop purger removes a
-collection's records with its documents, a late drop's sweep removes those of
-the life it ends, and a rewind removes those of the writes it discards. At open
-the clock resumes above the last key of `idempotency_by_stamp` as well as the
-oplog's ([Time & Conflicts](time-and-conflicts.md#clock-resumption)).
+to expire, at least one window after its first commit. **The drop purger removes
+the collection's records of the dropped life (`last` at or below the drop);
+records of a later life stay for retention. Under an id with no tombstone
+(ADR-158's residual, a purge a creation asked for) it removes every record,
+since nothing there tells one life from another and the name is created again
+with no floor.** A late drop's sweep removes the records of the life it ends, and
+a rewind removes those of the writes it discards. At open the clock resumes above
+the largest of each origin's last row of `idempotency_by_stamp` and the change
+log's high water, as well as the oplog's
+([Time & Conflicts](time-and-conflicts.md#clock-resumption)).
 
 ### Truncation and corruption
 
@@ -414,7 +447,7 @@ pub fn next_index_id(&self) -> u32 {
 | Crash mid-request | Every chunk that committed stays; the chunk in flight is lost whole; the oplog reflects exactly what landed, and the response's `commits` says how many chunks did |
 | A failure after the first chunk | The later chunks wait for the writer with no time limit, so a busy writer no longer splits a request; any failure after the first commit answers `500 partially_applied` with the committed chunks' counts (ADR-192) |
 | `insert_many` | One transaction; all or nothing |
-| A write with an `Idempotency-Key` | Its record in the same transaction as the write, so the two cannot diverge; a `multi: true` request's record follows its chunks, `applying` until the chunk that ends it writes `done` (ADR-240) |
+| A write with an `Idempotency-Key` | Its record in the same transaction as the write, so the two cannot diverge; a `multi: true` request's record follows its chunks, `applying` until the chunk that ends it writes `done`: the last full chunk, by a lookahead for one more match it could write, or a later chunk that writes nothing, which commits the record alone (ADR-240) |
 | A sync batch from a peer | One transaction per run of consecutive document entries, the witnessed vector in the last one; a schema change in the batch ends a run. A DDL-free batch is one commit and one fsync on the replica, as the bulk insert it carries was on the writer (ADR-119) |
 
 > **Sharp edge.** A `multi: true` update or delete is atomic per *chunk*, not

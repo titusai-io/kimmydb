@@ -286,48 +286,91 @@ channel as documents.
 
 ---
 
-## Idempotency records beside the entries
+## Idempotency records travel with coverage
 
 A write sent with an `Idempotency-Key` leaves a **record** beside its entries,
 in the same transaction ([Storage](storage.md#idempotency-records),
-[ADR-240](decisions.md)), and the record travels with them. The entry format,
-its codec and the set of kinds do not change: the record is an optional field
-of the message that carries the entries, never part of an entry.
+[ADR-240](decisions.md)). The entry format, its codec and the set of kinds do
+not change: the record rides as an optional field of the message that carries
+the window, never inside an entry.
+
+**What vouches for a record is a row, and what carries it is coverage.** A
+record's rows in `idempotency_by_stamp` are stamps of its request: its merged
+`first` and its merged `last` (the request's last entry), and on a receiver the
+row the sender shipped it at. The rule is stated in terms of the coverage a
+window grants, not of the entries it ships: **a member whose coverage of an
+origin passes one of a record's rows holds the record.** So a member that takes
+a request's effect, under any origin and by any route, takes its record with it.
+The row at `first` is what makes a window cut inside a commit safe: a keyed
+commit of two entries whose window ends at the first covers that entry's effect,
+and the only row of the record in its advance is the one at `first`.
 
 | Carried by | How |
 |---|---|
-| `Entries`, `ReplayEntries`, `Push` | An optional `records` list: collection id, scope hash, the carrying entry's stamp and the record's bytes, for the entries the frame ships and only those, read in the read transaction that read the window. The frame-size fit that answers `BatchTooLarge` counts each record with its entry |
-| `SnapshotPage` | An optional `records` list. Collection by collection, a records phase in pages of up to 512 records goes ahead of the collection's documents, and a page never holds one collection's records after another's documents. The same holds for a scoped repair snapshot and for a converge page ([ADR-237](decisions.md)) |
-| `SnapshotCursor` | An optional records position, so a snapshot resumes inside a records phase |
+| `Entries`, `Push` | An optional `records` list: collection id, scope hash, `carrying` (the sender's row) and the record's bytes. **F2:** every live record with a row inside the advance the window grants the requester, above what it holds of that origin and at or below what the window's end and the sender's servable vector reach. **F3:** every live record with a row above both what the requester holds and what the sender's servable vector reaches, a row a page or a lost entry left, which no window of the sender would otherwise vouch for. Read in the window's own read transaction, one per key. A record may ride no shipped entry |
+| `ReplayEntries` | The same list: the records the page's own advance vouches for, and the F3 records |
+| `SnapshotPage` | An optional `records` list. Collection by collection, a records phase in pages of up to 512 records goes ahead of the collection's documents, and a page never holds one collection's records after another's documents. Every page after the first also carries the **records delta**, below. The same holds for a scoped repair and for a converge page ([ADR-237](decisions.md)) |
+| `SnapshotCursor` | An optional records position, so a snapshot resumes inside a records phase, and an optional `records_base`, `{key, epoch}`, the base of the next page's delta |
+
+**A sender ships a record at a row of its own. A row below the record's
+`first` was left by an earlier life under the same key, and ships nothing.** The
+frame fit that answers `BatchTooLarge` counts every record: the F3 records first,
+since a window carries them whatever else it carries, and each other with the
+first entry at or after its row. When the F3 records alone overfill a frame, the
+window carries no entries and grants nothing until the sender has pulled their
+entries, and the sender logs it at `WARN`; so does a replay page.
+
+**A receiver stores on coverage.** **A receiver stores a frame's record with the
+first entry it takes at or after the record's row, or in the batch's last
+transaction**, the one that raises its witnessed vector, whether or not an entry
+of the record's collection was taken and whether or not the collection stands
+here: a stamp a window covers is never served again, so a record vouched for at
+one is stored then or never. **A batch that ends at an entry stores no record
+whose row is at or past that entry; the window serves those again.** A record
+that is history by its collection's drop is not stored. Two records of one key
+merge as a join ([Time & Conflicts](time-and-conflicts.md#idempotency-records-merge-as-a-join)),
+and the receiver's clock moves past both of the record's stamps. A store that
+changes nothing writes nothing, and a frame of records held already costs no
+commit where nothing else is written.
+
+**The records delta.** A keyed write on the sender after a collection's records
+phase and before the page that holds its document would otherwise reach the
+receiver without its record. Each member keeps a node-local change log,
+`idempotency_changes`: one row per store that changes a record, on every path,
+in commit order ([Storage](storage.md#idempotency-records)). A page's
+`records_base` is the log's high water as the page before read it, in its
+documents' transaction; each later page carries, read in its own documents'
+transaction, every record the log names above that base (the scoped
+collection's, on a scoped or converge pull), and the receiver stores them before
+the documents. So a page never holds a document without the record of the write
+that produced it. Keys are compared only within one **epoch**, a random number
+the log is given when it begins and again after a restore, an identity reset or
+an open that found no log: a base of another epoch, or a key without one,
+restarts the cursor's collection from its records phase, and the zero base of a
+log that held nothing is sent every change. **A page carries documents only with
+the whole remainder** of the log above its base within 32 MiB and 65,536 rows;
+otherwise it is a records-only page, its document position unchanged and its
+base moved to the last key it examined, logged at `INFO`. A sender whose keyed
+changes, per page round trip, outrun what a frame carries sends records-only
+pages until they slow.
 
 Each field is read leniently: a list that does not decode is none, and a record
 that does not decode is dropped and counted
 (`kimmy_idempotency_records_undecodable_total`), never fatal to what carries it.
 A member of an earlier release ignores the fields, sends none, and drops the
-cursor's position, so its sender goes straight to the documents.
-
-**Where a receiver stores a record.** In the run transaction that takes
-(applies or supersedes) **any entry of its collection** in the frame, on
-**both** outcomes of the merge: a write that lost is still a write that
-happened, and without its record a retry on that member would apply it again
-after the version that beat it. Any entry of the collection, not only the
-carrying one, because a drop in the same millisecond can judge the first entry
-history and let a later one apply. A record that is history by its collection's
-drop is not stored, and when no entry of its collection is taken (deferred, or
-left after a stop) it is stored when they are re-served. Two records of one key
-merge as a join ([Time & Conflicts](time-and-conflicts.md#idempotency-records-merge-as-a-join)),
-and the receiver's clock moves past both of the record's stamps.
+cursor's records position and `records_base`, so its sender goes straight to the
+documents and its pages carry no delta.
 
 **Why a side field.** A new entry kind fails the whole frame on an older
 member, which has no catch-all for an unknown `OpKind`; a field inside
 `OplogEntry` is dropped by an older member that re-encodes the entry. An unknown
 optional field on a message is ignored, which the protocol already relies on.
 
-**What it cannot do.** A record arrives with the write: a member that has not
-received the write has no record of it, and applies a retry of it a second
-time ([HTTP API](http-api.md#a-retry-on-another-member)). And a member of an
-earlier release serves every entry from its own oplog without records, which is
-why a member takes keys only while every live member carries them
+**What it cannot do.** A member that has not received the write has no record
+of it, and applies a retry of it a second time
+([HTTP API](http-api.md#a-retry-on-another-member)). And a member of an earlier
+release serves every entry from its own oplog without records, which is why a
+member takes keys only while every live member carries them
 ([the gate](http-api.md#the-gate)).
 
 ---
@@ -601,7 +644,7 @@ negotiation for this.
 
 | Field | On | Meaning |
 |---|---|---|
-| `facts` | both | The sender's block about itself: whether it is catching up, which classes it yields (`yielding`), which of expiry and embeddings it has off, its TTL holder list, and, from 0.44.0, `class_state` and `class_cause` (per class: `ok`, `idle`, `suspect`, `stalled`, and why), `responsive` and `started_ms` (its process start, in its own clock), and, from 0.51.0, `vector_chunk_ids` (the vector chunk-id format it writes, `2`; ADR-239), and, from 0.52.0, `idempotency_records` (`true`: it stores and relays [idempotency records](#idempotency-records-beside-the-entries), whatever its `cluster.idempotency_keys`; ADR-240). A block that does not decode is no block and is counted |
+| `facts` | both | The sender's block about itself: whether it is catching up, which classes it yields (`yielding`), which of expiry and embeddings it has off, its TTL holder list, and, from 0.44.0, `class_state` and `class_cause` (per class: `ok`, `idle`, `suspect`, `stalled`, and why), `responsive` and `started_ms` (its process start, in its own clock), and, from 0.51.0, `vector_chunk_ids` (the vector chunk-id format it writes, `2`; ADR-239), and, from 0.52.0, `idempotency_records` (`true`: it stores and relays [idempotency records](#idempotency-records-travel-with-coverage), whatever its `cluster.idempotency_keys`; ADR-240). A block that does not decode is no block and is counted |
 | `facts_gen` | both | The generation of the sender's block: a counter per process, an `Int64`, that rises each time the block changes. A receiver never replaces a held block with a lower generation from the same process, so a late-decoded older frame cannot undo a newer one |
 | `echo` | both | `{ boot, generation }`: the **other** side's block as the sender holds it. On `AskVersions` it is the server's block as the requester holds it; on `Vectors` it is the requester's block as the server holds it after recording the request's, which it does before it replies. A sender that holds nothing of the other side sends an empty `boot` and generation 0 |
 
