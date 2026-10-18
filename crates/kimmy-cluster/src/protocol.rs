@@ -1020,11 +1020,11 @@ mod tests {
                     after_key: vec![1, 2],
                     records: None,
                     // A records delta's base: a key of the sender's change
-                    // log (B5).
-                    records_base: Some(kimmy_core::Stamp::new(
-                        Hlc::new(77, 1),
-                        NodeId::from_bytes([3; 16]),
-                    )),
+                    // log and its epoch (B5).
+                    records_base: Some(kimmy_storage::RecordsBase {
+                        key: kimmy_core::Stamp::new(Hlc::new(77, 1), NodeId::from_bytes([3; 16])),
+                        epoch: Some(i64::MIN + 5),
+                    }),
                 }),
                 collection: Some(CollectionId(u64::MAX)),
             },
@@ -1444,7 +1444,7 @@ mod tests {
                 after_key: Vec::new(),
                 records: Some(vec![9; 32]),
                 // And the records delta's base.
-                records_base: Some(at),
+                records_base: Some(kimmy_storage::RecordsBase { key: at, epoch: Some(-1) }),
             }),
             versions: versions.clone(),
             dropped: None,
@@ -1497,7 +1497,7 @@ mod tests {
             "after": {
                 "collection": bson::serialize_to_bson(&high).unwrap(),
                 "after_key": bson::Bson::Array(Vec::new()),
-                "records_base": "not a stamp",
+                "records_base": "not a base",
             },
             "collection": bson::Bson::Null,
         };

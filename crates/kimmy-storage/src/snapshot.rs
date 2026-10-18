@@ -205,14 +205,14 @@ pub struct SnapshotCursor {
     )]
     pub records: Option<Vec<u8>>,
     /// The base of the next page's **records delta** (B5, "Snapshots carry
-    /// records"): a key of the sender's change log of idempotency records
-    /// (`IDEMPOTENCY_CHANGES`), its high water as the page that cut this cursor
-    /// read it in its documents' transaction. The next page carries, ahead of its
-    /// documents and read in their transaction, every record the log names above
-    /// it: every record the sender changed since that read, by any route. So a
-    /// page never holds a document whose record changed after its collection's
-    /// records phase without the record. A scoped or converge pull's pages carry
-    /// only the collection's.
+    /// records"): where the sender's change log of idempotency records
+    /// (`IDEMPOTENCY_CHANGES`) stood when the page that cut this cursor read its
+    /// documents, a key of it and the log's epoch ([`RecordsBase`]). The next page
+    /// carries, ahead of its documents and read in their transaction, every
+    /// record the log names above that key: every record the sender changed
+    /// since that read, by any route. So a page never holds a document whose
+    /// record changed after its collection's records phase without the record. A
+    /// scoped or converge pull's pages carry only the collection's.
     ///
     /// On a **records-only page**, one whose delta does not fit a page with its
     /// documents, the last log key the page's delta examined, with `collection`,
@@ -223,12 +223,33 @@ pub struct SnapshotCursor {
     /// collection's records phase covers, and a cursor a 0.51 receiver echoes,
     /// having dropped the field (keyed writes are refused while a 0.51 member is
     /// live). Persisted with the cursor (`SNAPSHOT_PROGRESS`), so a resumed pull
-    /// is sent everything that changed since. A base the sender's log cannot
-    /// answer for (another node's, from before its log began, or above its high
-    /// water) restarts the cursor's collection from its records phase. Read
-    /// leniently: a value of another shape is none.
+    /// is sent everything that changed since. A base of another epoch than the
+    /// sender's log has now (a restore, an identity reset) restarts the cursor's
+    /// collection from its records phase. Read leniently: a value of another
+    /// shape is none.
     #[serde(default, skip_serializing_if = "Option::is_none", deserialize_with = "lenient")]
-    pub records_base: Option<Stamp>,
+    pub records_base: Option<RecordsBase>,
+}
+
+/// Where a sender's change log of idempotency records stood (B5): a key of it
+/// and its epoch, the base of a snapshot page's records delta
+/// ([`SnapshotCursor::records_base`]).
+///
+/// The **epoch** is a random number the log is given when it begins: with its
+/// first change, and again after a restore (a backup carries no log), an
+/// identity reset, or an open that found no log. Keys are compared only within
+/// one epoch: a key is a stamp of the sender's clock, and a sender restored onto
+/// a host whose clock is behind mints keys below a base cut before the restore,
+/// so no comparison of keys can tell such a base from one cut since. `None` with
+/// the zero key is the base of a log that has held nothing: every change it
+/// logs is above it. On the wire as a BSON `int64` (BSON has no unsigned one).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RecordsBase {
+    /// A key of the log: the next page carries what the log names above it.
+    pub key: Stamp,
+    /// The log's epoch; `None` for a log that had held nothing.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub epoch: Option<i64>,
 }
 
 /// An optional cursor field read leniently, in the wire's BSON and in the JSON a
@@ -1055,33 +1076,41 @@ impl Engine {
             records_base: None,
         };
 
-        // The records delta, and the base the cursor this page cuts carries: the
-        // change log's high water, both read in this transaction, the documents'
-        // own, as a key of this node's. A log that has held nothing yet has the
-        // zero base: every change it logs is above it.
-        let high = crate::idempotency::changes_high_water(&txn)?.map_or(Hlc::ZERO, |high| high.hlc);
-        let high = Stamp::new(high, self.node_id());
+        // The records delta, and the base the cursor this page cuts carries: where
+        // the change log stands, both read in this transaction, the documents'
+        // own. A log that has held nothing (or only another identity's changes,
+        // which its next change begins again over) has the zero base.
+        let begun = crate::idempotency::changes_begin(&txn)?
+            .filter(|begun| begun.at.node == self.node_id());
+        let cut_base = match begun {
+            Some(begun) => {
+                let high = crate::idempotency::changes_high_water(&txn)?
+                    .map_or(begun.at.hlc, |high| high.hlc);
+                RecordsBase { key: Stamp::new(high, self.node_id()), epoch: Some(begun.epoch) }
+            }
+            None => RecordsBase { key: Stamp::new(Hlc::ZERO, self.node_id()), epoch: None },
+        };
         let mut records = Vec::new();
         let mut restart = false;
         if let Some(cursor) = &after
             && let Some(base) = cursor.records_base
         {
-            let begins = crate::idempotency::changes_begin(&txn)?;
-            if base.node != self.node_id()
-                || base.hlc != Hlc::ZERO
-                    && (begins.is_none_or(|begins| base.hlc < begins.hlc) || base.hlc > high.hlc)
-            {
-                // A base this log cannot answer for: another node's (an identity
-                // reset), from before the log began (a restore: a backup carries
-                // no log), or above its high water. The zero base, cut while the
-                // log held nothing, is below everything it holds. What changed since it is unknown, so the cursor's
-                // collection is sent again from its records phase, and every
-                // collection after it has its own.
+            // Within one epoch, or from the zero base: keys are compared only
+            // there (see `RecordsBase`).
+            let answered = match base.epoch {
+                Some(epoch) => begun.is_some_and(|begun| begun.epoch == epoch),
+                None => base.key.hlc == Hlc::ZERO,
+            };
+            if !answered {
+                // A base of another epoch than this log's (a restore, an identity
+                // reset, a log an open found missing), or a key without one: what
+                // changed since it is unknown, so the cursor's collection is sent
+                // again from its records phase, and every collection after it has
+                // its own.
                 info!(
                     base = ?base,
-                    begins = ?begins,
-                    high = ?high,
-                    "a snapshot cursor's records base is not this node's log; its collection \
+                    epoch = ?begun.map(|begun| begun.epoch),
+                    "a snapshot cursor's records base is of another log; its collection \
                      restarts from its records"
                 );
                 restart = true;
@@ -1089,7 +1118,7 @@ impl Engine {
                 let standing = |id: CollectionId| live.contains(&id.0);
                 let delta = crate::idempotency::records_changed_since(
                     &txn,
-                    base,
+                    base.key,
                     &standing,
                     self.record_delta_budget(),
                 )?;
@@ -1107,14 +1136,15 @@ impl Engine {
                         "a snapshot page carries only records: what changed since the page \
                          before does not fit one page with its documents"
                     );
-                    let cursor = SnapshotCursor { records_base: Some(stopped), ..cursor.clone() };
+                    let base = RecordsBase { key: stopped, epoch: cut_base.epoch };
+                    let cursor = SnapshotCursor { records_base: Some(base), ..cursor.clone() };
                     return Ok((records, Vec::new(), Vec::new(), Some(cursor)));
                 }
             }
         }
         let delta_len = records.len();
         let cut = |cursor: Option<SnapshotCursor>| {
-            cursor.map(|cursor| SnapshotCursor { records_base: Some(high), ..cursor })
+            cursor.map(|cursor| SnapshotCursor { records_base: Some(cut_base), ..cursor })
         };
 
         let mut out = Vec::new();

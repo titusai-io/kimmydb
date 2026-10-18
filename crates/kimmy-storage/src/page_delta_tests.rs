@@ -20,8 +20,8 @@ use crate::idempotency::{
     RecordState, RecordsVia,
 };
 use crate::{
-    Candidates, CollectionMeta, Engine, ModifySpec, PeerWindow, SNAPSHOT_PAGE, ServeVerdict,
-    SnapshotCursor, SnapshotPage, SnapshotProgress, SyncOutcome,
+    Candidates, CollectionMeta, Engine, ModifySpec, PeerWindow, RecordsBase, SNAPSHOT_PAGE,
+    ServeVerdict, SnapshotCursor, SnapshotPage, SnapshotProgress, SyncOutcome,
 };
 
 struct Inc;
@@ -547,7 +547,10 @@ fn a_resumed_pull_is_first_sent_every_record_that_changed_since() {
     let x = Engine::open(&x_path).unwrap();
     let (_, mut progress) = x.snapshots_to_resume().unwrap().pop().unwrap();
     let at = progress.after().cloned().unwrap();
-    assert!(at.records_base > asked.records_base, "the base moved and was persisted: {at:?}");
+    assert!(
+        at.records_base.unwrap().key > asked.records_base.unwrap().key,
+        "the base moved and was persisted: {at:?}"
+    );
     assert_eq!(
         (at.collection, &at.after_key, &at.records),
         (asked.collection, &asked.after_key, &asked.records)
@@ -602,7 +605,10 @@ fn a_cursor_without_a_base_carries_no_delta_and_the_base_crosses_bson_and_json()
     // The base, through BSON and JSON, alone and inside the persisted progress.
     let node = NodeId::from_bytes([3; 16]);
     let cursor = SnapshotCursor {
-        records_base: Some(Stamp::new(Hlc::new(1_700_000_000_000, 4), node)),
+        records_base: Some(RecordsBase {
+            key: Stamp::new(Hlc::new(1_700_000_000_000, 4), node),
+            epoch: Some(-7_000_000_000_000_000_000),
+        }),
         ..next
     };
     let wire: SnapshotCursor =
@@ -611,6 +617,13 @@ fn a_cursor_without_a_base_carries_no_delta_and_the_base_crosses_bson_and_json()
     let persisted: SnapshotCursor =
         serde_json::from_slice(&serde_json::to_vec(&cursor).unwrap()).unwrap();
     assert_eq!(persisted, cursor, "JSON");
+    let zero = SnapshotCursor {
+        records_base: Some(RecordsBase { key: Stamp::new(Hlc::ZERO, node), epoch: None }),
+        ..cursor.clone()
+    };
+    let wire: SnapshotCursor =
+        bson::deserialize_from_slice(&bson::serialize_to_vec(&zero).unwrap()).unwrap();
+    assert_eq!(wire, zero, "the zero base, through BSON");
     let none = SnapshotCursor { records_base: None, ..cursor.clone() };
     let text = serde_json::to_string(&none).unwrap();
     assert!(!text.contains("records_base"), "{text}");
@@ -873,7 +886,7 @@ fn a_record_a_member_pulls_while_serving_a_snapshot_rides_its_next_page() {
     retry_must_replay(&m, &cm, &k, target);
 }
 
-// -- A base the sender's log cannot answer for ---------------------------------------------
+// -- A base of another epoch --------------------------------------------------------------
 
 /// Whether `page` is its collection again from its records phase: all `records`
 /// of it, then its documents from the first, `first`.
@@ -882,37 +895,19 @@ fn restarted(page: &SnapshotPage, records: usize, first: i64) -> bool {
         && page.documents.first().map(|d| &d.id) == Some(&DocId::Int64(first))
 }
 
-/// A base above the sender's log's high water (a cursor from a log this node no
-/// longer has, or from a clock ahead of its own): what changed since it is
-/// unknown, so the cursor's collection restarts from its records phase, which
-/// carries the record of a keyed write made since the page before.
-#[test]
-fn a_base_above_the_senders_log_restarts_its_collection_from_its_records() {
-    let dir = tempfile::tempdir().unwrap();
-    let (y, x) = (open(&dir, "y"), open(&dir, "x"));
-    let target = SNAPSHOT_PAGE as i64 + 40;
-    let cy = three_pages(&y, target);
-    let mut progress = SnapshotProgress::of_collection(cy.id);
-    take(&x, &y, &mut progress);
-    let k = key(7);
-    fresh(y.modify_where_keyed(&cy, &Candidates::Scan, &Inc, Some(1), &k).unwrap());
-    let ahead = Stamp::new(Hlc::new(crate::physical_now_ms() + 3_600_000, 0), y.node_id());
-    let forged = SnapshotCursor { records_base: Some(ahead), ..progress.after().cloned().unwrap() };
-    let page = y.snapshot_page(Some(forged), Some(cy.id)).unwrap();
-    assert!(restarted(&page, 1, 1), "restarted: {:?}", page.next);
-    x.apply_snapshot_page(y.node_id(), &mut progress, &page).unwrap();
-    finish(&x, &y, &mut progress);
-    let cx = x.get_collection("shop", "orders").unwrap();
-    assert_eq!(n_of(&x, &cx, target), 11, "premise: the pull brought the effect");
-    retry_must_replay(&x, &cx, &k, target);
+/// A cursor's base with another epoch.
+fn of_epoch(cursor: &SnapshotCursor, epoch: Option<i64>) -> SnapshotCursor {
+    let base = cursor.records_base.expect("a base");
+    SnapshotCursor { records_base: Some(RecordsBase { epoch, ..base }), ..cursor.clone() }
 }
 
-/// A base from before the sender's log began, as a sender restored from a backup
-/// (which carries no log) has it: the cursor's collection restarts from its
-/// records phase. And a base of another node's, as after an identity reset, the
-/// same.
+/// A base of another epoch than the sender's log has (a cursor cut from a log
+/// this node no longer has): what changed since it is unknown, so the cursor's
+/// collection restarts from its records phase, which carries the record of a
+/// keyed write made since the page before. A key without an epoch, while the log
+/// has one, the same.
 #[test]
-fn a_base_from_before_a_restore_or_of_another_node_restarts_its_collection() {
+fn a_base_of_another_epoch_restarts_its_collection_from_its_records() {
     let dir = tempfile::tempdir().unwrap();
     let (y, x) = (open(&dir, "y"), open(&dir, "x"));
     let target = SNAPSHOT_PAGE as i64 + 40;
@@ -921,15 +916,56 @@ fn a_base_from_before_a_restore_or_of_another_node_restarts_its_collection() {
     let mut progress = SnapshotProgress::of_collection(cy.id);
     take(&x, &y, &mut progress);
     let asked = progress.after().cloned().unwrap();
-    // Another node's base, with a time this log answers for: only the node
-    // tells it apart, as after an identity reset.
-    let base = asked.records_base.unwrap();
-    let other = SnapshotCursor {
-        records_base: Some(Stamp::new(base.hlc, NodeId::from_bytes([0xEE; 16]))),
-        ..asked.clone()
-    };
-    let page = y.snapshot_page(Some(other), Some(cy.id)).unwrap();
-    assert!(restarted(&page, 1, 0), "restarted for another node's base: {:?}", page.next);
+    let epoch = asked.records_base.unwrap().epoch.expect("premise: the log has begun");
+    let k = key(7);
+    fresh(y.modify_where_keyed(&cy, &Candidates::Scan, &Inc, Some(1), &k).unwrap());
+    let page = y.snapshot_page(Some(of_epoch(&asked, None)), Some(cy.id)).unwrap();
+    assert!(restarted(&page, 2, 0), "a key without an epoch restarts: {:?}", page.next);
+    let page = y.snapshot_page(Some(of_epoch(&asked, Some(epoch ^ 1))), Some(cy.id)).unwrap();
+    assert!(restarted(&page, 2, 0), "restarted: {:?}", page.next);
+    x.apply_snapshot_page(y.node_id(), &mut progress, &page).unwrap();
+    finish(&x, &y, &mut progress);
+    let cx = x.get_collection("shop", "orders").unwrap();
+    assert_eq!(n_of(&x, &cx, target), 11, "premise: the pull brought the effect");
+    retry_must_replay(&x, &cx, &k, target);
+}
+
+/// The zero base, which a log that had held nothing cuts, is answered with every
+/// change the log holds since, whatever its epoch: no restart.
+#[test]
+fn the_zero_base_is_sent_every_change_the_log_holds() {
+    let dir = tempfile::tempdir().unwrap();
+    let (y, x) = (open(&dir, "y"), open(&dir, "x"));
+    let target = SNAPSHOT_PAGE as i64 + 40;
+    let cy = three_pages(&y, target);
+    let mut progress = SnapshotProgress::of_collection(cy.id);
+    take(&x, &y, &mut progress);
+    let asked = progress.after().cloned().unwrap();
+    assert_eq!(asked.records_base.unwrap().epoch, None, "premise: the zero base");
+    assert_eq!(asked.records_base.unwrap().key.hlc, Hlc::ZERO);
+    let k = key(7);
+    fresh(y.modify_where_keyed(&cy, &Candidates::Scan, &Inc, Some(1), &k).unwrap());
+    let page = take(&x, &y, &mut progress);
+    assert_eq!(page.records.len(), 1, "the change, as a delta");
+    assert_eq!(page.documents[0].id, DocId::Int64(SNAPSHOT_PAGE as i64 + 1), "no restart");
+    let cx = x.get_collection("shop", "orders").unwrap();
+    retry_must_replay(&x, &cx, &k, target);
+}
+
+/// A sender restored from a backup (which carries no log) begins its log again
+/// with a new epoch, and a base cut before the restore restarts the cursor's
+/// collection, before the restored log holds anything and after. And a sender
+/// whose identity was reset begins it again the same way.
+#[test]
+fn a_restore_or_an_identity_reset_begins_the_log_again_and_restarts_older_bases() {
+    let dir = tempfile::tempdir().unwrap();
+    let (y, x) = (open(&dir, "y"), open(&dir, "x"));
+    let target = SNAPSHOT_PAGE as i64 + 40;
+    let cy = three_pages(&y, target);
+    fresh(y.insert_keyed(&cy, doc! { "_id": 0i64 }, &key(3)).unwrap());
+    let mut progress = SnapshotProgress::of_collection(cy.id);
+    take(&x, &y, &mut progress);
+    let asked = progress.after().cloned().unwrap();
     let page = y.snapshot_page(Some(asked.clone()), Some(cy.id)).unwrap();
     assert!(!restarted(&page, 1, 0), "premise: its own base goes on: {:?}", page.next);
     // Y is replaced by a restore of its backup.
@@ -942,8 +978,79 @@ fn a_base_from_before_a_restore_or_of_another_node_restarts_its_collection() {
     assert_eq!(log_rows(&y), 0, "a backup carries no log");
     let page = y.snapshot_page(Some(asked.clone()), Some(cy.id)).unwrap();
     assert!(restarted(&page, 1, 0), "restarted on a restored log with nothing in it");
+    fresh(y.modify_where_keyed(&cy, &Candidates::Scan, &Inc, Some(1), &key(7)).unwrap());
+    let page = y.snapshot_page(Some(asked.clone()), Some(cy.id)).unwrap();
+    assert!(restarted(&page, 2, 0), "restarted after a restore: {:?}", page.next);
+    // Its identity is reset: the log begins again at its next change.
+    let page = y.snapshot_page(Some(asked), Some(cy.id)).unwrap();
+    let before = page.next.unwrap();
+    y.close().unwrap();
+    {
+        let db = redb::Database::open(&restored_path).unwrap();
+        let txn = db.begin_write().unwrap();
+        txn.open_table(crate::tables::META).unwrap().remove(crate::tables::META_NODE_ID).unwrap();
+        txn.commit().unwrap();
+    }
+    let y = Engine::open(&restored_path).unwrap();
+    let page = y.snapshot_page(Some(before.clone()), Some(cy.id)).unwrap();
+    assert!(restarted(&page, 2, 0), "restarted on a log another identity began");
+    fresh(y.insert_keyed(&cy, doc! { "_id": 1_000_000i64 }, &key(9)).unwrap());
+    let page = y.snapshot_page(Some(before.clone()), Some(cy.id)).unwrap();
+    assert!(restarted(&page, 3, 0), "restarted after an identity reset: {:?}", page.next);
+    let epoch = |cursor: &SnapshotCursor| cursor.records_base.and_then(|base| base.epoch);
+    let renewed = epoch(page.next.as_ref().unwrap());
+    assert!(renewed.is_some() && renewed != epoch(&before), "the log began again: {renewed:?}");
+}
+
+/// The clock-behind restore (the G1 review, 10.7's follow-up): the sender is
+/// restored from a backup older than the receiver's base, onto a host whose
+/// clock is behind it, so the keyed change it then takes is logged **below** that
+/// base; later, its clock past the base, it logs another above it. Read by key
+/// values alone the base looks current (between where the log begins and its
+/// high water), and the change below it would be missed: the receiver would take
+/// its effect without its record. The epoch tells the base is of another log, and
+/// the cursor's collection restarts from its records.
+#[test]
+fn a_base_from_before_a_restore_onto_a_clock_behind_restarts_its_collection() {
+    let dir = tempfile::tempdir().unwrap();
+    let (y, x) = (open(&dir, "y"), open(&dir, "x"));
+    let target = SNAPSHOT_PAGE as i64 + 40;
+    let cy = three_pages(&y, target);
+    fresh(y.insert_keyed(&cy, doc! { "_id": 0i64 }, &key(3)).unwrap());
+    let mut backup = Vec::new();
+    y.backup_to(&mut backup, crate::WalkScope::Background).unwrap();
+    // After the backup, Y's log goes on, and the receiver's base with it.
+    std::thread::sleep(std::time::Duration::from_millis(30));
+    fresh(y.insert_keyed(&cy, doc! { "_id": 1_000_000i64 }, &key(4)).unwrap());
+    let mut progress = SnapshotProgress::of_collection(cy.id);
+    take(&x, &y, &mut progress);
+    let base = progress.after().unwrap().records_base.unwrap();
+    drop(y);
+    // Restored onto a host whose clock is an hour behind.
+    let restored_path = dir.path().join("y2.redb");
+    crate::backup::restore(&restored_path, &mut backup.as_slice()).unwrap();
+    let y = Engine::open(&restored_path).unwrap();
+    y.set_clock_behind_for_test(3_600_000);
     let k = key(7);
     fresh(y.modify_where_keyed(&cy, &Candidates::Scan, &Inc, Some(1), &k).unwrap());
-    let page = y.snapshot_page(Some(asked), Some(cy.id)).unwrap();
-    assert!(restarted(&page, 2, 0), "restarted after a restore: {:?}", page.next);
+    let below = y.idempotency_record(cy.id, &k.scope).unwrap().unwrap().first;
+    assert!(below.hlc < base.key.hlc, "premise: logged below the base");
+    // The clock catches up, and the log goes on above the base.
+    y.set_clock_behind_for_test(0);
+    fresh(y.insert_keyed(&cy, doc! { "_id": 1_000_001i64 }, &key(5)).unwrap());
+    {
+        use redb::ReadableDatabase;
+        let txn = y.db().begin_read().unwrap();
+        let begun = crate::idempotency::changes_begin(&txn).unwrap().unwrap();
+        let high = crate::idempotency::changes_high_water(&txn).unwrap().unwrap();
+        assert!(begun.at.hlc < base.key.hlc && base.key.hlc < high.hlc, "premise: inside");
+        assert_ne!(Some(begun.epoch), base.epoch, "a new epoch");
+    }
+    let page = take(&x, &y, &mut progress);
+    // The restored records: the one from the backup and the two since.
+    assert!(restarted(&page, 3, 0), "restarted: {:?}", page.next);
+    finish(&x, &y, &mut progress);
+    let cx = x.get_collection("shop", "orders").unwrap();
+    assert_eq!(n_of(&x, &cx, target), 11, "premise: the pull brought the effect");
+    retry_must_replay(&x, &cx, &k, target);
 }

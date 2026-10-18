@@ -130,10 +130,14 @@
 //! page before read it in its documents' transaction ([`changes_high_water`]).
 //! One range, each change sent once, nothing for a store without keys. A page
 //! carries documents only with the whole of the log above its base; otherwise
-//! it is a records-only page and its base moves to the last key it examined. A
-//! base this log cannot answer for (another node's, from before the log began
-//! ([`changes_begin`]), above its high water) restarts the cursor's collection
-//! from its records phase.
+//! it is a records-only page and its base moves to the last key it examined.
+//!
+//! Keys are compared only within one **epoch** ([`changes_begin`]): a random
+//! number the log is given when it begins, with its first change, and again
+//! after a restore (a backup carries no log), an identity reset, or an open
+//! that found no log. A base of another epoch restarts the cursor's collection
+//! from its records phase, whatever the keys say: a sender restored onto a host
+//! whose clock is behind logs keys below a base cut before the restore.
 
 use std::collections::HashSet;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -997,32 +1001,78 @@ fn records_in_advance(
 /// One row of this node's change log ([`IDEMPOTENCY_CHANGES`]) for a store of
 /// the record under `(collection, scope)`, in the store's transaction, keyed by a
 /// stamp minted for it now. The caller holds the writer, so keys are in commit
-/// order. The first row a log holds also says where it begins: a new store's,
-/// one from before the log, or one restored from a backup, which carries none.
+/// order.
+///
+/// **The log begins** with the first change it holds, and begins again, with a
+/// new epoch, at the first change after an open that found no beginning (a new
+/// store, one from before the log, one restored from a backup, which carries
+/// none) or one this node's identity did not write (an identity reset).
 fn log_change(
     engine: &Engine,
     txn: &redb::WriteTransaction,
     collection: CollectionId,
     scope: &ScopeHash,
 ) -> Result<()> {
-    let key = codec::oplog_key(&engine.next_stamp());
+    let at = engine.next_stamp();
+    let key = codec::oplog_key(&at);
     let mut log = txn.open_table(IDEMPOTENCY_CHANGES)?;
-    if log.get(LOG_BEGINS)?.is_none() {
-        log.insert(LOG_BEGINS, key.as_slice())?;
+    let begun = log
+        .get(LOG_BEGINS)?
+        .and_then(|raw| LogBegin::decode(raw.value()))
+        .is_some_and(|begun| begun.at.node == engine.node_id());
+    if !begun {
+        let begin = LogBegin { at, epoch: new_epoch() };
+        log.insert(LOG_BEGINS, begin.encode().as_slice())?;
     }
     log.insert(key.as_slice(), row_value(collection, scope).as_slice())?;
     Ok(())
 }
 
+/// A new log's epoch: random, never 0.
+fn new_epoch() -> i64 {
+    loop {
+        let (high, _) = uuid::Uuid::new_v4().as_u64_pair();
+        if high != 0 {
+            return high as i64;
+        }
+    }
+}
+
+/// Where this node's change log began ([`IDEMPOTENCY_CHANGES`]'s empty key): the
+/// key of its first change, and its epoch (`snapshot::RecordsBase`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct LogBegin {
+    pub at: Stamp,
+    pub epoch: i64,
+}
+
+impl LogBegin {
+    /// `key (26) ‖ epoch (8, big-endian)`.
+    fn encode(&self) -> [u8; codec::STAMP_LEN + 8] {
+        let mut out = [0u8; codec::STAMP_LEN + 8];
+        out[..codec::STAMP_LEN].copy_from_slice(&codec::oplog_key(&self.at));
+        out[codec::STAMP_LEN..].copy_from_slice(&self.epoch.to_be_bytes());
+        out
+    }
+
+    fn decode(bytes: &[u8]) -> Option<Self> {
+        let (at, epoch) = bytes.split_at_checked(codec::STAMP_LEN)?;
+        Some(Self {
+            at: codec::decode_oplog_key(at).ok()?,
+            epoch: i64::from_be_bytes(epoch.try_into().ok()?),
+        })
+    }
+}
+
 /// The change log's empty key: where it begins.
 const LOG_BEGINS: &[u8] = &[];
 
-/// Where this node's change log begins, as `txn` sees it: its first change's
-/// key, `None` while it has held none.
-pub(crate) fn changes_begin(txn: &ReadTransaction) -> Result<Option<Stamp>> {
+/// Where this node's change log began, and its epoch, as `txn` sees it; `None`
+/// while it has held no change.
+pub(crate) fn changes_begin(txn: &ReadTransaction) -> Result<Option<LogBegin>> {
     let log = txn.open_table(IDEMPOTENCY_CHANGES)?;
     let Some(raw) = log.get(LOG_BEGINS)? else { return Ok(None) };
-    Ok(codec::decode_oplog_key(raw.value()).ok())
+    Ok(LogBegin::decode(raw.value()))
 }
 
 /// The change log's high water as `txn` sees it: its last key, or where it began
@@ -1037,7 +1087,7 @@ pub(crate) fn changes_high_water(txn: &ReadTransaction) -> Result<Option<Stamp>>
     {
         return Ok(Some(stamp));
     }
-    changes_begin(txn)
+    Ok(changes_begin(txn)?.map(|begun| begun.at))
 }
 
 /// [`changes_high_water`]'s time, at open, for where the clock resumes.

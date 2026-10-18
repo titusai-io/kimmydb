@@ -148,6 +148,10 @@ pub struct Engine {
     /// (ADR-086). Set from configuration at startup; the storage default
     /// stands for a bare engine.
     multi_chunk_docs: std::sync::atomic::AtomicUsize,
+    /// How far behind the wall clock this engine's clock reads its physical time,
+    /// for a test of a member restored onto a host whose clock is behind.
+    #[cfg(test)]
+    clock_behind_ms: std::sync::atomic::AtomicU64,
     /// How a commit becomes durable (ADR-088). `None` is the default class,
     /// `durable`: every commit fsyncs before it returns. `Some` is
     /// `coalesced`: commits skip their own fsync and wait at a shared barrier
@@ -1517,6 +1521,8 @@ impl Engine {
             multi_chunk_docs: std::sync::atomic::AtomicUsize::new(
                 crate::modify::DEFAULT_MULTI_CHUNK_DOCS,
             ),
+            #[cfg(test)]
+            clock_behind_ms: std::sync::atomic::AtomicU64::new(0),
             coalescer: Mutex::new(None),
             coalesce_woken: Condvar::new(),
             #[cfg(test)]
@@ -3690,8 +3696,29 @@ impl Engine {
 
     /// Mint the next stamp for a local write.
     pub(crate) fn next_stamp(&self) -> Stamp {
-        let hlc = self.clock.lock().tick(physical_now_ms());
+        let hlc = self.clock.lock().tick(self.clock_physical_ms());
         Stamp::new(hlc, self.node_id)
+    }
+
+    /// The physical time the clock ticks from: the wall clock's, or, in a test
+    /// that holds it back, that far behind it.
+    fn clock_physical_ms(&self) -> u64 {
+        #[cfg(test)]
+        {
+            let behind = self.clock_behind_ms.load(std::sync::atomic::Ordering::Relaxed);
+            if behind > 0 {
+                return physical_now_ms().saturating_sub(behind);
+            }
+        }
+        physical_now_ms()
+    }
+
+    /// Hold this engine's clock `ms` behind the wall clock, as a host whose clock
+    /// is behind would (0 for the wall clock's own): stamps it mints then rise by
+    /// their counter above what it has witnessed.
+    #[cfg(test)]
+    pub(crate) fn set_clock_behind_for_test(&self, ms: u64) {
+        self.clock_behind_ms.store(ms, std::sync::atomic::Ordering::Relaxed);
     }
 
     /// The last time the clock handed out, for a test that a path mints

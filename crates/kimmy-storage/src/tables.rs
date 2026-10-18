@@ -331,10 +331,13 @@ pub const IDEMPOTENCY_BY_STAMP: TableDefinition<&[u8], &[u8]> =
 /// above the base its cursor carries. Node-local: never shipped by a window, not
 /// carried by a backup. Retention drops rows older than the record window.
 ///
-/// The empty key holds where this log begins, the key of the first change it
-/// held (a new store's, one from before the log, or a restored one, whose backup
-/// carries none), so a base from before it is told apart. Its high water is in
-/// the clock's at open. Created by `Engine::open` with no schema bump.
+/// The empty key holds where this log began, the key of the first change it
+/// held, and its **epoch** (`key (26) ‖ epoch (8)`): a random number given again
+/// when the log begins again, at the first change after a restore (a backup
+/// carries none), an identity reset, or an open that found no log. A snapshot
+/// cursor's base names the epoch, and one of another is told apart whatever the
+/// keys say. The log's high water is in the clock's at open. Created by
+/// `Engine::open` with no schema bump.
 pub const IDEMPOTENCY_CHANGES: TableDefinition<&[u8], &[u8]> =
     TableDefinition::new("idempotency_changes");
 
