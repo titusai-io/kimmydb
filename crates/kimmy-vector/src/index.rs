@@ -909,12 +909,6 @@ mod tests {
         }
     }
 
-    /// The truly orphaned fraction below which a draw counts as a healthy
-    /// graph in [`a_healthy_graph_at_a_realistic_width_is_not_rebuilt`]:
-    /// above every healthy draw measured at 1,000 × 384 (2.8%), below the one
-    /// degraded draw (5.7%).
-    const HEALTHY_ORPHANED_BELOW: f64 = 0.04;
-
     /// Deterministic pseudo-random vectors, so recall numbers are reproducible.
     fn pseudo_random(seed: u64, dim: usize) -> Vec<f32> {
         let mut state = seed.wrapping_mul(6364136223846793005).wrapping_add(1);
@@ -1115,48 +1109,28 @@ mod tests {
         ));
     }
 
-    /// A healthy graph at a realistic embedding width is not treated as broken.
+    /// A healthy graph at a realistic embedding width is not treated as broken,
+    /// and is healthy: no more than 0.5% of it is out of reach.
     ///
-    /// This is the regression test for the defect that this change fixes, and
-    /// it is deliberately at 384 dimensions rather than the 16 the other tests
-    /// use. The threshold it guards was sized against a 400-vector,
-    /// 16-dimensional fixture, and both of those turned out to matter: at 384
-    /// dimensions a fixed search budget covers proportionally less of a growing
-    /// collection, so ordinary misses climbed with size until *every* build at
-    /// 4,000 vectors was discarded, rebuilt twice, and then reported as losing
-    /// data. Three times the build cost and a false alarm, on a good graph.
+    /// The threshold this guards was once sized against a 400-vector,
+    /// 16-dimensional fixture, and at 384 dimensions a fixed search budget
+    /// covers proportionally less of a growing collection, so ordinary misses
+    /// climbed with size until *every* build at 4,000 vectors was discarded,
+    /// rebuilt twice, and then reported as losing data. Hence 384 dimensions.
     ///
-    /// **Only healthy draws are graded, because not every draw is healthy.**
-    /// Measured over 300 builds at this size and width, with every point
-    /// checked rather than a sample, the builder is bimodal:
+    /// **And it is the realistic-width half of the regression test for
+    /// `hnsw_rs` 0.3.4** (ADR-241). Measured with every point checked, at this
+    /// size and width:
     ///
-    /// | draws | truly orphaned | sampled score |
-    /// |---|---|---|
-    /// | 297 healthy | 0.3%–2.8% | 0–6 |
-    /// | 1 grey | 5.7% | 7 |
-    /// | 2 catastrophic | 20.7%, 24.7% | 23, 32 |
+    /// | library | draws | truly orphaned | sampled score |
+    /// |---|---|---|---|
+    /// | 0.3.4 | 12 | 0.8%–2.1%, and 34.6% in one | 0–2, and more |
+    /// | 0.3.5 | 52 | 0–0.2% | 0–1 |
     ///
-    /// A catastrophic draw is what [`HnswIndex::build`] exists to discard, so a
-    /// score of 8 or more on one is the threshold working, not failing. This
-    /// test used to assert it of three raw draws, and at ~0.67% a draw it went
-    /// red on about 2% of runs for doing its job. So each draw's true orphaned
-    /// fraction is measured first, and only a draw below
-    /// [`HEALTHY_ORPHANED_BELOW`] is held to the threshold. That cutoff sits
-    /// above every healthy draw observed (2.8%) and below the grey one (5.7%),
-    /// which is degraded rather than healthy and which the threshold catches
-    /// about half the time by design.
-    ///
-    /// **Expected rate of a red.** A healthy draw scores 8 or more by sampling
-    /// alone about once in 1,400 (a 128-of-1,000 draw at each healthy build's
-    /// own orphaned count), so this test, grading up to three, goes red about
-    /// once in 470 runs with nothing wrong. Much more often than that means the
-    /// threshold is discarding healthy graphs; measure
-    /// `reachability_distribution_by_collection_size` before touching it.
-    ///
-    /// **A run that grades nothing fails.** Three catastrophic draws in a row
-    /// is about one run in three million at the measured rate; a builder whose
-    /// failure rate climbed would make it routine, and that must be a red
-    /// test, not a pass that graded nothing.
+    /// A build is a function of its records and its attempt, so the three
+    /// draws here are the same three graphs on every run (0.3.5: 2, 0 and 0
+    /// points out of reach), and the bound is an assertion about the library,
+    /// not a bet on a draw: 0.3.4's best of twelve left 8 out of reach.
     ///
     /// **Ignored, and run by its own CI job in release.** A 384-dimensional
     /// graph costs 146 seconds to build in a debug profile against 21 in
@@ -1170,11 +1144,12 @@ mod tests {
         const COUNT: usize = 1_000;
         const DIM: usize = 384;
         const DRAWS: usize = 3;
+        /// Out of reach in one draw, at most: 0.5%.
+        const MOST_OUT_OF_REACH: usize = COUNT / 200;
 
         let (engine, shadow, _dir) = setup(COUNT, DIM);
         let vectors = vectors_by_key(&engine, &shadow);
 
-        let mut graded = 0;
         for draw in 0..DRAWS {
             let (index, reach) =
                 HnswIndex::build_once(&engine, &shadow, Metric::Cosine, DIM, draw).unwrap();
@@ -1186,16 +1161,11 @@ mod tests {
             // Every point, not the sample: the ground truth the score is
             // judged against.
             let orphaned = truly_orphaned(&index, &vectors);
-            if orphaned as f64 >= HEALTHY_ORPHANED_BELOW * index.keys.len() as f64 {
-                println!(
-                    "draw {draw}: {orphaned} of {} truly orphaned (sampled score {}); not a \
-                     healthy graph, so not graded",
-                    index.keys.len(),
-                    reach.unreachable,
-                );
-                continue;
-            }
-            graded += 1;
+            assert!(
+                orphaned <= MOST_OUT_OF_REACH,
+                "draw {draw}: {orphaned} of {COUNT} {DIM}-dimensional vectors cannot find \
+                 themselves; hnsw_rs 0.3.5 leaves at most 2 here and 0.3.4 at least 8"
+            );
             assert!(
                 reach.unreachable < REACHABILITY_MAX_UNREACHABLE,
                 "draw {draw}: a healthy {DIM}-dimensional graph of {COUNT} vectors ({orphaned} \
@@ -1206,12 +1176,44 @@ mod tests {
                 reach.missed,
             );
         }
-        assert!(
-            graded > 0,
-            "none of {DRAWS} draws was a healthy graph, so this run graded nothing; at the \
-             measured ~0.67% catastrophic rate that is about one run in three million, so the \
-             builder's failure rate has risen"
-        );
+    }
+
+    /// Every vector can be found, in every build: the regression test for
+    /// `hnsw_rs` 0.3.4 in the default suite (ADR-241).
+    ///
+    /// 0.3.4 wrote a reverse edge at the new point's top layer rather than
+    /// the layer the edge was found on, so a point drawn above layer 0 could
+    /// be left with no edge into it at layer 0, and no search could return it.
+    /// At this size it left 0.25% to 3% of every graph out of reach (one of
+    /// thirty draws reached all), so eight draws all clean is a red on 0.3.4
+    /// on essentially every run; 0.3.5 left none out of reach in 315 draws.
+    /// The draws are attempts, so they are the same eight graphs on every
+    /// run. Every point is checked twice: by the search a probe makes, and by
+    /// the graph's own edges.
+    #[test]
+    fn every_vector_is_reachable_in_every_build() {
+        const COUNT: usize = 400;
+        const DIM: usize = 16;
+        const DRAWS: usize = 8;
+        let (engine, shadow, _dir) = setup(COUNT, DIM);
+        let vectors = vectors_by_key(&engine, &shadow);
+        for draw in 0..DRAWS {
+            let (index, _) =
+                HnswIndex::build_once(&engine, &shadow, Metric::Cosine, DIM, draw).unwrap();
+            assert_eq!(index.len(), COUNT);
+            let (no_edge_in, outside) = cut_off(&index);
+            assert_eq!(
+                (no_edge_in, outside),
+                (0, 0),
+                "draw {draw}: points with no layer-0 edge into them, and points the entry \
+                 point's layer 0 does not reach"
+            );
+            assert_eq!(
+                truly_orphaned(&index, &vectors),
+                0,
+                "draw {draw}: vectors that cannot find themselves"
+            );
+        }
     }
 
     /// The distribution the reachability constants are sized from.
