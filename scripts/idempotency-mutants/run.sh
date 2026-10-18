@@ -51,7 +51,7 @@ fi
 ROWS=()
 for s in "${SELECT[@]}"; do
     case "$s" in
-        all|design|fix-e|lives|delta|elsewhere) while read -r n; do ROWS+=("$n"); done < <(python3 "$TABLE" list "$s") ;;
+        all|design|fix-e|lives|delta|elsewhere|fixes) while read -r n; do ROWS+=("$n"); done < <(python3 "$TABLE" list "$s") ;;
         *) ROWS+=("$s") ;;
     esac
 done
