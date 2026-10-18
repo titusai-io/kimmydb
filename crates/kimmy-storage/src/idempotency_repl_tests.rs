@@ -346,6 +346,57 @@ fn a_record_lands_with_the_run_that_takes_its_entry_when_the_entry_loses() {
     assert_eq!(n_of(&b.engine, &cb, 1), 10, "not applied again");
 }
 
+/// The same when the entry is judged history here (ruling A: a record outlives a
+/// drop of its collection for its window): B has dropped `orders` and made it
+/// again since A's keyed insert, so A's entry is of a life B has buried, and its
+/// record is stored with the run that takes it as history. A schema change of
+/// A's after it commits that run and raises B's coverage of A past the entry,
+/// and the batch then fails at its last commit. Held for the last commit, the
+/// record would be lost for good, though B's coverage passed its row, and a retry
+/// on B would apply afresh where the record says the request was answered.
+#[test]
+fn a_record_lands_with_the_run_that_takes_its_entry_as_history() {
+    let (a, b, ca, _) = pair();
+    let k = keyed(33);
+    let (id, at) = fresh(a.engine.insert_keyed(&ca, doc! { "_id": 1i64, "v": 1 }, &k).unwrap());
+    a.engine.create_collection("shop", "later").unwrap();
+    // B's drop at or above A's keyed entry, and its next life.
+    b.engine.advance_clock_past(&at);
+    b.engine.drop_collection("shop", "orders").unwrap();
+    b.engine.finish_purges_now().unwrap();
+    let cb = b.engine.create_collection("shop", "orders").unwrap();
+
+    let theirs = a.engine.version_vector().unwrap();
+    let mine = b.engine.witnessed_vector().unwrap();
+    let window = a
+        .engine
+        .entries_for_peer_holding(Hlc::ZERO, 1024, Some(&mine), WalkScope::Background)
+        .unwrap();
+    crate::sync::count_hooks::fail_next(crate::sync::count_hooks::Fail::BeforeLastCommit);
+    let mut outcome = SyncOutcome::default();
+    let failed = b.engine.apply_peer_window_carrying_into(
+        &theirs,
+        Some(&mine),
+        &window.entries,
+        &window.records,
+        RecordsVia::Pull,
+        PeerWindow {
+            scanned_to: window.scanned_to,
+            exhausted: window.exhausted,
+            passed_through: None,
+            asked_partial: false,
+        },
+        &mut outcome,
+    );
+    assert!(failed.is_err(), "premise: the batch failed at its last commit");
+    assert!(b.engine.get(&cb, &id).unwrap().is_none(), "premise: the entry was history on B");
+    let covered = b.engine.witnessed_vector().unwrap().get(a.engine.node_id());
+    assert!(covered > at.hlc, "premise: B's coverage of A passed the keyed entry");
+    assert!(b.engine.idempotency_record(cb.id, &k.scope).unwrap().is_some(), "with the run");
+    replayed(b.engine.insert_keyed(&cb, doc! { "_id": 1i64, "v": 1 }, &k).unwrap());
+    assert_eq!(count(&b.engine, &cb), 0, "nothing written to B's next life");
+}
+
 /// A record whose row's entry is not in the frame rides with the first later
 /// entry of its collection the batch takes. A member whose own write beat the
 /// keyed entry never appended it, and serves its windows without it, while it
@@ -1078,6 +1129,34 @@ fn a_member_rebuilt_by_snapshot_after_a_drop_replays_the_old_key() {
     let again = b.engine.create_collection("shop", "orders").unwrap();
     replayed(b.engine.insert_keyed(&again, doc! { "_id": 1i64 }, &k).unwrap());
     assert_eq!(count(&b.engine, &again), 0, "nothing written");
+}
+
+/// A converge page whose first page is of a life this member has not buried (the
+/// sender dropped the collection and made it again, and this member still holds
+/// the life before) applies none of its documents, and stores its records: they
+/// outlive the drop. Here the record is put on the page by hand, as P2's sender
+/// will.
+#[test]
+fn a_converge_page_of_a_life_this_member_has_not_buried_keeps_its_records() {
+    let (a, b, ca, cb) = pair();
+    let k = keyed(78);
+    fresh(a.engine.insert_keyed(&ca, doc! { "_id": 1i64 }, &k).unwrap());
+    let record = a.engine.idempotency_record(ca.id, &k.scope).unwrap().unwrap();
+    a.engine.drop_collection("shop", "orders").unwrap();
+    a.engine.finish_purges_now().unwrap();
+    let next = a.engine.create_collection("shop", "orders").unwrap();
+    let mut page = a.engine.snapshot_page(None, Some(next.id)).unwrap();
+    assert!(page.dropped.is_none(), "premise: the collection stands on the sender");
+    page.records = vec![wire(next.id, &k, None, &record)];
+    let mut converge = SnapshotProgress::of_collection_converging(cb.id, Default::default());
+    assert!(
+        b.engine.first_page_is_a_life_this_member_has_not_buried(&converge, &page).unwrap(),
+        "premise: B holds the life before"
+    );
+    let applied = b.engine.apply_snapshot_page(a.engine.node_id(), &mut converge, &page).unwrap();
+    assert!(applied.history);
+    assert_eq!(b.engine.idempotency_record(cb.id, &k.scope).unwrap(), Some(record));
+    assert_eq!(b.engine.idempotency_records_received()[4], 1, "by repair");
 }
 
 /// A converge page from a sender that dropped the collection applies none of its
