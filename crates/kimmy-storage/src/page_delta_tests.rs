@@ -700,11 +700,13 @@ fn a_record_crosses_each_link_once() {
 
 /// The page-store edge: a member serving a snapshot of a collection takes a
 /// converge page of it, and the page changes a record the member had already
-/// sent the snapshot's receiver. Here the record becomes `done` by a
-/// record-only commit on its origin, after the member pulled the request's last
-/// chunk. The page store logs the change, so the snapshot's next page carries
-/// it, the receiver ends with `done`, and a retry there replays instead of
-/// resuming.
+/// sent the snapshot's receiver, at stamps the member had witnessed. Here the
+/// record becomes `done` by a record-only commit on its origin (G8's residual:
+/// the last writing chunk's lookahead met a match the stamp rule leaves, a
+/// document written between two chunks), after the member pulled the request's
+/// last writing chunk. The page store logs the change, so the snapshot's next
+/// page carries it, the receiver ends with `done`, and a retry there replays
+/// instead of resuming.
 #[test]
 fn a_record_a_member_takes_by_page_while_serving_a_snapshot_rides_its_next_page() {
     use crate::sync::race_hooks::{Race, at};
@@ -719,20 +721,27 @@ fn a_record_a_member_takes_by_page_while_serving_a_snapshot_rides_its_next_page(
     )
     .unwrap();
     pull(&s, &y);
-    // A two-chunk request; S pulls it after its last writing chunk and before
-    // the record-only commit that marks it done.
+    // A request of two writing chunks of one. Between them a third counter is
+    // written, above the request's `first`, so the second chunk's lookahead
+    // meets a match the stamp rule leaves and cannot call the end; a later
+    // chunk finds it and commits the record alone, `done`, at the same `last`.
+    // S pulls after the last writing chunk, before that commit.
     y.set_multi_chunk_docs(1);
     let k = key(7);
-    let (puller, from) = (Arc::clone(&s), Arc::clone(&y));
+    let (puller, from, writer, coll) = (Arc::clone(&s), Arc::clone(&y), Arc::clone(&y), cy.clone());
     at(Race::BetweenChunks, move || {
+        writer.insert(&coll, doc! { "_id": 3i64, "n": 0i64 }).unwrap();
         at(Race::BetweenChunks, move || pull(&puller, &from));
     });
     let out = fresh(y.modify_where_keyed(&cy, &Candidates::Scan, &Inc, None, &k).unwrap());
-    assert_eq!(out.commits, 2);
+    assert_eq!((out.commits, out.skipped), (2, 1), "premise: two writing chunks, one left");
     crate::sync::race_hooks::clear();
+    let done = y.idempotency_record(cy.id, &k.scope).unwrap().unwrap();
+    assert_eq!(done.state, RecordState::Done);
     let cs = s.get_collection("shop", "orders").unwrap();
     let held = s.idempotency_record(cs.id, &k.scope).unwrap().unwrap();
     assert_eq!(held.state, RecordState::Applying, "premise: S pulled it before `done`");
+    assert_eq!(held.last, done.last, "premise: the record-only commit kept its `last`");
 
     // M takes S's first page: the record as S holds it, and both documents.
     let mut progress = SnapshotProgress::of_collection(cs.id);

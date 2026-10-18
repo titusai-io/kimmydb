@@ -345,15 +345,15 @@ fn g3_a_coverage_only_window_passes_the_request_without_its_record() {
     retry_must_replay(&m, &cm, &k, 1, true);
 }
 
-/// G8: the record-only `done` commit mints a `last` of its own. M pulls Y between
-/// the last chunk that wrote and the chunk that finds nothing and only marks the
-/// record `done`, so it holds the record `applying` and covers its `last` as it
-/// stood. The `done` record's new row lies above that, so the next window Y
-/// serves M carries it (one comes once Y writes again: a member that is not
-/// behind its peer's vector asks it for no window), and a retry on M replays
-/// rather than resumes. With the `last` kept, no window would ever carry it.
+/// G8: a keyed multi-chunk request writes `done` in the chunk whose lookahead
+/// finds its end, so a member fully caught up on its sender gets `done` with the
+/// last chunk's entry and replays a retry. Nothing is written after the end. M
+/// pulls Y after the first chunk, and again once the request has answered; a
+/// pull is also armed before a third chunk, which runs only when the lookahead
+/// is off (that chunk finds nothing and marks the record `done` alone, keeping
+/// its `last`, so a member that pulled before it would never receive it).
 #[test]
-fn g8_a_member_that_pulled_before_the_done_commit_replays_a_retry() {
+fn g8_a_caught_up_member_gets_done_with_the_last_chunk_and_replays() {
     let dir = tempfile::tempdir().unwrap();
     let (y, m) = (std::sync::Arc::new(open(&dir, "y")), std::sync::Arc::new(open(&dir, "m")));
     let cy = y.create_collection("shop", "orders").unwrap();
@@ -363,27 +363,114 @@ fn g8_a_member_that_pulled_before_the_done_commit_replays_a_retry() {
     assert_eq!(pull(&m, &y), Pulled::Served);
     let cm = m.get_collection("shop", "orders").unwrap();
     let k = key();
-    // Before the second chunk, arm a pull before the third: the chunk that finds
-    // nothing and commits the record alone.
+    // Before the second chunk, M pulls the first; and a pull is armed before a
+    // third chunk, which only a request without the lookahead makes.
     let (y1, m1) = (std::sync::Arc::clone(&y), std::sync::Arc::clone(&m));
     y.before_next_continuing_write(move || {
+        assert_eq!(pull(&m1, &y1), Pulled::Served);
         let (y2, m2) = (std::sync::Arc::clone(&y1), std::sync::Arc::clone(&m1));
         y1.before_next_continuing_write(move || {
             assert_eq!(pull(&m2, &y2), Pulled::Served);
         });
     });
     let out = y.modify_where_keyed(&cy, &Candidates::Scan, &Inc, None, &k).unwrap();
-    assert!(matches!(out, Keyed::Fresh(_)), "{out:?}");
-    let held = m.idempotency_record(cm.id, &k.scope).unwrap().expect("premise: M pulled it");
-    assert_eq!(held.state, crate::idempotency::RecordState::Applying, "premise: before `done`");
+    let Keyed::Fresh(out) = out else { panic!("a fresh request: {out:?}") };
+    assert_eq!((out.modified, out.commits), (2, 2), "{out:?}");
+    // Nothing written after the end: M pulls once more, caught up or not.
+    pull(&m, &y);
     assert_eq!(n_of(&m, &cm, 2), 1, "premise: M holds both chunks");
-    // Y writes on, unkeyed and elsewhere, and M pulls.
-    let other = y.create_collection("shop", "other").unwrap();
-    y.insert(&other, doc! { "_id": 1i64 }).unwrap();
+    assert_eq!(
+        m.idempotency_record(cm.id, &k.scope).unwrap().map(|r| r.state),
+        Some(crate::idempotency::RecordState::Done),
+        "M holds the request's end"
+    );
+    retry_must_replay(&m, &cm, &k, 2, false);
+}
+
+/// G8's residual: when the last writing chunk's lookahead spends its budget on
+/// matches the stamp rule leaves, a later chunk finds the end having written
+/// nothing and marks the record `done` alone, keeping its `last`. A member that
+/// pulled the last writing chunk resumes a retry: `resumed`, every match left
+/// by the stamp rule, nothing written a second time.
+#[test]
+fn g8_residual_a_tail_of_left_matches_past_the_lookahead_resumes_without_a_double() {
+    let dir = tempfile::tempdir().unwrap();
+    let (y, m) = (std::sync::Arc::new(open(&dir, "y")), std::sync::Arc::new(open(&dir, "m")));
+    let cy = y.create_collection("shop", "orders").unwrap();
+    y.set_multi_chunk_docs(1);
+    let docs: Vec<Document> = (1..=3i64).map(|i| doc! { "_id": i, "n": 0i64 }).collect();
+    y.insert_many(&cy, docs).unwrap();
     assert_eq!(pull(&m, &y), Pulled::Served);
+    let cm = m.get_collection("shop", "orders").unwrap();
+    let k = key();
+    // After the first chunk (whose lookahead saw document 2 writable), another
+    // writer rewrites documents 2 and 3, so the stamp rule leaves both; M pulls
+    // all of it before the next chunk.
+    let (y1, m1) = (std::sync::Arc::clone(&y), std::sync::Arc::clone(&m));
+    y.before_next_continuing_write(move || {
+        let coll = y1.get_collection("shop", "orders").unwrap();
+        for id in [2i64, 3] {
+            y1.replace(&coll, &DocId::Int64(id), doc! { "n": 50i64 }, false).unwrap();
+        }
+        assert_eq!(pull(&m1, &y1), Pulled::Served);
+    });
+    let Keyed::Fresh(out) = y.modify_where_keyed(&cy, &Candidates::Scan, &Inc, None, &k).unwrap()
+    else {
+        panic!("a fresh request")
+    };
+    assert_eq!((out.modified, out.skipped, out.commits), (1, 2, 1), "{out:?}");
+    let stored = y.idempotency_record(cy.id, &k.scope).unwrap().unwrap();
+    assert_eq!(stored.state, crate::idempotency::RecordState::Done);
+    pull(&m, &y);
+    let held = m.idempotency_record(cm.id, &k.scope).unwrap().unwrap();
+    assert_eq!(held.state, crate::idempotency::RecordState::Applying, "premise: the residual");
+    let before: Vec<i64> = (1..=3).map(|id| n_of(&m, &cm, id)).collect();
+    let Keyed::Fresh(again) = m.modify_where_keyed(&cm, &Candidates::Scan, &Inc, None, &k).unwrap()
+    else {
+        panic!("a resume")
+    };
+    assert!(again.resumed, "{again:?}");
+    assert_eq!((again.modified, again.skipped), (1, 3), "cumulative, everything left: {again:?}");
+    assert_eq!((1..=3).map(|id| n_of(&m, &cm, id)).collect::<Vec<_>>(), before, "no double");
+}
+
+/// G8: the lookahead finds the end past matches the stamp rule leaves. A
+/// two-document chunk writes documents 3 and 4; past them only document 5 is
+/// left, rewritten by another writer after the request's first write, and then
+/// the scan ends: the chunk writes `done`, counting document 5 in `skipped`. A
+/// member that pulled before a further chunk would have run (one runs only if
+/// the lookahead took document 5 for a match it could write) gets `done` and
+/// replays.
+#[test]
+fn g8_the_lookahead_ends_past_matches_the_stamp_rule_leaves() {
+    let dir = tempfile::tempdir().unwrap();
+    let (y, m) = (std::sync::Arc::new(open(&dir, "y")), std::sync::Arc::new(open(&dir, "m")));
+    let cy = y.create_collection("shop", "orders").unwrap();
+    y.set_multi_chunk_docs(2);
+    let docs: Vec<Document> = (1..=5i64).map(|i| doc! { "_id": i, "n": 0i64 }).collect();
+    y.insert_many(&cy, docs).unwrap();
+    assert_eq!(pull(&m, &y), Pulled::Served);
+    let cm = m.get_collection("shop", "orders").unwrap();
+    let k = key();
+    let (y1, m1) = (std::sync::Arc::clone(&y), std::sync::Arc::clone(&m));
+    y.before_next_continuing_write(move || {
+        let coll = y1.get_collection("shop", "orders").unwrap();
+        y1.replace(&coll, &DocId::Int64(5), doc! { "n": 50i64 }, false).unwrap();
+        let (y2, m2) = (std::sync::Arc::clone(&y1), std::sync::Arc::clone(&m1));
+        y1.before_next_continuing_write(move || {
+            assert_eq!(pull(&m2, &y2), Pulled::Served);
+        });
+    });
+    let Keyed::Fresh(out) = y.modify_where_keyed(&cy, &Candidates::Scan, &Inc, None, &k).unwrap()
+    else {
+        panic!("a fresh request")
+    };
+    assert_eq!((out.modified, out.skipped, out.commits), (4, 1, 2), "{out:?}");
+    pull(&m, &y);
     assert_eq!(
         m.idempotency_record(cm.id, &k.scope).unwrap().map(|r| r.state),
         Some(crate::idempotency::RecordState::Done)
     );
-    retry_must_replay(&m, &cm, &k, 2, false);
+    retry_must_replay(&m, &cm, &k, 4, false);
+    assert_eq!(n_of(&m, &cm, 5), 50, "left as the other writer left it");
 }

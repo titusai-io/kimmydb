@@ -335,10 +335,9 @@ pub struct IdempotencyRecord {
     pub first: Stamp,
     /// **The stamp of the last entry the latest commit that changed the record
     /// wrote** (L1): for a commit of one entry, that entry's; for a bulk insert
-    /// or a chunk of a filtered write, the highest stamp it wrote; for the
-    /// record-only commit that marks a request `done`, a stamp minted for it
-    /// above the record's `last` before (G8). After a merge, the larger of the
-    /// two. The record's row moves with it, and the record is judged by it: the
+    /// or a chunk of a filtered write, the highest stamp it wrote; the
+    /// record-only commit that marks a request `done` keeps the standing
+    /// record's (G8's residual). After a merge, the larger of the two. The record's row moves with it, and the record is judged by it: the
     /// life rule makes it **history only when a drop is at or above every entry
     /// the request wrote**, comparing by `Hlc` with a tie going to the drop, as
     /// every comparison of a stamp against a drop does (ADR-236). So a drop at
