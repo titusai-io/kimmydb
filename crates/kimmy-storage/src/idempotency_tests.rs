@@ -2262,6 +2262,60 @@ fn a_sender_finds_the_records_of_the_coverage_it_grants() {
     assert_eq!(pages, vec![2, 2, 1], "five records, two a page, none of another collection");
 }
 
+/// A row by stamp whose record is gone (a retention pass stopped between its
+/// chunks can leave one until the next pass) is passed over by every sender's
+/// read, without an error: inside a window's advance (F2), above the sender's
+/// servable vector (F3), and a change-log row naming it in a page's delta. The
+/// records phase reads the records themselves and never meets it. Only the
+/// record that stands ships.
+#[test]
+fn a_row_whose_record_is_gone_ships_nothing() {
+    use redb::ReadableDatabase;
+    let (engine, coll, _dir, _path) = open();
+    let k = keyed(65);
+    let (_, at) = fresh(engine.insert_keyed(&coll, doc! { "v": 1 }, &k).unwrap());
+    let me = engine.node_id();
+    let servable = engine.version_vector().unwrap();
+    let gone = ScopeHash([66; 32]);
+    let mut names_gone = coll.id.0.to_be_bytes().to_vec();
+    names_gone.extend_from_slice(&gone.0);
+    let base = engine.next_stamp();
+    {
+        let txn = engine.begin_write(crate::WriterHolder::Repair).unwrap();
+        let mut by_stamp = txn.open_table(tables::IDEMPOTENCY_BY_STAMP).unwrap();
+        // Inside the advance a whole-history window grants, below the live row.
+        let inside = Stamp::new(at.hlc.predecessor(), me);
+        by_stamp.insert(idempotency::row_key(&inside).as_slice(), names_gone.as_slice()).unwrap();
+        // Above what the servable vector reaches: an F3 candidate.
+        let above = stamp(crate::physical_now_ms() + 3_600_000, 0, 9);
+        by_stamp.insert(idempotency::row_key(&above).as_slice(), names_gone.as_slice()).unwrap();
+        drop(by_stamp);
+        // A change-log row after the delta's base, naming it.
+        let logged = engine.next_stamp();
+        txn.open_table(tables::IDEMPOTENCY_CHANGES)
+            .unwrap()
+            .insert(crate::codec::oplog_key(&logged).as_slice(), names_gone.as_slice())
+            .unwrap();
+        txn.commit().unwrap();
+    }
+    assert_eq!(engine.idempotency_record(coll.id, &gone).unwrap(), None, "premise: no record");
+    assert_eq!(rows(&engine).len(), 3, "premise: the live row and the two left");
+
+    let txn = engine.db().begin_read().unwrap();
+    let nothing = |_: NodeId| Hlc::ZERO;
+    let (shipped, unanchored) =
+        idempotency::records_for_coverage(&txn, &nothing, &servable, &servable).unwrap();
+    assert_eq!((shipped.len(), unanchored), (1, 0), "F2 and F3 pass the rows over: {shipped:?}");
+    assert_eq!((shipped[0].scope, shipped[0].carrying), (k.scope, Some(at)));
+    let delta =
+        idempotency::records_changed_since(&txn, base, &|_| true, idempotency::DeltaBudget::PAGE)
+            .unwrap();
+    assert!(delta.records.iter().all(|r| r.scope != gone), "{:?}", delta.records);
+    assert_eq!(delta.stopped_at, None, "read to the end, without an error");
+    let (page, next) = idempotency::records_for_collection_page(&txn, coll.id, None, 10).unwrap();
+    assert_eq!((page.len(), page[0].0, next), (1, k.scope, None), "the records phase");
+}
+
 /// What a receiver stores: merged into the live record, rows at the merged
 /// `last` and the carrying stamp, its stamps witnessed; refused as history;
 /// overwriting what is not alive.

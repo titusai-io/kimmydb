@@ -986,11 +986,10 @@ impl Shipping {
     /// Every row a record has is at or above its merged `first` (its `first`, its
     /// `last`, and the sender's rows it was stored with, each at or above that
     /// sender's `first`). A row below it was left by another record under the same
-    /// key: one of a life a drop ended, purged with its rows left to expire, or one
-    /// past its window that a new request's record replaced. Such a row vouches for
-    /// nothing of the record standing now, and shipped at it, the record would reach
-    /// a member that has not yet applied the drop in the run of an earlier life's
-    /// entry and merge there with that life's record.
+    /// key, one past its window that a new request's record replaced: it vouches
+    /// for nothing of the record standing now. A row whose record is gone (a
+    /// retention pass stopped between chunks leaves one until the next pass)
+    /// names nothing and ships nothing.
     fn row(
         &mut self,
         records: &impl ReadableTable<(u64, &'static [u8]), &'static [u8]>,
