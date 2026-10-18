@@ -1490,6 +1490,12 @@ impl Fixture {
     /// to: A dials C, reads C's vectors and asks for the replay of its origin
     /// (`replay_own_origin`), so what A holds after is what the replay brought.
     async fn replay_outbound_only(&self) -> Result<(), ProtocolError> {
+        self.replay_outbound_for(Duration::from_secs(20)).await
+    }
+
+    /// [`Self::replay_outbound_only`], its deadline `time` after it starts: a zero
+    /// one asks for one page a contact.
+    async fn replay_outbound_for(&self, time: Duration) -> Result<(), ProtocolError> {
         let (mut ours, far) = tokio::io::duplex(MAX_FRAME);
         let serving = async {
             let _ = serve_peer(&self.c, far, SECRET, BINDING, None, ServeBudgets::serving(), None)
@@ -1501,7 +1507,7 @@ impl Fixture {
                 Some(theirs) => theirs,
                 None => return Err(ProtocolError::Malformed("no vectors".into())),
             };
-            let deadline = Instant::now() + Duration::from_secs(20);
+            let deadline = Instant::now() + time;
             let replayed = replay_own_origin(
                 &self.a,
                 &mut ours,
@@ -2031,4 +2037,48 @@ async fn a_pull_whose_first_entry_cannot_cross_with_its_records_takes_them_alone
         assert!(m.idempotency_record(morders.id, scope).unwrap().is_some(), "every record");
     }
     assert_eq!(records_unfit().get(UnfitPath::Pull), unfit, "nothing was left unfit");
+}
+
+/// The records cursor outlives a contact: a peer serving two pages a contact
+/// inbound, and a member asking one page a contact outbound, still carry the
+/// records at the replay's start over several contacts, each going on where the
+/// last left off, rather than starting the position's records over each time.
+#[tokio::test]
+async fn the_records_at_an_inbound_replays_start_cross_over_several_contacts() {
+    let f = fixture(5, 0);
+    let scopes = plant_spanning_records(&f, 30);
+    let _budget = EntryBudget::set(8 * 1024);
+    TEST_REPLAY_MAX_PAGES.with(|cap| cap.set(Some(2)));
+    let mut contacts = 0;
+    while !f.catch_up.replay_answered(f.c.node_id()) {
+        contacts += 1;
+        assert!(contacts <= 8, "the replay is not answered after eight contacts");
+        f.round().await.unwrap();
+    }
+    TEST_REPLAY_MAX_PAGES.with(|cap| cap.set(None));
+    assert!(contacts >= 3, "premise: the records took more than one contact: {contacts}");
+    let orders = f.a.get_collection("shop", "orders").unwrap();
+    for scope in &scopes {
+        assert!(f.a.idempotency_record(orders.id, scope).unwrap().is_some(), "every record");
+    }
+    assert_eq!(f.orders(), 2 + 5, "every lost write is back");
+}
+
+#[tokio::test]
+async fn the_records_at_an_outbound_replays_start_cross_over_several_contacts() {
+    let f = fixture(5, 0);
+    let scopes = plant_spanning_records(&f, 30);
+    let _budget = EntryBudget::set(8 * 1024);
+    let mut contacts = 0;
+    while !f.catch_up.replay_answered(f.c.node_id()) {
+        contacts += 1;
+        assert!(contacts <= 8, "the replay is not answered after eight contacts");
+        f.replay_outbound_for(Duration::ZERO).await.unwrap();
+    }
+    assert!(contacts >= 3, "premise: the records took more than one contact: {contacts}");
+    let orders = f.a.get_collection("shop", "orders").unwrap();
+    for scope in &scopes {
+        assert!(f.a.idempotency_record(orders.id, scope).unwrap().is_some(), "every record");
+    }
+    assert_eq!(f.orders(), 2 + 5, "every lost write is back");
 }
