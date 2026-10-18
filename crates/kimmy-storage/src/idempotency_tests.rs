@@ -1777,6 +1777,22 @@ fn kr_a_request_whose_record_turns_contested_between_chunks_ends_partially_appli
 
 // -- Retention ------------------------------------------------------------------------------
 
+/// Store in one transaction while the window's clock reads `now_ms`, then give
+/// the window back the real clock: a record older than one window at the real
+/// clock is refused on store (review m2), and a retention test must hold one
+/// first. Retention itself takes its cutoff from the pass, not from this clock.
+fn store_while_the_window_reads(
+    engine: &Engine,
+    now_ms: u64,
+    store: impl FnOnce(&crate::engine::WriteTxn<'_>),
+) {
+    engine.set_idempotency_clock_for_test(Some(now_ms));
+    let txn = engine.begin_write(crate::WriterHolder::Repair).unwrap();
+    store(&txn);
+    txn.commit().unwrap();
+    engine.set_idempotency_clock_for_test(None);
+}
+
 /// F7. A record goes one window after its `last`, not before; one a later
 /// chunk changed survives its first row's expiry; one stored from a page goes
 /// by its row at `last`.
@@ -1818,13 +1834,13 @@ fn f7_retention_collects_a_record_one_window_after_its_last() {
     let pass = engine.collect_garbage_at(stored.last.hlc.wall_ms + DAY_MS + 1, policy).unwrap();
     assert_eq!(pass.records_removed, 1);
 
-    // Stored from a page: no entry here, only its row at `last`.
+    // Stored from a page: no entry here, only its row at `last`. Stored while
+    // the window's clock reads its `last`, since a record past its window is
+    // refused (review m2).
     let page_record = base(3, stamp(5_000, 0, 9), stamp(6_000, 0, 9), 9, RecordState::Done);
-    {
-        let txn = engine.begin_write(crate::WriterHolder::Repair).unwrap();
-        engine.store_record(&txn, coll.id, &ScopeHash([3; 32]), &page_record, None).unwrap();
-        txn.commit().unwrap();
-    }
+    store_while_the_window_reads(&engine, 6_000, |txn| {
+        engine.store_record(txn, coll.id, &ScopeHash([3; 32]), &page_record, None).unwrap();
+    });
     assert_eq!(rows(&engine).iter().filter(|(s, ..)| *s == page_record.last).count(), 1);
     let pass = engine.collect_garbage_at(6_000 + DAY_MS + 1, policy).unwrap();
     assert_eq!(pass.records_removed, 1);
@@ -1881,11 +1897,11 @@ fn the_records_step_runs_when_the_oplog_step_has_nothing_to_do() {
     let now = crate::physical_now_ms();
     let old = stamp(now - 2 * DAY_MS, 0, 9);
     let peers = base(4, old, old, 9, RecordState::Done);
-    {
-        let txn = engine.begin_write(crate::WriterHolder::Replication).unwrap();
-        engine.store_record(&txn, coll.id, &ScopeHash([4; 32]), &peers, None).unwrap();
-        txn.commit().unwrap();
-    }
+    // Stored while it was inside its window: a record past it is refused (m2).
+    store_while_the_window_reads(&engine, old.hlc.wall_ms, |txn| {
+        engine.store_record(txn, coll.id, &ScopeHash([4; 32]), &peers, None).unwrap();
+    });
+    assert_eq!(engine.idempotency_records().unwrap(), 1, "premise: stored");
     let pass = engine.collect_garbage_at(now, RetentionPolicy::new(DAY, 365 * DAY)).unwrap();
     assert_eq!(pass.oplog_removed, 0, "premise: nothing in the oplog has expired");
     assert_eq!(pass.records_removed, 1, "and the records step still ran");
@@ -1894,11 +1910,10 @@ fn the_records_step_runs_when_the_oplog_step_has_nothing_to_do() {
     let dir = tempfile::tempdir().unwrap();
     let bare = Engine::open(&dir.path().join("kimmy.redb")).unwrap();
     assert_eq!(bare.oplog_entries().unwrap(), 0, "premise: no oplog");
-    {
-        let txn = bare.begin_write(crate::WriterHolder::Replication).unwrap();
-        bare.store_record(&txn, CollectionId(77), &ScopeHash([4; 32]), &peers, None).unwrap();
-        txn.commit().unwrap();
-    }
+    store_while_the_window_reads(&bare, old.hlc.wall_ms, |txn| {
+        bare.store_record(txn, CollectionId(77), &ScopeHash([4; 32]), &peers, None).unwrap();
+    });
+    assert_eq!(bare.idempotency_records().unwrap(), 1, "premise: stored");
     let pass = bare.collect_garbage_at(now, RetentionPolicy::new(DAY, DAY)).unwrap();
     assert_eq!((pass.oplog_removed, pass.records_removed), (0, 1));
 }
@@ -1909,17 +1924,18 @@ fn the_records_step_runs_when_the_oplog_step_has_nothing_to_do() {
 fn a_stop_ends_the_records_step_between_chunks() {
     let (engine, coll, _dir, _path) = open();
     let n = idempotency::RECORD_COLLECT_CHUNK + 500;
-    {
-        let txn = engine.begin_write(crate::WriterHolder::Repair).unwrap();
+    // Stored while the window's clock reads the first of them: a record past its
+    // window is refused (m2).
+    store_while_the_window_reads(&engine, 1_000, |txn| {
         for i in 0..n {
             let mut scope = [0u8; 32];
             scope[..8].copy_from_slice(&(i as u64).to_be_bytes());
             let s = stamp(1_000 + i as u64, 0, 9);
             let r = base(5, s, s, 9, RecordState::Done);
-            engine.store_record(&txn, coll.id, &ScopeHash(scope), &r, None).unwrap();
+            engine.store_record(txn, coll.id, &ScopeHash(scope), &r, None).unwrap();
         }
-        txn.commit().unwrap();
-    }
+    });
+    assert_eq!(engine.idempotency_records().unwrap(), n as u64, "premise: all stored");
     let cutoff = Hlc::new(1_000_000_000, 0);
     // A chunk's rows, and the one seek that finds the origin they belong to.
     engine.stop_walks_after_rows(idempotency::RECORD_COLLECT_CHUNK as u64 + 2);
@@ -1939,17 +1955,17 @@ fn a_stop_ends_the_records_step_between_chunks() {
 fn a_record_whose_row_at_last_is_missing_is_still_collected() {
     let (engine, coll, _dir, _path) = open();
     let r = base(6, stamp(1_000, 0, 9), stamp(1_000, 0, 9), 9, RecordState::Done);
-    {
-        let txn = engine.begin_write(crate::WriterHolder::Repair).unwrap();
+    // Stored while it was inside its window: a record past it is refused (m2).
+    store_while_the_window_reads(&engine, 1_000, |txn| {
         engine
-            .store_record(&txn, coll.id, &ScopeHash([6; 32]), &r, Some(stamp(2_000, 0, 9)))
+            .store_record(txn, coll.id, &ScopeHash([6; 32]), &r, Some(stamp(2_000, 0, 9)))
             .unwrap();
         txn.open_table(tables::IDEMPOTENCY_BY_STAMP)
             .unwrap()
             .remove(idempotency::row_key(&r.last).as_slice())
             .unwrap();
-        txn.commit().unwrap();
-    }
+    });
+    assert_eq!(engine.idempotency_records().unwrap(), 1, "premise: stored");
     assert_eq!(engine.collect_idempotency_records(Hlc::new(3_000, 0)).unwrap(), 1);
 }
 
