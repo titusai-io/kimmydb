@@ -619,6 +619,14 @@ pub(crate) struct Outcome {
     /// Replay pages at a records cursor's position the sender's log no longer honoured
     /// (another epoch: the sender was restored, m1's guard).
     pub cursor_restarts: usize,
+    /// Records a frame offered a receiver past their window there (m2: never stored).
+    pub past_window_offered: usize,
+    /// Rewinds taken, and the records they removed and reopened.
+    pub rewinds: usize,
+    pub rewound_removed: usize,
+    pub rewound_reopened: usize,
+    /// Records removed with their rows left (orphan rows).
+    pub orphaned: usize,
 }
 
 type Res<T> = std::result::Result<T, String>;
@@ -743,6 +751,11 @@ struct Ghost {
     /// record is contested exactly when the set holds two or more (`a.contested ||
     /// b.contested || a.fingerprint != b.fingerprint` is the union's size).
     fps: HashMap<(NodeId, u8, u8), BTreeSet<u8>>,
+    /// Requests a rewind cut part-way whose record it removed by design (Y's m3: any kind
+    /// but a filter's, in practice a bulk insert whose prefix stands): their standing
+    /// entries hold no record, and a retry meets the first standing document as a
+    /// duplicate and writes nothing. I2 does not hold them to a record.
+    bare: HashSet<u8>,
 }
 
 impl Ghost {
@@ -1402,6 +1415,12 @@ impl World {
                 .serve_entries_to_peer(start, limit, Some(&mine), &marked, None)
                 .map_err(|e| err("serve_entries_to_peer", e))?;
             self.check_carried(from, &window.records)?;
+            self.out.past_window_offered += window
+                .records
+                .iter()
+                .filter_map(|c| IdempotencyRecord::decode(&c.record).ok().flatten())
+                .filter(|r| self.past_window(r))
+                .count();
             let before = self.live_before(to, &window.records)?;
             let mut outcome = SyncOutcome::default();
             dst.apply_peer_window_carrying_into(
@@ -1630,6 +1649,9 @@ impl World {
                 dst.finish_purges_now().map_err(|e| err("finish_purges_now", e))?;
                 continue;
             }
+            // Let go of both members first: a step between the pages may restore the
+            // sender, which reopens its store.
+            drop((src, dst));
             for (j, ops) in inner {
                 if usize::from(*j) == pages && !progress.is_complete() {
                     for op in ops {
@@ -2519,7 +2541,9 @@ impl World {
     /// it cut part-way stands only as a filter's (`Modify`), reopened `applying` with no
     /// cursor (Y's m3), and it leaves no row by stamp naming a record it removed (G).
     fn rewind(&mut self, m: usize, t: u32) -> Res<()> {
-        let until = Hlc::new(self.base + u64::from(t), u16::MAX);
+        // The first stamp minted in millisecond `t` is kept, the rest of it discarded: a
+        // batch of that millisecond is cut part-way (`--until` is a millisecond).
+        let until = Hlc::new(self.base + u64::from(t), 1);
         let (before, orphans_before) = self.stored_records(m)?;
         let outcome = match self.e(m).rewind_to(until) {
             Ok(outcome) => outcome,
@@ -2529,6 +2553,9 @@ impl World {
             }
         };
         self.reopen(m, true)?;
+        self.out.rewinds += 1;
+        self.out.rewound_removed += outcome.records_removed;
+        self.out.rewound_reopened += outcome.records_reopened;
         let (after, orphans_after) = self.stored_records(m)?;
         self.note(format!(
             "{} rewound to t{t}: {} entries discarded, {} records removed, {} reopened",
@@ -2538,6 +2565,11 @@ impl World {
             let now = after.get(key);
             let cut = was.last.hlc > until;
             let filter = matches!(was.outcome, crate::idempotency::RecordOutcome::Modify(_));
+            if cut && !filter && was.first.hlc <= until {
+                let r = was.fingerprint.0[0].wrapping_sub(1);
+                self.ghost.bare.insert(r);
+                self.note(format!("r{r}'s record removed by the rewind, its prefix bare"));
+            }
             let fine = if was.first.hlc > until || (cut && !filter) {
                 now.is_none()
             } else if cut {
@@ -2599,6 +2631,7 @@ impl World {
                 removed += 1;
             }
         }
+        self.out.orphaned += removed;
         self.note(format!(
             "{}: {removed} records past their window removed, their rows left",
             LETTERS[m]
@@ -2741,6 +2774,7 @@ impl World {
                     }
                 }
             }
+            drop((src, dst));
             *pages += 1;
             for (j, ops) in inner {
                 if usize::from(*j) == *pages {
@@ -3177,7 +3211,7 @@ impl World {
             let Some((r, c, id)) = self.ghost.entries.get(&stamp).cloned() else { continue };
             // An entry of a life a drop ended needs its record too: a record outlives
             // a drop of its collection for its window (ruling A).
-            if self.memory_ended(r) {
+            if self.memory_ended(r) || self.ghost.bare.contains(&r) {
                 continue;
             }
             let key = self.sched.requests[r as usize].key;
@@ -3528,6 +3562,7 @@ impl World {
                     *dc == c
                         && ks_of(doc).iter().any(|k| {
                             self.sched.requests.get(*k as usize).is_some_and(|q| q.key == key)
+                                && !self.ghost.bare.contains(&(*k as u8))
                         })
                 });
                 kinds.push(match &records[m] {
@@ -3845,12 +3880,23 @@ pub(crate) fn run_with(
     all_strict: Option<bool>,
     retry_catching_up: bool,
 ) -> Outcome {
+    run_framed(sched, all_strict, retry_catching_up, REPLAY_FRAME)
+}
+
+/// [`run_with`], with the model's replay frame of `frame` units.
+fn run_framed(
+    sched: &Schedule,
+    all_strict: Option<bool>,
+    retry_catching_up: bool,
+    frame: usize,
+) -> Outcome {
     let world = Rc::new(RefCell::new(World::new(sched.clone(), base())));
     if let Some(all) = all_strict {
         world.borrow_mut().strict = all;
         world.borrow_mut().strict_s1 = all;
     }
     world.borrow_mut().retry_catching_up = retry_catching_up;
+    world.borrow_mut().replay_frame = frame;
     let out = setup(&mut world.borrow_mut());
     if let Err(e) = out {
         world.borrow_mut().fail(Inv::Error, format!("setup: {e}"));
@@ -4206,7 +4252,10 @@ impl Gen {
                 } else {
                     from
                 };
-                Op { step: Step::Send { r, m: at, crash: None, inner: Vec::new() }, t: self.t(at, extra) }
+                Op {
+                    step: Step::Send { r, m: at, crash: None, inner: Vec::new() },
+                    t: self.t(at, extra),
+                }
             }
             4..=5 => self.touch(from, extra),
             6 => Op { step: Step::Backup { m: from }, t: 0 },
@@ -4432,6 +4481,16 @@ struct Sweep {
     i5_off: usize,
     left_by_first: usize,
     kr: usize,
+    contested_refused: usize,
+    contested_stopped: usize,
+    records_restarts: usize,
+    records_alone: usize,
+    cursor_restarts: usize,
+    past_window_offered: usize,
+    rewinds: usize,
+    rewound_removed: usize,
+    rewound_reopened: usize,
+    orphaned: usize,
 }
 
 /// Run each seed of `seeds` on both tracks, `threads` at a time; panic with the first
@@ -4471,6 +4530,16 @@ fn sweep(seeds: std::ops::Range<u64>, len: usize, threads: usize) -> Sweep {
                         t.i5_off += out.i5_off;
                         t.left_by_first += out.left_by_first;
                         t.kr += out.kr;
+                        t.contested_refused += out.contested_refused;
+                        t.contested_stopped += out.contested_stopped;
+                        t.records_restarts += out.records_restarts;
+                        t.records_alone += out.records_alone;
+                        t.cursor_restarts += out.cursor_restarts;
+                        t.past_window_offered += out.past_window_offered;
+                        t.rewinds += out.rewinds;
+                        t.rewound_removed += out.rewound_removed;
+                        t.rewound_reopened += out.rewound_reopened;
+                        t.orphaned += out.orphaned;
                     }
                     // `IDEM_LIST=1`: each counted finding's schedule, by seed and track.
                     if std::env::var("IDEM_LIST").is_ok_and(|v| v == "1")
@@ -4496,7 +4565,11 @@ fn sweep(seeds: std::ops::Range<u64>, len: usize, threads: usize) -> Sweep {
          between commits), {} replays, {} resumes, {} crashes, {} relay, {} S1, {} KR; drops \
          of orders: {} schedules with one during a call, {} with an `$inc` written on both \
          sides of one, {} with one call's writes on both sides; {} I8 checks, {} counters \
-         left at or above a merged first, {} home runs without exact I5; in {:.1?}",
+         left at or above a merged first, {} home runs without exact I5; the contested \
+         algebra: {} lookups refused, {} requests stopped between chunks; {} snapshot pages \
+         refused at the zero records base (m4), {} replay pages of records alone (m1), {} \
+         records cursors started over, {} records offered past their window (m2); {} \
+         rewinds ({} records removed, {} reopened), {} records orphaned; in {:.1?}",
         totals.schedules,
         totals.steps,
         totals.between,
@@ -4512,6 +4585,16 @@ fn sweep(seeds: std::ops::Range<u64>, len: usize, threads: usize) -> Sweep {
         totals.i8_checks,
         totals.left_by_first,
         totals.i5_off,
+        totals.contested_refused,
+        totals.contested_stopped,
+        totals.records_restarts,
+        totals.records_alone,
+        totals.cursor_restarts,
+        totals.past_window_offered,
+        totals.rewinds,
+        totals.rewound_removed,
+        totals.rewound_reopened,
+        totals.orphaned,
         started.elapsed()
     );
     if let Some(report) = failure.into_inner().unwrap() {
@@ -4612,6 +4695,26 @@ fn reset(m: u8, from: u8, inner: Vec<(u8, Vec<Op>)>) -> Op {
     Op { step: Step::Reset { m, from, inner }, t: 0 }
 }
 
+fn backup(m: u8) -> Op {
+    Op { step: Step::Backup { m }, t: 0 }
+}
+
+fn restore(m: u8, nth: u8, inner: Vec<(u8, Vec<Op>)>) -> Op {
+    Op { step: Step::Restore { m, nth, inner }, t: 0 }
+}
+
+fn retention(m: u8, t: u32) -> Op {
+    Op { step: Step::Retention { m }, t }
+}
+
+fn orphan(m: u8) -> Op {
+    Op { step: Step::Orphan { m }, t: 0 }
+}
+
+fn rewind(m: u8, t: u32) -> Op {
+    Op { step: Step::Rewind { m }, t }
+}
+
 fn row(name: &str, members: u8, requests: Vec<Request>, ops: Vec<Op>) {
     row_with(name, members, requests, ops, false);
 }
@@ -4627,8 +4730,19 @@ fn row_with(name: &str, members: u8, requests: Vec<Request>, ops: Vec<Op>, at_co
 
 /// A named row (three members, run strictly) whose outcome must also pass `holds`.
 fn row_holding(name: &str, requests: Vec<Request>, ops: Vec<Op>, holds: impl Fn(&Outcome) -> bool) {
+    row_framed(name, REPLAY_FRAME, requests, ops, holds);
+}
+
+/// [`row_holding`], with the model's replay frame of `frame` units.
+fn row_framed(
+    name: &str,
+    frame: usize,
+    requests: Vec<Request>,
+    ops: Vec<Op>,
+    holds: impl Fn(&Outcome) -> bool,
+) {
     let sched = Schedule { track: Track::Anywhere, home: 0, members: 3, requests, ops };
-    let out = run_with(&sched, Some(true), false);
+    let out = run_framed(&sched, Some(true), false, frame);
     let shown = render(None, &sched, &out);
     if trace() {
         eprintln!("row {name}:\n{shown}");
@@ -4940,11 +5054,9 @@ fn row_f1_a_window_cut_inside_a_commit() {
 /// again; C takes the drop, the replace with its record, and the creation in one window.
 /// The drop's purge on C must leave that record, and a retry on C must replay.
 #[test]
-#[ignore = "until records outlive a drop (ruling A, builder G's idempotency-a)"]
 fn row_a_record_of_the_life_after_a_drop_survives_its_purge() {
-    row(
+    row_holding(
         "purge",
-        3,
         vec![req(1, Kind::Replace { at: Target::Client(0) })],
         vec![
             ask(0, C, 140),
@@ -4955,6 +5067,7 @@ fn row_a_record_of_the_life_after_a_drop_survives_its_purge() {
             pull(C, A),
             ask(0, C, 260),
         ],
+        |out| out.replays >= 1,
     );
 }
 
@@ -5083,11 +5196,9 @@ fn row_a_page_carried_record_resumed_after_a_restart() {
 /// life a drop ended, arriving from a member that applied the request before it heard of
 /// the drop, is replayed in the life after it, and nothing is written there.
 #[test]
-#[ignore = "until records outlive a drop (ruling A, builder G's idempotency-a)"]
 fn row_a_retry_after_a_drop_and_a_recreation_replays() {
-    row(
+    row_holding(
         "life",
-        3,
         vec![req(1, Kind::Insert { id: Some(0) })],
         vec![
             ask(0, A, 100),
@@ -5097,6 +5208,7 @@ fn row_a_retry_after_a_drop_and_a_recreation_replays() {
             pull(A, B),
             ask(0, A, 130),
         ],
+        |out| out.replays >= 1,
     );
 }
 
@@ -5175,11 +5287,9 @@ fn row_a_resumed_requests_record_reaches_every_member() {
 /// stamped after the drop. B then takes the drop, which keeps that write (ADR-236). A
 /// retry on B replays the record: the request never lands twice on counter 0.
 #[test]
-#[ignore = "until records outlive a drop (ruling A, builder G's idempotency-a)"]
 fn row_d2_a_retry_after_a_drop_replays_and_never_doubles() {
-    row(
+    row_holding(
         "d2",
-        3,
         vec![req(1, Kind::IncMulti)],
         vec![
             ask(0, A, 100),
@@ -5189,27 +5299,244 @@ fn row_d2_a_retry_after_a_drop_replays_and_never_doubles() {
             pull(B, A),
             ask(0, B, 170),
         ],
+        |out| out.replays >= 1,
     );
 }
 
 /// KR: r0 and r1 are two `$inc`s of every counter under one key. C applies r0; A,
 /// without r0's record, applies r1 and stops after its first chunk (counters 0 and 1); A
 /// then takes r0's effect and record from C, and the two records merge: the merged
-/// record is `contested`. A retry of r1 on A is refused (422), and nothing completes on
-/// r0's `first`.
+/// record is `contested`, as the algebra says (two requests merged). A retry of r1 on A
+/// is refused (422) as the algebra predicts, and nothing completes on r0's `first`.
 #[test]
-#[ignore = "until a record merged across two fingerprints is contested (builder G's idempotency-a)"]
 fn row_kr_a_reused_keys_merged_records_refuse() {
-    row(
+    row_holding(
         "kr",
-        3,
         vec![req(1, Kind::IncMulti), req(1, Kind::IncMulti)],
         vec![
             ask(0, C, 100),
             ask_crash(1, A, 130, 1, Crash::AfterCommit),
             pull(A, C),
             ask(1, A, 140),
+            pull(B, A),
+            ask(0, B, 150),
         ],
+        |out| out.contested_refused >= 2,
+    );
+}
+
+/// KR between chunks: as above, with A taking r0's record from C between r1's first
+/// and second chunks. The record turns contested there, and r1's next chunk is refused:
+/// it stops partially applied, its first chunk standing, and every retry on A is refused.
+#[test]
+fn row_kr_a_record_contested_between_chunks_stops_the_request() {
+    row_holding(
+        "kr-chunks",
+        vec![req(1, Kind::IncMulti), req(1, Kind::IncMulti)],
+        vec![
+            ask(0, C, 100),
+            ask_between(1, A, 130, vec![(1, vec![pull(A, C)])]),
+            ask(1, A, 140),
+            ask(0, A, 145),
+        ],
+        |out| out.contested_stopped == 1 && out.contested_refused >= 2,
+    );
+}
+
+// -- The fix branches' rows (m4, m1's cursor, m2, the rewind, orphan rows) ------------------
+
+/// m4, with records: A's backup B0 holds no record and B1 holds r0's (its effect on a
+/// late page of `big`). A is restored to B0 (no record, no change log), and B takes a
+/// scoped pull of `big` from it; between the first two pages A is restored to B1, and
+/// opens over B1's records with a fresh epoch (guard i). B's next page, asked with the
+/// zero records base, comes from a sender whose log has begun since and is refused
+/// (guard ii): `big` is asked for again from its records phase, which carries r0's
+/// record before its effect. A retry on B replays.
+#[test]
+fn row_m4_a_sender_restored_between_pages_onto_records() {
+    row_holding(
+        "m4-records",
+        vec![req(1, Kind::IncBig { d: 1200 })],
+        vec![
+            big(A),
+            backup(A),
+            ask(0, A, 100),
+            backup(A),
+            restore(A, 1, Vec::new()),
+            scoped(B, A, BIG, vec![(1, vec![restore(A, 0, Vec::new())])]),
+            ask(0, B, 130),
+        ],
+        |out| out.records_restarts >= 1 && out.replays >= 1,
+    );
+}
+
+/// m4, two restores of the sender during one pull: B's first page of `big` from A (r0's
+/// record in its records phase, the base of A's log); A restored to B0 (no record, no
+/// log: the base is of another epoch, and A starts `big` over); A restored to B1 (its
+/// records, a fresh epoch: the zero base B now holds is refused, and `big` starts over
+/// from its records). A retry on B replays.
+#[test]
+fn row_m4_two_restores_of_the_sender_during_one_pull() {
+    row_holding(
+        "m4-twice",
+        vec![req(1, Kind::IncBig { d: 1200 })],
+        vec![
+            big(A),
+            backup(A),
+            ask(0, A, 100),
+            backup(A),
+            scoped(
+                B,
+                A,
+                BIG,
+                vec![(1, vec![restore(A, 1, Vec::new())]), (2, vec![restore(A, 0, Vec::new())])],
+            ),
+            ask(0, B, 130),
+        ],
+        |out| out.records_restarts >= 1 && out.replays >= 1,
+    );
+}
+
+/// m1's records cursor (Y): C applies r0 to r2 and B takes them; A applies r3, B takes it,
+/// and A is restored from a backup before all of it. A's replay from B: its one lost
+/// entry needs four records (B2's three of C, carried at their `first` below it, and its
+/// own), more than the model's frame of three holds with it, so the first page carries
+/// three records alone under a cursor, and the next page at the same position the rest
+/// with the entry. Retries on A replay.
+#[test]
+fn row_m1_a_replay_page_of_records_alone_under_a_cursor() {
+    row_framed(
+        "replay-cursor",
+        3,
+        replay_requests(),
+        vec![
+            backup(A),
+            ask(0, C, 90),
+            ask(1, C, 91),
+            ask(2, C, 92),
+            pull(B, C),
+            ask(3, A, 100),
+            pull(B, A),
+            restore(A, 0, Vec::new()),
+            ask(3, A, 120),
+            ask(0, A, 121),
+        ],
+        |out| out.records_alone >= 1 && out.replays >= 2,
+    );
+}
+
+/// m1's cursor guarded by the epoch: as above, with B, the sender, restored from its
+/// backup between A's two replay pages. B opens over its records with a fresh epoch, so
+/// the cursor A holds is of another log and the position's records start over.
+#[test]
+fn row_m1_a_records_cursor_of_a_restored_sender_starts_over() {
+    row_framed(
+        "replay-cursor-epoch",
+        3,
+        replay_requests(),
+        vec![
+            backup(A),
+            ask(0, C, 90),
+            ask(1, C, 91),
+            ask(2, C, 92),
+            pull(B, C),
+            ask(3, A, 100),
+            pull(B, A),
+            backup(B),
+            restore(A, 0, vec![(1, vec![restore(B, 0, Vec::new())])]),
+            ask(3, A, 120),
+            ask(0, A, 121),
+        ],
+        |out| out.records_alone >= 2 && out.cursor_restarts >= 1 && out.replays >= 2,
+    );
+}
+
+fn replay_requests() -> Vec<Request> {
+    (0..4).map(|d| req(d + 1, Kind::IncSingle { d })).collect()
+}
+
+/// m2: a record past its window is not stored. r0 on A; the window passes (a retention
+/// pass on C moves every member's clock); r1, a new request under r0's key, on B, which
+/// never held r0's record; B then pulls A, whose window still carries r0's record. B
+/// refuses it: merged into r1's, it would lower `first` to r0's and mark the record
+/// contested. A retry of r1 on B replays.
+#[test]
+fn row_m2_a_record_past_its_window_is_not_stored() {
+    row_holding(
+        "m2",
+        vec![req(1, Kind::Insert { id: Some(0) }), req(1, Kind::Insert { id: Some(1) })],
+        vec![ask(0, A, 100), retention(C, 1700), ask(1, B, 1710), pull(B, A), ask(1, B, 1720)],
+        |out| out.past_window_offered >= 1 && out.replays >= 1,
+    );
+}
+
+/// The rewind (G, Y's m3): r0, an `$inc` of every counter, stops after its first chunk
+/// at 100 and resumes to its end at 200; r1 inserts at 140; r2, a bulk, at 160. A
+/// rewind to 150 removes r2's record with its rows (every write discarded), keeps r1's,
+/// and reopens r0's `applying` with no cursor (a filter's, cut part-way). The resume
+/// writes what the rewind undid and nothing that stands; r2 runs afresh; r1 replays.
+#[test]
+fn row_rewind_removes_what_it_discards_and_reopens_a_filter() {
+    row_holding(
+        "rewind",
+        vec![req(1, Kind::IncMulti), req(2, Kind::Insert { id: Some(0) }), req(3, Kind::Bulk)],
+        vec![
+            ask_crash(0, A, 100, 1, Crash::AfterCommit),
+            ask(1, A, 140),
+            ask(2, A, 160),
+            ask(0, A, 200),
+            rewind(A, 150),
+            ask(0, A, 210),
+            ask(2, A, 220),
+            ask(1, A, 230),
+        ],
+        |out| {
+            out.rewound_removed >= 1
+                && out.rewound_reopened >= 1
+                && out.replays >= 1
+                && out.resumes >= 2
+        },
+    );
+}
+
+/// The rewind cuts a bulk part-way (Y's m3): its first document, minted first in the
+/// millisecond the rewind keeps, stands, and its record goes with its rows; a retry is a
+/// fresh attempt that meets that document as a duplicate and writes nothing.
+#[test]
+fn row_rewind_that_cuts_a_bulk_part_way_removes_its_record() {
+    row_holding(
+        "rewind-bulk",
+        vec![req(1, Kind::Bulk)],
+        vec![ask(0, A, 160), rewind(A, 160), ask(0, A, 170), pull(B, A), ask(0, B, 180)],
+        |out| out.rewound_removed == 1,
+    );
+}
+
+/// Orphan rows: B holds r0's record with its row at A's stamp; the window passes and B
+/// removes the record and leaves its rows (a retention pass stopped between chunks). r1,
+/// a new request under the key, on B: the orphan row now names r1's record, below its
+/// `first`, and vouches for nothing of it. Every path passes over it and ships nothing
+/// at it: C's pull and scoped page from B, B's retention pass, B's replay after a
+/// restore. A retry of r1 on C replays.
+#[test]
+fn row_an_orphan_row_is_passed_over_everywhere() {
+    row_holding(
+        "orphan",
+        vec![req(1, Kind::Insert { id: Some(0) }), req(1, Kind::Insert { id: Some(1) })],
+        vec![
+            backup(B),
+            ask(0, A, 100),
+            pull(B, A),
+            retention(C, 1700),
+            orphan(B),
+            ask(1, B, 1710),
+            pull(C, B),
+            scoped(C, B, ITEMS, Vec::new()),
+            ask(1, C, 1720),
+            retention(B, 1730),
+            restore(B, 0, Vec::new()),
+        ],
+        |out| out.orphaned >= 1 && out.replays >= 1,
     );
 }
 
