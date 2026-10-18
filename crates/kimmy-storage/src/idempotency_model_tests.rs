@@ -21,9 +21,12 @@
 //! **Data.** `shop.orders` holds five counters `{_id: i, n: 0, ks: []}`, written once
 //! before the schedule and replicated everywhere; keyed `$inc` requests change them
 //! (every counter, chunked by two; two counters in one chunk; or one, the single form),
-//! unkeyed writes write on top of them, and `orders` is never dropped. `shop.items` takes
-//! keyed inserts with and without `_id` (the derived one), bulk inserts of two, replaces
-//! and deletes by id, unkeyed writes, and is dropped and created again. `shop.big`, in
+//! unkeyed writes write on top of them. `orders` is dropped and created again too, a life
+//! beginning with its counters fresh, and a drop made on one member can reach another
+//! between two commits of a keyed `$inc` there, so a multi-chunk request is applied on
+//! both sides of a concurrent drop. `shop.items` takes keyed inserts with and without
+//! `_id` (the derived one), bulk inserts of two, replaces and deletes by id, unkeyed
+//! writes, and is dropped and created again. `shop.big`, in
 //! named rows only, holds more documents than three snapshot pages.
 //!
 //! **Key sets.** Every version a keyed request writes carries, in its `ks` field, the
@@ -44,7 +47,8 @@
 //! whole-database snapshot), with writes on the sender between its pages; take a member
 //! down and up; restart or crash a member; back a member up and restore it, which then
 //! replays its own origin from its peers (ADR-212, as the transport does); drop or create
-//! `items`; and a retention pass with a moved clock. "Between two commits" is the
+//! `items` or `orders` (a drop of `orders` on another member also between two commits);
+//! and a retention pass with a moved clock. "Between two commits" is the
 //! engine's own commit point (`barrier_hooks::Point::Released`, after every commit,
 //! durable by then), so it is between any two commits whatever the code under test makes
 //! them.
@@ -87,11 +91,17 @@
 //! - **I4**, after quiescence: identical documents, identical live records, and at
 //!   most one document per (request, position) of a keyed insert.
 //! - **I5** (`Home`), after quiescence: each counter is the number of `$inc` requests
-//!   accepted for it.
+//!   accepted for it. Not in a run with a drop of `orders` (a life begins with fresh
+//!   counters, and a drop keeps the versions stamped after it, ADR-236): I8 instead.
 //! - **I6**: no counter is ever above the number of `$inc` requests sent for it.
 //! - **I7**: a keyed insert never lands on a derived `_id` another request's insert
 //!   landed on, and no live inserted document at a derived `_id` was written by
 //!   another request.
+//! - **I8**, at each completion of an `$inc` on a member (not a replay): every counter it
+//!   targets that the member holds in a version older than the request's first write in
+//!   the member's current life of `orders` holds its application. Within one life the
+//!   stamp rule's `first` is at or below that write, so this is what a fresh application
+//!   or a resume writes; a counter stored later, by another, is left by design.
 //! - **Life**: no replay answers from a record of an earlier life (`last` at or below
 //!   the member's tombstone or floor of the collection), or one past its window.
 //!
@@ -113,6 +123,13 @@
 //! - **R1** (counted, a convergence matter outside B5): a reset identity's writes, or a
 //!   restored identity's writes after its backup, kept by peers only as page state,
 //!   never converge to the reset or restored member.
+//! - **D2** (counted): a retry after a drop of `orders` applies afresh, as the life rule
+//!   says (the request's records are of the life the drop ended), on a counter whose
+//!   version a write stamped after the drop carried into the next life with the request's
+//!   earlier application in it (ADR-236): the counter is incremented twice.
+//! - **KR** (counted): an `$inc` completes short of counters I8 expects because its
+//!   record's `first` is another request's: a key reused for another request, applied on
+//!   a member that did not hold the first request's record, and the two records merged.
 //!
 //! **Reproducers.** `finding_g1_*` (G1 as first reported: its pull serves the window
 //! without the sender's verdict, which production refuses as `StateHeld`; kept as the
@@ -340,13 +357,15 @@ pub(crate) enum Step {
     Crash {
         m: u8,
     },
-    /// Drop `items`.
+    /// Drop collection `c` (`items` or `orders`).
     Drop {
         m: u8,
+        c: u8,
     },
-    /// Create `items`.
+    /// Create collection `c`; `orders` is created with its counters, fresh.
     Create {
         m: u8,
+        c: u8,
     },
     /// A retention pass on `m` at `t`, which the life rule's clock moves to everywhere.
     Retention {
@@ -413,8 +432,8 @@ impl std::fmt::Display for Op {
             Step::Restore { m } => write!(f, "{}.restore", l(*m)),
             Step::Restart { m } => write!(f, "{}.restart", l(*m)),
             Step::Crash { m } => write!(f, "{}.crash", l(*m)),
-            Step::Drop { m } => write!(f, "{}.drop(items)@{t}", l(*m)),
-            Step::Create { m } => write!(f, "{}.create(items)@{t}", l(*m)),
+            Step::Drop { m, c } => write!(f, "{}.drop({})@{t}", l(*m), NAMES[*c as usize]),
+            Step::Create { m, c } => write!(f, "{}.create({})@{t}", l(*m), NAMES[*c as usize]),
             Step::Retention { m } => write!(f, "{}.retention@{t}", l(*m)),
             Step::Clock { m } => write!(f, "{}.clock@{t}", l(*m)),
         }
@@ -490,6 +509,10 @@ pub(crate) enum Inv {
     I5,
     I6,
     I7,
+    /// A keyed `$inc` that completed on a member left a counter it targets without its
+    /// application, where the counter's version there is older than the request's first
+    /// write in the member's current life of `orders` (see the module docs).
+    I8,
     Life,
     /// The run itself failed: an unexpected error, or a cluster that never settled.
     Error,
@@ -527,6 +550,22 @@ pub(crate) struct Outcome {
     pub between: usize,
     /// Settled documents that differ only by a retired identity's versions (R1).
     pub retired: usize,
+    /// `$inc` completions I8 checked: those with a write in the member's current life.
+    pub i8_checks: usize,
+    /// Calls of a keyed request of `orders` during which a drop of `orders` reached
+    /// their member (between two of their commits, or before the first).
+    pub drop_mid_request: usize,
+    /// `$inc` requests with writes on both sides of a drop of `orders`, on any members.
+    pub straddled: usize,
+    /// Home-track runs whose exact I5 a drop of `orders` turned off.
+    pub i5_off: usize,
+    /// Finding D2: a retry after a drop of `orders` applied afresh, as the life rule
+    /// says, on a counter whose version a write after the drop carried into the next
+    /// life with the request's earlier application in it (ADR-236): a double increment.
+    pub d2: usize,
+    /// Finding KR: an `$inc` completed short of counters because its record's `first`
+    /// is another request's under a reused key (see `check_i8`).
+    pub kr: usize,
 }
 
 type Res<T> = std::result::Result<T, String>;
@@ -638,6 +677,9 @@ struct Ghost {
     /// (collection, document key, request) of every application on its own effect
     /// the life rule allows or that is a classified finding: a stored double it explains.
     explained: HashSet<(u8, Vec<u8>, u8)>,
+    /// Of those, the applications afresh the life rule allows on an earlier life's effect
+    /// that a version written after the drop carried into the next life (ADR-236).
+    life: HashSet<(u8, Vec<u8>, u8)>,
     /// Every drop of `items` minted, as its tombstone's stamp.
     drops: Vec<(u8, Stamp)>,
     /// (node, entry) I2 let pass because a drop elsewhere ended its life (D1).
@@ -1509,6 +1551,15 @@ impl World {
             if p.last_before.is_some_and(|last| last.hlc > p.floor) {
                 self.out.dropped_elsewhere += 1;
             }
+            if c == ORDERS && self.ghost.life.insert((c, key.clone(), r)) {
+                self.out.d2 += 1;
+                let s = format!(
+                    "D2: r{r} on {} applied afresh on counter {id:?}, whose version carries its \
+                     application of a life a drop ended: {ks:?}",
+                    LETTERS[p.m]
+                );
+                self.note(s);
+            }
             self.ghost.explained.insert((c, key, r));
             let s = format!(
                 "r{r} on {} applied afresh on {id:?}, an earlier life's effect",
@@ -1670,10 +1721,20 @@ impl World {
             }
         }
         let shown = minted.iter().map(|e| self.stamp(e.stamp)).collect::<Vec<_>>().join(" ");
+        if c == ORDERS && self.floor(m, c)? > p.floor {
+            self.out.drop_mid_request += 1;
+            self.note(format!(
+                "r{r} on {}: a drop of orders reached it during the call",
+                LETTERS[m]
+            ));
+        }
         match answer {
             Answer::Fresh { wrote, resumed } => {
                 if resumed {
                     self.out.resumes += 1;
+                }
+                if req.kind.is_inc() {
+                    self.check_i8(r, m)?;
                 }
                 self.accepted[r as usize] |= wrote || !minted.is_empty() || resumed;
                 self.finished[r as usize] = true;
@@ -1722,6 +1783,78 @@ impl World {
         Ok(())
     }
 
+    /// I8, when `$inc` request `r` completes on member `m` (not a replay): every counter
+    /// it targets that `m` holds in a version older than the request's first write in
+    /// `m`'s current life of `orders` (on any member) holds its application.
+    ///
+    /// The stamp rule leaves a counter stored at or above the merged `first` (written
+    /// meanwhile by another), and within one life that `first` is at or below the
+    /// request's first write there, so such a counter is exempt. A version older than
+    /// that write existed when the request's application in this life began: a fresh
+    /// one writes it, and a resume writes it when its `first` is of this life too. One
+    /// whose `first` is of a life a drop ended (a record merged across the drop) leaves
+    /// it, a partial application in this life.
+    fn check_i8(&mut self, r: u8, m: usize) -> Res<()> {
+        let floor = self.floor(m, ORDERS)?;
+        let first_here = self
+            .ghost
+            .entries
+            .iter()
+            .filter(|(s, (q, qc, _))| *q == r && *qc == ORDERS && s.hlc > floor)
+            .map(|(s, _)| *s)
+            .min();
+        let Some(first_here) = first_here else { return Ok(()) };
+        self.out.i8_checks += 1;
+        let kind = self.sched.requests[r as usize].kind;
+        let e = self.e(m);
+        let record = self.live_record(m, ORDERS, self.sched.requests[r as usize].key)?;
+        // Finding KR: the record's `first` is another request's under the same key (a key
+        // reused for another request, applied on a member without the first one's record,
+        // the two records merged): the stamp rule then reads that request's first.
+        let first_of_another = record.as_ref().and_then(|rec| {
+            self.ghost.entries.get(&rec.first).map(|(q, ..)| *q).filter(|q| *q != r)
+        });
+        let mut short = Vec::new();
+        for d in 0..COUNTERS {
+            if !kind.targets(d) {
+                continue;
+            }
+            if let Some((stamp, Some(doc))) = stored(&e, ORDERS, &DocId::Int64(d))
+                && stamp < first_here
+                && !ks_of(&doc).contains(&i64::from(r))
+            {
+                if let Some(q) = first_of_another {
+                    short.push(format!("{d} at {} ({doc}), the first r{q}'s", self.stamp(stamp)));
+                    continue;
+                }
+                let s = format!(
+                    "r{r} completed on {} and left counter {d} at {} ({doc}) without it: its \
+                     first write in this life is {}, the life from {}, its record {:?}",
+                    LETTERS[m],
+                    self.stamp(stamp),
+                    self.stamp(first_here),
+                    self.hlc(floor),
+                    record.as_ref().map(|rec| (
+                        self.stamp(rec.first),
+                        self.stamp(rec.last),
+                        rec.state
+                    )),
+                );
+                self.fail(Inv::I8, s);
+            }
+        }
+        if !short.is_empty() {
+            self.out.kr += 1;
+            let s = format!(
+                "KR: r{r} completed on {} short of counters {}",
+                LETTERS[m],
+                short.join(", ")
+            );
+            self.note(s);
+        }
+        Ok(())
+    }
+
     /// A send with nothing between its commits and no crash: a plain step, a drive, or
     /// a concurrent attempt run between another request's commits.
     fn send_plain(&mut self, r: u8, m: usize, t: u32) -> Res<()> {
@@ -1743,12 +1876,20 @@ impl World {
             if self.finished[r as usize] || self.members[home].catching_up || self.memory_ended(r) {
                 return Ok(());
             }
+            // A drop of `orders` took the request's collection from its home: nothing to
+            // drive it on until a creation reaches it.
+            let c = self.sched.requests[r as usize].kind.coll();
+            if self.e(home).get_collection(DB, NAMES[c as usize]).is_err() {
+                return Ok(());
+            }
             self.out.steps += 1;
             let t = self.latest_t(home);
             self.note(format!("drive r{r} on {}", LETTERS[home]));
             self.send_plain(r, home, t)?;
         }
-        if !self.finished[r as usize] {
+        let c = self.sched.requests[r as usize].kind.coll();
+        if !self.finished[r as usize] && self.e(home).get_collection(DB, NAMES[c as usize]).is_ok()
+        {
             self.fail(Inv::Error, format!("r{r} never finished on its home"));
         }
         Ok(())
@@ -1813,29 +1954,39 @@ impl World {
             }
             Step::Restart { m } => self.reopen(*m as usize, true)?,
             Step::Crash { m } => self.reopen(*m as usize, false)?,
-            Step::Drop { m } => {
-                let m = *m as usize;
+            Step::Drop { m, c } => {
+                let (m, c) = (*m as usize, *c);
                 self.clock(m, op.t);
-                match self.e(m).drop_collection(DB, NAMES[ITEMS as usize]) {
+                match self.e(m).drop_collection(DB, NAMES[c as usize]) {
                     Ok(held) => {
                         let e = self.e(m);
                         let at = e
-                            .collection_dropped_at(coll_id(ITEMS))
+                            .collection_dropped_at(coll_id(c))
                             .map_err(|e| err("dropped_at", e))?;
                         if let Some(at) = at {
-                            self.ghost.drops.push((ITEMS, at));
+                            self.ghost.drops.push((c, at));
                         }
-                        self.note(format!("{} dropped items (held {held})", LETTERS[m]))
+                        let s =
+                            format!("{} dropped {} (held {held})", LETTERS[m], NAMES[c as usize]);
+                        self.note(s)
                     }
                     Err(e) => self.note(format!("{} drop refused: {e}", LETTERS[m])),
                 }
             }
-            Step::Create { m } => {
-                let m = *m as usize;
+            Step::Create { m, c } => {
+                let (m, c) = (*m as usize, *c);
                 self.clock(m, op.t);
                 for attempt in 0..2 {
-                    match self.e(m).create_collection(DB, NAMES[ITEMS as usize]) {
-                        Ok(_) => self.note(format!("{} created items", LETTERS[m])),
+                    match self.e(m).create_collection(DB, NAMES[c as usize]) {
+                        Ok(coll) => {
+                            self.note(format!("{} created {}", LETTERS[m], NAMES[c as usize]));
+                            // A life of `orders` begins with its counters, fresh.
+                            if c == ORDERS {
+                                self.e(m)
+                                    .insert_many(&coll, fresh_counters())
+                                    .map_err(|e| err("insert_many", e.source))?;
+                            }
+                        }
                         Err(StorageError::CollectionPurging { .. }) if attempt == 0 => {
                             self.finish_purges()?;
                             continue;
@@ -2112,8 +2263,8 @@ impl World {
             | Step::Restart { m }
             | Step::Crash { m }
             | Step::Reset { m, .. }
-            | Step::Drop { m }
-            | Step::Create { m }
+            | Step::Drop { m, .. }
+            | Step::Create { m, .. }
             | Step::Retention { m } => *m as usize == running,
             Step::Page { to, restart, .. } => *restart && *to as usize == running,
             // An unkeyed write on the running member between its commits: the stamp
@@ -2204,9 +2355,18 @@ impl World {
                 if c == ORDERS {
                     let d = doc.get_i64("_id").unwrap_or(-1);
                     let n = doc.get_i64("n").unwrap_or(0);
+                    // Finding D2's doubles, counted and not failed.
+                    let d2: i64 = ks
+                        .iter()
+                        .collect::<BTreeSet<_>>()
+                        .into_iter()
+                        .filter(|k| self.ghost.life.contains(&(c, key.clone(), **k as u8)))
+                        .map(|k| ks.iter().filter(|x| *x == k).count() as i64 - 1)
+                        .sum();
                     let bound = (0..self.sched.requests.len())
                         .filter(|r| self.sent[*r] && self.sched.requests[*r].kind.targets(d))
-                        .count() as i64;
+                        .count() as i64
+                        + d2;
                     if n > bound && (unexplained || self.strict) {
                         let s = format!(
                             "{} counter {d} is {n}, above the {bound} requests sent for it: {ks:?}",
@@ -2543,8 +2703,19 @@ impl World {
                             || self.restored.get(&s.node).is_some_and(|at| s.hlc > *at)
                     };
                     let retired = |v: Option<&(Stamp, Document)>| v.is_none_or(|(s, _)| gone(s));
-                    retired_only &=
-                        (retired(a) || retired(b)) && [a, b].iter().flatten().any(|(s, _)| gone(s));
+                    // A side without the document may hold a tombstone of such an identity.
+                    let id = a.or(b).map(|(_, d)| id_of(d));
+                    let tombstone = |member: usize| {
+                        id.as_ref()
+                            .and_then(|id| stored(&self.e(member), k.0, id))
+                            .filter(|(_, body)| body.is_none())
+                            .map(|(s, _)| s)
+                    };
+                    let tombstones =
+                        [a.is_none().then(|| tombstone(0)), b.is_none().then(|| tombstone(m))];
+                    retired_only &= (retired(a) || retired(b))
+                        && ([a, b].iter().flatten().any(|(s, _)| gone(s))
+                            || tombstones.iter().flatten().flatten().any(gone));
                     let _ = write!(
                         diff,
                         " {k:?}: A {:?} / {} {:?};",
@@ -2669,8 +2840,32 @@ impl World {
             }
         }
         // I5: on the home track every counter is the number of `$inc` requests accepted
-        // for it.
-        if self.sched.track == Track::Home {
+        // for it. Not across a drop of `orders`: a life begins with fresh counters, and a
+        // drop keeps the versions stamped after it (ADR-236), their counts with them; I8
+        // checks each completion against the life it completed in instead.
+        let orders_dropped = self.ghost.drops.iter().any(|(c, _)| *c == ORDERS);
+        if self.sched.track == Track::Home && orders_dropped {
+            self.out.i5_off += 1;
+        }
+        // Requests with writes on both sides of a drop of `orders`.
+        for r in 0..self.sched.requests.len() as u8 {
+            let written: Vec<Hlc> = self
+                .ghost
+                .entries
+                .iter()
+                .filter(|(_, (q, qc, _))| *q == r && *qc == ORDERS)
+                .map(|(s, _)| s.hlc)
+                .collect();
+            let straddled = self.ghost.drops.iter().any(|(c, at)| {
+                *c == ORDERS
+                    && written.iter().any(|w| *w <= at.hlc)
+                    && written.iter().any(|w| *w > at.hlc)
+            });
+            if straddled {
+                self.out.straddled += 1;
+            }
+        }
+        if self.sched.track == Track::Home && !orders_dropped {
             for (m, held) in docs.iter().enumerate() {
                 for ((c, _), (_, doc)) in held {
                     if *c != ORDERS {
@@ -2852,14 +3047,17 @@ fn base() -> u64 {
     (crate::physical_now_ms() / 1000 + 3_600) * 1000
 }
 
+/// The counters of a life of `orders`, as it begins.
+fn fresh_counters() -> Vec<Document> {
+    (0..COUNTERS).map(|i| doc! { "_id": i, "n": 0i64, "ks": Vec::<Bson>::new() }).collect()
+}
+
 /// `orders` with its counters and an empty `items`, on A, pulled by B and C.
 fn setup(w: &mut World) -> Res<()> {
     let a = w.e(0);
     let orders = a.create_collection(DB, NAMES[ORDERS as usize]).map_err(|e| err("create", e))?;
     a.create_collection(DB, NAMES[ITEMS as usize]).map_err(|e| err("create", e))?;
-    let counters: Vec<Document> =
-        (0..COUNTERS).map(|i| doc! { "_id": i, "n": 0i64, "ks": Vec::<Bson>::new() }).collect();
-    a.insert_many(&orders, counters).map_err(|e| err("insert_many", e.source))?;
+    a.insert_many(&orders, fresh_counters()).map_err(|e| err("insert_many", e.source))?;
     for m in 1..w.n() {
         w.pull(m, 0, BATCH)?;
     }
@@ -3109,7 +3307,20 @@ impl Gen {
         if self.rng.chance(40) {
             for _ in 0..1 + self.rng.below(2) {
                 let j = 1 + self.rng.below(3) as u8;
-                let ops = (0..1 + self.rng.below(2)).map(|_| self.inner_op(r, m)).collect();
+                let mut ops = Vec::new();
+                for _ in 0..1 + self.rng.below(2) {
+                    let op = self.inner_op(r, m);
+                    // A drop made elsewhere, taken by the running member between two of
+                    // its commits.
+                    let pulled = match op.step {
+                        Step::Drop { m: by, .. } if by != m && self.rng.chance(70) => Some(by),
+                        _ => None,
+                    };
+                    ops.push(op);
+                    if let Some(by) = pulled {
+                        ops.push(Op { step: Step::Pull { to: m, from: by }, t: 0 });
+                    }
+                }
                 inner.push((j, ops));
             }
         }
@@ -3164,7 +3375,17 @@ impl Gen {
                 let other = self.other(m);
                 self.touch(other, extra)
             }
-            70..=82 => {
+            70..=74 => {
+                // A drop of `orders` on another member, concurrent with the request (a
+                // creation of it, now and then).
+                let other = self.other(m);
+                if self.rng.chance(70) {
+                    Op { step: Step::Drop { m: other, c: ORDERS }, t: self.t(other, extra) }
+                } else {
+                    Op { step: Step::Create { m: other, c: ORDERS }, t: self.t(other, extra) }
+                }
+            }
+            75..=82 => {
                 let later = extra + self.rng.below(40) as i64;
                 Op { step: Step::Clock { m }, t: self.t(m, later) }
             }
@@ -3312,11 +3533,13 @@ pub(crate) fn generate(seed: u64, track: Track, len: usize) -> Schedule {
             }
             82..=85 => {
                 let m = plan.member();
-                Op { step: Step::Drop { m }, t: plan.t(m, 0) }
+                let c = if plan.rng.chance(40) { ORDERS } else { ITEMS };
+                Op { step: Step::Drop { m, c }, t: plan.t(m, 0) }
             }
             86..=90 => {
                 let m = plan.member();
-                Op { step: Step::Create { m }, t: plan.t(m, 0) }
+                let c = if plan.rng.chance(50) { ORDERS } else { ITEMS };
+                Op { step: Step::Create { m, c }, t: plan.t(m, 0) }
             }
             93 => Op { step: Step::Backup { m: plan.member() }, t: 0 },
             94 => {
@@ -3365,6 +3588,14 @@ struct Sweep {
     replays: usize,
     resumes: usize,
     crashes: usize,
+    i8_checks: usize,
+    /// Schedules where a drop of `orders` reached a member during a keyed call of it.
+    with_drop_mid_request: usize,
+    /// Schedules with an `$inc` written on both sides of a drop of `orders`.
+    with_straddle: usize,
+    i5_off: usize,
+    d2: usize,
+    kr: usize,
 }
 
 /// Run each seed of `seeds` on both tracks, `threads` at a time; panic with the first
@@ -3400,12 +3631,20 @@ fn sweep(seeds: std::ops::Range<u64>, len: usize, threads: usize) -> Sweep {
                         t.replays += out.replays;
                         t.resumes += out.resumes;
                         t.crashes += out.crashes;
+                        t.i8_checks += out.i8_checks;
+                        t.with_drop_mid_request += usize::from(out.drop_mid_request > 0);
+                        t.with_straddle += usize::from(out.straddled > 0);
+                        t.i5_off += out.i5_off;
+                        t.d2 += out.d2;
+                        t.kr += out.kr;
                     }
                     // `IDEM_LIST=1`: each counted finding's schedule, by seed and track.
                     if std::env::var("IDEM_LIST").is_ok_and(|v| v == "1")
-                        && out.relay + out.l1 + out.s1 > 0
+                        && out.relay + out.l1 + out.s1 + out.d2 + out.kr > 0
                     {
-                        for n in out.notes.iter().filter(|n| n.contains("finding:")) {
+                        for n in out.notes.iter().filter(|n| {
+                            n.contains("finding:") || n.contains("D2:") || n.contains("KR:")
+                        }) {
                             eprintln!("FINDING seed {seed} {track:?}: {n}");
                         }
                     }
@@ -3421,7 +3660,9 @@ fn sweep(seeds: std::ops::Range<u64>, len: usize, threads: usize) -> Sweep {
     eprintln!(
         "idempotency model: seeds {seeds:?} x 2 tracks, len {len}: {} schedules, {} steps ({} \
          between commits), {} replays, {} resumes, {} crashes, {} life-rule applications, {} exempt by a drop elsewhere (D1), \
-         {} relay, {} L1, {} S1, in {:.1?}",
+         {} relay, {} L1, {} S1; drops of orders: {} schedules with one during a call, {} \
+         with an `$inc` written on both sides of one, {} I8 checks, {} home runs without \
+         exact I5, {} D2, {} KR; in {:.1?}",
         totals.schedules,
         totals.steps,
         totals.between,
@@ -3433,6 +3674,12 @@ fn sweep(seeds: std::ops::Range<u64>, len: usize, threads: usize) -> Sweep {
         totals.relay,
         totals.l1,
         totals.s1,
+        totals.with_drop_mid_request,
+        totals.with_straddle,
+        totals.i8_checks,
+        totals.i5_off,
+        totals.d2,
+        totals.kr,
         started.elapsed()
     );
     if let Some(report) = failure.into_inner().unwrap() {
@@ -3857,9 +4104,9 @@ fn row_a_record_of_the_life_after_a_drop_survives_its_purge() {
         vec![req(1, Kind::Replace { at: Target::Client(0) })],
         vec![
             ask(0, C, 140),
-            Op { step: Step::Drop { m: B }, t: 210 },
+            Op { step: Step::Drop { m: B, c: ITEMS }, t: 210 },
             ask(0, A, 220),
-            Op { step: Step::Create { m: B }, t: 250 },
+            Op { step: Step::Create { m: B, c: ITEMS }, t: 250 },
             pull(A, B),
             pull(C, A),
             ask(0, C, 260),
@@ -3999,8 +4246,8 @@ fn row_a_retry_after_a_drop_and_a_recreation_applies_afresh() {
         vec![
             ask(0, A, 100),
             ask(0, B, 105),
-            Op { step: Step::Drop { m: A }, t: 110 },
-            Op { step: Step::Create { m: A }, t: 120 },
+            Op { step: Step::Drop { m: A, c: ITEMS }, t: 110 },
+            Op { step: Step::Create { m: A, c: ITEMS }, t: 120 },
             pull(A, B),
             ask(0, A, 130),
         ],
