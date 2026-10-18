@@ -1567,10 +1567,12 @@ impl World {
         let record_dead = p.last_before.is_some_and(|last| last.hlc <= end)
             || current.iter().any(|s| self.straddles(r, *s, end));
         let current = !current.is_empty();
-        // Or the member holds no record and the effect it applies on is of an ended life
-        // only: an entry of that life it took before the drop reached it, from a sender
-        // that held no record of it (D1), whatever records the request has elsewhere.
-        if (record_dead || p.pre_record.is_none()) && !current {
+        // Or the effect it applies on is of an ended life only, and the member holds no
+        // record of that life: none at all (an entry of that life it took before the drop
+        // reached it, from a sender that held no record of it, D1), or one of the current
+        // life alone (the request applied afresh after the drop, then resumed).
+        let fresh_here = p.pre_record.as_ref().is_none_or(|rec| rec.first.hlc > end);
+        if (record_dead || fresh_here) && !current {
             self.out.life_exempt += 1;
             if p.last_before.is_some_and(|last| last.hlc > p.floor) {
                 self.out.dropped_elsewhere += 1;
@@ -1881,7 +1883,9 @@ impl World {
             if !kind.targets(d) {
                 continue;
             }
+            // A version at or below the floor is of the ended life, swept by the drop.
             if let Some((stamp, Some(doc))) = stored(&e, ORDERS, &DocId::Int64(d))
+                && stamp.hlc > floor
                 && stamp < first_here
                 && !ks_of(&doc).contains(&i64::from(r))
             {
