@@ -1225,6 +1225,40 @@ fn f5_a_keyed_request_stopped_between_chunks_resumes() {
     assert_eq!(ns(&engine, &coll, 3), vec![1, 1, 1]);
 }
 
+/// A short chunk that writes nothing ends a keyed request whose record stands,
+/// and marks it `done` in a commit of the record alone. Here the first attempt
+/// stopped after its first chunk, two documents of three, and the third was
+/// written by another write before the retry: the retry resumes, its one chunk
+/// finds the third and leaves it by the stamp rule, and the request ends. Left
+/// `applying`, every later retry would resume again rather than replay.
+#[test]
+fn a_resume_whose_short_last_chunk_writes_nothing_marks_the_record_done() {
+    let (engine, coll, _dir, path) = open();
+    counters(&engine, &coll, 3);
+    engine.set_multi_chunk_docs(2);
+    let engine = Arc::new(engine);
+    let k = keyed(98);
+    let stopper = Arc::clone(&engine);
+    crate::sync::race_hooks::at(crate::sync::race_hooks::Race::BetweenChunks, move || {
+        stopper.set_stopping();
+    });
+    let failed = engine.modify_where_keyed(&coll, &Candidates::Scan, &Inc, None, &k);
+    assert!(matches!(failed, Err(StorageError::PartiallyApplied { .. })), "{failed:?}");
+    drop(engine);
+    let (engine, coll) = reopen(&path);
+    engine.set_multi_chunk_docs(2);
+    assert_eq!(record(&engine, &coll, &k).unwrap().state, RecordState::Applying, "premise");
+    // Another write to the third document, after the request's first.
+    engine.replace(&coll, &DocId::Int64(2), doc! { "n": 10i64 }, false).unwrap();
+
+    let out = fresh(engine.modify_where_keyed(&coll, &Candidates::Scan, &Inc, None, &k).unwrap());
+    assert!(out.resumed);
+    assert_eq!((out.matched, out.modified, out.skipped), (2, 2, 1));
+    assert_eq!(record(&engine, &coll, &k).unwrap().state, RecordState::Done);
+    replayed(engine.modify_where_keyed(&coll, &Candidates::Scan, &Inc, None, &k).unwrap());
+    assert_eq!(ns(&engine, &coll, 3), vec![1, 1, 10]);
+}
+
 /// The two lines `docs/operations.md` publishes for a keyed write, at the
 /// levels it gives them: a resume at `INFO`, with the collection and the counts
 /// it carries on from, and a replay at `DEBUG`, below what an operator's
