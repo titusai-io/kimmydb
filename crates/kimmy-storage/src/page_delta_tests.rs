@@ -393,8 +393,9 @@ fn a_delta_larger_than_the_byte_budget_goes_as_records_only_pages() {
     fresh(y.insert_keyed(&cy, doc! { "_id": 20_000i64, "v": 1 }, &key_of(n + 7)).unwrap());
     let refused = y.snapshot_page(progress.after().cloned(), progress.scope());
     assert!(
-        matches!(refused, Err(crate::StorageError::SnapshotRowTooLarge { .. })),
-        "refused: {refused:?}"
+        matches!(&refused, Err(crate::StorageError::SnapshotRowTooLarge { what, .. })
+            if what.contains("idempotency record")),
+        "the delta's record refused: {refused:?}"
     );
     y.set_record_delta_budget_for_test(None);
     finish(&x, &y, &mut progress);
