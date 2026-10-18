@@ -163,34 +163,6 @@ pub const RECORD_COLLECT_CHUNK: usize = 1_000;
 /// Records on one snapshot page's records phase.
 pub const RECORD_PAGE: usize = 512;
 
-/// The bytes of idempotency records one snapshot page carries at most, its
-/// records delta ([`records_changed_since`]) and its records phase
-/// ([`records_for_collection_page`]) together, each record counted with
-/// [`CARRIED_OVERHEAD`] for its framing.
-///
-/// **The arithmetic.** A page crosses the wire as one frame of at most 64 MiB
-/// (the cluster's `MAX_FRAME`, which asserts this is at most half of it). Half
-/// for the records, so the other 32 MiB holds the rest of the page: its
-/// documents and tombstones, the first page's definitions, the drop lists, the
-/// sender's vector and BSON's framing. The documents are bounded by count
-/// (`SNAPSHOT_PAGE`) and not by bytes, as they were before records rode pages.
-///
-/// **Progress.** The delta goes first and takes what it needs, up to the budget:
-/// a delta that does not fit makes a records-only page. The records phase takes
-/// what is left, and a collection's records that do not fit go on the next page,
-/// from the cursor's records position. One record larger than the budget goes
-/// alone, as the only record of a page that carries nothing else: its delta's
-/// first, or its records phase's first when the page has no delta. A page with a
-/// delta leaves such a record to the next one.
-///
-/// **A record larger than a frame** holds a `find_and_modify`'s document, so that
-/// document is larger than a frame too: no document size is capped below it
-/// (`server.max_body_bytes` bounds a request's body, and updates grow a document
-/// past it). It goes alone and its page does not cross the wire, which is the
-/// outcome of the document it carries: its oplog entry exceeds a frame and does
-/// not replicate, and its own snapshot page does not cross either.
-pub const RECORD_PAGE_BYTES: usize = 32 * 1024 * 1024;
-
 /// The change-log rows one page's records delta examines at most, whatever they
 /// come to: the bound on one page's read, so a delta from an old base (a resumed
 /// pull) or of a scoped pull over a busy store is read over several pages.
@@ -200,7 +172,8 @@ pub const RECORD_DELTA_ROWS: usize = 64 * 1024;
 /// the scope hash and BSON's framing, a bound and not a measure.
 pub(crate) const CARRIED_OVERHEAD: usize = 96;
 
-/// What a record of `len` bytes costs a page's [`RECORD_PAGE_BYTES`].
+/// What a record of `len` bytes costs a page's bytes
+/// (`snapshot::SNAPSHOT_PAGE_BYTES`).
 pub(crate) fn carried_size(len: usize) -> usize {
     len + CARRIED_OVERHEAD
 }
@@ -1142,8 +1115,9 @@ pub(crate) fn changes_high_water_at_open(db: &redb::Database) -> Result<Hlc> {
 /// What one page's records delta may carry and read ([`records_changed_since`]).
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct DeltaBudget {
-    /// The bytes of its records, at most [`RECORD_PAGE_BYTES`]: the page's
-    /// records budget, which the records phase has what the delta leaves of.
+    /// The bytes of its records: what the page has for its rows
+    /// (`snapshot::SNAPSHOT_PAGE_BYTES` less its definitions and drops), of
+    /// which the records phase and the documents have what the delta leaves.
     pub bytes: usize,
     /// The log rows it examines, at most [`RECORD_DELTA_ROWS`].
     pub rows: usize,
@@ -1151,7 +1125,8 @@ pub(crate) struct DeltaBudget {
 
 impl DeltaBudget {
     /// A page's.
-    pub(crate) const PAGE: Self = Self { bytes: RECORD_PAGE_BYTES, rows: RECORD_DELTA_ROWS };
+    pub(crate) const PAGE: Self =
+        Self { bytes: crate::snapshot::SNAPSHOT_PAGE_BYTES, rows: RECORD_DELTA_ROWS };
 }
 
 /// One page's records delta.
@@ -1173,7 +1148,8 @@ pub(crate) struct Delta {
 /// writer, so every change committed after the read that cut `base` is above it.
 ///
 /// Stops before the budget is passed ([`DeltaBudget`]), naming the last key it
-/// examined; a record larger than the byte budget goes alone. A row whose record
+/// examined; a record larger than the whole budget, which a page holding nothing
+/// else cannot carry, is refused ([`StorageError::SnapshotRowTooLarge`]). A row whose record
 /// is gone (purged or collected) carries nothing. No keyed change since `base` is
 /// an empty read.
 pub(crate) fn records_changed_since(
@@ -1211,7 +1187,15 @@ pub(crate) fn records_changed_since(
             .flatten();
         if let Some((collection, scope, record)) = named {
             let size = carried_size(record.len());
-            if !out.is_empty() && bytes + size > budget.bytes {
+            if out.is_empty() && size > budget.bytes {
+                // Larger than a page holding nothing else: it cannot cross on one.
+                return Err(StorageError::SnapshotRowTooLarge {
+                    what: format!("the idempotency record of a request on collection {collection}"),
+                    bytes: size,
+                    room: budget.bytes,
+                });
+            }
+            if bytes + size > budget.bytes {
                 // This row is the next page's first.
                 return Ok(Delta { records: out, stopped_at: last });
             }
@@ -1227,9 +1211,10 @@ pub(crate) fn records_changed_since(
 /// One page of a collection's records for a snapshot's records phase: up to
 /// `limit` (at most [`RECORD_PAGE`]) records after the scope `after`, in scope
 /// order, within `room` bytes ([`carried_size`] each), and whether more of the
-/// collection's records are left. With `alone`, the first record goes even when
-/// it is larger than `room`, so a page that carries nothing else always makes
-/// progress ([`RECORD_PAGE_BYTES`]).
+/// collection's records are left: one that does not fit is the next page's
+/// first. With `refuse`, the page holds nothing else, and a first record larger
+/// than `room` cannot cross on a page: it is refused
+/// ([`StorageError::SnapshotRowTooLarge`], `snapshot::SNAPSHOT_PAGE_BYTES`).
 #[allow(clippy::type_complexity)]
 pub fn records_for_collection_page(
     txn: &ReadTransaction,
@@ -1237,7 +1222,7 @@ pub fn records_for_collection_page(
     after: Option<&ScopeHash>,
     limit: usize,
     room: usize,
-    alone: bool,
+    refuse: bool,
 ) -> Result<(Vec<(ScopeHash, Vec<u8>)>, bool)> {
     let limit = limit.clamp(1, RECORD_PAGE);
     let records = txn.open_table(IDEMPOTENCY)?;
@@ -1253,7 +1238,17 @@ pub fn records_for_collection_page(
         }
         let Some(scope) = ScopeHash::from_slice(scope) else { continue };
         let size = carried_size(value.value().len());
-        if used + size > room && !(alone && page.is_empty()) {
+        if used + size > room {
+            if refuse && page.is_empty() {
+                return Err(StorageError::SnapshotRowTooLarge {
+                    what: format!(
+                        "the idempotency record of a request on collection {collection} (a \
+                         find_and_modify's document)"
+                    ),
+                    bytes: size,
+                    room,
+                });
+            }
             return Ok((page, true));
         }
         used += size;
@@ -1549,13 +1544,15 @@ impl Engine {
         DeltaBudget::PAGE
     }
 
-    /// Set the budget of a page's records delta in bytes and log rows examined,
-    /// for a test that pages one without writing 32 MiB or 65,536 rows; `None`
-    /// for the real one.
+    /// Set the room of a snapshot page's rows in bytes (its delta's, records
+    /// phase's and documents' together, `snapshot::SNAPSHOT_PAGE_BYTES`) and the
+    /// log rows its delta examines, for a test that pages without writing 63 MiB
+    /// or 65,536 rows; `None` for the real ones.
     #[cfg(test)]
     pub(crate) fn set_record_delta_budget_for_test(&self, bytes_and_rows: Option<(usize, usize)>) {
         *self.idempotency.delta_budget.lock() =
             bytes_and_rows.map(|(bytes, rows)| DeltaBudget { bytes, rows });
+        self.set_snapshot_room_for_test(bytes_and_rows.map(|(bytes, _)| bytes));
     }
 
     /// Count `n` records stored from peers by `via`, once the transaction that

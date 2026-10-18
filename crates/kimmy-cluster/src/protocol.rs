@@ -52,10 +52,9 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 /// document rather than an 5 KiB one. Reachable, but no longer routine.
 pub const MAX_FRAME: usize = 64 * 1024 * 1024;
 
-// A snapshot page's idempotency records, its delta and its records phase
-// together, take at most half a frame, so the rest of the page has the other
-// half (`kimmy_storage::idempotency::RECORD_PAGE_BYTES`, B5).
-const _: () = assert!(kimmy_storage::idempotency::RECORD_PAGE_BYTES <= MAX_FRAME / 2);
+// A snapshot page's counted bytes leave a frame 1 MiB for what is not counted
+// (`kimmy_storage::SNAPSHOT_PAGE_BYTES`).
+const _: () = assert!(kimmy_storage::SNAPSHOT_PAGE_BYTES + 1024 * 1024 <= MAX_FRAME);
 
 /// Entries a peer will send in one response.
 ///

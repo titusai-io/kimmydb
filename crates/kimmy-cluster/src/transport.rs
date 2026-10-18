@@ -774,6 +774,9 @@ fn is_local_failure(e: &kimmy_storage::StorageError) -> bool {
         // A keyed client request's answer (B5), never an apply's, and about
         // the request, not this node's storage.
         E::IdempotencyKeyReused | E::IdempotencyKeyInFlight => false,
+        // A snapshot page's row no page can carry: about the row, never an
+        // apply's (B5).
+        E::SnapshotRowTooLarge { .. } => false,
     }
 }
 
@@ -1201,6 +1204,14 @@ where
                     Err(kimmy_storage::StorageError::Stopping(reason)) => {
                         debug!(%reason, "stopped serving a peer's snapshot: this node is shutting down");
                         return Ok(());
+                    }
+                    // A row no page can carry (a document larger than a frame):
+                    // the requester is told which, rather than left with a
+                    // connection that closed.
+                    Err(e @ kimmy_storage::StorageError::SnapshotRowTooLarge { .. }) => {
+                        warn!(error = %e, "a snapshot page cannot be served");
+                        write_frame(&mut stream, &Message::Fault(e.to_string())).await?;
+                        return Err(ProtocolError::Local(e.to_string()));
                     }
                     Err(e) => return Err(ProtocolError::Local(e.to_string())),
                 };
@@ -9788,6 +9799,101 @@ mod tests {
         let ((), answer) = tokio::join!(serving, asking);
         assert!(matches!(answer, Err(ProtocolError::Closed)), "no window was sent: {answer:?}");
         assert_eq!(*failures.lock(), [], "the cap is not a serve failure");
+    }
+
+    /// One snapshot pull of `b` by `a` through the listener and the requester's
+    /// pull, and what each end came to.
+    async fn pull_through(
+        a: &Engine,
+        b: &Engine,
+        scope: Option<CollectionId>,
+        policy: kimmy_storage::SnapshotPolicy,
+    ) -> (Result<(), ProtocolError>, Result<SnapshotPulled, ProtocolError>) {
+        const SECRET: &str = "a-page-bytes-secret";
+        const BINDING: &[u8] = b"a-page-bytes-binding";
+        let (mut ours, theirs) = tokio::io::duplex(1 << 20);
+        let serving = async {
+            serve_peer(b, theirs, SECRET, BINDING, None, ServeBudgets::serving(), None).await
+        };
+        let pulling = async {
+            open_handshake(a, &mut ours, SECRET, BINDING).await.unwrap();
+            let mut stalls = PeerStalls::new();
+            let clock = RoundClock::default();
+            let deadline = Instant::now() + Duration::from_secs(300);
+            let addr: SocketAddr = "127.0.0.1:1".parse().unwrap();
+            let pulled = pull_snapshot(
+                a,
+                &mut ours,
+                addr,
+                b.node_id(),
+                scope,
+                policy,
+                &mut stalls,
+                deadline,
+                &clock,
+            )
+            .await;
+            drop(ours);
+            pulled
+        };
+        tokio::join!(serving, pulling)
+    }
+
+    /// The v0.51.0 stall (B5, P2): 600 documents of 130 KiB, whose first page
+    /// was 68 MB, over a frame, so the listener refused it and the pull failed
+    /// for good. Pages are cut by bytes now (`SNAPSHOT_PAGE_BYTES`), and the
+    /// whole-database, scoped and converge pulls complete. A document no page can
+    /// carry is answered with a `Fault` naming it, not a closed connection.
+    #[tokio::test]
+    async fn snapshot_pages_of_large_documents_cross_within_a_frame() {
+        use kimmy_storage::SnapshotPolicy::{All, Converge};
+        let b_dir = tempfile::tempdir().unwrap();
+        let b = Engine::open(&b_dir.path().join("kimmy.redb")).unwrap();
+        let coll = b.create_collection("shop", "wide").unwrap();
+        let pad = "x".repeat(130 * 1024);
+        for chunk in 0..6i64 {
+            let docs = (0..100i64)
+                .map(|i| bson::doc! { "_id": chunk * 100 + i, "pad": pad.clone() })
+                .collect();
+            b.insert_many(&coll, docs).unwrap();
+        }
+        for scope in [None, Some(coll.id)] {
+            let a_dir = tempfile::tempdir().unwrap();
+            let a = Engine::open(&a_dir.path().join("kimmy.redb")).unwrap();
+            let (served, pulled) = pull_through(&a, &b, scope, All).await;
+            // The requester closing after its last page is the listener's end.
+            assert!(matches!(served, Ok(()) | Err(ProtocolError::Closed)), "{served:?}");
+            let pulled = pulled.unwrap();
+            assert!(pulled.complete, "the pull completes");
+            let held = a.get_collection("shop", "wide").unwrap();
+            assert_eq!(a.count(&held, kimmy_storage::WalkScope::Request).unwrap(), 600);
+            // A converge pull of what it holds crosses as well.
+            let (served, pulled) = pull_through(&a, &b, Some(held.id), Converge).await;
+            assert!(matches!(served, Ok(()) | Err(ProtocolError::Closed)), "{served:?}");
+            assert!(pulled.unwrap().complete, "a converge pull completes");
+        }
+
+        // A document larger than a page holds: refused by name.
+        b.set_snapshot_room_for_test(Some(64 * 1024));
+        let a_dir = tempfile::tempdir().unwrap();
+        let a = Engine::open(&a_dir.path().join("kimmy.redb")).unwrap();
+        let (served, pulled) = pull_through(&a, &b, Some(coll.id), All).await;
+        b.set_snapshot_room_for_test(None);
+        assert!(
+            matches!(&served, Err(ProtocolError::Local(why)) if why.contains("cannot cross")),
+            "the listener ends the connection: {served:?}"
+        );
+        match pulled {
+            Err(ProtocolError::Fault(reason)) => {
+                assert!(
+                    reason.contains("document Int64(0)") && reason.contains("cannot cross"),
+                    "{reason}"
+                );
+            }
+            other => {
+                panic!("expected a Fault naming the document, got {:?}", other.map(|p| p.complete))
+            }
+        }
     }
 
     /// A pushed window this node cannot apply is answered with a `Fault`

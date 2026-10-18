@@ -147,6 +147,37 @@ pub const LEFT_IDS_NAMED: usize = 10;
 /// one the receiver may not have the memory to hold.
 pub const SNAPSHOT_PAGE: usize = 512;
 
+/// The bytes one snapshot page holds: the cluster's frame (`MAX_FRAME`, 64 MiB,
+/// which asserts this) less 1 MiB, the room `write_frame` needs beyond what is
+/// counted here (the cursor, the tombstone horizon, the message's own framing).
+///
+/// **What is counted against it.** The page's fixed parts, measured as they will
+/// be encoded: the definitions (the first page's), the drops, the sender's
+/// vector. Then its rows, in order, each with a bound on its framing: the
+/// records delta (`idempotency::records_changed_since`), the records phase
+/// (`idempotency::records_for_collection_page`) and the documents and
+/// tombstones. [`SNAPSHOT_PAGE`] still caps the documents and tombstones, and
+/// `idempotency::RECORD_PAGE` the phase's records, by count.
+///
+/// **Progress.** A row that does not fit what the page has left goes first on
+/// the next page. A row that does not fit a page holding nothing else, its
+/// definitions aside, **cannot cross on a page at all**: a document larger than
+/// a frame, or the `find_and_modify` record holding one. It is refused, naming
+/// it ([`crate::StorageError::SnapshotRowTooLarge`]), rather than sent in a frame
+/// `write_frame` refuses; a document that size cannot cross in a window either
+/// (its oplog entry is over a frame), and it crosses once it is smaller. On the
+/// first page, which carries the definitions, such a row waits for the second.
+/// Before this bound a page of 512 documents averaging over 128 KiB was over a
+/// frame, and its pull failed for good (v0.51.0).
+pub const SNAPSHOT_PAGE_BYTES: usize = 63 * 1024 * 1024;
+
+/// What a document on a page costs beyond its body and key: its collection,
+/// stamp and `_id` and their framing, a bound and not a measure.
+pub(crate) const DOCUMENT_OVERHEAD: usize = 160;
+
+/// What a tombstone on a page costs beyond its key, likewise.
+pub(crate) const TOMBSTONE_OVERHEAD: usize = 96;
+
 /// What applying a snapshot page does (ADR-148, ADR-152, and the repair of a
 /// confirmed digest finding).
 ///
@@ -685,10 +716,9 @@ pub struct SnapshotPage {
     pub tombstone_horizon: Option<Hlc>,
     /// The idempotency records of the page's collection (B5, "Snapshots carry
     /// records"), sent **before** its documents: pages of up to
-    /// [`crate::idempotency::RECORD_PAGE`] of them, within the page's records
-    /// budget ([`crate::idempotency::RECORD_PAGE_BYTES`], which the delta shares),
-    /// open each collection's part of the snapshot, and a page never holds one
-    /// collection's records after
+    /// [`crate::idempotency::RECORD_PAGE`] of them, within what the page has left
+    /// of [`SNAPSHOT_PAGE_BYTES`] after its delta, open each collection's part of
+    /// the snapshot, and a page never holds one collection's records after
     /// another's documents. A member that takes a document by snapshot must not
     /// take it without the record of the write that produced it, or a retry there
     /// would apply on top of what the snapshot brought. Stored in the page's one
@@ -954,7 +984,24 @@ impl Engine {
             after_key: keyenc::stored_of_legacy(&cursor.after_key),
             ..cursor
         });
-        let (records, documents, mut deleted_documents, next) = self.snapshot_rows(after, scope)?;
+        // The page's parts other than its rows, measured as they will be
+        // encoded: what its rows have left of `SNAPSHOT_PAGE_BYTES`.
+        let fixed = bson::serialize_to_vec(&SnapshotPage {
+            collections: collections.clone(),
+            documents: Vec::new(),
+            next: None,
+            versions: versions.clone(),
+            dropped,
+            dropped_collections: dropped_collections.clone(),
+            deleted_documents: Vec::new(),
+            dropped_indexes: dropped_indexes.clone(),
+            tombstone_horizon: None,
+            records: Vec::new(),
+        })
+        .map_or(0, |bytes| bytes.len());
+        let first = after.is_none();
+        let (records, documents, mut deleted_documents, next) =
+            self.snapshot_rows(after, scope, self.snapshot_rows_room(fixed), first)?;
         #[cfg(test)]
         crate::sync::race_hooks::reach(crate::sync::race_hooks::Race::PageRead);
         for tombstone in &mut deleted_documents {
@@ -979,6 +1026,27 @@ impl Engine {
             tombstone_horizon,
             records,
         })
+    }
+
+    /// What a page's rows have of [`SNAPSHOT_PAGE_BYTES`] once its other parts,
+    /// `fixed` bytes of them, are counted; a test's own room when it set one.
+    fn snapshot_rows_room(&self, fixed: usize) -> usize {
+        #[cfg(any(test, feature = "test-hooks"))]
+        {
+            let set = self.snapshot_room_for_test.load(std::sync::atomic::Ordering::Relaxed);
+            if set != 0 {
+                return set;
+            }
+        }
+        SNAPSHOT_PAGE_BYTES.saturating_sub(fixed)
+    }
+
+    /// Give every snapshot page `bytes` for its rows, whatever its other parts
+    /// take, for a test that pages by bytes without writing 63 MiB; `None` for
+    /// [`SNAPSHOT_PAGE_BYTES`] less them.
+    #[cfg(any(test, feature = "test-hooks"))]
+    pub fn set_snapshot_room_for_test(&self, bytes: Option<usize>) {
+        self.snapshot_room_for_test.store(bytes.unwrap_or(0), std::sync::atomic::Ordering::Relaxed);
     }
 
     fn collection_states(&self) -> Result<Vec<CollectionState>> {
@@ -1030,6 +1098,8 @@ impl Engine {
         &self,
         after: Option<SnapshotCursor>,
         scope: Option<CollectionId>,
+        room: usize,
+        first: bool,
     ) -> Result<(
         Vec<crate::idempotency::CarriedRecord>,
         Vec<SnapshotDoc>,
@@ -1037,6 +1107,12 @@ impl Engine {
         Option<SnapshotCursor>,
     )> {
         use std::ops::Bound;
+
+        /// A document or a tombstone a page sends, once it is known to fit.
+        enum PageRow {
+            Document(SnapshotDoc),
+            Tombstone(SnapshotTombstone),
+        }
 
         /// Where a page begins: a collection's records after a scope (`None` from
         /// its first), or its rows after a key (`None` from its first).
@@ -1128,7 +1204,7 @@ impl Engine {
                     &txn,
                     base.key,
                     &standing,
-                    self.record_delta_budget(),
+                    crate::idempotency::DeltaBudget { bytes: room, ..self.record_delta_budget() },
                 )?;
                 records = delta.records;
                 if let Some(stopped) = delta.stopped_at {
@@ -1151,9 +1227,8 @@ impl Engine {
             }
         }
         let delta_len = records.len();
-        // The page's records budget, which the records phase has what the delta
-        // left of (`idempotency::RECORD_PAGE_BYTES`).
-        let budget = self.record_delta_budget().bytes;
+        // What the page's rows have of `SNAPSHOT_PAGE_BYTES`, in order: the delta,
+        // the records phase, the documents and tombstones.
         let mut used: usize =
             records.iter().map(|r| crate::idempotency::carried_size(r.record.len())).sum();
         let cut = |cursor: Option<SnapshotCursor>| {
@@ -1162,9 +1237,10 @@ impl Engine {
 
         let mut out = Vec::new();
         let mut deleted = Vec::new();
-        // The row that ended a full page, kept only once it is: across
-        // collections, since a page can fill at the last row of one.
-        let mut last_sent: Option<(u64, Vec<u8>)> = None;
+        // Where the documents' walk stands: after the last row this page sent,
+        // across collections, or where it began. What a page cut short, by count
+        // or by bytes, resumes after.
+        let mut resume: Option<(u64, Vec<u8>)> = None;
         let mut phase = match after {
             // not a row: the first standing collection id, from the set above.
             None => match live.iter().next() {
@@ -1201,16 +1277,17 @@ impl Engine {
                         return Ok((records, out, deleted, cut(Some(cursor))));
                     }
                     let after = at.as_deref().and_then(kimmy_core::ScopeHash::from_slice);
-                    // Within what the page's records budget has left; the first
-                    // record alone, larger or not, on a page that carries nothing
-                    // else, so the phase always moves.
+                    // Within what the page has left; a record that does not fit
+                    // goes first on the next page, and one that does not fit a
+                    // page holding nothing else is refused, but on the first page,
+                    // whose definitions it waits behind.
                     let (page, more) = crate::idempotency::records_for_collection_page(
                         &txn,
                         CollectionId(id),
                         after.as_ref(),
                         crate::idempotency::RECORD_PAGE - phased,
-                        budget.saturating_sub(used),
-                        records.is_empty(),
+                        room.saturating_sub(used),
+                        records.is_empty() && !first,
                     )?;
                     used += page
                         .iter()
@@ -1236,6 +1313,10 @@ impl Engine {
                     phase = Phase::Rows(id, None);
                 }
                 Phase::Rows(id, after_key) => {
+                    if resume.is_none() || after_key.is_none() {
+                        // not a row: where this collection's walk begins.
+                        resume = Some((id, after_key.clone().unwrap_or_default()));
+                    }
                     if live.contains(&id) {
                         // `Excluded` on the resume point, so the row that ended
                         // the last page is not sent twice.
@@ -1247,6 +1328,15 @@ impl Engine {
                             Some(next) => Bound::Excluded((next, [].as_slice())),
                             None => Bound::Unbounded,
                         };
+                        // A page cut short: after the last row it sent.
+                        let resumed = |resume: &Option<(u64, Vec<u8>)>| {
+                            resume.clone().map(|(collection, after_key)| SnapshotCursor {
+                                collection: CollectionId(collection),
+                                after_key,
+                                records: None,
+                                records_base: None,
+                            })
+                        };
                         for row in docs.range::<(u64, &[u8])>((start, end))? {
                             if out.len() + deleted.len() >= SNAPSHOT_PAGE {
                                 // Another row exists past a full page, so there
@@ -1254,14 +1344,7 @@ impl Engine {
                                 // sent. Looking one row ahead is what lets a
                                 // snapshot of exactly a page's worth end here
                                 // rather than with an empty page after it.
-                                let cursor =
-                                    last_sent.map(|(collection, after_key)| SnapshotCursor {
-                                        collection: CollectionId(collection),
-                                        after_key,
-                                        records: None,
-                                        records_base: None,
-                                    });
-                                return Ok((records, out, deleted, cut(cursor)));
+                                return Ok((records, out, deleted, cut(resumed(&resume))));
                             }
                             let (key, value) = row?;
                             let (collection, doc_key) = key.value();
@@ -1270,12 +1353,13 @@ impl Engine {
                             // `_id` to recover, so it cannot be a `SnapshotDoc`,
                             // and a receiver below this node's horizon may well
                             // hold the document.
-                            if !record.is_live() {
-                                deleted.push(SnapshotTombstone {
+                            let (bytes, item) = if !record.is_live() {
+                                let tombstone = SnapshotTombstone {
                                     collection: CollectionId(collection),
                                     key: doc_key.to_vec(),
                                     stamp: record.stamp,
-                                });
+                                };
+                                (doc_key.len() + TOMBSTONE_OVERHEAD, PageRow::Tombstone(tombstone))
                             } else {
                                 let Some(document) = record.document()? else {
                                     continue;
@@ -1284,16 +1368,46 @@ impl Engine {
                                     Some(value) => DocId::try_from_bson(value)?,
                                     None => continue,
                                 };
-                                out.push(SnapshotDoc {
+                                let bytes = record.body.len() + doc_key.len() + DOCUMENT_OVERHEAD;
+                                let document = SnapshotDoc {
                                     collection: CollectionId(collection),
                                     id,
                                     stamp: record.stamp,
                                     body: Some(record.body),
-                                });
+                                };
+                                (bytes, PageRow::Document(document))
+                            };
+                            if used + bytes > room {
+                                if records.is_empty()
+                                    && out.is_empty()
+                                    && deleted.is_empty()
+                                    && !first
+                                {
+                                    let what = match &item {
+                                        PageRow::Document(document) => format!(
+                                            "document {:?} of collection {}",
+                                            document.id, document.collection
+                                        ),
+                                        PageRow::Tombstone(tombstone) => format!(
+                                            "a tombstone of collection {}",
+                                            tombstone.collection
+                                        ),
+                                    };
+                                    return Err(crate::StorageError::SnapshotRowTooLarge {
+                                        what,
+                                        bytes,
+                                        room,
+                                    });
+                                }
+                                // Not on this page: first on the next.
+                                return Ok((records, out, deleted, cut(resumed(&resume))));
                             }
-                            if out.len() + deleted.len() == SNAPSHOT_PAGE {
-                                last_sent = Some((collection, doc_key.to_vec()));
+                            used += bytes;
+                            match item {
+                                PageRow::Document(document) => out.push(document),
+                                PageRow::Tombstone(tombstone) => deleted.push(tombstone),
                             }
+                            resume = Some((collection, doc_key.to_vec()));
                         }
                     }
                     // The collection's rows are done: on to the next, through

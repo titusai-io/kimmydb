@@ -151,6 +151,17 @@ pub enum StorageError {
     /// `retry: wait`: once it ends, the retry replays or resumes it.
     #[error("a request with this Idempotency-Key is still running on this member")]
     IdempotencyKeyInFlight,
+
+    /// A row of a snapshot page that does not fit a page holding nothing else
+    /// (`snapshot::SNAPSHOT_PAGE_BYTES`): a document larger than a frame, or the
+    /// `find_and_modify` record holding one. It cannot cross on a page, as its
+    /// oplog entry cannot cross in a window; it crosses once it is smaller. The
+    /// sender answers the page's request with this reason.
+    #[error(
+        "{what} is {bytes} bytes on a snapshot page, which has {room} bytes for its rows: it \
+         cannot cross on a page (nor its oplog entry in a window) until it is smaller"
+    )]
+    SnapshotRowTooLarge { what: String, bytes: usize, room: usize },
 }
 
 /// What kind of refusal a [`StorageError::RefusedStore`] is (ADR-204).

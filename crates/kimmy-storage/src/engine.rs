@@ -152,6 +152,10 @@ pub struct Engine {
     /// for a test of a member restored onto a host whose clock is behind.
     #[cfg(test)]
     clock_behind_ms: std::sync::atomic::AtomicU64,
+    /// A test's room for a snapshot page's rows (`snapshot::SNAPSHOT_PAGE_BYTES`);
+    /// 0 for the real one.
+    #[cfg(any(test, feature = "test-hooks"))]
+    pub(crate) snapshot_room_for_test: std::sync::atomic::AtomicUsize,
     /// How a commit becomes durable (ADR-088). `None` is the default class,
     /// `durable`: every commit fsyncs before it returns. `Some` is
     /// `coalesced`: commits skip their own fsync and wait at a shared barrier
@@ -1523,6 +1527,8 @@ impl Engine {
             ),
             #[cfg(test)]
             clock_behind_ms: std::sync::atomic::AtomicU64::new(0),
+            #[cfg(any(test, feature = "test-hooks"))]
+            snapshot_room_for_test: std::sync::atomic::AtomicUsize::new(0),
             coalescer: Mutex::new(None),
             coalesce_woken: Condvar::new(),
             #[cfg(test)]

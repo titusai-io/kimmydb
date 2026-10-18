@@ -348,8 +348,8 @@ fn a_pages_records_commit_with_its_documents() {
 /// [`crate::idempotency::RECORD_PAGE`] changed records ride one page with its
 /// documents. One larger than the byte budget goes as records-only pages, each
 /// leaving the cursor's document position as it came and moving its base, and
-/// then the documents with the rest; a record larger than the byte budget goes
-/// alone. Every record and every document arrives.
+/// then the documents with the rest; a record no page can carry is refused,
+/// naming it. Every other record and every document arrives.
 #[test]
 fn a_delta_larger_than_the_byte_budget_goes_as_records_only_pages() {
     let dir = tempfile::tempdir().unwrap();
@@ -387,26 +387,20 @@ fn a_delta_larger_than_the_byte_budget_goes_as_records_only_pages() {
         assert!(position.get_or_insert(at.clone()) == &at, "the document position stays");
     }
     assert_eq!(sizes, vec![3, 3, 1], "by bytes");
+    // Less room than one record: no page can carry it, and it is refused, naming
+    // it, rather than sent in a frame too large to cross.
     y.set_record_delta_budget_for_test(Some((1, crate::idempotency::RECORD_DELTA_ROWS)));
-    for i in n + 7..n + 9 {
-        let id = 10_000 + i as i64;
-        fresh(y.insert_keyed(&cy, doc! { "_id": id, "v": 1 }, &key_of(i)).unwrap());
-    }
-    let mut sizes = Vec::new();
-    loop {
-        let asked = progress.after().cloned().unwrap();
-        let page = take(&x, &y, &mut progress);
-        sizes.push(page.records.len());
-        if !records_only(&page, &asked) {
-            break;
-        }
-    }
-    assert_eq!(sizes, vec![1, 1], "a record larger than the budget goes alone");
+    fresh(y.insert_keyed(&cy, doc! { "_id": 20_000i64, "v": 1 }, &key_of(n + 7)).unwrap());
+    let refused = y.snapshot_page(progress.after().cloned(), progress.scope());
+    assert!(
+        matches!(refused, Err(crate::StorageError::SnapshotRowTooLarge { .. })),
+        "refused: {refused:?}"
+    );
     y.set_record_delta_budget_for_test(None);
     finish(&x, &y, &mut progress);
     let cx = x.get_collection("shop", "orders").unwrap();
     assert_eq!(count(&x, &cx), count(&y, &cy), "every document, once");
-    assert_eq!(x.idempotency_records().unwrap(), n + 9, "every record");
+    assert_eq!(x.idempotency_records().unwrap(), n + 8, "every record");
 }
 
 /// **A page carries documents only with the whole remainder** of the log above
@@ -459,6 +453,11 @@ fn a_page_carries_documents_only_with_the_whole_remainder() {
     }
     y.set_record_delta_budget_for_test(None);
     let cx = x.get_collection("shop", "orders").unwrap();
+    // The documents, at the real budget, up to the page that brings both effects.
+    let holds = |id: i64| x.get(&cx, &DocId::Int64(id)).unwrap().is_some();
+    while !(holds(target) && holds(during)) {
+        take(&x, &y, &mut progress);
+    }
     assert_eq!((n_of(&x, &cx, target), n_of(&x, &cx, during)), (11, 11), "premise: the page");
     assert!(!progress.is_complete(), "premise: the pull goes on");
     retry_must_replay(&x, &cx, &k, target);
@@ -477,7 +476,7 @@ fn a_delta_reads_a_bounded_number_of_rows_a_page() {
     let other = y.create_collection("shop", "other").unwrap();
     let mut progress = SnapshotProgress::of_collection(cy.id);
     take(&x, &y, &mut progress);
-    y.set_record_delta_budget_for_test(Some((crate::idempotency::RECORD_PAGE_BYTES, 4)));
+    y.set_record_delta_budget_for_test(Some((crate::SNAPSHOT_PAGE_BYTES, 4)));
     for i in 0..10u64 {
         fresh(y.insert_keyed(&other, doc! { "_id": i as i64 }, &key_of(i)).unwrap());
     }
@@ -1079,9 +1078,28 @@ fn large_records(y: &Engine, name: &str, n: i64, pad: usize) -> (CollectionMeta,
     (coll, keys)
 }
 
-/// What a page's records cost its records budget.
+/// What a page's records cost its rows' room.
 fn records_bytes(page: &SnapshotPage) -> usize {
     page.records.iter().map(|r| crate::idempotency::carried_size(r.record.len())).sum()
+}
+
+/// What a page's rows cost its room: its records, documents and tombstones.
+fn rows_bytes(page: &SnapshotPage) -> usize {
+    let documents: usize = page
+        .documents
+        .iter()
+        .map(|d| {
+            d.body.as_ref().map_or(0, Vec::len)
+                + crate::docs::doc_key(&d.id).unwrap().len()
+                + crate::snapshot::DOCUMENT_OVERHEAD
+        })
+        .sum();
+    let tombstones: usize = page
+        .deleted_documents
+        .iter()
+        .map(|t| t.key.len() + crate::snapshot::TOMBSTONE_OVERHEAD)
+        .sum();
+    records_bytes(page) + documents + tombstones
 }
 
 /// One record's cost, of a record of `coll` on `y`.
@@ -1111,7 +1129,7 @@ fn a_records_phase_larger_than_the_records_budget_spans_pages() {
         for _ in 0..2 {
             let page = take(&x, &y, &mut progress);
             assert_eq!(page.records.len(), 3, "three records' worth");
-            assert!(records_bytes(&page) <= budget, "within the budget");
+            assert!(rows_bytes(&page) <= budget, "within the budget");
             assert!(page.documents.is_empty(), "records first");
             positions.push(page.next.clone().unwrap().records.expect("a records position"));
         }
@@ -1131,7 +1149,7 @@ fn a_records_phase_larger_than_the_records_budget_spans_pages() {
     assert!(skipped.records.is_empty(), "a 0.51 echo: no records");
     assert_eq!(skipped.documents.first().map(|d| d.id.clone()), Some(DocId::Int64(0)));
     for page in finish(&x, &y, &mut progress) {
-        assert!(records_bytes(&page) <= budget, "within the budget");
+        assert!(rows_bytes(&page) <= budget, "within the budget");
     }
     let cx = x.get_collection("shop", "big").unwrap();
     assert_eq!(x.idempotency_records().unwrap(), 12, "every record");
@@ -1156,9 +1174,11 @@ fn a_scoped_and_a_converge_records_phase_span_pages_within_the_budget() {
     y.set_record_delta_budget_for_test(Some((budget, crate::idempotency::RECORD_DELTA_ROWS)));
     let mut progress = SnapshotProgress::of_collection(big.id);
     let pages = finish(&x, &y, &mut progress);
-    let counts: Vec<usize> = pages.iter().map(|page| page.records.len()).collect();
+    let counts: Vec<usize> =
+        pages.iter().map(|page| page.records.len()).filter(|n| *n > 0).collect();
     assert_eq!(counts, vec![4, 4, 2], "a scoped repair");
-    assert!(pages.iter().all(|page| records_bytes(page) <= budget));
+    assert!(pages.iter().all(|page| rows_bytes(page) <= budget));
+    assert!(pages.len() > 3, "and its documents, by bytes too");
     assert_eq!(x.idempotency_records().unwrap(), 10);
 
     // C holds the documents and has lost the records: a converge pull brings them.
@@ -1177,8 +1197,10 @@ fn a_scoped_and_a_converge_records_phase_span_pages_within_the_budget() {
     }
     let mut converge = SnapshotProgress::of_collection_converging(cc.id, Default::default());
     let pages = finish(&c, &y, &mut converge);
-    let counts: Vec<usize> = pages.iter().map(|page| page.records.len()).collect();
+    let counts: Vec<usize> =
+        pages.iter().map(|page| page.records.len()).filter(|n| *n > 0).collect();
     assert_eq!(counts, vec![4, 4, 2], "a converge pull");
+    assert!(pages.iter().all(|page| rows_bytes(page) <= budget));
     assert_eq!(c.idempotency_records().unwrap(), 10);
 }
 
@@ -1222,52 +1244,120 @@ fn the_delta_and_the_records_phase_share_the_records_budget() {
         );
     }
     let second = take(&x, &y, &mut progress);
-    assert!(records_bytes(&second) <= budget, "the delta and the phase within one budget");
+    assert!(rows_bytes(&second) <= budget, "the delta and the phase within one budget");
     let of_b = second.records.iter().filter(|r| r.collection == b.id).count();
     assert_eq!((second.records.len() - of_b, of_b), (3, 2), "three of the delta, two of b's phase");
     let rest = finish(&x, &y, &mut progress);
-    assert!(rest.iter().all(|page| records_bytes(page) <= budget));
+    assert!(rest.iter().all(|page| rows_bytes(page) <= budget));
     assert_eq!(x.idempotency_records().unwrap(), 2 + 6 + 3);
 }
 
-/// A record larger than the budget goes alone, on a page that carries nothing
-/// else; a page with a delta leaves it to the next page, which takes it alone.
+/// A row that does not fit what a page has left goes first on the next page: a
+/// page whose delta is large leaves the records phase's next record to the next.
+/// A row that does not fit a page holding nothing else cannot cross on a page:
+/// it is refused, naming it, a record or a document alike; the first page, which
+/// carries the definitions, leaves it to the second instead.
 #[test]
-fn a_record_larger_than_the_budget_goes_alone() {
+fn a_row_goes_first_on_the_next_page_and_one_no_page_can_carry_is_refused() {
     let dir = tempfile::tempdir().unwrap();
     let (y, x) = (open(&dir, "y"), open(&dir, "x"));
     let (big, keys) = large_records(&y, "big", 3, 10_000);
-    let small = y.create_collection("shop", "small").unwrap();
-    let budget = one_record(&y, &big, &keys[0]) / 2;
-    y.set_record_delta_budget_for_test(Some((budget, crate::idempotency::RECORD_DELTA_ROWS)));
+    let one = one_record(&y, &big, &keys[0]);
+    y.set_record_delta_budget_for_test(Some((
+        one + one / 2,
+        crate::idempotency::RECORD_DELTA_ROWS,
+    )));
     let mut progress = SnapshotProgress::of_collection(big.id);
     let first = take(&x, &y, &mut progress);
-    assert_eq!(first.records.len(), 1, "alone, larger than the budget");
-    // A small keyed write in the scope: the next page's delta.
+    assert_eq!(first.records.len(), 1, "one record's worth");
+    // A large keyed change: the next page's delta.
     let on = Candidates::Keys(vec![crate::docs::doc_key(&DocId::Int64(2)).unwrap()]);
-    fresh(y.modify_where_keyed(&big, &on, &Inc, Some(1), &key(42)).unwrap());
-    let _ = small;
+    fresh(
+        y.find_and_modify_keyed(
+            &big,
+            &on,
+            &Inc,
+            &key(42),
+            crate::idempotency::ReturnedImage::After,
+        )
+        .unwrap(),
+    );
     let second = take(&x, &y, &mut progress);
     assert_eq!(second.records.len(), 1, "the delta's record only");
     assert_eq!(second.records[0].scope, key(42).scope);
     let third = take(&x, &y, &mut progress);
-    assert_eq!(third.records.len(), 1, "then the next of the phase, alone");
+    assert_eq!(third.records.len(), 1, "then the phase's next, first on its page");
     assert_ne!(third.records[0].scope, first.records[0].scope, "from where the phase stood");
     finish(&x, &y, &mut progress);
     assert_eq!(x.idempotency_records().unwrap(), 4);
+
+    // Less room than one record: the first page leaves it, the second refuses it.
+    y.set_record_delta_budget_for_test(Some((one / 2, crate::idempotency::RECORD_DELTA_ROWS)));
+    let page = y.snapshot_page(None, Some(big.id)).unwrap();
+    assert!(page.records.is_empty() && page.documents.is_empty(), "behind the definitions");
+    let refused = y.snapshot_page(page.next.clone(), Some(big.id));
+    match refused {
+        Err(crate::StorageError::SnapshotRowTooLarge { what, bytes, room }) => {
+            assert!(what.contains("idempotency record") && bytes > room, "{what}");
+        }
+        other => panic!("expected the record refused, got {other:?}"),
+    }
+    // A document no page can carry, likewise.
+    let plain = y.create_collection("shop", "plain").unwrap();
+    y.insert(&plain, doc! { "_id": 7i64, "pad": "y".repeat(one) }).unwrap();
+    let page = y.snapshot_page(None, Some(plain.id)).unwrap();
+    assert!(page.documents.is_empty(), "behind the definitions");
+    match y.snapshot_page(page.next.clone(), Some(plain.id)) {
+        Err(e @ crate::StorageError::SnapshotRowTooLarge { .. }) => {
+            assert!(e.to_string().contains("document Int64(7)"), "{e}");
+        }
+        other => panic!("expected the document refused, got {other:?}"),
+    }
 }
 
-/// At the real budget: records holding megabyte documents, more than a page's
-/// records budget of them, span pages, each within `RECORD_PAGE_BYTES`.
+/// At the real budget: a page of documents and records that would pass a frame
+/// is cut by bytes, each page's encoding within a frame (`SNAPSHOT_PAGE_BYTES`
+/// and its 1 MiB), the cursor going on from the last row sent: 600 documents
+/// of 130 KiB, the shape that stalled a v0.51.0 pull for good, whole-database
+/// and scoped; and records holding megabyte documents, a records phase over a
+/// page.
 #[test]
-fn megabyte_records_span_pages_within_the_real_budget() {
+fn pages_of_large_rows_stay_within_a_frame_at_the_real_budget() {
+    let frame = crate::SNAPSHOT_PAGE_BYTES + 1024 * 1024;
     let dir = tempfile::tempdir().unwrap();
-    let (y, x) = (open(&dir, "y"), open(&dir, "x"));
-    let (_, _) = large_records(&y, "big", 36, 1024 * 1024);
-    let mut progress = SnapshotProgress::of_collection(y.get_collection("shop", "big").unwrap().id);
-    let pages = finish(&x, &y, &mut progress);
-    let budget = crate::idempotency::RECORD_PAGE_BYTES;
-    assert!(pages.iter().all(|page| records_bytes(page) <= budget), "within the budget");
-    assert!(pages[0].records.len() < 36 && pages[0].documents.is_empty(), "the phase spans pages");
-    assert_eq!(x.idempotency_records().unwrap(), 36);
+    let (y, x, z) = (open(&dir, "y"), open(&dir, "x"), open(&dir, "z"));
+    let wide = y.create_collection("shop", "wide").unwrap();
+    let pad = "x".repeat(130 * 1024);
+    for chunk in 0..6i64 {
+        let docs =
+            (0..100i64).map(|i| doc! { "_id": chunk * 100 + i, "pad": pad.clone() }).collect();
+        y.insert_many(&wide, docs).unwrap();
+    }
+    for (receiver, scope) in [(&x, None), (&z, Some(wide.id))] {
+        let mut progress = match scope {
+            None => SnapshotProgress::whole_database(),
+            Some(id) => SnapshotProgress::of_collection(id),
+        };
+        let pages = finish(receiver, &y, &mut progress);
+        for page in &pages {
+            let encoded = bson::serialize_to_vec(page).unwrap().len();
+            assert!(encoded <= frame, "a page of {encoded} bytes, over {frame}");
+        }
+        assert!(pages[0].documents.len() < SNAPSHOT_PAGE, "cut by bytes, not by count");
+        let cw = receiver.get_collection("shop", "wide").unwrap();
+        assert_eq!(count(receiver, &cw), 600, "every document, once");
+    }
+
+    let (big, _) = large_records(&y, "big", 70, 1024 * 1024);
+    let m = open(&dir, "m");
+    let mut progress = SnapshotProgress::of_collection(big.id);
+    let pages = finish(&m, &y, &mut progress);
+    for page in &pages {
+        let encoded = bson::serialize_to_vec(page).unwrap().len();
+        assert!(encoded <= frame, "a page of {encoded} bytes, over {frame}");
+    }
+    assert!(pages[0].records.len() < 70 && pages[0].documents.is_empty(), "the phase spans pages");
+    assert_eq!(m.idempotency_records().unwrap(), 70);
+    let cm = m.get_collection("shop", "big").unwrap();
+    assert_eq!(count(&m, &cm), 70);
 }
