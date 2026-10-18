@@ -905,6 +905,53 @@ async fn a_keyed_insert_without_an_id_stores_and_echoes_the_derived_one() {
     assert_eq!(node.doc(&upserted).await["sku"], "y");
 }
 
+/// The derived `_id` of each route that derives one, end to end, against values
+/// computed outside this code from the stated layouts (the collection id, the
+/// scope hash under `local:root`, the request's fingerprint as sent, the
+/// position). A release whose retry derived another `_id` (another fingerprint
+/// tag or layout, a renamed route template or parameter, another derivation)
+/// would leave two documents for one request, and fails here.
+#[tokio::test]
+async fn the_derived_id_of_every_deriving_route_is_pinned_end_to_end() {
+    let node = node().await;
+    let insert = node
+        .send(
+            "POST",
+            "/v1/db/shop/coll/orders/docs",
+            Req::key(KEY).raw(br#"{"n":1}"#, "application/json"),
+        )
+        .await;
+    assert_eq!(insert.status, 200, "{:?}", insert.body);
+    assert_eq!(insert.body["insertedId"], "0f7f7545-80d8-81aa-8d3e-6f9b6000fd29");
+
+    let bulk = node
+        .send(
+            "POST",
+            "/v1/db/shop/coll/orders/bulk",
+            Req::key("\"golden-bulk-6f1c0e52-8a1d\"")
+                .raw(br#"[{"n":1},{"n":2}]"#, "application/json"),
+        )
+        .await;
+    assert_eq!(bulk.status, 200, "{:?}", bulk.body);
+    assert_eq!(
+        bulk.body["insertedIds"],
+        json!(["290b4314-23bf-8b26-b03f-0e68c4abe7e4", "e406aed1-772b-836c-9af2-c82ffd73b7ee"])
+    );
+
+    let upsert = node
+        .send(
+            "POST",
+            "/v1/db/shop/coll/orders/find_and_modify",
+            Req::key("\"golden-upsert-6f1c0e52-8a1d\"").raw(
+                br#"{"filter":{"sku":"g"},"update":{"$set":{"q":1}},"upsert":true}"#,
+                "application/json",
+            ),
+        )
+        .await;
+    assert_eq!(upsert.status, 200, "{:?}", upsert.body);
+    assert_eq!(upsert.body["upsertedId"], "802a2ada-8b6a-8b0a-8a47-29a9f56ba277");
+}
+
 /// The derived `_id` is a function of the key, the principal, the collection
 /// and the request: two separate engines given the same request under the same
 /// key and principal derive the same one, which is `kimmy-core`'s derivation of

@@ -692,12 +692,16 @@ impl Engine {
     /// replaces wherever the two meet.
     ///
     /// **The residual (G8).** The last writing chunk's lookahead finds the end
-    /// itself and writes `done` there, unless its budget runs out on matches the
-    /// stamp rule leaves. Then this commit marks the end, and a member that took
-    /// the last writing chunk's entry before it, and so covers that `last`,
-    /// never receives `done`: a retry there resumes (`resumed: true`, its
-    /// counts cumulative, every match left by the stamp rule) where it would
-    /// replay. Never a double.
+    /// itself and writes `done` there, unless the request is not over at that
+    /// chunk's end: its budget runs out on matches the stamp rule leaves, or it
+    /// finds a match it could write that the next chunk then does not write (the
+    /// spec leaves it unchanged, ADR-208, or another writer rewrites it between
+    /// the two chunks, so the stamp rule leaves it). Then the next chunk finds
+    /// the end having written nothing, and this commit marks it, and a member
+    /// that took the last writing chunk's entry before it, and so covers that
+    /// `last`, never receives `done`: a retry there resumes (`resumed: true`,
+    /// its counts cumulative, the request's own writes left by the stamp rule)
+    /// where it would replay. Never a double.
     #[allow(clippy::too_many_arguments)]
     fn record_done_alone(
         &self,
@@ -754,11 +758,13 @@ impl Engine {
     /// writer rewrote the tail after the request began), and at most `budget`
     /// matches over a tail the stamp rule leaves.
     ///
-    /// **An end found here is final.** A document that arrives later, written
-    /// here or anywhere, is stamped above the request's `first` (its stamp is
-    /// minted after every stamp this member has witnessed, the request's own
-    /// entries among them, or comes from a member that witnessed them), so the
-    /// stamp rule would leave it: no later chunk could write it.
+    /// **An end found here ends the request, and never at the cost of a
+    /// double.** A document written later on this member, or by a member that
+    /// had witnessed the request's entries, is stamped above the request's
+    /// `first`, so the stamp rule would leave it. One written below `first` by
+    /// a member that had not seen the request can still replicate in after the
+    /// end, matching the filter: the request never writes it, which is
+    /// under-application, never a double.
     #[allow(clippy::too_many_arguments)]
     fn lookahead(
         &self,

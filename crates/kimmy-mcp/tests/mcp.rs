@@ -1858,6 +1858,46 @@ fn keyed_calls() -> Vec<(&'static str, Value)> {
     ]
 }
 
+/// The derived `_id` of each tool that derives one, end to end through the
+/// tool's typed arguments, against values computed outside this code from the
+/// stated layouts (the collection id, the scope hash under `local:root`, the
+/// call's fingerprint over the tool and its arguments re-serialized without the
+/// key, the position). A release that serialized the arguments differently (a
+/// field renamed or reordered) or hashed them differently would derive another
+/// `_id` for a retry and leave two documents.
+#[tokio::test]
+async fn the_derived_id_of_every_deriving_tool_is_pinned_end_to_end() {
+    let server = Server::start().await;
+    seed(&server);
+    let root = server.root();
+    let one = server
+        .call_ok(
+            &root,
+            "insert",
+            with_key(
+                json!({"database":"sales","collection":"orders","document":{"n":1}}),
+                "golden-mcp-insert-6f1c0e52",
+            ),
+        )
+        .await;
+    assert_eq!(one["insertedId"], "7f248224-39f1-8a44-9526-1f684dd372f4", "{one}");
+    let many = server
+        .call_ok(
+            &root,
+            "insert_many",
+            with_key(
+                json!({"database":"sales","collection":"orders","documents":[{"n":1},{"n":2}]}),
+                "golden-mcp-many-6f1c0e52",
+            ),
+        )
+        .await;
+    assert_eq!(
+        many["insertedIds"],
+        json!(["9f838414-7d3f-8d8a-bf40-5886b3327fe0", "a945d034-fb4a-8ade-aa80-c2cd66e8ffe8"]),
+        "{many}"
+    );
+}
+
 fn with_key(mut arguments: Value, key: &str) -> Value {
     arguments["idempotency_key"] = Value::from(key);
     arguments

@@ -31,9 +31,13 @@
 //!
 //! **Every byte here is a protocol constant.** A derived `_id` computed by one
 //! member must equal the one a retry computes on another, of any release, and a
-//! scope hash must find the record a peer stored. The domain tags, the field
-//! order and the widths are pinned by golden vectors in the tests below;
-//! changing any of them changes which document a retry lands on.
+//! scope hash must find the record a peer stored. The scope hash's and the
+//! derivation's domain tags, field order and widths are pinned by golden
+//! vectors in the tests below; changing any of them changes which document a
+//! retry lands on. The fingerprint the derivation takes is the API's bytes, not
+//! this crate's: `kimmy_api::idempotency` pins them (a golden vector per
+//! deriving route and MCP tool form), and the API's and MCP's integration tests
+//! pin the derived `_id` of each deriving route and tool end to end.
 
 use sha2::{Digest, Sha256};
 

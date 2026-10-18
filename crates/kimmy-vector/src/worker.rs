@@ -2742,7 +2742,11 @@ impl EmbeddingWorker {
                 queued.iter().map(|c| format!("{}/{}", c.db, c.name)).collect();
             info!(
                 ?collections,
-                "queued a one-time recheck of embedded collections for 0.51.0's vector chunk ids:                  each collection's owner re-embeds every document with a binary _id once, moves                  the chunks of a String _id that begins with ~, is 24 lowercase hex digits or is                  an integer's decimal, with no provider call, and leaves every other document's                  vectors as they are"
+                "queued a one-time recheck of embedded collections for 0.51.0's vector chunk ids: \
+                 each collection's owner re-embeds every document with a binary _id once, moves \
+                 the chunks of a String _id that begins with ~, is 24 lowercase hex digits or is \
+                 an integer's decimal, with no provider call, and leaves every other document's \
+                 vectors as they are"
             );
         }
         Ok(())

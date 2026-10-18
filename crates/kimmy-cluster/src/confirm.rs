@@ -43,6 +43,13 @@ pub const MAX_CONFIRM_BACKOFF: Duration = Duration::from_secs(60);
 /// member's writer (ADR-191).
 pub const REDIAL_GUARD: Duration = Duration::from_secs(1);
 
+/// Why a push sent nothing when the idempotency records its sender cannot
+/// vouch for by its oplog do not fit one frame (B5): the window would carry no
+/// entries and grant nothing.
+const RECORDS_OVERFILL_UNREACHED: &str = "the idempotency records this node cannot vouch for by \
+     its oplog do not fit one frame; anti-entropy will carry the change once this node pulls \
+     their entries";
+
 /// What a confirmation became on one member.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Resolution {
@@ -690,10 +697,7 @@ impl Confirmer {
         if let Fits::Nothing = fits {
             return PushResult::NothingSent {
                 their_node,
-                unreached: Some(
-                    "the idempotency records this node cannot vouch for by its oplog do not fit                      one frame; anti-entropy will carry the change once this node pulls their                      entries"
-                        .into(),
-                ),
+                unreached: Some(RECORDS_OVERFILL_UNREACHED.into()),
             };
         }
         if let Fits::Only(fits) = fits {
@@ -1061,6 +1065,16 @@ mod tests {
     use crate::transport::PushHook;
 
     const SECRET: &str = "a-confirm-test-secret";
+
+    /// A wrapped message literal reads as one sentence: a line break inside it
+    /// without its `\` continuation once carried the next line's indentation
+    /// into the message as a run of spaces.
+    #[test]
+    fn the_records_overfill_message_reads_as_one_sentence() {
+        let message = RECORDS_OVERFILL_UNREACHED;
+        assert!(!message.contains("  "), "a run of spaces: {message:?}");
+        assert!(message.ends_with("pulls their entries"), "{message:?}");
+    }
 
     /// What a serving member's push hook saw: each window's schema changes
     /// applied and entries deferred, in order; and levers to hold its answer

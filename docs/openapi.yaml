@@ -2090,7 +2090,7 @@ paths:
         "401": { $ref: "#/components/responses/Unauthorized" }
         "403": { $ref: "#/components/responses/Forbidden" }
         "404": { $ref: "#/components/responses/NotFound" }
-        "409": { $ref: "#/components/responses/IdempotencyKeyInFlight" }
+        "409": { $ref: "#/components/responses/ConflictOrKeyInFlight" }
         "500": { $ref: "#/components/responses/PartiallyApplied" }
 
   /v1/db/{db}/coll/{coll}/docs/{id}:

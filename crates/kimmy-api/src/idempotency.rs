@@ -655,6 +655,63 @@ mod tests {
         assert_ne!(fingerprint("POST", "a", "", b"b"), fingerprint("POST", "a", "b", b""));
     }
 
+    /// The fingerprints' bytes are a protocol constant: a derived `_id` is
+    /// built on them, so a release that hashed a keyed retry differently (the
+    /// tag, the layout, a route template) would derive another `_id` for it and
+    /// leave two documents. Golden values for the request of each route that
+    /// derives an `_id` and each MCP tool form that does, computed outside this
+    /// code from the layout the doc comments state.
+    #[test]
+    fn the_fingerprints_are_pinned_by_golden_vectors() {
+        fn hex(fp: Fingerprint) -> String {
+            fp.as_bytes().iter().map(|b| format!("{b:02x}")).collect()
+        }
+        for (route, target, body, expected) in [
+            (
+                "/v1/db/{db}/coll/{coll}/docs",
+                "/v1/db/shop/coll/orders/docs",
+                &br#"{"n":1}"#[..],
+                "2431ab8d5e91c7978d857d2f8f7f703c6eb74d793e6b4941ec20216680660129",
+            ),
+            (
+                "/v1/db/{db}/coll/{coll}/bulk",
+                "/v1/db/shop/coll/orders/bulk",
+                &br#"[{"n":1},{"n":2}]"#[..],
+                "24684180d8e249bc100a25e4d2bb1cf7c7585ff83f2d9194172c8010a89b806b",
+            ),
+            (
+                "/v1/db/{db}/coll/{coll}/find_and_modify",
+                "/v1/db/shop/coll/orders/find_and_modify",
+                &br#"{"filter":{"sku":"g"},"update":{"$set":{"q":1}},"upsert":true}"#[..],
+                "5d2c93c788ffc8a48147bff52bc03795ab3f3e3d6b5d122f33b1c7d20378896a",
+            ),
+        ] {
+            assert_eq!(hex(fingerprint("POST", route, target, body)), expected, "{route}");
+        }
+        for (tool, arguments, expected) in [
+            (
+                "insert",
+                serde_json::json!({"database":"shop","collection":"orders","document":{"n":1}}),
+                "803ebbf5f4f1b770cfbc7d3b900c2d0599adffa7807179f7d0c22afaadd82e53",
+            ),
+            (
+                "insert",
+                serde_json::json!({"database":"sales","collection":"orders","document":{"n":1},
+                                   "idempotency_key":"golden-mcp-insert-6f1c0e52"}),
+                "d2f19c4e4c32b8ce8e7cd51ffc2df4e2bbc0579a3d8cd971ca9ea00f9016298d",
+            ),
+            (
+                "insert_many",
+                serde_json::json!({"database":"sales","collection":"orders",
+                                   "documents":[{"n":1},{"n":2}],
+                                   "idempotency_key":"golden-mcp-many-6f1c0e52"}),
+                "73594820f198969f5a7e239ba7666fed5b649c49330095f116201aa0ae708014",
+            ),
+        ] {
+            assert_eq!(hex(tool_fingerprint(tool, &arguments)), expected, "{tool}");
+        }
+    }
+
     #[test]
     fn one_body_byte_moves_the_fingerprint() {
         let body = br#"{"_id":"x","n":12345}"#.to_vec();
