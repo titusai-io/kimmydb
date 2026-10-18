@@ -1707,6 +1707,45 @@ fn the_clock_resumes_above_every_record_after_a_restart() {
     assert!(engine.next_stamp() > ahead, "and after a restore");
 }
 
+/// The change log's keys are minted stamps, and a page's base is one of them: the clock
+/// resumes above the last key after a restart, even where the key is the only stamp
+/// this member holds that high (its clock moved ahead, then it stored a record whose own
+/// stamps are behind). Below it, the next change's key could fall under a base already
+/// handed out, and that page's delta would miss it.
+#[test]
+fn the_clock_resumes_above_the_change_logs_keys_after_a_restart() {
+    let (engine, coll, _dir, path) = open();
+    let now = Stamp::new(Hlc::new(crate::physical_now_ms(), 0), NodeId::from_bytes([9; 16]));
+    let ahead = Stamp::new(Hlc::new(crate::physical_now_ms() + 3_600_000, 0), engine.node_id());
+    engine.advance_clock_past(&ahead);
+    let r = base(8, now, now, 9, RecordState::Done);
+    {
+        let txn = engine.begin_write(crate::WriterHolder::Repair).unwrap();
+        let stored = engine
+            .store_record(
+                &txn,
+                &mut Default::default(),
+                Some(&coll),
+                coll.id,
+                &ScopeHash([8; 32]),
+                &r,
+                None,
+            )
+            .unwrap();
+        assert!(stored.is_some());
+        txn.commit().unwrap();
+    }
+    let key = {
+        use redb::ReadableDatabase;
+        let txn = engine.db().begin_read().unwrap();
+        crate::idempotency::changes_high_water(&txn).unwrap().expect("a change was logged")
+    };
+    assert!(key > ahead, "premise: the log's key is minted on the clock moved ahead");
+    drop(engine);
+    let (engine, _) = reopen(&path);
+    assert!(engine.next_stamp() > key, "the clock resumes above the log's last key");
+}
+
 // -- Purge, sweep, rewind, backup --------------------------------------------------------------
 
 /// A drop's purge removes the collection's records by its id's range, after its
