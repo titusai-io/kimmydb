@@ -684,9 +684,11 @@ pub struct SnapshotPage {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tombstone_horizon: Option<Hlc>,
     /// The idempotency records of the page's collection (B5, "Snapshots carry
-    /// records"), sent **before** its documents: a page of up to
-    /// [`crate::idempotency::RECORD_PAGE`] of them opens each collection's part of
-    /// the snapshot, and a page never holds one collection's records after
+    /// records"), sent **before** its documents: pages of up to
+    /// [`crate::idempotency::RECORD_PAGE`] of them, within the page's records
+    /// budget ([`crate::idempotency::RECORD_PAGE_BYTES`], which the delta shares),
+    /// open each collection's part of the snapshot, and a page never holds one
+    /// collection's records after
     /// another's documents. A member that takes a document by snapshot must not
     /// take it without the record of the write that produced it, or a retry there
     /// would apply on top of what the snapshot brought. Stored in the page's one
@@ -1065,9 +1067,15 @@ impl Engine {
             live.range((Bound::Excluded(id), Bound::Unbounded)).next().copied()
         };
         let has_records = |id: u64| -> Result<bool> {
-            let (page, _) =
-                crate::idempotency::records_for_collection_page(&txn, CollectionId(id), None, 1)?;
-            Ok(!page.is_empty())
+            let (page, more) = crate::idempotency::records_for_collection_page(
+                &txn,
+                CollectionId(id),
+                None,
+                1,
+                0,
+                false,
+            )?;
+            Ok(!page.is_empty() || more)
         };
         let records_cursor = |id: u64, at: Vec<u8>| SnapshotCursor {
             collection: CollectionId(id),
@@ -1143,6 +1151,11 @@ impl Engine {
             }
         }
         let delta_len = records.len();
+        // The page's records budget, which the records phase has what the delta
+        // left of (`idempotency::RECORD_PAGE_BYTES`).
+        let budget = self.record_delta_budget().bytes;
+        let mut used: usize =
+            records.iter().map(|r| crate::idempotency::carried_size(r.record.len())).sum();
         let cut = |cursor: Option<SnapshotCursor>| {
             cursor.map(|cursor| SnapshotCursor { records_base: Some(cut_base), ..cursor })
         };
@@ -1188,12 +1201,22 @@ impl Engine {
                         return Ok((records, out, deleted, cut(Some(cursor))));
                     }
                     let after = at.as_deref().and_then(kimmy_core::ScopeHash::from_slice);
+                    // Within what the page's records budget has left; the first
+                    // record alone, larger or not, on a page that carries nothing
+                    // else, so the phase always moves.
                     let (page, more) = crate::idempotency::records_for_collection_page(
                         &txn,
                         CollectionId(id),
                         after.as_ref(),
                         crate::idempotency::RECORD_PAGE - phased,
+                        budget.saturating_sub(used),
+                        records.is_empty(),
                     )?;
+                    used += page
+                        .iter()
+                        .map(|(_, record)| crate::idempotency::carried_size(record.len()))
+                        .sum::<usize>();
+                    let last = page.last().map(|(scope, _)| scope.as_bytes().to_vec());
                     records.extend(page.into_iter().map(|(scope, record)| {
                         crate::idempotency::CarriedRecord {
                             collection: CollectionId(id),
@@ -1202,8 +1225,12 @@ impl Engine {
                             record,
                         }
                     }));
-                    if let Some(last) = more {
-                        let cursor = records_cursor(id, last.as_bytes().to_vec());
+                    if more {
+                        // On the next page, from the last record this one sent,
+                        // or from where it came when it sent none.
+                        // not a row: the records position, empty for the first.
+                        let at = last.or(at).unwrap_or_default();
+                        let cursor = records_cursor(id, at);
                         return Ok((records, out, deleted, cut(Some(cursor))));
                     }
                     phase = Phase::Rows(id, None);

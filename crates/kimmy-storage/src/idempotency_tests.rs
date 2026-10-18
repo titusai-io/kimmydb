@@ -2072,12 +2072,19 @@ fn a_sender_finds_the_records_of_the_coverage_it_grants() {
     let mut after = None;
     let mut pages = Vec::new();
     loop {
-        let (page, next) =
-            idempotency::records_for_collection_page(&txn, other.id, after.as_ref(), 2).unwrap();
+        let (page, more) = idempotency::records_for_collection_page(
+            &txn,
+            other.id,
+            after.as_ref(),
+            2,
+            usize::MAX,
+            true,
+        )
+        .unwrap();
         pages.push(page.len());
-        match next {
-            Some(scope) => after = Some(scope),
-            None => break,
+        match page.last() {
+            Some((scope, _)) if more => after = Some(*scope),
+            _ => break,
         }
     }
     assert_eq!(pages, vec![2, 2, 1], "five records, two a page, none of another collection");

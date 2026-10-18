@@ -477,7 +477,7 @@ fn a_delta_reads_a_bounded_number_of_rows_a_page() {
     let other = y.create_collection("shop", "other").unwrap();
     let mut progress = SnapshotProgress::of_collection(cy.id);
     take(&x, &y, &mut progress);
-    y.set_record_delta_budget_for_test(Some((crate::idempotency::RECORD_DELTA_BYTES, 4)));
+    y.set_record_delta_budget_for_test(Some((crate::idempotency::RECORD_PAGE_BYTES, 4)));
     for i in 0..10u64 {
         fresh(y.insert_keyed(&other, doc! { "_id": i as i64 }, &key_of(i)).unwrap());
     }
@@ -1053,4 +1053,221 @@ fn a_base_from_before_a_restore_onto_a_clock_behind_restarts_its_collection() {
     let cx = x.get_collection("shop", "orders").unwrap();
     assert_eq!(n_of(&x, &cx, target), 11, "premise: the pull brought the effect");
     retry_must_replay(&x, &cx, &k, target);
+}
+
+// -- The records phase within the page's records budget ------------------------------------
+
+/// A collection `name` on `y` of `n` counters with a `pad`-byte string each, and
+/// a keyed `find_and_modify` on each answering with its document after: `n`
+/// records of about `pad` bytes each.
+fn large_records(y: &Engine, name: &str, n: i64, pad: usize) -> (CollectionMeta, Vec<KeyedWrite>) {
+    let coll = y.create_collection("shop", name).unwrap();
+    let text = "x".repeat(pad);
+    y.insert_many(
+        &coll,
+        (0..n).map(|i| doc! { "_id": i, "n": 0i64, "pad": text.clone() }).collect(),
+    )
+    .unwrap();
+    let keys: Vec<KeyedWrite> = (0..n as u64).map(|i| key_of(1_000 + i)).collect();
+    for (i, k) in keys.iter().enumerate() {
+        let on = Candidates::Keys(vec![crate::docs::doc_key(&DocId::Int64(i as i64)).unwrap()]);
+        let out = y
+            .find_and_modify_keyed(&coll, &on, &Inc, k, crate::idempotency::ReturnedImage::After)
+            .unwrap();
+        fresh(out);
+    }
+    (coll, keys)
+}
+
+/// What a page's records cost its records budget.
+fn records_bytes(page: &SnapshotPage) -> usize {
+    page.records.iter().map(|r| crate::idempotency::carried_size(r.record.len())).sum()
+}
+
+/// One record's cost, of a record of `coll` on `y`.
+fn one_record(y: &Engine, coll: &CollectionMeta, k: &KeyedWrite) -> usize {
+    crate::idempotency::carried_size(
+        y.idempotency_record(coll.id, &k.scope).unwrap().unwrap().encode().len(),
+    )
+}
+
+/// A records phase larger than the page's records budget spans pages, each
+/// within it, the cursor's records position moving on; a receiver restarted in
+/// the middle resumes from it; every record arrives and a retry replays. The
+/// cursor in the middle of the phase crosses BSON and JSON as before, and a 0.51
+/// receiver's echo, without the position, goes to the documents.
+#[test]
+fn a_records_phase_larger_than_the_records_budget_spans_pages() {
+    let dir = tempfile::tempdir().unwrap();
+    let y = open(&dir, "y");
+    let (big, keys) = large_records(&y, "big", 12, 10_000);
+    let budget = 3 * one_record(&y, &big, &keys[0]) + 50;
+    y.set_record_delta_budget_for_test(Some((budget, crate::idempotency::RECORD_DELTA_ROWS)));
+    let x_path = dir.path().join("x.redb");
+    let mut progress = SnapshotProgress::whole_database();
+    let mut positions = Vec::new();
+    {
+        let x = Engine::open(&x_path).unwrap();
+        for _ in 0..2 {
+            let page = take(&x, &y, &mut progress);
+            assert_eq!(page.records.len(), 3, "three records' worth");
+            assert!(records_bytes(&page) <= budget, "within the budget");
+            assert!(page.documents.is_empty(), "records first");
+            positions.push(page.next.clone().unwrap().records.expect("a records position"));
+        }
+    }
+    assert!(positions[0] < positions[1], "the position moves on");
+    let x = Engine::open(&x_path).unwrap();
+    let (_, mut progress) = x.snapshots_to_resume().unwrap().pop().expect("persisted");
+    let at = progress.after().cloned().unwrap();
+    assert_eq!(at.records.as_ref(), Some(&positions[1]), "resumed from the records position");
+    let wire: SnapshotCursor =
+        bson::deserialize_from_slice(&bson::serialize_to_vec(&at).unwrap()).unwrap();
+    assert_eq!(wire, at, "BSON");
+    let json: SnapshotCursor = serde_json::from_slice(&serde_json::to_vec(&at).unwrap()).unwrap();
+    assert_eq!(json, at, "JSON");
+    let older = SnapshotCursor { records: None, records_base: None, ..at.clone() };
+    let skipped = y.snapshot_page(Some(older), None).unwrap();
+    assert!(skipped.records.is_empty(), "a 0.51 echo: no records");
+    assert_eq!(skipped.documents.first().map(|d| d.id.clone()), Some(DocId::Int64(0)));
+    for page in finish(&x, &y, &mut progress) {
+        assert!(records_bytes(&page) <= budget, "within the budget");
+    }
+    let cx = x.get_collection("shop", "big").unwrap();
+    assert_eq!(x.idempotency_records().unwrap(), 12, "every record");
+    let on = Candidates::Keys(vec![crate::docs::doc_key(&DocId::Int64(11)).unwrap()]);
+    let again = x.find_and_modify_keyed(
+        &cx,
+        &on,
+        &Inc,
+        &keys[11],
+        crate::idempotency::ReturnedImage::After,
+    );
+    assert!(matches!(again.unwrap(), Keyed::Replayed(_)), "a retry replays");
+}
+
+/// The same on a scoped repair's pages and on a converge pull's.
+#[test]
+fn a_scoped_and_a_converge_records_phase_span_pages_within_the_budget() {
+    let dir = tempfile::tempdir().unwrap();
+    let (y, x, c) = (open(&dir, "y"), open(&dir, "x"), open(&dir, "c"));
+    let (big, keys) = large_records(&y, "big", 10, 10_000);
+    let budget = 4 * one_record(&y, &big, &keys[0]) + 50;
+    y.set_record_delta_budget_for_test(Some((budget, crate::idempotency::RECORD_DELTA_ROWS)));
+    let mut progress = SnapshotProgress::of_collection(big.id);
+    let pages = finish(&x, &y, &mut progress);
+    let counts: Vec<usize> = pages.iter().map(|page| page.records.len()).collect();
+    assert_eq!(counts, vec![4, 4, 2], "a scoped repair");
+    assert!(pages.iter().all(|page| records_bytes(page) <= budget));
+    assert_eq!(x.idempotency_records().unwrap(), 10);
+
+    // C holds the documents and has lost the records: a converge pull brings them.
+    pull(&c, &y);
+    let cc = c.get_collection("shop", "big").unwrap();
+    {
+        let db = c.db();
+        let txn = db.begin_write().unwrap();
+        {
+            let mut records = txn.open_table(crate::tables::IDEMPOTENCY).unwrap();
+            for k in &keys {
+                records.remove((cc.id.0, k.scope.as_bytes().as_slice())).unwrap();
+            }
+        }
+        txn.commit().unwrap();
+    }
+    let mut converge = SnapshotProgress::of_collection_converging(cc.id, Default::default());
+    let pages = finish(&c, &y, &mut converge);
+    let counts: Vec<usize> = pages.iter().map(|page| page.records.len()).collect();
+    assert_eq!(counts, vec![4, 4, 2], "a converge pull");
+    assert_eq!(c.idempotency_records().unwrap(), 10);
+}
+
+/// The delta and the records phase share the page's records budget: a page whose
+/// delta is large leaves its records phase what is left, and the phase goes on
+/// on the next page.
+#[test]
+fn the_delta_and_the_records_phase_share_the_records_budget() {
+    let dir = tempfile::tempdir().unwrap();
+    let (y, x) = (open(&dir, "y"), open(&dir, "x"));
+    // Two collections with records, walked in id order; the first page ends at
+    // the boundary into the second.
+    let (first_name, second_name) = if kimmy_core::CollectionId::derive("shop", "a")
+        < kimmy_core::CollectionId::derive("shop", "b")
+    {
+        ("a", "b")
+    } else {
+        ("b", "a")
+    };
+    let (a, a_keys) = large_records(&y, first_name, 2, 10_000);
+    let (b, _) = large_records(&y, second_name, 6, 10_000);
+    assert!(a.id < b.id, "premise: a is walked first");
+    let one = one_record(&y, &a, &a_keys[0]);
+    let budget = 5 * one + 50;
+    y.set_record_delta_budget_for_test(Some((budget, crate::idempotency::RECORD_DELTA_ROWS)));
+    let mut progress = SnapshotProgress::whole_database();
+    let first = take(&x, &y, &mut progress);
+    assert_eq!(first.records.len(), 2, "a's records, then its documents");
+    // Keyed changes since: a delta of three large records.
+    for (i, k) in [(0i64, 7u64), (1, 8)].into_iter().chain([(0, 9)]) {
+        let on = Candidates::Keys(vec![crate::docs::doc_key(&DocId::Int64(i)).unwrap()]);
+        fresh(
+            y.find_and_modify_keyed(
+                &a,
+                &on,
+                &Inc,
+                &key_of(k),
+                crate::idempotency::ReturnedImage::After,
+            )
+            .unwrap(),
+        );
+    }
+    let second = take(&x, &y, &mut progress);
+    assert!(records_bytes(&second) <= budget, "the delta and the phase within one budget");
+    let of_b = second.records.iter().filter(|r| r.collection == b.id).count();
+    assert_eq!((second.records.len() - of_b, of_b), (3, 2), "three of the delta, two of b's phase");
+    let rest = finish(&x, &y, &mut progress);
+    assert!(rest.iter().all(|page| records_bytes(page) <= budget));
+    assert_eq!(x.idempotency_records().unwrap(), 2 + 6 + 3);
+}
+
+/// A record larger than the budget goes alone, on a page that carries nothing
+/// else; a page with a delta leaves it to the next page, which takes it alone.
+#[test]
+fn a_record_larger_than_the_budget_goes_alone() {
+    let dir = tempfile::tempdir().unwrap();
+    let (y, x) = (open(&dir, "y"), open(&dir, "x"));
+    let (big, keys) = large_records(&y, "big", 3, 10_000);
+    let small = y.create_collection("shop", "small").unwrap();
+    let budget = one_record(&y, &big, &keys[0]) / 2;
+    y.set_record_delta_budget_for_test(Some((budget, crate::idempotency::RECORD_DELTA_ROWS)));
+    let mut progress = SnapshotProgress::of_collection(big.id);
+    let first = take(&x, &y, &mut progress);
+    assert_eq!(first.records.len(), 1, "alone, larger than the budget");
+    // A small keyed write in the scope: the next page's delta.
+    let on = Candidates::Keys(vec![crate::docs::doc_key(&DocId::Int64(2)).unwrap()]);
+    fresh(y.modify_where_keyed(&big, &on, &Inc, Some(1), &key(42)).unwrap());
+    let _ = small;
+    let second = take(&x, &y, &mut progress);
+    assert_eq!(second.records.len(), 1, "the delta's record only");
+    assert_eq!(second.records[0].scope, key(42).scope);
+    let third = take(&x, &y, &mut progress);
+    assert_eq!(third.records.len(), 1, "then the next of the phase, alone");
+    assert_ne!(third.records[0].scope, first.records[0].scope, "from where the phase stood");
+    finish(&x, &y, &mut progress);
+    assert_eq!(x.idempotency_records().unwrap(), 4);
+}
+
+/// At the real budget: records holding megabyte documents, more than a page's
+/// records budget of them, span pages, each within `RECORD_PAGE_BYTES`.
+#[test]
+fn megabyte_records_span_pages_within_the_real_budget() {
+    let dir = tempfile::tempdir().unwrap();
+    let (y, x) = (open(&dir, "y"), open(&dir, "x"));
+    let (_, _) = large_records(&y, "big", 36, 1024 * 1024);
+    let mut progress = SnapshotProgress::of_collection(y.get_collection("shop", "big").unwrap().id);
+    let pages = finish(&x, &y, &mut progress);
+    let budget = crate::idempotency::RECORD_PAGE_BYTES;
+    assert!(pages.iter().all(|page| records_bytes(page) <= budget), "within the budget");
+    assert!(pages[0].records.len() < 36 && pages[0].documents.is_empty(), "the phase spans pages");
+    assert_eq!(x.idempotency_records().unwrap(), 36);
 }
