@@ -1642,6 +1642,179 @@ fn pages_of_large_rows_stay_within_a_frame_at_the_real_budget() {
     assert_eq!(count(&m, &cm), 70);
 }
 
+// -- The build review's d3 and d4 (m5): pages within a frame at the real budget -------------
+
+/// The frame a page must fit: `SNAPSHOT_PAGE_BYTES` and the 1 MiB it leaves.
+const FRAME: usize = crate::SNAPSHOT_PAGE_BYTES + 1024 * 1024;
+
+/// Removes `pad`: the before image is large, the after image small.
+struct Shrink;
+
+impl ModifySpec for Shrink {
+    fn matches(&self, _: &Document) -> kimmy_core::Result<bool> {
+        Ok(true)
+    }
+    fn compare(&self, _: &Document, _: &Document) -> Ordering {
+        Ordering::Equal
+    }
+    fn apply(&self, doc: &Document) -> std::result::Result<Option<Document>, String> {
+        let mut next = doc.clone();
+        next.remove("pad");
+        next.insert("t", Bson::Int64(1));
+        Ok(Some(next))
+    }
+    fn upsert(&self) -> Option<std::result::Result<Document, String>> {
+        None
+    }
+}
+
+/// Sets `t` to a new value on every match.
+struct Touch;
+
+impl ModifySpec for Touch {
+    fn matches(&self, _: &Document) -> kimmy_core::Result<bool> {
+        Ok(true)
+    }
+    fn compare(&self, _: &Document, _: &Document) -> Ordering {
+        Ordering::Equal
+    }
+    fn apply(&self, doc: &Document) -> std::result::Result<Option<Document>, String> {
+        let mut next = doc.clone();
+        next.insert("t", Bson::Int64(doc.get_i64("t").unwrap_or(0) + 1));
+        Ok(Some(next))
+    }
+    fn upsert(&self) -> Option<std::result::Result<Document, String>> {
+        None
+    }
+}
+
+/// D3 (the review's m5, "separately confirmed"): a records phase of 512
+/// `find_and_modify` records, each holding a 140 KiB before image, was one page of
+/// 73,629,363 bytes, over a frame. It spans pages now, each within a frame, and
+/// every record arrives: a retry of any key replays.
+#[test]
+fn d3_a_records_phase_of_find_and_modify_records_stays_within_a_frame() {
+    let dir = tempfile::tempdir().unwrap();
+    let (y, x) = (open(&dir, "y"), open(&dir, "x"));
+    let cy = y.create_collection("shop", "big").unwrap();
+    let pad = "x".repeat(140 * 1024);
+    y.insert_many(&cy, (0..512i64).map(|i| doc! { "_id": i, "pad": pad.clone() }).collect())
+        .unwrap();
+    let image = crate::idempotency::ReturnedImage::Before;
+    for i in 0..512u64 {
+        let on = Candidates::Keys(vec![crate::docs::doc_key(&DocId::Int64(i as i64)).unwrap()]);
+        fresh(y.find_and_modify_keyed(&cy, &on, &Shrink, &key_of(i), image).unwrap());
+    }
+    let mut progress = SnapshotProgress::of_collection(cy.id);
+    let pages = finish(&x, &y, &mut progress);
+    for page in &pages {
+        let bytes = bson::serialize_to_vec(page).unwrap().len();
+        assert!(bytes <= FRAME, "a page of {bytes} bytes, over a frame of {FRAME}");
+    }
+    assert!(pages.iter().filter(|page| !page.records.is_empty()).count() > 1, "spans pages");
+    assert_eq!(x.idempotency_records().unwrap(), 512, "every record");
+    let cx = x.get_collection("shop", "big").unwrap();
+    let on = Candidates::Keys(vec![crate::docs::doc_key(&DocId::Int64(511)).unwrap()]);
+    let again = x.find_and_modify_keyed(&cx, &on, &Shrink, &key_of(511), image).unwrap();
+    assert!(matches!(again, Keyed::Replayed(_)), "a retry replays: {again:?}");
+}
+
+/// D4 (the review's m5): a page whose documents alone fit a frame (512 of 66 KiB,
+/// 33 MiB) and a delta of 32 `find_and_modify` records of 1,000 KiB documents that
+/// land between pages, 32 MiB, within the delta's old budget of its own, made a
+/// page of 67,478,180 bytes, and the pull stalled on it. The delta, the records
+/// phase and the documents share one budget now: that page stays within a frame,
+/// and the pull completes with every record.
+#[test]
+fn d4_a_whole_delta_and_a_page_of_documents_stay_within_a_frame() {
+    let dir = tempfile::tempdir().unwrap();
+    let (y, x) = (open(&dir, "y"), open(&dir, "x"));
+    let cy = y.create_collection("shop", "mid").unwrap();
+    let pad = "x".repeat(66 * 1024);
+    let docs = (1..=(2 * SNAPSHOT_PAGE as i64 + 10)).map(|i| doc! { "_id": i, "pad": pad.clone() });
+    y.insert_many(&cy, docs.collect()).unwrap();
+    // Big documents past the second page, for the find_and_modify records.
+    let big = "y".repeat(1000 * 1024);
+    let first_big = 10_000i64;
+    for i in 0..32i64 {
+        y.insert(&cy, doc! { "_id": first_big + i, "pad": big.clone() }).unwrap();
+    }
+    // Its log has begun, so the base names an epoch and the next page's delta
+    // answers it (a zero base would be refused at the first keyed write).
+    begun(&y);
+    let mut progress = SnapshotProgress::of_collection(cy.id);
+    take(&x, &y, &mut progress);
+    let image = crate::idempotency::ReturnedImage::After;
+    for i in 0..32u64 {
+        let id = DocId::Int64(first_big + i as i64);
+        let on = Candidates::Keys(vec![crate::docs::doc_key(&id).unwrap()]);
+        fresh(y.find_and_modify_keyed(&cy, &on, &Touch, &key_of(i), image).unwrap());
+    }
+    let second = y.snapshot_page(progress.after().cloned(), progress.scope()).unwrap();
+    let bytes = bson::serialize_to_vec(&second).unwrap().len();
+    assert!(bytes <= FRAME, "a page of {bytes} bytes, over a frame of {FRAME}");
+    assert!(!second.records.is_empty(), "premise: the delta rides it");
+    let applied = x.apply_snapshot_page(y.node_id(), &mut progress, &second).unwrap();
+    assert!(!applied.records_restarted, "premise: answered by the log");
+    for page in finish(&x, &y, &mut progress) {
+        let bytes = bson::serialize_to_vec(&page).unwrap().len();
+        assert!(bytes <= FRAME, "a page of {bytes} bytes, over a frame of {FRAME}");
+    }
+    assert_eq!(x.idempotency_records().unwrap(), 32, "every record");
+    let cx = x.get_collection("shop", "mid").unwrap();
+    assert_eq!(count(&x, &cx), count(&y, &cy), "every document, once");
+    let on = Candidates::Keys(vec![crate::docs::doc_key(&DocId::Int64(first_big + 31)).unwrap()]);
+    let again = x.find_and_modify_keyed(&cx, &on, &Touch, &key_of(31), image).unwrap();
+    assert!(matches!(again, Keyed::Replayed(_)), "a retry replays: {again:?}");
+}
+
+/// What a page's other parts cost (its definitions, drops, vector and epoch):
+/// the page encoded with no rows and no cursor, as `snapshot_page` measures it.
+fn fixed_bytes(page: &SnapshotPage) -> usize {
+    let bare = SnapshotPage {
+        documents: Vec::new(),
+        deleted_documents: Vec::new(),
+        records: Vec::new(),
+        next: None,
+        tombstone_horizon: None,
+        records_epoch: Some(0),
+        ..page.clone()
+    };
+    bson::serialize_to_vec(&bare).unwrap().len()
+}
+
+/// A page's other parts are counted against its budget with its rows: a
+/// whole-database snapshot of a sender holding sixty dropped collections, whose
+/// drops ride every page, keeps each page's drops and rows within the budget
+/// together, and every document arrives once.
+#[test]
+fn a_pages_definitions_and_drops_are_counted_against_its_budget() {
+    let dir = tempfile::tempdir().unwrap();
+    let (y, x) = (open(&dir, "y"), open(&dir, "x"));
+    for i in 0..60 {
+        let name = format!("gone{i}");
+        y.create_collection("shop", &name).unwrap();
+        assert!(y.drop_collection("shop", &name).unwrap());
+    }
+    let cy = y.create_collection("shop", "kept").unwrap();
+    let pad = "x".repeat(1024);
+    y.insert_many(&cy, (0..200i64).map(|i| doc! { "_id": i, "pad": pad.clone() }).collect())
+        .unwrap();
+    let budget = 24 * 1024;
+    y.set_snapshot_page_bytes_for_test(Some(budget));
+    let mut progress = SnapshotProgress::whole_database();
+    let pages = finish(&x, &y, &mut progress);
+    y.set_snapshot_page_bytes_for_test(None);
+    assert!(pages.len() > 2, "premise: paged by bytes");
+    for page in &pages {
+        let (fixed, rows) = (fixed_bytes(page), rows_bytes(page));
+        assert!(fixed > 2 * 1024, "premise: the drops ride every page: {fixed}");
+        assert!(fixed + rows <= budget, "{fixed} + {rows} over {budget}");
+    }
+    let cx = x.get_collection("shop", "kept").unwrap();
+    assert_eq!(count(&x, &cx), 200, "every document, once");
+}
+
 // -- The records of a collection dropped and not created again -----------------------------
 
 /// Two collection names whose ids put the first before the second in the walk.

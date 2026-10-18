@@ -1097,16 +1097,31 @@ impl Engine {
     }
 
     /// What a page's rows have of [`SNAPSHOT_PAGE_BYTES`] once its other parts,
-    /// `fixed` bytes of them, are counted; a test's own room when it set one.
+    /// `fixed` bytes of them, are counted; a test's own room when it set one, or
+    /// what a test's own page budget leaves them.
     fn snapshot_rows_room(&self, fixed: usize) -> usize {
         #[cfg(any(test, feature = "test-hooks"))]
         {
-            let set = self.snapshot_room_for_test.load(std::sync::atomic::Ordering::Relaxed);
+            use std::sync::atomic::Ordering::Relaxed;
+            let set = self.snapshot_room_for_test.load(Relaxed);
             if set != 0 {
                 return set;
             }
+            let page = self.snapshot_page_bytes_for_test.load(Relaxed);
+            if page != 0 {
+                return page.saturating_sub(fixed);
+            }
         }
         SNAPSHOT_PAGE_BYTES.saturating_sub(fixed)
+    }
+
+    /// Give every snapshot page a budget of `bytes` in place of
+    /// [`SNAPSHOT_PAGE_BYTES`], which its other parts are counted against as there,
+    /// for a test of that count without 63 MiB of rows; `None` for the real one.
+    #[cfg(any(test, feature = "test-hooks"))]
+    pub fn set_snapshot_page_bytes_for_test(&self, bytes: Option<usize>) {
+        let bytes = bytes.unwrap_or(0);
+        self.snapshot_page_bytes_for_test.store(bytes, std::sync::atomic::Ordering::Relaxed);
     }
 
     /// Give every snapshot page `bytes` for its rows, whatever its other parts

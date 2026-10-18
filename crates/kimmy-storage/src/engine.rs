@@ -156,6 +156,10 @@ pub struct Engine {
     /// 0 for the real one.
     #[cfg(any(test, feature = "test-hooks"))]
     pub(crate) snapshot_room_for_test: std::sync::atomic::AtomicUsize,
+    /// A test's budget for a whole snapshot page, its other parts counted against
+    /// it (`snapshot::SNAPSHOT_PAGE_BYTES`); 0 for the real one.
+    #[cfg(any(test, feature = "test-hooks"))]
+    pub(crate) snapshot_page_bytes_for_test: std::sync::atomic::AtomicUsize,
     /// How a commit becomes durable (ADR-088). `None` is the default class,
     /// `durable`: every commit fsyncs before it returns. `Some` is
     /// `coalesced`: commits skip their own fsync and wait at a shared barrier
@@ -1538,6 +1542,8 @@ impl Engine {
             ),
             #[cfg(any(test, feature = "test-hooks"))]
             snapshot_room_for_test: std::sync::atomic::AtomicUsize::new(0),
+            #[cfg(any(test, feature = "test-hooks"))]
+            snapshot_page_bytes_for_test: std::sync::atomic::AtomicUsize::new(0),
             coalescer: Mutex::new(None),
             coalesce_woken: Condvar::new(),
             #[cfg(test)]
