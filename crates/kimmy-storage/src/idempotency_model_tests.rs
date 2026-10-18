@@ -561,6 +561,9 @@ pub(crate) struct Outcome {
     pub drop_mid_request: usize,
     /// `$inc` requests with writes on both sides of a drop of `orders`, on any members.
     pub straddled: usize,
+    /// Calls whose own writes lie on both sides of a drop of `orders` (made anywhere):
+    /// a drop between two chunks of one application.
+    pub call_straddles: usize,
     /// Home-track runs whose exact I5 a drop of `orders` turned off.
     pub i5_off: usize,
     /// Finding D2: a retry after a drop of `orders` applied afresh, as the life rule
@@ -1728,6 +1731,16 @@ impl World {
             }
         }
         let shown = minted.iter().map(|e| self.stamp(e.stamp)).collect::<Vec<_>>().join(" ");
+        // One call's own writes on both sides of a drop of `orders` made anywhere.
+        if c == ORDERS
+            && self.ghost.drops.iter().any(|(dc, at)| {
+                *dc == ORDERS
+                    && minted.iter().any(|e| e.stamp.hlc <= at.hlc)
+                    && minted.iter().any(|e| e.stamp.hlc > at.hlc)
+            })
+        {
+            self.out.call_straddles += 1;
+        }
         if c == ORDERS && self.floor(m, c)? > p.floor {
             self.out.drop_mid_request += 1;
             self.note(format!(
@@ -3645,6 +3658,8 @@ struct Sweep {
     with_drop_mid_request: usize,
     /// Schedules with an `$inc` written on both sides of a drop of `orders`.
     with_straddle: usize,
+    /// Schedules with one call's writes on both sides of a drop of `orders`.
+    with_call_straddle: usize,
     i5_off: usize,
     d2: usize,
     kr: usize,
@@ -3687,6 +3702,7 @@ fn sweep(seeds: std::ops::Range<u64>, len: usize, threads: usize) -> Sweep {
                         t.i8_checks += out.i8_checks;
                         t.with_drop_mid_request += usize::from(out.drop_mid_request > 0);
                         t.with_straddle += usize::from(out.straddled > 0);
+                        t.with_call_straddle += usize::from(out.call_straddles > 0);
                         t.i5_off += out.i5_off;
                         t.d2 += out.d2;
                         t.kr += out.kr;
@@ -3718,7 +3734,8 @@ fn sweep(seeds: std::ops::Range<u64>, len: usize, threads: usize) -> Sweep {
         "idempotency model: seeds {seeds:?} x 2 tracks, len {len}: {} schedules, {} steps ({} \
          between commits), {} replays, {} resumes, {} crashes, {} life-rule applications, {} exempt by a drop elsewhere (D1), \
          {} relay, {} L1, {} S1; drops of orders: {} schedules with one during a call, {} \
-         with an `$inc` written on both sides of one, {} I8 checks, {} home runs without \
+         with an `$inc` written on both sides of one, {} with one call's writes on both \
+         sides, {} I8 checks, {} home runs without \
          exact I5, {} D2, {} D3, {} KR; in {:.1?}",
         totals.schedules,
         totals.steps,
@@ -3733,6 +3750,7 @@ fn sweep(seeds: std::ops::Range<u64>, len: usize, threads: usize) -> Sweep {
         totals.s1,
         totals.with_drop_mid_request,
         totals.with_straddle,
+        totals.with_call_straddle,
         totals.i8_checks,
         totals.i5_off,
         totals.d2,
