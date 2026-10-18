@@ -474,6 +474,7 @@ impl Engine {
             Some(budget),
             after.as_deref(),
             true,
+            None,
         ) {
             Ok(found) => found,
             Err(e) => {
@@ -736,13 +737,22 @@ impl Engine {
     }
 
     /// The lookahead of a keyed chunk that wrote and filled its budget (G8), in
-    /// that chunk's transaction: up to `budget` more matches past `last_key`.
-    /// [`Lookahead::Writable`] when one of them is a match the request could
-    /// write, stored below its merged `first` (every one, before a record
-    /// exists, since this chunk's entries are minted above every stored
-    /// stamp); [`Lookahead::End`] when the scan ends first, with how many
-    /// matches the stamp rule would leave; [`Lookahead::Unknown`] when the
-    /// budget runs out on such matches.
+    /// that chunk's transaction: matches past `last_key`, **stopping at the
+    /// first one the request could write** (stored below its merged `first`;
+    /// every one, before a record exists, since this chunk's entries are minted
+    /// above every stored stamp), and at most `budget` of them.
+    /// [`Lookahead::Writable`] when it finds one; [`Lookahead::End`] when the
+    /// scan ends first, with how many matches the stamp rule would leave;
+    /// [`Lookahead::Unknown`] when the budget runs out on such matches.
+    ///
+    /// **What it adds to the writer's hold.** A chunk's hold is bounded by its
+    /// match budget, `Some(budget)` to [`Self::collect_matches`] (ADR-086; the
+    /// rows a scan passes between matches are bounded by nothing but
+    /// `close_writes` at a stop, ADR-192, and `examined` only reports them).
+    /// The lookahead adds one match where the request goes on (the first match
+    /// past the chunk, when it is writable, which is the case unless another
+    /// writer rewrote the tail after the request began), and at most `budget`
+    /// matches over a tail the stamp rule leaves.
     ///
     /// **An end found here is final.** A document that arrives later, written
     /// here or anywhere, is stamped above the request's `first` (its stamp is
@@ -760,9 +770,18 @@ impl Engine {
         last_key: &[u8],
         first: Option<Stamp>,
     ) -> Result<Lookahead> {
-        let (ahead, _) =
-            self.collect_matches(txn, coll, candidates, spec, Some(budget), Some(last_key), false)?;
-        if ahead.iter().any(|found| first.is_none_or(|first| found.stamp < first)) {
+        let writable = |found: &Match| first.is_none_or(|first| found.stamp < first);
+        let (ahead, _) = self.collect_matches(
+            txn,
+            coll,
+            candidates,
+            spec,
+            Some(budget),
+            Some(last_key),
+            false,
+            Some(&writable),
+        )?;
+        if ahead.iter().any(writable) {
             return Ok(Lookahead::Writable);
         }
         Ok(if ahead.len() < budget {
@@ -1002,7 +1021,7 @@ impl Engine {
         // to `MAX_CANDIDATES` of them would otherwise be held twice over
         // under the writer.
         let (mut matches, _) =
-            self.collect_matches(txn, coll, candidates, spec, None, None, false)?;
+            self.collect_matches(txn, coll, candidates, spec, None, None, false, None)?;
 
         if matches.is_empty() {
             return Ok(None);
@@ -1050,6 +1069,7 @@ impl Engine {
         limit: Option<usize>,
         after: Option<&[u8]>,
         keep_bodies: bool,
+        stop_at: Option<&dyn Fn(&Match) -> bool>,
     ) -> Result<(Vec<Match>, u64)> {
         let mut matches: Vec<Match> = Vec::new();
         let mut examined = 0u64;
@@ -1071,6 +1091,9 @@ impl Engine {
                         "the filter matched more than {MAX_CANDIDATES} documents; \
                      narrow the filter, or add an index and a tighter one"
                     ))));
+                }
+                if stop_at.is_some_and(|stop| matches.last().is_some_and(stop)) {
+                    return Ok(false);
                 }
                 Ok(!limit.is_some_and(|n| matches.len() >= n))
             };
