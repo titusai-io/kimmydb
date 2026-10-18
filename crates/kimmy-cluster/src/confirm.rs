@@ -686,7 +686,17 @@ impl Confirmer {
             Ok(window) => window,
             Err(e) => return failed(crate::transport::from_storage(e, ProtocolError::Malformed)),
         };
-        if let Fits::Only(fits) = how_many_fit(&window.entries, &window.records) {
+        let fits = how_many_fit(&window.entries, &window.records, window.unanchored);
+        if let Fits::Nothing = fits {
+            return PushResult::NothingSent {
+                their_node,
+                unreached: Some(
+                    "the idempotency records this node cannot vouch for by its oplog do not fit                      one frame; anti-entropy will carry the change once this node pulls their                      entries"
+                        .into(),
+                ),
+            };
+        }
+        if let Fits::Only(fits) = fits {
             if fits == 0 {
                 return failed(ProtocolError::Malformed(format!(
                     "a single oplog entry at or after {from:?} exceeds the frame limit and \
@@ -762,7 +772,7 @@ impl Confirmer {
             scanned_to: window.scanned_to,
             exhausted: window.exhausted,
             versions: mine.clone(),
-            // The records of the entries it carries, read with the window (B5).
+            // The records the window ships, read with it (B5).
             records: crate::transport::records_to_send(engine, window.records),
         };
         if let Err(e) = write_frame(&mut stream, &push).await {

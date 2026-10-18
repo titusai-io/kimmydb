@@ -5201,3 +5201,154 @@ async fn lab_hook_a_fresh_keyed_multi_update_skips_what_others_wrote_between_its
     .await;
     assert_eq!(n_of(&client, &b, &t[1], 1).await, Some(1), "not applied again");
 }
+
+/// T2 of finding G1 over real processes: a keyed request's effect reaches a member
+/// under another origin, from a relay that cannot vouch for the request's own
+/// stamp, while the request's origin and the member that wrote on top of it are
+/// down. M dials only X throughout (`KIMMY_TEST_REFUSE_DIAL` names Y and Z). Y's
+/// keyed `$inc` reaches Z; X, cut off from both, writes the document later; Z
+/// writes on top of the `$inc`. X then pulls Z: the `$inc` loses to X's write
+/// (stored, not appended, so X's vector stays below it) and Z's version wins.
+/// With Y and Z down, M takes Z's version from X, which holds the `$inc`; the
+/// record comes with it, as one X cannot vouch for by its oplog, and a retry on M
+/// is answered from it.
+#[tokio::test]
+#[ignore = "boots a real four-node cluster; run with --ignored"]
+async fn t2_a_cross_origin_relay_carries_the_record_while_its_origin_is_down() {
+    const PATH: &str = "/v1/db/shop/coll/orders/update";
+    const BODY: &str = r#"{"filter":{"_id":1},"update":{"$inc":{"n":1}}}"#;
+    const KEY: &str = "t2-a-cross-origin-relay-while-y-and-z-are-down";
+    let client = reqwest::Client::new();
+    let (py, pz, px, pm) = (ports::choose(), ports::choose(), ports::choose(), ports::choose());
+    let y = Node::spawn_configured("node-y", py, &[pz], "", 1, KEYED);
+    let z = Node::spawn_configured("node-z", pz, &[py], "", 1, KEYED);
+    let x = Node::spawn_configured("node-x", px, &[py], "", 1, KEYED);
+    let mut m = Node::spawn_configured("node-m", pm, &[py], "", 1, KEYED);
+    for node in [&y, &z, &x, &m] {
+        node.wait_ready(&client).await;
+    }
+    let refused = format!("127.0.0.1:{py},127.0.0.1:{pz}");
+    m.restart_with(&[("KIMMY_TEST_REFUSE_DIAL", refused.as_str())]);
+    m.wait_ready(&client).await;
+    eventually("gossip to form", || all_report(&client, vec![&y, &z, &x, &m], 3)).await;
+    let t = [
+        y.login(&client).await,
+        z.login(&client).await,
+        x.login(&client).await,
+        m.login(&client).await,
+    ];
+    let created = client
+        .post(y.url("/v1/db/shop/collections"))
+        .bearer_auth(&t[0])
+        .json(&serde_json::json!({ "name": "orders" }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(created.status(), 200);
+    let seeded = client
+        .post(y.url("/v1/db/shop/coll/orders/docs"))
+        .bearer_auth(&t[0])
+        .json(&serde_json::json!({ "_id": 1, "n": 10 }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(seeded.status(), 200);
+    for (node, token) in [(&y, &t[0]), (&z, &t[1]), (&x, &t[2]), (&m, &t[3])] {
+        eventually("every member to hold the document and take keys", || async {
+            n_of(&client, node, token, 1).await == Some(10) && takes_keys(&client, node).await
+        })
+        .await;
+    }
+    let put = |node: &Node, token: &str, body: serde_json::Value| {
+        let request = client
+            .put(node.url("/v1/db/shop/coll/orders/docs/1"))
+            .bearer_auth(token.to_string())
+            .json(&body);
+        async move { request.send().await.unwrap().status() }
+    };
+
+    // Y's keyed `$inc` reaches Z, and not X (stopped) nor M (which dials only X).
+    // Y takes a key again once it no longer counts X (its block goes stale, then
+    // SWIM declares it down).
+    x.signal("STOP");
+    eventually("Y to take keys with X down", || takes_keys(&client, &y)).await;
+    let first = keyed_send(&client, &y, &t[0], reqwest::Method::POST, PATH, BODY, KEY).await;
+    assert_eq!((first.status, first.replayed), (200, false), "{}", first.text);
+    eventually("Z to take the $inc", || async { n_of(&client, &z, &t[1], 1).await == Some(11) })
+        .await;
+    assert_eq!(n_of(&client, &m, &t[3], 1).await, Some(10), "premise: M has not");
+    // X, cut off from Y and Z, writes the document after the `$inc`.
+    y.signal("STOP");
+    z.signal("STOP");
+    x.signal("CONT");
+    assert_eq!(put(&x, &t[2], serde_json::json!({ "n": 100 })).await, 200);
+    // Z writes on top of the `$inc`, later still.
+    x.signal("STOP");
+    z.signal("CONT");
+    assert_eq!(put(&z, &t[1], serde_json::json!({ "n": 11, "tag": "z" })).await, 200);
+    // X pulls Z: the `$inc` loses to X's write, and Z's version wins.
+    x.signal("CONT");
+    eventually("Z's version on X", || async { n_of(&client, &x, &t[2], 1).await == Some(11) })
+        .await;
+    // Y and Z down: M takes Z's version from X, the one member it dials.
+    z.signal("STOP");
+    eventually("M to take Z's version from X", || async {
+        n_of(&client, &m, &t[3], 1).await == Some(11)
+    })
+    .await;
+    eventually("M to take keys with Y and Z down", || takes_keys(&client, &m)).await;
+    let retry = keyed_send(&client, &m, &t[3], reqwest::Method::POST, PATH, BODY, KEY).await;
+    assert_eq!(retry.status, 200, "{}", retry.text);
+    assert!(retry.replayed, "answered from the record X relayed: {retry:?}");
+    assert_eq!(n_of(&client, &m, &t[3], 1).await, Some(11), "applied once");
+    y.signal("CONT");
+    z.signal("CONT");
+}
+
+/// G8 over real processes: a keyed multi-chunk update on an idle cluster writes
+/// `done` with its last chunk's entry (the chunk's lookahead finds the end), so
+/// every member that has caught up answers a retry from the record, as a replay
+/// and not a resume. Nothing is written after the request.
+#[tokio::test]
+#[ignore = "boots a real three-node cluster; run with --ignored"]
+async fn a_finished_multi_chunk_keyed_update_replays_on_every_caught_up_member() {
+    const PATH: &str = "/v1/db/shop/coll/orders/update";
+    const BODY: &str = r#"{"filter":{},"update":{"$inc":{"n":1}},"multi":true}"#;
+    const KEY: &str = "g8-a-finished-multi-chunk-request";
+    let client = reqwest::Client::new();
+    let docs: Vec<serde_json::Value> =
+        (1..=3).map(|i| serde_json::json!({ "_id": i, "n": 0 })).collect();
+    let (a, b, c, t) =
+        keyed_cluster(&client, "multi_chunk_docs = 1", serde_json::json!(docs)).await;
+    let first = keyed_send(&client, &a, &t[0], reqwest::Method::POST, PATH, BODY, KEY).await;
+    assert_eq!((first.status, first.replayed), (200, false), "{}", first.text);
+    assert_eq!(first.body["commits"], 3, "premise: three chunks: {}", first.text);
+    for (node, token) in [(&a, &t[0]), (&b, &t[1]), (&c, &t[2])] {
+        eventually("every member to hold the three increments", || async {
+            let mut all = true;
+            for id in 1..=3 {
+                all &= n_of(&client, node, token, id).await == Some(1);
+            }
+            all
+        })
+        .await;
+    }
+    for (node, token) in [(&b, &t[1]), (&c, &t[2]), (&a, &t[0])] {
+        eventually("a retry answered from the finished record", || async {
+            let retry =
+                keyed_send(&client, node, token, reqwest::Method::POST, PATH, BODY, KEY).await;
+            assert_eq!(retry.status, 200, "{}: {}", node.name, retry.text);
+            assert!(retry.body.get("resumed").is_none(), "{}: resumed: {}", node.name, retry.text);
+            retry.replayed && retry.text == first.text
+        })
+        .await;
+        for id in 1..=3 {
+            assert_eq!(
+                n_of(&client, node, token, id).await,
+                Some(1),
+                "{}: applied once",
+                node.name
+            );
+        }
+    }
+}

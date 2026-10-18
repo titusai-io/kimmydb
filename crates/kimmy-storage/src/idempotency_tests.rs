@@ -82,7 +82,7 @@ fn rows(engine: &Engine) -> Vec<(Stamp, u64, [u8; 32])> {
         .unwrap()
         .map(|row| {
             let (key, value) = row.unwrap();
-            let stamp = crate::codec::decode_oplog_key(key.value()).unwrap();
+            let stamp = idempotency::decode_row_key(key.value()).unwrap();
             let value = value.value();
             let id = u64::from_be_bytes(value[..8].try_into().unwrap());
             (stamp, id, value[8..].try_into().unwrap())
@@ -796,10 +796,10 @@ fn a_record_is_judged_by_its_last() {
     assert_eq!(ns(&engine, &again, 2), vec![0, 0], "nothing written again");
 }
 
-/// A record's `last` is the stamp of the first entry its transaction wrote,
-/// for a chunk of several documents as for a bulk: where a sender looks for it.
+/// A record of a chunk of several documents runs from the first entry its
+/// transaction wrote to the last (L1), with a row at each, as for a bulk.
 #[test]
-fn a_chunks_record_is_at_its_first_entry() {
+fn a_chunks_record_runs_from_its_first_entry_to_its_last() {
     let (engine, coll, _dir, _path) = open();
     counters(&engine, &coll, 3);
     engine.set_multi_chunk_docs(10);
@@ -815,8 +815,11 @@ fn a_chunks_record_is_at_its_first_entry() {
         .collect();
     assert_eq!(written.len(), 3);
     let stored = record(&engine, &coll, &k).unwrap();
-    assert_eq!((stored.first, stored.last), (written[0], written[0]));
-    assert_eq!(rows(&engine).iter().map(|(s, ..)| *s).collect::<Vec<_>>(), vec![written[0]]);
+    assert_eq!((stored.first, stored.last), (written[0], written[2]));
+    assert_eq!(
+        rows(&engine).iter().map(|(s, ..)| *s).collect::<Vec<_>>(),
+        vec![written[0], written[2]]
+    );
     // A chunk that found fewer than its budget ends the request: done, in its
     // own commit, and a retry replays it rather than resuming it.
     assert_eq!(stored.state, RecordState::Done);
@@ -1017,7 +1020,7 @@ fn a_multi_chunk_record_follows_its_chunks() {
     let m = modify(&stored);
     assert_eq!((m.matched, m.modified, m.commits, m.skipped), (3, 3, 3, 0));
     assert_eq!(m.cursor, Some(crate::docs::doc_key(&DocId::Int64(2)).unwrap()));
-    assert_eq!(rows(&engine).len(), 3, "one row per chunk's first entry");
+    assert_eq!(rows(&engine).len(), 3, "one row per chunk's entry");
     assert!(stored.first < stored.last);
     let again =
         replayed(engine.modify_where_keyed(&coll, &Candidates::Scan, &Inc, None, &k).unwrap());
@@ -1025,11 +1028,12 @@ fn a_multi_chunk_record_follows_its_chunks() {
     assert_eq!(ns(&engine, &coll, 3), vec![1, 1, 1]);
 }
 
-/// An end found by a chunk that writes nothing, after an earlier chunk
-/// committed, is one record-only commit marking the record `done`, at the
-/// record's own `last`.
+/// The end of a keyed request past a full chunk is found by that chunk's
+/// lookahead (G8), which writes `done` in the chunk's own record: no
+/// record-only commit follows, and the record's `last` is the chunk's last
+/// entry.
 #[test]
-fn an_end_found_by_a_chunk_that_writes_nothing_marks_the_record_done() {
+fn the_end_past_a_full_chunk_is_found_by_its_lookahead_and_written_with_it() {
     let (engine, coll, _dir, _path) = open();
     counters(&engine, &coll, 2);
     // Two chunks of one, both full, then a third that finds nothing.
@@ -1037,11 +1041,95 @@ fn an_end_found_by_a_chunk_that_writes_nothing_marks_the_record_done() {
     let commits = engine.commits();
     let out = fresh(engine.modify_where_keyed(&coll, &Candidates::Scan, &Inc, None, &k).unwrap());
     assert_eq!(out.commits, 2, "two chunks wrote");
-    assert_eq!(engine.commits(), commits + 3, "and one more commit marked the record done");
+    assert_eq!(engine.commits(), commits + 2, "and no commit of the record alone");
     let stored = record(&engine, &coll, &k).unwrap();
     assert_eq!(stored.state, RecordState::Done);
     assert_eq!(modify(&stored).commits, 2);
-    assert_eq!(rows(&engine).iter().map(|(s, ..)| *s).max(), Some(stored.last), "no new row");
+    let last_entry = engine
+        .read_oplog_from(Hlc::ZERO, 100, WalkScope::Request)
+        .unwrap()
+        .iter()
+        .map(|e| e.stamp)
+        .max()
+        .unwrap();
+    assert_eq!(stored.last, last_entry, "`done` with the last chunk's entry");
+}
+
+/// L1. A record's `last` is the stamp of the last entry its commit wrote. A drop
+/// from another member at the HLC of a keyed update's first entry (a tie goes to
+/// the drop) takes that entry's document with the earlier life, and leaves the
+/// later entry's document standing in the life the drop re-dates; the record,
+/// judged by its `last`, stands too, so a retry is answered from it and does
+/// not increment the standing document a second time.
+#[test]
+fn l1_a_drop_at_a_commits_first_entry_leaves_the_record_of_its_later_entry_standing() {
+    let (engine, coll, _dir, _path) = open();
+    engine
+        .insert_many(&coll, vec![doc! { "_id": 1i64, "n": 0i64 }, doc! { "_id": 2i64, "n": 0i64 }])
+        .unwrap();
+    let k = keyed(90);
+    let out = fresh(engine.modify_where_keyed(&coll, &Candidates::Scan, &Inc, None, &k).unwrap());
+    assert_eq!((out.modified, out.commits), (2, 1), "premise: one commit wrote both");
+    let stored = record(&engine, &coll, &k).unwrap();
+    let mut written: Vec<Stamp> = engine
+        .read_oplog_from(Hlc::ZERO, 100, WalkScope::Request)
+        .unwrap()
+        .iter()
+        .filter(|e| e.kind == kimmy_core::OpKind::Replace)
+        .map(|e| e.stamp)
+        .collect();
+    written.sort();
+    let (first, last) = (written[0], written[written.len() - 1]);
+    assert!(first < last, "premise: two entries");
+    assert_eq!((stored.first, stored.last), (first, last), "`last` is the last entry's");
+    let drop = crate::engine::ddl_entry(
+        Stamp::new(first.hlc, NodeId::from_bytes([0xD1; 16])),
+        kimmy_core::OpKind::DropCollection,
+        coll.id,
+        &kimmy_core::CollectionRef::new("shop", "orders"),
+    )
+    .unwrap();
+    engine.apply_batch(std::slice::from_ref(&drop)).unwrap();
+    let life = engine.get_collection("shop", "orders").expect("the later entry's life stands");
+    let doc = |id: i64| engine.get(&life, &DocId::Int64(id)).unwrap();
+    assert!(doc(1).is_none(), "premise: the drop took the first entry's document");
+    assert_eq!(doc(2).unwrap().get_i64("n").unwrap(), 1, "premise: the later entry stands");
+    let again =
+        replayed(engine.modify_where_keyed(&life, &Candidates::Scan, &Inc, None, &k).unwrap());
+    assert_eq!(again.last, last);
+    assert_eq!(doc(2).unwrap().get_i64("n").unwrap(), 1, "applied once");
+}
+
+/// L1 for a keyed bulk insert: the record runs from its first entry to its last.
+#[test]
+fn l1_a_bulk_inserts_record_runs_from_its_first_entry_to_its_last() {
+    let (engine, coll, _dir, _path) = open();
+    let k = keyed(91);
+    let ids = fresh(
+        engine
+            .insert_many_keyed(&coll, vec![doc! { "v": 1 }, doc! { "v": 2 }, doc! { "v": 3 }], &k)
+            .unwrap(),
+    );
+    let stored = record(&engine, &coll, &k).unwrap();
+    let stamps: Vec<Stamp> = ids.iter().map(|(_, stamp)| *stamp).collect();
+    assert_eq!((stored.first, stored.last), (stamps[0], stamps[2]));
+    let at: Vec<Stamp> = rows(&engine).iter().map(|(s, ..)| *s).collect();
+    assert!(at.contains(&stamps[0]) && at.contains(&stamps[2]), "rows at both: {at:?}");
+}
+
+/// The lookahead never ends a request that has a match it could still write:
+/// two-document chunks over three documents, the first chunk's lookahead finds
+/// the third, the request goes on and writes it, and `done` comes with it.
+#[test]
+fn the_lookahead_does_not_end_a_request_with_a_match_it_could_write() {
+    let (engine, coll, _dir, _path) = open();
+    counters(&engine, &coll, 3);
+    engine.set_multi_chunk_docs(2);
+    let k = keyed(93);
+    let out = fresh(engine.modify_where_keyed(&coll, &Candidates::Scan, &Inc, None, &k).unwrap());
+    assert_eq!((out.modified, out.skipped, out.commits), (3, 0, 2), "{out:?}");
+    assert_eq!(ns(&engine, &coll, 3), vec![1, 1, 1], "every match written");
+    assert_eq!(record(&engine, &coll, &k).unwrap().state, RecordState::Done);
 }
 
 /// F4. A three-chunk `$inc` that fails at chunk two's commit: after the reopen
@@ -1393,10 +1481,12 @@ fn f7_retention_collects_a_record_one_window_after_its_last() {
     let first_row = rows(&engine).iter().map(|(s, ..)| *s).min().unwrap();
     assert!(stored.last.hlc.wall_ms >= first_row.hlc.wall_ms + 10_000, "premise");
     let between = first_row.hlc.wall_ms + DAY_MS + 1;
+    let held_rows = rows(&engine);
     let pass = engine.collect_garbage_at(between, policy).unwrap();
     assert_eq!(pass.records_removed, 0, "a later chunk changed it");
     assert_eq!(record(&engine, &coll, &k2), Some(stored.clone()));
-    assert!(rows(&engine).iter().all(|(s, ..)| *s > first_row), "only the row went");
+    assert_eq!(stored.first, first_row, "premise: the expired row is the record's first");
+    assert_eq!(rows(&engine), held_rows, "a live record's row at `first` stays (F1)");
     let pass = engine.collect_garbage_at(stored.last.hlc.wall_ms + DAY_MS + 1, policy).unwrap();
     assert_eq!(pass.records_removed, 1);
 
@@ -1501,7 +1591,8 @@ fn a_stop_ends_the_records_step_between_chunks() {
         txn.commit().unwrap();
     }
     let cutoff = Hlc::new(1_000_000_000, 0);
-    engine.stop_walks_after_rows(idempotency::RECORD_COLLECT_CHUNK as u64 + 1);
+    // A chunk's rows, and the one seek that finds the origin they belong to.
+    engine.stop_walks_after_rows(idempotency::RECORD_COLLECT_CHUNK as u64 + 2);
     let stopped = engine.collect_idempotency_records(cutoff);
     assert!(matches!(stopped, Err(StorageError::Stopping(_))), "{stopped:?}");
     assert_eq!(engine.idempotency_records().unwrap(), 500, "the first chunk stands");
@@ -1533,7 +1624,7 @@ fn a_record_whose_row_at_last_is_missing_is_still_collected() {
             .unwrap();
         txn.open_table(tables::IDEMPOTENCY_BY_STAMP)
             .unwrap()
-            .remove(crate::codec::oplog_key(&r.last).as_slice())
+            .remove(idempotency::row_key(&r.last).as_slice())
             .unwrap();
         txn.commit().unwrap();
     }
@@ -1699,40 +1790,40 @@ fn a_backup_carries_the_records() {
 
 // -- For replication ------------------------------------------------------------------------
 
-/// What a sender reads: the record at an entry's stamp, by point reads or one
-/// range over a window, and a collection's records page by page.
+/// What a sender reads: the records whose rows lie inside the coverage a window
+/// grants (F2), the ones whose rows its servable vector does not reach (F3)
+/// leading, one per key; and a collection's records page by page.
 #[test]
-fn a_sender_finds_the_records_of_the_entries_it_ships() {
+fn a_sender_finds_the_records_of_the_coverage_it_grants() {
     use redb::ReadableDatabase;
     let (engine, coll, _dir, _path) = open();
-    counters(&engine, &coll, 3);
     let k = keyed(64);
-    fresh(engine.modify_where_keyed(&coll, &Candidates::Scan, &Inc, None, &k).unwrap());
-    let entries: Vec<Stamp> = engine
-        .read_oplog_from(Hlc::ZERO, 100, WalkScope::Request)
-        .unwrap()
-        .iter()
-        .map(|e| e.stamp)
-        .collect();
+    let (_, at) = fresh(engine.insert_keyed(&coll, doc! { "v": 1 }, &k).unwrap());
     let stored = record(&engine, &coll, &k).unwrap();
+    let me = engine.node_id();
+    let servable = engine.version_vector().unwrap();
     let txn = engine.db().begin_read().unwrap();
-    let at = idempotency::records_at_stamps(&txn, &entries).unwrap();
-    assert_eq!(at.len(), 3, "one per chunk's first entry");
-    for carried in &at {
-        assert_eq!((carried.collection, carried.scope), (coll.id, k.scope));
-        assert_eq!(IdempotencyRecord::decode(&carried.record).unwrap(), Some(stored.clone()));
-    }
-    // A frame that ships the second and third chunks' entries and not the
-    // first's: the range covers all three rows, the frame carries two.
-    let firsts: Vec<Stamp> = at.iter().filter_map(|c| c.carrying).collect();
-    let shipped: std::collections::HashSet<Stamp> =
-        entries.iter().copied().filter(|s| *s > firsts[0]).collect();
-    let window =
-        idempotency::records_for_window(&txn, entries[0], *entries.last().unwrap(), &|s| {
-            shipped.contains(s)
-        })
-        .unwrap();
-    assert_eq!(window.iter().filter_map(|c| c.carrying).collect::<Vec<_>>(), firsts[1..].to_vec());
+    let nothing = |_: NodeId| Hlc::ZERO;
+    // The whole history granted: the record, once, at its row.
+    let (all, unanchored) =
+        idempotency::records_for_coverage(&txn, &nothing, &servable, &servable).unwrap();
+    assert_eq!((all.len(), unanchored), (1, 0));
+    assert_eq!((all[0].collection, all[0].scope, all[0].carrying), (coll.id, k.scope, Some(at)));
+    assert_eq!(IdempotencyRecord::decode(&all[0].record).unwrap(), Some(stored.clone()));
+    // A requester that holds the write already: nothing.
+    let held = |_: NodeId| at.hlc;
+    let (none, _) = idempotency::records_for_coverage(&txn, &held, &servable, &servable).unwrap();
+    assert!(none.is_empty(), "{none:?}");
+    // A window that grants coverage only up to before the write: nothing.
+    let mut short = kimmy_core::VersionVector::new();
+    short.insert(me, at.hlc.predecessor());
+    let (none, _) = idempotency::records_for_coverage(&txn, &nothing, &short, &servable).unwrap();
+    assert!(none.is_empty(), "{none:?}");
+    // A servable vector below the record's row: shipped whatever the window
+    // grants, as one this node cannot vouch for, ahead of the rest.
+    let (f3, unanchored) =
+        idempotency::records_for_coverage(&txn, &nothing, &short, &short).unwrap();
+    assert_eq!((f3.len(), unanchored), (1, 1));
 
     drop(txn);
     let other = engine.create_collection("shop", "items").unwrap();

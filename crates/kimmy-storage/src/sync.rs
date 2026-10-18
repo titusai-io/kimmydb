@@ -609,6 +609,28 @@ pub fn coverage_up_to(theirs: &VersionVector, end: WindowEnd) -> VersionVector {
     }
 }
 
+/// The coverage a window grants its requester, judged from `servable` (the
+/// sender's own vector, read with the window) by the end the receiver will read
+/// in it: the whole tail for an exhausted window, else through its last entry
+/// or where its scan reached, and through `passed_through` as well when it has
+/// one (the receiver believes that only when it asked for a partial window, so
+/// both readings are covered). What the coverage rule's F2 ships records up to.
+pub fn window_reach(servable: &VersionVector, window: &crate::OplogWindow) -> VersionVector {
+    if window.exhausted {
+        return coverage_up_to(servable, WindowEnd::Exhausted);
+    }
+    let plain = match window.entries.last() {
+        Some(last) if last.stamp.hlc <= window.scanned_to => WindowEnd::Through(last.stamp),
+        Some(last) => WindowEnd::Through(Stamp::new(window.scanned_to, last.stamp.node)),
+        None => WindowEnd::Before(Stamp::new(Hlc::ZERO, NodeId::from_bytes([0; 16]))),
+    };
+    let mut reach = coverage_up_to(servable, plain);
+    if let Some(through) = window.passed_through {
+        reach.merge(&coverage_up_to(servable, WindowEnd::Through(through)));
+    }
+    reach
+}
+
 /// A span of one origin's history a requester holds as state at or below its
 /// own position, which it asks a peer to serve anyway (ADR-172): every entry of
 /// `origin` from `from` through `through`, both inclusive.
@@ -783,14 +805,16 @@ impl Engine {
     /// in the frame**, applied or superseded: on both outcomes of the merge,
     /// since a lost write is still a write that happened, and a retry here must
     /// be answered from its record rather than applied after the version that
-    /// beat it; and on any entry of the collection, not only the one that
-    /// carries it, since a drop in the same millisecond can judge the carrying
-    /// entry history and let the later ones apply. Through
-    /// [`Self::store_record`] (history refused, merged, rows at the merged `last`
-    /// and the carrying stamp, its stamps witnessed), in that run's
-    /// transaction. **Not stored when no entry of its collection is taken**:
-    /// deferred above the advertised vector, or left at the batch's stop; it
-    /// comes again with the entries. A record this build cannot decode is
+    /// beat it. **Every other record the frame carries is stored in the batch's
+    /// last transaction, the one that raises the witnessed vector**, whether or
+    /// not an entry of its collection was taken and whether or not the
+    /// collection stands here: the sender ships a record because the coverage
+    /// this window grants passes a stamp that vouches for it, or because it
+    /// cannot vouch for that stamp by its oplog (B5, records travel with
+    /// coverage), and a covered stamp is never served here again. Through
+    /// [`Self::store_record`] (history refused, merged, rows at the merged
+    /// `first` and `last` and the sender's row, its stamps witnessed, nothing
+    /// written for a record held already). A record this build cannot decode is
     /// dropped and counted, and its entries are applied all the same.
     #[allow(clippy::too_many_arguments)]
     pub fn apply_peer_window_carrying_into(
@@ -1071,13 +1095,11 @@ impl Engine {
             match tried? {
                 Ok(mut window) => {
                     record(WalkPath::Keys);
-                    // The records of the entries it ships, in the window's own
-                    // transaction: point reads, since the key walk passed over
-                    // what the requester holds and a range would read past it.
-                    let shipped: Vec<Stamp> = window.entries.iter().map(|e| e.stamp).collect();
+                    // The records the window ships, in its own transaction.
                     #[cfg(test)]
                     race_hooks::reach(race_hooks::Race::WindowRecords);
-                    window.records = crate::idempotency::records_at_stamps(&txn, &shipped)?;
+                    (window.records, window.unanchored) =
+                        self.records_with_coverage(&txn, held, start, &window)?;
                     return Ok(window);
                 }
                 Err(why) => {
@@ -1096,19 +1118,11 @@ impl Engine {
         }
         let mut window =
             self.read_oplog_linear_in(&txn, start, limit, scope, skip, keep, budget)?;
-        // The records of the entries it ships, in the window's own transaction:
-        // one range read of the rows between its first and last entry, keeping
-        // only the stamps it ships (B5).
-        if let (Some(first), Some(last)) = (window.entries.first(), window.entries.last()) {
-            let shipped: std::collections::HashSet<Stamp> =
-                window.entries.iter().map(|e| e.stamp).collect();
-            #[cfg(test)]
-            race_hooks::reach(race_hooks::Race::WindowRecords);
-            window.records =
-                crate::idempotency::records_for_window(&txn, first.stamp, last.stamp, &|stamp| {
-                    shipped.contains(stamp)
-                })?;
-        }
+        // The records the window ships, in its own transaction (B5).
+        #[cfg(test)]
+        race_hooks::reach(race_hooks::Race::WindowRecords);
+        (window.records, window.unanchored) =
+            self.records_with_coverage(&txn, held, start, &window)?;
         record(path);
         // Said only once the linear walk has served the window: when it failed
         // as well (a body that cannot be decoded), no window was served and
@@ -1135,6 +1149,34 @@ impl Engine {
             );
         }
         Ok(window)
+    }
+
+    /// The idempotency records a window ships, in the window's own read
+    /// transaction (B5, records travel with coverage): this node's servable
+    /// vector read there, the coverage the window grants the requester from it
+    /// ([`window_reach`]), and [`crate::idempotency::records_for_coverage`] over
+    /// what the requester holds. A request that names nothing it holds (a
+    /// repair's re-serve below its position) is treated as holding everything
+    /// below the walk's start: every row from `start` to the window's end, and
+    /// every row this node cannot vouch for from `start` on.
+    ///
+    /// **Why the servable vector read here and not the requester's view of it.**
+    /// The requester was told this node's vector before this window was read,
+    /// and vectors only rise, so the coverage the receiver will grant itself
+    /// (`coverage_up_to(theirs, end)`) is within this reach, whatever was
+    /// appended in between.
+    fn records_with_coverage(
+        &self,
+        txn: &redb::ReadTransaction,
+        held: Option<&VersionVector>,
+        start: Hlc,
+        window: &OplogWindow,
+    ) -> Result<(Vec<crate::idempotency::CarriedRecord>, usize)> {
+        let servable = Engine::read_versions_in(txn, crate::tables::OPLOG_VERSIONS)?;
+        let reach = window_reach(&servable, window);
+        let below_start = start.predecessor();
+        let floor = |node: NodeId| held.map_or(below_start, |held| held.get(node));
+        crate::idempotency::records_for_coverage(txn, &floor, &reach, &servable)
     }
 
     /// The spans of each origin's history this node holds as state at or below
@@ -1472,6 +1514,26 @@ impl Engine {
                 },
             };
             witnessed.merge(&coverage_up_to(theirs, end));
+        }
+
+        // Every record the frame carries that no run stored, in the transaction
+        // that raises this node's coverage, whether or not an entry of its
+        // collection was taken (B5, records travel with coverage): a stamp this
+        // window covers is never served here again, so a record vouched for at
+        // one is stored now or never. A frame of records held already writes
+        // nothing, and costs no commit where nothing else is written.
+        if frame.owes_any() {
+            let opened = run.txn.is_some();
+            let txn = self.run_txn(run)?;
+            let wrote = self.store_owed_records(txn, &mut memo, frame)?;
+            run.records += wrote;
+            if wrote == 0
+                && !opened
+                && witnessed.is_empty()
+                && let Some(txn) = run.txn.take()
+            {
+                txn.abort()?;
+            }
         }
 
         // The witnessed vector rides in the last run's transaction. A batch
@@ -8931,6 +8993,7 @@ mod tests {
     /// `window` cut after its first `n` entries, as a pull truncated there.
     fn first(window: &OplogWindow, n: usize) -> OplogWindow {
         OplogWindow {
+            unanchored: 0,
             entries: window.entries[..n].to_vec(),
             scanned_to: window.entries[n - 1].stamp.hlc,
             exhausted: false,
@@ -9051,6 +9114,7 @@ mod tests {
         let kinds: Vec<OpKind> = whole.entries.iter().map(|e| e.kind).collect();
         assert_eq!(kinds, [OpKind::CreateCollection, OpKind::DropCollection]);
         let through_create = OplogWindow {
+            unanchored: 0,
             entries: whole.entries[..1].to_vec(),
             scanned_to: whole.entries[0].stamp.hlc,
             exhausted: false,
@@ -9182,6 +9246,7 @@ mod tests {
         // The same window cut after the drop, as a pull truncated there would
         // carry it.
         let through_drop = OplogWindow {
+            unanchored: 0,
             entries: whole.entries[..2].to_vec(),
             scanned_to: whole.entries[1].stamp.hlc,
             exhausted: false,
@@ -9225,6 +9290,7 @@ mod tests {
     /// `window` cut to its entries `from..to`, as a window serving only them.
     fn slice(window: &OplogWindow, from: usize, to: usize) -> OplogWindow {
         OplogWindow {
+            unanchored: 0,
             entries: window.entries[from..to].to_vec(),
             scanned_to: window.entries[to - 1].stamp.hlc,
             exhausted: to == window.entries.len() && window.exhausted,
@@ -9328,6 +9394,7 @@ mod tests {
         // Everything from the drop on, the recreation included, without the
         // shadow's own entries.
         let after = OplogWindow {
+            unanchored: 0,
             entries: whole.entries[drop..]
                 .iter()
                 .filter(|e| e.collection == second.id)
@@ -9481,6 +9548,7 @@ mod tests {
         );
         apply(&b, &theirs, &slice(&whole, create, create + 1)).unwrap();
         let after = OplogWindow {
+            unanchored: 0,
             entries: vec![whole.entries[index].clone(), whole.entries[drop].clone()],
             scanned_to: whole.scanned_to,
             exhausted: whole.exhausted,
@@ -9530,6 +9598,7 @@ mod tests {
         let drop = of(first.id, OpKind::DropCollection)[0];
         // B holds the first life with vectors on.
         let held = OplogWindow {
+            unanchored: 0,
             entries: vec![whole.entries[creates[0]].clone(), whole.entries[configure1].clone()],
             scanned_to: whole.entries[configure1].stamp.hlc,
             exhausted: false,
@@ -9539,6 +9608,7 @@ mod tests {
         apply(&b, &theirs, &held).unwrap();
         assert!(b.get_collection("shop", "orders").unwrap().vector.is_some());
         let after = OplogWindow {
+            unanchored: 0,
             entries: vec![
                 whole.entries[drop].clone(),
                 whole.entries[creates[1]].clone(),
@@ -9744,6 +9814,7 @@ mod tests {
             after.iter().any(|e| e.kind == OpKind::DropCollection && e.collection == shadow_id())
         );
         let window = |entries: Vec<OplogEntry>| OplogWindow {
+            unanchored: 0,
             scanned_to: entries.last().unwrap().stamp.hlc,
             entries,
             exhausted: false,

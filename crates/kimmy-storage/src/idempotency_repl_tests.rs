@@ -235,6 +235,7 @@ fn a_record_is_stored_with_any_entry_of_its_collection() {
     theirs.insert(e1.node, Hlc::new(base, 0));
     let mine = b.engine.witnessed_vector().unwrap();
     let window = crate::OplogWindow {
+        unanchored: 0,
         entries: entries.to_vec(),
         scanned_to: e2.hlc,
         exhausted: true,
@@ -246,31 +247,82 @@ fn a_record_is_stored_with_any_entry_of_its_collection() {
     assert_eq!(b.engine.idempotency_record(cb.id, &k.scope).unwrap(), Some(r));
 }
 
-/// A frame's record is not stored when no entry of its collection is taken: it
-/// comes again with the entries, and is stored then.
+/// A record lands with the run that takes an entry of its collection, not only
+/// with the batch's last transaction: when the batch fails after that run
+/// committed (here at its last commit, after a schema change ended the run),
+/// the effect the run committed has its record with it, and a retry replays.
 #[test]
-fn a_record_waits_for_an_entry_of_its_collection_to_be_taken() {
+fn a_record_lands_with_the_run_that_takes_its_collections_entry() {
+    let (a, b, ca, cb) = pair();
+    let k = keyed(31);
+    let (id, _) = fresh(a.engine.insert_keyed(&ca, doc! { "v": 1 }, &k).unwrap());
+    a.engine.create_collection("shop", "later").unwrap();
+    let theirs = a.engine.version_vector().unwrap();
+    let mine = b.engine.witnessed_vector().unwrap();
+    let window = a
+        .engine
+        .entries_for_peer_holding(Hlc::ZERO, 1024, Some(&mine), WalkScope::Background)
+        .unwrap();
+    crate::sync::count_hooks::fail_next(crate::sync::count_hooks::Fail::BeforeLastCommit);
+    let mut outcome = SyncOutcome::default();
+    let failed = b.engine.apply_peer_window_carrying_into(
+        &theirs,
+        Some(&mine),
+        &window.entries,
+        &window.records,
+        RecordsVia::Pull,
+        PeerWindow {
+            scanned_to: window.scanned_to,
+            exhausted: window.exhausted,
+            passed_through: None,
+            asked_partial: false,
+        },
+        &mut outcome,
+    );
+    assert!(failed.is_err(), "premise: the batch failed at its last commit");
+    assert!(b.engine.get(&cb, &id).unwrap().is_some(), "premise: the run took the insert");
+    assert!(b.engine.idempotency_record(cb.id, &k.scope).unwrap().is_some(), "and its record");
+    replayed(b.engine.insert_keyed(&cb, doc! { "v": 1 }, &k).unwrap());
+    assert_eq!(count(&b.engine, &cb), 1);
+}
+
+/// A frame's records are stored in the transaction that raises the receiver's
+/// coverage, **whether or not an entry of their collection is taken** and
+/// whether or not the collection stands here (B5, records travel with
+/// coverage): here the only entry is left above the vector the sender
+/// advertised, and a second record names a collection this member has never
+/// heard of. Both are stored, and counted by the way they came; the same frame
+/// again writes nothing.
+#[test]
+fn a_frames_records_are_stored_whether_or_not_an_entry_of_their_collection_is_taken() {
     let b = member();
     let cb = b.engine.create_collection("shop", "orders").unwrap();
-    let k = keyed(4);
+    let (k, elsewhere) = (keyed(4), keyed(14));
     let e1 = stamp(crate::physical_now_ms() + 1, 0xA1);
-    let r = record_of(&k, e1, e1);
+    let e2 = stamp(crate::physical_now_ms() + 2, 0xA1);
+    let (r, r2) = (record_of(&k, e1, e1), record_of(&elsewhere, e2, e2));
+    let unknown = CollectionId::derive("shop", "not-here-yet");
     let window = crate::OplogWindow {
+        unanchored: 0,
         entries: vec![insert_entry(cb.id, 1, e1)],
         scanned_to: e1.hlc,
         exhausted: true,
         passed_through: None,
-        records: vec![wire(cb.id, &k, Some(e1), &r)],
+        records: vec![wire(cb.id, &k, Some(e1), &r), wire(unknown, &elsewhere, Some(e2), &r2)],
     };
     let mine = b.engine.witnessed_vector().unwrap();
     let below = kimmy_core::VersionVector::new();
     let outcome = apply_window(&b.engine, &below, &mine, &window);
     assert_eq!(outcome.deferred, 1, "premise: the entry was left");
-    assert_eq!(b.engine.idempotency_record(cb.id, &k.scope).unwrap(), None);
-    let mut theirs = kimmy_core::VersionVector::new();
-    theirs.insert(e1.node, e1.hlc);
-    apply_window(&b.engine, &theirs, &mine, &window);
-    assert_eq!(b.engine.idempotency_record(cb.id, &k.scope).unwrap(), Some(r));
+    assert_eq!(b.engine.idempotency_record(cb.id, &k.scope).unwrap(), Some(r.clone()));
+    assert_eq!(b.engine.idempotency_record(unknown, &elsewhere.scope).unwrap(), Some(r2));
+    assert_eq!(b.engine.idempotency_records_received()[0], 2, "counted, by pull");
+    let commits = b.engine.commits();
+    b.engine
+        .apply_batch_carrying(&[], &window.records, RecordsVia::Pull)
+        .expect("a frame of records held already");
+    assert_eq!(b.engine.commits(), commits, "records held already cost no commit");
+    assert_eq!(b.engine.idempotency_records_received()[0], 2, "and are not counted again");
 }
 
 /// A record of a life the receiver has buried is not stored, and one this build
@@ -570,7 +622,7 @@ fn an_undecodable_record_goes_when_its_row_expires() {
         row.extend_from_slice(k.scope.as_bytes());
         txn.open_table(crate::tables::IDEMPOTENCY_BY_STAMP)
             .unwrap()
-            .insert(crate::codec::oplog_key(&at).as_slice(), row.as_slice())
+            .insert(crate::idempotency::row_key(&at).as_slice(), row.as_slice())
             .unwrap();
         txn.commit().unwrap();
     }

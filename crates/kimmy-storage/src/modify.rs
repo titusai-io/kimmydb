@@ -204,9 +204,22 @@ enum ChunkEnd {
         skipped: usize,
         entries: Vec<OplogEntry>,
         last_key: Vec<u8>,
+        /// Whether the chunk found the request's end past a full budget, by
+        /// its lookahead (G8), and wrote `done`: no chunk follows.
+        ended: bool,
     },
     /// The key's record says the request is done: its first answer.
     Replayed(IdempotencyRecord),
+}
+
+/// What a keyed chunk's lookahead found past its last match (G8).
+enum Lookahead {
+    /// A match the request could write: the request goes on.
+    Writable,
+    /// The scan's end, past `skipped` matches the stamp rule leaves.
+    End { skipped: usize },
+    /// Its budget spent on matches the stamp rule leaves: the next chunk decides.
+    Unknown,
 }
 
 /// A keyed filtered write's hold on its record, across its chunks (B5).
@@ -344,7 +357,7 @@ impl Engine {
                     outcome.examined += examined;
                     break;
                 }
-                Ok(ChunkEnd::Matched { examined, matched, skipped, entries, last_key }) => {
+                Ok(ChunkEnd::Matched { examined, matched, skipped, entries, last_key, ended }) => {
                     outcome.examined += examined;
                     outcome.matched += matched as u64;
                     outcome.skipped += skipped as u64;
@@ -362,7 +375,7 @@ impl Engine {
                     }
 
                     after = Some(last_key);
-                    if matched + skipped < budget {
+                    if ended || matched + skipped < budget {
                         break;
                     }
                 }
@@ -531,6 +544,7 @@ impl Engine {
             skipped,
             entries,
             last_key: last_key.clone(),
+            ended: false,
         };
 
         if entries.is_empty() {
@@ -559,20 +573,43 @@ impl Engine {
             return Ok(found(entries));
         }
 
+        // The lookahead (G8): a keyed chunk that wrote and filled its budget
+        // looks past its last match for one more match it could write, within a
+        // budget of as many matches again. Finding the end instead, it writes
+        // `done` in its own record, so a member that takes this chunk's entry
+        // takes the request's end with it; a record-only `done` commit after it
+        // would keep this `last`, and never reach such a member.
+        let mut ends = ends;
+        let mut skipped_ahead = 0usize;
+        if !ends && let Some(run) = run.as_deref() {
+            let first = run.live.as_ref().map(|live| live.first);
+            match self.lookahead(&txn, coll, candidates, spec, budget, &last_key, first) {
+                Ok(Lookahead::Writable | Lookahead::Unknown) => {}
+                Ok(Lookahead::End { skipped }) => {
+                    ends = true;
+                    skipped_ahead = skipped;
+                }
+                Err(e) => {
+                    txn.abort().map_err(none)?;
+                    return Err(none(e));
+                }
+            }
+        }
+
         // The record, in this chunk's transaction: `applying` until the chunk
-        // that ends the request, and at this chunk's first entry.
+        // that ends the request, from this chunk's first entry to its last (L1).
         if let Some(run) = run.as_deref() {
-            let first_entry = entries[0].stamp;
+            let (first_entry, last_entry) = (entries[0].stamp, entries[entries.len() - 1].stamp);
             let record = IdempotencyRecord {
                 fingerprint: run.keyed.fingerprint,
                 first: first_entry,
-                last: first_entry,
+                last: last_entry,
                 origin: self.node_id(),
                 state: if ends { RecordState::Done } else { RecordState::Applying },
                 outcome: RecordOutcome::Modify(ModifyRecorded {
                     matched: outcome.matched + matched as u64,
                     modified: outcome.modified + entries.len() as u64,
-                    skipped: outcome.skipped + skipped as u64,
+                    skipped: outcome.skipped + (skipped + skipped_ahead) as u64,
                     commits: outcome.commits + 1,
                     stamp: entries.last().map(|entry| entry.stamp),
                     cursor: Some(last_key.clone()),
@@ -588,7 +625,14 @@ impl Engine {
         }
 
         match txn.commit() {
-            Ok(()) => Ok(found(entries)),
+            Ok(()) => Ok(ChunkEnd::Matched {
+                examined,
+                matched,
+                skipped: skipped + skipped_ahead,
+                entries,
+                last_key,
+                ended: ends,
+            }),
             Err(e @ StorageError::OutcomeUnknown(_)) => {
                 let in_doubt = entries.len() as u64;
                 Err((e, in_doubt))
@@ -642,9 +686,17 @@ impl Engine {
 
     /// The commit of a record alone, `done` (B5): a keyed request's end found
     /// by a chunk that wrote nothing, with its record standing. Its `last` is
-    /// the standing record's, so the commit has no entry of its own and is
-    /// served with the earlier chunks' entries; at that equal `last`, `done`
-    /// beats the `applying` it replaces wherever the two meet.
+    /// the standing record's ([`Self::done_alone_last`]), so the commit has no
+    /// entry of its own; at that equal `last`, `done` beats the `applying` it
+    /// replaces wherever the two meet.
+    ///
+    /// **The residual (G8).** The last writing chunk's lookahead finds the end
+    /// itself and writes `done` there, unless its budget runs out on matches the
+    /// stamp rule leaves. Then this commit marks the end, and a member that took
+    /// the last writing chunk's entry before it, and so covers that `last`,
+    /// never receives `done`: a retry there resumes (`resumed: true`, its
+    /// counts cumulative, every match left by the stamp rule) where it would
+    /// replay. Never a double.
     #[allow(clippy::too_many_arguments)]
     fn record_done_alone(
         &self,
@@ -660,7 +712,7 @@ impl Engine {
         let record = IdempotencyRecord {
             fingerprint: run.keyed.fingerprint,
             first: live.first,
-            last: live.last,
+            last: self.done_alone_last(live),
             origin: self.node_id(),
             state: RecordState::Done,
             outcome: RecordOutcome::Modify(ModifyRecorded {
@@ -675,6 +727,49 @@ impl Engine {
         };
         self.put_record(txn, coll.id, &run.keyed.scope, Some(live), &record)?;
         Ok(())
+    }
+
+    /// The `last` of a record-only `done` commit (G8): the standing record's,
+    /// minting nothing. The one place it is decided.
+    fn done_alone_last(&self, live: &IdempotencyRecord) -> Stamp {
+        live.last
+    }
+
+    /// The lookahead of a keyed chunk that wrote and filled its budget (G8), in
+    /// that chunk's transaction: up to `budget` more matches past `last_key`.
+    /// [`Lookahead::Writable`] when one of them is a match the request could
+    /// write, stored below its merged `first` (every one, before a record
+    /// exists, since this chunk's entries are minted above every stored
+    /// stamp); [`Lookahead::End`] when the scan ends first, with how many
+    /// matches the stamp rule would leave; [`Lookahead::Unknown`] when the
+    /// budget runs out on such matches.
+    ///
+    /// **An end found here is final.** A document that arrives later, written
+    /// here or anywhere, is stamped above the request's `first` (its stamp is
+    /// minted after every stamp this member has witnessed, the request's own
+    /// entries among them, or comes from a member that witnessed them), so the
+    /// stamp rule would leave it: no later chunk could write it.
+    #[allow(clippy::too_many_arguments)]
+    fn lookahead(
+        &self,
+        txn: &WriteTxn<'_>,
+        coll: &CollectionMeta,
+        candidates: &Candidates,
+        spec: &dyn ModifySpec,
+        budget: usize,
+        last_key: &[u8],
+        first: Option<Stamp>,
+    ) -> Result<Lookahead> {
+        let (ahead, _) =
+            self.collect_matches(txn, coll, candidates, spec, Some(budget), Some(last_key), false)?;
+        if ahead.iter().any(|found| first.is_none_or(|first| found.stamp < first)) {
+            return Ok(Lookahead::Writable);
+        }
+        Ok(if ahead.len() < budget {
+            Lookahead::End { skipped: ahead.len() }
+        } else {
+            Lookahead::Unknown
+        })
     }
 
     /// Find one document, change it, and return it — atomically.
