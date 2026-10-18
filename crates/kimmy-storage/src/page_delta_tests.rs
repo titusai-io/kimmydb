@@ -1362,3 +1362,88 @@ fn pages_of_large_rows_stay_within_a_frame_at_the_real_budget() {
     let cm = m.get_collection("shop", "big").unwrap();
     assert_eq!(count(&m, &cm), 70);
 }
+
+// -- The records of a collection dropped and not created again -----------------------------
+
+/// Two collection names whose ids put the first before the second in the walk.
+fn walked_in_order(first: &'static str, second: &'static str) -> (&'static str, &'static str) {
+    let id = |name| kimmy_core::CollectionId::derive("shop", name);
+    if id(first) < id(second) { (first, second) } else { (second, first) }
+}
+
+/// A key outlives a drop of its collection for its window (B5): a snapshot of a
+/// sender that dropped a collection and did not create it again still carries
+/// its records, whole-database and scoped, and none of its documents.
+#[test]
+fn a_snapshot_after_a_drop_carries_the_dropped_collections_records() {
+    let dir = tempfile::tempdir().unwrap();
+    let (y, x) = (open(&dir, "y"), open(&dir, "x"));
+    let gone = y.create_collection("shop", "gone").unwrap();
+    for i in 0..3u64 {
+        fresh(y.insert_keyed(&gone, doc! { "_id": i as i64 }, &key_of(500 + i)).unwrap());
+    }
+    let kept = y.create_collection("shop", "kept").unwrap();
+    y.insert(&kept, doc! { "_id": 1i64 }).unwrap();
+    assert!(y.drop_collection("shop", "gone").unwrap());
+    let mut progress = SnapshotProgress::whole_database();
+    let pages = finish(&x, &y, &mut progress);
+    let of_gone =
+        |page: &SnapshotPage| page.records.iter().filter(|r| r.collection == gone.id).count();
+    assert_eq!(pages.iter().map(of_gone).sum::<usize>(), 3, "whole-database: its records");
+    assert!(
+        pages.iter().all(|page| page.documents.iter().all(|d| d.collection != gone.id)),
+        "and none of its documents"
+    );
+    let scoped = y.snapshot_page(None, Some(gone.id)).unwrap();
+    assert!(scoped.dropped.is_some(), "premise: the scoped page carries the drop");
+    assert_eq!(of_gone(&scoped), 3, "scoped: its records");
+    assert!(scoped.documents.is_empty());
+}
+
+/// A page's delta carries a record of a collection that no longer stands: a
+/// keyed write on a collection the walk has passed, and then its drop, between
+/// two pages.
+#[test]
+fn a_pages_delta_carries_a_record_of_a_dropped_collection() {
+    let dir = tempfile::tempdir().unwrap();
+    let (y, x) = (open(&dir, "y"), open(&dir, "x"));
+    let (gone_name, big_name) = walked_in_order("gone", "big");
+    let gone = y.create_collection("shop", gone_name).unwrap();
+    y.insert(&gone, doc! { "_id": 1i64, "n": 0i64 }).unwrap();
+    let big = y.create_collection("shop", big_name).unwrap();
+    y.insert_many(&big, (0..(2 * SNAPSHOT_PAGE as i64)).map(|i| doc! { "_id": i }).collect())
+        .unwrap();
+    let mut progress = SnapshotProgress::whole_database();
+    take(&x, &y, &mut progress);
+    assert_eq!(progress.after().unwrap().collection, big.id, "premise: the walk is past it");
+    let k = key(7);
+    fresh(y.modify_where_keyed(&gone, &Candidates::Scan, &Inc, Some(1), &k).unwrap());
+    assert!(y.drop_collection("shop", gone_name).unwrap());
+    let page = take(&x, &y, &mut progress);
+    assert!(
+        page.records.iter().any(|r| r.collection == gone.id && r.scope == k.scope),
+        "the delta carries it: {:?}",
+        page.records
+    );
+}
+
+/// End to end, with the receiver half (G, `idempotency-a`): a member rebuilt by
+/// snapshot after a drop, the collection not created again, replays a retry of
+/// the old key once the name is created again.
+#[test]
+#[ignore = "needs idempotency-a: store_page_records storing a record of a collection absent \
+            here, and a lookup that answers a key past a drop of its collection"]
+fn a_member_rebuilt_by_snapshot_after_a_drop_replays_a_retry_of_the_old_key() {
+    let dir = tempfile::tempdir().unwrap();
+    let (y, x) = (open(&dir, "y"), open(&dir, "x"));
+    let gone = y.create_collection("shop", "gone").unwrap();
+    let k = key(7);
+    fresh(y.insert_keyed(&gone, doc! { "_id": 1i64 }, &k).unwrap());
+    assert!(y.drop_collection("shop", "gone").unwrap());
+    let mut progress = SnapshotProgress::whole_database();
+    finish(&x, &y, &mut progress);
+    assert!(x.get_collection("shop", "gone").is_err(), "premise: dropped there too");
+    let again = x.create_collection("shop", "gone").unwrap();
+    let retry = x.insert_keyed(&again, doc! { "_id": 1i64 }, &k).unwrap();
+    assert!(matches!(retry, Keyed::Replayed(_)), "the old key replays: {retry:?}");
+}

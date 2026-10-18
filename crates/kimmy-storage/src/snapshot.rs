@@ -1138,9 +1138,26 @@ impl Engine {
             }
             live
         };
+        // The ids whose records the walk sends: every collection that stands, and
+        // every one dropped and not created again, whose idempotency keys outlive
+        // the drop for their window (B5): a member rebuilt by snapshot answers a
+        // retry of such a key as the members that saw the drop do. Their
+        // documents are not sent: only a collection that stands has rows on a
+        // page. The drops are bounded by `tombstone_retention_secs`.
+        let walked: std::collections::BTreeSet<u64> = {
+            let mut walked = live.clone();
+            let dropped = open_walk_table(&txn, tables::COLLECTIONS_DROPPED, walk)?;
+            for row in dropped.iter()? {
+                let (id, _) = row?;
+                if scope.is_none_or(|scope| scope.0 == id.value()) {
+                    walked.insert(id.value());
+                }
+            }
+            walked
+        };
         let next_after = |id: u64| {
-            // not a row: the next standing collection id, from the set read above.
-            live.range((Bound::Excluded(id), Bound::Unbounded)).next().copied()
+            // not a row: the next collection id the walk visits, from the set above.
+            walked.range((Bound::Excluded(id), Bound::Unbounded)).next().copied()
         };
         let has_records = |id: u64| -> Result<bool> {
             let (page, more) = crate::idempotency::records_for_collection_page(
@@ -1199,7 +1216,9 @@ impl Engine {
                 );
                 restart = true;
             } else {
-                let standing = |id: CollectionId| live.contains(&id.0);
+                // Not by whether the collection stands: a key outlives a drop of
+                // its collection for its window. A scoped page's, its collection's.
+                let standing = |id: CollectionId| scope.is_none_or(|scope| scope == id);
                 let delta = crate::idempotency::records_changed_since(
                     &txn,
                     base.key,
@@ -1243,7 +1262,7 @@ impl Engine {
         let mut resume: Option<(u64, Vec<u8>)> = None;
         let mut phase = match after {
             // not a row: the first standing collection id, from the set above.
-            None => match live.iter().next() {
+            None => match walked.iter().next() {
                 Some(first) => Phase::Records(*first, None),
                 None => return Ok((records, out, deleted, None)),
             },
@@ -1256,8 +1275,9 @@ impl Engine {
         loop {
             match phase {
                 Phase::Records(id, at) => {
-                    if !live.contains(&id) {
-                        // Dropped since the cursor was cut: on to the next.
+                    if !walked.contains(&id) {
+                        // Neither standing nor dropped any more (its tombstone
+                        // collected since the cursor was cut): on to the next.
                         match next_after(id) {
                             Some(next) => phase = Phase::Records(next, None),
                             None => return Ok((records, out, deleted, None)),
