@@ -653,6 +653,14 @@ replication:
   pulled their entries. The window then carries no entries and grants the peer
   nothing until it has. It takes a frame's worth of such records, about 63 MiB,
   so it should not be seen.
+- **`WARN` `a snapshot page cannot be served`**, with `error`: a row of a
+  snapshot, repair or converge page, a document or the `find_and_modify` record
+  holding one, is larger than a page holds (63 MiB, what a frame holds less
+  1 MiB). The sender answers the request with a fault naming the collection, the
+  id and the size, and the requester's round fails with it
+  (`kimmy_sync_failures_total`); the pull asks again on its next round, and moves
+  on once the document is smaller. Such a document cannot cross in a window
+  either.
 - **`INFO` `a snapshot page carries only records`**, with `records`, `base` and
   `stopped`: what changed since the page before does not fit one page with its
   documents, so the page carries the records and the snapshot's position stays.
@@ -661,6 +669,15 @@ replication:
 - **`INFO` `a snapshot cursor's records base is of another log`**, with `base`
   and `epoch`: the sender was restored or reset since the cursor was cut, and the
   cursor's collection starts again from its records.
+- **`INFO` `this store holds idempotency records and no change log of this
+  node`**, with `epoch`, at the first start after a restore or an identity reset:
+  the change log begins again there, so a snapshot cursor cut before it restarts
+  its collection from its records.
+- **`INFO` `a snapshot page asked with the zero records base comes from a sender
+  whose change log has begun since`**, with `collection` and `epoch`: the page is
+  refused and its collection asked for again from its records. Once per pull when
+  the sender's first keyed write lands during it, or after the sender was
+  restored; more than once in a pull means the sender was restored again.
 
 #### A start that rebuilds the live document counts
 
@@ -2085,7 +2102,7 @@ surfaces.
 - more than three clear-and-recur **episodes** in a rolling hour stop the collection for six hours (or an hour with no confirmed finding): `ERROR` `a divergence recurs after repair; repair of this collection is stopped`, `kimmy_sync_digest_repair_stopped_collections` above 0. Episodes are counted per collection and per kind of repair (a digest repair that cleared its finding is no recurrence of a definition finding that stands). Episodes of **different** peers within three rotation periods, capped at 15 minutes, are one: a partition that heals on five members is not a loop. The same peer's recurrence always counts, however many collections the member holds.
 - `WARN` `a divergence repair did not clear the finding; backing off` once, on entering level 2.
 
-**Pace.** A document or definition repair never starves the peer's ordinary replication. After any such pull to a peer, the next contact with it is an ordinary one, whichever repair is next; a document repair's round is at most 20 pages (512 records each) or 10 seconds, and it resumes two contacts later where it stopped. So a repair of a large collection takes twice as many contacts as pulls. A document repair also ends, and is judged, once it has walked this member's live count of the collection at planning plus `cluster.repair_max_documents`, so a collection under heavy inserts cannot hold it for ever.
+**Pace.** A document or definition repair never starves the peer's ordinary replication. After any such pull to a peer, the next contact with it is an ordinary one, whichever repair is next; a document repair's round is at most 20 pages (up to 512 documents each, fewer when they are large) or 10 seconds, and it resumes two contacts later where it stopped. So a repair of a large collection takes twice as many contacts as pulls. A document repair also ends, and is judged, once it has walked this member's live count of the collection at planning plus `cluster.repair_max_documents`, counted in the documents and tombstones its pages carried (a page of idempotency records only counts none), so a collection under heavy inserts cannot hold it for ever.
 
 **What a restart or a member that is down loses.** The loop guard's state (levels, back-offs, episodes) is kept for a member until it has been absent from the live member list for **12 hours**, not just the tick it is down: the cluster has no configured member set to prune by, and a peer that restarts or is cut for seconds would otherwise be repaired again at level 0 on its return. A member removed for good loses its state after the 12 hours. With `cluster.divergence_repair = false` the findings of a removed member are not pruned at all, and the divergence gauges are exactly 0.49.0's.
 
@@ -2460,9 +2477,9 @@ and, from 0.52.0, the idempotency records and their rows by stamp (tags 12 and
 there replays rather than applying on top of a write the backup brought back
 ([ADR-240](decisions.md)). A backup that holds a record cannot be restored by
 0.51.x or earlier. The records' change log, `idempotency_changes`, is node-local
-and left out: the first change after the restore begins it again with a new
-epoch, and a snapshot a peer was pulling from this member restarts the records
-of the collection it was in.
+and left out: the first start after the restore begins it again with a new
+epoch (logged at `INFO`), and a snapshot a peer was pulling from this member
+restarts the records of the collection it was in.
 
 **Not everything the node holds.** Three tables are deliberately left out
 because each is node-local and re-derived when the database is opened: the
@@ -2927,7 +2944,7 @@ defaults rolls back untouched.
 
 **Rolling back from 0.51.0 to 0.50.x or 0.49.x needs the backup taken before the upgrade.** Storage schema 5 is a rollback boundary ([ADR-238](decisions.md)): from the moment a 0.51.0 start raises `kimmy.format` to schema 5, just before its migration's first commit, 0.50 and 0.49 refuse the store, an interrupted migration's included: `kimmy.redb` and `kimmy.format` are left bytewise as they were and no file is added or removed, but the refusing build rewrites `kimmy.last-exit` to record the failed start (exit `error`, `failed_start`, the cause and a `[previous]` block), which a later 0.51.0 start reads with no effect. They refuse a backup taken on 0.51.0 before the restore creates a file, so the data directory stays empty and nothing is written. A 0.51.0 start that was refused before that point (the free-space check, an unparseable partial filter) leaves a store 0.50 opens. The way back is the backup taken before the upgrade (`BACKUP=true`): restored on 0.50, it loses every write made after it on that member, which the member then catches up from its peers. Wiping the data directory and letting the member catch up from its peers works while no member holds a document whose `_id` is a `Decimal128`.
 
-**Rolling back from 0.52.0 to 0.51.x needs no store work and one edit to the configuration, and a backup 0.52.0 took of a store holding a record does not restore on 0.51.x** ([ADR-240](decisions.md)). The `kimmy.format` schema (still 5), `I_EPOCH`, redb version and entry kinds are unchanged, so 0.51.x opens the store. The store gains three tables, `idempotency`, `idempotency_by_stamp` and the node-local change log `idempotency_changes`, which 0.51.x never opens: its writes, drops and purges leave the records untouched, and its retention pass collects oplog entries and not records. Rolled forward again, a record of a collection the older build dropped is judged by its collection's drop and never replayed, and the rest are collected by age; nothing is rebuilt, since the tables are never derived from the oplog, and the change log begins again with its next change. **Remove `cluster.idempotency_keys` from the configuration first**: 0.51.x refuses to start on a configuration that names it, at any value. **Once the switch has been set, rolling back any member reopens the gap it closes** ([below](#clusteridempotency_keys-and-the-procedure)). **A backup is the boundary**: a backup taken by 0.52.0 carries the records as tags 12 and 13, and 0.51.x's `kimmyd restore` refuses a backup that holds either, naming the table it does not know (`backup contains table 12, which this build does not know`); a backup of a store that holds no record carries neither and restores. A backup taken by 0.51.x restores into 0.52.0 with no records. The wire's additions (`records` on entries, replays, pushes and snapshot pages, a records position and a `records_base` in the snapshot cursor, `replay` and `replay_records` on the ask for entries and `replay_records` on its answer, `idempotency_records` in the facts block) are optional fields 0.51.x ignores (it answers a restored member's replay ask as a pull, with no records, and holds none), and a 0.52.0 member reads a 0.51.x block without the field as a member that does not carry records, so it refuses keys while one is live.
+**Rolling back from 0.52.0 to 0.51.x needs no store work and one edit to the configuration, and a backup 0.52.0 took of a store holding a record does not restore on 0.51.x** ([ADR-240](decisions.md)). The `kimmy.format` schema (still 5), `I_EPOCH`, redb version and entry kinds are unchanged, so 0.51.x opens the store. The store gains three tables, `idempotency`, `idempotency_by_stamp` and the node-local change log `idempotency_changes`, which 0.51.x never opens: its writes, drops and purges leave the records untouched, and its retention pass collects oplog entries and not records. Rolled forward again, a record of a collection the older build dropped is judged by its collection's drop and never replayed, and the rest are collected by age; nothing is rebuilt, since the tables are never derived from the oplog, and the change log begins again with its next change. **Remove `cluster.idempotency_keys` from the configuration first**: 0.51.x refuses to start on a configuration that names it, at any value. **Once the switch has been set, rolling back any member reopens the gap it closes** ([below](#clusteridempotency_keys-and-the-procedure)). **A backup is the boundary**: a backup taken by 0.52.0 carries the records as tags 12 and 13, and 0.51.x's `kimmyd restore` refuses a backup that holds either, naming the table it does not know (`backup contains table 12, which this build does not know`); a backup of a store that holds no record carries neither and restores. A backup taken by 0.51.x restores into 0.52.0 with no records. The wire's additions (`records` on entries, replays, pushes and snapshot pages, a records position and a `records_base` in the snapshot cursor, `records_epoch` on snapshot pages, `replay` and `replay_records` on the ask for entries and `replay_records` on its answer, `idempotency_records` in the facts block) are optional fields 0.51.x ignores (it answers a restored member's replay ask as a pull, with no records, and holds none), and a 0.52.0 member reads a 0.51.x block without the field as a member that does not carry records, so it refuses keys while one is live.
 
 #### `cluster.idempotency_keys` and the procedure
 

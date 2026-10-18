@@ -133,9 +133,10 @@
 //! it is a records-only page and its base moves to the last key it examined.
 //!
 //! Keys are compared only within one **epoch** ([`changes_begin`]): a random
-//! number the log is given when it begins, with its first change, and again
-//! after a restore (a backup carries no log), an identity reset, or an open
-//! that found no log. A base of another epoch restarts the cursor's collection
+//! number the log is given when it begins, with its first change, or at an open
+//! that finds records and no log of this node (a restore, since a backup carries
+//! no log; an identity reset: [`begin_log_over_held_records`]). A base of another
+//! epoch restarts the cursor's collection
 //! from its records phase, whatever the keys say: a sender restored onto a host
 //! whose clock is behind logs keys below a base cut before the restore.
 
@@ -163,13 +164,6 @@ pub const RECORD_COLLECT_CHUNK: usize = 1_000;
 /// Records on one snapshot page's records phase.
 pub const RECORD_PAGE: usize = 512;
 
-/// The bytes of records one snapshot page's records delta carries at most
-/// ([`records_changed_since`]): half the cluster's 64 MiB frame, so the delta,
-/// the records phase and the documents share a frame. A page whose delta does
-/// not fit is a records-only page. One record larger than this goes alone, as
-/// the only record of its page's delta.
-pub const RECORD_DELTA_BYTES: usize = 32 * 1024 * 1024;
-
 /// The change-log rows one page's records delta examines at most, whatever they
 /// come to: the bound on one page's read, so a delta from an old base (a resumed
 /// pull) or of a scoped pull over a busy store is read over several pages.
@@ -177,7 +171,13 @@ pub const RECORD_DELTA_ROWS: usize = 64 * 1024;
 
 /// What a carried record costs on the wire beyond its bytes: the collection id,
 /// the scope hash and BSON's framing, a bound and not a measure.
-const CARRIED_OVERHEAD: usize = 96;
+pub(crate) const CARRIED_OVERHEAD: usize = 96;
+
+/// What a record of `len` bytes costs a page's bytes
+/// (`snapshot::SNAPSHOT_PAGE_BYTES`).
+pub(crate) fn carried_size(len: usize) -> usize {
+    len + CARRIED_OVERHEAD
+}
 
 /// The window a bare engine remembers a key for: `storage.oplog_retention_secs`'
 /// default. The daemon sets its own ([`Engine::set_idempotency_window`]).
@@ -1033,9 +1033,9 @@ fn records_in_advance(
 /// order.
 ///
 /// **The log begins** with the first change it holds, and begins again, with a
-/// new epoch, at the first change after an open that found no beginning (a new
-/// store, one from before the log, one restored from a backup, which carries
-/// none) or one this node's identity did not write (an identity reset).
+/// new epoch, at the first change after an open that found no beginning, or one
+/// this node's identity did not write, over a store that held no record. One
+/// that held records began it at the open ([`begin_log_over_held_records`]).
 fn log_change(
     engine: &Engine,
     txn: &redb::WriteTransaction,
@@ -1055,6 +1055,67 @@ fn log_change(
     }
     log.insert(key.as_slice(), row_value(collection, scope).as_slice())?;
     Ok(())
+}
+
+/// At open: **begin the change log, with a new epoch, over the records this
+/// store holds** when it holds any and no log of this node's identity has
+/// begun ([`IDEMPOTENCY_CHANGES`]'s empty key absent, or another identity's).
+/// Returns whether it began one.
+///
+/// Such records were written by no change this log names: a restore (a backup
+/// carries records and no log), an identity reset, a store from before the log.
+/// Without a beginning, this node would cut the **zero base** (`RecordsBase`,
+/// "a log that has held nothing") on its next page, and answer a zero base cut
+/// by an earlier store with "nothing changed": a sender restored once from a
+/// backup with records serves a page with the zero base, is restored again from
+/// another, and the next page brings that backup's effect without its record
+/// (m4). Begun here, a base this node cuts names the epoch, and a base cut before
+/// the next restore is of another epoch, which restarts its collection from its
+/// records phase. A zero base cut by a sender that held no records, answered
+/// after it was restored with some, is the requester's to refuse
+/// (`SnapshotPage::records_epoch`).
+///
+/// Before the engine serves, so no page is cut before it, in a transaction of
+/// its own (metadata alone, as a schema change's); the beginning's key is a
+/// stamp of this node's clock minted under the writer, above every key a page of
+/// this store cut before the open (`resume_hlc` covers the log).
+pub(crate) fn begin_log_over_held_records(engine: &Engine) -> Result<bool> {
+    use redb::ReadableDatabase;
+    {
+        let txn = engine.db().begin_read()?;
+        // not a row of the walk: whether the store holds any record, one seek.
+        let holds = txn.open_table(IDEMPOTENCY)?.first()?.is_some();
+        let begun = changes_begin(&txn)?.is_some_and(|begun| begun.at.node == engine.node_id());
+        if !holds || begun {
+            return Ok(false);
+        }
+    }
+    let txn = engine.begin_write(WriterHolder::Ddl)?;
+    // Minted under the writer, as every log key is.
+    let begin = LogBegin { at: engine.next_stamp(), epoch: new_epoch() };
+    txn.open_table(IDEMPOTENCY_CHANGES)?.insert(LOG_BEGINS, begin.encode().as_slice())?;
+    txn.commit()?;
+    info!(
+        epoch = begin.epoch,
+        "this store holds idempotency records and no change log of this node: the log begins \
+         again here, so a snapshot cursor cut before (a restore, an identity reset) restarts its \
+         collection from its records"
+    );
+    Ok(true)
+}
+
+/// Begin this node's change log now, with a new epoch and no change in it: the
+/// state of a sender whose log began and whose records retention has collected
+/// since, so its pages cut bases that name an epoch. For a test of a delta from
+/// such a base, which a pull from a log that has never begun (the zero base)
+/// cannot show past its first keyed write (`SnapshotPage::records_epoch`).
+#[cfg(test)]
+pub(crate) fn begin_log_for_test(engine: &Engine) -> Result<LogBegin> {
+    let txn = engine.begin_write(WriterHolder::Ddl)?;
+    let begin = LogBegin { at: engine.next_stamp(), epoch: new_epoch() };
+    txn.open_table(IDEMPOTENCY_CHANGES)?.insert(LOG_BEGINS, begin.encode().as_slice())?;
+    txn.commit()?;
+    Ok(begin)
 }
 
 /// A new log's epoch: random, never 0.
@@ -1129,7 +1190,9 @@ pub(crate) fn changes_high_water_at_open(db: &redb::Database) -> Result<Hlc> {
 /// What one page's records delta may carry and read ([`records_changed_since`]).
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct DeltaBudget {
-    /// The bytes of its records, at most [`RECORD_DELTA_BYTES`].
+    /// The bytes of its records: what the page has for its rows
+    /// (`snapshot::SNAPSHOT_PAGE_BYTES` less its definitions and drops), of
+    /// which the records phase and the documents have what the delta leaves.
     pub bytes: usize,
     /// The log rows it examines, at most [`RECORD_DELTA_ROWS`].
     pub rows: usize,
@@ -1137,7 +1200,8 @@ pub(crate) struct DeltaBudget {
 
 impl DeltaBudget {
     /// A page's.
-    pub(crate) const PAGE: Self = Self { bytes: RECORD_DELTA_BYTES, rows: RECORD_DELTA_ROWS };
+    pub(crate) const PAGE: Self =
+        Self { bytes: crate::snapshot::SNAPSHOT_PAGE_BYTES, rows: RECORD_DELTA_ROWS };
 }
 
 /// One page's records delta.
@@ -1159,7 +1223,8 @@ pub(crate) struct Delta {
 /// writer, so every change committed after the read that cut `base` is above it.
 ///
 /// Stops before the budget is passed ([`DeltaBudget`]), naming the last key it
-/// examined; a record larger than the byte budget goes alone. A row whose record
+/// examined; a record larger than the whole budget, which a page holding nothing
+/// else cannot carry, is refused ([`StorageError::SnapshotRowTooLarge`]). A row whose record
 /// is gone (purged or collected) carries nothing. No keyed change since `base` is
 /// an empty read.
 pub(crate) fn records_changed_since(
@@ -1196,8 +1261,16 @@ pub(crate) fn records_changed_since(
             .transpose()?
             .flatten();
         if let Some((collection, scope, record)) = named {
-            let size = record.len() + CARRIED_OVERHEAD;
-            if !out.is_empty() && bytes + size > budget.bytes {
+            let size = carried_size(record.len());
+            if out.is_empty() && size > budget.bytes {
+                // Larger than a page holding nothing else: it cannot cross on one.
+                return Err(StorageError::SnapshotRowTooLarge {
+                    what: format!("the idempotency record of a request on collection {collection}"),
+                    bytes: size,
+                    room: budget.bytes,
+                });
+            }
+            if bytes + size > budget.bytes {
                 // This row is the next page's first.
                 return Ok(Delta { records: out, stopped_at: last });
             }
@@ -1212,33 +1285,51 @@ pub(crate) fn records_changed_since(
 
 /// One page of a collection's records for a snapshot's records phase: up to
 /// `limit` (at most [`RECORD_PAGE`]) records after the scope `after`, in scope
-/// order, and the scope to go on after, `None` once the collection's records
-/// are all sent.
+/// order, within `room` bytes ([`carried_size`] each), and whether more of the
+/// collection's records are left: one that does not fit is the next page's
+/// first. With `refuse`, the page holds nothing else, and a first record larger
+/// than `room` cannot cross on a page: it is refused
+/// ([`StorageError::SnapshotRowTooLarge`], `snapshot::SNAPSHOT_PAGE_BYTES`).
 #[allow(clippy::type_complexity)]
 pub fn records_for_collection_page(
     txn: &ReadTransaction,
     collection: CollectionId,
     after: Option<&ScopeHash>,
     limit: usize,
-) -> Result<(Vec<(ScopeHash, Vec<u8>)>, Option<ScopeHash>)> {
+    room: usize,
+    refuse: bool,
+) -> Result<(Vec<(ScopeHash, Vec<u8>)>, bool)> {
     let limit = limit.clamp(1, RECORD_PAGE);
     let records = txn.open_table(IDEMPOTENCY)?;
     let mut page = Vec::new();
-    let mut more = false;
+    let mut used = 0usize;
     for row in
         records.range(collection_records(collection, after.map(|s| s.as_bytes().as_slice())))?
     {
         let (key, value) = row?;
         let (_, scope) = key.value();
         if page.len() == limit {
-            more = true;
-            break;
+            return Ok((page, true));
         }
         let Some(scope) = ScopeHash::from_slice(scope) else { continue };
+        let size = carried_size(value.value().len());
+        if used + size > room {
+            if refuse && page.is_empty() {
+                return Err(StorageError::SnapshotRowTooLarge {
+                    what: format!(
+                        "the idempotency record of a request on collection {collection} (a \
+                         find_and_modify's document)"
+                    ),
+                    bytes: size,
+                    room,
+                });
+            }
+            return Ok((page, true));
+        }
+        used += size;
         page.push((scope, value.value().to_vec()));
     }
-    let next = if more { page.last().map(|(scope, _)| *scope) } else { None };
-    Ok((page, next))
+    Ok((page, false))
 }
 
 // -- In the engine ---------------------------------------------------------------------------
@@ -1528,13 +1619,15 @@ impl Engine {
         DeltaBudget::PAGE
     }
 
-    /// Set the budget of a page's records delta in bytes and log rows examined,
-    /// for a test that pages one without writing 32 MiB or 65,536 rows; `None`
-    /// for the real one.
+    /// Set the room of a snapshot page's rows in bytes (its delta's, records
+    /// phase's and documents' together, `snapshot::SNAPSHOT_PAGE_BYTES`) and the
+    /// log rows its delta examines, for a test that pages without writing 63 MiB
+    /// or 65,536 rows; `None` for the real ones.
     #[cfg(test)]
     pub(crate) fn set_record_delta_budget_for_test(&self, bytes_and_rows: Option<(usize, usize)>) {
         *self.idempotency.delta_budget.lock() =
             bytes_and_rows.map(|(bytes, rows)| DeltaBudget { bytes, rows });
+        self.set_snapshot_room_for_test(bytes_and_rows.map(|(bytes, _)| bytes));
     }
 
     /// Count `n` records stored from peers by `via`, once the transaction that

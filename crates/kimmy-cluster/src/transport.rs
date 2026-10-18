@@ -1203,6 +1203,9 @@ fn is_local_failure(e: &kimmy_storage::StorageError) -> bool {
         // A keyed client request's answer (B5), never an apply's, and about
         // the request, not this node's storage.
         E::IdempotencyKeyReused | E::IdempotencyKeyInFlight => false,
+        // A snapshot page's row no page can carry: about the row, never an
+        // apply's (B5).
+        E::SnapshotRowTooLarge { .. } => false,
     }
 }
 
@@ -1729,6 +1732,14 @@ where
                     Err(kimmy_storage::StorageError::Stopping(reason)) => {
                         debug!(%reason, "stopped serving a peer's snapshot: this node is shutting down");
                         return Ok(());
+                    }
+                    // A row no page can carry (a document larger than a frame):
+                    // the requester is told which, rather than left with a
+                    // connection that closed.
+                    Err(e @ kimmy_storage::StorageError::SnapshotRowTooLarge { .. }) => {
+                        warn!(error = %e, "a snapshot page cannot be served");
+                        write_frame(&mut stream, &Message::Fault(e.to_string())).await?;
+                        return Err(ProtocolError::Local(e.to_string()));
                     }
                     Err(e) => return Err(ProtocolError::Local(e.to_string())),
                 };
@@ -4464,11 +4475,12 @@ struct Repairs {
     /// (`cluster.repair_max_index_documents`).
     limits: BTreeMap<CollectionId, u64>,
     active_limit: u64,
-    /// The most pages each queued Converge repair may walk, and the active one: sized from
-    /// the collection when it was planned, so a collection that keeps growing under the
-    /// pull cannot make it chase the tail for ever (0: unbounded).
-    page_bounds: BTreeMap<CollectionId, usize>,
-    active_page_bound: usize,
+    /// The most rows (documents and tombstones) each queued Converge repair may walk,
+    /// and the active one: sized from the collection when it was planned, so a
+    /// collection that keeps growing under the pull cannot make it chase the tail for
+    /// ever (0: unbounded).
+    row_bounds: BTreeMap<CollectionId, usize>,
+    active_row_bound: usize,
     /// The repair in progress, and the collection it is for.
     active: Option<(CollectionId, Repair)>,
     /// Consecutive rounds the repair in progress has been handed out for
@@ -5076,20 +5088,28 @@ impl PeerStalls {
     }
 
     /// Bound the queued Converge repair of `collection` against `peer`: it ends as finished
-    /// after the pages that `documents` documents fill (the planner passes the collection's
-    /// live count when it plans, and the size gate on top), however much the collection has
-    /// grown by then (repair design section 2.6).
+    /// once its pages have carried `documents` rows, documents and tombstones, and two
+    /// full pages' worth more (the planner passes the collection's live count when it
+    /// plans, and the size gate on top), however much the collection has grown by then
+    /// (repair design section 2.6).
+    ///
+    /// **Rows, not pages** (B5, the build review's m6): a page is cut by its byte budget
+    /// (`kimmy_storage::SNAPSHOT_PAGE_BYTES`) as well as at `SNAPSHOT_PAGE` rows, so a page
+    /// of large documents carries fewer, and a records phase sends pages with no row at
+    /// all; counted in pages, either would end the repair before it had walked the
+    /// collection. A full page is `SNAPSHOT_PAGE` rows, so where every page is full this
+    /// is the bound it was, `documents / SNAPSHOT_PAGE + 2` pages.
     pub fn bound_converge(&mut self, peer: NodeId, collection: CollectionId, documents: u64) {
-        let pages = usize::try_from(documents / kimmy_storage::SNAPSHOT_PAGE as u64 + 2)
-            .unwrap_or(usize::MAX);
+        let rows = documents.saturating_add(2 * kimmy_storage::SNAPSHOT_PAGE as u64);
+        let rows = usize::try_from(rows).unwrap_or(usize::MAX);
         if let Some(repairs) = self.repairs.get_mut(&peer) {
-            repairs.page_bounds.insert(collection, pages);
+            repairs.row_bounds.insert(collection, rows);
         }
     }
 
-    /// The pages the active Converge repair against `peer` may walk (0: unbounded).
-    fn converge_page_bound(&self, peer: NodeId) -> usize {
-        self.repairs.get(&peer).map_or(0, |repairs| repairs.active_page_bound)
+    /// The rows the active Converge repair against `peer` may walk (0: unbounded).
+    fn converge_row_bound(&self, peer: NodeId) -> usize {
+        self.repairs.get(&peer).map_or(0, |repairs| repairs.active_row_bound)
     }
 
     /// A definition plan gate refused a repair (`too_large`, `disabled`).
@@ -5472,9 +5492,9 @@ impl PeerStalls {
                 }
                 _ => 0,
             };
-            repairs.active_page_bound = match repairs.active {
+            repairs.active_row_bound = match repairs.active {
                 Some((collection, Repair::Converge)) => {
-                    repairs.page_bounds.remove(&collection).unwrap_or(0)
+                    repairs.row_bounds.remove(&collection).unwrap_or(0)
                 }
                 _ => 0,
             };
@@ -6429,6 +6449,7 @@ where
         let advanced = progress.pages() > before;
         let complete = progress.is_complete();
         let (total_pages, total_documents) = (progress.pages(), progress.documents());
+        let total_rows = progress.rows();
         let cursor = progress.after().map(ToString::to_string);
         if advanced {
             stalls.snapshot_advanced(node);
@@ -6542,11 +6563,14 @@ where
         // A Converge repair is bounded by the collection's size when it was planned: a
         // collection under a faster insert load than the pull walks would otherwise never
         // reach its last page. The repair ends as finished, and the loop guard judges it.
-        let bound = stalls.converge_page_bound(node);
-        if policy == kimmy_storage::SnapshotPolicy::Converge && bound > 0 && total_pages >= bound {
+        // In rows its pages carried, so a page of records only, or one cut short by its
+        // bytes, spends only what it carried (`bound_converge`).
+        let bound = stalls.converge_row_bound(node);
+        if policy == kimmy_storage::SnapshotPolicy::Converge && bound > 0 && total_rows >= bound {
             info!(
                 %peer,
                 total_pages,
+                total_rows,
                 bound,
                 documents = outcome.applied,
                 "a converge repair has walked the collection's size at its start; it ends here \
@@ -8888,6 +8912,7 @@ mod tests {
             tombstone_horizon: None,
             deleted_documents: Vec::new(),
             records: Vec::new(),
+            records_epoch: None,
         }
     }
 
@@ -10150,7 +10175,7 @@ mod tests {
 
         let mut stalls = PeerStalls::new();
         assert!(stalls.plan_repair(a.node_id(), orders.id, Repair::Converge));
-        // No documents counted: the bound is two pages.
+        // No documents counted: the bound is two full pages' worth of rows.
         stalls.bound_converge(a.node_id(), orders.id, 0);
         for _ in 0..4 {
             stalls.tick_opened();
@@ -10162,6 +10187,156 @@ mod tests {
         assert!(!stalls.repairing(a.node_id()), "the repair ended at its bound");
         let left = stale() as i64;
         assert!(left > 0 && left < docs, "two pages walked, the rest not: {left} of {docs}");
+    }
+
+    /// A collection on `a`, served, held stale on `b`: `docs` documents written,
+    /// pulled by `b`, then each rewritten on `a` with `v: 2` (and `pad`), so every one
+    /// `b` holds is a stale version a converge repair must replace.
+    async fn stale_on_b(
+        docs: i64,
+        pad: usize,
+        secret: &'static str,
+    ) -> (
+        Arc<Engine>,
+        Engine,
+        std::net::SocketAddr,
+        CollectionId,
+        tempfile::TempDir,
+        tempfile::TempDir,
+    ) {
+        let a_dir = tempfile::tempdir().unwrap();
+        let a = Arc::new(Engine::open(&a_dir.path().join("kimmy.redb")).unwrap());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(serve(Arc::clone(&a), listener, secret.into()));
+        let orders = a.create_collection("shop", "orders").unwrap();
+        let text = "x".repeat(pad);
+        for chunk in (0..docs).collect::<Vec<_>>().chunks(32) {
+            let batch = chunk.iter().map(|i| bson::doc! { "_id": *i, "v": 1, "pad": text.clone() });
+            a.insert_many(&orders, batch.collect()).unwrap();
+        }
+        let b_dir = tempfile::tempdir().unwrap();
+        let b = Engine::open(&b_dir.path().join("kimmy.redb")).unwrap();
+        let mut ordinary = PeerStalls::new();
+        for _ in 0..16 {
+            ordinary.tick_opened();
+            sync_once_with(&b, addr, secret, None, &mut ordinary).await.unwrap();
+            if b.version_vector().unwrap().get(a.node_id())
+                == a.version_vector().unwrap().get(a.node_id())
+            {
+                break;
+            }
+        }
+        std::thread::sleep(Duration::from_millis(5));
+        for i in 0..docs {
+            let doc = bson::doc! { "_id": i, "v": 2, "pad": text.clone() };
+            a.replace(&orders, &kimmy_core::DocId::Int64(i), doc, false).unwrap();
+        }
+        b.absorb_witnessed(&a.witnessed_vector().unwrap()).unwrap();
+        (a, b, addr, orders.id, a_dir, b_dir)
+    }
+
+    /// The documents of `collection` on `b` still at `v: 1`.
+    fn stale_left(b: &Engine, docs: i64) -> i64 {
+        let meta = b.get_collection("shop", "orders").unwrap();
+        (0..docs)
+            .filter(|i| {
+                b.get(&meta, &kimmy_core::DocId::Int64(*i)).unwrap().unwrap().get_i32("v").ok()
+                    == Some(1)
+            })
+            .count() as i64
+    }
+
+    /// Run the planned Converge repair of `collection` from `a` to its end.
+    async fn converge_to_its_end(
+        b: &Engine,
+        a: NodeId,
+        addr: std::net::SocketAddr,
+        secret: &str,
+        collection: CollectionId,
+        documents: u64,
+    ) {
+        let mut stalls = PeerStalls::new();
+        assert!(stalls.plan_repair(a, collection, Repair::Converge));
+        // The bound the planner gives a collection of this size (with no gate's margin).
+        stalls.bound_converge(a, collection, documents);
+        for _ in 0..16 {
+            stalls.tick_opened();
+            sync_once_with(b, addr, secret, None, &mut stalls).await.unwrap();
+            if !stalls.repairing(a) {
+                return;
+            }
+        }
+        panic!("the repair did not end in 16 rounds");
+    }
+
+    /// The build review's m6, with the byte budget: a collection of 140 documents of
+    /// about 1 MiB, which pages hold about 63 of each, converges whole. Counted in
+    /// pages, the bound the planner gives it (140 / 512 + 2 = 2 pages) ended the
+    /// repair after about 126; counted in rows it carried, it walks all 140.
+    #[tokio::test]
+    async fn a_converge_repair_of_megabyte_documents_walks_the_whole_collection() {
+        const SECRET: &str = "a-converge-large-secret";
+        let docs = 140i64;
+        let (a, b, addr, orders, _a_dir, _b_dir) = stale_on_b(docs, 1024 * 1024, SECRET).await;
+        assert_eq!(stale_left(&b, docs), docs, "premise: B holds every stale version");
+        converge_to_its_end(&b, a.node_id(), addr, SECRET, orders, docs as u64).await;
+        assert_eq!(stale_left(&b, docs), 0, "every document repaired");
+    }
+
+    /// The build review's m6: a Converge repair's records phase sends pages with no
+    /// row, and they spend none of its bound. 1,030 stale documents, each with two
+    /// keyed writes' records (2,060 records, four pages of them): counted in pages
+    /// the bound (4) was spent on records and no document was repaired; counted in
+    /// rows, every document is.
+    #[tokio::test]
+    async fn a_converge_repairs_records_only_pages_spend_none_of_its_bound() {
+        struct Set(&'static str, i32);
+        impl kimmy_storage::ModifySpec for Set {
+            fn matches(&self, _: &bson::Document) -> kimmy_core::Result<bool> {
+                Ok(true)
+            }
+            fn compare(&self, _: &bson::Document, _: &bson::Document) -> std::cmp::Ordering {
+                std::cmp::Ordering::Equal
+            }
+            fn apply(
+                &self,
+                doc: &bson::Document,
+            ) -> std::result::Result<Option<bson::Document>, String> {
+                let mut next = doc.clone();
+                next.insert(self.0, self.1);
+                Ok(Some(next))
+            }
+            fn upsert(&self) -> Option<std::result::Result<bson::Document, String>> {
+                None
+            }
+        }
+        const SECRET: &str = "a-converge-records-secret";
+        let docs = 2 * kimmy_storage::SNAPSHOT_PAGE as i64 + 6;
+        let (a, b, addr, orders, _a_dir, _b_dir) = stale_on_b(docs, 0, SECRET).await;
+        let meta = a.get_collection("shop", "orders").unwrap();
+        // Two keyed writes a document, each its own key: 2 x 1,030 records.
+        let key = |i: u64| {
+            let mut scope = [0u8; 32];
+            scope[..8].copy_from_slice(&i.to_be_bytes());
+            kimmy_storage::idempotency::KeyedWrite::new(
+                kimmy_core::ScopeHash(scope),
+                kimmy_core::Fingerprint([1; 32]),
+            )
+        };
+        for i in 0..docs {
+            let on = kimmy_storage::Candidates::Keys(vec![
+                kimmy_core::keyenc::encode(&kimmy_core::DocId::Int64(i).to_bson()).unwrap(),
+            ]);
+            a.modify_where_keyed(&meta, &on, &Set("w", 1), Some(1), &key(i as u64)).unwrap();
+            a.modify_where_keyed(&meta, &on, &Set("u", 1), Some(1), &key(100_000 + i as u64))
+                .unwrap();
+        }
+        assert_eq!(a.idempotency_records().unwrap(), 2 * docs as u64, "premise: the records");
+        b.absorb_witnessed(&a.witnessed_vector().unwrap()).unwrap();
+        assert_eq!(stale_left(&b, docs), docs, "premise: B holds every stale version");
+        converge_to_its_end(&b, a.node_id(), addr, SECRET, orders, docs as u64).await;
+        assert_eq!(stale_left(&b, docs), 0, "every document repaired, the records spent nothing");
     }
 
     /// The cooldown: a repair done for a collection is not planned again
@@ -10349,6 +10524,203 @@ mod tests {
         let ((), answer) = tokio::join!(serving, asking);
         assert!(matches!(answer, Err(ProtocolError::Closed)), "no window was sent: {answer:?}");
         assert_eq!(*failures.lock(), [], "the cap is not a serve failure");
+    }
+
+    /// One snapshot pull of `b` by `a` through the listener and the requester's
+    /// pull, and what each end came to.
+    async fn pull_through(
+        a: &Engine,
+        b: &Engine,
+        scope: Option<CollectionId>,
+        policy: kimmy_storage::SnapshotPolicy,
+    ) -> (Result<(), ProtocolError>, Result<SnapshotPulled, ProtocolError>) {
+        pull_through_with(a, b, scope, policy, &mut PeerStalls::new()).await
+    }
+
+    /// [`pull_through`], resuming whatever pull `stalls` holds with `b`.
+    async fn pull_through_with(
+        a: &Engine,
+        b: &Engine,
+        scope: Option<CollectionId>,
+        policy: kimmy_storage::SnapshotPolicy,
+        stalls: &mut PeerStalls,
+    ) -> (Result<(), ProtocolError>, Result<SnapshotPulled, ProtocolError>) {
+        const SECRET: &str = "a-page-bytes-secret";
+        const BINDING: &[u8] = b"a-page-bytes-binding";
+        let (mut ours, theirs) = tokio::io::duplex(1 << 20);
+        let serving = async {
+            serve_peer(b, theirs, SECRET, BINDING, None, ServeBudgets::serving(), None).await
+        };
+        let pulling = async {
+            open_handshake(a, &mut ours, SECRET, BINDING).await.unwrap();
+            let clock = RoundClock::default();
+            let deadline = Instant::now() + Duration::from_secs(300);
+            let addr: SocketAddr = "127.0.0.1:1".parse().unwrap();
+            let pulled = pull_snapshot(
+                a,
+                &mut ours,
+                addr,
+                b.node_id(),
+                scope,
+                policy,
+                stalls,
+                deadline,
+                &clock,
+            )
+            .await;
+            drop(ours);
+            pulled
+        };
+        tokio::join!(serving, pulling)
+    }
+
+    /// The requester's guard on the zero records base (m4, guard ii), through the
+    /// listener and `pull_snapshot`: the sender held no records when the pull
+    /// began, so the first page carried the zero base; it is then restored from a
+    /// backup that holds a keyed `$inc` on a document of the next page, whose open
+    /// begins its change log over the restored records and logs none of them. The
+    /// round refuses the page that answers the zero base, asks for the collection
+    /// again from its records phase, and completes in the same round with the
+    /// record: a retry replays.
+    #[tokio::test]
+    async fn a_pull_refuses_a_zero_base_page_once_and_completes_with_the_record() {
+        use kimmy_storage::SnapshotPolicy::All;
+        struct Inc;
+        impl kimmy_storage::ModifySpec for Inc {
+            fn matches(&self, doc: &bson::Document) -> kimmy_core::Result<bool> {
+                Ok(doc.contains_key("n"))
+            }
+            fn compare(&self, _: &bson::Document, _: &bson::Document) -> std::cmp::Ordering {
+                std::cmp::Ordering::Equal
+            }
+            fn apply(
+                &self,
+                doc: &bson::Document,
+            ) -> std::result::Result<Option<bson::Document>, String> {
+                let mut next = doc.clone();
+                next.insert("n", doc.get_i64("n").map_err(|e| e.to_string())? + 1);
+                Ok(Some(next))
+            }
+            fn upsert(&self) -> Option<std::result::Result<bson::Document, String>> {
+                None
+            }
+        }
+        let b_dir = tempfile::tempdir().unwrap();
+        let b = Engine::open(&b_dir.path().join("kimmy.redb")).unwrap();
+        let coll = b.create_collection("shop", "orders").unwrap();
+        let target = kimmy_storage::SNAPSHOT_PAGE as i64 + 40;
+        let docs = (1..3 * kimmy_storage::SNAPSHOT_PAGE as i64)
+            .map(|i| {
+                if i == target {
+                    bson::doc! { "_id": i, "n": 10i64 }
+                } else {
+                    bson::doc! { "_id": i }
+                }
+            })
+            .collect();
+        b.insert_many(&coll, docs).unwrap();
+        let backup = |e: &Engine| {
+            let mut out = Vec::new();
+            e.backup_to(&mut out, kimmy_storage::WalkScope::Background).unwrap();
+            out
+        };
+        let restored = |name: &str, from: &[u8]| {
+            let path = b_dir.path().join(name);
+            kimmy_storage::backup::restore(&path, &mut &from[..]).unwrap();
+            Engine::open(&path).unwrap()
+        };
+        let bare = backup(&b);
+        let key = kimmy_storage::idempotency::KeyedWrite::new(
+            kimmy_core::ScopeHash([7; 32]),
+            kimmy_core::Fingerprint([7; 32]),
+        );
+        let on = kimmy_storage::Candidates::Scan;
+        let done = b.modify_where_keyed(&coll, &on, &Inc, Some(1), &key).unwrap();
+        assert!(matches!(done, kimmy_storage::idempotency::Keyed::Fresh(_)), "{done:?}");
+        let keyed = backup(&b);
+        drop(b);
+        let a_dir = tempfile::tempdir().unwrap();
+        let a = Engine::open(&a_dir.path().join("kimmy.redb")).unwrap();
+        // The first page, by hand, from the sender restored without records: the
+        // zero base.
+        let b1 = restored("b1.redb", &bare);
+        let mut stalls = PeerStalls::new();
+        let progress = stalls.snapshot_progress(b1.node_id(), Some(coll.id), All);
+        let page = b1.snapshot_page(None, Some(coll.id)).unwrap();
+        a.apply_snapshot_page(b1.node_id(), progress, &page).unwrap();
+        let base = progress.after().and_then(|after| after.records_base).unwrap();
+        assert_eq!(base.epoch, None, "premise: the zero base");
+        drop(b1);
+        // Restored again, with the keyed write's record.
+        let b = restored("b2.redb", &keyed);
+        let (served, pulled) = pull_through_with(&a, &b, Some(coll.id), All, &mut stalls).await;
+        assert!(matches!(served, Ok(()) | Err(ProtocolError::Closed)), "{served:?}");
+        assert!(pulled.unwrap().complete, "the pull completes in the round");
+        let held = a.get_collection("shop", "orders").unwrap();
+        let id = kimmy_core::DocId::Int64(target);
+        let n = |e: &Engine| e.get(&held, &id).unwrap().unwrap().get_i64("n").unwrap();
+        assert_eq!(n(&a), 11, "premise: the pull brought the effect");
+        assert!(a.idempotency_record(held.id, &key.scope).unwrap().is_some(), "and the record");
+        let retry = a.modify_where_keyed(&held, &on, &Inc, Some(1), &key).unwrap();
+        assert!(matches!(retry, kimmy_storage::idempotency::Keyed::Replayed(_)), "{retry:?}");
+        assert_eq!(n(&a), 11, "the retry replays");
+    }
+
+    /// The v0.51.0 stall (B5, P2): 600 documents of 130 KiB, whose first page
+    /// was 68 MB, over a frame, so the listener refused it and the pull failed
+    /// for good. Pages are cut by bytes now (`SNAPSHOT_PAGE_BYTES`), and the
+    /// whole-database, scoped and converge pulls complete. A document no page can
+    /// carry is answered with a `Fault` naming it, not a closed connection.
+    #[tokio::test]
+    async fn snapshot_pages_of_large_documents_cross_within_a_frame() {
+        use kimmy_storage::SnapshotPolicy::{All, Converge};
+        let b_dir = tempfile::tempdir().unwrap();
+        let b = Engine::open(&b_dir.path().join("kimmy.redb")).unwrap();
+        let coll = b.create_collection("shop", "wide").unwrap();
+        let pad = "x".repeat(130 * 1024);
+        for chunk in 0..6i64 {
+            let docs = (0..100i64)
+                .map(|i| bson::doc! { "_id": chunk * 100 + i, "pad": pad.clone() })
+                .collect();
+            b.insert_many(&coll, docs).unwrap();
+        }
+        for scope in [None, Some(coll.id)] {
+            let a_dir = tempfile::tempdir().unwrap();
+            let a = Engine::open(&a_dir.path().join("kimmy.redb")).unwrap();
+            let (served, pulled) = pull_through(&a, &b, scope, All).await;
+            // The requester closing after its last page is the listener's end.
+            assert!(matches!(served, Ok(()) | Err(ProtocolError::Closed)), "{served:?}");
+            let pulled = pulled.unwrap();
+            assert!(pulled.complete, "the pull completes");
+            let held = a.get_collection("shop", "wide").unwrap();
+            assert_eq!(a.count(&held, kimmy_storage::WalkScope::Request).unwrap(), 600);
+            // A converge pull of what it holds crosses as well.
+            let (served, pulled) = pull_through(&a, &b, Some(held.id), Converge).await;
+            assert!(matches!(served, Ok(()) | Err(ProtocolError::Closed)), "{served:?}");
+            assert!(pulled.unwrap().complete, "a converge pull completes");
+        }
+
+        // A document larger than a page holds: refused by name.
+        b.set_snapshot_room_for_test(Some(64 * 1024));
+        let a_dir = tempfile::tempdir().unwrap();
+        let a = Engine::open(&a_dir.path().join("kimmy.redb")).unwrap();
+        let (served, pulled) = pull_through(&a, &b, Some(coll.id), All).await;
+        b.set_snapshot_room_for_test(None);
+        assert!(
+            matches!(&served, Err(ProtocolError::Local(why)) if why.contains("cannot cross")),
+            "the listener ends the connection: {served:?}"
+        );
+        match pulled {
+            Err(ProtocolError::Fault(reason)) => {
+                assert!(
+                    reason.contains("document Int64(0)") && reason.contains("cannot cross"),
+                    "{reason}"
+                );
+            }
+            other => {
+                panic!("expected a Fault naming the document, got {:?}", other.map(|p| p.complete))
+            }
+        }
     }
 
     /// A pushed window this node cannot apply is answered with a `Fault`

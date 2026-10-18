@@ -421,7 +421,8 @@ const BOUNDED_READS: &[(&str, &str)] = &[
     ),
     (
         "idempotency::records_for_collection_page",
-        "one snapshot page's records phase: at most RECORD_PAGE (512) records of one collection",
+        "one snapshot page's records phase: at most RECORD_PAGE (512) records of one collection, \
+         within the page's records budget",
     ),
     ("idempotency_tests::rows", "test code reading a store of a few thousand rows it wrote itself"),
     (

@@ -309,7 +309,7 @@ and the only row of the record in its advance is the one at `first`.
 |---|---|
 | `Entries`, `Push` | An optional `records` list: collection id, scope hash, `carrying` (the sender's row) and the record's bytes. **F2:** every live record with a row inside the advance the window grants the requester, above what it holds of that origin and at or below what the window's end and the sender's servable vector reach. **F3:** every live record with a row above both what the requester holds and what the sender's servable vector reaches, a row a page or a lost entry left, which no window of the sender would otherwise vouch for. Read in the window's own read transaction, one per key. A record may ride no shipped entry |
 | `ReplayEntries` | The same list: the records the page's own advance vouches for, and the F3 records |
-| `SnapshotPage` | An optional `records` list. Collection by collection, a records phase in pages of up to 512 records goes ahead of the collection's documents, and a page never holds one collection's records after another's documents. Every page after the first also carries the **records delta**, below. The same holds for a scoped repair and for a converge page ([ADR-237](decisions.md)) |
+| `SnapshotPage` | An optional `records` list, and an optional `records_epoch` (the epoch of the sender's change log, below). Collection by collection, a records phase in pages of up to 512 records, within the page's byte budget, goes ahead of the collection's documents, and a page never holds one collection's records after another's documents. Every page after the first also carries the **records delta**, below. The same holds for a scoped repair and for a converge page ([ADR-237](decisions.md)). A collection dropped and not created again, while its tombstone stands, has its records phase on the page too, and none of its documents: a key outlives a drop of its collection for its window |
 | `SnapshotCursor` | An optional records position, so a snapshot resumes inside a records phase, and an optional `records_base`, `{key, epoch}`, the base of the next page's delta |
 
 **A sender ships a record at a row of its own. A row below the record's
@@ -344,11 +344,19 @@ transaction, every record the log names above that base (the scoped
 collection's, on a scoped or converge pull), and the receiver stores them before
 the documents. So a page never holds a document without the record of the write
 that produced it. Keys are compared only within one **epoch**, a random number
-the log is given when it begins and again after a restore, an identity reset or
-an open that found no log: a base of another epoch, or a key without one,
-restarts the cursor's collection from its records phase, and the zero base of a
-log that held nothing is sent every change. **A page carries documents only with
-the whole remainder** of the log above its base within 32 MiB and 65,536 rows;
+the log is given when it begins: with its first change, or at a start that finds
+records and no log of this node (after a restore, since a backup carries no log,
+or an identity reset). A base of another epoch, or a key without one, restarts
+the cursor's collection from its records phase, and the zero base of a log that
+held nothing is sent every change. **A receiver holds a page asked with the zero
+base to the page's `records_epoch`**, the epoch of the sender's log as the page
+read it, on every page, the last included: a page that names one comes from a
+log begun since the base was cut, by a keyed write, which logs every record
+since, or over records a restore brought, which it does not. The receiver cannot
+tell which, so it refuses the page and asks for its collection again from its
+records phase, with no base: once a pull, when the sender's first keyed write
+lands during it. **A page carries documents only with
+the whole remainder** of the log above its base within the page's byte budget and 65,536 rows;
 otherwise it is a records-only page, its document position unchanged and its
 base moved to the last key it examined, logged at `INFO`. A sender whose keyed
 changes, per page round trip, outrun what a frame carries sends records-only
@@ -573,7 +581,17 @@ rather than as history**. See [ADR-036](decisions.md) and
 [ADR-160](decisions.md).
 
 **A snapshot is paged, one transaction a page, and resumes across rounds.**
-Documents arrive 512 to a page; the receiver applies a page's documents in one
+Documents arrive up to 512 to a page, and **within a byte budget**: 63 MiB
+(`SNAPSHOT_PAGE_BYTES`, what a 64 MiB frame holds less 1 MiB), less what the
+page's definitions, drops and vector take, shared in order by its idempotency
+records (the delta, then the records phase) and its documents and tombstones. A
+row that does not fit goes first on the next page; a row no page can carry, a
+document or a `find_and_modify` record larger than that, is refused by name, the
+sender answering with a fault that names the collection, the id and the size,
+since such a document cannot cross in a window either. Before 0.52.0 a page
+carried 512 rows whatever their size: 512 averaging over about 128 KiB made a
+page over a frame, the sender closed the connection, and the requester asked for
+the same page for ever. The receiver applies a page's documents in one
 write transaction — none when it already holds every document on the page, and
 none for a collection tombstone it already holds ([ADR-162](decisions.md)) — and
 records where the next page begins before it asks for it, so a round that runs

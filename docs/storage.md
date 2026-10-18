@@ -100,8 +100,8 @@ absent from a backup**: each is re-derived when the database is opened, so a
 restored node rebuilds them rather than carrying them across. See
 [operations.md](operations.md) for what that means when restoring during a
 snapshot. `idempotency` and `idempotency_by_stamp` are carried, as backup tags
-12 and 13; `idempotency_changes` is node-local and is not, and the first change
-after a restore begins it again.
+12 and 13; `idempotency_changes` is node-local and is not, and the first start
+after a restore begins it again over the restored records.
 
 ### Why the keys are shaped this way
 
@@ -252,10 +252,12 @@ record, on every path (a local commit, a frame, a replay or snapshot page, a
 rewind's reopen), in the store's own transaction, keyed by a stamp minted under
 the writer, so in commit order; a store that changes nothing writes no row. A
 snapshot page reads it to carry what changed since the page before. It is never
-shipped and not carried by a backup. Its empty key holds the key of its first
-change and a random **epoch**, written by that first change, not at open, and
-given again at the first change after a restore, an identity reset, or an open
-that found no log.
+shipped and not carried by a backup. Its empty key holds where it began and a
+random **epoch**: written by its first change, or at an open that finds records
+and no log of this node's identity (after a restore, since a backup carries no
+log, or an identity reset), before any page is cut, so a store that holds
+records always has one; and given again at the first change of a store that held
+none.
 
 **How long a record lives.** A record is judged by its `last`. It is absent to
 a lookup once `last` is older than `storage.oplog_retention_secs`, or once it is

@@ -52,6 +52,10 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 /// document rather than an 5 KiB one. Reachable, but no longer routine.
 pub const MAX_FRAME: usize = 64 * 1024 * 1024;
 
+// A snapshot page's counted bytes leave a frame 1 MiB for what is not counted
+// (`kimmy_storage::SNAPSHOT_PAGE_BYTES`).
+const _: () = assert!(kimmy_storage::SNAPSHOT_PAGE_BYTES + 1024 * 1024 <= MAX_FRAME);
+
 /// Entries a peer will send in one response.
 ///
 /// Bounded so a node that is far behind catches up over several rounds rather
@@ -1626,10 +1630,13 @@ mod tests {
             dropped_indexes: Vec::new(),
             tombstone_horizon: None,
             records: vec![kimmy_storage::CarriedRecord { carrying: None, ..record }],
+            // And the epoch of the sender's change log, on every page (m4).
+            records_epoch: Some(i64::MIN + 3),
         };
         let message = Message::Snapshot(Box::new(page.clone()));
         let sent = body_of(&message, "Snapshot").await;
         assert!(sent.contains_key("records"), "carried: {sent}");
+        assert!(sent.contains_key("records_epoch"), "the epoch rides the page: {sent}");
         let older: PageBeforeRecords = bson::deserialize_from_document(sent.clone())
             .expect("a receiver that predates the field reads the page");
         assert!(older.documents.is_empty());
@@ -1644,6 +1651,19 @@ mod tests {
             panic!("not a page")
         };
         assert!(read.records.is_empty(), "a page from before carries none");
+        // A sender before the epoch writes none, which reads as none; one of
+        // another shape reads as none too.
+        let mut before = body_of(&message, "Snapshot").await;
+        before.remove("records_epoch");
+        let Message::Snapshot(read) = read_back("Snapshot", before.clone()).await else {
+            panic!("not a page")
+        };
+        assert_eq!(read.records_epoch, None, "a page from before names no epoch");
+        before.insert("records_epoch", "not an epoch");
+        let Message::Snapshot(read) = read_back("Snapshot", before).await else {
+            panic!("not a page")
+        };
+        assert_eq!((read.records_epoch, read.records.len()), (None, 1), "read leniently");
         // The older receiver echoes `{collection, after_key}`: read as the
         // documents phase of the collection, which is where its sender goes.
         let ask = bson::doc! {
@@ -2200,6 +2220,7 @@ mod tests {
                 dropped_indexes: Vec::new(),
                 tombstone_horizon: None,
                 records: Vec::new(),
+                records_epoch: None,
             })),
         )
         .await
@@ -2276,6 +2297,7 @@ mod tests {
             dropped_indexes: vec![(CollectionId(7), 2_032_551_883, stamp(550))],
             tombstone_horizon: Some(Hlc::new(777, 3)),
             records: Vec::new(),
+            records_epoch: None,
         };
 
         let mut written = Vec::new();
