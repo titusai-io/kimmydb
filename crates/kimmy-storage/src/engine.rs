@@ -152,6 +152,14 @@ pub struct Engine {
     /// for a test of a member restored onto a host whose clock is behind.
     #[cfg(test)]
     clock_behind_ms: std::sync::atomic::AtomicU64,
+    /// A test's room for a snapshot page's rows (`snapshot::SNAPSHOT_PAGE_BYTES`);
+    /// 0 for the real one.
+    #[cfg(any(test, feature = "test-hooks"))]
+    pub(crate) snapshot_room_for_test: std::sync::atomic::AtomicUsize,
+    /// A test's budget for a whole snapshot page, its other parts counted against
+    /// it (`snapshot::SNAPSHOT_PAGE_BYTES`); 0 for the real one.
+    #[cfg(any(test, feature = "test-hooks"))]
+    pub(crate) snapshot_page_bytes_for_test: std::sync::atomic::AtomicUsize,
     /// How a commit becomes durable (ADR-088). `None` is the default class,
     /// `durable`: every commit fsyncs before it returns. `Some` is
     /// `coalesced`: commits skip their own fsync and wait at a shared barrier
@@ -672,6 +680,13 @@ thread_local! {
     /// `None` outside one.
     static WRITER_WAIT_METER: std::cell::Cell<Option<std::time::Duration>> =
         const { std::cell::Cell::new(None) };
+}
+
+#[cfg(test)]
+thread_local! {
+    /// How far behind the wall clock an engine opened on this thread starts
+    /// ([`Engine::open_with_clock_behind_for_test`]); 0 for the wall clock's own.
+    static OPEN_CLOCK_BEHIND_MS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
 }
 
 /// Run `f` and say how long it spent waiting for the single writer, across
@@ -1522,7 +1537,13 @@ impl Engine {
                 crate::modify::DEFAULT_MULTI_CHUNK_DOCS,
             ),
             #[cfg(test)]
-            clock_behind_ms: std::sync::atomic::AtomicU64::new(0),
+            clock_behind_ms: std::sync::atomic::AtomicU64::new(
+                OPEN_CLOCK_BEHIND_MS.with(std::cell::Cell::get),
+            ),
+            #[cfg(any(test, feature = "test-hooks"))]
+            snapshot_room_for_test: std::sync::atomic::AtomicUsize::new(0),
+            #[cfg(any(test, feature = "test-hooks"))]
+            snapshot_page_bytes_for_test: std::sync::atomic::AtomicUsize::new(0),
             coalescer: Mutex::new(None),
             coalesce_woken: Condvar::new(),
             #[cfg(test)]
@@ -1569,6 +1590,10 @@ impl Engine {
             purges: Default::default(),
             idempotency: Default::default(),
         };
+
+        // Records with no log of this node over them (a restore, an identity
+        // reset) begin the log, with a new epoch, before any page is cut (m4).
+        crate::idempotency::begin_log_over_held_records(&engine)?;
 
         // A drop a restart interrupted is announced here and finished by the
         // drop purger once the node serves, not before it binds (ADR-158's
@@ -3721,6 +3746,17 @@ impl Engine {
         self.clock_behind_ms.store(ms, std::sync::atomic::Ordering::Relaxed);
     }
 
+    /// [`Self::open`], with the clock `ms` behind the wall clock from the open
+    /// on, so what the open itself mints is behind too: a store opened on a host
+    /// whose clock is behind.
+    #[cfg(test)]
+    pub(crate) fn open_with_clock_behind_for_test(path: &Path, ms: u64) -> Result<Self> {
+        OPEN_CLOCK_BEHIND_MS.with(|behind| behind.set(ms));
+        let opened = Self::open(path);
+        OPEN_CLOCK_BEHIND_MS.with(|behind| behind.set(0));
+        opened
+    }
+
     /// The last time the clock handed out, for a test that a path mints
     /// nothing.
     #[cfg(test)]
@@ -5044,9 +5080,7 @@ impl Engine {
     pub fn purge_dropped_collection(&self, id: CollectionId) -> Result<usize> {
         let mut removed = 0usize;
         loop {
-            // The records too, which the purger's chunks remove after the
-            // documents and index entries, and which a creation never waits for.
-            if self.collection_range_is_empty(id)? && !self.records_under(id)? {
+            if self.collection_range_is_empty(id)? {
                 break;
             }
             let chunk = self.purge_chunk(id)?;
@@ -5228,14 +5262,9 @@ impl Engine {
                     }
                     removed += keys.len();
                 }
-                // The collection's idempotency records, after its documents and
-                // index entries and in what is left of the chunk (B5). For space
-                // only: a record of a dropped life is history by the life rule
-                // whether it stays or goes. Their rows by stamp are left to
-                // expire, since they name nothing now.
-                if removed < DROP_PURGE_CHUNK {
-                    removed += Self::purge_records_in(&txn, id, DROP_PURGE_CHUNK - removed)?;
-                }
+                // The collection's idempotency records stay: a record outlives a
+                // drop of its collection for its window, and retention alone
+                // removes it (B5).
                 // The ranges are exhausted: the digest row of a collection
                 // that is gone goes with this commit (a row of zeros and the
                 // highest stamps of a life that has ended).

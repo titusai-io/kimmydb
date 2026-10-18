@@ -1858,6 +1858,46 @@ fn keyed_calls() -> Vec<(&'static str, Value)> {
     ]
 }
 
+/// The derived `_id` of each tool that derives one, end to end through the
+/// tool's typed arguments, against values computed outside this code from the
+/// stated layouts (the collection id, the scope hash under `local:root`, the
+/// call's fingerprint over the tool and its arguments re-serialized without the
+/// key, the position). A release that serialized the arguments differently (a
+/// field renamed or reordered) or hashed them differently would derive another
+/// `_id` for a retry and leave two documents.
+#[tokio::test]
+async fn the_derived_id_of_every_deriving_tool_is_pinned_end_to_end() {
+    let server = Server::start().await;
+    seed(&server);
+    let root = server.root();
+    let one = server
+        .call_ok(
+            &root,
+            "insert",
+            with_key(
+                json!({"database":"sales","collection":"orders","document":{"n":1}}),
+                "golden-mcp-insert-6f1c0e52",
+            ),
+        )
+        .await;
+    assert_eq!(one["insertedId"], "7f248224-39f1-8a44-9526-1f684dd372f4", "{one}");
+    let many = server
+        .call_ok(
+            &root,
+            "insert_many",
+            with_key(
+                json!({"database":"sales","collection":"orders","documents":[{"n":1},{"n":2}]}),
+                "golden-mcp-many-6f1c0e52",
+            ),
+        )
+        .await;
+    assert_eq!(
+        many["insertedIds"],
+        json!(["9f838414-7d3f-8d8a-bf40-5886b3327fe0", "a945d034-fb4a-8ade-aa80-c2cd66e8ffe8"]),
+        "{many}"
+    );
+}
+
 fn with_key(mut arguments: Value, key: &str) -> Value {
     arguments["idempotency_key"] = Value::from(key);
     arguments
@@ -2007,4 +2047,51 @@ async fn a_keyed_tool_call_sent_again_is_its_first_result_marked_as_a_replay() {
     let reused = server.call(&root, tool, with_key(arguments, "replay-00-6f1c0e52-8a1d")).await;
     let (code, _) = refusal(&reused);
     assert_eq!(code, "idempotency_key_reused", "{reused}");
+}
+
+/// KR through the tools: a key two members accepted for two calls, whose
+/// records met here in a merge, refuses every retry of the call as a key
+/// reused, writing nothing and never answering from the record, though the
+/// merged record is this call's own. The other member's record is stored as
+/// replication stores it.
+#[tokio::test]
+async fn a_keyed_tool_call_under_a_key_two_calls_met_under_is_refused() {
+    let server = Server::start().await;
+    seed(&server);
+    let root = server.root();
+    let orders = server.engine.get_collection("sales", "orders").unwrap();
+    let documents = || async {
+        server.call_ok(&root, "find", json!({"database":"sales","collection":"orders"})).await
+    };
+    for (i, (tool, arguments)) in keyed_calls().into_iter().enumerate() {
+        let key = format!("contested-{i:02}-6f1c0e52-8a1d");
+        let first = server.call(&root, tool, with_key(arguments.clone(), &key)).await;
+        assert!(first["error"].is_null(), "{tool}: {first}");
+
+        let scope = kimmy_core::IdempotencyKey::from_raw(&key).unwrap().scope_hash("local:root");
+        let live = server.engine.idempotency_record(orders.id, &scope).unwrap().expect("a record");
+        let other = kimmy_core::NodeId::from_bytes([0x43; 16]);
+        let at = kimmy_core::Stamp::new(kimmy_core::Hlc::new(live.first.hlc.wall_ms - 1, 0), other);
+        let theirs = kimmy_storage::IdempotencyRecord {
+            fingerprint: kimmy_core::Fingerprint([0x5a; 32]),
+            first: at,
+            last: at,
+            origin: other,
+            ..live.clone()
+        };
+        let stored =
+            server.engine.store_peer_record_for_test(orders.id, &scope, &theirs).unwrap().unwrap();
+        assert!(stored.contested, "{tool}: premise: two calls met under the key");
+        assert_eq!(
+            stored.fingerprint, live.fingerprint,
+            "{tool}: premise: this call's record wins"
+        );
+
+        let before = documents().await;
+        let retry = server.call(&root, tool, with_key(arguments, &key)).await;
+        let (code, _) = refusal(&retry);
+        assert_eq!(code, "idempotency_key_reused", "{tool}: {retry}");
+        assert!(retry["result"].is_null(), "{tool}: never the first result: {retry}");
+        assert_eq!(documents().await, before, "{tool}: nothing written");
+    }
 }

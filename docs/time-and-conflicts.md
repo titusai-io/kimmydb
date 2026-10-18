@@ -219,7 +219,16 @@ on the order they arrive in.
   greater `last`; at an equal `last`, `done` beats `applying`, and at an equal
   `last` and state the record whose bytes are greater wins, so the merge is
   commutative as well as associative and idempotent, and every member picks the
-  same record.
+  same record;
+- `contested` is set when either side is, or when their fingerprints differ:
+  two members accepted the key for two different requests, each before it held
+  the other's record. It is computed from both sides beside `first`, after the
+  winner is picked and never as part of the tie-break, so it keeps the join's
+  three properties and every member reaches the same flag. A contested record
+  is refused for every retry of either request (`422 idempotency_key_reused`):
+  the winner's answer is one request's, and its merged `first` may be the
+  other's, so neither replaying it nor resuming under it is the retried
+  request's own.
 
 Two applications therefore converge to one record: the outcome of the later one,
 whose document version last-writer-wins also keeps, and the earliest `first` of

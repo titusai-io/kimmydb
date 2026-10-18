@@ -51,6 +51,9 @@ const STOP_AWARE_WALKS: &[&str] = &[
     "gc::Engine::collect_tombstones_within",
     // Retention's read of the idempotency records' rows below its cutoff (B5).
     "idempotency::Engine::collect_idempotency_records",
+    // A replay page's records of its collections (B2 of the B5 build review),
+    // which serves no client.
+    "idempotency_replay::Engine::replay_records_in",
     // The read ahead of a drop purge chunk, which serves no client: the stop is
     // its error, so the chunk never reaches the writer during the drain.
     "engine::Engine::warm_purge_chunk",
@@ -398,27 +401,18 @@ const BOUNDED_READS: &[(&str, &str)] = &[
         "inside find_and_modify's write transaction: close_writes bounds it (ADR-192)",
     ),
     (
-        "idempotency::Engine::purge_records_in",
-        "what is left of one purge chunk of DROP_PURGE_CHUNK rows, in its write: close_writes \
-         bounds it (ADR-192)",
-    ),
-    (
         "idempotency::Engine::records_high_water",
         "at open: two seeks per origin that has a record row, its first key and its last",
     ),
-    (
-        "idempotency::Engine::records_under",
-        "one seek: whether a collection id has any idempotency record",
-    ),
     ("idempotency::Engine::rewind_records_in", "`kimmyd rewind`, which runs on a stopped node"),
     (
-        "idempotency::Engine::sweep_late_drop_records",
-        "one chunk of RECORD_COLLECT_CHUNK records of one collection, in a write: close_writes \
-         bounds it (ADR-192); the stop is looked for between two chunks (ADR-231)",
+        "idempotency::remove_rows_naming",
+        "`kimmyd rewind`'s removal of the rows of the records it removed, on a stopped node",
     ),
     (
         "idempotency::records_for_collection_page",
-        "one snapshot page's records phase: at most RECORD_PAGE (512) records of one collection",
+        "one snapshot page's records phase: at most RECORD_PAGE (512) records of one collection, \
+         within the page's records budget",
     ),
     ("idempotency_tests::rows", "test code reading a store of a few thousand rows it wrote itself"),
     (

@@ -419,26 +419,44 @@ async fn a_fresh_multi_chunk_request_skips_what_unrelated_writers_wrote_between_
 }
 
 /// C8. A key used in one life of a collection, dropped and created again: the
-/// same key applies afresh in the new life, on every member, and the old
-/// life's record is never brought back.
+/// record outlives the drop and its purge for its window (ADR-240, guarantee
+/// 7), on the member that dropped it and on the one the drop replicated to. A
+/// retry with the old key replays its first answer on every member and writes
+/// nothing to the new life; another request under the key is refused as a key
+/// reused there.
 #[tokio::test]
-async fn c8_a_key_from_before_a_drop_and_recreate_applies_afresh() {
+async fn c8_a_key_from_before_a_drop_and_recreate_replays() {
     let (a, b) = pair().await;
     let k = keyed(8);
     fresh(a.engine.insert_keyed(&a.orders(), doc! { "_id": 50i64, "v": 1 }, &k).unwrap());
     sync(&a, &b).await;
-    assert!(b.record(&k).is_some(), "premise");
+    let held = b.record(&k).expect("premise: B holds the record");
     a.engine.drop_collection("shop", "orders").unwrap();
     a.engine.finish_purges_now().unwrap();
     a.engine.create_collection("shop", "orders").unwrap();
     sync(&a, &b).await;
     b.engine.finish_purges_now().unwrap();
     sync(&a, &b).await;
-    assert_eq!(b.count(), 0, "premise: B holds the new life");
-    fresh(b.engine.insert_keyed(&b.orders(), doc! { "_id": 50i64, "v": 1 }, &k).unwrap());
+    assert_eq!((a.count(), b.count()), (0, 0), "premise: both hold the new, empty life");
+    assert_eq!(
+        (a.record(&k), b.record(&k)),
+        (Some(held.clone()), Some(held)),
+        "it outlived both purges"
+    );
+
+    for node in [&b, &a] {
+        replayed(
+            node.engine.insert_keyed(&node.orders(), doc! { "_id": 50i64, "v": 1 }, &k).unwrap(),
+        );
+        let another = KeyedWrite::new(k.scope, Fingerprint([0x5a; 32]));
+        let refused = node.engine.insert_keyed(&node.orders(), doc! { "_id": 51i64 }, &another);
+        assert!(
+            matches!(refused, Err(kimmy_storage::StorageError::IdempotencyKeyReused)),
+            "{refused:?}"
+        );
+    }
     sync(&a, &b).await;
-    assert_eq!((a.count(), b.count()), (1, 1));
-    replayed(a.engine.insert_keyed(&a.orders(), doc! { "_id": 50i64, "v": 1 }, &k).unwrap());
+    assert_eq!((a.count(), b.count()), (0, 0), "nothing written to the new life");
 }
 
 // -- C9: a member that does not carry records -----------------------------------------------

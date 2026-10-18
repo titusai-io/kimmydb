@@ -1871,6 +1871,27 @@ impl TelemetryGuard {
         );
         observe!(
             u64_observable_counter,
+            "kimmy.idempotency.records.unfit.pull",
+            "{frame}",
+            "Frames and replay pages that could not carry the idempotency records they must, by this path (pull: a window a peer pulled).",
+            |s| s.idempotency_records_unfit[0]
+        );
+        observe!(
+            u64_observable_counter,
+            "kimmy.idempotency.records.unfit.push",
+            "{frame}",
+            "Frames and replay pages that could not carry the idempotency records they must, by this path (push: a push not sent).",
+            |s| s.idempotency_records_unfit[1]
+        );
+        observe!(
+            u64_observable_counter,
+            "kimmy.idempotency.records.unfit.replay",
+            "{frame}",
+            "Frames and replay pages that could not carry the idempotency records they must, by this path (replay: a page of a peer's replay).",
+            |s| s.idempotency_records_unfit[2]
+        );
+        observe!(
+            u64_observable_counter,
             "kimmy.idempotency.records.collected",
             "{record}",
             "Idempotency records retention removed.",

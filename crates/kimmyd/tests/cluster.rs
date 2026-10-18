@@ -4903,6 +4903,16 @@ async fn c5_a_retry_is_answered_where_the_keyed_entry_lost() {
 /// C6. A member stopped while its peers collect the history it would need catches up by a
 /// snapshot, and the snapshot carries the record of a keyed write made since: its snapshot
 /// counter moves, and a retry on it is answered from the record.
+///
+/// One setting does two things here: the window that collects the history C would need,
+/// which forces the snapshot, is also the record's window, which the keyed write starts
+/// afresh after that collection. The record must still stand on A when C's snapshot reads
+/// it, and must not be past its window on C when C stores it (a record past its window is
+/// refused, review m2). So the window is sized for the margin: 60 s, of which C's catch-up
+/// takes a few, leaves a stall of C of half a minute or more at its snapshot step (as a
+/// loaded scheduler causes) inside the record's life. At 30 s a 32 s stall had A and B
+/// collect the record two seconds before C's snapshot landed, and the poller below could
+/// never succeed.
 #[tokio::test]
 #[ignore = "boots a real three-node cluster; run with --ignored"]
 async fn c6_a_member_that_caught_up_by_snapshot_answers_a_retry_from_the_record() {
@@ -4912,7 +4922,7 @@ async fn c6_a_member_that_caught_up_by_snapshot_answers_a_retry_from_the_record(
     let client = reqwest::Client::new();
     let (a, b, c, t) = keyed_cluster(
         &client,
-        "oplog_retention_secs = 30\ngc_interval_secs = 2",
+        "oplog_retention_secs = 60\ngc_interval_secs = 2",
         serde_json::json!([]),
     )
     .await;
@@ -4933,8 +4943,8 @@ async fn c6_a_member_that_caught_up_by_snapshot_answers_a_retry_from_the_record(
     // The documents C has not seen, collected on A and on B. They were written at one
     // instant, after every other entry but a few, and expire together: once twenty entries
     // have left the oplog, they are among them. Each count is read as soon as its member
-    // holds the documents: with a 30 s window a slow runner can collect them before a later
-    // read, and the premise is then lost to the clock and not to the code.
+    // holds the documents: a slow runner can collect them before a later read, and the
+    // premise is then lost to the clock and not to the code.
     let held_a = a.gauge(&client, "kimmy_oplog_entries").await.unwrap();
     let held_b = std::cell::Cell::new(0);
     eventually("B to hold the documents in its oplog", || async {
@@ -4958,6 +4968,10 @@ async fn c6_a_member_that_caught_up_by_snapshot_answers_a_retry_from_the_record(
             && series(&client, &c, RECEIVED_SNAPSHOT).await > snapshots
     })
     .await;
+    // A member back from a long stop has not yet heard its peers' blocks again, and its gate
+    // refuses keys until it has (a live member not heard from counts as one that does not
+    // carry records); a client branches on the capability per node, and so does this test.
+    eventually("C to take keys again", || takes_keys(&client, &c)).await;
     let retry = keyed_send(&client, &c, &t[2], reqwest::Method::POST, PATH, BODY, KEY).await;
     assert_eq!(retry.status, 200, "{}", retry.text);
     assert!(retry.replayed, "answered from the record the snapshot carried: {retry:?}");
@@ -4965,19 +4979,23 @@ async fn c6_a_member_that_caught_up_by_snapshot_answers_a_retry_from_the_record(
     assert_eq!(orders_where(&client, &c, &t[2], serde_json::json!({})).await, Some(21));
 }
 
-/// C8. A key used in one life of a collection, the collection dropped and created again: a
-/// retry with the old key applies afresh in the new life, and every member holds that one
-/// document.
+/// C8. A key used in one life of a collection, the collection dropped and created again:
+/// the key's record outlives the drop for its window (ADR-240, guarantee 7). A retry with
+/// the old key, on every member, replays its first answer and writes nothing to the new
+/// life; another request under the key is refused as a key reused, there too.
 #[tokio::test]
 #[ignore = "boots a real three-node cluster; run with --ignored"]
-async fn c8_an_old_key_applies_afresh_after_a_drop_and_a_recreation() {
+async fn c8_an_old_key_replays_after_a_drop_and_a_recreation() {
     const PATH: &str = "/v1/db/shop/coll/orders/docs";
     const BODY: &str = r#"{"_id":50,"v":"c8"}"#;
+    const OTHER: &str = r#"{"_id":51,"v":"c8"}"#;
     const KEY: &str = "c8-a-key-from-the-life-before";
     let client = reqwest::Client::new();
     let (a, b, c, t) = keyed_cluster(&client, "", serde_json::json!([])).await;
     let first = keyed_send(&client, &a, &t[0], reqwest::Method::POST, PATH, BODY, KEY).await;
     assert_eq!(first.status, 200, "{}", first.text);
+    // A member holding the document holds its record: the record rides with the coverage
+    // that brings the write.
     for (node, token) in [(&a, &t[0]), (&b, &t[1]), (&c, &t[2])] {
         eventually("the write on every member", || async {
             orders_where(&client, node, token, serde_json::json!({ "v": "c8" })).await == Some(1)
@@ -5005,14 +5023,22 @@ async fn c8_an_old_key_applies_afresh_after_a_drop_and_a_recreation() {
         .await;
     }
 
-    let again = keyed_send(&client, &b, &t[1], reqwest::Method::POST, PATH, BODY, KEY).await;
-    assert_eq!(again.status, 200, "{}", again.text);
-    assert!(!again.replayed, "the old life's record answers nothing: {again:?}");
+    for (node, token) in [(&b, &t[1]), (&c, &t[2]), (&a, &t[0])] {
+        let again = keyed_send(&client, node, token, reqwest::Method::POST, PATH, BODY, KEY).await;
+        assert_eq!(again.status, 200, "{}: {}", node.name, again.text);
+        assert!(again.replayed, "{}: the record outlives the drop: {again:?}", node.name);
+        assert_eq!(again.text, first.text, "{}: the first answer", node.name);
+        let other = keyed_send(&client, node, token, reqwest::Method::POST, PATH, OTHER, KEY).await;
+        assert_eq!(other.status, 422, "{}: {}", node.name, other.text);
+        assert_eq!(other.body["error"], "idempotency_key_reused", "{}", node.name);
+    }
     for (node, token) in [(&a, &t[0]), (&b, &t[1]), (&c, &t[2])] {
-        eventually("the new write on every member", || async {
-            orders_where(&client, node, token, serde_json::json!({ "v": "c8" })).await == Some(1)
-        })
-        .await;
+        assert_eq!(
+            orders_where(&client, node, token, serde_json::json!({})).await,
+            Some(0),
+            "{}: nothing written to the new life",
+            node.name
+        );
     }
 }
 
@@ -5353,4 +5379,89 @@ async fn a_finished_multi_chunk_keyed_update_replays_on_every_caught_up_member()
             );
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// A member declared down that rejoins goes on failure detecting
+// ---------------------------------------------------------------------------
+
+/// Y, Z, X and M, seeded as the field run that found it: Y and Z seed each
+/// other, X and M seed Y.
+fn rejoin_cluster() -> (Node, Node, Node, Node) {
+    let (py, pz, px, pm) = (ports::choose(), ports::choose(), ports::choose(), ports::choose());
+    (
+        Node::spawn_configured("node-y", py, &[pz], "", 1, ""),
+        Node::spawn_configured("node-z", pz, &[py], "", 1, ""),
+        Node::spawn_configured("node-x", px, &[py], "", 1, ""),
+        Node::spawn_configured("node-m", pm, &[py], "", 1, ""),
+    )
+}
+
+/// Until X and M each count exactly one live member, the other, and return how
+/// long that took.
+async fn x_and_m_alone_together(client: &reqwest::Client, x: &Node, m: &Node) -> Duration {
+    let started = std::time::Instant::now();
+    eventually("X and M to declare Y and Z down and see each other live", || async {
+        x.members_gauge(client).await == Some(1) && m.members_gauge(client).await == Some(1)
+    })
+    .await;
+    started.elapsed()
+}
+
+/// X and M are frozen (SIGSTOP) until Y and Z declare them down, then Y and Z
+/// are frozen and X and M resumed. X and M learn they were declared down and
+/// rejoin; they must then declare the frozen Y and Z down within SWIM's own
+/// timing (a probe, its round trip and the suspicion time, about 6.5 s here)
+/// and find each other. Before the fix a member that rejoined on a `TurnUndead`
+/// sat disconnected, probing no one: X and M held Y and Z live for good.
+#[tokio::test]
+#[ignore = "boots a real four-node cluster; run with --ignored"]
+async fn a_member_declared_down_while_frozen_rejoins_and_declares_its_frozen_peers_down() {
+    let client = reqwest::Client::new();
+    let (y, z, x, m) = rejoin_cluster();
+    for node in [&y, &z, &x, &m] {
+        node.wait_ready(&client).await;
+    }
+    eventually("gossip to form", || all_report(&client, vec![&y, &z, &x, &m], 3)).await;
+    x.signal("STOP");
+    m.signal("STOP");
+    eventually("Y and Z to declare X and M down", || async {
+        y.members_gauge(&client).await == Some(1) && z.members_gauge(&client).await == Some(1)
+    })
+    .await;
+    y.signal("STOP");
+    z.signal("STOP");
+    x.signal("CONT");
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    m.signal("CONT");
+    let took = x_and_m_alone_together(&client, &x, &m).await;
+    assert!(took < Duration::from_secs(30), "X and M took {took:?}");
+    y.signal("CONT");
+    z.signal("CONT");
+}
+
+/// The same with Y and Z stopped for good (`TERM`) while X and M are frozen.
+#[tokio::test]
+#[ignore = "boots a real four-node cluster; run with --ignored"]
+async fn a_member_declared_down_while_frozen_rejoins_and_declares_its_dead_peers_down() {
+    let client = reqwest::Client::new();
+    let (y, z, x, m) = rejoin_cluster();
+    for node in [&y, &z, &x, &m] {
+        node.wait_ready(&client).await;
+    }
+    eventually("gossip to form", || all_report(&client, vec![&y, &z, &x, &m], 3)).await;
+    x.signal("STOP");
+    m.signal("STOP");
+    eventually("Y and Z to declare X and M down", || async {
+        y.members_gauge(&client).await == Some(1) && z.members_gauge(&client).await == Some(1)
+    })
+    .await;
+    y.signal("TERM");
+    z.signal("TERM");
+    y.wait_exit(Duration::from_secs(60));
+    z.wait_exit(Duration::from_secs(60));
+    x.signal("CONT");
+    m.signal("CONT");
+    let took = x_and_m_alone_together(&client, &x, &m).await;
+    assert!(took < Duration::from_secs(30), "X and M took {took:?}");
 }

@@ -287,6 +287,10 @@ struct Replay {
     answered: BTreeSet<NodeId>,
     /// How far each peer's replay has read and applied, across rounds.
     cursors: BTreeMap<NodeId, kimmy_core::Hlc>,
+    /// Where each peer's outbound replay stands in records at its position, across
+    /// rounds: the cursor of the last page of records alone this member stored
+    /// (m1 of the B5 build review). In memory only.
+    records: BTreeMap<NodeId, kimmy_storage::ReplayRecords>,
     /// How long a peer keeps the oplog: what is older than this can no longer be
     /// read back, and asking for it is answered `BeyondHorizon`. `None` when
     /// retention collection is off.
@@ -868,6 +872,24 @@ impl CatchUp {
         replay.horizon_since.remove(&peer);
         let cursor = replay.cursors.entry(peer).or_default();
         *cursor = (*cursor).max(hlc);
+    }
+
+    /// Where `peer`'s replay stands in records at the position it asks from: the
+    /// records cursor of the last page of records alone stored from it there.
+    pub fn replay_records(&self, peer: NodeId) -> Option<kimmy_storage::ReplayRecords> {
+        let replay = self.replay.lock();
+        let at = replay.asks_from(peer);
+        replay.records.get(&peer).filter(|cursor| cursor.at == at).cloned()
+    }
+
+    /// A page of `peer`'s replay was stored with this records cursor (`None`: a
+    /// page that ended the position's records).
+    pub fn set_replay_records(&self, peer: NodeId, cursor: Option<kimmy_storage::ReplayRecords>) {
+        let mut replay = self.replay.lock();
+        match cursor {
+            Some(cursor) => replay.records.insert(peer, cursor),
+            None => replay.records.remove(&peer),
+        };
     }
 
     /// Whether this is the first time in this armed episode that `peer` has shown

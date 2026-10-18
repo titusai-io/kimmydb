@@ -141,6 +141,9 @@ mod page_delta_tests;
 mod idempotency_coverage_tests;
 
 #[cfg(test)]
+mod idempotency_review_tests;
+
+#[cfg(test)]
 mod log_capture;
 #[cfg(feature = "test-hooks")]
 pub use live_walk::stop_open_after_rows_for_test;
@@ -178,7 +181,8 @@ pub use hold_meter::{
 };
 pub use idempotency::{
     CarriedRecord, IdempotencyRecord, InFlightGuard, Keyed, KeyedWrite, ModifyRecorded,
-    RecordOutcome, RecordState, RecordsVia, ReturnedImage, lenient_records,
+    RecordOutcome, RecordState, RecordsVia, ReplayPageRecords, ReplayRecords, ReturnedImage,
+    lenient_records,
 };
 pub use index::{CandidateOrder, Dropped, IndexScan, IndexScanOutcome};
 pub use meta::{CollectionMeta, DatabaseMeta, Enforcement, IndexField, IndexMeta, VectorConfig};
@@ -192,8 +196,9 @@ pub use open_progress::{
 pub use purge::PurgeCounters;
 pub use refusal_hint::{HintKind, RefusalHint};
 pub use snapshot::{
-    CollectionState, LEFT_IDS_NAMED, RecordsBase, SNAPSHOT_PAGE, ServeVerdict, SnapshotApplied,
-    SnapshotCursor, SnapshotDoc, SnapshotPage, SnapshotPolicy, SnapshotProgress, SnapshotTombstone,
+    CollectionState, LEFT_IDS_NAMED, RecordsBase, SNAPSHOT_PAGE, SNAPSHOT_PAGE_BYTES, ServeVerdict,
+    SnapshotApplied, SnapshotCursor, SnapshotDoc, SnapshotPage, SnapshotPolicy, SnapshotProgress,
+    SnapshotTombstone,
 };
 pub use sync::{
     EntryWait, MarkedRange, PeerWindow, PullTiming, SyncOutcome, UnknownCollection, WindowEnd,

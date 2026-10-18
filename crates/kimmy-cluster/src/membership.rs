@@ -32,7 +32,9 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use foca::{Config, Foca, Identity, Notification, PostcardCodec, Timer};
+use foca::{
+    Config, Foca, Identity, NoCustomBroadcast, Notification, PostcardCodec, Runtime, Timer,
+};
 use kimmy_core::{CollectionId, NodeId};
 
 use crate::facts::{
@@ -861,6 +863,70 @@ enum Input {
     Announce(SocketAddr),
 }
 
+/// This crate's SWIM instance.
+pub(crate) type Swim = Foca<Member, PostcardCodec, rand::rngs::StdRng, NoCustomBroadcast>;
+
+/// What follows every input foca handles: after one that made this member
+/// rejoin, foca is asked to judge its connection state again.
+///
+/// **Why (foca 2.0.0).** A member that learns it was declared down by a
+/// `TurnUndead` message (the one a peer sends to a member it declares down,
+/// which a member that was paused or cut off reads first when it is back)
+/// rejoins inside `handle_data` through `attempt_rejoin`, which calls
+/// `change_identity`, which resets the instance to `Disconnected`, bumping its
+/// timer token so every timer already scheduled is ignored. Only `apply_many`
+/// judges the connection state again (its last step makes an instance with
+/// active members `Connected`, and schedules its probe, gossip and announce
+/// timers), and the `TurnUndead` paths (from a sender held active, and from one
+/// held down) rejoin after it, or without it. The member then probes no one,
+/// gossips nothing, announces nothing and acks no ping, while still listing its
+/// peers live: until an active peer happens to send it something its new
+/// identity accepts, which, with every peer it could hear from paused or dead,
+/// is never. `apply_many` with no updates is foca's public way to have the
+/// state judged again; this call can go once foca does it itself on that path.
+///
+/// `rejoined` is whether the input's handling notified `Rejoin`.
+pub(crate) fn after_input(swim: &mut Swim, rejoined: bool, runtime: impl Runtime<Member>) {
+    if rejoined && let Err(e) = swim.apply_many(std::iter::empty(), false, runtime) {
+        warn!(error = %e, "membership could not resume after rejoining the cluster");
+    }
+}
+
+/// The addresses to announce this member to when discovery offers `offered`:
+/// that address, and, **while this member holds no active member**, every other
+/// address in foca's member table, the members it holds down included.
+///
+/// **Why.** A member with no active member is `Disconnected`, and every timer
+/// foca schedules for itself (probe, gossip, announce, announce to the members
+/// it holds down) needs it connected: it says nothing until something reaches
+/// it. Discovery offers the configured seeds only, so two members that both
+/// rejoined after a pause, each holding the other's earlier identity down and
+/// unaware of its new one, whose seeds are all gone, would each stay alone for
+/// good. Announcing to what the table still knows lets each find the other, as
+/// foca's own announce to down members would if it were connected.
+///
+/// **Cost.** Bounded by the member table (a member held down stays in it for
+/// `Config::remove_down_after`, 24 hours), and only while this member is alone;
+/// the membership loop sends it at most once every [`ALONE_ANNOUNCE_EVERY`].
+pub(crate) fn announce_targets(swim: &Swim, offered: SocketAddr) -> Vec<SocketAddr> {
+    let mut targets = vec![offered];
+    if swim.num_members() == 0 {
+        let own = swim.identity().addr;
+        for member in swim.iter_membership_state() {
+            let addr = member.id().addr;
+            if addr != own && !targets.contains(&addr) {
+                targets.push(addr);
+            }
+        }
+    }
+    targets
+}
+
+/// The least time between two announces to the whole member table by a member
+/// that is alone ([`announce_targets`]): discovery offers each seed every
+/// interval, and the table is announced to once for all of them.
+const ALONE_ANNOUNCE_EVERY: Duration = Duration::from_secs(1);
+
 /// Collects foca's outputs so they can be dispatched after the call returns.
 ///
 /// foca's `Runtime` is synchronous, but sending a datagram and sleeping are
@@ -870,6 +936,8 @@ struct Collector {
     outgoing: Vec<(SocketAddr, Vec<u8>)>,
     timers: Vec<(Timer<Member>, Duration)>,
     members: Members,
+    /// Whether the input being handled made this member rejoin.
+    rejoined: bool,
 }
 
 impl foca::Runtime<Member> for Collector {
@@ -905,6 +973,7 @@ impl foca::Runtime<Member> for Collector {
             Notification::Rejoin(identity) => {
                 info!(as_member = %identity.addr, "rejoined the cluster");
                 self.members.clear_for_own_defunct();
+                self.rejoined = true;
             }
             other => debug!(?other, "membership notification"),
         }
@@ -941,7 +1010,7 @@ pub async fn run(
     // Seeded from the OS. SWIM uses randomness to pick probe targets, so a
     // predictable sequence would make every node probe in the same order.
     let rng: rand::rngs::StdRng = rand::make_rng();
-    let mut foca = Foca::new(identity, config, rng, PostcardCodec);
+    let mut foca: Swim = Foca::new(identity, config, rng, PostcardCodec);
     let socket = Arc::new(socket);
     let (tx, mut rx) = mpsc::channel::<Input>(1024);
 
@@ -1027,13 +1096,31 @@ pub async fn run(
 
     info!(bind = %local, "gossiping membership");
 
-    let mut collector = Collector { outgoing: Vec::new(), timers: Vec::new(), members };
+    let mut collector =
+        Collector { outgoing: Vec::new(), timers: Vec::new(), members, rejoined: false };
 
+    let mut announced_alone: Option<Instant> = None;
     while let Some(input) = rx.recv().await {
         let result = match input {
             Input::Data(bytes) => foca.handle_data(&bytes, &mut collector),
             Input::Timer(timer) => foca.handle_timer(timer, &mut collector),
-            Input::Announce(addr) => foca.announce(Member::announcing(addr), &mut collector),
+            Input::Announce(addr) => {
+                let alone_due = foca.num_members() == 0
+                    && announced_alone.is_none_or(|at| at.elapsed() >= ALONE_ANNOUNCE_EVERY);
+                let targets = if alone_due {
+                    announced_alone = Some(Instant::now());
+                    announce_targets(&foca, addr)
+                } else {
+                    vec![addr]
+                };
+                let mut result = Ok(());
+                for target in targets {
+                    if let Err(e) = foca.announce(Member::announcing(target), &mut collector) {
+                        result = Err(e);
+                    }
+                }
+                result
+            }
         };
 
         if let Err(e) = result {
@@ -1041,6 +1128,8 @@ pub async fn run(
             // everyone; foca's state is unchanged by a rejected message.
             debug!(error = %e, "membership input rejected");
         }
+        let rejoined = std::mem::take(&mut collector.rejoined);
+        after_input(&mut foca, rejoined, &mut collector);
 
         // Dispatch what foca asked for. Datagrams are best-effort by design —
         // SWIM assumes loss and probes again — so a send failure is logged at
@@ -1107,6 +1196,9 @@ impl SeedFeed {
 mod yield_tests;
 
 #[cfg(test)]
+mod rejoin_tests;
+
+#[cfg(test)]
 mod tests {
     use super::*;
 
@@ -1143,8 +1235,12 @@ mod tests {
         assert_eq!(members.peer_states()[&node(1)], PeerState::IneligibleCatchingUp);
         assert!(members.unconfirmed_peers(OwnerClass::Ttl).is_empty());
 
-        let mut collector =
-            Collector { outgoing: Vec::new(), timers: Vec::new(), members: members.clone() };
+        let mut collector = Collector {
+            outgoing: Vec::new(),
+            timers: Vec::new(),
+            members: members.clone(),
+            rejoined: false,
+        };
         collector.notify(Notification::Rename(&old, &new));
         assert_eq!(members.peer_states()[&node(1)], PeerState::Unknown, "its block is dropped");
         assert_eq!(

@@ -147,7 +147,10 @@ where it stopped instead of applying again. What a client must do to rely on it:
   Without the capability, the rules above apply.
 - **Send the retry byte for byte as the first attempt**, with the same key.
   The same key with a different body, path or query is
-  `422 idempotency_key_reused`; a new request needs a new key.
+  `422 idempotency_key_reused`; a new request needs a new key. So is every
+  retry under a key that two members each accepted for two different requests
+  (a key reused across them before either had the other's record), once their
+  records have met: neither first answer can stand for the key.
 - **Retry on the member that took the write, once it serves again.** A member
   that has not yet received the write cannot know the key and applies it a
   second time, answering without the marker; there is no wait after which
@@ -183,7 +186,9 @@ where it stopped instead of applying again. What a client must do to rely on it:
   it once the member takes them again; until then the rules above apply. A
   `400` naming the key's syntax or the route is the client's to fix.
 - A key is remembered for `idempotencyWindowSecs` (`GET /v1/version`), 24 hours
-  by default. A retry later than that is a new request.
+  by default. A retry later than that is a new request. A drop of the
+  collection does not end it: a retry after the collection was dropped, and
+  created again or not, replays its first answer and writes nothing.
 
 ---
 

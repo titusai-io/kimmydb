@@ -289,29 +289,6 @@ impl Engine {
             }
             after = chunk.last;
         }
-        // The idempotency records of the life before (B5): those whose `last` is
-        // at or before the drop. For space only, and after the floor's commit,
-        // from which they are history whether they stay or go; so a stop or a
-        // failure here ends this step and not the sweep, and what it leaves
-        // expires by age.
-        if survived {
-            let id = CollectionId::derive(db, name);
-            match self.sweep_late_drop_records(id, dropped, stop) {
-                Ok(0) => {}
-                Ok(records) => debug!(
-                    db,
-                    collection = name,
-                    records,
-                    "removed the idempotency records of the life before a drop"
-                ),
-                Err(e) => debug!(
-                    db,
-                    collection = name,
-                    error = %e,
-                    "left the idempotency records of the life before a drop to expire"
-                ),
-            }
-        }
         if skipped > 0 {
             warn!(
                 db,

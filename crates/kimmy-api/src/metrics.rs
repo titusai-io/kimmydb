@@ -539,6 +539,9 @@ pub struct MetricsSnapshot {
     pub idempotency_records: u64,
     pub idempotency_records_received: [u64; RECORDS_RECEIVED_VIA.len()],
     pub idempotency_records_undecodable: u64,
+    /// Records that fit no frame or replay page that must carry them, by
+    /// `kimmy_cluster::UnfitPath` (m1 of the B5 build review).
+    pub idempotency_records_unfit: [u64; 3],
     pub idempotency_records_collected: u64,
     /// Definition repairs by outcome (`DigestRepairOutcome::DEFINITION` are the labels used),
     /// the loop guard's judgements of them (`DefinitionJudgement::ALL`) and what their pages
@@ -1562,6 +1565,9 @@ impl Metrics {
             idempotency_records: readings.idempotency.records,
             idempotency_records_received: readings.idempotency.received,
             idempotency_records_undecodable: readings.idempotency.undecodable,
+            idempotency_records_unfit: std::array::from_fn(|slot| {
+                kimmy_cluster::records_unfit().get(kimmy_cluster::UnfitPath::ALL[slot])
+            }),
             idempotency_records_collected: readings.idempotency.collected,
             sync_definition_repairs: std::array::from_fn(|slot| {
                 self.get(&self.sync_definition_repairs[slot])
@@ -2000,6 +2006,9 @@ impl Metrics {
              # HELP kimmy_idempotency_records_undecodable_total Idempotency records a peer sent that this build could not decode, and dropped; the write they came with is applied. A record of a newer format is skipped this way, not fatal.\n\
              # TYPE kimmy_idempotency_records_undecodable_total counter\n\
              kimmy_idempotency_records_undecodable_total {idempotency_undecodable}\n\
+             # HELP kimmy_idempotency_records_unfit_total Frames and replay pages that could not carry the idempotency records they must, by path, each logged at WARN: one record, or the records the sender cannot vouch for by its oplog, larger than a frame. pull: a window a peer pulled, answered as one entry that cannot replicate or with no entries; push: a push not sent; replay: a page of a peer's replay that carried nothing. Should read 0.\n\
+             # TYPE kimmy_idempotency_records_unfit_total counter\n\
+             {idempotency_unfit_lines}\
              # HELP kimmy_idempotency_records_collected_total Idempotency records retention removed, once storage.oplog_retention_secs had passed since their last commit.\n\
              # TYPE kimmy_idempotency_records_collected_total counter\n\
              kimmy_idempotency_records_collected_total {idempotency_collected}\n\
@@ -2224,6 +2233,16 @@ impl Metrics {
                 })
                 .collect::<String>(),
             idempotency_undecodable = readings.idempotency.undecodable,
+            idempotency_unfit_lines = kimmy_cluster::UnfitPath::ALL
+                .iter()
+                .map(|path| {
+                    format!(
+                        "kimmy_idempotency_records_unfit_total{{path=\"{}\"}} {}\n",
+                        path.label(),
+                        kimmy_cluster::records_unfit().get(*path)
+                    )
+                })
+                .collect::<String>(),
             idempotency_collected = readings.idempotency.collected,
             sync_definition_repairs_lines = kimmy_cluster::DigestRepairOutcome::DEFINITION
                 .iter()
@@ -3951,6 +3970,11 @@ kimmy_idempotency_records_received_total{via=\"repair\"} 1615
 # HELP kimmy_idempotency_records_undecodable_total Idempotency records a peer sent that this build could not decode, and dropped; the write they came with is applied. A record of a newer format is skipped this way, not fatal.
 # TYPE kimmy_idempotency_records_undecodable_total counter
 kimmy_idempotency_records_undecodable_total 1621
+# HELP kimmy_idempotency_records_unfit_total Frames and replay pages that could not carry the idempotency records they must, by path, each logged at WARN: one record, or the records the sender cannot vouch for by its oplog, larger than a frame. pull: a window a peer pulled, answered as one entry that cannot replicate or with no entries; push: a push not sent; replay: a page of a peer's replay that carried nothing. Should read 0.
+# TYPE kimmy_idempotency_records_unfit_total counter
+kimmy_idempotency_records_unfit_total{path=\"pull\"} 0
+kimmy_idempotency_records_unfit_total{path=\"push\"} 0
+kimmy_idempotency_records_unfit_total{path=\"replay\"} 0
 # HELP kimmy_idempotency_records_collected_total Idempotency records retention removed, once storage.oplog_retention_secs had passed since their last commit.
 # TYPE kimmy_idempotency_records_collected_total counter
 kimmy_idempotency_records_collected_total 1631
@@ -4634,6 +4658,12 @@ kimmy_storage_cache_reads_total{result=\"miss\"} 9104
             "kimmy_idempotency_records_undecodable_total {}\n",
             s.idempotency_records_undecodable
         ));
+        for (path, count) in kimmy_cluster::UnfitPath::ALL.iter().zip(s.idempotency_records_unfit) {
+            expect(&format!(
+                "kimmy_idempotency_records_unfit_total{{path=\"{}\"}} {count}\n",
+                path.label()
+            ));
+        }
         expect(&format!(
             "kimmy_idempotency_records_collected_total {}\n",
             s.idempotency_records_collected
@@ -5082,13 +5112,15 @@ kimmy_storage_cache_reads_total{result=\"miss\"} 9104
                 + kimmy_cluster::DefinitionJudgement::ALL.len()
                 + kimmy_storage::DEFINITION_RESULTS.len()
                 // Keyed requests by outcome, peer replays, the records held, the
-                // records received by way, undecodable and collected (B5).
+                // records received by way, undecodable and collected (B5), and
+                // those that fit no frame, by path (m1).
                 + crate::idempotency::KeyedOutcome::ALL.len()
                 + 1
                 + 1
                 + RECORDS_RECEIVED_VIA.len()
                 + 1
-                + 1,
+                + 1
+                + kimmy_cluster::UnfitPath::ALL.len(),
             "expected one sample per series: {out}"
         );
     }

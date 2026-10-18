@@ -682,6 +682,10 @@ mod tests {
                 let year_on = crate::physical_now_ms() + 365 * 24 * 3_600_000;
                 e.collect_garbage_at(year_on, crate::RetentionPolicy::new(1, 1)).map(drop)
             }),
+            // covers: idempotency_replay::Engine::replay_records_in
+            ("records_for_replay_page", |e, c| {
+                e.records_for_replay_page(&[c.id], Hlc::ZERO, Hlc::MAX).map(drop)
+            }),
             // covers: index::Engine::index_keyed_entries_after
             ("index_keyed_entries_after", |e, c| {
                 let index = c.index("by_n").unwrap();
