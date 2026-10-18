@@ -2207,7 +2207,15 @@ async fn every_page_of_records_alone_advances_its_key(outbound: bool) {
     plant_spanning_records(&f, 40);
     let _budget = EntryBudget::set(8 * 1024);
     take_cuts();
-    f.replay_through(outbound).await;
+    // The pages first, whether or not the replay finished: a page that kept its
+    // key is named here rather than as a replay that never ends.
+    for _ in 0..8 {
+        let round = if outbound { f.round_outbound().await } else { f.round().await };
+        round.unwrap();
+        if f.catch_up.replay_answered(f.c.node_id()) {
+            break;
+        }
+    }
     let cuts = take_cuts();
     let alone: Vec<_> = cuts.iter().filter(|cut| cut.records_alone).collect();
     assert!(alone.len() >= 4, "premise: pages of records alone: {}", alone.len());
@@ -2219,6 +2227,7 @@ async fn every_page_of_records_alone_advances_its_key(outbound: bool) {
             assert!(key_of(went) > key_of(came), "the key strictly advances: {cut:?}");
         }
     }
+    assert!(f.catch_up.replay_answered(f.c.node_id()), "and the replay finishes");
 }
 
 #[tokio::test]
