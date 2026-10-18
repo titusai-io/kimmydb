@@ -1783,7 +1783,10 @@ impl World {
             }
             Answer::Failed(e) => {
                 self.accepted[r as usize] |= !minted.is_empty();
-                self.finished[r as usize] = false;
+                // Refused because its key now names another request (one sent under the
+                // reused key after a drop made this one's record history): nothing more
+                // can happen to it, and the home track's drive must not wait for it.
+                self.finished[r as usize] = matches!(e, StorageError::IdempotencyKeyReused);
                 self.note(format!("r{r} on {}: {e}, minted [{shown}]", LETTERS[m]));
             }
         }
@@ -2745,9 +2748,26 @@ impl World {
                     };
                     let tombstones =
                         [a.is_none().then(|| tombstone(0)), b.is_none().then(|| tombstone(m))];
+                    // Or a drop of the collection, made by such an identity, at or above
+                    // the version the other side holds: the life it ended is buried here.
+                    let present = a.or(b).map(|(s, _)| s.hlc);
+                    let buried_by = |member: usize| -> Option<Stamp> {
+                        let floor = self.floor(member, k.0).ok()?;
+                        if present.is_none_or(|at| floor < at) {
+                            return None;
+                        }
+                        self.ghost
+                            .drops
+                            .iter()
+                            .find(|(c, at)| *c == k.0 && at.hlc == floor)
+                            .map(|(_, at)| *at)
+                    };
+                    let drops =
+                        [a.is_none().then(|| buried_by(0)), b.is_none().then(|| buried_by(m))];
                     retired_only &= (retired(a) || retired(b))
                         && ([a, b].iter().flatten().any(|(s, _)| gone(s))
-                            || tombstones.iter().flatten().flatten().any(gone));
+                            || tombstones.iter().flatten().flatten().any(gone)
+                            || drops.iter().flatten().flatten().any(gone));
                     let _ = write!(
                         diff,
                         " {k:?}: A {:?} / {} {:?};",
