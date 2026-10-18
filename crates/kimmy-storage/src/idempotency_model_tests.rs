@@ -192,7 +192,7 @@ const ITEM_BASE: i64 = 100;
 /// The model's frame for a replay page, in units: an entry or a record costs one. Small,
 /// so that a page whose first entry needs more records than a frame holds carries
 /// records alone (m1) in generated schedules too.
-const REPLAY_FRAME: usize = 6;
+const REPLAY_FRAME: usize = 4;
 /// The bytes a replay page's records delta under a cursor takes (`budget / 2` of the
 /// transport's frame): a few records, so a delta that does not reach the log's end
 /// moves the cursor's base (m1).
@@ -608,6 +608,8 @@ pub(crate) struct Outcome {
     pub kr: usize,
     /// Lookups refused on a record the model holds contested, as the algebra says.
     pub contested_refused: usize,
+    /// Members' records the algebra held contested, each once.
+    pub contested_records: usize,
     /// Multi-chunk requests stopped partially applied because their record turned
     /// contested between two of their chunks, as the algebra says.
     pub contested_stopped: usize,
@@ -756,6 +758,8 @@ struct Ghost {
     /// entries hold no record, and a retry meets the first standing document as a
     /// duplicate and writes nothing. I2 does not hold them to a record.
     bare: HashSet<u8>,
+    /// Every (node, collection, key) whose live record the algebra has held contested.
+    contested: HashSet<(NodeId, u8, u8)>,
 }
 
 impl Ghost {
@@ -1264,6 +1268,12 @@ impl World {
             for (c, key) in self.keys() {
                 let Some(record) = self.live_record(m, c, key)? else { continue };
                 let set = self.fps(m, c, key);
+                if set.len() >= 2 {
+                    let node = self.e(m).node_id();
+                    if self.ghost.contested.insert((node, c, key)) {
+                        self.out.contested_records += 1;
+                    }
+                }
                 let of = record.fingerprint.0[0].wrapping_sub(1);
                 let agrees = if set.len() >= 2 {
                     record.contested
@@ -4062,7 +4072,7 @@ impl Gen {
     fn new_request(&mut self) -> u8 {
         let r = self.requests.len() as u8;
         let kind = self.kind();
-        let key = if !self.open.is_empty() && self.rng.chance(10) {
+        let key = if !self.open.is_empty() && self.rng.chance(15) {
             let q = self.rng.pick(&self.open.clone());
             self.requests[q as usize].key
         } else {
@@ -4437,7 +4447,7 @@ pub(crate) fn generate(seed: u64, track: Track, len: usize) -> Schedule {
                     Op { step: Step::Rewind { m }, t: plan.t(m, -back) }
                 }
             }
-            96 => Op { step: Step::Orphan { m: plan.member() }, t: 0 },
+            96..=97 => Op { step: Step::Orphan { m: plan.member() }, t: 0 },
             91..=92 => {
                 // The window passes: an era ends.
                 plan.g += WINDOW_SECS as i64 * 1000 + 500;
@@ -4482,6 +4492,7 @@ struct Sweep {
     left_by_first: usize,
     kr: usize,
     contested_refused: usize,
+    contested_records: usize,
     contested_stopped: usize,
     records_restarts: usize,
     records_alone: usize,
@@ -4531,6 +4542,7 @@ fn sweep(seeds: std::ops::Range<u64>, len: usize, threads: usize) -> Sweep {
                         t.left_by_first += out.left_by_first;
                         t.kr += out.kr;
                         t.contested_refused += out.contested_refused;
+                        t.contested_records += out.contested_records;
                         t.contested_stopped += out.contested_stopped;
                         t.records_restarts += out.records_restarts;
                         t.records_alone += out.records_alone;
@@ -4566,7 +4578,7 @@ fn sweep(seeds: std::ops::Range<u64>, len: usize, threads: usize) -> Sweep {
          of orders: {} schedules with one during a call, {} with an `$inc` written on both \
          sides of one, {} with one call's writes on both sides; {} I8 checks, {} counters \
          left at or above a merged first, {} home runs without exact I5; the contested \
-         algebra: {} lookups refused, {} requests stopped between chunks; {} snapshot pages \
+         algebra: {} records contested, {} lookups refused, {} requests stopped between chunks; {} snapshot pages \
          refused at the zero records base (m4), {} replay pages of records alone (m1), {} \
          records cursors started over, {} records offered past their window (m2); {} \
          rewinds ({} records removed, {} reopened), {} records orphaned; in {:.1?}",
@@ -4585,6 +4597,7 @@ fn sweep(seeds: std::ops::Range<u64>, len: usize, threads: usize) -> Sweep {
         totals.i8_checks,
         totals.left_by_first,
         totals.i5_off,
+        totals.contested_records,
         totals.contested_refused,
         totals.contested_stopped,
         totals.records_restarts,
