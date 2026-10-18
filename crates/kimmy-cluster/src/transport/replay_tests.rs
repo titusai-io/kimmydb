@@ -191,6 +191,22 @@ where
 /// Nothing: the hook point every scripted test starts from.
 async fn f_script(_stream: &mut tokio::io::DuplexStream, _f: &Fixture) {}
 
+/// C's servable vector, as a round reads it.
+async fn ask_versions_servable(
+    stream: &mut tokio::io::DuplexStream,
+) -> Option<kimmy_core::VersionVector> {
+    write_frame(
+        stream,
+        &Message::AskVersions { witnessed: true, facts: None, facts_gen: None, echo: None },
+    )
+    .await
+    .ok()?;
+    match read_frame(stream).await.ok()? {
+        Message::Vectors { servable, .. } => Some(servable),
+        _ => None,
+    }
+}
+
 async fn ask_versions(stream: &mut tokio::io::DuplexStream) -> Option<Hlc> {
     write_frame(
         stream,
@@ -1470,6 +1486,51 @@ impl Fixture {
         outcome
     }
 
+    /// The outbound replay alone, and not the ordinary pull its round goes on
+    /// to: A dials C, reads C's vectors and asks for the replay of its origin
+    /// (`replay_own_origin`), so what A holds after is what the replay brought.
+    async fn replay_outbound_only(&self) -> Result<(), ProtocolError> {
+        let (mut ours, far) = tokio::io::duplex(MAX_FRAME);
+        let serving = async {
+            let _ = serve_peer(&self.c, far, SECRET, BINDING, None, ServeBudgets::serving(), None)
+                .await;
+        };
+        let asking = async {
+            open_handshake(&self.a, &mut ours, SECRET, BINDING).await.unwrap();
+            let theirs = match ask_versions_servable(&mut ours).await {
+                Some(theirs) => theirs,
+                None => return Err(ProtocolError::Malformed("no vectors".into())),
+            };
+            let deadline = Instant::now() + Duration::from_secs(20);
+            let replayed = replay_own_origin(
+                &self.a,
+                &mut ours,
+                addr(),
+                self.c.node_id(),
+                &theirs,
+                &self.catch_up,
+                deadline,
+            )
+            .await;
+            drop(ours);
+            replayed
+        };
+        let ((), replayed) = tokio::join!(serving, asking);
+        replayed
+    }
+
+    /// The outbound replay alone, contact after contact, until C has answered it,
+    /// at most eight.
+    async fn replay_outbound_only_through(&self) {
+        for _ in 0..8 {
+            self.replay_outbound_only().await.unwrap();
+            if self.catch_up.replay_answered(self.c.node_id()) {
+                return;
+            }
+        }
+        panic!("the outbound replay is not answered after eight contacts");
+    }
+
     /// Rounds one way until C has answered A's replay, at most eight.
     async fn replay_through(&self, outbound: bool) {
         for _ in 0..8 {
@@ -1631,7 +1692,9 @@ async fn b2_an_inbound_replay_carries_a_record_with_no_row_of_the_requesters_ori
 #[tokio::test]
 async fn b2_an_outbound_replay_carries_a_record_with_no_row_of_the_requesters_origin() {
     let (f, k) = other_origins_record(false);
-    f.replay_through(true).await;
+    // The replay alone: the ordinary pull that follows it in a round would bring
+    // Q's entries, and the record with them, by coverage.
+    f.replay_outbound_only_through().await;
     the_restored_member_holds_the_effect_with_its_record(&f, &k);
 }
 
