@@ -4440,3 +4440,88 @@ async fn a_decimal128_id_is_created_where_declared_and_applied_everywhere() {
     })
     .await;
 }
+
+// ---------------------------------------------------------------------------
+// A member declared down that rejoins goes on failure detecting
+// ---------------------------------------------------------------------------
+
+/// Y, Z, X and M, seeded as the field run that found it: Y and Z seed each
+/// other, X and M seed Y.
+fn rejoin_cluster() -> (Node, Node, Node, Node) {
+    let (py, pz, px, pm) = (ports::choose(), ports::choose(), ports::choose(), ports::choose());
+    (
+        Node::spawn_with("node-y", py, &[pz], ""),
+        Node::spawn_with("node-z", pz, &[py], ""),
+        Node::spawn_with("node-x", px, &[py], ""),
+        Node::spawn_with("node-m", pm, &[py], ""),
+    )
+}
+
+/// Until X and M each count exactly one live member, the other, and return how
+/// long that took.
+async fn x_and_m_alone_together(client: &reqwest::Client, x: &Node, m: &Node) -> Duration {
+    let started = std::time::Instant::now();
+    eventually("X and M to declare Y and Z down and see each other live", || async {
+        x.members_gauge(client).await == Some(1) && m.members_gauge(client).await == Some(1)
+    })
+    .await;
+    started.elapsed()
+}
+
+/// X and M are frozen (SIGSTOP) until Y and Z declare them down, then Y and Z
+/// are frozen and X and M resumed. X and M learn they were declared down and
+/// rejoin; they must then declare the frozen Y and Z down within SWIM's own
+/// timing (a probe, its round trip and the suspicion time, about 6.5 s here)
+/// and find each other. Before the fix a member that rejoined on a `TurnUndead`
+/// sat disconnected, probing no one: X and M held Y and Z live for good.
+#[tokio::test]
+#[ignore = "boots a real four-node cluster; run with --ignored"]
+async fn a_member_declared_down_while_frozen_rejoins_and_declares_its_frozen_peers_down() {
+    let client = reqwest::Client::new();
+    let (y, z, x, m) = rejoin_cluster();
+    for node in [&y, &z, &x, &m] {
+        node.wait_ready(&client).await;
+    }
+    eventually("gossip to form", || all_report(&client, vec![&y, &z, &x, &m], 3)).await;
+    x.signal("STOP");
+    m.signal("STOP");
+    eventually("Y and Z to declare X and M down", || async {
+        y.members_gauge(&client).await == Some(1) && z.members_gauge(&client).await == Some(1)
+    })
+    .await;
+    y.signal("STOP");
+    z.signal("STOP");
+    x.signal("CONT");
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    m.signal("CONT");
+    let took = x_and_m_alone_together(&client, &x, &m).await;
+    assert!(took < Duration::from_secs(30), "X and M took {took:?}");
+    y.signal("CONT");
+    z.signal("CONT");
+}
+
+/// The same with Y and Z stopped for good (`TERM`) while X and M are frozen.
+#[tokio::test]
+#[ignore = "boots a real four-node cluster; run with --ignored"]
+async fn a_member_declared_down_while_frozen_rejoins_and_declares_its_dead_peers_down() {
+    let client = reqwest::Client::new();
+    let (y, z, x, m) = rejoin_cluster();
+    for node in [&y, &z, &x, &m] {
+        node.wait_ready(&client).await;
+    }
+    eventually("gossip to form", || all_report(&client, vec![&y, &z, &x, &m], 3)).await;
+    x.signal("STOP");
+    m.signal("STOP");
+    eventually("Y and Z to declare X and M down", || async {
+        y.members_gauge(&client).await == Some(1) && z.members_gauge(&client).await == Some(1)
+    })
+    .await;
+    y.signal("TERM");
+    z.signal("TERM");
+    y.wait_exit(Duration::from_secs(60));
+    z.wait_exit(Duration::from_secs(60));
+    x.signal("CONT");
+    m.signal("CONT");
+    let took = x_and_m_alone_together(&client, &x, &m).await;
+    assert!(took < Duration::from_secs(30), "X and M took {took:?}");
+}

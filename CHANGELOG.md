@@ -10,6 +10,12 @@ Versioning follows the pre-1.0 policy in
 [docs/compatibility.md](docs/compatibility.md): a `0.MINOR` bump may carry
 breaking changes and says so here; a `0.x.PATCH` bump never does.
 
+## Unreleased
+
+### Fixed
+
+- **A member the cluster declared down while it was paused or cut off could stop failure detecting for good after it rejoined.** A member that learns it was declared down from a peer's `TurnUndead` (the message a peer sends the moment it declares a member down, which a paused or partitioned member reads first when it is back) rejoins under a new incarnation, and the SWIM library it runs on (foca 2.0.0) then left it disconnected: it probed no peer, gossiped and announced nothing and acked no ping, while still counting every peer it knew as live. Members that died meanwhile stayed in its member set, its `kimmy_cluster_members` gauge, `/v1/topology` and the ownership computed over them, until a live peer happened to reach its new identity, and never if every peer it could hear from was paused or gone. It now resumes probing as it rejoins, declares a dead peer down within SWIM's own timing (about 6.5 s), and is seen live again by the members that are. No configuration, wire, table or schema change, and not a rollback boundary.
+
 ## 0.51.0 - 2026-10-17
 
 **Read before upgrading, three things for Decimal128 and a fourth for vector search.**
