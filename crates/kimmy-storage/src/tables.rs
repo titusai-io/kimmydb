@@ -310,11 +310,14 @@ pub const IDEMPOTENCY: TableDefinition<(u64, &[u8]), &[u8]> = TableDefinition::n
 /// `stamp (26 bytes, an oplog key) -> collection id (8) ‖ scope hash (32)`:
 /// every record by the stamps that carry it (B5).
 ///
-/// One row at each record's merged `last`, written by every store of it (a local
-/// commit, a frame, a page), and on a receiver one more at each carrying stamp a
-/// frame names, so a sender finds the record of an entry it ships by the entry's
-/// stamp. What retention reads, a range below its cutoff, to find records past
-/// their window; its last key is in the clock's high water at open. A row whose
+/// Keyed origin-major, `node (16) ‖ hlc (10)`, so the rows of one origin in a
+/// range are one range read. A record has a row at each of its merged `first`
+/// and merged `last`, written by every store of it (a local commit, a frame, a
+/// page), and on a receiver one more at each carrying stamp a frame names, so a
+/// sender finds the records of the coverage a window grants by the rows in it.
+/// What retention reads, per origin below its cutoff, to find records past
+/// their window (it keeps a live record's `first` and `last` rows); the largest
+/// of each origin's last key is in the clock's high water at open. A row whose
 /// record is gone names nothing and expires. Carried by a backup (tag 13).
 pub const IDEMPOTENCY_BY_STAMP: TableDefinition<&[u8], &[u8]> =
     TableDefinition::new("idempotency_by_stamp");

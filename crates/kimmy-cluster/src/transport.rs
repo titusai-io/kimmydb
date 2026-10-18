@@ -1167,7 +1167,7 @@ where
                     Fits::Nothing => {
                         warn!(
                             records = unanchored,
-                            "the idempotency records this node cannot vouch for by its oplog do                              not fit one frame; this window carries no entries and grants the                              peer nothing until this node pulls their entries"
+                            "the idempotency records this node cannot vouch for by its oplog do not fit one frame; this window carries no entries and grants the peer nothing until this node pulls their entries"
                         );
                         write_frame(
                             &mut stream,
@@ -2162,7 +2162,7 @@ where
                         warn!(
                             %peer,
                             records = unanchored,
-                            "the idempotency records this node cannot vouch for by its oplog do                              not fit one replay page; the page carries nothing"
+                            "the idempotency records this node cannot vouch for by its oplog do not fit one replay page; the page carries nothing"
                         );
                         entries.clear();
                         exhausted = false;
