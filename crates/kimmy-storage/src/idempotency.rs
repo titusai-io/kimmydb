@@ -1522,7 +1522,11 @@ impl FrameRecords {
     /// Whether a record carried at `carrying` is stored with the entry stamped
     /// `at`: its row is at or before the entry (a record with no row rides with
     /// any). One whose row is past the entry waits for an entry at or after it,
-    /// or for the batch's last transaction.
+    /// or for the batch's last transaction. With a window carrying each record
+    /// at the lowest of its own rows it found (B1), riding by that row stores it
+    /// no later than the run that takes the effect there; an effect below it
+    /// lies in coverage the receiver held already, for which it holds a version
+    /// of the record (INV-C).
     fn rides_by(carrying: Option<Stamp>, at: Stamp) -> bool {
         carrying.is_none_or(|row| row <= at)
     }

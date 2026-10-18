@@ -1151,13 +1151,10 @@ fn a_snapshot_page_leaves_a_dropped_collections_record_and_a_retry_replays() {
 /// The same, end to end: the sender's records phase must carry the dropped
 /// collection's record itself.
 ///
-/// **Depends on branch `idempotency-p2`** (dropped-collection records in a
-/// snapshot: its records phase walks the ids under `COLLECTIONS_DROPPED`, and
-/// its delta and pages stop filtering records by whether their collection
-/// stands). Ignored here until that branch merges ahead of this one; un-ignore
-/// it then.
+/// Needs the dropped-collection records of a snapshot: its records phase walks
+/// the ids under `COLLECTIONS_DROPPED`, and its delta and pages do not filter
+/// records by whether their collection stands.
 #[test]
-#[ignore = "depends on idempotency-p2: its records phase walks the ids under COLLECTIONS_DROPPED"]
 fn a_member_rebuilt_by_snapshot_after_a_drop_replays_the_old_key() {
     let a = member();
     let ca = a.engine.create_collection("shop", "orders").unwrap();

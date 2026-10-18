@@ -1880,12 +1880,10 @@ fn a_pages_delta_carries_a_record_of_a_dropped_collection() {
     );
 }
 
-/// End to end, with the receiver half (G, `idempotency-a`): a member rebuilt by
+/// End to end, with the receiver half (ruling A): a member rebuilt by
 /// snapshot after a drop, the collection not created again, replays a retry of
 /// the old key once the name is created again.
 #[test]
-#[ignore = "needs idempotency-a: store_page_records storing a record of a collection absent \
-            here, and a lookup that answers a key past a drop of its collection"]
 fn a_member_rebuilt_by_snapshot_after_a_drop_replays_a_retry_of_the_old_key() {
     let dir = tempfile::tempdir().unwrap();
     let (y, x) = (open(&dir, "y"), open(&dir, "x"));

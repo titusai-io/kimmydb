@@ -2198,6 +2198,10 @@ fn a_rewind_that_cuts_a_bulk_part_way_removes_its_record() {
     let out = engine.rewind_to(until).unwrap();
     assert_eq!((out.records_removed, out.records_reopened), (1, 0));
     assert_eq!(record(&engine, &coll, &k), None, "cut part-way, and not reopened");
+    assert!(
+        rows(&engine).into_iter().all(|(_, _, scope)| scope != k.scope.0),
+        "no row by stamp names the record the rewind removed"
+    );
     assert_eq!(count(&engine, &coll), 2, "premise: the rewind kept two of three");
     let retry = engine.insert_many_keyed(&coll, docs, &k);
     assert!(
