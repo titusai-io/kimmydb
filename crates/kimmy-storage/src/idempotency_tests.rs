@@ -1020,11 +1020,7 @@ fn a_multi_chunk_record_follows_its_chunks() {
     let m = modify(&stored);
     assert_eq!((m.matched, m.modified, m.commits, m.skipped), (3, 3, 3, 0));
     assert_eq!(m.cursor, Some(crate::docs::doc_key(&DocId::Int64(2)).unwrap()));
-    assert_eq!(
-        rows(&engine).len(),
-        4,
-        "one row per chunk's first entry, and the done commit's own (G8)"
-    );
+    assert_eq!(rows(&engine).len(), 3, "one row per chunk's entry");
     assert!(stored.first < stored.last);
     let again =
         replayed(engine.modify_where_keyed(&coll, &Candidates::Scan, &Inc, None, &k).unwrap());
@@ -1032,11 +1028,12 @@ fn a_multi_chunk_record_follows_its_chunks() {
     assert_eq!(ns(&engine, &coll, 3), vec![1, 1, 1]);
 }
 
-/// An end found by a chunk that writes nothing, after an earlier chunk
-/// committed, is one record-only commit marking the record `done`, at a `last`
-/// minted for it above the last chunk's, with a row of its own (G8).
+/// The end of a keyed request past a full chunk is found by that chunk's
+/// lookahead (G8), which writes `done` in the chunk's own record: no
+/// record-only commit follows, and the record's `last` is the chunk's last
+/// entry.
 #[test]
-fn an_end_found_by_a_chunk_that_writes_nothing_marks_the_record_done() {
+fn the_end_past_a_full_chunk_is_found_by_its_lookahead_and_written_with_it() {
     let (engine, coll, _dir, _path) = open();
     counters(&engine, &coll, 2);
     // Two chunks of one, both full, then a third that finds nothing.
@@ -1044,7 +1041,7 @@ fn an_end_found_by_a_chunk_that_writes_nothing_marks_the_record_done() {
     let commits = engine.commits();
     let out = fresh(engine.modify_where_keyed(&coll, &Candidates::Scan, &Inc, None, &k).unwrap());
     assert_eq!(out.commits, 2, "two chunks wrote");
-    assert_eq!(engine.commits(), commits + 3, "and one more commit marked the record done");
+    assert_eq!(engine.commits(), commits + 2, "and no commit of the record alone");
     let stored = record(&engine, &coll, &k).unwrap();
     assert_eq!(stored.state, RecordState::Done);
     assert_eq!(modify(&stored).commits, 2);
@@ -1055,8 +1052,7 @@ fn an_end_found_by_a_chunk_that_writes_nothing_marks_the_record_done() {
         .map(|e| e.stamp)
         .max()
         .unwrap();
-    assert!(stored.last > last_entry, "a `last` of its own: {stored:?}");
-    assert!(rows(&engine).iter().any(|(s, ..)| *s == stored.last), "and a row at it");
+    assert_eq!(stored.last, last_entry, "`done` with the last chunk's entry");
 }
 
 /// L1. A record's `last` is the stamp of the last entry its commit wrote. A drop

@@ -5304,3 +5304,51 @@ async fn t2_a_cross_origin_relay_carries_the_record_while_its_origin_is_down() {
     y.signal("CONT");
     z.signal("CONT");
 }
+
+/// G8 over real processes: a keyed multi-chunk update on an idle cluster writes
+/// `done` with its last chunk's entry (the chunk's lookahead finds the end), so
+/// every member that has caught up answers a retry from the record, as a replay
+/// and not a resume. Nothing is written after the request.
+#[tokio::test]
+#[ignore = "boots a real three-node cluster; run with --ignored"]
+async fn a_finished_multi_chunk_keyed_update_replays_on_every_caught_up_member() {
+    const PATH: &str = "/v1/db/shop/coll/orders/update";
+    const BODY: &str = r#"{"filter":{},"update":{"$inc":{"n":1}},"multi":true}"#;
+    const KEY: &str = "g8-a-finished-multi-chunk-request";
+    let client = reqwest::Client::new();
+    let docs: Vec<serde_json::Value> =
+        (1..=3).map(|i| serde_json::json!({ "_id": i, "n": 0 })).collect();
+    let (a, b, c, t) =
+        keyed_cluster(&client, "multi_chunk_docs = 1", serde_json::json!(docs)).await;
+    let first = keyed_send(&client, &a, &t[0], reqwest::Method::POST, PATH, BODY, KEY).await;
+    assert_eq!((first.status, first.replayed), (200, false), "{}", first.text);
+    assert_eq!(first.body["commits"], 3, "premise: three chunks: {}", first.text);
+    for (node, token) in [(&a, &t[0]), (&b, &t[1]), (&c, &t[2])] {
+        eventually("every member to hold the three increments", || async {
+            let mut all = true;
+            for id in 1..=3 {
+                all &= n_of(&client, node, token, id).await == Some(1);
+            }
+            all
+        })
+        .await;
+    }
+    for (node, token) in [(&b, &t[1]), (&c, &t[2]), (&a, &t[0])] {
+        eventually("a retry answered from the finished record", || async {
+            let retry =
+                keyed_send(&client, node, token, reqwest::Method::POST, PATH, BODY, KEY).await;
+            assert_eq!(retry.status, 200, "{}: {}", node.name, retry.text);
+            assert!(retry.body.get("resumed").is_none(), "{}: resumed: {}", node.name, retry.text);
+            retry.replayed && retry.text == first.text
+        })
+        .await;
+        for id in 1..=3 {
+            assert_eq!(
+                n_of(&client, node, token, id).await,
+                Some(1),
+                "{}: applied once",
+                node.name
+            );
+        }
+    }
+}

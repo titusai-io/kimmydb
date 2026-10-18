@@ -247,6 +247,45 @@ fn a_record_is_stored_with_any_entry_of_its_collection() {
     assert_eq!(b.engine.idempotency_record(cb.id, &k.scope).unwrap(), Some(r));
 }
 
+/// A record lands with the run that takes an entry of its collection, not only
+/// with the batch's last transaction: when the batch fails after that run
+/// committed (here at its last commit, after a schema change ended the run),
+/// the effect the run committed has its record with it, and a retry replays.
+#[test]
+fn a_record_lands_with_the_run_that_takes_its_collections_entry() {
+    let (a, b, ca, cb) = pair();
+    let k = keyed(31);
+    let (id, _) = fresh(a.engine.insert_keyed(&ca, doc! { "v": 1 }, &k).unwrap());
+    a.engine.create_collection("shop", "later").unwrap();
+    let theirs = a.engine.version_vector().unwrap();
+    let mine = b.engine.witnessed_vector().unwrap();
+    let window = a
+        .engine
+        .entries_for_peer_holding(Hlc::ZERO, 1024, Some(&mine), WalkScope::Background)
+        .unwrap();
+    crate::sync::count_hooks::fail_next(crate::sync::count_hooks::Fail::BeforeLastCommit);
+    let mut outcome = SyncOutcome::default();
+    let failed = b.engine.apply_peer_window_carrying_into(
+        &theirs,
+        Some(&mine),
+        &window.entries,
+        &window.records,
+        RecordsVia::Pull,
+        PeerWindow {
+            scanned_to: window.scanned_to,
+            exhausted: window.exhausted,
+            passed_through: None,
+            asked_partial: false,
+        },
+        &mut outcome,
+    );
+    assert!(failed.is_err(), "premise: the batch failed at its last commit");
+    assert!(b.engine.get(&cb, &id).unwrap().is_some(), "premise: the run took the insert");
+    assert!(b.engine.idempotency_record(cb.id, &k.scope).unwrap().is_some(), "and its record");
+    replayed(b.engine.insert_keyed(&cb, doc! { "v": 1 }, &k).unwrap());
+    assert_eq!(count(&b.engine, &cb), 1);
+}
+
 /// A frame's records are stored in the transaction that raises the receiver's
 /// coverage, **whether or not an entry of their collection is taken** and
 /// whether or not the collection stands here (B5, records travel with
