@@ -1525,7 +1525,7 @@ impl Engine {
         if frame.owes_any() {
             let opened = run.txn.is_some();
             let txn = self.run_txn(run)?;
-            let wrote = self.store_owed_records(txn, &mut memo, frame)?;
+            let wrote = self.store_owed_records(txn, &mut memo, frame, stopped_at)?;
             run.records += wrote;
             if wrote == 0
                 && !opened

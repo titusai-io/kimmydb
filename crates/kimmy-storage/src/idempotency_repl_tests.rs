@@ -709,3 +709,39 @@ fn a_frames_record_rides_with_the_entry_at_its_row_not_an_earlier_one() {
         "the later life's record, not merged with the earlier life's"
     );
 }
+
+/// A batch that ends at an entry stores none of the frame's records whose row is at
+/// or past it: the window grants no coverage there and serves them again. Here B's
+/// batch ends at the creation of `shop.other` again, its earlier life's purge still
+/// owed, before the drop of `orders` and the later life's write with its record;
+/// B still holds the earlier life's record under the key. Stored at the batch's end,
+/// the later life's record merged with it.
+#[test]
+fn a_batch_that_ends_early_leaves_the_records_past_its_end() {
+    let (a, b, ca, cb) = pair();
+    a.engine.create_collection("shop", "other").unwrap();
+    let k = keyed(43);
+    fresh(a.engine.insert_keyed(&ca, doc! { "v": 1 }, &k).unwrap());
+    pull(&b.engine, &a.engine);
+    let earlier = b.engine.idempotency_record(cb.id, &k.scope).unwrap().expect("premise");
+    a.engine.drop_collection("shop", "other").unwrap();
+    a.engine.finish_purges_now().unwrap();
+    a.engine.create_collection("shop", "other").unwrap();
+    a.engine.drop_collection("shop", "orders").unwrap();
+    a.engine.finish_purges_now().unwrap();
+    let again = a.engine.create_collection("shop", "orders").unwrap();
+    fresh(a.engine.insert_keyed(&again, doc! { "v": 1 }, &k).unwrap());
+    let later = a.engine.idempotency_record(again.id, &k.scope).unwrap().expect("premise");
+    let outcome = pull(&b.engine, &a.engine);
+    assert_eq!(outcome.purge_pending, 1, "premise: the batch ended at the creation");
+    assert_eq!(
+        b.engine.idempotency_record(cb.id, &k.scope).unwrap(),
+        Some(earlier),
+        "the later life's record is left for the window that takes its row"
+    );
+    for _ in 0..4 {
+        b.engine.finish_purges_now().unwrap();
+        pull(&b.engine, &a.engine);
+    }
+    assert_eq!(b.engine.idempotency_record(again.id, &k.scope).unwrap(), Some(later));
+}

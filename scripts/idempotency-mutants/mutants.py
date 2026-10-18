@@ -425,6 +425,17 @@ ROWS = [
         "suites": MODEL,
     },
     {
+        "name": "stores-records-past-the-stop",
+        "group": "lives",
+        "doc": "A batch that ends at an entry stores the frame's records whose row is past it",
+        "patches": [
+            ("crates/kimmy-storage/src/idempotency.rs",
+             "            if *done || carrying.is_some_and(|row| stop.is_some_and(|stop| row >= stop)) {\n",
+             "            if *done || (carrying.is_some() && stop.is_some() && false) {\n"),
+        ],
+        "suites": MODEL,
+    },
+    {
         "name": "header-guard-not-over-mcp",
         "group": "elsewhere",
         "doc": "The header guard lets `/mcp` through",

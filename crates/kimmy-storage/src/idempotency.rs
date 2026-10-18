@@ -1171,15 +1171,23 @@ impl Engine {
     /// covers is never served here again, so the record it vouched for at that
     /// stamp is stored now or never. The life rule still refuses history.
     /// Returns how many it wrote: a record held already writes nothing.
+    ///
+    /// **Not one whose row is at or past `stop`**, the entry a batch ended at: the
+    /// window grants no coverage there, so the record is served again with what
+    /// follows, and the entries between the stop and its row, a drop of its
+    /// collection among them, are not taken. Stored now, a record of the life after
+    /// that drop met the earlier life's record, still alive here, and merged with
+    /// it ([`FrameRecords`]).
     pub(crate) fn store_owed_records(
         &self,
         txn: &WriteTxn<'_>,
         memo: &mut Memo,
         frame: &mut FrameRecords,
+        stop: Option<Stamp>,
     ) -> Result<usize> {
         let mut stored = 0usize;
         for (collection, scope, carrying, record, done) in &mut frame.records {
-            if *done {
+            if *done || carrying.is_some_and(|row| stop.is_some_and(|stop| row >= stop)) {
                 continue;
             }
             let standing = self.memo_collection(memo, *collection)?;
