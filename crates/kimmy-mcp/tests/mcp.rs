@@ -1919,8 +1919,10 @@ async fn the_write_tools_take_a_well_formed_key_and_refuse_a_malformed_one() {
         }
     }
     assert_eq!(documents().await, before, "no refused call wrote anything");
-    for (tool, arguments) in keyed_calls() {
-        let done = server.call_ok(&root, tool, with_key(arguments, KEY)).await;
+    // A key of its own for each call: one key names one request.
+    for (i, (tool, arguments)) in keyed_calls().into_iter().enumerate() {
+        let key = format!("tool-{i:02}-6f1c0e52-8a1d-4f53");
+        let done = server.call_ok(&root, tool, with_key(arguments, &key)).await;
         assert!(done.is_object(), "{tool}: {done}");
     }
 }
@@ -1958,4 +1960,51 @@ async fn the_argument_is_gated_as_the_header_is() {
 
     *state.lock().unwrap() = Ok(());
     server.call_ok(&root, tool, with_key(arguments, KEY)).await;
+}
+
+/// Each write tool's call sent again with its key is answered with its first
+/// result, the structured content identical, marked in `_meta` as a replay,
+/// and writes nothing again; another call under the same key is refused as a
+/// key reused.
+#[tokio::test]
+async fn a_keyed_tool_call_sent_again_is_its_first_result_marked_as_a_replay() {
+    let server = Server::start().await;
+    seed(&server);
+    let root = server.root();
+    for (i, (tool, arguments)) in keyed_calls().into_iter().enumerate() {
+        let key = format!("replay-{i:02}-6f1c0e52-8a1d");
+        let first = server.call(&root, tool, with_key(arguments.clone(), &key)).await;
+        assert!(first["error"].is_null(), "{tool}: {first}");
+        assert!(
+            first["result"]["_meta"]["kimmydb/idempotency-replayed"].is_null(),
+            "{tool}: a first answer is not marked: {first}"
+        );
+        let again = server.call(&root, tool, with_key(arguments.clone(), &key)).await;
+        assert_eq!(
+            again["result"]["structuredContent"], first["result"]["structuredContent"],
+            "{tool}: the first result"
+        );
+        assert_eq!(again["result"]["content"], first["result"]["content"], "{tool}");
+        assert_eq!(
+            again["result"]["_meta"]["kimmydb/idempotency-replayed"],
+            json!(true),
+            "{tool}: marked: {again}"
+        );
+    }
+    // The update incremented once, though it was sent twice.
+    let found = server
+        .call_ok(
+            &root,
+            "find",
+            json!({"database":"sales","collection":"orders","filter":{"_id":"a"}}),
+        )
+        .await;
+    assert_eq!(found["documents"][0]["k"], 1, "{found}");
+
+    // The same key with other arguments is another call: refused, nothing written.
+    let (tool, mut arguments) = keyed_calls().remove(0);
+    arguments["document"] = json!({ "n": 99 });
+    let reused = server.call(&root, tool, with_key(arguments, "replay-00-6f1c0e52-8a1d")).await;
+    let (code, _) = refusal(&reused);
+    assert_eq!(code, "idempotency_key_reused", "{reused}");
 }

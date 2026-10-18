@@ -206,7 +206,13 @@ again. A call is the same when the tool and its other arguments are, every
 document's fields in the order sent. The argument is refused where the header
 would be: malformed, reused for a different call, or while this member does not
 take keys. `/mcp` itself refuses the header: a tool call is keyed by its
-argument.
+argument. A keyed `update` or `delete` with `multi: true` that runs past one
+chunk (1,000 documents by default) never touches a document written after its
+first write, by anyone, and counts those matches in `skipped`; `resumed: true`
+appears only when a call continued one that had stopped. Unkeyed calls, and
+keyed ones that fit in one chunk, are unchanged. Two attempts of one call can
+run on different members at once, and this is what keeps any of them from
+writing on top of its own effect ([HTTP API](http-api.md#a-keyed-write-past-one-chunk)).
 
 `ddl` is its own action, and it federates ([ADR-090](decisions.md)): an agent
 authenticating through an identity provider can be given the right to create

@@ -10,25 +10,30 @@
 //!   line holding one RFC 9651 sf-String of 16 to 255 printable ASCII
 //!   characters once unescaped, as draft-ietf-httpapi-idempotency-key-header-07
 //!   §2.1 requires, and the same rule without quotes for the MCP argument
-//!   `idempotency_key` ([`from_raw`]);
+//!   `idempotency_key` ([`from_raw`]); the rule itself is `kimmy-core`'s
+//!   ([`IdempotencyKey`]), which the scope hash and the derived `_id` read;
 //! - **the fingerprint** ([`fingerprint`], [`tool_fingerprint`]): what decides
 //!   whether a retry is the same request, taken over the request as sent;
 //! - **the extractors** ([`KeyedJson`], [`KeyedNoBody`]) a keyed route reads its
 //!   body and its key through, which keep every refusal `JsonBody` makes;
-//! - **the answer** ([`WriteAnswer`], [`mark_replayed`]), the two log lines a
-//!   replay and a resume write ([`log_replayed`], [`log_resumed`]), and the
-//!   outcomes `kimmy_idempotency_requests_total` counts ([`KeyedOutcome`]).
+//! - **the answer** ([`WriteAnswer`], [`mark_replayed`]) and the outcomes
+//!   `kimmy_idempotency_requests_total` counts ([`KeyedOutcome`]). The two log
+//!   lines a replay and a resume write are the engine's, written where it finds
+//!   the record, with the record's own origin.
 //!
-//! Which routes take the header, and whether this member takes it at all now,
-//! is decided before any of this runs, by the layer over the route table
-//! (`routes::IDEMPOTENT_ROUTES`) and the gate it asks
-//! ([`crate::AppState::idempotency_gate`]). This module refuses a malformed
-//! key on its own as well, so a handler is never handed one, whoever built its
-//! router.
+//! Which routes take the header is decided before any of this runs, before
+//! authentication, by the layer over the route table
+//! (`routes::IDEMPOTENT_ROUTES`), which refuses a malformed key too. Whether
+//! this member takes keys at all now (the gate,
+//! [`crate::AppState::idempotency_gate`]) is asked here, after authentication,
+//! by the extractors and by [`tool_key`]: its refusal can name a member of the
+//! cluster. This module refuses a malformed key on its own as well, so a
+//! handler is never handed one, whoever built its router.
 //!
-//! Until the storage half lands, a request the layer admits is validated,
-//! fingerprinted and then applied as an unkeyed request would be: the key does
-//! not yet reach the engine.
+//! What the key does once admitted is the executor's: `crate::exec`'s write
+//! functions hand it to the engine's keyed twins with the principal's scope,
+//! and render a fresh answer and a replay through one function each
+//! (`crate::outcome`).
 
 use std::fmt;
 
@@ -40,11 +45,10 @@ use axum::http::request::Parts;
 use axum::response::{IntoResponse, Response};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
-use tracing::{debug, info};
 
 use crate::error::ApiError;
 use crate::json::JsonBody;
-use crate::state::AppState;
+use crate::state::{AppState, SharedState};
 
 /// The gate's types, from the cluster layer that answers it, for an embedder
 /// that installs a predicate of its own ([`AppState::set_idempotency_gate`]).
@@ -65,157 +69,60 @@ pub const REPLAYED: HeaderValue = HeaderValue::from_static("?1");
 /// an MCP client sets no header per tool call.
 pub const MCP_ARGUMENT: &str = "idempotency_key";
 
-/// The shortest key taken, in characters of the unescaped value. Long enough
-/// that a key is not guessed or collided by accident; a UUID is 36.
-pub const MIN_KEY_CHARS: usize = 16;
+/// The shortest key taken, in characters of the unescaped value: `kimmy-core`'s
+/// bound, named here for the refusal that publishes it.
+pub const MIN_KEY_CHARS: usize = kimmy_core::idempotency::KEY_MIN_LEN;
 
 /// The longest key taken, in characters of the unescaped value.
-pub const MAX_KEY_CHARS: usize = 255;
+pub const MAX_KEY_CHARS: usize = kimmy_core::idempotency::KEY_MAX_LEN;
 
 /// How long a key is remembered when nothing has said otherwise:
-/// `storage.oplog_retention_secs`'s default, 24 hours.
-pub const DEFAULT_WINDOW_SECS: u64 = 24 * 60 * 60;
+/// `storage.oplog_retention_secs`'s default, 24 hours, the engine's own.
+pub const DEFAULT_WINDOW_SECS: u64 = kimmy_storage::idempotency::DEFAULT_WINDOW_SECS;
 
-/// A key as the client meant it: unquoted, unescaped, and checked against the
-/// published format. Not stored anywhere: the record is found by a hash over
-/// the principal, the collection and this.
-#[derive(Clone, Debug, PartialEq, Eq, Hash)]
-pub struct RawKey(String);
-
-impl RawKey {
-    pub fn as_str(&self) -> &str {
-        &self.0
-    }
-
-    pub fn into_string(self) -> String {
-        self.0
-    }
-}
+/// A key as the client meant it, unquoted and unescaped, held to the published
+/// format: `kimmy-core`'s, which the scope hash and the derived `_id` read too.
+/// Not stored anywhere, and never printed.
+pub use kimmy_core::{Fingerprint, IdempotencyKey, KeyError};
 
 /// Why a key was refused. Each is a `400 bad_request` naming the header (or
 /// the MCP argument) and this reason.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub enum KeyRefusal {
-    /// The header came on more than one field line.
+    /// The header came on more than one field line: a field-line rule, so the
+    /// edge's own, where the value's rule is `kimmy-core`'s.
     Repeated,
-    /// The field value is empty.
-    Empty,
-    /// The value is not a quoted string: a bare token, a number, a list.
-    NotAString,
-    /// The opening quote is never closed.
-    Unterminated,
-    /// A backslash escapes something other than `"` or `\`.
-    BadEscape,
-    /// A character outside printable ASCII, `0x20` to `0x7E`.
-    NotPrintable,
-    /// The unescaped value is this many characters, outside
-    /// [`MIN_KEY_CHARS`]`..=`[`MAX_KEY_CHARS`].
-    Length(usize),
-    /// Parameters follow the string (`"k";a=1`): refused, not ignored.
-    Parameters,
-    /// Something other than parameters follows the string.
-    Trailing,
+    /// The value broke the published format ([`IdempotencyKey`]).
+    Invalid(KeyError),
 }
 
 impl fmt::Display for KeyRefusal {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Repeated => f.write_str("it was sent on more than one field line"),
-            Self::Empty => f.write_str("its value is empty"),
-            Self::NotAString => {
-                f.write_str("its value is not a quoted string (a bare token is not one)")
-            }
-            Self::Unterminated => f.write_str("its quoted string is not closed"),
-            Self::BadEscape => {
-                f.write_str(r#"a backslash in it escapes something other than \" or \\"#)
-            }
-            Self::NotPrintable => f.write_str("it holds a character that is not printable ASCII"),
-            Self::Length(0) => f.write_str("the key is empty"),
-            Self::Length(n) => write!(
-                f,
-                "the key is {n} characters once unescaped, and it must be {MIN_KEY_CHARS} to \
-                 {MAX_KEY_CHARS}"
-            ),
-            Self::Parameters => f.write_str("parameters follow the string, and none are taken"),
-            Self::Trailing => {
-                f.write_str("something follows the quoted string; the value is one string")
-            }
+            Self::Invalid(e) => fmt::Display::fmt(e, f),
         }
     }
 }
 
-/// Read one field line's value as the key it carries: an sf-String (RFC 9651
-/// §3.3.3, parsed as §4.2 parses an Item), with no parameters, whose unescaped
-/// value is [`MIN_KEY_CHARS`] to [`MAX_KEY_CHARS`] characters of the
-/// sf-String alphabet. The length is the unescaped value's, so `\"` and `\\`
-/// each count as one character, as they will in the scope hash.
-///
-/// The published rule lives in `kimmy-core`, beside the scope hash and the
-/// derived `_id` that use the same unescaped value; integrating the storage
-/// half replaces this body with a call to its validator, so both edges and the
-/// engine read one definition. Until then this is that rule, and the tests
-/// below are its specification.
-pub fn parse_header_value(value: &[u8]) -> Result<RawKey, KeyRefusal> {
-    // §4.2: leading spaces are discarded, then the Item, then trailing spaces.
-    // `http` has already removed the field's surrounding whitespace, so this
-    // matters only to a caller handing in raw bytes.
-    let start = value.iter().position(|&b| b != b' ').unwrap_or(value.len());
-    let input = &value[start..];
-    let Some((&first, mut rest)) = input.split_first() else {
-        return Err(KeyRefusal::Empty);
-    };
-    if first != b'"' {
-        return Err(KeyRefusal::NotAString);
-    }
-    let mut key = String::new();
-    loop {
-        let Some((&byte, after)) = rest.split_first() else {
-            return Err(KeyRefusal::Unterminated);
-        };
-        rest = after;
-        match byte {
-            b'"' => break,
-            b'\\' => {
-                let Some((&escaped, after)) = rest.split_first() else {
-                    return Err(KeyRefusal::Unterminated);
-                };
-                if escaped != b'"' && escaped != b'\\' {
-                    return Err(KeyRefusal::BadEscape);
-                }
-                key.push(char::from(escaped));
-                rest = after;
-            }
-            0x20..=0x7e => key.push(char::from(byte)),
-            _ => return Err(KeyRefusal::NotPrintable),
-        }
-    }
-    if rest.first() == Some(&b';') {
-        return Err(KeyRefusal::Parameters);
-    }
-    if rest.iter().any(|&b| b != b' ') {
-        return Err(KeyRefusal::Trailing);
-    }
-    checked(key)
+/// Read one field line's value as the key it carries, by `kimmy-core`'s rule
+/// ([`IdempotencyKey::parse_header_value`]): an sf-String (RFC 9651 §3.3.3)
+/// with no parameters, whose unescaped value is [`MIN_KEY_CHARS`] to
+/// [`MAX_KEY_CHARS`] printable ASCII characters. A value that is not UTF-8 at
+/// all (an obs-text byte `http` admits) holds a character outside that
+/// alphabet, and is refused as one.
+pub fn parse_header_value(value: &[u8]) -> Result<IdempotencyKey, KeyRefusal> {
+    let text =
+        std::str::from_utf8(value).map_err(|_| KeyRefusal::Invalid(KeyError::BadCharacter))?;
+    IdempotencyKey::parse_header_value(text).map_err(KeyRefusal::Invalid)
 }
 
 /// The key the MCP argument `idempotency_key` carries: the same rule as the
 /// header, without the quotes, so `"` and `\` are characters like any other
-/// and `ab"c` here is the key `"ab\"c"` is there.
-pub fn from_raw(text: &str) -> Result<RawKey, KeyRefusal> {
-    if !text.bytes().all(|b| (0x20..=0x7e).contains(&b)) {
-        return Err(KeyRefusal::NotPrintable);
-    }
-    checked(text.to_string())
-}
-
-/// The length rule, on an unescaped value already known to be printable ASCII
-/// (so its length in bytes is its length in characters).
-fn checked(key: String) -> Result<RawKey, KeyRefusal> {
-    if (MIN_KEY_CHARS..=MAX_KEY_CHARS).contains(&key.len()) {
-        Ok(RawKey(key))
-    } else {
-        Err(KeyRefusal::Length(key.len()))
-    }
+/// and `ab"c` here is the key `"ab\"c"` is there
+/// ([`IdempotencyKey::from_raw`]).
+pub fn from_raw(text: &str) -> Result<IdempotencyKey, KeyRefusal> {
+    IdempotencyKey::from_raw(text).map_err(KeyRefusal::Invalid)
 }
 
 /// The `400` a malformed header draws, naming the header, the reason and the
@@ -238,7 +145,7 @@ pub fn argument_refused(refusal: KeyRefusal) -> ApiError {
 
 /// The key a request carries, if any: `None` without the header, the key with
 /// one well-formed field line, and the `400` naming the header otherwise.
-pub fn key_from_headers(headers: &HeaderMap) -> Result<Option<RawKey>, ApiError> {
+pub fn key_from_headers(headers: &HeaderMap) -> Result<Option<IdempotencyKey>, ApiError> {
     let mut lines = headers.get_all(IDEMPOTENCY_KEY).iter();
     let Some(first) = lines.next() else {
         return Ok(None);
@@ -278,14 +185,14 @@ const TOOL_TAG: &[u8] = b"kimmydb idempotency fingerprint mcp v1\0";
 /// percent-encoded differently, is another request, which a retry of the same
 /// request never is. The route template is in it so that one path cannot be
 /// read as two routes' requests.
-pub fn fingerprint(method: &str, route: &str, path_and_query: &str, body: &[u8]) -> [u8; 32] {
+pub fn fingerprint(method: &str, route: &str, path_and_query: &str, body: &[u8]) -> Fingerprint {
     let mut hash = Sha256::new();
     hash.update(HTTP_TAG);
     for part in [method.as_bytes(), route.as_bytes(), path_and_query.as_bytes(), body] {
         hash.update((part.len() as u64).to_be_bytes());
         hash.update(part);
     }
-    hash.finalize().into()
+    Fingerprint(hash.finalize().into())
 }
 
 /// An MCP tool call's fingerprint: SHA-256 over the tool's name and its
@@ -301,7 +208,7 @@ pub fn fingerprint(method: &str, route: &str, path_and_query: &str, body: &[u8])
 /// order the client sent them and its numbers as `serde_json` renders the
 /// parsed value. A top-level `idempotency_key` member is removed first, so the
 /// key itself is never part of the request it names.
-pub fn tool_fingerprint(tool: &str, arguments: &Value) -> [u8; 32] {
+pub fn tool_fingerprint(tool: &str, arguments: &Value) -> Fingerprint {
     let mut arguments = arguments.clone();
     if let Value::Object(members) = &mut arguments {
         members.shift_remove(MCP_ARGUMENT);
@@ -313,16 +220,26 @@ pub fn tool_fingerprint(tool: &str, arguments: &Value) -> [u8; 32] {
         hash.update((part.len() as u64).to_be_bytes());
         hash.update(part);
     }
-    hash.finalize().into()
+    Fingerprint(hash.finalize().into())
 }
 
 /// A keyed request, as the edge hands it on: the key, and the fingerprint of
-/// the request it came with. The principal and the collection, which complete
-/// its scope, are the caller's to add once authorization has named them.
+/// the request it came with. The principal, which completes its scope, is the
+/// caller's to add once authorization has named it ([`Self::keyed_write`]).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct IdempotentRequest {
-    pub key: RawKey,
-    pub fingerprint: [u8; 32],
+    pub key: IdempotencyKey,
+    pub fingerprint: Fingerprint,
+}
+
+impl IdempotentRequest {
+    /// What the engine keys the write by, for the principal whose
+    /// [`AppState::principal_scope`] is `principal`: the key's scope hash under
+    /// that principal, and this request's fingerprint. The collection, the
+    /// record's other half, is the engine's.
+    pub fn keyed_write(&self, principal: &str) -> kimmy_storage::KeyedWrite {
+        kimmy_storage::KeyedWrite::new(self.key.scope_hash(principal), self.fingerprint)
+    }
 }
 
 /// The route template the router matched, which the fingerprint and the guard
@@ -338,7 +255,10 @@ fn target_of(uri: &axum::http::Uri) -> &str {
 /// A keyed write route's JSON body, and the key it came with.
 ///
 /// Without the header this is exactly [`JsonBody`]: the same extractor, the
-/// same refusals, and the same body. With it, the body is read as bytes through
+/// same refusals, and the same body. With it, the gate is asked first: a member
+/// that does not take keys now refuses with `400` naming the cause, after
+/// authentication (the handler's `Auth` runs before this) and before a byte of
+/// the body is read. Then the body is read as bytes through
 /// axum's `Bytes` extractor, hashed into the fingerprint, and then parsed, and
 /// every refusal `JsonBody` makes is made the same way, in the same order:
 ///
@@ -354,18 +274,18 @@ pub struct KeyedJson<T> {
     pub key: Option<IdempotentRequest>,
 }
 
-impl<T, S> FromRequest<S> for KeyedJson<T>
+impl<T> FromRequest<SharedState> for KeyedJson<T>
 where
     T: serde::de::DeserializeOwned,
-    S: Send + Sync,
 {
     type Rejection = ApiError;
 
-    async fn from_request(req: Request, state: &S) -> Result<Self, Self::Rejection> {
+    async fn from_request(req: Request, state: &SharedState) -> Result<Self, Self::Rejection> {
         let Some(key) = key_from_headers(req.headers())? else {
             let JsonBody(body) = JsonBody::<T>::from_request(req, state).await?;
             return Ok(Self { body, key: None });
         };
+        refuse_unless_open(state, |closed| closed.to_string())?;
         if let Some(refused) = refused_content_type(req.headers()).await {
             return Err(refused);
         }
@@ -398,16 +318,20 @@ async fn refused_content_type(headers: &HeaderMap) -> Option<ApiError> {
 
 /// The key a route with no body came with: `DELETE …/docs/{id}`, whose
 /// fingerprint is taken over an empty body whatever was sent, since the route
-/// reads none.
+/// reads none. The gate is asked as [`KeyedJson`] asks it.
 pub struct KeyedNoBody(pub Option<IdempotentRequest>);
 
-impl<S: Send + Sync> FromRequestParts<S> for KeyedNoBody {
+impl FromRequestParts<SharedState> for KeyedNoBody {
     type Rejection = ApiError;
 
-    async fn from_request_parts(parts: &mut Parts, _state: &S) -> Result<Self, Self::Rejection> {
+    async fn from_request_parts(
+        parts: &mut Parts,
+        state: &SharedState,
+    ) -> Result<Self, Self::Rejection> {
         let Some(key) = key_from_headers(&parts.headers)? else {
             return Ok(Self(None));
         };
+        refuse_unless_open(state, |closed| closed.to_string())?;
         let fingerprint = fingerprint(
             parts.method.as_str(),
             &route_of(&parts.extensions),
@@ -415,6 +339,25 @@ impl<S: Send + Sync> FromRequestParts<S> for KeyedNoBody {
             b"",
         );
         Ok(Self(Some(IdempotentRequest { key, fingerprint })))
+    }
+}
+
+/// Refuse a well-formed key while this member does not take keys (the gate:
+/// the operator's switch and the live-peer net), with `400 bad_request` and the
+/// gate's own words, which name the switch or the live member; counted as
+/// `kimmy_idempotency_requests_total{outcome="gated"}`. Asked after
+/// authentication, since the refusal can name a member of the cluster, and
+/// before anything is read, looked up or written.
+fn refuse_unless_open(
+    state: &AppState,
+    message: impl FnOnce(&IdempotencyClosed) -> String,
+) -> Result<(), ApiError> {
+    match state.idempotency_gate() {
+        Ok(()) => Ok(()),
+        Err(closed) => {
+            state.metrics.record_idempotency(KeyedOutcome::Gated);
+            Err(ApiError::bad_request(message(&closed)))
+        }
     }
 }
 
@@ -433,10 +376,7 @@ pub fn tool_key(
         return Ok(None);
     };
     let key = from_raw(key).map_err(argument_refused)?;
-    if let Err(closed) = state.idempotency_gate() {
-        state.metrics.record_idempotency(KeyedOutcome::Gated);
-        return Err(ApiError::bad_request(format!("{MCP_ARGUMENT}: {closed}")));
-    }
+    refuse_unless_open(state, |closed| format!("{MCP_ARGUMENT}: {closed}"))?;
     let arguments = serde_json::to_value(arguments)
         .map_err(|e| ApiError::internal(format!("the tool's arguments did not serialize: {e}")))?;
     Ok(Some(IdempotentRequest { key, fingerprint: tool_fingerprint(tool, &arguments) }))
@@ -522,52 +462,29 @@ impl KeyedOutcome {
     }
 }
 
-/// The `INFO` line a resumed request writes: a multi-document update or delete
-/// that had stopped, sent again with its key and continued past where it
-/// stopped. `origin` is the member whose record it resumed from; the counts
-/// are the request's so far, across its attempts.
-pub fn log_resumed(
-    db: &str,
-    collection: &str,
-    origin: kimmy_core::NodeId,
-    matched: u64,
-    modified: u64,
-    skipped: u64,
-) {
-    info!(
-        db,
-        collection,
-        origin = %origin,
-        matched,
-        modified,
-        skipped,
-        "resumed a keyed write that had stopped"
-    );
-}
-
-/// The `DEBUG` line a replay writes: `origin` is the member that wrote the
-/// record, and `age_ms` how long ago its last commit was, by the record's own
-/// clock.
-pub fn log_replayed(db: &str, collection: &str, origin: kimmy_core::NodeId, age_ms: u64) {
-    debug!(db, collection, origin = %origin, age_ms, "replayed a keyed write");
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
     fn key(text: &str) -> Result<String, KeyRefusal> {
-        parse_header_value(text.as_bytes()).map(RawKey::into_string)
+        parse_header_value(text.as_bytes()).map(|k| k.as_str().to_string())
+    }
+
+    fn invalid<T>(e: KeyError) -> Result<T, KeyRefusal> {
+        Err(KeyRefusal::Invalid(e))
     }
 
     const UUID: &str = "6f1c0e52-8a1d-4f53-9b3e-2c1d6a7e4b90";
 
-    // The header's specification. Accepted: a quoted UUID; the bounds, 16 and
+    // The header as this edge reads it. The rule is `kimmy-core`'s, and its own
+    // tests are the rule's specification; these hold the edge to it through the
+    // bytes a field line arrives as. Accepted: a quoted UUID; the bounds, 16 and
     // 255, counted on the unescaped value; the two escapes; a space inside;
-    // spaces around the Item. Refused: an empty value, a bare token, an
-    // unclosed string, any other escape, a character outside printable ASCII
-    // (a non-ASCII byte, a control character, a tab), 15 and 256 characters,
-    // parameters, and anything else after the string, a list included.
+    // whitespace around the Item. Refused: an empty value, a bare token, an
+    // unclosed string, any other escape, a character outside printable ASCII (a
+    // non-ASCII byte, a control character, a tab, a byte that is not UTF-8), 15
+    // and 256 characters, parameters, anything else after the string, a list
+    // included, and a second field line.
 
     #[test]
     fn a_quoted_key_is_its_unquoted_value() {
@@ -579,11 +496,11 @@ mod tests {
     #[test]
     fn the_length_is_the_unescaped_values_and_its_bounds_are_16_and_255() {
         let of = |n: usize| format!("\"{}\"", "k".repeat(n));
-        assert_eq!(key(&of(15)), Err(KeyRefusal::Length(15)));
+        assert_eq!(key(&of(15)), invalid(KeyError::Length { found: 15 }));
         assert_eq!(key(&of(16)).map(|k| k.len()), Ok(16));
         assert_eq!(key(&of(255)).map(|k| k.len()), Ok(255));
-        assert_eq!(key(&of(256)), Err(KeyRefusal::Length(256)));
-        assert_eq!(key("\"\""), Err(KeyRefusal::Length(0)));
+        assert_eq!(key(&of(256)), invalid(KeyError::Length { found: 256 }));
+        assert_eq!(key("\"\""), invalid(KeyError::Length { found: 0 }));
 
         // 14 plain characters and two escapes are 16 once unescaped, and 18 as
         // sent: the unescaped count is the one that decides.
@@ -594,54 +511,58 @@ mod tests {
         let at_the_top = format!("\"{}\\\\\"", "k".repeat(254));
         assert_eq!(key(&at_the_top).map(|k| k.len()), Ok(255));
         let over = format!("\"{}\\\\\"", "k".repeat(255));
-        assert_eq!(key(&over), Err(KeyRefusal::Length(256)));
+        assert_eq!(key(&over), invalid(KeyError::Length { found: 256 }));
     }
 
     #[test]
     fn only_a_quote_and_a_backslash_are_escaped() {
-        assert_eq!(key(&format!("\"{UUID}\\n\"")), Err(KeyRefusal::BadEscape));
-        assert_eq!(key(&format!("\"{UUID}\\")), Err(KeyRefusal::Unterminated));
+        assert_eq!(key(&format!("\"{UUID}\\n\"")), invalid(KeyError::BadEscape));
+        assert_eq!(key(&format!("\"{UUID}\\")), invalid(KeyError::Unterminated));
     }
 
     #[test]
     fn a_value_that_is_not_one_quoted_string_is_refused() {
-        assert_eq!(key(""), Err(KeyRefusal::Empty));
-        assert_eq!(key("   "), Err(KeyRefusal::Empty));
-        assert_eq!(key(UUID), Err(KeyRefusal::NotAString), "a bare token is not a String");
-        assert_eq!(key("12345678901234567"), Err(KeyRefusal::NotAString));
-        assert_eq!(key(&format!("\"{UUID}")), Err(KeyRefusal::Unterminated));
-        assert_eq!(key(&format!("\"{UUID}\";a=1")), Err(KeyRefusal::Parameters));
-        assert_eq!(key(&format!("\"{UUID}\";a")), Err(KeyRefusal::Parameters));
-        assert_eq!(key(&format!("\"{UUID}\", \"{UUID}\"")), Err(KeyRefusal::Trailing));
-        assert_eq!(key(&format!("\"{UUID}\"x")), Err(KeyRefusal::Trailing));
-        assert_eq!(key(&format!("\"{UUID}\" ;a=1")), Err(KeyRefusal::Trailing));
+        assert_eq!(key(""), invalid(KeyError::NotAString));
+        assert_eq!(key("   "), invalid(KeyError::NotAString));
+        assert_eq!(key(UUID), invalid(KeyError::NotAString), "a bare token is not a String");
+        assert_eq!(key("12345678901234567"), invalid(KeyError::NotAString));
+        assert_eq!(key(&format!("\"{UUID}")), invalid(KeyError::Unterminated));
+        assert_eq!(key(&format!("\"{UUID}\";a=1")), invalid(KeyError::Parameters));
+        assert_eq!(key(&format!("\"{UUID}\";a")), invalid(KeyError::Parameters));
+        assert_eq!(key(&format!("\"{UUID}\" ;a=1")), invalid(KeyError::Parameters));
+        assert_eq!(key(&format!("\"{UUID}\", \"{UUID}\"")), invalid(KeyError::TrailingInput));
+        assert_eq!(key(&format!("\"{UUID}\"x")), invalid(KeyError::TrailingInput));
     }
 
     #[test]
     fn a_character_outside_printable_ascii_is_refused() {
         for bad in ["é", "\u{7f}", "\t", "\u{1}"] {
-            assert_eq!(key(&format!("\"{UUID}{bad}\"")), Err(KeyRefusal::NotPrintable), "{bad:?}");
+            assert_eq!(
+                key(&format!("\"{UUID}{bad}\"")),
+                invalid(KeyError::BadCharacter),
+                "{bad:?}"
+            );
         }
         // An obs-text byte, which `HeaderValue` admits and a `&str` cannot hold.
         let mut raw = format!("\"{UUID}").into_bytes();
         raw.extend_from_slice(&[0xff, b'"']);
-        assert_eq!(parse_header_value(&raw), Err(KeyRefusal::NotPrintable));
+        assert_eq!(parse_header_value(&raw), invalid(KeyError::BadCharacter));
     }
 
     #[test]
     fn the_mcp_argument_is_the_same_rule_without_quotes() {
-        assert_eq!(from_raw(UUID).map(RawKey::into_string), Ok(UUID.to_string()));
+        assert_eq!(from_raw(UUID).map(|k| k.as_str().to_string()), Ok(UUID.to_string()));
         // The characters a header must escape are plain here, and name the same key.
         let raw = format!("{}\"\\", "k".repeat(14));
         assert_eq!(
             from_raw(&raw),
             parse_header_value(format!("\"{}\\\"\\\\\"", "k".repeat(14)).as_bytes())
         );
-        assert_eq!(from_raw(&"k".repeat(15)), Err(KeyRefusal::Length(15)));
-        assert_eq!(from_raw(&"k".repeat(256)), Err(KeyRefusal::Length(256)));
-        assert_eq!(from_raw(""), Err(KeyRefusal::Length(0)));
-        assert_eq!(from_raw(&format!("{UUID}é")), Err(KeyRefusal::NotPrintable));
-        assert_eq!(from_raw(&format!("{UUID}\n")), Err(KeyRefusal::NotPrintable));
+        assert_eq!(from_raw(&"k".repeat(15)), invalid(KeyError::Length { found: 15 }));
+        assert_eq!(from_raw(&"k".repeat(256)), invalid(KeyError::Length { found: 256 }));
+        assert_eq!(from_raw(""), invalid(KeyError::Length { found: 0 }));
+        assert_eq!(from_raw(&format!("{UUID}é")), invalid(KeyError::BadCharacter));
+        assert_eq!(from_raw(&format!("{UUID}\n")), invalid(KeyError::BadCharacter));
     }
 
     #[test]
@@ -649,7 +570,10 @@ mod tests {
         let mut headers = HeaderMap::new();
         assert_eq!(key_from_headers(&headers).unwrap(), None);
         headers.append(IDEMPOTENCY_KEY, HeaderValue::from_str(&format!("\"{UUID}\"")).unwrap());
-        assert_eq!(key_from_headers(&headers).unwrap().map(RawKey::into_string), Some(UUID.into()));
+        assert_eq!(
+            key_from_headers(&headers).unwrap().map(|k| k.as_str().to_string()),
+            Some(UUID.into())
+        );
         // The same value on a second line is still two lines.
         headers.append(IDEMPOTENCY_KEY, HeaderValue::from_str(&format!("\"{UUID}\"")).unwrap());
         let refused = key_from_headers(&headers).unwrap_err();
@@ -673,21 +597,28 @@ mod tests {
     fn every_refusal_says_why_in_words() {
         for refusal in [
             KeyRefusal::Repeated,
-            KeyRefusal::Empty,
-            KeyRefusal::NotAString,
-            KeyRefusal::Unterminated,
-            KeyRefusal::BadEscape,
-            KeyRefusal::NotPrintable,
-            KeyRefusal::Length(0),
-            KeyRefusal::Length(300),
-            KeyRefusal::Parameters,
-            KeyRefusal::Trailing,
+            KeyRefusal::Invalid(KeyError::NotAString),
+            KeyRefusal::Invalid(KeyError::Unterminated),
+            KeyRefusal::Invalid(KeyError::BadEscape),
+            KeyRefusal::Invalid(KeyError::BadCharacter),
+            KeyRefusal::Invalid(KeyError::Parameters),
+            KeyRefusal::Invalid(KeyError::TrailingInput),
+            KeyRefusal::Invalid(KeyError::Length { found: 0 }),
+            KeyRefusal::Invalid(KeyError::Length { found: 300 }),
         ] {
-            let header = header_refused(refusal).message;
+            let header = header_refused(refusal.clone()).message;
             assert!(header.contains(&refusal.to_string()), "{header}");
+            assert!(header.starts_with("Idempotency-Key: "), "{header}");
             let argument = argument_refused(refusal).message;
             assert!(argument.starts_with("idempotency_key: "), "{argument}");
         }
+    }
+
+    /// The edge's bounds are `kimmy-core`'s, so the refusal publishes the rule
+    /// the engine's scope hash and derived `_id` are taken under.
+    #[test]
+    fn the_published_bounds_are_the_cores() {
+        assert_eq!((MIN_KEY_CHARS, MAX_KEY_CHARS), (16, 255));
     }
 
     #[test]
@@ -778,67 +709,6 @@ mod tests {
             first.headers().get(axum::http::header::CONTENT_TYPE),
             replay.headers().get(axum::http::header::CONTENT_TYPE)
         );
-    }
-
-    /// What the two log helpers write, as a JSON subscriber formats it: the
-    /// level, the message and every field, at its value.
-    fn logged(emit: impl FnOnce()) -> Vec<Value> {
-        #[derive(Clone, Default)]
-        struct Captured(std::sync::Arc<parking_lot::Mutex<Vec<u8>>>);
-        impl std::io::Write for Captured {
-            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-                self.0.lock().extend_from_slice(buf);
-                Ok(buf.len())
-            }
-            fn flush(&mut self) -> std::io::Result<()> {
-                Ok(())
-            }
-        }
-        impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for Captured {
-            type Writer = Captured;
-            fn make_writer(&'a self) -> Self::Writer {
-                self.clone()
-            }
-        }
-        let sink = Captured::default();
-        let subscriber = tracing_subscriber::fmt()
-            .json()
-            .with_writer(sink.clone())
-            .with_max_level(tracing::Level::TRACE)
-            .finish();
-        tracing::subscriber::with_default(subscriber, emit);
-        let out = String::from_utf8(sink.0.lock().clone()).unwrap();
-        out.lines().map(|line| serde_json::from_str(line).unwrap()).collect()
-    }
-
-    #[test]
-    fn a_resume_logs_at_info_with_its_counts_and_a_replay_at_debug() {
-        let origin = kimmy_core::NodeId::from_bytes([7; 16]);
-        let lines = logged(|| log_resumed("shop", "orders", origin, 1800, 1700, 3));
-        assert_eq!(lines.len(), 1, "{lines:?}");
-        let line = &lines[0];
-        assert_eq!(line["level"], "INFO");
-        let fields = &line["fields"];
-        assert_eq!(fields["message"], "resumed a keyed write that had stopped");
-        assert_eq!(fields["db"], "shop");
-        assert_eq!(fields["collection"], "orders");
-        assert_eq!(fields["origin"], origin.to_string());
-        assert_eq!(
-            (fields["matched"].clone(), fields["modified"].clone()),
-            (1800.into(), 1700.into())
-        );
-        assert_eq!(fields["skipped"], 3);
-
-        let lines = logged(|| log_replayed("shop", "orders", origin, 250));
-        assert_eq!(lines.len(), 1, "{lines:?}");
-        let line = &lines[0];
-        assert_eq!(line["level"], "DEBUG", "a replay is the feature working: below the default");
-        let fields = &line["fields"];
-        assert_eq!(fields["message"], "replayed a keyed write");
-        assert_eq!(fields["db"], "shop");
-        assert_eq!(fields["collection"], "orders");
-        assert_eq!(fields["origin"], origin.to_string());
-        assert_eq!(fields["age_ms"], 250);
     }
 
     #[test]

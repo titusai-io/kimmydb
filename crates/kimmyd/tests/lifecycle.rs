@@ -1142,6 +1142,112 @@ async fn a_write_whose_own_fsync_fails_is_not_answered_as_failed_and_is_there_af
     assert!(after.wait_exit().success());
 }
 
+/// The keyed counterpart (B5): a keyed insert without `_id` whose own fsync
+/// fails is answered by nothing, the node stops, and after the restart the same
+/// request with the same key is answered `200`, marked `Idempotency-Replayed:
+/// ?1`, with the `insertedId` the first attempt stored: the key's derived one.
+/// One document remains. The record was written in the write's own
+/// transaction, so it survived exactly what the write survived.
+#[tokio::test]
+async fn a_keyed_write_whose_own_fsync_fails_is_answered_by_its_replay_after_the_restart() {
+    const KEY: &str = "6f1c0e52-8a1d-4f53-9b3e-2c1d6a7e4b90";
+    const BODY: &str = r#"{"item":"maybe"}"#;
+    let dir = tempfile::tempdir().unwrap();
+    let client = reqwest::Client::new();
+    let url = |run: &Run, path: &str| {
+        format!("http://127.0.0.1:{}{path}", run.http.get().expect("a bound port"))
+    };
+    let token_of = |run: &Run| {
+        let login = client
+            .post(url(run, "/v1/auth/login"))
+            .json(&serde_json::json!({ "user": "root", "password": "harness-root-password" }))
+            .send();
+        async move {
+            let body: serde_json::Value = login.await.unwrap().json().await.unwrap();
+            body["token"].as_str().expect("a token").to_string()
+        }
+    };
+    let keyed_insert = |run: &Run, token: &str| {
+        client
+            .post(url(run, "/v1/db/shop/coll/orders/docs"))
+            .bearer_auth(token)
+            .header("Idempotency-Key", format!("\"{KEY}\""))
+            .header("Content-Type", "application/json")
+            .body(BODY)
+            .send()
+    };
+
+    let mut before = Run::spawn(dir.path(), "keyed-fsync-before");
+    before.wait_ready(&client).await;
+    let token = token_of(&before).await;
+    let res = client
+        .post(url(&before, "/v1/db/shop/collections"))
+        .bearer_auth(&token)
+        .json(&serde_json::json!({ "name": "orders" }))
+        .send()
+        .await;
+    assert!(res.unwrap().status().is_success());
+    before.signal("TERM");
+    assert!(before.wait_exit().success());
+
+    let mut failing = Run::spawn_with(
+        dir.path(),
+        "keyed-fsync-fails",
+        &[("KIMMY_TEST_FAIL_STORAGE", "sync_data@write")],
+    );
+    failing.wait_ready(&client).await;
+    let token = token_of(&failing).await;
+    match keyed_insert(&failing, &token).await {
+        Err(e) => assert!(!e.is_connect(), "the request was sent, and the answer never came: {e}"),
+        Ok(res) => {
+            let body: serde_json::Value = res.json().await.unwrap_or_default();
+            assert_eq!(body["error"], "outcome_unknown", "{body}");
+        }
+    }
+    let status = failing.wait_exit();
+    assert_eq!(status.code(), Some(70), "the fsync failure stops the node: {status:?}");
+
+    let mut after = Run::spawn(dir.path(), "keyed-fsync-after");
+    after.wait_ready(&client).await;
+    let token = token_of(&after).await;
+    let replay = keyed_insert(&after, &token).await.unwrap();
+    assert_eq!(replay.status(), 200);
+    assert_eq!(
+        replay.headers().get("idempotency-replayed").map(|v| v.to_str().unwrap().to_string()),
+        Some("?1".to_string()),
+        "the answer the first attempt never delivered"
+    );
+    let replayed: serde_json::Value = replay.json().await.unwrap();
+    let fingerprint = kimmy_api::idempotency::fingerprint(
+        "POST",
+        "/v1/db/{db}/coll/{coll}/docs",
+        "/v1/db/shop/coll/orders/docs",
+        BODY.as_bytes(),
+    );
+    let derived = kimmy_core::idempotency::derived_id(
+        kimmy_core::CollectionId::derive("shop", "orders"),
+        &kimmy_core::IdempotencyKey::from_raw(KEY).unwrap().scope_hash("local:root"),
+        &fingerprint,
+        0,
+    );
+    assert_eq!(replayed["insertedId"], derived.as_str(), "{replayed}");
+    let all: serde_json::Value = client
+        .post(url(&after, "/v1/db/shop/coll/orders/find"))
+        .bearer_auth(&token)
+        .json(&serde_json::json!({}))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let documents = all["documents"].as_array().expect("documents");
+    assert_eq!(documents.len(), 1, "one document: {all}");
+    assert_eq!(documents[0]["_id"], derived.as_str());
+    after.signal("TERM");
+    assert!(after.wait_exit().success());
+}
+
 /// Signal `run`, and wait for it to end: its status, and how long it took.
 fn stop(run: &mut Run) -> (std::process::ExitStatus, Duration) {
     let started = Instant::now();

@@ -3244,6 +3244,9 @@ fn spawn_collector(
                 Ok(outcome) => info!(
                     oplog = outcome.oplog_removed,
                     tombstones = outcome.tombstones_removed,
+                    // Idempotency records (B5), collected on the oplog's
+                    // window, so a pass that removed only these still says so.
+                    idempotency_records = outcome.records_removed,
                     elapsed_ms = elapsed.as_millis() as u64,
                     "collected expired records"
                 ),

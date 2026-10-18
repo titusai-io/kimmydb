@@ -131,10 +131,6 @@ pub struct AppState {
     /// serves, like `local_login`; unset reads as open, which is what a node
     /// with clustering off and the switch at its default answers.
     pub(crate) idempotency_gate: std::sync::OnceLock<kimmy_cluster::IdempotencyPredicate>,
-    /// How long this member remembers a key, `storage.oplog_retention_secs`
-    /// (B5): published as `idempotencyWindowSecs`. Unset reads as that
-    /// setting's default.
-    pub(crate) idempotency_window_secs: std::sync::OnceLock<u64>,
 }
 
 /// A peer that has been away longer than tombstone retention.
@@ -395,20 +391,18 @@ impl AppState {
         self.idempotency_gate.get().map_or(Ok(()), |gate| gate())
     }
 
-    /// Say how long this member remembers a key: `storage.oplog_retention_secs`.
-    /// Called once, at startup; a second call is ignored.
+    /// Say how long this member remembers a key: `storage.oplog_retention_secs`,
+    /// handed to the engine, whose lookup treats a record past it as absent.
     pub fn set_idempotency_window_secs(&self, secs: u64) {
-        let _ = self.idempotency_window_secs.set(secs);
+        self.engine.set_idempotency_window(secs);
     }
 
     /// How long this member remembers a key, in seconds (B5): one window with
     /// the write's own history, so a key is remembered as long as its write is
-    /// kept and replicated by pull.
+    /// kept and replicated by pull. The engine's, so what `GET /v1/version`
+    /// publishes is the window the lookup applies.
     pub fn idempotency_window_secs(&self) -> u64 {
-        self.idempotency_window_secs
-            .get()
-            .copied()
-            .unwrap_or(crate::idempotency::DEFAULT_WINDOW_SECS)
+        self.engine.idempotency_window_secs()
     }
 
     /// The name a principal's idempotency keys are scoped to (B5): the key its
@@ -420,13 +414,18 @@ impl AppState {
         principal_key(principal, issuer.as_deref())
     }
 
-    /// The engine's idempotency records, read at the scrape (B5): how many
-    /// this member holds, how many it took from peers by each way, how many it
-    /// could not decode and how many retention removed. The records live in the
-    /// storage half, which reads them here; until it does, every count is zero,
-    /// and the series are on the page all the same.
+    /// The engine's idempotency records, read at the scrape (B5): how many this
+    /// member holds (the table's own count, O(1)) and how many retention
+    /// removed. The records taken from peers, by way, and those a peer sent
+    /// that this build could not decode are counted where replication stores
+    /// them, and read into `received` and `undecodable` here once it does; until
+    /// then they are zero, and on the page all the same.
     pub fn idempotency_reading(&self) -> Result<crate::metrics::IdempotencyReading, ApiError> {
-        Ok(crate::metrics::IdempotencyReading::default())
+        Ok(crate::metrics::IdempotencyReading {
+            records: self.engine.idempotency_records()?,
+            collected: self.engine.idempotency_records_collected(),
+            ..Default::default()
+        })
     }
 }
 
