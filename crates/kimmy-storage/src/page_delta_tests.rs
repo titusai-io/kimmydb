@@ -912,6 +912,17 @@ fn a_base_from_before_a_restore_or_of_another_node_restarts_its_collection() {
     let mut progress = SnapshotProgress::of_collection(cy.id);
     take(&x, &y, &mut progress);
     let asked = progress.after().cloned().unwrap();
+    // Another node's base, with a time this log answers for: only the node
+    // tells it apart, as after an identity reset.
+    let base = asked.records_base.unwrap();
+    let other = SnapshotCursor {
+        records_base: Some(Stamp::new(base.hlc, NodeId::from_bytes([0xEE; 16]))),
+        ..asked.clone()
+    };
+    let page = y.snapshot_page(Some(other), Some(cy.id)).unwrap();
+    assert!(restarted(&page, 1, 0), "restarted for another node's base: {:?}", page.next);
+    let page = y.snapshot_page(Some(asked.clone()), Some(cy.id)).unwrap();
+    assert!(!restarted(&page, 1, 0), "premise: its own base goes on: {:?}", page.next);
     // Y is replaced by a restore of its backup.
     let mut backup = Vec::new();
     y.backup_to(&mut backup, crate::WalkScope::Background).unwrap();
@@ -920,16 +931,10 @@ fn a_base_from_before_a_restore_or_of_another_node_restarts_its_collection() {
     crate::backup::restore(&restored_path, &mut backup.as_slice()).unwrap();
     let y = Engine::open(&restored_path).unwrap();
     assert_eq!(log_rows(&y), 0, "a backup carries no log");
+    let page = y.snapshot_page(Some(asked.clone()), Some(cy.id)).unwrap();
+    assert!(restarted(&page, 1, 0), "restarted on a restored log with nothing in it");
     let k = key(7);
     fresh(y.modify_where_keyed(&cy, &Candidates::Scan, &Inc, Some(1), &k).unwrap());
-    let page = y.snapshot_page(Some(asked.clone()), Some(cy.id)).unwrap();
+    let page = y.snapshot_page(Some(asked), Some(cy.id)).unwrap();
     assert!(restarted(&page, 2, 0), "restarted after a restore: {:?}", page.next);
-    // Another node's base.
-    let base = asked.records_base.unwrap();
-    let other = SnapshotCursor {
-        records_base: Some(Stamp::new(base.hlc, NodeId::from_bytes([0xEE; 16]))),
-        ..asked
-    };
-    let page = y.snapshot_page(Some(other), Some(cy.id)).unwrap();
-    assert!(restarted(&page, 2, 0), "restarted for another node's base: {:?}", page.next);
 }
