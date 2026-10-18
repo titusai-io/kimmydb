@@ -28758,7 +28758,11 @@ with it, and not be offered while any member could carry the write without it.
      acknowledged, across contacts, in memory; the outbound way keeps the one of the last page it stored. **A frame
      or page that cannot carry even that** (one record, or the F3 records, larger than a frame; a pull that cannot
      take a partial window, or whose window would not end past where it began) is logged at `WARN` and counted in
-     `kimmy_idempotency_records_unfit_total{path}`.
+     `kimmy_idempotency_records_unfit_total{path}`. **So is a record the change log names as changed since a
+     cursor's base that is larger than the delta's half of a frame** (refused by name, as a snapshot page's delta
+     refuses one): that replay page carries nothing, the contact ends in step, and **the replay of that peer's own
+     origin stalls at its position, its cursor kept**, until the log's row of the change is trimmed with the record's
+     window (or the cursor is lost with a restart of the serving member, inbound, and starts over).
    - **The receiver stores on coverage.** **A receiver stores a frame's record with the first entry it takes at or
      after the record's row, or in the batch's last transaction**, the one that raises its witnessed vector, whether or
      not an entry of the record's collection was taken and whether or not the collection stands here: a stamp a window

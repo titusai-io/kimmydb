@@ -1849,7 +1849,9 @@ async fn the_records_at_the_replay_start_cross_on_several_pages(outbound: bool) 
     for scope in &scopes {
         assert!(f.a.idempotency_record(orders.id, scope).unwrap().is_some(), "every record");
     }
-    assert_eq!(records_unfit().get(UnfitPath::Replay), 0, "nothing was left unfit");
+    // Nothing was left unfit: the replay is answered with every record, which a
+    // page that carried nothing would have stopped (the process-wide counter is
+    // shared with the tests that do leave a page unfit, in parallel).
     if !outbound {
         let pages = TEST_REPLAY_PAGES_SENT.with(std::cell::Cell::get);
         assert!(pages >= 5, "pages of records alone, then the entries: {pages}");
@@ -2081,4 +2083,107 @@ async fn the_records_at_an_outbound_replays_start_cross_over_several_contacts() 
         assert!(f.a.idempotency_record(orders.id, scope).unwrap().is_some(), "every record");
     }
     assert_eq!(f.orders(), 2 + 5, "every lost write is back");
+}
+
+/// A record on C, changed now (a frame's store logs it), of `bytes` padding: a
+/// `find_and_modify` record of A's origin inside the replay's span.
+fn plant_large_change(f: &Fixture, bytes: usize) {
+    let from = f.a.own_position_at_open();
+    let orders = f.c.get_collection("shop", "orders").unwrap();
+    let node = f.a.node_id();
+    let at = Stamp::new(Hlc::new(from.wall_ms + 1, 900), node);
+    let record = kimmy_storage::IdempotencyRecord {
+        fingerprint: kimmy_core::Fingerprint([0x6b; 32]),
+        first: at,
+        last: at,
+        origin: node,
+        state: kimmy_storage::RecordState::Done,
+        outcome: kimmy_storage::RecordOutcome::FindAndModify {
+            matched: true,
+            modified: true,
+            removed: false,
+            upserted_id: None,
+            stamp: Some(at),
+            document: Some(bson::doc! { "pad": "q".repeat(bytes) }),
+        },
+    };
+    let carried = kimmy_storage::CarriedRecord {
+        collection: orders.id,
+        scope: kimmy_core::ScopeHash([0x6b; 32]),
+        carrying: Some(at),
+        record: record.encode(),
+    };
+    f.c.apply_batch_carrying(&[], &[carried], kimmy_storage::RecordsVia::Pull).unwrap();
+}
+
+/// The WARN lines a page that could not carry a changed record says, in `log`.
+fn delta_refusals(log: &std::sync::Mutex<Vec<(tracing::Level, String)>>) -> usize {
+    log.lock()
+        .unwrap()
+        .iter()
+        .filter(|(level, message)| {
+            *level == tracing::Level::WARN
+                && message.contains("larger than a replay page's delta can carry")
+        })
+        .count()
+}
+
+/// A record changed since a replay's records cursor that is larger than the
+/// delta's half of a page (refused by name in storage) cannot cross on a page of
+/// that replay: the page carries nothing, the refusal is said at `WARN` once and
+/// counted, the contact ends in step and not as a failure, and the replay stays
+/// at its position with its cursor. Inbound: C serves A's replay, a page a
+/// contact for the first, then a contact of its full page cap.
+#[tokio::test]
+async fn a_changed_record_too_large_for_an_inbound_replays_delta_is_counted_and_stays() {
+    let f = fixture(5, 0);
+    plant_spanning_records(&f, 30);
+    let _budget = EntryBudget::set(8 * 1024);
+    TEST_REPLAY_MAX_PAGES.with(|cap| cap.set(Some(1)));
+    f.round().await.unwrap();
+    TEST_REPLAY_MAX_PAGES.with(|cap| cap.set(None));
+    let (a, c) = (f.a.node_id(), f.c.node_id());
+    let at = f.catch_up.replay_from(c);
+    let cursor = inbound_records(c, a, at).expect("premise: a page of records alone left a cursor");
+    plant_large_change(&f, 5 * 1024);
+    let seen = Seen::default();
+    let log = Arc::clone(&seen.0);
+    let _recording = tracing::subscriber::set_default(seen);
+    tracing::callsite::rebuild_interest_cache();
+    let unfit = records_unfit().get(UnfitPath::Replay);
+    let round = f.round().await;
+    assert!(round.is_ok(), "the contact is no failure: {round:?}");
+    assert!(records_unfit().get(UnfitPath::Replay) > unfit, "counted");
+    assert_eq!(delta_refusals(&log), 1, "said once, and the contact went no further");
+    assert!(!f.catch_up.replay_answered(c), "the replay stays owed");
+    assert_eq!(f.catch_up.replay_from(c), at, "at its position");
+    assert_eq!(inbound_records(c, a, at), Some(cursor), "with its cursor");
+}
+
+/// The same, outbound: A asks C one page a contact, then asks again with a
+/// contact's whole time; C's answer carries nothing and the cursor A sent, and A
+/// stops asking for the contact rather than asking the same page until its
+/// deadline.
+#[tokio::test]
+async fn a_changed_record_too_large_for_an_outbound_replays_delta_is_counted_and_stays() {
+    let f = fixture(5, 0);
+    plant_spanning_records(&f, 30);
+    let _budget = EntryBudget::set(8 * 1024);
+    f.replay_outbound_for(Duration::ZERO).await.unwrap();
+    let c = f.c.node_id();
+    let at = f.catch_up.replay_from(c);
+    let cursor = f.catch_up.replay_records(c).expect("premise: a page of records alone");
+    plant_large_change(&f, 5 * 1024);
+    let seen = Seen::default();
+    let log = Arc::clone(&seen.0);
+    let _recording = tracing::subscriber::set_default(seen);
+    tracing::callsite::rebuild_interest_cache();
+    let unfit = records_unfit().get(UnfitPath::Replay);
+    let replayed = f.replay_outbound_for(Duration::from_secs(20)).await;
+    assert!(replayed.is_ok(), "the contact is no failure: {replayed:?}");
+    assert!(records_unfit().get(UnfitPath::Replay) > unfit, "counted");
+    assert_eq!(delta_refusals(&log), 1, "said once, and the contact asked no more");
+    assert!(!f.catch_up.replay_answered(c), "the replay stays owed");
+    assert_eq!(f.catch_up.replay_from(c), at, "at its position");
+    assert_eq!(f.catch_up.replay_records(c), Some(cursor), "with its cursor");
 }

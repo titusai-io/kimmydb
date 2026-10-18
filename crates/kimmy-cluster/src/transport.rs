@@ -329,8 +329,14 @@ pub(crate) struct ReplayCut {
     pub(crate) scanned_to: Hlc,
     pub(crate) exhausted: bool,
     /// Set on a page of records alone: where the next page at the same position
-    /// goes on after ([`kimmy_storage::ReplayRecords`]).
+    /// goes on after ([`kimmy_storage::ReplayRecords`]). On a page that could not
+    /// carry what it must (`unfit`), the cursor it came with, unchanged.
     pub(crate) replay_records: Option<kimmy_storage::ReplayRecords>,
+    /// The page carries nothing because what it must carry does not fit one page:
+    /// counted in `kimmy_idempotency_records_unfit_total{path="replay"}` and logged
+    /// at `WARN`. The replay stays at its position, and its cursor where it was,
+    /// for this contact.
+    pub(crate) unfit: bool,
 }
 
 /// The key a record is one of, for a page's records each once.
@@ -393,10 +399,43 @@ pub(crate) fn cut_replay_page(
     let mut collections: Vec<CollectionId> = entries.iter().map(|entry| entry.collection).collect();
     collections.sort();
     collections.dedup();
-    let read = kimmy_storage::blocking(|| {
+    // The cursor as it came, for a page that cannot go on from it.
+    let kept = cursor.clone();
+    let stays = |kept: Option<kimmy_storage::ReplayRecords>| ReplayCut {
+        entries: Vec::new(),
+        records: Vec::new(),
+        scanned_to: from,
+        exhausted: false,
+        replay_records: kept,
+        unfit: true,
+    };
+    let read = match kimmy_storage::blocking(|| {
         engine.replay_page_records(&collections, from, through, cursor.as_ref(), budget / 2)
-    })
-    .map_err(|e| from_storage(e, ProtocolError::Local))?;
+    }) {
+        Ok(read) => read,
+        // A record the change log names as changed since the cursor's base that
+        // is larger than the delta's half of a page (P2's refusal): the delta
+        // cannot carry it, and a page that went on without it could pass it. The
+        // page carries nothing, the replay stays at this position with its cursor,
+        // and it is said and counted, as every page that cannot carry what it must.
+        Err(kimmy_storage::StorageError::SnapshotRowTooLarge { what, bytes, room }) => {
+            records_unfit().bump(UnfitPath::Replay);
+            warn!(
+                %peer,
+                ?from,
+                what = %what,
+                bytes,
+                room,
+                "an idempotency record changed since this replay's records cursor is larger than \
+                 a replay page's delta can carry; the page carries nothing and the replay of the \
+                 peer's own origin stays at this position until the change log's row of it is \
+                 trimmed with the record's window; counted in \
+                 kimmy_idempotency_records_unfit_total"
+            );
+            return Ok(stays(kept));
+        }
+        Err(e) => return Err(from_storage(e, ProtocolError::Local)),
+    };
     let passed: HashSet<RecordKey> =
         read.passed.iter().map(|(collection, scope)| (collection.0, scope.0)).collect();
     let changed: HashSet<RecordKey> = read.changed.iter().map(record_key).collect();
@@ -443,13 +482,7 @@ pub(crate) fn cut_replay_page(
              peer's own origin stays at this position until they do; counted in \
              kimmy_idempotency_records_unfit_total"
         );
-        Ok(ReplayCut {
-            entries: Vec::new(),
-            records: Vec::new(),
-            scanned_to: from,
-            exhausted: false,
-            replay_records: None,
-        })
+        Ok(stays(kept.clone()))
     };
     let size_of = |records: &[kimmy_storage::CarriedRecord]| -> Option<usize> {
         records.iter().map(record_bytes).sum()
@@ -471,15 +504,21 @@ pub(crate) fn cut_replay_page(
             scanned_to: from,
             exhausted: false,
             replay_records: Some(kimmy_storage::ReplayRecords { base: read.base, ..cursor }),
+            unfit: false,
         });
     }
     let unanchored = lead.len();
     let mut all = lead;
     all.extend(rest.into_values());
     match how_many_fit(&entries, &all, unanchored) {
-        Fits::All => {
-            Ok(ReplayCut { entries, records: all, scanned_to, exhausted, replay_records: None })
-        }
+        Fits::All => Ok(ReplayCut {
+            entries,
+            records: all,
+            scanned_to,
+            exhausted,
+            replay_records: None,
+            unfit: false,
+        }),
         Fits::Only(fits) if fits > 0 => {
             entries.truncate(fits);
             let end = entries[fits - 1].stamp;
@@ -497,6 +536,7 @@ pub(crate) fn cut_replay_page(
                 scanned_to: end.hlc,
                 exhausted: false,
                 replay_records: None,
+                unfit: false,
             })
         }
         _ => {
@@ -515,6 +555,7 @@ pub(crate) fn cut_replay_page(
                     scanned_to,
                     exhausted: false,
                     replay_records: None,
+                    unfit: false,
                 });
             }
             // The rest in key order, as many as fit.
@@ -568,6 +609,7 @@ pub(crate) fn cut_replay_page(
                 scanned_to: from,
                 exhausted: false,
                 replay_records: Some(next),
+                unfit: false,
             })
         }
     }
@@ -2315,6 +2357,12 @@ where
             cursor.at == from && matches!(page, ReplayPage::Empty { next } if next == from)
         });
         catch_up.set_replay_records(their_node, alone.clone());
+        // A page of records alone whose cursor came back as it went: the peer could
+        // not carry what the next page must (it says so and counts it), so the
+        // replay stays where it is, its cursor with it, until a later contact.
+        if alone.is_some() && alone == replay_records {
+            return Ok(());
+        }
         match page {
             ReplayPage::Stalled(_) => {
                 // A collection these entries name is not here yet: the ordinary
@@ -2659,8 +2707,10 @@ where
             return Ok(ReplayServed::InStep);
         }
         sent_pages += 1;
-        // The records cursor the page cut, set only on a page of records alone.
+        // The records cursor the page cut, set only on a page of records alone,
+        // and whether the page could not carry what it must.
         let mut records_cut = None;
+        let mut page_unfit = false;
         // Every other origin is "held", whatever the peer says it holds of them: the
         // replay is about the peer's own origin alone, so the walk passes over
         // the rest unread and uncounted, and the horizon is judged for that origin
@@ -2725,6 +2775,7 @@ where
                     records_cursor.clone(),
                 )?;
                 records_cut = cut.replay_records;
+                page_unfit = cut.unfit;
                 let records = records_to_send(engine, cut.records);
                 (cut.entries, cut.exhausted, false, cut.scanned_to, records)
             }
@@ -2765,6 +2816,12 @@ where
             Message::ReplayAck { next_from, done, stalled } => {
                 info!(%peer, entries = count, exhausted, done, "served a page of a peer's replay");
                 if done || stalled.is_some() || horizon || exhausted {
+                    return Ok(ReplayServed::InStep);
+                }
+                // A page that could not carry what it must (said and counted where it
+                // was cut): the replay stays where it is, its cursor with it, and the
+                // contact goes on with the ordinary round.
+                if page_unfit {
                     return Ok(ReplayServed::InStep);
                 }
                 // A page of records alone the peer stored, at the position it asks
