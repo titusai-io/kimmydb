@@ -540,7 +540,16 @@ fn trace() -> bool {
     std::env::var("IDEM_TRACE").is_ok_and(|v| v == "1")
 }
 
+/// Whether the relay class and L1 fail a generated run: yes, since fix (e) and L1's
+/// fix landed; `IDEM_LENIENT=1` counts them instead, for a tree without those fixes.
 fn strict() -> bool {
+    !std::env::var("IDEM_LENIENT").is_ok_and(|v| v == "1")
+}
+
+/// Whether S1 fails a generated run as well: `IDEM_STRICT=1`. Counted by default, since
+/// it holds G8's ruled residual (a record-only `done` keeps `last`, and never reaches a
+/// member that covers it).
+fn strict_s1() -> bool {
     std::env::var("IDEM_STRICT").is_ok_and(|v| v == "1")
 }
 
@@ -789,8 +798,10 @@ struct World {
     restored: HashMap<NodeId, Hlc>,
     /// A drive is running: the home track's policy does not nest.
     driving: bool,
-    /// Classified findings fail the run (`IDEM_STRICT=1`, or a named row).
+    /// The relay class and L1 fail the run ([`strict`], and every named row).
     strict: bool,
+    /// S1 fails the run as well ([`strict_s1`], and every named row).
+    strict_s1: bool,
     /// Members the schedule has taken down.
     down: Vec<bool>,
     /// Each member's backup, with the identity it was taken under.
@@ -834,6 +845,7 @@ impl World {
             restored: HashMap::new(),
             driving: false,
             strict: strict(),
+            strict_s1: strict_s1(),
             down: vec![false; count],
             retry_catching_up: false,
             backups: HashMap::new(),
@@ -2636,7 +2648,9 @@ impl World {
                 self.out.s1 += 1;
             }
             self.note(format!("finding: {detail}"));
-            if self.strict {
+            if (kinds.contains(&"relay") && self.strict)
+                || (kinds.contains(&"S1") && self.strict_s1)
+            {
                 self.fail(Inv::I4, format!("(strict) {detail}"));
             }
         }
@@ -2861,14 +2875,22 @@ fn settle(w: &mut World) -> Res<()> {
 
 /// Run a schedule and settle it.
 pub(crate) fn run(sched: &Schedule) -> Outcome {
-    run_with(sched, strict(), false)
+    run_with(sched, None, false)
 }
 
-/// [`run`], with classified findings failing it (`strict`), and requests sent to a
-/// member catching up (`retry_catching_up`).
-pub(crate) fn run_with(sched: &Schedule, strict: bool, retry_catching_up: bool) -> Outcome {
+/// [`run`], with every classified finding failing it when `all_strict` says so (as a
+/// named row runs; `None`, as the environment says), and requests sent to a member
+/// catching up (`retry_catching_up`).
+pub(crate) fn run_with(
+    sched: &Schedule,
+    all_strict: Option<bool>,
+    retry_catching_up: bool,
+) -> Outcome {
     let world = Rc::new(RefCell::new(World::new(sched.clone(), base())));
-    world.borrow_mut().strict = strict;
+    if let Some(all) = all_strict {
+        world.borrow_mut().strict = all;
+        world.borrow_mut().strict_s1 = all;
+    }
     world.borrow_mut().retry_catching_up = retry_catching_up;
     let out = setup(&mut world.borrow_mut());
     if let Err(e) = out {
@@ -3495,7 +3517,7 @@ fn row(name: &str, members: u8, requests: Vec<Request>, ops: Vec<Op>) {
 
 fn row_with(name: &str, members: u8, requests: Vec<Request>, ops: Vec<Op>, at_completion: bool) {
     let sched = Schedule { track: Track::Anywhere, home: 0, members, requests, ops };
-    let out = run_with(&sched, true, at_completion);
+    let out = run_with(&sched, Some(true), at_completion);
     if trace() {
         eprintln!("row {name}:\n{}", render(None, &sched, &out));
     }
@@ -3712,6 +3734,41 @@ fn row_g5_an_own_origin_replay_after_a_restore() {
             pull(B, A),
             Op { step: Step::Restore { m: A }, t: 0 },
             ask(0, A, 120),
+        ],
+    );
+}
+
+/// G8: a keyed `$inc` of two counters fills its one chunk, and its lookahead finds the
+/// end, so the chunk's own record says `done`. B pulls right after that commit: it holds
+/// `done`, and a retry there replays (no record-only `done` it could never receive).
+#[test]
+fn row_g8_a_member_that_pulls_the_last_chunk_gets_done_with_it() {
+    row(
+        "g8",
+        3,
+        vec![req(1, Kind::IncRange { d: 0 })],
+        vec![ask_between(0, A, 100, vec![(1, vec![pull(B, A)])]), ask(0, B, 110)],
+    );
+}
+
+/// G8, past matches the stamp rule leaves: counter 4 is written after the request's
+/// first write, so it is left; the second chunk fills its budget and its lookahead finds
+/// only that left match before the end, so it writes `done`. B, pulling right after it,
+/// holds `done`, and a retry there replays.
+#[test]
+fn row_g8_the_lookahead_ends_past_a_left_match() {
+    row(
+        "g8-left",
+        3,
+        vec![req(1, Kind::IncMulti)],
+        vec![
+            ask_between(
+                0,
+                A,
+                100,
+                vec![(1, vec![touch(A, ORDERS, 4, 103)]), (2, vec![pull(B, A)])],
+            ),
+            ask(0, B, 110),
         ],
     );
 }

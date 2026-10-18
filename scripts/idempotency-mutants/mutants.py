@@ -4,7 +4,7 @@ source, applied once to a `git archive` export, run against its suites under a t
 and reverted by copying the pristine file back. A row whose text does not occur exactly
 once fails `check` and is never run.
 
-    mutants.py list [group]            names of the rows (group: design, elsewhere, all)
+    mutants.py list [group]            names of the rows (group: design, fix-e, elsewhere, all)
     mutants.py check <tree>            every row applies to <tree>, exactly once
     mutants.py apply <name> <tree>     patch <tree> in place
     mutants.py files <name>            the files a row touches
@@ -13,12 +13,10 @@ once fails `check` and is never run.
 """
 import sys
 
-# The model's suites: its CI sweep and its named rows (the break rows are ignored on a
-# tree without their fix, and run here with --include-ignored).
-MODEL = [
-    ("kimmy-storage", "--lib", "idempotency_model_tests::generated_schedules_short", "no"),
-    ("kimmy-storage", "--lib", "idempotency_model_tests::row_", "yes"),
-]
+# The storage crate's idempotency tests: the model's CI sweep, its named rows and
+# reproducers, and the unit, replication and coverage tests. What is ignored (the long
+# run, rows waiting for a fix not on the tree) is left out.
+MODEL = [("kimmy-storage", "--lib", "idempotency", "no")]
 
 ROWS = [
     {
@@ -118,15 +116,19 @@ ROWS = [
         "doc": "A snapshot or converge page's record stored without witnessing its stamps",
         "patches": [
             ("crates/kimmy-storage/src/idempotency.rs",
-             """        put_rows(txn, collection, scope, &merged, carrying)?;
+             """            None => record.clone(),
+        };
         self.witness(&merged.first);
         self.witness(&merged.last);
+        if live.as_ref() == Some(&merged)
 """,
-             """        put_rows(txn, collection, scope, &merged, carrying)?;
+             """            None => record.clone(),
+        };
         if carrying.is_some() {
             self.witness(&merged.first);
             self.witness(&merged.last);
         }
+        if live.as_ref() == Some(&merged)
 """),
         ],
         "suites": MODEL,
@@ -152,12 +154,12 @@ ROWS = [
             Some(live) => live.merge(record),
             None => record.clone(),
         };
-        put_rows(txn, collection, scope, &merged, carrying)?;""",
+        self.witness(&merged.first);""",
              """        let merged = match &live {
             Some(live) => live.clone(),
             None => record.clone(),
         };
-        put_rows(txn, collection, scope, &merged, carrying)?;"""),
+        self.witness(&merged.first);"""),
         ],
         "suites": MODEL,
     },
@@ -189,23 +191,17 @@ ROWS = [
         "doc": "A received record rowed at its carrying stamp only, not at its `last` (a page store gets no row)",
         "patches": [
             ("crates/kimmy-storage/src/idempotency.rs",
-             """        let merged = match &live {
-            Some(live) => live.merge(record),
-            None => record.clone(),
-        };
-        put_rows(txn, collection, scope, &merged, carrying)?;""",
-             """        let merged = match &live {
-            Some(live) => live.merge(record),
-            None => record.clone(),
-        };
-        txn.open_table(IDEMPOTENCY)?
+             """        put_rows(txn, collection, scope, &merged, carrying)?;
+        Ok((Some(merged), true))
+""",
+             """        txn.open_table(IDEMPOTENCY)?
             .insert((collection.0, scope.as_bytes().as_slice()), merged.encode().as_slice())?;
         if let Some(carrying) = carrying {
-            txn.open_table(IDEMPOTENCY_BY_STAMP)?.insert(
-                codec::oplog_key(&carrying).as_slice(),
-                row_value(collection, scope).as_slice(),
-            )?;
-        }"""),
+            txn.open_table(IDEMPOTENCY_BY_STAMP)?
+                .insert(row_key(&carrying).as_slice(), row_value(collection, scope).as_slice())?;
+        }
+        Ok((Some(merged), true))
+"""),
         ],
         "suites": MODEL,
     },
@@ -254,6 +250,130 @@ ROWS = [
              "        let _ = (memo, standing, collection, record);\n        Ok(false)\n"),
         ],
         "suites": MODEL,
+    },
+    {
+        "name": "records-at-shipped-stamps-only",
+        "group": "fix-e",
+        "doc": "A window ships only the records whose row is one of its entries' stamps (before fix (e))",
+        "patches": [
+            ("crates/kimmy-storage/src/sync.rs",
+             "        crate::idempotency::records_for_coverage(txn, &floor, &reach, &servable)\n",
+             """        let (records, _) =
+            crate::idempotency::records_for_coverage(txn, &floor, &reach, &servable)?;
+        let shipped: std::collections::HashSet<Stamp> =
+            window.entries.iter().map(|entry| entry.stamp).collect();
+        let records =
+            records.into_iter().filter(|r| r.carrying.is_some_and(|at| shipped.contains(&at))).collect();
+        Ok((records, 0))
+"""),
+        ],
+        "suites": MODEL,
+    },
+    {
+        "name": "f2-without-store-on-coverage",
+        "group": "fix-e",
+        "doc": "A frame's record is stored only in a run that takes an entry of its collection",
+        "patches": [
+            ("crates/kimmy-storage/src/sync.rs",
+             "        if frame.owes_any() {\n",
+             "        if false && frame.owes_any() {\n"),
+        ],
+        "suites": MODEL,
+    },
+    {
+        "name": "no-f3",
+        "group": "fix-e",
+        "doc": "No record a sender cannot vouch for by its oplog is shipped (F3 off)",
+        "patches": [
+            ("crates/kimmy-storage/src/idempotency.rs",
+             "    records_unanchored(&rows, &records, floor, servable, &mut shipping)?;\n",
+             "    let _ = servable;\n"),
+        ],
+        "suites": MODEL,
+    },
+    {
+        "name": "no-row-at-first",
+        "group": "fix-e",
+        "doc": "A record is rowed at its last (and a carrying stamp), never at its first (F1 off)",
+        "patches": [
+            ("crates/kimmy-storage/src/idempotency.rs",
+             "    let mut stamps = vec![record.first, record.last];\n",
+             "    let mut stamps = vec![record.last];\n"),
+        ],
+        "suites": MODEL,
+    },
+    {
+        "name": "retention-drops-a-live-first-row",
+        "group": "fix-e",
+        "doc": "Retention removes the row at the first of a record still inside its window",
+        "patches": [
+            ("crates/kimmy-storage/src/idempotency.rs",
+             "                            record.first == stamp && record.last.hlc >= cutoff,\n",
+             "                            false,\n"),
+        ],
+        "suites": MODEL,
+    },
+    {
+        "name": "lookahead-off",
+        "group": "fix-e",
+        "doc": "No lookahead: a request whose end follows a full chunk is marked done by a record-only commit (G8)",
+        "patches": [
+            ("crates/kimmy-storage/src/modify.rs",
+             "        if !ends && let Some(run) = run.as_deref() {\n",
+             "        if false && !ends && let Some(run) = run.as_deref() {\n"),
+        ],
+        "suites": MODEL,
+    },
+    {
+        "name": "lookahead-counts-left-matches-as-writable",
+        "group": "fix-e",
+        "doc": "The lookahead takes a match the stamp rule leaves for one the request could write",
+        "patches": [
+            ("crates/kimmy-storage/src/modify.rs",
+             "        if ahead.iter().any(|found| first.is_none_or(|first| found.stamp < first)) {\n",
+             "        let _ = first;\n        if !ahead.is_empty() {\n"),
+        ],
+        "suites": MODEL,
+    },
+    {
+        "name": "last-is-the-commits-first-entry",
+        "group": "fix-e",
+        "doc": "A record's last is its latest commit's first entry, not its last (L1 reverted)",
+        "patches": [
+            ("crates/kimmy-storage/src/modify.rs",
+             "            let (first_entry, last_entry) = (entries[0].stamp, entries[entries.len() - 1].stamp);\n",
+             "            let (first_entry, last_entry) = (entries[0].stamp, entries[0].stamp);\n"),
+            ("crates/kimmy-storage/src/docs.rs",
+             "            let (first, last) = (stamps[0], stamps[stamps.len() - 1]);\n",
+             "            let (first, last) = (stamps[0], stamps[0]);\n"),
+        ],
+        "suites": MODEL,
+    },
+    {
+        "name": "replay-pages-filtered-by-shipped-entries",
+        "group": "fix-e",
+        "doc": "A replay page carries only the records whose carrying stamp is one of its entries (records_of)",
+        "patches": [
+            ("crates/kimmy-cluster/src/transport.rs",
+             """                    through.max(window.scanned_to),
+                    records_to_send(engine, window.records),
+                    window.unanchored,
+                );
+""",
+             """                    through.max(window.scanned_to),
+                    {
+                        let shipped: std::collections::HashSet<kimmy_core::Stamp> =
+                            entries.iter().map(|entry| entry.stamp).collect();
+                        records_to_send(engine, window.records)
+                            .into_iter()
+                            .filter(|r| r.carrying.is_some_and(|at| shipped.contains(&at)))
+                            .collect()
+                    },
+                    0,
+                );
+"""),
+        ],
+        "suites": [("kimmy-cluster", "--lib", "replay_tests", "no")],
     },
     {
         "name": "replay-without-the-barrier",
