@@ -415,16 +415,15 @@ impl AppState {
     }
 
     /// The engine's idempotency records, read at the scrape (B5): how many this
-    /// member holds (the table's own count, O(1)) and how many retention
-    /// removed. The records taken from peers, by way, and those a peer sent
-    /// that this build could not decode are counted where replication stores
-    /// them, and read into `received` and `undecodable` here once it does; until
-    /// then they are zero, and on the page all the same.
+    /// member holds (the table's own count, O(1)), how many retention removed,
+    /// the records taken from peers by way (`RECORDS_RECEIVED_VIA` order) and
+    /// those a peer sent that this build could not decode.
     pub fn idempotency_reading(&self) -> Result<crate::metrics::IdempotencyReading, ApiError> {
         Ok(crate::metrics::IdempotencyReading {
             records: self.engine.idempotency_records()?,
+            received: self.engine.idempotency_records_received(),
+            undecodable: self.engine.idempotency_records_undecodable(),
             collected: self.engine.idempotency_records_collected(),
-            ..Default::default()
         })
     }
 }
