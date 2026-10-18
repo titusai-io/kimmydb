@@ -132,6 +132,9 @@ mod idempotency_tests;
 mod idempotency_repl_tests;
 
 #[cfg(test)]
+mod idempotency_model_tests;
+
+#[cfg(test)]
 mod page_delta_tests;
 
 #[cfg(test)]

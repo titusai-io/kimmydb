@@ -646,3 +646,102 @@ fn an_undecodable_record_goes_when_its_row_expires() {
     assert_eq!(gone.records_removed, 1);
     assert_eq!(raw(&a.engine), (false, 0), "the record went with its row");
 }
+
+// -- Lives: a record of the life after a drop -----------------------------------------------
+
+/// A window ships a record at a row of its own, never at a row another record
+/// under its key left: one of a life a drop ended (its record purged, its rows
+/// left to expire), here below the record's `first`. Shipped at that row, the
+/// record of the later life rode with the earlier life's entry.
+#[test]
+fn a_window_ships_a_record_at_its_own_row_not_at_one_an_earlier_life_left() {
+    let (a, _b, ca, _) = pair();
+    let k = keyed(41);
+    fresh(a.engine.insert_keyed(&ca, doc! { "v": 1 }, &k).unwrap());
+    let old = a.engine.idempotency_record(ca.id, &k.scope).unwrap().expect("premise").first;
+    a.engine.drop_collection("shop", "orders").unwrap();
+    a.engine.finish_purges_now().unwrap();
+    let again = a.engine.create_collection("shop", "orders").unwrap();
+    fresh(a.engine.insert_keyed(&again, doc! { "v": 1 }, &k).unwrap());
+    let now = a.engine.idempotency_record(again.id, &k.scope).unwrap().expect("premise");
+    assert!(old < now.first, "premise: the earlier life's row is below the record");
+    let empty = kimmy_core::VersionVector::new();
+    let window = a
+        .engine
+        .entries_for_peer_holding(Hlc::ZERO, 1024, Some(&empty), WalkScope::Background)
+        .unwrap();
+    let shipped: Vec<_> = window.records.iter().filter(|r| r.scope == k.scope).collect();
+    assert_eq!(shipped.len(), 1, "one per key: {shipped:?}");
+    assert_eq!(shipped[0].carrying, Some(now.first), "at its own row, not the earlier life's");
+}
+
+/// A frame's record is stored with the entry at or after its row, never in the
+/// run of an earlier entry of its collection: the batch takes entries in stamp
+/// order, and one before the row can be of a life a drop between them ends, a
+/// drop this member has not taken yet. Here B holds its own record of the key
+/// from the earlier life, and A's window carries the dropped life's write, the
+/// drop, the creation and the later life's write with its record. Stored with
+/// the first entry, the later life's record merged with B's, still alive then,
+/// and B held the earlier life's `first` under it.
+#[test]
+fn a_frames_record_rides_with_the_entry_at_its_row_not_an_earlier_one() {
+    let (a, b, ca, cb) = pair();
+    let k = keyed(42);
+    let tick = || std::thread::sleep(std::time::Duration::from_millis(3));
+    fresh(a.engine.insert_keyed(&ca, doc! { "v": 1 }, &k).unwrap());
+    tick();
+    fresh(b.engine.insert_keyed(&cb, doc! { "v": 1 }, &k).unwrap());
+    tick();
+    pull(&a.engine, &b.engine);
+    a.engine.drop_collection("shop", "orders").unwrap();
+    a.engine.finish_purges_now().unwrap();
+    let again = a.engine.create_collection("shop", "orders").unwrap();
+    fresh(a.engine.insert_keyed(&again, doc! { "v": 1 }, &k).unwrap());
+    let theirs = a.engine.idempotency_record(again.id, &k.scope).unwrap().expect("premise");
+    let mine = b.engine.idempotency_record(cb.id, &k.scope).unwrap().expect("premise");
+    assert!(mine.last < theirs.first, "premise: B's record is the earlier life's");
+    pull(&b.engine, &a.engine);
+    b.engine.finish_purges_now().unwrap();
+    pull(&b.engine, &a.engine);
+    assert_eq!(
+        b.engine.idempotency_record(again.id, &k.scope).unwrap(),
+        Some(theirs),
+        "the later life's record, not merged with the earlier life's"
+    );
+}
+
+/// A batch that ends at an entry stores none of the frame's records whose row is at
+/// or past it: the window grants no coverage there and serves them again. Here B's
+/// batch ends at the creation of `shop.other` again, its earlier life's purge still
+/// owed, before the drop of `orders` and the later life's write with its record;
+/// B still holds the earlier life's record under the key. Stored at the batch's end,
+/// the later life's record merged with it.
+#[test]
+fn a_batch_that_ends_early_leaves_the_records_past_its_end() {
+    let (a, b, ca, cb) = pair();
+    a.engine.create_collection("shop", "other").unwrap();
+    let k = keyed(43);
+    fresh(a.engine.insert_keyed(&ca, doc! { "v": 1 }, &k).unwrap());
+    pull(&b.engine, &a.engine);
+    let earlier = b.engine.idempotency_record(cb.id, &k.scope).unwrap().expect("premise");
+    a.engine.drop_collection("shop", "other").unwrap();
+    a.engine.finish_purges_now().unwrap();
+    a.engine.create_collection("shop", "other").unwrap();
+    a.engine.drop_collection("shop", "orders").unwrap();
+    a.engine.finish_purges_now().unwrap();
+    let again = a.engine.create_collection("shop", "orders").unwrap();
+    fresh(a.engine.insert_keyed(&again, doc! { "v": 1 }, &k).unwrap());
+    let later = a.engine.idempotency_record(again.id, &k.scope).unwrap().expect("premise");
+    let outcome = pull(&b.engine, &a.engine);
+    assert_eq!(outcome.purge_pending, 1, "premise: the batch ended at the creation");
+    assert_eq!(
+        b.engine.idempotency_record(cb.id, &k.scope).unwrap(),
+        Some(earlier),
+        "the later life's record is left for the window that takes its row"
+    );
+    for _ in 0..4 {
+        b.engine.finish_purges_now().unwrap();
+        pull(&b.engine, &a.engine);
+    }
+    assert_eq!(b.engine.idempotency_record(again.id, &k.scope).unwrap(), Some(later));
+}

@@ -1668,7 +1668,9 @@ fn a_record_whose_row_at_last_is_missing_is_still_collected() {
 
 /// A record stored from a sender whose clock is ahead is folded into the clock,
 /// and after a restart the clock resumes above it: the last key of the rows by
-/// stamp is in the high water at open.
+/// stamp is in the high water at open. After a restart the change log's high
+/// water is above it too (its key was minted after the record was witnessed); after
+/// a restore, which does not carry the log, only the rows' is.
 #[test]
 fn the_clock_resumes_above_every_record_after_a_restart() {
     let (engine, coll, _dir, path) = open();
@@ -1694,6 +1696,54 @@ fn the_clock_resumes_above_every_record_after_a_restart() {
     drop(engine);
     let (engine, _) = reopen(&path);
     assert!(engine.next_stamp() > ahead, "and after a restart");
+    // A restore carries the records and not the change log, which begins again: the
+    // records' own high water is what the clock resumes above there.
+    let mut buf = Vec::new();
+    engine.backup_to(&mut buf, WalkScope::Request).unwrap();
+    let dest = tempfile::tempdir().unwrap();
+    let restored = dest.path().join("restored.redb");
+    crate::backup::restore(&restored, &mut buf.as_slice()).unwrap();
+    let (engine, _) = reopen(&restored);
+    assert!(engine.next_stamp() > ahead, "and after a restore");
+}
+
+/// The change log's keys are minted stamps, and a page's base is one of them: the clock
+/// resumes above the last key after a restart, even where the key is the only stamp
+/// this member holds that high (its clock moved ahead, then it stored a record whose own
+/// stamps are behind). Below it, the next change's key could fall under a base already
+/// handed out, and that page's delta would miss it.
+#[test]
+fn the_clock_resumes_above_the_change_logs_keys_after_a_restart() {
+    let (engine, coll, _dir, path) = open();
+    let now = Stamp::new(Hlc::new(crate::physical_now_ms(), 0), NodeId::from_bytes([9; 16]));
+    let ahead = Stamp::new(Hlc::new(crate::physical_now_ms() + 3_600_000, 0), engine.node_id());
+    engine.advance_clock_past(&ahead);
+    let r = base(8, now, now, 9, RecordState::Done);
+    {
+        let txn = engine.begin_write(crate::WriterHolder::Repair).unwrap();
+        let stored = engine
+            .store_record(
+                &txn,
+                &mut Default::default(),
+                Some(&coll),
+                coll.id,
+                &ScopeHash([8; 32]),
+                &r,
+                None,
+            )
+            .unwrap();
+        assert!(stored.is_some());
+        txn.commit().unwrap();
+    }
+    let key = {
+        use redb::ReadableDatabase;
+        let txn = engine.db().begin_read().unwrap();
+        crate::idempotency::changes_high_water(&txn).unwrap().expect("a change was logged")
+    };
+    assert!(key > ahead, "premise: the log's key is minted on the clock moved ahead");
+    drop(engine);
+    let (engine, _) = reopen(&path);
+    assert!(engine.next_stamp() > key, "the clock resumes above the log's last key");
 }
 
 // -- Purge, sweep, rewind, backup --------------------------------------------------------------
@@ -1714,6 +1764,47 @@ fn a_drops_purge_removes_the_collections_records() {
     assert!(!engine.records_under(coll.id).unwrap());
     assert!(engine.records_under(other.id).unwrap(), "another collection's stand");
     assert_eq!(rows(&engine).len(), 6, "rows are left to expire");
+}
+
+/// The purge removes the dropped life's records only (finding P1). A window stores
+/// the records it carries whether or not their collection stands, so a member that
+/// has applied a drop, its purge pending, can hold the record of a write stamped after
+/// the drop, a write the next life keeps (ADR-236). That record stays through the
+/// purge, and a retry after the name is created again replays it; the dropped life's
+/// record goes.
+#[test]
+fn a_drops_purge_leaves_a_record_of_the_life_after_it() {
+    let (engine, coll, _dir, _path) = open();
+    let old = keyed(60);
+    fresh(engine.insert_keyed(&coll, doc! { "_id": 1i64 }, &old).unwrap());
+    engine.drop_collection("shop", "orders").unwrap();
+    let dropped = engine.collection_dropped_at(coll.id).unwrap().expect("a tombstone");
+    // As a window brings it, the collection absent here and its purge pending.
+    let k = keyed(61);
+    let at = Stamp::new(dropped.hlc.successor(), NodeId::from_bytes([9; 16]));
+    let later = IdempotencyRecord {
+        fingerprint: k.fingerprint,
+        first: at,
+        last: at,
+        origin: at.node,
+        state: RecordState::Done,
+        outcome: RecordOutcome::Insert { stamp: at },
+    };
+    {
+        let txn = engine.begin_write(crate::WriterHolder::Replication).unwrap();
+        let stored = engine
+            .store_record(&txn, &mut Default::default(), None, coll.id, &k.scope, &later, Some(at))
+            .unwrap();
+        assert!(stored.is_some(), "premise: not history, its last is above the drop");
+        txn.commit().unwrap();
+    }
+    engine.finish_purges_now().unwrap();
+    assert_eq!(record(&engine, &coll, &old), None, "the dropped life's record went");
+    assert_eq!(record(&engine, &coll, &k), Some(later), "the later life's stays");
+    let again = engine.create_collection("shop", "orders").unwrap();
+    let replay = replayed(engine.insert_keyed(&again, doc! { "_id": 2i64 }, &k).unwrap());
+    assert_eq!(replay.first, at);
+    assert_eq!(count(&engine, &again), 0, "nothing written again");
 }
 
 /// A database drop buries each collection the same way, and the purge that
