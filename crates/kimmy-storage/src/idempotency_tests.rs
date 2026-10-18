@@ -1225,6 +1225,45 @@ fn f5_a_keyed_request_stopped_between_chunks_resumes() {
     assert_eq!(ns(&engine, &coll, 3), vec![1, 1, 1]);
 }
 
+/// The two lines `docs/operations.md` publishes for a keyed write, at the
+/// levels it gives them: a resume at `INFO`, with the collection and the counts
+/// it carries on from, and a replay at `DEBUG`, below what an operator's
+/// default `INFO` shows.
+#[test]
+fn a_resume_logs_at_info_and_a_replay_below_it() {
+    let (engine, coll, _dir, path) = open();
+    counters(&engine, &coll, 3);
+    let engine = Arc::new(engine);
+    let k = keyed(96);
+    let stopper = Arc::clone(&engine);
+    crate::sync::race_hooks::at(crate::sync::race_hooks::Race::BetweenChunks, move || {
+        stopper.set_stopping();
+    });
+    let failed = engine.modify_where_keyed(&coll, &Candidates::Scan, &Inc, None, &k);
+    assert!(matches!(failed, Err(StorageError::PartiallyApplied { .. })), "{failed:?}");
+    drop(engine);
+    let (engine, coll) = reopen(&path);
+    engine.set_multi_chunk_docs(1);
+
+    let (out, logs) = crate::log_capture::logged(|| {
+        fresh(engine.modify_where_keyed(&coll, &Candidates::Scan, &Inc, None, &k).unwrap())
+    });
+    assert!(out.resumed);
+    let line = logs
+        .lines()
+        .find(|line| line.contains("resumed a keyed write that had stopped"))
+        .unwrap_or_else(|| panic!("a resume logs its line at INFO:\n{logs}"));
+    assert!(line.contains(" INFO "), "{line}");
+    for field in ["db=shop", "collection=orders", "matched=1", "modified=1", "skipped=0"] {
+        assert!(line.contains(field), "{field} in {line}");
+    }
+
+    let (_, logs) = crate::log_capture::logged(|| {
+        replayed(engine.modify_where_keyed(&coll, &Candidates::Scan, &Inc, None, &k).unwrap())
+    });
+    assert!(!logs.contains("replayed a keyed write"), "a replay logs at DEBUG:\n{logs}");
+}
+
 /// How a test crashes a request between two of its commits.
 #[derive(Clone, Copy, Debug)]
 enum Crash {
