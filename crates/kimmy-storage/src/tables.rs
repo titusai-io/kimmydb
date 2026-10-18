@@ -302,8 +302,9 @@ pub const SNAPSHOT_PROGRESS: TableDefinition<&[u8], &[u8]> =
 ///
 /// The scope hash (32 bytes) is SHA-256 over the principal and the client's key;
 /// the key itself is never stored. The value leads with its own version byte. A
-/// record lives `storage.oplog_retention_secs` after its `last`, and is judged by
-/// the history rule documents are, on that `last`. Carried by a backup (tag 12).
+/// record lives `storage.oplog_retention_secs` after its `last`, a drop of its
+/// collection notwithstanding: retention is the only remover. Carried by a
+/// backup (tag 12).
 /// Created by `Engine::open` with no schema bump: an older build never opens it.
 pub const IDEMPOTENCY: TableDefinition<(u64, &[u8]), &[u8]> = TableDefinition::new("idempotency");
 
@@ -318,7 +319,9 @@ pub const IDEMPOTENCY: TableDefinition<(u64, &[u8]), &[u8]> = TableDefinition::n
 /// What retention reads, per origin below its cutoff, to find records past
 /// their window (it keeps a live record's `first` and `last` rows); the largest
 /// of each origin's last key is in the clock's high water at open. A row whose
-/// record is gone names nothing and expires. Carried by a backup (tag 13).
+/// record is gone (a retention pass stopped between its chunks leaves some until
+/// the next) names nothing, ships nothing and expires. Carried by a backup (tag
+/// 13) only beside a record: a store that holds none writes neither tag.
 pub const IDEMPOTENCY_BY_STAMP: TableDefinition<&[u8], &[u8]> =
     TableDefinition::new("idempotency_by_stamp");
 

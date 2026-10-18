@@ -812,7 +812,7 @@ impl Engine {
     /// this window grants passes a stamp that vouches for it, or because it
     /// cannot vouch for that stamp by its oplog (B5, records travel with
     /// coverage), and a covered stamp is never served here again. Through
-    /// [`Self::store_record`] (history refused, merged, rows at the merged
+    /// [`Self::store_record`] (a dropped life's too, merged, rows at the merged
     /// `first` and `last` and the sender's row, its stamps witnessed, nothing
     /// written for a record held already). A record this build cannot decode is
     /// dropped and counted, and its entries are applied all the same.
@@ -1525,7 +1525,7 @@ impl Engine {
         if frame.owes_any() {
             let opened = run.txn.is_some();
             let txn = self.run_txn(run)?;
-            let wrote = self.store_owed_records(txn, &mut memo, frame, stopped_at)?;
+            let wrote = self.store_owed_records(txn, frame, stopped_at)?;
             run.records += wrote;
             if wrote == 0
                 && !opened
@@ -2361,9 +2361,9 @@ impl Engine {
         let collection = match self.judge_document(memo, entry, outcome)? {
             Judged::Decided(Step::Taken) => {
                 // Superseded as history, and taken: the frame's records of its
-                // collection are stored now if any of them is not history
-                // itself (a record's `last` can be above its carrying entry).
-                self.store_frame_records_for_history(entry, run, memo, frame)?;
+                // collection are stored now all the same, since a record
+                // outlives a drop of its collection for its window.
+                self.store_frame_records_for_history(entry, run, frame)?;
                 return Ok(Step::Taken);
             }
             Judged::Decided(step) => return Ok(step),
@@ -2397,7 +2397,7 @@ impl Engine {
                     #[cfg(test)]
                     race_hooks::absorbed(race_hooks::Race::DocumentRun);
                     if matches!(step, Step::Taken) {
-                        self.store_frame_records_for_history(entry, run, memo, frame)?;
+                        self.store_frame_records_for_history(entry, run, frame)?;
                     }
                     return Ok(step);
                 }
@@ -2417,14 +2417,7 @@ impl Engine {
         // The frame's records of this collection, on either outcome of the
         // merge, in this run's transaction (B5).
         if frame.owes(collection.id, entry.stamp) {
-            run.records += self.store_frame_records(
-                txn,
-                memo,
-                Some(&collection),
-                collection.id,
-                entry.stamp,
-                frame,
-            )?;
+            run.records += self.store_frame_records(txn, collection.id, entry.stamp, frame)?;
         }
         match applied {
             RemoteApplied::Applied { id, violations, released } => {
@@ -2444,39 +2437,20 @@ impl Engine {
     }
 
     /// The frame's records of a document entry judged history and taken: stored
-    /// in the run's transaction when one of them is not history itself, the run
-    /// opened for it only then. A record's `last` can be above the entry that
-    /// carries it, so its collection's later life may hold the record's later
-    /// chunks while the carrying entry was a drop's.
+    /// in the run's transaction, the run opened for them when the frame owes
+    /// any. A record outlives a drop of its collection for its window, so one
+    /// carried by an entry of a dropped life is stored as any other.
     fn store_frame_records_for_history<'e>(
         &'e self,
         entry: &OplogEntry,
         run: &mut Run<'e>,
-        memo: &mut Memo,
         frame: &mut crate::idempotency::FrameRecords,
     ) -> Result<()> {
         if !frame.owes(entry.collection, entry.stamp) {
             return Ok(());
         }
-        let standing = self.memo_collection(memo, entry.collection)?;
-        if !self.frame_holds_a_live_record(
-            memo,
-            standing.as_deref(),
-            entry.collection,
-            entry.stamp,
-            frame,
-        )? {
-            return Ok(());
-        }
         let txn = self.run_txn(run)?;
-        run.records += self.store_frame_records(
-            txn,
-            memo,
-            standing.as_deref(),
-            entry.collection,
-            entry.stamp,
-            frame,
-        )?;
+        run.records += self.store_frame_records(txn, entry.collection, entry.stamp, frame)?;
         Ok(())
     }
 

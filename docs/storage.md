@@ -100,7 +100,8 @@ absent from a backup**: each is re-derived when the database is opened, so a
 restored node rebuilds them rather than carrying them across. See
 [operations.md](operations.md) for what that means when restoring during a
 snapshot. `idempotency` and `idempotency_by_stamp` are carried, as backup tags
-12 and 13; `idempotency_changes` is node-local and is not, and the first start
+12 and 13, the rows only beside a record (a store that holds none writes neither
+tag); `idempotency_changes` is node-local and is not, and the first start
 after a restore begins it again over the restored records.
 
 ### Why the keys are shaped this way
@@ -219,7 +220,11 @@ smallest of its attempts'), `last` the stamp of the **last** entry the commit
 that last changed the record wrote (a bulk's, a chunk's, a replace's, a
 `find_and_modify`'s or a delete's highest; after a merge, the greater),
 `origin` the member that wrote it, and `state` `applying` (a
-`multi: true` request that has not finished) or `done`. The outcome is what the
+`multi: true` request that has not finished) or `done`, with its high bit
+(`0x80`) set when the record is **contested**: two members accepted the key for
+two different requests, and their records met in a merge
+([Time & Conflicts](time-and-conflicts.md#idempotency-records-merge-as-a-join)).
+A record written before the bit existed reads as not contested. The outcome is what the
 first answer is rendered from, through the function that rendered it, never the
 response bytes, which would tie a record to one build's rendering: an insert's
 stamp (tag 1), a bulk's stamps (2), a replace's flags and stamp (3), a delete's
@@ -259,14 +264,17 @@ log, or an identity reset), before any page is cut, so a store that holds
 records always has one; and given again at the first change of a store that held
 none.
 
-**How long a record lives.** A record is judged by its `last`. It is absent to
-a lookup once `last` is older than `storage.oplog_retention_secs`, or once it is
-**history**: a drop of its collection at or above every entry the request wrote,
-which is the drop tombstone or incarnation floor covering `last`, by HLC, a tie
-going to the drop (the history rule documents are judged by). A drop in the
-millisecond of a commit's first entry, with a later entry of it standing in the
-next life, leaves the record standing with that entry. A keyed delete by id is
-replayed only while its own tombstone, or a later version over it, stands. The
+**How long a record lives.** A record is judged by its `last`: it is absent to
+a lookup once `last` is older than `storage.oplog_retention_secs`, and a record
+a peer sends that is already past that window is not stored. **A record
+outlives a drop of its collection for its window**: a drop, a database drop, the
+drop purger and a late drop's sweep remove no record, and a record of a dropped
+life is stored and served as any other, so a retry after the name is dropped,
+created again or not, replays its first answer and writes nothing to the new
+life. Retention is the only remover. A keyed delete by id is replayed while its
+own tombstone, or a later version over it, stands, or while the row is gone
+with a drop at or above the delete's stamp, which took the tombstone with the
+life. The
 retention pass collects records **after its oplog step**: one seek per origin to
 its rows below the cutoff, under a read transaction, then 1,000 rows per commit
 with the writer released between them (ADR-151). Each row is read again under
@@ -275,13 +283,8 @@ its rows at or above `last`, so a record a later commit changed is kept and only
 the row goes, and the row at the `first` of a record still inside the window is
 kept. The same pass trims the change log's rows below the cutoff. A record this
 build cannot decode has no `last` to age by and goes with the first of its rows
-to expire, at least one window after its first commit. **The drop purger removes
-the collection's records of the dropped life (`last` at or below the drop);
-records of a later life stay for retention. Under an id with no tombstone
-(ADR-158's residual, a purge a creation asked for) it removes every record,
-since nothing there tells one life from another and the name is created again
-with no floor.** A late drop's sweep removes the records of the life it ends, and
-a rewind removes those of the writes it discards. At open the clock resumes above
+to expire, at least one window after its first commit. A rewind removes the
+records of the writes it discards. At open the clock resumes above
 the largest of each origin's last row of `idempotency_by_stamp` and the change
 log's high water, as well as the oplog's
 ([Time & Conflicts](time-and-conflicts.md#clock-resumption)).

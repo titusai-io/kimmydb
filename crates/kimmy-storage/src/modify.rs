@@ -616,6 +616,7 @@ impl Engine {
                     cursor: Some(last_key.clone()),
                     resumed: outcome.resumed,
                 }),
+                contested: false,
             };
             if let Err(e) =
                 self.put_record(&txn, coll.id, &run.keyed.scope, run.live.as_ref(), &record)
@@ -729,6 +730,7 @@ impl Engine {
                 cursor,
                 resumed: outcome.resumed,
             }),
+            contested: false,
         };
         self.put_record(txn, coll.id, &run.keyed.scope, Some(live), &record)?;
         Ok(())

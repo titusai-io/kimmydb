@@ -27,6 +27,11 @@
 //! (Decision Q4): a build before 0.52 refuses a backup that holds either tag, as
 //! it refuses every tag it does not know. A backup an older build wrote restores
 //! into this one with no records, and nothing about restoring changes for it.
+//! **The rows by stamp travel only beside a record**: a store that holds no
+//! record writes neither tag, so its backup restores on an older build. A row
+//! whose record is gone (a rewind removes a record and leaves its rows, and a
+//! retention pass stopped between chunks can leave some until the next pass)
+//! vouches for nothing.
 //!
 //! Index entries are derivable
 //! from documents, so omitting them would make backups smaller — and would make
@@ -206,7 +211,16 @@ impl Engine {
             out.extend_from_slice(k.1);
             out
         });
-        simple!(T_IDEMPOTENCY_BY_STAMP, tables::IDEMPOTENCY_BY_STAMP, <[u8]>::to_vec);
+        // Their rows only beside a record, in the same read transaction: rows
+        // whose record is gone vouch for nothing, and must not make a backup of
+        // a store that holds no record one an older build refuses.
+        let holds_a_record = match open_walk_table_if_exists(&txn, tables::IDEMPOTENCY, walk)? {
+            Some(records) => records.len()? > 0,
+            None => false,
+        };
+        if holds_a_record {
+            simple!(T_IDEMPOTENCY_BY_STAMP, tables::IDEMPOTENCY_BY_STAMP, <[u8]>::to_vec);
+        }
 
         // Value types that are not `&[u8]` need their own arm.
         if let Some(t) = open_walk_table_if_exists(&txn, tables::OPLOG_ARRIVAL_SEQ, walk)? {
@@ -564,6 +578,117 @@ mod tests {
         assert!(metas > 0, "the backup carries META");
         assert!(tags[metas..].iter().all(|&t| t != T_META), "every META record leads: {tags:?}");
         assert!(metas < tags.len(), "and other tables follow it");
+    }
+
+    /// The tags of a backup stream, in order.
+    fn tags_of(out: &[u8]) -> Vec<u8> {
+        let mut rest = &out[8 + 1 + 16 + 8..];
+        let mut tags = Vec::new();
+        loop {
+            let tag = rest[0];
+            rest = &rest[1..];
+            if tag == END {
+                return tags;
+            }
+            tags.push(tag);
+            read_chunk(&mut rest).unwrap();
+            read_chunk(&mut rest).unwrap();
+        }
+    }
+
+    /// Whether a backup carries tag 12 and tag 13.
+    fn carried(engine: &Engine) -> (bool, bool) {
+        let mut out = Vec::new();
+        engine.backup_to(&mut out, crate::WalkScope::Request).unwrap();
+        let tags = tags_of(&out);
+        (tags.contains(&T_IDEMPOTENCY), tags.contains(&T_IDEMPOTENCY_BY_STAMP))
+    }
+
+    fn rows_by_stamp(engine: &Engine) -> u64 {
+        use redb::{ReadableDatabase, ReadableTableMetadata};
+        let txn = engine.db().begin_read().unwrap();
+        txn.open_table(tables::IDEMPOTENCY_BY_STAMP).unwrap().len().unwrap()
+    }
+
+    /// The tag-13 boundary is the records': a store that holds no record writes
+    /// a backup with neither tag 12 nor tag 13, which a build before 0.52
+    /// restores. A rewind that removes the only record takes its rows with it,
+    /// so nothing is left for tag 13 to carry. With a record, both tags travel.
+    #[test]
+    fn rows_by_stamp_travel_only_beside_a_record() {
+        use kimmy_core::{Fingerprint, ScopeHash};
+        let dir = tempfile::tempdir().unwrap();
+        let engine = Engine::open(&dir.path().join("kimmy.redb")).unwrap();
+        let coll = engine.create_collection("shop", "orders").unwrap();
+        engine.insert(&coll, doc! { "_id": 1i64 }).unwrap();
+        let keyed = crate::KeyedWrite::new(ScopeHash([7; 32]), Fingerprint([7; 32]));
+        let until = engine.clock_last();
+        engine.insert_keyed(&coll, doc! { "_id": 2i64 }, &keyed).unwrap();
+        assert_eq!(carried(&engine), (true, true), "a record and its rows");
+
+        let rewound = engine.rewind_to(until).unwrap();
+        assert_eq!(rewound.records_removed, 1, "premise: the rewind removed the record");
+        assert_eq!(engine.idempotency_records().unwrap(), 0);
+        assert_eq!(rows_by_stamp(&engine), 0, "and its rows");
+        assert_eq!(carried(&engine), (false, false), "neither tag without a record");
+    }
+
+    /// The other way rows by stamp outlive their record: a retention pass
+    /// stopped between chunks, after the chunk that removed a record at its row
+    /// at `last` and before the chunk holding its row at `first`, at another
+    /// origin. Until the next pass removes that row the store holds no record,
+    /// and its backup carries neither tag; the next pass leaves nothing.
+    #[test]
+    fn a_retention_pass_stopped_between_chunks_leaves_a_backup_without_the_tags() {
+        use crate::idempotency::{
+            IdempotencyRecord, RECORD_COLLECT_CHUNK, RecordOutcome, RecordState,
+        };
+        use kimmy_core::{Fingerprint, Hlc, NodeId, ScopeHash, Stamp};
+        let dir = tempfile::tempdir().unwrap();
+        let engine = Engine::open(&dir.path().join("kimmy.redb")).unwrap();
+        let coll = engine.create_collection("shop", "orders").unwrap();
+        let at = |ms: u64, node: u8| Stamp::new(Hlc::new(ms, 0), NodeId::from_bytes([node; 16]));
+        // One chunk of records whose rows are all at origin 1, the last of them
+        // a merged record whose `first` is at origin 9, which sorts after it.
+        // Stored while the window's clock reads their time.
+        engine.set_idempotency_clock_for_test(Some(1_000));
+        let txn = engine.begin_write(crate::WriterHolder::Repair).unwrap();
+        for i in 0..RECORD_COLLECT_CHUNK {
+            let mut scope = [0u8; 32];
+            scope[..8].copy_from_slice(&(i as u64).to_be_bytes());
+            let last = at(1_000 + i as u64, 1);
+            let first = if i + 1 == RECORD_COLLECT_CHUNK { at(1_000, 9) } else { last };
+            let record = IdempotencyRecord {
+                fingerprint: Fingerprint([5; 32]),
+                first,
+                last,
+                origin: last.node,
+                state: RecordState::Done,
+                outcome: RecordOutcome::Insert { stamp: last },
+                contested: false,
+            };
+            engine.store_record(&txn, coll.id, &ScopeHash(scope), &record, None).unwrap();
+        }
+        txn.commit().unwrap();
+        engine.set_idempotency_clock_for_test(None);
+        let held = RECORD_COLLECT_CHUNK as u64;
+        assert_eq!(
+            (engine.idempotency_records().unwrap(), rows_by_stamp(&engine)),
+            (held, held + 1)
+        );
+
+        let cutoff = Hlc::new(1_000_000_000, 0);
+        // The first chunk's seek and rows, then a stop before the second.
+        engine.stop_walks_after_rows(RECORD_COLLECT_CHUNK as u64 + 2);
+        let stopped = engine.collect_idempotency_records(cutoff);
+        assert!(matches!(stopped, Err(StorageError::Stopping(_))), "{stopped:?}");
+        engine.lift_stops_for_test();
+        assert_eq!(engine.idempotency_records().unwrap(), 0, "premise: every record went");
+        assert_eq!(rows_by_stamp(&engine), 1, "premise: the row at origin 9 is left");
+        assert_eq!(carried(&engine), (false, false), "neither tag without a record");
+
+        assert_eq!(engine.collect_idempotency_records(cutoff).unwrap(), 0);
+        assert_eq!(rows_by_stamp(&engine), 0, "the next pass removes it");
     }
 
     /// An engine holding a bit of everything a backup has to carry.

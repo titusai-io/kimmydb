@@ -32,8 +32,8 @@
 //!
 //! Inside the write transaction each path already opens, under the writer:
 //!
-//! 1. **Look the record up**, with the life rule below. The same fingerprint
-//!    replays; another is refused.
+//! 1. **Look the record up**, alive by its window below. The same fingerprint
+//!    replays; another, or a contested record, is refused.
 //! 2. **Write as today.**
 //! 3. **If it wrote**, put the record and its [`IDEMPOTENCY_BY_STAMP`] rows at
 //!    the record's merged `first` and `last`, which for a first local commit are
@@ -55,21 +55,33 @@
 //! ([`KeyedWrite::derived_id`]), stored as a string; a client's `_id` is used
 //! as it is. A `find_and_modify` upsert's seed is position 0.
 //!
-//! # The life rule
+//! # A record lives its window
 //!
-//! A record is judged by its `last`. It is absent on lookup when it is
-//! **history**: [`Engine::is_history`] says the collection's drop tombstone or
-//! incarnation floor covers `last`, the rule documents are judged by. And it is
-//! absent once it is **older than the window**, `storage.oplog_retention_secs`
-//! measured on `last`'s own wall time ([`Engine::set_idempotency_window`]); the
-//! cutoff is the retention pass's own, so a record is never replayed past the
-//! window retention removes it at. An absent record is overwritten by the next
-//! store, never merged with.
+//! A record is absent on lookup once it is **older than the window**,
+//! `storage.oplog_retention_secs` measured on `last`'s own wall time
+//! ([`Engine::set_idempotency_window`]); the cutoff is the retention pass's
+//! own, so a record is never replayed past the window retention removes it at.
+//! An absent record is overwritten by the next store, never merged with.
 //!
-//! **A keyed delete by id** is replayed only while its own tombstone stands:
-//! the document's stored row carries a stamp at or above the delete's (the
-//! tombstone, or a later version over it). Once the tombstone is collected the
-//! record is absent for that request, which then runs afresh.
+//! **A record outlives a drop of its collection** for its window. A drop, a
+//! database's drop and a late drop's sweep remove no record, and a record of a
+//! dropped life is stored and served as any other: a retry after a drop, the
+//! name created again or not, replays its first answer and writes nothing to
+//! the new life, and another request under the key is refused for the window.
+//! Retention is the only remover.
+//!
+//! **A keyed delete by id** is replayed while its own tombstone stands: the
+//! document's stored row carries a stamp at or above the delete's (the
+//! tombstone, or a later version over it), or the row is gone and the
+//! collection's drop or incarnation floor is at or above the delete's stamp
+//! (the drop took the tombstone). Once retention has collected the tombstone
+//! with no drop over it, the record is absent for that request, which then
+//! runs afresh.
+//!
+//! **A contested record** is refused for every retry: two members accepted the
+//! key for two requests (two fingerprints), and their records met in a merge
+//! ([`IdempotencyRecord::contested`]). A multi-chunk request whose record turns
+//! contested between its chunks stops, partially applied.
 //!
 //! # Multi-chunk requests
 //!
@@ -104,13 +116,12 @@
 //!
 //! A receiver stores every record a frame carries in the transaction that
 //! raises its coverage, whether or not an entry of its collection was taken
-//! ([`Engine::store_record`], merged, history refused, rows at the merged
-//! `first` and `last` and at the sender's row, its stamps witnessed, nothing
-//! written when it holds all of that already). So a member whose coverage of an
+//! and whether or not the collection stands ([`Engine::store_record`], merged,
+//! rows at the merged `first` and `last` and at the sender's row, its stamps
+//! witnessed, nothing written when it holds all of that already). So a member whose coverage of an
 //! origin passes a row holds the record with `first` at or below it, and a
 //! member that takes a request's effect under any origin takes its record with
 //! it. [`records_for_collection_page`] reads a snapshot's records phase.
-//! [`Engine::record_is_history`] is the life rule for a record a peer sent.
 //!
 //! # The records delta on snapshot pages
 //!
@@ -156,9 +167,8 @@ use crate::sync::Memo;
 use crate::tables::{self, IDEMPOTENCY, IDEMPOTENCY_BY_STAMP, IDEMPOTENCY_CHANGES};
 use crate::walk::{WalkScope, open_walk_table};
 
-/// Records removed per write transaction of a retention pass, and per chunk of
-/// a late drop's sweep of them: the bound the oplog step and the drop purge
-/// hold the writer to (ADR-151).
+/// Records removed per write transaction of a retention pass: the bound the
+/// oplog step and the drop purge hold the writer to (ADR-151).
 pub const RECORD_COLLECT_CHUNK: usize = 1_000;
 
 /// Records on one snapshot page's records phase.
@@ -341,19 +351,21 @@ pub struct IdempotencyRecord {
     /// wrote** (L1): for a commit of one entry, that entry's; for a bulk insert
     /// or a chunk of a filtered write, the highest stamp it wrote; the
     /// record-only commit that marks a request `done` keeps the standing
-    /// record's (G8's residual). After a merge, the larger of the two. The record's row moves with it, and the record is judged by it: the
-    /// life rule makes it **history only when a drop is at or above every entry
-    /// the request wrote**, comparing by `Hlc` with a tie going to the drop, as
-    /// every comparison of a stamp against a drop does (ADR-236). So a drop at
-    /// the HLC of a commit's first entry, with a later entry of the same commit
-    /// standing in the new life, leaves the record standing, and a retry there
-    /// is answered from it; a drop at or above the HLC of its last entry makes
-    /// it history with every document the request wrote.
+    /// record's (G8's residual). After a merge, the larger of the two. The
+    /// record's row moves with it, and the window is measured on it: retention
+    /// collects the record one window after `last`.
     pub last: Stamp,
     /// The member that wrote it.
     pub origin: NodeId,
     pub state: RecordState,
     pub outcome: RecordOutcome,
+    /// **Two requests met under the key** (KR): two members accepted it for
+    /// requests with two fingerprints, and their records merged. Every retry of
+    /// either is refused ([`StorageError::IdempotencyKeyReused`]), for the
+    /// record's window. Set by [`Self::merge`], beside `first` and never by the
+    /// tie-break; a local store never sets it, since a lookup refuses another
+    /// fingerprint before anything is written.
+    pub contested: bool,
 }
 
 // -- The codec ------------------------------------------------------------------------------
@@ -363,7 +375,7 @@ pub struct IdempotencyRecord {
 //   first                26 (an oplog key)
 //   last                 26
 //   origin               16
-//   state                u8: 0 applying, 1 done
+//   state                u8: 0 applying, 1 done; 0x80 set when contested
 //   outcome              tag u8, then its fields:
 //     1 insert           stamp
 //     2 bulk             u32 count, stamps
@@ -379,6 +391,12 @@ pub struct IdempotencyRecord {
 
 const STATE_APPLYING: u8 = 0;
 const STATE_DONE: u8 = 1;
+/// The state byte's contested bit ([`IdempotencyRecord::contested`]). A record
+/// written before the bit reads as not contested.
+const STATE_CONTESTED: u8 = 0x80;
+/// Where the state byte is: after the version, the fingerprint, `first`,
+/// `last` and the origin.
+const STATE_AT: usize = 1 + 32 + 2 * codec::STAMP_LEN + 16;
 const TAG_INSERT: u8 = 1;
 const TAG_BULK: u8 = 2;
 const TAG_REPLACE: u8 = 3;
@@ -478,10 +496,11 @@ impl IdempotencyRecord {
         out.extend_from_slice(&codec::oplog_key(&self.first));
         out.extend_from_slice(&codec::oplog_key(&self.last));
         out.extend_from_slice(&self.origin.to_bytes());
-        out.push(match self.state {
+        let state = match self.state {
             RecordState::Applying => STATE_APPLYING,
             RecordState::Done => STATE_DONE,
-        });
+        };
+        out.push(if self.contested { state | STATE_CONTESTED } else { state });
         match &self.outcome {
             RecordOutcome::Insert { stamp } => {
                 out.push(TAG_INSERT);
@@ -552,7 +571,9 @@ impl IdempotencyRecord {
         let first = take_stamp(&mut input)?;
         let last = take_stamp(&mut input)?;
         let origin = NodeId::from_bytes(take(&mut input, 16)?.try_into().expect("16 bytes"));
-        let state = match take_u8(&mut input)? {
+        let state_byte = take_u8(&mut input)?;
+        let contested = flag(state_byte, STATE_CONTESTED);
+        let state = match state_byte & !STATE_CONTESTED {
             STATE_APPLYING => RecordState::Applying,
             STATE_DONE => RecordState::Done,
             _ => return Err(corrupt("an unknown state")),
@@ -621,7 +642,7 @@ impl IdempotencyRecord {
         if !input.is_empty() {
             return Err(corrupt("bytes after its last field"));
         }
-        Ok(Some(Self { fingerprint, first, last, origin, state, outcome }))
+        Ok(Some(Self { fingerprint, first, last, origin, state, outcome, contested }))
     }
 
     /// The record of a write committed here in one transaction: `first` and
@@ -651,12 +672,15 @@ impl IdempotencyRecord {
             origin,
             state: RecordState::Done,
             outcome,
+            contested: false,
         }
     }
 
-    /// Everything but `first`, the bytes the merge breaks a tie by.
+    /// Everything but `first` and `contested`, the bytes the merge breaks a tie
+    /// by: the two the merge computes rather than picks.
     fn rest(&self) -> Vec<u8> {
         let mut bytes = self.encode();
+        bytes[STATE_AT] &= !STATE_CONTESTED;
         // `first` is the 26 bytes after the version and the fingerprint.
         bytes.drain(1 + 32..1 + 32 + codec::STAMP_LEN);
         bytes
@@ -672,6 +696,12 @@ impl IdempotencyRecord {
     /// `first` is the smaller and not the winner's: each attempt of a request
     /// writes at or above its own `first`, so a resume that writes only below
     /// the merged one never writes what any attempt wrote.
+    ///
+    /// `contested` is set when either side is, or when the two fingerprints
+    /// differ: whether the requests merged into the result are two or more. A
+    /// function of the union, so it keeps the join's three properties; computed
+    /// beside `first`, after the winner is picked, and never part of the
+    /// tie-break.
     pub fn merge(&self, other: &Self) -> Self {
         let first = self.first.min(other.first);
         let ours = (self.last, self.state);
@@ -682,7 +712,8 @@ impl IdempotencyRecord {
             std::cmp::Ordering::Equal if self.rest() >= other.rest() => self,
             std::cmp::Ordering::Equal => other,
         };
-        Self { first, ..winner.clone() }
+        let contested = self.contested || other.contested || self.fingerprint != other.fingerprint;
+        Self { first, contested, ..winner.clone() }
     }
 }
 
@@ -715,6 +746,54 @@ pub(crate) fn decode_row_key(key: &[u8]) -> Option<Stamp> {
     let node: [u8; 16] = key[..16].try_into().ok()?;
     let hlc: [u8; kimmy_core::HLC_ENCODED_LEN] = key[16..].try_into().ok()?;
     Some(Stamp::new(Hlc::from_bytes(hlc), NodeId::from_bytes(node)))
+}
+
+/// A rewind's removal of the rows by stamp of the records it removed
+/// (`named`), in its transaction: every row of a record is at or above its
+/// `first`, so every such row is at or above `from`, the lowest `first` among
+/// them (above the rewind's target for a record whose every write it
+/// discarded). One range per origin, from `from`. A reopened record's rows,
+/// the one at its `last` included, name a record that stays, and stay. Returns
+/// how many rows it removed.
+fn remove_rows_naming(
+    txn: &WriteTxn<'_>,
+    from: Hlc,
+    named: &HashSet<(CollectionId, ScopeHash)>,
+) -> Result<usize> {
+    use std::ops::Bound::{Excluded, Included, Unbounded};
+    if named.is_empty() {
+        return Ok(0);
+    }
+    let mut rows = txn.open_table(IDEMPOTENCY_BY_STAMP)?;
+    let mut doomed: Vec<Vec<u8>> = Vec::new();
+    let mut past: Option<Vec<u8>> = None;
+    loop {
+        let next = match &past {
+            None => rows.range::<&[u8]>(..)?.next().transpose()?,
+            Some(past) => {
+                rows.range::<&[u8]>((Excluded(past.as_slice()), Unbounded))?.next().transpose()?
+            }
+        };
+        let Some((key, _)) = next else { break };
+        let key = key.value().to_vec();
+        let Some(at) = decode_row_key(&key) else {
+            // A key of another length names nothing; retention removes it.
+            past = Some(key);
+            continue;
+        };
+        let (start, end) = (row_key_at(at.node, from), row_key_at(at.node, Hlc::MAX));
+        for row in rows.range::<&[u8]>((Included(start.as_slice()), Included(end.as_slice())))? {
+            let (key, value) = row?;
+            if parse_row_value(value.value()).is_some_and(|row| named.contains(&row)) {
+                doomed.push(key.value().to_vec());
+            }
+        }
+        past = Some(end.to_vec());
+    }
+    for key in &doomed {
+        rows.remove(key.as_slice())?;
+    }
+    Ok(doomed.len())
 }
 
 /// An `IDEMPOTENCY_BY_STAMP` row's value: `collection id ‖ scope hash`.
@@ -916,11 +995,10 @@ impl Shipping {
     /// Every row a record has is at or above its merged `first` (its `first`, its
     /// `last`, and the sender's rows it was stored with, each at or above that
     /// sender's `first`). A row below it was left by another record under the same
-    /// key: one of a life a drop ended, purged with its rows left to expire, or one
-    /// past its window that a new request's record replaced. Such a row vouches for
-    /// nothing of the record standing now, and shipped at it, the record would reach
-    /// a member that has not yet applied the drop in the run of an earlier life's
-    /// entry and merge there with that life's record.
+    /// key, one past its window that a new request's record replaced: it vouches
+    /// for nothing of the record standing now. A row whose record is gone (a
+    /// retention pass stopped between chunks leaves one until the next pass)
+    /// names nothing and ships nothing.
     fn row(
         &mut self,
         records: &impl ReadableTable<(u64, &'static [u8]), &'static [u8]>,
@@ -1346,7 +1424,7 @@ pub(crate) struct IdempotencyState {
     received: [AtomicU64; RecordsVia::ALL.len()],
     /// Records a peer sent that this build could not decode, since start.
     undecodable: AtomicU64,
-    /// The wall clock the life rule reads, set by a test that moves time; 0 is
+    /// The wall clock the window reads, set by a test that moves time; 0 is
     /// the real one.
     #[cfg(any(test, feature = "test-hooks"))]
     now_ms: AtomicU64,
@@ -1414,13 +1492,12 @@ impl RecordsVia {
 /// batch's last transaction, the one that raises the witnessed vector (B5,
 /// records travel with coverage).
 ///
-/// Not in the run of an entry before the row: the batch takes its entries in
-/// stamp order, and one before the row can be of a life of the collection a drop
-/// between the two ends, a drop this member has not taken yet. Stored there, a
-/// record of the life after the drop met the earlier life's record under its key
-/// while that one was still alive here, and the two merged: the earlier life's
-/// `first` under the later life's request, so a resume here wrote nothing the
-/// stamp rule reads as written below it.
+/// Not in the run of an entry before the row: a record is stored with the
+/// coverage that vouches for it, never ahead of it. (Before records outlived a
+/// drop of their collection, this also kept a later life's record out of the
+/// run of an earlier life's entry, where it met that life's record under the
+/// key; a record now lives its window whatever the drops, and the merge is the
+/// join in any order.)
 pub(crate) struct FrameRecords {
     via: RecordsVia,
     /// `(collection, scope, carrying stamp, record, stored yet)`.
@@ -1477,15 +1554,14 @@ impl Engine {
     /// Store, in the run's transaction, every record of the frame for the
     /// collection `id` that is not stored yet and rides by the entry stamped `at`
     /// ([`FrameRecords::rides_by`]): called when the run takes (applies or
-    /// supersedes) that entry of that collection, on both outcomes of the merge. Each through [`Self::store_record`]: refused if history by the life
-    /// rule, merged with the live record, rows at the merged `last` and at the
-    /// carrying stamp, its stamps witnessed. Marked stored either way, so a later
-    /// entry of the collection asks nothing again. Returns how many were stored.
+    /// supersedes, history included) that entry of that collection, on every
+    /// outcome. Each through [`Self::store_record`]: merged with the live
+    /// record, rows at the merged `last` and at the carrying stamp, its stamps
+    /// witnessed. Marked stored, so a later entry of the collection asks nothing
+    /// again. Returns how many were stored.
     pub(crate) fn store_frame_records(
         &self,
         txn: &WriteTxn<'_>,
-        memo: &mut Memo,
-        standing: Option<&CollectionMeta>,
         id: CollectionId,
         at: Stamp,
         frame: &mut FrameRecords,
@@ -1495,8 +1571,7 @@ impl Engine {
             if *collection != id || *done || !FrameRecords::rides_by(*carrying, at) {
                 continue;
             }
-            let (_, wrote) =
-                self.store_record_noting(txn, memo, standing, id, scope, record, *carrying)?;
+            let (_, wrote) = self.store_record_noting(txn, id, scope, record, *carrying)?;
             stored += usize::from(wrote);
             *done = true;
         }
@@ -1508,19 +1583,16 @@ impl Engine {
     /// collection was taken, and whether or not the collection stands here**. A
     /// window grants coverage per origin, not per collection, and a stamp it
     /// covers is never served here again, so the record it vouched for at that
-    /// stamp is stored now or never. The life rule still refuses history.
-    /// Returns how many it wrote: a record held already writes nothing.
+    /// stamp is stored now or never. Returns how many it wrote: a record held
+    /// already writes nothing.
     ///
     /// **Not one whose row is at or past `stop`**, the entry a batch ended at: the
     /// window grants no coverage there, so the record is served again with what
-    /// follows, and the entries between the stop and its row, a drop of its
-    /// collection among them, are not taken. Stored now, a record of the life after
-    /// that drop met the earlier life's record, still alive here, and merged with
-    /// it ([`FrameRecords`]).
+    /// follows, and the entries between the stop and its row are not taken: the
+    /// coverage that vouches for it is not granted ([`FrameRecords`]).
     pub(crate) fn store_owed_records(
         &self,
         txn: &WriteTxn<'_>,
-        memo: &mut Memo,
         frame: &mut FrameRecords,
         stop: Option<Stamp>,
     ) -> Result<usize> {
@@ -1529,59 +1601,26 @@ impl Engine {
             if *done || carrying.is_some_and(|row| stop.is_some_and(|stop| row >= stop)) {
                 continue;
             }
-            let standing = self.memo_collection(memo, *collection)?;
-            let (_, wrote) = self.store_record_noting(
-                txn,
-                memo,
-                standing.as_deref(),
-                *collection,
-                scope,
-                record,
-                *carrying,
-            )?;
+            let (_, wrote) =
+                self.store_record_noting(txn, *collection, scope, record, *carrying)?;
             stored += usize::from(wrote);
             *done = true;
         }
         Ok(stored)
     }
 
-    /// Whether any of the frame's records of collection `id` not stored yet and
-    /// riding by the entry stamped `at` is not history by the life rule: what makes an entry judged history worth a
-    /// transaction for the frame's records.
-    pub(crate) fn frame_holds_a_live_record(
-        &self,
-        memo: &mut Memo,
-        standing: Option<&CollectionMeta>,
-        id: CollectionId,
-        at: Stamp,
-        frame: &FrameRecords,
-    ) -> Result<bool> {
-        for (collection, _, carrying, record, stored) in &frame.records {
-            if *collection == id
-                && !stored
-                && FrameRecords::rides_by(*carrying, at)
-                && !self.record_is_history(memo, standing, id, record)?
-            {
-                return Ok(true);
-            }
-        }
-        Ok(false)
-    }
-
     /// Store a snapshot or converge page's records in the page's transaction
-    /// (B5, "Snapshots carry records"): each of a collection that stands here,
-    /// through [`Self::store_record_noting`] with no carrying stamp (rows at its
-    /// merged `first` and `last`, and a row of this node's change log),
-    /// refused if history by the life rule. A record of a collection absent here
-    /// is not stored, as the page's documents of it are not. Those this build
-    /// cannot decode are dropped and counted. Returns how many it **changed**, to
+    /// (B5, "Snapshots carry records"): each through
+    /// [`Self::store_record_noting`] with no carrying stamp (rows at its merged
+    /// `first` and `last`, and a row of this node's change log), whether or not
+    /// its collection stands here: a record outlives a drop of its collection
+    /// for its window. Those this build cannot decode are dropped and counted. Returns how many it **changed**, to
     /// count once the page's transaction commits: a page whose records change
     /// nothing here writes nothing and costs no commit, as a page whose documents
     /// all lose costs none (ADR-152).
     pub(crate) fn store_page_records(
         &self,
         txn: &WriteTxn<'_>,
-        memo: &mut Memo,
         records: &[CarriedRecord],
     ) -> Result<usize> {
         let mut stored = 0usize;
@@ -1593,19 +1632,39 @@ impl Engine {
                     continue;
                 }
             };
-            let Some(standing) = self.memo_collection(memo, wire.collection)? else {
-                continue;
-            };
-            let (_, wrote) = self.store_record_noting(
-                txn,
-                memo,
-                Some(&standing),
-                wire.collection,
-                &wire.scope,
-                &record,
-                None,
-            )?;
+            let (_, wrote) =
+                self.store_record_noting(txn, wire.collection, &wire.scope, &record, None)?;
             stored += usize::from(wrote);
+        }
+        Ok(stored)
+    }
+
+    /// [`Self::store_page_records`] in a transaction of their own, counted once it
+    /// commits: a page whose documents are not applied here (a converge page from
+    /// a sender that dropped the collection, or one of a life this member has not
+    /// buried) still leaves its records, which outlive a drop for their window.
+    /// Nothing is committed when they change nothing.
+    pub(crate) fn store_page_records_alone(
+        &self,
+        records: &[CarriedRecord],
+        via: RecordsVia,
+    ) -> Result<usize> {
+        if records.is_empty() {
+            return Ok(0);
+        }
+        let txn = self.begin_write(WriterHolder::Repair)?;
+        let stored = match self.store_page_records(&txn, records) {
+            Ok(stored) => stored,
+            Err(e) => {
+                txn.abort()?;
+                return Err(e);
+            }
+        };
+        if stored == 0 {
+            txn.abort()?;
+        } else {
+            txn.commit()?;
+            self.count_records_received(via, stored);
         }
         Ok(stored)
     }
@@ -1717,7 +1776,7 @@ impl Engine {
         Ok(txn.open_table(IDEMPOTENCY)?.len()?)
     }
 
-    /// The record stored under a key, as stored, with no life rule: for tests
+    /// The record stored under a key, as stored, window or not: for tests
     /// and for an operator's look at one key.
     pub fn idempotency_record(
         &self,
@@ -1729,11 +1788,29 @@ impl Engine {
         read_record(&txn.open_table(IDEMPOTENCY)?, collection, scope)
     }
 
-    /// Set the wall clock the life rule reads, for a test whose clocks run
+    /// Set the wall clock the window reads, for a test whose clocks run
     /// ahead of it; `None` for the real one.
     #[cfg(any(test, feature = "test-hooks"))]
     pub fn set_idempotency_clock_for_test(&self, now_ms: Option<u64>) {
         self.idempotency.now_ms.store(now_ms.unwrap_or(0), Ordering::SeqCst);
+    }
+
+    /// Store `record` under a key as a peer's frame stores it
+    /// ([`Self::store_record`]: merged with the live record, its rows written,
+    /// its stamps witnessed), in a transaction of its own. For a test outside
+    /// this crate that needs what only replication brings, such as a record
+    /// two members met in (KR). Returns the record as stored.
+    #[cfg(any(test, feature = "test-hooks"))]
+    pub fn store_peer_record_for_test(
+        &self,
+        collection: CollectionId,
+        scope: &ScopeHash,
+        record: &IdempotencyRecord,
+    ) -> Result<Option<IdempotencyRecord>> {
+        let txn = self.begin_write(WriterHolder::Replication)?;
+        let stored = self.store_record(&txn, collection, scope, record, Some(record.last))?;
+        txn.commit()?;
+        Ok(stored)
     }
 
     fn idempotency_now_ms(&self) -> u64 {
@@ -1769,49 +1846,27 @@ impl Engine {
             < crate::gc::cutoff(self.idempotency_now_ms(), self.idempotency_window_secs())
     }
 
-    /// The life rule's history half, for a record a peer sent or one read
-    /// here: [`Engine::is_history`] on its `last`. A record whose `last` is at
-    /// or below the collection's drop tombstone or its incarnation floor
-    /// belongs to an earlier life.
-    ///
-    /// By `last` and not `first`: a drop that falls between two chunks of one
-    /// request keeps the later chunks' documents (ADR-231, ADR-236), and by
-    /// `first` their record would be ignored, so a retry would write them a
-    /// second time.
-    pub(crate) fn record_is_history(
-        &self,
-        memo: &mut Memo,
-        standing: Option<&CollectionMeta>,
-        collection: CollectionId,
-        record: &IdempotencyRecord,
-    ) -> Result<bool> {
-        self.is_history(memo, standing, collection, record.last)
-    }
-
-    /// The key's record if it is alive: stored, readable by this build, not
-    /// history and not past the window. `standing` is the collection as the
-    /// transaction sees it. A record a newer build wrote reads as none.
+    /// The key's record if it is alive: stored, readable by this build and not
+    /// past the window, whether or not a drop of its collection came after it.
+    /// A record a newer build wrote reads as none.
     fn live_record_in(
         &self,
         txn: &redb::WriteTransaction,
-        memo: &mut Memo,
-        standing: Option<&CollectionMeta>,
         collection: CollectionId,
         scope: &ScopeHash,
     ) -> Result<Option<IdempotencyRecord>> {
         let Some(record) = read_record(&txn.open_table(IDEMPOTENCY)?, collection, scope)? else {
             return Ok(None);
         };
-        if self.record_is_history(memo, standing, collection, &record)?
-            || self.record_is_past_window(&record)
-        {
+        if self.record_is_past_window(&record) {
             return Ok(None);
         }
         Ok(Some(record))
     }
 
-    /// The collection under `coll`'s name as `txn` sees it: the life rule reads
-    /// the floor that stands under the writer, not the one the caller read.
+    /// The collection under `coll`'s name as `txn` sees it: a keyed delete's
+    /// replay reads the floor that stands under the writer, not the one the
+    /// caller read.
     fn standing_in(
         txn: &redb::WriteTransaction,
         coll: &CollectionMeta,
@@ -1823,14 +1878,30 @@ impl Engine {
             .transpose()
     }
 
+    /// Whether a keyed delete's tombstone, stamped `deleted` and gone from
+    /// `coll`'s rows, went with a drop: the collection's drop tombstone, or the
+    /// floor of the life standing under the writer, at or above it
+    /// ([`Engine::is_history`], a tie going to the drop).
+    pub(crate) fn delete_taken_by_a_drop(
+        &self,
+        txn: &WriteTxn<'_>,
+        coll: &CollectionMeta,
+        deleted: Stamp,
+    ) -> Result<bool> {
+        let standing = Self::standing_in(txn, coll)?;
+        self.is_history(&mut Memo::default(), standing.as_ref(), coll.id, deleted)
+    }
+
     /// The lookup a keyed write makes first, under the writer, in its own
     /// transaction: the authoritative one, so two duplicates on one member
     /// serialise here.
     ///
     /// Refuses a key whose multi-chunk request runs here (unless `owner` is
-    /// that request), and a key whose live record has another fingerprint.
-    /// A record it uses has its stamps witnessed: a resume must write above
-    /// its `first`, and a new record must merge above its `last`.
+    /// that request), and a key whose live record has another fingerprint or
+    /// is contested: before replay, resume, or a delete's tombstone test, so
+    /// every keyed call refuses it alike. A record it uses has its stamps
+    /// witnessed: a resume must write above its `first`, and a new record must
+    /// merge above its `last`.
     pub(crate) fn keyed_lookup(
         &self,
         txn: &WriteTxn<'_>,
@@ -1843,20 +1914,12 @@ impl Engine {
         {
             return Err(StorageError::IdempotencyKeyInFlight);
         }
-        let standing = Self::standing_in(txn, coll)?;
-        let Some(record) = self.live_record_in(
-            txn,
-            &mut Memo::default(),
-            standing.as_ref(),
-            coll.id,
-            &keyed.scope,
-        )?
-        else {
+        let Some(record) = self.live_record_in(txn, coll.id, &keyed.scope)? else {
             return Ok(Found::Absent);
         };
         self.witness(&record.first);
         self.witness(&record.last);
-        if record.fingerprint != keyed.fingerprint {
+        if record.contested || record.fingerprint != keyed.fingerprint {
             return Err(StorageError::IdempotencyKeyReused);
         }
         Ok(match record.state {
@@ -1868,23 +1931,25 @@ impl Engine {
     /// The key's live record, read by a later chunk of the request that owns
     /// it, under that chunk's writer: another attempt's record may have merged
     /// in since the chunk before. Witnessed, as every record used is.
+    ///
+    /// **Refused when it has turned contested** (or another request's), with
+    /// [`StorageError::IdempotencyKeyReused`]: another request's record met this
+    /// one's, and its `first` is no bound for this request's stamp rule. The
+    /// caller has committed chunks, so the request ends partially applied
+    /// (ADR-192), and every later retry is refused at its lookup.
     pub(crate) fn keyed_live_record(
         &self,
         txn: &WriteTxn<'_>,
         coll: &CollectionMeta,
         keyed: &KeyedWrite,
     ) -> Result<Option<IdempotencyRecord>> {
-        let standing = Self::standing_in(txn, coll)?;
-        let record = self.live_record_in(
-            txn,
-            &mut Memo::default(),
-            standing.as_ref(),
-            coll.id,
-            &keyed.scope,
-        )?;
+        let record = self.live_record_in(txn, coll.id, &keyed.scope)?;
         if let Some(record) = &record {
             self.witness(&record.first);
             self.witness(&record.last);
+            if record.contested || record.fingerprint != keyed.fingerprint {
+                return Err(StorageError::IdempotencyKeyReused);
+            }
         }
         Ok(record)
     }
@@ -1918,7 +1983,7 @@ impl Engine {
     /// Put a local commit's record, merged into the live one if there is one
     /// (a resumed or continuing request's), with its row at the merged `last`.
     /// What stands under the key and is not alive is overwritten, never merged
-    /// with: an earlier life's record, or one past the window, belongs to
+    /// with: a record past the window, or one this build cannot read, belongs to
     /// another request.
     pub(crate) fn put_record(
         &self,
@@ -1943,22 +2008,22 @@ impl Engine {
     /// the stamps it was vouched for to it. The record's stamps are witnessed: a
     /// resume here must write above its `first`.
     ///
-    /// Not stored when it is history by the life rule; what stands under the
-    /// key and is not alive (history, past the window, unreadable by this
+    /// Stored whether or not a drop of its collection came after it, or the
+    /// collection stands: a record outlives a drop for its window. **Not stored
+    /// when it is past its window**, the one test of a record's life: merged
+    /// into the live record of a new request under the key, it would lower that
+    /// record's `first` to the old request's, and mark it contested. What stands
+    /// under the key and is not alive (past the window, unreadable by this
     /// build) is overwritten. Returns the record as stored, or `None`.
-    #[allow(clippy::too_many_arguments)]
     pub(crate) fn store_record(
         &self,
         txn: &WriteTxn<'_>,
-        memo: &mut Memo,
-        standing: Option<&CollectionMeta>,
         collection: CollectionId,
         scope: &ScopeHash,
         record: &IdempotencyRecord,
         carrying: Option<Stamp>,
     ) -> Result<Option<IdempotencyRecord>> {
-        let (stored, _) =
-            self.store_record_noting(txn, memo, standing, collection, scope, record, carrying)?;
+        let (stored, _) = self.store_record_noting(txn, collection, scope, record, carrying)?;
         Ok(stored)
     }
 
@@ -1966,23 +2031,21 @@ impl Engine {
     /// that would change nothing writes nothing** (the merge is what stands and
     /// its rows are there): a sender ships a record it cannot vouch for in every
     /// window until it can (F3), and a window of records a receiver holds already
-    /// must not cost it a write, nor a commit where nothing else is written.
-    #[allow(clippy::too_many_arguments)]
+    /// must not cost it a write, nor a commit where nothing else is written. The
+    /// check is against the record as stored, alive or past its window.
     pub(crate) fn store_record_noting(
         &self,
         txn: &WriteTxn<'_>,
-        memo: &mut Memo,
-        standing: Option<&CollectionMeta>,
         collection: CollectionId,
         scope: &ScopeHash,
         record: &IdempotencyRecord,
         carrying: Option<Stamp>,
     ) -> Result<(Option<IdempotencyRecord>, bool)> {
-        if self.record_is_history(memo, standing, collection, record)? {
+        if self.record_is_past_window(record) {
             return Ok((None, false));
         }
-        let live = match self.live_record_in(txn, memo, standing, collection, scope) {
-            Ok(live) => live,
+        let stored = match read_record(&txn.open_table(IDEMPOTENCY)?, collection, scope) {
+            Ok(stored) => stored,
             // A local record this format cannot be: the peer's is good data,
             // and refusing it would fail the run for good.
             Err(StorageError::Corrupt(why)) => {
@@ -1991,13 +2054,14 @@ impl Engine {
             }
             Err(e) => return Err(e),
         };
-        let merged = match &live {
+        let live = stored.as_ref().filter(|stored| !self.record_is_past_window(stored));
+        let merged = match live {
             Some(live) => live.merge(record),
             None => record.clone(),
         };
         self.witness(&merged.first);
         self.witness(&merged.last);
-        if live.as_ref() == Some(&merged)
+        if stored.as_ref() == Some(&merged)
             && store_is_a_no_op(txn, collection, scope, &merged, carrying)?
         {
             return Ok((Some(merged), false));
@@ -2196,132 +2260,19 @@ impl Engine {
         Ok(removed)
     }
 
-    /// The drop purger's share: up to `budget` of collection `id`'s records
-    /// examined in `txn`, which has already found no collection standing under
-    /// the id, and **those of the dropped life removed**: a record whose `last` is
-    /// at or below the collection's drop tombstone (the life rule, as the late
-    /// drop's sweep judges). Their rows are left to expire: they name nothing now.
-    ///
-    /// **A record of a later life stays**, for retention. A window stores the
-    /// records it carries whether or not their collection stands (records travel
-    /// with coverage), so a member that has applied a drop, its purge pending, can
-    /// hold the record of a write stamped after the drop (kept in the next life,
-    /// ADR-236); removed here, that write's effect would stand without its record.
-    /// A record this build cannot decode goes, as it went before, and so does every
-    /// record under an id with no tombstone over it (ADR-158's residual before its
-    /// addendum, a purge a creation asked for): nothing there tells one life from
-    /// another, and the name is created again with no floor over what stays.
-    ///
-    /// A chunk that examines a record of a later life removes less than it
-    /// examined, so the purger reads it as the end: dropped-life records past it
-    /// are left for retention, history by the life rule meanwhile.
-    pub(crate) fn purge_records_in(
-        txn: &WriteTxn<'_>,
-        id: CollectionId,
-        budget: usize,
-    ) -> Result<usize> {
-        let dropped = match txn.open_table(tables::COLLECTIONS_DROPPED)?.get(id.0)? {
-            Some(raw) => Some(codec::decode_oplog_key(raw.value())?),
-            None => None,
-        };
-        let mut records = txn.open_table(IDEMPOTENCY)?;
-        let keys: Vec<Vec<u8>> = {
-            let mut keys = Vec::new();
-            for row in records.range(collection_records(id, None))?.take(budget) {
-                let (key, value) = row?;
-                let of_the_dropped_life = match IdempotencyRecord::decode(value.value()) {
-                    Ok(Some(record)) => dropped.is_none_or(|at| record.last.hlc <= at.hlc),
-                    Ok(None) | Err(_) => true,
-                };
-                if of_the_dropped_life {
-                    keys.push(key.value().1.to_vec());
-                }
-            }
-            keys
-        };
-        for scope in &keys {
-            records.remove((id.0, scope.as_slice()))?;
-        }
-        Ok(keys.len())
-    }
-
-    /// Whether collection `id` has any record stored. Not part of whether a
-    /// name can be created again: records never hold that up, since an earlier
-    /// life's are never read.
-    pub(crate) fn records_under(&self, id: CollectionId) -> Result<bool> {
-        use redb::ReadableDatabase;
-        let txn = self.db().begin_read()?;
-        let records = txn.open_table(IDEMPOTENCY)?;
-        Ok(records.range(collection_records(id, None))?.next().transpose()?.is_some())
-    }
-
-    /// A late drop's share (ADR-231): the records of collection `standing`
-    /// whose `last` is at or before `dropped`, [`RECORD_COLLECT_CHUNK`]
-    /// examined per commit, with `stop` asked between chunks. For space only:
-    /// once the sweep has taken the floor up to the drop, they are history
-    /// whether they stay or go. Returns how many it removed.
-    pub(crate) fn sweep_late_drop_records(
-        &self,
-        id: CollectionId,
-        dropped: Stamp,
-        stop: crate::late_drop::StopCheck<'_>,
-    ) -> Result<usize> {
-        let mut removed = 0usize;
-        let mut after: Option<Vec<u8>> = None;
-        loop {
-            stop()?;
-            let txn = self.begin_write(WriterHolder::Drop)?;
-            let (gone, last, exhausted) = {
-                let mut records = txn.open_table(IDEMPOTENCY)?;
-                let mut gone = Vec::new();
-                let mut last = None;
-                let mut exhausted = true;
-                for (examined, row) in
-                    records.range(collection_records(id, after.as_deref()))?.enumerate()
-                {
-                    if examined == RECORD_COLLECT_CHUNK {
-                        exhausted = false;
-                        break;
-                    }
-                    let (key, value) = row?;
-                    let (_, scope) = key.value();
-                    last = Some(scope.to_vec());
-                    if let Ok(Some(record)) = IdempotencyRecord::decode(value.value())
-                        && record.last.hlc <= dropped.hlc
-                    {
-                        gone.push(scope.to_vec());
-                    }
-                }
-                for scope in &gone {
-                    records.remove((id.0, scope.as_slice()))?;
-                }
-                (gone.len(), last, exhausted)
-            };
-            if gone == 0 {
-                txn.abort()?;
-            } else {
-                txn.commit()?;
-            }
-            removed += gone;
-            if exhausted {
-                break;
-            }
-            after = last;
-        }
-        Ok(removed)
-    }
-
     /// A rewind's share (`kimmyd restore --until`), in its transaction: a
     /// record of a request whose every write the rewind discards (`first` after
     /// `until`) goes, since nothing of the request stands and a retry must apply
-    /// it afresh. One the rewind cuts part-way (`first` at or before `until`,
+    /// it afresh, **with its rows by stamp** ([`remove_rows_naming`]): left
+    /// behind, they would be above the rewound servable vector, read as F3
+    /// candidates by every frame until retention collected them. One the rewind cuts part-way (`first` at or before `until`,
     /// `last` after it) is of a request only some of whose writes stand:
     ///
     /// - **an update or delete by filter** (`Modify`) becomes `applying`, with
     ///   no cursor, so a retry resumes from the beginning and the stamp rule
     ///   writes what the rewind undid and nothing the request still holds. Its
     ///   counts are left as they were, an overcount;
-    /// - **any other kind goes**, as one discarded whole does. Only a bulk insert
+    /// - **any other kind goes**, as one discarded whole does, with its rows. Only a bulk insert
     ///   spans stamps among them (a batch minted in the millisecond the rewind
     ///   is to keeps a prefix, since `--until` is a millisecond), and nothing
     ///   resumes one: kept, its replay would answer every document inserted
@@ -2358,13 +2309,26 @@ impl Engine {
                 reopened.push((id, scope.to_vec(), open.encode()));
             }
         }
+        // The lowest `first` of what goes: where its rows begin.
+        let mut from: Option<Hlc> = None;
         for (id, scope) in &gone {
-            records.remove((*id, scope.as_slice()))?;
+            if let Some(old) = records.remove((*id, scope.as_slice()))?
+                && let Ok(Some(old)) = IdempotencyRecord::decode(old.value())
+            {
+                from = Some(from.map_or(old.first.hlc, |from| from.min(old.first.hlc)));
+            }
         }
         for (id, scope, bytes) in &reopened {
             records.insert((*id, scope.as_slice()), bytes.as_slice())?;
         }
         drop(records);
+        let named: HashSet<(CollectionId, ScopeHash)> = gone
+            .iter()
+            .filter_map(|(id, scope)| Some((CollectionId(*id), ScopeHash::from_slice(scope)?)))
+            .collect();
+        if let Some(from) = from {
+            remove_rows_naming(txn, from, &named)?;
+        }
         for (id, scope, _) in &reopened {
             if let Some(scope) = ScopeHash::from_slice(scope) {
                 log_change(self, txn, CollectionId(*id), &scope)?;

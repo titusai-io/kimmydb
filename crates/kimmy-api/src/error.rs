@@ -832,7 +832,8 @@ impl ApiError {
     }
 
     /// `422 idempotency_key_reused` (B5): the key is remembered here for a
-    /// request whose fingerprint differs from this one's
+    /// request whose fingerprint differs from this one's, or its record is
+    /// contested, two requests having met under it
     /// (`StorageError::IdempotencyKeyReused`).
     pub fn idempotency_key_reused() -> Self {
         Self::new(

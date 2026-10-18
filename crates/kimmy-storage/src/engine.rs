@@ -5080,9 +5080,7 @@ impl Engine {
     pub fn purge_dropped_collection(&self, id: CollectionId) -> Result<usize> {
         let mut removed = 0usize;
         loop {
-            // The records too, which the purger's chunks remove after the
-            // documents and index entries, and which a creation never waits for.
-            if self.collection_range_is_empty(id)? && !self.records_under(id)? {
+            if self.collection_range_is_empty(id)? {
                 break;
             }
             let chunk = self.purge_chunk(id)?;
@@ -5264,14 +5262,9 @@ impl Engine {
                     }
                     removed += keys.len();
                 }
-                // The collection's idempotency records, after its documents and
-                // index entries and in what is left of the chunk (B5). For space
-                // only: a record of a dropped life is history by the life rule
-                // whether it stays or goes. Their rows by stamp are left to
-                // expire, since they name nothing now.
-                if removed < DROP_PURGE_CHUNK {
-                    removed += Self::purge_records_in(&txn, id, DROP_PURGE_CHUNK - removed)?;
-                }
+                // The collection's idempotency records stay: a record outlives a
+                // drop of its collection for its window, and retention alone
+                // removes it (B5).
                 // The ranges are exhausted: the digest row of a collection
                 // that is gone goes with this commit (a row of zeros and the
                 // highest stamps of a life that has ended).

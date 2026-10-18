@@ -140,8 +140,9 @@ pub enum StorageError {
     PartiallyApplied { applied: Applied, cause: Box<StorageError> },
 
     /// The `Idempotency-Key` names a request already made with another body,
-    /// path or query (its record's fingerprint differs), or of another kind.
-    /// Nothing was written. The API's `422 idempotency_key_reused`, `retry: no`
+    /// path or query (its record's fingerprint differs), or of another kind, or
+    /// its record is contested: two members accepted it for two requests and
+    /// their records met. Nothing was written. The API's `422 idempotency_key_reused`, `retry: no`
     /// (draft §2.7): the client must send a new key.
     #[error("this Idempotency-Key was used for a different request")]
     IdempotencyKeyReused,

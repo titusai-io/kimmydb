@@ -1725,6 +1725,7 @@ fn plant_orphan_row(engine: &Engine, stamp: Stamp) -> kimmy_core::ScopeHash {
         last: stamp,
         origin: stamp.node,
         state: kimmy_storage::RecordState::Done,
+        contested: false,
         outcome: kimmy_storage::RecordOutcome::Insert { stamp },
     };
     let carried = kimmy_storage::CarriedRecord {
@@ -1810,6 +1811,7 @@ fn plant_spanning_records(f: &Fixture, count: u16) -> Vec<kimmy_core::ScopeHash>
                 last,
                 origin: node,
                 state: kimmy_storage::RecordState::Done,
+                contested: false,
                 outcome: kimmy_storage::RecordOutcome::FindAndModify {
                     matched: true,
                     modified: true,
@@ -2000,6 +2002,7 @@ async fn a_pull_whose_first_entry_cannot_cross_with_its_records_takes_them_alone
                 last: at,
                 origin: me,
                 state: kimmy_storage::RecordState::Done,
+                contested: false,
                 outcome: kimmy_storage::RecordOutcome::FindAndModify {
                     matched: true,
                     modified: true,

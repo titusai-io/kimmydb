@@ -124,6 +124,11 @@ impl ModifySpec for Inc {
     }
 }
 
+/// Past the millisecond: the next stamp on any member is above every one before.
+fn tick() {
+    std::thread::sleep(std::time::Duration::from_millis(3));
+}
+
 fn stamp(ms: u64, node: u8) -> Stamp {
     Stamp::new(Hlc::new(ms, 0), NodeId::from_bytes([node; 16]))
 }
@@ -155,6 +160,7 @@ fn record_of(k: &KeyedWrite, first: Stamp, last: Stamp) -> IdempotencyRecord {
         origin: first.node,
         state: RecordState::Done,
         outcome: RecordOutcome::Insert { stamp: first },
+        contested: false,
     }
 }
 
@@ -340,6 +346,57 @@ fn a_record_lands_with_the_run_that_takes_its_entry_when_the_entry_loses() {
     assert_eq!(n_of(&b.engine, &cb, 1), 10, "not applied again");
 }
 
+/// The same when the entry is judged history here (ruling A: a record outlives a
+/// drop of its collection for its window): B has dropped `orders` and made it
+/// again since A's keyed insert, so A's entry is of a life B has buried, and its
+/// record is stored with the run that takes it as history. A schema change of
+/// A's after it commits that run and raises B's coverage of A past the entry,
+/// and the batch then fails at its last commit. Held for the last commit, the
+/// record would be lost for good, though B's coverage passed its row, and a retry
+/// on B would apply afresh where the record says the request was answered.
+#[test]
+fn a_record_lands_with_the_run_that_takes_its_entry_as_history() {
+    let (a, b, ca, _) = pair();
+    let k = keyed(33);
+    let (id, at) = fresh(a.engine.insert_keyed(&ca, doc! { "_id": 1i64, "v": 1 }, &k).unwrap());
+    a.engine.create_collection("shop", "later").unwrap();
+    // B's drop at or above A's keyed entry, and its next life.
+    b.engine.advance_clock_past(&at);
+    b.engine.drop_collection("shop", "orders").unwrap();
+    b.engine.finish_purges_now().unwrap();
+    let cb = b.engine.create_collection("shop", "orders").unwrap();
+
+    let theirs = a.engine.version_vector().unwrap();
+    let mine = b.engine.witnessed_vector().unwrap();
+    let window = a
+        .engine
+        .entries_for_peer_holding(Hlc::ZERO, 1024, Some(&mine), WalkScope::Background)
+        .unwrap();
+    crate::sync::count_hooks::fail_next(crate::sync::count_hooks::Fail::BeforeLastCommit);
+    let mut outcome = SyncOutcome::default();
+    let failed = b.engine.apply_peer_window_carrying_into(
+        &theirs,
+        Some(&mine),
+        &window.entries,
+        &window.records,
+        RecordsVia::Pull,
+        PeerWindow {
+            scanned_to: window.scanned_to,
+            exhausted: window.exhausted,
+            passed_through: None,
+            asked_partial: false,
+        },
+        &mut outcome,
+    );
+    assert!(failed.is_err(), "premise: the batch failed at its last commit");
+    assert!(b.engine.get(&cb, &id).unwrap().is_none(), "premise: the entry was history on B");
+    let covered = b.engine.witnessed_vector().unwrap().get(a.engine.node_id());
+    assert!(covered > at.hlc, "premise: B's coverage of A passed the keyed entry");
+    assert!(b.engine.idempotency_record(cb.id, &k.scope).unwrap().is_some(), "with the run");
+    replayed(b.engine.insert_keyed(&cb, doc! { "_id": 1i64, "v": 1 }, &k).unwrap());
+    assert_eq!(count(&b.engine, &cb), 0, "nothing written to B's next life");
+}
+
 /// A record whose row's entry is not in the frame rides with the first later
 /// entry of its collection the batch takes. A member whose own write beat the
 /// keyed entry never appended it, and serves its windows without it, while it
@@ -439,10 +496,13 @@ fn a_frames_records_are_stored_whether_or_not_an_entry_of_their_collection_is_ta
     assert_eq!(b.engine.idempotency_records_received()[0], 2, "and are not counted again");
 }
 
-/// A record of a life the receiver has buried is not stored, and one this build
-/// cannot decode is dropped and counted while its entries are applied.
+/// A record of a life the receiver has buried is stored all the same (ruling A:
+/// a record outlives a drop for its window), and a retry in the life standing
+/// replays it; one this build cannot decode is dropped and counted while its
+/// entries are applied. Its entry is history here, so the record rides with an
+/// entry judged history.
 #[test]
-fn a_history_record_is_not_stored_and_an_undecodable_one_is_dropped() {
+fn a_dropped_lifes_record_is_stored_and_an_undecodable_one_is_dropped() {
     let b = member();
     b.engine.create_collection("shop", "orders").unwrap();
     b.engine.drop_collection("shop", "orders").unwrap();
@@ -452,11 +512,11 @@ fn a_history_record_is_not_stored_and_an_undecodable_one_is_dropped() {
     let k = keyed(5);
     let old = Stamp::new(Hlc::new(floor.wall_ms - 5, 0), NodeId::from_bytes([0xA1; 16]));
     let new = Stamp::new(Hlc::new(crate::physical_now_ms() + 5, 0), NodeId::from_bytes([0xA1; 16]));
-    let history = record_of(&k, old, old);
+    let dropped_life = record_of(&k, old, old);
     let mut undecodable = record_of(&keyed(6), new, new).encode();
     undecodable[0] = crate::idempotency::RECORD_FORMAT + 1;
     let records = vec![
-        wire(cb.id, &k, Some(old), &history),
+        wire(cb.id, &k, Some(old), &dropped_life),
         CarriedRecord {
             collection: cb.id,
             scope: keyed(6).scope,
@@ -473,10 +533,17 @@ fn a_history_record_is_not_stored_and_an_undecodable_one_is_dropped() {
         )
         .unwrap();
     assert_eq!((outcome.superseded, outcome.applied), (1, 1));
-    assert_eq!(b.engine.idempotency_record(cb.id, &k.scope).unwrap(), None, "history");
+    assert_eq!(
+        b.engine.idempotency_record(cb.id, &k.scope).unwrap(),
+        Some(dropped_life),
+        "stored, though its life is buried here"
+    );
     assert_eq!(b.engine.idempotency_record(cb.id, &keyed(6).scope).unwrap(), None);
     assert_eq!(b.engine.idempotency_records_undecodable(), 1);
     assert!(b.engine.get(&cb, &DocId::Int64(2)).unwrap().is_some(), "its entry applied");
+    let replay = replayed(b.engine.insert_keyed(&cb, doc! { "_id": 1i64 }, &k).unwrap());
+    assert_eq!(replay.first, old);
+    assert!(b.engine.get(&cb, &DocId::Int64(1)).unwrap().is_none(), "nothing written");
 }
 
 /// A window's records are read in the read transaction that read its entries:
@@ -761,24 +828,23 @@ fn an_undecodable_record_goes_when_its_row_expires() {
     assert_eq!(raw(&a.engine), (false, 0), "the record went with its row");
 }
 
-// -- Lives: a record of the life after a drop -----------------------------------------------
+// -- Rows another record left; records across a drop ------------------------------------
 
 /// A window ships a record at a row of its own, never at a row another record
-/// under its key left: one of a life a drop ended (its record purged, its rows
-/// left to expire), here below the record's `first`. Shipped at that row, the
-/// record of the later life rode with the earlier life's entry.
+/// under its key left: here one past its window that a new request's record
+/// replaced, its rows not yet collected, below the new record's `first`. Shipped
+/// at that row, the new record would ride with an entry of the request before.
 #[test]
-fn a_window_ships_a_record_at_its_own_row_not_at_one_an_earlier_life_left() {
+fn a_window_ships_a_record_at_its_own_row_not_at_one_an_earlier_record_left() {
     let (a, _b, ca, _) = pair();
+    a.engine.set_idempotency_window(3_600);
     let k = keyed(41);
-    fresh(a.engine.insert_keyed(&ca, doc! { "v": 1 }, &k).unwrap());
-    let old = a.engine.idempotency_record(ca.id, &k.scope).unwrap().expect("premise").first;
-    a.engine.drop_collection("shop", "orders").unwrap();
-    a.engine.finish_purges_now().unwrap();
-    let again = a.engine.create_collection("shop", "orders").unwrap();
-    fresh(a.engine.insert_keyed(&again, doc! { "v": 1 }, &k).unwrap());
-    let now = a.engine.idempotency_record(again.id, &k.scope).unwrap().expect("premise");
-    assert!(old < now.first, "premise: the earlier life's row is below the record");
+    let (_, old) = fresh(a.engine.insert_keyed(&ca, doc! { "_id": 1i64 }, &k).unwrap());
+    a.engine.set_idempotency_clock_for_test(Some(old.hlc.wall_ms + 3_600_001));
+    fresh(a.engine.insert_keyed(&ca, doc! { "_id": 2i64 }, &k).unwrap());
+    a.engine.set_idempotency_clock_for_test(None);
+    let now = a.engine.idempotency_record(ca.id, &k.scope).unwrap().expect("premise");
+    assert!(old < now.first, "premise: the earlier record's row is below the record");
     let empty = kimmy_core::VersionVector::new();
     let window = a
         .engine
@@ -786,7 +852,7 @@ fn a_window_ships_a_record_at_its_own_row_not_at_one_an_earlier_life_left() {
         .unwrap();
     let shipped: Vec<_> = window.records.iter().filter(|r| r.scope == k.scope).collect();
     assert_eq!(shipped.len(), 1, "one per key: {shipped:?}");
-    assert_eq!(shipped[0].carrying, Some(now.first), "at its own row, not the earlier life's");
+    assert_eq!(shipped[0].carrying, Some(now.first), "at its own row, not the earlier one's");
 }
 
 /// A record found again at a lower row is carried there (B1 of the build
@@ -835,19 +901,15 @@ fn a_row_below_the_records_first_found_later_does_not_lower_its_carrying_row() {
     assert_eq!(shipped[0].carrying, Some(own), "at its own row, not the lower one");
 }
 
-/// A frame's record is stored with the entry at or after its row, never in the
-/// run of an earlier entry of its collection: the batch takes entries in stamp
-/// order, and one before the row can be of a life a drop between them ends, a
-/// drop this member has not taken yet. Here B holds its own record of the key
-/// from the earlier life, and A's window carries the dropped life's write, the
-/// drop, the creation and the later life's write with its record. Stored with
-/// the first entry, the later life's record merged with B's, still alive then,
-/// and B held the earlier life's `first` under it.
+/// A record rides through a drop and a recreation (ruling A). A and B each
+/// applied the same keyed write before A dropped the collection; A's retry in
+/// the next life replays, and B, taking the drop, the creation and A's record
+/// in one window, keeps its record merged with A's, so a retry there replays
+/// too and nothing is written to the next life on either.
 #[test]
-fn a_frames_record_rides_with_the_entry_at_its_row_not_an_earlier_one() {
+fn a_record_rides_through_a_drop_and_a_recreation_to_a_member_that_holds_its_own() {
     let (a, b, ca, cb) = pair();
     let k = keyed(42);
-    let tick = || std::thread::sleep(std::time::Duration::from_millis(3));
     fresh(a.engine.insert_keyed(&ca, doc! { "v": 1 }, &k).unwrap());
     tick();
     fresh(b.engine.insert_keyed(&cb, doc! { "v": 1 }, &k).unwrap());
@@ -856,26 +918,27 @@ fn a_frames_record_rides_with_the_entry_at_its_row_not_an_earlier_one() {
     a.engine.drop_collection("shop", "orders").unwrap();
     a.engine.finish_purges_now().unwrap();
     let again = a.engine.create_collection("shop", "orders").unwrap();
-    fresh(a.engine.insert_keyed(&again, doc! { "v": 1 }, &k).unwrap());
+    replayed(a.engine.insert_keyed(&again, doc! { "v": 1 }, &k).unwrap());
     let theirs = a.engine.idempotency_record(again.id, &k.scope).unwrap().expect("premise");
     let mine = b.engine.idempotency_record(cb.id, &k.scope).unwrap().expect("premise");
-    assert!(mine.last < theirs.first, "premise: B's record is the earlier life's");
     pull(&b.engine, &a.engine);
     b.engine.finish_purges_now().unwrap();
     pull(&b.engine, &a.engine);
+    let life = b.engine.get_collection("shop", "orders").unwrap();
     assert_eq!(
-        b.engine.idempotency_record(again.id, &k.scope).unwrap(),
-        Some(theirs),
-        "the later life's record, not merged with the earlier life's"
+        b.engine.idempotency_record(life.id, &k.scope).unwrap(),
+        Some(mine.merge(&theirs)),
+        "B's record and A's, merged across the drop"
     );
+    replayed(b.engine.insert_keyed(&life, doc! { "v": 1 }, &k).unwrap());
+    assert_eq!((count(&a.engine, &again), count(&b.engine, &life)), (0, 0));
 }
 
 /// A batch that ends at an entry stores none of the frame's records whose row is at
 /// or past it: the window grants no coverage there and serves them again. Here B's
 /// batch ends at the creation of `shop.other` again, its earlier life's purge still
-/// owed, before the drop of `orders` and the later life's write with its record;
-/// B still holds the earlier life's record under the key. Stored at the batch's end,
-/// the later life's record merged with it.
+/// owed, before the drop of `orders`, its creation again and a keyed write there with
+/// its record. B's record of a write before the drop stays throughout (ruling A).
 #[test]
 fn a_batch_that_ends_early_leaves_the_records_past_its_end() {
     let (a, b, ca, cb) = pair();
@@ -890,18 +953,274 @@ fn a_batch_that_ends_early_leaves_the_records_past_its_end() {
     a.engine.drop_collection("shop", "orders").unwrap();
     a.engine.finish_purges_now().unwrap();
     let again = a.engine.create_collection("shop", "orders").unwrap();
-    fresh(a.engine.insert_keyed(&again, doc! { "v": 1 }, &k).unwrap());
-    let later = a.engine.idempotency_record(again.id, &k.scope).unwrap().expect("premise");
+    let k2 = keyed(44);
+    fresh(a.engine.insert_keyed(&again, doc! { "v": 2 }, &k2).unwrap());
+    let later = a.engine.idempotency_record(again.id, &k2.scope).unwrap().expect("premise");
     let outcome = pull(&b.engine, &a.engine);
     assert_eq!(outcome.purge_pending, 1, "premise: the batch ended at the creation");
     assert_eq!(
-        b.engine.idempotency_record(cb.id, &k.scope).unwrap(),
-        Some(earlier),
-        "the later life's record is left for the window that takes its row"
+        b.engine.idempotency_record(cb.id, &k2.scope).unwrap(),
+        None,
+        "the later write's record is left for the window that takes its row"
     );
     for _ in 0..4 {
         b.engine.finish_purges_now().unwrap();
         pull(&b.engine, &a.engine);
     }
-    assert_eq!(b.engine.idempotency_record(again.id, &k.scope).unwrap(), Some(later));
+    assert_eq!(b.engine.idempotency_record(again.id, &k2.scope).unwrap(), Some(later));
+    assert_eq!(b.engine.idempotency_record(again.id, &k.scope).unwrap(), Some(earlier));
+}
+
+// -- D2, D3 and KR across members (ruling A, the `contested` flag) -------------------------------
+
+/// `$inc` of every counter from 0 to `n`, on `coll` at `on`, one chunk a pair.
+fn counters_on(on: &Engine, coll: &CollectionMeta, n: i64) {
+    for i in 0..n {
+        on.insert(coll, doc! { "_id": i, "n": 0i64 }).unwrap();
+    }
+}
+
+fn ns(engine: &Engine, coll: &CollectionMeta, n: i64) -> Vec<i64> {
+    (0..n).map(|i| n_of(engine, coll, i)).collect()
+}
+
+/// Stop the keyed request this thread runs next after its first commit, as a
+/// drain deadline does: the next chunk is refused and the record left
+/// `applying`.
+fn stop_after_the_first_chunk(engine: &Arc<Engine>) {
+    let engine = Arc::clone(engine);
+    crate::sync::race_hooks::at(crate::sync::race_hooks::Race::BetweenChunks, move || {
+        engine.set_stopping();
+    });
+}
+
+/// A member's restart, after a stop: the store opened again.
+fn restart(m: Member) -> Member {
+    crate::sync::race_hooks::clear();
+    let Member { engine, _dir } = m;
+    let path = _dir.path().join("kimmy.redb");
+    drop(Arc::into_inner(engine).expect("the only handle"));
+    Member { engine: Arc::new(Engine::open(&path).unwrap()), _dir }
+}
+
+/// D2 under ruling A. A applies an `$inc` of every counter and B takes it with its
+/// record; A drops `orders`; B, before it hears of the drop, writes counter 0
+/// (unkeyed) on top of its version, which carries the `$inc`, stamped after the
+/// drop. B then takes the drop, which keeps that write (ADR-236). A retry on B
+/// replays the record: the request never lands twice on counter 0. Under the life
+/// rule the record was history there, and the retry incremented counter 0 again.
+#[test]
+fn d2_a_retry_after_a_drop_replays_and_never_doubles() {
+    let (a, b, ca, cb) = pair();
+    counters_on(&a.engine, &ca, 3);
+    a.engine.set_multi_chunk_docs(2);
+    let k = keyed(70);
+    fresh(a.engine.modify_where_keyed(&ca, &Candidates::Scan, &Inc, None, &k).unwrap());
+    pull(&b.engine, &a.engine);
+    assert_eq!(ns(&b.engine, &cb, 3), vec![1, 1, 1], "premise: B took the $inc");
+    a.engine.drop_collection("shop", "orders").unwrap();
+    tick();
+    b.engine
+        .replace(&cb, &DocId::Int64(0), doc! { "_id": 0i64, "n": 1i64, "touched": true }, false)
+        .unwrap();
+    pull(&b.engine, &a.engine);
+    let life = b.engine.get_collection("shop", "orders").expect("the touched write's life");
+    assert_eq!(count(&b.engine, &life), 1, "premise: the drop took counters 1 and 2");
+    b.engine.set_multi_chunk_docs(2);
+    let again =
+        replayed(b.engine.modify_where_keyed(&life, &Candidates::Scan, &Inc, None, &k).unwrap());
+    assert_eq!(again.origin, a.engine.node_id());
+    assert_eq!(n_of(&b.engine, &life, 0), 1, "the $inc landed once on counter 0");
+}
+
+/// D3 under ruling A, the stamp rule's contract across a drop. A applies an
+/// `$inc` of every counter; B drops `orders` and creates it again with fresh
+/// counters; C, before it hears of either, applies the same request, stamped
+/// after the drop, and stops after its first chunk. C takes A's effect and
+/// record (merged: A's `first`, before the drop), then the drop and the new
+/// life: C's first chunk stands (ADR-236), and counters 2 to 4 are B's fresh
+/// ones. A retry on C resumes on the merged `first` and leaves every match, each
+/// stored at or above it, counted in `skipped`: nothing is written twice, and the
+/// new life's counters are left as they are (Chris's 2026-10-18 rule).
+#[test]
+fn d3_a_resume_after_a_drop_leaves_what_is_at_or_above_its_merged_first() {
+    let (a, b, ca, _) = pair();
+    let c = member();
+    counters_on(&a.engine, &ca, 5);
+    pull(&b.engine, &a.engine);
+    pull(&c.engine, &a.engine);
+    let k = keyed(71);
+    a.engine.set_multi_chunk_docs(2);
+    fresh(a.engine.modify_where_keyed(&ca, &Candidates::Scan, &Inc, None, &k).unwrap());
+    tick();
+    b.engine.drop_collection("shop", "orders").unwrap();
+    b.engine.finish_purges_now().unwrap();
+    let fresh_life = b.engine.create_collection("shop", "orders").unwrap();
+    counters_on(&b.engine, &fresh_life, 5);
+    tick();
+    let cc = c.engine.get_collection("shop", "orders").unwrap();
+    c.engine.set_multi_chunk_docs(2);
+    stop_after_the_first_chunk(&c.engine);
+    let stopped = c.engine.modify_where_keyed(&cc, &Candidates::Scan, &Inc, None, &k).unwrap_err();
+    assert!(matches!(stopped, crate::StorageError::PartiallyApplied { .. }), "{stopped:?}");
+    let c = restart(c);
+    pull(&c.engine, &a.engine);
+    for _ in 0..3 {
+        c.engine.finish_purges_now().unwrap();
+        pull(&c.engine, &b.engine);
+    }
+    let life = c.engine.get_collection("shop", "orders").unwrap();
+    assert_eq!(ns(&c.engine, &life, 5), vec![1, 1, 0, 0, 0], "premise: C's chunk and B's life");
+    let record = c.engine.idempotency_record(life.id, &k.scope).unwrap().unwrap();
+    assert_eq!(record.state, RecordState::Applying, "premise: C's attempt, merged with A's");
+    c.engine.set_multi_chunk_docs(2);
+    let out = fresh(c.engine.modify_where_keyed(&life, &Candidates::Scan, &Inc, None, &k).unwrap());
+    assert!(out.resumed);
+    assert_eq!(ns(&c.engine, &life, 5), vec![1, 1, 0, 0, 0], "nothing written twice or afresh");
+    assert_eq!(out.modified, 2, "C's first chunk, and nothing since");
+    assert!(out.skipped >= 3, "the new life's counters, left and counted: {out:?}");
+}
+
+/// KR: r0 and r1 are two `$inc`s of every counter under one key (two
+/// fingerprints). C applies r0; A, without r0's record, applies r1 and stops
+/// after its first chunk; A then takes r0's effect and record from C, and the
+/// two records merge contested. A retry of r1 on A is refused (422), and nothing
+/// completes on r0's `first`; so is r0's. And the other way round: C, taking A's
+/// record into r0's, holds a contested record too.
+#[test]
+fn kr_a_reused_keys_merged_records_are_contested_and_refused() {
+    let (a, c, ca, cc) = pair();
+    counters_on(&a.engine, &ca, 5);
+    pull(&c.engine, &a.engine);
+    let r0 = keyed(72);
+    let r1 = KeyedWrite::new(r0.scope, Fingerprint([0x73; 32]));
+    c.engine.set_multi_chunk_docs(2);
+    fresh(c.engine.modify_where_keyed(&cc, &Candidates::Scan, &Inc, None, &r0).unwrap());
+    tick();
+    a.engine.set_multi_chunk_docs(2);
+    stop_after_the_first_chunk(&a.engine);
+    a.engine.modify_where_keyed(&ca, &Candidates::Scan, &Inc, None, &r1).unwrap_err();
+    let a = restart(a);
+    a.engine.set_multi_chunk_docs(2);
+    pull(&a.engine, &c.engine);
+    let merged = a.engine.idempotency_record(ca.id, &r1.scope).unwrap().unwrap();
+    assert!(merged.contested, "{merged:?}");
+    let before = ns(&a.engine, &ca, 5);
+    for k in [&r1, &r0] {
+        let refused = a.engine.modify_where_keyed(&ca, &Candidates::Scan, &Inc, None, k);
+        assert!(matches!(refused, Err(crate::StorageError::IdempotencyKeyReused)), "{refused:?}");
+    }
+    assert_eq!(ns(&a.engine, &ca, 5), before, "nothing completes on r0's first");
+    pull(&c.engine, &a.engine);
+    assert!(c.engine.idempotency_record(cc.id, &r0.scope).unwrap().unwrap().contested);
+    let refused = c.engine.modify_where_keyed(&cc, &Candidates::Scan, &Inc, None, &r0);
+    assert!(matches!(refused, Err(crate::StorageError::IdempotencyKeyReused)), "{refused:?}");
+}
+
+/// A whole-database snapshot's page carries the record of a collection dropped
+/// and not created again, as the sender's records phase walks the ids under its
+/// tombstones; the receiver stores it, though nothing stands under the id there,
+/// and a retry once the name is created replays and writes nothing. The page is
+/// the sender's with that record added: the receiver's half.
+#[test]
+fn a_snapshot_page_leaves_a_dropped_collections_record_and_a_retry_replays() {
+    let a = member();
+    let ca = a.engine.create_collection("shop", "orders").unwrap();
+    a.engine.create_collection("shop", "items").unwrap();
+    let k = keyed(74);
+    fresh(a.engine.insert_keyed(&ca, doc! { "_id": 1i64 }, &k).unwrap());
+    let record = a.engine.idempotency_record(ca.id, &k.scope).unwrap().unwrap();
+    a.engine.drop_collection("shop", "orders").unwrap();
+    a.engine.finish_purges_now().unwrap();
+    let mut pages = pages(&a.engine, None);
+    pages[0].records.insert(0, wire(ca.id, &k, None, &record));
+    let b = member();
+    let mut progress = SnapshotProgress::whole_database();
+    for page in &pages {
+        b.engine.apply_snapshot_page(a.engine.node_id(), &mut progress, page).unwrap();
+    }
+    assert!(progress.is_complete());
+    assert!(b.engine.get_collection("shop", "orders").is_err(), "premise: not there");
+    assert_eq!(b.engine.idempotency_record(ca.id, &k.scope).unwrap(), Some(record.clone()));
+    let again = b.engine.create_collection("shop", "orders").unwrap();
+    let replay = replayed(b.engine.insert_keyed(&again, doc! { "_id": 1i64 }, &k).unwrap());
+    assert_eq!(replay.first, record.first);
+    assert_eq!(count(&b.engine, &again), 0, "nothing written");
+}
+
+/// The same, end to end: the sender's records phase must carry the dropped
+/// collection's record itself.
+///
+/// **Depends on branch `idempotency-p2`** (dropped-collection records in a
+/// snapshot: its records phase walks the ids under `COLLECTIONS_DROPPED`, and
+/// its delta and pages stop filtering records by whether their collection
+/// stands). Ignored here until that branch merges ahead of this one; un-ignore
+/// it then.
+#[test]
+#[ignore = "depends on idempotency-p2: its records phase walks the ids under COLLECTIONS_DROPPED"]
+fn a_member_rebuilt_by_snapshot_after_a_drop_replays_the_old_key() {
+    let a = member();
+    let ca = a.engine.create_collection("shop", "orders").unwrap();
+    a.engine.create_collection("shop", "items").unwrap();
+    let k = keyed(75);
+    fresh(a.engine.insert_keyed(&ca, doc! { "_id": 1i64 }, &k).unwrap());
+    a.engine.drop_collection("shop", "orders").unwrap();
+    a.engine.finish_purges_now().unwrap();
+    let b = member();
+    let mut progress = SnapshotProgress::whole_database();
+    for page in &pages(&a.engine, None) {
+        b.engine.apply_snapshot_page(a.engine.node_id(), &mut progress, page).unwrap();
+    }
+    assert!(progress.is_complete());
+    let again = b.engine.create_collection("shop", "orders").unwrap();
+    replayed(b.engine.insert_keyed(&again, doc! { "_id": 1i64 }, &k).unwrap());
+    assert_eq!(count(&b.engine, &again), 0, "nothing written");
+}
+
+/// A converge page whose first page is of a life this member has not buried (the
+/// sender dropped the collection and made it again, and this member still holds
+/// the life before) applies none of its documents, and stores its records: they
+/// outlive the drop. Here the record is put on the page by hand, as P2's sender
+/// will.
+#[test]
+fn a_converge_page_of_a_life_this_member_has_not_buried_keeps_its_records() {
+    let (a, b, ca, cb) = pair();
+    let k = keyed(78);
+    fresh(a.engine.insert_keyed(&ca, doc! { "_id": 1i64 }, &k).unwrap());
+    let record = a.engine.idempotency_record(ca.id, &k.scope).unwrap().unwrap();
+    a.engine.drop_collection("shop", "orders").unwrap();
+    a.engine.finish_purges_now().unwrap();
+    let next = a.engine.create_collection("shop", "orders").unwrap();
+    let mut page = a.engine.snapshot_page(None, Some(next.id)).unwrap();
+    assert!(page.dropped.is_none(), "premise: the collection stands on the sender");
+    page.records = vec![wire(next.id, &k, None, &record)];
+    let mut converge = SnapshotProgress::of_collection_converging(cb.id, Default::default());
+    assert!(
+        b.engine.first_page_is_a_life_this_member_has_not_buried(&converge, &page).unwrap(),
+        "premise: B holds the life before"
+    );
+    let applied = b.engine.apply_snapshot_page(a.engine.node_id(), &mut converge, &page).unwrap();
+    assert!(applied.history);
+    assert_eq!(b.engine.idempotency_record(cb.id, &k.scope).unwrap(), Some(record));
+    assert_eq!(b.engine.idempotency_records_received()[4], 1, "by repair");
+}
+
+/// A converge page from a sender that dropped the collection applies none of its
+/// documents, and stores its records: they outlive the drop. Here the record is
+/// put on the page by hand, as P2's sender will.
+#[test]
+fn a_converge_page_from_a_sender_that_dropped_keeps_its_records() {
+    let (a, b, ca, cb) = pair();
+    let k = keyed(76);
+    fresh(a.engine.insert_keyed(&ca, doc! { "_id": 1i64 }, &k).unwrap());
+    let record = a.engine.idempotency_record(ca.id, &k.scope).unwrap().unwrap();
+    a.engine.drop_collection("shop", "orders").unwrap();
+    let mut page = a.engine.snapshot_page(None, Some(ca.id)).unwrap();
+    assert!(page.dropped.is_some(), "premise: the sender's page names its drop");
+    page.records = vec![wire(ca.id, &k, None, &record)];
+    let mut converge = SnapshotProgress::of_collection_converging(cb.id, Default::default());
+    let applied = b.engine.apply_snapshot_page(a.engine.node_id(), &mut converge, &page).unwrap();
+    assert!(applied.sender_dropped);
+    assert_eq!(b.engine.idempotency_record(cb.id, &k.scope).unwrap(), Some(record));
+    assert_eq!(b.engine.idempotency_records_received()[4], 1, "by repair");
 }

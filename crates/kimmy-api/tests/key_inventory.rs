@@ -391,7 +391,7 @@ const PERSISTERS: &[Persister] = &[
     persister(
         "kimmy-storage/src/engine.rs",
         "purge_chunk",
-        "removes rows and the collection's idempotency records; forgets the digest row",
+        "removes rows (the collection's idempotency records stay); forgets the digest row",
     ),
     persister("kimmy-storage/src/index.rs", "drop_index_inner", "removes entries; writes a stamp"),
     persister(

@@ -863,6 +863,7 @@ fn r2_a_record_stored_below_the_senders_witnessed_vector_still_rides_the_next_pa
             cursor: None,
             resumed: false,
         }),
+        contested: false,
     };
     let carried = CarriedRecord {
         collection: cy.id,

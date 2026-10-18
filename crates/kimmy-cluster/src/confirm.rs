@@ -2002,6 +2002,7 @@ mod tests {
                 last: at,
                 origin: me,
                 state: kimmy_storage::RecordState::Done,
+                contested: false,
                 outcome: kimmy_storage::RecordOutcome::FindAndModify {
                     matched: true,
                     modified: true,

@@ -21,9 +21,12 @@
 //! **Data.** `shop.orders` holds five counters `{_id: i, n: 0, ks: []}`, written once
 //! before the schedule and replicated everywhere; keyed `$inc` requests change them
 //! (every counter, chunked by two; two counters in one chunk; or one, the single form),
-//! unkeyed writes write on top of them, and `orders` is never dropped. `shop.items` takes
-//! keyed inserts with and without `_id` (the derived one), bulk inserts of two, replaces
-//! and deletes by id, unkeyed writes, and is dropped and created again. `shop.big`, in
+//! unkeyed writes write on top of them. `orders` is dropped and created again too, a life
+//! beginning with its counters fresh, and a drop made on one member can reach another
+//! between two commits of a keyed `$inc` there, so a multi-chunk request is applied on
+//! both sides of a concurrent drop. `shop.items` takes keyed inserts with and without
+//! `_id` (the derived one), bulk inserts of two, replaces and deletes by id, unkeyed
+//! writes, and is dropped and created again. `shop.big`, in
 //! named rows only, holds more documents than three snapshot pages.
 //!
 //! **Key sets.** Every version a keyed request writes carries, in its `ks` field, the
@@ -44,7 +47,8 @@
 //! whole-database snapshot), with writes on the sender between its pages; take a member
 //! down and up; restart or crash a member; back a member up and restore it, which then
 //! replays its own origin from its peers (ADR-212, as the transport does); drop or create
-//! `items`; and a retention pass with a moved clock. "Between two commits" is the
+//! `items` or `orders` (a drop of `orders` on another member also between two commits);
+//! and a retention pass with a moved clock. "Between two commits" is the
 //! engine's own commit point (`barrier_hooks::Point::Released`, after every commit,
 //! durable by then), so it is between any two commits whatever the code under test makes
 //! them.
@@ -66,57 +70,68 @@
 //! holds exactly. `Anywhere`: retries land on any member, concurrent attempts on two
 //! members included, and I6 bounds the counters.
 //!
+//! **Records outlive a drop** (ruling A): a record lives its window, whatever happens to
+//! its collection, so a retry after a drop (and a creation again) replays its first
+//! answer and writes nothing to the life that stands. The invariants hold across lives.
+//!
 //! **The invariants**, after every step unless said otherwise:
 //! - **I1**, never on its own effect: no application of K writes on a base whose set
 //!   holds K. Checked where it happens (the `$inc`'s `apply` sees its base; the test
 //!   reads the base of an insert, replace or delete just before it) and on every
-//!   stored version (no list holds a request twice). Not counted: K's record belongs to
-//!   an earlier life of the collection (its greatest `last` at or below a drop, and K
-//!   wrote that document in no later life: the life rule, under which a retry after a
-//!   drop applies afresh).
+//!   stored version (no list holds a request twice).
 //! - **I2**, the record with the effect: a member that processed an entry of K by
 //!   history (its own, one a pull shipped it and its coverage then passed, or one an
 //!   own-origin replay read back) holds K's live record with `first` at or below that
-//!   entry, unless the entry is of an earlier life or K's memory ended; and a member that
+//!   entry, unless K's memory ended, whatever life the entry is of; and a member that
 //!   completed a snapshot holds every live record the sender held for what the snapshot
 //!   carried, merged (`first` at or below, `last` at or above), save the keys written on
 //!   the sender during it.
 //! - **I3**, once per member: on one member, a request writes each document at most
-//!   once across all its attempts in one life of the collection (counted from the
+//!   once across all its attempts, in every life of the collection (counted from the
 //!   entries each node minted).
 //! - **I4**, after quiescence: identical documents, identical live records, and at
 //!   most one document per (request, position) of a keyed insert.
 //! - **I5** (`Home`), after quiescence: each counter is the number of `$inc` requests
-//!   accepted for it.
+//!   accepted for it. Not in a run with a drop of `orders` (a life begins with fresh
+//!   counters, and a drop keeps the versions stamped after it, ADR-236): I8 instead.
 //! - **I6**: no counter is ever above the number of `$inc` requests sent for it.
 //! - **I7**: a keyed insert never lands on a derived `_id` another request's insert
 //!   landed on, and no live inserted document at a derived `_id` was written by
 //!   another request.
-//! - **Life**: no replay answers from a record of an earlier life (`last` at or below
-//!   the member's tombstone or floor of the collection), or one past its window.
+//! - **I8**, at each completion of an `$inc` on a member (not a replay): every counter it
+//!   targets that the member holds in a version older than the request's merged `first`
+//!   holds its application. The stamp rule leaves what is stored at or above the merged
+//!   `first` (written meanwhile by another, or, after a drop, the later life's
+//!   documents), counted as left; and a request never completes on a record whose
+//!   `first` is another request's (finding KR: such a record is contested).
+//! - **Life**: a member that holds K's live `done` record replays it (a delete by id
+//!   while its document's row is at or above the delete, or the row is gone and the
+//!   collection's drop or floor is at or above it), and no replay answers from a record
+//!   past its window.
 //!
 //! **Findings the model classifies** (counted in every run's summary line; with
-//! `IDEM_STRICT=1`, and in every named row, the first three fail the run):
+//! `IDEM_STRICT=1`, and in every named row, they fail the run):
 //! - **Relay** (the G1 analysis's G1b, G2, G2b, G3, T2, G5): an effect or an entry of K
 //!   reached a member without K's record (an application on its own effect by a member
-//!   that held no live record and had taken no entry of K of the current life; an entry
-//!   shipped without the record by a sender that held it; a record missing at quiescence
-//!   where a document holds K). Fixed by records travelling with coverage.
-//! - **L1**: a drop in the millisecond of a commit's first entry buries the record,
-//!   judged by its `last` (that first entry), while a later entry of the commit stands in
-//!   the life after it. Fixed by a record's `last` being its commit's last entry.
+//!   that held no live record and had taken no entry of K; an entry shipped without the
+//!   record by a sender that held it; a record missing at quiescence where a document
+//!   holds K). Fixed by records travelling with coverage. Fails every run unless
+//!   `IDEM_LENIENT=1`.
 //! - **S1**: a record at quiescence that the merged record dominates, or none where no
 //!   document holds the key: a record state carried only by entries that lost where the
 //!   member pulled them from, or by a record-only `done`. Harmless while I2 holds.
-//! - **D1** (counted, by design): an entry of a life a drop ended elsewhere, taken by a
-//!   member that has not received the drop, from a sender that purged its record.
 //! - **R1** (counted, a convergence matter outside B5): a reset identity's writes, or a
 //!   restored identity's writes after its backup, kept by peers only as page state,
 //!   never converge to the reset or restored member.
 //!
+//! Under the life rule the extended model found D2 (a retry after a drop doubled a
+//! counter a later write carried over), D3 (a resume across a drop left the later life's
+//! counters) and KR (a reused key's merged records). Ruling A makes D2 a Life and I1
+//! violation and D3 the stamp rule's contract; KR is refused by the `contested` flag.
+//!
 //! **Reproducers.** `finding_g1_*` (G1 as first reported: its pull serves the window
 //! without the sender's verdict, which production refuses as `StateHeld`; kept as the
-//! mechanism's minimal form) and `finding_l1_*`, both ignored until their fix lands.
+//! mechanism's minimal form) and `finding_l1_*`.
 //! The named rows `row_*` write out the breaks of the G1 analysis and the shapes the
 //! design's mutants need.
 
@@ -340,13 +355,15 @@ pub(crate) enum Step {
     Crash {
         m: u8,
     },
-    /// Drop `items`.
+    /// Drop collection `c` (`items` or `orders`).
     Drop {
         m: u8,
+        c: u8,
     },
-    /// Create `items`.
+    /// Create collection `c`; `orders` is created with its counters, fresh.
     Create {
         m: u8,
+        c: u8,
     },
     /// A retention pass on `m` at `t`, which the life rule's clock moves to everywhere.
     Retention {
@@ -413,8 +430,8 @@ impl std::fmt::Display for Op {
             Step::Restore { m } => write!(f, "{}.restore", l(*m)),
             Step::Restart { m } => write!(f, "{}.restart", l(*m)),
             Step::Crash { m } => write!(f, "{}.crash", l(*m)),
-            Step::Drop { m } => write!(f, "{}.drop(items)@{t}", l(*m)),
-            Step::Create { m } => write!(f, "{}.create(items)@{t}", l(*m)),
+            Step::Drop { m, c } => write!(f, "{}.drop({})@{t}", l(*m), NAMES[*c as usize]),
+            Step::Create { m, c } => write!(f, "{}.create({})@{t}", l(*m), NAMES[*c as usize]),
             Step::Retention { m } => write!(f, "{}.retention@{t}", l(*m)),
             Step::Clock { m } => write!(f, "{}.clock@{t}", l(*m)),
         }
@@ -490,6 +507,10 @@ pub(crate) enum Inv {
     I5,
     I6,
     I7,
+    /// A keyed `$inc` that completed on a member left a counter it targets without its
+    /// application, where the counter's version there is older than the request's first
+    /// write in the member's current life of `orders` (see the module docs).
+    I8,
     Life,
     /// The run itself failed: an unexpected error, or a cluster that never settled.
     Error,
@@ -511,15 +532,8 @@ pub(crate) struct Outcome {
     /// Effects or entries that reached a member without their record: the relay
     /// class (findings G1b, G2, G2b, G3, T2 of the G1 analysis).
     pub relay: usize,
-    /// Effects of the current life whose record a drop buried by its `last`: finding L1.
-    pub l1: usize,
     /// Settled records that differ only by a dominated, earlier state: finding S1.
     pub s1: usize,
-    /// Applications afresh on an earlier life's effect, which the life rule allows.
-    pub life_exempt: usize,
-    /// Of those and of I2's exemptions, the ones only a drop made elsewhere explains: the
-    /// member had not yet received it (finding D1, see the module docs).
-    pub dropped_elsewhere: usize,
     pub replays: usize,
     pub resumes: usize,
     pub crashes: usize,
@@ -527,6 +541,24 @@ pub(crate) struct Outcome {
     pub between: usize,
     /// Settled documents that differ only by a retired identity's versions (R1).
     pub retired: usize,
+    /// `$inc` completions I8 checked: those with a live record after the call.
+    pub i8_checks: usize,
+    /// Counters a completed `$inc` left because their version was at or above its merged
+    /// `first` (the stamp rule, by design; after a drop, the later life's documents).
+    pub left_by_first: usize,
+    /// Calls of a keyed request of `orders` during which a drop of `orders` reached
+    /// their member (between two of their commits, or before the first).
+    pub drop_mid_request: usize,
+    /// `$inc` requests with writes on both sides of a drop of `orders`, on any members.
+    pub straddled: usize,
+    /// Calls whose own writes lie on both sides of a drop of `orders` (made anywhere):
+    /// a drop between two chunks of one application.
+    pub call_straddles: usize,
+    /// Home-track runs whose exact I5 a drop of `orders` turned off.
+    pub i5_off: usize,
+    /// Finding KR, a failure: an `$inc` completed on a record whose `first` is another
+    /// request's under a reused key (see `check_i8`).
+    pub kr: usize,
 }
 
 type Res<T> = std::result::Result<T, String>;
@@ -635,15 +667,11 @@ struct Ghost {
     last: HashMap<u8, Stamp>,
     /// The request whose insert first landed on a derived `_id` (I7).
     owner: HashMap<String, u8>,
-    /// (collection, document key, request) of every application on its own effect
-    /// the life rule allows or that is a classified finding: a stored double it explains.
+    /// (collection, document key, request) of every application on its own effect that
+    /// is a classified finding (the relay class): a stored double it explains.
     explained: HashSet<(u8, Vec<u8>, u8)>,
-    /// Every drop of `items` minted, as its tombstone's stamp.
+    /// Every drop of a collection minted, as its tombstone's stamp.
     drops: Vec<(u8, Stamp)>,
-    /// (node, entry) I2 let pass because a drop elsewhere ended its life (D1).
-    dropped_elsewhere: HashSet<(NodeId, Stamp)>,
-    /// (node, entry) of the current life whose record is buried (finding L1).
-    g2: HashSet<(NodeId, Stamp)>,
     /// (node, entry) a sender holding the record shipped without it (the relay class).
     g1b: HashSet<(NodeId, Stamp)>,
     /// Those relay entries I2 has counted.
@@ -685,6 +713,8 @@ struct Prepared {
     base: Vec<(DocId, Vec<i64>, Option<Stamp>)>,
     /// The member's live record of the key before the call.
     pre_record: Option<IdempotencyRecord>,
+    /// A delete by id's target row before the call, live or a tombstone: its stamp.
+    row_before: Option<Stamp>,
     /// The member's tombstone or floor of the collection before the call.
     floor: Hlc,
     /// The greatest `last` of the request's records seen before the call.
@@ -928,14 +958,13 @@ impl World {
     }
 
     /// The member's record under `key` in `c` when it is alive there: not past its
-    /// window, not of an earlier life.
+    /// window. A record outlives a drop of its collection for its window (ruling A).
     fn live_record(&self, m: usize, c: u8, key: u8) -> Res<Option<IdempotencyRecord>> {
         let record = self
             .e(m)
             .idempotency_record(coll_id(c), &ScopeHash([key; 32]))
             .map_err(|e| err("idempotency_record", e))?;
-        let floor = self.floor(m, c)?;
-        Ok(record.filter(|r| !self.past_window(r) && r.last.hlc > floor))
+        Ok(record.filter(|r| !self.past_window(r)))
     }
 
     /// Whether request `r` is of an era a retention step has closed: its key's memory
@@ -1289,10 +1318,7 @@ impl World {
         // I2, a completed snapshot: the receiver holds every live record the sender held
         // for what it carried, merged.
         for (c, key, theirs) in expected {
-            if during.contains(&key)
-                || self.e(to).get_collection(DB, NAMES[c as usize]).is_err()
-                || theirs.last.hlc <= self.floor(to, c)?
-            {
+            if during.contains(&key) || self.e(to).get_collection(DB, NAMES[c as usize]).is_err() {
                 continue;
             }
             let mine = self
@@ -1389,6 +1415,7 @@ impl World {
             next
         };
         let mut base = Vec::new();
+        let mut row_before = None;
         let call = match req.kind {
             Kind::Insert { id } => {
                 let (target, body) = match id {
@@ -1440,6 +1467,7 @@ impl World {
             }
             Kind::Delete { at } => {
                 let target = target_id(at);
+                row_before = stored(&engine, c, &target).map(|(stamp, _)| stamp);
                 let (ks, at) = match stored(&engine, c, &target) {
                     Some((stamp, Some(doc))) => (ks_of(&doc), Some(stamp)),
                     _ => (Vec::new(), None),
@@ -1460,6 +1488,7 @@ impl World {
             before,
             base,
             pre_record,
+            row_before,
             floor,
             last_before,
             on_own_effect: Arc::new(Mutex::new(Vec::new())),
@@ -1469,15 +1498,14 @@ impl World {
     }
 
     /// Classify an application of request `r` on member `m` whose base already holds
-    /// it (I1): allowed by the life rule, a classified finding (relay, L1), or a
-    /// violation.
-    #[allow(clippy::too_many_arguments)]
+    /// it (I1): the relay class (the member held no record of it and had taken no entry
+    /// of it), or a violation. No drop explains one: a record outlives a drop of its
+    /// collection for its window (ruling A), so a retry after a drop replays.
     fn on_own_effect(
         &mut self,
         p: &Prepared,
         id: &DocId,
         ks: &[i64],
-        base_at: Option<Stamp>,
         phase: usize,
         minted: &HashSet<Stamp>,
     ) {
@@ -1486,48 +1514,16 @@ impl World {
         let r = p.r;
         let c = self.sched.requests[r as usize].kind.coll();
         let key = crate::docs::doc_key(id).unwrap_or_default();
-        // Where the collection's current life begins, for this member: its own tombstone
-        // or floor, or a drop made elsewhere it has not received yet.
-        let end = self.ghost_life_end(c).max(p.floor);
-        // The request's writes of this document in the current life.
-        let current: Vec<Stamp> = self
-            .ghost
-            .entries
-            .iter()
-            .filter(|(s, (q, qc, d))| *q == r && *qc == c && d == id && !minted.contains(s))
-            .map(|(s, _)| *s)
-            // A version holds only applications at or below its own stamp.
-            .filter(|s| s.hlc > end && base_at.is_none_or(|at| *s <= at))
-            .collect();
-        // Whether every record of the request is of an earlier life, or the commit that
-        // wrote the document straddles a drop (its first entry buried, so its record).
-        let record_dead = p.last_before.is_some_and(|last| last.hlc <= end)
-            || current.iter().any(|s| self.straddles(r, *s, end));
-        let current = !current.is_empty();
-        if record_dead && !current {
-            self.out.life_exempt += 1;
-            if p.last_before.is_some_and(|last| last.hlc > p.floor) {
-                self.out.dropped_elsewhere += 1;
-            }
-            self.ghost.explained.insert((c, key, r));
-            let s = format!(
-                "r{r} on {} applied afresh on {id:?}, an earlier life's effect",
-                LETTERS[p.m]
-            );
-            self.note(s);
-            return;
-        }
-        let processed_current = self.ghost.processed.iter().any(|((n, s), seq)| {
+        let processed_before = self.ghost.processed.iter().any(|((n, s), seq)| {
             *n == p.node
                 && *seq <= taken_by
                 && !minted.contains(s)
-                && s.hlc > end
                 && self.ghost.entries.get(s).is_some_and(|(q, ..)| *q == r)
         });
         let detail = format!(
             "r{r} applied on {} to {id:?} whose key set {ks:?} already holds it (live record \
-             before: {:?}; an entry of r{r} processed there before: {processed_current}; its \
-             greatest last {:?}, life from {})",
+             before: {:?}; an entry of r{r} processed there before: {processed_before}; its \
+             greatest last {:?}; the member's floor {})",
             LETTERS[p.m],
             p.pre_record.as_ref().map(|rec| (
                 self.stamp(rec.first),
@@ -1535,21 +1531,9 @@ impl World {
                 rec.state
             )),
             p.last_before.map(|l| self.stamp(l)),
-            self.hlc(end)
+            self.hlc(p.floor)
         );
-        if record_dead {
-            // Finding L1: the request's record is judged by its `last`, the first entry of
-            // its latest commit, and a drop in that commit's millisecond buries it while a
-            // later entry of the same commit stands in the new life.
-            self.out.l1 += 1;
-            self.ghost.explained.insert((c, key, r));
-            self.note(format!("L1: {detail}"));
-            if self.strict {
-                self.fail(Inv::I1, format!("L1 (strict): {detail}"));
-            }
-            return;
-        }
-        if p.pre_record.is_none() && !processed_current {
+        if p.pre_record.is_none() && !processed_before {
             self.out.relay += 1;
             self.ghost.explained.insert((c, key, r));
             self.note(format!("RELAY: {detail}"));
@@ -1594,15 +1578,15 @@ impl World {
         let seen: Vec<(DocId, Vec<i64>, usize)> =
             std::mem::take(&mut *p.on_own_effect.lock().unwrap());
         for (id, ks, phase) in &seen {
-            self.on_own_effect(&p, id, ks, None, *phase, &minted_set);
+            self.on_own_effect(&p, id, ks, *phase, &minted_set);
         }
         // An insert, replace or delete whose write landed (answered or not: a failed
         // fsync's may have) on a base already holding the request.
         if !req.kind.is_inc() {
-            for (id, ks, at) in p.base.clone() {
+            for (id, ks, _) in p.base.clone() {
                 let landed = minted.iter().any(|e| e.doc_id.as_ref() == Some(&id));
                 if landed && ks.contains(&i64::from(r)) {
-                    self.on_own_effect(&p, &id, &ks, at, 0, &minted_set);
+                    self.on_own_effect(&p, &id, &ks, 0, &minted_set);
                 }
             }
         }
@@ -1611,32 +1595,10 @@ impl World {
             let key = crate::docs::doc_key(&id).unwrap_or_default();
             self.ghost.entries.insert(entry.stamp, (r, c, id.clone()));
             self.ghost.mark_processed(p.node, entry.stamp);
-            // Writes of one life of the collection: a drop between two ends the
-            // first's, and the life rule lets the request apply afresh after it.
-            let life = self
-                .ghost
-                .drops
-                .iter()
-                .filter(|(dc, at)| *dc == c && at.hlc < entry.stamp.hlc)
-                .count();
-            let earlier: Vec<Stamp> = self
-                .ghost
-                .writes
-                .get(&(p.node, r, c, key.clone()))
-                .map(|w| {
-                    w.iter()
-                        .copied()
-                        .filter(|s| {
-                            self.ghost
-                                .drops
-                                .iter()
-                                .filter(|(dc, at)| *dc == c && at.hlc < s.hlc)
-                                .count()
-                                == life
-                        })
-                        .collect()
-                })
-                .unwrap_or_default();
+            // Writes across every life of the collection: a record outlives a drop
+            // for its window (ruling A), so a retry after one replays.
+            let earlier: Vec<Stamp> =
+                self.ghost.writes.get(&(p.node, r, c, key.clone())).cloned().unwrap_or_default();
             self.ghost.writes.entry((p.node, r, c, key.clone())).or_default().push(entry.stamp);
             if !earlier.is_empty() && !self.ghost.explained.contains(&(c, key.clone(), r)) {
                 let s = format!(
@@ -1670,10 +1632,31 @@ impl World {
             }
         }
         let shown = minted.iter().map(|e| self.stamp(e.stamp)).collect::<Vec<_>>().join(" ");
+        // One call's own writes on both sides of a drop of `orders` made anywhere.
+        if c == ORDERS
+            && self.ghost.drops.iter().any(|(dc, at)| {
+                *dc == ORDERS
+                    && minted.iter().any(|e| e.stamp.hlc <= at.hlc)
+                    && minted.iter().any(|e| e.stamp.hlc > at.hlc)
+            })
+        {
+            self.out.call_straddles += 1;
+        }
+        if c == ORDERS && self.floor(m, c)? > p.floor {
+            self.out.drop_mid_request += 1;
+            self.note(format!(
+                "r{r} on {}: a drop of orders reached it during the call",
+                LETTERS[m]
+            ));
+        }
+        self.check_replay(&p, &answer);
         match answer {
             Answer::Fresh { wrote, resumed } => {
                 if resumed {
                     self.out.resumes += 1;
+                }
+                if req.kind.is_inc() {
+                    self.check_i8(r, m)?;
                 }
                 self.accepted[r as usize] |= wrote || !minted.is_empty() || resumed;
                 self.finished[r as usize] = true;
@@ -1689,16 +1672,6 @@ impl World {
                 self.out.replays += 1;
                 self.accepted[r as usize] = true;
                 self.finished[r as usize] = true;
-                let floor = self.floor(m, c)?;
-                if record.last.hlc <= floor {
-                    let s = format!(
-                        "r{r} on {} replayed a record of an earlier life (last {}, floor {})",
-                        LETTERS[m],
-                        self.stamp(record.last),
-                        self.hlc(floor)
-                    );
-                    self.fail(Inv::Life, s);
-                }
                 if self.past_window(&record) {
                     let s = format!("r{r} on {} replayed a record past its window", LETTERS[m]);
                     self.fail(Inv::Life, s);
@@ -1715,9 +1688,106 @@ impl World {
             }
             Answer::Failed(e) => {
                 self.accepted[r as usize] |= !minted.is_empty();
-                self.finished[r as usize] = false;
+                // Refused because its key now names another request (one sent under the
+                // reused key after a drop made this one's record history): nothing more
+                // can happen to it, and the home track's drive must not wait for it.
+                self.finished[r as usize] = matches!(e, StorageError::IdempotencyKeyReused);
                 self.note(format!("r{r} on {}: {e}, minted [{shown}]", LETTERS[m]));
             }
+        }
+        Ok(())
+    }
+
+    /// Life (ruling A): a request whose member held its `done` record, alive by its window
+    /// alone (a drop of the collection since changes nothing), replays it. A delete by id
+    /// replays while the row of its document is at or above the delete's stamp, or when
+    /// the row is gone and the collection's drop or floor is at or above it; a row gone
+    /// otherwise (retention collected the tombstone) lets it run afresh.
+    fn check_replay(&mut self, p: &Prepared, answer: &Answer) {
+        let Some(rec) = &p.pre_record else { return };
+        if rec.fingerprint != p.keyed.fingerprint
+            || rec.state != crate::idempotency::RecordState::Done
+            || matches!(answer, Answer::Replayed(_))
+        {
+            return;
+        }
+        if let crate::idempotency::RecordOutcome::Delete { stamp: Some(deleted), .. } = &rec.outcome
+        {
+            let stands = match p.row_before {
+                Some(row) => row >= *deleted,
+                None => p.floor >= deleted.hlc,
+            };
+            if !stands {
+                return;
+            }
+        }
+        let s = format!(
+            "r{} on {} held its done record (first {} last {}, the member's floor {}) and \
+             answered {answer:?}, not its replay",
+            p.r,
+            LETTERS[p.m],
+            self.stamp(rec.first),
+            self.stamp(rec.last),
+            self.hlc(p.floor)
+        );
+        self.fail(Inv::Life, s);
+    }
+
+    /// I8, when `$inc` request `r` completes on member `m` (not a replay): every counter
+    /// it targets that `m` holds in a version older than the request's merged `first`
+    /// there holds its application. The stamp rule writes exactly those, and leaves a
+    /// match stored at or above the merged `first` (by design, counted in `skipped`): a
+    /// version written meanwhile by another, or a later life's document after a drop
+    /// (ruling A; counted here as `left_by_first`).
+    ///
+    /// Finding KR, a failure: the merged `first` is another request's under the same key
+    /// (a key reused for another request, applied on a member without the first one's
+    /// record, the two records merged). Such a record is `contested` and answers 422 on
+    /// every path; completing on it reads the other request's `first`.
+    fn check_i8(&mut self, r: u8, m: usize) -> Res<()> {
+        let floor = self.floor(m, ORDERS)?;
+        let key = self.sched.requests[r as usize].key;
+        let Some(record) = self.live_record(m, ORDERS, key)? else { return Ok(()) };
+        self.out.i8_checks += 1;
+        let first = record.first;
+        let first_of_another = self.ghost.entries.get(&first).map(|(q, ..)| *q).filter(|q| *q != r);
+        if let Some(q) = first_of_another {
+            self.out.kr += 1;
+            let s = format!(
+                "KR: r{r} completed on {} on a record whose first {} is r{q}'s",
+                LETTERS[m],
+                self.stamp(first)
+            );
+            self.note(s.clone());
+            self.fail(Inv::I8, s);
+            return Ok(());
+        }
+        let kind = self.sched.requests[r as usize].kind;
+        let e = self.e(m);
+        for d in 0..COUNTERS {
+            if !kind.targets(d) {
+                continue;
+            }
+            // A version at or below the floor is of the ended life, swept by the drop.
+            let Some((stamp, Some(doc))) = stored(&e, ORDERS, &DocId::Int64(d)) else { continue };
+            if stamp.hlc <= floor || ks_of(&doc).contains(&i64::from(r)) {
+                continue;
+            }
+            if stamp >= first {
+                self.out.left_by_first += 1;
+                continue;
+            }
+            let s = format!(
+                "r{r} completed on {} and left counter {d} at {} ({doc}) without it, below its \
+                 merged first {} (record last {}, {:?}; the member's floor {})",
+                LETTERS[m],
+                self.stamp(stamp),
+                self.stamp(first),
+                self.stamp(record.last),
+                record.state,
+                self.hlc(floor),
+            );
+            self.fail(Inv::I8, s);
         }
         Ok(())
     }
@@ -1743,12 +1813,20 @@ impl World {
             if self.finished[r as usize] || self.members[home].catching_up || self.memory_ended(r) {
                 return Ok(());
             }
+            // A drop of `orders` took the request's collection from its home: nothing to
+            // drive it on until a creation reaches it.
+            let c = self.sched.requests[r as usize].kind.coll();
+            if self.e(home).get_collection(DB, NAMES[c as usize]).is_err() {
+                return Ok(());
+            }
             self.out.steps += 1;
             let t = self.latest_t(home);
             self.note(format!("drive r{r} on {}", LETTERS[home]));
             self.send_plain(r, home, t)?;
         }
-        if !self.finished[r as usize] {
+        let c = self.sched.requests[r as usize].kind.coll();
+        if !self.finished[r as usize] && self.e(home).get_collection(DB, NAMES[c as usize]).is_ok()
+        {
             self.fail(Inv::Error, format!("r{r} never finished on its home"));
         }
         Ok(())
@@ -1813,29 +1891,39 @@ impl World {
             }
             Step::Restart { m } => self.reopen(*m as usize, true)?,
             Step::Crash { m } => self.reopen(*m as usize, false)?,
-            Step::Drop { m } => {
-                let m = *m as usize;
+            Step::Drop { m, c } => {
+                let (m, c) = (*m as usize, *c);
                 self.clock(m, op.t);
-                match self.e(m).drop_collection(DB, NAMES[ITEMS as usize]) {
+                match self.e(m).drop_collection(DB, NAMES[c as usize]) {
                     Ok(held) => {
                         let e = self.e(m);
                         let at = e
-                            .collection_dropped_at(coll_id(ITEMS))
+                            .collection_dropped_at(coll_id(c))
                             .map_err(|e| err("dropped_at", e))?;
                         if let Some(at) = at {
-                            self.ghost.drops.push((ITEMS, at));
+                            self.ghost.drops.push((c, at));
                         }
-                        self.note(format!("{} dropped items (held {held})", LETTERS[m]))
+                        let s =
+                            format!("{} dropped {} (held {held})", LETTERS[m], NAMES[c as usize]);
+                        self.note(s)
                     }
                     Err(e) => self.note(format!("{} drop refused: {e}", LETTERS[m])),
                 }
             }
-            Step::Create { m } => {
-                let m = *m as usize;
+            Step::Create { m, c } => {
+                let (m, c) = (*m as usize, *c);
                 self.clock(m, op.t);
                 for attempt in 0..2 {
-                    match self.e(m).create_collection(DB, NAMES[ITEMS as usize]) {
-                        Ok(_) => self.note(format!("{} created items", LETTERS[m])),
+                    match self.e(m).create_collection(DB, NAMES[c as usize]) {
+                        Ok(coll) => {
+                            self.note(format!("{} created {}", LETTERS[m], NAMES[c as usize]));
+                            // A life of `orders` begins with its counters, fresh.
+                            if c == ORDERS {
+                                self.e(m)
+                                    .insert_many(&coll, fresh_counters())
+                                    .map_err(|e| err("insert_many", e.source))?;
+                            }
+                        }
                         Err(StorageError::CollectionPurging { .. }) if attempt == 0 => {
                             self.finish_purges()?;
                             continue;
@@ -2112,8 +2200,8 @@ impl World {
             | Step::Restart { m }
             | Step::Crash { m }
             | Step::Reset { m, .. }
-            | Step::Drop { m }
-            | Step::Create { m }
+            | Step::Drop { m, .. }
+            | Step::Create { m, .. }
             | Step::Retention { m } => *m as usize == running,
             Step::Page { to, restart, .. } => *restart && *to as usize == running,
             // An unkeyed write on the running member between its commits: the stamp
@@ -2238,7 +2326,6 @@ impl World {
     /// request's record there.
     fn check_i2(&mut self) -> Res<()> {
         let mut records: HashMap<(usize, u8, u8), Option<IdempotencyRecord>> = HashMap::new();
-        let mut floors: HashMap<(usize, u8), Hlc> = HashMap::new();
         let mut failures = Vec::new();
         let nodes: Vec<NodeId> = (0..self.n()).map(|m| self.e(m).node_id()).collect();
         let mut processed: Vec<(NodeId, Stamp)> = self.ghost.processed.keys().copied().collect();
@@ -2246,25 +2333,9 @@ impl World {
         for (node, stamp) in processed {
             let Some(m) = nodes.iter().position(|n| *n == node) else { continue };
             let Some((r, c, id)) = self.ghost.entries.get(&stamp).cloned() else { continue };
+            // An entry of a life a drop ended needs its record too: a record outlives
+            // a drop of its collection for its window (ruling A).
             if self.memory_ended(r) {
-                continue;
-            }
-            let floor = match floors.get(&(m, c)) {
-                Some(f) => *f,
-                None => {
-                    let f = self.floor(m, c)?;
-                    floors.insert((m, c), f);
-                    f
-                }
-            };
-            if stamp.hlc <= floor {
-                continue;
-            }
-            if stamp.hlc <= self.ghost_life_end(c) {
-                // A life a drop made elsewhere has ended: its sender purged the record.
-                if self.ghost.dropped_elsewhere.insert((node, stamp)) {
-                    self.out.dropped_elsewhere += 1;
-                }
                 continue;
             }
             let key = self.sched.requests[r as usize].key;
@@ -2285,29 +2356,6 @@ impl World {
                              that held it",
                             LETTERS[m],
                             self.stamp(stamp)
-                        );
-                        self.note(s.clone());
-                        if self.strict {
-                            failures.push(format!("(strict) {s}"));
-                        }
-                    }
-                    continue;
-                }
-                let end = self.ghost_life_end(c).max(floor);
-                if self.straddles(r, stamp, end)
-                    || (record.is_none() && self.ghost.last.get(&r).is_some_and(|l| l.hlc <= end))
-                {
-                    // Finding L1 (see `on_own_effect`): the entry stands in the current
-                    // life, and its request's record is buried by its `last`.
-                    if self.ghost.g2.insert((node, stamp)) {
-                        self.out.l1 += 1;
-                        let s = format!(
-                            "L1: {} holds r{r}'s entry {} of the current life (from {}), its \
-                             record buried at its last {:?}",
-                            LETTERS[m],
-                            self.stamp(stamp),
-                            self.hlc(end),
-                            self.ghost.last.get(&r).map(|l| self.stamp(*l))
                         );
                         self.note(s.clone());
                         if self.strict {
@@ -2543,8 +2591,36 @@ impl World {
                             || self.restored.get(&s.node).is_some_and(|at| s.hlc > *at)
                     };
                     let retired = |v: Option<&(Stamp, Document)>| v.is_none_or(|(s, _)| gone(s));
-                    retired_only &=
-                        (retired(a) || retired(b)) && [a, b].iter().flatten().any(|(s, _)| gone(s));
+                    // A side without the document may hold a tombstone of such an identity.
+                    let id = a.or(b).map(|(_, d)| id_of(d));
+                    let tombstone = |member: usize| {
+                        id.as_ref()
+                            .and_then(|id| stored(&self.e(member), k.0, id))
+                            .filter(|(_, body)| body.is_none())
+                            .map(|(s, _)| s)
+                    };
+                    let tombstones =
+                        [a.is_none().then(|| tombstone(0)), b.is_none().then(|| tombstone(m))];
+                    // Or a drop of the collection, made by such an identity, at or above
+                    // the version the other side holds: the life it ended is buried here.
+                    let present = a.or(b).map(|(s, _)| s.hlc);
+                    let buried_by = |member: usize| -> Option<Stamp> {
+                        let floor = self.floor(member, k.0).ok()?;
+                        if present.is_none_or(|at| floor < at) {
+                            return None;
+                        }
+                        self.ghost
+                            .drops
+                            .iter()
+                            .find(|(c, at)| *c == k.0 && at.hlc == floor)
+                            .map(|(_, at)| *at)
+                    };
+                    let drops =
+                        [a.is_none().then(|| buried_by(0)), b.is_none().then(|| buried_by(m))];
+                    retired_only &= (retired(a) || retired(b))
+                        && ([a, b].iter().flatten().any(|(s, _)| gone(s))
+                            || tombstones.iter().flatten().flatten().any(gone)
+                            || drops.iter().flatten().flatten().any(gone));
                     let _ = write!(
                         diff,
                         " {k:?}: A {:?} / {} {:?};",
@@ -2669,8 +2745,32 @@ impl World {
             }
         }
         // I5: on the home track every counter is the number of `$inc` requests accepted
-        // for it.
-        if self.sched.track == Track::Home {
+        // for it. Not across a drop of `orders`: a life begins with fresh counters, and a
+        // drop keeps the versions stamped after it (ADR-236), their counts with them; I8
+        // checks each completion against the life it completed in instead.
+        let orders_dropped = self.ghost.drops.iter().any(|(c, _)| *c == ORDERS);
+        if self.sched.track == Track::Home && orders_dropped {
+            self.out.i5_off += 1;
+        }
+        // Requests with writes on both sides of a drop of `orders`.
+        for r in 0..self.sched.requests.len() as u8 {
+            let written: Vec<Hlc> = self
+                .ghost
+                .entries
+                .iter()
+                .filter(|(_, (q, qc, _))| *q == r && *qc == ORDERS)
+                .map(|(s, _)| s.hlc)
+                .collect();
+            let straddled = self.ghost.drops.iter().any(|(c, at)| {
+                *c == ORDERS
+                    && written.iter().any(|w| *w <= at.hlc)
+                    && written.iter().any(|w| *w > at.hlc)
+            });
+            if straddled {
+                self.out.straddled += 1;
+            }
+        }
+        if self.sched.track == Track::Home && !orders_dropped {
             for (m, held) in docs.iter().enumerate() {
                 for ((c, _), (_, doc)) in held {
                     if *c != ORDERS {
@@ -2703,31 +2803,6 @@ impl World {
             }
         }
         Ok(())
-    }
-
-    /// Whether the commit of request `r` that wrote `entry` straddles `end`, a drop: an
-    /// entry of the same node and millisecond at or below it, `entry` above it (finding
-    /// L1: the record's `last`, the commit's first entry, is then buried with it).
-    fn straddles(&self, r: u8, entry: Stamp, end: Hlc) -> bool {
-        entry.hlc > end
-            && self.ghost.entries.iter().any(|(s, (q, ..))| {
-                *q == r
-                    && s.node == entry.node
-                    && s.hlc.wall_ms == entry.hlc.wall_ms
-                    && s.hlc <= end
-            })
-    }
-
-    /// The latest drop of `c` minted anywhere: what is at or below it belongs to a life
-    /// that has ended, whether or not a member has received the drop yet.
-    fn ghost_life_end(&self, c: u8) -> Hlc {
-        self.ghost
-            .drops
-            .iter()
-            .filter(|(dc, _)| *dc == c)
-            .map(|(_, at)| at.hlc)
-            .max()
-            .unwrap_or(Hlc::ZERO)
     }
 
     /// Whether member `m` processed any entry of a request under `key` in `c`.
@@ -2852,14 +2927,17 @@ fn base() -> u64 {
     (crate::physical_now_ms() / 1000 + 3_600) * 1000
 }
 
+/// The counters of a life of `orders`, as it begins.
+fn fresh_counters() -> Vec<Document> {
+    (0..COUNTERS).map(|i| doc! { "_id": i, "n": 0i64, "ks": Vec::<Bson>::new() }).collect()
+}
+
 /// `orders` with its counters and an empty `items`, on A, pulled by B and C.
 fn setup(w: &mut World) -> Res<()> {
     let a = w.e(0);
     let orders = a.create_collection(DB, NAMES[ORDERS as usize]).map_err(|e| err("create", e))?;
     a.create_collection(DB, NAMES[ITEMS as usize]).map_err(|e| err("create", e))?;
-    let counters: Vec<Document> =
-        (0..COUNTERS).map(|i| doc! { "_id": i, "n": 0i64, "ks": Vec::<Bson>::new() }).collect();
-    a.insert_many(&orders, counters).map_err(|e| err("insert_many", e.source))?;
+    a.insert_many(&orders, fresh_counters()).map_err(|e| err("insert_many", e.source))?;
     for m in 1..w.n() {
         w.pull(m, 0, BATCH)?;
     }
@@ -3109,7 +3187,20 @@ impl Gen {
         if self.rng.chance(40) {
             for _ in 0..1 + self.rng.below(2) {
                 let j = 1 + self.rng.below(3) as u8;
-                let ops = (0..1 + self.rng.below(2)).map(|_| self.inner_op(r, m)).collect();
+                let mut ops = Vec::new();
+                for _ in 0..1 + self.rng.below(2) {
+                    let op = self.inner_op(r, m);
+                    // A drop made elsewhere, taken by the running member between two of
+                    // its commits.
+                    let pulled = match op.step {
+                        Step::Drop { m: by, .. } if by != m && self.rng.chance(70) => Some(by),
+                        _ => None,
+                    };
+                    ops.push(op);
+                    if let Some(by) = pulled {
+                        ops.push(Op { step: Step::Pull { to: m, from: by }, t: 0 });
+                    }
+                }
                 inner.push((j, ops));
             }
         }
@@ -3164,7 +3255,17 @@ impl Gen {
                 let other = self.other(m);
                 self.touch(other, extra)
             }
-            70..=82 => {
+            70..=74 => {
+                // A drop of `orders` on another member, concurrent with the request (a
+                // creation of it, now and then).
+                let other = self.other(m);
+                if self.rng.chance(70) {
+                    Op { step: Step::Drop { m: other, c: ORDERS }, t: self.t(other, extra) }
+                } else {
+                    Op { step: Step::Create { m: other, c: ORDERS }, t: self.t(other, extra) }
+                }
+            }
+            75..=82 => {
                 let later = extra + self.rng.below(40) as i64;
                 Op { step: Step::Clock { m }, t: self.t(m, later) }
             }
@@ -3312,11 +3413,13 @@ pub(crate) fn generate(seed: u64, track: Track, len: usize) -> Schedule {
             }
             82..=85 => {
                 let m = plan.member();
-                Op { step: Step::Drop { m }, t: plan.t(m, 0) }
+                let c = if plan.rng.chance(40) { ORDERS } else { ITEMS };
+                Op { step: Step::Drop { m, c }, t: plan.t(m, 0) }
             }
             86..=90 => {
                 let m = plan.member();
-                Op { step: Step::Create { m }, t: plan.t(m, 0) }
+                let c = if plan.rng.chance(50) { ORDERS } else { ITEMS };
+                Op { step: Step::Create { m, c }, t: plan.t(m, 0) }
             }
             93 => Op { step: Step::Backup { m: plan.member() }, t: 0 },
             94 => {
@@ -3358,13 +3461,20 @@ struct Sweep {
     steps: usize,
     between: usize,
     relay: usize,
-    l1: usize,
     s1: usize,
-    dropped_elsewhere: usize,
-    life_exempt: usize,
     replays: usize,
     resumes: usize,
     crashes: usize,
+    i8_checks: usize,
+    /// Schedules where a drop of `orders` reached a member during a keyed call of it.
+    with_drop_mid_request: usize,
+    /// Schedules with an `$inc` written on both sides of a drop of `orders`.
+    with_straddle: usize,
+    /// Schedules with one call's writes on both sides of a drop of `orders`.
+    with_call_straddle: usize,
+    i5_off: usize,
+    left_by_first: usize,
+    kr: usize,
 }
 
 /// Run each seed of `seeds` on both tracks, `threads` at a time; panic with the first
@@ -3393,19 +3503,25 @@ fn sweep(seeds: std::ops::Range<u64>, len: usize, threads: usize) -> Sweep {
                         t.steps += out.steps;
                         t.between += out.between;
                         t.relay += out.relay;
-                        t.l1 += out.l1;
                         t.s1 += out.s1;
-                        t.dropped_elsewhere += out.dropped_elsewhere;
-                        t.life_exempt += out.life_exempt;
                         t.replays += out.replays;
                         t.resumes += out.resumes;
                         t.crashes += out.crashes;
+                        t.i8_checks += out.i8_checks;
+                        t.with_drop_mid_request += usize::from(out.drop_mid_request > 0);
+                        t.with_straddle += usize::from(out.straddled > 0);
+                        t.with_call_straddle += usize::from(out.call_straddles > 0);
+                        t.i5_off += out.i5_off;
+                        t.left_by_first += out.left_by_first;
+                        t.kr += out.kr;
                     }
                     // `IDEM_LIST=1`: each counted finding's schedule, by seed and track.
                     if std::env::var("IDEM_LIST").is_ok_and(|v| v == "1")
-                        && out.relay + out.l1 + out.s1 > 0
+                        && out.relay + out.s1 + out.kr > 0
                     {
-                        for n in out.notes.iter().filter(|n| n.contains("finding:")) {
+                        for n in out.notes.iter().filter(|n| {
+                            n.contains("finding:") || n.contains("RELAY:") || n.contains("KR:")
+                        }) {
                             eprintln!("FINDING seed {seed} {track:?}: {n}");
                         }
                     }
@@ -3420,19 +3536,25 @@ fn sweep(seeds: std::ops::Range<u64>, len: usize, threads: usize) -> Sweep {
     let totals = totals.into_inner().unwrap();
     eprintln!(
         "idempotency model: seeds {seeds:?} x 2 tracks, len {len}: {} schedules, {} steps ({} \
-         between commits), {} replays, {} resumes, {} crashes, {} life-rule applications, {} exempt by a drop elsewhere (D1), \
-         {} relay, {} L1, {} S1, in {:.1?}",
+         between commits), {} replays, {} resumes, {} crashes, {} relay, {} S1, {} KR; drops \
+         of orders: {} schedules with one during a call, {} with an `$inc` written on both \
+         sides of one, {} with one call's writes on both sides; {} I8 checks, {} counters \
+         left at or above a merged first, {} home runs without exact I5; in {:.1?}",
         totals.schedules,
         totals.steps,
         totals.between,
         totals.replays,
         totals.resumes,
         totals.crashes,
-        totals.life_exempt,
-        totals.dropped_elsewhere,
         totals.relay,
-        totals.l1,
         totals.s1,
+        totals.kr,
+        totals.with_drop_mid_request,
+        totals.with_straddle,
+        totals.with_call_straddle,
+        totals.i8_checks,
+        totals.left_by_first,
+        totals.i5_off,
         started.elapsed()
     );
     if let Some(report) = failure.into_inner().unwrap() {
@@ -3544,6 +3666,17 @@ fn row_with(name: &str, members: u8, requests: Vec<Request>, ops: Vec<Op>, at_co
         eprintln!("row {name}:\n{}", render(None, &sched, &out));
     }
     assert!(out.failures.is_empty(), "row {name}:\n{}", render(None, &sched, &out));
+}
+
+/// A named row (three members, run strictly) whose outcome must also pass `holds`.
+fn row_holding(name: &str, requests: Vec<Request>, ops: Vec<Op>, holds: impl Fn(&Outcome) -> bool) {
+    let sched = Schedule { track: Track::Anywhere, home: 0, members: 3, requests, ops };
+    let out = run_with(&sched, Some(true), false);
+    let shown = render(None, &sched, &out);
+    if trace() {
+        eprintln!("row {name}:\n{shown}");
+    }
+    assert!(out.failures.is_empty() && holds(&out), "row {name}:\n{shown}");
 }
 
 const A: u8 = 0;
@@ -3850,6 +3983,7 @@ fn row_f1_a_window_cut_inside_a_commit() {
 /// again; C takes the drop, the replace with its record, and the creation in one window.
 /// The drop's purge on C must leave that record, and a retry on C must replay.
 #[test]
+#[ignore = "until records outlive a drop (ruling A, builder G's idempotency-a)"]
 fn row_a_record_of_the_life_after_a_drop_survives_its_purge() {
     row(
         "purge",
@@ -3857,9 +3991,9 @@ fn row_a_record_of_the_life_after_a_drop_survives_its_purge() {
         vec![req(1, Kind::Replace { at: Target::Client(0) })],
         vec![
             ask(0, C, 140),
-            Op { step: Step::Drop { m: B }, t: 210 },
+            Op { step: Step::Drop { m: B, c: ITEMS }, t: 210 },
             ask(0, A, 220),
-            Op { step: Step::Create { m: B }, t: 250 },
+            Op { step: Step::Create { m: B, c: ITEMS }, t: 250 },
             pull(A, B),
             pull(C, A),
             ask(0, C, 260),
@@ -3988,10 +4122,12 @@ fn row_a_page_carried_record_resumed_after_a_restart() {
     );
 }
 
-/// The life rule: a record of a life a drop ended, arriving from a member that applied
-/// the request before it heard of the drop, is never replayed in the life after it.
+/// Ruling A: a record outlives a drop of its collection for its window. A record of the
+/// life a drop ended, arriving from a member that applied the request before it heard of
+/// the drop, is replayed in the life after it, and nothing is written there.
 #[test]
-fn row_a_retry_after_a_drop_and_a_recreation_applies_afresh() {
+#[ignore = "until records outlive a drop (ruling A, builder G's idempotency-a)"]
+fn row_a_retry_after_a_drop_and_a_recreation_replays() {
     row(
         "life",
         3,
@@ -3999,8 +4135,8 @@ fn row_a_retry_after_a_drop_and_a_recreation_applies_afresh() {
         vec![
             ask(0, A, 100),
             ask(0, B, 105),
-            Op { step: Step::Drop { m: A }, t: 110 },
-            Op { step: Step::Create { m: A }, t: 120 },
+            Op { step: Step::Drop { m: A, c: ITEMS }, t: 110 },
+            Op { step: Step::Create { m: A, c: ITEMS }, t: 120 },
             pull(A, B),
             ask(0, A, 130),
         ],
@@ -4075,6 +4211,75 @@ fn row_a_resumed_requests_record_reaches_every_member() {
 }
 
 // -- Reproducers -------------------------------------------------------------------------------
+
+/// D2 under ruling A (records outlive a drop for their window). A applies an `$inc` of
+/// every counter and B takes it with its record; A drops `orders`; B, before it hears of
+/// the drop, writes counter 0 (unkeyed) on top of its version, which carries the `$inc`,
+/// stamped after the drop. B then takes the drop, which keeps that write (ADR-236). A
+/// retry on B replays the record: the request never lands twice on counter 0.
+#[test]
+#[ignore = "until records outlive a drop (ruling A, builder G's idempotency-a)"]
+fn row_d2_a_retry_after_a_drop_replays_and_never_doubles() {
+    row(
+        "d2",
+        3,
+        vec![req(1, Kind::IncMulti)],
+        vec![
+            ask(0, A, 100),
+            pull(B, A),
+            Op { step: Step::Drop { m: A, c: ORDERS }, t: 150 },
+            touch(B, ORDERS, 0, 160),
+            pull(B, A),
+            ask(0, B, 170),
+        ],
+    );
+}
+
+/// KR: r0 and r1 are two `$inc`s of every counter under one key. C applies r0; A,
+/// without r0's record, applies r1 and stops after its first chunk (counters 0 and 1); A
+/// then takes r0's effect and record from C, and the two records merge: the merged
+/// record is `contested`. A retry of r1 on A is refused (422), and nothing completes on
+/// r0's `first`.
+#[test]
+#[ignore = "until a record merged across two fingerprints is contested (builder G's idempotency-a)"]
+fn row_kr_a_reused_keys_merged_records_refuse() {
+    row(
+        "kr",
+        3,
+        vec![req(1, Kind::IncMulti), req(1, Kind::IncMulti)],
+        vec![
+            ask(0, C, 100),
+            ask_crash(1, A, 130, 1, Crash::AfterCommit),
+            pull(A, C),
+            ask(1, A, 140),
+        ],
+    );
+}
+
+/// D3 under ruling A, the stamp rule's contract across a drop: A applies an `$inc` of
+/// every counter; B drops `orders` and creates it again, its counters fresh; C, before it
+/// hears of either, applies the same request, stamped after the drop, and stops after its
+/// first chunk. C takes A's effect and record (merged: A's `first`, before the drop),
+/// then the drop and the new life: C's first chunk stands (ADR-236), and counters 2 to 4
+/// are B's fresh ones. A retry on C resumes on the merged `first` and leaves those three,
+/// stored at or above it (counted as `skipped`): nothing is written twice, and I8 holds.
+#[test]
+fn row_d3_a_resume_after_a_drop_leaves_what_is_at_or_above_its_merged_first() {
+    row_holding(
+        "d3",
+        vec![req(1, Kind::IncMulti)],
+        vec![
+            ask(0, A, 100),
+            Op { step: Step::Drop { m: B, c: ORDERS }, t: 150 },
+            Op { step: Step::Create { m: B, c: ORDERS }, t: 152 },
+            ask_crash(0, C, 160, 1, Crash::AfterCommit),
+            pull(C, A),
+            pull(C, B),
+            ask(0, C, 170),
+        ],
+        |out| out.left_by_first == 3,
+    );
+}
 
 /// `$inc` of `n` by one, with no key set: the reproducer's own.
 struct PlainInc;

@@ -328,6 +328,7 @@ mod tests {
             last,
             origin: NODE,
             state: RecordState::Done,
+            contested: false,
             outcome: RecordOutcome::Insert { stamp: last },
         }
     }

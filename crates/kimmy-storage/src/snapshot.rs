@@ -730,7 +730,8 @@ pub struct SnapshotPage {
     /// another's documents. A member that takes a document by snapshot must not
     /// take it without the record of the write that produced it, or a retry there
     /// would apply on top of what the snapshot brought. Stored in the page's one
-    /// transaction, by the life rule. No carrying stamp: each is rowed at its
+    /// transaction, whether or not its collection stands there (a record
+    /// outlives a drop for its window). No carrying stamp: each is rowed at its
     /// `first` and `last`, and a store that changes what the receiver holds is
     /// logged in its change log. Optional on the wire and read leniently: an
     /// older receiver ignores them, and an older sender writes none.
@@ -1780,7 +1781,7 @@ impl Engine {
             let txn = self.begin_write(WriterHolder::Repair)?;
             // The collection's records before its documents, as the sender
             // sent them; in the one transaction either way.
-            let records_stored = self.store_page_records(&txn, &mut memo, &page.records)?;
+            let records_stored = self.store_page_records(&txn, &page.records)?;
             let mut pending = Vec::new();
             for document in &page.documents {
                 let collection = self.memo_collection(&mut memo, document.collection)?;
@@ -1990,12 +1991,17 @@ impl Engine {
         deletes: &[CarriedDelete],
     ) -> Result<SnapshotApplied> {
         debug_assert!(progress.scope.is_some(), "a Converge pull is always scoped");
+        // Neither answer applies the page's documents; both keep its records
+        // (B5), which outlive a drop of their collection for their window.
+        let via = crate::idempotency::RecordsVia::Repair;
         if page.dropped.is_some() {
+            self.store_page_records_alone(&page.records, via)?;
             return Ok(SnapshotApplied { sender_dropped: true, ..Default::default() });
         }
         if progress.pages == 0
             && self.first_page_is_a_life_this_member_has_not_buried(progress, page)?
         {
+            self.store_page_records_alone(&page.records, via)?;
             return Ok(SnapshotApplied { history: true, ..Default::default() });
         }
         let mut applied = 0usize;
@@ -2018,7 +2024,7 @@ impl Engine {
             // transaction (B5): a converge repair (ADR-237) ships them for the
             // whole window, the cost the design accepts, so that a member it
             // repairs also replays the keys of the writes it was given.
-            let records_stored = self.store_page_records(&txn, &mut memo, &page.records)?;
+            let records_stored = self.store_page_records(&txn, &page.records)?;
             // The young-stamp rule's two horizons (design section 13.2). The receiver's own
             // is read **in this write transaction**, beside the "no row" read below, so a
             // collection that commits between a plan and this page cannot leave the page

@@ -160,22 +160,22 @@ fn everything_expires_and_nothing_is_left() {
         last,
         origin: last.node,
         state,
+        contested: false,
         outcome: RecordOutcome::Modify(ModifyRecorded::default()),
     };
     {
         let txn = engine.begin_write(crate::WriterHolder::Replication).unwrap();
-        let mut memo = Default::default();
         let s = ScopeHash([6; 32]);
         let a =
             peer(stamp(now - 5_000, 0, 0xA1), stamp(now - 4_000, 0, 0xA1), RecordState::Applying);
         let b =
             peer(stamp(now - 3_000, 0, 0xB2), stamp(now - 2_000, 0, 0xB2), RecordState::Applying);
-        engine.store_record(&txn, &mut memo, Some(&coll), coll.id, &s, &a, Some(a.first)).unwrap();
+        engine.store_record(&txn, coll.id, &s, &a, Some(a.first)).unwrap();
         let third = Some(stamp(now - 1_000, 0, 0xC3));
-        engine.store_record(&txn, &mut memo, Some(&coll), coll.id, &s, &b, third).unwrap();
+        engine.store_record(&txn, coll.id, &s, &b, third).unwrap();
         let p = peer(stamp(now - 6_000, 0, 0xD4), stamp(now - 6_000, 0, 0xD4), RecordState::Done);
         let page = ScopeHash([7; 32]);
-        engine.store_record(&txn, &mut memo, Some(&coll), coll.id, &page, &p, None).unwrap();
+        engine.store_record(&txn, coll.id, &page, &p, None).unwrap();
         let mut newer = p.encode();
         newer[0] = idempotency::RECORD_FORMAT + 1;
         txn.open_table(tables::IDEMPOTENCY)

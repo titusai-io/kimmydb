@@ -1232,11 +1232,15 @@ impl Engine {
 
     /// A keyed delete's record is replayed only while the delete's own
     /// tombstone stands (B5): the document's row carries a stamp at or above
-    /// the delete's, the tombstone or a later version over it. Once retention
-    /// has collected the tombstone, an older write a peer still holds can bring
-    /// the document back, and `{"deleted": 1}` would describe nothing that
-    /// stands; the record is then absent for this request, which runs afresh.
-    /// A record of another kind passes, for the replay to refuse.
+    /// the delete's, the tombstone or a later version over it; or the row is
+    /// gone with a drop of the collection at or above the delete's stamp, which
+    /// took the tombstone with the life the delete was made in (the record
+    /// outlives the drop, and a row of a later life under the id is stamped
+    /// above the delete's). Once retention has collected the tombstone with no
+    /// drop over it, an older write a peer still holds can bring the document
+    /// back, and `{"deleted": 1}` would describe nothing that stands; the
+    /// record is then absent for this request, which runs afresh. A record of
+    /// another kind passes, for the replay to refuse.
     fn unless_tombstone_gone(
         &self,
         txn: &WriteTxn<'_>,
@@ -1254,7 +1258,7 @@ impl Engine {
         let docs = txn.open_table(tables::DOCS)?;
         let stands = match docs.get((coll.id.0, key.as_slice()))? {
             Some(raw) => codec::doc_record_header(raw.value())?.0 >= *deleted,
-            None => false,
+            None => self.delete_taken_by_a_drop(txn, coll, *deleted)?,
         };
         Ok(if stands { found } else { Found::Absent })
     }
