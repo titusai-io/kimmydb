@@ -286,6 +286,52 @@ channel as documents.
 
 ---
 
+## Idempotency records beside the entries
+
+A write sent with an `Idempotency-Key` leaves a **record** beside its entries,
+in the same transaction ([Storage](storage.md#idempotency-records),
+[ADR-240](decisions.md)), and the record travels with them. The entry format,
+its codec and the set of kinds do not change: the record is an optional field
+of the message that carries the entries, never part of an entry.
+
+| Carried by | How |
+|---|---|
+| `Entries`, `ReplayEntries`, `Push` | An optional `records` list: collection id, scope hash, the carrying entry's stamp and the record's bytes, for the entries the frame ships and only those, read in the read transaction that read the window. The frame-size fit that answers `BatchTooLarge` counts each record with its entry |
+| `SnapshotPage` | An optional `records` list. Collection by collection, a records phase in pages of up to 512 records goes ahead of the collection's documents, and a page never holds one collection's records after another's documents. The same holds for a scoped repair snapshot and for a converge page ([ADR-237](decisions.md)) |
+| `SnapshotCursor` | An optional records position, so a snapshot resumes inside a records phase |
+
+Each field is read leniently: a list that does not decode is none, and a record
+that does not decode is dropped and counted
+(`kimmy_idempotency_records_undecodable_total`), never fatal to what carries it.
+A member of an earlier release ignores the fields, sends none, and drops the
+cursor's position, so its sender goes straight to the documents.
+
+**Where a receiver stores a record.** In the run transaction that takes
+(applies or supersedes) **any entry of its collection** in the frame, on
+**both** outcomes of the merge: a write that lost is still a write that
+happened, and without its record a retry on that member would apply it again
+after the version that beat it. Any entry of the collection, not only the
+carrying one, because a drop in the same millisecond can judge the first entry
+history and let a later one apply. A record that is history by its collection's
+drop is not stored, and when no entry of its collection is taken (deferred, or
+left after a stop) it is stored when they are re-served. Two records of one key
+merge as a join ([Time & Conflicts](time-and-conflicts.md#idempotency-records-merge-as-a-join)),
+and the receiver's clock moves past both of the record's stamps.
+
+**Why a side field.** A new entry kind fails the whole frame on an older
+member, which has no catch-all for an unknown `OpKind`; a field inside
+`OplogEntry` is dropped by an older member that re-encodes the entry. An unknown
+optional field on a message is ignored, which the protocol already relies on.
+
+**What it cannot do.** A record arrives with the write: a member that has not
+received the write has no record of it, and applies a retry of it a second
+time ([HTTP API](http-api.md#a-retry-on-another-member)). And a member of an
+earlier release serves every entry from its own oplog without records, which is
+why a member takes keys only while every live member carries them
+([the gate](http-api.md#the-gate)).
+
+---
+
 ## Retention
 
 Configured by `storage.oplog_retention_secs` (default 24 h) and enforced by a
@@ -294,12 +340,13 @@ interval to `0` to disable collection; validation refuses an interval *longer*
 than the retention window, since that would make the retention number mean
 "the window, plus up to one interval".
 
-Retention bounds two things:
+Retention bounds three things:
 
 | Bounded thing | Consequence when exceeded |
 |---|---|
 | How long a disconnected subscriber can be away and still resume | `410 Gone`, must resubscribe |
 | How far a peer can fall behind and still catch up incrementally | The sender says so and ships a snapshot instead ([ADR-036](decisions.md)) |
+| How long a member remembers an `Idempotency-Key` | A retry is a new request. The pass collects records after the oplog step, by their rows below the same cutoff ([Storage](storage.md#idempotency-records)) |
 
 The expiry check exists already:
 
@@ -554,7 +601,7 @@ negotiation for this.
 
 | Field | On | Meaning |
 |---|---|---|
-| `facts` | both | The sender's block about itself: whether it is catching up, which classes it yields (`yielding`), which of expiry and embeddings it has off, its TTL holder list, and, from 0.44.0, `class_state` and `class_cause` (per class: `ok`, `idle`, `suspect`, `stalled`, and why), `responsive` and `started_ms` (its process start, in its own clock), and, from 0.51.0, `vector_chunk_ids` (the vector chunk-id format it writes, `2`; ADR-239). A block that does not decode is no block and is counted |
+| `facts` | both | The sender's block about itself: whether it is catching up, which classes it yields (`yielding`), which of expiry and embeddings it has off, its TTL holder list, and, from 0.44.0, `class_state` and `class_cause` (per class: `ok`, `idle`, `suspect`, `stalled`, and why), `responsive` and `started_ms` (its process start, in its own clock), and, from 0.51.0, `vector_chunk_ids` (the vector chunk-id format it writes, `2`; ADR-239), and, from 0.52.0, `idempotency_records` (`true`: it stores and relays [idempotency records](#idempotency-records-beside-the-entries), whatever its `cluster.idempotency_keys`; ADR-240). A block that does not decode is no block and is counted |
 | `facts_gen` | both | The generation of the sender's block: a counter per process, an `Int64`, that rises each time the block changes. A receiver never replaces a held block with a lower generation from the same process, so a late-decoded older frame cannot undo a newer one |
 | `echo` | both | `{ boot, generation }`: the **other** side's block as the sender holds it. On `AskVersions` it is the server's block as the requester holds it; on `Vectors` it is the requester's block as the server holds it after recording the request's, which it does before it replies. A sender that holds nothing of the other side sends an empty `boot` and generation 0 |
 

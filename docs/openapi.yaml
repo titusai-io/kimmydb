@@ -619,7 +619,7 @@ paths:
                     description: |
                       How long this node remembers an `Idempotency-Key`, in
                       seconds after the keyed write's last commit: its
-                      `storage.oplog_retention_secs`, 86,400 by default (B5).
+                      `storage.oplog_retention_secs`, 86,400 by default (ADR-240).
                       This node's, like `durability`: members configured
                       differently remember keys for different times.
         "400": { $ref: "#/components/responses/BadRequest" }
@@ -3117,7 +3117,7 @@ components:
         Makes a retry of this write safe to send: the member that applied it
         answers the same request with the same key, from the same principal on
         the same collection, with the first answer and
-        `Idempotency-Replayed: ?1`, writing nothing (B5). One field line
+        `Idempotency-Replayed: ?1`, writing nothing (ADR-240). One field line
         holding one RFC 9651 String: quoted, 16 to 255 printable ASCII
         characters once unescaped (`\"` and `\\` count as one each), no
         parameters. Anything else is `400 bad_request` naming the header.
@@ -3130,7 +3130,9 @@ components:
         - Refused `400` while this member does not take keys
           (`cluster.idempotency_keys` is off here, or a live member does not
           carry records), after authentication, so a request with no token is
-          `401` first; and on `update` and `delete` with `explain: true`.
+          `401` first, and before authorization, so a principal without the
+          write grant gets this `400` before `403`; and on `update` and
+          `delete` with `explain: true`.
         - Remembered for `idempotencyWindowSecs` (`GET /v1/version`) after the
           write's last commit. A retry on a member that has not yet received
           the write is applied there a second time, without the marker: retry
@@ -3164,7 +3166,7 @@ components:
         authentication; or, after authentication, one while this member does
         not take keys, the message naming the header and the cause:
         `cluster.idempotency_keys`, or the live member that does not carry
-        records (B5).
+        records (ADR-240).
       content:
         application/json:
           schema: { $ref: "#/components/schemas/Error" }
@@ -3195,7 +3197,7 @@ components:
           schema: { $ref: "#/components/schemas/Error" }
     IdempotencyKeyReused:
       description: |
-        `idempotency_key_reused`, `retry: no` (B5): this member remembers the
+        `idempotency_key_reused`, `retry: no` (ADR-240): this member remembers the
         `Idempotency-Key` for a different request (another body, path, query
         or method) from this principal on this collection. Nothing was
         written. Use a new key for a new request.
@@ -3214,7 +3216,7 @@ components:
           schema: { $ref: "#/components/schemas/Error" }
     IdempotencyKeyInFlight:
       description: |
-        `idempotency_key_in_flight`, `retry: wait` (B5): a `multi: true`
+        `idempotency_key_in_flight`, `retry: wait` (ADR-240): a `multi: true`
         request with this `Idempotency-Key` is still running on this member.
         Nothing was written. Send it again here once it has finished, when it
         is answered from its record; not elsewhere, where a member that has

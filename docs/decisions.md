@@ -4182,6 +4182,11 @@ behaviour change for a configuration nobody should have had.
 > failure after the first commit answers `500 partially_applied`, `verify`,
 > with the counts of the committed chunks.
 
+> **Amended by [ADR-240](#adr-240--idempotency-keys-the-record-is-written-with-the-write-and-travels-with-it-and-a-member-takes-keys-only-while-every-member-carries-records).** A
+> keyed request's later chunks write a match only if its stamp is below the
+> request's first write, and count the rest in `skipped`, so two attempts of
+> one request on two members never write what the other wrote.
+
 **Decision.** `update` and `delete` with `multi: true` commit in chunks of
 `storage.multi_chunk_docs` documents (default 1,000; 1 to 10,000). Each chunk
 is one write transaction, matched and written inside it exactly as ADR-083
@@ -20802,6 +20807,11 @@ addendum). The cluster harness's burst test asserts at most N.
 
 ## ADR-192 — A request that commits more than once keeps going after its first commit, and a failure after it says what landed
 
+> **Amended by [ADR-240](#adr-240--idempotency-keys-the-record-is-written-with-the-write-and-travels-with-it-and-a-member-takes-keys-only-while-every-member-carries-records).** A
+> `partially_applied` request sent with an `Idempotency-Key` is recovered by
+> sending it again with the same key: it resumes, and never writes a document
+> twice. The marker remains the answer for a request without one.
+
 **Decision.** A request whose effect takes more than one write transaction
 follows one rule, after MongoDB's for `updateMany` and `deleteMany`:
 
@@ -28566,3 +28576,293 @@ delete leaving no chunk in either format, the rescan moving or re-embedding, one
 0.50 write and a twin delete judged again when the roll ends). `kimmy-cluster`: the roll read from the facts blocks,
 and the field's lenient decode. `kimmy-api`: V2, V3 (both join directions, with debris) and V5 inverted. Mutation rows
 in bash, one per clause.
+
+---
+
+## ADR-240 — Idempotency keys: the record is written with the write and travels with it, and a member takes keys only while every member carries records
+
+> **Amends [ADR-086](#adr-086--a-multi-write-commits-in-bounded-chunks)**, whose later chunks write every match they
+> reach: a keyed request's later chunks leave a match written after the request's first write (item 4). **Amends
+> [ADR-192](#adr-192--a-request-that-commits-more-than-once-keeps-going-after-its-first-commit-and-a-failure-after-it-says-what-landed)**,
+> whose `partially_applied` a client could only recover with a marker of its own: a keyed one is recovered by sending
+> it again with its key. Two tables are added (`idempotency`, `idempotency_by_stamp`) and two backup tags (12, 13),
+> which are a backup rollback boundary. No `kimmy.format` schema (still 5), `I_EPOCH`, existing codec or entry kind
+> changes. One configuration key (`cluster.idempotency_keys`), five optional wire fields, one facts field, two error
+> codes, a capability, a version field and a response header are added.
+
+**The case.** A write has three outcomes: it happened, it did not, or it is not known whether it did, which a client
+meets as `500 outcome_unknown` or, more often, as a connection that closed after the request was sent, because a member
+whose own fsync fails stops (ADR-188). Until now a client could send again only a write that was idempotent already (a
+client `_id`, an `if_stamp`, a complete replace): an insert with a server-assigned `_id` or a `$inc` had to be read back
+first, and a `multi: true` request answered `partially_applied` (ADR-192) needed a marker of the client's own in the
+request. The draft that standardises the header (draft-ietf-httpapi-idempotency-key-header-07, expired, no RFC) assumes
+one resource state. A leaderless cluster has one per member, and the member most likely to hold the only copy of a write
+whose outcome is unknown is the one that has just stopped. So a key has to be remembered with the write itself, travel
+with it, and not be offered while any member could carry the write without it.
+
+**Decision.**
+
+1. **The contract** (`kimmy-core` `IdempotencyKey`, `kimmy-api`). A document write may carry `Idempotency-Key`, an RFC
+   9651 String of 16 to 255 printable ASCII characters once unescaped, with no parameters; the MCP tools `insert`,
+   `insert_many`, `update` and `delete` take the same value as the argument `idempotency_key`. The routes that take it
+   are insert, bulk, replace and delete by id, update, `find_and_modify` and delete. **Every other route refuses it with
+   `400`**, the health probes, `/metrics`, `/v1/version`, login and `/mcp` itself included, and so do `update` and
+   `delete` with `explain: true`: a client that believes it is protected and is not is worse off than one told no
+   (ADR-121, ADR-124). A key belongs to a principal (`principal_key`, its name) and a collection, and is remembered
+   under SHA-256 over a domain tag, the principal and the key; the key itself is never stored. A retry is the same
+   request when its fingerprint is: SHA-256 over the method, the route template, the path and query as sent and the
+   body bytes as sent (a delete by id hashes an empty body; an MCP call, the tool and its typed arguments without the
+   key). The same request replays the first answer, status and body, with `Idempotency-Replayed: ?1` (on MCP,
+   `"kimmydb/idempotency-replayed": true` in the result's `_meta`), and writes nothing; another request under a
+   remembered key is `422 idempotency_key_reused`, `retry: no`; a duplicate of a `multi: true` request still running on
+   this member is `409 idempotency_key_in_flight`, `retry: wait`, `Retry-After: 1`. A request that changed nothing
+   (refused, matched nothing, unchanged under ADR-208) leaves no record, so its retry is evaluated again. Authorization
+   runs before the record is read, so a revoked grant is `403`, never a replay. A keyed insert without `_id`, each bulk
+   position and a `find_and_modify` upsert's seed get a **derived `_id`**: a UUID version 8 built as RFC 9562 Appendix
+   B.2 builds a name-based one, over the collection id, the scope, the request's fingerprint and the position, stored as
+   its 36-character string. Two applications of one request on two members then land on one document key, and a key
+   reused for another request derives another `_id` and never replaces a document. A key is remembered
+   `storage.oplog_retention_secs` after the record's `last` commit, the window in which the write itself replicates by
+   pull, published as `idempotencyWindowSecs` on `GET /v1/version`; `idempotency-keys` is listed while the member takes
+   keys. **The order of the refusals:** the route's refusal and a malformed key's are made before authentication, as a
+   query string's is, since they read the header and the route and nothing else; the gate (item 7) is asked after
+   authentication and **before authorization**, in the extractors that read the body (and in the MCP tool before it
+   runs), so a keyed request with no token is `401`, and one from a principal without the write grant meets the gate's
+   `400` before RBAC's `403` (the gate can name a member, and any authenticated principal can read node ids on
+   `/v1/topology` already); `explain`'s refusal is made after authorization, since only the body says it. Where this
+   departs from the draft: the error envelope is KimmyDB's (ADR-057) and carries no `Link`; single-transaction
+   duplicates are serialised by the writer, not refused `409`; a request that changed nothing is not recorded; a partly
+   applied request resumes rather than replaying its error; unsupported routes refuse the header; the replay marker is
+   KimmyDB's own, since the draft defines none and without one a client cannot tell a replay from a second application;
+   and a retry on another member is not one resource state (item 5).
+
+2. **The record, in the write's own transaction** (`kimmy-storage`, `idempotency.rs`). Each write path has a keyed twin
+   sharing its body (`insert_keyed`, `insert_many_keyed`, `replace_keyed`, `delete_keyed`, `modify_where_keyed`,
+   `find_and_modify_keyed`), so no unkeyed call site changes. Inside the write transaction it already opens, under the
+   writer, it looks the record up, writes as before and, if it wrote, puts the record and its row by stamp, then commits
+   and publishes. That lookup is the only one, so two duplicates on one member serialise there. `idempotency` maps
+   `(collection id, scope hash)` to the record; `idempotency_by_stamp` maps a 26-byte stamp, in the oplog key's shape,
+   to collection id ‖ scope hash, one row at each record's merged `last` and, on a receiver, one at each carrying stamp
+   a frame names, so a sender finds the record of an entry it ships by the entry's stamp. Both are created at open with
+   no schema bump, as `oplog_witnessed` and `live_digests` were. The record has its own codec behind a leading version
+   byte (`RECORD_FORMAT` 1): the fingerprint; `first`, the first entry the request wrote (after a merge, the smallest of
+   its attempts'); `last`, the latest commit that changed it; the origin member; `applying` or `done`; and the outcome
+   the first answer is rendered from, through the function that rendered it (an insert's stamp, a bulk's stamps, a
+   replace's flags, a delete's count, a filtered write's cumulative counts, `commits`, cursor and whether it resumed, a
+   `find_and_modify`'s flags, upserted `_id` and returned document), never the response bytes, which would tie a record
+   to one build's rendering. Insert and bulk records keep no ids: a replay's body is the same, and a derived `_id` is
+   derived again, which keeps a large-id bulk's record, and its frame, small. A record is replayed only to its own kind
+   of request; another kind is a key reused. Under `durable` the commit fsyncs before the writer is released, so a later
+   lookup sees only a durable record. Under `coalesced` a replay takes a coalescing ticket while it holds the writer and
+   waits for the flush that covers the record, answering `outcome_unknown` if that flush fails, as the first attempt's
+   commit would: without the barrier a duplicate could be told `200` for a write the next flush then fails to make
+   durable.
+
+3. **The life rule.** A record is judged by its `last`. It is absent when `Engine::is_history` says its collection's
+   drop tombstone or incarnation floor covers `last`, the rule documents are judged by, so a name dropped and created
+   again never replays a record of the earlier life; by `last` and not `first`, because ADR-231 and ADR-236 keep the
+   chunks a request wrote after a drop, and judged by `first` their record would be ignored and a retry would write
+   them again. It is absent once `last` is past the window, at the cutoff the retention pass collects at, so no record
+   is replayed past the window that removes it. An absent record is overwritten by the next store, never merged with.
+   **A keyed delete by id replays only while its own tombstone stands**, or a later version over it (the document's row
+   carries a stamp at or above the delete's); after that it runs afresh. **A filter delete and a `find_and_modify`
+   removal carry no check of their own: they rely on the start check that refuses `storage.tombstone_retention_secs`
+   shorter than `storage.oplog_retention_secs`** ([ADR-085](#adr-085--tombstones-outlive-the-oplog-and-a-stale-rejoiner-is-named-not-refused),
+   `tombstone_retention_shorter_than_the_oplog_window_is_rejected`), so the tombstones they wrote are kept at least as
+   long as their record is replayed. One edge: a multi-chunk delete's record is aged by its last chunk, so an earlier
+   chunk's tombstones can be collected before the record by up to the request's own span, its first commit to its last;
+   a replay is the first answer, not the current state, and stays true of the first attempt.
+
+4. **A keyed write past one chunk** (amends ADR-086). A keyed `update` or `delete` by filter writes its record
+   `applying` with its first chunk, updates it in each later chunk's transaction, and writes `done` with the chunk that
+   ends the request, or in one record-only commit when the end is found by a chunk that writes nothing. While it runs,
+   its `(collection, scope)` is in an in-process set, inserted before the first chunk waits for the writer and removed by
+   an RAII guard on every exit, so a duplicate here is `409` and a panic cannot leave the key refused until a restart. A
+   retry of an `applying` record that is not running here **resumes**: after the record's cursor only when the record's
+   origin is this member (another member's cursor would skip documents that attempt never saw), otherwise from the
+   beginning, writing a match only when its stored stamp is below the record's merged `first`, and counting the rest in
+   a cumulative `skipped`, with `resumed: true`. **The stamp rule holds on every chunk after a record exists, a fresh
+   attempt's later chunks included** (Chris, 2026-10-17, as built). The reason: in a leaderless cluster two attempts of
+   one request can run on different members at once, a retry sent elsewhere while the first still runs or before its
+   writes have arrived there. Each writes at or above its own `first`, and once their records merge the merged `first`
+   is the smaller, so the rule leaves whatever either wrote. That is what keeps invariant I1 of the design's model, that
+   no application of a request writes on a version that already contains it, so a keyed `$inc` lands once per document.
+   The cost: a match another client changed after the request's first write is left as that change left it, and
+   counted in `skipped`; `skipped` is rendered whenever it is above 0, `resumed` only on a real resume. A client that
+   needs every current match written sends the request without the key, for an update that is idempotent, or uses
+   ADR-192's marker. MongoDB draws the same line from the other side: its retryable writes exclude `updateMany` and
+   `deleteMany` altogether. Unkeyed writes, and keyed ones that fit in one chunk, write every match they reach, as
+   before. A resumed request takes `now` again, so `$currentDate` in its later chunks is later than in its first.
+
+5. **Records travel with their entries** (`kimmy-cluster`, `kimmy-storage` `sync.rs`, `snapshot.rs`). `Entries`,
+   `ReplayEntries` and `Push` gain an optional, leniently read `records` list (collection, scope, carrying stamp,
+   record bytes), filled in the read transaction that read the window, for the stamps the frame ships and only those;
+   the frame fit that answers `BatchTooLarge` counts each record with its entry, and a replay page keeps the records of
+   the entries it keeps. A receiver decodes a frame's records once and stores each in the run transaction that takes
+   (applies or supersedes) **any entry of its collection** in the frame, on **both** outcomes of the merge: a lost write
+   is still a write that happened, and without its record a retry there would apply it again after the version that
+   beat it. Any entry of the collection, not only the carrying one, because `is_history` compares the HLC only and a
+   drop in the same millisecond can judge the first entry history and let later ones apply. A record that is history
+   by the life rule is not stored; an entry judged history stores the frame's records only when one of them is not
+   history; and when no entry of its collection is taken (deferred, or left after a stop) a record is stored when they
+   are re-served. Records **merge as a join**: `first` the smaller, `last` the greater, state, outcome, cursor and origin
+   from the greater `last`, `done` over `applying` at an equal one, so the result does not depend on arrival order. The
+   receiver writes the merged record's rows and witnesses both stamps, so its clock passes `first`, and at open
+   `resume_hlc` takes the last key of `idempotency_by_stamp`, since a record a page stored came with no oplog entry.
+   **Snapshots carry records**: per collection, a records phase in pages of up to 512 ahead of its documents; a page
+   ends at the boundary into a collection with records and never holds one collection's records after another's
+   documents; `SnapshotPage` gains `records` and `SnapshotCursor` a records position, which an older receiver drops, so
+   its sender goes straight to the documents. A whole-database snapshot, a scoped repair and a converge page (ADR-237)
+   store a page's records in the page's transaction; a converge repair ships the collection's records for the whole
+   window ahead of what may be a handful of documents, which is accepted, since a bound on the page's stamps would miss
+   the record of a document written after its transaction's first entry. Records are not in the cut digest (ADR-230):
+   they converge through the frames that carry their entries, and a difference has no repair worth a finding; the two
+   versions of a keyed insert applied on two members are transient there and settle. **A member that has not received
+   a write cannot know its key**, and applies a retry a second time: by id on the same documents, by filter on what the
+   filter selects there, and where both applications started from one version last-writer-wins keeps one, which is the
+   change made once. No member asks its peers first (blind to a member that is down, which is when an outcome is
+   unknown, and the per-write coordination ADR-020 declined), and none refuses what it cannot vouch for (every member is
+   in that state after every write anywhere until it has pulled it). The client's choice, retry on the member that took
+   the write or accept the second application, is documented, with no wait after which a retry elsewhere is safe. **A
+   residual:** a keyed write made on the sender after a collection's records went and before the page holding its
+   document arrives afterwards by pull, with its record; only a scoped repair on a serving member exposes that span,
+   since a whole-database snapshot leaves the member `catching_up` (ADR-202).
+
+6. **Retention, drops, rewinds and backups.** Retention collects records after its oplog step, by a range read of
+   `idempotency_by_stamp` below its cutoff under a read transaction, removing 1,000 rows per commit with the writer
+   released between them (ADR-151). Each row is read again under the writer, and its record goes only when the record's
+   `last` is at or below the row's stamp, so a record a later commit changed is kept and only the row goes. **A record
+   this build cannot decode** (a newer format, or damage) has no `last` to age by: it is absent to every lookup here and
+   goes with the first of its rows to expire, which is at least one window after its first commit, so it never outlives
+   the window; a frame's or a page's undecodable record is dropped on receipt and counted. The drop purger removes a
+   collection's records by its id range after its documents and index entries; a late drop's sweep (ADR-231) removes the
+   records whose `last` is at or before the drop; a database drop buries each collection the same way; the rows a purge
+   leaves name nothing and expire. A rewind removes the records of requests whose every write it discarded, which would
+   replay an answer for a write that no longer exists, and reopens, to resume, one it cut part-way. A backup carries both
+   tables as tags 12 and 13, so a restored member keeps the records of the writes it holds, those it took by snapshot
+   included: without them a retry there would apply on top of a write the backup brought back.
+
+7. **The gate: an operator switch and a live-peer net**, after ADR-238's `cluster.decimal128`. An older release ignores
+   the header and applies the write with a random `_id`, ignores the records it is sent, and serves every origin's
+   entries from its own oplog without them; and an entry a requester's `held` vector covers is never served to it
+   again. So a member of this release that pulls a keyed entry through an older one holds its effect without the record
+   for good, while listing the capability, and a retry there applies on top of it. A member therefore takes keys only
+   while **(a)** its `cluster.idempotency_keys` is true, the operator's declaration that every member runs this release
+   and none will run an older one again (default `true` with clustering off, `false` with it on; read at start, printed
+   by `check-config`; it gates local acceptance only, and records and keyed entries from other members are always
+   stored and applied), **and (b)** every live peer's facts block (ADR-201) says `idempotency_records`, which every
+   member of this release sends as `true` whatever its switch. An absent field or block, or a live peer not heard from
+   yet, counts as not carrying records, so the net fails closed, and a clustered member with `cluster.membership` off
+   refuses keys. It is a net and not a check: a member that is down is not live and is not asked, and a peer restarted
+   on an older release keeps its last block on its peers for up to one lease. Otherwise every keyed route answers
+   `400 bad_request` naming the header and the cause (the switch, or the live member), looks nothing up and writes
+   nothing; the capability is not listed, and the refusal is counted as `gated`. `400`, as ADR-238's gate answers, and
+   not `503` with `retry: wait`, because the condition lasts a whole roll or longer. A record written before the gate
+   closed stays for its window, and a retry replays from it once the gate opens again. A router with no gate installed
+   reads as open, as an uninstalled Decimal128 predicate does; `kimmyd` always installs one. **The procedure:** set the
+   switch only once every member runs this release, as its own configuration change and restart, never in the change
+   that ships the binary. Shipped together, a member down for its upgrade is not in the live set, a keyed write is
+   accepted, and if that member then comes back on 0.51 it relays the write without its record; the net closes the gate
+   once its block is seen, which stops new keyed writes and not that relay.
+
+8. **What it reports.** Two codes: `idempotency_key_reused` (`422`, `no`) and `idempotency_key_in_flight` (`409`,
+   `wait`, `Retry-After: 1`), logged at `INFO` through `request failed`. Six series, bridged to OTLP:
+   `kimmy_idempotency_requests_total{outcome}` (`applied`, `replayed`, `resumed`, `reused`, `in_flight`, `gated`),
+   which counts a keyed request only when it ends in a write's answer or in one of the key's own refusals (a keyed
+   `403`, `404`, `partially_applied` or `outcome_unknown` counts under none, and a fresh keyed request that changed
+   nothing counts as `applied`); `kimmy_idempotency_peer_replays_total`, the replays answered from a record another
+   member wrote; the gauge `kimmy_idempotency_records`, the table's length, which redb keeps in the tree's root;
+   `kimmy_idempotency_records_received_total{via}` (`pull`, `push`, `replay`, `snapshot`, `repair`);
+   `kimmy_idempotency_records_undecodable_total`; and `kimmy_idempotency_records_collected_total`. The engine writes
+   `INFO` "resumed a keyed write that had stopped" and `DEBUG` "replayed a keyed write", where it finds the record and
+   with the record's own origin, and the retention pass's line carries `idempotency_records`. No new `WARN`.
+
+**Where the build departs from the design of record, now the behaviour.** The design (v2.1 of 2026-10-16) was built in
+four parts: storage, the API's front, its wiring to the engine, and replication. Each departure below is the behaviour
+as built and accepted:
+- **Retention's re-check** removes a record whose `last` is at or below the row's stamp, not only at it: a record whose
+  `last` is below an expired row is past its window too, and only its own row at `last` would otherwise remove it.
+- **A keyed delete by id** replays while its tombstone or a later version over it stands, not the tombstone alone.
+- **A record of another kind of request** is a key reused, whatever the fingerprint says.
+- **The stamp rule holds on every chunk after a record exists**, not only on a resume (item 4; Chris).
+- **The engine writes the resume and replay lines**, naming the database, the collection and the record's origin; the
+  API writes neither, which would have written each line twice and could not name the origin a resume read.
+- **An entry judged history** stores the frame's records only when one of them is not history; **a snapshot page ends at
+  the boundary into a collection with records**; **an undecodable record** is dropped on receipt and counted, and one
+  retained goes with the first of its rows to expire; a test switch (`set_test_strip_records`) makes a member serve
+  without records, as an older release does, for C9.
+- **The route's refusal and the key's syntax are refused before authentication, the gate after it and before
+  authorization.** The design put all three in one layer before authentication, where the gate's refusal named a peer's
+  node id to an unauthenticated caller.
+- **Every route that does not take the header refuses it**, the health probes, `/metrics`, `/v1/version` and login
+  included; a route that does not exist still answers `404`.
+- **`explain: true` with a key** is refused in the executor after authorization, with its own message, since only the
+  body says it.
+- **The MCP replay marker** is `_meta: {"kimmydb/idempotency-replayed": true}`, where the design named none, and an MCP
+  call is fingerprinted over its typed arguments, so `"multi": false` and an omitted `multi` are one call.
+- **A router with no gate installed reads as open**; **`kimmy_idempotency_requests_total` counts as item 8 says**; and
+  **`GET /v1/version` publishes the engine's own window**, so the two cannot disagree.
+
+**Rollback.** The binary rollback target is 0.51.x, and the store stays at schema 5, so 0.51.x opens it. It never opens
+the two tables: its writes, drops and purges leave records untouched, its retention collects oplog entries and not
+records, and its facts block omits the field, so its peers refuse keys once they hear it. **Remove
+`cluster.idempotency_keys` from the configuration first**: 0.51.x refuses to start on a configuration that names it
+(`[cluster]` denies unknown keys). **Once the switch has been set, rolling back any member reopens the gap**: its oplog
+serves the keyed entries accepted before the rollback without their records for the rest of their window, its peers
+still accept keyed writes until they hear its new block (up to one lease), and a retry on a member that pulled such an
+entry through it can apply on top of the first application; setting the switch back to `false` everywhere first stops
+new keyed writes, not that relay. **The backup tags are a backup rollback boundary**: 0.51.x's `kimmyd restore` refuses a
+backup holding a record (tag 12 or 13), naming the table it does not know; a backup of a store holding none restores, and
+a 0.51.x backup restores here with no records. Rolled forward again, a record of a collection the older build dropped is
+ignored by the life rule and collected by age, and nothing is rebuilt: the tables are never derived from the oplog.
+**An undecodable record is aged by its first row in `idempotency_by_stamp`, so it can be removed early**, before its
+own window has passed. That costs something only after a rollback to this release from a build with a newer record
+format and a roll forward inside the window, where the newer build no longer finds the record and applies a retry
+afresh; and a rollback already reopens the gap. A rollback below 0.51.x crosses ADR-238's schema-5 boundary, which this
+leaves as it was.
+
+**Alternatives rejected.** Records only on the member that took the write: a retry on any member that received the
+write would apply on top of its own effect, and last-writer-wins would make the double cluster-wide. A new entry kind
+for records: an older member fails the whole frame on an unknown `OpKind`, so a roll would stop replication. A field
+inside `OplogEntry`: an older member re-encodes entries and drops it, and it touches over a hundred struct literals. A
+check across members before applying (ask the peers, a quorum): blind to a member that is down, and the per-write
+coordination ADR-020 declined. Storing the response bytes: ties a record to one build's rendering. Recording refusals
+and no-ops: a commit and an fsync per refusal to repeat an answer that changed nothing. The draft's `409` for every
+concurrent duplicate: the writer already serialises single-transaction ones and both can be answered truthfully. A
+random `_id` for keyed inserts: a cross-member duplicate leaves two documents for good, which the digest cannot see. A
+key per document for bulk and update-many: N keys for documents the client cannot address one by one. Keys on schema
+changes: their retries already say what an earlier attempt did, and records would need DDL's own apply path. A separate
+retention setting: a second window to size, with no use while it outlives the one the write replicates in. Accepting
+and ignoring the header where unsupported: a client would believe it is protected. Problem details for the new errors:
+the envelope is the protocol (ADR-057). Records in the cut digest: a difference has no repair worth a finding. A resume
+driven by the cursor alone: a stale cursor re-applies to documents already written. The stamp rule on resumes only: two
+attempts running at once on two members would each write what the other had. Accepting keyed writes during a mixed roll
+and documenting the double: an upgraded member that pulled a keyed entry through an older one holds its effect without
+the record for good, while it lists the capability. `503` with `retry: wait` for the gate: the condition lasts a roll.
+The live-peer net without the switch: blind to a member that was down at the write and comes back on an older release.
+
+**Tests.** `kimmy-core`: golden vectors for the scope hash and the derived `_id` against an independent computation, and
+the construction against RFC 9562 B.2's published vector. `kimmy-storage` (`idempotency_tests.rs`): the codec pinned, a
+newer record skipped and a malformed one refused, the merged `first` the earliest attempt's, a replay per write path, a
+reused key refused writing nothing, a delete replayed only while its tombstone stands, a record of an earlier life never
+replayed and judged by its `last`, one past its window absent, the coalesced barrier (F3) and a durable replay paying no
+fsync, a keyed insert whose fsync fails replaying after the repair (F1) and one whose first write fails applying once
+(F2), records surviving restarts under both classes (F6), the multi-chunk record and the record-only `done`, a request
+failed at its second chunk (F4) and one stopped between chunks (F5) resuming, a multi-chunk request across crashes
+writing each document once, the in-flight duplicate, another member's attempt resumed writing each document once, a
+later chunk leaving what another attempt wrote meanwhile, retention one window after `last` (F7), with nothing else to
+do, stopped between chunks and without the row at `last`, the clock above every record after a restart, the drop purge,
+a database drop, a late drop's sweep, a rewind and a backup. `kimmy-storage` (`idempotency_repl_tests.rs`): a window's
+records only those of the entries it ships and read in its own transaction, C1, C4, C5 (stored on a loss), C2, stored
+with any entry of the collection and waiting for one, a history record not stored and an undecodable one dropped, C6's
+records phase ahead of the documents and across pages, an older receiver skipping it, the repair and converge pages, and
+an undecodable record going with its row. `kimmy-cluster` (`tests/idempotency.rs`, in process over real sockets): C1
+pulled and pushed, C2, C3, C5, C6 with more records than a page, C8, C9 (a live member that does not carry records
+closes the gate; with the gate removed the schedule ends at base + 2), and a fresh multi-chunk request racing writers on
+two members; C7 as the version-boundary decodes beside the protocol. `kimmy-api` (`tests/idempotency.rs`): the header's
+syntax, the route guard against `openapi.yaml`, the gate with the switch off and with an older or unheard peer, an
+unauthenticated keyed request `401` and not counted as gated, a replay of every keyed route byte for byte, the derived
+`_id` and its echo, scope per principal, a revoked grant refused before the record, the in-flight `409`, the resume
+answer, and a fresh multi-chunk request's `skipped` without `resumed`. `kimmy-mcp`: each keyed tool replayed with the
+`_meta` marker and a reused key refused. `kimmyd`: the switch's defaults and its refusal of a misspelt key, the facts
+field, the gate across a cluster, and a keyed write whose own fsync fails answered by its replay after the restart.

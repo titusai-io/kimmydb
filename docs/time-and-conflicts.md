@@ -178,6 +178,56 @@ Per-field LWW or a CRDT would preserve both. The tradeoff was made explicitly â€
 see [Decisions](decisions.md) â€” and `merge_policy` is the intended extension
 point if the semantics need to change later.
 
+### A keyed write applied twice is one version
+
+A write sent with an `Idempotency-Key` that reaches a member which has not yet
+received its first application is applied there a second time
+([HTTP API](http-api.md#a-retry-on-another-member)). Last-writer-wins does not
+know about keys: the second application is an ordinary concurrent write with its
+own stamp. What makes it harmless is that it targets the same document key.
+
+- **A keyed insert without `_id` gets an `_id` derived from the key and the
+  request**, not a random ObjectId: a UUID version 8 over the collection, the
+  key's scope, the request's fingerprint and the document's position, stored as
+  a string. Both applications land on one key, and the merge keeps one version.
+  With a random `_id` they would be two documents for good, and the cut digest
+  could not see them: both members would hold both. The fingerprint is in the
+  derivation so that a key reused for a different request derives a different
+  `_id` and never replaces a document another request wrote.
+- **By id** (replace, delete, a client `_id`) the two applications target the
+  same document already. Where both started from the same version, the version
+  the merge keeps is the change made once: a keyed `$inc` lands once.
+- **By filter** the second application targets what the filter selects on the
+  member it reaches, which can be different documents, and then both changes
+  stand. A later write that the second member had not seen can be lost to it, as
+  to any concurrent write.
+
+In the cut digest ([ADR-230](decisions.md)) the two versions are transient: each
+member holds its own until both have witnessed both stamps, and then both hold
+the later one.
+
+### Idempotency records merge as a join
+
+A keyed write's record ([Storage](storage.md#idempotency-records)) is not a
+document and is not merged by stamp: two records of one key, from two
+applications on two members, merge field by field, so the result does not depend
+on the order they arrive in.
+
+- `first`, the stamp of the request's first write, is the **smaller** of the two;
+- `last`, its latest commit, is the **greater**;
+- the state, the outcome, the cursor and the origin come from the record with the
+  greater `last`, and at an equal `last`, `done` beats `applying`.
+
+Two applications therefore converge to one record: the outcome of the later one,
+whose document version last-writer-wins also keeps, and the earliest `first` of
+any attempt. That `first` is what a resumed `multi: true` request reads: it
+writes a match only if the match's stamp is below it, and every attempt wrote at
+or above its own `first`, so once the records have met no attempt writes what
+another wrote. Keeping the winner's `first` instead would drop the earlier
+attempt's, and a later resume would write that attempt's documents again
+([ADR-240](decisions.md)). The rule needs every member's clock past `first`, so a
+member that stores a record witnesses its stamps, as applying an entry does.
+
 ---
 
 ## Tombstones
@@ -249,6 +299,14 @@ HlcClock::resuming_from(resumed)
 
 Without this, a restart would mint stamps *below* ones already on disk, and a
 document rewritten after the restart could lose to its own older version.
+
+The resumed clock is the highest of several stamps the store holds, not the oplog
+tail alone: the version vectors, the metadata's stamps (ADR-233), and the last key
+of `idempotency_by_stamp`, the highest stamp any idempotency record carries. A
+record a snapshot or repair page stored came with no oplog entry here, and a
+resumed `multi: true` request writes only above its record's `first`, so a clock
+resumed below that record would let a resume write a document twice
+([ADR-240](decisions.md)).
 
 ---
 

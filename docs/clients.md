@@ -158,6 +158,25 @@ where it stopped instead of applying again. What a client must do to rely on it:
   falls outside an `_id` range over them.
 - **`409 idempotency_key_in_flight`** means the same request is still running
   there: wait (`Retry-After: 1`) and send it again to the same member.
+- **Read the marker.** `Idempotency-Replayed: ?1` (on MCP,
+  `"kimmydb/idempotency-replayed": true` in the result's `_meta`) says the
+  answer is the first attempt's, read from its record: its `stamp` names the
+  version that attempt produced, which may have moved on since, so an
+  `if_stamp` built from it can be `409 stale`. A keyed answer without the marker
+  was applied by this attempt, and on a member other than the one that took the
+  first attempt that can be a second application.
+- **A `multi: true` update or delete sent again with its key resumes**: its
+  counts are cumulative over the attempts, and the matches it left because they
+  changed after its first write are counted in `skipped`, with `resumed: true`.
+  A keyed request past one chunk leaves such matches on its first attempt too.
+  To have every current match written, send it without the key, if the update
+  is idempotent ([HTTP API](http-api.md#a-keyed-write-past-one-chunk)).
+- **A `400` naming `Idempotency-Key` and the cluster** (the member does not take
+  keys now: its `cluster.idempotency_keys` is off, or a live member does not
+  carry records) wrote nothing and looked nothing up. A record written before
+  the member stopped taking keys stays for its window, and the retry replays from
+  it once the member takes them again; until then the rules above apply. A
+  `400` naming the key's syntax or the route is the client's to fix.
 - A key is remembered for `idempotencyWindowSecs` (`GET /v1/version`), 24 hours
   by default. A retry later than that is a new request.
 
