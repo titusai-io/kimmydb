@@ -28588,7 +28588,7 @@ in bash, one per clause.
 > it again with its key. Three tables are added: `idempotency` and `idempotency_by_stamp`, carried by a backup as tags
 > 12 and 13, which are a backup rollback boundary, and `idempotency_changes`, a node-local change log no backup carries.
 > No `kimmy.format` schema (still 5), `I_EPOCH`, existing codec or entry kind changes. One configuration key
-> (`cluster.idempotency_keys`), six optional wire fields, one facts field, two error codes, a capability, a version
+> (`cluster.idempotency_keys`), nine optional wire fields, one facts field, two error codes, a capability, a version
 > field and a response header are added.
 
 **The case.** A write has three outcomes: it happened, it did not, or it is not known whether it did, which a client
@@ -28732,14 +28732,33 @@ with it, and not be offered while any member could carry the write without it.
      above what it holds of that origin and at or below what the window's end and the sender's own servable vector
      reach (F2), and every live record with a row above both what the requester holds and what the sender's servable
      vector reaches (F3): a row a page or a lost entry left, which no window of the sender would otherwise ever vouch
-     for. A replay page carries its own advance and the F3 records. **A sender ships a record at a row of its own. A
+     for. A replay page carries its own advance and the F3 records, and **every live record of the collections its
+     entries name whose `last` is above the page's start and whose `first` is at or below its end, carried at its
+     `first`** (B2 of the build review, `Engine::records_for_replay_page`): a request whose attempts all ended on
+     other members merges into a record with no row of the restored member's origin, and without them the replay
+     handed that member its own effects bare. Carried at `first`, such a record rides with the first entry of its
+     collection the member takes, so a page that stops between an effect and `last` stores it. **A sender ships a record at a row of its own. A
      row below the record's `first` was left by an earlier life under the same key, and ships nothing.** **Of the
      record's own rows the window finds, it is carried at the lowest**, whichever F3 or an origin read first found:
      carried at a higher one, a batch that stops, or splits into runs, between the two takes the effect at the lower
      row and, by the rule below, stores the record with neither. The frame
      fit counts every record, the F3 records first, each other with the first entry at or after its row; **when the F3
      records alone overfill a frame, the window carries no entries and grants nothing** (`Fits::Nothing`) until the
-     sender has pulled their entries, and the sender logs it at `WARN`.
+     sender has pulled their entries, and the sender logs it at `WARN`. **When no entry fits with the records riding
+     the first** (m1 of the build review), a pull is answered with a partial window of records alone: the F3 records
+     and, in carrying order, the riders that fit, ending just before the first left out (or before the first entry),
+     so it grants coverage only below the rows of what it carries and the next window carries the rest; a push sends
+     nothing and leaves the change to anti-entropy; a replay page carries records alone, in key order, at the same
+     position under a **records cursor** (`AskEntries::replay_records`, `Entries::replay_records`): the position, the
+     page's end and collections, the key of the last record sent, and the sender's change log as `{key, epoch}`, the
+     shape of a snapshot cursor's `records_base`. The next page at the position carries no entry past the cursor's
+     end, sends nothing of the cursor's set at or before its key that the log does not name as changed since its
+     base, sends every record the log does name, and so goes on until what is left fits with the entries; a cursor
+     of another epoch starts the position's records over. The inbound way keeps the cursor of the last page a peer
+     acknowledged, across contacts, in memory; the outbound way keeps the one of the last page it stored. **A frame
+     or page that cannot carry even that** (one record, or the F3 records, larger than a frame; a pull that cannot
+     take a partial window, or whose window would not end past where it began) is logged at `WARN` and counted in
+     `kimmy_idempotency_records_unfit_total{path}`.
    - **The receiver stores on coverage.** **A receiver stores a frame's record with the first entry it takes at or
      after the record's row, or in the batch's last transaction**, the one that raises its witnessed vector, whether or
      not an entry of the record's collection was taken and whether or not the collection stands here: a stamp a window
@@ -28753,7 +28772,13 @@ with it, and not be offered while any member could carry the write without it.
      costs no commit where nothing else is written, as a page whose documents all lose costs none (ADR-152).
    - **The wire.** `Entries`, `ReplayEntries` and `Push` carry an optional, leniently read `records` list (collection,
      scope, `carrying`, record bytes). It may carry records that ride no shipped entry, and `carrying` names the
-     sender's row. An older receiver ignores it.
+     sender's row. An older receiver ignores it. **`AskEntries` gains `replay`**, a `bool` read as `false` when
+     absent and not written when false: the outbound replay (the restored member asking a peer, `replay_own_origin`)
+     sets it, and the sender cuts its answer as a replay page, sized to the frame by the sender, with B2's records.
+     A 0.51 sender ignores it and answers the window as a pull, which is safe: 0.51 holds no records, and keyed
+     writes are taken only while every live member says it carries records. **`AskEntries` and `Entries` gain an
+     optional, leniently read `replay_records`**, the records cursor above, which an older build ignores and an
+     older sender never sends.
    - **Snapshots carry records.** Per collection, a records phase in pages of up to 512 goes ahead of its documents; a
      page ends at the boundary into a collection with records and never holds one collection's records after another's
      documents; `SnapshotPage` gains `records` and `SnapshotCursor` a records position, which an older receiver drops,
@@ -28850,11 +28875,13 @@ with it, and not be offered while any member could carry the write without it.
    nothing counts as `applied`); `kimmy_idempotency_peer_replays_total`, the replays answered from a record another
    member wrote; the gauge `kimmy_idempotency_records`, the table's length, which redb keeps in the tree's root;
    `kimmy_idempotency_records_received_total{via}` (`pull`, `push`, `replay`, `snapshot`, `repair`);
-   `kimmy_idempotency_records_undecodable_total`; and `kimmy_idempotency_records_collected_total`. The engine writes
+   `kimmy_idempotency_records_undecodable_total`; `kimmy_idempotency_records_unfit_total{path}` (`pull`, `push`,
+   `replay`), the frames and pages that could not carry the records they must (item 5); and
+   `kimmy_idempotency_records_collected_total`. The engine writes
    `INFO` "resumed a keyed write that had stopped" and `DEBUG` "replayed a keyed write", where it finds the record and
    with the record's own origin, and the retention pass's line carries `idempotency_records`. A sender logs at `WARN`
-   when the records it cannot vouch for by its oplog do not fit one frame or one replay page (item 5), and at `INFO` a
-   records-only snapshot page and a cursor's base of another log.
+   when the records a frame or a replay page must carry do not fit one (item 5), and at `INFO` a records-only
+   snapshot page, a partial window or a replay page of records alone, and a cursor's base of another log.
 
 **Where the build departs from the design of record, now the behaviour.** The design (v2.1 of 2026-10-16) was built in
 four parts: storage, the API's front, its wiring to the engine, and replication. Each departure below is the behaviour
