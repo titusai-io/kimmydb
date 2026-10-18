@@ -1668,7 +1668,9 @@ fn a_record_whose_row_at_last_is_missing_is_still_collected() {
 
 /// A record stored from a sender whose clock is ahead is folded into the clock,
 /// and after a restart the clock resumes above it: the last key of the rows by
-/// stamp is in the high water at open.
+/// stamp is in the high water at open. After a restart the change log's high
+/// water is above it too (its key was minted after the record was witnessed); after
+/// a restore, which does not carry the log, only the rows' is.
 #[test]
 fn the_clock_resumes_above_every_record_after_a_restart() {
     let (engine, coll, _dir, path) = open();
@@ -1694,6 +1696,15 @@ fn the_clock_resumes_above_every_record_after_a_restart() {
     drop(engine);
     let (engine, _) = reopen(&path);
     assert!(engine.next_stamp() > ahead, "and after a restart");
+    // A restore carries the records and not the change log, which begins again: the
+    // records' own high water is what the clock resumes above there.
+    let mut buf = Vec::new();
+    engine.backup_to(&mut buf, WalkScope::Request).unwrap();
+    let dest = tempfile::tempdir().unwrap();
+    let restored = dest.path().join("restored.redb");
+    crate::backup::restore(&restored, &mut buf.as_slice()).unwrap();
+    let (engine, _) = reopen(&restored);
+    assert!(engine.next_stamp() > ahead, "and after a restore");
 }
 
 // -- Purge, sweep, rewind, backup --------------------------------------------------------------

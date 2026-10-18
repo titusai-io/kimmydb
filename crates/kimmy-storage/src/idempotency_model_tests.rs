@@ -3719,6 +3719,44 @@ fn row_r1b_a_peer_takes_a_page_from_the_receiver_mid_pull() {
     );
 }
 
+/// R2, by page: a member serving a scoped pull takes a keyed write's effect and record
+/// by a page of its own scoped pull from the writer, between two pages it serves; the
+/// effect reaches the requester on a later page, and its record must ride that page's
+/// delta (the page store writes a change-log row). A retry on the requester must replay.
+#[test]
+fn row_r2_a_record_taken_by_page_rides_the_next_page_its_member_serves() {
+    row(
+        "r2-page",
+        3,
+        vec![req(1, Kind::IncBig { d: 0 }), req(2, Kind::IncBig { d: 1200 })],
+        vec![
+            big(A),
+            ask(0, A, 100),
+            scoped(B, A, BIG, Vec::new()),
+            scoped(C, B, BIG, vec![(1, vec![ask(1, A, 110), scoped(B, A, BIG, Vec::new())])]),
+            ask(1, C, 130),
+        ],
+    );
+}
+
+/// R2, by frame: as above, with the serving member taking the write by a pulled window
+/// (the frame store writes a change-log row).
+#[test]
+fn row_r2_a_record_taken_by_frame_rides_the_next_page_its_member_serves() {
+    row(
+        "r2-frame",
+        3,
+        vec![req(1, Kind::IncBig { d: 0 }), req(2, Kind::IncBig { d: 1200 })],
+        vec![
+            big(A),
+            ask(0, A, 100),
+            scoped(B, A, BIG, Vec::new()),
+            scoped(C, B, BIG, vec![(1, vec![ask(1, A, 110), pull(B, A)])]),
+            ask(1, C, 130),
+        ],
+    );
+}
+
 /// R1c: a whole-database snapshot whose later page brings an effect whose record came
 /// after the collection's records phase; a retry at completion (what the catching-up
 /// gate allows once it opens as `unknown`) must replay.
