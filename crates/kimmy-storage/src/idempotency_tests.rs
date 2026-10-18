@@ -1225,6 +1225,79 @@ fn f5_a_keyed_request_stopped_between_chunks_resumes() {
     assert_eq!(ns(&engine, &coll, 3), vec![1, 1, 1]);
 }
 
+/// A short chunk that writes nothing ends a keyed request whose record stands,
+/// and marks it `done` in a commit of the record alone. Here the first attempt
+/// stopped after its first chunk, two documents of three, and the third was
+/// written by another write before the retry: the retry resumes, its one chunk
+/// finds the third and leaves it by the stamp rule, and the request ends. Left
+/// `applying`, every later retry would resume again rather than replay.
+#[test]
+fn a_resume_whose_short_last_chunk_writes_nothing_marks_the_record_done() {
+    let (engine, coll, _dir, path) = open();
+    counters(&engine, &coll, 3);
+    engine.set_multi_chunk_docs(2);
+    let engine = Arc::new(engine);
+    let k = keyed(98);
+    let stopper = Arc::clone(&engine);
+    crate::sync::race_hooks::at(crate::sync::race_hooks::Race::BetweenChunks, move || {
+        stopper.set_stopping();
+    });
+    let failed = engine.modify_where_keyed(&coll, &Candidates::Scan, &Inc, None, &k);
+    assert!(matches!(failed, Err(StorageError::PartiallyApplied { .. })), "{failed:?}");
+    drop(engine);
+    let (engine, coll) = reopen(&path);
+    engine.set_multi_chunk_docs(2);
+    assert_eq!(record(&engine, &coll, &k).unwrap().state, RecordState::Applying, "premise");
+    // Another write to the third document, after the request's first.
+    engine.replace(&coll, &DocId::Int64(2), doc! { "n": 10i64 }, false).unwrap();
+
+    let out = fresh(engine.modify_where_keyed(&coll, &Candidates::Scan, &Inc, None, &k).unwrap());
+    assert!(out.resumed);
+    assert_eq!((out.matched, out.modified, out.skipped), (2, 2, 1));
+    assert_eq!(record(&engine, &coll, &k).unwrap().state, RecordState::Done);
+    replayed(engine.modify_where_keyed(&coll, &Candidates::Scan, &Inc, None, &k).unwrap());
+    assert_eq!(ns(&engine, &coll, 3), vec![1, 1, 10]);
+}
+
+/// The two lines `docs/operations.md` publishes for a keyed write, at the
+/// levels it gives them: a resume at `INFO`, with the collection and the counts
+/// it carries on from, and a replay at `DEBUG`, below what an operator's
+/// default `INFO` shows.
+#[test]
+fn a_resume_logs_at_info_and_a_replay_below_it() {
+    let (engine, coll, _dir, path) = open();
+    counters(&engine, &coll, 3);
+    let engine = Arc::new(engine);
+    let k = keyed(96);
+    let stopper = Arc::clone(&engine);
+    crate::sync::race_hooks::at(crate::sync::race_hooks::Race::BetweenChunks, move || {
+        stopper.set_stopping();
+    });
+    let failed = engine.modify_where_keyed(&coll, &Candidates::Scan, &Inc, None, &k);
+    assert!(matches!(failed, Err(StorageError::PartiallyApplied { .. })), "{failed:?}");
+    drop(engine);
+    let (engine, coll) = reopen(&path);
+    engine.set_multi_chunk_docs(1);
+
+    let (out, logs) = crate::log_capture::logged(|| {
+        fresh(engine.modify_where_keyed(&coll, &Candidates::Scan, &Inc, None, &k).unwrap())
+    });
+    assert!(out.resumed);
+    let line = logs
+        .lines()
+        .find(|line| line.contains("resumed a keyed write that had stopped"))
+        .unwrap_or_else(|| panic!("a resume logs its line at INFO:\n{logs}"));
+    assert!(line.contains(" INFO "), "{line}");
+    for field in ["db=shop", "collection=orders", "matched=1", "modified=1", "skipped=0"] {
+        assert!(line.contains(field), "{field} in {line}");
+    }
+
+    let (_, logs) = crate::log_capture::logged(|| {
+        replayed(engine.modify_where_keyed(&coll, &Candidates::Scan, &Inc, None, &k).unwrap())
+    });
+    assert!(!logs.contains("replayed a keyed write"), "a replay logs at DEBUG:\n{logs}");
+}
+
 /// How a test crashes a request between two of its commits.
 #[derive(Clone, Copy, Debug)]
 enum Crash {
@@ -1543,6 +1616,47 @@ fn f7_retention_collects_a_record_one_window_after_its_last() {
     assert_eq!(rows(&engine).iter().filter(|(s, ..)| *s == page_record.last).count(), 1);
     let pass = engine.collect_garbage_at(6_000 + DAY_MS + 1, policy).unwrap();
     assert_eq!(pass.records_removed, 1);
+}
+
+/// A record is judged by its `last` at whichever of its rows retention reaches,
+/// not only at its `first`: a three-chunk request, ten seconds between chunks,
+/// keeps a row at its second chunk's entry that is neither its `first` nor its
+/// `last`. When that row expires, the record, whose `last` is still inside the
+/// window, stays, and a retry replays.
+#[test]
+fn a_record_stays_when_a_row_between_its_first_and_last_expires() {
+    fn later_by(engine: &Engine, ms: u64) {
+        let now = crate::physical_now_ms() + ms;
+        engine.advance_clock_past(&Stamp::new(Hlc::new(now, 0), engine.node_id()));
+    }
+    let (engine, coll, _dir, _path) = open();
+    let policy = RetentionPolicy::new(DAY, DAY);
+    counters(&engine, &coll, 3);
+    let engine = Arc::new(engine);
+    let k = keyed(97);
+    let mover = Arc::clone(&engine);
+    crate::sync::race_hooks::at(crate::sync::race_hooks::Race::BetweenChunks, move || {
+        later_by(&mover, 10_000);
+        crate::sync::race_hooks::at(crate::sync::race_hooks::Race::BetweenChunks, move || {
+            later_by(&mover, 20_000);
+        });
+    });
+    fresh(engine.modify_where_keyed(&coll, &Candidates::Scan, &Inc, None, &k).unwrap());
+    crate::sync::race_hooks::clear();
+    let stored = record(&engine, &coll, &k).unwrap();
+    let held: Vec<Stamp> = rows(&engine).iter().map(|(s, ..)| *s).collect();
+    assert_eq!(held.len(), 3, "premise: a row at each chunk's entry: {held:?}");
+    let (first, middle, last) = (held[0], held[1], held[2]);
+    assert_eq!((stored.first, stored.last), (first, last), "premise");
+    assert!(last.hlc.wall_ms >= middle.hlc.wall_ms + 10_000, "premise: {held:?}");
+
+    let pass = engine.collect_garbage_at(middle.hlc.wall_ms + DAY_MS + 1, policy).unwrap();
+    assert_eq!(pass.records_removed, 0, "its `last` is inside the window");
+    assert_eq!(record(&engine, &coll, &k), Some(stored));
+    let left: Vec<Stamp> = rows(&engine).iter().map(|(s, ..)| *s).collect();
+    assert_eq!(left, [first, last], "the expired row goes, the one at `first` stays (F1)");
+    replayed(engine.modify_where_keyed(&coll, &Candidates::Scan, &Inc, None, &k).unwrap());
+    assert_eq!(ns(&engine, &coll, 3), vec![1, 1, 1]);
 }
 
 /// The records step runs whatever the oplog step found (the manager's guard):
