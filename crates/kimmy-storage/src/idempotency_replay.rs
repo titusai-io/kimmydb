@@ -33,6 +33,7 @@ use crate::engine::Engine;
 use crate::error::Result;
 use crate::snapshot::RecordsBase;
 use crate::tables::IDEMPOTENCY;
+use crate::walk::{WalkScope, open_walk_table};
 
 /// Where a replay's pages of records alone stand at one replay position (m1 of
 /// the build review): what the next page at that position goes on after.
@@ -148,6 +149,8 @@ impl Engine {
         self.replay_records_in(&txn, collections, from, through)
     }
 
+    /// Stop-aware: a replay page is served to no client, and a node's stop ends
+    /// its read of the page's collections' records between two of them.
     fn replay_records_in(
         &self,
         txn: &ReadTransaction,
@@ -155,7 +158,7 @@ impl Engine {
         from: Hlc,
         through: Hlc,
     ) -> Result<Vec<CarriedRecord>> {
-        let records = txn.open_table(IDEMPOTENCY)?;
+        let records = open_walk_table(txn, IDEMPOTENCY, self.walk(WalkScope::Background))?;
         let mut ids = collections.to_vec();
         ids.sort();
         ids.dedup();
@@ -165,6 +168,7 @@ impl Engine {
                 let (key, value) = row?;
                 let (_, scope) = key.value();
                 let Some(scope) = ScopeHash::from_slice(scope) else { continue };
+                // not a row: a record's own bytes, which this build may not decode
                 let Ok(Some(record)) = IdempotencyRecord::decode(value.value()) else {
                     continue;
                 };
