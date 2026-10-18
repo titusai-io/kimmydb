@@ -1414,6 +1414,18 @@ async fn a_replay_of_many_pages_is_reported_once_not_once_per_page() {
     })
     .await
     .unwrap();
+    // The member logs the end after it has acked the last page, which the script
+    // returns on: wait for the line rather than race the task that writes it.
+    for _ in 0..500 {
+        let finished = log.lock().unwrap().iter().any(|(l, m)| {
+            *l == tracing::Level::INFO
+                && m.contains("replay of this member's own origin is finished")
+        });
+        if finished {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
     let log = log.lock().unwrap();
     let said = |needle: &str, level: tracing::Level| {
         log.iter().filter(|(l, m)| *l == level && m.contains(needle)).count()
