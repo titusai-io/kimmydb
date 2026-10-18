@@ -803,13 +803,7 @@ impl HnswIndex {
         options: &SearchOptions,
         allowed: Option<&HashSet<DocId>>,
     ) -> Result<Vec<Hit>> {
-        // Over-fetch: the per-document cap can collapse several chunks of one
-        // document into a single result, which would otherwise return under k.
-        let over_fetch = (options.k * 4).max(options.k + 10);
-        // A post-filter discards results after the walk, so a selective filter
-        // needs a much wider search to still return k.
-        let wanted = if allowed.is_some() { over_fetch * 8 } else { over_fetch };
-        let keys = self.search_keys(query, wanted)?;
+        let keys = self.search_keys(query, walk_width(options.k, allowed.is_some()))?;
         let old_forms = allowed.map(old_forms).unwrap_or_default();
 
         let mut hits = Vec::with_capacity(keys.len());
@@ -836,6 +830,17 @@ impl HnswIndex {
         }
         Ok(crate::search::rank_hits(hits, options))
     }
+}
+
+/// How many candidates [`HnswIndex::search`] asks the graph walk for, for `k`
+/// hits.
+fn walk_width(k: usize, filtered: bool) -> usize {
+    // Over-fetch: the per-document cap can collapse several chunks of one
+    // document into a single result, which would otherwise return under k.
+    let over_fetch = (k * 4).max(k + 10);
+    // A post-filter discards results after the walk, so a selective filter
+    // needs a much wider search to still return k.
+    if filtered { over_fetch * 8 } else { over_fetch }
 }
 
 /// The 0.50 forms of the admitted documents whose chunk ids changed in 0.51.0
@@ -952,6 +957,32 @@ mod tests {
         fixture: u64,
     ) -> (Engine, CollectionMeta, tempfile::TempDir) {
         const PER_COMMIT: usize = 5_000;
+        // `KIMMY_REACH_LATENT=d` draws each vector from `d` dimensions mapped
+        // into `dim` by one fixed projection, plus a little noise: data of
+        // intrinsic dimension `d`, nearer what an embedding model produces
+        // than `dim` independent coordinates are.
+        let latent: Option<usize> =
+            std::env::var("KIMMY_REACH_LATENT").ok().and_then(|d| d.parse().ok());
+        let projection: Vec<Vec<f32>> = latent
+            .map(|d| (0..dim).map(|row| pseudo_random(0xfeed_0000 + row as u64, d)).collect())
+            .unwrap_or_default();
+        let vector = |i: usize| {
+            let seed = (fixture << 32) | (i as u64 + 1);
+            match latent {
+                None => pseudo_random(seed, dim),
+                Some(d) => {
+                    let z = pseudo_random(seed, d);
+                    let noise = pseudo_random(seed ^ 0x5eed_5eed_5eed_5eed, dim);
+                    projection
+                        .iter()
+                        .zip(noise)
+                        .map(|(row, e)| {
+                            row.iter().zip(&z).map(|(p, x)| p * x).sum::<f32>() + 0.05 * e
+                        })
+                        .collect()
+                }
+            }
+        };
         let dir = tempfile::tempdir().unwrap();
         let engine = Engine::open(&dir.path().join("kimmy.redb")).unwrap();
         engine.create_collection("app", "docs").unwrap();
@@ -966,7 +997,7 @@ mod tests {
                             source: source.clone(),
                             chunk: 0,
                             source_hlc: Hlc::new(1, 0),
-                            vector: pseudo_random((fixture << 32) | (i as u64 + 1), dim),
+                            vector: vector(i),
                             text: format!("document {i}"),
                             config: None,
                         };
@@ -1001,12 +1032,14 @@ mod tests {
         vectors
     }
 
-    /// How many of the graph's points no search can reach: not linked at
-    /// layer 0, directly or through other points, from the entry point or any
-    /// point drawn above layer 0 (where a search's descent ends). The graph's
-    /// own structure, read rather than searched, so a point that is merely
-    /// hard to find at a given effort is not counted.
-    fn cut_off(index: &HnswIndex) -> usize {
+    /// The graph's structure, read rather than searched: how many points have
+    /// no edge into them at layer 0, and how many layer 0 does not link to
+    /// the entry point at all, directly or through other points. Every
+    /// search's walk at layer 0 is a walk along those edges from the point
+    /// its descent ends at, so a point with no edge into it is returned only
+    /// when the descent ends on it, and a point outside the entry point's
+    /// component only from a descent that ends inside its own.
+    fn cut_off(index: &HnswIndex) -> (usize, usize) {
         let n = index.keys.len();
         let mut level = vec![0u8; n];
         let mut edges: Vec<Vec<usize>> = vec![Vec::new(); n];
@@ -1019,11 +1052,23 @@ mod tests {
             level[at] = point.get_point_id().0;
             edges[at] = point.get_neighborhood_id()[0].iter().map(|n| n.d_id).collect();
         }
-        let mut seen = vec![false; n];
-        let mut stack: Vec<usize> = (0..n).filter(|&i| i == 0 || level[i] >= 1).collect();
-        for &i in &stack {
-            seen[i] = true;
+        let mut into = vec![0usize; n];
+        for (at, out) in edges.iter().enumerate() {
+            for &to in out {
+                if to != at {
+                    into[to] += 1;
+                }
+            }
         }
+        let no_edge_in = into.iter().filter(|&&c| c == 0).count();
+        // The entry point is the first point inserted at the top level: the
+        // graph replaces it only on a strictly higher one, and ids are
+        // insertion order.
+        let top = level.iter().copied().max().unwrap_or(0);
+        let Some(entry) = (0..n).find(|&i| level[i] == top) else { return (0, 0) };
+        let mut seen = vec![false; n];
+        seen[entry] = true;
+        let mut stack = vec![entry];
         while let Some(at) = stack.pop() {
             for &to in &edges[at] {
                 if !std::mem::replace(&mut seen[to], true) {
@@ -1031,7 +1076,7 @@ mod tests {
                 }
             }
         }
-        seen.iter().filter(|s| !**s).count()
+        (no_edge_in, seen.iter().filter(|s| !**s).count())
     }
 
     /// How many of the graph's points do not come back for their own vector
@@ -1220,6 +1265,7 @@ mod tests {
         for (dim, count, fixtures, attempts) in grid {
             let mut orphaned = Vec::new();
             let mut cut_offs = Vec::new();
+            let mut no_edges_in = Vec::new();
             let mut lost_wider = Vec::new();
             let mut missed = Vec::new();
             let mut unreachable = Vec::new();
@@ -1237,7 +1283,7 @@ mod tests {
                     // the ones still missing at four times the effort: a
                     // point found there, or linked, is hard to find rather
                     // than lost.
-                    let cut = cut_off(&index);
+                    let (no_edge_in, cut) = cut_off(&index);
                     let wider = (0..index.keys.len())
                         .filter(|&i| {
                             !index.finds_itself(&vectors[&index.keys[i]], i)
@@ -1245,21 +1291,28 @@ mod tests {
                         })
                         .count();
                     println!(
-                        "row,{dim},{count},{fixture},{attempt},{lost},{},{},{},{},{cut},{wider}",
+                        "row,{dim},{count},{fixture},{attempt},{lost},{},{},{},{},{cut},{wider},{no_edge_in}",
                         reach.sampled,
                         reach.missed,
                         reach.unreachable,
                         built.as_millis()
                     );
                     cut_offs.push(cut);
+                    no_edges_in.push(no_edge_in);
                     lost_wider.push(wider);
                     orphaned.push(lost);
                     missed.push(reach.missed);
                     unreachable.push(reach.unreachable);
                 }
             }
-            for v in [&mut orphaned, &mut cut_offs, &mut lost_wider, &mut missed, &mut unreachable]
-            {
+            for v in [
+                &mut orphaned,
+                &mut cut_offs,
+                &mut no_edges_in,
+                &mut lost_wider,
+                &mut missed,
+                &mut unreachable,
+            ] {
                 v.sort_unstable();
             }
             let builds = orphaned.len();
@@ -1268,7 +1321,8 @@ mod tests {
             println!(
                 "dim={dim:<4} n={count:<6} builds={builds:<4} \
                  truly orphaned: median={} max={} ({:.2}%) builds with any={} | \
-                 cut off: max={} | lost at ef 3200: max={} | \
+                 outside the entry's component: max={} | no edge in: max={} | \
+                 lost at ef 3200: max={} | \
                  missed: median={:<3} max={:<3} | unreachable: median={:<3} max={:<3} \
                  >=1:{:<3} >=2:{:<3} >=3:{:<3} >=8:{}",
                 median(&orphaned),
@@ -1276,6 +1330,7 @@ mod tests {
                 100.0 * *orphaned.last().unwrap() as f64 / count as f64,
                 over(&orphaned, 1),
                 cut_offs.last().unwrap(),
+                no_edges_in.last().unwrap(),
                 lost_wider.last().unwrap(),
                 median(&missed),
                 missed.last().unwrap(),
@@ -1614,6 +1669,92 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
+    // Build attempts (ADR-241)
+    // -----------------------------------------------------------------------
+
+    /// What a graph is, named by keys rather than by the ids an insertion
+    /// order assigns: each point's level and its neighbours at every layer.
+    type Shape = std::collections::BTreeMap<String, (u8, Vec<Vec<String>>)>;
+
+    fn shape(index: &HnswIndex) -> Shape {
+        let Graph::Cosine(g) = &index.graph else { unimplemented!("cosine fixtures") };
+        g.get_point_indexation()
+            .into_iter()
+            .map(|point| {
+                let layers = point
+                    .get_neighborhood_id()
+                    .iter()
+                    .map(|layer| {
+                        let mut keys: Vec<String> =
+                            layer.iter().map(|n| index.keys[n.d_id].clone()).collect();
+                        keys.sort();
+                        keys
+                    })
+                    .collect();
+                (index.keys[point.get_origin_id()].clone(), (point.get_point_id().0, layers))
+            })
+            .collect()
+    }
+
+    /// An attempt builds one graph, and each retry another.
+    ///
+    /// hnsw_rs 0.3.5 seeds every graph's level draw with one constant, so the
+    /// same records inserted in the same order build the same graph: the
+    /// first assertion is that property, and the reason the second can fail.
+    /// A retry that kept the order would rebuild the graph it was retrying.
+    #[test]
+    fn an_attempt_builds_one_graph_and_each_retry_another() {
+        let (engine, shadow, _dir) = setup(200, 16);
+        let built = |attempt| {
+            shape(&HnswIndex::build_once(&engine, &shadow, Metric::Cosine, 16, attempt).unwrap().0)
+        };
+        let attempts: Vec<Shape> = (0..=MAX_BUILD_ATTEMPTS).map(built).collect();
+        assert_eq!(built(0), attempts[0], "one attempt, two graphs: the build is not reproducible");
+        for (a, first) in attempts.iter().enumerate() {
+            for (b, second) in attempts.iter().enumerate().skip(a + 1) {
+                assert_ne!(first, second, "attempts {a} and {b} built the same graph");
+            }
+        }
+    }
+
+    /// A build that loses data is retried, each time in that attempt's order,
+    /// and what it returns is the last attempt's graph. A collection of one
+    /// vector repeated loses data in every draw: a probe among hundreds of
+    /// points at distance zero cannot tell itself from the rest, so every
+    /// attempt is judged lost and `build` runs them all.
+    #[test]
+    fn a_build_that_loses_data_retries_in_each_attempts_order() {
+        let dir = tempfile::tempdir().unwrap();
+        let engine = Engine::open(&dir.path().join("kimmy.redb")).unwrap();
+        engine.create_collection("app", "docs").unwrap();
+        engine.configure_vectors("app", "docs", config(4)).unwrap();
+        let shadow = engine.vector_collection("app", "docs").unwrap().unwrap();
+        for i in 0..300 {
+            let source = DocId::Int64(i);
+            let record = VectorRecord {
+                source: source.clone(),
+                chunk: 0,
+                source_hlc: Hlc::new(1, 0),
+                vector: vec![1.0, 0.0, 0.0, 0.0],
+                text: "the same".into(),
+                config: None,
+            };
+            engine.put_vectors(&shadow, &source, &[record]).unwrap();
+        }
+        let (first, reach) = HnswIndex::build_once(&engine, &shadow, Metric::Cosine, 4, 0).unwrap();
+        assert!(
+            reach.unreachable >= REACHABILITY_MAX_UNREACHABLE,
+            "the fixture must lose data in a draw to be retried: {reach:?}"
+        );
+        let last = HnswIndex::build_once(&engine, &shadow, Metric::Cosine, 4, MAX_BUILD_ATTEMPTS)
+            .unwrap()
+            .0;
+        let returned = HnswIndex::build(&engine, &shadow, Metric::Cosine, 4).unwrap();
+        assert_ne!(shape(&returned), shape(&first), "the retries rebuilt the first draw");
+        assert_eq!(shape(&returned), shape(&last), "not the last attempt's graph");
+    }
+
+    // -----------------------------------------------------------------------
     // Chunk ids (ADR-239)
     // -----------------------------------------------------------------------
 
@@ -1634,6 +1775,24 @@ mod tests {
             ids.push(id);
         }
         (engine, shadow, ids, dir)
+    }
+
+    /// The graph's walk of `width` candidates for `query` returns the chunk
+    /// key of each of `documents` (UUIDs, as `uuid_documents` stores them).
+    /// A precondition: a test that asserts on hits holds the walk to this
+    /// first, so that its own red names what the hits add, not graph recall.
+    fn assert_walk_returns(index: &HnswIndex, query: &[f32], width: usize, documents: &[DocId]) {
+        let walked = index.search_keys(query, width).unwrap();
+        for document in documents {
+            let DocId::Binary(bytes) = document else { panic!("a binary") };
+            let hex: String = bytes.iter().map(|b| format!("{b:02x}")).collect();
+            let key = format!("~b:{hex}.04#0");
+            assert!(
+                walked.contains(&key),
+                "graph recall: the walk of {width} returned {} keys and not {key}",
+                walked.len()
+            );
+        }
     }
 
     fn put_as_uuid(
@@ -1664,6 +1823,10 @@ mod tests {
     /// Test 18: the graph finds a subtype-4 document's chunks. Keyed by an id
     /// recomputed from the record, which carries no subtype, it named ids no
     /// chunk is stored under and loaded nothing.
+    ///
+    /// Deterministic: the graph is a function of the records and the attempt
+    /// (`insertion_order`), so this builds one graph on every run. And the
+    /// walk is checked first, so a red names graph recall, not the keys.
     #[test]
     fn the_graph_finds_the_chunks_of_a_uuid_document() {
         let (engine, shadow, ids, _dir) = uuid_documents(40);
@@ -1672,6 +1835,7 @@ mod tests {
         let hex: String = std::iter::repeat_n("00", 16).collect();
         assert!(index.keys.contains(&format!("~b:{hex}.04#0")), "keyed by the stored id");
         let options = SearchOptions { k: 3, metric: Metric::Cosine, per_document: 1 };
+        assert_walk_returns(&index, &[1.0, 0.0], walk_width(options.k, false), &ids[..3]);
         let hits = index.search(&engine, &shadow, &[1.0, 0.0], &options, None).unwrap();
         assert_eq!(hits.len(), 3);
         assert_eq!(hits[0].id, ids[0]);
@@ -1770,6 +1934,20 @@ mod tests {
         let allowed: HashSet<DocId> =
             [old_binary.clone(), tilde.clone(), ids[1].clone()].into_iter().collect();
         let options = SearchOptions { k: 5, metric: Metric::Cosine, per_document: 1 };
+        // The walk returns every admitted chunk first, so a red below names
+        // the key pre-filter or the admission, and a red here graph recall.
+        // This test failed about one run in sixteen on hnsw_rs 0.3.4, whose
+        // graph left `~x#0` unreachable: that red was here, not below.
+        let walked = index.search_keys(&[1.0, 0.0], walk_width(options.k, true)).unwrap();
+        for key in ["bin(16 bytes)#0", "~x#0"] {
+            assert!(
+                walked.iter().any(|k| k == key),
+                "graph recall: the walk of {} returned {} keys and not {key}",
+                walk_width(options.k, true),
+                walked.len()
+            );
+        }
+        assert_walk_returns(&index, &[1.0, 0.0], walk_width(options.k, true), &ids[1..3]);
         let hits = index.search(&engine, &shadow, &[1.0, 0.0], &options, Some(&allowed)).unwrap();
         let got: Vec<(DocId, String)> = hits.into_iter().map(|h| (h.id, h.text)).collect();
         assert_eq!(
