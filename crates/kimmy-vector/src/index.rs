@@ -581,9 +581,14 @@ impl HnswIndex {
     /// are both at distance zero, so a `k` of one can return the other and
     /// report a miss that has nothing to do with reachability.
     fn finds_itself(&self, query: &[f32], id: usize) -> bool {
+        self.finds_itself_at(query, id, REACHABILITY_CONFIRM_EF)
+    }
+
+    /// [`Self::finds_itself`] at a chosen effort.
+    fn finds_itself_at(&self, query: &[f32], id: usize, ef: usize) -> bool {
         let neighbours = match &self.graph {
-            Graph::Cosine(g) => g.search(query, REACHABILITY_CONFIRM_K, REACHABILITY_CONFIRM_EF),
-            Graph::Euclidean(g) => g.search(query, REACHABILITY_CONFIRM_K, REACHABILITY_CONFIRM_EF),
+            Graph::Cosine(g) => g.search(query, REACHABILITY_CONFIRM_K, ef),
+            Graph::Euclidean(g) => g.search(query, REACHABILITY_CONFIRM_K, ef),
         };
         neighbours.iter().any(|n| n.d_id == id)
     }
@@ -996,6 +1001,39 @@ mod tests {
         vectors
     }
 
+    /// How many of the graph's points no search can reach: not linked at
+    /// layer 0, directly or through other points, from the entry point or any
+    /// point drawn above layer 0 (where a search's descent ends). The graph's
+    /// own structure, read rather than searched, so a point that is merely
+    /// hard to find at a given effort is not counted.
+    fn cut_off(index: &HnswIndex) -> usize {
+        let n = index.keys.len();
+        let mut level = vec![0u8; n];
+        let mut edges: Vec<Vec<usize>> = vec![Vec::new(); n];
+        let points: Vec<_> = match &index.graph {
+            Graph::Cosine(g) => g.get_point_indexation().into_iter().collect::<Vec<_>>(),
+            Graph::Euclidean(_) => unimplemented!("the measurements are cosine"),
+        };
+        for point in points {
+            let at = point.get_origin_id();
+            level[at] = point.get_point_id().0;
+            edges[at] = point.get_neighborhood_id()[0].iter().map(|n| n.d_id).collect();
+        }
+        let mut seen = vec![false; n];
+        let mut stack: Vec<usize> = (0..n).filter(|&i| i == 0 || level[i] >= 1).collect();
+        for &i in &stack {
+            seen[i] = true;
+        }
+        while let Some(at) = stack.pop() {
+            for &to in &edges[at] {
+                if !std::mem::replace(&mut seen[to], true) {
+                    stack.push(to);
+                }
+            }
+        }
+        seen.iter().filter(|s| !**s).count()
+    }
+
     /// How many of the graph's points do not come back for their own vector
     /// when effort stops being the limit: every point checked, not a sample.
     /// The ground truth a sampled score is judged against.
@@ -1181,6 +1219,8 @@ mod tests {
         };
         for (dim, count, fixtures, attempts) in grid {
             let mut orphaned = Vec::new();
+            let mut cut_offs = Vec::new();
+            let mut lost_wider = Vec::new();
             let mut missed = Vec::new();
             let mut unreachable = Vec::new();
             for fixture in 0..fixtures {
@@ -1193,19 +1233,33 @@ mod tests {
                             .unwrap();
                     let built = started.elapsed();
                     let lost = truly_orphaned(&index, &vectors);
+                    // Of those, the ones the graph's structure cuts off, and
+                    // the ones still missing at four times the effort: a
+                    // point found there, or linked, is hard to find rather
+                    // than lost.
+                    let cut = cut_off(&index);
+                    let wider = (0..index.keys.len())
+                        .filter(|&i| {
+                            !index.finds_itself(&vectors[&index.keys[i]], i)
+                                && !index.finds_itself_at(&vectors[&index.keys[i]], i, 3_200)
+                        })
+                        .count();
                     println!(
-                        "row,{dim},{count},{fixture},{attempt},{lost},{},{},{},{}",
+                        "row,{dim},{count},{fixture},{attempt},{lost},{},{},{},{},{cut},{wider}",
                         reach.sampled,
                         reach.missed,
                         reach.unreachable,
                         built.as_millis()
                     );
+                    cut_offs.push(cut);
+                    lost_wider.push(wider);
                     orphaned.push(lost);
                     missed.push(reach.missed);
                     unreachable.push(reach.unreachable);
                 }
             }
-            for v in [&mut orphaned, &mut missed, &mut unreachable] {
+            for v in [&mut orphaned, &mut cut_offs, &mut lost_wider, &mut missed, &mut unreachable]
+            {
                 v.sort_unstable();
             }
             let builds = orphaned.len();
@@ -1214,12 +1268,15 @@ mod tests {
             println!(
                 "dim={dim:<4} n={count:<6} builds={builds:<4} \
                  truly orphaned: median={} max={} ({:.2}%) builds with any={} | \
+                 cut off: max={} | lost at ef 3200: max={} | \
                  missed: median={:<3} max={:<3} | unreachable: median={:<3} max={:<3} \
                  >=1:{:<3} >=2:{:<3} >=3:{:<3} >=8:{}",
                 median(&orphaned),
                 orphaned.last().unwrap(),
                 100.0 * *orphaned.last().unwrap() as f64 / count as f64,
                 over(&orphaned, 1),
+                cut_offs.last().unwrap(),
+                lost_wider.last().unwrap(),
                 median(&missed),
                 missed.last().unwrap(),
                 median(&unreachable),

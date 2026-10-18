@@ -373,3 +373,331 @@ impl Input {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use hnsw_rs::api::AnnT;
+    use hnsw_rs::prelude::{DistCosine, DistL2, Hnsw};
+
+    use super::*;
+
+    const POINTS: usize = 60;
+    const DIM: usize = 4;
+
+    /// A real dump of a small graph, as `HnswIndex::save` writes one, and the
+    /// bytes of its two files.
+    fn dumped() -> (tempfile::TempDir, Vec<u8>, Vec<u8>) {
+        let dir = tempfile::tempdir().unwrap();
+        let hnsw = Hnsw::<f32, DistCosine>::new(16, POINTS, 16, 200, DistCosine {});
+        for i in 0..POINTS {
+            let angle = i as f32 * 0.1;
+            let v = [angle.cos(), angle.sin(), 0.5, (i % 7) as f32 * 0.1];
+            hnsw.insert((&v[..], i));
+        }
+        hnsw.file_dump(dir.path(), BASENAME).unwrap();
+        let graph = std::fs::read(dir.path().join("index.hnsw.graph")).unwrap();
+        let data = std::fs::read(dir.path().join("index.hnsw.data")).unwrap();
+        (dir, graph, data)
+    }
+
+    fn expect() -> Expect<'static> {
+        Expect {
+            points: POINTS,
+            dim: DIM,
+            connections: 16,
+            distance: std::any::type_name::<DistCosine>(),
+        }
+    }
+
+    /// The description's length, from its two name lengths.
+    fn description_len(graph: &[u8]) -> usize {
+        let distance = usize::from_ne_bytes(graph[39..47].try_into().unwrap());
+        47 + distance
+            + 8
+            + usize::from_ne_bytes(graph[47 + distance..55 + distance].try_into().unwrap())
+    }
+
+    /// Where the first point of layer 0 starts in the graph file.
+    fn first_point(graph: &[u8]) -> usize {
+        description_len(graph) + 1 + 4 + 8
+    }
+
+    fn put(bytes: &mut [u8], at: usize, value: &[u8]) {
+        bytes[at..at + value.len()].copy_from_slice(value);
+    }
+
+    type Spoil = fn(&mut Vec<u8>, &mut Vec<u8>);
+
+    /// Every way of spoiling a dump this check refuses, with what the refusal
+    /// names. Each is something `hnsw_rs` 0.3.5's loader would end the process
+    /// on (exit), abort on (an allocation), read out of bounds for, or panic
+    /// on, or a dump this build does not write.
+    fn spoiled() -> Vec<(&'static str, Spoil, &'static str)> {
+        vec![
+            (
+                "format 2",
+                |g, _| {
+                    put(g, 0, &MAGICDESCR_2.to_ne_bytes());
+                    g.drain(6..14);
+                },
+                "dump format 2",
+            ),
+            (
+                "format 3",
+                |g, _| {
+                    put(g, 0, &MAGICDESCR_3.to_ne_bytes());
+                    g.drain(6..14);
+                },
+                "dump format 3",
+            ),
+            ("not a dump", |g, _| put(g, 0, &0xdead_beefu32.to_ne_bytes()), "not a dump"),
+            ("light mode", |g, _| g[4] = 0, "dump mode 0"),
+            ("connections", |g, _| g[5] = 8, "8 connections"),
+            ("level scale", |g, _| put(g, 6, &f64::NAN.to_ne_bytes()), "level scale"),
+            ("description layers", |g, _| g[14] = 17, "description has 17 layers"),
+            ("point count", |g, _| put(g, 23, &61usize.to_ne_bytes()), "holds 61 points"),
+            ("dimension", |g, _| put(g, 31, &5usize.to_ne_bytes()), "5-dimensional"),
+            (
+                "distance name length",
+                |g, _| put(g, 39, &(1usize << 40).to_ne_bytes()),
+                "bytes long",
+            ),
+            ("distance name UTF-8", |g, _| g[47] = 0xff, "not UTF-8"),
+            (
+                "element type",
+                |g, _| {
+                    let at = description_len(g) - 3;
+                    put(g, at, b"f64");
+                },
+                "not f32",
+            ),
+            (
+                "graph layers",
+                |g, _| {
+                    let at = description_len(g);
+                    g[at] = 15;
+                },
+                "graph has 15 layers",
+            ),
+            (
+                "layer magic",
+                |g, _| {
+                    let at = description_len(g) + 1;
+                    put(g, at, &0u32.to_ne_bytes());
+                },
+                "a layer's start",
+            ),
+            (
+                "layer count past memory",
+                |g, _| {
+                    let at = description_len(g) + 5;
+                    put(g, at, &(1usize << 59).to_ne_bytes());
+                },
+                "declares",
+            ),
+            (
+                "point magic",
+                |g, _| {
+                    let at = first_point(g);
+                    put(g, at, &0u32.to_ne_bytes());
+                },
+                "a point's start",
+            ),
+            (
+                "origin out of range",
+                |g, _| {
+                    let at = first_point(g) + 4;
+                    put(g, at, &(POINTS + 1).to_ne_bytes());
+                },
+                "out of range or seen before",
+            ),
+            (
+                "point rank",
+                |g, _| {
+                    let at = first_point(g) + 13;
+                    put(g, at, &5i32.to_ne_bytes());
+                },
+                "says it is point 5",
+            ),
+            (
+                "neighbour count past memory",
+                |g, _| {
+                    let at = first_point(g) + 17;
+                    put(g, at, &(1usize << 58).to_ne_bytes());
+                },
+                "neighbours in one layer",
+            ),
+            (
+                "neighbour layer",
+                |g, _| {
+                    let at = first_point(g) + 25 + 8;
+                    g[at] = 16;
+                },
+                "out of range",
+            ),
+            (
+                "negative neighbour rank",
+                |g, _| {
+                    let at = first_point(g) + 25 + 9;
+                    put(g, at, &(-1i32).to_ne_bytes());
+                },
+                "rank -1",
+            ),
+            (
+                "neighbour rank past its layer",
+                |g, _| {
+                    let at = first_point(g) + 25 + 9;
+                    put(g, at, &i32::MAX.to_ne_bytes());
+                },
+                "a neighbour is point",
+            ),
+            (
+                "NaN distance",
+                |g, _| {
+                    let at = first_point(g) + 25 + 13;
+                    put(g, at, &f32::NAN.to_ne_bytes());
+                },
+                "NaN distance",
+            ),
+            (
+                "entry point rank",
+                |g, _| {
+                    let at = g.len() - 4;
+                    put(g, at, &(POINTS as i32).to_ne_bytes());
+                },
+                "the entry point",
+            ),
+            (
+                "entry point layer",
+                |g, _| {
+                    let at = g.len() - 5;
+                    g[at] = 16;
+                },
+                "the entry point",
+            ),
+            (
+                "graph cut short",
+                |g, _| {
+                    g.pop();
+                },
+                "the graph file ends inside",
+            ),
+            ("graph continues", |g, _| g.push(0), "the graph file continues"),
+            ("data magic", |_, d| put(d, 0, &0u32.to_ne_bytes()), "the data file has"),
+            (
+                "data dimension",
+                |_, d| put(d, 4, &5usize.to_ne_bytes()),
+                "data file is 5-dimensional",
+            ),
+            ("vector magic", |_, d| put(d, 12, &0u32.to_ne_bytes()), "a vector's start"),
+            ("vector origin", |_, d| put(d, 16, &u64::MAX.to_ne_bytes()), "says it is"),
+            (
+                "vector shorter than its width",
+                |_, d| put(d, 24, &12u64.to_ne_bytes()),
+                "12 bytes, not 16",
+            ),
+            (
+                "vector length past memory",
+                |_, d| put(d, 24, &(1u64 << 62).to_ne_bytes()),
+                "bytes, not 16",
+            ),
+            ("vector not finite", |_, d| put(d, 32, &f32::INFINITY.to_ne_bytes()), "not finite"),
+            (
+                "data cut short",
+                |_, d| {
+                    d.truncate(d.len() - 3);
+                },
+                "the data file ends inside",
+            ),
+            ("data continues", |_, d| d.push(0), "the data file continues"),
+        ]
+    }
+
+    /// The audit this check is built from, re-runnable on a library upgrade:
+    /// each spoiled dump handed to `hnsw_rs`'s loader directly, in a child
+    /// process, and how the child ended. Prints a table; asserts nothing.
+    ///
+    /// ```bash
+    /// cargo test -p kimmy-vector --lib -- --ignored --nocapture what_the_library_does
+    /// ```
+    #[test]
+    #[ignore = "an audit table for a library upgrade; spawns a child per case"]
+    fn what_the_library_does_with_each_spoiled_dump() {
+        const CHILD: &str = "KIMMY_DUMP_AUDIT_CHILD";
+        if let Ok(dir) = std::env::var(CHILD) {
+            let loaded = std::panic::catch_unwind(|| {
+                let mut io = hnsw_rs::hnswio::HnswIo::new(Path::new(&dir), BASENAME);
+                io.load_hnsw::<f32, DistCosine>().map(|_| ()).map_err(|e| e.to_string())
+            });
+            match loaded {
+                Ok(Ok(())) => println!("AUDIT loaded"),
+                Ok(Err(e)) => println!("AUDIT returned an error: {e}"),
+                Err(_) => println!("AUDIT panicked"),
+            }
+            return;
+        }
+        let name = "dump::tests::what_the_library_does_with_each_spoiled_dump";
+        for (case, spoil, _) in spoiled() {
+            let (dir, mut graph, mut data) = dumped();
+            spoil(&mut graph, &mut data);
+            std::fs::write(dir.path().join("index.hnsw.graph"), &graph).unwrap();
+            std::fs::write(dir.path().join("index.hnsw.data"), &data).unwrap();
+            let out = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", name, "--nocapture", "--ignored", "--test-threads=1"])
+                .env(CHILD, dir.path())
+                .output()
+                .unwrap();
+            let stdout = String::from_utf8_lossy(&out.stdout);
+            let said = stdout.lines().find_map(|l| l.split_once("AUDIT ").map(|(_, said)| said));
+            let ended = match (said, out.status.code()) {
+                (Some(said), _) => said.to_string(),
+                (None, Some(code)) => format!("ENDED THE PROCESS: exit({code})"),
+                (None, None) => format!("ENDED THE PROCESS: {:?} (a signal)", out.status),
+            };
+            println!("{case:<32} {ended}");
+        }
+    }
+
+    #[test]
+    fn a_dump_as_saved_passes() {
+        let (dir, _, _) = dumped();
+        assert_eq!(check(dir.path(), &expect()), Ok(()));
+    }
+
+    #[test]
+    fn every_spoiled_dump_is_refused_by_what_spoiled_it() {
+        for (name, spoil, says) in spoiled() {
+            let (dir, mut graph, mut data) = dumped();
+            spoil(&mut graph, &mut data);
+            std::fs::write(dir.path().join("index.hnsw.graph"), &graph).unwrap();
+            std::fs::write(dir.path().join("index.hnsw.data"), &data).unwrap();
+            match check(dir.path(), &expect()) {
+                Err(e) => assert!(e.contains(says), "{name}: refused as {e:?}, not for {says:?}"),
+                Ok(()) => panic!("{name}: passed"),
+            }
+        }
+    }
+
+    /// What the caller expects is held to as well: a dump of another shape
+    /// is not this snapshot's graph.
+    #[test]
+    fn a_dump_of_another_shape_is_refused() {
+        let (dir, _, _) = dumped();
+        for (name, expect, says) in [
+            ("count", Expect { points: POINTS + 1, ..expect() }, "holds 60 points, not 61"),
+            ("width", Expect { dim: DIM + 1, ..expect() }, "4-dimensional, not 5"),
+            ("connections", Expect { connections: 32, ..expect() }, "16 connections, not 32"),
+            (
+                "metric",
+                Expect { distance: std::any::type_name::<DistL2>(), ..expect() },
+                "distance",
+            ),
+        ] {
+            let refused = check(dir.path(), &expect);
+            assert!(refused.as_ref().is_err_and(|e| e.contains(says)), "{name}: {refused:?}");
+        }
+        std::fs::remove_file(dir.path().join("index.hnsw.data")).unwrap();
+        let refused = check(dir.path(), &expect());
+        assert!(refused.as_ref().is_err_and(|e| e.contains("the data file")), "{refused:?}");
+    }
+}

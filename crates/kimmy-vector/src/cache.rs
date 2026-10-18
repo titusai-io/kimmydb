@@ -1799,6 +1799,232 @@ mod tests {
         assert_eq!(index.len(), 60);
     }
 
+    /// A snapshot a 0.51 build saved, its graph built by `hnsw_rs` 0.3.4, is
+    /// refused and rebuilt, never adopted (ADR-241): it says format 3, and the
+    /// dump's layout is the same as 0.3.5's, so nothing but the format tells
+    /// the graph with 0.3.4's unreachable vectors from a sound one. It covers
+    /// exactly what the store holds, so on any other test it would be adopted
+    /// as fresh; the control shows that.
+    #[test]
+    fn a_format_3_snapshot_is_refused_and_rebuilt_never_adopted() {
+        let (engine, shadow, dir) = setup(60);
+        let cache = snapshot_cache(&dir);
+        cache.access(&engine, &shadow, Metric::Cosine, 4);
+        drop(cache);
+        drop(engine);
+        let snapshot = dir.path().join("hnsw").join(format!("{:016x}", shadow.id.0));
+        let meta = |path: &std::path::Path| -> serde_json::Value {
+            serde_json::from_slice(&std::fs::read(path.join("meta.json")).unwrap()).unwrap()
+        };
+        assert_eq!(meta(&snapshot)["format"], 4, "this build saves format 4");
+        // A file a load leaves where it is and a save, which replaces the
+        // directory, does not: which of the two the access did.
+        let marked = |path: &std::path::Path| path.join("adopted-marker").exists();
+
+        // The control: as saved, the snapshot is adopted.
+        std::fs::write(snapshot.join("adopted-marker"), b"").unwrap();
+        let (engine, shadow) = reopen(&dir);
+        let cache = snapshot_cache(&dir);
+        assert!(matches!(
+            cache.access(&engine, &shadow, Metric::Cosine, 4),
+            Access::Approximate(_)
+        ));
+        assert!(marked(&snapshot), "the control: a format-4 snapshot of the store is adopted");
+        drop(cache);
+        drop(engine);
+
+        // The same snapshot as a 0.51 build writes it.
+        let mut old = meta(&snapshot);
+        old["format"] = serde_json::json!(3);
+        std::fs::write(snapshot.join("meta.json"), serde_json::to_vec(&old).unwrap()).unwrap();
+        let (engine, shadow) = reopen(&dir);
+        let refused = crate::index::HnswIndex::load(&snapshot, Metric::Cosine, 4, shadow.created);
+        assert!(
+            matches!(&refused, Err(crate::VectorError::Snapshot(d)) if d.contains("format 3 is not 4")),
+            "{:?}",
+            refused.as_ref().err()
+        );
+        let cache = snapshot_cache(&dir);
+        let Access::Approximate(index) = cache.access(&engine, &shadow, Metric::Cosine, 4) else {
+            panic!("a refused snapshot must fall back to a rebuild");
+        };
+        assert_eq!(index.len(), 60);
+        assert!(!marked(&snapshot), "a format-3 snapshot was adopted");
+        assert_eq!(meta(&snapshot)["format"], 4, "the rebuild saved its own graph");
+    }
+
+    // -----------------------------------------------------------------------
+    // A dump the library would end the process on (ADR-241)
+    // -----------------------------------------------------------------------
+
+    /// The child's instructions: `<mode>:<case>:<directory>`.
+    const DUMP_CHILD: &str = "KIMMY_VECTOR_DUMP_CHILD";
+
+    /// How `hnsw_rs` 0.3.5's loader ends the process on a dump.
+    #[derive(Debug, Clone, Copy)]
+    enum Ends {
+        /// `std::process::exit` with this code.
+        Exit(i32),
+        /// An allocation of a size the file declares fails, which aborts.
+        Abort,
+    }
+
+    /// The length of a graph file's description, from its two name lengths.
+    fn description_len(graph: &[u8]) -> usize {
+        let len = |at: usize| usize::from_ne_bytes(graph[at..at + 8].try_into().unwrap());
+        let distance = len(39);
+        47 + distance + 8 + len(47 + distance)
+    }
+
+    /// Each spoiled dump the loader ends the process on, as a change to a
+    /// saved snapshot's files, and how it ends.
+    fn process_ending_dumps() -> [(&'static str, fn(&std::path::Path), Ends); 3] {
+        [
+            // Format 2's description, which has no level scale: the loader
+            // reads it, and ends the process at the first vector.
+            (
+                "format-2",
+                |dir| {
+                    let path = dir.join("index.hnsw.graph");
+                    let mut bytes = std::fs::read(&path).unwrap();
+                    bytes[0..4].copy_from_slice(&0x002a_677fu32.to_ne_bytes());
+                    bytes.drain(6..14);
+                    std::fs::write(&path, bytes).unwrap();
+                },
+                Ends::Exit(1),
+            ),
+            // A data file cut short, as a crash after a save's rename can
+            // leave one: any vector the loader cannot read ends the process.
+            (
+                "torn-vector",
+                |dir| {
+                    let path = dir.join("index.hnsw.data");
+                    let mut bytes = std::fs::read(&path).unwrap();
+                    bytes.truncate(bytes.len() - 3);
+                    std::fs::write(&path, bytes).unwrap();
+                },
+                Ends::Exit(1),
+            ),
+            // A layer's point count, allocated before a point is read.
+            (
+                "declared-count",
+                |dir| {
+                    let path = dir.join("index.hnsw.graph");
+                    let mut bytes = std::fs::read(&path).unwrap();
+                    let at = description_len(&bytes) + 1 + 4;
+                    bytes[at..at + 8].copy_from_slice(&(1usize << 59).to_ne_bytes());
+                    std::fs::write(&path, bytes).unwrap();
+                },
+                Ends::Abort,
+            ),
+        ]
+    }
+
+    /// A dump that `hnsw_rs` 0.3.5 answers by ending the process is refused
+    /// before the library reads it, and rebuilt, and the process survives.
+    ///
+    /// Each case runs in a child process, twice: once handing the dump to the
+    /// library directly, which must end that child the way the case says (the
+    /// proof the fixture is the dangerous one, and a tripwire for a library
+    /// upgrade that changes it), and once through the cache, which must refuse
+    /// the snapshot, rebuild the graph and save one that loads. A child that
+    /// the library ends fails this test with its status rather than taking
+    /// the test binary with it.
+    #[test]
+    fn a_dump_that_would_end_the_process_is_refused_and_rebuilt_and_the_process_survives() {
+        if let Ok(task) = std::env::var(DUMP_CHILD) {
+            return dump_child(&task);
+        }
+        let name = "cache::tests::a_dump_that_would_end_the_process_is_refused_and_rebuilt_and_the_process_survives";
+        for (case, spoil, ends) in process_ending_dumps() {
+            let (engine, shadow, dir) = setup(60);
+            let cache = snapshot_cache(&dir);
+            cache.access(&engine, &shadow, Metric::Cosine, 4);
+            drop(cache);
+            drop(engine);
+            let snapshot = dir.path().join("hnsw").join(format!("{:016x}", shadow.id.0));
+            spoil(&snapshot);
+            let pristine: Vec<(String, Vec<u8>)> = ["index.hnsw.graph", "index.hnsw.data"]
+                .iter()
+                .map(|f| (f.to_string(), std::fs::read(snapshot.join(f)).unwrap()))
+                .collect();
+
+            for mode in ["library", "cache"] {
+                // The library child does not remove what it read; the cache
+                // child does. Each starts from the spoiled files.
+                for (file, bytes) in &pristine {
+                    std::fs::write(snapshot.join(file), bytes).unwrap();
+                }
+                let out = std::process::Command::new(std::env::current_exe().unwrap())
+                    .args(["--exact", name, "--nocapture", "--test-threads=1"])
+                    .env(DUMP_CHILD, format!("{mode}:{case}:{}", dir.path().display()))
+                    .output()
+                    .unwrap();
+                let said = format!(
+                    "{case}, {mode}: {:?}\nstdout: {}\nstderr: {}",
+                    out.status,
+                    String::from_utf8_lossy(&out.stdout),
+                    String::from_utf8_lossy(&out.stderr)
+                );
+                let stdout = String::from_utf8_lossy(&out.stdout);
+                if mode == "library" {
+                    match ends {
+                        Ends::Exit(code) => assert_eq!(out.status.code(), Some(code), "{said}"),
+                        Ends::Abort => {
+                            #[cfg(unix)]
+                            {
+                                use std::os::unix::process::ExitStatusExt;
+                                assert_eq!(out.status.signal(), Some(6), "{said}");
+                            }
+                            #[cfg(not(unix))]
+                            assert!(!out.status.success(), "{said}");
+                        }
+                    }
+                    assert!(!stdout.contains("CHILD-RETURNED"), "{said}");
+                } else {
+                    assert!(out.status.success(), "the process did not survive: {said}");
+                    assert!(stdout.contains("CHILD-SURVIVED refused and rebuilt"), "{said}");
+                }
+            }
+        }
+    }
+
+    /// The child half of the test above.
+    fn dump_child(task: &str) {
+        let mut parts = task.splitn(3, ':');
+        let (mode, case, dir) =
+            (parts.next().unwrap(), parts.next().unwrap(), parts.next().unwrap());
+        let dir = std::path::Path::new(dir);
+        let engine = Engine::open(&dir.join("kimmy.redb")).unwrap();
+        let shadow = engine.vector_collection("app", "docs").unwrap().unwrap();
+        let snapshot = dir.join("hnsw").join(format!("{:016x}", shadow.id.0));
+        match mode {
+            "library" => {
+                let loaded = std::panic::catch_unwind(|| {
+                    let mut io = hnsw_rs::hnswio::HnswIo::new(&snapshot, "index");
+                    io.load_hnsw::<f32, hnsw_rs::prelude::DistCosine>().is_ok()
+                });
+                println!("CHILD-RETURNED {case}: {loaded:?}");
+            }
+            "cache" => {
+                let cache = IndexCache {
+                    min_vectors: 10,
+                    ..IndexCache::with_snapshot_dir(dir.join("hnsw"))
+                };
+                let Access::Approximate(index) = cache.access(&engine, &shadow, Metric::Cosine, 4)
+                else {
+                    panic!("{case}: no graph");
+                };
+                assert_eq!(index.len(), 60, "{case}");
+                let reloaded =
+                    crate::index::HnswIndex::load(&snapshot, Metric::Cosine, 4, shadow.created);
+                assert!(reloaded.is_ok(), "{case}: the rebuild's snapshot: {:?}", reloaded.err());
+                println!("CHILD-SURVIVED refused and rebuilt {case}");
+            }
+            other => panic!("mode {other}"),
+        }
+    }
+
     #[test]
     fn a_reconfigured_dimension_refuses_the_old_snapshot() {
         let (engine, shadow, dir) = setup(60);
