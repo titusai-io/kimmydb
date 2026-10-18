@@ -115,10 +115,16 @@ use crate::{
 };
 
 const DB: &str = "shop";
-const NAMES: [&str; 2] = ["orders", "items"];
+const NAMES: [&str; 3] = ["orders", "items", "big"];
 const ORDERS: u8 = 0;
 const ITEMS: u8 = 1;
-const LETTERS: [char; 3] = ['A', 'B', 'C'];
+/// A collection of more documents than three snapshot pages hold, for the rows whose
+/// snapshot must span pages within one collection. Not in generated schedules.
+const BIG: u8 = 2;
+const BIG_DOCS: i64 = 3 * crate::SNAPSHOT_PAGE as i64 + 40;
+const LETTERS: [char; 4] = ['A', 'B', 'C', 'D'];
+/// Members a schedule can have.
+const MEMBERS_MAX: usize = 4;
 /// Counters in `orders`.
 const COUNTERS: i64 = 5;
 /// Documents per chunk of a `multi` write.
@@ -168,6 +174,14 @@ pub(crate) enum Kind {
     IncSingle {
         d: u8,
     },
+    /// `$inc` of counters `d` and `d + 1`: a multi-document request of one chunk.
+    IncRange {
+        d: u8,
+    },
+    /// `$inc` of document `d` of `big`, the single-document form.
+    IncBig {
+        d: u16,
+    },
     /// A replace of an `items` document, upserting.
     Replace {
         at: Target,
@@ -180,7 +194,8 @@ pub(crate) enum Kind {
 impl Kind {
     fn coll(&self) -> u8 {
         match self {
-            Kind::IncMulti | Kind::IncSingle { .. } => ORDERS,
+            Kind::IncMulti | Kind::IncSingle { .. } | Kind::IncRange { .. } => ORDERS,
+            Kind::IncBig { .. } => BIG,
             _ => ITEMS,
         }
     }
@@ -194,6 +209,7 @@ impl Kind {
         match self {
             Kind::IncMulti => true,
             Kind::IncSingle { d: x } => i64::from(*x) == d,
+            Kind::IncRange { d: x } => i64::from(*x) == d || i64::from(*x) + 1 == d,
             _ => false,
         }
     }
@@ -244,19 +260,41 @@ pub(crate) enum Step {
         to: u8,
         from: u8,
     },
-    /// A scoped page of collection `c` (a converge page with `converge`), then a
-    /// restart of the receiver with `restart`.
+    /// A scoped snapshot of collection `c` (a converge pull with `converge`), then a
+    /// restart of the receiver with `restart`. `inner`: steps run after its `j`-th page.
     Page {
         to: u8,
         from: u8,
         c: u8,
         converge: bool,
         restart: bool,
+        inner: Vec<(u8, Vec<Op>)>,
     },
-    /// A fresh store with a new identity, then a whole-database snapshot from `from`.
+    /// A fresh store with a new identity, then a whole-database snapshot from `from`,
+    /// with `inner` steps run after its `j`-th page.
     Reset {
         m: u8,
         from: u8,
+        inner: Vec<(u8, Vec<Op>)>,
+    },
+    /// An unkeyed write on `m`: counter `d` of `orders`, `ITEM_BASE + d` of `items`
+    /// (upserted), or document `d` of `big`. It keeps the version's key set: a write
+    /// on top of what `m` holds.
+    Touch {
+        m: u8,
+        c: u8,
+        d: u16,
+    },
+    /// The member stops being reached: no pull to or from it, no request to it.
+    Down {
+        m: u8,
+    },
+    Up {
+        m: u8,
+    },
+    /// Create `big` on `m` with its documents.
+    Big {
+        m: u8,
     },
     Restart {
         m: u8,
@@ -294,6 +332,8 @@ pub(crate) struct Schedule {
     pub track: Track,
     /// The `Home` track's member for every `$inc`.
     pub home: u8,
+    /// Members: three, or four.
+    pub members: u8,
     pub requests: Vec<Request>,
     pub ops: Vec<Op>,
 }
@@ -308,24 +348,30 @@ impl std::fmt::Display for Op {
                 if let Some((j, how)) = crash {
                     write!(f, " crash {how:?} at {j}")?;
                 }
-                for (j, ops) in inner {
-                    let shown: Vec<String> = ops.iter().map(|op| op.to_string()).collect();
-                    write!(f, " [at {j}: {}]", shown.join(", "))?;
-                }
-                Ok(())
+                show_inner(f, inner)
             }
             Step::Pull { to, from } => write!(f, "{}<-{}", l(*to), l(*from)),
             Step::PullShort { to, from } => write!(f, "{}<-{} short", l(*to), l(*from)),
-            Step::Page { to, from, c, converge, restart } => write!(
-                f,
-                "{}<-{} {}({}){}",
-                l(*to),
-                l(*from),
-                if *converge { "converge" } else { "scoped" },
-                NAMES[*c as usize],
-                if *restart { " then restart" } else { "" }
-            ),
-            Step::Reset { m, from } => write!(f, "{}.reset from {}", l(*m), l(*from)),
+            Step::Page { to, from, c, converge, restart, inner } => {
+                write!(
+                    f,
+                    "{}<-{} {}({}){}",
+                    l(*to),
+                    l(*from),
+                    if *converge { "converge" } else { "scoped" },
+                    NAMES[*c as usize],
+                    if *restart { " then restart" } else { "" }
+                )?;
+                show_inner(f, inner)
+            }
+            Step::Reset { m, from, inner } => {
+                write!(f, "{}.reset from {}", l(*m), l(*from))?;
+                show_inner(f, inner)
+            }
+            Step::Touch { m, c, d } => write!(f, "{}.touch({}/{d})@{t}", l(*m), NAMES[*c as usize]),
+            Step::Down { m } => write!(f, "{}.down", l(*m)),
+            Step::Up { m } => write!(f, "{}.up", l(*m)),
+            Step::Big { m } => write!(f, "{}.big", l(*m)),
             Step::Restart { m } => write!(f, "{}.restart", l(*m)),
             Step::Crash { m } => write!(f, "{}.crash", l(*m)),
             Step::Drop { m } => write!(f, "{}.drop(items)@{t}", l(*m)),
@@ -334,6 +380,14 @@ impl std::fmt::Display for Op {
             Step::Clock { m } => write!(f, "{}.clock@{t}", l(*m)),
         }
     }
+}
+
+fn show_inner(f: &mut std::fmt::Formatter<'_>, inner: &[(u8, Vec<Op>)]) -> std::fmt::Result {
+    for (j, ops) in inner {
+        let shown: Vec<String> = ops.iter().map(|op| op.to_string()).collect();
+        write!(f, " [at {j}: {}]", shown.join(", "))?;
+    }
+    Ok(())
 }
 
 fn fingerprint(r: u8) -> Fingerprint {
@@ -350,10 +404,11 @@ fn coll_id(c: u8) -> CollectionId {
 
 // -- Templates and members ------------------------------------------------------------------
 
-/// The three member stores and the spares, empty, with fixed identities, opened once
-/// and copied per run.
-fn templates() -> &'static [PathBuf; 3 + SPARES] {
-    static TEMPLATES: OnceLock<(tempfile::TempDir, [PathBuf; 3 + SPARES])> = OnceLock::new();
+/// The member stores and the spares, empty, with fixed identities, opened once and
+/// copied per run.
+fn templates() -> &'static [PathBuf; MEMBERS_MAX + SPARES] {
+    static TEMPLATES: OnceLock<(tempfile::TempDir, [PathBuf; MEMBERS_MAX + SPARES])> =
+        OnceLock::new();
     &TEMPLATES
         .get_or_init(|| {
             let dir = tempfile::tempdir().unwrap();
@@ -414,13 +469,13 @@ pub(crate) struct Outcome {
     pub notes: Vec<String>,
     /// Steps run, steps between commits and drives included.
     pub steps: usize,
-    /// Violations classified as finding G1.
-    pub g1: usize,
-    /// Effects of the current life whose record a drop buried by its `last`: finding G2.
-    pub g2: usize,
-    /// Settled records that differ only as finding G3: an earlier state of the
-    /// merged record, with its `first`.
-    pub g3: usize,
+    /// Effects or entries that reached a member without their record: the relay
+    /// class (findings G1b, G2, G2b, G3, T2 of the G1 analysis).
+    pub relay: usize,
+    /// Effects of the current life whose record a drop buried by its `last`: finding L1.
+    pub l1: usize,
+    /// Settled records that differ only by a dominated, earlier state: finding S1.
+    pub s1: usize,
     /// Applications afresh on an earlier life's effect, which the life rule allows.
     pub life_exempt: usize,
     /// Of those and of I2's exemptions, the ones only a drop made elsewhere explains: the
@@ -462,7 +517,8 @@ type OwnEffect = Arc<Mutex<Vec<(DocId, Vec<i64>, usize)>>>;
 /// application on its own effect (I1), seen where it happens.
 struct Inc {
     r: i64,
-    target: Option<i64>,
+    /// The documents it changes, by `_id`, both ends included; all, without.
+    target: Option<(i64, i64)>,
     on_own_effect: OwnEffect,
     phase: Arc<std::sync::atomic::AtomicUsize>,
 }
@@ -489,7 +545,7 @@ impl ModifySpec for Inc {
             return Ok(false);
         }
         Ok(match self.target {
-            Some(d) => doc.get_i64("_id").is_ok_and(|id| id == d),
+            Some((lo, hi)) => doc.get_i64("_id").is_ok_and(|id| (lo..=hi).contains(&id)),
             None => true,
         })
     }
@@ -532,7 +588,7 @@ struct Ghost {
     /// The request whose insert first landed on a derived `_id` (I7).
     owner: HashMap<String, u8>,
     /// (collection, document key, request) of every application on its own effect
-    /// the life rule allows or that is finding G1: a stored double it explains.
+    /// the life rule allows or that is a classified finding: a stored double it explains.
     explained: HashSet<(u8, Vec<u8>, u8)>,
     /// Every drop of `items` minted, as its tombstone's stamp.
     drops: Vec<(u8, Stamp)>,
@@ -540,9 +596,9 @@ struct Ghost {
     dropped_elsewhere: HashSet<(NodeId, Stamp)>,
     /// (node, entry) of the current life whose record is buried (finding G2).
     g2: HashSet<(NodeId, Stamp)>,
-    /// (node, entry) a sender holding the record shipped without it (finding G1b).
+    /// (node, entry) a sender holding the record shipped without it (the relay class).
     g1b: HashSet<(NodeId, Stamp)>,
-    /// Those G1b entries I2 has counted.
+    /// Those relay entries I2 has counted.
     g1b_counted: HashSet<(NodeId, Stamp)>,
 }
 
@@ -560,7 +616,7 @@ impl Ghost {
 enum Call {
     Insert(Document),
     Bulk(Vec<Document>),
-    Inc { target: Option<i64>, stop: Option<usize> },
+    Inc { target: Option<(i64, i64)>, stop: Option<usize> },
     Replace(DocId, Document),
     Delete(DocId),
 }
@@ -692,13 +748,18 @@ struct World {
     retired: HashSet<NodeId>,
     /// A drive is running: the home track's policy does not nest.
     driving: bool,
+    /// Classified findings fail the run (`IDEM_STRICT=1`, or a named row).
+    strict: bool,
+    /// Members the schedule has taken down.
+    down: Vec<bool>,
     step: String,
 }
 
 impl World {
     fn new(sched: Schedule, base: u64) -> Self {
         let n = sched.requests.len();
-        let members = templates()[..3]
+        let count = sched.members as usize;
+        let members = templates()[..count]
             .iter()
             .map(|template| {
                 let dir = tempfile::tempdir().unwrap();
@@ -725,14 +786,20 @@ impl World {
             running: None,
             retired: HashSet::new(),
             driving: false,
+            strict: strict(),
+            down: vec![false; count],
             step: "setup".into(),
         };
-        for m in 0..3 {
+        for m in 0..count {
             let e = world.e(m);
             world.configure(&e);
             world.labels.insert(e.node_id(), LETTERS[m].to_string());
         }
         world
+    }
+
+    fn n(&self) -> usize {
+        self.members.len()
     }
 
     fn e(&self, m: usize) -> Arc<Engine> {
@@ -817,7 +884,7 @@ impl World {
     }
 
     fn finish_purges(&self) -> Res<()> {
-        for m in 0..3 {
+        for m in 0..self.n() {
             self.e(m).finish_purges_now().map_err(|e| err("finish_purges_now", e))?;
         }
         Ok(())
@@ -846,24 +913,28 @@ impl World {
         self.open(m)
     }
 
-    fn reset(&mut self, m: usize, from: usize) -> Res<()> {
+    fn reset(&mut self, m: usize, from: usize, inner: &[(u8, Vec<Op>)]) -> Res<()> {
         if self.spare >= SPARES {
             self.note(format!("{} has no spare identity left: restarted instead", LETTERS[m]));
             return self.reopen(m, true);
+        }
+        if self.down[from] {
+            self.note(format!("{} is down: no reset from it", LETTERS[from]));
+            return Ok(());
         }
         let arc = self.members[m].engine.take().expect("open");
         self.retired.insert(arc.node_id());
         drop(Arc::into_inner(arc).ok_or("the engine is held elsewhere")?);
         let path = self.members[m].path.clone();
         std::fs::remove_file(&path).map_err(|e| err("remove", e))?;
-        std::fs::copy(&templates()[3 + self.spare], &path).map_err(|e| err("copy", e))?;
+        std::fs::copy(&templates()[MEMBERS_MAX + self.spare], &path).map_err(|e| err("copy", e))?;
         self.spare += 1;
         self.open(m)?;
         let node = self.e(m).node_id();
         let label = format!("{}{}", LETTERS[m], "'".repeat(self.spare));
         self.labels.insert(node, label.clone());
         self.note(format!("{} reset as {label}", LETTERS[m]));
-        self.transfer(m, from, None, None)
+        self.transfer(m, from, None, None, inner)
     }
 
     // -- Replication --------------------------------------------------------------------------
@@ -872,7 +943,20 @@ impl World {
     /// window's records: a whole-database snapshot beyond the horizon, a scoped page for
     /// a collection the batch stopped at.
     fn pull(&mut self, to: usize, from: usize, limit: usize) -> Res<()> {
+        self.pull_from(to, from, limit, true)
+    }
+
+    /// [`Self::pull`]. A refusal (`BeyondHorizon`, which `StateHeld` reads as on the
+    /// wire) is set aside once when `aside` allows it, as the transport's loop does
+    /// (ADR-224): the tick's other contacts are pulled first, then the peer is asked
+    /// again, and a second refusal takes its whole-database snapshot.
+    fn pull_from(&mut self, to: usize, from: usize, limit: usize, aside: bool) -> Res<()> {
+        if self.down[to] || self.down[from] {
+            self.note(format!("{}<-{}: one of them is down", LETTERS[to], LETTERS[from]));
+            return Ok(());
+        }
         let mut stopped_at: Option<Stamp> = None;
+        let mut set_aside = !aside;
         for _ in 0..32 {
             let (src, dst) = (self.e(from), self.e(to));
             let theirs = src.version_vector().map_err(|e| err("version_vector", e))?;
@@ -893,18 +977,33 @@ impl World {
             let Some(start) = start else { break };
             match src.serve_verdict(&mine).map_err(|e| err("serve_verdict", e))? {
                 ServeVerdict::Serve => {}
+                verdict if !set_aside => {
+                    set_aside = true;
+                    let others: Vec<usize> = (0..self.n())
+                        .filter(|o| *o != to && *o != from && !self.down[*o])
+                        .collect();
+                    self.note(format!(
+                        "{}<-{}: {verdict:?}, set aside: the other contacts first",
+                        LETTERS[to], LETTERS[from]
+                    ));
+                    for other in others {
+                        self.pull_from(to, other, BATCH, false)?;
+                    }
+                    continue;
+                }
                 verdict => {
                     self.note(format!(
                         "{}<-{}: {verdict:?}, a whole-database snapshot",
                         LETTERS[to], LETTERS[from]
                     ));
-                    self.transfer(to, from, None, None)?;
+                    self.transfer(to, from, None, None, &[])?;
                     break;
                 }
             }
+            // As the listener serves it.
             let window = src
-                .entries_for_peer_marked(start, limit, Some(&mine), &marked, WalkScope::Background)
-                .map_err(|e| err("entries_for_peer", e))?;
+                .serve_entries_to_peer(start, limit, Some(&mine), &marked, None)
+                .map_err(|e| err("serve_entries_to_peer", e))?;
             let mut outcome = SyncOutcome::default();
             dst.apply_peer_window_carrying_into(
                 &theirs,
@@ -965,7 +1064,7 @@ impl World {
                     break;
                 }
                 stopped_at = Some(unknown.stamp);
-                self.transfer(to, from, Some(unknown.id), None)?;
+                self.transfer(to, from, Some(unknown.id), None, &[])?;
                 continue;
             }
             if limit < BATCH || window.exhausted {
@@ -980,7 +1079,7 @@ impl World {
     /// effect of them).
     ///
     /// An entry of a keyed request shipped without its request's record by a sender
-    /// that holds the record alive is finding G1 at its source (G1b): the window carries
+    /// that holds the record alive is the relay class at its source: the window carries
     /// only the rows at the stamps it ships, and a sender can ship an entry of a commit
     /// whose first entry, the record's carrying stamp, it does not hold (that entry lost
     /// there, or a page gave it the later one as state).
@@ -1017,7 +1116,7 @@ impl World {
             return Ok(());
         }
         let mine = self.e(m).witnessed_vector().map_err(|e| err("witnessed_vector", e))?;
-        for peer in 0..3 {
+        for peer in 0..self.n() {
             if peer == m {
                 continue;
             }
@@ -1065,8 +1164,19 @@ impl World {
         from: usize,
         scope: Option<CollectionId>,
         converge: Option<kimmy_core::VersionVector>,
+        inner: &[(u8, Vec<Op>)],
     ) -> Res<()> {
         let expected = self.sender_records(from, scope)?;
+        // Keys a step between the pages sends: a keyed write the sender makes during the
+        // snapshot is the stated residual for the snapshot half of I2.
+        let during: HashSet<u8> = inner
+            .iter()
+            .flat_map(|(_, ops)| ops.iter())
+            .filter_map(|op| match op.step {
+                Step::Send { r, .. } => Some(self.sched.requests[r as usize].key),
+                _ => None,
+            })
+            .collect();
         let mut progress = match (scope, converge) {
             (None, _) => SnapshotProgress::whole_database(),
             (Some(id), None) => SnapshotProgress::of_collection(id),
@@ -1093,14 +1203,21 @@ impl World {
                 refused = true;
                 break;
             }
-            if applied.purge_pending.is_none() {
+            if applied.purge_pending.is_some() {
+                waits += 1;
+                if waits > 4 {
+                    return Err("a page that waits for a purge that never finishes".into());
+                }
+                dst.finish_purges_now().map_err(|e| err("finish_purges_now", e))?;
                 continue;
             }
-            waits += 1;
-            if waits > 4 {
-                return Err("a page that waits for a purge that never finishes".into());
+            for (j, ops) in inner {
+                if usize::from(*j) == pages && !progress.is_complete() {
+                    for op in ops {
+                        self.apply_between_pages(op, to, from)?;
+                    }
+                }
             }
-            dst.finish_purges_now().map_err(|e| err("finish_purges_now", e))?;
         }
         if scope.is_none() {
             self.members[to].catching_up = true;
@@ -1111,7 +1228,8 @@ impl World {
         // I2, a completed snapshot: the receiver holds every live record the sender held
         // for what it carried, merged.
         for (c, key, theirs) in expected {
-            if self.e(to).get_collection(DB, NAMES[c as usize]).is_err()
+            if during.contains(&key)
+                || self.e(to).get_collection(DB, NAMES[c as usize]).is_err()
                 || theirs.last.hlc <= self.floor(to, c)?
             {
                 continue;
@@ -1146,8 +1264,8 @@ impl World {
     fn prepare(&mut self, r: u8, m: usize, t: u32) -> Res<Option<Prepared>> {
         let req = self.sched.requests[r as usize];
         let c = req.kind.coll();
-        if self.members[m].catching_up {
-            self.note(format!("r{r} not sent: {} is catching up", LETTERS[m]));
+        if self.members[m].catching_up || self.down[m] {
+            self.note(format!("r{r} not sent: {} is catching up or down", LETTERS[m]));
             return Ok(None);
         }
         if self.memory_ended(r) {
@@ -1243,7 +1361,15 @@ impl World {
                 Call::Bulk(docs)
             }
             Kind::IncMulti => Call::Inc { target: None, stop: None },
-            Kind::IncSingle { d } => Call::Inc { target: Some(i64::from(d)), stop: Some(1) },
+            Kind::IncSingle { d } => {
+                Call::Inc { target: Some((i64::from(d), i64::from(d))), stop: Some(1) }
+            }
+            Kind::IncRange { d } => {
+                Call::Inc { target: Some((i64::from(d), i64::from(d) + 1)), stop: None }
+            }
+            Kind::IncBig { d } => {
+                Call::Inc { target: Some((i64::from(d), i64::from(d))), stop: Some(1) }
+            }
             Kind::Replace { at } => {
                 let target = target_id(at);
                 let (ks, at) = base_of(&target);
@@ -1350,23 +1476,23 @@ impl World {
             self.hlc(end)
         );
         if record_dead {
-            // Finding G2: the request's record is judged by its `last`, the first entry of
+            // Finding L1: the request's record is judged by its `last`, the first entry of
             // its latest commit, and a drop in that commit's millisecond buries it while a
             // later entry of the same commit stands in the new life.
-            self.out.g2 += 1;
+            self.out.l1 += 1;
             self.ghost.explained.insert((c, key, r));
-            self.note(format!("G2: {detail}"));
-            if strict() {
-                self.fail(Inv::I1, format!("G2 (strict): {detail}"));
+            self.note(format!("L1: {detail}"));
+            if self.strict {
+                self.fail(Inv::I1, format!("L1 (strict): {detail}"));
             }
             return;
         }
         if p.pre_record.is_none() && !processed_current {
-            self.out.g1 += 1;
+            self.out.relay += 1;
             self.ghost.explained.insert((c, key, r));
-            self.note(format!("G1: {detail}"));
-            if strict() {
-                self.fail(Inv::I1, format!("G1 (strict): {detail}"));
+            self.note(format!("RELAY: {detail}"));
+            if self.strict {
+                self.fail(Inv::I1, format!("relay (strict): {detail}"));
             }
             return;
         }
@@ -1581,19 +1707,40 @@ impl World {
             Step::Send { r, m, .. } => self.send_plain(*r, *m as usize, op.t)?,
             Step::Pull { to, from } => self.pull(*to as usize, *from as usize, BATCH)?,
             Step::PullShort { to, from } => self.pull(*to as usize, *from as usize, SHORT)?,
-            Step::Page { to, from, c, converge, restart } => {
+            Step::Page { to, from, c, converge, restart, inner } => {
                 let (to, from) = (*to as usize, *from as usize);
-                if self.e(from).get_collection(DB, NAMES[*c as usize]).is_err() {
+                if self.down[to] || self.down[from] {
+                    self.note("no page: a member is down");
+                } else if self.e(from).get_collection(DB, NAMES[*c as usize]).is_err() {
                     self.note(format!("{} lacks {}: no page", LETTERS[from], NAMES[*c as usize]));
                 } else {
                     let cut = converge.then(kimmy_core::VersionVector::new);
-                    self.transfer(to, from, Some(coll_id(*c)), cut)?;
+                    self.transfer(to, from, Some(coll_id(*c)), cut, inner)?;
                 }
-                if *restart {
+                if *restart && !self.down[to] {
                     self.reopen(to, true)?;
                 }
             }
-            Step::Reset { m, from } => self.reset(*m as usize, *from as usize)?,
+            Step::Reset { m, from, inner } => self.reset(*m as usize, *from as usize, inner)?,
+            Step::Touch { m, c, d } => self.touch(*m as usize, *c, *d, op.t)?,
+            Step::Down { m } => {
+                self.down[*m as usize] = true;
+                self.note(format!("{} is down", LETTERS[*m as usize]));
+            }
+            Step::Up { m } => {
+                self.down[*m as usize] = false;
+                self.note(format!("{} is up", LETTERS[*m as usize]));
+            }
+            Step::Big { m } => {
+                let m = *m as usize;
+                let e = self.e(m);
+                let big =
+                    e.create_collection(DB, NAMES[BIG as usize]).map_err(|e| err("big", e))?;
+                let docs: Vec<Document> = (0..BIG_DOCS)
+                    .map(|i| doc! { "_id": i, "n": 0i64, "ks": Vec::<Bson>::new() })
+                    .collect();
+                e.insert_many(&big, docs).map_err(|e| err("big", e.source))?;
+            }
             Step::Restart { m } => self.reopen(*m as usize, true)?,
             Step::Crash { m } => self.reopen(*m as usize, false)?,
             Step::Drop { m } => {
@@ -1637,7 +1784,7 @@ impl World {
                 }
                 let now = self.base + u64::from(op.t);
                 self.now = Some(now);
-                for j in 0..3 {
+                for j in 0..self.n() {
                     self.e(j).set_idempotency_clock_for_test(Some(now));
                 }
                 self.era += 1;
@@ -1656,6 +1803,74 @@ impl World {
             Step::Clock { m } => self.clock(*m as usize, op.t),
         }
         Ok(())
+    }
+
+    /// An unkeyed write on `m`, on top of what `m` holds: the version keeps its key
+    /// set. On the home track every `$inc` ends first when it is a counter.
+    fn touch(&mut self, m: usize, c: u8, d: u16, t: u32) -> Res<()> {
+        if self.down[m] {
+            return Ok(());
+        }
+        if c == ORDERS && self.sched.track == Track::Home && !self.driving && self.running.is_none()
+        {
+            self.driving = true;
+            for r in self.open_incs() {
+                self.drive(r)?;
+            }
+            self.driving = false;
+        }
+        let e = self.e(m);
+        let Ok(coll) = e.get_collection(DB, NAMES[c as usize]) else {
+            self.note(format!("{} lacks {}: no touch", LETTERS[m], NAMES[c as usize]));
+            return Ok(());
+        };
+        let id = DocId::Int64(if c == ITEMS { ITEM_BASE + i64::from(d) } else { i64::from(d) });
+        let body = match e.get(&coll, &id).map_err(|e| err("get", e))? {
+            Some(mut doc) => {
+                let u = doc.get_i64("u").unwrap_or(0);
+                doc.insert("u", u + 1);
+                doc
+            }
+            None if c == ITEMS => doc! { "u": 1i64, "ks": Vec::<Bson>::new() },
+            None => return Ok(()),
+        };
+        self.clock(m, t);
+        let out = e.replace(&coll, &id, body, true).map_err(|e| err("touch", e))?;
+        let s = format!(
+            "{} touched {}/{id:?} at {:?}",
+            LETTERS[m],
+            NAMES[c as usize],
+            out.stamp.map(|s| self.stamp(s))
+        );
+        self.note(s);
+        Ok(())
+    }
+
+    /// A step run between two pages of a snapshot into `to` from `from`: never one that
+    /// closes or sends to the receiver, nor closes the sender.
+    fn apply_between_pages(&mut self, op: &Op, to: usize, from: usize) -> Res<()> {
+        let skip = match &op.step {
+            Step::Send { m, .. } | Step::Touch { m, .. } => *m as usize == to,
+            Step::Pull { to: t, from: f } | Step::PullShort { to: t, from: f } => {
+                *t as usize == to || *f as usize == to
+            }
+            Step::Clock { .. } => false,
+            _ => true,
+        };
+        if skip {
+            self.note(format!("skipped between pages: {op}"));
+            return Ok(());
+        }
+        let _ = from;
+        self.out.between += 1;
+        let saved = self.step.clone();
+        self.step = format!("{saved} > {op}");
+        let out = match &op.step {
+            Step::Send { r, m, .. } => self.send_plain(*r, *m as usize, op.t),
+            _ => self.apply(op),
+        };
+        self.step = saved;
+        out
     }
 
     /// `$inc` requests accepted and not finished.
@@ -1682,6 +1897,11 @@ impl World {
             | Step::Create { m }
             | Step::Retention { m } => *m as usize == running,
             Step::Page { to, restart, .. } => *restart && *to as usize == running,
+            // An unkeyed write on the running member between its commits: the stamp
+            // rule then leaves that document (`skipped`), which I5 does not allow for.
+            Step::Touch { m, c, .. } => {
+                *m as usize == running && *c == ORDERS && self.sched.track == Track::Home
+            }
             _ => false,
         };
         if touches {
@@ -1709,7 +1929,7 @@ impl World {
     fn observe_records(&mut self) -> Res<()> {
         for r in 0..self.sched.requests.len() as u8 {
             let req = self.sched.requests[r as usize];
-            for m in 0..3 {
+            for m in 0..self.n() {
                 let record = self
                     .e(m)
                     .idempotency_record(coll_id(req.kind.coll()), &req.scope())
@@ -1729,7 +1949,7 @@ impl World {
     fn documents(&self, m: usize) -> Res<BTreeMap<(u8, String), (Stamp, Document)>> {
         let mut out = BTreeMap::new();
         let e = self.e(m);
-        for c in [ORDERS, ITEMS] {
+        for c in [ORDERS, ITEMS, BIG] {
             let Ok(meta) = e.get_collection(DB, NAMES[c as usize]) else { continue };
             e.for_each_record_after(&meta, None, WalkScope::Background, |id, stamp, doc| {
                 out.insert((c, format!("{id:?}")), (stamp, doc));
@@ -1742,7 +1962,7 @@ impl World {
 
     /// I1 on every stored version, I6 on every counter, I7 on every inserted document.
     fn check_stored(&mut self) -> Res<()> {
-        for m in 0..3 {
+        for m in 0..self.n() {
             for ((c, shown), (stamp, doc)) in self.documents(m)? {
                 let ks = ks_of(&doc);
                 let id = id_of(&doc);
@@ -1768,7 +1988,7 @@ impl World {
                     let bound = (0..self.sched.requests.len())
                         .filter(|r| self.sent[*r] && self.sched.requests[*r].kind.targets(d))
                         .count() as i64;
-                    if n > bound && (unexplained || strict()) {
+                    if n > bound && (unexplained || self.strict) {
                         let s = format!(
                             "{} counter {d} is {n}, above the {bound} requests sent for it: {ks:?}",
                             LETTERS[m]
@@ -1801,7 +2021,7 @@ impl World {
         let mut records: HashMap<(usize, u8, u8), Option<IdempotencyRecord>> = HashMap::new();
         let mut floors: HashMap<(usize, u8), Hlc> = HashMap::new();
         let mut failures = Vec::new();
-        let nodes: Vec<NodeId> = (0..3).map(|m| self.e(m).node_id()).collect();
+        let nodes: Vec<NodeId> = (0..self.n()).map(|m| self.e(m).node_id()).collect();
         let mut processed: Vec<(NodeId, Stamp)> = self.ghost.processed.keys().copied().collect();
         processed.sort();
         for (node, stamp) in processed {
@@ -1840,15 +2060,15 @@ impl World {
             if !record.as_ref().is_some_and(|rec| rec.first <= stamp) {
                 if self.ghost.g1b.contains(&(node, stamp)) {
                     if self.ghost.g1b_counted.insert((node, stamp)) {
-                        self.out.g1 += 1;
+                        self.out.relay += 1;
                         let s = format!(
-                            "G1b: {} took r{r}'s entry {} without its record, from a sender \
+                            "RELAY: {} took r{r}'s entry {} without its record, from a sender \
                              that held it",
                             LETTERS[m],
                             self.stamp(stamp)
                         );
                         self.note(s.clone());
-                        if strict() {
+                        if self.strict {
                             failures.push(format!("(strict) {s}"));
                         }
                     }
@@ -1861,9 +2081,9 @@ impl World {
                     // Finding G2 (see `on_own_effect`): the entry stands in the current
                     // life, and its request's record is buried by its `last`.
                     if self.ghost.g2.insert((node, stamp)) {
-                        self.out.g2 += 1;
+                        self.out.l1 += 1;
                         let s = format!(
-                            "G2: {} holds r{r}'s entry {} of the current life (from {}), its \
+                            "L1: {} holds r{r}'s entry {} of the current life (from {}), its \
                              record buried at its last {:?}",
                             LETTERS[m],
                             self.stamp(stamp),
@@ -1871,7 +2091,7 @@ impl World {
                             self.ghost.last.get(&r).map(|l| self.stamp(*l))
                         );
                         self.note(s.clone());
-                        if strict() {
+                        if self.strict {
                             failures.push(format!("(strict) {s}"));
                         }
                     }
@@ -1895,7 +2115,7 @@ impl World {
 
     fn fingerprint(&self) -> Res<String> {
         let mut out = String::new();
-        for m in 0..3 {
+        for m in 0..self.n() {
             let e = self.e(m);
             let _ = write!(
                 out,
@@ -1915,10 +2135,11 @@ impl World {
     }
 
     fn quiesce(&mut self) -> Res<bool> {
+        self.down.iter_mut().for_each(|d| *d = false);
         for _ in 0..QUIESCE_ROUNDS {
             let before = self.fingerprint()?;
-            for to in 0..3 {
-                for from in 0..3 {
+            for to in 0..self.n() {
+                for from in 0..self.n() {
                     if to != from {
                         self.pull(to, from, BATCH)?;
                         self.finish_purges()?;
@@ -1928,7 +2149,7 @@ impl World {
             self.repair_round()?;
             self.finish_purges()?;
             if self.fingerprint()? == before {
-                for m in 0..3 {
+                for m in 0..self.n() {
                     self.maybe_caught_up(m)?;
                 }
                 return Ok(true);
@@ -1944,8 +2165,8 @@ impl World {
     /// `count_repair_replay_from`, or pulled as a scoped page when the peer cannot
     /// serve from there.
     fn repair_round(&mut self) -> Res<()> {
-        for me in 0..3 {
-            for peer in 0..3 {
+        for me in 0..self.n() {
+            for peer in 0..self.n() {
                 if me == peer {
                     continue;
                 }
@@ -1978,7 +2199,7 @@ impl World {
                         "repair: {} lacks a collection, a scoped page from {}",
                         LETTERS[me], LETTERS[peer]
                     ));
-                    self.transfer(me, peer, Some(id), None)?;
+                    self.transfer(me, peer, Some(id), None, &[])?;
                 }
                 // The cut digest (ADR-230): a collection whose digests differ at the
                 // cut is repaired by a converge page (ADR-237).
@@ -2002,7 +2223,8 @@ impl World {
                             "repair: {}'s digest differs from {}'s, a converge page",
                             LETTERS[me], LETTERS[peer]
                         ));
-                        self.transfer(me, peer, Some(verdict.collection), Some(plan.cut.clone()))?;
+                        let cut = Some(plan.cut.clone());
+                        self.transfer(me, peer, Some(verdict.collection), cut, &[])?;
                     }
                 }
                 for (id, meta) in counts {
@@ -2018,7 +2240,7 @@ impl World {
                             ));
                             self.replay(me, peer, from, id)?;
                         }
-                        None => self.transfer(me, peer, Some(id), None)?,
+                        None => self.transfer(me, peer, Some(id), None, &[])?,
                     }
                 }
             }
@@ -2033,7 +2255,7 @@ impl World {
         if self.e(from).serve_verdict_from(floor).map_err(|e| err("serve_verdict_from", e))?
             != ServeVerdict::Serve
         {
-            return self.transfer(to, from, Some(id), None);
+            return self.transfer(to, from, Some(id), None, &[]);
         }
         let mut start = floor;
         for _ in 0..32 {
@@ -2066,7 +2288,7 @@ impl World {
                 continue;
             }
             if let Some(unknown) = outcome.unknown {
-                return self.transfer(to, from, Some(unknown.id), None);
+                return self.transfer(to, from, Some(unknown.id), None, &[]);
             }
             if window.exhausted {
                 return Ok(());
@@ -2079,8 +2301,8 @@ impl World {
     /// I4 and I5 once the cluster is quiet.
     fn check_settled(&mut self) -> Res<()> {
         // Identical documents.
-        let docs: Vec<_> = (0..3).map(|m| self.documents(m)).collect::<Res<_>>()?;
-        for m in 1..3 {
+        let docs: Vec<_> = (0..self.n()).map(|m| self.documents(m)).collect::<Res<_>>()?;
+        for m in 1..self.n() {
             if docs[m] == docs[0] {
                 continue;
             }
@@ -2136,7 +2358,7 @@ impl World {
         // Identical live records, after the merge rule.
         for (c, key) in self.keys() {
             let records: Vec<Option<IdempotencyRecord>> =
-                (0..3).map(|m| self.live_record(m, c, key)).collect::<Res<_>>()?;
+                (0..self.n()).map(|m| self.live_record(m, c, key)).collect::<Res<_>>()?;
             if records.iter().all(|r| *r == records[0]) {
                 continue;
             }
@@ -2155,7 +2377,7 @@ impl World {
                 .reduce(|a, b| a.merge(&b))
                 .expect("a record differs, so one is present");
             let mut kinds = Vec::new();
-            for m in 0..3 {
+            for m in 0..self.n() {
                 // Whether a live document here holds a request under the key.
                 let holds_effect = docs[m].iter().any(|((dc, _), (_, doc))| {
                     *dc == c
@@ -2165,9 +2387,9 @@ impl World {
                 });
                 kinds.push(match &records[m] {
                     Some(r) if *r == merged => "same",
-                    None if !holds_effect => "G3",
-                    None => "G1",
-                    Some(r) if r.merge(&merged) == merged => "G3",
+                    None if !holds_effect => "S1",
+                    None => "relay",
+                    Some(r) if r.merge(&merged) == merged => "S1",
                     _ => "bad",
                 });
             }
@@ -2195,14 +2417,14 @@ impl World {
                 self.fail(Inv::I4, detail);
                 continue;
             }
-            if kinds.contains(&"G1") {
-                self.out.g1 += 1;
+            if kinds.contains(&"relay") {
+                self.out.relay += 1;
             }
-            if kinds.contains(&"G3") {
-                self.out.g3 += 1;
+            if kinds.contains(&"S1") {
+                self.out.s1 += 1;
             }
             self.note(format!("finding: {detail}"));
-            if strict() {
+            if self.strict {
                 self.fail(Inv::I4, format!("(strict) {detail}"));
             }
         }
@@ -2230,7 +2452,7 @@ impl World {
                                     *k as u8,
                                 ))
                         });
-                    if n != want && !(explained && !strict()) {
+                    if n != want && !(explained && !self.strict) {
                         let s = format!(
                             "{} counter {d} is {n}, not the {want} requests accepted for it: {ks:?}",
                             LETTERS[m]
@@ -2245,7 +2467,7 @@ impl World {
 
     /// Whether the commit of request `r` that wrote `entry` straddles `end`, a drop: an
     /// entry of the same node and millisecond at or below it, `entry` above it (finding
-    /// G2: the record's `last`, the commit's first entry, is then buried with it).
+    /// L1: the record's `last`, the commit's first entry, is then buried with it).
     fn straddles(&self, r: u8, entry: Stamp, end: Hlc) -> bool {
         entry.hlc > end
             && self.ghost.entries.iter().any(|(s, (q, ..))| {
@@ -2485,15 +2707,17 @@ pub(crate) fn render(seed: Option<u64>, sched: &Schedule, out: &Outcome) -> Stri
 // -- Generation ------------------------------------------------------------------------------
 
 /// SplitMix64: reproducible from a seed, no dependency.
-struct Rng(u64);
+struct Rng {
+    state: u64,
+}
 
 impl Rng {
     fn new(seed: u64) -> Self {
-        Rng(seed ^ 0x5DEE_CE66_D1CE_4E5B)
+        Rng { state: seed ^ 0x5DEE_CE66_D1CE_4E5B }
     }
     fn next(&mut self) -> u64 {
-        self.0 = self.0.wrapping_add(0x9E37_79B9_7F4A_7C15);
-        let mut z = self.0;
+        self.state = self.state.wrapping_add(0x9E37_79B9_7F4A_7C15);
+        let mut z = self.state;
         z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
         z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
         z ^ (z >> 31)
@@ -2501,18 +2725,11 @@ impl Rng {
     fn below(&mut self, n: u64) -> u64 {
         self.next() % n
     }
-    fn member(&mut self) -> u8 {
-        self.below(3) as u8
-    }
-    fn other(&mut self, m: u8) -> u8 {
-        (m + 1 + self.below(2) as u8) % 3
-    }
-    fn pair(&mut self) -> (u8, u8) {
-        let to = self.member();
-        (to, self.other(to))
-    }
     fn chance(&mut self, percent: u64) -> bool {
         self.below(100) < percent
+    }
+    fn pick<T: Copy>(&mut self, from: &[T]) -> T {
+        from[self.below(from.len() as u64) as usize]
     }
 }
 
@@ -2520,12 +2737,16 @@ struct Gen {
     rng: Rng,
     track: Track,
     home: u8,
+    /// Members in the schedule.
+    n: u8,
     requests: Vec<Request>,
     /// Requests of the current era, which may be sent again.
     open: Vec<u8>,
-    skew: [i64; 3],
+    skew: [i64; MEMBERS_MAX],
     g: i64,
     resets: usize,
+    /// Members the schedule has taken down.
+    down: Vec<bool>,
 }
 
 const SKEWS: [i64; 7] = [-20, -10, 0, 0, 0, 10, 20];
@@ -2533,6 +2754,27 @@ const SKEWS: [i64; 7] = [-20, -10, 0, 0, 0, 10, 20];
 impl Gen {
     fn t(&self, m: u8, extra: i64) -> u32 {
         (self.g + extra + self.skew[m as usize]).max(1) as u32
+    }
+
+    fn up(&self) -> Vec<u8> {
+        (0..self.n).filter(|m| !self.down[*m as usize]).collect()
+    }
+
+    /// A member that is up.
+    fn member(&mut self) -> u8 {
+        let up = self.up();
+        self.rng.pick(&up)
+    }
+
+    /// Another member that is up, or `m` itself when none is.
+    fn other(&mut self, m: u8) -> u8 {
+        let others: Vec<u8> = self.up().into_iter().filter(|o| *o != m).collect();
+        if others.is_empty() { m } else { self.rng.pick(&others) }
+    }
+
+    fn pair(&mut self) -> (u8, u8) {
+        let to = self.member();
+        (to, self.other(to))
     }
 
     fn target(&mut self) -> Target {
@@ -2547,7 +2789,7 @@ impl Gen {
             })
             .collect();
         if !derived.is_empty() && self.rng.chance(50) {
-            let (r, pos) = derived[self.rng.below(derived.len() as u64) as usize];
+            let (r, pos) = self.rng.pick(&derived);
             Target::Derived(r, pos)
         } else {
             Target::Client(self.rng.below(3) as u8)
@@ -2556,12 +2798,13 @@ impl Gen {
 
     fn kind(&mut self) -> Kind {
         match self.rng.below(100) {
-            0..=29 => Kind::IncMulti,
-            30..=41 => Kind::IncSingle { d: self.rng.below(COUNTERS as u64) as u8 },
-            42..=55 => Kind::Insert { id: None },
-            56..=62 => Kind::Insert { id: Some(self.rng.below(3) as u8) },
-            63..=69 => Kind::Bulk,
-            70..=84 => Kind::Replace { at: self.target() },
+            0..=24 => Kind::IncMulti,
+            25..=34 => Kind::IncSingle { d: self.rng.below(COUNTERS as u64) as u8 },
+            35..=42 => Kind::IncRange { d: self.rng.below(COUNTERS as u64 - 1) as u8 },
+            43..=55 => Kind::Insert { id: None },
+            56..=61 => Kind::Insert { id: Some(self.rng.below(3) as u8) },
+            62..=68 => Kind::Bulk,
+            69..=84 => Kind::Replace { at: self.target() },
             _ => Kind::Delete { at: self.target() },
         }
     }
@@ -2571,7 +2814,8 @@ impl Gen {
         let r = self.requests.len() as u8;
         let kind = self.kind();
         let key = if !self.open.is_empty() && self.rng.chance(10) {
-            self.requests[self.open[self.rng.below(self.open.len() as u64) as usize] as usize].key
+            let q = self.rng.pick(&self.open.clone());
+            self.requests[q as usize].key
         } else {
             r + 1
         };
@@ -2580,19 +2824,27 @@ impl Gen {
         r
     }
 
+    /// A request to send: one of the era's again, or a new one.
+    fn request(&mut self, again: bool) -> u8 {
+        if again && !self.open.is_empty() {
+            self.rng.pick(&self.open.clone())
+        } else {
+            self.new_request()
+        }
+    }
+
     fn member_for(&mut self, r: u8) -> u8 {
         if self.track == Track::Home && self.requests[r as usize].kind.is_inc() {
             self.home
         } else {
-            self.rng.member()
+            self.member()
         }
     }
 
     fn send(&mut self, r: u8) -> Op {
         let m = self.member_for(r);
         let crash = self.rng.chance(25).then(|| {
-            let how = [Crash::AfterCommit, Crash::BeforeCommit, Crash::FsyncFails]
-                [self.rng.below(3) as usize];
+            let how = self.rng.pick(&[Crash::AfterCommit, Crash::BeforeCommit, Crash::FsyncFails]);
             (self.rng.below(4) as u8, how)
         });
         let mut inner = Vec::new();
@@ -2606,22 +2858,30 @@ impl Gen {
         Op { step: Step::Send { r, m, crash, inner }, t: self.t(m, 0) }
     }
 
+    /// An unkeyed write on `m` (the home's alone for a counter on the home track).
+    fn touch(&mut self, m: u8, extra: i64) -> Op {
+        let c = if self.rng.chance(50) { ORDERS } else { ITEMS };
+        let m = if c == ORDERS && self.track == Track::Home { self.home } else { m };
+        let d = if c == ORDERS { self.rng.below(COUNTERS as u64) } else { self.rng.below(3) };
+        Op { step: Step::Touch { m, c, d: d as u16 }, t: self.t(m, extra) }
+    }
+
     /// A step between two commits of request `r` on `m`.
     fn inner_op(&mut self, r: u8, m: u8) -> Op {
         let extra = 1 + self.rng.below(8) as i64;
         match self.rng.below(100) {
-            0..=34 => {
-                let (to, from) = self.rng.pair();
+            0..=29 => {
+                let (to, from) = self.pair();
                 Op { step: Step::Pull { to, from }, t: 0 }
             }
-            35..=44 => {
-                let (to, from) = self.rng.pair();
+            30..=37 => {
+                let (to, from) = self.pair();
                 Op { step: Step::PullShort { to, from }, t: 0 }
             }
-            45..=69 => {
+            38..=59 => {
                 // A concurrent attempt on another member: of the same request, or, on the
                 // home track (where every `$inc` stays home), of one that is not an `$inc`.
-                let other = self.rng.other(m);
+                let other = self.other(m);
                 let pick = if self.track == Track::Home && self.requests[r as usize].kind.is_inc() {
                     let not_inc: Vec<u8> = self
                         .open
@@ -2629,107 +2889,191 @@ impl Gen {
                         .copied()
                         .filter(|q| !self.requests[*q as usize].kind.is_inc())
                         .collect();
-                    (!not_inc.is_empty())
-                        .then(|| not_inc[self.rng.below(not_inc.len() as u64) as usize])
+                    (!not_inc.is_empty()).then(|| self.rng.pick(&not_inc))
                 } else {
                     Some(r)
                 };
                 match pick {
-                    Some(q) => Op {
+                    Some(q) if other != m => Op {
                         step: Step::Send { r: q, m: other, crash: None, inner: Vec::new() },
                         t: self.t(other, extra),
                     },
-                    None => Op { step: Step::Clock { m }, t: self.t(m, extra) },
+                    _ => Op { step: Step::Clock { m }, t: self.t(m, extra) },
                 }
             }
-            70..=84 => {
+            60..=69 => {
+                // A racing or on-top unkeyed write, on another member.
+                let other = self.other(m);
+                self.touch(other, extra)
+            }
+            70..=82 => {
                 let later = extra + self.rng.below(40) as i64;
                 Op { step: Step::Clock { m }, t: self.t(m, later) }
             }
-            85..=94 => {
-                let (to, from) = self.rng.pair();
+            83..=93 => {
+                let (to, from) = self.pair();
                 let c = if self.rng.chance(50) { ORDERS } else { ITEMS };
                 let converge = self.rng.chance(40);
                 let restart = to != m && self.rng.chance(50);
-                Op { step: Step::Page { to, from, c, converge, restart }, t: 0 }
+                Op { step: Step::Page { to, from, c, converge, restart, inner: Vec::new() }, t: 0 }
             }
-            _ => Op { step: Step::Restart { m: self.rng.other(m) }, t: 0 },
+            _ => Op { step: Step::Restart { m: self.other(m) }, t: 0 },
         }
+    }
+
+    /// A reset of `m` from `from`, with steps between the snapshot's pages now and then:
+    /// writes on the sender, a pull between two others.
+    fn reset(&mut self, m: u8, from: u8) -> Op {
+        let mut inner = Vec::new();
+        if self.rng.chance(50) {
+            let mut ops = Vec::new();
+            for _ in 0..1 + self.rng.below(3) {
+                let extra = 1 + self.rng.below(8) as i64;
+                ops.push(match self.rng.below(10) {
+                    0..=4 => {
+                        let again = self.rng.chance(40);
+                        let r = self.request(again);
+                        let at = if self.track == Track::Home
+                            && self.requests[r as usize].kind.is_inc()
+                        {
+                            self.home
+                        } else {
+                            from
+                        };
+                        Op {
+                            step: Step::Send { r, m: at, crash: None, inner: Vec::new() },
+                            t: self.t(at, extra),
+                        }
+                    }
+                    5..=8 => self.touch(from, extra),
+                    _ => {
+                        let (to, by) = self.pair();
+                        Op { step: Step::Pull { to, from: by }, t: 0 }
+                    }
+                });
+            }
+            inner.push((1 + self.rng.below(2) as u8, ops));
+        }
+        Op { step: Step::Reset { m, from, inner }, t: 0 }
     }
 }
 
-/// A schedule of `len` steps from `seed`.
+/// A schedule of `len` steps from `seed`: three members, or four now and then.
 pub(crate) fn generate(seed: u64, track: Track, len: usize) -> Schedule {
     let mut rng = Rng::new(seed);
-    let home = rng.member();
-    let skew = std::array::from_fn(|_| SKEWS[rng.below(SKEWS.len() as u64) as usize]);
-    let mut plan =
-        Gen { rng, track, home, requests: Vec::new(), open: Vec::new(), skew, g: 100, resets: 0 };
+    let n = if rng.chance(25) { 4 } else { 3 };
+    let home = rng.below(n as u64) as u8;
+    let skew = std::array::from_fn(|_| rng.pick(&SKEWS));
+    let mut plan = Gen {
+        rng,
+        track,
+        home,
+        n,
+        requests: Vec::new(),
+        open: Vec::new(),
+        skew,
+        g: 100,
+        resets: 0,
+        down: vec![false; n as usize],
+    };
     let mut ops = Vec::with_capacity(len);
     for _ in 0..len {
         plan.g += 10;
         if plan.rng.below(10) == 0 {
-            let m = plan.rng.below(3) as usize;
-            plan.skew[m] = SKEWS[plan.rng.below(SKEWS.len() as u64) as usize];
+            let m = plan.rng.below(n as u64) as usize;
+            plan.skew[m] = plan.rng.pick(&SKEWS);
         }
         let op = match plan.rng.below(100) {
-            0..=23 => {
+            0..=20 => {
                 let r = plan.new_request();
                 plan.send(r)
             }
-            24..=43 | 94..=99 if !plan.open.is_empty() => {
-                let r = plan.open[plan.rng.below(plan.open.len() as u64) as usize];
+            21..=38 => {
+                let r = plan.request(true);
                 plan.send(r)
             }
-            24..=43 | 94..=99 => {
-                let r = plan.new_request();
-                plan.send(r)
-            }
-            44..=61 => {
-                let (to, from) = plan.rng.pair();
+            39..=53 => {
+                let (to, from) = plan.pair();
                 Op { step: Step::Pull { to, from }, t: 0 }
             }
-            62..=66 => {
-                let (to, from) = plan.rng.pair();
+            54..=57 => {
+                let (to, from) = plan.pair();
                 Op { step: Step::PullShort { to, from }, t: 0 }
             }
-            67..=72 => {
-                let (to, from) = plan.rng.pair();
+            58..=64 => {
+                let m = plan.member();
+                plan.touch(m, 0)
+            }
+            65..=69 => {
+                let (to, from) = plan.pair();
                 let c = if plan.rng.chance(50) { ORDERS } else { ITEMS };
                 let converge = plan.rng.chance(40);
                 let restart = plan.rng.chance(60);
-                Op { step: Step::Page { to, from, c, converge, restart }, t: 0 }
+                Op { step: Step::Page { to, from, c, converge, restart, inner: Vec::new() }, t: 0 }
             }
-            73..=75 if plan.resets < SPARES => {
+            70..=72 if plan.resets < SPARES => {
                 plan.resets += 1;
-                let (mut m, from) = plan.rng.pair();
-                if track == Track::Home && m == plan.home {
-                    // A reset of the home loses what it alone held, the `$inc`s it
-                    // answered among them: data loss, not a retry's concern.
-                    m = 3 - m - from;
+                let from = plan.member();
+                // Not the home on the home track: a reset of it loses what it alone held,
+                // the `$inc`s it answered among them, data loss and not a retry's concern.
+                let targets: Vec<u8> = plan
+                    .up()
+                    .into_iter()
+                    .filter(|m| *m != from && !(track == Track::Home && *m == plan.home))
+                    .collect();
+                if targets.is_empty() {
+                    Op { step: Step::Restart { m: from }, t: 0 }
+                } else {
+                    let m = plan.rng.pick(&targets);
+                    plan.reset(m, from)
                 }
-                Op { step: Step::Reset { m, from }, t: 0 }
             }
-            73..=79 => Op { step: Step::Restart { m: plan.rng.member() }, t: 0 },
-            80..=82 => Op { step: Step::Crash { m: plan.rng.member() }, t: 0 },
-            83..=86 => {
-                let m = plan.rng.member();
+            70..=74 => Op { step: Step::Restart { m: plan.member() }, t: 0 },
+            75..=76 => Op { step: Step::Crash { m: plan.member() }, t: 0 },
+            77..=81 => {
+                // Down while at least two stay up (the home stays up on the home track),
+                // or a member back up.
+                let can_go: Vec<u8> = plan
+                    .up()
+                    .into_iter()
+                    .filter(|m| !(track == Track::Home && *m == plan.home))
+                    .collect();
+                let downed: Vec<u8> = (0..n).filter(|m| plan.down[*m as usize]).collect();
+                if !downed.is_empty() && (plan.up().len() <= 2 || plan.rng.chance(50)) {
+                    let m = plan.rng.pick(&downed);
+                    plan.down[m as usize] = false;
+                    Op { step: Step::Up { m }, t: 0 }
+                } else if plan.up().len() > 2 && !can_go.is_empty() {
+                    let m = plan.rng.pick(&can_go);
+                    plan.down[m as usize] = true;
+                    Op { step: Step::Down { m }, t: 0 }
+                } else {
+                    let (to, from) = plan.pair();
+                    Op { step: Step::Pull { to, from }, t: 0 }
+                }
+            }
+            82..=85 => {
+                let m = plan.member();
                 Op { step: Step::Drop { m }, t: plan.t(m, 0) }
             }
-            87..=91 => {
-                let m = plan.rng.member();
+            86..=90 => {
+                let m = plan.member();
                 Op { step: Step::Create { m }, t: plan.t(m, 0) }
             }
-            _ => {
+            91..=92 => {
                 // The window passes: an era ends.
                 plan.g += WINDOW_SECS as i64 * 1000 + 500;
                 plan.open.clear();
-                Op { step: Step::Retention { m: plan.rng.member() }, t: plan.g as u32 }
+                Op { step: Step::Retention { m: plan.member() }, t: plan.g as u32 }
+            }
+            _ => {
+                let r = plan.request(true);
+                plan.send(r)
             }
         };
         ops.push(op);
     }
-    Schedule { track, home: plan.home, requests: plan.requests, ops }
+    Schedule { track, home: plan.home, members: n, requests: plan.requests, ops }
 }
 
 // -- Running many ----------------------------------------------------------------------------
@@ -2744,9 +3088,9 @@ struct Sweep {
     schedules: usize,
     steps: usize,
     between: usize,
-    g1: usize,
-    g2: usize,
-    g3: usize,
+    relay: usize,
+    l1: usize,
+    s1: usize,
     dropped_elsewhere: usize,
     life_exempt: usize,
     replays: usize,
@@ -2779,9 +3123,9 @@ fn sweep(seeds: std::ops::Range<u64>, len: usize, threads: usize) -> Sweep {
                         t.schedules += 1;
                         t.steps += out.steps;
                         t.between += out.between;
-                        t.g1 += out.g1;
-                        t.g2 += out.g2;
-                        t.g3 += out.g3;
+                        t.relay += out.relay;
+                        t.l1 += out.l1;
+                        t.s1 += out.s1;
                         t.dropped_elsewhere += out.dropped_elsewhere;
                         t.life_exempt += out.life_exempt;
                         t.replays += out.replays;
@@ -2800,7 +3144,7 @@ fn sweep(seeds: std::ops::Range<u64>, len: usize, threads: usize) -> Sweep {
     eprintln!(
         "idempotency model: seeds {seeds:?} x 2 tracks, len {len}: {} schedules, {} steps ({} \
          between commits), {} replays, {} resumes, {} crashes, {} life-rule applications, {} exempt by a drop elsewhere (D1), \
-         {} G1, {} G2, {} G3, in {:.1?}",
+         {} relay, {} L1, {} S1, in {:.1?}",
         totals.schedules,
         totals.steps,
         totals.between,
@@ -2809,9 +3153,9 @@ fn sweep(seeds: std::ops::Range<u64>, len: usize, threads: usize) -> Sweep {
         totals.crashes,
         totals.life_exempt,
         totals.dropped_elsewhere,
-        totals.g1,
-        totals.g2,
-        totals.g3,
+        totals.relay,
+        totals.l1,
+        totals.s1,
         started.elapsed()
     );
     if let Some(report) = failure.into_inner().unwrap() {
@@ -2957,5 +3301,47 @@ fn finding_g1_a_relay_of_a_snapshot_held_version_drops_the_record() {
         held.is_some() && matches!(retry, Keyed::Replayed(_)) && n == 11,
         "M holds the `$inc`'s effect without its record ({held:?}), and a retry there applied \
          it again: {retry:?}, n = {n}"
+    );
+}
+
+/// Finding L1, minimal: a keyed `$inc` of two documents commits once, at (t,1) and
+/// (t,2); another member drops the collection at (t,1), in the same millisecond. The
+/// drop buries the first entry (`is_history` compares the HLC, at or below) and with it
+/// the record, whose `last` is that first entry, while the second document's version,
+/// at (t,2), stands in the life after the drop (ADR-236). The member then holds that
+/// document's effect with no live record, and a retry increments it a second time.
+/// Asserts the design's intent ("judged by `last`" exists so that a drop between two
+/// writes of one request never lets a retry write them again), so it fails until a
+/// record's `last` is the last entry its commit wrote.
+#[test]
+#[ignore = "finding L1: a drop in the millisecond of a commit's first entry buries its record (fix pending)"]
+fn finding_l1_a_drop_in_the_millisecond_of_a_commit_buries_its_record() {
+    let dir = tempfile::tempdir().unwrap();
+    let a = Engine::open(&dir.path().join("a.redb")).unwrap();
+    let b = Engine::open(&dir.path().join("b.redb")).unwrap();
+    let ca = a.create_collection("shop", "notes").unwrap();
+    a.insert_many(&ca, vec![doc! { "_id": 0i64, "n": 0i64 }, doc! { "_id": 1i64, "n": 0i64 }])
+        .unwrap();
+    pull_all(&b, &a);
+    let t = (crate::physical_now_ms() / 1000 + 3_600) * 1000;
+    let k = KeyedWrite::new(ScopeHash([7; 32]), Fingerprint([7; 32]));
+    a.advance_clock_past(&Stamp::new(Hlc::new(t, 0), a.node_id()));
+    let first = a.modify_where_keyed(&ca, &Candidates::Scan, &PlainInc, None, &k).unwrap();
+    assert!(matches!(first, Keyed::Fresh(ref o) if o.commits == 1 && o.modified == 2));
+    b.advance_clock_past(&Stamp::new(Hlc::new(t, 0), b.node_id()));
+    b.drop_collection("shop", "notes").unwrap();
+    assert_eq!(b.collection_dropped_at(ca.id).unwrap().map(|s| s.hlc), Some(Hlc::new(t, 1)));
+    pull_all(&a, &b);
+    a.finish_purges_now().unwrap();
+    let cn = a.get_collection("shop", "notes").expect("the life after the drop stands");
+    let n1 = |e: &Engine| e.get(&cn, &DocId::Int64(1)).unwrap().unwrap().get_i64("n").unwrap();
+    assert_eq!(n1(&a), 1, "premise: the second document's version stands, with the `$inc`");
+    let held = a.idempotency_record(cn.id, &k.scope).unwrap();
+    let retry = a.modify_where_keyed(&cn, &Candidates::Scan, &PlainInc, None, &k).unwrap();
+    assert_eq!(
+        n1(&a),
+        1,
+        "the `$inc` was applied twice to a document it wrote in the life that stands: record \
+         {held:?}, retry {retry:?}"
     );
 }
