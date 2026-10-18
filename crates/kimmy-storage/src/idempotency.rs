@@ -1691,6 +1691,24 @@ impl Engine {
         self.idempotency.now_ms.store(now_ms.unwrap_or(0), Ordering::SeqCst);
     }
 
+    /// Store `record` under a key as a peer's frame stores it
+    /// ([`Self::store_record`]: merged with the live record, its rows written,
+    /// its stamps witnessed), in a transaction of its own. For a test outside
+    /// this crate that needs what only replication brings, such as a record
+    /// two members met in (KR). Returns the record as stored.
+    #[cfg(any(test, feature = "test-hooks"))]
+    pub fn store_peer_record_for_test(
+        &self,
+        collection: CollectionId,
+        scope: &ScopeHash,
+        record: &IdempotencyRecord,
+    ) -> Result<Option<IdempotencyRecord>> {
+        let txn = self.begin_write(WriterHolder::Replication)?;
+        let stored = self.store_record(&txn, collection, scope, record, Some(record.last))?;
+        txn.commit()?;
+        Ok(stored)
+    }
+
     fn idempotency_now_ms(&self) -> u64 {
         #[cfg(any(test, feature = "test-hooks"))]
         {

@@ -993,6 +993,73 @@ async fn a_different_request_under_a_remembered_key_is_refused_and_writes_nothin
     );
 }
 
+/// The record a peer would send for another request under `key` (another
+/// fingerprint, stamped just below this member's, from another member), stored
+/// here as replication stores it: the two meet in the merge, and the record
+/// turns contested (KR). Returns the record as stored.
+fn contest(engine: &Engine, key: &str) -> kimmy_storage::IdempotencyRecord {
+    let orders = engine.get_collection("shop", "orders").unwrap();
+    let scope = kimmy_core::IdempotencyKey::from_raw(key).unwrap().scope_hash("local:root");
+    let live = engine.idempotency_record(orders.id, &scope).unwrap().expect("a record to contest");
+    let other = NodeId::from_bytes([0x43; 16]);
+    let at = kimmy_core::Stamp::new(kimmy_core::Hlc::new(live.first.hlc.wall_ms - 1, 0), other);
+    let theirs = kimmy_storage::IdempotencyRecord {
+        fingerprint: kimmy_core::Fingerprint([0x5a; 32]),
+        first: at,
+        last: at,
+        origin: other,
+        ..live.clone()
+    };
+    let stored = engine.store_peer_record_for_test(orders.id, &scope, &theirs).unwrap().unwrap();
+    assert!(stored.contested, "premise: two requests met under the key");
+    assert_eq!(
+        stored.fingerprint, live.fingerprint,
+        "premise: this member's record wins the merge"
+    );
+    stored
+}
+
+/// KR at the edge: a key two members accepted for two requests, whose records
+/// met here in a merge, is refused for every retry, `422
+/// idempotency_key_reused`, `retry: no`, writing nothing and never replayed,
+/// though the merged record carries this request's own fingerprint and first
+/// answer. Neither request's answer can stand for the key.
+#[tokio::test]
+async fn a_retry_under_a_key_two_requests_met_under_is_refused_and_writes_nothing() {
+    let node = node().await;
+    let cases: Vec<(&str, &str, &str, &[u8])> = vec![
+        ("POST", "/v1/db/shop/coll/orders/docs", "contested-insert-6f1c0e52", br#"{"n":1}"#),
+        ("PUT", "/v1/db/shop/coll/orders/docs/1", "contested-replace-6f1c0e52", br#"{"n":5}"#),
+        (
+            "POST",
+            "/v1/db/shop/coll/orders/update",
+            "contested-update-6f1c0e52",
+            br#"{"filter":{"_id":2},"update":{"$inc":{"n":1}}}"#,
+        ),
+    ];
+    for (method, path, key, body) in &cases {
+        let request = || Req::key(&format!("\"{key}\"")).raw(body, "application/json");
+        let first = node.send(method, path, request()).await;
+        assert_eq!(first.status, 200, "{method} {path}: {}", first.text);
+        contest(&node.state.engine, key);
+        let count = node.count().await;
+        let (one, two) = (node.doc("1").await, node.doc("2").await);
+        let before = node.metric("kimmy_idempotency_requests_total{outcome=\"reused\"}").await;
+        let retry = node.send(method, path, request()).await;
+        assert_eq!(retry.status, 422, "{method} {path}: {}", retry.text);
+        assert_eq!(retry.body["error"], "idempotency_key_reused", "{method} {path}");
+        assert_eq!(retry.body["retry"], "no", "{method} {path}");
+        assert!(!replayed(&retry), "{method} {path}: never the first answer");
+        assert_eq!(node.count().await, count, "{method} {path}: nothing written");
+        assert_eq!((node.doc("1").await, node.doc("2").await), (one, two), "{method} {path}");
+        assert_eq!(
+            node.metric("kimmy_idempotency_requests_total{outcome=\"reused\"}").await,
+            before + 1,
+            "{method} {path}: counted as a key reused"
+        );
+    }
+}
+
 /// A key belongs to a principal: the same key and request from another one is
 /// another request, applied on its own, never the first principal's replay.
 #[tokio::test]

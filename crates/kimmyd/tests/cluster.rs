@@ -4965,19 +4965,23 @@ async fn c6_a_member_that_caught_up_by_snapshot_answers_a_retry_from_the_record(
     assert_eq!(orders_where(&client, &c, &t[2], serde_json::json!({})).await, Some(21));
 }
 
-/// C8. A key used in one life of a collection, the collection dropped and created again: a
-/// retry with the old key applies afresh in the new life, and every member holds that one
-/// document.
+/// C8. A key used in one life of a collection, the collection dropped and created again:
+/// the key's record outlives the drop for its window (ADR-240, guarantee 7). A retry with
+/// the old key, on every member, replays its first answer and writes nothing to the new
+/// life; another request under the key is refused as a key reused, there too.
 #[tokio::test]
 #[ignore = "boots a real three-node cluster; run with --ignored"]
-async fn c8_an_old_key_applies_afresh_after_a_drop_and_a_recreation() {
+async fn c8_an_old_key_replays_after_a_drop_and_a_recreation() {
     const PATH: &str = "/v1/db/shop/coll/orders/docs";
     const BODY: &str = r#"{"_id":50,"v":"c8"}"#;
+    const OTHER: &str = r#"{"_id":51,"v":"c8"}"#;
     const KEY: &str = "c8-a-key-from-the-life-before";
     let client = reqwest::Client::new();
     let (a, b, c, t) = keyed_cluster(&client, "", serde_json::json!([])).await;
     let first = keyed_send(&client, &a, &t[0], reqwest::Method::POST, PATH, BODY, KEY).await;
     assert_eq!(first.status, 200, "{}", first.text);
+    // A member holding the document holds its record: the record rides with the coverage
+    // that brings the write.
     for (node, token) in [(&a, &t[0]), (&b, &t[1]), (&c, &t[2])] {
         eventually("the write on every member", || async {
             orders_where(&client, node, token, serde_json::json!({ "v": "c8" })).await == Some(1)
@@ -5005,14 +5009,22 @@ async fn c8_an_old_key_applies_afresh_after_a_drop_and_a_recreation() {
         .await;
     }
 
-    let again = keyed_send(&client, &b, &t[1], reqwest::Method::POST, PATH, BODY, KEY).await;
-    assert_eq!(again.status, 200, "{}", again.text);
-    assert!(!again.replayed, "the old life's record answers nothing: {again:?}");
+    for (node, token) in [(&b, &t[1]), (&c, &t[2]), (&a, &t[0])] {
+        let again = keyed_send(&client, node, token, reqwest::Method::POST, PATH, BODY, KEY).await;
+        assert_eq!(again.status, 200, "{}: {}", node.name, again.text);
+        assert!(again.replayed, "{}: the record outlives the drop: {again:?}", node.name);
+        assert_eq!(again.text, first.text, "{}: the first answer", node.name);
+        let other = keyed_send(&client, node, token, reqwest::Method::POST, PATH, OTHER, KEY).await;
+        assert_eq!(other.status, 422, "{}: {}", node.name, other.text);
+        assert_eq!(other.body["error"], "idempotency_key_reused", "{}", node.name);
+    }
     for (node, token) in [(&a, &t[0]), (&b, &t[1]), (&c, &t[2])] {
-        eventually("the new write on every member", || async {
-            orders_where(&client, node, token, serde_json::json!({ "v": "c8" })).await == Some(1)
-        })
-        .await;
+        assert_eq!(
+            orders_where(&client, node, token, serde_json::json!({})).await,
+            Some(0),
+            "{}: nothing written to the new life",
+            node.name
+        );
     }
 }
 

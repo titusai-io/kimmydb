@@ -2008,3 +2008,50 @@ async fn a_keyed_tool_call_sent_again_is_its_first_result_marked_as_a_replay() {
     let (code, _) = refusal(&reused);
     assert_eq!(code, "idempotency_key_reused", "{reused}");
 }
+
+/// KR through the tools: a key two members accepted for two calls, whose
+/// records met here in a merge, refuses every retry of the call as a key
+/// reused, writing nothing and never answering from the record, though the
+/// merged record is this call's own. The other member's record is stored as
+/// replication stores it.
+#[tokio::test]
+async fn a_keyed_tool_call_under_a_key_two_calls_met_under_is_refused() {
+    let server = Server::start().await;
+    seed(&server);
+    let root = server.root();
+    let orders = server.engine.get_collection("sales", "orders").unwrap();
+    let documents = || async {
+        server.call_ok(&root, "find", json!({"database":"sales","collection":"orders"})).await
+    };
+    for (i, (tool, arguments)) in keyed_calls().into_iter().enumerate() {
+        let key = format!("contested-{i:02}-6f1c0e52-8a1d");
+        let first = server.call(&root, tool, with_key(arguments.clone(), &key)).await;
+        assert!(first["error"].is_null(), "{tool}: {first}");
+
+        let scope = kimmy_core::IdempotencyKey::from_raw(&key).unwrap().scope_hash("local:root");
+        let live = server.engine.idempotency_record(orders.id, &scope).unwrap().expect("a record");
+        let other = kimmy_core::NodeId::from_bytes([0x43; 16]);
+        let at = kimmy_core::Stamp::new(kimmy_core::Hlc::new(live.first.hlc.wall_ms - 1, 0), other);
+        let theirs = kimmy_storage::IdempotencyRecord {
+            fingerprint: kimmy_core::Fingerprint([0x5a; 32]),
+            first: at,
+            last: at,
+            origin: other,
+            ..live.clone()
+        };
+        let stored =
+            server.engine.store_peer_record_for_test(orders.id, &scope, &theirs).unwrap().unwrap();
+        assert!(stored.contested, "{tool}: premise: two calls met under the key");
+        assert_eq!(
+            stored.fingerprint, live.fingerprint,
+            "{tool}: premise: this call's record wins"
+        );
+
+        let before = documents().await;
+        let retry = server.call(&root, tool, with_key(arguments, &key)).await;
+        let (code, _) = refusal(&retry);
+        assert_eq!(code, "idempotency_key_reused", "{tool}: {retry}");
+        assert!(retry["result"].is_null(), "{tool}: never the first result: {retry}");
+        assert_eq!(documents().await, before, "{tool}: nothing written");
+    }
+}
