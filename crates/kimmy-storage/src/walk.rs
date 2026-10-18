@@ -670,7 +670,7 @@ mod tests {
                 let witnessed = [(HELD_ORIGIN, Hlc::new(u64::MAX, 0))].into_iter().collect();
                 e.held_marks_covered_by(&witnessed).map(drop)
             }),
-            // covers: snapshot::Engine::snapshot_documents
+            // covers: snapshot::Engine::snapshot_rows
             ("snapshot_page", |e, _| e.snapshot_page(None, None).map(drop)),
             // covers: gc::Engine::collect_oplog, gc::Engine::collect_tombstones_within
             ("collect_garbage", |e, _| {

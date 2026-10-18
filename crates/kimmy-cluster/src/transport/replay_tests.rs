@@ -39,6 +39,24 @@ fn fixture(lost: i64, big: usize) -> Fixture {
 /// [`fixture`], and C also holds `tail` entries of a third origin that sort between
 /// the backup and the lost writes: what a serve's walk must read past to reach them.
 fn fixture_with_tail(lost: i64, big: usize, tail: usize) -> Fixture {
+    fixture_of(lost, big, tail, false)
+}
+
+/// The scope of the idempotency key the `i`th lost write is made under, when
+/// they are keyed.
+fn lost_scope(i: i64) -> kimmy_core::ScopeHash {
+    let mut scope = [0u8; 32];
+    scope[..8].copy_from_slice(&i.to_be_bytes());
+    kimmy_core::ScopeHash(scope)
+}
+
+fn lost_key(i: i64) -> kimmy_storage::KeyedWrite {
+    kimmy_storage::KeyedWrite::new(lost_scope(i), kimmy_core::Fingerprint([7; 32]))
+}
+
+/// [`fixture_with_tail`]; with `keyed`, each lost write is a keyed insert (under
+/// [`lost_key`]), and C pulled it with its record.
+fn fixture_of(lost: i64, big: usize, tail: usize, keyed: bool) -> Fixture {
     let writer_dir = tempfile::tempdir().unwrap();
     let writer = Engine::open(&writer_dir.path().join("kimmy.redb")).unwrap();
     let orders = writer.create_collection("shop", "orders").unwrap();
@@ -49,13 +67,24 @@ fn fixture_with_tail(lost: i64, big: usize, tail: usize) -> Fixture {
     // The lost writes are stamped after the third origin's entries.
     std::thread::sleep(Duration::from_millis(15));
     let pad = "x".repeat(big);
-    for chunk in (2..2 + lost).collect::<Vec<_>>().chunks(100) {
-        writer
-            .insert_many(
-                &orders,
-                chunk.iter().map(|i| bson::doc! { "_id": *i, "pad": pad.clone() }).collect(),
-            )
-            .unwrap();
+    if keyed {
+        for i in 2..2 + lost {
+            let doc = bson::doc! { "_id": i, "pad": pad.clone() };
+            let kimmy_storage::Keyed::Fresh(_) =
+                writer.insert_keyed(&orders, doc, &lost_key(i)).unwrap()
+            else {
+                panic!("a fresh key")
+            };
+        }
+    } else {
+        for chunk in (2..2 + lost).collect::<Vec<_>>().chunks(100) {
+            writer
+                .insert_many(
+                    &orders,
+                    chunk.iter().map(|i| bson::doc! { "_id": *i, "pad": pad.clone() }).collect(),
+                )
+                .unwrap();
+        }
     }
     let c_dir = tempfile::tempdir().unwrap();
     let c = Engine::open(&c_dir.path().join("kimmy.redb")).unwrap();
@@ -63,7 +92,8 @@ fn fixture_with_tail(lost: i64, big: usize, tail: usize) -> Fixture {
     loop {
         let window =
             writer.entries_for_peer(from, MAX_BATCH, kimmy_storage::WalkScope::Background).unwrap();
-        c.apply_batch(&window.entries).unwrap();
+        c.apply_batch_carrying(&window.entries, &window.records, kimmy_storage::RecordsVia::Pull)
+            .unwrap();
         if window.exhausted {
             break;
         }
@@ -208,6 +238,35 @@ async fn an_inbound_contact_serves_the_whole_replay() {
     assert!(replay_counters().get(true, ReplayResult::Served) >= served + 3, "pages were served");
 }
 
+/// A replay brings back the records of the keyed writes it brings back (B5): a
+/// member restored from a backup that lacks its own keyed writes takes them
+/// from C with their records, so a retry on it is answered from the record its
+/// own first application wrote rather than applied a second time.
+#[tokio::test]
+async fn a_replay_brings_back_the_records_of_the_keyed_writes_it_restores() {
+    let f = fixture_of(40, 0, 0, true);
+    let orders = f.a.get_collection("shop", "orders").unwrap();
+    assert_eq!(f.a.idempotency_record(orders.id, &lost_scope(2)).unwrap(), None, "premise");
+    let replayed = f.a.idempotency_records_received()[2];
+    for _ in 0..8 {
+        f.round().await.unwrap();
+        if f.catch_up.replay_answered(f.c.node_id()) {
+            break;
+        }
+    }
+    assert!(f.catch_up.replay_answered(f.c.node_id()), "the replay is answered");
+    assert_eq!(f.a.idempotency_records_received()[2], replayed + 40, "counted, by replay");
+    for i in 2..2 + f.lost {
+        let doc = bson::doc! { "_id": i, "pad": "" };
+        match f.a.insert_keyed(&orders, doc, &lost_key(i)).unwrap() {
+            kimmy_storage::Keyed::Replayed(record) => {
+                assert_eq!(record.origin, f.a.node_id(), "its own first application")
+            }
+            kimmy_storage::Keyed::Fresh(_) => panic!("the retry of {i} applied again"),
+        }
+    }
+}
+
 /// An unmarked member asks as well: it is armed, and nothing says it was restored
 /// until the replay proves it.
 #[tokio::test]
@@ -265,6 +324,7 @@ async fn pages_that_were_not_asked_for_are_refused() {
                 exhausted: true,
                 horizon: false,
                 scanned_to: from,
+                records: Vec::new(),
             },
         )
         .await
@@ -283,6 +343,7 @@ async fn pages_that_were_not_asked_for_are_refused() {
                 exhausted: true,
                 horizon: false,
                 scanned_to: at(1),
+                records: Vec::new(),
             },
         ),
         (
@@ -293,6 +354,7 @@ async fn pages_that_were_not_asked_for_are_refused() {
                 exhausted: false,
                 horizon: false,
                 scanned_to: at(4),
+                records: Vec::new(),
             },
         ),
         (
@@ -303,6 +365,7 @@ async fn pages_that_were_not_asked_for_are_refused() {
                 exhausted: false,
                 horizon: false,
                 scanned_to: at(9),
+                records: Vec::new(),
             },
         ),
         (
@@ -313,6 +376,7 @@ async fn pages_that_were_not_asked_for_are_refused() {
                 exhausted: false,
                 horizon: false,
                 scanned_to: at(9),
+                records: Vec::new(),
             },
         ),
         (
@@ -326,6 +390,7 @@ async fn pages_that_were_not_asked_for_are_refused() {
                 exhausted: false,
                 horizon: false,
                 scanned_to: at(9),
+                records: Vec::new(),
             },
         ),
         (
@@ -338,6 +403,7 @@ async fn pages_that_were_not_asked_for_are_refused() {
                 exhausted: false,
                 horizon: false,
                 scanned_to: at(MAX_BATCH as u64 + 9),
+                records: Vec::new(),
             },
         ),
     ];
@@ -370,6 +436,7 @@ async fn an_empty_page_that_is_not_the_end_does_not_finish_the_replay() {
                 exhausted: false,
                 horizon: false,
                 scanned_to: from,
+                records: Vec::new(),
             },
         )
         .await
@@ -389,6 +456,7 @@ async fn an_empty_page_that_is_not_the_end_does_not_finish_the_replay() {
                 exhausted: true,
                 horizon: false,
                 scanned_to: from,
+                records: Vec::new(),
             },
         )
         .await
@@ -420,6 +488,7 @@ async fn a_horizon_page_is_recorded_and_answers_nothing() {
                 exhausted: false,
                 horizon: true,
                 scanned_to: from,
+                records: Vec::new(),
             },
         )
         .await
@@ -545,6 +614,7 @@ fn the_new_frames_round_trip_and_an_older_build_ignores_the_ask() {
             exhausted: true,
             horizon: false,
             scanned_to: Hlc::new(3, 1),
+            records: Vec::new(),
         },
         Message::ReplayAck { next_from: Hlc::new(4, 0), done: false, stalled: None },
         Message::ReplayAck {
@@ -606,6 +676,7 @@ fn frames_page() -> Message {
         exhausted: true,
         horizon: false,
         scanned_to: Hlc::ZERO,
+        records: Vec::new(),
     }
 }
 
@@ -734,7 +805,7 @@ fn applying_a_page_twice_and_at_once_is_safe() {
         window.entries.iter().filter(|e| e.stamp.node == f.a.node_id()).cloned().collect();
     assert!(!page.is_empty());
     let apply = |via| {
-        replay_apply(&f.a, &f.catch_up, &"c", c, from, page.clone(), from, true, via).unwrap()
+        replay_apply(&f.a, &f.catch_up, &"c", c, from, page.clone(), &[], from, true, via).unwrap()
     };
     let (one, two) = std::thread::scope(|scope| {
         // UNSUPERVISED: a scripted peer or racing applier in a test, joined below, whose panic fails it
@@ -819,6 +890,7 @@ async fn the_ack_names_the_cursor_the_page_reached() {
                 exhausted: false,
                 horizon: false,
                 scanned_to: at(2),
+                records: Vec::new(),
             },
         )
         .await
@@ -1188,6 +1260,7 @@ async fn a_replay_of_many_pages_is_reported_once_not_once_per_page() {
                     exhausted,
                     horizon: false,
                     scanned_to,
+                    records: Vec::new(),
                 },
             )
             .await

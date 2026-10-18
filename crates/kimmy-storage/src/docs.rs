@@ -559,6 +559,8 @@ impl Engine {
             }
         }
         txn.commit()?;
+        #[cfg(test)]
+        crate::sync::race_hooks::reach(crate::sync::race_hooks::Race::KeyedCommitted);
         self.publish(vec![entry]);
 
         Ok(Keyed::Fresh((id, stamp)))

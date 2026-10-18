@@ -718,13 +718,40 @@ impl Engine {
         exhausted: bool,
         outcome: &mut SyncOutcome,
     ) -> Result<()> {
+        let none = crate::idempotency::RecordsVia::Push;
+        self.apply_peer_batch_carrying_into(
+            theirs,
+            entries,
+            &[],
+            none,
+            scanned_to,
+            exhausted,
+            outcome,
+        )
+    }
+
+    /// [`Self::apply_peer_batch_into`], with the idempotency records the frame
+    /// carried beside its entries (B5) and the way they came: each is stored in
+    /// the run that takes an entry of its collection (see
+    /// [`Self::apply_peer_window_carrying_into`]).
+    #[allow(clippy::too_many_arguments)]
+    pub fn apply_peer_batch_carrying_into(
+        &self,
+        theirs: &VersionVector,
+        entries: &[OplogEntry],
+        records: &[crate::idempotency::CarriedRecord],
+        via: crate::idempotency::RecordsVia,
+        scanned_to: Hlc,
+        exhausted: bool,
+        outcome: &mut SyncOutcome,
+    ) -> Result<()> {
         let window =
             PeerWindow { scanned_to, exhausted, passed_through: None, asked_partial: false };
         // Not the live pull path: a push (transport.rs, confirm.rs) and a
         // repair replay both land here with no pull's own `held` behind
         // them, and neither reads `outcome.coverage_raised`, so there is
         // nothing to compare it against and no reason to pay a read for one.
-        self.apply_peer_window_into(theirs, None, entries, window, outcome)
+        self.apply_peer_window_carrying_into(theirs, None, entries, records, via, window, outcome)
     }
 
     /// [`Self::apply_peer_batch_into`], for a window whose end the peer
@@ -744,12 +771,45 @@ impl Engine {
         window: PeerWindow,
         outcome: &mut SyncOutcome,
     ) -> Result<()> {
+        let none = crate::idempotency::RecordsVia::Pull;
+        self.apply_peer_window_carrying_into(theirs, mine, entries, &[], none, window, outcome)
+    }
+
+    /// [`Self::apply_peer_window_into`], with the idempotency records the frame
+    /// carried beside its entries (B5, "On the receiving side") and the way
+    /// they came.
+    ///
+    /// **A record is stored in the run that takes any entry of its collection
+    /// in the frame**, applied or superseded: on both outcomes of the merge,
+    /// since a lost write is still a write that happened, and a retry here must
+    /// be answered from its record rather than applied after the version that
+    /// beat it; and on any entry of the collection, not only the one that
+    /// carries it, since a drop in the same millisecond can judge the carrying
+    /// entry history and let the later ones apply. Through
+    /// [`Self::store_record`] (history refused, merged, rows at the merged `last`
+    /// and the carrying stamp, its stamps witnessed), in that run's
+    /// transaction. **Not stored when no entry of its collection is taken**:
+    /// deferred above the advertised vector, or left at the batch's stop; it
+    /// comes again with the entries. A record this build cannot decode is
+    /// dropped and counted, and its entries are applied all the same.
+    #[allow(clippy::too_many_arguments)]
+    pub fn apply_peer_window_carrying_into(
+        &self,
+        theirs: &VersionVector,
+        mine: Option<&VersionVector>,
+        entries: &[OplogEntry],
+        records: &[crate::idempotency::CarriedRecord],
+        via: crate::idempotency::RecordsVia,
+        window: PeerWindow,
+        outcome: &mut SyncOutcome,
+    ) -> Result<()> {
         let PeerWindow { scanned_to, exhausted, passed_through, asked_partial } = window;
         let introduced =
             Introduced { theirs, mine, scanned_to, exhausted, passed_through, asked_partial };
+        let mut frame = self.frame_records(records, via);
         self.test_apply_delay();
         let (applied, waited) = crate::engine::metered_writer_wait(|| {
-            self.apply_batch_absorbing_into(entries, Some(introduced), outcome)
+            self.apply_batch_absorbing_into(entries, Some(introduced), &mut frame, outcome)
         });
         outcome.writer_wait = waited;
         applied
@@ -1009,8 +1069,15 @@ impl Engine {
                     Ok(tried) => Ok(tried),
                 };
             match tried? {
-                Ok(window) => {
+                Ok(mut window) => {
                     record(WalkPath::Keys);
+                    // The records of the entries it ships, in the window's own
+                    // transaction: point reads, since the key walk passed over
+                    // what the requester holds and a range would read past it.
+                    let shipped: Vec<Stamp> = window.entries.iter().map(|e| e.stamp).collect();
+                    #[cfg(test)]
+                    race_hooks::reach(race_hooks::Race::WindowRecords);
+                    window.records = crate::idempotency::records_at_stamps(&txn, &shipped)?;
                     return Ok(window);
                 }
                 Err(why) => {
@@ -1027,7 +1094,21 @@ impl Engine {
                 }
             }
         }
-        let window = self.read_oplog_linear_in(&txn, start, limit, scope, skip, keep, budget)?;
+        let mut window =
+            self.read_oplog_linear_in(&txn, start, limit, scope, skip, keep, budget)?;
+        // The records of the entries it ships, in the window's own transaction:
+        // one range read of the rows between its first and last entry, keeping
+        // only the stamps it ships (B5).
+        if let (Some(first), Some(last)) = (window.entries.first(), window.entries.last()) {
+            let shipped: std::collections::HashSet<Stamp> =
+                window.entries.iter().map(|e| e.stamp).collect();
+            #[cfg(test)]
+            race_hooks::reach(race_hooks::Race::WindowRecords);
+            window.records =
+                crate::idempotency::records_for_window(&txn, first.stamp, last.stamp, &|stamp| {
+                    shipped.contains(stamp)
+                })?;
+        }
         record(path);
         // Said only once the linear walk has served the window: when it failed
         // as well (a body that cannot be decoded), no window was served and
@@ -1131,7 +1212,21 @@ impl Engine {
     /// commit per run; a batch with no schema change in it is exactly one
     /// commit. See [`Self::apply_batch_absorbing`] for the shape.
     pub fn apply_batch(&self, entries: &[OplogEntry]) -> Result<SyncOutcome> {
-        self.apply_batch_absorbing(entries, None)
+        self.apply_batch_carrying(entries, &[], crate::idempotency::RecordsVia::Pull)
+    }
+
+    /// [`Self::apply_batch`], with the idempotency records the entries came
+    /// with (B5), stored as [`Self::apply_peer_window_carrying_into`] says.
+    pub fn apply_batch_carrying(
+        &self,
+        entries: &[OplogEntry],
+        records: &[crate::idempotency::CarriedRecord],
+        via: crate::idempotency::RecordsVia,
+    ) -> Result<SyncOutcome> {
+        let mut frame = self.frame_records(records, via);
+        let mut outcome = SyncOutcome::default();
+        self.apply_batch_absorbing_into(entries, None, &mut frame, &mut outcome)?;
+        Ok(outcome)
     }
 
     /// [`Self::apply_batch`], also raising the witnessed vector by `extra`
@@ -1216,7 +1311,8 @@ impl Engine {
         introduced: Option<Introduced<'_>>,
     ) -> Result<SyncOutcome> {
         let mut outcome = SyncOutcome::default();
-        self.apply_batch_absorbing_into(entries, introduced, &mut outcome)?;
+        let mut frame = crate::idempotency::FrameRecords::none();
+        self.apply_batch_absorbing_into(entries, introduced, &mut frame, &mut outcome)?;
         Ok(outcome)
     }
 
@@ -1239,12 +1335,13 @@ impl Engine {
         &self,
         entries: &[OplogEntry],
         introduced: Option<Introduced<'_>>,
+        frame: &mut crate::idempotency::FrameRecords,
         outcome: &mut SyncOutcome,
     ) -> Result<()> {
         let (unknown, deferred, purging) =
             (outcome.unknown_collection, outcome.deferred, outcome.purge_pending);
-        let mut run = Run::default();
-        let applied = self.apply_batch_run(entries, introduced, outcome, &mut run);
+        let mut run = Run { via: Some(Engine::frame_via(frame)), ..Run::default() };
+        let applied = self.apply_batch_run(entries, introduced, frame, outcome, &mut run);
         let refused = std::mem::take(&mut run.refused);
         match &applied {
             Ok(()) => {
@@ -1277,6 +1374,7 @@ impl Engine {
         &'e self,
         entries: &[OplogEntry],
         introduced: Option<Introduced<'_>>,
+        frame: &mut crate::idempotency::FrameRecords,
         outcome: &mut SyncOutcome,
         run: &mut Run<'e>,
     ) -> Result<()> {
@@ -1316,7 +1414,7 @@ impl Engine {
                 witnessed.observe(entry.stamp);
                 continue;
             }
-            match self.apply_one(entry, position, run, &mut memo, outcome)? {
+            match self.apply_one(entry, position, run, &mut memo, frame, outcome)? {
                 Step::Taken => witnessed.observe(entry.stamp),
                 Step::Unknown(name) => {
                     outcome.unknown_collection += 1;
@@ -1490,6 +1588,10 @@ impl Engine {
         // Counted only now: a release in a run that failed to commit did not
         // happen, and the next window releases it again (ADR-169's addendum).
         self.count_held_marks_released(std::mem::take(&mut run.released));
+        // And the records stored in it, for the same reason (B5).
+        if let Some(via) = run.via {
+            self.count_records_received(via, std::mem::take(&mut run.records));
+        }
         let mut published = Vec::with_capacity(run.pending.len());
         let mut failed = None;
         for Pending { collection, entry, id, violations } in run.pending.drain(..) {
@@ -1816,6 +1918,10 @@ struct Run<'e> {
     /// commit has landed, even if what follows it then failed.
     last: bool,
     last_committed: bool,
+    /// Idempotency records stored into `txn` (B5), counted by `via` once it
+    /// commits.
+    records: usize,
+    via: Option<crate::idempotency::RecordsVia>,
 }
 
 /// An entry applied into the open run, with what its commit owes.
@@ -2125,6 +2231,7 @@ impl Engine {
         position: crate::engine::Position,
         run: &mut Run<'e>,
         memo: &mut Memo,
+        frame: &mut crate::idempotency::FrameRecords,
         outcome: &mut SyncOutcome,
     ) -> Result<Step> {
         // A node's own observation of a broken constraint is not a fact
@@ -2190,6 +2297,13 @@ impl Engine {
         }
 
         let collection = match self.judge_document(memo, entry, outcome)? {
+            Judged::Decided(Step::Taken) => {
+                // Superseded as history, and taken: the frame's records of its
+                // collection are stored now if any of them is not history
+                // itself (a record's `last` can be above its carrying entry).
+                self.store_frame_records_for_history(entry, run, memo, frame)?;
+                return Ok(Step::Taken);
+            }
             Judged::Decided(step) => return Ok(step),
             Judged::Apply(collection) => collection,
         };
@@ -2220,6 +2334,9 @@ impl Engine {
                 Judged::Decided(step) => {
                     #[cfg(test)]
                     race_hooks::absorbed(race_hooks::Race::DocumentRun);
+                    if matches!(step, Step::Taken) {
+                        self.store_frame_records_for_history(entry, run, memo, frame)?;
+                    }
                     return Ok(step);
                 }
                 Judged::Apply(current) => {
@@ -2234,21 +2351,53 @@ impl Engine {
             collection
         };
         let txn = self.run_txn(run)?;
-        match self.apply_remote_in_txn(txn, &collection, entry, position)? {
+        let applied = self.apply_remote_in_txn(txn, &collection, entry, position)?;
+        // The frame's records of this collection, on either outcome of the
+        // merge, in this run's transaction (B5).
+        if frame.owes(collection.id) {
+            run.records +=
+                self.store_frame_records(txn, memo, Some(&collection), collection.id, frame)?;
+        }
+        match applied {
             RemoteApplied::Applied { id, violations, released } => {
                 outcome.applied += 1;
                 run.released += u64::from(released);
                 run.pending.push(Pending { collection, entry: entry.clone(), id, violations });
             }
             // Nothing was written, so the run's transaction is exactly as it
-            // was — save a held mark released — and the next entry carries on
-            // in it.
+            // was — save a held mark released, and a record stored — and the
+            // next entry carries on in it.
             RemoteApplied::Superseded { released } => {
                 outcome.superseded += 1;
                 run.released += u64::from(released);
             }
         }
         Ok(Step::Taken)
+    }
+
+    /// The frame's records of a document entry judged history and taken: stored
+    /// in the run's transaction when one of them is not history itself, the run
+    /// opened for it only then. A record's `last` can be above the entry that
+    /// carries it, so its collection's later life may hold the record's later
+    /// chunks while the carrying entry was a drop's.
+    fn store_frame_records_for_history<'e>(
+        &'e self,
+        entry: &OplogEntry,
+        run: &mut Run<'e>,
+        memo: &mut Memo,
+        frame: &mut crate::idempotency::FrameRecords,
+    ) -> Result<()> {
+        if !frame.owes(entry.collection) {
+            return Ok(());
+        }
+        let standing = self.memo_collection(memo, entry.collection)?;
+        if !self.frame_holds_a_live_record(memo, standing.as_deref(), entry.collection, frame)? {
+            return Ok(());
+        }
+        let txn = self.run_txn(run)?;
+        run.records +=
+            self.store_frame_records(txn, memo, standing.as_deref(), entry.collection, frame)?;
+        Ok(())
     }
 
     /// Apply a replicated schema change.
@@ -3130,6 +3279,12 @@ pub(crate) mod race_hooks {
         /// A document repair's page has been taken and judged to apply, and has not yet taken
         /// the writer: a retention pass can commit between a plan and the page.
         ConvergePage,
+        /// A peer window has been read, and its idempotency records not yet (B5): not a
+        /// race, a point to show they are read in the window's own transaction.
+        WindowRecords,
+        /// A keyed insert has committed, and not yet published (B5): not a race, the point
+        /// a pull between the write and anything after it reads.
+        KeyedCommitted,
     }
 
     type Hook = Box<dyn FnOnce()>;
@@ -8780,6 +8935,7 @@ mod tests {
             scanned_to: window.entries[n - 1].stamp.hlc,
             exhausted: false,
             passed_through: None,
+            records: Vec::new(),
         }
     }
 
@@ -8899,6 +9055,7 @@ mod tests {
             scanned_to: whole.entries[0].stamp.hlc,
             exhausted: false,
             passed_through: None,
+            records: Vec::new(),
         };
 
         let competing = (Arc::clone(&b), theirs.clone(), whole.clone());
@@ -9029,6 +9186,7 @@ mod tests {
             scanned_to: whole.entries[1].stamp.hlc,
             exhausted: false,
             passed_through: None,
+            records: Vec::new(),
         };
 
         let competing = (Arc::clone(&b), theirs.clone(), whole.clone());
@@ -9071,6 +9229,7 @@ mod tests {
             scanned_to: window.entries[to - 1].stamp.hlc,
             exhausted: to == window.entries.len() && window.exhausted,
             passed_through: None,
+            records: Vec::new(),
         }
     }
 
@@ -9177,6 +9336,7 @@ mod tests {
             scanned_to: whole.scanned_to,
             exhausted: whole.exhausted,
             passed_through: None,
+            records: Vec::new(),
         };
         assert_eq!(kinds(&after), [OpKind::DropCollection, OpKind::CreateCollection]);
 
@@ -9325,6 +9485,7 @@ mod tests {
             scanned_to: whole.scanned_to,
             exhausted: whole.exhausted,
             passed_through: None,
+            records: Vec::new(),
         };
 
         let competing = (Arc::clone(&b), theirs.clone(), after);
@@ -9373,6 +9534,7 @@ mod tests {
             scanned_to: whole.entries[configure1].stamp.hlc,
             exhausted: false,
             passed_through: None,
+            records: Vec::new(),
         };
         apply(&b, &theirs, &held).unwrap();
         assert!(b.get_collection("shop", "orders").unwrap().vector.is_some());
@@ -9385,6 +9547,7 @@ mod tests {
             scanned_to: whole.scanned_to,
             exhausted: whole.exhausted,
             passed_through: None,
+            records: Vec::new(),
         };
 
         let competing = (Arc::clone(&b), theirs.clone(), after);
@@ -9585,6 +9748,7 @@ mod tests {
             entries,
             exhausted: false,
             passed_through: None,
+            records: Vec::new(),
         };
 
         // The configuration first, then the drop.

@@ -1724,7 +1724,7 @@ fn a_sender_finds_the_records_of_the_entries_it_ships() {
     }
     // A frame that ships the second and third chunks' entries and not the
     // first's: the range covers all three rows, the frame carries two.
-    let firsts: Vec<Stamp> = at.iter().map(|c| c.carrying).collect();
+    let firsts: Vec<Stamp> = at.iter().filter_map(|c| c.carrying).collect();
     let shipped: std::collections::HashSet<Stamp> =
         entries.iter().copied().filter(|s| *s > firsts[0]).collect();
     let window =
@@ -1732,7 +1732,7 @@ fn a_sender_finds_the_records_of_the_entries_it_ships() {
             shipped.contains(s)
         })
         .unwrap();
-    assert_eq!(window.iter().map(|c| c.carrying).collect::<Vec<_>>(), firsts[1..].to_vec());
+    assert_eq!(window.iter().filter_map(|c| c.carrying).collect::<Vec<_>>(), firsts[1..].to_vec());
 
     drop(txn);
     let other = engine.create_collection("shop", "items").unwrap();

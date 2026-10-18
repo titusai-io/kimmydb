@@ -58,12 +58,33 @@ pub(crate) enum Fits {
     Only(usize),
 }
 
-/// How many leading entries fit inside [`ENTRY_BUDGET`].
+/// How many leading entries fit inside [`ENTRY_BUDGET`], with the idempotency
+/// records they carry (B5): a record's bytes count with the entry whose stamp
+/// carries it, since a window cut to the entries that fit carries only theirs.
 ///
 /// Sizes each entry once and takes a running total, rather than serializing the
 /// whole batch to find out it is too big and then doing it again for a smaller one.
 /// The common case is a single pass that says `All`.
-pub(crate) fn how_many_fit(entries: &[OplogEntry]) -> Fits {
+pub(crate) fn how_many_fit(
+    entries: &[OplogEntry],
+    records: &[kimmy_storage::CarriedRecord],
+) -> Fits {
+    let mut carried: std::collections::HashMap<kimmy_core::Stamp, usize> =
+        std::collections::HashMap::new();
+    for record in records {
+        let Some(at) = record.carrying else { continue };
+        let size = match bson::serialize_to_vec(record) {
+            Ok(bytes) => bytes.len(),
+            // As an entry that does not encode: the frame would not either, so
+            // nothing from the entry that carries it on is offered.
+            Err(_) => {
+                return Fits::Only(
+                    entries.iter().position(|e| e.stamp == at).unwrap_or(entries.len()),
+                );
+            }
+        };
+        *carried.entry(at).or_default() += size;
+    }
     let mut total = 0usize;
     for (i, entry) in entries.iter().enumerate() {
         let size = match bson::serialize_to_vec(entry) {
@@ -73,12 +94,58 @@ pub(crate) fn how_many_fit(entries: &[OplogEntry]) -> Fits {
             // surface where it is reported properly.
             Err(_) => return Fits::Only(i),
         };
+        let size = size + carried.get(&entry.stamp).copied().unwrap_or(0);
         if total + size > ENTRY_BUDGET {
             return Fits::Only(i);
         }
         total += size;
     }
     Fits::All
+}
+
+/// A window's records that ride with `entries`: those whose carrying stamp is
+/// one of theirs. What a frame cut to fewer entries than its window carries.
+pub(crate) fn records_of(
+    entries: &[OplogEntry],
+    records: Vec<kimmy_storage::CarriedRecord>,
+) -> Vec<kimmy_storage::CarriedRecord> {
+    let shipped: std::collections::HashSet<kimmy_core::Stamp> =
+        entries.iter().map(|entry| entry.stamp).collect();
+    records
+        .into_iter()
+        .filter(|record| record.carrying.is_some_and(|at| shipped.contains(&at)))
+        .collect()
+}
+
+/// The `KIMMY_TEST`-style switch that makes the listed members send every frame
+/// and page **without** records, as a release before 0.52 does (C9 of the B5
+/// design): the in-process mixed-version test strips one member's sender.
+/// Process-wide, keyed by the serving member's node id, so two tests in one
+/// process do not share it.
+static TEST_STRIP_RECORDS: std::sync::RwLock<Vec<kimmy_core::NodeId>> =
+    std::sync::RwLock::new(Vec::new());
+
+/// Make each of `nodes` serve its windows, pushes, replays and snapshot pages
+/// without idempotency records, as an older release does. A test switch.
+#[doc(hidden)]
+pub fn set_test_strip_records(nodes: Vec<kimmy_core::NodeId>) {
+    if let Ok(mut stripped) = TEST_STRIP_RECORDS.write() {
+        *stripped = nodes;
+    }
+}
+
+/// Whether `node` serves without records ([`set_test_strip_records`]).
+pub(crate) fn strips_records(node: kimmy_core::NodeId) -> bool {
+    TEST_STRIP_RECORDS.read().is_ok_and(|stripped| stripped.contains(&node))
+}
+
+/// The records `engine` sends with a frame: none from a member a test has made
+/// an older release ([`set_test_strip_records`]).
+pub(crate) fn records_to_send(
+    engine: &Engine,
+    records: Vec<kimmy_storage::CarriedRecord>,
+) -> Vec<kimmy_storage::CarriedRecord> {
+    if strips_records(engine.node_id()) { Vec::new() } else { records }
 }
 
 /// How long a peer has to complete the handshake.
@@ -835,7 +902,7 @@ where
                 )
                 .await?;
             }
-            Message::ReplayEntries { from, entries, exhausted, horizon, scanned_to } => {
+            Message::ReplayEntries { from, entries, exhausted, horizon, scanned_to, records } => {
                 let counters = replay_counters();
                 let refuse = |why: &str| {
                     counters.bump(Via::Inbound, ReplayResult::Refused);
@@ -907,6 +974,7 @@ where
                     peer,
                     from,
                     entries,
+                    &records,
                     scanned_to,
                     exhausted,
                     Via::Inbound,
@@ -1016,7 +1084,10 @@ where
                 // recover. Answer with the count that fits instead, and let the
                 // requester ask again; see `Message::BatchTooLarge` for why serving
                 // fewer entries unasked would be a silent gap rather than a kindness.
-                match how_many_fit(&window.entries) {
+                // The records count: a window whose records push it over the
+                // frame is answered the same way (B5).
+                let records = records_to_send(engine, window.records);
+                match how_many_fit(&window.entries, &records) {
                     Fits::All => {
                         write_frame(
                             &mut stream,
@@ -1025,6 +1096,7 @@ where
                                 scanned_to: window.scanned_to,
                                 exhausted: window.exhausted,
                                 passed_through: window.passed_through,
+                                records,
                             },
                         )
                         .await?
@@ -1039,6 +1111,15 @@ where
                 // The whole database, or the one collection a repair named
                 // (ADR-152); resumed from wherever the requester says.
                 let page = match engine.snapshot_page(after, collection) {
+                    // A member a test has made an older release sends no
+                    // records and no records position (C9 of the B5 design).
+                    Ok(mut page) if strips_records(engine.node_id()) => {
+                        page.records.clear();
+                        if let Some(next) = page.next.as_mut() {
+                            next.records = None;
+                        }
+                        page
+                    }
                     Ok(page) => page,
                     // As a window's walk: the connection ends, quietly.
                     Err(kimmy_storage::StorageError::Stopping(reason)) => {
@@ -1132,7 +1213,7 @@ where
                 )
                 .await?;
             }
-            Message::Push { entries, scanned_to, exhausted, versions } => {
+            Message::Push { entries, scanned_to, exhausted, versions, records } => {
                 // The same cap a pull is served under: a peer must not be able
                 // to hand this node an unbounded batch to apply in one go.
                 if entries.len() > MAX_BATCH {
@@ -1157,9 +1238,11 @@ where
                 let mut outcome = SyncOutcome::default();
                 // Off the async worker, as the pull's apply is: see there.
                 let applied = kimmy_storage::blocking(|| {
-                    engine.apply_peer_batch_into(
+                    engine.apply_peer_batch_carrying_into(
                         &versions,
                         &entries,
+                        &records,
+                        kimmy_storage::RecordsVia::Push,
                         scanned_to,
                         exhausted,
                         &mut outcome,
@@ -1558,8 +1641,8 @@ where
         )
         .await?;
         let entries = match read_frame(stream).await? {
-            Message::Entries { entries, exhausted, scanned_to, .. } => {
-                (entries, exhausted, scanned_to)
+            Message::Entries { entries, exhausted, scanned_to, records, .. } => {
+                (entries, exhausted, scanned_to, records)
             }
             Message::BatchTooLarge { fits } if fits > 0 && fits < limit => {
                 limit = fits;
@@ -1593,7 +1676,7 @@ where
                 )));
             }
         };
-        let (entries, exhausted, scanned_to) = entries;
+        let (entries, exhausted, scanned_to, records) = entries;
         match replay_apply(
             engine,
             catch_up,
@@ -1601,6 +1684,7 @@ where
             their_node,
             from,
             entries,
+            &records,
             scanned_to,
             exhausted,
             Via::Outbound,
@@ -1660,6 +1744,7 @@ pub(crate) fn replay_apply(
     their_node: kimmy_core::NodeId,
     from: kimmy_core::Hlc,
     entries: Vec<kimmy_core::OplogEntry>,
+    records: &[kimmy_storage::CarriedRecord],
     scanned_to: kimmy_core::Hlc,
     exhausted: bool,
     via: Via,
@@ -1705,8 +1790,12 @@ pub(crate) fn replay_apply(
                 std::time::Instant::now(),
             )
             .map_err(|e| ProtocolError::Local(format!("writing the catching-up marker: {e}")))?;
-        let outcome = kimmy_storage::blocking(|| engine.apply_batch(&lost))
-            .map_err(|e| ProtocolError::Local(e.to_string()))?;
+        // With the records the page carried: an entry this member lost and reads
+        // back keeps its record too (B5).
+        let outcome = kimmy_storage::blocking(|| {
+            engine.apply_batch_carrying(&lost, records, kimmy_storage::RecordsVia::Replay)
+        })
+        .map_err(|e| ProtocolError::Local(e.to_string()))?;
         if outcome.unknown.is_some() {
             replay_counters().bump(via, ReplayResult::Stalled);
             return Ok(ReplayPage::Stalled(crate::protocol::ReplayStall::UnknownCollection));
@@ -1945,14 +2034,14 @@ where
             engine.note_state_held_refusal();
             say_state_held_refusal(engine, their_node);
         }
-        let (entries, exhausted, horizon, scanned_to) = if verdict
+        let (entries, exhausted, horizon, scanned_to, records) = if verdict
             != kimmy_storage::ServeVerdict::Serve
         {
-            (Vec::new(), false, true, from)
+            (Vec::new(), false, true, from, Vec::new())
         } else {
             if ours.get(their_node) <= from {
                 // Nothing held above where the replay asks: the whole answer.
-                (Vec::new(), true, false, from)
+                (Vec::new(), true, false, from, Vec::new())
             } else {
                 let budget = kimmy_storage::ExamineBudget {
                     time: replay_examine_time(
@@ -1975,12 +2064,15 @@ where
                     .filter(|entry| entry.stamp.node == their_node && entry.stamp.hlc > from)
                     .collect();
                 let mut exhausted = window.exhausted && window.passed_through.is_none();
-                if let Fits::Only(fits) = how_many_fit(&entries) {
+                let records = records_to_send(engine, records_of(&entries, window.records));
+                if let Fits::Only(fits) = how_many_fit(&entries, &records) {
                     // This side sizes the page: the peer cannot negotiate a limit.
                     entries.truncate(fits.max(1).min(entries.len()));
                     exhausted = false;
                 }
-                (entries, exhausted, false, window.scanned_to)
+                // Only the records of the entries the page carries.
+                let records = records_of(&entries, records);
+                (entries, exhausted, false, window.scanned_to, records)
             }
         };
         let last_sent = entries.last().map(|entry| entry.stamp.hlc);
@@ -1990,7 +2082,14 @@ where
         let count = entries.len();
         write_frame(
             stream,
-            &Message::ReplayEntries { from, entries, exhausted, horizon, scanned_to: after },
+            &Message::ReplayEntries {
+                from,
+                entries,
+                exhausted,
+                horizon,
+                scanned_to: after,
+                records,
+            },
         )
         .await?;
         counters.bump(Via::Inbound, ReplayResult::Served);
@@ -2382,7 +2481,7 @@ where
         // could make a lie (ADR-127). The decision lives in storage
         // (`coverage_up_to`), where it is tested between engines
         // without a network.
-        Message::Entries { entries, scanned_to, exhausted, passed_through } => {
+        Message::Entries { entries, scanned_to, exhausted, passed_through, records } => {
             // Where the sender's budget ended the window, when this request
             // asked for a partial one; one nobody asked for is not believed,
             // and the window is read as it always was (ADR-194).
@@ -2475,10 +2574,12 @@ where
             // rather than being misread as either.
             let (applied, apply_time) = kimmy_storage::blocking(|| {
                 let started = std::time::Instant::now();
-                let applied = engine.apply_peer_window_into(
+                let applied = engine.apply_peer_window_carrying_into(
                     &theirs,
                     Some(&mine),
                     &entries,
+                    &records,
+                    kimmy_storage::RecordsVia::Pull,
                     window,
                     &mut outcome,
                 );
@@ -6091,6 +6192,37 @@ mod tests {
         io::Error::from_raw_os_error(24)
     }
 
+    /// A frame counts the idempotency records its entries carry (B5): a window
+    /// whose entries fit alone is cut where an entry and the record riding with
+    /// it no longer do, and a record riding with no entry of the frame costs it
+    /// nothing.
+    #[test]
+    fn a_frame_counts_the_records_its_entries_carry() {
+        use kimmy_core::{CollectionId, DocId, Hlc, NodeId, OpKind, ScopeHash, Stamp};
+        let at = |ms: u64| Stamp::new(Hlc::new(ms, 0), NodeId::from_bytes([1; 16]));
+        let entry = |ms: u64, size: usize| OplogEntry {
+            stamp: at(ms),
+            kind: OpKind::Insert,
+            collection: CollectionId(1),
+            doc_id: Some(DocId::Int64(ms as i64)),
+            body: Some(vec![0; size]),
+        };
+        let third = ENTRY_BUDGET / 3;
+        let entries = vec![entry(1, third), entry(2, third)];
+        assert!(matches!(how_many_fit(&entries, &[]), Fits::All), "premise: they fit alone");
+        let record = kimmy_storage::CarriedRecord {
+            collection: CollectionId(1),
+            scope: ScopeHash([1; 32]),
+            carrying: Some(at(2)),
+            record: vec![0; third + third / 2],
+        };
+        assert!(matches!(how_many_fit(&entries, std::slice::from_ref(&record)), Fits::Only(1)));
+        let first = kimmy_storage::CarriedRecord { carrying: Some(at(1)), ..record.clone() };
+        assert!(matches!(how_many_fit(&entries, &[first]), Fits::Only(1)));
+        let stray = kimmy_storage::CarriedRecord { carrying: Some(at(3)), ..record };
+        assert!(matches!(how_many_fit(&entries, &[stray]), Fits::All));
+    }
+
     /// The keys on a snapshot page and in the cut digest's uncovered lists are converted
     /// between the stored and the legacy (schema-4) form at the engine's wire API and
     /// nowhere else (Decimal128 design 7.1, review v2.3-delta M2): `snapshot_page`,
@@ -7603,6 +7735,7 @@ mod tests {
                 scanned_to,
                 exhausted: true,
                 passed_through: None,
+                records: Vec::new(),
             };
             write_frame(&mut stream, &entries).await.unwrap();
             // The window was taken whole up to the advertised vector, so the
@@ -7721,6 +7854,7 @@ mod tests {
                 scanned_to,
                 exhausted: false,
                 passed_through: None,
+                records: Vec::new(),
             };
             write_frame(&mut stream, &entries).await.unwrap();
         }
@@ -7965,8 +8099,13 @@ mod tests {
                 other => panic!("expected AskEntries, got {other:?}"),
             }
             let scanned_to = window.last().unwrap().stamp.hlc;
-            let entries =
-                Message::Entries { entries: window, scanned_to, exhausted, passed_through: None };
+            let entries = Message::Entries {
+                entries: window,
+                scanned_to,
+                exhausted,
+                passed_through: None,
+                records: Vec::new(),
+            };
             write_frame(&mut stream, &entries).await.unwrap();
             if exhausted {
                 match read_frame(&mut stream).await.unwrap() {
@@ -8077,6 +8216,7 @@ mod tests {
             dropped_indexes: Vec::new(),
             tombstone_horizon: None,
             deleted_documents: Vec::new(),
+            records: Vec::new(),
         }
     }
 
@@ -8084,6 +8224,7 @@ mod tests {
         kimmy_storage::SnapshotCursor {
             collection: CollectionId::derive("shop", "orders"),
             after_key: after.to_be_bytes().to_vec(),
+            records: None,
         }
     }
 
@@ -9566,6 +9707,7 @@ mod tests {
                 scanned_to: window.scanned_to,
                 exhausted: window.exhausted,
                 versions: a.version_vector().unwrap(),
+                records: Vec::new(),
             };
             write_frame(&mut ours, &push).await.unwrap();
             read_frame(&mut ours).await
@@ -9611,7 +9753,13 @@ mod tests {
         let pushing = async {
             open_handshake(&pusher, &mut ours, SECRET, BINDING).await.unwrap();
             let scanned_to = entries.last().unwrap().stamp.hlc;
-            let push = Message::Push { entries, scanned_to, exhausted: false, versions };
+            let push = Message::Push {
+                entries,
+                scanned_to,
+                exhausted: false,
+                versions,
+                records: Vec::new(),
+            };
             write_frame(&mut ours, &push).await.unwrap();
             let answer = read_frame(&mut ours).await;
             drop(ours);
@@ -9822,6 +9970,7 @@ mod tests {
                     scanned_to: window.scanned_to,
                     exhausted: window.exhausted,
                     versions: versions.clone(),
+                    records: Vec::new(),
                 };
                 write_frame(&mut ours, &push).await.unwrap();
                 match read_frame(&mut ours).await.unwrap() {
@@ -10042,6 +10191,7 @@ mod tests {
                 scanned_to,
                 exhausted: true,
                 passed_through: None,
+                records: Vec::new(),
             },
         )
         .await
@@ -10433,6 +10583,7 @@ mod tests {
                 scanned_to,
                 exhausted: false,
                 passed_through: None,
+                records: Vec::new(),
             };
             write_frame(&mut stream, &entries).await.unwrap();
             let _ = read_frame(&mut stream).await;
@@ -10962,6 +11113,7 @@ mod tests {
                     scanned_to,
                     exhausted: true,
                     passed_through: None,
+                    records: Vec::new(),
                 };
                 if write_frame(&mut stream, &entries).await.is_err() {
                     return;
@@ -11990,6 +12142,7 @@ mod partial_windows_never_skip {
                     scanned_to,
                     exhausted: true,
                     passed_through: None,
+                    records: Vec::new(),
                 };
                 write_frame(&mut peer_end, &entries).await.unwrap();
             }

@@ -1535,6 +1535,7 @@ pub(crate) mod tests {
             scanned_to: Hlc::new(scanned_to, 0),
             exhausted,
             passed_through: None,
+            records: Vec::new(),
         };
         assert_eq!(window_end(&window(true, 20)), WindowEnd::Exhausted);
         assert_eq!(

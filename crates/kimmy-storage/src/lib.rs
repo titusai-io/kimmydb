@@ -129,6 +129,9 @@ mod mixed_roll_tests;
 mod idempotency_tests;
 
 #[cfg(test)]
+mod idempotency_repl_tests;
+
+#[cfg(test)]
 mod log_capture;
 #[cfg(feature = "test-hooks")]
 pub use live_walk::stop_open_after_rows_for_test;
@@ -166,7 +169,7 @@ pub use hold_meter::{
 };
 pub use idempotency::{
     CarriedRecord, IdempotencyRecord, InFlightGuard, Keyed, KeyedWrite, ModifyRecorded,
-    RecordOutcome, RecordState, ReturnedImage,
+    RecordOutcome, RecordState, RecordsVia, ReturnedImage, lenient_records,
 };
 pub use index::{CandidateOrder, Dropped, IndexScan, IndexScanOutcome};
 pub use meta::{CollectionMeta, DatabaseMeta, Enforcement, IndexField, IndexMeta, VectorConfig};
