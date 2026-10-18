@@ -2997,6 +2997,9 @@ impl World {
             Step::Pull { to: t, .. } | Step::PullShort { to: t, .. } => *t as usize == to,
             Step::Page { to: t, restart, .. } => *t as usize == to || *restart,
             Step::Clock { .. } => false,
+            // The sender restored between two pages (m4): its change log begins again
+            // over the records its backup holds, or not at all.
+            Step::Backup { m } | Step::Restore { m, .. } => *m as usize == to,
             _ => true,
         };
         if skip {
@@ -3037,6 +3040,9 @@ impl World {
             | Step::Reset { m, .. }
             | Step::Drop { m, .. }
             | Step::Create { m, .. }
+            | Step::Restore { m, .. }
+            | Step::Rewind { m }
+            | Step::Orphan { m }
             | Step::Retention { m } => *m as usize == running,
             Step::Page { to, restart, .. } => *restart && *to as usize == running,
             // An unkeyed write on the running member between its commits: the stamp
@@ -4141,6 +4147,78 @@ impl Gen {
         }
     }
 
+    /// A restore of `m` from its latest backup or the one before, with steps between the
+    /// replay's pages now and then: a keyed write or a pull elsewhere, a backup or a
+    /// restore of another member (a sender's change log begins again under a cursor).
+    fn restore(&mut self, m: u8) -> Op {
+        let nth = u8::from(self.rng.chance(20));
+        let mut inner = Vec::new();
+        if self.rng.chance(40) {
+            let mut ops = Vec::new();
+            for _ in 0..1 + self.rng.below(2) {
+                let other = self.other(m);
+                let extra = 1 + self.rng.below(8) as i64;
+                ops.push(match self.rng.below(10) {
+                    0..=3 => {
+                        let again = self.rng.chance(50);
+                        let r = self.request(again);
+                        let at = if self.track == Track::Home
+                            && self.requests[r as usize].kind.is_inc()
+                        {
+                            self.home
+                        } else {
+                            other
+                        };
+                        Op {
+                            step: Step::Send { r, m: at, crash: None, inner: Vec::new() },
+                            t: self.t(at, extra),
+                        }
+                    }
+                    4..=5 => {
+                        let by = self.other(other);
+                        Op { step: Step::Pull { to: other, from: by }, t: 0 }
+                    }
+                    6 => Op { step: Step::Backup { m: other }, t: 0 },
+                    7 if !(self.track == Track::Home && other == self.home) => {
+                        Op { step: Step::Restore { m: other, nth: 0, inner: Vec::new() }, t: 0 }
+                    }
+                    _ => self.touch(other, extra),
+                });
+            }
+            inner.push((1 + self.rng.below(3) as u8, ops));
+        }
+        Op { step: Step::Restore { m, nth, inner }, t: 0 }
+    }
+
+    /// Steps between a scoped or converge page's pages, now and then: a keyed or unkeyed
+    /// write on the sender, its backup, or its restore (m4: its change log begins again).
+    fn between_pages(&mut self, from: u8) -> Vec<(u8, Vec<Op>)> {
+        if !self.rng.chance(25) {
+            return Vec::new();
+        }
+        let extra = 1 + self.rng.below(8) as i64;
+        let op = match self.rng.below(10) {
+            0..=3 => {
+                let again = self.rng.chance(40);
+                let r = self.request(again);
+                let at = if self.track == Track::Home && self.requests[r as usize].kind.is_inc() {
+                    self.home
+                } else {
+                    from
+                };
+                Op { step: Step::Send { r, m: at, crash: None, inner: Vec::new() }, t: self.t(at, extra) }
+            }
+            4..=5 => self.touch(from, extra),
+            6 => Op { step: Step::Backup { m: from }, t: 0 },
+            _ if !(self.track == Track::Home && from == self.home) => {
+                let nth = self.rng.below(2) as u8;
+                Op { step: Step::Restore { m: from, nth, inner: Vec::new() }, t: 0 }
+            }
+            _ => self.touch(from, extra),
+        };
+        vec![(1, vec![op])]
+    }
+
     /// A reset of `m` from `from`, with steps between the snapshot's pages now and then:
     /// writes on the sender, a pull between two others.
     fn reset(&mut self, m: u8, from: u8) -> Op {
@@ -4165,7 +4243,12 @@ impl Gen {
                             t: self.t(at, extra),
                         }
                     }
-                    5..=8 => self.touch(from, extra),
+                    5..=7 => self.touch(from, extra),
+                    8 if self.rng.chance(50) => Op { step: Step::Backup { m: from }, t: 0 },
+                    8 if !(self.track == Track::Home && from == self.home) => {
+                        let nth = self.rng.below(2) as u8;
+                        Op { step: Step::Restore { m: from, nth, inner: Vec::new() }, t: 0 }
+                    }
                     _ => {
                         let (to, by) = self.pair();
                         Op { step: Step::Pull { to, from: by }, t: 0 }
@@ -4229,7 +4312,8 @@ pub(crate) fn generate(seed: u64, track: Track, len: usize) -> Schedule {
                 let c = if plan.rng.chance(50) { ORDERS } else { ITEMS };
                 let converge = plan.rng.chance(40);
                 let restart = plan.rng.chance(60);
-                Op { step: Step::Page { to, from, c, converge, restart, inner: Vec::new() }, t: 0 }
+                let inner = plan.between_pages(from);
+                Op { step: Step::Page { to, from, c, converge, restart, inner }, t: 0 }
             }
             70..=72 if plan.resets < SPARES => {
                 plan.resets += 1;
@@ -4290,9 +4374,21 @@ pub(crate) fn generate(seed: u64, track: Track, len: usize) -> Schedule {
                 if track == Track::Home && m == plan.home {
                     Op { step: Step::Restart { m }, t: 0 }
                 } else {
-                    Op { step: Step::Restore { m, nth: 0, inner: Vec::new() }, t: 0 }
+                    plan.restore(m)
                 }
             }
+            95 => {
+                // A rewind to a moment a little back: what it discards comes back from
+                // the peers that hold it. Not the home on the home track, as a restore.
+                let m = plan.member();
+                if track == Track::Home && m == plan.home {
+                    Op { step: Step::Restart { m }, t: 0 }
+                } else {
+                    let back = plan.rng.below(60) as i64;
+                    Op { step: Step::Rewind { m }, t: plan.t(m, -back) }
+                }
+            }
+            96 => Op { step: Step::Orphan { m: plan.member() }, t: 0 },
             91..=92 => {
                 // The window passes: an era ends.
                 plan.g += WINDOW_SECS as i64 * 1000 + 500;
