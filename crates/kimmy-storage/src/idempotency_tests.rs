@@ -1117,6 +1117,21 @@ fn l1_a_bulk_inserts_record_runs_from_its_first_entry_to_its_last() {
     assert!(at.contains(&stamps[0]) && at.contains(&stamps[2]), "rows at both: {at:?}");
 }
 
+/// The lookahead never ends a request that has a match it could still write:
+/// two-document chunks over three documents, the first chunk's lookahead finds
+/// the third, the request goes on and writes it, and `done` comes with it.
+#[test]
+fn the_lookahead_does_not_end_a_request_with_a_match_it_could_write() {
+    let (engine, coll, _dir, _path) = open();
+    counters(&engine, &coll, 3);
+    engine.set_multi_chunk_docs(2);
+    let k = keyed(93);
+    let out = fresh(engine.modify_where_keyed(&coll, &Candidates::Scan, &Inc, None, &k).unwrap());
+    assert_eq!((out.modified, out.skipped, out.commits), (3, 0, 2), "{out:?}");
+    assert_eq!(ns(&engine, &coll, 3), vec![1, 1, 1], "every match written");
+    assert_eq!(record(&engine, &coll, &k).unwrap().state, RecordState::Done);
+}
+
 /// F4. A three-chunk `$inc` that fails at chunk two's commit: after the reopen
 /// the retry resumes after chunk one, and every document is incremented once.
 #[test]
