@@ -498,6 +498,12 @@ resolver. Something untestable in place tends to stay untested.
 | Leave the undone future in the oplog | `the_undone_future_leaves_the_oplog` |
 | Skip index maintenance during the rewind | `indexes_follow_the_rewind` |
 | Leave the version vector high after the oplog shrinks | `the_undone_future_leaves_the_oplog` |
+| Leave the witnessed vector high after a rewind | `a_rewind_lowers_every_origin_it_discarded_to_the_target_and_no_lower`, `a_rewound_member_asks_its_peer_again_for_what_it_discarded` |
+| Rebuild the servable vector from the oplog the rewind kept (0.51) | `a_rewind_after_retention_keeps_the_coverage_of_what_retention_collected`, `a_rewind_that_discards_nothing_changes_neither_vector`, the convergence model's RW1 row |
+| Rebuild the witnessed vector from the oplog the rewind kept (0.51) | `a_rewind_after_retention_keeps_the_coverage_of_what_retention_collected`, `a_rewind_that_discards_nothing_changes_neither_vector` |
+| Set the witnessed vector to the lowered servable one | `a_rewind_that_discards_nothing_changes_neither_vector` |
+| Write no verified record after the rewind | `restore_carries_no_record_and_restore_until_leaves_a_true_one` |
+| Resume the clock without the rewinds' records, or record no minted tombstone | `a_start_after_a_rewind_resumes_the_clock_past_what_it_discarded_and_minted` |
 
 **The first one escaped on the first run**, and it is the most important refusal
 in the feature: without it a rewind leaves an unrecoverable document at its

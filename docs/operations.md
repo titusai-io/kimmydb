@@ -2386,6 +2386,28 @@ passed**, so a refusal leaves the file exactly as the restore wrote it.
 > writes.** Anti-entropy would put them straight back. Run it standalone, or
 > rewind every node.
 
+A rewind that discarded nothing (the command reports `0 oplog entries
+discarded`) undid no writes, so this rule does not apply to it: the member
+rejoins its cluster as any restored member does. A rewind keeps what the member
+covers at or below the target and lowers it to the target above it
+([ADR-243](decisions.md)).
+
+**A member rewound by 0.51 or earlier that has rejoined its cluster.** That
+rewind lowered the member's version vectors below writes retention had
+collected, its own among them, so a peer that had not taken one of those writes,
+a collection's drop among them, is never told it lacks it. A peer that pulls a
+whole-database page from the member logs, at `WARN`, `a whole-database page
+denied a collection with a stamp its sender's own coverage does not name;
+ignored`, with the collection and the stamp. Either remedy closes it:
+
+- Stop the member, remove its `kimmy.redb`, and restore it again from the same
+  backup with this release's `kimmyd restore --from … --until …`, then start it.
+  The rewind keeps what the member covers, and its peers take the writes they
+  lack from it.
+- Or stop the member, remove its `kimmy.redb`, and start it empty, so it takes
+  its peers' state. Then make again by hand each of its writes that no peer
+  holds, such as the drop the `WARN` names.
+
 ### The identity comes back with it
 
 A backup carries the node's id, and a restore keeps it. That is what you want

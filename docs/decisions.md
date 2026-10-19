@@ -1433,6 +1433,11 @@ neither is worth guessing.
 
 ## ADR-044 — Point-in-time restore rewinds from post-images, and refuses what it cannot reconstruct
 
+> **Amended by [ADR-243](#adr-243--a-rewind-lowers-each-vector-to-its-target-and-no-lower).** The vectors no
+> longer come down "with the oplog". Rebuilt from what it kept, they lost coverage at or below the target of what
+> retention had collected, the member's own drops among them, and a cluster with a member rewound after a retention
+> pass stayed diverged. A rewind lowers each vector to its target and no lower (`Engine::lower_vectors_to_target`).
+
 **Decision.** `kimmyd restore --from <backup> --until <ms>` restores a backup and
 then rewinds document state to that instant using the oplog the backup carries.
 It refuses — having written nothing — when the target predates the oplog
@@ -16547,6 +16552,14 @@ phase.
 
 ## ADR-173 — A resume token carries its issuing member's delivered vector, and resumes on any member
 
+> **Amended by [ADR-243](#adr-243--a-rewind-lowers-each-vector-to-its-target-and-no-lower).** A rewind no longer
+> replaces the vectors with the maximum over the entries it keeps (`reset_version_vector_to_oplog`): it lowers each
+> to its target, in one transaction. So it does not leave a member's witnessed position below a held entry at or
+> below the target, and that mark goes as it would without the rewind (the origin writing again, or retention); the
+> rewind still removes a mark with the row it discards. Invariant I holds after it, as below. The record of a rewind
+> also carries, under the member's own origin, the newest tombstone it minted, and a start resumes its clock past
+> every stamp a record names.
+
 > **Corrects [ADR-055](#adr-055--the-client-protocol-is-httpjson-and-websocket-said-out-loud)'s**
 > "resume tokens that are portable across nodes", which `docs/clients.md`, the
 > Rust and Python clients and `openapi.yaml` repeated as "a reconnect may land
@@ -28566,3 +28579,90 @@ delete leaving no chunk in either format, the rescan moving or re-embedding, one
 0.50 write and a twin delete judged again when the roll ends). `kimmy-cluster`: the roll read from the facts blocks,
 and the field's lenient decode. `kimmy-api`: V2, V3 (both join directions, with debris) and V5 inverted. Mutation rows
 in bash, one per clause.
+
+---
+
+## ADR-243 — A rewind lowers each vector to its target and no lower
+
+> **Amends [ADR-044](#adr-044--point-in-time-restore-rewinds-from-post-images-and-refuses-what-it-cannot-reconstruct)
+> and [ADR-173](#adr-173--a-resume-token-carries-its-issuing-members-delivered-vector-and-resumes-on-any-member).**
+> Not a rollback boundary: no format, table, key or schema changes, and `I_EPOCH` is unchanged.
+
+**The case (RW1).** Found by the idempotency model's long suite (seed 1000688), minimised to seven steps, and
+reproduced on 0.51.0 with no idempotency code by the convergence model's row
+`row_rw1_a_rewind_after_retention_keeps_the_members_collected_drop`. B drops `items`. B's retention pass collects
+B's own drop entry before A or C has taken it (they are past the oplog window and within the tombstone window). B
+is rewound (`kimmyd restore --until`) to a moment after the pass, discarding nothing. A, which never heard of the
+drop, writes into `items`. Without the rewind, A's next pull from B is told `Collected` (A lacks an entry B has
+collected, ADR-097), A takes B's whole-database page, applies the drop and keeps its writes made after it (ADR-236),
+and every member ends with the re-dated life. With the rewind, every route ends diverged for good: B holds no
+`items`, and A and C hold no drop.
+
+**Why.** `rewind_to` rebuilt both vectors from the oplog it kept (`reset_version_vector_to_oplog`, ADR-044).
+Retention had removed every entry of B's own origin, so that origin left both of B's vectors. Then:
+- `lacks_collected` reads only the origins in the sender's servable vector, so no peer was told it lacked the
+  collected drop;
+- B's whole-database page carries the drop, and a receiver applies a carried drop only when the page's coverage
+  names it (ADR-163), which B's no longer did (`a whole-database page denied a collection with a stamp its sender's
+  own coverage does not name; ignored`);
+- the divergence check cannot close it. B's tombstone makes A's life the dropped one, so B has no existence finding.
+  The count and the cut digest compare only collections both members hold, and the digest defers as `incarnation`
+  while the cut does not cover B's drop, which it never can, since A's witnessed position at B cannot pass what B
+  advertises. A converge page writes documents over rows held, never a collection or a drop (ADR-237).
+
+**Decision.** For both vectors and every origin `X`, a rewind to `until` leaves `min(V[X], until)`, read and
+written in one transaction (`Engine::lower_vectors_to_target`).
+
+The rewind removes every entry stamped after `until` and no other, so coverage above `until` has to come down
+(ADR-044's reason stands: left high, the member would claim history it no longer holds and never be sent it again),
+and coverage at or below `until` is exactly as true as it was. Every invariant the vectors carry follows from that
+one rule:
+- **Invariant I** (ADR-173): every entry the rewind keeps is at or below `until` and was at or below `V` or held, so
+  it is at or below the lowered `V` or held.
+- **Witnessed at least servable** (ADR-054): a minimum with one bound keeps the order.
+- **ADR-160:** nothing is raised, so no held entry is claimed.
+- **What retention collected stays covered.** Every collected entry is at or below the horizon, which is at or below
+  `until` (a rewind refuses a target below it), and was covered, so it still is: a member never claims less of an
+  origin than an entry it has collected, its own drop included. A peer lacking it is told `Collected` again, and a
+  page's coverage names it again.
+- **An origin the rewind discarded from** drops to exactly `until`, below every entry discarded. A peer's discarded
+  writes come back by anti-entropy, as ADR-044 says, and the member's own from the peers that hold them.
+- **Not touched:** `OPLOG_COLLECTED` and the horizon, both at or below `until`; and the `state_held` rows (ADR-224).
+  A hole above the target can cost a peer one extra `StateHeld` snapshot, never a silent gap.
+
+**Rejected: `min(V[X], max(oplog max[X], collected[X]))`**, the model builder's first reading. It fixes RW1, and
+it is below the decision wherever the vectors cover what the oplog does not name: a completed snapshot's grant (a
+sender whose own write another origin overwrote sends no entry of its own), and the witnessed vector's coverage of entries processed without an
+append (ADR-054's list). Lowered there, a rewound member asks again for history it has already judged, and an old
+insert served again can come back where this member collected its delete's tombstone (ADR-085's class, on one
+member). After a restore, `OPLOG_COLLECTED` is also only the coarse horizon's seed.
+
+**The clock after a rewind (CL1, found beside RW1).** A start resumed its clock from the oplog's tail, the vectors
+and the stored metadata. After a rewind none of them names what it discarded, nor the tombstones it minted for
+documents created after the target, which the clock at the rewind stamps above everything discarded. On a member
+whose clock led its wall clock (`HlcClock::witness` folds any peer's stamp, unbounded) the next writes were stamped
+inside the discarded range and below those tombstones. A stamp there can be the very stamp of a discarded entry:
+a change-stream token naming the discarded entry then resumes from the new write as if it named it, where it is to
+be refused (ADR-173), and a peer that still holds the discarded entry takes the new write for one it already holds.
+**The rewind's record now carries, under the member's own origin, the newest tombstone it minted, and `resume_hlc`
+folds the highest stamp any record names.** No entry of the member's own stands between what it discarded and
+those tombstones, so the token check reads the record as it did. A record that does not decode costs the fold and
+not the open, with a `WARN`.
+
+**Rollback.** No format change: the record keeps its layout. A 0.51 binary reads the vectors a 0.52 rewind left
+(every invariant 0.51 relies on holds, and the verified record's form is unchanged) and the record, whose one more
+stamp under the member's own origin it reads as the newest discarded. On 0.51 a rewind lowers as it did, and a start
+does not fold the records. **A store rewound by 0.51 or earlier keeps the vectors it was left with.** Nothing raises
+them at open: raising `V` to `OPLOG_COLLECTED` could claim contiguity over a collected held entry (ADR-160). The
+operations guide says how to find such a member and what to do.
+
+**Tests.** `rewind.rs`: `a_rewind_after_retention_keeps_the_coverage_of_what_retention_collected` (and that a fresh
+peer is told `Collected`), `a_rewind_lowers_every_origin_it_discarded_to_the_target_and_no_lower`,
+`a_rewound_member_asks_its_peer_again_for_what_it_discarded`, `a_rewind_that_discards_nothing_changes_neither_vector`
+(a snapshot's grant and a write that lost last-writer-wins), and
+`a_start_after_a_rewind_resumes_the_clock_past_what_it_discarded_and_minted`. The convergence model gains a retention
+step (the oplog window passed, the tombstones kept) and a rewind step, taken by named rows only, and the RW1 row runs
+on every route with a control variant without the rewind. Mutation rows, in bash, each failing a test with only its
+own change: the servable vector not lowered; the witnessed vector not lowered; each vector rebuilt from the oplog as
+0.51 did; the witnessed vector set to the lowered servable one; the verified record not written; the start not
+folding the records; the minted tombstones not recorded.
