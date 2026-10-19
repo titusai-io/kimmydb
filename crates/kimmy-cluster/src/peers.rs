@@ -791,23 +791,14 @@ pub async fn replicate(engine: Arc<Engine>, config: ReplicationConfig) {
     // The immediate facts exchanges membership asks for (ADR-247), run beside
     // this loop, never in it: an ask that came while a tick drained would wait
     // for the tick. Aborted when the loop ends, with every exchange in flight.
-    struct Exchanging(tokio::task::JoinHandle<()>);
-    impl Drop for Exchanging {
-        fn drop(&mut self) {
-            self.0.abort();
-        }
-    }
     let _exchanging = config.members.as_ref().and_then(|members| {
         let queue = members.take_exchange_queue()?;
-        // UNSUPERVISED: owned by this loop and aborted with it; each exchange is a
-        // task of its own whose panic it logs and outlives, and a lost exchange
-        // leaves its blocks to the next sync contact.
-        Some(Exchanging(tokio::spawn(crate::exchange::run(
+        Some(crate::exchange::Driver::spawn(
             Arc::clone(&engine),
             config.secret.clone(),
             members.clone(),
             queue,
-        ))))
+        ))
     });
     // A snapshot this node was part-way through when it stopped resumes where
     // it left off rather than transferring everything again (ADR-161). Never

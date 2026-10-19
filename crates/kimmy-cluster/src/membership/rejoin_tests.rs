@@ -109,6 +109,10 @@ struct Exchanges {
     running: Vec<Option<Members>>,
     now: u64,
     log: Vec<Exchange>,
+    /// Members whose exchanges run at the end of the input that asked them,
+    /// after every notification of it, as the daemon's queued ones are answered.
+    defer: BTreeSet<usize>,
+    deferred: Vec<(usize, SocketAddr, NodeId)>,
 }
 
 fn node_id(member: usize) -> NodeId {
@@ -138,6 +142,27 @@ fn process_members(
     }));
     let shared = Arc::clone(shared);
     members.set_exchange_sink_for_test(Arc::new(move |addr, node| {
+        {
+            let mut shared = shared.lock();
+            if shared.defer.contains(&member) {
+                shared.deferred.push((member, addr, node));
+                return;
+            }
+        }
+        run_exchange(&shared, member, addr, node);
+    }));
+    members
+}
+
+/// One exchange `member` asked with `node` at `addr`: its block recorded at that
+/// member and that member's at it, when both processes run.
+fn run_exchange(
+    shared: &Arc<parking_lot::Mutex<Exchanges>>,
+    member: usize,
+    addr: SocketAddr,
+    node: NodeId,
+) {
+    {
         let to = usize::from(addr.port() - 7900);
         let (mine, theirs, at) = {
             let shared = shared.lock();
@@ -163,8 +188,7 @@ fn process_members(
             _ => None,
         };
         shared.lock().log.push(Exchange { from: member, to, at, answered });
-    }));
-    members
+    }
 }
 
 /// The daemon's step after every input, as built.
@@ -317,6 +341,17 @@ impl Net {
         };
         input(&mut self.nodes[node].swim, &mut out);
         (self.after_input)(&mut self.nodes[node].swim, &mut out);
+        let deferred: Vec<_> = {
+            let mut shared = self.exchanges.lock();
+            let (mine, rest) = std::mem::take(&mut shared.deferred)
+                .into_iter()
+                .partition(|(from, ..)| *from == node);
+            shared.deferred = rest;
+            mine
+        };
+        for (from, addr, asked) in deferred {
+            run_exchange(&self.exchanges, from, addr, asked);
+        }
         self.exchanges_held(node, since, &out.drops);
         if out.rejoined {
             self.nodes[node].rejoins.push((via, self.now));
@@ -398,6 +433,28 @@ impl Net {
 
     /// Advance the clock by `ms`, firing every timer that comes due and
     /// announcing every member to its seeds each discovery interval.
+    /// The earliest trailing ask a running process has pending, in ms on the
+    /// clock (not before now), and whose it is.
+    fn next_trailing(&self) -> Option<(u64, usize)> {
+        (0..self.nodes.len())
+            .filter(|node| self.nodes[*node].life == Life::Running)
+            .filter_map(|node| {
+                let due = self.nodes[node].members.next_trailing_exchange()?;
+                let ms = due.saturating_duration_since(self.base).as_nanos().div_ceil(1_000_000);
+                Some((u64::try_from(ms).unwrap().max(self.now), node))
+            })
+            .min()
+    }
+
+    /// Start `node`'s trailing asks due now, as its driver's timer does.
+    fn fire_trailing(&mut self, node: usize) {
+        let members = self.nodes[node].members.clone();
+        let at = self.base + Duration::from_millis(self.now);
+        self.input(node, Via::Other, move |_, _| {
+            members.exchange_due_at(at);
+        });
+    }
+
     fn run_for(&mut self, ms: u64) {
         let until = self.now + ms;
         loop {
@@ -406,6 +463,14 @@ impl Net {
                 Some(at) if at <= self.next_discovery => at,
                 _ => self.next_discovery,
             };
+            if let Some((at, node)) = self.next_trailing()
+                && at <= next
+                && at <= until
+            {
+                self.now = at;
+                self.fire_trailing(node);
+                continue;
+            }
             if next > until {
                 break;
             }
@@ -924,9 +989,11 @@ fn every_restart_starts_one_exchange_each_way_and_every_block_is_held() {
 }
 
 /// A rename that lands within a sync interval of the last exchange with the
-/// member starts none, and one that lands after it starts one (ADR-247).
+/// member starts none at once: it owes one, since the rename dropped what that
+/// exchange brought, and one trailing ask starts at the end of the interval. A
+/// rename after the trailing ask's own interval starts one at once (ADR-247).
 #[test]
-fn a_rename_within_the_interval_of_the_last_exchange_starts_none_and_one_after_it_does() {
+fn a_rename_within_the_interval_of_the_last_exchange_waits_for_its_end_and_one_after_it_does_not() {
     let mut net = trio();
     let first = mark(&net);
     net.kill(B);
@@ -946,13 +1013,21 @@ fn a_rename_within_the_interval_of_the_last_exchange_starts_none_and_one_after_i
         "A started none for the rename at {again}, {} ms after the last",
         again - renamed
     );
+    net.run_for(200);
+    let trailing: Vec<u64> = net.exchanges.lock().log[second..]
+        .iter()
+        .filter(|started| (started.from, started.to) == (A, B))
+        .map(|started| started.at)
+        .collect();
+    assert_eq!(trailing, vec![renamed + 5_000], "one trailing ask, at the interval's end");
+    assert_eq!(held_boot(&net, A, B), Some(boot(B, net.nodes[B].epoch)));
 
     net.run_for(12_000);
     let third = mark(&net);
     net.kill(B);
     net.restart(B);
     let later = run_until_renamed(&mut net, A, B);
-    assert!(later - renamed >= 5_000, "premise");
+    assert!(later - (renamed + 5_000) >= 5_000, "premise");
     net.run_for(1_000);
     assert_eq!(started_since(&net, third).iter().filter(|p| **p == (A, B)).count(), 1);
 }
@@ -989,5 +1064,68 @@ fn a_member_that_rejoins_exchanges_with_every_peer_it_holds_live() {
         assert_eq!(since.iter().filter(|p| **p == (peer, B)).count(), 1, "{peer} on the rename");
         assert_eq!(held_boot(&net, B, peer), Some(boot(peer, 0)));
         assert_eq!(held_boot(&net, peer, B), Some(boot(B, 0)));
+    }
+}
+
+/// Peers that ask no exchange, as a build before ADR-247 during a roll.
+fn ask_none(net: &mut Net, peers: &[usize]) {
+    for &peer in peers {
+        net.nodes[peer].members.set_exchange_sink_for_test(Arc::new(|_, _| {}));
+    }
+}
+
+/// B restarted with nothing recorded, after `walks - 1` earlier such starts,
+/// so it walks `walks` steps past the identity its peers hold (ADR-242), each a
+/// rejoin that clears every block it holds. Answers the walk's length.
+fn walk(net: &mut Net, walks: usize) -> usize {
+    for _ in 1..walks {
+        net.nodes[B].kept = None;
+        restart_once(net, B, 10_000);
+    }
+    net.nodes[B].kept = None;
+    restart_once(net, B, 10_000).0
+}
+
+/// A renewal walk against peers that ask no exchange (an older build, in a
+/// roll): the seed's `Up` asks first, a later step's clear drops what that
+/// exchange brought, and the interval holds the step's own ask, which owes a
+/// trailing one. The walk ends with every block held and no tick run, whether
+/// the exchanges are answered inside the ask or at the end of the input that
+/// asked them, as the daemon's queued ones are.
+#[test]
+fn a_renewal_walk_ends_with_every_block_held_against_peers_that_ask_none() {
+    for deferred in [false, true] {
+        for walks in 1..=4 {
+            let mut net = trio();
+            ask_none(&mut net, &[A, C]);
+            if deferred {
+                net.exchanges.lock().defer.insert(B);
+            }
+            let rejoins = walk(&mut net, walks);
+            assert_eq!(rejoins, walks, "premise: a walk of {walks}");
+            for peer in [A, C] {
+                assert_eq!(
+                    held_boot(&net, B, peer),
+                    Some(boot(peer, 0)),
+                    "deferred {deferred}, walk of {walks}: B holds {peer}'s block"
+                );
+            }
+        }
+    }
+}
+
+/// The same walks against peers on this build, whose renames of B carry their
+/// blocks to it as well.
+#[test]
+fn a_renewal_walk_ends_with_every_block_held_against_peers_on_this_build() {
+    for walks in 1..=4 {
+        let mut net = trio();
+        net.exchanges.lock().defer.insert(B);
+        let rejoins = walk(&mut net, walks);
+        assert_eq!(rejoins, walks, "premise: a walk of {walks}");
+        for peer in [A, C] {
+            assert_eq!(held_boot(&net, B, peer), Some(boot(peer, 0)), "walk of {walks}");
+            assert_eq!(held_boot(&net, peer, B), Some(boot(B, net.nodes[B].epoch)));
+        }
     }
 }

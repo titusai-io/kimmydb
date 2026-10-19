@@ -32,12 +32,44 @@ use crate::transport::{close, dial};
 /// authenticated it; the dial has bounds of its own.
 pub(crate) const EXCHANGE_TIMEOUT: Duration = Duration::from_secs(10);
 
-/// Run each exchange asked on `queue`, each in a task of its own, for as long as
-/// the replication loop that spawned this runs: the loop aborts this when it
-/// ends, and every exchange in flight with it.
+/// The driver of a replication loop's exchanges: [`run`] in a task of its own,
+/// aborted when this is dropped, which the loop does when it ends, and with it
+/// every exchange in flight.
+pub(crate) struct Driver(tokio::task::JoinHandle<()>);
+
+impl Driver {
+    pub(crate) fn spawn(
+        engine: Arc<Engine>,
+        secret: String,
+        members: Members,
+        queue: ExchangeQueue,
+    ) -> Self {
+        // UNSUPERVISED: owned by the replication loop and aborted with it; each exchange
+        // is a task of its own whose panic it logs and outlives, and a lost exchange
+        // leaves its blocks to the next sync contact.
+        Self(tokio::spawn(run(engine, secret, members, queue)))
+    }
+
+    /// The driver's task, for a test that watches it end.
+    #[cfg(test)]
+    fn abort_handle(&self) -> tokio::task::AbortHandle {
+        self.0.abort_handle()
+    }
+}
+
+impl Drop for Driver {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
+
+/// Run each exchange asked on `queue`, each in a task of its own, and start each
+/// trailing ask when it is due ([`Members::exchange_due_at`]), which puts it on
+/// the queue.
 ///
-/// This member's block is read here, before an exchange's task starts, so an
-/// exchange takes no storage step and an abort can end one anywhere.
+/// This member's block is read here, at each ask, before the exchange's task
+/// starts, so an exchange takes no storage step and an abort can end one
+/// anywhere.
 pub(crate) async fn run(
     engine: Arc<Engine>,
     secret: String,
@@ -46,6 +78,13 @@ pub(crate) async fn run(
 ) {
     let mut running = tokio::task::JoinSet::new();
     loop {
+        let next = members.next_trailing_exchange();
+        let trailing = async move {
+            match next {
+                Some(due) => tokio::time::sleep_until(tokio::time::Instant::from_std(due)).await,
+                None => std::future::pending().await,
+            }
+        };
         tokio::select! {
             asked = queue.recv() => {
                 // The sender lives in `members`, which this holds, so the queue
@@ -70,8 +109,15 @@ pub(crate) async fn run(
                              the blocks"
                         ),
                     }
+                    #[cfg(test)]
+                    members.note_exchange_ended_for_test();
                 });
             }
+            () = trailing => {
+                members.exchange_due_at(Instant::now());
+            }
+            // A trailing ask scheduled since `next` was read: read it again.
+            () = members.exchange_scheduled() => {}
             Some(done) = running.join_next(), if !running.is_empty() => {
                 if let Err(e) = done
                     && e.is_panic()
@@ -93,11 +139,22 @@ pub(crate) async fn exchange(
     members: &Members,
     ours: Option<(Arc<Facts>, u64)>,
 ) -> Result<NodeId, ProtocolError> {
+    exchange_within(engine, peer, secret, members, ours, EXCHANGE_TIMEOUT).await
+}
+
+/// [`exchange`], waiting `limit` for the answer once dialled and authenticated.
+async fn exchange_within(
+    engine: &Engine,
+    peer: SocketAddr,
+    secret: &str,
+    members: &Members,
+    ours: Option<(Arc<Facts>, u64)>,
+    limit: Duration,
+) -> Result<NodeId, ProtocolError> {
     let (mut stream, their_node) = dial(engine, peer, secret).await?;
-    let answered =
-        tokio::time::timeout(EXCHANGE_TIMEOUT, frames(&mut stream, their_node, members, ours))
-            .await
-            .unwrap_or_else(|_| Err(ProtocolError::TimedOut("facts exchange".into())));
+    let answered = tokio::time::timeout(limit, frames(&mut stream, their_node, members, ours))
+        .await
+        .unwrap_or_else(|_| Err(ProtocolError::TimedOut("facts exchange".into())));
     close(&mut stream).await;
     answered.map(|()| their_node)
 }
@@ -163,6 +220,12 @@ mod tests {
     }
 
     async fn peer(boot: u8, yields: bool) -> Peer {
+        let yields = Arc::new(parking_lot::Mutex::new(yields));
+        peer_yielding(boot, yields).await
+    }
+
+    /// [`peer`], whose block yields webhooks while `yields` says so.
+    async fn peer_yielding(boot: u8, yields: Arc<parking_lot::Mutex<bool>>) -> Peer {
         let dir = tempfile::tempdir().unwrap();
         let engine = Arc::new(Engine::open(&dir.path().join("kimmy.redb")).unwrap());
         let members = Members::default();
@@ -170,7 +233,7 @@ mod tests {
         members.set_facts_source(Arc::new(move || Facts {
             boot: vec![boot; 16],
             started_ms: Some(1_000),
-            yielding: Yielding { webhooks: yields, ..Yielding::default() },
+            yielding: Yielding { webhooks: *yields.lock(), ..Yielding::default() },
             ..Facts::default()
         }));
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -190,6 +253,20 @@ mod tests {
 
     fn held_boot(members: &Members, node: NodeId) -> Option<Vec<u8>> {
         members.view().blocks.get(&node).map(|held| held.facts.boot.clone())
+    }
+
+    /// Wait (within 30 s) until `done` holds.
+    async fn until(what: &str, mut done: impl FnMut() -> bool) {
+        let deadline = Instant::now() + Duration::from_secs(30);
+        while !done() {
+            assert!(Instant::now() < deadline, "never: {what}");
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    }
+
+    fn driver(member: &Peer) -> Driver {
+        let queue = member.members.take_exchange_queue().expect("the queue, once");
+        Driver::spawn(Arc::clone(&member.engine), SECRET.into(), member.members.clone(), queue)
     }
 
     /// One exchange: each side holds the other's block afterwards, and the
@@ -251,6 +328,134 @@ mod tests {
         }
         assert_eq!(held_boot(&a.members, b_node), Some(vec![2; 16]));
         driver.abort();
+        a.serving.abort();
+        b.serving.abort();
+    }
+
+    /// An ask made before the driver has taken the queue (the daemon starts
+    /// membership before replication) is run once it does.
+    #[tokio::test]
+    async fn an_ask_made_before_the_driver_starts_runs_when_it_does() {
+        let (a, b) = (peer(1, false).await, peer(2, false).await);
+        let b_node = b.engine.node_id();
+        a.members.insert_for_test(b.addr, b_node);
+        assert!(a.members.exchange_at(b.addr, b_node, Instant::now()));
+        let _driver = driver(&a);
+        until("the early ask's exchange", || held_boot(&a.members, b_node).is_some()).await;
+        a.serving.abort();
+        b.serving.abort();
+    }
+
+    /// A failed exchange counts as the member's last ask as a good one does: a
+    /// member that does not answer costs one exchange an interval.
+    #[tokio::test]
+    async fn a_failed_exchange_still_holds_the_next_ask_for_the_interval() {
+        let a = peer(1, false).await;
+        let closed = {
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            listener.local_addr().unwrap()
+        };
+        let node = NodeId::from_bytes([7; 16]);
+        let _driver = driver(&a);
+        assert!(a.members.exchange_at(closed, node, Instant::now()));
+        until("the failed exchange to end", || a.members.exchanges_ended_for_test() >= 1).await;
+        assert!(!a.members.exchange_at(closed, node, Instant::now()), "held for the interval");
+        a.serving.abort();
+    }
+
+    /// Each ask carries this member's block as it is at the ask: one asked after
+    /// the block changed carries the change.
+    #[tokio::test]
+    async fn each_exchange_carries_the_block_as_it_is_at_its_ask() {
+        let yields = Arc::new(parking_lot::Mutex::new(false));
+        let (a, b) = (peer_yielding(1, Arc::clone(&yields)).await, peer(2, false).await);
+        let (a_node, b_node) = (a.engine.node_id(), b.engine.node_id());
+        let held_yield =
+            || b.members.view().blocks.get(&a_node).map(|held| held.facts.yielding.webhooks);
+        let _driver = driver(&a);
+        let t0 = Instant::now();
+        assert!(a.members.exchange_at(b.addr, b_node, t0));
+        until("the first exchange", || a.members.exchanges_ended_for_test() >= 1).await;
+        assert_eq!(held_yield(), Some(false));
+        // The block changes, and is rebuilt (its cache holds a block for a second).
+        *yields.lock() = true;
+        let _ = a.members.local_facts_at(Instant::now() + Duration::from_secs(2));
+        assert!(a.members.exchange_at(b.addr, b_node, t0 + Duration::from_secs(10)));
+        until("the second exchange", || a.members.exchanges_ended_for_test() >= 2).await;
+        assert_eq!(held_yield(), Some(true), "the block as it was at the second ask");
+        a.serving.abort();
+        b.serving.abort();
+    }
+
+    /// A member that completes the handshake and never answers: the exchange
+    /// ends at its bound.
+    #[tokio::test]
+    async fn an_exchange_with_a_member_that_never_answers_ends_at_its_bound() {
+        let a = peer(1, false).await;
+        let dir = tempfile::tempdir().unwrap();
+        let silent = Arc::new(Engine::open(&dir.path().join("kimmy.redb")).unwrap());
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let tls = crate::tls::ClusterTls::new().unwrap();
+        let serving = tokio::spawn({
+            let silent = Arc::clone(&silent);
+            async move {
+                let (tcp, _) = listener.accept().await.unwrap();
+                let mut stream = tls.acceptor().accept(tcp).await.unwrap();
+                let binding = crate::tls::binding(stream.get_ref().1).unwrap();
+                crate::transport::accept_handshake(&silent, &mut stream, SECRET, &binding)
+                    .await
+                    .unwrap();
+                let _asked = crate::protocol::read_frame(&mut stream).await.unwrap();
+                std::future::pending::<()>().await;
+            }
+        });
+        let ours = a.members.local_facts();
+        let limit = Duration::from_millis(300);
+        let answered = tokio::time::timeout(
+            Duration::from_secs(20),
+            exchange_within(&a.engine, addr, SECRET, &a.members, ours, limit),
+        )
+        .await
+        .expect("the exchange ends at its bound");
+        assert!(matches!(answered, Err(ProtocolError::TimedOut(_))), "{answered:?}");
+        serving.abort();
+        a.serving.abort();
+    }
+
+    /// Dropping the driver, as the replication loop does when it ends, ends it.
+    #[tokio::test]
+    async fn dropping_the_driver_ends_it() {
+        let a = peer(1, false).await;
+        let driver = driver(&a);
+        let task = driver.abort_handle();
+        assert!(!task.is_finished(), "premise: it runs");
+        drop(driver);
+        until("the driver to end", || task.is_finished()).await;
+        a.serving.abort();
+    }
+
+    /// The driver starts a trailing ask when it is due: the member's block was
+    /// dropped (declared down and up again) within the interval of the last ask,
+    /// whose own ask the interval holds.
+    #[tokio::test]
+    async fn the_driver_starts_a_trailing_ask_when_it_is_due() {
+        let (a, b) = (peer(1, false).await, peer(2, false).await);
+        let b_node = b.engine.node_id();
+        a.members.configure_lease(Duration::from_secs(2), 3);
+        a.members.insert_for_test(b.addr, b_node);
+        let _driver = driver(&a);
+        assert!(a.members.exchange_at(b.addr, b_node, Instant::now()));
+        until("the first exchange", || a.members.exchanges_ended_for_test() >= 1).await;
+        assert!(held_boot(&a.members, b_node).is_some());
+        a.members.remove_for_test(&b.addr);
+        a.members.insert_for_test(b.addr, b_node);
+        assert!(held_boot(&a.members, b_node).is_none(), "premise: dropped");
+        assert!(!a.members.exchange_at(b.addr, b_node, Instant::now()), "held by the interval");
+        assert!(a.members.next_trailing_exchange().is_some(), "a trailing ask is owed");
+        until("the trailing exchange", || held_boot(&a.members, b_node).is_some()).await;
+        assert_eq!(a.members.exchanges_ended_for_test(), 2);
+        assert!(a.members.next_trailing_exchange().is_none());
         a.serving.abort();
         b.serving.abort();
     }

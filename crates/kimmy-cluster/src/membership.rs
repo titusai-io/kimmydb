@@ -223,7 +223,24 @@ pub(crate) type ExchangeQueue = mpsc::UnboundedReceiver<(SocketAddr, NodeId)>;
 struct Exchanges {
     sink: RwLock<ExchangeSink>,
     queue: Mutex<Option<ExchangeQueue>>,
-    asked: Mutex<BTreeMap<NodeId, Instant>>,
+    asked: Mutex<BTreeMap<NodeId, Asked>>,
+    /// Woken when a trailing ask is scheduled, so the driver's timer takes it.
+    scheduled: tokio::sync::Notify,
+    /// Exchanges the driver has seen end, for a test that waits on one.
+    #[cfg(test)]
+    ended: std::sync::atomic::AtomicUsize,
+}
+
+/// When a member was last asked for, and what is owed it since (ADR-247).
+#[derive(Clone, Copy, Debug)]
+struct Asked {
+    /// The last ask, or, while `trailing`, when the trailing ask is due.
+    at: Instant,
+    /// Whether the member's block, or every block, was dropped since that ask:
+    /// what makes an ask the debounce holds owe a trailing one.
+    dropped: bool,
+    /// A trailing ask is pending, due at `at`.
+    trailing: bool,
 }
 
 impl Default for Exchanges {
@@ -235,7 +252,14 @@ impl Default for Exchanges {
             // which holds this set, has gone with the loop.
             let _ = tx.send((addr, node));
         });
-        Self { sink: RwLock::new(sink), queue: Mutex::new(Some(rx)), asked: Mutex::default() }
+        Self {
+            sink: RwLock::new(sink),
+            queue: Mutex::new(Some(rx)),
+            asked: Mutex::default(),
+            scheduled: tokio::sync::Notify::new(),
+            #[cfg(test)]
+            ended: std::sync::atomic::AtomicUsize::new(0),
+        }
     }
 }
 
@@ -526,6 +550,9 @@ impl Members {
         if let Some(local) = self.0.local.get() {
             local.forget(node);
         }
+        if let Some(asked) = self.0.exchanges.asked.lock().get_mut(&node) {
+            asked.dropped = true;
+        }
     }
 
     fn forget_peer(&self, node: NodeId) {
@@ -544,6 +571,9 @@ impl Members {
         table.floor = last_decoded_seq();
         if let Some(local) = self.0.local.get() {
             local.clear_echoes();
+        }
+        for asked in self.0.exchanges.asked.lock().values_mut() {
+            asked.dropped = true;
         }
         self.publish(&table);
     }
@@ -582,7 +612,14 @@ impl Members {
     /// (ADR-247): **at most one per member per sync interval**, counted from the
     /// last ask whatever became of it, so a member that flaps or does not answer
     /// costs one exchange an interval and the tick is the fallback. Answers
-    /// whether one was started.
+    /// whether one was started now.
+    ///
+    /// **An ask the interval holds is not lost when it is owed**: if the member's
+    /// block, or every block, was dropped since the last ask (a rename, a down,
+    /// this member's own rejoin), one trailing ask is scheduled for the end of the
+    /// interval, at most one pending per member, which
+    /// [`Self::exchange_due_at`] starts. An ask that drops nothing since (the
+    /// `MemberUp` beside a `Rename` in one input) owes none.
     ///
     /// Called after the change that asked for it is applied: an exchange started
     /// before a rename's drop could bring the new block back before the drop
@@ -591,16 +628,78 @@ impl Members {
         let interval = self.sync_interval();
         {
             let mut asked = self.0.exchanges.asked.lock();
-            asked.retain(|_, last| at.saturating_duration_since(*last) < interval);
-            if asked.contains_key(&node) {
+            asked.retain(|_, last| {
+                last.trailing || at.saturating_duration_since(last.at) < interval
+            });
+            if let Some(last) = asked.get_mut(&node) {
+                let owed = last.dropped && !last.trailing;
+                if owed {
+                    last.at += interval;
+                    last.trailing = true;
+                }
+                drop(asked);
+                if owed {
+                    self.0.exchanges.scheduled.notify_one();
+                }
                 return false;
             }
-            asked.insert(node, at);
+            asked.insert(node, Asked { at, dropped: false, trailing: false });
         }
         // Called with no lock of this set held: a sink may read and record blocks.
         let sink = Arc::clone(&self.0.exchanges.sink.read());
         sink(addr, node);
         true
+    }
+
+    /// Start every trailing ask due by `now` whose member is still live, at the
+    /// address it is live at (ADR-247), and answer when the next one is due. A
+    /// trailing ask counts as an ask at its due instant.
+    pub(crate) fn exchange_due_at(&self, now: Instant) -> Option<Instant> {
+        let due: Vec<NodeId> = {
+            let mut asked = self.0.exchanges.asked.lock();
+            asked
+                .iter_mut()
+                .filter(|(_, last)| last.trailing && last.at <= now)
+                .map(|(node, last)| {
+                    last.trailing = false;
+                    last.dropped = false;
+                    *node
+                })
+                .collect()
+        };
+        if !due.is_empty() {
+            let live = self.entries();
+            let sink = Arc::clone(&self.0.exchanges.sink.read());
+            for node in due {
+                if let Some((addr, _)) = live.iter().find(|(_, live)| *live == node) {
+                    sink(*addr, node);
+                }
+            }
+        }
+        self.next_trailing_exchange()
+    }
+
+    /// When the next trailing ask is due, if one is pending.
+    pub(crate) fn next_trailing_exchange(&self) -> Option<Instant> {
+        let asked = self.0.exchanges.asked.lock();
+        asked.values().filter(|last| last.trailing).map(|last| last.at).min()
+    }
+
+    /// Wait until a trailing ask is scheduled (or one was since the last wait).
+    pub(crate) async fn exchange_scheduled(&self) {
+        self.0.exchanges.scheduled.notified().await;
+    }
+
+    /// Count an exchange the driver saw end, for a test that waits on one.
+    #[cfg(test)]
+    pub(crate) fn note_exchange_ended_for_test(&self) {
+        self.0.exchanges.ended.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    /// How many exchanges the driver has seen end.
+    #[cfg(test)]
+    pub(crate) fn exchanges_ended_for_test(&self) -> usize {
+        self.0.exchanges.ended.load(std::sync::atomic::Ordering::SeqCst)
     }
 
     /// [`Self::exchange_at`] for every live peer: this member's own rejoin
@@ -1458,6 +1557,56 @@ mod tests {
             *started.lock(),
             vec![(addr(7901), node(1)), (addr(7902), node(2)), (addr(7901), node(1))]
         );
+    }
+
+    /// An ask the interval holds owes one trailing ask at the interval's end when
+    /// the member's block was dropped since the last ask, and none otherwise; at
+    /// most one is pending per member; it starts at the address the member is live
+    /// at then, not at all if it is not live, and counts as an ask at its due
+    /// instant (ADR-247).
+    #[test]
+    fn an_ask_the_interval_holds_owes_one_trailing_ask_only_after_a_drop() {
+        let members = Members::default();
+        members.configure_lease(Duration::from_secs(5), 3);
+        let started = Arc::new(Mutex::new(Vec::new()));
+        members.set_exchange_sink_for_test({
+            let started = Arc::clone(&started);
+            Arc::new(move |addr, node| started.lock().push((addr, node)))
+        });
+        let t0 = Instant::now();
+        let at = |ms: u64| t0 + Duration::from_millis(ms);
+        members.insert_for_test(addr(7901), node(1));
+        members.insert_for_test(addr(7902), node(2));
+        assert!(members.exchange_at(addr(7901), node(1), at(0)));
+        assert!(!members.exchange_at(addr(7901), node(1), at(10)), "nothing dropped since");
+        assert_eq!(members.next_trailing_exchange(), None, "so none is owed");
+
+        members.remove_for_test(&addr(7901));
+        members.insert_for_test(addr(7901), node(1));
+        assert!(!members.exchange_at(addr(7901), node(1), at(1_000)));
+        assert_eq!(members.next_trailing_exchange(), Some(at(5_000)), "owed at the interval's end");
+        members.remove_for_test(&addr(7901));
+        members.insert_for_test(addr(7911), node(1));
+        assert!(!members.exchange_at(addr(7911), node(1), at(2_000)));
+        assert_eq!(members.next_trailing_exchange(), Some(at(5_000)), "one pending");
+
+        assert_eq!(members.exchange_due_at(at(4_999)), Some(at(5_000)), "not yet due");
+        assert_eq!(started.lock().len(), 1);
+        assert_eq!(members.exchange_due_at(at(5_000)), None);
+        assert_eq!(
+            *started.lock(),
+            vec![(addr(7901), node(1)), (addr(7911), node(1))],
+            "at the address it is live at"
+        );
+        assert!(!members.exchange_at(addr(7911), node(1), at(9_999)), "an ask at its due instant");
+        assert_eq!(members.next_trailing_exchange(), None, "nothing dropped since it");
+
+        // Owed to a member that is no longer live when it is due: not started.
+        assert!(members.exchange_at(addr(7902), node(2), at(0)));
+        members.remove_for_test(&addr(7902));
+        assert!(!members.exchange_at(addr(7902), node(2), at(100)));
+        assert_eq!(members.exchange_due_at(at(5_000)), None);
+        assert_eq!(started.lock().len(), 3, "the member is not live");
     }
 
     #[test]
