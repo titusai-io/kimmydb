@@ -586,11 +586,15 @@ rather than as history**. See [ADR-036](decisions.md) and
 Documents arrive up to 512 to a page, and **within a byte budget**: 63 MiB
 (`SNAPSHOT_PAGE_BYTES`, what a 64 MiB frame holds less 1 MiB), less what the
 page's definitions, drops and vector take, shared in order by its idempotency
-records (the delta, then the records phase) and its documents and tombstones. A
-row that does not fit goes first on the next page; a row no page can carry, a
-document or a `find_and_modify` record larger than that, is refused by name, the
-sender answering with a fault that names the collection, the id and the size,
-since such a document cannot cross in a window either. Before 0.52.0 a page
+records (the delta, then the records phase) and its documents and tombstones, a
+document's `_id` at the size it crosses in. The cursor the page ends at is
+reserved with each row at the size its key crosses in: a binary `_id` and a
+cursor's key cross as arrays of integers, about ten bytes a byte. A row that
+does not fit goes first on the next page; a row no page can carry is refused by
+name, the sender answering with a fault that names the row and its size: a
+document or a `find_and_modify` record larger than that, which cannot cross in a
+window either, or a document whose `_id` is so large (over about 3 MiB of binary
+or 5 MiB of string) that the cursor naming it does not fit with it. Before 0.52.0 a page
 carried 512 rows whatever their size: 512 averaging over about 128 KiB made a
 page over a frame, the sender closed the connection, and the requester asked for
 the same page for ever. The receiver applies a page's documents in one

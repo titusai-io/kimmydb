@@ -28812,24 +28812,27 @@ with it, and not be offered while any member could carry the write without it.
      so its sender goes straight to the documents. A whole-database snapshot, a scoped repair and a converge page
      (ADR-237) store a page's records in the page's transaction, whether or not their collection stands here, and a
      converge page whose documents are not applied (its sender dropped the collection, or it is of a life this member
-     has not buried) still stores its records, in a transaction of its own; a converge
-     repair ships the collection's records for the whole window ahead of what may be a handful of documents, which is
-     accepted, since a bound on the page's stamps would miss a record whose rows lie below them. The walk visits, for
-     its records only, every collection the sender dropped and has not created again while its tombstone stands, and the
-     delta carries a record whatever its collection's state: a key outlives a drop of its collection for its window (D2,
-     option A), so a member rebuilt by snapshot answers a retry of it as the members that saw the drop do. **One byte
-     budget per page:** `SNAPSHOT_PAGE_BYTES`, 63 MiB (`MAX_FRAME` less 1 MiB for what is not counted), less what the
-     page's definitions, drops and vector take, shared in order by the delta, the records phase and the documents and
-     tombstones. A row that does not fit goes first on the next page; one that does not fit a page holding nothing else
-     (the first page's definitions aside) is refused by name, the sender answering with `Message::Fault` (the
-     collection, the id, the size) instead of a frame `write_frame` refuses. Before it a page carried 512 rows whatever
-     their size, so 512 averaging over about 128 KiB (64 KiB with records on the page) made a page over a frame, the
-     connection closed, and the pull asked for the same page for ever (found in 0.51.0 while bounding the records
-     phase). **A converge repair's bound** (ADR-237: it ends once it has walked the collection's size at planning)
-     **counts the documents and tombstones its pages carried**, against that size and two full pages more, not its
-     pages: a page cut short by its bytes, or one of records only, carries fewer than 512 rows, and counted as a page
-     either ended the repair before it had walked the collection (the build review's m6). Where every page is full the
-     bound is what it was.
+     has not buried) still stores its records, in a transaction of its own; a converge repair ships the collection's
+     records for the whole window ahead of what may be a handful of documents, which is accepted, since a bound on the
+     page's stamps would miss a record whose rows lie below them. The walk visits, for its records only, every
+     collection the sender dropped and has not created again while its tombstone stands, and the delta carries a record
+     whatever its collection's state: a key outlives a drop of its collection for its window (D2, option A), so a member
+     rebuilt by snapshot answers a retry of it as the members that saw the drop do. **One byte budget per page:**
+     `SNAPSHOT_PAGE_BYTES`, 63 MiB (`MAX_FRAME` less 1 MiB for what is not counted), less what the page's definitions,
+     drops and vector take, shared in order by the delta, the records phase and the documents and tombstones, a
+     document's `_id` at the size it crosses in, and the cursor the page ends at reserved with each row at the size its
+     key crosses in: serde writes a `DocId::Binary` and `SnapshotCursor::after_key` as arrays of `int32`s, about ten
+     bytes a byte, and the wire stays as it is. A row that does not fit goes first on the next page; one that does not
+     fit a page holding nothing else (the first page's definitions aside), its cursor included, is refused by name, the
+     sender answering with `Message::Fault` (the row and its size) instead of a frame `write_frame` refuses: a document
+     whose `_id` is over about 3 MiB of binary or 5 MiB of string cannot cross on a page. Before it a page carried 512
+     rows whatever their size, so 512 averaging over about 128 KiB (64 KiB with records on the page) made a page over a
+     frame, the connection closed, and the pull asked for the same page for ever (found in 0.51.0 while bounding the
+     records phase). **A converge repair's bound** (ADR-237: it ends once it has walked the collection's size at
+     planning) **counts the documents and tombstones its pages carried**, against that size and two full pages more, not
+     its pages: a page cut short by its bytes, or one of records only, carries fewer than 512 rows, and counted as a
+     page either ended the repair before it had walked the collection (the build review's m6). Where every page is full
+     the bound is what it was.
    - **The page delta.** A keyed write on the sender after a collection's records phase and before the page that holds
      its document would reach the receiver without its record. So each member keeps a node-local **change log**,
      `idempotency_changes`: one row per store that changes a record, on every path (a local commit, a frame, a replay

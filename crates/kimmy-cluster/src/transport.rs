@@ -10864,6 +10864,38 @@ mod tests {
         }
     }
 
+    /// The same through the listener with binary `_id`s of 4 KiB, which cross as
+    /// arrays of integers, about ten bytes a byte: 512 documents of 110,000 bytes
+    /// were counted within a page and crossed at 78.9 MB, so the listener could
+    /// not write the page and the pull failed with no fault. Counted at the size
+    /// they cross in, the pages are cut to fit and the pull completes.
+    #[tokio::test]
+    async fn snapshot_pages_of_large_binary_ids_cross_within_a_frame() {
+        use kimmy_storage::SnapshotPolicy::All;
+        let b_dir = tempfile::tempdir().unwrap();
+        let b = Engine::open(&b_dir.path().join("kimmy.redb")).unwrap();
+        let coll = b.create_collection("shop", "bin").unwrap();
+        let pad = "x".repeat(110_000);
+        for chunk in 0..8u32 {
+            let docs = (0..64u32)
+                .map(|i| {
+                    let mut bytes = vec![0u8; 4096];
+                    bytes[..4].copy_from_slice(&(chunk * 64 + i).to_be_bytes());
+                    let id = bson::Binary { subtype: bson::spec::BinarySubtype::Generic, bytes };
+                    bson::doc! { "_id": bson::Bson::Binary(id), "pad": pad.clone() }
+                })
+                .collect();
+            b.insert_many(&coll, docs).unwrap();
+        }
+        let a_dir = tempfile::tempdir().unwrap();
+        let a = Engine::open(&a_dir.path().join("kimmy.redb")).unwrap();
+        let (served, pulled) = pull_through(&a, &b, Some(coll.id), All).await;
+        assert!(matches!(served, Ok(()) | Err(ProtocolError::Closed)), "{served:?}");
+        assert!(pulled.is_ok_and(|p| p.complete), "the pull completes");
+        let held = a.get_collection("shop", "bin").unwrap();
+        assert_eq!(a.count(&held, kimmy_storage::WalkScope::Request).unwrap(), 512);
+    }
+
     /// A pushed window this node cannot apply is answered with a `Fault`
     /// naming why, not a hang-up. The pusher reports the member pending with
     /// what it reads; a closed connection told it only "peer closed the

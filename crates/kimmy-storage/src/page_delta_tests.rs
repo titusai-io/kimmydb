@@ -381,9 +381,11 @@ fn a_delta_larger_than_the_byte_budget_goes_as_records_only_pages() {
     assert_eq!(page.records.len(), n as usize, "more than a page of records, on one page");
     assert_eq!(page.documents[0].id, DocId::Int64(SNAPSHOT_PAGE as i64 + 1));
 
-    // By bytes: a budget of three records, then of less than one.
+    // By bytes: a budget of three records and the cursor the records-only page
+    // carries, then of less than one.
     let one = page.records[0].record.len() + 96;
-    y.set_record_delta_budget_for_test(Some((3 * one, crate::idempotency::RECORD_DELTA_ROWS)));
+    let budget = 3 * one + crate::snapshot::cursor_reserve(0);
+    y.set_record_delta_budget_for_test(Some((budget, crate::idempotency::RECORD_DELTA_ROWS)));
     for i in n..n + 7 {
         let id = 10_000 + i as i64;
         fresh(y.insert_keyed(&cy, doc! { "_id": id, "v": 1 }, &key_of(i)).unwrap());
@@ -550,7 +552,7 @@ fn a_resumed_pull_is_first_sent_every_record_that_changed_since() {
     fresh(y.modify_where_keyed(&cy, &Candidates::Scan, &Inc, Some(1), &k).unwrap());
     let size = y.idempotency_record(cy.id, &key_of(0).scope).unwrap().unwrap().encode().len();
     y.set_record_delta_budget_for_test(Some((
-        20 * (size + 96),
+        20 * (size + 96) + crate::snapshot::cursor_reserve(0),
         crate::idempotency::RECORD_DELTA_ROWS,
     )));
     let x = Engine::open(&x_path).unwrap();
@@ -1371,7 +1373,7 @@ fn rows_bytes(page: &SnapshotPage) -> usize {
         .iter()
         .map(|d| {
             d.body.as_ref().map_or(0, Vec::len)
-                + crate::docs::doc_key(&d.id).unwrap().len()
+                + crate::snapshot::id_wire_len(&d.id)
                 + crate::snapshot::DOCUMENT_OVERHEAD
         })
         .sum();
@@ -1814,6 +1816,206 @@ fn a_pages_definitions_and_drops_are_counted_against_its_budget() {
     }
     let cx = x.get_collection("shop", "kept").unwrap();
     assert_eq!(count(&x, &cx), 200, "every document, once");
+}
+
+// -- The page budget against the encoding: `_id`s and cursor keys --------------------------
+
+/// The bounds the budget counts rows and the cursor at hold of the BSON encoding,
+/// row by row, for the shapes that maximise them: the widest collection id and
+/// stamp, a delta of 65,536 records, and `_id`s of every kind, binary ones as
+/// large as 4 KiB, which serde writes as an array of `int32`s; and the cursor,
+/// whose key crosses the same way, at the legacy form of each key.
+#[test]
+fn the_row_overheads_bound_the_encoding() {
+    use crate::snapshot::{
+        DOCUMENT_OVERHEAD, SnapshotDoc, SnapshotTombstone, TOMBSTONE_OVERHEAD, cursor_reserve,
+        id_wire_len,
+    };
+    let node = NodeId::from_bytes([0xab; 16]);
+    let stamp = Stamp::new(Hlc { wall_ms: u64::from(u32::MAX) * 1000, counter: u16::MAX }, node);
+    let bare = SnapshotPage {
+        collections: Vec::new(),
+        documents: Vec::new(),
+        next: None,
+        versions: Default::default(),
+        dropped: None,
+        dropped_collections: Vec::new(),
+        deleted_documents: Vec::new(),
+        dropped_indexes: Vec::new(),
+        tombstone_horizon: None,
+        records: Vec::new(),
+        records_epoch: Some(0),
+    };
+    let size = |page: &SnapshotPage| bson::serialize_to_vec(page).unwrap().len();
+    let base = size(&bare);
+    // Records: a delta carries up to RECORD_DELTA_ROWS of them on one page.
+    let n = crate::idempotency::RECORD_DELTA_ROWS;
+    let records: Vec<CarriedRecord> = (0..n)
+        .map(|i| CarriedRecord {
+            collection: kimmy_core::CollectionId(u64::MAX - i as u64),
+            scope: ScopeHash([7; 32]),
+            carrying: None,
+            record: vec![1; 120],
+        })
+        .collect();
+    let page = SnapshotPage { records, ..bare.clone() };
+    let counted: usize =
+        page.records.iter().map(|r| crate::idempotency::carried_size(r.record.len())).sum();
+    let actual = size(&page) - base;
+    assert!(actual <= counted, "records: {actual} bytes, counted {counted}");
+    let decimal = DocId::try_from_bson(&Bson::Decimal128("1.5".parse().unwrap())).unwrap();
+    for (name, id) in [
+        ("int64", DocId::Int64(i64::MIN)),
+        ("objectid", DocId::ObjectId(bson::oid::ObjectId::new())),
+        ("uuid", DocId::Uuid(uuid::Uuid::new_v4())),
+        ("decimal", decimal),
+        ("string-1k", DocId::String("s".repeat(1024))),
+        ("binary-0", DocId::Binary(Vec::new())),
+        ("binary-32", DocId::Binary(vec![9; 32])),
+        ("binary-256", DocId::Binary(vec![9; 256])),
+        ("binary-4k", DocId::Binary(vec![9; 4096])),
+    ] {
+        let key = crate::docs::doc_key(&id).unwrap();
+        let body =
+            bson::serialize_to_vec(&doc! { "_id": id.to_bson(), "pad": "p".repeat(100) }).unwrap();
+        let documents: Vec<SnapshotDoc> = (0..SNAPSHOT_PAGE)
+            .map(|_| SnapshotDoc {
+                collection: kimmy_core::CollectionId(u64::MAX),
+                id: id.clone(),
+                stamp,
+                body: Some(body.clone()),
+            })
+            .collect();
+        let page = SnapshotPage { documents, ..bare.clone() };
+        let counted = SNAPSHOT_PAGE * (body.len() + id_wire_len(&id) + DOCUMENT_OVERHEAD);
+        let actual = size(&page) - base;
+        assert!(actual <= counted, "documents {name}: {actual} bytes, counted {counted}");
+        let tombstones: Vec<SnapshotTombstone> = (0..SNAPSHOT_PAGE)
+            .map(|_| SnapshotTombstone {
+                collection: kimmy_core::CollectionId(u64::MAX),
+                key: kimmy_core::legacy_key::legacy_of_stored(&key).into_bytes(),
+                stamp,
+            })
+            .collect();
+        let page = SnapshotPage { deleted_documents: tombstones, ..bare.clone() };
+        let counted = SNAPSHOT_PAGE * (key.len() + TOMBSTONE_OVERHEAD);
+        let actual = size(&page) - base;
+        assert!(actual <= counted, "tombstones {name}: {actual} bytes, counted {counted}");
+        // The cursor a page cuts at such a row, with every optional part.
+        let cursor = SnapshotCursor {
+            collection: kimmy_core::CollectionId(u64::MAX),
+            after_key: kimmy_core::legacy_key::legacy_of_stored(&key).into_bytes(),
+            records: Some(vec![0xff; 32]),
+            records_base: Some(RecordsBase { key: stamp, epoch: Some(i64::MIN) }),
+        };
+        let page = SnapshotPage { next: Some(cursor), ..bare.clone() };
+        let actual = size(&page) - base;
+        let reserved = cursor_reserve(key.len());
+        assert!(actual <= reserved, "the cursor at {name}: {actual} bytes, reserved {reserved}");
+    }
+}
+
+/// A full page of documents with 4 KiB binary `_id`s (512 of 110,000 bytes was
+/// counted at 60.6 MB and crossed at 78.9 MB, over a frame): each page within a
+/// frame, and every document arrives once.
+#[test]
+fn a_page_of_large_binary_ids_stays_within_a_frame() {
+    let dir = tempfile::tempdir().unwrap();
+    let y = open(&dir, "y");
+    let cy = y.create_collection("shop", "bin").unwrap();
+    let pad = "x".repeat(110_000);
+    for chunk in 0..8u32 {
+        let docs = (0..64u32)
+            .map(|i| {
+                let mut bytes = vec![0u8; 4096];
+                bytes[..4].copy_from_slice(&(chunk * 64 + i).to_be_bytes());
+                let id = bson::Binary { subtype: bson::spec::BinarySubtype::Generic, bytes };
+                doc! { "_id": Bson::Binary(id), "pad": pad.clone() }
+            })
+            .collect();
+        y.insert_many(&cy, docs).unwrap();
+    }
+    let x = open(&dir, "x");
+    let mut progress = SnapshotProgress::of_collection(cy.id);
+    let pages = finish(&x, &y, &mut progress);
+    let frame = crate::SNAPSHOT_PAGE_BYTES + 1024 * 1024;
+    for page in &pages {
+        let encoded = bson::serialize_to_vec(page).unwrap().len();
+        assert!(encoded <= frame, "a page of {encoded} bytes, over a frame of {frame}");
+    }
+    let cx = x.get_collection("shop", "bin").unwrap();
+    assert_eq!(count(&x, &cx), 512, "every document, once");
+}
+
+/// A page whose rows fill it ends at a document with a 1.9 MiB string `_id`: the
+/// cursor the page cuts names that key, which crosses as an array of integers,
+/// about 19 MB. It is reserved with the row, so the page stays within a frame.
+#[test]
+fn a_full_page_ending_at_a_large_id_stays_within_a_frame() {
+    let dir = tempfile::tempdir().unwrap();
+    let y = open(&dir, "y");
+    let cy = y.create_collection("shop", "wide").unwrap();
+    let pad = "x".repeat(1024 * 1024);
+    for i in 0..59 {
+        y.insert(&cy, doc! { "_id": format!("a{i:03}"), "pad": pad.clone() }).unwrap();
+    }
+    let big = format!("b{}", "z".repeat(1900 * 1024));
+    y.insert(&cy, doc! { "_id": big, "n": 1i64 }).unwrap();
+    y.insert(&cy, doc! { "_id": "c", "pad": pad.clone() }).unwrap();
+    let x = open(&dir, "x");
+    let mut progress = SnapshotProgress::of_collection(cy.id);
+    let pages = finish(&x, &y, &mut progress);
+    let frame = crate::SNAPSHOT_PAGE_BYTES + 1024 * 1024;
+    for page in &pages {
+        let encoded = bson::serialize_to_vec(page).unwrap().len();
+        assert!(encoded <= frame, "a page of {encoded} bytes, over a frame of {frame}");
+    }
+    let cx = x.get_collection("shop", "wide").unwrap();
+    assert_eq!(count(&x, &cx), 61, "every document, once");
+}
+
+/// A records-only page carries the cursor it was asked with, whose key may be
+/// large: under a test page budget of 4 MiB, a pull whose cursor names a document
+/// with a 200 KiB string `_id` (about 2.5 MB as it crosses), and whose next delta
+/// is larger than a page holds, sends records-only pages each within the budget
+/// with that cursor, and then the rest.
+#[test]
+fn a_records_only_page_reserves_the_large_key_of_the_cursor_it_carries() {
+    let dir = tempfile::tempdir().unwrap();
+    let (y, x) = (open(&dir, "y"), open(&dir, "x"));
+    let cy = y.create_collection("shop", "keys").unwrap();
+    let wide = |i: u8| format!("{}{}", char::from(b'a' + i), "k".repeat(200 * 1024));
+    let pad = "x".repeat(400 * 1024);
+    for i in 0..6 {
+        y.insert(&cy, doc! { "_id": wide(i), "n": 0i64, "pad": pad.clone() }).unwrap();
+    }
+    begun(&y);
+    let budget = 4 * 1024 * 1024;
+    y.set_snapshot_page_bytes_for_test(Some(budget));
+    let mut progress = SnapshotProgress::of_collection(cy.id);
+    take(&x, &y, &mut progress);
+    let asked = progress.after().cloned().unwrap();
+    assert!(asked.after_key.len() > 200 * 1024, "premise: the cursor names a wide key");
+    // A delta of find_and_modify records of 600 KiB, more than a page holds.
+    let image = crate::idempotency::ReturnedImage::After;
+    for i in 0..6u8 {
+        let id = DocId::String(wide(i));
+        let on = Candidates::Keys(vec![crate::docs::doc_key(&id).unwrap()]);
+        fresh(y.find_and_modify_keyed(&cy, &on, &Inc, &key_of(700 + u64::from(i)), image).unwrap());
+    }
+    let mut carried = 0;
+    while !progress.is_complete() {
+        let asked = progress.after().cloned().unwrap();
+        let page = take(&x, &y, &mut progress);
+        let encoded = bson::serialize_to_vec(&page).unwrap().len();
+        assert!(encoded <= budget + 4096, "a page of {encoded} bytes, over {budget}");
+        carried += usize::from(records_only(&page, &asked));
+    }
+    y.set_snapshot_page_bytes_for_test(None);
+    assert!(carried > 1, "premise: records-only pages carried the cursor: {carried}");
+    let cx = x.get_collection("shop", "keys").unwrap();
+    assert_eq!(count(&x, &cx), 6, "every document, once");
+    assert_eq!(x.idempotency_records().unwrap(), 6, "every record");
 }
 
 // -- The records of a collection dropped and not created again -----------------------------
