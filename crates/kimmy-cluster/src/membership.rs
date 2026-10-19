@@ -872,43 +872,86 @@ enum Input {
 /// This crate's SWIM instance.
 pub(crate) type Swim = Foca<Member, PostcardCodec, rand::rngs::StdRng, NoCustomBroadcast>;
 
-/// What follows every input foca handles: after one that made this member
-/// rejoin, foca is asked to judge its connection state again.
-///
-/// **Why (foca 2.0.0).** A member that learns it was declared down by a
-/// `TurnUndead` message (the one a peer sends to a member it declares down,
-/// which a member that was paused or cut off reads first when it is back)
-/// rejoins inside `handle_data` through `attempt_rejoin`, which calls
-/// `change_identity`, which resets the instance to `Disconnected`, bumping its
-/// timer token so every timer already scheduled is ignored. Only `apply_many`
-/// judges the connection state again (its last step makes an instance with
-/// active members `Connected`, and schedules its probe, gossip and announce
-/// timers), and the `TurnUndead` paths (from a sender held active, and from one
-/// held down) rejoin after it, or without it. The member then probes no one,
-/// gossips nothing, announces nothing and acks no ping, while still listing its
-/// peers live: until an active peer happens to send it something its new
-/// identity accepts, which, with every peer it could hear from paused or dead,
-/// is never. `apply_many` with no updates is foca's public way to have the
-/// state judged again; this call can go once foca does it itself on that path.
-///
-/// `rejoined` is whether the input's handling notified `Rejoin`.
-///
-/// **The renewed incarnation is recorded first** (`record`, which is
-/// [`IncarnationFile::record`] in the daemon): every datagram the input queued
-/// is sent after this returns, so the identity is on disk before any datagram
-/// carries it, and the next start is above it (ADR-242).
-pub(crate) fn after_input(
-    swim: &mut Swim,
-    rejoined: bool,
-    runtime: impl Runtime<Member>,
-    record: impl FnOnce(u64),
-) {
-    if !rejoined {
-        return;
+/// Where [`after_input`] records a renewed incarnation (ADR-242): the data
+/// directory's file in the daemon.
+pub(crate) trait KeepIncarnation {
+    fn record(&mut self, incarnation: u64);
+}
+
+impl KeepIncarnation for IncarnationFile {
+    fn record(&mut self, incarnation: u64) {
+        IncarnationFile::record(self, incarnation);
     }
-    record(swim.identity().incarnation);
-    if let Err(e) = swim.apply_many(std::iter::empty(), false, runtime) {
-        warn!(error = %e, "membership could not resume after rejoining the cluster");
+}
+
+pub(crate) use step::{Outgoing, after_input};
+
+/// The daemon's step after every input, and the queue of what the input sends,
+/// which **only that step's answer opens**: a datagram an input queued can be
+/// taken only with the `Recorded` that [`after_input`] returns once it has
+/// recorded the input's renewal, so no datagram carries a renewed identity
+/// before it is recorded (ADR-242). Nothing outside this module can make one.
+mod step {
+    use super::{KeepIncarnation, Member, Runtime, SocketAddr, Swim, warn};
+
+    /// That an input's renewal, if it made one, is recorded: what its datagrams
+    /// wait for. Only [`after_input`] makes one.
+    #[must_use]
+    pub(crate) struct Recorded(());
+
+    /// The datagrams an input queued, held until its renewal is recorded.
+    #[derive(Default)]
+    pub(crate) struct Outgoing(Vec<(SocketAddr, Vec<u8>)>);
+
+    impl Outgoing {
+        pub(crate) fn push(&mut self, to: SocketAddr, data: Vec<u8>) {
+            self.0.push((to, data));
+        }
+
+        /// Everything queued, to send now.
+        pub(crate) fn take(&mut self, _recorded: Recorded) -> Vec<(SocketAddr, Vec<u8>)> {
+            std::mem::take(&mut self.0)
+        }
+    }
+
+    /// What follows every input foca handles: after one that made this member
+    /// rejoin, foca is asked to judge its connection state again.
+    ///
+    /// **Why (foca 2.0.0).** A member that learns it was declared down by a
+    /// `TurnUndead` message (the one a peer sends to a member it declares down,
+    /// which a member that was paused or cut off reads first when it is back)
+    /// rejoins inside `handle_data` through `attempt_rejoin`, which calls
+    /// `change_identity`, which resets the instance to `Disconnected`, bumping its
+    /// timer token so every timer already scheduled is ignored. Only `apply_many`
+    /// judges the connection state again (its last step makes an instance with
+    /// active members `Connected`, and schedules its probe, gossip and announce
+    /// timers), and the `TurnUndead` paths (from a sender held active, and from one
+    /// held down) rejoin after it, or without it. The member then probes no one,
+    /// gossips nothing, announces nothing and acks no ping, while still listing its
+    /// peers live: until an active peer happens to send it something its new
+    /// identity accepts, which, with every peer it could hear from paused or dead,
+    /// is never. `apply_many` with no updates is foca's public way to have the
+    /// state judged again; this call can go once foca does it itself on that path.
+    ///
+    /// `rejoined` is whether the input's handling notified `Rejoin`.
+    ///
+    /// **The renewed incarnation is recorded first**, in `kept`: the answer is
+    /// what opens the input's datagrams ([`Outgoing::take`]), so the identity
+    /// is on disk before any datagram carries it, and the next start is above
+    /// it (ADR-242).
+    pub(crate) fn after_input(
+        swim: &mut Swim,
+        rejoined: bool,
+        runtime: impl Runtime<Member>,
+        kept: &mut impl KeepIncarnation,
+    ) -> Recorded {
+        if rejoined {
+            kept.record(swim.identity().incarnation);
+            if let Err(e) = swim.apply_many(std::iter::empty(), false, runtime) {
+                warn!(error = %e, "membership could not resume after rejoining the cluster");
+            }
+        }
+        Recorded(())
     }
 }
 
@@ -953,7 +996,7 @@ const ALONE_ANNOUNCE_EVERY: Duration = Duration::from_secs(1);
 /// not, so nothing is performed here — the work is queued and flushed by the
 /// caller, which is the only place that can `await`.
 struct Collector {
-    outgoing: Vec<(SocketAddr, Vec<u8>)>,
+    outgoing: Outgoing,
     timers: Vec<(Timer<Member>, Duration)>,
     members: Members,
     /// Whether the input being handled made this member rejoin.
@@ -1000,7 +1043,7 @@ impl foca::Runtime<Member> for Collector {
     }
 
     fn send_to(&mut self, to: Member, data: &[u8]) {
-        self.outgoing.push((to.addr, data.to_vec()));
+        self.outgoing.push(to.addr, data.to_vec());
     }
 
     fn submit_after(&mut self, event: Timer<Member>, after: Duration) {
@@ -1121,7 +1164,7 @@ pub async fn run(
     info!(bind = %local, "gossiping membership");
 
     let mut collector =
-        Collector { outgoing: Vec::new(), timers: Vec::new(), members, rejoined: false };
+        Collector { outgoing: Outgoing::default(), timers: Vec::new(), members, rejoined: false };
 
     let mut announced_alone: Option<Instant> = None;
     while let Some(input) = rx.recv().await {
@@ -1153,12 +1196,12 @@ pub async fn run(
             debug!(error = %e, "membership input rejected");
         }
         let rejoined = std::mem::take(&mut collector.rejoined);
-        after_input(&mut foca, rejoined, &mut collector, |renewed| incarnation.record(renewed));
+        let recorded = after_input(&mut foca, rejoined, &mut collector, &mut incarnation);
 
-        // Dispatch what foca asked for. Datagrams are best-effort by design —
-        // SWIM assumes loss and probes again — so a send failure is logged at
-        // debug rather than treated as an error.
-        for (addr, data) in collector.outgoing.drain(..) {
+        // Dispatch what foca asked for, which only the record opens. Datagrams
+        // are best-effort by design — SWIM assumes loss and probes again — so a
+        // send failure is logged at debug rather than treated as an error.
+        for (addr, data) in collector.outgoing.take(recorded) {
             let data = protocol::tag_datagram(&secret, &data);
             if let Err(e) = socket.send_to(&data, addr).await {
                 debug!(peer = %addr, error = %e, "membership send failed");
@@ -1262,7 +1305,7 @@ mod tests {
         assert!(members.unconfirmed_peers(OwnerClass::Ttl).is_empty());
 
         let mut collector = Collector {
-            outgoing: Vec::new(),
+            outgoing: Outgoing::default(),
             timers: Vec::new(),
             members: members.clone(),
             rejoined: false,

@@ -28606,8 +28606,9 @@ second close about 5 s into the run when the late `Down` lands.
    carries it. Peers holding any identity of this member, live, suspect or down, are below it, take it at once
    (`Rename`, and `MemberUp` if they held it down), and send no `TurnUndead`: **a restart makes no rejoin.**
 3. **A renewal in a process is recorded before anything carries it.** The daemon's step after every input
-   (`after_input`, which also resumes failure detection after a rejoin) records the identity's
-   incarnation when the input rejoined, and only then are the input's datagrams sent. The next start is above it too.
+   (`after_input`, which also resumes failure detection after a rejoin) records the identity's incarnation when the
+   input rejoined, and only then are the input's datagrams sent: the queue they wait in opens only with the value that
+   step returns, which nothing else can make. The next start is above it too.
 4. **A file that cannot help starts at 0, and the member walks once.** A missing file (the first start of this build on
    a data directory an older one ran, a wiped directory, a restore into a new one), one that cannot be read, one that
    does not hold a number, and one that holds 2^63 or more (a `WARN` for the last three) start at 0, which is what every

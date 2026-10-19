@@ -64,8 +64,15 @@ impl Runtime<Member> for Out {
 fn daemon(swim: &mut Swim, out: &mut Out) {
     let rejoined = out.rejoined;
     let mut recorded = None;
-    super::after_input(swim, rejoined, &mut *out, |renewed| recorded = Some(renewed));
+    let _ = super::after_input(swim, rejoined, &mut *out, &mut recorded);
     out.recorded = recorded;
+}
+
+/// The simulation's record of a renewal: what the daemon's step recorded.
+impl super::KeepIncarnation for Option<u64> {
+    fn record(&mut self, incarnation: u64) {
+        *self = Some(incarnation);
+    }
 }
 
 /// foca alone, without that step.
