@@ -1198,6 +1198,8 @@ async fn start_and_serve(
     // like the audit mode above it is a property of the deployment, and the
     // cache's default is the same value the config's default carries.
     state.vectors.set_max_bytes(config.vector.index_cache.max_bytes);
+    // How many graphs build at once, off the request path (ADR-245).
+    state.vectors.set_build_concurrency(config.vector.index_cache.build_concurrency);
 
     // The OTLP counters, reading the same atomics `/metrics` renders. Here
     // rather than in `logging::init` because the counters live in this state

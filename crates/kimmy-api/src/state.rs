@@ -235,6 +235,9 @@ impl AppState {
             // An estimate from node count and width, not a heap measurement;
             // what the budget evicts against, so the two agree by construction.
             vector_index_cache_bytes: self.vectors.resident_bytes(),
+            vector_graphs_stale: self.vectors.stale_graphs(),
+            vector_graph_builds_pending: self.vectors.builds_pending(),
+            vector_graph_unreached_sample: self.vectors.unreached_sample(),
             process_resident_bytes: memory.resident_bytes,
             process_resident_peak_bytes: memory.peak_resident_bytes,
             index_unkeyed: self.engine.unkeyed_writes(),

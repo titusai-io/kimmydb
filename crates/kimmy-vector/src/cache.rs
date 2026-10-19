@@ -43,17 +43,18 @@
 //! or, without snapshots, a rebuild; the budget should be sized so that is
 //! rare (`docs/operations.md`).
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
 use kimmy_core::{CollectionId, Hlc, Metric};
 use kimmy_storage::{CollectionMeta, Engine};
-use parking_lot::Mutex;
+use parking_lot::{Condvar, Mutex};
+use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use tracing::debug;
 
-use crate::error::Result;
+use crate::error::{Result, VectorError};
 use crate::index::HnswIndex;
 
 /// Below this many vectors, an exact scan is not worth displacing.
@@ -112,6 +113,21 @@ const MAX_STALENESS: Duration = Duration::from_secs(30);
 /// about 82,000 chunks; at ~11 KB per 1,536-dimensional chunk, about 48,000.
 /// Zero means unbounded, which is the behaviour before the budget existed.
 pub const DEFAULT_MAX_BYTES: u64 = 512 * 1024 * 1024;
+
+/// The generation of an entry adopted from a snapshot that is behind the
+/// store: no live counter returns it, so the entry is never usable as fresh
+/// and its rebuild is queued at once; it serves until the rebuild installs.
+const BEHIND: u64 = u64::MAX;
+
+/// The generation of an entry adopted from a snapshot a previous process
+/// saved, until a builder has counted the collection to judge it: fresh, and
+/// re-stamped at the generation the count began at, or behind, and rebuilt.
+const UNVERIFIED: u64 = u64::MAX - 1;
+
+/// The generation every collection's counter starts at in a process: what a
+/// snapshot a previous process saved is judged at, since it predates every
+/// write this process has made.
+const PROCESS_START: u64 = 0;
 
 /// What the last decision for a collection was.
 enum Decision {
@@ -241,20 +257,56 @@ impl Entries {
     }
 }
 
+/// How many graph builds run at once unless told otherwise
+/// (`vector.index_cache.build_concurrency`).
+///
+/// One: a build is CPU and memory bound (a 100,000 × 384 graph peaks at
+/// 1.3 GiB with its records), and a roll that starts every collection's
+/// rebuild at once would otherwise run them all side by side. A collection
+/// waiting its turn is searched by the graph it had, or by exact scan.
+pub const DEFAULT_BUILD_CONCURRENCY: usize = 1;
+
+/// How many exact scans of one collection run at once while it has no graph
+/// to serve. A scan of 100,000 vectors of 384 dimensions takes about 1.4 s
+/// and 10,000 about 135 ms (release, measured), all of it CPU and storage
+/// reads; more than this many at once would take the cores the build needs
+/// and the rest of the member's.
+/// A search that cannot get a turn before its deadline answers as a request
+/// that ran out of time does.
+pub const EXACT_SCANS_PER_COLLECTION: usize = 2;
+
 /// Per-collection index cache.
+///
+/// A handle: the state is shared with the builder threads that run every
+/// graph build and save off the request path (ADR-241).
+#[derive(Default)]
 pub struct IndexCache {
+    shared: Arc<Shared>,
+}
+
+impl std::ops::Deref for IndexCache {
+    type Target = Shared;
+
+    fn deref(&self) -> &Shared {
+        &self.shared
+    }
+}
+
+/// What an [`IndexCache`] and its builder threads share.
+#[doc(hidden)]
+pub struct Shared {
     entries: Mutex<Entries>,
     /// One lock per collection, held for the length of a build.
     ///
     /// This is what keeps a build off `entries`: the builder holds its
     /// collection's lock and nothing else, so a search on any other
-    /// collection takes `entries` for a lookup and carries on. A second
-    /// caller for the *same* collection finds the lock taken and either
-    /// serves what is already cached or waits for this one build. Entries
-    /// here are created on first use and removed on `invalidate`, so the map
-    /// is bounded by the number of vector collections. Removing a slot does
-    /// not stop the build holding it — the guard is the builder's own — which
-    /// is what [`Entries::epochs`] is for.
+    /// collection takes `entries` for a lookup and carries on. A search of
+    /// the same collection that finds the lock taken serves what is cached,
+    /// or scans exactly; it never waits for the build. Entries here are
+    /// created on first use and removed on `invalidate`, so the map is
+    /// bounded by the number of vector collections. Removing a slot does not
+    /// stop the build holding it — the guard is the builder's own — which is
+    /// what [`Entries::epochs`] is for.
     builds: Mutex<HashMap<CollectionId, Arc<Mutex<()>>>>,
     /// Overridable so tests can exercise the threshold on small fixtures.
     min_vectors: usize,
@@ -283,16 +335,42 @@ pub struct IndexCache {
     /// adopt a graph from before that write as fresh at the generation after
     /// it. Removed with the snapshot in [`Self::invalidate`].
     saved_at: Mutex<HashMap<CollectionId, u64>>,
-    /// Called with the collection about to be built, before the build. Lets
-    /// a test hold a build open to observe what happens around it.
+    /// Builds waiting for a builder thread, and running on one.
+    queue: Mutex<Queue>,
+    /// Signalled when a build finishes or a builder thread exits.
+    idle: Condvar,
+    /// How many builds run at once; [`DEFAULT_BUILD_CONCURRENCY`] unless set.
+    max_builds: AtomicUsize,
+    /// Each collection's turns at an exact scan
+    /// ([`EXACT_SCANS_PER_COLLECTION`]), awaited rather than blocked on, so a
+    /// search waiting for one holds no thread (ADR-245).
+    scans: Mutex<HashMap<CollectionId, Arc<Semaphore>>>,
+    /// Called with the collection about to be built, on its builder, before
+    /// the build. Lets a test hold a build open to observe what happens
+    /// around it.
     #[cfg(test)]
     build_hook: Mutex<Option<BuildHook>>,
+    /// Called with the collection a search is about to look for a snapshot
+    /// of, before the load: the same, for a first look.
+    #[cfg(test)]
+    load_hook: Mutex<Option<BuildHook>>,
+    /// Called with the collection whose graph a builder is about to save,
+    /// once the builder has let go of the store.
+    #[cfg(test)]
+    save_hook: Mutex<Option<BuildHook>>,
+    /// Called inside an exact scan's turn with how many of the collection's
+    /// turns are taken.
+    #[cfg(test)]
+    scan_hook: Mutex<Option<ScanHook>>,
 }
 
 #[cfg(test)]
 type BuildHook = Arc<dyn Fn(CollectionId) + Send + Sync>;
 
-impl Default for IndexCache {
+#[cfg(test)]
+type ScanHook = Arc<dyn Fn(usize) + Send + Sync>;
+
+impl Default for Shared {
     fn default() -> Self {
         Self {
             entries: Mutex::new(Entries::default()),
@@ -301,10 +379,47 @@ impl Default for IndexCache {
             snapshot_dir: None,
             max_bytes: AtomicU64::new(DEFAULT_MAX_BYTES),
             saved_at: Mutex::new(HashMap::new()),
+            queue: Mutex::new(Queue::default()),
+            idle: Condvar::new(),
+            max_builds: AtomicUsize::new(DEFAULT_BUILD_CONCURRENCY),
+            scans: Mutex::new(HashMap::new()),
             #[cfg(test)]
             build_hook: Mutex::new(None),
+            #[cfg(test)]
+            load_hook: Mutex::new(None),
+            #[cfg(test)]
+            save_hook: Mutex::new(None),
+            #[cfg(test)]
+            scan_hook: Mutex::new(None),
         }
     }
+}
+
+/// A graph build a search asked for, waiting for a builder or running on one.
+struct Job {
+    /// The store to build from. Weak while the job waits, so a queued build
+    /// keeps nothing from the node's stop; the builder holds it strongly for
+    /// the count and the build only, and lets go before the save.
+    engine: std::sync::Weak<Engine>,
+    shadow: CollectionMeta,
+    metric: Metric,
+    dim: usize,
+    /// [`Entries::epoch`] when the search that asked for the build missed: a
+    /// forget since then fences the build, as it fences one in progress.
+    epoch: u64,
+}
+
+#[derive(Default)]
+struct Queue {
+    waiting: VecDeque<Job>,
+    /// Collections with a build waiting or running, and the shape it is a
+    /// build of: one at a time each, and a search that finds its collection
+    /// here asks for nothing more.
+    pending: HashMap<CollectionId, (Metric, usize)>,
+    /// Builder threads alive.
+    builders: usize,
+    /// Builds running now.
+    running: usize,
 }
 
 /// Which access path a search should take.
@@ -313,6 +428,16 @@ pub enum Access {
     Approximate(Arc<HnswIndex>),
     /// Scan every vector. Correct, and faster below the size threshold.
     Exact,
+    /// The collection has no graph to serve and one is being built: scan
+    /// every vector meanwhile, in a turn and under the request's deadline
+    /// ([`Shared::scan_while_building`]).
+    Building,
+}
+
+/// A turn at an exact scan of one collection ([`Shared::exact_scan_turn`]),
+/// given back when dropped.
+pub struct ScanTurn {
+    _turn: OwnedSemaphorePermit,
 }
 
 /// What [`IndexCache::sweep_snapshots`] does with a `<id>.build` directory.
@@ -342,13 +467,394 @@ impl IndexCache {
     /// A cache that persists graphs under `dir` and reloads them on the first
     /// access after a restart.
     pub fn with_snapshot_dir(dir: std::path::PathBuf) -> Self {
-        Self { snapshot_dir: Some(dir), ..Self::default() }
+        Self { shared: Arc::new(Shared { snapshot_dir: Some(dir), ..Shared::default() }) }
     }
 
     /// A cache with a non-default size threshold. For tests.
     #[cfg(test)]
     fn with_min_vectors(min_vectors: usize) -> Self {
-        Self { min_vectors, ..Self::default() }
+        Self::new().min_vectors(min_vectors)
+    }
+
+    /// This cache with a non-default size threshold. For tests, before the
+    /// cache is shared.
+    #[cfg(test)]
+    fn min_vectors(mut self, min_vectors: usize) -> Self {
+        Arc::get_mut(&mut self.shared).expect("not yet shared").min_vectors = min_vectors;
+        self
+    }
+
+    /// Choose an access path, asking for a build or a rebuild if warranted.
+    ///
+    /// Never fails the query, and **never waits for a build** (ADR-241). A
+    /// usable graph is served. A graph from before a write, or one a
+    /// snapshot said was behind, is served while its rebuild runs, which is
+    /// bounded recall loss on new data, never a wrong answer. With nothing to
+    /// serve, the first look tries the snapshot; failing that, the build is
+    /// queued and the answer is [`Access::Building`], an exact scan. Every
+    /// build, the O(n) count that decides whether a collection is worth
+    /// one, and every save run on the builder threads, at most
+    /// [`Shared::set_build_concurrency`] at once, one per collection.
+    ///
+    /// The size count is O(n), so its verdict is cached under the same
+    /// generation-and-staleness rule as the graph itself. Otherwise the
+    /// check meant to *avoid* a full scan would perform one on every query.
+    pub fn access(
+        &self,
+        engine: &Arc<Engine>,
+        shadow: &CollectionMeta,
+        metric: Metric,
+        dim: usize,
+    ) -> Access {
+        // No graph exists for this metric at all, so there is nothing to cache
+        // and nothing to count.
+        if !HnswIndex::supports(metric) {
+            return Access::Exact;
+        }
+
+        let generation = engine.vector_generation(shadow.id);
+        if let Some(access) = self.serve(shadow, metric, dim, Serve::Usable(generation)) {
+            return access;
+        }
+        // A graph of this collection and shape from before a write: served
+        // while it is rebuilt.
+        if let Some(access) = self.serve(shadow, metric, dim, Serve::Anything) {
+            self.enqueue(engine, shadow, metric, dim);
+            return access;
+        }
+        // The snapshot is a read of a file, under a second at 100,000
+        // vectors; off the async worker, as a storage read is.
+        kimmy_storage::blocking(|| self.first_look(engine, shadow, metric, dim, generation))
+    }
+
+    /// The slow path of [`Self::access`]: nothing resident to serve.
+    fn first_look(
+        &self,
+        engine: &Arc<Engine>,
+        shadow: &CollectionMeta,
+        metric: Metric,
+        dim: usize,
+        generation: u64,
+    ) -> Access {
+        let build_lock = self.build_lock(shadow.id);
+        let Some(building) = build_lock.try_lock() else {
+            // A builder has this collection now and there is nothing older to
+            // serve: scan meanwhile. Its result is installed when it is done.
+            self.enqueue(engine, shadow, metric, dim);
+            return Access::Building;
+        };
+        // A build that finished between the lookup and here has installed.
+        if let Some(access) = self.serve(shadow, metric, dim, Serve::Usable(generation)) {
+            return access;
+        }
+        // The epoch is the fence `install` compares against, read before the
+        // snapshot load; `seen` says whether this process has newer knowledge
+        // than any snapshot (an entry of another incarnation or shape).
+        let (epoch, seen) = {
+            let entries = self.entries.lock();
+            (entries.epoch(shadow.id), entries.map.contains_key(&shadow.id))
+        };
+        #[cfg(test)]
+        if !seen {
+            self.run_hook(&self.load_hook, shadow.id);
+        }
+        if !seen && let Some(entry) = self.try_snapshot(shadow, metric, dim, generation) {
+            let behind = entry.generation != generation;
+            let access = self.install(shadow, entry, epoch);
+            drop(building);
+            if behind && matches!(access, Access::Approximate(_)) {
+                self.enqueue(engine, shadow, metric, dim);
+            }
+            return access;
+        }
+        drop(building);
+        self.enqueue(engine, shadow, metric, dim);
+        Access::Building
+    }
+
+    /// Queue a build of `shadow`, unless one is waiting or running, and start
+    /// a builder thread if fewer run than the concurrency allows.
+    fn enqueue(&self, engine: &Arc<Engine>, shadow: &CollectionMeta, metric: Metric, dim: usize) {
+        let epoch = self.entries.lock().epoch(shadow.id);
+        let mut queue = self.queue.lock();
+        if queue.pending.contains_key(&shadow.id) {
+            return;
+        }
+        queue.pending.insert(shadow.id, (metric, dim));
+        queue.waiting.push_back(Job {
+            engine: Arc::downgrade(engine),
+            shadow: shadow.clone(),
+            metric,
+            dim,
+            epoch,
+        });
+        if queue.builders < self.max_builds.load(Ordering::Relaxed).max(1) {
+            let shared = Arc::clone(&self.shared);
+            let started = std::thread::Builder::new()
+                .name("kimmy-hnsw-build".into())
+                // UNSUPERVISED: a builder catches each build's panic and lives on, exits when the queue is empty, and the next search that queues a build starts another.
+                .spawn(move || shared.builder());
+            match started {
+                Ok(_) => queue.builders += 1,
+                // The build stays queued, for the next builder to start.
+                Err(e) => tracing::warn!(error = %e, "could not start an HNSW builder thread"),
+            }
+        }
+    }
+
+    /// Block until no build is waiting or running. For tests, which would
+    /// otherwise see [`Access::Building`] where a graph is about to be.
+    #[cfg(any(test, feature = "test-hooks"))]
+    pub fn settle(&self) {
+        let mut queue = self.queue.lock();
+        while !(queue.waiting.is_empty() && queue.running == 0) {
+            self.idle.wait(&mut queue);
+        }
+    }
+}
+
+impl Shared {
+    /// Run builds from the queue until it is empty. A builder thread's body.
+    fn builder(&self) {
+        loop {
+            let job = {
+                let mut queue = self.queue.lock();
+                match queue.waiting.pop_front() {
+                    Some(job) => {
+                        queue.running += 1;
+                        job
+                    }
+                    None => {
+                        queue.builders -= 1;
+                        drop(queue);
+                        self.idle.notify_all();
+                        return;
+                    }
+                }
+            };
+            let collection = job.shadow.id;
+            let name = job.shadow.name.clone();
+            // The job, and the engine it holds, are gone before the build is
+            // counted as done. A build that panics (the library asserts on
+            // what it cannot take) costs that build and not the builder: the
+            // counts below stay true, so no later build waits on a builder
+            // that is gone, and the collection is scanned until a later
+            // search asks again. `AssertUnwindSafe`: the build's own state
+            // goes with it, and what it shares is behind locks that do not
+            // poison and are not held across the library's calls.
+            let built = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| self.build(job)));
+            if built.is_err() {
+                tracing::error!(
+                    collection = %name,
+                    "an HNSW build panicked; the collection is scanned until a later search asks again"
+                );
+            }
+            let mut queue = self.queue.lock();
+            queue.running -= 1;
+            queue.pending.remove(&collection);
+            drop(queue);
+            self.idle.notify_all();
+        }
+    }
+
+    /// One queued build: decide, build, save and install, under the
+    /// collection's build lock and the forget fence the search read.
+    ///
+    /// The store is held for the count and the build, whose walks end at the
+    /// node's stop, and let go before the save, which needs none: a save of
+    /// 100,000 vectors takes up to two minutes, and a stop that lands in it
+    /// must find the store free to close (ADR-245). A save the stop's exit
+    /// cuts short leaves its staging directory, never a half snapshot, and the
+    /// next start sweeps it.
+    fn build(&self, job: Job) {
+        let Job { engine, shadow, metric, dim, epoch } = job;
+        // Gone: the store is closing, and nothing is built for it.
+        let Some(engine) = engine.upgrade() else { return };
+        let build_lock = self.build_lock(shadow.id);
+        let _building = build_lock.lock();
+        // Read before the build, so a write that lands during it makes the
+        // result look behind, never fresh.
+        let generation = engine.vector_generation(shadow.id);
+        if self.serve(&shadow, metric, dim, Serve::Usable(generation)).is_some() {
+            return;
+        }
+        #[cfg(test)]
+        self.run_hook(&self.build_hook, shadow.id);
+        if self.verify_snapshot(&engine, &shadow, metric, dim, epoch) {
+            return;
+        }
+        // Whether this build replaces a graph adopted behind or unjudged:
+        // the swap an upgrade's rebuilds make, said at `INFO`. An ordinary
+        // rebuild after a write is said at `DEBUG`.
+        let after_adoption = self.entries.lock().map.get(&shadow.id).is_some_and(|e| {
+            e.created == shadow.created
+                && e.metric == metric
+                && e.dim == dim
+                && matches!(e.generation, BEHIND | UNVERIFIED)
+        });
+        // Falling back on error keeps the query correct: the collection is
+        // scanned until a later search asks again.
+        let decision = match self.decide(&engine, &shadow, metric, dim) {
+            Ok(decision) => decision,
+            Err(e) => {
+                debug!(collection = %shadow.name, error = %e, "the HNSW build failed; scanning");
+                return;
+            }
+        };
+        // Not saved once the node's stop has begun: a save writes the whole
+        // graph, and the next start builds or loads one either way.
+        let stopping = engine.walk_stop(kimmy_storage::WalkScope::Background).is_some();
+        drop(engine);
+        if let Decision::Index(index) = &decision
+            && !stopping
+        {
+            #[cfg(test)]
+            self.run_hook(&self.save_hook, shadow.id);
+            self.save(&shadow, index, generation);
+        }
+        let graph = matches!(decision, Decision::Index(_));
+        let entry = Entry::new(decision, generation, shadow.created, metric, dim, Instant::now());
+        if matches!(self.install(&shadow, entry, epoch), Access::Approximate(_)) && graph {
+            if after_adoption {
+                tracing::info!(collection = %shadow.name, "a rebuilt HNSW graph replaced the one served meanwhile");
+            } else {
+                debug!(collection = %shadow.name, "a rebuilt HNSW graph replaced the one served meanwhile");
+            }
+        }
+    }
+
+    /// Judge a snapshot a previous process saved, which the first look
+    /// adopted [`UNVERIFIED`]: when the collection still holds what it was
+    /// built over, by count and by moves of chunk ids, re-stamp it at the
+    /// generation it was adopted at, and say so; otherwise say not, and the
+    /// caller rebuilds. The adoption's generation, not the one now: a write
+    /// this process made since the adoption that keeps the count and the
+    /// keys, an edit of a document into as many chunks, is one the count
+    /// cannot see and the generation can, and it leaves the graph behind, to
+    /// be rebuilt once the window passes, rather than fresh for good.
+    fn verify_snapshot(
+        &self,
+        engine: &Engine,
+        shadow: &CollectionMeta,
+        metric: Metric,
+        dim: usize,
+        epoch: u64,
+    ) -> bool {
+        let index = {
+            let entries = self.entries.lock();
+            match entries.map.get(&shadow.id) {
+                Some(Entry {
+                    decision: Decision::Index(index), generation: UNVERIFIED, ..
+                }) if entries.epoch(shadow.id) == epoch => Arc::clone(index),
+                _ => return false,
+            }
+        };
+        let (Ok(current), Ok(renames)) =
+            (count_vectors(engine, shadow), engine.vector_renames(shadow.id))
+        else {
+            return false;
+        };
+        if current != index.len() || renames != index.renames() {
+            debug!(
+                snapshot = index.len(),
+                current,
+                snapshot_renames = index.renames(),
+                renames,
+                "snapshot is behind the store; rebuilding while it serves"
+            );
+            return false;
+        }
+        let mut entries = self.entries.lock();
+        if entries.epoch(shadow.id) != epoch {
+            return true;
+        }
+        if let Some(entry) = entries.map.get_mut(&shadow.id)
+            && entry.generation == UNVERIFIED
+            && entry.created == shadow.created
+            && entry.metric == metric
+            && entry.dim == dim
+        {
+            entry.generation = PROCESS_START;
+            entry.decided = Instant::now();
+        }
+        true
+    }
+
+    /// A test hook, cloned out in its own statement so the guard is gone
+    /// before the hook runs: a hook that parks must not park the lock too.
+    #[cfg(test)]
+    fn run_hook(&self, hook: &Mutex<Option<BuildHook>>, collection: CollectionId) {
+        let hook = hook.lock().clone();
+        if let Some(hook) = hook {
+            hook(collection);
+        }
+    }
+
+    /// How many builds run at once; zero is taken as one.
+    pub fn set_build_concurrency(&self, builds: usize) {
+        self.max_builds.store(builds.max(1), Ordering::Relaxed);
+    }
+
+    /// A turn at an exact scan of `collection` while it has no graph
+    /// ([`Access::Building`]), awaited until `deadline`, or `None` at it. At
+    /// most [`EXACT_SCANS_PER_COLLECTION`] run at once. Awaited, not blocked
+    /// on: a search waiting for a turn holds no thread.
+    pub async fn exact_scan_turn(
+        &self,
+        collection: CollectionId,
+        deadline: Option<Instant>,
+    ) -> Option<ScanTurn> {
+        let turns = Arc::clone(
+            self.scans
+                .lock()
+                .entry(collection)
+                .or_insert_with(|| Arc::new(Semaphore::new(EXACT_SCANS_PER_COLLECTION))),
+        );
+        let turn = match deadline {
+            Some(deadline) => {
+                tokio::time::timeout_at(deadline.into(), turns.acquire_owned()).await.ok()?.ok()?
+            }
+            None => turns.acquire_owned().await.ok()?,
+        };
+        Some(ScanTurn { _turn: turn })
+    }
+
+    /// The search of a collection whose graph is being built
+    /// ([`Access::Building`]): every stored vector scored, in one of the
+    /// collection's turns ([`Self::exact_scan_turn`]) and under `deadline`,
+    /// which the scan reads itself because a request's timeout cannot end a
+    /// thread that does not yield. The turn is held for the whole scan, and
+    /// the scan, a walk, runs off the async worker. Past the deadline, waiting
+    /// or scanning, [`VectorError::DeadlineExceeded`].
+    pub async fn scan_while_building(
+        &self,
+        engine: &Engine,
+        shadow: &CollectionMeta,
+        query: &[f32],
+        options: &crate::search::SearchOptions,
+        allowed: Option<&HashSet<kimmy_core::DocId>>,
+        deadline: Option<Instant>,
+    ) -> Result<Vec<crate::search::Hit>> {
+        let Some(turn) = self.exact_scan_turn(shadow.id, deadline).await else {
+            return Err(VectorError::DeadlineExceeded);
+        };
+        let hits = kimmy_storage::blocking(|| {
+            #[cfg(test)]
+            {
+                let hook = self.scan_hook.lock().clone();
+                if let Some(hook) = hook {
+                    let taken = self
+                        .scans
+                        .lock()
+                        .get(&shadow.id)
+                        .map_or(0, |t| EXACT_SCANS_PER_COLLECTION - t.available_permits());
+                    hook(taken);
+                }
+            }
+            crate::search::vector_search_until(engine, shadow, query, options, allowed, deadline)
+        });
+        drop(turn);
+        hits
     }
 
     /// Bound the bytes of graphs kept resident; zero lifts the bound.
@@ -369,134 +875,56 @@ impl IndexCache {
         self.entries.lock().resident as u64
     }
 
+    /// How many resident graphs came from a snapshot that is behind the
+    /// store, or not yet judged, and are served while a builder rebuilds or
+    /// judges them — the `kimmy_vector_graphs_stale` gauge (ADR-241). A
+    /// roll to 0.52.0 raises it to every vector collection a member serves
+    /// and it falls as the rebuilds land.
+    pub fn stale_graphs(&self) -> u64 {
+        let entries = self.entries.lock();
+        entries
+            .map
+            .values()
+            .filter(|e| {
+                matches!(e.decision, Decision::Index(_))
+                    && matches!(e.generation, BEHIND | UNVERIFIED)
+            })
+            .count() as u64
+    }
+
+    /// Builds queued or running: one per collection, whether or not it has a
+    /// graph resident meanwhile — the `kimmy_vector_graph_builds_pending`
+    /// gauge. It counts what [`Self::stale_graphs`] cannot: a collection with
+    /// no graph at all, scanned until its build lands, and one whose adopted
+    /// graph the budget evicted while its rebuild waited (ADR-245).
+    pub fn builds_pending(&self) -> u64 {
+        self.queue.lock().pending.len() as u64
+    }
+
+    /// The highest sampled score among the resident graphs this process
+    /// built: of [`crate::index`]'s 128 probes, how many could not find
+    /// themselves at the build check's effort — the
+    /// `kimmy_vector_graph_unreached_sample` gauge. A graph loaded from a
+    /// snapshot was not sampled here and counts 0.
+    pub fn unreached_sample(&self) -> u64 {
+        let entries = self.entries.lock();
+        entries
+            .map
+            .values()
+            .filter_map(|e| match &e.decision {
+                Decision::Index(index) => Some(index.unreached() as u64),
+                Decision::TooSmall => None,
+            })
+            .max()
+            .unwrap_or(0)
+    }
+
     /// Where one collection's snapshot lives, when snapshots are on at all.
     fn snapshot_path(&self, collection: CollectionId) -> Option<std::path::PathBuf> {
         // Hex of the derived collection id: stable across restarts and nodes
         // because ids are derived from names (ADR-031), and free of anything
         // that needs escaping in a filename.
         self.snapshot_dir.as_ref().map(|dir| dir.join(format!("{:016x}", collection.0)))
-    }
-
-    /// Choose an access path, building or rebuilding the index if warranted.
-    ///
-    /// Never fails the query: if building an index errors — an unsupported
-    /// metric, say — it falls back to the exact scan, which is always correct.
-    ///
-    /// The size count this needs is O(n), so its verdict is cached under the
-    /// same generation-and-staleness rule as the graph itself. Otherwise the
-    /// check meant to *avoid* a full scan would perform one on every query.
-    ///
-    /// The cache-wide lock is held only to look and to install. The build —
-    /// seconds, and O(n log n) — runs between the two under this collection's
-    /// own lock, so it delays nothing but a search on this same collection
-    /// that has nothing older to serve.
-    pub fn access(
-        &self,
-        engine: &Engine,
-        shadow: &CollectionMeta,
-        metric: Metric,
-        dim: usize,
-    ) -> Access {
-        // No graph exists for this metric at all, so there is nothing to cache
-        // and nothing to count.
-        if !HnswIndex::supports(metric) {
-            return Access::Exact;
-        }
-
-        let generation = engine.vector_generation(shadow.id);
-        if let Some(access) = self.serve(shadow, metric, dim, Serve::Usable(generation)) {
-            return access;
-        }
-
-        // A build, or a wait for one. Off the async runtime's worker either
-        // way: the same reasoning as a storage commit's fsync — seconds spent
-        // here on a worker thread are seconds every other task on it waits.
-        kimmy_storage::blocking(|| self.build_or_wait(engine, shadow, metric, dim, generation))
-    }
-
-    /// The slow path of [`Self::access`]: everything after the lookup missed.
-    fn build_or_wait(
-        &self,
-        engine: &Engine,
-        shadow: &CollectionMeta,
-        metric: Metric,
-        dim: usize,
-        generation: u64,
-    ) -> Access {
-        let build_lock = self.build_lock(shadow.id);
-        let _building = match build_lock.try_lock() {
-            Some(guard) => guard,
-            None => {
-                // Someone is building this collection right now. A graph from
-                // before the write that made it stale is still a correct
-                // answer, so serve that rather than queue behind the build.
-                if let Some(access) = self.serve(shadow, metric, dim, Serve::Anything) {
-                    return access;
-                }
-                // Nothing to serve: wait for that build, then take its result.
-                // If it failed — there is no entry — this caller tries once
-                // itself, which is what it would have done unopposed.
-                let guard = build_lock.lock();
-                if let Some(access) = self.serve(shadow, metric, dim, Serve::Usable(generation)) {
-                    return access;
-                }
-                guard
-            }
-        };
-
-        // Holding the build lock. A build that finished between the lookup
-        // and here has installed its result, and this one would be a
-        // duplicate.
-        if let Some(access) = self.serve(shadow, metric, dim, Serve::Usable(generation)) {
-            return access;
-        }
-
-        // Two things read under one lock before anything slow starts.
-        //
-        // The epoch is the fence `install` compares against: captured here,
-        // ahead of the snapshot load and the build alike, so a forget that
-        // lands during either — a drop committing while the graph is being
-        // built from a read transaction that still sees every vector — is
-        // seen by the install that follows. See [`Entries::epochs`].
-        //
-        // `seen` decides whether the snapshot is worth a look: a process's
-        // first look at this collection tries it before paying the build,
-        // but only on a true miss — an entry that has gone stale means this
-        // process has newer knowledge than any snapshot. Eviction removes
-        // the entry, so an evicted collection comes back this way too, which
-        // is the cheaper of its two ways back.
-        let (epoch, seen) = {
-            let entries = self.entries.lock();
-            (entries.epoch(shadow.id), entries.map.contains_key(&shadow.id))
-        };
-
-        // Cloned out in its own statement, so the guard is gone before the
-        // hook runs: a hook that parks must not park the lock too.
-        #[cfg(test)]
-        {
-            let hook = self.build_hook.lock().clone();
-            if let Some(hook) = hook {
-                hook(shadow.id);
-            }
-        }
-
-        if !seen && let Some(entry) = self.try_snapshot(engine, shadow, metric, dim, generation) {
-            return self.install(shadow, entry, epoch);
-        }
-
-        // Falling back on error keeps the query correct; the alternative is
-        // failing a search because an optimisation could not be built.
-        match self.decide(engine, shadow, metric, dim, generation) {
-            Ok(decision) => self.install(
-                shadow,
-                Entry::new(decision, generation, shadow.created, metric, dim, Instant::now()),
-                epoch,
-            ),
-            Err(e) => {
-                debug!(error = %e, "falling back to an exact scan");
-                Access::Exact
-            }
-        }
     }
 
     /// This collection's build lock, created on first use.
@@ -655,7 +1083,10 @@ impl IndexCache {
     /// check is the vector *count* the snapshot covered against the count
     /// stored now, and the shadow's moves of chunk ids since it was built
     /// ([`Engine::vector_renames`], ADR-239), which keep the count and change
-    /// the keys. Both equal adopt the snapshot as fresh. The corner this
+    /// the keys. Both equal adopt the snapshot as fresh. The count is a walk
+    /// of the collection, so it is a builder's (ADR-241): the snapshot is
+    /// served meanwhile, marked [`UNVERIFIED`], and the builder either
+    /// re-stamps it fresh or rebuilds it. The corner this
     /// accepts, on purpose: a delete-and-add while the node was down leaves
     /// the count equal, and that snapshot serves as fresh until the next
     /// vector write bumps the generation. Same class of bound as the
@@ -663,7 +1094,8 @@ impl IndexCache {
     ///
     /// A snapshot judged behind is still adopted — serving a stale graph is
     /// bounded recall loss, never wrong data, and it answers this query
-    /// instantly — but marked already-stale, so the very next access rebuilds.
+    /// instantly — but marked [`BEHIND`], so that its rebuild is queued and it
+    /// serves until the rebuild replaces it.
     ///
     /// Anything unreadable is deleted and `None` returned: a corrupt snapshot
     /// is discarded, not trusted, and the ordinary build path takes over. That
@@ -674,7 +1106,6 @@ impl IndexCache {
     /// and serve until a vector write bumped the generation.
     fn try_snapshot(
         &self,
-        engine: &Engine,
         shadow: &CollectionMeta,
         metric: Metric,
         dim: usize,
@@ -695,55 +1126,40 @@ impl IndexCache {
 
         // A graph `hnsw_rs` 0.3.4 built, saved by 0.51 or earlier, is behind
         // whatever the counts say: it left part of the collection where no
-        // search reaches it (ADR-241). It serves this search, as any behind
-        // snapshot does, and the next one rebuilds it.
+        // search reaches it (ADR-241). It is served while its rebuild runs,
+        // as any behind snapshot is.
         if !index.built_by_this_build() {
             tracing::info!(
                 ?path,
                 vectors = index.len(),
-                "adopting an HNSW snapshot a build before 0.52.0 made as behind; it serves \
-                 this search and the next search of the collection rebuilds it"
+                "adopting an HNSW snapshot a build before 0.52.0 made as behind; it is \
+                 served until its rebuild replaces it"
             );
+            return Some(Entry::new(
+                Decision::Index(Arc::new(index)),
+                BEHIND,
+                shadow.created,
+                metric,
+                dim,
+                Instant::now() - MAX_STALENESS,
+            ));
         }
-        let fresh = index.built_by_this_build()
-            && match self.saved_at.lock().get(&shadow.id).copied() {
-                Some(saved_at) => {
-                    let fresh = saved_at == generation;
-                    if !fresh {
-                        debug!(
-                            saved_at,
-                            generation,
-                            "snapshot predates a write this process made; serving it once and \
-                         rebuilding"
-                        );
-                    }
-                    fresh
-                }
-                None => {
-                    // The count, and the moves of chunk ids since the build: an
-                    // adoption, or a re-embed that took a document off its 0.50
-                    // ids, keeps the count and changes the keys (ADR-239).
-                    let current = count_vectors(engine, shadow).ok()?;
-                    let renames = engine.vector_renames(shadow.id).ok()?;
-                    let fresh = current == index.len() && renames == index.renames();
-                    if !fresh {
-                        debug!(
-                            snapshot = index.len(),
-                            current,
-                            snapshot_renames = index.renames(),
-                            renames,
-                            "snapshot is behind the store; serving it once and rebuilding"
-                        );
-                    }
-                    fresh
-                }
-            };
-        let (generation, decided) = if fresh {
-            (generation, Instant::now())
-        } else {
-            // A generation no live counter returns, plus an already-expired
-            // clock: the next access falls through to a rebuild.
-            (u64::MAX, Instant::now() - MAX_STALENESS)
+        let (generation, decided) = match self.saved_at.lock().get(&shadow.id).copied() {
+            Some(saved_at) if saved_at == generation => (generation, Instant::now()),
+            Some(saved_at) => {
+                debug!(
+                    saved_at,
+                    generation,
+                    "snapshot predates a write this process made; serving it until its \
+                     rebuild replaces it"
+                );
+                (BEHIND, Instant::now() - MAX_STALENESS)
+            }
+            // A previous process's snapshot: judged by the vector count and the
+            // moves of chunk ids since its build, which is a walk of the
+            // collection, so not here. It is served while a builder counts
+            // (`Shared::build`), and either adopted as fresh or rebuilt.
+            None => (UNVERIFIED, Instant::now() - MAX_STALENESS),
         };
         Some(Entry::new(
             Decision::Index(Arc::new(index)),
@@ -755,16 +1171,13 @@ impl IndexCache {
         ))
     }
 
-    /// Build the graph or the "too small" verdict, persisting a graph and
-    /// remembering `generation` — the generation the build was decided at —
-    /// as the one its snapshot is good for.
+    /// Build the graph or the "too small" verdict.
     fn decide(
         &self,
         engine: &Engine,
         shadow: &CollectionMeta,
         metric: Metric,
         dim: usize,
-        generation: u64,
     ) -> Result<Decision> {
         if count_vectors(engine, shadow)? < self.min_vectors {
             return Ok(Decision::TooSmall);
@@ -777,28 +1190,28 @@ impl IndexCache {
             "rebuilt vector index"
         );
 
-        // Every successful build is persisted, so whatever graph a restart
-        // finds is the newest one that existed. Failure to save costs the
-        // next process a rebuild, not this query an answer.
-        //
-        // Not once the node's stop has begun: a save writes the whole graph,
-        // and the next start builds or loads one either way.
-        let stopping = engine.walk_stop(kimmy_storage::WalkScope::Background).is_some();
-        if let Some(path) = self.snapshot_path(shadow.id).filter(|_| !stopping) {
-            match index.save(&path) {
-                // `generation` was read before the build, so a write that
-                // landed during it makes this snapshot look behind — the
-                // conservative side, and the same one the entry itself is on.
-                Ok(()) => {
-                    self.saved_at.lock().insert(shadow.id, generation);
-                }
-                Err(e) => {
-                    self.saved_at.lock().remove(&shadow.id);
-                    tracing::warn!(error = %e, ?path, "could not save the HNSW snapshot");
-                }
+        Ok(Decision::Index(Arc::new(index)))
+    }
+
+    /// Persist a built graph, remembering `generation` — the generation the
+    /// build was decided at — as the one its snapshot is good for. Every
+    /// successful build is saved, so whatever graph a restart finds is the
+    /// newest one that existed; a failure to save costs the next process a
+    /// rebuild, not a search an answer.
+    fn save(&self, shadow: &CollectionMeta, index: &HnswIndex, generation: u64) {
+        let Some(path) = self.snapshot_path(shadow.id) else { return };
+        match index.save(&path) {
+            // `generation` was read before the build, so a write that
+            // landed during it makes this snapshot look behind — the
+            // conservative side, and the same one the entry itself is on.
+            Ok(()) => {
+                self.saved_at.lock().insert(shadow.id, generation);
+            }
+            Err(e) => {
+                self.saved_at.lock().remove(&shadow.id);
+                tracing::warn!(error = %e, ?path, "could not save the HNSW snapshot");
             }
         }
-        Ok(Decision::Index(Arc::new(index)))
     }
 
     /// Forget a collection's index. Used when its vectors are dropped.
@@ -972,12 +1385,11 @@ impl IndexCache {
     /// captured the epoch before it will decline to install — without that,
     /// a build of the old shape already under way would install a graph
     /// `serve` declines at every search, and the resident bytes would stay
-    /// until eviction. A match, or nothing resident, moves nothing: a build
-    /// in flight then is either of the shape in force, which is wanted, or
-    /// of the old shape as read by a request that raced the reconfiguration,
-    /// which installs an entry `serve` declines at the next search — and
-    /// that search's build replaces it. Bounded, and the same class as the
-    /// race the reconfiguring route already accepts.
+    /// until eviction. Nothing resident with a build queued or running moves
+    /// it too: a build asked for before the reconfiguration is of the old
+    /// shape, and would run, save and install a graph `serve` declines while
+    /// the build of the shape in force waited behind it (ADR-245). A match,
+    /// or nothing resident and nothing queued, moves nothing.
     ///
     /// The directory is touched only under the collection's build lock,
     /// taken with `try_lock` and skipped when held, for the reason
@@ -992,6 +1404,8 @@ impl IndexCache {
         dim: usize,
     ) -> bool {
         let mut forgot = false;
+        // Read before the entries, so the two locks are never held together.
+        let queued = self.queue.lock().pending.get(&collection).copied();
         {
             let mut entries = self.entries.lock();
             match entries.map.get(&collection) {
@@ -1003,6 +1417,15 @@ impl IndexCache {
                     entries.warned.remove(&collection);
                     entries.fence(collection);
                     forgot = true;
+                }
+                // Nothing resident, and a build of another shape queued or
+                // running: one asked for before the reconfiguration, which
+                // would run, save and install a graph `serve` declines while
+                // the build of the shape in force waited behind it. A build of
+                // the shape in force, which a re-delivered configuration finds
+                // queued, is the one wanted, and is left alone.
+                None if queued.is_some_and(|shape| shape != (metric, dim)) => {
+                    entries.fence(collection)
                 }
                 None => {}
             }
@@ -1309,7 +1732,8 @@ fn remove_snapshot(path: &std::path::Path, why: &'static str) -> bool {
 /// O(n) — see `access`, which caches its verdict for exactly that reason.
 pub fn count_vectors(engine: &Engine, shadow: &CollectionMeta) -> Result<usize> {
     let mut n = 0;
-    engine.for_each_vector(shadow, kimmy_storage::WalkScope::Request, |_, _| {
+    // A builder's walk (ADR-241), which the node's stop ends.
+    engine.for_each_vector(shadow, kimmy_storage::WalkScope::Background, |_, _| {
         n += 1;
         Ok(true)
     })?;
@@ -1322,9 +1746,29 @@ mod tests {
 
     use super::*;
 
-    fn setup(count: usize) -> (Engine, CollectionMeta, tempfile::TempDir) {
+    /// [`IndexCache::access`], waiting for the build when there was nothing to
+    /// serve: what the searches that follow a first one see once its graph is
+    /// built. A test of what a search sees *while* a build runs calls
+    /// `cache.access` itself.
+    fn access(
+        cache: &IndexCache,
+        engine: &Arc<Engine>,
+        shadow: &CollectionMeta,
+        metric: Metric,
+        dim: usize,
+    ) -> Access {
+        match cache.access(engine, shadow, metric, dim) {
+            Access::Building => {
+                cache.settle();
+                cache.access(engine, shadow, metric, dim)
+            }
+            other => other,
+        }
+    }
+
+    fn setup(count: usize) -> (Arc<Engine>, CollectionMeta, tempfile::TempDir) {
         let dir = tempfile::tempdir().unwrap();
-        let engine = Engine::open(&dir.path().join("kimmy.redb")).unwrap();
+        let engine = Arc::new(Engine::open(&dir.path().join("kimmy.redb")).unwrap());
         let shadow = add_collection(&engine, "docs", count);
         (engine, shadow, dir)
     }
@@ -1384,7 +1828,7 @@ mod tests {
         // Building a graph over a handful of vectors costs more than scanning.
         let (engine, shadow, _dir) = setup(5);
         let cache = IndexCache::new();
-        assert!(matches!(cache.access(&engine, &shadow, Metric::Cosine, 4), Access::Exact));
+        assert!(matches!(access(&cache, &engine, &shadow, Metric::Cosine, 4), Access::Exact));
     }
 
     #[test]
@@ -1393,7 +1837,7 @@ mod tests {
         // make the check that exists to avoid a full scan perform one.
         let (engine, shadow, _dir) = setup(5);
         let cache = IndexCache::new();
-        cache.access(&engine, &shadow, Metric::Cosine, 4);
+        access(&cache, &engine, &shadow, Metric::Cosine, 4);
         assert_eq!(cache.len(), 1, "the verdict should be remembered, not recomputed");
     }
 
@@ -1402,7 +1846,7 @@ mod tests {
         // Dot has no approximate index; the query must still work.
         let (engine, shadow, _dir) = setup(5);
         let cache = IndexCache::with_min_vectors(1);
-        assert!(matches!(cache.access(&engine, &shadow, Metric::Dot, 4), Access::Exact));
+        assert!(matches!(access(&cache, &engine, &shadow, Metric::Dot, 4), Access::Exact));
         assert!(cache.is_empty(), "an unsupported metric needs no cache entry");
     }
 
@@ -1412,14 +1856,14 @@ mod tests {
         // A lowered threshold keeps the fixture small while still crossing it.
         let cache = IndexCache::with_min_vectors(10);
 
-        let first = cache.access(&engine, &shadow, Metric::Cosine, 4);
+        let first = access(&cache, &engine, &shadow, Metric::Cosine, 4);
         assert!(matches!(first, Access::Approximate(_)));
         assert_eq!(cache.len(), 1);
 
-        let Access::Approximate(a) = cache.access(&engine, &shadow, Metric::Cosine, 4) else {
+        let Access::Approximate(a) = access(&cache, &engine, &shadow, Metric::Cosine, 4) else {
             panic!("expected the cached index");
         };
-        let Access::Approximate(b) = cache.access(&engine, &shadow, Metric::Cosine, 4) else {
+        let Access::Approximate(b) = access(&cache, &engine, &shadow, Metric::Cosine, 4) else {
             panic!("expected the cached index");
         };
         // Reused rather than rebuilt on every query.
@@ -1437,12 +1881,13 @@ mod tests {
         let (engine, shadow, _dir) = setup(60);
         let cache = IndexCache::with_min_vectors(10);
 
-        let Access::Approximate(cosine) = cache.access(&engine, &shadow, Metric::Cosine, 4) else {
+        let Access::Approximate(cosine) = access(&cache, &engine, &shadow, Metric::Cosine, 4)
+        else {
             panic!("expected an index");
         };
         assert_eq!(cosine.metric(), Metric::Cosine);
 
-        let Access::Approximate(euclidean) = cache.access(&engine, &shadow, Metric::Euclidean, 4)
+        let Access::Approximate(euclidean) = access(&cache, &engine, &shadow, Metric::Euclidean, 4)
         else {
             panic!("a supported metric over enough vectors should build an index");
         };
@@ -1472,12 +1917,12 @@ mod tests {
         let (engine, shadow, _dir) = setup(60);
         let cache = IndexCache::with_min_vectors(10);
 
-        let Access::Approximate(old) = cache.access(&engine, &shadow, Metric::Cosine, 4) else {
+        let Access::Approximate(old) = access(&cache, &engine, &shadow, Metric::Cosine, 4) else {
             panic!("expected an index");
         };
         assert_eq!(old.dim(), 4);
 
-        if let Access::Approximate(served) = cache.access(&engine, &shadow, Metric::Cosine, 8) {
+        if let Access::Approximate(served) = access(&cache, &engine, &shadow, Metric::Cosine, 8) {
             assert!(
                 !Arc::ptr_eq(&old, &served),
                 "the graph built at width 4 was served for a configuration of width 8"
@@ -1486,6 +1931,130 @@ mod tests {
         }
         assert_eq!(cache.len(), 1, "one entry per collection, whatever shape it holds");
         assert_eq!(cache.entries.lock().map[&shadow.id].dim, 8, "the entry records the new width");
+    }
+
+    /// At most [`EXACT_SCANS_PER_COLLECTION`] exact scans of one collection
+    /// run at once (ADR-245): a third waits for a turn until its deadline and
+    /// is refused at it, takes the turn a finished scan gives back, and
+    /// another collection's scans are not counted against it.
+    #[tokio::test]
+    async fn a_collections_exact_scans_take_turns_until_their_deadline() {
+        let cache = IndexCache::new();
+        let (a, b) = (CollectionId(1), CollectionId(2));
+        let soon = || Some(Instant::now() + Duration::from_millis(50));
+        let first = cache.exact_scan_turn(a, soon()).await.expect("a turn");
+        let second = cache.exact_scan_turn(a, soon()).await.expect("a second turn");
+        let started = Instant::now();
+        let third = tokio::time::timeout(PATIENCE, cache.exact_scan_turn(a, soon()))
+            .await
+            .expect("a third is answered at its deadline, not when a turn comes back");
+        assert!(third.is_none(), "a third at once");
+        assert!(started.elapsed() >= Duration::from_millis(50), "refused at its deadline");
+        assert!(cache.exact_scan_turn(b, soon()).await.is_some(), "another collection's own turns");
+        let giving_back = async {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            drop(first);
+        };
+        let (_, third) =
+            tokio::join!(giving_back, cache.exact_scan_turn(a, Some(Instant::now() + PATIENCE)));
+        assert!(third.is_some(), "the third took the turn the first gave back");
+        drop((second, third));
+        let turns = Arc::clone(&cache.scans.lock()[&a]);
+        assert_eq!(turns.available_permits(), EXACT_SCANS_PER_COLLECTION, "every turn back");
+    }
+
+    /// A scan of a collection whose graph is being built holds its turn
+    /// while it reads, and gives it back when it is done (ADR-245).
+    #[tokio::test]
+    async fn a_scan_holds_its_turn_while_it_reads() {
+        let (engine, shadow, _dir) = setup(60);
+        let cache = IndexCache::new();
+        let seen = Arc::new(AtomicUsize::new(usize::MAX));
+        *cache.scan_hook.lock() = Some(Arc::new({
+            let seen = Arc::clone(&seen);
+            move |taken| seen.store(taken, Ordering::SeqCst)
+        }));
+        let options =
+            crate::search::SearchOptions { k: 3, metric: Metric::Cosine, per_document: 1 };
+        let later = Some(Instant::now() + PATIENCE);
+        let hits = cache
+            .scan_while_building(&engine, &shadow, &[1.0, 1.0, 0.0, 0.0], &options, None, later)
+            .await
+            .unwrap();
+        assert_eq!(hits.len(), 3);
+        assert_eq!(seen.load(Ordering::SeqCst), 1, "one turn taken while the scan read");
+        let turns = Arc::clone(&cache.scans.lock()[&shadow.id]);
+        assert_eq!(turns.available_permits(), EXACT_SCANS_PER_COLLECTION, "and given back");
+    }
+
+    /// The stale gauge counts the graphs served while they are rebuilt: one
+    /// adopted from a snapshot a previous process saved, until a builder has
+    /// judged it, and none once the judgement or the rebuild lands (ADR-245).
+    #[test]
+    fn the_stale_gauge_counts_graphs_served_while_they_are_rebuilt() {
+        let dir = tempfile::tempdir().unwrap();
+        let snapshots = dir.path().join("snapshots");
+        let engine = Arc::new(Engine::open(&dir.path().join("kimmy.redb")).unwrap());
+        let shadow = add_collection(&engine, "docs", 60);
+        let first = IndexCache::with_snapshot_dir(snapshots.clone()).min_vectors(10);
+        assert!(matches!(
+            access(&first, &engine, &shadow, Metric::Cosine, 4),
+            Access::Approximate(_)
+        ));
+        assert_eq!(first.stale_graphs(), 0, "a graph this process built and judged");
+        drop(first);
+
+        let second = IndexCache::with_snapshot_dir(snapshots).min_vectors(10);
+        let gate = Gate::install(&second, shadow.id);
+        assert!(matches!(
+            second.access(&engine, &shadow, Metric::Cosine, 4),
+            Access::Approximate(_)
+        ));
+        gate.wait_for_build_to_start();
+        assert_eq!(second.stale_graphs(), 1, "adopted, and not yet judged");
+        gate.release();
+        second.settle();
+        assert_eq!(second.stale_graphs(), 0, "judged, and fresh");
+    }
+
+    /// A build that panics costs that build and not the builder (ADR-245):
+    /// the queue's counts stay true, so settling returns, and the next search
+    /// queues the build again and a builder runs it.
+    #[test]
+    fn a_build_that_panics_costs_that_build_and_not_the_builder() {
+        let (engine, shadow, _dir) = setup(10);
+        let cache = IndexCache::with_min_vectors(5);
+        let panics = Arc::new(AtomicUsize::new(1));
+        *cache.build_hook.lock() = Some(Arc::new({
+            let panics = Arc::clone(&panics);
+            move |_| {
+                if panics.fetch_sub(1, Ordering::SeqCst) == 1 {
+                    panic!("a build that panics");
+                }
+            }
+        }));
+        assert!(matches!(cache.access(&engine, &shadow, Metric::Cosine, 4), Access::Building));
+        // Polled rather than settled, so a builder lost to the panic, with
+        // its build still counted as running, fails the test rather than
+        // hanging it.
+        let deadline = Instant::now() + PATIENCE;
+        loop {
+            {
+                let queue = cache.queue.lock();
+                if queue.waiting.is_empty() && queue.running == 0 {
+                    break;
+                }
+            }
+            assert!(Instant::now() < deadline, "the queue never settled");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert_eq!(cache.len(), 0, "the build that panicked installed nothing");
+        assert!(matches!(cache.access(&engine, &shadow, Metric::Cosine, 4), Access::Building));
+        cache.settle();
+        assert!(matches!(
+            cache.access(&engine, &shadow, Metric::Cosine, 4),
+            Access::Approximate(_)
+        ));
     }
 
     #[test]
@@ -1504,11 +2073,11 @@ mod tests {
             }
         }));
 
-        assert!(matches!(cache.access(&engine, &shadow, Metric::Cosine, 4), Access::Exact));
-        assert!(matches!(cache.access(&engine, &shadow, Metric::Cosine, 4), Access::Exact));
+        assert!(matches!(access(&cache, &engine, &shadow, Metric::Cosine, 4), Access::Exact));
+        assert!(matches!(access(&cache, &engine, &shadow, Metric::Cosine, 4), Access::Exact));
         assert_eq!(decisions.load(Ordering::SeqCst), 1, "the same shape reuses the verdict");
 
-        assert!(matches!(cache.access(&engine, &shadow, Metric::Cosine, 8), Access::Exact));
+        assert!(matches!(access(&cache, &engine, &shadow, Metric::Cosine, 8), Access::Exact));
         assert_eq!(
             decisions.load(Ordering::SeqCst),
             2,
@@ -1560,7 +2129,7 @@ mod tests {
 
         let (engine, shadow, _dir) = setup(60);
         let cache = IndexCache::with_min_vectors(10);
-        let Access::Approximate(first) = cache.access(&engine, &shadow, Metric::Cosine, 4) else {
+        let Access::Approximate(first) = access(&cache, &engine, &shadow, Metric::Cosine, 4) else {
             panic!("expected an index");
         };
         let built_at = engine.vector_generation(shadow.id);
@@ -1601,7 +2170,14 @@ mod tests {
         // `Serve::Usable`, and that is precisely how the old graph was served
         // forever. Only the generation mismatch makes this access rebuild.
         cache.age(shadow.id);
-        let Access::Approximate(second) = cache.access(&engine, &shadow, Metric::Cosine, 4) else {
+        // Served stale while a builder rebuilds it (ADR-245).
+        assert!(matches!(
+            cache.access(&engine, &shadow, Metric::Cosine, 4),
+            Access::Approximate(_)
+        ));
+        cache.settle();
+        let Access::Approximate(second) = access(&cache, &engine, &shadow, Metric::Cosine, 4)
+        else {
             panic!("expected an index");
         };
         assert!(
@@ -1618,7 +2194,7 @@ mod tests {
         let (engine, shadow, _dir) = setup(60);
         let cache = IndexCache::with_min_vectors(10);
 
-        let Access::Approximate(first) = cache.access(&engine, &shadow, Metric::Cosine, 4) else {
+        let Access::Approximate(first) = access(&cache, &engine, &shadow, Metric::Cosine, 4) else {
             panic!("expected an index");
         };
 
@@ -1639,7 +2215,8 @@ mod tests {
             )
             .unwrap();
 
-        let Access::Approximate(second) = cache.access(&engine, &shadow, Metric::Cosine, 4) else {
+        let Access::Approximate(second) = access(&cache, &engine, &shadow, Metric::Cosine, 4)
+        else {
             panic!("expected an index");
         };
         assert!(
@@ -1652,7 +2229,7 @@ mod tests {
     fn invalidating_forgets_the_index() {
         let (engine, shadow, _dir) = setup(60);
         let cache = IndexCache::with_min_vectors(10);
-        cache.access(&engine, &shadow, Metric::Cosine, 4);
+        access(&cache, &engine, &shadow, Metric::Cosine, 4);
         assert_eq!(cache.len(), 1);
 
         cache.invalidate(shadow.id);
@@ -1671,7 +2248,7 @@ mod tests {
         let query = vec![37.0, 1.0, 0.0, 0.0];
         let options = SearchOptions { k: 5, metric: Metric::Cosine, per_document: 1 };
 
-        let Access::Approximate(index) = cache.access(&engine, &shadow, Metric::Cosine, 4) else {
+        let Access::Approximate(index) = access(&cache, &engine, &shadow, Metric::Cosine, 4) else {
             panic!("60 vectors over a threshold of 10 should build an index");
         };
         let approximate = index.search(&engine, &shadow, &query, &options, None).unwrap();
@@ -1696,30 +2273,292 @@ mod tests {
 
     /// A cache with snapshots on and a low threshold, plus its snapshot dir.
     fn snapshot_cache(dir: &tempfile::TempDir) -> IndexCache {
-        IndexCache { min_vectors: 10, ..IndexCache::with_snapshot_dir(dir.path().join("hnsw")) }
+        IndexCache::with_snapshot_dir(dir.path().join("hnsw")).min_vectors(10)
     }
 
     /// Simulate a restart: reopen the engine from the same directory, which
     /// also resets the in-memory generation counters — the condition that
     /// makes snapshot validation interesting.
-    fn reopen(dir: &tempfile::TempDir) -> (Engine, CollectionMeta) {
-        let engine = Engine::open(&dir.path().join("kimmy.redb")).unwrap();
+    fn reopen(dir: &tempfile::TempDir) -> (Arc<Engine>, CollectionMeta) {
+        let engine = Arc::new(Engine::open(&dir.path().join("kimmy.redb")).unwrap());
         let shadow = engine.vector_collection("app", "docs").unwrap().unwrap();
         (engine, shadow)
     }
 
-    /// A graph built once the node's stop has begun serves its search, and
-    /// is not saved: a save writes the whole graph, and the next start builds
-    /// or loads one either way.
+    /// A stop that lands while a builder saves finds the store free (ADR-245):
+    /// the builder let go of it before the save, and a build queued behind
+    /// holds none while it waits. The save, which needs no store, finishes
+    /// whole. The save is held open as one of 100,000 vectors runs for up to
+    /// two minutes.
     #[test]
-    fn a_graph_built_at_the_stop_is_not_saved() {
+    fn a_stop_during_a_save_finds_the_store_free() {
+        let (engine, shadow, dir) = setup(60);
+        let other = add_collection(&engine, "other", 60);
+        let cache = snapshot_cache(&dir);
+        let gate = Gate::install_at(&cache.save_hook, shadow.id);
+        assert!(matches!(cache.access(&engine, &shadow, Metric::Cosine, 4), Access::Building));
+        gate.wait_for_build_to_start();
+        assert!(matches!(cache.access(&engine, &other, Metric::Cosine, 4), Access::Building));
+        assert_eq!(cache.queue.lock().waiting.len(), 1, "the other build waits behind the save");
+
+        engine.stop_walks();
+        let stop = Instant::now();
+        while Arc::strong_count(&engine) > 1 {
+            assert!(
+                stop.elapsed() < Duration::from_millis(500),
+                "the store was held {:?} after the stop began, through a save",
+                stop.elapsed()
+            );
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        gate.release();
+        cache.settle();
+        let path = cache.snapshot_path(shadow.id).unwrap();
+        assert!(path.join("meta.json").is_file(), "the save finished whole");
+        assert!(!path.with_extension("build").exists(), "and left no staging behind");
+        assert!(!cache.snapshot_path(other.id).unwrap().exists(), "nothing built once stopped");
+    }
+
+    /// A write this process makes between adopting a previous process's
+    /// snapshot and a builder judging it is not lost (ADR-245): the edit of
+    /// one document keeps the count and the keys, so the count cannot see it,
+    /// and the graph is re-stamped at the generation it was adopted at, which
+    /// leaves it behind and rebuilt once the window passes.
+    #[test]
+    fn a_write_between_adopting_a_snapshot_and_judging_it_leaves_it_behind() {
+        let (engine, shadow, dir) = setup(60);
+        add_collection(&engine, "other", 60);
+        let first = snapshot_cache(&dir);
+        assert!(matches!(
+            access(&first, &engine, &shadow, Metric::Cosine, 4),
+            Access::Approximate(_)
+        ));
+        first.settle();
+        drop(first);
+        drop(engine);
+
+        let (engine, shadow) = reopen(&dir);
+        let other = engine.vector_collection("app", "other").unwrap().unwrap();
+        let cache = snapshot_cache(&dir);
+        let gate = Gate::install(&cache, other.id);
+        let _ = cache.access(&engine, &other, Metric::Cosine, 4);
+        gate.wait_for_build_to_start();
+        let adopted_at = engine.vector_generation(shadow.id);
+        let Access::Approximate(adopted) = cache.access(&engine, &shadow, Metric::Cosine, 4) else {
+            panic!("the snapshot should have been adopted");
+        };
+        let source = DocId::Int64(7);
+        engine
+            .put_vectors(
+                &shadow,
+                &source,
+                &[VectorRecord {
+                    source: source.clone(),
+                    chunk: 0,
+                    source_hlc: Hlc::new(5, 0),
+                    vector: vec![-1000.0, -1000.0, 7.0, 7.0],
+                    text: "edited".into(),
+                    config: None,
+                }],
+            )
+            .unwrap();
+        let live = engine.vector_generation(shadow.id);
+        assert_ne!(live, adopted_at, "the premise: the edit moved the generation");
+        gate.release();
+        cache.settle();
+        assert_eq!(
+            cache.entries.lock().map[&shadow.id].generation,
+            adopted_at,
+            "judged at the process's start, before the edit"
+        );
+        cache.age(shadow.id);
+        let Access::Approximate(served) = cache.access(&engine, &shadow, Metric::Cosine, 4) else {
+            panic!("a graph");
+        };
+        assert!(Arc::ptr_eq(&served, &adopted), "served while it is rebuilt");
+        cache.settle();
+        let Access::Approximate(rebuilt) = cache.access(&engine, &shadow, Metric::Cosine, 4) else {
+            panic!("a graph");
+        };
+        assert!(!Arc::ptr_eq(&rebuilt, &adopted), "rebuilt past the window, edit and all");
+    }
+
+    /// An edit this process makes after a restart and before the first
+    /// search adopts the previous process's snapshot is not lost either
+    /// (ADR-245): the snapshot predates every write this process has made, so
+    /// it is judged at the process's start, and the edit, which keeps the
+    /// count and the keys, leaves it behind and rebuilt once the window
+    /// passes.
+    #[test]
+    fn an_edit_before_the_first_search_after_a_restart_leaves_the_snapshot_behind() {
+        let (engine, shadow, dir) = setup(60);
+        let first = snapshot_cache(&dir);
+        assert!(matches!(
+            access(&first, &engine, &shadow, Metric::Cosine, 4),
+            Access::Approximate(_)
+        ));
+        first.settle();
+        drop(first);
+        drop(engine);
+        let (engine, shadow) = reopen(&dir);
+        let source = DocId::Int64(7);
+        engine
+            .put_vectors(
+                &shadow,
+                &source,
+                &[VectorRecord {
+                    source: source.clone(),
+                    chunk: 0,
+                    source_hlc: Hlc::new(5, 0),
+                    vector: vec![-1000.0, -1000.0, 7.0, 7.0],
+                    text: "edited".into(),
+                    config: None,
+                }],
+            )
+            .unwrap();
+        let cache = snapshot_cache(&dir);
+        let Access::Approximate(adopted) = cache.access(&engine, &shadow, Metric::Cosine, 4) else {
+            panic!("the snapshot should have been adopted");
+        };
+        cache.settle();
+        let live = engine.vector_generation(shadow.id);
+        assert_ne!(cache.entries.lock().map[&shadow.id].generation, live, "judged behind the edit");
+        cache.age(shadow.id);
+        let Access::Approximate(served) = cache.access(&engine, &shadow, Metric::Cosine, 4) else {
+            panic!("a graph");
+        };
+        assert!(Arc::ptr_eq(&served, &adopted), "served while it is rebuilt");
+        cache.settle();
+        let Access::Approximate(rebuilt) = cache.access(&engine, &shadow, Metric::Cosine, 4) else {
+            panic!("a graph");
+        };
+        assert!(!Arc::ptr_eq(&rebuilt, &adopted), "rebuilt past the window, edit and all");
+    }
+
+    /// A reconfiguration re-delivered with the shape already in force finds
+    /// the build of that shape queued, and leaves it alone (ADR-245): only a
+    /// queued build of another shape is fenced.
+    #[test]
+    fn a_re_delivered_configuration_keeps_the_queued_build_of_its_shape() {
+        let (engine, a, dir) = setup(60);
+        let b = add_collection(&engine, "other", 60);
+        let cache = snapshot_cache(&dir);
+        let gate = Gate::install(&cache, b.id);
+        assert!(matches!(cache.access(&engine, &b, Metric::Cosine, 4), Access::Building));
+        gate.wait_for_build_to_start();
+        assert!(matches!(cache.access(&engine, &a, Metric::Cosine, 4), Access::Building));
+        assert!(!cache.forget_unless_shaped(a.id, Metric::Cosine, 4), "nothing to forget");
+        gate.release();
+        cache.settle();
+        assert!(cache.contains(a.id), "the build of the shape in force installed");
+    }
+
+    /// A drop that lands while the build is still queued, not yet running,
+    /// fences it: the epoch it carries was read when it was queued
+    /// (ADR-245), so it installs nothing, saves nothing and records nothing.
+    #[test]
+    fn a_drop_while_the_build_is_queued_installs_nothing() {
+        let (engine, a, dir) = setup(60);
+        let b = add_collection(&engine, "other", 60);
+        let cache = snapshot_cache(&dir);
+        let gate = Gate::install(&cache, b.id);
+        assert!(matches!(cache.access(&engine, &b, Metric::Cosine, 4), Access::Building));
+        gate.wait_for_build_to_start();
+        assert!(matches!(cache.access(&engine, &a, Metric::Cosine, 4), Access::Building));
+        assert_eq!(cache.queue.lock().waiting.len(), 1, "a's build is queued behind b's");
+        cache.invalidate(a.id);
+        gate.release();
+        cache.settle();
+        assert!(!cache.contains(a.id), "a build queued before the drop installed its entry");
+        assert!(!cache.saved_at.lock().contains_key(&a.id), "or its saved generation");
+        assert!(!cache.snapshot_path(a.id).unwrap().exists(), "or its snapshot");
+    }
+
+    /// A reconfiguration fences a build queued before it even with nothing
+    /// resident (ADR-245): the build of the old shape installs nothing and
+    /// saves nothing, and the next search asks for the shape in force.
+    #[test]
+    fn a_reconfiguration_fences_a_queued_build_with_nothing_resident() {
+        let (engine, a, dir) = setup(60);
+        let b = add_collection(&engine, "other", 60);
+        let cache = snapshot_cache(&dir);
+        let gate = Gate::install(&cache, b.id);
+        assert!(matches!(cache.access(&engine, &b, Metric::Cosine, 4), Access::Building));
+        gate.wait_for_build_to_start();
+        assert!(matches!(cache.access(&engine, &a, Metric::Cosine, 4), Access::Building));
+        assert!(!cache.contains(a.id), "the premise: nothing resident");
+        assert!(!cache.forget_unless_shaped(a.id, Metric::Euclidean, 4), "nothing to forget");
+        gate.release();
+        cache.settle();
+        assert!(!cache.contains(a.id), "the build of the old shape installed nothing");
+        assert!(!cache.snapshot_path(a.id).unwrap().exists(), "and saved nothing");
+        assert!(matches!(
+            access(&cache, &engine, &a, Metric::Euclidean, 4),
+            Access::Approximate(_)
+        ));
+    }
+
+    /// The pending gauge counts the builds the stale gauge cannot (ADR-245):
+    /// a collection with no graph at all, and an adopted graph the budget
+    /// evicted while its rebuild waited. The stale gauge falls with the
+    /// eviction; the pending gauge holds every build queued or running.
+    #[test]
+    fn the_pending_gauge_counts_builds_the_stale_gauge_cannot() {
+        let (engine, a, dir) = setup(60);
+        let b = add_collection(&engine, "b", 60);
+        let c = add_collection(&engine, "c", 60);
+        let first = snapshot_cache(&dir);
+        for s in [&a, &b, &c] {
+            assert!(matches!(
+                access(&first, &engine, s, Metric::Cosine, 4),
+                Access::Approximate(_)
+            ));
+        }
+        first.settle();
+        let one_graph = first.resident_bytes() / 3;
+        drop(first);
+        drop(engine);
+        let engine = Arc::new(Engine::open(&dir.path().join("kimmy.redb")).unwrap());
+        let a = engine.vector_collection("app", "docs").unwrap().unwrap();
+        let b = engine.vector_collection("app", "b").unwrap().unwrap();
+        let c = engine.vector_collection("app", "c").unwrap().unwrap();
+        let none = add_collection(&engine, "none", 60);
+        let cache = snapshot_cache(&dir);
+        cache.set_max_bytes(one_graph + one_graph / 2);
+        let gate = Gate::install(&cache, c.id);
+        assert!(matches!(cache.access(&engine, &c, Metric::Cosine, 4), Access::Approximate(_)));
+        gate.wait_for_build_to_start();
+        assert!(matches!(cache.access(&engine, &a, Metric::Cosine, 4), Access::Approximate(_)));
+        assert!(matches!(cache.access(&engine, &b, Metric::Cosine, 4), Access::Approximate(_)));
+        assert!(matches!(cache.access(&engine, &none, Metric::Cosine, 4), Access::Building));
+        assert_eq!(cache.builds_pending(), 4, "c running; a, b and the one with no graph queued");
+        assert!(cache.stale_graphs() < 4, "the stale gauge sees only what is resident");
+        let next = Gate::install(&cache, a.id);
+        gate.release();
+        next.wait_for_build_to_start();
+        assert_eq!(cache.builds_pending(), 3, "a running; b and the one with no graph queued");
+        assert!(!cache.contains(b.id), "the premise: b's adopted graph was evicted");
+        next.release();
+        cache.settle();
+        assert_eq!(cache.builds_pending(), 0);
+        assert_eq!(cache.stale_graphs(), 0);
+    }
+
+    /// Once the node's stop has begun no graph is built or saved: a builder's
+    /// walk is background work, which the stop ends (ADR-245). The search is
+    /// answered by the exact scan, and no snapshot is written.
+    #[test]
+    fn no_graph_is_built_or_saved_once_the_stop_has_begun() {
         let (engine, shadow, dir) = setup(60);
         let cache = snapshot_cache(&dir);
         engine.stop_walks();
-        assert!(matches!(
-            cache.access(&engine, &shadow, Metric::Cosine, 4),
-            Access::Approximate(_)
-        ));
+        assert!(matches!(cache.access(&engine, &shadow, Metric::Cosine, 4), Access::Building));
+        cache.settle();
+        assert!(
+            matches!(cache.access(&engine, &shadow, Metric::Cosine, 4), Access::Building),
+            "a graph was built at the stop"
+        );
+        cache.settle();
         let path = cache.snapshot_path(shadow.id).unwrap();
         assert!(!path.exists(), "a graph was saved at the stop: {path:?}");
     }
@@ -1729,9 +2568,10 @@ mod tests {
         let (engine, shadow, dir) = setup(60);
         let cache = snapshot_cache(&dir);
         assert!(matches!(
-            cache.access(&engine, &shadow, Metric::Cosine, 4),
+            access(&cache, &engine, &shadow, Metric::Cosine, 4),
             Access::Approximate(_)
         ));
+        cache.settle();
         drop(cache);
         drop(engine);
 
@@ -1757,14 +2597,17 @@ mod tests {
             .unwrap();
 
         let cache = snapshot_cache(&dir);
-        let Access::Approximate(first) = cache.access(&engine, &shadow, Metric::Cosine, 4) else {
+        let Access::Approximate(first) = access(&cache, &engine, &shadow, Metric::Cosine, 4) else {
             panic!("the snapshot should serve");
         };
         assert_eq!(first.len(), 60, "must be the loaded snapshot, not a rebuild");
 
-        // ...and because it was behind the store, the very next access must
-        // rebuild to the current 61 rather than serving stale for a window.
-        let Access::Approximate(second) = cache.access(&engine, &shadow, Metric::Cosine, 4) else {
+        // ...and because it was behind the store, a builder rebuilds it to the
+        // current 61 rather than letting it serve stale for a window; the
+        // searches meanwhile are served the snapshot (ADR-245).
+        cache.settle();
+        let Access::Approximate(second) = access(&cache, &engine, &shadow, Metric::Cosine, 4)
+        else {
             panic!("the rebuild should serve");
         };
         assert_eq!(second.len(), 61, "a behind snapshot is served once, then rebuilt");
@@ -1774,16 +2617,18 @@ mod tests {
     fn a_snapshot_matching_the_store_is_adopted_as_fresh() {
         let (engine, shadow, dir) = setup(60);
         let cache = snapshot_cache(&dir);
-        cache.access(&engine, &shadow, Metric::Cosine, 4);
+        access(&cache, &engine, &shadow, Metric::Cosine, 4);
+        cache.settle();
         drop(cache);
         drop(engine);
 
         let (engine, shadow) = reopen(&dir);
         let cache = snapshot_cache(&dir);
-        let Access::Approximate(first) = cache.access(&engine, &shadow, Metric::Cosine, 4) else {
+        let Access::Approximate(first) = access(&cache, &engine, &shadow, Metric::Cosine, 4) else {
             panic!("the snapshot should serve");
         };
-        let Access::Approximate(second) = cache.access(&engine, &shadow, Metric::Cosine, 4) else {
+        let Access::Approximate(second) = access(&cache, &engine, &shadow, Metric::Cosine, 4)
+        else {
             panic!("the snapshot should keep serving");
         };
         assert!(Arc::ptr_eq(&first, &second), "an up-to-date snapshot must not trigger a rebuild");
@@ -1793,7 +2638,8 @@ mod tests {
     fn a_corrupt_snapshot_is_discarded_not_trusted() {
         let (engine, shadow, dir) = setup(60);
         let cache = snapshot_cache(&dir);
-        cache.access(&engine, &shadow, Metric::Cosine, 4);
+        access(&cache, &engine, &shadow, Metric::Cosine, 4);
+        cache.settle();
         drop(cache);
 
         // Torn write, disk fault, editor accident: the graph bytes are junk.
@@ -1806,7 +2652,7 @@ mod tests {
         };
         let cache = snapshot_cache(&dir);
         // The query still gets an index — rebuilt — and the junk is gone.
-        let Access::Approximate(index) = cache.access(&engine, &shadow, Metric::Cosine, 4) else {
+        let Access::Approximate(index) = access(&cache, &engine, &shadow, Metric::Cosine, 4) else {
             panic!("a corrupt snapshot must fall back to a rebuild");
         };
         assert_eq!(index.len(), 60);
@@ -1822,7 +2668,8 @@ mod tests {
     fn a_snapshot_0_51_saved_serves_once_and_is_rebuilt() {
         let (engine, shadow, dir) = setup(60);
         let cache = snapshot_cache(&dir);
-        cache.access(&engine, &shadow, Metric::Cosine, 4);
+        access(&cache, &engine, &shadow, Metric::Cosine, 4);
+        cache.settle();
         drop(cache);
         drop(engine);
         let snapshot = dir.path().join("hnsw").join(format!("{:016x}", shadow.id.0));
@@ -1840,14 +2687,16 @@ mod tests {
         std::fs::write(snapshot.join("adopted-marker"), b"").unwrap();
         let (engine, shadow) = reopen(&dir);
         let cache = snapshot_cache(&dir);
-        let Access::Approximate(first) = cache.access(&engine, &shadow, Metric::Cosine, 4) else {
+        let Access::Approximate(first) = access(&cache, &engine, &shadow, Metric::Cosine, 4) else {
             panic!("the snapshot should serve");
         };
-        let Access::Approximate(second) = cache.access(&engine, &shadow, Metric::Cosine, 4) else {
+        let Access::Approximate(second) = access(&cache, &engine, &shadow, Metric::Cosine, 4)
+        else {
             panic!("and keep serving");
         };
         assert!(Arc::ptr_eq(&first, &second), "the control: a marked snapshot is fresh");
         assert!(marked(&snapshot));
+        cache.settle();
         drop((cache, first, second));
         drop(engine);
 
@@ -1857,12 +2706,21 @@ mod tests {
         std::fs::write(snapshot.join("meta.json"), serde_json::to_vec(&old).unwrap()).unwrap();
         let (engine, shadow) = reopen(&dir);
         let cache = snapshot_cache(&dir);
+        let gate = Gate::install(&cache, shadow.id);
         let Access::Approximate(first) = cache.access(&engine, &shadow, Metric::Cosine, 4) else {
             panic!("0.51's snapshot should serve the search that loads it");
         };
         assert_eq!(first.len(), 60);
+        gate.wait_for_build_to_start();
         assert!(marked(&snapshot), "served as it was, not rebuilt yet");
-        let Access::Approximate(second) = cache.access(&engine, &shadow, Metric::Cosine, 4) else {
+        assert!(
+            matches!(cache.access(&engine, &shadow, Metric::Cosine, 4), Access::Approximate(g) if Arc::ptr_eq(&g, &first)),
+            "served while its rebuild runs"
+        );
+        gate.release();
+        cache.settle();
+        let Access::Approximate(second) = access(&cache, &engine, &shadow, Metric::Cosine, 4)
+        else {
             panic!("then a rebuild serves");
         };
         assert!(!Arc::ptr_eq(&first, &second), "0.51's snapshot was adopted as fresh");
@@ -1959,7 +2817,8 @@ mod tests {
         for (case, spoil, ends) in process_ending_dumps() {
             let (engine, shadow, dir) = setup(60);
             let cache = snapshot_cache(&dir);
-            cache.access(&engine, &shadow, Metric::Cosine, 4);
+            access(&cache, &engine, &shadow, Metric::Cosine, 4);
+            cache.settle();
             drop(cache);
             drop(engine);
             let snapshot = dir.path().join("hnsw").join(format!("{:016x}", shadow.id.0));
@@ -2015,7 +2874,7 @@ mod tests {
         let (mode, case, dir) =
             (parts.next().unwrap(), parts.next().unwrap(), parts.next().unwrap());
         let dir = std::path::Path::new(dir);
-        let engine = Engine::open(&dir.join("kimmy.redb")).unwrap();
+        let engine = Arc::new(Engine::open(&dir.join("kimmy.redb")).unwrap());
         let shadow = engine.vector_collection("app", "docs").unwrap().unwrap();
         let snapshot = dir.join("hnsw").join(format!("{:016x}", shadow.id.0));
         match mode {
@@ -2027,11 +2886,9 @@ mod tests {
                 println!("CHILD-RETURNED {case}: {loaded:?}");
             }
             "cache" => {
-                let cache = IndexCache {
-                    min_vectors: 10,
-                    ..IndexCache::with_snapshot_dir(dir.join("hnsw"))
-                };
-                let Access::Approximate(index) = cache.access(&engine, &shadow, Metric::Cosine, 4)
+                let cache = IndexCache::with_snapshot_dir(dir.join("hnsw")).min_vectors(10);
+                let Access::Approximate(index) =
+                    access(&cache, &engine, &shadow, Metric::Cosine, 4)
                 else {
                     panic!("{case}: no graph");
                 };
@@ -2049,7 +2906,8 @@ mod tests {
     fn a_reconfigured_dimension_refuses_the_old_snapshot() {
         let (engine, shadow, dir) = setup(60);
         let cache = snapshot_cache(&dir);
-        cache.access(&engine, &shadow, Metric::Cosine, 4);
+        access(&cache, &engine, &shadow, Metric::Cosine, 4);
+        cache.settle();
         drop(cache);
         drop(engine);
 
@@ -2062,7 +2920,7 @@ mod tests {
         assert!(crate::index::HnswIndex::load(&path, Metric::Cosine, 8, shadow.created).is_err());
         // Through the cache, the mismatch falls back cleanly too.
         assert!(matches!(
-            cache.access(&engine, &shadow, Metric::Cosine, 4),
+            access(&cache, &engine, &shadow, Metric::Cosine, 4),
             Access::Approximate(_)
         ));
     }
@@ -2078,19 +2936,19 @@ mod tests {
         let (engine, docs, dir) = setup(60);
         let other = add_collection(&engine, "other", 60);
         let cache = snapshot_cache(&dir);
-        cache.access(&engine, &docs, Metric::Cosine, 4);
+        access(&cache, &engine, &docs, Metric::Cosine, 4);
         let snapshot = cache.snapshot_path(docs.id).unwrap();
         assert!(snapshot.is_dir(), "the build should have been persisted");
 
         // A budget too small for two graphs: installing the other evicts docs.
         cache.set_max_bytes(1);
-        cache.access(&engine, &other, Metric::Cosine, 4);
+        access(&cache, &engine, &other, Metric::Cosine, 4);
         assert!(!cache.contains(docs.id), "docs should have been evicted for other");
         assert!(snapshot.is_dir(), "eviction keeps the snapshot");
 
         // Control: nothing written since the snapshot, so reloading it is
         // adopting it as fresh — and that install evicts `other` in turn.
-        cache.access(&engine, &docs, Metric::Cosine, 4);
+        access(&cache, &engine, &docs, Metric::Cosine, 4);
         let generation = engine.vector_generation(docs.id);
         assert_eq!(
             cache.entries.lock().map[&docs.id].generation,
@@ -2122,17 +2980,22 @@ mod tests {
 
         // Evicted again, then reloaded: the snapshot predates the write and
         // must come back already stale, whatever its count says.
-        cache.access(&engine, &other, Metric::Cosine, 4);
+        access(&cache, &engine, &other, Metric::Cosine, 4);
         assert!(!cache.contains(docs.id));
         assert!(snapshot.is_dir());
-        cache.access(&engine, &docs, Metric::Cosine, 4);
+        // The rebuild it asks for is held, so that what was adopted can be
+        // read before the rebuild replaces it.
+        let gate = Gate::install(&cache, docs.id);
+        assert!(matches!(cache.access(&engine, &docs, Metric::Cosine, 4), Access::Approximate(_)));
+        gate.wait_for_build_to_start();
         assert_eq!(
             cache.entries.lock().map[&docs.id].generation,
-            u64::MAX,
+            BEHIND,
             "a snapshot written before a later write was adopted as fresh"
         );
-        // And the access after it rebuilds, landing at the live generation.
-        cache.access(&engine, &docs, Metric::Cosine, 4);
+        // And the rebuild lands at the live generation.
+        gate.release();
+        cache.settle();
         assert_eq!(cache.entries.lock().map[&docs.id].generation, written);
     }
 
@@ -2140,7 +3003,7 @@ mod tests {
     fn invalidating_removes_the_snapshot_too() {
         let (engine, shadow, dir) = setup(60);
         let cache = snapshot_cache(&dir);
-        cache.access(&engine, &shadow, Metric::Cosine, 4);
+        access(&cache, &engine, &shadow, Metric::Cosine, 4);
         let path = cache.snapshot_path(shadow.id).unwrap();
         assert!(path.is_dir(), "the build should have been persisted");
 
@@ -2159,7 +3022,7 @@ mod tests {
         // records which incarnation it was built for.
         let (engine, first, dir) = setup(60);
         let cache = snapshot_cache(&dir);
-        cache.access(&engine, &first, Metric::Cosine, 4);
+        access(&cache, &engine, &first, Metric::Cosine, 4);
         let path = cache.snapshot_path(first.id).unwrap();
         assert!(path.is_dir(), "the build should have been persisted");
 
@@ -2177,7 +3040,7 @@ mod tests {
         // And through the cache: 70 is the new collection's own count, 60 the
         // orphan's, so the size says which graph answered.
         let fresh = snapshot_cache(&dir);
-        let Access::Approximate(index) = fresh.access(&engine, &second, Metric::Cosine, 4) else {
+        let Access::Approximate(index) = access(&fresh, &engine, &second, Metric::Cosine, 4) else {
             panic!("expected an index");
         };
         assert_eq!(index.len(), 70, "the orphan was adopted instead of a rebuild");
@@ -2195,7 +3058,7 @@ mod tests {
         // graph for as long as that stays true, which is indefinitely.
         let (engine, first, _dir) = setup(60);
         let cache = IndexCache::with_min_vectors(10);
-        let Access::Approximate(built) = cache.access(&engine, &first, Metric::Cosine, 4) else {
+        let Access::Approximate(built) = access(&cache, &engine, &first, Metric::Cosine, 4) else {
             panic!("expected an index");
         };
         assert_eq!(built.len(), 60);
@@ -2215,7 +3078,7 @@ mod tests {
         // The honest answer for a collection holding no vectors is the exact
         // scan. Anything else is the dead graph still answering.
         assert!(
-            matches!(cache.access(&engine, &second, Metric::Cosine, 4), Access::Exact),
+            matches!(access(&cache, &engine, &second, Metric::Cosine, 4), Access::Exact),
             "a graph built for the previous collection of this name served a search on the new one"
         );
     }
@@ -2229,8 +3092,8 @@ mod tests {
         let (engine, kept, dir) = setup(60);
         let gone = add_collection(&engine, "gone", 60);
         let cache = snapshot_cache(&dir);
-        cache.access(&engine, &kept, Metric::Cosine, 4);
-        cache.access(&engine, &gone, Metric::Cosine, 4);
+        access(&cache, &engine, &kept, Metric::Cosine, 4);
+        access(&cache, &engine, &gone, Metric::Cosine, 4);
         let kept_path = cache.snapshot_path(kept.id).unwrap();
         let gone_path = cache.snapshot_path(gone.id).unwrap();
 
@@ -2289,8 +3152,8 @@ mod tests {
         let (engine, first, dir) = setup(60);
         let other = add_collection(&engine, "other", 60);
         let cache = snapshot_cache(&dir);
-        cache.access(&engine, &first, Metric::Cosine, 4);
-        cache.access(&engine, &other, Metric::Cosine, 4);
+        access(&cache, &engine, &first, Metric::Cosine, 4);
+        access(&cache, &engine, &other, Metric::Cosine, 4);
         let path = cache.snapshot_path(first.id).unwrap();
         let other_path = cache.snapshot_path(other.id).unwrap();
         assert!(path.is_dir() && other_path.is_dir(), "both builds should have been persisted");
@@ -2335,8 +3198,8 @@ mod tests {
         let (engine, first, dir) = setup(60);
         let kept = add_collection(&engine, "kept", 60);
         let cache = snapshot_cache(&dir);
-        cache.access(&engine, &first, Metric::Cosine, 4);
-        cache.access(&engine, &kept, Metric::Cosine, 4);
+        access(&cache, &engine, &first, Metric::Cosine, 4);
+        access(&cache, &engine, &kept, Metric::Cosine, 4);
         let path = cache.snapshot_path(first.id).unwrap();
         assert!(path.is_dir(), "the build should have been persisted");
 
@@ -2371,8 +3234,8 @@ mod tests {
         let (engine, gone, dir) = setup(60);
         let kept = add_collection(&engine, "kept", 60);
         let cache = snapshot_cache(&dir);
-        cache.access(&engine, &gone, Metric::Cosine, 4);
-        cache.access(&engine, &kept, Metric::Cosine, 4);
+        access(&cache, &engine, &gone, Metric::Cosine, 4);
+        access(&cache, &engine, &kept, Metric::Cosine, 4);
         let stranded = cache.snapshot_path(gone.id).unwrap();
         assert!(stranded.is_dir(), "the build should have been persisted");
 
@@ -2394,13 +3257,14 @@ mod tests {
 
         let (engine, shadow, dir) = setup(60);
         let cache = snapshot_cache(&dir);
-        cache.access(&engine, &shadow, Metric::Cosine, 4);
+        access(&cache, &engine, &shadow, Metric::Cosine, 4);
+        cache.settle();
         drop(cache);
         drop(engine);
 
         let (engine, shadow) = reopen(&dir);
         let cache = snapshot_cache(&dir);
-        let Access::Approximate(index) = cache.access(&engine, &shadow, Metric::Cosine, 4) else {
+        let Access::Approximate(index) = access(&cache, &engine, &shadow, Metric::Cosine, 4) else {
             panic!("the snapshot should serve");
         };
 
@@ -2433,6 +3297,15 @@ mod tests {
 
     impl Gate {
         fn install(cache: &IndexCache, target: CollectionId) -> Self {
+            Self::install_at(&cache.build_hook, target)
+        }
+
+        /// The gate at a first look's snapshot load, not at a build.
+        fn install_at_load(cache: &IndexCache, target: CollectionId) -> Self {
+            Self::install_at(&cache.load_hook, target)
+        }
+
+        fn install_at(slot: &Mutex<Option<BuildHook>>, target: CollectionId) -> Self {
             let (tx, entered) = mpsc::channel();
             let barrier = Arc::new(std::sync::Barrier::new(2));
             let builds = Arc::new(AtomicUsize::new(0));
@@ -2452,7 +3325,7 @@ mod tests {
                     }
                 }
             };
-            *cache.build_hook.lock() = Some(Arc::new(hook));
+            *slot.lock() = Some(Arc::new(hook));
             Self { entered, barrier, builds }
         }
 
@@ -2470,7 +3343,7 @@ mod tests {
     fn timed_access<'s, 'e: 's>(
         scope: &'s std::thread::Scope<'s, 'e>,
         cache: &'e IndexCache,
-        engine: &'e Engine,
+        engine: &'e Arc<Engine>,
         shadow: &'e CollectionMeta,
     ) -> mpsc::Receiver<Access> {
         let (tx, rx) = mpsc::channel();
@@ -2482,72 +3355,88 @@ mod tests {
 
     #[test]
     fn a_slow_build_on_one_collection_does_not_delay_a_search_on_another() {
-        // The defect: the build ran under the cache-wide lock, so a
+        // The defect this guards: a build ran under the cache-wide lock, so a
         // multi-second rebuild of one collection stalled vector search on
-        // every collection the node serves. With the build off the lock, B
-        // is served — including its own build — while A's is parked.
+        // every collection the node serves. Builds run on builder threads
+        // now (ADR-245): while A's is parked, a search of B is answered at
+        // once, by an exact scan while B waits its turn at the one builder,
+        // and by B's own graph when two builders run.
         let (engine, a, _dir) = setup(60);
         let b = add_collection(&engine, "other", 60);
         let cache = IndexCache::with_min_vectors(10);
         let gate = Gate::install(&cache, a.id);
 
-        std::thread::scope(|s| {
-            let a_result = timed_access(s, &cache, &engine, &a);
-            gate.wait_for_build_to_start();
+        assert!(matches!(cache.access(&engine, &a, Metric::Cosine, 4), Access::Building));
+        gate.wait_for_build_to_start();
+        assert!(
+            matches!(cache.access(&engine, &b, Metric::Cosine, 4), Access::Building),
+            "B waits its turn behind A's build, and is scanned meanwhile"
+        );
+        std::thread::sleep(Duration::from_millis(300));
+        assert!(!cache.contains(b.id), "one builder: B's build waits for A's");
+        cache.set_build_concurrency(2);
+        // A second builder starts for the next build asked for; B's is queued
+        // already, so the next search of B asks again and is deduplicated.
+        let other = add_collection(&engine, "third", 60);
+        assert!(matches!(cache.access(&engine, &other, Metric::Cosine, 4), Access::Building));
+        let deadline = Instant::now() + PATIENCE;
+        while !cache.contains(b.id) || !cache.contains(other.id) {
+            assert!(Instant::now() < deadline, "B and the third collection were never built");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(!cache.contains(a.id), "A's build is still parked");
+        assert!(matches!(cache.access(&engine, &b, Metric::Cosine, 4), Access::Approximate(_)));
 
-            let b_result = timed_access(s, &cache, &engine, &b);
-            let served = b_result
-                .recv_timeout(PATIENCE)
-                .expect("a search on B waited behind A's build: the build holds the lock");
-            assert!(matches!(served, Access::Approximate(_)), "B should have built its own graph");
-
-            gate.release();
-            let served = a_result.recv_timeout(PATIENCE).expect("A's build never finished");
-            assert!(matches!(served, Access::Approximate(_)));
-        });
-        assert_eq!(cache.len(), 2);
+        gate.release();
+        cache.settle();
+        assert!(matches!(cache.access(&engine, &a, Metric::Cosine, 4), Access::Approximate(_)));
+        assert_eq!(cache.len(), 3);
     }
 
     #[test]
     fn concurrent_accesses_to_one_collection_share_a_single_build() {
-        // Two searches arriving at an unbuilt collection must not each build
-        // it: the second waits for the first and takes the same graph. The
-        // count is the proof; pointer equality is the corollary.
+        // Searches arriving at an unbuilt collection must not each build it,
+        // and none waits for the build (ADR-245): each is answered by an
+        // exact scan, one build runs, and every search after it is served its
+        // graph. The count is the proof; pointer equality is the corollary.
         let (engine, a, _dir) = setup(60);
         let cache = IndexCache::with_min_vectors(10);
         let gate = Gate::install(&cache, a.id);
 
-        std::thread::scope(|s| {
-            let first = timed_access(s, &cache, &engine, &a);
-            gate.wait_for_build_to_start();
-            let second = timed_access(s, &cache, &engine, &a);
-            // Nothing to serve yet, so the second caller must be waiting on
-            // the build rather than have returned — or started its own.
+        assert!(matches!(cache.access(&engine, &a, Metric::Cosine, 4), Access::Building));
+        gate.wait_for_build_to_start();
+        for _ in 0..3 {
             assert!(
-                second.recv_timeout(Duration::from_millis(200)).is_err(),
-                "a second caller with nothing to serve should wait for the build in progress"
+                matches!(cache.access(&engine, &a, Metric::Cosine, 4), Access::Building),
+                "a search with nothing to serve is scanned, not held for the build"
             );
-            gate.release();
+        }
+        assert!(
+            cache.queue.lock().waiting.is_empty(),
+            "the running build is the only one asked for"
+        );
+        gate.release();
+        cache.settle();
 
-            let Access::Approximate(x) = first.recv_timeout(PATIENCE).unwrap() else {
-                panic!("the builder should get a graph");
-            };
-            let Access::Approximate(y) = second.recv_timeout(PATIENCE).unwrap() else {
-                panic!("the waiter should get the builder's graph");
-            };
-            assert!(Arc::ptr_eq(&x, &y), "the waiter got a different graph: it built its own");
-        });
+        let Access::Approximate(x) = cache.access(&engine, &a, Metric::Cosine, 4) else {
+            panic!("the build should have installed a graph");
+        };
+        let Access::Approximate(y) = cache.access(&engine, &a, Metric::Cosine, 4) else {
+            panic!("and keep serving it");
+        };
+        assert!(Arc::ptr_eq(&x, &y));
         assert_eq!(gate.builds.load(Ordering::SeqCst), 1, "exactly one build");
     }
 
     #[test]
     fn a_caller_arriving_mid_rebuild_is_served_the_previous_graph() {
         // The staleness policy, under concurrency: a graph from before the
-        // write is a correct answer with bounded recall loss, so a search
-        // that finds a rebuild in progress takes it rather than queueing.
+        // write is a correct answer with bounded recall loss, so every search
+        // while the rebuild runs takes it, the one that asked for the rebuild
+        // included (ADR-245), and none waits.
         let (engine, a, _dir) = setup(60);
         let cache = IndexCache::with_min_vectors(10);
-        let Access::Approximate(old) = cache.access(&engine, &a, Metric::Cosine, 4) else {
+        let Access::Approximate(old) = access(&cache, &engine, &a, Metric::Cosine, 4) else {
             panic!("expected an index");
         };
 
@@ -2570,26 +3459,23 @@ mod tests {
         cache.age(a.id);
         let gate = Gate::install(&cache, a.id);
 
-        std::thread::scope(|s| {
-            let rebuild = timed_access(s, &cache, &engine, &a);
-            gate.wait_for_build_to_start();
+        let Access::Approximate(asked) = cache.access(&engine, &a, Metric::Cosine, 4) else {
+            panic!("the search that asks for the rebuild should be served the stale graph");
+        };
+        assert!(Arc::ptr_eq(&asked, &old));
+        gate.wait_for_build_to_start();
+        let Access::Approximate(served) = cache.access(&engine, &a, Metric::Cosine, 4) else {
+            panic!("expected the stale graph");
+        };
+        assert!(Arc::ptr_eq(&served, &old), "should be served the graph that exists");
+        assert_eq!(served.len(), 60);
 
-            let meanwhile = timed_access(s, &cache, &engine, &a);
-            let Access::Approximate(served) = meanwhile
-                .recv_timeout(PATIENCE)
-                .expect("a caller with a stale graph to serve waited on the rebuild")
-            else {
-                panic!("expected the stale graph");
-            };
-            assert!(Arc::ptr_eq(&served, &old), "should be served the graph that exists");
-            assert_eq!(served.len(), 60);
-
-            gate.release();
-            let Access::Approximate(rebuilt) = rebuild.recv_timeout(PATIENCE).unwrap() else {
-                panic!("expected the rebuilt graph");
-            };
-            assert_eq!(rebuilt.len(), 61, "the rebuild should see the write");
-        });
+        gate.release();
+        cache.settle();
+        let Access::Approximate(rebuilt) = cache.access(&engine, &a, Metric::Cosine, 4) else {
+            panic!("expected the rebuilt graph");
+        };
+        assert_eq!(rebuilt.len(), 61, "the rebuild should see the write");
         assert_eq!(gate.builds.load(Ordering::SeqCst), 1);
     }
 
@@ -2624,18 +3510,11 @@ mod tests {
         let cache = snapshot_cache(&dir);
         let gate = Gate::install(&cache, a.id);
 
-        std::thread::scope(|s| {
-            let result = timed_access(s, &cache, &engine, &a);
-            gate.wait_for_build_to_start();
-            cache.invalidate(a.id);
-            gate.release();
-
-            let served = result.recv_timeout(PATIENCE).expect("the fenced build never returned");
-            assert!(
-                matches!(served, Access::Exact),
-                "a build fenced by a drop must answer with the exact scan, not its graph"
-            );
-        });
+        assert!(matches!(cache.access(&engine, &a, Metric::Cosine, 4), Access::Building));
+        gate.wait_for_build_to_start();
+        cache.invalidate(a.id);
+        gate.release();
+        cache.settle();
         assert_nothing_installed(&cache, a.id);
         assert_eq!(gate.builds.load(Ordering::SeqCst), 1);
     }
@@ -2650,16 +3529,11 @@ mod tests {
         let cache = IndexCache::with_min_vectors(10);
         let gate = Gate::install(&cache, a.id);
 
-        std::thread::scope(|s| {
-            let result = timed_access(s, &cache, &engine, &a);
-            gate.wait_for_build_to_start();
-            cache.invalidate(a.id);
-            gate.release();
-            assert!(matches!(
-                result.recv_timeout(PATIENCE).expect("the fenced verdict never returned"),
-                Access::Exact
-            ));
-        });
+        assert!(matches!(cache.access(&engine, &a, Metric::Cosine, 4), Access::Building));
+        gate.wait_for_build_to_start();
+        cache.invalidate(a.id);
+        gate.release();
+        cache.settle();
         assert!(cache.is_empty(), "a verdict decided before the drop was installed after it");
         assert_nothing_installed(&cache, a.id);
     }
@@ -2675,15 +3549,16 @@ mod tests {
         // be fenced by the epoch captured ahead of it.
         let (engine, a, dir) = setup(60);
         let cache = snapshot_cache(&dir);
-        cache.access(&engine, &a, Metric::Cosine, 4);
+        access(&cache, &engine, &a, Metric::Cosine, 4);
         let path = cache.snapshot_path(a.id).unwrap();
         assert!(path.is_dir(), "the build should have been persisted");
+        cache.settle();
         drop(cache);
 
         let aside = dir.path().join("aside");
         std::fs::rename(&path, &aside).unwrap();
         let cache = snapshot_cache(&dir);
-        let gate = Gate::install(&cache, a.id);
+        let gate = Gate::install_at_load(&cache, a.id);
 
         std::thread::scope(|s| {
             let result = timed_access(s, &cache, &engine, &a);
@@ -2713,25 +3588,20 @@ mod tests {
         let cache = snapshot_cache(&dir);
         let gate = Gate::install(&cache, first.id);
 
-        std::thread::scope(|s| {
-            let result = timed_access(s, &cache, &engine, &first);
-            gate.wait_for_build_to_start();
+        assert!(matches!(cache.access(&engine, &first, Metric::Cosine, 4), Access::Building));
+        gate.wait_for_build_to_start();
 
-            engine.drop_collection("app", "docs").unwrap();
-            let second = add_collection(&engine, "docs", 60);
-            assert_eq!(second.id, first.id, "the id is derived from the name, so it repeats");
-            assert_ne!(second.created, first.created, "the incarnation does not");
-            assert!(
-                !cache.forget_unless_created(first.id, Some(second.created)),
-                "nothing was resident to forget; the fence is the whole effect"
-            );
+        engine.drop_collection("app", "docs").unwrap();
+        let second = add_collection(&engine, "docs", 60);
+        assert_eq!(second.id, first.id, "the id is derived from the name, so it repeats");
+        assert_ne!(second.created, first.created, "the incarnation does not");
+        assert!(
+            !cache.forget_unless_created(first.id, Some(second.created)),
+            "nothing was resident to forget; the fence is the whole effect"
+        );
 
-            gate.release();
-            assert!(matches!(
-                result.recv_timeout(PATIENCE).expect("the fenced build never returned"),
-                Access::Exact
-            ));
-        });
+        gate.release();
+        cache.settle();
         assert_nothing_installed(&cache, first.id);
     }
 
@@ -2744,7 +3614,8 @@ mod tests {
         // right shape would be discarded for nothing.
         let (engine, shadow, dir) = setup(60);
         let cache = snapshot_cache(&dir);
-        let Access::Approximate(before) = cache.access(&engine, &shadow, Metric::Cosine, 4) else {
+        let Access::Approximate(before) = access(&cache, &engine, &shadow, Metric::Cosine, 4)
+        else {
             panic!("60 vectors over a threshold of 10 should build a graph");
         };
         let path = cache.snapshot_path(shadow.id).unwrap();
@@ -2762,7 +3633,7 @@ mod tests {
             "the generation the snapshot was saved at must stay"
         );
         assert_eq!(cache.entries.lock().epoch(shadow.id), 0, "a no-op must not fence");
-        let Access::Approximate(after) = cache.access(&engine, &shadow, Metric::Cosine, 4) else {
+        let Access::Approximate(after) = access(&cache, &engine, &shadow, Metric::Cosine, 4) else {
             panic!("the graph should still be served");
         };
         assert!(Arc::ptr_eq(&before, &after), "the same graph, not a rebuild");
@@ -2778,7 +3649,7 @@ mod tests {
         let (engine, shadow, dir) = setup(60);
         let cache = snapshot_cache(&dir);
         assert!(matches!(
-            cache.access(&engine, &shadow, Metric::Cosine, 4),
+            access(&cache, &engine, &shadow, Metric::Cosine, 4),
             Access::Approximate(_)
         ));
         let path = cache.snapshot_path(shadow.id).unwrap();
@@ -2797,7 +3668,7 @@ mod tests {
         // A width change is the other half of a shape, and is judged the
         // same way.
         assert!(matches!(
-            cache.access(&engine, &shadow, Metric::Cosine, 4),
+            access(&cache, &engine, &shadow, Metric::Cosine, 4),
             Access::Approximate(_)
         ));
         assert!(cache.forget_unless_shaped(shadow.id, Metric::Cosine, 8));
@@ -2815,11 +3686,12 @@ mod tests {
         let (engine, shadow, dir) = setup(60);
         let cache = snapshot_cache(&dir);
         assert!(matches!(
-            cache.access(&engine, &shadow, Metric::Cosine, 4),
+            access(&cache, &engine, &shadow, Metric::Cosine, 4),
             Access::Approximate(_)
         ));
         let path = cache.snapshot_path(shadow.id).unwrap();
         assert!(path.is_dir());
+        cache.settle();
         drop(cache);
 
         // A fresh cache over the same directory: the snapshot, and no entry.
@@ -2840,10 +3712,11 @@ mod tests {
         let (engine, shadow, dir) = setup(60);
         let cache = snapshot_cache(&dir);
         assert!(matches!(
-            cache.access(&engine, &shadow, Metric::Cosine, 4),
+            access(&cache, &engine, &shadow, Metric::Cosine, 4),
             Access::Approximate(_)
         ));
         let path = cache.snapshot_path(shadow.id).unwrap();
+        cache.settle();
         drop(cache);
 
         let cache = snapshot_cache(&dir);
@@ -2868,23 +3741,18 @@ mod tests {
         let cache = snapshot_cache(&dir);
         let gate = Gate::install(&cache, a.id);
 
-        std::thread::scope(|s| {
-            let result = timed_access(s, &cache, &engine, &a);
-            gate.wait_for_build_to_start();
+        assert!(matches!(cache.access(&engine, &a, Metric::Cosine, 4), Access::Building));
+        gate.wait_for_build_to_start();
 
-            let live: HashMap<CollectionId, Hlc> = [(kept.id, kept.created)].into_iter().collect();
-            assert_eq!(
-                cache.forget_absent(&live),
-                0,
-                "nothing was resident to forget; the fence is the whole effect"
-            );
+        let live: HashMap<CollectionId, Hlc> = [(kept.id, kept.created)].into_iter().collect();
+        assert_eq!(
+            cache.forget_absent(&live),
+            0,
+            "nothing was resident to forget; the fence is the whole effect"
+        );
 
-            gate.release();
-            assert!(matches!(
-                result.recv_timeout(PATIENCE).expect("the fenced build never returned"),
-                Access::Exact
-            ));
-        });
+        gate.release();
+        cache.settle();
         assert_nothing_installed(&cache, a.id);
     }
 
@@ -2893,11 +3761,11 @@ mod tests {
     // -----------------------------------------------------------------------
 
     /// The graph for one of these fixtures, and what it says it costs.
-    fn graph(cache: &IndexCache, engine: &Engine, shadow: &CollectionMeta) -> Arc<HnswIndex> {
+    fn graph(cache: &IndexCache, engine: &Arc<Engine>, shadow: &CollectionMeta) -> Arc<HnswIndex> {
         // Instants are what eviction orders by; a pause keeps two accesses
         // from sharing one on a coarse clock.
         std::thread::sleep(Duration::from_millis(2));
-        let Access::Approximate(index) = cache.access(engine, shadow, Metric::Cosine, 4) else {
+        let Access::Approximate(index) = access(cache, engine, shadow, Metric::Cosine, 4) else {
             panic!("{} should be served a graph", shadow.name);
         };
         index
@@ -3002,6 +3870,9 @@ mod tests {
             )
             .unwrap();
         cache.age(a.id);
+        // Served stale while a builder rebuilds it.
+        assert!(matches!(cache.access(&engine, &a, Metric::Cosine, 4), Access::Approximate(_)));
+        cache.settle();
 
         let rebuilt = graph(&cache, &engine, &a);
         assert_eq!(rebuilt.len(), 61);
@@ -3016,7 +3887,7 @@ mod tests {
         let cache = IndexCache::with_min_vectors(10);
 
         let bytes = graph(&cache, &engine, &a).approx_bytes() as u64;
-        assert!(matches!(cache.access(&engine, &small, Metric::Cosine, 4), Access::Exact));
+        assert!(matches!(access(&cache, &engine, &small, Metric::Cosine, 4), Access::Exact));
         assert_eq!(cache.len(), 2);
         assert_eq!(cache.resident_bytes(), bytes, "a too-small verdict holds no graph");
 
@@ -3076,18 +3947,22 @@ mod tests {
         let doc = bson::serialize_to_document(&record).unwrap();
         engine.replace(&shadow, &DocId::String("12345#0".into()), doc, true).unwrap();
         let cache = snapshot_cache(&dir);
-        cache.access(&engine, &shadow, Metric::Cosine, 4);
+        access(&cache, &engine, &shadow, Metric::Cosine, 4);
+        cache.settle();
         drop(cache);
         drop(engine);
 
         let (engine, shadow) = reopen(&dir);
         assert_eq!(engine.adopt_legacy_chunks(&shadow, &source).unwrap(), 1);
         let cache = snapshot_cache(&dir);
-        let Access::Approximate(first) = cache.access(&engine, &shadow, Metric::Cosine, 4) else {
+        let Access::Approximate(first) = access(&cache, &engine, &shadow, Metric::Cosine, 4) else {
             panic!("the snapshot serves once");
         };
         assert_eq!(first.len(), 61, "the count agrees");
-        let Access::Approximate(second) = cache.access(&engine, &shadow, Metric::Cosine, 4) else {
+        // Rebuilt by a builder while the snapshot serves (ADR-245).
+        cache.settle();
+        let Access::Approximate(second) = access(&cache, &engine, &shadow, Metric::Cosine, 4)
+        else {
             panic!("then a rebuild serves");
         };
         assert!(
@@ -3141,11 +4016,12 @@ mod tests {
         owner.replace(&owner_shadow, &DocId::String("12345#0".into()), doc, true).unwrap();
 
         let dir = tempfile::tempdir().unwrap();
-        let replica = Engine::open(&dir.path().join("kimmy.redb")).unwrap();
+        let replica = Arc::new(Engine::open(&dir.path().join("kimmy.redb")).unwrap());
         pull(&replica, &owner);
         let shadow = replica.vector_collection("app", "docs").unwrap().unwrap();
         let cache = snapshot_cache(&dir);
-        cache.access(&replica, &shadow, Metric::Cosine, 4);
+        access(&cache, &replica, &shadow, Metric::Cosine, 4);
+        cache.settle();
         drop(cache);
 
         assert_eq!(owner.adopt_legacy_chunks(&owner_shadow, &source).unwrap(), 1);
@@ -3156,11 +4032,15 @@ mod tests {
 
         let (replica, shadow) = reopen(&dir);
         let cache = snapshot_cache(&dir);
-        let Access::Approximate(first) = cache.access(&replica, &shadow, Metric::Cosine, 4) else {
+        let Access::Approximate(first) = access(&cache, &replica, &shadow, Metric::Cosine, 4)
+        else {
             panic!("the snapshot serves once");
         };
         assert_eq!(first.len(), 61, "the count agrees");
-        let Access::Approximate(second) = cache.access(&replica, &shadow, Metric::Cosine, 4) else {
+        // Rebuilt by a builder while the snapshot serves (ADR-245).
+        cache.settle();
+        let Access::Approximate(second) = access(&cache, &replica, &shadow, Metric::Cosine, 4)
+        else {
             panic!("then a rebuild serves");
         };
         assert!(
