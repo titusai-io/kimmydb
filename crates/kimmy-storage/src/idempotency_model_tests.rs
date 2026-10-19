@@ -961,6 +961,16 @@ struct Prepared {
     /// request's next chunk: one point that says so and a commit after it is a chunk
     /// written on a contested record.
     refusing: Rc<RefCell<Vec<bool>>>,
+    /// I8's reading at the last commit point, taken before its steps when it ran any
+    /// (an `$inc` only); `None` when the last point ran none.
+    i8_at: Rc<RefCell<Option<I8State>>>,
+}
+
+/// What I8 reads of a member at a request's completion.
+struct I8State {
+    floor: Hlc,
+    record: Option<IdempotencyRecord>,
+    counters: Vec<Option<(Stamp, Option<Document>)>>,
 }
 
 // One per request, moved once.
@@ -1952,6 +1962,7 @@ impl World {
             refused_pre,
             contested_pre,
             refusing: Rc::new(RefCell::new(Vec::new())),
+            i8_at: Rc::new(RefCell::new(None)),
         }))
     }
 
@@ -2115,7 +2126,13 @@ impl World {
                     self.out.resumes += 1;
                 }
                 if req.kind.is_inc() {
-                    self.check_i8(r, m)?;
+                    // At completion: the state the last commit point read before its
+                    // steps, when it ran any; else as it stands.
+                    let at_last = p.i8_at.borrow_mut().take();
+                    match at_last {
+                        Some(state) => self.check_i8_on(r, m, state)?,
+                        None => self.check_i8(r, m)?,
+                    }
                 }
                 self.accepted[r as usize] |= wrote || !minted.is_empty() || resumed;
                 self.finished[r as usize] = true;
@@ -2286,9 +2303,27 @@ impl World {
     /// record, the two records merged). Such a record is `contested` and answers 422 on
     /// every path; completing on it reads the other request's `first`.
     fn check_i8(&mut self, r: u8, m: usize) -> Res<()> {
+        let state = self.i8_state(r, m)?;
+        self.check_i8_on(r, m, state)
+    }
+
+    /// What I8 reads of `m` for request `r`: the floor of `orders`, the live record
+    /// under the key, and the stored rows of the counters, as they stand now.
+    fn i8_state(&self, r: u8, m: usize) -> Res<I8State> {
         let floor = self.floor(m, ORDERS)?;
         let key = self.sched.requests[r as usize].key;
-        let Some(record) = self.live_record(m, ORDERS, key)? else { return Ok(()) };
+        let record = self.live_record(m, ORDERS, key)?;
+        let e = self.e(m);
+        let counters = (0..COUNTERS).map(|d| stored(&e, ORDERS, &DocId::Int64(d))).collect();
+        Ok(I8State { floor, record, counters })
+    }
+
+    /// I8 on `state`, read at the request's completion: right after its last commit,
+    /// before the steps run there (a document or a record a step brings after the
+    /// request ended is no part of what it completed on).
+    fn check_i8_on(&mut self, r: u8, m: usize, state: I8State) -> Res<()> {
+        let I8State { floor, record, counters } = state;
+        let Some(record) = record else { return Ok(()) };
         self.out.i8_checks += 1;
         let first = record.first;
         let first_of_another = self.ghost.entries.get(&first).map(|(q, ..)| *q).filter(|q| *q != r);
@@ -2304,13 +2339,12 @@ impl World {
             return Ok(());
         }
         let kind = self.sched.requests[r as usize].kind;
-        let e = self.e(m);
         for d in 0..COUNTERS {
             if !kind.targets(d) {
                 continue;
             }
             // A version at or below the floor is of the ended life, swept by the drop.
-            let Some((stamp, Some(doc))) = stored(&e, ORDERS, &DocId::Int64(d)) else { continue };
+            let Some((stamp, Some(doc))) = counters[d as usize].clone() else { continue };
             if stamp.hlc <= floor || ks_of(&doc).contains(&i64::from(r)) {
                 continue;
             }
@@ -3877,7 +3911,12 @@ fn send(world: &Rc<RefCell<World>>, op: &Op) -> Res<()> {
     }
     world.borrow_mut().running = Some(m);
     world.borrow_mut().running_req = Some(*r);
-    let phases = (Arc::clone(&p.phase), Rc::clone(&p.phase_seq), Rc::clone(&p.refusing));
+    let phases = (
+        Arc::clone(&p.phase),
+        Rc::clone(&p.phase_seq),
+        Rc::clone(&p.refusing),
+        Rc::clone(&p.i8_at),
+    );
     arm(Rc::clone(world), Rc::clone(&pending), *crash, Arc::downgrade(&engine), phases, 1);
     drop(engine);
     let answer = call(&p);
@@ -3912,7 +3951,12 @@ fn arm_crash(engine: &Engine, how: Crash) {
 
 /// What a request's commit points keep: how many have run, the ghost's order after each,
 /// and whether the algebra says the record refuses the next chunk after each one's steps.
-type Phases = (Arc<std::sync::atomic::AtomicUsize>, Rc<RefCell<Vec<u64>>>, Rc<RefCell<Vec<bool>>>);
+type Phases = (
+    Arc<std::sync::atomic::AtomicUsize>,
+    Rc<RefCell<Vec<u64>>>,
+    Rc<RefCell<Vec<bool>>>,
+    Rc<RefCell<Option<I8State>>>,
+);
 
 /// Arm the `j`-th commit point of the request on `engine`: its record's store in the
 /// algebra, its steps, then its crash, then the next point.
@@ -3937,6 +3981,16 @@ fn arm(
             world.borrow_mut().fps_own(m, r);
         }
         let ops = pending.borrow_mut().remove(&j).unwrap_or_default();
+        // I8 at completion, should this commit be the request's last: before the steps.
+        let snapshot = match running {
+            Some((m, r))
+                if !ops.is_empty() && world.borrow().sched.requests[r as usize].kind.is_inc() =>
+            {
+                world.borrow().i8_state(r, m).ok()
+            }
+            _ => None,
+        };
+        *phases.3.borrow_mut() = snapshot;
         for op in &ops {
             let out = world.borrow_mut().apply_inner(op);
             if let Err(e) = out {
