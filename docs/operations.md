@@ -2392,6 +2392,14 @@ passed**, so a refusal leaves the file exactly as the restore wrote it.
 > writes.** Anti-entropy would put them straight back. Run it standalone, or
 > rewind every node.
 
+**When one member refuses during an every-member rewind**, bring up none of the
+rewound members: a cluster's rewind is all or none, and a member that was not
+rewound sends the undone writes back to the others. Either pick a target every
+member accepts (each refusal says why it refused: a schema change after the
+target, the horizon, or the documents it names), and rewind every member again
+from its backup to that target, or restore every member from its backup without
+`--until`.
+
 A rewind that discarded nothing (the command reports `0 oplog entries
 discarded`) undid no writes, so this rule does not apply to it: the member
 rejoins its cluster as any restored member does. A rewind keeps what the member
@@ -2486,6 +2494,14 @@ re-creation of a collection it holds as affected, and compare that collection's
 documents across the members. Restore that member again from the same backup with
 this release's `kimmyd restore --from … --until …`, or stop it, remove its
 `kimmy.redb` and start it empty so it takes its peers' state.
+
+If every member held the ended life's version, every member put back the same
+wrong row: comparing the members finds no difference, and a member started empty
+copies the row from its peers. Then only restoring every member again from its
+backup with this release's `kimmyd restore --from … --until …` removes it. Such a
+row is a document stamped at or below its collection's incarnation floor, the
+stamp of the drop the collection was created after: its last write is from
+before that drop.
 
 ### The identity comes back with it
 

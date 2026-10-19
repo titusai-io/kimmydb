@@ -29513,8 +29513,8 @@ t330. A, which never heard of the drop, writes `items/100` at t386, and C takes 
 rewound to t352 (`kimmyd restore --until`); C holds A's discarded write, so every member is rewound to t352, as the
 operations guide says. C put the document back to B's t120 version, the post-image of its latest entry at or below the
 target, while A and B removed it. The cluster stayed diverged on every route: no entry ever arrives that is newer
-than C's row, and the divergence check's replays and converge pages write over rows held and never remove one. Found
-by the idempotency model's long run (seed 2000443); present on 0.51.0 and every build since the rewind existed.
+than C's row, and the divergence check's replays and converge pages write over rows held and never remove one.
+Present on 0.51.0 and every build since the rewind existed.
 
 **Why.** A collection's id is derived from its name (`CollectionId::derive`), so a drop and a re-creation leave one
 id. The purge removes the dropped life's documents and index entries but not its oplog entries, which stay until
