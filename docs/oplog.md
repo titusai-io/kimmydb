@@ -315,7 +315,8 @@ and the only row of the record in its advance is the one at `first`.
 **A sender ships a record at a row of its own. A row below the record's
 `first` was left by an earlier record under the same key, one past its window
 and overwritten, and ships nothing.** The
-frame fit that answers `BatchTooLarge` counts every record: the F3 records first,
+frame fit that answers `BatchTooLarge` counts every record and every entry, each
+at its encoding and its framing in the frame's array: the F3 records first,
 since a window carries them whatever else it carries, and each other with the
 first entry at or after its row. When the F3 records alone overfill a frame, the
 window carries no entries and grants nothing until the sender has pulled their
