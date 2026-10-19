@@ -28613,7 +28613,12 @@ ten.
    build; none lost in any graph up to 1,000 vectors of either kind; 0.02% of the low-dimensional data hard to find at
    100,000 (found at four times the effort but for two); the uniform data keeps reachable points a search at the build
    check's effort misses (0.9% to 1.1% at 10,000, 10.8% at 100,000), which is recall, not loss. The linking costs under a
-   second at 100,000 low-dimensional vectors and 18 s at 100,000 uniform ones.
+   second at 100,000 low-dimensional vectors and 18 s at 100,000 uniform ones. A cut-off point whose 16 nearest are all
+   cut off gets no edge, so a component of more than 16 points out of the entry point's reach whose searches return only
+   one another stays cut off, and the build is retried as item 3 says. That was seen only at toy parameters (four
+   connections, construction effort 8, two tight clusters inserted one after the other: 20 of 80 points); at the
+   build's parameters and in its shuffled order, two to fifty tight clusters of 100 to 2,000 vectors of 384 dimensions
+   left nothing out of reach.
 3. **Each build attempt inserts in its own order** (`insertion_order`): a Fisher–Yates shuffle of the walk's order (chunk
    keys in key order) driven by SplitMix64 seeded with the attempt number, the first attempt included. A collection's
    graph is a function of its records and the attempt, reproducible on every member and across restarts, and different
@@ -28631,10 +28636,13 @@ ten.
    shorter than the dimension, and panics on a dozen asserts, `unwrap`s and indexes. The check reads both files the way
    the loader does, allocates nothing the file declares, and refuses every one of those, and anything that is not the dump
    this build writes: format 4 of the library's description, full mode, sixteen layers, the expected point count, width,
-   connection count, distance and element type, every point once, every neighbour in range, no NaN distance, finite
-   vectors, nothing after the end. Refused is a rebuild, as every unusable snapshot already was. The audit is a test that
-   hands 36 spoiled dumps to the raw loader in child processes and prints what each does (two exit, three abort, the rest
-   panic, return an error, or load).
+   connection count, distance and element type, every point once, every neighbour and entry rank inside its layer, no
+   NaN distance, every vector's squared length a finite 32-bit float, nothing after the end. A finite component is not
+   enough: 3e38 is finite and its square is not, the library's cosine distance to such a vector is NaN, and an assertion
+   in it panics, so a snapshot holding one loaded and then failed every search of its collection. A client's vectors, a
+   query vector and a provider's answer are held to the same test where they enter (`search::searchable`). Refused is a
+   rebuild, as every unusable snapshot already was. The audit is a test that hands 39 spoiled dumps to the raw loader in
+   child processes and prints what each does (two exit, three abort, the rest panic, return an error, or load).
 5. **A snapshot says what built its graph, and is synced.** `meta.json` gains `graph`: 2 for a graph this build made (1 is
    never written; no release built 0.3.5 graphs unlinked). One without it, which 0.51 and earlier wrote, is adopted as
    behind whatever its counts say: it serves the search that loaded it, and the next search of the collection rebuilds it.
@@ -28643,14 +28651,22 @@ ten.
    writes `meta.json` from its own fields, so a graph it rebuilds and saves loses the mark exactly. `save` fsyncs the three
    files and the staging directory before the rename that publishes them, and the parent directory after it.
 6. **A filtered walk widens with its filter.** The first walk asks for `clamp(⌈2 · k · chunks / admitted⌉, w, max(8,000,
-   w))` candidates, `w` the unadapted filtered width (320 at `k` 10), at the usual effort of four times the width; a walk
-   that comes back with fewer than `min(k, admitted × per_document)` hits is retried once at four times the width, up to
-   the cap; a second short walk gives way to the keyed join, which is exact. `SELECTIVE_JOIN_MAX` stays 1,000: the keyed
-   join costs about 44 µs per admitted document at 384 dimensions whatever the collection's size, and above about 1,000
-   the widened walk is cheaper. Measured at 100,000 × 384 on the low-dimensional data: recall 1.000 against the exact
-   filtered answer at 1%, 2%, 3%, 5% and 10% admitted, never short, the graph answering every search, at 33, 18, 14, 10
-   and 9 ms. A search reaches the cap only when the filter admits at most one document in 400, so the keyed join it gives
-   way to reads at most 2,500 documents per million.
+   w))` candidates, `w` the unadapted filtered width (320 at `k` 10), at the usual effort of four times the width. A walk
+   that comes back with fewer than `min(k, admitted × per_document)` hits is retried once, widened by what it saw:
+   `⌈2 · k · candidates / admitted candidates⌉`, at least four times the first width, the cap when it admitted none. A
+   second short walk gives way to the keyed join, which is exact. `SELECTIVE_JOIN_MAX` stays 1,000: the keyed join costs
+   about 44 µs per admitted document at 384 dimensions whatever the collection's size, and above about 1,000 the widened
+   walk is cheaper. Measured at 100,000 × 384 on the low-dimensional data: recall 1.000 against the exact filtered answer
+   at 1%, 2%, 3%, 5% and 10% admitted, never short, the graph answering every search, at 33, 18, 14, 10 and 9 ms. The
+   first width assumes the admitted documents are spread like the rest, which a filter correlated with the query breaks:
+   one that refuses the documents nearest the query admits nothing a narrow walk finds, however much of the collection
+   it admits, and the retry reads the walk's own share instead. Measured with two clusters, the one nearest the query (a
+   fifth of the collection) refused and the other admitted: at 20,000 × 384 the retry at the cap answered `k` of `k`, the exact answer, in 88 to
+   97 ms, where the keyed join takes 463 to 521 ms; at 100,000 × 384 the walk at the cap was short too, and the keyed
+   join read the 80,000 admitted documents for the exact answer in 2.3 to 3.4 s. So the keyed join's cost is bounded by
+   the admitted set alone, which can be most of the collection, and it is held to the request's deadline rather than to
+   a count, which would answer short: it reads the time every 64 documents and, past the deadline, answers as the
+   timeout layer would (`503`, `timeout`).
 
 **Rollback.** None added. A 0.51 member loads 0.52's snapshots, ignoring the `graph` field, and rebuilds nothing; a graph
 it rebuilds and saves is unmarked, and a member rolled forward again serves it once and rebuilds it. What 0.51 serves is
@@ -28671,10 +28687,16 @@ reasons beside the insert loop.
 0.3.4 on essentially every run); at 1,000 × 384 in release, three draws with nothing lost and nothing cut off; a build
 links every point its insertion cut off (300 copies of one vector, 203 cut off before; a 96-dimensional fixture); an
 attempt builds one graph and each retry another; a build left cut off (the linking skipped) is retried in each attempt's
-order and returns the last; a high sampled score with nothing cut off is not retried; the two graph tests that flaked hold the walk first, so a red names recall; the dump check against 38 spoilings
-and four shapes; a snapshot of each process-ending kind refused, rebuilt and survived, each case in a child process whose
+order and returns the last; a high sampled score with nothing cut off is not retried; the linking reaches a component
+the entry point does not (two clusters whose top level holds seven points of different reach, judged from the entry
+point the library dumps); the two graph tests that flaked hold the walk first, so a red names recall; the dump check against 39 spoilings
+(a rank equal to its layer's size, and a vector too large to square, among them) and four shapes; a snapshot of each process-ending kind refused, rebuilt and survived, each case in a child process whose
 raw-library twin must exit or abort as the case says; a 0.51 snapshot served once and rebuilt; what built a loaded graph
-read from its snapshot; a filtered search returning `k` at 1%, 2% and 3% admitted with no fallback, a forced fallback
-equal to the keyed join, and the same rows at 100,000 documents in release. The reachability distribution measurement
+read from its snapshot; a filtered search returning `k` at 1%, 2% and 3% admitted with no fallback, a first walk short
+of `k` retried wider and answering `k`, a retry widened by what the first walk saw (the 2,000 documents nearest the
+query of 5,000 refused, so that four times the first width admits none), a forced fallback equal to the keyed join, the
+keyed join stopping at a passed deadline, and the same rows at 100,000 documents in release; a provider's vector too
+large to square stores nothing of its batch. `kimmy-api`: a chunk and a query vector too large to square are refused
+with `400`, and a search past its deadline answers as a timeout. The reachability distribution measurement
 counts every point, the points cut off and the points found at four times the effort, on either fixture
 (`KIMMY_REACH_LATENT`), and the library audit is re-runnable on a library upgrade.
