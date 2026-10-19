@@ -1126,6 +1126,8 @@ impl HnswIndex {
             return Ok(hits);
         }
         let wider = first.saturating_mul(FILTERED_RETRY_FACTOR).min(cap);
+        #[cfg(test)]
+        FILTERED_RETRIES.with(|n| n.set(n.get() + 1));
         if wider > first {
             let hits = self.walk(engine, shadow, query, options, Some(allowed), wider)?;
             if hits.len() >= wanted {
@@ -1181,6 +1183,8 @@ impl HnswIndex {
 thread_local! {
     /// How many filtered searches on this thread gave way to the keyed join.
     pub(crate) static KEYED_FALLBACKS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    /// How many filtered searches on this thread found their first walk short.
+    static FILTERED_RETRIES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
 /// The widest walk a filtered search makes before reading the admitted
@@ -1537,11 +1541,13 @@ mod tests {
     /// the layer the edge was found on, so a point drawn above layer 0 could
     /// be left with no edge into it at layer 0, and no search could return it.
     /// At this size it left 0.25% to 3% of every graph out of reach (one of
-    /// thirty draws reached all), so eight draws all clean is a red on 0.3.4
-    /// on essentially every run; 0.3.5 left none out of reach in 315 draws.
-    /// The draws are attempts, so they are the same eight graphs on every
-    /// run. Every point is checked twice: by the search a probe makes, and by
-    /// the graph's own edges.
+    /// thirty draws reached all); 0.3.5 left none in 315 draws. The build's
+    /// linking would repair such points too, which would hide the library
+    /// going back, so each draw is held twice: the library's insertion alone,
+    /// with the linking skipped, must cut nothing off; and the build as it
+    /// ships must leave every vector able to find itself, checked by search
+    /// and by the graph's own edges. The draws are attempts, so they are the
+    /// same eight graphs on every run.
     #[test]
     fn every_vector_is_reachable_in_every_build() {
         const COUNT: usize = 400;
@@ -1550,16 +1556,19 @@ mod tests {
         let (engine, shadow, _dir) = setup(COUNT, DIM);
         let vectors = vectors_by_key(&engine, &shadow);
         for draw in 0..DRAWS {
+            SKIP_LINKING.with(|skip| skip.set(true));
+            let library = HnswIndex::build_once(&engine, &shadow, Metric::Cosine, DIM, draw);
+            SKIP_LINKING.with(|skip| skip.set(false));
+            assert_eq!(
+                cut_off(&library.unwrap().0),
+                (0, 0),
+                "draw {draw}: the library's insertion left points with no layer-0 edge into \
+                 them, or outside the entry point's component"
+            );
             let (index, _) =
                 HnswIndex::build_once(&engine, &shadow, Metric::Cosine, DIM, draw).unwrap();
             assert_eq!(index.len(), COUNT);
-            let (no_edge_in, outside) = cut_off(&index);
-            assert_eq!(
-                (no_edge_in, outside),
-                (0, 0),
-                "draw {draw}: points with no layer-0 edge into them, and points the entry \
-                 point's layer 0 does not reach"
-            );
+            assert_eq!(cut_off(&index), (0, 0), "draw {draw}: cut off after the build");
             assert_eq!(
                 truly_orphaned(&index, &vectors),
                 0,
@@ -2004,13 +2013,14 @@ mod tests {
         dim: usize,
         admitted: usize,
         queries: u64,
-    ) -> (usize, usize, f64) {
+    ) -> (usize, usize, usize, f64) {
         let step = count / admitted;
         let allowed: HashSet<DocId> =
             (0..admitted).map(|i| DocId::Int64((i * step) as i64)).collect();
         let ids: Vec<DocId> = allowed.iter().cloned().collect();
         let options = SearchOptions { k: 10, metric: Metric::Cosine, per_document: 1 };
         let fallbacks = KEYED_FALLBACKS.with(|n| n.get());
+        let retries = FILTERED_RETRIES.with(|n| n.get());
         let (mut short, mut recall) = (0, 0.0);
         for q in 0..queries {
             let query = pseudo_random(90_000 + q, dim);
@@ -2028,7 +2038,12 @@ mod tests {
             recall +=
                 hits.iter().filter(|h| exact.contains(&h.id)).count() as f64 / exact.len() as f64;
         }
-        (short, KEYED_FALLBACKS.with(|n| n.get()) - fallbacks, recall / queries as f64)
+        (
+            short,
+            FILTERED_RETRIES.with(|n| n.get()) - retries,
+            KEYED_FALLBACKS.with(|n| n.get()) - fallbacks,
+            recall / queries as f64,
+        )
     }
 
     /// A filtered search returns `k` hits when `k` documents are admitted, at
@@ -2051,9 +2066,10 @@ mod tests {
         assert!(fixed.len() < 10, "the precondition: a fixed walk is short here ({})", fixed.len());
 
         for (percent, admitted) in [(1, 50), (2, 100), (3, 150)] {
-            let (short, fallbacks, recall) =
+            let (short, retries, fallbacks, recall) =
                 filtered_rows(&index, &engine, &shadow, COUNT, DIM, admitted, 10);
             assert_eq!(short, 0, "{percent}% admitted: searches that came back short");
+            assert_eq!(retries, 0, "{percent}% admitted: the first walk should be wide enough");
             assert_eq!(fallbacks, 0, "{percent}% admitted: the graph should answer it");
             assert!(recall >= 0.9, "{percent}% admitted: recall {recall:.3}");
         }
@@ -2102,11 +2118,11 @@ mod tests {
         let (engine, shadow, _dir) = setup_bulk(COUNT, DIM, 0);
         let index = HnswIndex::build(&engine, &shadow, Metric::Cosine, DIM).unwrap();
         for (percent, admitted) in [(1, 1_000), (2, 2_000), (3, 3_000)] {
-            let (short, fallbacks, recall) =
+            let (short, retries, fallbacks, recall) =
                 filtered_rows(&index, &engine, &shadow, COUNT, DIM, admitted, 20);
             println!(
-                "{percent}% admitted ({admitted} of {COUNT}): short {short}/20, keyed \
-                 fallbacks {fallbacks}, recall {recall:.3}"
+                "{percent}% admitted ({admitted} of {COUNT}): short {short}/20, retried \
+                 {retries}, keyed fallbacks {fallbacks}, recall {recall:.3}"
             );
             assert_eq!(short, 0, "{percent}% admitted: searches that came back short");
             assert_eq!(fallbacks, 0, "{percent}% admitted: the graph should answer it");
