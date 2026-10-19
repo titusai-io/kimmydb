@@ -1851,7 +1851,9 @@ async fn the_records_at_the_replay_start_cross_on_several_pages(outbound: bool) 
     for scope in &scopes {
         assert!(f.a.idempotency_record(orders.id, scope).unwrap().is_some(), "every record");
     }
-    assert_eq!(records_unfit().get(UnfitPath::Replay), 0, "nothing was left unfit");
+    // Nothing was left unfit: the replay is answered with every record, which a
+    // page that carried nothing would have stopped (the process-wide counter is
+    // shared with the tests that do leave a page unfit, in parallel).
     if !outbound {
         let pages = TEST_REPLAY_PAGES_SENT.with(std::cell::Cell::get);
         assert!(pages >= 5, "pages of records alone, then the entries: {pages}");
@@ -2082,6 +2084,245 @@ async fn the_records_at_an_outbound_replays_start_cross_over_several_contacts() 
     let orders = f.a.get_collection("shop", "orders").unwrap();
     for scope in &scopes {
         assert!(f.a.idempotency_record(orders.id, scope).unwrap().is_some(), "every record");
+    }
+    assert_eq!(f.orders(), 2 + 5, "every lost write is back");
+}
+
+/// A record on C, changed now (a frame's store logs it), of `bytes` padding: a
+/// `find_and_modify` record of A's origin inside the replay's span.
+fn plant_large_change(f: &Fixture, bytes: usize) {
+    let from = f.a.own_position_at_open();
+    let orders = f.c.get_collection("shop", "orders").unwrap();
+    let node = f.a.node_id();
+    let at = Stamp::new(Hlc::new(from.wall_ms + 1, 900), node);
+    let record = kimmy_storage::IdempotencyRecord {
+        fingerprint: kimmy_core::Fingerprint([0x6b; 32]),
+        first: at,
+        last: at,
+        origin: node,
+        state: kimmy_storage::RecordState::Done,
+        outcome: kimmy_storage::RecordOutcome::FindAndModify {
+            matched: true,
+            modified: true,
+            removed: false,
+            upserted_id: None,
+            stamp: Some(at),
+            document: Some(bson::doc! { "pad": "q".repeat(bytes) }),
+        },
+    };
+    let carried = kimmy_storage::CarriedRecord {
+        collection: orders.id,
+        scope: kimmy_core::ScopeHash([0x6b; 32]),
+        carrying: Some(at),
+        record: record.encode(),
+    };
+    f.c.apply_batch_carrying(&[], &[carried], kimmy_storage::RecordsVia::Pull).unwrap();
+}
+
+/// The WARN lines a page that could not carry a changed record says, in `log`.
+fn delta_refusals(log: &std::sync::Mutex<Vec<(tracing::Level, String)>>) -> usize {
+    log.lock()
+        .unwrap()
+        .iter()
+        .filter(|(level, message)| {
+            *level == tracing::Level::WARN
+                && message.contains("larger than a replay page's delta can carry")
+        })
+        .count()
+}
+
+/// A record changed since a replay's records cursor that is larger than the
+/// delta's half of a page (refused by name in storage) cannot cross on a page of
+/// that replay: the page carries nothing, the refusal is said at `WARN` once and
+/// counted, the contact ends in step and not as a failure, and the replay stays
+/// at its position with its cursor. Inbound: C serves A's replay, a page a
+/// contact for the first, then a contact of its full page cap.
+#[tokio::test]
+async fn a_changed_record_too_large_for_an_inbound_replays_delta_is_counted_and_stays() {
+    let f = fixture(5, 0);
+    plant_spanning_records(&f, 30);
+    let _budget = EntryBudget::set(8 * 1024);
+    TEST_REPLAY_MAX_PAGES.with(|cap| cap.set(Some(1)));
+    f.round().await.unwrap();
+    TEST_REPLAY_MAX_PAGES.with(|cap| cap.set(None));
+    let (a, c) = (f.a.node_id(), f.c.node_id());
+    let at = f.catch_up.replay_from(c);
+    let cursor = inbound_records(c, a, at).expect("premise: a page of records alone left a cursor");
+    plant_large_change(&f, 5 * 1024);
+    let seen = Seen::default();
+    let log = Arc::clone(&seen.0);
+    let _recording = tracing::subscriber::set_default(seen);
+    tracing::callsite::rebuild_interest_cache();
+    let unfit = records_unfit().get(UnfitPath::Replay);
+    let round = f.round().await;
+    assert!(round.is_ok(), "the contact is no failure: {round:?}");
+    assert!(records_unfit().get(UnfitPath::Replay) > unfit, "counted");
+    assert_eq!(delta_refusals(&log), 1, "said once, and the contact went no further");
+    assert!(!f.catch_up.replay_answered(c), "the replay stays owed");
+    assert_eq!(f.catch_up.replay_from(c), at, "at its position");
+    assert_eq!(inbound_records(c, a, at), Some(cursor), "with its cursor");
+}
+
+/// The same, outbound: A asks C one page a contact, then asks again with a
+/// contact's whole time; C's answer carries nothing and the cursor A sent, and A
+/// stops asking for the contact rather than asking the same page until its
+/// deadline.
+#[tokio::test]
+async fn a_changed_record_too_large_for_an_outbound_replays_delta_is_counted_and_stays() {
+    let f = fixture(5, 0);
+    plant_spanning_records(&f, 30);
+    let _budget = EntryBudget::set(8 * 1024);
+    f.replay_outbound_for(Duration::ZERO).await.unwrap();
+    let c = f.c.node_id();
+    let at = f.catch_up.replay_from(c);
+    let cursor = f.catch_up.replay_records(c).expect("premise: a page of records alone");
+    plant_large_change(&f, 5 * 1024);
+    let seen = Seen::default();
+    let log = Arc::clone(&seen.0);
+    let _recording = tracing::subscriber::set_default(seen);
+    tracing::callsite::rebuild_interest_cache();
+    let unfit = records_unfit().get(UnfitPath::Replay);
+    let replayed = f.replay_outbound_for(Duration::from_secs(20)).await;
+    assert!(replayed.is_ok(), "the contact is no failure: {replayed:?}");
+    assert!(records_unfit().get(UnfitPath::Replay) > unfit, "counted");
+    assert_eq!(delta_refusals(&log), 1, "said once, and the contact asked no more");
+    assert!(!f.catch_up.replay_answered(c), "the replay stays owed");
+    assert_eq!(f.catch_up.replay_from(c), at, "at its position");
+    assert_eq!(f.catch_up.replay_records(c), Some(cursor), "with its cursor");
+}
+
+/// The pages a test's replay cut on this thread since it last looked.
+fn take_cuts() -> Vec<TestReplayCut> {
+    TEST_REPLAY_CUTS.with(|cuts| std::mem::take(&mut *cuts.borrow_mut()))
+}
+
+fn key_of(cursor: &kimmy_storage::ReplayRecords) -> (u64, [u8; 32]) {
+    (cursor.collection.0, cursor.scope.0)
+}
+
+/// Every page of records alone a replay cuts **strictly advances its cursor's
+/// last key sent**, so the pages at a position end (the ruling on m1(c)): each
+/// leaves a cursor of its own position whose key is past the key of the cursor
+/// it came with. (The one page of records alone that keeps the key, a delta that
+/// fills it, is said and counted, below.)
+async fn every_page_of_records_alone_advances_its_key(outbound: bool) {
+    let f = fixture(5, 0);
+    plant_spanning_records(&f, 40);
+    let _budget = EntryBudget::set(8 * 1024);
+    take_cuts();
+    // The pages first, whether or not the replay finished: a page that kept its
+    // key is named here rather than as a replay that never ends.
+    for _ in 0..8 {
+        let round = if outbound { f.round_outbound().await } else { f.round().await };
+        round.unwrap();
+        if f.catch_up.replay_answered(f.c.node_id()) {
+            break;
+        }
+    }
+    let cuts = take_cuts();
+    let alone: Vec<_> = cuts.iter().filter(|cut| cut.records_alone).collect();
+    assert!(alone.len() >= 4, "premise: pages of records alone: {}", alone.len());
+    for cut in alone {
+        assert!(!cut.unfit, "{cut:?}");
+        let went = cut.went.as_ref().expect("a page of records alone leaves a cursor");
+        assert_eq!(went.at, cut.from, "of its own position");
+        if let Some(came) = cut.came.as_ref().filter(|came| came.at == cut.from) {
+            assert!(key_of(went) > key_of(came), "the key strictly advances: {cut:?}");
+        }
+    }
+    assert!(f.catch_up.replay_answered(f.c.node_id()), "and the replay finishes");
+}
+
+#[tokio::test]
+async fn every_page_of_records_alone_of_an_inbound_replay_advances_its_key() {
+    every_page_of_records_alone_advances_its_key(false).await;
+}
+
+#[tokio::test]
+async fn every_page_of_records_alone_of_an_outbound_replay_advances_its_key() {
+    every_page_of_records_alone_advances_its_key(true).await;
+}
+
+/// The page of records alone that does not advance the key: records changed
+/// since the cursor's base fill it (each small enough for the delta, together
+/// more than it carries), so it carries those, keeps its key and moves its
+/// base. It is said at `WARN` and counted, and the replay still finishes, with
+/// every record.
+#[tokio::test]
+async fn a_page_filled_by_what_changed_since_the_cursor_keeps_its_key_and_is_counted() {
+    let f = fixture(5, 0);
+    let mut scopes = plant_spanning_records(&f, 30);
+    let _budget = EntryBudget::set(8 * 1024);
+    TEST_REPLAY_MAX_PAGES.with(|cap| cap.set(Some(1)));
+    f.round().await.unwrap();
+    TEST_REPLAY_MAX_PAGES.with(|cap| cap.set(None));
+    let c = f.c.node_id();
+    assert!(inbound_records(c, f.a.node_id(), f.catch_up.replay_from(c)).is_some(), "premise");
+    // Twelve changes of about 600 bytes each: more than the delta's 4 KiB.
+    let from = f.a.own_position_at_open();
+    let orders = f.c.get_collection("shop", "orders").unwrap();
+    let node = f.a.node_id();
+    for k in 0..12u16 {
+        let at = Stamp::new(Hlc::new(from.wall_ms + 1, 700 + k), node);
+        let record = kimmy_storage::IdempotencyRecord {
+            fingerprint: kimmy_core::Fingerprint([0x7c; 32]),
+            first: at,
+            last: at,
+            origin: node,
+            state: kimmy_storage::RecordState::Done,
+            outcome: kimmy_storage::RecordOutcome::FindAndModify {
+                matched: true,
+                modified: true,
+                removed: false,
+                upserted_id: None,
+                stamp: Some(at),
+                document: Some(bson::doc! { "pad": "c".repeat(500) }),
+            },
+        };
+        let mut scope = [0x7c; 32];
+        scope[30..].copy_from_slice(&k.to_be_bytes());
+        let scope = kimmy_core::ScopeHash(scope);
+        let carried = kimmy_storage::CarriedRecord {
+            collection: orders.id,
+            scope,
+            carrying: Some(at),
+            record: record.encode(),
+        };
+        f.c.apply_batch_carrying(&[], &[carried], kimmy_storage::RecordsVia::Pull).unwrap();
+        scopes.push(scope);
+    }
+    let seen = Seen::default();
+    let log = Arc::clone(&seen.0);
+    let _recording = tracing::subscriber::set_default(seen);
+    tracing::callsite::rebuild_interest_cache();
+    let unfit = records_unfit().get(UnfitPath::Replay);
+    take_cuts();
+    f.replay_through(false).await;
+    let cuts = take_cuts();
+    let kept: Vec<_> = cuts
+        .iter()
+        .filter(|cut| {
+            cut.records_alone
+                && cut.came.as_ref().zip(cut.went.as_ref()).is_some_and(|(came, went)| {
+                    key_of(came) == key_of(went) && went.base.key > came.base.key
+                })
+        })
+        .collect();
+    assert!(!kept.is_empty(), "premise: a page the delta filled: {cuts:#?}");
+    assert!(records_unfit().get(UnfitPath::Replay) >= unfit + kept.len() as u64, "counted");
+    let said = log
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|(level, message)| {
+            *level == tracing::Level::WARN
+                && message.contains("carries only the idempotency records changed since")
+        })
+        .count();
+    assert_eq!(said, kept.len(), "said for each");
+    let aorders = f.a.get_collection("shop", "orders").unwrap();
+    for scope in &scopes {
+        assert!(f.a.idempotency_record(aorders.id, scope).unwrap().is_some(), "every record");
     }
     assert_eq!(f.orders(), 2 + 5, "every lost write is back");
 }
