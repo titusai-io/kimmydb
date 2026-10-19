@@ -1447,6 +1447,11 @@ neither is worth guessing.
 > target is removed and leaves no tombstone: a tombstone outranked a write of it at or below the target that another
 > member keeps. A document deleted at the target keeps its delete's own tombstone, as before.
 
+> **Amended by [ADR-248](#adr-248--a-rewind-judges-a-collections-ended-lives-as-the-apply-path-does).** Only entries of the
+> collection's standing life count: an entry at or below its tombstone or its incarnation floor is of a life a drop
+> ended, and is never put back. A drop after the target is refused whether the oplog holds its entry or the member
+> knows it only as a tombstone or a floor.
+
 **Decision.** `kimmyd restore --from <backup> --until <ms>` restores a backup and
 then rewinds document state to that instant using the oplog the backup carries.
 It refuses — having written nothing — when the target predates the oplog
@@ -29862,6 +29867,10 @@ it](adr-245-mutation-rows.md).
 > and [ADR-243](#adr-243--a-rewind-lowers-each-vector-to-its-target-and-further-only-below-a-document-it-restores).**
 > Not a rollback boundary: no format, table, key or schema changes.
 
+> **Amended by [ADR-248](#adr-248--a-rewind-judges-a-collections-ended-lives-as-the-apply-path-does).** "No entry of the document
+> at or below the target" counts only entries of the collection's standing life: a document whose only versions there
+> are of a life a drop ended is removed when its earliest entry after the target is an insert, and refused otherwise.
+
 **The case.** C inserts `orders/1` at t150. B takes an insert of the same `_id` stamped t300 first, its own or A's,
 so C's insert loses last-writer-wins on B and is witnessed without an append (ADR-054). B is rewound to t200. B's
 oplog holds no entry of the document at or below the target and its earliest entry after it is an insert, so the
@@ -30108,3 +30117,121 @@ decoded. The two are taken in one poll with no await between them, so they can d
 thread makes in the same synchronous stretch, which no test can place there; in that stretch the mutant would keep a
 block decoded before a drop, which the floor exists to refuse. The simulation pins the ask after the drop, not this
 choice.
+
+---
+
+## ADR-248 — A rewind judges a collection's ended lives as the apply path does
+
+> **Amends [ADR-044](#adr-044--point-in-time-restore-rewinds-from-post-images-and-refuses-what-it-cannot-reconstruct)
+> and [ADR-246](#adr-246--a-rewind-removes-a-document-created-after-its-target-without-a-tombstone).**
+> Not a rollback boundary: no format, table, key, wire or schema change, and `I_EPOCH` is unchanged.
+
+**The case.** B writes `items/100` at t120 and drops `items` at t260. C takes both and creates `items` again at
+t330. A, which never heard of the drop, writes `items/100` at t386, and C takes it into the life standing there. A is
+rewound to t352 (`kimmyd restore --until`); C holds A's discarded write, so every member is rewound to t352, as the
+operations guide says. C put the document back to B's t120 version, the post-image of its latest entry at or below the
+target, while A and B removed it. The cluster stayed diverged on every route: no entry ever arrives that is newer
+than C's row, and the divergence check's replays and converge pages write over rows held and never remove one.
+Present on 0.51.0 and every build since the rewind existed.
+
+**Why.** A collection's id is derived from its name (`CollectionId::derive`), so a drop and a re-creation leave one
+id. The purge removes the dropped life's documents and index entries but not its oplog entries, which stay until
+retention collects them. The rewind collected each document's history by collection id and document key and took any
+write entry at or below the target as its value there. The apply path turns those same entries away
+(`Engine::is_history`: at or below the collection's tombstone, or at or below its standing life's incarnation floor,
+by `Hlc`, a tie being the drop's, ADR-236); the rewind never asked it.
+
+A second door into the same state: ADR-044 refuses a schema change after the target, and the rewind found one only as
+an entry in its oplog. A drop that reached the member by a snapshot page leaves its tombstone (and, on a life created
+after it, a floor) and no entry, so a rewind past it went ahead. It put a document of the dropped collection back as a
+row under the id of a collection that no longer exists, and a creation of the name was then refused with
+`CollectionPurging` until the purger removed the row.
+
+**Decision.**
+
+1. **The rewind's history of a document is its entries that are not history** by `Engine::is_history`, on both sides
+   of the target. ADR-044's table then applies to them: the latest at or below the target is put back (its post-image,
+   or its delete's tombstone); with none, the document is removed with no tombstone (ADR-246) when its earliest entry
+   after the target is an insert, and refused otherwise. In the case above, C removes the document.
+2. **A replacement with nothing of the standing life at or below the target is refused**, as a document whose value
+   at the target the member does not hold. A held the document in the life the drop ended, so its t386 write is a
+   `Replace`, and C holds no entry of the document in the standing life at or below the target. Removing it would
+   guess "absent": a snapshot page's row is also a `Replace` with no history behind it, and on a member that took the
+   standing life by a page the document can have existed at the target with a value the member never held, which is
+   the guess ADR-044 refuses. The refusal now says why the member may not hold that value: retention collected it,
+   the member holds the document only as a page's state, or its entries at or below the target are of a life a drop
+   ended. In that schedule C refuses, and A's t386 write, which C keeps, comes back to every member.
+3. **A drop after the target is refused however it arrived**: an entry, a tombstone (`COLLECTIONS_DROPPED`, a
+   database's drop included) or a standing collection's incarnation floor stamped after the target is a schema change
+   after it, named `DropCollection` in the refusal. Strictly after: a drop at the target is part of the state there.
+   `operations.md`'s refusal table already listed a schema change after the target; this makes the code keep it on
+   every route.
+4. **Not covered: a first life created after the target that arrived by a page.** Only its `created` would show it,
+   and a store written before `created` was the origin's stamp does not hold that reliably. No row is written wrongly:
+   its documents, all written after the target, are removed (inserts) or refused (a page's rows), and the empty
+   collection stays.
+
+**The invariant.** For each document changed after the target, the rewound state is what this member's own apply
+rule accepts from its retained entries at or below the target: the latest of them that is not history, or, with none,
+absent when its first non-history entry after the target is an insert; otherwise the rewind refuses. A rewind never
+puts back a version of a life a drop ended, and never rewinds past a drop the member knows of.
+
+**Which life stands at the target.** At or after the standing life began (every drop the member knows of is at or
+before the target), it is the standing life, and a document's history is its entries above the life's floor. A write
+made after the drop by a member that had not heard of it, before the re-creation, belongs to the standing life (ADR-236
+keeps it), so the judgement uses the floor and the tombstone and never `created`. Before a drop, the life standing at
+the target has since been ended by a drop the rewind cannot undo, and the rewind is refused. Between a drop and a
+re-creation, the re-creation is after the target and is refused by its entry; one carried by a page is item 4.
+ADR-173's token check is unchanged: the rewind discards the same entries, every one stamped after the target.
+
+**With ADR-243 and ADR-246.** A document whose only version at or below the target is of an ended life is now a
+removal, not a restore, so it no longer sets `F`: the floor is the lowest restored entry, and no higher than the
+horizon (ADR-246). In the case above C's coverage of A comes down to the entry of A it keeps instead of to B's t120,
+so it asks again for more and never for less than it keeps or collected. The ended life's entries it is sent again are
+history to the apply path by the same predicate, so none comes back; a write of the standing life at or below the
+target that C judged against the discarded write is taken again
+(`row_a_rewind_that_removes_an_ended_lifes_version_asks_again_for_a_judged_write`). The ended life's entries stay in the
+oplog and count in `kept[X]` as before, so invariant I is unchanged. The outcome counts such a document as removed.
+
+**The other choices a rewind makes.** Index entries and the multikey flag follow the planned document
+(`index::maintain`); the live counts and digests move with the rows through `put_record` and `remove_record` in the
+rewind's transaction; a vector shadow collection is a collection with its own id, tombstone and floor, and its chunks
+are ordinary entries, so the same rule judges them; a unique violation's row goes with its entry above the target. None
+picks a version on its own.
+
+**Rollback.** No format change. A 0.51 binary opens a store this build rewound. A store rewound across a drop and a
+re-creation by 0.51 or earlier can hold an ended life's version as a live row of the standing life; nothing at open
+removes it, and the divergence check's repairs do not. Restore that member again from the same backup with this
+release, or wipe it and let it resync (the operations guide). A member that took a drop by a page now refuses a rewind
+past it, where 0.51 went ahead.
+
+**Tests.** `rewind.rs`: `a_rewind_does_not_put_back_a_version_of_a_life_a_drop_ended` (the case on one engine: no
+record, the counts exact), `a_rewind_does_not_put_back_the_delete_of_a_life_a_drop_ended`,
+`a_rewind_puts_back_the_standing_lifes_version_over_an_ended_lifes`,
+`an_entry_in_the_drops_own_millisecond_is_of_the_life_it_ended`,
+`a_write_after_a_drop_and_before_the_re_creation_is_of_the_standing_life`,
+`a_rewind_past_a_drop_a_snapshot_page_carried_is_refused_without_writing`, `a_rewind_to_the_drop_itself_is_not_refused`
+and `a_rewind_past_a_drop_named_only_by_a_floor_is_refused` (and not at the floor). The convergence model, every member
+rewound: the case with the drop by entries, by a whole-database page and as the database's drop; a replacement whose
+only earlier version is of the ended life, refused by C with every member ending at t386 (C held the document in the
+ended life, never held it, and a write in the drop's millisecond); a tie with the drop; the standing life's version put
+back; a write between the drop and the re-creation put back; and a judged write of the standing life taken again. By
+pure entries too, except the write between the drop and the re-creation, which pure entries do not bring to the member
+that dropped the collection with no rewind either, and the repair loop and pages do.
+
+Mutation rows, in bash, each failing a test with only its own change: the skip removed; the skip only after the target;
+the skip only for live entries; the skip judged by `created`; the skip strict at a tie; the tombstone refusal removed;
+it at the target; the floor refusal removed; and it at the target. Argued equivalent:
+- **The skip without the floor (the tombstone alone).** Every life standing here was created or re-dated after the
+  drop its floor names, and the member records that drop's tombstone with it. A tombstone goes only by tombstone
+  retention, which under the operator rule (`tombstone_retention_secs >= oplog_retention_secs`) collects it only past
+  the oplog window, where the ended life's entries are collected too; one arriving later is history on arrival and is
+  not appended.
+- **The skip without the tombstone (the floor alone).** For a standing life the tombstone is above its floor only while
+  the sweep of an ignored drop of an older life runs, which takes the floor in its last chunk. A store stopped in the
+  middle of one owes the sweep, and a start finishes it before it serves (`reconcile_late_drops`), removing any record
+  the rewind put back at or below that drop. For an absent collection, item 3 refuses a
+  tombstone after the target, and no entry above a tombstone is appended while the collection is absent: the entries
+  path stops at it and asks for a page, which installs the life with its floor.
+- **The skip only before the target.** An entry of an ended life after the target is above the target and at or below
+  a tombstone or a floor, which item 3 refuses.

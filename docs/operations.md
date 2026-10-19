@@ -2448,8 +2448,8 @@ window.
 | Refusal | Why |
 |---|---|
 | A target before the oplog horizon | Nothing describes the database before that point |
-| A schema change after the target | Dropping a collection purges its documents, and purged documents are not in the oplog either |
-| A document whose earlier value was collected | It existed at the target with a value that now exists nowhere. It is named in the error |
+| A schema change after the target | Dropping a collection purges its documents, and purged documents are not in the oplog either. A drop counts whether the member holds its oplog entry or knows it only as a collection or database tombstone, or as a collection's incarnation floor, as a snapshot page leaves it |
+| A document whose value at the target the member does not hold | It changed after the target, and the value it had there is not in this member's oplog: retention collected it, the member holds the document only as a snapshot page's state, or its entries at or below the target are of a collection life a drop ended. It is named in the error |
 
 The last one is the important one. The oplog stores what a document *became*,
 never what it was, and a delete stores nothing at all — so a document untouched
@@ -2463,6 +2463,14 @@ passed**, so a refusal leaves the file exactly as the restore wrote it.
 > rewind every node. After such a rejoin, a keyed request's idempotency record
 > need not come back with its undone write, so a retry of that request may apply
 > it again.
+
+**When one member refuses during an every-member rewind**, bring up none of the
+rewound members: a cluster's rewind is all or none, and a member that was not
+rewound sends the undone writes back to the others. Either pick a target every
+member accepts (each refusal says why it refused: a schema change after the
+target, the horizon, or the documents it names), and rewind every member again
+from its backup to that target, or restore every member from its backup without
+`--until`.
 
 A rewind that discarded nothing (the command reports `0 oplog entries
 discarded`) undid no writes, so this rule does not apply to it: the member
@@ -2546,6 +2554,26 @@ discarded, and the peer passes the delete on as an entry under the member's id
 
   If no member that was not rewound holds a copy of a document, its value cannot
   be recovered from the cluster.
+
+**A collection dropped and created again before the target.** A rewind takes a
+document's value at the target only from entries of the collection's life that
+stands there: a version written before the drop is of a life the drop ended, and
+is never put back ([ADR-248](decisions.md)). A rewind by 0.51 or earlier put such
+a version back when the document's latest entry at or below the target was one,
+and the member then holds a document its peers do not, which no sync or repair
+removes. Treat any member rewound by 0.51 or earlier to a target after a drop and
+re-creation of a collection it holds as affected, and compare that collection's
+documents across the members. Restore that member again from the same backup with
+this release's `kimmyd restore --from … --until …`, or stop it, remove its
+`kimmy.redb` and start it empty so it takes its peers' state.
+
+If every member held the ended life's version, every member put back the same
+wrong row: comparing the members finds no difference, and a member started empty
+copies the row from its peers. Then only restoring every member again from its
+backup with this release's `kimmyd restore --from … --until …` removes it. Such a
+row is a document stamped at or below its collection's incarnation floor, the
+stamp of the drop the collection was created after: its last write is from
+before that drop.
 
 ### The identity comes back with it
 
