@@ -21,10 +21,13 @@ readers.
 │                     ([Operations](operations.md#rolling-back-and-kimmyformat))
 ├── kimmy.last-exit   how the last run ended; written on the way out, read and
 │                     removed by the next start ([Operations](operations.md#what-a-shutdown-logs-and-what-a-start-says-about-the-last-one))
-└── kimmy.last-start  when the current run reached serving and what verdict it
-                      started from; advisory, read by the next start to judge
-                      probation ([Operations](operations.md#a-member-that-yields-a-class-of-work)),
-                      ignored by 0.43.0
+├── kimmy.last-start  when the current run reached serving and what verdict it
+│                     started from; advisory, read by the next start to judge
+│                     probation ([Operations](operations.md#a-member-that-yields-a-class-of-work)),
+│                     ignored by 0.43.0
+└── kimmy.swim-incarnation
+                      this member's last SWIM incarnation; a clustered start
+                      takes one above it ([ADR-242](decisions.md))
 ```
 
 > Node identity lives **inside** the database file, not beside it. Copying or

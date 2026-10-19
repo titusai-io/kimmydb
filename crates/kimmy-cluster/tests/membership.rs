@@ -20,6 +20,9 @@ struct Node {
     members: Members,
     announce: tokio::sync::mpsc::Sender<SocketAddr>,
     handle: tokio::task::JoinHandle<()>,
+    /// Where the node keeps its SWIM incarnation (ADR-242), as a data
+    /// directory does.
+    _dir: tempfile::TempDir,
 }
 
 async fn node() -> Node {
@@ -34,11 +37,14 @@ async fn node_with_secret(secret: &str) -> Node {
     // A distinct id per node, as a real node has: it comes from the database
     // file, and it is what peers key on rather than the address.
     let node_id = kimmy_core::NodeId::generate();
+    let dir = tempfile::tempdir().unwrap();
+    let incarnation = kimmy_cluster::membership::IncarnationFile::begin(dir.path());
 
     let handle = tokio::spawn(kimmy_cluster::membership::run(
         socket,
         addr,
         node_id,
+        incarnation,
         secret.to_string(),
         members.clone(),
         feed,
@@ -46,7 +52,7 @@ async fn node_with_secret(secret: &str) -> Node {
         // the announcement is never made and a task ending would be a death.
         kimmy_task::Shutdown::new(),
     ));
-    Node { addr, node_id, members, announce, handle }
+    Node { addr, node_id, members, announce, handle, _dir: dir }
 }
 
 /// Wait for a condition, failing rather than hanging.

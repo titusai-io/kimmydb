@@ -5697,10 +5697,16 @@ async fn a_drain_the_tick_finishes_is_counted_as_caught_up() {
     use kimmy_cluster::ContactEnd;
 
     // The same backlog from a peer that answers at once is drained inside a
-    // generous tick, and no contact ends any other way.
+    // generous tick, and no contact ends any other way. The tick's budget is
+    // its interval, read on the wall clock (a paused tokio clock does not
+    // hold it), and the next pull is made only while more time is left than
+    // the slowest pull took: a five-second tick was ended by the budget
+    // whenever a stalled or loaded host's pull took more than what was left.
+    // An hour is past anything this test survives, its own sixty-second wait
+    // included, so only the drain can end the contact.
     let (a, b) = a_source_holding(3 * kimmy_cluster::protocol::MAX_BATCH).await;
 
-    let (seen, _) = loop_until(&b, a.addr, Duration::from_secs(5), |seen| {
+    let (seen, _) = loop_until(&b, a.addr, Duration::from_secs(3_600), |seen| {
         seen.contacts[ContactEnd::CaughtUp.slot()] >= 1
     })
     .await;

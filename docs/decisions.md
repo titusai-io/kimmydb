@@ -1011,6 +1011,10 @@ it and never lowers it.
 
 ## ADR-037 — Local peer health, and SWIM membership above it
 
+> **Amended by [ADR-242](#adr-242--a-members-swim-incarnation-outlives-its-process-and-each-start-takes-one-above-the-last).**
+> An identity's incarnation outlives the process: a start takes one above the last its data directory recorded,
+> where every start used to be at 0.
+
 **Decision.** Two layers, built in that order. Each node keeps private
 bookkeeping — exponential backoff for peers that fail it, and a fixed fanout
 contacted per round in rotation. Above that, SWIM via [`foca`](https://github.com/caio/foca)
@@ -29181,3 +29185,91 @@ peer_unheard` with `Retry-After: 5` and never `400`, then the first application 
 before the `400` of C's heard block, and the cluster tests' keyed requests are sent again through the window as a
 client sends them. `kimmyd`: the switch's defaults and its refusal of a misspelt key, the facts
 field, the gate across a cluster, and a keyed write whose own fsync fails answered by its replay after the restart.
+
+## ADR-242 — A member's SWIM incarnation outlives its process, and each start takes one above the last
+
+> **Amends [ADR-037](#adr-037--local-peer-health-and-swim-membership-above-it)**, whose identities carry an
+> incarnation that every process started at 0. No wire, table, `kimmy.format` schema, backup tag or configuration key
+> changes. One file joins the data directory, `kimmy.swim-incarnation`, which an older build never opens.
+
+**The case.** A member's SWIM identity is `{addr, incarnation, node}`, and a peer that holds one identity for an
+address keeps it against any other whose incarnation is lower (`win_addr_conflict`): foca 2.0.0 discards the newcomer's
+update, treats it as an inactive sender and answers it with a `TurnUndead`, on which the newcomer renews one step
+(`Identity::renew`, +1) and is answered again. Every process started at incarnation 0. So once a peer had seen a
+member renewed to k, each later start of it walked: k renewals to reach the identity its peers held live, k + 1 to pass
+one they held down. Each step is a `Rejoin` on the restarted member, which clears every peer block it holds
+(ADR-213), closing the gates that wait for every live peer's block (ADR-238's `Decimal128` gate, the idempotency
+gate) until the next replication contact brings them back. The peers saw one `Rename` per restart (the winning step);
+the steps before it lost the conflict. **The walk only grew.** A stop the peers noticed renewed the member once more:
+declared down, it had to pass k; merely suspected (a 1.5 s stop is enough), it walked back to exactly the suspected
+identity at SWIM incarnation 0, never heard the suspicion (its broadcast was spent while it was dead), could not refute
+it, and was declared down 4.8 s into its run (`suspect_to_down_after` for `Config::new_lan(16)`), renewing again. With
+10 s of downtime three real members restarted one member 20 times and its rejoins per restart were exactly 1, 2, …,
+20; quick restarts climbed from 0 to 12 over 22. A 0.51.0 build from the tag walked the same (8 restarts: 1 to 8, with
+10 s and with 2 s of downtime). The walk itself is fast (20 steps in 20 to 180 ms); what it costs is a gate closed for up
+to a sync interval after a start (about 4.8 s at the default 5 s, 0.9 s at 1 s, whatever the walk's length), and a
+second close about 5 s into the run when the late `Down` lands.
+
+**Decision.**
+
+1. **The incarnation is kept in the data directory**, in `kimmy.swim-incarnation`: the decimal value of the last
+   incarnation this member used, written to a temporary file, fsynced, renamed into place, and the directory fsynced.
+2. **A start takes one above what it records, and records that first.** `IncarnationFile::begin` reads the file, takes
+   `last + 1` (0 with nothing recorded), and writes it before the membership task is started, so before any datagram
+   carries it. Peers holding any identity of this member, live, suspect or down, are below it, take it at once
+   (`Rename`, and `MemberUp` if they held it down), and send no `TurnUndead`: **a restart makes no rejoin.**
+3. **A renewal in a process is recorded before anything carries it.** The daemon's step after every input
+   (`after_input`, which also resumes failure detection after a rejoin) records the identity's incarnation when the
+   input rejoined, and only then are the input's datagrams sent: the queue they wait in opens only with the value that
+   step returns, which nothing else can make. The next start is above it too.
+4. **A file that cannot help starts at 0, and the member walks once.** A missing file (the first start of this build on
+   a data directory an older one ran, a wiped directory, a restore into a new one), one that cannot be read, one that
+   does not hold a number, and one that holds 2^63 or more (a `WARN` for the last three) start at 0, which is what every
+   start did before; after a stop shorter than SWIM's down time (about 6.5 s) it may renew once more about 5 s into its
+   run, when its peers declare down the suspected identity it walked back to, which it cannot refute. Each renewal of
+   the walk is recorded, so the next start is one step. A write that fails is said in a `WARN` and the member goes on;
+   it costs the next start at most the renewals it lost, one step each.
+5. **No clock.** The value counts this member's starts and renewals, so a clock that steps back changes nothing.
+
+**Invariant.** The recorded value is at least the incarnation of every identity any process of this data directory
+has sent, unless a write failed, and then it is below by at most the renewals whose write failed. Hence a start's
+first identity is above every identity of this member a peer can hold. Model rows: the deterministic SWIM simulation
+(`membership::rejoin_tests`, foca and this crate's `Member` and `after_input`), 25 restarts each dead for 0, 1.5, 3 and
+10 s with no rejoin, one rename on each peer and one incarnation more per restart; a renewal in a process (frozen until
+declared down, then resumed) recorded, and the next start taken at once; that renewal's record lost, costing the next
+start exactly one rejoin and the one after none; and with nothing recorded at each of 20 starts, the walk of 1 to 20
+rejoins, then one start with the file kept taken at once.
+
+**What every peer sees: one rename per restart, which fails closed.** A rename runs `forget_peer` (ADR-201): the
+peer drops the block it held from the member's last process when its new identity first reaches it, rather than when
+its first new block arrives. Before, a quick restart that kept its identity (at incarnation 0, before any renewal) was
+judged by the dead process's block until the new one's came, so a member restarted into an older build was taken for
+one that could hold what the old process could. Now no peer judges a new process by an old one's block; the cost is that
+a peer's gates close from the rename until the new process's first block.
+
+**Alternatives.** *An incarnation from the wall clock* (milliseconds since an epoch): one step with no state, and no
+walk for a wiped directory, but a clock that steps back by Δ walks one step per unit of Δ (a minute of milliseconds is
+60,000 steps), and a member rolled back to 0.51 would start at 0 against about 1.8 × 10¹² and could not rejoin until
+every peer had forgotten the identity (`Config::remove_down_after`, 24 hours) or the whole cluster was stopped at once.
+A coarser unit only shrinks that (seconds since 2026: about 2.5 × 10⁷ steps, a day and a half). *The larger of the file
+and the clock* keeps the clock's rollback cost. *A key in the store's metadata table*: a backup carries it, so a
+restore brings back a stale value, and it ties SWIM's identity to the engine's commits. *Learning the held incarnation
+and jumping past it*: a `TurnUndead` carries none, and a feed lists only active members, so a member held down cannot
+learn it. *A new field in `Member`* (a boot id ordered before the incarnation): postcard is not self-describing, so a
+field changes the wire format and a mixed cluster forms no membership (ADR-051's cutover).
+
+**Rollback.** A 0.51 build never opens the file. A member rolled back to 0.51 starts at 0 against the incarnation its
+peers hold (about its number of starts since the upgrade, plus its renewals and the walk it had before) and walks once,
+a few milliseconds a step, as 0.51 does at every start (a thousand restarts since the upgrade is a walk of a few
+seconds); from then on it walks as 0.51 does. Rolled forward again, it finds the file below what its peers hold (0.51
+did not update it) and walks once more, by the starts it made on 0.51, then takes one step. The first start of this
+build walks once for the same reason: the file is not there yet. Each of these walks may renew once more about 5 s into
+the run after a stop shorter than SWIM's down time, as item 4 says.
+
+**Tests.** `membership::incarnation`: the first start's 0, each start one above the last, a renewal recorded and the
+start after it above it, a file that is not a number, or holds 2^63 or more, started at 0 and rewritten, a directory
+that cannot take the file still starting, saturation at `u64::MAX`. The simulation rows above, with the five rows of a
+rejoining member that resumes failure detection unchanged. `kimmyd/tests/cluster.rs` (`--ignored`): three real members,
+one restarted twice after its peers declared it down, once after it renewed in its run (frozen until declared down, then
+resumed) and twice at once, with no rejoin in any run, its file one above the last each time and the renewal recorded.
+Mutation rows in bash, one per clause.
