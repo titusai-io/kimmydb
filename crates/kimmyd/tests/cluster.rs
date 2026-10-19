@@ -4950,13 +4950,20 @@ async fn c5_a_retry_is_answered_where_the_keyed_entry_lost() {
 ///
 /// One setting does two things here: the window that collects the history C would need,
 /// which forces the snapshot, is also the record's window, which the keyed write starts
-/// afresh after that collection. The record must still stand on A when C's snapshot reads
-/// it, and must not be past its window on C when C stores it (a record past its window is
-/// refused, review m2). So the window is sized for the margin: 60 s, of which C's catch-up
-/// takes a few, leaves a stall of C of half a minute or more at its snapshot step (as a
-/// loaded scheduler causes) inside the record's life. At 30 s a 32 s stall had A and B
-/// collect the record two seconds before C's snapshot landed, and the poller below could
-/// never succeed.
+/// afresh after that collection. The record must still stand on the peer when C's snapshot
+/// reads it, and must not be past its window on C when C stores it (C holds no record of the
+/// key, and a record past its window is then refused). So the window is sized for the
+/// margin: 60 s, of which C's catch-up takes a few, leaves a stall of C of half a minute or
+/// more at its snapshot step (as a loaded scheduler causes) inside the record's life. At
+/// 30 s a 32 s stall had A and B collect the record two seconds before C's snapshot landed,
+/// and the poller below could never succeed.
+///
+/// C goes on only once B, as well as A, holds the keyed write and its record. C is behind
+/// both peers' horizons, so whichever it asks first answers with a snapshot, and that
+/// snapshot then carries the document and its record; nothing reaches C by a pull before it.
+/// Sent on at once, C could take its snapshot from a B that had not yet pulled the write,
+/// and then pull the write from A with its record (counted `via="pull"`): a real catch-up,
+/// but not the one this test is about, and the snapshot counter would never move.
 #[tokio::test]
 #[ignore = "boots a real three-node cluster; run with --ignored"]
 async fn c6_a_member_that_caught_up_by_snapshot_answers_a_retry_from_the_record() {
@@ -5005,6 +5012,11 @@ async fn c6_a_member_that_caught_up_by_snapshot_answers_a_retry_from_the_record(
     .await;
     let first = keyed_send(&client, &a, &t[0], reqwest::Method::POST, PATH, BODY, KEY).await;
     assert_eq!(first.status, 200, "{}", first.text);
+    eventually("B to hold the keyed write and its record", || async {
+        orders_where(&client, &b, &t[1], serde_json::json!({ "v": "c6" })).await == Some(1)
+            && b.gauge(&client, "kimmy_idempotency_records").await.is_some_and(|n| n >= 1)
+    })
+    .await;
     c.signal("CONT");
 
     eventually("C to catch up by snapshot, with the record", || async {
