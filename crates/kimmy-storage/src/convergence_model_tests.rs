@@ -2120,25 +2120,11 @@ fn row_on(name: &str, pre: &[Op], variants: &[(&str, Vec<Op>)], expect: Expect, 
     assert!(failed.is_empty(), "{}", failed.join("\n"));
 }
 
-/// [`row`] held to pure entries as well: every route, the entries route without the
-/// divergence check's repairs included, converges and ends as `expect`. For a row whose
-/// case the entries themselves must close, where a repair that heals it would hide the
-/// defect the row is for.
+/// [`row_strict`] for each of several schedules of one row.
 fn row_strict_each(name: &str, variants: &[(&str, Vec<Op>)], expect: Expect) {
-    let mut failed = Vec::new();
     for (variant, ops) in variants {
-        let mut outcomes = check_routes(ops, &[Route::Entries, Route::Pages]);
-        for outcome in &mut outcomes {
-            expected_end(ops, outcome, expect);
-        }
-        if outcomes
-            .iter()
-            .any(|o| o.failures.iter().any(|f| f.category != Category::DocsAfterAgeOut))
-        {
-            failed.push(format!("--- {name} / {variant}\n{}", render(ops, &outcomes)));
-        }
+        row_strict(&format!("{name} / {variant}"), ops, expect);
     }
-    assert!(failed.is_empty(), "{}", failed.join("\n"));
 }
 
 /// A schedule fails when the entries route as the loop runs it (with its repairs) or
