@@ -22288,6 +22288,10 @@ serves*, which leaves the commit on the start and depends on task order.
 
 ## ADR-201 — What a member says about itself on the sync contact decides who may own expiry, webhooks and embeddings
 
+> **Amended by [ADR-247](#adr-247--a-member-that-sees-a-peer-come-up-or-renamed-exchanges-facts-blocks-with-it-at-once).** A
+> member that sees a peer come up or renamed, or rejoins itself, exchanges blocks with that peer at once, on the
+> opening frame pair of a sync round, rather than at the next sync contact.
+
 > **Amended by [ADR-213](#adr-213--a-member-that-cannot-do-a-class-of-work-yields-it-judged-by-its-own-heartbeats-against-its-peers).**
 > the sender now sets `yielding`, confirmation is the reader's (an echo or the
 > sync path), a block never replaces an older one from the same process, and
@@ -28286,7 +28290,7 @@ The roll is member-at-a-time, and 0.49 and 0.51 may share a cluster if an operat
 A 0.49 or 0.50 member cannot hold a `Decimal128` `_id`, and cannot parse a `Decimal128` partial-filter bound: an entry or page that carries the new `DocId` variant fails to decode, the window is requested for ever, and a refused index definition is recorded, never retried, and survives the member's own upgrade. So accepting either is an operator declaration, the featureCompatibilityVersion pattern.
 - **The switch.** `cluster.decimal128` (bool), default `true` when clustering is off and `false` when it is on. It states that every member runs 0.51 and has migrated, and it gates local creation only. An entry, a page, a restored or a repaired definition from another member is always applied; refusing one would wedge replication.
 - **Three chokepoints**, keyed on the BSON type of the `_id`, not on the `DocId` variant (an integral decimal is an `Int64` with a decimal body, which breaks an older member's full scans): `check_insert` (insert, bulk, scope inserts, upserts and `$setOnInsert`), `replace_in_txn` (only when the replace creates the row; a replace over an existing decimal `_id` is not refused), and a local `create_index` that mints such a definition (a new one, or the re-stamp of an inherited one): an identical standing definition is the idempotent answer and a duplicate `_id` is `DuplicateKey`, as for any index or id. Each refuses with `400`, naming `cluster.decimal128` and the peers that do not advertise it.
-- **The net.** A gated creation is also refused unless every live peer advertises `Facts.decimal128 = Some(true)` (written by every 0.51 member regardless of the key). An unheard peer fails closed, a migrating member is not live, and `cluster.membership = false` with clustering on always refuses. It is a net, not a check: a peer that restarts on an older build keeps its last block for up to one lease. **Amended by [ADR-240](#adr-240--idempotency-keys-the-record-is-written-with-the-write-and-travels-with-it-and-a-member-takes-keys-only-while-every-member-carries-records) (0.52.0):** the refusal tells the net's two causes apart. A live peer that does not say `decimal128` is the `400`, and decides: its held block says otherwise or nothing of it (an older build), its last block did not decode, or no block of it has arrived for more than the unheard lease (ADR-240 item 7: the longer of the lease and SWIM's time to declare a silent member down plus one sync interval) since it came up, was renamed or this member rejoined. A live peer with no block held within that lease, with none refusing, is `503 peer_unheard`, `retry: wait`, `Retry-After` of one sync interval, since it is heard at the next contact. 0.51 answered that case `400`.
+- **The net.** A gated creation is also refused unless every live peer advertises `Facts.decimal128 = Some(true)` (written by every 0.51 member regardless of the key). An unheard peer fails closed, a migrating member is not live, and `cluster.membership = false` with clustering on always refuses. It is a net, not a check: a peer that restarts on an older build keeps its last block for up to one lease. **Amended by [ADR-240](#adr-240--idempotency-keys-the-record-is-written-with-the-write-and-travels-with-it-and-a-member-takes-keys-only-while-every-member-carries-records) (0.52.0):** the refusal tells the net's two causes apart. A live peer that does not say `decimal128` is the `400`, and decides: its held block says otherwise or nothing of it (an older build), its last block did not decode, or no block of it has arrived for more than the unheard lease (ADR-240 item 7: the longer of the lease and SWIM's time to declare a silent member down plus one sync interval) since it came up, was renamed or this member rejoined. A live peer with no block held within that lease, with none refusing, is `503 peer_unheard`, `retry: wait`, `Retry-After: 1`, since it is heard at the next contact. 0.51 answered that case `400`.
 - **The marker.** A `META` row `decimal128:id_present` is written in the transaction that writes or applies the first document whose body `_id` has BSON type `Decimal128`: at `write_insert`, `replace_in_txn`, `write_chosen`, and in `apply_remote_in_txn` (entries, `All` and scoped pages, the deletes a page carries, `Converge` rows), and a backup carries it. It is exposed as the gauge `kimmy_decimal128_id_present`, a `/readyz` field, and a WARN once per peer and every ten minutes while it is set and a live peer cannot hold such an id. **The marker, not the key, is the authority**: the key can be set back to `false` and the ids remain.
 - **The procedure.** Set `cluster.decimal128` only after every member runs 0.51 and has finished its migration, and never in the same change as the binary. The same procedure covers a decimal partial-filter bound.
 - **Mutation rows.** 31 rows are killed, among them: the BSON-type test replaced by the variant at both chokepoints, the key ignored, the net removed, an unheard peer passing, the marker unwritten or keyed on the variant, any of the three chokepoints ungated, the third chokepoint gating replicated definitions, the integer normalisation removed, and `to_bson` not re-padding.
@@ -29019,8 +29023,8 @@ with it, and not be offered while any member could carry the write without it.
    one live peer per period in a reshuffled round-robin and suspects a failed probe at the next period, and then
    `suspect_to_down_after`. A member that stops answering therefore leaves the live set before its unheard lease runs
    out, at any sync interval. A live peer *not heard yet*, with no block held within that lease (it came up a moment ago, or this member
-   dropped its block on a SWIM rename or its own rejoin), is **`503 peer_unheard`, `retry: wait`, with `Retry-After`
-   of one sync interval** (whole seconds, at least 1), because it is heard at the next contact; a `Retry-After`
+   dropped its block on a SWIM rename or its own rejoin), is **`503 peer_unheard`, `retry: wait`, with `Retry-After: 1`**, because it is heard by an immediate exchange (ADR-247) or at the next contact. The wait is a fixed second, whatever the sync interval; it was
+   one sync interval before the exchange, when the next contact was the only way. A `Retry-After`
    promises a condition that ends, so the `503` lasts no longer than the unheard lease. Measured at a 1 s sync
    interval with three members, a peer frozen just as this member rejoined was declared down 6.0 to 7.8 s later, inside
    the 9.8 s unheard lease; the lease alone (3 s), or the suspect-to-down time and one interval (5.8 s), answered `400`
@@ -29041,7 +29045,7 @@ with it, and not be offered while any member could carry the write without it.
 
 8. **What it reports.** Three codes: `idempotency_key_reused` (`422`, `no`) and `idempotency_key_in_flight` (`409`,
    `wait`, `Retry-After: 1`), logged at `INFO` through `request failed`, and `peer_unheard` (`503`, `wait`,
-   `Retry-After` of one sync interval; item 7, and ADR-238's gate), which writes no line: it is bounded, explained by
+   `Retry-After: 1`; item 7, and ADR-238's gate), which writes no line: it is bounded, explained by
    the response, and membership already warns of a peer unheard for more than a lease. The MCP argument carries the
    same refusal in its error's `data`, with `retry_after_secs`. Seven series, bridged to OTLP:
    `kimmy_idempotency_requests_total{outcome}` (`applied`, `replayed`, `resumed`, `reused`, `in_flight`, `gated`),
@@ -29396,6 +29400,9 @@ counts every point, the points cut off and the points found at four times the ef
 
 ## ADR-242 — A member's SWIM incarnation outlives its process, and each start takes one above the last
 
+> **Amended by [ADR-247](#adr-247--a-member-that-sees-a-peer-come-up-or-renamed-exchanges-facts-blocks-with-it-at-once).** The
+> peer that renames a restarted member exchanges blocks with it at once, so the close below lasts about one contact.
+
 > **Amends [ADR-037](#adr-037--local-peer-health-and-swim-membership-above-it)**, whose identities carry an
 > incarnation that every process started at 0. No wire, table, `kimmy.format` schema, backup tag or configuration key
 > changes. One file joins the data directory, `kimmy.swim-incarnation`, which an older build never opens.
@@ -29453,7 +29460,9 @@ peer drops the block it held from the member's last process when its new identit
 its first new block arrives. Before, a quick restart that kept its identity (at incarnation 0, before any renewal) was
 judged by the dead process's block until the new one's came, so a member restarted into an older build was taken for
 one that could hold what the old process could. Now no peer judges a new process by an old one's block; the cost is that
-a peer's gates close from the rename until the new process's first block.
+a peer's gates close from the rename until the new process's first block, which the peer asks for at the rename itself
+([ADR-247](#adr-247--a-member-that-sees-a-peer-come-up-or-renamed-exchanges-facts-blocks-with-it-at-once)), so the
+close lasts about one contact rather than up to a sync interval.
 
 **Alternatives.** *An incarnation from the wall clock* (milliseconds since an epoch): one step with no state, and no
 walk for a wiped directory, but a clock that steps back by Δ walks one step per unit of Δ (a minute of milliseconds is
@@ -29972,3 +29981,130 @@ document deleted at the target removed; only a removed live row bounding the vec
 horizon even beside a lower restored entry; and the bound without what retention collected, killed beside a late
 restored entry, with a removal or without (for a removal alone it changes nothing: the floor at the horizon is at or
 above every collected stamp).
+
+---
+
+## ADR-247 — A member that sees a peer come up or renamed exchanges facts blocks with it at once
+
+> **Amends [ADR-201](#adr-201--what-a-member-says-about-itself-on-the-sync-contact-decides-who-may-own-expiry-webhooks-and-embeddings)**,
+> whose blocks cross only on a sync contact, and
+> **[ADR-242](#adr-242--a-members-swim-incarnation-outlives-its-process-and-each-start-takes-one-above-the-last)**,
+> whose rename closes a peer's gates until the new process's first block. No frame, table, `kimmy.format` schema,
+> backup tag or configuration key changes.
+
+**The case.** A member's facts block crosses on a sync contact's opening frames: `AskVersions` carries the
+requester's, which the server records before it answers, and `Vectors` the server's (ADR-201, ordered by when each
+frame decoded, ADR-213). Each restart is renamed on every peer exactly once (ADR-242), and the rename drops the block
+the peer held from the old process, so the peer holds the member live with no block, and everything that waits for
+every live peer's block stays closed (the `Decimal128` net of ADR-238; ownership counts the member as no candidate,
+ADR-213), until the next contact between the two. That was up to a sync interval later: measured on three
+release-build members at the default 5 s interval, 20 restarts per shape (SIGTERM and SIGKILL, idle and under write
+load, 0 and 10 s down), with `kimmy_ownership_peers{state="unknown"}` sampled every 10 ms, a peer's window had a median
+of 3.3–4.8 s when idle and 0.1–1.1 s under write load (whose rounds come more often), and a maximum of 5.3 s; at a 1 s
+interval, medians of 0.1–0.7 s. The restarted member's own window had a 3.7 s tail under load after 10 s down: its
+first tick drained one peer for its whole budget while the other waited for the next. With the exchange, on the same
+shapes, a peer's window was at most 0.04–0.13 s and the restarted member's 0.
+
+**Decision.**
+
+1. **What asks.** In the handling of a SWIM notification, after the change it makes: `MemberUp(m)` after `m` is
+   inserted; `Rename(old, new)` after both drops and the insert; this member's own `Rejoin` after it has cleared every
+   peer block (ADR-213), once for each peer it holds live.
+2. **At most one per member per sync interval**, counted from the last ask for that member whatever became of it. A
+   restart after the peer declared the member down is a `Rename` and a `MemberUp` in one input, and asks once; a member
+   that flaps, or does not answer, costs one exchange an interval. **An ask the interval holds is not lost when it is
+   owed**: if the member's block, or every block, was dropped since the last ask (a rename, a down, this member's own
+   rejoin), it schedules one trailing ask for the end of the interval, at most one pending per member, which the driver
+   starts then if the member is still live, at the address it is live at; it counts as an ask at that instant, and one
+   that starts nothing (the member is down) keeps the drop it owed, so the member's next `Up` within the interval owes
+   another. An ask with no drop since the last one (the `MemberUp` beside a `Rename`) owes none.
+3. **The exchange** is the opening frame pair of a sync round and nothing after it: dial (TLS and the shared-secret
+   handshake, with the test refusals), `AskVersions { witnessed: true }` with this member's block, its generation and
+   its echo of the peer's block as held now, then the peer's `Vectors`, whose block is recorded ordered by its decode
+   sequence and whose echo is noted, then close. The peer handles it as any contact: it records the request's block and
+   echo before answering. Nothing else of a round happens: no pull, no divergence check, no replay served (one the peer
+   asks for on its `Vectors` stays owed to its next round), no `PeerHealth` change, no catching-up judgement, no lag
+   vector. Bounded by the dial's timeouts and 10 s more for the frame pair.
+4. **Where it runs.** A driver task the replication loop spawns beside itself, and aborts when it ends; each exchange
+   is a task of its own whose panic the driver logs. The driver's timer starts each trailing ask when it is due. The
+   ask queue exists from the member set's creation, so an `Up` the membership task sees before the loop starts (the
+   daemon starts membership first) is queued. The driver reads
+   this member's block at each ask, so an exchange takes no storage step and an abort can end it anywhere.
+5. **A failed exchange** is one `DEBUG` line and still counts as the member's last ask; the next sync contact carries
+   the blocks.
+
+**Why after the change.** The drop a rename makes records the decode sequence it happened at, and a block decoded
+before it is refused (ADR-213). An exchange asked after the drop reads its answer after it and keeps it. Asked before,
+an answer that came first would be dropped by the rename it was meant to follow, and the window would stay open until
+the next contact. The same holds for a rejoin's clear.
+
+**Why the opening frames, beside the loop, and not a round in it.** A tick is one arm of the loop's `select!`, and a
+tick that drains runs for up to an interval with nothing else polled: an ask that arrived during it would wait for it,
+which is the 3.7 s tail. A round needs the loop's `PeerStalls` (snapshot resume, the set-aside, the repair ledger), so it
+cannot run beside it, and a failed round goes through the back-off, which would lengthen the window it is for. The two
+frames carry both blocks and both echoes, which is all the window waits for.
+
+**Why the rejoining member asks too.** Its rejoin cleared every block it held. Its peers' renames of it ask exchanges
+that carry their blocks to it as well, but only once each has learned the new identity by gossip, and an older peer
+during a roll never asks. Its own asks close its own window at once. In a renewal walk (ADR-242), where each step is a
+rejoin, the seed's `Up` asks first and a later step's clear can drop what that exchange brought; that step's ask is
+held by the interval and owed, so it starts at the interval's end (item 2), about when the next sync contact would
+have come. A peer it still holds live that has gone costs one failed dial in a task of its own.
+
+**Invariant.** Every `Up` or `Rename` of a member that a member sees, and every live peer at its own `Rejoin`, starts an
+exchange with that member at once unless one was started with it within the last sync interval, and then, if the
+member's block was dropped since that one, at the interval's end; at most one is started per member per interval; and
+an exchange that is answered leaves its starter holding the answer's block, unless a later change of the same input
+dropped it. Model rows: the deterministic SWIM simulation (`membership::rejoin_tests`), whose member sets take every
+notification through the production handling, run each exchange inside the ask (or, for a member set so, at the end of
+the input that asked it, as the daemon's queued ones are answered) and start each trailing ask when it is due: after
+every input, each exchange it started that was answered left the starter holding the block it brought. Restarts dead
+for 0, 1.5, 3 and 10 s, ten each: each peer starts exactly one exchange with the member and the member one with each
+peer, all answered, and every member holds every other's current block with no tick run; a second rename within the
+interval starts none at once and one at the interval's end, and a rename after that one's interval starts one at once;
+a rejoin starts one with every live peer, in the input that rejoined; renewal walks of one to four steps, against peers
+that ask none and against peers on this build, with exchanges answered inside the ask and at the end of the input, end
+with every block held.
+
+**Interactions.** The catching-up marker is judged on full rounds only, so an exchange reaches no member for it; a
+marked member's block (`catching_up`) simply arrives sooner. An exchange's echo confirms a yield exactly as a round's
+does (ADR-213), and a yield still waits for the live set to hold still for a lease. An exchange and a tick's round to
+the same peer are two connections, as serving and dialling already were, and their blocks are ordered by decode
+sequence.
+
+**Cost.** One dial and one frame pair per member per `Up`, `Rename` or rejoin, at most one per member per interval: a
+restart costs each peer one exchange and the restarted member one per peer, and a second restart within the interval
+one more each, at its end.
+
+**Rollback.** Nothing is stored and no frame is new. An older build asks no exchanges: its own window after a start is
+up to a sync interval, as before, and a peer on this build still exchanges with it at once on seeing it renamed or up.
+
+**Alternatives.** *Wake the tick for the member* (a reset tick restricted to it): it waits behind a draining tick, a
+failure backs the member off, and the extra tick moves the divergence rotation and the repair clocks. *A whole round
+beside the loop*: needs the loop's `PeerStalls`. *Carry the block over SWIM*: a field in `Member` changes the wire
+(postcard is not self-describing, ADR-242's alternatives), and a block can outgrow a datagram. *No debounce*: a flapping
+member would cost a contact per flap, and a restart after a down declaration two.
+
+**Tests.** `membership::tests`: one ask per member per interval, each member on its own, from its own last ask; an ask
+the interval holds owes one trailing ask only after a drop, one pending, started at the address the member is live at
+then and not at all if it is not live; one due while the member is down keeps the drop it owed. `exchange::tests`: an
+exchange leaves each side holding the other's block and the asker the answerer's echo of its own; one with a member not
+serving fails at the dial and records nothing; one with a member that completes the handshake and never answers ends at
+its bound; the driver runs what is asked, runs an ask made before it started, carries the block as it is at each ask,
+holds the next ask for the interval after a failed exchange, starts a trailing ask when it is due, and ends when its
+guard is dropped. The simulation rows above. `kimmyd/tests/cluster.rs` (`--ignored`): three real members at a 5 s sync
+interval, one restarted three times with SIGTERM; every member's `kimmy_ownership_peers{state="unknown"}` is sampled
+every 10 ms and no run above 0 lasts a second. Mutation rows in bash, each failing a test with only that change: no ask
+on `Up`; none on `Rename`; no exchange at all (the simulation and the real-process test); the ask before the rename's
+drop; no debounce; the debounce keyed for every member at once; no ask at the own rejoin; the rejoin's asks before its
+clear; the interval inclusive; the driver not started; the answer's block not recorded; the request without a block; the
+answer's echo not noted; `AskVersions` without the witnessed flag; the driver dropping its asks; no trailing ask; a
+trailing ask owed with no drop; more than one pending; one due at once; a drop, or a clear, not marked; one started for
+a member not live; the driver's timer never starting one; the driver not aborted with its guard; a failed exchange
+clearing the member's last ask; the block read once for every ask; no bound on the frame pair; asks made before the
+driver starts dropped; a trailing ask that starts nothing clearing the drop it owed. One more is argued unobservable
+(not equivalent) rather than run: recording the answer at a sequence taken when it is recorded instead of when it
+decoded. The two are taken in one poll with no await between them, so they can differ only by a decode or a drop another
+thread makes in the same synchronous stretch, which no test can place there; in that stretch the mutant would keep a
+block decoded before a drop, which the floor exists to refuse. The simulation pins the ask after the drop, not this
+choice.

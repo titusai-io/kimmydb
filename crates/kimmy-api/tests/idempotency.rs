@@ -561,7 +561,7 @@ const UNHEARD_KEY: &str = "\"unheard-6f1c0e52-8a1d-4f53-9b3e-2c1d6a7e\"";
 /// The switch on, clustered, a live peer not heard from yet and no held block
 /// saying no (a peer that came up a moment ago, or whose block was dropped on a
 /// rename): every keyed route answers `503 peer_unheard`, `retry: wait`, with
-/// `Retry-After` of one sync interval, naming the member and saying to send the
+/// `Retry-After: 1`, naming the member and saying to send the
 /// same key again; the refusal is counted as gated, writes nothing and the
 /// capability is not listed. Once the peer is heard, the same request with the
 /// same key is taken as a first answer, and sent again is its replay.
@@ -585,8 +585,8 @@ async fn a_live_peer_not_heard_from_is_answered_503_and_the_same_key_is_then_tak
         assert_eq!(answer.body["retry"], "wait", "{}", answer.text);
         assert_eq!(
             answer.headers.get("retry-after").map(|v| v.to_str().unwrap()),
-            Some("2"),
-            "{method} {path}: one sync interval"
+            Some("1"),
+            "{method} {path}: a fixed second"
         );
         let message = answer.body["message"].as_str().unwrap();
         for said in [id.to_string().as_str(), "Idempotency-Key", "transient", "same key"] {

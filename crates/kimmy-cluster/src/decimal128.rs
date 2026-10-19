@@ -17,8 +17,8 @@
 //! says the peer cannot hold one is [`Decimal128Closed::Peers`], which the API
 //! answers `400`, and lasts a roll; a live peer not heard from yet, with no
 //! held block saying no, is [`Decimal128Closed::Unheard`], answered `503` with
-//! `retry: wait` and a `Retry-After` of one sync interval, since its block
-//! arrives at the next contact.
+//! `retry: wait` and a `Retry-After` of 1, since its block
+//! arrives by an immediate exchange or at the next contact.
 //!
 //! With clustering off there are no peers, and the key alone decides (its
 //! default is `true` there). With clustering on and `cluster.membership` off,
@@ -96,7 +96,7 @@ impl Decimal128Gate {
             PeerNet::Refused(peers) => Err(Decimal128Closed::Peers(names(peers))),
             PeerNet::Unheard(peers) => Err(Decimal128Closed::Unheard {
                 peers: names(peers),
-                retry_after_secs: members.unheard_retry_after_secs(),
+                retry_after_secs: crate::membership::UNHEARD_RETRY_AFTER_SECS,
             }),
         }
     }
@@ -161,7 +161,7 @@ mod tests {
             gate.check(),
             Err(Decimal128Closed::Unheard {
                 peers: vec![node(2).to_string()],
-                retry_after_secs: members.unheard_retry_after_secs(),
+                retry_after_secs: crate::membership::UNHEARD_RETRY_AFTER_SECS,
             })
         );
         // An older build: its block says nothing of the capability.
@@ -179,7 +179,7 @@ mod tests {
     }
 
     /// The two causes apart: a peer not heard from is `Unheard`, transient, with
-    /// one sync interval to wait; a held block that says no is `Peers` and
+    /// a second to wait; a held block that says no is `Peers` and
     /// carries none; and with both at once the block that says no decides, naming
     /// only its member.
     #[test]
@@ -191,9 +191,9 @@ mod tests {
         let closed = gate.check().unwrap_err();
         assert_eq!(
             closed,
-            Decimal128Closed::Unheard { peers: vec![node(2).to_string()], retry_after_secs: 3 }
+            Decimal128Closed::Unheard { peers: vec![node(2).to_string()], retry_after_secs: 1 }
         );
-        assert_eq!(closed.retry_after_secs(), Some(3), "one sync interval");
+        assert_eq!(closed.retry_after_secs(), Some(1), "a fixed second");
 
         // A second live peer whose block says no: it decides, whoever is unheard.
         members.insert_for_test(addr(3), node(3));

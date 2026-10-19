@@ -886,8 +886,7 @@ impl ApiError {
 
     /// `503 peer_unheard`, `retry: wait` (see [`ErrorCode::PeerUnheard`]): a
     /// gate closed only because a live member has not been heard from yet.
-    /// `Retry-After` is the gate's own figure, one sync interval in whole
-    /// seconds, never 0; `message` is the gate's words, which name the member.
+    /// `Retry-After` is the gate's own figure, a fixed second, never 0; `message` is the gate's words, which name the member.
     pub fn peer_unheard(message: impl Into<String>, retry_after_secs: u64) -> Self {
         Self {
             retry_after_secs: Some(retry_after_secs.max(1)),
@@ -1075,7 +1074,7 @@ impl From<CoreError> for ApiError {
             // request names a `Decimal128` id or partial-filter bound, and
             // the answer names `cluster.decimal128` and any peer that holds
             // it back. A live peer not heard from yet, with no held block
-            // saying no, ends by itself within a sync interval: `503
+            // saying no, ends by itself within about a contact: `503
             // peer_unheard`, with the gate's `Retry-After`. Every other cause
             // lasts until the operator or the roll acts, so 400, never a retry
             // hint: repeating it changes nothing until then.

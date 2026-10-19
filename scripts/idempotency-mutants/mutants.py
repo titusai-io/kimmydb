@@ -63,7 +63,7 @@ GATE_SPLIT = [
             ("crates/kimmy-cluster/src/idempotency.rs",
              "            PeerNet::Unheard(peers) => Err(IdempotencyClosed::Unheard {\n"
              "                peers: names(peers),\n"
-             "                retry_after_secs: members.unheard_retry_after_secs(),\n"
+             "                retry_after_secs: crate::membership::UNHEARD_RETRY_AFTER_SECS,\n"
              "            }),\n",
              "            PeerNet::Unheard(peers) => Err(IdempotencyClosed::Peers(names(peers))),\n"),
         ],
@@ -79,7 +79,7 @@ GATE_SPLIT = [
             ("crates/kimmy-cluster/src/decimal128.rs",
              "            PeerNet::Unheard(peers) => Err(Decimal128Closed::Unheard {\n"
              "                peers: names(peers),\n"
-             "                retry_after_secs: members.unheard_retry_after_secs(),\n"
+             "                retry_after_secs: crate::membership::UNHEARD_RETRY_AFTER_SECS,\n"
              "            }),\n",
              "            PeerNet::Unheard(peers) => Err(Decimal128Closed::Peers(names(peers))),\n"),
         ],
@@ -138,28 +138,28 @@ GATE_SPLIT = [
         "kills": ["error::tests::a_decimal128_refusal_is_503_while_a_peer_is_unheard_and_400_otherwise"],
     },
     {
-        "name": "gs-wait-not-rounded-up",
+        "name": "gs-wait-longer",
         "group": "gate-split",
-        "doc": "The wait truncates a fractional sync interval instead of rounding it up",
+        "doc": "The wait of a refusal for a peer not heard from yet is 5 seconds, not 1",
         "patches": [
             ("crates/kimmy-cluster/src/membership.rs",
-             "        let whole = interval.as_secs() + u64::from(interval.subsec_nanos() > 0);\n",
-             "        let whole = interval.as_secs();\n"),
+             "pub const UNHEARD_RETRY_AFTER_SECS: u64 = 1;\n",
+             "pub const UNHEARD_RETRY_AFTER_SECS: u64 = 5;\n"),
         ],
-        "suites": [("kimmy-cluster", "--lib", "idempotency::tests::the_wait_is_one_sync_interval_rounded_up_and_at_least_a_second", "no")],
-        "kills": ["idempotency::tests::the_wait_is_one_sync_interval_rounded_up_and_at_least_a_second"],
+        "suites": [("kimmy-cluster", "--lib", "idempotency::tests::the_wait_is_a_fixed_second_whatever_the_sync_interval", "no")],
+        "kills": ["idempotency::tests::the_wait_is_a_fixed_second_whatever_the_sync_interval"],
     },
     {
-        "name": "gs-wait-may-be-zero",
+        "name": "gs-wait-zero",
         "group": "gate-split",
-        "doc": "The wait of a sub-second sync interval is 0",
+        "doc": "The wait of a refusal for a peer not heard from yet is 0",
         "patches": [
             ("crates/kimmy-cluster/src/membership.rs",
-             "        whole.max(1)\n    }\n",
-             "        whole\n    }\n"),
+             "pub const UNHEARD_RETRY_AFTER_SECS: u64 = 1;\n",
+             "pub const UNHEARD_RETRY_AFTER_SECS: u64 = 0;\n"),
         ],
-        "suites": [("kimmy-cluster", "--lib", "idempotency::tests::the_wait_is_one_sync_interval_rounded_up_and_at_least_a_second", "no")],
-        "kills": ["idempotency::tests::the_wait_is_one_sync_interval_rounded_up_and_at_least_a_second"],
+        "suites": [("kimmy-cluster", "--lib", "idempotency::tests::the_wait_is_a_fixed_second_whatever_the_sync_interval", "no")],
+        "kills": ["idempotency::tests::the_wait_is_a_fixed_second_whatever_the_sync_interval"],
     },
     {
         "name": "gs-precedence-swapped",

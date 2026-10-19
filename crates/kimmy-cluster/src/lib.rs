@@ -22,6 +22,7 @@ pub mod catchup;
 pub mod confirm;
 pub mod decimal128;
 pub mod discovery;
+mod exchange;
 pub mod facts;
 pub mod health;
 pub mod idempotency;

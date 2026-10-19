@@ -144,7 +144,7 @@ pub enum Decimal128Closed {
     /// The key is set and no live peer refuses, but these live peers (node ids,
     /// sorted) have not been heard from yet, within a lease of coming up, being
     /// renamed or this member's rejoin. **Transient**: a block arrives with the
-    /// next contact, about `retry_after_secs` (one sync interval) later, so the
+    /// next contact, about `retry_after_secs` (a fixed second) later, so the
     /// request is answered `503` with `Retry-After`; once the lease has run with
     /// none the peer counts among [`Self::Peers`].
     Unheard { peers: Vec<String>, retry_after_secs: u64 },
@@ -188,7 +188,8 @@ fn decimal128_refusal(what: Decimal128Use, closed: &Decimal128Closed) -> String 
         Decimal128Closed::Unheard { peers, .. } => format!(
             "{what} yet: cluster.decimal128 is set, but this member has not yet heard from the \
              live member(s) {} whether they can hold one (a member that came up or rejoined a \
-             moment ago). This is transient: nothing was written; send the same request again \
+             moment ago; its facts arrive by an immediate exchange, or the next replication \
+             contact). This is transient: nothing was written; send the same request again \
              after Retry-After",
             peers.join(", ")
         ),

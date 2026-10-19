@@ -15992,8 +15992,8 @@ async fn the_live_peer_net_holds_back_a_decimal_id_and_bound_until_every_peer_ca
     // key set. An older live peer (its block says nothing of the capability) holds both
     // creations back with a 400 that names it, and decides over a live peer not heard
     // from yet, which is not named. Once the older peer can, the unheard one holds both
-    // back with a transient `503 peer_unheard`, `retry: wait` and `Retry-After` of one
-    // sync interval, naming it; once every live peer says it can, both are created.
+    // back with a transient `503 peer_unheard`, `retry: wait` and `Retry-After: 1`,
+    // naming it; once every live peer says it can, both are created.
     let server = Server::start().await;
     let token = server.root().await;
     server.post("/v1/db/shop/collections", Some(&token), json!({ "name": "c" })).await;
@@ -16039,7 +16039,7 @@ async fn the_live_peer_net_holds_back_a_decimal_id_and_bound_until_every_peer_ca
         assert_eq!(res.status, 503, "the unheard peer still holds it back: {:?}", res.body);
         assert_eq!(res.body["error"], "peer_unheard", "{path}: {:?}", res.body);
         assert_eq!(res.body["retry"], "wait", "{path}: {:?}", res.body);
-        assert_eq!(res.header("retry-after").as_deref(), Some("3"), "{path}: one sync interval");
+        assert_eq!(res.header("retry-after").as_deref(), Some("1"), "{path}: a fixed second");
         let message = res.body["message"].as_str().unwrap_or_default();
         assert!(message.contains(&unheard.to_string()), "{path}: names {unheard}: {message}");
         assert!(message.contains("transient"), "{path}: {message}");

@@ -241,7 +241,7 @@ and every live member can hold one
 an index whose `partialFilterExpression` holds a `Decimal128`. While the only
 cause is a live member this member has not heard from yet, within the unheard lease of
 its coming up, being renamed or this member rejoining, the refusal is `503
-peer_unheard`, `retry: wait`, with `Retry-After` of one sync interval instead,
+peer_unheard`, `retry: wait`, with `Retry-After: 1` instead,
 and the same request sent again once it is heard is taken
 ([The gate](#the-gate) has the lease).
 
@@ -670,7 +670,7 @@ request. An MCP call is fingerprinted over the tool and its arguments without
 | Case | Answer |
 |---|---|
 | The member does not take keys now (see [The gate](#the-gate)) | `400 bad_request` naming the header and the cause. Nothing is looked up or written |
-| The member does not take keys **yet**: a live member has not been heard from, within the unheard lease of its coming up, being renamed or this member rejoining, and no live member refuses | `503 peer_unheard`, `retry: wait`, `Retry-After` of one sync interval, naming the member. Nothing is looked up or written; sent again here with the same key once it has been heard, it is answered as any keyed request is |
+| The member does not take keys **yet**: a live member has not been heard from, within the unheard lease of its coming up, being renamed or this member rejoining, and no live member refuses | `503 peer_unheard`, `retry: wait`, `Retry-After: 1`, naming the member. Nothing is looked up or written; sent again here with the same key once it has been heard, it is answered as any keyed request is |
 | No record of the key | Processed as without a key. If it wrote anything, the record is written with it. No marker |
 | A record, the same request | The first answer: `200` and the body the first attempt returned, with `Idempotency-Replayed: ?1`. Nothing is written. Under `coalesced` it is answered once the record's commit is durable |
 | A record, a different request | `422 idempotency_key_reused`, `retry: no`. Nothing is written |
@@ -819,8 +819,7 @@ it, naming the header and the cause, in one of two ways:
   intervals and the time SWIM takes to declare a silent member down plus one
   sync interval, SWIM's time to declare a silent member down being foca's suspect-to-down time (4.8 s) plus two probe periods (1 s each) per live peer, so a member that stops answering is declared down,
   and leaves the live set, before its lease runs out.
-- **`503 peer_unheard`, `retry: wait`, `Retry-After` of one sync interval** (in
-  whole seconds, at least 1), when the only cause is a live member this member
+- **`503 peer_unheard`, `retry: wait`, `Retry-After: 1`**, when the only cause is a live member this member
   has not heard from yet, within the unheard lease: one that came up a moment ago, or
   whose block this member dropped when SWIM renamed it or this member rejoined.
   Every restart of a member in a roll opens such a window, on the restarted
@@ -1734,7 +1733,7 @@ and `verify` today, and a client treats a class it does not know as `no`.
 | 500 | `outcome_unknown` | verify | A write reached the storage engine's durability step and then failed, so it **may or may not have been applied** — and if it was, it replicates. **Read the target back before sending it again**, unless the write is idempotent or carries an [`Idempotency-Key`](#idempotency-keys), which makes sending it again with the same key safe on the member that took it: see [retrying after an unknown outcome](clients.md#retrying-after-an-unknown-outcome). A node whose own fsync fails usually stops (ADR-188) before it can answer, so a client more often meets this as a dropped connection after its request was sent, which it must treat the same way |
 | 500 | `partially_applied` | verify | A request that commits in more than one transaction — a `multi: true` update or delete, a database drop — failed after its first commit. **What landed stands and replicates**, and `applied` says how much; `cause` says why the rest did not. Read back, or resend a request built to skip what is done: see [a request that was partly applied](#a-request-that-was-partly-applied). Never resend it blindly |
 | 500 | `internal` | elsewhere | Storage failure on this node — details logged, never returned |
-| 503 | `peer_unheard` | wait | A keyed request, or the creation of a `Decimal128` `_id` or partial-filter bound, while the only cause the gate is closed is a live member this member has not heard from yet, within the unheard lease (the longer of `ceil(peers / cluster.fanout) + 2` sync intervals and the time SWIM takes to declare a silent member down plus one sync interval) of its coming up, being renamed or this member rejoining, as every restart in a roll causes. Past the unheard lease with no block, or with a block that does not decode, the member counts as one that does not say it has the capability, and the answer is `400 bad_request`. Nothing was looked up or written. Carries `Retry-After`, one sync interval in whole seconds; the same request sent again here then (with the same key, if it had one) is taken. Not elsewhere: a keyed retry stays on the member that may hold its record ([The gate](#the-gate)) |
+| 503 | `peer_unheard` | wait | A keyed request, or the creation of a `Decimal128` `_id` or partial-filter bound, while the only cause the gate is closed is a live member this member has not heard from yet, within the unheard lease (the longer of `ceil(peers / cluster.fanout) + 2` sync intervals and the time SWIM takes to declare a silent member down plus one sync interval) of its coming up, being renamed or this member rejoining, as every restart in a roll causes. Past the unheard lease with no block, or with a block that does not decode, the member counts as one that does not say it has the capability, and the answer is `400 bad_request`. Nothing was looked up or written. Carries `Retry-After: 1`; the same request sent again here then (with the same key, if it had one) is taken. Not elsewhere: a keyed retry stays on the member that may hold its record ([The gate](#the-gate)) |
 | 503 | `starting` | elsewhere | This node has bound its port and is still starting, and answers only `/healthz` and `/readyz` until it is up: nothing was read or written. Send it to another member ([ADR-198](decisions.md)) |
 | 503 | `catching_up` | elsewhere | This member knows it is behind (it created its store in a cluster it has seeds for, was restored from a backup, or fell behind its peers' retention horizon, and its catching-up marker is set) and answers only `/healthz`, `/readyz`, `/metrics` and `/v1/topology` until it has caught up: nothing was read or written. Send it to another member ([ADR-202](decisions.md)) |
 | 503 | `node_stopping` | elsewhere | This node is shutting down and did not complete the request: nothing was written. Send it to another member ([ADR-192](decisions.md)) |
