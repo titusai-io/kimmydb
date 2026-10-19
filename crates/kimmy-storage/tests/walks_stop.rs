@@ -49,9 +49,9 @@ const STOP_AWARE_WALKS: &[&str] = &[
     // Retention's scans, which serve no client.
     "gc::Engine::collect_oplog",
     "gc::Engine::collect_tombstones_within",
-    // Retention's read of the idempotency records' rows below its cutoff (B5).
+    // Retention's read of the idempotency records' rows below its cutoff (ADR-240).
     "idempotency::Engine::collect_idempotency_records",
-    // A replay page's records of its collections (B2 of the B5 build review),
+    // A replay page's records of its collections (the spanning records),
     // which serves no client.
     "idempotency_replay::Engine::replay_records_in",
     // The read ahead of a drop purge chunk, which serves no client: the stop is
@@ -94,6 +94,10 @@ const STOP_AWARE_WALKS: &[&str] = &[
 /// Functions that iterate a table without checking the stop, as
 /// `(file::function, why it cannot hold a stop up)`.
 const BOUNDED_READS: &[(&str, &str)] = &[
+    (
+        "backup::restore_with",
+        "`kimmyd restore`, which writes a new store offline before any node opens it: the held marks are derived from the oplog it just wrote (ADR-244)",
+    ),
     (
         "database_tombstone::Engine::record_database_tombstone_in",
         "the dropped-collection registry, one row per drop, read once when a database's tombstone is raised (ADR-236)",
@@ -227,10 +231,7 @@ const BOUNDED_READS: &[(&str, &str)] = &[
         "engine::Engine::release_held_under",
         "inside the write that applies a peer's batch: close_writes bounds it (ADR-192)",
     ),
-    (
-        "engine::Engine::reset_version_vector_to_oplog",
-        "`kimmyd rewind`, which runs on a stopped node",
-    ),
+    ("engine::Engine::lower_vectors_in", "`kimmyd rewind`, which runs on a stopped node"),
     ("engine::Engine::snapshots_to_resume", "one row per peer a snapshot is under way with"),
     (
         "engine::collection_stands_under",
@@ -495,7 +496,7 @@ const WRITES: &[&str] = &[
     // with no usable index, the whole collection (`modify::scan_until`).
     "modify_where",
     "find_and_modify",
-    // The same, keyed (B5): the same bodies, in the same transactions.
+    // The same, keyed (ADR-240): the same bodies, in the same transactions.
     "modify_where_keyed",
     "find_and_modify_keyed",
 ];

@@ -197,6 +197,35 @@ async fn a_gated_member_refuses_every_routed_request_and_says_why() {
     }
 }
 
+/// A keyed write on a member marked restored is refused like every routed request, before
+/// any record is read, and writes nothing. The idempotency model relies on it: a restored
+/// member can hold an effect ahead of its record while it catches up (its own-origin
+/// replay reads back a version that embeds another member's write before its coverage of
+/// that member, and so the record, catches up), and no retry reaches it meanwhile.
+#[tokio::test]
+async fn a_keyed_write_on_a_member_marked_restored_is_refused_and_writes_nothing() {
+    let member = member(Some(CatchUpReason::Restored), Duration::from_secs(120)).await;
+    let res = reqwest::Client::new()
+        .post(format!("{}/v1/db/shop/coll/orders/docs", member.base))
+        .bearer_auth(&member.token)
+        .header("idempotency-key", "\"a-retry-of-an-insert-0001\"")
+        .json(&serde_json::json!({ "_id": 7 }))
+        .send()
+        .await
+        .unwrap();
+    let status = res.status().as_u16();
+    let header = res.headers().get("x-kimmy-catching-up").map(|v| v.to_str().unwrap().to_string());
+    let text = res.text().await.unwrap();
+    let body: Value = serde_json::from_str(&text).unwrap_or(Value::Null);
+    assert_eq!(status, 503, "{text}");
+    assert_eq!(body["error"], "catching_up", "{text}");
+    assert_eq!(header.as_deref(), Some("restored"));
+
+    member.catch_up.clear("the test");
+    let read = get(&member, "/v1/db/shop/coll/orders/docs/7").await;
+    assert_eq!(read.status, 404, "the refused write wrote nothing: {}", read.text);
+}
+
 /// The refusals are counted and traced like any other response: they pass through
 /// the counting layer, and are not invisible to the scrape.
 #[tokio::test]

@@ -41,7 +41,7 @@ pub fn source(
             decimal128: Some(true),
             vector_chunk_ids: Some(kimmy_core::CHUNK_ID_FORMAT),
             // This binary stores and relays the records keyed writes carry,
-            // whatever this member's `cluster.idempotency_keys` says (B5): the
+            // whatever this member's `cluster.idempotency_keys` says (ADR-240): the
             // switch is the operator's word about the cluster, this the build's
             // about itself, and a peer's gate counts this member by it.
             idempotency_records: Some(true),
@@ -198,7 +198,7 @@ mod tests {
         assert_eq!(source().decimal128, Some(true), "whatever the store says");
     }
 
-    /// Every block of this build says it carries idempotency records (B5), with
+    /// Every block of this build says it carries idempotency records (ADR-240), with
     /// an engine or without: the field is the binary's, not the configuration's.
     #[test]
     fn the_block_says_this_build_carries_idempotency_records() {

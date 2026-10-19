@@ -23,7 +23,10 @@
 //! entries); take a scoped snapshot; take a whole-database snapshot (coverage granted
 //! on completion); restart (close, open, the two start reconciles `node::run` makes);
 //! collect garbage honouring the operator rule (only what every member has witnessed);
-//! and age out everything a member holds (the rule broken: ADR-235's premise).
+//! age out everything a member holds (the rule broken: ADR-235's premise); a retention
+//! pass past the oplog window and within the tombstone window; and a point-in-time
+//! rewind (`kimmyd restore --until`) followed by a start. The last two are taken by named
+//! rows only; the generator does not draw them.
 //!
 //! **Quiescence.** After a schedule, every ordered pair syncs until nothing moves (the
 //! observable state, `created` and the vectors all stand still for a whole round),
@@ -149,7 +152,22 @@ pub(crate) enum Step {
     Purge {
         m: u8,
     },
+    /// A retention pass at `t` with the oplog window passed and the tombstone window
+    /// not: the oplog below `t` less [`RETENTION_OPLOG_SECS`] is collected, the
+    /// tombstones are kept (`tombstone_retention_secs >= oplog_retention_secs`).
+    Retention {
+        m: u8,
+    },
+    /// A point-in-time rewind to `t` (`kimmyd restore --until`, offline), then a start.
+    Rewind {
+        m: u8,
+    },
 }
+
+/// The oplog window of a [`Step::Retention`] pass.
+const RETENTION_OPLOG_SECS: u64 = 1;
+/// Its tombstone window: longer than any schedule, so the pass keeps every tombstone.
+const RETENTION_TOMBSTONE_SECS: u64 = 24 * 60 * 60;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub(crate) struct Op {
@@ -213,6 +231,8 @@ impl std::fmt::Display for Op {
             Step::AgeOut { m } => write!(f, "{}.ageout", l(m)),
             Step::PurgerOff => write!(f, "purger off"),
             Step::Purge { m } => write!(f, "{}.purge", l(m)),
+            Step::Retention { m } => write!(f, "{}.retention@{t}", l(m)),
+            Step::Rewind { m } => write!(f, "{}.rewind@{t}", l(m)),
         }
     }
 }
@@ -280,6 +300,8 @@ pub(crate) fn parse(text: &str) -> Vec<Op> {
                 "gc" => Step::Gc { m },
                 "ageout" => Step::AgeOut { m },
                 "purge" => Step::Purge { m },
+                "retention" => Step::Retention { m },
+                "rewind" => Step::Rewind { m },
                 "write" | "delete" => {
                     let (c, d) = arg.split_once('/').expect("collection/doc");
                     let (c, d) = (coll(c), d.parse().expect("a doc"));
@@ -774,6 +796,56 @@ impl Cluster {
             Step::Purge { m } => {
                 self.e(m as usize).finish_purges_now().map_err(|e| err("finish_purges_now", e))?;
             }
+            Step::Retention { m } => {
+                let m = m as usize;
+                let now = self.base + u64::from(op.t);
+                let out = self
+                    .e(m)
+                    .collect_garbage_at(
+                        now,
+                        RetentionPolicy::new(RETENTION_OPLOG_SECS, RETENTION_TOMBSTONE_SECS),
+                    )
+                    .map_err(|e| err("collect_garbage", e))?;
+                let s = format!(
+                    "{} retention at t{}: {} entries, {} tombstones",
+                    LETTERS[m], op.t, out.oplog_removed, out.tombstones_removed
+                );
+                self.note(s);
+            }
+            Step::Rewind { m } => {
+                let m = m as usize;
+                // `--until` is a millisecond: what is stamped in it after its first
+                // stamp is discarded.
+                let until = Hlc::new(self.base + u64::from(op.t), 0);
+                match self.e(m).rewind_to(until) {
+                    Ok(out) => {
+                        let s = format!(
+                            "{} rewound to t{}: {} entries discarded, {} reverted, {} removed",
+                            LETTERS[m], op.t, out.oplog_discarded, out.reverted, out.removed
+                        );
+                        self.note(s);
+                        // The ghost forgets what the rewind undid for good: a write or
+                        // a delete stamped after the target that no other member has
+                        // witnessed. One another member has comes back by anti-entropy
+                        // (the operations guide's warning), so it is still expected.
+                        let mut others = Vec::new();
+                        for j in (0..3).filter(|j| *j != m) {
+                            others.push(
+                                self.e(j).witnessed_vector().map_err(|e| err("witnessed", e))?,
+                            );
+                        }
+                        let undone = |stamp: &Stamp| {
+                            stamp.hlc > until
+                                && others.iter().all(|w| w.get(stamp.node) < stamp.hlc)
+                        };
+                        self.ghost.writes.retain(|w| !undone(&w.stamp));
+                        self.ghost.deletes.retain(|(_, _, stamp)| !undone(stamp));
+                    }
+                    Err(e) => self.note(format!("{} rewind to t{} refused: {e}", LETTERS[m], op.t)),
+                }
+                // The restore command exits; the node starts on the rewound store.
+                self.restart(m)?;
+            }
         }
         // The drops a local step minted, read as the tombstones it wrote.
         if let Some(before) = before {
@@ -805,7 +877,9 @@ impl Cluster {
             | Step::Restart { m }
             | Step::Gc { m }
             | Step::AgeOut { m }
-            | Step::Purge { m } => m as usize,
+            | Step::Purge { m }
+            | Step::Retention { m }
+            | Step::Rewind { m } => m as usize,
             Step::PurgerOff => 0,
             Step::Pull { to, .. }
             | Step::PullShort { to, .. }
@@ -1996,6 +2070,12 @@ fn scoped(to: u8, from: u8, c: u8) -> Op {
 fn age_out(m: u8) -> Op {
     op(AgeOut { m }, 0)
 }
+fn retention(m: u8, t: u32) -> Op {
+    op(Retention { m }, t)
+}
+fn rewind(m: u8, t: u32) -> Op {
+    op(Rewind { m }, t)
+}
 
 /// A delivery of every member's news to every other, in the order `order` names
 /// the pairs, by `how`.
@@ -2038,6 +2118,13 @@ fn row_on(name: &str, pre: &[Op], variants: &[(&str, Vec<Op>)], expect: Expect, 
         }
     }
     assert!(failed.is_empty(), "{}", failed.join("\n"));
+}
+
+/// [`row_strict`] for each of several schedules of one row.
+fn row_strict_each(name: &str, variants: &[(&str, Vec<Op>)], expect: Expect) {
+    for (variant, ops) in variants {
+        row_strict(&format!("{name} / {variant}"), ops, expect);
+    }
 }
 
 /// A schedule fails when the entries route as the loop runs it (with its repairs) or
@@ -2871,6 +2958,807 @@ fn finding_f16_a_delete_made_after_a_drop_is_kept_as_a_write_after_it_is() {
     );
 }
 
+/// A rewind after a retention pass (ADR-243). B drops `items`; B's retention pass collects its
+/// own drop entry before A or C has taken it (they are past the oplog window and within the
+/// tombstone window); B rewinds to a moment after the pass, discarding nothing; A, which never
+/// heard of the drop, writes into `items`. B's drop reaches A and C only by a whole-database
+/// page, given to a peer that lacks a collected entry (ADR-036, ADR-097), and A keeps its
+/// writes made after the drop (ADR-236). The control variant is the same schedule without the
+/// rewind.
+#[test]
+fn row_a_rewind_after_retention_keeps_the_members_collected_drop() {
+    let pre = [
+        create(A, ORDERS, 100),
+        create(A, ITEMS, 110),
+        write(A, ORDERS, 1, 120),
+        pull(B, A),
+        pull(C, A),
+        drop_coll(B, ITEMS, 170),
+        write(C, ORDERS, 0, 190),
+        pull(B, C),
+        retention(B, 1730),
+    ];
+    let after = [write(A, ITEMS, 5, 1800), write(A, ITEMS, 6, 1801)];
+    let mut rewound = vec![rewind(B, 1757)];
+    rewound.extend(after);
+    row(
+        "a rewind after retention",
+        &pre,
+        &[("rewound after the pass", rewound), ("control: not rewound", after.to_vec())],
+        &[(ORDERS, Some(&[0, 1])), (ITEMS, Some(&[5, 6]))],
+    );
+}
+
+/// Every route, pure entries included (no repair loop), converges and ends as `expect`.
+fn row_strict(name: &str, ops: &[Op], expect: Expect) {
+    let mut outcomes = check_routes(ops, &[Route::Entries, Route::Pages]);
+    let mut bad = Vec::new();
+    for outcome in &mut outcomes {
+        expected_end(ops, outcome, expect);
+        let failures: Vec<String> = outcome
+            .failures
+            .iter()
+            .filter(|f| f.category != Category::DocsAfterAgeOut)
+            .map(|f| format!("{:?}: {}", f.category, f.detail))
+            .collect();
+        if !failures.is_empty() {
+            bad.push(format!("{:?}: {failures:?}\n{}", outcome.route, outcome.report));
+        }
+    }
+    assert!(bad.is_empty(), "{name}:\n{}", bad.join("\n"));
+}
+
+/// The bound counts a document put back to a delete (ADR-243). B deletes `orders/1` at t120;
+/// C's t150 write of it loses on B to B's own t300 write. The rewind to t200 puts the document
+/// back to B's t120 delete, and B's coverage of C comes down to that restored entry, so B asks
+/// for C's write again and takes it over the restored tombstone. Every route, pure entries
+/// included.
+#[test]
+fn row_a_rewind_that_restores_a_document_to_a_delete_asks_again_for_a_loser_it_judged() {
+    let ops = parse(
+        "A.create(orders)@100; A.write(orders/1)@110; B<-A entries; C<-A entries; \
+         B.delete(orders/1)@120; C.write(orders/1)@150; B.write(orders/1)@300; B<-C entries; \
+         A<-C entries; B.rewind@200",
+    );
+    row_strict("a document put back to a delete", &ops, &[(ORDERS, Some(&[1]))]);
+}
+
+/// The bound never counts an entry held as state as kept (ADR-243, ADR-160). C's t150 write of
+/// `orders/1` loses on B to B's own t300 write; C's t160 and t170 rows reach B by a scoped page
+/// and are held above B's coverage of C. The rewind puts `orders/1` back to A's t110 entry;
+/// counted as kept, the held rows would keep B's coverage of C over the t150 write, and B would
+/// never ask for it again. Every route, pure entries included.
+#[test]
+fn row_a_rewind_never_counts_an_entry_held_as_state_as_kept() {
+    let pre = "A.create(orders)@100; A.write(orders/1)@110; B<-A entries; C<-A entries; \
+               C.write(orders/1)@150; B.write(orders/1)@300; B<-C entries; C.write(orders/2)@160; \
+               C.write(orders/3)@170; B<-C scoped(orders); A<-C entries";
+    let mut cluster = Cluster::new(base());
+    cluster.run(&parse(pre)).expect("the schedule runs");
+    assert!(
+        cluster.e(B as usize).held_marks().expect("marks") > 0,
+        "premise: B holds C's later rows as state"
+    );
+    row_strict(
+        "an entry held as state",
+        &parse(&format!("{pre}; B.rewind@200")),
+        &[(ORDERS, Some(&[1, 2, 3]))],
+    );
+}
+
+/// A rewind that restores a document to an entry that arrived after a retention pass, stamped
+/// below what the pass collected. B drops `items` at t170; A's t190 write is B's newest entry,
+/// so B's retention pass collects B's own drop and keeps A's write. C, cut off until then,
+/// wrote `orders/5` at t120; B takes it after the pass, below its horizon, and writes the
+/// document at t1800, above the target. The rewind restores `orders/5` to C's t120 entry and
+/// keeps no entry of B's own origin, so bounded by the restored entry alone B's coverage of its
+/// own origin would fall below its collected drop, and no peer would be told it lacks it: the
+/// bound is also never below what retention collected of the origin (ADR-243). A then writes
+/// into `items`, never having heard of the drop.
+#[test]
+fn row_a_rewind_that_restores_a_late_entry_keeps_the_coverage_of_what_retention_collected() {
+    let ops = parse(
+        "A.create(orders)@100; A.create(items)@110; B<-A entries; C<-A entries; \
+         B.drop(items)@170; A.write(orders/0)@190; B<-A entries; C.write(orders/5)@120; \
+         B.retention@1730; B<-C entries; B.write(orders/5)@1800; B.rewind@1757; \
+         A.write(items/5)@1850; A.write(items/6)@1851",
+    );
+    row(
+        "a late restored entry and a collected drop",
+        &[],
+        &[("as found", ops)],
+        &[(ORDERS, Some(&[0, 5])), (ITEMS, Some(&[5, 6]))],
+    );
+}
+
+/// A rewind that restores a document asks again for a write it judged against the write it
+/// discarded (ADR-243). B holds A's `orders/1` at t110; C's t150 write of it reaches B only
+/// after B's own t300 write, so B witnesses it without an append, having lost last-writer-wins.
+/// The rewind to t200 discards t300 and puts the document back to t110; bounded by that
+/// restored entry, B's coverage of C no longer names t150, B asks for it again and takes it.
+/// Every member ends with `1@t150.1C`, whether B alone is rewound or every member is (A's own
+/// write at t300 in the second schedule).
+#[test]
+fn row_a_rewind_that_restores_a_document_asks_again_for_a_loser_it_judged() {
+    let alone = parse(
+        "A.create(orders)@100; A.write(orders/1)@110; B<-A entries; C<-A entries; \
+         C.write(orders/1)@150; B.write(orders/1)@300; B<-C entries; A<-C entries; B.rewind@200",
+    );
+    let every = parse(
+        "A.create(orders)@100; A.write(orders/1)@110; B<-A entries; C<-A entries; \
+         C.write(orders/1)@150; A.write(orders/1)@300; B<-A entries; B<-C entries; \
+         A.rewind@200; B.rewind@200; C.rewind@200",
+    );
+    row(
+        "a restored document and a loser",
+        &[],
+        &[("B alone rewound past its own write", alone), ("every member rewound", every)],
+        &[(ORDERS, Some(&[1]))],
+    );
+}
+
+/// The same through a whole-database grant: B's coverage of C's t150 write comes from a page
+/// whose document A had already superseded at t300. The rewind puts B's document back to the
+/// t110 entry it restores, and B asks for C's write again.
+#[test]
+fn row_a_rewind_that_restores_a_document_asks_again_for_a_granted_write() {
+    let pre = parse(
+        "A.create(orders)@100; A.write(orders/1)@110; B<-A entries; C<-A entries; \
+         C.write(orders/1)@150; A<-C entries; A.write(orders/1)@300; B<-A whole",
+    );
+    row(
+        "a restored document and a grant",
+        &pre,
+        &[
+            ("every member rewound", parse("A.rewind@200; B.rewind@200; C.rewind@200")),
+            ("B alone rewound", parse("B.rewind@200")),
+        ],
+        &[(ORDERS, Some(&[1]))],
+    );
+}
+
+/// A loser above the target: lowered to the target, B asks for it again.
+#[test]
+fn row_a_rewind_lowers_a_loser_above_the_target() {
+    let pre = parse(
+        "A.create(orders)@100; A.write(orders/1)@110; B<-A entries; C<-A entries; \
+         C.write(orders/1)@250; B.write(orders/1)@300; B<-C entries; A<-C entries",
+    );
+    row(
+        "a loser above the target",
+        &pre,
+        &[("B rewound", parse("B.rewind@200"))],
+        &[(ORDERS, Some(&[1]))],
+    );
+}
+
+/// A re-fetch after a rewind never brings back a deleted document (ADR-085's class, under the
+/// operator rule `tombstone_retention_secs >= oplog_retention_secs`). C's t120 insert of
+/// `orders/1` loses on B to B's own t125 write, and B deletes the document at t130; B's t300
+/// write of `orders/3` is above the target, so the rewind restores `orders/3`.
+/// - Restored to A's t105 entry, below C's insert: B's coverage of C comes down to t105, B is
+///   served the insert again, and it loses to the tombstone, which retention has not collected.
+/// - Restored to A's t140 entry, after a retention pass that collected the delete's entry (its
+///   tombstone stays): every entry the rewind keeps or restores is above what retention
+///   collected, so above the delete and the insert before it, and the insert is not asked for.
+///
+/// No member holds `orders/1` in either.
+#[test]
+fn row_a_refetch_after_a_rewind_does_not_resurrect_a_deleted_document() {
+    let below = parse(
+        "A.create(orders)@100; A.write(orders/3)@105; B<-A entries; C<-A entries; \
+         B.write(orders/1)@125; C.write(orders/1)@120; B<-C entries; B.delete(orders/1)@130; \
+         B.write(orders/3)@300; B.rewind@200",
+    );
+    let collected = parse(
+        "A.create(orders)@100; B<-A entries; C<-A entries; B.write(orders/1)@125; \
+         C.write(orders/1)@120; B<-C entries; B.delete(orders/1)@130; A.write(orders/3)@140; \
+         B<-A entries; B.write(orders/3)@300; B.retention@1135; B.rewind@200",
+    );
+    row(
+        "a re-fetch after a rewind",
+        &[],
+        &[("restored below the insert", below), ("the delete's entry collected", collected)],
+        &[(ORDERS, Some(&[3]))],
+    );
+}
+
+/// A rewind that restores a document, where the member also keeps a later entry of the origin
+/// whose write it judged: C's t150 write of `orders/1` loses on B to B's own t300 write, and
+/// C's t180 write of `orders/2` is appended. The rewind puts `orders/1` back to A's t110 entry,
+/// but B's coverage of C cannot come below the t180 entry it keeps (invariant I), so no pull
+/// sends C's t150 write again: the entries and repaired routes end with B holding `1@t110.1A`
+/// against `1@t150.1C` on A and C. The cut digest finds the difference, and the document repair
+/// (a `Converge` pull of the collection, as the transport runs one for a confirmed digest
+/// finding, ADR-237) takes C's row: one pull writes it, and a second writes nothing.
+#[test]
+fn a_restored_document_below_a_kept_entry_of_the_judged_origin_is_healed_by_the_document_repair() {
+    let ops = parse(
+        "A.create(orders)@100; A.write(orders/1)@110; B<-A entries; C<-A entries; \
+         C.write(orders/1)@150; C.write(orders/2)@180; B.write(orders/1)@300; B<-C entries; \
+         A<-C entries; B.rewind@200",
+    );
+    let mut cluster = Cluster::new(base());
+    cluster.run(&ops).expect("the schedule runs");
+    let settled = settle(&mut cluster, Route::Repaired);
+    assert!(
+        settled.failures.iter().any(|f| f.category == Category::Docs),
+        "premise: the routes leave B behind: {:?}",
+        settled.failures
+    );
+    let orders = CollectionId::derive(DB, NAMES[ORDERS as usize]);
+    let held = |cluster: &Cluster, m: u8| {
+        let (observed, _) = cluster.observe(m as usize).expect("observe");
+        let coll = observed.collections.get(NAMES[ORDERS as usize]).expect("orders is held");
+        let (stamp, _) = coll.documents.get(&1).expect("orders/1 is held");
+        cluster.stamp(*stamp)
+    };
+    assert_eq!(held(&cluster, B), "t110.1A", "premise: B holds the restored entry");
+    assert_eq!((held(&cluster, A), held(&cluster, C)), ("t150.1C".into(), "t150.1C".into()));
+    let budget = crate::ScanBudget::default();
+    let (requester, answerer) = (cluster.e(B as usize), cluster.e(C as usize));
+    let plan =
+        requester.digest_plan(&answerer.witnessed_vector().unwrap(), None, budget).expect("a plan");
+    let reply = answerer.digest_answer(&plan.ask, budget).unwrap().expect("an answer");
+    let verdicts = requester.digest_compare(&plan, &reply, budget).unwrap();
+    assert!(
+        verdicts
+            .iter()
+            .any(|v| matches!(v.outcome, crate::DigestOutcome::Compared { equal: false, .. })),
+        "the cut digest finds it: {verdicts:?}"
+    );
+    let pull = |cluster: &Cluster| {
+        let (to, from) = (cluster.e(B as usize), cluster.e(C as usize));
+        let mut progress =
+            SnapshotProgress::of_collection_converging(orders, kimmy_core::VersionVector::new());
+        let mut applied = 0;
+        while !progress.is_complete() {
+            let page = from.snapshot_page(progress.after().cloned(), progress.scope()).unwrap();
+            applied +=
+                to.apply_snapshot_page(from.node_id(), &mut progress, &page).unwrap().applied;
+        }
+        applied
+    };
+    assert_eq!(pull(&cluster), 1, "the repair writes C's row");
+    assert_eq!(held(&cluster, B), "t150.1C");
+    assert_eq!(pull(&cluster), 0, "a second repair writes nothing: no loop");
+}
+
+/// The insert a rewind removes was judged against a write at or below the target. C inserts
+/// `orders/1` at t150; B takes an insert of it stamped t300 first (its own, or A's), and C's
+/// loses last-writer-wins there, witnessed without an append. B's oplog holds no entry of the
+/// document at or below the target t200, so the rewind removes it. C's t150 write is at or below
+/// the target and is kept, so every member ends holding it: whether B alone is rewound, or every
+/// member is (A and B remove the document, C keeps its own), or every member is after A's t300
+/// insert reached C as well (C puts its own t150 entry back). By pure entries too: B and A ask
+/// again for C's write (ADR-246).
+#[test]
+fn row_a_rewind_that_removes_a_document_keeps_a_judged_write_at_or_below_the_target() {
+    let alone = parse(
+        "A.create(orders)@100; B<-A entries; C<-A entries; C.write(orders/1)@150; \
+         B.write(orders/1)@300; B<-C entries; A<-C entries; B.rewind@200",
+    );
+    let every = parse(
+        "A.create(orders)@100; B<-A entries; C<-A entries; C.write(orders/1)@150; \
+         A.write(orders/1)@300; B<-A entries; B<-C entries; A.rewind@200; B.rewind@200; \
+         C.rewind@200",
+    );
+    let every_c_lost = parse(
+        "A.create(orders)@100; B<-A entries; C<-A entries; C.write(orders/1)@150; \
+         A.write(orders/1)@300; B<-A entries; C<-A entries; B<-C entries; A<-C entries; \
+         A.rewind@200; B.rewind@200; C.rewind@200",
+    );
+    row_strict_each(
+        "a removal and a judged write",
+        &[
+            ("B alone rewound past its own insert", alone),
+            ("every member rewound", every),
+            ("every member rewound, C's write lost on C too", every_c_lost),
+        ],
+        &[(ORDERS, Some(&[1]))],
+    );
+}
+
+/// The same schedules, and then a rewound member writes again. Whatever the removal leaves on
+/// a rewound member must not delete C's kept t150 write on the members that hold it, once that
+/// member's coverage moves past it.
+#[test]
+fn row_a_rewind_that_removes_a_document_deletes_no_kept_write_once_the_member_writes_again() {
+    let alone = "A.create(orders)@100; B<-A entries; C<-A entries; C.write(orders/1)@150; \
+                 B.write(orders/1)@300; B<-C entries; A<-C entries; B.rewind@200";
+    let every = "A.create(orders)@100; B<-A entries; C<-A entries; C.write(orders/1)@150; \
+                 A.write(orders/1)@300; B<-A entries; B<-C entries; A.rewind@200; B.rewind@200; \
+                 C.rewind@200";
+    row_strict_each(
+        "a removal, a judged write, and a later write",
+        &[
+            ("B alone rewound, then B writes", parse(&format!("{alone}; B.write(orders/2)@400"))),
+            (
+                "every member rewound, then B writes",
+                parse(&format!("{every}; B.write(orders/2)@400")),
+            ),
+            (
+                "every member rewound, then A writes",
+                parse(&format!("{every}; A.write(orders/2)@400")),
+            ),
+        ],
+        &[(ORDERS, Some(&[1, 2]))],
+    );
+}
+
+/// A removal does not bring back a document a delete at or below the target removed. C inserts
+/// `orders/1` at t120 and B deletes it at t130; A takes the delete, C does not. B inserts it
+/// again at t300, over its tombstone, and a retention pass collects every entry of B's at or
+/// below t135. The rewind to t200 finds no entry of the document at or below the target and
+/// removes it; the document was deleted at the target, so no member ends holding it, C's stale
+/// t120 copy included.
+#[test]
+fn row_a_rewind_that_removes_a_document_brings_back_no_deleted_one() {
+    let ops = parse(
+        "A.create(orders)@100; B<-A entries; C<-A entries; C.write(orders/1)@120; B<-C entries; \
+         A<-C entries; B.delete(orders/1)@130; A<-B entries; A.write(orders/3)@140; \
+         B<-A entries; B.write(orders/1)@300; B.retention@1135; B.rewind@200",
+    );
+    row_strict_each(
+        "a removal over a deleted document",
+        &[("A holds the delete", ops)],
+        &[(ORDERS, Some(&[3]))],
+    );
+}
+
+/// A document deleted at the target keeps its delete's own tombstone. A and C miss B's t130
+/// delete of `orders/1`; B inserts it again at t300 and is rewound to t200. The delete's entry
+/// is at or below the target, so the rewind puts the document back to it, a tombstone at the
+/// delete's stamp, which A and C take by entries over C's t120 copy. Removed instead, the
+/// delete would be forgotten, and C's copy would come back to every member.
+#[test]
+fn row_a_rewind_keeps_the_tombstone_of_a_document_deleted_at_the_target() {
+    let ops = parse(
+        "A.create(orders)@100; B<-A entries; C<-A entries; C.write(orders/1)@120; B<-C entries; \
+         A<-C entries; B.delete(orders/1)@130; A.write(orders/3)@140; B<-A entries; \
+         B.write(orders/1)@300; B.rewind@200",
+    );
+    row_strict_each(
+        "a document deleted at the target",
+        &[("B alone rewound", ops)],
+        &[(ORDERS, Some(&[3]))],
+    );
+}
+
+/// A removed row that is itself a tombstone bounds the vectors as a live one does. B inserts
+/// `orders/1` at t300 and deletes it at t310, both after the target; C's t150 insert, judged
+/// against B's, reaches B in between. The rewind removes B's tombstone row, and B asks C again
+/// for its write by entries.
+#[test]
+fn row_a_rewind_that_removes_a_deleted_document_asks_again_for_a_judged_write() {
+    let ops = parse(
+        "A.create(orders)@100; B<-A entries; C<-A entries; C.write(orders/1)@150; \
+         B.write(orders/1)@300; B<-C entries; A<-C entries; B.delete(orders/1)@310; B.rewind@200",
+    );
+    row_strict_each(
+        "a removed tombstone row",
+        &[("B alone rewound", ops)],
+        &[(ORDERS, Some(&[1]))],
+    );
+}
+
+/// A judged write above a non-zero horizon still comes back by pure entries (ADR-246). B's
+/// retention pass collects its own t155 entry, so the horizon is t155; C's t170 write of
+/// `orders/1` loses on B to B's own t300 insert. The rewind to t200 removes the document and
+/// floors at the horizon, below C's write, which B asks for again and takes.
+#[test]
+fn row_a_rewind_that_removes_a_document_asks_again_for_a_judged_write_above_the_horizon() {
+    let ops = parse(
+        "A.create(orders)@100; B<-A entries; C<-A entries; B.write(orders/2)@155; A<-B entries; \
+         C<-B entries; C.write(orders/1)@170; B.write(orders/1)@300; B<-C entries; A<-C entries; \
+         B.retention@1160; B.rewind@200",
+    );
+    row_strict("a judged write above the horizon", &ops, &[(ORDERS, Some(&[1, 2]))]);
+}
+
+/// A judged write at or below the horizon that arrived on time stays covered, and the
+/// divergence check's repair heals it (accepted, ADR-246). C's t150 write of `orders/1` reaches
+/// B before any retention pass and loses to B's own t300 insert; B's pass then collects its own
+/// t155 entry, so the horizon is t155, above C's write. The rewind to t200 removes the document
+/// and floors at the horizon: pure entries leave B without C's write, and the repaired and pages
+/// routes converge. A target this close to the horizon is what it takes.
+#[test]
+fn a_removal_leaves_an_on_time_judged_write_at_or_below_the_horizon_to_the_repair() {
+    let ops = parse(
+        "A.create(orders)@100; B<-A entries; C<-A entries; C.write(orders/1)@150; \
+         B.write(orders/2)@155; A<-B entries; C<-B entries; B.write(orders/1)@300; B<-C entries; \
+         A<-C entries; B.retention@1160; B.rewind@200",
+    );
+    let expect: Expect = &[(ORDERS, Some(&[1, 2]))];
+    for mut outcome in check_routes(&ops, &[Route::Entries, Route::Pages]) {
+        expected_end(&ops, &mut outcome, expect);
+        let failures: Vec<(Category, String)> = outcome
+            .failures
+            .iter()
+            .filter(|f| f.category != Category::DocsAfterAgeOut)
+            .map(|f| (f.category, f.detail.clone()))
+            .collect();
+        if outcome.route == Route::Entries {
+            assert!(
+                failures
+                    .iter()
+                    .any(|(c, d)| *c == Category::LostWrite && d.starts_with("B lacks orders/1")),
+                "pinned: pure entries leave B without C's write: {failures:?}\n{}",
+                outcome.report
+            );
+        } else {
+            assert!(
+                failures.is_empty(),
+                "{:?} converges: {failures:?}\n{}",
+                outcome.route,
+                outcome.report
+            );
+        }
+    }
+}
+
+/// A removal beside a late restored entry keeps what retention collected covered (ADR-243,
+/// ADR-246). C's t120 insert of `orders/5` reaches B only after B's retention pass, below its
+/// horizon; B then writes `orders/5` and inserts `orders/9` after the target. The rewind puts
+/// `orders/5` back to C's late entry and removes `orders/9`, so the floor is the late entry,
+/// below the horizon, and only the bound's `collected` term keeps B's own collected drop of
+/// `items` covered.
+#[test]
+fn row_a_removal_beside_a_late_restored_entry_keeps_the_members_collected_drop() {
+    let ops = parse(
+        "A.create(orders)@100; A.create(items)@110; B<-A entries; C<-A entries; \
+         B.drop(items)@170; A.write(orders/0)@190; B<-A entries; C.write(orders/5)@120; \
+         B.retention@1730; B<-C entries; B.write(orders/5)@1800; B.write(orders/9)@1801; \
+         B.rewind@1757; A.write(items/5)@1850; A.write(items/6)@1851",
+    );
+    row(
+        "a removal beside a late restored entry",
+        &[],
+        &[("B's later writes discarded", ops)],
+        &[(ORDERS, Some(&[0, 5])), (ITEMS, Some(&[5, 6]))],
+    );
+}
+
+/// A removal beside a restored entry below the horizon floors at that entry, not at the horizon
+/// (ADR-246). C's t120 insert of `orders/5` reaches B late, below B's horizon t170; A's t150
+/// insert of the same document reaches B only after B's own t1800 write of it, loses there and
+/// is witnessed only. The rewind puts `orders/5` back to C's t120 entry and removes `orders/9`:
+/// floored at t120, B asks A again for its t150 write and takes it, by pure entries; floored at
+/// the horizon, B would keep claiming it.
+#[test]
+fn row_a_removal_beside_a_restored_entry_below_the_horizon_floors_at_that_entry() {
+    let ops = parse(
+        "A.create(orders)@100; B<-A entries; C<-A entries; C.write(orders/5)@120; \
+         A.write(orders/5)@150; B.write(orders/1)@170; B.write(orders/2)@190; B.retention@1730; \
+         B<-C entries; B.write(orders/5)@1800; B<-A entries; B.write(orders/9)@1801; \
+         B.rewind@1757",
+    );
+    row_strict(
+        "a removal beside a restored entry below the horizon",
+        &ops,
+        &[(ORDERS, Some(&[1, 2, 5]))],
+    );
+}
+
+/// A removal asks again for nothing at or below the oplog horizon (ADR-246). C's t110 insert of
+/// `orders/1` loses on B to B's t120 write and is witnessed only, so B appends no entry of C's.
+/// B deletes the document at t130, every member applies the delete, and B's retention pass
+/// collects the delete's entry and its tombstone (a one-second tombstone window here); C's
+/// pass has not run. B inserts `orders/7` at t300 and is rewound to t200, which removes it.
+/// Bounded below the horizon, B's coverage of C would fall to zero and B would take C's t110
+/// insert back from C's oplog, and the count repair would spread it to every member.
+#[test]
+fn a_removal_does_not_ask_below_the_horizon_for_an_insert_whose_delete_was_collected() {
+    let base = base();
+    let mut cluster = Cluster::new(base);
+    cluster
+        .run(&parse(
+            "A.create(orders)@100; B<-A entries; C<-A entries; C.write(orders/1)@110; \
+             B.write(orders/1)@120; B<-C entries; B.delete(orders/1)@130; B.write(orders/3)@140; \
+             C<-B entries; A<-B entries; A<-C entries; C<-A entries",
+        ))
+        .expect("the schedule runs");
+    let collect = |cluster: &Cluster, m: u8| {
+        cluster
+            .e(m as usize)
+            .collect_garbage_at(base + 1135, RetentionPolicy::new(1, 1))
+            .expect("a retention pass");
+    };
+    let holds = |cluster: &Cluster, m: u8| {
+        let e = cluster.e(m as usize);
+        let coll = e.get_collection(DB, NAMES[ORDERS as usize]).unwrap();
+        crate::docs::record_stamp(e, &coll, &DocId::Int64(1)).unwrap().is_some()
+            && e.get(&coll, &DocId::Int64(1)).unwrap().is_some()
+    };
+    collect(&cluster, B);
+    assert!([A, B, C].iter().all(|m| !holds(&cluster, *m)), "premise: every member deleted it");
+    cluster.run(&parse("B.write(orders/7)@300; B.rewind@200")).expect("the rewind runs");
+    cluster.run(&parse("B<-C entries")).expect("B pulls C before C's pass");
+    assert!(!holds(&cluster, B), "B takes back nothing at or below its horizon");
+    collect(&cluster, A);
+    collect(&cluster, C);
+    let settled = settle(&mut cluster, Route::Repaired);
+    assert!(
+        [A, B, C].iter().all(|m| !holds(&cluster, *m)),
+        "no member holds the deleted document: {:?}",
+        settled.failures.iter().map(|f| (f.category, f.detail.clone())).collect::<Vec<_>>()
+    );
+}
+
+/// A removal after a retention pass keeps what retention collected covered (ADR-243): the
+/// case of `row_a_rewind_after_retention_keeps_the_members_collected_drop`, with an insert of
+/// B's after the target that the rewind removes. Bounded by what it keeps alone, B's own
+/// origin, every entry of which retention collected, would fall below its collected drop.
+#[test]
+fn row_a_rewind_that_removes_a_document_after_retention_keeps_the_members_collected_drop() {
+    let ops = vec![
+        create(A, ORDERS, 100),
+        create(A, ITEMS, 110),
+        write(A, ORDERS, 1, 120),
+        pull(B, A),
+        pull(C, A),
+        drop_coll(B, ITEMS, 170),
+        write(C, ORDERS, 0, 190),
+        pull(B, C),
+        retention(B, 1730),
+        write(B, ORDERS, 7, 1760),
+        rewind(B, 1757),
+        write(A, ITEMS, 5, 1800),
+        write(A, ITEMS, 6, 1801),
+    ];
+    row(
+        "a removal after retention",
+        &[],
+        &[("B's insert after the target removed", ops)],
+        &[(ORDERS, Some(&[0, 1])), (ITEMS, Some(&[5, 6]))],
+    );
+}
+
+/// A judged write below a kept entry of its origin (accepted, ADR-246). C writes `orders/1` at
+/// t150, which loses on B to B's own t300 insert, and `orders/2` at t180, which B appends. The
+/// rewind removes `orders/1`, but invariant I keeps B's coverage of C at the t180 entry it
+/// keeps, above the judged write, so pure entries never send it again. The divergence check's
+/// count half does: B holds one document fewer than its peers, and the replay from the
+/// collection's creation brings C's write to a row B no longer holds.
+#[test]
+fn row_a_rewind_that_removes_a_document_below_a_kept_entry_of_the_judged_origin() {
+    let ops = parse(
+        "A.create(orders)@100; B<-A entries; C<-A entries; C.write(orders/1)@150; \
+         C.write(orders/2)@180; B.write(orders/1)@300; B<-C entries; A<-C entries; B.rewind@200",
+    );
+    row(
+        "a removal and a judged write below a kept entry",
+        &[],
+        &[("B alone rewound", ops)],
+        &[(ORDERS, Some(&[1, 2]))],
+    );
+}
+
+/// The residual of a removal (accepted as ADR-085's stale-rejoiner class, ADR-246), pinned by
+/// its exact shape so that a change in it shows. C inserts `orders/1` at t120 and B deletes it
+/// at t130; neither A nor C takes the delete before B's retention pass collects its entry. B
+/// inserts the document again at t300, over its tombstone, and is rewound to t200: its oplog
+/// holds no entry of the document at or below the target, so the rewind removes it, and the
+/// delete, which only B applied and whose tombstone B replaced, is forgotten. A and C, which
+/// missed the delete for longer than B's oplog window, hold the document from before it, and
+/// it comes back to every member on the repaired and the pages routes.
+#[test]
+fn residual_a_rewind_forgets_a_delete_only_the_rewound_member_applied() {
+    let ops = parse(
+        "A.create(orders)@100; B<-A entries; C<-A entries; C.write(orders/1)@120; \
+         B<-C entries; A<-C entries; B.delete(orders/1)@130; A.write(orders/3)@140; \
+         B<-A entries; B.write(orders/1)@300; B.retention@1135; B.rewind@200",
+    );
+    for outcome in check_routes(&ops, &[Route::Entries, Route::Pages]) {
+        if outcome.route == Route::Entries {
+            continue;
+        }
+        let found: Vec<(Category, String)> =
+            outcome.failures.iter().map(|f| (f.category, f.detail.clone())).collect();
+        let expected: Vec<(Category, String)> = ["A", "B", "C"]
+            .into_iter()
+            .map(|m| {
+                (
+                    Category::LostDelete,
+                    format!("{m} holds orders/1 at t120.1C, which a delete at t130.1B removed"),
+                )
+            })
+            .collect();
+        assert_eq!(
+            found, expected,
+            "{:?}: the residual's exact shape\n{}",
+            outcome.route, outcome.report
+        );
+    }
+}
+
+/// A rewind puts back no version of a life a drop ended. B writes `items/1` at t120 and drops
+/// `items` at t260; C takes both and creates `items` again at t330. A, which never heard of the
+/// drop, writes `items/1` at t386 and C takes it into the life standing there. A's rewind to
+/// t352 discards t386, which C holds, so every member is rewound to t352. C's oplog still holds
+/// B's t120 entry, the latest of the document at or below the target, but it is of the life
+/// the drop at t260 ended: at t352 the document did not exist in the standing life, so every
+/// member ends without it. By pure entries too. The drop reaches C by entries, by a
+/// whole-database page (no drop entry in C's oplog), or as the database's drop.
+#[test]
+fn row_a_rewind_puts_back_no_version_of_a_life_a_drop_ended() {
+    let tail = "C.create(items)@330; A.write(items/1)@386; C<-A entries; A.rewind@352; \
+                B.rewind@352; C.rewind@352";
+    row_strict_each(
+        "a version of an ended life",
+        &[
+            (
+                "the drop by entries",
+                parse(&format!(
+                    "A.create(items)@100; B<-A entries; C<-A entries; B.write(items/1)@120; \
+                     B.drop(items)@260; C<-B entries; {tail}"
+                )),
+            ),
+            (
+                "the drop by a whole-database page",
+                parse(&format!(
+                    "A.create(items)@100; B<-A entries; C<-A entries; B.write(items/1)@120; \
+                     C<-B entries; B.drop(items)@260; C<-B whole; {tail}"
+                )),
+            ),
+            (
+                "the database's drop",
+                parse(&format!(
+                    "A.create(items)@100; B<-A entries; C<-A entries; B.write(items/1)@120; \
+                     B.dropdb@260; C<-B entries; {tail}"
+                )),
+            ),
+        ],
+        &[(ITEMS, Some(&[]))],
+    );
+}
+
+/// The same, with the write into the standing life a replacement: A held `items/1` in the life
+/// the drop ended, so its t386 write is a `Replace`. C's oplog holds no entry of the document in
+/// the standing life at or below the target, and a replacement says the document had a value
+/// before it, which C does not hold: C refuses the rewind and names the document, as it refuses
+/// one whose earlier value was collected or is held only as a page's state (ADR-044). A guess of
+/// "absent" would be wrong for a page's row, which is a `Replace` with no history behind it.
+/// Every member then ends with A's t386 write, which C still holds. Whether C held the document
+/// in the ended life or not, and with the ended life's write stamped in the drop's own
+/// millisecond (a tie on the `Hlc` is the drop's, ADR-236).
+#[test]
+fn row_a_rewind_refuses_a_replacement_whose_only_earlier_version_is_of_an_ended_life() {
+    let tail = "C.create(items)@330; A.write(items/1)@386; C<-A entries; A.rewind@352; \
+                B.rewind@352; C.rewind@352";
+    let variants = [
+        (
+            "C held the document in the ended life",
+            format!(
+                "A.create(items)@100; B<-A entries; C<-A entries; C.write(items/1)@120; \
+                 A<-C entries; B.drop(items)@260; C<-B entries; {tail}"
+            ),
+        ),
+        (
+            "C never held it",
+            format!(
+                "A.create(items)@100; B<-A entries; C<-A entries; A.write(items/1)@120; \
+                 B.drop(items)@260; C<-B entries; {tail}"
+            ),
+        ),
+        (
+            "the ended life's write in the drop's millisecond",
+            format!(
+                "A.create(items)@100; B<-A entries; C<-A entries; A.write(items/1)@260; \
+                 C<-A entries; B.drop(items)@260; C<-B entries; {tail}"
+            ),
+        ),
+    ];
+    for (variant, schedule) in variants {
+        let ops = parse(&schedule);
+        let mut outcomes = check_routes(&ops, &[Route::Entries, Route::Pages]);
+        let mut bad = Vec::new();
+        for outcome in &mut outcomes {
+            expected_end(&ops, outcome, &[(ITEMS, Some(&[1]))]);
+            let failures: Vec<String> = outcome
+                .failures
+                .iter()
+                .filter(|f| f.category != Category::DocsAfterAgeOut)
+                .map(|f| format!("{:?}: {}", f.category, f.detail))
+                .collect();
+            let held = ["  A:", "  B:", "  C:"].iter().all(|m| {
+                outcome.report.lines().any(|l| {
+                    l.starts_with(m) && l.contains("items:") && l.contains("docs [1@t386.1A]")
+                })
+            });
+            // The repaired route's notes are the repair's own; the schedule's are on the others.
+            let refused = outcome.route == Route::Repaired
+                || outcome.report.contains("C rewind to t352 refused")
+                    && outcome.report.contains("not in this member's oplog");
+            if !failures.is_empty() || !held || !refused {
+                bad.push(format!(
+                    "{:?}: {failures:?}, every member holds t386: {held}, C refused: {refused}\n{}",
+                    outcome.route, outcome.report
+                ));
+            }
+        }
+        assert!(
+            bad.is_empty(),
+            "a replacement in the standing life / {variant}:\n{}",
+            bad.join("\n")
+        );
+    }
+}
+
+/// An entry stamped in the drop's own millisecond is of the life the drop ended (a tie on the
+/// `Hlc` is the drop's, ADR-236). C writes `items/1` at t260 and B drops `items` at t260, both
+/// minted without having seen the other; C takes the drop, which removes its write, and creates
+/// `items` again at t330. The rewind to t352 does not put C's t260 version back. By pure entries
+/// too.
+#[test]
+fn row_a_rewind_takes_an_entry_in_the_drops_millisecond_as_the_ended_lifes() {
+    let ops = parse(
+        "A.create(items)@100; B<-A entries; C<-A entries; C.write(items/1)@260; \
+         B.drop(items)@260; C<-B entries; C.create(items)@330; A.write(items/1)@386; \
+         C<-A entries; A.rewind@352; B.rewind@352; C.rewind@352",
+    );
+    row_strict_each("a tie with the drop", &[("every member rewound", ops)], &[(ITEMS, Some(&[]))]);
+}
+
+/// A write made after a drop by a member that never heard of it, before the collection was
+/// created again, is of the standing life (ADR-236 keeps it), though it predates the creation:
+/// the rewind puts it back. A writes `items/2` at t290, after B's drop at t260; C creates
+/// `items` at t330 and takes it, then A's t386 replacement. Every member ends with `2@t290`. B,
+/// which dropped the collection, judges A's t290 write before it holds the new life, and pure
+/// entries do not bring it back to B with no rewind either; the repair loop and pages do.
+#[test]
+fn row_a_rewind_puts_back_a_write_made_after_the_drop_before_the_re_creation() {
+    let ops = parse(
+        "A.create(items)@100; B<-A entries; C<-A entries; B.drop(items)@260; \
+         A.write(items/2)@290; C<-B entries; C.create(items)@330; C<-A entries; \
+         A.write(items/2)@386; C<-A entries; A.rewind@352; B.rewind@352; C.rewind@352",
+    );
+    row(
+        "a write between the drop and the re-creation",
+        &[],
+        &[("every member rewound", ops)],
+        &[(ITEMS, Some(&[2]))],
+    );
+}
+
+/// The removal of an ended life's version composes with ADR-246's: a write of the standing life
+/// at or below the target that C judged against the write the rewind discards is taken again.
+/// B writes `items/1` at t340 into the life C created; it reaches C after A's t386 write and
+/// loses there. C's rewind removes the document (its t120 entry is of the ended life) and asks
+/// B again, by entries, for what it judged. Every member ends with `1@t340`. By pure entries
+/// too.
+#[test]
+fn row_a_rewind_that_removes_an_ended_lifes_version_asks_again_for_a_judged_write() {
+    let ops = parse(
+        "A.create(items)@100; B<-A entries; C<-A entries; B.write(items/1)@120; \
+         B.drop(items)@260; C<-B entries; C.create(items)@330; B<-C entries; \
+         B.write(items/1)@340; A.write(items/1)@386; C<-A entries; C<-B entries; \
+         A.rewind@352; B.rewind@352; C.rewind@352",
+    );
+    row_strict_each(
+        "an ended life's version and a judged write",
+        &[("every member rewound", ops)],
+        &[(ITEMS, Some(&[1]))],
+    );
+}
+
+/// The control: a version of the standing life at or below the target is put back. C writes
+/// `items/1` at t340 into the life it created at t330, and the rewind to t352 puts it back on
+/// every member, B's t120 version of the ended life notwithstanding.
+#[test]
+fn row_a_rewind_puts_back_the_standing_lifes_version_over_an_ended_lifes() {
+    let ops = parse(
+        "A.create(items)@100; B<-A entries; C<-A entries; B.write(items/1)@120; \
+         B.drop(items)@260; C<-B entries; C.create(items)@330; C.write(items/1)@340; \
+         A.write(items/1)@386; C<-A entries; A.rewind@352; B.rewind@352; C.rewind@352",
+    );
+    row_strict_each(
+        "the standing life's version",
+        &[("every member rewound", ops)],
+        &[(ITEMS, Some(&[1]))],
+    );
+}
+
 /// ADR-236's residual 1, accepted as by design (ruled 2026-10-15), pinned by its exact shape
 /// so that a change in it shows. A drops the database while holding `items`, and buries it with
 /// an entry of its own stamp (t130.2A). B drops the database later, never having held `items`,
@@ -3331,7 +4219,12 @@ pub(crate) fn enumerate(alphabet: &[Step], depth: usize) -> Vec<Vec<Op>> {
                 next.knows[to] |= k.knows[from];
                 next.may_hold[to] |= k.may_hold[from];
             }
-            Restart { m } | Gc { m } | AgeOut { m } | Purge { m } => {
+            Restart { m }
+            | Gc { m }
+            | AgeOut { m }
+            | Purge { m }
+            | Retention { m }
+            | Rewind { m } => {
                 if k.knows[m as usize] == 0 {
                     return None;
                 }

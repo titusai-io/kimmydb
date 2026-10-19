@@ -549,7 +549,7 @@ mod tests {
             let (engine, _, dir) = engine_with(10);
             let orders = engine.get_collection("shop", "orders").unwrap();
             // Keyed writes, so retention's records step has rows to be stopped
-            // among (B5).
+            // among (ADR-240).
             for n in 0..3u8 {
                 let keyed = crate::KeyedWrite::new(
                     kimmy_core::ScopeHash([n; 32]),

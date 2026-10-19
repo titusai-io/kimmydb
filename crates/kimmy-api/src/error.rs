@@ -33,7 +33,7 @@ use tracing::{Level, error, info, warn};
 pub const COLLECTION_PURGING_RETRY_AFTER_SECS: u64 = 5;
 
 /// The `Retry-After` an `idempotency_key_in_flight` refusal carries, in
-/// seconds (B5): a chunk of a multi-document write commits in far less, so a
+/// seconds (ADR-240): a chunk of a multi-document write commits in far less, so a
 /// second is a wait that usually finds the request done.
 pub const IDEMPOTENCY_KEY_IN_FLIGHT_RETRY_AFTER_SECS: u64 = 1;
 
@@ -110,16 +110,16 @@ pub enum ErrorCode {
     ResolverBusy,
     /// An `Idempotency-Key` this member remembers for a different request:
     /// another body, path, query or method under the same key, collection and
-    /// principal (B5). Nothing was written.
+    /// principal (ADR-240). Nothing was written.
     IdempotencyKeyReused,
     /// A multi-chunk request with this `Idempotency-Key` is still running on
-    /// this member (B5). Nothing was written; once it ends, the same request
+    /// this member (ADR-240). Nothing was written; once it ends, the same request
     /// is answered from its record.
     IdempotencyKeyInFlight,
     /// A gate that reads every live member's facts block (ADR-201) is closed
     /// only because a live member has not been heard from yet: it came up, or
     /// this member saw it rejoin, a moment ago, and its block arrives at the
-    /// next contact. The idempotency-key gate (B5) and the `Decimal128` gate
+    /// next contact. The idempotency-key gate (ADR-240) and the `Decimal128` gate
     /// (ADR-238). Nothing was looked up or written; the same request, sent
     /// again after `Retry-After`, is taken once it has been heard.
     PeerUnheard,
@@ -340,12 +340,12 @@ impl ErrorCode {
             // The request with this key is running here and ends by itself; the
             // same request sent once it has is answered from its record. Not
             // `elsewhere`: another member that has not received the record
-            // would apply the request a second time (B5, guarantee 3).
+            // would apply the request a second time (ADR-240, guarantee 3).
             Self::IdempotencyKeyInFlight => Retry::Wait,
             // The peer's block arrives with its next contact, about a sync
             // interval away, and the gate opens here then. Not `elsewhere`: a
             // keyed retry must stay on the member that may hold its record
-            // (B5, guarantee 3), and every member that restarted or saw a
+            // (ADR-240, guarantee 3), and every member that restarted or saw a
             // rejoin is in the same window.
             Self::PeerUnheard => Retry::Wait,
             // It may already have happened, and replicates if it did: read
@@ -853,7 +853,7 @@ impl ApiError {
         e
     }
 
-    /// `422 idempotency_key_reused` (B5): the key is remembered here for a
+    /// `422 idempotency_key_reused` (ADR-240): the key is remembered here for a
     /// request whose fingerprint differs from this one's, or its record is
     /// contested, two requests having met under it
     /// (`StorageError::IdempotencyKeyReused`).
@@ -867,7 +867,7 @@ impl ApiError {
         )
     }
 
-    /// `409 idempotency_key_in_flight` (B5): a multi-chunk request with this
+    /// `409 idempotency_key_in_flight` (ADR-240): a multi-chunk request with this
     /// key is running on this member. `Retry-After: 1`: the request ends by
     /// itself, and the same request sent then is answered from its record
     /// (`StorageError::IdempotencyKeyInFlight`).
@@ -886,8 +886,7 @@ impl ApiError {
 
     /// `503 peer_unheard`, `retry: wait` (see [`ErrorCode::PeerUnheard`]): a
     /// gate closed only because a live member has not been heard from yet.
-    /// `Retry-After` is the gate's own figure, one sync interval in whole
-    /// seconds, never 0; `message` is the gate's words, which name the member.
+    /// `Retry-After` is the gate's own figure, a fixed second, never 0; `message` is the gate's words, which name the member.
     pub fn peer_unheard(message: impl Into<String>, retry_after_secs: u64) -> Self {
         Self {
             retry_after_secs: Some(retry_after_secs.max(1)),
@@ -1075,7 +1074,7 @@ impl From<CoreError> for ApiError {
             // request names a `Decimal128` id or partial-filter bound, and
             // the answer names `cluster.decimal128` and any peer that holds
             // it back. A live peer not heard from yet, with no held block
-            // saying no, ends by itself within a sync interval: `503
+            // saying no, ends by itself within about a contact: `503
             // peer_unheard`, with the gate's `Retry-After`. Every other cause
             // lasts until the operator or the roll acts, so 400, never a retry
             // hint: repeating it changes nothing until then.
@@ -1127,7 +1126,7 @@ impl From<StorageError> for ApiError {
             // its own. Nothing was written, as with a busy writer, and this
             // node is going away: another member serves.
             StorageError::Stopping(reason) => ApiError::node_stopping(reason),
-            // The two answers a key can draw from the engine (B5). Nothing was
+            // The two answers a key can draw from the engine (ADR-240). Nothing was
             // written either way: a key used for another request is the
             // client's to fix, and a request still running with it ends by
             // itself.
@@ -1264,7 +1263,7 @@ mod tests {
             // Refused on purpose, with no operator action to take. The
             // default only: `vectors.rs` raises its own source above this.
             (NotImplemented, Some(LogLevel::Info)),
-            // A key at work (B5): seen, never a fault.
+            // A key at work (ADR-240): seen, never a fault.
             (IdempotencyKeyReused, Some(LogLevel::Info)),
             (IdempotencyKeyInFlight, Some(LogLevel::Info)),
             // Somebody else's fault, or nobody's; a rise is the finding.
@@ -1711,7 +1710,7 @@ mod tests {
         assert!(!failed.message.contains("shutdown deadline"), "{}", failed.message);
     }
 
-    /// The two answers a key can draw (B5), as a client meets them: the draft's
+    /// The two answers a key can draw (ADR-240), as a client meets them: the draft's
     /// statuses (§2.7), the envelope's retry class, and `Retry-After: 1` on the
     /// one that says to wait. Neither names the key: it is the client's own, and
     /// the line it logs is read by an operator.

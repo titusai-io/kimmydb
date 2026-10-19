@@ -652,6 +652,16 @@ pub async fn put_document_vectors(
                 config.dim
             )));
         }
+        // A component too large to square in a 32-bit float (above about
+        // 1.8e19, or one that parsed to infinity) makes every distance to the
+        // vector NaN, and the graph's distance asserts against that (ADR-241).
+        if !kimmy_vector::search::searchable(&chunk.vector) {
+            return Err(ApiError::bad_request(format!(
+                "chunk {} has a vector too large to score: its squared length is not a finite \
+                 32-bit float",
+                chunk.chunk
+            )));
+        }
     }
 
     let mut numbers: Vec<u32> = body.iter().map(|c| c.chunk).collect();
@@ -944,7 +954,7 @@ async fn search_hits(
     let query = resolve_query_vector(state, &config, body).await?;
     let allowed = allowed_ids(state, auth, db, coll, body.filter.as_ref())?;
 
-    let hits = knn(state, &shadow, &config, &query, &options, allowed.as_ref())?;
+    let hits = knn(state, &shadow, &config, &query, &options, allowed.as_ref()).await?;
     let hits = only_live(state, &source, hits)?;
     Ok((source, hits))
 }
@@ -990,7 +1000,7 @@ pub(crate) async fn stage_documents(
 /// The paths return the same shape and score the same way — the exact scan
 /// and the keyed join are exhaustive, the graph walk is approximate — so
 /// callers do not branch.
-fn knn(
+async fn knn(
     state: &SharedState,
     shadow: &kimmy_storage::CollectionMeta,
     config: &VectorConfig,
@@ -998,12 +1008,12 @@ fn knn(
     options: &SearchOptions,
     allowed: Option<&Allowed>,
 ) -> Result<Vec<Hit>, ApiError> {
-    knn_joined(state, shadow, config, query, options, allowed.map(|a| (a, a.join())))
+    knn_joined(state, shadow, config, query, options, allowed.map(|a| (a, a.join()))).await
 }
 
 /// [`knn`] with the join direction chosen by the caller, so a test can run
 /// both over one fixture and hold them to the same answer.
-fn knn_joined(
+async fn knn_joined(
     state: &SharedState,
     shadow: &kimmy_storage::CollectionMeta,
     config: &VectorConfig,
@@ -1011,17 +1021,40 @@ fn knn_joined(
     options: &SearchOptions,
     allowed: Option<(&Allowed, Join)>,
 ) -> Result<Vec<Hit>, ApiError> {
+    // The keyed join a filtered graph search can give way to costs its
+    // admitted set, whatever the set's size, so it reads the request's
+    // deadline itself (ADR-241): the timeout cannot end a thread that does
+    // not yield.
+    let deadline = crate::limits::request_time_left().map(|left| std::time::Instant::now() + left);
     if let Some((allowed, Join::Keyed)) = allowed {
-        return search::vector_search_among(&state.engine, shadow, query, options, &allowed.ids)
-            .map_err(vector_error);
+        return search::vector_search_among_until(
+            &state.engine,
+            shadow,
+            query,
+            options,
+            &allowed.ids,
+            deadline,
+        )
+        .map_err(vector_error);
     }
     let set = allowed.map(|(a, _)| &a.set);
     match state.vectors.access(&state.engine, shadow, config.metric, config.dim) {
-        Access::Approximate(index) => index.search(&state.engine, shadow, query, options, set),
+        Access::Approximate(index) => kimmy_storage::blocking(|| {
+            index.search_until(&state.engine, shadow, query, options, set, deadline)
+        }),
         // Every stored vector scored: a walk, off the async worker (ADR-199).
         Access::Exact => kimmy_storage::blocking(|| {
             search::vector_search(&state.engine, shadow, query, options, set)
         }),
+        // No graph yet, and one is being built (ADR-245): every stored vector
+        // scored, as above, but in a turn of the collection's few at once,
+        // awaited, and under the request's deadline.
+        Access::Building => {
+            state
+                .vectors
+                .scan_while_building(&state.engine, shadow, query, options, set, deadline)
+                .await
+        }
     }
     .map_err(vector_error)
 }
@@ -1064,7 +1097,7 @@ pub async fn run_hybrid_search(
     // a document ranked modestly by both should be able to beat one ranked
     // first by only one.
     let wide = SearchOptions { k: (options.k * 4).min(MAX_K), ..options.clone() };
-    let dense = knn(state, &shadow, &config, &query, &wide, allowed.as_ref())?;
+    let dense = knn(state, &shadow, &config, &query, &wide, allowed.as_ref()).await?;
     // The overlap gate applies to the lexical half only. A document it drops
     // here is still in `dense` if the dense half ranked it, and keeps that
     // contribution: the gate removes lexical evidence, not documents.
@@ -1183,6 +1216,12 @@ async fn resolve_query_vector(
                 config.dim
             )));
         }
+        if !kimmy_vector::search::searchable(vector) {
+            return Err(ApiError::bad_request(
+                "query vector is too large to score: its squared length is not a finite 32-bit \
+                 float",
+            ));
+        }
         return Ok(vector.clone());
     }
 
@@ -1207,7 +1246,7 @@ async fn resolve_query_vector(
         None => text.clone(),
     };
     let mut vectors = provider.embed(std::slice::from_ref(&text)).await.map_err(vector_error)?;
-    vectors.pop().ok_or_else(|| {
+    let vector = vectors.pop().ok_or_else(|| {
         // The upstream's fault like every other `provider_error` — a
         // well-formed answer with the vector missing from it — so it takes
         // that code's level unchanged, and no override belongs here.
@@ -1216,7 +1255,16 @@ async fn resolve_query_vector(
             ErrorCode::ProviderError,
             "the embedding provider returned no vector for the query",
         )
-    })
+    })?;
+    // The same upstream fault: a vector no distance can be computed against.
+    if !kimmy_vector::search::searchable(&vector) {
+        return Err(ApiError::new(
+            StatusCode::BAD_GATEWAY,
+            ErrorCode::ProviderError,
+            "the embedding provider returned a query vector with no finite squared length",
+        ));
+    }
+    Ok(vector)
 }
 
 /// The documents a `filter` admitted, in the two shapes the join needs.
@@ -1411,6 +1459,11 @@ fn vector_error(e: kimmy_vector::VectorError) -> ApiError {
         V::Snapshot(_) => {
             ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, ErrorCode::Snapshot, e.to_string())
         }
+        // The answer a request that ran out of time gets: the search saw the
+        // deadline pass itself, where the timeout layer would have.
+        V::DeadlineExceeded => ApiError::timeout(
+            crate::limits::request_timeout().unwrap_or(crate::limits::DEFAULT_REQUEST_TIMEOUT),
+        ),
     }
 }
 
@@ -1421,6 +1474,144 @@ mod tests {
     use kimmy_core::{ChunkConfig, Metric, ProviderConfig, VectorRecord, similarity};
 
     use super::*;
+
+    /// A search that saw the request's deadline pass answers as a request
+    /// that ran out of time does: `503`, `timeout`.
+    #[test]
+    fn a_search_past_its_deadline_answers_as_a_timeout() {
+        let e = vector_error(kimmy_vector::VectorError::DeadlineExceeded);
+        let timeout = ApiError::timeout(crate::limits::DEFAULT_REQUEST_TIMEOUT);
+        assert_eq!(e.status, timeout.status);
+        assert_eq!(e.status, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(e.code, timeout.code);
+    }
+
+    /// An embedding endpoint on loopback, in the custom dialect, answering
+    /// every request with `answer`.
+    async fn embedding_stub(answer: serde_json::Value) -> String {
+        let app = axum::Router::new().route(
+            "/embed",
+            axum::routing::post(move || {
+                let answer = answer.clone();
+                async move { axum::Json(answer) }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+        format!("http://{addr}/embed")
+    }
+
+    /// **A provider's query vector too large to square, or missing from its
+    /// answer, is the provider's fault: `502` `provider_error`** (ADR-241).
+    /// The missing one is refused by the provider's own count of what it
+    /// returned, before the query sees it.
+    #[tokio::test]
+    async fn a_provider_query_vector_too_large_to_score_or_missing_answers_502() {
+        let policy = kimmy_vector::ProviderPolicy::new(
+            kimmy_vector::policy::default_allowed_key_env(),
+            vec!["127.0.0.1".into()],
+            false,
+            Default::default(),
+        )
+        .unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let state = live_state_with(&dir, policy);
+        let body = SearchRequest { query: Some("hello".into()), ..Default::default() };
+        for (answer, says) in [
+            (serde_json::json!({ "embeddings": [[3e38, 0.0]] }), "no finite squared length"),
+            (serde_json::json!({ "embeddings": [] }), "expected 1 vectors, got 0"),
+        ] {
+            let mut c = config();
+            c.provider = ProviderConfig::CustomHttp {
+                endpoint: embedding_stub(answer).await,
+                api_key_env: None,
+            };
+            let err = resolve_query_vector(&state, &c, &body).await.unwrap_err();
+            assert_eq!(err.status, StatusCode::BAD_GATEWAY, "{}", err.message);
+            assert_eq!(err.code, ErrorCode::ProviderError, "{}", err.message);
+            assert!(err.message.contains(says), "{says}: {}", err.message);
+        }
+        let mut c = config();
+        c.provider = ProviderConfig::CustomHttp {
+            endpoint: embedding_stub(serde_json::json!({ "embeddings": [[0.6, 0.8]] })).await,
+            api_key_env: None,
+        };
+        assert_eq!(resolve_query_vector(&state, &c, &body).await.unwrap(), vec![0.6, 0.8]);
+    }
+
+    /// A graph search is held to the request's deadline (ADR-241). The graph
+    /// is built over 300 documents, and the filter admits only the 100
+    /// written after it, which no walk can find: the search gives way to the
+    /// keyed join, which, run as a request whose deadline has passed, answers
+    /// `503` `timeout` naming the configured timeout, and with the deadline a
+    /// minute off answers exactly.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_graph_search_past_the_request_deadline_answers_503_timeout() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = live_state(&dir);
+        let (source, shadow) = fixture(&state, 300);
+        let config = config();
+        let query = [1.0f32, 0.0];
+        let options = SearchOptions { k: 10, metric: config.metric, per_document: 1 };
+        // The first search is answered by a scan and queues the graph's build
+        // (ADR-245), which is let finish.
+        let built = knn_joined(&state, &shadow, &config, &query, &options, None).await.unwrap();
+        assert_eq!(built.len(), 10);
+        state.vectors.settle();
+        assert_eq!(state.vectors.len(), 1, "the premise: a graph over the first 300");
+        for i in 300..400i64 {
+            state
+                .engine
+                .insert(&source, bson::doc! { "_id": i, "tag": i % 3, "text": format!("d{i}") })
+                .unwrap();
+            let record = VectorRecord {
+                source: DocId::Int64(i),
+                chunk: 0,
+                source_hlc: kimmy_core::Hlc::new(1, 0),
+                vector: vec![(i as f32 * 0.37).cos(), (i as f32 * 0.37).sin()],
+                text: format!("d{i}c0"),
+                config: None,
+            };
+            state.engine.put_vectors(&shadow, &DocId::Int64(i), &[record]).unwrap();
+        }
+        let mut allowed =
+            filter_ids(&state, &source, &parse(bson::doc! { "tag": 0 }), 1_000).unwrap();
+        allowed.ids = (300..400i64).map(DocId::Int64).collect();
+        allowed.set = allowed.ids.iter().cloned().collect();
+        let exact =
+            knn_joined(&state, &shadow, &config, &query, &options, Some((&allowed, Join::Keyed)))
+                .await
+                .unwrap();
+        let ids = |hits: &[Hit]| hits.iter().map(|h| h.id.clone()).collect::<Vec<_>>();
+
+        let timeout = std::time::Duration::from_secs(7);
+        let late = crate::limits::as_a_request(std::time::Instant::now(), timeout, async {
+            knn_joined(&state, &shadow, &config, &query, &options, Some((&allowed, Join::Discard)))
+                .await
+        })
+        .await
+        .expect_err("a graph search past the request's deadline must not answer");
+        assert_eq!(late.status, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(late.code, ErrorCode::Timeout);
+        assert!(late.message.contains("within 7 seconds"), "{}", late.message);
+
+        let far = std::time::Instant::now() + std::time::Duration::from_secs(60);
+        let inside = crate::limits::as_a_request(far, timeout, async {
+            knn_joined(&state, &shadow, &config, &query, &options, Some((&allowed, Join::Discard)))
+                .await
+        })
+        .await
+        .unwrap();
+        assert_eq!(ids(&inside), ids(&exact));
+    }
+
+    /// A search run to its end from a synchronous test.
+    fn ran<T>(search: impl std::future::Future<Output = T>) -> T {
+        tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap().block_on(search)
+    }
 
     fn live_state(dir: &tempfile::TempDir) -> SharedState {
         live_state_with(dir, kimmy_vector::ProviderPolicy::default())
@@ -1877,9 +2068,15 @@ mod tests {
             let options = SearchOptions { k, metric: config.metric, per_document };
             let expected = brute_force(&state, &shadow, &query, &options, &allowed.set);
             for join in [Join::Keyed, Join::Discard] {
-                let hits =
-                    knn_joined(&state, &shadow, &config, &query, &options, Some((&allowed, join)))
-                        .unwrap();
+                let hits = ran(knn_joined(
+                    &state,
+                    &shadow,
+                    &config,
+                    &query,
+                    &options,
+                    Some((&allowed, join)),
+                ))
+                .unwrap();
                 let got: Vec<(String, u32, f32, String)> = hits
                     .into_iter()
                     .map(|h| (h.id.to_string(), h.chunk, h.score, h.text))
@@ -1892,8 +2089,9 @@ mod tests {
         let none = filter_ids(&state, &source, &parse(bson::doc! { "tag": 7 }), 1_000).unwrap();
         for join in [Join::Keyed, Join::Discard] {
             let options = SearchOptions { k: 5, metric: config.metric, per_document: 1 };
-            let hits = knn_joined(&state, &shadow, &config, &query, &options, Some((&none, join)))
-                .unwrap();
+            let hits =
+                ran(knn_joined(&state, &shadow, &config, &query, &options, Some((&none, join))))
+                    .unwrap();
             assert!(hits.is_empty(), "{join:?}");
         }
     }
@@ -2069,7 +2267,7 @@ mod tests {
         let state = live_state(&dir);
         let (_, shadow, ids) = tenants(&state);
         let options = SearchOptions { k: 10, metric: Metric::Cosine, per_document: 1 };
-        let hits = knn(&state, &shadow, &config(), &[1.0, 0.0], &options, None).unwrap();
+        let hits = ran(knn(&state, &shadow, &config(), &[1.0, 0.0], &options, None)).unwrap();
         let mut got: Vec<(DocId, String)> = hits.into_iter().map(|h| (h.id, h.text)).collect();
         got.sort();
         // Document 4's nearest chunk is the debris that names it, wherever it
@@ -2080,7 +2278,7 @@ mod tests {
         expected.sort();
         assert_eq!(got, expected, "four documents, not one per id length");
         assert_eq!(
-            render(&knn(&state, &shadow, &config(), &[1.0, 0.0], &options, None).unwrap())["count"],
+            render(&ran(knn(&state, &shadow, &config(), &[1.0, 0.0], &options, None)).unwrap())["count"],
             4
         );
     }
@@ -2100,14 +2298,14 @@ mod tests {
         for join in [Join::Keyed, Join::Discard] {
             for per_document in [1, 3] {
                 let options = SearchOptions { k: 10, metric: Metric::Cosine, per_document };
-                let hits = knn_joined(
+                let hits = ran(knn_joined(
                     &state,
                     &shadow,
                     &config(),
                     &[1.0, 0.0],
                     &options,
                     Some((&allowed, join)),
-                )
+                ))
                 .unwrap();
                 let got: Vec<(DocId, String)> = hits.into_iter().map(|h| (h.id, h.text)).collect();
                 assert_eq!(
@@ -2146,14 +2344,14 @@ mod tests {
         assert_eq!(allowed.ids, [DocId::Int64(7)]);
         for join in [Join::Keyed, Join::Discard] {
             let options = SearchOptions { k: 10, metric: Metric::Cosine, per_document: 1 };
-            let hits = knn_joined(
+            let hits = ran(knn_joined(
                 &state,
                 &shadow,
                 &config(),
                 &[1.0, 0.0],
                 &options,
                 Some((&allowed, join)),
-            )
+            ))
             .unwrap();
             let got: Vec<(DocId, String)> = hits.into_iter().map(|h| (h.id, h.text)).collect();
             assert_eq!(got, [(DocId::Int64(7), "int seven".to_string())], "{join:?}");

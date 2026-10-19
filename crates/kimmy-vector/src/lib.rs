@@ -10,6 +10,7 @@
 #![allow(dead_code)]
 
 pub mod cache;
+mod dump;
 pub mod error;
 pub mod index;
 #[cfg(feature = "local-embeddings")]
@@ -19,7 +20,10 @@ pub mod provider;
 pub mod search;
 pub mod worker;
 
-pub use cache::{Access, DEFAULT_MAX_BYTES as DEFAULT_INDEX_CACHE_BYTES, IndexCache, Staging};
+pub use cache::{
+    Access, DEFAULT_BUILD_CONCURRENCY, DEFAULT_MAX_BYTES as DEFAULT_INDEX_CACHE_BYTES,
+    EXACT_SCANS_PER_COLLECTION, IndexCache, Staging,
+};
 pub use error::{Result, TransportKind, VectorError};
 
 /// Whether this build can embed in-process.

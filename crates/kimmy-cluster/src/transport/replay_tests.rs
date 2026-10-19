@@ -254,7 +254,7 @@ async fn an_inbound_contact_serves_the_whole_replay() {
     assert!(replay_counters().get(true, ReplayResult::Served) >= served + 3, "pages were served");
 }
 
-/// A replay brings back the records of the keyed writes it brings back (B5): a
+/// A replay brings back the records of the keyed writes it brings back (ADR-240): a
 /// member restored from a backup that lacks its own keyed writes takes them
 /// from C with their records, so a retry on it is answered from the record its
 /// own first application wrote rather than applied a second time.
@@ -283,7 +283,7 @@ async fn a_replay_brings_back_the_records_of_the_keyed_writes_it_restores() {
     }
 }
 
-/// `$inc` of `n`, for G5.
+/// `$inc` of `n`, for the replay below.
 struct IncN;
 
 impl kimmy_storage::ModifySpec for IncN {
@@ -339,7 +339,7 @@ fn pull_all(to: &Engine, from: &Engine) {
     }
 }
 
-/// G5: a member restored from a backup that lacks its own keyed `$inc` and the
+/// A member restored from a backup that lacks its own keyed `$inc` and the
 /// write it made on top, replayed by a peer whose copy of the `$inc` lost there
 /// (C wrote the document in between) and which holds the write on top. C's oplog
 /// has no entry at the `$inc`'s stamp, so the page carries only the write on top;
@@ -1493,7 +1493,7 @@ async fn a_replay_of_many_pages_is_reported_once_not_once_per_page() {
     assert!(f.catch_up.replay_first_loss_from(c), "armed afresh, it is the first again");
 }
 
-// -- B2 and m1 of the B5 build review: what a replay page carries, both ways -----------------
+// -- What a replay page carries, both ways: spanning records, records alone -----------------
 
 impl Fixture {
     /// One round the other way: A dials C, and its own round asks C for the replay
@@ -1588,7 +1588,7 @@ fn n_of(engine: &Engine, id: i64) -> i64 {
     engine.get(&coll, &kimmy_core::DocId::Int64(id)).unwrap().unwrap().get_i64("n").unwrap()
 }
 
-/// G5 with the record's rows at another origin (B2 of the build review). Q's keyed
+/// A replay page whose record has its rows only at another origin. Q's keyed
 /// update-many writes chunk 1 (d1, d2); before Q's chunk 2, the client's retry
 /// runs on R, which lacks Q's record: a fresh attempt writes d1..d4 in one chunk.
 /// Q's chunk 2 then writes d3, d4 later. The merged record's `first` (Q's first
@@ -1597,7 +1597,7 @@ fn n_of(engine: &Engine, id: i64) -> i64 {
 /// from a backup that predates all of it, and C replays R's own entries to it.
 /// With `f3`, R also writes d3, d4 after Q's chunk 2, so none of Q's entries is
 /// in R's oplog: C holds Q's rows above its servable vector, and the page carries
-/// the record by F3 (X4 of the build review's M1).
+/// the record by F3.
 fn other_origins_record(f3: bool) -> (Fixture, kimmy_storage::KeyedWrite) {
     let writer_dir = tempfile::tempdir().unwrap();
     let writer = Arc::new(Engine::open(&writer_dir.path().join("kimmy.redb")).unwrap());
@@ -1716,7 +1716,7 @@ fn the_restored_member_holds_the_effect_with_its_record(
     );
 }
 
-/// B2, the inbound way: C serves the replay on the contact it opened, and the
+/// The spanning records, the inbound way: C serves the replay on the contact it opened, and the
 /// page carries the record of the page's collection whose request spans it.
 #[tokio::test]
 async fn b2_an_inbound_replay_carries_a_record_with_no_row_of_the_requesters_origin() {
@@ -1725,7 +1725,7 @@ async fn b2_an_inbound_replay_carries_a_record_with_no_row_of_the_requesters_ori
     the_restored_member_holds_the_effect_with_its_record(&f, &k);
 }
 
-/// B2, the outbound way: A dials C and asks for its replay (`AskEntries` with
+/// The spanning records, the outbound way: A dials C and asks for its replay (`AskEntries` with
 /// `replay`), and the answer carries the record the same way.
 #[tokio::test]
 async fn b2_an_outbound_replay_carries_a_record_with_no_row_of_the_requesters_origin() {
@@ -1736,7 +1736,7 @@ async fn b2_an_outbound_replay_carries_a_record_with_no_row_of_the_requesters_or
     the_restored_member_holds_the_effect_with_its_record(&f, &k);
 }
 
-/// X4 of the build review's M1: the F3 half of a replay page. C holds Q's rows
+/// The F3 half of a replay page. C holds Q's rows
 /// above its servable vector, so the record rides the page by F3.
 #[tokio::test]
 async fn a_replay_page_carries_a_record_its_sender_cannot_vouch_for() {
@@ -1865,7 +1865,7 @@ fn plant_spanning_records(f: &Fixture, count: u16) -> Vec<kimmy_core::ScopeHash>
         .collect()
 }
 
-/// m1 of the build review, and the residual its ruling did not accept: the
+/// Records too many for a frame on a replay, and the stall this closes: the
 /// records a replay's first entry needs, all of requests that span the replay's
 /// start (carried at a `first` at or below it, so no page of records alone can
 /// move the position past them), fill more than one page. They cross on pages of
@@ -1902,7 +1902,7 @@ async fn the_records_at_an_outbound_replays_start_cross_on_several_pages() {
     the_records_at_the_replay_start_cross_on_several_pages(true).await;
 }
 
-/// B2's records ride at their `first`: a replay page that stops between a
+/// The spanning records ride at their `first`: a replay page that stops between a
 /// request's effects and its `last` stores the record with the effects. As
 /// [`other_origins_record`], with R writing into a collection Q created after
 /// the backup, between its attempt and Q's chunk 2, so the record's `last` (Q's
@@ -2010,7 +2010,7 @@ async fn pull_round(to: &Engine, from: &Engine) -> Result<SyncOutcome, ProtocolE
     outcome
 }
 
-/// m1 of the build review, on a pull: the records riding a window's first entry
+/// Records too many for a frame, on a pull: the records riding a window's first entry
 /// overfill a frame with it. Before, the answer was `fits: 0`, which the
 /// requester reads as an entry that can never replicate, every round. Now it is a
 /// partial window of records alone that ends before the first record left out:
@@ -2285,7 +2285,7 @@ fn key_of(cursor: &kimmy_storage::ReplayRecords) -> (u64, [u8; 32]) {
 }
 
 /// Every page of records alone a replay cuts **strictly advances its cursor's
-/// last key sent**, so the pages at a position end (the ruling on m1(c)): each
+/// last key sent**, so the pages at a position end: each
 /// leaves a cursor of its own position whose key is past the key of the cursor
 /// it came with. (The one page of records alone that keeps the key, a delta that
 /// fills it, is said and counted, below.)
@@ -2592,7 +2592,7 @@ fn plant_record_on_c(
 }
 
 /// A record a replay page carries twice, by the window (F3, or a row of the
-/// requester's origin inside the page) and by B2 at its `first`, is carried at
+/// requester's origin inside the page) and by the spanning rule at its `first`, is carried at
 /// the lower of the two stamps: carried at the higher, a page that stops between
 /// the two would store the effect there without its record.
 #[test]
@@ -2674,7 +2674,7 @@ fn a_page_of_records_alone_that_cannot_move_its_cursors_key_is_not_sent() {
 
 /// A replay page the sender truncates to fit its frame keeps every record riding
 /// its kept entries, the one riding its last entry included: the next page
-/// starts after that entry, so B2's rule (`last` above the page's start) never
+/// starts after that entry, so the spanning rule (`last` above the page's start) never
 /// selects that record again. Ten keyed inserts of about a kilobyte each under
 /// an 8 KiB frame, so every page is cut.
 async fn a_truncated_replay_page_keeps_its_last_entrys_record(outbound: bool) {

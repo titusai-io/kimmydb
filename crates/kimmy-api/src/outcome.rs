@@ -1,7 +1,7 @@
 //! What a document write answered, as plain data, and the one function per
 //! route kind that turns it into the response body.
 //!
-//! **Why an outcome and not the response bytes** (B5). A keyed write keeps a
+//! **Why an outcome and not the response bytes** (ADR-240). A keyed write keeps a
 //! record of what it answered, so that a retry gets the first answer back. A
 //! record that held the bytes would tie itself to the build that rendered
 //! them: a later build that renders the same answer differently would replay
@@ -109,7 +109,7 @@ impl DeleteByIdOutcome {
     }
 }
 
-/// What a keyed request adds to a filtered write's answer (B5), after every
+/// What a keyed request adds to a filtered write's answer (ADR-240), after every
 /// other field, so an unkeyed request's body is exactly what it always was:
 ///
 /// - `skipped`, whenever it is above 0: the matches the request left because
@@ -138,9 +138,9 @@ pub struct UpdateOutcome {
     /// The version the single-document form wrote; never set for `multi`,
     /// which names no single version (ADR-084).
     pub stamp: Option<Stamp>,
-    /// Matches a keyed request left by the stamp rule (B5); 0 for any other.
+    /// Matches a keyed request left by the stamp rule (ADR-240); 0 for any other.
     pub skipped: u64,
-    /// An attempt of this keyed request resumed one that had stopped (B5).
+    /// An attempt of this keyed request resumed one that had stopped (ADR-240).
     pub resumed: bool,
 }
 

@@ -236,11 +236,24 @@ pub struct IndexCacheConfig {
     /// `Σ chunks × per-chunk bytes`. Zero lifts the bound, which is the
     /// behaviour before it existed (ADR-103).
     pub max_bytes: u64,
+    /// How many HNSW graphs are built at once, on the node's builder threads.
+    ///
+    /// Every build and save runs off the request path (ADR-245): a search of
+    /// a collection whose graph is being built is answered by the graph it
+    /// had, or by an exact scan. A build is CPU and memory bound — a 100,000
+    /// × 384 graph peaks at about 1.3 GiB with its records — and the first
+    /// start of 0.52.0 asks for every collection's at once, so they queue.
+    /// 1 by default; raise it on a host with cores and memory to spare.
+    /// At least 1.
+    pub build_concurrency: usize,
 }
 
 impl Default for IndexCacheConfig {
     fn default() -> Self {
-        Self { max_bytes: kimmy_vector::DEFAULT_INDEX_CACHE_BYTES }
+        Self {
+            max_bytes: kimmy_vector::DEFAULT_INDEX_CACHE_BYTES,
+            build_concurrency: kimmy_vector::DEFAULT_BUILD_CONCURRENCY,
+        }
     }
 }
 
@@ -961,7 +974,7 @@ pub struct ClusterConfig {
     /// decimal id exists.
     pub decimal128: Option<bool>,
     /// Whether this member takes `Idempotency-Key` on a document write, and the
-    /// MCP argument `idempotency_key` (B5): the operator's declaration that
+    /// MCP argument `idempotency_key` (ADR-240): the operator's declaration that
     /// every member runs 0.52 or later, so records travel with every keyed
     /// write, and that no member will run an older release again. A member of
     /// an older release relays a keyed write without its record, and a member
@@ -1652,6 +1665,12 @@ impl Config {
                 "vector.index_cache.max_bytes must be 0 (unbounded) or at least 8 MiB \
                  (8388608); a smaller budget holds no graph worth building and would \
                  rebuild one on every search"
+            );
+        }
+        if self.vector.index_cache.build_concurrency == 0 {
+            anyhow::bail!(
+                "vector.index_cache.build_concurrency must be at least 1: with no builder, no \
+                 graph would ever be built and every search would scan"
             );
         }
         if self.storage.oplog_retention_secs == 0 {
@@ -2392,6 +2411,22 @@ mod tests {
     }
 
     #[test]
+    fn graph_builds_run_one_at_a_time_unless_told_otherwise_and_never_none() {
+        let mut cfg = valid();
+        assert_eq!(cfg.vector.index_cache.build_concurrency, 1);
+        assert_eq!(kimmy_vector::DEFAULT_BUILD_CONCURRENCY, 1);
+        cfg.vector.index_cache.build_concurrency = 0;
+        let err = cfg.validate().unwrap_err().to_string();
+        assert!(err.contains("vector.index_cache.build_concurrency"), "{err}");
+        cfg.vector.index_cache.build_concurrency = 4;
+        cfg.validate().unwrap();
+        let parsed: Config =
+            toml::from_str("[vector.index_cache]\nbuild_concurrency = 3\n").unwrap();
+        assert_eq!(parsed.vector.index_cache.build_concurrency, 3);
+        assert_eq!(parsed.vector.index_cache.max_bytes, kimmy_vector::DEFAULT_INDEX_CACHE_BYTES);
+    }
+
+    #[test]
     fn the_embedding_batch_bounds_are_checked() {
         let mut cfg = valid();
         cfg.vector.batch.max_chunks = 0;
@@ -2718,7 +2753,7 @@ api_key_env = "KIMMY_PROVIDER_HOSTED"
         assert!(err.contains("decimal128_ids"), "unhelpful error: {err}");
     }
 
-    /// `cluster.idempotency_keys` (B5): unset reads `true` alone and `false` in a
+    /// `cluster.idempotency_keys` (ADR-240): unset reads `true` alone and `false` in a
     /// cluster, a value set wins either way, and a typo is refused by name. The
     /// same `deny_unknown_fields` is why a 0.51 binary refuses a config that names
     /// the key at all: a rollback effect, documented, not tested here.

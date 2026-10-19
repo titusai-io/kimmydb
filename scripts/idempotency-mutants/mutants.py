@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""The B5 idempotency mutation rows: each is an exact-text patch of the post-format
+"""The idempotency keys' mutation rows (ADR-240): each is an exact-text patch of the post-format
 source, applied once to a `git archive` export, run against its suites under a timeout,
 and reverted by copying the pristine file back. A row whose text does not occur exactly
 once fails `check` and is never run.
@@ -23,7 +23,7 @@ MODEL = [("kimmy-storage", "--lib", "idempotency", "no")]
 # the unit tests that kill it elsewhere (P's page delta rows: its own table has those).
 MODEL_ONLY = [("kimmy-storage", "--lib", "idempotency_model_tests", "no")]
 
-# The gate split (B5's gate window; Chris's ruling): a live member not heard from yet is
+# The gate split (the gate window; Chris's ruling): a live member not heard from yet is
 # `503 peer_unheard` with `Retry-After`, a held block that says no is `400`, and the block
 # that says no decides. Each row names the tests that must fail (`kills`), and `check-kills`
 # reads a row's log for them.
@@ -63,7 +63,7 @@ GATE_SPLIT = [
             ("crates/kimmy-cluster/src/idempotency.rs",
              "            PeerNet::Unheard(peers) => Err(IdempotencyClosed::Unheard {\n"
              "                peers: names(peers),\n"
-             "                retry_after_secs: members.unheard_retry_after_secs(),\n"
+             "                retry_after_secs: crate::membership::UNHEARD_RETRY_AFTER_SECS,\n"
              "            }),\n",
              "            PeerNet::Unheard(peers) => Err(IdempotencyClosed::Peers(names(peers))),\n"),
         ],
@@ -79,7 +79,7 @@ GATE_SPLIT = [
             ("crates/kimmy-cluster/src/decimal128.rs",
              "            PeerNet::Unheard(peers) => Err(Decimal128Closed::Unheard {\n"
              "                peers: names(peers),\n"
-             "                retry_after_secs: members.unheard_retry_after_secs(),\n"
+             "                retry_after_secs: crate::membership::UNHEARD_RETRY_AFTER_SECS,\n"
              "            }),\n",
              "            PeerNet::Unheard(peers) => Err(Decimal128Closed::Peers(names(peers))),\n"),
         ],
@@ -138,28 +138,28 @@ GATE_SPLIT = [
         "kills": ["error::tests::a_decimal128_refusal_is_503_while_a_peer_is_unheard_and_400_otherwise"],
     },
     {
-        "name": "gs-wait-not-rounded-up",
+        "name": "gs-wait-longer",
         "group": "gate-split",
-        "doc": "The wait truncates a fractional sync interval instead of rounding it up",
+        "doc": "The wait of a refusal for a peer not heard from yet is 5 seconds, not 1",
         "patches": [
             ("crates/kimmy-cluster/src/membership.rs",
-             "        let whole = interval.as_secs() + u64::from(interval.subsec_nanos() > 0);\n",
-             "        let whole = interval.as_secs();\n"),
+             "pub const UNHEARD_RETRY_AFTER_SECS: u64 = 1;\n",
+             "pub const UNHEARD_RETRY_AFTER_SECS: u64 = 5;\n"),
         ],
-        "suites": [("kimmy-cluster", "--lib", "idempotency::tests::the_wait_is_one_sync_interval_rounded_up_and_at_least_a_second", "no")],
-        "kills": ["idempotency::tests::the_wait_is_one_sync_interval_rounded_up_and_at_least_a_second"],
+        "suites": [("kimmy-cluster", "--lib", "idempotency::tests::the_wait_is_a_fixed_second_whatever_the_sync_interval", "no")],
+        "kills": ["idempotency::tests::the_wait_is_a_fixed_second_whatever_the_sync_interval"],
     },
     {
-        "name": "gs-wait-may-be-zero",
+        "name": "gs-wait-zero",
         "group": "gate-split",
-        "doc": "The wait of a sub-second sync interval is 0",
+        "doc": "The wait of a refusal for a peer not heard from yet is 0",
         "patches": [
             ("crates/kimmy-cluster/src/membership.rs",
-             "        whole.max(1)\n    }\n",
-             "        whole\n    }\n"),
+             "pub const UNHEARD_RETRY_AFTER_SECS: u64 = 1;\n",
+             "pub const UNHEARD_RETRY_AFTER_SECS: u64 = 0;\n"),
         ],
-        "suites": [("kimmy-cluster", "--lib", "idempotency::tests::the_wait_is_one_sync_interval_rounded_up_and_at_least_a_second", "no")],
-        "kills": ["idempotency::tests::the_wait_is_one_sync_interval_rounded_up_and_at_least_a_second"],
+        "suites": [("kimmy-cluster", "--lib", "idempotency::tests::the_wait_is_a_fixed_second_whatever_the_sync_interval", "no")],
+        "kills": ["idempotency::tests::the_wait_is_a_fixed_second_whatever_the_sync_interval"],
     },
     {
         "name": "gs-precedence-swapped",
@@ -361,7 +361,7 @@ ROWS = [
             ("crates/kimmy-storage/src/docs.rs",
              """        let stamp = entry.stamp;
         // In the write's own transaction: the record survives exactly what the
-        // write survives (B5).
+        // write survives (ADR-240).
         if let Some(keyed) = keyed {
             let outcome = RecordOutcome::Insert { stamp };
             let record = IdempotencyRecord::written(keyed, stamp, self.node_id(), outcome);
@@ -514,8 +514,8 @@ ROWS = [
         "doc": "`resume_hlc` without the records' high water",
         "patches": [
             ("crates/kimmy-storage/src/engine.rs",
-             "            .max(Self::records_high_water(db)?)\n            .max(crate::idempotency::changes_high_water_at_open(db)?))\n",
-             "            .max(crate::idempotency::changes_high_water_at_open(db)?))\n"),
+             "            .max(Self::records_high_water(db)?)\n            .max(crate::idempotency::changes_high_water_at_open(db)?)\n",
+             "            .max(crate::idempotency::changes_high_water_at_open(db)?)\n"),
         ],
         "suites": MODEL,
     },
@@ -575,8 +575,8 @@ ROWS = [
         ],
         "suites": MODEL,
     },
-    # life-rule-off: retired with the life rule (ruling A): no record is history now,
-    # by design; G's A1 plants the life rule back at the lookup, its inverse.
+    # life-rule-off: retired with the life rule (records outlive a drop): no record is history now,
+    # by design; the row A1 plants the life rule back at the lookup, its inverse.
     {
         "name": "records-at-shipped-stamps-only",
         "group": "fix-e",
@@ -702,8 +702,8 @@ ROWS = [
         ],
         "suites": [("kimmy-storage", "--lib", "idempotency_tests::f3", "no")],
     },
-    # purge-removes-every-record-under-the-id: retired with P1's purge of records (ruling
-    # A): a drop's purge leaves every record; G's A2 plants a purge that removes them.
+    # purge-removes-every-record-under-the-id: retired with P1's purge of records (records
+    # outlive a drop): a drop's purge leaves every record; the row A2 plants a purge that removes them.
     {
         "name": "ships-a-record-at-an-earlier-lifes-row",
         "group": "lives",
@@ -836,8 +836,8 @@ ROWS = [
         "doc": "`resume_hlc` without the change log's high water (its keys are minted stamps)",
         "patches": [
             ("crates/kimmy-storage/src/engine.rs",
-             "            .max(Self::records_high_water(db)?)\n            .max(crate::idempotency::changes_high_water_at_open(db)?))\n",
-             "            .max(Self::records_high_water(db)?))\n"),
+             "            .max(Self::records_high_water(db)?)\n            .max(crate::idempotency::changes_high_water_at_open(db)?)\n",
+             "            .max(Self::records_high_water(db)?)\n"),
         ],
         "suites": MODEL,
         "timeout": 600,
@@ -891,10 +891,10 @@ ROWS = [
     },
 ] + GATE_SPLIT
 
-# The fix branches (Y, P2, G) and ruling A, as the model sees them: each row's killer
+# The fixes after the review of the merged head, and records outliving a drop, as the model sees them: each row's killer
 # is a model row or the generated sweep, run against the model alone.
 FIXES = [
-    ("contested-without-the-fingerprints", "A merge of two fingerprints is not contested (KR's fingerprint half)",
+    ("contested-without-the-fingerprints", "A merge of two fingerprints is not contested (the contested flag's fingerprint half)",
      "crates/kimmy-storage/src/idempotency.rs",
      "        let contested = self.contested || other.contested || self.fingerprint != other.fingerprint;\n",
      "        let contested = self.contested || other.contested;\n"),
@@ -910,43 +910,43 @@ FIXES = [
      "crates/kimmy-storage/src/idempotency.rs",
      "            self.witness(&record.last);\n            if record.contested || record.fingerprint != keyed.fingerprint {\n",
      "            self.witness(&record.last);\n            if record.fingerprint != keyed.fingerprint {\n"),
-    ("past-window-record-stored", "A receiver stores a record past its window (m2), merged into a new request's",
+    ("past-window-record-stored", "A receiver stores a record past its window, merged into a new request's",
      "crates/kimmy-storage/src/idempotency.rs",
      "        if self.record_is_past_window(record)\n            && !live.is_some_and(|live| live.fingerprint == record.fingerprint)\n        {\n            return Ok((None, false));\n        }\n",
      ""),
-    ("past-window-same-request-refused", "A record past its window of the live record's own request is refused, not merged (m2 before G narrowed it)",
+    ("past-window-same-request-refused", "A record past its window of the live record's own request is refused, not merged (as first built)",
      "crates/kimmy-storage/src/idempotency.rs",
      "        if self.record_is_past_window(record)\n            && !live.is_some_and(|live| live.fingerprint == record.fingerprint)\n        {\n",
      "        if self.record_is_past_window(record) {\n"),
-    ("zero-base-guard-off", "A page asked with the zero records base is applied though its sender's log began since (m4, guard ii)",
+    ("zero-base-guard-off", "A page asked with the zero records base is applied though its sender's log began since (the zero-base guard)",
      "crates/kimmy-storage/src/snapshot.rs",
      "    (zero && page.records_epoch.is_some()).then(|| SnapshotCursor {\n",
      "    (zero && page.records_epoch.is_some() && base.key.hlc != Hlc::ZERO).then(|| SnapshotCursor {\n"),
-    ("no-log-begun-over-restored-records", "An open over records with no log of this node begins none (m4, guard i)",
+    ("no-log-begun-over-restored-records", "An open over records with no log of this node begins none (the epoch begun at open)",
      "crates/kimmy-storage/src/engine.rs",
      "        crate::idempotency::begin_log_over_held_records(&engine)?;\n",
      ""),
-    ("replay-page-records-off", "A replay page carries no record of its collections (B2 off, in storage)",
+    ("replay-page-records-off", "A replay page carries no record of its collections (the spanning records off, in storage)",
      "crates/kimmy-storage/src/idempotency_replay.rs",
      "                if record.last.hlc <= from\n",
      "                if record.last.hlc <= Hlc::MAX\n"),
-    ("replay-records-carried-at-last", "B2's records carried at their last, not their first",
+    ("replay-records-carried-at-last", "The spanning records carried at their last, not their first",
      "crates/kimmy-storage/src/idempotency_replay.rs",
      "                    carrying: Some(record.first),\n",
      "                    carrying: Some(record.last),\n"),
-    ("replay-cursor-epoch-unguarded", "A replay's records cursor of another epoch of the sender's log is honoured (m1)",
+    ("replay-cursor-epoch-unguarded", "A replay's records cursor of another epoch of the sender's log is honoured",
      "crates/kimmy-storage/src/idempotency_replay.rs",
      "                Some(epoch) => begun.is_some_and(|begun| begun.epoch == epoch),\n",
      "                Some(_) => begun.is_some(),\n"),
-    ("replay-cursor-passes-changed", "A replay's records cursor passes a record the log names as changed since its base (m1)",
+    ("replay-cursor-passes-changed", "A replay's records cursor passes a record the log names as changed since its base",
      "crates/kimmy-storage/src/idempotency_replay.rs",
      "                && cursor.passed(record.collection, &record.scope)\n                && !changed.contains(&(record.collection.0, record.scope.0));\n",
      "                && cursor.passed(record.collection, &record.scope);\n"),
-    ("rewind-leaves-the-rows", "A rewind removes the records of what it discards and leaves their rows by stamp (G)",
+    ("rewind-leaves-the-rows", "A rewind removes the records of what it discards and leaves their rows by stamp",
      "crates/kimmy-storage/src/idempotency.rs",
      "        if let Some(from) = from {\n            remove_rows_naming(txn, from, &named)?;\n        }\n",
      "        let _ = (from, &named);\n"),
-    ("rewind-reopens-a-bulk", "A rewind reopens a cut bulk insert's record as it reopens every other kind's (Y's m3)",
+    ("rewind-reopens-a-bulk", "A rewind reopens a cut bulk insert's record as it reopens every other kind's",
      "crates/kimmy-storage/src/idempotency.rs",
      "            if record.first.hlc > until || (cut && bulk) {\n",
      "            if record.first.hlc > until {\n"),
@@ -954,6 +954,14 @@ FIXES = [
      "crates/kimmy-storage/src/idempotency.rs",
      "            if record.first.hlc > until || (cut && bulk) {\n",
      "            if record.first.hlc > until || (cut && !matches!(record.outcome, RecordOutcome::Modify(_))) {\n"),
+    ("restore-marks-no-held-rows", "A restore marks none of the rows its backup's source held above its vectors (BR1, before #211)",
+     "crates/kimmy-storage/src/backup.rs",
+     "                if stamp.hlc > vector.get(stamp.node) {\n",
+     "                if false && stamp.hlc > vector.get(stamp.node) {\n"),
+    ("rewind-lowers-to-the-oplog", "A rewind lowers each vector to the oplog's newest entry of its origin, below what retention collected (RW1, before #209)",
+     "crates/kimmy-storage/src/engine.rs",
+     "                let mut after = before.min(until);\n",
+     "                let mut after = before.min(until).min(kept.get(node));\n"),
     ("delete-judged-by-its-own-stamp", "A keyed delete by id is judged by its outcome's stamp, not the record's first (before G)",
      "crates/kimmy-storage/src/docs.rs",
      "        let first = record.first;\n        let key = doc_key(id)?;\n",

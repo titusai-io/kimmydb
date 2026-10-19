@@ -826,7 +826,7 @@ async fn start_and_serve(
             lifecycle::rebuilt(&config.storage.data_dir);
             opened.store(true, std::sync::atomic::Ordering::SeqCst);
             let engine = Arc::new(engine);
-            // The B5 cluster tests' lab hooks (a build with the `lab-hooks` feature only).
+            // The idempotency cluster tests' lab hooks (a build with the `lab-hooks` feature only).
             #[cfg(feature = "lab-hooks")]
             crate::lab_hooks::arm(&engine);
             // Kept for `run` from the moment the store is open, so that whatever
@@ -864,7 +864,7 @@ async fn start_and_serve(
             .context("writing the replay floor")?;
     }
     engine.set_multi_chunk_docs(config.storage.multi_chunk_docs);
-    // An idempotency key is remembered for the oplog's window (B5, Decision Q3):
+    // An idempotency key is remembered for the oplog's window (ADR-240):
     // the lookup treats a record past it as absent, at the cutoff the retention
     // pass collects it at, so the two read one setting.
     engine.set_idempotency_window(config.storage.oplog_retention_secs);
@@ -1121,7 +1121,7 @@ async fn start_and_serve(
     // Before any task that reads it is spawned: expiry and the dispatcher take the
     // marker from the state when they start.
     state.set_catch_up(Arc::clone(&catch_up));
-    // The gate on `Idempotency-Key` (B5), installed before anything serves: the
+    // The gate on `Idempotency-Key` (ADR-240), installed before anything serves: the
     // operator's switch now, the live member set once the cluster is up (until
     // then a clustered member refuses keys, failing closed). And how long this
     // member remembers a key, which `GET /v1/version` publishes.
@@ -1198,6 +1198,8 @@ async fn start_and_serve(
     // like the audit mode above it is a property of the deployment, and the
     // cache's default is the same value the config's default carries.
     state.vectors.set_max_bytes(config.vector.index_cache.max_bytes);
+    // How many graphs build at once, off the request path (ADR-245).
+    state.vectors.set_build_concurrency(config.vector.index_cache.build_concurrency);
 
     // The OTLP counters, reading the same atomics `/metrics` renders. Here
     // rather than in `logging::init` because the counters live in this state
@@ -3254,7 +3256,7 @@ fn spawn_collector(
                 Ok(outcome) => info!(
                     oplog = outcome.oplog_removed,
                     tombstones = outcome.tombstones_removed,
-                    // Idempotency records (B5), collected on the oplog's
+                    // Idempotency records (ADR-240), collected on the oplog's
                     // window, so a pass that removed only these still says so.
                     idempotency_records = outcome.records_removed,
                     elapsed_ms = elapsed.as_millis() as u64,
@@ -3492,7 +3494,7 @@ mod tests {
         assert!(installed < handed && handed < serving, "installed and handed before serving");
     }
 
-    /// The `Idempotency-Key` gate (B5) is built from the switch, the clustering
+    /// The `Idempotency-Key` gate (ADR-240) is built from the switch, the clustering
     /// switch and the membership switch, installed on the API state before the
     /// router serves, and handed the live member set beside the routes; the
     /// window is the configured oplog retention. A source check, as the

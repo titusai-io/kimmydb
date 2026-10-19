@@ -505,7 +505,7 @@ impl Engine {
         self.insert_one(coll, doc, None).map(crate::idempotency::unkeyed)
     }
 
-    /// [`Engine::insert_stamped`] under an idempotency key (B5, see
+    /// [`Engine::insert_stamped`] under an idempotency key (ADR-240, see
     /// [`crate::idempotency`]): the first attempt's record replays it, and a
     /// document without `_id` is given the key's derived one for position 0.
     pub fn insert_keyed(
@@ -549,7 +549,7 @@ impl Engine {
         };
         let stamp = entry.stamp;
         // In the write's own transaction: the record survives exactly what the
-        // write survives (B5).
+        // write survives (ADR-240).
         if let Some(keyed) = keyed {
             let outcome = RecordOutcome::Insert { stamp };
             let record = IdempotencyRecord::written(keyed, stamp, self.node_id(), outcome);
@@ -598,7 +598,7 @@ impl Engine {
         self.insert_batch(coll, docs, None).map(crate::idempotency::unkeyed)
     }
 
-    /// [`Engine::insert_many_stamped`] under an idempotency key (B5): one key,
+    /// [`Engine::insert_many_stamped`] under an idempotency key (ADR-240): one key,
     /// one record for the batch, which is one transaction. A document without
     /// `_id` is given the key's derived one for its position in the batch.
     /// The record keeps the stamps and no ids: a replay's body is the first
@@ -692,7 +692,7 @@ impl Engine {
         }
 
         // From the batch's first entry to its last (L1), in the batch's
-        // transaction (B5).
+        // transaction (ADR-240).
         if let Some(keyed) = keyed {
             let stamps: Vec<Stamp> = ids.iter().map(|(_, stamp)| *stamp).collect();
             let (first, last) = (stamps[0], stamps[stamps.len() - 1]);
@@ -867,7 +867,7 @@ impl Engine {
         self.replace_one(coll, id, doc, upsert, expected, None).map(crate::idempotency::unkeyed)
     }
 
-    /// [`Engine::replace_if`] under an idempotency key (B5). The record is
+    /// [`Engine::replace_if`] under an idempotency key (ADR-240). The record is
     /// looked up before the version check, so a retry whose `expected` the
     /// first attempt moved on from is answered from the record and not `Stale`.
     pub fn replace_keyed(
@@ -1100,7 +1100,7 @@ impl Engine {
         self.delete_by_id(coll, id, expected, None).map(crate::idempotency::unkeyed)
     }
 
-    /// [`Engine::delete_if`] under an idempotency key (B5). Replayed only
+    /// [`Engine::delete_if`] under an idempotency key (ADR-240). Replayed only
     /// while the request's own tombstone, or a later version, stands: once it
     /// is collected, the retry runs afresh (see [`crate::idempotency`]).
     pub fn delete_keyed(
@@ -1231,7 +1231,7 @@ impl Engine {
     }
 
     /// A keyed delete's record is replayed only while the request's own
-    /// tombstone stands (B5): the document's row carries a stamp at or above
+    /// tombstone stands (ADR-240): the document's row carries a stamp at or above
     /// the record's `first`, the tombstone of one of its attempts or a later
     /// version over it; or the row is gone with a drop of the collection at or
     /// above `first`, which took the tombstone with the life the delete was

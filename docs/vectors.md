@@ -368,7 +368,14 @@ changes or its configuration does.
 Requires `write` on the collection — this is derived data about a document you
 can already write, not an administrative act. The document must exist (there is
 no HLC to attach otherwise, so a missing one is `404`), and every vector must
-match the configured `dim` or the request is `400`.
+match the configured `dim` or the request is `400`. So is a vector whose
+squared length is not a finite 32-bit float (a component of 2^64, about
+1.8e19, or more, or squares summing past `f32::MAX`): the exact scan scores it
+0, and the graph's distance between two vectors with a component of 2^64 or
+more is NaN, on which the library panics at a search for such a vector
+itself. A query vector is held to the same test,
+and a provider's answer holding one is refused as unusable
+([ADR-241](decisions.md)).
 
 ---
 
@@ -593,10 +600,24 @@ What happens next depends on how many documents the filter admitted:
   collection, and the answer is exact whichever path the collection would
   otherwise take.
 - **More than 1,000**: the search runs as it would without a filter, exact
-  scan or graph walk, and discards hits outside the set. The graph is asked for
-  eight times the candidates when a filter is present so that discarding still
-  leaves `k`; an unselective filter discards little, which is what makes this
-  the right direction for it.
+  scan or graph walk, and discards hits outside the set. On the graph the walk
+  is widened by the share of the collection the filter admits — about
+  `2 × k × chunks / admitted` candidates, never fewer than eight times the
+  unfiltered walk and at most 8,000 — so that discarding still leaves `k`; a
+  walk that comes back short is retried once, widened by the share of its own
+  candidates the filter admitted (at least four times the first width, and the
+  widest when it admitted none), and a second short one gives way to reading
+  the admitted documents by key, so the search returns `k` whenever `k`
+  admitted documents have vectors ([ADR-241](decisions.md)). Measured at
+  100,000 documents of 384 dimensions, with 1% to 10% of them admitted: `k` of
+  `k`, recall 1.000 against the exact filtered answer, 9 to 33 ms. An
+  unselective filter discards little, which is what makes this the right
+  direction for it — unless it refuses what is nearest the query: with the
+  fifth of 100,000 documents nearest the query refused and the rest admitted,
+  even the widest walk comes back short, and the search reads the 80,000
+  admitted documents by key, exactly, in about 2.5 s. Reading by key stops at
+  the request's deadline and answers `503` `timeout`, as a request that ran
+  out of time does.
 
 The boundary is a count rather than a fraction of the collection because the
 first direction's cost does not depend on the collection: a thousand
@@ -780,17 +801,41 @@ back for the reachability probe. Earlier it materialised every record whole
 and held the lot until the probe had run, which made a rebuild's peak the
 graph plus the entire shadow collection, every staleness window under writes.
 
-It runs **off the cache lock**. The lock every collection's entry lives in is
-taken to look and to install, and the build itself — 4.3 s at 4,000 vectors
-of 384 dimensions, minutes at tens of thousands ([Benchmarks](benchmarks.md))
-— runs under a per-collection lock, on a thread the async runtime has been
-told about, as a storage commit's fsync does. So a rebuild delays searches on
-that one collection, and only those with nothing older to serve: a second
-search arriving mid-build takes the graph that already exists, under the
-staleness rule above, or, when there is none, waits for that one build rather
-than starting a duplicate. Before this the build held the lock, and a rebuild
-of one collection was a stall for vector and hybrid search on every collection
-the node serves.
+It runs **off the request** ([ADR-245](decisions.md)). A search that finds no
+usable graph queues a build and is answered at once; the build — 4.3 s at
+4,000 vectors of 384 dimensions, minutes at tens of thousands
+([Benchmarks](benchmarks.md)) — the count that decides whether the collection
+is worth one, and the save run on builder threads, at most
+`vector.index_cache.build_concurrency` at once (one by default), one build per
+collection, under a per-collection lock. The lock every collection's entry
+lives in is taken only to look and to install. Meanwhile a search is answered
+by the graph the collection already has, under the staleness rule above, and
+only with none at all by an **exact scan**: at most two scans of one
+collection at once, a fixed number rather than a setting, since each scan of
+100,000 vectors of 384 dimensions takes about 1.4 s of a core and the
+build needs the rest; a search awaits a turn, holding no thread, and the scan
+reads, only until the request's deadline, and answers `503` `timeout` past it.
+A graph a previous process saved is served at once and judged by a builder,
+which counts the collection and either re-stamps it at the generation the
+process started at, before any write it made, or rebuilds it. A builder lets go of the store before it saves, so
+the node's stop never waits for a save. Before 0.52.0
+the build ran in the search that asked for it, which waited for it, and so did
+every other search of that collection, past the request's timeout; before
+that, the build held the cache lock, and a rebuild of one collection stalled
+vector and hybrid search on every collection the node serves.
+
+The graph is built by `hnsw_rs` 0.3.5, kimmydb's copy of it with one function
+added ([ADR-241](decisions.md)). After the inserts the build reads layer 0 and
+links every point the library's insertion left with no edge into it, or
+outside the entry point's component, from its nearest linked points: such a
+point is one no search returns. A component whose searches return only one
+another, so that no search offers it a linked point, is bridged both ways to
+the nearest linked points found by reading them all. Then it asks a sample of 128 stored vectors
+to find themselves, and warns when 8 or more do not. A build is retried, in
+another insertion order, only if the linking leaves a point cut off, which no
+measured build has. Each attempt's order is a shuffle of the chunk keys seeded
+by the attempt, so a collection's graph is the same on every member and every
+run.
 
 `hnsw_rs` can insert in parallel, and it was measured — 3–4× faster on a
 ten-core host, saturating at four threads, with recall and reachability
@@ -917,8 +962,11 @@ The exact path is the oracle for everything approximate:
 | Invariant | How |
 |---|---|
 | The graph finds what a scan finds | Recall measured, not assumed: ≥ 90% at k=10, and the nearest neighbour agrees with an exact scan exactly |
+| No stored vector is out of every search's reach | Every vector of eight builds at 400 × 16 finds itself, and the graph's layer 0 leaves none without an edge into it or outside the entry point's component; the same of three builds at 1,000 × 384 in release; a build links what its insertion cut off (300 copies of one vector, two thirds cut off before); a component the entry point does not reach is linked, judged from the entry point the library dumps, and one no search's candidates reach is bridged |
+| A filtered search returns `k` | 1%, 2% and 3% of a collection admitted return `k` through the graph, at 5,000 documents and, in release, 100,000; a first walk short of `k` is retried wider and answers `k`; a filter that refuses what is nearest the query is retried at the width its first walk's own admitted share asks for; a walk short at its widest gives way to the keyed join's exact answer, which stops at the request's deadline |
+| A snapshot cannot take the node down | 39 spoilings of a snapshot's two files are refused before the library reads them, a vector too large to square among them; the three the library answers by ending the process are run in child processes, which the library alone ends and the cache survives, rebuilding |
 | Dispatch does not change results | `the_approximate_path_agrees_with_the_exact_one` asserts both paths return the same nearest neighbour with a **byte-identical score** |
-| A rebuild stalls no other collection | A build of one collection is parked and a search on another is asserted served meanwhile; two searches on an unbuilt collection produce exactly one build; a search arriving mid-rebuild is served the previous graph |
+| No search waits for a build | A build of one collection is parked and a search of it, and of another, is answered at once, by exact scan; two searches on an unbuilt collection produce exactly one build; a search arriving mid-rebuild is served the previous graph; at most two exact scans of one collection run at once, a third waiting only to its deadline; a scan holds its turn while it reads and stops at its deadline; a build that panics costs that build, not the builder; a stop during a save finds the store free, and one during the bridge's pass ends the build; a write between adopting a snapshot and judging it is not lost; a drop or a reconfiguration fences a queued build; the API's first search of a collection is answered by scan and the next by the graph built behind it, and searches waiting for a turn hold no thread |
 | The budget evicts least recently searched first, and never refuses | Three graphs under a budget for two: the untouched one goes, and comes back rebuilt on its next search; a graph larger than the whole budget still loads; a rebuild is charged once; `0` evicts nothing |
 | Dropping the data drops the graph | A collection drop, a database drop and a drop arriving by replication each leave the cache without the graph and the snapshot directory gone; a drop re-delivered after the name was created again leaves the live graph alone |
 | A snapshot cannot outlive the collection it describes | A collection dropped and recreated under the same name derives the same id and the same snapshot path; the graph records the incarnation it was built for and is refused when that does not match, and a sweep — at startup, and whenever the change-feed consumer falls behind — removes snapshots for collections the node no longer holds and any a previous collection of the same name left behind; the startup sweep also removes the staging directories of builds a previous process did not finish |

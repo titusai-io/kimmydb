@@ -1052,9 +1052,20 @@ not carry snapshots and rebuilds, which is always correct.
 
 **Found on the way, by testing the failure path:** `hnsw_rs` *panics* on a
 corrupt graph file — an `unwrap` on its magic check — so the load runs under
-`catch_unwind`, and a torn file on disk costs a rebuild rather than the
-process. The same species as `DistDot`'s assert in M2: the library's failure
-behaviour was checked rather than trusted, and it needed containing.
+`catch_unwind`. The same species as `DistDot`'s assert in M2: the library's
+failure behaviour was checked rather than trusted, and it needed containing.
+
+**And the containment was not enough, found in 0.52.0** ([ADR-241](decisions.md)).
+The loader also *ends the process*: `std::process::exit(1)` on a vector it
+cannot read, so a data file cut short (which a crash after a save could leave,
+since the save did not sync) took the node down at that collection's first
+search, and again after every restart, because the snapshot stayed; and in
+`hnsw_rs` 0.3.5 on a format-2 dump as well. A count or length the file declares
+is allocated before it is read, and a corrupt one aborts the process. No unwind
+sees either. Every snapshot's two files are now read by kimmydb first, the way
+the loader reads them, and refused when the loader would exit, abort, read out
+of bounds or panic; the save syncs before and after its rename. The audit — 36
+spoiled dumps handed to the raw loader in child processes — is a test.
 
 ---
 

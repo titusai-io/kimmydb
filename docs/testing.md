@@ -498,6 +498,42 @@ resolver. Something untestable in place tends to stay untested.
 | Leave the undone future in the oplog | `the_undone_future_leaves_the_oplog` |
 | Skip index maintenance during the rewind | `indexes_follow_the_rewind` |
 | Leave the version vector high after the oplog shrinks | `the_undone_future_leaves_the_oplog` |
+| Leave the witnessed vector high after a rewind | `a_rewind_lowers_every_origin_it_discarded_to_the_target_and_no_lower`, `a_rewound_member_asks_its_peer_again_for_what_it_discarded` |
+| Rebuild the servable vector from the oplog the rewind kept (0.51) | `a_rewind_after_retention_keeps_the_coverage_of_what_retention_collected`, `a_rewind_that_discards_nothing_changes_neither_vector`, `row_a_rewind_after_retention_keeps_the_members_collected_drop` |
+| Rebuild the witnessed vector from the oplog the rewind kept (0.51) | `a_rewind_after_retention_keeps_the_coverage_of_what_retention_collected`, `a_rewind_that_discards_nothing_changes_neither_vector` |
+| Set the witnessed vector to the lowered servable one | `a_rewind_that_discards_nothing_changes_neither_vector` |
+| Write no verified record after the rewind | `restore_carries_no_record_and_restore_until_leaves_a_true_one` |
+| Resume the clock without the rewinds' records | `a_start_after_a_rewind_resumes_the_clock_past_what_it_discarded` |
+| No bound under a document the rewind restores | `a_rewind_that_restores_a_document_bounds_the_vectors_by_it_and_by_what_it_keeps`, `row_a_rewind_that_restores_a_document_asks_again_for_a_loser_it_judged`, `row_a_rewind_that_restores_a_document_asks_again_for_a_granted_write` |
+| The bound under a restored document without the entries it keeps (below invariant I) | `a_rewind_that_restores_a_document_bounds_the_vectors_by_it_and_by_what_it_keeps` |
+| The bound under a restored document without what retention collected | `row_a_rewind_that_restores_a_late_entry_keeps_the_coverage_of_what_retention_collected` |
+| The bound leaves out a document put back to a delete | `row_a_rewind_that_restores_a_document_to_a_delete_asks_again_for_a_loser_it_judged` |
+| The entries the bound keeps include those held as state | `row_a_rewind_never_counts_an_entry_held_as_state_as_kept` |
+| Lower the vectors in a second transaction after the rewind's | `a_rewind_that_fails_while_lowering_the_vectors_writes_nothing` |
+| Fold only the member's own origin of the rewinds' records | `a_start_after_a_rewind_resumes_past_a_peers_discarded_stamp` |
+| Leave a tombstone at the rewind's clock for a removed document (0.51) | `a_document_created_after_the_target_is_removed`, `a_rewind_that_removes_a_document_asks_again_for_a_write_it_judged`, `row_a_rewind_that_removes_a_document_keeps_a_judged_write_at_or_below_the_target`, `row_a_rewind_that_removes_a_document_deletes_no_kept_write_once_the_member_writes_again` |
+| Leave a tombstone at the target for a removed document | `a_document_created_after_the_target_is_removed`, `a_rewind_that_removes_a_document_asks_again_for_a_write_it_judged` |
+| No bound when the rewind only removes | `a_rewind_that_removes_a_document_asks_again_for_a_write_it_judged`, `row_a_rewind_that_removes_a_deleted_document_asks_again_for_a_judged_write`, `row_a_rewind_that_removes_a_document_asks_again_for_a_judged_write_above_the_horizon` |
+| The bound under a removal taken from a restored entry when there is one | `a_rewind_that_restores_one_document_and_removes_another_is_bounded_by_the_removal` |
+| Delete the removed row without its count | `a_document_created_after_the_target_is_removed` |
+| Leave the removed row in its index | `a_document_created_after_the_target_is_removed` |
+| Bound only the origins whose coverage passes the target | `a_rewind_that_removes_a_document_asks_again_for_a_write_it_judged` |
+| Bound the vectors when the rewind neither restores nor removes | `a_rewind_that_discards_nothing_changes_neither_vector` |
+| Refuse a discarded entry's token only while the member does not hold the entry again | `a_rewound_entry_a_peer_sends_back_stays_refused` |
+| Floor a removal at zero, below the oplog horizon | `a_removal_does_not_ask_below_the_horizon_for_an_insert_whose_delete_was_collected` |
+| Floor a removal at the horizon even beside a restored entry below it | `row_a_removal_beside_a_restored_entry_below_the_horizon_floors_at_that_entry` |
+| The bound under a removal beside a late restored entry without what retention collected | `row_a_removal_beside_a_late_restored_entry_keeps_the_members_collected_drop` |
+| Remove the row of a document deleted at the target | `row_a_rewind_keeps_the_tombstone_of_a_document_deleted_at_the_target` |
+| Bound the vectors only for a removed live row | `row_a_rewind_that_removes_a_deleted_document_asks_again_for_a_judged_write` |
+| Put back a version of a collection life a drop ended (no skip of history) | `a_rewind_does_not_put_back_a_version_of_a_life_a_drop_ended`, `row_a_rewind_puts_back_no_version_of_a_life_a_drop_ended` |
+| Skip an ended life's entries only after the target | `a_rewind_does_not_put_back_a_version_of_a_life_a_drop_ended` |
+| Skip an ended life's live entries only, not its deletes | `a_rewind_does_not_put_back_the_delete_of_a_life_a_drop_ended` |
+| Judge an entry's life by the collection's `created` instead of its floor and tombstone | `a_write_after_a_drop_and_before_the_re_creation_is_of_the_standing_life` |
+| Give a tie with the drop's `Hlc` to the entry | `an_entry_in_the_drops_own_millisecond_is_of_the_life_it_ended`, `row_a_rewind_takes_an_entry_in_the_drops_millisecond_as_the_ended_lifes` |
+| Ignore a drop after the target known only by its tombstone | `a_rewind_past_a_drop_a_snapshot_page_carried_is_refused_without_writing` |
+| Refuse a drop's tombstone at the target | `a_rewind_to_the_drop_itself_is_not_refused` |
+| Ignore a drop after the target known only by a floor | `a_rewind_past_a_drop_named_only_by_a_floor_is_refused` |
+| Refuse a floor at the target | `a_rewind_past_a_drop_named_only_by_a_floor_is_refused` |
 
 **The first one escaped on the first run**, and it is the most important refusal
 in the feature: without it a rewind leaves an unrecoverable document at its
@@ -511,6 +547,10 @@ collects the newest entry ([ADR-028](decisions.md)), so the document's insert
 was still the tail and the rewind cheerfully *removed* the document instead. The
 fixture had not built the condition it was named for. Only after adding writes
 to push the insert off the tail does removing the check turn it red.
+
+Three narrowings of the skip of an ended life's entries pass every rewind test and
+are argued equivalent in [ADR-248](decisions.md) rather than listed: judging by the
+tombstone alone, by the floor alone, and only at or below the target.
 
 ### The cluster's channel binding
 

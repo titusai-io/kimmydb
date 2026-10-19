@@ -1,4 +1,4 @@
-//! `Idempotency-Key` at the HTTP edge (B5): which routes take it and which
+//! `Idempotency-Key` at the HTTP edge (ADR-240): which routes take it and which
 //! refuse it, what a malformed key draws, the gate (the operator's switch and the
 //! live-peer net), and the body path a keyed request is read through.
 //!
@@ -561,7 +561,7 @@ const UNHEARD_KEY: &str = "\"unheard-6f1c0e52-8a1d-4f53-9b3e-2c1d6a7e\"";
 /// The switch on, clustered, a live peer not heard from yet and no held block
 /// saying no (a peer that came up a moment ago, or whose block was dropped on a
 /// rename): every keyed route answers `503 peer_unheard`, `retry: wait`, with
-/// `Retry-After` of one sync interval, naming the member and saying to send the
+/// `Retry-After: 1`, naming the member and saying to send the
 /// same key again; the refusal is counted as gated, writes nothing and the
 /// capability is not listed. Once the peer is heard, the same request with the
 /// same key is taken as a first answer, and sent again is its replay.
@@ -585,8 +585,8 @@ async fn a_live_peer_not_heard_from_is_answered_503_and_the_same_key_is_then_tak
         assert_eq!(answer.body["retry"], "wait", "{}", answer.text);
         assert_eq!(
             answer.headers.get("retry-after").map(|v| v.to_str().unwrap()),
-            Some("2"),
-            "{method} {path}: one sync interval"
+            Some("1"),
+            "{method} {path}: a fixed second"
         );
         let message = answer.body["message"].as_str().unwrap();
         for said in [id.to_string().as_str(), "Idempotency-Key", "transient", "same key"] {
@@ -809,7 +809,7 @@ async fn the_version_publishes_the_window() {
     assert_eq!(version.body["idempotencyWindowSecs"], 3_600);
 }
 
-/// Every series B5 adds is on the page from the start, at zero, the ones the
+/// Every series idempotency keys add is on the page from the start, at zero, the ones the
 /// storage half feeds included: a series that appears only once something
 /// happens is one a dashboard cannot be built on.
 #[tokio::test]
@@ -1169,7 +1169,7 @@ async fn a_different_request_under_a_remembered_key_is_refused_and_writes_nothin
 /// The record a peer would send for another request under `key` (another
 /// fingerprint, stamped just below this member's, from another member), stored
 /// here as replication stores it: the two meet in the merge, and the record
-/// turns contested (KR). Returns the record as stored.
+/// turns contested. Returns the record as stored.
 fn contest(engine: &Engine, key: &str) -> kimmy_storage::IdempotencyRecord {
     let orders = engine.get_collection("shop", "orders").unwrap();
     let scope = kimmy_core::IdempotencyKey::from_raw(key).unwrap().scope_hash("local:root");
@@ -1192,7 +1192,7 @@ fn contest(engine: &Engine, key: &str) -> kimmy_storage::IdempotencyRecord {
     stored
 }
 
-/// KR at the edge: a key two members accepted for two requests, whose records
+/// A contested key at the edge: a key two members accepted for two requests, whose records
 /// met here in a merge, is refused for every retry, `422
 /// idempotency_key_reused`, `retry: no`, writing nothing and never replayed,
 /// though the merged record carries this request's own fingerprint and first

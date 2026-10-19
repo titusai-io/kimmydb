@@ -413,7 +413,7 @@ fn a_050_decoder_reads_a_block_carrying_decimal128() {
     assert_eq!((facts.boot, facts.catching_up, facts.started_ms), (vec![3; 16], true, Some(7)));
 }
 
-/// `Facts.idempotency_records` (B5) is read by this build from an older sender's
+/// `Facts.idempotency_records` (ADR-240) is read by this build from an older sender's
 /// block as `None`, which is *does not carry records*, and a value of another shape
 /// costs the field only: the gate fails closed on anything but `Some(true)`.
 #[test]

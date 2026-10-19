@@ -57,6 +57,11 @@ struct Reachability {
     missed: usize,
     /// Of those, the ones still missing when effort stops being the limit.
     unreachable: usize,
+    /// Edges the build added at layer 0 to link points it had cut off
+    /// ([`link_cut_off`]).
+    linked: usize,
+    /// Points still cut off at layer 0 after the linking: a build to retry.
+    cut_off: usize,
 }
 
 /// How hard a second look is, before a miss is called data loss.
@@ -65,7 +70,11 @@ struct Reachability {
 /// re-probing the missed points at 200, 400, 800 and 1600 changes the answer
 /// between 200 and 800 and then stops. Past the plateau more exploration buys
 /// nothing, because no amount of exploring crosses into a part of the graph
-/// that has no edges leading to it.
+/// that has no edges leading to it. (That was `hnsw_rs` 0.3.4's graph, whose
+/// losses were points with no edge into them. On a linked graph a point still
+/// missed here is reachable and hard to find: on uniformly random
+/// 384-dimensional vectors, 60% to 85% of them are found at four times the
+/// effort.)
 const REACHABILITY_CONFIRM_EF: usize = 800;
 
 /// How many neighbours the second look asks for.
@@ -75,31 +84,38 @@ const REACHABILITY_CONFIRM_EF: usize = 800;
 /// not one.
 const REACHABILITY_CONFIRM_K: usize = 32;
 
-/// How many unreachable points in a sample mean the graph lost data, rather
-/// than being the graph HNSW ordinarily produces.
+/// How many unreachable points in a sample make a build warn that searches of
+/// its collection may miss near neighbours.
 ///
-/// **Not zero, and not for the reason this comment used to give.** An earlier
-/// revision said a healthy miss was a vector among near-duplicates getting
-/// edged out by a neighbour — approximation working as designed. That was
-/// assumed, and it is wrong: re-probed at [`REACHABILITY_CONFIRM_EF`] those
-/// points are still not found, so they are not edged out, they are genuinely
-/// unreachable. **Every graph this builds orphans a little.** Over 599 healthy
-/// builds at 400 vectors, checking every point rather than a sample, the true
-/// orphaned fraction ran **0.8% to 3.0%** — never zero.
+/// **A warning, not a retry, since 0.52.0** (ADR-241). Until then it
+/// separated `hnsw_rs` 0.3.4's routine orphaning (0.8% to 3% of every graph,
+/// sampled scores 0 to 7) from its catastrophic draws (10% to 35%, scores 13
+/// and up). 0.3.5 stores reverse edges at the right layer, and the build
+/// links every point its insertion still cuts off ([`link_cut_off`]), so no
+/// point is left that a search cannot reach, and what a probe can still miss
+/// is a reachable point the confirming search ran out of effort for.
+/// Measured with every point checked, after the linking:
 ///
-/// So the threshold separates *routine* orphaning from *catastrophic*
-/// orphaning, and both sides are measured:
+/// | vectors × dim | data | builds | not found at [`REACHABILITY_CONFIRM_EF`] | sampled score |
+/// |---|---|---|---|---|
+/// | 400 to 1,000, 16 and 384 dims | uniform, latent | 108 | none | 0 |
+/// | 4,000 × 384 | uniform | 4 | up to 0.17% | 0 |
+/// | 4,000 × 384 | latent | 4 | up to 0.03% | 0 |
+/// | 10,000 × 384 | uniform | 2 | 0.9%–1.1% | 1–3 |
+/// | 10,000 × 384 | latent | 2 | 0.01% | 0–1 |
+/// | 100,000 × 384 | latent | 1 | 0.02% | 0 |
+/// | 100,000 × 384 | uniform | 1 | 10.8% | 13 |
 ///
-/// | | true orphaned | sampled score |
-/// |---|---|---|
-/// | 599 healthy builds | 0.8%–3.0% | 0–5, median 1 |
-/// | the 1 catastrophic build | 14.8% | **22** |
-///
-/// Across a further 126 builds spanning 16 and 384 dimensions and 500 to 8,000
-/// vectors, no healthy build scored above 7. **Eight sits above every healthy
-/// observation and far below the only bad one**, and a catastrophic build at
-/// the mildest fraction on record (10%) still expects ~13 of 128 — with
-/// [`MAX_BUILD_ATTEMPTS`] fresh draws behind it.
+/// "Latent" is 24 dimensions projected into 384 with noise, nearer what an
+/// embedding model writes than independent uniform coordinates are, which
+/// are HNSW's hardest case. **Eight sits above every score measured on data
+/// of realistic intrinsic dimension and below a graph that loses a tenth of
+/// itself**, which expects 13 of 128. Uniformly random 384-dimensional
+/// vectors at 100,000 score above it with every point linked. A build is
+/// retried only when the linking leaves a point cut off
+/// ([`MAX_BUILD_ATTEMPTS`]): a high score with nothing cut off is a
+/// collection that is hard to search, which another insertion order does not
+/// change, and retrying it tripled the build cost on exactly those builds.
 ///
 /// **This was 3, sized against a 400-vector, 16-dimensional fixture, and the
 /// shape depends on both.** At 384 dimensions — the realistic embedding width —
@@ -110,14 +126,33 @@ const REACHABILITY_CONFIRM_K: usize = 32;
 /// covers the rest.
 const REACHABILITY_MAX_UNREACHABLE: usize = 8;
 
-/// How many times a build that loses data is discarded and retried.
+/// How many times a build is retried when its linking leaves a point cut off
+/// at layer 0 ([`link_cut_off`]), logged at `ERROR`.
 ///
-/// The layer draw is independent each time, so at a measured ~0.4% failure
-/// rate two retries take the odds to roughly one in ten million. It is
-/// bounded because an index that genuinely cannot be built well — a
-/// pathological collection rather than an unlucky draw — must still return
-/// something rather than loop.
+/// No measured build has: an edge is only ever added, and every cut-off point
+/// had a linked point near it. Each attempt inserts in its own order
+/// ([`insertion_order`]), the only draw `hnsw_rs` 0.3.5 leaves to vary, so a
+/// retry is another graph. It is bounded because an index that genuinely
+/// cannot be built well — a pathological collection rather than an unlucky
+/// draw — must still return something rather than loop.
 const MAX_BUILD_ATTEMPTS: usize = 2;
+
+/// How many of a cut-off point's nearest linked points get an edge into it
+/// ([`link_cut_off`]). Two, so that one later removal of a list entry cannot
+/// cut it off again; one more edge each costs nothing measurable.
+const LINK_EDGES: usize = 2;
+
+/// How wide the search for a cut-off point's nearest linked points looks.
+/// The candidates only have to be near and linked, not the true nearest: an
+/// edge from any linked point makes the point reachable.
+const LINK_CANDIDATES: usize = 16;
+const LINK_EF: usize = 100;
+
+/// How many rounds of linking a build makes before it stops. Every measured
+/// build needed one: an edge is only ever added, so a point linked stays
+/// linked, and a round can only leave a point cut off whose candidates were
+/// all cut off too.
+const LINK_ROUNDS: usize = 4;
 
 /// What a snapshot must say about itself to be trusted.
 ///
@@ -155,6 +190,15 @@ struct SnapshotMeta {
     /// anyway when it is older.
     #[serde(default)]
     renames: u64,
+    /// Which build of the graph this is ([`GRAPH_BUILD`]); 0 when absent.
+    ///
+    /// A field rather than a format, so that 0.51, which ignores a field it
+    /// does not know, loads this build's graphs (the dump's layout is the
+    /// same) and a rollback rebuilds nothing; and exact, because 0.51 writes
+    /// its `meta.json` from its own fields, so a graph it rebuilt and saved
+    /// over one of these reads as 0 again.
+    #[serde(default)]
+    graph: u32,
 }
 
 /// Bumped when the snapshot layout changes; a mismatch is a rebuild, not a
@@ -172,7 +216,21 @@ struct SnapshotMeta {
 /// count, it would serve them for as long as the count held. The cost is one
 /// rebuild per vector collection per member, on its first search after the
 /// upgrade. A 0.50 build refuses a format-3 snapshot in turn, and rebuilds.
+///
+/// **Not bumped for 0.52.0's graphs** (ADR-241), which say what built them in
+/// [`SnapshotMeta::graph`] instead: the dump's layout did not change, so a
+/// 0.51 member reads a 0.52 graph and serves it, and a rollback rebuilds
+/// nothing.
 const SNAPSHOT_FORMAT: u32 = 3;
+
+/// What [`SnapshotMeta::graph`] says of a graph this build made: `hnsw_rs`
+/// 0.3.5, with every point its insertion cut off at layer 0 linked
+/// ([`link_cut_off`]). A snapshot without it (0, the field absent) was built
+/// by 0.3.4, whose graphs left 0.5% to 5% of a collection where no search
+/// reaches it, and is adopted as behind: it serves the search that loaded it,
+/// and the next one rebuilds it. 1 was never written: no release built 0.3.5
+/// graphs without the linking.
+const GRAPH_BUILD: u32 = 2;
 
 /// What the snapshot at `dir` says it was built for, read from its
 /// `meta.json` and nothing else: which incarnation, and at which shape.
@@ -204,14 +262,19 @@ pub(crate) struct SnapshotIdentity {
     pub(crate) dim: usize,
 }
 
-/// Reload one graph from a leaked io handle, containing `hnsw_rs`'s panics.
+/// Reload one graph from a leaked io handle, once [`crate::dump::check`] has
+/// passed its files, containing `hnsw_rs`'s panics.
 ///
-/// The library `unwrap`s on a corrupt graph file — bad magic aborts the
-/// process — and a torn file on disk must cost a rebuild, never the node.
-/// Found by the corrupt-snapshot test, the same way `DistDot`'s assert was
-/// found: by testing the failure path rather than trusting the library's.
-/// `AssertUnwindSafe` is sound here: the closure touches only the leaked io
-/// and the files it reads — no engine state a mid-load panic could tear.
+/// The library `unwrap`s and asserts on a corrupt dump, and a torn file on
+/// disk must cost a rebuild, never the node. Found by the corrupt-snapshot
+/// test, the same way `DistDot`'s assert was found: by testing the failure
+/// path rather than trusting the library's. **`catch_unwind` is not enough on
+/// its own** (ADR-241): the loader also ends the process (`exit(1)`) and
+/// aborts it (an allocation of a declared size), which no unwind sees, and so
+/// the files are checked first, by `check`. The catch stays for whatever that
+/// check does not foresee. `AssertUnwindSafe` is sound here: the closure
+/// touches only the leaked io and the files it reads — no engine state a
+/// mid-load panic could tear.
 fn load_graph<D>(dir: &std::path::Path) -> std::result::Result<Hnsw<'static, f32, D>, String>
 where
     D: hnsw_rs::anndists::dist::Distance<f32> + Default + Send + Sync,
@@ -224,7 +287,7 @@ where
         // problem. One small allocation per collection per process, bounded
         // and deliberate, in exchange for not pulling in a
         // self-referential-struct dependency to hold the pair.
-        let io = Box::leak(Box::new(hnsw_rs::hnswio::HnswIo::new(&dir, "index")));
+        let io = Box::leak(Box::new(hnsw_rs::hnswio::HnswIo::new(&dir, crate::dump::BASENAME)));
         io.load_hnsw::<f32, D>().map_err(|e| e.to_string())
     }))
     .unwrap_or_else(|_| Err("reload panicked; the file is corrupt".to_string()))
@@ -271,6 +334,355 @@ fn estimate_bytes(keys: &[String], dim: usize) -> usize {
     keys.len() * per_node + key_bytes
 }
 
+/// Layer 0 of a graph, read from its structure: for each graph id, whether
+/// no edge leads into it, and whether the entry point's component at layer 0
+/// does not hold it (no path of edges leads to it from the entry point).
+///
+/// Every search ends its descent at some point of layer 0 and walks the edges
+/// from there, so a point with no edge into it is returned only when a
+/// descent ends on it, and a point outside the entry point's component only
+/// from a descent that ends inside its own. Either is a point the graph has
+/// lost. The entry point is the first point inserted at the top level: the
+/// library replaces it only on a strictly higher one, and graph ids are
+/// insertion order.
+struct Layer0 {
+    no_edge_in: Vec<bool>,
+    outside: Vec<bool>,
+    /// Each point's layer-0 edges, by graph id.
+    edges: Vec<Vec<usize>>,
+}
+
+impl Layer0 {
+    fn read<D>(graph: &Hnsw<'static, f32, D>) -> Self
+    where
+        D: hnsw_rs::anndists::dist::Distance<f32> + Send + Sync,
+    {
+        let n = graph.get_nb_point();
+        if n == 0 {
+            // The library's point iterator unwraps the entry point, which an
+            // empty graph does not have.
+            return Self { no_edge_in: Vec::new(), outside: Vec::new(), edges: Vec::new() };
+        }
+        let mut level = vec![0u8; n];
+        let mut edges: Vec<Vec<usize>> = vec![Vec::new(); n];
+        for point in graph.get_point_indexation() {
+            let at = point.get_origin_id();
+            if at >= n {
+                continue;
+            }
+            level[at] = point.get_point_id().0;
+            edges[at] = point.get_neighborhood_id()[0].iter().map(|e| e.d_id).collect();
+        }
+        let mut into = vec![false; n];
+        for (at, out) in edges.iter().enumerate() {
+            for &to in out {
+                if to != at && to < n {
+                    into[to] = true;
+                }
+            }
+        }
+        let top = level.iter().copied().max().unwrap_or(0);
+        let mut reached = vec![false; n];
+        if let Some(entry) = (0..n).find(|&i| level[i] == top) {
+            // The entry point needs no edge into it: every search starts there.
+            into[entry] = true;
+            reached[entry] = true;
+            let mut stack = vec![entry];
+            while let Some(at) = stack.pop() {
+                for &to in &edges[at] {
+                    if to < n && !std::mem::replace(&mut reached[to], true) {
+                        stack.push(to);
+                    }
+                }
+            }
+        }
+        Self {
+            no_edge_in: into.iter().map(|linked| !linked).collect(),
+            outside: reached.iter().map(|r| !r).collect(),
+            edges,
+        }
+    }
+
+    /// The graph ids the graph has lost, in id order.
+    fn cut_off(&self) -> Vec<usize> {
+        (0..self.outside.len()).filter(|&i| self.no_edge_in[i] || self.outside[i]).collect()
+    }
+}
+
+/// Give every point a build left cut off at layer 0 ([`Layer0`]) an edge into
+/// it from [`LINK_EDGES`] of its nearest linked points, until none is cut off
+/// (ADR-241). Returns how many edges were added, and how many points are still
+/// cut off (none, in every build measured).
+///
+/// The nearest linked points come from a search of [`LINK_CANDIDATES`]. A
+/// point whose candidates are all cut off themselves, which a component of
+/// more than that many points out of the entry point's reach can leave, is
+/// bridged instead ([`bridges`]).
+///
+/// **Why a build leaves any.** `hnsw_rs` adds a new point to each of its
+/// neighbours' lists and, when a list is over its cap, drops the farthest
+/// entry, which can be the new point; a point dropped by every neighbour has
+/// no edge into it. 0.3.5 left 0.1% of a collection of low intrinsic
+/// dimension like that at 10,000 to 100,000 vectors, and 1.5% to 8% of
+/// uniformly random 384-dimensional ones; no search returns them. The edge is
+/// added past the cap, never by displacing another (`add_layer0_edges`, the
+/// one function kimmydb's copy of the library adds), so no point loses an
+/// edge into it, and every measured build was linked in one round, in under a
+/// second at 100,000 vectors of realistic data.
+fn link_cut_off<D>(graph: &Hnsw<'static, f32, D>, engine: &Engine) -> Result<(usize, usize)>
+where
+    D: hnsw_rs::anndists::dist::Distance<f32> + Default + Send + Sync,
+{
+    let mut added = 0;
+    for _ in 0..LINK_ROUNDS {
+        // A builder's work, which the node's stop ends, as the inserts.
+        engine.check_walk(kimmy_storage::WalkScope::Background)?;
+        let layer0 = Layer0::read(graph);
+        let cut = layer0.cut_off();
+        if cut.is_empty() {
+            return Ok((added, 0));
+        }
+        let lost: HashSet<usize> = cut.iter().copied().collect();
+        let mut vectors: Vec<Option<Vec<f32>>> = vec![None; layer0.outside.len()];
+        for point in graph.get_point_indexation() {
+            let at = point.get_origin_id();
+            if lost.contains(&at) {
+                vectors[at] = Some(point.get_v().to_vec());
+            }
+        }
+        let mut edges = Vec::with_capacity(cut.len() * LINK_EDGES);
+        // Edges given so far, by the point they leave: of a cut-off point's
+        // candidates, the least given win, nearest first among equals. Many
+        // copies of one vector all find the same few linked candidates, and
+        // would otherwise hang every edge on one of them.
+        let mut given: std::collections::HashMap<usize, usize> = Default::default();
+        let mut stranded = false;
+        for (at, &point) in cut.iter().enumerate() {
+            // One search per cut-off point, which on uniform data at a million
+            // vectors is tens of thousands: the stop is looked at between them,
+            // as the bridge's pass looks at it.
+            if at > 0 && at % BRIDGE_STOP_STRIDE == 0 {
+                #[cfg(test)]
+                LINK_PASS_HOOK.with(|hook| {
+                    if let Some(hook) = hook.borrow().as_ref() {
+                        hook();
+                    }
+                });
+                engine.check_walk(kimmy_storage::WalkScope::Background)?;
+            }
+            let Some(vector) = vectors[point].as_deref() else { continue };
+            let mut candidates: Vec<(usize, usize)> = graph
+                .search(vector, LINK_CANDIDATES, LINK_EF)
+                .iter()
+                .map(|n| n.d_id)
+                .filter(|&from| from != point && !lost.contains(&from))
+                .enumerate()
+                .map(|(rank, from)| {
+                    (given.get(&from).copied().unwrap_or(0) * LINK_CANDIDATES + rank, from)
+                })
+                .collect();
+            candidates.sort_unstable();
+            stranded |= candidates.is_empty();
+            for &(_, from) in candidates.iter().take(LINK_EDGES) {
+                *given.entry(from).or_default() += 1;
+                edges.push((from, point));
+            }
+        }
+        let mut linked = graph.add_layer0_edges(&edges);
+        if stranded {
+            let bridged =
+                bridges(graph, &Layer0::read(graph), engine, kimmy_storage::WalkScope::Background)?;
+            linked += graph.add_layer0_edges(&bridged);
+        }
+        if linked == 0 {
+            // Nothing could be linked: a graph with no linked point at all.
+            // Another round would find the same.
+            return Ok((added, cut.len()));
+        }
+        added += linked;
+    }
+    Ok((added, Layer0::read(graph).cut_off().len()))
+}
+
+/// Edges into and out of each component of cut-off points that no search's
+/// candidates reach (ADR-241): a component of more than [`LINK_CANDIDATES`]
+/// points out of the entry point's reach, whose searches return only one
+/// another. One point of each weakly connected component of cut-off points,
+/// one that no other cut-off point has an edge into when the component has
+/// one, is joined both ways to its [`LINK_EDGES`] nearest linked points,
+/// found by reading every linked point. Whatever of the component that point
+/// does not reach is linked by the next round's search, or bridged again: in
+/// every graph measured within two of the [`LINK_ROUNDS`], and a component
+/// left after them is the build's structural retry. The cost is one pass over
+/// the graph's vectors,
+/// scoring each against one point per component, which looks at the node's
+/// stop as it goes; and nothing when no point was stranded.
+fn bridges<D>(
+    graph: &Hnsw<'static, f32, D>,
+    layer0: &Layer0,
+    engine: &Engine,
+    scope: kimmy_storage::WalkScope,
+) -> Result<Vec<(usize, usize)>>
+where
+    D: hnsw_rs::anndists::dist::Distance<f32> + Default + Send + Sync,
+{
+    let cut = layer0.cut_off();
+    let n = layer0.outside.len();
+    let mut lost = vec![false; n];
+    for &point in &cut {
+        lost[point] = true;
+    }
+    // The weakly connected components of the cut-off points, by union-find
+    // over the layer-0 edges between them.
+    let mut parent: Vec<usize> = (0..n).collect();
+    fn root(parent: &mut [usize], mut at: usize) -> usize {
+        while parent[at] != at {
+            parent[at] = parent[parent[at]];
+            at = parent[at];
+        }
+        at
+    }
+    let mut fed = vec![false; n];
+    for &from in &cut {
+        for &to in &layer0.edges[from] {
+            if to < n && to != from && lost[to] {
+                fed[to] = true;
+                let (a, b) = (root(&mut parent, from), root(&mut parent, to));
+                if a != b {
+                    parent[a.max(b)] = a.min(b);
+                }
+            }
+        }
+    }
+    // One head per component: its first point no other cut-off point has an
+    // edge into, when it has one, else its first point. The preference only
+    // spares rounds: a head with an edge into it from the component reaches
+    // less of it, and the next round links or bridges the rest.
+    let mut head_of: std::collections::BTreeMap<usize, usize> = Default::default();
+    for &point in &cut {
+        let component = root(&mut parent, point);
+        let head = head_of.entry(component).or_insert(point);
+        if fed[*head] && !fed[point] {
+            *head = point;
+        }
+    }
+    let heads: Vec<usize> = head_of.into_values().collect();
+    #[cfg(test)]
+    BRIDGE_HEADS.with(|h| h.set(h.get() + heads.len()));
+    if heads.is_empty() {
+        return Ok(Vec::new());
+    }
+    let mut vectors: Vec<Option<Vec<f32>>> = vec![None; heads.len()];
+    let slot: std::collections::HashMap<usize, usize> =
+        heads.iter().enumerate().map(|(i, &h)| (h, i)).collect();
+    for point in graph.get_point_indexation() {
+        if let Some(&i) = slot.get(&point.get_origin_id()) {
+            vectors[i] = Some(point.get_v().to_vec());
+        }
+    }
+    let distance = D::default();
+    let mut nearest: Vec<Vec<(f32, usize)>> = vec![Vec::new(); heads.len()];
+    for (read, point) in graph.get_point_indexation().into_iter().enumerate() {
+        if read % BRIDGE_STOP_STRIDE == 0 {
+            #[cfg(test)]
+            BRIDGE_PASS_HOOK.with(|hook| {
+                if let Some(hook) = hook.borrow().as_ref() {
+                    hook();
+                }
+            });
+            engine.check_walk(scope)?;
+        }
+        let from = point.get_origin_id();
+        if from >= n || lost[from] {
+            continue;
+        }
+        for (i, vector) in vectors.iter().enumerate() {
+            let Some(vector) = vector else { continue };
+            let near = &mut nearest[i];
+            near.push((distance.eval(vector, point.get_v()), from));
+            if near.len() > LINK_EDGES {
+                near.sort_unstable_by(|a, b| a.0.total_cmp(&b.0).then(a.1.cmp(&b.1)));
+                near.truncate(LINK_EDGES);
+            }
+        }
+    }
+    let mut edges = Vec::new();
+    for (&head, near) in heads.iter().zip(&nearest) {
+        for &(_, from) in near {
+            edges.push((from, head));
+            edges.push((head, from));
+        }
+    }
+    Ok(edges)
+}
+
+/// How many vectors the bridge's pass reads, and how many cut-off points the
+/// linking searches for, between looks at the node's stop.
+const BRIDGE_STOP_STRIDE: usize = 4_096;
+
+#[cfg(test)]
+thread_local! {
+    /// How many heads the bridges made on this thread have joined.
+    static BRIDGE_HEADS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    /// Called on this thread at each of the bridge pass's looks at the stop,
+    /// just before it looks.
+    static BRIDGE_PASS_HOOK: std::cell::RefCell<Option<Box<dyn Fn()>>> =
+        const { std::cell::RefCell::new(None) };
+    /// The same, for the linking's looks between its searches.
+    static LINK_PASS_HOOK: std::cell::RefCell<Option<Box<dyn Fn()>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Builds on this thread skip the linking, so a test can make a build
+    /// that leaves points cut off.
+    static SKIP_LINKING: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// How many build attempts this thread has made.
+    static BUILD_ATTEMPTS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// fsync a file or a directory: what [`HnswIndex::save`] writes, and the
+/// directory entries that name it.
+fn sync(path: &std::path::Path) -> std::io::Result<()> {
+    std::fs::File::open(path)?.sync_all()
+}
+
+/// Put `items` in the order build `attempt` inserts them (ADR-241).
+///
+/// **The order is the draw.** `hnsw_rs` 0.3.5 gives each point the next level
+/// of one generator that every graph seeds with the constant 397, and has no
+/// way to seed it otherwise: the point inserted `i`-th always gets the `i`-th
+/// level of the same sequence. So the same records inserted in the same order
+/// build the same graph, level for level and edge for edge, and a retry that
+/// kept the order would rebuild exactly the graph it was retrying (0.3.4 drew
+/// levels from an unseeded generator, which is what made its retries
+/// independent). Each attempt therefore inserts in another order.
+///
+/// The scheme: a Fisher–Yates shuffle of the walk's order (the chunk keys in
+/// key order), driven by SplitMix64 seeded with the attempt number, every
+/// attempt the first included. It is a function of the records and the
+/// attempt alone, so a collection's graph is reproducible on every member and
+/// across restarts, and two attempts differ. Shuffling the first attempt as
+/// well keeps the key order out of the build: a key order that tracks the
+/// vectors (ids that grow with time while what is written drifts) is an
+/// insertion order HNSW builds poorer graphs from.
+fn insertion_order<T>(items: &mut [T], attempt: usize) {
+    let mut state = attempt as u64;
+    let mut next = move || {
+        state = state.wrapping_add(0x9E37_79B9_7F4A_7C15);
+        let mut z = state;
+        z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+        z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+        z ^ (z >> 31)
+    };
+    for i in (1..items.len()).rev() {
+        // Lemire's multiply-shift: an index in 0..=i without a modulo's bias.
+        let j = ((u128::from(next()) * (i as u128 + 1)) >> 64) as usize;
+        items.swap(i, j);
+    }
+}
+
 /// An approximate index over one collection's vectors.
 pub struct HnswIndex {
     graph: Graph,
@@ -287,6 +699,12 @@ pub struct HnswIndex {
     /// [`SnapshotMeta::renames`]: the shadow's moves of chunk ids when this was
     /// built, read before its walk.
     renames: u64,
+    /// [`SnapshotMeta::graph`]: [`GRAPH_BUILD`] for a graph this build made,
+    /// what the snapshot said for one it loaded.
+    built_by: u32,
+    /// The build check's sampled score ([`Reachability::unreachable`]); 0 for
+    /// a graph loaded from a snapshot, which was not sampled here.
+    unreached: usize,
 }
 
 impl HnswIndex {
@@ -327,42 +745,64 @@ impl HnswIndex {
     /// reach it.
     ///
     /// So the graph is checked against the property that matters, by asking a
-    /// sample of stored vectors to find themselves. A failed build is
-    /// discarded and rebuilt from a fresh random draw. Draws are independent,
-    /// so one retry takes ~0.4% to ~1 in 60,000.
+    /// sample of stored vectors to find themselves.
+    ///
+    /// **Those measurements were `hnsw_rs` 0.3.4's** (ADR-241), whose
+    /// misplaced reverse edges were most of what the check caught. 0.3.5
+    /// places them right, and the build now links every point its insertion
+    /// still cuts off ([`link_cut_off`]). A build that leaves one cut off even
+    /// so is discarded and rebuilt in another insertion order
+    /// ([`insertion_order`]); a sample that scores high with nothing cut off
+    /// warns ([`REACHABILITY_MAX_UNREACHABLE`]) and is served.
     pub fn build(
         engine: &Engine,
         shadow: &CollectionMeta,
         metric: Metric,
         dim: usize,
     ) -> Result<Self> {
-        let mut built = Self::build_once(engine, shadow, metric, dim)?;
-        for attempt in 1..=MAX_BUILD_ATTEMPTS {
-            if built.1.unreachable < REACHABILITY_MAX_UNREACHABLE {
-                return Ok(built.0);
+        let mut attempt = 0;
+        loop {
+            let (mut index, reach) = Self::build_once(engine, shadow, metric, dim, attempt)?;
+            index.unreached = reach.unreachable;
+            if reach.cut_off == 0 || attempt == MAX_BUILD_ATTEMPTS {
+                if reach.cut_off > 0 {
+                    // Never fail: a graph still answers, and refusing to build
+                    // one would take vector search down over a quality problem.
+                    tracing::error!(
+                        collection = %shadow.name,
+                        vectors = index.keys.len(),
+                        cut_off = reach.cut_off,
+                        attempts = attempt + 1,
+                        "HNSW graph still has points no search reaches after linking, in every \
+                         insertion order tried; searches on this collection may miss them"
+                    );
+                }
+                if reach.unreachable >= REACHABILITY_MAX_UNREACHABLE {
+                    // Not retried: every point is linked, so these are points
+                    // a search of the check's effort misses, and another
+                    // order does not make the collection easier to search.
+                    tracing::warn!(
+                        collection = %shadow.name,
+                        vectors = index.keys.len(),
+                        unreachable = reach.unreachable,
+                        sampled = reach.sampled,
+                        "HNSW graph: sampled vectors could not find themselves at the build \
+                         check's search effort though every point is linked; searches on this \
+                         collection may miss near neighbours"
+                    );
+                }
+                return Ok(index);
             }
-            debug!(
+            tracing::error!(
+                collection = %shadow.name,
+                vectors = index.keys.len(),
+                cut_off = reach.cut_off,
                 attempt,
-                unreachable = built.1.unreachable,
-                missed = built.1.missed,
-                vectors = built.0.keys.len(),
-                "HNSW build left data unreachable; rebuilding"
+                "HNSW build left points no search reaches after linking them; rebuilding in \
+                 another insertion order"
             );
-            built = Self::build_once(engine, shadow, metric, dim)?;
+            attempt += 1;
         }
-        if built.1.unreachable >= REACHABILITY_MAX_UNREACHABLE {
-            // Never fail: a poor index still answers, and refusing to build one
-            // would take vector search down entirely over a quality problem.
-            // The caller gets a working index and the operator gets a warning.
-            tracing::warn!(
-                vectors = built.0.keys.len(),
-                unreachable = built.1.unreachable,
-                sampled = built.1.sampled,
-                "HNSW index still loses data after {MAX_BUILD_ATTEMPTS} rebuilds; \
-                 searches on this collection may be incomplete"
-            );
-        }
-        Ok(built.0)
     }
 
     /// One build, with the count of sampled vectors that could not find
@@ -383,6 +823,7 @@ impl HnswIndex {
         shadow: &CollectionMeta,
         metric: Metric,
         dim: usize,
+        attempt: usize,
     ) -> Result<(Self, Reachability)> {
         if !Self::supports(metric) {
             return Err(VectorError::MalformedResponse {
@@ -412,7 +853,9 @@ impl HnswIndex {
         // graph read as behind, never as fresh.
         let renames = engine.vector_renames(shadow.id)?;
         let mut records: Vec<(String, Vec<f32>)> = Vec::new();
-        engine.for_each_vector(shadow, kimmy_storage::WalkScope::Request, |id, record| {
+        // A builder's walk, off every request (ADR-241), which the node's
+        // stop ends.
+        engine.for_each_vector(shadow, kimmy_storage::WalkScope::Background, |id, record| {
             // A wrong width belongs to a different model and would corrupt
             // every distance the graph computes.
             if record.vector.len() == dim
@@ -422,6 +865,9 @@ impl HnswIndex {
             }
             Ok(true)
         })?;
+        // The library draws every level from one fixed seed, so the order is
+        // the only thing that tells two attempts apart ([`insertion_order`]).
+        insertion_order(&mut records, attempt);
 
         let expected = records.len().max(1);
         let graph = match metric {
@@ -483,8 +929,8 @@ impl HnswIndex {
         // build's peak is one copy plus the graph's bookkeeping, not two.
         let mut keys = Vec::with_capacity(n);
         for (key, vector) in records {
-            // A build is for a search, which the drain's deadline ends.
-            engine.check_walk(kimmy_storage::WalkScope::Request)?;
+            // A builder's work, which the node's stop ends.
+            engine.check_walk(kimmy_storage::WalkScope::Background)?;
             let id = keys.len();
             match &graph {
                 Graph::Cosine(g) => g.insert((vector.as_slice(), id)),
@@ -493,13 +939,45 @@ impl HnswIndex {
             keys.push(key);
         }
 
-        debug!(vectors = keys.len(), "built HNSW index");
+        // Link what the insertion left where no search reaches (ADR-241).
+        #[cfg(test)]
+        let unlinked = SKIP_LINKING.with(|skip| skip.get());
+        #[cfg(not(test))]
+        let unlinked = false;
+        let (linked, cut_off) = match &graph {
+            _ if unlinked => (0, 0),
+            Graph::Cosine(g) => link_cut_off(g, engine)?,
+            Graph::Euclidean(g) => link_cut_off(g, engine)?,
+        };
+        #[cfg(test)]
+        let cut_off = if unlinked {
+            match &graph {
+                Graph::Cosine(g) => Layer0::read(g).cut_off().len(),
+                Graph::Euclidean(g) => Layer0::read(g).cut_off().len(),
+            }
+        } else {
+            cut_off
+        };
+        #[cfg(test)]
+        BUILD_ATTEMPTS.with(|n| n.set(n.get() + 1));
+
+        debug!(vectors = keys.len(), linked, "built HNSW index");
         let bytes = estimate_bytes(&keys, dim);
-        let index = Self { graph, keys, metric, dim, created: shadow.created, bytes, renames };
+        let index = Self {
+            graph,
+            keys,
+            metric,
+            dim,
+            created: shadow.created,
+            bytes,
+            renames,
+            built_by: GRAPH_BUILD,
+            unreached: 0,
+        };
 
         // Ask the sampled vectors to find themselves. A few dozen searches
         // against an O(n log n) build, and no extra reads.
-        let mut reach = Reachability::default();
+        let mut reach = Reachability { linked, cut_off, ..Reachability::default() };
         for (i, vector) in &probes {
             reach.sampled += 1;
             let found = index.search_keys(vector, 1)?;
@@ -527,9 +1005,14 @@ impl HnswIndex {
     /// are both at distance zero, so a `k` of one can return the other and
     /// report a miss that has nothing to do with reachability.
     fn finds_itself(&self, query: &[f32], id: usize) -> bool {
+        self.finds_itself_at(query, id, REACHABILITY_CONFIRM_EF)
+    }
+
+    /// [`Self::finds_itself`] at a chosen effort.
+    fn finds_itself_at(&self, query: &[f32], id: usize, ef: usize) -> bool {
         let neighbours = match &self.graph {
-            Graph::Cosine(g) => g.search(query, REACHABILITY_CONFIRM_K, REACHABILITY_CONFIRM_EF),
-            Graph::Euclidean(g) => g.search(query, REACHABILITY_CONFIRM_K, REACHABILITY_CONFIRM_EF),
+            Graph::Cosine(g) => g.search(query, REACHABILITY_CONFIRM_K, ef),
+            Graph::Euclidean(g) => g.search(query, REACHABILITY_CONFIRM_K, ef),
         };
         neighbours.iter().any(|n| n.d_id == id)
     }
@@ -568,6 +1051,19 @@ impl HnswIndex {
         self.renames
     }
 
+    /// The build check's sampled score for this graph; 0 for one loaded from
+    /// a snapshot.
+    pub fn unreached(&self) -> usize {
+        self.unreached
+    }
+
+    /// Whether this build's library and linking made the graph
+    /// ([`GRAPH_BUILD`]). A loaded graph that was not is behind whatever the
+    /// store holds.
+    pub(crate) fn built_by_this_build(&self) -> bool {
+        self.built_by >= GRAPH_BUILD
+    }
+
     pub fn is_empty(&self) -> bool {
         self.keys.is_empty()
     }
@@ -593,7 +1089,14 @@ impl HnswIndex {
     /// Atomic by staging: the dump lands in a `.build` sibling that replaces
     /// the real directory only once every file is on disk. A crash mid-save
     /// leaves the previous snapshot (or none), never a torn one — and the
-    /// loader treats anything unreadable as absent anyway.
+    /// loader refuses anything unreadable anyway ([`crate::dump::check`]).
+    ///
+    /// **On disk means synced** (ADR-241). The files, then the staging
+    /// directory, are fsynced before the rename, and the parent after it.
+    /// Without that a rename can reach the disk before the data it names: a
+    /// crash then leaves the new name over files cut short, which `hnsw_rs`
+    /// answered by ending the process at the collection's first search, on
+    /// every restart, until the dump check refused them.
     pub fn save(&self, dir: &std::path::Path) -> Result<()> {
         use hnsw_rs::api::AnnT;
 
@@ -603,8 +1106,8 @@ impl HnswIndex {
         std::fs::create_dir_all(&staging).map_err(io)?;
 
         match &self.graph {
-            Graph::Cosine(g) => g.file_dump(&staging, "index"),
-            Graph::Euclidean(g) => g.file_dump(&staging, "index"),
+            Graph::Cosine(g) => g.file_dump(&staging, crate::dump::BASENAME),
+            Graph::Euclidean(g) => g.file_dump(&staging, crate::dump::BASENAME),
         }
         .map_err(|e| VectorError::Snapshot(e.to_string()))?;
 
@@ -615,15 +1118,27 @@ impl HnswIndex {
             created: self.created,
             keys: self.keys.clone(),
             renames: self.renames,
+            graph: self.built_by,
         };
         std::fs::write(
             staging.join("meta.json"),
             serde_json::to_vec(&meta).map_err(|e| VectorError::Snapshot(e.to_string()))?,
         )
         .map_err(io)?;
+        for file in [
+            format!("{}.hnsw.graph", crate::dump::BASENAME),
+            format!("{}.hnsw.data", crate::dump::BASENAME),
+            "meta.json".to_string(),
+        ] {
+            sync(&staging.join(file)).map_err(io)?;
+        }
+        sync(&staging).map_err(io)?;
 
         let _ = std::fs::remove_dir_all(dir);
         std::fs::rename(&staging, dir).map_err(io)?;
+        if let Some(parent) = dir.parent() {
+            sync(parent).map_err(io)?;
+        }
         debug!(vectors = self.keys.len(), ?dir, "saved HNSW snapshot");
         Ok(())
     }
@@ -667,6 +1182,21 @@ impl HnswIndex {
             )));
         }
 
+        // Before the library sees a byte of the dump: it ends the process on
+        // some of what a corrupt or foreign file holds (ADR-241).
+        let distance = match metric {
+            Metric::Cosine => std::any::type_name::<DistCosine>(),
+            Metric::Euclidean => std::any::type_name::<DistL2>(),
+            Metric::Dot => return Err(corrupt("dot has no approximate index".to_string())),
+        };
+        let expect = crate::dump::Expect {
+            points: meta.keys.len(),
+            dim,
+            connections: MAX_CONNECTIONS as u8,
+            distance,
+        };
+        crate::dump::check(dir, &expect).map_err(|e| corrupt(format!("graph dump: {e}")))?;
+
         let graph = match metric {
             Metric::Cosine => load_graph::<DistCosine>(dir).map(Graph::Cosine),
             Metric::Euclidean => load_graph::<DistL2>(dir).map(Graph::Euclidean),
@@ -684,6 +1214,8 @@ impl HnswIndex {
             created: meta.created,
             bytes,
             renames: meta.renames,
+            built_by: meta.graph,
+            unreached: 0,
         })
     }
 
@@ -719,8 +1251,20 @@ impl HnswIndex {
     /// ([`may_hold`]): only a key that can hold an admitted document's chunk,
     /// its run's or its 0.50 id, so a filtered search reads what it reads
     /// unfiltered scaled by the filter, not every candidate of the widened
-    /// walk. Filtering happens after the graph walk, so the search is widened
-    /// to compensate.
+    /// walk.
+    ///
+    /// **A filtered search returns as many hits as the admitted documents can
+    /// give, up to `k`** (ADR-241). Filtering happens after the walk, so the
+    /// walk is widened by how much of the collection the filter admits
+    /// ([`filtered_width`]). A walk that still comes back short is retried
+    /// once, widened by the share of its own candidates the filter admitted
+    /// ([`retry_width`]): a filter that tracks the vectors, and admits much
+    /// of the collection but little near the query, is widened by what the
+    /// walk saw rather than by the collection's ratio. A second short walk
+    /// gives way to reading the admitted documents' chunks by key, which is
+    /// exact and stops at `deadline` ([`VectorError::DeadlineExceeded`]).
+    /// With a fixed width a filter admitting 1% of 100,000 documents
+    /// returned four hits of ten.
     pub fn search(
         &self,
         engine: &Engine,
@@ -729,13 +1273,92 @@ impl HnswIndex {
         options: &SearchOptions,
         allowed: Option<&HashSet<DocId>>,
     ) -> Result<Vec<Hit>> {
-        // Over-fetch: the per-document cap can collapse several chunks of one
-        // document into a single result, which would otherwise return under k.
-        let over_fetch = (options.k * 4).max(options.k + 10);
-        // A post-filter discards results after the walk, so a selective filter
-        // needs a much wider search to still return k.
-        let wanted = if allowed.is_some() { over_fetch * 8 } else { over_fetch };
-        let keys = self.search_keys(query, wanted)?;
+        self.search_until(engine, shadow, query, options, allowed, None)
+    }
+
+    /// [`Self::search`], with the request's deadline for the keyed join a
+    /// filtered search can give way to.
+    pub fn search_until(
+        &self,
+        engine: &Engine,
+        shadow: &CollectionMeta,
+        query: &[f32],
+        options: &SearchOptions,
+        allowed: Option<&HashSet<DocId>>,
+        deadline: Option<std::time::Instant>,
+    ) -> Result<Vec<Hit>> {
+        let first = allowed
+            .map(|allowed| filtered_width(options.k, self.keys.len(), allowed.len()))
+            .unwrap_or_default();
+        self.search_with(
+            engine,
+            shadow,
+            query,
+            options,
+            allowed,
+            first,
+            FILTERED_WIDTH_CAP,
+            deadline,
+        )
+    }
+
+    /// [`Self::search_until`] with the first filtered walk's width and the
+    /// widest as parameters, so a test can make a first walk short, and reach
+    /// the keyed join, on a collection small enough to build.
+    #[allow(clippy::too_many_arguments)]
+    fn search_with(
+        &self,
+        engine: &Engine,
+        shadow: &CollectionMeta,
+        query: &[f32],
+        options: &SearchOptions,
+        allowed: Option<&HashSet<DocId>>,
+        first: usize,
+        cap: usize,
+        deadline: Option<std::time::Instant>,
+    ) -> Result<Vec<Hit>> {
+        let Some(allowed) = allowed else {
+            let walked =
+                self.walk(engine, shadow, query, options, None, walk_width(options.k, false))?;
+            return Ok(walked.hits);
+        };
+        // As many as the admitted documents can give: the per-document cap
+        // bounds each document's share.
+        let wanted = options.k.min(allowed.len().saturating_mul(options.per_document.max(1)));
+        let cap = cap.max(walk_width(options.k, true));
+        let first = first.clamp(walk_width(options.k, true), cap);
+        let walked = self.walk(engine, shadow, query, options, Some(allowed), first)?;
+        if walked.hits.len() >= wanted {
+            return Ok(walked.hits);
+        }
+        #[cfg(test)]
+        FILTERED_RETRIES.with(|n| n.set(n.get() + 1));
+        let wider = retry_width(options.k, first, &walked, cap);
+        if wider > first {
+            let walked = self.walk(engine, shadow, query, options, Some(allowed), wider)?;
+            if walked.hits.len() >= wanted {
+                return Ok(walked.hits);
+            }
+        }
+        #[cfg(test)]
+        KEYED_FALLBACKS.with(|n| n.set(n.get() + 1));
+        let ids: Vec<DocId> = allowed.iter().cloned().collect();
+        crate::search::vector_search_among_until(engine, shadow, query, options, &ids, deadline)
+    }
+
+    /// One walk of `width` candidates, admitted and ranked, with how many of
+    /// its candidates the filter admitted.
+    fn walk(
+        &self,
+        engine: &Engine,
+        shadow: &CollectionMeta,
+        query: &[f32],
+        options: &SearchOptions,
+        allowed: Option<&HashSet<DocId>>,
+        width: usize,
+    ) -> Result<Walked> {
+        let keys = self.search_keys(query, width)?;
+        let candidates = keys.len();
         let old_forms = allowed.map(old_forms).unwrap_or_default();
 
         let mut hits = Vec::with_capacity(keys.len());
@@ -760,8 +1383,76 @@ impl HnswIndex {
                 text: record.text,
             });
         }
-        Ok(crate::search::rank_hits(hits, options))
+        let admitted = hits.len();
+        Ok(Walked { hits: crate::search::rank_hits(hits, options), admitted, candidates })
     }
+}
+
+/// What one walk found: its ranked hits, and how many of its candidates the
+/// filter admitted, of how many it walked.
+struct Walked {
+    hits: Vec<Hit>,
+    admitted: usize,
+    candidates: usize,
+}
+
+/// The width of the one retry of a short filtered walk of `first`
+/// candidates: wide enough to expect `FILTERED_MARGIN × k` admitted ones at
+/// the share of its candidates the first walk found admitted, the whole cap
+/// when it found none, and never less than [`FILTERED_RETRY_FACTOR`] times
+/// the first. The collection's ratio is a guess when the filter tracks the
+/// vectors; what the walk saw near the query is not.
+fn retry_width(k: usize, first: usize, walked: &Walked, cap: usize) -> usize {
+    let observed = match walked.admitted {
+        0 => cap,
+        admitted => (FILTERED_MARGIN * k).saturating_mul(walked.candidates).div_ceil(admitted),
+    };
+    observed.max(first.saturating_mul(FILTERED_RETRY_FACTOR)).min(cap)
+}
+
+#[cfg(test)]
+thread_local! {
+    /// How many filtered searches on this thread gave way to the keyed join.
+    pub(crate) static KEYED_FALLBACKS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    /// How many filtered searches on this thread found their first walk short.
+    static FILTERED_RETRIES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// The widest walk a filtered search makes before reading the admitted
+/// documents by key. Measured at 100,000 × 384, a walk of 8,000 candidates
+/// costs about 50 ms. A filter independent of the vectors reaches it only
+/// when it admits at most one document in 400; one that tracks the vectors
+/// (it admits most of the collection, and little near the query) can reach
+/// it at any selectivity, and then the keyed join reads every admitted
+/// document, about 30 to 45 µs each at 384 dimensions, up to the request's
+/// deadline.
+const FILTERED_WIDTH_CAP: usize = 8_000;
+
+/// How much wider than the admitted share a filtered walk looks: a walk of
+/// `2 × k × chunks / admitted` candidates expects `2k` admitted ones.
+const FILTERED_MARGIN: usize = 2;
+
+/// How much wider the one retry of a short filtered walk looks.
+const FILTERED_RETRY_FACTOR: usize = 4;
+
+/// The first walk of a search whose filter admits `admitted` documents of a
+/// graph of `chunks` chunks: wide enough to expect `FILTERED_MARGIN × k`
+/// admitted candidates, and never narrower than an unadapted filtered walk
+/// ([`walk_width`]), which is what a filter admitting most of the collection
+/// still gets.
+fn filtered_width(k: usize, chunks: usize, admitted: usize) -> usize {
+    (FILTERED_MARGIN * k).saturating_mul(chunks).div_ceil(admitted.max(1)).max(walk_width(k, true))
+}
+
+/// How many candidates [`HnswIndex::search`] asks the graph walk for, for `k`
+/// hits.
+fn walk_width(k: usize, filtered: bool) -> usize {
+    // Over-fetch: the per-document cap can collapse several chunks of one
+    // document into a single result, which would otherwise return under k.
+    let over_fetch = (k * 4).max(k + 10);
+    // A post-filter discards results after the walk, so a selective filter
+    // needs a much wider search to still return k.
+    if filtered { over_fetch * 8 } else { over_fetch }
 }
 
 /// The 0.50 forms of the admitted documents whose chunk ids changed in 0.51.0
@@ -830,12 +1521,6 @@ mod tests {
         }
     }
 
-    /// The truly orphaned fraction below which a draw counts as a healthy
-    /// graph in [`a_healthy_graph_at_a_realistic_width_is_not_rebuilt`]:
-    /// above every healthy draw measured at 1,000 × 384 (2.8%), below the one
-    /// degraded draw (5.7%).
-    const HEALTHY_ORPHANED_BELOW: f64 = 0.04;
-
     /// Deterministic pseudo-random vectors, so recall numbers are reproducible.
     fn pseudo_random(seed: u64, dim: usize) -> Vec<f32> {
         let mut state = seed.wrapping_mul(6364136223846793005).wrapping_add(1);
@@ -869,6 +1554,122 @@ mod tests {
         (engine, shadow, dir)
     }
 
+    /// `setup`'s shape at sizes where a commit per document is minutes: the
+    /// same records, written a few thousand to a commit, with `fixture`
+    /// choosing another set of vectors (`0` is `setup`'s).
+    fn setup_bulk(
+        count: usize,
+        dim: usize,
+        fixture: u64,
+    ) -> (Engine, CollectionMeta, tempfile::TempDir) {
+        const PER_COMMIT: usize = 5_000;
+        // `KIMMY_REACH_LATENT=d` draws each vector from `d` dimensions mapped
+        // into `dim` by one fixed projection, plus a little noise: data of
+        // intrinsic dimension `d`, nearer what an embedding model produces
+        // than `dim` independent coordinates are.
+        let latent: Option<usize> =
+            std::env::var("KIMMY_REACH_LATENT").ok().and_then(|d| d.parse().ok());
+        let projection: Vec<Vec<f32>> = latent
+            .map(|d| (0..dim).map(|row| pseudo_random(0xfeed_0000 + row as u64, d)).collect())
+            .unwrap_or_default();
+        let vector = |i: usize| {
+            let seed = (fixture << 32) | (i as u64 + 1);
+            match latent {
+                None => pseudo_random(seed, dim),
+                Some(d) => {
+                    let z = pseudo_random(seed, d);
+                    let noise = pseudo_random(seed ^ 0x5eed_5eed_5eed_5eed, dim);
+                    projection
+                        .iter()
+                        .zip(noise)
+                        .map(|(row, e)| {
+                            row.iter().zip(&z).map(|(p, x)| p * x).sum::<f32>() + 0.05 * e
+                        })
+                        .collect()
+                }
+            }
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let engine = Engine::open(&dir.path().join("kimmy.redb")).unwrap();
+        engine.create_collection("app", "docs").unwrap();
+        engine.configure_vectors("app", "docs", config(dim)).unwrap();
+        let shadow = engine.vector_collection("app", "docs").unwrap().unwrap();
+        for start in (0..count).step_by(PER_COMMIT) {
+            engine
+                .write_batch(kimmy_storage::WriterHolder::Embedding, |scope| {
+                    for i in start..(start + PER_COMMIT).min(count) {
+                        let source = DocId::Int64(i as i64);
+                        let record = VectorRecord {
+                            source: source.clone(),
+                            chunk: 0,
+                            source_hlc: Hlc::new(1, 0),
+                            vector: vector(i),
+                            text: format!("document {i}"),
+                            config: None,
+                        };
+                        let write = kimmy_storage::VectorWrite::encode(
+                            &source,
+                            &ChunkSource::from(&source),
+                            &[record],
+                        )?;
+                        scope.put_vectors(&shadow, write)?;
+                    }
+                    Ok(())
+                })
+                .unwrap();
+        }
+        (engine, shadow, dir)
+    }
+
+    /// Every stored vector by the key the graph names it by.
+    fn vectors_by_key(
+        engine: &Engine,
+        shadow: &CollectionMeta,
+    ) -> std::collections::HashMap<String, Vec<f32>> {
+        let mut vectors = std::collections::HashMap::new();
+        engine
+            .for_each_vector(shadow, kimmy_storage::WalkScope::Request, |id, record| {
+                if let DocId::String(key) = id {
+                    vectors.insert(key.clone(), record.vector);
+                }
+                Ok(true)
+            })
+            .unwrap();
+        vectors
+    }
+
+    /// The graph's structure, read rather than searched: how many points have
+    /// no edge into them at layer 0, and how many layer 0 does not link to
+    /// the entry point at all, directly or through other points. Every
+    /// search's walk at layer 0 is a walk along those edges from the point
+    /// its descent ends at, so a point with no edge into it is returned only
+    /// when the descent ends on it, and a point outside the entry point's
+    /// component only from a descent that ends inside its own.
+    fn cut_off(index: &HnswIndex) -> (usize, usize) {
+        let (no_edge_in, outside) = cut_off_points(index);
+        (no_edge_in.iter().filter(|c| **c).count(), outside.iter().filter(|c| **c).count())
+    }
+
+    /// [`cut_off`] point by point: whether each graph id has no layer-0 edge
+    /// into it, and whether it is outside the entry point's component.
+    fn cut_off_points(index: &HnswIndex) -> (Vec<bool>, Vec<bool>) {
+        let layer0 = match &index.graph {
+            Graph::Cosine(g) => Layer0::read(g),
+            Graph::Euclidean(g) => Layer0::read(g),
+        };
+        (layer0.no_edge_in, layer0.outside)
+    }
+
+    /// How many of the graph's points do not come back for their own vector
+    /// when effort stops being the limit: every point checked, not a sample.
+    /// The ground truth a sampled score is judged against.
+    fn truly_orphaned(
+        index: &HnswIndex,
+        vectors: &std::collections::HashMap<String, Vec<f32>>,
+    ) -> usize {
+        (0..index.keys.len()).filter(|&i| !index.finds_itself(&vectors[&index.keys[i]], i)).count()
+    }
+
     #[test]
     fn an_index_builds_over_stored_vectors() {
         let (engine, shadow, _dir) = setup(50, 8);
@@ -895,48 +1696,28 @@ mod tests {
         ));
     }
 
-    /// A healthy graph at a realistic embedding width is not treated as broken.
+    /// A graph at a realistic embedding width loses nothing, and is not
+    /// treated as broken.
     ///
-    /// This is the regression test for the defect that this change fixes, and
-    /// it is deliberately at 384 dimensions rather than the 16 the other tests
-    /// use. The threshold it guards was sized against a 400-vector,
-    /// 16-dimensional fixture, and both of those turned out to matter: at 384
-    /// dimensions a fixed search budget covers proportionally less of a growing
-    /// collection, so ordinary misses climbed with size until *every* build at
-    /// 4,000 vectors was discarded, rebuilt twice, and then reported as losing
-    /// data. Three times the build cost and a false alarm, on a good graph.
+    /// The threshold this guards was once sized against a 400-vector,
+    /// 16-dimensional fixture, and at 384 dimensions a fixed search budget
+    /// covers proportionally less of a growing collection, so ordinary misses
+    /// climbed with size until *every* build at 4,000 vectors was discarded,
+    /// rebuilt twice, and then reported as losing data. Hence 384 dimensions.
     ///
-    /// **Only healthy draws are graded, because not every draw is healthy.**
-    /// Measured over 300 builds at this size and width, with every point
-    /// checked rather than a sample, the builder is bimodal:
+    /// **And it is the realistic-width half of the regression test for
+    /// `hnsw_rs` 0.3.4** (ADR-241). Measured with every point checked, at this
+    /// size and width:
     ///
-    /// | draws | truly orphaned | sampled score |
-    /// |---|---|---|
-    /// | 297 healthy | 0.3%–2.8% | 0–6 |
-    /// | 1 grey | 5.7% | 7 |
-    /// | 2 catastrophic | 20.7%, 24.7% | 23, 32 |
+    /// | library | draws | truly orphaned | cut off at layer 0 |
+    /// |---|---|---|---|
+    /// | 0.3.4 | 12 | 0.8%–2.1%, and 34.6% in one | up to 800 |
+    /// | 0.3.5 | 52 | 0–0.2% | up to 2 |
+    /// | 0.3.5, linked | 24 | none | none |
     ///
-    /// A catastrophic draw is what [`HnswIndex::build`] exists to discard, so a
-    /// score of 8 or more on one is the threshold working, not failing. This
-    /// test used to assert it of three raw draws, and at ~0.67% a draw it went
-    /// red on about 2% of runs for doing its job. So each draw's true orphaned
-    /// fraction is measured first, and only a draw below
-    /// [`HEALTHY_ORPHANED_BELOW`] is held to the threshold. That cutoff sits
-    /// above every healthy draw observed (2.8%) and below the grey one (5.7%),
-    /// which is degraded rather than healthy and which the threshold catches
-    /// about half the time by design.
-    ///
-    /// **Expected rate of a red.** A healthy draw scores 8 or more by sampling
-    /// alone about once in 1,400 (a 128-of-1,000 draw at each healthy build's
-    /// own orphaned count), so this test, grading up to three, goes red about
-    /// once in 470 runs with nothing wrong. Much more often than that means the
-    /// threshold is discarding healthy graphs; measure
-    /// `reachability_distribution_by_collection_size` before touching it.
-    ///
-    /// **A run that grades nothing fails.** Three catastrophic draws in a row
-    /// is about one run in three million at the measured rate; a builder whose
-    /// failure rate climbed would make it routine, and that must be a red
-    /// test, not a pass that graded nothing.
+    /// A build is a function of its records and its attempt, so the three
+    /// draws here are the same three graphs on every run, and the assertions
+    /// are about the library and the linking, not bets on a draw.
     ///
     /// **Ignored, and run by its own CI job in release.** A 384-dimensional
     /// graph costs 146 seconds to build in a debug profile against 21 in
@@ -952,54 +1733,82 @@ mod tests {
         const DRAWS: usize = 3;
 
         let (engine, shadow, _dir) = setup(COUNT, DIM);
-        let mut records = Vec::new();
-        engine
-            .for_each_vector(&shadow, kimmy_storage::WalkScope::Request, |_, r| {
-                records.push(r);
-                Ok(true)
-            })
-            .unwrap();
+        let vectors = vectors_by_key(&engine, &shadow);
 
-        let mut graded = 0;
         for draw in 0..DRAWS {
             let (index, reach) =
-                HnswIndex::build_once(&engine, &shadow, Metric::Cosine, DIM).unwrap();
+                HnswIndex::build_once(&engine, &shadow, Metric::Cosine, DIM, draw).unwrap();
             assert_eq!(reach.sampled, REACHABILITY_SAMPLE, "the sample must be full at this size");
             assert!(
                 reach.unreachable <= reach.missed,
                 "a confirmed loss is a subset of the misses it was found among"
             );
+            assert_eq!(
+                cut_off(&index),
+                (0, 0),
+                "draw {draw}: points with no layer-0 edge into them, and points outside the \
+                 entry point's component"
+            );
             // Every point, not the sample: the ground truth the score is
             // judged against.
-            let orphaned = (0..index.keys.len())
-                .filter(|&i| !index.finds_itself(&records[i].vector, i))
-                .count();
-            if orphaned as f64 >= HEALTHY_ORPHANED_BELOW * index.keys.len() as f64 {
-                println!(
-                    "draw {draw}: {orphaned} of {} truly orphaned (sampled score {}); not a \
-                     healthy graph, so not graded",
-                    index.keys.len(),
-                    reach.unreachable,
-                );
-                continue;
-            }
-            graded += 1;
+            let orphaned = truly_orphaned(&index, &vectors);
+            assert_eq!(
+                orphaned, 0,
+                "draw {draw}: {DIM}-dimensional vectors of {COUNT} that cannot find themselves"
+            );
             assert!(
                 reach.unreachable < REACHABILITY_MAX_UNREACHABLE,
-                "draw {draw}: a healthy {DIM}-dimensional graph of {COUNT} vectors ({orphaned} \
-                 truly orphaned) scored {} unreachable of {} sampled ({} missed at ordinary \
-                 effort) and would be discarded and rebuilt",
+                "draw {draw}: a healthy {DIM}-dimensional graph of {COUNT} vectors scored {} \
+                 unreachable of {} sampled ({} missed at ordinary effort) and would be \
+                 discarded and rebuilt",
                 reach.unreachable,
                 reach.sampled,
                 reach.missed,
             );
         }
-        assert!(
-            graded > 0,
-            "none of {DRAWS} draws was a healthy graph, so this run graded nothing; at the \
-             measured ~0.67% catastrophic rate that is about one run in three million, so the \
-             builder's failure rate has risen"
-        );
+    }
+
+    /// Every vector can be found, in every build: the regression test for
+    /// `hnsw_rs` 0.3.4 in the default suite (ADR-241).
+    ///
+    /// 0.3.4 wrote a reverse edge at the new point's top layer rather than
+    /// the layer the edge was found on, so a point drawn above layer 0 could
+    /// be left with no edge into it at layer 0, and no search could return it.
+    /// At this size it left 0.25% to 3% of every graph out of reach (one of
+    /// thirty draws reached all); 0.3.5 left none in 315 draws. The build's
+    /// linking would repair such points too, which would hide the library
+    /// going back, so each draw is held twice: the library's insertion alone,
+    /// with the linking skipped, must cut nothing off; and the build as it
+    /// ships must leave every vector able to find itself, checked by search
+    /// and by the graph's own edges. The draws are attempts, so they are the
+    /// same eight graphs on every run.
+    #[test]
+    fn every_vector_is_reachable_in_every_build() {
+        const COUNT: usize = 400;
+        const DIM: usize = 16;
+        const DRAWS: usize = 8;
+        let (engine, shadow, _dir) = setup(COUNT, DIM);
+        let vectors = vectors_by_key(&engine, &shadow);
+        for draw in 0..DRAWS {
+            SKIP_LINKING.with(|skip| skip.set(true));
+            let library = HnswIndex::build_once(&engine, &shadow, Metric::Cosine, DIM, draw);
+            SKIP_LINKING.with(|skip| skip.set(false));
+            assert_eq!(
+                cut_off(&library.unwrap().0),
+                (0, 0),
+                "draw {draw}: the library's insertion left points with no layer-0 edge into \
+                 them, or outside the entry point's component"
+            );
+            let (index, _) =
+                HnswIndex::build_once(&engine, &shadow, Metric::Cosine, DIM, draw).unwrap();
+            assert_eq!(index.len(), COUNT);
+            assert_eq!(cut_off(&index), (0, 0), "draw {draw}: cut off after the build");
+            assert_eq!(
+                truly_orphaned(&index, &vectors),
+                0,
+                "draw {draw}: vectors that cannot find themselves"
+            );
+        }
     }
 
     /// The distribution the reachability constants are sized from.
@@ -1021,39 +1830,121 @@ mod tests {
         // flat. It is not. Width drives it far harder than count does, and 384
         // is the realistic embedding width — the regime that matters is the one
         // a 16-dimensional fixture does not show.
-        for &(dim, count, builds) in &[
-            (16, 500, 40),
-            (16, 4_000, 12),
-            (384, 500, 30),
-            (384, 1_000, 20),
-            (384, 2_000, 14),
-            (384, 4_000, 10),
-        ] {
-            let (engine, shadow, _dir) = setup(count, dim);
+        //
+        // A build is a function of its records and its attempt (see
+        // `insertion_order`), so the draws are the attempts over several
+        // fixtures, and every point of every build is checked: the true
+        // orphaned count beside the sampled score the threshold judges.
+        // `KIMMY_REACH_SIZES` (`dim:count:fixtures:attempts,...`) runs a
+        // chosen grid instead; `row,` lines are the raw data.
+        let grid: Vec<(usize, usize, u64, usize)> = match std::env::var("KIMMY_REACH_SIZES") {
+            Ok(spec) => spec
+                .split(',')
+                .map(|cell| {
+                    let v: Vec<usize> = cell.split(':').map(|x| x.parse().unwrap()).collect();
+                    (v[0], v[1], v[2] as u64, v[3])
+                })
+                .collect(),
+            Err(_) => vec![
+                (8, 50, 10, 20),
+                (8, 100, 10, 20),
+                (16, 200, 10, 20),
+                (16, 400, 10, 30),
+                (16, 500, 10, 20),
+                (16, 4_000, 4, 5),
+                (384, 500, 6, 10),
+                (384, 1_000, 5, 8),
+                (384, 2_000, 4, 5),
+                (384, 4_000, 3, 4),
+                (384, 10_000, 2, 3),
+            ],
+        };
+        for (dim, count, fixtures, attempts) in grid {
+            let mut orphaned = Vec::new();
+            let mut cut_offs = Vec::new();
+            let mut no_edges_in = Vec::new();
+            let mut lost_wider = Vec::new();
             let mut missed = Vec::new();
             let mut unreachable = Vec::new();
-            for _ in 0..builds {
-                let (_, reach) =
-                    HnswIndex::build_once(&engine, &shadow, Metric::Cosine, dim).unwrap();
-                missed.push(reach.missed);
-                unreachable.push(reach.unreachable);
+            for fixture in 0..fixtures {
+                let (engine, shadow, _dir) = setup_bulk(count, dim, fixture);
+                let vectors = vectors_by_key(&engine, &shadow);
+                for attempt in 0..attempts {
+                    let started = std::time::Instant::now();
+                    let (index, reach) =
+                        HnswIndex::build_once(&engine, &shadow, Metric::Cosine, dim, attempt)
+                            .unwrap();
+                    let built = started.elapsed();
+                    let lost = truly_orphaned(&index, &vectors);
+                    // Of those, the ones the graph's structure cuts off, and
+                    // the ones still missing at four times the effort: a
+                    // point found there, or linked, is hard to find rather
+                    // than lost.
+                    let (no_edge_in, cut) = cut_off(&index);
+                    // Lost although layer 0 links it in: what a repair of the
+                    // structure, or an exact look at the cut-off points,
+                    // would still leave.
+                    let (none_in, outside) = cut_off_points(&index);
+                    let linked_lost = (0..index.keys.len())
+                        .filter(|&i| !none_in[i] && !outside[i])
+                        .filter(|&i| !index.finds_itself(&vectors[&index.keys[i]], i))
+                        .count();
+                    let wider = (0..index.keys.len())
+                        .filter(|&i| {
+                            !index.finds_itself(&vectors[&index.keys[i]], i)
+                                && !index.finds_itself_at(&vectors[&index.keys[i]], i, 3_200)
+                        })
+                        .count();
+                    println!(
+                        "row,{dim},{count},{fixture},{attempt},{lost},{},{},{},{},{cut},{wider},{no_edge_in},{linked_lost}",
+                        reach.sampled,
+                        reach.missed,
+                        reach.unreachable,
+                        built.as_millis()
+                    );
+                    cut_offs.push(cut);
+                    no_edges_in.push(no_edge_in);
+                    lost_wider.push(wider);
+                    orphaned.push(lost);
+                    missed.push(reach.missed);
+                    unreachable.push(reach.unreachable);
+                }
             }
-            missed.sort_unstable();
-            unreachable.sort_unstable();
+            for v in [
+                &mut orphaned,
+                &mut cut_offs,
+                &mut no_edges_in,
+                &mut lost_wider,
+                &mut missed,
+                &mut unreachable,
+            ] {
+                v.sort_unstable();
+            }
+            let builds = orphaned.len();
             let median = |v: &Vec<usize>| v[v.len() / 2];
             let over = |v: &Vec<usize>, t: usize| v.iter().filter(|&&x| x >= t).count();
             println!(
                 "dim={dim:<4} n={count:<6} builds={builds:<4} \
+                 truly orphaned: median={} max={} ({:.2}%) builds with any={} | \
+                 outside the entry's component: max={} | no edge in: max={} | \
+                 lost at ef 3200: max={} | \
                  missed: median={:<3} max={:<3} | unreachable: median={:<3} max={:<3} \
-                 >=3:{:<3} >=5:{:<3} >=8:{:<3} >=13:{}",
+                 >=1:{:<3} >=2:{:<3} >=3:{:<3} >=8:{}",
+                median(&orphaned),
+                orphaned.last().unwrap(),
+                100.0 * *orphaned.last().unwrap() as f64 / count as f64,
+                over(&orphaned, 1),
+                cut_offs.last().unwrap(),
+                no_edges_in.last().unwrap(),
+                lost_wider.last().unwrap(),
                 median(&missed),
                 missed.last().unwrap(),
                 median(&unreachable),
                 unreachable.last().unwrap(),
+                over(&unreachable, 1),
+                over(&unreachable, 2),
                 over(&unreachable, 3),
-                over(&unreachable, 5),
                 over(&unreachable, 8),
-                over(&unreachable, 13),
             );
         }
     }
@@ -1083,24 +1974,16 @@ mod tests {
         const BUILDS: usize = 600;
 
         let (engine, shadow, _dir) = setup(COUNT, DIM);
-        let mut records = Vec::new();
-        engine
-            .for_each_vector(&shadow, kimmy_storage::WalkScope::Request, |_, r| {
-                records.push(r);
-                Ok(true)
-            })
-            .unwrap();
+        let vectors = vectors_by_key(&engine, &shadow);
 
         let mut healthy = Vec::new();
         let mut bad = Vec::new();
-        for _ in 0..BUILDS {
+        for attempt in 0..BUILDS {
             let (index, reach) =
-                HnswIndex::build_once(&engine, &shadow, Metric::Cosine, DIM).unwrap();
+                HnswIndex::build_once(&engine, &shadow, Metric::Cosine, DIM, attempt).unwrap();
             // Every point, not a sample: this is the ground truth the sampled
             // score is being judged against.
-            let truly = (0..index.keys.len())
-                .filter(|&i| !index.finds_itself(&records[i].vector, i))
-                .count();
+            let truly = truly_orphaned(&index, &vectors);
             let fraction = truly as f64 / index.keys.len() as f64;
             if fraction >= 0.05 { &mut bad } else { &mut healthy }
                 .push((fraction, reach.unreachable));
@@ -1353,6 +2236,367 @@ mod tests {
         }
     }
 
+    /// The admitted documents spread evenly over `setup_bulk`'s `count`, and
+    /// how many filtered searches of `k` of them come back short, with how many
+    /// gave way to the keyed join.
+    fn filtered_rows(
+        index: &HnswIndex,
+        engine: &Engine,
+        shadow: &CollectionMeta,
+        count: usize,
+        dim: usize,
+        admitted: usize,
+        queries: u64,
+    ) -> (usize, usize, usize, f64) {
+        let step = count / admitted;
+        let allowed: HashSet<DocId> =
+            (0..admitted).map(|i| DocId::Int64((i * step) as i64)).collect();
+        let ids: Vec<DocId> = allowed.iter().cloned().collect();
+        let options = SearchOptions { k: 10, metric: Metric::Cosine, per_document: 1 };
+        let fallbacks = KEYED_FALLBACKS.with(|n| n.get());
+        let retries = FILTERED_RETRIES.with(|n| n.get());
+        let (mut short, mut recall) = (0, 0.0);
+        for q in 0..queries {
+            let query = pseudo_random(90_000 + q, dim);
+            let hits = index.search(engine, shadow, &query, &options, Some(&allowed)).unwrap();
+            assert!(hits.iter().all(|h| allowed.contains(&h.id)), "a hit outside the filter");
+            if hits.len() < options.k {
+                short += 1;
+            }
+            let exact: HashSet<DocId> =
+                crate::search::vector_search_among(engine, shadow, &query, &options, &ids)
+                    .unwrap()
+                    .into_iter()
+                    .map(|h| h.id)
+                    .collect();
+            recall +=
+                hits.iter().filter(|h| exact.contains(&h.id)).count() as f64 / exact.len() as f64;
+        }
+        (
+            short,
+            FILTERED_RETRIES.with(|n| n.get()) - retries,
+            KEYED_FALLBACKS.with(|n| n.get()) - fallbacks,
+            recall / queries as f64,
+        )
+    }
+
+    /// A filtered search returns `k` hits when `k` documents are admitted, at
+    /// low selectivity too, and the graph answers it (ADR-241). At a fixed
+    /// width of 320 candidates a filter admitting 1% of a collection expects
+    /// three admitted among them, and returned four hits of ten at 100,000
+    /// documents; the precondition shows this fixture is short the same way.
+    #[test]
+    fn a_filtered_search_returns_k_at_low_selectivity() {
+        const COUNT: usize = 5_000;
+        const DIM: usize = 8;
+        let (engine, shadow, _dir) = setup_bulk(COUNT, DIM, 0);
+        let index = HnswIndex::build(&engine, &shadow, Metric::Cosine, DIM).unwrap();
+        let options = SearchOptions { k: 10, metric: Metric::Cosine, per_document: 1 };
+
+        let allowed: HashSet<DocId> = (0..50).map(|i| DocId::Int64(i * 100)).collect();
+        let fixed = index
+            .walk(&engine, &shadow, &pseudo_random(90_000, DIM), &options, Some(&allowed), 320)
+            .unwrap()
+            .hits;
+        assert!(fixed.len() < 10, "the precondition: a fixed walk is short here ({})", fixed.len());
+
+        for (percent, admitted) in [(1, 50), (2, 100), (3, 150)] {
+            let (short, retries, fallbacks, recall) =
+                filtered_rows(&index, &engine, &shadow, COUNT, DIM, admitted, 10);
+            assert_eq!(short, 0, "{percent}% admitted: searches that came back short");
+            assert_eq!(retries, 0, "{percent}% admitted: the first walk should be wide enough");
+            assert_eq!(fallbacks, 0, "{percent}% admitted: the graph should answer it");
+            assert!(recall >= 0.9, "{percent}% admitted: recall {recall:.3}");
+        }
+    }
+
+    /// A filtered walk that is short at its widest gives way to the keyed
+    /// join, which is exact, so the search is never short while `k`
+    /// documents are admitted. A cap no wider than the unadapted walk makes
+    /// the fallback reachable on a collection small enough to build.
+    #[test]
+    fn a_filtered_walk_short_at_its_widest_reads_the_admitted_documents() {
+        const COUNT: usize = 5_000;
+        const DIM: usize = 8;
+        let (engine, shadow, _dir) = setup_bulk(COUNT, DIM, 0);
+        let index = HnswIndex::build(&engine, &shadow, Metric::Cosine, DIM).unwrap();
+        let options = SearchOptions { k: 10, metric: Metric::Cosine, per_document: 1 };
+        let allowed: HashSet<DocId> = (0..50).map(|i| DocId::Int64(i * 100)).collect();
+        let ids: Vec<DocId> = allowed.iter().cloned().collect();
+        let query = pseudo_random(90_000, DIM);
+        let before = KEYED_FALLBACKS.with(|n| n.get());
+        let hits = index
+            .search_with(&engine, &shadow, &query, &options, Some(&allowed), 0, 0, None)
+            .unwrap();
+        assert_eq!(KEYED_FALLBACKS.with(|n| n.get()) - before, 1, "the keyed join answered");
+        let exact =
+            crate::search::vector_search_among(&engine, &shadow, &query, &options, &ids).unwrap();
+        let ids_of = |hits: &[Hit]| hits.iter().map(|h| h.id.clone()).collect::<Vec<_>>();
+        assert_eq!(ids_of(&hits), ids_of(&exact), "exactly the keyed join's answer");
+        assert_eq!(hits.len(), 10);
+    }
+
+    /// A first walk that comes back with some admitted hits but fewer than
+    /// `k` is retried, widened by the share of its own candidates the filter
+    /// admitted, and the retry answers with `k`: the search never answers
+    /// short, and does not give way to the keyed join when a wider walk is
+    /// enough. The first walk is held to the unadapted 320 candidates, and the
+    /// admitted set is chosen so that it holds between half of `k` and `k − 1`
+    /// admitted hits, which accepting a walk of half the hits wanted would
+    /// pass.
+    #[test]
+    fn a_first_walk_short_of_k_is_retried_wider_and_answers_k() {
+        const COUNT: usize = 5_000;
+        const DIM: usize = 8;
+        let (engine, shadow, _dir) = setup_bulk(COUNT, DIM, 0);
+        let index = HnswIndex::build(&engine, &shadow, Metric::Cosine, DIM).unwrap();
+        let options = SearchOptions { k: 10, metric: Metric::Cosine, per_document: 1 };
+        let query = pseudo_random(90_000, DIM);
+        // The first admitted set, spread evenly, whose 320-candidate walk holds
+        // 5 to 9 admitted hits: the same one on every run.
+        let (allowed, short) = (60..=200)
+            .step_by(5)
+            .find_map(|admitted: usize| {
+                let step = COUNT / admitted;
+                let allowed: HashSet<DocId> =
+                    (0..admitted).map(|i| DocId::Int64((i * step) as i64)).collect();
+                let hits = index
+                    .walk(&engine, &shadow, &query, &options, Some(&allowed), 320)
+                    .unwrap()
+                    .hits
+                    .len();
+                (5..10).contains(&hits).then_some((allowed, hits))
+            })
+            .expect("no admitted set leaves the first walk between half of k and k - 1");
+        let (retries, fallbacks) =
+            (FILTERED_RETRIES.with(|n| n.get()), KEYED_FALLBACKS.with(|n| n.get()));
+        let hits = index
+            .search_with(&engine, &shadow, &query, &options, Some(&allowed), 320, 8_000, None)
+            .unwrap();
+        assert_eq!(hits.len(), 10, "a first walk of {short} hits was answered short");
+        assert!(hits.iter().all(|h| allowed.contains(&h.id)));
+        assert_eq!(FILTERED_RETRIES.with(|n| n.get()) - retries, 1, "the short walk was retried");
+        assert_eq!(KEYED_FALLBACKS.with(|n| n.get()) - fallbacks, 0, "the retry should answer it");
+    }
+
+    /// A first walk that admits a few candidates, fewer than `k`, is retried
+    /// at the width its own admitted share asks for, not at four times the
+    /// first (ADR-241). The filter admits the 3 nearest documents and every
+    /// one from the 1,400th on: a 320-candidate walk sees 3 admitted, four
+    /// times it (1,280) still 3, and the observed share's width
+    /// (2 × 10 × 320 / 3 = 2,134) reaches the rest, so the retry answers and
+    /// the keyed join is not needed.
+    #[test]
+    fn a_retry_is_widened_by_a_nonzero_observed_share() {
+        const COUNT: usize = 5_000;
+        const DIM: usize = 8;
+        let (engine, shadow, _dir) = setup_bulk(COUNT, DIM, 0);
+        let index = HnswIndex::build(&engine, &shadow, Metric::Cosine, DIM).unwrap();
+        let options = SearchOptions { k: 10, metric: Metric::Cosine, per_document: 1 };
+        let query = pseudo_random(90_000, DIM);
+        let ranked: Vec<DocId> = crate::search::vector_search(
+            &engine,
+            &shadow,
+            &query,
+            &SearchOptions { k: COUNT, ..options },
+            None,
+        )
+        .unwrap()
+        .into_iter()
+        .map(|h| h.id)
+        .collect();
+        let mut allowed: HashSet<DocId> = ranked[..3].iter().cloned().collect();
+        allowed.extend(ranked[1_400..].iter().cloned());
+        let walked = index.walk(&engine, &shadow, &query, &options, Some(&allowed), 320).unwrap();
+        assert!((1..10).contains(&walked.admitted), "the precondition: {}", walked.admitted);
+        let (retries, fallbacks) =
+            (FILTERED_RETRIES.with(|n| n.get()), KEYED_FALLBACKS.with(|n| n.get()));
+        let hits = index.search(&engine, &shadow, &query, &options, Some(&allowed)).unwrap();
+        assert_eq!(hits.len(), 10);
+        assert_eq!(FILTERED_RETRIES.with(|n| n.get()) - retries, 1, "one retry");
+        assert_eq!(
+            KEYED_FALLBACKS.with(|n| n.get()) - fallbacks,
+            0,
+            "the retry at the observed share answered"
+        );
+    }
+
+    /// A filter that tracks the vectors, admitting most of the collection but
+    /// none of the query's neighbourhood, finds no admitted candidate in its
+    /// first walk; the retry is widened by what that walk saw (none admitted,
+    /// so the whole cap), not by four times the first, which would stay
+    /// inside the excluded neighbourhood and leave the search to the keyed
+    /// join over every admitted document.
+    #[test]
+    fn a_retry_is_widened_by_what_the_first_walk_saw() {
+        const COUNT: usize = 5_000;
+        const DIM: usize = 8;
+        let (engine, shadow, _dir) = setup_bulk(COUNT, DIM, 0);
+        let index = HnswIndex::build(&engine, &shadow, Metric::Cosine, DIM).unwrap();
+        let options = SearchOptions { k: 10, metric: Metric::Cosine, per_document: 1 };
+        let query = pseudo_random(90_000, DIM);
+        // Every document but the 2,000 nearest the query: 60% admitted, so
+        // the first walk is the floor's 320, and four times it, 1,280, is
+        // still inside the excluded neighbourhood.
+        let nearest: HashSet<DocId> = crate::search::vector_search(
+            &engine,
+            &shadow,
+            &query,
+            &SearchOptions { k: 2_000, ..options },
+            None,
+        )
+        .unwrap()
+        .into_iter()
+        .map(|h| h.id)
+        .collect();
+        let allowed: HashSet<DocId> =
+            (0..COUNT as i64).map(DocId::Int64).filter(|id| !nearest.contains(id)).collect();
+        let walked = index.walk(&engine, &shadow, &query, &options, Some(&allowed), 1_280).unwrap();
+        assert_eq!(
+            walked.admitted, 0,
+            "the precondition: four times the floor finds none admitted"
+        );
+        let (retries, fallbacks) =
+            (FILTERED_RETRIES.with(|n| n.get()), KEYED_FALLBACKS.with(|n| n.get()));
+        let hits = index.search(&engine, &shadow, &query, &options, Some(&allowed)).unwrap();
+        assert_eq!(hits.len(), 10);
+        assert!(hits.iter().all(|h| allowed.contains(&h.id)));
+        assert_eq!(FILTERED_RETRIES.with(|n| n.get()) - retries, 1);
+        assert_eq!(
+            KEYED_FALLBACKS.with(|n| n.get()) - fallbacks,
+            0,
+            "the retry should have answered, not the keyed join"
+        );
+    }
+
+    /// The exact scan a search of a collection whose graph is being built
+    /// is answered by stops at a passed deadline, having read no more than
+    /// the rows between two looks at it rather than the whole collection, and
+    /// answers exactly without one (ADR-245).
+    #[test]
+    fn an_exact_scan_stops_at_its_deadline() {
+        const COUNT: usize = 2_000;
+        const DIM: usize = 8;
+        let (engine, shadow, _dir) = setup_bulk(COUNT, DIM, 0);
+        let options = SearchOptions { k: 10, metric: Metric::Cosine, per_document: 1 };
+        let query = pseudo_random(90_000, DIM);
+        let passed = std::time::Instant::now();
+        crate::search::SCAN_ROWS.with(|n| n.set(0));
+        assert!(matches!(
+            crate::search::vector_search_until(
+                &engine,
+                &shadow,
+                &query,
+                &options,
+                None,
+                Some(passed)
+            ),
+            Err(VectorError::DeadlineExceeded)
+        ));
+        let read = crate::search::SCAN_ROWS.with(|n| n.get());
+        assert!(read <= 256, "{read} of {COUNT} rows read past a passed deadline");
+        let later = std::time::Instant::now() + std::time::Duration::from_secs(600);
+        let ids = |hits: Vec<Hit>| hits.into_iter().map(|h| h.id).collect::<Vec<_>>();
+        assert_eq!(
+            ids(crate::search::vector_search_until(
+                &engine,
+                &shadow,
+                &query,
+                &options,
+                None,
+                Some(later)
+            )
+            .unwrap()),
+            ids(crate::search::vector_search(&engine, &shadow, &query, &options, None).unwrap())
+        );
+    }
+
+    /// The keyed join a filtered search gives way to stops at the request's
+    /// deadline with [`VectorError::DeadlineExceeded`]: its cost is the
+    /// admitted set, and a filter that tracks the vectors reaches it at any
+    /// selectivity.
+    #[test]
+    fn the_keyed_join_stops_at_its_deadline() {
+        const COUNT: usize = 2_000;
+        const DIM: usize = 8;
+        let (engine, shadow, _dir) = setup_bulk(COUNT, DIM, 0);
+        let index = HnswIndex::build(&engine, &shadow, Metric::Cosine, DIM).unwrap();
+        let options = SearchOptions { k: 10, metric: Metric::Cosine, per_document: 1 };
+        let allowed: HashSet<DocId> = (0..COUNT as i64).map(DocId::Int64).collect();
+        let ids: Vec<DocId> = allowed.iter().cloned().collect();
+        let query = pseudo_random(90_000, DIM);
+        let passed = std::time::Instant::now();
+        assert!(matches!(
+            crate::search::vector_search_among_until(
+                &engine,
+                &shadow,
+                &query,
+                &options,
+                &ids,
+                Some(passed)
+            ),
+            Err(VectorError::DeadlineExceeded)
+        ));
+        // Through the graph search, a filter that tracks the vectors: it
+        // admits every document but the 400 nearest the query, so a walk of
+        // the floor's 320 candidates finds none admitted, and at a cap no
+        // wider the search gives way to the join, which the passed deadline
+        // ends.
+        let nearest: HashSet<DocId> = crate::search::vector_search(
+            &engine,
+            &shadow,
+            &query,
+            &SearchOptions { k: 400, ..options },
+            None,
+        )
+        .unwrap()
+        .into_iter()
+        .map(|h| h.id)
+        .collect();
+        let far: HashSet<DocId> = allowed.difference(&nearest).cloned().collect();
+        let walked = index.walk(&engine, &shadow, &query, &options, Some(&far), 320).unwrap();
+        assert_eq!(walked.admitted, 0, "the precondition: the walk finds none admitted");
+        let late =
+            index.search_with(&engine, &shadow, &query, &options, Some(&far), 0, 0, Some(passed));
+        assert!(matches!(late, Err(VectorError::DeadlineExceeded)), "{:?}", late.map(|h| h.len()));
+        // With no deadline, the same search is the join's exact answer.
+        let exact: Vec<DocId> = far.iter().cloned().collect();
+        let answer = index.search_with(&engine, &shadow, &query, &options, Some(&far), 0, 0, None);
+        let want =
+            crate::search::vector_search_among(&engine, &shadow, &query, &options, &exact).unwrap();
+        let ids_of = |hits: &[Hit]| hits.iter().map(|h| h.id.clone()).collect::<Vec<_>>();
+        assert_eq!(ids_of(&answer.unwrap()), ids_of(&want));
+    }
+
+    /// [`a_filtered_search_returns_k_at_low_selectivity`] at the size the
+    /// defect was measured at: 1%, 2% and 3% of 100,000 documents admitted.
+    /// 16 dimensions, so that the build is a minute in release rather than
+    /// ten; the selectivity, not the width, is what decides whether a fixed
+    /// walk comes back short.
+    ///
+    /// ```bash
+    /// cargo test -p kimmy-vector --release --lib -- --ignored --exact \
+    ///     index::tests::a_filtered_search_returns_k_at_100k_documents
+    /// ```
+    #[test]
+    #[ignore = "a 100,000-vector build; CI runs this in release"]
+    fn a_filtered_search_returns_k_at_100k_documents() {
+        const COUNT: usize = 100_000;
+        const DIM: usize = 16;
+        let (engine, shadow, _dir) = setup_bulk(COUNT, DIM, 0);
+        let index = HnswIndex::build(&engine, &shadow, Metric::Cosine, DIM).unwrap();
+        for (percent, admitted) in [(1, 1_000), (2, 2_000), (3, 3_000)] {
+            let (short, retries, fallbacks, recall) =
+                filtered_rows(&index, &engine, &shadow, COUNT, DIM, admitted, 20);
+            println!(
+                "{percent}% admitted ({admitted} of {COUNT}): short {short}/20, retried \
+                 {retries}, keyed fallbacks {fallbacks}, recall {recall:.3}"
+            );
+            assert_eq!(short, 0, "{percent}% admitted: searches that came back short");
+            assert_eq!(fallbacks, 0, "{percent}% admitted: the graph should answer it");
+        }
+    }
+
     #[test]
     fn growth_past_capacity_is_reported() {
         // Capacity is fixed at construction, so exceeding it must be visible
@@ -1391,6 +2635,616 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
+    // Build attempts (ADR-241)
+    // -----------------------------------------------------------------------
+
+    /// What a graph is, named by keys rather than by the ids an insertion
+    /// order assigns: each point's level and its neighbours at every layer.
+    type Shape = std::collections::BTreeMap<String, (u8, Vec<Vec<String>>)>;
+
+    fn shape(index: &HnswIndex) -> Shape {
+        let Graph::Cosine(g) = &index.graph else { unimplemented!("cosine fixtures") };
+        g.get_point_indexation()
+            .into_iter()
+            .map(|point| {
+                let layers = point
+                    .get_neighborhood_id()
+                    .iter()
+                    .map(|layer| {
+                        let mut keys: Vec<String> =
+                            layer.iter().map(|n| index.keys[n.d_id].clone()).collect();
+                        keys.sort();
+                        keys
+                    })
+                    .collect();
+                (index.keys[point.get_origin_id()].clone(), (point.get_point_id().0, layers))
+            })
+            .collect()
+    }
+
+    /// An attempt builds one graph, and each retry another.
+    ///
+    /// hnsw_rs 0.3.5 seeds every graph's level draw with one constant, so the
+    /// same records inserted in the same order build the same graph: the
+    /// first assertion is that property, and the reason the second can fail.
+    /// A retry that kept the order would rebuild the graph it was retrying.
+    #[test]
+    fn an_attempt_builds_one_graph_and_each_retry_another() {
+        let (engine, shadow, _dir) = setup(200, 16);
+        let built = |attempt| {
+            shape(&HnswIndex::build_once(&engine, &shadow, Metric::Cosine, 16, attempt).unwrap().0)
+        };
+        let attempts: Vec<Shape> = (0..=MAX_BUILD_ATTEMPTS).map(built).collect();
+        assert_eq!(built(0), attempts[0], "one attempt, two graphs: the build is not reproducible");
+        for (a, first) in attempts.iter().enumerate() {
+            for (b, second) in attempts.iter().enumerate().skip(a + 1) {
+                assert_ne!(first, second, "attempts {a} and {b} built the same graph");
+            }
+        }
+    }
+
+    /// 300 copies of one vector: a collection whose insertion cuts most
+    /// points off at layer 0 (every list fills with copies at distance zero
+    /// and drops the newcomer), and whose sampled probes cannot tell
+    /// themselves from the copies, so its score is high whether or not the
+    /// graph is linked.
+    fn one_vector_repeated() -> (Engine, CollectionMeta, tempfile::TempDir) {
+        let dir = tempfile::tempdir().unwrap();
+        let engine = Engine::open(&dir.path().join("kimmy.redb")).unwrap();
+        engine.create_collection("app", "docs").unwrap();
+        engine.configure_vectors("app", "docs", config(4)).unwrap();
+        let shadow = engine.vector_collection("app", "docs").unwrap().unwrap();
+        engine
+            .write_batch(kimmy_storage::WriterHolder::Embedding, |scope| {
+                for i in 0..300 {
+                    let source = DocId::Int64(i);
+                    let record = VectorRecord {
+                        source: source.clone(),
+                        chunk: 0,
+                        source_hlc: Hlc::new(1, 0),
+                        vector: vec![1.0, 0.0, 0.0, 0.0],
+                        text: "the same".into(),
+                        config: None,
+                    };
+                    let write = kimmy_storage::VectorWrite::encode(
+                        &source,
+                        &ChunkSource::from(&source),
+                        &[record],
+                    )?;
+                    scope.put_vectors(&shadow, write)?;
+                }
+                Ok(())
+            })
+            .unwrap();
+        (engine, shadow, dir)
+    }
+
+    /// A build that leaves points cut off after linking is retried, each
+    /// time in that attempt's order, and returns the last attempt's graph.
+    /// No measured build has left one, so the test skips the linking to make
+    /// one that does.
+    #[test]
+    fn a_build_left_cut_off_is_retried_in_each_attempts_order() {
+        let (engine, shadow, _dir) = one_vector_repeated();
+        SKIP_LINKING.with(|skip| skip.set(true));
+        let (first, reach) = HnswIndex::build_once(&engine, &shadow, Metric::Cosine, 4, 0).unwrap();
+        assert!(reach.cut_off > 0, "the fixture must leave points cut off: {reach:?}");
+        let last = HnswIndex::build_once(&engine, &shadow, Metric::Cosine, 4, MAX_BUILD_ATTEMPTS)
+            .unwrap()
+            .0;
+        let before = BUILD_ATTEMPTS.with(|n| n.get());
+        let returned = HnswIndex::build(&engine, &shadow, Metric::Cosine, 4).unwrap();
+        let attempts = BUILD_ATTEMPTS.with(|n| n.get()) - before;
+        SKIP_LINKING.with(|skip| skip.set(false));
+        assert_eq!(attempts, MAX_BUILD_ATTEMPTS + 1, "every attempt was made");
+        assert_ne!(shape(&returned), shape(&first), "the retries rebuilt the first draw");
+        assert_eq!(shape(&returned), shape(&last), "not the last attempt's graph");
+    }
+
+    /// A build whose sample scores high while every point is linked is not
+    /// retried: what the probes missed is reachable, and another insertion
+    /// order does not make the collection easier to search. It warns, and
+    /// serves the first graph.
+    #[test]
+    fn a_high_sampled_score_with_nothing_cut_off_is_not_retried() {
+        let (engine, shadow, _dir) = one_vector_repeated();
+        let (first, reach) = HnswIndex::build_once(&engine, &shadow, Metric::Cosine, 4, 0).unwrap();
+        assert_eq!(reach.cut_off, 0, "linked: {reach:?}");
+        assert!(
+            reach.unreachable >= REACHABILITY_MAX_UNREACHABLE,
+            "the fixture must score at or above the threshold: {reach:?}"
+        );
+        let before = BUILD_ATTEMPTS.with(|n| n.get());
+        let returned = HnswIndex::build(&engine, &shadow, Metric::Cosine, 4).unwrap();
+        assert_eq!(BUILD_ATTEMPTS.with(|n| n.get()) - before, 1, "retried");
+        assert_eq!(shape(&returned), shape(&first));
+    }
+
+    /// A build links every point its insertion cut off at layer 0, so none is
+    /// left that no search reaches (ADR-241).
+    ///
+    /// Two fixtures that the library's insertion cuts points off in, measured
+    /// here first by inserting the same vectors in the same order with the
+    /// same parameters and reading layer 0: 300 copies of one vector (every
+    /// list fills with copies at distance zero and drops the newcomer: about
+    /// two thirds are cut off), and 1,500 uniformly random 96-dimensional
+    /// vectors (a few, in some orders). The build must leave none.
+    #[test]
+    fn a_build_links_every_point_its_insertion_cut_off() {
+        for (name, count, dim, same) in
+            [("one vector repeated", 300, 4, true), ("uniform 96-d", 1_500, 96, false)]
+        {
+            let dir = tempfile::tempdir().unwrap();
+            let engine = Engine::open(&dir.path().join("kimmy.redb")).unwrap();
+            engine.create_collection("app", "docs").unwrap();
+            engine.configure_vectors("app", "docs", config(dim)).unwrap();
+            let shadow = engine.vector_collection("app", "docs").unwrap().unwrap();
+            let vector = |i: usize| {
+                if same {
+                    let mut v = vec![0.0; dim];
+                    v[0] = 1.0;
+                    v
+                } else {
+                    pseudo_random(i as u64 + 1, dim)
+                }
+            };
+            engine
+                .write_batch(kimmy_storage::WriterHolder::Embedding, |scope| {
+                    for i in 0..count {
+                        let source = DocId::Int64(i as i64);
+                        let record = VectorRecord {
+                            source: source.clone(),
+                            chunk: 0,
+                            source_hlc: Hlc::new(1, 0),
+                            vector: vector(i),
+                            text: String::new(),
+                            config: None,
+                        };
+                        let write = kimmy_storage::VectorWrite::encode(
+                            &source,
+                            &ChunkSource::from(&source),
+                            &[record],
+                        )?;
+                        scope.put_vectors(&shadow, write)?;
+                    }
+                    Ok(())
+                })
+                .unwrap();
+
+            // The precondition: the library's insertion alone cuts points off,
+            // in the first attempt's order that does so (the same one on every
+            // run: a build is a function of its records and its attempt).
+            let mut walked: Vec<Vec<f32>> = Vec::new();
+            engine
+                .for_each_vector(&shadow, kimmy_storage::WalkScope::Request, |_, record| {
+                    walked.push(record.vector);
+                    Ok(true)
+                })
+                .unwrap();
+            let cut_by_insertion = |attempt: usize| {
+                let mut ordered = walked.clone();
+                insertion_order(&mut ordered, attempt);
+                let raw = Hnsw::<f32, DistCosine>::new(
+                    MAX_CONNECTIONS,
+                    count,
+                    MAX_LAYERS,
+                    EF_CONSTRUCTION,
+                    DistCosine {},
+                );
+                for (i, v) in ordered.iter().enumerate() {
+                    raw.insert((v.as_slice(), i));
+                }
+                Layer0::read(&raw).cut_off().len()
+            };
+            let Some((attempt, before)) =
+                (0..32).map(|a| (a, cut_by_insertion(a))).find(|(_, cut)| *cut > 0)
+            else {
+                panic!("{name}: no order of 32 cuts a point off, so nothing tests the linking");
+            };
+
+            let (index, reach) =
+                HnswIndex::build_once(&engine, &shadow, Metric::Cosine, dim, attempt).unwrap();
+            assert_eq!(
+                cut_off(&index),
+                (0, 0),
+                "{name}: {before} points cut off before linking; points with no layer-0 edge \
+                 into them, and points outside the entry point's component, after it"
+            );
+            assert!(reach.linked >= before, "{name}: {before} cut off, {} edges", reach.linked);
+        }
+    }
+
+    /// The origin id of `graph`'s entry point, as the library itself dumps
+    /// it: the graph file ends with it (`usize` origin id, `u8` layer, `i32`
+    /// rank).
+    fn library_entry_point(graph: &Hnsw<'static, f32, DistCosine>) -> usize {
+        use hnsw_rs::api::AnnT;
+        let dir = tempfile::tempdir().unwrap();
+        graph.file_dump(dir.path(), crate::dump::BASENAME).unwrap();
+        let file = dir.path().join(format!("{}.hnsw.graph", crate::dump::BASENAME));
+        let bytes = std::fs::read(file).unwrap();
+        let at = bytes.len() - 13;
+        usize::from_ne_bytes(bytes[at..at + 8].try_into().unwrap())
+    }
+
+    /// Per point, whether `graph`'s layer-0 edges leave it unreached from
+    /// `root`.
+    fn unreached_from(graph: &Hnsw<'static, f32, DistCosine>, root: usize) -> Vec<bool> {
+        let n = graph.get_nb_point();
+        let mut edges: Vec<Vec<usize>> = vec![Vec::new(); n];
+        for point in graph.get_point_indexation() {
+            edges[point.get_origin_id()] =
+                point.get_neighborhood_id()[0].iter().map(|e| e.d_id).collect();
+        }
+        let mut reached = vec![false; n];
+        reached[root] = true;
+        let mut stack = vec![root];
+        while let Some(at) = stack.pop() {
+            for &to in &edges[at] {
+                if !std::mem::replace(&mut reached[to], true) {
+                    stack.push(to);
+                }
+            }
+        }
+        reached.iter().map(|reached| !reached).collect()
+    }
+
+    /// The linking reaches a component the entry point does not, as well as
+    /// points with no edge into them, judged from the entry point the library
+    /// itself dumps (ADR-241). Two tight clusters at opposite ends, inserted
+    /// one after the other with four connections a point and a construction
+    /// effort of 8, leave half the second cluster with edges into it and out
+    /// of the entry point's reach, half with no edge into it, and seven points
+    /// at the top level whose reaches differ. So a wrong root, a cut-off point
+    /// left out, or an edge from a cut-off candidate leaves a point cut off,
+    /// or links in more than one round.
+    #[test]
+    fn the_linking_reaches_a_component_the_entry_point_does_not() {
+        const DIM: usize = 8;
+        let mut vectors = Vec::new();
+        for (base, side) in [(70_001u64, 1.0f32), (71_000, -1.0)] {
+            for i in 0..40 {
+                let mut v = pseudo_random(base + i, DIM);
+                v.iter_mut().for_each(|x| *x *= 0.05);
+                v[0] += side;
+                vectors.push(v);
+            }
+        }
+        let graph = Hnsw::<f32, DistCosine>::new(4, vectors.len(), MAX_LAYERS, 8, DistCosine {});
+        for (i, v) in vectors.iter().enumerate() {
+            graph.insert((v.as_slice(), i));
+        }
+        let lost = |graph: &Hnsw<'static, f32, DistCosine>| {
+            (0..vectors.len())
+                .filter(|&i| !graph.search(&vectors[i], 32, 800).iter().any(|n| n.d_id == i))
+                .count()
+        };
+        let entry = library_entry_point(&graph);
+        let top = graph.get_max_level_observed();
+        let tops: Vec<usize> = graph
+            .get_point_indexation()
+            .into_iter()
+            .filter(|point| point.get_point_id().0 == top)
+            .map(|point| point.get_origin_id())
+            .collect();
+        assert!(
+            tops.iter()
+                .any(|&other| unreached_from(&graph, other) != unreached_from(&graph, entry)),
+            "the precondition: a top-level point other than the entry point reaches other points"
+        );
+        let before = Layer0::read(&graph);
+        assert_eq!(before.outside, unreached_from(&graph, entry), "reach from the entry point");
+        let islands =
+            (0..vectors.len()).filter(|&i| before.outside[i] && !before.no_edge_in[i]).count();
+        assert!(islands > 0, "the precondition: points with an edge into them that are cut off");
+        assert!(lost(&graph) > 0, "the precondition: vectors that cannot find themselves");
+        let cut = before.cut_off().len();
+
+        let dir = tempfile::tempdir().unwrap();
+        let engine = Engine::open(&dir.path().join("kimmy.redb")).unwrap();
+        let (linked, left) = link_cut_off(&graph, &engine).unwrap();
+        assert_eq!(left, 0, "points still cut off");
+        assert_eq!(linked, LINK_EDGES * cut, "one round: two edges from linked points into each");
+        assert_eq!(library_entry_point(&graph), entry, "the linking moves no entry point");
+        assert!(
+            unreached_from(&graph, entry).iter().all(|unreached| !unreached),
+            "points the entry point does not reach after the linking"
+        );
+        assert_eq!(lost(&graph), 0, "vectors that cannot find themselves after the linking");
+    }
+
+    /// `graph`'s layer-0 edges, by the point they leave.
+    fn layer0_edges(graph: &Hnsw<'static, f32, DistCosine>) -> Vec<HashSet<usize>> {
+        let mut edges = vec![HashSet::new(); graph.get_nb_point()];
+        for point in graph.get_point_indexation() {
+            edges[point.get_origin_id()] =
+                point.get_neighborhood_id()[0].iter().map(|e| e.d_id).collect();
+        }
+        edges
+    }
+
+    /// Two tight clusters of 40 at opposite ends, inserted one after the
+    /// other with four connections a point and a construction effort of 8:
+    /// the second cluster is cut off at layer 0, and every search for one of
+    /// its points returns only its own cluster.
+    fn stranded_clusters() -> (Hnsw<'static, f32, DistCosine>, Vec<Vec<f32>>) {
+        const DIM: usize = 8;
+        let mut vectors = Vec::new();
+        for (base, side) in [(990_001u64, 1.0f32), (991_000, -1.0)] {
+            for i in 0..40 {
+                let mut v = pseudo_random(base + i, DIM);
+                v.iter_mut().for_each(|x| *x *= 0.05);
+                v[0] += side;
+                vectors.push(v);
+            }
+        }
+        let graph = Hnsw::<f32, DistCosine>::new(4, vectors.len(), MAX_LAYERS, 8, DistCosine {});
+        for (i, v) in vectors.iter().enumerate() {
+            graph.insert((v.as_slice(), i));
+        }
+        (graph, vectors)
+    }
+
+    /// The weakly connected components of the cut-off points of `layer0`,
+    /// each as the set of its points: counted here on their own, to hold the
+    /// bridge to one head per component.
+    fn cut_off_components(layer0: &Layer0) -> Vec<HashSet<usize>> {
+        let cut: HashSet<usize> = layer0.cut_off().into_iter().collect();
+        let mut both: std::collections::HashMap<usize, Vec<usize>> = Default::default();
+        for &from in &cut {
+            for &to in &layer0.edges[from] {
+                if to != from && cut.contains(&to) {
+                    both.entry(from).or_default().push(to);
+                    both.entry(to).or_default().push(from);
+                }
+            }
+        }
+        let mut seen = HashSet::new();
+        let mut components = Vec::new();
+        let mut ordered: Vec<usize> = cut.iter().copied().collect();
+        ordered.sort_unstable();
+        for start in ordered {
+            if !seen.insert(start) {
+                continue;
+            }
+            let mut component = HashSet::from([start]);
+            let mut stack = vec![start];
+            while let Some(at) = stack.pop() {
+                for &to in both.get(&at).into_iter().flatten() {
+                    if seen.insert(to) {
+                        component.insert(to);
+                        stack.push(to);
+                    }
+                }
+            }
+            components.push(component);
+        }
+        components
+    }
+
+    /// The bridge joins one point of each component of cut-off points to its
+    /// two nearest linked points, one edge each way to each (ADR-241): read
+    /// against the toy fixture's stranded cluster, every bridged point is in
+    /// a component of its own, every component has one, and its two in-edges
+    /// leave the two linked points nearest it.
+    #[test]
+    fn a_bridge_joins_one_point_per_component_to_its_two_nearest_linked_points() {
+        let (graph, _) = stranded_clusters();
+        let layer0 = Layer0::read(&graph);
+        let components = cut_off_components(&layer0);
+        let lost: HashSet<usize> = layer0.cut_off().into_iter().collect();
+        let dir = tempfile::tempdir().unwrap();
+        let engine = Engine::open(&dir.path().join("kimmy.redb")).unwrap();
+        let edges = bridges(&graph, &layer0, &engine, kimmy_storage::WalkScope::Request).unwrap();
+        let heads: HashSet<usize> =
+            edges.iter().flat_map(|&(a, b)| [a, b]).filter(|p| lost.contains(p)).collect();
+        assert_eq!(heads.len(), components.len(), "one bridged point per component");
+        for component in &components {
+            assert_eq!(component.intersection(&heads).count(), 1, "{component:?}");
+        }
+        let vector_of = |id: usize| {
+            graph
+                .get_point_indexation()
+                .into_iter()
+                .find(|p| p.get_origin_id() == id)
+                .map(|p| p.get_v().to_vec())
+                .unwrap()
+        };
+        let distance = DistCosine {};
+        for &head in &heads {
+            let into: HashSet<usize> =
+                edges.iter().filter(|&&(_, to)| to == head).map(|&(from, _)| from).collect();
+            let out: HashSet<usize> =
+                edges.iter().filter(|&&(from, _)| from == head).map(|&(_, to)| to).collect();
+            assert_eq!(into.len(), LINK_EDGES, "two linked points into each");
+            assert_eq!(out, into, "and an edge back to each");
+            let mut linked: Vec<(f32, usize)> = (0..graph.get_nb_point())
+                .filter(|p| !lost.contains(p))
+                .map(|p| {
+                    use hnsw_rs::anndists::dist::Distance;
+                    (distance.eval(&vector_of(head), &vector_of(p)), p)
+                })
+                .collect();
+            linked.sort_by(|a, b| a.0.total_cmp(&b.0).then(a.1.cmp(&b.1)));
+            let nearest: HashSet<usize> = linked.iter().take(LINK_EDGES).map(|&(_, p)| p).collect();
+            assert_eq!(into, nearest, "the nearest linked points");
+        }
+        // The stop ends background walks at once; a build's own scope is
+        // looked at the same way.
+        engine.stop_walks();
+        assert!(
+            bridges(&graph, &layer0, &engine, kimmy_storage::WalkScope::Background).is_err(),
+            "the pass stops at the node's stop"
+        );
+    }
+
+    /// A stop that lands during the bridge's pass, on a builder's thread,
+    /// ends the build at the pass's next look at it (ADR-245): a builder's
+    /// walks are background walks, which the stop ends at once, and a build
+    /// that ends this way saves nothing.
+    #[test]
+    fn a_stop_during_the_bridge_pass_ends_the_build() {
+        let (graph, _) = stranded_clusters();
+        let dir = tempfile::tempdir().unwrap();
+        let engine = std::sync::Arc::new(Engine::open(&dir.path().join("kimmy.redb")).unwrap());
+        let (parked, in_the_pass) = std::sync::mpsc::channel();
+        let (go, released) = std::sync::mpsc::channel::<()>();
+        let builder = std::thread::spawn({
+            let engine = std::sync::Arc::clone(&engine);
+            move || {
+                BRIDGE_PASS_HOOK.with(|hook| {
+                    *hook.borrow_mut() = Some(Box::new(move || {
+                        let _ = parked.send(());
+                        let _ = released.recv();
+                    }));
+                });
+                let ended = link_cut_off(&graph, &engine).is_err();
+                (ended, Layer0::read(&graph).cut_off().len())
+            }
+        });
+        in_the_pass.recv_timeout(std::time::Duration::from_secs(10)).expect("the pass began");
+        engine.stop_walks();
+        let stopped = std::time::Instant::now();
+        go.send(()).unwrap();
+        let (ended, cut) = builder.join().unwrap();
+        assert!(ended, "the build ended at the stop");
+        assert_eq!(cut, 40, "the pass bridged nothing once the stop had begun");
+        assert!(
+            stopped.elapsed() < std::time::Duration::from_millis(500),
+            "the build ran on {:?} past the stop",
+            stopped.elapsed()
+        );
+    }
+
+    /// A stop that lands while the linking searches for its cut-off points
+    /// ends the round at its next look (ADR-245), which comes every 4,096
+    /// points, rather than after the round's last search: two tight
+    /// clusters of 5,000 inserted in turn at toy parameters leave more than
+    /// 4,096 cut off, and the stop arrives at the first look.
+    #[test]
+    fn a_stop_during_a_linking_round_ends_it() {
+        const DIM: usize = 8;
+        let mut vectors = Vec::new();
+        for (base, side) in [(980_001u64, 1.0f32), (985_000, -1.0)] {
+            for i in 0..5_000 {
+                let mut v = pseudo_random(base + i, DIM);
+                v.iter_mut().for_each(|x| *x *= 0.05);
+                v[0] += side;
+                vectors.push(v);
+            }
+        }
+        let graph = Hnsw::<f32, DistCosine>::new(4, vectors.len(), MAX_LAYERS, 8, DistCosine {});
+        for (i, v) in vectors.iter().enumerate() {
+            graph.insert((v.as_slice(), i));
+        }
+        let before = Layer0::read(&graph).cut_off().len();
+        assert!(before > BRIDGE_STOP_STRIDE, "the precondition: {before} cut off");
+        let dir = tempfile::tempdir().unwrap();
+        let engine = std::sync::Arc::new(Engine::open(&dir.path().join("kimmy.redb")).unwrap());
+        let stopping = std::sync::Arc::clone(&engine);
+        LINK_PASS_HOOK
+            .with(|hook| *hook.borrow_mut() = Some(Box::new(move || stopping.stop_walks())));
+        let ended = link_cut_off(&graph, &engine);
+        LINK_PASS_HOOK.with(|hook| *hook.borrow_mut() = None);
+        assert!(ended.is_err(), "the round ended at the stop");
+        assert_eq!(Layer0::read(&graph).cut_off().len(), before, "and linked nothing after it");
+    }
+
+    /// The bridge's cost at scale: one pass per round scoring every vector
+    /// against one point per component, not one per point no other cut-off
+    /// point has an edge into (ADR-241). Five tight clusters of 20,000
+    /// vectors of 384 dimensions, inserted in order at four connections and a
+    /// construction effort of 8, strand most of the graph in many components;
+    /// the pass must join one point of each and finish in seconds. Release
+    /// only: `cargo test --release -p kimmy-vector --lib -- --ignored
+    /// the_bridge_joins_one_point_per_component_at_100k`.
+    #[test]
+    #[ignore = "release-only measurement"]
+    fn the_bridge_joins_one_point_per_component_at_100k() {
+        const PER: usize = 20_000;
+        const DIM: usize = 384;
+        let mut vectors = Vec::with_capacity(5 * PER);
+        for cluster in 0..5u64 {
+            let mut centre = pseudo_random(cluster * 1_000_003 + 77, DIM);
+            let norm = centre.iter().map(|x| x * x).sum::<f32>().sqrt();
+            centre.iter_mut().for_each(|x| *x /= norm);
+            for i in 0..PER as u64 {
+                let noise = pseudo_random(cluster * 7_919_000 + i + 13, DIM);
+                vectors
+                    .push(centre.iter().zip(noise).map(|(c, e)| c + 0.05 * e).collect::<Vec<_>>());
+            }
+        }
+        let graph = Hnsw::<f32, DistCosine>::new(4, vectors.len(), MAX_LAYERS, 8, DistCosine {});
+        for (i, v) in vectors.iter().enumerate() {
+            graph.insert((v.as_slice(), i));
+        }
+        let layer0 = Layer0::read(&graph);
+        let components = cut_off_components(&layer0).len();
+        let cut = layer0.cut_off().len();
+        let dir = tempfile::tempdir().unwrap();
+        let engine = Engine::open(&dir.path().join("kimmy.redb")).unwrap();
+        BRIDGE_HEADS.with(|h| h.set(0));
+        let started = std::time::Instant::now();
+        bridges(&graph, &layer0, &engine, kimmy_storage::WalkScope::Request).unwrap();
+        let took = started.elapsed();
+        let heads = BRIDGE_HEADS.with(|h| h.get());
+        println!("BRIDGE {cut} cut off in {components} components: {heads} heads, {took:?}");
+        assert_eq!(heads, components, "one head per component");
+        assert!(took < std::time::Duration::from_secs(120), "the pass took {took:?}");
+    }
+
+    /// The linking bridges a component of cut-off points that no search's
+    /// candidates reach (ADR-241). Two tight clusters at opposite ends,
+    /// inserted one after the other with four connections a point and a
+    /// construction effort of 8, leave the second cluster's 40 points out of
+    /// the entry point's reach at layer 0, and every search for one of them
+    /// returns only its own cluster: a linking by candidates alone gives them
+    /// no edge. Judged from the entry point the library dumps, and by search.
+    #[test]
+    fn the_linking_bridges_a_component_no_search_reaches() {
+        let (graph, vectors) = stranded_clusters();
+        let before = Layer0::read(&graph);
+        let cut: HashSet<usize> = before.cut_off().into_iter().collect();
+        assert_eq!(cut.len(), 40, "the precondition: the second cluster is cut off");
+        let stranded = cut
+            .iter()
+            .filter(|&&p| {
+                graph
+                    .search(&vectors[p], LINK_CANDIDATES, LINK_EF)
+                    .iter()
+                    .all(|n| n.d_id == p || cut.contains(&n.d_id))
+            })
+            .count();
+        assert_eq!(stranded, 40, "the precondition: no search finds them a linked candidate");
+        let out_of = |graph: &Hnsw<'static, f32, DistCosine>| {
+            let edges = layer0_edges(graph);
+            cut.iter()
+                .map(|&p| edges[p].iter().filter(|to| !cut.contains(to)).count())
+                .sum::<usize>()
+        };
+        let out_before = out_of(&graph);
+
+        let dir = tempfile::tempdir().unwrap();
+        let engine = Engine::open(&dir.path().join("kimmy.redb")).unwrap();
+        let (linked, left) = link_cut_off(&graph, &engine).unwrap();
+        assert!(linked > 0);
+        assert_eq!(left, 0, "points still cut off");
+        assert!(
+            out_of(&graph) > out_before,
+            "the bridge leaves the component as well as entering it"
+        );
+        let entry = library_entry_point(&graph);
+        assert!(
+            unreached_from(&graph, entry).iter().all(|unreached| !unreached),
+            "points the entry point does not reach after the linking"
+        );
+        let lost = (0..vectors.len())
+            .filter(|&i| !graph.search(&vectors[i], 32, 800).iter().any(|n| n.d_id == i))
+            .count();
+        assert_eq!(lost, 0, "vectors that cannot find themselves after the linking");
+    }
+
+    // -----------------------------------------------------------------------
     // Chunk ids (ADR-239)
     // -----------------------------------------------------------------------
 
@@ -1411,6 +3265,24 @@ mod tests {
             ids.push(id);
         }
         (engine, shadow, ids, dir)
+    }
+
+    /// The graph's walk of `width` candidates for `query` returns the chunk
+    /// key of each of `documents` (UUIDs, as `uuid_documents` stores them).
+    /// A precondition: a test that asserts on hits holds the walk to this
+    /// first, so that its own red names what the hits add, not graph recall.
+    fn assert_walk_returns(index: &HnswIndex, query: &[f32], width: usize, documents: &[DocId]) {
+        let walked = index.search_keys(query, width).unwrap();
+        for document in documents {
+            let DocId::Binary(bytes) = document else { panic!("a binary") };
+            let hex: String = bytes.iter().map(|b| format!("{b:02x}")).collect();
+            let key = format!("~b:{hex}.04#0");
+            assert!(
+                walked.contains(&key),
+                "graph recall: the walk of {width} returned {} keys and not {key}",
+                walked.len()
+            );
+        }
     }
 
     fn put_as_uuid(
@@ -1441,6 +3313,10 @@ mod tests {
     /// Test 18: the graph finds a subtype-4 document's chunks. Keyed by an id
     /// recomputed from the record, which carries no subtype, it named ids no
     /// chunk is stored under and loaded nothing.
+    ///
+    /// Deterministic: the graph is a function of the records and the attempt
+    /// (`insertion_order`), so this builds one graph on every run. And the
+    /// walk is checked first, so a red names graph recall, not the keys.
     #[test]
     fn the_graph_finds_the_chunks_of_a_uuid_document() {
         let (engine, shadow, ids, _dir) = uuid_documents(40);
@@ -1449,6 +3325,7 @@ mod tests {
         let hex: String = std::iter::repeat_n("00", 16).collect();
         assert!(index.keys.contains(&format!("~b:{hex}.04#0")), "keyed by the stored id");
         let options = SearchOptions { k: 3, metric: Metric::Cosine, per_document: 1 };
+        assert_walk_returns(&index, &[1.0, 0.0], walk_width(options.k, false), &ids[..3]);
         let hits = index.search(&engine, &shadow, &[1.0, 0.0], &options, None).unwrap();
         assert_eq!(hits.len(), 3);
         assert_eq!(hits[0].id, ids[0]);
@@ -1492,6 +3369,28 @@ mod tests {
                 "{path}"
             );
         }
+    }
+
+    /// What built a loaded graph is what its snapshot says: this build's
+    /// marker as saved, and nothing when the field is absent, as in every
+    /// snapshot 0.51 and earlier wrote (ADR-241).
+    #[test]
+    fn a_snapshot_says_what_built_its_graph() {
+        let (engine, shadow, _ids, _dir) = uuid_documents(10);
+        let index = HnswIndex::build(&engine, &shadow, Metric::Cosine, 2).unwrap();
+        assert!(index.built_by_this_build());
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("snapshot");
+        index.save(&path).unwrap();
+        let loaded = HnswIndex::load(&path, Metric::Cosine, 2, shadow.created).unwrap();
+        assert!(loaded.built_by_this_build(), "as saved");
+
+        let mut meta: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(path.join("meta.json")).unwrap()).unwrap();
+        meta.as_object_mut().unwrap().remove("graph");
+        std::fs::write(path.join("meta.json"), serde_json::to_vec(&meta).unwrap()).unwrap();
+        let loaded = HnswIndex::load(&path, Metric::Cosine, 2, shadow.created).unwrap();
+        assert!(!loaded.built_by_this_build(), "0.51's snapshot, which has no marker");
     }
 
     /// Test 18: a snapshot in the format a 0.50 build wrote, whose keys were
@@ -1547,6 +3446,20 @@ mod tests {
         let allowed: HashSet<DocId> =
             [old_binary.clone(), tilde.clone(), ids[1].clone()].into_iter().collect();
         let options = SearchOptions { k: 5, metric: Metric::Cosine, per_document: 1 };
+        // The walk returns every admitted chunk first, so a red below names
+        // the key pre-filter or the admission, and a red here graph recall.
+        // This test failed about one run in sixteen on hnsw_rs 0.3.4, whose
+        // graph left `~x#0` unreachable: that red was here, not below.
+        let walked = index.search_keys(&[1.0, 0.0], walk_width(options.k, true)).unwrap();
+        for key in ["bin(16 bytes)#0", "~x#0"] {
+            assert!(
+                walked.iter().any(|k| k == key),
+                "graph recall: the walk of {} returned {} keys and not {key}",
+                walk_width(options.k, true),
+                walked.len()
+            );
+        }
+        assert_walk_returns(&index, &[1.0, 0.0], walk_width(options.k, true), &ids[1..3]);
         let hits = index.search(&engine, &shadow, &[1.0, 0.0], &options, Some(&allowed)).unwrap();
         let got: Vec<(DocId, String)> = hits.into_iter().map(|h| (h.id, h.text)).collect();
         assert_eq!(

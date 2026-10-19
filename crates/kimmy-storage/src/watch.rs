@@ -481,9 +481,11 @@ impl Engine {
     ///   the retained range, from the first entry stamped after it rather than
     ///   at the tail.
     ///
-    /// A token naming an entry a rewind discarded, and that this member does not
-    /// hold again, is refused in every case: the client saw history this member
-    /// no longer has.
+    /// A token naming an entry a rewind discarded is refused in every case, whether
+    /// or not this member holds the entry again: the client saw history this member
+    /// rewound away, and an entry a peer sent back since is held at a new place in
+    /// this member's arrival order, after entries the client was never sent
+    /// (ADR-173, ADR-246).
     fn resume_point(&self, token: &ResumeToken, walked: &mut Walked) -> Result<Opened> {
         let stamp = token.to_stamp();
         let held = self.arrival_of(&stamp)?;
@@ -493,7 +495,7 @@ impl Engine {
             (None, Some(_)) => "single_stamp_held",
             (None, None) => "single_stamp_not_held",
         };
-        if held.is_none() && self.rewinds()?.iter().any(|rewind| rewind.discarded(&stamp)) {
+        if self.rewinds()?.iter().any(|rewind| rewind.discarded(&stamp)) {
             return Err(expired());
         }
         match &token.issued {
@@ -1092,7 +1094,7 @@ pub struct OplogWindow {
     /// one was kept, withheld, or passed over (ADR-194). `None` for a window
     /// that filled or reached the end.
     pub passed_through: Option<Stamp>,
-    /// The idempotency records the window ships (B5, records travel with
+    /// The idempotency records the window ships (ADR-240, records travel with
     /// coverage): every record with a row inside the coverage the window grants
     /// the requester, and every record with a row this node's own servable
     /// vector does not reach (`idempotency::records_for_coverage`), read in the
@@ -3643,10 +3645,11 @@ mod tests {
         drop(stream);
         engine.rewind_to(until).unwrap();
 
-        // A peer that still holds it sends it back. The rewind left a tombstone
-        // stamped after it, so it loses and is never held here again: the token
-        // naming it still describes history this member does not have.
-        assert!(!engine.apply_remote(&coll, &undone).unwrap(), "the rewind's tombstone wins");
+        // A peer that still holds it sends it back. The rewind left no tombstone
+        // (ADR-246), so it is held here again, at a new place in the arrival
+        // order: the token naming it still describes history this member rewound
+        // away, and stays refused.
+        assert!(engine.apply_remote(&coll, &undone).unwrap(), "held again");
         let refused = engine.watch(
             WatchScope::Collection(coll.id),
             WatchOptions { resume_after: Some(token), ..Default::default() },

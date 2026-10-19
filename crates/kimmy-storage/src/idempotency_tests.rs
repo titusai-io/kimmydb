@@ -1,4 +1,4 @@
-//! Idempotency records (B5): the codec, the merge, the keyed write paths, a
+//! Idempotency records (ADR-240): the codec, the merge, the keyed write paths, a
 //! record across a drop, the coalesced replay barrier, the multi-chunk record and
 //! resume, retention, the purge and the sweep (which leave records), backups, a
 //! rewind, and what replication will read and store. The storage, crash and
@@ -307,7 +307,7 @@ fn the_record_codec_is_pinned() {
         )
     );
 
-    // KR's bit, beside the state: a record written before it reads as not
+    // The contested bit, beside the state: a record written before it reads as not
     // contested (every record above), and either state carries it.
     let contested =
         IdempotencyRecord { contested: true, ..base(0xAB, s1, s1, 0x22, RecordState::Done) };
@@ -430,7 +430,7 @@ proptest! {
         }
     }
 
-    /// KR's flag: set when either side is, or the fingerprints differ, so the
+    /// The contested flag: set when either side is, or the fingerprints differ, so the
     /// merge is still a join with it (commutative, associative and idempotent
     /// above, the flag compared with the rest); and it never picks the winner,
     /// so flipping it on one side changes nothing else of the merge.
@@ -459,7 +459,7 @@ proptest! {
     }
 }
 
-/// KR's two records, merged in either order: the flag comes from both sides
+/// Two contested records, merged in either order: the flag comes from both sides
 /// and not from the winner, and at an equal `last` and state the winner is the
 /// same whichever side carries the flag.
 #[test]
@@ -826,7 +826,7 @@ fn the_derived_id_is_the_same_on_two_engines() {
 
 // -- Across a drop, and the window ----------------------------------------------------------
 
-/// A record outlives a drop of its collection for its window (ruling A): the
+/// A record outlives a drop of its collection for its window: the
 /// drop's purge leaves it, re-creation is not held up by it, and a retry in the
 /// next life replays the first answer and writes nothing there. Another request
 /// under the key is refused across the drop, as before it.
@@ -850,7 +850,7 @@ fn a_record_outlives_a_drop_and_a_retry_in_the_next_life_replays() {
 }
 
 /// A record of a dropped life that a peer sends is stored as any other, and a
-/// retry in the next life replays it (D2's way in by F2: the record reaches a
+/// retry in the next life replays it (a drop's way in by F2: the record reaches a
 /// member after the drop did). Refused, the retry wrote afresh there.
 #[test]
 fn a_dropped_lifes_record_from_a_peer_is_stored_and_replayed() {
@@ -1662,7 +1662,7 @@ fn a_later_chunk_leaves_what_another_attempt_wrote_meanwhile() {
     assert!(!out.resumed);
 }
 
-// -- A contested key (KR) -------------------------------------------------------------------
+// -- A contested key ------------------------------------------------------------------------
 
 /// Merge into `k`'s record, as a peer's store does, the record of another
 /// request under the key, written a millisecond before this one's `first`: the
@@ -1699,7 +1699,7 @@ fn refused_writing_nothing<T: std::fmt::Debug>(
     assert_eq!(engine.commits(), commits, "nothing committed");
 }
 
-/// KR: a contested record is refused (422) on every keyed path, before a replay,
+/// A contested record is refused (422) on every keyed path, before a replay,
 /// a resume or a delete's tombstone test, for the fingerprint that won the merge
 /// as for the other: neither client's retry is answered from it. Nothing is
 /// written.
@@ -1753,10 +1753,11 @@ fn a_contested_key_is_refused_on_every_keyed_path() {
     });
 }
 
-/// KR in flight: a multi-chunk request whose record turns contested between its
-/// chunks stops, partially applied (ADR-192) with the chunk it committed, and
-/// writes nothing more: the merged `first` is another request's, no bound for
-/// this one's stamp rule. Every retry is then refused, a resume included.
+/// A contested key in flight: a multi-chunk request whose record turns
+/// contested between its chunks stops, partially applied (ADR-192) with the
+/// chunk it committed, and writes nothing more: the merged `first` is another
+/// request's, no bound for this one's stamp rule. Every retry is then refused,
+/// a resume included.
 #[test]
 fn kr_a_request_whose_record_turns_contested_between_chunks_ends_partially_applied() {
     let (engine, coll, _dir, _path) = open();
@@ -1787,7 +1788,7 @@ fn kr_a_request_whose_record_turns_contested_between_chunks_ends_partially_appli
 
 /// Store in one transaction while the window's clock reads `now_ms`, then give
 /// the window back the real clock: a record older than one window at the real
-/// clock is refused on store (review m2), and a retention test must hold one
+/// clock is refused on store, and a retention test must hold one
 /// first. Retention itself takes its cutoff from the pass, not from this clock.
 fn store_while_the_window_reads(
     engine: &Engine,
@@ -1844,7 +1845,7 @@ fn f7_retention_collects_a_record_one_window_after_its_last() {
 
     // Stored from a page: no entry here, only its row at `last`. Stored while
     // the window's clock reads its `last`, since a record past its window is
-    // refused (review m2).
+    // refused.
     let page_record = base(3, stamp(5_000, 0, 9), stamp(6_000, 0, 9), 9, RecordState::Done);
     store_while_the_window_reads(&engine, 6_000, |txn| {
         engine.store_record(txn, coll.id, &ScopeHash([3; 32]), &page_record, None).unwrap();
@@ -1895,7 +1896,7 @@ fn a_record_stays_when_a_row_between_its_first_and_last_expires() {
     assert_eq!(ns(&engine, &coll, 3), vec![1, 1, 1]);
 }
 
-/// The records step runs whatever the oplog step found (the manager's guard):
+/// The records step runs whatever the oplog step found:
 /// here the oplog step removes nothing, every entry being inside its window,
 /// and a record a peer sent with an older `last` still goes; and on a store
 /// with no oplog at all, where the oplog step ends at once.
@@ -1905,7 +1906,7 @@ fn the_records_step_runs_when_the_oplog_step_has_nothing_to_do() {
     let now = crate::physical_now_ms();
     let old = stamp(now - 2 * DAY_MS, 0, 9);
     let peers = base(4, old, old, 9, RecordState::Done);
-    // Stored while it was inside its window: a record past it is refused (m2).
+    // Stored while it was inside its window: a record past it is refused.
     store_while_the_window_reads(&engine, old.hlc.wall_ms, |txn| {
         engine.store_record(txn, coll.id, &ScopeHash([4; 32]), &peers, None).unwrap();
     });
@@ -1933,7 +1934,7 @@ fn a_stop_ends_the_records_step_between_chunks() {
     let (engine, coll, _dir, _path) = open();
     let n = idempotency::RECORD_COLLECT_CHUNK + 500;
     // Stored while the window's clock reads the first of them: a record past its
-    // window is refused (m2).
+    // window is refused.
     store_while_the_window_reads(&engine, 1_000, |txn| {
         for i in 0..n {
             let mut scope = [0u8; 32];
@@ -1963,7 +1964,7 @@ fn a_stop_ends_the_records_step_between_chunks() {
 fn a_record_whose_row_at_last_is_missing_is_still_collected() {
     let (engine, coll, _dir, _path) = open();
     let r = base(6, stamp(1_000, 0, 9), stamp(1_000, 0, 9), 9, RecordState::Done);
-    // Stored while it was inside its window: a record past it is refused (m2).
+    // Stored while it was inside its window: a record past it is refused.
     store_while_the_window_reads(&engine, 1_000, |txn| {
         engine
             .store_record(txn, coll.id, &ScopeHash([6; 32]), &r, Some(stamp(2_000, 0, 9)))
@@ -2040,9 +2041,9 @@ fn the_clock_resumes_above_the_change_logs_keys_after_a_restart() {
 
 // -- Purge, sweep, rewind, backup --------------------------------------------------------------
 
-/// A drop's purge leaves the collection's records (ruling A): it removes the
-/// documents and index entries, and retention alone removes a record, one
-/// window after its `last`.
+/// A drop's purge leaves the collection's records (they outlive the drop): it
+/// removes the documents and index entries, and retention alone removes a
+/// record, one window after its `last`.
 #[test]
 fn a_drops_purge_leaves_the_collections_records() {
     let (engine, coll, _dir, _path) = open();
@@ -2115,11 +2116,12 @@ fn a_database_drop_leaves_every_collections_records() {
     assert_eq!(count(&engine, &again), 0);
 }
 
-/// A late drop's sweep leaves the records of the life before (ruling A). Here a
-/// peer's drop lands between two of this member's writes, a keyed one before it
-/// and an unkeyed one after: the sweep takes the keyed write's document with
-/// the life before and keeps the later one, and the keyed write's record stays,
-/// so a retry replays and writes nothing to the life the drop re-dated.
+/// A late drop's sweep leaves the records of the life before (they outlive the
+/// drop). Here a peer's drop lands between two of this member's writes, a keyed
+/// one before it and an unkeyed one after: the sweep takes the keyed write's
+/// document with the life before and keeps the later one, and the keyed write's
+/// record stays, so a retry replays and writes nothing to the life the drop
+/// re-dated.
 #[test]
 fn a_late_drops_sweep_leaves_the_records_of_the_life_before() {
     let (engine, coll, _dir, _path) = open();
@@ -2189,11 +2191,11 @@ fn a_rewind_removes_or_reopens_the_records_it_cuts() {
     assert_eq!(ns(&engine, &coll, 3), vec![1, 1, 1]);
 }
 
-/// A rewind that cuts a keyed bulk insert part-way removes its record (m3 of the
-/// build review): a bulk minted in the millisecond the rewind is to keeps a
-/// prefix, and nothing resumes a bulk, so a reopened record would replay
-/// "inserted 3" while two documents stand. The retry is a fresh attempt, which
-/// meets the first document that stands as a duplicate and writes nothing.
+/// A rewind that cuts a keyed bulk insert part-way removes its record: a bulk
+/// minted in the millisecond the rewind is to keeps a prefix, and nothing
+/// resumes a bulk, so a reopened record would replay "inserted 3" while two
+/// documents stand. The retry is a fresh attempt, which meets the first
+/// document that stands as a duplicate and writes nothing.
 #[test]
 fn a_rewind_that_cuts_a_bulk_part_way_removes_its_record() {
     let (engine, coll, _dir, _path) = open();

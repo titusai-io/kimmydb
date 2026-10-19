@@ -1,4 +1,4 @@
-//! A keyed write in the executor (B5): what the engine is handed, and what a
+//! A keyed write in the executor (ADR-240): what the engine is handed, and what a
 //! fresh answer, a replay and a refusal count.
 //!
 //! The write functions in `exec` take the edge's [`IdempotentRequest`] and,

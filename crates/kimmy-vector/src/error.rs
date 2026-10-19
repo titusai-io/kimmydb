@@ -99,6 +99,13 @@ pub enum VectorError {
     #[error("HNSW snapshot unusable: {0}")]
     Snapshot(String),
 
+    /// A search the request's deadline ended before it had read what it must
+    /// (the keyed join, [`crate::search::vector_search_among_until`], or an
+    /// exact scan, [`crate::search::vector_search_until`]): it answers as a
+    /// request that ran out of time.
+    #[error("the vector search did not finish within the request's deadline")]
+    DeadlineExceeded,
+
     #[error("embedding model {model:?} is not available: {detail}")]
     ModelUnavailable { model: String, detail: String },
 

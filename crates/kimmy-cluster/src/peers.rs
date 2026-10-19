@@ -788,6 +788,18 @@ pub async fn replicate(engine: Arc<Engine>, config: ReplicationConfig) {
     if let Some(members) = &config.members {
         members.configure_lease(config.sync_interval, config.fanout);
     }
+    // The immediate facts exchanges membership asks for (ADR-247), run beside
+    // this loop, never in it: an ask that came while a tick drained would wait
+    // for the tick. Aborted when the loop ends, with every exchange in flight.
+    let _exchanging = config.members.as_ref().and_then(|members| {
+        let queue = members.take_exchange_queue()?;
+        Some(crate::exchange::Driver::start(
+            Arc::clone(&engine),
+            config.secret.clone(),
+            members.clone(),
+            queue,
+        ))
+    });
     // A snapshot this node was part-way through when it stopped resumes where
     // it left off rather than transferring everything again (ADR-161). Never
     // fatal: the record is an optimisation, and a node that will not start

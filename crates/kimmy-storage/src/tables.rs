@@ -216,8 +216,9 @@ pub const OPLOG_WITNESSED: TableDefinition<&[u8], &[u8]> = TableDefinition::new(
 /// same entry is Raise at its origin and Hold at a snapshot receiver. A flag
 /// would also be a wire and format change needing capability negotiation; this
 /// needs neither. `OPLOG_WITNESSED` and `OPLOG_COLLECTED` are the same shape --
-/// node-local, absent from the backup, re-derived at open -- so this follows
-/// the house pattern rather than introducing one.
+/// node-local, absent from the backup, re-derived -- so this follows the house
+/// pattern rather than introducing one. This one is re-derived by the restore
+/// itself, from the backup's own vector (ADR-244).
 ///
 /// **What removes a mark, and what does not.** A mark goes when the entry stops
 /// being state: a completed snapshot's grant releases every stamp it covers, in
@@ -246,9 +247,11 @@ pub const OPLOG_WITNESSED: TableDefinition<&[u8], &[u8]> = TableDefinition::new(
 ///
 /// A mark is half of invariant I (see [`OPLOG_VERSIONS`]): an entry above the
 /// vector is allowed only while it is marked here. A backup does not carry this
-/// table, so a restored store can hold entries above its vector unmarked until
-/// the open's walk raises the vector over them; which is why a backup never
-/// carries [`VECTOR_VERIFIED`] either.
+/// table, so a restore marks every entry above the backup's vector for its
+/// origin, which under I at the source are the entries the source held as state
+/// (ADR-244). A restore by an older build marked none, and the open's walk raised
+/// the vectors over them; which is why a backup never carries
+/// [`VECTOR_VERIFIED`] either.
 pub const OPLOG_HELD: TableDefinition<&[u8], ()> = TableDefinition::new("oplog_held");
 
 /// `collection id (8) || stamp key (26) -> ()`: one row per retained
@@ -267,7 +270,7 @@ pub const UNIQUE_VIOLATIONS: TableDefinition<&[u8], &[u8]> =
 /// record that the version vector covers the oplog (invariant I), so
 /// `Engine::open` need not walk the oplog to raise it (`crate::verified`).
 ///
-/// Written only where I holds: after the open's walk, and by a rewind's reset.
+/// Written only where I holds: after the open's walk, and by a rewind's lowering.
 /// Counted only under this build's epoch and the store's schema. Its own table
 /// rather than a `META` key because no build's backup carries a table it does
 /// not list, so a restore, which can leave I broken, never carries it.
@@ -296,7 +299,7 @@ pub const VECTOR_VERIFIED: TableDefinition<&str, &[u8]> = TableDefinition::new("
 pub const SNAPSHOT_PROGRESS: TableDefinition<&[u8], &[u8]> =
     TableDefinition::new("snapshot_progress");
 
-/// `(collection id, scope hash) -> the idempotency record` (B5,
+/// `(collection id, scope hash) -> the idempotency record` (ADR-240,
 /// `crate::idempotency`): a keyed write's record, written in the write's own
 /// transaction, so it survives exactly what the write survives.
 ///
@@ -309,7 +312,7 @@ pub const SNAPSHOT_PROGRESS: TableDefinition<&[u8], &[u8]> =
 pub const IDEMPOTENCY: TableDefinition<(u64, &[u8]), &[u8]> = TableDefinition::new("idempotency");
 
 /// `stamp (26 bytes, an oplog key) -> collection id (8) ‖ scope hash (32)`:
-/// every record by the stamps that carry it (B5).
+/// every record by the stamps that carry it (ADR-240).
 ///
 /// Keyed origin-major, `node (16) ‖ hlc (10)`, so the rows of one origin in a
 /// range are one range read. A record has a row at each of its merged `first`
@@ -326,7 +329,7 @@ pub const IDEMPOTENCY_BY_STAMP: TableDefinition<&[u8], &[u8]> =
     TableDefinition::new("idempotency_by_stamp");
 
 /// `stamp (26 bytes, an oplog key) -> collection id (8) ‖ scope hash (32)`: this
-/// node's **change log** of idempotency records (B5, "Snapshots carry records").
+/// node's **change log** of idempotency records (ADR-240, "Snapshots carry records").
 ///
 /// One row per store that changes a record, on every path (a local commit, a
 /// frame, a replay page, a snapshot or converge page, a rewind's reopen), in the
@@ -395,7 +398,9 @@ pub const META_TOMBSTONE_HORIZON: &str = "gc:tombstone_horizon";
 pub const META_DECIMAL128_ID_PRESENT: &str = "decimal128:id_present";
 
 /// Every point-in-time rewind this database has taken: its target, and per
-/// origin the newest stamp it discarded (`Engine::rewinds`).
+/// origin the newest stamp it discarded (`Engine::rewinds`); under this member's
+/// own origin, no lower than the newest tombstone it minted. A start resumes the
+/// clock past every stamp it names (`Engine::resume_hlc`).
 ///
 /// A rewind removes oplog entries a change stream may already have delivered,
 /// so a resume token naming one of them describes history that no longer

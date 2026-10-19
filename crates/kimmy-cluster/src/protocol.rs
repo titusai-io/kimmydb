@@ -95,7 +95,7 @@ fn lenient_hlc<'de, D: serde::Deserializer<'de>>(deserializer: D) -> Result<Opti
     Ok(raw.and_then(|raw| bson::deserialize_from_bson::<Hlc>(raw).ok()))
 }
 
-/// A replay's records cursor, read leniently (m1 of the B5 build review): one
+/// A replay's records cursor, read leniently (ADR-240): one
 /// that does not decode is none, so the page's records start over at its
 /// position, and the frame is never refused for it.
 fn lenient_replay_records<'de, D: serde::Deserializer<'de>>(
@@ -308,7 +308,7 @@ pub enum Message {
         #[serde(default)]
         partial: bool,
         /// The requester asks for a page of the replay of its own origin
-        /// (ADR-212), from `from` (B2 of the B5 build review): the sender cuts
+        /// (ADR-212), from `from` (ADR-240): the sender cuts
         /// the answer as a replay page, with the records of the page's
         /// collections whose request spans it, and sizes it to the frame itself,
         /// down to a page of records alone (`Entries::replay_records`). Optional
@@ -372,7 +372,7 @@ pub enum Message {
         exhausted: bool,
         #[serde(default)]
         passed_through: Option<kimmy_core::Stamp>,
-        /// The idempotency records the shipped entries carry (B5, "How a
+        /// The idempotency records the shipped entries carry (ADR-240, "How a
         /// record travels"): `{collection, scope hash, carrying stamp, record
         /// bytes}`, read in the read transaction that read the window and only
         /// for the stamps shipped. The bytes are opaque here and pass through.
@@ -385,7 +385,7 @@ pub enum Message {
         )]
         records: Vec<kimmy_storage::CarriedRecord>,
         /// On the answer to an `AskEntries` that set `replay`: the page carries
-        /// records alone (m1 of the B5 build review), and the next page at the
+        /// records alone (ADR-240), and the next page at the
         /// same `from` goes on after this. Optional and read leniently: an older
         /// receiver ignores it, and an older sender sends none.
         #[serde(
@@ -447,7 +447,7 @@ pub enum Message {
         /// cut short before it reached the requester's entries therefore still
         /// makes progress at every contact.
         scanned_to: Hlc,
-        /// The idempotency records the shipped entries carry (B5, "How a
+        /// The idempotency records the shipped entries carry (ADR-240, "How a
         /// record travels"): `{collection, scope hash, carrying stamp, record
         /// bytes}`, read in the read transaction that read the window and only
         /// for the stamps shipped. The bytes are opaque here and pass through.
@@ -641,7 +641,7 @@ pub enum Message {
         scanned_to: Hlc,
         exhausted: bool,
         versions: VersionVector,
-        /// The idempotency records the shipped entries carry (B5, "How a
+        /// The idempotency records the shipped entries carry (ADR-240, "How a
         /// record travels"): `{collection, scope hash, carrying stamp, record
         /// bytes}`, read in the read transaction that read the window and only
         /// for the stamps shipped. The bytes are opaque here and pass through.
@@ -1124,7 +1124,7 @@ mod tests {
                     after_key: vec![1, 2],
                     records: None,
                     // A records delta's base: a key of the sender's change
-                    // log and its epoch (B5).
+                    // log and its epoch (ADR-240).
                     records_base: Some(kimmy_storage::RecordsBase {
                         key: kimmy_core::Stamp::new(Hlc::new(77, 1), NodeId::from_bytes([3; 16])),
                         epoch: Some(i64::MIN + 5),
@@ -1290,14 +1290,14 @@ mod tests {
     }
 
     /// The same boundary for `AskEntries::replay` and the replay's records cursor
-    /// (B2 and m1 of the B5 build review), in both directions. A request that
+    /// (ADR-240), in both directions. A request that
     /// sets neither writes neither key; a sender before them reads a request that
     /// sets them as the window it knew; a frame from before them reads as `false`
     /// and `None`; and a cursor of another shape reads as none, never refusing the
     /// frame.
     #[tokio::test]
     async fn the_replay_fields_cross_a_version_boundary_in_both_directions() {
-        /// `AskEntries` as a sender before B5 declares it.
+        /// `AskEntries` as a sender before 0.52 declares it.
         #[derive(Debug, Deserialize)]
         struct AskEntriesBeforeReplay {
             from: Hlc,
@@ -1547,7 +1547,7 @@ mod tests {
         );
     }
 
-    /// C7 of the B5 design: the idempotency records cross a version boundary in
+    /// The idempotency records cross a version boundary in
     /// both directions on every frame that carries them (`Entries`,
     /// `ReplayEntries`, `Push`, a snapshot page, and the records position of a
     /// snapshot cursor). A receiver before the field reads a frame carrying
@@ -1559,7 +1559,7 @@ mod tests {
     /// and `a_051_decoder_reads_a_block_carrying_idempotency_records`).
     #[tokio::test]
     async fn the_idempotency_records_cross_a_version_boundary_in_both_directions() {
-        /// `Entries` as a requester before B5 declares it.
+        /// `Entries` as a requester before 0.52 declares it.
         #[derive(Debug, Deserialize)]
         struct EntriesBeforeRecords {
             entries: Vec<OplogEntry>,
@@ -1568,7 +1568,7 @@ mod tests {
             #[serde(default)]
             passed_through: Option<kimmy_core::Stamp>,
         }
-        /// `ReplayEntries` as a receiver before B5 declares it.
+        /// `ReplayEntries` as a receiver before 0.52 declares it.
         #[derive(Debug, Deserialize)]
         struct ReplayBeforeRecords {
             from: Hlc,
@@ -1578,7 +1578,7 @@ mod tests {
             horizon: bool,
             scanned_to: Hlc,
         }
-        /// `Push` as a receiver before B5 declares it.
+        /// `Push` as a receiver before 0.52 declares it.
         #[derive(Debug, Deserialize)]
         struct PushBeforeRecords {
             entries: Vec<OplogEntry>,
@@ -1586,13 +1586,13 @@ mod tests {
             exhausted: bool,
             versions: VersionVector,
         }
-        /// `SnapshotCursor` as a receiver before B5 declares it.
+        /// `SnapshotCursor` as a receiver before 0.52 declares it.
         #[derive(Debug, Deserialize, Serialize)]
         struct CursorBeforeRecords {
             collection: CollectionId,
             after_key: Vec<u8>,
         }
-        /// `SnapshotPage`, as far as a receiver before B5 reads it.
+        /// `SnapshotPage`, as far as a receiver before 0.52 reads it.
         #[derive(Debug, Deserialize)]
         struct PageBeforeRecords {
             documents: Vec<kimmy_storage::SnapshotDoc>,
@@ -1741,7 +1741,7 @@ mod tests {
             dropped_indexes: Vec::new(),
             tombstone_horizon: None,
             records: vec![kimmy_storage::CarriedRecord { carrying: None, ..record }],
-            // And the epoch of the sender's change log, on every page (m4).
+            // And the epoch of the sender's change log, on every page.
             records_epoch: Some(i64::MIN + 3),
         };
         let message = Message::Snapshot(Box::new(page.clone()));

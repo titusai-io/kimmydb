@@ -1,4 +1,4 @@
-//! The lab hooks of the B5 cluster tests: a member that behaves as a release
+//! The lab hooks of the idempotency cluster tests: a member that behaves as a release
 //! before 0.52 does, and a keyed `multi` request held between two chunks. Built
 //! only with the `lab-hooks` cargo feature; the shipped binary has none of it (the
 //! release check is `strings kimmyd | grep -c` of each switch's name reading 0).

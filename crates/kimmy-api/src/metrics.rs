@@ -90,6 +90,15 @@ pub struct StorageReadings {
     /// database was opened (`Engine::cache_reading`).
     pub storage_cache: kimmy_storage::CacheReading,
     pub vector_index_cache_bytes: u64,
+    /// Resident HNSW graphs served while their rebuild, or the judging of the
+    /// snapshot they came from, is due (`IndexCache::stale_graphs`, ADR-245).
+    pub vector_graphs_stale: u64,
+    /// HNSW builds queued or running, one per collection
+    /// (`IndexCache::builds_pending`, ADR-245).
+    pub vector_graph_builds_pending: u64,
+    /// The highest sampled unreached score among the graphs this process
+    /// built (`IndexCache::unreached_sample`, ADR-241).
+    pub vector_graph_unreached_sample: u64,
     /// This process's resident memory and its high-water mark, as the
     /// kernel reports them ([`ProcessMemory`], ADR-147). The figure a
     /// container memory limit is enforced against, which neither of the two
@@ -135,7 +144,7 @@ pub struct StorageReadings {
     /// applied on this member (`Engine::decimal128_id_present`, ADR-238): the
     /// durable marker a rollback runbook reads, read at scrape.
     pub decimal128_id_present: bool,
-    /// The records keyed writes leave (B5): how many this member holds, and
+    /// The records keyed writes leave (ADR-240): how many this member holds, and
     /// the engine's counts of the ones it took from peers, could not decode and
     /// collected ([`crate::AppState::idempotency_reading`]).
     pub idempotency: IdempotencyReading,
@@ -160,7 +169,7 @@ pub struct StorageReadings {
     pub ownership: OwnershipReading,
 }
 
-/// The ways a record of a keyed write arrives from a peer (B5), the labels of
+/// The ways a record of a keyed write arrives from a peer (ADR-240), the labels of
 /// `kimmy_idempotency_records_received_total{via}`, in the order of
 /// [`IdempotencyReading::received`]: a window this member pulled, a window a
 /// peer pushed, the replay of this member's own origin (ADR-212), a snapshot
@@ -177,7 +186,7 @@ pub fn received_via_slot(via: &str) -> usize {
         .unwrap_or_else(|| panic!("`{via}` is not a way an idempotency record is received"))
 }
 
-/// The storage engine's idempotency records, read at the scrape (B5). Counts
+/// The storage engine's idempotency records, read at the scrape (ADR-240). Counts
 /// since the process started, but for `records`, which is a level.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct IdempotencyReading {
@@ -386,6 +395,12 @@ pub struct MetricsSnapshot {
     /// The storage engine's page cache, as [`StorageReadings::storage_cache`].
     pub storage_cache: kimmy_storage::CacheReading,
     pub vector_index_cache_bytes: u64,
+    /// As [`StorageReadings::vector_graphs_stale`].
+    pub vector_graphs_stale: u64,
+    /// As [`StorageReadings::vector_graph_builds_pending`].
+    pub vector_graph_builds_pending: u64,
+    /// As [`StorageReadings::vector_graph_unreached_sample`].
+    pub vector_graph_unreached_sample: u64,
     /// Resident memory and its high-water mark, from the same reading
     /// (ADR-147).
     pub process_resident_bytes: u64,
@@ -532,15 +547,15 @@ pub struct MetricsSnapshot {
     /// applied on this member (ADR-238): an engine reading.
     pub decimal128_id_present: u64,
     /// Keyed requests by outcome, in `KeyedOutcome::ALL` order, and the
-    /// replays answered from a record another member wrote (B5).
+    /// replays answered from a record another member wrote (ADR-240).
     pub idempotency_requests: [u64; crate::idempotency::KeyedOutcome::ALL.len()],
     pub idempotency_peer_replays: u64,
-    /// The engine's records (B5), as [`StorageReadings::idempotency`] read them.
+    /// The engine's records (ADR-240), as [`StorageReadings::idempotency`] read them.
     pub idempotency_records: u64,
     pub idempotency_records_received: [u64; RECORDS_RECEIVED_VIA.len()],
     pub idempotency_records_undecodable: u64,
     /// Records that fit no frame or replay page that must carry them, by
-    /// `kimmy_cluster::UnfitPath` (m1 of the B5 build review).
+    /// `kimmy_cluster::UnfitPath` (ADR-240, records too many for a frame).
     pub idempotency_records_unfit: [u64; 3],
     pub idempotency_records_collected: u64,
     /// Definition repairs by outcome (`DigestRepairOutcome::DEFINITION` are the labels used),
@@ -784,7 +799,7 @@ pub struct Metrics {
     /// The drop purger's, for its progress age (ADR-189).
     purge_counters: OnceLock<std::sync::Arc<kimmy_storage::PurgeCounters>>,
     /// Keyed requests by what became of them, and the replays of another
-    /// member's record among them (B5): counted by the edge, which is the one
+    /// member's record among them (ADR-240): counted by the edge, which is the one
     /// place every keyed request passes, the gate's refusals included.
     idempotency_requests: [AtomicU64; crate::idempotency::KeyedOutcome::ALL.len()],
     idempotency_peer_replays: AtomicU64,
@@ -937,13 +952,13 @@ impl Metrics {
         self.rate_limited_principal.fetch_add(1, Ordering::Relaxed);
     }
 
-    /// One keyed request, by what became of it (B5).
+    /// One keyed request, by what became of it (ADR-240).
     pub fn record_idempotency(&self, outcome: crate::idempotency::KeyedOutcome) {
         self.idempotency_requests[outcome.slot()].fetch_add(1, Ordering::Relaxed);
     }
 
     /// One replay answered from a record another member wrote: the
-    /// cross-member deduplication at work (B5). Also counted as `replayed`.
+    /// cross-member deduplication at work (ADR-240). Also counted as `replayed`.
     pub fn record_idempotency_peer_replay(&self) {
         self.idempotency_peer_replays.fetch_add(1, Ordering::Relaxed);
     }
@@ -1479,6 +1494,9 @@ impl Metrics {
             store_repairs: readings.store_repairs,
             storage_cache: readings.storage_cache,
             vector_index_cache_bytes: readings.vector_index_cache_bytes,
+            vector_graphs_stale: readings.vector_graphs_stale,
+            vector_graph_builds_pending: readings.vector_graph_builds_pending,
+            vector_graph_unreached_sample: readings.vector_graph_unreached_sample,
             process_resident_bytes: readings.process_resident_bytes,
             process_resident_peak_bytes: readings.process_resident_peak_bytes,
             write_lock_wait_timeouts: readings.writer_wait_timeouts,
@@ -1829,6 +1847,15 @@ impl Metrics {
              # HELP kimmy_vector_index_cache_bytes Estimated bytes of HNSW graphs held in memory across vector collections. Bounded by vector.index_cache.max_bytes; a graph larger than the whole budget is held anyway.\n\
              # TYPE kimmy_vector_index_cache_bytes gauge\n\
              kimmy_vector_index_cache_bytes {index_cache}\n\
+             # HELP kimmy_vector_graphs_stale HNSW graphs served while they are rebuilt: adopted from a snapshot that was behind the store, or from one a previous process saved and a builder has not yet judged. Rises at the first start of 0.52.0 with the collections searched and falls as the rebuilds land; a graph evicted meanwhile is counted by kimmy_vector_graph_builds_pending.\n\
+             # TYPE kimmy_vector_graphs_stale gauge\n\
+             kimmy_vector_graphs_stale {graphs_stale}\n\
+             # HELP kimmy_vector_graph_builds_pending HNSW builds queued or running, one per collection: what kimmy_vector_graphs_stale counts and also a collection with no graph at all, answered by exact scans until its build lands, and an adopted graph evicted while its rebuild waited. Roll the next member once both read 0.\n\
+             # TYPE kimmy_vector_graph_builds_pending gauge\n\
+             kimmy_vector_graph_builds_pending {builds_pending}\n\
+             # HELP kimmy_vector_graph_unreached_sample The highest score among the HNSW graphs this process built and holds: of the 128 stored vectors each build asks to find themselves, how many did not at the build check's search effort. 8 or more is logged as a warning; every vector is linked, so it is a collection that is hard to search, not one that lost data.\n\
+             # TYPE kimmy_vector_graph_unreached_sample gauge\n\
+             kimmy_vector_graph_unreached_sample {unreached_sample}\n\
              # HELP kimmy_process_resident_bytes Resident memory of this process as the kernel reports it (VmRSS in /proc/self/status) - the figure a container memory limit is enforced against. Holds storage.cache_bytes, the HNSW graphs, and whatever heap the allocator keeps for reuse after a burst, which is why it does not follow the two byte gauges above down. 0 where /proc is not available.\n\
              # TYPE kimmy_process_resident_bytes gauge\n\
              kimmy_process_resident_bytes {resident}\n\
@@ -2120,6 +2147,9 @@ impl Metrics {
             oplog_verified_secs = readings.oplog_verified.elapsed_ms as f64 / 1e3,
             storage_cache = storage_cache,
             index_cache = readings.vector_index_cache_bytes,
+            graphs_stale = readings.vector_graphs_stale,
+            builds_pending = readings.vector_graph_builds_pending,
+            unreached_sample = readings.vector_graph_unreached_sample,
             resident = readings.process_resident_bytes,
             resident_peak = readings.process_resident_peak_bytes,
             p_requests = kimmy_vector::provider_totals().0,
@@ -2943,7 +2973,7 @@ mod tests {
 
         m.record_backup(Duration::from_secs(42));
         // Each keyed outcome a count of its own, so one rendered under another
-        // label cannot match (B5).
+        // label cannot match (ADR-240).
         for (outcome, times) in
             crate::idempotency::KeyedOutcome::ALL.into_iter().zip([3, 5, 7, 2, 4, 6])
         {
@@ -3234,6 +3264,9 @@ mod tests {
                 read_misses: 9_104,
             },
             vector_index_cache_bytes: 48,
+            vector_graphs_stale: 1_501,
+            vector_graph_builds_pending: 1_503,
+            vector_graph_unreached_sample: 1_502,
             process_resident_bytes: 49,
             process_resident_peak_bytes: 50,
             index_unkeyed: 26,
@@ -3713,6 +3746,15 @@ kimmy_oplog_verified_walk_seconds 1.304
 # HELP kimmy_vector_index_cache_bytes Estimated bytes of HNSW graphs held in memory across vector collections. Bounded by vector.index_cache.max_bytes; a graph larger than the whole budget is held anyway.
 # TYPE kimmy_vector_index_cache_bytes gauge
 kimmy_vector_index_cache_bytes 48
+# HELP kimmy_vector_graphs_stale HNSW graphs served while they are rebuilt: adopted from a snapshot that was behind the store, or from one a previous process saved and a builder has not yet judged. Rises at the first start of 0.52.0 with the collections searched and falls as the rebuilds land; a graph evicted meanwhile is counted by kimmy_vector_graph_builds_pending.
+# TYPE kimmy_vector_graphs_stale gauge
+kimmy_vector_graphs_stale 1501
+# HELP kimmy_vector_graph_builds_pending HNSW builds queued or running, one per collection: what kimmy_vector_graphs_stale counts and also a collection with no graph at all, answered by exact scans until its build lands, and an adopted graph evicted while its rebuild waited. Roll the next member once both read 0.
+# TYPE kimmy_vector_graph_builds_pending gauge
+kimmy_vector_graph_builds_pending 1503
+# HELP kimmy_vector_graph_unreached_sample The highest score among the HNSW graphs this process built and holds: of the 128 stored vectors each build asks to find themselves, how many did not at the build check's search effort. 8 or more is logged as a warning; every vector is linked, so it is a collection that is hard to search, not one that lost data.
+# TYPE kimmy_vector_graph_unreached_sample gauge
+kimmy_vector_graph_unreached_sample 1502
 # HELP kimmy_process_resident_bytes Resident memory of this process as the kernel reports it (VmRSS in /proc/self/status) - the figure a container memory limit is enforced against. Holds storage.cache_bytes, the HNSW graphs, and whatever heap the allocator keeps for reuse after a burst, which is why it does not follow the two byte gauges above down. 0 where /proc is not available.
 # TYPE kimmy_process_resident_bytes gauge
 kimmy_process_resident_bytes 49
@@ -4482,6 +4524,12 @@ kimmy_storage_cache_reads_total{result=\"miss\"} 9104
             assert!(!out.contains("kimmy_storage_cache"), "absent without the feature: {out}");
         }
         expect(&format!("kimmy_vector_index_cache_bytes {}\n", s.vector_index_cache_bytes));
+        expect(&format!("kimmy_vector_graphs_stale {}\n", s.vector_graphs_stale));
+        expect(&format!("kimmy_vector_graph_builds_pending {}\n", s.vector_graph_builds_pending));
+        expect(&format!(
+            "kimmy_vector_graph_unreached_sample {}\n",
+            s.vector_graph_unreached_sample
+        ));
         expect(&format!("kimmy_process_resident_bytes {}\n", s.process_resident_bytes));
         expect(&format!("kimmy_process_resident_peak_bytes {}\n", s.process_resident_peak_bytes));
         expect(&format!("kimmy_uptime_seconds {}\n", s.uptime_secs));
@@ -5112,15 +5160,19 @@ kimmy_storage_cache_reads_total{result=\"miss\"} 9104
                 + kimmy_cluster::DefinitionJudgement::ALL.len()
                 + kimmy_storage::DEFINITION_RESULTS.len()
                 // Keyed requests by outcome, peer replays, the records held, the
-                // records received by way, undecodable and collected (B5), and
-                // those that fit no frame, by path (m1).
+                // records received by way, undecodable and collected (ADR-240), and
+                // those that fit no frame, by path.
                 + crate::idempotency::KeyedOutcome::ALL.len()
                 + 1
                 + 1
                 + RECORDS_RECEIVED_VIA.len()
                 + 1
                 + 1
-                + kimmy_cluster::UnfitPath::ALL.len(),
+                + kimmy_cluster::UnfitPath::ALL.len()
+                // The HNSW graphs served while rebuilt, the builds queued or
+                // running, and the highest sampled unreached score among the
+                // graphs built here (ADR-245).
+                + 3,
             "expected one sample per series: {out}"
         );
     }

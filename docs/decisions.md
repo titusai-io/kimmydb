@@ -1437,6 +1437,21 @@ neither is worth guessing.
 
 ## ADR-044 — Point-in-time restore rewinds from post-images, and refuses what it cannot reconstruct
 
+> **Amended by [ADR-243](#adr-243--a-rewind-lowers-each-vector-to-its-target-and-further-only-below-a-document-it-restores).** The vectors no
+> longer come down "with the oplog". Rebuilt from what it kept, they lost coverage at or below the target of what
+> retention had collected, the member's own drops among them, and a cluster with a member rewound after a retention
+> pass stayed diverged. A rewind lowers each vector to its target, and further only below a document it restores, in
+> its own transaction (`Engine::lower_vectors_in`).
+
+> **Amended by [ADR-246](#adr-246--a-rewind-removes-a-document-created-after-its-target-without-a-tombstone).** A document created after the
+> target is removed and leaves no tombstone: a tombstone outranked a write of it at or below the target that another
+> member keeps. A document deleted at the target keeps its delete's own tombstone, as before.
+
+> **Amended by [ADR-248](#adr-248--a-rewind-judges-a-collections-ended-lives-as-the-apply-path-does).** Only entries of the
+> collection's standing life count: an entry at or below its tombstone or its incarnation floor is of a life a drop
+> ended, and is never put back. A drop after the target is refused whether the oplog holds its entry or the member
+> knows it only as a tombstone or a floor.
+
 **Decision.** `kimmyd restore --from <backup> --until <ms>` restores a backup and
 then rewinds document state to that instant using the oplog the backup carries.
 It refuses — having written nothing — when the target predates the oplog
@@ -14240,6 +14255,9 @@ interrupted drop before binding — is closed.
 
 ## ADR-159 — The writer hold says what held it
 
+> **Amended by [ADR-243](#adr-243--a-rewind-lowers-each-vector-to-its-target-and-further-only-below-a-document-it-restores).** The live exception below is closed: a rewind lowers the vectors
+> inside its own transaction (`Engine::lower_vectors_in`), which holds the gate as `rewind`.
+
 **Decision.** Every path that takes the single writer **declares what it is
 doing**. `Engine::begin_write` takes a `WriterHolder`, `Engine::hold_writer`
 takes one, and the coalescing barrier's flush — which takes the gate without
@@ -14444,6 +14462,12 @@ the waiter's own row does not carry it.
 ---
 
 ## ADR-160 — The open-time raise is confined to the entries this node appended in position
+
+> **Amended by [ADR-244](#adr-244--a-restore-re-derives-the-held-marks-from-the-backups-own-vector).** "The backup format" below still holds that
+> `OPLOG_HELD` is not in a backup, but its consequence no longer does: a restore
+> re-derives the marks from the backup's own vector, so a restored node does not
+> count the entries its source held as state. The residual accepted there was a
+> write lost for good, not a narrow window, and its fix needs no backup tag.
 
 > **Amended by [ADR-166](#adr-166--three-claims-the-code-does-not-support).**
 
@@ -15172,6 +15196,11 @@ must, when the guard is widened to refuse every removal.
 ---
 
 ## ADR-166 — Three claims the code does not support
+
+> **Amended by [ADR-244](#adr-244--a-restore-re-derives-the-held-marks-from-the-backups-own-vector).** The corrected ADR-160 paragraph below says the
+> restore residual reaches any node that has ever taken a snapshot from a busy
+> peer, and keeps the trade. The trade is withdrawn: a restore re-derives the held
+> marks, with no backup tag.
 
 **Decision.** Three statements in ADR-160, ADR-161 and ADR-162, and two
 comments in `snapshot.rs`, are corrected against what the code does. No
@@ -15980,6 +16009,12 @@ elsewhere would be set without evidence.
 
 ## ADR-171 — A served window passes over what the puller has already processed
 
+> **Amended by [ADR-243](#adr-243--a-rewind-lowers-each-vector-to-its-target-and-further-only-below-a-document-it-restores).** A point-in-time rewind no
+> longer resets both vectors to what the oplog holds (`reset_version_vector_to_oplog`, below): it lowers each to its
+> target, and further only below a document it restores, never below an entry it keeps. Unless it restores a
+> document, it leaves the witnessed position over a held entry at or below the target where it was, and the mark
+> goes as it would without the rewind.
+
 > **Amended by [ADR-197](#adr-197--a-served-window-that-skips-most-of-what-it-walks-reads-the-keys-of-the-arrival-index-not-the-oplogs-bodies).**
 > The skip decides on a key, but the walk read every row's body to reach it: the
 > cost the **Cost** paragraph below records. A window for a requester that names
@@ -16555,6 +16590,21 @@ phase.
   with no marks.
 
 ## ADR-173 — A resume token carries its issuing member's delivered vector, and resumes on any member
+
+> **Amended by [ADR-243](#adr-243--a-rewind-lowers-each-vector-to-its-target-and-further-only-below-a-document-it-restores).** A rewind no longer
+> replaces the vectors with the maximum over the entries it keeps (`reset_version_vector_to_oplog`): it lowers each
+> to its target, and further only below a document it restores, in its own transaction. So, unless it restores a
+> document, it does not leave a member's witnessed position below a held entry at or below the target, and that mark
+> goes as it would without the rewind (the origin writing again, or retention); the rewind still removes a mark with
+> the row it discards. Invariant I holds after it, as below. The record of a rewind
+> also carries, under the member's own origin, the newest tombstone it minted, and a start resumes its clock past
+> every stamp a record names.
+
+> **Amended by [ADR-246](#adr-246--a-rewind-removes-a-document-created-after-its-target-without-a-tombstone).** A rewind removes a document
+> created after its target without a tombstone and mints none, so a peer sending back an entry the rewind discarded
+> is held again here, at a new place in the arrival order. A token naming such an entry is `410` whether or not the
+> member holds it again, which is what this decision's "a peer sending the entry back does not change that" now rests
+> on.
 
 > **Corrects [ADR-055](#adr-055--the-client-protocol-is-httpjson-and-websocket-said-out-loud)'s**
 > "resume tokens that are portable across nodes", which `docs/clients.md`, the
@@ -22242,6 +22292,10 @@ the decision above refused) and *delaying the first step until the node
 serves*, which leaves the commit on the start and depends on task order.
 
 ## ADR-201 — What a member says about itself on the sync contact decides who may own expiry, webhooks and embeddings
+
+> **Amended by [ADR-247](#adr-247--a-member-that-sees-a-peer-come-up-or-renamed-exchanges-facts-blocks-with-it-at-once).** A
+> member that sees a peer come up or renamed, or rejoins itself, exchanges blocks with that peer at once, on the
+> opening frame pair of a sync round, rather than at the next sync contact.
 
 > **Amended by [ADR-213](#adr-213--a-member-that-cannot-do-a-class-of-work-yields-it-judged-by-its-own-heartbeats-against-its-peers).**
 > the sender now sets `yielding`, confirmation is the reader's (an echo or the
@@ -28241,7 +28295,7 @@ The roll is member-at-a-time, and 0.49 and 0.51 may share a cluster if an operat
 A 0.49 or 0.50 member cannot hold a `Decimal128` `_id`, and cannot parse a `Decimal128` partial-filter bound: an entry or page that carries the new `DocId` variant fails to decode, the window is requested for ever, and a refused index definition is recorded, never retried, and survives the member's own upgrade. So accepting either is an operator declaration, the featureCompatibilityVersion pattern.
 - **The switch.** `cluster.decimal128` (bool), default `true` when clustering is off and `false` when it is on. It states that every member runs 0.51 and has migrated, and it gates local creation only. An entry, a page, a restored or a repaired definition from another member is always applied; refusing one would wedge replication.
 - **Three chokepoints**, keyed on the BSON type of the `_id`, not on the `DocId` variant (an integral decimal is an `Int64` with a decimal body, which breaks an older member's full scans): `check_insert` (insert, bulk, scope inserts, upserts and `$setOnInsert`), `replace_in_txn` (only when the replace creates the row; a replace over an existing decimal `_id` is not refused), and a local `create_index` that mints such a definition (a new one, or the re-stamp of an inherited one): an identical standing definition is the idempotent answer and a duplicate `_id` is `DuplicateKey`, as for any index or id. Each refuses with `400`, naming `cluster.decimal128` and the peers that do not advertise it.
-- **The net.** A gated creation is also refused unless every live peer advertises `Facts.decimal128 = Some(true)` (written by every 0.51 member regardless of the key). An unheard peer fails closed, a migrating member is not live, and `cluster.membership = false` with clustering on always refuses. It is a net, not a check: a peer that restarts on an older build keeps its last block for up to one lease. **Amended by [ADR-240](#adr-240--idempotency-keys-the-record-is-written-with-the-write-and-travels-with-it-and-a-member-takes-keys-only-while-every-member-carries-records) (0.52.0):** the refusal tells the net's two causes apart. A live peer that does not say `decimal128` is the `400`, and decides: its held block says otherwise or nothing of it (an older build), its last block did not decode, or no block of it has arrived for more than the unheard lease (ADR-240 item 7: the longer of the lease and SWIM's time to declare a silent member down plus one sync interval) since it came up, was renamed or this member rejoined. A live peer with no block held within that lease, with none refusing, is `503 peer_unheard`, `retry: wait`, `Retry-After` of one sync interval, since it is heard at the next contact. 0.51 answered that case `400`.
+- **The net.** A gated creation is also refused unless every live peer advertises `Facts.decimal128 = Some(true)` (written by every 0.51 member regardless of the key). An unheard peer fails closed, a migrating member is not live, and `cluster.membership = false` with clustering on always refuses. It is a net, not a check: a peer that restarts on an older build keeps its last block for up to one lease. **Amended by [ADR-240](#adr-240--idempotency-keys-the-record-is-written-with-the-write-and-travels-with-it-and-a-member-takes-keys-only-while-every-member-carries-records) (0.52.0):** the refusal tells the net's two causes apart. A live peer that does not say `decimal128` is the `400`, and decides: its held block says otherwise or nothing of it (an older build), its last block did not decode, or no block of it has arrived for more than the unheard lease (ADR-240 item 7: the longer of the lease and SWIM's time to declare a silent member down plus one sync interval) since it came up, was renamed or this member rejoined. A live peer with no block held within that lease, with none refusing, is `503 peer_unheard`, `retry: wait`, `Retry-After: 1`, since it is heard at the next contact. 0.51 answered that case `400`.
 - **The marker.** A `META` row `decimal128:id_present` is written in the transaction that writes or applies the first document whose body `_id` has BSON type `Decimal128`: at `write_insert`, `replace_in_txn`, `write_chosen`, and in `apply_remote_in_txn` (entries, `All` and scoped pages, the deletes a page carries, `Converge` rows), and a backup carries it. It is exposed as the gauge `kimmy_decimal128_id_present`, a `/readyz` field, and a WARN once per peer and every ten minutes while it is set and a live peer cannot hold such an id. **The marker, not the key, is the authority**: the key can be set back to `false` and the ids remain.
 - **The procedure.** Set `cluster.decimal128` only after every member runs 0.51 and has finished its migration, and never in the same change as the binary. The same procedure covers a decimal partial-filter bound.
 - **Mutation rows.** 31 rows are killed, among them: the BSON-type test replaced by the variant at both chokepoints, the key ignored, the net removed, an unheard peer passing, the marker unwritten or keyed on the variant, any of the three chokepoints ungated, the third chokepoint gating replicated definitions, the integer normalisation removed, and `to_bson` not re-padding.
@@ -28676,7 +28730,7 @@ with it, and not be offered while any member could carry the write without it.
    `outcome_unknown` if that flush fails, as the first attempt's commit would: without the barrier a duplicate could be
    told `200` for a write the next flush then fails to make durable.
 
-3. **A record lives its window, and outlives a drop of its collection** (Chris, 2026-10-18, D2 option A). A record
+3. **A record lives its window, and outlives a drop of its collection** (Chris, 2026-10-18). A record
    is judged by its `last`: it is absent once `last` is past the window, at the cutoff the retention pass collects
    at, so no record is replayed past the window that removes it, and a record a peer sends that is already past it is
    not stored unless the live record here is of the same request, the same fingerprint (merged into the live record
@@ -28762,7 +28816,7 @@ with it, and not be offered while any member could carry the write without it.
      vector reaches (F3): a row a page or a lost entry left, which no window of the sender would otherwise ever vouch
      for. A replay page carries its own advance and the F3 records, and **every live record of the collections its
      entries name whose `last` is above the page's start and whose `first` is at or below its end, carried at its
-     `first`** (B2 of the build review, `Engine::records_for_replay_page`): a request whose attempts all ended on
+     `first`** (the spanning records, `Engine::records_for_replay_page`): a request whose attempts all ended on
      other members merges into a record with no row of the restored member's origin, and without them the replay
      handed that member its own effects bare. Carried at `first`, such a record rides with the first entry of its
      collection the member takes, so a page that stops between an effect and `last` stores it. **A sender ships a record at a row of its own. A
@@ -28773,7 +28827,7 @@ with it, and not be offered while any member could carry the write without it.
      fit counts every record, the F3 records first, each other with the first entry at or after its row; **when the F3
      records alone overfill a frame, the window carries no entries and grants nothing** (`Fits::Nothing`) until the
      sender has pulled their entries, and the sender logs it at `WARN`. **When no entry fits with the records riding
-     the first** (m1 of the build review), a pull is answered with a partial window of records alone: the F3 records
+     the first**, a pull is answered with a partial window of records alone: the F3 records
      and, in carrying order, the riders that fit, ending just before the first left out (or before the first entry),
      so it grants coverage only below the rows of what it carries and the next window carries the rest; a push sends
      nothing and leaves the change to anti-entropy; a replay page carries records alone, in key order, at the same
@@ -28818,7 +28872,7 @@ with it, and not be offered while any member could carry the write without it.
      `last`, `done` over `applying` at an equal one, and at an equal `last` and state the record whose bytes (but for
      `first` and the contested bit) are greater, so the merge is commutative as well as associative and idempotent,
      and every member picks the same record. **`contested`** is set when either side is or when the two fingerprints
-     differ (KR): a local store never merges two fingerprints, since its lookup refuses another one before anything is
+     differ: a local store never merges two fingerprints, since its lookup refuses another one before anything is
      written, so two meet only in a peer's merge, and the flag says the requests merged into the record are two or
      more. A function of the union, computed beside `first` after the winner is picked and never part of the
      tie-break, it keeps the join's three properties. A contested record is refused at every keyed lookup, before a
@@ -28832,7 +28886,8 @@ with it, and not be offered while any member could carry the write without it.
      scope, `carrying`, record bytes). It may carry records that ride no shipped entry, and `carrying` names the
      sender's row. An older receiver ignores it. **`AskEntries` gains `replay`**, a `bool` read as `false` when
      absent and not written when false: the outbound replay (the restored member asking a peer, `replay_own_origin`)
-     sets it, and the sender cuts its answer as a replay page, sized to the frame by the sender, with B2's records.
+     sets it, and the sender cuts its answer as a replay page, sized to the frame by the sender, with the spanning
+     records.
      A 0.51 sender ignores it and answers the window as a pull, which is safe: 0.51 holds no records, and keyed
      writes are taken only while every live member says it carries records. **`AskEntries` and `Entries` gain an
      optional, leniently read `replay_records`**, the records cursor above, which an older build ignores and an
@@ -28861,7 +28916,7 @@ with it, and not be offered while any member could carry the write without it.
      records for the whole window ahead of what may be a handful of documents, which is accepted, since a bound on the
      page's stamps would miss a record whose rows lie below them. The walk visits, for its records only, every
      collection the sender dropped and has not created again while its tombstone stands, and the delta carries a record
-     whatever its collection's state: a key outlives a drop of its collection for its window (D2, option A), so a member
+     whatever its collection's state: a key outlives a drop of its collection for its window (item 3), so a member
      rebuilt by snapshot answers a retry of it as the members that saw the drop do. **One byte budget per page:**
      `SNAPSHOT_PAGE_BYTES`, 63 MiB (`MAX_FRAME` less 1 MiB for what is not counted), less what the page's definitions,
      drops and vector take, shared in order by the delta, the records phase and the documents and tombstones, a
@@ -28876,7 +28931,7 @@ with it, and not be offered while any member could carry the write without it.
      records phase). **A converge repair's bound** (ADR-237: it ends once it has walked the collection's size at
      planning) **counts the documents and tombstones its pages carried**, against that size and two full pages more, not
      its pages: a page cut short by its bytes, or one of records only, carries fewer than 512 rows, and counted as a
-     page either ended the repair before it had walked the collection (the build review's m6). Where every page is full
+     page either ended the repair before it had walked the collection. Where every page is full
      the bound is what it was.
    - **The page delta.** A keyed write on the sender after a collection's records phase and before the page that holds
      its document would reach the receiver without its record. So each member keeps a node-local **change log**,
@@ -28890,7 +28945,7 @@ with it, and not be offered while any member could carry the write without it.
      the documents. **The epoch** is a random `i64` the log is given when it begins: with its first change, or at an
      open that finds records and no log of this node's identity (a restore, since a backup carries no log; an identity
      reset), before any page is cut, so a store that holds records always has one, and a sender restored twice during
-     one pull cuts bases of two epochs (the build review's m4). Keys are compared only within one epoch: a base of
+     one pull cuts bases of two epochs. Keys are compared only within one epoch: a base of
      another epoch, or a key without one, restarts the cursor's collection from its records phase, since a sender
      restored onto a host whose clock is behind logs keys below a base cut before the restore, which no comparison of
      keys can tell; the zero base of a log that had held nothing is sent every change. **The requester holds a page asked with the zero base to the epoch the page
@@ -28901,7 +28956,7 @@ with it, and not be offered while any member could carry the write without it.
      is never refused again. That costs one records-phase restart when a sender's first keyed write lands during a pull,
      accepted. A 0.51 sender writes no `records_epoch` and holds no records; a 0.51 receiver ignores the field. With the
      open's beginning (item 6), a sender restored during a pull, once or twice, never lands an effect without its
-     record (the build review's m4). **The remainder rule:** a page carries documents only with the whole
+     record. **The remainder rule:** a page carries documents only with the whole
      remainder of the log above its base within the page's byte budget and 65,536 log rows; otherwise it is a
      records-only page, its document position unchanged and its base moved to the last key it examined, logged at
      `INFO`. A sender whose keyed
@@ -28939,7 +28994,10 @@ with it, and not be offered while any member could carry the write without it.
    attempt's stamp its `first` and the later one's its `last`) it reopens as `applying`, its rows kept: a filter's
    resumes from the beginning under the stamp rule, and an insert, a replace, a delete by id or a `find_and_modify`
    replays its first answer, since an attempt's effect stands at or below the target. Left behind, a removed
-   record's rows would be read as F3 candidates by every frame until retention collected them. A backup carries
+   record's rows would be read as F3 candidates by every frame until retention collected them. A rewound member
+   that rejoins a cluster still holding the writes it undid is outside the documented procedure (operations,
+   "Point-in-time restore"): after such a rejoin, a keyed request's record need not come back with its undone write,
+   so a retry may apply it again. A backup carries
    `idempotency` and `idempotency_by_stamp` as tags 12 and 13, so a restored member keeps the records of the writes it
    holds, those it took by snapshot included: without them a retry there would apply on top of a write the backup
    brought back. **The rows travel only beside a record**: a store that holds no record writes neither tag, so its
@@ -28976,8 +29034,8 @@ with it, and not be offered while any member could carry the write without it.
    one live peer per period in a reshuffled round-robin and suspects a failed probe at the next period, and then
    `suspect_to_down_after`. A member that stops answering therefore leaves the live set before its unheard lease runs
    out, at any sync interval. A live peer *not heard yet*, with no block held within that lease (it came up a moment ago, or this member
-   dropped its block on a SWIM rename or its own rejoin), is **`503 peer_unheard`, `retry: wait`, with `Retry-After`
-   of one sync interval** (whole seconds, at least 1), because it is heard at the next contact; a `Retry-After`
+   dropped its block on a SWIM rename or its own rejoin), is **`503 peer_unheard`, `retry: wait`, with `Retry-After: 1`**, because it is heard by an immediate exchange (ADR-247) or at the next contact. The wait is a fixed second, whatever the sync interval; it was
+   one sync interval before the exchange, when the next contact was the only way. A `Retry-After`
    promises a condition that ends, so the `503` lasts no longer than the unheard lease. Measured at a 1 s sync
    interval with three members, a peer frozen just as this member rejoined was declared down 6.0 to 7.8 s later, inside
    the 9.8 s unheard lease; the lease alone (3 s), or the suspect-to-down time and one interval (5.8 s), answered `400`
@@ -28998,7 +29056,7 @@ with it, and not be offered while any member could carry the write without it.
 
 8. **What it reports.** Three codes: `idempotency_key_reused` (`422`, `no`) and `idempotency_key_in_flight` (`409`,
    `wait`, `Retry-After: 1`), logged at `INFO` through `request failed`, and `peer_unheard` (`503`, `wait`,
-   `Retry-After` of one sync interval; item 7, and ADR-238's gate), which writes no line: it is bounded, explained by
+   `Retry-After: 1`; item 7, and ADR-238's gate), which writes no line: it is bounded, explained by
    the response, and membership already warns of a peer unheard for more than a lease. The MCP argument carries the
    same refusal in its error's `data`, with `retry_after_secs`. Seven series, bridged to OTLP:
    `kimmy_idempotency_requests_total{outcome}` (`applied`, `replayed`, `resumed`, `reused`, `in_flight`, `gated`),
@@ -29046,17 +29104,17 @@ as built and accepted:
 - **A router with no gate installed reads as open**; **`kimmy_idempotency_requests_total` counts as item 8 says**; and
   **`GET /v1/version` publishes the engine's own window**, so the two cannot disagree.
 
-Five changes replaced parts of the design after the built parts were reviewed (the G1 analysis of how an effect could
-be relayed without its record, and the model test): **records travel with coverage** (item 5's F1 to F3 and the store
+Five changes replaced parts of the design after the built parts were reviewed (an analysis of how an effect could be
+relayed without its record, and the model test): **records travel with coverage** (item 5's F1 to F3 and the store
 on coverage), where the design stored a frame's record only in the run that took an entry of its collection, which
 left a relayed effect bare when its entry lost or its window was cut inside a commit; **`last` is a commit's last
 entry** (L1, item 2), where the design's first entry let a drop in that entry's millisecond bury a record whose
 later entry stood (moot since records outlive a drop; it stays as the truer `last` the window is measured on); **the lookahead** (G8, item 4), where the design's record-only `done` commit never reached a member
 that had pulled the last writing chunk; **the page delta** (item 5), which closes the scoped-repair residual the design
 accepted; and **a record's own row** (P1, item 5), where a row an earlier record under the key had left could ship the
-record standing now (P1's drop-purge half is moot since records outlive a drop). Three more followed the build review
-of the merged head (FIX FIRST): **records outlive a drop** (Chris, 2026-10-18, D2 option A; item 3), where the design's
-life rule made a record of a dropped life history and the purge removed it; **the contested flag** (KR, items 1 and
+record standing now (P1's drop-purge half is moot since records outlive a drop). Three more followed a review
+of the merged head: **records outlive a drop** (Chris, 2026-10-18; item 3), where the design's
+life rule made a record of a dropped life history and the purge removed it; **the contested flag** (items 1 and
 5), where two members that accepted one key for two requests merged their records into one whose answer was one
 request's and whose `first` could be the other's; and **a record past its window is not stored** unless the live
 record is of its own request (item 3), where it could merge into a new request's record and lower its `first`.
@@ -29116,7 +29174,8 @@ dropped life is history, absent on lookup and purged with the drop): a sender th
 still serves that life's entries, a member the drop has not reached yet takes a keyed `$inc` among them without its
 record, and a retry there writes again, stamped after the drop, which the next life keeps (ADR-236); closing that
 under the rule needed attempt segments carried in the record, since a resume-time rule read from a member's rows
-reopened a double, and the price of ruling A is only that a retry after a drop and recreate replays the old answer.
+reopened a double, and the price of records outliving a drop is only that a retry after a drop and recreate replays
+the old answer.
 **Replaying a contested record's winner to its own fingerprint**: one more branch, to keep a reply for one client of a
 client bug.
 
@@ -29125,9 +29184,9 @@ the construction against RFC 9562 B.2's published vector. **The model test** (`k
 `idempotency_model_tests.rs`): three or four engines run seeded schedules of keyed writes and retries on any member,
 crashes before and after any commit and failed fsyncs, pulls (short ones cut inside a window), scoped and converge
 pages, whole-database snapshots with writes between their pages, outages, restarts, backups and restores with
-the own-origin replay (its pages cut as the transport cuts them, in a frame of a few units: B2's records, and records
-alone under a records cursor), with steps between the replay's pages and the sender itself restored between a
-snapshot's pages (m4), rewinds (`restore --until`), orphan rows by stamp, drops and re-creations, unkeyed writes and
+the own-origin replay (its pages cut as the transport cuts them, in a frame of a few units: the spanning records, and
+records alone under a records cursor), with steps between the replay's pages and the sender itself restored between a
+snapshot's pages, rewinds (`restore --until`), orphan rows by stamp, drops and re-creations, unkeyed writes and
 retention with a moved clock, with steps run between any two commits of a request; it asserts I1 to I7 (never on its own effect, the record with the effect, once per
 member, convergence, exact on one member, never over, no replacement across requests), I8 (an `$inc` completes
 with every counter older than its merged `first` applied, never on another request's `first`) and Life (a member
@@ -29137,7 +29196,8 @@ into it, as the test tracks them, are two or more; a lookup refuses exactly wher
 request's; and a request whose record turns contested between two of its chunks commits no more and answers
 `partially_applied`. Every record a frame or page carries stands on its sender and rides at or above its `first`. `generated_schedules_short` runs in CI;
 `generated_schedules_long` is ignored, a gate of record, `IDEM_SEEDS` seeds `IDEM_THREADS` at a time. Named rows write
-out the G1 analysis's breaks and the shapes the mutants need; `row_f1_a_window_cut_inside_a_commit` is the one that
+out the breaks the analysis of relays without the record found, and the shapes the mutants need;
+`row_f1_a_window_cut_inside_a_commit` is the one that
 makes F1 load-bearing: a keyed `$inc` of two counters in one commit, a short pull by B that ends at the commit's first
 entry, so the only row of the record the window's advance holds is the one at `first`, and a retry on B must replay.
 Two classes are counted and do not fail a run: **S1**, a record at
@@ -29145,7 +29205,8 @@ quiescence that the merged record dominates, or none where no document holds the
 that lost where the member pulled them, or by a record-only `done`, harmless while I2 holds; and **R1**, the writes of a
 reset or restored identity that peers keep only as page state never converge to it, a convergence matter outside this
 ADR. The mutation harness (`scripts/idempotency-mutants/`, run under bash) applies each mutant to an exported tree and
-runs its suites, the model's among them; [every mutation row of B5, run again together on the merged head, is listed
+runs its suites, the model's among them; [every mutation row of idempotency keys, run again together on the merged
+head, is listed
 with the test that kills it](adr-240-mutation-rows.md): 313 rows, 297 killed, 5 equivalent and 3 superseded, and the 8
 that G repeated from C run once. `kimmy-storage` also: `idempotency_tests.rs` (the codec, the contested bit and the merge's algebra, replays per
 path, a record outliving a drop (the purge, a database drop, a late drop, a resume across a drop, a delete by id whose
@@ -29154,21 +29215,25 @@ refused on store, the coalesced barrier, the fsync and write faults, restarts, t
 and its residual, resumes across crashes and members, retention and the row at `first`, the clock, the rewind and its
 rows, the backup and the rows it carries, a row whose record is gone shipping nothing), `idempotency_repl_tests.rs` (windows,
 receivers, the store on coverage, a record at its own row and with the entry at its row, a batch that ends early, the
-snapshot's records phase and an older receiver, repair and converge pages), `idempotency_coverage_tests.rs` (the G1
-analysis's G1b, G2, G2b, G3, T2 and G8 as storage tests) and `page_delta_tests.rs` (the R1 and R2 schedules, the base
+snapshot's records phase and an older receiver, repair and converge pages), `idempotency_coverage_tests.rs` (the
+analysis's relays after a snapshot, of a losing entry and of a coverage-only window, the cross-origin relay and G8 as
+storage tests) and `page_delta_tests.rs` (the R1 and R2 schedules, the base
 read in the page's own transaction, the remainder rule by bytes and rows, a resumed pull, the epoch after a restore, an
-identity reset and a clock behind), `idempotency_review_tests.rs` (what the build review's M1 found untested: every
+identity reset and a clock behind), `idempotency_review_tests.rs` (mutants a review found no test killed: every
 record and the change log expiring, the log kept across a pull's pages, a records-only page inside a records phase)
-and `idempotency_replay.rs` (B2's selection, an orphan row, the records cursor's set, its delta and its epoch);
-`kimmy-cluster`'s `replay_tests.rs` (B2 on both ways, F3 on a replay page, a page that stops between a request's
+and `idempotency_replay.rs` (the spanning records' selection, an orphan row, the records cursor's set, its delta and
+its epoch);
+`kimmy-cluster`'s `replay_tests.rs` (the spanning records on both ways, F3 on a replay page, a page that stops between
+a request's
 effects and its `last`, an orphan row on both ways, and records at a replay's start filling several pages on both
-ways), a pull and a push whose first entry cannot cross with its records, and the build review's B1 schedules (a
+ways), a pull and a push whose first entry cannot cross with its records, and the lowest-row schedules (a
 batch stopped, or split into runs, between two rows of one record) in `idempotency_coverage_tests.rs`. A rewind that
-cuts a keyed bulk part-way removes its record (m3). `kimmy-cluster` (`tests/idempotency.rs`, in process over real sockets): C1 pulled and
+cuts a keyed bulk part-way removes its record. `kimmy-cluster` (`tests/idempotency.rs`, in process over real sockets): C1 pulled and
 pushed, C2, C3, C5, C6 with more records than a page, C8 (an old key replays after a drop and a re-creation), C9, and a fresh multi-chunk request racing writers on two
 members; C7 as the version-boundary decodes beside the protocol.
-`kimmyd` (`tests/cluster.rs`, real processes over HTTP): C1, C2, C3, C5, C6, C8, C9 and the multi-chunk race, T2 over
-four members, and a finished multi-chunk request replaying on every caught-up member. `kimmy-api` (`tests/idempotency.rs`):
+`kimmyd` (`tests/cluster.rs`, real processes over HTTP): C1, C2, C3, C5, C6, C8, C9 and the multi-chunk race, the
+cross-origin relay over four members, and a finished multi-chunk request replaying on every caught-up member.
+`kimmy-api` (`tests/idempotency.rs`):
 the header's syntax, the route guard against `openapi.yaml`, the gate with the switch off, with an older peer (`400` on
 every keyed route, deciding over an unheard one) and with an unheard peer (`503 peer_unheard` and `Retry-After` on every
 keyed route, again after a rename, then the same key's first answer and its replay), with a peer past its lease or
@@ -29191,7 +29256,170 @@ before the `400` of C's heard block, and the cluster tests' keyed requests are s
 client sends them. `kimmyd`: the switch's defaults and its refusal of a misspelt key, the facts
 field, the gate across a cluster, and a keyed write whose own fsync fails answered by its replay after the restart.
 
+---
+
+## ADR-241 — The HNSW graph is built by `hnsw_rs` 0.3.5 and linked at layer 0, a snapshot's dump is checked before the library reads it, and a filtered walk widens with its filter
+
+> **Amends [ADR-103](#adr-103--hnsw-graphs-are-built-off-the-lock-and-live-under-a-budget)** (how a graph is built and
+> retried) **and [ADR-102](#adr-102--vector-search-filters-use-the-planner-and-the-exact-and-lexical-paths-hold-only-the-top-k)**
+> (how a filtered search over the graph joins its admitted set). No `kimmy.format` schema, codec, record, wire field,
+> configuration key or snapshot format changes; a snapshot's `meta.json` gains one field, `graph`, which 0.51 ignores.
+> Not a rollback boundary.
+
+> **Extended by [ADR-245](#adr-245--hnsw-graphs-are-built-and-saved-on-builder-threads-and-no-search-waits-for-one).**
+> The rebuild every graph takes once after the upgrade (item 5) runs on a builder thread, and no search waits for it.
+
+**The case.** `hnsw_rs` 0.3.4, the library the graph was built with, stored the reverse edge it adds for a new point at
+the new point's top layer instead of the layer the edge was found on, so a point drawn above layer 0 could be left with
+no edge into it at layer 0, and no search returns such a point at any `k`. Measured with every point checked: 0.75% to
+3% of a 400 × 16 collection, 0.8% to 2.1% of 1,000 × 384 (one draw in twelve 34.6%, 800 points outside the entry
+point's component), 4.4% to 5.2% of 10,000 × 384; on data of low intrinsic dimension (24 dimensions projected into 384,
+plus noise, nearer what an embedding model writes) 1.6% to 2.4% at every size. Two tests flaked on it, about one run in
+sixteen and one in a hundred. 0.3.5 stores the edge at the right layer, and still leaves points with no edge into them,
+by another route: an insertion pushes the new point into each neighbour's list and pops the farthest entry when the list
+is over its cap, and a point every neighbour holds closer points for is popped by all of them (0.1% of the
+low-dimensional data at 10,000 to 100,000 vectors; 1.5% to 8% of uniformly random 384-dimensional vectors). 0.3.5 also
+seeds every graph's level generator with the constant 397, with no way to seed it otherwise, so the same records
+inserted in the same order build the same graph and a retry rebuilt the graph it was retrying; and its loader ends the
+process (`std::process::exit(1)`) on a format-2 dump, as both versions do on any vector they cannot read. Separately, a
+filtered search that walks the graph (a filter admitting more than 1,000 documents) asked the walk for a fixed 320
+candidates and discarded the ones the filter refused: at 1% of 100,000 documents admitted it returned about four hits of
+ten.
+
+**Decision.**
+
+1. **The library is `hnsw_rs` 0.3.5, vendored with one added function** (`vendor/hnsw_rs`, through `[patch.crates-io]`).
+   The source diff from 0.3.4 was read whole: the reverse-edge fix, the seeded generator, the format-2 exit, a corrected
+   (capacity-only) layer-size estimate, `bincode` removed and `rand` 0.9 → 0.10. No new `unsafe`, no `build.rs`, no I/O or
+   network beyond the dump and load it already did; the one new process exit is the format-2 read. `Cargo.lock` loses
+   `bincode` and moves the library's `rand` to the 0.10.3 the workspace already carried, with the same features. The
+   vendored tree is the published `.crate` (sha256 `c9b4dcb9…af9f`) in one commit and `kimmydb.patch` in the next, and
+   `scripts/check-vendored-hnsw.sh`, a CI step, holds it to the published crate plus the patch, byte for byte. The patch
+   adds `Hnsw::add_layer0_edges`, which adds layer-0 edges past a list's cap without displacing any; the library has no
+   other way to add an edge.
+2. **A build links every point its insertion cut off** (`link_cut_off`). After the inserts it reads layer 0's structure:
+   every point with no edge into it, and every point outside the entry point's component (the first point inserted at
+   the top level). Each gets edges from its two nearest linked points, found by a search of 16 at an effort of 100, the
+   least-loaded candidates first so that copies of one vector do not hang every edge on one point; rounds repeat until
+   none is left, at most four, and every measured build needed one. Measured after linking: no point cut off in any
+   build; none lost in any graph up to 1,000 vectors of either kind; 0.02% of the low-dimensional data hard to find at
+   100,000 (found at four times the effort but for two); the uniform data keeps reachable points a search at the build
+   check's effort misses (0.9% to 1.1% at 10,000, 10.8% at 100,000), which is recall, not loss. The linking costs under a
+   second at 100,000 low-dimensional vectors and 18 s at 100,000 uniform ones. **A component no search's candidates
+   reach is bridged** (`bridges`): a cut-off point whose 16 nearest are all cut off themselves gets no edge from them,
+   which a component of more than 16 points out of the entry point's reach, whose searches return only one another,
+   leaves. In the same round, one point of each weakly connected component of cut-off points (one no other cut-off point
+   has an edge into, when the component has one) is joined both ways to its two nearest linked points, found by reading
+   every linked point's vector. What of the component that point does not reach is linked by the next round's search, or
+   bridged again. That is measured, not guaranteed: in 75 graphs, at toy parameters and the build's, every one was left
+   with no point cut off within two rounds of the four, and none reached the retry; a component still cut off after
+   the four rounds goes to the structural retry of item 3. The cost is one pass over the vectors per round, scoring each against one
+   point per component, which looks at the node's stop every 4,096 vectors; nothing when no point was stranded. Seen at
+   toy parameters (four connections, construction effort 8, two tight clusters inserted one after the other: the second
+   cluster's 40 of 80 points, every one stranded), where the bridge leaves none cut off; at the build's parameters and
+   in its shuffled order, two to fifty tight clusters of 100 to 2,000 vectors of 384 dimensions stranded nothing. Five
+   tight clusters of 20,000 vectors of 384 dimensions at toy parameters leave 90,406 points cut off in 10,726
+   components, which the pass joins in 22 s in release, where one point per point no other cut-off point had an edge
+   into took 233 s. A point still cut off after the rounds is the structural retry of item 3.
+3. **Each build attempt inserts in its own order** (`insertion_order`): a Fisher–Yates shuffle of the walk's order (chunk
+   keys in key order) driven by SplitMix64 seeded with the attempt number, the first attempt included. A collection's
+   graph is a function of its records and the attempt, reproducible on every member and across restarts, and different
+   per attempt, which is the only way left to vary the draw. Shuffling the first attempt too keeps the key order, which
+   can track the vectors, out of the build. **A build is retried only when its linking leaves a point cut off**, which no
+   measured build has: an `ERROR`, then the next attempt's order, at most `MAX_BUILD_ATTEMPTS` (2) times. The sampled
+   check (`REACHABILITY_SAMPLE` 128, `REACHABILITY_CONFIRM_EF` 800, `REACHABILITY_CONFIRM_K` 32) stays, as a `WARN` at
+   `REACHABILITY_MAX_UNREACHABLE` (8) naming the collection, the score and the sample, with no retry: every point is
+   linked, so what a probe misses is a point a search of that effort does not find, and another order does not make a
+   collection easier to search. The linked graphs score 0 on the low-dimensional data at every size, 1 to 3 on the
+   uniform data at 10,000, and 13 on it at 100,000, where a retry tripled the build for nothing.
+4. **A snapshot's dump is checked before the library reads it** (`kimmy_vector::dump::check`). `catch_unwind` contains the
+   loader's panics and nothing else: it ends the process on format 2 and on any vector it cannot read (a data file cut
+   short), aborts it when an allocation of a size the file declares fails, reads past a buffer whose declared length is
+   shorter than the dimension, and panics on a dozen asserts, `unwrap`s and indexes. The check reads both files the way
+   the loader does, allocates nothing the file declares, and refuses every one of those, and anything that is not the dump
+   this build writes: format 4 of the library's description, full mode, sixteen layers, the expected point count, width,
+   connection count, distance and element type, every point once, every neighbour and entry rank inside its layer, no
+   NaN distance, every vector's squared length a finite 32-bit float, nothing after the end. A finite component is not
+   enough: 3e38 is finite and its square is not, and two components of 1.31e19 square to finite numbers that sum past
+   `f32::MAX`. The exact scan, which sums the squares in 32-bit floats, scores either kind 0. The library's cosine
+   distance multiplies in 32-bit floats and sums in 64-bit, so it is NaN, on which an assertion in it panics, only
+   between two vectors with a component of 2^64 (about 1.8e19) or more: a search for such a vector itself, and a build
+   whose self-check or linking searched for it, panicked, and a snapshot holding one loaded and then panicked at such a
+   search. Other searches went through, since the distance from such a vector to an ordinary one is finite, and at
+   1.31e19 only the exact scan failed. A client's vectors, a query vector and a
+   provider's answer are held to the same test where they enter (`search::searchable`). Refused is a
+   rebuild, as every unusable snapshot already was. The audit is a test that hands 39 spoiled dumps to the raw loader in
+   child processes and prints what each does (two exit, three abort, the rest panic, return an error, or load).
+5. **A snapshot says what built its graph, and is synced.** `meta.json` gains `graph`: 2 for a graph this build made (1 is
+   never written; no release built 0.3.5 graphs unlinked). One without it, which 0.51 and earlier wrote, is adopted as
+   behind whatever its counts say: it serves the search that loaded it, and the next search of the collection rebuilds it.
+   A field rather than a format bump, because the dump's layout did not change: 0.51 ignores a field it does not know, so
+   it loads and serves 0.52's graphs (proved with main's build against hnsw_rs 0.3.4, lists past the cap included), and it
+   writes `meta.json` from its own fields, so a graph it rebuilds and saves loses the mark exactly. `save` fsyncs the three
+   files and the staging directory before the rename that publishes them, and the parent directory after it.
+6. **A filtered walk widens with its filter.** The first walk asks for `clamp(⌈2 · k · chunks / admitted⌉, w, max(8,000,
+   w))` candidates, `w` the unadapted filtered width (320 at `k` 10), at the usual effort of four times the width. A walk
+   that comes back with fewer than `min(k, admitted × per_document)` hits is retried once, widened by what it saw:
+   `⌈2 · k · candidates / admitted candidates⌉`, at least four times the first width, the cap when it admitted none. A
+   second short walk gives way to the keyed join, which is exact. `SELECTIVE_JOIN_MAX` stays 1,000: the keyed join costs
+   about 44 µs per admitted document at 384 dimensions whatever the collection's size, and above about 1,000 the widened
+   walk is cheaper. Measured at 100,000 × 384 on the low-dimensional data: recall 1.000 against the exact filtered answer
+   at 1%, 2%, 3%, 5% and 10% admitted, never short, the graph answering every search, at 33, 18, 14, 10 and 9 ms. The
+   first width assumes the admitted documents are spread like the rest, which a filter correlated with the query breaks:
+   one that refuses the documents nearest the query admits nothing a narrow walk finds, however much of the collection
+   it admits, and the retry reads the walk's own share instead. Measured with two clusters, the one nearest the query (a
+   fifth of the collection) refused and the other admitted: at 20,000 × 384 the retry at the cap answered `k` of `k`, the exact answer, in 88 to
+   97 ms, where the keyed join takes 463 to 521 ms; at 100,000 × 384 the walk at the cap was short too, and the keyed
+   join read the 80,000 admitted documents for the exact answer in 2.3 to 3.4 s. So the keyed join's cost is bounded by
+   the admitted set alone, which can be most of the collection, and it is held to the request's deadline rather than to
+   a count, which would answer short: it reads the time every 64 documents and, past the deadline, answers as the
+   timeout layer would (`503`, `timeout`).
+
+**Rollback.** None added. A 0.51 member loads 0.52's snapshots, ignoring the `graph` field, and rebuilds nothing; a graph
+it rebuilds and saves is unmarked, and a member rolled forward again serves it once and rebuilds it. What 0.51 serves is
+its own: its filtered walk is fixed-width again, and a dump it cannot read can end its process as before.
+
+**Alternatives rejected.** Staying on 0.3.4 with a patch of our own: the edge bug is upstream's and fixed there. Forking
+0.3.5 to seed the generator: the order does the same with no change to the library. `set_keeping_pruned(true)`: measured,
+it loses three to twenty times as many points (1,831 of 100,000 low-dimensional vectors against 117 unlinked). Re-inserting
+cut-off points under fresh ids, which needs no patch: it displaces other points' edges (at 100,000 uniform vectors 32,801
+re-insertions in eight rounds left 3,448 cut off), and needs several graph ids per key. A git fork of the library instead
+of the vendored copy: a source the deny policy would have to allow, fetched at every release build. A snapshot format bump
+to 4: a rollback to 0.51 would then rebuild every graph, inside a search. Relying on `catch_unwind`: it cannot contain an
+exit or an abort. Raising `SELECTIVE_JOIN_MAX` or scaling it with the collection: the keyed join's cost grows with the
+admitted set, not the collection, and loses to the widened walk past about 1,000. Parallel insertion: unchanged, for the
+reasons beside the insert loop.
+
+**Tests.** `kimmy-vector`: every vector reachable in eight builds at 400 × 16, by search and by layer-0 structure (red on
+0.3.4 on essentially every run); at 1,000 × 384 in release, three draws with nothing lost and nothing cut off; a build
+links every point its insertion cut off (300 copies of one vector, 203 cut off before; a 96-dimensional fixture); an
+attempt builds one graph and each retry another; a build left cut off (the linking skipped) is retried in each attempt's
+order and returns the last; a high sampled score with nothing cut off is not retried; the linking reaches a component
+the entry point does not (two clusters whose top level holds seven points of different reach, judged from the entry
+point the library dumps); the linking bridges a component no search's candidates reach (40 of 80 points stranded, none
+left cut off, and edges both into and out of the component); the bridge joins one point per component to its two
+nearest linked points, both ways; the two graph tests that flaked hold the walk first, so a red names recall; the dump check against 39 spoilings
+(a rank equal to its layer's size, and a vector too large to square, among them) and four shapes; a snapshot of each process-ending kind refused, rebuilt and survived, each case in a child process whose
+raw-library twin must exit or abort as the case says; a 0.51 snapshot served once and rebuilt; what built a loaded graph
+read from its snapshot; a filtered search returning `k` at 1%, 2% and 3% admitted with no fallback, a first walk short
+of `k` retried wider and answering `k`, a retry widened by what the first walk saw (the 2,000 documents nearest the
+query of 5,000 refused, so that four times the first width admits none), and by a nonzero share it saw (the 3 nearest
+admitted and everything from the 1,400th on), a forced fallback equal to the keyed join, the
+keyed join stopping at a passed deadline, and the same rows at 100,000 documents in release; a provider's vector too
+large to square stores nothing of its batch. `kimmy-api`: a chunk and a query vector too large to square are refused
+with `400`, two components whose squares sum past `f32::MAX` among them and two that sum below it accepted; a graph
+search run as a request past its deadline answers `503` `timeout` naming the configured timeout, and exactly inside it; a provider's query vector too large to square, and one missing from its answer, answer `502`
+`provider_error`; and a search past its deadline answers as a timeout. [Every mutation row with the test that kills
+it](adr-241-mutation-rows.md). The reachability distribution measurement
+counts every point, the points cut off and the points found at four times the effort, on either fixture
+(`KIMMY_REACH_LATENT`), and the library audit is re-runnable on a library upgrade.
+
+---
+
 ## ADR-242 — A member's SWIM incarnation outlives its process, and each start takes one above the last
+
+> **Amended by [ADR-247](#adr-247--a-member-that-sees-a-peer-come-up-or-renamed-exchanges-facts-blocks-with-it-at-once).** The
+> peer that renames a restarted member exchanges blocks with it at once, so the close below lasts about one contact.
 
 > **Amends [ADR-037](#adr-037--local-peer-health-and-swim-membership-above-it)**, whose identities carry an
 > incarnation that every process started at 0. No wire, table, `kimmy.format` schema, backup tag or configuration key
@@ -29250,7 +29478,9 @@ peer drops the block it held from the member's last process when its new identit
 its first new block arrives. Before, a quick restart that kept its identity (at incarnation 0, before any renewal) was
 judged by the dead process's block until the new one's came, so a member restarted into an older build was taken for
 one that could hold what the old process could. Now no peer judges a new process by an old one's block; the cost is that
-a peer's gates close from the rename until the new process's first block.
+a peer's gates close from the rename until the new process's first block, which the peer asks for at the rename itself
+([ADR-247](#adr-247--a-member-that-sees-a-peer-come-up-or-renamed-exchanges-facts-blocks-with-it-at-once)), so the
+close lasts about one contact rather than up to a sync interval.
 
 **Alternatives.** *An incarnation from the wall clock* (milliseconds since an epoch): one step with no state, and no
 walk for a wiped directory, but a clock that steps back by Δ walks one step per unit of Δ (a minute of milliseconds is
@@ -29278,3 +29508,743 @@ rejoining member that resumes failure detection unchanged. `kimmyd/tests/cluster
 one restarted twice after its peers declared it down, once after it renewed in its run (frozen until declared down, then
 resumed) and twice at once, with no rejoin in any run, its file one above the last each time and the renewal recorded.
 Mutation rows in bash, one per clause.
+
+---
+
+## ADR-243 — A rewind lowers each vector to its target, and further only below a document it restores
+
+> **Amends [ADR-044](#adr-044--point-in-time-restore-rewinds-from-post-images-and-refuses-what-it-cannot-reconstruct)
+> and [ADR-173](#adr-173--a-resume-token-carries-its-issuing-members-delivered-vector-and-resumes-on-any-member).**
+> Not a rollback boundary: no format, table, key or schema changes, and `I_EPOCH` is unchanged.
+
+> **Amended by [ADR-246](#adr-246--a-rewind-removes-a-document-created-after-its-target-without-a-tombstone).** A document the rewind
+> removes leaves no tombstone, and a removal bounds the vectors as a restore does, with `F` no higher than the
+> oplog horizon. The rewind mints no tombstone, so its record names only what it discarded, and the
+> clock still resumes past it; the mutation rows on the minted tombstones go with them. Lowering only the origins the
+> rewind discarded an entry of is no longer equivalent: a removed document's judged write can be of an origin
+> nothing was discarded from.
+
+**The case.** B drops `items`. B's retention pass collects B's own drop entry before A or C has taken it (they are
+past the oplog window and within the tombstone window). B is rewound (`kimmyd restore --until`) to a moment after the
+pass, discarding nothing. A, which never heard of the drop, writes into `items`. Without the rewind, A's next pull
+from B is told `Collected` (A lacks an entry B has collected, ADR-097), A takes B's whole-database page, applies the
+drop and keeps its writes made after it (ADR-236), and every member ends with the re-dated life. With the rewind,
+every route ends diverged for good: B holds no `items`, and A and C hold no drop. The convergence model's
+`row_a_rewind_after_retention_keeps_the_members_collected_drop` is the case.
+
+**Why.** `rewind_to` rebuilt both vectors from the oplog it kept (`reset_version_vector_to_oplog`, ADR-044).
+Retention had removed every entry of B's own origin, so that origin left both of B's vectors. Then:
+- `lacks_collected` reads only the origins in the sender's servable vector, so no peer was told it lacked the
+  collected drop;
+- B's whole-database page carries the drop, and a receiver applies a carried drop only when the page's coverage
+  names it (ADR-163), which B's no longer did (`a whole-database page denied a collection with a stamp its sender's
+  own coverage does not name; ignored`);
+- the divergence check cannot close it. B's tombstone makes A's life the dropped one, so B has no existence finding.
+  The count and the cut digest compare only collections both members hold, and the digest defers as `incarnation`
+  while the cut does not cover B's drop, which it never can, since A's witnessed position at B cannot pass what B
+  advertises. A converge page writes documents over rows held, never a collection or a drop (ADR-237).
+
+**Decision.** A rewind to `until` lowers both vectors, origin by origin, in its own write transaction
+(`Engine::lower_vectors_in`, before the commit that removes the entries):
+
+`after[X] = min(V[X], until)`, and also at most `max(F, kept[X], collected[X])` when the rewind restores a document,
+
+where `F` is the lowest stamp among the entries the rewind restored (a document put back to an earlier entry, or to
+an earlier delete), `kept[X]` the newest entry of `X` the rewind keeps that is not held, and `collected[X]` the newest
+entry of `X` retention removed.
+
+The rewind removes every entry stamped after `until` and no other, so coverage above `until` has to come down
+(ADR-044's reason stands: left high, the member would claim history it no longer holds and never be sent it again).
+At or below `until` coverage stays, except under a restored document. **The member can cover a write of that
+document it never appended, judged against a write the rewind discarded**: one that lost last-writer-wins to it
+(ADR-054), or one a whole-database grant covers while the page carried the later write. The document now holds an
+older entry, and the coverage would keep every peer from sending the judged write again. Bounded by `F`, the member
+asks again for what it may have judged above it; bounded below by `kept[X]`, it never claims less than an entry it
+keeps; and bounded below by `collected[X]`, it never claims less than what retention collected. That last term
+matters when the restored entry arrived after a retention pass with a stamp below what the pass collected (a write
+of a member cut off for longer than retention): bounded by `F` alone, an origin with no kept entry, the member's own
+among them, would fall below its collected drop again (the convergence model's
+`row_a_rewind_that_restores_a_late_entry_keeps_the_coverage_of_what_retention_collected`). Every invariant the
+vectors carry holds:
+- **Invariant I** (ADR-173): every entry the rewind keeps is at or below `until` and `kept[X]`, and was at or below
+  `V` or held.
+- **Witnessed at least servable** (ADR-054): both vectors take the same bounds.
+- **ADR-160:** nothing is raised, so no held entry is claimed.
+- **What retention collected stays covered.** Every collected entry of `X` is at or below `collected[X]` and the
+  horizon, and `until` is at or above the horizon (a rewind refuses a target below it). So a member never claims
+  less of an origin than an entry it has collected, its own drop included: a peer lacking it is told `Collected`
+  again, and a page's coverage names it again.
+- **An origin the rewind discarded from** drops to `until` or below, under every entry discarded. A peer's discarded
+  writes come back by anti-entropy, as ADR-044 says, and the member's own from the peers that hold them.
+- **One transaction.** Lowered in a transaction of its own, as before, a failure between the two left the oplog
+  shrunk and the vectors above the target: ADR-044's failure, entered by another door.
+- **Not touched:** `OPLOG_COLLECTED` and the horizon, and the `state_held` rows (ADR-224). A hole above the target
+  can cost a peer one extra `StateHeld` snapshot, never a silent gap.
+- **With a restore's marks** ([ADR-244](#adr-244--a-restore-re-derives-the-held-marks-from-the-backups-own-vector)).
+  `kimmyd restore --until` restores, opens and then rewinds. The restore marks every restored entry stamped above the
+  backup's vector for its origin as held, so the open raises nothing over it. The rewind removes every entry above its
+  target with its mark, and its lowering never raises and leaves held entries out of `kept[X]`, so it claims none of
+  the held entries it keeps. The two compose, and invariant I holds after both
+  (`restore_page_state.rs`: `a_restore_until_does_not_claim_a_row_held_as_state`).
+
+**What a re-fetch can bring back.** Lowering to `max(F, kept[X], collected[X])` asks peers again for entries above
+it. None of them is an insert whose later delete's tombstone this member has collected, under the operator rule
+`tombstone_retention_secs >= oplog_retention_secs`: a tombstone collected means its delete's entry was collected in
+the same pass or an earlier one, so the delete is at or below the horizon, and so is the insert before it, and an
+entry the rewind restores or keeps is above the horizon. Two exceptions, both narrow. Retention's tail rule: the
+newest entry is never collected, so a delete that was the newest entry when its tombstone was collected stays in the
+oplog above the horizon until the next pass after a newer entry arrives; a rewind in that window, restoring a
+document to an entry below an insert of the deleted document that this member judged without appending, could take
+the insert again. And an entry that arrived after a pass with a stamp below the horizon, restored by the rewind, puts
+`F` below it. The value is never below `kept[X]`, the rebuild 0.51 made, so a rewind never asks for more than
+0.51's did. Measured on a rewind of a
+three-member store (B's oplog 3,300 entries, 50 documents restored, 100 removed, 150 entries discarded): no entry at
+or below the target was asked for again, and one pull's walk read 153 rows against 150 without the bound.
+
+**A judged write below a kept entry of its origin is the document repair's.** When the member keeps a later entry of
+the judged write's origin (C's t180 write of another document beside C's t150 write it judged), invariant I keeps
+its coverage of that origin at the kept entry, above the judged write, and no pull sends it again. The cut digest
+finds the difference and the document repair takes the row (ADR-237): in the cluster harness, with its one-second
+sync interval, every member of a cluster rewound to one target held the judged write 8.4 s after they were ready, a
+finding being confirmed at its second compared mismatch and repaired at the next contact.
+
+**Rejected: `min(V[X], max(oplog max[X], collected[X]))`.** It fixes the case and is below the decision wherever the
+vectors cover what the oplog does not name, with no restored document to justify it: a completed snapshot's grant (a
+sender whose own write another origin overwrote sends no entry of its own), and the witnessed vector's coverage of
+entries processed without an append (ADR-054's list). After a restore, `OPLOG_COLLECTED` is also only the coarse
+horizon's seed.
+
+**The clock after a rewind.** A start resumed its clock from the oplog's tail, the vectors and the stored metadata.
+After a rewind none of them names what it discarded, nor the tombstones it minted for documents created after the
+target, which the clock at the rewind stamps above everything discarded. On a member whose clock led its wall clock
+(`HlcClock::witness` folds any peer's stamp, unbounded) the next writes were stamped inside the discarded range and
+below those tombstones. A stamp there can be the very stamp of a discarded entry: a change-stream token naming the
+discarded entry then resumes from the new write as if it named it, where it is to be refused (ADR-173), and a peer
+that still holds the discarded entry takes the new write for one it already holds. A write below a peer's discarded
+one loses to it when anti-entropy brings it back. **The rewind's record now carries, under the member's own origin,
+the newest tombstone it minted, and `resume_hlc` folds the highest stamp any record names, of every origin.** No
+entry of the member's own stands between what it discarded and those tombstones, so the token check reads the record
+as it did. A record that does not decode costs the fold and not the open, with a `WARN`.
+
+**Rollback.** No format change: the record keeps its layout. A 0.51 binary reads the vectors a 0.52 rewind left
+(every invariant 0.51 relies on holds, and the verified record's form is unchanged) and the record, whose one more
+stamp under the member's own origin it reads as the newest discarded. On 0.51 a rewind rebuilds the vectors as it
+did, and a start does not fold the records. **A store rewound by 0.51 or earlier keeps the vectors it was left
+with.** Nothing raises them at open: raising `V` to `OPLOG_COLLECTED` could claim contiguity over a collected held
+entry (ADR-160). The operations guide says what to do with such a member.
+
+**Tests.** `rewind.rs`: `a_rewind_after_retention_keeps_the_coverage_of_what_retention_collected` (and that a fresh
+peer is told `Collected`), `a_rewind_of_a_restored_store_after_retention_keeps_the_coverage`,
+`a_rewind_lowers_every_origin_it_discarded_to_the_target_and_no_lower`,
+`a_rewound_member_asks_its_peer_again_for_what_it_discarded`, `a_rewind_that_discards_nothing_changes_neither_vector`
+(a snapshot's grant and a write that lost last-writer-wins),
+`a_rewind_that_restores_a_document_bounds_the_vectors_by_it_and_by_what_it_keeps`,
+`a_rewind_that_fails_while_lowering_the_vectors_writes_nothing`,
+`a_start_after_a_rewind_resumes_the_clock_past_what_it_discarded` and
+`a_start_after_a_rewind_resumes_past_a_peers_discarded_stamp`. The convergence model gains a retention step (the
+oplog window passed, the tombstones kept) and a rewind step, taken by named rows only, and its ghost forgets a write a
+rewind undid that no other member witnessed. Its rows, on every route: the case above with a control without the
+rewind; a restored document and a loser it judged (one member rewound, and every member); a restored document and a
+grant; a document put back to a delete; an entry held as state, never counted as kept; a loser above the target; a
+restored entry that arrived after a retention pass below what it collected; and a re-fetch after a rewind that meets
+a held tombstone, or is not asked for once the delete's entry is collected. `a_restored_document_below_a_kept_entry_of_the_judged_origin_is_healed_by_the_document_repair`
+pins the repair's case, and the cluster harness's
+`a_rewound_cluster_repairs_a_row_a_member_judged_against_a_discarded_write` runs it through real processes and the
+real repair. Mutation rows, in bash, each failing a test with only its own change: the servable vector not lowered;
+the witnessed vector not lowered; each vector rebuilt from the oplog as 0.51 did; the witnessed vector set to the
+lowered servable one; the verified record not written; no bound under a restored document; the bound without
+`kept[X]`; the bound without `collected[X]`; the bound leaving out a document put back to a delete; held entries
+counted as kept; the lowering in a second transaction; the start not folding the records; the start folding only the
+member's own origin; the minted tombstones not recorded; the minted tombstone recorded only when an own entry was
+discarded. **Equivalent: lowering only the origins the rewind discarded an entry of.** An origin whose coverage
+reaches past the target with nothing of it discarded covers there only writes this member never appended: an entry
+never shipped (ADR-029), a definition refused as a rival, which is judged the same again, or a write superseded or
+judged against a write of a document the rewind restores, which the bound under `F` lowers anyway, or removes, whose
+tombstone outranks it.
+
+---
+
+## ADR-244 — A restore re-derives the held marks from the backup's own vector
+
+> **Amends [ADR-160](#adr-160--the-open-time-raise-is-confined-to-the-entries-this-node-appended-in-position)
+> and [ADR-166](#adr-166--three-claims-the-code-does-not-support).** Not a rollback boundary: no backup tag,
+> format, table, key, schema or wire change, and `I_EPOCH` is unchanged.
+
+**The case.** B inserts `orders/1`, then `items/101`. D, which took B's earlier writes by entries, takes `items` by a
+scoped page, so the row of `items/101` is held as state (ADR-160) and grants D no coverage of B. D is backed up and
+restored. A backup does not carry `OPLOG_HELD`, so the restored store had no marks. Its first open, which
+`kimmyd restore` itself makes to read the replay floor, walked the oplog, found the page's row unmarked above the
+vector, raised both vectors over it, and recorded the vector verified. D's pulls then started past `orders/1` and
+never took it. A document written once and not touched again never reached D, though D's witnessed vector covered B's
+servable one and its catching-up marker cleared by dominance. A member that pulled B's origin from D lost it too. A
+backup taken part-way through a whole-database snapshot lost the later pages' documents the same way: the pull's
+progress is node-local and not in a backup, so the restored member never resumes it. Reproduced on 0.51.0; every build
+since ADR-160 behaves the same.
+
+**What the divergence check did with it.** Both halves see a lost insert: the live counts differ, and so do the cut
+digests. The digest repair (ADR-237) leaves it as `left`: the restored member holds nothing for the id, and the row is
+not young, because a restore resets the tombstone horizon to the open's start time. The count half's replay (ADR-148)
+brings it back while the origin keeps the entry. The digest repair heals a lost update of a document the member held.
+A lost insert whose count difference another difference in the same collection cancels stays lost, and until a repair
+runs, the member serves reads without the document and passes the gap on to members that pull from it.
+
+**Decision.** `restore_with` marks every restored oplog entry stamped above the restored `OPLOG_VERSIONS` entry for its
+origin, in its own write transaction, after the records. The first open then raises nothing, both vectors are the
+backup's servable vector, and the member takes the history around those entries again. It takes it by entries from its
+position, which releases each mark as its entry arrives in a contiguous window (ADR-169), or by a snapshot from a peer
+whose horizon it is past. The `restored a backup` line says how many it marked (`held`).
+
+**Why it is exact.** A backup is read in one read transaction of an open member. That member's open established
+invariant I (ADR-173's addendum of 2026-09-26) and every writer keeps it, so every entry above its servable vector for
+its origin was marked held there. The marks the restore derives are therefore exactly the source's marks that withheld
+a raise. A mark the source kept on an entry at or below its vector, one no grant or window had released yet, withheld
+nothing and is not carried. The member's own origin follows the same rule: a write of its own that it holds only as
+state does not raise its own position, so the start's replay of its own origin (`own_position_at_open`) still begins
+below it.
+
+**With a rewind.** `kimmyd restore --until` restores, opens and then rewinds. The rewind removes every entry above its
+target together with its mark, and whatever it does to the vectors must not raise them over a held entry, which ADR-160
+requires of it as of every writer. The marks the restore derived then stand on exactly the held entries the rewind kept,
+and invariant I holds after it.
+
+**The residual ADR-160 accepted is withdrawn.** ADR-160 left `OPLOG_HELD` out of the backup and accepted that "a
+restored node counts every entry and raises over the held ones", because carrying the table needed a backup tag that
+an older build's restore refuses. ADR-166 widened the residual to every member that has ever taken a snapshot from a
+busy sender, and kept the trade. The trade rested on the tag. Deriving the marks needs none.
+
+**Cost.** One pass over the restored oplog's keys inside the restore's transaction; no value is decoded. A backup from
+a build older than invariant I could hold an entry above its vector that its source held in position. That entry is
+marked, so the restored member asks for the history again instead of claiming it, which is the conservative direction.
+
+**Rollback.** The format does not move. A backup written by this build restores on 0.51 as before, and a 0.51 restore
+still raises over what the backup's source held as state. A store this build restored, opened by 0.51, keeps its marks,
+because 0.51 reads `OPLOG_HELD`. A member restored by 0.51 or earlier keeps the vector its open raised, since the raise
+was recorded as verified, and upgrading does not lower it. `operations.md` says how to tell whether a member is in that
+state and what to do about it.
+
+**Alternatives.**
+- *Carry `OPLOG_HELD` under a new tag.* 0.51's restore would refuse a backup of any member holding marks, which is a
+  rollback boundary, and a 0.51 backup restored by this build would still carry no marks, so this change would be
+  needed anyway.
+- *Carry the marks as `META` rows*, as ADR-224 carries its holes. 0.51 would copy them and not read them, but they
+  would still need deriving for older backups, and they add nothing to that.
+- *Record the vector verified at the restore*, to skip the first open's walk. A separate optimisation, not taken.
+- *Make every open mark instead of raise.* That would remove ADR-054's repair of a stale vector from every store, which
+  is wider than the restore needs.
+
+**Tests.** `kimmy-storage`, in `tests/restore_page_state.rs`:
+- a restored member takes the write a scoped page jumped over, at fixed stamps and on the real clock, the second with a
+  document written once and never again while B writes on after the restore;
+- its two vectors are the backup's servable vector;
+- a member pulling from it takes what the page jumped over;
+- a member restored part-way through a whole-database snapshot takes the later pages by entries, and holds nothing as
+  state at the end;
+- `restore --until` over a held row does not claim it;
+- the member's own position does not rise over a write of its own held as state.
+
+- a backup whose vector names two origins at different positions: the restore marks the lower origin's held row and
+  nothing of the higher origin's, and the member takes the lower origin's write below the row.
+
+In `backup::tests`: the restored marks are exactly the entries above the backup's vector, a stale mark on a covered
+entry is not carried, and a backup of a member that holds nothing as state restores no mark. The invariant model test
+in `verified::tests` asserts, after every restore it runs, that both vectors are the backup's servable vector.
+
+Mutations, in bash, each failing a test with only that change:
+- the marking removed;
+- `>=` in place of `>`;
+- `<` in place of `>`;
+- the comparison made against an empty vector;
+- one threshold for every origin, the vector's lowest position (it marks the entries of origins held further ahead);
+- one threshold for every origin, the vector's highest position (it leaves the held rows of origins held further
+  behind unmarked);
+- origins the vector does not name skipped (it leaves a row of an origin the member holds nothing of in position
+  unmarked).
+
+One more is argued equivalent rather than run: marking in a second transaction after the records commit behaves the same
+in every test and differs only on a crash between the two commits, which is why the marks are written in the records'
+transaction.
+
+---
+
+## ADR-245 — HNSW graphs are built and saved on builder threads, and no search waits for one
+
+> **Extends [ADR-241](#adr-241--the-hnsw-graph-is-built-by-hnsw_rs-035-and-linked-at-layer-0-a-snapshots-dump-is-checked-before-the-library-reads-it-and-a-filtered-walk-widens-with-its-filter)**
+> **and amends [ADR-103](#adr-103--hnsw-graphs-are-built-off-the-lock-and-live-under-a-budget)** (where a build runs,
+> and what a search of a collection without a graph is answered by). Adds one configuration key,
+> `vector.index_cache.build_concurrency`, which 0.51 refuses, and three gauges. No format, wire, schema or snapshot
+> change. Not a rollback boundary; remove the key before rolling back.
+
+**The case.** A search that found no usable graph built it, in the request: the O(n) count, the build, the linking and
+the save ran on that request's blocking thread, and every other search of the collection arriving meanwhile waited for
+the same build. `server.request_timeout_secs` cannot end a thread that does not yield, so those searches waited the
+whole build: measured with 384 dimensions, 9 s and a 4 s save at 10,000 vectors, and 4.4 to 12 minutes and up to two
+minutes' save at 100,000. ADR-241 rebuilds every vector graph once after the upgrade, so after a roll every searched
+collection's next search would wait that long, on every member.
+
+**Decision.**
+
+1. **Builds run on builder threads.** A search that finds no usable graph queues a build and is answered at once. The
+   queue holds one build per collection, carrying the forget epoch read when it was asked for, so a drop, a reconfigure
+   or a recreate since fences it as it fences a build under way. The queue records each build's shape, and a
+   reconfiguration fences a queued build of another shape even with nothing resident, since one asked for before it is
+   of the old shape; a re-delivered configuration finds a queued build of the shape in force, and leaves it alone. At most `vector.index_cache.build_concurrency`
+   builder threads run (default 1; at least 1): a build is CPU and memory bound (a 100,000 × 384 graph peaks at about
+   1.3 GiB with its records), and the first start of 0.52.0 asks for every searched collection's at once. A builder runs
+   the count that decides whether the collection is worth a graph, the build and the linking, then the save, then
+   installs under the collection's build lock and the epoch fence. A builder exits when the queue is empty, and the next
+   search that queues a build starts one. A build that panics costs that build and not the builder: it is caught,
+   logged at `ERROR`, the queue's counts stay true, and the collection is scanned until a later search asks again.
+   **A builder keeps nothing from the node's stop.** Its walks, the count, the build's reads, the linking and the
+   bridge's pass among them, are background walks, which the stop ends at once; the linking looks at the stop between
+   its searches every 4,096 cut-off points, as the bridge's pass does every 4,096 vectors. A queued build holds the store weakly,
+   and a builder holds it only for the count and the build and lets go before the save, which needs none: a save of
+   100,000 vectors takes up to two minutes, and a stop that lands in one finds the store free to close. No save starts
+   once the stop has begun; one the exit cuts short leaves its staging directory, never a half snapshot (ADR-241 item
+   5), and the next start sweeps it.
+2. **What a search is answered by meanwhile.** A graph of the collection and shape from before a write is served while
+   its rebuild runs, as before (bounded recall on new data, never a wrong answer). A snapshot found behind, which
+   includes every snapshot 0.51 or earlier saved (ADR-241), is installed behind and served until its rebuild lands. A
+   snapshot a previous process saved is installed unjudged and served at once; a builder counts the collection and
+   compares its moves of chunk ids, and either re-stamps it at the generation the process started at or rebuilds it.
+   The process's start, not the builder's generation or the adoption's: a snapshot a previous process saved predates
+   every write this process has made, and a write that keeps the count and the keys, an edit of a document into as many
+   chunks, made before the first search or between the adoption and the judgement, is one the count cannot see; stamped
+   at the start the graph is behind it and rebuilt once the window passes, rather than fresh until some later write.
+   The snapshot load itself stays in the search, off the async worker: under a second at 100,000 vectors. Only a
+   collection with no graph at all is answered by an **exact scan** of every vector (`Access::Building`).
+3. **The exact scan while a graph is built** takes a turn first: at most two scans of one collection at once
+   (`EXACT_SCANS_PER_COLLECTION`), a fixed number, since each scan is all CPU and storage reads (135 ms at 10,000 × 384
+   and 1.4 s at 100,000, release) and the build needs the rest of the cores. The turn is awaited, from a semaphore per
+   collection, so a search waiting for one holds no thread; a search waits only until its request's deadline, holds the
+   turn for the whole of its scan, and the scan reads its deadline every 256 vectors (`vector_search_until`); past it
+   the search answers as a request that ran out of time does, `503` `timeout`, with the configured timeout in the
+   message. Scans of other collections are not counted against it.
+4. **Three gauges, and the swap's log line.** `kimmy_vector_graphs_stale` counts the resident graphs served while they
+   are rebuilt: installed behind, or unjudged. `kimmy_vector_graph_builds_pending` counts the builds queued or running,
+   one per collection, which includes what the first cannot see: a collection with no graph at all, answered by exact
+   scans until its build lands, and an adopted graph the budget evicted while its rebuild waited. After a roll both rise
+   with the collections searched and fall to 0 as the rebuilds land, and an operator rolls on when both read 0.
+   `kimmy_vector_graph_unreached_sample` is the highest sampled score (ADR-241 item 3) among the resident graphs this
+   process built. All three are bridged to OTLP (`kimmy.vector.graphs.stale`, `kimmy.vector.graph.builds_pending`,
+   `kimmy.vector.graph.unreached_sample`). A rebuilt graph that replaces one installed behind or unjudged is logged at
+   `INFO` (`a rebuilt HNSW graph replaced the one served meanwhile`), the swap an upgrade's rebuilds make; an ordinary
+   rebuild after a write is logged at `DEBUG`, as before.
+5. **Tests wait with `settle`**, which blocks until no build is queued or running. It is compiled only for
+   `kimmy-vector`'s tests and under its `test-hooks` feature, which only a dev-dependency turns on; a test reads the
+   source and every manifest to hold that true.
+
+**Measured** (macOS, a debug build of the API on a two-worker runtime): with 4 and with 8 collections of
+20,000 vectors rebuilding at once at a build concurrency of 4 and 8, with and without eight CPU-burning threads beside
+them, the p99 of `/readyz` stayed at or under 0.9 ms, of a find at or under 3.3 ms and of an insert at or under
+18.4 ms during the builds, against 0.6 to 0.9, 1.7 to 2.1 and 9.0 to 16.0 ms before them; no request failed. Each
+collection's first search was answered by its scan in 0.4 to 0.8 s, and the searches after it until its graph landed
+at a median of 0.21 to 0.25 s (p99 0.25 to 0.48 s); every graph was installed within 10 to 13 s. At the default
+concurrency of 1, 8 collections took 71 s to install, and 557 searches in that time were answered by scan, median
+206 ms, p99 224 ms. Those numbers were taken while a search waited for its turn on a blocked thread; the turn is
+awaited now, and a test holds that eight searches waiting for one on a two-worker runtime leave other requests
+answered at once.
+
+**Rollback.** A 0.51 member reads nothing new on disk. It refuses a configuration that names
+`vector.index_cache.build_concurrency`, so the key is removed before rolling back; `docs/operations.md` says so beside
+the key and in the 0.52.0 section.
+
+**Alternatives rejected.** Building in the request under the request's deadline: a build cannot be resumed, so a
+search that gives up wastes it and the next one starts again. A task on the async runtime: a build holds a core for
+minutes. Answering `503` while a graph is built: an exact scan answers correctly, within the deadline at every size
+measured. Unbounded concurrent scans: at 100,000 × 384 each is 1.4 s of a core, and a burst of searches would take
+the cores the build needs. A setting for the scan count: no measurement asks for another value.
+
+**Tests.** `kimmy-vector`: a build of one collection parked while a search of it and of another is answered at once, by
+scan; two searches of an unbuilt collection make one build; a search mid-rebuild is served the previous graph; a
+build that panics costs that build and not the builder; a stop during a save finds the store free, a build queued
+behind it holding none, and the save finishes whole; a stop during the bridge's pass ends the build at its next look,
+bridging nothing more, and one during a linking round ends it at its next look; a write between adopting a snapshot and
+judging it, and one before the first search after a restart, leave the graph behind and rebuilt; a drop while a build is
+queued, and a reconfiguration of another shape with nothing resident, fence it, and a re-delivered configuration of the
+shape in force keeps it; at most two scans of one collection at
+once, a third waiting only to its deadline and taking a turn given back; a scan holds its turn while it reads; an exact
+scan stops at a passed deadline, having read no more than the rows between two looks, and answers exactly without one;
+the stale gauge counts a snapshot adopted unjudged until a builder judges it, and the pending gauge counts the builds it
+cannot see; every cache test that expects a graph on a first access settles first. `kimmy-api`: the first search of a collection is answered by scan and the next by the
+graph built behind it; a search with no turn by its deadline answers `503` `timeout` at the deadline; searches waiting
+for a turn hold no thread; `settle` is in no build that ships; the walks a search makes while a graph is built run under
+`blocking`. `kimmyd`: the configuration key's default, its refusal of 0, and the cluster stop test polling the cache
+gauge until it holds a graph for three reads running. [Every mutation row with the test that kills
+it](adr-245-mutation-rows.md).
+
+---
+
+## ADR-246 — A rewind removes a document created after its target without a tombstone
+
+> **Amends [ADR-044](#adr-044--point-in-time-restore-rewinds-from-post-images-and-refuses-what-it-cannot-reconstruct)
+> and [ADR-243](#adr-243--a-rewind-lowers-each-vector-to-its-target-and-further-only-below-a-document-it-restores).**
+> Not a rollback boundary: no format, table, key or schema changes.
+
+> **Amended by [ADR-248](#adr-248--a-rewind-judges-a-collections-ended-lives-as-the-apply-path-does).** "No entry of the document
+> at or below the target" counts only entries of the collection's standing life: a document whose only versions there
+> are of a life a drop ended is removed when its earliest entry after the target is an insert, and refused otherwise.
+
+**The case.** C inserts `orders/1` at t150. B takes an insert of the same `_id` stamped t300 first, its own or A's,
+so C's insert loses last-writer-wins on B and is witnessed without an append (ADR-054). B is rewound to t200. B's
+oplog holds no entry of the document at or below the target and its earliest entry after it is an insert, so the
+rewind removes the document (ADR-044's table). It left a tombstone stamped at the rewind's clock, above every stamp B
+had seen, and that tombstone outranks C's t150 write, which is at or below the target and is to be kept:
+- B never took C's write again. A re-served entry, a page's row and a converge row all lose to the newer tombstone,
+  so the cluster stayed diverged, whether B alone was rewound or every member was (A and B remove the document, C
+  keeps its own). It did before ADR-243 as well.
+- Once the rewound member writes anything again, its servable vector covers the tombstone's stamp, and a page that
+  carries the tombstone is no longer refused by the coverage check (ADR-163). A converge page (ADR-237), a scoped page
+  or a whole-database page then deletes C's write on the member that takes it, which appends the delete and passes it
+  on by entries. In the convergence model every member ended without the document on the pages route.
+
+**Decision.** A document the rewind removes leaves no row: no tombstone takes its place. A document deleted at the
+target keeps its delete's own tombstone, at its own stamp, as before. And a removal bounds both vectors as a restored
+document does (ADR-243), with `F` at the oplog horizon:
+
+`after[X] = min(V[X], until)`, and also at most `max(F, kept[X], collected[X])` when the rewind restores or removes a
+document,
+
+where `F` is the lowest stamp among the entries the rewind restored, and no higher than the oplog horizon when it
+removes one.
+
+**Why no tombstone.** The member's oplog holds no entry of the document at or below the target. It has no evidence
+the document existed then, and none that it did not: a write of it at or below the target that it judged against
+the discarded insert, or that a whole-database grant covered, is held elsewhere. No row loses to every write, so the
+rewound members' states merge to the newest write at or below the target that any member keeps, which is ADR-044's
+"it did not exist yet — remove it" taken literally. A tombstone needs a stamp, and none serves:
+- one above the target outranks the kept write;
+- one at or below it outranks every kept write below it, and a stamp of the past under a real origin can be another
+  write's own stamp, whose entry a receiver that still holds it would have overwritten (an oplog entry's key is its
+  stamp);
+- one below every write outranks nothing, travels to every member as a bare tombstone (ADR-228) and is collected at
+  the next pass.
+
+**Why the floor, and why at the horizon.** A removed document holds nothing, so a write of it at or below the target
+that the member judged can be of any origin. Bounded at the horizon, the member asks again by entries for every write
+of every origin above the horizon and above what it keeps, and takes the judged write onto the row it no longer holds.
+No lower: below the horizon the member's retention may have collected a delete and its tombstone, while a peer whose
+own pass has not run still serves the insert before it, which the member would take onto the empty row and the count
+repair would then spread to every member
+(`a_removal_does_not_ask_below_the_horizon_for_an_insert_whose_delete_was_collected`). At the horizon it is ADR-243's
+bound, so invariant I, witnessed at least servable, ADR-160, the coverage of what retention collected, and ADR-243's
+argument that a re-fetch brings back no insert whose delete this member collected, all hold as given there
+(`row_a_rewind_that_removes_a_document_brings_back_no_deleted_one`). Beside a restored entry below the horizon, a late
+arrival, the floor is that entry, as for a restore alone: a write judged above it is asked for again
+(`row_a_removal_beside_a_restored_entry_below_the_horizon_floors_at_that_entry`), and there the bound's `collected`
+term is what keeps the member's collected entries covered
+(`row_a_removal_beside_a_late_restored_entry_keeps_the_members_collected_drop`). The clock is unchanged: no tombstone
+is minted, the record names what the rewind discarded, and a start resumes past it (ADR-243).
+
+**Residuals, accepted.**
+- **A judged write below a kept entry of its origin, or at or below the horizon.** Invariant I keeps the member's
+  coverage of that origin at the kept entry, and the floor at the horizon, above the judged write. One at or below the
+  horizon arrived late (ADR-243's late arrival), or arrived on time and lost before the retention pass that collected
+  past it, which takes a target within the reordering delay of the horizon
+  (`a_removal_leaves_an_on_time_judged_write_at_or_below_the_horizon_to_the_repair`). No pull sends it again. The
+  divergence check repairs it: the count half
+  replays the collection onto the row the member no longer holds, and a young converge row (ADR-237) or a page does the
+  same. The convergence model's `row_a_rewind_that_removes_a_document_below_a_kept_entry_of_the_judged_origin`
+  converges on the repaired and pages routes, and the cluster harness's
+  `a_rewound_cluster_keeps_a_write_judged_against_an_insert_the_rewind_removes` is the case on real processes, every
+  member rewound to one target and healed by the check's repair.
+- **A delete only the rewound members applied, each replacing its tombstone by a write after the target, is
+  forgotten,** and a member that missed it writes back the document it holds from before the delete; that member missed
+  the delete for longer than the oplog window, which with `tombstone_retention_secs` equal to `oplog_retention_secs`
+  (the default) is past the tombstone window the operations guide bounds a partition by, ADR-085's stale rejoiner.
+  With `tombstone_retention_secs` above `oplog_retention_secs`, a member that lagged between the two windows is
+  within the tolerated partition, so the operations guide has the operator reset (wipe and resync) a member that was
+  out of touch with a rewound member for longer than the oplog window: ADR-085's remedy for a stale member, applied
+  at the oplog window. Pinned by `residual_a_rewind_forgets_a_delete_only_the_rewound_member_applied`.
+
+**A token naming a discarded entry stays `410`.** ADR-173 refused a token whose entry a rewind discarded while the
+member did not hold the entry, and a peer sending it back did not change that because the rewind's tombstone
+outranked it. With no tombstone the entry is held again, at a new place in the arrival order, after entries the
+client was never sent, so a stream resumed from it would skip them. The token check now refuses such a token
+whether or not the member holds the entry again. That is also what the change-stream guide already says (a token
+naming an entry a rewind discarded is `410`), and it covers an entry of a document the rewind put back to an earlier
+value, which a peer could already send back.
+
+**Rollback.** No format change. A 0.51 binary opens a store this build rewound: the removed documents are absent, the
+vectors keep every invariant 0.51 relies on, and the rewind's record keeps its layout. **A store rewound by 0.51 or
+earlier keeps the tombstones that rewind minted**, under the member's own node id and stamped after the rewind's
+target, at about the time it ran. Nothing tells them from a delete's, so nothing removes them at open. Once that
+member has written again, a page from it carries them to its peers, and a peer that takes one deletes the kept write
+there and passes the delete on as an entry under the member's id. Restoring the member again from the same backup
+with this release removes the tombstones only while no peer holds such a delete. Once one does, the restored member
+takes the delete back by entries, and the write stays deleted on every member that took it. Each document is then to
+be inserted again, through any member, with its value taken from a member that was not rewound, as it stood before
+the delete reached that member (a backup of it from before then, or its live store while it has not taken the
+delete); never from the
+rewound member's own backup from before the rewind, which holds the write the rewind undid. With no such copy, the
+value cannot be recovered from the cluster (the operations guide).
+
+**Tests.** `rewind.rs`: `a_document_created_after_the_target_is_removed` (no record, the count, the index),
+`a_rewind_that_removes_a_document_asks_again_for_a_write_it_judged`,
+`a_rewind_that_removes_a_document_after_retention_keeps_the_coverage_of_what_retention_collected` and
+`a_rewind_that_restores_one_document_and_removes_another_is_bounded_by_the_removal`; ADR-243's
+`a_rewind_lowers_every_origin_it_discarded_to_the_target_and_no_lower` now discards by restoring, and
+`a_start_after_a_rewind_resumes_the_clock_past_what_it_discarded` checks that the removed documents leave no record.
+The convergence model, on every route and by pure entries too: a removal and a judged write (B alone rewound, every
+member, and every member with C's write lost on C too), the same followed by a write of a rewound member, a removal
+over a deleted document, a document deleted at the target, a removed row that was itself a tombstone, a judged write
+above a non-zero horizon, and a removal beside a restored entry below the horizon. On the repaired and pages routes,
+which the divergence check's repairs close: a removal after a retention pass (pure entries do not close that case
+without a rewind either), the same beside a late restored entry, and a judged write below a kept entry (the first
+residual); a judged write at or below the horizon, which pure entries leave to the repair, is pinned so.
+`a_removal_does_not_ask_below_the_horizon_for_an_insert_whose_delete_was_collected` runs one member's retention pass
+ahead of the others'. The residual of a forgotten delete is pinned by its exact shape. The cluster harness as above.
+Mutation rows, in bash, each failing a test with only its own change: the removal leaving a tombstone at the rewind's
+clock; leaving one at the target; no bound when the rewind only removes; the bound under a removal taken from a
+restored entry when there is one; the removed row deleted without its count; the removed row left in its index; the
+bound only on origins whose coverage passes the target; the bound applied when the rewind neither restores nor
+removes; a discarded entry's token refused only while the member does not hold the entry again
+(`a_rewound_entry_a_peer_sends_back_stays_refused`); the removal's floor at zero, below the horizon; the row of a
+document deleted at the target removed; only a removed live row bounding the vectors; the removal's floor at the
+horizon even beside a lower restored entry; and the bound without what retention collected, killed beside a late
+restored entry, with a removal or without (for a removal alone it changes nothing: the floor at the horizon is at or
+above every collected stamp).
+
+---
+
+## ADR-247 — A member that sees a peer come up or renamed exchanges facts blocks with it at once
+
+> **Amends [ADR-201](#adr-201--what-a-member-says-about-itself-on-the-sync-contact-decides-who-may-own-expiry-webhooks-and-embeddings)**,
+> whose blocks cross only on a sync contact, and
+> **[ADR-242](#adr-242--a-members-swim-incarnation-outlives-its-process-and-each-start-takes-one-above-the-last)**,
+> whose rename closes a peer's gates until the new process's first block. No frame, table, `kimmy.format` schema,
+> backup tag or configuration key changes.
+
+**The case.** A member's facts block crosses on a sync contact's opening frames: `AskVersions` carries the
+requester's, which the server records before it answers, and `Vectors` the server's (ADR-201, ordered by when each
+frame decoded, ADR-213). Each restart is renamed on every peer exactly once (ADR-242), and the rename drops the block
+the peer held from the old process, so the peer holds the member live with no block, and everything that waits for
+every live peer's block stays closed (the `Decimal128` net of ADR-238; ownership counts the member as no candidate,
+ADR-213), until the next contact between the two. That was up to a sync interval later: measured on three
+release-build members at the default 5 s interval, 20 restarts per shape (SIGTERM and SIGKILL, idle and under write
+load, 0 and 10 s down), with `kimmy_ownership_peers{state="unknown"}` sampled every 10 ms, a peer's window had a median
+of 3.3–4.8 s when idle and 0.1–1.1 s under write load (whose rounds come more often), and a maximum of 5.3 s; at a 1 s
+interval, medians of 0.1–0.7 s. The restarted member's own window had a 3.7 s tail under load after 10 s down: its
+first tick drained one peer for its whole budget while the other waited for the next. With the exchange, on the same
+shapes, a peer's window was at most 0.04–0.13 s and the restarted member's 0.
+
+**Decision.**
+
+1. **What asks.** In the handling of a SWIM notification, after the change it makes: `MemberUp(m)` after `m` is
+   inserted; `Rename(old, new)` after both drops and the insert; this member's own `Rejoin` after it has cleared every
+   peer block (ADR-213), once for each peer it holds live.
+2. **At most one per member per sync interval**, counted from the last ask for that member whatever became of it. A
+   restart after the peer declared the member down is a `Rename` and a `MemberUp` in one input, and asks once; a member
+   that flaps, or does not answer, costs one exchange an interval. **An ask the interval holds is not lost when it is
+   owed**: if the member's block, or every block, was dropped since the last ask (a rename, a down, this member's own
+   rejoin), it schedules one trailing ask for the end of the interval, at most one pending per member, which the driver
+   starts then if the member is still live, at the address it is live at; it counts as an ask at that instant, and one
+   that starts nothing (the member is down) keeps the drop it owed, so the member's next `Up` within the interval owes
+   another. An ask with no drop since the last one (the `MemberUp` beside a `Rename`) owes none.
+3. **The exchange** is the opening frame pair of a sync round and nothing after it: dial (TLS and the shared-secret
+   handshake, with the test refusals), `AskVersions { witnessed: true }` with this member's block, its generation and
+   its echo of the peer's block as held now, then the peer's `Vectors`, whose block is recorded ordered by its decode
+   sequence and whose echo is noted, then close. The peer handles it as any contact: it records the request's block and
+   echo before answering. Nothing else of a round happens: no pull, no divergence check, no replay served (one the peer
+   asks for on its `Vectors` stays owed to its next round), no `PeerHealth` change, no catching-up judgement, no lag
+   vector. Bounded by the dial's timeouts and 10 s more for the frame pair.
+4. **Where it runs.** A driver task the replication loop spawns beside itself, and aborts when it ends; each exchange
+   is a task of its own whose panic the driver logs. The driver's timer starts each trailing ask when it is due. The
+   ask queue exists from the member set's creation, so an `Up` the membership task sees before the loop starts (the
+   daemon starts membership first) is queued. The driver reads
+   this member's block at each ask, so an exchange takes no storage step and an abort can end it anywhere.
+5. **A failed exchange** is one `DEBUG` line and still counts as the member's last ask; the next sync contact carries
+   the blocks.
+
+**Why after the change.** The drop a rename makes records the decode sequence it happened at, and a block decoded
+before it is refused (ADR-213). An exchange asked after the drop reads its answer after it and keeps it. Asked before,
+an answer that came first would be dropped by the rename it was meant to follow, and the window would stay open until
+the next contact. The same holds for a rejoin's clear.
+
+**Why the opening frames, beside the loop, and not a round in it.** A tick is one arm of the loop's `select!`, and a
+tick that drains runs for up to an interval with nothing else polled: an ask that arrived during it would wait for it,
+which is the 3.7 s tail. A round needs the loop's `PeerStalls` (snapshot resume, the set-aside, the repair ledger), so it
+cannot run beside it, and a failed round goes through the back-off, which would lengthen the window it is for. The two
+frames carry both blocks and both echoes, which is all the window waits for.
+
+**Why the rejoining member asks too.** Its rejoin cleared every block it held. Its peers' renames of it ask exchanges
+that carry their blocks to it as well, but only once each has learned the new identity by gossip, and an older peer
+during a roll never asks. Its own asks close its own window at once. In a renewal walk (ADR-242), where each step is a
+rejoin, the seed's `Up` asks first and a later step's clear can drop what that exchange brought; that step's ask is
+held by the interval and owed, so it starts at the interval's end (item 2), about when the next sync contact would
+have come. A peer it still holds live that has gone costs one failed dial in a task of its own.
+
+**Invariant.** Every `Up` or `Rename` of a member that a member sees, and every live peer at its own `Rejoin`, starts an
+exchange with that member at once unless one was started with it within the last sync interval, and then, if the
+member's block was dropped since that one, at the interval's end; at most one is started per member per interval; and
+an exchange that is answered leaves its starter holding the answer's block, unless a later change of the same input
+dropped it. Model rows: the deterministic SWIM simulation (`membership::rejoin_tests`), whose member sets take every
+notification through the production handling, run each exchange inside the ask (or, for a member set so, at the end of
+the input that asked it, as the daemon's queued ones are answered) and start each trailing ask when it is due: after
+every input, each exchange it started that was answered left the starter holding the block it brought. Restarts dead
+for 0, 1.5, 3 and 10 s, ten each: each peer starts exactly one exchange with the member and the member one with each
+peer, all answered, and every member holds every other's current block with no tick run; a second rename within the
+interval starts none at once and one at the interval's end, and a rename after that one's interval starts one at once;
+a rejoin starts one with every live peer, in the input that rejoined; renewal walks of one to four steps, against peers
+that ask none and against peers on this build, with exchanges answered inside the ask and at the end of the input, end
+with every block held.
+
+**Interactions.** The catching-up marker is judged on full rounds only, so an exchange reaches no member for it; a
+marked member's block (`catching_up`) simply arrives sooner. An exchange's echo confirms a yield exactly as a round's
+does (ADR-213), and a yield still waits for the live set to hold still for a lease. An exchange and a tick's round to
+the same peer are two connections, as serving and dialling already were, and their blocks are ordered by decode
+sequence.
+
+**Cost.** One dial and one frame pair per member per `Up`, `Rename` or rejoin, at most one per member per interval: a
+restart costs each peer one exchange and the restarted member one per peer, and a second restart within the interval
+one more each, at its end.
+
+**Rollback.** Nothing is stored and no frame is new. An older build asks no exchanges: its own window after a start is
+up to a sync interval, as before, and a peer on this build still exchanges with it at once on seeing it renamed or up.
+
+**Alternatives.** *Wake the tick for the member* (a reset tick restricted to it): it waits behind a draining tick, a
+failure backs the member off, and the extra tick moves the divergence rotation and the repair clocks. *A whole round
+beside the loop*: needs the loop's `PeerStalls`. *Carry the block over SWIM*: a field in `Member` changes the wire
+(postcard is not self-describing, ADR-242's alternatives), and a block can outgrow a datagram. *No debounce*: a flapping
+member would cost a contact per flap, and a restart after a down declaration two.
+
+**Tests.** `membership::tests`: one ask per member per interval, each member on its own, from its own last ask; an ask
+the interval holds owes one trailing ask only after a drop, one pending, started at the address the member is live at
+then and not at all if it is not live; one due while the member is down keeps the drop it owed. `exchange::tests`: an
+exchange leaves each side holding the other's block and the asker the answerer's echo of its own; one with a member not
+serving fails at the dial and records nothing; one with a member that completes the handshake and never answers ends at
+its bound; the driver runs what is asked, runs an ask made before it started, carries the block as it is at each ask,
+holds the next ask for the interval after a failed exchange, starts a trailing ask when it is due, and ends when its
+guard is dropped. The simulation rows above. `kimmyd/tests/cluster.rs` (`--ignored`): three real members at a 5 s sync
+interval, one restarted three times with SIGTERM; every member's `kimmy_ownership_peers{state="unknown"}` is sampled
+every 10 ms and no run above 0 lasts a second. Mutation rows in bash, each failing a test with only that change: no ask
+on `Up`; none on `Rename`; no exchange at all (the simulation and the real-process test); the ask before the rename's
+drop; no debounce; the debounce keyed for every member at once; no ask at the own rejoin; the rejoin's asks before its
+clear; the interval inclusive; the driver not started; the answer's block not recorded; the request without a block; the
+answer's echo not noted; `AskVersions` without the witnessed flag; the driver dropping its asks; no trailing ask; a
+trailing ask owed with no drop; more than one pending; one due at once; a drop, or a clear, not marked; one started for
+a member not live; the driver's timer never starting one; the driver not aborted with its guard; a failed exchange
+clearing the member's last ask; the block read once for every ask; no bound on the frame pair; asks made before the
+driver starts dropped; a trailing ask that starts nothing clearing the drop it owed. One more is argued unobservable
+(not equivalent) rather than run: recording the answer at a sequence taken when it is recorded instead of when it
+decoded. The two are taken in one poll with no await between them, so they can differ only by a decode or a drop another
+thread makes in the same synchronous stretch, which no test can place there; in that stretch the mutant would keep a
+block decoded before a drop, which the floor exists to refuse. The simulation pins the ask after the drop, not this
+choice.
+
+---
+
+## ADR-248 — A rewind judges a collection's ended lives as the apply path does
+
+> **Amends [ADR-044](#adr-044--point-in-time-restore-rewinds-from-post-images-and-refuses-what-it-cannot-reconstruct)
+> and [ADR-246](#adr-246--a-rewind-removes-a-document-created-after-its-target-without-a-tombstone).**
+> Not a rollback boundary: no format, table, key, wire or schema change, and `I_EPOCH` is unchanged.
+
+**The case.** B writes `items/100` at t120 and drops `items` at t260. C takes both and creates `items` again at
+t330. A, which never heard of the drop, writes `items/100` at t386, and C takes it into the life standing there. A is
+rewound to t352 (`kimmyd restore --until`); C holds A's discarded write, so every member is rewound to t352, as the
+operations guide says. C put the document back to B's t120 version, the post-image of its latest entry at or below the
+target, while A and B removed it. The cluster stayed diverged on every route: no entry ever arrives that is newer
+than C's row, and the divergence check's replays and converge pages write over rows held and never remove one.
+Present on 0.51.0 and every build since the rewind existed.
+
+**Why.** A collection's id is derived from its name (`CollectionId::derive`), so a drop and a re-creation leave one
+id. The purge removes the dropped life's documents and index entries but not its oplog entries, which stay until
+retention collects them. The rewind collected each document's history by collection id and document key and took any
+write entry at or below the target as its value there. The apply path turns those same entries away
+(`Engine::is_history`: at or below the collection's tombstone, or at or below its standing life's incarnation floor,
+by `Hlc`, a tie being the drop's, ADR-236); the rewind never asked it.
+
+A second door into the same state: ADR-044 refuses a schema change after the target, and the rewind found one only as
+an entry in its oplog. A drop that reached the member by a snapshot page leaves its tombstone (and, on a life created
+after it, a floor) and no entry, so a rewind past it went ahead. It put a document of the dropped collection back as a
+row under the id of a collection that no longer exists, and a creation of the name was then refused with
+`CollectionPurging` until the purger removed the row.
+
+**Decision.**
+
+1. **The rewind's history of a document is its entries that are not history** by `Engine::is_history`, on both sides
+   of the target. ADR-044's table then applies to them: the latest at or below the target is put back (its post-image,
+   or its delete's tombstone); with none, the document is removed with no tombstone (ADR-246) when its earliest entry
+   after the target is an insert, and refused otherwise. In the case above, C removes the document.
+2. **A replacement with nothing of the standing life at or below the target is refused**, as a document whose value
+   at the target the member does not hold. A held the document in the life the drop ended, so its t386 write is a
+   `Replace`, and C holds no entry of the document in the standing life at or below the target. Removing it would
+   guess "absent": a snapshot page's row is also a `Replace` with no history behind it, and on a member that took the
+   standing life by a page the document can have existed at the target with a value the member never held, which is
+   the guess ADR-044 refuses. The refusal now says why the member may not hold that value: retention collected it,
+   the member holds the document only as a page's state, or its entries at or below the target are of a life a drop
+   ended. In that schedule C refuses, and A's t386 write, which C keeps, comes back to every member.
+3. **A drop after the target is refused however it arrived**: an entry, a tombstone (`COLLECTIONS_DROPPED`, a
+   database's drop included) or a standing collection's incarnation floor stamped after the target is a schema change
+   after it, named `DropCollection` in the refusal. Strictly after: a drop at the target is part of the state there.
+   `operations.md`'s refusal table already listed a schema change after the target; this makes the code keep it on
+   every route.
+4. **Not covered: a first life created after the target that arrived by a page.** Only its `created` would show it,
+   and a store written before `created` was the origin's stamp does not hold that reliably. No row is written wrongly:
+   its documents, all written after the target, are removed (inserts) or refused (a page's rows), and the empty
+   collection stays.
+
+**The invariant.** For each document changed after the target, the rewound state is what this member's own apply
+rule accepts from its retained entries at or below the target: the latest of them that is not history, or, with none,
+absent when its first non-history entry after the target is an insert; otherwise the rewind refuses. A rewind never
+puts back a version of a life a drop ended, and never rewinds past a drop the member knows of.
+
+**Which life stands at the target.** At or after the standing life began (every drop the member knows of is at or
+before the target), it is the standing life, and a document's history is its entries above the life's floor. A write
+made after the drop by a member that had not heard of it, before the re-creation, belongs to the standing life (ADR-236
+keeps it), so the judgement uses the floor and the tombstone and never `created`. Before a drop, the life standing at
+the target has since been ended by a drop the rewind cannot undo, and the rewind is refused. Between a drop and a
+re-creation, the re-creation is after the target and is refused by its entry; one carried by a page is item 4.
+ADR-173's token check is unchanged: the rewind discards the same entries, every one stamped after the target.
+
+**With ADR-243 and ADR-246.** A document whose only version at or below the target is of an ended life is now a
+removal, not a restore, so it no longer sets `F`: the floor is the lowest restored entry, and no higher than the
+horizon (ADR-246). In the case above C's coverage of A comes down to the entry of A it keeps instead of to B's t120,
+so it asks again for more and never for less than it keeps or collected. The ended life's entries it is sent again are
+history to the apply path by the same predicate, so none comes back; a write of the standing life at or below the
+target that C judged against the discarded write is taken again
+(`row_a_rewind_that_removes_an_ended_lifes_version_asks_again_for_a_judged_write`). The ended life's entries stay in the
+oplog and count in `kept[X]` as before, so invariant I is unchanged. The outcome counts such a document as removed.
+
+**The other choices a rewind makes.** Index entries and the multikey flag follow the planned document
+(`index::maintain`); the live counts and digests move with the rows through `put_record` and `remove_record` in the
+rewind's transaction; a vector shadow collection is a collection with its own id, tombstone and floor, and its chunks
+are ordinary entries, so the same rule judges them; a unique violation's row goes with its entry above the target. None
+picks a version on its own.
+
+**Rollback.** No format change. A 0.51 binary opens a store this build rewound. A store rewound across a drop and a
+re-creation by 0.51 or earlier can hold an ended life's version as a live row of the standing life; nothing at open
+removes it, and the divergence check's repairs do not. Restore that member again from the same backup with this
+release, or wipe it and let it resync (the operations guide). A member that took a drop by a page now refuses a rewind
+past it, where 0.51 went ahead.
+
+**Tests.** `rewind.rs`: `a_rewind_does_not_put_back_a_version_of_a_life_a_drop_ended` (the case on one engine: no
+record, the counts exact), `a_rewind_does_not_put_back_the_delete_of_a_life_a_drop_ended`,
+`a_rewind_puts_back_the_standing_lifes_version_over_an_ended_lifes`,
+`an_entry_in_the_drops_own_millisecond_is_of_the_life_it_ended`,
+`a_write_after_a_drop_and_before_the_re_creation_is_of_the_standing_life`,
+`a_rewind_past_a_drop_a_snapshot_page_carried_is_refused_without_writing`, `a_rewind_to_the_drop_itself_is_not_refused`
+and `a_rewind_past_a_drop_named_only_by_a_floor_is_refused` (and not at the floor). The convergence model, every member
+rewound: the case with the drop by entries, by a whole-database page and as the database's drop; a replacement whose
+only earlier version is of the ended life, refused by C with every member ending at t386 (C held the document in the
+ended life, never held it, and a write in the drop's millisecond); a tie with the drop; the standing life's version put
+back; a write between the drop and the re-creation put back; and a judged write of the standing life taken again. By
+pure entries too, except the write between the drop and the re-creation, which pure entries do not bring to the member
+that dropped the collection with no rewind either, and the repair loop and pages do.
+
+Mutation rows, in bash, each failing a test with only its own change: the skip removed; the skip only after the target;
+the skip only for live entries; the skip judged by `created`; the skip strict at a tie; the tombstone refusal removed;
+it at the target; the floor refusal removed; and it at the target. Argued equivalent:
+- **The skip without the floor (the tombstone alone).** Every life standing here was created or re-dated after the
+  drop its floor names, and the member records that drop's tombstone with it. A tombstone goes only by tombstone
+  retention, which under the operator rule (`tombstone_retention_secs >= oplog_retention_secs`) collects it only past
+  the oplog window, where the ended life's entries are collected too; one arriving later is history on arrival and is
+  not appended.
+- **The skip without the tombstone (the floor alone).** For a standing life the tombstone is above its floor only while
+  the sweep of an ignored drop of an older life runs, which takes the floor in its last chunk. A store stopped in the
+  middle of one owes the sweep, and a start finishes it before it serves (`reconcile_late_drops`), removing any record
+  the rewind put back at or below that drop. For an absent collection, item 3 refuses a
+  tombstone after the target, and no entry above a tombstone is appended while the collection is absent: the entries
+  path stops at it and asks for a page, which installs the life with its floor.
+- **The skip only before the target.** An entry of an ended life after the target is above the target and at or below
+  a tombstone or a floor, which item 3 refuses.

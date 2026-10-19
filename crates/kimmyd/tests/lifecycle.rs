@@ -1142,7 +1142,7 @@ async fn a_write_whose_own_fsync_fails_is_not_answered_as_failed_and_is_there_af
     assert!(after.wait_exit().success());
 }
 
-/// The keyed counterpart (B5): a keyed insert without `_id` whose own fsync
+/// The keyed counterpart (ADR-240): a keyed insert without `_id` whose own fsync
 /// fails is answered by nothing, the node stops, and after the restart the same
 /// request with the same key is answered `200`, marked `Idempotency-Replayed:
 /// ?1`, with the `insertedId` the first attempt stored: the key's derived one.

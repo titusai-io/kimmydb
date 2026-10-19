@@ -87,7 +87,7 @@ struct ExpiredTombstone {
 pub struct GcOutcome {
     pub oplog_removed: usize,
     pub tombstones_removed: usize,
-    /// Idempotency records past their window (B5).
+    /// Idempotency records past their window (ADR-240).
     pub records_removed: usize,
 }
 
@@ -123,14 +123,14 @@ impl Engine {
         if oplog_removed > 0 {
             self.trim_violation_rows()?;
         }
-        // The idempotency records (B5), after the oplog step and at its cutoff,
+        // The idempotency records (ADR-240), after the oplog step and at its cutoff,
         // so a record and the entries it describes age out under one clock.
         // Whatever the oplog step found, nothing included: it has its own early
         // ends (an empty oplog, nothing expired), and the records step is not
         // one of them. Only a stop ends the pass before it, as it ends every
         // step.
         let records_removed = self.collect_idempotency_records(oplog_cutoff)?;
-        // And the change log the snapshot pages' records deltas read (B5), on the
+        // And the change log the snapshot pages' records deltas read (ADR-240), on the
         // same window: a change older than it names a record past it, or one
         // changed again since and logged again.
         self.trim_idempotency_changes(oplog_cutoff)?;
@@ -589,7 +589,7 @@ impl Engine {
 /// collect the entire database.
 ///
 /// The idempotency records' window reads it too, so a record is absent on
-/// lookup exactly when the records step would collect it (B5).
+/// lookup exactly when the records step would collect it (ADR-240).
 pub(crate) fn cutoff(now_ms: u64, retention_secs: u64) -> Hlc {
     let age_ms = retention_secs.saturating_mul(1000);
     Hlc::new(now_ms.saturating_sub(age_ms), 0)

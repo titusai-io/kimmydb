@@ -1,12 +1,12 @@
 # ADR-240: the mutation rows, and the test that kills each
 
-This is the table [ADR-240](decisions.md#adr-240--idempotency-keys-the-record-is-written-with-the-write-and-travels-with-it-and-a-member-takes-keys-only-while-every-member-carries-records) refers to: every mutation row of the eight pieces of B5, run again together on the merged head. Each row is a change to the source that must make a test fail. Each piece ran its own harness against its own tree as it was built; here every row was run on one tree, a `git archive 9922b699` export, the integration of storage (S), the front (F), the executor (E), replication (R), the HTTP cluster tests (C), coverage with L1 and the G8 lookahead (G), the page records delta (P), the model (M) and the docs.
+This is the table [ADR-240](decisions.md#adr-240--idempotency-keys-the-record-is-written-with-the-write-and-travels-with-it-and-a-member-takes-keys-only-while-every-member-carries-records) refers to: every mutation row of the eight pieces of the idempotency-keys work, run again together on the merged head. Each row is a change to the source that must make a test fail. Each piece ran its own harness against its own tree as it was built; here every row was run on one tree, a `git archive 9922b699` export, the integration of storage (S), the front (F), the executor (E), replication (R), the HTTP cluster tests (C), coverage with L1 and the G8 lookahead (G), the page records delta (P), the model (M) and the docs.
 
 **How a row was run.** A row is one or more exact replacements of the post-format source, applied in order, each of which must occur exactly once at its turn, or the row is not run. It was applied to the export, never to a worktree; its piece's own suites ran under a timeout that kills the suite's whole process group (a hang is a kill: an engine write inside `write_batch` can deadlock), stopping at the first suite that failed; and the files it touched were copied back from a second, pristine export and compared with it. Every suite passed on the unmutated export first, each having run at least one test, and each export was whole and equal to its pristine copy at the end. Two exports ran side by side, each with its own target directory, at `nice -n 10`. A merge mutant that failed a proptest left its seed in the export's `proptest-regressions`, so later rows of that export ran it as one more case, which the unmutated tree passes. *Killed by* names the tests that failed, by function name.
 
-**Rows that had moved.** 35 of the 265 rows no longer applied to the merged text. 32 are re-pointed at it with the same meaning, and the Notes say what moved; three are superseded, their target removed or replaced, and say by what. G's eight re-runs of C's rows are the same edit and the same test as C's, and ran once, as C's. One test R's cluster suite named was renamed since, and the filter follows it.
+**Rows that had moved.** 35 of the 265 rows no longer applied to the merged text. 32 are re-pointed at it with the same meaning, and the Notes say what moved; three are superseded, their target removed or replaced, and say by what. The coverage piece's eight re-runs of C's rows are the same edit and the same test as C's, and ran once, as C's. One test R's cluster suite named was renamed since, and the filter follows it.
 
-**Survivors.** A row its piece's suites did not kill was run again against the head's idempotency suites across the crates, the wider suites: kimmy-storage's `idempotency`, `page_delta`, `modify::`, `gc::`, `rewind` and `backup` tests, kimmy-cluster's `--test idempotency` and its `idempotency`, `replay_tests` and `transport::tests` lib tests (less `a_replay_of_many_pages_is_reported_once_not_once_per_page`, whose scoped log subscriber missed a line in three of five shared-process runs of the unmutated tree), kimmy-api's lib tests, `--test idempotency` and `--test api`, and kimmy-mcp's `--test mcp`. The model's delta rows, which run the model alone by design, were run again with P's suite for the same patch. A row still standing after that is killed by a test added on `idempotency-h`, run on a `git archive 595ee612` export with that test's own filter (*killed (test added)*), or is recorded as equivalent, with the argument. No production code changed: no survivor showed a fault in the code, and each one killed was a test missing.
+**Survivors.** A row its piece's suites did not kill was run again against the head's idempotency suites across the crates, the wider suites: kimmy-storage's `idempotency`, `page_delta`, `modify::`, `gc::`, `rewind` and `backup` tests, kimmy-cluster's `--test idempotency` and its `idempotency`, `replay_tests` and `transport::tests` lib tests (less `a_replay_of_many_pages_is_reported_once_not_once_per_page`, whose scoped log subscriber missed a line in three of five shared-process runs of the unmutated tree), kimmy-api's lib tests, `--test idempotency` and `--test api`, and kimmy-mcp's `--test mcp`. The model's delta rows, which run the model alone by design, were run again with P's suite for the same patch. A row still standing after that is killed by a test added with this combined run, run on a `git archive 595ee612` export with that test's own filter (*killed (test added)*), or is recorded as equivalent, with the argument. No production code changed: no survivor showed a fault in the code, and each one killed was a test missing.
 
 ## Storage (S)
 
@@ -77,7 +77,7 @@ This is the table [ADR-240](decisions.md#adr-240--idempotency-keys-the-record-is
 
 ## The front (F)
 
-49 rows: the operator switch, the live-peer net and the facts field; the header's syntax and the MCP argument's; the route table and its guard; the fingerprint; the outcome bodies; the error codes; the version's window; the metrics and the resume's log line. Each row runs the kimmy-cluster, kimmy-api, kimmy-mcp or kimmyd tests F named for it, 1200 s. Since F ran, phase E replaced the API's key parser with kimmy-core's, moved the gate after authentication into the keyed extractors and `tool_key`, and moved the resume's log line into the engine: those rows are re-pointed at the new sites, with F's suites.
+49 rows: the operator switch, the live-peer net and the facts field; the header's syntax and the MCP argument's; the route table and its guard; the fingerprint; the outcome bodies; the error codes; the version's window; the metrics and the resume's log line. Each row runs the kimmy-cluster, kimmy-api, kimmy-mcp or kimmyd tests F named for it, 1200 s. Since F ran, the executor piece (E) replaced the API's key parser with kimmy-core's, moved the gate after authentication into the keyed extractors and `tool_key`, and moved the resume's log line into the engine: those rows are re-pointed at the new sites, with F's suites.
 
 | Row | What it plants | Result | Killed by | Notes |
 |---|---|---|---|---|
@@ -87,14 +87,14 @@ This is the table [ADR-240](decisions.md#adr-240--idempotency-keys-the-record-is
 | G4 | membership off passes | killed | `without_a_membership_view_the_net_fails_closed` |  |
 | G5 | facts field not advertised | killed | `the_block_says_this_build_carries_idempotency_records` |  |
 | G6 | facts field not lenient | killed | `this_build_reads_idempotency_records_leniently_and_an_older_block_as_not_carrying` |  |
-| G7 | guard does not ask the gate | killed | `an_older_or_unheard_live_peer_refuses_naming_it_until_it_carries_records`, `with_the_switch_off_a_key_is_refused_naming_the_switch` | re-pointed: the gate moved from the route guard into the keyed extractor, after authentication (phase E); the same text as E:A4, run with F's wider suite. The gate split replaced the first test with `an_older_live_peer_refuses_400_naming_it_whoever_else_is_unheard` and `a_live_peer_not_heard_from_is_answered_503_and_the_same_key_is_then_taken` |
+| G7 | guard does not ask the gate | killed | `an_older_or_unheard_live_peer_refuses_naming_it_until_it_carries_records`, `with_the_switch_off_a_key_is_refused_naming_the_switch` | re-pointed: the gate moved from the route guard into the keyed extractor, after authentication (the executor piece, E); the same text as E:A4, run with F's wider suite. The gate split replaced the first test with `an_older_live_peer_refuses_400_naming_it_whoever_else_is_unheard` and `a_live_peer_not_heard_from_is_answered_503_and_the_same_key_is_then_taken` |
 | G8 | MCP argument not gated | killed | `the_argument_is_gated_as_the_header_is` | re-pointed: `tool_key` asks the gate through `refuse_unless_open` |
 | G9 | capability ignores the gate | killed | `idempotency_keys_is_listed_only_while_the_gate_is_open` |  |
 | G10 | clustered default is true | killed | `check_config_prints_the_idempotency_keys_in_effect`, `idempotency_keys_defaults_by_clustering_and_parses` |  |
 | G11 | check-config does not settle the switch | killed | `check_config_prints_the_idempotency_keys_in_effect` |  |
 | G12 | node does not install the gate | killed | `the_idempotency_gate_is_installed_from_the_switch_before_anything_serves` |  |
 | G13 | node does not hand the gate its members | killed | `the_idempotency_gate_is_installed_from_the_switch_before_anything_serves` |  |
-| H1 | length counted on the escaped value | killed | `the_length_is_the_unescaped_values_and_its_bounds_are_16_and_255`, `the_mcp_argument_is_the_same_rule_without_quotes` | re-pointed: the API's parser was replaced by kimmy-core's `IdempotencyKey::parse_header_value` (phase E); the escape kept in the value |
+| H1 | length counted on the escaped value | killed | `the_length_is_the_unescaped_values_and_its_bounds_are_16_and_255`, `the_mcp_argument_is_the_same_rule_without_quotes` | re-pointed: the API's parser was replaced by kimmy-core's `IdempotencyKey::parse_header_value` (the executor piece, E); the escape kept in the value |
 | H2 | minimum 15 | killed | `the_header_is_read_from_one_field_line_and_refused_by_name`, `the_length_is_the_unescaped_values_and_its_bounds_are_16_and_255`, `the_mcp_argument_is_the_same_rule_without_quotes`, `the_published_bounds_are_the_cores` | re-pointed: `MIN_KEY_CHARS` is kimmy-core's `KEY_MIN_LEN` (the same text as S:C6, run with F's suite) |
 | H3 | maximum 256 | killed | `the_header_is_read_from_one_field_line_and_refused_by_name`, `the_length_is_the_unescaped_values_and_its_bounds_are_16_and_255`, `the_mcp_argument_is_the_same_rule_without_quotes`, `the_published_bounds_are_the_cores` | re-pointed: `MAX_KEY_CHARS` is kimmy-core's `KEY_MAX_LEN` |
 | H4 | anything after the string accepted | killed | `a_value_that_is_not_one_quoted_string_is_refused` | re-pointed: kimmy-core's parser |
@@ -107,13 +107,13 @@ This is the table [ADR-240](decisions.md#adr-240--idempotency-keys-the-record-is
 | R2 | guard not over /mcp (layered beside the query-string guard) | killed | `every_other_route_refuses_the_header_by_name` | re-pointed: the guard is one layer over the merged table, so removing it is no longer 'not over /mcp' but no guard at all; `/mcp` let through by the guard instead (the same text as M:header-guard-not-over-mcp), run with F's suite |
 | R3 | guard ignores the table | killed | `every_other_route_refuses_the_header_by_name`, `the_route_refusal_comes_before_authentication`, `with_the_switch_off_a_key_is_refused_naming_the_switch` |  |
 | R4 | guard checks no syntax before authentication | killed | `the_route_refusal_comes_before_authentication` |  |
-| R5 | explain with a key allowed (update) | superseded | | superseded by E:A6: the explain refusal moved from the update route's handler into `exec` (phase E); E:A6 plants the same fault there and runs the same suite |
+| R5 | explain with a key allowed (update) | superseded | | superseded by E:A6: the explain refusal moved from the update route's handler into `exec` (the executor piece, E); E:A6 plants the same fault there and runs the same suite |
 | F1 | body not hashed | killed | `one_body_byte_moves_the_fingerprint`, `the_fingerprint_moves_with_every_part_of_the_request_as_sent` |  |
 | F2 | query not hashed | killed | `the_fingerprint_is_taken_over_the_request_as_sent` |  |
 | F3 | no length prefix | killed | `the_fingerprint_moves_with_every_part_of_the_request_as_sent` |  |
 | F4 | tool fingerprint keeps the key | killed | `a_tool_fingerprint_is_the_name_and_the_arguments_without_the_key` |  |
 | F5 | keyed body skips the 415 | killed | `a_keyed_body_is_refused_exactly_as_an_unkeyed_one_is` |  |
-| O1 | resumed fields always rendered | killed | `a_keyed_request_adds_skipped_and_resumed_after_everything_else`, `update_and_delete_render_what_their_routes_answered` | re-pointed: `resumed` is a flag rendered by `append_keyed` since phase E |
+| O1 | resumed fields always rendered | killed | `a_keyed_request_adds_skipped_and_resumed_after_everything_else`, `update_and_delete_render_what_their_routes_answered` | re-pointed: `resumed` is a flag rendered by `append_keyed` since the executor piece (E) |
 | O2 | replace renders modified as matched | killed | `replace_renders_what_the_replace_route_answered` |  |
 | O3 | find_and_modify reports a removal's stamp | killed | `find_and_modify_reports_a_stamp_only_for_a_document_that_still_exists` |  |
 | O4 | update reports a multi write's stamp | killed | `filtered_writes_report_a_stamp_only_when_one_document_was_written` | re-pointed: the counts come from `run_filtered` (fresh or the record's) |
@@ -129,7 +129,7 @@ This is the table [ADR-240](decisions.md#adr-240--idempotency-keys-the-record-is
 | M3 | records gauge not in the snapshot | killed | `the_snapshot_reads_the_same_atomics_the_render_does` |  |
 | M4 | bridge reads another outcome's slot | killed | `each_idempotency_instrument_reads_the_slot_of_its_own_label` |  |
 | M5 | a series off the bridge | killed | `every_metrics_series_reaches_the_bridge` |  |
-| L1 | resume logged at DEBUG | killed (test added) | `a_resume_logs_at_info_and_a_replay_below_it` | re-pointed: the resume line is the engine's (`Engine::log_resume`) since phase E |
+| L1 | resume logged at DEBUG | killed (test added) | `a_resume_logs_at_info_and_a_replay_below_it` | re-pointed: the resume line is the engine's (`Engine::log_resume`) since the executor piece (E) |
 
 **49 rows: 47 killed, 1 equivalent, 1 superseded, 0 run once elsewhere, 0 survived.**
 
@@ -174,14 +174,14 @@ This is the table [ADR-240](decisions.md#adr-240--idempotency-keys-the-record-is
 
 ## Records across members (R)
 
-19 rows: the receiver's store, a window's records and the frame's fit, the replay, the snapshot's records phase, the converge page, the stamp rule on a fresh attempt and the live-peer net. Suites: `cargo test -p kimmy-storage --lib idempotency_repl_tests::`; kimmy-cluster's `--test idempotency` with the lib tests of R; or C9 alone; 1200 s. G's coverage rule replaced the window readers W1 to W3 moved.
+19 rows: the receiver's store, a window's records and the frame's fit, the replay, the snapshot's records phase, the converge page, the stamp rule on a fresh attempt and the live-peer net. Suites: `cargo test -p kimmy-storage --lib idempotency_repl_tests::`; kimmy-cluster's `--test idempotency` with the lib tests of R; or C9 alone; 1200 s. The coverage piece's rule replaced the window readers W1 to W3 moved.
 
 | Row | What it plants | Result | Killed by | Notes |
 |---|---|---|---|---|
 | V1-receiver-stores-only-on-win | receiver stores only on win | killed (test added) | `a_record_lands_with_the_run_that_takes_its_entry_when_the_entry_loses` | re-pointed: `frame.owes` takes the entry's stamp since the records ride by stamp (the same text as M:store-only-on-a-win) |
 | V2-record-stored-only-with-its-carrying-entry | record stored only with its carrying entry | killed (test added) | `a_record_whose_entry_is_not_in_the_frame_rides_with_a_later_entry` | re-pointed: a record rides with an entry at or after its row (`rides_by`); stored only with the entry at its row |
-| V3-record-stored-while-history | record stored while history | killed | `a_history_record_is_not_stored_and_an_undecodable_one_is_dropped` | re-pointed: G's re-point of the same row (the store returns `(None, false)`) |
-| V4-undecodable-record-kept-past-its-row | undecodable record kept past its row | killed | `an_undecodable_record_goes_when_its_row_expires` | re-pointed: G's re-point (the retention re-check is a `(stale, keep_row)` pair) |
+| V3-record-stored-while-history | record stored while history | killed | `a_history_record_is_not_stored_and_an_undecodable_one_is_dropped` | re-pointed: the coverage piece's re-point of the same row (the store returns `(None, false)`) |
+| V4-undecodable-record-kept-past-its-row | undecodable record kept past its row | killed | `an_undecodable_record_goes_when_its_row_expires` | re-pointed: the coverage piece's re-point (the retention re-check is a `(stale, keep_row)` pair) |
 | W1-records-outside-the-windows-txn-keys | records outside the windows txn keys | killed | `a_windows_records_are_read_in_its_own_transaction` | re-pointed: one reader, `records_for_coverage`, replaced both `records_at_stamps` (W1) and `records_for_window` (W2); the same text as G13 |
 | W2-records-outside-the-windows-txn-linear | records outside the windows txn linear | superseded | | superseded: `records_for_window`, the linear reader it moved out of the window's transaction, is gone; the one reader left is W1's (re-pointed, = G13) |
 | W3-frame-fit-ignores-records | frame fit ignores records | killed | `a_frame_counts_every_record_its_window_ships` | re-pointed: the fit counts a record as a rider of the entry it rides with (`riders`); the same text as G14; suite filter `a_frame_counts_the_records` renamed `a_frame_counts_every_record` |
@@ -219,7 +219,7 @@ This is the table [ADR-240](decisions.md#adr-240--idempotency-keys-the-record-is
 
 ## Records travel with coverage (G)
 
-42 rows: G's own 18 (F1 to F3, store on coverage, the frame's fit of riders, the no-op store, the G8 lookahead, where a window's reach comes from, L1), its re-runs of R's 16 rows on its head with a wider suite, and of C's eight, which ran once, as C's. Storage rows run all of kimmy-storage's `idempotency` tests, the model's CI sweep among them, 1500 s.
+42 rows: the piece's own 18 (F1 to F3, store on coverage, the frame's fit of riders, the no-op store, the G8 lookahead, where a window's reach comes from, L1), its re-runs of R's 16 rows on its head with a wider suite, and of C's eight, which ran once, as C's. Storage rows run all of kimmy-storage's `idempotency` tests, the model's CI sweep among them, 1500 s.
 
 | Row | What it plants | Result | Killed by | Notes |
 |---|---|---|---|---|
@@ -345,19 +345,19 @@ This is the table [ADR-240](decisions.md#adr-240--idempotency-keys-the-record-is
 
 **39 rows: 39 killed, 0 equivalent, 0 superseded, 0 run once elsewhere, 0 survived.**
 
-## The build review's fixes (Y): B1, B2, M1, m1 and m3
+## The fixes after the review of the merged head (Y)
 
-27 rows, on `git archive` exports of the fix branch `idempotency-y` (`100b8bec` for the first fifteen, `ae544eb0` for the rest), each with its own target directory and a 900 s timeout (1,500 s for the outbound cursor row, whose replay loops to its deadline): B1 (a window carries a record at the lowest of its own rows), B2 (a replay page's records of its collections, both ways), the five tests M1 of the build review found missing, m1 (records too many for one frame: a pull's partial window of records alone, a push not sent, a replay's pages of records alone under a records cursor) and m3 (a rewind removes a cut bulk's record). Suites: the named tests alone, by exact name, each row required to run them. Two rows survived their first run because the outbound B2 test then ran a whole round, whose ordinary pull brought Q's coverage and the record with it; the test now runs the replay alone, and both rows are killed against it.
+27 rows, on `git archive` exports of the fix branch (`100b8bec` for the first fifteen, `ae544eb0` for the rest), each with its own target directory and a 900 s timeout (1,500 s for the outbound cursor row, whose replay loops to its deadline): a window carrying a record at the lowest of its own rows, a replay page's spanning records of its collections (both ways), five tests for mutants no suite killed, records too many for one frame ( a pull's partial window of records alone, a push not sent, a replay's pages of records alone under a records cursor), and a rewind removing a cut bulk's record. Suites: the named tests alone, by exact name, each row required to run them. Two rows survived their first run because the outbound spanning-records test then ran a whole round, whose ordinary pull brought Q's coverage and the record with it; the test now runs the replay alone, and both rows are killed against it.
 
 | Row | What it plants | Result | Killed by | Notes |
 |---|---|---|---|---|
 | Y-B1a-carried-at-the-first-row-found | A record found again at a lower row keeps the row it was first found at | killed | `a_stopped_batch_covers_a_row_whose_record_rode_a_later_one`, `a_run_committed_before_the_carried_row_holds_the_effect_bare` | the control `a_stopped_batch_with_the_lower_row_found_first` passes under it |
 | Y-B1b-lowered-below-first | A lower row found later lowers the carrying row even below the record's `first` | killed | `a_row_below_the_records_first_found_later_does_not_lower_its_carrying_row` |  |
 | Y-m3-rewind-reopens-a-bulk | A rewind reopens a cut bulk insert's record as it reopens a filter's | killed | `a_rewind_that_cuts_a_bulk_part_way_removes_its_record` |  |
-| Y-B2-no-collection-records-inbound | A replay page carries no record of its collections (B2 off), inbound | killed | `b2_an_inbound_replay_carries_a_record_with_no_row_of_the_requesters_origin` |  |
+| Y-B2-no-collection-records-inbound | A replay page carries no record of its collections (the spanning records off), inbound | killed | `b2_an_inbound_replay_carries_a_record_with_no_row_of_the_requesters_origin` |  |
 | Y-B2-no-collection-records-outbound | The same, outbound | killed | `b2_an_outbound_replay_carries_a_record_with_no_row_of_the_requesters_origin` | survived the first run (see above) |
 | Y-B2-no-collection-records-storage | The same, in storage | killed | `a_replay_page_takes_the_live_spanning_records_of_its_collections_at_their_first` |  |
-| Y-B2-carried-at-last | B2's records carried at `last`, not `first` | killed | `a_replay_page_that_stops_between_the_effects_and_last_stores_the_record` |  |
+| Y-B2-carried-at-last | The spanning records carried at `last`, not `first` | killed | `a_replay_page_that_stops_between_the_effects_and_last_stores_the_record` |  |
 | Y-B2-outbound-asks-no-replay | The outbound replay's `AskEntries` does not set `replay` | killed | `b2_an_outbound_replay_carries_a_record_with_no_row_of_the_requesters_origin` | survived the first run (see above) |
 | Y-m1-cursor-dropped-inbound | A replay page ignores the records cursor it is given | killed | `the_records_at_an_inbound_replays_start_cross_on_several_pages` |  |
 | Y-m1-cursor-dropped-outbound | The same, outbound | killed | `the_records_at_an_outbound_replays_start_cross_on_several_pages` |  |
@@ -371,13 +371,13 @@ This is the table [ADR-240](decisions.md#adr-240--idempotency-keys-the-record-is
 | Y-m1-delta-stop-ignored | A delta that stopped at its budget reads as whole | killed | `a_records_cursors_delta_stops_at_its_budget_and_moves_the_base` |  |
 | Y-m1-inbound-cursor-forgotten | The inbound serve starts every contact without the cursor its peer acknowledged | killed | `the_records_at_an_inbound_replays_start_cross_over_several_contacts` |  |
 | Y-m1-outbound-cursor-forgotten | The outbound replay starts every contact without the cursor it stored | killed | `the_records_at_an_outbound_replays_start_cross_over_several_contacts` |  |
-| M1-X07-retention-first-origin-only | Retention reads only the first origin that has rows | killed | `everything_expires_and_nothing_is_left` | the build review's M1 |
-| M1-X05-change-log-never-trimmed | The change log's trim returns at once | killed | `everything_expires_and_nothing_is_left`, `retention_trims_the_change_log_below_the_window_and_keeps_its_beginning` | the build review's M1 (X05) |
-| M1-N3-trim-not-called | The retention pass never calls the change log's trim | killed | `retention_trims_the_change_log_below_the_window_and_keeps_its_beginning` | the build review's M1 (N3) |
-| M1-N1-whole-log-trimmed | Every retention pass trims the whole change log | killed | `a_retention_pass_during_a_pull_keeps_the_log_the_next_page_reads` | the build review's M1 |
-| M1-M13a-records-only-page-drops-the-phase | A records-only page cut inside a records phase drops the phase position | killed | `a_records_only_page_inside_a_records_phase_keeps_the_phase` | the build review's M1 |
-| M1-X4-replay-drops-unanchored | A replay page drops its F3 records | killed | `a_replay_page_carries_a_record_its_sender_cannot_vouch_for` | the build review's M1 |
-| M1-X4-with-B2-off | X4 with B2's records off as well | killed | `a_replay_page_carries_a_record_its_sender_cannot_vouch_for` | the F3 test holds without B2 |
+| M1-X07-retention-first-origin-only | Retention reads only the first origin that has rows | killed | `everything_expires_and_nothing_is_left` | no suite killed it before |
+| M1-X05-change-log-never-trimmed | The change log's trim returns at once | killed | `everything_expires_and_nothing_is_left`, `retention_trims_the_change_log_below_the_window_and_keeps_its_beginning` | no suite killed it before |
+| M1-N3-trim-not-called | The retention pass never calls the change log's trim | killed | `retention_trims_the_change_log_below_the_window_and_keeps_its_beginning` | no suite killed it before |
+| M1-N1-whole-log-trimmed | Every retention pass trims the whole change log | killed | `a_retention_pass_during_a_pull_keeps_the_log_the_next_page_reads` | no suite killed it before |
+| M1-M13a-records-only-page-drops-the-phase | A records-only page cut inside a records phase drops the phase position | killed | `a_records_only_page_inside_a_records_phase_keeps_the_phase` | no suite killed it before |
+| M1-X4-replay-drops-unanchored | A replay page drops its F3 records | killed | `a_replay_page_carries_a_record_its_sender_cannot_vouch_for` | no suite killed it before |
+| M1-X4-with-B2-off | The row above with the spanning records off as well | killed | `a_replay_page_carries_a_record_its_sender_cannot_vouch_for` | the F3 test holds without the spanning records |
 
 **27 rows: 27 killed, 0 equivalent, 0 superseded, 0 survived.**
 
@@ -394,8 +394,8 @@ This is the table [ADR-240](decisions.md#adr-240--idempotency-keys-the-record-is
 | gs-decimal128-edge-unheard-as-400 | The API answers a `Decimal128` refusal for an unheard peer `400` | killed | `a_decimal128_refusal_is_503_while_a_peer_is_unheard_and_400_otherwise`, `the_live_peer_net_holds_back_a_decimal_id_and_bound_until_every_peer_can_hold_one` |  |
 | gs-retry-after-dropped | `peer_unheard` carries no `Retry-After` | killed | `a_live_peer_not_heard_from_is_answered_503_and_the_same_key_is_then_taken`, `the_argument_is_gated_as_the_header_is` | REST's header and MCP's `retry_after_secs` |
 | gs-retry-after-zero-allowed | `peer_unheard`'s `Retry-After` may be 0 | killed | `a_decimal128_refusal_is_503_while_a_peer_is_unheard_and_400_otherwise` |  |
-| gs-wait-not-rounded-up | The wait truncates a fractional sync interval | killed | `the_wait_is_one_sync_interval_rounded_up_and_at_least_a_second` |  |
-| gs-wait-may-be-zero | The membership's wait loses its floor of one second | equivalent | | `sync_interval` is never zero (an unconfigured or zero interval reads as the default), so the interval rounded up is at least 1 already; `ApiError::peer_unheard`'s own floor is the one `gs-retry-after-zero-allowed` kills |
+| gs-wait-longer | The wait of a refusal for a peer not heard from yet is 5 seconds, not 1 | killed | `the_wait_is_a_fixed_second_whatever_the_sync_interval` |  |
+| gs-wait-zero | The wait of a refusal for a peer not heard from yet is 0 | killed | `the_wait_is_a_fixed_second_whatever_the_sync_interval` | `ApiError::peer_unheard`'s own floor, which `gs-retry-after-zero-allowed` kills, would answer 1 |
 | gs-precedence-swapped | A peer not heard from decides over one whose block says no | killed | `a_peer_not_heard_from_is_transient_and_a_peer_that_says_no_decides` (idempotency and decimal128), `an_older_live_peer_refuses_400_naming_it_whoever_else_is_unheard`, `the_live_peer_net_holds_back_a_decimal_id_and_bound_until_every_peer_can_hold_one` |  |
 | gs-unheard-passes | A live peer not heard from passes the net (fails open) | killed | `a_peer_not_heard_from_is_transient_and_a_peer_that_says_no_decides` (idempotency), `a_live_peer_not_heard_from_is_answered_503_and_the_same_key_is_then_taken` |  |
 | gs-capability-listed-while-unheard | `idempotency-keys` listed while an unheard peer closes the gate | killed | `idempotency_keys_is_not_listed_while_a_member_is_unheard_or_says_no`, `a_live_peer_not_heard_from_is_answered_503_and_the_same_key_is_then_taken` |  |
@@ -424,8 +424,8 @@ This is the table [ADR-240](decisions.md#adr-240--idempotency-keys-the-record-is
 | Records travel with coverage (G) | 42 | 33 | 1 | 0 | 8 | 0 |
 | The page records delta (P) | 20 | 20 | 0 | 0 | 0 | 0 |
 | The model's mutants (M) | 39 | 39 | 0 | 0 | 0 | 0 |
-| The build review's fixes (Y) | 27 | 27 | 0 | 0 | 0 | 0 |
+| The fixes after the review of the merged head (Y) | 27 | 27 | 0 | 0 | 0 | 0 |
 | The gate split (GS) | 21 | 20 | 1 | 0 | 0 | 0 |
 | **All** | **313** | **297** | **5** | **3** | **8** | **0** |
 
-Of the 250 rows killed before the build review, 238 were killed by their piece's own suites (3 of them by a hang, with the tests that failed before it), 4 by the wider suites and 8 by the five tests added on `idempotency-h`: `a_resume_logs_at_info_and_a_replay_below_it`, `a_resume_whose_short_last_chunk_writes_nothing_marks_the_record_done` and `a_record_stays_when_a_row_between_its_first_and_last_expires` in `idempotency_tests.rs`, `a_record_lands_with_the_run_that_takes_its_entry_when_the_entry_loses` and `a_record_whose_entry_is_not_in_the_frame_rides_with_a_later_entry` in `idempotency_repl_tests.rs`. The five equivalent rows are B3 and M13 of S, O5 of F, G11 of G and `gs-wait-may-be-zero` of GS.
+Of the 250 rows killed before the review of the merged head, 238 were killed by their piece's own suites (3 of them by a hang, with the tests that failed before it), 4 by the wider suites and 8 by the five tests added with the combined run: `a_resume_logs_at_info_and_a_replay_below_it`, `a_resume_whose_short_last_chunk_writes_nothing_marks_the_record_done` and `a_record_stays_when_a_row_between_its_first_and_last_expires` in `idempotency_tests.rs`, `a_record_lands_with_the_run_that_takes_its_entry_when_the_entry_loses` and `a_record_whose_entry_is_not_in_the_frame_rides_with_a_later_entry` in `idempotency_repl_tests.rs`. The five equivalent rows are B3 and M13 of S, O5 of F, G11 of G and `gs-wait-may-be-zero` of GS.

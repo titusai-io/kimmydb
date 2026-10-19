@@ -184,7 +184,7 @@ where it stopped instead of applying again. What a client must do to rely on it:
   heard from a live member whether it carries records: one that came up, or
   that it saw rejoin, a moment ago, which every restart of a member in a roll
   causes. It wrote nothing and looked nothing up. It lasts until that member is
-  heard, about a sync interval, and at most the unheard lease (the longer of
+  heard, about one contact, and at most the unheard lease (the longer of
   `ceil(peers / cluster.fanout) + 2` sync intervals and the time SWIM takes to
   declare a silent member down plus one sync interval), after which the member that is still not
   heard from is answered with the `400` below. **Honour `Retry-After` and send the same request again,
