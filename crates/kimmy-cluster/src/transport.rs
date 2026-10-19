@@ -462,7 +462,7 @@ fn cut_replay_page_from(
     collections.sort();
     collections.dedup();
     // The cursor as it came, for a page that cannot go on from it.
-    let kept = cursor.clone();
+    let mut kept = cursor.clone();
     let stays = |kept: Option<kimmy_storage::ReplayRecords>| ReplayCut {
         entries: Vec::new(),
         records: Vec::new(),
@@ -477,24 +477,29 @@ fn cut_replay_page_from(
         Ok(read) => read,
         // A record the change log names as changed since the cursor's base that
         // is larger than the delta's half of a page (P2's refusal): the delta
-        // cannot carry it, and a page that went on without it could pass it. The
-        // page carries nothing, the replay stays at this position with its cursor,
-        // and it is said and counted, as every page that cannot carry what it must.
+        // cannot carry it. The position's records start over, from a base above
+        // the change: the record is then no change to that base, and goes as an
+        // ordinary record on a page of records alone, which holds a record up to
+        // a whole page. What the earlier pages at the position sent is sent again.
+        // Only a record larger than a whole page still cannot cross, and that is
+        // said and counted where the page is cut, as every page that cannot carry
+        // what it must.
         Err(kimmy_storage::StorageError::SnapshotRowTooLarge { what, bytes, room }) => {
-            records_unfit().bump(UnfitPath::Replay);
-            warn!(
+            info!(
                 %peer,
                 ?from,
                 what = %what,
                 bytes,
                 room,
                 "an idempotency record changed since this replay's records cursor is larger than \
-                 a replay page's delta can carry; the page carries nothing and the replay of the \
-                 peer's own origin stays at this position until the change log's row of it is \
-                 trimmed with the record's window; counted in \
-                 kimmy_idempotency_records_unfit_total"
+                 a replay page's delta can carry; the position's records start over from a new \
+                 base, which carries it as an ordinary record"
             );
-            return Ok(stays(kept));
+            kept = None;
+            kimmy_storage::blocking(|| {
+                engine.replay_page_records(&collections, from, through, None, budget / 2)
+            })
+            .map_err(|e| from_storage(e, ProtocolError::Local))?
         }
         Err(e) => return Err(from_storage(e, ProtocolError::Local)),
     };
@@ -2898,6 +2903,9 @@ where
                 // was cut): the replay stays where it is, its cursor with it, and the
                 // contact goes on with the ordinary round.
                 if page_unfit {
+                    // The cursor the page left: the one it came with, or none where
+                    // its position's records started over.
+                    set_inbound_records(engine.node_id(), their_node, records_cut);
                     return Ok(ReplayServed::InStep);
                 }
                 // A page of records alone the peer stored, at the position it asks

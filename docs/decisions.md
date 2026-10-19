@@ -28765,11 +28765,14 @@ with it, and not be offered while any member could carry the write without it.
      acknowledged, across contacts, in memory; the outbound way keeps the one of the last page it stored. **A frame
      or page that cannot carry even that** (one record, or the F3 records, larger than a frame; a pull that cannot
      take a partial window, or whose window would not end past where it began) is logged at `WARN` and counted in
-     `kimmy_idempotency_records_unfit_total{path}`. **So is a record the change log names as changed since a
-     cursor's base that is larger than the delta's half of a frame** (refused by name, as a snapshot page's delta
-     refuses one): that replay page carries nothing, the contact ends in step, and **the replay of that peer's own
-     origin stalls at its position, its cursor kept**, until the log's row of the change is trimmed with the record's
-     window (or the cursor is lost with a restart of the serving member, inbound, and starts over). **Every other page
+     `kimmy_idempotency_records_unfit_total{path}`. **A record the change log names as changed since a cursor's base
+     that is larger than the delta's half of a frame** (refused by name, as a snapshot page's delta refuses one)
+     **starts the position's records over**, from a base above the change, logged at `INFO`: the record is then no
+     change to that base and crosses as an ordinary record on a page of records alone, which holds one up to a whole
+     frame, and what the earlier pages at the position sent is sent again. **Only a record larger than a whole frame
+     stalls that replay** (the class of a document no page can carry): the page that reaches it carries nothing, the
+     contact ends in step, and the replay of that peer's own origin stays at its position, logged at `WARN` and
+     counted, until the record expires with its window. **Every other page
      of records alone strictly advances the cursor's last key sent**, so the pages at a position end, with one
      exception, also logged at `WARN` and counted there: a page that what changed since the cursor's base fills
      carries that alone, keeps its key and moves its base, so under keyed changes faster than a page's round trip
