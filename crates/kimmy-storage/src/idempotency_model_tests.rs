@@ -113,10 +113,13 @@
 //! - **Life**: a member that holds K's live `done` record replays it (a delete by id
 //!   while its document's row is at or above the delete, or the row is gone and the
 //!   collection's drop or floor is at or above it), and no replay answers from a record
-//!   past its window. A rewind leaves no record of a request whose every write it
-//!   discarded, reopens one it cut part-way only as a filter's (`applying`, no cursor;
-//!   any other kind goes, and its standing writes are bare by design, Y's m3), and leaves
-//!   no row by stamp naming a record it removed (G).
+//!   past its window; an `applying` record of any kind but a filter's replays too. A
+//!   rewind leaves no record of a request whose every write it discarded; one it cut
+//!   part-way goes only as a bulk insert's (its standing prefix bare by design, Y's m3)
+//!   and is reopened `applying` as any other kind's, its rows kept (a filter's with no
+//!   cursor; G's narrowed rule); and it leaves no row by stamp naming a record it removed.
+//!   A keyed delete by id is judged by the record's `first`. A record past its window
+//!   merges into a live record of the same request and is refused otherwise (m2).
 //! - **Contested** (the KR ruling): the test keeps, per member and key, the requests
 //!   merged into its live record (a local commit adds its own; a stored record adds its
 //!   sender's; an absent record has none), so the merge algebra `a.contested ||
@@ -697,8 +700,12 @@ pub(crate) struct Outcome {
     /// Replay pages at a records cursor's position the sender's log no longer honoured
     /// (another epoch: the sender was restored, m1's guard).
     pub cursor_restarts: usize,
-    /// Records a frame offered a receiver past their window there (m2: never stored).
+    /// Records a frame offered a receiver past their window there (m2: refused, unless
+    /// of the live record's own request).
     pub past_window_offered: usize,
+    /// Of them, those merged into a live record of the same request, lowering its
+    /// `first` (m2 as G narrowed it).
+    pub past_window_merged: usize,
     /// Rewinds taken, and the records they removed and reopened.
     pub rewinds: usize,
     pub rewound_removed: usize,
@@ -859,8 +866,8 @@ struct Ghost {
     /// record is contested exactly when the set holds two or more (`a.contested ||
     /// b.contested || a.fingerprint != b.fingerprint` is the union's size).
     fps: HashMap<(NodeId, u8, u8), BTreeSet<u8>>,
-    /// Requests a rewind cut part-way whose record it removed by design (Y's m3: any kind
-    /// but a filter's, in practice a bulk insert whose prefix stands): their standing
+    /// Requests a rewind cut part-way whose record it removed by design (Y's m3: a bulk
+    /// insert whose prefix stands, every request merged into its record): their standing
     /// entries hold no record, and a retry meets the first standing document as a
     /// duplicate and writes nothing. I2 does not hold them to a record.
     bare: HashSet<u8>,
@@ -1318,6 +1325,7 @@ impl World {
             if now == was {
                 continue;
             }
+
             let theirs = self.ghost.fps.get(&(sender, c, key)).cloned().unwrap_or_default();
             let mine = self.ghost.fps.entry((node, c, key)).or_default();
             if was.is_none() {
@@ -1548,6 +1556,21 @@ impl World {
                 .filter(|r| self.past_window(r))
                 .count();
             let before = self.live_before(to, &window.records)?;
+            // m2 as G narrowed it: a record past its window merges into a live record of
+            // the same request (`first` the lower of the two), and is refused otherwise.
+            let mut same: Vec<(u8, u8, Stamp)> = Vec::new();
+            for carried in &window.records {
+                let Some((c, key)) = key_of(carried) else { continue };
+                let Some(theirs) = IdempotencyRecord::decode(&carried.record).ok().flatten() else {
+                    continue;
+                };
+                let mine = before.iter().find(|(k, _)| *k == (c, key)).and_then(|(_, r)| r.clone());
+                if self.past_window(&theirs)
+                    && mine.is_some_and(|mine| mine.fingerprint == theirs.fingerprint)
+                {
+                    same.push((c, key, theirs.first));
+                }
+            }
             let mut outcome = SyncOutcome::default();
             dst.apply_peer_window_carrying_into(
                 &theirs,
@@ -1565,6 +1588,21 @@ impl World {
             )
             .map_err(|e| err("apply_peer_window", e))?;
             self.fps_carried(src.node_id(), to, before)?;
+            for (c, key, first) in same {
+                let held = self.live_record(to, c, key)?;
+                if held.as_ref().is_some_and(|held| held.first <= first) {
+                    self.out.past_window_merged += 1;
+                } else {
+                    let s = format!(
+                        "m2: {} refused key {key}'s record of its own request past its window \
+                         (first {}), where it holds the live one ({:?})",
+                        LETTERS[to],
+                        self.stamp(first),
+                        held.map(|h| self.stamp(h.first))
+                    );
+                    self.fail(Inv::I2, s);
+                }
+            }
             if trace() {
                 let shipped: Vec<String> =
                     window.entries.iter().map(|e| self.stamp(e.stamp)).collect();
@@ -2288,18 +2326,24 @@ impl World {
     fn check_replay(&mut self, p: &Prepared, answer: &Answer) {
         let Some(rec) = &p.pre_record else { return };
         // A contested record is refused, not replayed (the algebra's check).
+        // A `done` record replays, and so does an `applying` one of any kind but a filter's
+        // (a rewind reopens a cut insert, replace or delete by id; it replays).
+        let filter = matches!(rec.outcome, crate::idempotency::RecordOutcome::Modify(_));
+        let replays = rec.state == crate::idempotency::RecordState::Done || !filter;
         if p.refused_pre
             || rec.fingerprint != p.keyed.fingerprint
-            || rec.state != crate::idempotency::RecordState::Done
+            || !replays
             || matches!(answer, Answer::Replayed(_))
         {
             return;
         }
-        if let crate::idempotency::RecordOutcome::Delete { stamp: Some(deleted), .. } = &rec.outcome
-        {
+        // A delete by id is judged by the record's `first`, the request's first write
+        // (G): its tombstone or a version over it stands at or above it, or the row is
+        // gone and a drop or floor at or above it took it.
+        if let crate::idempotency::RecordOutcome::Delete { stamp: Some(_), .. } = &rec.outcome {
             let stands = match p.row_before {
-                Some(row) => row >= *deleted,
-                None => p.floor >= deleted.hlc,
+                Some(row) => row >= rec.first,
+                None => p.floor >= rec.first.hlc,
             };
             if !stands {
                 return;
@@ -2726,8 +2770,9 @@ impl World {
     /// A rewind of `m` to `t` (`kimmyd restore --until`), offline, then the replay of its
     /// own origin a restore starts. Right after it, before any replay: no record of a
     /// request whose every write it discarded stands (`first` after the target), a record
-    /// it cut part-way stands only as a filter's (`Modify`), reopened `applying` with no
-    /// cursor (Y's m3), and it leaves no row by stamp naming a record it removed (G).
+    /// it cut part-way goes as a bulk's and stands reopened `applying` as any other kind's
+    /// (a filter's with no cursor), and it leaves no row by stamp naming a record it
+    /// removed (G).
     fn rewind(&mut self, m: usize, t: u32) -> Res<()> {
         // The first stamp minted in millisecond `t` is kept, the rest of it discarded: a
         // batch of that millisecond is cut part-way (`--until` is a millisecond).
@@ -2752,8 +2797,10 @@ impl World {
         for (key, was) in &before {
             let now = after.get(key);
             let cut = was.last.hlc > until;
-            let filter = matches!(was.outcome, crate::idempotency::RecordOutcome::Modify(_));
-            if cut && !filter && was.first.hlc <= until {
+            // G's narrowed rule: only a cut bulk insert goes; every other kind cut
+            // part-way is reopened, its rows kept.
+            let bulk = matches!(was.outcome, crate::idempotency::RecordOutcome::Bulk { .. });
+            if cut && bulk && was.first.hlc <= until {
                 // Every request merged into the record (a contested one holds two or
                 // more): the writes of each that stand are bare.
                 let r = was.fingerprint.0[0].wrapping_sub(1);
@@ -2766,7 +2813,7 @@ impl World {
                 }
                 self.note(format!("{merged:?}'s record removed by the rewind, what stands bare"));
             }
-            let fine = if was.first.hlc > until || (cut && !filter) {
+            let fine = if was.first.hlc > until || (cut && bulk) {
                 now.is_none()
             } else if cut {
                 now.is_some_and(|now| {
@@ -4804,7 +4851,9 @@ impl Gen {
         let mut bias = Bias::default();
         let len = ops.len();
         if self.rng.chance(33) {
-            bias.page_room = Some(self.rng.pick(&[450, 700]));
+            // Room for a document with the cursor that names it (P2 counts both at the
+            // size they cross in), and for a few counters a page.
+            bias.page_room = Some(self.rng.pick(&[2000, 2600]));
             let (to, from) = self.pair();
             let r = self.requests.len() as u8;
             self.requests.push(Request { key: r + 1, kind: Kind::Insert { id: None } });
@@ -6017,6 +6066,35 @@ fn row_m2_a_record_past_its_window_is_not_stored() {
         vec![req(1, Kind::Insert { id: Some(0) }), req(1, Kind::Insert { id: Some(1) })],
         vec![ask(0, A, 100), retention(C, 1700), ask(1, B, 1710), pull(B, A), ask(1, B, 1720)],
         |out| out.past_window_offered >= 1 && out.replays >= 1,
+    );
+}
+
+/// m2 as G narrowed it: a record past its window of the live record's own request
+/// merges. r0 on A at 100; B, without A's record, retries r0 at 1500; the window passes
+/// for A's record (a retention pass on C at 1700) and not for B's; B pulls A, whose
+/// window carries r0's record past its window: B merges it, its `first` now A's.
+#[test]
+fn row_m2_a_record_past_its_window_of_the_same_request_merges() {
+    row_holding(
+        "m2-same",
+        vec![req(1, Kind::Replace { at: Target::Client(0) })],
+        vec![ask(0, A, 100), ask(0, B, 1500), retention(C, 1700), pull(B, A)],
+        |out| out.past_window_merged >= 1,
+    );
+}
+
+/// The rewind as G narrowed it: a record of any kind but a bulk that a rewind cuts
+/// part-way is reopened, its rows kept, and replays. r0, an insert, applies on A at 100
+/// and, without A's record, on B at 200; A pulls B, and its record runs from A's 100 to
+/// B's 200. A rewind of A to 150 cuts it: reopened `applying`, it replays a retry on A,
+/// and A's insert at 100 stands with its record.
+#[test]
+fn row_rewind_reopens_a_merged_insert() {
+    row_holding(
+        "rewind-insert",
+        vec![req(1, Kind::Insert { id: None })],
+        vec![ask(0, A, 100), ask(0, B, 200), pull(A, B), rewind(A, 150), ask(0, A, 210)],
+        |out| out.rewound_reopened >= 1 && out.replays >= 1,
     );
 }
 
