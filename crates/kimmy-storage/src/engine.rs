@@ -2410,10 +2410,12 @@ impl Engine {
             // database reporting damage into "nothing is held" -- silently
             // restoring the pre-ADR-160 behaviour on precisely the node least
             // entitled to it. The table is created eagerly in `open_with_cache`
-            // above, before this runs, so a database from an older build or a
-            // restored backup finds it here EMPTY rather than missing, which
-            // produces the same "count every entry" answer without hiding
-            // anything.
+            // above, before this runs, so a database from an older build finds
+            // it here EMPTY rather than missing, which produces the same "count
+            // every entry" answer without hiding anything. A restored backup
+            // finds the marks the restore re-derived (ADR-244): a store an
+            // older build restored finds it empty, and is raised over what its
+            // source held as state.
             let held = txn.open_table(tables::OPLOG_HELD)?;
             // Hoisted: after one retention pass the table exists on every
             // node, including ones that have never taken a snapshot, so
