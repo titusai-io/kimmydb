@@ -84,11 +84,13 @@ pub fn vector_search(
 }
 
 /// Whether `vector` can be scored without overflowing: its squared length,
-/// summed in 32-bit floats as the graph's distances are, is finite. A NaN or
-/// an infinity fails, and so does a finite component large enough that its
-/// square, or the sum, overflows (3e38 is finite and its square is not): the
-/// cosine distance of such a vector is NaN, which the graph's distance
-/// asserts against, so every search that met it would panic (ADR-241).
+/// summed in 32-bit floats as the exact scan sums it, is finite. A NaN or an
+/// infinity fails, and so does a finite component large enough that its
+/// square overflows (3e38 is finite and its square is not), or squares that
+/// sum past `f32::MAX`. The exact scan scores such a vector 0, and the graph's
+/// cosine distance between two of them is NaN, which the library's distance
+/// asserts against: a search for the vector itself panicked, as did a build
+/// whose self-check or linking searched for it (ADR-241).
 pub fn searchable(vector: &[f32]) -> bool {
     vector.iter().map(|x| x * x).sum::<f32>().is_finite()
 }

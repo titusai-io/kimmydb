@@ -370,9 +370,11 @@ can already write, not an administrative act. The document must exist (there is
 no HLC to attach otherwise, so a missing one is `404`), and every vector must
 match the configured `dim` or the request is `400`. So is a vector whose
 squared length is not a finite 32-bit float (a component of about 1.8e19 or
-more): no distance to it can be computed, and a graph holding one fails every
-search of its collection. A query vector is held to the same test, and a
-provider's answer holding one is refused as unusable ([ADR-241](decisions.md)).
+more, or squares summing past `f32::MAX`): the exact scan scores it 0, and the
+graph's distance between two such vectors is NaN, on which the library panics
+at a search for the vector itself. A query vector is held to the same test,
+and a provider's answer holding one is refused as unusable
+([ADR-241](decisions.md)).
 
 ---
 

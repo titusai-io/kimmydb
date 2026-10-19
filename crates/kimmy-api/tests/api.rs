@@ -6421,9 +6421,12 @@ async fn searching_a_collection_with_no_vectors_says_so() {
 
 /// A vector whose squared length overflows a 32-bit float is refused where
 /// it enters, as a client's chunk and as a query (ADR-241): a component of
-/// 3e38 is finite, and its square is not, so every distance to the vector is
-/// NaN and every graph search that met it would panic. (A component past
-/// `f32::MAX` is already refused by the body's parse, as out of range.)
+/// 3e38 is finite and its square is not, and two components of 1.31e19 each
+/// square to a finite number and sum past `f32::MAX`. The exact scan scores
+/// such a vector 0, and the graph's distance between two of them is NaN, on
+/// which the library panics. Two components of 1.3e19 sum below it, and are
+/// stored. (A component past `f32::MAX` is already refused by the body's
+/// parse, as out of range.)
 #[tokio::test]
 async fn a_vector_too_large_to_score_is_refused_as_a_chunk_and_as_a_query() {
     let server = Server::start().await;
@@ -6431,7 +6434,9 @@ async fn a_vector_too_large_to_score_is_refused_as_a_chunk_and_as_a_query() {
     server
         .post("/v1/db/shop/coll/docs/docs", Some(&token), json!({ "_id": "a", "text": "a" }))
         .await;
-    for vector in [json!([3e38, 0.0, 0.0]), json!([2e19, 2e19, 0.0])] {
+    for vector in
+        [json!([3e38, 0.0, 0.0]), json!([2e19, 2e19, 0.0]), json!([1.31e19, 1.31e19, 0.0])]
+    {
         let stored = server
             .put(
                 "/v1/db/shop/coll/docs/docs/a/vectors",
@@ -6447,6 +6452,14 @@ async fn a_vector_too_large_to_score_is_refused_as_a_chunk_and_as_a_query() {
             stored.body
         );
     }
+    let stored = server
+        .put(
+            "/v1/db/shop/coll/docs/docs/a/vectors",
+            Some(&token),
+            json!([{ "chunk": 0, "vector": [1.3e19, 1.3e19, 0.0], "text": "a" }]),
+        )
+        .await;
+    assert_eq!(stored.status, 200, "squares summing below f32::MAX: {:?}", stored.body);
     let stored = server
         .put(
             "/v1/db/shop/coll/docs/docs/a/vectors",

@@ -1533,6 +1533,65 @@ mod tests {
         assert_eq!(resolve_query_vector(&state, &c, &body).await.unwrap(), vec![0.6, 0.8]);
     }
 
+    /// A graph search is held to the request's deadline (ADR-241). The graph
+    /// is built over 300 documents, and the filter admits only the 100
+    /// written after it, which no walk can find: the search gives way to the
+    /// keyed join, which, run as a request whose deadline has passed, answers
+    /// `503` `timeout` naming the configured timeout, and with the deadline a
+    /// minute off answers exactly.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_graph_search_past_the_request_deadline_answers_503_timeout() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = live_state(&dir);
+        let (source, shadow) = fixture(&state, 300);
+        let config = config();
+        let query = [1.0f32, 0.0];
+        let options = SearchOptions { k: 10, metric: config.metric, per_document: 1 };
+        let built = knn_joined(&state, &shadow, &config, &query, &options, None).unwrap();
+        assert_eq!(built.len(), 10, "the premise: a graph over the first 300");
+        for i in 300..400i64 {
+            state
+                .engine
+                .insert(&source, bson::doc! { "_id": i, "tag": i % 3, "text": format!("d{i}") })
+                .unwrap();
+            let record = VectorRecord {
+                source: DocId::Int64(i),
+                chunk: 0,
+                source_hlc: kimmy_core::Hlc::new(1, 0),
+                vector: vec![(i as f32 * 0.37).cos(), (i as f32 * 0.37).sin()],
+                text: format!("d{i}c0"),
+                config: None,
+            };
+            state.engine.put_vectors(&shadow, &DocId::Int64(i), &[record]).unwrap();
+        }
+        let mut allowed =
+            filter_ids(&state, &source, &parse(bson::doc! { "tag": 0 }), 1_000).unwrap();
+        allowed.ids = (300..400i64).map(DocId::Int64).collect();
+        allowed.set = allowed.ids.iter().cloned().collect();
+        let exact =
+            knn_joined(&state, &shadow, &config, &query, &options, Some((&allowed, Join::Keyed)))
+                .unwrap();
+        let ids = |hits: &[Hit]| hits.iter().map(|h| h.id.clone()).collect::<Vec<_>>();
+
+        let timeout = std::time::Duration::from_secs(7);
+        let late = crate::limits::as_a_request(std::time::Instant::now(), timeout, async {
+            knn_joined(&state, &shadow, &config, &query, &options, Some((&allowed, Join::Discard)))
+        })
+        .await
+        .expect_err("a graph search past the request's deadline must not answer");
+        assert_eq!(late.status, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(late.code, ErrorCode::Timeout);
+        assert!(late.message.contains("within 7 seconds"), "{}", late.message);
+
+        let far = std::time::Instant::now() + std::time::Duration::from_secs(60);
+        let inside = crate::limits::as_a_request(far, timeout, async {
+            knn_joined(&state, &shadow, &config, &query, &options, Some((&allowed, Join::Discard)))
+        })
+        .await
+        .unwrap();
+        assert_eq!(ids(&inside), ids(&exact));
+    }
+
     fn live_state(dir: &tempfile::TempDir) -> SharedState {
         live_state_with(dir, kimmy_vector::ProviderPolicy::default())
     }

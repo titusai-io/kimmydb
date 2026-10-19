@@ -128,6 +128,18 @@ pub fn request_time_left() -> Option<Duration> {
         .ok()
 }
 
+/// Run `handler` as [`enforce_timeout`] runs one: under a request deadline of
+/// `deadline` and a configured timeout of `timeout`. For tests of a handler's
+/// own reading of its deadline.
+#[cfg(test)]
+pub(crate) async fn as_a_request<F: std::future::Future>(
+    deadline: std::time::Instant,
+    timeout: Duration,
+    handler: F,
+) -> F::Output {
+    REQUEST_DEADLINE.scope(deadline, REQUEST_TIMEOUT.scope(timeout, handler)).await
+}
+
 /// Abandon a request that is still pending at the deadline.
 ///
 /// An `axum::middleware::from_fn_with_state` function rather than

@@ -28631,13 +28631,17 @@ ten.
    second at 100,000 low-dimensional vectors and 18 s at 100,000 uniform ones. **A component no search's candidates
    reach is bridged** (`bridges`): a cut-off point whose 16 nearest are all cut off themselves gets no edge from them,
    which a component of more than 16 points out of the entry point's reach, whose searches return only one another,
-   leaves. In the same round, one point of each such component, chosen so that the rest of the component is reachable
-   from it (a cut-off point no other cut-off point has an edge into, first), is joined both ways to its two nearest
-   linked points, found by reading every linked point's vector: one pass over the vectors per component, and nothing
-   when no point was stranded. Seen at toy parameters (four connections, construction effort 8, two tight clusters
-   inserted one after the other: the second cluster's 40 of 80 points, every one stranded), where the bridge leaves
-   none cut off; at the build's parameters and in its shuffled order, two to fifty tight clusters of 100 to 2,000
-   vectors of 384 dimensions stranded nothing. A point still cut off after the rounds is the structural retry of item 3.
+   leaves. In the same round, one point of each weakly connected component of cut-off points (one no other cut-off point
+   has an edge into, when the component has one) is joined both ways to its two nearest linked points, found by reading
+   every linked point's vector. What of the component that point does not reach is linked by the next round's search, or
+   bridged again, within the four rounds. The cost is one pass over the vectors per round, scoring each against one
+   point per component, which looks at the node's stop every 4,096 vectors; nothing when no point was stranded. Seen at
+   toy parameters (four connections, construction effort 8, two tight clusters inserted one after the other: the second
+   cluster's 40 of 80 points, every one stranded), where the bridge leaves none cut off; at the build's parameters and
+   in its shuffled order, two to fifty tight clusters of 100 to 2,000 vectors of 384 dimensions stranded nothing. Five
+   tight clusters of 20,000 vectors of 384 dimensions at toy parameters leave 90,406 points cut off in 10,726
+   components, which the pass joins in 22 s in release, where one point per point no other cut-off point had an edge
+   into took 233 s. A point still cut off after the rounds is the structural retry of item 3.
 3. **Each build attempt inserts in its own order** (`insertion_order`): a Fisher–Yates shuffle of the walk's order (chunk
    keys in key order) driven by SplitMix64 seeded with the attempt number, the first attempt included. A collection's
    graph is a function of its records and the attempt, reproducible on every member and across restarts, and different
@@ -28657,9 +28661,12 @@ ten.
    this build writes: format 4 of the library's description, full mode, sixteen layers, the expected point count, width,
    connection count, distance and element type, every point once, every neighbour and entry rank inside its layer, no
    NaN distance, every vector's squared length a finite 32-bit float, nothing after the end. A finite component is not
-   enough: 3e38 is finite and its square is not, the library's cosine distance to such a vector is NaN, and an assertion
-   in it panics, so a snapshot holding one loaded and then failed every search of its collection. A client's vectors, a
-   query vector and a provider's answer are held to the same test where they enter (`search::searchable`). Refused is a
+   enough: 3e38 is finite and its square is not, and two components of 1.31e19 square to finite numbers that sum past
+   `f32::MAX`. The exact scan scores such a vector 0, and the library's cosine distance between two such vectors is NaN,
+   on which an assertion in it panics: a search for the vector itself, and a build whose self-check or linking searched
+   for it, panicked, and a snapshot holding one loaded and then panicked at such a search. Other searches went through,
+   since the distance from such a vector to an ordinary one is finite. A client's vectors, a query vector and a
+   provider's answer are held to the same test where they enter (`search::searchable`). Refused is a
    rebuild, as every unusable snapshot already was. The audit is a test that hands 39 spoiled dumps to the raw loader in
    child processes and prints what each does (two exit, three abort, the rest panic, return an error, or load).
 5. **A snapshot says what built its graph, and is synced.** `meta.json` gains `graph`: 2 for a graph this build made (1 is
@@ -28709,15 +28716,18 @@ attempt builds one graph and each retry another; a build left cut off (the linki
 order and returns the last; a high sampled score with nothing cut off is not retried; the linking reaches a component
 the entry point does not (two clusters whose top level holds seven points of different reach, judged from the entry
 point the library dumps); the linking bridges a component no search's candidates reach (40 of 80 points stranded, none
-left cut off, and edges both into and out of the component); the two graph tests that flaked hold the walk first, so a red names recall; the dump check against 39 spoilings
+left cut off, and edges both into and out of the component); the bridge joins one point per component to its two
+nearest linked points, both ways; the two graph tests that flaked hold the walk first, so a red names recall; the dump check against 39 spoilings
 (a rank equal to its layer's size, and a vector too large to square, among them) and four shapes; a snapshot of each process-ending kind refused, rebuilt and survived, each case in a child process whose
 raw-library twin must exit or abort as the case says; a 0.51 snapshot served once and rebuilt; what built a loaded graph
 read from its snapshot; a filtered search returning `k` at 1%, 2% and 3% admitted with no fallback, a first walk short
 of `k` retried wider and answering `k`, a retry widened by what the first walk saw (the 2,000 documents nearest the
-query of 5,000 refused, so that four times the first width admits none), a forced fallback equal to the keyed join, the
+query of 5,000 refused, so that four times the first width admits none), and by a nonzero share it saw (the 3 nearest
+admitted and everything from the 1,400th on), a forced fallback equal to the keyed join, the
 keyed join stopping at a passed deadline, and the same rows at 100,000 documents in release; a provider's vector too
 large to square stores nothing of its batch. `kimmy-api`: a chunk and a query vector too large to square are refused
-with `400`; a provider's query vector too large to square, and one missing from its answer, answer `502`
+with `400`, two components whose squares sum past `f32::MAX` among them and two that sum below it accepted; a graph
+search run as a request past its deadline answers `503` `timeout` naming the configured timeout, and exactly inside it; a provider's query vector too large to square, and one missing from its answer, answer `502`
 `provider_error`; and a search past its deadline answers as a timeout. [Every mutation row with the test that kills
 it](adr-241-mutation-rows.md). The reachability distribution measurement
 counts every point, the points cut off and the points found at four times the effort, on either fixture

@@ -478,7 +478,9 @@ where
         }
         let mut linked = graph.add_layer0_edges(&edges);
         if stranded {
-            linked += graph.add_layer0_edges(&bridges(graph, &Layer0::read(graph)));
+            let bridged =
+                bridges(graph, &Layer0::read(graph), engine, kimmy_storage::WalkScope::Request)?;
+            linked += graph.add_layer0_edges(&bridged);
         }
         if linked == 0 {
             // Nothing could be linked: a graph with no linked point at all.
@@ -493,12 +495,20 @@ where
 /// Edges into and out of each component of cut-off points that no search's
 /// candidates reach (ADR-241): a component of more than [`LINK_CANDIDATES`]
 /// points out of the entry point's reach, whose searches return only one
-/// another. One point of each component, chosen so that the rest of the
-/// component is reachable from it, is joined both ways to its [`LINK_EDGES`]
-/// nearest linked points, found by reading every linked point. The cost is
-/// one pass over the graph's vectors per component, and nothing when no
-/// point was stranded.
-fn bridges<D>(graph: &Hnsw<'static, f32, D>, layer0: &Layer0) -> Vec<(usize, usize)>
+/// another. One point of each weakly connected component of cut-off points,
+/// one that no other cut-off point has an edge into when the component has
+/// one, is joined both ways to its [`LINK_EDGES`] nearest linked points,
+/// found by reading every linked point. Whatever of the component that point
+/// does not reach is linked by the next round's search, or bridged again,
+/// within [`LINK_ROUNDS`]. The cost is one pass over the graph's vectors,
+/// scoring each against one point per component, which looks at the node's
+/// stop as it goes; and nothing when no point was stranded.
+fn bridges<D>(
+    graph: &Hnsw<'static, f32, D>,
+    layer0: &Layer0,
+    engine: &Engine,
+    scope: kimmy_storage::WalkScope,
+) -> Result<Vec<(usize, usize)>>
 where
     D: hnsw_rs::anndists::dist::Distance<f32> + Default + Send + Sync,
 {
@@ -508,36 +518,43 @@ where
     for &point in &cut {
         lost[point] = true;
     }
-    // A cut-off point that no other cut-off point has an edge into heads its
-    // component, and is taken first; then each point not yet covered, in id
-    // order, covering what its edges reach among the cut-off points.
+    // The weakly connected components of the cut-off points, by union-find
+    // over the layer-0 edges between them.
+    let mut parent: Vec<usize> = (0..n).collect();
+    fn root(parent: &mut [usize], mut at: usize) -> usize {
+        while parent[at] != at {
+            parent[at] = parent[parent[at]];
+            at = parent[at];
+        }
+        at
+    }
     let mut fed = vec![false; n];
     for &from in &cut {
         for &to in &layer0.edges[from] {
             if to < n && to != from && lost[to] {
                 fed[to] = true;
-            }
-        }
-    }
-    let order = cut.iter().filter(|&&p| !fed[p]).chain(cut.iter().filter(|&&p| fed[p]));
-    let mut covered = vec![false; n];
-    let mut heads = Vec::new();
-    for &head in order {
-        if std::mem::replace(&mut covered[head], true) {
-            continue;
-        }
-        heads.push(head);
-        let mut stack = vec![head];
-        while let Some(at) = stack.pop() {
-            for &to in &layer0.edges[at] {
-                if to < n && lost[to] && !std::mem::replace(&mut covered[to], true) {
-                    stack.push(to);
+                let (a, b) = (root(&mut parent, from), root(&mut parent, to));
+                if a != b {
+                    parent[a.max(b)] = a.min(b);
                 }
             }
         }
     }
+    // One head per component: its first point no other cut-off point has an
+    // edge into, from which the walk reaches furthest, else its first point.
+    let mut head_of: std::collections::BTreeMap<usize, usize> = Default::default();
+    for &point in &cut {
+        let component = root(&mut parent, point);
+        let head = head_of.entry(component).or_insert(point);
+        if fed[*head] && !fed[point] {
+            *head = point;
+        }
+    }
+    let heads: Vec<usize> = head_of.into_values().collect();
+    #[cfg(test)]
+    BRIDGE_HEADS.with(|h| h.set(h.get() + heads.len()));
     if heads.is_empty() {
-        return Vec::new();
+        return Ok(Vec::new());
     }
     let mut vectors: Vec<Option<Vec<f32>>> = vec![None; heads.len()];
     let slot: std::collections::HashMap<usize, usize> =
@@ -549,7 +566,10 @@ where
     }
     let distance = D::default();
     let mut nearest: Vec<Vec<(f32, usize)>> = vec![Vec::new(); heads.len()];
-    for point in graph.get_point_indexation() {
+    for (read, point) in graph.get_point_indexation().into_iter().enumerate() {
+        if read % BRIDGE_STOP_STRIDE == 0 {
+            engine.check_walk(scope)?;
+        }
         let from = point.get_origin_id();
         if from >= n || lost[from] {
             continue;
@@ -571,7 +591,16 @@ where
             edges.push((head, from));
         }
     }
-    edges
+    Ok(edges)
+}
+
+/// How many vectors the bridge's pass reads between looks at the node's stop.
+const BRIDGE_STOP_STRIDE: usize = 4_096;
+
+#[cfg(test)]
+thread_local! {
+    /// How many heads the bridges made on this thread have joined.
+    static BRIDGE_HEADS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
 #[cfg(test)]
@@ -2306,6 +2335,48 @@ mod tests {
         assert_eq!(KEYED_FALLBACKS.with(|n| n.get()) - fallbacks, 0, "the retry should answer it");
     }
 
+    /// A first walk that admits a few candidates, fewer than `k`, is retried
+    /// at the width its own admitted share asks for, not at four times the
+    /// first (ADR-241). The filter admits the 3 nearest documents and every
+    /// one from the 1,400th on: a 320-candidate walk sees 3 admitted, four
+    /// times it (1,280) still 3, and the observed share's width
+    /// (2 × 10 × 320 / 3 = 2,134) reaches the rest, so the retry answers and
+    /// the keyed join is not needed.
+    #[test]
+    fn a_retry_is_widened_by_a_nonzero_observed_share() {
+        const COUNT: usize = 5_000;
+        const DIM: usize = 8;
+        let (engine, shadow, _dir) = setup_bulk(COUNT, DIM, 0);
+        let index = HnswIndex::build(&engine, &shadow, Metric::Cosine, DIM).unwrap();
+        let options = SearchOptions { k: 10, metric: Metric::Cosine, per_document: 1 };
+        let query = pseudo_random(90_000, DIM);
+        let ranked: Vec<DocId> = crate::search::vector_search(
+            &engine,
+            &shadow,
+            &query,
+            &SearchOptions { k: COUNT, ..options },
+            None,
+        )
+        .unwrap()
+        .into_iter()
+        .map(|h| h.id)
+        .collect();
+        let mut allowed: HashSet<DocId> = ranked[..3].iter().cloned().collect();
+        allowed.extend(ranked[1_400..].iter().cloned());
+        let walked = index.walk(&engine, &shadow, &query, &options, Some(&allowed), 320).unwrap();
+        assert!((1..10).contains(&walked.admitted), "the precondition: {}", walked.admitted);
+        let (retries, fallbacks) =
+            (FILTERED_RETRIES.with(|n| n.get()), KEYED_FALLBACKS.with(|n| n.get()));
+        let hits = index.search(&engine, &shadow, &query, &options, Some(&allowed)).unwrap();
+        assert_eq!(hits.len(), 10);
+        assert_eq!(FILTERED_RETRIES.with(|n| n.get()) - retries, 1, "one retry");
+        assert_eq!(
+            KEYED_FALLBACKS.with(|n| n.get()) - fallbacks,
+            0,
+            "the retry at the observed share answered"
+        );
+    }
+
     /// A filter that tracks the vectors, admitting most of the collection but
     /// none of the query's neighbourhood, finds no admitted candidate in its
     /// first walk; the retry is widened by what that walk saw (none admitted,
@@ -2806,15 +2877,11 @@ mod tests {
         edges
     }
 
-    /// The linking bridges a component of cut-off points that no search's
-    /// candidates reach (ADR-241). Two tight clusters at opposite ends,
-    /// inserted one after the other with four connections a point and a
-    /// construction effort of 8, leave the second cluster's 40 points out of
-    /// the entry point's reach at layer 0, and every search for one of them
-    /// returns only its own cluster: a linking by candidates alone gives them
-    /// no edge. Judged from the entry point the library dumps, and by search.
-    #[test]
-    fn the_linking_bridges_a_component_no_search_reaches() {
+    /// Two tight clusters of 40 at opposite ends, inserted one after the
+    /// other with four connections a point and a construction effort of 8:
+    /// the second cluster is cut off at layer 0, and every search for one of
+    /// its points returns only its own cluster.
+    fn stranded_clusters() -> (Hnsw<'static, f32, DistCosine>, Vec<Vec<f32>>) {
         const DIM: usize = 8;
         let mut vectors = Vec::new();
         for (base, side) in [(990_001u64, 1.0f32), (991_000, -1.0)] {
@@ -2829,6 +2896,155 @@ mod tests {
         for (i, v) in vectors.iter().enumerate() {
             graph.insert((v.as_slice(), i));
         }
+        (graph, vectors)
+    }
+
+    /// The weakly connected components of the cut-off points of `layer0`,
+    /// each as the set of its points: counted here on their own, to hold the
+    /// bridge to one head per component.
+    fn cut_off_components(layer0: &Layer0) -> Vec<HashSet<usize>> {
+        let cut: HashSet<usize> = layer0.cut_off().into_iter().collect();
+        let mut both: std::collections::HashMap<usize, Vec<usize>> = Default::default();
+        for &from in &cut {
+            for &to in &layer0.edges[from] {
+                if to != from && cut.contains(&to) {
+                    both.entry(from).or_default().push(to);
+                    both.entry(to).or_default().push(from);
+                }
+            }
+        }
+        let mut seen = HashSet::new();
+        let mut components = Vec::new();
+        let mut ordered: Vec<usize> = cut.iter().copied().collect();
+        ordered.sort_unstable();
+        for start in ordered {
+            if !seen.insert(start) {
+                continue;
+            }
+            let mut component = HashSet::from([start]);
+            let mut stack = vec![start];
+            while let Some(at) = stack.pop() {
+                for &to in both.get(&at).into_iter().flatten() {
+                    if seen.insert(to) {
+                        component.insert(to);
+                        stack.push(to);
+                    }
+                }
+            }
+            components.push(component);
+        }
+        components
+    }
+
+    /// The bridge joins one point of each component of cut-off points to its
+    /// two nearest linked points, one edge each way to each (ADR-241): read
+    /// against the toy fixture's stranded cluster, every bridged point is in
+    /// a component of its own, every component has one, and its two in-edges
+    /// leave the two linked points nearest it.
+    #[test]
+    fn a_bridge_joins_one_point_per_component_to_its_two_nearest_linked_points() {
+        let (graph, _) = stranded_clusters();
+        let layer0 = Layer0::read(&graph);
+        let components = cut_off_components(&layer0);
+        let lost: HashSet<usize> = layer0.cut_off().into_iter().collect();
+        let dir = tempfile::tempdir().unwrap();
+        let engine = Engine::open(&dir.path().join("kimmy.redb")).unwrap();
+        let edges = bridges(&graph, &layer0, &engine, kimmy_storage::WalkScope::Request).unwrap();
+        let heads: HashSet<usize> =
+            edges.iter().flat_map(|&(a, b)| [a, b]).filter(|p| lost.contains(p)).collect();
+        assert_eq!(heads.len(), components.len(), "one bridged point per component");
+        for component in &components {
+            assert_eq!(component.intersection(&heads).count(), 1, "{component:?}");
+        }
+        let vector_of = |id: usize| {
+            graph
+                .get_point_indexation()
+                .into_iter()
+                .find(|p| p.get_origin_id() == id)
+                .map(|p| p.get_v().to_vec())
+                .unwrap()
+        };
+        let distance = DistCosine {};
+        for &head in &heads {
+            let into: HashSet<usize> =
+                edges.iter().filter(|&&(_, to)| to == head).map(|&(from, _)| from).collect();
+            let out: HashSet<usize> =
+                edges.iter().filter(|&&(from, _)| from == head).map(|&(_, to)| to).collect();
+            assert_eq!(into.len(), LINK_EDGES, "two linked points into each");
+            assert_eq!(out, into, "and an edge back to each");
+            let mut linked: Vec<(f32, usize)> = (0..graph.get_nb_point())
+                .filter(|p| !lost.contains(p))
+                .map(|p| {
+                    use hnsw_rs::anndists::dist::Distance;
+                    (distance.eval(&vector_of(head), &vector_of(p)), p)
+                })
+                .collect();
+            linked.sort_by(|a, b| a.0.total_cmp(&b.0).then(a.1.cmp(&b.1)));
+            let nearest: HashSet<usize> = linked.iter().take(LINK_EDGES).map(|&(_, p)| p).collect();
+            assert_eq!(into, nearest, "the nearest linked points");
+        }
+        // The stop ends background walks at once; a build's own scope is
+        // looked at the same way.
+        engine.stop_walks();
+        assert!(
+            bridges(&graph, &layer0, &engine, kimmy_storage::WalkScope::Background).is_err(),
+            "the pass stops at the node's stop"
+        );
+    }
+
+    /// The bridge's cost at scale: one pass per round scoring every vector
+    /// against one point per component, not one per point no other cut-off
+    /// point has an edge into (ADR-241). Five tight clusters of 20,000
+    /// vectors of 384 dimensions, inserted in order at four connections and a
+    /// construction effort of 8, strand most of the graph in many components;
+    /// the pass must join one point of each and finish in seconds. Release
+    /// only: `cargo test --release -p kimmy-vector --lib -- --ignored
+    /// the_bridge_joins_one_point_per_component_at_100k`.
+    #[test]
+    #[ignore = "release-only measurement"]
+    fn the_bridge_joins_one_point_per_component_at_100k() {
+        const PER: usize = 20_000;
+        const DIM: usize = 384;
+        let mut vectors = Vec::with_capacity(5 * PER);
+        for cluster in 0..5u64 {
+            let mut centre = pseudo_random(cluster * 1_000_003 + 77, DIM);
+            let norm = centre.iter().map(|x| x * x).sum::<f32>().sqrt();
+            centre.iter_mut().for_each(|x| *x /= norm);
+            for i in 0..PER as u64 {
+                let noise = pseudo_random(cluster * 7_919_000 + i + 13, DIM);
+                vectors
+                    .push(centre.iter().zip(noise).map(|(c, e)| c + 0.05 * e).collect::<Vec<_>>());
+            }
+        }
+        let graph = Hnsw::<f32, DistCosine>::new(4, vectors.len(), MAX_LAYERS, 8, DistCosine {});
+        for (i, v) in vectors.iter().enumerate() {
+            graph.insert((v.as_slice(), i));
+        }
+        let layer0 = Layer0::read(&graph);
+        let components = cut_off_components(&layer0).len();
+        let cut = layer0.cut_off().len();
+        let dir = tempfile::tempdir().unwrap();
+        let engine = Engine::open(&dir.path().join("kimmy.redb")).unwrap();
+        BRIDGE_HEADS.with(|h| h.set(0));
+        let started = std::time::Instant::now();
+        bridges(&graph, &layer0, &engine, kimmy_storage::WalkScope::Request).unwrap();
+        let took = started.elapsed();
+        let heads = BRIDGE_HEADS.with(|h| h.get());
+        println!("BRIDGE {cut} cut off in {components} components: {heads} heads, {took:?}");
+        assert_eq!(heads, components, "one head per component");
+        assert!(took < std::time::Duration::from_secs(120), "the pass took {took:?}");
+    }
+
+    /// The linking bridges a component of cut-off points that no search's
+    /// candidates reach (ADR-241). Two tight clusters at opposite ends,
+    /// inserted one after the other with four connections a point and a
+    /// construction effort of 8, leave the second cluster's 40 points out of
+    /// the entry point's reach at layer 0, and every search for one of them
+    /// returns only its own cluster: a linking by candidates alone gives them
+    /// no edge. Judged from the entry point the library dumps, and by search.
+    #[test]
+    fn the_linking_bridges_a_component_no_search_reaches() {
+        let (graph, vectors) = stranded_clusters();
         let before = Layer0::read(&graph);
         let cut: HashSet<usize> = before.cut_off().into_iter().collect();
         assert_eq!(cut.len(), 40, "the precondition: the second cluster is cut off");
