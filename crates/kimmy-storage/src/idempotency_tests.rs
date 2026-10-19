@@ -826,7 +826,7 @@ fn the_derived_id_is_the_same_on_two_engines() {
 
 // -- Across a drop, and the window ----------------------------------------------------------
 
-/// A record outlives a drop of its collection for its window (ruling A): the
+/// A record outlives a drop of its collection for its window: the
 /// drop's purge leaves it, re-creation is not held up by it, and a retry in the
 /// next life replays the first answer and writes nothing there. Another request
 /// under the key is refused across the drop, as before it.
@@ -2041,9 +2041,9 @@ fn the_clock_resumes_above_the_change_logs_keys_after_a_restart() {
 
 // -- Purge, sweep, rewind, backup --------------------------------------------------------------
 
-/// A drop's purge leaves the collection's records (ruling A): it removes the
-/// documents and index entries, and retention alone removes a record, one
-/// window after its `last`.
+/// A drop's purge leaves the collection's records (they outlive the drop): it
+/// removes the documents and index entries, and retention alone removes a
+/// record, one window after its `last`.
 #[test]
 fn a_drops_purge_leaves_the_collections_records() {
     let (engine, coll, _dir, _path) = open();
@@ -2116,11 +2116,12 @@ fn a_database_drop_leaves_every_collections_records() {
     assert_eq!(count(&engine, &again), 0);
 }
 
-/// A late drop's sweep leaves the records of the life before (ruling A). Here a
-/// peer's drop lands between two of this member's writes, a keyed one before it
-/// and an unkeyed one after: the sweep takes the keyed write's document with
-/// the life before and keeps the later one, and the keyed write's record stays,
-/// so a retry replays and writes nothing to the life the drop re-dated.
+/// A late drop's sweep leaves the records of the life before (they outlive the
+/// drop). Here a peer's drop lands between two of this member's writes, a keyed
+/// one before it and an unkeyed one after: the sweep takes the keyed write's
+/// document with the life before and keeps the later one, and the keyed write's
+/// record stays, so a retry replays and writes nothing to the life the drop
+/// re-dated.
 #[test]
 fn a_late_drops_sweep_leaves_the_records_of_the_life_before() {
     let (engine, coll, _dir, _path) = open();

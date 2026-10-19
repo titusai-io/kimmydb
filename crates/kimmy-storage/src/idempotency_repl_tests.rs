@@ -346,7 +346,7 @@ fn a_record_lands_with_the_run_that_takes_its_entry_when_the_entry_loses() {
     assert_eq!(n_of(&b.engine, &cb, 1), 10, "not applied again");
 }
 
-/// The same when the entry is judged history here (ruling A: a record outlives a
+/// The same when the entry is judged history here (a record outlives a
 /// drop of its collection for its window): B has dropped `orders` and made it
 /// again since A's keyed insert, so A's entry is of a life B has buried, and its
 /// record is stored with the run that takes it as history. A schema change of
@@ -496,8 +496,8 @@ fn a_frames_records_are_stored_whether_or_not_an_entry_of_their_collection_is_ta
     assert_eq!(b.engine.idempotency_records_received()[0], 2, "and are not counted again");
 }
 
-/// A record of a life the receiver has buried is stored all the same (ruling A:
-/// a record outlives a drop for its window), and a retry in the life standing
+/// A record of a life the receiver has buried is stored all the same (a
+/// record outlives a drop for its window), and a retry in the life standing
 /// replays it; one this build cannot decode is dropped and counted while its
 /// entries are applied. Its entry is history here, so the record rides with an
 /// entry judged history.
@@ -901,11 +901,11 @@ fn a_row_below_the_records_first_found_later_does_not_lower_its_carrying_row() {
     assert_eq!(shipped[0].carrying, Some(own), "at its own row, not the lower one");
 }
 
-/// A record rides through a drop and a recreation (ruling A). A and B each
-/// applied the same keyed write before A dropped the collection; A's retry in
-/// the next life replays, and B, taking the drop, the creation and A's record
-/// in one window, keeps its record merged with A's, so a retry there replays
-/// too and nothing is written to the next life on either.
+/// A record rides through a drop and a recreation (it outlives the drop). A and
+/// B each applied the same keyed write before A dropped the collection; A's
+/// retry in the next life replays, and B, taking the drop, the creation and A's
+/// record in one window, keeps its record merged with A's, so a retry there
+/// replays too and nothing is written to the next life on either.
 #[test]
 fn a_record_rides_through_a_drop_and_a_recreation_to_a_member_that_holds_its_own() {
     let (a, b, ca, cb) = pair();
@@ -938,7 +938,7 @@ fn a_record_rides_through_a_drop_and_a_recreation_to_a_member_that_holds_its_own
 /// or past it: the window grants no coverage there and serves them again. Here B's
 /// batch ends at the creation of `shop.other` again, its earlier life's purge still
 /// owed, before the drop of `orders`, its creation again and a keyed write there with
-/// its record. B's record of a write before the drop stays throughout (ruling A).
+/// its record. B's record of a write before the drop stays throughout.
 #[test]
 fn a_batch_that_ends_early_leaves_the_records_past_its_end() {
     let (a, b, ca, cb) = pair();

@@ -283,7 +283,7 @@ async fn a_replay_brings_back_the_records_of_the_keyed_writes_it_restores() {
     }
 }
 
-/// `$inc` of `n`, for G5.
+/// `$inc` of `n`, for the replay below.
 struct IncN;
 
 impl kimmy_storage::ModifySpec for IncN {
@@ -339,7 +339,7 @@ fn pull_all(to: &Engine, from: &Engine) {
     }
 }
 
-/// G5: a member restored from a backup that lacks its own keyed `$inc` and the
+/// A member restored from a backup that lacks its own keyed `$inc` and the
 /// write it made on top, replayed by a peer whose copy of the `$inc` lost there
 /// (C wrote the document in between) and which holds the write on top. C's oplog
 /// has no entry at the `$inc`'s stamp, so the page carries only the write on top;
