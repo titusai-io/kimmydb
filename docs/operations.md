@@ -2997,9 +2997,7 @@ wait`, `Retry-After` of one sync interval, and does not list
 and sends the same request again with the same key, to the same member, is
 answered normally once the block is heard. A member whose held block says it does
 not carry records (an older release) decides over this: the answer is then the
-`400`, which lasts until that member is upgraded. Readiness does not wait for
-the gate: a peer that pauses would otherwise take every member out of the load
-balancer at once.
+`400`, which lasts until that member is upgraded.
 
 **What to watch.** `kimmy_idempotency_requests_total{outcome="gated"}` rising
 after the roll is a member whose switch was not set, or a live member of an

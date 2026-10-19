@@ -188,11 +188,8 @@ where it stopped instead of applying again. What a client must do to rely on it:
   with the same key, to the same member**: that is the keyed retry the rules
   above describe, and it is answered with the first application or its replay.
   Not elsewhere, for the reason a keyed retry stays on its member. It is the
-  `wait` class, so a client acting on the class needs no table entry for it
-  (the client libraries' code lists name `peer_unheard` once they are updated,
-  and read it as an unknown code with `retry: wait` until then); a layer that
-  reads only the status must not treat this `503` as a reason to move to
-  another member. On MCP the same refusal is the tool error whose `data`
+  `wait` class, so a client acting on the class handles it by that class. On
+  MCP the same refusal is the tool error whose `data`
   carries `"error": "peer_unheard"`, `"retry": "wait"` and `retry_after_secs`.
 - **A `400` naming `Idempotency-Key` and the cluster** (the member does not take
   keys now: its `cluster.idempotency_keys` is off, or a live member says it does

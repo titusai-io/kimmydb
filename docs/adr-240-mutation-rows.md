@@ -82,12 +82,12 @@ This is the table [ADR-240](decisions.md#adr-240--idempotency-keys-the-record-is
 | Row | What it plants | Result | Killed by | Notes |
 |---|---|---|---|---|
 | G1 | switch ignored | killed | `the_switch_decides_first_and_is_named` |  |
-| G2 | net removed | killed | `a_peer_that_is_not_live_is_not_asked`, `the_net_refuses_with_an_older_or_unknown_live_peer_and_accepts_without`, `the_predicate_answers_as_the_gate_does_and_reads_it_live` |  |
-| G3 | unheard live peer passes | killed | `the_net_refuses_with_an_older_or_unknown_live_peer_and_accepts_without`, `the_predicate_answers_as_the_gate_does_and_reads_it_live` |  |
+| G2 | net removed | killed | `a_peer_that_is_not_live_is_not_asked`, `the_net_refuses_with_an_older_or_unknown_live_peer_and_accepts_without`, `the_predicate_answers_as_the_gate_does_and_reads_it_live` | to re-point: the gate split moved the net into `facts::idempotency_records_net`, as M's `live-peer-net-removed` now patches it |
+| G3 | unheard live peer passes | killed | `the_net_refuses_with_an_older_or_unknown_live_peer_and_accepts_without`, `the_predicate_answers_as_the_gate_does_and_reads_it_live` | to re-point: the unheard set is now `facts::unheard_peers`, which GS's `gs-unheard-passes` patches |
 | G4 | membership off passes | killed | `without_a_membership_view_the_net_fails_closed` |  |
 | G5 | facts field not advertised | killed | `the_block_says_this_build_carries_idempotency_records` |  |
 | G6 | facts field not lenient | killed | `this_build_reads_idempotency_records_leniently_and_an_older_block_as_not_carrying` |  |
-| G7 | guard does not ask the gate | killed | `an_older_or_unheard_live_peer_refuses_naming_it_until_it_carries_records`, `with_the_switch_off_a_key_is_refused_naming_the_switch` | re-pointed: the gate moved from the route guard into the keyed extractor, after authentication (phase E); the same text as E:A4, run with F's wider suite |
+| G7 | guard does not ask the gate | killed | `an_older_or_unheard_live_peer_refuses_naming_it_until_it_carries_records`, `with_the_switch_off_a_key_is_refused_naming_the_switch` | re-pointed: the gate moved from the route guard into the keyed extractor, after authentication (phase E); the same text as E:A4, run with F's wider suite. The gate split replaced the first test with `an_older_live_peer_refuses_400_naming_it_whoever_else_is_unheard` and `a_live_peer_not_heard_from_is_answered_503_and_the_same_key_is_then_taken` |
 | G8 | MCP argument not gated | killed | `the_argument_is_gated_as_the_header_is` | re-pointed: `tool_key` asks the gate through `refuse_unless_open` |
 | G9 | capability ignores the gate | killed | `idempotency_keys_is_listed_only_while_the_gate_is_open` |  |
 | G10 | clustered default is true | killed | `check_config_prints_the_idempotency_keys_in_effect`, `idempotency_keys_defaults_by_clustering_and_parses` |  |
@@ -341,7 +341,7 @@ This is the table [ADR-240](decisions.md#adr-240--idempotency-keys-the-record-is
 | resume-hlc-without-the-change-log | `resume_hlc` without the change log's high water (its keys are minted stamps) | killed | `the_clock_resumes_above_the_change_logs_keys_after_a_restart` |  |
 | header-guard-not-over-mcp | The header guard lets `/mcp` through | killed | `every_other_route_refuses_the_header_by_name` |  |
 | operator-switch-ungated | `cluster.idempotency_keys` ignored | killed | `with_the_switch_off_a_key_is_refused_naming_the_switch` |  |
-| live-peer-net-removed | The live-peer net never blocks | killed | `c9_a_live_member_that_does_not_carry_records_closes_the_gate` |  |
+| live-peer-net-removed | The live-peer net never blocks | killed | `c9_a_live_member_that_does_not_carry_records_closes_the_gate` | re-pointed by the gate split at `match crate::facts::idempotency_records_net(…)`, and killed there again (GS below) |
 
 **39 rows: 39 killed, 0 equivalent, 0 superseded, 0 run once elsewhere, 0 survived.**
 
