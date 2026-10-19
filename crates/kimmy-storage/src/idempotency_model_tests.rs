@@ -5166,6 +5166,7 @@ struct Sweep {
     rewinds: usize,
     rewinds_alone: usize,
     rewinds_widened: usize,
+    rewinds_skipped: usize,
     rewound_removed: usize,
     rewound_reopened: usize,
     orphaned: usize,
@@ -5238,6 +5239,7 @@ fn sweep_listing(
                         t.rewinds += out.rewinds;
                         t.rewinds_alone += out.rewinds_alone;
                         t.rewinds_widened += out.rewinds_widened;
+                        t.rewinds_skipped += out.rewinds_skipped;
                         t.rewound_removed += out.rewound_removed;
                         t.rewound_reopened += out.rewound_reopened;
                         t.orphaned += out.orphaned;
@@ -5283,8 +5285,8 @@ fn sweep_listing(
          algebra: {} records contested, {} lookups refused, {} requests stopped between chunks; {} snapshot pages \
          refused at the zero records base (m4), {} replay pages of records alone (m1), {} \
          records cursors started over, {} records offered past their window (m2); {} \
-         member rewinds ({} of one member alone, {} widened to every member; {} records \
-         removed, {} reopened), {} records orphaned; {} replay deltas \
+         member rewinds ({} of one member alone, {} widened to every member, {} not taken \
+         on the home track; {} records removed, {} reopened), {} records orphaned; {} replay deltas \
          too large for their page ({} cursors dropped, their position read again), {} replay \
          pages unfit; in {:.1?}",
         totals.schedules,
@@ -5312,6 +5314,7 @@ fn sweep_listing(
         totals.rewinds,
         totals.rewinds_alone,
         totals.rewinds_widened,
+        totals.rewinds_skipped,
         totals.rewound_removed,
         totals.rewound_reopened,
         totals.orphaned,
