@@ -2409,13 +2409,48 @@ dropped indexes, the **servable** version vector, the user store, the node
 id, and the holes a snapshot left ([a member that took a snapshot](#a-member-that-took-a-snapshot-and-what-it-will-not-serve), which are `META` rows).
 
 **Not everything the node holds.** Three tables are deliberately left out
-because each is node-local and re-derived when the database is opened: the
-witnessed vector, the per-origin retention record, and the record of which oplog
+because each is node-local and re-derived: the witnessed vector and the
+per-origin retention record by the first open, and the record of which oplog
 entries this node appended as state rather than as history
-([ADR-160](decisions.md)). The consequence of the last one is worth knowing when
-restoring: **a node restored from a backup taken while a snapshot was running
-begins that snapshot again** rather than resuming it, and until it completes the
-restored node may advertise coverage of snapshot documents it holds as state.
+([ADR-160](decisions.md)) by the restore itself. Every oplog entry above the
+backup's version vector for its origin is one the node held as state (a snapshot
+page's row, a scoped repair's, a digest repair's), and the restore marks each of
+them again ([ADR-244](decisions.md)); the `restored a backup` line says how many
+(`held`). So the restored node claims the backup's version vector and no more,
+and takes the history around those entries again from its peers, by entries or,
+past their horizon, by a snapshot. **A snapshot the node was part-way through
+when the backup was taken is not resumed**: its progress is node-local as well,
+and the pages it had applied are held like any other.
+
+#### A member restored by 0.51 or earlier
+
+A restore by 0.51.x or any earlier release did not mark those entries. The
+restored store's first open, which `kimmyd restore` itself makes, raised both
+version vectors over them and recorded the result as verified, so no later start
+checks it again. Such a member claims each origin up to the newest entry it held
+as state, and its pulls start there: an origin's write below that point which
+the member did not already hold never reaches it by sync. A document written once
+and not touched again is missing for good, and a member that pulls that origin
+from it misses the document too. Upgrading does not lower the vector.
+
+**How to tell**, either of:
+
+- Run `python3 -I scripts/backup-held-rows.py <backup>` on the backup the member
+  was restored from. It reads the file and nothing else. A total above 0 means
+  the restore claimed history it did not take, for the origins it lists; 0 means
+  it did not.
+- On the restored member, the `WARN` `a divergence repair left rows it will not
+  write` for a collection, naming ids it holds nothing for (with
+  `cluster.divergence_repair` on, the default): the digest repair found a
+  document the member lacks, and does not write it because its stamp is older
+  than the restore. A count finding on the same collection (`divergence
+  confirmed; planned a repair from this peer`) plans the count half's replay,
+  which brings a lost insert back while the origin still retains its entry; a
+  lost write the counts do not show is not brought back.
+
+**What to do**: wipe the member's data directory and let it re-sync from its
+peers, or redo the restore with 0.52.0 or later, from the original backup, with
+the command above. The second marks the entries and claims nothing over them.
 
 Restoring an older backup onto a newer build is supported while the format
 version matches; a backup from a *newer* build is refused by name rather than
