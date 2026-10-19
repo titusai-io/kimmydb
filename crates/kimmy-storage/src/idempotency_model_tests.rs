@@ -715,6 +715,13 @@ pub(crate) struct Outcome {
     pub rewinds_widened: usize,
     /// Rewinds not taken: on the home track, widened, they would rewind the home.
     pub rewinds_skipped: usize,
+    /// Member rewinds past a drop the member holds (entries judged across a life a drop
+    /// ended, ADR-248), and refusals by kind: a document with no value at the target this
+    /// member holds (an ended life's version, a replacement, a collected entry), and a
+    /// schema change after the target.
+    pub rewinds_across_a_drop: usize,
+    pub rewind_refused_unrecoverable: usize,
+    pub rewind_refused_schema: usize,
     /// Writes a member rewound alone undid (`Step::RewindAlone`) that came back to it.
     pub undone_returned: usize,
     pub rewound_removed: usize,
@@ -2894,10 +2901,15 @@ impl World {
         for m in 0..n {
             let before = self.stored_records(m)?;
             // Bound first: the engine's handle must be let go before a refusal reopens it.
+            let past_a_drop = self.rewinds_past_a_drop(m, until)?;
             let rewound = self.e(m).rewind_to(until);
             match rewound {
-                Ok(outcome) => befores.push((before, outcome)),
+                Ok(outcome) => {
+                    self.out.rewinds_across_a_drop += usize::from(past_a_drop);
+                    befores.push((before, outcome))
+                }
                 Err(e) => {
+                    self.note_rewind_refusal(&e);
                     self.note(format!(
                         "{} refuses the rewind to t{t} ({e}): no member is rewound",
                         LETTERS[m]
@@ -2925,16 +2937,47 @@ impl World {
     /// Rewind `m` alone; whether it was (a refusal writes nothing).
     fn rewind_to(&mut self, m: usize, until: Hlc, t: u32) -> Res<bool> {
         let before = self.stored_records(m)?;
-        let outcome = match self.e(m).rewind_to(until) {
+        let past_a_drop = self.rewinds_past_a_drop(m, until)?;
+        let rewound = self.e(m).rewind_to(until);
+        let outcome = match rewound {
             Ok(outcome) => outcome,
             Err(e) => {
+                self.note_rewind_refusal(&e);
                 self.note(format!("{} rewind to t{t} refused: {e}", LETTERS[m]));
                 return Ok(false);
             }
         };
+        self.out.rewinds_across_a_drop += usize::from(past_a_drop);
         self.reopen(m, true)?;
         self.pending_rewind = Some((before, outcome));
         Ok(true)
+    }
+
+    /// Whether a rewind of `m` to `until` lies past a drop `m` holds (a collection's drop
+    /// tombstone or incarnation floor at or below the target): one that judges entries
+    /// across a life the drop ended, and puts none of its versions back.
+    fn rewinds_past_a_drop(&self, m: usize, until: Hlc) -> Res<bool> {
+        for c in [ORDERS, ITEMS] {
+            let floor = self.floor(m, c)?;
+            if floor != Hlc::ZERO && floor <= until {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
+    /// Count a rewind's refusal by its kind: a document whose value at the target this
+    /// member does not hold (retention collected it, only a page's state holds it, or its
+    /// entries at or below the target are of a life a drop ended, so a later write that
+    /// replaces it has nothing to go back to), or a schema change after the target (a
+    /// drop, including one known only as a page's state).
+    fn note_rewind_refusal(&mut self, e: &StorageError) {
+        let text = e.to_string();
+        if text.contains("changed after the target") {
+            self.out.rewind_refused_unrecoverable += 1;
+        } else if text.contains("schema change") {
+            self.out.rewind_refused_schema += 1;
+        }
     }
 
     /// The checks of a rewind `rewind_to` made.
@@ -5059,6 +5102,10 @@ impl Gen {
     ///   thirds in; in half of them its first peer is restored between the replay's first
     ///   two pages (a cursor of another epoch), and in a third of them the cursor's delta
     ///   takes a hundred bytes (a changed record too large for it).
+    /// - **A rewind across a dropped life** (a fifth of the `Anywhere` seeds): a document
+    ///   written and taken, its collection dropped and created again, the document replaced
+    ///   by a member that never heard of the drop, and a rewind to between the creation and
+    ///   the replacement, which the member that created it refuses (ADR-248).
     /// - **A rewind of a shared write** (a quarter of the `Anywhere` seeds): a keyed write
     ///   on a member, a peer's pull of it, and a rewind of the member to just before it,
     ///   which the documented procedure widens to every member.
@@ -5116,6 +5163,31 @@ impl Gen {
                 Op { step: Step::Send { r, m, crash: None, inner: Vec::new() }, t: t + 1 },
                 Op { step: Step::Pull { to: peer, from: m }, t: 0 },
                 Op { step: Step::Rewind { m }, t },
+            ];
+            ops.splice(at..at, block);
+        }
+        if self.track == Track::Anywhere && self.n >= 3 && self.rng.chance(20) && len > 8 {
+            // A rewind across a dropped life whose replacement it cannot undo (ADR-248):
+            // P writes a document of `items` and R takes it; P drops `items` and Q takes the
+            // drop and creates `items` again; R, which never heard of the drop, replaces the
+            // document, and Q takes that; Q rewinds to between its creation and R's write,
+            // which the procedure widens to every member, and Q refuses: the document's
+            // only value at the target is of the life the drop ended.
+            let at = len / 3 + self.rng.below(len as u64 / 3) as usize;
+            let p = self.rng.below(self.n as u64) as u8;
+            let q = (p + 1) % self.n;
+            let r = (p + 2) % self.n;
+            let d = self.rng.below(3) as u16;
+            let t = time_at(ops, at);
+            let block = [
+                Op { step: Step::Touch { m: p, c: ITEMS, d }, t: t + 1 },
+                Op { step: Step::Pull { to: r, from: p }, t: 0 },
+                Op { step: Step::Drop { m: p, c: ITEMS }, t: t + 2 },
+                Op { step: Step::Pull { to: q, from: p }, t: 0 },
+                Op { step: Step::Create { m: q, c: ITEMS }, t: t + 3 },
+                Op { step: Step::Touch { m: r, c: ITEMS, d }, t: t + 6 },
+                Op { step: Step::Pull { to: q, from: r }, t: 0 },
+                Op { step: Step::Rewind { m: q }, t: t + 4 },
             ];
             ops.splice(at..at, block);
         }
@@ -5220,6 +5292,9 @@ struct Sweep {
     rewinds_alone: usize,
     rewinds_widened: usize,
     rewinds_skipped: usize,
+    rewinds_across_a_drop: usize,
+    rewind_refused_unrecoverable: usize,
+    rewind_refused_schema: usize,
     rewound_removed: usize,
     rewound_reopened: usize,
     orphaned: usize,
@@ -5293,6 +5368,9 @@ fn sweep_listing(
                         t.rewinds_alone += out.rewinds_alone;
                         t.rewinds_widened += out.rewinds_widened;
                         t.rewinds_skipped += out.rewinds_skipped;
+                        t.rewinds_across_a_drop += out.rewinds_across_a_drop;
+                        t.rewind_refused_unrecoverable += out.rewind_refused_unrecoverable;
+                        t.rewind_refused_schema += out.rewind_refused_schema;
                         t.rewound_removed += out.rewound_removed;
                         t.rewound_reopened += out.rewound_reopened;
                         t.orphaned += out.orphaned;
@@ -5339,7 +5417,8 @@ fn sweep_listing(
          refused at the zero records base (m4), {} replay pages of records alone (m1), {} \
          records cursors started over, {} records offered past their window (m2); {} \
          member rewinds ({} of one member alone, {} widened to every member, {} not taken \
-         on the home track; {} records removed, {} reopened), {} records orphaned; {} replay deltas \
+         on the home track; {} past a drop; refused: {} with no value at the target, {} \
+         past a schema change; {} records removed, {} reopened), {} records orphaned; {} replay deltas \
          too large for their page ({} cursors dropped, their position read again), {} replay \
          pages unfit; in {:.1?}",
         totals.schedules,
@@ -5368,6 +5447,9 @@ fn sweep_listing(
         totals.rewinds_alone,
         totals.rewinds_widened,
         totals.rewinds_skipped,
+        totals.rewinds_across_a_drop,
+        totals.rewind_refused_unrecoverable,
+        totals.rewind_refused_schema,
         totals.rewound_removed,
         totals.rewound_reopened,
         totals.orphaned,
@@ -5434,6 +5516,14 @@ fn assert_coverage(totals: &Sweep, seeds: u64) {
         ("records offered past their window (m2)", totals.past_window_offered),
         ("rewinds of one member, no peer holding a write it undoes", totals.rewinds_alone),
         ("rewinds widened to every member", totals.rewinds_widened),
+        (
+            "member rewinds past a drop (a dropped life judged, ADR-248)",
+            totals.rewinds_across_a_drop,
+        ),
+        (
+            "rewinds refused for a value not held at the target (a replacement, an ended life)",
+            totals.rewind_refused_unrecoverable,
+        ),
         ("records orphaned", totals.orphaned),
     ];
     let short: Vec<String> =
