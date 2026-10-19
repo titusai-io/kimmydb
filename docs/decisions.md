@@ -28979,7 +28979,10 @@ with it, and not be offered while any member could carry the write without it.
    attempt's stamp its `first` and the later one's its `last`) it reopens as `applying`, its rows kept: a filter's
    resumes from the beginning under the stamp rule, and an insert, a replace, a delete by id or a `find_and_modify`
    replays its first answer, since an attempt's effect stands at or below the target. Left behind, a removed
-   record's rows would be read as F3 candidates by every frame until retention collected them. A backup carries
+   record's rows would be read as F3 candidates by every frame until retention collected them. A rewound member
+   that rejoins a cluster still holding the writes it undid is outside the documented procedure (operations,
+   "Point-in-time restore"): after such a rejoin, a keyed request's record need not come back with its undone write,
+   so a retry may apply it again. A backup carries
    `idempotency` and `idempotency_by_stamp` as tags 12 and 13, so a restored member keeps the records of the writes it
    holds, those it took by snapshot included: without them a retry there would apply on top of a write the backup
    brought back. **The rows travel only beside a record**: a store that holds no record writes neither tag, so its

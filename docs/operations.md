@@ -2460,7 +2460,9 @@ passed**, so a refusal leaves the file exactly as the restore wrote it.
 
 > ⚠️ **A rewound database must not rejoin a cluster that still holds the undone
 > writes.** Anti-entropy would put them straight back. Run it standalone, or
-> rewind every node.
+> rewind every node. After such a rejoin, a keyed request's idempotency record
+> need not come back with its undone write, so a retry of that request may apply
+> it again.
 
 A rewind that discarded nothing (the command reports `0 oplog entries
 discarded`) undid no writes, so this rule does not apply to it: the member
