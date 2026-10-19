@@ -28566,3 +28566,115 @@ delete leaving no chunk in either format, the rescan moving or re-embedding, one
 0.50 write and a twin delete judged again when the roll ends). `kimmy-cluster`: the roll read from the facts blocks,
 and the field's lenient decode. `kimmy-api`: V2, V3 (both join directions, with debris) and V5 inverted. Mutation rows
 in bash, one per clause.
+
+---
+
+## ADR-241 — The HNSW graph is built by `hnsw_rs` 0.3.5 and linked at layer 0, a snapshot's dump is checked before the library reads it, and a filtered walk widens with its filter
+
+> **Amends [ADR-103](#adr-103--hnsw-graphs-are-built-off-the-lock-and-live-under-a-budget)** (how a graph is built and
+> retried) **and [ADR-102](#adr-102--vector-search-filters-use-the-planner-and-the-exact-and-lexical-paths-hold-only-the-top-k)**
+> (how a filtered search over the graph joins its admitted set). No `kimmy.format` schema, codec, record, wire field,
+> configuration key or snapshot format changes; a snapshot's `meta.json` gains one field, `graph`, which 0.51 ignores.
+> Not a rollback boundary.
+
+**The case.** `hnsw_rs` 0.3.4, the library the graph was built with, stored the reverse edge it adds for a new point at
+the new point's top layer instead of the layer the edge was found on, so a point drawn above layer 0 could be left with
+no edge into it at layer 0, and no search returns such a point at any `k`. Measured with every point checked: 0.75% to
+3% of a 400 × 16 collection, 0.8% to 2.1% of 1,000 × 384 (one draw in twelve 34.6%, 800 points outside the entry
+point's component), 4.4% to 5.2% of 10,000 × 384; on data of low intrinsic dimension (24 dimensions projected into 384,
+plus noise, nearer what an embedding model writes) 1.6% to 2.4% at every size. Two tests flaked on it, about one run in
+sixteen and one in a hundred. 0.3.5 stores the edge at the right layer, and still leaves points with no edge into them,
+by another route: an insertion pushes the new point into each neighbour's list and pops the farthest entry when the list
+is over its cap, and a point every neighbour holds closer points for is popped by all of them (0.1% of the
+low-dimensional data at 10,000 to 100,000 vectors; 1.5% to 8% of uniformly random 384-dimensional vectors). 0.3.5 also
+seeds every graph's level generator with the constant 397, with no way to seed it otherwise, so the same records
+inserted in the same order build the same graph and a retry rebuilt the graph it was retrying; and its loader ends the
+process (`std::process::exit(1)`) on a format-2 dump, as both versions do on any vector they cannot read. Separately, a
+filtered search that walks the graph (a filter admitting more than 1,000 documents) asked the walk for a fixed 320
+candidates and discarded the ones the filter refused: at 1% of 100,000 documents admitted it returned about four hits of
+ten.
+
+**Decision.**
+
+1. **The library is `hnsw_rs` 0.3.5, vendored with one added function** (`vendor/hnsw_rs`, through `[patch.crates-io]`).
+   The source diff from 0.3.4 was read whole: the reverse-edge fix, the seeded generator, the format-2 exit, a corrected
+   (capacity-only) layer-size estimate, `bincode` removed and `rand` 0.9 → 0.10. No new `unsafe`, no `build.rs`, no I/O or
+   network beyond the dump and load it already did; the one new process exit is the format-2 read. `Cargo.lock` loses
+   `bincode` and moves the library's `rand` to the 0.10.3 the workspace already carried, with the same features. The
+   vendored tree is the published `.crate` (sha256 `c9b4dcb9…af9f`) in one commit and `kimmydb.patch` in the next, and
+   `scripts/check-vendored-hnsw.sh`, a CI step, holds it to the published crate plus the patch, byte for byte. The patch
+   adds `Hnsw::add_layer0_edges`, which adds layer-0 edges past a list's cap without displacing any; the library has no
+   other way to add an edge.
+2. **A build links every point its insertion cut off** (`link_cut_off`). After the inserts it reads layer 0's structure:
+   every point with no edge into it, and every point outside the entry point's component (the first point inserted at
+   the top level). Each gets edges from its two nearest linked points, found by a search of 16 at an effort of 100, the
+   least-loaded candidates first so that copies of one vector do not hang every edge on one point; rounds repeat until
+   none is left, at most four, and every measured build needed one. Measured after linking: no point cut off in any
+   build; none lost in any graph up to 1,000 vectors of either kind; 0.02% of the low-dimensional data hard to find at
+   100,000 (found at four times the effort but for two); the uniform data keeps reachable points a search at the build
+   check's effort misses (0.9% to 1.1% at 10,000, 10.8% at 100,000), which is recall, not loss. The linking costs under a
+   second at 100,000 low-dimensional vectors and 18 s at 100,000 uniform ones.
+3. **Each build attempt inserts in its own order** (`insertion_order`): a Fisher–Yates shuffle of the walk's order (chunk
+   keys in key order) driven by SplitMix64 seeded with the attempt number, the first attempt included. A collection's
+   graph is a function of its records and the attempt, reproducible on every member and across restarts, and different
+   per attempt, which is the only way left to vary the draw. Shuffling the first attempt too keeps the key order, which
+   can track the vectors, out of the build. **A build is retried only when its linking leaves a point cut off**, which no
+   measured build has: an `ERROR`, then the next attempt's order, at most `MAX_BUILD_ATTEMPTS` (2) times. The sampled
+   check (`REACHABILITY_SAMPLE` 128, `REACHABILITY_CONFIRM_EF` 800, `REACHABILITY_CONFIRM_K` 32) stays, as a `WARN` at
+   `REACHABILITY_MAX_UNREACHABLE` (8) naming the collection, the score and the sample, with no retry: every point is
+   linked, so what a probe misses is a point a search of that effort does not find, and another order does not make a
+   collection easier to search. The linked graphs score 0 on the low-dimensional data at every size, 1 to 3 on the
+   uniform data at 10,000, and 13 on it at 100,000, where a retry tripled the build for nothing.
+4. **A snapshot's dump is checked before the library reads it** (`kimmy_vector::dump::check`). `catch_unwind` contains the
+   loader's panics and nothing else: it ends the process on format 2 and on any vector it cannot read (a data file cut
+   short), aborts it when an allocation of a size the file declares fails, reads past a buffer whose declared length is
+   shorter than the dimension, and panics on a dozen asserts, `unwrap`s and indexes. The check reads both files the way
+   the loader does, allocates nothing the file declares, and refuses every one of those, and anything that is not the dump
+   this build writes: format 4 of the library's description, full mode, sixteen layers, the expected point count, width,
+   connection count, distance and element type, every point once, every neighbour in range, no NaN distance, finite
+   vectors, nothing after the end. Refused is a rebuild, as every unusable snapshot already was. The audit is a test that
+   hands 36 spoiled dumps to the raw loader in child processes and prints what each does (two exit, three abort, the rest
+   panic, return an error, or load).
+5. **A snapshot says what built its graph, and is synced.** `meta.json` gains `graph`: 2 for a graph this build made (1 is
+   never written; no release built 0.3.5 graphs unlinked). One without it, which 0.51 and earlier wrote, is adopted as
+   behind whatever its counts say: it serves the search that loaded it, and the next search of the collection rebuilds it.
+   A field rather than a format bump, because the dump's layout did not change: 0.51 ignores a field it does not know, so
+   it loads and serves 0.52's graphs (proved with main's build against hnsw_rs 0.3.4, lists past the cap included), and it
+   writes `meta.json` from its own fields, so a graph it rebuilds and saves loses the mark exactly. `save` fsyncs the three
+   files and the staging directory before the rename that publishes them, and the parent directory after it.
+6. **A filtered walk widens with its filter.** The first walk asks for `clamp(⌈2 · k · chunks / admitted⌉, w, max(8,000,
+   w))` candidates, `w` the unadapted filtered width (320 at `k` 10), at the usual effort of four times the width; a walk
+   that comes back with fewer than `min(k, admitted × per_document)` hits is retried once at four times the width, up to
+   the cap; a second short walk gives way to the keyed join, which is exact. `SELECTIVE_JOIN_MAX` stays 1,000: the keyed
+   join costs about 44 µs per admitted document at 384 dimensions whatever the collection's size, and above about 1,000
+   the widened walk is cheaper. Measured at 100,000 × 384 on the low-dimensional data: recall 1.000 against the exact
+   filtered answer at 1%, 2%, 3%, 5% and 10% admitted, never short, the graph answering every search, at 33, 18, 14, 10
+   and 9 ms. A search reaches the cap only when the filter admits at most one document in 400, so the keyed join it gives
+   way to reads at most 2,500 documents per million.
+
+**Rollback.** None added. A 0.51 member loads 0.52's snapshots, ignoring the `graph` field, and rebuilds nothing; a graph
+it rebuilds and saves is unmarked, and a member rolled forward again serves it once and rebuilds it. What 0.51 serves is
+its own: its filtered walk is fixed-width again, and a dump it cannot read can end its process as before.
+
+**Alternatives rejected.** Staying on 0.3.4 with a patch of our own: the edge bug is upstream's and fixed there. Forking
+0.3.5 to seed the generator: the order does the same with no change to the library. `set_keeping_pruned(true)`: measured,
+it loses three to twenty times as many points (1,831 of 100,000 low-dimensional vectors against 117 unlinked). Re-inserting
+cut-off points under fresh ids, which needs no patch: it displaces other points' edges (at 100,000 uniform vectors 32,801
+re-insertions in eight rounds left 3,448 cut off), and needs several graph ids per key. A git fork of the library instead
+of the vendored copy: a source the deny policy would have to allow, fetched at every release build. A snapshot format bump
+to 4: a rollback to 0.51 would then rebuild every graph, inside a search. Relying on `catch_unwind`: it cannot contain an
+exit or an abort. Raising `SELECTIVE_JOIN_MAX` or scaling it with the collection: the keyed join's cost grows with the
+admitted set, not the collection, and loses to the widened walk past about 1,000. Parallel insertion: unchanged, for the
+reasons beside the insert loop.
+
+**Tests.** `kimmy-vector`: every vector reachable in eight builds at 400 × 16, by search and by layer-0 structure (red on
+0.3.4 on essentially every run); at 1,000 × 384 in release, three draws with nothing lost and nothing cut off; a build
+links every point its insertion cut off (300 copies of one vector, 203 cut off before; a 96-dimensional fixture); an
+attempt builds one graph and each retry another; a build left cut off (the linking skipped) is retried in each attempt's
+order and returns the last; a high sampled score with nothing cut off is not retried; the two graph tests that flaked hold the walk first, so a red names recall; the dump check against 36 spoilings
+and three shapes; a snapshot of each process-ending kind refused, rebuilt and survived, each case in a child process whose
+raw-library twin must exit or abort as the case says; a 0.51 snapshot served once and rebuilt; what built a loaded graph
+read from its snapshot; a filtered search returning `k` at 1%, 2% and 3% admitted with no fallback, a forced fallback
+equal to the keyed join, and the same rows at 100,000 documents in release. The reachability distribution measurement
+counts every point, the points cut off and the points found at four times the effort, on either fixture
+(`KIMMY_REACH_LATENT`), and the library audit is re-runnable on a library upgrade.
