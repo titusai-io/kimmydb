@@ -477,7 +477,8 @@ pub(crate) struct Bias {
     pub frame: usize,
     /// Every member's room for a snapshot page's rows, in bytes
     /// (`Engine::set_snapshot_room_for_test`), so a collection of a few documents spans
-    /// pages; `None` for the real one.
+    /// pages, for the schedule's first step alone (the m4 pull): later documents grow
+    /// past any small room as their key sets do; `None` for the real one.
     pub page_room: Option<usize>,
     /// The bytes of a replay page's records delta under a cursor ([`REPLAY_DELTA_BYTES`]).
     pub delta_bytes: usize,
@@ -1137,6 +1138,9 @@ struct World {
     retry_catching_up: bool,
     /// The model's frame for a replay page ([`REPLAY_FRAME`]; a row sets its own).
     replay_frame: usize,
+    /// The page room every member opens with ([`Bias::page_room`], until the first step
+    /// ends).
+    page_room: Option<usize>,
     step: String,
 }
 
@@ -1155,6 +1159,7 @@ impl World {
             })
             .collect();
         let sched_frame = sched.bias.frame;
+        let sched_room = sched.bias.page_room;
         let mut world = World {
             sched,
             members,
@@ -1179,6 +1184,7 @@ impl World {
             down: vec![false; count],
             retry_catching_up: false,
             replay_frame: sched_frame,
+            page_room: sched_room,
             backups: HashMap::new(),
             step: "setup".into(),
         };
@@ -1202,7 +1208,7 @@ impl World {
         e.set_multi_chunk_docs(CHUNK);
         e.set_idempotency_window(WINDOW_SECS);
         e.set_idempotency_clock_for_test(self.now);
-        e.set_snapshot_room_for_test(self.sched.bias.page_room);
+        e.set_snapshot_room_for_test(self.page_room);
     }
 
     fn label(&self, node: NodeId) -> String {
@@ -4275,6 +4281,14 @@ fn run_framed(
         if let Err(e) = out {
             world.borrow_mut().fail(Inv::Error, e);
         }
+        // The small page room is the first step's alone (the m4 pull).
+        if i == 0 && world.borrow().page_room.is_some() {
+            let mut w = world.borrow_mut();
+            w.page_room = None;
+            for m in 0..w.n() {
+                w.e(m).set_snapshot_room_for_test(None);
+            }
+        }
     }
     if world.borrow().out.failures.is_empty() {
         let mut w = world.borrow_mut();
@@ -4851,9 +4865,9 @@ impl Gen {
         let mut bias = Bias::default();
         let len = ops.len();
         if self.rng.chance(33) {
-            // Room for a document with the cursor that names it (P2 counts both at the
-            // size they cross in), and for a few counters a page.
-            bias.page_room = Some(self.rng.pick(&[2000, 2600]));
+            // Room for a fresh counter with the cursor that names it (P2 counts both at
+            // the size they cross in), one or two of them a page: `orders` spans pages.
+            bias.page_room = Some(self.rng.pick(&[700, 1100]));
             let (to, from) = self.pair();
             let r = self.requests.len() as u8;
             self.requests.push(Request { key: r + 1, kind: Kind::Insert { id: None } });
