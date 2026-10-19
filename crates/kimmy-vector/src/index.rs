@@ -435,8 +435,8 @@ where
 {
     let mut added = 0;
     for _ in 0..LINK_ROUNDS {
-        // A search's build, which the drain's deadline ends, as the inserts.
-        engine.check_walk(kimmy_storage::WalkScope::Request)?;
+        // A builder's work, which the node's stop ends, as the inserts.
+        engine.check_walk(kimmy_storage::WalkScope::Background)?;
         let layer0 = Layer0::read(graph);
         let cut = layer0.cut_off();
         if cut.is_empty() {
@@ -479,7 +479,7 @@ where
         let mut linked = graph.add_layer0_edges(&edges);
         if stranded {
             let bridged =
-                bridges(graph, &Layer0::read(graph), engine, kimmy_storage::WalkScope::Request)?;
+                bridges(graph, &Layer0::read(graph), engine, kimmy_storage::WalkScope::Background)?;
             linked += graph.add_layer0_edges(&bridged);
         }
         if linked == 0 {
@@ -572,6 +572,12 @@ where
     let mut nearest: Vec<Vec<(f32, usize)>> = vec![Vec::new(); heads.len()];
     for (read, point) in graph.get_point_indexation().into_iter().enumerate() {
         if read % BRIDGE_STOP_STRIDE == 0 {
+            #[cfg(test)]
+            BRIDGE_PASS_HOOK.with(|hook| {
+                if let Some(hook) = hook.borrow().as_ref() {
+                    hook();
+                }
+            });
             engine.check_walk(scope)?;
         }
         let from = point.get_origin_id();
@@ -605,6 +611,10 @@ const BRIDGE_STOP_STRIDE: usize = 4_096;
 thread_local! {
     /// How many heads the bridges made on this thread have joined.
     static BRIDGE_HEADS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    /// Called on this thread at each of the bridge pass's looks at the stop,
+    /// just before it looks.
+    static BRIDGE_PASS_HOOK: std::cell::RefCell<Option<Box<dyn Fn()>>> =
+        const { std::cell::RefCell::new(None) };
 }
 
 #[cfg(test)]
@@ -676,6 +686,9 @@ pub struct HnswIndex {
     /// [`SnapshotMeta::graph`]: [`GRAPH_BUILD`] for a graph this build made,
     /// what the snapshot said for one it loaded.
     built_by: u32,
+    /// The build check's sampled score ([`Reachability::unreachable`]); 0 for
+    /// a graph loaded from a snapshot, which was not sampled here.
+    unreached: usize,
 }
 
 impl HnswIndex {
@@ -733,7 +746,8 @@ impl HnswIndex {
     ) -> Result<Self> {
         let mut attempt = 0;
         loop {
-            let (index, reach) = Self::build_once(engine, shadow, metric, dim, attempt)?;
+            let (mut index, reach) = Self::build_once(engine, shadow, metric, dim, attempt)?;
+            index.unreached = reach.unreachable;
             if reach.cut_off == 0 || attempt == MAX_BUILD_ATTEMPTS {
                 if reach.cut_off > 0 {
                     // Never fail: a graph still answers, and refusing to build
@@ -823,7 +837,9 @@ impl HnswIndex {
         // graph read as behind, never as fresh.
         let renames = engine.vector_renames(shadow.id)?;
         let mut records: Vec<(String, Vec<f32>)> = Vec::new();
-        engine.for_each_vector(shadow, kimmy_storage::WalkScope::Request, |id, record| {
+        // A builder's walk, off every request (ADR-241), which the node's
+        // stop ends.
+        engine.for_each_vector(shadow, kimmy_storage::WalkScope::Background, |id, record| {
             // A wrong width belongs to a different model and would corrupt
             // every distance the graph computes.
             if record.vector.len() == dim
@@ -897,8 +913,8 @@ impl HnswIndex {
         // build's peak is one copy plus the graph's bookkeeping, not two.
         let mut keys = Vec::with_capacity(n);
         for (key, vector) in records {
-            // A build is for a search, which the drain's deadline ends.
-            engine.check_walk(kimmy_storage::WalkScope::Request)?;
+            // A builder's work, which the node's stop ends.
+            engine.check_walk(kimmy_storage::WalkScope::Background)?;
             let id = keys.len();
             match &graph {
                 Graph::Cosine(g) => g.insert((vector.as_slice(), id)),
@@ -940,6 +956,7 @@ impl HnswIndex {
             bytes,
             renames,
             built_by: GRAPH_BUILD,
+            unreached: 0,
         };
 
         // Ask the sampled vectors to find themselves. A few dozen searches
@@ -1016,6 +1033,12 @@ impl HnswIndex {
     /// ([`Engine::vector_renames`]).
     pub(crate) fn renames(&self) -> u64 {
         self.renames
+    }
+
+    /// The build check's sampled score for this graph; 0 for one loaded from
+    /// a snapshot.
+    pub fn unreached(&self) -> usize {
+        self.unreached
     }
 
     /// Whether this build's library and linking made the graph
@@ -1176,6 +1199,7 @@ impl HnswIndex {
             bytes,
             renames: meta.renames,
             built_by: meta.graph,
+            unreached: 0,
         })
     }
 
@@ -2429,6 +2453,48 @@ mod tests {
         );
     }
 
+    /// The exact scan a search of a collection whose graph is being built
+    /// is answered by stops at a passed deadline, having read no more than
+    /// the rows between two looks at it rather than the whole collection, and
+    /// answers exactly without one (ADR-245).
+    #[test]
+    fn an_exact_scan_stops_at_its_deadline() {
+        const COUNT: usize = 2_000;
+        const DIM: usize = 8;
+        let (engine, shadow, _dir) = setup_bulk(COUNT, DIM, 0);
+        let options = SearchOptions { k: 10, metric: Metric::Cosine, per_document: 1 };
+        let query = pseudo_random(90_000, DIM);
+        let passed = std::time::Instant::now();
+        crate::search::SCAN_ROWS.with(|n| n.set(0));
+        assert!(matches!(
+            crate::search::vector_search_until(
+                &engine,
+                &shadow,
+                &query,
+                &options,
+                None,
+                Some(passed)
+            ),
+            Err(VectorError::DeadlineExceeded)
+        ));
+        let read = crate::search::SCAN_ROWS.with(|n| n.get());
+        assert!(read <= 256, "{read} of {COUNT} rows read past a passed deadline");
+        let later = std::time::Instant::now() + std::time::Duration::from_secs(600);
+        let ids = |hits: Vec<Hit>| hits.into_iter().map(|h| h.id).collect::<Vec<_>>();
+        assert_eq!(
+            ids(crate::search::vector_search_until(
+                &engine,
+                &shadow,
+                &query,
+                &options,
+                None,
+                Some(later)
+            )
+            .unwrap()),
+            ids(crate::search::vector_search(&engine, &shadow, &query, &options, None).unwrap())
+        );
+    }
+
     /// The keyed join a filtered search gives way to stops at the request's
     /// deadline with [`VectorError::DeadlineExceeded`]: its cost is the
     /// admitted set, and a filter that tracks the vectors reaches it at any
@@ -2993,6 +3059,44 @@ mod tests {
         assert!(
             bridges(&graph, &layer0, &engine, kimmy_storage::WalkScope::Background).is_err(),
             "the pass stops at the node's stop"
+        );
+    }
+
+    /// A stop that lands during the bridge's pass, on a builder's thread,
+    /// ends the build at the pass's next look at it (ADR-245): a builder's
+    /// walks are background walks, which the stop ends at once, and a build
+    /// that ends this way saves nothing.
+    #[test]
+    fn a_stop_during_the_bridge_pass_ends_the_build() {
+        let (graph, _) = stranded_clusters();
+        let dir = tempfile::tempdir().unwrap();
+        let engine = std::sync::Arc::new(Engine::open(&dir.path().join("kimmy.redb")).unwrap());
+        let (parked, in_the_pass) = std::sync::mpsc::channel();
+        let (go, released) = std::sync::mpsc::channel::<()>();
+        let builder = std::thread::spawn({
+            let engine = std::sync::Arc::clone(&engine);
+            move || {
+                BRIDGE_PASS_HOOK.with(|hook| {
+                    *hook.borrow_mut() = Some(Box::new(move || {
+                        let _ = parked.send(());
+                        let _ = released.recv();
+                    }));
+                });
+                let ended = link_cut_off(&graph, &engine).is_err();
+                (ended, Layer0::read(&graph).cut_off().len())
+            }
+        });
+        in_the_pass.recv_timeout(std::time::Duration::from_secs(10)).expect("the pass began");
+        engine.stop_walks();
+        let stopped = std::time::Instant::now();
+        go.send(()).unwrap();
+        let (ended, cut) = builder.join().unwrap();
+        assert!(ended, "the build ended at the stop");
+        assert_eq!(cut, 40, "the pass bridged nothing once the stop had begun");
+        assert!(
+            stopped.elapsed() < std::time::Duration::from_millis(500),
+            "the build ran on {:?} past the stop",
+            stopped.elapsed()
         );
     }
 

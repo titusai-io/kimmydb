@@ -10550,6 +10550,9 @@ async fn the_metrics_body_exposes_exactly_these_series_in_exactly_this_order() {
         "kimmy_oplog_verified_logical_bytes",
         "kimmy_oplog_verified_walk_seconds",
         "kimmy_vector_index_cache_bytes",
+        "kimmy_vector_graphs_stale",
+        "kimmy_vector_graph_builds_pending",
+        "kimmy_vector_graph_unreached_sample",
         "kimmy_process_resident_bytes",
         "kimmy_process_resident_peak_bytes",
         "kimmy_up",
@@ -13848,6 +13851,9 @@ fn fill_and_build(
         .collect();
     engine.put_vectors(shadow, &source, &records).unwrap();
 
+    // The first access queues the build on a builder thread (ADR-245).
+    let _ = server.state.vectors.access(engine, shadow, kimmy_core::Metric::Cosine, 3);
+    server.state.vectors.settle();
     let access = server.state.vectors.access(engine, shadow, kimmy_core::Metric::Cosine, 3);
     assert!(
         matches!(access, kimmy_vector::Access::Approximate(_)),
@@ -13855,6 +13861,148 @@ fn fill_and_build(
     );
     assert!(snapshot_of(server, shadow.id).is_dir(), "the build should have been persisted");
     shadow.id
+}
+
+/// A collection `shop.docs` of one document with 500 chunks, enough for a
+/// graph, and nothing built: each chunk at `[1, chunk / 100, 0]`, so chunk 0
+/// is the nearest to `[1, 0, 0]`.
+async fn a_collection_worth_a_graph(server: &Server, token: &str) -> kimmy_storage::CollectionMeta {
+    configure_vectors(server, token, "shop", "docs").await;
+    let res = server
+        .post("/v1/db/shop/coll/docs/docs", Some(token), json!({ "_id": 1, "text": "t" }))
+        .await;
+    assert_eq!(res.status, 200, "{:?}", res.body);
+    let engine = &server.state.engine;
+    let shadow = engine.vector_collection("shop", "docs").unwrap().unwrap();
+    let source = kimmy_core::DocId::Int64(1);
+    let records: Vec<kimmy_core::VectorRecord> = (0..500u32)
+        .map(|chunk| kimmy_core::VectorRecord {
+            source: source.clone(),
+            chunk,
+            source_hlc: kimmy_core::Hlc::new(1, 0),
+            vector: vec![1.0, chunk as f32 / 100.0, 0.0],
+            text: "t".into(),
+            config: None,
+        })
+        .collect();
+    engine.put_vectors(&shadow, &source, &records).unwrap();
+    shadow
+}
+
+/// The first search of a collection big enough for a graph is answered at
+/// once, by scoring every stored vector, while the graph is built behind it
+/// on a builder thread (ADR-245); the search after the build lands is served
+/// by the graph, with the same nearest chunk.
+#[tokio::test]
+async fn the_first_search_is_answered_by_a_scan_and_the_graph_is_built_behind_it() {
+    let server = Server::start().await;
+    let token = server.root().await;
+    a_collection_worth_a_graph(&server, &token).await;
+    let search = || {
+        server.post(
+            "/v1/db/shop/coll/docs/vector_search",
+            Some(&token),
+            json!({ "vector": [1.0, 0.0, 0.0], "k": 1 }),
+        )
+    };
+
+    assert_eq!(server.state.vectors.len(), 0, "the premise: no graph");
+    let scanned = search().await;
+    assert_eq!(scanned.status, 200, "{:?}", scanned.body);
+    assert_eq!(scanned.body["matches"][0]["chunk"], 0, "{:?}", scanned.body);
+    server.state.vectors.settle();
+    assert_eq!(server.state.vectors.len(), 1, "the graph the first search asked for");
+    let walked = search().await;
+    assert_eq!(walked.status, 200, "{:?}", walked.body);
+    assert_eq!(walked.body["matches"][0]["chunk"], 0, "{:?}", walked.body);
+}
+
+/// A search of a collection whose graph is being built waits for a turn at
+/// an exact scan only until its request's deadline, and then answers as a
+/// request that ran out of time does (ADR-245). Both turns are held past the
+/// deadline, and given back after three seconds.
+#[tokio::test]
+async fn a_search_with_no_turn_at_a_scan_by_its_deadline_answers_503_timeout() {
+    let server = Server::start_with_limits(kimmy_api::RequestLimits {
+        request_timeout: std::time::Duration::from_millis(300),
+        ..kimmy_api::RequestLimits::default()
+    })
+    .await;
+    let token = server.root().await;
+    let shadow = a_collection_worth_a_graph(&server, &token).await;
+    let turns = [
+        server.state.vectors.exact_scan_turn(shadow.id, None).await.unwrap(),
+        server.state.vectors.exact_scan_turn(shadow.id, None).await.unwrap(),
+    ];
+    let holder = tokio::spawn(async move {
+        tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+        drop(turns);
+    });
+
+    let started = std::time::Instant::now();
+    let res = server
+        .post(
+            "/v1/db/shop/coll/docs/vector_search",
+            Some(&token),
+            json!({ "vector": [1.0, 0.0, 0.0], "k": 1 }),
+        )
+        .await;
+    assert_eq!(res.status, 503, "{:?}", res.body);
+    assert_eq!(res.body["error"], "timeout", "{:?}", res.body);
+    assert!(
+        started.elapsed() < std::time::Duration::from_secs(2),
+        "answered at its deadline, not when a turn came back: {:?}",
+        started.elapsed()
+    );
+    holder.await.unwrap();
+}
+
+/// Searches waiting for a turn at an exact scan hold no thread: on a runtime
+/// of two workers, with both of a collection's turns taken and eight searches
+/// of it waiting, other requests are answered at once (ADR-245).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn searches_waiting_for_a_scan_turn_hold_no_thread() {
+    let server = Server::start_with_limits(kimmy_api::RequestLimits {
+        request_timeout: std::time::Duration::from_secs(3),
+        ..kimmy_api::RequestLimits::default()
+    })
+    .await;
+    let token = server.root().await;
+    let shadow = a_collection_worth_a_graph(&server, &token).await;
+    let turns = [
+        server.state.vectors.exact_scan_turn(shadow.id, None).await.unwrap(),
+        server.state.vectors.exact_scan_turn(shadow.id, None).await.unwrap(),
+    ];
+    let waiting: Vec<_> = (0..8)
+        .map(|_| {
+            let (base, token) = (server.base.clone(), token.clone());
+            tokio::spawn(async move {
+                Client
+                    .request(
+                        "POST",
+                        &format!("{base}/v1/db/shop/coll/docs/vector_search"),
+                        Some(&token),
+                        Some(json!({ "vector": [1.0, 0.0, 0.0], "k": 1 })),
+                    )
+                    .await
+            })
+        })
+        .collect();
+    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+    for path in ["/readyz", "/v1/db/shop/coll/docs/docs/1"] {
+        let started = std::time::Instant::now();
+        let res = server.get(path, Some(&token)).await;
+        assert_eq!(res.status, 200, "{path}: {:?}", res.body);
+        assert!(
+            started.elapsed() < std::time::Duration::from_millis(500),
+            "{path} waited {:?} behind the searches waiting for a turn",
+            started.elapsed()
+        );
+    }
+    drop(turns);
+    for search in waiting {
+        assert_eq!(search.await.unwrap().status, 200, "a turn given back is taken");
+    }
 }
 
 #[tokio::test]
@@ -13923,6 +14071,8 @@ async fn dropping_a_database_takes_an_orphan_shadow_and_its_vector_index_with_it
         })
         .collect();
     engine.put_vectors(&orphan, &source, &records).unwrap();
+    let _ = server.state.vectors.access(engine, &orphan, kimmy_core::Metric::Cosine, 3);
+    server.state.vectors.settle();
     let access = server.state.vectors.access(engine, &orphan, kimmy_core::Metric::Cosine, 3);
     assert!(matches!(access, kimmy_vector::Access::Approximate(_)), "a graph over the orphan");
     assert!(snapshot_of(&server, orphan.id).is_dir());
@@ -14207,6 +14357,7 @@ async fn a_replicated_reconfiguration_forgets_the_index_on_the_member_that_appli
         )
         .await;
     assert_eq!(res.status, 200, "{:?}", res.body);
+    applier.state.vectors.settle();
     assert_eq!(applier.state.vectors.len(), 1, "the search should have built a graph");
     let engine = &applier.state.engine;
     let shadow_meta = engine.vector_collection("shop", "docs").unwrap().unwrap();
@@ -14288,6 +14439,7 @@ async fn a_re_delivered_reconfiguration_leaves_the_rebuilt_graph_alone() {
         )
         .await;
     assert_eq!(res.status, 200, "{:?}", res.body);
+    applier.state.vectors.settle();
     assert_eq!(applier.state.vectors.len(), 2, "the search should have rebuilt the graph");
     let engine = &applier.state.engine;
     let shadow_meta = engine.vector_collection("shop", "docs").unwrap().unwrap();

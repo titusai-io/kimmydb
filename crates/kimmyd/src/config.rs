@@ -236,11 +236,24 @@ pub struct IndexCacheConfig {
     /// `Σ chunks × per-chunk bytes`. Zero lifts the bound, which is the
     /// behaviour before it existed (ADR-103).
     pub max_bytes: u64,
+    /// How many HNSW graphs are built at once, on the node's builder threads.
+    ///
+    /// Every build and save runs off the request path (ADR-245): a search of
+    /// a collection whose graph is being built is answered by the graph it
+    /// had, or by an exact scan. A build is CPU and memory bound — a 100,000
+    /// × 384 graph peaks at about 1.3 GiB with its records — and the first
+    /// start of 0.52.0 asks for every collection's at once, so they queue.
+    /// 1 by default; raise it on a host with cores and memory to spare.
+    /// At least 1.
+    pub build_concurrency: usize,
 }
 
 impl Default for IndexCacheConfig {
     fn default() -> Self {
-        Self { max_bytes: kimmy_vector::DEFAULT_INDEX_CACHE_BYTES }
+        Self {
+            max_bytes: kimmy_vector::DEFAULT_INDEX_CACHE_BYTES,
+            build_concurrency: kimmy_vector::DEFAULT_BUILD_CONCURRENCY,
+        }
     }
 }
 
@@ -1623,6 +1636,12 @@ impl Config {
                  rebuild one on every search"
             );
         }
+        if self.vector.index_cache.build_concurrency == 0 {
+            anyhow::bail!(
+                "vector.index_cache.build_concurrency must be at least 1: with no builder, no \
+                 graph would ever be built and every search would scan"
+            );
+        }
         if self.storage.oplog_retention_secs == 0 {
             anyhow::bail!("storage.oplog_retention_secs must be greater than zero");
         }
@@ -2358,6 +2377,22 @@ mod tests {
         let parsed: Config = toml::from_str("[vector.index_cache]\nmax_bytes = 0\n").unwrap();
         assert_eq!(parsed.vector.index_cache.max_bytes, 0);
         assert!(parsed.vector.worker_enabled, "a sibling table must not disturb the defaults");
+    }
+
+    #[test]
+    fn graph_builds_run_one_at_a_time_unless_told_otherwise_and_never_none() {
+        let mut cfg = valid();
+        assert_eq!(cfg.vector.index_cache.build_concurrency, 1);
+        assert_eq!(kimmy_vector::DEFAULT_BUILD_CONCURRENCY, 1);
+        cfg.vector.index_cache.build_concurrency = 0;
+        let err = cfg.validate().unwrap_err().to_string();
+        assert!(err.contains("vector.index_cache.build_concurrency"), "{err}");
+        cfg.vector.index_cache.build_concurrency = 4;
+        cfg.validate().unwrap();
+        let parsed: Config =
+            toml::from_str("[vector.index_cache]\nbuild_concurrency = 3\n").unwrap();
+        assert_eq!(parsed.vector.index_cache.build_concurrency, 3);
+        assert_eq!(parsed.vector.index_cache.max_bytes, kimmy_vector::DEFAULT_INDEX_CACHE_BYTES);
     }
 
     #[test]
