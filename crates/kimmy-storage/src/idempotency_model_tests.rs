@@ -153,6 +153,16 @@
 //! violation and D3 the stamp rule's contract; KR is refused by the `contested` flag, and
 //! the rows `row_d2_*`, `row_d3_*` and `row_kr_*` hold the engine to it.
 //!
+//! **Finding RW1** (2026-10-18, open, outside B5's code): a rewind after a retention
+//! pass leaves the cluster diverged for good. `Engine::rewind_to` replaces both version
+//! vectors with the oplog's greatest stamp per origin, and retention has removed entries
+//! the vectors covered, the member's own among them: its claim on its own origin falls
+//! below its own collected writes (a drop, in the minimised schedule), so no peer is ever
+//! behind it there, none is refused as `Collected`, and none takes the snapshot that would
+//! carry them. `row_rw1_*` reproduces it and is ignored until it is fixed; the generated
+//! schedules take rewinds (and fail on it now and then), and `IDEM_NO_REWIND=1` leaves them
+//! out for a diagnostic run.
+//!
 //! **Reproducers**, both run (not ignored) and pass since their fixes landed:
 //! `finding_g1_*` (G1 as first reported: its pull serves the window without the sender's
 //! verdict, which production refuses as `StateHeld`; kept as the mechanism's minimal
@@ -674,6 +684,11 @@ fn trace() -> bool {
 /// landed; `IDEM_LENIENT=1` counts it instead, for a tree without that fix.
 fn strict() -> bool {
     !std::env::var("IDEM_LENIENT").is_ok_and(|v| v == "1")
+}
+
+/// `IDEM_NO_REWIND=1`: generated schedules take no rewind (a diagnostic run only).
+fn no_rewind() -> bool {
+    std::env::var("IDEM_NO_REWIND").is_ok_and(|v| v == "1")
 }
 
 /// Whether S1 fails a generated run as well: `IDEM_STRICT=1`. Counted by default, since
@@ -4460,7 +4475,10 @@ pub(crate) fn generate(seed: u64, track: Track, len: usize) -> Schedule {
                 // A rewind to a moment a little back: what it discards comes back from
                 // the peers that hold it. Not the home on the home track, as a restore.
                 let m = plan.member();
-                if track == Track::Home && m == plan.home {
+                // `IDEM_NO_REWIND=1`: a restart instead, for a diagnostic run past finding
+                // RW1 (a rewind after a retention pass lowers the member's version vector
+                // below what retention collected; see the module docs). Never a gate.
+                if (track == Track::Home && m == plan.home) || no_rewind() {
                     Op { step: Step::Restart { m }, t: 0 }
                 } else {
                     let back = plan.rng.below(60) as i64;
@@ -4665,7 +4683,7 @@ fn generated_schedules_long() {
 }
 
 /// One seed, for a failure's report: `IDEM_SEED`, `IDEM_TRACK` (`home` or anything
-/// else for anywhere).
+/// else for anywhere), and `IDEM_DROP`, steps to leave out.
 #[test]
 #[ignore = "one seed of the model, printed: IDEM_SEED and IDEM_TRACK"]
 fn one_seed() {
@@ -4674,7 +4692,18 @@ fn one_seed() {
         Ok("home") => Track::Home,
         _ => Track::Anywhere,
     };
-    let sched = generate(seed, track, LEN);
+    let mut sched = generate(seed, track, LEN);
+    // `IDEM_DROP=3,17`: the schedule without those steps, to minimise a failure.
+    if let Ok(drop) = std::env::var("IDEM_DROP") {
+        let gone: HashSet<usize> = drop.split(',').filter_map(|i| i.trim().parse().ok()).collect();
+        sched.ops = sched
+            .ops
+            .into_iter()
+            .enumerate()
+            .filter(|(i, _)| !gone.contains(i))
+            .map(|(_, op)| op)
+            .collect();
+    }
     let out = run(&sched);
     eprintln!("{}", render(Some(seed), &sched, &out));
     assert!(out.failures.is_empty());
@@ -5595,6 +5624,30 @@ fn row_d3_a_resume_after_a_drop_leaves_what_is_at_or_above_its_merged_first() {
             ask(0, C, 170),
         ],
         |out| out.left_by_first == 3,
+    );
+}
+
+/// Finding RW1, minimised from the long run's seed 1000688: B drops `items`; B's
+/// retention pass collects its own drop entry; B rewinds to a moment after it (nothing
+/// discarded), and its version vectors are rebuilt from the oplog, below the drop. A,
+/// which never heard of the drop, inserts into `items`; at quiescence A and C hold the
+/// documents and B holds no `items`: no peer is behind B where the drop is, so none takes
+/// it. Ignored until the rewind keeps what retention collected in its vectors.
+#[test]
+#[ignore = "finding RW1: a rewind after retention lowers the version vector below collected writes"]
+fn row_rw1_a_rewind_after_retention_keeps_the_members_collected_writes() {
+    row(
+        "rw1",
+        3,
+        vec![req(5, Kind::Bulk)],
+        vec![
+            Op { step: Step::Drop { m: B, c: ITEMS }, t: 170 },
+            touch(C, ORDERS, 0, 190),
+            pull(B, C),
+            retention(B, 1730),
+            rewind(B, 1757),
+            ask(0, A, 1800),
+        ],
     );
 }
 
