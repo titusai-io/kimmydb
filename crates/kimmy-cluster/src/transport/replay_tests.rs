@@ -2798,3 +2798,128 @@ async fn a_pull_takes_a_find_and_modifys_record_ahead_of_its_entry_in_one_contac
     assert!(matches!(retry, kimmy_storage::Keyed::Replayed(_)), "{retry:?}");
     assert_eq!(n_of(&m, 1), 1, "applied once");
 }
+
+/// Whether `message` is an answer of records ahead of an entry: no entries, not
+/// the tail, no partial end, and records.
+fn is_records_ahead(message: &Message) -> bool {
+    matches!(
+        message,
+        Message::Entries { entries, exhausted: false, passed_through: None, records, .. }
+            if entries.is_empty() && !records.is_empty()
+    )
+}
+
+/// One pull of `s` by `m` through a relay that ends the contact as soon as an
+/// answer of records ahead has reached `m`, as a sender stopped between that
+/// answer and the next would. Returns the pull's outcome and whether the relay
+/// cut it there.
+async fn pull_round_cut_after_records_ahead(
+    m: &Engine,
+    s: &Engine,
+) -> (Result<SyncOutcome, ProtocolError>, bool) {
+    let (mut ours, relay_m) = tokio::io::duplex(MAX_FRAME);
+    let (relay_s, far) = tokio::io::duplex(MAX_FRAME);
+    let serving = async {
+        let _ = serve_peer(s, far, SECRET, BINDING, None, ServeBudgets::serving(), None).await;
+    };
+    let cut = std::sync::atomic::AtomicBool::new(false);
+    let relay = async {
+        let (mut m_read, mut m_write) = tokio::io::split(relay_m);
+        let (mut s_read, mut s_write) = tokio::io::split(relay_s);
+        let up = async {
+            while let Ok(frame) = read_frame(&mut m_read).await {
+                if write_frame(&mut s_write, &frame).await.is_err() {
+                    break;
+                }
+            }
+        };
+        let down = async {
+            while let Ok(frame) = read_frame(&mut s_read).await {
+                let ahead = is_records_ahead(&frame);
+                if write_frame(&mut m_write, &frame).await.is_err() || ahead {
+                    cut.store(ahead, std::sync::atomic::Ordering::SeqCst);
+                    break;
+                }
+            }
+        };
+        tokio::select! {
+            () = up => {}
+            () = down => {}
+        }
+    };
+    let mut stalls = PeerStalls::new();
+    let asking = async {
+        open_handshake(m, &mut ours, SECRET, BINDING).await.unwrap();
+        let outcome = sync_over(m, &mut ours, addr(), s.node_id(), None, &mut stalls).await;
+        drop(ours);
+        outcome
+    };
+    let ((), (), outcome) = tokio::join!(serving, relay, asking);
+    (outcome, cut.load(std::sync::atomic::Ordering::SeqCst))
+}
+
+/// Records sent ahead of their entry grant nothing, and a contact cut between
+/// them and the entry costs one more round, never a loop. S holds a keyed
+/// `find_and_modify` whose entry and record each hold a document of about 5 KiB,
+/// under an 8 KiB frame. M's first contact ends as soon as the records ahead have
+/// reached it: M stored the record and nothing else (no vector, coverage or held
+/// mark moved, no document written). Its next contact is sent the records ahead
+/// once more, asks again, and takes the entry.
+#[tokio::test]
+async fn records_sent_ahead_grant_nothing_and_a_cut_contact_sends_them_again_then_the_entry() {
+    let s_dir = tempfile::tempdir().unwrap();
+    let s = Engine::open(&s_dir.path().join("kimmy.redb")).unwrap();
+    let orders = s.create_collection("shop", "orders").unwrap();
+    s.insert(&orders, bson::doc! { "_id": 1i64, "n": 0i64, "pad": "x".repeat(5_000) }).unwrap();
+    let m_dir = tempfile::tempdir().unwrap();
+    let m = Engine::open(&m_dir.path().join("kimmy.redb")).unwrap();
+    pull_all(&m, &s);
+    let k = lost_key(9);
+    let kimmy_storage::Keyed::Fresh(_) = s
+        .find_and_modify_keyed(
+            &orders,
+            &kimmy_storage::Candidates::Scan,
+            &IncN,
+            &k,
+            kimmy_storage::ReturnedImage::After,
+        )
+        .unwrap()
+    else {
+        panic!("a fresh key")
+    };
+    let _budget = EntryBudget::set(8 * 1024);
+    let morders = m.get_collection("shop", "orders").unwrap();
+    let witnessed = m.witnessed_vector().unwrap();
+    let servable = m.version_vector().unwrap();
+    let held = m.held_ranges_covered_by(&witnessed).unwrap();
+    assert!(m.idempotency_record(morders.id, &k.scope).unwrap().is_none(), "premise");
+
+    let (first, cut) = pull_round_cut_after_records_ahead(&m, &s).await;
+    assert!(cut, "premise: the contact was cut right after the records ahead");
+    assert!(first.is_err(), "the contact ended there: {first:?}");
+    assert!(m.idempotency_record(morders.id, &k.scope).unwrap().is_some(), "the record is stored");
+    assert_eq!(m.witnessed_vector().unwrap(), witnessed, "nothing covered");
+    assert_eq!(m.version_vector().unwrap(), servable, "nothing taken");
+    assert_eq!(m.held_ranges_covered_by(&witnessed).unwrap(), held, "no held mark moved");
+    assert_eq!(n_of(&m, 1), 0, "the entry not taken");
+
+    let seen = Seen::default();
+    let log = Arc::clone(&seen.0);
+    let recording = tracing::subscriber::set_default(seen);
+    tracing::callsite::rebuild_interest_cache();
+    pull_round(&m, &s).await.expect("the next contact takes the records again, then the entry");
+    drop(recording);
+    assert_eq!(said(&log, tracing::Level::INFO, "they go ahead of it, alone"), 1, "once, no loop");
+    assert_eq!(n_of(&m, 1), 1, "the entry crossed");
+    let retry = m
+        .find_and_modify_keyed(
+            &morders,
+            &kimmy_storage::Candidates::Scan,
+            &IncN,
+            &k,
+            kimmy_storage::ReturnedImage::After,
+        )
+        .unwrap();
+    assert!(matches!(retry, kimmy_storage::Keyed::Replayed(_)), "{retry:?}");
+    assert_eq!(n_of(&m, 1), 1, "applied once");
+}
