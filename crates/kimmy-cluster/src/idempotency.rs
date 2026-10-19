@@ -379,7 +379,7 @@ mod tests {
         members.insert_for_test(addr(2), node(2));
         let view = members.view();
         let since = view.unheard_since[&node(2)];
-        let within = since + view.lease;
+        let within = since + view.unheard_lease;
         assert!(matches!(gate.check_at(within), Err(IdempotencyClosed::Unheard { .. })));
         let after = within + Duration::from_millis(1);
         let closed = gate.check_at(after).unwrap_err();

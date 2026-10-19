@@ -15832,7 +15832,10 @@ async fn the_live_peer_net_holds_back_a_decimal_id_and_bound_until_every_peer_ca
         assert!(message.contains("transient"), "{path}: {message}");
     }
     // Past the lease the unheard peer is one that cannot: the lasting 400.
-    members.backdate_unheard_for_test(unheard, members.lease() + std::time::Duration::from_secs(1));
+    members.backdate_unheard_for_test(
+        unheard,
+        members.unheard_lease() + std::time::Duration::from_secs(1),
+    );
     for (path, body) in &creations {
         let res = server.post(path, Some(&token), body.clone()).await;
         assert_eq!(res.status, 400, "{path}: past its lease: {:?}", res.body);

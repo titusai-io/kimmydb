@@ -383,7 +383,7 @@ This is the table [ADR-240](decisions.md#adr-240--idempotency-keys-the-record-is
 
 ## The gate split (GS)
 
-18 rows, the `gate-split` group of `scripts/idempotency-mutants/mutants.py`, with M's `live-peer-net-removed` re-pointed at the net's new call, on a `git archive 977072f1` export of `idempotency-gw` with its own target directory and a 1,500 s timeout per suite: the two gates' split of a live member not heard from yet (`503 peer_unheard`, `Retry-After` of one sync interval, for at most the unheard-peer lease) from one that does not say it has the capability (`400`: its block says no or does not decode, or no block within the lease). Each row names the tests that must fail, and counts as killed only when every one of them ran and failed in its log; every suite passed on the unmutated export first, with every named test run.
+21 rows, the `gate-split` group of `scripts/idempotency-mutants/mutants.py`, with M's `live-peer-net-removed` re-pointed at the net's new call, on a `git archive 1d3612b0` export of `idempotency-gw` with its own target directory and a 1,500 s timeout per suite: the two gates' split of a live member not heard from yet (`503 peer_unheard`, `Retry-After` of one sync interval, for at most the unheard lease, which is floored at the time SWIM takes to declare a silent peer down plus one sync interval) from one that does not say it has the capability (`400`: its block says no or does not decode, or no block within the lease). Each row names the tests that must fail, and counts as killed only when every one of them ran and failed in its log; every suite passed on the unmutated export first, with every named test run.
 
 | Row | What it plants | Result | Killed by | Notes |
 |---|---|---|---|---|
@@ -405,9 +405,12 @@ This is the table [ADR-240](decisions.md#adr-240--idempotency-keys-the-record-is
 | gs-undecodable-counted-as-unheard | A block that does not decode counts as no block: `503` within the lease | killed | `a_peer_whose_block_does_not_decode_refuses_at_once`, `a_peer_not_heard_from_refuses_after_its_lease_and_an_undecodable_one_at_once`, `a_peer_unheard_past_its_lease_or_whose_block_does_not_decode_is_400` |  |
 | gs-rename-keeps-the-clock | A SWIM rename leaves the peer's unheard clock where it was | killed | `a_rename_or_a_rejoin_starts_the_unheard_clock_again` |  |
 | gs-rejoin-keeps-the-clock | This member's rejoin leaves every peer's unheard clock where it was | killed | `a_rename_or_a_rejoin_starts_the_unheard_clock_again` |  |
+| gs-unheard-lease-without-floor | The unheard lease is the lease alone, without SWIM's floor | killed | `the_unheard_lease_is_floored_at_the_time_swim_takes_to_declare_a_peer_down`, `a_frozen_peer_is_declared_down_before_its_unheard_lease_runs_out` | the real-process test: a frozen peer is answered `400` while live |
+| gs-floor-without-detection | The floor is the suspect-to-down time alone, without the probe periods SWIM takes to suspect | killed | `the_unheard_lease_is_floored_at_the_time_swim_takes_to_declare_a_peer_down`, `a_frozen_peer_is_declared_down_before_its_unheard_lease_runs_out` | the real-process test: `400` at 5.8 s, the peer declared down at about 6.8 s |
+| gs-floor-not-configured | The running membership never gives the member set foca's timers | killed | `a_frozen_peer_is_declared_down_before_its_unheard_lease_runs_out` |  |
 | live-peer-net-removed (re-pointed) | The live-peer net never blocks | killed | `c9_a_live_member_that_does_not_carry_records_closes_the_gate` | M's row; counted there |
 
-**18 rows: 17 killed, 1 equivalent, 0 superseded, 0 survived.**
+**21 rows: 20 killed, 1 equivalent, 0 superseded, 0 survived.**
 
 ## Totals
 
@@ -422,7 +425,7 @@ This is the table [ADR-240](decisions.md#adr-240--idempotency-keys-the-record-is
 | The page records delta (P) | 20 | 20 | 0 | 0 | 0 | 0 |
 | The model's mutants (M) | 39 | 39 | 0 | 0 | 0 | 0 |
 | The build review's fixes (Y) | 27 | 27 | 0 | 0 | 0 | 0 |
-| The gate split (GS) | 18 | 17 | 1 | 0 | 0 | 0 |
-| **All** | **310** | **294** | **5** | **3** | **8** | **0** |
+| The gate split (GS) | 21 | 20 | 1 | 0 | 0 | 0 |
+| **All** | **313** | **297** | **5** | **3** | **8** | **0** |
 
 Of the 250 rows killed before the build review, 238 were killed by their piece's own suites (3 of them by a hang, with the tests that failed before it), 4 by the wider suites and 8 by the five tests added on `idempotency-h`: `a_resume_logs_at_info_and_a_replay_below_it`, `a_resume_whose_short_last_chunk_writes_nothing_marks_the_record_done` and `a_record_stays_when_a_row_between_its_first_and_last_expires` in `idempotency_tests.rs`, `a_record_lands_with_the_run_that_takes_its_entry_when_the_entry_loses` and `a_record_whose_entry_is_not_in_the_frame_rides_with_a_later_entry` in `idempotency_repl_tests.rs`. The five equivalent rows are B3 and M13 of S, O5 of F, G11 of G and `gs-wait-may-be-zero` of GS.

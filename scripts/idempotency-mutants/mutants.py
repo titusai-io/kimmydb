@@ -38,6 +38,8 @@ DECIMAL_LEASE_UNIT = ("kimmy-cluster", "--lib", "decimal128::tests::a_peer_not_h
 UNDECODABLE_UNIT = ("kimmy-cluster", "--lib", "idempotency::tests::a_peer_whose_block_does_not_decode_refuses_at_once", "no")
 CLOCK_UNIT = ("kimmy-cluster", "--lib", "facts::tests::a_rename_or_a_rejoin_starts_the_unheard_clock_again", "no")
 API_LEASE = ("kimmy-api", "--test idempotency", "a_peer_unheard_past_its_lease_or_whose_block_does_not_decode_is_400", "no")
+FLOOR_UNIT = ("kimmy-cluster", "--lib", "facts::tests::the_unheard_lease_is_floored_at_the_time_swim_takes_to_declare_a_peer_down", "no")
+FROZEN_CLUSTER = ("kimmyd", "--test cluster", "a_frozen_peer_is_declared_down_before_its_unheard_lease_runs_out", "yes")
 
 GATE_SPLIT = [
     {
@@ -235,7 +237,7 @@ GATE_SPLIT = [
         "doc": "A peer not heard from is never past its lease: the gate answers 503 for as long as it stays unheard",
         "patches": [
             ("crates/kimmy-cluster/src/membership.rs",
-             "            .is_some_and(|since| now.saturating_duration_since(*since) > self.lease)\n",
+             "            .is_some_and(|since| now.saturating_duration_since(*since) > self.unheard_lease)\n",
              "            .is_some_and(|since| {\n"
              "                let _ = (since, now);\n"
              "                false\n"
@@ -307,6 +309,46 @@ GATE_SPLIT = [
         ],
         "suites": [CLOCK_UNIT],
         "kills": ["facts::tests::a_rename_or_a_rejoin_starts_the_unheard_clock_again"],
+    },
+    {
+        "name": "gs-unheard-lease-without-floor",
+        "group": "gate-split",
+        "doc": "The unheard lease is the lease alone, without SWIM's floor",
+        "patches": [
+            ("crates/kimmy-cluster/src/membership.rs",
+             "        self.lease().max(floor)\n",
+             "        let _ = floor;\n"
+             "        self.lease()\n"),
+        ],
+        "suites": [FLOOR_UNIT, FROZEN_CLUSTER],
+        "kills": ["facts::tests::the_unheard_lease_is_floored_at_the_time_swim_takes_to_declare_a_peer_down",
+                  "a_frozen_peer_is_declared_down_before_its_unheard_lease_runs_out"],
+    },
+    {
+        "name": "gs-floor-without-detection",
+        "group": "gate-split",
+        "doc": "The floor is SWIM's suspect-to-down time alone, without the probe periods it takes to suspect",
+        "patches": [
+            ("crates/kimmy-cluster/src/membership.rs",
+             "        timers.suspect_to_down_after + timers.probe_period * (2 * peers)\n",
+             "        let _ = (timers.probe_period, peers);\n"
+             "        timers.suspect_to_down_after\n"),
+        ],
+        "suites": [FLOOR_UNIT, FROZEN_CLUSTER],
+        "kills": ["facts::tests::the_unheard_lease_is_floored_at_the_time_swim_takes_to_declare_a_peer_down",
+                  "a_frozen_peer_is_declared_down_before_its_unheard_lease_runs_out"],
+    },
+    {
+        "name": "gs-floor-not-configured",
+        "group": "gate-split",
+        "doc": "The running membership never gives the member set foca's timers: no floor",
+        "patches": [
+            ("crates/kimmy-cluster/src/membership.rs",
+             "    members.configure_swim(&config);\n",
+             "    let _ = &config;\n"),
+        ],
+        "suites": [FROZEN_CLUSTER],
+        "kills": ["a_frozen_peer_is_declared_down_before_its_unheard_lease_runs_out"],
     },
 ]
 
@@ -870,8 +912,12 @@ FIXES = [
      "            self.witness(&record.last);\n            if record.fingerprint != keyed.fingerprint {\n"),
     ("past-window-record-stored", "A receiver stores a record past its window (m2), merged into a new request's",
      "crates/kimmy-storage/src/idempotency.rs",
-     "        if self.record_is_past_window(record) {\n            return Ok((None, false));\n        }\n",
+     "        if self.record_is_past_window(record)\n            && !live.is_some_and(|live| live.fingerprint == record.fingerprint)\n        {\n            return Ok((None, false));\n        }\n",
      ""),
+    ("past-window-same-request-refused", "A record past its window of the live record's own request is refused, not merged (m2 before G narrowed it)",
+     "crates/kimmy-storage/src/idempotency.rs",
+     "        if self.record_is_past_window(record)\n            && !live.is_some_and(|live| live.fingerprint == record.fingerprint)\n        {\n",
+     "        if self.record_is_past_window(record) {\n"),
     ("zero-base-guard-off", "A page asked with the zero records base is applied though its sender's log began since (m4, guard ii)",
      "crates/kimmy-storage/src/snapshot.rs",
      "    (zero && page.records_epoch.is_some()).then(|| SnapshotCursor {\n",
@@ -900,10 +946,18 @@ FIXES = [
      "crates/kimmy-storage/src/idempotency.rs",
      "        if let Some(from) = from {\n            remove_rows_naming(txn, from, &named)?;\n        }\n",
      "        let _ = (from, &named);\n"),
-    ("rewind-reopens-a-bulk", "A rewind reopens a cut bulk insert's record as it reopens a filter's (Y's m3)",
+    ("rewind-reopens-a-bulk", "A rewind reopens a cut bulk insert's record as it reopens every other kind's (Y's m3)",
      "crates/kimmy-storage/src/idempotency.rs",
-     "            if record.first.hlc > until || (cut && !resumes) {\n",
+     "            if record.first.hlc > until || (cut && bulk) {\n",
      "            if record.first.hlc > until {\n"),
+    ("rewind-removes-every-cut-kind", "A rewind removes a cut record of every kind but a filter's (the rule before G narrowed it to a bulk)",
+     "crates/kimmy-storage/src/idempotency.rs",
+     "            if record.first.hlc > until || (cut && bulk) {\n",
+     "            if record.first.hlc > until || (cut && !matches!(record.outcome, RecordOutcome::Modify(_))) {\n"),
+    ("delete-judged-by-its-own-stamp", "A keyed delete by id is judged by its outcome's stamp, not the record's first (before G)",
+     "crates/kimmy-storage/src/docs.rs",
+     "        let first = record.first;\n        let key = doc_key(id)?;\n",
+     "        let first = match &record.outcome {\n            RecordOutcome::Delete { stamp: Some(s), .. } => *s,\n            _ => record.first,\n        };\n        let key = doc_key(id)?;\n"),
     ("rewind-keeps-the-cursor", "A rewind reopens a filter's record with its cursor (a resume skips what it undid)",
      "crates/kimmy-storage/src/idempotency.rs",
      "                    m.cursor = None;\n",
