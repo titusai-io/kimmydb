@@ -5149,7 +5149,7 @@ mod tests {
     fn a_rewind_discards_marks_with_the_entries_and_does_not_raise_over_the_rest() {
         // Rewind is the only remover of oplog rows outside retention, and the
         // marks it strands could never be collected. Its lowering of the vectors
-        // (`lower_vectors_to_target`, ADR-243) never raises, so it cannot claim
+        // (`lower_vectors_in`, ADR-243) never raises, so it cannot claim
         // a held entry either: the next test holds it to that.
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("kimmy.redb");

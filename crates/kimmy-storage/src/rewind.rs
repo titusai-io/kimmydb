@@ -218,6 +218,10 @@ impl Engine {
         // The newest tombstone stamp this rewind mints, for the record: no oplog
         // entry and no vector names it, and a start resumes the clock past it.
         let mut minted: Option<Stamp> = None;
+        // The lowest stamp among the entries the rewind restores: the vectors are
+        // bounded by it as well (`Engine::lower_vectors_in`).
+        let mut restored_floor: Option<Hlc> = None;
+        let schema = Engine::schema_for_record(self.db())?;
         let txn = self.begin_write(WriterHolder::Rewind)?;
         {
             // Index maintenance needs each collection's index definitions,
@@ -231,6 +235,12 @@ impl Engine {
             let mut docs = txn.open_table(tables::DOCS)?;
 
             for ((collection_id, key), restore_to) in plan {
+                if let Some(entry) = &restore_to {
+                    restored_floor = Some(match restored_floor {
+                        Some(floor) => floor.min(entry.stamp.hlc),
+                        None => entry.stamp.hlc,
+                    });
+                }
                 let before = match docs.get((collection_id, key.as_slice()))? {
                     Some(raw) => codec::decode_doc_record(raw.value())?.document()?,
                     None => None,
@@ -363,7 +373,7 @@ impl Engine {
             }
             // The tombstones it minted go in the record under this member's own
             // origin: they are above everything it discarded, and a start resumes
-            // the clock past the record (`Engine::resume_hlc`, CL1). No entry of
+            // the clock past the record (`Engine::resume_hlc`). No entry of
             // this member's stands between them and what it discarded, so a token
             // check reads the record exactly as before.
             if let Some(stamp) = minted {
@@ -385,15 +395,15 @@ impl Engine {
                 &crate::live_count::mark_of(&arrival, &oplog)?,
             )?;
         }
-        txn.commit()?;
-
         // The oplog just lost everything above the target, so the vectors come
-        // down to it: left high, this node would claim history it no longer
-        // holds, and no peer would ever send that range again. To the target and
-        // no lower: what is at or below it is exactly as it was, and a vector
-        // lowered there loses coverage of what retention collected, this member's
-        // own drops among them (ADR-243).
-        Engine::lower_vectors_to_target(self.db(), until)?;
+        // down to it, in this transaction: left high, this node would claim history
+        // it no longer holds, and no peer would ever send that range again; lowered
+        // in a transaction of their own, a failure between the two would leave them
+        // so. To the target, and below it only as far as a restored document asks:
+        // a vector lowered further loses coverage of what retention collected, this
+        // member's own drops among them (ADR-243).
+        Engine::lower_vectors_in(&txn, schema, until, restored_floor)?;
+        txn.commit()?;
 
         info!(
             reverted = outcome.reverted,
@@ -462,7 +472,7 @@ fn record_rewind(
 }
 
 /// The highest stamp any rewind's record names, or zero: where a start's clock must
-/// resume at least (`Engine::resume_hlc`, CL1).
+/// resume at least (`Engine::resume_hlc`).
 ///
 /// A record that does not decode costs the fold, not the open: it is read here only
 /// to keep the clock above a range nothing else names, and the token check that
@@ -511,6 +521,24 @@ fn decode_rewinds(mut raw: &[u8]) -> Result<Vec<Rewound>> {
         raw = &raw[end..];
     }
     Ok(out)
+}
+
+/// A failure injected in the vectors' lowering, to show the rewind is one transaction.
+#[cfg(test)]
+pub(crate) mod test_support {
+    use std::cell::Cell;
+
+    thread_local! {
+        static FAIL_THE_LOWERING: Cell<bool> = const { Cell::new(false) };
+    }
+
+    pub(crate) fn fail_the_lowering(on: bool) {
+        FAIL_THE_LOWERING.with(|f| f.set(on));
+    }
+
+    pub(crate) fn fails_the_lowering() -> bool {
+        FAIL_THE_LOWERING.with(|f| f.get())
+    }
 }
 
 #[cfg(test)]
@@ -767,8 +795,8 @@ mod tests {
 
     #[test]
     fn a_rewind_after_retention_keeps_the_coverage_of_what_retention_collected() {
-        // RW1 (ADR-243) where it starts. Retention collected every entry of this
-        // member's own origin, and the rewind discards nothing. Rebuilt from the
+        // A rewind after a retention pass (ADR-243). Retention collected every
+        // entry of this member's own origin, and the rewind discards nothing. Rebuilt from the
         // oplog, the vectors lost the origin altogether: no peer lacking what was
         // collected was told so, and no page vouched for it.
         let base = base();
@@ -908,12 +936,12 @@ mod tests {
 
     #[test]
     fn a_start_after_a_rewind_resumes_the_clock_past_what_it_discarded_and_minted() {
-        // CL1. A member whose clock led its wall clock (a fast peer's clock reached
-        // it) rewinds past two of its own inserts: it discards them and mints a
-        // tombstone for each document. Neither the oplog's tail nor a vector names
-        // any of those stamps afterwards, so a start resumed below them: its next
-        // write was stamped inside the range the rewind's record says it discarded,
-        // and below its own tombstones.
+        // The clock after a rewind. A member whose clock led its wall clock (a
+        // fast peer's clock reached it) rewinds past two of its own inserts: it
+        // discards them and mints a tombstone for each document. Neither the
+        // oplog's tail nor a vector names any of those stamps afterwards, so a
+        // start resumed below them: its next write was stamped inside the range
+        // the rewind's record says it discarded, and below its own tombstones.
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("kimmy.redb");
         let ahead = crate::engine::physical_now_ms() + 60 * 60 * 1000;
@@ -953,6 +981,199 @@ mod tests {
             !engine.rewinds().unwrap().iter().any(|rewind| rewind.discarded(&next)),
             "so a token naming it is not read as naming a discarded entry"
         );
+    }
+
+    #[test]
+    fn a_start_after_a_rewind_resumes_past_a_peers_discarded_stamp() {
+        // The rewind discards a peer's write stamped far ahead. A start that resumed
+        // below it would stamp the member's next write of the document below the
+        // peer's, which then wins when anti-entropy brings it back.
+        let base = base();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("kimmy.redb");
+        let (c, _dc) = engine();
+        let far = {
+            let b = Engine::open(&path).unwrap();
+            at(&b, base, 10);
+            let orders = b.create_collection("shop", "orders").unwrap();
+            at(&b, base, 20);
+            b.insert(&orders, doc! { "_id": 1 }).unwrap();
+            pull(&c, &b);
+            at(&c, base, 100_000);
+            c.replace(
+                &c.get_collection("shop", "orders").unwrap(),
+                &DocId::Int64(1),
+                doc! { "_id": 1, "v": "c" },
+                false,
+            )
+            .unwrap();
+            let far = c.version_vector().unwrap().get(c.node_id());
+            pull(&b, &c);
+            let out = b.rewind_to(Hlc::new(base + 50, 0)).unwrap();
+            assert_eq!(out.oplog_discarded, 1, "the peer's write");
+            b.close().unwrap();
+            far
+        };
+        let b = Engine::open(&path).unwrap();
+        let orders = b.get_collection("shop", "orders").unwrap();
+        b.replace(&orders, &DocId::Int64(1), doc! { "_id": 1, "v": "b" }, false).unwrap();
+        let next = crate::docs::record_stamp(&b, &orders, &DocId::Int64(1)).unwrap().unwrap();
+        assert!(
+            next.hlc > far,
+            "the next write must be stamped above the peer's discarded write: {next:?} vs {far:?}"
+        );
+    }
+
+    #[test]
+    fn a_start_resumes_past_a_tombstone_minted_for_a_peers_insert() {
+        // The rewind removes a document a peer created, discarding none of this
+        // member's own entries, and mints the tombstone under its own origin.
+        let base = base();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("kimmy.redb");
+        let (c, _dc) = engine();
+        let minted = {
+            let b = Engine::open(&path).unwrap();
+            at(&b, base, 10);
+            let orders = b.create_collection("shop", "orders").unwrap();
+            pull(&c, &b);
+            at(&c, base, 300);
+            c.insert(&c.get_collection("shop", "orders").unwrap(), doc! { "_id": 9 }).unwrap();
+            pull(&b, &c);
+            let out = b.rewind_to(Hlc::new(base + 200, 0)).unwrap();
+            assert_eq!((out.oplog_discarded, out.removed), (1, 1));
+            let minted = crate::docs::record_stamp(&b, &orders, &DocId::Int64(9)).unwrap().unwrap();
+            assert_eq!(minted.node, b.node_id());
+            b.close().unwrap();
+            minted
+        };
+        let b = Engine::open(&path).unwrap();
+        let orders = b.get_collection("shop", "orders").unwrap();
+        b.insert(&orders, doc! { "_id": 10 }).unwrap();
+        let next = crate::docs::record_stamp(&b, &orders, &DocId::Int64(10)).unwrap().unwrap();
+        assert!(next > minted, "the next write above the minted tombstone: {next:?} vs {minted:?}");
+    }
+
+    #[test]
+    fn a_rewind_of_a_restored_store_after_retention_keeps_the_coverage() {
+        // `kimmyd restore --until`: a backup re-derives the witnessed vector and
+        // the per-origin retention record at open; the rewind keeps both vectors.
+        let base = base();
+        let ((b, _db), (c, _dc), (fresh, _df)) = (engine(), engine(), engine());
+        at(&b, base, 100);
+        let orders = b.create_collection("shop", "orders").unwrap();
+        at(&b, base, 110);
+        b.insert(&orders, doc! { "_id": 1 }).unwrap();
+        pull(&c, &b);
+        at(&c, base, 190);
+        c.insert(&c.get_collection("shop", "orders").unwrap(), doc! { "_id": 2 }).unwrap();
+        pull(&b, &c);
+        b.collect_garbage_at(base + 1730, crate::RetentionPolicy::new(1, 24 * 60 * 60)).unwrap();
+        let (servable, witnessed) = (b.version_vector().unwrap(), b.witnessed_vector().unwrap());
+        let mut backup = Vec::new();
+        b.backup_to(&mut backup, crate::WalkScope::Request).unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let restored = dir.path().join("kimmy.redb");
+        crate::backup::restore(&restored, &mut backup.as_slice()).unwrap();
+        let r = Engine::open(&restored).unwrap();
+        r.rewind_to(Hlc::new(base + 1757, 0)).unwrap();
+        assert_eq!(
+            r.version_vector().unwrap(),
+            servable,
+            "servable kept through restore and rewind"
+        );
+        assert_eq!(r.witnessed_vector().unwrap(), witnessed, "witnessed kept");
+        drop(r);
+        let r = Engine::open(&restored).unwrap();
+        assert_eq!(r.version_vector().unwrap(), servable, "and across a reopen");
+        assert_eq!(
+            r.serve_verdict(&fresh.witnessed_vector().unwrap()).unwrap(),
+            crate::ServeVerdict::Collected
+        );
+    }
+
+    #[test]
+    fn a_rewind_that_fails_while_lowering_the_vectors_writes_nothing() {
+        // The vectors are lowered in the rewind's own transaction. Lowered in a
+        // second one, a failure between the two left the oplog shrunk and the
+        // vectors above the target: the member claimed history it no longer held.
+        let base = base();
+        let ((b, _db), (c, _dc)) = (engine(), engine());
+        at(&b, base, 50);
+        let orders = b.create_collection("shop", "orders").unwrap();
+        pull(&c, &b);
+        at(&b, base, 100);
+        b.insert(&orders, doc! { "_id": 1 }).unwrap();
+        at(&c, base, 300);
+        c.insert(&c.get_collection("shop", "orders").unwrap(), doc! { "_id": 9 }).unwrap();
+        pull(&b, &c);
+        let entries = b.oplog_entries().unwrap();
+        let (servable, witnessed) = (b.version_vector().unwrap(), b.witnessed_vector().unwrap());
+
+        test_support::fail_the_lowering(true);
+        let failed = b.rewind_to(Hlc::new(base + 200, 0));
+        test_support::fail_the_lowering(false);
+        assert!(failed.is_err(), "the injected failure");
+        assert_eq!(b.oplog_entries().unwrap(), entries, "no entry was discarded");
+        assert!(b.get(&orders, &DocId::Int64(9)).unwrap().is_some(), "no document was removed");
+        assert_eq!(b.version_vector().unwrap(), servable);
+        assert_eq!(b.witnessed_vector().unwrap(), witnessed);
+
+        let outcome = b.rewind_to(Hlc::new(base + 200, 0)).unwrap();
+        assert_eq!(outcome.oplog_discarded, 1);
+        assert_eq!(b.version_vector().unwrap().get(c.node_id()), Hlc::new(base + 200, 0));
+    }
+
+    #[test]
+    fn a_rewind_that_restores_a_document_bounds_the_vectors_by_it_and_by_what_it_keeps() {
+        // B holds A's t110 write of document 1. C's t150 write of it reaches B
+        // after B's own t300 write, loses last-writer-wins and is witnessed without
+        // an append; C's t180 write of document 2 is appended. The rewind to t200
+        // puts document 1 back to t110, so each vector comes down to at most
+        // t110 (B's own origin, which keeps nothing) or to the newest entry it
+        // keeps of the origin (C's t180), never below it (invariant I).
+        let base = base();
+        let ((a, _da), (b, _db), (c, _dc)) = (engine(), engine(), engine());
+        at(&a, base, 100);
+        let orders = a.create_collection("shop", "orders").unwrap();
+        at(&a, base, 110);
+        a.insert(&orders, doc! { "_id": 1 }).unwrap();
+        pull(&b, &a);
+        pull(&c, &a);
+        let theirs = c.get_collection("shop", "orders").unwrap();
+        at(&c, base, 150);
+        c.replace(&theirs, &DocId::Int64(1), doc! { "_id": 1, "v": "c" }, false).unwrap();
+        at(&c, base, 180);
+        c.insert(&theirs, doc! { "_id": 2 }).unwrap();
+        let mine = b.get_collection("shop", "orders").unwrap();
+        at(&b, base, 300);
+        b.replace(&mine, &DocId::Int64(1), doc! { "_id": 1, "v": "b" }, false).unwrap();
+        pull(&b, &c);
+        let restored = crate::docs::record_stamp(&a, &orders, &DocId::Int64(1)).unwrap().unwrap();
+        let kept = crate::docs::record_stamp(&c, &theirs, &DocId::Int64(2)).unwrap().unwrap();
+        assert!(
+            b.witnessed_vector().unwrap().get(c.node_id()) >= kept.hlc,
+            "the fixture must witness C's losing write below C's kept one"
+        );
+
+        let outcome = b.rewind_to(Hlc::new(base + 200, 0)).unwrap();
+        assert_eq!((outcome.reverted, outcome.oplog_discarded), (1, 1));
+        for (vector, name) in [
+            (b.version_vector().unwrap(), "servable"),
+            (b.witnessed_vector().unwrap(), "witnessed"),
+        ] {
+            assert_eq!(
+                vector.get(b.node_id()),
+                restored.hlc,
+                "{name}: bounded by the restored entry"
+            );
+            assert_eq!(vector.get(c.node_id()), kept.hlc, "{name}: never below an entry it keeps");
+            assert_eq!(
+                vector.get(a.node_id()),
+                restored.hlc,
+                "{name}: A's coverage is its kept entry"
+            );
+        }
     }
 
     #[test]

@@ -2389,24 +2389,34 @@ passed**, so a refusal leaves the file exactly as the restore wrote it.
 A rewind that discarded nothing (the command reports `0 oplog entries
 discarded`) undid no writes, so this rule does not apply to it: the member
 rejoins its cluster as any restored member does. A rewind keeps what the member
-covers at or below the target and lowers it to the target above it
+covers at or below the target, lowers it to the target above it, and lowers it
+further only below a document it put back to an earlier value, so that the
+member asks its peers again for writes of that document it had judged
 ([ADR-243](decisions.md)).
 
 **A member rewound by 0.51 or earlier that has rejoined its cluster.** That
 rewind lowered the member's version vectors below writes retention had
 collected, its own among them, so a peer that had not taken one of those writes,
-a collection's drop among them, is never told it lacks it. A peer that pulls a
-whole-database page from the member logs, at `WARN`, `a whole-database page
-denied a collection with a stamp its sender's own coverage does not name;
-ignored`, with the collection and the stamp. Either remedy closes it:
+a collection's drop among them, is never told it lacks it. Nothing on the member
+signals it: the divergence check does not report a collection the member
+dropped, and a peer logs `a whole-database page denied a collection with a stamp
+its sender's own coverage does not name; ignored` (at `WARN`, with the
+collection and the stamp) only when it takes a whole-database page from the
+member, which this state gives it no reason to do. Compare the collections each
+member lists, and their document counts, across the members; treat any member
+rewound by 0.51 or earlier on a store retention had collected from, and rejoined
+since, as affected. Either remedy closes it:
 
 - Stop the member, remove its `kimmy.redb`, and restore it again from the same
   backup with this release's `kimmyd restore --from … --until …`, then start it.
   The rewind keeps what the member covers, and its peers take the writes they
-  lack from it.
+  lack from it, a drop included, keeping the documents written into the
+  collection after the drop ([ADR-236](decisions.md)). Prefer this one.
 - Or stop the member, remove its `kimmy.redb`, and start it empty, so it takes
-  its peers' state. Then make again by hand each of its writes that no peer
-  holds, such as the drop the `WARN` names.
+  its peers' state; then make again by hand each of its writes that no peer
+  holds. A collection's drop made again by hand also removes the documents
+  written into it after the original drop, which the original drop keeps: copy
+  them out first and write them back after the drop.
 
 ### The identity comes back with it
 

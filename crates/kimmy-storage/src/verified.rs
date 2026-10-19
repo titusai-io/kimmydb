@@ -951,7 +951,7 @@ mod tests {
         ("engine.rs", "release_held_in_position"),
         ("engine.rs", "release_held_under"),
         ("engine.rs", "rebuild_version_vector_if_stale"),
-        ("engine.rs", "lower_vectors_to_target"),
+        ("engine.rs", "lower_vectors_in"),
         ("gc.rs", "remove_oplog_entries"),
         ("gc.rs", "trim_violation_rows"),
         ("rewind.rs", "rewind_to"),
