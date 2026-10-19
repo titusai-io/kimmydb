@@ -202,6 +202,41 @@ struct MembersInner {
     /// When each peer was last named in the WARN that a `Decimal128` id exists
     /// here while it cannot hold one (ADR-238).
     decimal128_said: Mutex<BTreeMap<NodeId, Instant>>,
+    /// The immediate facts exchanges asked of this set (ADR-247).
+    exchanges: Exchanges,
+}
+
+/// Where an immediate facts exchange with a member is started: handed the
+/// member's address and node id (ADR-247).
+pub(crate) type ExchangeSink = Arc<dyn Fn(SocketAddr, NodeId) + Send + Sync>;
+
+/// The asks the replication loop's exchange driver takes, in order.
+pub(crate) type ExchangeQueue = mpsc::UnboundedReceiver<(SocketAddr, NodeId)>;
+
+/// The immediate facts exchanges asked of a member set (ADR-247): where an ask
+/// goes, the queue the replication loop takes once, and when each member was
+/// last asked for.
+///
+/// **The queue exists from the set's creation**, so a member the membership task
+/// sees come up before the replication loop has started (the daemon starts
+/// membership first) is queued, not lost.
+struct Exchanges {
+    sink: RwLock<ExchangeSink>,
+    queue: Mutex<Option<ExchangeQueue>>,
+    asked: Mutex<BTreeMap<NodeId, Instant>>,
+}
+
+impl Default for Exchanges {
+    fn default() -> Self {
+        let (tx, rx) = mpsc::unbounded_channel();
+        let sink: ExchangeSink = Arc::new(move |addr, node| {
+            // Unbounded, and bounded by the debounce instead: one ask per
+            // member per sync interval. A send fails only once the driver,
+            // which holds this set, has gone with the loop.
+            let _ = tx.send((addr, node));
+        });
+        Self { sink: RwLock::new(sink), queue: Mutex::new(Some(rx)), asked: Mutex::default() }
+    }
 }
 
 /// The blocks held, and where a block must have been decoded after to count.
@@ -531,14 +566,62 @@ impl Members {
     /// not reach every peer, and a fixed lease would expire facts that are still
     /// being refreshed (ADR-201).
     pub fn lease(&self) -> Duration {
-        let (interval, fanout) = *self.0.lease_shape.read();
-        // Unconfigured (a member set nothing has told its intervals): the
-        // defaults, so a lease is never zero and never divides by zero.
-        let interval =
-            if interval.is_zero() { crate::peers::DEFAULT_SYNC_INTERVAL } else { interval };
-        let fanout = fanout.max(1);
+        let fanout = self.0.lease_shape.read().1.max(1);
         let peers = self.0.live.read().len();
-        interval * (peers.div_ceil(fanout) as u32 + 2)
+        self.sync_interval() * (peers.div_ceil(fanout) as u32 + 2)
+    }
+
+    /// The sync interval this set was told. Unconfigured (a member set nothing
+    /// has told its intervals): the default, so a lease is never zero.
+    fn sync_interval(&self) -> Duration {
+        let interval = self.0.lease_shape.read().0;
+        if interval.is_zero() { crate::peers::DEFAULT_SYNC_INTERVAL } else { interval }
+    }
+
+    /// Ask for an immediate facts exchange with `node` at `addr`, as of `at`
+    /// (ADR-247): **at most one per member per sync interval**, counted from the
+    /// last ask whatever became of it, so a member that flaps or does not answer
+    /// costs one exchange an interval and the tick is the fallback. Answers
+    /// whether one was started.
+    ///
+    /// Called after the change that asked for it is applied: an exchange started
+    /// before a rename's drop could bring the new block back before the drop
+    /// removed it again.
+    pub(crate) fn exchange_at(&self, addr: SocketAddr, node: NodeId, at: Instant) -> bool {
+        let interval = self.sync_interval();
+        {
+            let mut asked = self.0.exchanges.asked.lock();
+            asked.retain(|_, last| at.saturating_duration_since(*last) < interval);
+            if asked.contains_key(&node) {
+                return false;
+            }
+            asked.insert(node, at);
+        }
+        // Called with no lock of this set held: a sink may read and record blocks.
+        let sink = Arc::clone(&self.0.exchanges.sink.read());
+        sink(addr, node);
+        true
+    }
+
+    /// [`Self::exchange_at`] for every live peer: this member's own rejoin
+    /// dropped every block it held (ADR-247).
+    pub(crate) fn exchange_with_live_at(&self, at: Instant) {
+        for (addr, node) in self.entries() {
+            self.exchange_at(addr, node, at);
+        }
+    }
+
+    /// The queue of asked exchanges, for the replication loop's driver. Once:
+    /// `None` after the first call.
+    pub(crate) fn take_exchange_queue(&self) -> Option<ExchangeQueue> {
+        self.0.exchanges.queue.lock().take()
+    }
+
+    /// Start exchanges with `sink` instead of the queue: a test that runs them
+    /// itself.
+    #[cfg(test)]
+    pub(crate) fn set_exchange_sink_for_test(&self, sink: ExchangeSink) {
+        *self.0.exchanges.sink.write() = sink;
     }
 
     /// This member's block to send, with its generation, or `None` with no
@@ -1002,44 +1085,68 @@ struct Collector {
     members: Members,
     /// Whether the input being handled made this member rejoin.
     rejoined: bool,
+    /// When the input being handled was taken: what the exchanges it asks for
+    /// are debounced by (ADR-247).
+    at: Instant,
+}
+
+/// Apply what `notification` says to `members`, at `at`, and ask for the
+/// immediate facts exchanges it calls for (ADR-247). Answers whether it was this
+/// member's own `Rejoin`.
+///
+/// **Each exchange is asked for after the change is applied**: after a rename's
+/// drop, so the block the exchange brings is decoded after the drop and kept
+/// (ADR-213), and after a rejoin's clear, for the same reason.
+fn apply_notification(
+    members: &Members,
+    notification: Notification<'_, Member>,
+    at: Instant,
+) -> bool {
+    match notification {
+        Notification::MemberUp(member) => {
+            info!(peer = %member.addr, node = %member.node, "member up");
+            members.insert(member.addr, member.node);
+            members.exchange_at(member.addr, member.node, at);
+        }
+        Notification::MemberDown(member) => {
+            info!(peer = %member.addr, "member down");
+            members.remove(&member.addr);
+        }
+        // A member came back under a new incarnation. The address is
+        // unchanged, so the live set already contains it.
+        Notification::Rename(old, new) => {
+            debug!(from = ?old, to = ?new, "member renewed its identity");
+            // A new incarnation: what the old one said, and read, is not
+            // this one's (ADR-201). Only `insert` follows, and it drops
+            // nothing, since a block can beat the insert of a peer that is
+            // new to this member.
+            members.forget_peer(old.node);
+            members.forget_peer(new.node);
+            members.insert(new.addr, new.node);
+            members.exchange_at(new.addr, new.node, at);
+        }
+        Notification::Defunct => {
+            warn!("this node was declared down by the cluster; rejoining");
+            // The cluster dropped this member's block, and this member may
+            // have missed changes to its peers': clear what it routes by
+            // and what it counted as confirmed (ADR-213).
+            members.clear_for_own_defunct();
+        }
+        Notification::Rejoin(identity) => {
+            info!(as_member = %identity.addr, "rejoined the cluster");
+            members.clear_for_own_defunct();
+            members.exchange_with_live_at(at);
+            return true;
+        }
+        other => debug!(?other, "membership notification"),
+    }
+    false
 }
 
 impl foca::Runtime<Member> for Collector {
     fn notify(&mut self, notification: Notification<'_, Member>) {
-        match notification {
-            Notification::MemberUp(member) => {
-                info!(peer = %member.addr, node = %member.node, "member up");
-                self.members.insert(member.addr, member.node);
-            }
-            Notification::MemberDown(member) => {
-                info!(peer = %member.addr, "member down");
-                self.members.remove(&member.addr);
-            }
-            // A member came back under a new incarnation. The address is
-            // unchanged, so the live set already contains it.
-            Notification::Rename(old, new) => {
-                debug!(from = ?old, to = ?new, "member renewed its identity");
-                // A new incarnation: what the old one said, and read, is not
-                // this one's (ADR-201). Only `insert` follows, and it drops
-                // nothing, since a block can beat the insert of a peer that is
-                // new to this member.
-                self.members.forget_peer(old.node);
-                self.members.forget_peer(new.node);
-                self.members.insert(new.addr, new.node);
-            }
-            Notification::Defunct => {
-                warn!("this node was declared down by the cluster; rejoining");
-                // The cluster dropped this member's block, and this member may
-                // have missed changes to its peers': clear what it routes by
-                // and what it counted as confirmed (ADR-213).
-                self.members.clear_for_own_defunct();
-            }
-            Notification::Rejoin(identity) => {
-                info!(as_member = %identity.addr, "rejoined the cluster");
-                self.members.clear_for_own_defunct();
-                self.rejoined = true;
-            }
-            other => debug!(?other, "membership notification"),
+        if apply_notification(&self.members, notification, self.at) {
+            self.rejoined = true;
         }
     }
 
@@ -1164,11 +1271,17 @@ pub async fn run(
 
     info!(bind = %local, "gossiping membership");
 
-    let mut collector =
-        Collector { outgoing: Outgoing::default(), timers: Vec::new(), members, rejoined: false };
+    let mut collector = Collector {
+        outgoing: Outgoing::default(),
+        timers: Vec::new(),
+        members,
+        rejoined: false,
+        at: Instant::now(),
+    };
 
     let mut announced_alone: Option<Instant> = None;
     while let Some(input) = rx.recv().await {
+        collector.at = Instant::now();
         let result = match input {
             Input::Data(bytes) => foca.handle_data(&bytes, &mut collector),
             Input::Timer(timer) => foca.handle_timer(timer, &mut collector),
@@ -1310,6 +1423,7 @@ mod tests {
             timers: Vec::new(),
             members: members.clone(),
             rejoined: false,
+            at: Instant::now(),
         };
         collector.notify(Notification::Rename(&old, &new));
         assert_eq!(members.peer_states()[&node(1)], PeerState::Unknown, "its block is dropped");
@@ -1317,6 +1431,32 @@ mod tests {
             members.unconfirmed_peers(OwnerClass::Ttl),
             vec![node(1)],
             "and what it read of ours"
+        );
+    }
+
+    /// An immediate exchange is asked at most once per member per sync interval
+    /// (ADR-247), counted from the last ask, and each member on its own: a
+    /// second ask within the interval starts none, another member's starts one,
+    /// and one at the interval's end starts one again.
+    #[test]
+    fn an_exchange_is_asked_once_per_member_per_sync_interval() {
+        let members = Members::default();
+        members.configure_lease(Duration::from_secs(5), 3);
+        let started = Arc::new(Mutex::new(Vec::new()));
+        members.set_exchange_sink_for_test({
+            let started = Arc::clone(&started);
+            Arc::new(move |addr, node| started.lock().push((addr, node)))
+        });
+        let t0 = Instant::now();
+        let at = |ms: u64| t0 + Duration::from_millis(ms);
+        assert!(members.exchange_at(addr(7901), node(1), at(0)));
+        assert!(!members.exchange_at(addr(7901), node(1), at(4_999)), "within the interval");
+        assert!(members.exchange_at(addr(7902), node(2), at(1_000)), "another member's own");
+        assert!(members.exchange_at(addr(7901), node(1), at(5_000)), "the interval is over");
+        assert!(!members.exchange_at(addr(7902), node(2), at(5_000)), "from its own last ask");
+        assert_eq!(
+            *started.lock(),
+            vec![(addr(7901), node(1)), (addr(7902), node(2)), (addr(7901), node(1))]
         );
     }
 

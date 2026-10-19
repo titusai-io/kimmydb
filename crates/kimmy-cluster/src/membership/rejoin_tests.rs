@@ -8,23 +8,34 @@
 //! [`super::announce_targets`]. A member can also be restarted: a new process,
 //! whose identity starts one above the incarnation its data directory recorded
 //! (ADR-242), as the daemon's does.
+//!
+//! Each process also holds a member set, fed the production notification
+//! handling, whose immediate facts exchanges (ADR-247) run synchronously inside
+//! the ask: the asker's block is recorded at the member asked, if its process
+//! runs, and that member's block at the asker, as an exchange's two frames would.
+//! No sync tick runs here, so a block held is a block an exchange brought.
 
 use std::cmp::Reverse;
 use std::collections::{BTreeSet, BinaryHeap, VecDeque};
 use std::net::SocketAddr;
-use std::time::Duration;
+use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use foca::{Config, Foca, Notification, PostcardCodec, Runtime, Timer};
 use rand::SeedableRng;
 use rand::rngs::StdRng;
 
 use super::incarnation::first_after;
-use super::{Member, Swim};
+use super::{Member, Members, Swim, apply_notification};
+use crate::facts::{Facts, next_decoded_seq};
 use kimmy_core::NodeId;
 
 /// How often each member announces itself to its seeds (the daemon's
 /// discovery interval in the cluster harness).
 const DISCOVERY_MS: u64 = 2_000;
+
+/// The sync interval the processes' member sets debounce their exchanges by.
+const SYNC_INTERVAL: Duration = Duration::from_secs(5);
 
 /// A probe period, a probe's round trip and the suspicion time
 /// (`Config::new_lan(16)`: 1 s, 0.5 s, 4.8 s), and a probe period's wait for
@@ -41,15 +52,36 @@ struct Out {
     renamed: Vec<SocketAddr>,
     /// The renewed incarnation the daemon's step recorded.
     recorded: Option<u64>,
+    /// The process's member set and the input's instant, which every
+    /// notification is applied to as the daemon applies it.
+    members: Option<(Members, Instant)>,
+    /// What each notification that drops blocks drops (`None`: every peer's,
+    /// a rejoin's or a defunct's), with how many exchanges had been started
+    /// when it came, in the order they came.
+    drops: Vec<(usize, Option<SocketAddr>)>,
+    exchanges: Option<Arc<parking_lot::Mutex<Exchanges>>>,
 }
 
 impl Runtime<Member> for Out {
     fn notify(&mut self, notification: Notification<'_, Member>) {
-        match notification {
+        match &notification {
             Notification::Rejoin(_) => self.rejoined = true,
             Notification::MemberDown(member) => self.down.push(member.addr),
             Notification::Rename(_, new) => self.renamed.push(new.addr),
             _ => {}
+        }
+        let drops = match &notification {
+            Notification::Rename(_, member) | Notification::MemberDown(member) => {
+                Some(Some(member.addr))
+            }
+            Notification::Rejoin(_) | Notification::Defunct => Some(None),
+            _ => None,
+        };
+        if let (Some(dropped), Some(exchanges)) = (drops, &self.exchanges) {
+            self.drops.push((exchanges.lock().log.len(), dropped));
+        }
+        if let Some((members, at)) = &self.members {
+            apply_notification(members, notification, *at);
         }
     }
     fn send_to(&mut self, to: Member, data: &[u8]) {
@@ -58,6 +90,81 @@ impl Runtime<Member> for Out {
     fn submit_after(&mut self, event: Timer<Member>, after: Duration) {
         self.timers.push((event, after));
     }
+}
+
+/// One exchange a process started: by which member, with which, when, and the
+/// boot of the process that answered (`None`: none did, dead or frozen).
+#[derive(Clone, Debug)]
+struct Exchange {
+    from: usize,
+    to: usize,
+    at: u64,
+    answered: Option<Vec<u8>>,
+}
+
+/// What the exchanges read and leave: each member's running process's set
+/// (`None` while it is dead or frozen), the clock, and every exchange started.
+#[derive(Default)]
+struct Exchanges {
+    running: Vec<Option<Members>>,
+    now: u64,
+    log: Vec<Exchange>,
+}
+
+fn node_id(member: usize) -> NodeId {
+    NodeId::from_bytes([member as u8 + 1; 16])
+}
+
+/// The boot of process `epoch` of `member`.
+fn boot(member: usize, epoch: u64) -> Vec<u8> {
+    vec![member as u8 + 1, epoch as u8]
+}
+
+/// The member set of process `epoch` of `member`, whose exchanges run against
+/// `shared` inside the ask: its block recorded at the member asked, and that
+/// member's at it, when that member's process runs.
+fn process_members(
+    shared: &Arc<parking_lot::Mutex<Exchanges>>,
+    member: usize,
+    epoch: u64,
+) -> Members {
+    let members = Members::default();
+    members.configure_lease(SYNC_INTERVAL, 3);
+    let own = boot(member, epoch);
+    members.set_facts_source(Arc::new(move || Facts {
+        boot: own.clone(),
+        started_ms: Some(epoch),
+        ..Facts::default()
+    }));
+    let shared = Arc::clone(shared);
+    members.set_exchange_sink_for_test(Arc::new(move |addr, node| {
+        let to = usize::from(addr.port() - 7900);
+        let (mine, theirs, at) = {
+            let shared = shared.lock();
+            (shared.running[member].clone(), shared.running[to].clone(), shared.now)
+        };
+        let answered = match (mine, theirs) {
+            (Some(mine), Some(theirs)) => {
+                let (block, generation) = mine.local_facts().expect("a source");
+                let seq = next_decoded_seq();
+                theirs.record_peer_facts(
+                    node_id(member),
+                    block,
+                    Some(generation),
+                    seq,
+                    Instant::now(),
+                );
+                let (block, generation) = theirs.local_facts().expect("a source");
+                let answered = block.boot.clone();
+                let seq = next_decoded_seq();
+                mine.record_peer_facts(node, block, Some(generation), seq, Instant::now());
+                Some(answered)
+            }
+            _ => None,
+        };
+        shared.lock().log.push(Exchange { from: member, to, at, answered });
+    }));
+    members
 }
 
 /// The daemon's step after every input, as built.
@@ -116,6 +223,8 @@ struct Node {
     /// Whether a recorded renewal reaches the file (`false`: a write that
     /// failed, or a crash before it).
     keeps: bool,
+    /// The running process's member set.
+    members: Members,
 }
 
 /// The simulated network: nodes, a clock in milliseconds, and the timers each
@@ -133,20 +242,23 @@ struct Net {
     /// Directed links that drop what crosses them.
     cut: BTreeSet<(usize, usize)>,
     after_input: fn(&mut Swim, &mut Out),
+    exchanges: Arc<parking_lot::Mutex<Exchanges>>,
+    /// The instant the clock's 0 stands for, for the member sets.
+    base: Instant,
 }
 
 impl Net {
     /// `n` members; member `i` is seeded with `seeds[i]`.
     fn new(seeds: &[&[usize]], after_input: fn(&mut Swim, &mut Out)) -> Net {
         let config = Config::new_lan(std::num::NonZeroU32::new(16).unwrap());
+        let exchanges = Arc::new(parking_lot::Mutex::new(Exchanges::default()));
         let nodes: Vec<Node> = seeds
             .iter()
             .enumerate()
             .map(|(i, seeds)| {
                 let addr: SocketAddr = format!("127.0.0.1:{}", 7900 + i).parse().unwrap();
                 let first = first_after(None);
-                let identity =
-                    Member::identified(addr, NodeId::from_bytes([i as u8 + 1; 16]), first);
+                let identity = Member::identified(addr, node_id(i), first);
                 let rng = StdRng::seed_from_u64(i as u64);
                 Node {
                     swim: Foca::new(identity, config.clone(), rng, PostcardCodec),
@@ -161,9 +273,11 @@ impl Net {
                     epoch: 0,
                     kept: Some(first),
                     keeps: true,
+                    members: process_members(&exchanges, i, 0),
                 }
             })
             .collect();
+        exchanges.lock().running = nodes.iter().map(|node| Some(node.members.clone())).collect();
         let mut net = Net {
             nodes,
             now: 0,
@@ -174,6 +288,8 @@ impl Net {
             next_discovery: 0,
             cut: BTreeSet::new(),
             after_input,
+            exchanges,
+            base: Instant::now(),
         };
         net.run_for(15_000);
         for (i, node) in net.nodes.iter().enumerate() {
@@ -188,9 +304,20 @@ impl Net {
 
     /// Hand `node` one input, then the daemon's step, and route what came out.
     fn input(&mut self, node: usize, via: Via, input: impl FnOnce(&mut Swim, &mut Out)) {
-        let mut out = Out::default();
+        let since = {
+            let mut shared = self.exchanges.lock();
+            shared.now = self.now;
+            shared.log.len()
+        };
+        let at = self.base + Duration::from_millis(self.now);
+        let mut out = Out {
+            members: Some((self.nodes[node].members.clone(), at)),
+            exchanges: Some(Arc::clone(&self.exchanges)),
+            ..Out::default()
+        };
         input(&mut self.nodes[node].swim, &mut out);
         (self.after_input)(&mut self.nodes[node].swim, &mut out);
+        self.exchanges_held(node, since, &out.drops);
         if out.rejoined {
             self.nodes[node].rejoins.push((via, self.now));
         }
@@ -213,6 +340,39 @@ impl Net {
             if let Some(to) = self.index(to) {
                 self.deliver(node, to, data);
             }
+        }
+    }
+
+    /// Every exchange `node` started in the input just handled (log entries from
+    /// `since`) that a process answered left `node` holding that process's block:
+    /// an exchange is asked after the change it is for, never before a drop that
+    /// would remove what it brought. Unless a later notification of the same
+    /// input dropped it (`drops`, recorded before each is applied), or `node` no
+    /// longer holds the member live.
+    fn exchanges_held(&self, node: usize, since: usize, drops: &[(usize, Option<SocketAddr>)]) {
+        let shared = self.exchanges.lock();
+        let view = self.nodes[node].members.view();
+        for (index, started) in shared.log.iter().enumerate().skip(since) {
+            if started.from != node {
+                continue;
+            }
+            let Some(answered) = &started.answered else { continue };
+            let addr = self.nodes[started.to].addr;
+            let dropped_after =
+                drops.iter().any(|(count, of)| *count > index && of.is_none_or(|of| of == addr));
+            let to = node_id(started.to);
+            if dropped_after || !view.live.contains(&to) {
+                continue;
+            }
+            let held = view.blocks.get(&to).map(|held| &held.facts.boot);
+            assert_eq!(
+                held,
+                Some(answered),
+                "at {} ms member {node} started an exchange with {} in this input and does not \
+                 hold the block it brought",
+                self.now,
+                started.to
+            );
         }
     }
 
@@ -292,10 +452,12 @@ impl Net {
 
     fn freeze(&mut self, node: usize) {
         self.nodes[node].life = Life::Frozen;
+        self.exchanges.lock().running[node] = None;
     }
 
     fn kill(&mut self, node: usize) {
         self.nodes[node].life = Life::Dead;
+        self.exchanges.lock().running[node] = None;
     }
 
     /// Start a new process of `node`: a fresh SWIM instance that knows nothing,
@@ -314,12 +476,15 @@ impl Net {
         n.life = Life::Running;
         n.buffered.clear();
         n.due.clear();
+        n.members = process_members(&self.exchanges, node, n.epoch);
+        self.exchanges.lock().running[node] = Some(n.members.clone());
     }
 
     /// Resume a frozen node: the timers that came due fire, and the datagrams
     /// that waited in its socket are read, in order, as a resumed process does.
     fn resume(&mut self, node: usize) {
         self.nodes[node].life = Life::Running;
+        self.exchanges.lock().running[node] = Some(self.nodes[node].members.clone());
         for event in std::mem::take(&mut self.nodes[node].due) {
             self.input(node, Via::Other, |swim, out| {
                 let _ = swim.handle_timer(event, out);
@@ -673,4 +838,156 @@ fn a_start_with_nothing_recorded_walks_once_and_the_next_is_taken_at_once() {
     let (rejoins, renames) = restart_once(&mut net, B, 10_000);
     assert_eq!((rejoins, renames), (0, 2));
     assert_eq!(incarnation(&net, B), 21);
+}
+
+// Immediate facts exchanges (ADR-247).
+
+/// How many exchanges have been started: a mark for [`started_since`].
+fn mark(net: &Net) -> usize {
+    net.exchanges.lock().log.len()
+}
+
+/// The exchanges started since `mark`, as `(from, to)` pairs, sorted.
+fn started_since(net: &Net, mark: usize) -> Vec<(usize, usize)> {
+    let mut pairs: Vec<(usize, usize)> =
+        net.exchanges.lock().log[mark..].iter().map(|started| (started.from, started.to)).collect();
+    pairs.sort_unstable();
+    pairs
+}
+
+/// The boot of the block `holder` holds of `of`.
+fn held_boot(net: &Net, holder: usize, of: usize) -> Option<Vec<u8>> {
+    let view = net.nodes[holder].members.view();
+    view.blocks.get(&node_id(of)).map(|held| held.facts.boot.clone())
+}
+
+/// Run the clock in 50 ms steps until `peer` has seen `of` renamed once more
+/// than it had (within 10 s), and answer when.
+fn run_until_renamed(net: &mut Net, peer: usize, of: usize) -> u64 {
+    let addr = net.nodes[of].addr;
+    let renamed = |net: &Net| -> Vec<u64> {
+        net.nodes[peer]
+            .renames
+            .iter()
+            .filter(|(at, _)| *at == addr)
+            .map(|(_, when)| *when)
+            .collect()
+    };
+    let before = renamed(net).len();
+    let until = net.now + 10_000;
+    loop {
+        if let Some(when) = renamed(net).get(before) {
+            return *when;
+        }
+        assert!(net.now < until, "{peer} never saw {of} renamed again");
+        net.run_for(50);
+    }
+}
+
+/// Every restart, dead for 0, 1.5, 3 or 10 s: each peer, which sees the member
+/// renamed (and up as well, when it had declared it down), starts exactly one
+/// exchange with it, and the restarted member, which sees each peer up, exactly
+/// one with each. Each is answered and leaves its starter holding the other's
+/// block at the end of the input that started it (`Net::exchanges_held`), and
+/// with no sync tick in the simulation every member holds every other's current
+/// block.
+#[test]
+fn every_restart_starts_one_exchange_each_way_and_every_block_is_held() {
+    for down in [0, 1_500, 3_000, 10_000] {
+        let mut net = trio();
+        for restart in 1..=10 {
+            let since = mark(&net);
+            restart_once(&mut net, B, down);
+            assert_eq!(
+                started_since(&net, since),
+                vec![(A, B), (B, A), (B, C), (C, B)],
+                "dead {down} ms, restart {restart}"
+            );
+            let log = net.exchanges.lock().log[since..].to_vec();
+            assert!(
+                log.iter().all(|started| started.answered.is_some()),
+                "dead {down} ms, restart {restart}: every exchange answered: {log:?}"
+            );
+            for holder in [A, B, C] {
+                for of in [A, B, C] {
+                    if holder != of {
+                        assert_eq!(
+                            held_boot(&net, holder, of),
+                            Some(boot(of, net.nodes[of].epoch)),
+                            "dead {down} ms, restart {restart}: {holder} holds {of}'s block"
+                        );
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// A rename that lands within a sync interval of the last exchange with the
+/// member starts none, and one that lands after it starts one (ADR-247).
+#[test]
+fn a_rename_within_the_interval_of_the_last_exchange_starts_none_and_one_after_it_does() {
+    let mut net = trio();
+    let first = mark(&net);
+    net.kill(B);
+    net.restart(B);
+    let renamed = run_until_renamed(&mut net, A, B);
+    assert_eq!(started_since(&net, first).iter().filter(|p| **p == (A, B)).count(), 1);
+
+    let second = mark(&net);
+    net.kill(B);
+    net.restart(B);
+    let again = run_until_renamed(&mut net, A, B);
+    assert!(again - renamed < 5_000, "premise: within the interval ({renamed}, {again})");
+    net.run_for((renamed + 4_900).saturating_sub(net.now));
+    assert_eq!(
+        started_since(&net, second).iter().filter(|p| **p == (A, B)).count(),
+        0,
+        "A started none for the rename at {again}, {} ms after the last",
+        again - renamed
+    );
+
+    net.run_for(12_000);
+    let third = mark(&net);
+    net.kill(B);
+    net.restart(B);
+    let later = run_until_renamed(&mut net, A, B);
+    assert!(later - renamed >= 5_000, "premise");
+    net.run_for(1_000);
+    assert_eq!(started_since(&net, third).iter().filter(|p| **p == (A, B)).count(), 1);
+}
+
+/// A member that rejoins (frozen until its peers declared it down, then resumed)
+/// dropped every block it held, and starts an exchange with every peer it holds
+/// live in the input that rejoined it; each peer, seeing it renamed, starts one
+/// with it (ADR-247). Each then holds the other's block.
+#[test]
+fn a_member_that_rejoins_exchanges_with_every_peer_it_holds_live() {
+    let mut net = trio();
+    net.freeze(B);
+    net.run_for(15_000);
+    assert!(
+        [A, C].iter().all(|peer| !net.live_at(*peer).contains(&net.nodes[B].addr)),
+        "premise: its peers declared B down"
+    );
+    let (back, since) = (net.now, mark(&net));
+    net.resume(B);
+    net.run_for(15_000);
+    let &(_, rejoined) = net.nodes[B].rejoins.last().expect("premise: B rejoined");
+    assert!(rejoined >= back);
+    let at_rejoin: BTreeSet<usize> = net
+        .exchanges
+        .lock()
+        .log
+        .iter()
+        .filter(|started| started.from == B && started.at == rejoined)
+        .map(|started| started.to)
+        .collect();
+    assert_eq!(at_rejoin, BTreeSet::from([A, C]), "B, in the input that rejoined it");
+    let since = started_since(&net, since);
+    for peer in [A, C] {
+        assert_eq!(since.iter().filter(|p| **p == (peer, B)).count(), 1, "{peer} on the rename");
+        assert_eq!(held_boot(&net, B, peer), Some(boot(peer, 0)));
+        assert_eq!(held_boot(&net, peer, B), Some(boot(B, 0)));
+    }
 }
