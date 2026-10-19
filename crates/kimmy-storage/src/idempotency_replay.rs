@@ -1,9 +1,9 @@
 //! The records a replay page carries (ADR-212's replay of a restored member's
-//! own origin, B5): B2 of the build review, the records of the page's
-//! collections whose request spans the page, and m1's records cursor, which pages
+//! own origin, ADR-240): the **spanning records**, the records of the page's
+//! collections whose request spans the page, and the records cursor, which pages
 //! records too many for one frame without moving the replay's position.
 //!
-//! **Why B2.** A replay page's own advance (the rows of the requester's origin
+//! **Why the spanning records.** A replay page's own advance (the rows of the requester's origin
 //! inside it) and the records its sender cannot vouch for by its oplog (F3) are
 //! not every record a page's entries need. A request whose attempts all ended on
 //! other members merges into a record with no row of the requester's origin, and
@@ -17,7 +17,7 @@
 //! lie between its `first` and `last`, so every record with an effect on the page
 //! is among these. Carried at `first`, a record rides with the first entry of
 //! its collection the requester takes, so a batch that stops between an effect
-//! and `last` stores it all the same, as B1's lowest row does for a window.
+//! and `last` stores it all the same, as a window's lowest carrying row does.
 
 use std::collections::HashSet;
 
@@ -35,8 +35,8 @@ use crate::snapshot::RecordsBase;
 use crate::tables::IDEMPOTENCY;
 use crate::walk::{WalkScope, open_walk_table};
 
-/// Where a replay's pages of records alone stand at one replay position (m1 of
-/// the build review): what the next page at that position goes on after.
+/// Where a replay's pages of records alone stand at one replay position: what
+/// the next page at that position goes on after.
 ///
 /// A replay page whose entries cannot cross with the records they need (more
 /// than a frame of them, all riding its first entry) carries records alone, in
@@ -45,7 +45,7 @@ use crate::walk::{WalkScope, open_walk_table};
 /// records after that key, and once what is left fits with its entries, the
 /// entries resume and the cursor ends.
 ///
-/// **What it pages is fixed when it is cut**: B2's records of the collections the
+/// **What it pages is fixed when it is cut**: the spanning records of the collections the
 /// page's entries named (`collections`) through the page's end (`through`). Every
 /// page at the position reads that set again and carries entries no further
 /// than `through`, so a record an entry of a later page there needs is in it,
@@ -90,7 +90,7 @@ impl ReplayRecords {
 /// ([`Engine::replay_page_records`]).
 #[derive(Debug)]
 pub struct ReplayPageRecords {
-    /// B2's records ([`Engine::records_for_replay_page`]), in key order, less
+    /// The spanning records ([`Engine::records_for_replay_page`]), in key order, less
     /// those in `passed`: under an honoured cursor, of the cursor's collections
     /// as well as the page's, through the cursor's end.
     pub records: Vec<CarriedRecord>,
@@ -133,7 +133,7 @@ impl Engine {
         Ok(removed)
     }
 
-    /// B2's records of a replay page whose entries name `collections`, from
+    /// The spanning records of a replay page whose entries name `collections`, from
     /// `from` (exclusive, the page's start) through `through` (its end): every
     /// record of those collections with `last` above `from` and `first` at or
     /// below `through`, live by the window alone (a record outlives a drop of
@@ -189,7 +189,7 @@ impl Engine {
         Ok(out)
     }
 
-    /// One replay page's records read, in one read transaction: B2's records
+    /// One replay page's records read, in one read transaction: the spanning records
     /// ([`Self::records_for_replay_page`]), and with a `cursor` of this page's
     /// position and of this log's epoch ([`ReplayRecords`]), its set read again
     /// with them, the records the change log names above its base (at most
@@ -349,7 +349,7 @@ mod tests {
         records.iter().map(|r| (r.collection.0, r.scope.0[0])).collect()
     }
 
-    /// B2's rule: the records of the named collections with `last` above the
+    /// The spanning rule: the records of the named collections with `last` above the
     /// page's start and `first` at or below its end, live by the window, carried
     /// at their `first`, in key order; nothing of another collection, of a request
     /// that ended at or before the start or began after the end, or past its
@@ -379,7 +379,7 @@ mod tests {
 
     /// An orphan row (its record gone, as a retention pass stopped between chunks
     /// leaves one) inside a replay page's range is passed over without error and
-    /// ships nothing: B2 reads the records, and the window's own rows (F2, F3)
+    /// ships nothing: the spanning rule reads the records, and the window's own rows (F2, F3)
     /// name a record that is not there.
     #[test]
     fn an_orphan_row_inside_a_replay_page_ships_nothing() {
@@ -484,7 +484,7 @@ mod tests {
         assert_eq!(rest, want);
     }
 
-    /// B2's rule is `first` at or below the page's end: a record that begins
+    /// The spanning rule is `first` at or below the page's end: a record that begins
     /// exactly there is the page's, since its effect can be the page's last entry,
     /// at that HLC, on the origin replayed.
     #[test]

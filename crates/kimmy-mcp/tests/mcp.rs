@@ -1839,7 +1839,7 @@ async fn a_vector_search_whose_filter_expr_cannot_be_evaluated_is_refused() {
 }
 
 // ---------------------------------------------------------------------------
-// Idempotency keys (B5): the argument behaves as the REST header does
+// Idempotency keys (ADR-240): the argument behaves as the REST header does
 // ---------------------------------------------------------------------------
 
 const KEY: &str = "6f1c0e52-8a1d-4f53-9b3e-2c1d6a7e4b90";
@@ -2068,7 +2068,7 @@ async fn a_keyed_tool_call_sent_again_is_its_first_result_marked_as_a_replay() {
     assert_eq!(code, "idempotency_key_reused", "{reused}");
 }
 
-/// KR through the tools: a key two members accepted for two calls, whose
+/// A contested key through the tools: a key two members accepted for two calls, whose
 /// records met here in a merge, refuses every retry of the call as a key
 /// reused, writing nothing and never answering from the record, though the
 /// merged record is this call's own. The other member's record is stored as

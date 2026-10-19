@@ -1,4 +1,4 @@
-//! `Idempotency-Key` at the HTTP and MCP edges (B5).
+//! `Idempotency-Key` at the HTTP and MCP edges (ADR-240).
 //!
 //! A client may send `Idempotency-Key` with a document write. The member that
 //! applies the write keeps a record of it in the write's own transaction, and a

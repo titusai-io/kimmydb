@@ -1,4 +1,4 @@
-//! Idempotency keys across members over real TCP sockets (B5, "Replication and
+//! Idempotency keys across members over real TCP sockets (ADR-240, "Replication and
 //! the cross-member retry", tests C1 to C9). Each member is an engine serving
 //! the real replication listener; a keyed request is the engine's keyed write,
 //! which is what the API's keyed routes call once the gate lets the key in.
@@ -350,7 +350,7 @@ impl ModifySpec for IncAll {
     }
 }
 
-/// The stamp rule on a fresh attempt (Chris's ruling on S departure 1): a keyed
+/// The stamp rule on a fresh attempt (Chris's ruling, 2026-10-17): a keyed
 /// multi-chunk `$inc` on A, two documents a chunk, races two unrelated writers
 /// between its first and second chunk, one on B (pulled into A before the next
 /// chunk) and one on A itself. Each document they wrote is left alone and

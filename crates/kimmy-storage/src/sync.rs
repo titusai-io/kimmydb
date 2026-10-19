@@ -753,7 +753,7 @@ impl Engine {
     }
 
     /// [`Self::apply_peer_batch_into`], with the idempotency records the frame
-    /// carried beside its entries (B5) and the way they came: each is stored in
+    /// carried beside its entries (ADR-240) and the way they came: each is stored in
     /// the run that takes an entry of its collection (see
     /// [`Self::apply_peer_window_carrying_into`]).
     #[allow(clippy::too_many_arguments)]
@@ -798,7 +798,7 @@ impl Engine {
     }
 
     /// [`Self::apply_peer_window_into`], with the idempotency records the frame
-    /// carried beside its entries (B5, "On the receiving side") and the way
+    /// carried beside its entries (ADR-240, "On the receiving side") and the way
     /// they came.
     ///
     /// **A record is stored in the run that takes any entry of its collection
@@ -810,7 +810,7 @@ impl Engine {
     /// not an entry of its collection was taken and whether or not the
     /// collection stands here: the sender ships a record because the coverage
     /// this window grants passes a stamp that vouches for it, or because it
-    /// cannot vouch for that stamp by its oplog (B5, records travel with
+    /// cannot vouch for that stamp by its oplog (ADR-240, records travel with
     /// coverage), and a covered stamp is never served here again. Through
     /// [`Self::store_record`] (a dropped life's too, merged, rows at the merged
     /// `first` and `last` and the sender's row, its stamps witnessed, nothing
@@ -1118,7 +1118,7 @@ impl Engine {
         }
         let mut window =
             self.read_oplog_linear_in(&txn, start, limit, scope, skip, keep, budget)?;
-        // The records the window ships, in its own transaction (B5).
+        // The records the window ships, in its own transaction (ADR-240).
         #[cfg(test)]
         race_hooks::reach(race_hooks::Race::WindowRecords);
         (window.records, window.unanchored) =
@@ -1152,7 +1152,7 @@ impl Engine {
     }
 
     /// The idempotency records a window ships, in the window's own read
-    /// transaction (B5, records travel with coverage): this node's servable
+    /// transaction (ADR-240, records travel with coverage): this node's servable
     /// vector read there, the coverage the window grants the requester from it
     /// ([`window_reach`]), and [`crate::idempotency::records_for_coverage`] over
     /// what the requester holds. A request that names nothing it holds (a
@@ -1258,7 +1258,7 @@ impl Engine {
     }
 
     /// [`Self::apply_batch`], with the idempotency records the entries came
-    /// with (B5), stored as [`Self::apply_peer_window_carrying_into`] says.
+    /// with (ADR-240), stored as [`Self::apply_peer_window_carrying_into`] says.
     pub fn apply_batch_carrying(
         &self,
         entries: &[OplogEntry],
@@ -1518,7 +1518,7 @@ impl Engine {
 
         // Every record the frame carries that no run stored, in the transaction
         // that raises this node's coverage, whether or not an entry of its
-        // collection was taken (B5, records travel with coverage): a stamp this
+        // collection was taken (ADR-240, records travel with coverage): a stamp this
         // window covers is never served here again, so a record vouched for at
         // one is stored now or never. A frame of records held already writes
         // nothing, and costs no commit where nothing else is written.
@@ -1650,7 +1650,7 @@ impl Engine {
         // Counted only now: a release in a run that failed to commit did not
         // happen, and the next window releases it again (ADR-169's addendum).
         self.count_held_marks_released(std::mem::take(&mut run.released));
-        // And the records stored in it, for the same reason (B5).
+        // And the records stored in it, for the same reason (ADR-240).
         if let Some(via) = run.via {
             self.count_records_received(via, std::mem::take(&mut run.records));
         }
@@ -1980,7 +1980,7 @@ struct Run<'e> {
     /// commit has landed, even if what follows it then failed.
     last: bool,
     last_committed: bool,
-    /// Idempotency records stored into `txn` (B5), counted by `via` once it
+    /// Idempotency records stored into `txn` (ADR-240), counted by `via` once it
     /// commits.
     records: usize,
     via: Option<crate::idempotency::RecordsVia>,
@@ -2415,7 +2415,7 @@ impl Engine {
         let txn = self.run_txn(run)?;
         let applied = self.apply_remote_in_txn(txn, &collection, entry, position)?;
         // The frame's records of this collection, on either outcome of the
-        // merge, in this run's transaction (B5).
+        // merge, in this run's transaction (ADR-240).
         if frame.owes(collection.id, entry.stamp) {
             run.records += self.store_frame_records(txn, collection.id, entry.stamp, frame)?;
         }
@@ -3333,17 +3333,17 @@ pub(crate) mod race_hooks {
         /// A document repair's page has been taken and judged to apply, and has not yet taken
         /// the writer: a retention pass can commit between a plan and the page.
         ConvergePage,
-        /// A peer window has been read, and its idempotency records not yet (B5): not a
+        /// A peer window has been read, and its idempotency records not yet (ADR-240): not a
         /// race, a point to show they are read in the window's own transaction.
         WindowRecords,
-        /// A keyed insert has committed, and not yet published (B5): not a race, the point
+        /// A keyed insert has committed, and not yet published (ADR-240): not a race, the point
         /// a pull between the write and anything after it reads.
         KeyedCommitted,
-        /// A snapshot page's rows have been read and its cursor cut (B5): not a race, a
+        /// A snapshot page's rows have been read and its cursor cut (ADR-240): not a race, a
         /// point to show the next page's records base is read in the page's own
         /// transaction.
         PageRead,
-        /// A snapshot page's transaction has committed (B5): not a race, a point to show
+        /// A snapshot page's transaction has committed (ADR-240): not a race, a point to show
         /// its records committed with its documents.
         PageCommitted,
     }

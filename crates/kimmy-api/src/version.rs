@@ -65,7 +65,7 @@ pub enum Capability {
     /// node built with `local-embeddings` and refused on one without.
     LocalEmbeddings,
     /// `Idempotency-Key` on the document writes, the `Idempotency-Replayed`
-    /// marker and the two key codes (B5). **The one that varies at run time**:
+    /// marker and the two key codes (ADR-240). **The one that varies at run time**:
     /// listed only while this member takes the header, which is while the
     /// operator's switch is set and every live member carries records. A
     /// client that read it and then meets the gate's `400` has met a roll, a
@@ -163,7 +163,7 @@ pub async fn version(State(state): State<SharedState>) -> impl IntoResponse {
         // `storage.oplog_retention_secs`, a field for the reason `durability`
         // is one. The draft's §2.5.2 asks a server to publish its expiry
         // policy, and members configured differently remember keys for
-        // different times, so it is this node's (B5).
+        // different times, so it is this node's (ADR-240).
         "idempotencyWindowSecs": state.idempotency_window_secs(),
     })) as Json<Value>
 }
@@ -178,7 +178,7 @@ mod tests {
     }
 
     /// `idempotency-keys` is listed exactly while the gate is open, read at
-    /// each answer (B5), and appended last: a client that reads the list as
+    /// each answer (ADR-240), and appended last: a client that reads the list as
     /// ordered finds every earlier capability where it was.
     #[test]
     fn idempotency_keys_is_listed_only_while_the_gate_is_open() {

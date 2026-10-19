@@ -1025,7 +1025,7 @@ where
 // Writes
 // ---------------------------------------------------------------------------
 
-/// Insert one document. With an idempotency key (B5) the engine's keyed twin
+/// Insert one document. With an idempotency key (ADR-240) the engine's keyed twin
 /// writes it with its record, or answers the first attempt's record, and an
 /// absent `_id` is the key's derived one rather than a random ObjectId.
 ///
@@ -1070,7 +1070,7 @@ pub fn insert(
 }
 
 /// The `_id` a keyed insert stored at `position`, recomputed for a replay: the
-/// client's own, as sent, or else the key's derived one (B5), which the engine
+/// client's own, as sent, or else the key's derived one (ADR-240), which the engine
 /// stored as a string.
 fn keyed_id(
     sent: Option<bson::Bson>,
@@ -1405,7 +1405,7 @@ pub fn update(
 /// What a filtered write counted, fresh from the engine or from the first
 /// attempt's record: cumulative over the request's commits, and over its
 /// attempts once it resumes. `skipped` and `resumed` are a keyed request's
-/// own and stay 0 and `false` for any other (B5).
+/// own and stay 0 and `false` for any other (ADR-240).
 struct FilteredCounts {
     matched: u64,
     modified: u64,

@@ -21,11 +21,11 @@
 //! and the tag list below is hand-written in both directions, so a table added
 //! to it makes every backup this build writes unrestorable by an older one.
 //!
-//! The idempotency records and their rows by stamp (B5) are carried as tags 12
+//! The idempotency records and their rows by stamp (ADR-240) are carried as tags 12
 //! and 13, so a restored member keeps the records of the writes it holds, those
 //! it took by snapshot included: without them a retry there would apply on top
 //! of a write the backup brought back. That is a backup rollback boundary
-//! (Decision Q4): a build before 0.52 refuses a backup that holds either tag, as
+//! (ADR-240): a build before 0.52 refuses a backup that holds either tag, as
 //! it refuses every tag it does not know. A backup an older build wrote restores
 //! into this one with no records, and nothing about restoring changes for it.
 //! **The rows by stamp travel only beside a record**: a store that holds no
@@ -91,9 +91,9 @@ const T_OPLOG_ARRIVAL_SEQ: u8 = 8;
 const T_COLLECTIONS_DROPPED: u8 = 9;
 const T_OPLOG_VERSIONS: u8 = 10;
 const T_INDEXES_DROPPED: u8 = 11;
-/// `(collection id, scope hash) -> record` (B5).
+/// `(collection id, scope hash) -> record` (ADR-240).
 const T_IDEMPOTENCY: u8 = 12;
-/// `stamp -> collection id ‖ scope hash` (B5).
+/// `stamp -> collection id ‖ scope hash` (ADR-240).
 const T_IDEMPOTENCY_BY_STAMP: u8 = 13;
 
 /// What a backup or restore moved.
@@ -206,7 +206,7 @@ impl Engine {
             out
         });
         // The records, so a restored member answers a retry of a write it holds
-        // from the record and not by applying it again (B5).
+        // from the record and not by applying it again (ADR-240).
         simple!(T_IDEMPOTENCY, tables::IDEMPOTENCY, |k: (u64, &[u8])| {
             let mut out = k.0.to_be_bytes().to_vec();
             out.extend_from_slice(k.1);

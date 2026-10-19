@@ -144,7 +144,7 @@ pub struct StorageReadings {
     /// applied on this member (`Engine::decimal128_id_present`, ADR-238): the
     /// durable marker a rollback runbook reads, read at scrape.
     pub decimal128_id_present: bool,
-    /// The records keyed writes leave (B5): how many this member holds, and
+    /// The records keyed writes leave (ADR-240): how many this member holds, and
     /// the engine's counts of the ones it took from peers, could not decode and
     /// collected ([`crate::AppState::idempotency_reading`]).
     pub idempotency: IdempotencyReading,
@@ -169,7 +169,7 @@ pub struct StorageReadings {
     pub ownership: OwnershipReading,
 }
 
-/// The ways a record of a keyed write arrives from a peer (B5), the labels of
+/// The ways a record of a keyed write arrives from a peer (ADR-240), the labels of
 /// `kimmy_idempotency_records_received_total{via}`, in the order of
 /// [`IdempotencyReading::received`]: a window this member pulled, a window a
 /// peer pushed, the replay of this member's own origin (ADR-212), a snapshot
@@ -186,7 +186,7 @@ pub fn received_via_slot(via: &str) -> usize {
         .unwrap_or_else(|| panic!("`{via}` is not a way an idempotency record is received"))
 }
 
-/// The storage engine's idempotency records, read at the scrape (B5). Counts
+/// The storage engine's idempotency records, read at the scrape (ADR-240). Counts
 /// since the process started, but for `records`, which is a level.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct IdempotencyReading {
@@ -547,15 +547,15 @@ pub struct MetricsSnapshot {
     /// applied on this member (ADR-238): an engine reading.
     pub decimal128_id_present: u64,
     /// Keyed requests by outcome, in `KeyedOutcome::ALL` order, and the
-    /// replays answered from a record another member wrote (B5).
+    /// replays answered from a record another member wrote (ADR-240).
     pub idempotency_requests: [u64; crate::idempotency::KeyedOutcome::ALL.len()],
     pub idempotency_peer_replays: u64,
-    /// The engine's records (B5), as [`StorageReadings::idempotency`] read them.
+    /// The engine's records (ADR-240), as [`StorageReadings::idempotency`] read them.
     pub idempotency_records: u64,
     pub idempotency_records_received: [u64; RECORDS_RECEIVED_VIA.len()],
     pub idempotency_records_undecodable: u64,
     /// Records that fit no frame or replay page that must carry them, by
-    /// `kimmy_cluster::UnfitPath` (m1 of the B5 build review).
+    /// `kimmy_cluster::UnfitPath` (ADR-240, records too many for a frame).
     pub idempotency_records_unfit: [u64; 3],
     pub idempotency_records_collected: u64,
     /// Definition repairs by outcome (`DigestRepairOutcome::DEFINITION` are the labels used),
@@ -799,7 +799,7 @@ pub struct Metrics {
     /// The drop purger's, for its progress age (ADR-189).
     purge_counters: OnceLock<std::sync::Arc<kimmy_storage::PurgeCounters>>,
     /// Keyed requests by what became of them, and the replays of another
-    /// member's record among them (B5): counted by the edge, which is the one
+    /// member's record among them (ADR-240): counted by the edge, which is the one
     /// place every keyed request passes, the gate's refusals included.
     idempotency_requests: [AtomicU64; crate::idempotency::KeyedOutcome::ALL.len()],
     idempotency_peer_replays: AtomicU64,
@@ -952,13 +952,13 @@ impl Metrics {
         self.rate_limited_principal.fetch_add(1, Ordering::Relaxed);
     }
 
-    /// One keyed request, by what became of it (B5).
+    /// One keyed request, by what became of it (ADR-240).
     pub fn record_idempotency(&self, outcome: crate::idempotency::KeyedOutcome) {
         self.idempotency_requests[outcome.slot()].fetch_add(1, Ordering::Relaxed);
     }
 
     /// One replay answered from a record another member wrote: the
-    /// cross-member deduplication at work (B5). Also counted as `replayed`.
+    /// cross-member deduplication at work (ADR-240). Also counted as `replayed`.
     pub fn record_idempotency_peer_replay(&self) {
         self.idempotency_peer_replays.fetch_add(1, Ordering::Relaxed);
     }
@@ -2973,7 +2973,7 @@ mod tests {
 
         m.record_backup(Duration::from_secs(42));
         // Each keyed outcome a count of its own, so one rendered under another
-        // label cannot match (B5).
+        // label cannot match (ADR-240).
         for (outcome, times) in
             crate::idempotency::KeyedOutcome::ALL.into_iter().zip([3, 5, 7, 2, 4, 6])
         {
@@ -5160,8 +5160,8 @@ kimmy_storage_cache_reads_total{result=\"miss\"} 9104
                 + kimmy_cluster::DefinitionJudgement::ALL.len()
                 + kimmy_storage::DEFINITION_RESULTS.len()
                 // Keyed requests by outcome, peer replays, the records held, the
-                // records received by way, undecodable and collected (B5), and
-                // those that fit no frame, by path (m1).
+                // records received by way, undecodable and collected (ADR-240), and
+                // those that fit no frame, by path.
                 + crate::idempotency::KeyedOutcome::ALL.len()
                 + 1
                 + 1

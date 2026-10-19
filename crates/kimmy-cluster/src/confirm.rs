@@ -44,7 +44,7 @@ pub const MAX_CONFIRM_BACKOFF: Duration = Duration::from_secs(60);
 pub const REDIAL_GUARD: Duration = Duration::from_secs(1);
 
 /// Why a push sent nothing when the idempotency records its sender cannot
-/// vouch for by its oplog do not fit one frame (B5): the window would carry no
+/// vouch for by its oplog do not fit one frame (ADR-240): the window would carry no
 /// entries and grant nothing.
 const RECORDS_OVERFILL_UNREACHED: &str = "the idempotency records this node cannot vouch for by \
      its oplog do not fit one frame; anti-entropy will carry the change once this node pulls \
@@ -740,8 +740,8 @@ impl Confirmer {
         }
         if let Fits::Only(fits) = fits {
             if fits == 0 {
-                // No entry fits with the records riding the first (m1 of the B5
-                // build review), or the first is larger than a frame itself:
+                // No entry fits with the records riding the first, or the first
+                // is larger than a frame itself:
                 // nothing is pushed, and the waiters resolve pending. A pull's
                 // partial window of records alone carries such records.
                 return PushResult::NothingSent {
@@ -822,7 +822,7 @@ impl Confirmer {
             scanned_to: window.scanned_to,
             exhausted: window.exhausted,
             versions: mine.clone(),
-            // The records the window ships, read with it (B5).
+            // The records the window ships, read with it (ADR-240).
             records: crate::transport::records_to_send(engine, window.records),
         };
         if let Err(e) = write_frame(&mut stream, &push).await {
@@ -2060,7 +2060,7 @@ mod tests {
         assert!(b.served.windows().is_empty(), "the member was sent no window");
     }
 
-    /// m1 of the B5 build review: a push none of whose entries fits one frame
+    /// A push none of whose entries fits one frame
     /// with the idempotency records riding its first sends nothing and leaves the
     /// change to anti-entropy, whose partial windows carry such records alone,
     /// rather than failing as an entry that cannot replicate.

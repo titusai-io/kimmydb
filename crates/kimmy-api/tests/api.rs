@@ -9093,7 +9093,7 @@ async fn find_and_modify_can_remove_and_can_project() {
 /// `find_and_modify` reports the version it produced only for a document that
 /// still exists: a change reports it, a removal (whose tombstone nothing can be
 /// conditional on) and an update that left the document as it was (ADR-208) do
-/// not. Held here because the answer is now rendered from an outcome (B5), and
+/// not. Held here because the answer is now rendered from an outcome (ADR-240), and
 /// nothing else drove a removal's answer for the absence of `stamp`.
 #[tokio::test]
 async fn find_and_modify_reports_a_stamp_only_for_a_document_that_still_exists() {

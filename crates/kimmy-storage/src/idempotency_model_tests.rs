@@ -1,4 +1,4 @@
-//! The idempotency model test (B5, design "Tests > Model test"): three or four engines
+//! The idempotency model test (ADR-240, design "Tests > Model test"): three or four engines
 //! run random, seeded schedules of keyed writes, retries, crashes, pulls, snapshots,
 //! outages, drops, restores and retention, and invariants I1 to I7 are asserted after
 //! every step and at quiescence.
@@ -47,9 +47,9 @@
 //! whole-database snapshot), with writes on the sender between its pages; take a member
 //! down and up; restart or crash a member; back a member up and restore it (from its
 //! latest backup or an earlier one, and the sender of a page or a snapshot between two
-//! of its pages, m4), which then replays its own origin from its peers (ADR-212, each page
-//! cut as the transport's `cut_replay_page` cuts it, in a frame of a few units: B2's
-//! records, and records alone under a records cursor, m1), with steps between the
+//! of its pages), which then replays its own origin from its peers (ADR-212, each page
+//! cut as the transport's `cut_replay_page` cuts it, in a frame of a few units: the
+//! spanning records, and records alone under a records cursor), with steps between the
 //! replay's pages; rewind a member (`restore --until`, offline), as the documented
 //! procedure has it (alone when no peer holds a write the rewind undoes, else every
 //! member to the same target), each then replaying its own origin the same way; leave orphan rows by stamp (records past their window removed, as
@@ -77,7 +77,7 @@
 //! holds exactly. `Anywhere`: retries land on any member, concurrent attempts on two
 //! members included, and I6 bounds the counters.
 //!
-//! **Records outlive a drop** (ruling A): a record lives its window, whatever happens to
+//! **Records outlive a drop** (ADR-240): a record lives its window, whatever happens to
 //! its collection, so a retry after a drop (and a creation again) replays its first
 //! answer and writes nothing to the life that stands. The invariants hold across lives.
 //!
@@ -110,18 +110,18 @@
 //!   holds its application. The stamp rule leaves what is stored at or above the merged
 //!   `first` (written meanwhile by another, or, after a drop, the later life's
 //!   documents), counted as left; and a request never completes on a record whose
-//!   `first` is another request's (finding KR: such a record is contested).
+//!   `first` is another request's (such a record is contested).
 //! - **Life**: a member that holds K's live `done` record replays it (a delete by id
 //!   while its document's row is at or above the delete, or the row is gone and the
 //!   collection's drop or floor is at or above it), and no replay answers from a record
 //!   past its window; an `applying` record of any kind but a filter's replays too. A
 //!   rewind leaves no record of a request whose every write it discarded; one it cut
-//!   part-way goes only as a bulk insert's (its standing prefix bare by design, Y's m3)
+//!   part-way goes only as a bulk insert's (its standing prefix bare by design)
 //!   and is reopened `applying` as any other kind's, its rows kept (a filter's with no
-//!   cursor; G's narrowed rule); and it leaves no row by stamp naming a record it removed.
+//!   cursor); and it leaves no row by stamp naming a record it removed.
 //!   A keyed delete by id is judged by the record's `first`. A record past its window
-//!   merges into a live record of the same request and is refused otherwise (m2).
-//! - **Contested** (the KR ruling): the test keeps, per member and key, the requests
+//!   merges into a live record of the same request and is refused otherwise.
+//! - **Contested** (the contested flag): the test keeps, per member and key, the requests
 //!   merged into its live record (a local commit adds its own; a stored record adds its
 //!   sender's; an absent record has none), so the merge algebra `a.contested ||
 //!   b.contested || a.fingerprint != b.fingerprint` is the set's size: a live record is
@@ -134,30 +134,31 @@
 //!   record's `first` (an earlier record's under the key) vouches for nothing of it.
 //!
 //! **Findings the model classifies**, each counted in every run's summary line:
-//! - **Relay** (the G1 analysis's G1b, G2, G2b, G3, T2, G5): an effect or an entry of K
-//!   reached a member without K's record (an application on its own effect by a member
-//!   that held no live record and had taken no entry of K; an entry shipped without the
-//!   record by a sender that held it; a record missing at quiescence where a document
-//!   holds K). Fixed by records travelling with coverage. **Fails every run** (generated
-//!   and named) by default; `IDEM_LENIENT=1` counts it instead, for a tree without that
-//!   fix.
-//! - **KR** (see I8): fails every run.
+//! - **Relay** (relays after a snapshot, of a losing entry, of a coverage-only window,
+//!   across origins, and by a replay): an effect or an entry of K reached a member without
+//!   K's record (an application on its own effect by a member that held no live record and
+//!   had taken no entry of K; an entry shipped without the record by a sender that held it;
+//!   a record missing at quiescence where a document holds K). Fixed by records travelling
+//!   with coverage. **Fails every run** (generated and named) by default; `IDEM_LENIENT=1`
+//!   counts it instead, for a tree without that fix.
+//! - **KR**, a contested key completed on (see I8): fails every run.
 //! - **S1**: a record at quiescence that the merged record dominates, or none where no
 //!   document holds the key: a record state carried only by entries that lost where the
 //!   member pulled them from, or by a record-only `done` (G8's ruled residual). Harmless
 //!   while I2 holds. Counted in a generated run; fails it with `IDEM_STRICT=1`, and fails
 //!   every named row.
-//! - **R1** (counted, never failed; a convergence matter outside B5): a reset identity's
-//!   writes, or a restored identity's writes after its backup, kept by peers only as page
-//!   state, never converge to the reset or restored member.
+//! - **R1** (counted, never failed; a convergence matter outside idempotency keys): a reset
+//!   identity's writes, or a restored identity's writes after its backup, kept by peers
+//!   only as page state, never converge to the reset or restored member.
 //!
-//! Under the life rule the extended model found D2 (a retry after a drop doubled a
-//! counter a later write carried over), D3 (a resume across a drop left the later life's
-//! counters) and KR (a reused key's merged records). Ruling A makes D2 a Life and I1
-//! violation and D3 the stamp rule's contract; KR is refused by the `contested` flag, and
-//! the rows `row_d2_*`, `row_d3_*` and `row_kr_*` hold the engine to it.
+//! Under the life rule the extended model found a retry after a drop doubling a counter a
+//! later write carried over, a resume across a drop leaving the later life's counters, and
+//! a reused key's merged records. With records outliving a drop the first is a Life and I1
+//! violation and the second the stamp rule's contract; the third is refused by the
+//! `contested` flag, and the rows `row_d2_*`, `row_d3_*` and `row_kr_*` hold the engine to
+//! it.
 //!
-//! **Findings RW1 and BR1** (2026-10-18, outside B5's code, fixed on main by #209 and
+//! **Findings RW1 and BR1** (2026-10-18, outside the idempotency code, fixed on main by #209 and
 //! #211): a rewind after a retention pass lowered the version vectors below the writes
 //! retention had collected, and a restore counted the rows a page left as held state as
 //! covered. Either left a member's coverage past writes it never took, and their records
@@ -166,11 +167,11 @@
 //! happens; both now hold, and every generated schedule takes rewinds and restores.
 //!
 //! **Reproducers**, both run (not ignored) and pass since their fixes landed:
-//! `finding_g1_*` (G1 as first reported: its pull serves the window without the sender's
-//! verdict, which production refuses as `StateHeld`; kept as the mechanism's minimal
-//! form) and `finding_l1_*`. The named rows `row_*` write out the breaks of the G1
-//! analysis and the shapes the design's mutants need, each run strictly; those ignored
-//! name what they wait for.
+//! `finding_g1_*` (the relay as first reported: its pull serves the window without the
+//! sender's verdict, which production refuses as `StateHeld`; kept as the mechanism's
+//! minimal form) and `finding_l1_*`. The named rows `row_*` write out the breaks an
+//! analysis of relays without the record found, and the shapes the design's mutants need,
+//! each run strictly; those ignored name what they wait for.
 
 // Members are indices into small per-member arrays (`LETTERS`, the members, a step's
 // records) all through: a range reads as "every member", an enumeration would not.
@@ -224,11 +225,11 @@ const SPARES: usize = 6;
 const ITEM_BASE: i64 = 100;
 /// The model's frame for a replay page, in units: an entry or a record costs one. Small,
 /// so that a page whose first entry needs more records than a frame holds carries
-/// records alone (m1) in generated schedules too.
+/// records alone in generated schedules too.
 const REPLAY_FRAME: usize = 4;
 /// The bytes a replay page's records delta under a cursor takes (`budget / 2` of the
 /// transport's frame): a few records, so a delta that does not reach the log's end
-/// moves the cursor's base (m1).
+/// moves the cursor's base.
 const REPLAY_DELTA_BYTES: usize = 800;
 /// A restore of this member, between two pages of a replay, restores the member that
 /// served the page just applied (its change log begins again, with another epoch).
@@ -472,7 +473,7 @@ pub(crate) struct Bias {
     pub frame: usize,
     /// Every member's room for a snapshot page's rows, in bytes
     /// (`Engine::set_snapshot_room_for_test`), so a collection of a few documents spans
-    /// pages, for the schedule's first step alone (the m4 pull): later documents grow
+    /// pages, for the schedule's first step alone (the pull a restore splits): later documents grow
     /// past any small room as their key sets do; `None` for the real one.
     pub page_room: Option<usize>,
     /// The bytes of a replay page's records delta under a cursor ([`REPLAY_DELTA_BYTES`]).
@@ -632,7 +633,7 @@ pub(crate) enum Inv {
     /// write in the member's current life of `orders` (see the module docs).
     I8,
     Life,
-    /// The contested algebra (finding KR, ruling of 2026-10-18): a member's live record
+    /// The contested algebra (the contested flag, 2026-10-18): a member's live record
     /// is contested exactly when the requests merged into it are two or more, a lookup
     /// on a contested record (or another request's) refuses, and a multi-chunk request
     /// whose record turns contested between its chunks stops there, partially applied.
@@ -655,7 +656,8 @@ pub(crate) struct Outcome {
     /// Steps run, steps between commits and drives included.
     pub steps: usize,
     /// Effects or entries that reached a member without their record: the relay
-    /// class (findings G1b, G2, G2b, G3, T2 of the G1 analysis).
+    /// class (relays after a snapshot, of a losing entry, of a coverage-only window, and
+    /// across origins).
     pub relay: usize,
     /// Settled records that differ only by a dominated, earlier state: finding S1.
     pub s1: usize,
@@ -681,8 +683,8 @@ pub(crate) struct Outcome {
     pub call_straddles: usize,
     /// Home-track runs whose exact I5 a drop of `orders` turned off.
     pub i5_off: usize,
-    /// Finding KR, a failure: an `$inc` completed on a record whose `first` is another
-    /// request's under a reused key (see `check_i8`).
+    /// A contested key completed on, a failure: an `$inc` completed on a record whose
+    /// `first` is another request's under a reused key (see `check_i8`).
     pub kr: usize,
     /// Lookups refused on a record the model holds contested, as the algebra says.
     pub contested_refused: usize,
@@ -692,18 +694,18 @@ pub(crate) struct Outcome {
     /// contested between two of their chunks, as the algebra says.
     pub contested_stopped: usize,
     /// Snapshot pages refused because they were asked with the zero records base of a
-    /// sender whose change log began since (m4, guard ii).
+    /// sender whose change log began since (the zero-base guard).
     pub records_restarts: usize,
-    /// Replay pages that carried records alone, under a records cursor (m1).
+    /// Replay pages that carried records alone, under a records cursor.
     pub records_alone: usize,
     /// Replay pages at a records cursor's position the sender's log no longer honoured
-    /// (another epoch: the sender was restored, m1's guard).
+    /// (another epoch: the sender was restored, the cursor's guard).
     pub cursor_restarts: usize,
-    /// Records a frame offered a receiver past their window there (m2: refused, unless
+    /// Records a frame offered a receiver past their window there (refused, unless
     /// of the live record's own request).
     pub past_window_offered: usize,
     /// Of them, those merged into a live record of the same request, lowering its
-    /// `first` (m2 as G narrowed it).
+    /// `first`.
     pub past_window_merged: usize,
     /// Rewinds taken (each member rewound counts), and the records they removed and
     /// reopened.
@@ -731,7 +733,7 @@ pub(crate) struct Outcome {
     /// Replay pages whose cursor's delta met a changed record too large for it.
     pub delta_too_large: usize,
     /// Records cursors dropped for that, the position's records read again from a fresh
-    /// base (Y2).
+    /// base.
     pub cursor_dropped: usize,
     /// Replay pages that could not carry what they must (the model's whole-frame
     /// refusal: F3 records more than a frame, or a page of records alone that sends
@@ -871,7 +873,7 @@ struct Ghost {
     /// record is contested exactly when the set holds two or more (`a.contested ||
     /// b.contested || a.fingerprint != b.fingerprint` is the union's size).
     fps: HashMap<(NodeId, u8, u8), BTreeSet<u8>>,
-    /// Requests a rewind cut part-way whose record it removed by design (Y's m3: a bulk
+    /// Requests a rewind cut part-way whose record it removed by design (a bulk
     /// insert whose prefix stands, every request merged into its record): their standing
     /// entries hold no record, and a retry meets the first standing document as a
     /// duplicate and writes nothing. I2 does not hold them to a record.
@@ -1138,7 +1140,7 @@ struct World {
     /// Each member's backup, with the identity it was taken under.
     backups: HashMap<usize, Vec<Backup>>,
     /// Requests go to a member catching up after a whole-database snapshot: what the
-    /// catching-up gate allows once it opens as `unknown` (finding G7), for a row.
+    /// catching-up gate allows once it opens as `unknown`, for a row.
     retry_catching_up: bool,
     /// The model's frame for a replay page ([`REPLAY_FRAME`]; a row sets its own).
     replay_frame: usize,
@@ -1283,7 +1285,7 @@ impl World {
     }
 
     /// The member's record under `key` in `c` when it is alive there: not past its
-    /// window. A record outlives a drop of its collection for its window (ruling A).
+    /// window. A record outlives a drop of its collection for its window.
     fn live_record(&self, m: usize, c: u8, key: u8) -> Res<Option<IdempotencyRecord>> {
         let record = self
             .e(m)
@@ -1579,7 +1581,7 @@ impl World {
                 .filter(|r| self.past_window(r))
                 .count();
             let before = self.live_before(to, &window.records)?;
-            // m2 as G narrowed it: a record past its window merges into a live record of
+            // A record past its window merges into a live record of
             // the same request (`first` the lower of the two), and is refused otherwise.
             let mut same: Vec<(u8, u8, Stamp)> = Vec::new();
             for carried in &window.records {
@@ -1822,7 +1824,7 @@ impl World {
             self.fps_carried(src.node_id(), to, before)?;
             if applied.records_restarted {
                 // Asked with the zero records base of a sender whose change log has begun
-                // since (m4, guard ii): nothing applied, the collection asked for again
+                // since (the zero-base guard): nothing applied, the collection asked for again
                 // from its records phase.
                 self.out.records_restarts += 1;
                 self.note(format!(
@@ -1869,7 +1871,7 @@ impl World {
             return Ok(());
         }
         // A sender restored between the pages holds what its backup held, from then on:
-        // the receiver is owed every record the sender holds at the end (m4: a page asked
+        // the receiver is owed every record the sender holds at the end (a page asked
         // with a base the restore made stale starts its collection's records again), and
         // none the restore took away.
         if sender_restored {
@@ -2068,7 +2070,7 @@ impl World {
     /// Classify an application of request `r` on member `m` whose base already holds
     /// it (I1): the relay class (the member held no record of it and had taken no entry
     /// of it), or a violation. No drop explains one: a record outlives a drop of its
-    /// collection for its window (ruling A), so a retry after a drop replays.
+    /// collection for its window, so a retry after a drop replays.
     fn on_own_effect(
         &mut self,
         p: &Prepared,
@@ -2165,7 +2167,7 @@ impl World {
             self.ghost.entries.insert(entry.stamp, (r, c, id.clone()));
             self.ghost.mark_processed(p.node, entry.stamp);
             // Writes across every life of the collection: a record outlives a drop
-            // for its window (ruling A), so a retry after one replays.
+            // for its window, so a retry after one replays.
             let earlier: Vec<Stamp> =
                 self.ghost.writes.get(&(p.node, r, c, key.clone())).cloned().unwrap_or_default();
             self.ghost.writes.entry((p.node, r, c, key.clone())).or_default().push(entry.stamp);
@@ -2275,7 +2277,7 @@ impl World {
         Ok(())
     }
 
-    /// The contested algebra's answers to a call of request `r` on `m` (finding KR): a
+    /// The contested algebra's answers to a call of request `r` on `m`: a
     /// local commit adds `r` to the record's set; a lookup refuses (422) exactly where
     /// the record before the call is contested or another request's, writing nothing;
     /// and a multi-chunk request writes no chunk after a commit point whose steps left
@@ -2353,11 +2355,11 @@ impl World {
         Ok(())
     }
 
-    /// Life (ruling A): a request whose member held its `done` record, alive by its window
-    /// alone (a drop of the collection since changes nothing), replays it. A delete by id
-    /// replays while the row of its document is at or above the delete's stamp, or when
-    /// the row is gone and the collection's drop or floor is at or above it; a row gone
-    /// otherwise (retention collected the tombstone) lets it run afresh.
+    /// Life (records outlive a drop): a request whose member held its `done` record, alive
+    /// by its window alone (a drop of the collection since changes nothing), replays it. A
+    /// delete by id replays while the row of its document is at or above the delete's
+    /// stamp, or when the row is gone and the collection's drop or floor is at or above it;
+    /// a row gone otherwise (retention collected the tombstone) lets it run afresh.
     fn check_replay(&mut self, p: &Prepared, answer: &Answer) {
         let Some(rec) = &p.pre_record else { return };
         // A contested record is refused, not replayed (the algebra's check).
@@ -2373,7 +2375,7 @@ impl World {
             return;
         }
         // A delete by id is judged by the record's `first`, the request's first write
-        // (G): its tombstone or a version over it stands at or above it, or the row is
+        // (ADR-240): its tombstone or a version over it stands at or above it, or the row is
         // gone and a drop or floor at or above it took it.
         if let crate::idempotency::RecordOutcome::Delete { stamp: Some(_), .. } = &rec.outcome {
             let stands = match p.row_before {
@@ -2401,12 +2403,12 @@ impl World {
     /// there holds its application. The stamp rule writes exactly those, and leaves a
     /// match stored at or above the merged `first` (by design, counted in `skipped`): a
     /// version written meanwhile by another, or a later life's document after a drop
-    /// (ruling A; counted here as `left_by_first`).
+    /// (records outlive a drop; counted here as `left_by_first`).
     ///
-    /// Finding KR, a failure: the merged `first` is another request's under the same key
-    /// (a key reused for another request, applied on a member without the first one's
-    /// record, the two records merged). Such a record is `contested` and answers 422 on
-    /// every path; completing on it reads the other request's `first`.
+    /// A contested key completed on, a failure: the merged `first` is another request's
+    /// under the same key (a key reused for another request, applied on a member without
+    /// the first one's record, the two records merged). Such a record is `contested` and
+    /// answers 422 on every path; completing on it reads the other request's `first`.
     fn check_i8(&mut self, r: u8, m: usize) -> Res<()> {
         let state = self.i8_state(r, m)?;
         self.check_i8_on(r, m, state)
@@ -2802,7 +2804,7 @@ impl World {
     /// request whose every write it discarded stands (`first` after the target), a record
     /// it cut part-way goes as a bulk's and stands reopened `applying` as any other kind's
     /// (a filter's with no cursor), and it leaves no row by stamp naming a record it
-    /// removed (G).
+    /// removed.
     fn rewind(&mut self, m: usize, t: u32) -> Res<()> {
         // The documented procedure (operations, "Point-in-time restore"): a rewound
         // database never rejoins a cluster that still holds the writes it undid. A member
@@ -3010,7 +3012,7 @@ impl World {
         for (key, was) in &before {
             let now = after.get(key);
             let cut = was.last.hlc > until;
-            // G's narrowed rule: only a cut bulk insert goes; every other kind cut
+            // Only a cut bulk insert goes; every other kind cut
             // part-way is reopened, its rows kept.
             let bulk = matches!(was.outcome, crate::idempotency::RecordOutcome::Bulk { .. });
             if cut && bulk && was.first.hlc <= until {
@@ -3293,7 +3295,7 @@ impl World {
 
     /// One page of a replay as the transport cuts it (`transport::cut_replay_page`), with
     /// the model's frame: `replay_frame` units, an entry or a record one each. The F3
-    /// records and those of the page's own advance (`records_of_replay`), B2's records of
+    /// records and those of the page's own advance (`records_of_replay`), the spanning records of
     /// the page's collections read by the engine (`Engine::replay_page_records`, with the
     /// records cursor of an earlier page of records alone at this position), each once at
     /// the lowest carrying stamp among them; all of it when it fits, else the leading
@@ -3336,7 +3338,7 @@ impl World {
         ) {
             Ok(read) => read,
             // A record the change log names as changed since the cursor's base, larger
-            // than the delta's half of a page (P2's refusal): as Y2's transport, the
+            // than the delta's half of a page (refused by name): as the transport does, the
             // cursor is dropped and the position's records are read again from a fresh
             // base, which carries the record as an ordinary one on a page of records
             // alone, what earlier pages at the position sent with it.
@@ -3555,7 +3557,7 @@ impl World {
             Step::Pull { to: t, .. } | Step::PullShort { to: t, .. } => *t as usize == to,
             Step::Page { to: t, restart, .. } => *t as usize == to || *restart,
             Step::Clock { .. } => false,
-            // The sender restored between two pages (m4): its change log begins again
+            // The sender restored between two pages: its change log begins again
             // over the records its backup holds, or not at all.
             Step::Backup { m } | Step::Restore { m, .. } => *m as usize == to,
             _ => true,
@@ -3789,7 +3791,7 @@ impl World {
             let Some(m) = nodes.iter().position(|n| *n == node) else { continue };
             let Some((r, c, id)) = self.ghost.entries.get(&stamp).cloned() else { continue };
             // An entry of a life a drop ended needs its record too: a record outlives
-            // a drop of its collection for its window (ruling A).
+            // a drop of its collection for its window.
             if self.memory_ended(r) || self.ghost.bare.contains(&r) {
                 continue;
             }
@@ -4137,7 +4139,7 @@ impl World {
             }
             // Each member's record against the merge of them all. One the merged record
             // dominates (merging it in changes nothing), or none where no document holds
-            // a request under the key: finding G3, a record state carried only by entries
+            // a request under the key: the S1 class, a record state carried only by entries
             // that lost where the member pulled them from (or a record-only `done`), which
             // never reaches it; harmless while I2 holds, since every entry the member
             // processed is at or above its own `first`. None where a document holds a
@@ -4524,7 +4526,7 @@ fn run_framed(
         if let Err(e) = out {
             world.borrow_mut().fail(Inv::Error, e);
         }
-        // The small page room is the first step's alone (the m4 pull).
+        // The small page room is the first step's alone (the pull a restore splits).
         if i == 0 && world.borrow().page_room.is_some() {
             let mut w = world.borrow_mut();
             w.page_room = None;
@@ -4859,7 +4861,7 @@ impl Gen {
     }
 
     /// Steps between a scoped or converge page's pages, now and then: a keyed or unkeyed
-    /// write on the sender, its backup, or its restore (m4: its change log begins again).
+    /// write on the sender, its backup, or its restore (its change log begins again).
     fn between_pages(&mut self, from: u8) -> Vec<(u8, Vec<Op>)> {
         if !self.rng.chance(25) {
             return Vec::new();
@@ -5088,12 +5090,12 @@ impl Gen {
     /// the seeds, so the long run reaches every one of them many times (its coverage
     /// assertion holds it to that). Each is spliced into the schedule made so far:
     ///
-    /// - **m4** (a third of the seeds): every member's page room is a few documents, and
-    ///   the schedule begins with a scoped pull of `orders` whose sender takes its first
-    ///   keyed write between two pages: its change log begins with an epoch, and the
-    ///   receiver's next page, asked with the zero records base, is refused.
-    /// - **KR between chunks** (a third of the `Anywhere` seeds): an `$inc` of every
-    ///   counter on one member, then another under its key on a member without its
+    /// - **A restore during a pull** (a third of the seeds): every member's page room is a
+    ///   few documents, and the schedule begins with a scoped pull of `orders` whose sender
+    ///   takes its first keyed write between two pages: its change log begins with an
+    ///   epoch, and the receiver's next page, asked with the zero records base, is refused.
+    /// - **A contested key between chunks** (a third of the `Anywhere` seeds): an `$inc` of
+    ///   every counter on one member, then another under its key on a member without its
     ///   record, which pulls the first between its first two chunks: the record turns
     ///   contested there and the request stops partially applied.
     /// - **Records alone** (half the seeds): a frame of one to three units (one, most often: a
@@ -5414,8 +5416,8 @@ fn sweep_listing(
          sides of one, {} with one call's writes on both sides; {} I8 checks, {} counters \
          left at or above a merged first, {} home runs without exact I5; the contested \
          algebra: {} records contested, {} lookups refused, {} requests stopped between chunks; {} snapshot pages \
-         refused at the zero records base (m4), {} replay pages of records alone (m1), {} \
-         records cursors started over, {} records offered past their window (m2); {} \
+         refused at the zero records base, {} replay pages of records alone, {} \
+         records cursors started over, {} records offered past their window; {} \
          member rewinds ({} of one member alone, {} widened to every member, {} not taken \
          on the home track; {} past a drop; refused: {} with no value at the target, {} \
          past a schema change; {} records removed, {} reopened), {} records orphaned; {} replay deltas \
@@ -5503,17 +5505,17 @@ fn assert_coverage(totals: &Sweep, seeds: u64) {
     let per_thousand = env_u64("IDEM_MIN_EVENTS", 20);
     let floor = (per_thousand * seeds).div_ceil(1000) as usize;
     let events = [
-        ("requests stopped between chunks (KR)", totals.contested_stopped),
-        ("lookups refused on a contested record (KR)", totals.contested_refused),
-        ("snapshot pages refused at the zero records base (m4)", totals.records_restarts),
-        ("replay pages of records alone (m1)", totals.records_alone),
-        ("records cursors started over (m1, another epoch)", totals.cursor_restarts),
+        ("requests stopped between chunks (contested)", totals.contested_stopped),
+        ("lookups refused on a contested record", totals.contested_refused),
+        ("snapshot pages refused at the zero records base", totals.records_restarts),
+        ("replay pages of records alone", totals.records_alone),
+        ("records cursors started over (another epoch)", totals.cursor_restarts),
         (
-            "replay deltas too large, the cursor dropped and the position read again (Y2)",
+            "replay deltas too large, the cursor dropped and the position read again",
             totals.cursor_dropped,
         ),
         ("replay pages unfit, the whole-frame refusal", totals.replay_unfit),
-        ("records offered past their window (m2)", totals.past_window_offered),
+        ("records offered past their window", totals.past_window_offered),
         ("rewinds of one member, no peer holding a write it undoes", totals.rewinds_alone),
         ("rewinds widened to every member", totals.rewinds_widened),
         (
@@ -5566,8 +5568,9 @@ fn one_seed() {
 // -- Named rows ------------------------------------------------------------------------------
 //
 // Schedules written out, each run strictly (every classified finding fails it). The
-// first group are the breaks of the G1 analysis (sections 3 and 9) and must fail until
-// their fix lands: records travel with coverage (G1b, G2, G2b, G3, T2), a records delta
+// first group are the breaks an analysis of relays without the record found, and must
+// fail until their fix lands: records travel with coverage (relays after a snapshot, of a
+// losing entry, of a coverage-only window, across origins), a records delta
 // on every page (R1, R1b, R1c). The second group are the shapes the design's mutants
 // need, and pass today.
 
@@ -5673,10 +5676,10 @@ const B: u8 = 1;
 const C: u8 = 2;
 const D: u8 = 3;
 
-/// G2: B writes the counter just after A's keyed `$inc`, so the `$inc` loses on B (its
-/// record stored, its entry not appended); A's write on top of the `$inc` wins there. C
-/// pulls B, holds the effect, and its coverage of A passes the `$inc`'s entry, which A
-/// then never serves it. A retry on C must replay.
+/// A losing entry relayed: B writes the counter just after A's keyed `$inc`, so the `$inc`
+/// loses on B (its record stored, its entry not appended); A's write on top of the `$inc`
+/// wins there. C pulls B, holds the effect, and its coverage of A passes the `$inc`'s
+/// entry, which A then never serves it. A retry on C must replay.
 #[test]
 fn row_g2_a_loser_relay() {
     row(
@@ -5694,9 +5697,10 @@ fn row_g2_a_loser_relay() {
     );
 }
 
-/// G2b: a keyed `$inc` of two counters, one commit; B's own write beats its first entry,
-/// which carries the record, and its second entry wins on B. C pulls B and holds the
-/// request's own effect on the second counter, bare. A retry on C must not apply again.
+/// A losing first entry: a keyed `$inc` of two counters, one commit; B's own write beats
+/// its first entry, which carries the record, and its second entry wins on B. C pulls B and
+/// holds the request's own effect on the second counter, bare. A retry on C must not apply
+/// again.
 #[test]
 fn row_g2b_a_multi_document_request_whose_first_entry_lost() {
     row(
@@ -5707,9 +5711,9 @@ fn row_g2b_a_multi_document_request_whose_first_entry_lost() {
     );
 }
 
-/// G3: the `$inc` loses on B, which then appends A's write to another collection; C's
-/// coverage of A passes the `$inc` in a window that carries no entry of its collection.
-/// A's later write on top reaches C bare. A retry on C must replay.
+/// A coverage-only window: the `$inc` loses on B, which then appends A's write to another
+/// collection; C's coverage of A passes the `$inc` in a window that carries no entry of its
+/// collection. A's later write on top reaches C bare. A retry on C must replay.
 #[test]
 fn row_g3_a_coverage_only_window() {
     row(
@@ -5729,10 +5733,10 @@ fn row_g3_a_coverage_only_window() {
     );
 }
 
-/// T2: A's `$inc` loses on C to C's own write, so C's servable vector at A stays below
-/// it; B took the `$inc` and wrote on top, and that version wins on C. With A and B down,
-/// D pulls only C and holds B's version, which holds the `$inc`, with no record, while
-/// its coverage of A does not move. A retry on D must replay.
+/// A cross-origin relay: A's `$inc` loses on C to C's own write, so C's servable vector at
+/// A stays below it; B took the `$inc` and wrote on top, and that version wins on C. With A
+/// and B down, D pulls only C and holds B's version, which holds the `$inc`, with no
+/// record, while its coverage of A does not move. A retry on D must replay.
 #[test]
 fn row_t2_a_cross_origin_relay_while_the_origin_is_down() {
     row(
@@ -5754,10 +5758,11 @@ fn row_t2_a_cross_origin_relay_while_the_origin_is_down() {
     );
 }
 
-/// G1b: A's keyed write and a write on top land between B's first snapshot page and the
-/// collection's records phase, so B stores the record from the page and holds the later
-/// version above its grant; B then pulls A, where the keyed entry loses. C, at the grant,
-/// pulls B and takes the later version bare. A retry on C must replay.
+/// A relay after a snapshot: A's keyed write and a write on top land between B's first
+/// snapshot page and the collection's records phase, so B stores the record from the page
+/// and holds the later version above its grant; B then pulls A, where the keyed entry
+/// loses. C, at the grant, pulls B and takes the later version bare. A retry on C must
+/// replay.
 #[test]
 fn row_g1b_a_write_between_snapshot_pages_then_a_relay() {
     // The keyed write goes to the collection the whole-database walk reaches second, so
@@ -5923,7 +5928,7 @@ fn row_r1c_a_whole_database_retry_at_completion() {
     );
 }
 
-/// G5: A is restored from a backup taken before its keyed `$inc` and the write it made on
+/// A replay: A is restored from a backup taken before its keyed `$inc` and the write it made on
 /// top. B's copy of the `$inc` lost (C's write came first), and B holds A's write on top;
 /// A's own-origin replay from B reads that write back, without the record. A is the
 /// member guarantee 4 tells the client to retry on, and a retry there must replay.
@@ -6038,7 +6043,7 @@ fn row_concurrent_fresh_attempts_on_two_members() {
     );
 }
 
-/// The merged `first` is the earliest attempt's (B1): A's attempt stops after a chunk, A
+/// The merged `first` is the earliest attempt's: A's attempt stops after a chunk, A
 /// resumes and stops again; B, without A's record, starts afresh later and stops; after
 /// the pulls the merged record's `last` is B's. A resume must still leave what A's resume
 /// wrote, which is below B's `first`.
@@ -6110,7 +6115,7 @@ fn row_a_page_carried_record_resumed_after_a_restart() {
     );
 }
 
-/// Ruling A: a record outlives a drop of its collection for its window. A record of the
+/// A record outlives a drop of its collection for its window. A record of the
 /// life a drop ended, arriving from a member that applied the request before it heard of
 /// the drop, is replayed in the life after it, and nothing is written there.
 #[test]
@@ -6130,7 +6135,7 @@ fn row_a_retry_after_a_drop_and_a_recreation_replays() {
     );
 }
 
-/// The derived `_id` holds the request's fingerprint (M1): a key reused for another
+/// The derived `_id` holds the request's fingerprint: a key reused for another
 /// insert on a member without the first one's record lands on another document.
 #[test]
 fn row_a_reused_key_on_a_member_without_the_record() {
@@ -6199,7 +6204,7 @@ fn row_a_resumed_requests_record_reaches_every_member() {
 
 // -- Reproducers -------------------------------------------------------------------------------
 
-/// D2 under ruling A (records outlive a drop for their window). A applies an `$inc` of
+/// A retry after a drop (records outlive a drop for their window). A applies an `$inc` of
 /// every counter and B takes it with its record; A drops `orders`; B, before it hears of
 /// the drop, writes counter 0 (unkeyed) on top of its version, which carries the `$inc`,
 /// stamped after the drop. B then takes the drop, which keeps that write (ADR-236). A
@@ -6221,7 +6226,7 @@ fn row_d2_a_retry_after_a_drop_replays_and_never_doubles() {
     );
 }
 
-/// KR: r0 and r1 are two `$inc`s of every counter under one key. C applies r0; A,
+/// A contested key: r0 and r1 are two `$inc`s of every counter under one key. C applies r0; A,
 /// without r0's record, applies r1 and stops after its first chunk (counters 0 and 1); A
 /// then takes r0's effect and record from C, and the two records merge: the merged
 /// record is `contested`, as the algebra says (two requests merged). A retry of r1 on A
@@ -6243,9 +6248,10 @@ fn row_kr_a_reused_keys_merged_records_refuse() {
     );
 }
 
-/// KR between chunks: as above, with A taking r0's record from C between r1's first
-/// and second chunks. The record turns contested there, and r1's next chunk is refused:
-/// it stops partially applied, its first chunk standing, and every retry on A is refused.
+/// A contested key between chunks: as above, with A taking r0's record from C between r1's
+/// first and second chunks. The record turns contested there, and r1's next chunk is
+/// refused: it stops partially applied, its first chunk standing, and every retry on A is
+/// refused.
 #[test]
 fn row_kr_a_record_contested_between_chunks_stops_the_request() {
     row_holding(
@@ -6261,15 +6267,15 @@ fn row_kr_a_record_contested_between_chunks_stops_the_request() {
     );
 }
 
-// -- The fix branches' rows (m4, m1's cursor, m2, the rewind, orphan rows) ------------------
+// -- Restores during a pull, the records cursor, past-window records, rewinds, orphan rows --
 
-/// m4, with records: A's backup B0 holds no record and B1 holds r0's (its effect on a
-/// late page of `big`). A is restored to B0 (no record, no change log), and B takes a
-/// scoped pull of `big` from it; between the first two pages A is restored to B1, and
-/// opens over B1's records with a fresh epoch (guard i). B's next page, asked with the
-/// zero records base, comes from a sender whose log has begun since and is refused
-/// (guard ii): `big` is asked for again from its records phase, which carries r0's
-/// record before its effect. A retry on B replays.
+/// A restore during a pull, with records: A's backup B0 holds no record and B1 holds r0's
+/// (its effect on a late page of `big`). A is restored to B0 (no record, no change log),
+/// and B takes a scoped pull of `big` from it; between the first two pages A is restored to
+/// B1, and opens over B1's records with a fresh epoch (the epoch begun at open). B's next
+/// page, asked with the zero records base, comes from a sender whose log has begun since
+/// and is refused (the zero-base guard): `big` is asked for again from its records phase,
+/// which carries r0's record before its effect. A retry on B replays.
 #[test]
 fn row_m4_a_sender_restored_between_pages_onto_records() {
     row_holding(
@@ -6288,7 +6294,7 @@ fn row_m4_a_sender_restored_between_pages_onto_records() {
     );
 }
 
-/// m4, two restores of the sender during one pull: B's first page of `big` from A (r0's
+/// Two restores of the sender during one pull: B's first page of `big` from A (r0's
 /// record in its records phase, the base of A's log); A restored to B0 (no record, no
 /// log: the base is of another epoch, and A starts `big` over); A restored to B1 (its
 /// records, a fresh epoch: the zero base B now holds is refused, and `big` starts over
@@ -6315,12 +6321,12 @@ fn row_m4_two_restores_of_the_sender_during_one_pull() {
     );
 }
 
-/// m1's records cursor (Y): C applies r0 to r2 and B takes them; A applies r3, B takes it,
-/// and A is restored from a backup before all of it. A's replay from B: its one lost
-/// entry needs four records (B2's three of C, carried at their `first` below it, and its
+/// The records cursor: C applies r0 to r2 and B takes them; A applies r3, B takes it, and A
+/// is restored from a backup before all of it. A's replay from B: its one lost entry needs
+/// four records (three spanning records of C, carried at their `first` below it, and its
 /// own), more than the model's frame of three holds with it, so the first page carries
-/// three records alone under a cursor, and the next page at the same position the rest
-/// with the entry. Retries on A replay.
+/// three records alone under a cursor, and the next page at the same position the rest with
+/// the entry. Retries on A replay.
 #[test]
 fn row_m1_a_replay_page_of_records_alone_under_a_cursor() {
     row_framed(
@@ -6343,7 +6349,7 @@ fn row_m1_a_replay_page_of_records_alone_under_a_cursor() {
     );
 }
 
-/// m1's cursor guarded by the epoch: as above, with B, the sender, restored from its
+/// The records cursor guarded by the epoch: as above, with B, the sender, restored from its
 /// backup between A's two replay pages. B opens over its records with a fresh epoch, so
 /// the cursor A holds is of another log and the position's records start over.
 #[test]
@@ -6373,7 +6379,7 @@ fn replay_requests() -> Vec<Request> {
     (0..4).map(|d| req(d + 1, Kind::IncSingle { d })).collect()
 }
 
-/// m2: a record past its window is not stored. r0 on A; the window passes (a retention
+/// A record past its window is not stored. r0 on A; the window passes (a retention
 /// pass on C moves every member's clock); r1, a new request under r0's key, on B, which
 /// never held r0's record; B then pulls A, whose window still carries r0's record. B
 /// refuses it: merged into r1's, it would lower `first` to r0's and mark the record
@@ -6388,7 +6394,7 @@ fn row_m2_a_record_past_its_window_is_not_stored() {
     );
 }
 
-/// m2 as G narrowed it: a record past its window of the live record's own request
+/// A record past its window of the live record's own request
 /// merges. r0 on A at 100; B, without A's record, retries r0 at 1500; the window passes
 /// for A's record (a retention pass on C at 1700) and not for B's; B pulls A, whose
 /// window carries r0's record past its window: B merges it, its `first` now A's.
@@ -6417,7 +6423,7 @@ fn row_rewind_reopens_a_merged_insert() {
     );
 }
 
-/// The rewind (G, Y's m3): r0, an `$inc` of every counter, stops after its first chunk
+/// The rewind: r0, an `$inc` of every counter, stops after its first chunk
 /// at 100 and resumes to its end at 200; r1 inserts at 140; r2, a bulk, at 160. A
 /// rewind to 150 removes r2's record with its rows (every write discarded), keeps r1's,
 /// and reopens r0's `applying` with no cursor (a filter's, cut part-way). The resume
@@ -6446,7 +6452,7 @@ fn row_rewind_removes_what_it_discards_and_reopens_a_filter() {
     );
 }
 
-/// The rewind cuts a bulk part-way (Y's m3): its first document, minted first in the
+/// The rewind cuts a bulk part-way: its first document, minted first in the
 /// millisecond the rewind keeps, stands, and its record goes with its rows; a retry is a
 /// fresh attempt that meets that document as a duplicate and writes nothing.
 #[test]
@@ -6487,7 +6493,7 @@ fn row_an_orphan_row_is_passed_over_everywhere() {
     );
 }
 
-/// D3 under ruling A, the stamp rule's contract across a drop: A applies an `$inc` of
+/// A resume across a drop, the stamp rule's contract: A applies an `$inc` of
 /// every counter; B drops `orders` and creates it again, its counters fresh; C, before it
 /// hears of either, applies the same request, stamped after the drop, and stops after its
 /// first chunk. C takes A's effect and record (merged: A's `first`, before the drop),
@@ -6630,13 +6636,13 @@ fn pull_all(to: &Engine, from: &Engine) {
     }
 }
 
-/// Finding G1, minimal: Y applies a keyed `$inc` and then writes the counter again; X
-/// takes the database by snapshot (the record with it, rowed at its `last`); M pulls
-/// from X and is sent the later version without the record, and its coverage then
-/// passes the `$inc`'s own entry, so Y never serves it the record either, Y serving
-/// throughout. A retry on M applies the `$inc` a second time (n 11 -> 12). Asserts
-/// guarantee 2 (a member holding any effect of the write holds its record); it passes
-/// since records travel with coverage (fix (e)).
+/// The relay as first reported, minimal: Y applies a keyed `$inc` and then writes the
+/// counter again; X takes the database by snapshot (the record with it, rowed at its
+/// `last`); M pulls from X and is sent the later version without the record, and its
+/// coverage then passes the `$inc`'s own entry, so Y never serves it the record either, Y
+/// serving throughout. A retry on M applies the `$inc` a second time (n 11 -> 12). Asserts
+/// guarantee 2 (a member holding any effect of the write holds its record); it passes since
+/// records travel with coverage (fix (e)).
 #[test]
 fn finding_g1_a_relay_of_a_snapshot_held_version_drops_the_record() {
     let dir = tempfile::tempdir().unwrap();

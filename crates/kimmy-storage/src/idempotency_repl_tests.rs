@@ -1,4 +1,4 @@
-//! Idempotency records across members (B5, "Replication and the cross-member
+//! Idempotency records across members (ADR-240, "Replication and the cross-member
 //! retry"): what a window carries, what a receiver stores and when, what a
 //! snapshot and a converge page carry, between engines in one process through
 //! the storage halves of the real paths (`entries_for_peer_*`, the apply of a
@@ -346,7 +346,7 @@ fn a_record_lands_with_the_run_that_takes_its_entry_when_the_entry_loses() {
     assert_eq!(n_of(&b.engine, &cb, 1), 10, "not applied again");
 }
 
-/// The same when the entry is judged history here (ruling A: a record outlives a
+/// The same when the entry is judged history here (a record outlives a
 /// drop of its collection for its window): B has dropped `orders` and made it
 /// again since A's keyed insert, so A's entry is of a life B has buried, and its
 /// record is stored with the run that takes it as history. A schema change of
@@ -459,7 +459,7 @@ fn a_record_whose_entry_is_not_in_the_frame_rides_with_a_later_entry() {
 
 /// A frame's records are stored in the transaction that raises the receiver's
 /// coverage, **whether or not an entry of their collection is taken** and
-/// whether or not the collection stands here (B5, records travel with
+/// whether or not the collection stands here (ADR-240, records travel with
 /// coverage): here the only entry is left above the vector the sender
 /// advertised, and a second record names a collection this member has never
 /// heard of. Both are stored, and counted by the way they came; the same frame
@@ -496,8 +496,8 @@ fn a_frames_records_are_stored_whether_or_not_an_entry_of_their_collection_is_ta
     assert_eq!(b.engine.idempotency_records_received()[0], 2, "and are not counted again");
 }
 
-/// A record of a life the receiver has buried is stored all the same (ruling A:
-/// a record outlives a drop for its window), and a retry in the life standing
+/// A record of a life the receiver has buried is stored all the same (a
+/// record outlives a drop for its window), and a retry in the life standing
 /// replays it; one this build cannot decode is dropped and counted while its
 /// entries are applied. Its entry is history here, so the record rides with an
 /// entry judged history.
@@ -855,11 +855,11 @@ fn a_window_ships_a_record_at_its_own_row_not_at_one_an_earlier_record_left() {
     assert_eq!(shipped[0].carrying, Some(now.first), "at its own row, not the earlier one's");
 }
 
-/// A record found again at a lower row is carried there (B1 of the build
-/// review), but only at a row of its own: a row another record under its key
-/// left below its `first` lowers nothing. Here that row is planted at an origin
-/// that sorts after the record's own, so F2 reads it after the record was
-/// shipped at its own row.
+/// A record found again at a lower row is carried there (a window ships a
+/// record at its lowest row), but only at a row of its own: a row another
+/// record under its key left below its `first` lowers nothing. Here that row is
+/// planted at an origin that sorts after the record's own, so F2 reads it after
+/// the record was shipped at its own row.
 #[test]
 fn a_row_below_the_records_first_found_later_does_not_lower_its_carrying_row() {
     let a = member();
@@ -901,11 +901,11 @@ fn a_row_below_the_records_first_found_later_does_not_lower_its_carrying_row() {
     assert_eq!(shipped[0].carrying, Some(own), "at its own row, not the lower one");
 }
 
-/// A record rides through a drop and a recreation (ruling A). A and B each
-/// applied the same keyed write before A dropped the collection; A's retry in
-/// the next life replays, and B, taking the drop, the creation and A's record
-/// in one window, keeps its record merged with A's, so a retry there replays
-/// too and nothing is written to the next life on either.
+/// A record rides through a drop and a recreation (it outlives the drop). A and
+/// B each applied the same keyed write before A dropped the collection; A's
+/// retry in the next life replays, and B, taking the drop, the creation and A's
+/// record in one window, keeps its record merged with A's, so a retry there
+/// replays too and nothing is written to the next life on either.
 #[test]
 fn a_record_rides_through_a_drop_and_a_recreation_to_a_member_that_holds_its_own() {
     let (a, b, ca, cb) = pair();
@@ -938,7 +938,7 @@ fn a_record_rides_through_a_drop_and_a_recreation_to_a_member_that_holds_its_own
 /// or past it: the window grants no coverage there and serves them again. Here B's
 /// batch ends at the creation of `shop.other` again, its earlier life's purge still
 /// owed, before the drop of `orders`, its creation again and a keyed write there with
-/// its record. B's record of a write before the drop stays throughout (ruling A).
+/// its record. B's record of a write before the drop stays throughout.
 #[test]
 fn a_batch_that_ends_early_leaves_the_records_past_its_end() {
     let (a, b, ca, cb) = pair();
@@ -971,7 +971,7 @@ fn a_batch_that_ends_early_leaves_the_records_past_its_end() {
     assert_eq!(b.engine.idempotency_record(again.id, &k.scope).unwrap(), Some(earlier));
 }
 
-// -- D2, D3 and KR across members (ruling A, the `contested` flag) -------------------------------
+// -- A drop, a resume across a drop and a contested key across members -------------------------
 
 /// `$inc` of every counter from 0 to `n`, on `coll` at `on`, one chunk a pair.
 fn counters_on(on: &Engine, coll: &CollectionMeta, n: i64) {
@@ -1003,12 +1003,13 @@ fn restart(m: Member) -> Member {
     Member { engine: Arc::new(Engine::open(&path).unwrap()), _dir }
 }
 
-/// D2 under ruling A. A applies an `$inc` of every counter and B takes it with its
-/// record; A drops `orders`; B, before it hears of the drop, writes counter 0
-/// (unkeyed) on top of its version, which carries the `$inc`, stamped after the
-/// drop. B then takes the drop, which keeps that write (ADR-236). A retry on B
-/// replays the record: the request never lands twice on counter 0. Under the life
-/// rule the record was history there, and the retry incremented counter 0 again.
+/// A retry after a drop, records outliving it. A applies an `$inc` of every
+/// counter and B takes it with its record; A drops `orders`; B, before it hears
+/// of the drop, writes counter 0 (unkeyed) on top of its version, which carries
+/// the `$inc`, stamped after the drop. B then takes the drop, which keeps that
+/// write (ADR-236). A retry on B replays the record: the request never lands
+/// twice on counter 0. Under the life rule the record was history there, and
+/// the retry incremented counter 0 again.
 #[test]
 fn d2_a_retry_after_a_drop_replays_and_never_doubles() {
     let (a, b, ca, cb) = pair();
@@ -1033,7 +1034,7 @@ fn d2_a_retry_after_a_drop_replays_and_never_doubles() {
     assert_eq!(n_of(&b.engine, &life, 0), 1, "the $inc landed once on counter 0");
 }
 
-/// D3 under ruling A, the stamp rule's contract across a drop. A applies an
+/// A resume across a drop, records outliving it: the stamp rule's contract. A applies an
 /// `$inc` of every counter; B drops `orders` and creates it again with fresh
 /// counters; C, before it hears of either, applies the same request, stamped
 /// after the drop, and stops after its first chunk. C takes A's effect and
@@ -1081,7 +1082,7 @@ fn d3_a_resume_after_a_drop_leaves_what_is_at_or_above_its_merged_first() {
     assert!(out.skipped >= 3, "the new life's counters, left and counted: {out:?}");
 }
 
-/// KR: r0 and r1 are two `$inc`s of every counter under one key (two
+/// A contested key: r0 and r1 are two `$inc`s of every counter under one key (two
 /// fingerprints). C applies r0; A, without r0's record, applies r1 and stops
 /// after its first chunk; A then takes r0's effect and record from C, and the
 /// two records merge contested. A retry of r1 on A is refused (422), and nothing

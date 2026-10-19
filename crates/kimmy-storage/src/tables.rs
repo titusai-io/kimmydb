@@ -299,7 +299,7 @@ pub const VECTOR_VERIFIED: TableDefinition<&str, &[u8]> = TableDefinition::new("
 pub const SNAPSHOT_PROGRESS: TableDefinition<&[u8], &[u8]> =
     TableDefinition::new("snapshot_progress");
 
-/// `(collection id, scope hash) -> the idempotency record` (B5,
+/// `(collection id, scope hash) -> the idempotency record` (ADR-240,
 /// `crate::idempotency`): a keyed write's record, written in the write's own
 /// transaction, so it survives exactly what the write survives.
 ///
@@ -312,7 +312,7 @@ pub const SNAPSHOT_PROGRESS: TableDefinition<&[u8], &[u8]> =
 pub const IDEMPOTENCY: TableDefinition<(u64, &[u8]), &[u8]> = TableDefinition::new("idempotency");
 
 /// `stamp (26 bytes, an oplog key) -> collection id (8) ‖ scope hash (32)`:
-/// every record by the stamps that carry it (B5).
+/// every record by the stamps that carry it (ADR-240).
 ///
 /// Keyed origin-major, `node (16) ‖ hlc (10)`, so the rows of one origin in a
 /// range are one range read. A record has a row at each of its merged `first`
@@ -329,7 +329,7 @@ pub const IDEMPOTENCY_BY_STAMP: TableDefinition<&[u8], &[u8]> =
     TableDefinition::new("idempotency_by_stamp");
 
 /// `stamp (26 bytes, an oplog key) -> collection id (8) ‖ scope hash (32)`: this
-/// node's **change log** of idempotency records (B5, "Snapshots carry records").
+/// node's **change log** of idempotency records (ADR-240, "Snapshots carry records").
 ///
 /// One row per store that changes a record, on every path (a local commit, a
 /// frame, a replay page, a snapshot or converge page, a rewind's reopen), in the

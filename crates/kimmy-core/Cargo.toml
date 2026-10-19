@@ -16,7 +16,7 @@ bson.workspace = true
 thiserror.workspace = true
 uuid.workspace = true
 base64.workspace = true
-# The idempotency scope hash and the derived `_id` (B5): SHA-256 is fixed by the
+# The idempotency scope hash and the derived `_id` (ADR-240): SHA-256 is fixed by the
 # protocol. Already in the graph through `kimmy-api` and `kimmy-cluster`.
 sha2 = "0.11"
 

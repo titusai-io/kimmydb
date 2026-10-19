@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# The B5 idempotency mutation harness. Run it with bash (zsh does not word-split an
+# The idempotency keys' mutation harness (ADR-240). Run it with bash (zsh does not word-split an
 # unquoted command, and every mutant would "survive").
 #
 #   scripts/idempotency-mutants/run.sh <worktree> <out-dir> [group|name ...]
