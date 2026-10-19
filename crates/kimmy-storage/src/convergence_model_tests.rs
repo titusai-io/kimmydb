@@ -3342,6 +3342,104 @@ fn row_a_rewind_that_removes_a_deleted_document_asks_again_for_a_judged_write() 
     );
 }
 
+/// A judged write above a non-zero horizon still comes back by pure entries (ADR-246). B's
+/// retention pass collects its own t155 entry, so the horizon is t155; C's t170 write of
+/// `orders/1` loses on B to B's own t300 insert. The rewind to t200 removes the document and
+/// floors at the horizon, below C's write, which B asks for again and takes.
+#[test]
+fn row_a_rewind_that_removes_a_document_asks_again_for_a_judged_write_above_the_horizon() {
+    let ops = parse(
+        "A.create(orders)@100; B<-A entries; C<-A entries; B.write(orders/2)@155; A<-B entries; \
+         C<-B entries; C.write(orders/1)@170; B.write(orders/1)@300; B<-C entries; A<-C entries; \
+         B.retention@1160; B.rewind@200",
+    );
+    row_strict("a judged write above the horizon", &ops, &[(ORDERS, Some(&[1, 2]))]);
+}
+
+/// A judged write at or below the horizon that arrived on time stays covered, and the
+/// divergence check's repair heals it (accepted, ADR-246). C's t150 write of `orders/1` reaches
+/// B before any retention pass and loses to B's own t300 insert; B's pass then collects its own
+/// t155 entry, so the horizon is t155, above C's write. The rewind to t200 removes the document
+/// and floors at the horizon: pure entries leave B without C's write, and the repaired and pages
+/// routes converge. A target this close to the horizon is what it takes.
+#[test]
+fn a_removal_leaves_an_on_time_judged_write_at_or_below_the_horizon_to_the_repair() {
+    let ops = parse(
+        "A.create(orders)@100; B<-A entries; C<-A entries; C.write(orders/1)@150; \
+         B.write(orders/2)@155; A<-B entries; C<-B entries; B.write(orders/1)@300; B<-C entries; \
+         A<-C entries; B.retention@1160; B.rewind@200",
+    );
+    let expect: Expect = &[(ORDERS, Some(&[1, 2]))];
+    for mut outcome in check_routes(&ops, &[Route::Entries, Route::Pages]) {
+        expected_end(&ops, &mut outcome, expect);
+        let failures: Vec<(Category, String)> = outcome
+            .failures
+            .iter()
+            .filter(|f| f.category != Category::DocsAfterAgeOut)
+            .map(|f| (f.category, f.detail.clone()))
+            .collect();
+        if outcome.route == Route::Entries {
+            assert!(
+                failures
+                    .iter()
+                    .any(|(c, d)| *c == Category::LostWrite && d.starts_with("B lacks orders/1")),
+                "pinned: pure entries leave B without C's write: {failures:?}\n{}",
+                outcome.report
+            );
+        } else {
+            assert!(
+                failures.is_empty(),
+                "{:?} converges: {failures:?}\n{}",
+                outcome.route,
+                outcome.report
+            );
+        }
+    }
+}
+
+/// A removal beside a late restored entry keeps what retention collected covered (ADR-243,
+/// ADR-246). C's t120 insert of `orders/5` reaches B only after B's retention pass, below its
+/// horizon; B then writes `orders/5` and inserts `orders/9` after the target. The rewind puts
+/// `orders/5` back to C's late entry and removes `orders/9`, so the floor is the late entry,
+/// below the horizon, and only the bound's `collected` term keeps B's own collected drop of
+/// `items` covered.
+#[test]
+fn row_a_removal_beside_a_late_restored_entry_keeps_the_members_collected_drop() {
+    let ops = parse(
+        "A.create(orders)@100; A.create(items)@110; B<-A entries; C<-A entries; \
+         B.drop(items)@170; A.write(orders/0)@190; B<-A entries; C.write(orders/5)@120; \
+         B.retention@1730; B<-C entries; B.write(orders/5)@1800; B.write(orders/9)@1801; \
+         B.rewind@1757; A.write(items/5)@1850; A.write(items/6)@1851",
+    );
+    row(
+        "a removal beside a late restored entry",
+        &[],
+        &[("B's later writes discarded", ops)],
+        &[(ORDERS, Some(&[0, 5])), (ITEMS, Some(&[5, 6]))],
+    );
+}
+
+/// A removal beside a restored entry below the horizon floors at that entry, not at the horizon
+/// (ADR-246). C's t120 insert of `orders/5` reaches B late, below B's horizon t170; A's t150
+/// insert of the same document reaches B only after B's own t1800 write of it, loses there and
+/// is witnessed only. The rewind puts `orders/5` back to C's t120 entry and removes `orders/9`:
+/// floored at t120, B asks A again for its t150 write and takes it, by pure entries; floored at
+/// the horizon, B would keep claiming it.
+#[test]
+fn row_a_removal_beside_a_restored_entry_below_the_horizon_floors_at_that_entry() {
+    let ops = parse(
+        "A.create(orders)@100; B<-A entries; C<-A entries; C.write(orders/5)@120; \
+         A.write(orders/5)@150; B.write(orders/1)@170; B.write(orders/2)@190; B.retention@1730; \
+         B<-C entries; B.write(orders/5)@1800; B<-A entries; B.write(orders/9)@1801; \
+         B.rewind@1757",
+    );
+    row_strict(
+        "a removal beside a restored entry below the horizon",
+        &ops,
+        &[(ORDERS, Some(&[1, 2, 5]))],
+    );
+}
+
 /// A removal asks again for nothing at or below the oplog horizon (ADR-246). C's t110 insert of
 /// `orders/1` loses on B to B's t120 write and is witnessed only, so B appends no entry of C's.
 /// B deletes the document at t130, every member applies the delete, and B's retention pass
