@@ -777,6 +777,15 @@ max_wait_ms = 100
 # bound, which is the behaviour before it existed (ADR-103).
 [vector.index_cache]
 max_bytes = 536870912
+# How many HNSW graphs are built at once (ADR-245). Every build and save runs
+# off the request path: a search of a collection whose graph is being built is
+# answered by the graph it had, or by an exact scan under the request's
+# deadline. A build is CPU and memory bound (a 100,000 x 384 graph peaks at
+# about 1.3 GiB with its records), and the first start of 0.52.0 asks for every
+# collection's at once, so they queue. At least 1; the default, 1, is shown
+# commented out: 0.51.x refuses a configuration that names the key, so a
+# configuration that sets it must drop it before rolling back.
+# build_concurrency = 1
 
 # What an embedding provider may be handed, and where it may be sent (ADR-115).
 #
