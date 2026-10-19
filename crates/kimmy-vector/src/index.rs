@@ -60,6 +60,8 @@ struct Reachability {
     /// Edges the build added at layer 0 to link points it had cut off
     /// ([`link_cut_off`]).
     linked: usize,
+    /// Points still cut off at layer 0 after the linking: a build to retry.
+    cut_off: usize,
 }
 
 /// How hard a second look is, before a miss is called data loss.
@@ -82,10 +84,10 @@ const REACHABILITY_CONFIRM_EF: usize = 800;
 /// not one.
 const REACHABILITY_CONFIRM_K: usize = 32;
 
-/// How many unreachable points in a sample mean the graph lost data, rather
-/// than being the graph HNSW ordinarily produces.
+/// How many unreachable points in a sample make a build warn that searches of
+/// its collection may miss near neighbours.
 ///
-/// **A guard against a gross failure, since 0.52.0** (ADR-241). Until then it
+/// **A warning, not a retry, since 0.52.0** (ADR-241). Until then it
 /// separated `hnsw_rs` 0.3.4's routine orphaning (0.8% to 3% of every graph,
 /// sampled scores 0 to 7) from its catastrophic draws (10% to 35%, scores 13
 /// and up). 0.3.5 stores reverse edges at the right layer, and the build
@@ -109,8 +111,11 @@ const REACHABILITY_CONFIRM_K: usize = 32;
 /// are HNSW's hardest case. **Eight sits above every score measured on data
 /// of realistic intrinsic dimension and below a graph that loses a tenth of
 /// itself**, which expects 13 of 128. Uniformly random 384-dimensional
-/// vectors at 100,000 score above it, and their build is retried in vain,
-/// since another order does not make a hard search easier.
+/// vectors at 100,000 score above it with every point linked. A build is
+/// retried only when the linking leaves a point cut off
+/// ([`MAX_BUILD_ATTEMPTS`]): a high score with nothing cut off is a
+/// collection that is hard to search, which another insertion order does not
+/// change, and retrying it tripled the build cost on exactly those builds.
 ///
 /// **This was 3, sized against a 400-vector, 16-dimensional fixture, and the
 /// shape depends on both.** At 384 dimensions — the realistic embedding width —
@@ -121,12 +126,13 @@ const REACHABILITY_CONFIRM_K: usize = 32;
 /// covers the rest.
 const REACHABILITY_MAX_UNREACHABLE: usize = 8;
 
-/// How many times a build that loses data is discarded and retried.
+/// How many times a build is retried when its linking leaves a point cut off
+/// at layer 0 ([`link_cut_off`]), logged at `ERROR`.
 ///
-/// Each attempt inserts in its own order ([`insertion_order`]), the only
-/// draw `hnsw_rs` 0.3.5 leaves to vary, so a retry is another graph. With
-/// the linking no measured build needed one; it stays for a failure no
-/// measurement has shown. It is bounded because an index that genuinely
+/// No measured build has: an edge is only ever added, and every cut-off point
+/// had a linked point near it. Each attempt inserts in its own order
+/// ([`insertion_order`]), the only draw `hnsw_rs` 0.3.5 leaves to vary, so a
+/// retry is another graph. It is bounded because an index that genuinely
 /// cannot be built well — a pathological collection rather than an unlucky
 /// draw — must still return something rather than loop.
 const MAX_BUILD_ATTEMPTS: usize = 2;
@@ -402,7 +408,8 @@ impl Layer0 {
 
 /// Give every point a build left cut off at layer 0 ([`Layer0`]) an edge into
 /// it from [`LINK_EDGES`] of its nearest linked points, until none is cut off
-/// (ADR-241). Returns how many edges were added.
+/// (ADR-241). Returns how many edges were added, and how many points are still
+/// cut off (none, in every build measured).
 ///
 /// **Why a build leaves any.** `hnsw_rs` adds a new point to each of its
 /// neighbours' lists and, when a list is over its cap, drops the farthest
@@ -414,7 +421,7 @@ impl Layer0 {
 /// one function kimmydb's copy of the library adds), so no point loses an
 /// edge into it, and every measured build was linked in one round, in under a
 /// second at 100,000 vectors of realistic data.
-fn link_cut_off<D>(graph: &Hnsw<'static, f32, D>, engine: &Engine) -> Result<usize>
+fn link_cut_off<D>(graph: &Hnsw<'static, f32, D>, engine: &Engine) -> Result<(usize, usize)>
 where
     D: hnsw_rs::anndists::dist::Distance<f32> + Send + Sync,
 {
@@ -425,7 +432,7 @@ where
         let layer0 = Layer0::read(graph);
         let cut = layer0.cut_off();
         if cut.is_empty() {
-            break;
+            return Ok((added, 0));
         }
         let lost: HashSet<usize> = cut.iter().copied().collect();
         let mut vectors: Vec<Option<Vec<f32>>> = vec![None; layer0.outside.len()];
@@ -464,11 +471,20 @@ where
             // Nothing linked could be found near what is left: a graph with
             // no linked point at all, or one of nothing but duplicates of a
             // cut-off point. Another round would find the same.
-            break;
+            return Ok((added, cut.len()));
         }
         added += linked;
     }
-    Ok(added)
+    Ok((added, Layer0::read(graph).cut_off().len()))
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Builds on this thread skip the linking, so a test can make a build
+    /// that leaves points cut off.
+    static SKIP_LINKING: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// How many build attempts this thread has made.
+    static BUILD_ATTEMPTS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
 /// fsync a file or a directory: what [`HnswIndex::save`] writes, and the
@@ -571,48 +587,63 @@ impl HnswIndex {
     /// reach it.
     ///
     /// So the graph is checked against the property that matters, by asking a
-    /// sample of stored vectors to find themselves. A failed build is
-    /// discarded and rebuilt in another insertion order ([`insertion_order`]).
+    /// sample of stored vectors to find themselves.
     ///
     /// **Those measurements were `hnsw_rs` 0.3.4's** (ADR-241), whose
     /// misplaced reverse edges were most of what the check caught. 0.3.5
     /// places them right, and the build now links every point its insertion
-    /// still cuts off ([`link_cut_off`]), so the check guards against a
-    /// failure no measured build has shown; see
-    /// [`REACHABILITY_MAX_UNREACHABLE`] for what it scores now.
+    /// still cuts off ([`link_cut_off`]). A build that leaves one cut off even
+    /// so is discarded and rebuilt in another insertion order
+    /// ([`insertion_order`]); a sample that scores high with nothing cut off
+    /// warns ([`REACHABILITY_MAX_UNREACHABLE`]) and is served.
     pub fn build(
         engine: &Engine,
         shadow: &CollectionMeta,
         metric: Metric,
         dim: usize,
     ) -> Result<Self> {
-        let mut built = Self::build_once(engine, shadow, metric, dim, 0)?;
-        for attempt in 1..=MAX_BUILD_ATTEMPTS {
-            if built.1.unreachable < REACHABILITY_MAX_UNREACHABLE {
-                return Ok(built.0);
+        let mut attempt = 0;
+        loop {
+            let (index, reach) = Self::build_once(engine, shadow, metric, dim, attempt)?;
+            if reach.cut_off == 0 || attempt == MAX_BUILD_ATTEMPTS {
+                if reach.cut_off > 0 {
+                    // Never fail: a graph still answers, and refusing to build
+                    // one would take vector search down over a quality problem.
+                    tracing::error!(
+                        collection = %shadow.name,
+                        vectors = index.keys.len(),
+                        cut_off = reach.cut_off,
+                        attempts = attempt + 1,
+                        "HNSW graph still has points no search reaches after linking, in every \
+                         insertion order tried; searches on this collection may miss them"
+                    );
+                }
+                if reach.unreachable >= REACHABILITY_MAX_UNREACHABLE {
+                    // Not retried: every point is linked, so these are points
+                    // a search of the check's effort misses, and another
+                    // order does not make the collection easier to search.
+                    tracing::warn!(
+                        collection = %shadow.name,
+                        vectors = index.keys.len(),
+                        unreachable = reach.unreachable,
+                        sampled = reach.sampled,
+                        "HNSW graph: sampled vectors could not find themselves at the build \
+                         check's search effort though every point is linked; searches on this \
+                         collection may miss near neighbours"
+                    );
+                }
+                return Ok(index);
             }
-            debug!(
+            tracing::error!(
+                collection = %shadow.name,
+                vectors = index.keys.len(),
+                cut_off = reach.cut_off,
                 attempt,
-                unreachable = built.1.unreachable,
-                missed = built.1.missed,
-                vectors = built.0.keys.len(),
-                "HNSW build left data unreachable; rebuilding in another insertion order"
+                "HNSW build left points no search reaches after linking them; rebuilding in \
+                 another insertion order"
             );
-            built = Self::build_once(engine, shadow, metric, dim, attempt)?;
+            attempt += 1;
         }
-        if built.1.unreachable >= REACHABILITY_MAX_UNREACHABLE {
-            // Never fail: a poor index still answers, and refusing to build one
-            // would take vector search down entirely over a quality problem.
-            // The caller gets a working index and the operator gets a warning.
-            tracing::warn!(
-                vectors = built.0.keys.len(),
-                unreachable = built.1.unreachable,
-                sampled = built.1.sampled,
-                "HNSW index still loses data after {MAX_BUILD_ATTEMPTS} rebuilds; \
-                 searches on this collection may be incomplete"
-            );
-        }
-        Ok(built.0)
     }
 
     /// One build, with the count of sampled vectors that could not find
@@ -748,10 +779,26 @@ impl HnswIndex {
         }
 
         // Link what the insertion left where no search reaches (ADR-241).
-        let linked = match &graph {
+        #[cfg(test)]
+        let unlinked = SKIP_LINKING.with(|skip| skip.get());
+        #[cfg(not(test))]
+        let unlinked = false;
+        let (linked, cut_off) = match &graph {
+            _ if unlinked => (0, 0),
             Graph::Cosine(g) => link_cut_off(g, engine)?,
             Graph::Euclidean(g) => link_cut_off(g, engine)?,
         };
+        #[cfg(test)]
+        let cut_off = if unlinked {
+            match &graph {
+                Graph::Cosine(g) => Layer0::read(g).cut_off().len(),
+                Graph::Euclidean(g) => Layer0::read(g).cut_off().len(),
+            }
+        } else {
+            cut_off
+        };
+        #[cfg(test)]
+        BUILD_ATTEMPTS.with(|n| n.set(n.get() + 1));
 
         debug!(vectors = keys.len(), linked, "built HNSW index");
         let bytes = estimate_bytes(&keys, dim);
@@ -768,7 +815,7 @@ impl HnswIndex {
 
         // Ask the sampled vectors to find themselves. A few dozen searches
         // against an O(n log n) build, and no extra reads.
-        let mut reach = Reachability { linked, ..Reachability::default() };
+        let mut reach = Reachability { linked, cut_off, ..Reachability::default() };
         for (i, vector) in &probes {
             reach.sampled += 1;
             let found = index.search_keys(vector, 1)?;
@@ -2152,41 +2199,81 @@ mod tests {
         }
     }
 
-    /// A build that loses data is retried, each time in that attempt's order,
-    /// and what it returns is the last attempt's graph. A collection of one
-    /// vector repeated loses data in every draw: a probe among hundreds of
-    /// points at distance zero cannot tell itself from the rest, so every
-    /// attempt is judged lost and `build` runs them all.
-    #[test]
-    fn a_build_that_loses_data_retries_in_each_attempts_order() {
+    /// 300 copies of one vector: a collection whose insertion cuts most
+    /// points off at layer 0 (every list fills with copies at distance zero
+    /// and drops the newcomer), and whose sampled probes cannot tell
+    /// themselves from the copies, so its score is high whether or not the
+    /// graph is linked.
+    fn one_vector_repeated() -> (Engine, CollectionMeta, tempfile::TempDir) {
         let dir = tempfile::tempdir().unwrap();
         let engine = Engine::open(&dir.path().join("kimmy.redb")).unwrap();
         engine.create_collection("app", "docs").unwrap();
         engine.configure_vectors("app", "docs", config(4)).unwrap();
         let shadow = engine.vector_collection("app", "docs").unwrap().unwrap();
-        for i in 0..300 {
-            let source = DocId::Int64(i);
-            let record = VectorRecord {
-                source: source.clone(),
-                chunk: 0,
-                source_hlc: Hlc::new(1, 0),
-                vector: vec![1.0, 0.0, 0.0, 0.0],
-                text: "the same".into(),
-                config: None,
-            };
-            engine.put_vectors(&shadow, &source, &[record]).unwrap();
-        }
+        engine
+            .write_batch(kimmy_storage::WriterHolder::Embedding, |scope| {
+                for i in 0..300 {
+                    let source = DocId::Int64(i);
+                    let record = VectorRecord {
+                        source: source.clone(),
+                        chunk: 0,
+                        source_hlc: Hlc::new(1, 0),
+                        vector: vec![1.0, 0.0, 0.0, 0.0],
+                        text: "the same".into(),
+                        config: None,
+                    };
+                    let write = kimmy_storage::VectorWrite::encode(
+                        &source,
+                        &ChunkSource::from(&source),
+                        &[record],
+                    )?;
+                    scope.put_vectors(&shadow, write)?;
+                }
+                Ok(())
+            })
+            .unwrap();
+        (engine, shadow, dir)
+    }
+
+    /// A build that leaves points cut off after linking is retried, each
+    /// time in that attempt's order, and returns the last attempt's graph.
+    /// No measured build has left one, so the test skips the linking to make
+    /// one that does.
+    #[test]
+    fn a_build_left_cut_off_is_retried_in_each_attempts_order() {
+        let (engine, shadow, _dir) = one_vector_repeated();
+        SKIP_LINKING.with(|skip| skip.set(true));
         let (first, reach) = HnswIndex::build_once(&engine, &shadow, Metric::Cosine, 4, 0).unwrap();
-        assert!(
-            reach.unreachable >= REACHABILITY_MAX_UNREACHABLE,
-            "the fixture must lose data in a draw to be retried: {reach:?}"
-        );
+        assert!(reach.cut_off > 0, "the fixture must leave points cut off: {reach:?}");
         let last = HnswIndex::build_once(&engine, &shadow, Metric::Cosine, 4, MAX_BUILD_ATTEMPTS)
             .unwrap()
             .0;
+        let before = BUILD_ATTEMPTS.with(|n| n.get());
         let returned = HnswIndex::build(&engine, &shadow, Metric::Cosine, 4).unwrap();
+        let attempts = BUILD_ATTEMPTS.with(|n| n.get()) - before;
+        SKIP_LINKING.with(|skip| skip.set(false));
+        assert_eq!(attempts, MAX_BUILD_ATTEMPTS + 1, "every attempt was made");
         assert_ne!(shape(&returned), shape(&first), "the retries rebuilt the first draw");
         assert_eq!(shape(&returned), shape(&last), "not the last attempt's graph");
+    }
+
+    /// A build whose sample scores high while every point is linked is not
+    /// retried: what the probes missed is reachable, and another insertion
+    /// order does not make the collection easier to search. It warns, and
+    /// serves the first graph.
+    #[test]
+    fn a_high_sampled_score_with_nothing_cut_off_is_not_retried() {
+        let (engine, shadow, _dir) = one_vector_repeated();
+        let (first, reach) = HnswIndex::build_once(&engine, &shadow, Metric::Cosine, 4, 0).unwrap();
+        assert_eq!(reach.cut_off, 0, "linked: {reach:?}");
+        assert!(
+            reach.unreachable >= REACHABILITY_MAX_UNREACHABLE,
+            "the fixture must score at or above the threshold: {reach:?}"
+        );
+        let before = BUILD_ATTEMPTS.with(|n| n.get());
+        let returned = HnswIndex::build(&engine, &shadow, Metric::Cosine, 4).unwrap();
+        assert_eq!(BUILD_ATTEMPTS.with(|n| n.get()) - before, 1, "retried");
+        assert_eq!(shape(&returned), shape(&first));
     }
 
     /// A build links every point its insertion cut off at layer 0, so none is
