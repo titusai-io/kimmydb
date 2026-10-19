@@ -1633,7 +1633,8 @@ impl World {
         converge: Option<kimmy_core::VersionVector>,
         inner: &[(u8, Vec<Op>)],
     ) -> Res<()> {
-        let expected = self.sender_records(from, scope)?;
+        let mut expected = self.sender_records(from, scope)?;
+        let mut sender_restored = false;
         // Keys a step between the pages sends: a keyed write the sender makes during the
         // snapshot is the stated residual for the snapshot half of I2.
         let during: HashSet<u8> = inner
@@ -1703,6 +1704,8 @@ impl World {
             for (j, ops) in inner {
                 if usize::from(*j) == pages && !progress.is_complete() {
                     for op in ops {
+                        sender_restored |=
+                            matches!(op.step, Step::Restore { m, .. } if m as usize == from);
                         self.apply_between_pages(op, to, from, scope.is_none())?;
                     }
                 }
@@ -1713,6 +1716,13 @@ impl World {
         }
         if refused {
             return Ok(());
+        }
+        // A sender restored between the pages holds what its backup held, from then on:
+        // the receiver is owed every record the sender holds at the end (m4: a page asked
+        // with a base the restore made stale starts its collection's records again), and
+        // none the restore took away.
+        if sender_restored {
+            expected = self.sender_records(from, scope)?;
         }
         // I2, a completed snapshot: the receiver holds every live record the sender held
         // for what it carried, merged.
@@ -4551,6 +4561,10 @@ fn sweep(seeds: std::ops::Range<u64>, len: usize, threads: usize) -> Sweep {
     let next = std::sync::atomic::AtomicUsize::new(0);
     let totals = Mutex::new(Sweep::default());
     let failure: Mutex<Option<String>> = Mutex::new(None);
+    // `IDEM_KEEP_GOING=1`: every failing schedule is listed, one line each, and the sweep
+    // runs to its end (to classify failures); it still fails at the end.
+    let keep_going = std::env::var("IDEM_KEEP_GOING").is_ok_and(|v| v == "1");
+    let failed: Mutex<Vec<String>> = Mutex::new(Vec::new());
     std::thread::scope(|scope| {
         for _ in 0..threads.max(1) {
             scope.spawn(|| {
@@ -4602,6 +4616,16 @@ fn sweep(seeds: std::ops::Range<u64>, len: usize, threads: usize) -> Sweep {
                         }
                     }
                     if !out.failures.is_empty() {
+                        if keep_going {
+                            let first = &out.failures[0];
+                            let line = format!(
+                                "FAILED seed {seed} track {track:?}: {:?}: {}",
+                                first.inv, first.detail
+                            );
+                            eprintln!("{line}");
+                            failed.lock().unwrap().push(line);
+                            continue;
+                        }
                         failure.lock().unwrap().get_or_insert(render(Some(seed), &sched, &out));
                         return;
                     }
@@ -4651,6 +4675,8 @@ fn sweep(seeds: std::ops::Range<u64>, len: usize, threads: usize) -> Sweep {
     if let Some(report) = failure.into_inner().unwrap() {
         panic!("{report}");
     }
+    let failed = failed.into_inner().unwrap();
+    assert!(failed.is_empty(), "{} schedules failed:\n{}", failed.len(), failed.join("\n"));
     totals
 }
 
