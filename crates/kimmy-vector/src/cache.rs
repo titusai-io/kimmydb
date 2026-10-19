@@ -1800,7 +1800,7 @@ mod tests {
     }
 
     /// A snapshot a 0.51 build saved, its graph built by `hnsw_rs` 0.3.4, is
-    /// refused and rebuilt, never adopted (ADR-242): it says format 3, and the
+    /// refused and rebuilt, never adopted (ADR-241): it says format 3, and the
     /// dump's layout is the same as 0.3.5's, so nothing but the format tells
     /// the graph with 0.3.4's unreachable vectors from a sound one. It covers
     /// exactly what the store holds, so on any other test it would be adopted
@@ -1854,7 +1854,7 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // A dump the library would end the process on (ADR-242)
+    // A dump the library would end the process on (ADR-241)
     // -----------------------------------------------------------------------
 
     /// The child's instructions: `<mode>:<case>:<directory>`.

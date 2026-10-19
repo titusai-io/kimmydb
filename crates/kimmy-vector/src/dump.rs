@@ -1,5 +1,5 @@
 //! What `hnsw_rs`'s reader would do with a snapshot's two files, decided
-//! before it is asked to (ADR-242).
+//! before it is asked to (ADR-241).
 //!
 //! `HnswIo::load_hnsw` trusts its files. A file it cannot read is not always
 //! an error it returns: in 0.3.5 a description in dump format 2, and **any**
