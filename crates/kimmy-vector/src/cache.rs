@@ -693,38 +693,51 @@ impl IndexCache {
             }
         };
 
-        let fresh = match self.saved_at.lock().get(&shadow.id).copied() {
-            Some(saved_at) => {
-                let fresh = saved_at == generation;
-                if !fresh {
-                    debug!(
-                        saved_at,
-                        generation,
-                        "snapshot predates a write this process made; serving it once and \
+        // A graph `hnsw_rs` 0.3.4 built, saved by 0.51 or earlier, is behind
+        // whatever the counts say: it left part of the collection where no
+        // search reaches it (ADR-241). It serves this search, as any behind
+        // snapshot does, and the next one rebuilds it.
+        if !index.built_by_this_build() {
+            tracing::info!(
+                ?path,
+                vectors = index.len(),
+                "adopting an HNSW snapshot a build before 0.52.0 made as behind; it serves \
+                 this search and the next search of the collection rebuilds it"
+            );
+        }
+        let fresh = index.built_by_this_build()
+            && match self.saved_at.lock().get(&shadow.id).copied() {
+                Some(saved_at) => {
+                    let fresh = saved_at == generation;
+                    if !fresh {
+                        debug!(
+                            saved_at,
+                            generation,
+                            "snapshot predates a write this process made; serving it once and \
                          rebuilding"
-                    );
+                        );
+                    }
+                    fresh
                 }
-                fresh
-            }
-            None => {
-                // The count, and the moves of chunk ids since the build: an
-                // adoption, or a re-embed that took a document off its 0.50
-                // ids, keeps the count and changes the keys (ADR-239).
-                let current = count_vectors(engine, shadow).ok()?;
-                let renames = engine.vector_renames(shadow.id).ok()?;
-                let fresh = current == index.len() && renames == index.renames();
-                if !fresh {
-                    debug!(
-                        snapshot = index.len(),
-                        current,
-                        snapshot_renames = index.renames(),
-                        renames,
-                        "snapshot is behind the store; serving it once and rebuilding"
-                    );
+                None => {
+                    // The count, and the moves of chunk ids since the build: an
+                    // adoption, or a re-embed that took a document off its 0.50
+                    // ids, keeps the count and changes the keys (ADR-239).
+                    let current = count_vectors(engine, shadow).ok()?;
+                    let renames = engine.vector_renames(shadow.id).ok()?;
+                    let fresh = current == index.len() && renames == index.renames();
+                    if !fresh {
+                        debug!(
+                            snapshot = index.len(),
+                            current,
+                            snapshot_renames = index.renames(),
+                            renames,
+                            "snapshot is behind the store; serving it once and rebuilding"
+                        );
+                    }
+                    fresh
                 }
-                fresh
-            }
-        };
+            };
         let (generation, decided) = if fresh {
             (generation, Instant::now())
         } else {
@@ -1800,13 +1813,13 @@ mod tests {
     }
 
     /// A snapshot a 0.51 build saved, its graph built by `hnsw_rs` 0.3.4, is
-    /// refused and rebuilt, never adopted (ADR-241): it says format 3, and the
-    /// dump's layout is the same as 0.3.5's, so nothing but the format tells
-    /// the graph with 0.3.4's unreachable vectors from a sound one. It covers
-    /// exactly what the store holds, so on any other test it would be adopted
-    /// as fresh; the control shows that.
+    /// served once and rebuilt, never adopted as fresh (ADR-241). Its
+    /// `meta.json` has no `graph` field, and its dump's layout is the same as
+    /// this build's, so nothing else tells the graph with 0.3.4's unreachable
+    /// vectors from a sound one. It covers exactly what the store holds, so
+    /// on any other test it would be adopted as fresh; the control shows that.
     #[test]
-    fn a_format_3_snapshot_is_refused_and_rebuilt_never_adopted() {
+    fn a_snapshot_0_51_saved_serves_once_and_is_rebuilt() {
         let (engine, shadow, dir) = setup(60);
         let cache = snapshot_cache(&dir);
         cache.access(&engine, &shadow, Metric::Cosine, 4);
@@ -1816,41 +1829,45 @@ mod tests {
         let meta = |path: &std::path::Path| -> serde_json::Value {
             serde_json::from_slice(&std::fs::read(path.join("meta.json")).unwrap()).unwrap()
         };
-        assert_eq!(meta(&snapshot)["format"], 4, "this build saves format 4");
+        assert_eq!(meta(&snapshot)["format"], 3, "the format is 0.51's");
+        assert_eq!(meta(&snapshot)["graph"], 2, "this build says what built the graph");
         // A file a load leaves where it is and a save, which replaces the
-        // directory, does not: which of the two the access did.
+        // directory, does not: which of the two an access did.
         let marked = |path: &std::path::Path| path.join("adopted-marker").exists();
 
-        // The control: as saved, the snapshot is adopted.
+        // The control: as saved, the snapshot is adopted as fresh, and the
+        // next access serves the same graph.
         std::fs::write(snapshot.join("adopted-marker"), b"").unwrap();
         let (engine, shadow) = reopen(&dir);
         let cache = snapshot_cache(&dir);
-        assert!(matches!(
-            cache.access(&engine, &shadow, Metric::Cosine, 4),
-            Access::Approximate(_)
-        ));
-        assert!(marked(&snapshot), "the control: a format-4 snapshot of the store is adopted");
-        drop(cache);
+        let Access::Approximate(first) = cache.access(&engine, &shadow, Metric::Cosine, 4) else {
+            panic!("the snapshot should serve");
+        };
+        let Access::Approximate(second) = cache.access(&engine, &shadow, Metric::Cosine, 4) else {
+            panic!("and keep serving");
+        };
+        assert!(Arc::ptr_eq(&first, &second), "the control: a marked snapshot is fresh");
+        assert!(marked(&snapshot));
+        drop((cache, first, second));
         drop(engine);
 
-        // The same snapshot as a 0.51 build writes it.
+        // The same snapshot as a 0.51 build writes it: no `graph` field.
         let mut old = meta(&snapshot);
-        old["format"] = serde_json::json!(3);
+        old.as_object_mut().unwrap().remove("graph");
         std::fs::write(snapshot.join("meta.json"), serde_json::to_vec(&old).unwrap()).unwrap();
         let (engine, shadow) = reopen(&dir);
-        let refused = crate::index::HnswIndex::load(&snapshot, Metric::Cosine, 4, shadow.created);
-        assert!(
-            matches!(&refused, Err(crate::VectorError::Snapshot(d)) if d.contains("format 3 is not 4")),
-            "{:?}",
-            refused.as_ref().err()
-        );
         let cache = snapshot_cache(&dir);
-        let Access::Approximate(index) = cache.access(&engine, &shadow, Metric::Cosine, 4) else {
-            panic!("a refused snapshot must fall back to a rebuild");
+        let Access::Approximate(first) = cache.access(&engine, &shadow, Metric::Cosine, 4) else {
+            panic!("0.51's snapshot should serve the search that loads it");
         };
-        assert_eq!(index.len(), 60);
-        assert!(!marked(&snapshot), "a format-3 snapshot was adopted");
-        assert_eq!(meta(&snapshot)["format"], 4, "the rebuild saved its own graph");
+        assert_eq!(first.len(), 60);
+        assert!(marked(&snapshot), "served as it was, not rebuilt yet");
+        let Access::Approximate(second) = cache.access(&engine, &shadow, Metric::Cosine, 4) else {
+            panic!("then a rebuild serves");
+        };
+        assert!(!Arc::ptr_eq(&first, &second), "0.51's snapshot was adopted as fresh");
+        assert!(!marked(&snapshot), "the rebuild saved its own graph");
+        assert_eq!(meta(&snapshot)["graph"], 2);
     }
 
     // -----------------------------------------------------------------------

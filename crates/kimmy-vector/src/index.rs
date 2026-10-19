@@ -175,6 +175,15 @@ struct SnapshotMeta {
     /// anyway when it is older.
     #[serde(default)]
     renames: u64,
+    /// Which build of the graph this is ([`GRAPH_BUILD`]); 0 when absent.
+    ///
+    /// A field rather than a format, so that 0.51, which ignores a field it
+    /// does not know, loads this build's graphs (the dump's layout is the
+    /// same) and a rollback rebuilds nothing; and exact, because 0.51 writes
+    /// its `meta.json` from its own fields, so a graph it rebuilt and saved
+    /// over one of these reads as 0 again.
+    #[serde(default)]
+    graph: u32,
 }
 
 /// Bumped when the snapshot layout changes; a mismatch is a rebuild, not a
@@ -193,16 +202,20 @@ struct SnapshotMeta {
 /// rebuild per vector collection per member, on its first search after the
 /// upgrade. A 0.50 build refuses a format-3 snapshot in turn, and rebuilds.
 ///
-/// 4 is a graph `hnsw_rs` 0.3.5 built (ADR-241). The dump's layout did not
-/// change, so 0.3.5 would read a format-3 snapshot; what changed is the graph
-/// in it. 0.3.4 stored each reverse edge at the new point's top layer instead
-/// of the layer it was found on, which left 0.5% to 3.8% of every collection
-/// of 500 vectors or more that no search reaches, and a format-3 graph adopted
-/// on an equal count would keep them unreachable until the collection's next
-/// write. Refused, it is rebuilt once per vector collection per member, on the
-/// collection's first search. A 0.51 build refuses a format-4 snapshot in
-/// turn, before its library reads the dump, and rebuilds.
-const SNAPSHOT_FORMAT: u32 = 4;
+/// **Not bumped for 0.52.0's graphs** (ADR-241), which say what built them in
+/// [`SnapshotMeta::graph`] instead: the dump's layout did not change, so a
+/// 0.51 member reads a 0.52 graph and serves it, and a rollback rebuilds
+/// nothing.
+const SNAPSHOT_FORMAT: u32 = 3;
+
+/// What [`SnapshotMeta::graph`] says of a graph this build made: `hnsw_rs`
+/// 0.3.5, with every point its insertion cut off at layer 0 linked
+/// ([`link_cut_off`]). A snapshot without it (0, the field absent) was built
+/// by 0.3.4, whose graphs left 0.5% to 5% of a collection where no search
+/// reaches it, and is adopted as behind: it serves the search that loaded it,
+/// and the next one rebuilds it. 1 was never written: no release built 0.3.5
+/// graphs without the linking.
+const GRAPH_BUILD: u32 = 2;
 
 /// What the snapshot at `dir` says it was built for, read from its
 /// `meta.json` and nothing else: which incarnation, and at which shape.
@@ -328,6 +341,11 @@ impl Layer0 {
         D: hnsw_rs::anndists::dist::Distance<f32> + Send + Sync,
     {
         let n = graph.get_nb_point();
+        if n == 0 {
+            // The library's point iterator unwraps the entry point, which an
+            // empty graph does not have.
+            return Self { no_edge_in: Vec::new(), outside: Vec::new() };
+        }
         let mut level = vec![0u8; n];
         let mut edges: Vec<Vec<usize>> = vec![Vec::new(); n];
         for point in graph.get_point_indexation() {
@@ -490,6 +508,9 @@ pub struct HnswIndex {
     /// [`SnapshotMeta::renames`]: the shadow's moves of chunk ids when this was
     /// built, read before its walk.
     renames: u64,
+    /// [`SnapshotMeta::graph`]: [`GRAPH_BUILD`] for a graph this build made,
+    /// what the snapshot said for one it loaded.
+    built_by: u32,
 }
 
 impl HnswIndex {
@@ -708,7 +729,16 @@ impl HnswIndex {
 
         debug!(vectors = keys.len(), linked, "built HNSW index");
         let bytes = estimate_bytes(&keys, dim);
-        let index = Self { graph, keys, metric, dim, created: shadow.created, bytes, renames };
+        let index = Self {
+            graph,
+            keys,
+            metric,
+            dim,
+            created: shadow.created,
+            bytes,
+            renames,
+            built_by: GRAPH_BUILD,
+        };
 
         // Ask the sampled vectors to find themselves. A few dozen searches
         // against an O(n log n) build, and no extra reads.
@@ -786,6 +816,13 @@ impl HnswIndex {
         self.renames
     }
 
+    /// Whether this build's library and linking made the graph
+    /// ([`GRAPH_BUILD`]). A loaded graph that was not is behind whatever the
+    /// store holds.
+    pub(crate) fn built_by_this_build(&self) -> bool {
+        self.built_by >= GRAPH_BUILD
+    }
+
     pub fn is_empty(&self) -> bool {
         self.keys.is_empty()
     }
@@ -840,6 +877,7 @@ impl HnswIndex {
             created: self.created,
             keys: self.keys.clone(),
             renames: self.renames,
+            graph: self.built_by,
         };
         std::fs::write(
             staging.join("meta.json"),
@@ -935,6 +973,7 @@ impl HnswIndex {
             created: meta.created,
             bytes,
             renames: meta.renames,
+            built_by: meta.graph,
         })
     }
 
@@ -2135,6 +2174,28 @@ mod tests {
                 "{path}"
             );
         }
+    }
+
+    /// What built a loaded graph is what its snapshot says: this build's
+    /// marker as saved, and nothing when the field is absent, as in every
+    /// snapshot 0.51 and earlier wrote (ADR-241).
+    #[test]
+    fn a_snapshot_says_what_built_its_graph() {
+        let (engine, shadow, _ids, _dir) = uuid_documents(10);
+        let index = HnswIndex::build(&engine, &shadow, Metric::Cosine, 2).unwrap();
+        assert!(index.built_by_this_build());
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("snapshot");
+        index.save(&path).unwrap();
+        let loaded = HnswIndex::load(&path, Metric::Cosine, 2, shadow.created).unwrap();
+        assert!(loaded.built_by_this_build(), "as saved");
+
+        let mut meta: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(path.join("meta.json")).unwrap()).unwrap();
+        meta.as_object_mut().unwrap().remove("graph");
+        std::fs::write(path.join("meta.json"), serde_json::to_vec(&meta).unwrap()).unwrap();
+        let loaded = HnswIndex::load(&path, Metric::Cosine, 2, shadow.created).unwrap();
+        assert!(!loaded.built_by_this_build(), "0.51's snapshot, which has no marker");
     }
 
     /// Test 18: a snapshot in the format a 0.50 build wrote, whose keys were
