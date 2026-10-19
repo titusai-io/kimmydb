@@ -4775,6 +4775,14 @@ struct Sweep {
 /// Run each seed of `seeds` on both tracks, `threads` at a time; panic with the first
 /// failing schedule's report.
 fn sweep(seeds: std::ops::Range<u64>, len: usize, threads: usize) -> Sweep {
+    let (totals, failed) = sweep_listing(seeds, len, threads);
+    assert!(failed.is_empty(), "{} schedules failed:\n{}", failed.len(), failed.join("\n"));
+    totals
+}
+
+/// [`sweep`], handing back the schedules `IDEM_KEEP_GOING=1` listed as failed rather than
+/// failing on them, so the caller can check its coverage first.
+fn sweep_listing(seeds: std::ops::Range<u64>, len: usize, threads: usize) -> (Sweep, Vec<String>) {
     let started = std::time::Instant::now();
     let jobs: Vec<(u64, Track)> =
         seeds.clone().flat_map(|seed| [(seed, Track::Home), (seed, Track::Anywhere)]).collect();
@@ -4903,9 +4911,7 @@ fn sweep(seeds: std::ops::Range<u64>, len: usize, threads: usize) -> Sweep {
     if let Some(report) = failure.into_inner().unwrap() {
         panic!("{report}");
     }
-    let failed = failed.into_inner().unwrap();
-    assert!(failed.is_empty(), "{} schedules failed:\n{}", failed.len(), failed.join("\n"));
-    totals
+    (totals, failed.into_inner().unwrap())
 }
 
 fn threads() -> usize {
@@ -4933,8 +4939,10 @@ fn generated_schedules_short() {
 fn generated_schedules_long() {
     let start = env_u64("IDEM_SEED_START", 1_000_000);
     let count = env_u64("IDEM_SEEDS", 1000);
-    let totals = sweep(start..start + count, LEN, threads());
+    let (totals, failed) = sweep_listing(start..start + count, LEN, threads());
+    // The coverage first: a run whose schedules failed still says what it reached.
     assert_coverage(&totals, count);
+    assert!(failed.is_empty(), "{} schedules failed:\n{}", failed.len(), failed.join("\n"));
 }
 
 /// The long run's coverage: every path the generator's bias exists for is reached at
