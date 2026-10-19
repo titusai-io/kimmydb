@@ -38,7 +38,7 @@ pub(crate) const EXCHANGE_TIMEOUT: Duration = Duration::from_secs(10);
 pub(crate) struct Driver(tokio::task::JoinHandle<()>);
 
 impl Driver {
-    pub(crate) fn spawn(
+    pub(crate) fn start(
         engine: Arc<Engine>,
         secret: String,
         members: Members,
@@ -266,7 +266,7 @@ mod tests {
 
     fn driver(member: &Peer) -> Driver {
         let queue = member.members.take_exchange_queue().expect("the queue, once");
-        Driver::spawn(Arc::clone(&member.engine), SECRET.into(), member.members.clone(), queue)
+        Driver::start(Arc::clone(&member.engine), SECRET.into(), member.members.clone(), queue)
     }
 
     /// One exchange: each side holds the other's block afterwards, and the

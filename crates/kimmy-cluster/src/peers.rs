@@ -793,7 +793,7 @@ pub async fn replicate(engine: Arc<Engine>, config: ReplicationConfig) {
     // for the tick. Aborted when the loop ends, with every exchange in flight.
     let _exchanging = config.members.as_ref().and_then(|members| {
         let queue = members.take_exchange_queue()?;
-        Some(crate::exchange::Driver::spawn(
+        Some(crate::exchange::Driver::start(
             Arc::clone(&engine),
             config.secret.clone(),
             members.clone(),
