@@ -1477,6 +1477,62 @@ mod tests {
         assert_eq!(e.code, timeout.code);
     }
 
+    /// An embedding endpoint on loopback, in the custom dialect, answering
+    /// every request with `answer`.
+    async fn embedding_stub(answer: serde_json::Value) -> String {
+        let app = axum::Router::new().route(
+            "/embed",
+            axum::routing::post(move || {
+                let answer = answer.clone();
+                async move { axum::Json(answer) }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+        format!("http://{addr}/embed")
+    }
+
+    /// **A provider's query vector too large to square, or missing from its
+    /// answer, is the provider's fault: `502` `provider_error`** (ADR-241).
+    /// The missing one is refused by the provider's own count of what it
+    /// returned, before the query sees it.
+    #[tokio::test]
+    async fn a_provider_query_vector_too_large_to_score_or_missing_answers_502() {
+        let policy = kimmy_vector::ProviderPolicy::new(
+            kimmy_vector::policy::default_allowed_key_env(),
+            vec!["127.0.0.1".into()],
+            false,
+            Default::default(),
+        )
+        .unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let state = live_state_with(&dir, policy);
+        let body = SearchRequest { query: Some("hello".into()), ..Default::default() };
+        for (answer, says) in [
+            (serde_json::json!({ "embeddings": [[3e38, 0.0]] }), "no finite squared length"),
+            (serde_json::json!({ "embeddings": [] }), "expected 1 vectors, got 0"),
+        ] {
+            let mut c = config();
+            c.provider = ProviderConfig::CustomHttp {
+                endpoint: embedding_stub(answer).await,
+                api_key_env: None,
+            };
+            let err = resolve_query_vector(&state, &c, &body).await.unwrap_err();
+            assert_eq!(err.status, StatusCode::BAD_GATEWAY, "{}", err.message);
+            assert_eq!(err.code, ErrorCode::ProviderError, "{}", err.message);
+            assert!(err.message.contains(says), "{says}: {}", err.message);
+        }
+        let mut c = config();
+        c.provider = ProviderConfig::CustomHttp {
+            endpoint: embedding_stub(serde_json::json!({ "embeddings": [[0.6, 0.8]] })).await,
+            api_key_env: None,
+        };
+        assert_eq!(resolve_query_vector(&state, &c, &body).await.unwrap(), vec![0.6, 0.8]);
+    }
+
     fn live_state(dir: &tempfile::TempDir) -> SharedState {
         live_state_with(dir, kimmy_vector::ProviderPolicy::default())
     }

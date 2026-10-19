@@ -348,6 +348,8 @@ fn estimate_bytes(keys: &[String], dim: usize) -> usize {
 struct Layer0 {
     no_edge_in: Vec<bool>,
     outside: Vec<bool>,
+    /// Each point's layer-0 edges, by graph id.
+    edges: Vec<Vec<usize>>,
 }
 
 impl Layer0 {
@@ -359,7 +361,7 @@ impl Layer0 {
         if n == 0 {
             // The library's point iterator unwraps the entry point, which an
             // empty graph does not have.
-            return Self { no_edge_in: Vec::new(), outside: Vec::new() };
+            return Self { no_edge_in: Vec::new(), outside: Vec::new(), edges: Vec::new() };
         }
         let mut level = vec![0u8; n];
         let mut edges: Vec<Vec<usize>> = vec![Vec::new(); n];
@@ -397,6 +399,7 @@ impl Layer0 {
         Self {
             no_edge_in: into.iter().map(|linked| !linked).collect(),
             outside: reached.iter().map(|r| !r).collect(),
+            edges,
         }
     }
 
@@ -411,6 +414,11 @@ impl Layer0 {
 /// (ADR-241). Returns how many edges were added, and how many points are still
 /// cut off (none, in every build measured).
 ///
+/// The nearest linked points come from a search of [`LINK_CANDIDATES`]. A
+/// point whose candidates are all cut off themselves, which a component of
+/// more than that many points out of the entry point's reach can leave, is
+/// bridged instead ([`bridges`]).
+///
 /// **Why a build leaves any.** `hnsw_rs` adds a new point to each of its
 /// neighbours' lists and, when a list is over its cap, drops the farthest
 /// entry, which can be the new point; a point dropped by every neighbour has
@@ -423,7 +431,7 @@ impl Layer0 {
 /// second at 100,000 vectors of realistic data.
 fn link_cut_off<D>(graph: &Hnsw<'static, f32, D>, engine: &Engine) -> Result<(usize, usize)>
 where
-    D: hnsw_rs::anndists::dist::Distance<f32> + Send + Sync,
+    D: hnsw_rs::anndists::dist::Distance<f32> + Default + Send + Sync,
 {
     let mut added = 0;
     for _ in 0..LINK_ROUNDS {
@@ -448,6 +456,7 @@ where
         // copies of one vector all find the same few linked candidates, and
         // would otherwise hang every edge on one of them.
         let mut given: std::collections::HashMap<usize, usize> = Default::default();
+        let mut stranded = false;
         for &point in &cut {
             let Some(vector) = vectors[point].as_deref() else { continue };
             let mut candidates: Vec<(usize, usize)> = graph
@@ -461,21 +470,108 @@ where
                 })
                 .collect();
             candidates.sort_unstable();
+            stranded |= candidates.is_empty();
             for &(_, from) in candidates.iter().take(LINK_EDGES) {
                 *given.entry(from).or_default() += 1;
                 edges.push((from, point));
             }
         }
-        let linked = graph.add_layer0_edges(&edges);
+        let mut linked = graph.add_layer0_edges(&edges);
+        if stranded {
+            linked += graph.add_layer0_edges(&bridges(graph, &Layer0::read(graph)));
+        }
         if linked == 0 {
-            // Nothing linked could be found near what is left: a graph with
-            // no linked point at all, or one of nothing but duplicates of a
-            // cut-off point. Another round would find the same.
+            // Nothing could be linked: a graph with no linked point at all.
+            // Another round would find the same.
             return Ok((added, cut.len()));
         }
         added += linked;
     }
     Ok((added, Layer0::read(graph).cut_off().len()))
+}
+
+/// Edges into and out of each component of cut-off points that no search's
+/// candidates reach (ADR-241): a component of more than [`LINK_CANDIDATES`]
+/// points out of the entry point's reach, whose searches return only one
+/// another. One point of each component, chosen so that the rest of the
+/// component is reachable from it, is joined both ways to its [`LINK_EDGES`]
+/// nearest linked points, found by reading every linked point. The cost is
+/// one pass over the graph's vectors per component, and nothing when no
+/// point was stranded.
+fn bridges<D>(graph: &Hnsw<'static, f32, D>, layer0: &Layer0) -> Vec<(usize, usize)>
+where
+    D: hnsw_rs::anndists::dist::Distance<f32> + Default + Send + Sync,
+{
+    let cut = layer0.cut_off();
+    let n = layer0.outside.len();
+    let mut lost = vec![false; n];
+    for &point in &cut {
+        lost[point] = true;
+    }
+    // A cut-off point that no other cut-off point has an edge into heads its
+    // component, and is taken first; then each point not yet covered, in id
+    // order, covering what its edges reach among the cut-off points.
+    let mut fed = vec![false; n];
+    for &from in &cut {
+        for &to in &layer0.edges[from] {
+            if to < n && to != from && lost[to] {
+                fed[to] = true;
+            }
+        }
+    }
+    let order = cut.iter().filter(|&&p| !fed[p]).chain(cut.iter().filter(|&&p| fed[p]));
+    let mut covered = vec![false; n];
+    let mut heads = Vec::new();
+    for &head in order {
+        if std::mem::replace(&mut covered[head], true) {
+            continue;
+        }
+        heads.push(head);
+        let mut stack = vec![head];
+        while let Some(at) = stack.pop() {
+            for &to in &layer0.edges[at] {
+                if to < n && lost[to] && !std::mem::replace(&mut covered[to], true) {
+                    stack.push(to);
+                }
+            }
+        }
+    }
+    if heads.is_empty() {
+        return Vec::new();
+    }
+    let mut vectors: Vec<Option<Vec<f32>>> = vec![None; heads.len()];
+    let slot: std::collections::HashMap<usize, usize> =
+        heads.iter().enumerate().map(|(i, &h)| (h, i)).collect();
+    for point in graph.get_point_indexation() {
+        if let Some(&i) = slot.get(&point.get_origin_id()) {
+            vectors[i] = Some(point.get_v().to_vec());
+        }
+    }
+    let distance = D::default();
+    let mut nearest: Vec<Vec<(f32, usize)>> = vec![Vec::new(); heads.len()];
+    for point in graph.get_point_indexation() {
+        let from = point.get_origin_id();
+        if from >= n || lost[from] {
+            continue;
+        }
+        for (i, vector) in vectors.iter().enumerate() {
+            let Some(vector) = vector else { continue };
+            let near = &mut nearest[i];
+            near.push((distance.eval(vector, point.get_v()), from));
+            if near.len() > LINK_EDGES {
+                near.sort_unstable_by(|a, b| a.0.total_cmp(&b.0).then(a.1.cmp(&b.1)));
+                near.truncate(LINK_EDGES);
+            }
+        }
+    }
+    let mut edges = Vec::new();
+    for (&head, near) in heads.iter().zip(&nearest) {
+        for &(_, from) in near {
+            edges.push((from, head));
+            edges.push((head, from));
+        }
+    }
+    edges
 }
 
 #[cfg(test)]
@@ -2698,6 +2794,80 @@ mod tests {
             "points the entry point does not reach after the linking"
         );
         assert_eq!(lost(&graph), 0, "vectors that cannot find themselves after the linking");
+    }
+
+    /// `graph`'s layer-0 edges, by the point they leave.
+    fn layer0_edges(graph: &Hnsw<'static, f32, DistCosine>) -> Vec<HashSet<usize>> {
+        let mut edges = vec![HashSet::new(); graph.get_nb_point()];
+        for point in graph.get_point_indexation() {
+            edges[point.get_origin_id()] =
+                point.get_neighborhood_id()[0].iter().map(|e| e.d_id).collect();
+        }
+        edges
+    }
+
+    /// The linking bridges a component of cut-off points that no search's
+    /// candidates reach (ADR-241). Two tight clusters at opposite ends,
+    /// inserted one after the other with four connections a point and a
+    /// construction effort of 8, leave the second cluster's 40 points out of
+    /// the entry point's reach at layer 0, and every search for one of them
+    /// returns only its own cluster: a linking by candidates alone gives them
+    /// no edge. Judged from the entry point the library dumps, and by search.
+    #[test]
+    fn the_linking_bridges_a_component_no_search_reaches() {
+        const DIM: usize = 8;
+        let mut vectors = Vec::new();
+        for (base, side) in [(990_001u64, 1.0f32), (991_000, -1.0)] {
+            for i in 0..40 {
+                let mut v = pseudo_random(base + i, DIM);
+                v.iter_mut().for_each(|x| *x *= 0.05);
+                v[0] += side;
+                vectors.push(v);
+            }
+        }
+        let graph = Hnsw::<f32, DistCosine>::new(4, vectors.len(), MAX_LAYERS, 8, DistCosine {});
+        for (i, v) in vectors.iter().enumerate() {
+            graph.insert((v.as_slice(), i));
+        }
+        let before = Layer0::read(&graph);
+        let cut: HashSet<usize> = before.cut_off().into_iter().collect();
+        assert_eq!(cut.len(), 40, "the precondition: the second cluster is cut off");
+        let stranded = cut
+            .iter()
+            .filter(|&&p| {
+                graph
+                    .search(&vectors[p], LINK_CANDIDATES, LINK_EF)
+                    .iter()
+                    .all(|n| n.d_id == p || cut.contains(&n.d_id))
+            })
+            .count();
+        assert_eq!(stranded, 40, "the precondition: no search finds them a linked candidate");
+        let out_of = |graph: &Hnsw<'static, f32, DistCosine>| {
+            let edges = layer0_edges(graph);
+            cut.iter()
+                .map(|&p| edges[p].iter().filter(|to| !cut.contains(to)).count())
+                .sum::<usize>()
+        };
+        let out_before = out_of(&graph);
+
+        let dir = tempfile::tempdir().unwrap();
+        let engine = Engine::open(&dir.path().join("kimmy.redb")).unwrap();
+        let (linked, left) = link_cut_off(&graph, &engine).unwrap();
+        assert!(linked > 0);
+        assert_eq!(left, 0, "points still cut off");
+        assert!(
+            out_of(&graph) > out_before,
+            "the bridge leaves the component as well as entering it"
+        );
+        let entry = library_entry_point(&graph);
+        assert!(
+            unreached_from(&graph, entry).iter().all(|unreached| !unreached),
+            "points the entry point does not reach after the linking"
+        );
+        let lost = (0..vectors.len())
+            .filter(|&i| !graph.search(&vectors[i], 32, 800).iter().any(|n| n.d_id == i))
+            .count();
+        assert_eq!(lost, 0, "vectors that cannot find themselves after the linking");
     }
 
     // -----------------------------------------------------------------------
