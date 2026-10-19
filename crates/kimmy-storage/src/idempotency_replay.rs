@@ -136,8 +136,8 @@ impl Engine {
     /// B2's records of a replay page whose entries name `collections`, from
     /// `from` (exclusive, the page's start) through `through` (its end): every
     /// record of those collections with `last` above `from` and `first` at or
-    /// below `through`, live by the window alone (the life rule is the
-    /// receiver's), carried at its `first`, in key order. A record this build
+    /// below `through`, live by the window alone (a record outlives a drop of
+    /// its collection for its window), carried at its `first`, in key order. A record this build
     /// cannot decode carries nothing here. One read of each collection's records.
     pub fn records_for_replay_page(
         &self,
@@ -509,7 +509,8 @@ mod tests {
     }
 
     /// A changed record larger than the budget cannot cross on a page holding
-    /// nothing else, and is refused by name rather than sent alone (P2's rule).
+    /// nothing else, and is refused by name rather than sent alone, as a
+    /// snapshot page's delta refuses one.
     #[test]
     fn a_changed_record_larger_than_the_budget_is_refused_by_name() {
         let (engine, a, _b, _dir) = open();
