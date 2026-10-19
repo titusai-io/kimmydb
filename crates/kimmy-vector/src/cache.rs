@@ -124,6 +124,11 @@ const BEHIND: u64 = u64::MAX;
 /// re-stamped at the generation the count began at, or behind, and rebuilt.
 const UNVERIFIED: u64 = u64::MAX - 1;
 
+/// The generation every collection's counter starts at in a process: what a
+/// snapshot a previous process saved is judged at, since it predates every
+/// write this process has made.
+const PROCESS_START: u64 = 0;
+
 /// What the last decision for a collection was.
 enum Decision {
     /// A built graph, ready to serve.
@@ -173,11 +178,6 @@ struct Entry {
     decided: Instant,
     /// When a search last took this entry. Eviction order under the budget.
     last_used: Instant,
-    /// For an entry adopted [`UNVERIFIED`], the generation the store was at
-    /// when the snapshot was adopted: what a builder that finds the snapshot
-    /// still matches the store re-stamps it at, so a write made since the
-    /// adoption leaves it behind rather than fresh (ADR-245).
-    adopted_at: u64,
 }
 
 impl Entry {
@@ -189,16 +189,7 @@ impl Entry {
         dim: usize,
         decided: Instant,
     ) -> Self {
-        Self {
-            decision,
-            generation,
-            created,
-            metric,
-            dim,
-            decided,
-            last_used: Instant::now(),
-            adopted_at: 0,
-        }
+        Self { decision, generation, created, metric, dim, decided, last_used: Instant::now() }
     }
 
     fn access(&self) -> Access {
@@ -421,9 +412,10 @@ struct Job {
 #[derive(Default)]
 struct Queue {
     waiting: VecDeque<Job>,
-    /// Collections with a build waiting or running: one at a time each, and
-    /// a search that finds its collection here asks for nothing more.
-    pending: HashSet<CollectionId>,
+    /// Collections with a build waiting or running, and the shape it is a
+    /// build of: one at a time each, and a search that finds its collection
+    /// here asks for nothing more.
+    pending: HashMap<CollectionId, (Metric, usize)>,
     /// Builder threads alive.
     builders: usize,
     /// Builds running now.
@@ -585,9 +577,10 @@ impl IndexCache {
     fn enqueue(&self, engine: &Arc<Engine>, shadow: &CollectionMeta, metric: Metric, dim: usize) {
         let epoch = self.entries.lock().epoch(shadow.id);
         let mut queue = self.queue.lock();
-        if !queue.pending.insert(shadow.id) {
+        if queue.pending.contains_key(&shadow.id) {
             return;
         }
+        queue.pending.insert(shadow.id, (metric, dim));
         queue.waiting.push_back(Job {
             engine: Arc::downgrade(engine),
             shadow: shadow.clone(),
@@ -781,7 +774,7 @@ impl Shared {
             && entry.metric == metric
             && entry.dim == dim
         {
-            entry.generation = entry.adopted_at;
+            entry.generation = PROCESS_START;
             entry.decided = Instant::now();
         }
         true
@@ -845,19 +838,19 @@ impl Shared {
         let Some(turn) = self.exact_scan_turn(shadow.id, deadline).await else {
             return Err(VectorError::DeadlineExceeded);
         };
-        #[cfg(test)]
-        {
-            let hook = self.scan_hook.lock().clone();
-            if let Some(hook) = hook {
-                let taken = self
-                    .scans
-                    .lock()
-                    .get(&shadow.id)
-                    .map_or(0, |t| EXACT_SCANS_PER_COLLECTION - t.available_permits());
-                hook(taken);
-            }
-        }
         let hits = kimmy_storage::blocking(|| {
+            #[cfg(test)]
+            {
+                let hook = self.scan_hook.lock().clone();
+                if let Some(hook) = hook {
+                    let taken = self
+                        .scans
+                        .lock()
+                        .get(&shadow.id)
+                        .map_or(0, |t| EXACT_SCANS_PER_COLLECTION - t.available_permits());
+                    hook(taken);
+                }
+            }
             crate::search::vector_search_until(engine, shadow, query, options, allowed, deadline)
         });
         drop(turn);
@@ -1151,7 +1144,6 @@ impl Shared {
                 Instant::now() - MAX_STALENESS,
             ));
         }
-        let adopted_at = generation;
         let (generation, decided) = match self.saved_at.lock().get(&shadow.id).copied() {
             Some(saved_at) if saved_at == generation => (generation, Instant::now()),
             Some(saved_at) => {
@@ -1169,16 +1161,14 @@ impl Shared {
             // (`Shared::build`), and either adopted as fresh or rebuilt.
             None => (UNVERIFIED, Instant::now() - MAX_STALENESS),
         };
-        let mut entry = Entry::new(
+        Some(Entry::new(
             Decision::Index(Arc::new(index)),
             generation,
             shadow.created,
             metric,
             dim,
             decided,
-        );
-        entry.adopted_at = adopted_at;
-        Some(entry)
+        ))
     }
 
     /// Build the graph or the "too small" verdict.
@@ -1415,7 +1405,7 @@ impl Shared {
     ) -> bool {
         let mut forgot = false;
         // Read before the entries, so the two locks are never held together.
-        let queued = self.queue.lock().pending.contains(&collection);
+        let queued = self.queue.lock().pending.get(&collection).copied();
         {
             let mut entries = self.entries.lock();
             match entries.map.get(&collection) {
@@ -1428,11 +1418,15 @@ impl Shared {
                     entries.fence(collection);
                     forgot = true;
                 }
-                // Nothing resident, and a build queued or running: one asked
-                // for before the reconfiguration is of the old shape, and would
-                // run, save and install a graph `serve` declines while the
-                // build of the shape in force waited behind it.
-                None if queued => entries.fence(collection),
+                // Nothing resident, and a build of another shape queued or
+                // running: one asked for before the reconfiguration, which
+                // would run, save and install a graph `serve` declines while
+                // the build of the shape in force waited behind it. A build of
+                // the shape in force, which a re-delivered configuration finds
+                // queued, is the one wanted, and is left alone.
+                None if queued.is_some_and(|shape| shape != (metric, dim)) => {
+                    entries.fence(collection)
+                }
                 None => {}
             }
         }
@@ -1951,7 +1945,10 @@ mod tests {
         let first = cache.exact_scan_turn(a, soon()).await.expect("a turn");
         let second = cache.exact_scan_turn(a, soon()).await.expect("a second turn");
         let started = Instant::now();
-        assert!(cache.exact_scan_turn(a, soon()).await.is_none(), "a third at once");
+        let third = tokio::time::timeout(PATIENCE, cache.exact_scan_turn(a, soon()))
+            .await
+            .expect("a third is answered at its deadline, not when a turn comes back");
+        assert!(third.is_none(), "a third at once");
         assert!(started.elapsed() >= Duration::from_millis(50), "refused at its deadline");
         assert!(cache.exact_scan_turn(b, soon()).await.is_some(), "another collection's own turns");
         let giving_back = async {
@@ -2372,7 +2369,7 @@ mod tests {
         assert_eq!(
             cache.entries.lock().map[&shadow.id].generation,
             adopted_at,
-            "judged at the generation it was adopted at"
+            "judged at the process's start, before the edit"
         );
         cache.age(shadow.id);
         let Access::Approximate(served) = cache.access(&engine, &shadow, Metric::Cosine, 4) else {
@@ -2384,6 +2381,76 @@ mod tests {
             panic!("a graph");
         };
         assert!(!Arc::ptr_eq(&rebuilt, &adopted), "rebuilt past the window, edit and all");
+    }
+
+    /// An edit this process makes after a restart and before the first
+    /// search adopts the previous process's snapshot is not lost either
+    /// (ADR-245): the snapshot predates every write this process has made, so
+    /// it is judged at the process's start, and the edit, which keeps the
+    /// count and the keys, leaves it behind and rebuilt once the window
+    /// passes.
+    #[test]
+    fn an_edit_before_the_first_search_after_a_restart_leaves_the_snapshot_behind() {
+        let (engine, shadow, dir) = setup(60);
+        let first = snapshot_cache(&dir);
+        assert!(matches!(
+            access(&first, &engine, &shadow, Metric::Cosine, 4),
+            Access::Approximate(_)
+        ));
+        first.settle();
+        drop(first);
+        drop(engine);
+        let (engine, shadow) = reopen(&dir);
+        let source = DocId::Int64(7);
+        engine
+            .put_vectors(
+                &shadow,
+                &source,
+                &[VectorRecord {
+                    source: source.clone(),
+                    chunk: 0,
+                    source_hlc: Hlc::new(5, 0),
+                    vector: vec![-1000.0, -1000.0, 7.0, 7.0],
+                    text: "edited".into(),
+                    config: None,
+                }],
+            )
+            .unwrap();
+        let cache = snapshot_cache(&dir);
+        let Access::Approximate(adopted) = cache.access(&engine, &shadow, Metric::Cosine, 4) else {
+            panic!("the snapshot should have been adopted");
+        };
+        cache.settle();
+        let live = engine.vector_generation(shadow.id);
+        assert_ne!(cache.entries.lock().map[&shadow.id].generation, live, "judged behind the edit");
+        cache.age(shadow.id);
+        let Access::Approximate(served) = cache.access(&engine, &shadow, Metric::Cosine, 4) else {
+            panic!("a graph");
+        };
+        assert!(Arc::ptr_eq(&served, &adopted), "served while it is rebuilt");
+        cache.settle();
+        let Access::Approximate(rebuilt) = cache.access(&engine, &shadow, Metric::Cosine, 4) else {
+            panic!("a graph");
+        };
+        assert!(!Arc::ptr_eq(&rebuilt, &adopted), "rebuilt past the window, edit and all");
+    }
+
+    /// A reconfiguration re-delivered with the shape already in force finds
+    /// the build of that shape queued, and leaves it alone (ADR-245): only a
+    /// queued build of another shape is fenced.
+    #[test]
+    fn a_re_delivered_configuration_keeps_the_queued_build_of_its_shape() {
+        let (engine, a, dir) = setup(60);
+        let b = add_collection(&engine, "other", 60);
+        let cache = snapshot_cache(&dir);
+        let gate = Gate::install(&cache, b.id);
+        assert!(matches!(cache.access(&engine, &b, Metric::Cosine, 4), Access::Building));
+        gate.wait_for_build_to_start();
+        assert!(matches!(cache.access(&engine, &a, Metric::Cosine, 4), Access::Building));
+        assert!(!cache.forget_unless_shaped(a.id, Metric::Cosine, 4), "nothing to forget");
+        gate.release();
+        cache.settle();
+        assert!(cache.contains(a.id), "the build of the shape in force installed");
     }
 
     /// A drop that lands while the build is still queued, not yet running,

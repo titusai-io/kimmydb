@@ -457,7 +457,19 @@ where
         // would otherwise hang every edge on one of them.
         let mut given: std::collections::HashMap<usize, usize> = Default::default();
         let mut stranded = false;
-        for &point in &cut {
+        for (at, &point) in cut.iter().enumerate() {
+            // One search per cut-off point, which on uniform data at a million
+            // vectors is tens of thousands: the stop is looked at between them,
+            // as the bridge's pass looks at it.
+            if at > 0 && at % BRIDGE_STOP_STRIDE == 0 {
+                #[cfg(test)]
+                LINK_PASS_HOOK.with(|hook| {
+                    if let Some(hook) = hook.borrow().as_ref() {
+                        hook();
+                    }
+                });
+                engine.check_walk(kimmy_storage::WalkScope::Background)?;
+            }
             let Some(vector) = vectors[point].as_deref() else { continue };
             let mut candidates: Vec<(usize, usize)> = graph
                 .search(vector, LINK_CANDIDATES, LINK_EF)
@@ -604,7 +616,8 @@ where
     Ok(edges)
 }
 
-/// How many vectors the bridge's pass reads between looks at the node's stop.
+/// How many vectors the bridge's pass reads, and how many cut-off points the
+/// linking searches for, between looks at the node's stop.
 const BRIDGE_STOP_STRIDE: usize = 4_096;
 
 #[cfg(test)]
@@ -614,6 +627,9 @@ thread_local! {
     /// Called on this thread at each of the bridge pass's looks at the stop,
     /// just before it looks.
     static BRIDGE_PASS_HOOK: std::cell::RefCell<Option<Box<dyn Fn()>>> =
+        const { std::cell::RefCell::new(None) };
+    /// The same, for the linking's looks between its searches.
+    static LINK_PASS_HOOK: std::cell::RefCell<Option<Box<dyn Fn()>>> =
         const { std::cell::RefCell::new(None) };
 }
 
@@ -3098,6 +3114,40 @@ mod tests {
             "the build ran on {:?} past the stop",
             stopped.elapsed()
         );
+    }
+
+    /// A stop that lands while the linking searches for its cut-off points
+    /// ends the round at its next look (ADR-245), which comes every 4,096
+    /// points, rather than after the round's last search: two tight
+    /// clusters of 5,000 inserted in turn at toy parameters leave more than
+    /// 4,096 cut off, and the stop arrives at the first look.
+    #[test]
+    fn a_stop_during_a_linking_round_ends_it() {
+        const DIM: usize = 8;
+        let mut vectors = Vec::new();
+        for (base, side) in [(980_001u64, 1.0f32), (985_000, -1.0)] {
+            for i in 0..5_000 {
+                let mut v = pseudo_random(base + i, DIM);
+                v.iter_mut().for_each(|x| *x *= 0.05);
+                v[0] += side;
+                vectors.push(v);
+            }
+        }
+        let graph = Hnsw::<f32, DistCosine>::new(4, vectors.len(), MAX_LAYERS, 8, DistCosine {});
+        for (i, v) in vectors.iter().enumerate() {
+            graph.insert((v.as_slice(), i));
+        }
+        let before = Layer0::read(&graph).cut_off().len();
+        assert!(before > BRIDGE_STOP_STRIDE, "the precondition: {before} cut off");
+        let dir = tempfile::tempdir().unwrap();
+        let engine = std::sync::Arc::new(Engine::open(&dir.path().join("kimmy.redb")).unwrap());
+        let stopping = std::sync::Arc::clone(&engine);
+        LINK_PASS_HOOK
+            .with(|hook| *hook.borrow_mut() = Some(Box::new(move || stopping.stop_walks())));
+        let ended = link_cut_off(&graph, &engine);
+        LINK_PASS_HOOK.with(|hook| *hook.borrow_mut() = None);
+        assert!(ended.is_err(), "the round ended at the stop");
+        assert_eq!(Layer0::read(&graph).cut_off().len(), before, "and linked nothing after it");
     }
 
     /// The bridge's cost at scale: one pass per round scoring every vector
