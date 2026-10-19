@@ -435,8 +435,8 @@ where
 {
     let mut added = 0;
     for _ in 0..LINK_ROUNDS {
-        // A search's build, which the drain's deadline ends, as the inserts.
-        engine.check_walk(kimmy_storage::WalkScope::Request)?;
+        // A builder's work, which the node's stop ends, as the inserts.
+        engine.check_walk(kimmy_storage::WalkScope::Background)?;
         let layer0 = Layer0::read(graph);
         let cut = layer0.cut_off();
         if cut.is_empty() {
@@ -643,6 +643,9 @@ pub struct HnswIndex {
     /// [`SnapshotMeta::graph`]: [`GRAPH_BUILD`] for a graph this build made,
     /// what the snapshot said for one it loaded.
     built_by: u32,
+    /// The build check's sampled score ([`Reachability::unreachable`]); 0 for
+    /// a graph loaded from a snapshot, which was not sampled here.
+    unreached: usize,
 }
 
 impl HnswIndex {
@@ -700,7 +703,8 @@ impl HnswIndex {
     ) -> Result<Self> {
         let mut attempt = 0;
         loop {
-            let (index, reach) = Self::build_once(engine, shadow, metric, dim, attempt)?;
+            let (mut index, reach) = Self::build_once(engine, shadow, metric, dim, attempt)?;
+            index.unreached = reach.unreachable;
             if reach.cut_off == 0 || attempt == MAX_BUILD_ATTEMPTS {
                 if reach.cut_off > 0 {
                     // Never fail: a graph still answers, and refusing to build
@@ -790,7 +794,9 @@ impl HnswIndex {
         // graph read as behind, never as fresh.
         let renames = engine.vector_renames(shadow.id)?;
         let mut records: Vec<(String, Vec<f32>)> = Vec::new();
-        engine.for_each_vector(shadow, kimmy_storage::WalkScope::Request, |id, record| {
+        // A builder's walk, off every request (ADR-241), which the node's
+        // stop ends.
+        engine.for_each_vector(shadow, kimmy_storage::WalkScope::Background, |id, record| {
             // A wrong width belongs to a different model and would corrupt
             // every distance the graph computes.
             if record.vector.len() == dim
@@ -864,8 +870,8 @@ impl HnswIndex {
         // build's peak is one copy plus the graph's bookkeeping, not two.
         let mut keys = Vec::with_capacity(n);
         for (key, vector) in records {
-            // A build is for a search, which the drain's deadline ends.
-            engine.check_walk(kimmy_storage::WalkScope::Request)?;
+            // A builder's work, which the node's stop ends.
+            engine.check_walk(kimmy_storage::WalkScope::Background)?;
             let id = keys.len();
             match &graph {
                 Graph::Cosine(g) => g.insert((vector.as_slice(), id)),
@@ -907,6 +913,7 @@ impl HnswIndex {
             bytes,
             renames,
             built_by: GRAPH_BUILD,
+            unreached: 0,
         };
 
         // Ask the sampled vectors to find themselves. A few dozen searches
@@ -983,6 +990,12 @@ impl HnswIndex {
     /// ([`Engine::vector_renames`]).
     pub(crate) fn renames(&self) -> u64 {
         self.renames
+    }
+
+    /// The build check's sampled score for this graph; 0 for one loaded from
+    /// a snapshot.
+    pub fn unreached(&self) -> usize {
+        self.unreached
     }
 
     /// Whether this build's library and linking made the graph
@@ -1143,6 +1156,7 @@ impl HnswIndex {
             bytes,
             renames: meta.renames,
             built_by: meta.graph,
+            unreached: 0,
         })
     }
 
@@ -2358,6 +2372,44 @@ mod tests {
     /// deadline with [`VectorError::DeadlineExceeded`]: its cost is the
     /// admitted set, and a filter that tracks the vectors reaches it at any
     /// selectivity.
+    /// The exact scan a search of a collection whose graph is being built
+    /// is answered by stops at a passed deadline, and answers exactly
+    /// without one (ADR-245).
+    #[test]
+    fn an_exact_scan_stops_at_its_deadline() {
+        const COUNT: usize = 2_000;
+        const DIM: usize = 8;
+        let (engine, shadow, _dir) = setup_bulk(COUNT, DIM, 0);
+        let options = SearchOptions { k: 10, metric: Metric::Cosine, per_document: 1 };
+        let query = pseudo_random(90_000, DIM);
+        let passed = std::time::Instant::now();
+        assert!(matches!(
+            crate::search::vector_search_until(
+                &engine,
+                &shadow,
+                &query,
+                &options,
+                None,
+                Some(passed)
+            ),
+            Err(VectorError::DeadlineExceeded)
+        ));
+        let later = std::time::Instant::now() + std::time::Duration::from_secs(600);
+        let ids = |hits: Vec<Hit>| hits.into_iter().map(|h| h.id).collect::<Vec<_>>();
+        assert_eq!(
+            ids(crate::search::vector_search_until(
+                &engine,
+                &shadow,
+                &query,
+                &options,
+                None,
+                Some(later)
+            )
+            .unwrap()),
+            ids(crate::search::vector_search(&engine, &shadow, &query, &options, None).unwrap())
+        );
+    }
+
     #[test]
     fn the_keyed_join_stops_at_its_deadline() {
         const COUNT: usize = 2_000;

@@ -441,6 +441,22 @@ impl TelemetryGuard {
             "Estimated bytes of HNSW graphs held in memory across vector collections.",
             vector_index_cache_bytes
         );
+        observe!(
+            u64_observable_gauge,
+            "kimmy.vector.graphs.stale",
+            "{graph}",
+            "HNSW graphs served while they are rebuilt, from a snapshot behind the store or \
+             not yet judged.",
+            vector_graphs_stale
+        );
+        observe!(
+            u64_observable_gauge,
+            "kimmy.vector.graph.unreached_sample",
+            "{vector}",
+            "The highest sampled score of unreached vectors among the HNSW graphs this process \
+             built.",
+            vector_graph_unreached_sample
+        );
         // The process as the kernel sees it (ADR-147): the figure a container
         // limit is enforced against, which neither byte gauge above is. Zero
         // on a platform without /proc, as on `/metrics`.

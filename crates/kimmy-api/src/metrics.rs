@@ -90,6 +90,12 @@ pub struct StorageReadings {
     /// database was opened (`Engine::cache_reading`).
     pub storage_cache: kimmy_storage::CacheReading,
     pub vector_index_cache_bytes: u64,
+    /// Resident HNSW graphs served while their rebuild, or the judging of the
+    /// snapshot they came from, is due (`IndexCache::stale_graphs`, ADR-245).
+    pub vector_graphs_stale: u64,
+    /// The highest sampled unreached score among the graphs this process
+    /// built (`IndexCache::unreached_sample`, ADR-241).
+    pub vector_graph_unreached_sample: u64,
     /// This process's resident memory and its high-water mark, as the
     /// kernel reports them ([`ProcessMemory`], ADR-147). The figure a
     /// container memory limit is enforced against, which neither of the two
@@ -350,6 +356,10 @@ pub struct MetricsSnapshot {
     /// The storage engine's page cache, as [`StorageReadings::storage_cache`].
     pub storage_cache: kimmy_storage::CacheReading,
     pub vector_index_cache_bytes: u64,
+    /// As [`StorageReadings::vector_graphs_stale`].
+    pub vector_graphs_stale: u64,
+    /// As [`StorageReadings::vector_graph_unreached_sample`].
+    pub vector_graph_unreached_sample: u64,
     /// Resident memory and its high-water mark, from the same reading
     /// (ADR-147).
     pub process_resident_bytes: u64,
@@ -1413,6 +1423,8 @@ impl Metrics {
             store_repairs: readings.store_repairs,
             storage_cache: readings.storage_cache,
             vector_index_cache_bytes: readings.vector_index_cache_bytes,
+            vector_graphs_stale: readings.vector_graphs_stale,
+            vector_graph_unreached_sample: readings.vector_graph_unreached_sample,
             process_resident_bytes: readings.process_resident_bytes,
             process_resident_peak_bytes: readings.process_resident_peak_bytes,
             write_lock_wait_timeouts: readings.writer_wait_timeouts,
@@ -1752,6 +1764,12 @@ impl Metrics {
              # HELP kimmy_vector_index_cache_bytes Estimated bytes of HNSW graphs held in memory across vector collections. Bounded by vector.index_cache.max_bytes; a graph larger than the whole budget is held anyway.\n\
              # TYPE kimmy_vector_index_cache_bytes gauge\n\
              kimmy_vector_index_cache_bytes {index_cache}\n\
+             # HELP kimmy_vector_graphs_stale HNSW graphs served while they are rebuilt: adopted from a snapshot that was behind the store, or from one a previous process saved and a builder has not yet judged. Every vector collection a member serves at the first start of 0.52.0, falling as the rebuilds land.\n\
+             # TYPE kimmy_vector_graphs_stale gauge\n\
+             kimmy_vector_graphs_stale {graphs_stale}\n\
+             # HELP kimmy_vector_graph_unreached_sample The highest score among the HNSW graphs this process built and holds: of the 128 stored vectors each build asks to find themselves, how many did not at the build check's search effort. 8 or more is logged as a warning; every vector is linked, so it is a collection that is hard to search, not one that lost data.\n\
+             # TYPE kimmy_vector_graph_unreached_sample gauge\n\
+             kimmy_vector_graph_unreached_sample {unreached_sample}\n\
              # HELP kimmy_process_resident_bytes Resident memory of this process as the kernel reports it (VmRSS in /proc/self/status) - the figure a container memory limit is enforced against. Holds storage.cache_bytes, the HNSW graphs, and whatever heap the allocator keeps for reuse after a burst, which is why it does not follow the two byte gauges above down. 0 where /proc is not available.\n\
              # TYPE kimmy_process_resident_bytes gauge\n\
              kimmy_process_resident_bytes {resident}\n\
@@ -2022,6 +2040,8 @@ impl Metrics {
             oplog_verified_secs = readings.oplog_verified.elapsed_ms as f64 / 1e3,
             storage_cache = storage_cache,
             index_cache = readings.vector_index_cache_bytes,
+            graphs_stale = readings.vector_graphs_stale,
+            unreached_sample = readings.vector_graph_unreached_sample,
             resident = readings.process_resident_bytes,
             resident_peak = readings.process_resident_peak_bytes,
             p_requests = kimmy_vector::provider_totals().0,
@@ -3093,6 +3113,8 @@ mod tests {
                 read_misses: 9_104,
             },
             vector_index_cache_bytes: 48,
+            vector_graphs_stale: 1_501,
+            vector_graph_unreached_sample: 1_502,
             process_resident_bytes: 49,
             process_resident_peak_bytes: 50,
             index_unkeyed: 26,
@@ -3566,6 +3588,12 @@ kimmy_oplog_verified_walk_seconds 1.304
 # HELP kimmy_vector_index_cache_bytes Estimated bytes of HNSW graphs held in memory across vector collections. Bounded by vector.index_cache.max_bytes; a graph larger than the whole budget is held anyway.
 # TYPE kimmy_vector_index_cache_bytes gauge
 kimmy_vector_index_cache_bytes 48
+# HELP kimmy_vector_graphs_stale HNSW graphs served while they are rebuilt: adopted from a snapshot that was behind the store, or from one a previous process saved and a builder has not yet judged. Every vector collection a member serves at the first start of 0.52.0, falling as the rebuilds land.
+# TYPE kimmy_vector_graphs_stale gauge
+kimmy_vector_graphs_stale 1501
+# HELP kimmy_vector_graph_unreached_sample The highest score among the HNSW graphs this process built and holds: of the 128 stored vectors each build asks to find themselves, how many did not at the build check's search effort. 8 or more is logged as a warning; every vector is linked, so it is a collection that is hard to search, not one that lost data.
+# TYPE kimmy_vector_graph_unreached_sample gauge
+kimmy_vector_graph_unreached_sample 1502
 # HELP kimmy_process_resident_bytes Resident memory of this process as the kernel reports it (VmRSS in /proc/self/status) - the figure a container memory limit is enforced against. Holds storage.cache_bytes, the HNSW graphs, and whatever heap the allocator keeps for reuse after a burst, which is why it does not follow the two byte gauges above down. 0 where /proc is not available.
 # TYPE kimmy_process_resident_bytes gauge
 kimmy_process_resident_bytes 49
@@ -4303,6 +4331,11 @@ kimmy_storage_cache_reads_total{result=\"miss\"} 9104
             assert!(!out.contains("kimmy_storage_cache"), "absent without the feature: {out}");
         }
         expect(&format!("kimmy_vector_index_cache_bytes {}\n", s.vector_index_cache_bytes));
+        expect(&format!("kimmy_vector_graphs_stale {}\n", s.vector_graphs_stale));
+        expect(&format!(
+            "kimmy_vector_graph_unreached_sample {}\n",
+            s.vector_graph_unreached_sample
+        ));
         expect(&format!("kimmy_process_resident_bytes {}\n", s.process_resident_bytes));
         expect(&format!("kimmy_process_resident_peak_bytes {}\n", s.process_resident_peak_bytes));
         expect(&format!("kimmy_uptime_seconds {}\n", s.uptime_secs));
@@ -4905,7 +4938,10 @@ kimmy_storage_cache_reads_total{result=\"miss\"} 9104
                 // And the definition repair's: outcomes, judgements and index results.
                 + kimmy_cluster::DigestRepairOutcome::DEFINITION.len()
                 + kimmy_cluster::DefinitionJudgement::ALL.len()
-                + kimmy_storage::DEFINITION_RESULTS.len(),
+                + kimmy_storage::DEFINITION_RESULTS.len()
+                // The HNSW graphs served while rebuilt, and the highest
+                // sampled unreached score among those built here (ADR-245).
+                + 2,
             "expected one sample per series: {out}"
         );
     }

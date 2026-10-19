@@ -2631,8 +2631,20 @@ async fn a_stop_with_every_duty_running_closes_every_members_store() {
             .await
             .unwrap();
         assert!(search.status().is_success(), "{}: {:?}", node.name, search.text().await);
-        let graph = node.gauge(&client, "kimmy_vector_index_cache_bytes").await;
-        assert!(graph.is_some_and(|bytes| bytes > 0), "{}: no graph built: {graph:?}", node.name);
+        // The search queues the build, which a builder thread runs (ADR-245):
+        // the gauge is polled, and must hold a graph for three reads running.
+        let deadline = std::time::Instant::now() + Duration::from_secs(60);
+        let mut held = 0;
+        while held < 3 {
+            let graph = node.gauge(&client, "kimmy_vector_index_cache_bytes").await;
+            held = if graph.is_some_and(|bytes| bytes > 0) { held + 1 } else { 0 };
+            assert!(
+                std::time::Instant::now() < deadline,
+                "{}: no graph built: {graph:?}",
+                node.name
+            );
+            tokio::time::sleep(POLL).await;
+        }
         feeds.push(open_feed(node, &bearer, None).await);
     }
     let backup = client.get(a.url("/v1/admin/backup")).bearer_auth(&token).send().await.unwrap();

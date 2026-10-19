@@ -564,6 +564,8 @@ fn nothing_the_endpoint_exposes_depends_on_the_engine_readings() {
             read_misses: 25,
         },
         vector_index_cache_bytes: 8,
+        vector_graphs_stale: 0,
+        vector_graph_unreached_sample: 0,
         process_resident_bytes: 9,
         process_resident_peak_bytes: 10,
         index_unkeyed: 11,

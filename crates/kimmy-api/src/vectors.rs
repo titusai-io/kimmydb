@@ -1046,6 +1046,16 @@ fn knn_joined(
         Access::Exact => kimmy_storage::blocking(|| {
             search::vector_search(&state.engine, shadow, query, options, set)
         }),
+        // No graph yet, and one is being built (ADR-245): every stored vector
+        // scored, as above, but in a turn of the collection's few at once and
+        // under the request's deadline, which the scan reads itself because
+        // the request's timeout cannot end a thread that does not yield.
+        Access::Building => kimmy_storage::blocking(|| {
+            let Some(_turn) = state.vectors.exact_scan_permit(shadow.id, deadline) else {
+                return Err(kimmy_vector::VectorError::DeadlineExceeded);
+            };
+            search::vector_search_until(&state.engine, shadow, query, options, set, deadline)
+        }),
     }
     .map_err(vector_error)
 }
