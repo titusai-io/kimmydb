@@ -225,7 +225,7 @@ indexes decide them by exact value), where a 0.50 member's do not.
 the roll a declaration.** A keyed write's record travels with the coverage a window
 grants, as an optional `records` field on entries, replays, pushes and snapshot pages (a
 list that may carry records riding no entry the frame ships), with an optional records
-position and `records_base` in the snapshot cursor, a `replay` flag and a `replay_records`
+position and `records_base` in the snapshot cursor, `records_epoch` on snapshot pages, a `replay` flag and a `replay_records`
 cursor on the ask for entries (and that cursor on its answer), and `idempotency_records` in
 the facts block; a 0.51 member ignores all of them and sends none. That is safe to roll and not safe to
 take keys across. A 0.51 member ignores the header (it applies the write, with a random
