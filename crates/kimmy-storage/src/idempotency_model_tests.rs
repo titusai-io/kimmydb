@@ -600,6 +600,8 @@ struct Member {
     /// After a whole-database snapshot, until it holds what its peers hold: no keyed
     /// request is sent to it.
     catching_up: bool,
+    /// After a restore or a rewind, until it holds what its peers hold.
+    restored_behind: bool,
 }
 
 /// A member's backup: the identity it was taken under, its bytes, and the contested
@@ -1155,7 +1157,13 @@ impl World {
                 let path = dir.path().join("kimmy.redb");
                 std::fs::copy(template, &path).unwrap();
                 let engine = Engine::open(&path).unwrap();
-                Member { _dir: dir, path, engine: Some(Arc::new(engine)), catching_up: false }
+                Member {
+                    _dir: dir,
+                    path,
+                    engine: Some(Arc::new(engine)),
+                    catching_up: false,
+                    restored_behind: false,
+                }
             })
             .collect();
         let sched_frame = sched.bias.frame;
@@ -1665,6 +1673,15 @@ impl World {
         self.maybe_caught_up(to)
     }
 
+    /// The keyed write the ghost knows by `entry`'s stamp, when the entry is that write's:
+    /// of its collection and document. A stamp a member re-mints after a restore lost the
+    /// write that held it everywhere (its own-origin replay found no peer holding it) is
+    /// another write's, and no keyed request's.
+    fn ghost_entry(&self, entry: &kimmy_core::OplogEntry) -> Option<(u8, u8, DocId)> {
+        let (r, c, id) = self.ghost.entries.get(&entry.stamp).cloned()?;
+        (entry.collection == coll_id(c) && entry.doc_id.as_ref() == Some(&id)).then_some((r, c, id))
+    }
+
     /// The entries of a window `dst` took by history: those its coverage passed, of a
     /// collection it holds (one it does not hold takes them as nothing, and holds no
     /// effect of them).
@@ -1686,7 +1703,7 @@ impl World {
         let held: Vec<bool> =
             NAMES.iter().map(|name| dst.get_collection(DB, name).is_ok()).collect();
         for entry in entries {
-            let Some((r, c, _)) = self.ghost.entries.get(&entry.stamp).cloned() else { continue };
+            let Some((r, c, _)) = self.ghost_entry(entry) else { continue };
             if !held[c as usize] || entry.stamp.hlc > after.get(entry.stamp.node) {
                 continue;
             }
@@ -1703,7 +1720,7 @@ impl World {
     }
 
     fn maybe_caught_up(&mut self, m: usize) -> Res<()> {
-        if !self.members[m].catching_up {
+        if !self.members[m].catching_up && !self.members[m].restored_behind {
             return Ok(());
         }
         let mine = self.e(m).witnessed_vector().map_err(|e| err("witnessed_vector", e))?;
@@ -1716,8 +1733,11 @@ impl World {
                 return Ok(());
             }
         }
+        if self.members[m].catching_up {
+            self.note(format!("{} caught up", LETTERS[m]));
+        }
         self.members[m].catching_up = false;
-        self.note(format!("{} caught up", LETTERS[m]));
+        self.members[m].restored_behind = false;
         Ok(())
     }
 
@@ -2690,6 +2710,9 @@ impl World {
     /// store; its own writes past where its store now leaves off, which a peer holds only
     /// as page state, never come back (R1).
     fn after_losing_history(&mut self, m: usize) -> Res<()> {
+        // Until its coverage of every other origin has caught up again, it may hold an
+        // effect ahead of its record (see `check_effects`).
+        self.members[m].restored_behind = true;
         let e = self.e(m);
         let node = e.node_id();
         let at = e.own_position_at_open();
@@ -3123,6 +3146,26 @@ impl World {
                 return Ok(());
             };
             self.check_carried(peer, &cut.records)?;
+            if trace() {
+                let s = format!(
+                    "{}'s replay page from {} at {}: entries [{}] records [{}]{}",
+                    LETTERS[m],
+                    LETTERS[peer],
+                    self.hlc(from),
+                    cut.entries.iter().map(|e| self.stamp(e.stamp)).collect::<Vec<_>>().join(" "),
+                    cut.records
+                        .iter()
+                        .map(|c| format!(
+                            "key {} at {:?}",
+                            c.scope.0[0],
+                            c.carrying.map(|s| self.stamp(s))
+                        ))
+                        .collect::<Vec<_>>()
+                        .join("; "),
+                    if cut.replay_records.is_some() { " (records alone)" } else { "" }
+                );
+                self.note(s);
+            }
             let own: Vec<kimmy_core::OplogEntry> = cut
                 .entries
                 .iter()
@@ -3167,7 +3210,7 @@ impl World {
                 // Taken by history, so I2 holds them to their records; one the peer held
                 // the record of and did not send is the relay class at its source.
                 for entry in &lost {
-                    let Some((r, c, _)) = self.ghost.entries.get(&entry.stamp).cloned() else {
+                    let Some((r, c, _)) = self.ghost_entry(entry) else {
                         continue;
                     };
                     self.ghost.mark_processed(me, entry.stamp);
@@ -3557,6 +3600,15 @@ impl World {
     fn check_effects(&mut self) -> Res<()> {
         let mut bare = Vec::new();
         for m in 0..self.n() {
+            // A restored or rewound member, until its coverage of every other origin has
+            // caught up, can hold an effect ahead of its record: a version its own-origin
+            // replay reads back embeds another origin's write whose entry, and record, its
+            // coverage has not reached; its pulls bring the record with the entry. (The
+            // transport marks it restored until then, and the catching-up gate takes no
+            // keyed request.)
+            if self.members[m].restored_behind {
+                continue;
+            }
             let node = self.e(m).node_id();
             for ((c, shown), (stamp, doc)) in self.documents(m)? {
                 for k in ks_of(&doc) {
