@@ -173,7 +173,7 @@ struct SnapshotMeta {
 /// rebuild per vector collection per member, on its first search after the
 /// upgrade. A 0.50 build refuses a format-3 snapshot in turn, and rebuilds.
 ///
-/// 4 is a graph `hnsw_rs` 0.3.5 built (ADR-241). The dump's layout did not
+/// 4 is a graph `hnsw_rs` 0.3.5 built (ADR-242). The dump's layout did not
 /// change, so 0.3.5 would read a format-3 snapshot; what changed is the graph
 /// in it. 0.3.4 stored each reverse edge at the new point's top layer instead
 /// of the layer it was found on, which left 0.5% to 3.8% of every collection
@@ -221,7 +221,7 @@ pub(crate) struct SnapshotIdentity {
 /// disk must cost a rebuild, never the node. Found by the corrupt-snapshot
 /// test, the same way `DistDot`'s assert was found: by testing the failure
 /// path rather than trusting the library's. **`catch_unwind` is not enough on
-/// its own** (ADR-241): the loader also ends the process (`exit(1)`) and
+/// its own** (ADR-242): the loader also ends the process (`exit(1)`) and
 /// aborts it (an allocation of a declared size), which no unwind sees, and so
 /// the files are checked first, by `check`. The catch stays for whatever that
 /// check does not foresee. `AssertUnwindSafe` is sound here: the closure
@@ -292,7 +292,7 @@ fn sync(path: &std::path::Path) -> std::io::Result<()> {
     std::fs::File::open(path)?.sync_all()
 }
 
-/// Put `items` in the order build `attempt` inserts them (ADR-241).
+/// Put `items` in the order build `attempt` inserts them (ADR-242).
 ///
 /// **The order is the draw.** `hnsw_rs` 0.3.5 gives each point the next level
 /// of one generator that every graph seeds with the constant 397, and has no
@@ -660,7 +660,7 @@ impl HnswIndex {
     /// leaves the previous snapshot (or none), never a torn one — and the
     /// loader refuses anything unreadable anyway ([`crate::dump::check`]).
     ///
-    /// **On disk means synced** (ADR-241). The files, then the staging
+    /// **On disk means synced** (ADR-242). The files, then the staging
     /// directory, are fsynced before the rename, and the parent after it.
     /// Without that a rename can reach the disk before the data it names: a
     /// crash then leaves the new name over files cut short, which `hnsw_rs`
@@ -751,7 +751,7 @@ impl HnswIndex {
         }
 
         // Before the library sees a byte of the dump: it ends the process on
-        // some of what a corrupt or foreign file holds (ADR-241).
+        // some of what a corrupt or foreign file holds (ADR-242).
         let distance = match metric {
             Metric::Cosine => std::any::type_name::<DistCosine>(),
             Metric::Euclidean => std::any::type_name::<DistL2>(),
@@ -1058,6 +1058,13 @@ mod tests {
     /// when the descent ends on it, and a point outside the entry point's
     /// component only from a descent that ends inside its own.
     fn cut_off(index: &HnswIndex) -> (usize, usize) {
+        let (no_edge_in, outside) = cut_off_points(index);
+        (no_edge_in.iter().filter(|c| **c).count(), outside.iter().filter(|c| **c).count())
+    }
+
+    /// [`cut_off`] point by point: whether each graph id has no layer-0 edge
+    /// into it, and whether it is outside the entry point's component.
+    fn cut_off_points(index: &HnswIndex) -> (Vec<bool>, Vec<bool>) {
         let n = index.keys.len();
         let mut level = vec![0u8; n];
         let mut edges: Vec<Vec<usize>> = vec![Vec::new(); n];
@@ -1078,12 +1085,14 @@ mod tests {
                 }
             }
         }
-        let no_edge_in = into.iter().filter(|&&c| c == 0).count();
+        let no_edge_in: Vec<bool> = into.iter().map(|&c| c == 0).collect();
         // The entry point is the first point inserted at the top level: the
         // graph replaces it only on a strictly higher one, and ids are
         // insertion order.
         let top = level.iter().copied().max().unwrap_or(0);
-        let Some(entry) = (0..n).find(|&i| level[i] == top) else { return (0, 0) };
+        let Some(entry) = (0..n).find(|&i| level[i] == top) else {
+            return (vec![false; n], vec![false; n]);
+        };
         let mut seen = vec![false; n];
         seen[entry] = true;
         let mut stack = vec![entry];
@@ -1094,7 +1103,7 @@ mod tests {
                 }
             }
         }
-        (no_edge_in, seen.iter().filter(|s| !**s).count())
+        (no_edge_in, seen.iter().map(|s| !*s).collect())
     }
 
     /// How many of the graph's points do not come back for their own vector
@@ -1143,7 +1152,7 @@ mod tests {
     /// rebuilt twice, and then reported as losing data. Hence 384 dimensions.
     ///
     /// **And it is the realistic-width half of the regression test for
-    /// `hnsw_rs` 0.3.4** (ADR-241). Measured with every point checked, at this
+    /// `hnsw_rs` 0.3.4** (ADR-242). Measured with every point checked, at this
     /// size and width:
     ///
     /// | library | draws | truly orphaned | sampled score |
@@ -1203,7 +1212,7 @@ mod tests {
     }
 
     /// Every vector can be found, in every build: the regression test for
-    /// `hnsw_rs` 0.3.4 in the default suite (ADR-241).
+    /// `hnsw_rs` 0.3.4 in the default suite (ADR-242).
     ///
     /// 0.3.4 wrote a reverse edge at the new point's top layer rather than
     /// the layer the edge was found on, so a point drawn above layer 0 could
@@ -1310,6 +1319,14 @@ mod tests {
                     // point found there, or linked, is hard to find rather
                     // than lost.
                     let (no_edge_in, cut) = cut_off(&index);
+                    // Lost although layer 0 links it in: what a repair of the
+                    // structure, or an exact look at the cut-off points,
+                    // would still leave.
+                    let (none_in, outside) = cut_off_points(&index);
+                    let linked_lost = (0..index.keys.len())
+                        .filter(|&i| !none_in[i] && !outside[i])
+                        .filter(|&i| !index.finds_itself(&vectors[&index.keys[i]], i))
+                        .count();
                     let wider = (0..index.keys.len())
                         .filter(|&i| {
                             !index.finds_itself(&vectors[&index.keys[i]], i)
@@ -1317,7 +1334,7 @@ mod tests {
                         })
                         .count();
                     println!(
-                        "row,{dim},{count},{fixture},{attempt},{lost},{},{},{},{},{cut},{wider},{no_edge_in}",
+                        "row,{dim},{count},{fixture},{attempt},{lost},{},{},{},{},{cut},{wider},{no_edge_in},{linked_lost}",
                         reach.sampled,
                         reach.missed,
                         reach.unreachable,
@@ -1695,7 +1712,7 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // Build attempts (ADR-241)
+    // Build attempts (ADR-242)
     // -----------------------------------------------------------------------
 
     /// What a graph is, named by keys rather than by the ids an insertion

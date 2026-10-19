@@ -1,5 +1,5 @@
 //! What `hnsw_rs`'s reader would do with a snapshot's two files, decided
-//! before it is asked to (ADR-241).
+//! before it is asked to (ADR-242).
 //!
 //! `HnswIo::load_hnsw` trusts its files. A file it cannot read is not always
 //! an error it returns: in 0.3.5 a description in dump format 2, and **any**
@@ -190,10 +190,7 @@ pub(crate) fn check(dir: &Path, expect: &Expect<'_>) -> Result<(), String> {
             }
             data.exact(&mut vector, "a vector")?;
             // A search computes distances from these, by the same `Ord`.
-            if vector
-                .chunks_exact(size_of::<f32>())
-                .any(|b| !f32::from_ne_bytes(b.try_into().expect("four bytes")).is_finite())
-            {
+            if vector.as_chunks::<4>().0.iter().any(|b| !f32::from_ne_bytes(*b).is_finite()) {
                 return Err(format!("point {origin}'s vector is not finite"));
             }
             loaded += 1;
