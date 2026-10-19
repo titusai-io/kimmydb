@@ -269,9 +269,10 @@ a lookup once `last` is older than `storage.oplog_retention_secs`, and a record
 a peer sends that is already past that window is not stored. **A record
 outlives a drop of its collection for its window**: a drop, a database drop, the
 drop purger and a late drop's sweep remove no record, and a record of a dropped
-life is stored and served as any other, so a retry after the name is dropped,
-created again or not, replays its first answer and writes nothing to the new
-life. Retention is the only remover. A keyed delete by id is replayed while its
+life is stored and served as any other, so a retry after the name is dropped
+and created again replays its first answer and writes nothing to the new life;
+until the name is created again, the route answers `404` as for any missing
+collection. Retention is the only remover. A keyed delete by id is replayed while its
 own tombstone, or a later version over it, stands, or while the row is gone
 with a drop at or above the delete's stamp, which took the tombstone with the
 life. The

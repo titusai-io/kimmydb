@@ -543,12 +543,23 @@ async fn three_nodes_configured(
     storage: &str,
     cluster_extra: &str,
 ) -> (Node, Node, Node) {
+    three_nodes_configured_at(client, storage, cluster_extra, 1).await
+}
+
+/// [`three_nodes_configured`], every member at `sync_interval_secs`.
+async fn three_nodes_configured_at(
+    client: &reqwest::Client,
+    storage: &str,
+    cluster_extra: &str,
+    sync_interval_secs: u64,
+) -> (Node, Node, Node) {
     const ATTEMPTS: usize = 5;
     for _ in 0..ATTEMPTS {
         let (pa, pb, pc) = (ports::choose(), ports::choose(), ports::choose());
-        let a = Node::spawn_configured("node-a", pa, &[pb], storage, 1, cluster_extra);
-        let b = Node::spawn_configured("node-b", pb, &[pa], storage, 1, cluster_extra);
-        let c = Node::spawn_configured("node-c", pc, &[pa], storage, 1, cluster_extra);
+        let interval = sync_interval_secs;
+        let a = Node::spawn_configured("node-a", pa, &[pb], storage, interval, cluster_extra);
+        let b = Node::spawn_configured("node-b", pb, &[pa], storage, interval, cluster_extra);
+        let c = Node::spawn_configured("node-c", pc, &[pa], storage, interval, cluster_extra);
         let mut collided = false;
         for node in [&a, &b, &c] {
             match node.try_ready(client).await {
@@ -4565,6 +4576,11 @@ struct KeyedAnswer {
 
 /// `body` sent to `node` with `Idempotency-Key: "<key>"`. The same `body` and `key` make
 /// the same request, byte for byte, on any member.
+///
+/// Sent again, as a client must, while `node` answers `503 peer_unheard` (a live member not
+/// heard from yet, after a restart, a pause or a rejoin): the same request with the same
+/// key, until it is answered otherwise. A schedule that pauses or restarts members meets
+/// that window by design; a `400` is never sent again.
 async fn keyed_send(
     client: &reqwest::Client,
     node: &Node,
@@ -4574,16 +4590,32 @@ async fn keyed_send(
     body: &str,
     key: &str,
 ) -> KeyedAnswer {
-    let res = client
-        .request(method, node.url(path))
-        .bearer_auth(token)
-        .header("Idempotency-Key", format!("\"{key}\""))
-        .header("Content-Type", "application/json")
-        .body(body.to_string())
-        .send()
-        .await
-        .unwrap();
-    keyed_answer(res).await
+    let deadline = std::time::Instant::now() + patience();
+    loop {
+        let res = client
+            .request(method.clone(), node.url(path))
+            .bearer_auth(token)
+            .header("Idempotency-Key", format!("\"{key}\""))
+            .header("Content-Type", "application/json")
+            .body(body.to_string())
+            .send()
+            .await
+            .unwrap();
+        let waited = res.status() == 503;
+        let answer = keyed_answer(res).await;
+        if !(waited && answer.body["error"] == "peer_unheard") {
+            return answer;
+        }
+        assert_eq!(answer.body["retry"], "wait", "{}", answer.text);
+        assert!(
+            std::time::Instant::now() < deadline,
+            "{} answered peer_unheard for {:?}: {}",
+            node.name,
+            patience(),
+            answer.text
+        );
+        tokio::time::sleep(POLL).await;
+    }
 }
 
 async fn keyed_answer(res: reqwest::Response) -> KeyedAnswer {
@@ -4670,7 +4702,19 @@ async fn keyed_cluster(
     storage: &str,
     docs: serde_json::Value,
 ) -> (Node, Node, Node, [String; 3]) {
-    let (a, b, c) = three_nodes_configured(client, storage, KEYED).await;
+    keyed_cluster_at(client, storage, KEYED, 1, docs).await
+}
+
+/// [`keyed_cluster`], with `cluster` as every member's `[cluster]` lines (which must set
+/// `idempotency_keys = true`) and every member at `sync_interval_secs`.
+async fn keyed_cluster_at(
+    client: &reqwest::Client,
+    storage: &str,
+    cluster: &str,
+    sync_interval_secs: u64,
+    docs: serde_json::Value,
+) -> (Node, Node, Node, [String; 3]) {
+    let (a, b, c) = three_nodes_configured_at(client, storage, cluster, sync_interval_secs).await;
     eventually("gossip to form", || all_report(client, vec![&a, &b, &c], 2)).await;
     let tokens = [a.login(client).await, b.login(client).await, c.login(client).await];
     let created = client
@@ -5070,10 +5114,15 @@ async fn lab_hook_c9_a_live_member_that_does_not_carry_records_closes_the_gate()
     c.wait_ready(&client).await;
     eventually("gossip to re-form", || all_report(&client, vec![&a, &b, &c], 2)).await;
     t[2] = c.login(&client).await;
-    eventually("A and B to hear C's block without the field", || async {
+    // A peer restarted keeps its last block on its peers until they see it renamed or
+    // hear its new one, so the gate is first seen closed; no keyed write is sent before.
+    eventually("A and B to close their gates", || async {
         !takes_keys(&client, &a).await && !takes_keys(&client, &b).await
     })
     .await;
+    // Until A and B hold C's new block, C is live and not heard from: the transient
+    // `503 peer_unheard`, which `keyed_send` sends again through. Once they hold it, the
+    // block that says no is the `400`, which lasts.
     for (node, token) in [(&a, &t[0]), (&b, &t[1])] {
         let refused = keyed_send(
             &client,
@@ -5086,7 +5135,9 @@ async fn lab_hook_c9_a_live_member_that_does_not_carry_records_closes_the_gate()
         )
         .await;
         assert_eq!(refused.status, 400, "{}: {}", node.name, refused.text);
+        assert_eq!(refused.body["retry"], "no", "{}", refused.text);
         assert!(refused.text.contains(&c_id.to_string()), "names C: {}", refused.text);
+        assert!(!takes_keys(&client, node).await, "{}", node.name);
     }
     let base = [received(&client, &a).await, received(&client, &b).await];
     let relayed = keyed_send(
@@ -5145,6 +5196,144 @@ async fn lab_hook_c9_a_live_member_that_does_not_carry_records_closes_the_gate()
             n_of(&client, node, token, 1).await == Some(1)
         })
         .await;
+    }
+}
+
+/// One answer of a gated request in the window: its status, its `Retry-After`, and its body.
+struct GateAnswer {
+    status: u16,
+    retry_after: Option<String>,
+    replayed: bool,
+    text: String,
+    body: serde_json::Value,
+}
+
+/// `body` POSTed to `path` on `node`, with `Idempotency-Key: "<key>"` when `key` is given.
+async fn gate_send(
+    client: &reqwest::Client,
+    node: &Node,
+    token: &str,
+    path: &str,
+    body: &str,
+    key: Option<&str>,
+) -> GateAnswer {
+    let mut request = client
+        .post(node.url(path))
+        .bearer_auth(token)
+        .header("Content-Type", "application/json")
+        .body(body.to_string());
+    if let Some(key) = key {
+        request = request.header("Idempotency-Key", format!("\"{key}\""));
+    }
+    let res = request.send().await.unwrap();
+    let status = res.status().as_u16();
+    let header = |name: &str| res.headers().get(name).map(|v| v.to_str().unwrap().to_string());
+    let retry_after = header("retry-after");
+    let replayed = header("idempotency-replayed").is_some();
+    let text = res.text().await.unwrap();
+    let body = serde_json::from_str(&text).unwrap_or(serde_json::Value::Null);
+    GateAnswer { status, retry_after, replayed, text, body }
+}
+
+/// The gate window after an ordinary restart (B5's gate-window finding; Chris's ruling, the
+/// 503 split). B is restarted with SIGTERM, and from the moment its `/readyz` answers 200 it
+/// is sent a keyed insert and a `Decimal128`-`_id` insert, again and again, until each is
+/// taken. While B has not yet heard a live peer's facts block, each is answered `503
+/// peer_unheard`, `retry: wait`, with `Retry-After` of one sync interval (5 s here, so the
+/// window is wide), and **never `400`**: every member runs this build and says it carries
+/// records and can hold a decimal. The keyed request sent again with its key then gets its
+/// first application, once, and sent again after that its replay. Up to `RESTARTS` restarts,
+/// until the window has been met for both requests.
+#[tokio::test]
+#[ignore = "boots a real three-node cluster; run with --ignored"]
+async fn a_restarted_member_answers_503_until_it_has_heard_its_peers_and_never_400() {
+    const RESTARTS: usize = 10;
+    const SYNC_SECS: u64 = 5;
+    const PATH: &str = "/v1/db/shop/coll/orders/docs";
+    let client = reqwest::Client::new();
+    let cluster = format!("{KEYED}\ndecimal128 = true");
+    let (_a, mut b, _c, t) =
+        keyed_cluster_at(&client, "", &cluster, SYNC_SECS, serde_json::json!([])).await;
+
+    let (mut keyed_waited, mut decimal_waited) = (0, 0);
+    let mut rounds = 0;
+    for round in 0..RESTARTS {
+        rounds += 1;
+        b.restart_with(&[]);
+        eventually("B to be ready again", || async {
+            client.get(b.url("/readyz")).send().await.is_ok_and(|r| r.status() == 200)
+        })
+        .await;
+        let key = format!("gate-window-{round:02}-6f1c0e52-8a1d");
+        let body = format!(r#"{{"v":"gate-window-{round}"}}"#);
+        let decimal = format!(r#"{{"_id":{{"$numberDecimal":"{round}.5"}}}}"#);
+        let (mut first, mut decimal_done) = (None, false);
+        let deadline = std::time::Instant::now() + patience();
+        while first.is_none() || !decimal_done {
+            assert!(std::time::Instant::now() < deadline, "round {round}: B never took both");
+            let mut probes = vec![(true, body.as_str())];
+            if !decimal_done {
+                probes.push((false, decimal.as_str()));
+            }
+            for (keyed, sent) in probes {
+                if keyed && first.is_some() {
+                    continue;
+                }
+                let answer =
+                    gate_send(&client, &b, &t[1], PATH, sent, keyed.then_some(&*key)).await;
+                match answer.status {
+                    200 if keyed => {
+                        assert!(!answer.replayed, "round {round}: the first application");
+                        first = Some(answer.text);
+                    }
+                    200 => decimal_done = true,
+                    503 => {
+                        assert_eq!(answer.body["error"], "peer_unheard", "{}", answer.text);
+                        assert_eq!(answer.body["retry"], "wait", "{}", answer.text);
+                        assert_eq!(
+                            answer.retry_after.as_deref(),
+                            Some(SYNC_SECS.to_string().as_str()),
+                            "one sync interval: {}",
+                            answer.text
+                        );
+                        assert!(answer.text.contains("transient"), "{}", answer.text);
+                        if keyed {
+                            keyed_waited += 1;
+                        } else {
+                            decimal_waited += 1;
+                        }
+                    }
+                    other => panic!(
+                        "round {round}: a ready member answered {other}, never 400 nor anything \
+                         but 200 or 503 peer_unheard: {}",
+                        answer.text
+                    ),
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        let again = gate_send(&client, &b, &t[1], PATH, &body, Some(&key)).await;
+        assert_eq!(again.status, 200, "{}", again.text);
+        assert!(again.replayed, "round {round}: sent again, the replay: {}", again.text);
+        assert_eq!(Some(again.text), first, "round {round}: the first answer");
+        if keyed_waited > 0 && decimal_waited > 0 {
+            break;
+        }
+    }
+    eprintln!(
+        "gate window: {rounds} restart(s), {keyed_waited} keyed and {decimal_waited} decimal \
+         answers 503 peer_unheard"
+    );
+    assert!(
+        keyed_waited > 0 && decimal_waited > 0,
+        "no restart in {RESTARTS} met the window (keyed {keyed_waited}, decimal \
+         {decimal_waited}): the test proved nothing"
+    );
+    // Each keyed insert landed once, wherever it was answered from.
+    for round in 0..RESTARTS {
+        let filter = serde_json::json!({ "v": format!("gate-window-{round}") });
+        let held = orders_where(&client, &b, &t[1], filter).await;
+        assert!(matches!(held, Some(0 | 1)), "round {round}: {held:?}");
     }
 }
 

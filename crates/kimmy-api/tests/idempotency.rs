@@ -492,39 +492,128 @@ async fn with_the_switch_off_a_key_is_refused_naming_the_switch() {
     assert_eq!(plain.status, 200, "a write without the header is untouched");
 }
 
-/// The switch on, clustered: a live peer that has said nothing yet, or whose
-/// block lacks `idempotency_records` (an older release), closes the gate, and
-/// the refusal names it; once it says it carries records, keys are taken and the
-/// capability is listed.
-#[tokio::test]
-async fn an_older_or_unheard_live_peer_refuses_naming_it_until_it_carries_records() {
-    let node = node().await;
+/// A clustered member with the switch on, over `members`.
+fn clustered_gate(node: &Node) -> Members {
     let members = Members::default();
+    members.configure_lease(Duration::from_secs(2), 3);
     let gate = IdempotencyGate::new(true, true, true);
     gate.set_members(members.clone());
     node.state.set_idempotency_gate(gate.predicate());
+    members
+}
 
+/// The switch on, clustered, a live peer whose block lacks
+/// `idempotency_records` (an older release): every keyed route refuses `400
+/// bad_request`, `retry: no`, no `Retry-After`, naming the member, and the
+/// capability is not listed. A second live peer not heard from yet changes
+/// nothing: the block that says no decides, and only its member is named. Once
+/// it says it carries records and the other is heard, keys are taken.
+#[tokio::test]
+async fn an_older_live_peer_refuses_400_naming_it_whoever_else_is_unheard() {
+    let node = node().await;
+    let members = clustered_gate(&node);
     let insert =
         || node.send("POST", "/v1/db/shop/coll/orders/docs", Req::key(KEY).json(&json!({})));
     assert_eq!(insert().await.status, 200, "alone, the switch decides");
+    let documents = node.count().await;
 
-    let (addr, id) = peer(2);
-    members.insert_for_test(addr, id);
-    for (what, block) in [("not heard from", None), ("an older block", Some(carries(None)))] {
-        if let Some(block) = block {
-            members.record_peer_facts_for_test(id, block, Duration::ZERO);
+    let (older, older_id) = peer(2);
+    members.insert_for_test(older, older_id);
+    members.record_peer_facts_for_test(older_id, carries(None), Duration::ZERO);
+    let (unheard, unheard_id) = peer(3);
+    for (what, with_unheard) in [("an older block", false), ("and an unheard peer", true)] {
+        if with_unheard {
+            members.insert_for_test(unheard, unheard_id);
         }
-        let answer = insert().await;
-        assert_eq!(answer.status, 400, "{what}: {}", answer.text);
-        let message = answer.body["message"].as_str().unwrap();
-        assert!(message.contains(&id.to_string()), "{what}: names the member: {message}");
-        assert!(message.contains("Idempotency-Key"), "{what}: {message}");
+        let before = node.gated_count().await;
+        for (method, _, path, body) in keyed_routes() {
+            let mut req = Req::key(KEY);
+            if let Some(body) = &body {
+                req = req.json(body);
+            }
+            let answer = node.send(method, path, req).await;
+            assert_eq!(answer.status, 400, "{what}: {method} {path}: {}", answer.text);
+            assert_eq!(answer.body["error"], "bad_request", "{what}: {}", answer.text);
+            assert_eq!(answer.body["retry"], "no", "{what}: {}", answer.text);
+            assert!(answer.headers.get("retry-after").is_none(), "{what}: lasts a roll");
+            let message = answer.body["message"].as_str().unwrap();
+            assert!(message.contains(&older_id.to_string()), "{what}: names it: {message}");
+            assert!(!message.contains(&unheard_id.to_string()), "{what}: only it: {message}");
+            assert!(message.contains("Idempotency-Key"), "{what}: {message}");
+        }
+        assert_eq!(node.gated_count().await, before + 7, "{what}: each refusal counted");
         assert!(!node.capabilities().await.contains(&"idempotency-keys".to_string()), "{what}");
     }
+    assert_eq!(node.count().await, documents, "nothing was written by a refusal");
+
+    members.record_peer_facts_for_test(older_id, carries(Some(true)), Duration::ZERO);
+    members.record_peer_facts_for_test(unheard_id, carries(Some(true)), Duration::ZERO);
+    let answer = node
+        .send("POST", "/v1/db/shop/coll/orders/docs", Req::key(UNHEARD_KEY).json(&json!({})))
+        .await;
+    assert_eq!(answer.status, 200, "{}", answer.text);
+    assert!(node.capabilities().await.contains(&"idempotency-keys".to_string()));
+}
+
+/// A key of its own for [`a_live_peer_not_heard_from_is_answered_503_and_the_same_key_is_then_taken`].
+const UNHEARD_KEY: &str = "\"unheard-6f1c0e52-8a1d-4f53-9b3e-2c1d6a7e\"";
+
+/// The switch on, clustered, a live peer not heard from yet and no held block
+/// saying no (a peer that came up a moment ago, or whose block was dropped on a
+/// rename): every keyed route answers `503 peer_unheard`, `retry: wait`, with
+/// `Retry-After` of one sync interval, naming the member and saying to send the
+/// same key again; the refusal is counted as gated, writes nothing and the
+/// capability is not listed. Once the peer is heard, the same request with the
+/// same key is taken as a first answer, and sent again is its replay.
+#[tokio::test]
+async fn a_live_peer_not_heard_from_is_answered_503_and_the_same_key_is_then_taken() {
+    let node = node().await;
+    let members = clustered_gate(&node);
+    let (addr, id) = peer(2);
+    members.insert_for_test(addr, id);
+    let documents = node.count().await;
+
+    let before = node.gated_count().await;
+    for (method, _, path, body) in keyed_routes() {
+        let mut req = Req::key(UNHEARD_KEY);
+        if let Some(body) = &body {
+            req = req.json(body);
+        }
+        let answer = node.send(method, path, req).await;
+        assert_eq!(answer.status, 503, "{method} {path}: {}", answer.text);
+        assert_eq!(answer.body["error"], "peer_unheard", "{}", answer.text);
+        assert_eq!(answer.body["retry"], "wait", "{}", answer.text);
+        assert_eq!(
+            answer.headers.get("retry-after").map(|v| v.to_str().unwrap()),
+            Some("2"),
+            "{method} {path}: one sync interval"
+        );
+        let message = answer.body["message"].as_str().unwrap();
+        for said in [id.to_string().as_str(), "Idempotency-Key", "transient", "same key"] {
+            assert!(message.contains(said), "{method} {path}: says {said:?}: {message}");
+        }
+    }
+    assert_eq!(node.gated_count().await, before + 7, "each refusal counted as gated");
+    assert_eq!(node.count().await, documents, "nothing was written");
+    assert!(!node.capabilities().await.contains(&"idempotency-keys".to_string()));
+
+    // A rename drops a block that was held: the same answer again.
+    members.record_peer_facts_for_test(id, carries(Some(true)), Duration::ZERO);
+    members.forget_peer_for_test(id);
+    let insert = || {
+        node.send("POST", "/v1/db/shop/coll/orders/docs", Req::key(UNHEARD_KEY).json(&json!({})))
+    };
+    assert_eq!(insert().await.status, 503, "a dropped block is unheard again");
 
     members.record_peer_facts_for_test(id, carries(Some(true)), Duration::ZERO);
-    let answer = insert().await;
-    assert_eq!(answer.status, 200, "{}", answer.text);
+    let first = insert().await;
+    assert_eq!(first.status, 200, "{}", first.text);
+    assert!(first.headers.get("idempotency-replayed").is_none(), "the first application");
+    let again = insert().await;
+    assert_eq!(again.status, 200, "{}", again.text);
+    assert_eq!(again.headers.get("idempotency-replayed").unwrap(), "?1", "then its replay");
+    assert_eq!(again.text, first.text);
+    assert_eq!(node.count().await, documents + 1, "applied once");
     assert!(node.capabilities().await.contains(&"idempotency-keys".to_string()));
 }
 

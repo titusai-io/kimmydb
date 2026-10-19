@@ -254,8 +254,14 @@ fn a_retention_pass_during_a_pull_keeps_the_log_the_next_page_reads() {
     let (y, x) = (open(&dir, "y"), open(&dir, "x"));
     let target = SNAPSHOT_PAGE as i64 + 40;
     let cy = three_pages(&y, target);
+    // A sender whose change log has begun, so the next page is answered by the
+    // delta from the base page 1 cut: a log that has not begun gives the zero base,
+    // whose page is refused and restarts the records phase, which would carry the
+    // record whatever the log holds.
+    idempotency::begin_log_for_test(&y).unwrap();
     let mut progress = SnapshotProgress::of_collection(cy.id);
     take(&x, &y, &mut progress);
+    assert!(progress.after().unwrap().records_base.unwrap().epoch.is_some(), "premise: an epoch");
     let k = keyed(7);
     fresh(y.modify_where_keyed(&cy, &Candidates::Scan, &Inc, Some(1), &k).unwrap());
     y.collect_garbage(RetentionPolicy::new(DAY, DAY)).unwrap();

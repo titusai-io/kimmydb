@@ -65,10 +65,11 @@
 //!
 //! **A record outlives a drop of its collection** for its window. A drop, a
 //! database's drop and a late drop's sweep remove no record, and a record of a
-//! dropped life is stored and served as any other: a retry after a drop, the
-//! name created again or not, replays its first answer and writes nothing to
-//! the new life, and another request under the key is refused for the window.
-//! Retention is the only remover.
+//! dropped life is stored and served as any other: a retry after a drop and the
+//! name created again replays its first answer and writes nothing to the new
+//! life, and another request under the key is refused for the window (until
+//! the name is created again, the API answers `404` as for any missing
+//! collection). Retention is the only remover.
 //!
 //! **A keyed delete by id** is replayed while its own tombstone stands: the
 //! document's stored row carries a stamp at or above the delete's (the

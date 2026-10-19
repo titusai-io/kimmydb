@@ -50,6 +50,43 @@ const RECORDS_OVERFILL_UNREACHED: &str = "the idempotency records this node cann
      its oplog do not fit one frame; anti-entropy will carry the change once this node pulls \
      their entries";
 
+/// Why a push sent nothing when not even its first entry fits one frame: with
+/// the idempotency records that ride it when some do, and otherwise beside the
+/// records the sender cannot vouch for by its oplog, or by itself.
+fn first_entry_unfit_unreached(
+    from: impl std::fmt::Debug,
+    riding: bool,
+    unanchored: bool,
+) -> String {
+    if riding {
+        format!(
+            "the member's first entry at or after {from:?} does not fit one frame with the \
+             idempotency records that ride it; anti-entropy will carry them"
+        )
+    } else if unanchored {
+        format!(
+            "the member's first entry at or after {from:?} does not fit one frame beside the \
+             idempotency records this node cannot vouch for by its oplog"
+        )
+    } else {
+        format!("the member's first entry at or after {from:?} does not fit one frame by itself")
+    }
+}
+
+/// Whether any record rides a window's first entry, as `how_many_fit` counts
+/// them: past the first `unanchored`, a record whose row is at or before that
+/// entry. One whose row is past every entry counts at the window's end instead.
+fn riding_the_first_entry(
+    entries: &[OplogEntry],
+    records: &[kimmy_storage::CarriedRecord],
+    unanchored: usize,
+) -> bool {
+    let Some(first) = entries.first() else { return false };
+    records[unanchored.min(records.len())..]
+        .iter()
+        .any(|record| record.carrying.is_some_and(|at| at <= first.stamp))
+}
+
 /// What a confirmation became on one member.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Resolution {
@@ -709,9 +746,10 @@ impl Confirmer {
                 // partial window of records alone carries such records.
                 return PushResult::NothingSent {
                     their_node,
-                    unreached: Some(format!(
-                        "the member's first entry at or after {from:?} does not fit one frame \
-                         with the idempotency records that ride it; anti-entropy will carry them"
+                    unreached: Some(first_entry_unfit_unreached(
+                        from,
+                        riding_the_first_entry(&window.entries, &window.records, window.unanchored),
+                        window.unanchored > 0,
                     )),
                 };
             }
@@ -1082,6 +1120,47 @@ mod tests {
         let message = RECORDS_OVERFILL_UNREACHED;
         assert!(!message.contains("  "), "a run of spaces: {message:?}");
         assert!(message.ends_with("pulls their entries"), "{message:?}");
+    }
+
+    /// A push whose first entry does not fit one frame says why: the records
+    /// riding it only when some do, the records it cannot vouch for when those
+    /// are what it does not fit beside, and otherwise the entry by itself.
+    #[test]
+    fn a_first_entry_that_does_not_fit_says_whether_records_ride_it() {
+        let riding = first_entry_unfit_unreached(7, true, true);
+        assert!(riding.contains("with the idempotency records that ride it"), "{riding}");
+        let beside = first_entry_unfit_unreached(7, false, true);
+        assert!(beside.contains("beside the idempotency records this node cannot"), "{beside}");
+        assert!(!beside.contains("ride"), "{beside}");
+        let alone = first_entry_unfit_unreached(7, false, false);
+        assert!(alone.ends_with("does not fit one frame by itself"), "{alone}");
+        assert!(!alone.contains("record"), "{alone}");
+        for message in [riding, beside, alone] {
+            assert!(message.starts_with("the member's first entry at or after 7 "), "{message}");
+            assert!(!message.contains("  "), "a run of spaces: {message:?}");
+        }
+    }
+
+    /// A record rides the first entry when it is past the unvouched ones and
+    /// its row is at or before that entry; one carried by a later entry, one at
+    /// the window's end and an unvouched one do not.
+    #[test]
+    fn a_record_rides_the_first_entry_only_at_or_before_it() {
+        let record = |carrying: Option<Stamp>| kimmy_storage::CarriedRecord {
+            collection: CollectionId(1),
+            scope: kimmy_core::ScopeHash([7; 32]),
+            carrying,
+            record: Vec::new(),
+        };
+        let entries = [entry(stamp(10, 1), OpKind::Insert), entry(stamp(20, 1), OpKind::Insert)];
+        let at = |hlc| record(Some(stamp(hlc, 1)));
+        assert!(riding_the_first_entry(&entries, &[at(10)], 0));
+        assert!(riding_the_first_entry(&entries, &[at(5)], 0));
+        assert!(!riding_the_first_entry(&entries, &[at(20)], 0), "a later entry carries it");
+        assert!(!riding_the_first_entry(&entries, &[record(None)], 0), "at the window's end");
+        assert!(!riding_the_first_entry(&entries, &[at(10)], 1), "an unvouched record");
+        assert!(riding_the_first_entry(&entries, &[at(30), at(10)], 1));
+        assert!(!riding_the_first_entry(&[], &[at(10)], 0), "no entry");
     }
 
     /// What a serving member's push hook saw: each window's schema changes

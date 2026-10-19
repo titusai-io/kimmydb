@@ -1177,8 +1177,8 @@ fn a_member_rebuilt_by_snapshot_after_a_drop_replays_the_old_key() {
 /// A converge page whose first page is of a life this member has not buried (the
 /// sender dropped the collection and made it again, and this member still holds
 /// the life before) applies none of its documents, and stores its records: they
-/// outlive the drop. Here the record is put on the page by hand, as P2's sender
-/// will.
+/// outlive the drop. Here the record is put on the page by hand, as a sender's
+/// records phase over its dropped collections puts it.
 #[test]
 fn a_converge_page_of_a_life_this_member_has_not_buried_keeps_its_records() {
     let (a, b, ca, cb) = pair();
@@ -1204,7 +1204,8 @@ fn a_converge_page_of_a_life_this_member_has_not_buried_keeps_its_records() {
 
 /// A converge page from a sender that dropped the collection applies none of its
 /// documents, and stores its records: they outlive the drop. Here the record is
-/// put on the page by hand, as P2's sender will.
+/// put on the page by hand, as a sender's records phase over its dropped
+/// collections puts it.
 #[test]
 fn a_converge_page_from_a_sender_that_dropped_keeps_its_records() {
     let (a, b, ca, cb) = pair();

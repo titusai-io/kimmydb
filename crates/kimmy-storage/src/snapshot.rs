@@ -1183,8 +1183,9 @@ impl Engine {
     /// life that has ended, which a receiver must never be handed.
     ///
     /// **The records delta** (B5, "Snapshots carry records"), first, in the same
-    /// transaction: when the cursor carries a `records_base`, every record of a
-    /// standing collection (of the scoped one, for a scoped snapshot) the change
+    /// transaction: when the cursor carries a `records_base`, every record (of
+    /// the scoped collection, for a scoped snapshot; of a dropped collection too,
+    /// since a key outlives a drop of its collection for its window) the change
     /// log names above it ([`crate::idempotency::records_changed_since`]), ahead
     /// of the page's records phase and documents. The cursor this page cuts
     /// carries the log's high water as this transaction sees it, the next page's
