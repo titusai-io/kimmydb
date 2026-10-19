@@ -2397,6 +2397,19 @@ oplog says was created after the target is removed and leaves no tombstone, so a
 write of it at or below the target that another member keeps comes back to the
 members that removed it.
 
+**When `storage.tombstone_retention_secs` exceeds
+`storage.oplog_retention_secs`, reset a member that was out of touch with a
+rewound member for longer than the oplog window**, rather than just bringing it
+back: stop it, wipe its data directory and let it catch up from its peers, as
+[a damaged store](#a-damaged-store) is reseeded. Such a member can hold a
+document from before a delete that only the rewound members applied and then
+replaced with a write after the target; the rewind removes that write and leaves
+no tombstone, so the member would write the deleted document back. It is the
+reset ADR-085 recommends for a member that trailed by more than the tombstone
+window, applied at the oplog window ([ADR-246](decisions.md)). With the two
+windows equal, the default, such a member trailed by more than the tombstone
+window as well.
+
 **A member rewound by 0.51 or earlier that has rejoined its cluster.** That
 rewind lowered the member's version vectors below writes retention had
 collected, its own among them, so a peer that had not taken one of those writes,

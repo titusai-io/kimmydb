@@ -28900,7 +28900,10 @@ minted, the record names what the rewind discarded, and a start resumes past it 
   forgotten,** and a member that missed it writes back the document it holds from before the delete; that member missed
   the delete for longer than the oplog window, which with `tombstone_retention_secs` equal to `oplog_retention_secs`
   (the default) is past the tombstone window the operations guide bounds a partition by, ADR-085's stale rejoiner.
-  Pinned by `residual_a_rewind_forgets_a_delete_only_the_rewound_member_applied`.
+  With `tombstone_retention_secs` above `oplog_retention_secs`, a member that lagged between the two windows is
+  within the tolerated partition, so the operations guide has the operator reset (wipe and resync) a member that was
+  out of touch with a rewound member for longer than the oplog window: ADR-085's remedy for a stale member, applied
+  at the oplog window. Pinned by `residual_a_rewind_forgets_a_delete_only_the_rewound_member_applied`.
 
 **A token naming a discarded entry stays `410`.** ADR-173 refused a token whose entry a rewind discarded while the
 member did not hold the entry, and a peer sending it back did not change that because the rewind's tombstone
