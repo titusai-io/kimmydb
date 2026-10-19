@@ -28824,10 +28824,18 @@ with it, and not be offered while any member could carry the write without it.
      older sender never sends; **so do `ReplayEntries`** (the cursor the page leaves), **`ReplayAck`** (the cursor
      the member replayed to holds after storing the page, echoed) **and `Vectors`** (with `replay_from`, the cursor
      it holds for that position), each skipped when none. A 0.51 member ignores them on either side: as a sender
-     it keeps no cursor, and as a receiver it holds no records. **`AskEntries` also gains `records_ahead_of`**, an
-     optional HLC read leniently and skipped when none: the entry whose records the requester stored ahead of it
-     in this contact. A 0.51 sender ignores it and never sends records ahead; a 0.51 requester given records ahead
-     refuses the answer as it refused the `fits: 0` it would have had, and holds no records to need them.
+     it keeps no cursor, and as a receiver it holds no records. **An `Entries` answer of records ahead** is a new
+     shape of an existing message, with no new field: no entries, not exhausted, no `passed_through`, a non-empty
+     `records`, and `scanned_to` at the HLC of the entry the records ride. **It grants nothing**: the requester
+     stores its records and changes no vector, coverage or held mark, and before this shape an answer with no
+     entries that was neither the tail nor a partial window could only be refused. **`AskEntries` gains
+     `records_ahead_of`**, an optional HLC read leniently and skipped when none: the entry whose records the
+     requester stored ahead of it in this contact. A contact that ends between the two (the sender stopped, the
+     connection dropped) only stored records early: the next contact is sent them ahead again, asks again, and
+     takes the entry, since nothing was covered. **Mixed versions:** a 0.51 sender ignores the field and never
+     sends records ahead. A 0.51 requester refuses the empty answer, and its round fails just as it would already
+     stall on that entry (`fits: 0`); and records exist only once every member runs 0.52 and the switch is set,
+     since keyed writes are taken only then.
    - **Snapshots carry records.** Per collection, a records phase in pages of up to 512 goes ahead of its documents; a
      page ends at the boundary into a collection with records and never holds one collection's records after another's
      documents; `SnapshotPage` gains `records` and `SnapshotCursor` a records position, which an older receiver drops,
