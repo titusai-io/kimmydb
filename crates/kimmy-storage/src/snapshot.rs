@@ -149,14 +149,17 @@ pub const SNAPSHOT_PAGE: usize = 512;
 
 /// The bytes one snapshot page holds: the cluster's frame (`MAX_FRAME`, 64 MiB,
 /// which asserts this) less 1 MiB, the room `write_frame` needs beyond what is
-/// counted here (the cursor, the tombstone horizon, the message's own framing).
+/// counted here (the tombstone horizon, the message's own framing).
 ///
 /// **What is counted against it.** The page's fixed parts, measured as they will
 /// be encoded: the definitions (the first page's), the drops, the sender's
 /// vector. Then its rows, in order, each with a bound on its framing: the
 /// records delta (`idempotency::records_changed_since`), the records phase
 /// (`idempotency::records_for_collection_page`) and the documents and
-/// tombstones. [`SNAPSHOT_PAGE`] still caps the documents and tombstones, and
+/// tombstones, a document's `_id` at the size it crosses in ([`id_wire_len`]).
+/// And the cursor the page cuts, at the size its key crosses in
+/// ([`cursor_reserve`]): the key of the row it would end at, reserved with each
+/// row. [`SNAPSHOT_PAGE`] still caps the documents and tombstones, and
 /// `idempotency::RECORD_PAGE` the phase's records, by count.
 ///
 /// **Progress.** A row that does not fit what the page has left goes first on
@@ -171,12 +174,58 @@ pub const SNAPSHOT_PAGE: usize = 512;
 /// frame, and its pull failed for good (v0.51.0).
 pub const SNAPSHOT_PAGE_BYTES: usize = 63 * 1024 * 1024;
 
-/// What a document on a page costs beyond its body and key: its collection,
-/// stamp and `_id` and their framing, a bound and not a measure.
+/// What a document on a page costs beyond its body and its `_id` as it
+/// crosses ([`id_wire_len`]): its collection and stamp, the `_id`'s variant, the
+/// field names and their framing, a bound and not a measure.
 pub(crate) const DOCUMENT_OVERHEAD: usize = 160;
 
-/// What a tombstone on a page costs beyond its key, likewise.
-pub(crate) const TOMBSTONE_OVERHEAD: usize = 96;
+/// What a tombstone on a page costs beyond its key (sent as bytes), likewise;
+/// 138 measured at the widest collection id and stamp.
+pub(crate) const TOMBSTONE_OVERHEAD: usize = 160;
+
+/// What the cursor a page cuts costs beyond its key as it crosses: its
+/// collection, a records position, a records base and their framing, a bound.
+pub(crate) const CURSOR_OVERHEAD: usize = 256;
+
+/// The bytes `n` bytes cross in when serde writes them as a sequence, which it
+/// does for a `Vec<u8>` without `serde_bytes`: a BSON array of `int32`s, each an
+/// element of a type byte, its decimal index as a C string and four bytes, about
+/// ten bytes a byte. So cross a `DocId::Binary` and a cursor's key
+/// ([`SnapshotCursor::after_key`]); the wire is left as it is.
+pub(crate) fn byte_array_wire_len(n: usize) -> usize {
+    // The array's length and its terminator, and each element's type byte, the
+    // index's terminator and the int32.
+    let mut total = 5 + 6 * n;
+    // And each index's digits: one each below 10, two below 100, and so on.
+    let (mut start, mut end, mut digits) = (0usize, 10usize, 1usize);
+    while start < n {
+        total += (end.min(n) - start) * digits;
+        start = end;
+        end = end.saturating_mul(10);
+        digits += 1;
+    }
+    total
+}
+
+/// What a document's `_id` costs on a page as it crosses, a bound: a binary one
+/// is an array of `int32`s ([`byte_array_wire_len`]), a string its bytes and
+/// their length and terminator, every other kind at most 32 bytes. The variant's
+/// name and framing are in [`DOCUMENT_OVERHEAD`].
+pub(crate) fn id_wire_len(id: &DocId) -> usize {
+    match id {
+        DocId::Binary(bytes) => byte_array_wire_len(bytes.len()),
+        DocId::String(text) => text.len() + 5,
+        _ => 32,
+    }
+}
+
+/// What the cursor a page cuts after a row whose stored key is `stored_key`
+/// bytes long costs it, a bound: its key crosses in the legacy form, which is at
+/// most one byte longer, or 12 bytes for an integer ([`kimmy_core::legacy_key`]),
+/// as an array of `int32`s.
+pub(crate) fn cursor_reserve(stored_key: usize) -> usize {
+    CURSOR_OVERHEAD + byte_array_wire_len(stored_key.max(11) + 1)
+}
 
 /// What applying a snapshot page does (ADR-148, ADR-152, and the repair of a
 /// confirmed digest finding).
@@ -1325,11 +1374,15 @@ impl Engine {
                 // Not by whether the collection stands: a key outlives a drop of
                 // its collection for its window. A scoped page's, its collection's.
                 let standing = |id: CollectionId| scope.is_none_or(|scope| scope == id);
+                // A records-only page carries the cursor it was asked with, and
+                // a page that sends no row of the cursor's collection ends at it:
+                // its key is reserved ahead of the delta.
+                let bytes = room.saturating_sub(cursor_reserve(cursor.after_key.len()));
                 let delta = crate::idempotency::records_changed_since(
                     &txn,
                     base.key,
                     &standing,
-                    crate::idempotency::DeltaBudget { bytes: room, ..self.record_delta_budget() },
+                    crate::idempotency::DeltaBudget { bytes, ..self.record_delta_budget() },
                 )?;
                 records = delta.records;
                 if let Some(stopped) = delta.stopped_at {
@@ -1494,7 +1547,8 @@ impl Engine {
                                     Some(value) => DocId::try_from_bson(value)?,
                                     None => continue,
                                 };
-                                let bytes = record.body.len() + doc_key.len() + DOCUMENT_OVERHEAD;
+                                let bytes =
+                                    record.body.len() + id_wire_len(&id) + DOCUMENT_OVERHEAD;
                                 let document = SnapshotDoc {
                                     collection: CollectionId(collection),
                                     id,
@@ -1503,7 +1557,11 @@ impl Engine {
                                 };
                                 (bytes, PageRow::Document(document))
                             };
-                            if used + bytes > room {
+                            // With the cursor the page cuts if it ends at this row,
+                            // whose key crosses as an array: one cursor a page, so
+                            // reserved with each row and not added up.
+                            let reserved = cursor_reserve(doc_key.len());
+                            if used + bytes + reserved > room {
                                 if records.is_empty()
                                     && out.is_empty()
                                     && deleted.is_empty()
@@ -1521,7 +1579,7 @@ impl Engine {
                                     };
                                     return Err(crate::StorageError::SnapshotRowTooLarge {
                                         what,
-                                        bytes,
+                                        bytes: bytes + reserved,
                                         room,
                                     });
                                 }
