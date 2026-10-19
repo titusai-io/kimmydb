@@ -2210,6 +2210,54 @@ mod tests {
         assert_eq!(KEYED_FALLBACKS.with(|n| n.get()) - fallbacks, 0, "the retry should answer it");
     }
 
+    /// A filter that tracks the vectors, admitting most of the collection but
+    /// none of the query's neighbourhood, finds no admitted candidate in its
+    /// first walk; the retry is widened by what that walk saw (none admitted,
+    /// so the whole cap), not by four times the first, which would stay
+    /// inside the excluded neighbourhood and leave the search to the keyed
+    /// join over every admitted document.
+    #[test]
+    fn a_retry_is_widened_by_what_the_first_walk_saw() {
+        const COUNT: usize = 5_000;
+        const DIM: usize = 8;
+        let (engine, shadow, _dir) = setup_bulk(COUNT, DIM, 0);
+        let index = HnswIndex::build(&engine, &shadow, Metric::Cosine, DIM).unwrap();
+        let options = SearchOptions { k: 10, metric: Metric::Cosine, per_document: 1 };
+        let query = pseudo_random(90_000, DIM);
+        // Every document but the 2,000 nearest the query: 60% admitted, so
+        // the first walk is the floor's 320, and four times it, 1,280, is
+        // still inside the excluded neighbourhood.
+        let nearest: HashSet<DocId> = crate::search::vector_search(
+            &engine,
+            &shadow,
+            &query,
+            &SearchOptions { k: 2_000, ..options },
+            None,
+        )
+        .unwrap()
+        .into_iter()
+        .map(|h| h.id)
+        .collect();
+        let allowed: HashSet<DocId> =
+            (0..COUNT as i64).map(DocId::Int64).filter(|id| !nearest.contains(id)).collect();
+        let walked = index.walk(&engine, &shadow, &query, &options, Some(&allowed), 1_280).unwrap();
+        assert_eq!(
+            walked.admitted, 0,
+            "the precondition: four times the floor finds none admitted"
+        );
+        let (retries, fallbacks) =
+            (FILTERED_RETRIES.with(|n| n.get()), KEYED_FALLBACKS.with(|n| n.get()));
+        let hits = index.search(&engine, &shadow, &query, &options, Some(&allowed)).unwrap();
+        assert_eq!(hits.len(), 10);
+        assert!(hits.iter().all(|h| allowed.contains(&h.id)));
+        assert_eq!(FILTERED_RETRIES.with(|n| n.get()) - retries, 1);
+        assert_eq!(
+            KEYED_FALLBACKS.with(|n| n.get()) - fallbacks,
+            0,
+            "the retry should have answered, not the keyed join"
+        );
+    }
+
     /// The keyed join a filtered search gives way to stops at the request's
     /// deadline with [`VectorError::DeadlineExceeded`]: its cost is the
     /// admitted set, and a filter that tracks the vectors reaches it at any
