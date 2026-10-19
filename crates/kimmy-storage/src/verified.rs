@@ -6,15 +6,16 @@
 //! where invariant I holds -- every entry at or below the vector for its
 //! origin, or held (`OPLOG_HELD`) -- that walk raises nothing, and on a cold
 //! page cache it cost about 30 s per GB of oplog read (round 0420, on the lab
-//! host). The record says a walk, or a rewind's reset, has left I holding;
+//! host). The record says a walk, or a rewind's lowering, has left I holding;
 //! every writer of every build that can open the store keeps it; so an open
 //! that finds the record skips the walk.
 //!
 //! The record is its own table, [`tables::VECTOR_VERIFIED`], and not a key in
 //! `META`, because a backup copies `META` and lists its tables by hand: no
 //! build's backup carries a table it does not list, so a restore -- which
-//! omits `OPLOG_HELD` and so can leave I broken -- never carries the record,
-//! whichever build restores it.
+//! does not carry `OPLOG_HELD`, and before ADR-244 left I broken, as an older
+//! build's restore still does -- never carries the record, whichever build
+//! restores it.
 
 use redb::{ReadTransaction, ReadableDatabase, WriteTransaction};
 
@@ -115,7 +116,7 @@ pub(crate) fn read_db(db: &redb::Database, schema: u8) -> Result<Option<Verified
 
 /// Record that the vector covers the oplog, as `walk` found it. Only ever
 /// called in the transaction that leaves invariant I holding: the open's
-/// walk, and a rewind's reset.
+/// walk, and a rewind's lowering of the vectors.
 pub(crate) fn write(txn: &WriteTransaction, schema: u8, walk: &VerifiedWalk) -> Result<()> {
     txn.open_table(tables::VECTOR_VERIFIED)?.insert(KEY, encode(schema, walk).as_slice())?;
     Ok(())
@@ -449,7 +450,7 @@ mod tests {
             (before, engine.oplog_entries().unwrap(), recorded)
         };
         assert!(after < before, "the rewind removed entries: {before} -> {after}");
-        assert_eq!(recorded.rows, after, "the reset rewrote the record with what it walked");
+        assert_eq!(recorded.rows, after, "the rewind rewrote the record with what it walked");
         let logged = logs_of(|| drop(Engine::open(&restored).unwrap()));
         assert!(logged.contains("skipped the oplog walk"), "{logged}");
         let skipped = Engine::open(&restored).unwrap().version_vector().unwrap();
@@ -811,6 +812,7 @@ mod tests {
                     }
                 }
                 Op::Restore => {
+                    let servable = self.engine().version_vector().unwrap();
                     let mut backup = Vec::new();
                     self.engine().backup_to(&mut backup, crate::WalkScope::Request).unwrap();
                     self.close();
@@ -820,6 +822,11 @@ mod tests {
                     self.dirs.push(dir);
                     assert_eq!(record_of(&self.path), None, "a restore carries no record");
                     self.open();
+                    // The restore re-derives the held marks, so its open raises
+                    // nothing: the member claims the backup's servable vector, for
+                    // both vectors, and not an entry it held as state (ADR-244).
+                    assert_eq!(self.engine().version_vector().unwrap(), servable);
+                    assert_eq!(self.engine().witnessed_vector().unwrap(), servable);
                 }
                 Op::StaleSchema => {
                     self.close();
@@ -951,7 +958,7 @@ mod tests {
         ("engine.rs", "release_held_in_position"),
         ("engine.rs", "release_held_under"),
         ("engine.rs", "rebuild_version_vector_if_stale"),
-        ("engine.rs", "reset_version_vector_to_oplog"),
+        ("engine.rs", "lower_vectors_in"),
         ("gc.rs", "remove_oplog_entries"),
         ("gc.rs", "trim_violation_rows"),
         ("rewind.rs", "rewind_to"),
