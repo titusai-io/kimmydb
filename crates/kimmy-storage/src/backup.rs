@@ -15,8 +15,9 @@
 //! # What a backup contains
 //!
 //! Every table a restored node cannot rebuild for itself, including secondary
-//! index entries. Three are deliberately omitted because opening re-derives
-//! them: `OPLOG_WITNESSED`, `OPLOG_COLLECTED`, and `OPLOG_HELD` (ADR-160) --
+//! index entries. Three are deliberately omitted because they are re-derived:
+//! `OPLOG_WITNESSED` and `OPLOG_COLLECTED` by the first open, and `OPLOG_HELD`
+//! (ADR-160) by [`restore`] itself, from the backup's own vector (ADR-244) --
 //! and the tag list below is hand-written in both directions, so a table added
 //! to it makes every backup this build writes unrestorable by an older one.
 //!
@@ -244,6 +245,15 @@ impl Engine {
 /// for replacing a node, not for cloning one. Cloning needs a fresh identity,
 /// and there is deliberately no flag for it here: it would be one keystroke
 /// between "recover" and "corrupt the cluster's identity space".
+///
+/// # What the restored member claims
+///
+/// Its servable vector is the backup's, and the first open raises it over
+/// nothing: every oplog entry above that vector for its origin is marked held
+/// (`OPLOG_HELD`), in the restore's own transaction, as the member the backup
+/// came from held it. Those are the entries a snapshot page or a repair wrote
+/// as state, and the member takes the history around them again, by entries or
+/// by a snapshot (ADR-244).
 pub fn restore(path: &Path, input: &mut impl Read) -> Result<BackupInfo> {
     restore_with(path, input, &crate::format::BuildVersions::ours())
 }
@@ -336,6 +346,7 @@ pub fn restore_with(
     let db = Database::create(path)?;
     let mut records = 0usize;
     let mut bytes = header.len();
+    let mut marked = 0usize;
 
     {
         let txn = db.begin_write()?;
@@ -450,6 +461,46 @@ pub fn restore_with(
                     }
                 }
             }
+
+            // The held marks, re-derived from the backup's own vector (ADR-244).
+            // A backup does not carry `OPLOG_HELD`, and the open's walk raises
+            // both vectors over every unmarked entry, so without this a row the
+            // source held as state (a snapshot page's, a repair's) became
+            // coverage: the restored member's pulls started past whatever the
+            // origin wrote below it, and never took it. The backup was read in
+            // one transaction of a member whose writers keep invariant I, so
+            // every entry above its servable vector for its origin was marked
+            // there; marking exactly those keeps I on the restored store, and its
+            // first open raises nothing. A mark the source kept on an entry at or
+            // below its vector withheld nothing, and is not carried.
+            let vector = {
+                let mut vector = kimmy_core::VersionVector::new();
+                for row in redb::ReadableTable::iter(&versions)? {
+                    let (node, hlc) = row?;
+                    let node: [u8; 16] = node.value().try_into().map_err(|_| {
+                        StorageError::Database(
+                            "a version vector key in the backup is not a node id".into(),
+                        )
+                    })?;
+                    let hlc: [u8; kimmy_core::HLC_ENCODED_LEN] =
+                        hlc.value().try_into().map_err(|_| {
+                            StorageError::Database(
+                                "a version vector value in the backup is not a stamp".into(),
+                            )
+                        })?;
+                    vector.insert(NodeId::from_bytes(node), kimmy_core::Hlc::from_bytes(hlc));
+                }
+                vector
+            };
+            let mut held = txn.open_table(tables::OPLOG_HELD)?;
+            for row in redb::ReadableTable::iter(&oplog)? {
+                let (key, _) = row?;
+                let stamp = crate::codec::decode_oplog_key(key.value())?;
+                if stamp.hlc > vector.get(stamp.node) {
+                    held.insert(key.value(), ())?;
+                    marked += 1;
+                }
+            }
         }
         txn.commit()?;
     }
@@ -460,7 +511,7 @@ pub fn restore_with(
     let schema = crate::migrate::stored_version(&db)?.unwrap_or(0);
     crate::format::write_sidecar(path, &crate::format::stamp(schema, build))?;
 
-    info!(records, bytes, %node, path = %path.display(), "restored a backup");
+    info!(records, bytes, held = marked, %node, path = %path.display(), "restored a backup");
     Ok(BackupInfo { node: Some(node), created_ms, records, bytes })
 }
 
@@ -729,6 +780,83 @@ mod tests {
             restore(&path, &mut buf.as_slice()).is_err(),
             "a truncated backup must not restore"
         );
+    }
+
+    /// The keys `OPLOG_HELD` holds.
+    fn held_keys(engine: &Engine) -> std::collections::BTreeSet<Vec<u8>> {
+        use redb::ReadableTable;
+        let txn = engine.db().begin_read().unwrap();
+        let held = txn.open_table(tables::OPLOG_HELD).unwrap();
+        held.iter().unwrap().map(|row| row.unwrap().0.value().to_vec()).collect()
+    }
+
+    /// The keys of the oplog entries above the servable vector for their origin.
+    fn above_the_vector(engine: &Engine) -> std::collections::BTreeSet<Vec<u8>> {
+        use redb::ReadableTable;
+        let vector = engine.version_vector().unwrap();
+        let txn = engine.db().begin_read().unwrap();
+        let oplog = txn.open_table(tables::OPLOG).unwrap();
+        oplog
+            .iter()
+            .unwrap()
+            .map(|row| row.unwrap().0.value().to_vec())
+            .filter(|key| {
+                let stamp = crate::codec::decode_oplog_key(key).unwrap();
+                stamp.hlc > vector.get(stamp.node)
+            })
+            .collect()
+    }
+
+    /// A restore marks exactly the entries above the backup's servable vector for
+    /// their origin (ADR-244): the marks the member it came from held over them, and
+    /// no mark on an entry that vector already covers, which withheld nothing. A
+    /// backup of a member that holds nothing as state restores no mark.
+    #[test]
+    fn a_restore_marks_exactly_the_entries_above_the_backups_vector() {
+        let dir = tempfile::tempdir().unwrap();
+        let b = Engine::open(&dir.path().join("b.redb")).unwrap();
+        let d = Engine::open(&dir.path().join("d.redb")).unwrap();
+        let orders = b.create_collection("shop", "orders").unwrap();
+        let items = b.create_collection("shop", "items").unwrap();
+        b.insert(&orders, doc! { "_id": 0i64 }).unwrap();
+        let window =
+            b.entries_for_peer(kimmy_core::Hlc::ZERO, 1_000, crate::WalkScope::Request).unwrap();
+        d.apply_batch(&window.entries).unwrap();
+        b.insert(&orders, doc! { "_id": 1i64 }).unwrap();
+        b.insert(&items, doc! { "_id": 101i64 }).unwrap();
+        // D takes `items` by a scoped page: its row is held as state.
+        let mut progress = crate::snapshot::SnapshotProgress::of_collection(items.id);
+        while !progress.is_complete() {
+            let page = b.snapshot_page(progress.after().cloned(), progress.scope()).unwrap();
+            d.apply_snapshot_page(b.node_id(), &mut progress, &page).unwrap();
+        }
+        let held = held_keys(&d);
+        assert_eq!(held.len(), 1, "the page's row");
+        assert_eq!(held, above_the_vector(&d));
+        // A stale mark, on the entry at D's vector of B, which withholds nothing.
+        {
+            let covered = window.entries.last().unwrap().stamp;
+            assert!(covered.hlc <= d.version_vector().unwrap().get(b.node_id()));
+            let txn = d.db().begin_write().unwrap();
+            txn.open_table(tables::OPLOG_HELD)
+                .unwrap()
+                .insert(crate::codec::oplog_key(&covered).as_slice(), ())
+                .unwrap();
+            txn.commit().unwrap();
+        }
+        assert_eq!(held_keys(&d).len(), 2);
+
+        for (engine, expected) in [(&d, held), (&b, Default::default())] {
+            let mut buf = Vec::new();
+            engine.backup_to(&mut buf, crate::WalkScope::Request).unwrap();
+            let dest = tempfile::tempdir().unwrap();
+            let path = dest.path().join("restored.redb");
+            restore(&path, &mut buf.as_slice()).unwrap();
+            let restored = Engine::open(&path).unwrap();
+            assert_eq!(held_keys(&restored), expected, "the restored marks");
+            assert_eq!(held_keys(&restored), above_the_vector(&restored));
+            assert_eq!(restored.version_vector().unwrap(), engine.version_vector().unwrap());
+        }
     }
 
     #[test]
