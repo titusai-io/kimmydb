@@ -28646,9 +28646,10 @@ in bash, one per clause.
 > it again with its key. Three tables are added: `idempotency` and `idempotency_by_stamp`, carried by a backup as tags
 > 12 and 13, which are a backup rollback boundary, and `idempotency_changes`, a node-local change log no backup carries.
 > No `kimmy.format` schema (still 5), `I_EPOCH`, existing codec or entry kind changes. One configuration key
-> (`cluster.idempotency_keys`), ten optional wire fields (`replay` and `replay_records` on `AskEntries`, `records` and
-> `replay_records` on `Entries`, `records` on `ReplayEntries` and on `Push`, `records` (the records position) and
-> `records_base` on a snapshot cursor, `records` and `records_epoch` on a snapshot page), in three new wire types
+> (`cluster.idempotency_keys`), fourteen optional wire fields (`replay`, `replay_records` and `records_ahead_of` on
+> `AskEntries`, `records` and `replay_records` on `Entries` and on `ReplayEntries`, `replay_records` on `ReplayAck` and
+> on `Vectors`, `records` on `Push`, `records` (the records position) and `records_base` on a snapshot cursor, `records`
+> and `records_epoch` on a snapshot page), in three new wire types
 > (`CarriedRecord`: `collection`, `scope`, an optional `carrying` and `record`; `RecordsBase`: `key` and an optional
 > `epoch`; `ReplayRecords`: `at`, `through`, `collections`, `collection`, `scope` and `base`), one facts field
 > (`idempotency_records`), three error codes, a capability, a version field and a response header are added.
