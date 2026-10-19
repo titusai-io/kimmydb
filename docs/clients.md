@@ -183,8 +183,10 @@ where it stopped instead of applying again. What a client must do to rely on it:
 - **A `503 peer_unheard` with `retry: wait`** means the member has not yet
   heard from a live member whether it carries records: one that came up, or
   that it saw rejoin, a moment ago, which every restart of a member in a roll
-  causes. It wrote nothing and looked nothing up, and it ends by itself within
-  about a sync interval. **Honour `Retry-After` and send the same request again,
+  causes. It wrote nothing and looked nothing up. It lasts until that member is
+  heard, about a sync interval, and at most a lease (`ceil(peers /
+  cluster.fanout) + 2` sync intervals), after which the member that is still not
+  heard from is answered with the `400` below. **Honour `Retry-After` and send the same request again,
   with the same key, to the same member**: that is the keyed retry the rules
   above describe, and it is answered with the first application or its replay.
   Not elsewhere, for the reason a keyed retry stays on its member. It is the
@@ -192,9 +194,11 @@ where it stopped instead of applying again. What a client must do to rely on it:
   MCP the same refusal is the tool error whose `data`
   carries `"error": "peer_unheard"`, `"retry": "wait"` and `retry_after_secs`.
 - **A `400` naming `Idempotency-Key` and the cluster** (the member does not take
-  keys now: its `cluster.idempotency_keys` is off, or a live member says it does
-  not carry records, a member of an earlier release during a roll) wrote nothing
-  and looked nothing up, and lasts until the operator or the roll changes it. A
+  keys now: its `cluster.idempotency_keys` is off, or a live member does not say
+  it carries records: a member of an earlier release during a roll, one whose
+  block does not decode, or one not heard from for more than a lease) wrote
+  nothing and looked nothing up, and lasts until the operator, the roll or that
+  member changes it. A
   record written before the member stopped taking keys stays for its window,
   and the retry replays from it once the member takes them again; until then
   the rules above apply. A `400` naming the key's syntax or the route is the
