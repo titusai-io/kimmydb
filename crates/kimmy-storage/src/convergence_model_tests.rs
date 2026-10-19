@@ -23,7 +23,10 @@
 //! entries); take a scoped snapshot; take a whole-database snapshot (coverage granted
 //! on completion); restart (close, open, the two start reconciles `node::run` makes);
 //! collect garbage honouring the operator rule (only what every member has witnessed);
-//! and age out everything a member holds (the rule broken: ADR-235's premise).
+//! age out everything a member holds (the rule broken: ADR-235's premise); a retention
+//! pass past the oplog window and within the tombstone window; and a point-in-time
+//! rewind (`kimmyd restore --until`) followed by a start. The last two are taken by named
+//! rows only (RW1); the generator does not draw them.
 //!
 //! **Quiescence.** After a schedule, every ordered pair syncs until nothing moves (the
 //! observable state, `created` and the vectors all stand still for a whole round),
@@ -149,7 +152,22 @@ pub(crate) enum Step {
     Purge {
         m: u8,
     },
+    /// A retention pass at `t` with the oplog window passed and the tombstone window
+    /// not: the oplog below `t` less [`RETENTION_OPLOG_SECS`] is collected, the
+    /// tombstones are kept (`tombstone_retention_secs >= oplog_retention_secs`).
+    Retention {
+        m: u8,
+    },
+    /// A point-in-time rewind to `t` (`kimmyd restore --until`, offline), then a start.
+    Rewind {
+        m: u8,
+    },
 }
+
+/// The oplog window of a [`Step::Retention`] pass.
+const RETENTION_OPLOG_SECS: u64 = 1;
+/// Its tombstone window: longer than any schedule, so the pass keeps every tombstone.
+const RETENTION_TOMBSTONE_SECS: u64 = 24 * 60 * 60;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub(crate) struct Op {
@@ -213,6 +231,8 @@ impl std::fmt::Display for Op {
             Step::AgeOut { m } => write!(f, "{}.ageout", l(m)),
             Step::PurgerOff => write!(f, "purger off"),
             Step::Purge { m } => write!(f, "{}.purge", l(m)),
+            Step::Retention { m } => write!(f, "{}.retention@{t}", l(m)),
+            Step::Rewind { m } => write!(f, "{}.rewind@{t}", l(m)),
         }
     }
 }
@@ -280,6 +300,8 @@ pub(crate) fn parse(text: &str) -> Vec<Op> {
                 "gc" => Step::Gc { m },
                 "ageout" => Step::AgeOut { m },
                 "purge" => Step::Purge { m },
+                "retention" => Step::Retention { m },
+                "rewind" => Step::Rewind { m },
                 "write" | "delete" => {
                     let (c, d) = arg.split_once('/').expect("collection/doc");
                     let (c, d) = (coll(c), d.parse().expect("a doc"));
@@ -774,6 +796,40 @@ impl Cluster {
             Step::Purge { m } => {
                 self.e(m as usize).finish_purges_now().map_err(|e| err("finish_purges_now", e))?;
             }
+            Step::Retention { m } => {
+                let m = m as usize;
+                let now = self.base + u64::from(op.t);
+                let out = self
+                    .e(m)
+                    .collect_garbage_at(
+                        now,
+                        RetentionPolicy::new(RETENTION_OPLOG_SECS, RETENTION_TOMBSTONE_SECS),
+                    )
+                    .map_err(|e| err("collect_garbage", e))?;
+                let s = format!(
+                    "{} retention at t{}: {} entries, {} tombstones",
+                    LETTERS[m], op.t, out.oplog_removed, out.tombstones_removed
+                );
+                self.note(s);
+            }
+            Step::Rewind { m } => {
+                let m = m as usize;
+                // `--until` is a millisecond: what is stamped in it after its first
+                // stamp is discarded.
+                let until = Hlc::new(self.base + u64::from(op.t), 0);
+                match self.e(m).rewind_to(until) {
+                    Ok(out) => {
+                        let s = format!(
+                            "{} rewound to t{}: {} entries discarded, {} reverted, {} removed",
+                            LETTERS[m], op.t, out.oplog_discarded, out.reverted, out.removed
+                        );
+                        self.note(s);
+                    }
+                    Err(e) => self.note(format!("{} rewind to t{} refused: {e}", LETTERS[m], op.t)),
+                }
+                // The restore command exits; the node starts on the rewound store.
+                self.restart(m)?;
+            }
         }
         // The drops a local step minted, read as the tombstones it wrote.
         if let Some(before) = before {
@@ -805,7 +861,9 @@ impl Cluster {
             | Step::Restart { m }
             | Step::Gc { m }
             | Step::AgeOut { m }
-            | Step::Purge { m } => m as usize,
+            | Step::Purge { m }
+            | Step::Retention { m }
+            | Step::Rewind { m } => m as usize,
             Step::PurgerOff => 0,
             Step::Pull { to, .. }
             | Step::PullShort { to, .. }
@@ -1996,6 +2054,12 @@ fn scoped(to: u8, from: u8, c: u8) -> Op {
 fn age_out(m: u8) -> Op {
     op(AgeOut { m }, 0)
 }
+fn retention(m: u8, t: u32) -> Op {
+    op(Retention { m }, t)
+}
+fn rewind(m: u8, t: u32) -> Op {
+    op(Rewind { m }, t)
+}
 
 /// A delivery of every member's news to every other, in the order `order` names
 /// the pairs, by `how`.
@@ -2871,6 +2935,37 @@ fn finding_f16_a_delete_made_after_a_drop_is_kept_as_a_write_after_it_is() {
     );
 }
 
+/// RW1 (the idempotency model's long suite, seed 1000688, minimised to seven steps). B drops
+/// `items`; B's retention pass collects its own drop entry before A or C has taken it (they
+/// are past the oplog window and within the tombstone window); B rewinds to a moment after
+/// the pass, discarding nothing; A, which never heard of the drop, writes into `items`. B's
+/// drop reaches A and C only by a whole-database page, given to a peer that lacks a collected
+/// entry (ADR-036, ADR-097), and A keeps its writes made after the drop (ADR-236). The control
+/// variant is the same schedule without the rewind.
+#[test]
+fn row_rw1_a_rewind_after_retention_keeps_the_members_collected_drop() {
+    let pre = [
+        create(A, ORDERS, 100),
+        create(A, ITEMS, 110),
+        write(A, ORDERS, 1, 120),
+        pull(B, A),
+        pull(C, A),
+        drop_coll(B, ITEMS, 170),
+        write(C, ORDERS, 0, 190),
+        pull(B, C),
+        retention(B, 1730),
+    ];
+    let after = [write(A, ITEMS, 5, 1800), write(A, ITEMS, 6, 1801)];
+    let mut rewound = vec![rewind(B, 1757)];
+    rewound.extend(after);
+    row(
+        "RW1",
+        &pre,
+        &[("rewound after the pass", rewound), ("control: not rewound", after.to_vec())],
+        &[(ORDERS, Some(&[0, 1])), (ITEMS, Some(&[5, 6]))],
+    );
+}
+
 /// ADR-236's residual 1, accepted as by design (ruled 2026-10-15), pinned by its exact shape
 /// so that a change in it shows. A drops the database while holding `items`, and buries it with
 /// an entry of its own stamp (t130.2A). B drops the database later, never having held `items`,
@@ -3331,7 +3426,12 @@ pub(crate) fn enumerate(alphabet: &[Step], depth: usize) -> Vec<Vec<Op>> {
                 next.knows[to] |= k.knows[from];
                 next.may_hold[to] |= k.may_hold[from];
             }
-            Restart { m } | Gc { m } | AgeOut { m } | Purge { m } => {
+            Restart { m }
+            | Gc { m }
+            | AgeOut { m }
+            | Purge { m }
+            | Retention { m }
+            | Rewind { m } => {
                 if k.knows[m as usize] == 0 {
                     return None;
                 }
